@@ -1,0 +1,30 @@
+{
+  "name": "@blasti/desktop",
+  "version": "0.2.0",
+  "private": true,
+  "description": "BLASTI Desktop — Multi-agency queue management system",
+  "main": "main.js",
+  "scripts": {
+    "dev": "electron . --dev",
+    "dev:verbose": "electron . --dev --enable-logging",
+    "prebuild": "node scripts/prebuild.js",
+    "build": "node scripts/prebuild.js && electron-builder",
+    "build:win": "node scripts/prebuild.js && electron-builder --win",
+    "build:mac": "node scripts/prebuild.js && electron-builder --mac",
+    "build:linux": "node scripts/prebuild.js && electron-builder --linux",
+    "build:all": "node scripts/prebuild.js && electron-builder --mac --win --linux",
+    "build:export": "cd ../web && NEXT_BUILD_MODE=export next build"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.0.12",
+    "@prisma/client": "^6.11.1",
+    "bcryptjs": "^2.4.3",
+    "electron-is-dev": "^3.0.1",
+    "hono": "^4.12.32",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "electron": "^42.3.3",
+    "electron-builder": "^26.15.2"
+  }
+}

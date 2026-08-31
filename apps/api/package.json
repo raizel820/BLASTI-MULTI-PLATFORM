@@ -1,0 +1,24 @@
+{
+  "name": "@blasti/api",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun src/index.ts",
+    "start:node": "node realtime.cjs"
+  },
+  "dependencies": {
+    "@blasti/db": "workspace:*",
+    "@hono/node-server": "^1.14.0",
+    "hono": "^4.7.0",
+    "jose": "^6.0.0",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.1",
+    "zod": "^4.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,951 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum NotificationPref {
+  SMS
+  WHATSAPP
+  BOTH
+  APP_ONLY
+}
+
+enum JobStatus {
+  PENDING
+  SENT
+  CANCELLED
+}
+
+model User {
+  id                      String         @id @default(cuid())
+  username                String         @unique
+  fullName                String
+  email                   String?        @unique
+  phoneNumber             String?        @unique
+  shortAppId              String?        @unique
+  passwordHash            String
+  role                    String         @default("CUSTOMER")
+  language                String         @default("ar")
+  avatarUrl               String?
+  /// Storage provider for avatar ('blob', 'r2', 'local'). Null = legacy URL.
+  avatarStorageProvider   String?
+  /// Storage key for avatar. Used with getFileUrl() for provider-neutral access.
+  avatarStorageKey        String?
+  freeSmsCount            Int            @default(10)
+  notificationPreferences String         @default("{\"queue_called\":true,\"turn_approaching\":true,\"completed\":true}")
+  reminderMinutes         Int            @default(10)
+  smsNotificationsEnabled Boolean        @default(true)
+  notificationPref        NotificationPref @default(APP_ONLY)
+  isAppOnline             Boolean          @default(false)
+  fcmToken                String?
+  delayedJobs             DelayedJob[]
+  isActive                Boolean        @default(true)
+  /// Phase 2b: Timestamp of the last role change. JWTs issued before this time
+  /// have stale role claims and must be rejected to prevent privilege escalation.
+  lastRoleChangeAt       DateTime       @default(now())
+  createdAt               DateTime       @default(now())
+  updatedAt               DateTime       @updatedAt
+  ownedAgencies           Agency[]
+  staffAgencies           AgencyStaff[]
+  auditLogs               AuditLog[]
+  favorites               Favorite[]
+  notifications           Notification[]
+  reservations            Reservation[]
+  smsPurchases            SmsPurchase[]
+  managedTransactions     Transaction[]  @relation("ReviewedBy")
+  reviews                 Review[]
+  devices                 DeviceRegistration[]
+}
+
+model Agency {
+  id                    String          @id @default(cuid())
+  name                  String
+  nameFr                String?
+  nameAr                String?
+  customCode            String          @unique
+  category              String
+  address               String?
+  city                  String          @default("M'Sila")
+  wilaya                String          @default("28")
+  phone                 String?
+  email                 String?
+  website               String?
+  logoUrl               String?
+  /// Storage provider for logo ('blob', 'r2', 'local'). Null = legacy URL.
+  logoStorageProvider    String?
+  /// Storage key for logo. Used with getFileUrl() for provider-neutral access.
+  logoStorageKey         String?
+  coverUrl              String?
+  /// Storage provider for cover image
+  coverStorageProvider   String?
+  /// Storage key for cover image
+  coverStorageKey        String?
+  description           String?
+  descriptionFr         String?
+  descriptionAr         String?
+  averageServiceTime    Int             @default(10)
+  maxActiveReservations Int             @default(50)
+  autoPauseWhenFull     Boolean         @default(false)
+  isSponsored           Boolean         @default(false)
+  /// Phase 2: Dynamic subscription — now links to SubscriptionPlan instead of hardcoded enum
+  subscriptionPlanId    String?
+  subscriptionTier      String          @default("BASIC")
+  subscriptionStatus    String          @default("INACTIVE")
+  workingHoursStart     String          @default("08:00")
+  workingHoursEnd       String          @default("17:00")
+  isQueueOpen           Boolean         @default(true)
+  isActive              Boolean         @default(true)
+  kioskModeEnabled      Boolean         @default(false)
+  sponsorSms             Boolean         @default(false)
+  smsBalance             Int             @default(0)
+  /// Phase 5d: When a downgrade takes full effect (null = no pending downgrade). Existing reservations complete naturally until this date.
+  gracePeriodEndsAt     DateTime?
+  /// Subscription Start: When the current subscription period was activated (set when admin approves payment)
+  subscriptionStartsAt  DateTime?
+  /// Subscription Expiry: When the current subscription period expires. null = no expiry (e.g. ONE_TIME plans). When this date passes, the app blocks until renewed.
+  subscriptionExpiresAt DateTime?
+  createdAt             DateTime        @default(now())
+  updatedAt             DateTime        @updatedAt
+  ownerId               String
+  owner                 User            @relation(fields: [ownerId], references: [id])
+  branches              Branch[]
+  staff                 AgencyStaff[]
+  announcements         Announcement[]
+  favorites             Favorite[]
+  queueSettings         QueueSettings[]
+  reservations          Reservation[]
+  services              Service[]
+  transactions          Transaction[]
+  reviews               Review[]
+  subscriptionPlan      SubscriptionPlan? @relation(fields: [subscriptionPlanId], references: [id])
+  devices               AgencyDevice[]
+  savedTvs              SavedTv[]
+  defaultPrinter        DefaultPrinter?
+  hardwareOrders        HardwareOrder[]
+  enterpriseRequests    EnterpriseContractRequest[]
+  ownedEnterprisePlans  SubscriptionPlan[] @relation("EnterprisePlanOwner")
+}
+
+// Phase 2: Dynamic SubscriptionPlan model — replaces hardcoded subscriptionTier enum
+model SubscriptionPlan {
+  id                String   @id @default(cuid())
+  name              String   @unique
+  displayName       String
+  displayNameAr     String?
+  displayNameFr     String?
+  description       String?
+  descriptionAr     String?
+  descriptionFr     String?
+  price             Int      @default(0)     // Price in DA (Algerian Dinar)
+  currency          String   @default("DZD")
+  billingCycle      String   @default("MONTHLY") // MONTHLY, YEARLY, ONE_TIME
+  maxServices       Int      @default(5)
+  maxBranches       Int      @default(1)
+  maxStaff          Int      @default(3)
+  maxActiveReservations Int  @default(50)
+  maxSmsPerMonth    Int      @default(50)
+  kioskModeEnabled  Boolean  @default(false)
+  analyticsEnabled  Boolean  @default(false)
+  priorityListing   Boolean  @default(false)
+  customBranding    Boolean  @default(false)
+  apiAccess         Boolean  @default(false)
+  isActive          Boolean  @default(true)
+  sortOrder         Int      @default(0)
+  /// Discount % when paying for 3 months upfront (e.g., 5 = 5% off)
+  quarterlyDiscount Int      @default(0)
+  /// Discount % when paying for 6 months upfront (e.g., 10 = 10% off)
+  semiAnnualDiscount Int     @default(0)
+  /// Discount % when paying for 12 months upfront (e.g., 15 = 15% off)
+  annualDiscount    Int      @default(0)
+  /// Discount % when paying for 24 months upfront (e.g., 20 = 20% off)
+  biennialDiscount  Int      @default(0)
+  /// Enterprise custom plan flag — when true, this plan is a bespoke plan built
+  /// for a single enterprise and must NOT appear in the public plan catalog.
+  isEnterprise      Boolean  @default(false)
+  /// The agency this enterprise plan was created for. Null for regular public
+  /// plans. When set, only this agency can see/subscribe/cancel/upgrade it.
+  ownerAgencyId     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  agencies          Agency[]
+  features          PlanFeature[]
+  enterpriseRequests EnterpriseContractRequest[]
+  ownerAgency       Agency?  @relation("EnterprisePlanOwner", fields: [ownerAgencyId], references: [id], onDelete: SetNull)
+}
+
+// Phase 2: PlanFeature model — allows dynamic feature flags per plan
+model PlanFeature {
+  id          String   @id @default(cuid())
+  planId      String
+  featureKey  String   // e.g., "kiosk_mode", "analytics", "sms_gateway", "custom_branding"
+  featureName String
+  featureNameAr String?
+  featureNameFr String?
+  enabled     Boolean  @default(false)
+  limitValue  Int?     // Optional numeric limit (e.g., max_sms = 100)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  plan        SubscriptionPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@unique([planId, featureKey])
+}
+
+// ─── Hardware Ordering System ───────────────────────────────────────────────
+// Admin-defined hardware products (TV, PC, Kiosk, Printer) with base prices.
+// Agencies can order these when subscribing (upfront or monthly extra).
+
+model HardwareProduct {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  nameAr      String?
+  nameFr      String?
+  description String?
+  descriptionAr String?
+  descriptionFr String?
+  category    String   // "TV", "PC", "KIOSK", "PRINTER"
+  basePrice   Int      @default(0) // Base price in DZD
+  isActive    Boolean  @default(true) // Admin can disable individual products
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  orderItems  HardwareOrderItem[]
+}
+
+model HardwareOrder {
+  id               String   @id @default(cuid())
+  agencyId         String
+  paymentModel     String   @default("UPFRONT") // "UPFRONT" or "MONTHLY"
+  commitmentMonths Int?     // 12/24/36/48/60 (null if UPFRONT)
+  totalBasePrice   Int      @default(0) // Sum of (unitPrice × quantity) for all items
+  extraPercentage  Int      @default(0) // Admin-set extra % for monthly payments
+  monthlyExtra     Int      @default(0) // Calculated: (totalBasePrice × (1 + extraPercentage/100)) / commitmentMonths
+  upfrontTotal     Int      @default(0) // = totalBasePrice (for UPFRONT model)
+  status           String   @default("PENDING") // PENDING, APPROVED, REJECTED, FULFILLED
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  agency           Agency   @relation(fields: [agencyId], references: [id])
+  items            HardwareOrderItem[]
+}
+
+model HardwareOrderItem {
+  id          String   @id @default(cuid())
+  orderId     String
+  productId   String
+  quantity    Int      @default(1)
+  unitPrice   Int      @default(0) // Snapshot of base price at order time
+  createdAt   DateTime @default(now())
+
+  order       HardwareOrder   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product     HardwareProduct @relation(fields: [productId], references: [id])
+}
+
+// ─── Enterprise Contract Requests ───────────────────────────────────────────
+// When an agency requests a custom enterprise plan, a request is created.
+// Admin reviews it and can create a custom SubscriptionPlan from it.
+
+model EnterpriseContractRequest {
+  id              String   @id @default(cuid())
+  agencyId        String
+  agencyName      String
+  contactEmail    String
+  contactPhone    String?
+  message         String   @default("") // Agency's requirements description
+  requestedFeatures String @default("[]") // JSON array of feature keys
+  branchesNeeded  Int      @default(1)
+  countersNeeded  Int      @default(1)
+  hardwareNeeded  Boolean  @default(true)
+  status          String   @default("PENDING") // PENDING, REVIEWING, APPROVED, REJECTED
+  adminNotes      String?
+  customPlanId    String?  // Link to a created SubscriptionPlan (when admin creates one)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency           Agency   @relation(fields: [agencyId], references: [id])
+  customPlan       SubscriptionPlan? @relation(fields: [customPlanId], references: [id])
+}
+
+// ─── Hardware Settings (global config) ─────────────────────────────────────
+// Stores the hardware-enabled toggle and commitment-tier extra percentages.
+
+model HardwareSettings {
+  id                String   @id @default("singleton")
+  hardwareEnabled   Boolean  @default(true) // Global toggle — when false, hardware ordering is disabled
+  upfrontDiscount   Int      @default(0) // Discount % for upfront payment (e.g., 5 = 5% off)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model HardwareCommitmentTier {
+  id              String   @id @default(cuid())
+  months          Int      @unique // 12, 24, 36, 48, 60
+  label           String   // "1 Year", "2 Years", etc.
+  labelAr         String?
+  labelFr         String?
+  extraPercentage Int      @default(0) // Extra % over base price for monthly payments
+  isActive        Boolean  @default(true)
+  sortOrder       Int      @default(0)
+}
+
+model AgencyStaff {
+  id          String   @id @default(cuid())
+  userId      String
+  agencyId    String
+  branchId    String?
+  role        String   @default("STAFF")
+  /// Phase 2: Normalized permissions as boolean columns (replacing JSON string)
+  canManageQueue       Boolean @default(true)
+  canManageServices    Boolean @default(false)
+  canManageStaff       Boolean @default(false)
+  canViewAnalytics     Boolean @default(true)
+  canManageBranches    Boolean @default(false)
+  canManageWorkingHours Boolean @default(false)
+  canExportData        Boolean @default(false)
+  canManageProfile     Boolean @default(false)
+  /// Legacy JSON permissions field — kept for backward compatibility, migrated from on startup
+  permissions String   @default("{\"canManageQueue\":true,\"canManageServices\":false,\"canManageStaff\":false,\"canViewAnalytics\":true,\"canManageBranches\":false,\"canManageWorkingHours\":false,\"canExportData\":false,\"canManageProfile\":false}")
+  isActive    Boolean  @default(true)
+  joinedAt    DateTime @default(now())
+  agency      Agency   @relation(fields: [agencyId], references: [id])
+  branch      Branch?  @relation(fields: [branchId], references: [id])
+  user        User     @relation(fields: [userId], references: [id])
+  counters    Counter[]
+
+  @@unique([userId, agencyId])
+}
+
+model Service {
+  id           String        @id @default(cuid())
+  agencyId     String
+  name         String
+  nameFr       String?
+  nameAr       String?
+  description  String?
+  prefix       String        @default("A")
+  isActive     Boolean       @default(true)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+  reservations Reservation[]
+  agency       Agency        @relation(fields: [agencyId], references: [id])
+
+  @@unique([agencyId, name])
+}
+
+model QueueSettings {
+  id                   String    @id @default(cuid())
+  agencyId             String
+  currentServingNumber Int       @default(0)
+  lastIssuedNumber     Int       @default(0)
+  isPaused             Boolean   @default(false)
+  pausedAt             DateTime?
+  openedAt             DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  agency               Agency    @relation(fields: [agencyId], references: [id])
+}
+
+model Reservation {
+  id                  String    @id @default(cuid())
+  userId              String?
+  agencyId            String
+  serviceId           String
+  queueNumber         Int
+  displayNumber       String
+  status              String    @default("WAITING")
+  estimatedWait       Int?
+  reservedDate        String?
+  joinedAt            DateTime  @default(now())
+  calledAt            DateTime?
+  completedAt         DateTime?
+  cancelledAt         DateTime?
+  rating              Int?
+  feedback            String?
+  notes               String?
+  ratedAt             DateTime?
+  reminderSent        Boolean   @default(false)
+  reminderSentAt      DateTime?
+  smsReminderSent     Boolean   @default(false)
+  smsReminderSentAt   DateTime?
+  skippedForNoShow    Boolean   @default(false)
+  skippedAt           DateTime?
+  reclaimRequestedAt   DateTime?
+  deferredTimeoutAt   DateTime?
+  preferredTime       String?
+  fixedTimeEnabled    Boolean   @default(false)
+  postponeCount       Int       @default(0)
+  isWalkIn            Boolean   @default(false)
+  walkInCustomerName  String?
+  /// Module 3: When this was created offline
+  offlineCreatedAt    DateTime?
+  /// Module 3: When this was synced to the server
+  syncedAt            DateTime?
+  /// Module 3: Device ID that created this offline
+  syncDeviceId        String?
+  /// Module 3: Whether there was a sync conflict
+  syncConflict        Boolean   @default(false)
+  /// Module 4: HMAC-based token for QR claim (O2O QR Bridge)
+  importToken         String?   @unique
+  /// Module 4: When the QR was scanned and claimed
+  qrClaimedAt         DateTime?
+  /// Module 4: Which kiosk scanned the QR
+  qrClaimDeviceId     String?
+  /// Phase 1d: Snapshot pricing — freezes plan details at booking time so price changes don't affect existing reservations
+  priceSnapshot       Int?
+  currencySnapshot    String?
+  planNameSnapshot    String?
+  /// Phase 2: Multi-Desk Tracking — which counter called this ticket
+  counterId           String?
+  counter             Counter?  @relation("ServedByCounter", fields: [counterId], references: [id], onDelete: SetNull)
+  currentCounter      Counter?  @relation("CurrentReservation")
+  agency              Agency    @relation(fields: [agencyId], references: [id])
+  service             Service   @relation(fields: [serviceId], references: [id])
+  user                User?     @relation(fields: [userId], references: [id])
+  review              Review?
+
+  // Phase 2: Compound indexes for performance on large ticket histories
+  // Prevents full table scans when filtering by agency + status + queue number
+  @@index([agencyId, status, queueNumber])
+  @@index([agencyId, serviceId, status])
+  @@index([userId, status])
+}
+
+model Transaction {
+  id              String    @id @default(cuid())
+  agencyId        String
+  amount          Int
+  plan            String
+  paymentMethod   String
+  receiptUrl      String?
+  /// Storage provider for receipt ('blob', 'r2', 'local'). Null = legacy URL.
+  receiptStorageProvider String?
+  /// Storage key for receipt. Used with getFileUrl() for provider-neutral access.
+  receiptStorageKey      String?
+  status          String    @default("PENDING")
+  rejectionReason String?
+  reviewedBy      String?
+  reviewedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  /// Snapshot: amount paid at time of transaction (prevents plan price changes from altering history)
+  amountPaid       Int?
+  /// Snapshot: plan name at time of transaction (prevents plan rename from altering history)
+  planName         String?
+  /// Phase 1d: Snapshot pricing — freezes plan price/currency at transaction time
+  priceSnapshot    Int?
+  currencySnapshot String?
+  /// Phase 5b: Optimistic Concurrency Control — incremented on every update; WHERE clause includes current version to prevent double-grant races
+  version         Int       @default(0)
+  /// Module 2: Payment provider — chargily, manual, eccp
+  paymentProvider String    @default("chargily")
+  /// Module 2: Provider reference — Chargily checkout ID or ECCP ref
+  providerRef     String?   @default("")
+  /// Module 2: Whether webhook signature was verified
+  webhookVerified Boolean   @default(false)
+  /// Module 2: When this was reconciled by ECCP
+  reconciledAt    DateTime?
+  /// Module 2: Admin who reconciled
+  reconciledBy    String?
+  agency          Agency    @relation(fields: [agencyId], references: [id])
+  reviewer        User?     @relation("ReviewedBy", fields: [reviewedBy], references: [id])
+}
+
+model SmsPurchase {
+  id            String   @id @default(cuid())
+  userId        String
+  quantity      Int
+  price         Int
+  /// Phase 1e: Status now requires APPROVED before credits are granted
+  status        String   @default("PENDING") // PENDING → APPROVED | REJECTED
+  paymentMethod String?
+  receiptUrl    String?
+  /// Storage provider for SMS receipt
+  receiptStorageProvider String?
+  /// Storage key for SMS receipt
+  receiptStorageKey      String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt @default(now())
+  user          User     @relation(fields: [userId], references: [id])
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  type      String
+  title     String
+  message   String   @default("")
+  isRead    Boolean  @default(false)
+  entityId  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt @default(now())
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+model Favorite {
+  id        String   @id @default(cuid())
+  userId    String
+  agencyId  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt @default(now())
+  agency    Agency   @relation(fields: [agencyId], references: [id])
+  user      User     @relation(fields: [userId], references: [id])
+
+  @@unique([userId, agencyId])
+}
+
+model Announcement {
+  id        String    @id @default(cuid())
+  agencyId  String
+  message   String
+  type      String    @default("INFO")
+  isActive  Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt @default(now())
+  expiresAt DateTime?
+  agency    Agency    @relation(fields: [agencyId], references: [id])
+}
+
+model GlobalAnnouncement {
+  id        String   @id @default(cuid())
+  message   String
+  type      String   @default("INFO")
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt @default(now())
+}
+
+model SmsSettings {
+  id              String   @id @default(cuid())
+  provider        String   @default("algeria_sms")
+  apiUrl          String   @default("")
+  apiKey          String   @default("")
+  senderName      String   @default("BLASTI")
+  enabled         Boolean  @default(false)
+  smsPerReminder  Int      @default(1)
+  maxSmsPerDay    Int      @default(5)
+  testPhoneNumber String?
+  templateTurnApproaching String @default("🔄 BLASTI: Dear {customerName}, your turn is approaching! Ticket {ticketNumber} at {agencyName}. Position: {position}. Est. wait: {estimatedMinutes} min.")
+  templateYourTurn        String @default("🎫 BLASTI: Dear {customerName}, it's your turn now! Ticket {ticketNumber} at {agencyName}. Please proceed.")
+  templateNoShow          String @default("⚠️ BLASTI: Dear {customerName}, your ticket {ticketNumber} at {agencyName} was skipped due to no-show. You can reclaim your position.")
+  templateCustom          String @default("")
+  updatedAt       DateTime @updatedAt
+  createdAt       DateTime @default(now())
+  smsLogs         SmsLog[]
+}
+
+model SmsLog {
+  id            String      @id @default(cuid())
+  userId        String?
+  phoneNumber   String
+  message       String
+  status        String      @default("PENDING")
+  provider      String      @default("")
+  errorMessage  String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt @default(now())
+  smsSettings   SmsSettings? @relation(fields: [smsSettingsId], references: [id])
+  smsSettingsId String?
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String
+  entityType String?
+  entityId   String?
+  details    String?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt @default(now())
+  user       User?    @relation(fields: [userId], references: [id])
+}
+
+model Review {
+  id            String       @id @default(cuid())
+  rating        Int
+  comment       String?
+  replyText     String?
+  repliedAt     DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  userId        String
+  user          User         @relation(fields: [userId], references: [id])
+  agencyId      String
+  agency        Agency       @relation(fields: [agencyId], references: [id])
+  reservationId String?     @unique
+  reservation   Reservation? @relation(fields: [reservationId], references: [id])
+
+  @@unique([userId, agencyId])
+}
+
+model FAQ {
+  id          String   @id @default(cuid())
+  question    String
+  questionFr  String?
+  questionAr  String?
+  answer      String
+  answerFr    String?
+  answerAr    String?
+  category    String   @default("SUBSCRIPTION")
+  order       Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model PaymentSettings {
+  id                String   @id @default(cuid())
+  ccpEnabled        Boolean  @default(false)
+  bankEnabled       Boolean  @default(false)
+  electronicEnabled Boolean  @default(false)
+  ccpAccount        String   @default("")
+  ccpKey            String   @default("")
+  bankName          String   @default("")
+  bankAccount       String   @default("")
+  bankRib           String   @default("")
+  ewalletNumber     String   @default("")
+  updatedAt         DateTime @updatedAt
+  createdAt         DateTime @default(now())
+}
+
+model Branch {
+  id        String   @id @default(cuid())
+  name      String
+  nameAr    String?
+  nameFr    String?
+  address   String?
+  phone     String?
+  isActive  Boolean  @default(true)
+  isMain    Boolean  @default(false)
+  agencyId  String
+  agency    Agency   @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  counters  Counter[]
+  staff     AgencyStaff[]
+  devices   AgencyDevice[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Counter {
+  id                   String       @id @default(cuid())
+  number               Int
+  name                 String
+  nameAr               String?
+  nameFr               String?
+  isActive             Boolean      @default(true)
+  branchId             String
+  branch               Branch       @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  staffId              String?
+  staff                AgencyStaff? @relation(fields: [staffId], references: [id])
+  currentReservationId String?       @unique
+  currentReservation   Reservation?  @relation("CurrentReservation", fields: [currentReservationId], references: [id])
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  servedReservations Reservation[] @relation("ServedByCounter")
+}
+
+model DeviceRegistration {
+  id                 String   @id @default(cuid())
+  userId             String
+  platform           String   // web, electron, android, ios
+  deviceToken        String?  // FCM/APNs token for push
+  deviceId           String   // Unique device identifier
+  deviceFingerprint  String?  // Browser/device fingerprint for verification
+  appVersion         String?
+  lastActiveAt       DateTime @default(now())
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId])
+}
+
+// ─── Storage Abstraction ──────────────────────────────────────────────────────
+
+/// Provider-neutral file record. All uploads should be tracked here.
+/// Existing models keep their legacy URL fields (avatarUrl, logoUrl, etc.)
+/// for backward compatibility. New code should use storageProvider + storageKey.
+model UploadedFile {
+  id              String   @id @default(cuid())
+  /// Storage provider: 'blob', 'r2', or 'local'
+  storageProvider String
+  /// Provider-neutral storage key (e.g. "avatar/abc123.jpg")
+  storageKey      String
+  /// Original filename (sanitized)
+  originalName    String?
+  /// MIME type
+  contentType     String?
+  /// File size in bytes
+  size            Int?
+  /// When the file was uploaded
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt @default(now())
+
+  @@index([storageProvider])
+  @@index([storageKey])
+}
+
+// Phase 5: DeletedRecord (tombstone) table for WatermelonDB sync tracking
+model DeletedRecord {
+  id         String   @id @default(cuid())
+  modelName  String   // Which model was deleted (e.g., "Reservation", "Notification")
+  recordId   String   // The ID of the deleted record
+  deletedAt  DateTime @default(now())
+
+  @@index([modelName, deletedAt])
+  @@index([recordId])
+}
+
+// Module 1: Dynamic Configuration System
+model SystemSetting {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       String
+  encrypted   Boolean  @default(false)
+  category    String   @default("general")
+  description String   @default("")
+  valueType   String   @default("string")  // string, number, boolean, json
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+
+  @@index([category])
+  @@index([key])
+  @@map("system_settings")
+}
+
+// ─── Agency Device Management ──────────────────────────────────────────────────
+
+/// A TV, Kiosk, display, or printer device connected to an agency for queue display or ticket printing.
+/// Devices authenticate via deviceToken (separate from JWT user auth).
+/// Heartbeat mechanism tracks online/offline status in real-time.
+model AgencyDevice {
+  id              String    @id @default(cuid())
+  agencyId        String?
+  name            String                    // Display name e.g. "Waiting Room TV", "Reception Kiosk"
+  nameAr          String?
+  nameFr          String?
+  type            String    @default("TV")  // TV, KIOSK, DISPLAY, PRINTER
+  status          String    @default("OFFLINE") // ONLINE, OFFLINE, PAIRING, DISABLED, UPDATING
+  /// How the device connects to the server
+  connectionType  String    @default("LAN") // LAN, WIFI, CABLE, MANUAL
+  /// IP address of the device on the network
+  ipAddress       String?
+  /// Port the device listens on
+  port            Int?
+  /// Short pairing code for easy device linking (e.g. "A3B7")
+  pairingCode     String?   @unique
+  /// Device hardware/software fingerprint for verification
+  deviceFingerprint String?
+  /// Last known app version running on the device
+  appVersion      String?
+  /// Secure token used by the device to authenticate API calls (NOT JWT — device-level auth)
+  deviceToken     String?   @unique
+  /// Auto-discovery enabled for this device
+  autoDiscovery   Boolean   @default(true)
+  /// Display settings as JSON: fontSize, theme, language, showAds, showLogo, rotationSec, etc.
+  displaySettings String    @default("{}")
+  /// Printer configuration as JSON: paperSize, autoCut, copies, darkMode, logoUrl
+  printerConfig   String    @default("{}")
+  /// The screen/layout this device should show: QUEUE_BOARD, TICKET_PRINTER, SERVICE_SELECTOR, CUSTOM
+  screenLayout    String    @default("QUEUE_BOARD")
+  /// Which branch this device belongs to (null = main)
+  branchId        String?
+  /// Which services to display (empty = all), comma-separated service IDs
+  serviceFilter   String    @default("")
+  /// Last heartbeat/ping from the device (updated by device, NOT by staff)
+  lastHeartbeatAt DateTime?
+  /// Last time device status was changed
+  statusChangedAt DateTime  @default(now())
+  /// When the device was connected/paired
+  connectedAt     DateTime?
+  /// Total uptime in seconds (accumulated by heartbeat delta)
+  totalUptimeSec  Int       @default(0)
+  /// Whether the device supports offline mode
+  offlineCapable  Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  agency          Agency?   @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  branch          Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  commands        DeviceCommand[]
+
+  @@index([agencyId])
+  @@index([status])
+  @@index([agencyId, status])
+  @@index([pairingCode])
+  @@index([deviceToken])
+  @@index([lastHeartbeatAt])
+  @@index([deviceFingerprint])
+}
+
+// ─── Saved TVs (discovered TVs the agency wants to keep for later) ─────────
+
+/// A TV discovered on the network that the agency has saved for later operation
+/// (cast, preview, open on HDMI, etc.). Decoupled from AgencyDevice because
+/// saved TVs are discovered passively (mDNS/SSDP) and may not run the BLASTI
+/// agent — so they cannot be paired/registered like kiosks.
+model SavedTv {
+  id            String   @id @default(cuid())
+  agencyId      String?
+  /// Display name (from mDNS / SSDP / MAC OUI)
+  name          String
+  nameAr        String?
+  nameFr        String?
+  /// IP on the LAN
+  ip            String
+  /// Port the TV exposes (UPnP description port, usually 8001/9197/7676/etc.)
+  port          Int      @default(0)
+  /// MAC address (when known — used for vendor lookup)
+  mac           String?
+  /// Inferred vendor (Samsung, LG, Sony, …)
+  manufacturer  String?
+  model         String?
+  /// UPnP SSDP location URL
+  ssdpLocation  String?
+  /// mDNS service type (e.g. _samsung._tcp, _googlecast._tcp)
+  mdnsService   String?
+  /// Discovery source: ssdp | mdns | http_probe | arp | ping
+  source        String   @default("ssdp")
+  /// Last time this TV was seen on the network
+  lastSeenAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  agency        Agency?  @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, ip])
+  @@index([agencyId])
+}
+
+// ─── Default Printer (per-agency preferred printer) ────────────────────────
+
+/// The default printer an agency has chosen for ticket printing.
+/// Kiosks and desktop apps on the same LAN query this to know which printer
+/// to send ticket jobs to. Can point to a network printer (LAN/WIFI) or a
+/// USB printer connected to the desktop machine running BLASTI desktop.
+model DefaultPrinter {
+  id            String   @id @default(cuid())
+  agencyId      String?  @unique
+  /// Display name (e.g. "Canon G2010 series", "HP LaserJet Pro M404")
+  name          String
+  nameAr        String?
+  nameFr        String?
+  /// IP on the LAN (null for USB-only printers)
+  ip            String?
+  /// Port (usually 9100 for raw JetDirect / 631 for IPP)
+  port          Int      @default(9100)
+  /// MAC address (when known)
+  mac           String?
+  /// Inferred vendor (Canon, HP, Brother, Epson, …)
+  manufacturer  String?
+  model         String?
+  /// CUPS queue name (for USB printers detected via lpstat)
+  cupsName      String?
+  /// CUPS URI (e.g. ipp://localhost/printers/Canon_G2010, usb://...)
+  cupsUri       String?
+  /// USB vendor/product IDs (for USB printers)
+  usbVendorId   String?
+  usbProductId  String?
+  /// Connection type: LAN | WIFI | USB
+  connectionType String  @default("LAN")
+  /// Discovery source: cups | usb | ssdp | mdns | http_probe | arp
+  source        String   @default("http_probe")
+  /// Last time this printer was seen on the network
+  lastSeenAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  agency        Agency?  @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+}
+
+// ─── Device Commands (Agency → Device) ──────────────────────────────────────────
+
+/// A command sent from the agency dashboard to a device (config update, reboot, refresh, etc.)
+/// The device polls for pending commands during heartbeat, then marks them as DELIVERED/COMPLETED.
+model DeviceCommand {
+  id          String   @id @default(cuid())
+  deviceId    String                   // FK → AgencyDevice
+  type        String                   // CONFIG_UPDATE, REFRESH, REBOOT, CLEAR_CACHE, PRINT_JOB, UPDATE_FIRMWARE
+  payload     String   @default("{}") // JSON payload specific to command type
+  status      String   @default("PENDING") // PENDING, DELIVERED, COMPLETED, FAILED, EXPIRED
+  createdAt   DateTime @default(now())
+  deliveredAt DateTime?
+  completedAt DateTime?
+  error       String?                  // Error message if command failed
+  ttl         Int      @default(300)  // Time-to-live in seconds (5 min default)
+
+  device      AgencyDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, status])
+  @@index([createdAt])
+}
+
+// ─── App Version Management ────────────────────────────────────────────────────
+
+/// A published version of the BLASTI phone or desktop app, managed by the admin.
+model AppVersion {
+  id              String    @id @default(cuid())
+  /// Target platform: android, ios, electron, windows, mac, linux
+  platform        String
+  /// Semantic version string e.g. "1.2.3"
+  version         String
+  /// Numeric version code for Android (incremental)
+  versionCode     Int       @default(0)
+  /// Human-readable release notes
+  releaseNotes    String    @default("")
+  releaseNotesAr  String?
+  releaseNotesFr  String?
+  /// Whether this update is mandatory (force update)
+  isMandatory     Boolean   @default(false)
+  /// Whether this version is published and available for download
+  isPublished     Boolean   @default(false)
+  /// Whether this is a patch release
+  isPatch         Boolean   @default(false)
+  /// Download URL for the app binary
+  downloadUrl     String    @default("")
+  /// Storage key for the uploaded binary
+  fileStorageKey  String?
+  /// Storage provider for the binary file
+  fileStorageProvider String?
+  /// Original filename of the uploaded binary
+  fileName        String?
+  /// File size in bytes
+  fileSize        Int?
+  /// SHA-256 hash of the file for integrity verification
+  fileHash        String?
+  /// Minimum app version required to update from (for delta updates)
+  minAppVersion   String?
+  /// When this version was published (made available to users)
+  publishedAt     DateTime?
+  /// Number of times this version has been downloaded
+  downloadCount   Int       @default(0)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([platform, version])
+  @@index([platform])
+  @@index([isPublished])
+}
+
+model DelayedJob {
+  id            String     @id @default(cuid())
+  reservationId String
+  userId        String
+  user          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  jobType       String     // "ADVANCE_WARNING"
+  payload       String     // LongText stringified parameters (phone, message, agencyId)
+  executeAt     DateTime
+  status        JobStatus  @default(PENDING)
+  createdAt     DateTime   @default(now())
+
+  @@index([status, executeAt])
+  @@index([userId, reservationId])
+}

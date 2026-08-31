@@ -1,0 +1,82 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env
+.env.local
+.env.production
+.env.*.local
+# Keep .env.example files — they are templates without real secrets
+!.env.example
+!apps/*/.env.example
+
+# vercel
+.vercel
+
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+.claude
+.z-ai-config
+*.log
+dev.log
+dev.out.log
+test
+prompt
+
+server.log
+api.log
+
+# Database files — except the canonical copy at packages/db/data/custom.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.bak
+# Exception: keep packages/ fully visible (including database file for preview)
+!packages/
+!packages/db/
+!packages/db/data/
+!packages/db/data/*.db
+
+# Skills directory
+/skills/
+
+# Sandbox/platform artifacts
+/mini-services/
+/tool-results/
+/download/
+/upload/
+/examples/
+Caddyfile
+ops/.next/

@@ -1,0 +1,51 @@
+{
+  "name": "blasti-multiplatform",
+  "version": "0.2.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c blue,green \"bun run dev:api\" \"bun run dev:web\"",
+    "dev:web": "cd apps/web && bun --bun run node_modules/.bin/next dev -p 3000 -H 0.0.0.0",
+    "dev:api": "DATABASE_URL=file:$PWD/packages/db/data/custom.db bun run --filter @blasti/db db:push && cd apps/api && bun --hot src/index.ts",
+    "dev:all": "concurrently -n api,web -c blue,green \"bun run dev:api\" \"bun run dev:web\"",
+    "build": "bun run --filter @blasti/web build",
+    "build:api": "bun run --filter @blasti/api build",
+    "build:all": "bun run --filter @blasti/web build && bun run --filter @blasti/api build",
+    "build:export": "cd apps/web && NEXT_BUILD_MODE=export next build",
+    "build:desktop": "bun run build:export && bun run --filter @blasti/desktop build",
+    "build:mobile": "bun run build:export && bun run --filter @blasti/mobile cap:sync:android",
+    "lint": "cd apps/web && eslint .",
+    "db:push": "DATABASE_URL=file:$PWD/packages/db/data/custom.db bun run --filter @blasti/db db:push",
+    "db:generate": "bun run --filter @blasti/db db:generate",
+    "db:migrate": "DATABASE_URL=file:$PWD/packages/db/data/custom.db bun run --filter @blasti/db db:migrate",
+    "db:reset": "DATABASE_URL=file:$PWD/packages/db/data/custom.db bun run --filter @blasti/db db:reset",
+    "db:seed": "DATABASE_URL=file:$PWD/packages/db/data/custom.db bun run --filter @blasti/db db:seed",
+    "cap:sync": "bun run --filter @blasti/mobile cap:sync",
+    "electron:dev": "cd apps/desktop && npx electron . --dev",
+    "electron:dev:bun": "bun run --filter @blasti/desktop dev",
+    "electron:dev:full": "concurrently -n api,web,desktop -c blue,green,yellow \"bun run dev:api\" \"bun run dev:web\" \"cd apps/desktop && npx electron . --dev\"",
+    "electron:build": "bun run --filter @blasti/desktop build",
+    "electron:build:win": "bun run --filter @blasti/desktop build:win",
+    "electron:build:mac": "bun run --filter @blasti/desktop build:mac",
+    "electron:build:linux": "bun run --filter @blasti/desktop build:linux"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "concurrently": "^9.1.2",
+    "eslint": "^9",
+    "typescript": "^5"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "engineStrict": true,
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}
