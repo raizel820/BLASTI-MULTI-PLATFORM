@@ -1140,6 +1140,33 @@ async function runDiagnostics(mainWindow, config) {
             sendUpdate(mainWindow, { log: `[SKIP] Branches: no data returned`, logType: 'info' });
           }
 
+          // Import Counters (nested under branches)
+          // Cloud response from /api/agency/counters: { counters: [...] }
+          const countersRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/counters?agencyId=${agencyId}`, cloudAuthToken);
+          const countersList = countersRes?.counters || (Array.isArray(countersRes) ? countersRes : null);
+          if (Array.isArray(countersList) && countersList.length > 0) {
+            const { localDb: importDb } = require('./local-api/lib/db');
+            if (importDb) {
+              for (const counter of countersList) {
+                const { _count, branch, staff, currentReservation, ...counterData } = counter;
+                const upsertPayload = {
+                  ...counterData,
+                  branchId: counter.branchId || counter.branch?.id,
+                  staffId: counter.staffId || counter.staff?.id || null,
+                };
+                await importDb.counter.upsert({
+                  where: { id: counter.id },
+                  update: upsertPayload,
+                  create: upsertPayload,
+                }).catch(e => console.warn('[Import] Counter error:', e.message));
+              }
+              importResults.counters = `${countersList.length} imported`;
+              sendUpdate(mainWindow, { log: `[OK] Counters: ${countersList.length} imported`, logType: 'ok' });
+            }
+          } else {
+            sendUpdate(mainWindow, { log: `[SKIP] Counters: no data returned`, logType: 'info' });
+          }
+
           // Import Staff
           // Cloud response: { staff: [...] }  (NO { success, data } wrapper)
           const staffRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/staff?agencyId=${agencyId}`, cloudAuthToken);
@@ -2104,6 +2131,13 @@ function fetchWithAuth(url, token, timeoutMs = 8000) {
     let body = '';
     request.on('response', (response) => {
       clearTimeout(timer);
+      // Check HTTP status — 2xx only. 401/403 means expired/invalid token.
+      if (response.statusCode >= 400) {
+        console.warn(`[fetchWithAuth] HTTP ${response.statusCode} from ${url}`);
+        response.on('data', () => {}); // drain
+        response.on('end', () => done(null));
+        return;
+      }
       response.on('data', (chunk) => { body += chunk.toString(); });
       response.on('end', () => {
         try {

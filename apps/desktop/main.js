@@ -1081,6 +1081,38 @@ ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
     const syncService = require('./local-api/sync-service');
     syncService.setAuth(token, user);
 
+    // Ensure sync service is started (it may not have been started yet)
+    try {
+      const { localDb } = require('./local-api/lib/db');
+      if (localDb && !syncService.getStatus()?.isStarted) {
+        const isDevMode = process.env.NODE_ENV === 'development' || process.env.ELECTRON_DEV === '1';
+        const syncCloudUrl = isDevMode
+          ? (process.env.BLASTI_API_URL || 'http://localhost:3003')
+          : (process.env.BLASTI_CLOUD_URL || 'https://blasti.vercel.app');
+        syncService.startSync({
+          localDb,
+          cloudBaseUrl: syncCloudUrl,
+          agencyId: user?.agencyId || '',
+        });
+        console.log('[IPC] Sync service started after auth — cloud:', syncCloudUrl);
+      }
+    } catch (startErr) {
+      console.warn('[IPC] Failed to start sync service:', startErr.message);
+    }
+
+    // Trigger immediate initial sync to pull all agency data from cloud
+    try {
+      syncService.initialSync().then((result) => {
+        if (result?.success) {
+          console.log('[IPC] Initial sync after login: pulled', result.pulled, 'pushed', result.pushed);
+        } else {
+          console.warn('[IPC] Initial sync after login failed:', result?.error);
+        }
+      }).catch((err) => {
+        console.warn('[IPC] Initial sync after login error:', err.message);
+      });
+    } catch { /* non-blocking */ }
+
     // Persist auth to file so the loading screen can import agency data on next launch
     try {
       const authPath = path.join(app.getPath('userData'), 'blasti-auth.json');

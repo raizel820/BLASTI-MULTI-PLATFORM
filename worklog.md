@@ -683,3 +683,53 @@ Stage Summary:
 - All mutations log to pending-mutations for cloud sync when online
 - Settings, profile, staff, branches, counters, reviews, working hours, daily chart, subscription plans all work offline
 - 0 lint errors
+
+---
+Task ID: 5
+Agent: Main
+Task: Diagnose and fix offline mode data flow — desktop app fails to read cached/synced data
+
+Work Log:
+- Traced complete data flow: login → setCloudSyncAuth IPC → main.js → sync-service → local DB → LAN API → frontend
+- Read loading-screen.js (2132 lines) — startup import mechanism
+- Read sync-service.js (965 lines) — background sync loop
+- Read main.js (1482 lines) — IPC bridge between renderer and main process
+- Read api-client.ts — LAN failover routing
+- Read cloud sync.ts — /api/sync/pull and /api/sync/push endpoints
+
+ROOT CAUSE FOUND (3 issues):
+
+1. **syncService.startSync() is NEVER called** — The sync service has a `startSync(config)` function that sets `_isStarted=true` and starts a periodic sync loop (every 120s). But main.js NEVER calls it. This means:
+   - `_isStarted` is always false
+   - Post-login `setAuth()` checks `if (_isStarted && token)` → always false → no sync triggered
+   - Periodic sync interval never starts
+   - `triggerSyncNow()` calls `_syncCycle()` but no periodic sync
+   - The ONLY data import is the loading screen's manual fetch+upsert (which was missing Counters)
+
+2. **Loading screen import missing Counters** — The loading screen Step 3 imports Agency, Services, Branches, Staff, User, QueueSettings but NOT Counters. Without counters, branches page shows 0 counters, counter management is broken.
+
+3. **fetchWithAuth doesn't check HTTP status codes** — Uses Electron's `net.request` but never checks `response.statusCode`. If JWT is expired, cloud returns 401 with JSON `{ error: "..." }`. The function resolves with this error object. The subsequent check `if (agencyRes?.id)` fails silently — no import, no error shown.
+
+Fixes applied:
+1. **main.js cloud-sync:set-auth IPC** — After `setAuth()`, now:
+   - Calls `syncService.startSync(config)` with proper `cloudBaseUrl` (localhost:3003 in dev, blasti.vercel.app in prod) and `agencyId`
+   - Calls `syncService.initialSync()` which resets sync cursor to 0 (full pull) and pulls ALL agency data from cloud via `/api/sync/pull` endpoint
+   - This fixes the background sync loop AND triggers a full data pull after every login
+
+2. **loading-screen.js Counters import** — Added after Branches import:
+   - Fetches `/api/agency/counters?agencyId=xxx`
+   - Strips relation fields (`_count`, `branch`, `staff`, `currentReservation`)
+   - Upserts each counter with `branchId` and `staffId`
+   - Logs count: `[OK] Counters: N imported`
+
+3. **loading-screen.js fetchWithAuth** — Added HTTP status code checking:
+   - If `response.statusCode >= 400`, logs a warning and returns null
+   - Drains response body to prevent memory leaks
+   - This ensures expired tokens are detected and imports fail cleanly (falling back to "will import after login" path)
+
+Stage Summary:
+- Root cause identified: sync service was never started, loading screen was missing Counters, fetchWithAuth was silently accepting error responses
+- After fix: on login, the full sync service starts + initialSync pulls ALL agency data (Agency, Service, Branch, Counter, Reservation, Notification, QueueSettings) from cloud
+- Loading screen also enhanced to import Counters on cold start
+- fetchWithAuth now properly detects expired/invalid tokens and fails cleanly
+- The sync service runs every 120s in background, pushing local mutations and pulling cloud changes
