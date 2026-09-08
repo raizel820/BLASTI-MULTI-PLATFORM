@@ -13,7 +13,7 @@
  */
 
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { requireAuth, requireAgencyAccess, authErrorResponse } from '../lib/auth'
 import { createCheckout, getCheckoutStatus } from '../lib/chargily-service'
 import { validateBody } from '../lib/validations'
@@ -47,13 +47,13 @@ app.post('/create-checkout', async (c) => {
     await requireAgencyAccess(c, agencyId)
 
     // Get the agency
-    const agency = await db.agency.findUnique({ where: { id: agencyId } })
+    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
     if (!agency) {
       return c.json({ success: false, error: 'Agency not found' }, 404)
     }
 
     // Get the subscription plan details
-    const subscriptionPlan = await db.subscriptionPlan.findFirst({
+    const subscriptionPlan = await cloudDb.subscriptionPlan.findFirst({
       where: { name: plan, isActive: true },
     })
 
@@ -82,7 +82,7 @@ app.post('/create-checkout', async (c) => {
     })
 
     // Create a pending transaction linked to this checkout
-    const transaction = await db.transaction.create({
+    const transaction = await cloudDb.transaction.create({
       data: {
         agencyId,
         amount,
@@ -97,13 +97,13 @@ app.post('/create-checkout', async (c) => {
     })
 
     // Update agency subscription status to pending
-    await db.agency.update({
+    await cloudDb.agency.update({
       where: { id: agencyId },
       data: { subscriptionStatus: 'PENDING' },
     })
 
     // Create audit log
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: user.id,
         action: 'PAYMENT_CHECKOUT_CREATED',
@@ -148,7 +148,7 @@ app.get('/checkout/:id', async (c) => {
     const checkoutId = c.req.param('id')
 
     // Find the transaction associated with this checkout
-    const transaction = await db.transaction.findFirst({
+    const transaction = await cloudDb.transaction.findFirst({
       where: { providerRef: checkoutId },
     })
 

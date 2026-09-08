@@ -92,7 +92,7 @@ export async function verifySessionToken(token: string, options?: { checkStaleRo
 
     // Phase 2b: Stale JWT escalation check
     if (options?.checkStaleRole && sessionToken.id) {
-      const user = await db.user.findUnique({
+      const user = await cloudDb.user.findUnique({
         where: { id: sessionToken.id },
         select: { lastRoleChangeAt: true, passwordHash: true },
       })
@@ -192,7 +192,7 @@ export class AuthError extends Error {
 
 // ─── Auth Requirements (same API as original auth-guard.ts) ────────────────
 
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 
 /**
  * Requires authentication. Throws AuthError if not logged in.
@@ -299,7 +299,7 @@ export async function requireStaffPermission(
   if (ownership?.isOwner) return user
 
   // Live DB lookup for staff permissions — prevents stale JWT privilege escalation
-  const staffRecord = await db.agencyStaff.findFirst({
+  const staffRecord = await cloudDb.agencyStaff.findFirst({
     where: { userId: user.id, agencyId, isActive: true },
     select: { [permission]: true },
   })
@@ -314,13 +314,13 @@ export async function requireStaffPermission(
 // ─── Agency Ownership Verification ────────────────────────────────────────
 
 export async function getUserAgencyId(userId: string): Promise<string | null> {
-  const ownedAgency = await db.agency.findFirst({
+  const ownedAgency = await cloudDb.agency.findFirst({
     where: { ownerId: userId },
     select: { id: true },
   })
   if (ownedAgency) return ownedAgency.id
 
-  const staffRecord = await db.agencyStaff.findFirst({
+  const staffRecord = await cloudDb.agencyStaff.findFirst({
     where: { userId, isActive: true },
     select: { agencyId: true },
   })
@@ -331,7 +331,7 @@ export async function verifyAgencyOwnership(
   userId: string,
   requestedAgencyId?: string | null
 ): Promise<{ agencyId: string; isOwner: boolean } | null> {
-  const ownedAgency = await db.agency.findFirst({
+  const ownedAgency = await cloudDb.agency.findFirst({
     where: { ownerId: userId },
     select: { id: true },
   })
@@ -340,7 +340,7 @@ export async function verifyAgencyOwnership(
     return { agencyId: ownedAgency.id, isOwner: true }
   }
 
-  const staffRecord = await db.agencyStaff.findFirst({
+  const staffRecord = await cloudDb.agencyStaff.findFirst({
     where: { userId, isActive: true },
     select: { agencyId: true },
   })
@@ -355,12 +355,12 @@ export async function verifyAgencyOwnership(
 export async function resolveUserAgencyId(user: SessionUser): Promise<string | null> {
   if (user.agencyId) return user.agencyId
   if (user.role === 'SUPER_ADMIN') return null
-  const ownedAgency = await db.agency.findFirst({
+  const ownedAgency = await cloudDb.agency.findFirst({
     where: { ownerId: user.id },
     select: { id: true },
   })
   if (ownedAgency) return ownedAgency.id
-  const staffRecord = await db.agencyStaff.findFirst({
+  const staffRecord = await cloudDb.agencyStaff.findFirst({
     where: { userId: user.id, isActive: true },
     select: { agencyId: true },
   })

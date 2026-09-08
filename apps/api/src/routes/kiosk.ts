@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { randomBytes } from 'crypto'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { validateBody, kioskJoinSchema } from '../lib/validations'
 import { emitQueueEvent, emitKioskEvent } from '../lib/realtime-emit'
 import { enforceRateLimit, KIOSK_RATE_LIMIT, KIOSK_READ_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
@@ -23,7 +23,7 @@ app.post('/join', async (c) => {
 
     const { agencyId, serviceId, customerName } = validation.data
 
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId, isActive: true },
       include: { queueSettings: { take: 1, orderBy: { updatedAt: 'desc' } } },
     })
@@ -32,18 +32,18 @@ app.post('/join', async (c) => {
     if (!agency.isQueueOpen) return c.json({ success: false, error: 'Queue is currently closed' }, 400)
     if (agency.queueSettings.length > 0 && agency.queueSettings[0].isPaused) return c.json({ success: false, error: 'Queue is currently paused' }, 400)
 
-    const service = await db.service.findUnique({ where: { id: serviceId, agencyId } })
+    const service = await cloudDb.service.findUnique({ where: { id: serviceId, agencyId } })
     if (!service || !service.isActive) return c.json({ success: false, error: 'Service not found or inactive' }, 404)
 
-    const activeCount = await db.reservation.count({ where: { agencyId, status: { in: ['WAITING', 'CALLED'] } } })
+    const activeCount = await cloudDb.reservation.count({ where: { agencyId, status: { in: ['WAITING', 'CALLED'] } } })
     if (activeCount >= agency.maxActiveReservations) return c.json({ success: false, error: 'Queue is full' }, 400)
 
-    const waitingCount = await db.reservation.count({ where: { agencyId, serviceId, status: 'WAITING' } })
+    const waitingCount = await cloudDb.reservation.count({ where: { agencyId, serviceId, status: 'WAITING' } })
 
     // ── Unified ETA: use the same advanced engine as the mobile app ──
     // Fetch historical data for accurate service time estimation
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompleted = await db.reservation.findMany({
+    const recentCompleted = await cloudDb.reservation.findMany({
       where: {
         agencyId,
         status: 'COMPLETED',
@@ -57,7 +57,7 @@ app.post('/join', async (c) => {
 
     // Count active non-stale counters (phantom counter protection)
     const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
-    const activeCounters = await db.counter.count({
+    const activeCounters = await cloudDb.counter.count({
       where: {
         isActive: true,
         staffId: { not: null },
@@ -78,7 +78,7 @@ app.post('/join', async (c) => {
     // Use the max of the range as the single persisted estimate (matches mobile display)
     const estimatedWait = eta.estimatedMaxMinutes
 
-    const reservation = await db.$transaction(async (tx) => {
+    const reservation = await cloudDb.$transaction(async (tx) => {
       const cnt = await tx.reservation.count({ where: { agencyId, status: { in: ['WAITING', 'CALLED'] } } })
       if (cnt >= agency.maxActiveReservations) throw new Error('FULL')
 
@@ -103,7 +103,7 @@ app.post('/join', async (c) => {
       return res
     })
 
-    const position = await db.reservation.count({
+    const position = await cloudDb.reservation.count({
       where: { agencyId, serviceId, status: 'WAITING', joinedAt: { lte: reservation.joinedAt } },
     })
 
@@ -137,7 +137,7 @@ app.get('/status', async (c) => {
       return c.json({ success: false, error: 'Agency ID is required' }, 400)
     }
 
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId, isActive: true },
       include: {
         services: { where: { isActive: true }, select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
@@ -154,7 +154,7 @@ app.get('/status', async (c) => {
 
     // ── Unified ETA: historical data + phantom counter protection ──
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompletedForAgency = await db.reservation.findMany({
+    const recentCompletedForAgency = await cloudDb.reservation.findMany({
       where: {
         agencyId,
         status: 'COMPLETED',
@@ -167,7 +167,7 @@ app.get('/status', async (c) => {
     const effective = getEffectiveServiceTime(recentCompletedForAgency, agency.averageServiceTime)
 
     const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
-    const totalActiveCounters = await db.counter.count({
+    const totalActiveCounters = await cloudDb.counter.count({
       where: {
         isActive: true,
         staffId: { not: null },
@@ -176,7 +176,7 @@ app.get('/status', async (c) => {
       },
     })
 
-    const servingReservations = await db.reservation.findMany({
+    const servingReservations = await cloudDb.reservation.findMany({
       where: { agencyId, status: { in: ['CALLED', 'SERVING'] } },
       select: { id: true, displayNumber: true, status: true, serviceId: true, calledAt: true, service: { select: { id: true, name: true, prefix: true } }, counter: { select: { id: true, name: true, number: true } } },
       orderBy: { calledAt: 'desc' },
@@ -184,7 +184,7 @@ app.get('/status', async (c) => {
 
     const serviceStats = await Promise.all(
       agency.services.map(async (service) => {
-        const waiting = await db.reservation.count({ where: { agencyId, serviceId: service.id, status: 'WAITING' } })
+        const waiting = await cloudDb.reservation.count({ where: { agencyId, serviceId: service.id, status: 'WAITING' } })
         // Unified ETA per service
         const svcCompleted = recentCompletedForAgency.filter(r => r.serviceId === service.id)
         const svcEffective = getEffectiveServiceTime(svcCompleted, agency.averageServiceTime)
@@ -200,7 +200,7 @@ app.get('/status', async (c) => {
       })
     )
 
-    const recentCalls = await db.reservation.findMany({
+    const recentCalls = await cloudDb.reservation.findMany({
       where: { agencyId, status: { in: ['CALLED', 'SERVING', 'COMPLETED'] }, calledAt: { not: null } },
       select: { id: true, displayNumber: true, status: true, calledAt: true, service: { select: { prefix: true, name: true } } },
       orderBy: { calledAt: 'desc' },
@@ -212,7 +212,7 @@ app.get('/status', async (c) => {
     // Count total served today (COMPLETED reservations with completedAt today)
     const startOfDay = new Date()
     startOfDay.setHours(0, 0, 0, 0)
-    const totalServedToday = await db.reservation.count({
+    const totalServedToday = await cloudDb.reservation.count({
       where: {
         agencyId,
         status: 'COMPLETED',
@@ -264,7 +264,7 @@ app.get('/agency', async (c) => {
       return c.json({ success: false, error: 'Agency code is required' }, 400)
     }
 
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { customCode: code, isActive: true },
       include: {
         services: { where: { isActive: true }, select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
@@ -277,9 +277,9 @@ app.get('/agency', async (c) => {
       return c.json({ success: false, error: 'Agency not found' }, 404)
     }
 
-    const waiting = await db.reservation.count({ where: { agencyId: agency.id, status: 'WAITING' } })
+    const waiting = await cloudDb.reservation.count({ where: { agencyId: agency.id, status: 'WAITING' } })
 
-    const currentServing = await db.reservation.findFirst({
+    const currentServing = await cloudDb.reservation.findFirst({
       where: { agencyId: agency.id, status: { in: ['CALLED', 'SERVING'] } },
       select: { displayNumber: true, service: { select: { prefix: true } } },
       orderBy: { calledAt: 'desc' },
@@ -287,7 +287,7 @@ app.get('/agency', async (c) => {
 
     // Unified ETA from advanced engine
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompleted = await db.reservation.findMany({
+    const recentCompleted = await cloudDb.reservation.findMany({
       where: {
         agencyId: agency.id,
         status: 'COMPLETED',
@@ -299,7 +299,7 @@ app.get('/agency', async (c) => {
     })
     const effective = getEffectiveServiceTime(recentCompleted, agency.averageServiceTime)
     const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
-    const activeCounters = await db.counter.count({
+    const activeCounters = await cloudDb.counter.count({
       where: {
         isActive: true,
         staffId: { not: null },

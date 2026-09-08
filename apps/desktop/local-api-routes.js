@@ -1,5 +1,26 @@
 /**
- * BLASTI Desktop — Local API Routes
+ * @deprecated This file is DEPRECATED and should not be used.
+ * The active sync engine is at apps/desktop/local-api/sync-service.js
+ * The active database layer is at apps/desktop/local-api/lib/db.js
+ * The active API routes are at apps/desktop/local-api/index.js
+ *
+ * The Hono-based local API (./local-api/index.js on port 3080) now handles
+ * all LAN kiosk/tablet routes using the SINGLE Prisma SQLite database
+ * (via ./local-api/lib/db.js → ~/.blasti/local/local.db).
+ *
+ * This file used the separate better-sqlite3 database (blasti-lan-sync.db)
+ * via local-db.js, creating a dual-database split-brain problem.
+ *
+ * Migration path:
+ *   - Kiosk LAN sync → Hono local API (./local-api/index.js)
+ *   - Cloud sync → ./local-api/sync-service.js
+ *   - Direct DB access → Prisma (./local-api/lib/db.js → localDb)
+ *
+ * This file is kept for reference only and will be removed in a future release.
+ *
+ * ──────────────────────────────────────────────────────────────────────────────
+ *
+ * BLASTI Desktop — Local API Routes (LEGACY)
  *
  * Provides 24 Express routes for the desktop's local API server (port 3080).
  * When the internet is off, kiosks and phones on the LAN use these routes

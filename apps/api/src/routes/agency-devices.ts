@@ -1,6 +1,6 @@
 import os from 'node:os'
 import { Hono, type Context } from 'hono'
-import { db, dbRaw } from '@blasti/db'
+import { cloudDb, cloudDbRaw } from '@blasti/cloud-db'
 import { requireAuth, authErrorResponse, AuthError } from '../lib/auth'
 import { z } from 'zod'
 import crypto from 'crypto'
@@ -159,7 +159,7 @@ async function requireDeviceAuth(c: Context) {
   const authHeader = c.req.header('Authorization')
   if (!authHeader?.startsWith('Bearer ')) return null
   const token = authHeader.slice(7)
-  const device = await db.agencyDevice.findUnique({
+  const device = await cloudDb.agencyDevice.findUnique({
     where: { deviceToken: token },
     include: DEVICE_INCLUDE,
   })
@@ -175,12 +175,12 @@ async function runHeartbeatWatchdog() {
   const graceThreshold = new Date(Date.now() - 120_000)
 
   // Mark stale ONLINE devices as OFFLINE (respecting grace period)
-  const result = await db.agencyDevice.updateMany({
+  const result = await cloudDb.agencyDevice.updateMany({
     where: { lastHeartbeatAt: { lt: staleThreshold }, status: 'ONLINE', createdAt: { lt: graceThreshold } },
     data: { status: 'OFFLINE', statusChangedAt: new Date() },
   })
   if (result.count > 0) {
-    const offlineDevices = await db.agencyDevice.findMany({
+    const offlineDevices = await cloudDb.agencyDevice.findMany({
       where: { lastHeartbeatAt: { lt: staleThreshold }, status: 'OFFLINE' },
       select: { id: true, agencyId: true, name: true, type: true },
     })
@@ -190,7 +190,7 @@ async function runHeartbeatWatchdog() {
   }
 
   // Mark stale PAIRING devices (unpaired) as OFFLINE so they disappear from /unpaired (respecting grace period)
-  await db.agencyDevice.updateMany({
+  await cloudDb.agencyDevice.updateMany({
     where: { lastHeartbeatAt: { lt: staleThreshold }, status: 'PAIRING', agencyId: null, createdAt: { lt: graceThreshold } },
     data: { status: 'OFFLINE', statusChangedAt: new Date() },
   })
@@ -200,7 +200,7 @@ async function runHeartbeatWatchdog() {
 
 async function expireOldDeliveredCommands(deviceId: string) {
   const fiveMinAgo = new Date(Date.now() - 5 * 60_000)
-  await db.deviceCommand.updateMany({
+  await cloudDb.deviceCommand.updateMany({
     where: {
       deviceId,
       status: 'DELIVERED',
@@ -249,12 +249,12 @@ app.post('/public/register', async (c) => {
     const { agencyCode, deviceName, deviceType, connectionType, deviceFingerprint } = validation.data
 
     // 1. Look up agency by customCode first, then fallback to ID
-    let agency = await db.agency.findUnique({
+    let agency = await cloudDb.agency.findUnique({
       where: { customCode: agencyCode, isActive: true },
     })
     // Fallback: agencyCode might be an agency ID (e.g. TV board loaded via ?agencyId=)
     if (!agency) {
-      agency = await db.agency.findUnique({
+      agency = await cloudDb.agency.findUnique({
         where: { id: agencyCode, isActive: true },
       })
     }
@@ -268,7 +268,7 @@ app.post('/public/register', async (c) => {
     const effectiveName = deviceName || 'Auto-Kiosk'
 
     // 2. Check if an AgencyDevice already exists (only match fingerprint when provided)
-    const result = await db.$transaction(async (tx) => {
+    const result = await cloudDb.$transaction(async (tx) => {
       const existingDevice = deviceFingerprint
         ? await tx.agencyDevice.findFirst({
             where: { agencyId: agency.id, type: effectiveDeviceType, deviceFingerprint },
@@ -385,7 +385,7 @@ app.post('/public/join-queue', async (c) => {
       return c.json({ success: false, error: 'Device not authorized for this agency' }, 403)
     }
 
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId, isActive: true },
       include: { queueSettings: { take: 1, orderBy: { updatedAt: 'desc' } } },
     })
@@ -394,17 +394,17 @@ app.post('/public/join-queue', async (c) => {
     if (!agency.isQueueOpen) return c.json({ success: false, error: 'Queue is currently closed' }, 400)
     if (agency.queueSettings.length > 0 && agency.queueSettings[0].isPaused) return c.json({ success: false, error: 'Queue is currently paused' }, 400)
 
-    const service = await db.service.findUnique({ where: { id: serviceId, agencyId } })
+    const service = await cloudDb.service.findUnique({ where: { id: serviceId, agencyId } })
     if (!service || !service.isActive) return c.json({ success: false, error: 'Service not found or inactive' }, 404)
 
-    const activeCount = await db.reservation.count({ where: { agencyId, status: { in: ['WAITING', 'CALLED'] } } })
+    const activeCount = await cloudDb.reservation.count({ where: { agencyId, status: { in: ['WAITING', 'CALLED'] } } })
     if (activeCount >= agency.maxActiveReservations) return c.json({ success: false, error: 'Queue is full' }, 400)
 
-    const waitingCount = await db.reservation.count({ where: { agencyId, serviceId, status: 'WAITING' } })
+    const waitingCount = await cloudDb.reservation.count({ where: { agencyId, serviceId, status: 'WAITING' } })
 
     // ── Unified ETA ──
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompleted = await db.reservation.findMany({
+    const recentCompleted = await cloudDb.reservation.findMany({
       where: {
         agencyId,
         status: 'COMPLETED',
@@ -417,7 +417,7 @@ app.post('/public/join-queue', async (c) => {
     const effective = getEffectiveServiceTime(recentCompleted, agency.averageServiceTime)
 
     const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
-    const activeCounters = await db.counter.count({
+    const activeCounters = await cloudDb.counter.count({
       where: {
         isActive: true,
         staffId: { not: null },
@@ -437,7 +437,7 @@ app.post('/public/join-queue', async (c) => {
     })
     const estimatedWait = eta.estimatedMaxMinutes
 
-    const reservation = await db.$transaction(async (tx) => {
+    const reservation = await cloudDb.$transaction(async (tx) => {
       const cnt = await tx.reservation.count({ where: { agencyId, status: { in: ['WAITING', 'CALLED'] } } })
       if (cnt >= agency.maxActiveReservations) throw new Error('FULL')
 
@@ -474,12 +474,12 @@ app.post('/public/join-queue', async (c) => {
       const payload = JSON.stringify({ reservationId: reservation.id, agencyId, customerId: customerName?.trim() || 'Anonymous', exp })
       const sig = crypto.createHmac('sha256', QR_SECRET).update(payload).digest('hex')
       importToken = Buffer.from(payload).toString('base64url') + '.' + sig
-      await db.reservation.update({ where: { id: reservation.id }, data: { importToken } })
+      await cloudDb.reservation.update({ where: { id: reservation.id }, data: { importToken } })
     } catch (tokenErr) {
       console.warn('[DEVICE/PUBLIC/JOIN] Failed to generate import token:', tokenErr)
     }
 
-    const position = await db.reservation.count({
+    const position = await cloudDb.reservation.count({
       where: { agencyId, serviceId, status: 'WAITING', joinedAt: { lte: reservation.joinedAt } },
     })
 
@@ -504,7 +504,7 @@ app.post('/public/join-queue', async (c) => {
     let branchNameAr: string | null = null
     let branchNameFr: string | null = null
     if (device && device.branchId) {
-      const branch = await db.branch.findUnique({
+      const branch = await cloudDb.branch.findUnique({
         where: { id: device.branchId },
         select: { name: true, nameAr: true, nameFr: true },
       })
@@ -515,7 +515,7 @@ app.post('/public/join-queue', async (c) => {
       }
     } else if (device && device.agencyId) {
       // Try to get default branch
-      const defaultBranch = await db.branch.findFirst({
+      const defaultBranch = await cloudDb.branch.findFirst({
         where: { agencyId: device.agencyId, isActive: true },
         select: { name: true, nameAr: true, nameFr: true },
         orderBy: { createdAt: 'asc' },
@@ -585,7 +585,7 @@ app.get('/public/queue-status', async (c) => {
       return c.json({ success: false, error: 'Agency ID is required' }, 400)
     }
 
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId, isActive: true },
       include: {
         services: { where: { isActive: true }, select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
@@ -601,7 +601,7 @@ app.get('/public/queue-status', async (c) => {
     const isPaused = agency.queueSettings.length > 0 ? agency.queueSettings[0].isPaused : false
 
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompletedForAgency = await db.reservation.findMany({
+    const recentCompletedForAgency = await cloudDb.reservation.findMany({
       where: {
         agencyId,
         status: 'COMPLETED',
@@ -614,7 +614,7 @@ app.get('/public/queue-status', async (c) => {
     const effective = getEffectiveServiceTime(recentCompletedForAgency, agency.averageServiceTime)
 
     const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
-    const totalActiveCounters = await db.counter.count({
+    const totalActiveCounters = await cloudDb.counter.count({
       where: {
         isActive: true,
         staffId: { not: null },
@@ -623,7 +623,7 @@ app.get('/public/queue-status', async (c) => {
       },
     })
 
-    const servingReservations = await db.reservation.findMany({
+    const servingReservations = await cloudDb.reservation.findMany({
       where: { agencyId, status: { in: ['CALLED', 'SERVING'] } },
       select: { id: true, displayNumber: true, status: true, serviceId: true, calledAt: true, service: { select: { id: true, name: true, prefix: true } }, counter: { select: { id: true, name: true, number: true } } },
       orderBy: { calledAt: 'desc' },
@@ -631,7 +631,7 @@ app.get('/public/queue-status', async (c) => {
 
     const serviceStats = await Promise.all(
       agency.services.map(async (service) => {
-        const waiting = await db.reservation.count({ where: { agencyId, serviceId: service.id, status: 'WAITING' } })
+        const waiting = await cloudDb.reservation.count({ where: { agencyId, serviceId: service.id, status: 'WAITING' } })
         const svcCompleted = recentCompletedForAgency.filter(r => r.serviceId === service.id)
         const svcEffective = getEffectiveServiceTime(svcCompleted, agency.averageServiceTime)
         const svcEta = calculateETA({
@@ -646,7 +646,7 @@ app.get('/public/queue-status', async (c) => {
       })
     )
 
-    const recentCalls = await db.reservation.findMany({
+    const recentCalls = await cloudDb.reservation.findMany({
       where: { agencyId, status: { in: ['CALLED', 'SERVING', 'COMPLETED'] }, calledAt: { not: null } },
       select: { id: true, displayNumber: true, status: true, calledAt: true, service: { select: { prefix: true, name: true } } },
       orderBy: { calledAt: 'desc' },
@@ -707,7 +707,7 @@ app.get('/public/agency', async (c) => {
       return c.json({ success: false, error: 'Agency code is required' }, 400)
     }
 
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { customCode: code, isActive: true },
       include: {
         services: { where: { isActive: true }, select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
@@ -720,23 +720,23 @@ app.get('/public/agency', async (c) => {
       return c.json({ success: false, error: 'Agency not found' }, 404)
     }
 
-    const waiting = await db.reservation.count({ where: { agencyId: agency.id, status: 'WAITING' } })
+    const waiting = await cloudDb.reservation.count({ where: { agencyId: agency.id, status: 'WAITING' } })
 
-    const currentServing = await db.reservation.findFirst({
+    const currentServing = await cloudDb.reservation.findFirst({
       where: { agencyId: agency.id, status: { in: ['CALLED', 'SERVING'] } },
       select: { displayNumber: true, service: { select: { prefix: true } } },
       orderBy: { calledAt: 'desc' },
     })
 
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompleted = await db.reservation.findMany({
+    const recentCompleted = await cloudDb.reservation.findMany({
       where: { agencyId: agency.id, status: 'COMPLETED', calledAt: { not: null }, completedAt: { gte: sevenDaysAgo } },
       select: { calledAt: true, completedAt: true, joinedAt: true },
       take: 200,
     })
     const effective = getEffectiveServiceTime(recentCompleted, agency.averageServiceTime)
     const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
-    const activeCounters = await db.counter.count({
+    const activeCounters = await cloudDb.counter.count({
       where: { isActive: true, staffId: { not: null }, branch: { agencyId: agency.id, isActive: true }, updatedAt: { gte: fortyFiveMinsAgo } },
     })
     const isPausedAgency = agency.queueSettings.length > 0 ? agency.queueSettings[0].isPaused : false
@@ -803,7 +803,7 @@ app.post('/public/kiosk-auth', async (c) => {
     const { pairingCode, deviceToken } = validation.data
 
     // Look up device by pairing code (case-insensitive)
-    const foundDevice = await db.agencyDevice.findUnique({
+    const foundDevice = await cloudDb.agencyDevice.findUnique({
       where: { pairingCode: pairingCode.toUpperCase() },
       include: {
         branch: { select: { id: true, name: true, nameAr: true, nameFr: true } },
@@ -838,7 +838,7 @@ app.post('/public/kiosk-auth', async (c) => {
     }
 
     // Mark device as ONLINE
-    await db.agencyDevice.update({
+    await cloudDb.agencyDevice.update({
       where: { id: foundDevice.id },
       data: {
         status: 'ONLINE',
@@ -913,7 +913,7 @@ app.post('/public/discover-register', async (c) => {
     let existingDevice: any = null
     if (deviceFingerprint) {
       try {
-        existingDevice = await db.agencyDevice.findFirst({
+        existingDevice = await cloudDb.agencyDevice.findFirst({
           where: { deviceFingerprint, status: 'PAIRING' },
         })
       } catch (e) {
@@ -926,7 +926,7 @@ app.post('/public/discover-register', async (c) => {
       const token = existingDevice.deviceToken
       if (!token) {
         const newToken = crypto.randomBytes(32).toString('hex')
-        await db.agencyDevice.update({
+        await cloudDb.agencyDevice.update({
           where: { id: existingDevice.id },
           data: { deviceToken: newToken, connectionType: connectionType || 'LAN', name: effectiveName, type: deviceType },
         })
@@ -941,7 +941,7 @@ app.post('/public/discover-register', async (c) => {
     const deviceToken = crypto.randomBytes(32).toString('hex')
     let newDevice: any = null
     try {
-      newDevice = await db.agencyDevice.create({
+      newDevice = await cloudDb.agencyDevice.create({
         data: {
           name: effectiveName,
           type: deviceType,
@@ -999,7 +999,7 @@ app.get('/public/device-status', async (c) => {
     }
 
     // Get pending PAIRING_REQUEST commands
-    const pendingPairingRequests = await db.deviceCommand.findMany({
+    const pendingPairingRequests = await cloudDb.deviceCommand.findMany({
       where: { deviceId: device.id, type: 'PAIRING_REQUEST', status: 'PENDING' },
       orderBy: { createdAt: 'desc' },
       take: 5,
@@ -1023,16 +1023,16 @@ app.get('/public/device-status', async (c) => {
     // If device is paired (has agency), fetch full agency + services data
     let agencyData: Record<string, unknown> | null = null
     if (device.agencyId) {
-      const agency = await db.agency.findUnique({
+      const agency = await cloudDb.agency.findUnique({
         where: { id: device.agencyId, isActive: true },
         select: { id: true, name: true, nameAr: true, nameFr: true, customCode: true, isQueueOpen: true, logoUrl: true, category: true, workingHoursStart: true, workingHoursEnd: true },
       })
       if (agency) {
-        const services = await db.service.findMany({
+        const services = await cloudDb.service.findMany({
           where: { agencyId: device.agencyId, isActive: true },
           select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
         })
-        const queueSettings = await db.queueSettings.findFirst({
+        const queueSettings = await cloudDb.queueSettings.findFirst({
           where: { agencyId: device.agencyId },
           select: { isPaused: true, currentServingNumber: true, lastIssuedNumber: true },
           orderBy: { updatedAt: 'desc' },
@@ -1117,7 +1117,7 @@ app.post('/device/heartbeat', async (c) => {
       if (data.ipAddress) updateData.ipAddress = data.ipAddress
     }
 
-    const updated = await db.agencyDevice.update({
+    const updated = await cloudDb.agencyDevice.update({
       where: { id: device.id },
       data: updateData,
       select: { id: true, status: true, lastHeartbeatAt: true, totalUptimeSec: true, appVersion: true, ipAddress: true },
@@ -1127,7 +1127,7 @@ app.post('/device/heartbeat', async (c) => {
     await expireOldDeliveredCommands(device.id)
 
     // ── Fetch pending commands (H4: filter by TTL) ──
-    const pendingCommands = await db.deviceCommand.findMany({
+    const pendingCommands = await cloudDb.deviceCommand.findMany({
       where: { deviceId: device.id, status: 'PENDING' },
       orderBy: { createdAt: 'asc' },
     })
@@ -1144,7 +1144,7 @@ app.post('/device/heartbeat', async (c) => {
       return cmdAge >= (cmd.ttl || 300) * 1000
     }).map(cmd => cmd.id)
     if (expiredIds.length > 0) {
-      await db.deviceCommand.updateMany({ where: { id: { in: expiredIds } }, data: { status: 'EXPIRED' } })
+      await cloudDb.deviceCommand.updateMany({ where: { id: { in: expiredIds } }, data: { status: 'EXPIRED' } })
     }
 
     // ── Run heartbeat watchdog (L1: throttle to at most once per 30s) ──
@@ -1195,7 +1195,7 @@ app.post('/device/pair', async (c) => {
     const { pairingCode } = validation.data
 
     // Find the agency device record that has this pairing code
-    const targetDevice = await db.agencyDevice.findUnique({
+    const targetDevice = await cloudDb.agencyDevice.findUnique({
       where: { pairingCode },
       include: {
         agency: { select: { id: true, name: true, nameAr: true, nameFr: true, logoUrl: true, category: true } },
@@ -1219,8 +1219,8 @@ app.post('/device/pair', async (c) => {
     // Link the calling device: transfer the pairing target's agency/branch to the
     // authenticated device, then clear the pairing code from the target.
     const now = new Date()
-    const [updatedDevice] = await db.$transaction([
-      db.agencyDevice.update({
+    const [updatedDevice] = await cloudDb.$transaction([
+      cloudDb.agencyDevice.update({
         where: { id: device.id },
         data: {
           agencyId: targetDevice.agencyId,
@@ -1238,7 +1238,7 @@ app.post('/device/pair', async (c) => {
         select: DEVICE_SELECT,
       }),
       // Remove the pairing code from the original device so it can't be reused
-      db.agencyDevice.update({
+      cloudDb.agencyDevice.update({
         where: { id: targetDevice.id },
         data: { pairingCode: null },
       }),
@@ -1268,7 +1268,7 @@ app.post('/device/command/:commandId/ack', async (c) => {
     const commandId = c.req.param('commandId')
 
     // Verify the command belongs to this device
-    const command = await db.deviceCommand.findFirst({
+    const command = await cloudDb.deviceCommand.findFirst({
       where: { id: commandId, deviceId: device.id },
     })
     if (!command) {
@@ -1297,7 +1297,7 @@ app.post('/device/command/:commandId/ack', async (c) => {
     if (status === 'COMPLETED') updateData.completedAt = new Date()
     if (status === 'FAILED' && error) updateData.error = error
 
-    const updated = await db.deviceCommand.update({
+    const updated = await cloudDb.deviceCommand.update({
       where: { id: commandId },
       data: updateData,
     })
@@ -1319,7 +1319,7 @@ app.get('/device/config', async (c) => {
     }
 
     // Re-fetch with full relations (avoid relying on cached select)
-    const fullDevice = await db.agencyDevice.findUnique({
+    const fullDevice = await cloudDb.agencyDevice.findUnique({
       where: { id: device.id },
       select: {
         id: true,
@@ -1396,7 +1396,7 @@ app.post('/device/accept-pairing', async (c) => {
     }
 
     // Verify the agency exists
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId, isActive: true },
       select: { id: true, name: true, nameAr: true, nameFr: true, customCode: true, isQueueOpen: true, logoUrl: true, category: true, workingHoursStart: true, workingHoursEnd: true },
     })
@@ -1406,7 +1406,7 @@ app.post('/device/accept-pairing', async (c) => {
 
     // Update device to belong to this agency
     const now = new Date()
-    const updatedDevice = await db.agencyDevice.update({
+    const updatedDevice = await cloudDb.agencyDevice.update({
       where: { id: device.id },
       data: {
         agencyId,
@@ -1421,26 +1421,26 @@ app.post('/device/accept-pairing', async (c) => {
 
     // Mark the pairing request command as COMPLETED
     if (commandId) {
-      await db.deviceCommand.updateMany({
+      await cloudDb.deviceCommand.updateMany({
         where: { id: commandId, deviceId: device.id, type: 'PAIRING_REQUEST' },
         data: { status: 'COMPLETED', completedAt: now },
       })
     }
 
     // Mark ALL other pending pairing requests as FAILED (only one can be accepted)
-    await db.deviceCommand.updateMany({
+    await cloudDb.deviceCommand.updateMany({
       where: { deviceId: device.id, type: 'PAIRING_REQUEST', status: 'PENDING', id: { not: commandId || '___none___' } },
       data: { status: 'FAILED', error: 'Rejected — another pairing was accepted' },
     })
 
     // Fetch services for the kiosk
-    const services = await db.service.findMany({
+    const services = await cloudDb.service.findMany({
       where: { agencyId, isActive: true },
       select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
     })
 
     // Get queue settings
-    const queueSettings = await db.queueSettings.findFirst({
+    const queueSettings = await cloudDb.queueSettings.findFirst({
       where: { agencyId },
       select: { isPaused: true, currentServingNumber: true, lastIssuedNumber: true },
       orderBy: { updatedAt: 'desc' },
@@ -1483,7 +1483,7 @@ app.post('/device/reject-pairing', async (c) => {
       return c.json({ success: false, error: 'commandId is required' }, 400)
     }
 
-    const result = await db.deviceCommand.updateMany({
+    const result = await cloudDb.deviceCommand.updateMany({
       where: { id: commandId, deviceId: device.id, type: 'PAIRING_REQUEST', status: 'PENDING' },
       data: { status: 'FAILED', error: 'Rejected by kiosk operator' },
     })
@@ -1528,7 +1528,7 @@ app.post('/device/sync', async (c) => {
     const todayStart = new Date()
     todayStart.setHours(0, 0, 0, 0)
 
-    const waitingCount = await db.reservation.count({
+    const waitingCount = await cloudDb.reservation.count({
       where: {
         agencyId: device.agencyId,
         branchId: device.branchId ?? null,
@@ -1536,7 +1536,7 @@ app.post('/device/sync', async (c) => {
       },
     })
 
-    const servedTodayCount = await db.reservation.count({
+    const servedTodayCount = await cloudDb.reservation.count({
       where: {
         agencyId: device.agencyId,
         branchId: device.branchId ?? null,
@@ -1546,7 +1546,7 @@ app.post('/device/sync', async (c) => {
     })
 
     // Get the latest config version (device updatedAt serves as config version)
-    const latestDevice = await db.agencyDevice.findUnique({
+    const latestDevice = await cloudDb.agencyDevice.findUnique({
       where: { id: device.id },
       select: { updatedAt: true, status: true },
     })
@@ -1583,7 +1583,7 @@ app.get('/unpaired', async (c) => {
 
     const ninetySecAgo = new Date(Date.now() - 90 * 1000)
 
-    const devices = await db.agencyDevice.findMany({
+    const devices = await cloudDb.agencyDevice.findMany({
       where: {
         agencyId: null,
         status: 'PAIRING',
@@ -1619,7 +1619,7 @@ app.post('/:id/pairing-request', async (c) => {
     const deviceId = c.req.param('id')
 
     // Verify device exists and is unpaired
-    const device = await db.agencyDevice.findUnique({
+    const device = await cloudDb.agencyDevice.findUnique({
       where: { id: deviceId },
       select: { id: true, name: true, type: true, status: true, agencyId: true, lastHeartbeatAt: true },
     })
@@ -1643,7 +1643,7 @@ app.post('/:id/pairing-request', async (c) => {
     }
 
     // Get agency info for the pairing request payload
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: user.agencyId },
       select: { id: true, name: true, nameAr: true, nameFr: true },
     })
@@ -1653,7 +1653,7 @@ app.post('/:id/pairing-request', async (c) => {
     }
 
     // Create a PAIRING_REQUEST command for the device
-    const command = await db.deviceCommand.create({
+    const command = await cloudDb.deviceCommand.create({
       data: {
         deviceId,
         type: 'PAIRING_REQUEST',
@@ -1706,7 +1706,7 @@ app.get('/', async (c) => {
     if (status) where.status = status
     if (type) where.type = type
 
-    const devices = await db.agencyDevice.findMany({
+    const devices = await cloudDb.agencyDevice.findMany({
       where,
       select: DEVICE_SELECT,
       orderBy: { createdAt: 'desc' },
@@ -1747,7 +1747,7 @@ app.post('/', async (c) => {
     let pairingCode = generatePairingCode()
     let attempts = 0
     while (attempts < 10) {
-      const existing = await db.agencyDevice.findUnique({ where: { pairingCode } })
+      const existing = await cloudDb.agencyDevice.findUnique({ where: { pairingCode } })
       if (!existing) break
       pairingCode = generatePairingCode()
       attempts++
@@ -1756,7 +1756,7 @@ app.post('/', async (c) => {
     // Generate device token (returned only this one time)
     const deviceToken = crypto.randomBytes(32).toString('hex')
 
-    const device = await db.agencyDevice.create({
+    const device = await cloudDb.agencyDevice.create({
       data: {
         agencyId: user.agencyId,
         name: data.name,
@@ -1825,7 +1825,7 @@ app.post('/auto-register', async (c) => {
 
     const { deviceId, name } = validation.data
 
-    const device = await db.agencyDevice.findUnique({
+    const device = await cloudDb.agencyDevice.findUnique({
       where: { id: deviceId },
     })
 
@@ -1837,7 +1837,7 @@ app.post('/auto-register', async (c) => {
       return c.json({ success: false, error: `Device is not in PAIRING status (current: ${device.status})` }, 409)
     }
 
-    const updated = await db.agencyDevice.update({
+    const updated = await cloudDb.agencyDevice.update({
       where: { id: deviceId },
       data: {
         agencyId: user.agencyId,
@@ -1881,7 +1881,7 @@ app.post('/test-printer', async (c) => {
 
     const { deviceId } = validation.data
 
-    const device = await db.agencyDevice.findFirst({
+    const device = await cloudDb.agencyDevice.findFirst({
       where: { id: deviceId, agencyId: user.agencyId },
       select: { id: true, name: true, type: true, ipAddress: true, port: true },
     })
@@ -1939,7 +1939,7 @@ app.get('/:id', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
 
-    const device = await db.agencyDevice.findFirst({
+    const device = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
       select: DEVICE_SELECT,
     })
@@ -1980,7 +1980,7 @@ app.patch('/:id', async (c) => {
     const data = validation.data
 
     // Verify ownership
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
     })
     if (!existing) {
@@ -2008,7 +2008,7 @@ app.patch('/:id', async (c) => {
     if (data.displaySettings !== undefined) updateData.displaySettings = JSON.stringify(data.displaySettings)
     if (data.printerConfig !== undefined) updateData.printerConfig = JSON.stringify(data.printerConfig)
 
-    const device = await db.agencyDevice.update({
+    const device = await cloudDb.agencyDevice.update({
       where: { id: c.req.param('id') },
       data: updateData,
       select: DEVICE_SELECT,
@@ -2018,7 +2018,7 @@ app.patch('/:id', async (c) => {
     // changed and the device is currently ONLINE
     const configChanged = data.displaySettings !== undefined || data.printerConfig !== undefined
     if (configChanged && existing.status === 'ONLINE') {
-      await db.deviceCommand.create({
+      await cloudDb.deviceCommand.create({
         data: {
           deviceId: existing.id,
           type: 'CONFIG_UPDATE',
@@ -2055,14 +2055,14 @@ app.delete('/:id', async (c) => {
       whereClause.agencyId = user.agencyId
     }
 
-    const existing = await db.agencyDevice.findFirst({ where: whereClause })
+    const existing = await cloudDb.agencyDevice.findFirst({ where: whereClause })
     if (!existing) {
       return c.json({ success: false, error: 'Device not found' }, 404)
     }
 
     // Delete related commands first, then delete the device
-    await dbRaw.deviceCommand.deleteMany({ where: { deviceId: c.req.param('id') } })
-    await dbRaw.agencyDevice.delete({ where: { id: c.req.param('id') } })
+    await cloudDbRaw.deviceCommand.deleteMany({ where: { deviceId: c.req.param('id') } })
+    await cloudDbRaw.agencyDevice.delete({ where: { id: c.req.param('id') } })
 
     // Emit realtime event
     emitAgencyDeviceEvent('agency-device:disconnected', existing.agencyId || 'system', { deviceId: existing.id, deviceName: existing.name, deviceType: existing.type })
@@ -2086,7 +2086,7 @@ app.post('/:id/pair', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
 
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
     })
     if (!existing) {
@@ -2097,7 +2097,7 @@ app.post('/:id/pair', async (c) => {
     let pairingCode = generatePairingCode()
     let attempts = 0
     while (attempts < 10) {
-      const dupe = await db.agencyDevice.findUnique({ where: { pairingCode } })
+      const dupe = await cloudDb.agencyDevice.findUnique({ where: { pairingCode } })
       if (!dupe) break
       pairingCode = generatePairingCode()
       attempts++
@@ -2106,7 +2106,7 @@ app.post('/:id/pair', async (c) => {
     // Security measure: regenerate deviceToken on pairing initiation
     const deviceToken = crypto.randomBytes(32).toString('hex')
 
-    const device = await db.agencyDevice.update({
+    const device = await cloudDb.agencyDevice.update({
       where: { id: c.req.param('id') },
       data: {
         pairingCode,
@@ -2133,14 +2133,14 @@ app.post('/:id/connect', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
 
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
     })
     if (!existing) {
       return c.json({ success: false, error: 'Device not found' }, 404)
     }
 
-    const device = await db.agencyDevice.update({
+    const device = await cloudDb.agencyDevice.update({
       where: { id: c.req.param('id') },
       data: {
         status: 'ONLINE',
@@ -2170,14 +2170,14 @@ app.post('/:id/disconnect', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
 
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
     })
     if (!existing) {
       return c.json({ success: false, error: 'Device not found' }, 404)
     }
 
-    const device = await db.agencyDevice.update({
+    const device = await cloudDb.agencyDevice.update({
       where: { id: c.req.param('id') },
       data: {
         status: 'OFFLINE',
@@ -2207,7 +2207,7 @@ app.post('/:id/unpair', async (c) => {
     }
 
     const deviceId = c.req.param('id')
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: deviceId, agencyId: user.agencyId },
       include: { branch: { select: { id: true, name: true, nameAr: true, nameFr: true } } },
     })
@@ -2222,7 +2222,7 @@ app.post('/:id/unpair', async (c) => {
     const now = new Date()
 
     // Create FORCE_DISCONNECT command so the kiosk gets notified immediately via heartbeat
-    await db.deviceCommand.create({
+    await cloudDb.deviceCommand.create({
       data: {
         deviceId: existing.id,
         type: 'FORCE_DISCONNECT',
@@ -2233,7 +2233,7 @@ app.post('/:id/unpair', async (c) => {
     })
 
     // Update device: remove agency, invalidate token, set offline
-    const device = await db.agencyDevice.update({
+    const device = await cloudDb.agencyDevice.update({
       where: { id: deviceId },
       data: {
         agencyId: null,
@@ -2272,14 +2272,14 @@ app.post('/:id/reboot', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
 
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
     })
     if (!existing) {
       return c.json({ success: false, error: 'Device not found' }, 404)
     }
 
-    const command = await db.deviceCommand.create({
+    const command = await cloudDb.deviceCommand.create({
       data: {
         deviceId: existing.id,
         type: 'REBOOT',
@@ -2307,14 +2307,14 @@ app.post('/:id/refresh', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
 
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
     })
     if (!existing) {
       return c.json({ success: false, error: 'Device not found' }, 404)
     }
 
-    const command = await db.deviceCommand.create({
+    const command = await cloudDb.deviceCommand.create({
       data: {
         deviceId: existing.id,
         type: 'REFRESH',
@@ -2342,7 +2342,7 @@ app.post('/:id/command', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
 
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
     })
     if (!existing) {
@@ -2357,7 +2357,7 @@ app.post('/:id/command', async (c) => {
 
     const { type, payload, ttl } = validation.data
 
-    const command = await db.deviceCommand.create({
+    const command = await cloudDb.deviceCommand.create({
       data: {
         deviceId: existing.id,
         type,
@@ -2389,7 +2389,7 @@ app.get('/:id/commands', async (c) => {
     const deviceId = c.req.param('id')
 
     // Verify the device belongs to this agency
-    const device = await db.agencyDevice.findFirst({
+    const device = await cloudDb.agencyDevice.findFirst({
       where: { id: deviceId, agencyId: user.agencyId },
       select: { id: true },
     })
@@ -2402,7 +2402,7 @@ app.get('/:id/commands', async (c) => {
     const where: Record<string, unknown> = { deviceId }
     if (statusFilter) where.status = statusFilter
 
-    const commands = await db.deviceCommand.findMany({
+    const commands = await cloudDb.deviceCommand.findMany({
       where,
       orderBy: { createdAt: 'desc' },
     })
@@ -2441,7 +2441,7 @@ app.post('/:id/kiosk-credentials', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
 
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
     })
     if (!existing) {
@@ -2462,7 +2462,7 @@ app.post('/:id/kiosk-credentials', async (c) => {
     let pairingCode = generatePairingCode()
     let attempts = 0
     while (attempts < 10) {
-      const dupe = await db.agencyDevice.findUnique({ where: { pairingCode } })
+      const dupe = await cloudDb.agencyDevice.findUnique({ where: { pairingCode } })
       if (!dupe) break
       pairingCode = generatePairingCode()
       attempts++
@@ -2470,7 +2470,7 @@ app.post('/:id/kiosk-credentials', async (c) => {
 
     const deviceToken = crypto.randomBytes(32).toString('hex')
 
-    await db.agencyDevice.update({
+    await cloudDb.agencyDevice.update({
       where: { id: existing.id },
       data: { pairingCode, deviceToken, status: existing.status === 'DISABLED' ? 'OFFLINE' : existing.status },
     })
@@ -2491,7 +2491,7 @@ app.post('/:id/kiosk-credentials/regenerate', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
 
-    const existing = await db.agencyDevice.findFirst({
+    const existing = await cloudDb.agencyDevice.findFirst({
       where: { id: c.req.param('id'), agencyId: user.agencyId },
     })
     if (!existing) {
@@ -2501,7 +2501,7 @@ app.post('/:id/kiosk-credentials/regenerate', async (c) => {
     let pairingCode = generatePairingCode()
     let attempts = 0
     while (attempts < 10) {
-      const dupe = await db.agencyDevice.findUnique({ where: { pairingCode } })
+      const dupe = await cloudDb.agencyDevice.findUnique({ where: { pairingCode } })
       if (!dupe) break
       pairingCode = generatePairingCode()
       attempts++
@@ -2509,7 +2509,7 @@ app.post('/:id/kiosk-credentials/regenerate', async (c) => {
 
     const deviceToken = crypto.randomBytes(32).toString('hex')
 
-    await db.agencyDevice.update({
+    await cloudDb.agencyDevice.update({
       where: { id: existing.id },
       data: {
         pairingCode,
@@ -2840,7 +2840,7 @@ app.post('/discovery/saved-tvs', async (c) => {
     }
     const v = validation.data
     // Upsert by (agencyId, ip) — re-saving the same TV updates its metadata
-    const tv = await db.savedTv.upsert({
+    const tv = await cloudDb.savedTv.upsert({
       where: { agencyId_ip: { agencyId: user.agencyId, ip: v.ip } },
       create: { ...v, agencyId: user.agencyId, lastSeenAt: new Date() },
       update: {
@@ -2864,7 +2864,7 @@ app.get('/discovery/saved-tvs', async (c) => {
     if (!user.agencyId) {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
-    const tvs = await db.savedTv.findMany({
+    const tvs = await cloudDb.savedTv.findMany({
       where: { agencyId: user.agencyId },
       orderBy: { createdAt: 'desc' },
     })
@@ -2883,11 +2883,11 @@ app.delete('/discovery/saved-tvs/:id', async (c) => {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
     const id = c.req.param('id')
-    const existing = await db.savedTv.findUnique({ where: { id } })
+    const existing = await cloudDb.savedTv.findUnique({ where: { id } })
     if (!existing || existing.agencyId !== user.agencyId) {
       return c.json({ success: false, error: 'Saved TV not found' }, 404)
     }
-    await db.savedTv.delete({ where: { id } })
+    await cloudDb.savedTv.delete({ where: { id } })
     return c.json({ success: true })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -2930,7 +2930,7 @@ app.post('/discovery/default-printer', async (c) => {
     }
     const v = validation.data
     // Upsert by agencyId — only one default printer per agency
-    const printer = await db.defaultPrinter.upsert({
+    const printer = await cloudDb.defaultPrinter.upsert({
       where: { agencyId: user.agencyId },
       create: { ...v, agencyId: user.agencyId, lastSeenAt: new Date() },
       update: {
@@ -2963,7 +2963,7 @@ app.get('/discovery/default-printer', async (c) => {
         return c.json({ success: false, error: 'agencyId required' }, 400)
       }
     }
-    const printer = await db.defaultPrinter.findUnique({ where: { agencyId } })
+    const printer = await cloudDb.defaultPrinter.findUnique({ where: { agencyId } })
     return c.json({ success: true, defaultPrinter: printer })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -2978,7 +2978,7 @@ app.delete('/discovery/default-printer', async (c) => {
     if (!user.agencyId) {
       return c.json({ success: false, error: 'No agency assigned' }, 403)
     }
-    await db.defaultPrinter.deleteMany({ where: { agencyId: user.agencyId } })
+    await cloudDb.defaultPrinter.deleteMany({ where: { agencyId: user.agencyId } })
     return c.json({ success: true })
   } catch (error: unknown) {
     const err = authErrorResponse(error)

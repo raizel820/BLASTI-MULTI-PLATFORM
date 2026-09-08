@@ -12,7 +12,7 @@
  * - Cache invalidation (single key or full flush)
  */
 
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { encrypt, decrypt } from './encryption'
 
 // ─── Cache ─────────────────────────────────────────────────────────────────
@@ -43,7 +43,7 @@ export async function getConfig(key: string): Promise<string | null> {
     return cached.encrypted ? decrypt(cached.value) : cached.value
   }
 
-  const setting = await db.systemSetting.findUnique({ where: { key } })
+  const setting = await cloudDb.systemSetting.findUnique({ where: { key } })
   if (!setting) return null
 
   cache.set(key, {
@@ -96,7 +96,7 @@ export async function getConfigJSON<T = unknown>(key: string, defaultValue: T): 
  * Automatically decrypts encrypted values.
  */
 export async function getConfigByCategory(category: string): Promise<Record<string, string>> {
-  const settings = await db.systemSetting.findMany({ where: { category } })
+  const settings = await cloudDb.systemSetting.findMany({ where: { category } })
   const result: Record<string, string> = {}
   for (const s of settings) {
     // Update cache
@@ -115,7 +115,7 @@ export async function getConfigByCategory(category: string): Promise<Record<stri
  * Automatically decrypts encrypted values.
  */
 export async function getAllConfig(): Promise<Record<string, string>> {
-  const settings = await db.systemSetting.findMany()
+  const settings = await cloudDb.systemSetting.findMany()
   const result: Record<string, string> = {}
   for (const s of settings) {
     // Update cache
@@ -147,7 +147,7 @@ export async function setConfig(key: string, value: string, options: SetConfigOp
   const { encrypted = false, category = 'general', description = '', valueType = 'string' } = options
   const storedValue = encrypted ? encrypt(value) : value
 
-  await db.systemSetting.upsert({
+  await cloudDb.systemSetting.upsert({
     where: { key },
     create: {
       key,
@@ -182,11 +182,11 @@ export async function setConfig(key: string, value: string, options: SetConfigOp
 export async function deleteConfig(key: string): Promise<boolean> {
   try {
     // Check if the setting exists first
-    const setting = await db.systemSetting.findUnique({ where: { key } })
+    const setting = await cloudDb.systemSetting.findUnique({ where: { key } })
     if (!setting) return false
 
     // Use raw SQL to bypass the Ghost Delete Trap (SystemSetting doesn't need tombstones)
-    await db.$executeRaw`DELETE FROM system_settings WHERE id = ${setting.id}`
+    await cloudDb.$executeRaw`DELETE FROM system_settings WHERE id = ${setting.id}`
     cache.delete(key)
     return true
   } catch {
@@ -223,7 +223,7 @@ export async function getAllSettingsRaw(): Promise<Array<{
   updatedAt: Date
   createdAt: Date
 }>> {
-  return db.systemSetting.findMany({ orderBy: [{ category: 'asc' }, { key: 'asc' }] })
+  return cloudDb.systemSetting.findMany({ orderBy: [{ category: 'asc' }, { key: 'asc' }] })
 }
 
 /**
@@ -241,14 +241,14 @@ export async function getSettingRaw(key: string): Promise<{
   updatedAt: Date
   createdAt: Date
 } | null> {
-  return db.systemSetting.findUnique({ where: { key } })
+  return cloudDb.systemSetting.findUnique({ where: { key } })
 }
 
 /**
  * Get all distinct categories.
  */
 export async function getSettingCategories(): Promise<string[]> {
-  const results = await db.systemSetting.findMany({
+  const results = await cloudDb.systemSetting.findMany({
     select: { category: true },
     distinct: ['category'],
     orderBy: { category: 'asc' },

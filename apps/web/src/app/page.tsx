@@ -30,12 +30,8 @@ const AgencySubscription = lazy(() => import('@/components/agency/agency-subscri
 const AgencyReviews = lazy(() => import('@/components/agency/agency-reviews').then(m => ({ default: m.AgencyReviews })));
 const AgencyEmployees = lazy(() => import('@/components/agency/agency-employees').then(m => ({ default: m.AgencyEmployees })));
 const AgencyBranches = lazy(() => import('@/components/agency/agency-branches').then(m => ({ default: m.AgencyBranches })));
-const AgencyDevices = lazy(() => import('@/components/agency/agency-devices').then(m => ({ default: m.AgencyDevices })));
 const AgencyFullscreen = lazy(() => import('@/components/agency/agency-fullscreen').then(m => ({ default: m.AgencyFullscreen })));
 const AgencyFullscreenHistory = lazy(() => import('@/components/agency/agency-fullscreen-history').then(m => ({ default: m.AgencyFullscreenHistory })));
-// Device Views (standalone kiosk, TV board — accessed via ?mode=device&type=KIOSK|TV)
-const DeviceKiosk = lazy(() => import('@/components/devices/device-kiosk').then(m => ({ default: m.DeviceKiosk })));
-const DeviceTvBoard = lazy(() => import('@/components/devices/device-tv-board').then(m => ({ default: m.DeviceTvBoard })));
 
 // Admin Views
 const AdminDashboard = lazy(() => import('@/components/admin/admin-dashboard').then(m => ({ default: m.AdminDashboard })));
@@ -47,8 +43,6 @@ const AdminAnalytics = lazy(() => import('@/components/admin/admin-analytics').t
 const AdminSettings = lazy(() => import('@/components/admin/admin-settings').then(m => ({ default: m.AdminSettings })));
 const AdminSubscriptionPlans = lazy(() => import('@/components/admin/admin-subscription-plans').then(m => ({ default: m.AdminSubscriptionPlans })));
 const AdminAppSettings = lazy(() => import('@/components/admin/admin-app-settings').then(m => ({ default: m.AdminAppSettings })));
-const AdminHardware = lazy(() => import('@/components/admin/admin-hardware').then(m => ({ default: m.AdminHardware })));
-const AdminHardwareRequests = lazy(() => import('@/components/admin/admin-hardware-requests').then(m => ({ default: m.AdminHardwareRequests })));
 const AdminEnterpriseRequests = lazy(() => import('@/components/admin/admin-enterprise-requests').then(m => ({ default: m.AdminEnterpriseRequests })));
 
 // Shared (eagerly imported — lightweight)
@@ -57,8 +51,7 @@ import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
 import { PlatformSwitcher } from '@/components/shared/platform-switcher';
 import { PlatformBadge } from '@/components/shared/platform-badge';
-import { ConnectionStatus, ConnectionDot, onCloudStatusChange } from '@/components/shared/connection-status';
-import { OfflineDiagnosisPanel } from '@/components/shared/offline-diagnosis-panel';
+import { ConnectionStatus, ConnectionDot } from '@/components/shared/connection-status';
 import { NotificationBadge } from '@/components/shared/notification-badge';
 import { BlastiSkeleton, BlastiSkeletonCompact } from '@/components/shared/blasti-skeleton';
 import { usePlatform } from '@/hooks/use-platform';
@@ -132,8 +125,6 @@ const ViewRouter = memo(function ViewRouter() {
               return <AgencyEmployees />;
             case 'agency-branches':
               return <AgencyBranches />;
-            case 'agency-devices':
-              return <AgencyDevices />;
             case 'agency-fullscreen':
               return <AgencyFullscreen />;
             case 'agency-fullscreen-history':
@@ -156,10 +147,6 @@ const ViewRouter = memo(function ViewRouter() {
               return <AdminSubscriptionPlans />;
             case 'admin-app-settings':
               return <AdminAppSettings />;
-            case 'admin-hardware':
-              return <AdminHardware />;
-            case 'admin-hardware-requests':
-              return <AdminHardwareRequests />;
             case 'admin-enterprise-requests':
               return <AdminEnterpriseRequests />;
             default:
@@ -188,60 +175,16 @@ export default function Home() {
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const logout = useAppStore((s) => s.logout);
   const isAuthenticated = useAppStore((s) => s.isAuthenticated);
-  // Device mode: standalone kiosk/TV accessed via ?mode=device&type=KIOSK|TV
-  const [deviceMode, setDeviceMode] = useState<string | null>(null);
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const mode = params.get('mode');
-    const type = params.get('type');
-    if (mode === 'device' && (type === 'KIOSK' || type === 'TV' || type === 'DISPLAY')) {
-      setDeviceMode(type);
-    }
-  }, []);
 
-  // L17: Reset device mode on URL change (popstate)
-  useEffect(() => {
-    const onUrlChange = () => {
-      const params = new URLSearchParams(window.location.search);
-      const mode = params.get('mode');
-      const type = params.get('type');
-      setDeviceMode(
-        mode === 'device' && (type === 'KIOSK' || type === 'TV' || type === 'DISPLAY')
-          ? type
-          : null
-      );
-    };
-    window.addEventListener('popstate', onUrlChange);
-    return () => window.removeEventListener('popstate', onUrlChange);
-  }, []);
  const { t, lang } = useLanguage();
   const { platform } = usePlatform();
   // Aggressive turn alert — full-screen overlay when customer's turn is called
   // Hook is always called (rules of hooks) but only activates for customers via userId filtering
   const { showTurnAlert, turnAlertData, dismissTurnAlert } = useTurnAlert(user?.role === 'CUSTOMER' ? user?.id : undefined);
 
-  const [showDiagnosis, setShowDiagnosis] = useState(false);
   const [globalAnnouncements, setGlobalAnnouncements] = useState<Array<{ id: string; message: string; type: string; createdAt: string }>>([]);
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
   const [showOnboarding, setShowOnboarding] = useState(false);
-
-  // Auto-show diagnosis panel when cloud goes down (desktop app offline transition)
-  useEffect(() => {
-    const unsub = onCloudStatusChange((isDown) => {
-      if (isDown && platform.isElectron) {
- setShowDiagnosis(true);
-      }
-    });
-    return unsub;
-  }, [platform.isElectron]);
-
-  // Listen for custom event from ConnectionStatus "Diagnose" button
-  useEffect(() => {
-    const handler = () => setShowDiagnosis(true);
-    window.addEventListener("blasti:show-diagnosis", handler);
-    return () => window.removeEventListener("blasti:show-diagnosis", handler);
-  }, []);
-
   // Phase 6c: Hydration mismatch guard — useAppStore reads from localStorage on
   // the client but returns defaults on the server, causing React hydration mismatches.
   // We defer rendering store-dependent content until the client has mounted, so the
@@ -408,7 +351,6 @@ export default function Home() {
       'agency-settings': t('settings') + ' - BLASTI',
       'agency-profile': t('profile') + ' - BLASTI',
       'agency-subscription': t('subscription') + ' - BLASTI',
-      'agency-devices': t('devicesConnection') + ' - BLASTI',
       'admin-dashboard': t('dashboard') + ' - BLASTI',
       'admin-transactions': t('transactions') + ' - BLASTI',
       'admin-agencies': t('agencies') + ' - BLASTI',
@@ -444,11 +386,8 @@ export default function Home() {
   }, []);
 
   // Handle deep links: ?code=CLINIC01
-  // Skip when device mode is active (URL has ?mode=device) — device mode handles its own params
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    // Don't interfere with device mode URLs
-    if (params.get('mode') === 'device') return;
     const code = params.get('code');
     if (code) {
       setPendingAgencyCode(code);
@@ -468,17 +407,6 @@ export default function Home() {
   const isCustomer = user?.role === 'CUSTOMER';
   const isAgency = user?.role === 'AGENCY_STAFF' || user?.role === 'AGENCY_OWNER';
   const isAdmin = user?.role === 'SUPER_ADMIN';
-
-  // Device mode: render fullscreen kiosk/TV without any chrome (no sidebar, no header)
-  if (deviceMode) {
-    return (
-      <ErrorBoundary>
-        <Suspense fallback={<BlastiSkeleton />}>
-          {deviceMode === 'KIOSK' ? <DeviceKiosk /> : <DeviceTvBoard />}
-        </Suspense>
-      </ErrorBoundary>
-    );
-  }
 
   // Phase 6c: Hydration mismatch guard — render a loading skeleton until the
   // client has mounted and the store is hydrated. This ensures the server-rendered
@@ -536,11 +464,6 @@ export default function Home() {
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />
-        <OfflineDiagnosisPanel
-          open={showDiagnosis}
-          onClose={() => setShowDiagnosis(false)}
-          autoRun={showDiagnosis}
-        />
       </>
     );
   }
@@ -560,11 +483,6 @@ export default function Home() {
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />
-        <OfflineDiagnosisPanel
-          open={showDiagnosis}
-          onClose={() => setShowDiagnosis(false)}
-          autoRun={showDiagnosis}
-        />
       </>
     );
   }
@@ -711,13 +629,6 @@ export default function Home() {
         ticketNumber={turnAlertData?.ticketNumber || ''}
         agencyName={turnAlertData?.agencyName || ''}
         onDismiss={dismissTurnAlert}
-      />
-
-      {/* Offline Diagnosis Panel — auto-shown when cloud goes down in Electron */}
-      <OfflineDiagnosisPanel
-        open={showDiagnosis}
-        onClose={() => setShowDiagnosis(false)}
-        autoRun={showDiagnosis}
       />
 
       {/* Onboarding Wizard — lazy loaded */}

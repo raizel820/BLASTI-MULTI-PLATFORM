@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { db, dbRaw } from '@blasti/db'
+import { cloudDb, cloudDbRaw } from '@blasti/cloud-db'
 import { requireAuth, authErrorResponse } from '../lib/auth'
 import { validateBody, updateProfileSchema, updatePreferencesSchema, changePasswordSchema } from '../lib/validations'
 import { hashPassword, verifyPassword } from '../lib/password'
@@ -12,7 +12,7 @@ app.get('/profile', async (c) => {
   try {
     const user = await requireAuth(c)
 
-    const profile = await db.user.findUnique({
+    const profile = await cloudDb.user.findUnique({
       where: { id: user.id },
       select: {
         id: true, username: true, fullName: true, email: true, phoneNumber: true,
@@ -57,7 +57,7 @@ app.patch('/profile', async (c) => {
 
     if (Object.keys(updateData).length === 0) return c.json({ error: 'No fields to update' }, 400)
 
-    const updated = await db.user.update({
+    const updated = await cloudDb.user.update({
       where: { id: user.id },
       data: updateData,
       select: {
@@ -79,7 +79,7 @@ app.get('/preferences', async (c) => {
   try {
     const user = await requireAuth(c)
 
-    const dbUser = await db.user.findUnique({
+    const dbUser = await cloudDb.user.findUnique({
       where: { id: user.id },
       select: { id: true, notificationPreferences: true, language: true, smsNotificationsEnabled: true },
     })
@@ -114,7 +114,7 @@ app.patch('/preferences', async (c) => {
 
     const prefsStr = JSON.stringify(preferences)
 
-    const updated = await db.user.update({
+    const updated = await cloudDb.user.update({
       where: { id: user.id },
       data: { notificationPreferences: prefsStr },
       select: { id: true, notificationPreferences: true },
@@ -142,14 +142,14 @@ app.patch('/change-password', async (c) => {
 
     const { currentPassword, newPassword } = validation.data
 
-    const dbUser = await db.user.findUnique({ where: { id: user.id }, select: { id: true, passwordHash: true } })
+    const dbUser = await cloudDb.user.findUnique({ where: { id: user.id }, select: { id: true, passwordHash: true } })
     if (!dbUser) return c.json({ error: 'User not found' }, 404)
 
     const isCorrect = verifyPassword(currentPassword, dbUser.passwordHash)
     if (!isCorrect) return c.json({ error: 'Current password is incorrect' }, 401)
 
     const newHash = hashPassword(newPassword)
-    await db.user.update({ where: { id: user.id }, data: { passwordHash: newHash } })
+    await cloudDb.user.update({ where: { id: user.id }, data: { passwordHash: newHash } })
 
     return c.json({ success: true })
   } catch (error: unknown) {
@@ -169,12 +169,12 @@ app.delete('/delete-account', async (c) => {
 
     if (user.role === 'SUPER_ADMIN') return c.json({ success: false, error: 'Admin accounts cannot be deleted' }, 403)
 
-    const dbUser = await db.user.findUnique({ where: { id: userId }, select: { id: true, role: true } })
+    const dbUser = await cloudDb.user.findUnique({ where: { id: userId }, select: { id: true, role: true } })
     if (!dbUser) return c.json({ success: false, error: 'User not found' }, 404)
 
-    // Uses dbRaw to bypass the ghost-delete extension (deleteMany crashes
+    // Uses cloudDbRaw to bypass the ghost-delete extension (deleteMany crashes
     // inside $transaction in Prisma 6.x).
-    await dbRaw.$transaction(async (tx) => {
+    await cloudDbRaw.$transaction(async (tx) => {
       await tx.auditLog.deleteMany({ where: { userId } })
       await tx.notification.deleteMany({ where: { userId } })
       await tx.smsPurchase.deleteMany({ where: { userId } })
@@ -230,10 +230,10 @@ app.get('/stats', async (c) => {
     const now = new Date()
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)
 
-    const totalQueues = await db.reservation.count({ where: { userId } })
-    const thisMonthCount = await db.reservation.count({ where: { userId, joinedAt: { gte: monthStart } } })
+    const totalQueues = await cloudDb.reservation.count({ where: { userId } })
+    const thisMonthCount = await cloudDb.reservation.count({ where: { userId, joinedAt: { gte: monthStart } } })
 
-    const completedReservations = await db.reservation.findMany({
+    const completedReservations = await cloudDb.reservation.findMany({
       where: { userId, status: 'COMPLETED' },
       include: { agency: { select: { id: true, name: true, nameAr: true, nameFr: true } } },
       orderBy: { completedAt: 'desc' },
@@ -282,7 +282,7 @@ app.get('/customer/service-stats', async (c) => {
     const now = new Date()
 
     // Find currently CALLED reservation for this customer at this agency
-    const currentServing = await db.reservation.findFirst({
+    const currentServing = await cloudDb.reservation.findFirst({
       where: { userId: user.id, agencyId, status: 'CALLED' },
       include: { service: { select: { name: true, nameAr: true, nameFr: true } } },
     })
@@ -303,7 +303,7 @@ app.get('/customer/service-stats', async (c) => {
     }
 
     // Find last 10 completed reservations for this customer at this agency
-    const completedReservations = await db.reservation.findMany({
+    const completedReservations = await cloudDb.reservation.findMany({
       where: {
         userId: user.id,
         agencyId,
@@ -334,7 +334,7 @@ app.get('/customer/service-stats', async (c) => {
     }
 
     // Average of ALL completed reservations for this customer at this agency
-    const totalCompleted = await db.reservation.count({
+    const totalCompleted = await cloudDb.reservation.count({
       where: {
         userId: user.id,
         agencyId,
@@ -351,7 +351,7 @@ app.get('/customer/service-stats', async (c) => {
       if (totalCompleted <= 10) {
         averageAll = Math.round((durations.reduce((a, b) => a + b, 0) / durations.length) * 100) / 100
       } else {
-        const allCompleted = await db.reservation.findMany({
+        const allCompleted = await cloudDb.reservation.findMany({
           where: {
             userId: user.id,
             agencyId,

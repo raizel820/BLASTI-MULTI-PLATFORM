@@ -27,7 +27,7 @@
  */
 
 import type { Server as SocketIOServer } from 'socket.io'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { sendSms, normalizeDzPhone } from './sms-service'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -83,7 +83,7 @@ export async function routeNotification(
 
   // ── Fetch user and agency data ──────────────────────────────────────────
   const [user, agency] = await Promise.all([
-    db.user.findUnique({
+    cloudDb.user.findUnique({
       where: { id: userId },
       select: {
         id: true,
@@ -96,7 +96,7 @@ export async function routeNotification(
         smsNotificationsEnabled: true,
       },
     }),
-    db.agency.findUnique({
+    cloudDb.agency.findUnique({
       where: { id: agencyId },
       select: {
         id: true,
@@ -339,7 +339,7 @@ export async function sendViaSms(
     }
 
     // Determine who pays for this SMS
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId },
       select: { sponsorSms: true, smsBalance: true },
     })
@@ -349,7 +349,7 @@ export async function sendViaSms(
     if (isAgencySponsored) {
       // ── Agency-sponsored path ──────────────────────────────────────────
       // 1. Deduct from agency balance (atomic with gte guard)
-      const deducted = await db.agency.updateMany({
+      const deducted = await cloudDb.agency.updateMany({
         where: { id: agencyId, smsBalance: { gte: 1 } },
         data: { smsBalance: { decrement: 1 } },
       })
@@ -367,7 +367,7 @@ export async function sendViaSms(
 
         if (!result.success) {
           // Refund agency balance on failure
-          await db.agency.update({
+          await cloudDb.agency.update({
             where: { id: agencyId },
             data: { smsBalance: { increment: 1 } },
           })
@@ -378,7 +378,7 @@ export async function sendViaSms(
         }
 
         // 3. Manually create an SmsLog with userId for tracking
-        await db.smsLog.create({
+        await cloudDb.smsLog.create({
           data: {
             userId,
             phoneNumber: normalizedPhone,
@@ -446,7 +446,7 @@ export async function sendViaWhatsApp(
     }
 
     // Determine who pays
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId },
       select: { sponsorSms: true, smsBalance: true },
     })
@@ -456,7 +456,7 @@ export async function sendViaWhatsApp(
 
     if (isAgencySponsored) {
       // Deduct from agency balance
-      const deducted = await db.agency.updateMany({
+      const deducted = await cloudDb.agency.updateMany({
         where: { id: agencyId, smsBalance: { gte: 1 } },
         data: { smsBalance: { decrement: 1 } },
       })
@@ -471,19 +471,19 @@ export async function sendViaWhatsApp(
 
     // If not agency-sponsored, deduct from user balance
     if (!agencyDeducted) {
-      const userDeducted = await db.user.updateMany({
+      const userDeducted = await cloudDb.user.updateMany({
         where: { id: userId, freeSmsCount: { gte: 1 } },
         data: { freeSmsCount: { decrement: 1 } },
       })
 
       if (userDeducted.count === 0) {
         // Check purchased credits
-        const purchasedTotal = await db.smsPurchase.aggregate({
+        const purchasedTotal = await cloudDb.smsPurchase.aggregate({
           where: { userId, status: 'APPROVED' },
           _sum: { quantity: true },
         })
         const totalPurchased = purchasedTotal._sum.quantity ?? 0
-        const usedCount = await db.smsLog.count({
+        const usedCount = await cloudDb.smsLog.count({
           where: { userId, status: 'SENT' },
         })
 
@@ -520,7 +520,7 @@ export async function sendViaWhatsApp(
     )
 
     // Create an SMS log entry for tracking (even though it's WhatsApp)
-    await db.smsLog.create({
+    await cloudDb.smsLog.create({
       data: {
         userId,
         phoneNumber: normalizedPhone,
@@ -560,7 +560,7 @@ export async function scheduleDelayedJob(
 ): Promise<string> {
   const executeAt = new Date(Date.now() + delayMs)
 
-  const job = await db.delayedJob.create({
+  const job = await cloudDb.delayedJob.create({
     data: {
       reservationId: payload.reservationId,
       userId: payload.userId,
@@ -609,14 +609,14 @@ export async function deductSmsBalance(
   userId: string
 ): Promise<boolean> {
   try {
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId },
       select: { sponsorSms: true, smsBalance: true },
     })
 
     if (agency?.sponsorSms) {
       // Agency sponsors SMS — deduct from agency balance
-      const result = await db.agency.updateMany({
+      const result = await cloudDb.agency.updateMany({
         where: { id: agencyId, smsBalance: { gte: 1 } },
         data: { smsBalance: { decrement: 1 } },
       })
@@ -635,7 +635,7 @@ export async function deductSmsBalance(
     }
 
     // Deduct from user's free SMS count
-    const userResult = await db.user.updateMany({
+    const userResult = await cloudDb.user.updateMany({
       where: { id: userId, freeSmsCount: { gte: 1 } },
       data: { freeSmsCount: { decrement: 1 } },
     })
@@ -648,12 +648,12 @@ export async function deductSmsBalance(
     }
 
     // Check if user has purchased SMS credits as fallback
-    const purchasedTotal = await db.smsPurchase.aggregate({
+    const purchasedTotal = await cloudDb.smsPurchase.aggregate({
       where: { userId, status: 'APPROVED' },
       _sum: { quantity: true },
     })
     const totalPurchased = purchasedTotal._sum.quantity ?? 0
-    const usedCount = await db.smsLog.count({
+    const usedCount = await cloudDb.smsLog.count({
       where: { userId, status: 'SENT' },
     })
 
@@ -692,14 +692,14 @@ export async function refundSmsBalance(
   userId: string
 ): Promise<void> {
   try {
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId },
       select: { sponsorSms: true },
     })
 
     if (agency?.sponsorSms) {
       // Try to refund to agency balance first
-      await db.agency.update({
+      await cloudDb.agency.update({
         where: { id: agencyId },
         data: { smsBalance: { increment: 1 } },
       })
@@ -708,7 +708,7 @@ export async function refundSmsBalance(
       )
     } else {
       // Refund to user's free SMS count
-      await db.user.update({
+      await cloudDb.user.update({
         where: { id: userId },
         data: { freeSmsCount: { increment: 1 } },
       })
@@ -735,11 +735,11 @@ async function checkCarrierBalance(
   userId: string
 ): Promise<boolean> {
   const [agency, user] = await Promise.all([
-    db.agency.findUnique({
+    cloudDb.agency.findUnique({
       where: { id: agencyId },
       select: { sponsorSms: true, smsBalance: true },
     }),
-    db.user.findUnique({
+    cloudDb.user.findUnique({
       where: { id: userId },
       select: { freeSmsCount: true },
     }),
@@ -756,12 +756,12 @@ async function checkCarrierBalance(
   }
 
   // Check purchased credits
-  const purchasedTotal = await db.smsPurchase.aggregate({
+  const purchasedTotal = await cloudDb.smsPurchase.aggregate({
     where: { userId, status: 'APPROVED' },
     _sum: { quantity: true },
   })
   const totalPurchased = purchasedTotal._sum.quantity ?? 0
-  const usedCount = await db.smsLog.count({
+  const usedCount = await cloudDb.smsLog.count({
     where: { userId, status: 'SENT' },
   })
 
@@ -891,7 +891,7 @@ async function createInAppNotification(
   payload: NotificationPayload
 ): Promise<void> {
   try {
-    await db.notification.create({
+    await cloudDb.notification.create({
       data: {
         userId: payload.userId,
         type: payload.type,

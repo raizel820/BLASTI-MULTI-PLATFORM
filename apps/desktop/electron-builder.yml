@@ -12,6 +12,9 @@ directories:
 files:
   - main.js
   - preload.js
+  # DEPRECATED: These legacy files use the old better-sqlite3 DB.
+  # They are NOT imported by main.js (which uses Prisma via ./local-api/).
+  # Kept for packaging compatibility until fully removed.
   - local-api-routes.js
   - local-db.js
   - cloud-sync.js
@@ -24,6 +27,8 @@ asar: true
 asarUnpack:
   - out/**/*
   - data/**/*
+  # DEPRECATED: better-sqlite3 is only used by legacy local-db.js / cloud-sync.js.
+  # Can be removed once those files are deleted.
   - node_modules/better-sqlite3/**/*
 
 npmRebuild: true

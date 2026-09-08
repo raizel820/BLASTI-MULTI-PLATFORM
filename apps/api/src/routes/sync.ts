@@ -4,15 +4,24 @@
  * Provides incremental sync endpoints for pulling and pushing data
  * between local WatermelonDB clients and the central Prisma database.
  *
- * GET  /api/sync/status — Server sync status
- * POST /api/sync/pull   — Pull incremental changes since last sync
- * POST /api/sync/push   — Push local changes to the server
+ * GET  /api/sync/status — Server sync status with cursor info
+ * POST /api/sync/pull   — Cursor-based incremental pull using SyncChange
+ * POST /api/sync/push   — Push local changes with idempotency & conflict detection
  */
 
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { requireAuth, authErrorResponse, AuthError } from '../lib/auth'
 import { isRealtimeHealthy } from '../lib/realtime-emit'
+import {
+  getChangesSinceCursor,
+  advanceCursor,
+  getCursor,
+  getLatestSequence,
+  processPushMutation,
+  IdempotencyConflictError,
+} from '../lib/sync-helpers'
+import { SYNC_PROTOCOL_VERSION } from '@blasti/core/sync-registry'
 import { z } from 'zod'
 
 const app = new Hono()
@@ -43,6 +52,9 @@ const SYNC_MODELS = [
   'Reservation',
   'Notification',
   'QueueSettings',
+  'AgencyStaff',
+  'Review',
+  'User',
 ] as const
 
 type SyncModel = typeof SYNC_MODELS[number]
@@ -84,220 +96,160 @@ const ALLOWED_PUSH_PER_ROLE: Record<string, Record<string, { create: boolean; up
 // ─── Pull Schema ────────────────────────────────────────────────────────────
 
 const pullSchema = z.object({
-  lastPulledAt: z.string().optional(), // ISO timestamp of last successful pull
+  cursor: z.number().optional(),    // Sequence cursor (cursor-based pull)
+  lastPulledAt: z.string().optional(), // Legacy: ISO timestamp of last successful pull
   models: z.array(z.string()).optional(), // Which models to sync (default: all)
   agencyId: z.string().optional(), // Filter to specific agency
+  limit: z.number().optional(),    // Max changes per request (default 500)
 })
 
-// POST /api/sync/pull — Pull incremental changes since last sync
-// Phase 5: Returns all records updated after lastPulledAt + deleted record tombstones
+// POST /api/sync/pull — Cursor-based incremental pull using SyncChange
+// Phase 5: Returns SyncChange records since cursor + record data for each change
 app.post('/pull', async (c) => {
   try {
     const user = await requireAuth(c)
     const body = await c.req.json()
-    const validation = z.object({
-      lastPulledAt: z.string().optional(),
-      agencyId: z.string().optional(),
-    }).safeParse(body)
+    const validation = pullSchema.safeParse(body)
 
     if (!validation.success) {
-      return c.json({ success: false, error: 'Invalid pull request', details: validation.error.errors }, 400)
+      return c.json({ success: false, error: 'Invalid pull request', details: validation.error.issues }, 400)
     }
 
-    const { lastPulledAt, agencyId } = validation.data
-    const since = lastPulledAt ? new Date(lastPulledAt) : new Date(0) // Epoch if never synced
+    const { cursor, lastPulledAt, agencyId, limit } = validation.data
 
     // Determine which agency(s) the user has access to
     let targetAgencyId = agencyId
 
     if (!targetAgencyId && user.role !== 'SUPER_ADMIN') {
       // Auto-resolve to user's agency
-      const staffRecord = await db.agencyStaff.findFirst({
+      const staffRecord = await cloudDb.agencyStaff.findFirst({
         where: { userId: user.id, isActive: true },
         select: { agencyId: true },
       })
-      const ownedAgency = await db.agency.findFirst({
+      const ownedAgency = await cloudDb.agency.findFirst({
         where: { ownerId: user.id },
         select: { id: true },
       })
       targetAgencyId = staffRecord?.agencyId || ownedAgency?.id || undefined
     }
 
-    const now = new Date()
-    const changes: Record<string, { created: any[]; updated: any[]; deleted: string[] }> = {}
+    if (!targetAgencyId) {
+      return c.json({
+        success: false,
+        error: 'No agency found for user — specify agencyId',
+      }, 400)
+    }
 
-    // Fetch changes for each sync model
-    for (const model of SYNC_MODELS) {
-      changes[model] = { created: [], updated: [], deleted: [] }
+    // ── Cursor-based pull using SyncChange ────────────────────────────────
+    // If cursor is provided, use the new cursor-based approach
+    // If only lastPulledAt is provided (legacy), resolve to a cursor
+    let sinceSequence = cursor ?? 0
 
-      // Get deleted records (tombstones)
-      const deletedRecords = await db.deletedRecord.findMany({
+    if (!cursor && lastPulledAt) {
+      // Legacy fallback: find the latest SyncChange sequence before lastPulledAt
+      const since = new Date(lastPulledAt)
+      const lastChangeBeforeCursor = await cloudDb.syncChange.findFirst({
         where: {
-          modelName: model,
-          deletedAt: { gte: since },
+          agencyId: targetAgencyId,
+          changedAt: { lt: since },
         },
-        select: { recordId: true },
+        orderBy: { sequence: 'desc' },
+        select: { sequence: true },
       })
-      changes[model].deleted = deletedRecords.map(r => r.recordId)
+      sinceSequence = lastChangeBeforeCursor?.sequence ?? 0
+    }
 
-      // Fetch created/updated records based on model type
-      switch (model) {
-        case 'Agency': {
-          const where: any = { updatedAt: { gte: since } }
-          if (targetAgencyId) where.id = targetAgencyId
-          else if (user.role === 'CUSTOMER') {
-            // Customers can see agencies they have reservations with
-            const reservationAgencies = await db.reservation.findMany({
-              where: { userId: user.id },
-              select: { agencyId: true },
-              distinct: ['agencyId'],
-            })
-            where.id = { in: reservationAgencies.map(r => r.agencyId) }
-          }
-          const records = await db.agency.findMany({
-            where,
-            select: {
-              id: true, name: true, nameFr: true, nameAr: true,
-              customCode: true, category: true, address: true, city: true,
-              phone: true, email: true, averageServiceTime: true,
-              maxActiveReservations: true, isQueueOpen: true,
-              subscriptionTier: true, subscriptionStatus: true,
-              workingHoursStart: true, workingHoursEnd: true,
-              isActive: true, createdAt: true, updatedAt: true,
-            },
-          })
-          // Split into created vs updated based on createdAt
-          for (const record of records) {
-            if (record.createdAt >= since) {
-              changes[model].created.push(record)
-            } else {
-              changes[model].updated.push(record)
-            }
-          }
-          break
-        }
+    // If no cursor at all, try loading from the SyncCursor table
+    if (!cursor && !lastPulledAt) {
+      sinceSequence = await getCursor(targetAgencyId)
+    }
 
-        case 'Service': {
-          const where: any = { updatedAt: { gte: since }, isActive: true }
-          if (targetAgencyId) where.agencyId = targetAgencyId
-          const records = await db.service.findMany({
-            where,
-            select: {
-              id: true, agencyId: true, name: true, nameFr: true, nameAr: true,
-              prefix: true, isActive: true, createdAt: true, updatedAt: true,
-            },
-          })
-          for (const record of records) {
-            if (record.createdAt >= since) changes[model].created.push(record)
-            else changes[model].updated.push(record)
-          }
-          break
-        }
+    // Fetch changes since cursor
+    const { changes, hasMore, latestSequence } = await getChangesSinceCursor(
+      targetAgencyId,
+      sinceSequence,
+      limit ?? 500,
+    )
 
-        case 'Branch': {
-          const where: any = { updatedAt: { gte: since }, isActive: true }
-          if (targetAgencyId) where.agencyId = targetAgencyId
-          const records = await db.branch.findMany({
-            where,
-            select: {
-              id: true, agencyId: true, name: true, nameAr: true, nameFr: true,
-              address: true, phone: true, isMain: true, isActive: true,
-              createdAt: true, updatedAt: true,
-            },
-          })
-          for (const record of records) {
-            if (record.createdAt >= since) changes[model].created.push(record)
-            else changes[model].updated.push(record)
-          }
-          break
-        }
+    // ── Hydrate changes with record data ─────────────────────────────────
+    // For each SyncChange, fetch the current record state (for create/update)
+    // or just the recordId (for delete)
+    const hydratedChanges: Record<string, { created: any[]; updated: any[]; deleted: string[] }> = {}
 
-        case 'Counter': {
-          const where: any = { updatedAt: { gte: since }, isActive: true }
-          if (targetAgencyId) {
-            where.branch = { agencyId: targetAgencyId }
-          }
-          const records = await db.counter.findMany({
-            where,
-            select: {
-              id: true, branchId: true, number: true, name: true,
-              nameAr: true, nameFr: true, isActive: true,
-              createdAt: true, updatedAt: true,
-            },
-          })
-          for (const record of records) {
-            if (record.createdAt >= since) changes[model].created.push(record)
-            else changes[model].updated.push(record)
-          }
-          break
-        }
+    for (const model of SYNC_MODELS) {
+      hydratedChanges[model] = { created: [], updated: [], deleted: [] }
+    }
 
-        case 'Reservation': {
-          const where: any = { updatedAt: { gte: since } }
-          if (targetAgencyId) {
-            where.agencyId = targetAgencyId
-          } else if (user.role === 'CUSTOMER') {
-            where.userId = user.id
-          }
-          const records = await db.reservation.findMany({
-            where,
-            select: {
-              id: true, userId: true, agencyId: true, serviceId: true,
-              queueNumber: true, displayNumber: true, status: true,
-              estimatedWait: true, joinedAt: true, calledAt: true,
-              completedAt: true, cancelledAt: true, preferredTime: true,
-              fixedTimeEnabled: true, postponeCount: true, isWalkIn: true,
-              walkInCustomerName: true, counterId: true,
-              createdAt: true, updatedAt: true,
-            },
-            take: 500, // Limit batch size
-            orderBy: { updatedAt: 'asc' },
-          })
-          for (const record of records) {
-            if (record.createdAt >= since) changes[model].created.push(record)
-            else changes[model].updated.push(record)
-          }
-          break
-        }
+    // Group changes by model and operation for efficient batch fetching
+    const changesByModelOp: Record<string, { create: string[]; update: string[]; delete: string[] }> = {}
+    for (const change of changes) {
+      if (!changesByModelOp[change.model]) {
+        changesByModelOp[change.model] = { create: [], update: [], delete: [] }
+      }
+      changesByModelOp[change.model][change.operation as 'create' | 'update' | 'delete']?.push(change.recordId)
+    }
 
-        case 'Notification': {
-          const where: any = { createdAt: { gte: since }, userId: user.id }
-          const records = await db.notification.findMany({
-            where,
-            select: {
-              id: true, userId: true, type: true, title: true,
-              message: true, isRead: true, entityId: true, createdAt: true,
-            },
-            take: 200,
-            orderBy: { createdAt: 'desc' },
-          })
-          changes[model].created = records // Notifications are never "updated"
-          break
-        }
+    // Fetch record data for each model
+    for (const [modelName, ops] of Object.entries(changesByModelOp)) {
+      const allRecordIds = [...(ops.create || []), ...(ops.update || [])]
 
-        case 'QueueSettings': {
-          const where: any = { updatedAt: { gte: since } }
-          if (targetAgencyId) where.agencyId = targetAgencyId
-          const records = await db.queueSettings.findMany({
-            where,
-            select: {
-              id: true, agencyId: true, currentServingNumber: true,
-              lastIssuedNumber: true, isPaused: true, pausedAt: true,
-              updatedAt: true,
-            },
-          })
-          for (const record of records) {
-            changes[model].updated.push(record) // Queue settings are always updates
+      if (allRecordIds.length === 0 && ops.delete.length === 0) continue
+
+      // Add deletes directly
+      if (hydratedChanges[modelName]) {
+        hydratedChanges[modelName].deleted = ops.delete
+      }
+
+      // Fetch record data for creates and updates
+      if (allRecordIds.length > 0) {
+        const records = await fetchRecordsForModel(modelName, allRecordIds, targetAgencyId, user.id, user.role)
+
+        for (const change of changes) {
+          if (change.model !== modelName) continue
+          if (change.operation === 'delete') continue
+
+          const record = records.find((r: any) => r.id === change.recordId)
+          if (!record) continue
+
+          if (!hydratedChanges[modelName]) {
+            hydratedChanges[modelName] = { created: [], updated: [], deleted: [] }
           }
-          break
+
+          if (change.operation === 'create') {
+            hydratedChanges[modelName].created.push(record)
+          } else if (change.operation === 'update') {
+            hydratedChanges[modelName].updated.push(record)
+          }
         }
       }
     }
 
+    // Also include deleted record tombstones for the legacy path
+    const since = lastPulledAt ? new Date(lastPulledAt) : new Date(0)
+    const deletedRecords = await cloudDb.deletedRecord.findMany({
+      where: {
+        deletedAt: { gte: since },
+      },
+      select: { modelName: true, recordId: true },
+    })
+    for (const dr of deletedRecords) {
+      if (hydratedChanges[dr.modelName] && !hydratedChanges[dr.modelName].deleted.includes(dr.recordId)) {
+        hydratedChanges[dr.modelName].deleted.push(dr.recordId)
+      }
+    }
+
+    // Advance the cursor after successful pull
+    if (changes.length > 0) {
+      await advanceCursor(targetAgencyId, latestSequence)
+      markAgencySynced(targetAgencyId)
+    }
+
     return c.json({
       success: true,
-      timestamp: now.toISOString(),
-      changes,
+      cursor: latestSequence,
+      hasMore,
+      changes: hydratedChanges,
+      syncProtocolVersion: SYNC_PROTOCOL_VERSION,
     })
   } catch (error: unknown) {
     if (error instanceof AuthError) {
@@ -309,16 +261,143 @@ app.post('/pull', async (c) => {
   }
 })
 
+// ─── Helper: fetch records for a model by IDs ──────────────────────────────
+
+async function fetchRecordsForModel(
+  modelName: string,
+  recordIds: string[],
+  agencyId: string,
+  userId: string,
+  userRole: string,
+): Promise<any[]> {
+  switch (modelName) {
+    case 'Agency': {
+      return cloudDb.agency.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, name: true, nameFr: true, nameAr: true,
+          customCode: true, category: true, address: true, city: true,
+          phone: true, email: true, averageServiceTime: true,
+          maxActiveReservations: true, isQueueOpen: true,
+          subscriptionTier: true, subscriptionStatus: true,
+          workingHoursStart: true, workingHoursEnd: true,
+          isActive: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'Service': {
+      return cloudDb.service.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, agencyId: true, name: true, nameFr: true, nameAr: true,
+          prefix: true, isActive: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'Branch': {
+      return cloudDb.branch.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, agencyId: true, name: true, nameAr: true, nameFr: true,
+          address: true, phone: true, isMain: true, isActive: true,
+          syncVersion: true, createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'Counter': {
+      return cloudDb.counter.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, branchId: true, number: true, name: true,
+          nameAr: true, nameFr: true, isActive: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'Reservation': {
+      const where: any = { id: { in: recordIds } }
+      if (userRole === 'CUSTOMER') where.userId = userId
+      return cloudDb.reservation.findMany({
+        where,
+        select: {
+          id: true, userId: true, agencyId: true, serviceId: true,
+          queueNumber: true, displayNumber: true, status: true,
+          estimatedWait: true, joinedAt: true, calledAt: true,
+          completedAt: true, cancelledAt: true, preferredTime: true,
+          fixedTimeEnabled: true, postponeCount: true, isWalkIn: true,
+          walkInCustomerName: true, counterId: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'Notification': {
+      return cloudDb.notification.findMany({
+        where: { id: { in: recordIds }, userId },
+        select: {
+          id: true, userId: true, type: true, title: true,
+          message: true, isRead: true, entityId: true, syncVersion: true,
+          createdAt: true,
+        },
+      })
+    }
+    case 'QueueSettings': {
+      return cloudDb.queueSettings.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, agencyId: true, currentServingNumber: true,
+          lastIssuedNumber: true, isPaused: true, pausedAt: true,
+          syncVersion: true, updatedAt: true,
+        },
+      })
+    }
+    case 'AgencyStaff': {
+      return cloudDb.agencyStaff.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, userId: true, agencyId: true, role: true,
+          branchId: true, isActive: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'Review': {
+      return cloudDb.review.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, userId: true, agencyId: true, rating: true,
+          comment: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'User': {
+      return cloudDb.user.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, username: true, fullName: true, email: true,
+          phoneNumber: true, role: true, language: true,
+          isActive: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    default:
+      return []
+  }
+}
+
 // ─── Push Schema ────────────────────────────────────────────────────────────
 
 const pushSchema = z.object({
-  changes: z.record(z.any()),
+  changes: z.record(z.string(), z.any()),
   lastPulledAt: z.string().optional(),
+  cursor: z.number().optional(),
 })
 
 // POST /api/sync/push — Push local changes to the server
-// Phase 5: Accepts changes from WatermelonDB clients
-// Phase 4a: Enforces role-based push permissions via ALLOWED_PUSH_PER_ROLE
+// Phase 5: Uses processPushMutation() with idempotency and conflict detection
 app.post('/push', async (c) => {
   try {
     const user = await requireAuth(c)
@@ -326,26 +405,40 @@ app.post('/push', async (c) => {
 
     const validation = pushSchema.safeParse(body)
     if (!validation.success) {
-      return c.json({ success: false, error: 'Invalid push request', details: validation.error.errors }, 400)
+      return c.json({ success: false, error: 'Invalid push request', details: validation.error.issues }, 400)
     }
 
     const { changes } = validation.data
-    const results: Record<string, { created: number; updated: number; deleted: number; skipped?: string }> = {}
+    const results: Record<string, { created: number; updated: number; deleted: number; skipped?: string; conflicts?: any[] }> = {}
 
     // Phase 4a: Resolve the user's role for permission checks
     const userRole = user.role as string
     const rolePermissions = ALLOWED_PUSH_PER_ROLE[userRole]
+
+    // Determine agency ID for SyncChange recording
+    let agencyId: string | undefined
+    const staffRecord = await cloudDb.agencyStaff.findFirst({
+      where: { userId: user.id, isActive: true },
+      select: { agencyId: true },
+    })
+    const ownedAgency = await cloudDb.agency.findFirst({
+      where: { ownerId: user.id },
+      select: { id: true },
+    })
+    agencyId = staffRecord?.agencyId || ownedAgency?.id
+
+    // Extract idempotency key from header if present
+    const idempotencyKeyPrefix = c.req.header('X-Idempotency-Key') || ''
 
     // Process each model's changes
     for (const [modelName, modelChanges] of Object.entries(changes)) {
       if (!SYNC_MODELS.includes(modelName as SyncModel)) continue
 
       const mc = modelChanges as { created?: any[]; updated?: any[]; deleted?: string[] }
-      results[modelName] = { created: 0, updated: 0, deleted: 0 }
+      results[modelName] = { created: 0, updated: 0, deleted: 0, conflicts: [] }
 
       // Phase 4a: Check if this model is allowed for the user's role
       if (!rolePermissions || !rolePermissions[modelName]) {
-        // Model not in user's allowed list — skip entirely
         console.warn(`[SYNC] User role ${userRole} attempted push to ${modelName} — skipped (not allowed)`)
         results[modelName].skipped = 'Model not allowed for role'
         continue
@@ -353,113 +446,54 @@ app.post('/push', async (c) => {
 
       const modelPerms = rolePermissions[modelName]
 
-      // Process creates
+      // Process creates — wrapped in processPushMutation
       if (mc.created && Array.isArray(mc.created)) {
         if (!modelPerms.create) {
-          // Create not allowed for this role+model combination
           if (mc.created.length > 0) {
             console.warn(`[SYNC] User role ${userRole} attempted create on ${modelName} — skipped (not allowed)`)
             results[modelName].skipped = 'Create not allowed for role'
           }
         } else {
-          for (const record of mc.created) {
+          for (let i = 0; i < mc.created.length; i++) {
+            const record = mc.created[i]
             try {
               // Only allow creating reservations that belong to the user
-              if (modelName === 'Reservation' && record.userId === user.id) {
-                await db.reservation.upsert({
-                  where: { id: record.id },
-                  create: {
-                    id: record.id,
-                    userId: record.userId,
-                    agencyId: record.agencyId,
-                    serviceId: record.serviceId,
-                    queueNumber: record.queueNumber,
-                    displayNumber: record.displayNumber,
-                    status: record.status || 'WAITING',
-                    estimatedWait: record.estimatedWait,
-                    preferredTime: record.preferredTime,
-                    fixedTimeEnabled: record.fixedTimeEnabled ?? false,
-                    isWalkIn: record.isWalkIn ?? false,
-                    walkInCustomerName: record.walkInCustomerName,
-                  },
-                  update: {},
+              if (modelName === 'Reservation' && record.userId && record.userId !== user.id) {
+                results[modelName].conflicts!.push({
+                  recordId: record.id,
+                  reason: 'Cannot create reservation for another user',
                 })
+                continue
+              }
+
+              const idemKey = idempotencyKeyPrefix
+                ? `${idempotencyKeyPrefix}:${modelName}:create:${record.id}`
+                : undefined
+
+              const pushResult = await processPushMutation({
+                agencyId: agencyId || record.agencyId || '',
+                model: modelName,
+                recordId: record.id,
+                operation: 'create',
+                data: record,
+                idempotencyKey: idemKey,
+                expectedVersion: record.syncVersion,
+              })
+
+              if (pushResult.success) {
                 results[modelName].created++
-              } else if (modelName === 'Service') {
-                await db.service.upsert({
-                  where: { id: record.id },
-                  create: {
-                    id: record.id,
-                    agencyId: record.agencyId,
-                    name: record.name,
-                    nameFr: record.nameFr,
-                    nameAr: record.nameAr,
-                    prefix: record.prefix,
-                    isActive: record.isActive ?? true,
-                  },
-                  update: {},
+              } else if (pushResult.conflict) {
+                results[modelName].conflicts!.push({
+                  recordId: record.id,
+                  ...pushResult.conflict,
                 })
-                results[modelName].created++
-              } else if (modelName === 'Branch') {
-                await db.branch.upsert({
-                  where: { id: record.id },
-                  create: {
-                    id: record.id,
-                    agencyId: record.agencyId,
-                    name: record.name,
-                    nameAr: record.nameAr,
-                    nameFr: record.nameFr,
-                    address: record.address,
-                    phone: record.phone,
-                    isActive: record.isActive ?? true,
-                  },
-                  update: {},
-                })
-                results[modelName].created++
-              } else if (modelName === 'Counter') {
-                await db.counter.upsert({
-                  where: { id: record.id },
-                  create: {
-                    id: record.id,
-                    branchId: record.branchId,
-                    name: record.name,
-                    nameAr: record.nameAr,
-                    nameFr: record.nameFr,
-                    isActive: record.isActive ?? true,
-                  },
-                  update: {},
-                })
-                results[modelName].created++
-              } else if (modelName === 'Notification') {
-                await db.notification.upsert({
-                  where: { id: record.id },
-                  create: {
-                    id: record.id,
-                    userId: record.userId || user.id,
-                    type: record.type,
-                    title: record.title,
-                    message: record.message,
-                    isRead: record.isRead ?? false,
-                  },
-                  update: {},
-                })
-                results[modelName].created++
-              } else if (modelName === 'QueueSettings') {
-                await db.queueSettings.upsert({
-                  where: { id: record.id },
-                  create: {
-                    id: record.id,
-                    agencyId: record.agencyId,
-                    currentServingNumber: record.currentServingNumber ?? 0,
-                    lastIssuedNumber: record.lastIssuedNumber ?? 0,
-                    isPaused: record.isPaused ?? false,
-                  },
-                  update: {},
-                })
-                results[modelName].created++
               }
             } catch (err) {
               console.warn(`[SYNC] Failed to create ${modelName}:`, err)
+              results[modelName].conflicts!.push({
+                recordId: record.id,
+                reason: err instanceof Error ? err.message : 'Unknown error',
+              })
             }
           }
         }
@@ -468,7 +502,8 @@ app.post('/push', async (c) => {
       // Process updates — Phase 4a: Only allow specified fields per role
       if (mc.updated && Array.isArray(mc.updated)) {
         const allowedUpdateFields = modelPerms.update
-        for (const record of mc.updated) {
+        for (let i = 0; i < mc.updated.length; i++) {
+          const record = mc.updated[i]
           try {
             // Filter record to only include allowed update fields
             const filteredData: Record<string, unknown> = {}
@@ -479,61 +514,66 @@ app.post('/push', async (c) => {
             }
 
             if (Object.keys(filteredData).length === 0) {
-              // No allowed fields in the update — skip
-              continue
+              continue // No allowed fields in the update
             }
 
-            if (modelName === 'Reservation') {
-              // Customers can only update their own reservations
-              const whereClause: Record<string, unknown> = { id: record.id }
-              if (userRole === 'CUSTOMER') {
-                whereClause.userId = user.id
-              }
-              await db.reservation.updateMany({
-                where: whereClause,
-                data: filteredData,
-              })
-              results[modelName].updated++
-            } else if (modelName === 'Notification') {
-              // Users can only update their own notifications
-              await db.notification.updateMany({
+            // Ownership check for customers
+            if (modelName === 'Reservation' && userRole === 'CUSTOMER') {
+              const existing = await cloudDb.reservation.findFirst({
                 where: { id: record.id, userId: user.id },
-                data: filteredData,
+                select: { id: true },
               })
-              results[modelName].updated++
-            } else if (modelName === 'Service') {
-              await db.service.updateMany({
-                where: { id: record.id },
-                data: filteredData,
+              if (!existing) {
+                results[modelName].conflicts!.push({
+                  recordId: record.id,
+                  reason: 'Cannot update another user\'s reservation',
+                })
+                continue
+              }
+            }
+
+            if (modelName === 'Notification') {
+              const existing = await cloudDb.notification.findFirst({
+                where: { id: record.id, userId: user.id },
+                select: { id: true },
               })
+              if (!existing) {
+                results[modelName].conflicts!.push({
+                  recordId: record.id,
+                  reason: 'Cannot update another user\'s notification',
+                })
+                continue
+              }
+            }
+
+            const idemKey = idempotencyKeyPrefix
+              ? `${idempotencyKeyPrefix}:${modelName}:update:${record.id}`
+              : undefined
+
+            const pushResult = await processPushMutation({
+              agencyId: agencyId || record.agencyId || '',
+              model: modelName,
+              recordId: record.id,
+              operation: 'update',
+              data: filteredData,
+              idempotencyKey: idemKey,
+              expectedVersion: record.syncVersion,
+            })
+
+            if (pushResult.success) {
               results[modelName].updated++
-            } else if (modelName === 'Branch') {
-              await db.branch.updateMany({
-                where: { id: record.id },
-                data: filteredData,
+            } else if (pushResult.conflict) {
+              results[modelName].conflicts!.push({
+                recordId: record.id,
+                ...pushResult.conflict,
               })
-              results[modelName].updated++
-            } else if (modelName === 'Counter') {
-              await db.counter.updateMany({
-                where: { id: record.id },
-                data: filteredData,
-              })
-              results[modelName].updated++
-            } else if (modelName === 'QueueSettings') {
-              await db.queueSettings.updateMany({
-                where: { id: record.id },
-                data: filteredData,
-              })
-              results[modelName].updated++
-            } else if (modelName === 'Agency') {
-              await db.agency.updateMany({
-                where: { id: record.id },
-                data: filteredData,
-              })
-              results[modelName].updated++
             }
           } catch (err) {
             console.warn(`[SYNC] Failed to update ${modelName}:`, err)
+            results[modelName].conflicts!.push({
+              recordId: record.id,
+              reason: err instanceof Error ? err.message : 'Unknown error',
+            })
           }
         }
       }
@@ -541,7 +581,6 @@ app.post('/push', async (c) => {
       // Process deletes — Phase 4a: Only if delete is allowed for role+model
       if (mc.deleted && Array.isArray(mc.deleted)) {
         if (!modelPerms.delete) {
-          // Delete not allowed for this role+model combination
           if (mc.deleted.length > 0) {
             console.warn(`[SYNC] User role ${userRole} attempted delete on ${modelName} — skipped (not allowed)`)
             results[modelName].skipped = 'Delete not allowed for role'
@@ -549,21 +588,41 @@ app.post('/push', async (c) => {
         } else {
           for (const recordId of mc.deleted) {
             try {
-              await db.deletedRecord.upsert({
-                where: { id: `${modelName}:${recordId}` },
-                create: {
-                  id: `${modelName}:${recordId}`,
-                  modelName,
-                  recordId,
-                },
-                update: {},
+              const idemKey = idempotencyKeyPrefix
+                ? `${idempotencyKeyPrefix}:${modelName}:delete:${recordId}`
+                : undefined
+
+              const pushResult = await processPushMutation({
+                agencyId: agencyId || '',
+                model: modelName,
+                recordId,
+                operation: 'delete',
+                data: {},
+                idempotencyKey: idemKey,
               })
-              results[modelName].deleted++
+
+              if (pushResult.success) {
+                results[modelName].deleted++
+              } else if (pushResult.conflict) {
+                results[modelName].conflicts!.push({
+                  recordId,
+                  ...pushResult.conflict,
+                })
+              }
             } catch (err) {
               console.warn(`[SYNC] Failed to delete ${modelName}:`, err)
+              results[modelName].conflicts!.push({
+                recordId,
+                reason: err instanceof Error ? err.message : 'Unknown error',
+              })
             }
           }
         }
+      }
+
+      // Clean up empty conflicts arrays
+      if (results[modelName].conflicts!.length === 0) {
+        delete results[modelName].conflicts
       }
     }
 
@@ -573,12 +632,16 @@ app.post('/push', async (c) => {
       const err = authErrorResponse(error)
       return c.json({ success: err.success, error: err.error }, err.status as any)
     }
+    if (error instanceof IdempotencyConflictError) {
+      return c.json({ success: false, error: error.message }, 409)
+    }
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }
 })
 
 // GET /api/sync/status — Server sync status endpoint
+// Phase 5: Returns cursor info, pending mutations count, etc.
 app.get('/status', async (c) => {
   try {
     const agencyId = c.req.query('agencyId')
@@ -597,14 +660,14 @@ app.get('/status', async (c) => {
       serverUnixMs: now.getTime(),
       connectionStatus: realtimeHealthy ? 'connected' : 'disconnected',
       realtimeServiceHealthy: realtimeHealthy,
-      syncProtocolVersion: 1,
+      syncProtocolVersion: SYNC_PROTOCOL_VERSION,
     }
 
     if (!agencyId) {
       return c.json({ success: true, ...baseResponse, agency: null })
     }
 
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id: agencyId },
       select: { id: true },
     })
@@ -613,16 +676,34 @@ app.get('/status', async (c) => {
       return c.json({ success: true, ...baseResponse, agency: null })
     }
 
-    const lastSyncTime = agencyLastSync.get(agencyId)
+    // ── Cursor-based status ───────────────────────────────────────────────
+    const [syncCursor, latestSeq, pendingMutations, lastSyncTime] = await Promise.all([
+      // SyncCursor for this agency
+      cloudDb.syncCursor.findUnique({
+        where: { agencyId },
+        select: { lastPulledSeq: true, lastPushedSeq: true, lastPulledAt: true, lastPushedAt: true },
+      }),
+      // Latest SyncChange sequence
+      getLatestSequence(agencyId),
+      // Pending SyncMutations count
+      cloudDb.syncMutation.count({
+        where: { agencyId, status: 'pending' },
+      }),
+      // In-memory last sync time
+      Promise.resolve(agencyLastSync.get(agencyId)),
+    ])
 
     const [currentWaiting, currentCalled, queueSettings, latestReservation] = await Promise.all([
-      db.reservation.count({ where: { agencyId, status: 'WAITING' } }),
-      db.reservation.count({ where: { agencyId, status: 'CALLED' } }),
-      db.queueSettings.findFirst({ where: { agencyId }, select: { updatedAt: true, isPaused: true } }),
-      db.reservation.findFirst({ where: { agencyId }, orderBy: { joinedAt: 'desc' }, select: { joinedAt: true } }),
+      cloudDb.reservation.count({ where: { agencyId, status: 'WAITING' } }),
+      cloudDb.reservation.count({ where: { agencyId, status: 'CALLED' } }),
+      cloudDb.queueSettings.findFirst({ where: { agencyId }, select: { updatedAt: true, isPaused: true } }),
+      cloudDb.reservation.findFirst({ where: { agencyId }, orderBy: { joinedAt: 'desc' }, select: { joinedAt: true } }),
     ])
 
     let effectiveLastSync: Date | null = lastSyncTime || null
+    if (syncCursor?.lastPulledAt && (!effectiveLastSync || syncCursor.lastPulledAt > effectiveLastSync)) {
+      effectiveLastSync = syncCursor.lastPulledAt
+    }
     if (queueSettings?.updatedAt && (!effectiveLastSync || queueSettings.updatedAt > effectiveLastSync)) {
       effectiveLastSync = queueSettings.updatedAt
     }
@@ -631,6 +712,7 @@ app.get('/status', async (c) => {
     }
 
     const totalPendingEvents = currentWaiting + currentCalled
+    const changesBehind = latestSeq - (syncCursor?.lastPulledSeq ?? 0)
 
     return c.json({
       success: true,
@@ -643,6 +725,16 @@ app.get('/status', async (c) => {
         isPaused: queueSettings?.isPaused ?? false,
         currentWaiting,
         currentCalled,
+        // ── Cursor-based sync info ──────────────────────────────────
+        cursor: {
+          lastPulledSeq: syncCursor?.lastPulledSeq ?? 0,
+          lastPushedSeq: syncCursor?.lastPushedSeq ?? 0,
+          lastPulledAt: syncCursor?.lastPulledAt?.toISOString() ?? null,
+          lastPushedAt: syncCursor?.lastPushedAt?.toISOString() ?? null,
+        },
+        latestSequence: latestSeq,
+        changesBehind,
+        pendingMutations,
       },
     })
   } catch (error: unknown) {

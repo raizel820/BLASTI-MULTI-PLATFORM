@@ -34,8 +34,6 @@ export type ViewName =
   | 'admin-settings'
   | 'admin-subscription-plans'
   | 'admin-app-settings'
-  | 'admin-hardware'
-  | 'admin-hardware-requests'
   | 'admin-enterprise-requests'
   | 'kiosk'
   | 'agency-fullscreen'
@@ -118,8 +116,6 @@ const viewHashMap: Record<ViewName, string> = {
   'admin-settings': '#/admin/settings',
   'admin-subscription-plans': '#/admin/subscription-plans',
   'admin-app-settings': '#/admin/app-settings',
-  'admin-hardware': '#/admin/hardware',
-  'admin-hardware-requests': '#/admin/hardware-requests',
   'admin-enterprise-requests': '#/admin/enterprise-requests',
   'kiosk': '#/kiosk',
   'agency-fullscreen': '#/agency/fullscreen',
@@ -227,8 +223,7 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'agency-reviews', 'agency-subscription', 'agency-branches', 'agency-devices',
   'admin-dashboard', 'admin-transactions', 'admin-agencies', 'admin-audit',
   'admin-users', 'admin-analytics', 'admin-settings', 'admin-subscription-plans', 'admin-app-settings',
-  'admin-hardware', 'admin-enterprise-requests',
-  'admin-hardware-requests',
+  'admin-enterprise-requests',
   'kiosk', 'agency-fullscreen', 'agency-fullscreen-history',
 ]);
 
@@ -343,30 +338,6 @@ export const useAppStore = create<AppState>()(
 
       setSessionToken: (token) => {
         set({ sessionToken: token });
-        // Pass auth token to Electron main process for cloud sync
-        const w = window as any;
-        const currentUser = useAppStore.getState().user;
-        if (w.electronAPI?.setCloudSyncAuth) {
-          w.electronAPI.setCloudSyncAuth({ token, user: currentUser });
-        }
-        // CRITICAL: Also import session into the local API (port 3080)
-        // so that when cloud goes down and LAN failover kicks in,
-        // the local API accepts requests with this same token.
-        // Without this, every offline request gets 401 → "Failed to load data"
-        if (w.electronAPI?.setLocalApiSession && currentUser) {
-          w.electronAPI.setLocalApiSession({ token, user: currentUser });
-          // Also store in localStorage so buildAuthHeaders() can find it
-          try { localStorage.setItem('blasti-local-api-token', token); } catch { /* ignore */ }
-        } else if (w.electronAPI?.setLocalApiSession && !currentUser) {
-          // User might not be set yet — schedule a retry after setState settles
-          setTimeout(() => {
-            const retryUser = useAppStore.getState().user;
-            if (retryUser && w.electronAPI?.setLocalApiSession) {
-              w.electronAPI.setLocalApiSession({ token, user: retryUser });
-              try { localStorage.setItem('blasti-local-api-token', token); } catch { /* ignore */ }
-            }
-          }, 500);
-        }
       },
 
       setUser: (user) => {
@@ -422,16 +393,6 @@ export const useAppStore = create<AppState>()(
           pendingAgencyCode: null,
           onboarded: false,
         });
-        // Clear Electron cloud sync auth on logout
-        const w = window as any;
-        if (w.electronAPI?.clearCloudSyncAuth) {
-          w.electronAPI.clearCloudSyncAuth();
-        }
-        // Also clear local API session and token
-        if (w.electronAPI?.clearLocalApiSession) {
-          w.electronAPI.clearLocalApiSession();
-        }
-        try { localStorage.removeItem('blasti-local-api-token'); } catch { /* ignore */ }
         // Clear persisted storage AFTER set (persist middleware writes during set)
         // Also call the Hono backend logout endpoint to clear the JWT session cookie
         setTimeout(() => {

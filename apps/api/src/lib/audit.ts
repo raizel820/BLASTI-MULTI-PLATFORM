@@ -9,7 +9,7 @@
  *   await auditLog.userAction(userId, 'AGENCY_CREATE', 'AGENCY', agencyId, { name, customCode })
  */
 
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 
 export type AuditAction =
   | 'AGENCY_CREATE' | 'AGENCY_UPDATE' | 'AGENCY_DELETE'
@@ -53,7 +53,7 @@ export const auditLog = {
    */
   async userAction(entry: AuditLogEntry): Promise<void> {
     try {
-      await db.auditLog.create({
+      await cloudDb.auditLog.create({
         data: {
           userId: entry.userId,
           action: entry.action,

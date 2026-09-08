@@ -7,7 +7,7 @@
  * because the customer is already engaged via the app.
  */
 
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 
 /**
  * Cancel all PENDING delayed jobs for a specific user + reservation.
@@ -20,7 +20,7 @@ export async function cancelPendingCustomerAlerts(
   userId: string,
   reservationId: string,
 ): Promise<number> {
-  const result = await db.delayedJob.updateMany({
+  const result = await cloudDb.delayedJob.updateMany({
     where: {
       userId,
       reservationId,
@@ -52,7 +52,7 @@ export async function cancelAllPendingAlertsForUser(
   userId: string,
 ): Promise<number> {
   // First, find all active reservations for the user
-  const activeReservations = await db.reservation.findMany({
+  const activeReservations = await cloudDb.reservation.findMany({
     where: {
       userId,
       status: { in: ['WAITING', 'CALLED'] },

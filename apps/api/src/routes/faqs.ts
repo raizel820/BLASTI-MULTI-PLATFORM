@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { enforceRateLimit, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
 
 const app = new Hono()
@@ -10,7 +10,7 @@ app.get('/', async (c) => {
   try {
     clientIp = enforceRateLimit(c, PUBLIC_RATE_LIMIT)
 
-    const faqs = await db.fAQ.findMany({
+    const faqs = await cloudDb.fAQ.findMany({
       where: { isActive: true },
       orderBy: [{ order: 'asc' }, { createdAt: 'desc' }],
     })
@@ -41,7 +41,7 @@ app.get('/faqs', async (c) => {
     const where: Record<string, unknown> = { isActive: true }
     if (category) where.category = category
 
-    const faqs = await db.fAQ.findMany({
+    const faqs = await cloudDb.fAQ.findMany({
       where,
       orderBy: { order: 'asc' },
     })

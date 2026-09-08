@@ -1,5 +1,22 @@
 /**
- * BLASTI Desktop — Cloud Sync Loop
+ * @deprecated This file is DEPRECATED and should not be used.
+ * The active sync engine is at apps/desktop/local-api/sync-service.js
+ * The active database layer is at apps/desktop/local-api/lib/db.js
+ * The active API routes are at apps/desktop/local-api/index.js
+ *
+ * Use ./local-api/sync-service.js instead, which provides:
+ * - Version-based incremental sync (not timestamp-based)
+ * - Conflict resolution with _sync_conflicts table
+ * - Pending mutations WAL replay
+ * - Agency-scoped filtering
+ * - Exponential backoff
+ * - _lastCloudContactAt tracking for 3-day offline policy
+ *
+ * This file is kept for reference only and will be removed in a future release.
+ *
+ * ──────────────────────────────────────────────────────────────────────────────
+ *
+ * BLASTI Desktop — Cloud Sync Loop (LEGACY)
  *
  * Pushes local SQLite cache changes to the cloud server and pulls
  * cloud changes back, so the desktop stays in sync when internet
@@ -15,11 +32,11 @@
  * access to NextAuth cookies, so the renderer must provide the token.
  */
 
-const localDb = require('./local-db');
+const localDb = require('./local-db'); // @deprecated — uses separate better-sqlite3 DB; use ./local-api/lib/db instead
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const CLOUD_BASE_URL = process.env.BLASTI_API_URL || 'https://blasti.vercel.app';
+const CLOUD_BASE_URL = process.env.BLASTI_API_URL || 'https://blasti-api.vercel.app';
 const SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const INITIAL_DELAY_MS = 5000;
 

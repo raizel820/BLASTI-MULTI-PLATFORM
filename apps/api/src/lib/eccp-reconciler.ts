@@ -15,7 +15,7 @@
  *   const unreconciled = await getUnreconciledTransactions()
  */
 
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ export async function reconcileDate(date: string, adminId: string): Promise<Reco
   endOfDay.setHours(23, 59, 59, 999)
 
   // Get all completed transactions for the date
-  const transactions = await db.transaction.findMany({
+  const transactions = await cloudDb.transaction.findMany({
     where: {
       status: 'COMPLETED',
       createdAt: { gte: startOfDay, lte: endOfDay },
@@ -111,7 +111,7 @@ export async function reconcileDate(date: string, adminId: string): Promise<Reco
     // In a real system, we'd compare with bank/CCP records here
     // For now, we trust that COMPLETED transactions with webhookVerified = true are valid
     if (tx.webhookVerified || tx.paymentProvider === 'manual') {
-      await db.transaction.update({
+      await cloudDb.transaction.update({
         where: { id: tx.id },
         data: {
           reconciledAt: new Date(),
@@ -152,7 +152,7 @@ export async function reconcileDate(date: string, adminId: string): Promise<Reco
   }
 
   // Also check for any unmatched records (pending/failed transactions that should have been resolved)
-  const pendingOrFailed = await db.transaction.findMany({
+  const pendingOrFailed = await cloudDb.transaction.findMany({
     where: {
       status: { in: ['PENDING'] },
       createdAt: { gte: startOfDay, lte: endOfDay },
@@ -181,7 +181,7 @@ export async function reconcileDate(date: string, adminId: string): Promise<Reco
   }
 
   // Create audit log
-  await db.auditLog.create({
+  await cloudDb.auditLog.create({
     data: {
       userId: adminId,
       action: 'RECONCILIATION_RUN',
@@ -242,7 +242,7 @@ export async function getReconciliationReport(date: string): Promise<{
   const endOfDay = new Date(date)
   endOfDay.setHours(23, 59, 59, 999)
 
-  const transactions = await db.transaction.findMany({
+  const transactions = await cloudDb.transaction.findMany({
     where: {
       createdAt: { gte: startOfDay, lte: endOfDay },
     },
@@ -308,7 +308,7 @@ export async function getReconciliationReport(date: string): Promise<{
  */
 export async function getUnreconciledTransactions(limit: number = 50, offset: number = 0) {
   const [transactions, total] = await Promise.all([
-    db.transaction.findMany({
+    cloudDb.transaction.findMany({
       where: {
         status: 'COMPLETED',
         reconciledAt: null,
@@ -321,7 +321,7 @@ export async function getUnreconciledTransactions(limit: number = 50, offset: nu
       take: limit,
       skip: offset,
     }),
-    db.transaction.count({
+    cloudDb.transaction.count({
       where: {
         status: 'COMPLETED',
         reconciledAt: null,

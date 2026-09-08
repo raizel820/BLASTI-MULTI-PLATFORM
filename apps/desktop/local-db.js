@@ -1,5 +1,24 @@
 /**
- * BLASTI Desktop — Local SQLite Sync Cache
+ * @deprecated This file is DEPRECATED and should not be used.
+ * The active sync engine is at apps/desktop/local-api/sync-service.js
+ * The active database layer is at apps/desktop/local-api/lib/db.js
+ * The active API routes are at apps/desktop/local-api/index.js
+ *
+ * This file uses better-sqlite3 (blasti-lan-sync.db) which is a
+ * SEPARATE database from the Prisma-backed local.db used by the main local API.
+ * This creates a dual-database split-brain problem.
+ *
+ * The desktop app should use a SINGLE database: the Prisma SQLite at
+ * ~/.blasti/local/local.db (via ./local-api/lib/db.js).
+ *
+ * LAN kiosk sync should be routed through the Hono local API on port 3080,
+ * which reads/writes the same Prisma DB.
+ *
+ * This file is kept for reference only and will be removed in a future release.
+ *
+ * ──────────────────────────────────────────────────────────────────────────────
+ *
+ * BLASTI Desktop — Local SQLite Sync Cache (LEGACY)
  *
  * Main-process SQLite database that acts as the LAN sync hub.
  * Kiosks and tablets on the LAN sync to THIS database (via the

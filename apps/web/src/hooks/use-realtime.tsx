@@ -60,9 +60,7 @@ const REALTIME_TOKEN = process.env.NEXT_PUBLIC_REALTIME_TOKEN || ''
 /**
  * Resolves the correct Socket.IO connection URL based on the runtime platform:
  *
- * - Electron/Capacitor (native): connect directly to cloud API / realtime server.
- *   The renderer is at a different origin than the API server, and the gateway
- *   cannot proxy WebSocket upgrades reliably. Use BLASTI_CLOUD_URL or localhost:3003.
+ * - Capacitor (native): connect directly to cloud API / realtime server.
  * - If NEXT_PUBLIC_REALTIME_URL is explicitly set, use it.
  * - Otherwise (web browser): use relative path "/" so the Caddy gateway proxies
  *   the connection, and pass XTransformPort=3003 as a query parameter.
@@ -70,8 +68,7 @@ const REALTIME_TOKEN = process.env.NEXT_PUBLIC_REALTIME_TOKEN || ''
 function resolveSocketUrl(): string {
   // Native platform: connect directly to cloud API (no gateway proxy)
   if (isNativePlatform()) {
-    return (typeof process !== 'undefined' && (process as any).env?.BLASTI_CLOUD_URL)
-      || `http://localhost:${REALTIME_PORT}`
+    return `http://localhost:${REALTIME_PORT}`
   }
   // Explicit env override (e.g. for Capacitor builds with a specific URL)
   const nativeUrl = process.env.NEXT_PUBLIC_REALTIME_URL
@@ -123,12 +120,12 @@ function resolveSocketOptions(): Parameters<typeof io>[1] {
 let globalSocket: Socket | null = null
 let connectionCount = 0
 
-// LAN Socket.IO fallback (connects to desktop's local server when cloud is unreachable)
+// No LAN Socket.IO fallback on web-only build
 let lanSocket: Socket | null = null
 let lanSocketConnected = false
 
 function isNativePlatform(): boolean {
-  return !!(window as any).electronAPI || !!(window as any).Capacitor
+  return !!(window as any).Capacitor
 }
 
 function getSocket(): Socket {
@@ -163,53 +160,9 @@ interface UseRealtimeOptions {
 
 // ── LAN Socket Connection ──────────────────────────────────────────────────
 
+// LAN socket connection is not used on web-only build
 async function connectLanSocket() {
-  try {
-    const { getGlobalLanServer } = await import('@/hooks/use-lan-mode')
-    const server = getGlobalLanServer()
-    if (!server) return
-
-    // Skip LAN socket connection — the local API (port 3080) serves HTTP only,
-    // it does not run a Socket.IO server. Attempting to connect would spam
-    // WebSocket connection refused errors in the console. The cloud Socket.IO
-    // connection handles all realtime events; LAN failover is HTTP-only.
-    return
-    const lanUrl = `http://${server.ip}:${server.port}`
-    lanSocket = io(lanUrl, {
-      transports: ['websocket', 'polling'],
-      timeout: 5000,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 2000,
-    })
-
-    const queueEvents = [
-      'queue:called', 'queue:joined', 'queue:completed', 'queue:cancelled',
-      'queue:paused', 'queue:resumed', 'queue:walk-in', 'queue:postponed',
-      'notification:new', 'notification:read',
-      'agency:update', 'staff:update',
-    ]
-
-    lanSocket.on('connect', () => {
-      lanSocketConnected = true
-      console.log('[Realtime] LAN socket connected to', lanUrl)
-      // Update connection status to connected
-      setConnectionStatus('connected')
-    })
-
-    lanSocket.on('disconnect', () => {
-      lanSocketConnected = false
-      console.log('[Realtime] LAN socket disconnected')
-      if (!globalSocket?.connected) {
-        setConnectionStatus('disconnected')
-      }
-    })
-
-    lanSocket.on('error', () => {
-      lanSocketConnected = false
-    })
-  } catch (err) {
-    console.warn('[Realtime] LAN fallback failed:', err)
-  }
+  return
 }
 
 export function useRealtime(options?: UseRealtimeOptions) {
@@ -245,14 +198,6 @@ export function useRealtime(options?: UseRealtimeOptions) {
 
     const onDisconnect = (reason: string) => {
       setConnectionStatus('disconnected')
-
-      // On native platforms, try connecting to LAN server after 5s delay
-      if (isNativePlatform() && !lanSocket) {
-        setTimeout(() => {
-          if (globalSocket?.connected) return // cloud reconnected
-          connectLanSocket()
-        }, 5000)
-      }
     }
 
     const onConnecting = () => {

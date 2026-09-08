@@ -489,6 +489,31 @@ function pushSchema() {
     return
   }
 
+  // Handle "duplicate column name" errors — this happens when prisma db push generates
+  // ALTER TABLE ADD COLUMN for columns that already exist (schema drift between pushes).
+  // The fix is to force-reset the local DB and re-push from scratch.
+  // This is safe because the local DB is a sync target — all data comes from cloud.
+  if (stderr.includes('duplicate column name')) {
+    console.warn('[local-api:db] Schema drift detected (duplicate column). Force-resetting local DB and re-pushing...')
+    const resetResult = runPrismaCommand([
+      'db', 'push',
+      `--schema=${SCHEMA_PATH}`,
+      '--accept-data-loss',
+      '--skip-generate',
+      '--force-reset',
+    ], {
+      cwd: path.join(MONOREPO_ROOT, 'packages', 'db'),
+      timeout: 30000,
+      env: { DATABASE_URL },
+    })
+    if (resetResult.success) {
+      console.log('[local-api:db] Schema re-pushed after force-reset — OK')
+    } else {
+      console.error('[local-api:db] Force-reset schema push also failed:', resetResult.stderr.substring(0, 300))
+    }
+    return
+  }
+
   console.warn('[local-api:db] Schema push warning (exit', result.code + '):', stderr.substring(0, 300))
 }
 

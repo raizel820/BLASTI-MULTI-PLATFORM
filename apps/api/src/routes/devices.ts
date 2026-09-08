@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { requireAuth, authErrorResponse } from '../lib/auth'
 import { validateBody, deviceRegistrationSchema } from '../lib/validations'
 import { emitDeviceEvent } from '../lib/realtime-emit'
@@ -20,7 +20,7 @@ app.post('/', async (c) => {
 
     const { platform, deviceToken, deviceId, appVersion, deviceFingerprint } = validation.data
 
-    const device = await db.deviceRegistration.upsert({
+    const device = await cloudDb.deviceRegistration.upsert({
       where: { userId_deviceId: { userId, deviceId } },
       update: {
         platform,
@@ -60,7 +60,7 @@ app.get('/', async (c) => {
       return c.json({ success: false, error: 'Cannot access devices for another user' }, 403)
     }
 
-    const devices = await db.deviceRegistration.findMany({
+    const devices = await cloudDb.deviceRegistration.findMany({
       where: { userId },
       orderBy: { lastActiveAt: 'desc' },
     })
@@ -83,13 +83,13 @@ app.delete('/', async (c) => {
 
     if (!deviceId) return c.json({ success: false, error: 'deviceId is required' }, 400)
 
-    const device = await db.deviceRegistration.findUnique({
+    const device = await cloudDb.deviceRegistration.findUnique({
       where: { userId_deviceId: { userId, deviceId } },
     })
 
     if (!device) return c.json({ success: false, error: 'Device not found or does not belong to you' }, 404)
 
-    await db.deviceRegistration.delete({ where: { id: device.id } })
+    await cloudDb.deviceRegistration.delete({ where: { id: device.id } })
 
     return c.json({ success: true })
   } catch (error: unknown) {

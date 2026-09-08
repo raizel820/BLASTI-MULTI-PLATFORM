@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { enforceRateLimit, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
 
 const app = new Hono()
@@ -10,7 +10,7 @@ app.get('/', async (c) => {
   try {
     clientIp = enforceRateLimit(c, PUBLIC_RATE_LIMIT)
 
-    let settings = await db.paymentSettings.findFirst()
+    let settings = await cloudDb.paymentSettings.findFirst()
     if (!settings) {
       if (clientIp) recordSuccessfulRequest(clientIp)
       return c.json({

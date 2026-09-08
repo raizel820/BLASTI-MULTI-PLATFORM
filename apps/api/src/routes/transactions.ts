@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { requireAuth, requireAgencyAccess, authErrorResponse } from '../lib/auth'
 import { validateBody } from '../lib/validations'
 import { z } from 'zod'
@@ -27,13 +27,13 @@ app.post('/', async (c) => {
 
     await requireAgencyAccess(c, agencyId)
 
-    const agency = await db.agency.findUnique({ where: { id: agencyId } })
+    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
 
     // Snapshot: look up the current SubscriptionPlan to freeze price & name
     let planName: string | undefined
     let amountPaid: number | undefined
-    const subscriptionPlan = await db.subscriptionPlan.findFirst({
+    const subscriptionPlan = await cloudDb.subscriptionPlan.findFirst({
       where: { name: plan, isActive: true },
     })
     if (subscriptionPlan) {
@@ -45,11 +45,11 @@ app.post('/', async (c) => {
       amountPaid = amount
     }
 
-    const transaction = await db.transaction.create({
+    const transaction = await cloudDb.transaction.create({
       data: { agencyId, amount, plan, paymentMethod, receiptUrl, status: 'PENDING', amountPaid, planName },
     })
 
-    await db.agency.update({ where: { id: agencyId }, data: { subscriptionStatus: 'PENDING' } })
+    await cloudDb.agency.update({ where: { id: agencyId }, data: { subscriptionStatus: 'PENDING' } })
 
     return c.json({ success: true, transaction }, 201)
   } catch (error: unknown) {
@@ -70,14 +70,14 @@ app.get('/', async (c) => {
     if (status) where.status = status
 
     if (user.role !== 'SUPER_ADMIN') {
-      const ownedAgency = await db.agency.findFirst({
+      const ownedAgency = await cloudDb.agency.findFirst({
         where: { ownerId: user.id },
         select: { id: true },
       })
       if (ownedAgency) {
         where.agencyId = ownedAgency.id
       } else {
-        const staffRecord = await db.agencyStaff.findFirst({
+        const staffRecord = await cloudDb.agencyStaff.findFirst({
           where: { userId: user.id, isActive: true },
           select: { agencyId: true },
         })
@@ -90,7 +90,7 @@ app.get('/', async (c) => {
     }
 
     const [transactions, total] = await Promise.all([
-      db.transaction.findMany({
+      cloudDb.transaction.findMany({
         where,
         include: {
           agency: { select: { id: true, name: true, customCode: true, category: true, subscriptionTier: true, subscriptionStatus: true } },
@@ -100,7 +100,7 @@ app.get('/', async (c) => {
         take: limit,
         skip: offset,
       }),
-      db.transaction.count({ where }),
+      cloudDb.transaction.count({ where }),
     ])
 
     return c.json({ success: true, transactions, total, limit, offset })
@@ -124,7 +124,7 @@ app.put('/:id/review', async (c) => {
 
     const { status, rejectionReason } = validation.data
 
-    const existingTransaction = await db.transaction.findUnique({ where: { id } })
+    const existingTransaction = await cloudDb.transaction.findUnique({ where: { id } })
     if (!existingTransaction) return c.json({ success: false, error: 'Transaction not found' }, 404)
 
     const reviewedBy = user.id
@@ -132,7 +132,7 @@ app.put('/:id/review', async (c) => {
     // Optimistic Concurrency Control: include current version in WHERE, increment in data.
     // If two admins approve simultaneously, only the first update will match the version;
     // the second will affect 0 rows → conflict error, preventing double-grant.
-    const updateResult = await db.transaction.updateMany({
+    const updateResult = await cloudDb.transaction.updateMany({
       where: { id, status: 'PENDING', version: existingTransaction.version },
       data: {
         status,
@@ -148,7 +148,7 @@ app.put('/:id/review', async (c) => {
     }
 
     // Fetch the updated record separately for the response
-    const updatedTransaction = await db.transaction.findUnique({
+    const updatedTransaction = await cloudDb.transaction.findUnique({
       where: { id },
       include: {
         agency: { select: { id: true, name: true, customCode: true, subscriptionTier: true, subscriptionStatus: true } },
@@ -158,11 +158,11 @@ app.put('/:id/review', async (c) => {
     if (status === 'APPROVED') {
       // Use snapshot values (amountPaid / planName) when updating agency tier
       const effectivePlan = existingTransaction.planName || existingTransaction.plan
-      await db.agency.update({ where: { id: existingTransaction.agencyId }, data: { subscriptionStatus: 'ACTIVE', subscriptionTier: existingTransaction.plan } })
+      await cloudDb.agency.update({ where: { id: existingTransaction.agencyId }, data: { subscriptionStatus: 'ACTIVE', subscriptionTier: existingTransaction.plan } })
 
       // If amountPaid wasn't set at creation (legacy rows), backfill it now
       if (existingTransaction.amountPaid === null || existingTransaction.amountPaid === undefined) {
-        await db.transaction.update({
+        await cloudDb.transaction.update({
           where: { id: existingTransaction.id },
           data: {
             amountPaid: existingTransaction.amount,
@@ -173,10 +173,10 @@ app.put('/:id/review', async (c) => {
     }
 
     if (status === 'REJECTED') {
-      await db.agency.update({ where: { id: existingTransaction.agencyId }, data: { subscriptionStatus: 'INACTIVE' } })
+      await cloudDb.agency.update({ where: { id: existingTransaction.agencyId }, data: { subscriptionStatus: 'INACTIVE' } })
     }
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: reviewedBy,
         action: status === 'APPROVED' ? 'PAYMENT_APPROVE' : 'PAYMENT_REJECT',

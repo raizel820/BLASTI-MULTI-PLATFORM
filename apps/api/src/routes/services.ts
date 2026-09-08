@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { requireAgencyAccess, authErrorResponse } from '../lib/auth'
 import { createServiceSchema, validateBody } from '../lib/validations'
 
@@ -11,7 +11,7 @@ app.get('/', async (c) => {
     const agencyId = c.req.query('agencyId')
     if (!agencyId) return c.json({ success: false, error: 'agencyId is required' }, 400)
 
-    const services = await db.service.findMany({
+    const services = await cloudDb.service.findMany({
       where: { agencyId, isActive: true },
       orderBy: { name: 'asc' },
     })
@@ -38,10 +38,10 @@ app.post('/', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    const agency = await db.agency.findUnique({ where: { id: agencyId } })
+    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
 
-    const service = await db.service.create({
+    const service = await cloudDb.service.create({
       data: {
         agencyId,
         name: validation.data.name,
@@ -63,12 +63,12 @@ app.delete('/:id', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const service = await db.service.findUnique({ where: { id } })
+    const service = await cloudDb.service.findUnique({ where: { id } })
     if (!service) return c.json({ success: false, error: 'Service not found' }, 404)
 
     await requireAgencyAccess(c, service.agencyId)
 
-    const updatedService = await db.service.update({ where: { id }, data: { isActive: false } })
+    const updatedService = await cloudDb.service.update({ where: { id }, data: { isActive: false } })
 
     return c.json({ success: true, service: updatedService })
   } catch (error: unknown) {

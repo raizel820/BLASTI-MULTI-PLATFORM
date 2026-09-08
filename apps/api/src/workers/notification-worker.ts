@@ -8,7 +8,7 @@
  * 3. Logs each processed job for observability
  */
 
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { sendSms, type SendSmsResult } from '../lib/sms-service'
 
 const POLL_INTERVAL_MS = 30_000 // 30 seconds
@@ -54,7 +54,7 @@ interface DelayedJobPayload {
 async function processPendingJobs(): Promise<number> {
   const now = new Date()
 
-  const pendingJobs = await db.delayedJob.findMany({
+  const pendingJobs = await cloudDb.delayedJob.findMany({
     where: {
       status: 'PENDING',
       executeAt: { lte: now },
@@ -83,7 +83,7 @@ async function processPendingJobs(): Promise<number> {
       const { phone, message, agencyId, userId, channel } = payload
 
       // ── Step 1: Look up agency to decide who pays for SMS ──
-      const agency = await db.agency.findUnique({
+      const agency = await cloudDb.agency.findUnique({
         where: { id: agencyId },
         select: {
           id: true,
@@ -95,7 +95,7 @@ async function processPendingJobs(): Promise<number> {
 
       if (!agency) {
         console.warn(`[notification-worker] Agency ${agencyId} not found for job ${job.id} — cancelling`)
-        await db.delayedJob.update({
+        await cloudDb.delayedJob.update({
           where: { id: job.id },
           data: { status: 'CANCELLED' },
         })
@@ -106,7 +106,7 @@ async function processPendingJobs(): Promise<number> {
       // If user is APP_ONLY or already online, cancel the carrier alert
       if (job.user.isAppOnline) {
         console.log(`[notification-worker] User ${userId} is online — cancelling carrier alert job ${job.id}`)
-        await db.delayedJob.update({
+        await cloudDb.delayedJob.update({
           where: { id: job.id },
           data: { status: 'CANCELLED' },
         })
@@ -118,7 +118,7 @@ async function processPendingJobs(): Promise<number> {
       // APP_ONLY preference → no carrier alert needed
       if (effectiveChannel === 'APP_ONLY') {
         console.log(`[notification-worker] User ${userId} pref is APP_ONLY — cancelling job ${job.id}`)
-        await db.delayedJob.update({
+        await cloudDb.delayedJob.update({
           where: { id: job.id },
           data: { status: 'CANCELLED' },
         })
@@ -141,7 +141,7 @@ async function processPendingJobs(): Promise<number> {
           `[notification-worker] Insufficient balance for job ${job.id} ` +
           `(agency.sponsorSms=${agency.sponsorSms}, agency.smsBalance=${agency.smsBalance}, user.freeSmsCount=${job.user.freeSmsCount}) — cancelling`
         )
-        await db.delayedJob.update({
+        await cloudDb.delayedJob.update({
           where: { id: job.id },
           data: { status: 'CANCELLED' },
         })
@@ -153,7 +153,7 @@ async function processPendingJobs(): Promise<number> {
 
       if (!targetPhone) {
         console.warn(`[notification-worker] No phone number for user ${userId} — cancelling job ${job.id}`)
-        await db.delayedJob.update({
+        await cloudDb.delayedJob.update({
           where: { id: job.id },
           data: { status: 'CANCELLED' },
         })
@@ -176,7 +176,7 @@ async function processPendingJobs(): Promise<number> {
       if (sendResult.success) {
         // Deduct 1 from the appropriate balance
         if (agency.sponsorSms) {
-          await db.agency.update({
+          await cloudDb.agency.update({
             where: { id: agencyId },
             data: { smsBalance: { decrement: 1 } },
           })
@@ -184,7 +184,7 @@ async function processPendingJobs(): Promise<number> {
         // Note: sendSms() already deducts from user.freeSmsCount when userId is passed,
         // so we only need to handle the agency-sponsored case explicitly.
 
-        await db.delayedJob.update({
+        await cloudDb.delayedJob.update({
           where: { id: job.id },
           data: { status: 'SENT' },
         })
@@ -198,7 +198,7 @@ async function processPendingJobs(): Promise<number> {
         console.error(
           `[notification-worker] Failed to send job ${job.id}: ${sendResult.error} — cancelling`
         )
-        await db.delayedJob.update({
+        await cloudDb.delayedJob.update({
           where: { id: job.id },
           data: { status: 'CANCELLED' },
         })
@@ -206,7 +206,7 @@ async function processPendingJobs(): Promise<number> {
     } catch (error) {
       console.error(`[notification-worker] Failed to process job ${job.id}:`, error)
       try {
-        await db.delayedJob.update({
+        await cloudDb.delayedJob.update({
           where: { id: job.id },
           data: { status: 'CANCELLED' },
         })

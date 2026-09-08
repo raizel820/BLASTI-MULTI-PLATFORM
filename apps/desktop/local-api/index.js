@@ -21,8 +21,17 @@
 const { Hono } = require('hono')
 const { cors } = require('hono/cors')
 const { createServer } = require('http')
-const { randomBytes, timingSafeEqual, createHash, timingSafeEqual: _tse } = require('crypto')
+const path = require('path')
+const { randomBytes, timingSafeEqual, createHash } = require('crypto')
 const { localDb, setupPragmas } = require('./lib/db')
+
+// ─── Socket.IO (optional) ────────────────────────────────────────────────────
+let socketIO = null
+try {
+  socketIO = require('socket.io')
+} catch (_e) {
+  // socket.io not installed — realtime events will only go to local listeners
+}
 
 // ─── Configuration ────────────────────────────────────────────────────────
 
@@ -32,18 +41,247 @@ const CORS_ORIGINS = [
   'http://localhost:3000',
   'http://localhost:3080',
   'http://localhost:3111',
+  'http://localhost:5173',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:3080',
   'http://127.0.0.1:3111',
+  'http://127.0.0.1:5173',
 ]
+
+// ─── Cloud URL Resolution ─────────────────────────────────────────────────
+
+let _resolvedCloudUrl = null
+
+/**
+ * Get the resolved cloud API base URL.
+ * Priority: BLASTI_CLOUD_URL → BLASTI_API_URL → dev/prod defaults.
+ * The result is cached after first call and logged once.
+ *
+ * IMPORTANT: This points to the Hono API server, NOT the Next.js frontend.
+ * - ✅ https://blasti-api.vercel.app  (API server)
+ * - ✅ http://localhost:3003           (local dev API)
+ * - ❌ https://blasti.vercel.app       (Next.js frontend — will 404 on /api/auth/login)
+ */
+function getCloudUrl() {
+  if (_resolvedCloudUrl) return _resolvedCloudUrl
+
+  // Dev mode detection — check env vars AND --dev CLI flag (Electron passes it via process.argv)
+  const isDevMode = process.env.NODE_ENV === 'development' ||
+    process.env.ELECTRON_DEV === '1' ||
+    (process.argv && process.argv.includes('--dev'))
+
+  if (process.env.BLASTI_CLOUD_URL) {
+    _resolvedCloudUrl = process.env.BLASTI_CLOUD_URL
+  } else if (process.env.BLASTI_API_URL) {
+    _resolvedCloudUrl = process.env.BLASTI_API_URL
+  } else if (isDevMode) {
+    _resolvedCloudUrl = 'http://localhost:3003'
+  } else {
+    _resolvedCloudUrl = 'https://blasti-api.vercel.app'
+  }
+
+  console.log('[LocalAPI] Cloud API URL resolved to:', _resolvedCloudUrl, '(isDevMode:', isDevMode, ')')
+  return _resolvedCloudUrl
+}
 
 // ─── Module-level State ───────────────────────────────────────────────────
 
 let db = null
 let httpServer = null
+let ioServer = null  // Socket.IO server instance (optional)
 let sessionToken = null
 let sessionUser = null
 let eventListeners = []
+let _isSyncing = false
+let _lastSyncAt = null
+let _pendingMutationsCount = 0
+let _lastCloudContactAt = null  // Timestamp of last successful cloud communication
+const OFFLINE_TOKEN_MAX_MS = 3 * 24 * 60 * 60 * 1000  // 3 days — max offline duration before re-auth required
+let _monotonicStart = process.hrtime.bigint()  // Monotonic clock reference point for clock-manipulation detection
+let _wallClockAtStart = Date.now()  // Wall clock at monotonic start
+
+// ─── Transactional Write Helpers ───────────────────────────────────────────
+
+/**
+ * Execute a write operation atomically with the local SQLite database.
+ * Wraps the operation in a Prisma $transaction for crash safety.
+ * If the transaction fails, it rolls back and the error is thrown.
+ */
+async function atomicWrite(writeFn) {
+  if (!db) throw new Error('Database not initialized')
+  return db.$transaction(writeFn, { maxWait: 5000, timeout: 10000 })
+}
+
+/**
+ * Execute a write + pending mutation record atomically.
+ * This ensures that if the local write succeeds but the mutation record fails,
+ * the entire operation rolls back. This prevents orphaned writes without
+ * mutation tracking (which would be lost on the next sync push).
+ */
+async function atomicWriteWithMutation(writeFn, mutationData) {
+  if (!db) throw new Error('Database not initialized')
+  return db.$transaction(async (tx) => {
+    const result = await writeFn(tx)
+    if (mutationData) {
+      await ensurePendingMutationsTable()
+      const id = require('crypto').randomUUID()
+      const iKey = mutationData.idempotencyKey || 
+        (mutationData.method === 'POST' ? `${mutationData.method}:${mutationData.path}:${id}` : null)
+      await tx.$executeRawUnsafe(
+        'INSERT OR IGNORE INTO "_pending_mutations" (id, method, path, body, idempotency_key, status, created_at, response_data) VALUES (?, ?, ?, ?, ?, \'pending\', ?, ?)',
+        id,
+        mutationData.method,
+        mutationData.path,
+        mutationData.body ? JSON.stringify(mutationData.body) : null,
+        iKey,
+        Date.now(),
+        result ? JSON.stringify(result) : null
+      )
+    }
+    return result
+  }, { maxWait: 5000, timeout: 10000 })
+}
+
+// ─── Sync Cursor State ────────────────────────────────────────────────────
+
+let _lastPulledSequence = 0
+let _lastPushedSequence = 0
+const _syncProtocolVersion = 1
+const _syncModelCount = 12  // Number of syncable models
+
+/**
+ * Get a tamper-resistant timestamp. Uses monotonic clock (hrtime) as primary
+ * and falls back to wall clock. Detects clock manipulation by comparing
+ * the wall clock delta vs monotonic delta.
+ */
+function _safeTimestamp() {
+  const monotonicMs = Number(process.hrtime.bigint() - _monotonicStart) / 1_000_000
+  const wallClockDelta = Date.now() - _wallClockAtStart
+  // If wall clock went backward or drifted >10min from monotonic, prefer monotonic
+  if (wallClockDelta < 0 || Math.abs(wallClockDelta - monotonicMs) > 600_000) {
+    return _wallClockAtStart + Math.round(monotonicMs)
+  }
+  return Date.now()
+}
+
+/**
+ * Persist _lastCloudContactAt to a file so it survives app restarts.
+ */
+function _persistCloudContact() {
+  try {
+    const fs = require('fs')
+    const os = require('os')
+    const dir = process.env.BLASTI_LOCAL_DB_DIR || path.join(os.homedir(), '.blasti', 'local')
+    const filePath = path.join(dir, 'last-cloud-contact.json')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(filePath, JSON.stringify({ lastCloudContactAt: _lastCloudContactAt, persistedAt: Date.now() }), 'utf-8')
+  } catch (e) {
+    // Non-critical — best effort
+  }
+}
+
+/**
+ * Restore _lastCloudContactAt from persisted file on startup.
+ */
+function _restoreCloudContact() {
+  try {
+    const fs = require('fs')
+    const os = require('os')
+    const dir = process.env.BLASTI_LOCAL_DB_DIR || path.join(os.homedir(), '.blasti', 'local')
+    const filePath = path.join(dir, 'last-cloud-contact.json')
+    if (fs.existsSync(filePath)) {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+      if (data && data.lastCloudContactAt) {
+        _lastCloudContactAt = data.lastCloudContactAt
+        _monotonicStart = process.hrtime.bigint()
+        _wallClockAtStart = Date.now()
+        console.log('[LocalAPI] Restored _lastCloudContactAt from disk:', new Date(_lastCloudContactAt).toISOString())
+      }
+    }
+  } catch (e) {
+    // Non-critical
+  }
+}
+
+// ─── Session Persistence ──────────────────────────────────────────────────
+
+/**
+ * Get the path for the persisted session file.
+ */
+function _sessionFilePath() {
+  const fs = require('fs')
+  const os = require('os')
+  const dir = process.env.BLASTI_LOCAL_DB_DIR || path.join(os.homedir(), '.blasti', 'local')
+  return path.join(dir, 'session.json')
+}
+
+/**
+ * Persist current session to disk so it survives Electron restarts.
+ */
+function persistSession() {
+  if (!sessionToken || !sessionUser) return
+  try {
+    const fs = require('fs')
+    const filePath = _sessionFilePath()
+    const dir = path.dirname(filePath)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(filePath, JSON.stringify({
+      token: sessionToken,
+      user: sessionUser,
+      persistedAt: Date.now(),
+      lastCloudContactAt: _lastCloudContactAt,
+    }, null, 0), 'utf-8')
+    console.log('[LocalAPI] Session persisted to disk')
+  } catch (e) {
+    console.warn('[LocalAPI] Failed to persist session:', e.message)
+  }
+}
+
+/**
+ * Load persisted session from disk (called at startup).
+ * Restores sessionToken, sessionUser, and _lastCloudContactAt.
+ */
+function loadPersistedSession() {
+  try {
+    const fs = require('fs')
+    const filePath = _sessionFilePath()
+    if (!fs.existsSync(filePath)) return false
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+    if (!data || !data.token || !data.user) return false
+    // Don't restore sessions older than 3 days
+    if (data.persistedAt && (Date.now() - data.persistedAt > OFFLINE_TOKEN_MAX_MS)) {
+      console.log('[LocalAPI] Persisted session expired (>3 days old), discarding')
+      try { fs.unlinkSync(filePath) } catch { /* ignore */ }
+      return false
+    }
+    sessionToken = data.token
+    sessionUser = data.user
+    if (data.lastCloudContactAt) {
+      _lastCloudContactAt = data.lastCloudContactAt
+    }
+    console.log('[LocalAPI] Restored session from disk for:', data.user.username || data.user.id)
+    return true
+  } catch (e) {
+    console.warn('[LocalAPI] Failed to load persisted session:', e.message)
+    return false
+  }
+}
+
+/**
+ * Delete the persisted session file (called on logout).
+ */
+function deletePersistedSession() {
+  try {
+    const fs = require('fs')
+    const filePath = _sessionFilePath()
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath)
+      console.log('[LocalAPI] Persisted session deleted')
+    }
+  } catch (e) {
+    console.warn('[LocalAPI] Failed to delete persisted session:', e.message)
+  }
+}
 
 // ─── Event Emitter (UI reactivity) ────────────────────────────────────────
 
@@ -53,11 +291,25 @@ let eventListeners = []
  * @param {object} payload
  */
 function emitEvent(event, payload) {
+  // Broadcast to all registered local UI listeners
   for (const cb of eventListeners) {
     try {
       cb(event, payload)
     } catch (err) {
       console.error('[LocalAPI] Event listener error:', err)
+    }
+  }
+  // Broadcast to Socket.IO clients if available
+  if (ioServer) {
+    try {
+      const agencyId = payload?.agencyId || (sessionUser && sessionUser.agencyId)
+      if (agencyId) {
+        ioServer.to(`agency:${agencyId}`).emit(event, payload)
+      }
+      // Also emit to a global room for admin/monitoring clients
+      ioServer.emit(event, payload)
+    } catch (err) {
+      console.error('[LocalAPI] Socket.IO broadcast error:', err)
     }
   }
 }
@@ -71,6 +323,75 @@ function onEvent(callback) {
   eventListeners.push(callback)
   return () => {
     eventListeners = eventListeners.filter((cb) => cb !== callback)
+  }
+}
+
+// ─── Socket.IO Setup ────────────────────────────────────────────────────────
+
+/**
+ * Set up Socket.IO on the given HTTP server for local realtime events.
+ * If socket.io is not available, this is a no-op.
+ * @param {import('http').Server} server - The HTTP server to attach Socket.IO to
+ * @returns {import('socket.io').Server | null} The Socket.IO server instance, or null
+ */
+function setupSocketIO(server) {
+  if (!socketIO || !server) {
+    console.log('[LocalAPI] Socket.IO not available — realtime events are local-only')
+    return null
+  }
+  try {
+    ioServer = new socketIO.Server(server, {
+      cors: {
+        origin: CORS_ORIGINS,
+        methods: ['GET', 'POST'],
+        credentials: true,
+      },
+      path: '/socket.io',
+      // Reduce overhead for local-only usage
+      pingInterval: 25000,
+      pingTimeout: 5000,
+    })
+
+    // Client authentication middleware
+    ioServer.use((socket, next) => {
+      const token = socket.handshake.auth.token || socket.handshake.query.token
+      if (!token || !sessionToken || !timingSafeEqual(
+        Buffer.from(String(token)),
+        Buffer.from(String(sessionToken))
+      )) {
+        return next(new Error('Authentication failed'))
+      }
+      next()
+    })
+
+    ioServer.on('connection', (socket) => {
+      const agencyId = sessionUser?.agencyId
+      if (agencyId) {
+        socket.join(`agency:${agencyId}`)
+      }
+      console.log(`[LocalAPI] Socket.IO client connected: ${socket.id} (agency: ${agencyId || 'none'})`)
+
+      socket.on('disconnect', () => {
+        console.log(`[LocalAPI] Socket.IO client disconnected: ${socket.id}`)
+      })
+
+      // Allow clients to explicitly join an agency room
+      socket.on('join:agency', (joinAgencyId, ack) => {
+        if (joinAgencyId && typeof ack === 'function') {
+          socket.join(`agency:${joinAgencyId}`)
+          ack({ success: true })
+        } else if (typeof ack === 'function') {
+          ack({ success: false, error: 'agencyId required' })
+        }
+      })
+    })
+
+    console.log('[LocalAPI] Socket.IO realtime server attached')
+    return ioServer
+  } catch (err) {
+    console.error('[LocalAPI] Failed to set up Socket.IO:', err)
+    ioServer = null
+    return null
   }
 }
 
@@ -124,6 +445,39 @@ function requireAuth() {
       return c.json({ success: false, error: 'Local database not ready (PrismaClient not initialized)' }, 503)
     }
 
+    // 3-day offline token policy: if the app hasn't contacted the cloud in 3 days,
+    // require re-authentication. This ensures stale offline sessions are eventually
+    // refreshed. Cloud-only routes (registration, payment) are already blocked by
+    // the cloud-proxy returning 503, but data routes should still force re-auth.
+    // If _lastCloudContactAt is null (never had cloud contact or not yet restored),
+    // allow a 24-hour grace window for local-only login, then require re-auth.
+    if (_lastCloudContactAt) {
+      const offlineDuration = _safeTimestamp() - _lastCloudContactAt
+      if (offlineDuration > OFFLINE_TOKEN_MAX_MS) {
+        return c.json({
+          success: false,
+          error: 'Session expired — offline for more than 3 days. Please reconnect to the internet and log in again.',
+          code: 'OFFLINE_SESSION_EXPIRED',
+          offlineDays: Math.floor(offlineDuration / (24 * 60 * 60 * 1000)),
+        }, 401)
+      }
+    } else if (!sessionToken?.startsWith?.('eyJ')) {
+      // No cloud contact recorded and this is a local-only session (not a JWT from cloud).
+      // Allow a 24-hour grace period, then require online login.
+      // JWT sessions (from cloud import-session) are exempt — they were just authenticated.
+      const localLoginGrace = 24 * 60 * 60 * 1000 // 24 hours
+      if (sessionUser?._loggedInAt) {
+        const sinceLocalLogin = _safeTimestamp() - sessionUser._loggedInAt
+        if (sinceLocalLogin > localLoginGrace) {
+          return c.json({
+            success: false,
+            error: 'Local session expired — no cloud contact recorded. Please connect to the internet and log in.',
+            code: 'OFFLINE_SESSION_EXPIRED',
+          }, 401)
+        }
+      }
+    }
+
     // Attach user and db to context
     c.set('user', sessionUser)
     c.set('db', db)
@@ -138,10 +492,64 @@ function requireAgencyId(c) {
   const user = c.get('user')
   const agencyId = user?.agencyId
   if (!agencyId) {
-    c.json({ success: false, error: 'No agency associated with this account' }, 403)
     return null
   }
   return agencyId
+}
+
+/**
+ * Middleware: require active subscription for queue operations.
+ * Checks the agency's subscriptionStatus in local DB.
+ * Allows ACTIVE and TRIAL statuses. Blocks EXPIRED, INACTIVE, PENDING.
+ * Also enforces subscriptionExpiresAt — if past, flips to EXPIRED in DB.
+ */
+function requireActiveSubscription() {
+  return async (c, next) => {
+    if (!db || !sessionUser?.agencyId) {
+      // No agency or no DB — let the route handler deal with it
+      await next()
+      return
+    }
+    try {
+      const agency = await db.agency.findUnique({
+        where: { id: sessionUser.agencyId },
+        select: { subscriptionStatus: true, subscriptionExpiresAt: true },
+      })
+      if (!agency) {
+        await next()
+        return
+      }
+
+      // Check if subscription has expired based on date
+      let status = agency.subscriptionStatus
+      if (agency.subscriptionExpiresAt) {
+        const diffMs = new Date(agency.subscriptionExpiresAt).getTime() - Date.now()
+        if (diffMs <= 0 && (status === 'ACTIVE' || status === 'TRIAL')) {
+          // Subscription has expired — persist to local DB
+          status = 'EXPIRED'
+          await db.agency.update({
+            where: { id: sessionUser.agencyId },
+            data: { subscriptionStatus: 'EXPIRED' },
+          }).catch(() => {})
+        }
+      }
+
+      // Only ACTIVE and TRIAL can use queue features
+      if (status !== 'ACTIVE' && status !== 'TRIAL') {
+        return c.json({
+          success: false,
+          error: 'An active subscription is required to use queue features',
+          subscriptionStatus: status,
+        }, 403)
+      }
+
+      await next()
+    } catch (err) {
+      // On error, allow the request through — don't block on subscription check failure
+      console.error('[LocalAPI] Subscription check error:', err.message)
+      await next()
+    }
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -180,6 +588,7 @@ async function ensurePendingMutationsTable() {
       '"path" TEXT NOT NULL,' +
       '"body" TEXT,' +
       '"headers" TEXT,' +
+      '"idempotency_key" TEXT,' +
       '"status" TEXT NOT NULL DEFAULT \'pending\',' +
       '"attempts" INTEGER NOT NULL DEFAULT 0,' +
       '"max_attempts" INTEGER NOT NULL DEFAULT 5,' +
@@ -192,6 +601,9 @@ async function ensurePendingMutationsTable() {
     await db.$executeRawUnsafe(
       'CREATE INDEX IF NOT EXISTS "idx_pending_mutations_status" ON "_pending_mutations"("status")'
     )
+    await db.$executeRawUnsafe(
+      'CREATE UNIQUE INDEX IF NOT EXISTS "idx_pending_mutations_idempotency" ON "_pending_mutations"("idempotency_key") WHERE "idempotency_key" IS NOT NULL'
+    ).catch(() => {}) // Ignore if already exists
   } catch (e) {
     console.error('[LocalAPI] Failed to create _pending_mutations table:', e.message)
   }
@@ -201,17 +613,20 @@ async function ensurePendingMutationsTable() {
  * Log a mutation to the pending queue.
  * Called by write handlers (POST/PUT/PATCH/DELETE) when cloud is unreachable.
  */
-async function logPendingMutation(method, path, body, responseData) {
+async function logPendingMutation(method, path, body, responseData, idempotencyKey) {
   if (!db) return
   try {
     await ensurePendingMutationsTable()
     const id = require('crypto').randomUUID()
+    // Generate idempotency key for POST creates to prevent duplicates on replay
+    const iKey = idempotencyKey || (method === 'POST' ? `${method}:${path}:${id}` : null)
     await db.$executeRawUnsafe(
-      'INSERT INTO "_pending_mutations" (id, method, path, body, status, created_at, response_data) VALUES (?, ?, ?, ?, \'pending\', ?, ?)',
+      'INSERT OR IGNORE INTO "_pending_mutations" (id, method, path, body, idempotency_key, status, created_at, response_data) VALUES (?, ?, ?, ?, ?, \'pending\', ?, ?)',
       id,
       method,
       path,
       body ? JSON.stringify(body) : null,
+      iKey,
       Date.now(),
       responseData ? JSON.stringify(responseData) : null
     )
@@ -355,41 +770,215 @@ function createApp() {
         return c.json({ success: false, error: 'Username and password required' }, 400)
       }
 
-      // Find user in local SQLite
-      const user = await db.user.findUnique({ where: { username } })
-      if (!user) {
-        return c.json({ success: false, error: 'Invalid username or password' }, 401)
+      // ══════════════════════════════════════════════════════════════════
+      // CLOUD-FIRST LOGIN ARCHITECTURE
+      //
+      // 1. When ONLINE: Authenticate against cloud API first.
+      //    - Cloud login succeeds → cache password hash locally (bcrypt),
+      //      import session, start sync, return success.
+      //    - Cloud login fails (401) → return error immediately (bad creds).
+      //
+      // 2. When OFFLINE: Fall back to locally cached credentials.
+      //    - User must have logged in at least once while online.
+      //    - Password hash is stored as real bcrypt (not placeholder).
+      //    - Must be within 3-day offline window (_lastCloudContactAt).
+      //    - If offline > 3 days → require online re-auth.
+      //
+      // 3. First run (no local users): Must be online.
+      // ══════════════════════════════════════════════════════════════════
+
+      const cloudUrl = getCloudUrl()
+
+      // ── Step 0: Cloud health check — skip cloud login if API is unreachable ──
+      let cloudHealthy = false
+      try {
+        const healthResp = await fetch(`${cloudUrl}/health`, {
+          signal: AbortSignal.timeout(5000),
+        })
+        cloudHealthy = healthResp.ok
+        if (!cloudHealthy) {
+          console.warn('[LocalAPI] Cloud API health check failed (status', healthResp.status, ') at', cloudUrl, '— skipping cloud login')
+        }
+      } catch (healthErr) {
+        console.warn('[LocalAPI] Cloud API unreachable at', cloudUrl, '— skipping cloud login, falling back to offline:', healthErr.message)
       }
 
-      // Verify password — timing-safe comparison of stored hash
-      // (In production this would use bcrypt; for local-only we compare the stored hash)
-      const inputHash = require('crypto')
-        .createHash('sha256')
-        .update(password)
-        .digest('hex')
+      // ── Step 1: Try cloud API first (when online and healthy) ────────
+      let cloudLoginSucceeded = false
+      let cloudUser = null
+      let cloudToken = null
 
-      try {
-        const storedBuf = Buffer.from(user.passwordHash, 'utf-8')
-        const inputBuf = Buffer.from(inputHash, 'utf-8')
-        if (
-          storedBuf.length !== inputBuf.length ||
-          !timingSafeEqual(storedBuf, inputBuf)
-        ) {
-          // If the stored hash looks like a bcrypt hash (starts with $2), try bcrypt
-          if (user.passwordHash && user.passwordHash.startsWith('$2')) {
-            try {
-              const bcrypt = require('bcryptjs')
-              if (!(await bcrypt.compare(password, user.passwordHash))) {
-                return c.json({ success: false, error: 'Invalid username or password' }, 401)
-              }
-            } catch {
-              return c.json({ success: false, error: 'Invalid username or password' }, 401)
+      if (cloudHealthy) {
+        try {
+          console.log('[LocalAPI] Trying cloud login for:', username)
+          const cloudResp = await fetch(`${cloudUrl}/api/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password }),
+            signal: AbortSignal.timeout(15000),
+          })
+
+          if (cloudResp.ok) {
+            const cloudData = await cloudResp.json()
+            cloudUser = cloudData.user || cloudData.data?.user
+            cloudToken = cloudData.token || cloudData.accessToken
+
+            if (cloudUser && cloudToken) {
+              cloudLoginSucceeded = true
+              console.log('[LocalAPI] Cloud login successful for:', cloudUser.username || cloudUser.email || username)
             }
+          } else if (cloudResp.status === 401 || cloudResp.status === 403) {
+            // Cloud rejected credentials — don't try local fallback
+            const errBody = await cloudResp.json().catch(() => ({}))
+            console.log('[LocalAPI] Cloud rejected credentials:', cloudResp.status, errBody.error || '')
+            return c.json({ success: false, error: errBody.error || 'Invalid username or password' }, cloudResp.status)
+          } else if (cloudResp.status === 404) {
+            // Cloud API endpoint not found — likely wrong URL (e.g. Next.js frontend instead of API)
+            console.error(`[LocalAPI] Cloud API endpoint not found at ${cloudUrl}/api/auth/login — check BLASTI_CLOUD_URL/BLASTI_API_URL environment variables. Falling back to offline login.`)
           } else {
-            return c.json({ success: false, error: 'Invalid username or password' }, 401)
+            // Cloud returned unexpected status (5xx, etc.) — fall through to offline
+            const errBody = await cloudResp.json().catch(() => ({}))
+            console.warn('[LocalAPI] Cloud returned unexpected status:', cloudResp.status, errBody.error || '')
           }
+        } catch (cloudErr) {
+          // Cloud unreachable (network error) — fall through to offline login
+          console.warn('[LocalAPI] Cloud unreachable, falling back to offline login:', cloudErr.message)
         }
-      } catch {
+      }
+
+      // ── Step 2: Cloud login succeeded — import session & cache creds ────
+      if (cloudLoginSucceeded && cloudUser && cloudToken) {
+        // Hash the password for offline re-login capability
+        // Try bcryptjs first, then fall back to Node crypto.scryptSync
+        let bcryptHash = null
+        try {
+          let bcrypt = null
+          try { bcrypt = require('bcryptjs') } catch { /* try alternate paths */ }
+          if (!bcrypt) {
+            try { bcrypt = require(require('path').join(process.cwd(), 'node_modules', 'bcryptjs')) } catch { /* nope */ }
+          }
+          if (!bcrypt) {
+            try { bcrypt = require(require('path').join(__dirname, '..', 'node_modules', 'bcryptjs')) } catch { /* nope */ }
+          }
+          if (bcrypt) {
+            bcryptHash = await bcrypt.hash(password, 10)
+          } else {
+            // Fallback: use Node built-in scrypt to produce a bcrypt-like hash string
+            const { scryptSync } = require('crypto')
+            const salt = require('crypto').randomBytes(16).toString('base64')
+            const derived = scryptSync(password, salt, 64).toString('base64')
+            bcryptHash = `$scrypt$${salt}$${derived}`
+            console.log('[LocalAPI] bcryptjs unavailable — using scrypt fallback for password hash')
+          }
+        } catch (e) {
+          // Last resort: SHA256 hash (better than nothing for offline re-login)
+          console.warn('[LocalAPI] bcrypt and scrypt failed, using SHA256 fallback:', e.message)
+          bcryptHash = require('crypto').createHash('sha256').update(password).digest('hex')
+        }
+
+        // Upsert user into local SQLite with REAL bcrypt hash
+        try {
+          const existingUser = await db.user.findUnique({ where: { id: cloudUser.id } }).catch(() => null)
+          const userData = {
+            id: cloudUser.id,
+            username: cloudUser.username || cloudUser.email || username,
+            fullName: cloudUser.fullName || cloudUser.name || '',
+            email: cloudUser.email || null,
+            role: cloudUser.role || 'CUSTOMER',
+            language: cloudUser.language || 'ar',
+            avatarUrl: cloudUser.avatarUrl || null,
+            isActive: cloudUser.isActive !== false,
+            passwordHash: bcryptHash, // Real bcrypt hash for offline re-login!
+          }
+
+          if (existingUser) {
+            await db.user.update({ where: { id: cloudUser.id }, data: userData })
+          } else {
+            await db.user.create({ data: userData }).catch(e => {
+              console.warn('[LocalAPI] Could not create user in local DB:', e.message)
+            })
+          }
+        } catch (e) {
+          console.warn('[LocalAPI] Could not upsert user from cloud:', e.message)
+        }
+
+        // Create local session
+        const sessionData = {
+          id: cloudUser.id,
+          username: cloudUser.username || cloudUser.email || username,
+          fullName: cloudUser.fullName || cloudUser.name || '',
+          role: cloudUser.role || 'CUSTOMER',
+          language: cloudUser.language || 'ar',
+          avatarUrl: cloudUser.avatarUrl || null,
+          agencyId: cloudUser.agencyId || null,
+          _loggedInAt: Date.now(),
+        }
+        sessionToken = cloudToken
+        sessionUser = sessionData
+
+        // Mark cloud contact for offline token policy
+        _lastCloudContactAt = _safeTimestamp()
+        _persistCloudContact()
+        persistSession()
+
+        emitEvent('auth:login', { user: sessionData })
+
+        // Trigger initial sync in background to pull agency data
+        try {
+          const syncService = require('./sync-service')
+          if (!syncService.getStatus()?.isStarted) {
+            const { localDb } = require('./lib/db')
+            if (localDb) {
+              syncService.startSync({
+                localDb,
+                cloudBaseUrl: cloudUrl,
+                agencyId: sessionData.agencyId || '',
+              })
+            }
+          }
+          syncService.setAuth(cloudToken, cloudUser)
+          syncService.initialSync().catch(e => {
+            console.warn('[LocalAPI] Background initial sync error:', e.message)
+          })
+        } catch (e) {
+          console.warn('[LocalAPI] Could not start sync after cloud login:', e.message)
+        }
+
+        return c.json({
+          success: true,
+          user: sessionData,
+          token: sessionToken,
+          source: 'cloud',
+        })
+      }
+
+      // ── Step 3: Cloud was unreachable — try offline re-login ───────────
+      console.log('[LocalAPI] Cloud unreachable — trying offline login for:', username)
+
+      // Check offline window: must have contacted cloud within 3 days
+      if (_lastCloudContactAt) {
+        const offlineDuration = _safeTimestamp() - _lastCloudContactAt
+        if (offlineDuration > OFFLINE_TOKEN_MAX_MS) {
+          const offlineDays = Math.floor(offlineDuration / (24 * 60 * 60 * 1000))
+          return c.json({
+            success: false,
+            error: `Offline for ${offlineDays} days. Please connect to the internet and log in again.`,
+            code: 'OFFLINE_SESSION_EXPIRED',
+            offlineDays,
+          }, 401)
+        }
+      } else {
+        // Never had cloud contact — must be online for first login
+        return c.json({
+          success: false,
+          error: 'No cached session found. Please connect to the internet to log in for the first time.',
+          code: 'NO_CACHED_SESSION',
+        }, 401)
+      }
+
+      // Find user in local DB and verify password
+      const user = await db.user.findUnique({ where: { username } })
+      if (!user) {
         return c.json({ success: false, error: 'Invalid username or password' }, 401)
       }
 
@@ -397,7 +986,69 @@ function createApp() {
         return c.json({ success: false, error: 'Account is deactivated' }, 403)
       }
 
-      // Build session data
+      // Verify password against locally cached hash
+      let localAuthOk = false
+
+      if (!user.passwordHash) {
+        return c.json({ success: false, error: 'Invalid username or password' }, 401)
+      }
+
+      // Strategy 1: bcrypt compare (cloud-cached passwords are bcrypt $2a$/$2b$)
+      if (user.passwordHash.startsWith('$2')) {
+        try {
+          let bcrypt = null
+          try { bcrypt = require('bcryptjs') } catch { /* try alternate paths */ }
+          if (!bcrypt) {
+            try { bcrypt = require(require('path').join(process.cwd(), 'node_modules', 'bcryptjs')) } catch { /* nope */ }
+          }
+          if (!bcrypt) {
+            try { bcrypt = require(require('path').join(__dirname, '..', 'node_modules', 'bcryptjs')) } catch { /* nope */ }
+          }
+          if (bcrypt && await bcrypt.compare(password, user.passwordHash)) {
+            localAuthOk = true
+          }
+        } catch { /* bcrypt not available */ }
+      }
+
+      // Strategy 2: scrypt verify ($scrypt$ format written by our fallback)
+      if (!localAuthOk && user.passwordHash.startsWith('$scrypt$')) {
+        try {
+          const { scryptSync } = require('crypto')
+          const parts = user.passwordHash.split('$')
+          // Format: $scrypt$<salt>$<derived>
+          if (parts.length >= 4) {
+            const salt = parts[2]
+            const storedDerived = parts[3]
+            const derived = scryptSync(password, salt, 64).toString('base64')
+            const storedBuf = Buffer.from(storedDerived, 'utf-8')
+            const inputBuf = Buffer.from(derived, 'utf-8')
+            if (storedBuf.length === inputBuf.length && timingSafeEqual(storedBuf, inputBuf)) {
+              localAuthOk = true
+            }
+          }
+        } catch { /* scrypt verify failed */ }
+      }
+
+      // Strategy 3: SHA256 compare (for locally created users or last-resort hash)
+      if (!localAuthOk) {
+        const inputHash = require('crypto')
+          .createHash('sha256')
+          .update(password)
+          .digest('hex')
+        try {
+          const storedBuf = Buffer.from(user.passwordHash, 'utf-8')
+          const inputBuf = Buffer.from(inputHash, 'utf-8')
+          if (storedBuf.length === inputBuf.length && timingSafeEqual(storedBuf, inputBuf)) {
+            localAuthOk = true
+          }
+        } catch { /* comparison failed */ }
+      }
+
+      if (!localAuthOk) {
+        return c.json({ success: false, error: 'Invalid username or password' }, 401)
+      }
+
+      // Offline login succeeded — create local session
       const sessionData = {
         id: user.id,
         username: user.username,
@@ -406,6 +1057,7 @@ function createApp() {
         language: user.language || 'ar',
         avatarUrl: user.avatarUrl || null,
         agencyId: null,
+        _loggedInAt: Date.now(),
       }
 
       // Look up agencyId from agency-staff membership
@@ -414,11 +1066,14 @@ function createApp() {
           where: { userId: user.id, isActive: true },
         })
         if (staff) sessionData.agencyId = staff.agencyId
+      } else if (user.role === 'SUPER_ADMIN') {
+        const agency = await db.agency.findFirst({ select: { id: true } })
+        if (agency) sessionData.agencyId = agency.id
       }
 
-      // Create session token (random hex, per-launch)
       sessionToken = randomBytes(32).toString('hex')
       sessionUser = sessionData
+      persistSession()
 
       emitEvent('auth:login', { user: sessionData })
 
@@ -426,6 +1081,8 @@ function createApp() {
         success: true,
         user: sessionData,
         token: sessionToken,
+        source: 'offline',
+        offlineWarning: 'Logged in offline — some features may be limited',
       })
     } catch (error) {
       console.error('[LocalAPI] Login error:', error)
@@ -438,6 +1095,12 @@ function createApp() {
       return c.json({ success: false, error: 'No active session' }, 401)
     }
     // Return in NextAuth-compatible format (same as cloud API)
+    // Include offline token status for the frontend to act on
+    const offlineDuration = _lastCloudContactAt ? _safeTimestamp() - _lastCloudContactAt : null
+    const offlineDays = offlineDuration ? Math.floor(offlineDuration / (24 * 60 * 60 * 1000)) : null
+    const offlineTokenRemaining = _lastCloudContactAt
+      ? Math.max(0, OFFLINE_TOKEN_MAX_MS - offlineDuration)
+      : null
     return c.json({
       user: {
         id: sessionUser.id,
@@ -449,6 +1112,13 @@ function createApp() {
         agencyId: sessionUser.agencyId,
       },
       expires: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      offline: {
+        lastCloudContact: _lastCloudContactAt,
+        offlineDays,
+        offlineTokenRemainingMs: offlineTokenRemaining,
+        offlineTokenMaxMs: OFFLINE_TOKEN_MAX_MS,
+        isExpiringSoon: offlineTokenRemaining !== null && offlineTokenRemaining < 24 * 60 * 60 * 1000, // < 1 day remaining
+      },
     })
   })
 
@@ -456,8 +1126,99 @@ function createApp() {
     const previousUser = sessionUser
     sessionToken = null
     sessionUser = null
+    deletePersistedSession()
     emitEvent('auth:logout', { previousUser })
     return c.json({ success: true, data: { message: 'Logged out' } })
+  })
+
+  // ── Password Reset (Cloud-Only) ─────────────────────────────────────────
+  // Password reset ALWAYS requires cloud connectivity.
+  // These routes proxy to the cloud API and return errors if offline.
+
+  app.post('/api/auth/forgot-password', async (c) => {
+    const cloudUrl = getCloudUrl()
+
+    try {
+      const body = await c.req.json()
+      console.log('[LocalAPI] Proxying forgot-password to cloud')
+      const cloudResp = await fetch(`${cloudUrl}/api/auth/forgot-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10000),
+      })
+      const cloudData = await cloudResp.json()
+      return c.json(cloudData, cloudResp.status)
+    } catch (e) {
+      return c.json({
+        success: false,
+        error: 'Password reset requires an internet connection. Please check your network and try again.',
+        code: 'CLOUD_REQUIRED',
+      }, 503)
+    }
+  })
+
+  app.post('/api/auth/reset-password', async (c) => {
+    const cloudUrl = getCloudUrl()
+
+    try {
+      const body = await c.req.json()
+      console.log('[LocalAPI] Proxying reset-password to cloud')
+      const cloudResp = await fetch(`${cloudUrl}/api/auth/reset-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10000),
+      })
+      const cloudData = await cloudResp.json()
+
+      // If reset succeeded, also update the local password hash
+      if (cloudResp.ok && cloudData.success && body.newPassword && sessionUser) {
+        try {
+          const bcrypt = require('bcryptjs')
+          const newHash = await bcrypt.hash(body.newPassword, 10)
+          await db.user.update({
+            where: { id: sessionUser.id },
+            data: { passwordHash: newHash },
+          })
+          console.log('[LocalAPI] Local password hash updated after cloud reset')
+        } catch (updateErr) {
+          console.warn('[LocalAPI] Could not update local password hash after reset:', updateErr.message)
+        }
+      }
+
+      return c.json(cloudData, cloudResp.status)
+    } catch (e) {
+      return c.json({
+        success: false,
+        error: 'Password reset requires an internet connection. Please check your network and try again.',
+        code: 'CLOUD_REQUIRED',
+      }, 503)
+    }
+  })
+
+  app.get('/api/auth/check-username', async (c) => {
+    const cloudUrl = getCloudUrl()
+
+    try {
+      const username = c.req.query('username')
+      console.log('[LocalAPI] Proxying check-username to cloud')
+      const cloudResp = await fetch(`${cloudUrl}/api/auth/check-username?username=${encodeURIComponent(username || '')}`, {
+        signal: AbortSignal.timeout(5000),
+      })
+      const cloudData = await cloudResp.json()
+      return c.json(cloudData, cloudResp.status)
+    } catch (e) {
+      // Offline fallback: check local DB
+      try {
+        const username = c.req.query('username')
+        if (!username || username.length < 3) return c.json({ available: true })
+        const existing = await db.user.findUnique({ where: { username }, select: { id: true } })
+        return c.json({ available: !existing })
+      } catch {
+        return c.json({ available: true })
+      }
+    }
   })
 
   /**
@@ -502,10 +1263,16 @@ function createApp() {
         language: user.language || 'ar',
         avatarUrl: user.avatarUrl || null,
         agencyId: user.agencyId || null,
+        _loggedInAt: Date.now(),
       }
 
       console.log('[LocalAPI] Session imported from cloud:', sessionUser.username, 'role:', sessionUser.role)
       emitEvent('auth:login', { user: sessionUser })
+
+      // Mark that we had cloud contact (import-session is called after cloud login)
+      _lastCloudContactAt = _safeTimestamp()
+      _persistCloudContact()
+      persistSession()
 
       return c.json({
         success: true,
@@ -729,12 +1496,8 @@ function createApp() {
     }
   })
 
-  app.get('/api/admin/announcements', authMiddleware, async (c) => {
-    return c.json({
-      success: true,
-      data: { available: false, reason: 'offline', message: 'Announcements require cloud connection' },
-    })
-  })
+  // NOTE: /api/admin/announcements moved to /api/agency/announcements (line ~3230)
+  // The /api/admin/ prefix is not allowed per security policy (NO admin endpoints).
 
   // ═══════════════════════════════════════════════════════════════════════
   // 3. AGENCY (auth required)
@@ -756,7 +1519,7 @@ function createApp() {
         console.log(`[LocalAPI] Agency ${agencyId} not in local DB, returning session-based fallback`)
         return c.json({
           id: agencyId,
-          name: sessionUser.agencyName || sessionUser.name || 'Unknown Agency',
+          name: sessionUser.fullName || 'Unknown Agency',
           _partial: true,
           _reason: 'Agency not yet synced to local database',
         })
@@ -772,22 +1535,14 @@ function createApp() {
         ? await db.counter.count({ where: { branchId: { in: branchIds.map(b => b.id) }, isActive: true } })
         : 0
 
-      // Remove sensitive fields
+      // Remove sensitive fields and include computed stats
       const { passwordHash, ...safeAgency } = agency
 
       return c.json({
-        id: agency.id,
-        name: agency.name,
-        nameAr: agency.nameAr,
-        nameFr: agency.nameFr,
-        address: agency.address,
-        category: agency.category,
-        phone: agency.phone,
-        email: agency.email,
+        ...safeAgency,
         code: agency.customCode,
-        logoUrl: agency.logoUrl,
-        workingHoursStart: agency.workingHoursStart,
-        workingHoursEnd: agency.workingHoursEnd,
+        // Include computed stats that were previously wasted
+        _stats: { serviceCount, staffCount, branchCount, counterCount },
       })
     } catch (error) {
       console.error('[LocalAPI] Agency profile error:', error)
@@ -813,6 +1568,9 @@ function createApp() {
         completed,
         noShow,
         cancelled,
+        queueSettings,
+        activeCounters,
+        recentReservations,
       ] = await Promise.all([
         db.reservation.count({
           where: { agencyId, joinedAt: { gte: startMs, lte: endMs } },
@@ -830,18 +1588,111 @@ function createApp() {
         db.reservation.count({
           where: { agencyId, status: 'CANCELLED', cancelledAt: { gte: startMs } },
         }),
+        // Queue settings for currentServingNumber
+        db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null),
+        // Active counters with their current reservations
+        db.counter.findMany({
+          where: { agencyId, isActive: true },
+          include: {
+            reservations: {
+              where: { status: { in: ['CALLED', 'SERVING'] } },
+              take: 1,
+              orderBy: { calledAt: 'desc' },
+            },
+          },
+          orderBy: { number: 'asc' },
+        }).catch(() => []),
+        // Recent activity (last 5 completed/changed reservations today)
+        db.reservation.findMany({
+          where: { agencyId, joinedAt: { gte: startMs } },
+          orderBy: { updatedAt: 'desc' },
+          take: 5,
+          select: {
+            id: true,
+            queueNumber: true,
+            displayNumber: true,
+            status: true,
+            walkInCustomerName: true,
+            serviceId: true,
+            joinedAt: true,
+            calledAt: true,
+            completedAt: true,
+            updatedAt: true,
+            estimatedWait: true,
+          },
+        }).catch(() => []),
       ])
+
+      // Average wait time today
+      const avgWaitResult = completed > 0
+        ? await db.reservation.aggregate({
+            where: { agencyId, status: 'COMPLETED', completedAt: { gte: startMs } },
+            _avg: { estimatedWait: true },
+          }).catch(() => ({ _avg: { estimatedWait: 0 } }))
+        : { _avg: { estimatedWait: 0 } }
+      const averageWaitMinutes = Math.round(avgWaitResult._avg.estimatedWait || 0)
+
+      // Estimated wait for next in queue
+      // Based on average service time of completed reservations today
+      let estimatedWaitForNext = 0
+      if (waiting > 0) {
+        const avgServiceResult = await db.reservation.aggregate({
+          where: { agencyId, status: 'COMPLETED', completedAt: { gte: startMs }, calledAt: { not: null } },
+          _avg: { estimatedWait: true },
+        }).catch(() => ({ _avg: { estimatedWait: 0 } }))
+        const avgServiceMinutes = avgServiceResult._avg.estimatedWait || 5 // default 5 min
+        estimatedWaitForNext = Math.round(waiting * avgServiceMinutes)
+      }
+
+      // Build recent activity events
+      const serviceIds = new Set(recentReservations.map((r) => r.serviceId).filter(Boolean))
+      const serviceList = serviceIds.size > 0
+        ? await db.service.findMany({ where: { id: { in: [...serviceIds] } } }).catch(() => [])
+        : []
+      const serviceMap = new Map(serviceList.map((s) => [s.id, s]))
+      const recentActivity = recentReservations.map((r) => ({
+        id: r.id,
+        queueNumber: r.queueNumber,
+        displayNumber: r.displayNumber || String(r.queueNumber),
+        status: r.status,
+        customerName: r.walkInCustomerName || 'Walk-in',
+        serviceName: serviceMap.get(r.serviceId)?.name || null,
+        joinedAt: r.joinedAt instanceof Date ? r.joinedAt.toISOString() : (r.joinedAt ? String(r.joinedAt) : null),
+        calledAt: r.calledAt instanceof Date ? r.calledAt.toISOString() : (r.calledAt ? String(r.calledAt) : null),
+        completedAt: r.completedAt instanceof Date ? r.completedAt.toISOString() : (r.completedAt ? String(r.completedAt) : null),
+        updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : (r.updatedAt ? String(r.updatedAt) : null),
+      }))
+
+      // Format active counters
+      const counters = activeCounters.map((c) => ({
+        id: c.id,
+        number: c.number,
+        name: c.name,
+        currentReservation: c.reservations?.[0] || null,
+      }))
 
       return c.json({
         success: true,
         data: {
+          // Today's queue summary
           totalToday,
           waiting,
           serving,
           completed,
           noShow,
           cancelled,
-          averageWaitMinutes: 0, // placeholder — would need actual wait calculations
+          // Current serving info
+          currentServingNumber: queueSettings?.currentServingNumber || 0,
+          lastIssuedNumber: queueSettings?.lastIssuedNumber || 0,
+          isPaused: queueSettings?.isPaused || false,
+          // Active counters with their current reservations
+          activeCounters: counters,
+          // Recent activity (last 5 events)
+          recentActivity,
+          // Average wait time today
+          averageWaitMinutes,
+          // Estimated wait for next in queue
+          estimatedWaitForNext,
         },
       })
     } catch (error) {
@@ -1317,8 +2168,13 @@ function createApp() {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
       const branchId = c.req.param('branchId')
+      // Verify branch belongs to agency first
+      const branch = await db.branch.findUnique({ where: { id: branchId } })
+      if (!branch || branch.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Branch not found' }, 404)
+      }
       const counters = await db.counter.findMany({
-        where: { agencyId, branchId },
+        where: { branchId },
         orderBy: { name: 'asc' },
       })
       return c.json({ success: true, data: counters })
@@ -1333,9 +2189,14 @@ function createApp() {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
-      const { counterId } = c.req.param()
+      const { branchId, counterId } = c.req.param()
+      // Verify branch belongs to this agency
+      const branch = await db.branch.findUnique({ where: { id: branchId } }).catch(() => null)
+      if (!branch || branch.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Branch not found' }, 404)
+      }
       const counter = await db.counter.findUnique({ where: { id: counterId } })
-      if (!counter || counter.agencyId !== agencyId) {
+      if (!counter || counter.branchId !== branchId) {
         return c.json({ success: false, error: 'Counter not found' }, 404)
       }
       return c.json({ success: true, data: counter })
@@ -1351,13 +2212,18 @@ function createApp() {
       try {
         const agencyId = sessionUser.agencyId
         if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
-        const { counterId } = c.req.param()
+        const { branchId, counterId } = c.req.param()
+        // Verify branch belongs to this agency
+        const branch = await db.branch.findUnique({ where: { id: branchId } }).catch(() => null)
+        if (!branch || branch.agencyId !== agencyId) {
+          return c.json({ success: false, error: 'Branch not found' }, 404)
+        }
         const body = await c.req.json()
         const existing = await db.counter.findUnique({ where: { id: counterId } })
-        if (!existing || existing.agencyId !== agencyId) {
+        if (!existing || existing.branchId !== branchId) {
           return c.json({ success: false, error: 'Counter not found' }, 404)
         }
-        const allowedFields = ['name', 'branchId', 'isActive', 'prefix']
+        const allowedFields = ['name', 'branchId', 'isActive']
         const updateData = {}
         for (const field of allowedFields) {
           if (body[field] !== undefined) updateData[field] = body[field]
@@ -1378,9 +2244,14 @@ function createApp() {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
-      const { counterId } = c.req.param()
+      const { branchId, counterId } = c.req.param()
+      // Verify branch belongs to this agency
+      const branch = await db.branch.findUnique({ where: { id: branchId } }).catch(() => null)
+      if (!branch || branch.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Branch not found' }, 404)
+      }
       const existing = await db.counter.findUnique({ where: { id: counterId } })
-      if (!existing || existing.agencyId !== agencyId) {
+      if (!existing || existing.branchId !== branchId) {
         return c.json({ success: false, error: 'Counter not found' }, 404)
       }
       await db.counter.delete({ where: { id: counterId } })
@@ -1466,7 +2337,7 @@ function createApp() {
   })
 
   // POST /api/reservations — create reservation with auto queue number
-  app.post('/api/reservations', authMiddleware, async (c) => {
+  app.post('/api/reservations', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -1521,7 +2392,7 @@ function createApp() {
           isWalkIn: !!isWalkIn,
           walkInCustomerName: walkInCustomerName || null,
           preferredTime: preferredTime || null,
-          fixedTimeEnabled: fixedTimeEnabled ? 1 : 0,
+          fixedTimeEnabled: !!fixedTimeEnabled,
         },
       })
 
@@ -1666,7 +2537,7 @@ function createApp() {
   })
 
   // POST /api/queue/call-next — call next customer
-  app.post('/api/queue/call-next', authMiddleware, async (c) => {
+  app.post('/api/queue/call-next', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -1712,16 +2583,9 @@ function createApp() {
         })
       }
 
-      // Update positions of remaining waiting reservations
-      const remainingWaiting = await db.reservation.findMany({
-        where: { agencyId, status: 'WAITING' },
-        orderBy: { joinedAt: 'asc' },
-      })
-      // position reassignment loop removed — position is not a schema field
-
       const updated = await db.reservation.findUnique({ where: { id: next.id } })
 
-      emitEvent('queue:called', { agencyId, reservation: updated })
+      emitEvent('queue:called', { agencyId, reservation: updated, counterId: counterId || null })
       logPendingMutation('POST', '/api/queue/call-next', body, updated).catch(() => {})
 
       return c.json({ success: true, data: updated })
@@ -1732,7 +2596,7 @@ function createApp() {
   })
 
   // POST /api/queue/call/:id — call specific reservation
-  app.post('/api/queue/call/:id', authMiddleware, async (c) => {
+  app.post('/api/queue/call/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -1768,7 +2632,7 @@ function createApp() {
 
       const updated = await db.reservation.findUnique({ where: { id } })
 
-      emitEvent('queue:called', { agencyId, reservation: updated })
+      emitEvent('queue:called', { agencyId, reservation: updated, counterId: counterId || null })
       logPendingMutation('POST', '/api/queue/call/:id', body, updated).catch(() => {})
 
       return c.json({ success: true, data: updated })
@@ -1779,7 +2643,7 @@ function createApp() {
   })
 
   // POST /api/queue/complete/:id
-  app.post('/api/queue/complete/:id', authMiddleware, async (c) => {
+  app.post('/api/queue/complete/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -1803,13 +2667,6 @@ function createApp() {
         },
       })
 
-      // Update positions of remaining waiting
-      const remainingWaiting = await db.reservation.findMany({
-        where: { agencyId, status: 'WAITING' },
-        orderBy: { joinedAt: 'asc' },
-      })
-      // position reassignment loop removed — position is not a schema field
-
       emitEvent('queue:completed', { agencyId, reservation })
       logPendingMutation('POST', '/api/queue/complete/:id', {}, reservation).catch(() => {})
 
@@ -1821,7 +2678,7 @@ function createApp() {
   })
 
   // POST /api/queue/no-show/:id
-  app.post('/api/queue/no-show/:id', authMiddleware, async (c) => {
+  app.post('/api/queue/no-show/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -1844,13 +2701,6 @@ function createApp() {
         },
       })
 
-      // Update positions
-      const remainingWaiting = await db.reservation.findMany({
-        where: { agencyId, status: 'WAITING' },
-        orderBy: { joinedAt: 'asc' },
-      })
-      // position reassignment loop removed — position is not a schema field
-
       emitEvent('queue:no-show', { agencyId, reservation })
       logPendingMutation('POST', '/api/queue/no-show/:id', {}, reservation).catch(() => {})
 
@@ -1862,7 +2712,7 @@ function createApp() {
   })
 
   // POST /api/queue/cancel/:id
-  app.post('/api/queue/cancel/:id', authMiddleware, async (c) => {
+  app.post('/api/queue/cancel/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -1886,13 +2736,6 @@ function createApp() {
         },
       })
 
-      // Update positions
-      const remainingWaiting = await db.reservation.findMany({
-        where: { agencyId, status: 'WAITING' },
-        orderBy: { joinedAt: 'asc' },
-      })
-      // position reassignment loop removed — position is not a schema field
-
       emitEvent('queue:cancelled', { agencyId, reservation })
       logPendingMutation('POST', '/api/queue/cancel/:id', {}, reservation).catch(() => {})
 
@@ -1904,7 +2747,7 @@ function createApp() {
   })
 
   // POST /api/queue/postpone/:id
-  app.post('/api/queue/postpone/:id', authMiddleware, async (c) => {
+  app.post('/api/queue/postpone/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -1934,13 +2777,6 @@ function createApp() {
         },
       })
 
-      // Update positions
-      const remainingWaiting = await db.reservation.findMany({
-        where: { agencyId, status: 'WAITING' },
-        orderBy: { joinedAt: 'asc' },
-      })
-      // position reassignment loop removed — position is not a schema field
-
       emitEvent('queue:postponed', { agencyId, reservation })
       logPendingMutation('POST', '/api/queue/postpone/:id', {}, reservation).catch(() => {})
 
@@ -1952,7 +2788,7 @@ function createApp() {
   })
 
   // POST /api/queue/recall/:id — re-call a CALLED reservation
-  app.post('/api/queue/recall/:id', authMiddleware, async (c) => {
+  app.post('/api/queue/recall/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -1991,6 +2827,30 @@ function createApp() {
     }
   })
 
+  // GET /api/queue/status — current serving info
+  app.get('/api/queue/status', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const qs = await db.queueSettings.findFirst({ where: { agencyId } })
+      const waitingCount = await db.reservation.count({ where: { agencyId, status: 'WAITING' } })
+      const servingCount = await db.reservation.count({ where: { agencyId, status: { in: ['CALLED', 'SERVING'] } } })
+      return c.json({
+        success: true,
+        data: {
+          currentServingNumber: qs?.currentServingNumber || 0,
+          lastIssuedNumber: qs?.lastIssuedNumber || 0,
+          isPaused: qs?.isPaused || false,
+          waitingCount,
+          servingCount,
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] Queue status error:', error)
+      return c.json({ success: false, error: 'Failed to get queue status' }, 500)
+    }
+  })
+
   // ═══════════════════════════════════════════════════════════════════════
   // 10. NOTIFICATIONS (auth required)
   // ═══════════════════════════════════════════════════════════════════════
@@ -2012,7 +2872,7 @@ function createApp() {
         db.notification.count({ where: { userId: user.id, isRead: false } }),
       ])
 
-      return c.json({ success: true, notifications, unreadCount })
+      return c.json({ success: true, notifications, total: total, unreadCount, page: 1, limit: take })
     } catch (error) {
       console.error('[LocalAPI] List notifications error:', error)
       return c.json({ success: false, error: 'Failed to list notifications' }, 500)
@@ -2030,10 +2890,28 @@ function createApp() {
       })
 
       emitEvent('notifications:read-all', { userId: user.id })
+      logPendingMutation('POST', '/api/notifications/read-all', {}, {}).catch(() => {})
 
       return c.json({ success: true, data: { message: 'All notifications marked as read' } })
     } catch (error) {
       console.error('[LocalAPI] Read-all notifications error:', error)
+      return c.json({ success: false, error: 'Failed to mark notifications as read' }, 500)
+    }
+  })
+
+  // PUT /api/notifications/read-all — alias (cloud uses PUT)
+  app.put('/api/notifications/read-all', authMiddleware, async (c) => {
+    try {
+      const user = sessionUser
+      await db.notification.updateMany({
+        where: { userId: user.id, isRead: false },
+        data: { isRead: true },
+      })
+      emitEvent('notifications:read-all', { userId: user.id })
+      logPendingMutation('PUT', '/api/notifications/read-all', {}, {}).catch(() => {})
+      return c.json({ success: true, data: { message: 'All notifications marked as read' } })
+    } catch (error) {
+      console.error('[LocalAPI] PUT read-all notifications error:', error)
       return c.json({ success: false, error: 'Failed to mark notifications as read' }, 500)
     }
   })
@@ -2061,6 +2939,7 @@ function createApp() {
           data: updateData,
         })
 
+        logPendingMutation(method.toUpperCase(), '/api/notifications/:id', body, updated).catch(() => {})
         return c.json({ success: true, data: updated })
       } catch (error) {
         console.error('[LocalAPI] Update notification error:', error)
@@ -2078,6 +2957,7 @@ function createApp() {
         return c.json({ success: false, error: 'Notification not found' }, 404)
       }
       await db.notification.delete({ where: { id } })
+      logPendingMutation('DELETE', '/api/notifications/:id', {}, { id }).catch(() => {})
       return c.json({ success: true, data: { deleted: true } })
     } catch (error) {
       console.error('[LocalAPI] Delete notification error:', error)
@@ -2145,6 +3025,150 @@ function createApp() {
     } catch (error) {
       console.error('[LocalAPI] Update user profile error:', error)
       return c.json({ success: false, error: 'Failed to update user profile' }, 500)
+    }
+  })
+
+  // PATCH /api/user/profile — alias for PUT (cloud uses PATCH)
+  app.patch('/api/user/profile', authMiddleware, async (c) => {
+    // Delegate to the same logic as PUT
+    try {
+      const user = sessionUser
+      const body = await c.req.json()
+      const allowedFields = ['fullName', 'language', 'avatarUrl']
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) {
+          updateData[field] = body[field]
+        }
+      }
+      if (Object.keys(updateData).length === 0) {
+        return c.json({ success: false, error: 'No valid fields to update' }, 400)
+      }
+      const updated = await db.user.update({ where: { id: user.id }, data: updateData })
+      if (updateData.fullName) sessionUser.fullName = updateData.fullName
+      if (updateData.language) sessionUser.language = updateData.language
+      if (updateData.avatarUrl !== undefined) sessionUser.avatarUrl = updateData.avatarUrl
+      const { passwordHash, ...safeUser } = updated
+      emitEvent('user:updated', { userId: user.id, ...updateData })
+      logPendingMutation('PATCH', '/api/user/profile', body, safeUser).catch(() => {})
+      return c.json({ success: true, data: safeUser })
+    } catch (error) {
+      console.error('[LocalAPI] PATCH user profile error:', error)
+      return c.json({ success: false, error: 'Failed to update user profile' }, 500)
+    }
+  })
+
+  // PATCH /api/user/change-password — change password (requires cloud connection)
+  app.patch('/api/user/change-password', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json()
+      const { currentPassword, newPassword } = body
+      if (!currentPassword || !newPassword) {
+        return c.json({ success: false, error: 'currentPassword and newPassword are required' }, 400)
+      }
+      if (newPassword.length < 6) {
+        return c.json({ success: false, error: 'New password must be at least 6 characters' }, 400)
+      }
+      // Password change requires cloud — forward via cloud-proxy pattern
+      const cloudUrl = getCloudUrl()
+
+      // Check if cloud is reachable
+      let cloudHealthy = false
+      try {
+        const healthResp = await fetch(`${cloudUrl}/health`, { signal: AbortSignal.timeout(5000) })
+        cloudHealthy = healthResp.ok
+      } catch { /* cloud unreachable */ }
+
+      if (!cloudHealthy) {
+        return c.json({ success: false, error: 'Password change requires internet connection', code: 'CLOUD_REQUIRED' }, 403)
+      }
+
+      try {
+        const resp = await fetch(`${cloudUrl}/api/user/change-password`, {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${sessionToken}`,
+          },
+          body: JSON.stringify({ currentPassword, newPassword }),
+          signal: AbortSignal.timeout(15000),
+        })
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({ error: 'Cloud request failed' }))
+          return c.json({ success: false, error: errData.error || 'Password change failed', offline: resp.status === 503 }, resp.status)
+        }
+        const data = await resp.json()
+        // Update local password hash if cloud succeeded
+        if (data.success || data.user) {
+          try {
+            let bcrypt = null
+            try { bcrypt = require('bcryptjs') } catch { /* try alternate paths */ }
+            if (!bcrypt) {
+              try { bcrypt = require(require('path').join(process.cwd(), 'node_modules', 'bcryptjs')) } catch { /* nope */ }
+            }
+            if (!bcrypt) {
+              try { bcrypt = require(require('path').join(__dirname, '..', 'node_modules', 'bcryptjs')) } catch { /* nope */ }
+            }
+            let newHash
+            if (bcrypt) {
+              newHash = await bcrypt.hash(newPassword, 10)
+            } else {
+              // Fallback: scrypt
+              const { scryptSync } = require('crypto')
+              const salt = require('crypto').randomBytes(16).toString('base64')
+              const derived = scryptSync(newPassword, salt, 64).toString('base64')
+              newHash = `$scrypt$${salt}$${derived}`
+            }
+            await db.user.update({ where: { id: sessionUser.id }, data: { passwordHash: newHash } })
+            console.log('[LocalAPI] Local password hash updated after cloud change-password')
+          } catch (updateErr) {
+            console.warn('[LocalAPI] Could not update local password hash after change:', updateErr.message)
+          }
+        }
+        return c.json(data)
+      } catch (fetchErr) {
+        return c.json({ success: false, error: 'Password change requires internet connection', code: 'CLOUD_REQUIRED' }, 403)
+      }
+    } catch (error) {
+      console.error('[LocalAPI] Change password error:', error)
+      return c.json({ success: false, error: 'Failed to change password' }, 500)
+    }
+  })
+
+  // GET /api/user/preferences
+  app.get('/api/user/preferences', authMiddleware, async (c) => {
+    try {
+      const user = await db.user.findUnique({
+        where: { id: sessionUser.id },
+        select: { id: true, language: true, notificationPreferences: true },
+      })
+      if (!user) return c.json({ success: false, error: 'User not found' }, 404)
+      return c.json({ success: true, data: user })
+    } catch (error) {
+      console.error('[LocalAPI] Get preferences error:', error)
+      return c.json({ success: false, error: 'Failed to get preferences' }, 500)
+    }
+  })
+
+  // PATCH /api/user/preferences
+  app.patch('/api/user/preferences', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json()
+      const allowedFields = ['language', 'notificationPreferences']
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) updateData[field] = body[field]
+      }
+      if (Object.keys(updateData).length === 0) {
+        return c.json({ success: false, error: 'No valid fields to update' }, 400)
+      }
+      const updated = await db.user.update({ where: { id: sessionUser.id }, data: updateData })
+      emitEvent('user:updated', { userId: sessionUser.id, ...updateData })
+      logPendingMutation('PATCH', '/api/user/preferences', body, updated).catch(() => {})
+      return c.json({ success: true, data: { id: updated.id, language: updated.language, notificationPreferences: updated.notificationPreferences } })
+    } catch (error) {
+      console.error('[LocalAPI] Update preferences error:', error)
+      return c.json({ success: false, error: 'Failed to update preferences' }, 500)
     }
   })
 
@@ -2245,7 +3269,7 @@ function createApp() {
   })
 
   // PATCH /api/agency/queue/:id — complete / no_show / cancel
-  app.patch('/api/agency/queue/:id', authMiddleware, async (c) => {
+  app.patch('/api/agency/queue/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const reservationId = c.req.param('id')
       const body = await c.req.json().catch(() => ({}))
@@ -2322,6 +3346,95 @@ function createApp() {
       const queueSettings = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
       const isPaused = queueSettings ? queueSettings.isPaused === 1 || queueSettings.isPaused === true : false
 
+      // ── Rating stats ──
+      const reviewAgg = await db.review.aggregate({
+        where: { agencyId },
+        _avg: { rating: true },
+        _count: true,
+      }).catch(() => ({ _avg: { rating: null }, _count: 0 }))
+      const avgRating = reviewAgg._avg.rating ? Math.round(reviewAgg._avg.rating * 10) / 10 : 0
+      const totalRatings = reviewAgg._count || 0
+
+      // ── Rating distribution (1-5) ──
+      const ratingDistribution = await Promise.all(
+        [1, 2, 3, 4, 5].map((r) =>
+          db.review.count({ where: { agencyId, rating: r } }).catch(() => 0)
+        )
+      )
+
+      // ── Completion & no-show rates (today) ──
+      const todayCompletedCount = completed
+      const todayNoShowCount = noShow
+      const todayTotal = total || 0
+      const completionRate = todayTotal > 0 ? Math.round((todayCompletedCount / todayTotal) * 100) : 0
+      const noShowRate = todayTotal > 0 ? Math.round((todayNoShowCount / todayTotal) * 100) : 0
+
+      // ── Peak hour: hour with most reservations today ──
+      let peakHour = '—'
+      try {
+        const todayReservations = await db.reservation.findMany({
+          where: { agencyId, joinedAt: { gte: startMs, lte: endMs } },
+          select: { joinedAt: true },
+        })
+        if (todayReservations.length > 0) {
+          const hourCounts = new Array(24).fill(0)
+          for (const r of todayReservations) {
+            const hour = new Date(r.joinedAt).getHours()
+            hourCounts[hour]++
+          }
+          let maxHour = 0
+          let maxCount = 0
+          for (let h = 0; h < 24; h++) {
+            if (hourCounts[h] > maxCount) {
+              maxCount = hourCounts[h]
+              maxHour = h
+            }
+          }
+          peakHour = `${String(maxHour).padStart(2, '0')}:00`
+        }
+      } catch (_) { /* keep default */ }
+
+      // ── Hourly wait time: average wait per hour for completed reservations today ──
+      const hourlyWaitTime = new Array(24).fill(0)
+      try {
+        const completedToday = await db.reservation.findMany({
+          where: {
+            agencyId,
+            status: 'COMPLETED',
+            completedAt: { gte: startMs, lte: endMs },
+            calledAt: { not: null },
+          },
+          select: { calledAt: true, joinedAt: true },
+        })
+        const hourBuckets = new Array(24).fill(null).map(() => [])
+        for (const r of completedToday) {
+          if (r.calledAt && r.joinedAt) {
+            const waitMin = (new Date(r.calledAt).getTime() - new Date(r.joinedAt).getTime()) / 60000
+            const hour = new Date(r.joinedAt).getHours()
+            hourBuckets[hour].push(waitMin)
+          }
+        }
+        for (let h = 0; h < 24; h++) {
+          if (hourBuckets[h].length > 0) {
+            hourlyWaitTime[h] = Math.round(hourBuckets[h].reduce((a, b) => a + b, 0) / hourBuckets[h].length)
+          }
+        }
+      } catch (_) { /* keep zeros */ }
+
+      // ── Estimated wait range ──
+      const avgServiceTime = agency?.averageServiceTime || 10
+      const queueLength = waiting + called
+      let estimatedWaitRange = { minMinutes: 0, maxMinutes: 0, confidence: 'LOW' }
+      if (queueLength > 0 && activeCounters > 0) {
+        const minMin = Math.round((queueLength * avgServiceTime) / activeCounters)
+        const maxMin = Math.round(minMin * 1.5)
+        estimatedWaitRange = {
+          minMinutes: minMin,
+          maxMinutes: maxMin,
+          confidence: queueLength >= 5 ? 'MEDIUM' : 'HIGH',
+        }
+      }
+
       const result = {
         todayReservations: total,
         currentlyWaiting: waiting,
@@ -2331,16 +3444,15 @@ function createApp() {
         avgWaitTime: agency?.averageServiceTime || 10,
         currentQueueNumber: queueSettings?.currentServingNumber ? String(queueSettings.currentServingNumber) : '—',
         isPaused,
-        peakHour: '—',
-        avgRating: 0,
-        totalRatings: 0,
-        completionRate: 0,
-        noShowRate: 0,
-        hourlyWaitTime: new Array(24).fill(0),
-        ratingDistribution: new Array(5).fill(0),
-        subscriptionStatus: agency?.subscriptionStatus
-          || 'ACTIVE',  // Default to ACTIVE in offline mode if not set
-        estimatedWaitRange: { minMinutes: 0, maxMinutes: 0, confidence: 'LOW' },
+        peakHour,
+        avgRating,
+        totalRatings,
+        completionRate,
+        noShowRate,
+        hourlyWaitTime,
+        ratingDistribution,
+        subscriptionStatus: agency?.subscriptionStatus || 'INACTIVE',  // Default to INACTIVE if not set (safe default)
+        estimatedWaitRange,
         activeCounters,
         walkInCount,
         onlineReservationCount,
@@ -2385,7 +3497,6 @@ function createApp() {
           nameAr: nameAr || null,
           nameFr: nameFr || null,
           prefix: prefix || null,
-          averageServiceTime: avgServiceTime ? Number(avgServiceTime) : 10,
           isActive: true,
         },
       })
@@ -2405,27 +3516,32 @@ function createApp() {
       if (!agencyId) {
         return c.json({ success: false, error: 'No agency associated' }, 403)
       }
-      // Fetch recent reservations with status changes as activity events
+      // Fetch last 20 reservations with status changes, ordered by most recently updated
       const recent = await db.reservation.findMany({
         where: { agencyId },
-        orderBy: { joinedAt: 'desc' },
-        take: 10,
+        orderBy: { updatedAt: 'desc' },
+        take: 20,
       })
       // Build service lookup map
-      const servicesIds = new Set()
+      const serviceIds = new Set()
       for (const r of recent) {
-        if (r.serviceId) servicesIds.add(r.serviceId)
+        if (r.serviceId) serviceIds.add(r.serviceId)
       }
-      const serviceList = servicesIds.size > 0 ? await db.service.findMany({ where: { id: { in: [...servicesIds] } } }).catch(() => []) : []
+      const serviceList = serviceIds.size > 0 ? await db.service.findMany({ where: { id: { in: [...serviceIds] } } }).catch(() => []) : []
       const serviceMap = new Map(serviceList.map((s) => [s.id, s]))
       const events = recent.map((r) => ({
         id: r.id,
+        queueNumber: r.queueNumber,
+        displayNumber: r.displayNumber || String(r.queueNumber),
+        status: r.status,
+        customerName: r.walkInCustomerName || 'Walk-in',
+        serviceName: serviceMap.get(r.serviceId)?.name || null,
+        joinedAt: r.joinedAt instanceof Date ? r.joinedAt.toISOString() : (r.joinedAt ? String(r.joinedAt) : null),
+        calledAt: r.calledAt instanceof Date ? r.calledAt.toISOString() : (r.calledAt ? String(r.calledAt) : null),
+        completedAt: r.completedAt instanceof Date ? r.completedAt.toISOString() : (r.completedAt ? String(r.completedAt) : null),
+        updatedAt: r.updatedAt instanceof Date ? r.updatedAt.toISOString() : (r.updatedAt ? String(r.updatedAt) : null),
         eventType: r.status === 'COMPLETED' ? 'completed' : r.status === 'CANCELLED' ? 'cancelled' : r.status === 'NO_SHOW' ? 'no_show' : r.status === 'CALLED' ? 'called' : 'joined',
         eventKey: r.status === 'COMPLETED' ? 'customerCompletedService' : r.status === 'CANCELLED' ? 'customerCancelledRes' : r.status === 'NO_SHOW' ? 'customerNoShow' : r.status === 'CALLED' ? 'customerWasCalled' : 'customerJoinedQueue',
-        customerName: r.walkInCustomerName || 'Walk-in',
-        queueNumber: r.displayNumber || String(r.queueNumber),
-        timestamp: r.joinedAt instanceof Date ? r.joinedAt.toISOString() : String(r.joinedAt),
-        serviceName: serviceMap.get(r.serviceId)?.name || null,
       }))
       return c.json({ success: true, events })
     } catch (error) {
@@ -2435,7 +3551,7 @@ function createApp() {
   })
 
   // POST /api/queue/pause — explicit pause (used by SimpleMobileDashboard)
-  app.post('/api/queue/pause', authMiddleware, async (c) => {
+  app.post('/api/queue/pause', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
@@ -2445,7 +3561,7 @@ function createApp() {
       } else {
         await db.queueSettings.create({ data: { agencyId, isPaused: true, pausedAt: new Date() } })
       }
-      emitEvent('queue:paused', {})
+      emitEvent('queue:paused', { agencyId, queueSettings: { isPaused: true } })
       logPendingMutation('POST', '/api/queue/pause', {}, { isPaused: true }).catch(() => {})
       return c.json({ success: true, isPaused: true })
     } catch (error) {
@@ -2454,8 +3570,29 @@ function createApp() {
     }
   })
 
+  // PUT /api/queue/pause — alias (cloud uses PUT)
+  app.put('/api/queue/pause', authMiddleware, requireActiveSubscription(), async (c) => {
+    // Same logic as POST above
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const existing = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      if (existing) {
+        await db.queueSettings.update({ where: { id: existing.id }, data: { isPaused: true, pausedAt: new Date() } })
+      } else {
+        await db.queueSettings.create({ data: { agencyId, isPaused: true, pausedAt: new Date() } })
+      }
+      emitEvent('queue:paused', { agencyId, queueSettings: { isPaused: true } })
+      logPendingMutation('PUT', '/api/queue/pause', {}, { isPaused: true }).catch(() => {})
+      return c.json({ success: true, isPaused: true })
+    } catch (error) {
+      console.error('[LocalAPI] PUT /api/queue/pause error:', error)
+      return c.json({ success: false, error: 'Failed to pause' }, 500)
+    }
+  })
+
   // POST /api/queue/resume — explicit resume (used by SimpleMobileDashboard)
-  app.post('/api/queue/resume', authMiddleware, async (c) => {
+  app.post('/api/queue/resume', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
@@ -2463,7 +3600,7 @@ function createApp() {
       if (existing) {
         await db.queueSettings.update({ where: { id: existing.id }, data: { isPaused: false, pausedAt: null } })
       }
-      emitEvent('queue:resumed', {})
+      emitEvent('queue:resumed', { agencyId, queueSettings: { isPaused: false } })
       logPendingMutation('POST', '/api/queue/resume', {}, { isPaused: false }).catch(() => {})
       return c.json({ success: true, isPaused: false })
     } catch (error) {
@@ -2472,8 +3609,26 @@ function createApp() {
     }
   })
 
+  // PUT /api/queue/resume — alias (cloud uses PUT)
+  app.put('/api/queue/resume', authMiddleware, requireActiveSubscription(), async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const existing = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      if (existing) {
+        await db.queueSettings.update({ where: { id: existing.id }, data: { isPaused: false, pausedAt: null } })
+      }
+      emitEvent('queue:resumed', { agencyId, queueSettings: { isPaused: false } })
+      logPendingMutation('PUT', '/api/queue/resume', {}, { isPaused: false }).catch(() => {})
+      return c.json({ success: true, isPaused: false })
+    } catch (error) {
+      console.error('[LocalAPI] PUT /api/queue/resume error:', error)
+      return c.json({ success: false, error: 'Failed to resume' }, 500)
+    }
+  })
+
   // POST /api/agency/queue/toggle-pause
-  app.post('/api/agency/queue/toggle-pause', authMiddleware, async (c) => {
+  app.post('/api/agency/queue/toggle-pause', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -2492,7 +3647,8 @@ function createApp() {
           data: { agencyId, isPaused: true, pausedAt: now },
         })
       }
-      emitEvent('queue:pause-toggled', { isPaused: !currentPaused })
+      emitEvent('queue:pause-toggled', { agencyId, isPaused: !currentPaused })
+      emitEvent(!currentPaused ? 'queue:paused' : 'queue:resumed', { agencyId, queueSettings: { isPaused: !currentPaused } })
       logPendingMutation('POST', '/api/agency/queue/toggle-pause', {}, { isPaused: !currentPaused }).catch(() => {})
       return c.json({ success: true, isPaused: !currentPaused })
     } catch (error) {
@@ -2502,7 +3658,7 @@ function createApp() {
   })
 
   // POST /api/agency/queue/walk-in — create walk-in reservation
-  app.post('/api/agency/queue/walk-in', authMiddleware, async (c) => {
+  app.post('/api/agency/queue/walk-in', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) {
@@ -2529,10 +3685,9 @@ function createApp() {
           agencyId,
           serviceId,
           userId: sessionUser.id,
-          queueNumber,
+          queueNumber: todayCount + 1,
           displayNumber: queueNumber,
           status: 'WAITING',
-          customerName,
           walkInCustomerName: customerName,
           isWalkIn: true,
           joinedAt: now,
@@ -2540,7 +3695,7 @@ function createApp() {
         },
       })
 
-      emitEvent('queue:walk-in', { reservation })
+      emitEvent('queue:joined', { agencyId, reservation })
       logPendingMutation('POST', '/api/agency/queue/walk-in', body, reservation).catch(() => {})
       return c.json({ success: true, reservation })
     } catch (error) {
@@ -2567,12 +3722,46 @@ function createApp() {
 
   // POST /api/agency/announcements — create announcement
   app.post('/api/agency/announcements', authMiddleware, async (c) => {
-    return c.json({ success: true, message: 'Announcement created (offline)' })
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const body = await c.req.json()
+      const { title, message, type } = body
+      if (!title || !message) return c.json({ success: false, error: 'Title and message required' }, 400)
+      const announcement = await db.announcement.create({
+        data: {
+          agencyId,
+          title,
+          message,
+          type: type || 'INFO',
+          isActive: true,
+        },
+      })
+      emitEvent('announcement:created', { agencyId, announcement })
+      logPendingMutation('POST', '/api/agency/announcements', body, announcement).catch(() => {})
+      return c.json({ success: true, data: announcement }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create announcement error:', error)
+      return c.json({ success: false, error: 'Failed to create announcement' }, 500)
+    }
   })
 
   // DELETE /api/agency/announcements?id= — delete announcement
   app.delete('/api/agency/announcements', authMiddleware, async (c) => {
-    return c.json({ success: true })
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const id = c.req.query('id')
+      if (!id) return c.json({ success: false, error: 'Announcement id required' }, 400)
+      const existing = await db.announcement.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Announcement not found' }, 404)
+      await db.announcement.delete({ where: { id } })
+      logPendingMutation('DELETE', '/api/agency/announcements', { id }, null).catch(() => {})
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] Delete announcement error:', error)
+      return c.json({ success: false, error: 'Failed to delete announcement' }, 500)
+    }
   })
 
   // GET /api/agency/analytics — service analytics
@@ -2586,10 +3775,22 @@ function createApp() {
       const endMs = todayEndMs()
       const services = await db.service.findMany({ where: { agencyId, isActive: true } })
       const result = services.map(async (s) => {
-        const completed = await db.reservation.count({
-          where: { agencyId, serviceId: s.id, status: 'COMPLETED', completedAt: { gte: startMs, lte: endMs } },
-        })
-        return { serviceId: s.id, name: s.name, prefix: s.prefix, served: completed }
+        const [completed, avgWaitAgg] = await Promise.all([
+          db.reservation.count({
+            where: { agencyId, serviceId: s.id, status: 'COMPLETED', completedAt: { gte: startMs, lte: endMs } },
+          }),
+          db.reservation.aggregate({
+            where: { agencyId, serviceId: s.id, status: 'COMPLETED', completedAt: { gte: startMs, lte: endMs }, waitTime: { not: null } },
+            _avg: { waitTime: true },
+          }),
+        ])
+        return {
+          serviceId: s.id,
+          name: s.name,
+          prefix: s.prefix,
+          count: completed,
+          avgWaitTime: Math.round(avgWaitAgg._avg.waitTime || 0),
+        }
       })
       return c.json({ success: true, services: await Promise.all(result) })
     } catch (error) {
@@ -2616,10 +3817,8 @@ function createApp() {
       if (status && status !== 'ALL') where.status = status
       if (search) {
         where.OR = [
-          { customerName: { contains: search } },
           { walkInCustomerName: { contains: search } },
           { displayNumber: { contains: search } },
-          { customerPhone: { contains: search } },
         ]
       }
 
@@ -2661,21 +3860,52 @@ function createApp() {
         return c.json({ success: false, error: 'Reservation not found' }, 404)
       }
 
-      // Enrich with service data
-      const service = reservation.serviceId
-        ? await db.service.findUnique({ where: { id: reservation.serviceId } }).catch(() => null)
-        : null
-      const user = reservation.userId
-        ? await db.user.findUnique({ where: { id: reservation.userId } }).catch(() => null)
-        : null
+      // Enrich with service, counter, and user data in parallel
+      const [service, counter, user, review] = await Promise.all([
+        reservation.serviceId
+          ? db.service.findUnique({ where: { id: reservation.serviceId } }).catch(() => null)
+          : Promise.resolve(null),
+        reservation.counterId
+          ? db.counter.findUnique({ where: { id: reservation.counterId } }).catch(() => null)
+          : Promise.resolve(null),
+        reservation.userId
+          ? db.user.findUnique({ where: { id: reservation.userId } }).catch(() => null)
+          : Promise.resolve(null),
+        // Check for review linked to this reservation
+        db.review.findFirst({ where: { agencyId, reservationId: reservation.id } }).catch(() => null),
+      ])
 
       return c.json({
-        ...reservation,
-        serviceName: service?.name || null,
-        serviceNameAr: service?.nameAr || null,
-        serviceNameFr: service?.nameFr || null,
-        customerPhone: user?.phoneNumber || null,
-        customerName: user?.fullName || reservation.walkInCustomerName || null,
+        success: true,
+        data: {
+          ...reservation,
+          // Service enrichment
+          serviceName: service?.name || null,
+          serviceNameAr: service?.nameAr || null,
+          serviceNameFr: service?.nameFr || null,
+          // Counter enrichment
+          counterName: counter?.name || null,
+          counterNumber: counter?.number || null,
+          // User enrichment
+          customerPhone: user?.phoneNumber || null,
+          customerName: user?.fullName || reservation.walkInCustomerName || null,
+          customerEmail: user?.email || null,
+          // All timestamps
+          joinedAt: reservation.joinedAt,
+          calledAt: reservation.calledAt || null,
+          completedAt: reservation.completedAt || null,
+          cancelledAt: reservation.cancelledAt || null,
+          skippedAt: reservation.skippedAt || null,
+          // Review info
+          review: review ? {
+            id: review.id,
+            rating: review.rating,
+            comment: review.comment,
+            replyText: review.replyText,
+            repliedAt: review.repliedAt,
+            createdAt: review.createdAt,
+          } : null,
+        },
       })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/history/:id error:', error)
@@ -2686,11 +3916,16 @@ function createApp() {
   // GET /api/agency/subscription — subscription status from local Agency record
   // Subscription data (tier, status, dates) is embedded in the Agency table and
   // synced to local SQLite at login. SubscriptionPlan catalog and Transaction
-  // history are NOT synced, so those return empty arrays.
+  // history are queried from the local DB (synced via background sync).
   // Payment/cancellation/unsubscribe actions require cloud — not available offline.
   app.get('/api/agency/subscription', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
+      // Pre-load plans/transactions even for early-return paths
+      const [fallbackPlans, fallbackTxns] = await Promise.all([
+        db.subscriptionPlan.findMany({ where: { isActive: true }, orderBy: { sortOrder: 'asc' } }).catch(() => []),
+        agencyId ? db.transaction.findMany({ where: { agencyId }, orderBy: { createdAt: 'desc' }, take: 10 }).catch(() => []) : Promise.resolve([]),
+      ])
       if (!agencyId) {
         return c.json({
           currentPlan: 'BASIC',
@@ -2700,8 +3935,8 @@ function createApp() {
           daysRemaining: null,
           isExpired: false,
           isExpiringSoon: false,
-          availablePlans: [],
-          recentTransactions: [],
+          availablePlans: fallbackPlans,
+          recentTransactions: fallbackTxns,
         })
       }
 
@@ -2724,8 +3959,8 @@ function createApp() {
           daysRemaining: null,
           isExpired: false,
           isExpiringSoon: false,
-          availablePlans: [],
-          recentTransactions: [],
+          availablePlans: fallbackPlans,
+          recentTransactions: fallbackTxns,
         })
       }
 
@@ -2747,6 +3982,19 @@ function createApp() {
         }
       }
 
+      // Query available plans and recent transactions from local DB
+      const [availablePlans, recentTransactions] = await Promise.all([
+        db.subscriptionPlan.findMany({
+          where: { isActive: true },
+          orderBy: { sortOrder: 'asc' },
+        }).catch(() => []),
+        db.transaction.findMany({
+          where: { agencyId },
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        }).catch(() => []),
+      ])
+
       return c.json({
         currentPlan: agency.subscriptionTier || 'BASIC',
         status,
@@ -2755,8 +4003,8 @@ function createApp() {
         daysRemaining,
         isExpired,
         isExpiringSoon,
-        availablePlans: [],
-        recentTransactions: [],
+        availablePlans,
+        recentTransactions,
       })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/subscription error:', error)
@@ -2882,13 +4130,15 @@ function createApp() {
       today.setHours(0, 0, 0, 0)
       const reservations = await db.reservation.findMany({
         where: { agencyId, joinedAt: { gte: today } },
-        select: { joinedAt: true, status: true },
+        select: { joinedAt: true, completedAt: true, status: true },
       })
       const hourlyData = []
       for (let h = 7; h <= 22; h++) {
-        const hourReservations = reservations.filter((r) => new Date(r.joinedAt).getHours() === h)
-        const completed = hourReservations.filter((r) => r.status === 'COMPLETED').length
-        hourlyData.push({ hour: h, count: hourReservations.length, completed })
+        // count = reservations that joined in this hour
+        const joinedInHour = reservations.filter((r) => new Date(r.joinedAt).getHours() === h)
+        // completed = reservations whose completedAt falls in this hour
+        const completedInHour = reservations.filter((r) => r.completedAt && new Date(r.completedAt).getHours() === h)
+        hourlyData.push({ hour: h, count: joinedInHour.length, completed: completedInHour.length })
       }
       return c.json({ success: true, data: hourlyData })
     } catch (error) {
@@ -2901,7 +4151,7 @@ function createApp() {
   app.patch('/api/agency/settings', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
-      if (!agencyId) return c.json({ error: 'No agency found' }, 404)
+      if (!agencyId) return c.json({ success: false, error: 'No agency found' }, 404)
       const body = await c.req.json()
       const updateData = {}
       if (body.avgServiceTime !== undefined) updateData.averageServiceTime = body.avgServiceTime
@@ -2926,18 +4176,18 @@ function createApp() {
   app.post('/api/agency/staff', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
-      if (!agencyId) return c.json({ error: 'agencyId required' }, 400)
+      if (!agencyId) return c.json({ success: false, error: 'agencyId required' }, 400)
       const { agencyId: bodyAgencyId, username } = await c.req.json()
       const targetAgencyId = bodyAgencyId || agencyId
-      if (!username) return c.json({ error: 'username required' }, 400)
+      if (!username) return c.json({ success: false, error: 'username required' }, 400)
       // Find user by username
       const user = await db.user.findUnique({ where: { username: username.trim() } })
-      if (!user) return c.json({ error: 'User not found' }, 404)
+      if (!user) return c.json({ success: false, error: 'User not found' }, 404)
       // Check if already staff
       const existing = await db.agencyStaff.findUnique({
         where: { userId_agencyId: { userId: user.id, agencyId: targetAgencyId } },
       })
-      if (existing) return c.json({ error: 'Staff already exists in this agency' }, 409)
+      if (existing) return c.json({ success: false, error: 'Staff already exists in this agency' }, 409)
       const staff = await db.agencyStaff.create({
         data: { userId: user.id, agencyId: targetAgencyId, role: user.role === 'AGENCY_OWNER' ? 'OWNER' : 'STAFF' },
         include: { user: { select: { id: true, username: true, fullName: true, role: true } } },
@@ -2947,7 +4197,7 @@ function createApp() {
       return c.json({ staff }, 201)
     } catch (error) {
       console.error('[LocalAPI] POST /api/agency/staff error:', error)
-      return c.json({ error: 'Failed to add staff' }, 500)
+      return c.json({ success: false, error: 'Failed to add staff' }, 500)
     }
   })
 
@@ -2955,21 +4205,21 @@ function createApp() {
   app.delete('/api/agency/staff', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
-      if (!agencyId) return c.json({ error: 'agencyId required' }, 400)
+      if (!agencyId) return c.json({ success: false, error: 'agencyId required' }, 400)
       const staffId = c.req.query('staffId')
       const queryAgencyId = c.req.query('agencyId') || agencyId
-      if (!staffId) return c.json({ error: 'staffId required' }, 400)
+      if (!staffId) return c.json({ success: false, error: 'staffId required' }, 400)
       const staffMember = await db.agencyStaff.findUnique({ where: { id: staffId } })
-      if (!staffMember) return c.json({ error: 'Staff member not found' }, 404)
-      if (staffMember.agencyId !== queryAgencyId) return c.json({ error: 'Staff not in this agency' }, 403)
-      if (staffMember.role === 'OWNER') return c.json({ error: 'Cannot remove agency owner' }, 403)
+      if (!staffMember) return c.json({ success: false, error: 'Staff member not found' }, 404)
+      if (staffMember.agencyId !== queryAgencyId) return c.json({ success: false, error: 'Staff not in this agency' }, 403)
+      if (staffMember.role === 'OWNER') return c.json({ success: false, error: 'Cannot remove agency owner' }, 403)
       await db.agencyStaff.delete({ where: { id: staffId } })
       emitEvent('staff:updated', { agencyId: queryAgencyId, action: 'staff-removed', staffId })
       logPendingMutation('DELETE', '/api/agency/staff', { staffId }, null).catch(() => {})
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] DELETE /api/agency/staff error:', error)
-      return c.json({ error: 'Failed to remove staff' }, 500)
+      return c.json({ success: false, error: 'Failed to remove staff' }, 500)
     }
   })
 
@@ -2977,16 +4227,16 @@ function createApp() {
   app.patch('/api/agency/staff/:id', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
-      if (!agencyId) return c.json({ error: 'No agency found' }, 403)
+      if (!agencyId) return c.json({ success: false, error: 'No agency found' }, 403)
       const id = c.req.param('id')
       const body = await c.req.json()
       const staffMember = await db.agencyStaff.findUnique({
         where: { id },
         include: { user: { select: { id: true, username: true, fullName: true, role: true, isActive: true } } },
       })
-      if (!staffMember) return c.json({ error: 'Staff member not found' }, 404)
-      if (staffMember.agencyId !== agencyId) return c.json({ error: 'Not your agency' }, 403)
-      if (staffMember.role === 'OWNER') return c.json({ error: 'Cannot modify owner' }, 403)
+      if (!staffMember) return c.json({ success: false, error: 'Staff member not found' }, 404)
+      if (staffMember.agencyId !== agencyId) return c.json({ success: false, error: 'Not your agency' }, 403)
+      if (staffMember.role === 'OWNER') return c.json({ success: false, error: 'Cannot modify owner' }, 403)
       const { fullName, role, isActive, permissions } = body
       // Update user fullName
       if (fullName !== undefined && fullName.trim()) {
@@ -3021,15 +4271,46 @@ function createApp() {
     }
   })
 
-  // GET /api/agency/subscription-plans — list available plans (offline: empty)
+  // GET /api/agency/subscription-plans — list available plans
   app.get('/api/agency/subscription-plans', authMiddleware, async (c) => {
     try {
-      // SubscriptionPlan table is NOT synced locally.
-      // Return empty array — the subscription page will show cached plan data from session.
-      return c.json({ plans: [] })
+      const plans = await db.subscriptionPlan.findMany({
+        where: { isActive: true, isEnterprise: false },
+        orderBy: { sortOrder: 'asc' },
+        include: { features: true },
+      })
+      return c.json({ success: true, plans })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/subscription-plans error:', error)
-      return c.json({ plans: [] })
+      // If SubscriptionPlan table not yet synced, return empty
+      return c.json({ success: true, plans: [] })
+    }
+  })
+
+  // GET /api/agency/working-hours — get working hours configuration
+  app.get('/api/agency/working-hours', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency found' }, 404)
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId },
+        select: { id: true, workingHoursStart: true, workingHoursEnd: true, isQueueOpen: true },
+      })
+      if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
+      // Also check queueSettings for isPaused state
+      const queueSettings = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      const isQueueOpen = agency.isQueueOpen !== false && !(queueSettings?.isPaused)
+      return c.json({
+        success: true,
+        data: {
+          workingHoursStart: agency.workingHoursStart || '08:00',
+          workingHoursEnd: agency.workingHoursEnd || '17:00',
+          isQueueOpen,
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] GET /api/agency/working-hours error:', error)
+      return c.json({ success: false, error: 'Failed to get working hours' }, 500)
     }
   })
 
@@ -3065,11 +4346,11 @@ function createApp() {
     try {
       const body = await c.req.json().catch(() => ({}))
       const { reviewId } = body
-      if (!reviewId) return c.json({ error: 'reviewId is required' }, 400)
+      if (!reviewId) return c.json({ success: false, error: 'reviewId is required' }, 400)
       const review = await db.review.findUnique({ where: { id: reviewId } })
-      if (!review) return c.json({ error: 'Review not found' }, 404)
+      if (!review) return c.json({ success: false, error: 'Review not found' }, 404)
       if (review.agencyId !== sessionUser.agencyId && review.userId !== sessionUser.id) {
-        return c.json({ error: 'Not authorized to delete this review' }, 403)
+        return c.json({ success: false, error: 'Not authorized to delete this review' }, 403)
       }
       await db.review.delete({ where: { id: reviewId } })
       emitEvent('review:deleted', { agencyId: review.agencyId, reviewId })
@@ -3077,7 +4358,7 @@ function createApp() {
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] DELETE /api/reviews error:', error)
-      return c.json({ error: 'Failed to delete review' }, 500)
+      return c.json({ success: false, error: 'Failed to delete review' }, 500)
     }
   })
 
@@ -3086,11 +4367,11 @@ function createApp() {
     try {
       const body = await c.req.json().catch(() => ({}))
       const { reviewId } = body
-      if (!reviewId) return c.json({ error: 'reviewId is required' }, 400)
+      if (!reviewId) return c.json({ success: false, error: 'reviewId is required' }, 400)
       const review = await db.review.findUnique({ where: { id: reviewId } })
-      if (!review) return c.json({ error: 'Review not found' }, 404)
+      if (!review) return c.json({ success: false, error: 'Review not found' }, 404)
       if (review.agencyId !== sessionUser.agencyId) {
-        return c.json({ error: 'Not authorized' }, 403)
+        return c.json({ success: false, error: 'Not authorized' }, 403)
       }
       await db.review.delete({ where: { id: reviewId } })
       emitEvent('review:deleted', { agencyId: review.agencyId, reviewId })
@@ -3098,7 +4379,7 @@ function createApp() {
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] DELETE /api/agency/reviews error:', error)
-      return c.json({ error: 'Failed to delete review' }, 500)
+      return c.json({ success: false, error: 'Failed to delete review' }, 500)
     }
   })
 
@@ -3146,7 +4427,7 @@ function createApp() {
   app.get('/api/agency/reviews', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
-      if (!agencyId) return c.json({ error: 'agencyId is required' }, 400)
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
       const page = parseInt(c.req.query('page') || '1', 10)
       const limit = parseInt(c.req.query('limit') || '10', 10)
       const skip = (page - 1) * limit
@@ -3157,15 +4438,16 @@ function createApp() {
         }),
         db.review.count({ where: { agencyId } }),
       ])
-      // Rating distribution
+      // Rating distribution from real data
       const ratingDistribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }
-      const allRatings = await db.review.findMany({ where: { agencyId }, select: { rating: true } })
-      for (const r of allRatings) {
-        if (r.rating >= 1 && r.rating <= 5) ratingDistribution[r.rating]++
-      }
+      const ratingCounts = await Promise.all(
+        [1, 2, 3, 4, 5].map((r) => db.review.count({ where: { agencyId, rating: r } }))
+      )
+      for (let i = 0; i < 5; i++) ratingDistribution[i + 1] = ratingCounts[i]
       const agg = await db.review.aggregate({ where: { agencyId }, _avg: { rating: true } })
       const avgRating = agg._avg.rating ? Math.round(agg._avg.rating * 10) / 10 : 0
       return c.json({
+        success: true,
         reviews: reviews.map((r) => ({
           id: r.id, rating: r.rating, comment: r.comment,
           replyText: r.replyText, repliedAt: r.repliedAt?.toISOString() ?? null,
@@ -3173,11 +4455,191 @@ function createApp() {
           user: r.user ? { id: r.user.id, fullName: r.user.fullName, avatarUrl: r.user.avatarUrl } : { id: '', fullName: 'Unknown' },
         })),
         avgRating, totalReviews, ratingDistribution,
+        page, limit,
         hasMore: skip + limit < totalReviews,
       })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/reviews error:', error)
-      return c.json({ reviews: [], avgRating: 0, totalReviews: 0, ratingDistribution: {}, hasMore: false })
+      return c.json({ success: false, reviews: [], avgRating: 0, totalReviews: 0, ratingDistribution: {}, hasMore: false, page: 1, limit: 10 })
+    }
+  })
+
+  // POST /api/agency/reviews/:id/reply — agency reply to a review
+  app.post('/api/agency/reviews/:id/reply', authMiddleware, async (c) => {
+    try {
+      const reviewId = c.req.param('id')
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const body = await c.req.json()
+      const { text } = body
+      if (!text?.trim()) return c.json({ success: false, error: 'Reply text is required' }, 400)
+
+      const review = await db.review.findUnique({ where: { id: reviewId } })
+      if (!review || review.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Review not found' }, 404)
+      }
+
+      const updated = await db.review.update({
+        where: { id: reviewId },
+        data: { replyText: text.trim(), repliedAt: new Date() },
+      })
+      emitEvent('review:replied', { agencyId, reviewId })
+      logPendingMutation('POST', `/api/agency/reviews/${reviewId}/reply`, body, { replyText: text.trim() }).catch(() => {})
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/agency/reviews/:id/reply error:', error)
+      return c.json({ success: false, error: 'Failed to reply' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 13c. FAVORITES (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/favorites — list user's favorites (local)
+  app.get('/api/agency/favorites', authMiddleware, async (c) => {
+    try {
+      const favorites = await db.favorite.findMany({
+        where: { userId: sessionUser.id },
+        orderBy: { createdAt: 'desc' },
+      })
+      return c.json({ success: true, data: favorites })
+    } catch (error) {
+      console.error('[LocalAPI] List favorites error:', error)
+      return c.json({ success: false, error: 'Failed to list favorites' }, 500)
+    }
+  })
+
+  // POST /api/agency/favorites — add favorite
+  app.post('/api/agency/favorites', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json()
+      const { agencyId: targetAgencyId } = body
+      if (!targetAgencyId) return c.json({ success: false, error: 'agencyId is required' }, 400)
+      const existing = await db.favorite.findFirst({ where: { userId: sessionUser.id, agencyId: targetAgencyId } })
+      if (existing) return c.json({ success: true, data: existing })
+      const favorite = await db.favorite.create({ data: { userId: sessionUser.id, agencyId: targetAgencyId } })
+      emitEvent('favorite:added', { userId: sessionUser.id, agencyId: targetAgencyId })
+      logPendingMutation('POST', '/api/agency/favorites', body, favorite).catch(() => {})
+      return c.json({ success: true, data: favorite }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Add favorite error:', error)
+      return c.json({ success: false, error: 'Failed to add favorite' }, 500)
+    }
+  })
+
+  // DELETE /api/agency/favorites — remove favorite
+  app.delete('/api/agency/favorites', authMiddleware, async (c) => {
+    try {
+      const agencyIdTarget = c.req.query('agencyId')
+      if (!agencyIdTarget) return c.json({ success: false, error: 'agencyId query param required' }, 400)
+      const existing = await db.favorite.findFirst({ where: { userId: sessionUser.id, agencyId: agencyIdTarget } })
+      if (!existing) return c.json({ success: false, error: 'Favorite not found' }, 404)
+      await db.favorite.delete({ where: { id: existing.id } })
+      emitEvent('favorite:removed', { userId: sessionUser.id, agencyId: agencyIdTarget })
+      logPendingMutation('DELETE', '/api/agency/favorites', { agencyId: agencyIdTarget }, { id: existing.id }).catch(() => {})
+      return c.json({ success: true, data: { id: existing.id, deleted: true } })
+    } catch (error) {
+      console.error('[LocalAPI] Remove favorite error:', error)
+      return c.json({ success: false, error: 'Failed to remove favorite' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 13d. FAQs (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/faqs — list FAQs
+  app.get('/api/agency/faqs', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const faqs = await db.fAQ.findMany({ where: { agencyId }, orderBy: { createdAt: 'asc' } })
+      return c.json({ success: true, data: faqs })
+    } catch (error) {
+      console.error('[LocalAPI] List FAQs error:', error)
+      return c.json({ success: false, error: 'Failed to list FAQs' }, 500)
+    }
+  })
+
+  // POST /api/agency/faqs — create FAQ
+  app.post('/api/agency/faqs', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const body = await c.req.json()
+      const { question, answer, questionFr, answerFr, questionAr, answerAr } = body
+      if (!question || !answer) return c.json({ success: false, error: 'question and answer are required' }, 400)
+      const faq = await db.fAQ.create({ data: { agencyId, question, answer, questionFr: questionFr || null, answerFr: answerFr || null, questionAr: questionAr || null, answerAr: answerAr || null } })
+      emitEvent('faq:created', { agencyId, faq })
+      logPendingMutation('POST', '/api/agency/faqs', body, faq).catch(() => {})
+      return c.json({ success: true, data: faq }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create FAQ error:', error)
+      return c.json({ success: false, error: 'Failed to create FAQ' }, 500)
+    }
+  })
+
+  // PATCH /api/agency/faqs/:id — update FAQ
+  app.patch('/api/agency/faqs/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const id = c.req.param('id')
+      const existing = await db.fAQ.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'FAQ not found' }, 404)
+      const body = await c.req.json()
+      const allowedFields = ['question', 'answer', 'questionFr', 'answerFr', 'questionAr', 'answerAr']
+      const updateData = {}
+      for (const field of allowedFields) { if (body[field] !== undefined) updateData[field] = body[field] }
+      const updated = await db.fAQ.update({ where: { id }, data: updateData })
+      emitEvent('faq:updated', { agencyId, faqId: id })
+      logPendingMutation('PATCH', '/api/agency/faqs/:id', body, updated).catch(() => {})
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Update FAQ error:', error)
+      return c.json({ success: false, error: 'Failed to update FAQ' }, 500)
+    }
+  })
+
+  // DELETE /api/agency/faqs/:id — delete FAQ
+  app.delete('/api/agency/faqs/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const id = c.req.param('id')
+      const existing = await db.fAQ.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'FAQ not found' }, 404)
+      await db.fAQ.delete({ where: { id } })
+      emitEvent('faq:deleted', { agencyId, faqId: id })
+      logPendingMutation('DELETE', '/api/agency/faqs/:id', {}, { id }).catch(() => {})
+      return c.json({ success: true, data: { id, deleted: true } })
+    } catch (error) {
+      console.error('[LocalAPI] Delete FAQ error:', error)
+      return c.json({ success: false, error: 'Failed to delete FAQ' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 13e. TRANSACTIONS (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/transactions — list transactions
+  app.get('/api/agency/transactions', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const { take, skip } = parsePagination(c)
+      const transactions = await db.transaction.findMany({
+        where: { agencyId },
+        orderBy: { createdAt: 'desc' },
+        take,
+        skip,
+      })
+      return c.json({ success: true, data: transactions })
+    } catch (error) {
+      console.error('[LocalAPI] List transactions error:', error)
+      return c.json({ success: false, error: 'Failed to list transactions' }, 500)
     }
   })
 
@@ -3195,24 +4657,72 @@ function createApp() {
       service: 'blasti-lan-sync',
       local: { ready: !!db, mode: 'sqlite' },
       sessionActive: !!sessionToken,
+      isSyncing: _isSyncing || false,
+      lastSyncAt: _lastSyncAt || null,
+      pendingMutations: _pendingMutationsCount || 0,
+      lastPulledSequence: _lastPulledSequence || 0,
+      lastPushedSequence: _lastPushedSequence || 0,
+      syncProtocolVersion: _syncProtocolVersion,
+      syncModelCount: _syncModelCount,
     })
   })
 
+  // POST /api/sync/trigger — manual sync trigger (used by desktop frontend)
+  app.post('/api/sync/trigger', requireAuth(), async (c) => {
+    try {
+      // Trigger the sync service if available
+      const syncService = require('./sync-service')
+      if (syncService.triggerSyncNow) {
+        const result = await syncService.triggerSyncNow()
+        // If sync succeeded, update cloud contact time
+        if (result?.success !== false) {
+          _lastCloudContactAt = _safeTimestamp()
+          _persistCloudContact()
+        }
+        return c.json({ success: true, message: 'Sync triggered', result })
+      }
+      return c.json({ success: false, error: 'Sync service not available' }, 503)
+    } catch (e) {
+      return c.json({ success: false, error: e.message || 'Sync trigger failed' }, 500)
+    }
+  })
+
   // GET /api/sync-status — local sync status for diagnosis panel
-  app.get('/api/sync-status', (c) => {
+  app.get('/api/sync-status', async (c) => {
+    const offlineDuration = _lastCloudContactAt ? _safeTimestamp() - _lastCloudContactAt : null
+
+    // Actually check cloud health with a 3-second timeout
+    let cloudConnected = false
+    try {
+      const cloudUrl = getCloudUrl()
+      const healthUrl = `${cloudUrl}/health`
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), 3000)
+      const res = await fetch(healthUrl, { signal: controller.signal })
+      clearTimeout(timeout)
+      cloudConnected = res.ok
+    } catch (_) {
+      cloudConnected = false
+    }
+
     return c.json({
       success: true,
       localReady: !!db,
       sessionActive: !!sessionToken,
-      cloudConnected: false,
-      lastSyncAt: null,
+      cloudConnected,
+      lastSyncAt: _lastSyncAt || null,
+      lastCloudContactAt: _lastCloudContactAt || null,
+      offlineDurationMs: offlineDuration,
+      offlineDays: offlineDuration ? Math.floor(offlineDuration / (24 * 60 * 60 * 1000)) : null,
+      offlineTokenRemainingMs: offlineDuration ? Math.max(0, OFFLINE_TOKEN_MAX_MS - offlineDuration) : null,
+      pendingMutations: _pendingMutationsCount || 0,
     })
   })
 
   // GET /api/db-status — database diagnostics for the diagnosis panel
   app.get('/api/db-status', async (c) => {
     if (!db) {
-      return c.json({ success: false, error: 'Database not initialized', tables: 0 })
+      return c.json({ success: false, error: 'Database not initialized', tables: 0 }, 503)
     }
     try {
       // Count tables and records in the local SQLite database
@@ -3242,14 +4752,14 @@ function createApp() {
         user: sessionUser ? { id: sessionUser.id, username: sessionUser.username, role: sessionUser.role } : null,
       })
     } catch (err) {
-      return c.json({ success: false, error: String(err), tables: 0 })
+      return c.json({ success: false, error: String(err), tables: 0 }, 500)
     }
   })
 
   // GET /api/cloud-health — check if local API can reach the cloud API
   // This endpoint is used by the diagnosis panel to verify local→cloud connectivity
   app.get('/api/cloud-health', async (c) => {
-    const cloudUrl = process.env.BLASTI_CLOUD_URL || 'http://localhost:3003'
+    const cloudUrl = getCloudUrl()
     try {
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), 2000)
@@ -3276,103 +4786,54 @@ function createApp() {
   // 15. ADDITIONAL OFFLINE ROUTES
   // ═══════════════════════════════════════════════════════════════════════
 
-  // POST /api/agency/queue/call-next — alias (frontend calls this path)
-  app.post('/api/agency/queue/call-next', authMiddleware, async (c) => {
-    try {
-      const agencyId = sessionUser.agencyId
-      if (!agencyId) {
-        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
-      }
+  // NOTE: /api/agency/queue/call-next is handled by /api/queue/call-next above (same logic)
 
-      const body = await c.req.json().catch(() => ({}))
-      const { serviceId, counterId, branchId } = body
-
-      // Build where clause for next waiting
-      const where = { agencyId, status: 'WAITING' }
-      if (serviceId) where.serviceId = serviceId
-      // branchId filter removed — Reservation has no branchId field
-
-      const next = await db.reservation.findFirst({
-        where,
-        orderBy: { joinedAt: 'asc' },
-      })
-
-      if (!next) {
-        return c.json({ success: false, error: 'No customers in queue' }, 404)
-      }
-
-      const now = new Date()
-
-      // Call the customer
-      await db.reservation.update({
-        where: { id: next.id },
-        data: {
-          status: 'CALLED',
-          calledAt: now,
-          // calledBy: removed — not a Reservation schema field
-          counterId: counterId || null,
-        },
-      })
-
-      // Update current serving number in queue settings
-      const qs = await db.queueSettings.findFirst({ where: { agencyId } })
-      if (qs) {
-        await db.queueSettings.update({
-          where: { id: qs.id },
-          data: { currentServingNumber: next.queueNumber },
-        })
-      }
-
-      // Update positions of remaining waiting reservations
-      const remainingWaiting = await db.reservation.findMany({
-        where: { agencyId, status: 'WAITING' },
-        orderBy: { joinedAt: 'asc' },
-      })
-      // position reassignment loop removed — position is not a schema field
-
-      const updated = await db.reservation.findUnique({ where: { id: next.id } })
-
-      emitEvent('queue:called', { agencyId, reservation: updated })
-
-      return c.json({ success: true, data: updated })
-    } catch (error) {
-      console.error('[LocalAPI] /api/agency/queue/call-next error:', error)
-      return c.json({ success: false, error: 'Failed to call next customer' }, 500)
-    }
-  })
-
-  // POST /api/agency/queue/walk-in-token — QR-based walk-in
-  app.post('/api/agency/queue/walk-in-token', authMiddleware, async (c) => {
+  // POST /api/agency/queue/walk-in-token — QR-based walk-in token call
+  app.post('/api/agency/queue/walk-in-token', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
       const body = await c.req.json().catch(() => ({}))
-      const { serviceId, customerName, phone } = body
-      if (!serviceId) return c.json({ success: false, error: 'serviceId required' }, 400)
-      const service = await db.service.findUnique({ where: { id: serviceId } })
-      if (!service || service.agencyId !== agencyId) return c.json({ success: false, error: 'Service not found' }, 404)
-      // Generate a 6-digit token code
-      const tokenCode = String(Math.floor(100000 + Math.random() * 900000))
-      const now = new Date()
-      const reservation = await db.reservation.create({
-        data: {
+      const { importToken } = body
+      if (!importToken) return c.json({ success: false, error: 'importToken required' }, 400)
+      // Look up reservation by the 6-digit token code (stored in displayNumber or importToken)
+      const reservation = await db.reservation.findFirst({
+        where: {
           agencyId,
-          serviceId,
-          userId: sessionUser.id,
-          queueNumber: tokenCode,
-          displayNumber: tokenCode,
-          status: 'WAITING',
-          walkInCustomerName: customerName || 'Token',
-          isWalkIn: true,
-          joinedAt: now,
-          estimatedWait: 0,
+          OR: [
+            { displayNumber: String(importToken) },
+            { importToken: String(importToken) },
+          ],
         },
       })
-      emitEvent('reservation:created', { agencyId, reservation })
-      return c.json({ success: true, data: { ...reservation, tokenCode } }, 201)
+      if (!reservation) return c.json({ success: false, error: 'Invalid token — reservation not found' }, 404)
+      if (reservation.status !== 'WAITING') {
+        return c.json({ success: false, error: `Token already used or reservation is ${reservation.status}` }, 400)
+      }
+      // Update reservation status to CALLED
+      const now = new Date()
+      const updated = await db.reservation.update({
+        where: { id: reservation.id },
+        data: {
+          status: 'CALLED',
+          calledAt: now,
+          updatedAt: now,
+        },
+      })
+      // Update queueSettings.currentServingNumber
+      const qs = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      if (qs) {
+        await db.queueSettings.update({
+          where: { id: qs.id },
+          data: { currentServingNumber: reservation.queueNumber },
+        }).catch(() => {})
+      }
+      emitEvent('queue:called', { agencyId, reservation: updated, counterId: null })
+      logPendingMutation('POST', '/api/agency/queue/walk-in-token', body, updated).catch(() => {})
+      return c.json({ success: true, data: updated })
     } catch (error) {
       console.error('[LocalAPI] walk-in-token error:', error)
-      return c.json({ success: false, error: 'Failed to create token walk-in' }, 500)
+      return c.json({ success: false, error: 'Failed to process walk-in token' }, 500)
     }
   })
 
@@ -3393,6 +4854,7 @@ function createApp() {
       if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields' }, 400)
       const updated = await db.service.update({ where: { id }, data: updateData })
       emitEvent('service:updated', { agencyId, serviceId: id, ...updateData })
+      logPendingMutation('PATCH', '/api/agency/services/:id', body, updated).catch(() => {})
       return c.json({ success: true, data: updated })
     } catch (error) {
       console.error('[LocalAPI] PATCH service error:', error)
@@ -3410,6 +4872,7 @@ function createApp() {
       if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Service not found' }, 404)
       await db.service.update({ where: { id }, data: { isActive: false } })
       emitEvent('service:deleted', { agencyId, serviceId: id })
+      logPendingMutation('DELETE', '/api/agency/services/:id', {}, { id }).catch(() => {})
       return c.json({ success: true, data: { id, deleted: true } })
     } catch (error) {
       console.error('[LocalAPI] DELETE service error:', error)
@@ -3442,6 +4905,7 @@ function createApp() {
         },
       })
       emitEvent('staff:created', { agencyId, staff })
+      logPendingMutation('POST', '/api/agency/staff/create', body, staff).catch(() => {})
       return c.json({ success: true, data: staff }, 201)
     } catch (error) {
       console.error('[LocalAPI] Create staff error:', error)
@@ -3449,30 +4913,7 @@ function createApp() {
     }
   })
 
-  // PUT/PATCH /api/agency/staff/:id — update staff
-  for (const method of ['put', 'patch']) {
-    app[method]('/api/agency/staff/:id', authMiddleware, async (c) => {
-      try {
-        const agencyId = sessionUser.agencyId
-        if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
-        const id = c.req.param('id')
-        const body = await c.req.json()
-        const existing = await db.agencyStaff.findUnique({ where: { id } })
-        if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Staff not found' }, 404)
-        const allowedFields = ['role', 'permissions', 'isActive']
-        const updateData = {}
-        for (const field of allowedFields) {
-          if (body[field] !== undefined) updateData[field] = body[field]
-        }
-        const updated = await db.agencyStaff.update({ where: { id }, data: updateData })
-        emitEvent('staff:updated', { agencyId, staffId: id, ...updateData })
-        return c.json({ success: true, data: updated })
-      } catch (error) {
-        console.error('[LocalAPI] Update staff error:', error)
-        return c.json({ success: false, error: 'Failed to update staff' }, 500)
-      }
-    })
-  }
+  // NOTE: /api/agency/staff/:id PATCH is handled by the standalone route above
 
   // DELETE /api/agency/staff/:id — remove staff
   app.delete('/api/agency/staff/:id', authMiddleware, async (c) => {
@@ -3484,6 +4925,7 @@ function createApp() {
       if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Staff not found' }, 404)
       await db.agencyStaff.delete({ where: { id } })
       emitEvent('staff:deleted', { agencyId, staffId: id })
+      logPendingMutation('DELETE', '/api/agency/staff/:id', {}, { id }).catch(() => {})
       return c.json({ success: true, data: { id, deleted: true } })
     } catch (error) {
       console.error('[LocalAPI] DELETE staff error:', error)
@@ -3498,14 +4940,28 @@ function createApp() {
       if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
       const agency = await db.agency.findUnique({ where: { id: agencyId } })
       if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
-      // Return a placeholder QR — actual QR generation requires the display URL
+
+      // Build the public queue URL from the agency's customCode
+      const displayUrl = `https://blasti.vercel.app/queue/${agency.customCode}`
+
+      // Try to generate a QR code SVG using the 'qrcode' package if available
+      let qrCodeSvg = null
+      try {
+        const QRCode = require('qrcode')
+        qrCodeSvg = await QRCode.toString(displayUrl, { type: 'svg', width: 256, margin: 2 })
+      } catch (_) {
+        // qrcode package not available — return URL without SVG
+        qrCodeSvg = null
+      }
+
       return c.json({
         success: true,
         data: {
-          qrCodeUrl: null,
-          displayUrl: null,
+          qrCodeUrl: qrCodeSvg,
+          displayUrl,
           agencyName: agency.name,
-          message: 'QR code available online',
+          customCode: agency.customCode,
+          message: qrCodeSvg ? 'QR code generated' : 'QR code URL ready (install qrcode package for SVG)',
         },
       })
     } catch (error) {
@@ -3602,6 +5058,7 @@ function createApp() {
         },
       })
       emitEvent('review:created', { agencyId, review })
+      logPendingMutation('POST', '/api/reviews', body, review).catch(() => {})
       return c.json({ success: true, data: review }, 201)
     } catch (error) {
       console.error('[LocalAPI] Create review error:', error)
@@ -3614,8 +5071,8 @@ function createApp() {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
-      const dateFrom = c.req.query('dateFrom')
-      const dateTo = c.req.query('dateTo')
+      const dateFrom = c.req.query('from') || c.req.query('dateFrom')
+      const dateTo = c.req.query('to') || c.req.query('dateTo')
       const where = { agencyId }
       if (dateFrom || dateTo) {
         where.joinedAt = {}
@@ -3627,14 +5084,30 @@ function createApp() {
         orderBy: { joinedAt: 'desc' },
         take: 5000,
       })
-      // Build CSV
-      const header = 'ID,Ticket,Display Number,Status,Service,Customer,Created At,Completed At\n'
-      const rows = reservations.map(r => {
-        const svc = r.serviceId || ''
-        const name = r.walkInCustomerName || ''
-        const created = r.joinedAt ? new Date(r.joinedAt).toISOString() : ''
-        const completed = r.completedAt ? new Date(r.completedAt).toISOString() : ''
-        return `${r.id},${r.displayNumber},${r.status},${svc},${name},${created},${completed}`
+      // Build service lookup map for serviceName resolution
+      const serviceIds = [...new Set(reservations.map((r) => r.serviceId).filter(Boolean))]
+      const serviceList = serviceIds.length > 0 ? await db.service.findMany({ where: { id: { in: serviceIds } } }).catch(() => []) : []
+      const serviceMap = new Map(serviceList.map((s) => [s.id, s.name]))
+      // CSV escape: wrap in quotes if contains comma, quote, or newline
+      const csvEscape = (val) => {
+        const str = String(val ?? '')
+        if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+          return '"' + str.replace(/"/g, '""') + '"'
+        }
+        return str
+      }
+      // Build CSV with full columns matching cloud API format
+      const header = 'Queue Number,Customer Name,Service Name,Status,Joined At,Called At,Completed At,Wait Time (min)\n'
+      const rows = reservations.map((r) => {
+        const queueNumber = r.displayNumber || String(r.queueNumber || '')
+        const customerName = r.walkInCustomerName || ''
+        const serviceName = serviceMap.get(r.serviceId) || ''
+        const joinedAt = r.joinedAt ? new Date(r.joinedAt).toISOString() : ''
+        const calledAt = r.calledAt ? new Date(r.calledAt).toISOString() : ''
+        const completedAt = r.completedAt ? new Date(r.completedAt).toISOString() : ''
+        const waitTime = r.waitTime != null ? String(r.waitTime) : ''
+        return [queueNumber, customerName, serviceName, r.status, joinedAt, calledAt, completedAt, waitTime]
+          .map(csvEscape).join(',')
       })
       const csv = header + rows.join('\n')
       return c.text(csv, 200, {
@@ -3647,37 +5120,7 @@ function createApp() {
     }
   })
 
-  // POST /api/agency/queue/call/:id — call specific reservation
-  app.post('/api/agency/queue/call/:id', authMiddleware, async (c) => {
-    try {
-      const agencyId = sessionUser.agencyId
-      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
-      const id = c.req.param('id')
-      const body = await c.req.json().catch(() => ({}))
-      const { counterId } = body
-      const existing = await db.reservation.findUnique({ where: { id } })
-      if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Reservation not found' }, 404)
-      if (!['WAITING', 'CALLED'].includes(existing.status)) {
-        return c.json({ success: false, error: 'Cannot call reservation with status: ' + existing.status }, 400)
-      }
-      const now = new Date()
-      await db.reservation.update({
-        where: { id },
-        data: {
-          status: 'CALLED',
-          calledAt: now,
-          // calledBy: removed — not a Reservation schema field
-          counterId: counterId || null,
-        },
-      })
-      const updated = await db.reservation.findUnique({ where: { id } })
-      emitEvent('queue:called', { agencyId, reservation: updated })
-      return c.json({ success: true, data: updated })
-    } catch (error) {
-      console.error('[LocalAPI] /api/agency/queue/call/:id error:', error)
-      return c.json({ success: false, error: 'Failed to call reservation' }, 500)
-    }
-  })
+  // NOTE: /api/agency/queue/call/:id is handled by /api/queue/call/:id above (same logic)
 
   // GET /api/probe — health check used by frontend
   app.get('/api/probe', (c) => {
@@ -3717,14 +5160,452 @@ function createApp() {
   })
 
   // ── Middleware: require DB ───────────────────────────────────────────
-  // Prevents 500 crashes when db is null (e.g. during startup race).
-  // Must be applied AFTER authMiddleware so it runs after auth.
-  const requireDb = async (c, next) => {
-    if (!db) {
-      return c.json({ success: false, error: 'Database not initialized' }, 503)
+  // NOTE: requireDb middleware removed — requireAuth() already checks for !db at line 187.
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // DESKTOP FRONTEND — Static file serving for the dedicated desktop UI
+  // ═══════════════════════════════════════════════════════════════════════
+  // The desktop frontend is a Vite-built React SPA that ONLY talks to this
+  // local API. It's served from the frontend/dist/ directory.
+  // This replaces the old architecture where the web app (Next.js) was loaded
+  // via Electron and had to failover between cloud and local API.
+
+  const FRONTEND_DIST = path.join(__dirname, '..', 'frontend', 'dist')
+
+  // Serve static files from the frontend dist directory
+  // This handles all non-API routes (the SPA)
+  app.get('/*', async (c) => {
+    // Only serve static files for non-API routes
+    const urlPath = c.req.path
+    if (urlPath.startsWith('/api/')) {
+      return c.notFound()
     }
-    await next()
-  }
+
+    // Try to serve the exact file first
+    let filePath = path.join(FRONTEND_DIST, urlPath)
+    if (urlPath === '/' || urlPath === '') {
+      filePath = path.join(FRONTEND_DIST, 'index.html')
+    }
+
+    try {
+      const fs = require('fs')
+      if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+        const content = fs.readFileSync(filePath)
+        const ext = path.extname(filePath)
+        const mimeTypes = {
+          '.html': 'text/html',
+          '.js': 'application/javascript',
+          '.css': 'text/css',
+          '.json': 'application/json',
+          '.png': 'image/png',
+          '.jpg': 'image/jpeg',
+          '.svg': 'image/svg+xml',
+          '.ico': 'image/x-icon',
+          '.woff': 'font/woff',
+          '.woff2': 'font/woff2',
+          '.ttf': 'font/ttf',
+        }
+        const contentType = mimeTypes[ext] || 'application/octet-stream'
+        return new Response(content, {
+          headers: {
+            'Content-Type': contentType,
+            'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=31536000',
+          },
+        })
+      }
+
+      // SPA fallback: serve index.html for client-side routing
+      const indexPath = path.join(FRONTEND_DIST, 'index.html')
+      if (fs.existsSync(indexPath)) {
+        const indexContent = fs.readFileSync(indexPath)
+        return new Response(indexContent, {
+          headers: {
+            'Content-Type': 'text/html',
+            'Cache-Control': 'no-cache',
+          },
+        })
+      }
+
+      return c.json({ success: false, error: 'Frontend not built — run: cd apps/desktop/frontend && bun run build' }, 404)
+    } catch (e) {
+      return c.json({ success: false, error: 'Frontend not available' }, 404)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CLOUD PROXY — Proxy cloud-only features when online
+  // ═══════════════════════════════════════════════════════════════════════
+  // The desktop frontend ONLY talks to this local API. For features that
+  // require the cloud (registration, password reset, payment), the local API
+  // proxies the request to the cloud when online, and returns an error when offline.
+
+  app.post('/api/cloud-proxy/*', requireAuth(), async (c) => {
+    const cloudPath = c.req.path.replace('/api/cloud-proxy/', '/api/')
+    const cloudBase = getCloudUrl()
+
+    try {
+      const body = await c.req.json().catch(() => null)
+      const headers = {
+        'Content-Type': 'application/json',
+        'Authorization': c.req.header('Authorization') || '',
+      }
+
+      const cloudUrl = `${cloudBase}${cloudPath}`
+      const resp = await fetch(cloudUrl, {
+        method: c.req.method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+      })
+
+      const data = await resp.json()
+      return c.json(data, resp.status)
+    } catch (e) {
+      return c.json({
+        success: false,
+        error: 'Cloud unavailable — this feature requires internet connection',
+        offline: true,
+      }, 503)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ROUTE ALIASES — Frontend compatibility routes
+  // These map frontend API client paths to the actual local API routes.
+  // Without these, the desktop frontend would get 404s.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency → alias for /api/agency/profile
+  app.get('/api/agency', authMiddleware, async (c) => {
+    const agencyId = requireAgencyId(c)
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+    const agency = await db.agency.findUnique({ where: { id: agencyId } })
+    if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
+    return c.json({ success: true, data: agency })
+  })
+
+  // GET /api/queue → alias for /api/queue/active
+  app.get('/api/queue', authMiddleware, async (c) => {
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+    const waiting = await db.reservation.findMany({
+      where: { agencyId, status: 'WAITING' },
+      orderBy: { joinedAt: 'asc' },
+      take: 100,
+    })
+    const calledOrServing = await db.reservation.findMany({
+      where: { agencyId, status: { in: ['CALLED', 'SERVING'] } },
+      orderBy: { calledAt: 'desc' },
+    })
+    return c.json({ success: true, data: { waiting, active: calledOrServing } })
+  })
+
+  // PATCH /api/services/:id → alias for PUT /api/services/:id
+  app.patch('/api/services/:id', authMiddleware, async (c) => {
+    const { id } = c.req.param()
+    try {
+      const body = await c.req.json()
+      const user = c.get('user')
+      const agencyId = user?.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+      const existing = await db.service.findFirst({ where: { id, agencyId } })
+      if (!existing) return c.json({ success: false, error: 'Service not found' }, 404)
+
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'description', 'descriptionAr', 'descriptionFr', 'estimatedTime', 'isActive', 'prefix', 'fixedTimeEnabled', 'fixedTimeMinutes']
+      const data = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) {
+          if (field === 'fixedTimeEnabled') data[field] = !!body[field]
+          else data[field] = body[field]
+        }
+      }
+      data.updatedAt = new Date().toISOString()
+
+      const updated = await db.service.update({ where: { id }, data })
+      logPendingMutation('update', 'Service', id, data)
+      return c.json({ success: true, data: updated })
+    } catch (e) {
+      return c.json({ success: false, error: e.message }, 500)
+    }
+  })
+
+  // POST /api/reservations/:id/call → proxy to queue logic
+  app.post('/api/reservations/:id/call', authMiddleware, async (c) => {
+    const { id } = c.req.param()
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+    const reservation = await db.reservation.findFirst({ where: { id, agencyId } })
+    if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
+
+    const updated = await db.reservation.update({
+      where: { id },
+      data: { status: 'CALLED', calledAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    })
+    logPendingMutation('update', 'Reservation', id, { status: 'CALLED' })
+    return c.json({ success: true, data: updated })
+  })
+
+  // POST /api/reservations/:id/complete
+  app.post('/api/reservations/:id/complete', authMiddleware, async (c) => {
+    const { id } = c.req.param()
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+    const reservation = await db.reservation.findFirst({ where: { id, agencyId } })
+    if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
+
+    const completedAt = new Date().toISOString()
+    const waitTime = reservation.joinedAt ? Math.round((new Date(completedAt) - new Date(reservation.joinedAt)) / 60000) : null
+    const updated = await db.reservation.update({
+      where: { id },
+      data: { status: 'COMPLETED', completedAt, waitTime, updatedAt: completedAt },
+    })
+    logPendingMutation('update', 'Reservation', id, { status: 'COMPLETED' })
+    return c.json({ success: true, data: updated })
+  })
+
+  // POST /api/reservations/:id/noshow
+  app.post('/api/reservations/:id/noshow', authMiddleware, async (c) => {
+    const { id } = c.req.param()
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+    const reservation = await db.reservation.findFirst({ where: { id, agencyId } })
+    if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
+
+    const updated = await db.reservation.update({
+      where: { id },
+      data: { status: 'NO_SHOW', updatedAt: new Date().toISOString() },
+    })
+    logPendingMutation('update', 'Reservation', id, { status: 'NO_SHOW' })
+    return c.json({ success: true, data: updated })
+  })
+
+  // POST /api/reservations/:id/cancel
+  app.post('/api/reservations/:id/cancel', authMiddleware, async (c) => {
+    const { id } = c.req.param()
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+    const reservation = await db.reservation.findFirst({ where: { id, agencyId } })
+    if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
+
+    const updated = await db.reservation.update({
+      where: { id },
+      data: { status: 'CANCELLED', cancelledAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    })
+    logPendingMutation('update', 'Reservation', id, { status: 'CANCELLED' })
+    return c.json({ success: true, data: updated })
+  })
+
+  // POST /api/reservations/:id/recall
+  app.post('/api/reservations/:id/recall', authMiddleware, async (c) => {
+    const { id } = c.req.param()
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+    const reservation = await db.reservation.findFirst({ where: { id, agencyId, status: 'CALLED' } })
+    if (!reservation) return c.json({ success: false, error: 'Reservation not found or not called' }, 404)
+
+    const updated = await db.reservation.update({
+      where: { id },
+      data: { calledAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+    })
+    logPendingMutation('update', 'Reservation', id, { action: 'recall' })
+    return c.json({ success: true, data: updated })
+  })
+
+  // POST /api/reservations/:id/postpone
+  app.post('/api/reservations/:id/postpone', authMiddleware, async (c) => {
+    try {
+      const { id } = c.req.param()
+      const user = c.get('user')
+      const agencyId = user?.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+      const reservation = await db.reservation.findFirst({ where: { id, agencyId } })
+      if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
+
+      if (!['WAITING', 'CALLED'].includes(reservation.status)) {
+        return c.json({ success: false, error: `Cannot postpone reservation with status: ${reservation.status}` }, 400)
+      }
+
+      const postponeCount = (reservation.postponeCount || 0) + 1
+      const now = new Date()
+      let updateData
+
+      if (reservation.status === 'CALLED') {
+        // If CALLED, move back to WAITING
+        updateData = { status: 'WAITING', postponeCount, updatedAt: now }
+      } else {
+        // If WAITING, move to end of queue — get the highest queueNumber and re-assign
+        const maxReservation = await db.reservation.findFirst({
+          where: { agencyId, status: { in: ['WAITING', 'CALLED'] } },
+          orderBy: { queueNumber: 'desc' },
+          select: { queueNumber: true },
+        })
+        const newQueueNumber = (maxReservation?.queueNumber || reservation.queueNumber) + 1
+        updateData = { status: 'WAITING', postponeCount, queueNumber: newQueueNumber, updatedAt: now }
+      }
+
+      const updated = await db.reservation.update({
+        where: { id },
+        data: updateData,
+      })
+      emitEvent('queue:postponed', { agencyId, reservation: updated })
+      logPendingMutation('update', 'Reservation', id, { action: 'postpone', postponeCount, ...updateData })
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] /api/reservations/:id/postpone error:', error)
+      return c.json({ success: false, error: 'Failed to postpone reservation' }, 500)
+    }
+  })
+
+  // GET /api/stats/* → alias routes for the desktop frontend stats methods
+  app.get('/api/stats/daily', authMiddleware, async (c) => {
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+    // Reuse the existing agency stats logic
+    const today = new Date(); today.setHours(0, 0, 0, 0)
+    const todayISO = today.toISOString()
+    const [totalToday, servedToday, waitingToday, noShowToday, cancelledToday, avgWait] = await Promise.all([
+      db.reservation.count({ where: { agencyId, joinedAt: { gte: todayISO } } }),
+      db.reservation.count({ where: { agencyId, status: 'COMPLETED', completedAt: { gte: todayISO } } }),
+      db.reservation.count({ where: { agencyId, status: 'WAITING' } }),
+      db.reservation.count({ where: { agencyId, status: 'NO_SHOW', updatedAt: { gte: todayISO } } }),
+      db.reservation.count({ where: { agencyId, status: 'CANCELLED', updatedAt: { gte: todayISO } } }),
+      db.reservation.aggregate({ where: { agencyId, status: 'COMPLETED', completedAt: { gte: todayISO }, waitTime: { not: null } }, _avg: { waitTime: true } }),
+    ])
+    return c.json({
+      success: true, data: {
+        totalToday, servedToday, waitingToday, noShowToday, cancelledToday,
+        avgWaitTime: Math.round(avgWait._avg.waitTime || 0),
+      }
+    })
+  })
+
+  app.get('/api/stats/service-breakdown', authMiddleware, async (c) => {
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+    const services = await db.service.findMany({ where: { agencyId, isActive: true }, select: { id: true, name: true, nameAr: true, nameFr: true } })
+    const breakdown = await Promise.all(services.map(async (s) => ({
+      ...s,
+      waiting: await db.reservation.count({ where: { agencyId, serviceId: s.id, status: 'WAITING' } }),
+      completed: await db.reservation.count({ where: { agencyId, serviceId: s.id, status: 'COMPLETED', completedAt: { gte: new Date(new Date().setHours(0,0,0,0)).toISOString() } } }),
+    })))
+    return c.json({ success: true, data: breakdown })
+  })
+
+  app.get('/api/stats/wait-times', authMiddleware, async (c) => {
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+    const today = new Date(); today.setHours(0, 0, 0, 0)
+    const result = await db.reservation.aggregate({
+      where: { agencyId, status: 'COMPLETED', completedAt: { gte: today.toISOString() }, waitTime: { not: null } },
+      _avg: { waitTime: true }, _min: { waitTime: true }, _max: { waitTime: true }, _count: true,
+    })
+    return c.json({ success: true, data: { avg: Math.round(result._avg.waitTime || 0), min: result._min.waitTime || 0, max: result._max.waitTime || 0, count: result._count } })
+  })
+
+  app.get('/api/stats/no-show', authMiddleware, async (c) => {
+    // Redirect to the existing no-show analytics
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+    const periodDays = parseInt(c.req.query('period') || '30', 10)
+    const periodAgo = new Date(Date.now() - periodDays * 86400000).toISOString()
+    const [total, noShow] = await Promise.all([
+      db.reservation.count({ where: { agencyId, joinedAt: { gte: periodAgo } } }),
+      db.reservation.count({ where: { agencyId, status: 'NO_SHOW', updatedAt: { gte: periodAgo } } }),
+    ])
+    return c.json({ success: true, data: { total, noShow, rate: total > 0 ? (noShow / total * 100).toFixed(1) : '0' } })
+  })
+
+  app.get('/api/stats/peak-hours', authMiddleware, async (c) => {
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+    // Return hourly distribution
+    const periodDays = parseInt(c.req.query('period') || '7', 10)
+    const periodAgo = new Date(Date.now() - periodDays * 86400000).toISOString()
+    const reservations = await db.reservation.findMany({
+      where: { agencyId, joinedAt: { gte: periodAgo } },
+      select: { joinedAt: true },
+    })
+    const hourly = new Array(24).fill(0)
+    for (const r of reservations) {
+      if (r.joinedAt) { const h = new Date(r.joinedAt).getHours(); hourly[h]++ }
+    }
+    const peakHour = hourly.indexOf(Math.max(...hourly))
+    return c.json({ success: true, data: { hourly, peakHour } })
+  })
+
+  // GET /api/reservations/history → alias for /api/agency/history
+  app.get('/api/reservations/history', authMiddleware, async (c) => {
+    const user = c.get('user')
+    const agencyId = user?.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+    const skip = parseInt(c.req.query('skip') || '0', 10)
+    const take = parseInt(c.req.query('take') || '50', 10)
+    const status = c.req.query('status')
+
+    const where = { agencyId }
+    if (status && status !== 'ALL') where.status = status
+
+    const [data, total] = await Promise.all([
+      db.reservation.findMany({ where, orderBy: { joinedAt: 'desc' }, skip, take }),
+      db.reservation.count({ where }),
+    ])
+    return c.json({ success: true, data, total, skip, take })
+  })
+
+  // POST /api/notifications/:id/read → alias for PATCH/PUT notifications
+  app.post('/api/notifications/:id/read', authMiddleware, async (c) => {
+    const { id } = c.req.param()
+    const user = c.get('user')
+    try {
+      const existing = await db.notification.findUnique({ where: { id } })
+      if (!existing || existing.userId !== user.id) {
+        return c.json({ success: false, error: 'Notification not found' }, 404)
+      }
+      const updated = await db.notification.update({
+        where: { id },
+        data: { isRead: true, readAt: new Date().toISOString() },
+      })
+      return c.json({ success: true, data: updated })
+    } catch (e) {
+      return c.json({ success: false, error: e.message }, 500)
+    }
+  })
+
+  // DELETE /api/agency/announcements/:id → path-param variant (frontend uses this)
+  app.delete('/api/agency/announcements/:id', authMiddleware, async (c) => {
+    const { id } = c.req.param()
+    const agencyId = sessionUser.agencyId
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+    try {
+      const existing = await db.announcement.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Announcement not found' }, 404)
+      }
+      await db.announcement.delete({ where: { id } })
+      logPendingMutation('delete', 'Announcement', id, {})
+      return c.json({ success: true })
+    } catch (e) {
+      return c.json({ success: false, error: e.message }, 500)
+    }
+  })
 
   // 404 handler
   app.notFound((c) => {
@@ -3750,6 +5631,22 @@ async function startLocalApi(dbPath, port, options) {
   // Initialize Prisma database
   db = localDb
   await setupPragmas()
+
+  // Runtime safety: verify local DB is SQLite
+  if (db) {
+    try {
+      const result = await db.$queryRaw`SELECT 1 FROM sqlite_master LIMIT 1`
+      // If we get here, it's SQLite — OK
+      console.log('[LocalAPI] SQLite database verified')
+    } catch (e) {
+      console.error('[LocalAPI] FATAL: Local database is not SQLite! This configuration is unsupported.')
+    }
+  }
+
+  // Restore persisted cloud contact timestamp from previous session
+  _restoreCloudContact()
+  // Restore session from disk if available (survives Electron restart)
+  loadPersistedSession()
   // Ensure schema is pushed to the local database
   // (The Prisma schema matches @blasti/db — same models, same structure)
   console.log(`[LocalAPI] Prisma database initialized (local SQLite)`)
@@ -3783,12 +5680,16 @@ async function startLocalApi(dbPath, port, options) {
       if (!settled) {
         settled = true
         console.log(`[LocalAPI] BLASTI Embedded API running on http://${BIND_ADDRESS}:${port}`)
+        console.log('[LocalAPI] Cloud API URL:', getCloudUrl())
         resolve(serverInfo)
       }
     })
 
     // Store the server reference for stopLocalApi() and getStatus()
     httpServer = server
+
+    // Set up Socket.IO for local realtime events (no-op if socket.io not installed)
+    setupSocketIO(server)
 
     // Handle listen errors (e.g. EADDRINUSE — port already in use)
     server.on('error', (err) => {
@@ -3807,6 +5708,10 @@ async function startLocalApi(dbPath, port, options) {
  * Stop the embedded local API server.
  */
 function stopLocalApi() {
+  if (ioServer) {
+    ioServer.close()
+    ioServer = null
+  }
   if (httpServer) {
     httpServer.close()
     httpServer = null
@@ -3822,6 +5727,7 @@ function stopLocalApi() {
   sessionToken = null
   sessionUser = null
   eventListeners = []
+  deletePersistedSession()
   console.log('[LocalAPI] Stopped')
 }
 
@@ -3872,6 +5778,21 @@ function getStatus() {
   }
 }
 
+/**
+ * Mark that cloud contact was successful (called by sync-service on successful sync).
+ */
+function markCloudContact() {
+  _lastCloudContactAt = _safeTimestamp()
+  _persistCloudContact()
+}
+
+/**
+ * Get the last cloud contact timestamp.
+ */
+function getLastCloudContact() {
+  return _lastCloudContactAt
+}
+
 // ─── Module Exports ──────────────────────────────────────────────────────
 
 module.exports = {
@@ -3881,10 +5802,18 @@ module.exports = {
   setSession,
   clearSession,
   onEvent,
+  emitEvent,
+  setupSocketIO,
   getStatus,
   logPendingMutation,
   getPendingMutations,
   markMutationCompleted,
   markMutationFailed,
+  markCloudContact,
+  getLastCloudContact,
+  requireActiveSubscription,
   DEFAULT_PORT,
+  getCloudUrl,
+  atomicWrite,
+  atomicWriteWithMutation,
 }

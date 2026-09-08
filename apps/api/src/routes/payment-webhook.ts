@@ -14,7 +14,7 @@
  */
 
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { verifyWebhookSignature, type ChargilyWebhookEvent } from '../lib/chargily-service'
 
 const app = new Hono()
@@ -59,7 +59,7 @@ app.post('/', async (c) => {
     console.log(`[payment-webhook] Received event: ${type}, checkout: ${data.id}`)
 
     // Find the transaction by provider reference (Chargily checkout ID)
-    const transaction = await db.transaction.findFirst({
+    const transaction = await cloudDb.transaction.findFirst({
       where: { providerRef: data.id },
     })
 
@@ -72,7 +72,7 @@ app.post('/', async (c) => {
     // Process based on event type
     if (type === 'checkout.paid') {
       // Mark transaction as completed
-      await db.transaction.update({
+      await cloudDb.transaction.update({
         where: { id: transaction.id },
         data: {
           status: 'COMPLETED',
@@ -82,7 +82,7 @@ app.post('/', async (c) => {
       })
 
       // Activate the agency subscription
-      await db.agency.update({
+      await cloudDb.agency.update({
         where: { id: transaction.agencyId },
         data: {
           subscriptionStatus: 'ACTIVE',
@@ -91,7 +91,7 @@ app.post('/', async (c) => {
       })
 
       // Create audit log
-      await db.auditLog.create({
+      await cloudDb.auditLog.create({
         data: {
           action: 'PAYMENT_WEBHOOK_PAID',
           entityType: 'TRANSACTION',
@@ -131,7 +131,7 @@ app.post('/', async (c) => {
 
     } else if (type === 'checkout.failed') {
       // Mark transaction as failed
-      await db.transaction.update({
+      await cloudDb.transaction.update({
         where: { id: transaction.id },
         data: {
           status: 'FAILED',
@@ -141,13 +141,13 @@ app.post('/', async (c) => {
       })
 
       // Update agency subscription status
-      await db.agency.update({
+      await cloudDb.agency.update({
         where: { id: transaction.agencyId },
         data: { subscriptionStatus: 'INACTIVE' },
       })
 
       // Create audit log
-      await db.auditLog.create({
+      await cloudDb.auditLog.create({
         data: {
           action: 'PAYMENT_WEBHOOK_FAILED',
           entityType: 'TRANSACTION',

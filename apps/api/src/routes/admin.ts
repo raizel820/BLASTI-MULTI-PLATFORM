@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { db, dbRaw } from '@blasti/db'
+import { cloudDb, cloudDbRaw } from '@blasti/cloud-db'
 import { requireAuth, requireAdmin, authErrorResponse } from '../lib/auth'
 import { validateBody, adminCreateAgencySchema, adminUserActionSchema, faqSchema, paymentSettingsSchema, smsSettingsSchema, createSubscriptionPlanSchema, updateSubscriptionPlanSchema, createHardwareProductSchema, updateHardwareProductSchema, updateHardwareSettingsSchema, updateHardwareCommitmentTierSchema, updateEnterpriseRequestStatusSchema, createEnterprisePlanFromRequestSchema } from '../lib/validations'
 import { getTodayStart, getTodayEnd } from '../lib/date-utils'
@@ -39,7 +39,7 @@ app.post('/agencies', async (c) => {
     // SECURITY: ownerId must always be provided — derive from admin session if missing
     const resolvedOwnerId = ownerId || admin.id
 
-    const agency = await db.agency.create({
+    const agency = await cloudDb.agency.create({
       data: {
         name,
         nameAr: nameAr || name,
@@ -53,7 +53,7 @@ app.post('/agencies', async (c) => {
       },
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'AGENCY_CREATE',
@@ -85,7 +85,7 @@ app.get('/agencies', async (c) => {
     }
 
     const [agencies, total] = await Promise.all([
-      db.agency.findMany({
+      cloudDb.agency.findMany({
         where,
         include: {
           owner: {
@@ -114,7 +114,7 @@ app.get('/agencies', async (c) => {
         take: limit,
         skip: offset,
       }),
-      db.agency.count({ where }),
+      cloudDb.agency.count({ where }),
     ])
 
     const formattedAgencies = agencies.map((agency) => ({
@@ -175,20 +175,20 @@ app.patch('/agencies/:id', async (c) => {
 
     const { action } = validation.data
 
-    const agency = await db.agency.findUnique({ where: { id } })
+    const agency = await cloudDb.agency.findUnique({ where: { id } })
     if (!agency) return c.json({ error: 'Agency not found' }, 404)
 
     if (action === 'suspend') {
-      await db.agency.update({ where: { id }, data: { isActive: false } })
+      await cloudDb.agency.update({ where: { id }, data: { isActive: false } })
     } else if (action === 'activate') {
-      await db.agency.update({ where: { id }, data: { isActive: true } })
+      await cloudDb.agency.update({ where: { id }, data: { isActive: true } })
     } else if (action === 'delete') {
       // Cascade delete all related records (complete cascade — includes
       // reviews, favorites, hardware orders, enterprise requests, devices,
       // branches which have required FKs with Restrict/default onDelete).
-      // Uses dbRaw (base Prisma client) to bypass the ghost-delete extension
+      // Uses cloudDbRaw (base Prisma client) to bypass the ghost-delete extension
       // whose deleteMany hook crashes inside $transaction in Prisma 6.x.
-      await dbRaw.$transaction(async (tx) => {
+      await cloudDbRaw.$transaction(async (tx) => {
         await tx.review.deleteMany({ where: { agencyId: id } })
         await tx.favorite.deleteMany({ where: { agencyId: id } })
         await tx.hardwareOrderItem.deleteMany({ where: { order: { agencyId: id } } })
@@ -208,7 +208,7 @@ app.patch('/agencies/:id', async (c) => {
       return c.json({ error: 'Invalid action. Use suspend, activate, or delete.' }, 400)
     }
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: `AGENCY_${action.toUpperCase()}`,
@@ -232,7 +232,7 @@ app.delete('/agencies/:id', async (c) => {
 
     const id = c.req.param('id')
     // Cascade delete all related records (complete cascade)
-    await dbRaw.$transaction(async (tx) => {
+    await cloudDbRaw.$transaction(async (tx) => {
       await tx.review.deleteMany({ where: { agencyId: id } })
       await tx.favorite.deleteMany({ where: { agencyId: id } })
       await tx.hardwareOrderItem.deleteMany({ where: { order: { agencyId: id } } })
@@ -249,7 +249,7 @@ app.delete('/agencies/:id', async (c) => {
       await tx.agency.delete({ where: { id } })
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'AGENCY_DELETE',
@@ -280,7 +280,7 @@ app.post('/agencies/:id/extend-subscription', async (c) => {
       return c.json({ error: 'days must be a positive number' }, 400)
     }
 
-    const agency = await db.agency.findUnique({ where: { id: agencyId } })
+    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ error: 'Agency not found' }, 404)
 
     const now = new Date()
@@ -293,7 +293,7 @@ app.post('/agencies/:id/extend-subscription', async (c) => {
     const newExpiry = new Date(baseDate)
     newExpiry.setDate(newExpiry.getDate() + days)
 
-    await db.agency.update({
+    await cloudDb.agency.update({
       where: { id: agencyId },
       data: {
         subscriptionStatus: 'ACTIVE',
@@ -304,7 +304,7 @@ app.post('/agencies/:id/extend-subscription', async (c) => {
       },
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'SUBSCRIPTION_EXTEND',
@@ -346,10 +346,10 @@ app.get('/analytics', async (c) => {
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000)
 
     // Total reservations (all-time)
-    const totalReservations = await db.reservation.count()
+    const totalReservations = await cloudDb.reservation.count()
 
     // Registrations trend: daily count for last 30 days
-    const registrations = await db.user.findMany({
+    const registrations = await cloudDb.user.findMany({
       where: { createdAt: { gte: thirtyDaysAgo } },
       select: { createdAt: true },
       orderBy: { createdAt: 'asc' },
@@ -369,7 +369,7 @@ app.get('/analytics', async (c) => {
     }
 
     // Top performing agencies: most reservations in last 30 days
-    const topAgencies = await db.reservation.groupBy({
+    const topAgencies = await cloudDb.reservation.groupBy({
       by: ['agencyId'],
       where: { joinedAt: { gte: thirtyDaysAgo } },
       _count: { id: true },
@@ -379,7 +379,7 @@ app.get('/analytics', async (c) => {
 
     const agencyDetails = await Promise.all(
       topAgencies.map(async (a) => {
-        const agency = await db.agency.findUnique({
+        const agency = await cloudDb.agency.findUnique({
           where: { id: a.agencyId },
           select: { id: true, name: true, nameAr: true, nameFr: true, category: true },
         })
@@ -395,7 +395,7 @@ app.get('/analytics', async (c) => {
     )
 
     // Average wait times per agency
-    const completedReservations = await db.reservation.findMany({
+    const completedReservations = await cloudDb.reservation.findMany({
       where: {
         joinedAt: { gte: thirtyDaysAgo },
         calledAt: { not: null },
@@ -418,7 +418,7 @@ app.get('/analytics', async (c) => {
 
     const avgWaitPerAgency = await Promise.all(
       Object.entries(agencyWaitTimes).map(async ([agencyId, times]) => {
-        const agency = await db.agency.findUnique({
+        const agency = await cloudDb.agency.findUnique({
           where: { id: agencyId },
           select: { name: true },
         })
@@ -431,7 +431,7 @@ app.get('/analytics', async (c) => {
     )
 
     // Busiest time slots (hour of day distribution)
-    const reservationsWithHour = await db.reservation.findMany({
+    const reservationsWithHour = await cloudDb.reservation.findMany({
       where: { joinedAt: { gte: thirtyDaysAgo } },
       select: { joinedAt: true },
     })
@@ -443,7 +443,7 @@ app.get('/analytics', async (c) => {
     }
 
     // Customer growth trend
-    const customerGrowth = await db.user.findMany({
+    const customerGrowth = await cloudDb.user.findMany({
       where: {
         role: 'CUSTOMER',
         createdAt: { gte: thirtyDaysAgo },
@@ -455,7 +455,7 @@ app.get('/analytics', async (c) => {
     const dailyCustomerGrowth: Record<string, number> = {}
     let cumulative = 0
     // Get total customers before 30 days ago for cumulative count
-    const customersBefore = await db.user.count({
+    const customersBefore = await cloudDb.user.count({
       where: {
         role: 'CUSTOMER',
         createdAt: { lt: thirtyDaysAgo },
@@ -521,7 +521,7 @@ app.get('/announcements', async (c) => {
   try {
     await requireAuth(c)
 
-    const announcements = await db.globalAnnouncement.findMany({
+    const announcements = await cloudDb.globalAnnouncement.findMany({
       orderBy: { createdAt: 'desc' },
       take: 20,
     })
@@ -546,7 +546,7 @@ app.post('/announcements', async (c) => {
 
     const { message, type } = validation.data
 
-    const announcement = await db.globalAnnouncement.create({
+    const announcement = await cloudDb.globalAnnouncement.create({
       data: {
         message: message.trim(),
         type,
@@ -571,7 +571,7 @@ app.delete('/announcements', async (c) => {
       return c.json({ error: 'id required' }, 400)
     }
 
-    await db.globalAnnouncement.delete({
+    await cloudDb.globalAnnouncement.delete({
       where: { id },
     })
 
@@ -638,7 +638,7 @@ app.get('/audit-logs', async (c) => {
     }
 
     const [auditLogs, total] = await Promise.all([
-      db.auditLog.findMany({
+      cloudDb.auditLog.findMany({
         where,
         include: {
           user: {
@@ -655,22 +655,22 @@ app.get('/audit-logs', async (c) => {
         take: limit,
         skip: offset,
       }),
-      db.auditLog.count({ where }),
+      cloudDb.auditLog.count({ where }),
     ])
 
     // Get unique actions and entity types for filter dropdowns
     const [uniqueActions, uniqueEntityTypes, uniqueUsers] = await Promise.all([
-      db.auditLog.findMany({
+      cloudDb.auditLog.findMany({
         select: { action: true },
         distinct: ['action'],
         orderBy: { action: 'asc' },
       }),
-      db.auditLog.findMany({
+      cloudDb.auditLog.findMany({
         select: { entityType: true },
         distinct: ['entityType'],
         orderBy: { entityType: 'asc' },
       }),
-      db.auditLog.findMany({
+      cloudDb.auditLog.findMany({
         where: { userId: { not: null } },
         select: { userId: true, user: { select: { id: true, username: true, fullName: true } } },
         distinct: ['userId'],
@@ -715,25 +715,25 @@ app.get('/dashboard', async (c) => {
       expiredSubscriptions,
       expiringSoonSubscriptions,
     ] = await Promise.all([
-      db.agency.count({ where: { isActive: true } }),
-      db.agency.count({ where: { isActive: true, isQueueOpen: true } }),
-      db.reservation.count({
+      cloudDb.agency.count({ where: { isActive: true } }),
+      cloudDb.agency.count({ where: { isActive: true, isQueueOpen: true } }),
+      cloudDb.reservation.count({
         where: { joinedAt: { gte: todayStart, lte: todayEnd } },
       }),
-      db.transaction.count({ where: { status: 'PENDING' } }),
-      db.transaction.aggregate({
+      cloudDb.transaction.count({ where: { status: 'PENDING' } }),
+      cloudDb.transaction.aggregate({
         where: { status: 'APPROVED' },
         _sum: { amount: true },
       }),
-      db.user.count({ where: { isActive: true } }),
+      cloudDb.user.count({ where: { isActive: true } }),
       // Agencies whose subscription has already expired (expiry date in the past)
-      db.agency.count({
+      cloudDb.agency.count({
         where: {
           subscriptionExpiresAt: { lt: new Date(), not: null },
         },
       }),
       // Agencies whose subscription will expire within the next 7 days
-      db.agency.count({
+      cloudDb.agency.count({
         where: {
           subscriptionExpiresAt: {
             gte: new Date(),
@@ -744,7 +744,7 @@ app.get('/dashboard', async (c) => {
     ])
 
     // Get recent activity
-    const recentActivity = await db.auditLog.findMany({
+    const recentActivity = await cloudDb.auditLog.findMany({
       take: 10,
       orderBy: { createdAt: 'desc' },
       include: {
@@ -786,7 +786,7 @@ app.get('/export/agencies', async (c) => {
   try {
     await requireAdmin(c)
 
-    const agencies = await db.agency.findMany({
+    const agencies = await cloudDb.agency.findMany({
       include: {
         owner: { select: { fullName: true, username: true, email: true, phoneNumber: true } },
         services: { select: { name: true, isActive: true } },
@@ -857,7 +857,7 @@ app.get('/export/users', async (c) => {
   try {
     await requireAdmin(c)
 
-    const users = await db.user.findMany({
+    const users = await cloudDb.user.findMany({
       include: {
         _count: {
           select: { reservations: true, favorites: true, auditLogs: true, notifications: true },
@@ -917,7 +917,7 @@ app.get('/faq', async (c) => {
   try {
     await requireAdmin(c)
 
-    const faqs = await db.fAQ.findMany({
+    const faqs = await cloudDb.fAQ.findMany({
       orderBy: [{ order: 'asc' }, { createdAt: 'desc' }],
     })
     return c.json({ faqs })
@@ -940,7 +940,7 @@ app.post('/faq', async (c) => {
 
     const { question, answer, questionAr, answerAr, questionFr, answerFr, category, order, isActive } = validation.data
 
-    const faq = await db.fAQ.create({
+    const faq = await cloudDb.fAQ.create({
       data: {
         question,
         answer,
@@ -974,7 +974,7 @@ app.put('/faq', async (c) => {
 
     const { id, question, answer, questionAr, answerAr, questionFr, answerFr, category, order, isActive } = validation.data
 
-    const faq = await db.fAQ.update({
+    const faq = await cloudDb.fAQ.update({
       where: { id },
       data: {
         ...(question !== undefined && { question }),
@@ -1007,7 +1007,7 @@ app.delete('/faq', async (c) => {
       return c.json({ error: 'FAQ ID is required' }, 400)
     }
 
-    await db.fAQ.delete({ where: { id } })
+    await cloudDb.fAQ.delete({ where: { id } })
     return c.json({ success: true })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -1026,7 +1026,7 @@ app.get('/faqs', async (c) => {
   try {
     await requireAdmin(c)
 
-    const faqs = await db.fAQ.findMany({
+    const faqs = await cloudDb.fAQ.findMany({
       orderBy: { order: 'asc' },
     })
     return c.json({ faqs })
@@ -1049,7 +1049,7 @@ app.post('/faqs', async (c) => {
 
     const { question, questionFr, questionAr, answer, answerFr, answerAr, category, order, isActive } = validation.data
 
-    const faq = await db.fAQ.create({
+    const faq = await cloudDb.fAQ.create({
       data: {
         question,
         questionFr: questionFr || null,
@@ -1083,12 +1083,12 @@ app.put('/faqs', async (c) => {
 
     const { id, question, questionFr, questionAr, answer, answerFr, answerAr, category, order, isActive } = validation.data
 
-    const existing = await db.fAQ.findUnique({ where: { id } })
+    const existing = await cloudDb.fAQ.findUnique({ where: { id } })
     if (!existing) {
       return c.json({ error: 'FAQ not found' }, 404)
     }
 
-    const faq = await db.fAQ.update({
+    const faq = await cloudDb.fAQ.update({
       where: { id },
       data: {
         ...(question !== undefined && { question }),
@@ -1122,12 +1122,12 @@ app.delete('/faqs', async (c) => {
       return c.json({ error: 'FAQ ID is required' }, 400)
     }
 
-    const existing = await db.fAQ.findUnique({ where: { id } })
+    const existing = await cloudDb.fAQ.findUnique({ where: { id } })
     if (!existing) {
       return c.json({ error: 'FAQ not found' }, 404)
     }
 
-    await db.fAQ.delete({ where: { id } })
+    await cloudDb.fAQ.delete({ where: { id } })
     return c.json({ success: true })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -1196,13 +1196,13 @@ app.post('/faqs/seed', async (c) => {
     await requireAdmin(c)
 
     // Check if FAQs already exist
-    const existingCount = await db.fAQ.count()
+    const existingCount = await cloudDb.fAQ.count()
     if (existingCount > 0) {
       return c.json({ message: 'FAQs already seeded', count: existingCount })
     }
 
-    const created = await db.$transaction(
-      SEED_FAQS.map((faq) => db.fAQ.create({ data: faq }))
+    const created = await cloudDb.$transaction(
+      SEED_FAQS.map((faq) => cloudDb.fAQ.create({ data: faq }))
     )
 
     return c.json({ message: 'FAQs seeded successfully', count: created.length })
@@ -1278,10 +1278,10 @@ app.get('/payment-settings', async (c) => {
   try {
     await requireAdmin(c)
 
-    let settings = await db.paymentSettings.findFirst()
+    let settings = await cloudDb.paymentSettings.findFirst()
     if (!settings) {
       // Create default settings if none exist
-      settings = await db.paymentSettings.create({ data: {} })
+      settings = await cloudDb.paymentSettings.create({ data: {} })
     }
     return c.json({ settings })
   } catch (error) {
@@ -1295,9 +1295,9 @@ app.put('/payment-settings', async (c) => {
   try {
     await requireAdmin(c)
 
-    let settings = await db.paymentSettings.findFirst()
+    let settings = await cloudDb.paymentSettings.findFirst()
     if (!settings) {
-      settings = await db.paymentSettings.create({ data: {} })
+      settings = await cloudDb.paymentSettings.create({ data: {} })
     }
 
     const body = await c.req.json()
@@ -1308,7 +1308,7 @@ app.put('/payment-settings', async (c) => {
 
     const validatedData = validation.data
 
-    const updated = await db.paymentSettings.update({
+    const updated = await cloudDb.paymentSettings.update({
       where: { id: settings.id },
       data: {
         ...(validatedData.ccpEnabled !== undefined && { ccpEnabled: validatedData.ccpEnabled }),
@@ -1349,23 +1349,23 @@ app.get('/performance', async (c) => {
       totalNotifications,
       totalAuditLogs,
     ] = await Promise.all([
-      db.user.count(),
-      db.agency.count(),
-      db.reservation.count(),
-      db.reservation.count({ where: { status: { in: ['WAITING', 'CALLED'] } } }),
-      db.notification.count(),
-      db.auditLog.count(),
+      cloudDb.user.count(),
+      cloudDb.agency.count(),
+      cloudDb.reservation.count(),
+      cloudDb.reservation.count({ where: { status: { in: ['WAITING', 'CALLED'] } } }),
+      cloudDb.notification.count(),
+      cloudDb.auditLog.count(),
     ])
 
     // ── Queue stats ──
     const [totalOpenQueues, totalWaitingCustomers, totalCalledCustomers] = await Promise.all([
-      db.agency.count({ where: { isQueueOpen: true, isActive: true } }),
-      db.reservation.count({ where: { status: 'WAITING' } }),
-      db.reservation.count({ where: { status: 'CALLED' } }),
+      cloudDb.agency.count({ where: { isQueueOpen: true, isActive: true } }),
+      cloudDb.reservation.count({ where: { status: 'WAITING' } }),
+      cloudDb.reservation.count({ where: { status: 'CALLED' } }),
     ])
 
     // Queue sizes per open agency
-    const queueSizes = await db.reservation.groupBy({
+    const queueSizes = await cloudDb.reservation.groupBy({
       by: ['agencyId'],
       where: { status: { in: ['WAITING', 'CALLED'] } },
       _count: { id: true },
@@ -1377,7 +1377,7 @@ app.get('/performance', async (c) => {
     const maxQueueSize = queueSizeValues.length > 0 ? Math.max(...queueSizeValues) : 0
 
     // Queues by category
-    const agenciesByCategory = await db.agency.findMany({
+    const agenciesByCategory = await cloudDb.agency.findMany({
       where: { isQueueOpen: true, isActive: true },
       select: { id: true, category: true },
     })
@@ -1390,7 +1390,7 @@ app.get('/performance', async (c) => {
       categoryMap.get(cat)!.open += 1
     }
     // Count waiting per category
-    const waitingByCategory = await db.reservation.groupBy({
+    const waitingByCategory = await cloudDb.reservation.groupBy({
       by: ['agencyId'],
       where: { status: 'WAITING' },
       _count: { id: true },
@@ -1409,19 +1409,19 @@ app.get('/performance', async (c) => {
 
     // ── Today's activity ──
     const [todayJoins, todayCompletions, todayCancellations] = await Promise.all([
-      db.reservation.count({
+      cloudDb.reservation.count({
         where: { joinedAt: { gte: todayStart, lte: todayEnd } },
       }),
-      db.reservation.count({
+      cloudDb.reservation.count({
         where: { completedAt: { gte: todayStart, lte: todayEnd }, status: 'COMPLETED' },
       }),
-      db.reservation.count({
+      cloudDb.reservation.count({
         where: { cancelledAt: { gte: todayStart, lte: todayEnd }, status: 'CANCELLED' },
       }),
     ])
 
     // Estimate avg wait time from completed reservations today
-    const completedToday = await db.reservation.findMany({
+    const completedToday = await cloudDb.reservation.findMany({
       where: {
         completedAt: { gte: todayStart, lte: todayEnd },
         status: 'COMPLETED',
@@ -1624,7 +1624,7 @@ app.put('/sms-settings', async (c) => {
     if (templateNoShow !== undefined) updateData.templateNoShow = templateNoShow
     if (templateCustom !== undefined) updateData.templateCustom = templateCustom
 
-    const updated = await db.smsSettings.update({
+    const updated = await cloudDb.smsSettings.update({
       where: { id: settings.id },
       data: updateData,
     })
@@ -1633,7 +1633,7 @@ app.put('/sms-settings', async (c) => {
     if (provider && !apiUrl && ALGERIAN_PROVIDERS[provider as keyof typeof ALGERIAN_PROVIDERS]) {
       const defaultUrl = ALGERIAN_PROVIDERS[provider as keyof typeof ALGERIAN_PROVIDERS].defaultApiUrl
       if (defaultUrl && updated.apiUrl !== defaultUrl) {
-        await db.smsSettings.update({
+        await cloudDb.smsSettings.update({
           where: { id: settings.id },
           data: { apiUrl: defaultUrl },
         })
@@ -1715,42 +1715,42 @@ app.get('/stats', async (c) => {
       totalReservations,
     ] = await Promise.all([
       // Total agencies
-      db.agency.count({
+      cloudDb.agency.count({
         where: { isActive: true },
       }),
 
       // Active queues (agencies with isQueueOpen and not paused)
-      db.queueSettings.count({
+      cloudDb.queueSettings.count({
         where: { isPaused: false },
       }),
 
       // Today's reservations
-      db.reservation.count({
+      cloudDb.reservation.count({
         where: {
           joinedAt: { gte: today },
         },
       }),
 
       // Total revenue (approved transactions)
-      db.transaction.aggregate({
+      cloudDb.transaction.aggregate({
         where: { status: 'APPROVED' },
         _sum: { amount: true },
       }),
 
       // Pending transactions count
-      db.transaction.count({
+      cloudDb.transaction.count({
         where: { status: 'PENDING' },
       }),
 
       // Total users
-      db.user.count(),
+      cloudDb.user.count(),
 
       // Total reservations
-      db.reservation.count(),
+      cloudDb.reservation.count(),
     ])
 
     // Get recent reservations for today
-    const recentReservations = await db.reservation.findMany({
+    const recentReservations = await cloudDb.reservation.findMany({
       where: {
         joinedAt: { gte: today },
       },
@@ -1806,7 +1806,7 @@ app.post('/transactions/:id', async (c) => {
 
     const { action, reason } = validation.data
 
-    const transaction = await db.transaction.findUnique({ where: { id } })
+    const transaction = await cloudDb.transaction.findUnique({ where: { id } })
     if (!transaction) return c.json({ error: 'Transaction not found' }, 404)
 
     if (transaction.status !== 'PENDING') {
@@ -1818,7 +1818,7 @@ app.post('/transactions/:id', async (c) => {
 
     const newStatus = action === 'approve' ? 'APPROVED' : 'REJECTED'
 
-    const updated = await db.transaction.update({
+    const updated = await cloudDb.transaction.update({
       where: { id },
       data: {
         status: newStatus,
@@ -1850,7 +1850,7 @@ app.post('/transactions/:id', async (c) => {
       // is encoded in transaction.planName as a `(${period}m)` suffix.
       // We recover it here and use it to compute the exact expiry
       // (now + period months) — overriding the plan's default billingCycle.
-      const planRecord = await db.subscriptionPlan.findFirst({
+      const planRecord = await cloudDb.subscriptionPlan.findFirst({
         where: { name: transaction.plan, isActive: true },
       })
 
@@ -1886,7 +1886,7 @@ app.post('/transactions/:id', async (c) => {
         }
       }
 
-      await db.agency.update({
+      await cloudDb.agency.update({
         where: { id: transaction.agencyId },
         data: {
           subscriptionStatus: 'ACTIVE',
@@ -1898,7 +1898,7 @@ app.post('/transactions/:id', async (c) => {
       })
     } else {
       // Rejected - reset agency subscription status
-      await db.agency.update({
+      await cloudDb.agency.update({
         where: { id: transaction.agencyId },
         data: {
           subscriptionStatus: 'INACTIVE',
@@ -1906,7 +1906,7 @@ app.post('/transactions/:id', async (c) => {
       })
     }
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: action === 'approve' ? 'PAYMENT_APPROVE' : 'PAYMENT_REJECT',
@@ -1958,7 +1958,7 @@ app.get('/users', async (c) => {
     }
 
     const [users, total] = await Promise.all([
-      db.user.findMany({
+      cloudDb.user.findMany({
         where,
         select: {
           id: true,
@@ -1976,12 +1976,12 @@ app.get('/users', async (c) => {
         skip: (page - 1) * limit,
         take: limit,
       }),
-      db.user.count({ where }),
+      cloudDb.user.count({ where }),
     ])
 
     // Fetch agency names for agency owners
     const userIds = users.map((u) => u.id)
-    const agencies = await db.agency.findMany({
+    const agencies = await cloudDb.agency.findMany({
       where: { ownerId: { in: userIds } },
       select: { ownerId: true, name: true, nameAr: true, nameFr: true },
     })
@@ -2018,7 +2018,7 @@ app.patch('/users', async (c) => {
 
     const { userId, action } = validation.data
 
-    const targetUser = await db.user.findUnique({ where: { id: userId } })
+    const targetUser = await cloudDb.user.findUnique({ where: { id: userId } })
     if (!targetUser) {
       return c.json(
         { success: false, error: 'User not found' },
@@ -2035,7 +2035,7 @@ app.patch('/users', async (c) => {
     }
 
     if (action === 'suspend') {
-      const user = await db.user.update({
+      const user = await cloudDb.user.update({
         where: { id: userId },
         data: { isActive: false },
         select: { id: true, fullName: true, isActive: true },
@@ -2043,13 +2043,13 @@ app.patch('/users', async (c) => {
 
       // Also deactivate associated agency if user is an agency owner
       if (targetUser.role === 'AGENCY_OWNER') {
-        await db.agency.updateMany({
+        await cloudDb.agency.updateMany({
           where: { ownerId: userId },
           data: { isActive: false },
         })
       }
 
-      await db.auditLog.create({
+      await cloudDb.auditLog.create({
         data: {
           userId: admin.id,
           action: 'USER_SUSPEND',
@@ -2063,7 +2063,7 @@ app.patch('/users', async (c) => {
     }
 
     if (action === 'activate') {
-      const user = await db.user.update({
+      const user = await cloudDb.user.update({
         where: { id: userId },
         data: { isActive: true },
         select: { id: true, fullName: true, isActive: true },
@@ -2071,13 +2071,13 @@ app.patch('/users', async (c) => {
 
       // Also reactivate associated agency if user is an agency owner
       if (targetUser.role === 'AGENCY_OWNER') {
-        await db.agency.updateMany({
+        await cloudDb.agency.updateMany({
           where: { ownerId: userId },
           data: { isActive: true },
         })
       }
 
-      await db.auditLog.create({
+      await cloudDb.auditLog.create({
         data: {
           userId: admin.id,
           action: 'USER_ACTIVATE',
@@ -2115,7 +2115,7 @@ app.delete('/users', async (c) => {
     const { userId } = validation.data
 
     // Prevent deleting super admin accounts
-    const targetUser = await db.user.findUnique({ where: { id: userId } })
+    const targetUser = await cloudDb.user.findUnique({ where: { id: userId } })
     if (!targetUser) {
       return c.json(
         { success: false, error: 'User not found' },
@@ -2131,12 +2131,12 @@ app.delete('/users', async (c) => {
     }
 
     // Get agencyId before deleting (for agency cleanup)
-    const agency = await db.agency.findFirst({ where: { ownerId: userId } })
+    const agency = await cloudDb.agency.findFirst({ where: { ownerId: userId } })
 
     // Use transaction for atomic deletion.
-    // Uses dbRaw to bypass the ghost-delete extension (deleteMany crashes
+    // Uses cloudDbRaw to bypass the ghost-delete extension (deleteMany crashes
     // inside $transaction in Prisma 6.x).
-    await dbRaw.$transaction(async (tx) => {
+    await cloudDbRaw.$transaction(async (tx) => {
       // Delete agency-related records first (complete cascade)
       if (agency) {
         await tx.review.deleteMany({ where: { agencyId: agency.id } })
@@ -2183,7 +2183,7 @@ app.delete('/users', async (c) => {
       await tx.user.delete({ where: { id: userId } })
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'USER_DELETE',
@@ -2233,7 +2233,7 @@ app.patch('/users/:id', async (c) => {
       )
     }
 
-    const user = await db.user.update({
+    const user = await cloudDb.user.update({
       where: { id },
       data: updateData,
       select: { id: true, fullName: true, isActive: true },
@@ -2257,7 +2257,7 @@ app.post('/users/:id/reset-password', async (c) => {
     const newPassword = 'password123'
 
     // Verify user exists
-    const user = await db.user.findUnique({
+    const user = await cloudDb.user.findUnique({
       where: { id },
     })
 
@@ -2270,13 +2270,13 @@ app.post('/users/:id/reset-password', async (c) => {
     const passwordHash = scryptSync(newPassword, salt, 64).toString('hex')
 
     // Update password
-    await db.user.update({
+    await cloudDb.user.update({
       where: { id },
       data: { passwordHash },
     })
 
     // Create audit log
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'SETTINGS_UPDATE',
@@ -2304,7 +2304,7 @@ app.get('/subscription-plans', async (c) => {
   try {
     await requireAdmin(c)
 
-    const plans = await db.subscriptionPlan.findMany({
+    const plans = await cloudDb.subscriptionPlan.findMany({
       include: {
         features: true,
         _count: {
@@ -2335,14 +2335,14 @@ app.post('/subscription-plans', async (c) => {
     const data = validation.data
 
     // Check for duplicate name
-    const existing = await db.subscriptionPlan.findUnique({ where: { name: data.name } })
+    const existing = await cloudDb.subscriptionPlan.findUnique({ where: { name: data.name } })
     if (existing) {
       return c.json({ success: false, error: 'A plan with this name already exists' }, 409)
     }
 
-    const plan = await db.subscriptionPlan.create({ data })
+    const plan = await cloudDb.subscriptionPlan.create({ data })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'SUBSCRIPTION_PLAN_CREATE',
@@ -2374,25 +2374,25 @@ app.patch('/subscription-plans/:id', async (c) => {
     const data = validation.data
 
     // Check plan exists
-    const existing = await db.subscriptionPlan.findUnique({ where: { id } })
+    const existing = await cloudDb.subscriptionPlan.findUnique({ where: { id } })
     if (!existing) {
       return c.json({ success: false, error: 'Plan not found' }, 404)
     }
 
     // Check for duplicate name if name is being changed
     if (data.name && data.name !== existing.name) {
-      const nameConflict = await db.subscriptionPlan.findUnique({ where: { name: data.name } })
+      const nameConflict = await cloudDb.subscriptionPlan.findUnique({ where: { name: data.name } })
       if (nameConflict) {
         return c.json({ success: false, error: 'A plan with this name already exists' }, 409)
       }
     }
 
-    const plan = await db.subscriptionPlan.update({
+    const plan = await cloudDb.subscriptionPlan.update({
       where: { id },
       data,
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'SUBSCRIPTION_PLAN_UPDATE',
@@ -2417,7 +2417,7 @@ app.delete('/subscription-plans/:id', async (c) => {
     const id = c.req.param('id')
 
     // Check plan exists
-    const existing = await db.subscriptionPlan.findUnique({
+    const existing = await cloudDb.subscriptionPlan.findUnique({
       where: { id },
       include: { _count: { select: { agencies: true } } },
     })
@@ -2433,9 +2433,9 @@ app.delete('/subscription-plans/:id', async (c) => {
       }, 409)
     }
 
-    await db.subscriptionPlan.delete({ where: { id } })
+    await cloudDb.subscriptionPlan.delete({ where: { id } })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'SUBSCRIPTION_PLAN_DELETE',
@@ -2459,7 +2459,7 @@ app.get('/hardware', async (c) => {
   try {
     await requireAdmin(c)
 
-    const products = await db.hardwareProduct.findMany({
+    const products = await cloudDb.hardwareProduct.findMany({
       orderBy: { sortOrder: 'asc' },
     })
 
@@ -2484,14 +2484,14 @@ app.post('/hardware', async (c) => {
     const data = validation.data
 
     // Check for duplicate name
-    const existing = await db.hardwareProduct.findUnique({ where: { name: data.name } })
+    const existing = await cloudDb.hardwareProduct.findUnique({ where: { name: data.name } })
     if (existing) {
       return c.json({ success: false, error: 'A hardware product with this name already exists' }, 409)
     }
 
-    const product = await db.hardwareProduct.create({ data })
+    const product = await cloudDb.hardwareProduct.create({ data })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'HARDWARE_PRODUCT_CREATE',
@@ -2521,12 +2521,12 @@ app.get('/hardware/settings', async (c) => {
 
     // Ensure the singleton settings row exists (defensive — the seed script
     // creates it, but if the DB was reset we want to lazily create it here).
-    let settings = await db.hardwareSettings.findUnique({ where: { id: 'singleton' } })
+    let settings = await cloudDb.hardwareSettings.findUnique({ where: { id: 'singleton' } })
     if (!settings) {
-      settings = await db.hardwareSettings.create({ data: { id: 'singleton' } })
+      settings = await cloudDb.hardwareSettings.create({ data: { id: 'singleton' } })
     }
 
-    const commitmentTiers = await db.hardwareCommitmentTier.findMany({
+    const commitmentTiers = await cloudDb.hardwareCommitmentTier.findMany({
       orderBy: { sortOrder: 'asc' },
     })
 
@@ -2554,13 +2554,13 @@ app.patch('/hardware/settings', async (c) => {
     }
 
     // Upsert so admins can update settings even before the seed row exists
-    const settings = await db.hardwareSettings.upsert({
+    const settings = await cloudDb.hardwareSettings.upsert({
       where: { id: 'singleton' },
       create: { id: 'singleton', ...data },
       update: data,
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'HARDWARE_SETTINGS_UPDATE',
@@ -2594,17 +2594,17 @@ app.patch('/hardware/commitment-tiers/:id', async (c) => {
       return c.json({ success: false, error: 'No fields provided to update' }, 400)
     }
 
-    const existing = await db.hardwareCommitmentTier.findUnique({ where: { id } })
+    const existing = await cloudDb.hardwareCommitmentTier.findUnique({ where: { id } })
     if (!existing) {
       return c.json({ success: false, error: 'Commitment tier not found' }, 404)
     }
 
-    const tier = await db.hardwareCommitmentTier.update({
+    const tier = await cloudDb.hardwareCommitmentTier.update({
       where: { id },
       data,
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'HARDWARE_TIER_UPDATE',
@@ -2635,24 +2635,24 @@ app.patch('/hardware/:id', async (c) => {
 
     const data = validation.data
 
-    const existing = await db.hardwareProduct.findUnique({ where: { id } })
+    const existing = await cloudDb.hardwareProduct.findUnique({ where: { id } })
     if (!existing) {
       return c.json({ success: false, error: 'Hardware product not found' }, 404)
     }
 
     if (data.name && data.name !== existing.name) {
-      const nameConflict = await db.hardwareProduct.findUnique({ where: { name: data.name } })
+      const nameConflict = await cloudDb.hardwareProduct.findUnique({ where: { name: data.name } })
       if (nameConflict) {
         return c.json({ success: false, error: 'A hardware product with this name already exists' }, 409)
       }
     }
 
-    const product = await db.hardwareProduct.update({
+    const product = await cloudDb.hardwareProduct.update({
       where: { id },
       data,
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'HARDWARE_PRODUCT_UPDATE',
@@ -2676,7 +2676,7 @@ app.delete('/hardware/:id', async (c) => {
 
     const id = c.req.param('id')
 
-    const existing = await db.hardwareProduct.findUnique({ where: { id } })
+    const existing = await cloudDb.hardwareProduct.findUnique({ where: { id } })
     if (!existing) {
       return c.json({ success: false, error: 'Hardware product not found' }, 404)
     }
@@ -2684,7 +2684,7 @@ app.delete('/hardware/:id', async (c) => {
     // Block deletion if any order items reference this product — preserving
     // historical order integrity. Admins should set `isActive: false` instead
     // to remove it from the catalog without breaking old orders.
-    const referencedBy = await db.hardwareOrderItem.count({ where: { productId: id } })
+    const referencedBy = await cloudDb.hardwareOrderItem.count({ where: { productId: id } })
     if (referencedBy > 0) {
       return c.json({
         success: false,
@@ -2694,14 +2694,14 @@ app.delete('/hardware/:id', async (c) => {
 
     // Delete inside a transaction — the Prisma Client extension's `delete`
     // hook (ghost-delete trap) is invoked correctly when called via the
-    // transaction client `tx`, but `db.hardwareProduct.delete()` directly
+    // transaction client `tx`, but `cloudDb.hardwareProduct.delete()` directly
     // triggers a known issue where the `query` callback isn't passed to the
     // extension. This matches the pattern used by `DELETE /admin/agencies/:id`.
-    await db.$transaction(async (tx) => {
+    await cloudDb.$transaction(async (tx) => {
       await tx.hardwareProduct.delete({ where: { id } })
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: 'HARDWARE_PRODUCT_DELETE',
@@ -2728,7 +2728,7 @@ app.get('/enterprise-requests', async (c) => {
     const statusFilter = c.req.query('status')
     const where = statusFilter ? { status: statusFilter } : {}
 
-    const requests = await db.enterpriseContractRequest.findMany({
+    const requests = await cloudDb.enterpriseContractRequest.findMany({
       where,
       include: {
         agency: {
@@ -2778,12 +2778,12 @@ app.post('/enterprise-requests/:id', async (c) => {
 
     const { status, adminNotes } = validation.data
 
-    const existing = await db.enterpriseContractRequest.findUnique({ where: { id } })
+    const existing = await cloudDb.enterpriseContractRequest.findUnique({ where: { id } })
     if (!existing) {
       return c.json({ success: false, error: 'Enterprise request not found' }, 404)
     }
 
-    const request = await db.enterpriseContractRequest.update({
+    const request = await cloudDb.enterpriseContractRequest.update({
       where: { id },
       data: {
         status,
@@ -2791,7 +2791,7 @@ app.post('/enterprise-requests/:id', async (c) => {
       },
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: `ENTERPRISE_REQUEST_${status}`,
@@ -2836,7 +2836,7 @@ app.post('/enterprise-requests/:id/create-plan', async (c) => {
 
     const data = validation.data
 
-    const request = await db.enterpriseContractRequest.findUnique({ where: { id } })
+    const request = await cloudDb.enterpriseContractRequest.findUnique({ where: { id } })
     if (!request) {
       return c.json({ success: false, error: 'Enterprise request not found' }, 404)
     }
@@ -2849,7 +2849,7 @@ app.post('/enterprise-requests/:id/create-plan', async (c) => {
     }
 
     // Reject duplicate plan names — SubscriptionPlan.name is @unique
-    const nameConflict = await db.subscriptionPlan.findUnique({ where: { name: data.name } })
+    const nameConflict = await cloudDb.subscriptionPlan.findUnique({ where: { name: data.name } })
     if (nameConflict) {
       return c.json({ success: false, error: 'A plan with this name already exists' }, 409)
     }
@@ -2877,7 +2877,7 @@ app.post('/enterprise-requests/:id/create-plan', async (c) => {
     // Single transaction: create plan, link to request, assign to agency.
     // The plan is marked as an enterprise custom plan owned by the requesting
     // agency so it does NOT leak into the public subscription catalog.
-    const { plan, updatedRequest } = await db.$transaction(async (tx) => {
+    const { plan, updatedRequest } = await cloudDb.$transaction(async (tx) => {
       const createdPlan = await tx.subscriptionPlan.create({
         data: {
           ...data,
@@ -2944,7 +2944,7 @@ app.post('/enterprise-requests/:id/create-plan', async (c) => {
 app.get('/hardware', async (c) => {
   try {
     const admin = await requireAdmin(c)
-    const products = await db.hardwareProduct.findMany({ orderBy: { sortOrder: 'asc' } })
+    const products = await cloudDb.hardwareProduct.findMany({ orderBy: { sortOrder: 'asc' } })
     return c.json({ products })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -2961,10 +2961,10 @@ app.post('/hardware', async (c) => {
     if (!name?.trim() || !category?.trim()) {
       return c.json({ error: 'Name and category are required' }, 400)
     }
-    const product = await db.hardwareProduct.create({
+    const product = await cloudDb.hardwareProduct.create({
       data: { name, nameAr, nameFr, description, category, basePrice: basePrice || 0, sortOrder: sortOrder || 0 },
     })
-    await db.auditLog.create({ data: { userId: admin.id, action: 'HARDWARE_CREATE', entityType: 'HARDWARE_PRODUCT', entityId: product.id, details: JSON.stringify({ name }) } })
+    await cloudDb.auditLog.create({ data: { userId: admin.id, action: 'HARDWARE_CREATE', entityType: 'HARDWARE_PRODUCT', entityId: product.id, details: JSON.stringify({ name }) } })
     return c.json({ success: true, product })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -2978,7 +2978,7 @@ app.patch('/hardware/:id', async (c) => {
     const admin = await requireAdmin(c)
     const id = c.req.param('id')
     const body = await c.req.json()
-    const product = await db.hardwareProduct.update({ where: { id }, data: body })
+    const product = await cloudDb.hardwareProduct.update({ where: { id }, data: body })
     return c.json({ success: true, product })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -2991,8 +2991,8 @@ app.delete('/hardware/:id', async (c) => {
   try {
     const admin = await requireAdmin(c)
     const id = c.req.param('id')
-    await db.hardwareProduct.delete({ where: { id } })
-    await db.auditLog.create({ data: { userId: admin.id, action: 'HARDWARE_DELETE', entityType: 'HARDWARE_PRODUCT', entityId: id, details: '{}' } })
+    await cloudDb.hardwareProduct.delete({ where: { id } })
+    await cloudDb.auditLog.create({ data: { userId: admin.id, action: 'HARDWARE_DELETE', entityType: 'HARDWARE_PRODUCT', entityId: id, details: '{}' } })
     return c.json({ success: true })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -3004,8 +3004,8 @@ app.delete('/hardware/:id', async (c) => {
 app.get('/hardware/settings', async (c) => {
   try {
     const admin = await requireAdmin(c)
-    const settings = await db.hardwareSettings.findUnique({ where: { id: 'singleton' } })
-    const commitmentTiers = await db.hardwareCommitmentTier.findMany({ orderBy: { sortOrder: 'asc' } })
+    const settings = await cloudDb.hardwareSettings.findUnique({ where: { id: 'singleton' } })
+    const commitmentTiers = await cloudDb.hardwareCommitmentTier.findMany({ orderBy: { sortOrder: 'asc' } })
     return c.json({ settings, commitmentTiers })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -3019,12 +3019,12 @@ app.patch('/hardware/settings', async (c) => {
     const admin = await requireAdmin(c)
     const body = await c.req.json()
     const { hardwareEnabled, upfrontDiscount } = body
-    const settings = await db.hardwareSettings.upsert({
+    const settings = await cloudDb.hardwareSettings.upsert({
       where: { id: 'singleton' },
       update: { ...(hardwareEnabled !== undefined ? { hardwareEnabled } : {}), ...(upfrontDiscount !== undefined ? { upfrontDiscount } : {}) },
       create: { id: 'singleton', hardwareEnabled: hardwareEnabled ?? true, upfrontDiscount: upfrontDiscount ?? 0 },
     })
-    await db.auditLog.create({ data: { userId: admin.id, action: 'HARDWARE_SETTINGS_UPDATE', entityType: 'SETTINGS', entityId: 'singleton', details: JSON.stringify({ hardwareEnabled, upfrontDiscount }) } })
+    await cloudDb.auditLog.create({ data: { userId: admin.id, action: 'HARDWARE_SETTINGS_UPDATE', entityType: 'SETTINGS', entityId: 'singleton', details: JSON.stringify({ hardwareEnabled, upfrontDiscount }) } })
     return c.json({ success: true, settings })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -3039,7 +3039,7 @@ app.patch('/hardware/commitment-tiers/:id', async (c) => {
     const id = c.req.param('id')
     const body = await c.req.json()
     const { extraPercentage, isActive } = body
-    const tier = await db.hardwareCommitmentTier.update({
+    const tier = await cloudDb.hardwareCommitmentTier.update({
       where: { id },
       data: { ...(extraPercentage !== undefined ? { extraPercentage } : {}), ...(isActive !== undefined ? { isActive } : {}) },
     })
@@ -3060,7 +3060,7 @@ app.get('/enterprise-requests', async (c) => {
     const admin = await requireAdmin(c)
     const status = c.req.query('status')
     const where = status ? { status } : {}
-    const requests = await db.enterpriseContractRequest.findMany({
+    const requests = await cloudDb.enterpriseContractRequest.findMany({
       where,
       orderBy: { createdAt: 'desc' },
     })
@@ -3081,11 +3081,11 @@ app.post('/enterprise-requests/:id', async (c) => {
     if (!['PENDING', 'REVIEWING', 'APPROVED', 'REJECTED'].includes(status)) {
       return c.json({ error: 'Invalid status' }, 400)
     }
-    const request = await db.enterpriseContractRequest.update({
+    const request = await cloudDb.enterpriseContractRequest.update({
       where: { id },
       data: { status, adminNotes: adminNotes || undefined },
     })
-    await db.auditLog.create({ data: { userId: admin.id, action: 'ENTERPRISE_REQUEST_UPDATE', entityType: 'ENTERPRISE_REQUEST', entityId: id, details: JSON.stringify({ status }) } })
+    await cloudDb.auditLog.create({ data: { userId: admin.id, action: 'ENTERPRISE_REQUEST_UPDATE', entityType: 'ENTERPRISE_REQUEST', entityId: id, details: JSON.stringify({ status }) } })
     return c.json({ success: true, request })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -3101,12 +3101,12 @@ app.post('/enterprise-requests/:id/create-plan', async (c) => {
     const body = await c.req.json()
     const { name, displayName, displayNameAr, displayNameFr, description, price, currency, billingCycle, maxServices, maxBranches, maxStaff, maxActiveReservations, maxSmsPerMonth, kioskModeEnabled, analyticsEnabled, priorityListing, customBranding, apiAccess } = body
 
-    const request = await db.enterpriseContractRequest.findUnique({ where: { id } })
+    const request = await cloudDb.enterpriseContractRequest.findUnique({ where: { id } })
     if (!request) return c.json({ error: 'Request not found' }, 404)
 
     // Create the custom plan — marked as enterprise & owned by the requesting
     // agency so it is isolated from the public subscription catalog.
-    const plan = await db.subscriptionPlan.create({
+    const plan = await cloudDb.subscriptionPlan.create({
       data: {
         name, displayName: displayName || name, displayNameAr, displayNameFr, description,
         price: price || 0, currency: currency || 'DZD', billingCycle: billingCycle || 'MONTHLY',
@@ -3121,16 +3121,16 @@ app.post('/enterprise-requests/:id/create-plan', async (c) => {
     })
 
     // Link plan to request and set agency subscription
-    await db.enterpriseContractRequest.update({ where: { id }, data: { status: 'APPROVED', customPlanId: plan.id } })
+    await cloudDb.enterpriseContractRequest.update({ where: { id }, data: { status: 'APPROVED', customPlanId: plan.id } })
     const now = new Date()
     const expiry = new Date(now); expiry.setDate(expiry.getDate() + 365)
-    await db.agency.update({
+    await cloudDb.agency.update({
       where: { id: request.agencyId },
       data: { subscriptionPlanId: plan.id, subscriptionTier: name, subscriptionStatus: 'ACTIVE', subscriptionStartsAt: now, subscriptionExpiresAt: expiry },
     })
 
-    await db.auditLog.create({ data: { userId: admin.id, action: 'ENTERPRISE_PLAN_CREATE', entityType: 'SUBSCRIPTION_PLAN', entityId: plan.id, details: JSON.stringify({ requestId: id, agencyId: request.agencyId }) } })
-    return c.json({ success: true, plan, request: await db.enterpriseContractRequest.findUnique({ where: { id } }) })
+    await cloudDb.auditLog.create({ data: { userId: admin.id, action: 'ENTERPRISE_PLAN_CREATE', entityType: 'SUBSCRIPTION_PLAN', entityId: plan.id, details: JSON.stringify({ requestId: id, agencyId: request.agencyId }) } })
+    return c.json({ success: true, plan, request: await cloudDb.enterpriseContractRequest.findUnique({ where: { id } }) })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status)
@@ -3150,7 +3150,7 @@ app.get('/hardware/orders', async (c) => {
     await requireAdmin(c)
     const status = c.req.query('status')
     const where = status ? { status } : {}
-    const orders = await db.hardwareOrder.findMany({
+    const orders = await cloudDb.hardwareOrder.findMany({
       where,
       include: {
         agency: { select: { id: true, name: true, nameAr: true, customCode: true, city: true } },
@@ -3171,11 +3171,11 @@ app.get('/hardware/orders/stats', async (c) => {
   try {
     await requireAdmin(c)
     const [pending, approved, rejected, fulfilled, total] = await Promise.all([
-      db.hardwareOrder.count({ where: { status: 'PENDING' } }),
-      db.hardwareOrder.count({ where: { status: 'APPROVED' } }),
-      db.hardwareOrder.count({ where: { status: 'REJECTED' } }),
-      db.hardwareOrder.count({ where: { status: 'FULFILLED' } }),
-      db.hardwareOrder.count(),
+      cloudDb.hardwareOrder.count({ where: { status: 'PENDING' } }),
+      cloudDb.hardwareOrder.count({ where: { status: 'APPROVED' } }),
+      cloudDb.hardwareOrder.count({ where: { status: 'REJECTED' } }),
+      cloudDb.hardwareOrder.count({ where: { status: 'FULFILLED' } }),
+      cloudDb.hardwareOrder.count(),
     ])
     return c.json({ pending, approved, rejected, fulfilled, total })
   } catch (error) {
@@ -3189,7 +3189,7 @@ app.get('/hardware/orders/:id', async (c) => {
   try {
     await requireAdmin(c)
     const id = c.req.param('id')
-    const order = await db.hardwareOrder.findUnique({
+    const order = await cloudDb.hardwareOrder.findUnique({
       where: { id },
       include: {
         agency: { select: { id: true, name: true, nameAr: true, customCode: true, city: true, phone: true, email: true, ownerId: true } },
@@ -3218,10 +3218,10 @@ app.post('/hardware/orders/:id', async (c) => {
       return c.json({ success: false, error: 'Invalid status. Use PENDING, APPROVED, REJECTED, or FULFILLED.' }, 400)
     }
 
-    const existing = await db.hardwareOrder.findUnique({ where: { id } })
+    const existing = await cloudDb.hardwareOrder.findUnique({ where: { id } })
     if (!existing) return c.json({ success: false, error: 'Order not found' }, 404)
 
-    const order = await db.hardwareOrder.update({
+    const order = await cloudDb.hardwareOrder.update({
       where: { id },
       data: { status },
       include: {
@@ -3230,7 +3230,7 @@ app.post('/hardware/orders/:id', async (c) => {
       },
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: admin.id,
         action: `HARDWARE_ORDER_${status}`,

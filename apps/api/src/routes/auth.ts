@@ -13,7 +13,7 @@
 
 import { Hono } from 'hono'
 import { setCookie, deleteCookie } from 'hono/cookie'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { createSessionToken, getSessionUser, type SessionUser } from '../lib/auth'
 import { verifyPassword, hashPassword } from '../lib/password'
 import crypto from 'crypto'
@@ -220,7 +220,7 @@ app.post('/login', async (c) => {
     const { username, password, expectedRole } = validation.data
 
     // Find user by username
-    const user = await db.user.findUnique({
+    const user = await cloudDb.user.findUnique({
       where: { username },
       select: {
         id: true,
@@ -288,7 +288,7 @@ app.post('/login', async (c) => {
     }
 
     // Create audit log
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: user.id,
         action: 'LOGIN',
@@ -304,19 +304,19 @@ app.post('/login', async (c) => {
     let agencyId: string | undefined
     if (user.role === 'SUPER_ADMIN') {
       // SUPER_ADMIN gets agencyId from first available agency
-      const firstAgency = await db.agency.findFirst({
+      const firstAgency = await cloudDb.agency.findFirst({
         select: { id: true },
       })
       agencyId = firstAgency?.id
     } else if (user.role === 'AGENCY_OWNER' || user.role === 'AGENCY_STAFF') {
       if (user.role === 'AGENCY_OWNER') {
-        const ownedAgency = await db.agency.findFirst({
+        const ownedAgency = await cloudDb.agency.findFirst({
           where: { ownerId: user.id },
           select: { id: true },
         })
         agencyId = ownedAgency?.id
       } else {
-        const staffAssignment = await db.agencyStaff.findFirst({
+        const staffAssignment = await cloudDb.agencyStaff.findFirst({
           where: { userId: user.id, isActive: true },
           select: { agencyId: true },
         })
@@ -390,7 +390,7 @@ app.post('/register', async (c) => {
     const { username, fullName, password, phoneNumber, role, agencyCode, avatarUrl } = validation.data
 
     // Check for duplicate username
-    const existingUser = await db.user.findUnique({
+    const existingUser = await cloudDb.user.findUnique({
       where: { username },
     })
     if (existingUser) {
@@ -402,7 +402,7 @@ app.post('/register', async (c) => {
 
     // Check for duplicate phone number
     if (phoneNumber) {
-      const existingPhone = await db.user.findUnique({
+      const existingPhone = await cloudDb.user.findUnique({
         where: { phoneNumber },
       })
       if (existingPhone) {
@@ -417,7 +417,7 @@ app.post('/register', async (c) => {
     const passwordHash = hashPassword(password)
 
     // Create user
-    const user = await db.user.create({
+    const user = await cloudDb.user.create({
       data: {
         username,
         fullName,
@@ -446,11 +446,11 @@ app.post('/register', async (c) => {
     let agencyNameAr: string | undefined
     let agencyNameFr: string | undefined
     if (agencyCode && role === 'AGENCY_OWNER') {
-      const agency = await db.agency.findUnique({
+      const agency = await cloudDb.agency.findUnique({
         where: { customCode: agencyCode.toUpperCase() },
       })
       if (agency) {
-        await db.agencyStaff.create({
+        await cloudDb.agencyStaff.create({
           data: {
             userId: user.id,
             agencyId: agency.id,
@@ -620,7 +620,7 @@ app.post('/forgot-password', async (c) => {
     const { username } = validation.data
 
     // Find user by username (but don't reveal existence)
-    const user = await db.user.findUnique({
+    const user = await cloudDb.user.findUnique({
       where: { username },
       select: { id: true, username: true },
     })
@@ -709,7 +709,7 @@ app.post('/reset-password', async (c) => {
     const passwordHash = hashPassword(newPassword)
 
     // Update user's password in the database
-    await db.user.update({
+    await cloudDb.user.update({
       where: { id: tokenEntry.userId },
       data: { passwordHash },
     })
@@ -775,7 +775,7 @@ app.get('/check-username', async (c) => {
     }
 
     // Check if username exists in database
-    const existingUser = await db.user.findUnique({
+    const existingUser = await cloudDb.user.findUnique({
       where: { username },
       select: { id: true },
     })

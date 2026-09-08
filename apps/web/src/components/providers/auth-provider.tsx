@@ -38,31 +38,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!persistRehydrated) return;
     if (!isAuthenticated || !useAppStore.getState().user) return;
 
-    // ── Electron: Restore local API session on app reload ──
-    // When the Electron app restarts/reloads, the local API's sessionToken
-    // is null (it's module-level state), but Zustand persist still has the
-    // user + token. We need to re-import the session so LAN failover works.
-    try {
-      const w = window as any;
-      if (w.electronAPI || navigator.userAgent.includes('Electron')) {
-        const store = useAppStore.getState();
-        const token = store.sessionToken || localStorage.getItem('blasti-local-api-token');
-        if (token && store.user) {
-          // 1. Restore via IPC bridge (direct)
-          if (w.electronAPI?.setLocalApiSession) {
-            w.electronAPI.setLocalApiSession({ token, user: store.user });
-          }
-          // 2. Also call HTTP import-session as backup
-          fetch('http://127.0.0.1:3080/api/auth/import-session', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'omit',
-            body: JSON.stringify({ token, user: store.user }),
-          }).catch(() => { /* non-critical */ });
-        }
-      }
-    } catch { /* ignore */ }
-
     // Validate JWT session with the Hono backend (/api/auth/session)
     // Returns {user: {...}, expires: "..."} for valid sessions
     // and {} for expired/unauthenticated sessions

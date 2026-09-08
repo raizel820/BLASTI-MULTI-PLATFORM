@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { db, Prisma } from '@blasti/db'
+import { cloudDb, Prisma } from '@blasti/cloud-db'
 import { requireRole, requireAgencyAccess, authErrorResponse } from '../lib/auth'
 import { adminCreateAgencySchema, updateAgencyProfileSchema, validateBody } from '../lib/validations'
 import { enforceRateLimit, getClientIp, AGENCY_LISTING_RATE_LIMIT, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordFailedRequest, recordSuccessfulRequest } from '../lib/rate-limit'
@@ -37,7 +37,7 @@ app.get('/', async (c) => {
     }
 
     const [agencies, total] = await Promise.all([
-      db.agency.findMany({
+      cloudDb.agency.findMany({
         where,
         include: {
           _count: {
@@ -60,12 +60,12 @@ app.get('/', async (c) => {
         take: limit,
         skip: offset,
       }),
-      db.agency.count({ where }),
+      cloudDb.agency.count({ where }),
     ])
 
     const agencyIds = agencies.map(a => a.id)
     const ratingResults = agencyIds.length > 0
-      ? await db.$queryRaw<Array<{ agencyId: string; avgRating: number | null; reviewCount: number }>>`
+      ? await cloudDb.$queryRaw<Array<{ agencyId: string; avgRating: number | null; reviewCount: number }>>`
           SELECT agencyId,
                  ROUND(AVG(CAST(rating AS REAL)) * 10) / 10 as avgRating,
                  COUNT(*) as reviewCount
@@ -137,7 +137,7 @@ app.get('/code/:code', async (c) => {
 
     const code = c.req.param('code')
 
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { customCode: code },
       include: {
         services: {
@@ -229,7 +229,7 @@ app.get('/:id', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const agency = await db.agency.findUnique({
+    const agency = await cloudDb.agency.findUnique({
       where: { id },
       include: {
         services: {
@@ -302,7 +302,7 @@ app.post('/', async (c) => {
     const resolvedOwnerId = user.role === 'SUPER_ADMIN' ? (ownerId || user.id) : user.id
 
     if (customCode) {
-      const existingCode = await db.agency.findUnique({
+      const existingCode = await cloudDb.agency.findUnique({
         where: { customCode },
       })
       if (existingCode) {
@@ -310,7 +310,7 @@ app.post('/', async (c) => {
       }
     }
 
-    const agency = await db.agency.create({
+    const agency = await cloudDb.agency.create({
       data: {
         name,
         nameAr,
@@ -330,7 +330,7 @@ app.post('/', async (c) => {
       },
     })
 
-    await db.auditLog.create({
+    await cloudDb.auditLog.create({
       data: {
         userId: user.id,
         action: 'AGENCY_CREATE',
@@ -356,13 +356,13 @@ app.put('/:id', async (c) => {
 
     const body = await c.req.json()
 
-    const existingAgency = await db.agency.findUnique({ where: { id } })
+    const existingAgency = await cloudDb.agency.findUnique({ where: { id } })
     if (!existingAgency) {
       return c.json({ success: false, error: 'Agency not found' }, 404)
     }
 
     if (body.customCode && body.customCode !== existingAgency.customCode) {
-      const duplicateCode = await db.agency.findUnique({
+      const duplicateCode = await cloudDb.agency.findUnique({
         where: { customCode: body.customCode },
       })
       if (duplicateCode) {
@@ -382,7 +382,7 @@ app.put('/:id', async (c) => {
       }
     }
 
-    const agency = await db.agency.update({
+    const agency = await cloudDb.agency.update({
       where: { id },
       data: updateData,
     })

@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
+import { cloudDb } from '@blasti/cloud-db'
 import { requireAuth, requireResourceOwnership, authErrorResponse } from '../lib/auth'
 import { validateBody } from '../lib/validations'
 import { emitNotificationEvent } from '../lib/realtime-emit'
@@ -23,8 +23,8 @@ app.get('/', async (c) => {
       else if (types.length > 1) where.type = { in: types }
     }
 
-    const notifications = await db.notification.findMany({ where, orderBy: { createdAt: 'desc' }, take: 50 })
-    const unreadCount = await db.notification.count({ where: { userId, isRead: false } })
+    const notifications = await cloudDb.notification.findMany({ where, orderBy: { createdAt: 'desc' }, take: 50 })
+    const unreadCount = await cloudDb.notification.count({ where: { userId, isRead: false } })
 
     return c.json({ success: true, notifications, unreadCount })
   } catch (error: unknown) {
@@ -46,7 +46,7 @@ app.post('/', async (c) => {
 
     const { type, title, message, entityId } = validation.data
 
-    const notification = await db.notification.create({
+    const notification = await cloudDb.notification.create({
       data: { userId: user.id, type, title, message, isRead: false, entityId: entityId || null },
     })
 
@@ -73,12 +73,12 @@ app.patch('/', async (c) => {
     const { notificationIds, markAll } = validation.data
 
     if (markAll) {
-      const result = await db.notification.updateMany({ where: { userId: user.id, isRead: false }, data: { isRead: true } })
+      const result = await cloudDb.notification.updateMany({ where: { userId: user.id, isRead: false }, data: { isRead: true } })
       return c.json({ success: true, markedCount: result.count })
     }
 
     if (notificationIds && Array.isArray(notificationIds) && notificationIds.length > 0) {
-      const result = await db.notification.updateMany({ where: { id: { in: notificationIds }, userId: user.id, isRead: false }, data: { isRead: true } })
+      const result = await cloudDb.notification.updateMany({ where: { id: { in: notificationIds }, userId: user.id, isRead: false }, data: { isRead: true } })
       return c.json({ success: true, markedCount: result.count })
     }
 
@@ -94,7 +94,7 @@ app.patch('/mark-read', async (c) => {
   try {
     const user = await requireAuth(c)
 
-    await db.notification.updateMany({ where: { userId: user.id, isRead: false }, data: { isRead: true } })
+    await cloudDb.notification.updateMany({ where: { userId: user.id, isRead: false }, data: { isRead: true } })
 
     return c.json({ success: true })
   } catch (error: unknown) {
@@ -108,7 +108,7 @@ app.put('/read-all', async (c) => {
   try {
     const user = await requireAuth(c)
 
-    const result = await db.notification.updateMany({ where: { userId: user.id, isRead: false }, data: { isRead: true } })
+    const result = await cloudDb.notification.updateMany({ where: { userId: user.id, isRead: false }, data: { isRead: true } })
 
     return c.json({ success: true, markedCount: result.count })
   } catch (error: unknown) {
@@ -122,14 +122,14 @@ app.patch('/:id', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const notification = await db.notification.findUnique({ where: { id } })
+    const notification = await cloudDb.notification.findUnique({ where: { id } })
     if (!notification) return c.json({ success: false, error: 'Notification not found' }, 404)
 
     await requireResourceOwnership(c, notification.userId)
 
     if (notification.isRead) return c.json({ success: true, notification, message: 'Already read' })
 
-    const updated = await db.notification.update({ where: { id }, data: { isRead: true } })
+    const updated = await cloudDb.notification.update({ where: { id }, data: { isRead: true } })
 
     return c.json({ success: true, notification: updated })
   } catch (error: unknown) {
@@ -143,12 +143,12 @@ app.delete('/:id', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const notification = await db.notification.findUnique({ where: { id } })
+    const notification = await cloudDb.notification.findUnique({ where: { id } })
     if (!notification) return c.json({ success: false, error: 'Notification not found' }, 404)
 
     await requireResourceOwnership(c, notification.userId)
 
-    await db.notification.delete({ where: { id } })
+    await cloudDb.notification.delete({ where: { id } })
 
     return c.json({ success: true })
   } catch (error: unknown) {
