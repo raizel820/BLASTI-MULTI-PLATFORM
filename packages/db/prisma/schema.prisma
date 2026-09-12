@@ -404,6 +404,7 @@ model Reservation {
   estimatedWait      Int?
   reservedDate       String?
   joinedAt           DateTime  @default(now())
+  createdAt          DateTime  @default(now())
   calledAt           DateTime?
   completedAt        DateTime?
   cancelledAt        DateTime?

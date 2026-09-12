@@ -5,6 +5,7 @@ import { Wifi, WifiOff, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useRealtime } from '@/hooks/use-realtime';
 import { useOnlineStatus } from '@/hooks/use-online-status';
+import { isApiUnreachable } from '@/lib/api-client';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -24,8 +25,16 @@ let _consecutiveCloudFailures = 0;
 /**
  * Perform a cloud API health check.
  * Uses exponential backoff on failures to avoid spamming ERR_CONNECTION_REFUSED.
+ * Honors the central isApiUnreachable() cooldown (api-client.ts) so every
+ * mounted health-poll instance does not hammer a dead API independently —
+ * when the 30s cooldown is active the last known status is reported without
+ * a network round-trip.
  */
 async function checkApiHealth(): Promise<ApiHealthStatus> {
+  // ── Central unreachable cooldown (web-only dev mode: API may be down) ──
+  if (isApiUnreachable() && _healthStatus.cloudReachable !== null) {
+    return { ..._healthStatus };
+  }
   // ── Check Cloud API ───────────────────────────────────────────────
   try {
     const controller = new AbortController();

@@ -85,12 +85,25 @@ function resolveSocketOptions(): Parameters<typeof io>[1] {
 
   const baseOptions: Parameters<typeof io>[1] = {
     path: '/socket.io',
-    transports: ['websocket', 'polling'],
+    // POLLING FIRST (regression guard for the dev-crash audit):
+    // ['websocket', ...] hangs against the Next.js dev server — Next dev
+    // accepts the WS upgrade TCP connection but never completes it, so each
+    // attempt burns its full timeout and polling is never reached
+    // ("stuck Reconnecting…" on http://127.0.0.1:3000).
+    // With polling first: direct dev access connects over HTTP polling
+    // immediately, and behind the Caddy gateway / production proxy the
+    // server still advertises the websocket upgrade, which the client then
+    // upgrades to. Best behavior in every environment.
+    transports: ['polling', 'websocket'],
     reconnection: true,
-    // On native platforms, use fewer reconnection attempts to avoid
-    // spamming "WebSocket connection failed" when cloud is down.
-    // The LAN fallback (HTTP polling) handles offline events.
-    reconnectionAttempts: isNative ? 5 : Infinity,
+    // BOUNDED reconnection on ALL platforms (regression guard for the
+    // dev-crash audit): an unbounded retry loop against an unreachable API
+    // keeps the browser churning requests forever (WS fail + proxied HTTP
+    // 500 every attempt). Web now gives up after 20 attempts (~4 min with
+    // 1s→30s exponential backoff); native stays at 5. Consumers that need
+    // to retry later can call socket.connect() again on user action or on
+    // the next sessionToken change (see useRealtime reconnect effect).
+    reconnectionAttempts: isNative ? 5 : 20,
     reconnectionDelay: isNative ? 3000 : 1000,
     reconnectionDelayMax: 30000,
     timeout: 10000,
@@ -239,8 +252,16 @@ export function useRealtime(options?: UseRealtimeOptions) {
   // C3: Send auth with session token when it changes
   useEffect(() => {
     const authToken = sessionToken || REALTIME_TOKEN
-    if (socketRef.current?.connected) {
-      socketRef.current.emit('auth', { token: authToken })
+    const socket = socketRef.current
+    if (!socket) return
+    if (socket.connected) {
+      socket.emit('auth', { token: authToken })
+    } else if (!socket.active) {
+      // Reconnection attempts were exhausted (reconnect_failed) or the socket
+      // was manually disconnected. Auth changes (login/logout) are a natural
+      // moment to try again — this is bounded: one attempt per token change,
+      // never a loop.
+      socket.connect()
     }
   }, [sessionToken])
 

@@ -9,7 +9,9 @@ cd /home/z/my-project/apps/api
 bun src/index.ts > /tmp/api.log 2>&1 &
 
 cd /home/z/my-project/apps/web
-bun --bun run node_modules/.bin/next dev -p 3000 -H 0.0.0.0 > /tmp/web.log 2>&1 &
+# Web dev server runs on the Node.js runtime (Next.js 16 + Turbopack is not
+# supported under `bun --bun` — see WEB_DEV_CRASH_AUDIT.md).
+node node_modules/next/dist/bin/next dev -p 3000 -H 127.0.0.1 > /tmp/web.log 2>&1 &
 
 # wait forever to keep the script alive
 wait

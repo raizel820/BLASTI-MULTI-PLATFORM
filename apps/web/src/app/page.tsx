@@ -76,6 +76,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { Toaster } from 'sonner';
 import { toast } from 'sonner';
 import { useTurnAlert } from '@/hooks/use-realtime';
+import { DevDebugHud } from '@/components/shared/dev-debug-hud';
 import { AggressiveTurnAlert } from '@/components/customer/AggressiveTurnAlert';
 
 // Suspense fallback for lazy-loaded views — branded BLASTI skeleton
@@ -440,6 +441,8 @@ export default function Home() {
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />
+        {/* Optional dev diagnostics — inert unless ?debug=1 / localStorage flag */}
+        <DevDebugHud />
       </>
     );
   }
@@ -464,6 +467,8 @@ export default function Home() {
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />
+        {/* Optional dev diagnostics — inert unless ?debug=1 / localStorage flag */}
+        <DevDebugHud />
       </>
     );
   }
@@ -483,6 +488,8 @@ export default function Home() {
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />
+        {/* Optional dev diagnostics — inert unless ?debug=1 / localStorage flag */}
+        <DevDebugHud />
       </>
     );
   }
@@ -622,6 +629,9 @@ export default function Home() {
       </main>
 
       <Toaster richColors position="top-center" />
+
+      {/* Optional dev diagnostics — inert unless ?debug=1 / localStorage flag */}
+      <DevDebugHud />
 
       {/* Aggressive Turn Alert — full-screen overlay for customers */}
       <AggressiveTurnAlert

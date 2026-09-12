@@ -38,10 +38,18 @@ const nextConfig: NextConfig = {
   // The destination is configurable via API_PROXY_URL (defaults to
   // http://localhost:3003) so different environments can override it.
   //
-  // Note: In Next.js 16, if the rewrite destination is unreachable the dev
-  // server may log proxy errors, but this is acceptable for development.
-  // The API client's retry/unreachable logic handles downstream failures.
+  // NOTE: Static export mode (NEXT_BUILD_MODE=export, used for Electron/Capacitor
+  // builds) does NOT support rewrites — they must be omitted or `next build`
+  // fails. In export mode the app talks to the API via absolute URLs instead.
+  //
+  // NOTE: When the API is down (web-only `dev:web` mode), the proxy simply
+  // returns 500/ECONNREFUSED for /api/* requests. The client's central retry
+  // policy (api-client.ts) marks the API unreachable for 30s and pollers honor
+  // that cooldown, so the browser stays stable without the API.
   async rewrites() {
+    if (process.env.NEXT_BUILD_MODE === "export") {
+      return [];
+    }
     const apiProxyUrl = process.env.API_PROXY_URL || 'http://localhost:3003';
     return [
       {
@@ -49,8 +57,22 @@ const nextConfig: NextConfig = {
         destination: `${apiProxyUrl}/api/:path*`,
       },
       {
+        // NOTE the trailing slash on the destination: the browser normalizes
+        // "/socket.io/" → "/socket.io" (308) BEFORE rewrites run, so the
+        // destination must re-append "/" — engine.io only answers on
+        // "/socket.io/". Without this, realtime works through the gateway
+        // but NEVER connects on direct dev-server access (ChunkLoadError-era
+        // "stuck Reconnecting" bug on http://127.0.0.1:3000).
+        source: '/socket.io',
+        destination: `${apiProxyUrl}/socket.io/`,
+      },
+      {
         source: '/socket.io/:path*',
         destination: `${apiProxyUrl}/socket.io/:path*`,
+      },
+      {
+        source: '/health',
+        destination: `${apiProxyUrl}/health`,
       },
     ];
   },
