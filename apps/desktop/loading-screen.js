@@ -1049,6 +1049,44 @@ async function runDiagnostics(mainWindow, config) {
           localApiToken = cloudAuthToken;
           sendUpdate(mainWindow, { log: `[OK] Session imported to local API`, logType: 'ok' });
 
+          // ── Check AgencyLocalState: if NOT_INITIALIZED, skip heavy import ──
+          // The initial-sync engine (initial-sync.js) will handle the full import
+          // after the loading screen completes. Doing a partial import here would
+          // be redundant and slow down startup.
+          let skipHeavyImport = false;
+          try {
+            const { localDb: checkDb } = require('./local-api/lib/db');
+            if (checkDb && agencyId) {
+              const initialSync = require('./local-api/initial-sync');
+              const agencyReady = await initialSync.isAgencyReady(checkDb, agencyId);
+              if (agencyReady) {
+                // Agency already initialized — skip heavy import (incremental sync handles updates)
+                importResult = {
+                  step: 'import-agency-data',
+                  status: 'success',
+                  message: 'الوكالة مهيأة بالفعل — المزامنة التزايدي ستتعامل مع التحديثات',
+                };
+                sendUpdate(mainWindow, { log: `[OK] Agency already initialized — skipping heavy import (incremental sync handles updates)`, logType: 'ok' });
+                skipHeavyImport = true;
+              } else {
+                // NOT_INITIALIZED — initial sync is needed but should NOT block startup.
+                // The frontend will trigger initial-sync after the loading screen completes.
+                importResult = {
+                  step: 'import-agency-data',
+                  status: 'success',
+                  message: 'يلزم مزامنة أولية — سيتم استيراد البيانات بعد تحميل الشاشة الرئيسية',
+                  needsInitialSync: true,
+                };
+                sendUpdate(mainWindow, { log: `[INFO] Agency NOT_INITIALIZED — initial sync needed, will be triggered after startup`, logType: 'info' });
+                skipHeavyImport = true;
+              }
+            }
+          } catch (e) {
+            // AgencyLocalState table may not exist yet — proceed with old import
+            console.warn('[Diagnostics] Could not check AgencyLocalState:', e.message);
+          }
+
+          if (!skipHeavyImport) {
           // Now fetch agency data from cloud and upsert into local DB
           const importResults = {};
 
@@ -1295,6 +1333,7 @@ async function runDiagnostics(mainWindow, config) {
             detail: importResults,
           };
           console.log('[Diagnostics] Agency data import:', importResults);
+          } // end if (!skipHeavyImport)
         } else {
           importResult = {
             step: 'import-agency-data',
@@ -1446,8 +1485,30 @@ async function runDiagnostics(mainWindow, config) {
         };
         sendUpdate(mainWindow, { log: '[SKIP] No stored auth session — sync verification deferred after login', logType: 'info' });
         // Do NOT push/send here — it will be done after the block below
-      } else {
-      // ─── FULL VERIFICATION (only when auth exists) ─────────────────────
+      } else if (agencyId) {
+        // ─── NOT-INITIALIZED EARLY EXIT ────────────────────────────────────
+        // If the agency has not been initialized (initial sync not yet run),
+        // skip heavy verification. The initial-sync engine will handle data
+        // import after the loading screen completes.
+        let agencyInitialized = false;
+        try {
+          const { localDb: quickDb } = require('./local-api/lib/db');
+          if (quickDb) {
+            const initialSync = require('./local-api/initial-sync');
+            agencyInitialized = await initialSync.isAgencyReady(quickDb, agencyId);
+          }
+        } catch (_) { /* AgencyLocalState may not exist yet */ }
+
+        if (!agencyInitialized) {
+          verifyResult = {
+            step: 'verify-sync-integrity',
+            status: 'success',
+            message: 'تم التخطي — الوكالة غير مهيأة (سيتم التحقق بعد المزامنة الأولية)',
+            needsInitialSync: true,
+          };
+          sendUpdate(mainWindow, { log: '[SKIP] Agency NOT_INITIALIZED — sync verification deferred after initial sync', logType: 'info' });
+        } else {
+      // ─── FULL VERIFICATION (only when auth exists AND agency is READY) ──
       const { localDb: verifyDb } = require('./local-api/lib/db');
       if (!verifyDb) {
         verifyResult = {
@@ -1712,7 +1773,8 @@ async function runDiagnostics(mainWindow, config) {
           sendUpdate(mainWindow, { log: `[OK] Tables ready (${existingTables.length}), ${localTotalRecords} records — full verify after login`, logType: 'ok' });
         }
       }
-      } // end of hasStoredAuth else block
+        } // end of agencyInitialized else block (FULL VERIFICATION)
+      } // end of else if (agencyId) block
     } catch (err) {
       verifyResult = {
         step: 'verify-sync-integrity',
@@ -2138,6 +2200,7 @@ async function runDiagnostics(mainWindow, config) {
   const allPassed = results.every(r => r.status === 'success');
   const hasWarnings = results.some(r => r.status === 'warning');
   const hasErrors = results.some(r => r.status === 'error');
+  const needsInitialSync = results.some(r => r.needsInitialSync);
 
   console.log(`[Diagnostics] Complete — ${results.filter(r => r.status === 'success').length}/${results.length} passed`);
 
@@ -2148,7 +2211,7 @@ async function runDiagnostics(mainWindow, config) {
     });
   } catch (_) { /* window may be gone */ }
 
-  return { results, allPassed: allPassed || (!hasErrors && hasWarnings) };
+  return { results, allPassed: allPassed || (!hasErrors && hasWarnings), needsInitialSync };
 }
 
 // ─── Helper: Fetch with Auth (for cloud API) ──────────────────────────────

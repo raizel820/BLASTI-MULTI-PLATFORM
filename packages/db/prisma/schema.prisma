@@ -59,8 +59,12 @@ model User {
   managedTransactions     Transaction[]        @relation("ReviewedBy")
   reviews                 Review[]
   devices                 DeviceRegistration[]
-  syncVersion             Int               @default(0)
+  syncVersion             Int                  @default(0)
   syncedAt                DateTime?
+
+  @@index([role])
+  @@index([isActive])
+  @@index([createdAt])
 }
 
 model Agency {
@@ -134,6 +138,8 @@ model Agency {
   syncedAt              DateTime?
 
   @@index([ownerId])
+  @@index([subscriptionStatus])
+  @@index([isActive, createdAt])
 }
 
 // Phase 2: Dynamic SubscriptionPlan model — replaces hardcoded subscriptionTier enum
@@ -199,11 +205,12 @@ model PlanFeature {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
-  plan SubscriptionPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
-  syncVersion Int      @default(0)
+  plan        SubscriptionPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  syncVersion Int              @default(0)
   syncedAt    DateTime?
 
   @@unique([planId, featureKey])
+  @@index([featureKey])
 }
 
 // ─── Hardware Ordering System ───────────────────────────────────────────────
@@ -226,6 +233,8 @@ model HardwareProduct {
   updatedAt     DateTime @updatedAt
 
   orderItems HardwareOrderItem[]
+
+  @@index([category, isActive])
 }
 
 model HardwareOrder {
@@ -243,6 +252,9 @@ model HardwareOrder {
 
   agency Agency              @relation(fields: [agencyId], references: [id])
   items  HardwareOrderItem[]
+
+  @@index([agencyId, status])
+  @@index([createdAt])
 }
 
 model HardwareOrderItem {
@@ -255,6 +267,9 @@ model HardwareOrderItem {
 
   order   HardwareOrder   @relation(fields: [orderId], references: [id], onDelete: Cascade)
   product HardwareProduct @relation(fields: [productId], references: [id])
+
+  @@index([orderId])
+  @@index([productId])
 }
 
 // ─── Enterprise Contract Requests ───────────────────────────────────────────
@@ -280,6 +295,9 @@ model EnterpriseContractRequest {
 
   agency     Agency            @relation(fields: [agencyId], references: [id])
   customPlan SubscriptionPlan? @relation(fields: [customPlanId], references: [id])
+
+  @@index([agencyId, status])
+  @@index([status, createdAt])
 }
 
 // ─── Hardware Settings (global config) ─────────────────────────────────────
@@ -302,6 +320,8 @@ model HardwareCommitmentTier {
   extraPercentage Int     @default(0) // Extra % over base price for monthly payments
   isActive        Boolean @default(true)
   sortOrder       Int     @default(0)
+
+  @@index([isActive, sortOrder])
 }
 
 model AgencyStaff {
@@ -334,6 +354,7 @@ model AgencyStaff {
   @@unique([userId, agencyId])
   @@index([agencyId])
   @@index([userId])
+  @@index([role])
 }
 
 model Service {
@@ -437,6 +458,7 @@ model Reservation {
   @@index([agencyId, serviceId, status])
   @@index([userId, status])
   @@index([agencyId, joinedAt])
+  @@index([status, joinedAt])
 }
 
 model Transaction {
@@ -482,6 +504,7 @@ model Transaction {
 
   @@index([agencyId, status])
   @@index([agencyId, createdAt])
+  @@index([paymentProvider, providerRef])
 }
 
 model SmsPurchase {
@@ -521,14 +544,14 @@ model Notification {
 }
 
 model Favorite {
-  id        String   @id @default(cuid())
-  userId    String
-  agencyId  String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @default(now()) @updatedAt
-  agency    Agency   @relation(fields: [agencyId], references: [id])
-  user      User     @relation(fields: [userId], references: [id])
-  syncVersion Int      @default(0)
+  id          String    @id @default(cuid())
+  userId      String
+  agencyId    String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @default(now()) @updatedAt
+  agency      Agency    @relation(fields: [agencyId], references: [id])
+  user        User      @relation(fields: [userId], references: [id])
+  syncVersion Int       @default(0)
   syncedAt    DateTime?
 
   @@unique([userId, agencyId])
@@ -552,32 +575,34 @@ model Announcement {
 }
 
 model GlobalAnnouncement {
-  id        String   @id @default(cuid())
-  message   String
-  type      String   @default("INFO")
-  createdBy String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @default(now()) @updatedAt
+  id          String    @id @default(cuid())
+  message     String
+  type        String    @default("INFO")
+  createdBy   String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @default(now()) @updatedAt
   syncVersion Int       @default(0)
   syncedAt    DateTime?
+
+  @@index([createdAt])
 }
 
 model SmsSettings {
-  id                      String   @id @default(cuid())
-  provider                String   @default("algeria_sms")
-  apiUrl                  String   @default("")
-  apiKey                  String   @default("")
-  senderName              String   @default("BLASTI")
-  enabled                 Boolean  @default(false)
-  smsPerReminder          Int      @default(1)
-  maxSmsPerDay            Int      @default(5)
+  id                      String    @id @default(cuid())
+  provider                String    @default("algeria_sms")
+  apiUrl                  String    @default("")
+  apiKey                  String    @default("")
+  senderName              String    @default("BLASTI")
+  enabled                 Boolean   @default(false)
+  smsPerReminder          Int       @default(1)
+  maxSmsPerDay            Int       @default(5)
   testPhoneNumber         String?
-  templateTurnApproaching String   @default("🔄 BLASTI: Dear {customerName}, your turn is approaching! Ticket {ticketNumber} at {agencyName}. Position: {position}. Est. wait: {estimatedMinutes} min.")
-  templateYourTurn        String   @default("🎫 BLASTI: Dear {customerName}, it's your turn now! Ticket {ticketNumber} at {agencyName}. Please proceed.")
-  templateNoShow          String   @default("⚠️ BLASTI: Dear {customerName}, your ticket {ticketNumber} at {agencyName} was skipped due to no-show. You can reclaim your position.")
-  templateCustom          String   @default("")
-  updatedAt               DateTime @updatedAt
-  createdAt               DateTime @default(now())
+  templateTurnApproaching String    @default("🔄 BLASTI: Dear {customerName}, your turn is approaching! Ticket {ticketNumber} at {agencyName}. Position: {position}. Est. wait: {estimatedMinutes} min.")
+  templateYourTurn        String    @default("🎫 BLASTI: Dear {customerName}, it's your turn now! Ticket {ticketNumber} at {agencyName}. Please proceed.")
+  templateNoShow          String    @default("⚠️ BLASTI: Dear {customerName}, your ticket {ticketNumber} at {agencyName} was skipped due to no-show. You can reclaim your position.")
+  templateCustom          String    @default("")
+  updatedAt               DateTime  @updatedAt
+  createdAt               DateTime  @default(now())
   smsLogs                 SmsLog[]
   syncVersion             Int       @default(0)
   syncedAt                DateTime?
@@ -611,6 +636,8 @@ model AuditLog {
 
   @@index([userId])
   @@index([createdAt])
+  @@index([action, createdAt])
+  @@index([entityType, entityId])
 }
 
 model Review {
@@ -636,36 +663,38 @@ model Review {
 }
 
 model FAQ {
-  id         String   @id @default(cuid())
-  question   String
-  questionFr String?
-  questionAr String?
-  answer     String
-  answerFr   String?
-  answerAr   String?
-  category   String   @default("SUBSCRIPTION")
-  order      Int      @default(0)
-  isActive   Boolean  @default(true)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-  syncVersion Int      @default(0)
+  id          String    @id @default(cuid())
+  question    String
+  questionFr  String?
+  questionAr  String?
+  answer      String
+  answerFr    String?
+  answerAr    String?
+  category    String    @default("SUBSCRIPTION")
+  order       Int       @default(0)
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  syncVersion Int       @default(0)
   syncedAt    DateTime?
+
+  @@index([category, order])
 }
 
 model PaymentSettings {
-  id                String   @id @default(cuid())
-  ccpEnabled        Boolean  @default(false)
-  bankEnabled       Boolean  @default(false)
-  electronicEnabled Boolean  @default(false)
-  ccpAccount        String   @default("")
-  ccpKey            String   @default("")
-  bankName          String   @default("")
-  bankAccount       String   @default("")
-  bankRib           String   @default("")
-  ewalletNumber     String   @default("")
-  updatedAt         DateTime @updatedAt
-  createdAt         DateTime @default(now())
-  syncVersion       Int      @default(0)
+  id                String    @id @default(cuid())
+  ccpEnabled        Boolean   @default(false)
+  bankEnabled       Boolean   @default(false)
+  electronicEnabled Boolean   @default(false)
+  ccpAccount        String    @default("")
+  ccpKey            String    @default("")
+  bankName          String    @default("")
+  bankAccount       String    @default("")
+  bankRib           String    @default("")
+  ewalletNumber     String    @default("")
+  updatedAt         DateTime  @updatedAt
+  createdAt         DateTime  @default(now())
+  syncVersion       Int       @default(0)
   syncedAt          DateTime?
 }
 
@@ -726,6 +755,8 @@ model DeviceRegistration {
   user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, deviceId])
+  @@index([platform])
+  @@index([lastActiveAt])
 }
 
 // ─── Storage Abstraction ──────────────────────────────────────────────────────
@@ -749,6 +780,7 @@ model UploadedFile {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @default(now()) @updatedAt
 
+  @@unique([storageProvider, storageKey])
   @@index([storageProvider])
   @@index([storageKey])
 }
@@ -1022,9 +1054,9 @@ model SyncChange {
   /// Monotonic sequence number — used as sync cursor. MUST be assigned atomically.
   sequence    Int      @unique
   agencyId    String
-  model       String   // e.g., "Reservation", "Service"
-  recordId    String   // The ID of the changed record
-  operation   String   // "create" | "update" | "delete"
+  model       String // e.g., "Reservation", "Service"
+  recordId    String // The ID of the changed record
+  operation   String // "create" | "update" | "delete"
   /// The syncVersion of the record AFTER this change
   syncVersion Int      @default(0)
   changedAt   DateTime @default(now())
@@ -1040,17 +1072,17 @@ model SyncChange {
 /// Durable server-side idempotency log.
 /// Prevents duplicate mutations from concurrent or retried requests.
 model SyncMutation {
-  id             String   @id @default(cuid())
-  idempotencyKey String   @unique
+  id             String    @id @default(cuid())
+  idempotencyKey String    @unique
   agencyId       String
   model          String
   recordId       String
-  operation      String   // "create" | "update" | "delete"
+  operation      String // "create" | "update" | "delete"
   /// SHA-256 hash of the request payload for dedup verification
   payloadHash    String
-  status         String   @default("pending") // "pending" | "completed" | "failed"
-  result         String?  // JSON-serialized result for replay
-  createdAt      DateTime @default(now())
+  status         String    @default("pending") // "pending" | "completed" | "failed"
+  result         String? // JSON-serialized result for replay
+  createdAt      DateTime  @default(now())
   processedAt    DateTime?
 
   @@index([idempotencyKey])
@@ -1061,13 +1093,37 @@ model SyncMutation {
 /// Sync cursor state — tracks the last-processed sequence per agency.
 /// Desktop stores its cursor here after successful pull application.
 model SyncCursor {
-  id              String   @id @default(cuid())
-  agencyId        String   @unique
-  lastPulledSeq   Int      @default(0)
-  lastPushedSeq   Int      @default(0)
-  lastPulledAt    DateTime?
-  lastPushedAt    DateTime?
-  updatedAt       DateTime @updatedAt
+  id            String    @id @default(cuid())
+  agencyId      String    @unique
+  lastPulledSeq Int       @default(0)
+  lastPushedSeq Int       @default(0)
+  lastPulledAt  DateTime?
+  lastPushedAt  DateTime?
+  updatedAt     DateTime  @updatedAt
 
   @@index([agencyId])
+}
+
+/// Agency local initialization state — tracks the initial sync lifecycle.
+/// Replaces ad-hoc _sync_meta key-value entries for initialization tracking.
+model AgencyLocalState {
+  id                      String   @id @default(cuid())
+  agencyId                String   @unique
+  initializationStatus    String   @default("NOT_INITIALIZED")  // NOT_INITIALIZED, INITIALIZING, READY, FAILED, UPGRADING
+  initializationSessionId String?
+  initializationStartedAt DateTime?
+  initializationCompletedAt DateTime?
+  currentStage            String?
+  currentCursor           String?
+  currentBatch            Int      @default(0)
+  recordsImported         Int      @default(0)
+  lastError               String?
+  schemaVersion           Int      @default(1)
+  syncProtocolVersion     Int      @default(2)
+  snapshotSequence        Int      @default(0)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  @@index([initializationStatus])
+  @@index([agencyId, initializationStatus])
 }

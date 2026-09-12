@@ -150,6 +150,31 @@ export function getApiBaseUrl(): string {
 // ─── Auth Token Helpers ───────────────────────────────────────────────────────
 
 /**
+ * Module-level cache for the current session token.
+ *
+ * This is set by `setSessionToken()` after a successful login and cleared by
+ * `clearSessionToken()` on logout. It avoids the timing issue where Zustand's
+ * persist middleware hasn't written to localStorage yet when the first API
+ * call after login fires.
+ */
+let _cachedSessionToken: string = '';
+
+/**
+ * Set the session token in the module-level cache.
+ * Called by the login form after a successful login.
+ */
+export function setSessionToken(token: string): void {
+  _cachedSessionToken = token;
+}
+
+/**
+ * Clear the cached session token. Called on logout.
+ */
+export function clearSessionToken(): void {
+  _cachedSessionToken = '';
+}
+
+/**
  * The key used to store the JWT session token in localStorage
  * for native (non-web) clients.
  */
@@ -196,8 +221,13 @@ export function clearNativeSessionToken(): void {
 /**
  * Build auth-related headers for the request.
  *
- * - Web: no explicit header needed; cookies are sent automatically with `credentials: 'include'`.
- * - Capacitor: reads the session token from localStorage and adds `Authorization: Bearer <token>`.
+ * - Web: Uses the session token from the module-level cache (set by
+ *   `setSessionToken()` after login) as a Bearer header. Falls back to
+ *   reading from localStorage (Zustand persist) if the cache is empty.
+ *   This is necessary because Next.js rewrites don't forward Set-Cookie
+ *   headers from the backend, so httpOnly cookie auth doesn't work through
+ *   the proxy. The Bearer token from the login response body is used instead.
+ * - Capacitor: Same as web, also reads from a dedicated localStorage key.
  */
 function buildAuthHeaders(): Record<string, string> {
   if (isServerSide()) {
@@ -212,6 +242,28 @@ function buildAuthHeaders(): Record<string, string> {
     }
   }
 
+  // ── Web: Use session token from module cache or localStorage fallback ───
+  // Priority: 1) Module-level cache (set immediately after login)
+  //           2) localStorage (Zustand persist, may have a slight delay)
+  if (_cachedSessionToken) {
+    return { Authorization: `Bearer ${_cachedSessionToken}` };
+  }
+
+  try {
+    const stored = localStorage.getItem('blasti-app');
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      const token = parsed?.state?.sessionToken;
+      if (token && typeof token === 'string' && token.length > 0) {
+        // Cache for future requests
+        _cachedSessionToken = token;
+        return { Authorization: `Bearer ${token}` };
+      }
+    }
+  } catch {
+    // localStorage not available or parse error — fall through
+  }
+
   return {};
 }
 
@@ -219,26 +271,42 @@ function buildAuthHeaders(): Record<string, string> {
 
 /**
  * Build the full request URL from a base URL, path, and optional query params.
+ *
+ * Handles paths that already contain query parameters (e.g. from apiFetch)
+ * by merging existing params with new ones instead of appending a second `?`.
  */
 function buildUrl(baseUrl: string, path: string, params?: Record<string, string>): string {
   // Ensure path starts with /
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
 
-  let url = `${baseUrl}${normalizedPath}`;
+  // Separate the path from any existing query string
+  const [pathname, existingSearch] = normalizedPath.split('?');
 
-  // Build query params — merge caller's params with platform-specific routing
-  const queryParams: Record<string, string> = { ...(params || {}) };
+  let url = `${baseUrl}${pathname}`;
+
+  // Build query params — merge existing params from path, caller's params, and
+  // platform-specific routing
+  const queryParams = new URLSearchParams(existingSearch || '');
+
+  // Merge caller's params
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      queryParams.set(key, value);
+    }
+  }
 
   // For web browser (not Capacitor/SSR): when using a relative base URL
   // (empty string), inject XTransformPort=3003 so the gateway routes API requests
-  // to the cloud API on port 3003.
+  // to the cloud API on port 3003. Note: Next.js rewrites also handle this
+  // routing when accessing the dev server directly, so this param is redundant
+  // but harmless — it's kept for Caddy gateway compatibility.
   if (!baseUrl && !isServerSide() && !isCapacitorRuntime()) {
-    queryParams.XTransformPort = '3003';
+    queryParams.set('XTransformPort', '3003');
   }
 
-  if (Object.keys(queryParams).length > 0) {
-    const searchParams = new URLSearchParams(queryParams);
-    url += `?${searchParams.toString()}`;
+  const search = queryParams.toString();
+  if (search) {
+    url += `?${search}`;
   }
 
   return url;

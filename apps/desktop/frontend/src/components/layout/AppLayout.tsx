@@ -1,6 +1,7 @@
 import { Outlet, Navigate } from 'react-router-dom';
 import { useAuth } from '@/stores/auth';
 import Sidebar from './Sidebar';
+import { Toaster } from 'sonner';
 
 export default function AppLayout() {
   const { isAuthenticated } = useAuth();
@@ -17,6 +18,7 @@ export default function AppLayout() {
           <Outlet />
         </div>
       </main>
+      <Toaster position="top-center" richColors closeButton />
     </div>
   );
 }

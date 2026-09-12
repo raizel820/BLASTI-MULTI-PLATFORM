@@ -55,6 +55,7 @@ import { qrRoutes } from './routes/qr'
 import { transactionRoutes } from './routes/transactions'
 import { uploadRoutes } from './routes/upload'
 import { syncRoutes } from './routes/sync'
+import { initialSyncRoutes } from './routes/initial-sync'
 import { settingsRoutes } from './routes/settings'
 import { paymentWebhookRoutes } from './routes/payment-webhook'
 import { paymentCheckoutRoutes } from './routes/payment-checkout'
@@ -380,6 +381,7 @@ app.route('/api/qr', qrRoutes)
 app.route('/api/transactions', transactionRoutes)
 app.route('/api/upload', uploadRoutes)
 app.route('/api/sync', syncRoutes)
+app.route('/api/sync', initialSyncRoutes)
 app.route('/api/settings', settingsRoutes)
 app.route('/api/payment/webhook', paymentWebhookRoutes)
 app.route('/api/payment', paymentCheckoutRoutes)

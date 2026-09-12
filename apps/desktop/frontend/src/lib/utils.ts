@@ -1,7 +1,8 @@
 import { clsx, type ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
 
 export function cn(...inputs: ClassValue[]) {
-  return clsx(inputs);
+  return twMerge(clsx(inputs));
 }
 
 export function formatTime(date: Date | string | null | undefined): string {
@@ -70,4 +71,32 @@ export function getStatusBgColor(status: string): string {
 
 export function generateTicketNumber(position: number): string {
   return `A-${String(position).padStart(3, '0')}`;
+}
+
+// ─── Merged from Web utils.ts ────────────────────────────────────────────────
+
+/**
+ * Get a proxied URL for accessing private storage files.
+ *
+ * Desktop adaptation: In Electron, local files are served directly from the
+ * local API server at http://127.0.0.1:3080. No Vercel/R2 proxy is needed.
+ *
+ * @param url - The original URL to potentially proxy
+ * @returns The URL to use for accessing the file
+ */
+export function getProxiedUrl(url: string | null | undefined): string {
+  if (!url) return '';
+
+  // Vercel Blob URLs — route through local API proxy
+  if (url.includes('.blob.vercel-storage.com')) {
+    return `/api/upload/proxy?url=${encodeURIComponent(url)}`;
+  }
+
+  // R2 URLs — route through local API proxy (no public R2 URL in desktop)
+  if (url.includes('.r2.cloudflarestorage.com')) {
+    return `/api/upload/proxy?url=${encodeURIComponent(url)}`;
+  }
+
+  // Local paths and other URLs — return as-is
+  return url;
 }

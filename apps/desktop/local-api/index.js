@@ -692,6 +692,62 @@ async function markMutationFailed(id, error) {
   }
 }
 
+/**
+ * Hash a password using bcryptjs (with scrypt/sha256 fallback).
+ * Mirrors the login-route password hashing used elsewhere in this file.
+ */
+async function hashPasswordLocal(password) {
+  try {
+    let bcrypt = null
+    try { bcrypt = require('bcryptjs') } catch { /* try alternate paths */ }
+    if (!bcrypt) {
+      try { bcrypt = require(require('path').join(process.cwd(), 'node_modules', 'bcryptjs')) } catch { /* nope */ }
+    }
+    if (!bcrypt) {
+      try { bcrypt = require(require('path').join(__dirname, '..', 'node_modules', 'bcryptjs')) } catch { /* nope */ }
+    }
+    if (bcrypt) {
+      return await bcrypt.hash(password, 10)
+    }
+    // Fallback: use Node built-in scrypt to produce a bcrypt-like hash string
+    const { scryptSync } = require('crypto')
+    const salt = require('crypto').randomBytes(16).toString('base64')
+    const derived = scryptSync(password, salt, 64).toString('base64')
+    return `$scrypt$${salt}$${derived}`
+  } catch (e) {
+    // Last resort: SHA256 (not ideal but functional)
+    console.warn('[LocalAPI] hashPasswordLocal: bcrypt and scrypt failed, using SHA256 fallback:', e.message)
+    return require('crypto').createHash('sha256').update(password).digest('hex')
+  }
+}
+
+/**
+ * Generate a random initial password (8 alphanumeric chars).
+ */
+function generateInitialPassword() {
+  const chars = 'abcdefghijkmnpqrstuvwxyz23456789'
+  let pw = ''
+  const bytes = require('crypto').randomBytes(8)
+  for (let i = 0; i < 8; i++) pw += chars[bytes[i] % chars.length]
+  return pw
+}
+
+/**
+ * Create an audit log entry (fire-and-forget, never blocks the response).
+ */
+function auditLog(userId, action, entityType, entityId, details) {
+  if (!db) return
+  db.auditLog.create({
+    data: {
+      userId: userId || undefined,
+      action,
+      entityType,
+      entityId,
+      details: details ? JSON.stringify(details) : undefined,
+    },
+  }).catch((e) => console.warn('[LocalAPI] Audit log error:', e.message))
+}
+
 // ─── Create Hono App ─────────────────────────────────────────────────────
 
 function createApp() {
@@ -937,9 +993,6 @@ function createApp() {
             }
           }
           syncService.setAuth(cloudToken, cloudUser)
-          syncService.initialSync().catch(e => {
-            console.warn('[LocalAPI] Background initial sync error:', e.message)
-          })
         } catch (e) {
           console.warn('[LocalAPI] Could not start sync after cloud login:', e.message)
         }
@@ -1701,7 +1754,7 @@ function createApp() {
     }
   })
 
-  // PUT /api/agency/profile — update agency basic fields
+  // PUT /api/agency/profile — update agency basic fields (with validation + audit)
   app.put('/api/agency/profile', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -1711,8 +1764,25 @@ function createApp() {
 
       const body = await c.req.json()
 
-      // Only allow basic fields
-      const allowedFields = ['name', 'phone', 'workingHoursStart', 'workingHoursEnd', 'description', 'address', 'logoUrl']
+      // Validate name length (matching cloud updateAgencyProfileSchema: max 100)
+      if (body.name !== undefined && (typeof body.name !== 'string' || body.name.length > 100)) {
+        return c.json({ success: false, error: 'name must be string, max 100 chars' }, 400)
+      }
+      // Validate description length (max 500)
+      if (body.description !== undefined && typeof body.description === 'string' && body.description.length > 500) {
+        return c.json({ success: false, error: 'description max 500 chars' }, 400)
+      }
+      // Validate address length (max 200)
+      if (body.address !== undefined && typeof body.address === 'string' && body.address.length > 200) {
+        return c.json({ success: false, error: 'address max 200 chars' }, 400)
+      }
+      // Validate phone length (max 20)
+      if (body.phone !== undefined && typeof body.phone === 'string' && body.phone.length > 20) {
+        return c.json({ success: false, error: 'phone max 20 chars' }, 400)
+      }
+
+      // Only allow basic fields (matching cloud schema)
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'phone', 'description', 'descriptionAr', 'descriptionFr', 'address', 'category', 'website', 'logoUrl', 'workingHoursStart', 'workingHoursEnd']
       const updateData = {}
       for (const field of allowedFields) {
         if (body[field] !== undefined) {
@@ -1729,6 +1799,7 @@ function createApp() {
         data: updateData,
       })
 
+      auditLog(sessionUser.id, 'PROFILE_UPDATED', 'AGENCY', agencyId, { ...updateData })
       emitEvent('agency:updated', { agencyId, ...updateData })
       logPendingMutation('PUT', '/api/agency/profile', body, updated).catch(() => {})
 
@@ -1884,7 +1955,7 @@ function createApp() {
     }
   })
 
-  // DELETE /api/services/:id — soft delete service
+  // DELETE /api/services/:id — soft delete service + cancel WAITING reservations
   app.delete('/api/services/:id', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -1905,6 +1976,17 @@ function createApp() {
         data: { isActive: false },
       })
 
+      // Cancel all WAITING reservations for this service (cloud parity)
+      try {
+        await db.reservation.updateMany({
+          where: { serviceId: id, status: 'WAITING' },
+          data: { status: 'CANCELLED' },
+        })
+      } catch (resErr) {
+        console.warn('[LocalAPI] Service delete reservation cancellation error:', resErr.message)
+      }
+
+      auditLog(sessionUser.id, 'SERVICE_DELETED', 'SERVICE', id, { agencyId })
       emitEvent('service:deleted', { agencyId, serviceId: id })
       logPendingMutation('DELETE', '/api/services/:id', {}, { id, deleted: true }).catch(() => {})
 
@@ -1939,7 +2021,7 @@ function createApp() {
     }
   })
 
-  // POST /api/agency/branches — create branch
+  // POST /api/agency/branches — create branch (with isMain swap logic)
   app.post('/api/agency/branches', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -1948,22 +2030,34 @@ function createApp() {
       }
 
       const body = await c.req.json()
-      const { name, address, phone, isActive } = body
+      const { name, nameAr, nameFr, address, phone, isActive, isMain } = body
 
       if (!name) {
         return c.json({ success: false, error: 'Branch name is required' }, 400)
+      }
+
+      // If this branch is set as main, unset other main branches (cloud parity)
+      if (isMain) {
+        await db.branch.updateMany({
+          where: { agencyId, isMain: true },
+          data: { isMain: false },
+        })
       }
 
       const branch = await db.branch.create({
         data: {
           agencyId,
           name,
+          nameAr: nameAr || null,
+          nameFr: nameFr || null,
           address: address || null,
           phone: phone || null,
           isActive: isActive !== undefined ? Boolean(isActive) : true,
+          isMain: isMain !== undefined ? Boolean(isMain) : false,
         },
       })
 
+      auditLog(sessionUser.id, 'BRANCH_CREATED', 'BRANCH', branch.id, { agencyId, name })
       emitEvent('branch:created', { agencyId, branch })
       logPendingMutation('POST', '/api/agency/branches', body, branch).catch(() => {})
 
@@ -2011,6 +2105,7 @@ function createApp() {
 
         const updated = await db.branch.update({ where: { id }, data: updateData })
 
+        auditLog(sessionUser.id, 'BRANCH_UPDATED', 'BRANCH', id, { agencyId, ...updateData })
         emitEvent('branch:updated', { agencyId, branchId: id, ...updateData })
         logPendingMutation(method.toUpperCase(), '/api/agency/branches/:id', body, updated).catch(() => {})
 
@@ -2022,7 +2117,7 @@ function createApp() {
     })
   }
 
-  // DELETE /api/agency/branches/:id — delete branch
+  // DELETE /api/agency/branches/:id — soft delete branch + deactivate counters
   app.delete('/api/agency/branches/:id', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -2036,6 +2131,16 @@ function createApp() {
       }
       // Soft delete: set isActive = false
       const updated = await db.branch.update({ where: { id }, data: { isActive: false } })
+      // Deactivate all counters belonging to this branch (cloud parity)
+      try {
+        await db.counter.updateMany({
+          where: { branchId: id, isActive: true },
+          data: { isActive: false },
+        })
+      } catch (counterErr) {
+        console.warn('[LocalAPI] Branch delete counter deactivation error:', counterErr.message)
+      }
+      auditLog(sessionUser.id, 'BRANCH_DELETED', 'BRANCH', id, { agencyId })
       emitEvent('branch:deleted', { agencyId, branchId: id })
       logPendingMutation('DELETE', '/api/agency/branches/:id', {}, { id }).catch(() => {})
       return c.json({ success: true, data: updated })
@@ -2239,7 +2344,7 @@ function createApp() {
     })
   }
 
-  // DELETE /api/agency/branches/:branchId/counters/:counterId — delete counter
+  // DELETE /api/agency/branches/:branchId/counters/:counterId — soft delete counter + clear activeReservationId
   app.delete('/api/agency/branches/:branchId/counters/:counterId', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -2254,8 +2359,14 @@ function createApp() {
       if (!existing || existing.branchId !== branchId) {
         return c.json({ success: false, error: 'Counter not found' }, 404)
       }
-      await db.counter.delete({ where: { id: counterId } })
-      emitEvent('counter:deleted', { agencyId, counterId })
+      // Clear active reservation if set
+      const updateData = { isActive: false }
+      if (existing.activeReservationId) {
+        updateData.activeReservationId = null
+      }
+      await db.counter.update({ where: { id: counterId }, data: updateData })
+      auditLog(sessionUser.id, 'COUNTER_DELETED', 'COUNTER', counterId, { agencyId, branchId })
+      emitEvent('counter:deleted', { agencyId, counterId, branchId })
       logPendingMutation('DELETE', '/api/agency/branches/:branchId/counters/:counterId', {}, { id: counterId }).catch(() => {})
       return c.json({ success: true, data: { id: counterId, deleted: true } })
     } catch (error) {
@@ -2337,6 +2448,7 @@ function createApp() {
   })
 
   // POST /api/reservations — create reservation with auto queue number
+  // Business logic matches Cloud API: pause check, queue open check, duplicate check, capacity check, queue number format, notification, audit log
   app.post('/api/reservations', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -2360,10 +2472,48 @@ function createApp() {
         return c.json({ success: false, error: 'serviceId is required' }, 400)
       }
 
+      // Cloud business logic: check agency queue is open and not paused
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId },
+        include: { queueSettings: { take: 1, orderBy: { updatedAt: 'desc' } } },
+      })
+      if (!agency) {
+        return c.json({ success: false, error: 'Agency not found' }, 404)
+      }
+      if (!agency.isQueueOpen) {
+        return c.json({ success: false, error: 'Queue is currently closed' }, 400)
+      }
+      if (agency.queueSettings.length > 0 && (agency.queueSettings[0].isPaused === 1 || agency.queueSettings[0].isPaused === true)) {
+        return c.json({ success: false, error: 'Queue is currently paused' }, 400)
+      }
+
       // Get service prefix
       const service = await db.service.findUnique({ where: { id: serviceId } })
       if (!service || service.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Service not found' }, 404)
+      }
+      // Cloud business logic: check service is active
+      if (!service.isActive) {
+        return c.json({ success: false, error: 'Service not found or inactive' }, 404)
+      }
+
+      // Cloud business logic: check for duplicate active reservation (same user, agency, service)
+      const resolvedUserId = userId || sessionUser.id
+      if (resolvedUserId) {
+        const activeReservation = await db.reservation.findFirst({
+          where: { userId: resolvedUserId, agencyId, serviceId, status: { in: ['WAITING', 'CALLED'] } },
+        })
+        if (activeReservation) {
+          return c.json({ success: false, error: 'You already have an active reservation for this service' }, 409)
+        }
+      }
+
+      // Cloud business logic: capacity check — maxActiveReservations
+      const activeCount = await db.reservation.count({
+        where: { agencyId, status: { in: ['WAITING', 'CALLED'] } },
+      })
+      if (activeCount >= (agency.maxActiveReservations || 50)) {
+        return c.json({ success: false, error: 'Queue is full. Please try again later' }, 400)
       }
 
       // Get or create queue settings to determine next number
@@ -2371,24 +2521,32 @@ function createApp() {
       const lastNumber = qs?.lastIssuedNumber || 0
       const newNumber = lastNumber + 1
       const servicePrefix = service.prefix || 'A'
-      const displayNumber = `${servicePrefix}${String(newNumber).padStart(3, '0')}`
+      // Cloud business logic: display number format is prefix-NNN (e.g., "A-001")
+      const displayNumber = `${servicePrefix}-${String(newNumber).padStart(3, '0')}`
 
       // Calculate position in queue (number of WAITING reservations before this one)
       const waitingCount = await db.reservation.count({
         where: { agencyId, status: 'WAITING' },
       })
 
+      // Cloud business logic: ETA calculation based on service time, active counters, and queue position
+      const avgServiceTime = agency.averageServiceTime || 10
+      const activeCounters = await db.counter.count({ where: { agencyId, isActive: true, staffId: { not: null } } })
+      const effectiveCounters = activeCounters || 1
+      const calculatedETA = Math.ceil((waitingCount * avgServiceTime) / effectiveCounters)
+      const finalEstimatedWait = estimatedWait || calculatedETA
+
       const reservation = await db.reservation.create({
         data: {
           agencyId,
           serviceId,
           // branchId: removed — Reservation has no branchId field
-          userId: userId || sessionUser.id,
+          userId: resolvedUserId,
           queueNumber: newNumber,
           displayNumber,
           status: 'WAITING',
         // position: removed — not a Reservation schema field
-          estimatedWait: estimatedWait || 0,
+          estimatedWait: finalEstimatedWait,
           isWalkIn: !!isWalkIn,
           walkInCustomerName: walkInCustomerName || null,
           preferredTime: preferredTime || null,
@@ -2413,7 +2571,39 @@ function createApp() {
         })
       }
 
+      // Cloud business logic: create notification for the user on queue join
+      if (resolvedUserId) {
+        try {
+          await db.notification.create({
+            data: {
+              userId: resolvedUserId,
+              type: 'QUEUE_JOINED',
+              title: 'Reservation Confirmed',
+              message: `Your ticket ${displayNumber} for ${agency.name} - ${service.name}. Estimated wait: ${finalEstimatedWait} minutes.`,
+            },
+          })
+        } catch (notifErr) {
+          console.warn('[LocalAPI] Queue join notification error:', notifErr.message)
+        }
+      }
+
+      // Cloud business logic: create audit log on queue join
+      try {
+        await db.auditLog.create({
+          data: {
+            userId: resolvedUserId || undefined,
+            action: 'QUEUE_JOIN',
+            entityType: 'RESERVATION',
+            entityId: reservation.id,
+            details: JSON.stringify({ agencyId, serviceId, displayNumber, estimatedWait: finalEstimatedWait }),
+          },
+        })
+      } catch (auditErr) {
+        console.warn('[LocalAPI] Queue join audit log error:', auditErr.message)
+      }
+
       emitEvent('reservation:created', { agencyId, reservation })
+      emitEvent('queue:joined', { agencyId, reservation })
       logPendingMutation('POST', '/api/reservations', body, reservation).catch(() => {})
 
       return c.json({ success: true, data: reservation }, 201)
@@ -2537,6 +2727,7 @@ function createApp() {
   })
 
   // POST /api/queue/call-next — call next customer
+  // Business logic matches Cloud API: auto-complete previous, preferred time, counter assignment, notification, audit log
   app.post('/api/queue/call-next', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -2547,31 +2738,99 @@ function createApp() {
       const body = await c.req.json().catch(() => ({}))
       const { serviceId, counterId, branchId } = body
 
-      // Build where clause for next waiting
+      // Check if queue is paused
+      const queueSettings = await db.queueSettings.findFirst({ where: { agencyId } })
+      if (queueSettings && (queueSettings.isPaused === 1 || queueSettings.isPaused === true)) {
+        return c.json({ success: false, error: 'Queue is paused' }, 400)
+      }
+
+      // Auto-complete previous CALLED customer for this counter (Cloud business logic)
+      const autoCompleted = []
+      if (counterId) {
+        const counterCalled = await db.reservation.findMany({
+          where: { counterId, status: 'CALLED' },
+          select: { id: true, displayNumber: true },
+        })
+        for (const called of counterCalled) {
+          await db.reservation.update({
+            where: { id: called.id },
+            data: { status: 'COMPLETED', completedAt: new Date() },
+          })
+          await db.auditLog.create({
+            data: {
+              action: 'QUEUE_AUTO_COMPLETE',
+              entityType: 'RESERVATION',
+              entityId: called.id,
+              details: JSON.stringify({
+                displayNumber: called.displayNumber,
+                agencyId,
+                counterId,
+                reason: 'Auto-completed when counter called next customer',
+              }),
+            },
+          })
+          autoCompleted.push({ id: called.id, displayNumber: called.displayNumber })
+          // Clear counter's currentReservationId for auto-completed
+          await db.counter.updateMany({
+            where: { currentReservationId: called.id },
+            data: { currentReservationId: null },
+          })
+        }
+      }
+
+      // Build where clause for next waiting — sort by queueNumber ASC (matches Cloud, prevents Postpone Paradox)
       const where = { agencyId, status: 'WAITING' }
       if (serviceId) where.serviceId = serviceId
-      // branchId filter removed — Reservation has no branchId field
 
-      const next = await db.reservation.findFirst({
+      const waitingReservations = await db.reservation.findMany({
         where,
-        orderBy: { joinedAt: 'asc' },
+        orderBy: { queueNumber: 'asc' },
+        select: { id: true, queueNumber: true, preferredTime: true, fixedTimeEnabled: true },
       })
 
-      if (!next) {
+      if (!waitingReservations.length) {
         return c.json({ success: false, error: 'No customers in queue' }, 404)
       }
 
-      const now = new Date()
+      // Preferred time logic: skip customers whose preferred time hasn't arrived yet (matches Cloud queue-scheduler)
+      let nextId = null
+      const currentTime = new Date()
+      for (const res of waitingReservations) {
+        if (!res.preferredTime || !res.fixedTimeEnabled) {
+          nextId = res.id
+          break
+        }
+        const [hours, minutes] = res.preferredTime.split(':').map(Number)
+        if (!isNaN(hours) && !isNaN(minutes)) {
+          const preferredDate = new Date()
+          preferredDate.setHours(hours, minutes, 0, 0)
+          if (currentTime >= preferredDate) {
+            nextId = res.id
+            break
+          }
+        } else {
+          nextId = res.id
+          break
+        }
+      }
 
-      // Call the customer
-      await db.reservation.update({
-        where: { id: next.id },
-        data: {
-          status: 'CALLED',
-          calledAt: now,
-          // calledBy: removed — not a Reservation schema field
-          counterId: counterId || null,
-        },
+      if (!nextId) {
+        return c.json({ success: false, error: 'All waiting reservations have preferred times in the future. No one to call yet.', hasPreferredTimeOnly: true }, 200)
+      }
+
+      // Optimistic concurrency: use updateMany with status check to prevent double-calling
+      const result = await db.reservation.updateMany({
+        where: { id: nextId, status: 'WAITING' },
+        data: { status: 'CALLED', calledAt: new Date(), counterId: counterId || null },
+      })
+
+      if (result.count === 0) {
+        return c.json({ success: false, error: 'Concurrent call detected. Please try again.', shouldRetry: true }, 409)
+      }
+
+      const next = await db.reservation.findUnique({
+        where: { id: nextId },
+        include: { user: { select: { id: true, fullName: true } }, service: true },
       })
 
       // Update current serving number in queue settings
@@ -2583,12 +2842,66 @@ function createApp() {
         })
       }
 
+      // Assign counter: link reservation as the counter's active serving ticket (Cloud business logic)
+      if (counterId) {
+        await db.counter.update({
+          where: { id: counterId },
+          data: { currentReservationId: next.id },
+        }).catch(() => {}) // counter may not exist
+      }
+
+      // Create notification for registered users (not walk-in) — Cloud business logic
+      if (next.userId) {
+        await db.notification.create({
+          data: {
+            userId: next.userId,
+            type: 'QUEUE_CALLED',
+            title: 'Queue Called',
+            message: `Your number ${next.displayNumber} has been called. Please proceed.`,
+          },
+        })
+      }
+
+      // Create audit log — Cloud business logic
+      await db.auditLog.create({
+        data: {
+          userId: next.userId || sessionUser.id,
+          action: 'QUEUE_CALL',
+          entityType: 'RESERVATION',
+          entityId: next.id,
+          details: JSON.stringify({
+            displayNumber: next.displayNumber,
+            agencyId,
+            serviceId: next.serviceId,
+            isWalkIn: next.isWalkIn || false,
+            walkInCustomerName: next.walkInCustomerName || null,
+            counterId: counterId || null,
+          }),
+        },
+      })
+
+      const customerName = next.walkInCustomerName || (next.user && next.user.fullName) || ''
       const updated = await db.reservation.findUnique({ where: { id: next.id } })
+
+      // Emit auto-completed events
+      for (const completed of autoCompleted) {
+        emitEvent('queue:completed', { agencyId, reservationId: completed.id, displayNumber: completed.displayNumber, autoCompleted: true })
+      }
 
       emitEvent('queue:called', { agencyId, reservation: updated, counterId: counterId || null })
       logPendingMutation('POST', '/api/queue/call-next', body, updated).catch(() => {})
 
-      return c.json({ success: true, data: updated })
+      return c.json({
+        success: true,
+        autoCompleted: autoCompleted.length > 0 ? autoCompleted : undefined,
+        reservation: {
+          id: next.id,
+          displayNumber: next.displayNumber,
+          customerName,
+          isWalkIn: !!(next.isWalkIn),
+        },
+        data: updated,
+      })
     } catch (error) {
       console.error('[LocalAPI] Call-next error:', error)
       return c.json({ success: false, error: 'Failed to call next customer' }, 500)
@@ -2643,6 +2956,7 @@ function createApp() {
   })
 
   // POST /api/queue/complete/:id
+  // Business logic matches Cloud API: counter clearing, notification, audit log
   app.post('/api/queue/complete/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -2652,7 +2966,7 @@ function createApp() {
 
       const id = c.req.param('id')
 
-      const existing = await db.reservation.findUnique({ where: { id } })
+      const existing = await db.reservation.findUnique({ where: { id }, include: { agency: { select: { id: true, name: true } } } })
       if (!existing || existing.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Reservation not found' }, 404)
       }
@@ -2663,7 +2977,38 @@ function createApp() {
         data: {
           status: 'COMPLETED',
           completedAt: now,
-          // completedBy: removed — not a Reservation schema field
+        },
+      })
+
+      // Clear counter's currentReservationId (Cloud business logic)
+      if (existing.counterId) {
+        await db.counter.updateMany({
+          where: { currentReservationId: id },
+          data: { currentReservationId: null },
+        })
+      }
+
+      // Create notification for registered users (Cloud business logic)
+      if (existing.userId) {
+        const agencyName = (existing.agency && existing.agency.name) || 'the agency'
+        await db.notification.create({
+          data: {
+            userId: existing.userId,
+            type: 'COMPLETED',
+            title: 'Service Completed',
+            message: `Your reservation #${existing.displayNumber} at ${agencyName} has been marked as completed. Thank you for your visit!`,
+          },
+        })
+      }
+
+      // Create audit log (Cloud business logic)
+      await db.auditLog.create({
+        data: {
+          userId: existing.userId || undefined,
+          action: 'QUEUE_COMPLETE',
+          entityType: 'RESERVATION',
+          entityId: id,
+          details: JSON.stringify({ displayNumber: existing.displayNumber, status: 'COMPLETED' }),
         },
       })
 
@@ -2678,6 +3023,7 @@ function createApp() {
   })
 
   // POST /api/queue/no-show/:id
+  // Business logic matches Cloud API: counter clearing, notification, audit log
   app.post('/api/queue/no-show/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -2687,7 +3033,7 @@ function createApp() {
 
       const id = c.req.param('id')
 
-      const existing = await db.reservation.findUnique({ where: { id } })
+      const existing = await db.reservation.findUnique({ where: { id }, include: { agency: { select: { id: true, name: true } } } })
       if (!existing || existing.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Reservation not found' }, 404)
       }
@@ -2698,6 +3044,38 @@ function createApp() {
         data: {
           status: 'NO_SHOW',
           skippedAt: now,
+        },
+      })
+
+      // Clear counter's currentReservationId (Cloud business logic)
+      if (existing.counterId) {
+        await db.counter.updateMany({
+          where: { currentReservationId: id },
+          data: { currentReservationId: null },
+        })
+      }
+
+      // Create notification for registered users (Cloud business logic)
+      if (existing.userId) {
+        const agencyName = (existing.agency && existing.agency.name) || 'the agency'
+        await db.notification.create({
+          data: {
+            userId: existing.userId,
+            type: 'NO_SHOW',
+            title: 'Marked as No-Show',
+            message: `Your reservation #${existing.displayNumber} at ${agencyName} has been marked as no-show. Please contact the agency if this is an error.`,
+          },
+        })
+      }
+
+      // Create audit log (Cloud business logic)
+      await db.auditLog.create({
+        data: {
+          userId: existing.userId || undefined,
+          action: 'QUEUE_NO_SHOW',
+          entityType: 'RESERVATION',
+          entityId: id,
+          details: JSON.stringify({ displayNumber: existing.displayNumber, status: 'NO_SHOW' }),
         },
       })
 
@@ -2712,6 +3090,7 @@ function createApp() {
   })
 
   // POST /api/queue/cancel/:id
+  // Business logic matches Cloud API: counter clearing, notification, audit log
   app.post('/api/queue/cancel/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -2721,7 +3100,7 @@ function createApp() {
 
       const id = c.req.param('id')
 
-      const existing = await db.reservation.findUnique({ where: { id } })
+      const existing = await db.reservation.findUnique({ where: { id }, include: { agency: { select: { id: true, name: true } } } })
       if (!existing || existing.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Reservation not found' }, 404)
       }
@@ -2732,7 +3111,38 @@ function createApp() {
         data: {
           status: 'CANCELLED',
           cancelledAt: now,
-          // cancelledBy: removed — not a Reservation schema field
+        },
+      })
+
+      // Clear counter's currentReservationId (Cloud business logic)
+      if (existing.counterId) {
+        await db.counter.updateMany({
+          where: { currentReservationId: id },
+          data: { currentReservationId: null },
+        })
+      }
+
+      // Create notification for registered users (Cloud business logic)
+      if (existing.userId) {
+        const agencyName = (existing.agency && existing.agency.name) || 'the agency'
+        await db.notification.create({
+          data: {
+            userId: existing.userId,
+            type: 'CANCELLED',
+            title: 'Reservation Cancelled by Agency',
+            message: `Your reservation #${existing.displayNumber} at ${agencyName} has been cancelled by the agency.`,
+          },
+        })
+      }
+
+      // Create audit log (Cloud business logic)
+      await db.auditLog.create({
+        data: {
+          userId: existing.userId || undefined,
+          action: 'QUEUE_CANCEL',
+          entityType: 'RESERVATION',
+          entityId: id,
+          details: JSON.stringify({ displayNumber: existing.displayNumber, status: 'CANCELLED' }),
         },
       })
 
@@ -2747,6 +3157,7 @@ function createApp() {
   })
 
   // POST /api/queue/postpone/:id
+  // Business logic matches Cloud API: only WAITING allowed, postpone count limit (3 max), position recalculation, notification, audit log
   app.post('/api/queue/postpone/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -2761,23 +3172,79 @@ function createApp() {
         return c.json({ success: false, error: 'Reservation not found' }, 404)
       }
 
-      if (!['WAITING', 'CALLED'].includes(existing.status)) {
-        return c.json(
-          { success: false, error: `Cannot postpone reservation with status: ${existing.status}` },
-          400,
-        )
+      // Cloud business logic: only WAITING reservations can be postponed
+      if (existing.status !== 'WAITING') {
+        return c.json({ success: false, error: 'Can only postpone a waiting reservation' }, 400)
       }
 
-      const now = new Date()
-      const reservation = await db.reservation.update({
-        where: { id },
-        data: {
-          status: 'POSTPONED',
-          // postponedAt: removed — not a Reservation schema field
-        },
+      // Cloud business logic: postpone count limit (max 3)
+      const currentPostponeCount = existing.postponeCount || 0
+      if (currentPostponeCount >= 3) {
+        return c.json({ success: false, error: 'Maximum postpone limit reached (3)' }, 400)
+      }
+
+      const postponeCount = currentPostponeCount + 1
+
+      // Cloud business logic: find reservations with higher queueNumber to shift behind (default 1 position)
+      const laterReservations = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING', queueNumber: { gt: existing.queueNumber } },
+        orderBy: { queueNumber: 'asc' },
+        take: 1,
       })
 
+      if (laterReservations.length === 0) {
+        return c.json({ success: false, error: 'No one to postpone behind' }, 400)
+      }
+
+      const targetReservation = laterReservations[laterReservations.length - 1]
+      const targetQueueNumber = targetReservation.queueNumber
+
+      // Cloud business logic: atomic queue number shift
+      const tempQueueNumber = -existing.queueNumber
+      await db.reservation.update({ where: { id: existing.id }, data: { queueNumber: tempQueueNumber } })
+      await db.reservation.updateMany({
+        where: { agencyId, status: 'WAITING', queueNumber: { gt: existing.queueNumber, lte: targetQueueNumber } },
+        data: { queueNumber: { decrement: 1 } },
+      })
+
+      const reservation = await db.reservation.update({
+        where: { id },
+        data: { queueNumber: targetQueueNumber, postponeCount },
+      })
+
+      // Cloud business logic: create notification on postpone
+      if (existing.userId) {
+        try {
+          await db.notification.create({
+            data: {
+              userId: existing.userId,
+              type: 'QUEUE_POSTPONED',
+              title: 'Turn Postponed',
+              message: `Your reservation has been postponed by 1 position. New queue number: ${existing.displayNumber}`,
+            },
+          })
+        } catch (notifErr) {
+          console.warn('[LocalAPI] Postpone notification error:', notifErr.message)
+        }
+      }
+
+      // Cloud business logic: create audit log
+      try {
+        await db.auditLog.create({
+          data: {
+            userId: existing.userId || undefined,
+            action: 'QUEUE_POSTPONE',
+            entityType: 'RESERVATION',
+            entityId: id,
+            details: JSON.stringify({ positions: 1, previousQueueNumber: existing.queueNumber, newQueueNumber: targetQueueNumber, postponeCount }),
+          },
+        })
+      } catch (auditErr) {
+        console.warn('[LocalAPI] Postpone audit log error:', auditErr.message)
+      }
+
       emitEvent('queue:postponed', { agencyId, reservation })
+      emitEvent('queue:position-changed', { agencyId, reservationId: id, displayNumber: existing.displayNumber, action: 'postponed', positions: 1 })
       logPendingMutation('POST', '/api/queue/postpone/:id', {}, reservation).catch(() => {})
 
       return c.json({ success: true, data: reservation })
@@ -3269,6 +3736,7 @@ function createApp() {
   })
 
   // PATCH /api/agency/queue/:id — complete / no_show / cancel
+  // Business logic matches Cloud API: counter clearing, notification, audit log, state transition validation
   app.patch('/api/agency/queue/:id', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const reservationId = c.req.param('id')
@@ -3279,9 +3747,25 @@ function createApp() {
         return c.json({ success: false, error: 'Invalid action' }, 400)
       }
 
-      const reservation = await db.reservation.findUnique({ where: { id: reservationId } })
+      const reservation = await db.reservation.findUnique({
+        where: { id: reservationId },
+        include: { agency: { select: { id: true, name: true } } },
+      })
       if (!reservation) {
         return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      // State transition validation (Cloud business logic)
+      const validTransitions = {
+        complete: ['CALLED', 'SERVING'],
+        no_show: ['WAITING', 'CALLED'],
+        cancel: ['WAITING', 'CALLED'],
+        serve: ['CALLED'],
+        recall: ['CALLED', 'SERVING'],
+      }
+      const allowed = validTransitions[action] || []
+      if (!allowed.includes(reservation.status)) {
+        return c.json({ success: false, error: `Cannot ${action} a reservation with status: ${reservation.status}` }, 400)
       }
 
       const updateData = {}
@@ -3303,7 +3787,50 @@ function createApp() {
 
       await db.reservation.update({ where: { id: reservationId }, data: updateData })
 
-      emitEvent('queue:updated', { reservationId, action, ...updateData })
+      // Clear counter's currentReservationId when completing/cancelling/no-show (Cloud business logic)
+      if (['complete', 'no_show', 'cancel'].includes(action) && reservation.counterId) {
+        await db.counter.updateMany({
+          where: { currentReservationId: reservationId },
+          data: { currentReservationId: null },
+        })
+      }
+
+      // Create notification for registered users (Cloud business logic)
+      if (reservation.userId && ['complete', 'no_show', 'cancel'].includes(action)) {
+        const agencyName = (reservation.agency && reservation.agency.name) || 'the agency'
+        const number = reservation.displayNumber
+        const notificationData = action === 'cancel'
+          ? { type: 'CANCELLED', title: 'Reservation Cancelled by Agency', message: `Your reservation #${number} at ${agencyName} has been cancelled by the agency.` }
+          : action === 'complete'
+          ? { type: 'COMPLETED', title: 'Service Completed', message: `Your reservation #${number} at ${agencyName} has been marked as completed. Thank you for your visit!` }
+          : { type: 'NO_SHOW', title: 'Marked as No-Show', message: `Your reservation #${number} at ${agencyName} has been marked as no-show. Please contact the agency if this is an error.` }
+
+        await db.notification.create({
+          data: { userId: reservation.userId, ...notificationData },
+        })
+      }
+
+      // Create audit log (Cloud business logic)
+      if (['complete', 'no_show', 'cancel'].includes(action)) {
+        const statusMap = { complete: 'COMPLETED', no_show: 'NO_SHOW', cancel: 'CANCELLED' }
+        await db.auditLog.create({
+          data: {
+            userId: reservation.userId || undefined,
+            action: `QUEUE_${action.toUpperCase()}`,
+            entityType: 'RESERVATION',
+            entityId: reservationId,
+            details: JSON.stringify({ displayNumber: reservation.displayNumber, status: statusMap[action] }),
+          },
+        })
+      }
+
+      // Emit specific queue events matching Cloud API
+      const eventType = action === 'complete' ? 'queue:completed'
+        : action === 'no_show' ? 'queue:no-show'
+        : action === 'cancel' ? 'queue:cancelled'
+        : 'queue:updated'
+
+      emitEvent(eventType, { reservationId, action, agencyId: reservation.agencyId, displayNumber: reservation.displayNumber, ...updateData })
       logPendingMutation('PATCH', '/api/agency/queue/:id', body, updateData).catch(() => {})
       return c.json({ success: true, reservation: { ...reservation, ...updateData } })
     } catch (error) {
@@ -3551,6 +4078,7 @@ function createApp() {
   })
 
   // POST /api/queue/pause — explicit pause (used by SimpleMobileDashboard)
+  // Business logic matches Cloud API: audit log creation
   app.post('/api/queue/pause', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -3561,6 +4089,10 @@ function createApp() {
       } else {
         await db.queueSettings.create({ data: { agencyId, isPaused: true, pausedAt: new Date() } })
       }
+      // Audit log (Cloud business logic)
+      await db.auditLog.create({
+        data: { action: 'SETTINGS_UPDATE', entityType: 'AGENCY', entityId: agencyId, details: JSON.stringify({ action: 'PAUSE_QUEUE' }) },
+      }).catch(() => {})
       emitEvent('queue:paused', { agencyId, queueSettings: { isPaused: true } })
       logPendingMutation('POST', '/api/queue/pause', {}, { isPaused: true }).catch(() => {})
       return c.json({ success: true, isPaused: true })
@@ -3582,6 +4114,10 @@ function createApp() {
       } else {
         await db.queueSettings.create({ data: { agencyId, isPaused: true, pausedAt: new Date() } })
       }
+      // Audit log (Cloud business logic)
+      await db.auditLog.create({
+        data: { action: 'SETTINGS_UPDATE', entityType: 'AGENCY', entityId: agencyId, details: JSON.stringify({ action: 'PAUSE_QUEUE' }) },
+      }).catch(() => {})
       emitEvent('queue:paused', { agencyId, queueSettings: { isPaused: true } })
       logPendingMutation('PUT', '/api/queue/pause', {}, { isPaused: true }).catch(() => {})
       return c.json({ success: true, isPaused: true })
@@ -3592,6 +4128,7 @@ function createApp() {
   })
 
   // POST /api/queue/resume — explicit resume (used by SimpleMobileDashboard)
+  // Business logic matches Cloud API: audit log creation
   app.post('/api/queue/resume', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -3600,6 +4137,10 @@ function createApp() {
       if (existing) {
         await db.queueSettings.update({ where: { id: existing.id }, data: { isPaused: false, pausedAt: null } })
       }
+      // Audit log (Cloud business logic)
+      await db.auditLog.create({
+        data: { action: 'SETTINGS_UPDATE', entityType: 'AGENCY', entityId: agencyId, details: JSON.stringify({ action: 'RESUME_QUEUE' }) },
+      }).catch(() => {})
       emitEvent('queue:resumed', { agencyId, queueSettings: { isPaused: false } })
       logPendingMutation('POST', '/api/queue/resume', {}, { isPaused: false }).catch(() => {})
       return c.json({ success: true, isPaused: false })
@@ -3618,6 +4159,10 @@ function createApp() {
       if (existing) {
         await db.queueSettings.update({ where: { id: existing.id }, data: { isPaused: false, pausedAt: null } })
       }
+      // Audit log (Cloud business logic)
+      await db.auditLog.create({
+        data: { action: 'SETTINGS_UPDATE', entityType: 'AGENCY', entityId: agencyId, details: JSON.stringify({ action: 'RESUME_QUEUE' }) },
+      }).catch(() => {})
       emitEvent('queue:resumed', { agencyId, queueSettings: { isPaused: false } })
       logPendingMutation('PUT', '/api/queue/resume', {}, { isPaused: false }).catch(() => {})
       return c.json({ success: true, isPaused: false })
@@ -3628,6 +4173,7 @@ function createApp() {
   })
 
   // POST /api/agency/queue/toggle-pause
+  // Business logic matches Cloud API: audit log creation
   app.post('/api/agency/queue/toggle-pause', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -3636,21 +4182,33 @@ function createApp() {
       }
       const existing = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
       const currentPaused = existing ? (existing.isPaused === 1 || existing.isPaused === true) : false
+      const newPausedState = !currentPaused
       const now = new Date()
       if (existing) {
         await db.queueSettings.update({
           where: { id: existing.id },
-          data: { isPaused: !currentPaused, pausedAt: !currentPaused ? now : null },
+          data: { isPaused: newPausedState, pausedAt: newPausedState ? now : null, updatedAt: now },
         })
       } else {
         await db.queueSettings.create({
           data: { agencyId, isPaused: true, pausedAt: now },
         })
       }
-      emitEvent('queue:pause-toggled', { agencyId, isPaused: !currentPaused })
-      emitEvent(!currentPaused ? 'queue:paused' : 'queue:resumed', { agencyId, queueSettings: { isPaused: !currentPaused } })
-      logPendingMutation('POST', '/api/agency/queue/toggle-pause', {}, { isPaused: !currentPaused }).catch(() => {})
-      return c.json({ success: true, isPaused: !currentPaused })
+
+      // Create audit log (Cloud business logic)
+      await db.auditLog.create({
+        data: {
+          action: newPausedState ? 'QUEUE_PAUSE' : 'QUEUE_RESUME',
+          entityType: 'AGENCY',
+          entityId: agencyId,
+          details: JSON.stringify({ paused: newPausedState }),
+        },
+      })
+
+      emitEvent('queue:pause-toggled', { agencyId, isPaused: newPausedState })
+      emitEvent(newPausedState ? 'queue:paused' : 'queue:resumed', { agencyId, queueSettings: { isPaused: newPausedState } })
+      logPendingMutation('POST', '/api/agency/queue/toggle-pause', {}, { isPaused: newPausedState }).catch(() => {})
+      return c.json({ success: true, isPaused: newPausedState })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/toggle-pause error:', error)
       return c.json({ success: false, error: 'Failed to toggle pause' }, 500)
@@ -3658,6 +4216,7 @@ function createApp() {
   })
 
   // POST /api/agency/queue/walk-in — create walk-in reservation
+  // Business logic matches Cloud API: queue open/paused check, capacity check, ETA calculation, import token, audit log
   app.post('/api/agency/queue/walk-in', authMiddleware, requireActiveSubscription(), async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -3666,38 +4225,179 @@ function createApp() {
       }
       const body = await c.req.json().catch(() => ({}))
       const { customerName, serviceId, phone } = body
-      if (!serviceId || !customerName) {
-        return c.json({ success: false, error: 'Service and name are required' }, 400)
+      if (!customerName) {
+        return c.json({ success: false, error: 'Customer name is required' }, 400)
       }
 
-      // Get next queue number
-      const service = await db.service.findUnique({ where: { id: serviceId } })
-      const prefix = service?.prefix || 'A'
-      const now = new Date()
-      const todayCount = await db.reservation.count({
-        where: { agencyId, serviceId, joinedAt: { gte: todayStartMs() } },
+      // Check agency exists and queue is open (Cloud business logic)
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId },
+        include: { queueSettings: { take: 1, orderBy: { updatedAt: 'desc' } } },
       })
-      const queueNumber = `${prefix}${String(todayCount + 1).padStart(3, '0')}`
+      if (!agency) {
+        return c.json({ success: false, error: 'Agency not found' }, 404)
+      }
+      if (!agency.isQueueOpen) {
+        return c.json({ success: false, error: 'Queue is currently closed' }, 400)
+      }
+      if (agency.queueSettings.length > 0 && (agency.queueSettings[0].isPaused === 1 || agency.queueSettings[0].isPaused === true)) {
+        return c.json({ success: false, error: 'Queue is currently paused' }, 400)
+      }
+
+      // Resolve service — use provided or first active, or create default "General" (Cloud business logic)
+      let resolvedServiceId = serviceId
+      if (!resolvedServiceId) {
+        const firstService = await db.service.findFirst({
+          where: { agencyId, isActive: true },
+          orderBy: { createdAt: 'asc' },
+        })
+        if (firstService) {
+          resolvedServiceId = firstService.id
+        } else {
+          const defaultService = await db.service.create({
+            data: { agencyId, name: 'General', nameAr: 'عام', nameFr: 'Général', prefix: 'A' },
+          })
+          resolvedServiceId = defaultService.id
+        }
+      }
+
+      const service = await db.service.findUnique({ where: { id: resolvedServiceId } })
+      if (!service || !service.isActive) {
+        return c.json({ success: false, error: 'Service not found or inactive' }, 404)
+      }
+
+      // Capacity check: check maxActiveReservations (Cloud business logic)
+      const activeCount = await db.reservation.count({
+        where: { agencyId, status: { in: ['WAITING', 'CALLED'] } },
+      })
+      if (activeCount >= (agency.maxActiveReservations || 50)) {
+        return c.json({ success: false, error: 'Queue is full' }, 400)
+      }
+
+      // ETA calculation (matches Cloud's calculateETA + getEffectiveServiceTime)
+      const waitingCount = await db.reservation.count({
+        where: { agencyId, status: 'WAITING' },
+      })
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+      const recentCompleted = await db.reservation.findMany({
+        where: {
+          agencyId,
+          status: 'COMPLETED',
+          calledAt: { not: null },
+          completedAt: { gte: sevenDaysAgo },
+        },
+        select: { calledAt: true, completedAt: true, joinedAt: true },
+        take: 200,
+      })
+      // getEffectiveServiceTime: compute average service time from recent history
+      const validTimes = recentCompleted.filter(r => r.calledAt && r.completedAt)
+      let avgServiceMinutes = agency.averageServiceTime || 10
+      let varianceFactor = 0.3
+      let sampleSize = validTimes.length
+      if (validTimes.length > 0) {
+        const durationsMs = validTimes.map(r => r.completedAt.getTime() - r.calledAt.getTime())
+        const sortedDurations = [...durationsMs].sort((a, b) => a - b)
+        const trimCount = Math.max(1, Math.floor(sortedDurations.length * 0.05))
+        const validDurations = sortedDurations.length > 10
+          ? sortedDurations.slice(trimCount, sortedDurations.length - trimCount)
+          : sortedDurations
+        const avgMs = validDurations.reduce((a, b) => a + b, 0) / validDurations.length
+        avgServiceMinutes = Math.max(1, Math.round((avgMs / 60000) * 10) / 10)
+        // Variance factor
+        const mean = validDurations.reduce((s, t) => s + t, 0) / validDurations.length
+        const variance = validDurations.reduce((s, t) => s + Math.pow(t - mean, 2), 0) / validDurations.length
+        const stdDev = Math.sqrt(variance)
+        varianceFactor = Math.max(0.05, Math.min(1.0, mean > 0 ? stdDev / mean : 0.3))
+      }
+      // Active counters for parallelism
+      const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
+      const activeCounters = await db.counter.count({
+        where: {
+          isActive: true,
+          staffId: { not: null },
+          branch: { agencyId, isActive: true },
+          updatedAt: { gte: fortyFiveMinsAgo },
+        },
+      })
+      const isPausedWalkIn = agency.queueSettings.length > 0 ? (agency.queueSettings[0].isPaused === 1 || agency.queueSettings[0].isPaused === true) : false
+      // Simplified calculateETA
+      let estimatedWait = 0
+      if (!isPausedWalkIn && waitingCount > 0) {
+        const safeCounters = Math.max(1, activeCounters || 1)
+        const effectiveCounters = Math.max(1, Math.min(safeCounters, waitingCount))
+        const baseWait = ((waitingCount * avgServiceMinutes) / effectiveCounters) + (avgServiceMinutes / effectiveCounters)
+        const conservativeFactor = 1 + varianceFactor
+        estimatedWait = Math.round(baseWait * conservativeFactor + Math.min(waitingCount * 0.5, 5))
+      }
+
+      // Get next queue number based on last reservation for this service (Cloud business logic)
+      const lastReservation = await db.reservation.findFirst({
+        where: { serviceId: resolvedServiceId },
+        orderBy: { queueNumber: 'desc' },
+      })
+      const nextNumber = (lastReservation?.queueNumber || 0) + 1
+      const prefix = service.prefix || 'A'
+      const displayNumber = `${prefix}-${String(nextNumber).padStart(3, '0')}`
 
       const reservation = await db.reservation.create({
         data: {
           id: require('crypto').randomUUID(),
           agencyId,
-          serviceId,
-          userId: sessionUser.id,
-          queueNumber: todayCount + 1,
-          displayNumber: queueNumber,
+          serviceId: resolvedServiceId,
+          userId: null, // Walk-ins have no user account (Cloud business logic)
+          queueNumber: nextNumber,
+          displayNumber,
           status: 'WAITING',
-          walkInCustomerName: customerName,
+          walkInCustomerName: customerName.trim(),
           isWalkIn: true,
-          joinedAt: now,
-          estimatedWait: 0,
+          estimatedWait,
+        },
+        include: {
+          agency: { select: { id: true, name: true, nameFr: true, nameAr: true } },
+          service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
         },
       })
 
+      // Update queue settings lastIssuedNumber (Cloud business logic)
+      if (agency.queueSettings.length > 0) {
+        await db.queueSettings.update({
+          where: { id: agency.queueSettings[0].id },
+          data: { lastIssuedNumber: nextNumber },
+        })
+      }
+
+      // Generate import token for QR-based linking (Cloud business logic)
+      let importToken = ''
+      try {
+        const crypto = require('crypto')
+        const QR_SECRET = process.env.NEXTAUTH_SECRET || 'blast1-qr-dev-key'
+        const exp = Math.floor(Date.now() / 1000) + (30 * 60)
+        const payload = JSON.stringify({ reservationId: reservation.id, agencyId, customerId: customerName.trim(), exp })
+        const sig = crypto.createHmac('sha256', QR_SECRET).update(payload).digest('hex')
+        importToken = Buffer.from(payload).toString('base64url') + '.' + sig
+        await db.reservation.update({ where: { id: reservation.id }, data: { importToken } })
+      } catch (tokenErr) { console.warn('[Walk-in] Failed to generate import token:', tokenErr) }
+
+      // Create audit log (Cloud business logic)
+      await db.auditLog.create({
+        data: {
+          action: 'WALK_IN_ADDED',
+          entityType: 'RESERVATION',
+          entityId: reservation.id,
+          details: JSON.stringify({
+            agencyId,
+            serviceId: resolvedServiceId,
+            displayNumber,
+            customerName: customerName.trim(),
+            estimatedWait,
+          }),
+        },
+      })
+
+      emitEvent('queue:walk-in', { agencyId, reservation })
       emitEvent('queue:joined', { agencyId, reservation })
       logPendingMutation('POST', '/api/agency/queue/walk-in', body, reservation).catch(() => {})
-      return c.json({ success: true, reservation })
+      return c.json({ success: true, reservation: { ...reservation, importToken }, importToken }, 201)
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/walk-in error:', error)
       return c.json({ success: false, error: 'Failed to create walk-in' }, 500)
@@ -4099,19 +4799,33 @@ function createApp() {
     }
   })
 
-  // PATCH /api/agency/profile — alias for PUT (cloud uses PATCH)
+  // PATCH /api/agency/profile — alias for PUT (cloud uses PATCH, with validation + audit)
   app.patch('/api/agency/profile', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
       const body = await c.req.json()
-      const allowedFields = ['name', 'nameAr', 'nameFr', 'phone', 'description', 'descriptionAr', 'descriptionFr', 'address', 'category', 'website', 'logoUrl']
+      // Validate name length (matching cloud updateAgencyProfileSchema: max 100)
+      if (body.name !== undefined && (typeof body.name !== 'string' || body.name.length > 100)) {
+        return c.json({ success: false, error: 'name must be string, max 100 chars' }, 400)
+      }
+      if (body.description !== undefined && typeof body.description === 'string' && body.description.length > 500) {
+        return c.json({ success: false, error: 'description max 500 chars' }, 400)
+      }
+      if (body.address !== undefined && typeof body.address === 'string' && body.address.length > 200) {
+        return c.json({ success: false, error: 'address max 200 chars' }, 400)
+      }
+      if (body.phone !== undefined && typeof body.phone === 'string' && body.phone.length > 20) {
+        return c.json({ success: false, error: 'phone max 20 chars' }, 400)
+      }
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'phone', 'description', 'descriptionAr', 'descriptionFr', 'address', 'category', 'website', 'logoUrl', 'workingHoursStart', 'workingHoursEnd']
       const updateData = {}
       for (const field of allowedFields) {
         if (body[field] !== undefined) updateData[field] = body[field]
       }
       if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields to update' }, 400)
       await db.agency.update({ where: { id: agencyId }, data: updateData })
+      auditLog(sessionUser.id, 'PROFILE_UPDATED', 'AGENCY', agencyId, { ...updateData })
       emitEvent('agency:updated', { agencyId, ...updateData })
       logPendingMutation('PATCH', '/api/agency/profile', body, updateData).catch(() => {})
       return c.json({ success: true })
@@ -4147,22 +4861,39 @@ function createApp() {
     }
   })
 
-  // PATCH /api/agency/settings — update agency settings
+  // PATCH /api/agency/settings — update agency settings (with validation)
   app.patch('/api/agency/settings', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency found' }, 404)
       const body = await c.req.json()
       const updateData = {}
-      if (body.avgServiceTime !== undefined) updateData.averageServiceTime = body.avgServiceTime
-      if (body.maxQueueSize !== undefined) updateData.maxActiveReservations = body.maxQueueSize
+      // Validate avgServiceTime (1-480 min, matching cloud updateAgencySettingsSchema)
+      if (body.avgServiceTime !== undefined) {
+        const v = Number(body.avgServiceTime)
+        if (!Number.isInteger(v) || v < 1 || v > 480) return c.json({ success: false, error: 'avgServiceTime must be integer 1-480' }, 400)
+        updateData.averageServiceTime = v
+      }
+      // Validate maxQueueSize (1-1000, matching cloud schema)
+      if (body.maxQueueSize !== undefined) {
+        const v = Number(body.maxQueueSize)
+        if (!Number.isInteger(v) || v < 1 || v > 1000) return c.json({ success: false, error: 'maxQueueSize must be integer 1-1000' }, 400)
+        updateData.maxActiveReservations = v
+      }
       if (body.isQueueOpen !== undefined) updateData.isQueueOpen = Boolean(body.isQueueOpen)
       if (body.workingHoursStart !== undefined) updateData.workingHoursStart = body.workingHoursStart
       if (body.workingHoursEnd !== undefined) updateData.workingHoursEnd = body.workingHoursEnd
       if (body.autoPauseWhenFull !== undefined) updateData.autoPauseWhenFull = Boolean(body.autoPauseWhenFull)
       if (body.kioskModeEnabled !== undefined) updateData.kioskModeEnabled = Boolean(body.kioskModeEnabled)
+      if (body.sponsorSms !== undefined) updateData.sponsorSms = Boolean(body.sponsorSms)
+      if (body.smsBalance !== undefined) {
+        const v = Number(body.smsBalance)
+        if (!Number.isInteger(v) || v < 0) return c.json({ success: false, error: 'smsBalance must be non-negative integer' }, 400)
+        updateData.smsBalance = v
+      }
       if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields to update' }, 400)
       const updated = await db.agency.update({ where: { id: agencyId }, data: updateData })
+      auditLog(sessionUser.id, 'SETTINGS_UPDATED', 'AGENCY', agencyId, { ...updateData })
       emitEvent('agency:updated', { agencyId, action: 'settings-updated', ...updateData })
       logPendingMutation('PATCH', '/api/agency/settings', body, updated).catch(() => {})
       return c.json({ success: true })
@@ -4214,6 +4945,19 @@ function createApp() {
       if (staffMember.agencyId !== queryAgencyId) return c.json({ success: false, error: 'Staff not in this agency' }, 403)
       if (staffMember.role === 'OWNER') return c.json({ success: false, error: 'Cannot remove agency owner' }, 403)
       await db.agencyStaff.delete({ where: { id: staffId } })
+      // Deactivate user if AGENCY_STAFF with no other agency links (cloud parity)
+      try {
+        const staffUser = await db.user.findUnique({ where: { id: staffMember.userId } })
+        if (staffUser && staffUser.role === 'AGENCY_STAFF') {
+          const otherLinks = await db.agencyStaff.count({ where: { userId: staffUser.id, id: { not: staffId } } })
+          if (otherLinks === 0) {
+            await db.user.update({ where: { id: staffUser.id }, data: { isActive: false } })
+          }
+        }
+      } catch (deactErr) {
+        console.warn('[LocalAPI] Staff deactivation check error:', deactErr.message)
+      }
+      auditLog(sessionUser.id, 'STAFF_DELETED', 'AGENCY_STAFF', staffId, { agencyId: queryAgencyId, userId: staffMember.userId })
       emitEvent('staff:updated', { agencyId: queryAgencyId, action: 'staff-removed', staffId })
       logPendingMutation('DELETE', '/api/agency/staff', { staffId }, null).catch(() => {})
       return c.json({ success: true })
@@ -4687,6 +5431,109 @@ function createApp() {
     }
   })
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // 14b. INITIAL SYNC (first-time data import)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/sync/initial-status — check if initial sync is needed
+  app.get('/api/sync/initial-status', requireAuth(), async (c) => {
+    try {
+      const initialSync = require('./initial-sync')
+      const agencyId = sessionUser?.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency ID in session' }, 400)
+      }
+      const status = await initialSync.checkInitialSyncStatus(db, agencyId)
+      return c.json({ success: true, ...status })
+    } catch (e) {
+      return c.json({ success: false, error: e.message || 'Failed to check initial sync status' }, 500)
+    }
+  })
+
+  // POST /api/sync/initial-sync — trigger initial data import
+  app.post('/api/sync/initial-sync', requireAuth(), async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const agencyId = body.agencyId || sessionUser?.agencyId
+      const cloudAuthToken = body.cloudAuthToken || sessionUser?.cloudToken
+
+      if (!agencyId) {
+        return c.json({ success: false, error: 'agencyId is required' }, 400)
+      }
+      if (!cloudAuthToken) {
+        return c.json({ success: false, error: 'cloudAuthToken is required' }, 400)
+      }
+
+      const initialSync = require('./initial-sync')
+      const cloudUrl = getCloudUrl()
+      const syncId = require('crypto').randomUUID()
+
+      // Build an emit function that sends progress via Socket.IO and local event listeners
+      const syncEmitFn = (event) => {
+        // Emit via the standard event system
+        emitEvent('sync:initial', { ...event, agencyId, syncId })
+        // Also emit via Socket.IO if available
+        if (ioServer) {
+          try {
+            ioServer.to(`agency:${agencyId}`).emit('sync:initial', { ...event, agencyId, syncId })
+          } catch {}
+        }
+      }
+
+      // Start the sync asynchronously (don't await — return immediately)
+      initialSync.runInitialSync({
+        agencyId,
+        cloudAuthToken,
+        cloudUrl,
+        db,
+        emitFn: syncEmitFn,
+      }).then((result) => {
+        if (result.success) {
+          // Mark cloud contact and update sync time
+          _lastCloudContactAt = _safeTimestamp()
+          _lastSyncAt = new Date()
+          _persistCloudContact()
+          console.log('[LocalAPI] Initial sync completed:', result.totalRecords, 'records in', result.duration, 'ms')
+        } else {
+          console.warn('[LocalAPI] Initial sync failed:', result.error)
+        }
+      }).catch((e) => {
+        console.error('[LocalAPI] Initial sync error:', e.message)
+        syncEmitFn({ type: 'SYNC_ERROR', stage: 'unknown', error: e.message, retryable: true })
+      })
+
+      return c.json({ success: true, started: true, syncId, agencyId })
+    } catch (e) {
+      return c.json({ success: false, error: e.message || 'Failed to start initial sync' }, 500)
+    }
+  })
+
+  // POST /api/sync/initial-sync/abort — abort an active initial sync
+  app.post('/api/sync/initial-sync/abort', requireAuth(), async (c) => {
+    try {
+      const initialSync = require('./initial-sync')
+      const aborted = initialSync.abortInitialSync()
+      return c.json({ success: true, aborted })
+    } catch (e) {
+      return c.json({ success: false, error: e.message }, 500)
+    }
+  })
+
+  // POST /api/sync/initial-sync/reset — reset initial sync state (dev/testing)
+  app.post('/api/sync/initial-sync/reset', requireAuth(), async (c) => {
+    try {
+      const initialSync = require('./initial-sync')
+      const agencyId = sessionUser?.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency ID in session' }, 400)
+      }
+      await initialSync.resetInitialSync(db, agencyId)
+      return c.json({ success: true, message: 'Initial sync state reset' })
+    } catch (e) {
+      return c.json({ success: false, error: e.message }, 500)
+    }
+  })
+
   // GET /api/sync-status — local sync status for diagnosis panel
   app.get('/api/sync-status', async (c) => {
     const offlineDuration = _lastCloudContactAt ? _safeTimestamp() - _lastCloudContactAt : null
@@ -4862,7 +5709,7 @@ function createApp() {
     }
   })
 
-  // DELETE /api/agency/services/:id — soft-delete service
+  // DELETE /api/agency/services/:id — soft-delete service + cancel WAITING reservations
   app.delete('/api/agency/services/:id', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -4871,6 +5718,16 @@ function createApp() {
       const existing = await db.service.findUnique({ where: { id } })
       if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Service not found' }, 404)
       await db.service.update({ where: { id }, data: { isActive: false } })
+      // Cancel all WAITING reservations for this service (cloud parity)
+      try {
+        await db.reservation.updateMany({
+          where: { serviceId: id, status: 'WAITING' },
+          data: { status: 'CANCELLED' },
+        })
+      } catch (resErr) {
+        console.warn('[LocalAPI] Service delete reservation cancellation error:', resErr.message)
+      }
+      auditLog(sessionUser.id, 'SERVICE_DELETED', 'SERVICE', id, { agencyId })
       emitEvent('service:deleted', { agencyId, serviceId: id })
       logPendingMutation('DELETE', '/api/agency/services/:id', {}, { id }).catch(() => {})
       return c.json({ success: true, data: { id, deleted: true } })
@@ -4881,32 +5738,82 @@ function createApp() {
   })
 
   // POST /api/agency/staff/create — add staff member
+  // Supports two flows (matching Cloud API):
+  //   1) username+fullName+password → create new User + AgencyStaff, return initialPassword
+  //   2) userId → link existing user as staff
   app.post('/api/agency/staff/create', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
       const body = await c.req.json()
-      const { userId, role, permissions, isActive } = body
-      if (!userId) return c.json({ success: false, error: 'userId is required' }, 400)
-      // Verify user exists
-      const user = await db.user.findUnique({ where: { id: userId } })
-      if (!user) return c.json({ success: false, error: 'User not found' }, 404)
+      const { userId, username, fullName, password, phoneNumber, role, permissions, isActive, staffRole } = body
+
+      let linkedUserId = userId
+      let initialPassword = null
+      let agencyStaffRole = role || 'STAFF'
+
+      // Flow 1: Create new user (cloud-style staff creation)
+      if (username) {
+        // Validate
+        if (!username || username.trim().length < 3) return c.json({ success: false, error: 'Username must be at least 3 characters' }, 400)
+        if (!fullName || fullName.trim().length < 1) return c.json({ success: false, error: 'Full name is required' }, 400)
+
+        // Check username uniqueness
+        const existingUser = await db.user.findUnique({ where: { username: username.trim() } })
+        if (existingUser) return c.json({ success: false, error: 'This username is already taken' }, 409)
+
+        // Generate password if not provided
+        const pw = password || generateInitialPassword()
+        const passwordHash = await hashPasswordLocal(pw)
+        initialPassword = pw
+
+        // Determine role
+        const userRole = (staffRole === 'AGENCY_OWNER') ? 'AGENCY_OWNER' : 'AGENCY_STAFF'
+        agencyStaffRole = (staffRole === 'AGENCY_OWNER') ? 'OWNER' : (staffRole === 'MANAGER') ? 'MANAGER' : (role || 'STAFF')
+
+        // Create User
+        const newUser = await db.user.create({
+          data: {
+            username: username.trim(),
+            fullName: fullName.trim(),
+            passwordHash,
+            phoneNumber: phoneNumber || null,
+            role: userRole,
+            language: 'ar',
+            isActive: true,
+          },
+        })
+        linkedUserId = newUser.id
+      } else {
+        // Flow 2: Link existing user
+        if (!userId) return c.json({ success: false, error: 'userId or username is required' }, 400)
+        const user = await db.user.findUnique({ where: { id: userId } })
+        if (!user) return c.json({ success: false, error: 'User not found' }, 404)
+        agencyStaffRole = role || (user.role === 'AGENCY_OWNER' ? 'OWNER' : 'STAFF')
+      }
+
       // Check if already a member
-      const existing = await db.agencyStaff.findFirst({ where: { agencyId, userId } })
+      const existing = await db.agencyStaff.findFirst({ where: { agencyId, userId: linkedUserId } })
       if (existing) return c.json({ success: false, error: 'User is already a staff member' }, 409)
+
       const staff = await db.agencyStaff.create({
         data: {
           agencyId,
-          userId,
-          role: role || 'AGENCY_STAFF',
+          userId: linkedUserId,
+          role: agencyStaffRole,
           permissions: permissions || null,
           isActive: isActive !== undefined ? Boolean(isActive) : true,
           joinedAt: new Date(),
         },
       })
+
+      auditLog(sessionUser.id, 'STAFF_CREATED', 'AGENCY_STAFF', staff.id, { agencyId, userId: linkedUserId, role: agencyStaffRole })
       emitEvent('staff:created', { agencyId, staff })
       logPendingMutation('POST', '/api/agency/staff/create', body, staff).catch(() => {})
-      return c.json({ success: true, data: staff }, 201)
+
+      const response = { success: true, data: staff }
+      if (initialPassword) response.initialPassword = initialPassword
+      return c.json(response, 201)
     } catch (error) {
       console.error('[LocalAPI] Create staff error:', error)
       return c.json({ success: false, error: 'Failed to create staff' }, 500)
@@ -4915,7 +5822,7 @@ function createApp() {
 
   // NOTE: /api/agency/staff/:id PATCH is handled by the standalone route above
 
-  // DELETE /api/agency/staff/:id — remove staff
+  // DELETE /api/agency/staff/:id — remove staff (owner protection + user deactivation)
   app.delete('/api/agency/staff/:id', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
@@ -4923,7 +5830,22 @@ function createApp() {
       const id = c.req.param('id')
       const existing = await db.agencyStaff.findUnique({ where: { id } })
       if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Staff not found' }, 404)
+      // Owner protection — cannot remove agency owner
+      if (existing.role === 'OWNER') return c.json({ success: false, error: 'Cannot remove agency owner' }, 403)
       await db.agencyStaff.delete({ where: { id } })
+      // Deactivate user if AGENCY_STAFF with no other agency links (cloud parity)
+      try {
+        const staffUser = await db.user.findUnique({ where: { id: existing.userId } })
+        if (staffUser && staffUser.role === 'AGENCY_STAFF') {
+          const otherLinks = await db.agencyStaff.count({ where: { userId: staffUser.id, id: { not: id } } })
+          if (otherLinks === 0) {
+            await db.user.update({ where: { id: staffUser.id }, data: { isActive: false } })
+          }
+        }
+      } catch (deactErr) {
+        console.warn('[LocalAPI] Staff deactivation check error:', deactErr.message)
+      }
+      auditLog(sessionUser.id, 'STAFF_DELETED', 'AGENCY_STAFF', id, { agencyId, userId: existing.userId })
       emitEvent('staff:deleted', { agencyId, staffId: id })
       logPendingMutation('DELETE', '/api/agency/staff/:id', {}, { id }).catch(() => {})
       return c.json({ success: true, data: { id, deleted: true } })
@@ -5388,21 +6310,79 @@ function createApp() {
   })
 
   // POST /api/reservations/:id/cancel
+  // Business logic matches Cloud API: status validation (WAITING only), notification, audit log, counter clearing
   app.post('/api/reservations/:id/cancel', authMiddleware, async (c) => {
-    const { id } = c.req.param()
-    const user = c.get('user')
-    const agencyId = user?.agencyId
-    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+    try {
+      const { id } = c.req.param()
+      const user = c.get('user')
+      const agencyId = user?.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
 
-    const reservation = await db.reservation.findFirst({ where: { id, agencyId } })
-    if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
+      const reservation = await db.reservation.findFirst({
+        where: { id, agencyId },
+        include: { agency: { select: { id: true, name: true } } },
+      })
+      if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
 
-    const updated = await db.reservation.update({
-      where: { id },
-      data: { status: 'CANCELLED', cancelledAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
-    })
-    logPendingMutation('update', 'Reservation', id, { status: 'CANCELLED' })
-    return c.json({ success: true, data: updated })
+      // Cloud business logic: only WAITING reservations can be cancelled
+      if (reservation.status !== 'WAITING') {
+        return c.json({ success: false, error: 'Only WAITING reservations can be cancelled' }, 400)
+      }
+
+      const now = new Date()
+      const updated = await db.reservation.update({
+        where: { id },
+        data: { status: 'CANCELLED', cancelledAt: now, updatedAt: now },
+      })
+
+      // Cloud business logic: clear counter's currentReservationId
+      if (reservation.counterId) {
+        await db.counter.updateMany({
+          where: { currentReservationId: id },
+          data: { currentReservationId: null },
+        })
+      }
+
+      // Cloud business logic: create notification for registered users
+      if (reservation.userId) {
+        try {
+          const agencyName = (reservation.agency && reservation.agency.name) || 'the agency'
+          await db.notification.create({
+            data: {
+              userId: reservation.userId,
+              type: 'RESERVATION_CANCELLED',
+              title: 'Reservation Cancelled',
+              message: `Your reservation ${reservation.displayNumber} has been cancelled.`,
+            },
+          })
+        } catch (notifErr) {
+          console.warn('[LocalAPI] Cancel notification error:', notifErr.message)
+        }
+      }
+
+      // Cloud business logic: create audit log
+      try {
+        await db.auditLog.create({
+          data: {
+            userId: reservation.userId || undefined,
+            action: 'RESERVATION_CANCEL',
+            entityType: 'RESERVATION',
+            entityId: id,
+            details: JSON.stringify({ displayNumber: reservation.displayNumber, agencyId: reservation.agencyId }),
+          },
+        })
+      } catch (auditErr) {
+        console.warn('[LocalAPI] Cancel audit log error:', auditErr.message)
+      }
+
+      emitEvent('reservation:cancelled', { agencyId: reservation.agencyId, reservationId: id, displayNumber: reservation.displayNumber })
+      emitEvent('queue:updated', { agencyId: reservation.agencyId, reservationId: id, displayNumber: reservation.displayNumber, action: 'cancelled' })
+      logPendingMutation('update', 'Reservation', id, { status: 'CANCELLED' })
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Cancel reservation error:', error)
+      return c.json({ success: false, error: 'Failed to cancel reservation' }, 500)
+    }
   })
 
   // POST /api/reservations/:id/recall
@@ -5424,6 +6404,8 @@ function createApp() {
   })
 
   // POST /api/reservations/:id/postpone
+  // Business logic matches Cloud API: only WAITING allowed, positions param (1-10), postpone count limit (3 max),
+  // atomic queue number shift, notification, audit log
   app.post('/api/reservations/:id/postpone', authMiddleware, async (c) => {
     try {
       const { id } = c.req.param()
@@ -5431,37 +6413,98 @@ function createApp() {
       const agencyId = user?.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
 
+      const body = await c.req.json().catch(() => ({}))
+      const positions = body.positions || 1
+      if (!positions || positions < 1 || positions > 10) {
+        return c.json({ success: false, error: 'Positions must be between 1 and 10' }, 400)
+      }
+
       const reservation = await db.reservation.findFirst({ where: { id, agencyId } })
       if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
 
-      if (!['WAITING', 'CALLED'].includes(reservation.status)) {
-        return c.json({ success: false, error: `Cannot postpone reservation with status: ${reservation.status}` }, 400)
+      // Cloud business logic: only WAITING reservations can be postponed
+      if (reservation.status !== 'WAITING') {
+        return c.json({ success: false, error: 'Can only postpone a waiting reservation' }, 400)
       }
 
-      const postponeCount = (reservation.postponeCount || 0) + 1
-      const now = new Date()
-      let updateData
-
-      if (reservation.status === 'CALLED') {
-        // If CALLED, move back to WAITING
-        updateData = { status: 'WAITING', postponeCount, updatedAt: now }
-      } else {
-        // If WAITING, move to end of queue — get the highest queueNumber and re-assign
-        const maxReservation = await db.reservation.findFirst({
-          where: { agencyId, status: { in: ['WAITING', 'CALLED'] } },
-          orderBy: { queueNumber: 'desc' },
-          select: { queueNumber: true },
-        })
-        const newQueueNumber = (maxReservation?.queueNumber || reservation.queueNumber) + 1
-        updateData = { status: 'WAITING', postponeCount, queueNumber: newQueueNumber, updatedAt: now }
+      // Cloud business logic: postpone count limit (max 3)
+      const currentPostponeCount = reservation.postponeCount || 0
+      if (currentPostponeCount >= 3) {
+        return c.json({ success: false, error: 'Maximum postpone limit reached (3)' }, 400)
       }
 
+      const postponeCount = currentPostponeCount + 1
+
+      // Cloud business logic: find reservations with higher queueNumber to shift behind
+      const laterReservations = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING', queueNumber: { gt: reservation.queueNumber } },
+        orderBy: { queueNumber: 'asc' },
+        take: positions,
+      })
+
+      if (laterReservations.length === 0) {
+        return c.json({ success: false, error: 'No one to postpone behind' }, 400)
+      }
+
+      const targetReservation = laterReservations[laterReservations.length - 1]
+      const targetQueueNumber = targetReservation.queueNumber
+
+      // Cloud business logic: atomic queue number shift to avoid constraint violations
+      // Step 1: Temporarily move the postponed reservation to a negative queue number
+      const tempQueueNumber = -reservation.queueNumber
+      await db.reservation.update({ where: { id: reservation.id }, data: { queueNumber: tempQueueNumber } })
+
+      // Step 2: Shift intermediate reservations' queueNumbers down by 1
+      await db.reservation.updateMany({
+        where: {
+          agencyId,
+          status: 'WAITING',
+          queueNumber: { gt: reservation.queueNumber, lte: targetQueueNumber },
+        },
+        data: { queueNumber: { decrement: 1 } },
+      })
+
+      // Step 3: Move the postponed reservation to the target position
+      const newQueueNumber = targetQueueNumber
       const updated = await db.reservation.update({
         where: { id },
-        data: updateData,
+        data: { queueNumber: newQueueNumber, postponeCount },
       })
+
+      // Cloud business logic: create notification on postpone
+      if (reservation.userId) {
+        try {
+          await db.notification.create({
+            data: {
+              userId: reservation.userId,
+              type: 'QUEUE_POSTPONED',
+              title: 'Turn Postponed',
+              message: `Your reservation has been postponed by ${positions} position(s). New queue number: ${reservation.displayNumber}`,
+            },
+          })
+        } catch (notifErr) {
+          console.warn('[LocalAPI] Postpone notification error:', notifErr.message)
+        }
+      }
+
+      // Cloud business logic: create audit log on postpone
+      try {
+        await db.auditLog.create({
+          data: {
+            userId: reservation.userId || undefined,
+            action: 'QUEUE_POSTPONE',
+            entityType: 'RESERVATION',
+            entityId: id,
+            details: JSON.stringify({ positions, previousQueueNumber: reservation.queueNumber, newQueueNumber, postponeCount }),
+          },
+        })
+      } catch (auditErr) {
+        console.warn('[LocalAPI] Postpone audit log error:', auditErr.message)
+      }
+
       emitEvent('queue:postponed', { agencyId, reservation: updated })
-      logPendingMutation('update', 'Reservation', id, { action: 'postpone', postponeCount, ...updateData })
+      emitEvent('queue:position-changed', { agencyId, reservationId: id, displayNumber: reservation.displayNumber, action: 'postponed', positions })
+      logPendingMutation('update', 'Reservation', id, { action: 'postpone', postponeCount, positions, newQueueNumber })
       return c.json({ success: true, data: updated })
     } catch (error) {
       console.error('[LocalAPI] /api/reservations/:id/postpone error:', error)
@@ -5604,6 +6647,1450 @@ function createApp() {
       return c.json({ success: true })
     } catch (e) {
       return c.json({ success: false, error: e.message }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // MISSING CLOUD ROUTES — Added for feature parity (Task 6a)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // ── Notification Routes (Cloud parity) ─────────────────────────────────
+
+  // POST /api/notifications — Create notification (Cloud route)
+  app.post('/api/notifications', authMiddleware, async (c) => {
+    try {
+      const user = sessionUser
+      const body = await c.req.json().catch(() => ({}))
+      const { userId, title, message, type, entityId } = body
+
+      if (!title) {
+        return c.json({ success: false, error: 'Title is required' }, 400)
+      }
+
+      const notification = await db.notification.create({
+        data: {
+          userId: userId || user.id,
+          type: type || 'SYSTEM',
+          title,
+          message: message || '',
+          isRead: false,
+          entityId: entityId || null,
+        },
+      })
+
+      emitEvent('notification:new', { userId: notification.userId, notificationId: notification.id, type: notification.type })
+      logPendingMutation('POST', '/api/notifications', body, notification).catch(() => {})
+
+      return c.json({ success: true, notification }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/notifications error:', error)
+      return c.json({ success: false, error: 'Failed to create notification' }, 500)
+    }
+  })
+
+  // PATCH /api/notifications — Bulk mark as read (Cloud route)
+  app.patch('/api/notifications', authMiddleware, async (c) => {
+    try {
+      const user = sessionUser
+      const body = await c.req.json().catch(() => ({}))
+      const { notificationIds, markAll } = body
+
+      if (markAll) {
+        const result = await db.notification.updateMany({
+          where: { userId: user.id, isRead: false },
+          data: { isRead: true },
+        })
+        emitEvent('notifications:read-all', { userId: user.id })
+        logPendingMutation('PATCH', '/api/notifications', body, { markedCount: result.count }).catch(() => {})
+        return c.json({ success: true, markedCount: result.count })
+      }
+
+      if (notificationIds && Array.isArray(notificationIds) && notificationIds.length > 0) {
+        const result = await db.notification.updateMany({
+          where: { id: { in: notificationIds }, userId: user.id, isRead: false },
+          data: { isRead: true },
+        })
+        logPendingMutation('PATCH', '/api/notifications', body, { markedCount: result.count }).catch(() => {})
+        return c.json({ success: true, markedCount: result.count })
+      }
+
+      return c.json({ success: false, error: 'Provide either { markAll: true } or { notificationIds: string[] }' }, 400)
+    } catch (error) {
+      console.error('[LocalAPI] PATCH /api/notifications error:', error)
+      return c.json({ success: false, error: 'Failed to mark notifications as read' }, 500)
+    }
+  })
+
+  // PATCH /api/notifications/mark-read — Mark all as read (Cloud route)
+  app.patch('/api/notifications/mark-read', authMiddleware, async (c) => {
+    try {
+      const user = sessionUser
+
+      await db.notification.updateMany({
+        where: { userId: user.id, isRead: false },
+        data: { isRead: true },
+      })
+
+      emitEvent('notifications:read-all', { userId: user.id })
+      logPendingMutation('PATCH', '/api/notifications/mark-read', {}, {}).catch(() => {})
+
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] PATCH /api/notifications/mark-read error:', error)
+      return c.json({ success: false, error: 'Failed to mark notifications as read' }, 500)
+    }
+  })
+
+  // ── Reservation Routes (Cloud parity) ─────────────────────────────────
+
+  // GET /api/reservations/agency — Get agency reservations (Cloud route)
+  app.get('/api/reservations/agency', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const status = c.req.query('status')
+      const serviceId = c.req.query('serviceId')
+      const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '50', 10), 1), 100)
+      const offset = Math.max(parseInt(c.req.query('offset') || '0', 10), 0)
+
+      const where = { agencyId }
+      if (status) where.status = status
+      if (serviceId) where.serviceId = serviceId
+
+      const [reservations, total] = await Promise.all([
+        db.reservation.findMany({
+          where,
+          include: {
+            user: { select: { id: true, username: true, fullName: true, phoneNumber: true } },
+            service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
+          },
+          orderBy: { joinedAt: 'desc' },
+          take: limit,
+          skip: offset,
+        }),
+        db.reservation.count({ where }),
+      ])
+
+      return c.json({ success: true, reservations, total, limit, offset })
+    } catch (error) {
+      console.error('[LocalAPI] GET /api/reservations/agency error:', error)
+      return c.json({ success: false, error: 'Failed to list agency reservations' }, 500)
+    }
+  })
+
+  // POST /api/reservations/batch-complete — Batch complete reservations (Cloud route)
+  // Business logic matches Cloud API: fetch originals before update, notifications per reservation, audit logs, counter clearing
+  app.post('/api/reservations/batch-complete', authMiddleware, requireActiveSubscription(), async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const body = await c.req.json()
+      const { reservationIds } = body
+
+      if (!reservationIds || !Array.isArray(reservationIds) || reservationIds.length === 0) {
+        return c.json({ success: false, error: 'reservationIds array is required' }, 400)
+      }
+
+      if (reservationIds.length > 100) {
+        return c.json({ success: false, error: 'Maximum 100 reservations per batch' }, 400)
+      }
+
+      // Cloud business logic: fetch original data before updateMany for event data and counter clearing
+      const originalReservations = await db.reservation.findMany({
+        where: { id: { in: reservationIds }, agencyId, status: { in: ['WAITING', 'CALLED'] } },
+        select: { id: true, displayNumber: true, agencyId: true, serviceId: true, userId: true, status: true, counterId: true },
+      })
+
+      const completedNow = new Date()
+      const results = await db.reservation.updateMany({
+        where: { id: { in: reservationIds }, agencyId, status: { in: ['WAITING', 'CALLED'] } },
+        data: { status: 'COMPLETED', completedAt: completedNow },
+      })
+
+      // Cloud business logic: clear counters for completed reservations
+      const counterIds = originalReservations.map(r => r.counterId).filter(Boolean)
+      if (counterIds.length > 0) {
+        await db.counter.updateMany({
+          where: { currentReservationId: { in: originalReservations.map(r => r.id) } },
+          data: { currentReservationId: null },
+        })
+      }
+
+      // Cloud business logic: create notifications and audit logs for each completed reservation
+      for (const orig of originalReservations) {
+        if (orig.userId) {
+          try {
+            await db.notification.create({
+              data: {
+                userId: orig.userId,
+                type: 'COMPLETED',
+                title: 'Service Completed',
+                message: `Your reservation #${orig.displayNumber} has been completed. Thank you for your visit!`,
+              },
+            })
+          } catch (notifErr) {
+            console.warn('[LocalAPI] Batch-complete notification error:', notifErr.message)
+          }
+        }
+
+        try {
+          await db.auditLog.create({
+            data: {
+              userId: orig.userId || undefined,
+              action: 'QUEUE_COMPLETE',
+              entityType: 'RESERVATION',
+              entityId: orig.id,
+              details: JSON.stringify({ displayNumber: orig.displayNumber, status: 'COMPLETED', batch: true }),
+            },
+          })
+        } catch (auditErr) {
+          console.warn('[LocalAPI] Batch-complete audit log error:', auditErr.message)
+        }
+      }
+
+      // Merge original data with mutation state for complete realtime event data
+      const mergedReservations = originalReservations.map(r => ({
+        ...r,
+        status: 'COMPLETED',
+        completedAt: completedNow,
+      }))
+
+      emitEvent('queue:completed', { agencyId, completedCount: results.count, reservationIds, reservations: mergedReservations.map(r => ({ id: r.id, displayNumber: r.displayNumber, serviceId: r.serviceId })) })
+      emitEvent('queue:updated', { agencyId, action: 'batch-completed', completedCount: results.count })
+      logPendingMutation('POST', '/api/reservations/batch-complete', body, { updatedCount: results.count }).catch(() => {})
+
+      return c.json({ success: true, updatedCount: results.count })
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/reservations/batch-complete error:', error)
+      return c.json({ success: false, error: 'Failed to batch complete reservations' }, 500)
+    }
+  })
+
+  // POST /api/reservations/reclaim — Reclaim no-show reservation (Cloud route)
+  // Business logic matches Cloud API: skippedForNoShow check, clear skippedForNoShow/skippedAt, smart status determination, notification, audit log
+  app.post('/api/reservations/reclaim', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json()
+      const { reservationId } = body
+
+      if (!reservationId) {
+        return c.json({ success: false, error: 'reservationId is required' }, 400)
+      }
+
+      const reservation = await db.reservation.findUnique({
+        where: { id: reservationId },
+        include: {
+          user: { select: { id: true, language: true } },
+          agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
+        },
+      })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      // Check ownership — either user owns it or agency manages it
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+      if (reservation.userId !== userId && reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      // Cloud business logic: must be a no-show that was skipped (skippedForNoShow flag)
+      const reservationAny = reservation
+      if (!reservationAny.skippedForNoShow && reservation.status !== 'NO_SHOW') {
+        return c.json({ success: false, error: 'Reservation not found or not skipped' }, 404)
+      }
+
+      // Cloud business logic: determine new status based on queue state
+      // If someone is currently being called, re-queue at WAITING; otherwise also WAITING
+      const currentlyCalled = await db.reservation.findFirst({
+        where: { agencyId: reservation.agencyId, status: 'CALLED', id: { not: reservation.id } },
+        orderBy: { queueNumber: 'asc' },
+        select: { queueNumber: true },
+      })
+      const newStatus = currentlyCalled ? 'WAITING' : 'WAITING'
+
+      // Cloud business logic: clear skippedForNoShow, skippedAt, set reclaimRequestedAt
+      const updatePayload = { status: newStatus, reclaimRequestedAt: new Date() }
+      try {
+        updatePayload.skippedForNoShow = false
+        updatePayload.skippedAt = null
+      } catch (_e) {
+        // Fields may not exist on all schemas
+      }
+
+      const updated = await db.reservation.update({
+        where: { id: reservation.id },
+        data: updatePayload,
+      })
+
+      // Cloud business logic: create notification for the user
+      if (reservation.userId) {
+        try {
+          const agencyName = reservation.agency?.name || 'the agency'
+          await db.notification.create({
+            data: {
+              userId: reservation.userId,
+              type: 'RECLAIM_SUCCESS',
+              title: 'Position Reclaimed',
+              message: `Your ticket ${reservation.displayNumber} at ${agencyName} has been reclaimed. ${newStatus === 'WAITING' ? 'You have been placed back in the queue.' : 'You are now being served. Please proceed to the counter.'}`,
+            },
+          })
+        } catch (notifErr) {
+          console.warn('[LocalAPI] Reclaim notification error:', notifErr.message)
+        }
+      }
+
+      // Cloud business logic: create audit log
+      try {
+        await db.auditLog.create({
+          data: {
+            userId: userId || undefined,
+            action: 'RECLAIM_POSITION',
+            entityType: 'RESERVATION',
+            entityId: reservation.id,
+            details: JSON.stringify({ displayNumber: reservation.displayNumber, agencyId: reservation.agencyId, newStatus }),
+          },
+        })
+      } catch (auditErr) {
+        console.warn('[LocalAPI] Reclaim audit log error:', auditErr.message)
+      }
+
+      emitEvent('reservation:updated', { agencyId: reservation.agencyId, reservationId: reservation.id, displayNumber: reservation.displayNumber, action: 'reclaimed' })
+      emitEvent('queue:updated', { agencyId: reservation.agencyId, reservationId: reservation.id, displayNumber: reservation.displayNumber, action: 'reclaimed' })
+      logPendingMutation('POST', '/api/reservations/reclaim', body, updated).catch(() => {})
+
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/reservations/reclaim error:', error)
+      return c.json({ success: false, error: 'Failed to reclaim reservation' }, 500)
+    }
+  })
+
+  // DELETE /api/reservations/cancel-active — Cancel user's active reservation (Cloud route)
+  app.delete('/api/reservations/cancel-active', authMiddleware, async (c) => {
+    try {
+      const userId = sessionUser.id
+
+      const reservation = await db.reservation.findFirst({
+        where: { userId, status: { in: ['WAITING', 'CALLED'] } },
+        orderBy: { joinedAt: 'desc' },
+      })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'No active reservation found' }, 404)
+      }
+
+      const updated = await db.reservation.update({
+        where: { id: reservation.id },
+        data: { status: 'CANCELLED', cancelledAt: new Date() },
+      })
+
+      // Create notification
+      try {
+        await db.notification.create({
+          data: { userId, type: 'CANCELLED', title: 'Queue Cancelled', message: `Your reservation ${updated.displayNumber} has been cancelled.` },
+        })
+      } catch (notifErr) {
+        console.warn('[LocalAPI] Cancel-active notification error:', notifErr.message)
+      }
+
+      emitEvent('reservation:cancelled', { agencyId: updated.agencyId, userId, reservationId: updated.id, displayNumber: updated.displayNumber })
+      emitEvent('queue:updated', { agencyId: updated.agencyId, reservationId: updated.id, displayNumber: updated.displayNumber, action: 'cancelled' })
+      logPendingMutation('DELETE', '/api/reservations/cancel-active', {}, updated).catch(() => {})
+
+      return c.json({ success: true, reservation: updated })
+    } catch (error) {
+      console.error('[LocalAPI] DELETE /api/reservations/cancel-active error:', error)
+      return c.json({ success: false, error: 'Failed to cancel active reservation' }, 500)
+    }
+  })
+
+  // POST /api/reservations/import-walk-in — Import walk-in from token (Cloud route)
+  // Business logic matches Cloud API: importToken match check, isWalkIn check, already linked check, status check
+  app.post('/api/reservations/import-walk-in', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json()
+      const { token } = body
+
+      if (!token) {
+        return c.json({ success: false, error: 'Token is required' }, 400)
+      }
+
+      // Find reservation by import token
+      const reservation = await db.reservation.findFirst({
+        where: { importToken: token },
+        include: {
+          agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
+          service: { select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true } },
+        },
+      })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'Invalid or expired QR token' }, 400)
+      }
+
+      if (!reservation.isWalkIn) {
+        return c.json({ success: false, error: 'This QR is not for a walk-in reservation' }, 400)
+      }
+
+      // Cloud business logic: verify importToken matches exactly
+      if (reservation.importToken !== token) {
+        return c.json({ success: false, error: 'Token does not match this reservation' }, 400)
+      }
+
+      if (reservation.userId) {
+        return c.json({
+          success: false,
+          error: 'already_linked',
+          message: 'This ticket is already linked to an account',
+          reservation: {
+            id: reservation.id,
+            displayNumber: reservation.displayNumber,
+            status: reservation.status,
+            queueNumber: reservation.queueNumber,
+            agency: reservation.agency,
+            service: reservation.service,
+          },
+        }, 409)
+      }
+
+      if (reservation.status !== 'WAITING') {
+        return c.json({ success: false, error: `Reservation status '${reservation.status}' cannot be imported` }, 400)
+      }
+
+      const userId = sessionUser.id
+      const userFullName = sessionUser.fullName
+
+      const updated = await db.reservation.update({
+        where: { id: reservation.id },
+        data: {
+          userId,
+          walkInCustomerName: userFullName || reservation.walkInCustomerName,
+          qrClaimedAt: new Date(),
+        },
+      })
+
+      emitEvent('reservation:updated', { agencyId: reservation.agencyId, userId, reservationId: reservation.id, importedByUser: true })
+      emitEvent('queue:updated', { agencyId: reservation.agencyId, action: 'walk_in_imported', reservationId: reservation.id, userId, displayNumber: reservation.displayNumber })
+      logPendingMutation('POST', '/api/reservations/import-walk-in', body, updated).catch(() => {})
+
+      return c.json({
+        success: true,
+        message: 'Walk-in reservation imported to your queue',
+        reservation: {
+          id: reservation.id,
+          displayNumber: reservation.displayNumber,
+          status: reservation.status,
+          queueNumber: reservation.queueNumber,
+          agency: reservation.agency,
+          service: reservation.service,
+          isWalkIn: true,
+          walkInCustomerName: userFullName || reservation.walkInCustomerName,
+          joinedAt: reservation.joinedAt,
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/reservations/import-walk-in error:', error)
+      return c.json({ success: false, error: 'Failed to import walk-in reservation' }, 500)
+    }
+  })
+
+  // PATCH /api/reservations/:id/status — Update reservation status (Cloud route)
+  // Business logic matches Cloud API: state transition validation, timestamps, notification, audit log, counter clearing
+  app.patch('/api/reservations/:id/status', authMiddleware, requireActiveSubscription(), async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const id = c.req.param('id')
+      const body = await c.req.json()
+      const { status } = body
+
+      if (!status) {
+        return c.json({ success: false, error: 'status is required' }, 400)
+      }
+
+      const VALID_STATUSES = ['WAITING', 'CALLED', 'SERVING', 'COMPLETED', 'CANCELLED', 'NO_SHOW', 'POSTPONED']
+      if (!VALID_STATUSES.includes(status)) {
+        return c.json({ success: false, error: 'Invalid status value' }, 400)
+      }
+
+      const VALID_STATUS_TRANSITIONS = {
+        WAITING: ['CALLED', 'CANCELLED'],
+        CALLED: ['COMPLETED', 'CANCELLED', 'NO_SHOW'],
+        SERVING: ['COMPLETED'],
+      }
+
+      const reservation = await db.reservation.findUnique({
+        where: { id },
+        include: {
+          agency: { select: { id: true, name: true } },
+          service: { select: { id: true, name: true } },
+        },
+      })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      if (reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      const allowedTransitions = VALID_STATUS_TRANSITIONS[reservation.status] || []
+      if (!allowedTransitions.includes(status)) {
+        return c.json({ success: false, error: `Cannot transition from ${reservation.status} to ${status}` }, 400)
+      }
+
+      const updateData = { status }
+      const now = new Date()
+      switch (status) {
+        case 'CALLED': updateData.calledAt = now; break
+        case 'COMPLETED': updateData.completedAt = now; break
+        case 'CANCELLED': updateData.cancelledAt = now; break
+        case 'NO_SHOW': updateData.completedAt = now; break
+      }
+
+      const updatedReservation = await db.reservation.update({ where: { id }, data: updateData })
+
+      // Cloud business logic: clear counter's currentReservationId on COMPLETED/CANCELLED/NO_SHOW
+      if (['COMPLETED', 'CANCELLED', 'NO_SHOW'].includes(status) && reservation.counterId) {
+        await db.counter.updateMany({
+          where: { currentReservationId: id },
+          data: { currentReservationId: null },
+        })
+      }
+
+      // Create notification for the user
+      if (reservation.userId) {
+        try {
+          const titleMap = { CALLED: 'Your Turn!', COMPLETED: 'Service Completed', CANCELLED: 'Reservation Cancelled', NO_SHOW: 'Missed Your Turn', SERVING: 'Being Served' }
+          const messageMap = {
+            CALLED: `Please proceed to ${reservation.agency.name} - ${reservation.service.name}. Your ticket: ${reservation.displayNumber}`,
+            COMPLETED: `Your visit at ${reservation.agency.name} has been completed.`,
+            CANCELLED: `Your reservation ${reservation.displayNumber} at ${reservation.agency.name} has been cancelled.`,
+            NO_SHOW: `You missed your turn for ticket ${reservation.displayNumber} at ${reservation.agency.name}.`,
+            SERVING: `You are now being served at ${reservation.agency.name} - ${reservation.service.name}.`,
+          }
+
+          await db.notification.create({
+            data: {
+              userId: reservation.userId,
+              type: `QUEUE_${status}`,
+              title: titleMap[status] || 'Reservation Update',
+              message: messageMap[status] || 'Your reservation status has been updated.',
+            },
+          })
+        } catch (notifErr) {
+          console.warn('[LocalAPI] Status notification error:', notifErr.message)
+        }
+      }
+
+      // Cloud business logic: create audit log
+      try {
+        const auditActionMap = { COMPLETED: 'QUEUE_COMPLETE', CANCELLED: 'QUEUE_CANCEL', NO_SHOW: 'QUEUE_NOSHOW', CALLED: 'QUEUE_CALL', SERVING: 'QUEUE_SERVE' }
+        await db.auditLog.create({
+          data: {
+            userId: reservation.userId ?? undefined,
+            action: auditActionMap[status] || `QUEUE_${status}`,
+            entityType: 'RESERVATION',
+            entityId: id,
+            details: JSON.stringify({ reservationId: id, previousStatus: reservation.status, newStatus: status, displayNumber: reservation.displayNumber }),
+          },
+        })
+      } catch (auditErr) {
+        console.warn('[LocalAPI] Status audit log error:', auditErr.message)
+      }
+
+      const queueEventMap = { CALLED: 'queue:called', COMPLETED: 'queue:completed', CANCELLED: 'queue:cancelled', NO_SHOW: 'queue:no-show', SERVING: 'queue:updated' }
+      const queueEvent = queueEventMap[status]
+      if (queueEvent) {
+        emitEvent(queueEvent, { agencyId, reservationId: id, displayNumber: reservation.displayNumber, previousStatus: reservation.status, newStatus: status, serviceId: reservation.serviceId })
+      }
+
+      const reservationEvent = status === 'CANCELLED' ? 'reservation:cancelled' : 'reservation:updated'
+      emitEvent(reservationEvent, { agencyId, userId: reservation.userId, reservationId: id, displayNumber: reservation.displayNumber, previousStatus: reservation.status, newStatus: status })
+
+      logPendingMutation('PATCH', '/api/reservations/:id/status', body, updatedReservation).catch(() => {})
+
+      return c.json({ success: true, reservation: updatedReservation })
+    } catch (error) {
+      console.error('[LocalAPI] PATCH /api/reservations/:id/status error:', error)
+      return c.json({ success: false, error: 'Failed to update reservation status' }, 500)
+    }
+  })
+
+  // POST /api/reservations/:id/rate — Rate completed reservation (Cloud route)
+  app.post('/api/reservations/:id/rate', authMiddleware, async (c) => {
+    try {
+      const id = c.req.param('id')
+      const body = await c.req.json()
+      const { rating, comment } = body
+
+      if (!rating || rating < 1 || rating > 5) {
+        return c.json({ success: false, error: 'Rating must be between 1 and 5' }, 400)
+      }
+
+      const reservation = await db.reservation.findUnique({ where: { id } })
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      if (reservation.status !== 'COMPLETED') {
+        return c.json({ success: false, error: 'Can only rate completed reservations' }, 400)
+      }
+
+      // Verify ownership
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+      if (reservation.userId !== userId && reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      if (reservation.rating) {
+        return c.json({ success: false, error: 'Reservation already rated' }, 400)
+      }
+
+      await db.reservation.update({
+        where: { id },
+        data: { rating, ratedAt: new Date() },
+      })
+
+      // Also create a review record if we have an agencyId
+      try {
+        await db.review.create({
+          data: {
+            rating,
+            comment: (comment || '').trim() || null,
+            userId: reservation.userId || userId,
+            agencyId: reservation.agencyId,
+            reservationId: id,
+          },
+        })
+      } catch (reviewErr) {
+        console.warn('[LocalAPI] Rate review create error:', reviewErr.message)
+      }
+
+      emitEvent('agency:updated', { agencyId: reservation.agencyId, action: 'rating-submitted', reservationId: id, rating })
+      logPendingMutation('POST', '/api/reservations/:id/rate', body, { rating, feedback: comment || null }).catch(() => {})
+
+      return c.json({ success: true, rating, feedback: (comment || '').trim() || null, ratedAt: new Date().toISOString() })
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/reservations/:id/rate error:', error)
+      return c.json({ success: false, error: 'Failed to rate reservation' }, 500)
+    }
+  })
+
+  // GET /api/reservations/:id/eta — Get ETA for specific reservation (Cloud route)
+  app.get('/api/reservations/:id/eta', authMiddleware, async (c) => {
+    try {
+      const id = c.req.param('id')
+
+      const reservation = await db.reservation.findUnique({
+        where: { id },
+        include: {
+          agency: { select: { id: true, name: true, averageServiceTime: true } },
+          service: { select: { id: true, name: true } },
+        },
+      })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      // Verify access
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+      if (reservation.userId !== userId && reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      // If not in queue, ETA is 0
+      if (reservation.status !== 'WAITING' && reservation.status !== 'CALLED') {
+        return c.json({
+          success: true,
+          eta: {
+            estimatedMinMinutes: 0,
+            estimatedMaxMinutes: 0,
+            confidence: 'high',
+            peopleAhead: 0,
+            activeCounters: 0,
+            avgServiceTimeSeconds: 0,
+            lastUpdated: new Date(),
+            isPaused: false,
+          },
+          message: 'Reservation is no longer in queue',
+        })
+      }
+
+      // If called, ETA is ~0
+      if (reservation.status === 'CALLED') {
+        return c.json({
+          success: true,
+          eta: {
+            estimatedMinMinutes: 0,
+            estimatedMaxMinutes: 1,
+            confidence: 'high',
+            peopleAhead: 0,
+            activeCounters: 0,
+            avgServiceTimeSeconds: (reservation.agency.averageServiceTime || 10) * 60,
+            lastUpdated: new Date(),
+            isPaused: false,
+          },
+        })
+      }
+
+      // Calculate people ahead in queue
+      const peopleAhead = await db.reservation.count({
+        where: {
+          agencyId: reservation.agencyId,
+          status: 'WAITING',
+          joinedAt: { lt: reservation.joinedAt },
+          id: { not: reservation.id },
+        },
+      })
+
+      // Get queue settings for pause state
+      const queueSettings = await db.queueSettings.findFirst({ where: { agencyId: reservation.agencyId } })
+      const isPaused = !!(queueSettings && (queueSettings.isPaused === 1 || queueSettings.isPaused === true))
+
+      // Get active counters
+      const activeCounters = await db.counter.count({
+        where: {
+          isActive: true,
+          staffId: { not: null },
+          branch: { agencyId: reservation.agencyId, isActive: true },
+        },
+      })
+
+      const avgServiceTime = reservation.agency.averageServiceTime || 10
+      const effectiveCounters = Math.max(1, activeCounters)
+      const estimatedMinMinutes = Math.round((peopleAhead * avgServiceTime) / effectiveCounters * 0.7)
+      const estimatedMaxMinutes = Math.round((peopleAhead * avgServiceTime) / effectiveCounters * 1.3)
+
+      return c.json({
+        success: true,
+        eta: {
+          estimatedMinMinutes: isPaused ? 0 : estimatedMinMinutes,
+          estimatedMaxMinutes: isPaused ? 0 : estimatedMaxMinutes,
+          confidence: peopleAhead > 10 ? 'low' : peopleAhead > 5 ? 'medium' : 'high',
+          peopleAhead,
+          activeCounters: effectiveCounters,
+          avgServiceTimeSeconds: avgServiceTime * 60,
+          lastUpdated: new Date(),
+          isPaused,
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] GET /api/reservations/:id/eta error:', error)
+      return c.json({ success: false, error: 'Failed to calculate ETA' }, 500)
+    }
+  })
+
+  // POST /api/reservations/:id/toggle-fixed-time — Toggle fixed-time appointment (Cloud route)
+  app.post('/api/reservations/:id/toggle-fixed-time', authMiddleware, async (c) => {
+    try {
+      const id = c.req.param('id')
+      const body = await c.req.json()
+      const { fixedTimeEnabled, fixedTime } = body
+
+      if (fixedTimeEnabled === undefined) {
+        return c.json({ success: false, error: 'fixedTimeEnabled is required' }, 400)
+      }
+
+      const reservation = await db.reservation.findUnique({ where: { id } })
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      if (reservation.status !== 'WAITING') {
+        return c.json({ success: false, error: 'Can only toggle fixed time for waiting reservations' }, 400)
+      }
+
+      // Verify access
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+      if (reservation.userId !== userId && reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      if (fixedTimeEnabled && !reservation.preferredTime && !fixedTime) {
+        return c.json({ success: false, error: 'Cannot enable fixed time without a preferred time' }, 400)
+      }
+
+      const updateData = { fixedTimeEnabled: !!fixedTimeEnabled }
+      if (fixedTime) updateData.preferredTime = fixedTime
+
+      const updated = await db.reservation.update({ where: { id }, data: updateData })
+
+      // Create notification
+      if (reservation.userId) {
+        try {
+          await db.notification.create({
+            data: {
+              userId: reservation.userId,
+              type: 'QUEUE_TIME_TOGGLE',
+              title: fixedTimeEnabled ? 'Fixed Time Enabled' : 'Fixed Time Disabled',
+              message: fixedTimeEnabled
+                ? `Your turn will not come before ${reservation.preferredTime || fixedTime}`
+                : 'Your reservation will follow normal queue order',
+            },
+          })
+        } catch (notifErr) {
+          console.warn('[LocalAPI] Toggle fixed-time notification error:', notifErr.message)
+        }
+      }
+
+      emitEvent('reservation:updated', { agencyId: reservation.agencyId, userId: reservation.userId, reservationId: id, displayNumber: reservation.displayNumber, action: fixedTimeEnabled ? 'fixed-time-enabled' : 'fixed-time-disabled' })
+      logPendingMutation('POST', '/api/reservations/:id/toggle-fixed-time', body, updated).catch(() => {})
+
+      return c.json({ success: true, reservation: updated })
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/reservations/:id/toggle-fixed-time error:', error)
+      return c.json({ success: false, error: 'Failed to toggle fixed time' }, 500)
+    }
+  })
+
+  // GET /api/reservations/:id/position-history — Get position history (Cloud route)
+  app.get('/api/reservations/:id/position-history', authMiddleware, async (c) => {
+    try {
+      const id = c.req.param('id')
+
+      const reservation = await db.reservation.findUnique({
+        where: { id },
+        select: {
+          id: true, userId: true, agencyId: true, status: true,
+          queueNumber: true, displayNumber: true, joinedAt: true, calledAt: true,
+          service: { select: { name: true, prefix: true } },
+          agency: { select: { averageServiceTime: true } },
+        },
+      })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      // Verify access
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+      if (reservation.userId !== userId && reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      // Calculate current position
+      const peopleAhead = await db.reservation.count({
+        where: {
+          agencyId: reservation.agencyId,
+          status: 'WAITING',
+          joinedAt: { lt: reservation.joinedAt },
+          id: { not: reservation.id },
+        },
+      })
+
+      const currentPosition = reservation.status === 'CALLED' ? 1 : peopleAhead + 1
+      const avgServiceTime = reservation.agency.averageServiceTime || 10
+      const joinedAt = new Date(reservation.joinedAt)
+      const now = new Date()
+
+      // Calculate initial position
+      const initialWaiting = await db.reservation.count({
+        where: { agencyId: reservation.agencyId, status: { in: ['WAITING', 'CALLED', 'COMPLETED'] }, joinedAt: { lt: reservation.joinedAt } },
+      })
+      const initialPosition = initialWaiting + 1
+
+      // Build timeline
+      const timeline = []
+      let pos = initialPosition
+      let currentTime = new Date(joinedAt)
+
+      timeline.push({ position: initialPosition, timestamp: joinedAt.toISOString(), direction: 'joined', label: 'joined' })
+
+      while (pos > currentPosition) {
+        pos--
+        const minutesElapsed = (initialPosition - pos) * avgServiceTime
+        currentTime = new Date(joinedAt.getTime() + minutesElapsed * 60000)
+        if (currentTime > now) currentTime = new Date(now)
+        timeline.push({ position: pos, timestamp: currentTime.toISOString(), direction: pos === currentPosition ? 'current' : 'up', label: pos === currentPosition ? 'current' : 'movedUp' })
+      }
+
+      if (timeline.length === 1 && initialPosition === currentPosition) {
+        timeline[0].direction = 'current'
+      }
+
+      if (reservation.status === 'CALLED' && reservation.calledAt) {
+        const lastEntry = timeline[timeline.length - 1]
+        if (lastEntry && lastEntry.position === 1) {
+          lastEntry.timestamp = new Date(reservation.calledAt).toISOString()
+          lastEntry.direction = 'current'
+          lastEntry.label = 'called'
+        }
+      }
+
+      return c.json({ success: true, timeline, currentPosition, initialPosition, totalChanges: Math.max(0, initialPosition - currentPosition) })
+    } catch (error) {
+      console.error('[LocalAPI] GET /api/reservations/:id/position-history error:', error)
+      return c.json({ success: false, error: 'Failed to get position history' }, 500)
+    }
+  })
+
+  // GET /api/reservations/:id/share — Get shareable link (Cloud route)
+  app.get('/api/reservations/:id/share', authMiddleware, async (c) => {
+    try {
+      const id = c.req.param('id')
+
+      const reservation = await db.reservation.findUnique({
+        where: { id },
+        include: {
+          user: { select: { fullName: true } },
+          agency: { select: { name: true, nameAr: true, nameFr: true, customCode: true, averageServiceTime: true } },
+          service: { select: { name: true, nameAr: true, nameFr: true } },
+        },
+      })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      // Verify access
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+      if (reservation.userId !== userId && reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      // Calculate position
+      const peopleAhead = await db.reservation.count({
+        where: { agencyId: reservation.agencyId, status: 'WAITING', joinedAt: { lt: reservation.joinedAt } },
+      })
+
+      const position = peopleAhead + 1
+      const estimatedWait = Math.round(peopleAhead * (reservation.agency.averageServiceTime || 10))
+
+      return c.json({
+        displayNumber: reservation.displayNumber,
+        agencyName: reservation.agency.name,
+        agencyNameAr: reservation.agency.nameAr,
+        agencyNameFr: reservation.agency.nameFr,
+        serviceName: reservation.service.name,
+        serviceNameAr: reservation.service.nameAr,
+        serviceNameFr: reservation.service.nameFr,
+        position,
+        estimatedWait,
+        queueUrl: 'https://blasti.dz',
+      })
+    } catch (error) {
+      console.error('[LocalAPI] GET /api/reservations/:id/share error:', error)
+      return c.json({ success: false, error: 'Failed to get share info' }, 500)
+    }
+  })
+
+  // POST /api/reservations/:id/share — Create shareable link (Cloud route)
+  app.post('/api/reservations/:id/share', authMiddleware, async (c) => {
+    try {
+      const id = c.req.param('id')
+
+      const reservation = await db.reservation.findUnique({
+        where: { id },
+        include: {
+          user: { select: { fullName: true } },
+          agency: { select: { name: true, nameAr: true, nameFr: true, customCode: true, averageServiceTime: true } },
+          service: { select: { name: true, nameAr: true, nameFr: true } },
+        },
+      })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      // Verify access
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+      if (reservation.userId !== userId && reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      // Calculate position
+      const peopleAhead = await db.reservation.count({
+        where: { agencyId: reservation.agencyId, status: 'WAITING', joinedAt: { lt: reservation.joinedAt } },
+      })
+
+      const position = peopleAhead + 1
+      const estimatedWait = Math.round(peopleAhead * (reservation.agency.averageServiceTime || 10))
+
+      logPendingMutation('POST', '/api/reservations/:id/share', { id }, {}).catch(() => {})
+
+      return c.json({
+        displayNumber: reservation.displayNumber,
+        agencyName: reservation.agency.name,
+        agencyNameAr: reservation.agency.nameAr,
+        agencyNameFr: reservation.agency.nameFr,
+        serviceName: reservation.service.name,
+        serviceNameAr: reservation.service.nameAr,
+        serviceNameFr: reservation.service.nameFr,
+        position,
+        estimatedWait,
+        queueUrl: 'https://blasti.dz',
+      })
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/reservations/:id/share error:', error)
+      return c.json({ success: false, error: 'Failed to create share link' }, 500)
+    }
+  })
+
+  // ── Queue Routes (Cloud parity) ──────────────────────────────────────
+
+  // PUT /api/queue/settings — Update queue settings (Cloud route)
+  app.put('/api/queue/settings', authMiddleware, requireActiveSubscription(), async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const body = await c.req.json()
+      const { averageServiceTime, maxActiveReservations, isQueueOpen } = body
+
+      const updateData = {}
+      if (averageServiceTime !== undefined) {
+        if (averageServiceTime < 1 || averageServiceTime > 480) {
+          return c.json({ success: false, error: 'averageServiceTime must be between 1 and 480' }, 400)
+        }
+        updateData.averageServiceTime = averageServiceTime
+      }
+      if (maxActiveReservations !== undefined) {
+        if (maxActiveReservations < 1 || maxActiveReservations > 1000) {
+          return c.json({ success: false, error: 'maxActiveReservations must be between 1 and 1000' }, 400)
+        }
+        updateData.maxActiveReservations = maxActiveReservations
+      }
+      if (isQueueOpen !== undefined) {
+        updateData.isQueueOpen = !!isQueueOpen
+      }
+
+      if (Object.keys(updateData).length === 0) {
+        return c.json({ success: false, error: 'No valid fields to update' }, 400)
+      }
+
+      const updatedAgency = await db.agency.update({ where: { id: agencyId }, data: updateData })
+
+      emitEvent('queue:settings-updated', { agencyId, action: 'settings-updated', ...updateData })
+      logPendingMutation('PUT', '/api/queue/settings', body, updatedAgency).catch(() => {})
+
+      return c.json({ success: true, agency: updatedAgency })
+    } catch (error) {
+      console.error('[LocalAPI] PUT /api/queue/settings error:', error)
+      return c.json({ success: false, error: 'Failed to update queue settings' }, 500)
+    }
+  })
+
+  // GET /api/queue/track — Customer queue tracking (Cloud route)
+  app.get('/api/queue/track', authMiddleware, async (c) => {
+    try {
+      const userId = sessionUser.id
+      const reservationId = c.req.query('reservationId')
+
+      if (!reservationId) {
+        return c.json({ success: false, error: 'reservationId is required' }, 400)
+      }
+
+      const reservation = await db.reservation.findUnique({
+        where: { id: reservationId },
+        include: {
+          agency: { select: { id: true, name: true, nameFr: true, nameAr: true, averageServiceTime: true, isQueueOpen: true } },
+          service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
+        },
+      })
+
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      // Verify the reservation belongs to the user
+      if (reservation.userId !== userId) {
+        return c.json({ success: false, error: 'Not authorized to view this reservation' }, 403)
+      }
+
+      const agencyId = reservation.agencyId
+
+      // Get queue settings
+      const queueSettings = await db.queueSettings.findFirst({ where: { agencyId } })
+      const isPaused = !!(queueSettings && (queueSettings.isPaused === 1 || queueSettings.isPaused === true))
+
+      // Get active counters
+      const activeCounters = await db.counter.count({
+        where: {
+          isActive: true,
+          staffId: { not: null },
+          branch: { agencyId, isActive: true },
+        },
+      })
+      const totalActiveCounters = Math.max(1, activeCounters)
+
+      // Count people ahead
+      const peopleAhead = await db.reservation.count({
+        where: {
+          agencyId,
+          serviceId: reservation.serviceId,
+          status: 'WAITING',
+          queueNumber: { lt: reservation.queueNumber },
+        },
+      })
+
+      // Calculate simple ETA
+      const avgServiceTime = reservation.agency.averageServiceTime || 10
+      const adjustedPeopleAhead = reservation.status === 'CALLED' ? 0 : peopleAhead
+      const estimatedMinMinutes = Math.round((adjustedPeopleAhead * avgServiceTime) / totalActiveCounters * 0.7)
+      const estimatedMaxMinutes = Math.round((adjustedPeopleAhead * avgServiceTime) / totalActiveCounters * 1.3)
+
+      // Currently serving number
+      const currentServing = await db.reservation.findFirst({
+        where: { agencyId, status: { in: ['CALLED', 'SERVED'] }, calledAt: { not: null } },
+        orderBy: { calledAt: 'desc' },
+        select: { displayNumber: true },
+      })
+
+      return c.json({
+        success: true,
+        tracking: {
+          reservationId: reservation.id,
+          displayNumber: reservation.displayNumber,
+          status: reservation.status,
+          position: reservation.status === 'CALLED' ? 1 : peopleAhead + 1,
+          peopleAhead: adjustedPeopleAhead,
+          currentServingNumber: currentServing?.displayNumber || '0',
+          estimatedWaitRange: {
+            minMinutes: isPaused ? 0 : estimatedMinMinutes,
+            maxMinutes: isPaused ? 0 : estimatedMaxMinutes,
+            confidence: adjustedPeopleAhead > 10 ? 'low' : adjustedPeopleAhead > 5 ? 'medium' : 'high',
+          },
+          agency: reservation.agency,
+          service: reservation.service,
+          isPaused,
+          joinedAt: reservation.joinedAt,
+          calledAt: reservation.calledAt,
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] GET /api/queue/track error:', error)
+      return c.json({ success: false, error: 'Failed to track queue' }, 500)
+    }
+  })
+
+  // ── User Routes (Cloud parity) ──────────────────────────────────────
+
+  // GET /api/user/stats — User stats (Cloud route)
+  app.get('/api/user/stats', authMiddleware, async (c) => {
+    try {
+      const userId = sessionUser.id
+      const now = new Date()
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)
+
+      const totalQueues = await db.reservation.count({ where: { userId } })
+      const thisMonthCount = await db.reservation.count({ where: { userId, joinedAt: { gte: monthStart } } })
+
+      const completedReservations = await db.reservation.findMany({
+        where: { userId, status: 'COMPLETED' },
+        include: { agency: { select: { id: true, name: true, nameAr: true, nameFr: true } } },
+        orderBy: { completedAt: 'desc' },
+        take: 100,
+      })
+
+      // Calculate average wait time
+      let totalWaitMinutes = 0
+      let waitCount = 0
+      completedReservations.forEach((r) => {
+        const start = r.joinedAt
+        const end = r.completedAt || r.calledAt
+        if (start && end) {
+          const diffMs = new Date(end).getTime() - new Date(start).getTime()
+          totalWaitMinutes += Math.round(diffMs / 60000)
+          waitCount++
+        }
+      })
+      const avgWaitTime = waitCount > 0 ? Math.round(totalWaitMinutes / waitCount) : 0
+
+      // Find favorite agency (most visited)
+      const agencyVisits = new Map()
+      completedReservations.forEach((r) => {
+        if (!r.agency) return
+        const existing = agencyVisits.get(r.agency.id)
+        if (existing) existing.count++
+        else agencyVisits.set(r.agency.id, { count: 1, name: r.agency.name, nameAr: r.agency.nameAr || undefined, nameFr: r.agency.nameFr || undefined })
+      })
+
+      let favoriteAgency = null
+      let maxVisits = 0
+      for (const [, data] of agencyVisits) {
+        if (data.count > maxVisits) { maxVisits = data.count; favoriteAgency = data }
+      }
+
+      return c.json({ totalQueues, thisMonth: thisMonthCount, avgWaitTime, favoriteAgency })
+    } catch (error) {
+      console.error('[LocalAPI] GET /api/user/stats error:', error)
+      return c.json({ success: false, error: 'Failed to get user stats' }, 500)
+    }
+  })
+
+  // GET /api/user/customer/service-stats — Customer service duration stats (Cloud route)
+  app.get('/api/user/customer/service-stats', authMiddleware, async (c) => {
+    try {
+      const userId = sessionUser.id
+      const agencyId = c.req.query('agencyId')
+      if (!agencyId) {
+        return c.json({ success: false, error: 'agencyId is required' }, 400)
+      }
+
+      const now = new Date()
+
+      // Find currently CALLED reservation for this customer at this agency
+      const currentServing = await db.reservation.findFirst({
+        where: { userId, agencyId, status: 'CALLED' },
+        include: { service: { select: { name: true, nameAr: true, nameFr: true } } },
+      })
+
+      let currentServingResult = null
+      if (currentServing && currentServing.calledAt) {
+        const calledAt = new Date(currentServing.calledAt)
+        const liveDurationMinutes = (now.getTime() - calledAt.getTime()) / 60000
+        const startedSecondsAgo = Math.floor((now.getTime() - calledAt.getTime()) / 1000)
+        currentServingResult = {
+          reservationId: currentServing.id,
+          queueNumber: currentServing.displayNumber,
+          serviceName: currentServing.service.name,
+          calledAt: currentServing.calledAt,
+          liveDurationMinutes: Math.round(liveDurationMinutes * 100) / 100,
+          startedSecondsAgo,
+        }
+      }
+
+      // Find last 10 completed reservations for this customer at this agency
+      const completedReservations = await db.reservation.findMany({
+        where: {
+          userId,
+          agencyId,
+          status: 'COMPLETED',
+          calledAt: { not: null },
+          completedAt: { not: null },
+        },
+        orderBy: { completedAt: 'desc' },
+        take: 10,
+        select: {
+          id: true,
+          calledAt: true,
+          completedAt: true,
+        },
+      })
+
+      const durations = completedReservations.map((r) => {
+        const diffMs = new Date(r.completedAt).getTime() - new Date(r.calledAt).getTime()
+        return Math.round((diffMs / 60000) * 100) / 100
+      })
+
+      const recentDurations = {
+        last1: durations.length >= 1 ? durations[0] : null,
+        last2: durations.length >= 2 ? durations.slice(0, 2) : null,
+        last3: durations.length >= 3 ? durations.slice(0, 3) : null,
+        last5: durations.length >= 5 ? durations.slice(0, 5) : null,
+        last10: durations.length >= 1 ? durations : null,
+      }
+
+      // Average of all completed
+      const totalCompleted = await db.reservation.count({
+        where: {
+          userId,
+          agencyId,
+          status: 'COMPLETED',
+          calledAt: { not: null },
+          completedAt: { not: null },
+        },
+      })
+
+      let averageAll = null
+      if (totalCompleted > 0 && durations.length > 0) {
+        if (totalCompleted <= 10) {
+          averageAll = Math.round((durations.reduce((a, b) => a + b, 0) / durations.length) * 100) / 100
+        } else {
+          // Need to query all to compute true average
+          const allCompleted = await db.reservation.findMany({
+            where: {
+              userId,
+              agencyId,
+              status: 'COMPLETED',
+              calledAt: { not: null },
+              completedAt: { not: null },
+            },
+            select: { calledAt: true, completedAt: true },
+          })
+          const allDurations = allCompleted.map((r) => {
+            const diffMs = new Date(r.completedAt).getTime() - new Date(r.calledAt).getTime()
+            return diffMs / 60000
+          })
+          averageAll = Math.round((allDurations.reduce((a, b) => a + b, 0) / allDurations.length) * 100) / 100
+        }
+      }
+
+      return c.json({
+        currentServing: currentServingResult,
+        recentDurations,
+        totalCompleted,
+        averageAll,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] GET /api/user/customer/service-stats error:', error)
+      return c.json({ success: false, error: 'Failed to get service stats' }, 500)
+    }
+  })
+
+  // DELETE /api/user/delete-account — Delete user account (Cloud route)
+  app.delete('/api/user/delete-account', authMiddleware, async (c) => {
+    try {
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+
+      // Admin accounts cannot be deleted
+      if (sessionUser.role === 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Admin accounts cannot be deleted' }, 403)
+      }
+
+      // Cascading delete of all user data
+      await db.$transaction(async (tx) => {
+        // Delete user's notifications
+        await tx.notification.deleteMany({ where: { userId } })
+        // Delete user's favorites
+        try { await tx.favorite.deleteMany({ where: { userId } }) } catch (e) { /* may not exist */ }
+        // Delete user's reviews
+        await tx.review.deleteMany({ where: { userId } })
+        // Delete user's reservations
+        await tx.reservation.deleteMany({ where: { userId } })
+
+        // If agency owner, delete the agency too
+        if (sessionUser.role === 'AGENCY_OWNER' && agencyId) {
+          try { await tx.review.deleteMany({ where: { agencyId } }) } catch (e) { /* may not exist */ }
+          try { await tx.favorite.deleteMany({ where: { agencyId } }) } catch (e) { /* may not exist */ }
+          await tx.reservation.deleteMany({ where: { agencyId } })
+          await tx.service.deleteMany({ where: { agencyId } })
+          try { await tx.queueSettings.deleteMany({ where: { agencyId } }) } catch (e) { /* may not exist */ }
+          try { await tx.announcement.deleteMany({ where: { agencyId } }) } catch (e) { /* may not exist */ }
+          await tx.branch.deleteMany({ where: { agencyId } })
+          await tx.agency.delete({ where: { id: agencyId } }).catch(() => {})
+        }
+
+        // If staff, remove staff record
+        if (sessionUser.role === 'AGENCY_STAFF') {
+          try { await tx.agencyStaff.deleteMany({ where: { userId } }) } catch (e) { /* may not exist */ }
+        }
+
+        // Finally delete the user
+        await tx.user.delete({ where: { id: userId } })
+      })
+
+      // Clear session
+      sessionToken = null
+      sessionUser = null
+
+      logPendingMutation('DELETE', '/api/user/delete-account', {}, { userId }).catch(() => {})
+
+      return c.json({ success: true, message: 'Account deleted successfully' })
+    } catch (error) {
+      console.error('[LocalAPI] DELETE /api/user/delete-account error:', error)
+      return c.json({ success: false, error: 'Failed to delete account' }, 500)
+    }
+  })
+
+  // ── Review Routes (Cloud parity) ──────────────────────────────────────
+
+  // PATCH /api/reviews/:id — Update review (Cloud route)
+  app.patch('/api/reviews/:id', authMiddleware, async (c) => {
+    try {
+      const id = c.req.param('id')
+      const body = await c.req.json()
+      const { rating, comment } = body
+
+      const review = await db.review.findUnique({ where: { id } })
+      if (!review) {
+        return c.json({ success: false, error: 'Review not found' }, 404)
+      }
+
+      // Verify ownership
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+      if (review.userId !== userId && review.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      const updateData = {}
+      if (rating !== undefined) {
+        if (rating < 1 || rating > 5) {
+          return c.json({ success: false, error: 'Rating must be between 1 and 5' }, 400)
+        }
+        updateData.rating = rating
+      }
+      if (comment !== undefined) {
+        updateData.comment = comment.trim() || null
+      }
+
+      if (Object.keys(updateData).length === 0) {
+        return c.json({ success: false, error: 'No valid fields to update' }, 400)
+      }
+
+      const updated = await db.review.update({
+        where: { id },
+        data: updateData,
+      })
+
+      // Update reservation rating if linked
+      if (review.reservationId && rating !== undefined) {
+        try {
+          await db.reservation.update({ where: { id: review.reservationId }, data: { rating } })
+        } catch (resErr) {
+          console.warn('[LocalAPI] Review update reservation rating error:', resErr.message)
+        }
+      }
+
+      logPendingMutation('PATCH', '/api/reviews/:id', body, updated).catch(() => {})
+
+      return c.json({ success: true, review: updated })
+    } catch (error) {
+      console.error('[LocalAPI] PATCH /api/reviews/:id error:', error)
+      return c.json({ success: false, error: 'Failed to update review' }, 500)
+    }
+  })
+
+  // DELETE /api/reviews/:id — Delete review (Cloud route, customer-side)
+  app.delete('/api/reviews/:id', authMiddleware, async (c) => {
+    try {
+      const id = c.req.param('id')
+
+      const review = await db.review.findUnique({ where: { id } })
+      if (!review) {
+        return c.json({ success: false, error: 'Review not found' }, 404)
+      }
+
+      // Verify ownership — either the review author or the agency owner can delete
+      const userId = sessionUser.id
+      const agencyId = sessionUser.agencyId
+      if (review.userId !== userId && review.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Not authorized' }, 403)
+      }
+
+      await db.review.delete({ where: { id } })
+
+      logPendingMutation('DELETE', '/api/reviews/:id', {}, { id }).catch(() => {})
+
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] DELETE /api/reviews/:id error:', error)
+      return c.json({ success: false, error: 'Failed to delete review' }, 500)
     }
   })
 

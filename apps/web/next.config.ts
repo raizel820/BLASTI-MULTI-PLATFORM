@@ -28,19 +28,32 @@ const nextConfig: NextConfig = {
     '127.0.0.1',
   ],
 
-  // NOTE: API proxy rewrites have been REMOVED.
+  // ── API proxy rewrites ──────────────────────────────────────────────────────
   //
-  // Previously, /api/* requests were proxied to the cloud API (localhost:3003).
-  // In Next.js 16, when the rewrite destination is unreachable, the proxy can
-  // crash the entire dev server. This was causing the Electron desktop app
-  // to "stop working" when the cloud API was shut down.
+  // Proxy /api/* and /socket.io/* requests to the cloud API server.
+  // This ensures API calls work both:
+  //   - Through the Caddy gateway (port 81) — XTransformPort=3003 query param
+  //   - Directly to Next.js dev server (port 3000) — rewrites handle the routing
   //
-  // The API client (api-client.ts) now handles routing directly:
-  // - Web browser: connects to cloud API URL (NEXT_PUBLIC_API_URL or localhost:3003)
-  // - Electron: connects to cloud API, with automatic LAN failover to localhost:3080
-  // - Capacitor: connects to cloud API URL (NEXT_PUBLIC_API_URL or vercel)
+  // The destination is configurable via API_PROXY_URL (defaults to
+  // http://localhost:3003) so different environments can override it.
   //
-  // Socket.IO: handled client-side via the useRealtime hook.
+  // Note: In Next.js 16, if the rewrite destination is unreachable the dev
+  // server may log proxy errors, but this is acceptable for development.
+  // The API client's retry/unreachable logic handles downstream failures.
+  async rewrites() {
+    const apiProxyUrl = process.env.API_PROXY_URL || 'http://localhost:3003';
+    return [
+      {
+        source: '/api/:path*',
+        destination: `${apiProxyUrl}/api/:path*`,
+      },
+      {
+        source: '/socket.io/:path*',
+        destination: `${apiProxyUrl}/socket.io/:path*`,
+      },
+    ];
+  },
 };
 
 export default nextConfig;

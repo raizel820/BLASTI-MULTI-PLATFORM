@@ -27,6 +27,10 @@ interface AuthState {
   isExpiringSoon: boolean;
   lastCloudContact: number | null;
 
+  // Initial sync awareness
+  needsInitialSync: boolean;
+  initialSyncChecked: boolean;
+
   _offlineCheckInterval: ReturnType<typeof setInterval> | null;
 
   login: (username: string, password: string) => Promise<void>;
@@ -36,6 +40,8 @@ interface AuthState {
   checkOfflineStatus: () => Promise<void>;
   startOfflineCheck: () => void;
   stopOfflineCheck: () => void;
+  checkInitialSync: () => Promise<boolean>;
+  setInitialSyncComplete: () => void;
 }
 
 export const useAuth = create<AuthState>((set, get) => ({
@@ -53,6 +59,11 @@ export const useAuth = create<AuthState>((set, get) => ({
   offlineTokenRemainingMs: null,
   isExpiringSoon: false,
   lastCloudContact: null,
+
+  // Initial sync awareness
+  needsInitialSync: false,
+  initialSyncChecked: false,
+
   _offlineCheckInterval: null,
 
   login: async (username: string, password: string) => {
@@ -76,6 +87,8 @@ export const useAuth = create<AuthState>((set, get) => ({
       } catch {}
       // Start periodic offline token check
       get().startOfflineCheck();
+      // Check if initial sync is needed
+      get().checkInitialSync();
     } catch (err) {
       const error = err instanceof Error ? err.message : 'Login failed';
       set({ error, isLoading: false });
@@ -95,7 +108,7 @@ export const useAuth = create<AuthState>((set, get) => ({
       (window as any).electronAPI?.clearCloudSyncAuth?.();
       (window as any).electronAPI?.clearLocalApiSession?.();
     } catch {}
-    set({ user: null, token: null, isAuthenticated: false, loginSource: null, offlineWarning: null, offlineTokenRemainingMs: null, isExpiringSoon: false, lastCloudContact: null });
+    set({ user: null, token: null, isAuthenticated: false, loginSource: null, offlineWarning: null, offlineTokenRemainingMs: null, isExpiringSoon: false, lastCloudContact: null, needsInitialSync: false, initialSyncChecked: false });
   },
 
   restoreSession: () => {
@@ -157,5 +170,23 @@ export const useAuth = create<AuthState>((set, get) => ({
       clearInterval(state._offlineCheckInterval);
       set({ _offlineCheckInterval: null });
     }
+  },
+
+  checkInitialSync: async () => {
+    try {
+      const result = await api.getInitialSyncStatus();
+      const needsSync = result.needsInitialSync === true;
+      set({ needsInitialSync: needsSync, initialSyncChecked: true });
+      return needsSync;
+    } catch {
+      // If we can't check, assume no initial sync needed
+      // (the local DB might already have data from a previous session)
+      set({ needsInitialSync: false, initialSyncChecked: true });
+      return false;
+    }
+  },
+
+  setInitialSyncComplete: () => {
+    set({ needsInitialSync: false });
   },
 }));

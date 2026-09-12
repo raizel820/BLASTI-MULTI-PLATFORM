@@ -1127,3 +1127,27 @@ model SyncCursor {
 
   @@index([agencyId])
 }
+
+/// Agency local initialization state — tracks the initial sync lifecycle.
+/// Replaces ad-hoc _sync_meta key-value entries for initialization tracking.
+model AgencyLocalState {
+  id                      String   @id @default(cuid())
+  agencyId                String   @unique
+  initializationStatus    String   @default("NOT_INITIALIZED")  // NOT_INITIALIZED, INITIALIZING, READY, FAILED, UPGRADING
+  initializationSessionId String?
+  initializationStartedAt DateTime?
+  initializationCompletedAt DateTime?
+  currentStage            String?
+  currentCursor           String?
+  currentBatch            Int      @default(0)
+  recordsImported         Int      @default(0)
+  lastError               String?
+  schemaVersion           Int      @default(1)
+  syncProtocolVersion     Int      @default(2)
+  snapshotSequence        Int      @default(0)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  @@index([initializationStatus])
+  @@index([agencyId, initializationStatus])
+}

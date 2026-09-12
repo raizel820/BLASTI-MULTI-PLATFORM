@@ -2,7 +2,7 @@
 import { apiFetch } from '@/lib/api-fetch';;
 
 import { useState, useCallback } from 'react';
-import { apiClient } from '@/lib/api-client';
+import { apiClient, setSessionToken as setApiClientToken, clearSessionToken as clearApiClientToken } from '@/lib/api-client';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
@@ -63,6 +63,12 @@ export function LoginForm() {
       const data = await res.json();
 
       if (res.ok && data.user) {
+        // Immediately cache the token in the API client module so subsequent
+        // requests include the Authorization header without waiting for
+        // Zustand's persist middleware to write to localStorage.
+        if (data.token) {
+          setApiClientToken(data.token);
+        }
         setLoginSuccess(true);
         setTimeout(() => {
           setUser(data.user);

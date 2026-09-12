@@ -393,6 +393,13 @@ export const useAppStore = create<AppState>()(
           pendingAgencyCode: null,
           onboarded: false,
         });
+        // Clear the API client's cached session token immediately
+        try {
+          // Dynamic import to avoid circular dependency at module init time
+          import('@/lib/api-client').then(({ clearSessionToken }) => {
+            clearSessionToken();
+          }).catch(() => {});
+        } catch { /* ignore */ }
         // Clear persisted storage AFTER set (persist middleware writes during set)
         // Also call the Hono backend logout endpoint to clear the JWT session cookie
         setTimeout(() => {

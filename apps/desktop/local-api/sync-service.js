@@ -791,6 +791,35 @@ async function _pullFromCloud() {
 
   var pullStart = Date.now();
   var sinceSequence = await _getLastPulledSequence();
+
+  // ── Snapshot sequence baseline ─────────────────────────────────────────
+  // If _lastPulledSequence is 0 (never synced incrementally), check if
+  // initial sync has completed and use its snapshotSequence as the baseline.
+  // This ensures incremental sync only pulls changes AFTER the initial sync
+  // snapshot was taken, avoiding redundant re-processing of already-imported data.
+  if (sinceSequence === 0 && agencyId) {
+    try {
+      const initialSync = require('./initial-sync');
+      const ready = await initialSync.isAgencyReady(db, agencyId);
+      if (ready) {
+        // Read snapshotSequence from AgencyLocalState
+        const state = await db.agencyLocalState.findUnique({
+          where: { agencyId },
+          select: { snapshotSequence: true },
+        });
+        if (state && state.snapshotSequence > 0) {
+          sinceSequence = state.snapshotSequence;
+          // Persist as _lastPulledSequence so we don't re-check every cycle
+          await _setLastPulledSequence(sinceSequence);
+          console.log('[SyncService] Using initial sync snapshot sequence as baseline: ' + sinceSequence);
+        }
+      }
+    } catch (e) {
+      // AgencyLocalState may not exist — proceed with sinceSequence=0
+      console.warn('[SyncService] Could not read snapshot sequence from AgencyLocalState:', e.message);
+    }
+  }
+
   console.log('[SyncService] Pulling from cloud - agency: ' + agencyId + ', sinceSequence: ' + sinceSequence);
 
   var pullData = await _cloudPost('/api/sync/pull', {
@@ -1460,6 +1489,27 @@ async function _syncCycle() {
     return;
   }
 
+  // Check AgencyLocalState — only pull from cloud if initial sync is READY.
+  // If initial sync hasn't completed yet, skip incremental pull (initial-sync.js
+  // handles first-time bulk import via POST /api/sync/initial-data).
+  if (_config.agencyId) {
+    try {
+      const initialSync = require('./initial-sync');
+      const ready = await initialSync.isAgencyReady(_config.localDb, _config.agencyId);
+      if (!ready) {
+        console.log('[SyncService] Agency not initialized yet — skipping incremental pull (waiting for initial sync)');
+        emit({ type: 'sync-paused', reason: 'initial-sync-pending' });
+        // Still replay any pending local mutations
+        await _replayPendingMutations().catch(() => {});
+        return;
+      }
+    } catch (e) {
+      // If AgencyLocalState table doesn't exist yet, allow sync to proceed
+      // (backward compatibility — the table will be created after prisma generate)
+      console.warn('[SyncService] Could not check AgencyLocalState:', e.message);
+    }
+  }
+
   var online = await _isOnline();
   if (!online) {
     // Cloud is unreachable — check if local API is healthy.
@@ -1687,16 +1737,33 @@ function setAuth(token, userContext) {
   }
   console.log('[SyncService] Auth set - user: ' + (userContext && userContext.id) + ', role: ' + (userContext && userContext.role) + ', agency: ' + (userContext && userContext.agencyId || 'none'));
 
-  // Trigger an immediate sync after auth is set (for post-login initial sync)
-  if (_isStarted && token) {
-    // Reset sync version to force a full pull on first sync after login
-    _setLastSyncVersion(0).then(function() {
-      _setLastPulledSequence(0).catch(function() {});
-      console.log('[SyncService] Auth set — triggering immediate initial sync');
-      _syncCycle().catch(function(err) {
-        console.error('[SyncService] Post-auth sync error:', err.message);
+  // ── Check AgencyLocalState to determine sync readiness ──────────────────
+  // After setting auth, check if the agency is initialized:
+  //   - READY:      start incremental sync immediately
+  //   - NOT_INITIALIZED: emit 'sync:initial-required' so the frontend triggers initial sync
+  const agencyId = userContext && userContext.agencyId;
+  if (agencyId && _config && _config.localDb && _isStarted) {
+    try {
+      const initialSync = require('./initial-sync');
+      initialSync.isAgencyReady(_config.localDb, agencyId).then(function(ready) {
+        if (ready) {
+          console.log('[SyncService] Agency is READY — triggering incremental sync');
+          _syncCycle().catch(function(err) {
+            console.error('[SyncService] Incremental sync error after setAuth:', err.message);
+          });
+        } else {
+          console.log('[SyncService] Agency NOT_INITIALIZED — emitting sync:initial-required');
+          emit({ type: 'sync:initial-required', agencyId: agencyId });
+        }
+      }).catch(function(e) {
+        // AgencyLocalState may not exist yet — emit initial-required as default
+        console.warn('[SyncService] Could not check AgencyLocalState after setAuth:', e.message);
+        emit({ type: 'sync:initial-required', agencyId: agencyId });
       });
-    }).catch(function() { /* ignore */ });
+    } catch (e) {
+      // initial-sync module not available — skip check
+      console.warn('[SyncService] Could not load initial-sync module:', e.message);
+    }
   }
 }
 
@@ -1763,93 +1830,10 @@ async function resolveConflict(conflictId, resolution) {
   console.log('[SyncService] Conflict ' + conflictId + ' resolved: ' + resolution);
 }
 
-/**
- * Perform an initial full sync after login.
- * Resets sync cursor to epoch to pull ALL agency data from cloud.
- * Returns a promise that resolves when sync completes (or fails).
- */
-async function initialSync() {
-  if (!_authToken) {
-    console.warn('[SyncService] initialSync called but no auth token set');
-    return { success: false, error: 'No auth token' };
-  }
-  if (!_config || !_config.localDb) {
-    console.warn('[SyncService] initialSync called but local DB not ready');
-    return { success: false, error: 'Local DB not ready' };
-  }
-
-  // Reset sync cursor to force full pull
-  await _setLastSyncVersion(0);
-  await _setLastSyncTimestamp(0);
-  await _setLastPulledSequence(0);
-
-  console.log('[SyncService] Starting initial full sync (post-login)...');
-  emit({ type: 'sync-start', initial: true });
-
-  try {
-    var online = await _isOnline();
-    if (!online) {
-      _lastError = 'offline';
-      emit({ type: 'sync-paused', reason: 'offline' });
-      return { success: false, error: 'Cloud API is offline — will sync when connection returns' };
-    }
-
-    await _checkAndResetForNewAgency();
-    var pullResult = await _pullFromCloud();
-    var pushResult = await _pushToCloud();
-    _lastSyncAt = new Date();
-    _resetBackoff();
-
-    // Cleanup old tombstones
-    await _cleanupTombstones(_config.localDb);
-
-    // Replay pending mutations after initial sync
-    await _replayPendingMutations().catch(function(err) {
-      console.warn('[SyncService] Initial sync mutation replay error:', err.message);
-    });
-
-    // Mark successful cloud contact for 3-day offline token policy
-    try {
-      const localApi = require('./index');
-      if (localApi.markCloudContact) localApi.markCloudContact();
-    } catch {}
-
-    var totalConflicts = pullResult.conflicts + pushResult.conflicts;
-    var result = {
-      success: true,
-      pulled: pullResult.applied,
-      pushed: pushResult.pushed,
-      deleted: pullResult.deleted,
-      conflicts: totalConflicts,
-      mutationsPushed: pushResult.mutationsPushed || 0,
-      mutationsFailed: pushResult.mutationsFailed || 0,
-    };
-    emit({
-      type: 'sync-complete',
-      stats: {
-        pulled: pullResult.applied,
-        pushed: pushResult.pushed,
-        deleted: pullResult.deleted,
-        conflicts: totalConflicts,
-        mutationsPushed: pushResult.mutationsPushed || 0,
-        mutationsFailed: pushResult.mutationsFailed || 0,
-      },
-    });
-    console.log('[SyncService] Initial sync complete - pulled: ' + pullResult.applied + ', pushed: ' + pushResult.pushed);
-    return result;
-  } catch (err) {
-    _lastError = err.message;
-    console.error('[SyncService] Initial sync failed:', err.message);
-    emit({ type: 'sync-error', error: err.message });
-    return { success: false, error: err.message };
-  }
-}
-
 module.exports = {
   startSync: startSync,
   stopSync: stopSync,
   triggerSyncNow: triggerSyncNow,
-  initialSync: initialSync,
   getStatus: getStatus,
   setAuth: setAuth,
   clearAuth: clearAuth,
@@ -1858,4 +1842,7 @@ module.exports = {
   resolveConflict: resolveConflict,
   getSyncLog: getSyncLog,
   cleanupTombstones: cleanupTombstones,
+  // Accessors for main.js to get auth/agency info for initial-sync IPC
+  _getAuthToken: function() { return _authToken; },
+  _getAgencyId: function() { return _config ? _config.agencyId : ''; },
 };

@@ -55,6 +55,16 @@ const SYNC_MODELS = [
   'AgencyStaff',
   'Review',
   'User',
+  // ── 9 models added for full sync coverage (Task 2a) ────────────────────
+  'SmsSettings',
+  'PaymentSettings',
+  'Announcement',
+  'GlobalAnnouncement',
+  'Transaction',
+  'SubscriptionPlan',
+  'PlanFeature',
+  'Favorite',
+  'FAQ',
 ] as const
 
 type SyncModel = typeof SYNC_MODELS[number]
@@ -380,6 +390,110 @@ async function fetchRecordsForModel(
           phoneNumber: true, role: true, language: true,
           isActive: true, syncVersion: true,
           createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    // ── 9 models added for full sync coverage (Task 2a) ──────────────────
+    case 'SmsSettings': {
+      return cloudDb.smsSettings.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, provider: true, apiUrl: true, senderName: true,
+          enabled: true, smsPerReminder: true, maxSmsPerDay: true,
+          testPhoneNumber: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'PaymentSettings': {
+      return cloudDb.paymentSettings.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, ccpEnabled: true, bankEnabled: true, electronicEnabled: true,
+          ccpAccount: true, ccpKey: true, bankName: true, bankAccount: true,
+          bankRib: true, ewalletNumber: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'Announcement': {
+      return cloudDb.announcement.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, agencyId: true, message: true, type: true,
+          isActive: true, expiresAt: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'GlobalAnnouncement': {
+      return cloudDb.globalAnnouncement.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, message: true, type: true, createdBy: true,
+          syncVersion: true, createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'Transaction': {
+      return cloudDb.transaction.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, agencyId: true, amount: true, plan: true,
+          paymentMethod: true, status: true, rejectionReason: true,
+          reviewedBy: true, reviewedAt: true, amountPaid: true,
+          planName: true, priceSnapshot: true, currencySnapshot: true,
+          version: true, paymentProvider: true, providerRef: true,
+          webhookVerified: true, reconciledAt: true, reconciledBy: true,
+          syncVersion: true, createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'SubscriptionPlan': {
+      return cloudDb.subscriptionPlan.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, name: true, displayName: true, displayNameAr: true,
+          displayNameFr: true, price: true, currency: true,
+          billingCycle: true, maxServices: true, maxBranches: true,
+          maxStaff: true, maxActiveReservations: true, maxSmsPerMonth: true,
+          kioskModeEnabled: true, analyticsEnabled: true, priorityListing: true,
+          customBranding: true, apiAccess: true, isActive: true,
+          sortOrder: true, quarterlyDiscount: true, semiAnnualDiscount: true,
+          annualDiscount: true, biennialDiscount: true, isEnterprise: true,
+          ownerAgencyId: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'PlanFeature': {
+      return cloudDb.planFeature.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, planId: true, featureKey: true,
+          featureName: true, featureNameAr: true, featureNameFr: true,
+          enabled: true, limitValue: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'Favorite': {
+      return cloudDb.favorite.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, userId: true, agencyId: true,
+          syncVersion: true, createdAt: true, updatedAt: true,
+        },
+      })
+    }
+    case 'FAQ': {
+      return cloudDb.faq.findMany({
+        where: { id: { in: recordIds } },
+        select: {
+          id: true, question: true, questionFr: true, questionAr: true,
+          answer: true, answerFr: true, answerAr: true,
+          category: true, order: true, isActive: true,
+          syncVersion: true, createdAt: true, updatedAt: true,
         },
       })
     }

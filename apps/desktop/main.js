@@ -1065,6 +1065,8 @@ ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
     syncService.setAuth(token, user);
 
     // Ensure sync service is started (it may not have been started yet)
+    // The sync service will check AgencyLocalState and only start pulling
+    // if status is READY. Initial sync is handled separately by initial-sync.js.
     try {
       const { localDb } = require('./local-api/lib/db');
       if (localDb && !syncService.getStatus()?.isStarted) {
@@ -1083,18 +1085,13 @@ ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
       console.warn('[IPC] Failed to start sync service:', startErr.message);
     }
 
-    // Trigger immediate initial sync to pull all agency data from cloud
-    try {
-      syncService.initialSync().then((result) => {
-        if (result?.success) {
-          console.log('[IPC] Initial sync after login: pulled', result.pulled, 'pushed', result.pushed);
-        } else {
-          console.warn('[IPC] Initial sync after login failed:', result?.error);
-        }
-      }).catch((err) => {
-        console.warn('[IPC] Initial sync after login error:', err.message);
-      });
-    } catch { /* non-blocking */ }
+    // NOTE: We do NOT call syncService.initialSync() here.
+    // Initial sync (first-time bulk import) is handled by initial-sync.js,
+    // which is triggered separately and uses the POST /api/sync/initial-data
+    // endpoint. The sync service only handles incremental sync and will
+    // check AgencyLocalState.status === 'READY' before pulling.
+    // Calling both initialSync() and startSync() simultaneously caused
+    // competing sync mechanisms and data corruption.
 
     // Persist auth to file so the loading screen can import agency data on next launch
     try {
@@ -1168,8 +1165,50 @@ ipcMain.handle('cloud-sync:trigger', async () => {
 
 ipcMain.handle('cloud-sync:initial-sync', async () => {
   try {
+    // Use initial-sync.js (not syncService.initialSync) for proper staged import
+    // via POST /api/sync/initial-data
+    const initialSync = require('./local-api/initial-sync');
+    const { localDb } = require('./local-api/lib/db');
     const syncService = require('./local-api/sync-service');
-    const result = await syncService.initialSync();
+
+    // Get auth info from sync service
+    const status = syncService.getStatus();
+    if (!status?.isStarted || !localDb) {
+      return { success: false, error: 'Sync service not initialized' };
+    }
+
+    const isDevMode = process.env.NODE_ENV === 'development' || process.env.ELECTRON_DEV === '1';
+    const syncCloudUrl = isDevMode
+      ? (process.env.BLASTI_API_URL || 'http://localhost:3003')
+      : (process.env.BLASTI_CLOUD_URL || 'https://blasti-api.vercel.app');
+
+    // Get auth token from sync service internals
+    const authToken = syncService._getAuthToken ? syncService._getAuthToken() : null;
+    if (!authToken) {
+      return { success: false, error: 'No auth token available' };
+    }
+
+    const agencyId = syncService._getAgencyId ? syncService._getAgencyId() : (status.agencyId || '');
+    if (!agencyId) {
+      return { success: false, error: 'No agency ID available' };
+    }
+
+    const result = await initialSync.runInitialSync({
+      agencyId,
+      cloudAuthToken: authToken,
+      cloudUrl: syncCloudUrl,
+      db: localDb,
+      emitFn: (event) => {
+        // Forward events to renderer if needed
+        try {
+          const win = BrowserWindow.getAllWindows()[0];
+          if (win && !win.isDestroyed()) {
+            win.webContents.send('initial-sync:event', event);
+          }
+        } catch { /* ignore */ }
+      },
+    });
+
     return result;
   } catch (err) {
     console.error('[IPC] cloud-sync:initial-sync failed:', err.message);

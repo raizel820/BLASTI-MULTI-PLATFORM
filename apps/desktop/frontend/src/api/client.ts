@@ -478,6 +478,26 @@ class ApiClient {
     return this.request('/api/sync/trigger', { method: 'POST' });
   }
 
+  // ─── Initial Sync ─────────────────────────────────────────────
+  async getInitialSyncStatus() {
+    return this.request('/api/sync/initial-status');
+  }
+
+  async startInitialSync(agencyId: string, cloudAuthToken: string) {
+    return this.request('/api/sync/initial-sync', {
+      method: 'POST',
+      body: { agencyId, cloudAuthToken },
+    });
+  }
+
+  async abortInitialSync() {
+    return this.request('/api/sync/initial-sync/abort', { method: 'POST' });
+  }
+
+  async resetInitialSync() {
+    return this.request('/api/sync/initial-sync/reset', { method: 'POST' });
+  }
+
   // ─── Health ────────────────────────────────────────────────────
   async healthCheck() {
     return this.request('/api/health');

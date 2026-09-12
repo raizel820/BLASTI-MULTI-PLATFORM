@@ -1,250 +1,409 @@
-import { useCallback, useState } from 'react';
+import { useMemo } from 'react';
+import { motion } from 'framer-motion';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import {
-  ArrowRight,
-  Check,
-  X,
-  AlertTriangle,
-  RotateCcw,
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
+import {
   Clock,
+  Users,
+  CheckCircle2,
+  AlertTriangle,
+  PhoneCall,
+  Pause,
+  Play,
+  UserPlus,
+  QrCode,
   Loader2,
-  Plus,
+  RefreshCw,
 } from 'lucide-react';
-import api from '@/api/client';
-import { usePolling } from '@/hooks/use-api';
-import { useKeyboard } from '@/hooks/use-keyboard';
-import { formatTime, getStatusBgColor, formatWaitTime } from '@/lib/utils';
 
-interface Reservation {
-  id: string;
-  ticketNumber: string;
-  customerName?: string;
-  serviceName?: string;
-  status: string;
-  position?: number;
-  createdAt?: string;
-  calledAt?: string;
-  estimatedWaitMinutes?: number;
-  counterName?: string;
-}
+// Shared dashboard sub-components
+import { QueueControls } from '@/components/agency/dashboard/queue-controls';
+import { WaitingList } from '@/components/agency/dashboard/waiting-list';
+import { CounterManagement } from '@/components/agency/dashboard/counter-management';
+import { QueueTimeline } from '@/components/agency/dashboard/queue-timeline';
+import { TodaysSummary } from '@/components/agency/dashboard/todays-summary';
+import { ETABadge } from '@/components/agency/dashboard/eta-badge';
+import { ServiceBreakdown } from '@/components/agency/dashboard/service-breakdown';
+import { useDashboardData } from '@/components/agency/dashboard/use-dashboard-data';
 
 export default function QueuePage() {
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [showJoinDialog, setShowJoinDialog] = useState(false);
-  const [joinName, setJoinName] = useState('');
-  const [joinService, setJoinService] = useState('');
+  const {
+    t,
+    lang,
+    stats,
+    waitingList,
+    serviceStats,
+    loading,
+    actionLoading,
+    currentlyServed,
+    waitingOnly,
+    served,
+    safeCompletionRate,
+    maxWaiting,
+    queueProgress,
+    waitLevel,
+    waitLevelConfig,
+    lastUpdatedStr,
+    sparkData1,
+    sparkData2,
+    sparkData3,
+    batchMode,
+    selectedIds,
+    walkInOpen,
+    walkInName,
+    walkInServiceId,
+    walkInLoading,
+    showQrModal,
+    qrCodeDataUrl,
+    agencyCode,
+    fetchData,
+    handleCallNext,
+    handleTogglePause,
+    handleAction,
+    toggleBatchSelection,
+    exitBatchMode,
+    setBatchMode,
+    setWalkInOpen,
+    setWalkInName,
+    setWalkInServiceId,
+    setShowQrModal,
+    handleAddWalkIn,
+  } = useDashboardData();
 
-  const fetchQueue = useCallback(() => api.getQueue(), []);
-  const { data: queueData, isLoading, refetch } = usePolling(
-    fetchQueue, 2000
-  );
+  const avgWait = stats?.avgWaitTime ?? 0;
+  const totalToday = stats?.todayReservations ?? 0;
+  const calledEntries = useMemo(() => waitingList.filter(e => e.status === 'CALLED'), [waitingList]);
 
-  const reservations = ((queueData?.queue || queueData?.reservations || queueData?.data || []) as Reservation[]) || [];
-  const waiting = reservations.filter((r) => r.status === 'WAITING');
-  const active = reservations.filter((r) => ['CALLED', 'SERVING'].includes(r.status));
-  const completed = reservations.filter((r) => ['COMPLETED', 'CANCELLED', 'NO_SHOW'].includes(r.status));
-
-  // Keyboard shortcuts
-  useKeyboard([
-    { key: 'n', ctrl: true, handler: () => handleCallNext(), description: 'Call next' },
-    { key: 'j', ctrl: true, handler: () => setShowJoinDialog(true), description: 'Join queue' },
-  ]);
-
-  const handleCallNext = async () => {
-    try {
-      await api.callNext();
-      refetch();
-    } catch { /* */ }
-  };
-
-  const handleAction = async (id: string, action: 'call' | 'complete' | 'noshow' | 'cancel' | 'recall') => {
-    try {
-      switch (action) {
-        case 'call': await api.callReservation(id); break;
-        case 'complete': await api.completeReservation(id); break;
-        case 'noshow': await api.noShowReservation(id); break;
-        case 'cancel': await api.cancelReservation(id); break;
-        case 'recall': await api.recallReservation(id); break;
-      }
-      refetch();
-    } catch { /* */ }
-  };
-
-  const handleJoin = async () => {
-    try {
-      await api.joinQueue({
-        customerName: joinName || undefined,
-        serviceName: joinService || undefined,
-      });
-      setShowJoinDialog(false);
-      setJoinName('');
-      setJoinService('');
-      refetch();
-    } catch { /* */ }
-  };
-
-  const TicketCard = ({ r, showActions }: { r: Reservation; showActions?: boolean }) => (
-    <div
-      onClick={() => setSelectedId(r.id)}
-      className={`flex items-center gap-3 p-3 rounded-lg border transition-all cursor-pointer ${
-        selectedId === r.id
-          ? 'border-primary bg-primary/5'
-          : 'border-transparent hover:bg-muted/30'
-      }`}
-    >
-      <div className={`w-12 h-12 rounded-lg flex flex-col items-center justify-center font-bold text-sm ${
-        r.status === 'WAITING' ? 'bg-amber-500/20 text-amber-400' :
-        r.status === 'CALLED' ? 'bg-blue-500/20 text-blue-400' :
-        r.status === 'SERVING' ? 'bg-emerald-500/20 text-emerald-400' :
-        'bg-muted text-muted-foreground'
-      }`}>
-        <span className="text-[9px] font-normal opacity-60">
-          {r.status === 'WAITING' ? 'WAIT' : r.status.charAt(0)}
-        </span>
-        {r.ticketNumber || '--'}
-      </div>
-      <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium text-foreground truncate">
-          {r.customerName || 'Walk-in'}
-        </p>
-        <p className="text-xs text-muted-foreground">
-          {r.serviceName || 'General'}
-          {r.counterName && ` • ${r.counterName}`}
-          {' • '}
-          {formatTime(r.createdAt)}
-        </p>
-      </div>
-      <span className={`text-xs px-2 py-0.5 rounded-full ${getStatusBgColor(r.status)}`}>
-        {r.status.replace('_', ' ')}
-      </span>
-      {showActions && (
-        <div className="flex items-center gap-1">
-          {r.status === 'WAITING' && (
-            <button onClick={(e) => { e.stopPropagation(); handleAction(r.id, 'call'); }}
-              className="p-1.5 rounded-md hover:bg-blue-500/20 text-blue-400 transition-colors" title="Call">
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          )}
-          {['CALLED', 'SERVING'].includes(r.status) && (
-            <>
-              <button onClick={(e) => { e.stopPropagation(); handleAction(r.id, 'complete'); }}
-                className="p-1.5 rounded-md hover:bg-emerald-500/20 text-emerald-400 transition-colors" title="Complete">
-                <Check className="w-3.5 h-3.5" />
-              </button>
-              <button onClick={(e) => { e.stopPropagation(); handleAction(r.id, 'recall'); }}
-                className="p-1.5 rounded-md hover:bg-blue-500/20 text-blue-400 transition-colors" title="Recall">
-                <RotateCcw className="w-3.5 h-3.5" />
-              </button>
-            </>
-          )}
-          {r.status === 'WAITING' && (
-            <>
-              <button onClick={(e) => { e.stopPropagation(); handleAction(r.id, 'noshow'); }}
-                className="p-1.5 rounded-md hover:bg-orange-500/20 text-orange-400 transition-colors" title="No Show">
-                <AlertTriangle className="w-3.5 h-3.5" />
-              </button>
-              <button onClick={(e) => { e.stopPropagation(); handleAction(r.id, 'cancel'); }}
-                className="p-1.5 rounded-md hover:bg-red-500/20 text-red-400 transition-colors" title="Cancel">
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </>
-          )}
+  // ─── Loading State ─────────────────────────
+  if (loading) {
+    return (
+      <div className="p-4 sm:p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <Skeleton className="h-9 w-48" />
+          <Skeleton className="h-5 w-32" />
         </div>
-      )}
-    </div>
-  );
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <Skeleton key={i} className="h-24 rounded-2xl" />
+          ))}
+        </div>
+        <Skeleton className="h-48 rounded-2xl" />
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+          <Skeleton className="h-72 rounded-2xl" />
+          <Skeleton className="h-72 rounded-2xl" />
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-foreground">Queue</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
-            Manage your queue in real-time
-          </p>
-        </div>
+    <div className="p-4 sm:p-6 space-y-4">
+      {/* ═══ Page Header ═══ */}
+      <motion.div
+        initial={{ opacity: 0, y: -10 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3"
+      >
         <div className="flex items-center gap-3">
-          <button onClick={() => setShowJoinDialog(true)}
-            className="px-3 py-2 rounded-lg border border-border text-sm font-medium text-foreground hover:bg-accent transition-colors flex items-center gap-2">
-            <Plus className="w-4 h-4" /> Walk-in
-          </button>
-          <button onClick={handleCallNext} disabled={waiting.length === 0}
-            className="px-4 py-2 rounded-lg bg-emerald-500 text-white text-sm font-medium hover:bg-emerald-600 disabled:opacity-50 transition-all flex items-center gap-2">
-            <ArrowRight className="w-4 h-4" /> Call Next
-          </button>
+          <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-lg shadow-emerald-500/20">
+            <Clock className="h-5 w-5 text-white" />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold text-foreground">
+              {t('queueManagement')}
+            </h1>
+            <p className="text-sm text-muted-foreground">
+              {t('queuePageDesc' as any) || 'Manage your queue, counters, and customer flow'}
+            </p>
+          </div>
         </div>
+        <div className="flex items-center gap-2">
+          <Badge
+            variant="outline"
+            className={`text-xs px-2.5 py-0.5 h-6 border-2 ${
+              stats?.isPaused
+                ? 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-700 dark:bg-amber-900/20 dark:text-amber-400'
+                : 'border-emerald-300 bg-emerald-50 text-emerald-700 dark:border-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
+            }`}
+          >
+            {stats?.isPaused ? (
+              <><Pause className="h-3 w-3 me-1" />{t('queuePausedLabel')}</>
+            ) : (
+              <><Play className="h-3 w-3 me-1" />{t('queueActive')}</>
+            )}
+          </Badge>
+          <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => fetchData()}
+              className="h-8 px-3 rounded-lg gap-1.5 text-xs"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              {t('refresh')}
+            </Button>
+          </motion.div>
+        </div>
+      </motion.div>
+
+      {/* ═══ Section 1: Today's Summary ═══ */}
+      <TodaysSummary
+        stats={stats}
+        safeCompletionRate={safeCompletionRate}
+        sparkData1={sparkData1}
+        sparkData2={sparkData2}
+        sparkData3={sparkData3}
+        t={t}
+      />
+
+      {/* ═══ Section 2: Queue Controls (Currently Serving + Actions) ═══ */}
+      <div className="space-y-2">
+        <QueueControls
+          stats={stats}
+          currentlyServed={currentlyServed}
+          waitingOnly={waitingOnly}
+          actionLoading={actionLoading}
+          queueProgress={queueProgress}
+          served={served}
+          lastUpdatedStr={lastUpdatedStr}
+          waitLevel={waitLevel}
+          waitLevelConfig={waitLevelConfig}
+          onCallNext={handleCallNext}
+          onTogglePause={handleTogglePause}
+          onAction={handleAction}
+          onOpenWalkIn={() => setWalkInOpen(true)}
+          onOpenQrModal={() => setShowQrModal(true)}
+          lang={lang}
+          t={t as any}
+        />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Active (Called/Serving) */}
-        <div className="rounded-xl border border-border bg-card">
-          <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
-              <Clock className="w-4 h-4 text-blue-400" /> Active
-            </h2>
-            <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full">{active.length}</span>
-          </div>
-          <div className="p-3 space-y-1 max-h-96 overflow-y-auto">
-            {active.length === 0 ? (
-              <p className="text-sm text-muted-foreground text-center py-8">No active tickets</p>
-            ) : active.map((r) => <TicketCard key={r.id} r={r} showActions />)}
-          </div>
-        </div>
+      {/* ═══ Section 3: Waiting List + Service Breakdown ═══ */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <WaitingList
+          waitingOnly={waitingOnly}
+          batchMode={batchMode}
+          selectedIds={selectedIds}
+          actionLoading={actionLoading}
+          onAction={handleAction}
+          onToggleBatchSelection={toggleBatchSelection}
+          onExitBatchMode={exitBatchMode}
+          onSetBatchMode={setBatchMode}
+          lang={lang}
+          t={t as any}
+        />
 
-        {/* Waiting */}
-        <div className="rounded-xl border border-border bg-card">
-          <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
-              <Clock className="w-4 h-4 text-amber-400" /> Waiting
-            </h2>
-            <span className="text-xs bg-amber-500/20 text-amber-400 px-2 py-0.5 rounded-full">{waiting.length}</span>
-          </div>
-          <div className="p-3 space-y-1 max-h-96 overflow-y-auto">
-            {waiting.length === 0 ? (
-              <p className="text-sm text-muted-foreground text-center py-8">Queue is empty</p>
-            ) : waiting.map((r) => <TicketCard key={r.id} r={r} showActions />)}
-          </div>
-        </div>
-
-        {/* Completed / Done */}
-        <div className="rounded-xl border border-border bg-card">
-          <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-foreground">Done Today</h2>
-            <span className="text-xs text-muted-foreground">{completed.length}</span>
-          </div>
-          <div className="p-3 space-y-1 max-h-96 overflow-y-auto">
-            {completed.length === 0 ? (
-              <p className="text-sm text-muted-foreground text-center py-8">No completed tickets</p>
-            ) : completed.slice(0, 20).map((r) => <TicketCard key={r.id} r={r} />)}
-          </div>
-        </div>
+        <ServiceBreakdown
+          serviceStats={serviceStats}
+          maxWaiting={maxWaiting}
+          lang={lang}
+          t={t as any}
+        />
       </div>
 
-      {/* Join Dialog */}
-      {showJoinDialog && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setShowJoinDialog(false)}>
-          <div className="bg-card rounded-xl border border-border p-6 w-full max-w-sm" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-lg font-semibold text-foreground mb-4">Add Walk-in</h2>
-            <div className="space-y-3">
-              <input value={joinName} onChange={(e) => setJoinName(e.target.value)}
-                placeholder="Customer name (optional)"
-                className="w-full px-3 py-2 rounded-lg border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
-              <input value={joinService} onChange={(e) => setJoinService(e.target.value)}
-                placeholder="Service (optional)"
-                className="w-full px-3 py-2 rounded-lg border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring" />
+      {/* ═══ Section 4: Counter Management + Queue Timeline ═══ */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <CounterManagement
+          waitingList={waitingOnly}
+          calledEntry={calledEntries}
+          servedToday={served}
+          avgWaitTime={avgWait}
+          actionLoading={actionLoading}
+          onCallNext={handleCallNext}
+          onCallNextForCounter={(counterId: string) => {
+            handleCallNext();
+          }}
+          lang={lang}
+          t={t as any}
+        />
+
+        <QueueTimeline
+          hourlyWaitTime={
+            stats?.hourlyWaitTime &&
+            Array.isArray(stats.hourlyWaitTime) &&
+            stats.hourlyWaitTime.length > 0 &&
+            typeof stats.hourlyWaitTime[0] === 'object'
+              ? (stats.hourlyWaitTime as any[]).map((h: any) => h.avgWaitTime ?? 0)
+              : undefined
+          }
+          avgWaitTime={avgWait}
+          todayReservations={totalToday}
+          servedToday={served}
+          peakHour={stats?.peakHour}
+          lang={lang}
+          t={t as any}
+        />
+      </div>
+
+      {/* ═══ Section 5: Quick Stats Footer ═══ */}
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.4 }}
+      >
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm">
+          <CardContent className="p-4">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="flex items-center gap-6">
+                {/* Waiting */}
+                <div className="flex items-center gap-2">
+                  <Users className="h-4 w-4 text-amber-500" />
+                  <div>
+                    <p className="text-sm font-bold text-foreground">{stats?.currentlyWaiting ?? 0}</p>
+                    <p className="text-[10px] text-muted-foreground">{t('queueLengthShort')}</p>
+                  </div>
+                  {stats?.currentlyWaiting !== undefined && stats.currentlyWaiting > 0 && (
+                    <ETABadge minutes={avgWait} lang={lang} minLabel={t('min')} />
+                  )}
+                </div>
+
+                {/* Being Served */}
+                <div className="flex items-center gap-2">
+                  <PhoneCall className="h-4 w-4 text-sky-500" />
+                  <div>
+                    <p className="text-sm font-bold text-foreground">{calledEntries.length}</p>
+                    <p className="text-[10px] text-muted-foreground">{t('beingServed' as any) || 'Being Served'}</p>
+                  </div>
+                </div>
+
+                {/* Served Today */}
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                  <div>
+                    <p className="text-sm font-bold text-foreground">{served}</p>
+                    <p className="text-[10px] text-muted-foreground">{t('servedToday')}</p>
+                  </div>
+                </div>
+
+                {/* No-Show Rate */}
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="h-4 w-4 text-rose-500" />
+                  <div>
+                    <p className="text-sm font-bold text-foreground">
+                      {stats?.noShowRate ?? (stats && totalToday > 0 ? Math.round(((stats.noShowCount ?? 0) / totalToday) * 100) : 0)}%
+                    </p>
+                    <p className="text-[10px] text-muted-foreground">{t('noShowRateStat')}</p>
+                  </div>
+                </div>
+              </div>
+
+              {/* Estimated Wait */}
+              <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-gradient-to-r from-emerald-50 to-teal-50 dark:from-emerald-900/20 dark:to-teal-900/20 border border-emerald-200 dark:border-emerald-800">
+                <Clock className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                <div>
+                  <p className="text-sm font-bold text-emerald-700 dark:text-emerald-400">~{avgWait} {t('min')}</p>
+                  <p className="text-[10px] text-emerald-600/70 dark:text-emerald-400/70">{t('estimatedWait' as any) || 'Est. Wait'}</p>
+                </div>
+              </div>
             </div>
-            <div className="flex gap-3 mt-5">
-              <button onClick={() => setShowJoinDialog(false)}
-                className="flex-1 py-2 rounded-lg border border-border text-sm font-medium text-foreground hover:bg-accent transition-colors">
-                Cancel
-              </button>
-              <button onClick={handleJoin}
-                className="flex-1 py-2 rounded-lg bg-emerald-500 text-white text-sm font-medium hover:bg-emerald-600 transition-colors">
-                Add to Queue
-              </button>
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* ═══ Walk-in Dialog ═══ */}
+      <Dialog open={walkInOpen} onOpenChange={setWalkInOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <UserPlus className="h-5 w-5 text-emerald-600" />
+              {t('addWalkInCustomer')}
+            </DialogTitle>
+            <DialogDescription>
+              {t('walkInDialogDesc' as any) || 'Add a walk-in customer to the queue'}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label htmlFor="walkin-name">{t('customerName' as any) || 'Customer Name'}</Label>
+              <Input
+                id="walkin-name"
+                value={walkInName}
+                onChange={(e) => setWalkInName(e.target.value)}
+                placeholder={t('enterCustomerName' as any) || 'Enter customer name'}
+                className="rounded-xl"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && walkInName.trim()) handleAddWalkIn();
+                }}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="walkin-service">{t('service' as any) || 'Service'}</Label>
+              <select
+                id="walkin-service"
+                value={walkInServiceId}
+                onChange={(e) => setWalkInServiceId(e.target.value)}
+                className="w-full h-10 px-3 rounded-xl border border-input bg-background text-foreground text-sm"
+              >
+                <option value="">{t('autoDetect' as any) || 'Auto-detect'}</option>
+                {serviceStats.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {lang === 'ar' && s.nameAr ? s.nameAr : lang === 'fr' && s.nameFr ? s.nameFr : s.name}
+                  </option>
+                ))}
+              </select>
             </div>
           </div>
-        </div>
-      )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setWalkInOpen(false)} disabled={walkInLoading} className="rounded-xl">
+              {t('cancel')}
+            </Button>
+            <Button
+              onClick={handleAddWalkIn}
+              disabled={!walkInName.trim() || walkInLoading}
+              className="rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white gap-2"
+            >
+              {walkInLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <UserPlus className="h-4 w-4" />}
+              {t('addToQueue' as any) || 'Add to Queue'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ═══ QR Code Modal ═══ */}
+      <Dialog open={showQrModal} onOpenChange={setShowQrModal}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <QrCode className="h-5 w-5 text-emerald-600" />
+              {t('viewQrCode')}
+            </DialogTitle>
+            <DialogDescription>
+              {t('qrScanToJoin')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col items-center py-4">
+            {qrCodeDataUrl ? (
+              <motion.img
+                initial={{ opacity: 0, scale: 0.8 }}
+                animate={{ opacity: 1, scale: 1 }}
+                transition={{ type: 'spring', stiffness: 200, damping: 20 }}
+                src={qrCodeDataUrl}
+                alt="Agency QR Code"
+                className="w-56 h-56 rounded-xl border-4 border-emerald-100 dark:border-emerald-900 shadow-lg"
+              />
+            ) : (
+              <Skeleton className="w-56 h-56 rounded-xl" />
+            )}
+            {agencyCode && (
+              <Badge variant="outline" className="mt-3 text-xs font-mono">
+                {agencyCode}
+              </Badge>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
