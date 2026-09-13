@@ -14,10 +14,6 @@ const API_Q = 'XTransformPort=3003';
 const POLL_INTERVAL = 3000;
 const SLOW_POLL_INTERVAL = 30000;
 const AUTO_SCAN_INTERVAL = 30000;
-// Regression guard (dev-crash audit): stop the 3s scan-status poll after this
-// many consecutive failures. Otherwise a dead API mid-scan keeps a permanent
-// 3s retry loop alive for the whole page session.
-const MAX_SCAN_POLL_FAILURES = 3;
 
 interface DiscoveryServiceReturn {
   scanState: ScanState;
@@ -111,20 +107,10 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   }, []);
 
   // Poll scan status — proxy through API
-  const scanPollFailuresRef = useRef(0);
   const pollScanStatus = useCallback(async () => {
     try {
       const res = await apiFetch(`/api/agency-devices/discovery/scan/status?${API_Q}`);
-      if (!res.ok) {
-        scanPollFailuresRef.current++;
-        if (scanPollFailuresRef.current >= MAX_SCAN_POLL_FAILURES && pollTimerRef.current) {
-          // API is down — give up on this scan cycle instead of polling forever
-          clearInterval(pollTimerRef.current);
-          pollTimerRef.current = undefined;
-        }
-        return;
-      }
-      scanPollFailuresRef.current = 0;
+      if (!res.ok) return;
       const data = await res.json();
       if (mountedRef.current) {
         let wasScanning = false;
@@ -156,12 +142,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
         }
       }
     } catch {
-      // Network-level failure — count it and stop the poll loop when repeated
-      scanPollFailuresRef.current++;
-      if (scanPollFailuresRef.current >= MAX_SCAN_POLL_FAILURES && pollTimerRef.current) {
-        clearInterval(pollTimerRef.current);
-        pollTimerRef.current = undefined;
-      }
+      // Silent
     }
   }, [pollDevices]);
 
@@ -220,8 +201,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
             elapsed: 0,
           });
         }
-        // Start polling (reset the failure counter for the new scan cycle)
-        scanPollFailuresRef.current = 0;
+        // Start polling
         if (pollTimerRef.current) clearInterval(pollTimerRef.current);
         pollTimerRef.current = setInterval(() => {
           pollScanStatus();

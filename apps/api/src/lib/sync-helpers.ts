@@ -12,7 +12,7 @@
  *   import { atomicMutation, withIdempotency, processPushMutation } from '../lib/sync-helpers'
  */
 
-import { cloudDb } from '@blasti/cloud-db'
+import { cloudDb, suppressAutoSyncChange } from '@blasti/cloud-db'
 import {
   SYNC_REGISTRY,
   ConflictStrategy,
@@ -427,18 +427,23 @@ export async function processPushMutation(
     // If an idempotency key is provided, use withIdempotency
     if (idempotencyKey) {
       const payloadHash = hashPayload(data)
-      const idemResult = await withIdempotency(
-        {
-          idempotencyKey,
-          agencyId,
-          model,
-          recordId,
-          operation,
-          payloadHash,
-        },
-        async (tx) => {
-          return applyMutationInTx(tx, config, model, recordId, operation, data)
-        },
+      // suppressAutoSyncChange: atomicMutation/withIdempotency record SyncChange
+      // explicitly — the @blasti/cloud-db auto-hook must stay silent inside
+      // push processing or every push yields 2-3 redundant rows.
+      const idemResult = await suppressAutoSyncChange(() =>
+        withIdempotency(
+          {
+            idempotencyKey,
+            agencyId,
+            model,
+            recordId,
+            operation,
+            payloadHash,
+          },
+          async (tx) => {
+            return applyMutationInTx(tx, config, model, recordId, operation, data)
+          },
+        ),
       )
 
       return {
@@ -447,15 +452,18 @@ export async function processPushMutation(
       }
     }
 
-    // No idempotency key — use atomicMutation directly
-    const result = await atomicMutation(
-      agencyId,
-      model,
-      recordId,
-      operation,
-      async (tx) => {
-        return applyMutationInTx(tx, config, model, recordId, operation, data)
-      },
+    // No idempotency key — use atomicMutation directly (auto-hook suppressed,
+    // same reason as the withIdempotency path above)
+    const result = await suppressAutoSyncChange(() =>
+      atomicMutation(
+        agencyId,
+        model,
+        recordId,
+        operation,
+        async (tx) => {
+          return applyMutationInTx(tx, config, model, recordId, operation, data)
+        },
+      ),
     )
 
     return {

@@ -1423,7 +1423,7 @@ const en: Record<TranslationKeys, string> = {
   sevenDayTrend: "7 Day Trend",
   todayCount: "today",
   phonePlaceholder: "05XX XXX XXX",
-  inEnglish: "(English)",
+  // DUPLICATE REMOVED (3-c): inEnglish: "(English)",
   serviceNamePlaceholder: "General Consultation",
   languageEnglish: "English",
   languageArabic: "Arabic",
@@ -2190,7 +2190,7 @@ const en: Record<TranslationKeys, string> = {
   reviewing: 'Reviewing',
   fulfilled: 'Fulfilled',
 
-  enterprisePlanDesc:
+  enterpriseRequestDesc:
     'Need a tailored plan for a large network? Request a custom enterprise contract with dedicated features, hardware and SLAs.',
   requestEnterprise: 'Request Enterprise Plan',
   enterpriseMessage: 'Message',
@@ -2302,7 +2302,9 @@ const en: Record<TranslationKeys, string> = {
   // DUPLICATE REMOVED: enterprisePlan: 'Enterprise Plan',
   yourEnterprisePlan: 'Your Enterprise Plan',
   enterprisePlanBadge: 'ENTERPRISE',
-  // DUPLICATE REMOVED: enterprisePlanDesc: 'This is a custom plan tailored specifically for your institution. It is not available to other agencies.',
+  // RESTORED (closeout 4-e): this is the LIVE enterprisePlanDesc (institution-tailored plan).
+  // The earlier "Need a tailored plan..." string was renamed to enterpriseRequestDesc.
+  enterprisePlanDesc: 'This is a custom plan tailored specifically for your institution. It is not available to other agencies.',
   cancelEnterprisePlan: 'Cancel Enterprise Plan',
   upgradeEnterprisePlan: 'Upgrade',
   downgradeEnterprisePlan: 'Downgrade',
@@ -2722,6 +2724,64 @@ const en: Record<TranslationKeys, string> = {
   addToQueue: 'Add to Queue',
   customerName: 'Customer Name',
   autoDetect: 'Auto-detect',
+
+  // ─── Conflict Resolution & Counter Selection ──────────────
+  selectCounter: 'Select Counter',
+  syncConflictsTitle: 'Sync Conflicts',
+  syncConflictsDesc: 'Some changes conflict with the server version. Choose which version to keep.',
+  keepLocal: 'Keep Local',
+  keepServer: 'Keep Server',
+  local: 'Local',
+  server: 'Server',
+  localVersion: 'Local version',
+  serverVersion: 'Server version',
+  noConflicts: 'No conflicts to resolve',
+  resolveAllLocal: 'Keep Local for All',
+  resolveAllServer: 'Keep Server for All',
+  resolved: 'resolved',
+  conflictSingular: 'conflict',
+  conflictPlural: 'conflicts',
+  done: 'Done',
+
+  // ─── History Export ──────────────
+  fromDate: 'From Date',
+  toDate: 'To Date',
+
+  // ─── Sync Status UI (Desktop) ──────────────
+  syncStatusDesc: 'Details about data synchronization between this device and the cloud.',
+  currentStatus: 'Current Status',
+  allSynced: 'All Synced',
+  allDataUpToDate: 'All data up to date',
+  pendingChanges: 'pending changes',
+  changesAwaitingSync: 'Changes awaiting sync',
+  syncErrorLabel: 'Sync Error',
+  abandonedChanges: 'Abandoned changes',
+  connection: 'Connection',
+  lastSuccessfulSync: 'Last Successful Sync',
+  lastSyncAttempt: 'Last Sync Attempt',
+  conflicts: 'Conflicts',
+  offlineTokenRemaining: 'Offline session remaining',
+  protocolVersion: 'Sync protocol version',
+  forceSyncNow: 'Force Sync Now',
+  syncNow: 'Sync now',
+  retrySync: 'Retry sync',
+  noSyncData: 'No sync data',
+  never: 'Never',
+  secondsAgo: '{count}s ago',
+  minutesAgo: '{count}m ago',
+  hoursAgo: '{count}h ago',
+  daysAgo: '{count}d ago',
+
+  // ─── Sidebar Navigation (missing keys) ──────────────
+  queue: 'Queue',
+  staff: 'Staff',
+  qrCode: 'QR Code',
+  alerts: 'Alerts',
+
+  // ─── Offline Session Expired (offline-token window lapsed) ──────────────
+  offlineExpiredTitle: 'Offline session expired',
+  offlineExpiredDesc: 'This device has not contacted the cloud within the allowed window ({days} days), so the offline session has expired. Sign in again to re-sync your data and continue working.',
+  offlineExpiredAction: 'Sign in again',
 };
 
 export default en;

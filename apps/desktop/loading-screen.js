@@ -1049,44 +1049,6 @@ async function runDiagnostics(mainWindow, config) {
           localApiToken = cloudAuthToken;
           sendUpdate(mainWindow, { log: `[OK] Session imported to local API`, logType: 'ok' });
 
-          // ── Check AgencyLocalState: if NOT_INITIALIZED, skip heavy import ──
-          // The initial-sync engine (initial-sync.js) will handle the full import
-          // after the loading screen completes. Doing a partial import here would
-          // be redundant and slow down startup.
-          let skipHeavyImport = false;
-          try {
-            const { localDb: checkDb } = require('./local-api/lib/db');
-            if (checkDb && agencyId) {
-              const initialSync = require('./local-api/initial-sync');
-              const agencyReady = await initialSync.isAgencyReady(checkDb, agencyId);
-              if (agencyReady) {
-                // Agency already initialized — skip heavy import (incremental sync handles updates)
-                importResult = {
-                  step: 'import-agency-data',
-                  status: 'success',
-                  message: 'الوكالة مهيأة بالفعل — المزامنة التزايدي ستتعامل مع التحديثات',
-                };
-                sendUpdate(mainWindow, { log: `[OK] Agency already initialized — skipping heavy import (incremental sync handles updates)`, logType: 'ok' });
-                skipHeavyImport = true;
-              } else {
-                // NOT_INITIALIZED — initial sync is needed but should NOT block startup.
-                // The frontend will trigger initial-sync after the loading screen completes.
-                importResult = {
-                  step: 'import-agency-data',
-                  status: 'success',
-                  message: 'يلزم مزامنة أولية — سيتم استيراد البيانات بعد تحميل الشاشة الرئيسية',
-                  needsInitialSync: true,
-                };
-                sendUpdate(mainWindow, { log: `[INFO] Agency NOT_INITIALIZED — initial sync needed, will be triggered after startup`, logType: 'info' });
-                skipHeavyImport = true;
-              }
-            }
-          } catch (e) {
-            // AgencyLocalState table may not exist yet — proceed with old import
-            console.warn('[Diagnostics] Could not check AgencyLocalState:', e.message);
-          }
-
-          if (!skipHeavyImport) {
           // Now fetch agency data from cloud and upsert into local DB
           const importResults = {};
 
@@ -1105,25 +1067,21 @@ async function runDiagnostics(mainWindow, config) {
                     ...rest,
                     customCode: code || agencyRes.id,
                     ownerId: cloudUser.id,
-                    subscriptionStatus: agencyRes.subscriptionStatus || 'INACTIVE',
-                    subscriptionTier: agencyRes.subscriptionTier || 'BASIC',
-                    subscriptionExpiresAt: agencyRes.subscriptionExpiresAt || null,
-                    isQueueOpen: agencyRes.isQueueOpen !== undefined ? agencyRes.isQueueOpen : true,
-                    isActive: agencyRes.isActive !== undefined ? agencyRes.isActive : true,
+                    subscriptionStatus: 'ACTIVE',
+                    isQueueOpen: true,
+                    isActive: true,
                     // Prisma defaults for required fields not in response
-                    city: agencyRes.city || 'M\'Sila',
-                    wilaya: agencyRes.wilaya || '28',
+                    city: 'M\'Sila',
+                    wilaya: '28',
                   },
                   create: {
                     ...rest,
                     customCode: code || agencyRes.id,
                     ownerId: cloudUser.id,
-                    subscriptionStatus: agencyRes.subscriptionStatus || 'INACTIVE',
-                    subscriptionTier: agencyRes.subscriptionTier || 'BASIC',
-                    subscriptionExpiresAt: agencyRes.subscriptionExpiresAt || null,
-                    isQueueOpen: agencyRes.isQueueOpen !== undefined ? agencyRes.isQueueOpen : true,
-                    isActive: agencyRes.isActive !== undefined ? agencyRes.isActive : true,
-                    city: agencyRes.city || 'M\'Sila',
+                    subscriptionStatus: 'ACTIVE',
+                    isQueueOpen: true,
+                    isActive: true,
+                    city: 'M\'Sila',
                     wilaya: '28',
                   },
                 });
@@ -1333,7 +1291,6 @@ async function runDiagnostics(mainWindow, config) {
             detail: importResults,
           };
           console.log('[Diagnostics] Agency data import:', importResults);
-          } // end if (!skipHeavyImport)
         } else {
           importResult = {
             step: 'import-agency-data',
@@ -1463,52 +1420,6 @@ async function runDiagnostics(mainWindow, config) {
 
   if (localApiPort && serverResult.status === 'success') {
     try {
-      // ─── NO-AUTH EARLY EXIT ────────────────────────────────────────────
-      // If there is no stored auth session, the DB is expected to be empty or
-      // only partially created. Full sync verification should be deferred until
-      // after the user logs in. We skip the heavy checks and return success so
-      // the app can launch to the login screen.
-      const hasStoredAuth = cloudAuthToken && (cloudUser || agencyId);
-      if (!hasStoredAuth) {
-        // Light check: just verify the DB file is accessible
-        try {
-          const { localDb: quickDb } = require('./local-api/lib/db');
-          if (quickDb) {
-            await quickDb.$queryRaw`SELECT 1 as ok`;
-            sendUpdate(mainWindow, { log: `[OK] Local DB accessible — full sync verify deferred after login`, logType: 'ok' });
-          }
-        } catch (_) { /* DB may still be initializing */ }
-        verifyResult = {
-          step: 'verify-sync-integrity',
-          status: 'success',
-          message: 'تم التخطي — لا توجد جلسة نشطة (سيتم التحقق بعد تسجيل الدخول)',
-        };
-        sendUpdate(mainWindow, { log: '[SKIP] No stored auth session — sync verification deferred after login', logType: 'info' });
-        // Do NOT push/send here — it will be done after the block below
-      } else if (agencyId) {
-        // ─── NOT-INITIALIZED EARLY EXIT ────────────────────────────────────
-        // If the agency has not been initialized (initial sync not yet run),
-        // skip heavy verification. The initial-sync engine will handle data
-        // import after the loading screen completes.
-        let agencyInitialized = false;
-        try {
-          const { localDb: quickDb } = require('./local-api/lib/db');
-          if (quickDb) {
-            const initialSync = require('./local-api/initial-sync');
-            agencyInitialized = await initialSync.isAgencyReady(quickDb, agencyId);
-          }
-        } catch (_) { /* AgencyLocalState may not exist yet */ }
-
-        if (!agencyInitialized) {
-          verifyResult = {
-            step: 'verify-sync-integrity',
-            status: 'success',
-            message: 'تم التخطي — الوكالة غير مهيأة (سيتم التحقق بعد المزامنة الأولية)',
-            needsInitialSync: true,
-          };
-          sendUpdate(mainWindow, { log: '[SKIP] Agency NOT_INITIALIZED — sync verification deferred after initial sync', logType: 'info' });
-        } else {
-      // ─── FULL VERIFICATION (only when auth exists AND agency is READY) ──
       const { localDb: verifyDb } = require('./local-api/lib/db');
       if (!verifyDb) {
         verifyResult = {
@@ -1659,13 +1570,11 @@ async function runDiagnostics(mainWindow, config) {
 
           // Determine result status
           if (missingDataTables.length > 0) {
-            // Some tables have schema but NO local data while cloud has data.
-            // This is NOT a launch-blocking error — sync is progressive and the
-            // sync service will fill missing data in subsequent cycles.
+            // Critical: some tables have schema but NO data
             verifyResult = {
               step: 'verify-sync-integrity',
-              status: 'warning',
-              message: `جداول بدون بيانات محلية (ستتم مزامنتها): ${missingDataTables.join(', ')}`,
+              status: 'error',
+              message: `جداول موجودة لكن بدون بيانات: ${missingDataTables.join(', ')}`,
               detail: {
                 localCounts,
                 cloudCounts,
@@ -1709,7 +1618,6 @@ async function runDiagnostics(mainWindow, config) {
           const tablesWithError = Object.entries(localCounts).filter(([_, count]) => count < 0);
 
           if (missingTables.length > 0) {
-            // Missing tables with auth — this is a real problem (schema should have been pushed)
             verifyResult = {
               step: 'verify-sync-integrity',
               status: 'error',
@@ -1720,16 +1628,14 @@ async function runDiagnostics(mainWindow, config) {
           } else if (tablesWithData.length === 0) {
             // No data at all — might be first run without cloud
             if (cloudAuthToken && agencyId) {
-              // Had auth but no data — sync may not have completed yet.
-              // This is NOT a launch-blocking error — the sync service will
-              // fill data in subsequent cycles after app is loaded.
+              // Had auth but no data — real problem
               verifyResult = {
                 step: 'verify-sync-integrity',
-                status: 'warning',
-                message: 'جميع الجداول فارغة — ستتم المزامنة بعد تحميل التطبيق',
+                status: 'error',
+                message: 'جميع الجداول فارغة — لم يتم استيراد أي بيانات رغم وجود اتصال سابق',
                 detail: { localCounts, missingTables, localTotalRecords },
               };
-              sendUpdate(mainWindow, { log: `[WARN] ALL tables empty — sync will populate after app loads`, logType: 'fail' });
+              sendUpdate(mainWindow, { log: `[FAIL] ALL tables empty — no data was synced!`, logType: 'fail' });
             } else {
               // No auth — first run, expected
               verifyResult = {
@@ -1773,8 +1679,6 @@ async function runDiagnostics(mainWindow, config) {
           sendUpdate(mainWindow, { log: `[OK] Tables ready (${existingTables.length}), ${localTotalRecords} records — full verify after login`, logType: 'ok' });
         }
       }
-        } // end of agencyInitialized else block (FULL VERIFICATION)
-      } // end of else if (agencyId) block
     } catch (err) {
       verifyResult = {
         step: 'verify-sync-integrity',
@@ -2161,10 +2065,10 @@ async function runDiagnostics(mainWindow, config) {
     sendUpdate(mainWindow, { log: `[WARN] Cloud still unavailable — offline mode`, logType: 'fail' });
   }
 
-  // Start the sync service if local API is running AND we have an auth session.
-  // Without auth, starting sync is pointless — it will just log "No auth token - skipping"
-  // every cycle. Sync will be started later after login via cloud-sync:set-auth IPC.
-  if (localApiPort && cloudAuthToken) {
+  // Always start the sync service if local API is running, even if cloud
+  // is unreachable. The sync service handles "local-only" mode gracefully
+  // and will sync when the cloud becomes available later.
+  if (localApiPort) {
     try {
       const { localDb: syncDb } = require('./local-api/lib/db');
       if (syncDb) {
@@ -2177,18 +2081,11 @@ async function runDiagnostics(mainWindow, config) {
           syncIntervalMs: 2 * 60 * 1000,
           initialDelayMs: 5000,
         });
-        // CRITICAL: setAuth() must be called separately — startSync() does NOT
-        // set _authToken. Without this, every sync cycle logs "No auth token - skipping".
-        if (cloudAuthToken && cloudUser) {
-          syncService.setAuth(cloudAuthToken, cloudUser);
-        }
         sendUpdate(mainWindow, { log: `[OK] Sync service started (2-min interval, ${reconnectResult?.status === 'success' ? 'cloud+local' : 'local-only'})`, logType: 'ok' });
       }
     } catch (syncErr) {
       sendUpdate(mainWindow, { log: `[WARN] Sync service: ${syncErr.message.substring(0, 80)}`, logType: 'fail' });
     }
-  } else if (localApiPort && !cloudAuthToken) {
-    sendUpdate(mainWindow, { log: `[SKIP] Sync service not started — no auth session (will start after login)`, logType: 'info' });
   }
 
   results.push(reconnectResult);
@@ -2200,7 +2097,6 @@ async function runDiagnostics(mainWindow, config) {
   const allPassed = results.every(r => r.status === 'success');
   const hasWarnings = results.some(r => r.status === 'warning');
   const hasErrors = results.some(r => r.status === 'error');
-  const needsInitialSync = results.some(r => r.needsInitialSync);
 
   console.log(`[Diagnostics] Complete — ${results.filter(r => r.status === 'success').length}/${results.length} passed`);
 
@@ -2211,7 +2107,7 @@ async function runDiagnostics(mainWindow, config) {
     });
   } catch (_) { /* window may be gone */ }
 
-  return { results, allPassed: allPassed || (!hasErrors && hasWarnings), needsInitialSync };
+  return { results, allPassed: allPassed || (!hasErrors && hasWarnings) };
 }
 
 // ─── Helper: Fetch with Auth (for cloud API) ──────────────────────────────

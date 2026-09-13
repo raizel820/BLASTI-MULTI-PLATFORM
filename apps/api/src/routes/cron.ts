@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { normalizeDzPhone, getSmsTemplate, sendSms } from '../lib/sms-service'
 
 const app = new Hono()
@@ -26,7 +26,7 @@ app.get('/auto-skip', async (c) => {
   try {
     const cutoffTime = new Date(Date.now() - NO_SHOW_SKIP_MINUTES * 60 * 1000)
 
-    const candidates = await cloudDb.reservation.findMany({
+    const candidates = await db.reservation.findMany({
       where: {
         status: 'CALLED',
         calledAt: { not: null, lte: cutoffTime },
@@ -52,7 +52,7 @@ app.get('/auto-skip', async (c) => {
           : reservation.user.language === 'fr' ? reservation.agency.nameFr || reservation.agency.name
           : reservation.agency.name
 
-      await cloudDb.$transaction(async (tx) => {
+      await db.$transaction(async (tx) => {
         try {
           await tx.reservation.update({
             where: { id: reservation.id },
@@ -103,7 +103,7 @@ app.get('/check-reminders', async (c) => {
   try {
     const today = new Date().toISOString().split('T')[0]
 
-    const allCandidates = await cloudDb.reservation.findMany({
+    const allCandidates = await db.reservation.findMany({
       where: {
         status: 'WAITING',
         reminderSent: false,
@@ -127,7 +127,7 @@ app.get('/check-reminders', async (c) => {
     for (const reservation of candidates) {
       if (!reservation.user) continue
 
-      const peopleAhead = await cloudDb.reservation.count({
+      const peopleAhead = await db.reservation.count({
         where: { agencyId: reservation.agencyId, status: 'WAITING', joinedAt: { lt: reservation.joinedAt }, id: { not: reservation.id } },
       })
 
@@ -141,7 +141,7 @@ app.get('/check-reminders', async (c) => {
             : reservation.user.language === 'fr' ? reservation.agency.nameFr || reservation.agency.name
             : reservation.agency.name
 
-        await cloudDb.$transaction(async (tx) => {
+        await db.$transaction(async (tx) => {
           await tx.reservation.update({
             where: { id: reservation.id },
             data: { reminderSent: true, reminderSentAt: new Date() },
@@ -179,7 +179,7 @@ app.get('/check-sms-fallback', async (c) => {
   try {
     const cutoffTime = new Date(Date.now() - SMS_FALLBACK_MINUTES * 60 * 1000)
 
-    const allCandidates = await cloudDb.reservation.findMany({
+    const allCandidates = await db.reservation.findMany({
       where: {
         status: { in: ['WAITING', 'CALLED'] },
         user: { smsNotificationsEnabled: true, phoneNumber: { not: null }, isActive: true },
@@ -216,7 +216,7 @@ app.get('/check-sms-fallback', async (c) => {
 
       const normalizedPhone = normalizeDzPhone(user.phoneNumber!)
       if (!normalizedPhone) {
-        await cloudDb.smsLog.create({
+        await db.smsLog.create({
           data: { userId: user.id, phoneNumber: user.phoneNumber!, message: 'SMS fallback - invalid phone', status: 'FAILED', provider: 'system', errorMessage: `Invalid phone number format: ${user.phoneNumber}` },
         })
         continue
@@ -242,7 +242,7 @@ app.get('/check-sms-fallback', async (c) => {
 
       if (result.success) {
         try {
-          await cloudDb.reservation.update({
+          await db.reservation.update({
             where: { id: reservation.id },
             data: { smsReminderSent: true, smsReminderSentAt: new Date() },
           })
@@ -270,7 +270,7 @@ app.get('/handle-downgrades', async (c) => {
 
   try {
     // Find all agencies with active subscriptions
-    const agencies = await cloudDb.agency.findMany({
+    const agencies = await db.agency.findMany({
       where: { subscriptionStatus: 'ACTIVE' },
       include: {
         subscriptionPlan: true,
@@ -292,7 +292,7 @@ app.get('/handle-downgrades', async (c) => {
         // Soft-lock the MOST RECENTLY created excess services
         const toLock = agency.services.slice(0, excess)
         for (const service of toLock) {
-          await cloudDb.service.update({
+          await db.service.update({
             where: { id: service.id },
             data: { isActive: false },
           })
@@ -305,7 +305,7 @@ app.get('/handle-downgrades', async (c) => {
         const excess = agency.staff.length - plan.maxStaff
         const toLock = agency.staff.slice(0, excess)
         for (const staff of toLock) {
-          await cloudDb.agencyStaff.update({
+          await db.agencyStaff.update({
             where: { id: staff.id },
             data: { isActive: false },
           })
@@ -331,7 +331,7 @@ app.post('/sweep-offline', async (c) => {
     const staleThreshold = new Date(Date.now() - 24 * 60 * 60 * 1000) // 24 hours ago
 
     // Find all DEFERRED_OFFLINE reservations older than 24h
-    const staleReservations = await cloudDb.reservation.findMany({
+    const staleReservations = await db.reservation.findMany({
       where: {
         status: 'DEFERRED_OFFLINE',
         offlineCreatedAt: { not: null, lte: staleThreshold },
@@ -348,7 +348,7 @@ app.post('/sweep-offline', async (c) => {
 
     for (const reservation of staleReservations) {
       // Mark as CANCELLED and set sync conflict flag
-      await cloudDb.$transaction(async (tx) => {
+      await db.$transaction(async (tx) => {
         await tx.reservation.update({
           where: { id: reservation.id },
           data: {
@@ -398,7 +398,7 @@ app.post('/sweep-offline', async (c) => {
     }
 
     // Also handle DEFERRED_OFFLINE reservations without offlineCreatedAt (orphaned)
-    const orphanedReservations = await cloudDb.reservation.findMany({
+    const orphanedReservations = await db.reservation.findMany({
       where: {
         status: 'DEFERRED_OFFLINE',
         offlineCreatedAt: null,
@@ -407,7 +407,7 @@ app.post('/sweep-offline', async (c) => {
     })
 
     for (const reservation of orphanedReservations) {
-      await cloudDb.reservation.update({
+      await db.reservation.update({
         where: { id: reservation.id },
         data: {
           status: 'CANCELLED',

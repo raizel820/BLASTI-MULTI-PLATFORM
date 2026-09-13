@@ -2,8 +2,9 @@
  * apiFetch — Drop-in replacement for fetch() that uses apiClient internally.
  *
  * WHY: 226+ raw fetch('/api/...') calls across the codebase bypass the apiClient's
- * retry chain. This wrapper gives every fetch() call the same retry and timeout
- * support without requiring callers to rewrite their code.
+ * 3-layer failover chain (Cloud API → LAN Server → WatermelonDB Cache). This wrapper
+ * gives every fetch() call the same failover, retry, and offline support without
+ * requiring callers to rewrite their code.
  *
  * Usage — replace `fetch` with `apiFetch`:
  *   // Before:
@@ -34,7 +35,7 @@ export interface ApiFetchResponse {
 
 /**
  * Drop-in replacement for fetch() that routes through apiClient.
- * Gives every API call the same retry and timeout support.
+ * Gives every API call the 3-layer failover: Cloud → LAN → WatermelonDB.
  *
  * Accepts the same arguments as native fetch() for easy migration:
  *   - path: URL string (relative or absolute to API)

@@ -1,0 +1,246 @@
+{
+  "_comment": "GENERATED ARTIFACT — DO NOT EDIT BY HAND. Single source of truth: packages/core/src/sync-registry.ts (regenerate with packages/core/scripts/generate-sync-registry-json.js whenever the .ts changes). The desktop local-api (plain JS in Electron, cannot import TypeScript) requires this file: apps/desktop/local-api/sync-service.js.",
+  "protocolVersion": 2,
+  "generatedFrom": "packages/core/src/sync-registry.ts",
+  "syncedModelCount": 19,
+  "syncedModels": [
+    "Agency",
+    "User",
+    "AgencyStaff",
+    "Service",
+    "Branch",
+    "Counter",
+    "QueueSettings",
+    "Reservation",
+    "Transaction",
+    "SmsSettings",
+    "PaymentSettings",
+    "Notification",
+    "Announcement",
+    "GlobalAnnouncement",
+    "Review",
+    "Favorite",
+    "FAQ",
+    "SubscriptionPlan",
+    "PlanFeature"
+  ],
+  "models": {
+    "Agency": {
+      "delegate": "agency",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "FIELD_MERGE",
+      "syncOrder": 1
+    },
+    "User": {
+      "delegate": "user",
+      "isSynced": true,
+      "isAgencyScoped": false,
+      "conflictStrategy": "LAST_WRITE_WINS",
+      "syncOrder": 2
+    },
+    "AgencyStaff": {
+      "delegate": "agencyStaff",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "VERSION_AWARE",
+      "syncOrder": 3
+    },
+    "Service": {
+      "delegate": "service",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "VERSION_AWARE",
+      "syncOrder": 4
+    },
+    "Branch": {
+      "delegate": "branch",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "VERSION_AWARE",
+      "syncOrder": 5
+    },
+    "Counter": {
+      "delegate": "counter",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "VERSION_AWARE",
+      "syncOrder": 6
+    },
+    "QueueSettings": {
+      "delegate": "queueSettings",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "FIELD_MERGE",
+      "syncOrder": 7
+    },
+    "Reservation": {
+      "delegate": "reservation",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "CLOUD_WINS",
+      "syncOrder": 8
+    },
+    "Transaction": {
+      "delegate": "transaction",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "APPEND_ONLY",
+      "syncOrder": 9
+    },
+    "SmsSettings": {
+      "delegate": "smsSettings",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "LAST_WRITE_WINS",
+      "syncOrder": 10
+    },
+    "PaymentSettings": {
+      "delegate": "paymentSettings",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "LAST_WRITE_WINS",
+      "syncOrder": 11
+    },
+    "Notification": {
+      "delegate": "notification",
+      "isSynced": true,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 12
+    },
+    "Announcement": {
+      "delegate": "announcement",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "LAST_WRITE_WINS",
+      "syncOrder": 13
+    },
+    "GlobalAnnouncement": {
+      "delegate": "globalAnnouncement",
+      "isSynced": true,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 14
+    },
+    "Review": {
+      "delegate": "review",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "LAST_WRITE_WINS",
+      "syncOrder": 15
+    },
+    "Favorite": {
+      "delegate": "favorite",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "LAST_WRITE_WINS",
+      "syncOrder": 16
+    },
+    "FAQ": {
+      "delegate": "faq",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "LAST_WRITE_WINS",
+      "syncOrder": 17
+    },
+    "SubscriptionPlan": {
+      "delegate": "subscriptionPlan",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 18
+    },
+    "PlanFeature": {
+      "delegate": "planFeature",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 19
+    },
+    "HardwareProduct": {
+      "delegate": "hardwareProduct",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 100
+    },
+    "HardwareOrder": {
+      "delegate": "hardwareOrder",
+      "isSynced": false,
+      "isAgencyScoped": true,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 101
+    },
+    "HardwareOrderItem": {
+      "delegate": "hardwareOrderItem",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 102
+    },
+    "EnterpriseContractRequest": {
+      "delegate": "enterpriseContractRequest",
+      "isSynced": false,
+      "isAgencyScoped": true,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 103
+    },
+    "HardwareSettings": {
+      "delegate": "hardwareSettings",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 104
+    },
+    "HardwareCommitmentTier": {
+      "delegate": "hardwareCommitmentTier",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 105
+    },
+    "SmsLog": {
+      "delegate": "smsLog",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "APPEND_ONLY",
+      "syncOrder": 106
+    },
+    "AuditLog": {
+      "delegate": "auditLog",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "APPEND_ONLY",
+      "syncOrder": 107
+    },
+    "DeviceRegistration": {
+      "delegate": "deviceRegistration",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 108
+    },
+    "UploadedFile": {
+      "delegate": "uploadedFile",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 109
+    },
+    "AppVersion": {
+      "delegate": "appVersion",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 110
+    },
+    "DelayedJob": {
+      "delegate": "delayedJob",
+      "isSynced": false,
+      "isAgencyScoped": false,
+      "conflictStrategy": "CLOUD_AUTHORITATIVE",
+      "syncOrder": 111
+    }
+  }
+}

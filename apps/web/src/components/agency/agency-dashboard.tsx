@@ -79,7 +79,7 @@ import { ETABadge } from '@/components/agency/dashboard/eta-badge';
 import { TicketConfirmation } from '@/components/agency/dashboard/ticket-confirmation';
 import { CreateAgencyForm } from '@/components/agency/create-agency-form';
 import { apiFetch } from '@/lib/api-fetch';
-import { isApiUnreachable as isBothUnreachable } from '@/lib/api-client';
+import { isBothUnreachable } from '@/lib/api-client';
 
 interface QueueEntry {
   id: string;

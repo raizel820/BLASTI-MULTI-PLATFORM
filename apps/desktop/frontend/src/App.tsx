@@ -1,6 +1,7 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from '@/stores/auth';
+import { useLanguage } from '@/hooks/use-language';
 import AppLayout from '@/components/layout/AppLayout';
 import Login from '@/pages/Login';
 import InitialSync from '@/pages/InitialSync';
@@ -20,8 +21,18 @@ import Profile from '@/pages/Profile';
 import { AgencyFullscreen } from '@/components/agency/agency-fullscreen';
 import { AgencyFullscreenHistory } from '@/components/agency/agency-fullscreen-history';
 
+// Event detail shape dispatched by api/client.ts + lib/api-fetch.ts when the
+// local API answers 401 OFFLINE_SESSION_EXPIRED (offline token window lapsed).
+interface OfflineExpiredDetail {
+  offlineDays?: number;
+  message?: string;
+}
+
 export default function App() {
   const { isAuthenticated, needsInitialSync, initialSyncChecked, restoreSession, checkInitialSync } = useAuth();
+  const { t } = useLanguage();
+  const [offlineExpired, setOfflineExpired] = useState<OfflineExpiredDetail | null>(null);
+  const [redirectToLogin, setRedirectToLogin] = useState(false);
 
   // Restore session from localStorage on mount
   useEffect(() => {
@@ -35,11 +46,37 @@ export default function App() {
     }
   }, [isAuthenticated, initialSyncChecked, checkInitialSync]);
 
+  // Offline session expired — the API clients dispatch 'blasti:offline-expired'
+  // when the local API returns 401 OFFLINE_SESSION_EXPIRED (the device stayed
+  // offline past the offline-token validity window). Without a listener the
+  // user was silently dumped to /login with no explanation; show an
+  // Arabic-first overlay explaining what happened instead.
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<OfflineExpiredDetail>).detail;
+      setOfflineExpired(detail && typeof detail === 'object' ? detail : {});
+    };
+    window.addEventListener('blasti:offline-expired', handler);
+    return () => window.removeEventListener('blasti:offline-expired', handler);
+  }, []);
+
+  const handleOfflineReLogin = () => {
+    // Clear the expired session first so /login doesn't bounce back to "/"
+    useAuth.getState().logout();
+    setOfflineExpired(null);
+    setRedirectToLogin(true);
+  };
+
+  if (redirectToLogin) {
+    return <Navigate to="/login" replace />;
+  }
+
   // If authenticated but needs initial sync, redirect to /initial-sync
   // This is handled via routing below
 
   return (
-    <Routes>
+    <>
+      <Routes>
       {/* Login - accessible when not authenticated */}
       <Route
         path="/login"
@@ -87,5 +124,28 @@ export default function App() {
       {/* Catch-all */}
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
+      {offlineExpired && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm"
+          dir="rtl"
+          role="dialog"
+          aria-modal="true"
+        >
+          <div className="mx-4 w-full max-w-md space-y-4 rounded-xl border border-border bg-card p-6 text-center shadow-lg">
+            <div className="text-3xl" aria-hidden="true">🔒</div>
+            <h2 className="text-lg font-bold text-foreground">{t('offlineExpiredTitle')}</h2>
+            <p className="text-sm leading-relaxed text-muted-foreground">
+              {t('offlineExpiredDesc', { days: String(offlineExpired.offlineDays ?? 3) })}
+            </p>
+            <button
+              onClick={handleOfflineReLogin}
+              className="w-full rounded-lg bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+            >
+              {t('offlineExpiredAction')}
+            </button>
+          </div>
+        </div>
+      )}
+    </>
   );
 }

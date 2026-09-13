@@ -1838,7 +1838,7 @@ function EnterpriseRequestDialog({
               {t('requestEnterprise')}
             </DialogTitle>
             <DialogDescription className="text-purple-100 text-sm">
-              {t('enterprisePlanDesc')}
+              {t('enterpriseRequestDesc')}
             </DialogDescription>
           </DialogHeader>
         </div>

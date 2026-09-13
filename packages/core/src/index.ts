@@ -65,31 +65,3 @@ export {
   createNullEmitter,
 } from './realtime'
 export type { RealtimeEmitter } from './realtime'
-
-// ─── Sync Registry ───────────────────────────────────────────────────────
-export {
-  SYNC_PROTOCOL_VERSION,
-  ConflictStrategy,
-  SyncOperation,
-  SYNC_REGISTRY,
-  QUEUE_STATE_TRANSITIONS,
-  DATE_FIELDS,
-  getSyncModelConfig,
-  getSyncedModelsInOrder,
-  getAgencyScopedModels,
-  getOfflineCreatableModels,
-  isModelSynced,
-  validateSyncRegistry,
-} from './sync-registry'
-export type { SyncModelConfig } from './sync-registry'
-
-// ─── Sync Serializer ─────────────────────────────────────────────────────
-export {
-  serializeForCloud,
-  deserializeFromCloud,
-  computeRecordHash,
-  computeRecordHashSync,
-  isValidQueueTransition,
-  isDateField,
-  normalizeDateValue,
-} from './sync-serializer'

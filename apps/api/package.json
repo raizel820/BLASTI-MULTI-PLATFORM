@@ -9,8 +9,7 @@
     "start:node": "node realtime.cjs"
   },
   "dependencies": {
-    "@blasti/cloud-db": "workspace:*",
-    "@blasti/core": "workspace:*",
+    "@blasti/db": "workspace:*",
     "@hono/node-server": "^1.14.0",
     "hono": "^4.7.0",
     "jose": "^6.0.0",

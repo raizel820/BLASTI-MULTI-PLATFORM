@@ -84,6 +84,13 @@ if (isPostgresUrl) {
 // Only apply the extension when using the PostgreSQL client directly.
 // The @blasti/db SQLite client already has its own ghost delete trap.
 // For the PG client, we wrap delete/deleteMany to create DeletedRecord tombstones.
+//
+// NOTE (Task 3-b): rewritten to the DOCUMENTED `query` component API. The
+// previous implementation used the undocumented Prisma 5 `model` component
+// internal shape ({ args, model, query }); under Prisma 6+ the override
+// receives raw args, returns them unchanged, and the delete NEVER EXECUTES
+// (verified empirically — deletes were silent no-ops). The query component
+// works across Prisma 5/6/7.
 
 function modelToDelegate(model: string): string {
   return model.charAt(0).toLowerCase() + model.slice(1)
@@ -104,23 +111,19 @@ let extendedClient = baseClient
 if (usingPostgreSQL && !skipGhostDelete) {
   try {
     extendedClient = baseClient.$extends({
-      model: {
+      query: {
         $allModels: {
-          async delete(rawInput: any) {
-            if (!rawInput || typeof rawInput.query !== 'function') return rawInput
-            const { args, model: rawModel, query } = rawInput
-            const modelName = getModelName(rawModel)
+          async delete({ args, model, query }: { args: any; model: any; query: (args: any) => Promise<any> }) {
+            const modelName = getModelName(model)
             if (modelName === 'DeletedRecord') return query(args)
             const recordId = args?.where?.id
             if (recordId && typeof recordId === 'string' && modelName) {
-              try { await baseClient.deletedRecord.create({ data: { modelName, recordId } }) } catch { /* */ }
+              try { await (baseClient as any).deletedRecord.create({ data: { modelName, recordId } }) } catch { /* */ }
             }
             return query(args)
           },
-          async deleteMany(rawInput: any) {
-            if (!rawInput || typeof rawInput.query !== 'function') return rawInput
-            const { args, model: rawModel, query } = rawInput
-            const modelName = getModelName(rawModel)
+          async deleteMany({ args, model, query }: { args: any; model: any; query: (args: any) => Promise<any> }) {
+            const modelName = getModelName(model)
             if (modelName === 'DeletedRecord') return query(args)
             if (modelName) {
               const delegate = (baseClient as any)[modelToDelegate(modelName)]
@@ -128,7 +131,7 @@ if (usingPostgreSQL && !skipGhostDelete) {
                 try {
                   const records = await delegate.findMany({ where: args?.where || undefined, select: { id: true } })
                   if (records.length > 0) {
-                    await baseClient.deletedRecord.createMany({
+                    await (baseClient as any).deletedRecord.createMany({
                       data: records.map((r: { id: string }) => ({ modelName, recordId: r.id })),
                       skipDuplicates: true,
                     })
@@ -148,11 +151,247 @@ if (usingPostgreSQL && !skipGhostDelete) {
   }
 }
 
+// ── SyncChange Auto-Recording (Task 3-b / D2) ────────────────────────────────
+// Cloud-originated business writes (web/QR joins, admin edits, cron sweeps)
+// previously never recorded a SyncChange row, so /api/sync/pull could only
+// ever deliver echoes of desktop pushes. This extension records a SyncChange
+// AFTER every successful single-record create/update/upsert/delete on a model
+// in the sync set.
+//
+// Rules (Task 2-c audit fix D2):
+//   - Sync set mirrors SYNC_MODELS in apps/api/src/routes/sync.ts (19 models).
+//     (@blasti/core is not a dependency of this package, so the list is kept
+//     here with a comment matching sync.ts — do not diverge.)
+//   - Infrastructure models (SyncChange, SyncMutation, SyncCursor,
+//     DeletedRecord, AgencyLocalState, DelayedJob, AuditLog, ...) are excluded
+//     implicitly because they are not in the sync set.
+//   - *Many operations are skipped (deleteMany is already covered by the
+//     ghost-delete trap writing DeletedRecord tombstones).
+//   - agencyId is derived from the written record; models without an agencyId
+//     column (User, Notification, GlobalAnnouncement, PlanFeature, SmsSettings,
+//     PaymentSettings, FAQ — verified against the Prisma schema) are skipped
+//     safely, except User which is resolved via an AgencyStaff lookup, Counter
+//     which is resolved via its branch, and SubscriptionPlan which uses
+//     ownerAgencyId when set.
+//   - The insert runs on the RAW base client (no extension) AND checks the
+//     model name, so it can never recurse into itself.
+//   - Failures are logged and swallowed — a SyncChange recording failure must
+//     NEVER break the business write.
+
+// Mirrors SYNC_MODELS in apps/api/src/routes/sync.ts — keep in sync.
+const CLOUD_SYNC_MODELS: ReadonlySet<string> = new Set([
+  'Agency', 'Service', 'Branch', 'Counter', 'Reservation', 'Notification',
+  'QueueSettings', 'AgencyStaff', 'Review', 'User',
+  // ── 9 models added for full sync coverage (Task 2a) ──────────────────────
+  'SmsSettings', 'PaymentSettings', 'Announcement', 'GlobalAnnouncement',
+  'Transaction', 'SubscriptionPlan', 'PlanFeature', 'Favorite', 'FAQ',
+])
+
+// Models whose cloud-originated writes cannot be attributed to an agency
+// (no agencyId column in the Prisma schema) — skipped safely by the hook.
+const NO_AGENCY_ID_MODELS: ReadonlySet<string> = new Set([
+  'Notification',       // scoped by userId only
+  'GlobalAnnouncement', // global, no agency scoping
+  'PlanFeature',        // scoped via plan only (plan may be global)
+  'SmsSettings',        // global settings table
+  'PaymentSettings',    // global settings table
+  'FAQ',                // global content table
+])
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const asyncHooks: { AsyncLocalStorage: new <T>() => { run<R>(store: T, cb: (...args: any[]) => R, ...args: any[]): R; getStore(): T | undefined } } = require('node:async_hooks')
+const { AsyncLocalStorage } = asyncHooks
+
+// Suppression scope: push-processing (sync-helpers.atomicMutation /
+// withIdempotency) already records SyncChange explicitly via
+// recordSyncChange(); the auto-hook must stay silent inside that flow to
+// avoid double/triple rows. Scoped with AsyncLocalStorage so concurrent
+// requests never suppress each other.
+const autoSyncChangeSuppression = new AsyncLocalStorage<boolean>()
+
+export async function suppressAutoSyncChange<T>(fn: () => Promise<T>): Promise<T> {
+  return autoSyncChangeSuppression.run(true, fn)
+}
+
+function isAutoSyncChangeSuppressed(): boolean {
+  return autoSyncChangeSuppression.getStore() === true
+}
+
+/**
+ * Create a SyncChange row with correct sequence assignment.
+ *
+ * PostgreSQL: `sequence` is `@default(autoincrement())` — plain create works.
+ * SQLite fallback: the local schema declares `sequence Int @unique` with NO
+ * default (packages/db/prisma/schema.prisma), so the sequence must be
+ * assigned manually as max+1 (with a retry on unique-constraint collisions).
+ *
+ * Safe to call with a transaction client or the raw base client.
+ */
+export async function createSyncChangeRecord(
+  client: any,
+  data: { agencyId: string; model: string; recordId: string; operation: string; syncVersion: number; mutationId?: string | null },
+): Promise<any> {
+  if (usingPostgreSQL) {
+    return client.syncChange.create({ data })
+  }
+
+  // SQLite fallback — manual monotonic sequence assignment.
+  let lastError: unknown = null
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const agg = await client.syncChange.aggregate({ _max: { sequence: true } })
+      const nextSequence = ((agg?._max?.sequence as number | null) ?? 0) + 1
+      return await client.syncChange.create({ data: { ...data, sequence: nextSequence } })
+    } catch (err: any) {
+      lastError = err
+      if (err?.code !== 'P2002') throw err // unique-violation → retry; anything else → surface
+      await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)))
+    }
+  }
+  throw lastError
+}
+
+/**
+ * Derive the owning agencyId from a written record. Returns null when the
+ * agency cannot be determined unambiguously (caller must skip recording).
+ */
+async function deriveAgencyIdForModel(model: string, result: any): Promise<string | null> {
+  if (!result || typeof result !== 'object') return null
+
+  try {
+    switch (model) {
+      case 'Agency':
+        return typeof result.id === 'string' ? result.id : null
+
+      // Direct agencyId column (verified in the Prisma schema)
+      case 'Service':
+      case 'Branch':
+      case 'QueueSettings':
+      case 'Reservation':
+      case 'Review':
+      case 'Announcement':
+      case 'AgencyStaff':
+      case 'Transaction':
+      case 'Favorite':
+        return typeof result.agencyId === 'string' && result.agencyId ? result.agencyId : null
+
+      case 'Counter': {
+        // Counter has no agencyId — resolve via its (required) branch
+        if (typeof result.branchId !== 'string' || !result.branchId) return null
+        const branch = await (baseClient as any).branch.findUnique({
+          where: { id: result.branchId },
+          select: { agencyId: true },
+        })
+        return branch?.agencyId ?? null
+      }
+
+      case 'User': {
+        // User has no agencyId — resolve via an active AgencyStaff assignment
+        if (typeof result.id !== 'string' || !result.id) return null
+        const staff = await (baseClient as any).agencyStaff.findFirst({
+          where: { userId: result.id, isActive: true },
+          select: { agencyId: true },
+        })
+        return staff?.agencyId ?? null
+      }
+
+      case 'SubscriptionPlan': {
+        // Global catalog plans have no agency — only enterprise plans do
+        return typeof result.ownerAgencyId === 'string' && result.ownerAgencyId
+          ? result.ownerAgencyId
+          : null
+      }
+
+      default:
+        return null
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Fire-and-forget SyncChange recording used by the query extension hook.
+ * Never throws.
+ */
+async function recordAutoSyncChange(
+  model: string,
+  operation: 'create' | 'update' | 'upsert' | 'delete',
+  result: any,
+): Promise<void> {
+  try {
+    if (!CLOUD_SYNC_MODELS.has(model)) return
+    if (NO_AGENCY_ID_MODELS.has(model)) return
+    if (isAutoSyncChangeSuppressed()) return
+
+    // Map the operation to the SyncChange vocabulary.
+    // upsert can create or update — recording it as 'update' is safe: the
+    // desktop apply path inserts when the record is missing locally.
+    const syncOperation = operation === 'upsert' ? 'update' : operation
+    const recordId = typeof result?.id === 'string' ? result.id : null
+    if (!recordId) return
+
+    const agencyId = await deriveAgencyIdForModel(model, result)
+    if (!agencyId) return
+
+    const syncVersion = typeof result?.syncVersion === 'number' ? result.syncVersion : 0
+
+    await createSyncChangeRecord(baseClient, {
+      agencyId,
+      model,
+      recordId,
+      operation: syncOperation,
+      syncVersion,
+    })
+  } catch (err: any) {
+    console.warn(`[cloud-db] Failed to record SyncChange for ${model}:`, err?.message ?? err)
+  }
+}
+
+// Apply the SyncChange recording extension to BOTH client paths:
+//   - PostgreSQL: chained after the ghost-delete trap extension.
+//   - SQLite fallback: chained onto the @blasti/db client (which carries its
+//     own ghost-delete trap internally).
+let syncExtendedClient = extendedClient
+try {
+  syncExtendedClient = extendedClient.$extends({
+    query: {
+      $allModels: {
+        async $allOperations({ model, operation, args, query }: { model: any; operation: string; args: any; query: (args: any) => Promise<any> }) {
+          const result = await query(args)
+
+          const modelName = getModelName(model)
+          if (
+            modelName &&
+            (operation === 'create' || operation === 'update' || operation === 'upsert' || operation === 'delete') &&
+            !isAutoSyncChangeSuppressed()
+          ) {
+            // Fire-and-forget (NOT awaited): the hook also runs inside
+            // interactive transactions, and an awaited SyncChange insert on the
+            // base client would contend for SQLite's single write lock while
+            // the outer transaction holds it → guaranteed 5s busy-timeout and
+            // a P2028 "Transaction already closed" failure (observed on
+            // POST /api/agency/queue/walk-in). Recording happens right after
+            // commit instead; errors are already swallowed inside.
+            void recordAutoSyncChange(modelName, operation as any, result)
+          }
+
+          return result
+        },
+      },
+    },
+  })
+} catch (e) {
+  console.warn('[cloud-db] SyncChange recording extension failed:', (e as Error).message)
+  syncExtendedClient = extendedClient
+}
+
 /**
  * Cloud Prisma client — use this for ALL cloud database access.
  * In production: PostgreSQL. In dev without PG: SQLite via @blasti/db.
+ * Carries the ghost-delete trap (PG) and the SyncChange auto-recording hook.
  */
-export const cloudDb = extendedClient
+export const cloudDb = syncExtendedClient
 
 /**
  * Raw (un-extended) Prisma client for $transaction callbacks.

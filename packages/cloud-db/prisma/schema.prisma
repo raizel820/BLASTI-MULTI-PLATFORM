@@ -352,6 +352,8 @@ model AgencyStaff {
   permissions           String    @default("{\"canManageQueue\":true,\"canManageServices\":false,\"canManageStaff\":false,\"canViewAnalytics\":true,\"canManageBranches\":false,\"canManageWorkingHours\":false,\"canExportData\":false,\"canManageProfile\":false}")
   isActive              Boolean   @default(true)
   joinedAt              DateTime  @default(now())
+  /// Task 3-b (sync audit): added for LWW conflict resolution + hydration parity.
+  updatedAt             DateTime? @updatedAt
   agency                Agency    @relation(fields: [agencyId], references: [id])
   branch                Branch?   @relation(fields: [branchId], references: [id])
   user                  User      @relation(fields: [userId], references: [id])
@@ -414,6 +416,8 @@ model Reservation {
   reservedDate       String?
   joinedAt           DateTime  @default(now())
   createdAt          DateTime  @default(now())
+  /// Task 3-b (sync audit): added for LWW conflict resolution + hydration parity.
+  updatedAt          DateTime? @updatedAt
   calledAt           DateTime?
   completedAt        DateTime?
   cancelledAt        DateTime?

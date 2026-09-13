@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { requireAuth, authErrorResponse } from '../lib/auth'
 import { validateBody } from '../lib/validations'
 import { z } from 'zod'
@@ -23,15 +23,15 @@ app.post('/', async (c) => {
     const { agencyId } = validation.data
     const userId = user.id
 
-    const existing = await cloudDb.favorite.findUnique({
+    const existing = await db.favorite.findUnique({
       where: { userId_agencyId: { userId, agencyId } },
     })
 
     if (existing) {
-      await cloudDb.favorite.delete({ where: { id: existing.id } })
+      await db.favorite.delete({ where: { id: existing.id } })
       return c.json({ favorited: false })
     } else {
-      await cloudDb.favorite.create({ data: { userId, agencyId } })
+      await db.favorite.create({ data: { userId, agencyId } })
       return c.json({ favorited: true }, 201)
     }
   } catch (error: unknown) {
@@ -46,7 +46,7 @@ app.get('/', async (c) => {
     const user = await requireAuth(c)
     const userId = user.id
 
-    const favorites = await cloudDb.favorite.findMany({
+    const favorites = await db.favorite.findMany({
       where: { userId },
       include: {
         agency: {

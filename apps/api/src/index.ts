@@ -55,7 +55,6 @@ import { qrRoutes } from './routes/qr'
 import { transactionRoutes } from './routes/transactions'
 import { uploadRoutes } from './routes/upload'
 import { syncRoutes } from './routes/sync'
-import { initialSyncRoutes } from './routes/initial-sync'
 import { settingsRoutes } from './routes/settings'
 import { paymentWebhookRoutes } from './routes/payment-webhook'
 import { paymentCheckoutRoutes } from './routes/payment-checkout'
@@ -64,39 +63,8 @@ import { offlineSyncRoutes } from './routes/offline-sync'
 import { qrClaimRoutes } from './routes/qr-claim'
 import { agencyDeviceRoutes } from './routes/agency-devices'
 import { appVersionRoutes } from './routes/app-versions'
-import { cloudDb, setupPostgreSQLPragmas } from '@blasti/cloud-db'
+import { db, setupSQLitePragmas } from '@blasti/db'
 import { cancelPendingCustomerAlerts } from './lib/cancel-pending-alerts'
-
-// ─── Startup Assertion: Verify cloud DB is PostgreSQL ────────────────────────
-// The @blasti/cloud-db package already checks at import time, but we add an
-// explicit runtime check here so that a misconfigured deployment is caught.
-;(async () => {
-  try {
-    // Check CLOUD_DATABASE_URL points to PostgreSQL
-    const dbUrl = process.env.CLOUD_DATABASE_URL || ''
-    if (dbUrl && !dbUrl.startsWith('postgresql://') && !dbUrl.startsWith('postgres://')) {
-      console.error(`\n❌ FATAL: CLOUD_DATABASE_URL must point to PostgreSQL. Got: ${dbUrl.substring(0, 30)}...`)
-      process.exit(1)
-    }
-    // Try DMMF check (may not work with custom output paths)
-    try {
-      const { Prisma } = await import('@blasti/cloud-db/generated/cloud-client')
-      const ds = Prisma?.dmmf?.datamodel?.datasources?.[0]
-      const provider = ds?.provider
-      if (provider && provider !== 'postgresql') {
-        console.error(`\n❌ FATAL: Cloud DB provider must be PostgreSQL. Got: "${provider}"`)
-        process.exit(1)
-      }
-      if (provider) console.log(`[startup] Cloud DB provider verified: ${provider} ✓`)
-      else console.log('[startup] Cloud DB provider check: DMMF not available, URL check passed ✓')
-    } catch {
-      console.log('[startup] Cloud DB provider check: using URL validation only ✓')
-    }
-  } catch (err: any) {
-    console.error('\n❌ FATAL: Could not verify cloud DB provider.', err?.message || err)
-    process.exit(1)
-  }
-})()
 import { startNotificationWorker, stopNotificationWorker } from './workers/notification-worker'
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -381,7 +349,6 @@ app.route('/api/qr', qrRoutes)
 app.route('/api/transactions', transactionRoutes)
 app.route('/api/upload', uploadRoutes)
 app.route('/api/sync', syncRoutes)
-app.route('/api/sync', initialSyncRoutes)
 app.route('/api/settings', settingsRoutes)
 app.route('/api/payment/webhook', paymentWebhookRoutes)
 app.route('/api/payment', paymentCheckoutRoutes)
@@ -806,10 +773,10 @@ io.on('connection', async (socket) => {
   if (isAuthenticated && authUser) {
     try {
       // Mark user as online in the database
-      await cloudDb.user.update({ where: { id: authUser.id }, data: { isAppOnline: true } })
+      await db.user.update({ where: { id: authUser.id }, data: { isAppOnline: true } })
 
       // Cancel any pending delayed alerts for this user's active reservations
-      const activeReservations = await cloudDb.reservation.findMany({
+      const activeReservations = await db.reservation.findMany({
         where: { userId: authUser.id, status: { in: ['WAITING', 'CALLED'] } },
         select: { id: true },
       })
@@ -919,7 +886,7 @@ io.on('connection', async (socket) => {
     if (!token || typeof token !== 'string') return
 
     // Look up device by deviceToken
-    const device = await cloudDb.agencyDevice.findUnique({
+    const device = await db.agencyDevice.findUnique({
       where: { deviceToken: token },
       select: { id: true, agencyId: true, type: true, status: true }
     })
@@ -943,13 +910,13 @@ io.on('connection', async (socket) => {
 
     // Update device status to ONLINE (H7: only if not DISABLED)
     if (device.status !== 'DISABLED') {
-      await cloudDb.agencyDevice.update({
+      await db.agencyDevice.update({
         where: { id: device.id },
         data: { status: 'ONLINE', lastHeartbeatAt: new Date(), statusChangedAt: new Date() }
       })
     } else {
       // Still update heartbeat but don't change status
-      await cloudDb.agencyDevice.update({
+      await db.agencyDevice.update({
         where: { id: device.id },
         data: { lastHeartbeatAt: new Date() }
       })
@@ -997,7 +964,7 @@ io.on('connection', async (socket) => {
     const disconnectUser = (socket as any)._authUser as SessionToken | null
     if (disconnectUser) {
       try {
-        await cloudDb.user.update({ where: { id: disconnectUser.id }, data: { isAppOnline: false } })
+        await db.user.update({ where: { id: disconnectUser.id }, data: { isAppOnline: false } })
       } catch (error) {
         console.error('[socket] Error marking user offline on disconnect:', error)
       }
@@ -1039,8 +1006,7 @@ io.on('connection', async (socket) => {
 
 httpServer.listen(PORT, '127.0.0.1', async () => {
   // Phase 3b: Set SQLite busy_timeout PRAGMA on startup
-  await setupPostgreSQLPragmas()
-  console.log('[API] Using Cloud PostgreSQL database via @blasti/cloud-db')
+  await setupSQLitePragmas()
   console.log(`🚀 @blasti/api server running on port ${PORT}`)
   console.log(`   API:    http://localhost:${PORT}/`)
   console.log(`   Health: http://localhost:${PORT}/health`)

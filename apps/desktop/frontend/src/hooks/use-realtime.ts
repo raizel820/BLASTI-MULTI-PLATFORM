@@ -1,10 +1,25 @@
 /**
- * useRealtime — Desktop polling-only stub
+ * useRealtime — Desktop realtime hook (SINGLE SOURCE OF TRUTH)
  *
- * On Desktop, real-time updates are handled via HTTP polling against the local API.
- * Socket.IO integration will come in a later iteration.
+ * IMPORTANT: this file replaces the former use-realtime.ts / use-realtime.tsx
+ * shadow-file pair. Vite resolves `.ts` before `.tsx`, so this `.ts` file was
+ * the live implementation; the `.tsx` stub was dead code. The two have been
+ * MERGED here (the richer `.ts` handler surface + the `.tsx`-only exports:
+ * `connected`, `joinRoom`/`leaveRoom`, `on`/`off`/`emit`, `useAgencyRealtime`,
+ * `useCustomerRealtime`) so that every consumer import
+ * (`@/hooks/use-realtime` in agency-dashboard.tsx, agency-fullscreen.tsx,
+ * dashboard/SimpleMobileDashboard.tsx, shared/connection-status.tsx) resolves
+ * to exactly one module with the complete API surface.
  *
- * All methods are no-ops that return no-op cleanup functions.
+ * Desktop transport reality: the desktop frontend talks to the LOCAL API at
+ * 127.0.0.1:3080 over HTTP polling (use-api/use-notifications). There is no
+ * Socket.IO connection on desktop, so all room management and event
+ * subscriptions are no-ops that return safe unsubscribe functions. Data
+ * freshness is provided by the polling layers — this hook exists so shared
+ * agency components compile and run unchanged.
+ *
+ * Every subscription method is a guarded no-op: calling it never throws and
+ * always returns a callable cleanup function.
  */
 
 export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting';
@@ -25,11 +40,14 @@ const noopSub = (_handler?: unknown) => noop;
 
 export function useRealtime() {
   return {
-    // Connection state — always disconnected (polling mode)
+    // Connection state — always "disconnected" (polling mode)
+    connected: false as const, // alias kept for .tsx-stub consumers
     isConnected: false as const,
     connectionStatus: 'disconnected' as ConnectionStatus,
 
     // Room management — no-ops
+    joinRoom: noop as (room: string) => void,
+    leaveRoom: noop as (room: string) => void,
     joinAgency: noop as (agencyId: string) => void,
     leaveAgency: noop as (agencyId: string) => void,
     joinCustomer: noop as (userId: string) => void,
@@ -38,6 +56,11 @@ export function useRealtime() {
     leaveKiosk: noop as (agencyId: string) => void,
     joinAdmin: noop as () => void,
     leaveAdmin: noop as () => void,
+
+    // Low-level event methods — no-ops (from the merged .tsx stub)
+    on: noopSub as (event: string, handler: (...args: unknown[]) => void) => () => void,
+    off: noop as (event: string, handler: (...args: unknown[]) => void) => void,
+    emit: noop as (event: string, ...args: unknown[]) => void,
 
     // Queue event subscriptions — no-ops
     onQueueCreated: noopSub as (handler: EventHandler) => () => void,
@@ -76,6 +99,56 @@ export function useRealtime() {
     subscribe: noopSub as (event: string, handler: (...args: unknown[]) => void) => () => void,
     unsubscribe: noop as (event: string, handler: (...args: unknown[]) => void) => void,
     onAnyEvent: noopSub as (handler: (...args: unknown[]) => void) => () => void,
+  };
+}
+
+// ─── Agency realtime hook (merged from .tsx stub) ───────────────────────────
+
+/**
+ * useAgencyRealtime — Desktop polling-only no-op.
+ *
+ * On Desktop, agency staff receive updates via polling (useNotifications,
+ * use-api with usePolling). Provided so shared/web-derived components that
+ * call this hook compile and run unchanged.
+ */
+export function useAgencyRealtime(_agencyId?: string) {
+  return {
+    lastEvent: null as RealtimeEventData | null,
+    connected: false as const,
+    connectionStatus: 'disconnected' as ConnectionStatus,
+
+    // Convenience event subscriptions — no-ops
+    onQueueCreated: noopSub as (handler: EventHandler) => () => void,
+    onQueueCalled: noopSub as (handler: EventHandler) => () => void,
+    onQueueUpdated: noopSub as (handler: EventHandler) => () => void,
+    onQueueCompleted: noopSub as (handler: EventHandler) => () => void,
+    onAgencyUpdated: noopSub as (handler: EventHandler) => () => void,
+    onStaffUpdated: noopSub as (handler: EventHandler) => () => void,
+  };
+}
+
+// ─── Customer realtime hook (merged from .tsx stub) ─────────────────────────
+
+/**
+ * useCustomerRealtime — Desktop polling-only no-op.
+ *
+ * On Desktop, customers receive updates via polling (useNotifications,
+ * use-api with usePolling). Provided so shared/web-derived components that
+ * call this hook compile and run unchanged.
+ */
+export function useCustomerRealtime(_userId?: string) {
+  return {
+    lastEvent: null as RealtimeEventData | null,
+    connected: false as const,
+    connectionStatus: 'disconnected' as ConnectionStatus,
+
+    // Convenience event subscriptions — no-ops
+    onNotification: noopSub as (handler: EventHandler) => () => void,
+    onYourTurn: noopSub as (handler: EventHandler) => () => void,
+    onTurnApproaching: noopSub as (handler: EventHandler) => () => void,
+    onReservationCreated: noopSub as (handler: EventHandler) => () => void,
+    onReservationUpdated: noopSub as (handler: EventHandler) => () => void,
+    onQueueJoined: noopSub as (handler: EventHandler) => () => void,
   };
 }
 

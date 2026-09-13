@@ -2,7 +2,7 @@
 import { apiFetch } from '@/lib/api-fetch';;
 
 import { useState, useCallback } from 'react';
-import { apiClient, setSessionToken as setApiClientToken, clearSessionToken as clearApiClientToken } from '@/lib/api-client';
+import { apiClient } from '@/lib/api-client';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
@@ -12,7 +12,7 @@ import { Label } from '@/components/ui/label';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
-import { ArrowLeft, Loader2, Eye, EyeOff, CheckCircle2, KeyRound, Mail, Ticket } from 'lucide-react';
+import { ArrowLeft, Loader2, Eye, EyeOff, CheckCircle2, KeyRound, Mail, Ticket, Tablet } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { UserRole } from '@/store/use-app-store';
@@ -63,17 +63,52 @@ export function LoginForm() {
       const data = await res.json();
 
       if (res.ok && data.user) {
-        // Immediately cache the token in the API client module so subsequent
-        // requests include the Authorization header without waiting for
-        // Zustand's persist middleware to write to localStorage.
-        if (data.token) {
-          setApiClientToken(data.token);
-        }
         setLoginSuccess(true);
         setTimeout(() => {
           setUser(data.user);
           if (data.token) {
             setSessionToken(data.token);
+            // ── Electron: Establish local API session for LAN failover ──
+            // When cloud goes down, requests fall back to localhost:3080 (local API).
+            // The local API needs its own session token to authorize requests.
+            // We use import-session (not local login) because the local SQLite
+            // database may be empty (no synced user data).
+            try {
+              const w = window as any;
+              const isElectron = navigator.userAgent.includes('Electron') || w.electronAPI;
+              if (isElectron) {
+                // 1. Store the token so buildAuthHeaders() sends it with LAN requests
+                localStorage.setItem('blasti-local-api-token', data.token);
+
+                // 2. Import session directly into the local API via IPC bridge
+                //    This sets sessionToken + sessionUser in the main process module
+                if (w.electronAPI?.setLocalApiSession) {
+                  w.electronAPI.setLocalApiSession({ token: data.token, user: data.user });
+                }
+
+                // 3. Also call the HTTP import-session endpoint as a backup
+                //    (in case IPC bridge isn't wired up correctly)
+                if (!res.url || !res.url.includes('localhost:3080')) {
+                  fetch('http://127.0.0.1:3080/api/auth/import-session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    credentials: 'omit',
+                    body: JSON.stringify({ token: data.token, user: data.user }),
+                  }).catch(() => { /* non-critical */ });
+                }
+
+                // 4. Trigger initial cloud→local sync to pull agency data
+                //    This downloads all agency tables (Services, Branches, Counters,
+                //    Reservations, etc.) into the local SQLite for offline use.
+                if (w.electronAPI?.initialCloudSync) {
+                  w.electronAPI.initialCloudSync().then((syncResult: any) => {
+                    if (syncResult?.success) {
+                      console.log('[Login] Initial sync complete:', syncResult.pulled, 'records pulled');
+                    }
+                  }).catch(() => { /* non-critical — periodic sync will handle it */ });
+                }
+              }
+            } catch { /* ignore */ }
           }
           toast.success(t('loginSuccess'));
           setLoginSuccess(false);
@@ -408,7 +443,7 @@ export function LoginForm() {
                             <span className="bg-white/95 dark:bg-gray-900/95 px-3 text-muted-foreground">{t('orContinueWith')}</span>
                           </div>
                         </div>
-                        <div className="grid grid-cols-1 gap-2.5">
+                        <div className="grid grid-cols-2 gap-2.5">
                           <div className="relative group/social1">
                             <motion.button
                               type="button"
@@ -429,6 +464,14 @@ export function LoginForm() {
                               {t('comingSoon') || 'Coming Soon'}
                             </span>
                           </div>
+                          {/* Kiosk Mode Button — redirects to real kiosk page */}
+                          <a
+                            href="/?mode=device&type=KIOSK"
+                            className="w-full h-11 rounded-xl border-2 border-amber-200 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/30 flex items-center justify-center gap-2 text-sm font-medium text-amber-700 dark:text-amber-300 cursor-pointer transition-all duration-300 hover:border-amber-400 dark:hover:border-amber-500 hover:shadow-lg hover:shadow-amber-500/10"
+                          >
+                            <Tablet className="h-4 w-4" />
+                            {t('kioskMode')}
+                          </a>
                         </div>
                       </div>
 

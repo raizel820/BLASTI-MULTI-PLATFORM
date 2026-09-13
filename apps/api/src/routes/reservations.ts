@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { requireAuth, requireResourceOwnership, requireAgencyAccess, authErrorResponse } from '../lib/auth'
 import { validateBody, createReservationSchema, updateReservationStatusSchema, rateReservationSchema } from '../lib/validations'
 import { emitQueueEvent, emitReservationEvent, emitNotificationEvent, emitKioskEvent, emitAgencyEvent } from '../lib/realtime-emit'
@@ -52,7 +52,7 @@ app.post('/', async (c) => {
       return c.json({ success: false, error: 'Only customers can join queues' }, 403)
     }
 
-    const agency = await cloudDb.agency.findUnique({
+    const agency = await db.agency.findUnique({
       where: { id: agencyId },
       include: { queueSettings: { take: 1, orderBy: { updatedAt: 'desc' } } },
     })
@@ -74,21 +74,21 @@ app.post('/', async (c) => {
 
     let resolvedServiceId = serviceId
     if (!resolvedServiceId) {
-      const firstService = await cloudDb.service.findFirst({
+      const firstService = await db.service.findFirst({
         where: { agencyId, isActive: true },
         orderBy: { createdAt: 'asc' },
       })
       if (firstService) {
         resolvedServiceId = firstService.id
       } else {
-        const defaultService = await cloudDb.service.create({
+        const defaultService = await db.service.create({
           data: { agencyId, name: 'General', nameAr: 'عام', nameFr: 'Général', prefix: 'A' },
         })
         resolvedServiceId = defaultService.id
       }
     }
 
-    const service = await cloudDb.service.findUnique({ where: { id: resolvedServiceId } })
+    const service = await db.service.findUnique({ where: { id: resolvedServiceId } })
     if (!service || !service.isActive) {
       return c.json({ success: false, error: 'Service not found or inactive' }, 404)
     }
@@ -104,7 +104,7 @@ app.post('/', async (c) => {
     } else {
       duplicateWhere.reservedDate = null
     }
-    const activeReservation = await cloudDb.reservation.findFirst({ where: duplicateWhere })
+    const activeReservation = await db.reservation.findFirst({ where: duplicateWhere })
     if (activeReservation) {
       return c.json({ success: false, error: 'You already have an active reservation for this service' }, 409)
     }
@@ -114,7 +114,7 @@ app.post('/', async (c) => {
       status: { in: ['WAITING', 'CALLED'] },
     }
     if (targetDate) { countWhere.reservedDate = targetDate } else { countWhere.reservedDate = null }
-    const activeCount = await cloudDb.reservation.count({ where: countWhere })
+    const activeCount = await db.reservation.count({ where: countWhere })
     if (activeCount >= agency.maxActiveReservations) {
       return c.json({ success: false, error: 'Queue is full. Please try again later' }, 400)
     }
@@ -123,11 +123,11 @@ app.post('/', async (c) => {
     if (targetDate) { lastWhere.reservedDate = targetDate } else { lastWhere.reservedDate = null }
     const waitWhere: Record<string, unknown> = { agencyId, status: 'WAITING' }
     if (targetDate) { waitWhere.reservedDate = targetDate } else { waitWhere.reservedDate = null }
-    const waitingCount = await cloudDb.reservation.count({ where: waitWhere })
+    const waitingCount = await db.reservation.count({ where: waitWhere })
 
     // ── Unified ETA: use the same advanced engine as the mobile app ──
     const sevenDaysAgoForCreate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompletedForCreate = await cloudDb.reservation.findMany({
+    const recentCompletedForCreate = await db.reservation.findMany({
       where: {
         agencyId,
         status: 'COMPLETED',
@@ -139,7 +139,7 @@ app.post('/', async (c) => {
     })
     const effectiveForCreate = getEffectiveServiceTime(recentCompletedForCreate, agency.averageServiceTime)
     const fortyFiveForCreate = new Date(Date.now() - 45 * 60 * 1000)
-    const activeCountersForCreate = await cloudDb.counter.count({
+    const activeCountersForCreate = await db.counter.count({
       where: {
         isActive: true,
         staffId: { not: null },
@@ -158,7 +158,7 @@ app.post('/', async (c) => {
     })
     const estimatedWait = etaForCreate.estimatedMaxMinutes
 
-    const reservation = await cloudDb.$transaction(async (tx) => {
+    const reservation = await db.$transaction(async (tx) => {
       const dupCheck = await tx.reservation.findFirst({ where: duplicateWhere })
       if (dupCheck) throw new Error('DUPLICATE')
 
@@ -245,7 +245,7 @@ app.get('/active', async (c) => {
     const user = await requireAuth(c)
     const userId = user.id
 
-    const reservations = await cloudDb.reservation.findMany({
+    const reservations = await db.reservation.findMany({
       where: { userId, status: { in: ['WAITING', 'CALLED'] } },
       include: {
         agency: {
@@ -264,7 +264,7 @@ app.get('/active', async (c) => {
     const agencyIds = [...new Set(reservations.map((r) => r.agencyId))]
 
     // Fetch queue settings for pause state
-    const queueSettingsList = await cloudDb.queueSettings.findMany({
+    const queueSettingsList = await db.queueSettings.findMany({
       where: { agencyId: { in: agencyIds } },
     })
     const pausedByAgency = new Map(queueSettingsList.map((qs) => [qs.agencyId, qs.isPaused]))
@@ -272,7 +272,7 @@ app.get('/active', async (c) => {
     // Fetch active counters per agency for ETA calculation
     // Phantom Counter Protection: only count counters with recent activity (≤45 min)
     const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
-    const branches = await cloudDb.branch.findMany({
+    const branches = await db.branch.findMany({
       where: { agencyId: { in: agencyIds }, isActive: true },
       include: { counters: { where: { isActive: true, staffId: { not: null }, updatedAt: { gte: fortyFiveMinsAgo } } } },
     })
@@ -284,7 +284,7 @@ app.get('/active', async (c) => {
 
     // Fetch recent completed reservations for historical service time calculation
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompleted = await cloudDb.reservation.findMany({
+    const recentCompleted = await db.reservation.findMany({
       where: {
         agencyId: { in: agencyIds },
         status: 'COMPLETED',
@@ -300,13 +300,13 @@ app.get('/active', async (c) => {
       completedByAgency.get(rc.agencyId)!.push(rc)
     }
 
-    const waitingReservations = await cloudDb.reservation.findMany({
+    const waitingReservations = await db.reservation.findMany({
       where: { agencyId: { in: agencyIds }, status: 'WAITING' },
       orderBy: { joinedAt: 'asc' },
       select: { id: true, agencyId: true, joinedAt: true, fixedTimeEnabled: true, preferredTime: true },
     })
 
-    const currentServings = await cloudDb.reservation.findMany({
+    const currentServings = await db.reservation.findMany({
       where: { agencyId: { in: agencyIds }, status: { in: ['CALLED', 'SERVED'] }, calledAt: { not: null } },
       orderBy: { calledAt: 'desc' },
       distinct: ['agencyId'],
@@ -385,7 +385,7 @@ app.get('/history', async (c) => {
     const where = { userId, status: { in: completedStatuses } }
 
     const [reservations, total] = await Promise.all([
-      cloudDb.reservation.findMany({
+      db.reservation.findMany({
         where,
         include: {
           agency: { select: { id: true, name: true, nameFr: true, nameAr: true, customCode: true, category: true, logoUrl: true } },
@@ -395,7 +395,7 @@ app.get('/history', async (c) => {
         take: limit,
         skip: offset,
       }),
-      cloudDb.reservation.count({ where }),
+      db.reservation.count({ where }),
     ])
 
     const mappedReservations = reservations.map(r => {
@@ -435,7 +435,7 @@ app.get('/agency', async (c) => {
     if (status) where.status = status
 
     const [reservations, total] = await Promise.all([
-      cloudDb.reservation.findMany({
+      db.reservation.findMany({
         where,
         include: {
           user: { select: { id: true, username: true, fullName: true, phoneNumber: true } },
@@ -445,7 +445,7 @@ app.get('/agency', async (c) => {
         take: limit,
         skip: offset,
       }),
-      cloudDb.reservation.count({ where }),
+      db.reservation.count({ where }),
     ])
 
     return c.json({ success: true, reservations, total, limit, offset })
@@ -468,7 +468,7 @@ app.post('/reclaim', async (c) => {
 
     const { reservationId } = validation.data
 
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id: reservationId },
       include: {
         user: { select: { id: true, language: true } },
@@ -496,7 +496,7 @@ app.post('/reclaim', async (c) => {
       : userLang === 'fr' ? reservation.agency.nameFr || reservation.agency.name
       : reservation.agency.name
 
-    await cloudDb.$transaction(async (tx) => {
+    await db.$transaction(async (tx) => {
       const currentQueueNumber = await tx.reservation.findFirst({
         where: { agencyId: reservation.agencyId, status: 'CALLED', id: { not: reservation.id } },
         orderBy: { queueNumber: 'asc' },
@@ -551,7 +551,7 @@ app.delete('/cancel-active', async (c) => {
     const user = await requireAuth(c)
     const userId = user.id
 
-    const reservation = await cloudDb.reservation.findFirst({
+    const reservation = await db.reservation.findFirst({
       where: { userId, status: { in: ['WAITING', 'CALLED'] } },
       orderBy: { joinedAt: 'desc' },
     })
@@ -560,12 +560,12 @@ app.delete('/cancel-active', async (c) => {
       return c.json({ error: 'No active reservation found' }, 404)
     }
 
-    const updated = await cloudDb.reservation.update({
+    const updated = await db.reservation.update({
       where: { id: reservation.id },
       data: { status: 'CANCELLED', cancelledAt: new Date() },
     })
 
-    await cloudDb.notification.create({
+    await db.notification.create({
       data: { userId, type: 'CANCELLED', title: 'Queue Cancelled', message: `Your reservation ${updated.displayNumber} has been cancelled.` },
     })
 
@@ -597,7 +597,7 @@ app.post('/batch-complete', async (c) => {
 
     let resolvedAgencyId = agencyId
     if (!resolvedAgencyId) {
-      const firstRes = await cloudDb.reservation.findFirst({ where: { id: { in: reservationIds } }, select: { agencyId: true } })
+      const firstRes = await db.reservation.findFirst({ where: { id: { in: reservationIds } }, select: { agencyId: true } })
       if (firstRes) resolvedAgencyId = firstRes.agencyId
     }
 
@@ -608,12 +608,12 @@ app.post('/batch-complete', async (c) => {
     }
 
     // Phase 3a: Fetch original data before updateMany (updateMany only returns a count)
-    const originalReservations = await cloudDb.reservation.findMany({
+    const originalReservations = await db.reservation.findMany({
       where: { id: { in: reservationIds }, agencyId: resolvedAgencyId, status: { in: ['WAITING', 'CALLED'] } },
       select: { id: true, displayNumber: true, agencyId: true, serviceId: true, userId: true, status: true },
     })
 
-    const results = await cloudDb.reservation.updateMany({
+    const results = await db.reservation.updateMany({
       where: { id: { in: reservationIds }, agencyId: resolvedAgencyId, status: { in: ['WAITING', 'CALLED'] } },
       data: { status: 'COMPLETED', completedAt: new Date() },
     })
@@ -649,7 +649,7 @@ app.get('/:id/eta', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id },
       include: {
         agency: {
@@ -707,7 +707,7 @@ app.get('/:id/eta', async (c) => {
     // Get people ahead in queue for this agency
     // Phase 3c: Exclude future fixed-time appointments outside the 30-minute immediate window
     const etaNow = new Date()
-    const peopleAheadResult = await cloudDb.reservation.count({
+    const peopleAheadResult = await db.reservation.count({
       where: {
         agencyId: reservation.agencyId,
         status: 'WAITING',
@@ -724,13 +724,13 @@ app.get('/:id/eta', async (c) => {
     })
 
     // Get queue settings for pause state
-    const queueSettings = await cloudDb.queueSettings.findFirst({
+    const queueSettings = await db.queueSettings.findFirst({
       where: { agencyId: reservation.agencyId },
     })
     const isPaused = queueSettings?.isPaused || false
 
     // Get active counters
-    const activeCounters = await cloudDb.counter.count({
+    const activeCounters = await db.counter.count({
       where: {
         isActive: true,
         staffId: { not: null },
@@ -740,7 +740,7 @@ app.get('/:id/eta', async (c) => {
 
     // Get recent completed for historical service time
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompleted = await cloudDb.reservation.findMany({
+    const recentCompleted = await db.reservation.findMany({
       where: {
         agencyId: reservation.agencyId,
         status: 'COMPLETED',
@@ -786,7 +786,7 @@ app.post('/:id/postpone', async (c) => {
       return c.json({ success: false, error: 'Positions must be between 1 and 10' }, 400)
     }
 
-    const reservation = await cloudDb.reservation.findUnique({ where: { id } })
+    const reservation = await db.reservation.findUnique({ where: { id } })
     if (!reservation) {
       return c.json({ success: false, error: 'Reservation not found' }, 404)
     }
@@ -800,7 +800,7 @@ app.post('/:id/postpone', async (c) => {
       try { await requireResourceOwnership(c, reservation.userId) } catch { await requireAgencyAccess(c, reservation.agencyId) }
     }
 
-    const laterReservations = await cloudDb.reservation.findMany({
+    const laterReservations = await db.reservation.findMany({
       where: { agencyId: reservation.agencyId, status: 'WAITING', queueNumber: { gt: reservation.queueNumber } },
       orderBy: { queueNumber: 'asc' },
       take: positions,
@@ -813,7 +813,7 @@ app.post('/:id/postpone', async (c) => {
     const targetReservation = laterReservations[laterReservations.length - 1]
     const targetQueueNumber = targetReservation.queueNumber
 
-    const updated = await cloudDb.$transaction(async (tx) => {
+    const updated = await db.$transaction(async (tx) => {
       // Phase 3b: Use $executeRaw for atomic shift to avoid SQLite unique constraint violations
       // Sequential Prisma updates can temporarily create duplicate queueNumber values
       const tempQueueNumber = -reservation.queueNumber
@@ -882,7 +882,7 @@ app.post('/:id/rate', async (c) => {
 
     const { rating, comment } = validation.data
 
-    const reservation = await cloudDb.reservation.findUnique({ where: { id } })
+    const reservation = await db.reservation.findUnique({ where: { id } })
     if (!reservation) return c.json({ error: 'Reservation not found' }, 404)
     if (reservation.status !== 'COMPLETED') return c.json({ error: 'Can only rate completed reservations' }, 400)
 
@@ -894,11 +894,11 @@ app.post('/:id/rate', async (c) => {
 
     if (reservation.rating) return c.json({ error: 'Reservation already rated' }, 400)
 
-    await cloudDb.reservation.update({ where: { id }, data: { rating } })
+    await db.reservation.update({ where: { id }, data: { rating } })
 
     const feedbackText = (comment || '').trim()
     try {
-      await cloudDb.reservation.update({
+      await db.reservation.update({
         where: { id },
         data: { ratedAt: new Date(), ...(feedbackText ? { feedback: feedbackText } : {}) },
       })
@@ -908,7 +908,7 @@ app.post('/:id/rate', async (c) => {
 
     emitAgencyEvent('agency:updated', reservation.agencyId, { action: 'rating-submitted', reservationId: reservation.id, rating })
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: reservation.userId ?? undefined,
         action: 'RATING_SUBMITTED',
@@ -930,7 +930,7 @@ app.get('/:id/share', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id },
       include: {
         user: { select: { fullName: true } },
@@ -948,7 +948,7 @@ app.get('/:id/share', async (c) => {
     }
 
     // Phase 3c: Include fixedTimeEnabled/preferredTime to filter ghost tickets
-    const allAhead = await cloudDb.reservation.findMany({
+    const allAhead = await db.reservation.findMany({
       where: { agencyId: reservation.agencyId, status: 'WAITING', joinedAt: { lt: reservation.joinedAt } },
       select: { id: true, fixedTimeEnabled: true, preferredTime: true },
     })
@@ -962,7 +962,7 @@ app.get('/:id/share', async (c) => {
     ).length
 
     const position = peopleAhead + 1
-    const agency = await cloudDb.agency.findUnique({ where: { id: reservation.agencyId }, select: { averageServiceTime: true } })
+    const agency = await db.agency.findUnique({ where: { id: reservation.agencyId }, select: { averageServiceTime: true } })
     const estimatedWait = Math.round(peopleAhead * (agency?.averageServiceTime ?? 10))
 
     const displayNumber = `${reservation.service?.name?.substring(0, 1).toUpperCase() || ''}-${String(reservation.queueNumber).padStart(3, '0')}`
@@ -990,7 +990,7 @@ app.post('/:id/share', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id },
       include: {
         user: { select: { fullName: true } },
@@ -1008,7 +1008,7 @@ app.post('/:id/share', async (c) => {
     }
 
     // Phase 3c: Include fixedTimeEnabled/preferredTime to filter ghost tickets
-    const allAhead = await cloudDb.reservation.findMany({
+    const allAhead = await db.reservation.findMany({
       where: { agencyId: reservation.agencyId, status: 'WAITING', joinedAt: { lt: reservation.joinedAt } },
       select: { id: true, fixedTimeEnabled: true, preferredTime: true },
     })
@@ -1022,7 +1022,7 @@ app.post('/:id/share', async (c) => {
     ).length
 
     const position = peopleAhead + 1
-    const agency = await cloudDb.agency.findUnique({ where: { id: reservation.agencyId }, select: { averageServiceTime: true } })
+    const agency = await db.agency.findUnique({ where: { id: reservation.agencyId }, select: { averageServiceTime: true } })
     const estimatedWait = Math.round(peopleAhead * (agency?.averageServiceTime ?? 10))
 
     const displayNumber = `${reservation.service?.name?.substring(0, 1).toUpperCase() || ''}-${String(reservation.queueNumber).padStart(3, '0')}`
@@ -1050,7 +1050,7 @@ app.post('/:id/cancel', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const reservation = await cloudDb.reservation.findUnique({ where: { id } })
+    const reservation = await db.reservation.findUnique({ where: { id } })
     if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
 
     if (!reservation.userId) {
@@ -1063,7 +1063,7 @@ app.post('/:id/cancel', async (c) => {
       return c.json({ success: false, error: 'Only WAITING reservations can be cancelled' }, 400)
     }
 
-    await cloudDb.$transaction(async (tx) => {
+    await db.$transaction(async (tx) => {
       await tx.reservation.update({ where: { id }, data: { status: 'CANCELLED', cancelledAt: new Date() } })
 
       if (reservation.userId) {
@@ -1112,7 +1112,7 @@ app.put('/:id/status', async (c) => {
       SERVING: ['COMPLETED'],
     }
 
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id },
       include: { agency: { select: { id: true, name: true } }, service: { select: { id: true, name: true } } },
     })
@@ -1140,7 +1140,7 @@ app.put('/:id/status', async (c) => {
       // SERVING is an intermediate state — no timestamp to set
     }
 
-    const updatedReservation = await cloudDb.reservation.update({ where: { id }, data: updateData })
+    const updatedReservation = await db.reservation.update({ where: { id }, data: updateData })
 
     if (reservation.userId) {
       const notificationType = `QUEUE_${status}` as const
@@ -1153,12 +1153,12 @@ app.put('/:id/status', async (c) => {
         SERVING: `You are now being served at ${reservation.agency.name} - ${reservation.service.name}.`,
       }
 
-      await cloudDb.notification.create({
+      await db.notification.create({
         data: { userId: reservation.userId, type: notificationType, title: titleMap[status] || 'Reservation Update', message: messageMap[status] || 'Your reservation status has been updated.' },
       })
     }
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: reservation.userId ?? undefined,
         action: status === 'COMPLETED' ? 'QUEUE_COMPLETE' : status === 'CANCELLED' ? 'QUEUE_CANCEL' : status === 'NO_SHOW' ? 'QUEUE_NOSHOW' : 'QUEUE_CALL',
@@ -1209,7 +1209,7 @@ app.post('/:id/toggle-fixed-time', async (c) => {
 
     const { fixedTimeEnabled } = validation.data
 
-    const reservation = await cloudDb.reservation.findUnique({ where: { id } })
+    const reservation = await db.reservation.findUnique({ where: { id } })
     if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
     if (reservation.status !== 'WAITING') return c.json({ success: false, error: 'Can only toggle fixed time for waiting reservations' }, 400)
 
@@ -1219,10 +1219,10 @@ app.post('/:id/toggle-fixed-time', async (c) => {
       return c.json({ success: false, error: 'Cannot enable fixed time without a preferred time' }, 400)
     }
 
-    const updated = await cloudDb.reservation.update({ where: { id }, data: { fixedTimeEnabled } })
+    const updated = await db.reservation.update({ where: { id }, data: { fixedTimeEnabled } })
 
     if (reservation.userId) {
-      await cloudDb.notification.create({
+      await db.notification.create({
         data: {
           userId: reservation.userId,
           type: 'QUEUE_TIME_TOGGLE',
@@ -1232,7 +1232,7 @@ app.post('/:id/toggle-fixed-time', async (c) => {
       })
     }
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: reservation.userId || undefined,
         action: fixedTimeEnabled ? 'FIXED_TIME_ENABLE' : 'FIXED_TIME_DISABLE',
@@ -1256,7 +1256,7 @@ app.get('/:id/position-history', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id },
       select: { id: true, userId: true, agencyId: true, status: true, queueNumber: true, displayNumber: true, joinedAt: true, calledAt: true, service: { select: { name: true, prefix: true } }, agency: { select: { averageServiceTime: true } } },
     })
@@ -1267,7 +1267,7 @@ app.get('/:id/position-history', async (c) => {
 
     // Phase 3c: Exclude future fixed-time appointments outside the 30-minute immediate window
     const posNow = new Date()
-    const peopleAhead = await cloudDb.reservation.count({
+    const peopleAhead = await db.reservation.count({
       where: {
         agencyId: reservation.agencyId,
         status: 'WAITING',
@@ -1289,7 +1289,7 @@ app.get('/:id/position-history', async (c) => {
     const joinedAt = new Date(reservation.joinedAt)
     const now = new Date()
 
-    const initialWaiting = await cloudDb.reservation.count({
+    const initialWaiting = await db.reservation.count({
       where: { agencyId: reservation.agencyId, status: { in: ['WAITING', 'CALLED', 'COMPLETED'] }, joinedAt: { lt: reservation.joinedAt } },
     })
 
@@ -1354,7 +1354,7 @@ app.post('/import-walk-in', async (c) => {
     }
 
     // Find the reservation
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id: payload.reservationId },
       include: {
         agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
@@ -1402,14 +1402,14 @@ app.post('/import-walk-in', async (c) => {
     }
 
     // Fetch the customer's account data to update the reservation
-    const customerAccount = await cloudDb.user.findUnique({
+    const customerAccount = await db.user.findUnique({
       where: { id: user.id },
       select: { fullName: true, phoneNumber: true, avatarUrl: true },
     })
 
     // Link the reservation to the authenticated user and update customer data
     // Keep status as WAITING so it stays visible in both agency queue and customer queue
-    await cloudDb.reservation.update({
+    await db.reservation.update({
       where: { id: reservation.id },
       data: {
         userId: user.id,

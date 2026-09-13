@@ -46,12 +46,23 @@ const STAGE_MODEL_MAP = {
   counters:         'Counter',
   agencyStaff:      'AgencyStaff',
   queueSettings:    'QueueSettings',
+  // Task 4-b (PARITY_SYNC_AUDIT §5-5): previously-missing stages. Local
+  // Prisma models verified in packages/db/prisma/schema.prisma
+  // (Favorite:551, GlobalAnnouncement:582, SmsSettings:595, FAQ:670,
+  // PaymentSettings:689, PlanFeature:196). All use 'id' as unique key
+  // (MODEL_UNIQUE_KEYS fallback below handles the upsert routing).
+  smsSettings:      'SmsSettings',
+  paymentSettings:  'PaymentSettings',
   reservations:     'Reservation',
   reviews:          'Review',
+  favorites:        'Favorite',
+  faqs:             'FAQ',
   notifications:    'Notification',
   announcements:    'Announcement',
+  globalAnnouncements: 'GlobalAnnouncement',
   transactions:     'Transaction',
   subscriptionPlans: 'SubscriptionPlan',
+  planFeatures:     'PlanFeature',
 }
 
 // ─── Module State ───────────────────────────────────────────────────────────
@@ -162,8 +173,11 @@ function _transformRecord(record) {
       result[key] = value
     }
   }
-  // Add sync metadata
-  result.syncVersion = (result.syncVersion || 0) + 1
+  // D6 fix (Task 3-b): do NOT inflate syncVersion. The cloud sends its own
+  // syncVersion per record and the incremental-sync conflict detector compares
+  // stored vs cloud values — storing cloud+1 made EVERY later cloud update
+  // look like a conflict (unbounded _sync_conflicts growth, all 'pending').
+  result.syncVersion = result.syncVersion || 0
   result.syncedAt = new Date()
   return result
 }

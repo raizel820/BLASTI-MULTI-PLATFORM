@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { enforceRateLimit, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
 
 const app = new Hono()
@@ -11,10 +11,10 @@ app.get('/', async (c) => {
     clientIp = enforceRateLimit(c, PUBLIC_RATE_LIMIT)
 
     const [totalAgencies, totalCustomers, totalReservations, activeQueues] = await Promise.all([
-      cloudDb.agency.count({ where: { isActive: true } }),
-      cloudDb.user.count({ where: { role: 'CUSTOMER' } }),
-      cloudDb.reservation.count(),
-      cloudDb.agency.count({ where: { isQueueOpen: true } }),
+      db.agency.count({ where: { isActive: true } }),
+      db.user.count({ where: { role: 'CUSTOMER' } }),
+      db.reservation.count(),
+      db.agency.count({ where: { isQueueOpen: true } }),
     ])
 
     if (clientIp) recordSuccessfulRequest(clientIp)

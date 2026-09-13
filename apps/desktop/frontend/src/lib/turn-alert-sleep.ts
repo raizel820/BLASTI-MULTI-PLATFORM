@@ -9,7 +9,7 @@
  * reservation is no-show/cancelled.
  *
  * This module is the single source of truth shared between:
- * - AggressiveTurnAlert overlay (useTurnAlert hook in use-realtime.tsx)
+ * - AggressiveTurnAlert overlay (useTurnAlert hook in use-realtime.ts)
  * - Inline banner (customer-queue.tsx)
  *
  * State is persisted to localStorage so it survives page reloads.

@@ -1,4 +1,4 @@
-import { cloudDb } from '@blasti/cloud-db';
+import { db } from '@blasti/db';
 
 export interface SendSmsResult {
   success: boolean;
@@ -221,9 +221,9 @@ export async function getSmsTemplate(
  * Get current SMS settings (creates default if none exists)
  */
 export async function getSmsSettings() {
-  let settings = await cloudDb.smsSettings.findFirst();
+  let settings = await db.smsSettings.findFirst();
   if (!settings) {
-    settings = await cloudDb.smsSettings.create({
+    settings = await db.smsSettings.create({
       data: {
         provider: 'winsms',
         apiUrl: ALGERIAN_PROVIDERS.winsms.defaultApiUrl,
@@ -253,7 +253,7 @@ export function maskApiKey(key: string): string {
  * Check if a user has SMS credits available
  */
 export async function checkUserSmsCredit(userId: string): Promise<{ hasCredit: boolean; freeCount: number; purchasedTotal: number; purchasedUsed: number }> {
-  const user = await cloudDb.user.findUnique({
+  const user = await db.user.findUnique({
     where: { id: userId },
     select: { freeSmsCount: true },
   });
@@ -268,7 +268,7 @@ export async function checkUserSmsCredit(userId: string): Promise<{ hasCredit: b
   }
 
   // Check purchased SMS packages
-  const purchasedTotal = await cloudDb.smsPurchase.aggregate({
+  const purchasedTotal = await db.smsPurchase.aggregate({
     where: { userId },
     _sum: { quantity: true },
   });
@@ -276,7 +276,7 @@ export async function checkUserSmsCredit(userId: string): Promise<{ hasCredit: b
   const totalPurchased = purchasedTotal._sum.quantity ?? 0;
 
   // Count used SMS (SENT status logs)
-  const usedCount = await cloudDb.smsLog.count({
+  const usedCount = await db.smsLog.count({
     where: { userId, status: 'SENT' },
   });
 
@@ -296,7 +296,7 @@ export async function checkUserSmsCredit(userId: string): Promise<{ hasCredit: b
  * that could drive freeSmsCount below zero under concurrent requests.
  */
 async function deductSmsCredit(userId: string, count = 1): Promise<void> {
-  const result = await cloudDb.user.updateMany({
+  const result = await db.user.updateMany({
     where: { id: userId, freeSmsCount: { gte: count } },
     data: { freeSmsCount: { decrement: count } },
   });
@@ -314,7 +314,7 @@ export async function checkDailyLimit(userId: string, maxPerDay: number): Promis
   if (maxPerDay <= 0) return true; // unlimited
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
-  const sentToday = await cloudDb.smsLog.count({
+  const sentToday = await db.smsLog.count({
     where: {
       userId,
       status: 'SENT',
@@ -335,11 +335,11 @@ export async function getSmsUsageStats(): Promise<SmsUsageStats> {
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
   const [sentToday, sentThisWeek, sentThisMonth, totalSent, failedToday] = await Promise.all([
-    cloudDb.smsLog.count({ where: { status: 'SENT', createdAt: { gte: todayStart } } }),
-    cloudDb.smsLog.count({ where: { status: 'SENT', createdAt: { gte: weekStart } } }),
-    cloudDb.smsLog.count({ where: { status: 'SENT', createdAt: { gte: monthStart } } }),
-    cloudDb.smsLog.count({ where: { status: 'SENT' } }),
-    cloudDb.smsLog.count({ where: { status: 'FAILED', createdAt: { gte: todayStart } } }),
+    db.smsLog.count({ where: { status: 'SENT', createdAt: { gte: todayStart } } }),
+    db.smsLog.count({ where: { status: 'SENT', createdAt: { gte: weekStart } } }),
+    db.smsLog.count({ where: { status: 'SENT', createdAt: { gte: monthStart } } }),
+    db.smsLog.count({ where: { status: 'SENT' } }),
+    db.smsLog.count({ where: { status: 'FAILED', createdAt: { gte: todayStart } } }),
   ]);
 
   return { sentToday, sentThisWeek, sentThisMonth, totalSent, failedToday };
@@ -349,7 +349,7 @@ export async function getSmsUsageStats(): Promise<SmsUsageStats> {
  * Get recent SMS logs (last N)
  */
 export async function getRecentSmsLogs(limit = 10) {
-  return cloudDb.smsLog.findMany({
+  return db.smsLog.findMany({
     orderBy: { createdAt: 'desc' },
     take: limit,
     include: {
@@ -576,7 +576,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
   let hasPurchasedCredit = false;
   if (userId) {
     // 1. Atomically decrement free credits (only if > 0)
-    const decrementResult = await cloudDb.user.updateMany({
+    const decrementResult = await db.user.updateMany({
       where: { id: userId, freeSmsCount: { gt: 0 } },
       data: { freeSmsCount: { decrement: 1 } },
     });
@@ -586,12 +586,12 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
       creditDeducted = true;
     } else {
       // No free credits — check purchased SMS packages
-      const purchasedTotal = await cloudDb.smsPurchase.aggregate({
+      const purchasedTotal = await db.smsPurchase.aggregate({
         where: { userId },
         _sum: { quantity: true },
       });
       const totalPurchased = purchasedTotal._sum.quantity ?? 0;
-      const usedCount = await cloudDb.smsLog.count({
+      const usedCount = await db.smsLog.count({
         where: { userId, status: 'SENT' },
       });
       hasPurchasedCredit = (totalPurchased - usedCount) > 0;
@@ -606,12 +606,12 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
     if (!withinLimit) {
       // Refund the deducted free credit since we won't send
       if (creditDeducted) {
-        await cloudDb.user.update({
+        await db.user.update({
           where: { id: userId },
           data: { freeSmsCount: { increment: 1 } },
         });
       }
-      const log = await cloudDb.smsLog.create({
+      const log = await db.smsLog.create({
         data: {
           userId,
           phoneNumber,
@@ -631,7 +631,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
   if (!normalizedPhone) {
     // If not a valid DZ number, try the raw number (for international providers like Twilio)
     if (settings.provider !== 'twilio' && settings.provider !== 'vonage') {
-      const log = await cloudDb.smsLog.create({
+      const log = await db.smsLog.create({
         data: {
           userId,
           phoneNumber,
@@ -654,7 +654,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
   const senderName = settings.senderName || 'BLASTI';
 
   if (!apiUrl || !apiKey) {
-    const log = await cloudDb.smsLog.create({
+    const log = await db.smsLog.create({
       data: {
         userId,
         phoneNumber: finalPhone,
@@ -673,7 +673,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
   const senderNotSupported = providerInfo && !providerInfo.senderIdSupport && senderName && !senderName.match(/^\+?\d{10,15}$/);
 
   if (senderNotSupported) {
-    const log = await cloudDb.smsLog.create({
+    const log = await db.smsLog.create({
       data: {
         userId,
         phoneNumber: finalPhone,
@@ -694,7 +694,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
     const status = result.ok ? 'SENT' : 'FAILED';
     const errorMessage = result.ok ? null : `Provider error: ${result.raw?.slice(0, 300) ?? 'Unknown error'}`;
 
-    const log = await cloudDb.smsLog.create({
+    const log = await db.smsLog.create({
       data: {
         userId,
         phoneNumber: finalPhone,
@@ -709,7 +709,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
     // Credit was already atomically deducted before sending.
     // If the send failed (non-ok result), refund the deducted free credit.
     if (!result.ok && userId && creditDeducted) {
-      await cloudDb.user.update({
+      await db.user.update({
         where: { id: userId },
         data: { freeSmsCount: { increment: 1 } },
       });
@@ -725,7 +725,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
     // Refund the credit if SMS threw an exception
     if (userId && creditDeducted) {
       try {
-        await cloudDb.user.update({
+        await db.user.update({
           where: { id: userId },
           data: { freeSmsCount: { increment: 1 } },
         });
@@ -736,7 +736,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
 
     const errorMessage = err instanceof Error ? err.message : 'Unknown error';
 
-    const log = await cloudDb.smsLog.create({
+    const log = await db.smsLog.create({
       data: {
         userId,
         phoneNumber: finalPhone,

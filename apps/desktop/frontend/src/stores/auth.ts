@@ -82,8 +82,10 @@ export const useAuth = create<AuthState>((set, get) => ({
       // Also store user info
       localStorage.setItem('blasti-user', JSON.stringify(user));
       // Notify Electron main process about cloud auth (for sync service)
+      // preload.js expects a SINGLE params object: setCloudSyncAuth({ token, user })
+      // → ipcRenderer.invoke('cloud-sync:set-auth', params) → handler destructures { token, user }.
       try {
-        (window as any).electronAPI?.setCloudSyncAuth?.(result.token, user);
+        (window as any).electronAPI?.setCloudSyncAuth?.({ token: result.token, user });
       } catch {}
       // Start periodic offline token check
       get().startOfflineCheck();

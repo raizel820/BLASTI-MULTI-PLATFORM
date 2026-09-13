@@ -42,15 +42,12 @@ import {
   Loader2,
   Search,
   Briefcase,
-  Clock,
-  Users,
   GripVertical,
   ArrowUp,
   ArrowDown,
   ToggleLeft,
   ToggleRight,
   Settings2,
-  Zap,
 } from 'lucide-react';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -60,27 +57,23 @@ interface Service {
   nameAr?: string;
   nameFr?: string;
   prefix?: string;
-  estimatedWaitMinutes?: number;
   isActive?: boolean;
-  capacity?: number;
   order?: number;
   description?: string;
-  allowWalkIn?: boolean;
-  autoComplete?: boolean;
   branchId?: string;
 }
 
+// NOTE: estimatedWaitMinutes / capacity / allowWalkIn / autoComplete were
+// removed — they are NOT Service model fields (schema: name, nameAr, nameFr,
+// description, prefix, isActive) and were silently dropped by the API,
+// showing users fake settings that never persisted.
 interface ServiceForm {
   name: string;
   nameAr: string;
   nameFr: string;
   prefix: string;
-  estimatedWaitMinutes: number;
   isActive: boolean;
-  capacity: number;
   description: string;
-  allowWalkIn: boolean;
-  autoComplete: boolean;
 }
 
 const DEFAULT_FORM: ServiceForm = {
@@ -88,12 +81,8 @@ const DEFAULT_FORM: ServiceForm = {
   nameAr: '',
   nameFr: '',
   prefix: '',
-  estimatedWaitMinutes: 15,
   isActive: true,
-  capacity: 50,
   description: '',
-  allowWalkIn: true,
-  autoComplete: false,
 };
 
 // ─── Validation ──────────────────────────────────────────────────────────────
@@ -101,10 +90,6 @@ function validateServiceForm(form: ServiceForm, t: (k: string) => string): strin
   if (!form.name.trim()) return t('serviceNameRequired') || 'Service name is required';
   if (form.name.trim().length < 2) return t('serviceNameMinLength') || 'Service name must be at least 2 characters';
   if (!form.prefix.trim()) return t('servicePrefixRequired') || 'Service prefix is required';
-  if (form.estimatedWaitMinutes < 1 || form.estimatedWaitMinutes > 999)
-    return t('serviceDurationRange') || 'Duration must be between 1 and 999 minutes';
-  if (form.capacity < 1 || form.capacity > 500)
-    return t('serviceCapacityRange') || 'Capacity must be between 1 and 500';
   return null;
 }
 
@@ -182,12 +167,8 @@ export default function ServicesPage() {
       nameAr: s.nameAr || '',
       nameFr: s.nameFr || '',
       prefix: s.prefix || '',
-      estimatedWaitMinutes: s.estimatedWaitMinutes || 15,
       isActive: s.isActive !== false,
-      capacity: s.capacity || 50,
       description: s.description || '',
-      allowWalkIn: s.allowWalkIn !== false,
-      autoComplete: s.autoComplete ?? false,
     });
     setDialogOpen(true);
   };
@@ -212,12 +193,8 @@ export default function ServicesPage() {
         nameAr: form.nameAr.trim() || undefined,
         nameFr: form.nameFr.trim() || undefined,
         prefix: form.prefix.trim().toUpperCase(),
-        estimatedWaitMinutes: form.estimatedWaitMinutes,
         isActive: form.isActive,
-        capacity: form.capacity,
         description: form.description.trim() || undefined,
-        allowWalkIn: form.allowWalkIn,
-        autoComplete: form.autoComplete,
       };
 
       if (agencyId) body.agencyId = agencyId;
@@ -526,25 +503,6 @@ export default function ServicesPage() {
                               {t('servicePrefix') || 'Prefix'}: {s.prefix}
                             </span>
                           )}
-                          <span className="text-xs text-muted-foreground">
-                            <Clock className="inline h-3 w-3 me-0.5" />
-                            {s.estimatedWaitMinutes || 15} {t('min') || 'min'}
-                          </span>
-                          <span className="text-xs text-muted-foreground">
-                            <Users className="inline h-3 w-3 me-0.5" />
-                            {s.capacity || 50}
-                          </span>
-                          {s.allowWalkIn !== false && (
-                            <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4">
-                              {t('walkIn') || 'Walk-in'}
-                            </Badge>
-                          )}
-                          {s.autoComplete && (
-                            <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4">
-                              <Zap className="h-2.5 w-2.5 me-0.5" />
-                              {t('autoComplete') || 'Auto'}
-                            </Badge>
-                          )}
                         </div>
                         {s.description && (
                           <p className="text-xs text-muted-foreground mt-0.5 line-clamp-1">
@@ -663,40 +621,6 @@ export default function ServicesPage() {
                   maxLength={3}
                 />
               </div>
-              <div className="space-y-2">
-                <Label>{t('estServiceTime') || 'Est. Service Time (min)'}</Label>
-                <Input
-                  type="number"
-                  min={1}
-                  max={999}
-                  value={form.estimatedWaitMinutes}
-                  onChange={(e) =>
-                    setForm({ ...form, estimatedWaitMinutes: parseInt(e.target.value) || 15 })
-                  }
-                  className="h-11"
-                />
-              </div>
-            </div>
-
-            {/* Capacity */}
-            <div className="space-y-2">
-              <Label className="flex items-center gap-2">
-                <Users className="h-4 w-4 text-muted-foreground" />
-                {t('serviceCapacity') || 'Service Capacity'}
-              </Label>
-              <p className="text-xs text-muted-foreground">
-                {t('serviceCapacityDesc') || 'Maximum concurrent reservations for this service'}
-              </p>
-              <Input
-                type="number"
-                min={1}
-                max={500}
-                value={form.capacity}
-                onChange={(e) =>
-                  setForm({ ...form, capacity: parseInt(e.target.value) || 50 })
-                }
-                className="h-11 w-32"
-              />
             </div>
 
             <Separator />
@@ -735,38 +659,6 @@ export default function ServicesPage() {
                 <Switch
                   checked={form.isActive}
                   onCheckedChange={(v) => setForm({ ...form, isActive: v })}
-                />
-              </div>
-
-              {/* Allow walk-in */}
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium text-foreground">
-                    {t('allowWalkIn') || 'Allow Walk-in'}
-                  </p>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    {t('allowWalkInDesc') || 'Allow customers to join without a reservation'}
-                  </p>
-                </div>
-                <Switch
-                  checked={form.allowWalkIn}
-                  onCheckedChange={(v) => setForm({ ...form, allowWalkIn: v })}
-                />
-              </div>
-
-              {/* Auto-complete */}
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium text-foreground">
-                    {t('autoCompleteService') || 'Auto-complete'}
-                  </p>
-                  <p className="text-xs text-muted-foreground mt-0.5">
-                    {t('autoCompleteDesc') || 'Automatically mark service as completed after estimated duration'}
-                  </p>
-                </div>
-                <Switch
-                  checked={form.autoComplete}
-                  onCheckedChange={(v) => setForm({ ...form, autoComplete: v })}
                 />
               </div>
             </div>

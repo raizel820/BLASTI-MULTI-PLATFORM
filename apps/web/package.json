@@ -3,12 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "node node_modules/next/dist/bin/next dev -p 3000 -H 127.0.0.1",
-    "dev:lan": "node node_modules/next/dist/bin/next dev -p 3000 -H 0.0.0.0",
+    "dev": "next dev -p 3000 -H 0.0.0.0",
     "build": "next build",
     "start": "next start -p 3000",
-    "lint": "eslint .",
-    "clean": "node -e \"require('fs').rmSync('.next',{recursive:true,force:true})\""
+    "lint": "eslint ."
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

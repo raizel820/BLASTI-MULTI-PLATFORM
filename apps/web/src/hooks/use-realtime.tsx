@@ -60,7 +60,9 @@ const REALTIME_TOKEN = process.env.NEXT_PUBLIC_REALTIME_TOKEN || ''
 /**
  * Resolves the correct Socket.IO connection URL based on the runtime platform:
  *
- * - Capacitor (native): connect directly to cloud API / realtime server.
+ * - Electron/Capacitor (native): connect directly to cloud API / realtime server.
+ *   The renderer is at a different origin than the API server, and the gateway
+ *   cannot proxy WebSocket upgrades reliably. Use BLASTI_CLOUD_URL or localhost:3003.
  * - If NEXT_PUBLIC_REALTIME_URL is explicitly set, use it.
  * - Otherwise (web browser): use relative path "/" so the Caddy gateway proxies
  *   the connection, and pass XTransformPort=3003 as a query parameter.
@@ -68,7 +70,8 @@ const REALTIME_TOKEN = process.env.NEXT_PUBLIC_REALTIME_TOKEN || ''
 function resolveSocketUrl(): string {
   // Native platform: connect directly to cloud API (no gateway proxy)
   if (isNativePlatform()) {
-    return `http://localhost:${REALTIME_PORT}`
+    return (typeof process !== 'undefined' && (process as any).env?.BLASTI_CLOUD_URL)
+      || `http://localhost:${REALTIME_PORT}`
   }
   // Explicit env override (e.g. for Capacitor builds with a specific URL)
   const nativeUrl = process.env.NEXT_PUBLIC_REALTIME_URL
@@ -85,25 +88,12 @@ function resolveSocketOptions(): Parameters<typeof io>[1] {
 
   const baseOptions: Parameters<typeof io>[1] = {
     path: '/socket.io',
-    // POLLING FIRST (regression guard for the dev-crash audit):
-    // ['websocket', ...] hangs against the Next.js dev server — Next dev
-    // accepts the WS upgrade TCP connection but never completes it, so each
-    // attempt burns its full timeout and polling is never reached
-    // ("stuck Reconnecting…" on http://127.0.0.1:3000).
-    // With polling first: direct dev access connects over HTTP polling
-    // immediately, and behind the Caddy gateway / production proxy the
-    // server still advertises the websocket upgrade, which the client then
-    // upgrades to. Best behavior in every environment.
-    transports: ['polling', 'websocket'],
+    transports: ['websocket', 'polling'],
     reconnection: true,
-    // BOUNDED reconnection on ALL platforms (regression guard for the
-    // dev-crash audit): an unbounded retry loop against an unreachable API
-    // keeps the browser churning requests forever (WS fail + proxied HTTP
-    // 500 every attempt). Web now gives up after 20 attempts (~4 min with
-    // 1s→30s exponential backoff); native stays at 5. Consumers that need
-    // to retry later can call socket.connect() again on user action or on
-    // the next sessionToken change (see useRealtime reconnect effect).
-    reconnectionAttempts: isNative ? 5 : 20,
+    // On native platforms, use fewer reconnection attempts to avoid
+    // spamming "WebSocket connection failed" when cloud is down.
+    // The LAN fallback (HTTP polling) handles offline events.
+    reconnectionAttempts: isNative ? 5 : Infinity,
     reconnectionDelay: isNative ? 3000 : 1000,
     reconnectionDelayMax: 30000,
     timeout: 10000,
@@ -133,12 +123,12 @@ function resolveSocketOptions(): Parameters<typeof io>[1] {
 let globalSocket: Socket | null = null
 let connectionCount = 0
 
-// No LAN Socket.IO fallback on web-only build
+// LAN Socket.IO fallback (connects to desktop's local server when cloud is unreachable)
 let lanSocket: Socket | null = null
 let lanSocketConnected = false
 
 function isNativePlatform(): boolean {
-  return !!(window as any).Capacitor
+  return !!(window as any).electronAPI || !!(window as any).Capacitor
 }
 
 function getSocket(): Socket {
@@ -173,9 +163,53 @@ interface UseRealtimeOptions {
 
 // ── LAN Socket Connection ──────────────────────────────────────────────────
 
-// LAN socket connection is not used on web-only build
 async function connectLanSocket() {
-  return
+  try {
+    const { getGlobalLanServer } = await import('@/hooks/use-lan-mode')
+    const server = getGlobalLanServer()
+    if (!server) return
+
+    // Skip LAN socket connection — the local API (port 3080) serves HTTP only,
+    // it does not run a Socket.IO server. Attempting to connect would spam
+    // WebSocket connection refused errors in the console. The cloud Socket.IO
+    // connection handles all realtime events; LAN failover is HTTP-only.
+    return
+    const lanUrl = `http://${server.ip}:${server.port}`
+    lanSocket = io(lanUrl, {
+      transports: ['websocket', 'polling'],
+      timeout: 5000,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 2000,
+    })
+
+    const queueEvents = [
+      'queue:called', 'queue:joined', 'queue:completed', 'queue:cancelled',
+      'queue:paused', 'queue:resumed', 'queue:walk-in', 'queue:postponed',
+      'notification:new', 'notification:read',
+      'agency:update', 'staff:update',
+    ]
+
+    lanSocket.on('connect', () => {
+      lanSocketConnected = true
+      console.log('[Realtime] LAN socket connected to', lanUrl)
+      // Update connection status to connected
+      setConnectionStatus('connected')
+    })
+
+    lanSocket.on('disconnect', () => {
+      lanSocketConnected = false
+      console.log('[Realtime] LAN socket disconnected')
+      if (!globalSocket?.connected) {
+        setConnectionStatus('disconnected')
+      }
+    })
+
+    lanSocket.on('error', () => {
+      lanSocketConnected = false
+    })
+  } catch (err) {
+    console.warn('[Realtime] LAN fallback failed:', err)
+  }
 }
 
 export function useRealtime(options?: UseRealtimeOptions) {
@@ -211,6 +245,14 @@ export function useRealtime(options?: UseRealtimeOptions) {
 
     const onDisconnect = (reason: string) => {
       setConnectionStatus('disconnected')
+
+      // On native platforms, try connecting to LAN server after 5s delay
+      if (isNativePlatform() && !lanSocket) {
+        setTimeout(() => {
+          if (globalSocket?.connected) return // cloud reconnected
+          connectLanSocket()
+        }, 5000)
+      }
     }
 
     const onConnecting = () => {
@@ -252,16 +294,8 @@ export function useRealtime(options?: UseRealtimeOptions) {
   // C3: Send auth with session token when it changes
   useEffect(() => {
     const authToken = sessionToken || REALTIME_TOKEN
-    const socket = socketRef.current
-    if (!socket) return
-    if (socket.connected) {
-      socket.emit('auth', { token: authToken })
-    } else if (!socket.active) {
-      // Reconnection attempts were exhausted (reconnect_failed) or the socket
-      // was manually disconnected. Auth changes (login/logout) are a natural
-      // moment to try again — this is bounded: one attempt per token change,
-      // never a loop.
-      socket.connect()
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('auth', { token: authToken })
     }
   }, [sessionToken])
 

@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { cloudDb, Prisma } from '@blasti/cloud-db'
+import { db, Prisma } from '@blasti/db'
 import { requireAuth, requireAdmin, authErrorResponse, AuthError } from '../lib/auth'
 import { checkRateLimit, RateLimitError, SMS_RATE_LIMIT } from '../lib/rate-limit'
 import { validateBody } from '../lib/validations'
@@ -41,7 +41,7 @@ app.post('/purchase', async (c) => {
 
     // Deduplication: 5-minute cooldown per pack per user
     const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000)
-    const recentPurchase = await cloudDb.smsPurchase.findFirst({
+    const recentPurchase = await db.smsPurchase.findFirst({
       where: { userId, quantity: pack.quantity, createdAt: { gte: fiveMinutesAgo } },
     })
 
@@ -51,7 +51,7 @@ app.post('/purchase', async (c) => {
 
     // Phase 1e: Create PENDING purchase — NO direct increment of freeSmsCount
     // Credits are only granted when admin approves or webhook confirms payment
-    const purchase = await cloudDb.smsPurchase.create({
+    const purchase = await db.smsPurchase.create({
       data: {
         userId,
         quantity: pack.quantity,
@@ -61,7 +61,7 @@ app.post('/purchase', async (c) => {
     })
 
     // Notify user that purchase is pending approval
-    await cloudDb.notification.create({
+    await db.notification.create({
       data: {
         userId,
         type: 'SMS_PURCHASE_PENDING',
@@ -98,7 +98,7 @@ app.get('/purchase', async (c) => {
     const user = await requireAuth(c)
     const userId = user.id
 
-    const purchases = await cloudDb.smsPurchase.findMany({
+    const purchases = await db.smsPurchase.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
       take: 10,
@@ -118,7 +118,7 @@ app.post('/approve/:id', async (c) => {
     const admin = await requireAdmin(c)
     const purchaseId = c.req.param('id')
 
-    const purchase = await cloudDb.smsPurchase.findUnique({ where: { id: purchaseId } })
+    const purchase = await db.smsPurchase.findUnique({ where: { id: purchaseId } })
     if (!purchase) {
       return c.json({ success: false, error: 'Purchase not found' }, 404)
     }
@@ -128,7 +128,7 @@ app.post('/approve/:id', async (c) => {
     }
 
     // Phase 1e: Atomic transaction — approve purchase AND increment credits
-    const result = await cloudDb.$transaction(async (tx) => {
+    const result = await db.$transaction(async (tx) => {
       const updatedPurchase = await tx.smsPurchase.update({
         where: { id: purchaseId },
         data: { status: 'APPROVED' },
@@ -151,7 +151,7 @@ app.post('/approve/:id', async (c) => {
       return updatedPurchase
     })
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: admin.id,
         action: 'SMS_PURCHASE_APPROVE',
@@ -174,7 +174,7 @@ app.post('/reject/:id', async (c) => {
     const admin = await requireAdmin(c)
     const purchaseId = c.req.param('id')
 
-    const purchase = await cloudDb.smsPurchase.findUnique({ where: { id: purchaseId } })
+    const purchase = await db.smsPurchase.findUnique({ where: { id: purchaseId } })
     if (!purchase) {
       return c.json({ success: false, error: 'Purchase not found' }, 404)
     }
@@ -183,7 +183,7 @@ app.post('/reject/:id', async (c) => {
       return c.json({ success: false, error: `Purchase already ${purchase.status.toLowerCase()}` }, 400)
     }
 
-    const result = await cloudDb.$transaction(async (tx) => {
+    const result = await db.$transaction(async (tx) => {
       const updatedPurchase = await tx.smsPurchase.update({
         where: { id: purchaseId },
         data: { status: 'REJECTED' },
@@ -201,7 +201,7 @@ app.post('/reject/:id', async (c) => {
       return updatedPurchase
     })
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: admin.id,
         action: 'SMS_PURCHASE_REJECT',

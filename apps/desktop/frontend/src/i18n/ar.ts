@@ -1425,7 +1425,7 @@ const ar = {
   sevenDayTrend: "اتجاه 7 أيام",
   todayCount: "اليوم",
   phonePlaceholder: "05XX XXX XXX",
-  inEnglish: "(الإنجليزية)",
+  // DUPLICATE REMOVED (3-c): inEnglish: "(الإنجليزية)",
   serviceNamePlaceholder: "استشارة عامة",
   languageEnglish: "الإنجليزية",
   languageArabic: "العربية",
@@ -2190,7 +2190,7 @@ const ar = {
   reviewing: 'قيد المراجعة',
   fulfilled: 'تم التنفيذ',
 
-  enterprisePlanDesc:
+  enterpriseRequestDesc:
     'هل تحتاج خطة مخصصة لشبكة كبيرة؟ اطلب عقد مؤسسات مخصص بميزات ومعدات واتفاقيات خدمة مخصصة.',
   requestEnterprise: 'طلب خطة مؤسسات',
   enterpriseMessage: 'الرسالة',
@@ -2302,7 +2302,8 @@ const ar = {
   // DUPLICATE REMOVED: enterprisePlan: 'خطة المؤسسة',
   yourEnterprisePlan: 'خطة المؤسسة الخاصة بك',
   enterprisePlanBadge: 'مؤسسة',
-  // DUPLICATE REMOVED: enterprisePlanDesc: 'هذه خطة مخصصة مصممة خصيصاً لمؤسستك. وهي غير متاحة للمؤسسات الأخرى.',
+  // RESTORED (closeout 4-e): LIVE enterprisePlanDesc (institution-tailored plan); earlier string renamed to enterpriseRequestDesc.
+  enterprisePlanDesc: 'هذه خطة مخصصة مصممة خصيصاً لمؤسستك. وهي غير متاحة للمؤسسات الأخرى.',
   cancelEnterprisePlan: 'إلغاء خطة المؤسسة',
   upgradeEnterprisePlan: 'ترقية',
   downgradeEnterprisePlan: 'تخفيض',
@@ -2722,6 +2723,64 @@ const ar = {
   addToQueue: 'إضافة إلى الطابور',
   customerName: 'اسم العميل',
   autoDetect: 'اكتشاف تلقائي',
+
+  // ─── Conflict Resolution & Counter Selection ──────────────
+  selectCounter: 'اختيار الكاونتر',
+  syncConflictsTitle: 'تعارضات المزامنة',
+  syncConflictsDesc: 'بعض التغييرات تتعارض مع نسخة الخادم. اختر النسخة التي تريد الاحتفاظ بها.',
+  keepLocal: 'احتفاظ بالنسخة المحلية',
+  keepServer: 'احتفاظ بنسخة الخادم',
+  local: 'محلي',
+  server: 'الخادم',
+  localVersion: 'النسخة المحلية',
+  serverVersion: 'نسخة الخادم',
+  noConflicts: 'لا توجد تعارضات لحلها',
+  resolveAllLocal: 'احتفاظ بالنسخة المحلية للجميع',
+  resolveAllServer: 'احتفاظ بنسخة الخادم للجميع',
+  resolved: 'تم الحل',
+  conflictSingular: 'تعارض',
+  conflictPlural: 'تعارضات',
+  done: 'تم',
+
+  // ─── History Export ──────────────
+  fromDate: 'من تاريخ',
+  toDate: 'إلى تاريخ',
+
+  // ─── Sync Status UI (Desktop) ──────────────
+  syncStatusDesc: 'تفاصيل مزامنة البيانات بين هذا الجهاز والسحابة.',
+  currentStatus: 'الحالة الحالية',
+  allSynced: 'متزامن بالكامل',
+  allDataUpToDate: 'جميع البيانات محدثة',
+  pendingChanges: 'تغييرات معلقة',
+  changesAwaitingSync: 'تغييرات تنتظر المزامنة',
+  syncErrorLabel: 'خطأ في المزامنة',
+  abandonedChanges: 'تغييرات متروكة',
+  connection: 'الاتصال',
+  lastSuccessfulSync: 'آخر مزامنة ناجحة',
+  lastSyncAttempt: 'آخر محاولة مزامنة',
+  conflicts: 'التعارضات',
+  offlineTokenRemaining: 'صلاحية جلسة عدم الاتصال',
+  protocolVersion: 'إصدار بروتوكول المزامنة',
+  forceSyncNow: 'مزامنة الآن',
+  syncNow: 'مزامنة الآن',
+  retrySync: 'إعادة محاولة المزامنة',
+  noSyncData: 'لا توجد بيانات مزامنة',
+  never: 'أبداً',
+  secondsAgo: 'قبل {count} ثانية',
+  minutesAgo: 'قبل {count} دقيقة',
+  hoursAgo: 'قبل {count} ساعة',
+  daysAgo: 'قبل {count} يوم',
+
+  // ─── Sidebar Navigation (missing keys) ──────────────
+  queue: 'الطابور',
+  staff: 'الموظفون',
+  qrCode: 'رمز QR',
+  alerts: 'التنبيهات',
+
+  // ─── Offline Session Expired (offline-token window lapsed) ──────────────
+  offlineExpiredTitle: 'انتهت الجلسة دون اتصال',
+  offlineExpiredDesc: 'لم يتصل هذا الجهاز بالسحابة خلال المدة المسموح بها ({days} أيام)، فانتهت صلاحية جلسة عدم الاتصال. سجّل الدخول مجددًا لمزامنة بياناتك ومتابعة العمل.',
+  offlineExpiredAction: 'تسجيل الدخول مجددًا',
 };
 
 export default ar;

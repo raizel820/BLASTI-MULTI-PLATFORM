@@ -6,6 +6,19 @@
  * cloud sync routes, and field mappings.
  *
  * Phase 4 — BLASTI Database Architecture Upgrade
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ SINGLE SOURCE OF TRUTH (Task 4-b, PARITY_SYNC_AUDIT §5-3)               │
+ * │                                                                         │
+ * │ THIS FILE IS CANONICAL. packages/core/sync-registry.json is a GENERATED │
+ * │ artifact of this registry for the desktop local-api (plain JS run by    │
+ * │ Node inside Electron — it cannot import TypeScript). If you change      │
+ * │ anything in this file you MUST regenerate the JSON and commit it:       │
+ * │                                                                         │
+ * │   node packages/core/scripts/generate-sync-registry-json.js             │
+ * │                                                                         │
+ * │ Consumers of the JSON: apps/desktop/local-api/sync-service.js           │
+ * └─────────────────────────────────────────────────────────────────────────┘
  */
 
 // ─── Protocol Version ────────────────────────────────────────────────────────

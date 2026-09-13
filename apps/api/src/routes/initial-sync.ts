@@ -16,12 +16,24 @@
  *   5. counters        — Counters for this agency (via branches)
  *   6. agencyStaff     — AgencyStaff records for this agency
  *   7. queueSettings   — QueueSettings for this agency
- *   8. reservations    — Reservations for this agency (paginated, the big one)
- *   9. reviews         — Reviews for this agency
- *  10. notifications   — Notifications for agency users
- *  11. announcements   — Announcements for this agency
- *  12. transactions    — Transactions for this agency
- *  13. subscriptionPlans — Active subscription plans (global, not agency-scoped)
+ *   8. smsSettings     — Platform SMS settings singleton (Task 4-b §5-5; global
+ *                        singleton — projection mirrors the incremental pull in
+ *                        sync.ts and EXCLUDES the apiKey credential/templates)
+ *   9. paymentSettings — Platform payment settings singleton (Task 4-b §5-5;
+ *                        global singleton — cloud already serves this PUBLICLY
+ *                        via GET /api/payment-settings, projection mirrors sync.ts)
+ *  10. reservations    — Reservations for this agency (paginated, the big one)
+ *  11. reviews         — Reviews for this agency
+ *  12. favorites       — Favorites for this agency (agencyId-scoped, paginated)
+ *  13. faqs            — FAQ content (global read-only content, Task 4-b §5-5)
+ *  14. notifications   — Notifications for agency users
+ *  15. announcements   — Announcements for this agency
+ *  16. globalAnnouncements — Platform-wide broadcast announcements (global,
+ *                        read-only; no agency scoping exists by design)
+ *  17. transactions    — Transactions for this agency
+ *  18. subscriptionPlans — Active subscription plans (global, not agency-scoped)
+ *  19. planFeatures    — Feature flags of active plans (scoped via plan relation;
+ *                        global plan metadata like subscriptionPlans)
  */
 
 import { Hono } from 'hono'
@@ -74,12 +86,19 @@ const STAGE_DEFINITIONS: StageMeta[] = [
   { id: 'counters',         label: 'Counters',          mandatory: true  },
   { id: 'agencyStaff',      label: 'Agency Staff',      mandatory: true  },
   { id: 'queueSettings',    label: 'Queue Settings',    mandatory: true  },
+  // Task 4-b §5-5: settings stages before operational data
+  { id: 'smsSettings',      label: 'SMS Settings',      mandatory: false },
+  { id: 'paymentSettings',  label: 'Payment Settings',  mandatory: false },
   { id: 'reservations',     label: 'Reservations',      mandatory: true  },
   { id: 'reviews',          label: 'Reviews',           mandatory: false },
+  { id: 'favorites',        label: 'Favorites',         mandatory: false },
+  { id: 'faqs',             label: 'FAQs',              mandatory: false },
   { id: 'notifications',    label: 'Notifications',     mandatory: false },
   { id: 'announcements',    label: 'Announcements',     mandatory: false },
+  { id: 'globalAnnouncements', label: 'Global Announcements', mandatory: false },
   { id: 'transactions',     label: 'Transactions',      mandatory: false },
   { id: 'subscriptionPlans', label: 'Subscription Plans', mandatory: false },
+  { id: 'planFeatures',     label: 'Plan Features',     mandatory: false },
 ]
 
 const VALID_STAGES = new Set(STAGE_DEFINITIONS.map((s) => s.id))
@@ -90,6 +109,7 @@ const PAGINATED_STAGES = new Set([
   'notifications',
   'reviews',
   'transactions',
+  'favorites', // grows with the agency's user base — paginate like reviews
 ])
 
 const DEFAULT_PAGE_SIZE = 500
@@ -201,6 +221,40 @@ async function fetchStageData(
       return { records, hasMore: false, total: records.length }
     }
 
+    // ── 7b. SmsSettings (Task 4-b §5-5) ───────────────────────────────
+    case 'smsSettings': {
+      // SECURITY: global platform singleton — no agency scoping exists in the
+      // schema (documented decision). The projection mirrors the incremental
+      // pull (sync.ts fetchRecordsForModel 'SmsSettings') and deliberately
+      // EXCLUDES the apiKey credential and message templates.
+      const records = await cloudDb.smsSettings.findMany({
+        select: {
+          id: true, provider: true, apiUrl: true, senderName: true,
+          enabled: true, smsPerReminder: true, maxSmsPerDay: true,
+          testPhoneNumber: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+      return { records, hasMore: false, total: records.length }
+    }
+
+    // ── 7c. PaymentSettings (Task 4-b §5-5) ───────────────────────────
+    case 'paymentSettings': {
+      // SECURITY: global platform singleton. Cloud already serves this model
+      // PUBLICLY (unauthenticated GET /api/payment-settings) so agencies can
+      // read bank transfer instructions — projection mirrors the incremental
+      // pull (sync.ts 'PaymentSettings'), no new exposure.
+      const records = await cloudDb.paymentSettings.findMany({
+        select: {
+          id: true, ccpEnabled: true, bankEnabled: true, electronicEnabled: true,
+          ccpAccount: true, ccpKey: true, bankName: true, bankAccount: true,
+          bankRib: true, ewalletNumber: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+      })
+      return { records, hasMore: false, total: records.length }
+    }
+
     // ── 8. Reservations (paginated) ───────────────────────────────────────
     case 'reservations': {
       return fetchPaginated(
@@ -233,6 +287,44 @@ async function fetchStageData(
           }),
         pageSize,
       )
+    }
+
+    // ── 9b. Favorites (paginated, agencyId-scoped — Task 4-b §5-5) ────
+    case 'favorites': {
+      return fetchPaginated(
+        () => cloudDb.favorite.count({ where: { agencyId } }),
+        () =>
+          cloudDb.favorite.findMany({
+            where: {
+              agencyId,
+              ...(cursor ? { id: { gt: cursor } } : {}),
+            },
+            select: {
+              id: true, userId: true, agencyId: true, syncVersion: true,
+              createdAt: true, updatedAt: true,
+            },
+            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            take: pageSize + 1,
+          }),
+        pageSize,
+      )
+    }
+
+    // ── 9c. FAQs (global read-only content — Task 4-b §5-5) ──────────
+    case 'faqs': {
+      // Global content model (no agency scoping in schema — documented).
+      // No isActive filter: mirrors the incremental pull so locally
+      // deactivated FAQs keep their state instead of being resurrected.
+      const records = await cloudDb.faq.findMany({
+        select: {
+          id: true, question: true, questionFr: true, questionAr: true,
+          answer: true, answerFr: true, answerAr: true,
+          category: true, order: true, isActive: true,
+          syncVersion: true, createdAt: true, updatedAt: true,
+        },
+        orderBy: [{ order: 'asc' }, { createdAt: 'asc' }],
+      })
+      return { records, hasMore: false, total: records.length }
     }
 
     // ── 10. Notifications (paginated) ─────────────────────────────────────
@@ -278,6 +370,21 @@ async function fetchStageData(
       return { records, hasMore: false, total: records.length }
     }
 
+    // ── 11b. GlobalAnnouncements (global broadcast content — Task 4-b §5-5)
+    case 'globalAnnouncements': {
+      // SECURITY: platform-wide broadcast announcements — global by design
+      // (meant for every agency/user; no agency scoping exists). Projection
+      // mirrors the incremental pull (sync.ts 'GlobalAnnouncement').
+      const records = await cloudDb.globalAnnouncement.findMany({
+        select: {
+          id: true, message: true, type: true, createdBy: true,
+          syncVersion: true, createdAt: true, updatedAt: true,
+        },
+        orderBy: { createdAt: 'desc' },
+      })
+      return { records, hasMore: false, total: records.length }
+    }
+
     // ── 12. Transactions (paginated) ──────────────────────────────────────
     case 'transactions': {
       return fetchPaginated(
@@ -300,6 +407,24 @@ async function fetchStageData(
       const records = await cloudDb.subscriptionPlan.findMany({
         where: { isActive: true },
         orderBy: { sortOrder: 'asc' },
+      })
+      return { records, hasMore: false, total: records.length }
+    }
+
+    // ── 13b. PlanFeatures of ACTIVE plans (Task 4-b §5-5) ─────────────
+    case 'planFeatures': {
+      // Scoped through the plan relation (no direct agencyId on the model):
+      // only features of ACTIVE plans, mirroring the subscriptionPlans stage
+      // scope. Global plan metadata — same exposure class as plans themselves.
+      const records = await cloudDb.planFeature.findMany({
+        where: { plan: { isActive: true } },
+        select: {
+          id: true, planId: true, featureKey: true,
+          featureName: true, featureNameAr: true, featureNameFr: true,
+          enabled: true, limitValue: true, syncVersion: true,
+          createdAt: true, updatedAt: true,
+        },
+        orderBy: { createdAt: 'asc' },
       })
       return { records, hasMore: false, total: records.length }
     }
@@ -351,8 +476,14 @@ function serializeRecords(stage: string, records: any[]): any[] {
     reviews: 'Review',
     notifications: 'Notification',
     announcements: 'Announcement',
+    globalAnnouncements: 'GlobalAnnouncement',
     transactions: 'Transaction',
     subscriptionPlans: 'SubscriptionPlan',
+    planFeatures: 'PlanFeature',
+    favorites: 'Favorite',
+    faqs: 'FAQ',
+    smsSettings: 'SmsSettings',
+    paymentSettings: 'PaymentSettings',
   }
 
   const modelName = stageToModel[stage]
@@ -527,10 +658,22 @@ async function estimateStageCount(stage: string, agencyId: string): Promise<numb
     }
     case 'announcements':
       return cloudDb.announcement.count({ where: { agencyId } })
+    case 'globalAnnouncements':
+      return cloudDb.globalAnnouncement.count()
     case 'transactions':
       return cloudDb.transaction.count({ where: { agencyId } })
     case 'subscriptionPlans':
       return cloudDb.subscriptionPlan.count({ where: { isActive: true } })
+    case 'planFeatures':
+      return cloudDb.planFeature.count({ where: { plan: { isActive: true } } })
+    case 'favorites':
+      return cloudDb.favorite.count({ where: { agencyId } })
+    case 'faqs':
+      return cloudDb.faq.count()
+    case 'smsSettings':
+      return cloudDb.smsSettings.count()
+    case 'paymentSettings':
+      return cloudDb.paymentSettings.count()
     default:
       return 0
   }

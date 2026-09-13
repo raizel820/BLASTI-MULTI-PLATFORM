@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { requireAdmin, authErrorResponse } from '../lib/auth'
 import { z } from 'zod'
 import crypto from 'crypto'
@@ -62,7 +62,7 @@ app.get('/', async (c) => {
     if (published === 'true') where.isPublished = true
     if (published === 'false') where.isPublished = false
 
-    const versions = await cloudDb.appVersion.findMany({
+    const versions = await db.appVersion.findMany({
       where,
       orderBy: [{ platform: 'asc' }, { createdAt: 'desc' }],
     })
@@ -84,7 +84,7 @@ app.get('/latest', async (c) => {
     const latest: Record<string, any> = {}
 
     for (const platform of platforms) {
-      const version = await cloudDb.appVersion.findFirst({
+      const version = await db.appVersion.findFirst({
         where: { platform, isPublished: true },
         orderBy: { createdAt: 'desc' },
       })
@@ -113,14 +113,14 @@ app.post('/', async (c) => {
     const data = validation.data
 
     // Check for duplicate platform+version
-    const existing = await cloudDb.appVersion.findUnique({
+    const existing = await db.appVersion.findUnique({
       where: { platform_version: { platform: data.platform, version: data.version } },
     })
     if (existing) {
       return c.json({ success: false, error: 'Version already exists for this platform' }, 409)
     }
 
-    const appVersion = await cloudDb.appVersion.create({
+    const appVersion = await db.appVersion.create({
       data: {
         platform: data.platform,
         version: data.version,
@@ -176,7 +176,7 @@ app.post('/upload', async (c) => {
     const hash = crypto.createHash('sha256').update(buffer).digest('hex')
 
     // Update the app version record with file info
-    const appVersion = await cloudDb.appVersion.findUnique({
+    const appVersion = await db.appVersion.findUnique({
       where: { platform_version: { platform, version } },
     })
 
@@ -184,7 +184,7 @@ app.post('/upload', async (c) => {
       return c.json({ success: false, error: 'App version record not found. Create the version first, then upload the file.' }, 404)
     }
 
-    const updated = await cloudDb.appVersion.update({
+    const updated = await db.appVersion.update({
       where: { id: appVersion.id },
       data: {
         fileStorageKey: safeName,
@@ -217,7 +217,7 @@ app.post('/upload', async (c) => {
 app.get('/:id/download', async (c) => {
   try {
     // Public endpoint — no auth required (for app update checks)
-    const appVersion = await cloudDb.appVersion.findUnique({
+    const appVersion = await db.appVersion.findUnique({
       where: { id: c.req.param('id') },
     })
 
@@ -231,7 +231,7 @@ app.get('/:id/download', async (c) => {
     }
 
     // Increment download count
-    await cloudDb.appVersion.update({
+    await db.appVersion.update({
       where: { id: c.req.param('id') },
       data: { downloadCount: { increment: 1 } },
     })
@@ -257,7 +257,7 @@ app.get('/:id', async (c) => {
   try {
     await requireAdmin(c)
 
-    const appVersion = await cloudDb.appVersion.findUnique({
+    const appVersion = await db.appVersion.findUnique({
       where: { id: c.req.param('id') },
     })
 
@@ -286,7 +286,7 @@ app.patch('/:id', async (c) => {
 
     const data = validation.data
 
-    const existing = await cloudDb.appVersion.findUnique({
+    const existing = await db.appVersion.findUnique({
       where: { id: c.req.param('id') },
     })
     if (!existing) {
@@ -299,7 +299,7 @@ app.patch('/:id', async (c) => {
       publishData.publishedAt = new Date()
     }
 
-    const appVersion = await cloudDb.appVersion.update({
+    const appVersion = await db.appVersion.update({
       where: { id: c.req.param('id') },
       data: { ...data, ...publishData },
     })
@@ -317,7 +317,7 @@ app.delete('/:id', async (c) => {
   try {
     await requireAdmin(c)
 
-    const existing = await cloudDb.appVersion.findUnique({
+    const existing = await db.appVersion.findUnique({
       where: { id: c.req.param('id') },
     })
     if (!existing) {
@@ -332,7 +332,7 @@ app.delete('/:id', async (c) => {
       }
     }
 
-    await cloudDb.appVersion.delete({ where: { id: c.req.param('id') } })
+    await db.appVersion.delete({ where: { id: c.req.param('id') } })
 
     return c.json({ success: true })
   } catch (error: unknown) {
@@ -352,7 +352,7 @@ app.post('/check-update', async (c) => {
       return c.json({ success: false, error: 'platform and currentVersion are required' }, 400)
     }
 
-    const latestVersion = await cloudDb.appVersion.findFirst({
+    const latestVersion = await db.appVersion.findFirst({
       where: { platform, isPublished: true },
       orderBy: { createdAt: 'desc' },
     })

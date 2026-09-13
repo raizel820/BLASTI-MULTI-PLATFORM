@@ -214,7 +214,7 @@ export function ConflictResolutionDialog({
                         </div>
 
                         <div className="flex items-center justify-center">
-                          {isRTL ? (
+                          {rtl ? (
                             <ArrowRight className="h-4 w-4 text-muted-foreground" />
                           ) : (
                             <ArrowLeft className="h-4 w-4 text-muted-foreground" />
@@ -277,7 +277,7 @@ export function ConflictResolutionDialog({
             <Separator />
             <DialogFooter>
               <p className="text-xs text-muted-foreground">
-                {resolvedCount} {resolvedCount === 1 ? 'conflict' : 'conflicts'} {t('resolved') || 'resolved'}
+                {resolvedCount} {resolvedCount === 1 ? t('conflictSingular') : t('conflictPlural')} {t('resolved') || 'resolved'}
               </p>
               <Button variant="default" onClick={() => onOpenChange(false)}>
                 {t('done') || 'Done'}

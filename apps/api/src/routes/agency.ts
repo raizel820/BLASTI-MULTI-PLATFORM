@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { requireAuth, requireAgencyAccess, requireResourceOwnership, resolveUserAgencyId, authErrorResponse, verifyAgencyOwnership, AuthError } from '../lib/auth'
 import { validateBody, createAnnouncementSchema, createBranchSchema, updateBranchSchema, createCounterSchema, updateCounterSchema, updateAgencyProfileSchema, updateAgencySettingsSchema, createServiceSchema, updateServiceSchema, updateStaffSchema, createStaffSchema, createReviewSchema, subscriptionPaySchema, subscriptionUnsubscribeSchema, updateWorkingHoursSchema, createHardwareOrderSchema, createEnterpriseRequestSchema } from '../lib/validations'
 import { emitQueueEvent, emitNotificationEvent, emitKioskEvent, emitReservationEvent, emitAgencyEvent, emitStaffEvent } from '../lib/realtime-emit'
@@ -22,7 +22,7 @@ const app = new Hono()
 // that the subscription page renders directly.
 
 async function checkSubscriptionExpiry(agencyId: string) {
-  const agency = await cloudDb.agency.findUnique({
+  const agency = await db.agency.findUnique({
     where: { id: agencyId },
     select: {
       subscriptionStatus: true,
@@ -42,7 +42,7 @@ async function checkSubscriptionExpiry(agencyId: string) {
 
   // Auto-update status to EXPIRED if the expiry date has passed
   if (isExpired && agency.subscriptionStatus === 'ACTIVE') {
-    await cloudDb.agency.update({
+    await db.agency.update({
       where: { id: agencyId },
       data: { subscriptionStatus: 'EXPIRED' },
     })
@@ -120,7 +120,7 @@ app.get('/activity', async (c) => {
     await requireAgencyAccess(c, agencyId)
 
     // Fetch recent reservations with user info, limited to last 10
-    const reservations = await cloudDb.reservation.findMany({
+    const reservations = await db.reservation.findMany({
       where: { agencyId },
       include: {
         user: {
@@ -202,7 +202,7 @@ app.get('/analytics', async (c) => {
 
     await requireAgencyAccess(c, agencyId)
 
-    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) {
       return c.json({ error: 'Agency not found' }, 404)
     }
@@ -212,7 +212,7 @@ app.get('/analytics', async (c) => {
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000)
 
     // Get completed reservations from last 7 days with calledAt
-    const completedReservations = await cloudDb.reservation.findMany({
+    const completedReservations = await db.reservation.findMany({
       where: {
         agencyId,
         status: 'COMPLETED',
@@ -299,7 +299,7 @@ app.get('/announcements', async (c) => {
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
 
-    const announcements = await cloudDb.announcement.findMany({
+    const announcements = await db.announcement.findMany({
       where: {
         agencyId,
         isActive: true,
@@ -334,7 +334,7 @@ app.post('/announcements', async (c) => {
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
 
-    const announcement = await cloudDb.announcement.create({
+    const announcement = await db.announcement.create({
       data: {
         agencyId,
         message,
@@ -360,14 +360,14 @@ app.delete('/announcements', async (c) => {
     }
 
     // Verify the announcement belongs to the user's agency
-    const announcement = await cloudDb.announcement.findUnique({ where: { id } })
+    const announcement = await db.announcement.findUnique({ where: { id } })
     if (!announcement) {
       return c.json({ error: 'Announcement not found' }, 404)
     }
 
     await requireAgencyAccess(c, announcement.agencyId)
 
-    await cloudDb.announcement.delete({
+    await db.announcement.delete({
       where: { id },
     })
 
@@ -392,7 +392,7 @@ app.get('/branches', async (c) => {
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
 
-    const branches = await cloudDb.branch.findMany({
+    const branches = await db.branch.findMany({
       where: { agencyId },
       include: {
         _count: { select: { counters: true, staff: true } },
@@ -427,13 +427,13 @@ app.post('/branches', async (c) => {
 
     // If this branch is set as main, unset other main branches
     if (data.isMain) {
-      await cloudDb.branch.updateMany({
+      await db.branch.updateMany({
         where: { agencyId, isMain: true },
         data: { isMain: false },
       })
     }
 
-    const branch = await cloudDb.branch.create({
+    const branch = await db.branch.create({
       data: {
         name: data.name,
         nameAr: data.nameAr || null,
@@ -464,7 +464,7 @@ app.post('/branches', async (c) => {
 app.get('/branches/:id', async (c) => {
   try {
     const id = c.req.param('id')
-    const branch = await cloudDb.branch.findUnique({
+    const branch = await db.branch.findUnique({
       where: { id },
       include: {
         counters: {
@@ -495,7 +495,7 @@ app.get('/branches/:id', async (c) => {
 app.patch('/branches/:id', async (c) => {
   try {
     const id = c.req.param('id')
-    const branch = await cloudDb.branch.findUnique({ where: { id } })
+    const branch = await db.branch.findUnique({ where: { id } })
     if (!branch) {
       return c.json({ success: false, error: 'Branch not found' }, 404)
     }
@@ -510,13 +510,13 @@ app.patch('/branches/:id', async (c) => {
 
     // If setting as main, unset other main branches
     if (data.isMain) {
-      await cloudDb.branch.updateMany({
+      await db.branch.updateMany({
         where: { agencyId: branch.agencyId, isMain: true },
         data: { isMain: false },
       })
     }
 
-    const updated = await cloudDb.branch.update({
+    const updated = await db.branch.update({
       where: { id },
       data,
     })
@@ -538,14 +538,14 @@ app.patch('/branches/:id', async (c) => {
 app.delete('/branches/:id', async (c) => {
   try {
     const id = c.req.param('id')
-    const branch = await cloudDb.branch.findUnique({ where: { id } })
+    const branch = await db.branch.findUnique({ where: { id } })
     if (!branch) {
       return c.json({ success: false, error: 'Branch not found' }, 404)
     }
 
     await requireAgencyAccess(c, branch.agencyId)
 
-    const updated = await cloudDb.branch.update({
+    const updated = await db.branch.update({
       where: { id },
       data: { isActive: false },
     })
@@ -563,53 +563,20 @@ app.delete('/branches/:id', async (c) => {
   }
 })
 
-// ─── agency/counters ─────────────────────────────────────────────────────────
-
-// GET /counters — List all counters for an agency (across all branches)
-app.get('/counters', async (c) => {
-  try {
-    const agencyId = c.req.query('agencyId')
-    if (!agencyId) {
-      return c.json({ success: false, error: 'agencyId is required' }, 400)
-    }
-
-    await ensureAgencyIdOwnership(c, agencyId)
-    await requireAgencyAccess(c, agencyId)
-
-    const branchId = c.req.query('branchId')
-    const where: any = { branch: { agencyId } }
-    if (branchId) where.branchId = branchId
-    const counters = await cloudDb.counter.findMany({
-      where,
-      include: {
-        branch: { select: { id: true, name: true } },
-        staff: { select: { id: true, fullName: true } },
-        currentReservation: { select: { id: true, ticketNumber: true, fullName: true } },
-      },
-      orderBy: { number: 'asc' },
-    })
-
-    return c.json({ success: true, counters })
-  } catch (error) {
-    const err = authErrorResponse(error)
-    return c.json({ success: err.success, error: err.error }, err.status as any)
-  }
-})
-
 // ─── agency/branches/:id/counters ─────────────────────────────────────────────
 
 // GET /agency/branches/:id/counters
 app.get('/branches/:id/counters', async (c) => {
   try {
     const branchId = c.req.param('id')
-    const branch = await cloudDb.branch.findUnique({ where: { id: branchId } })
+    const branch = await db.branch.findUnique({ where: { id: branchId } })
     if (!branch) {
       return c.json({ success: false, error: 'Branch not found' }, 404)
     }
 
     await requireAgencyAccess(c, branch.agencyId)
 
-    const counters = await cloudDb.counter.findMany({
+    const counters = await db.counter.findMany({
       where: { branchId },
       include: {
         staff: { include: { user: { select: { fullName: true, username: true } } } },
@@ -629,7 +596,7 @@ app.get('/branches/:id/counters', async (c) => {
 app.post('/branches/:id/counters', async (c) => {
   try {
     const branchId = c.req.param('id')
-    const branch = await cloudDb.branch.findUnique({ where: { id: branchId } })
+    const branch = await db.branch.findUnique({ where: { id: branchId } })
     if (!branch) {
       return c.json({ success: false, error: 'Branch not found' }, 404)
     }
@@ -643,7 +610,7 @@ app.post('/branches/:id/counters', async (c) => {
     }
 
     // Check if counter number already exists in this branch
-    const existing = await cloudDb.counter.findFirst({
+    const existing = await db.counter.findFirst({
       where: { branchId, number: data.number },
     })
     if (existing) {
@@ -653,7 +620,7 @@ app.post('/branches/:id/counters', async (c) => {
       )
     }
 
-    const counter = await cloudDb.counter.create({
+    const counter = await db.counter.create({
       data: {
         number: data.number,
         name: data.name,
@@ -684,7 +651,7 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
   try {
     const branchId = c.req.param('id')
     const counterId = c.req.param('counterId')
-    const counter = await cloudDb.counter.findUnique({ where: { id: counterId }, include: { branch: true } })
+    const counter = await db.counter.findUnique({ where: { id: counterId }, include: { branch: true } })
     if (!counter || counter.branchId !== branchId) {
       return c.json({ success: false, error: 'Counter not found' }, 404)
     }
@@ -699,7 +666,7 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
 
     // If staffId is provided, verify the staff belongs to the same agency
     if (data.staffId) {
-      const staff = await cloudDb.agencyStaff.findUnique({ where: { id: data.staffId } })
+      const staff = await db.agencyStaff.findUnique({ where: { id: data.staffId } })
       if (!staff || staff.agencyId !== counter.branch.agencyId) {
         return c.json(
           { success: false, error: 'Staff member not found in this agency' },
@@ -708,7 +675,7 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
       }
     }
 
-    const updated = await cloudDb.counter.update({
+    const updated = await db.counter.update({
       where: { id: counterId },
       data: {
         ...(data.name !== undefined && { name: data.name }),
@@ -738,14 +705,14 @@ app.delete('/branches/:id/counters/:counterId', async (c) => {
   try {
     const branchId = c.req.param('id')
     const counterId = c.req.param('counterId')
-    const counter = await cloudDb.counter.findUnique({ where: { id: counterId }, include: { branch: true } })
+    const counter = await db.counter.findUnique({ where: { id: counterId }, include: { branch: true } })
     if (!counter || counter.branchId !== branchId) {
       return c.json({ success: false, error: 'Counter not found' }, 404)
     }
 
     await requireAgencyAccess(c, counter.branch.agencyId)
 
-    const updated = await cloudDb.counter.update({
+    const updated = await db.counter.update({
       where: { id: counterId },
       data: { isActive: false },
     })
@@ -779,7 +746,7 @@ app.get('/daily-chart', async (c) => {
     today.setHours(0, 0, 0, 0)
 
     // Get all reservations for today for this agency
-    const reservations = await cloudDb.reservation.findMany({
+    const reservations = await db.reservation.findMany({
       where: {
         agencyId,
         joinedAt: { gte: today },
@@ -830,7 +797,7 @@ app.get('/export-csv', async (c) => {
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
 
-    const reservations = await cloudDb.reservation.findMany({
+    const reservations = await db.reservation.findMany({
       where: { agencyId },
       include: {
         user: { select: { username: true, fullName: true, phoneNumber: true } },
@@ -910,13 +877,13 @@ app.get('/no-show-analytics', async (c) => {
     periodAgo.setDate(periodAgo.getDate() - periodDays)
 
     const [totalReservations, noShows, cancelled] = await Promise.all([
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, joinedAt: { gte: periodAgo } },
       }),
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, status: 'NO_SHOW', joinedAt: { gte: periodAgo } },
       }),
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, status: 'CANCELLED', joinedAt: { gte: periodAgo } },
       }),
     ])
@@ -924,7 +891,7 @@ app.get('/no-show-analytics', async (c) => {
     const noShowRate = totalReservations > 0 ? Math.round((noShows / totalReservations) * 100) : 0
     const cancelRate = totalReservations > 0 ? Math.round((cancelled / totalReservations) * 100) : 0
 
-    const dailyStats = await cloudDb.$queryRaw<Array<{ date: string; total: number; noShows: number }>>`
+    const dailyStats = await db.$queryRaw<Array<{ date: string; total: number; noShows: number }>>`
       SELECT 
         DATE(joinedAt) as date,
         COUNT(*) as total,
@@ -936,7 +903,7 @@ app.get('/no-show-analytics', async (c) => {
       ORDER BY date ASC
     `
 
-    const serviceStats = await cloudDb.$queryRaw<
+    const serviceStats = await db.$queryRaw<
       Array<{ serviceId: string; serviceName: string; total: number; noShows: number }>
     >`
       SELECT 
@@ -953,7 +920,7 @@ app.get('/no-show-analytics', async (c) => {
       LIMIT 10
     `
 
-    const hourlyStats = await cloudDb.$queryRaw<Array<{ hour: number; total: number; noShows: number }>>`
+    const hourlyStats = await db.$queryRaw<Array<{ hour: number; total: number; noShows: number }>>`
       SELECT 
         CAST(strftime('%H', joinedAt) AS INTEGER) as hour,
         COUNT(*) as total,
@@ -965,7 +932,7 @@ app.get('/no-show-analytics', async (c) => {
       ORDER BY hour ASC
     `
 
-    const reclaimedNoShows = await cloudDb.reservation.count({
+    const reclaimedNoShows = await db.reservation.count({
       where: {
         agencyId,
         status: 'NO_SHOW',
@@ -1035,7 +1002,7 @@ app.get('/peak-hours', async (c) => {
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
 
     // Hourly demand distribution
-    const hourlyDemand = await cloudDb.$queryRaw<Array<{ hour: number; count: number; avgWait: number }>>`
+    const hourlyDemand = await db.$queryRaw<Array<{ hour: number; count: number; avgWait: number }>>`
       SELECT 
         CAST(strftime('%H', joinedAt) AS INTEGER) as hour,
         COUNT(*) as count,
@@ -1048,7 +1015,7 @@ app.get('/peak-hours', async (c) => {
     `
 
     // Day of week demand
-    const weekdayDemand = await cloudDb.$queryRaw<Array<{ weekday: number; count: number; avgWait: number }>>`
+    const weekdayDemand = await db.$queryRaw<Array<{ weekday: number; count: number; avgWait: number }>>`
       SELECT 
         CAST(strftime('%w', joinedAt) AS INTEGER) as weekday,
         COUNT(*) as count,
@@ -1061,7 +1028,7 @@ app.get('/peak-hours', async (c) => {
     `
 
     // Peak hours by service
-    const servicePeakHours = await cloudDb.$queryRaw<
+    const servicePeakHours = await db.$queryRaw<
       Array<{ serviceId: string; serviceName: string; peakHour: number; count: number }>
     >`
       SELECT 
@@ -1096,7 +1063,7 @@ app.get('/peak-hours', async (c) => {
         : null
 
     // Daily average wait time trend (past 30 days)
-    const dailyWaitTrend = await cloudDb.$queryRaw<Array<{ date: string; avgWait: number; count: number }>>`
+    const dailyWaitTrend = await db.$queryRaw<Array<{ date: string; avgWait: number; count: number }>>`
       SELECT 
         DATE(joinedAt) as date,
         COALESCE(AVG(estimatedWait), 0) as avgWait,
@@ -1168,7 +1135,7 @@ app.get('/profile', async (c) => {
       return c.json({ error: 'No agency found' }, 404)
     }
 
-    const agency = await cloudDb.agency.findUnique({
+    const agency = await db.agency.findUnique({
       where: { id: agencyId },
       include: { queueSettings: { take: 1 } },
     })
@@ -1223,10 +1190,10 @@ app.patch('/profile', async (c) => {
       return c.json({ error: 'No agency found' }, 404)
     }
 
-    const targetAgency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const targetAgency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!targetAgency) return c.json({ error: 'No agency found' }, 404)
 
-    await cloudDb.agency.update({
+    await db.agency.update({
       where: { id: targetAgency.id },
       data: {
         ...(validatedData.name !== undefined && { name: validatedData.name }),
@@ -1311,7 +1278,7 @@ app.get('/queue', async (c) => {
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
 
-    const reservations = await cloudDb.reservation.findMany({
+    const reservations = await db.reservation.findMany({
       where: {
         agencyId,
         status: { in: statuses },
@@ -1370,7 +1337,7 @@ app.post('/queue/call-next', async (c) => {
     checkRateLimit(user.id, QUEUE_RATE_LIMIT)
 
     // Check agency has an active subscription
-    const agencyCheck = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const agencyCheck = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agencyCheck) {
       return c.json({ error: 'Agency not found' }, 404)
     }
@@ -1382,7 +1349,7 @@ app.post('/queue/call-next', async (c) => {
     }
 
     // Check if queue is paused
-    const queueSettings = await cloudDb.queueSettings.findFirst({ where: { agencyId } })
+    const queueSettings = await db.queueSettings.findFirst({ where: { agencyId } })
     if (queueSettings?.isPaused) {
       return c.json({ error: 'Queue is paused' }, 400)
     }
@@ -1390,7 +1357,7 @@ app.post('/queue/call-next', async (c) => {
     // Validate counterId if provided — must belong to the agency's branch
     let targetCounter: { id: string; currentReservationId: string | null } | null = null
     if (counterId) {
-      targetCounter = await cloudDb.counter.findFirst({
+      targetCounter = await db.counter.findFirst({
         where: {
           id: counterId,
           branch: { agencyId },
@@ -1405,7 +1372,7 @@ app.post('/queue/call-next', async (c) => {
 
     // Use transaction to prevent double-calling
     // Returns both the next reservation and any auto-completed entries
-    const { nextReservation: next, autoCompleted } = await cloudDb.$transaction(async (tx) => {
+    const { nextReservation: next, autoCompleted } = await db.$transaction(async (tx) => {
       // ─── Auto-complete the PREVIOUS customer for THIS counter only ───
       // Scoping to counterId ensures multiple receptions can serve simultaneously
       const completedEntries: { id: string; displayNumber: string }[] = []
@@ -1551,7 +1518,7 @@ app.post('/queue/toggle-pause', async (c) => {
     await requireAgencyAccess(c, agencyId)
 
     // Check agency has an active subscription
-    const agencyCheck = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const agencyCheck = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agencyCheck) {
       return c.json({ error: 'Agency not found' }, 404)
     }
@@ -1562,14 +1529,14 @@ app.post('/queue/toggle-pause', async (c) => {
       )
     }
 
-    const queueSettings = await cloudDb.queueSettings.findFirst({ where: { agencyId } })
+    const queueSettings = await db.queueSettings.findFirst({ where: { agencyId } })
     if (!queueSettings) {
       return c.json({ error: 'Queue settings not found' }, 404)
     }
 
     const newPausedState = !queueSettings.isPaused
 
-    await cloudDb.queueSettings.update({
+    await db.queueSettings.update({
       where: { id: queueSettings.id },
       data: {
         isPaused: newPausedState,
@@ -1578,7 +1545,7 @@ app.post('/queue/toggle-pause', async (c) => {
       },
     })
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         action: newPausedState ? 'QUEUE_PAUSE' : 'QUEUE_RESUME',
         entityType: 'AGENCY',
@@ -1625,7 +1592,7 @@ app.post('/queue/walk-in', async (c) => {
     await requireAgencyAccess(c, agencyId)
 
     // Check agency exists and queue is open
-    const agency = await cloudDb.agency.findUnique({
+    const agency = await db.agency.findUnique({
       where: { id: agencyId },
       include: { queueSettings: { take: 1, orderBy: { updatedAt: 'desc' } } },
     })
@@ -1645,27 +1612,27 @@ app.post('/queue/walk-in', async (c) => {
     // Resolve service
     let resolvedServiceId = serviceId
     if (!resolvedServiceId) {
-      const firstService = await cloudDb.service.findFirst({
+      const firstService = await db.service.findFirst({
         where: { agencyId, isActive: true },
         orderBy: { createdAt: 'asc' },
       })
       if (firstService) {
         resolvedServiceId = firstService.id
       } else {
-        const defaultService = await cloudDb.service.create({
+        const defaultService = await db.service.create({
           data: { agencyId, name: 'General', nameAr: 'عام', nameFr: 'Général', prefix: 'A' },
         })
         resolvedServiceId = defaultService.id
       }
     }
 
-    const service = await cloudDb.service.findUnique({ where: { id: resolvedServiceId } })
+    const service = await db.service.findUnique({ where: { id: resolvedServiceId } })
     if (!service || !service.isActive) {
       return c.json({ success: false, error: 'Service not found or inactive' }, 404)
     }
 
     // Check capacity
-    const activeCount = await cloudDb.reservation.count({
+    const activeCount = await db.reservation.count({
       where: { agencyId, status: { in: ['WAITING', 'CALLED'] } },
     })
 
@@ -1674,11 +1641,11 @@ app.post('/queue/walk-in', async (c) => {
     }
 
     // ── Unified ETA: use the same advanced engine as the mobile app ──
-    const waitingCount = await cloudDb.reservation.count({
+    const waitingCount = await db.reservation.count({
       where: { agencyId, status: 'WAITING' },
     })
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompleted = await cloudDb.reservation.findMany({
+    const recentCompleted = await db.reservation.findMany({
       where: {
         agencyId,
         status: 'COMPLETED',
@@ -1690,7 +1657,7 @@ app.post('/queue/walk-in', async (c) => {
     })
     const effective = getEffectiveServiceTime(recentCompleted, agency.averageServiceTime)
     const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
-    const activeCounters = await cloudDb.counter.count({
+    const activeCounters = await db.counter.count({
       where: {
         isActive: true,
         staffId: { not: null },
@@ -1710,7 +1677,7 @@ app.post('/queue/walk-in', async (c) => {
     const estimatedWait = eta.estimatedMaxMinutes
 
     // Create walk-in reservation atomically
-    const reservation = await cloudDb.$transaction(async (tx) => {
+    const reservation = await db.$transaction(async (tx) => {
       // Re-check capacity
       const cnt = await tx.reservation.count({
         where: { agencyId, status: { in: ['WAITING', 'CALLED'] } },
@@ -1778,7 +1745,7 @@ app.post('/queue/walk-in', async (c) => {
       const payload = JSON.stringify({ reservationId: reservation.id, agencyId, customerId: customerName.trim(), exp })
       const sig = crypto.createHmac('sha256', QR_SECRET).update(payload).digest('hex')
       importToken = Buffer.from(payload).toString('base64url') + '.' + sig
-      await cloudDb.reservation.update({ where: { id: reservation.id }, data: { importToken } })
+      await db.reservation.update({ where: { id: reservation.id }, data: { importToken } })
     } catch (tokenErr) { console.warn('[Walk-in] Failed to generate import token:', tokenErr) }
 
     // Emit realtime events (non-blocking — fire and forget)
@@ -1824,7 +1791,7 @@ app.post('/queue/walk-in-token', async (c) => {
     const user = await requireAuth(c)
     if (!user) return authErrorResponse(c, 'Authentication required')
 
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id: reservationId },
       include: { agency: { select: { id: true } } },
     })
@@ -1851,7 +1818,7 @@ app.post('/queue/walk-in-token', async (c) => {
     const token = Buffer.from(payload2).toString('base64url') + '.' + sig2
 
     // Save token to reservation
-    await cloudDb.reservation.update({
+    await db.reservation.update({
       where: { id: reservationId },
       data: { importToken: token },
     })
@@ -1879,7 +1846,7 @@ app.patch('/queue/:id', async (c) => {
 
     const { action } = validation.data
 
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id },
       select: {
         id: true,
@@ -1911,14 +1878,14 @@ app.patch('/queue/:id', async (c) => {
       cancelledAt: action === 'cancel' ? new Date() : undefined,
     }
 
-    await cloudDb.reservation.update({
+    await db.reservation.update({
       where: { id },
       data: updateData,
     })
 
     // Clear the counter's currentReservationId when this reservation is completed/cancelled/no-show
     if (reservation.counterId) {
-      await cloudDb.counter.updateMany({
+      await db.counter.updateMany({
         where: { currentReservationId: id },
         data: { currentReservationId: null },
       })
@@ -1936,7 +1903,7 @@ app.patch('/queue/:id', async (c) => {
           ? { type: 'COMPLETED', title: 'Service Completed', message: `Your reservation #${number} at ${agencyName} has been marked as completed. Thank you for your visit!` }
           : { type: 'NO_SHOW', title: 'Marked as No-Show', message: `Your reservation #${number} at ${agencyName} has been marked as no-show. Please contact the agency if this is an error.` }
 
-      await cloudDb.notification.create({
+      await db.notification.create({
         data: {
           userId: reservation.userId,
           type: notificationData.type,
@@ -1947,7 +1914,7 @@ app.patch('/queue/:id', async (c) => {
     }
 
     // Create audit log
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: reservation.userId ?? undefined,
         action: `QUEUE_${action.toUpperCase()}`,
@@ -2013,7 +1980,7 @@ app.get('/reviews', async (c) => {
     const skip = (page - 1) * limit
 
     const [reviews, totalReviews] = await Promise.all([
-      cloudDb.review.findMany({
+      db.review.findMany({
         where: { agencyId },
         orderBy: { createdAt: 'desc' },
         skip,
@@ -2028,11 +1995,11 @@ app.get('/reviews', async (c) => {
           },
         },
       }),
-      cloudDb.review.count({ where: { agencyId } }),
+      db.review.count({ where: { agencyId } }),
     ])
 
     // Calculate average rating
-    const ratingAggregation = await cloudDb.review.aggregate({
+    const ratingAggregation = await db.review.aggregate({
       where: { agencyId },
       _avg: { rating: true },
       _count: { rating: true },
@@ -2040,7 +2007,7 @@ app.get('/reviews', async (c) => {
 
     // Get rating distribution
     const ratingDistribution: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }
-    const allRatings = await cloudDb.review.findMany({
+    const allRatings = await db.review.findMany({
       where: { agencyId },
       select: { rating: true },
     })
@@ -2103,14 +2070,14 @@ app.post('/reviews', async (c) => {
     await requireAgencyAccess(c, agencyId)
 
     // Check if user already reviewed this agency
-    const existing = await cloudDb.review.findUnique({
+    const existing = await db.review.findUnique({
       where: { userId_agencyId: { userId, agencyId } },
     })
 
     let review
     if (existing) {
       // Update existing review
-      review = await cloudDb.review.update({
+      review = await db.review.update({
         where: { id: existing.id },
         data: {
           rating,
@@ -2124,7 +2091,7 @@ app.post('/reviews', async (c) => {
       })
     } else {
       // Create new review
-      review = await cloudDb.review.create({
+      review = await db.review.create({
         data: {
           userId,
           agencyId,
@@ -2169,7 +2136,7 @@ app.delete('/reviews', async (c) => {
       return c.json({ error: 'reviewId is required' }, 400)
     }
 
-    const review = await cloudDb.review.findUnique({ where: { id: reviewId } })
+    const review = await db.review.findUnique({ where: { id: reviewId } })
     if (!review) {
       return c.json({ error: 'Review not found' }, 404)
     }
@@ -2177,7 +2144,7 @@ app.delete('/reviews', async (c) => {
     // Use session-derived user to verify ownership instead of trusting client userId
     await requireResourceOwnership(c, review.userId)
 
-    await cloudDb.review.delete({ where: { id: reviewId } })
+    await db.review.delete({ where: { id: reviewId } })
 
     return c.json({ success: true })
   } catch (error: unknown) {
@@ -2196,7 +2163,7 @@ app.get('/services', async (c) => {
       return c.json({ services: [] })
     }
 
-    const services = await cloudDb.service.findMany({
+    const services = await db.service.findMany({
       where: { agencyId, isActive: true },
       orderBy: { createdAt: 'asc' },
     })
@@ -2229,7 +2196,7 @@ app.post('/services', async (c) => {
       return c.json({ error: 'Prefix required' }, 400)
     }
 
-    const service = await cloudDb.service.create({
+    const service = await db.service.create({
       data: {
         agencyId,
         name,
@@ -2271,7 +2238,7 @@ app.patch('/services/:id', async (c) => {
     }
 
     // Verify the service belongs to the user's agency
-    const existingService = await cloudDb.service.findUnique({ where: { id } })
+    const existingService = await db.service.findUnique({ where: { id } })
     if (!existingService || existingService.agencyId !== agencyId) {
       return c.json({ error: 'Service not found or access denied' }, 404)
     }
@@ -2285,7 +2252,7 @@ app.patch('/services/:id', async (c) => {
     const { name, nameAr, nameFr, description, isActive } = validation.data
     const { prefix } = body
 
-    const service = await cloudDb.service.update({
+    const service = await db.service.update({
       where: { id },
       data: {
         ...(name && { name }),
@@ -2324,12 +2291,12 @@ app.delete('/services/:id', async (c) => {
     }
 
     // Verify the service belongs to the user's agency
-    const existingService = await cloudDb.service.findUnique({ where: { id } })
+    const existingService = await db.service.findUnique({ where: { id } })
     if (!existingService || existingService.agencyId !== agencyId) {
       return c.json({ error: 'Service not found or access denied' }, 404)
     }
 
-    await cloudDb.service.update({
+    await db.service.update({
       where: { id },
       data: { isActive: false },
     })
@@ -2370,7 +2337,7 @@ app.get('/settings', async (c) => {
 
     let agency
     if (agencyId) {
-      agency = await cloudDb.agency.findUnique({
+      agency = await db.agency.findUnique({
         where: { id: agencyId },
         include: {
           services: {
@@ -2446,12 +2413,12 @@ app.patch('/settings', async (c) => {
       return c.json({ error: 'No agency found' }, 404)
     }
 
-    const targetAgency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const targetAgency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!targetAgency) {
       return c.json({ error: 'No agency found' }, 404)
     }
 
-    await cloudDb.agency.update({
+    await db.agency.update({
       where: { id: targetAgency.id },
       data: {
         ...(avgServiceTime !== undefined && { averageServiceTime: avgServiceTime }),
@@ -2495,7 +2462,7 @@ app.get('/staff', async (c) => {
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
 
-    const staff = await cloudDb.agencyStaff.findMany({
+    const staff = await db.agencyStaff.findMany({
       where: { agencyId },
       include: {
         user: {
@@ -2531,7 +2498,7 @@ app.post('/staff', async (c) => {
     await requireAgencyAccess(c, agencyId)
 
     // Find user by username
-    const user = await cloudDb.user.findUnique({
+    const user = await db.user.findUnique({
       where: { username: username.trim() },
     })
 
@@ -2540,7 +2507,7 @@ app.post('/staff', async (c) => {
     }
 
     // Check if user is already a staff member
-    const existing = await cloudDb.agencyStaff.findUnique({
+    const existing = await db.agencyStaff.findUnique({
       where: {
         userId_agencyId: {
           userId: user.id,
@@ -2554,7 +2521,7 @@ app.post('/staff', async (c) => {
     }
 
     // Create staff link
-    const staff = await cloudDb.agencyStaff.create({
+    const staff = await db.agencyStaff.create({
       data: {
         userId: user.id,
         agencyId,
@@ -2597,7 +2564,7 @@ app.delete('/staff', async (c) => {
     await requireAgencyAccess(c, agencyId)
 
     // Verify it's not an owner
-    const staffMember = await cloudDb.agencyStaff.findUnique({
+    const staffMember = await db.agencyStaff.findUnique({
       where: { id: staffId },
     })
 
@@ -2614,7 +2581,7 @@ app.delete('/staff', async (c) => {
       return c.json({ error: 'Cannot remove agency owner' }, 403)
     }
 
-    await cloudDb.agencyStaff.delete({
+    await db.agencyStaff.delete({
       where: { id: staffId },
     })
 
@@ -2665,7 +2632,7 @@ app.post('/staff/create', async (c) => {
     const agencyStaffRole = staffRole === 'AGENCY_OWNER' ? 'OWNER' : staffRole === 'MANAGER' ? 'MANAGER' : 'STAFF'
 
     // Verify agency exists
-    const agency = await cloudDb.agency.findUnique({
+    const agency = await db.agency.findUnique({
       where: { id: agencyId },
     })
 
@@ -2674,7 +2641,7 @@ app.post('/staff/create', async (c) => {
     }
 
     // Check username uniqueness
-    const existingUser = await cloudDb.user.findUnique({
+    const existingUser = await db.user.findUnique({
       where: { username: username.trim() },
     })
 
@@ -2686,7 +2653,7 @@ app.post('/staff/create', async (c) => {
     const passwordHash = hashPassword(password)
 
     // Create User with appropriate role
-    const newUser = await cloudDb.user.create({
+    const newUser = await db.user.create({
       data: {
         username: username.trim(),
         fullName: fullName.trim(),
@@ -2699,7 +2666,7 @@ app.post('/staff/create', async (c) => {
     })
 
     // Create AgencyStaff link
-    const staffLink = await cloudDb.agencyStaff.create({
+    const staffLink = await db.agencyStaff.create({
       data: {
         userId: newUser.id,
         agencyId,
@@ -2769,7 +2736,7 @@ app.patch('/staff/:id', async (c) => {
     const { fullName, role, isActive, permissions } = validation.data
 
     // Find the staff member
-    const staffMember = await cloudDb.agencyStaff.findUnique({
+    const staffMember = await db.agencyStaff.findUnique({
       where: { id },
       include: {
         user: {
@@ -2794,7 +2761,7 @@ app.patch('/staff/:id', async (c) => {
 
     // Update user fullName if provided
     if (fullName !== undefined && fullName.trim()) {
-      await cloudDb.user.update({
+      await db.user.update({
         where: { id: staffMember.userId },
         data: { fullName: fullName.trim() },
       })
@@ -2802,7 +2769,7 @@ app.patch('/staff/:id', async (c) => {
 
     // Update staff role if provided
     if (role !== undefined && ['STAFF', 'MANAGER'].includes(role)) {
-      await cloudDb.agencyStaff.update({
+      await db.agencyStaff.update({
         where: { id },
         data: { role },
       })
@@ -2810,12 +2777,12 @@ app.patch('/staff/:id', async (c) => {
 
     // Update user isActive if provided
     if (isActive !== undefined) {
-      await cloudDb.user.update({
+      await db.user.update({
         where: { id: staffMember.userId },
         data: { isActive },
       })
       // Also update the AgencyStaff isActive
-      await cloudDb.agencyStaff.update({
+      await db.agencyStaff.update({
         where: { id },
         data: { isActive },
       })
@@ -2828,14 +2795,14 @@ app.patch('/staff/:id', async (c) => {
         ? JSON.parse(staffMember.permissions as string)
         : {}
       const mergedPerms = { ...currentPerms, ...permissions }
-      await cloudDb.agencyStaff.update({
+      await db.agencyStaff.update({
         where: { id },
         data: { permissions: JSON.stringify(mergedPerms) },
       })
     }
 
     // Fetch updated staff member
-    const updated = await cloudDb.agencyStaff.findUnique({
+    const updated = await db.agencyStaff.findUnique({
       where: { id },
       include: {
         user: {
@@ -2871,7 +2838,7 @@ app.delete('/staff/:id', async (c) => {
     }
 
     // Find the staff member
-    const staffMember = await cloudDb.agencyStaff.findUnique({
+    const staffMember = await db.agencyStaff.findUnique({
       where: { id },
     })
 
@@ -2890,18 +2857,18 @@ app.delete('/staff/:id', async (c) => {
     }
 
     // Delete the staff link
-    await cloudDb.agencyStaff.delete({
+    await db.agencyStaff.delete({
       where: { id },
     })
 
     // Deactivate the user account if they are AGENCY_STAFF
-    const staffUser = await cloudDb.user.findUnique({
+    const staffUser = await db.user.findUnique({
       where: { id: staffMember.userId },
     })
 
     if (staffUser && staffUser.role === 'AGENCY_STAFF') {
       // Check if this user has any other staff links
-      const otherLinks = await cloudDb.agencyStaff.count({
+      const otherLinks = await db.agencyStaff.count({
         where: {
           userId: staffUser.id,
           id: { not: id },
@@ -2910,7 +2877,7 @@ app.delete('/staff/:id', async (c) => {
 
       if (otherLinks === 0) {
         // No other agencies, deactivate the user
-        await cloudDb.user.update({
+        await db.user.update({
           where: { id: staffUser.id },
           data: { isActive: false },
         })
@@ -2944,7 +2911,7 @@ app.get('/stats', async (c) => {
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
 
-    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) {
       return c.json({ error: 'Agency not found' }, 404)
     }
@@ -2967,41 +2934,41 @@ app.get('/stats', async (c) => {
       onlineReservationCount,
       activeCounters,
     ] = await Promise.all([
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, joinedAt: { gte: todayStart, lte: todayEnd } },
       }),
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, status: { in: ['WAITING', 'CALLED'] } },
       }),
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, status: { in: ['COMPLETED'] }, completedAt: { gte: todayStart, lte: todayEnd } },
       }),
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, status: { in: ['NO_SHOW'] }, cancelledAt: { gte: todayStart, lte: todayEnd } },
       }),
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, status: { in: ['CANCELLED'] }, cancelledAt: { gte: todayStart, lte: todayEnd } },
       }),
-      cloudDb.queueSettings.findFirst({ where: { agencyId } }),
-      cloudDb.reservation.aggregate({
+      db.queueSettings.findFirst({ where: { agencyId } }),
+      db.reservation.aggregate({
         where: { agencyId, rating: { not: null } },
         _avg: { rating: true },
         _count: { rating: true },
       }),
       // all-time totals
-      cloudDb.reservation.count({ where: { agencyId } }),
-      cloudDb.reservation.count({ where: { agencyId, status: 'COMPLETED' } }),
-      cloudDb.reservation.count({ where: { agencyId, status: 'NO_SHOW' } }),
+      db.reservation.count({ where: { agencyId } }),
+      db.reservation.count({ where: { agencyId, status: 'COMPLETED' } }),
+      db.reservation.count({ where: { agencyId, status: 'NO_SHOW' } }),
       // walk-in count for today
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, isWalkIn: true, joinedAt: { gte: todayStart, lte: todayEnd } },
       }),
       // online reservation count for today (non-walk-in with userId)
-      cloudDb.reservation.count({
+      db.reservation.count({
         where: { agencyId, isWalkIn: false, userId: { not: null }, joinedAt: { gte: todayStart, lte: todayEnd } },
       }),
       // active counters (with staff assigned)
-      cloudDb.counter.count({
+      db.counter.count({
         where: {
           isActive: true,
           staffId: { not: null },
@@ -3011,7 +2978,7 @@ app.get('/stats', async (c) => {
     ])
 
     // Calculate peak hour today
-    const todayReservationsList = await cloudDb.reservation.findMany({
+    const todayReservationsList = await db.reservation.findMany({
       where: { agencyId, joinedAt: { gte: todayStart, lte: todayEnd } },
       select: { joinedAt: true },
     })
@@ -3045,7 +3012,7 @@ app.get('/stats', async (c) => {
     const noShowRate = totalAllTime > 0 ? Math.round((noShowAllTime / totalAllTime) * 100) : 0
 
     // Hourly wait time data (today)
-    const todayCompleted = await cloudDb.reservation.findMany({
+    const todayCompleted = await db.reservation.findMany({
       where: { agencyId, status: 'COMPLETED', completedAt: { gte: todayStart, lte: todayEnd } },
       select: { joinedAt: true, completedAt: true, calledAt: true },
     })
@@ -3063,7 +3030,7 @@ app.get('/stats', async (c) => {
 
     // Rating distribution
     const ratingDist = [0, 0, 0, 0, 0] // 1-5 stars
-    const allRated = await cloudDb.reservation.findMany({
+    const allRated = await db.reservation.findMany({
       where: { agencyId, rating: { not: null } },
       select: { rating: true },
     })
@@ -3074,7 +3041,7 @@ app.get('/stats', async (c) => {
     // Calculate ETA range for overall queue
     const isPaused = queueSettings?.isPaused || false
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-    const recentCompletedForEta = await cloudDb.reservation.findMany({
+    const recentCompletedForEta = await db.reservation.findMany({
       where: {
         agencyId,
         status: 'COMPLETED',
@@ -3185,10 +3152,10 @@ app.get('/history', async (c) => {
     }
 
     // Count total matching records (for pagination)
-    const total = await cloudDb.reservation.count({ where })
+    const total = await db.reservation.count({ where })
 
     // Fetch paginated results with relations
-    const reservations = await cloudDb.reservation.findMany({
+    const reservations = await db.reservation.findMany({
       where,
       include: {
         service: { select: { id: true, name: true, nameAr: true, nameFr: true } },
@@ -3256,7 +3223,7 @@ app.get('/history/:id', async (c) => {
 
     const id = c.req.param('id')
 
-    const r = await cloudDb.reservation.findFirst({
+    const r = await db.reservation.findFirst({
       where: { id, agencyId },
       include: {
         service: { select: { id: true, name: true, nameAr: true, nameFr: true } },
@@ -3321,7 +3288,7 @@ app.get('/subscription-plans', async (c) => {
 
     // Exclude enterprise custom plans unless they belong to the requesting
     // agency. Public catalog only shows non-enterprise plans.
-    const plans = await cloudDb.subscriptionPlan.findMany({
+    const plans = await db.subscriptionPlan.findMany({
       where: {
         isActive: true,
         OR: [
@@ -3362,7 +3329,7 @@ app.get('/subscription', async (c) => {
     // Enterprise custom plans are excluded from the public catalog — they only
     // appear for the specific agency they were built for (ownerAgencyId match).
     const effectiveAgencyId = agencyIdParam || agencyId || undefined
-    const availablePlans = await cloudDb.subscriptionPlan.findMany({
+    const availablePlans = await db.subscriptionPlan.findMany({
       where: {
         isActive: true,
         OR: [
@@ -3388,7 +3355,7 @@ app.get('/subscription', async (c) => {
       })
     }
 
-    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) {
       return c.json({
         currentPlan: 'BASIC',
@@ -3407,7 +3374,7 @@ app.get('/subscription', async (c) => {
     // and surface the daysRemaining / isExpiringSoon flags for the UI banners.
     const expiry = await checkSubscriptionExpiry(agencyId)
 
-    const transactions = await cloudDb.transaction.findMany({
+    const transactions = await db.transaction.findMany({
       where: { agencyId: agency.id },
       orderBy: { createdAt: 'desc' },
       take: 10,
@@ -3471,14 +3438,14 @@ app.post('/subscription/pay', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ error: 'No agency found' }, 404)
 
     // Phase 2: Look up the actual SubscriptionPlan record the user wants to
     // subscribe to. This replaces the old hardcoded
     // `amount = plan === 'PREMIUM' ? 3000 : 2000` with the real admin-managed
     // price. It also validates that the requested plan exists and is active.
-    const planRecord = await cloudDb.subscriptionPlan.findFirst({
+    const planRecord = await db.subscriptionPlan.findFirst({
       where: { name: validation.data.plan, isActive: true },
     })
     if (!planRecord) {
@@ -3513,7 +3480,7 @@ app.post('/subscription/pay', async (c) => {
       ? `${validation.data.plan} (${effectivePeriod}m)`
       : validation.data.plan
 
-    const transaction = await cloudDb.transaction.create({
+    const transaction = await db.transaction.create({
       data: {
         agencyId: agency.id,
         amount,
@@ -3533,7 +3500,7 @@ app.post('/subscription/pay', async (c) => {
     // Phase 2: Link the agency to the SubscriptionPlan record (in addition to
     // the legacy subscriptionTier/subscriptionStatus fields) and mark the
     // subscription as PENDING until an admin approves the receipt.
-    await cloudDb.agency.update({
+    await db.agency.update({
       where: { id: agency.id },
       data: {
         subscriptionStatus: 'PENDING',
@@ -3579,12 +3546,12 @@ app.post('/subscription/unsubscribe', async (c) => {
       return c.json({ error: 'No agency found' }, 404)
     }
 
-    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ error: 'No agency found' }, 404)
 
     const previousTier = agency.subscriptionTier
 
-    await cloudDb.agency.update({
+    await db.agency.update({
       where: { id: agency.id },
       data: {
         subscriptionStatus: 'INACTIVE',
@@ -3597,7 +3564,7 @@ app.post('/subscription/unsubscribe', async (c) => {
       const downgradeSummary = await handleDowngrade(agency.id, 'BASIC')
 
       // Audit log for downgrade
-      await cloudDb.auditLog.create({
+      await db.auditLog.create({
         data: {
           userId,
           action: 'SUBSCRIPTION_DOWNGRADE',
@@ -3636,7 +3603,7 @@ app.patch('/working-hours', async (c) => {
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
 
-    const agency = await cloudDb.agency.update({
+    const agency = await db.agency.update({
       where: { id: agencyId },
       data: {
         ...(workingHoursStart !== undefined && { workingHoursStart }),
@@ -3745,7 +3712,7 @@ export async function handleDowngrade(
   newTier: string,
 ): Promise<DowngradeSummary> {
   // 1. Look up the target plan's limits
-  const targetPlan = await cloudDb.subscriptionPlan.findFirst({
+  const targetPlan = await db.subscriptionPlan.findFirst({
     where: { name: newTier, isActive: true },
   });
 
@@ -3762,7 +3729,7 @@ export async function handleDowngrade(
   const maxCounters = (targetPlan as Record<string, unknown>)?.maxCounters as number | undefined ?? maxStaff;
 
   // Count currently active counters for this agency
-  const activeCounters = await cloudDb.counter.findMany({
+  const activeCounters = await db.counter.findMany({
     where: {
       branch: { agencyId },
       isActive: true,
@@ -3775,7 +3742,7 @@ export async function handleDowngrade(
     const countersToDeactivate = activeCounters.slice(0, excess); // newest first
     const idsToDeactivate = countersToDeactivate.map((c) => c.id);
 
-    await cloudDb.counter.updateMany({
+    await db.counter.updateMany({
       where: { id: { in: idsToDeactivate } },
       data: { isActive: false },
     });
@@ -3791,7 +3758,7 @@ export async function handleDowngrade(
   const gracePeriodEndsAt = new Date();
   gracePeriodEndsAt.setDate(gracePeriodEndsAt.getDate() + gracePeriodDays);
 
-  await cloudDb.agency.update({
+  await db.agency.update({
     where: { id: agencyId },
     data: { gracePeriodEndsAt },
   });
@@ -3814,7 +3781,7 @@ app.get('/hardware', async (c) => {
   try {
     await requireAuth(c)
 
-    const settings = await cloudDb.hardwareSettings.findUnique({
+    const settings = await db.hardwareSettings.findUnique({
       where: { id: 'singleton' },
     })
 
@@ -3827,11 +3794,11 @@ app.get('/hardware', async (c) => {
     }
 
     const [products, commitmentTiers] = await Promise.all([
-      cloudDb.hardwareProduct.findMany({
+      db.hardwareProduct.findMany({
         where: { isActive: true },
         orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
       }),
-      cloudDb.hardwareCommitmentTier.findMany({
+      db.hardwareCommitmentTier.findMany({
         where: { isActive: true },
         orderBy: { sortOrder: 'asc' },
       }),
@@ -3854,7 +3821,7 @@ app.get('/hardware/orders', async (c) => {
       return c.json({ orders: [] })
     }
 
-    const orders = await cloudDb.hardwareOrder.findMany({
+    const orders = await db.hardwareOrder.findMany({
       where: { agencyId },
       include: {
         items: { include: { product: true } },
@@ -3898,14 +3865,14 @@ app.post('/hardware/orders', async (c) => {
     const { items, paymentModel, commitmentMonths } = validation.data
 
     // 1. Make sure hardware is enabled globally
-    const settings = await cloudDb.hardwareSettings.findUnique({ where: { id: 'singleton' } })
+    const settings = await db.hardwareSettings.findUnique({ where: { id: 'singleton' } })
     if (!settings || !settings.hardwareEnabled) {
       return c.json({ success: false, error: 'Hardware ordering is currently disabled' }, 403)
     }
 
     // 2. Snapshot current product prices (only active products can be ordered)
     const productIds = items.map((i) => i.productId)
-    const products = await cloudDb.hardwareProduct.findMany({
+    const products = await db.hardwareProduct.findMany({
       where: { id: { in: productIds }, isActive: true },
     })
 
@@ -3939,7 +3906,7 @@ app.post('/hardware/orders', async (c) => {
       monthlyExtra = 0
     } else {
       // MONTHLY — look up the commitment tier
-      const tier = await cloudDb.hardwareCommitmentTier.findFirst({
+      const tier = await db.hardwareCommitmentTier.findFirst({
         where: { months: commitmentMonths!, isActive: true },
       })
       if (!tier) {
@@ -3952,7 +3919,7 @@ app.post('/hardware/orders', async (c) => {
     }
 
     // 4. Create the order + items in a single transaction
-    const order = await cloudDb.$transaction(async (tx) => {
+    const order = await db.$transaction(async (tx) => {
       const created = await tx.hardwareOrder.create({
         data: {
           agencyId,
@@ -4030,7 +3997,7 @@ app.post('/enterprise-request', async (c) => {
       requestedFeatures,
     } = validation.data
 
-    const agency = await cloudDb.agency.findUnique({
+    const agency = await db.agency.findUnique({
       where: { id: agencyId },
       select: { id: true, name: true },
     })
@@ -4038,7 +4005,7 @@ app.post('/enterprise-request', async (c) => {
       return c.json({ success: false, error: 'Agency not found' }, 404)
     }
 
-    const request = await cloudDb.enterpriseContractRequest.create({
+    const request = await db.enterpriseContractRequest.create({
       data: {
         agencyId,
         agencyName: agency.name,
@@ -4053,7 +4020,7 @@ app.post('/enterprise-request', async (c) => {
       },
     })
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: user.id,
         action: 'ENTERPRISE_REQUEST_CREATE',
@@ -4087,7 +4054,7 @@ app.get('/enterprise-request', async (c) => {
       return c.json({ requests: [] })
     }
 
-    const requests = await cloudDb.enterpriseContractRequest.findMany({
+    const requests = await db.enterpriseContractRequest.findMany({
       where: { agencyId },
       orderBy: { createdAt: 'desc' },
     })
@@ -4114,7 +4081,7 @@ app.post('/subscription/cancel', async (c) => {
       return c.json({ success: false, error: 'No agency found for this user' }, 404)
     }
 
-    const agency = await cloudDb.agency.findUnique({
+    const agency = await db.agency.findUnique({
       where: { id: agencyId },
       select: { id: true, subscriptionTier: true, subscriptionStatus: true },
     })
@@ -4122,7 +4089,7 @@ app.post('/subscription/cancel', async (c) => {
       return c.json({ success: false, error: 'Agency not found' }, 404)
     }
 
-    await cloudDb.agency.update({
+    await db.agency.update({
       where: { id: agencyId },
       data: {
         subscriptionStatus: 'INACTIVE',
@@ -4133,7 +4100,7 @@ app.post('/subscription/cancel', async (c) => {
       },
     })
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: user.id,
         action: 'SUBSCRIPTION_CANCEL',
@@ -4162,13 +4129,13 @@ app.post('/subscription/cancel', async (c) => {
 app.get('/hardware', async (c) => {
   try {
     const user = await requireAuth(c)
-    const settings = await cloudDb.hardwareSettings.findUnique({ where: { id: 'singleton' } })
+    const settings = await db.hardwareSettings.findUnique({ where: { id: 'singleton' } })
     if (!settings?.hardwareEnabled) {
       return c.json({ products: [], commitmentTiers: [], settings: { hardwareEnabled: false, upfrontDiscount: 0 } })
     }
     const [products, commitmentTiers] = await Promise.all([
-      cloudDb.hardwareProduct.findMany({ where: { isActive: true }, orderBy: { sortOrder: 'asc' } }),
-      cloudDb.hardwareCommitmentTier.findMany({ where: { isActive: true }, orderBy: { sortOrder: 'asc' } }),
+      db.hardwareProduct.findMany({ where: { isActive: true }, orderBy: { sortOrder: 'asc' } }),
+      db.hardwareCommitmentTier.findMany({ where: { isActive: true }, orderBy: { sortOrder: 'asc' } }),
     ])
     return c.json({ products, commitmentTiers, settings })
   } catch (error) {
@@ -4183,7 +4150,7 @@ app.get('/hardware/orders', async (c) => {
     const user = await requireAuth(c)
     const agencyId = user.agencyId || await resolveUserAgencyId(user)
     if (!agencyId) return c.json({ orders: [] })
-    const orders = await cloudDb.hardwareOrder.findMany({
+    const orders = await db.hardwareOrder.findMany({
       where: { agencyId },
       include: { items: { include: { product: true } } },
       orderBy: { createdAt: 'desc' },
@@ -4215,7 +4182,7 @@ app.post('/hardware/orders', async (c) => {
       return c.json({ error: 'Invalid commitment period' }, 400)
     }
 
-    const settings = await cloudDb.hardwareSettings.findUnique({ where: { id: 'singleton' } })
+    const settings = await db.hardwareSettings.findUnique({ where: { id: 'singleton' } })
     if (!settings?.hardwareEnabled) {
       return c.json({ error: 'Hardware ordering is currently disabled' }, 403)
     }
@@ -4224,7 +4191,7 @@ app.post('/hardware/orders', async (c) => {
     let totalBasePrice = 0
     const orderItems = []
     for (const item of items) {
-      const product = await cloudDb.hardwareProduct.findUnique({ where: { id: item.productId } })
+      const product = await db.hardwareProduct.findUnique({ where: { id: item.productId } })
       if (!product || !product.isActive) {
         return c.json({ error: `Product not found or inactive: ${item.productId}` }, 400)
       }
@@ -4241,7 +4208,7 @@ app.post('/hardware/orders', async (c) => {
       const discount = settings.upfrontDiscount || 0
       upfrontTotal = Math.round(totalBasePrice * (1 - discount / 100))
     } else {
-      const tier = await cloudDb.hardwareCommitmentTier.findUnique({ where: { months: commitmentMonths } })
+      const tier = await db.hardwareCommitmentTier.findUnique({ where: { months: commitmentMonths } })
       if (!tier || !tier.isActive) {
         return c.json({ error: 'Invalid commitment tier' }, 400)
       }
@@ -4249,7 +4216,7 @@ app.post('/hardware/orders', async (c) => {
       monthlyExtra = Math.round((totalBasePrice * (1 + extraPercentage / 100)) / commitmentMonths)
     }
 
-    const order = await cloudDb.hardwareOrder.create({
+    const order = await db.hardwareOrder.create({
       data: {
         agencyId,
         paymentModel,
@@ -4264,7 +4231,7 @@ app.post('/hardware/orders', async (c) => {
       include: { items: { include: { product: true } } },
     })
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: user.id,
         action: 'HARDWARE_ORDER_CREATE',
@@ -4291,7 +4258,7 @@ app.get('/enterprise-request', async (c) => {
     const user = await requireAuth(c)
     const agencyId = user.agencyId || await resolveUserAgencyId(user)
     if (!agencyId) return c.json({ requests: [] })
-    const requests = await cloudDb.enterpriseContractRequest.findMany({
+    const requests = await db.enterpriseContractRequest.findMany({
       where: { agencyId },
       orderBy: { createdAt: 'desc' },
     })
@@ -4309,7 +4276,7 @@ app.post('/enterprise-request', async (c) => {
     const agencyId = user.agencyId || await resolveUserAgencyId(user)
     if (!agencyId) return c.json({ error: 'No agency found' }, 404)
 
-    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId }, select: { name: true } })
+    const agency = await db.agency.findUnique({ where: { id: agencyId }, select: { name: true } })
     if (!agency) return c.json({ error: 'Agency not found' }, 404)
 
     const body = await c.req.json()
@@ -4319,7 +4286,7 @@ app.post('/enterprise-request', async (c) => {
       return c.json({ error: 'Message and contact email are required' }, 400)
     }
 
-    const request = await cloudDb.enterpriseContractRequest.create({
+    const request = await db.enterpriseContractRequest.create({
       data: {
         agencyId,
         agencyName: agency.name,
@@ -4334,7 +4301,7 @@ app.post('/enterprise-request', async (c) => {
       },
     })
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: user.id,
         action: 'ENTERPRISE_REQUEST_CREATE',
@@ -4362,7 +4329,7 @@ app.post('/subscription/cancel', async (c) => {
     const agencyId = user.agencyId || await resolveUserAgencyId(user)
     if (!agencyId) return c.json({ error: 'No agency found' }, 404)
 
-    await cloudDb.agency.update({
+    await db.agency.update({
       where: { id: agencyId },
       data: {
         subscriptionStatus: 'INACTIVE',
@@ -4371,7 +4338,7 @@ app.post('/subscription/cancel', async (c) => {
       },
     })
 
-    await cloudDb.auditLog.create({
+    await db.auditLog.create({
       data: {
         userId: user.id,
         action: 'SUBSCRIPTION_CANCEL',

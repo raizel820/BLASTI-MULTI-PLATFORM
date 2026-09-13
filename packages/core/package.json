@@ -16,12 +16,6 @@
     },
     "./auth": {
       "default": "./src/auth.ts"
-    },
-    "./sync-registry": {
-      "default": "./src/sync-registry.ts"
-    },
-    "./sync-serializer": {
-      "default": "./src/sync-serializer.ts"
     }
   },
   "dependencies": {

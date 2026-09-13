@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { requireAuth, requireResourceOwnership, requireAgencyAccess, requireAdmin, authErrorResponse } from '../lib/auth'
 import { validateBody, createReviewSchema, replyToReviewSchema } from '../lib/validations'
 import { emitNotificationEvent } from '../lib/realtime-emit'
@@ -27,30 +27,30 @@ app.post('/', async (c) => {
 
     if (user.role !== 'CUSTOMER') return c.json({ error: 'Only customers can submit reviews' }, 403)
 
-    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ error: 'Agency not found' }, 404)
 
     if (reservationId) {
-      const reservation = await cloudDb.reservation.findUnique({ where: { id: reservationId } })
+      const reservation = await db.reservation.findUnique({ where: { id: reservationId } })
       if (!reservation) return c.json({ error: 'Reservation not found' }, 404)
       if (reservation.userId !== userId) return c.json({ error: 'You can only review your own reservations' }, 403)
       if (reservation.agencyId !== agencyId) return c.json({ error: 'Reservation does not belong to this agency' }, 400)
 
-      const existingReview = await cloudDb.review.findUnique({ where: { reservationId } })
+      const existingReview = await db.review.findUnique({ where: { reservationId } })
       if (existingReview) return c.json({ error: 'This reservation has already been reviewed' }, 400)
     }
 
-    const review = await cloudDb.review.create({
+    const review = await db.review.create({
       data: { rating, comment: comment?.trim() || null, userId, agencyId, reservationId: reservationId || null },
       include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
     })
 
     if (reservationId) {
-      await cloudDb.reservation.update({ where: { id: reservationId }, data: { rating } })
+      await db.reservation.update({ where: { id: reservationId }, data: { rating } })
       try {
-        await cloudDb.$executeRaw`UPDATE Reservation SET ratedAt = datetime('now') WHERE id = ${reservationId}`
+        await db.$executeRaw`UPDATE Reservation SET ratedAt = datetime('now') WHERE id = ${reservationId}`
         if (comment?.trim()) {
-          await cloudDb.$executeRaw`UPDATE Reservation SET feedback = ${comment.trim()} WHERE id = ${reservationId}`
+          await db.$executeRaw`UPDATE Reservation SET feedback = ${comment.trim()} WHERE id = ${reservationId}`
         }
       } catch {
         console.warn('[REVIEWS POST] Could not set feedback/ratedAt, columns may not exist')
@@ -74,21 +74,21 @@ app.get('/', async (c) => {
     const limit = Math.min(50, Math.max(1, parseInt(c.req.query('limit') || '20', 10)))
     const skip = (page - 1) * limit
 
-    const agency = await cloudDb.agency.findUnique({ where: { id: agencyId } })
+    const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ error: 'Agency not found' }, 404)
 
     const [reviews, total] = await Promise.all([
-      cloudDb.review.findMany({
+      db.review.findMany({
         where: { agencyId },
         include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit,
       }),
-      cloudDb.review.count({ where: { agencyId } }),
+      db.review.count({ where: { agencyId } }),
     ])
 
-    const ratingStats = await cloudDb.review.aggregate({ where: { agencyId }, _avg: { rating: true }, _count: { rating: true } })
+    const ratingStats = await db.review.aggregate({ where: { agencyId }, _avg: { rating: true }, _count: { rating: true } })
     const averageRating = ratingStats._avg.rating ? Math.round(ratingStats._avg.rating * 10) / 10 : 0
 
     return c.json({ success: true, reviews, averageRating, totalCount: total, page, limit, totalPages: Math.ceil(total / limit) })
@@ -111,7 +111,7 @@ app.patch('/:id', async (c) => {
 
     const { rating, comment } = validation.data
 
-    const review = await cloudDb.review.findUnique({ where: { id } })
+    const review = await db.review.findUnique({ where: { id } })
     if (!review) return c.json({ error: 'Review not found' }, 404)
 
     await requireResourceOwnership(c, review.userId)
@@ -120,7 +120,7 @@ app.patch('/:id', async (c) => {
     if (rating !== undefined) updateData.rating = rating
     if (comment !== undefined) updateData.comment = comment?.trim() || null
 
-    const updated = await cloudDb.review.update({
+    const updated = await db.review.update({
       where: { id },
       data: updateData,
       include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
@@ -128,11 +128,11 @@ app.patch('/:id', async (c) => {
 
     if (review.reservationId) {
       if (rating !== undefined) {
-        await cloudDb.reservation.update({ where: { id: review.reservationId }, data: { rating } })
+        await db.reservation.update({ where: { id: review.reservationId }, data: { rating } })
       }
       if (comment !== undefined) {
         try {
-          await cloudDb.$executeRaw`UPDATE Reservation SET feedback = ${comment?.trim() || null} WHERE id = ${review.reservationId}`
+          await db.$executeRaw`UPDATE Reservation SET feedback = ${comment?.trim() || null} WHERE id = ${review.reservationId}`
         } catch {
           console.warn('[REVIEWS PATCH] Could not set feedback, column may not exist')
         }
@@ -151,12 +151,12 @@ app.delete('/:id', async (c) => {
   try {
     const id = c.req.param('id')
 
-    const review = await cloudDb.review.findUnique({ where: { id } })
+    const review = await db.review.findUnique({ where: { id } })
     if (!review) return c.json({ error: 'Review not found' }, 404)
 
     try { await requireResourceOwnership(c, review.userId) } catch { await requireAdmin(c) }
 
-    await cloudDb.review.delete({ where: { id } })
+    await db.review.delete({ where: { id } })
 
     return c.json({ success: true })
   } catch (error: unknown) {
@@ -180,12 +180,12 @@ app.post('/:id/reply', async (c) => {
 
     await requireAgencyAccess(c, agencyId)
 
-    const review = await cloudDb.review.findUnique({ where: { id } })
+    const review = await db.review.findUnique({ where: { id } })
     if (!review) return c.json({ error: 'Review not found' }, 404)
 
     if (review.agencyId !== agencyId) return c.json({ error: 'Only the reviewed agency can reply' }, 403)
 
-    const updated = await cloudDb.review.update({
+    const updated = await db.review.update({
       where: { id },
       data: { replyText: reply.trim(), repliedAt: new Date() },
       include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },

@@ -7,7 +7,7 @@
  */
 
 import { Hono } from 'hono'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { requireAuth, authErrorResponse } from '../lib/auth'
 import { generateImportToken, verifyQRToken } from '../lib/qr-token-service'
 import { emitQueueEvent, emitReservationEvent, emitKioskEvent } from '../lib/realtime-emit'
@@ -33,7 +33,7 @@ app.post('/generate', async (c) => {
     }
 
     // Find the reservation and verify ownership
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id: reservationId },
       include: {
         agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
@@ -67,7 +67,7 @@ app.post('/generate', async (c) => {
     const token = generateImportToken(reservation.id, reservation.agencyId, customerId)
 
     // Save the token to the reservation
-    await cloudDb.reservation.update({
+    await db.reservation.update({
       where: { id: reservationId },
       data: { importToken: token },
     })
@@ -126,7 +126,7 @@ app.post('/claim', async (c) => {
     }
 
     // Find the reservation
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id: payload.reservationId },
       include: {
         agency: { select: { id: true, name: true, nameAr: true, nameFr: true } },
@@ -170,7 +170,7 @@ app.post('/claim', async (c) => {
 
     // Mark the reservation as claimed and checked-in
     const now = new Date()
-    await cloudDb.reservation.update({
+    await db.reservation.update({
       where: { id: reservation.id },
       data: {
         qrClaimedAt: now,
@@ -251,7 +251,7 @@ app.get('/verify/:token', async (c) => {
     }
 
     // Find the reservation for preview
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id: payload.reservationId },
       include: {
         agency: { select: { id: true, name: true, nameAr: true, nameFr: true, category: true } },

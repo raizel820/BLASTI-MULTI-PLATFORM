@@ -4,6 +4,7 @@ import { ThemeProvider } from "next-themes";
 import { AuthProvider } from "@/components/providers/auth-provider";
 import { ErrorBoundary } from "@/components/shared/error-boundary";
 import { PlatformProvider } from "@/hooks/use-platform";
+import { DatabaseProvider } from "@/db/provider";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -41,11 +42,13 @@ export default function RootLayout({
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground font-[family-name:var(--font-geist-sans)]`}>
         <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
           <PlatformProvider>
-            <AuthProvider>
-              <ErrorBoundary>
-                {children}
-              </ErrorBoundary>
-            </AuthProvider>
+            <DatabaseProvider>
+              <AuthProvider>
+                <ErrorBoundary>
+                  {children}
+                </ErrorBoundary>
+              </AuthProvider>
+            </DatabaseProvider>
           </PlatformProvider>
         </ThemeProvider>
       </body>

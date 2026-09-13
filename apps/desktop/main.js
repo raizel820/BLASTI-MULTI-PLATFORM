@@ -18,16 +18,6 @@
  *   - Auto-update support (via electron-updater, optional)
  */
 
-// ─── DEPRECATED FILES — DO NOT IMPORT ──────────────────────────────────────
-// The following files/modules are DEPRECATED and MUST NOT be imported anywhere
-// in the codebase. Importing them will cause runtime errors or undefined behavior.
-//
-//   • apps/desktop/local-api/server.ts       → Replaced by cloud API + offline-sync
-//   • apps/desktop/local-api/routes/*.ts     → All local API routes are deprecated
-//   • packages/db/index.ts (local SQLite)    → Use @blasti/cloud-db for cloud ops
-//   • apps/desktop/preload-*.js              → Legacy preload scripts (use preload.js)
-// ────────────────────────────────────────────────────────────────────────────
-
 const {
   app,
   BrowserWindow,
@@ -91,22 +81,10 @@ const isDev =
     try { return require('electron-is-dev'); } catch { return false; }
   })();
 
-// ─── Propagate dev mode to process.env ──────────────────────────────────────
-// CRITICAL: Subprocesses and required modules (local-api, sync-service) check
-// process.env.ELECTRON_DEV and process.env.NODE_ENV to determine cloud URL.
-// Without this, getCloudUrl() falls back to production URLs even in dev mode.
-if (isDev) {
-  process.env.ELECTRON_DEV = '1';
-  if (!process.env.NODE_ENV) process.env.NODE_ENV = 'development';
-}
-
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEV_URL = 'http://localhost:3000';
-// Production cloud API URL — MUST point to the API server, NOT the Next.js frontend.
-// ✅ https://blasti-api.vercel.app  (Hono API server)
-// ❌ https://blasti.vercel.app       (Next.js frontend — will 404 on /api/*)
-const PROD_URL = process.env.BLASTI_API_URL || 'https://blasti-api.vercel.app';
+const PROD_URL = process.env.BLASTI_API_URL || 'https://blasti.vercel.app';
 const PROTOCOL = 'blasti';
 
 // Path to bundled static web files (from Next.js export)
@@ -453,10 +431,7 @@ function createWindow() {
   // Handle navigation — prevent the app from navigating away from the web app
   mainWindow.webContents.on('will-navigate', (event, url) => {
     const allowedOrigins = [
-      'http://127.0.0.1:3080',
-      'http://localhost:3080',
       'http://localhost:3000',
-      'http://localhost:5173',
       PROD_URL,
     ];
 
@@ -567,85 +542,127 @@ function buildErrorPage(errorCode, errorDesc, url) {
 }
 
 function loadApp() {
-  // ─── NEW ARCHITECTURE ──────────────────────────────────────────────
-  // The desktop app now uses a DEDICATED frontend (Vite React SPA) that
-  // is served by the local API server on 127.0.0.1:3080.
-  //
-  // This frontend ONLY talks to the local API — never to the cloud directly.
-  // The local API handles everything locally via SQLite and syncs with the
-  // cloud in the background when online.
-  //
-  // Old architecture:  Electron → Next.js web app → cloud API (failover to local API)
-  // New architecture:   Electron → Desktop SPA (served by local API) → local API → SQLite
-  //                                                                          ↕
-  //                                                                    Sync → Cloud API
-  //
-  // Benefits:
-  //   - Works fully offline (no cloud dependency for UI)
-  //   - No complex failover logic in the frontend
-  //   - Desktop-optimized UI (not a web browser app)
-  //   - Local API always available (embedded in Electron main process)
+  if (isDev) {
+    // Development: probe localhost:3000 first to check if Next.js dev server is running.
+    // If it's not running, immediately show an error page with instructions.
+    // This avoids the hidden-window problem when loadURL silently fails.
+    console.log('[BLASTI Desktop] Checking if dev server is running at ' + DEV_URL + '...');
 
-  const LOCAL_API_URL = 'http://127.0.0.1:3080';
+    const probe = net.request(DEV_URL);
+    let settled = false;
 
-  console.log('[BLASTI Desktop] Loading desktop frontend from ' + LOCAL_API_URL);
+    const loadDevPage = () => {
+      if (settled) return;
+      settled = true;
+      try { probe.abort(); } catch { /* ignore */ }
+      console.log('[BLASTI Desktop] Loading ' + DEV_URL);
+      mainWindow.loadURL(DEV_URL);
+    };
 
-  // Probe the local API to make sure it's serving the frontend
-  const probe = net.request(LOCAL_API_URL);
-  let settled = false;
-
-  const loadDesktopFrontend = () => {
-    if (settled) return;
-    settled = true;
-    try { probe.abort(); } catch { /* ignore */ }
-    console.log('[BLASTI Desktop] Loading desktop frontend from local API');
-    mainWindow.loadURL(LOCAL_API_URL);
-  };
-
-  const showErrorPage = () => {
-    if (settled) return;
-    settled = true;
-    try { probe.abort(); } catch { /* ignore */ }
-    console.error('[BLASTI Desktop] Local API not responding — showing error page');
-    const errorHTML = buildErrorPage(-102, 'ERR_CONNECTION_REFUSED', LOCAL_API_URL);
-    mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(errorHTML)).catch(() => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.show();
-        mainWindow.focus();
-      }
-    });
-  };
-
-  // 5-second timeout for the probe
-  const timeout = setTimeout(() => {
-    console.warn('[BLASTI Desktop] Local API probe timed out');
-    showErrorPage();
-  }, 5000);
-
-  probe.on('response', () => {
-    clearTimeout(timeout);
-    loadDesktopFrontend();
-  });
-
-  probe.on('error', () => {
-    clearTimeout(timeout);
-    // Retry once after a short delay (local API might still be starting up)
-    setTimeout(() => {
-      const retryProbe = net.request(LOCAL_API_URL);
-      const retryTimeout = setTimeout(showErrorPage, 3000);
-      retryProbe.on('response', () => {
-        clearTimeout(retryTimeout);
-        loadDesktopFrontend();
+    const showErrorPage = () => {
+      if (settled) return;
+      settled = true;
+      try { probe.abort(); } catch { /* ignore */ }
+      console.warn('[BLASTI Desktop] Dev server not running at ' + DEV_URL + ' — showing error page');
+      const errorHTML = buildErrorPage(-102, 'ERR_CONNECTION_REFUSED', DEV_URL);
+      mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(errorHTML)).catch(() => {
+        // Last resort: show the window even with blank content
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.show();
+          mainWindow.focus();
+        }
       });
-      retryProbe.on('error', () => {
-        clearTimeout(retryTimeout);
-        showErrorPage();
-      });
-      try { retryProbe.end(); } catch { showErrorPage(); }
+    };
+
+    // Quick timeout: 2 seconds is enough to detect connection refused
+    const timeout = setTimeout(() => {
+      console.warn('[BLASTI Desktop] Dev server probe timed out');
+      showErrorPage();
     }, 2000);
-  });
 
-  try { probe.end(); } catch { showErrorPage(); }
+    probe.on('response', () => {
+      clearTimeout(timeout);
+      loadDevPage();
+    });
+
+    probe.on('error', () => {
+      clearTimeout(timeout);
+      showErrorPage();
+    });
+
+    try { probe.end(); } catch { showErrorPage(); }
+    return;
+  }
+
+  // Check if bundled static files exist
+  const indexPath = path.join(STATIC_WEB_DIR, 'index.html');
+  const hasBundledFiles = fs.existsSync(indexPath);
+
+  // If BLASTI_REMOTE_URL is set, prefer remote loading
+  const remoteUrl = process.env.BLASTI_REMOTE_URL;
+
+  if (remoteUrl) {
+    // Explicit remote URL mode — probe the server first
+    const request = net.request(remoteUrl);
+    let settled = false;
+    const fallback = () => {
+      if (settled) return;
+      settled = true;
+      try { request.abort(); } catch { /* ignore */ }
+      if (hasBundledFiles) {
+        mainWindow.loadFile(indexPath);
+      } else {
+        mainWindow.loadURL(
+          `data:text/html;charset=utf-8,${encodeURIComponent(OFFLINE_HTML)}`
+        );
+      }
+    };
+    // Electron's net.request does NOT have setTimeout — use a manual timer
+    const timeout = setTimeout(fallback, 5000);
+    request.on('response', () => {
+      clearTimeout(timeout);
+      if (settled) return;
+      settled = true;
+      mainWindow.loadURL(remoteUrl);
+    });
+    request.on('error', () => {
+      clearTimeout(timeout);
+      fallback();
+    });
+    try { request.end(); } catch { fallback(); }
+    return;
+  }
+
+  // Default production: load bundled static files
+  if (hasBundledFiles) {
+    mainWindow.loadFile(indexPath);
+    return;
+  }
+
+  // Fallback: try remote URL
+  const request = net.request(PROD_URL);
+  let settled = false;
+  const fallback = () => {
+    if (settled) return;
+    settled = true;
+    try { request.abort(); } catch { /* ignore */ }
+    mainWindow.loadURL(
+      `data:text/html;charset=utf-8,${encodeURIComponent(OFFLINE_HTML)}`
+    );
+  };
+  // Electron's net.request does NOT have setTimeout — use a manual timer
+  const timeout = setTimeout(fallback, 5000);
+  request.on('response', () => {
+    clearTimeout(timeout);
+    if (settled) return;
+    settled = true;
+    mainWindow.loadURL(PROD_URL);
+  });
+  request.on('error', () => {
+    clearTimeout(timeout);
+    fallback();
+  });
+  try { request.end(); } catch { fallback(); }
 }
 
 // ─── Loading Screen ───────────────────────────────────────────────────────────
@@ -1065,15 +1082,13 @@ ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
     syncService.setAuth(token, user);
 
     // Ensure sync service is started (it may not have been started yet)
-    // The sync service will check AgencyLocalState and only start pulling
-    // if status is READY. Initial sync is handled separately by initial-sync.js.
     try {
       const { localDb } = require('./local-api/lib/db');
       if (localDb && !syncService.getStatus()?.isStarted) {
         const isDevMode = process.env.NODE_ENV === 'development' || process.env.ELECTRON_DEV === '1';
         const syncCloudUrl = isDevMode
           ? (process.env.BLASTI_API_URL || 'http://localhost:3003')
-          : (process.env.BLASTI_CLOUD_URL || 'https://blasti-api.vercel.app');
+          : (process.env.BLASTI_CLOUD_URL || 'https://blasti.vercel.app');
         syncService.startSync({
           localDb,
           cloudBaseUrl: syncCloudUrl,
@@ -1085,13 +1100,18 @@ ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
       console.warn('[IPC] Failed to start sync service:', startErr.message);
     }
 
-    // NOTE: We do NOT call syncService.initialSync() here.
-    // Initial sync (first-time bulk import) is handled by initial-sync.js,
-    // which is triggered separately and uses the POST /api/sync/initial-data
-    // endpoint. The sync service only handles incremental sync and will
-    // check AgencyLocalState.status === 'READY' before pulling.
-    // Calling both initialSync() and startSync() simultaneously caused
-    // competing sync mechanisms and data corruption.
+    // Trigger immediate initial sync to pull all agency data from cloud
+    try {
+      syncService.initialSync().then((result) => {
+        if (result?.success) {
+          console.log('[IPC] Initial sync after login: pulled', result.pulled, 'pushed', result.pushed);
+        } else {
+          console.warn('[IPC] Initial sync after login failed:', result?.error);
+        }
+      }).catch((err) => {
+        console.warn('[IPC] Initial sync after login error:', err.message);
+      });
+    } catch { /* non-blocking */ }
 
     // Persist auth to file so the loading screen can import agency data on next launch
     try {
@@ -1165,50 +1185,8 @@ ipcMain.handle('cloud-sync:trigger', async () => {
 
 ipcMain.handle('cloud-sync:initial-sync', async () => {
   try {
-    // Use initial-sync.js (not syncService.initialSync) for proper staged import
-    // via POST /api/sync/initial-data
-    const initialSync = require('./local-api/initial-sync');
-    const { localDb } = require('./local-api/lib/db');
     const syncService = require('./local-api/sync-service');
-
-    // Get auth info from sync service
-    const status = syncService.getStatus();
-    if (!status?.isStarted || !localDb) {
-      return { success: false, error: 'Sync service not initialized' };
-    }
-
-    const isDevMode = process.env.NODE_ENV === 'development' || process.env.ELECTRON_DEV === '1';
-    const syncCloudUrl = isDevMode
-      ? (process.env.BLASTI_API_URL || 'http://localhost:3003')
-      : (process.env.BLASTI_CLOUD_URL || 'https://blasti-api.vercel.app');
-
-    // Get auth token from sync service internals
-    const authToken = syncService._getAuthToken ? syncService._getAuthToken() : null;
-    if (!authToken) {
-      return { success: false, error: 'No auth token available' };
-    }
-
-    const agencyId = syncService._getAgencyId ? syncService._getAgencyId() : (status.agencyId || '');
-    if (!agencyId) {
-      return { success: false, error: 'No agency ID available' };
-    }
-
-    const result = await initialSync.runInitialSync({
-      agencyId,
-      cloudAuthToken: authToken,
-      cloudUrl: syncCloudUrl,
-      db: localDb,
-      emitFn: (event) => {
-        // Forward events to renderer if needed
-        try {
-          const win = BrowserWindow.getAllWindows()[0];
-          if (win && !win.isDestroyed()) {
-            win.webContents.send('initial-sync:event', event);
-          }
-        } catch { /* ignore */ }
-      },
-    });
-
+    const result = await syncService.initialSync();
     return result;
   } catch (err) {
     console.error('[IPC] cloud-sync:initial-sync failed:', err.message);
@@ -1410,7 +1388,7 @@ app.whenReady().then(async () => {
               process.env.ELECTRON_DEV === '1';
     const cloudBaseUrl = isDevMode
       ? (process.env.BLASTI_API_URL || 'http://localhost:3003')
-      : (process.env.BLASTI_CLOUD_URL || 'https://blasti-api.vercel.app');
+      : (process.env.BLASTI_CLOUD_URL || 'https://blasti.vercel.app');
 
     // Wait for the loading screen renderer to register its listeners.
     // Without this, early IPC events may fire before the renderer is ready.

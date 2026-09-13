@@ -204,10 +204,20 @@ export function canAccess(
 }
 
 /**
- * Get all resources a role can read.
+ * Get all resources a role can perform a specific action on.
+ *
+ * Supports 'read' | 'write' | 'delete' (parity with web's lib/rbac.ts).
+ * Defaults to 'read' for backwards compatibility with callers that
+ * only pass a role.
  */
-export function getAllowedResources(role: Role): string[] {
+export function getAllowedResources(
+  role: Role,
+  action: 'read' | 'write' | 'delete' = 'read',
+): string[] {
   return Object.entries(PERMISSION_MATRIX)
-    .filter(([_, rolePerms]) => rolePerms[role]?.read !== 'none')
+    .filter(([_, rolePerms]) => {
+      const perm = rolePerms[role]
+      return perm && perm[action] !== 'none'
+    })
     .map(([resource]) => resource)
 }

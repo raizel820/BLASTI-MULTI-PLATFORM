@@ -12,7 +12,7 @@
  *   5. Cron sweeper cleans up stale DEFERRED_OFFLINE reservations > 24h
  */
 
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -61,7 +61,7 @@ export async function syncOfflineReservation(
   userId: string
 ): Promise<SyncResult> {
   // 1. Validate agency and service
-  const agency = await cloudDb.agency.findUnique({
+  const agency = await db.agency.findUnique({
     where: { id: offlineReservation.agencyId },
     include: {
       services: { where: { id: offlineReservation.serviceId } },
@@ -93,7 +93,7 @@ export async function syncOfflineReservation(
   }
 
   // 3. Check for duplicate (same user, same agency, same service, same offline time, same device)
-  const existing = await cloudDb.reservation.findFirst({
+  const existing = await db.reservation.findFirst({
     where: {
       userId,
       agencyId: offlineReservation.agencyId,
@@ -108,7 +108,7 @@ export async function syncOfflineReservation(
   }
 
   // 4. Check if queue is full
-  const activeCount = await cloudDb.reservation.count({
+  const activeCount = await db.reservation.count({
     where: {
       agencyId: offlineReservation.agencyId,
       serviceId: offlineReservation.serviceId,
@@ -120,7 +120,7 @@ export async function syncOfflineReservation(
   }
 
   // 5. Get next queue number
-  const lastReservation = await cloudDb.reservation.findFirst({
+  const lastReservation = await db.reservation.findFirst({
     where: { agencyId: offlineReservation.agencyId, serviceId: offlineReservation.serviceId },
     orderBy: { queueNumber: 'desc' },
     select: { queueNumber: true },
@@ -129,7 +129,7 @@ export async function syncOfflineReservation(
   const queueNumber = (lastReservation?.queueNumber || 0) + 1
 
   // 6. Calculate ETA
-  const waitingCount = await cloudDb.reservation.count({
+  const waitingCount = await db.reservation.count({
     where: {
       agencyId: offlineReservation.agencyId,
       serviceId: offlineReservation.serviceId,
@@ -144,7 +144,7 @@ export async function syncOfflineReservation(
   const displayNumber = `${service.prefix}${queueNumber}`
 
   // 8. Create the reservation — convert from DEFERRED_OFFLINE to WAITING
-  const reservation = await cloudDb.reservation.create({
+  const reservation = await db.reservation.create({
     data: {
       userId,
       agencyId: offlineReservation.agencyId,
@@ -170,7 +170,7 @@ export async function syncOfflineReservation(
 
   // 9. Update queue settings lastIssuedNumber
   if (agency.queueSettings.length > 0) {
-    await cloudDb.queueSettings.update({
+    await db.queueSettings.update({
       where: { id: agency.queueSettings[0].id },
       data: { lastIssuedNumber: queueNumber },
     })
@@ -214,21 +214,21 @@ export async function getDeviceSyncStatus(
   lastSyncAt: Date | null
 }> {
   const [pending, synced, conflicted] = await Promise.all([
-    cloudDb.reservation.count({
+    db.reservation.count({
       where: {
         syncDeviceId: deviceId,
         userId,
         status: 'DEFERRED_OFFLINE',
       },
     }),
-    cloudDb.reservation.count({
+    db.reservation.count({
       where: {
         syncDeviceId: deviceId,
         userId,
         syncedAt: { not: null },
       },
     }),
-    cloudDb.reservation.count({
+    db.reservation.count({
       where: {
         syncDeviceId: deviceId,
         userId,
@@ -237,7 +237,7 @@ export async function getDeviceSyncStatus(
     }),
   ])
 
-  const lastSynced = await cloudDb.reservation.findFirst({
+  const lastSynced = await db.reservation.findFirst({
     where: {
       syncDeviceId: deviceId,
       userId,

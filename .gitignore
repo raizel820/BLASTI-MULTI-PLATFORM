@@ -80,3 +80,7 @@ api.log
 /examples/
 Caddyfile
 ops/.next/
+
+# dev tooling caches
+.schema-stamp
+packages/db/.schema-stamp

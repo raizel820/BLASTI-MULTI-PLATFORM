@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import QRCode from 'qrcode'
 import { createHmac, timingSafeEqual } from 'crypto'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { requireAuth, authErrorResponse } from '../lib/auth'
 import { generateImportToken, verifyQRToken } from '../lib/qr-token-service'
 import { enforceRateLimit, PUBLIC_RATE_LIMIT, GENERAL_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
@@ -144,7 +144,7 @@ app.get('/import/:reservationId', async (c) => {
     }
 
     // Find the reservation
-    const reservation = await cloudDb.reservation.findUnique({
+    const reservation = await db.reservation.findUnique({
       where: { id: reservationId },
       include: {
         agency: { select: { id: true, name: true } },
@@ -168,7 +168,7 @@ app.get('/import/:reservationId', async (c) => {
     if (!token) {
       const customerId = reservation.userId || reservation.walkInCustomerName || ''
       token = generateImportToken(reservation.id, reservation.agencyId, customerId)
-      await cloudDb.reservation.update({
+      await db.reservation.update({
         where: { id: reservationId },
         data: { importToken: token },
       })
@@ -179,7 +179,7 @@ app.get('/import/:reservationId', async (c) => {
         // Token expired, regenerate
         const customerId = reservation.userId || reservation.walkInCustomerName || ''
         token = generateImportToken(reservation.id, reservation.agencyId, customerId)
-        await cloudDb.reservation.update({
+        await db.reservation.update({
           where: { id: reservationId },
           data: { importToken: token },
         })

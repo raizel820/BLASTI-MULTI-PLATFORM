@@ -1413,7 +1413,7 @@ const fr: Record<TranslationKeys, string> = {
   sevenDayTrend: "Tendance 7 jours",
   todayCount: "aujourd'hui",
   phonePlaceholder: "05XX XXX XXX",
-  inEnglish: "(Anglais)",
+  // DUPLICATE REMOVED (3-c): inEnglish: "(Anglais)",
   serviceNamePlaceholder: "Consultation générale",
   languageEnglish: "Anglais",
   languageArabic: "Arabe",
@@ -2190,7 +2190,7 @@ const fr: Record<TranslationKeys, string> = {
   reviewing: 'En cours de révision',
   fulfilled: 'Livré',
 
-  enterprisePlanDesc:
+  enterpriseRequestDesc:
     'Besoin d\'un plan sur mesure pour un grand réseau ? Demandez un contrat entreprise personnalisé avec des fonctionnalités, du matériel et des SLA dédiés.',
   requestEnterprise: 'Demander un plan entreprise',
   enterpriseMessage: 'Message',
@@ -2301,7 +2301,8 @@ const fr: Record<TranslationKeys, string> = {
   // DUPLICATE REMOVED: enterprisePlan: 'Plan entreprise',
   yourEnterprisePlan: 'Votre plan entreprise',
   enterprisePlanBadge: 'ENTREPRISE',
-  // DUPLICATE REMOVED: enterprisePlanDesc: 'Il s\'agit d\'un plan personnalisé conçu spécifiquement pour votre institution. Il n\'est pas disponible pour les autres agences.',
+  // RESTORED (closeout 4-e): LIVE enterprisePlanDesc (institution-tailored plan); earlier string renamed to enterpriseRequestDesc.
+  enterprisePlanDesc: 'Il s\'agit d\'un plan personnalisé conçu spécifiquement pour votre institution. Il n\'est pas disponible pour les autres agences.',
   cancelEnterprisePlan: 'Annuler le plan entreprise',
   upgradeEnterprisePlan: 'Améliorer',
   downgradeEnterprisePlan: 'Rétrograder',
@@ -2722,6 +2723,64 @@ const fr: Record<TranslationKeys, string> = {
   addToQueue: 'Ajouter à la file',
   customerName: 'Nom du client',
   autoDetect: 'Détection auto',
+
+  // ─── Conflict Resolution & Counter Selection ──────────────
+  selectCounter: 'Choisir un guichet',
+  syncConflictsTitle: 'Conflits de synchronisation',
+  syncConflictsDesc: 'Certaines modifications sont en conflit avec la version du serveur. Choisissez la version à conserver.',
+  keepLocal: 'Garder la version locale',
+  keepServer: 'Garder la version du serveur',
+  local: 'Local',
+  server: 'Serveur',
+  localVersion: 'Version locale',
+  serverVersion: 'Version du serveur',
+  noConflicts: 'Aucun conflit à résoudre',
+  resolveAllLocal: 'Tout garder en local',
+  resolveAllServer: 'Tout garder du serveur',
+  resolved: 'résolu(s)',
+  conflictSingular: 'conflit',
+  conflictPlural: 'conflits',
+  done: 'Terminé',
+
+  // ─── History Export ──────────────
+  fromDate: 'Du',
+  toDate: 'Au',
+
+  // ─── Sync Status UI (Desktop) ──────────────
+  syncStatusDesc: 'Détails de la synchronisation des données entre cet appareil et le cloud.',
+  currentStatus: 'État actuel',
+  allSynced: 'Tout est synchronisé',
+  allDataUpToDate: 'Toutes les données sont à jour',
+  pendingChanges: 'modifications en attente',
+  changesAwaitingSync: 'Modifications en attente de synchronisation',
+  syncErrorLabel: 'Erreur de synchronisation',
+  abandonedChanges: 'Modifications abandonnées',
+  connection: 'Connexion',
+  lastSuccessfulSync: 'Dernière synchronisation réussie',
+  lastSyncAttempt: 'Dernière tentative',
+  conflicts: 'Conflits',
+  offlineTokenRemaining: 'Session hors ligne restante',
+  protocolVersion: 'Version du protocole de synchronisation',
+  forceSyncNow: 'Forcer la synchronisation',
+  syncNow: 'Synchroniser',
+  retrySync: 'Réessayer la synchronisation',
+  noSyncData: 'Aucune donnée de synchronisation',
+  never: 'Jamais',
+  secondsAgo: 'il y a {count}s',
+  minutesAgo: 'il y a {count} min',
+  hoursAgo: 'il y a {count} h',
+  daysAgo: 'il y a {count} j',
+
+  // ─── Sidebar Navigation (missing keys) ──────────────
+  queue: 'File d\'attente',
+  staff: 'Personnel',
+  qrCode: 'Code QR',
+  alerts: 'Alertes',
+
+  // ─── Offline Session Expired (offline-token window lapsed) ──────────────
+  offlineExpiredTitle: 'Session hors ligne expirée',
+  offlineExpiredDesc: 'Cet appareil n\'a pas contacté le cloud dans la fenêtre autorisée ({days} jours) ; la session hors ligne a expiré. Reconnectez-vous pour resynchroniser vos données et continuer.',
+  offlineExpiredAction: 'Se reconnecter',
 };
 
 export default fr;
