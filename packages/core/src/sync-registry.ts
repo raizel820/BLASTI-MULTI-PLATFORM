@@ -143,7 +143,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: false,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 1,
+    syncOrder: 4,
     dateFields: ['createdAt', 'updatedAt', 'gracePeriodEndsAt', 'subscriptionStartsAt', 'subscriptionExpiresAt', 'syncedAt'],
   },
 
@@ -173,7 +173,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: false,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 2,
+    syncOrder: 1,
     dateFields: ['createdAt', 'updatedAt', 'lastRoleChangeAt', 'syncedAt'],
   },
 
@@ -202,7 +202,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: false,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 3,
+    syncOrder: 7,
     dateFields: ['joinedAt', 'createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -226,7 +226,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: true,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 4,
+    syncOrder: 6,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -274,7 +274,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: true,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 6,
+    syncOrder: 8,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -300,7 +300,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: true,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 7,
+    syncOrder: 9,
     dateFields: ['pausedAt', 'openedAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -336,7 +336,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: true,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 8,
+    syncOrder: 10,
     dateFields: [
       'joinedAt', 'calledAt', 'completedAt', 'cancelledAt', 'ratedAt',
       'reminderSentAt', 'smsReminderSentAt', 'skippedAt', 'reclaimRequestedAt',
@@ -372,7 +372,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: false,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 9,
+    syncOrder: 11,
     dateFields: ['reviewedAt', 'reconciledAt', 'createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -400,7 +400,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: true,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 10,
+    syncOrder: 12,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -427,7 +427,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: true,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 11,
+    syncOrder: 13,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -451,7 +451,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: false,
     canDeleteOffline: false,
     isReadOnly: true,
-    syncOrder: 12,
+    syncOrder: 14,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -475,7 +475,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: true,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 13,
+    syncOrder: 15,
     dateFields: ['expiresAt', 'createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -499,7 +499,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: false,
     canDeleteOffline: false,
     isReadOnly: true,
-    syncOrder: 14,
+    syncOrder: 16,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -523,7 +523,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: true,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 15,
+    syncOrder: 17,
     dateFields: ['repliedAt', 'createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -547,7 +547,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: false,
     canDeleteOffline: true,
     isReadOnly: false,
-    syncOrder: 16,
+    syncOrder: 18,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -571,7 +571,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: true,
     canDeleteOffline: false,
     isReadOnly: false,
-    syncOrder: 17,
+    syncOrder: 19,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -604,7 +604,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: false,
     canDeleteOffline: false,
     isReadOnly: true,
-    syncOrder: 18,
+    syncOrder: 2,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
@@ -628,7 +628,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canUpdateOffline: false,
     canDeleteOffline: false,
     isReadOnly: true,
-    syncOrder: 19,
+    syncOrder: 3,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 

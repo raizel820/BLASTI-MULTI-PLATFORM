@@ -937,7 +937,7 @@ export function DeviceKiosk() {
     // Wait briefly for LAN discovery to complete first
     const timer = setTimeout(tryAutoConnect, 2000);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   // ─── Offline Ticket Issuance ───────────────────────────────
   const handleOfflineJoinQueue = useCallback(() => {

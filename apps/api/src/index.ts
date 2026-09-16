@@ -64,6 +64,10 @@ import { qrClaimRoutes } from './routes/qr-claim'
 import { agencyDeviceRoutes } from './routes/agency-devices'
 import { appVersionRoutes } from './routes/app-versions'
 import { db, setupSQLitePragmas } from '@blasti/db'
+import { initialSyncRoutes } from './routes/initial-sync'
+import { idempotencyGuard } from './lib/idempotency-middleware'
+import { setSyncNotifyIo, startSyncNotifyTimer } from './lib/sync-notify'
+import { installSyncTracking, pruneSyncChanges } from './lib/sync-helpers'
 import { cancelPendingCustomerAlerts } from './lib/cancel-pending-alerts'
 import { startNotificationWorker, stopNotificationWorker } from './workers/notification-worker'
 
@@ -154,12 +158,18 @@ app.use('*', cors({
     'file://',
   ],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-internal-secret'],
-  exposeHeaders: ['Set-Cookie'],
+  allowHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-internal-secret', 'X-Idempotency-Key'],
+  exposeHeaders: ['Set-Cookie', 'X-Idempotency-Replayed'],
   credentials: true,
   maxAge: 86400,
 }))
 app.use('*', logger())
+
+// ─── Outbox Idempotency Guard (sync v2) ────────────────────────────────────
+// Route-agnostic: for mutation requests carrying X-Idempotency-Key, dedupes
+// replays via the SyncMutation ledger and stamps the sync request context so
+// SyncChange rows carry the origin mutationId. No-op without the header.
+app.use('/api/*', idempotencyGuard)
 
 // ─── Global API Rate Limiting Middleware ────────────────────────────────────
 //
@@ -278,6 +288,16 @@ app.get('/health', (c) => {
   })
 })
 
+// Canonical /api/health alias — web clients health-check through the sandbox
+// gateway, which only forwards /api/* paths (root /health is unreachable and
+// its bare 404 lacks CORS headers, making browser fetch() throw).
+app.get('/api/health', (c) => c.json({
+  status: 'ok',
+  service: '@blasti/api',
+  version: '0.2.0',
+  uptime: Math.floor(process.uptime()),
+}))
+
 // ─── LAN Discovery Endpoint ──────────────────────────────────────────────────
 // Used by kiosk devices to auto-discover the BLASTI server on the local network.
 // Scanned by the client at http://{ip}:{port}/api/discover
@@ -313,7 +333,7 @@ app.get('/stats', (c) => {
   const roomList = io ? Array.from(io.sockets.adapter.rooms.keys()) : []
   const roomCounts: Record<string, number> = {}
   for (const room of roomList) {
-    const sockets = io.sockets.adapter.rooms.get(room)
+    const sockets = io?.sockets.adapter.rooms.get(room)
     roomCounts[room] = sockets ? sockets.size : 0
   }
   return c.json({
@@ -349,6 +369,9 @@ app.route('/api/qr', qrRoutes)
 app.route('/api/transactions', transactionRoutes)
 app.route('/api/upload', uploadRoutes)
 app.route('/api/sync', syncRoutes)
+// Stage-based initial import (POST /api/sync/initial-data) — mounted under the
+// same prefix as the incremental pull/push surface.
+app.route('/api/sync', initialSyncRoutes)
 app.route('/api/settings', settingsRoutes)
 app.route('/api/payment/webhook', paymentWebhookRoutes)
 app.route('/api/payment', paymentCheckoutRoutes)
@@ -357,6 +380,20 @@ app.route('/api/offline-sync', offlineSyncRoutes)
 app.route('/api/qr-claim', qrClaimRoutes)
 app.route('/api/agency-devices', agencyDeviceRoutes)
 app.route('/api/app-versions', appVersionRoutes)
+
+// ─── Self-identifying 404 (isolation aid) ─────────────────────────────────
+// Hono's default 404 is a plain-text "404 Not Found" with no context, which
+// makes it impossible for callers (e.g. the desktop startup diagnostics) to
+// distinguish "outdated @blasti/api build" from "a different service on the
+// port". This handler identifies the service and echoes the unmatched path
+// in both the response body and the server console.
+app.notFound((c) => {
+  console.warn(`[api] 404 — no route matched: ${c.req.method} ${c.req.path}`)
+  return c.json(
+    { success: false, error: 'Not found', path: c.req.path, service: '@blasti/api' },
+    404,
+  )
+})
 
 // ─── Emit Endpoints (Phase 1a: Secured with x-internal-secret) ────────────
 
@@ -664,7 +701,22 @@ function isOriginAllowed(origin: string | undefined): boolean {
     return isDevelopment
   }
   // Strict exact match ONLY — no startsWith, no regex
-  return STRICT_ALLOWED_ORIGINS.has(origin)
+  if (STRICT_ALLOWED_ORIGINS.has(origin)) return true
+  // Dev-only extras: the sandbox preview gateway proxies same-origin traffic
+  // from the platform preview domains (https://preview-chat-*.space-z.ai)
+  // and from the local gateway port (http://localhost:81). Production
+  // deployments keep the strict exact-match behavior above.
+  if (isDevelopment) {
+    try {
+      const u = new URL(origin)
+      const host = u.hostname
+      if (host === 'localhost' || host === '127.0.0.1') return true
+      if (host.endsWith('.space-z.ai')) return true
+    } catch {
+      // malformed Origin header → reject below
+    }
+  }
+  return false
 }
 
 // Phase 1b: JWT Authentication middleware for Socket.IO
@@ -717,6 +769,19 @@ io = new SocketIOServer(httpServer, {
     fn(null, true)
   },
 })
+
+// ─── Sync Engine v2 startup wiring ─────────────────────────────────────────
+// 1. Auto-tracking: every mutation on a synced model (outside explicit
+//    transactions) records a SyncChange row + tombstones for deletes.
+// 2. Real-time notifier: debounced `sync:changes` events to agency rooms.
+// 3. Feed compaction: prune SyncChange rows older than 14 days (cursors
+//    beyond the horizon are healed by desktop full reconciliation).
+installSyncTracking()
+setSyncNotifyIo(io)
+startSyncNotifyTimer()
+setInterval(() => {
+  pruneSyncChanges(14).catch(() => {})
+}, 6 * 60 * 60 * 1000).unref()
 
 // Phase 3: Agency Presence Tracking — Heartbeat system
 const AGENCY_HEARTBEAT_INTERVAL = 30000 // 30 seconds

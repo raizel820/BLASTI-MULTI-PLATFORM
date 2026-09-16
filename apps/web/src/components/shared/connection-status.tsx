@@ -52,11 +52,12 @@ async function checkApiHealth(): Promise<ApiHealthStatus> {
     // In Electron, use shorter timeout when cloud is known-down to fail fast
     const timeout = isElectron && _consecutiveCloudFailures > 0 ? 1_500 : 3_000;
     const timer = setTimeout(() => controller.abort(), timeout);
-    // Use the resolved API base URL + /health to hit the actual cloud API server.
+    // Use the resolved API base URL + /api/health to hit the actual cloud API server.
     // On web, getApiBaseUrl() returns '' (relative), so we add XTransformPort=3003
-    // to route through the gateway to the cloud API on port 3003.
+    // to route through the gateway to the cloud API on port 3003. /api/health is
+    // the canonical alias — the gateway only forwards /api/* paths.
     const baseUrl = getApiBaseUrl();
-    const healthPath = '/health';
+    const healthPath = '/api/health';
     let healthUrl = `${baseUrl}${healthPath}`;
     // Inject XTransformPort for web platform (relative URL, not Electron/Capacitor)
     if (!baseUrl && typeof window !== 'undefined' && !isElectron && !(window as any).Capacitor) {

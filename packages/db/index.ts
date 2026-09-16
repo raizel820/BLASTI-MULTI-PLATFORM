@@ -112,6 +112,64 @@ function getModelName(model: unknown): string | undefined {
 // Skip ghost delete during seed/migration operations
 const skipGhostDelete = process.env.SKIP_GHOST_DELETE === '1'
 
+// ── Sync Tracking Hook Registration Point ─────────────────────────────────────
+// apps/api (cloud) registers a hook via setSyncQueryHook() at startup to record
+// SyncChange entries for every mutation on a synced model. Kept here so the
+// shared db package stays dependency-free while providing the interception.
+export interface SyncQueryHookEvent {
+  model: string
+  operation: string
+  args: any
+  result: any
+  /** For delete/deleteMany: FULL records captured before the delete executed. */
+  preDeleteRecords: any[] | null
+}
+
+type SyncQueryHook = (evt: SyncQueryHookEvent) => Promise<void>
+
+let syncQueryHook: SyncQueryHook | null = null
+
+/** Register the cloud-side sync tracking hook (called once by apps/api). */
+export function setSyncQueryHook(fn: SyncQueryHook | null): void {
+  syncQueryHook = fn
+}
+
+/** Disable sync tracking process-wide (seed scripts, migrations). */
+export function setSyncTrackingEnabled(enabled: boolean): void {
+  skipSyncTracking = !enabled
+}
+
+let skipSyncTracking = process.env.SKIP_SYNC_TRACKING === '1'
+
+/**
+ * The 19 synced models (single source of truth: packages/core/src/sync-registry.ts).
+ * Duplicated here as a plain Set because @blasti/db must not import @blasti/core
+ * (would create a circular workspace dependency at the type level).
+ * Keep in sync with the registry — see packages/core/sync-registry.json.
+ */
+export const SYNC_TRACKED_MODELS: Set<string> = new Set([
+  'Agency',
+  'User',
+  'AgencyStaff',
+  'Service',
+  'Branch',
+  'Counter',
+  'QueueSettings',
+  'Reservation',
+  'Transaction',
+  'SmsSettings',
+  'PaymentSettings',
+  'Notification',
+  'Announcement',
+  'GlobalAnnouncement',
+  'Review',
+  'Favorite',
+  'FAQ',
+  'SubscriptionPlan',
+  'PlanFeature',
+])
+
+
 /**
  * Ghost Delete Trap — Prisma Client Extension ($allModels)
  *
@@ -134,76 +192,61 @@ const skipGhostDelete = process.env.SKIP_GHOST_DELETE === '1'
 const extendedClient = skipGhostDelete
   ? baseClient // No extension when skip flag is set
   : baseClient.$extends({
-      model: {
+      query: {
         $allModels: {
-          async delete(rawInput: any) {
-            // ── Detect Prisma version by inspecting input shape ──
-            // Prisma 5.x:  { args: { where: { id } }, model: "User", query: Function }
-            // Prisma 6.x:  { where: { id } }  (raw query params, no model/query wrapper)
-            const isPrisma5 = rawInput && typeof rawInput.query === 'function'
-
-            if (!isPrisma5) {
-              // Prisma 6.x: the extension hook receives raw query params.
-              // We cannot determine the model name for tombstone creation.
-              // MUST return the raw input unchanged so Prisma executes the operation.
-              return rawInput
-            }
-
-            // ── Prisma 5.x path ──
-            const { args, model: rawModel, query } = rawInput
-            const modelName = getModelName(rawModel)
-
-            if (modelName === 'DeletedRecord') {
-              return query(args)
-            }
-
-            const recordId = args?.where?.id
-            if (recordId && typeof recordId === 'string' && modelName) {
+          async $allOperations({ model, operation, args, query }) {
+            // ── Sync Tracking Hook ──────────────────────────────────────
+            // apps/api registers a hook via setSyncQueryHook() at startup.
+            // The hook records SyncChange entries (+ tombstones for deletes)
+            // for every mutation on a synced model that flows through the
+            // extended client. Operations inside interactive $transaction
+            // callbacks do NOT flow through here — those routes call
+            // recordSyncChange() explicitly within the transaction.
+            //
+            // For bulk deletes we must capture the affected ids BEFORE the
+            // delete executes (they are gone afterwards).
+            let preDeleteRecords: any[] | null = null
+            if (
+              syncQueryHook &&
+              !skipSyncTracking &&
+              typeof model === 'string' &&
+              SYNC_TRACKED_MODELS.has(model) &&
+              (operation === 'delete' || operation === 'deleteMany')
+            ) {
               try {
-                await baseClient.deletedRecord.create({ data: { modelName, recordId } })
-              } catch {
-                /* ignore */
-              }
-            }
-            return query(args)
-          },
-
-          async deleteMany(rawInput: any) {
-            const isPrisma5 = rawInput && typeof rawInput.query === 'function'
-
-            if (!isPrisma5) {
-              // Prisma 6.x: pass through unchanged
-              return rawInput
-            }
-
-            // ── Prisma 5.x path ──
-            const { args, model: rawModel, query } = rawInput
-            const modelName = getModelName(rawModel)
-
-            if (modelName === 'DeletedRecord') {
-              return query(args)
-            }
-
-            if (modelName) {
-              const delegate = (baseClient as any)[modelToDelegate(modelName)]
-              if (delegate) {
-                try {
-                  const records = await delegate.findMany({
-                    where: args?.where || undefined,
-                    select: { id: true },
+                const delegate = (baseClient as any)[modelToDelegate(model)]
+                if (delegate) {
+                  // Full records — agency resolution for the SyncChange needs
+                  // fields like agencyId/branchId/userId, not just the id.
+                  preDeleteRecords = await delegate.findMany({
+                    where: (args as any)?.where || undefined,
                   })
-                  if (records.length > 0) {
-                    await baseClient.deletedRecord.createMany({
-                      data: records.map((r: { id: string }) => ({ modelName, recordId: r.id })),
-                      skipDuplicates: true,
-                    })
-                  }
-                } catch {
-                  /* ignore */
                 }
+              } catch { /* best-effort */ }
+            }
+
+            const result = await query(args)
+
+            if (
+              syncQueryHook &&
+              !skipSyncTracking &&
+              typeof model === 'string' &&
+              SYNC_TRACKED_MODELS.has(model)
+            ) {
+              try {
+                await syncQueryHook({
+                  model,
+                  operation,
+                  args,
+                  result,
+                  preDeleteRecords,
+                })
+              } catch (err) {
+                console.warn(`[db] sync-tracking hook failed (${model}.${operation}):`, (err as Error)?.message)
               }
             }
-            return query(args)
+
+            return result
           },
         },
       },

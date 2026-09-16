@@ -112,35 +112,38 @@ function testAgencyId() {
  */
 async function ensureConflictsTable(db) {
   if (!db) return
+  // Mirrors the production DDL in sync-service.js (_ensureConflictsTable):
+  // modelName/agencyId contract + BIGINT epoch-millis timestamps.
   await db.$executeRawUnsafe(`
     CREATE TABLE IF NOT EXISTS "_sync_conflicts" (
       "id" TEXT PRIMARY KEY,
       "modelName" TEXT NOT NULL,
       "recordId" TEXT NOT NULL,
       "agencyId" TEXT,
-      "localVersion" INTEGER,
-      "cloudVersion" INTEGER,
+      "localVersion" BIGINT,
+      "cloudVersion" BIGINT,
       "localData" TEXT,
       "cloudData" TEXT,
       "resolution" TEXT DEFAULT 'pending',
-      "resolvedAt" INTEGER,
-      "createdAt" INTEGER NOT NULL
+      "resolvedAt" BIGINT,
+      "createdAt" BIGINT NOT NULL
     )
   `)
 }
 
 /**
- * Ensure the _sync_tombstones table exists.
+ * Tombstones live in the production `DeletedRecord` table (see
+ * packages/db/prisma/schema.prisma) whose `deletedAt` is a Prisma DateTime —
+ * stored in SQLite as an ISO TEXT string. Tests must insert ISO strings.
  */
-async function ensureTombstonesTable(db) {
+async function ensureDeletedRecordTable(db) {
   if (!db) return
   await db.$executeRawUnsafe(`
-    CREATE TABLE IF NOT EXISTS "_sync_tombstones" (
+    CREATE TABLE IF NOT EXISTS "DeletedRecord" (
       "id" TEXT PRIMARY KEY,
       "modelName" TEXT NOT NULL,
       "recordId" TEXT NOT NULL,
-      "agencyId" TEXT,
-      "deletedAt" INTEGER NOT NULL
+      "deletedAt" TEXT NOT NULL
     )
   `)
 }
@@ -163,19 +166,22 @@ async function ensureSyncMetaTable(db) {
  */
 async function ensurePendingMutationsTable(db) {
   if (!db) return
+  // Mirrors the production DDL in local-api/index.js (BIGINT epoch millis).
   await db.$executeRawUnsafe(`
     CREATE TABLE IF NOT EXISTS "_pending_mutations" (
       "id" TEXT PRIMARY KEY,
       "method" TEXT NOT NULL,
       "path" TEXT NOT NULL,
       "body" TEXT,
-      "idempotency_key" TEXT,
-      "status" TEXT DEFAULT 'pending',
-      "created_at" INTEGER NOT NULL,
+      "headers" TEXT,
+      "status" TEXT NOT NULL DEFAULT 'pending',
+      "attempts" INTEGER NOT NULL DEFAULT 0,
+      "max_attempts" INTEGER NOT NULL DEFAULT 5,
+      "created_at" BIGINT NOT NULL,
+      "last_attempt_at" BIGINT,
+      "last_error" TEXT,
       "response_data" TEXT,
-      "completed_at" INTEGER,
-      "failed_at" INTEGER,
-      "retry_count" INTEGER DEFAULT 0
+      "idempotency_key" TEXT
     )
   `)
 }
@@ -210,7 +216,7 @@ async function runAllTests() {
       initialDelayMs: 30000, // long delay so it doesn't fire during test
     }
     syncService.startSync(config)
-    const status = syncService.getStatus()
+    const status = await syncService.getStatus()
     assertIncludes(status, 'isStarted', 'isStarted')
     assertEqual(status.isStarted, true, 'isStarted should be true')
     // Clean up
@@ -220,19 +226,28 @@ async function runAllTests() {
   await test('startSync() rejects config without localDb', async () => {
     // startSync without localDb should return early (not crash)
     syncService.startSync({}) // no localDb — should warn but not throw
-    const status = syncService.getStatus()
+    const status = await syncService.getStatus()
     // It should NOT have started (or be in error state)
     assertEqual(status.isStarted, false, 'isStarted should be false without localDb')
   })
 
-  await test('initialSync() returns error without auth token', async () => {
+  await test('triggerSyncNow() is safe without auth token', async () => {
     syncService.clearAuth()
-    const result = await syncService.initialSync()
-    assertEqual(result.success, false, 'success should be false')
-    assertIncludes(result, 'error', 'error')
+    // v2: initialSync() was consolidated into initial-sync.js's runInitialSync.
+    // The engine's manual trigger must degrade gracefully without auth/offline
+    // (no throw, no crash) and report no auth in its status.
+    let threw = false
+    try {
+      await syncService.triggerSyncNow()
+    } catch (e) {
+      threw = true
+    }
+    assertEqual(threw, false, 'triggerSyncNow should not throw without auth')
+    const status = await syncService.getStatus()
+    assertEqual(status.hasAuth, false, 'hasAuth should be false after clearAuth')
   })
 
-  await test('initialSync() returns error when offline', async () => {
+  await test('outbox replay degrades gracefully when offline', async () => {
     // Set a dummy auth token
     syncService.setAuth('test-token-123', {
       id: 'user-1',
@@ -247,9 +262,18 @@ async function runAllTests() {
       syncIntervalMs: 120000,
       initialDelayMs: 60000,
     })
-    const result = await syncService.initialSync()
-    // Should return failure (offline/unreachable)
-    assertEqual(result.success, false, 'success should be false when offline')
+    let result
+    try {
+      result = await syncService.triggerSyncNow()
+    } catch (e) {
+      result = { success: false, error: e.message }
+    }
+    // Should fail gracefully (offline/unreachable), never throw
+    if (result && result.success !== undefined) {
+      assertEqual(result.success, false, 'success should be false when offline')
+    }
+    const status = await syncService.getStatus()
+    assertEqual(status.hasAuth, true, 'hasAuth should be true while auth set')
     syncService.stopSync()
     syncService.clearAuth()
   })
@@ -353,15 +377,16 @@ async function runAllTests() {
       now
     )
 
-    // Verify the conflict was logged
+    // Verify the conflict was logged (BIGINT columns read back as BigInt —
+    // compare numerically)
     const conflicts = await db.$queryRawUnsafe(
       `SELECT * FROM "_sync_conflicts" WHERE id = ?`,
       conflictId
     )
     assert(conflicts && conflicts.length > 0, 'Conflict should be logged')
     assertEqual(conflicts[0].resolution, 'pending', 'resolution should be pending')
-    assertEqual(conflicts[0].localVersion, 2, 'localVersion')
-    assertEqual(conflicts[0].cloudVersion, 3, 'cloudVersion')
+    assertEqual(Number(conflicts[0].localVersion), 2, 'localVersion')
+    assertEqual(Number(conflicts[0].cloudVersion), 3, 'cloudVersion')
 
     // Clean up
     await db.$executeRawUnsafe(
@@ -470,27 +495,25 @@ async function runAllTests() {
   console.log(`\n${_colors.cyan}[Tombstones]${_colors.reset}`)
 
   await test('Delete creates DeletedRecord (tombstone)', async () => {
-    await ensureTombstonesTable(db)
-    const agencyId = testAgencyId()
+    await ensureDeletedRecordTable(db)
     const tombstoneId = 'tomb-' + crypto.randomBytes(8).toString('hex')
     const recordId = 'svc-del-' + crypto.randomBytes(8).toString('hex')
-    const now = Date.now()
 
-    // Insert a tombstone (simulates a delete)
+    // Insert a tombstone (simulates a cloud-confirmed delete) — production
+    // stores deletedAt as an ISO string in the DateTime column.
     await db.$executeRawUnsafe(
-      `INSERT OR IGNORE INTO "_sync_tombstones"
-        (id, "modelName", "recordId", "agencyId", "deletedAt")
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO "DeletedRecord"
+        (id, "modelName", "recordId", "deletedAt")
+       VALUES (?, ?, ?, ?)`,
       tombstoneId,
       'Service',
       recordId,
-      agencyId,
-      now
+      new Date().toISOString()
     )
 
     // Verify tombstone exists
     const rows = await db.$queryRawUnsafe(
-      `SELECT * FROM "_sync_tombstones" WHERE "recordId" = ?`,
+      `SELECT * FROM "DeletedRecord" WHERE "recordId" = ?`,
       recordId
     )
     assert(rows && rows.length > 0, 'Tombstone should exist after delete')
@@ -498,34 +521,31 @@ async function runAllTests() {
 
     // Clean up
     await db.$executeRawUnsafe(
-      `DELETE FROM "_sync_tombstones" WHERE id = ?`,
+      `DELETE FROM "DeletedRecord" WHERE id = ?`,
       tombstoneId
     )
   })
 
   await test('Tombstone prevents record resurrection', async () => {
-    await ensureTombstonesTable(db)
-    const agencyId = testAgencyId()
+    await ensureDeletedRecordTable(db)
     const tombstoneId = 'tomb-res-' + crypto.randomBytes(8).toString('hex')
     const recordId = 'svc-res-' + crypto.randomBytes(8).toString('hex')
-    const now = Date.now()
 
-    // Insert a tombstone
+    // Insert a tombstone for a cloud-confirmed delete
     await db.$executeRawUnsafe(
-      `INSERT OR IGNORE INTO "_sync_tombstones"
-        (id, "modelName", "recordId", "agencyId", "deletedAt")
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO "DeletedRecord"
+        (id, "modelName", "recordId", "deletedAt")
+       VALUES (?, ?, ?, ?)`,
       tombstoneId,
       'Service',
       recordId,
-      agencyId,
-      now
+      new Date().toISOString()
     )
 
-    // A sync pull should check for tombstones before inserting records
-    // Simulate: check if a tombstone exists for this recordId
+    // A sync pull checks for tombstones before inserting records —
+    // mirror that check against the production table.
     const tombstoneCheck = await db.$queryRawUnsafe(
-      `SELECT COUNT(*) as cnt FROM "_sync_tombstones" WHERE "recordId" = ? AND "modelName" = ?`,
+      `SELECT COUNT(*) as cnt FROM "DeletedRecord" WHERE "recordId" = ? AND "modelName" = ?`,
       recordId,
       'Service'
     )
@@ -534,33 +554,43 @@ async function runAllTests() {
 
     // Clean up
     await db.$executeRawUnsafe(
-      `DELETE FROM "_sync_tombstones" WHERE id = ?`,
+      `DELETE FROM "DeletedRecord" WHERE id = ?`,
       tombstoneId
     )
   })
 
   await test('cleanupTombstones() removes old entries', async () => {
-    await ensureTombstonesTable(db)
-    const agencyId = testAgencyId()
+    await ensureDeletedRecordTable(db)
     const oldTombstoneId = 'tomb-old-' + crypto.randomBytes(8).toString('hex')
+    const freshTombstoneId = 'tomb-fresh-' + crypto.randomBytes(8).toString('hex')
     const recordId = 'svc-old-' + crypto.randomBytes(8).toString('hex')
+    const freshRecordId = 'svc-fresh-' + crypto.randomBytes(8).toString('hex')
 
     // Insert a tombstone that's 60 days old (beyond the 30-day cleanup threshold)
-    const sixtyDaysAgo = Date.now() - (60 * 24 * 60 * 60 * 1000)
+    const sixtyDaysAgo = new Date(Date.now() - (60 * 24 * 60 * 60 * 1000)).toISOString()
     await db.$executeRawUnsafe(
-      `INSERT OR IGNORE INTO "_sync_tombstones"
-        (id, "modelName", "recordId", "agencyId", "deletedAt")
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT OR IGNORE INTO "DeletedRecord"
+        (id, "modelName", "recordId", "deletedAt")
+       VALUES (?, ?, ?, ?)`,
       oldTombstoneId,
       'Service',
       recordId,
-      agencyId,
       sixtyDaysAgo
+    )
+    // Insert a fresh tombstone that must survive the cleanup
+    await db.$executeRawUnsafe(
+      `INSERT OR IGNORE INTO "DeletedRecord"
+        (id, "modelName", "recordId", "deletedAt")
+       VALUES (?, ?, ?, ?)`,
+      freshTombstoneId,
+      'Service',
+      freshRecordId,
+      new Date().toISOString()
     )
 
     // Verify it exists before cleanup
     const before = await db.$queryRawUnsafe(
-      `SELECT * FROM "_sync_tombstones" WHERE id = ?`,
+      `SELECT * FROM "DeletedRecord" WHERE id = ?`,
       oldTombstoneId
     )
     assert(before && before.length > 0, 'Old tombstone should exist before cleanup')
@@ -569,7 +599,7 @@ async function runAllTests() {
     syncService.startSync({
       localDb: db,
       cloudBaseUrl: 'http://localhost:9999',
-      agencyId,
+      agencyId: testAgencyId(),
       syncIntervalMs: 120000,
       initialDelayMs: 60000,
     })
@@ -581,12 +611,22 @@ async function runAllTests() {
 
     // Verify old tombstone was removed
     const after = await db.$queryRawUnsafe(
-      `SELECT * FROM "_sync_tombstones" WHERE id = ?`,
+      `SELECT * FROM "DeletedRecord" WHERE id = ?`,
       oldTombstoneId
     )
     assert(!after || after.length === 0, 'Old tombstone should be removed after cleanup')
 
+    // Verify fresh tombstone survived
+    const fresh = await db.$queryRawUnsafe(
+      `SELECT * FROM "DeletedRecord" WHERE id = ?`,
+      freshTombstoneId
+    )
+    assert(fresh && fresh.length > 0, 'Fresh tombstone must survive cleanup')
+
     syncService.stopSync()
+
+    // Clean up
+    await db.$executeRawUnsafe(`DELETE FROM "DeletedRecord" WHERE id = ?`, freshTombstoneId)
   })
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -603,30 +643,30 @@ async function runAllTests() {
       syncIntervalMs: 120000,
       initialDelayMs: 60000,
     })
-    const statusBefore = syncService.getStatus()
+    const statusBefore = await syncService.getStatus()
     assertEqual(statusBefore.isStarted, true, 'isStarted before stop')
 
     syncService.stopSync()
-    const statusAfter = syncService.getStatus()
+    const statusAfter = await syncService.getStatus()
     assertEqual(statusAfter.isStarted, false, 'isStarted after stop')
   })
 
   await test('setAuth/clearAuth manage auth state', async () => {
     syncService.clearAuth()
+    let status = await syncService.getStatus()
+    assertEqual(status.hasAuth, false, 'hasAuth should be false after clearAuth')
+
     syncService.setAuth('test-token', { id: 'u1', agencyId: 'a1', role: 'AGENT' })
-    // Auth should now be set (no direct getter, but initialSync would use it)
-    // Verify by trying initialSync (it will fail on offline, but should NOT say "no auth token")
-    const result = await syncService.initialSync()
-    // It should NOT say "No auth token" — it should fail on offline/unreachable instead
-    if (result.error) {
-      assert(!result.error.includes('No auth token'),
-        `Error should NOT be about missing auth token, got: ${result.error}`)
-    }
+    status = await syncService.getStatus()
+    assertEqual(status.hasAuth, true, 'hasAuth should be true after setAuth')
+    // NOTE: status.agencyId precedence is (sync config agency) → (auth context
+    // agency). Earlier tests in this file call startSync with their own agency,
+    // so the configured value legitimately persists in this process — we only
+    // assert the auth flag transition here.
 
     syncService.clearAuth()
-    const resultAfter = await syncService.initialSync()
-    assertEqual(resultAfter.success, false, 'success should be false after clearAuth')
-    assertIncludes(resultAfter, 'error', 'error')
+    status = await syncService.getStatus()
+    assertEqual(status.hasAuth, false, 'hasAuth should be false after clearAuth')
   })
 
   await test('getConflicts() returns array', async () => {

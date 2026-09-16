@@ -37,7 +37,7 @@
  */
 
 import { Hono } from 'hono'
-import { cloudDb } from '@blasti/cloud-db'
+import { db } from '@blasti/db'
 import { requireAuth, requireAgencyAccess, authErrorResponse, AuthError } from '../lib/auth'
 import { getLatestSequence } from '../lib/sync-helpers'
 import { SYNC_PROTOCOL_VERSION, SYNC_REGISTRY } from '@blasti/core/sync-registry'
@@ -78,27 +78,31 @@ interface InitialSyncResponse {
 
 // ─── Stage Definitions ───────────────────────────────────────────────────────
 
+// Stage order is FK-SAFE (dependency order): importers apply stages in wire
+// order and SQLite enforces foreign keys, so every referenced model must be
+// imported BEFORE the models that reference it (User before Agency.ownerId,
+// SubscriptionPlan before Agency.subscriptionPlanId, Branch/Service before
+// Counter, ... ). Mirrors packages/core/sync-registry.json syncOrder.
 const STAGE_DEFINITIONS: StageMeta[] = [
-  { id: 'agency',           label: 'Agency',            mandatory: true  },
-  { id: 'users',            label: 'Users',             mandatory: true  },
-  { id: 'services',         label: 'Services',          mandatory: true  },
-  { id: 'branches',         label: 'Branches',          mandatory: true  },
-  { id: 'counters',         label: 'Counters',          mandatory: true  },
-  { id: 'agencyStaff',      label: 'Agency Staff',      mandatory: true  },
-  { id: 'queueSettings',    label: 'Queue Settings',    mandatory: true  },
-  // Task 4-b §5-5: settings stages before operational data
-  { id: 'smsSettings',      label: 'SMS Settings',      mandatory: false },
-  { id: 'paymentSettings',  label: 'Payment Settings',  mandatory: false },
-  { id: 'reservations',     label: 'Reservations',      mandatory: true  },
-  { id: 'reviews',          label: 'Reviews',           mandatory: false },
-  { id: 'favorites',        label: 'Favorites',         mandatory: false },
-  { id: 'faqs',             label: 'FAQs',              mandatory: false },
-  { id: 'notifications',    label: 'Notifications',     mandatory: false },
-  { id: 'announcements',    label: 'Announcements',     mandatory: false },
-  { id: 'globalAnnouncements', label: 'Global Announcements', mandatory: false },
-  { id: 'transactions',     label: 'Transactions',      mandatory: false },
+  { id: 'users', label: 'Users', mandatory: true  },
   { id: 'subscriptionPlans', label: 'Subscription Plans', mandatory: false },
-  { id: 'planFeatures',     label: 'Plan Features',     mandatory: false },
+  { id: 'planFeatures', label: 'Plan Features', mandatory: false },
+  { id: 'agency', label: 'Agency', mandatory: true  },
+  { id: 'branches', label: 'Branches', mandatory: true  },
+  { id: 'services', label: 'Services', mandatory: true  },
+  { id: 'agencyStaff', label: 'Agency Staff', mandatory: true  },
+  { id: 'counters', label: 'Counters', mandatory: true  },
+  { id: 'queueSettings', label: 'Queue Settings', mandatory: true  },
+  { id: 'reservations', label: 'Reservations', mandatory: true  },
+  { id: 'transactions', label: 'Transactions', mandatory: false },
+  { id: 'smsSettings', label: 'SMS Settings', mandatory: false },
+  { id: 'paymentSettings', label: 'Payment Settings', mandatory: false },
+  { id: 'notifications', label: 'Notifications', mandatory: false },
+  { id: 'announcements', label: 'Announcements', mandatory: false },
+  { id: 'globalAnnouncements', label: 'Global Announcements', mandatory: false },
+  { id: 'reviews', label: 'Reviews', mandatory: false },
+  { id: 'favorites', label: 'Favorites', mandatory: false },
+  { id: 'faqs', label: 'FAQs', mandatory: false },
 ]
 
 const VALID_STAGES = new Set(STAGE_DEFINITIONS.map((s) => s.id))
@@ -136,7 +140,7 @@ async function fetchStageData(
   switch (stage) {
     // ── 1. Agency ─────────────────────────────────────────────────────────
     case 'agency': {
-      const record = await cloudDb.agency.findUnique({
+      const record = await db.agency.findUnique({
         where: { id: agencyId },
       })
       const records = record ? [record] : []
@@ -145,43 +149,49 @@ async function fetchStageData(
 
     // ── 2. Users ──────────────────────────────────────────────────────────
     case 'users': {
-      // Get user IDs from AgencyStaff, plus the agency owner
-      const staffRecords = await cloudDb.agencyStaff.findMany({
-        where: { agencyId, isActive: true },
-        select: { userId: true },
-      })
-      const agency = await cloudDb.agency.findUnique({
-        where: { id: agencyId },
-        select: { ownerId: true },
-      })
-      const userIds = new Set(staffRecords.map((s: any) => s.userId))
+      // Get user IDs from AgencyStaff, plus the agency owner, plus every
+      // user referenced by synced agency data (Reservation.userId for
+      // customer tickets, Review/Favorite authors). Importing ONLY staff
+      // left reservations pointing at users the desktop had never stored —
+      // the local SQLite FK constraint then rejected those reservations.
+      const [staffRecords, agency, reservationUsers, reviewUsers, favoriteUsers] = await Promise.all([
+        db.agencyStaff.findMany({ where: { agencyId, isActive: true }, select: { userId: true } }),
+        db.agency.findUnique({ where: { id: agencyId }, select: { ownerId: true } }),
+        db.reservation.findMany({ where: { agencyId }, select: { userId: true }, distinct: ['userId'] }),
+        db.review.findMany({ where: { agencyId }, select: { userId: true }, distinct: ['userId'] }),
+        db.favorite.findMany({ where: { agencyId }, select: { userId: true }, distinct: ['userId'] }),
+      ])
+      const userIds = new Set<string>(staffRecords.map((s: any) => s.userId))
       if (agency?.ownerId) userIds.add(agency.ownerId)
+      for (const r of reservationUsers) if (r.userId) userIds.add(r.userId)
+      for (const r of reviewUsers) if (r.userId) userIds.add(r.userId)
+      for (const r of favoriteUsers) if (r.userId) userIds.add(r.userId)
 
       if (userIds.size === 0) {
         return { records: [], hasMore: false, total: 0 }
       }
 
-      const records = await cloudDb.user.findMany({
+      const records = await db.user.findMany({
         where: { id: { in: Array.from(userIds) } },
-        orderBy: { createdAt: 'asc' },
+        
       })
       return { records, hasMore: false, total: records.length }
     }
 
     // ── 3. Services ───────────────────────────────────────────────────────
     case 'services': {
-      const records = await cloudDb.service.findMany({
+      const records = await db.service.findMany({
         where: { agencyId },
-        orderBy: { createdAt: 'asc' },
+        
       })
       return { records, hasMore: false, total: records.length }
     }
 
     // ── 4. Branches ───────────────────────────────────────────────────────
     case 'branches': {
-      const records = await cloudDb.branch.findMany({
+      const records = await db.branch.findMany({
         where: { agencyId },
-        orderBy: { createdAt: 'asc' },
+        
       })
       return { records, hasMore: false, total: records.length }
     }
@@ -189,32 +199,32 @@ async function fetchStageData(
     // ── 5. Counters ───────────────────────────────────────────────────────
     case 'counters': {
       // Get counters via branches belonging to this agency
-      const branchIds = await cloudDb.branch.findMany({
+      const branchIds = await db.branch.findMany({
         where: { agencyId },
         select: { id: true },
       })
       if (branchIds.length === 0) {
         return { records: [], hasMore: false, total: 0 }
       }
-      const records = await cloudDb.counter.findMany({
+      const records = await db.counter.findMany({
         where: { branchId: { in: branchIds.map((b: any) => b.id) } },
-        orderBy: { createdAt: 'asc' },
+        
       })
       return { records, hasMore: false, total: records.length }
     }
 
     // ── 6. AgencyStaff ────────────────────────────────────────────────────
     case 'agencyStaff': {
-      const records = await cloudDb.agencyStaff.findMany({
+      const records = await db.agencyStaff.findMany({
         where: { agencyId },
-        orderBy: { createdAt: 'asc' },
+        
       })
       return { records, hasMore: false, total: records.length }
     }
 
     // ── 7. QueueSettings ──────────────────────────────────────────────────
     case 'queueSettings': {
-      const records = await cloudDb.queueSettings.findMany({
+      const records = await db.queueSettings.findMany({
         where: { agencyId },
         orderBy: { updatedAt: 'desc' },
       })
@@ -227,11 +237,11 @@ async function fetchStageData(
       // schema (documented decision). The projection mirrors the incremental
       // pull (sync.ts fetchRecordsForModel 'SmsSettings') and deliberately
       // EXCLUDES the apiKey credential and message templates.
-      const records = await cloudDb.smsSettings.findMany({
+      const records = await db.smsSettings.findMany({
         select: {
           id: true, provider: true, apiUrl: true, senderName: true,
           enabled: true, smsPerReminder: true, maxSmsPerDay: true,
-          testPhoneNumber: true, syncVersion: true,
+          testPhoneNumber: true, 
           createdAt: true, updatedAt: true,
         },
       })
@@ -244,11 +254,11 @@ async function fetchStageData(
       // PUBLICLY (unauthenticated GET /api/payment-settings) so agencies can
       // read bank transfer instructions — projection mirrors the incremental
       // pull (sync.ts 'PaymentSettings'), no new exposure.
-      const records = await cloudDb.paymentSettings.findMany({
+      const records = await db.paymentSettings.findMany({
         select: {
           id: true, ccpEnabled: true, bankEnabled: true, electronicEnabled: true,
           ccpAccount: true, ccpKey: true, bankName: true, bankAccount: true,
-          bankRib: true, ewalletNumber: true, syncVersion: true,
+          bankRib: true, ewalletNumber: true, 
           createdAt: true, updatedAt: true,
         },
       })
@@ -258,14 +268,15 @@ async function fetchStageData(
     // ── 8. Reservations (paginated) ───────────────────────────────────────
     case 'reservations': {
       return fetchPaginated(
-        () => cloudDb.reservation.count({ where: { agencyId } }),
+        () => db.reservation.count({ where: { agencyId } }),
         () =>
-          cloudDb.reservation.findMany({
+          db.reservation.findMany({
             where: {
               agencyId,
               ...(cursor ? { id: { gt: cursor } } : {}),
             },
-            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+            // NOTE: Reservation has no createdAt — the queue timestamp is joinedAt.
+            orderBy: [{ joinedAt: 'asc' }, { id: 'asc' }],
             take: pageSize + 1,
           }),
         pageSize,
@@ -275,9 +286,9 @@ async function fetchStageData(
     // ── 9. Reviews (paginated) ────────────────────────────────────────────
     case 'reviews': {
       return fetchPaginated(
-        () => cloudDb.review.count({ where: { agencyId } }),
+        () => db.review.count({ where: { agencyId } }),
         () =>
-          cloudDb.review.findMany({
+          db.review.findMany({
             where: {
               agencyId,
               ...(cursor ? { id: { gt: cursor } } : {}),
@@ -292,15 +303,15 @@ async function fetchStageData(
     // ── 9b. Favorites (paginated, agencyId-scoped — Task 4-b §5-5) ────
     case 'favorites': {
       return fetchPaginated(
-        () => cloudDb.favorite.count({ where: { agencyId } }),
+        () => db.favorite.count({ where: { agencyId } }),
         () =>
-          cloudDb.favorite.findMany({
+          db.favorite.findMany({
             where: {
               agencyId,
               ...(cursor ? { id: { gt: cursor } } : {}),
             },
             select: {
-              id: true, userId: true, agencyId: true, syncVersion: true,
+              id: true, userId: true, agencyId: true, 
               createdAt: true, updatedAt: true,
             },
             orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
@@ -315,12 +326,12 @@ async function fetchStageData(
       // Global content model (no agency scoping in schema — documented).
       // No isActive filter: mirrors the incremental pull so locally
       // deactivated FAQs keep their state instead of being resurrected.
-      const records = await cloudDb.faq.findMany({
+      const records = await db.fAQ.findMany({
         select: {
           id: true, question: true, questionFr: true, questionAr: true,
           answer: true, answerFr: true, answerAr: true,
           category: true, order: true, isActive: true,
-          syncVersion: true, createdAt: true, updatedAt: true,
+           createdAt: true, updatedAt: true,
         },
         orderBy: [{ order: 'asc' }, { createdAt: 'asc' }],
       })
@@ -330,11 +341,11 @@ async function fetchStageData(
     // ── 10. Notifications (paginated) ─────────────────────────────────────
     case 'notifications': {
       // Get user IDs for this agency to filter notifications
-      const staffRecords = await cloudDb.agencyStaff.findMany({
+      const staffRecords = await db.agencyStaff.findMany({
         where: { agencyId, isActive: true },
         select: { userId: true },
       })
-      const agency = await cloudDb.agency.findUnique({
+      const agency = await db.agency.findUnique({
         where: { id: agencyId },
         select: { ownerId: true },
       })
@@ -347,9 +358,9 @@ async function fetchStageData(
 
       const userIdArray = Array.from(userIds)
       return fetchPaginated(
-        () => cloudDb.notification.count({ where: { userId: { in: userIdArray } } }),
+        () => db.notification.count({ where: { userId: { in: userIdArray } } }),
         () =>
-          cloudDb.notification.findMany({
+          db.notification.findMany({
             where: {
               userId: { in: userIdArray },
               ...(cursor ? { id: { gt: cursor } } : {}),
@@ -363,9 +374,9 @@ async function fetchStageData(
 
     // ── 11. Announcements ─────────────────────────────────────────────────
     case 'announcements': {
-      const records = await cloudDb.announcement.findMany({
+      const records = await db.announcement.findMany({
         where: { agencyId },
-        orderBy: { createdAt: 'asc' },
+        
       })
       return { records, hasMore: false, total: records.length }
     }
@@ -375,10 +386,10 @@ async function fetchStageData(
       // SECURITY: platform-wide broadcast announcements — global by design
       // (meant for every agency/user; no agency scoping exists). Projection
       // mirrors the incremental pull (sync.ts 'GlobalAnnouncement').
-      const records = await cloudDb.globalAnnouncement.findMany({
+      const records = await db.globalAnnouncement.findMany({
         select: {
           id: true, message: true, type: true, createdBy: true,
-          syncVersion: true, createdAt: true, updatedAt: true,
+           createdAt: true, updatedAt: true,
         },
         orderBy: { createdAt: 'desc' },
       })
@@ -388,9 +399,9 @@ async function fetchStageData(
     // ── 12. Transactions (paginated) ──────────────────────────────────────
     case 'transactions': {
       return fetchPaginated(
-        () => cloudDb.transaction.count({ where: { agencyId } }),
+        () => db.transaction.count({ where: { agencyId } }),
         () =>
-          cloudDb.transaction.findMany({
+          db.transaction.findMany({
             where: {
               agencyId,
               ...(cursor ? { id: { gt: cursor } } : {}),
@@ -404,7 +415,7 @@ async function fetchStageData(
 
     // ── 13. SubscriptionPlans (global, not agency-scoped) ─────────────────
     case 'subscriptionPlans': {
-      const records = await cloudDb.subscriptionPlan.findMany({
+      const records = await db.subscriptionPlan.findMany({
         where: { isActive: true },
         orderBy: { sortOrder: 'asc' },
       })
@@ -416,15 +427,15 @@ async function fetchStageData(
       // Scoped through the plan relation (no direct agencyId on the model):
       // only features of ACTIVE plans, mirroring the subscriptionPlans stage
       // scope. Global plan metadata — same exposure class as plans themselves.
-      const records = await cloudDb.planFeature.findMany({
+      const records = await db.planFeature.findMany({
         where: { plan: { isActive: true } },
         select: {
           id: true, planId: true, featureKey: true,
           featureName: true, featureNameAr: true, featureNameFr: true,
-          enabled: true, limitValue: true, syncVersion: true,
+          enabled: true, limitValue: true, 
           createdAt: true, updatedAt: true,
         },
-        orderBy: { createdAt: 'asc' },
+        
       })
       return { records, hasMore: false, total: records.length }
     }
@@ -616,64 +627,64 @@ async function estimateStageCount(stage: string, agencyId: string): Promise<numb
       return 1
     case 'users': {
       const [staffCount, agency] = await Promise.all([
-        cloudDb.agencyStaff.count({ where: { agencyId, isActive: true } }),
-        cloudDb.agency.findUnique({ where: { id: agencyId }, select: { ownerId: true } }),
+        db.agencyStaff.count({ where: { agencyId, isActive: true } }),
+        db.agency.findUnique({ where: { id: agencyId }, select: { ownerId: true } }),
       ])
       return staffCount + (agency?.ownerId ? 1 : 0)
     }
     case 'services':
-      return cloudDb.service.count({ where: { agencyId } })
+      return db.service.count({ where: { agencyId } })
     case 'branches':
-      return cloudDb.branch.count({ where: { agencyId } })
+      return db.branch.count({ where: { agencyId } })
     case 'counters': {
-      const branchIds = await cloudDb.branch.findMany({
+      const branchIds = await db.branch.findMany({
         where: { agencyId },
         select: { id: true },
       })
-      return cloudDb.counter.count({
+      return db.counter.count({
         where: { branchId: { in: branchIds.map((b: any) => b.id) } },
       })
     }
     case 'agencyStaff':
-      return cloudDb.agencyStaff.count({ where: { agencyId } })
+      return db.agencyStaff.count({ where: { agencyId } })
     case 'queueSettings':
-      return cloudDb.queueSettings.count({ where: { agencyId } })
+      return db.queueSettings.count({ where: { agencyId } })
     case 'reservations':
-      return cloudDb.reservation.count({ where: { agencyId } })
+      return db.reservation.count({ where: { agencyId } })
     case 'reviews':
-      return cloudDb.review.count({ where: { agencyId } })
+      return db.review.count({ where: { agencyId } })
     case 'notifications': {
       const [staffRecords, agency] = await Promise.all([
-        cloudDb.agencyStaff.findMany({
+        db.agencyStaff.findMany({
           where: { agencyId, isActive: true },
           select: { userId: true },
         }),
-        cloudDb.agency.findUnique({ where: { id: agencyId }, select: { ownerId: true } }),
+        db.agency.findUnique({ where: { id: agencyId }, select: { ownerId: true } }),
       ])
       const userIds = new Set(staffRecords.map((s: any) => s.userId))
       if (agency?.ownerId) userIds.add(agency.ownerId)
-      return cloudDb.notification.count({
+      return db.notification.count({
         where: { userId: { in: Array.from(userIds) } },
       })
     }
     case 'announcements':
-      return cloudDb.announcement.count({ where: { agencyId } })
+      return db.announcement.count({ where: { agencyId } })
     case 'globalAnnouncements':
-      return cloudDb.globalAnnouncement.count()
+      return db.globalAnnouncement.count()
     case 'transactions':
-      return cloudDb.transaction.count({ where: { agencyId } })
+      return db.transaction.count({ where: { agencyId } })
     case 'subscriptionPlans':
-      return cloudDb.subscriptionPlan.count({ where: { isActive: true } })
+      return db.subscriptionPlan.count({ where: { isActive: true } })
     case 'planFeatures':
-      return cloudDb.planFeature.count({ where: { plan: { isActive: true } } })
+      return db.planFeature.count({ where: { plan: { isActive: true } } })
     case 'favorites':
-      return cloudDb.favorite.count({ where: { agencyId } })
+      return db.favorite.count({ where: { agencyId } })
     case 'faqs':
-      return cloudDb.faq.count()
+      return db.fAQ.count()
     case 'smsSettings':
-      return cloudDb.smsSettings.count()
+      return db.smsSettings.count()
     case 'paymentSettings':
-      return cloudDb.paymentSettings.count()
+      return db.paymentSettings.count()
     default:
       return 0
   }

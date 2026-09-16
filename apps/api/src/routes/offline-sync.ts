@@ -100,7 +100,7 @@ app.post('/', async (c) => {
       const mapped = conflictMap[result.conflict!] || { status: 400, message: result.conflict }
       return c.json(
         { success: false, error: mapped.message, conflict: result.conflict },
-        mapped.status
+        mapped.status as 400 | 404 | 409
       )
     }
 

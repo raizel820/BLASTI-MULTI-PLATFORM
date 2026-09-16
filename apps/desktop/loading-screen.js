@@ -6,8 +6,11 @@
  *
  *   1. Check local server is running; if not, start it
  *   2. Check cloud API is connected
- *   3. Check local DB and import agency data from cloud to local DB
- *   3b. Verify sync integrity: compare local DB tables & data with cloud
+ *   3. Initialize local workspace: gated v2 initial sync with per-stage
+ *      progress (IPC bridge primary, local-API HTTP fallback). Replaces the
+ *      old hand-rolled per-table importer. Launch is gated on local DB
+ *      readiness (fresh install offline is blocked; READY installs launch).
+ *   3b. Verify: light local DB readiness snapshot via GET /api/db-status
  *   4. Disconnect from cloud API to test fallback
  *   5. Test local API by creating a queue called "next", then delete it
  *   6. Test all local API endpoints
@@ -40,20 +43,20 @@ const DIAGNOSTIC_STEPS = [
     description: 'التحقق من اتصال السحابة',
     group: 'core',
   },
-  // ── Group 2: Data Import ──────────────────────────────
+  // ── Group 2: Workspace Initialization (gated v2 initial sync) ────────
   {
-    id: 'import-agency-data',
-    label: 'استيراد بيانات الوكالة',
+    id: 'initial-sync',
+    label: 'تهيئة مساحة العمل المحلية',
     icon: '📥',
-    description: 'جلب جميع بيانات الوكالة من السحابة وحفظها في قاعدة البيانات المحلية',
+    description: 'استيراد بيانات الوكالة من السحابة إلى قاعدة البيانات المحلية (مزامنة أولية مرحلية) مع منع الدخول لوضع فارغ',
     group: 'import',
   },
-  // ── Group 2b: Sync Verification ───────────────────────
+  // ── Group 2b: Local DB Verification ───────────────────
   {
-    id: 'verify-sync-integrity',
-    label: 'التحقق من اكتمال المزامنة',
+    id: 'verify',
+    label: 'التحقق من قاعدة البيانات المحلية',
     icon: '🔍',
-    description: 'مقارنة الجداول والبيانات المحلية مع السحابة للتأكد من اكتمال المزامنة',
+    description: 'فحص جاهزية قاعدة البيانات المحلية وعدد السجلات المستوردة',
     group: 'verify',
   },
   // ── Group 3: Offline Fallback Test ────────────────────
@@ -610,6 +613,81 @@ function getLoadingHTML() {
         updateProgress(); finalize();
       });
 
+      // ── Initial-sync progress listener (channel 'initial-sync:progress') ──
+      // main.js (agent 7-b) forwards runInitialSync emitFn events here via
+      // webContents.send. Event shapes (apps/desktop/local-api/initial-sync.js):
+      //   SYNC_STARTED         { agencyId, syncId, totalStages, snapshotSequence, resuming, resumeStage }
+      //   SYNC_STAGE_STARTED   { stage, stageLabel, stageIndex, totalStages, mandatory }
+      //   SYNC_STAGE_PROGRESS  { stage, current, total, percentage, batch }
+      //   SYNC_STAGE_COMPLETED { stage, stageLabel, count }
+      //   SYNC_ERROR           { stage, stageLabel?, error, retryable, skipped?, authFailure? }
+      //   SYNC_WARNING         { stage, message, originalSequence?, currentSequence? }
+      //   SYNC_COMPLETED       { agencyId, syncId, totalRecords, duration, snapshotSequence, alreadyInitialized? }
+      var STAGE_AR = {
+        agency: 'الوكالة', users: 'المستخدمون', services: 'الخدمات', branches: 'الفروع',
+        counters: 'طاولات الخدمة', agencyStaff: 'الموظفون', queueSettings: 'إعدادات الطابور',
+        smsSettings: 'إعدادات SMS', paymentSettings: 'إعدادات الدفع', reservations: 'الحجوزات',
+        reviews: 'التقييمات', favorites: 'المفضلة', faqs: 'الأسئلة الشائعة',
+        notifications: 'الإشعارات', announcements: 'الإعلانات', globalAnnouncements: 'الإعلانات العامة',
+        transactions: 'المعاملات', subscriptionPlans: 'خطط الاشتراك', planFeatures: 'ميزات الخطة',
+        validation: 'التحقق من السلامة', discovery: 'استكشاف المراحل', 'race-condition': 'فحص التزامن'
+      };
+      function stageLabelAr(id, fallback) { return STAGE_AR[id] || fallback || id || ''; }
+
+      if (window.electronAPI.onInitialSyncProgress) {
+        window.electronAPI.onInitialSyncProgress(function(evt) {
+          if (!evt || !evt.type) return;
+          var detailEl = document.getElementById('detail-initial-sync');
+          try {
+            switch (evt.type) {
+              case 'SYNC_STARTED':
+                addLog(evt.resuming
+                  ? '[INFO] استكمال الاستيراد الأولي — من المرحلة ' + (evt.resumeStage || '')
+                  : '[INFO] بدء الاستيراد الأولي — ' + (evt.totalStages || '?') + ' مراحل', 'info');
+                break;
+              case 'SYNC_STAGE_STARTED':
+                if (detailEl) detailEl.textContent = 'استيراد بيانات الوكالة… ' + stageLabelAr(evt.stage, evt.stageLabel) + ' ' + ((evt.stageIndex || 0) + 1) + '/' + (evt.totalStages || '?');
+                break;
+              case 'SYNC_STAGE_PROGRESS':
+                if (detailEl) detailEl.textContent = 'استيراد بيانات الوكالة… ' + stageLabelAr(evt.stage) + ' ' + (evt.current || 0) + (evt.total ? '/' + evt.total : '') + ' سجل';
+                break;
+              case 'SYNC_STAGE_COMPLETED':
+                addLog('[OK] ' + stageLabelAr(evt.stage, evt.stageLabel) + ': ' + (evt.count || 0) + ' سجل', 'ok');
+                break;
+              case 'SYNC_WARNING':
+                addLog('[WARN] ' + stageLabelAr(evt.stage) + ': ' + (evt.message || ''), 'warn');
+                break;
+              case 'SYNC_ERROR':
+                addLog('[FAIL] ' + stageLabelAr(evt.stage, evt.stageLabel) + ': ' + (evt.error || 'خطأ غير معروف') + (evt.skipped ? ' (سيتم التخطي)' : ''), 'fail');
+                break;
+              case 'SYNC_COMPLETED':
+                if (detailEl) detailEl.textContent = evt.alreadyInitialized
+                  ? 'مساحة العمل مهيأة مسبقًا'
+                  : 'اكتمل الاستيراد — ' + (evt.totalRecords || 0) + ' سجل';
+                addLog(evt.alreadyInitialized
+                  ? '[OK] مساحة العمل مهيأة مسبقًا — لا حاجة لإعادة الاستيراد'
+                  : '[OK] اكتمل الاستيراد الأولي — ' + (evt.totalRecords || 0) + ' سجل' + (evt.duration ? ' في ' + Math.round(evt.duration / 1000) + ' ثانية' : ''), 'ok');
+                break;
+            }
+          } catch (e) { /* never let a UI update break the gate */ }
+        });
+      }
+
+      // Bridge used by the main-process diagnostics runner (runDiagnostics)
+      // to trigger the initial sync through the IPC channel — window.electronAPI
+      // only exists in this renderer context, not in the main process.
+      // Returns { success, totalRecords?, error? } or { unavailable: true }.
+      window.__blastiRunInitialSync = function() {
+        if (!window.electronAPI || !window.electronAPI.initialCloudSync) {
+          return Promise.resolve({ unavailable: true });
+        }
+        return window.electronAPI.initialCloudSync().then(function(r) {
+          return r || { success: false, error: 'استجابة فارغة من جسر المزامنة' };
+        }).catch(function(e) {
+          return { unavailable: true, error: (e && e.message) || 'IPC failed' };
+        });
+      };
+
       if (window.electronAPI.loadingScreenReady) window.electronAPI.loadingScreenReady();
     } else {
       progressLabel.textContent = 'خطأ: جسر الإلكترون غير متاح';
@@ -621,6 +699,14 @@ function getLoadingHTML() {
 // ─── Diagnostic Runner ─────────────────────────────────────────────────────
 
 function sendUpdate(mainWindow, data) {
+  // Mirror every diagnostics log line into the main-process console so the
+  // `bun run electron:dev` output alone is enough to isolate failures.
+  if (data && data.log) {
+    const line = `[Diagnostics] ${data.log}`;
+    if (data.logType === 'fail') console.error(line);
+    else if (data.logType === 'warn') console.warn(line);
+    else console.log(line);
+  }
   if (mainWindow && !mainWindow.isDestroyed()) {
     try {
       mainWindow.webContents.send('diagnostics:update', data);
@@ -641,7 +727,7 @@ function probeUrl(url, timeoutMs = 4000) {
       try { request.abort(); } catch { /* ignore */ }
       resolve({ ...result, timeMs: Date.now() - start });
     };
-    const timer = setTimeout(() => done({ reachable: false }), timeoutMs);
+    const timer = setTimeout(() => done({ reachable: false, error: 'timeout' }), timeoutMs);
     request.on('response', (response) => {
       clearTimeout(timer);
       let body = '';
@@ -650,11 +736,11 @@ function probeUrl(url, timeoutMs = 4000) {
         done({ reachable: true, statusCode: response.statusCode, body });
       });
     });
-    request.on('error', () => {
+    request.on('error', (err) => {
       clearTimeout(timer);
-      done({ reachable: false });
+      done({ reachable: false, error: err?.message || 'connection failed' });
     });
-    try { request.end(); } catch { clearTimeout(timer); done({ reachable: false }); }
+    try { request.end(); } catch (err) { clearTimeout(timer); done({ reachable: false, error: err?.message || 'request failed' }); }
   });
 }
 
@@ -688,6 +774,46 @@ function postUrl(url, body, timeoutMs = 5000) {
       done({ reachable: false, error: err.message });
     });
     request.setHeader('Content-Type', 'application/json');
+    try {
+      request.write(JSON.stringify(body));
+      request.end();
+    } catch { clearTimeout(timer); done({ reachable: false, error: 'write failed' }); }
+  });
+}
+
+/**
+ * Make an authenticated POST request using Electron's net module.
+ * Used by the startup gate for local-API endpoints that require a Bearer
+ * token (e.g. POST /api/sync/initial-sync/run).
+ */
+function postAuthUrl(url, body, token, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const request = net.request(url);
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      try { request.abort(); } catch { /* ignore */ }
+      resolve({ ...result, timeMs: Date.now() - start });
+    };
+    const timer = setTimeout(() => done({ reachable: false, error: 'timeout' }), timeoutMs);
+    if (token) request.setHeader('Authorization', 'Bearer ' + token);
+    request.setHeader('Content-Type', 'application/json');
+    request.on('response', (response) => {
+      clearTimeout(timer);
+      let bodyStr = '';
+      response.on('data', (chunk) => { bodyStr += chunk.toString(); });
+      response.on('end', () => {
+        let parsed = null;
+        try { parsed = JSON.parse(bodyStr); } catch { /* ignore */ }
+        done({ reachable: true, statusCode: response.statusCode, body: bodyStr, json: parsed });
+      });
+    });
+    request.on('error', (err) => {
+      clearTimeout(timer);
+      done({ reachable: false, error: err.message });
+    });
     try {
       request.write(JSON.stringify(body));
       request.end();
@@ -815,6 +941,44 @@ async function runDiagnostics(mainWindow, config) {
   const { cloudBaseUrl, isDev, userDataPath } = config;
   const results = [];
 
+  /**
+   * Compute the diagnostics verdict, notify the renderer, and return the
+   * launch-gate result. Used by the normal end-of-run path and by the
+   * early-return when the local database fails startup initialization.
+   */
+  function finalizeDiagnostics() {
+    const allPassed = results.every(r => r.status === 'success');
+    const hasWarnings = results.some(r => r.status === 'warning');
+    const hasErrors = results.some(r => r.status === 'error');
+
+    const successCount = results.filter(r => r.status === 'success').length;
+    console.log(`[Diagnostics] Complete — ${successCount}/${results.length} passed`);
+    // Full per-step breakdown — the console alone isolates which steps
+    // failed and why (the loading-screen panel shows the same, truncated).
+    console.log('[Diagnostics] ────── RESULTS BREAKDOWN ──────');
+    for (const r of results) {
+      const icon = r.status === 'success' ? '✓' : r.status === 'warning' ? '▲' : '✗';
+      console.log(`[Diagnostics] ${icon} [${String(r.status).toUpperCase()}] ${r.step} — ${r.message || '(no message)'}`);
+      if (r.detail && r.status !== 'success') {
+        try { console.log(`[Diagnostics]     ${r.step} detail: ${JSON.stringify(r.detail).substring(0, 600)}`); } catch { /* ignore */ }
+      }
+    }
+    const finalErrors = results.filter(r => r.status === 'error');
+    const finalWarnings = results.filter(r => r.status === 'warning');
+    if (finalErrors.length) console.error(`[Diagnostics] ${finalErrors.length} ERROR(S) → ${finalErrors.map(r => r.step).join(', ')}`);
+    if (finalWarnings.length) console.warn(`[Diagnostics] ${finalWarnings.length} WARNING(S) → ${finalWarnings.map(r => r.step).join(', ')}`);
+    if (!finalErrors.length && !finalWarnings.length) console.log('[Diagnostics] All checks passed cleanly.');
+
+    try {
+      mainWindow.webContents.send('diagnostics:finalized', {
+        completedSteps: results.map(r => r.step),
+        totalSteps: DIAGNOSTIC_STEPS.length,
+      });
+    } catch (_) { /* window may be gone */ }
+
+    return { results, allPassed: allPassed || (!hasErrors && hasWarnings) };
+  }
+
   console.log('[Diagnostics] Starting startup diagnostics (new flow)...');
 
   let localApiPort = null;
@@ -823,6 +987,56 @@ async function runDiagnostics(mainWindow, config) {
   let agencyId = null;
   let cloudAuthToken = null;
   let cloudUser = null;
+
+  // ── Per-step console detail (isolation aid) ─────────────────────────────
+  // Every result is printed with a status icon, step name, human message and
+  // compact detail JSON — the console alone is enough to triage failures.
+  const STATUS_ICON = { success: '✓', warning: '▲', error: '✗' };
+  function pushResult(result) {
+    results.push(result);
+    sendUpdate(mainWindow, result);
+    const icon = STATUS_ICON[result.status] || '·';
+    let line = `[Diagnostics] ${icon} ${result.step}: ${String(result.status).toUpperCase()}${result.message ? ` — ${result.message}` : ''}`;
+    if (result.detail) {
+      try {
+        const d = JSON.stringify(result.detail);
+        if (d && d !== '{}') line += ` | detail: ${d.substring(0, 300)}`;
+      } catch { /* non-serializable detail */ }
+    }
+    (result.status === 'error' ? console.error : result.status === 'warning' ? console.warn : console.log)(line);
+  }
+
+  // ── 0. Load stored credentials (BEFORE every step) ──────────────────────
+  // Moved ahead of the cloud probe so the sync-endpoint validation can
+  // authenticate — some API builds answer 404 for unauthenticated requests,
+  // which previously produced false "misconfigured origin" verdicts.
+  let storedAuth = null;
+  try {
+    const pathMod = require('path');
+    const fs = require('fs');
+    const authStorePath = pathMod.join(userDataPath, 'blasti-auth.json');
+    if (fs.existsSync(authStorePath)) {
+      try {
+        storedAuth = JSON.parse(fs.readFileSync(authStorePath, 'utf-8'));
+        const u = storedAuth.user || {};
+        console.log(`[Diagnostics] Stored auth: user=${u.username || u.email || '?'} agency=${u.agencyId ? String(u.agencyId).substring(0, 8) + '…' : 'none'} token=${storedAuth.token ? `present (${String(storedAuth.token).length} chars)` : 'MISSING'}`);
+      } catch (parseErr) {
+        console.warn(`[Diagnostics] Stored auth file malformed (${authStorePath}): ${parseErr.message}`);
+      }
+    } else {
+      console.log('[Diagnostics] No stored auth file (blasti-auth.json) — onboarding path');
+    }
+  } catch (authErr) {
+    console.warn('[Diagnostics] Could not read stored auth:', authErr.message);
+  }
+
+  if (storedAuth && storedAuth.token && storedAuth.user) {
+    cloudAuthToken = storedAuth.token;
+    cloudUser = storedAuth.user;
+    agencyId = cloudUser.agencyId || null;
+  }
+
+  const hasStoredSession = !!(cloudAuthToken && cloudUser);
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 1: Check/Start Local Server
@@ -863,8 +1077,13 @@ async function runDiagnostics(mainWindow, config) {
 
       const pathMod = require('path');
       const fs = require('fs');
+      // Single authoritative DB dir (spec §5/§6): main.js already resolved
+      // <userData>/blasti-local at module scope. Do NOT override a value set
+      // by main — this is a consistency assertion, not a second decision.
       const localDbDir = pathMod.join(userDataPath, 'blasti-local');
-      process.env.BLASTI_LOCAL_DB_DIR = localDbDir;
+      if (!process.env.BLASTI_LOCAL_DB_DIR) {
+        process.env.BLASTI_LOCAL_DB_DIR = localDbDir;
+      }
 
       if (!fs.existsSync(localDbDir)) {
         fs.mkdirSync(localDbDir, { recursive: true });
@@ -903,6 +1122,27 @@ async function runDiagnostics(mainWindow, config) {
           message: `قاعدة البيانات غير متاحة — ${dbStatus.error || 'خطأ غير معروف'}`,
         };
       } else {
+        // Controlled NON-DESTRUCTIVE schema lifecycle (spec §1-§4): resolves
+        // the authoritative path, migrates a legacy DB (copy+verify),
+        // creates/adopts/upgrades the schema without ever dropping tables,
+        // and verifies required tables + integrity. Replaces the old
+        // `prisma db push --accept-data-loss` startup push entirely.
+        try {
+          const dbReadyResult = await dbModule.ensureDatabaseReady();
+          if (!dbReadyResult.ok) {
+            console.error('[Diagnostics] Local DB schema initialization FAILED:', dbReadyResult.error);
+            serverResult = {
+              step: 'local-server',
+              status: 'error',
+              message: `فشل تهيئة قاعدة البيانات المحلية — ${dbReadyResult.error || 'خطأ غير معروف'}`,
+            };
+            pushResult(serverResult);
+            // Jump to summary — later steps cannot run without a DB.
+            return finalizeDiagnostics();
+          }
+        } catch (dbReadyErr) {
+          console.error('[Diagnostics] ensureDatabaseReady threw:', dbReadyErr.message);
+        }
         await setupPragmas();
         await localDb.$queryRaw`SELECT 1 as ok`;
 
@@ -930,7 +1170,8 @@ async function runDiagnostics(mainWindow, config) {
         }
 
         if (verifyCheck.reachable) {
-          const dbPath = pathMod.join(localDbDir, 'local.db');
+          // Read the authoritative path from the DB manager (never recompute).
+          const dbPath = dbModule.getDbStatus().path || pathMod.join(localDbDir, 'local.db');
           const dbSize = fs.existsSync(dbPath) ? `${Math.round(fs.statSync(dbPath).size / 1024)}KB` : 'جديد';
           serverResult = {
             step: 'local-server',
@@ -957,8 +1198,7 @@ async function runDiagnostics(mainWindow, config) {
     console.error('[Diagnostics] Local server error:', err.message);
   }
 
-  results.push(serverResult);
-  sendUpdate(mainWindow, serverResult);
+  pushResult(serverResult);
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 2: Check Cloud API Connection
@@ -967,7 +1207,7 @@ async function runDiagnostics(mainWindow, config) {
     step: 'cloud-api',
     status: 'running',
     message: 'جاري فحص اتصال السحابة...',
-    log: `[INFO] Probing cloud at ${cloudBaseUrl}/health`,
+    log: `[INFO] Probing cloud at ${cloudBaseUrl}/api/health`,
     logType: 'info',
   });
 
@@ -975,730 +1215,620 @@ async function runDiagnostics(mainWindow, config) {
 
   let cloudResult = { step: 'cloud-api', status: 'warning', message: 'السحابة غير متاحة' };
   try {
-    const cloudProbe = await probeUrl(`${cloudBaseUrl}/health`, 5000);
-    if (cloudProbe.reachable) {
-      cloudAvailable = true;
+    // A generic health ping is NOT sufficient (spec §13): a static web host
+    // can answer while every /api/* route 404s. Validate BOTH the health
+    // endpoint AND a real sync endpoint before declaring the cloud OK.
+    const healthUrl = `${cloudBaseUrl}/api/health`;
+    const cloudProbe = await probeUrl(healthUrl, 5000);
+    console.log(`[Diagnostics] Cloud probe GET ${healthUrl} → ${cloudProbe.reachable ? `HTTP ${cloudProbe.statusCode} (${cloudProbe.timeMs}ms)` : `UNREACHABLE (${cloudProbe.error || 'no connection'})`}`);
+    const healthOk = cloudProbe.reachable && cloudProbe.statusCode === 200;
+
+    // Server identity (isolation aid): distinguishes "outdated @blasti/api
+    // build" from "a completely different service occupying the port" — the
+    // two possible causes when health answers 200 but sync routes 404.
+    // @blasti/api /api/health returns { status, service: '@blasti/api', version, ... }.
+    let cloudIdentity = null;
+    try {
+      const healthJson = cloudProbe.body ? JSON.parse(cloudProbe.body) : null;
+      if (healthJson && typeof healthJson === 'object') {
+        cloudIdentity = { service: healthJson.service || healthJson.name || null, version: healthJson.version || null };
+      }
+    } catch { /* non-JSON health body — identity unrecognized */ }
+    console.log(`[Diagnostics] Cloud identity: ${cloudIdentity && cloudIdentity.service
+      ? `${cloudIdentity.service} v${cloudIdentity.version || '?'}`
+      : `UNRECOGNIZED (body: ${String(cloudProbe.body || '').replace(/\s+/g, ' ').trim().substring(0, 120) || 'empty'})`}`);
+
+    if (healthOk) {
+      // Probe POST /api/sync/pull — WITH the stored token when available:
+      // a REAL sync API answers 200/400/401/403/422/500, a static host (or
+      // an outdated API build) answers 404. Authenticated probing avoids
+      // false "misconfigured origin" verdicts on APIs that 404 when
+      // unauthenticated.
+      const syncProbeUrl = `${cloudBaseUrl}/api/sync/pull`;
+      const probeBody = { agencyId: agencyId || 'diagnostics-probe' };
+      const syncProbe = cloudAuthToken
+        ? await postAuthUrl(syncProbeUrl, probeBody, cloudAuthToken, 5000)
+        : await postUrl(syncProbeUrl, probeBody, 5000);
+      const syncStatus = syncProbe?.statusCode || 0;
+      const syncBody = String(syncProbe?.body || '').replace(/\s+/g, ' ').trim().substring(0, 140);
+      console.log(`[Diagnostics] Cloud sync probe POST ${syncProbeUrl} (${cloudAuthToken ? 'with stored token' : 'NO token'}) → ${syncProbe?.reachable ? `HTTP ${syncStatus}` : `UNREACHABLE (${syncProbe?.error || 'no connection'})`}${syncBody ? ` | body: ${syncBody}` : ''}`);
+      // 401/403 → the route EXISTS but rejected the credential (expired
+      // token): origin is correct, re-login fixes it. 404 → this origin does
+      // not host the sync API (static web host or outdated API build).
+      const authRejected = syncStatus === 401 || syncStatus === 403;
+      const syncEndpointOk = syncStatus > 0 && syncStatus !== 404;
+      if (syncEndpointOk && !authRejected) {
+        cloudAvailable = true;
+        cloudResult = {
+          step: 'cloud-api',
+          status: 'success',
+          message: `السحابة متاحة — ${cloudBaseUrl} (${cloudProbe.timeMs}ms)`,
+          detail: { url: cloudBaseUrl, timeMs: cloudProbe.timeMs, healthStatus: cloudProbe.statusCode, syncEndpointStatus: syncStatus },
+        };
+        sendUpdate(mainWindow, { log: `[OK] Cloud API verified at ${cloudBaseUrl} (health ${cloudProbe.statusCode}, sync endpoint ${syncStatus})`, logType: 'ok' });
+      } else if (authRejected) {
+        // Origin hosts the sync API — the credential is the problem, not the URL.
+        cloudAvailable = true;
+        cloudResult = {
+          step: 'cloud-api',
+          status: 'warning',
+          message: `واجهة المزامنة موجودة لكن رفضت المصادقة (HTTP ${syncStatus}) — أعد تسجيل الدخول`,
+          detail: { url: cloudBaseUrl, healthStatus: cloudProbe.statusCode, syncEndpointStatus: syncStatus, syncBody: syncBody || undefined },
+        };
+        sendUpdate(mainWindow, { log: `[WARN] Sync API present at ${cloudBaseUrl} but auth rejected (HTTP ${syncStatus}) — re-login will refresh the token`, logType: 'warn' });
+      } else if (syncStatus === 404) {
+        // Classification (isolation aid): the health identity tells us WHICH
+        // fix applies — restarting a stale @blasti/api build vs pointing
+        // BLASTI_CLOUD_URL at the correct origin.
+        const isBlastiApi = !!(cloudIdentity && cloudIdentity.service === '@blasti/api');
+        const cloudFixHint = isBlastiApi
+          ? 'The process DID identify as @blasti/api but its RUNNING BUILD predates the v2 sync routes — restart the cloud API from the current checkout (cd apps/api && bun run dev) so /api/sync/* gets registered.'
+          : 'The process on this port did NOT identify as @blasti/api — start apps/api on this port (cd apps/api && bun run dev) or set BLASTI_CLOUD_URL to the origin that hosts the v2 sync API.';
+        cloudResult = {
+          step: 'cloud-api',
+          status: 'error',
+          message: `خادم السحابة لا يستضيف واجهة المزامنة — ${cloudBaseUrl} أرجع 404 لـ /api/sync/pull`,
+          detail: {
+            url: cloudBaseUrl,
+            healthStatus: cloudProbe.statusCode,
+            syncEndpointStatus: syncStatus,
+            probedWithToken: !!cloudAuthToken,
+            cloudIdentity: cloudIdentity || 'unrecognized',
+            syncBody: syncBody || undefined,
+            fixHint: cloudFixHint,
+          },
+        };
+        sendUpdate(mainWindow, { log: `[ERROR] ${cloudBaseUrl} does not host the sync API (/api/sync/pull → 404${cloudAuthToken ? ' even WITH the stored token' : ', and no token was available to retry'}). ${cloudFixHint}`, logType: 'fail' });
+      } else {
+        cloudResult = {
+          step: 'cloud-api',
+          status: 'warning',
+          message: 'السحابة غير متاحة',
+          detail: { url: cloudBaseUrl, healthStatus: cloudProbe.statusCode, syncProbeError: syncProbe?.error || 'unreachable' },
+        };
+        sendUpdate(mainWindow, { log: `[WARN] Cloud sync probe unreachable — continuing in offline mode (${syncProbe?.error || 'no connection'})`, logType: 'fail' });
+      }
+    } else {
       cloudResult = {
         step: 'cloud-api',
-        status: 'success',
-        message: `السحابة متاحة — ${cloudBaseUrl} (${cloudProbe.timeMs}ms)`,
-        detail: { url: cloudBaseUrl, timeMs: cloudProbe.timeMs },
+        status: 'warning',
+        message: 'السحابة غير متاحة',
+        detail: { url: cloudBaseUrl, healthStatus: cloudProbe.statusCode || null, error: cloudProbe.error || 'unreachable' },
       };
-      sendUpdate(mainWindow, { log: `[OK] Cloud API reachable at ${cloudBaseUrl} (${cloudProbe.timeMs}ms)`, logType: 'ok' });
-      console.log(`[Diagnostics] Cloud API: OK (${cloudProbe.timeMs}ms)`);
-    } else {
-      sendUpdate(mainWindow, { log: `[WARN] Cloud API unreachable — continuing in offline mode`, logType: 'fail' });
-      console.warn('[Diagnostics] Cloud API: unreachable');
+      sendUpdate(mainWindow, { log: `[WARN] Cloud API unreachable — continuing in offline mode (${cloudBaseUrl}/api/health ${cloudProbe.error || 'no connection'})`, logType: 'fail' });
     }
   } catch (err) {
     sendUpdate(mainWindow, { log: `[WARN] Cloud check error: ${err.message}`, logType: 'fail' });
   }
 
-  results.push(cloudResult);
-  sendUpdate(mainWindow, cloudResult);
+  pushResult(cloudResult);
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 3: Import Agency Data from Cloud to Local DB
   // ═══════════════════════════════════════════════════════════════════════
+  // STEP 3: Initialize Local Workspace (gated v2 initial sync)
+  // ═══════════════════════════════════════════════════════════════════════
+  // Local-first launch gate (spec §5/§7/§8). The hand-rolled per-table
+  // importer (Agency/Services/Branches/Counters/Staff upserts with a hardcoded
+  // "M'Sila" city fallback) that previously lived here was REMOVED — the
+  // authoritative initializer is local-api/initial-sync.js runInitialSync
+  // (19-stage, state machine in AgencyLocalState). It MUST run inside the
+  // local API process state, so this gate drives it either:
+  //   - Primary:  IPC bridge → window.electronAPI.initialCloudSync()
+  //               (preload → ipcMain 'cloud-sync:initial-sync', rewired by
+  //               agent 7-b to runInitialSync + forwards per-stage progress
+  //               events on the 'initial-sync:progress' channel)
+  //   - Fallback: POST http://127.0.0.1:{port}/api/sync/initial-sync/run
+  //               (local API HTTP route exposed by agent 7-b)
+  //
+  // Gate behavior matrix:
+  //   fresh (NOT_INITIALIZED) + online  → run sync → READY → launch
+  //   fresh (NOT_INITIALIZED) + offline → BLOCKED: first setup needs internet
+  //   READY + online                    → skip run (already initialized) → launch
+  //   READY + offline                   → launch (offline-ready)
   sendUpdate(mainWindow, {
-    step: 'import-agency-data',
+    step: 'initial-sync',
     status: 'running',
-    message: 'جاري استيراد بيانات الوكالة...',
+    message: 'جاري تهيئة مساحة العمل المحلية...',
   });
 
   await delay(300);
 
-  let importResult = { step: 'import-agency-data', status: 'success', message: 'تم التخطي — لا يوجد اتصال بالسحابة (سيتم الاستيراد بعد تسجيل الدخول)' };
+  let initResult = {
+    step: 'initial-sync',
+    status: 'success',
+    message: 'تم التخطي — لا توجد بيانات اعتماد محفوظة (سيتم الاستيراد بعد تسجيل الدخول)',
+  };
 
-  if (cloudAvailable && localApiPort && serverResult.status === 'success') {
+  // ── 3.0 Credentials were loaded before STEP 1 (step 0) so the cloud
+  // probe could authenticate. Here we only summarize + probe local state.
+  console.log(`[Diagnostics] Session: ${hasStoredSession ? `stored (${cloudUser.username || cloudUser.email || 'unknown user'})` : 'none'} | agencyId: ${agencyId ? String(agencyId).substring(0, 8) + '…' : 'none'}`);
+
+  // Single local probe of the workspace state (initializationStatus, readiness).
+  // Tolerant: the /api/db-status contract fields land with agent 7-b; when the
+  // route or fields are missing we fall back to the legacy tolerant behavior.
+  let preDbStatus = null;
+  if (localApiPort && serverResult.status === 'success') {
     try {
-      // Try to get stored credentials from Electron store
-      // The preload.js exposes cloudSyncAuth — check main.js for stored creds
-      const pathMod = require('path');
-      const fs = require('fs');
-      const authStorePath = pathMod.join(userDataPath, 'blasti-auth.json');
+      const dbStatusRes = await fetchWithAuth(
+        `http://127.0.0.1:${localApiPort}/api/db-status`,
+        localApiToken || cloudAuthToken,
+        5000,
+      );
+      if (dbStatusRes && typeof dbStatusRes === 'object') preDbStatus = dbStatusRes;
+    } catch { /* route may not exist yet — tolerated */ }
+  }
+  const preInitStatus = preDbStatus?.initializationStatus || null; // NOT_INITIALIZED | INITIALIZING | READY | FAILED | null
+  const alreadyReady = preInitStatus === 'READY';
 
-      let storedAuth = null;
-      if (fs.existsSync(authStorePath)) {
+  // ── 3.1 Import session to local API (needed for authenticated local ops) ─
+  // This runs in BOTH online and offline modes — offline it restores the
+  // session so the renderer can talk to the local API after launch.
+  let sessionImported = false;
+  if (localApiPort && serverResult.status === 'success' && hasStoredSession) {
+    // Identity probe (isolation aid): confirms WHAT is actually serving the
+    // local port before we trust any of its answers. blasti-local answers
+    // /api/discover with { service: 'blasti-local', version, mode }.
+    let localIdentity = null;
+    try {
+      const discoverRes = await probeUrl(`http://127.0.0.1:${localApiPort}/api/discover`, 3000);
+      if (discoverRes.reachable && discoverRes.body) {
         try {
-          storedAuth = JSON.parse(fs.readFileSync(authStorePath, 'utf-8'));
-          console.log('[Diagnostics] Found stored auth for user:', storedAuth.user?.username || storedAuth.user?.email);
-        } catch { /* ignore */ }
+          const dj = JSON.parse(discoverRes.body);
+          localIdentity = { service: dj.service || null, version: dj.version || null, mode: dj.mode || null };
+        } catch { /* non-JSON — identity unrecognized */ }
       }
+    } catch { /* probe failure tolerated — identity stays null */ }
+    console.log(`[Diagnostics] Local API identity on :${localApiPort} → ${localIdentity && localIdentity.service
+      ? `${localIdentity.service} v${localIdentity.version || '?'} (${localIdentity.mode || 'unknown mode'})`
+      : 'UNRECOGNIZED — the process serving this port did not answer /api/discover as blasti-local'}`);
 
-      if (storedAuth && storedAuth.token && storedAuth.user) {
-        cloudAuthToken = storedAuth.token;
-        cloudUser = storedAuth.user;
-        agencyId = cloudUser.agencyId;
-
-        sendUpdate(mainWindow, {
-          step: 'import-agency-data',
-          status: 'running',
-          message: `جاري استيراد بيانات الوكالة ${agencyId ? '(' + agencyId.substring(0, 8) + '...)' : ''}...`,
-          log: `[INFO] Importing agency data for user: ${cloudUser.username || cloudUser.email}`,
-          logType: 'info',
-        });
-
-        // Import session to local API first
-        const importSession = await postUrl(`http://127.0.0.1:${localApiPort}/api/auth/import-session`, {
-          token: cloudAuthToken,
-          user: cloudUser,
-        });
-
-        if (importSession.reachable && importSession.json?.success) {
-          localApiToken = cloudAuthToken;
-          sendUpdate(mainWindow, { log: `[OK] Session imported to local API`, logType: 'ok' });
-
-          // Now fetch agency data from cloud and upsert into local DB
-          const importResults = {};
-
-          // Import Agency Profile
-          // Cloud response is a FLAT object (no {success, data} wrapper):
-          //   { id, name, nameAr, nameFr, address, category, phone, email, code, logoUrl, workingHoursStart, workingHoursEnd }
-          const agencyRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/profile`, cloudAuthToken);
-          if (agencyRes?.id) {
-            const { localDb: importDb } = require('./local-api/lib/db');
-            if (importDb) {
-              try {
-                const { code, ...rest } = agencyRes;
-                await importDb.agency.upsert({
-                  where: { id: agencyRes.id },
-                  update: {
-                    ...rest,
-                    customCode: code || agencyRes.id,
-                    ownerId: cloudUser.id,
-                    subscriptionStatus: 'ACTIVE',
-                    isQueueOpen: true,
-                    isActive: true,
-                    // Prisma defaults for required fields not in response
-                    city: 'M\'Sila',
-                    wilaya: '28',
-                  },
-                  create: {
-                    ...rest,
-                    customCode: code || agencyRes.id,
-                    ownerId: cloudUser.id,
-                    subscriptionStatus: 'ACTIVE',
-                    isQueueOpen: true,
-                    isActive: true,
-                    city: 'M\'Sila',
-                    wilaya: '28',
-                  },
-                });
-                importResults.agency = 'imported';
-                sendUpdate(mainWindow, { log: `[OK] Agency profile imported: ${agencyRes.name || agencyRes.id}`, logType: 'ok' });
-              } catch (e) {
-                console.warn('[Import] Agency error:', e.message);
-                sendUpdate(mainWindow, { log: `[WARN] Agency import failed: ${e.message.substring(0, 80)}`, logType: 'warn' });
-              }
-            }
-          } else {
-            sendUpdate(mainWindow, { log: `[SKIP] Agency profile: unexpected response shape`, logType: 'info' });
-          }
-
-          // Import Services
-          // Cloud response: { success: true, services: [...] }
-          const servicesRes = await fetchWithAuth(`${cloudBaseUrl}/api/services?agencyId=${agencyId}`, cloudAuthToken);
-          const servicesList = servicesRes?.services || (Array.isArray(servicesRes) ? servicesRes : null);
-          if (Array.isArray(servicesList) && servicesList.length > 0) {
-            const { localDb: importDb } = require('./local-api/lib/db');
-            if (importDb) {
-              for (const svc of servicesList) {
-                const { _count, ...svcData } = svc;
-                await importDb.service.upsert({
-                  where: { id: svc.id },
-                  update: svcData,
-                  create: { ...svcData, agencyId: svc.agencyId || agencyId },
-                }).catch(e => console.warn('[Import] Service error:', e.message));
-              }
-              importResults.services = `${servicesList.length} imported`;
-              sendUpdate(mainWindow, { log: `[OK] Services: ${servicesList.length} imported`, logType: 'ok' });
-            }
-          } else {
-            sendUpdate(mainWindow, { log: `[SKIP] Services: no data returned`, logType: 'info' });
-          }
-
-          // Import Branches
-          // Cloud response: { success: true, branches: [...] }  (each branch has _count but no counters)
-          const branchesRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/branches?agencyId=${agencyId}`, cloudAuthToken);
-          const branchesList = branchesRes?.branches || (Array.isArray(branchesRes) ? branchesRes : null);
-          if (Array.isArray(branchesList) && branchesList.length > 0) {
-            const { localDb: importDb } = require('./local-api/lib/db');
-            if (importDb) {
-              for (const branch of branchesList) {
-                const { _count, counters, ...branchData } = branch;
-                await importDb.branch.upsert({
-                  where: { id: branch.id },
-                  update: branchData,
-                  create: { ...branchData, agencyId: branch.agencyId || agencyId },
-                }).catch(e => console.warn('[Import] Branch error:', e.message));
-              }
-              importResults.branches = `${branchesList.length} imported`;
-              sendUpdate(mainWindow, { log: `[OK] Branches: ${branchesList.length} imported`, logType: 'ok' });
-            }
-          } else {
-            sendUpdate(mainWindow, { log: `[SKIP] Branches: no data returned`, logType: 'info' });
-          }
-
-          // Import Counters (nested under branches)
-          // Cloud response from /api/agency/counters: { counters: [...] }
-          const countersRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/counters?agencyId=${agencyId}`, cloudAuthToken);
-          const countersList = countersRes?.counters || (Array.isArray(countersRes) ? countersRes : null);
-          if (Array.isArray(countersList) && countersList.length > 0) {
-            const { localDb: importDb } = require('./local-api/lib/db');
-            if (importDb) {
-              for (const counter of countersList) {
-                const { _count, branch, staff, currentReservation, ...counterData } = counter;
-                const upsertPayload = {
-                  ...counterData,
-                  branchId: counter.branchId || counter.branch?.id,
-                  staffId: counter.staffId || counter.staff?.id || null,
-                };
-                await importDb.counter.upsert({
-                  where: { id: counter.id },
-                  update: upsertPayload,
-                  create: upsertPayload,
-                }).catch(e => console.warn('[Import] Counter error:', e.message));
-              }
-              importResults.counters = `${countersList.length} imported`;
-              sendUpdate(mainWindow, { log: `[OK] Counters: ${countersList.length} imported`, logType: 'ok' });
-            }
-          } else {
-            sendUpdate(mainWindow, { log: `[SKIP] Counters: no data returned`, logType: 'info' });
-          }
-
-          // Import Staff
-          // Cloud response: { staff: [...] }  (NO { success, data } wrapper)
-          const staffRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/staff?agencyId=${agencyId}`, cloudAuthToken);
-          const staffList = staffRes?.staff || (Array.isArray(staffRes) ? staffRes : null);
-          if (Array.isArray(staffList) && staffList.length > 0) {
-            const { localDb: importDb } = require('./local-api/lib/db');
-            if (importDb) {
-              for (const staff of staffList) {
-                const { _count, user, permissions: rawPermissions, ...staffData } = staff;
-                // permissions may be a parsed object (not a string) — store as JSON string for SQLite
-                const upsertPayload = {
-                  ...staffData,
-                  agencyId: staff.agencyId || agencyId,
-                  permissions: typeof rawPermissions === 'object' ? JSON.stringify(rawPermissions) : (rawPermissions || '{}'),
-                };
-                await importDb.agencyStaff.upsert({
-                  where: { id: staff.id },
-                  update: upsertPayload,
-                  create: upsertPayload,
-                }).catch(e => console.warn('[Import] Staff error:', e.message));
-              }
-              importResults.staff = `${staffList.length} imported`;
-              sendUpdate(mainWindow, { log: `[OK] Staff: ${staffList.length} imported`, logType: 'ok' });
-            }
-          } else {
-            sendUpdate(mainWindow, { log: `[SKIP] Staff: no data returned`, logType: 'info' });
-          }
-
-          // Import User profile
-          // Cloud response: { success: true, id, username, fullName, email, ... }  (flat, no .data wrapper)
-          const userRes = await fetchWithAuth(`${cloudBaseUrl}/api/user/profile`, cloudAuthToken);
-          if (userRes?.id) {
-            const { localDb: importDb } = require('./local-api/lib/db');
-            if (importDb) {
-              try {
-                // passwordHash is not returned by cloud API — required for create, not for update
-                // Use update-only (skip create) to avoid needing passwordHash
-                const { success, _count, notificationPreferences, notificationPref, ...userData } = userRes;
-                const existingUser = await importDb.user.findUnique({ where: { id: userData.id } }).catch(() => null);
-                if (existingUser) {
-                  await importDb.user.update({
-                    where: { id: userData.id },
-                    data: userData,
-                  }).catch(e => console.warn('[Import] User update error:', e.message));
-                } else {
-                  // Create with a placeholder passwordHash — local login won't use it
-                  // (auth is via cloud-imported session token, not local password)
-                  await importDb.user.create({
-                    data: {
-                      ...userData,
-                      passwordHash: '__cloud_imported__',
-                      notificationPreferences: notificationPreferences || '{"queue_called":true,"turn_approaching":true,"completed":true}',
-                    },
-                  }).catch(e => console.warn('[Import] User create error:', e.message));
-                }
-                importResults.user = 'imported';
-                sendUpdate(mainWindow, { log: `[OK] User profile imported`, logType: 'ok' });
-              } catch (e) {
-                console.warn('[Import] User error:', e.message);
-                sendUpdate(mainWindow, { log: `[WARN] User import failed: ${e.message.substring(0, 80)}`, logType: 'warn' });
-              }
-            }
-          } else {
-            sendUpdate(mainWindow, { log: `[SKIP] User profile: unexpected response shape`, logType: 'info' });
-          }
-
-          // Import Queue Settings
-          // The old code fetched /api/agency/queue which returns QUEUE ENTRIES, not settings.
-          // There is no dedicated QueueSettings endpoint in the cloud API.
-          // Instead, fetch /api/agency/settings for agency-level settings,
-          // and ensure a QueueSettings record exists in the local DB.
-          const agencySettingsRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/settings?agencyId=${agencyId}`, cloudAuthToken);
-          const { localDb: importDb } = require('./local-api/lib/db');
-          if (importDb && agencyId) {
-            try {
-              // Update agency record with settings from /api/agency/settings
-              if (agencySettingsRes && typeof agencySettingsRes === 'object') {
-                const { services, ...settingsData } = agencySettingsRes;
-                // Only update fields that exist on the Agency model
-                const agencyUpdateFields = {};
-                if (settingsData.avgServiceTime !== undefined) agencyUpdateFields.averageServiceTime = settingsData.avgServiceTime;
-                if (settingsData.maxReservations !== undefined) agencyUpdateFields.maxActiveReservations = settingsData.maxReservations;
-                if (settingsData.isQueueOpen !== undefined) agencyUpdateFields.isQueueOpen = settingsData.isQueueOpen;
-                if (settingsData.workingHoursStart !== undefined) agencyUpdateFields.workingHoursStart = settingsData.workingHoursStart;
-                if (settingsData.workingHoursEnd !== undefined) agencyUpdateFields.workingHoursEnd = settingsData.workingHoursEnd;
-                if (settingsData.autoPauseWhenFull !== undefined) agencyUpdateFields.autoPauseWhenFull = settingsData.autoPauseWhenFull;
-                if (settingsData.kioskModeEnabled !== undefined) agencyUpdateFields.kioskModeEnabled = settingsData.kioskModeEnabled;
-                if (settingsData.sponsorSms !== undefined) agencyUpdateFields.sponsorSms = settingsData.sponsorSms;
-                if (settingsData.smsBalance !== undefined) agencyUpdateFields.smsBalance = settingsData.smsBalance;
-                if (Object.keys(agencyUpdateFields).length > 0) {
-                  await importDb.agency.update({ where: { id: agencyId }, data: agencyUpdateFields }).catch(() => {});
-                }
-              }
-
-              // Ensure a QueueSettings record exists for this agency
-              const existingQs = await importDb.queueSettings.findFirst({ where: { agencyId } }).catch(() => null);
-              if (!existingQs) {
-                await importDb.queueSettings.create({
-                  data: {
-                    agencyId,
-                    lastIssuedNumber: 0,
-                    currentServingNumber: 0,
-                    isPaused: false,
-                  },
-                });
-                sendUpdate(mainWindow, { log: `[OK] QueueSettings created (defaults)`, logType: 'ok' });
-              } else {
-                sendUpdate(mainWindow, { log: `[OK] QueueSettings already exists`, logType: 'ok' });
-              }
-              importResults.queueSettings = 'imported';
-            } catch (e) {
-              console.warn('[Import] QueueSettings error:', e.message);
-              sendUpdate(mainWindow, { log: `[WARN] QueueSettings import failed: ${e.message.substring(0, 80)}`, logType: 'warn' });
-            }
-          }
-
-          const summaryParts = Object.entries(importResults).map(([k, v]) => `${k}: ${v}`);
-          importResult = {
-            step: 'import-agency-data',
-            status: 'success',
-            message: `تم استيراد ${Object.keys(importResults).length} أنواع بيانات — ${summaryParts.join(', ')}`,
-            detail: importResults,
-          };
-          console.log('[Diagnostics] Agency data import:', importResults);
-        } else {
-          importResult = {
-            step: 'import-agency-data',
-            status: 'success',
-            message: 'تم التخطي — بيانات الاعتماد غير صالحة (سيتم الاستيراد بعد تسجيل الدخول)',
-          };
-          sendUpdate(mainWindow, { log: `[SKIP] Session import failed — will import after fresh login`, logType: 'info' });
-        }
-      } else {
-        importResult = {
-          step: 'import-agency-data',
-          status: 'success',
-          message: 'تم التخطي — لا توجد بيانات اعتماد محفوظة (سيتم الاستيراد بعد تسجيل الدخول)',
-        };
-        sendUpdate(mainWindow, { log: `[SKIP] No stored auth — will import after login`, logType: 'info' });
-      }
-    } catch (err) {
-      importResult = {
-        step: 'import-agency-data',
-        status: 'success',
-        message: `تم التخطي — خطأ غير متوقع (${err.message.substring(0, 40)}) — سيتم الاستيراد بعد تسجيل الدخول`,
-      };
-      sendUpdate(mainWindow, { log: `[SKIP] Import error: ${err.message} — will retry after login`, logType: 'info' });
-      console.warn('[Diagnostics] Import skipped (error):', err.message);
-    }
-  } else if (!cloudAvailable) {
-    sendUpdate(mainWindow, { log: `[INFO] Cloud unavailable — checking local data and restoring session...`, logType: 'info' });
-    // CRITICAL FIX: Even when offline, we MUST restore the local API session.
-    // The renderer cannot access the local API without a valid session.
-    // Read saved auth from blasti-auth.json and import into local API.
+    const importUrl = `http://127.0.0.1:${localApiPort}/api/auth/import-session`;
     try {
-      const pathMod = require('path');
-      const fs = require('fs');
-      const authStorePath = pathMod.join(userDataPath, 'blasti-auth.json');
-
-      if (fs.existsSync(authStorePath) && localApiPort) {
-        const storedAuth = JSON.parse(fs.readFileSync(authStorePath, 'utf-8'));
-        if (storedAuth && storedAuth.token && storedAuth.user) {
-          cloudAuthToken = storedAuth.token;
-          cloudUser = storedAuth.user;
-          agencyId = cloudUser.agencyId;
-
-          sendUpdate(mainWindow, { log: `[INFO] Found saved auth — restoring session to local API...`, logType: 'info' });
-
-          const importSession = await postUrl(`http://127.0.0.1:${localApiPort}/api/auth/import-session`, {
-            token: cloudAuthToken,
-            user: cloudUser,
-          });
-
-          if (importSession.reachable && importSession.json?.success) {
-            localApiToken = cloudAuthToken;
-            sendUpdate(mainWindow, { log: `[OK] Session restored from saved auth (offline mode) — user: ${cloudUser.username || cloudUser.email}`, logType: 'ok' });
-            console.log('[Diagnostics] Session restored from saved auth (offline):', cloudUser.username);
-          } else {
-            sendUpdate(mainWindow, { log: `[WARN] Session restore failed (offline) — renderer will retry`, logType: 'fail' });
-          }
-        } else {
-          sendUpdate(mainWindow, { log: `[INFO] No saved auth found — first run or not logged in`, logType: 'info' });
-        }
+      const importSession = await postUrl(importUrl, {
+        token: cloudAuthToken,
+        user: cloudUser,
+      });
+      if (importSession.reachable && importSession.json?.success) {
+        localApiToken = cloudAuthToken;
+        sessionImported = true;
+        sendUpdate(mainWindow, {
+          log: `[OK] Session imported to local API — user: ${cloudUser.username || cloudUser.email}`,
+          logType: 'ok',
+        });
       } else {
-        sendUpdate(mainWindow, { log: `[INFO] No auth file found at ${authStorePath}`, logType: 'info' });
+        const importBody = String(importSession.body || '').replace(/\s+/g, ' ').trim().substring(0, 120);
+        sendUpdate(mainWindow, {
+          log: `[WARN] Session import failed (HTTP ${importSession.statusCode || 'n/a'})${importBody ? ` — ${importBody}` : ' — no response body'} — continuing`,
+          logType: 'warn',
+        });
+        console.log(`[Diagnostics] Session import failed: POST ${importUrl} → HTTP ${importSession.statusCode || 'n/a'} | body: ${importBody || '(none)'} | local identity: ${localIdentity ? localIdentity.service : 'unrecognized'}`);
+        // ── Isolation hint + in-process fallback ─────────────────────────
+        // POST /api/auth/import-session is registered in THIS checkout; a 404
+        // from the local notFound handler means the RUNNING local-api code is
+        // older than this checkout (stale process or stale file). Recover by
+        // importing the session directly in-process — the same primitives the
+        // IPC handlers (local-api:set-session / cloud-sync:set-auth) use:
+        try {
+          const localApiModule = require('./local-api/index');
+          localApiModule.setSession(cloudAuthToken, cloudUser);
+          try {
+            const syncServiceModule = require('./local-api/sync-service');
+            syncServiceModule.setAuth(cloudAuthToken, cloudUser);
+          } catch (authErr) {
+            console.warn('[Diagnostics] SyncService setAuth fallback skipped:', authErr.message);
+          }
+          localApiToken = cloudAuthToken;
+          sessionImported = true;
+          console.log(`[Diagnostics] Session import FALLBACK via in-process setSession+setAuth succeeded — user: ${cloudUser.username || cloudUser.email || cloudUser.id || 'unknown'}`);
+          sendUpdate(mainWindow, {
+            log: `[OK] Session restored via in-process fallback (HTTP import was rejected) — user: ${cloudUser.username || cloudUser.email}`,
+            logType: 'ok',
+          });
+        } catch (fallbackErr) {
+          console.error('[Diagnostics] Session fallback FAILED:', fallbackErr.message);
+        }
       }
     } catch (e) {
-      sendUpdate(mainWindow, { log: `[WARN] Offline session restore error: ${e.message}`, logType: 'fail' });
+      sendUpdate(mainWindow, { log: `[WARN] Session import error: ${e.message}`, logType: 'warn' });
     }
-
-    // Check if local DB has data
-    try {
-      const { localDb: checkDb } = require('./local-api/lib/db');
-      if (checkDb) {
-        const agencyCount = await checkDb.agency.count();
-        if (agencyCount > 0) {
-          importResult = {
-            step: 'import-agency-data',
-            status: 'success',
-            message: `السحابة غير متاحة — استخدام البيانات المحلية (${agencyCount} وكالة) — تم استعادة الجلسة`,
-          };
-          sendUpdate(mainWindow, { log: `[OK] Using existing local data: ${agencyCount} agency(ies) + session restored`, logType: 'ok' });
-        } else {
-          importResult = {
-            step: 'import-agency-data',
-            status: localApiToken ? 'success' : 'warning',
-            message: localApiToken
-              ? 'الجلسة مستعادة لكن قاعدة البيانات المحلية فارغة'
-              : 'لا توجد بيانات محلية ولا جلسة محفوظة',
-          };
-          sendUpdate(mainWindow, { log: `[WARN] Local DB empty (agencyCount=0) ${localApiToken ? 'but session restored' : 'and no session'}`, logType: localApiToken ? 'info' : 'fail' });
-        }
-      }
-    } catch { /* ignore */ }
-  } else {
-    sendUpdate(mainWindow, { log: `[INFO] Local server not running — skipping import`, logType: 'info' });
   }
 
-  results.push(importResult);
-  sendUpdate(mainWindow, importResult);
+  // ── 3.2 Run the v2 initial sync (only when needed) ──────────────────────
+  // Skip when: no stored session (user will login → login flow triggers sync),
+  // cloud unreachable, local server down, or workspace already READY.
+  const mustRunSync = hasStoredSession && cloudAvailable && localApiPort
+    && serverResult.status === 'success' && !alreadyReady;
+
+  let syncOutcome = null; // { via: 'ipc'|'http', success, totalRecords?, error?, alreadyInitialized? }
+  let syncAttempted = false;
+
+  if (mustRunSync) {
+    sendUpdate(mainWindow, {
+      step: 'initial-sync',
+      status: 'running',
+      message: 'جاري استيراد بيانات الوكالة...',
+      log: `[INFO] Initial sync starting for agency ${agencyId ? agencyId.substring(0, 8) + '…' : '(unknown)'} — v2 staged protocol`,
+      logType: 'info',
+    });
+
+    // ── Primary path: IPC bridge via the loading-screen renderer ────────
+    // window.electronAPI lives in the RENDERER (preload contextIsolation
+    // bridge), not in this main-process diagnostics runner — so we invoke a
+    // small bridge function injected by the loading page
+    // (window.__blastiRunInitialSync → electronAPI.initialCloudSync()).
+    // Expected result shape (agent 7-b): { success, totalRecords?, error? }.
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        const bridgeResult = await Promise.race([
+          mainWindow.webContents.executeJavaScript(
+            '(window.__blastiRunInitialSync ? window.__blastiRunInitialSync() : Promise.resolve({ unavailable: true }))',
+            true,
+          ),
+          new Promise((resolve) => setTimeout(() => resolve({ timeout: true, error: 'IPC bridge timed out' }), 10 * 60 * 1000)),
+        ]);
+        if (bridgeResult && (bridgeResult.unavailable || bridgeResult.timeout)) {
+          sendUpdate(mainWindow, {
+            log: `[INFO] IPC bridge unavailable (${bridgeResult.error || 'no handler'}) — trying local API HTTP endpoint`,
+            logType: 'info',
+          });
+        } else if (bridgeResult) {
+          syncAttempted = true;
+          syncOutcome = { via: 'ipc', ...bridgeResult };
+        }
+      }
+    } catch (bridgeErr) {
+      sendUpdate(mainWindow, {
+        log: `[WARN] IPC bridge error: ${String(bridgeErr?.message || bridgeErr).substring(0, 80)} — trying local API HTTP endpoint`,
+        logType: 'warn',
+      });
+    }
+
+    // ── Fallback path: local API HTTP endpoint (agent 7-b route) ────────
+    // Only used when the IPC path could not produce a definitive result
+    // (no bridge / handler rejected). A definitive { success: false } from
+    // the IPC handler is honored — the sync state machine already ran.
+    if (!syncAttempted && localApiPort) {
+      try {
+        const httpRes = await postAuthUrl(
+          `http://127.0.0.1:${localApiPort}/api/sync/initial-sync/run`,
+          {},
+          cloudAuthToken,
+          10 * 60 * 1000,
+        );
+        if (httpRes.reachable && httpRes.statusCode === 404) {
+          // Route not landed yet (agent 7-b) — treated as "both paths
+          // unavailable": workspace will initialize after login instead.
+          sendUpdate(mainWindow, {
+            log: '[INFO] /api/sync/initial-sync/run not available yet — workspace will initialize after login',
+            logType: 'info',
+          });
+        } else if (httpRes.reachable && httpRes.json) {
+          syncAttempted = true;
+          syncOutcome = { via: 'http', ...httpRes.json };
+        } else {
+          sendUpdate(mainWindow, {
+            log: `[WARN] HTTP initial-sync endpoint failed (HTTP ${httpRes.statusCode || 'unreachable'})`,
+            logType: 'warn',
+          });
+        }
+      } catch (httpErr) {
+        sendUpdate(mainWindow, {
+          log: `[WARN] HTTP initial-sync error: ${String(httpErr?.message || httpErr).substring(0, 80)}`,
+          logType: 'warn',
+        });
+      }
+    }
+
+    if (syncOutcome?.alreadyInitialized) {
+      sendUpdate(mainWindow, { log: '[OK] Workspace already initialized (READY) — skipped re-import', logType: 'ok' });
+    } else if (syncOutcome?.success === false && syncOutcome?.error) {
+      sendUpdate(mainWindow, { log: `[FAIL] Initial sync failed: ${String(syncOutcome.error).substring(0, 120)}`, logType: 'fail' });
+    }
+  } else if (alreadyReady) {
+    sendUpdate(mainWindow, {
+      log: '[INFO] Local workspace already READY — skipping initial sync',
+      logType: 'info',
+    });
+  } else if (!hasStoredSession) {
+    sendUpdate(mainWindow, {
+      log: '[SKIP] No stored auth — workspace will initialize after login',
+      logType: 'info',
+    });
+  } else if (!cloudAvailable) {
+    sendUpdate(mainWindow, {
+      log: '[INFO] Cloud unavailable — checking local workspace for offline readiness...',
+      logType: 'info',
+    });
+  }
+
+  // ── 3.3 Post-run readiness gate (GET /api/db-status) ────────────────────
+  // readiness.ready === true  → launch
+  // readiness.ready === false → block (with retry) unless the user has never
+  //                             logged in (onboarding: import happens after
+  //                             login) or the workspace is READY-but-offline.
+  let postDbStatus = null;
+  if (localApiPort && serverResult.status === 'success') {
+    try {
+      const postRes = await fetchWithAuth(
+        `http://127.0.0.1:${localApiPort}/api/db-status`,
+        localApiToken || cloudAuthToken,
+        5000,
+      );
+      if (postRes && typeof postRes === 'object' && (postRes.readiness || postRes.initializationStatus !== undefined)) {
+        postDbStatus = postRes;
+      }
+    } catch { /* tolerated — handled as unknown readiness below */ }
+  }
+
+  const readiness = postDbStatus?.readiness || null;
+  const postInitStatus = postDbStatus?.initializationStatus ?? preInitStatus;
+  const isReady = readiness ? readiness.ready === true : null; // null = contract missing (tolerated)
+
+  // Compact per-table counts summary for the log panel (best effort)
+  let countsSummary = null;
+  {
+    const counts = postDbStatus?.counts;
+    if (counts && typeof counts === 'object') {
+      const pickCount = (obj, name) => {
+        const keys = Object.keys(obj);
+        const exact = keys.find(k => k.toLowerCase() === name.toLowerCase());
+        return exact !== undefined ? obj[exact] : undefined;
+      };
+      const wanted = [
+        ['agency', 'وكالات'], ['service', 'خدمات'], ['branch', 'فروع'],
+        ['counter', 'طاولات'], ['agencyStaff', 'موظفين'], ['reservation', 'حجوزات'],
+      ];
+      countsSummary = wanted
+        .map(([key, label]) => `${label}=${pickCount(counts, key) ?? '؟'}`)
+        .join('، ');
+    }
+  }
+
+  if (isReady === true) {
+    // READY (fresh+online completed, or ready+online, or ready+offline)
+    initResult = {
+      step: 'initial-sync',
+      status: 'success',
+      message: !cloudAvailable
+        ? 'جاهز للعمل دون اتصال'
+        : 'مساحة العمل المحلية جاهزة',
+      detail: {
+        initializationStatus: postInitStatus,
+        counts: postDbStatus?.counts || undefined,
+        recordsImported: syncOutcome?.totalRecords,
+        via: syncOutcome?.via,
+      },
+    };
+    if (countsSummary) {
+      sendUpdate(mainWindow, { log: `[OK] السجلات المحلية: ${countsSummary}`, logType: 'ok' });
+    }
+    if (syncOutcome?.totalRecords !== undefined && !syncOutcome?.alreadyInitialized) {
+      sendUpdate(mainWindow, { log: `[OK] Initial sync imported ${syncOutcome.totalRecords} records (via ${syncOutcome.via})`, logType: 'ok' });
+    }
+    console.log('[Diagnostics] Local workspace READY — gate passed');
+  } else if (isReady === false) {
+    const failReason = readiness?.reason || postDbStatus?.lastError || (syncOutcome?.error ?? 'سبب غير معروف');
+    if (syncAttempted && cloudAvailable) {
+      // Sync ran (or was attempted) and the workspace is still not ready —
+      // a real failure: block launch, the error banner offers retry.
+      initResult = {
+        step: 'initial-sync',
+        status: 'error',
+        message: `فشل تهيئة مساحة العمل المحلية — ${String(failReason).substring(0, 90)}`,
+        detail: { reason: failReason, lastError: postDbStatus?.lastError, initializationStatus: postInitStatus },
+      };
+      sendUpdate(mainWindow, {
+        log: `[FAIL] Workspace not ready: ${String(failReason).substring(0, 120)}`,
+        logType: 'fail',
+      });
+    } else if (!cloudAvailable && postInitStatus !== 'READY') {
+      // Fresh install offline — the desktop must NOT enter an empty dashboard
+      // (spec §5). Block with a clear Arabic message.
+      initResult = {
+        step: 'initial-sync',
+        status: 'error',
+        message: 'الإعداد الأول يتطلب اتصالاً بالإنترنت لاستيراد بيانات الوكالة',
+        detail: {
+          initializationStatus: postInitStatus,
+          offline: true,
+          hasStoredSession,
+          cloudBaseUrl,
+          readinessReason: readiness?.reason || undefined,
+          hint: 'root cause is usually in the cloud-api step result above',
+        },
+      };
+      sendUpdate(mainWindow, { log: `[FAIL] Workspace not ready while cloud unavailable (status=${postInitStatus}, session=${hasStoredSession ? 'present' : 'none'}) — see the cloud-api step above for the root cause`, logType: 'fail' });
+    } else {
+      // Not ready but this is expected onboarding (never logged in) —
+      // the login flow triggers the initial sync after successful auth.
+      initResult = {
+        step: 'initial-sync',
+        status: 'success',
+        message: 'سيتم استيراد بيانات الوكالة بعد تسجيل الدخول',
+        detail: { initializationStatus: postInitStatus },
+      };
+      sendUpdate(mainWindow, { log: '[SKIP] Workspace not initialized — will import after login', logType: 'info' });
+    }
+  } else {
+    // readiness contract missing (agent 7-b route not landed) — tolerant
+    // legacy behavior so startup is never bricked by a missing probe route.
+    if (syncOutcome?.success === true) {
+      initResult = {
+        step: 'initial-sync',
+        status: 'success',
+        message: syncOutcome.alreadyInitialized
+          ? 'مساحة العمل المحلية مهيأة مسبقًا'
+          : `تم استيراد بيانات الوكالة (${syncOutcome.totalRecords ?? 0} سجل)`,
+        detail: { via: syncOutcome.via, totalRecords: syncOutcome.totalRecords },
+      };
+      sendUpdate(mainWindow, { log: `[OK] Initial sync OK via ${syncOutcome.via} — ${syncOutcome.totalRecords ?? 0} records`, logType: 'ok' });
+    } else if (syncOutcome?.success === false) {
+      initResult = {
+        step: 'initial-sync',
+        status: 'error',
+        message: `فشل استيراد بيانات الوكالة — ${String(syncOutcome.error || 'خطأ غير معروف').substring(0, 90)}`,
+        detail: { via: syncOutcome.via, error: syncOutcome.error },
+      };
+      sendUpdate(mainWindow, { log: `[FAIL] Initial sync failed: ${String(syncOutcome.error || '').substring(0, 120)}`, logType: 'fail' });
+    } else if (!cloudAvailable && hasStoredSession) {
+      // Offline with a session: rely on whatever local data exists.
+      initResult = {
+        step: 'initial-sync',
+        status: 'success',
+        message: sessionImported
+          ? 'السحابة غير متاحة — العمل بالبيانات المحلية (الجلسة مستعادة)'
+          : 'السحابة غير متاحة — تعذر استعادة الجلسة (سيتم الطلب بعد الاتصال)',
+        detail: { offline: true, sessionImported },
+      };
+      sendUpdate(mainWindow, { log: `[INFO] Offline mode — session ${sessionImported ? 'restored' : 'NOT restored'}`, logType: 'info' });
+    } else {
+      initResult = {
+        step: 'initial-sync',
+        status: 'success',
+        message: hasStoredSession
+          ? 'تم التخطي — تعذر تشغيل الاستيراد الأولي (سيتم الاستيراد بعد تسجيل الدخول)'
+          : 'تم التخطي — لا توجد بيانات اعتماد محفوظة (سيتم الاستيراد بعد تسجيل الدخول)',
+      };
+    }
+  }
+
+  pushResult(initResult);
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 3b: Verify Sync Integrity — compare local DB data with cloud
+  // STEP 3b: Verify — local DB readiness snapshot (light, single local call)
   // ═══════════════════════════════════════════════════════════════════════
+  // Replaces the old hand-rolled local↔cloud count comparison. The v2 sync
+  // state machine validates integrity itself (mandatory stages + validation
+  // step); here we only log a compact table-count summary from /api/db-status.
   sendUpdate(mainWindow, {
-    step: 'verify-sync-integrity',
+    step: 'verify',
     status: 'running',
-    message: 'جاري التحقق من اكتمال المزامنة...',
-    log: '[INFO] Verifying sync integrity — comparing local DB with cloud...',
+    message: 'جاري التحقق من قاعدة البيانات المحلية...',
+    log: '[INFO] Verifying local DB readiness via /api/db-status...',
     logType: 'info',
   });
 
-  await delay(300);
+  await delay(200);
 
   let verifyResult = {
-    step: 'verify-sync-integrity',
+    step: 'verify',
     status: 'success',
-    message: 'تم التخطي — لا توجد بيانات كافية للتحقق',
+    message: 'تم التخطي — الخادم المحلي غير متاح',
   };
-
-  // Tables we want to verify (Prisma model names → local table names)
-  const VERIFY_TABLES = [
-    { model: 'Agency', table: 'Agency', label: 'وكالات', cloudEndpoint: null },
-    { model: 'Service', table: 'Service', label: 'خدمات', cloudEndpoint: 'services' },
-    { model: 'Branch', table: 'Branch', label: 'فروع', cloudEndpoint: 'branches' },
-    { model: 'AgencyStaff', table: 'AgencyStaff', label: 'موظفين', cloudEndpoint: 'staff' },
-    { model: 'Counter', table: 'Counter', label: 'طاولات', cloudEndpoint: null },
-    { model: 'Reservation', table: 'Reservation', label: 'حجوزات', cloudEndpoint: null },
-    { model: 'QueueSettings', table: 'QueueSettings', label: 'إعدادات الطابور', cloudEndpoint: null },
-  ];
 
   if (localApiPort && serverResult.status === 'success') {
     try {
-      const { localDb: verifyDb } = require('./local-api/lib/db');
-      if (!verifyDb) {
-        verifyResult = {
-          step: 'verify-sync-integrity',
-          status: 'warning',
-          message: 'قاعدة البيانات المحلية غير متاحة للتحقق',
-        };
-        sendUpdate(mainWindow, { log: `[WARN] Local DB not available for verification`, logType: 'fail' });
-      } else {
-        // --- Phase A: Count local records ---
-        const localCounts = {};
-        for (const vt of VERIFY_TABLES) {
-          try {
-            const count = await verifyDb[vt.table].count();
-            localCounts[vt.model] = typeof count === 'bigint' ? Number(count) : count;
-          } catch (e) {
-            localCounts[vt.model] = -1; // table may not exist
-            sendUpdate(mainWindow, { log: `[WARN] Table ${vt.table} error: ${e.message.substring(0, 60)}`, logType: 'fail' });
-          }
-        }
+      const statusRes = await fetchWithAuth(
+        `http://127.0.0.1:${localApiPort}/api/db-status`,
+        localApiToken || cloudAuthToken,
+        5000,
+      );
 
-        const localTotalRecords = Object.values(localCounts).reduce((sum, c) => sum + (c > 0 ? c : 0), 0);
+      if (statusRes && typeof statusRes === 'object' && (statusRes.counts || statusRes.readiness)) {
+        // Compact counts table (Agency/Service/Branch/Counter/QueueSettings/Reservation)
+        const COUNT_LABELS = [
+          ['agency', 'وكالات'], ['service', 'خدمات'], ['branch', 'فروع'],
+          ['counter', 'طاولات'], ['queueSettings', 'إعدادات الطابور'], ['reservation', 'حجوزات'],
+        ];
+        const counts = statusRes.counts || {};
+        const pickCount = (obj, name) => {
+          if (!obj || typeof obj !== 'object') return undefined;
+          const keys = Object.keys(obj);
+          const exact = keys.find(k => k.toLowerCase() === name.toLowerCase());
+          return exact !== undefined ? obj[exact] : undefined;
+        };
+        const cells = COUNT_LABELS.map(([key, label]) => {
+          const v = pickCount(counts, key);
+          return `${label}=${v === undefined ? '؟' : v}`;
+        });
+        const totalRecords = Object.values(counts)
+          .filter(v => typeof v === 'number')
+          .reduce((sum, v) => sum + v, 0);
+
         sendUpdate(mainWindow, {
-          log: `[INFO] Local DB counts: ${VERIFY_TABLES.map(t => t.label + '=' + (localCounts[t.model] >= 0 ? localCounts[t.model] : 'ERR')).join(', ')} (total: ${localTotalRecords})`,
+          log: `[INFO] جدول السجلات المحلية: ${cells.join(' | ')} (المجموع: ${totalRecords})`,
           logType: 'info',
         });
 
-        // --- Phase B: Check if tables exist (schema) ---
-        const tablesResult = await verifyDb.$queryRawUnsafe("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'");
-        const existingTables = tablesResult ? tablesResult.map(r => r.name) : [];
-        const expectedTables = VERIFY_TABLES.map(t => t.table);
-        const missingTables = expectedTables.filter(t => !existingTables.includes(t));
-
-        if (missingTables.length > 0) {
-          sendUpdate(mainWindow, { log: `[WARN] Missing tables: ${missingTables.join(', ')}`, logType: 'fail' });
-        }
-
-        // --- Phase C: Compare with cloud (if available) ---
-        let cloudCounts = null;
-        let comparisonDetails = [];
-
-        if (cloudAvailable && cloudAuthToken && agencyId) {
-          sendUpdate(mainWindow, { log: '[INFO] Cloud available — fetching cloud counts for comparison...', logType: 'info' });
-          cloudCounts = {};
-
-          // Agency: from profile (1 record if successful)
-          try {
-            const agencyRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/profile`, cloudAuthToken, 5000);
-            cloudCounts.Agency = agencyRes?.id ? 1 : 0;
-          } catch { cloudCounts.Agency = -1; }
-
-          // Services
-          try {
-            const servicesRes = await fetchWithAuth(`${cloudBaseUrl}/api/services?agencyId=${agencyId}`, cloudAuthToken, 5000);
-            const servicesList = servicesRes?.services || (Array.isArray(servicesRes) ? servicesRes : []);
-            cloudCounts.Service = servicesList.length;
-          } catch { cloudCounts.Service = -1; }
-
-          // Branches
-          try {
-            const branchesRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/branches?agencyId=${agencyId}`, cloudAuthToken, 5000);
-            const branchesList = branchesRes?.branches || (Array.isArray(branchesRes) ? branchesRes : []);
-            cloudCounts.Branch = branchesList.length;
-          } catch { cloudCounts.Branch = -1; }
-
-          // Staff
-          try {
-            const staffRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/staff?agencyId=${agencyId}`, cloudAuthToken, 5000);
-            const staffList = staffRes?.staff || (Array.isArray(staffRes) ? staffRes : []);
-            cloudCounts.AgencyStaff = staffList.length;
-          } catch { cloudCounts.AgencyStaff = -1; }
-
-          // Reservations (from stats or queue endpoint)
-          try {
-            const statsRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/stats?agencyId=${agencyId}`, cloudAuthToken, 5000);
-            if (statsRes?.todayTotal !== undefined) {
-              cloudCounts.Reservation = statsRes.todayTotal;
-            } else if (statsRes?.totalReservations !== undefined) {
-              cloudCounts.Reservation = statsRes.totalReservations;
-            } else {
-              // Fallback: count from queue endpoint
-              const queueRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/queue?agencyId=${agencyId}&limit=1`, cloudAuthToken, 5000);
-              cloudCounts.Reservation = queueRes?.total || queueRes?.pagination?.total || -1;
-            }
-          } catch { cloudCounts.Reservation = -1; }
-
-          // QueueSettings: 1 per agency (always 1 if agency exists)
-          cloudCounts.QueueSettings = cloudCounts.Agency > 0 ? 1 : 0;
-
-          // Counter: from branches
-          try {
-            const countersRes = await fetchWithAuth(`${cloudBaseUrl}/api/agency/counters?agencyId=${agencyId}`, cloudAuthToken, 5000);
-            const countersList = countersRes?.counters || (Array.isArray(countersRes) ? countersRes : []);
-            cloudCounts.Counter = countersList.length;
-          } catch { cloudCounts.Counter = -1; }
-
-          sendUpdate(mainWindow, {
-            log: `[INFO] Cloud counts: ${VERIFY_TABLES.map(t => t.label + '=' + (cloudCounts[t.model] >= 0 ? cloudCounts[t.model] : 'ERR')).join(', ')}`,
-            logType: 'info',
-          });
-
-          // --- Phase D: Compare counts ---
-          let matchCount = 0;
-          let mismatchCount = 0;
-          let missingDataTables = []; // tables with local=0 but cloud>0
-
-          for (const vt of VERIFY_TABLES) {
-            const local = localCounts[vt.model];
-            const cloud = cloudCounts[vt.model];
-
-            if (local < 0 || cloud < 0) {
-              // Could not fetch one side — skip comparison
-              comparisonDetails.push({ table: vt.label, local, cloud, status: 'skip' });
-              continue;
-            }
-
-            // For reservations, local may have more (offline-created) or fewer (cloud has more history)
-            // We only flag as error if local has ZERO but cloud has data
-            if (local === 0 && cloud > 0) {
-              mismatchCount++;
-              missingDataTables.push(vt.label);
-              comparisonDetails.push({ table: vt.label, local, cloud, status: 'missing' });
-              sendUpdate(mainWindow, {
-                log: `[FAIL] ${vt.label}: local=0, cloud=${cloud} — TABLE EXISTS BUT NO DATA!`,
-                logType: 'fail',
-              });
-            } else if (local < cloud * 0.5 && cloud > 0) {
-              // Local has significantly less than cloud (>50% missing)
-              mismatchCount++;
-              comparisonDetails.push({ table: vt.label, local, cloud, status: 'partial' });
-              sendUpdate(mainWindow, {
-                log: `[WARN] ${vt.label}: local=${local}, cloud=${cloud} — partial sync (${Math.round((local / cloud) * 100)}%)`,
-                logType: 'fail',
-              });
-            } else if (local >= cloud) {
-              matchCount++;
-              comparisonDetails.push({ table: vt.label, local, cloud, status: 'ok' });
-            } else {
-              // Local has less but within 50% — acceptable (reservations, notifications may differ)
-              matchCount++;
-              comparisonDetails.push({ table: vt.label, local, cloud, status: 'acceptable' });
-              sendUpdate(mainWindow, {
-                log: `[OK] ${vt.label}: local=${local}, cloud=${cloud} — acceptable difference`,
-                logType: 'ok',
-              });
-            }
-          }
-
-          // Determine result status
-          if (missingDataTables.length > 0) {
-            // Critical: some tables have schema but NO data
+        if (statusRes.readiness?.ready === true) {
+          verifyResult = {
+            step: 'verify',
+            status: 'success',
+            message: `البيانات المحلية مكتملة — ${cells.join('، ')}`,
+            detail: { counts: statusRes.counts, readiness: statusRes.readiness },
+          };
+        } else if (statusRes.readiness) {
+          const reason = statusRes.readiness.reason || statusRes.lastError || 'غير جاهز';
+          if (!cloudAuthToken) {
+            // Never logged in — empty tables are the expected onboarding state.
             verifyResult = {
-              step: 'verify-sync-integrity',
-              status: 'error',
-              message: `جداول موجودة لكن بدون بيانات: ${missingDataTables.join(', ')}`,
-              detail: {
-                localCounts,
-                cloudCounts,
-                comparison: comparisonDetails,
-                missingTables: missingTables.length === 0 ? undefined : missingTables,
-                localTotalRecords,
-              },
-            };
-          } else if (mismatchCount > 0) {
-            verifyResult = {
-              step: 'verify-sync-integrity',
-              status: 'warning',
-              message: `${matchCount}/${matchCount + mismatchCount} جدول متطابق — ${mismatchCount} لديه فرق في البيانات`,
-              detail: {
-                localCounts,
-                cloudCounts,
-                comparison: comparisonDetails,
-                missingTables: missingTables.length === 0 ? undefined : missingTables,
-                localTotalRecords,
-              },
-            };
-          } else {
-            verifyResult = {
-              step: 'verify-sync-integrity',
+              step: 'verify',
               status: 'success',
-              message: `جميع الجداول والبيانات متزامنة — ${Object.keys(localCounts).length} جدول، ${localTotalRecords} سجل محلي`,
-              detail: {
-                localCounts,
-                cloudCounts,
-                comparison: comparisonDetails,
-                localTotalRecords,
-              },
+              message: 'الجداول جاهزة لكن فارغة — سيتم ملؤها بعد تسجيل الدخول',
+              detail: { counts: statusRes.counts, readiness: statusRes.readiness },
             };
-          }
-        } else if (!cloudAvailable) {
-          // --- Cloud not available: just verify local has data ---
-          sendUpdate(mainWindow, { log: '[INFO] Cloud unavailable — verifying local data integrity only...', logType: 'info' });
-
-          const tablesWithData = Object.entries(localCounts).filter(([_, count]) => count > 0);
-          const tablesWithZero = Object.entries(localCounts).filter(([_, count]) => count === 0);
-          const tablesWithError = Object.entries(localCounts).filter(([_, count]) => count < 0);
-
-          if (missingTables.length > 0) {
-            verifyResult = {
-              step: 'verify-sync-integrity',
-              status: 'error',
-              message: `جداول مفقودة: ${missingTables.join(', ')} — لا يمكن العمل بدونها`,
-              detail: { localCounts, missingTables, localTotalRecords },
-            };
-            sendUpdate(mainWindow, { log: `[FAIL] Missing tables: ${missingTables.join(', ')}`, logType: 'fail' });
-          } else if (tablesWithData.length === 0) {
-            // No data at all — might be first run without cloud
-            if (cloudAuthToken && agencyId) {
-              // Had auth but no data — real problem
-              verifyResult = {
-                step: 'verify-sync-integrity',
-                status: 'error',
-                message: 'جميع الجداول فارغة — لم يتم استيراد أي بيانات رغم وجود اتصال سابق',
-                detail: { localCounts, missingTables, localTotalRecords },
-              };
-              sendUpdate(mainWindow, { log: `[FAIL] ALL tables empty — no data was synced!`, logType: 'fail' });
-            } else {
-              // No auth — first run, expected
-              verifyResult = {
-                step: 'verify-sync-integrity',
-                status: 'success',
-                message: 'الجداول جاهزة لكن فارغة — سيتم ملؤها بعد تسجيل الدخول',
-                detail: { localCounts, missingTables, localTotalRecords },
-              };
-              sendUpdate(mainWindow, { log: `[OK] Tables exist but empty — will populate after login`, logType: 'ok' });
-            }
-          } else if (localCounts.Agency > 0 && localCounts.Service > 0) {
-            // Key tables have data — good
-            verifyResult = {
-              step: 'verify-sync-integrity',
-              status: 'success',
-              message: `بيانات محلية متوفرة — ${tablesWithData.length} جدول به بيانات، ${localTotalRecords} سجل إجمالي (وضع عدم الاتصال)`,
-              detail: { localCounts, missingTables, localTotalRecords },
-            };
-            sendUpdate(mainWindow, { log: `[OK] Local data available: ${tablesWithData.map(([t, c]) => t + '=' + c).join(', ')}`, logType: 'ok' });
+            sendUpdate(mainWindow, { log: '[SKIP] Tables empty (no session yet) — will populate after login', logType: 'info' });
           } else {
-            // Some tables have data but not the critical ones
+            // A session exists but the workspace is incomplete — block.
             verifyResult = {
-              step: 'verify-sync-integrity',
-              status: 'warning',
-              message: `بيانات جزئية — ${tablesWithData.length} جدول به بيانات من ${VERIFY_TABLES.length} (السحابة غير متاحة للتحقق)`,
-              detail: { localCounts, missingTables, localTotalRecords },
+              step: 'verify',
+              status: 'error',
+              message: `قاعدة البيانات غير مكتملة — ${String(reason).substring(0, 90)}`,
+              detail: { counts: statusRes.counts, readiness: statusRes.readiness, lastError: statusRes.lastError },
             };
-            sendUpdate(mainWindow, {
-              log: `[WARN] Partial data: ${tablesWithData.map(([t, c]) => t + '=' + c).join(', ')} — ${tablesWithZero.length} empty`,
-              logType: 'fail',
-            });
+            sendUpdate(mainWindow, { log: `[FAIL] DB not ready: ${String(reason).substring(0, 120)}`, logType: 'fail' });
           }
         } else {
-          // Cloud available but no auth — skip detailed comparison
+          // Counts present but no readiness object (pre-7-b db-status) — tolerant.
           verifyResult = {
-            step: 'verify-sync-integrity',
+            step: 'verify',
             status: 'success',
-            message: `الجداول جاهزة (${existingTables.length} جدول، ${localTotalRecords} سجل) — سيتم التحقق الكامل بعد تسجيل الدخول`,
-            detail: { localCounts, missingTables, localTotalRecords },
+            message: `سجلات محلية: ${cells.join('، ')}`,
+            detail: { counts: statusRes.counts },
           };
-          sendUpdate(mainWindow, { log: `[OK] Tables ready (${existingTables.length}), ${localTotalRecords} records — full verify after login`, logType: 'ok' });
         }
+      } else {
+        verifyResult = {
+          step: 'verify',
+          status: 'success',
+          message: 'تم التخطي — حالة قاعدة البيانات غير متاحة بعد',
+        };
+        sendUpdate(mainWindow, { log: '[INFO] /api/db-status contract not available yet — skipping verification', logType: 'info' });
       }
     } catch (err) {
       verifyResult = {
-        step: 'verify-sync-integrity',
+        step: 'verify',
         status: 'warning',
         message: `خطأ في التحقق: ${err.message.substring(0, 60)}`,
       };
       sendUpdate(mainWindow, { log: `[WARN] Verification error: ${err.message}`, logType: 'fail' });
-      console.warn('[Diagnostics] Verify sync error:', err.message);
+      console.warn('[Diagnostics] Verify error:', err.message);
     }
   } else {
-    verifyResult = {
-      step: 'verify-sync-integrity',
-      status: 'success',
-      message: 'تم التخطي — الخادم المحلي غير متاح',
-    };
     sendUpdate(mainWindow, { log: '[SKIP] Local server not available — skipping verification', logType: 'info' });
   }
 
-  results.push(verifyResult);
-  sendUpdate(mainWindow, verifyResult);
+  pushResult(verifyResult);
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 4: Disconnect Cloud (simulate offline) to test fallback
@@ -1736,8 +1866,7 @@ async function runDiagnostics(mainWindow, config) {
     sendUpdate(mainWindow, { log: `[OK] Cloud was already offline — proceeding with local test`, logType: 'ok' });
   }
 
-  results.push(disconnectResult);
-  sendUpdate(mainWindow, disconnectResult);
+  pushResult(disconnectResult);
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 5: Test Queue CRUD (create queue "next", then delete)
@@ -1881,8 +2010,7 @@ async function runDiagnostics(mainWindow, config) {
     sendUpdate(mainWindow, { log: `[SKIP] Local server not available — will test after startup`, logType: 'info' });
   }
 
-  results.push(crudResult);
-  sendUpdate(mainWindow, crudResult);
+  pushResult(crudResult);
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 6: Test ALL Local API Endpoints
@@ -2016,8 +2144,7 @@ async function runDiagnostics(mainWindow, config) {
     };
   }
 
-  results.push(endpointsResult);
-  sendUpdate(mainWindow, endpointsResult);
+  pushResult(endpointsResult);
 
   // ═══════════════════════════════════════════════════════════════════════
   // STEP 7: Reconnect to Cloud API
@@ -2078,37 +2205,25 @@ async function runDiagnostics(mainWindow, config) {
           localDb: syncDb,
           cloudBaseUrl,
           deviceId: 'desktop-' + require('crypto').randomBytes(4).toString('hex'),
-          syncIntervalMs: 2 * 60 * 1000,
+          // Use the engine default (30s) — the historic 2-minute override
+          // here silently slowed realtime reconciliation for this path.
           initialDelayMs: 5000,
         });
-        sendUpdate(mainWindow, { log: `[OK] Sync service started (2-min interval, ${reconnectResult?.status === 'success' ? 'cloud+local' : 'local-only'})`, logType: 'ok' });
+        sendUpdate(mainWindow, { log: `[OK] Sync service started (30s interval, ${reconnectResult?.status === 'success' ? 'cloud+local' : 'local-only'})`, logType: 'ok' });
       }
     } catch (syncErr) {
       sendUpdate(mainWindow, { log: `[WARN] Sync service: ${syncErr.message.substring(0, 80)}`, logType: 'fail' });
     }
   }
 
-  results.push(reconnectResult);
-  sendUpdate(mainWindow, reconnectResult);
+  pushResult(reconnectResult);
 
   // ═══════════════════════════════════════════════════════════════════════
   // Summary
   // ═══════════════════════════════════════════════════════════════════════
-  const allPassed = results.every(r => r.status === 'success');
-  const hasWarnings = results.some(r => r.status === 'warning');
-  const hasErrors = results.some(r => r.status === 'error');
-
-  console.log(`[Diagnostics] Complete — ${results.filter(r => r.status === 'success').length}/${results.length} passed`);
-
-  try {
-    mainWindow.webContents.send('diagnostics:finalized', {
-      completedSteps: results.map(r => r.step),
-      totalSteps: DIAGNOSTIC_STEPS.length,
-    });
-  } catch (_) { /* window may be gone */ }
-
-  return { results, allPassed: allPassed || (!hasErrors && hasWarnings) };
+  return finalizeDiagnostics();
 }
+
 
 // ─── Helper: Fetch with Auth (for cloud API) ──────────────────────────────
 

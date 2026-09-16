@@ -22,7 +22,7 @@ const { Hono } = require('hono')
 const { cors } = require('hono/cors')
 const { createServer } = require('http')
 const { randomBytes, timingSafeEqual, createHash, timingSafeEqual: _tse } = require('crypto')
-const { localDb, setupPragmas } = require('./lib/db')
+const { localDb, setupPragmas, ensureDatabaseReady } = require('./lib/db')
 
 // ─── Configuration ────────────────────────────────────────────────────────
 
@@ -44,6 +44,8 @@ let httpServer = null
 let sessionToken = null
 let sessionUser = null
 let eventListeners = []
+let mutationListeners = []
+let idemColumnEnsured = false
 
 // ─── Event Emitter (UI reactivity) ────────────────────────────────────────
 
@@ -71,6 +73,34 @@ function onEvent(callback) {
   eventListeners.push(callback)
   return () => {
     eventListeners = eventListeners.filter((cb) => cb !== callback)
+  }
+}
+
+// ─── Mutation Listeners (local→cloud sync immediacy) ──────────────────
+
+/**
+ * Register a callback fired (fire-and-forget) after every pending mutation
+ * is logged. main.js wires this to syncService.onLocalMutation() so the
+ * outbox replays to the cloud immediately when online.
+ * NOTE: do NOT require sync-service from inside this module at top level —
+ * sync-service lazily requires ./index (circular dependency).
+ * @param {() => void} callback
+ * @returns {() => void} unsubscribe function
+ */
+function setMutationListener(callback) {
+  mutationListeners.push(callback)
+  return () => {
+    mutationListeners = mutationListeners.filter((cb) => cb !== callback)
+  }
+}
+
+function notifyMutationLogged() {
+  for (const cb of mutationListeners) {
+    try {
+      cb()
+    } catch (err) {
+      console.error('[LocalAPI] Mutation listener error:', err)
+    }
   }
 }
 
@@ -167,8 +197,79 @@ function todayEndMs() {
 
 // ─── Offline Mutation Queue (write-ahead log) ───────────────────────────
 
+let _pendingMutationsBigintDone = false
+
+/**
+ * One-time in-place migration: legacy `_pending_mutations` tables declared
+ * `created_at`/`last_attempt_at` as INTEGER. quaint binds INTEGER columns as
+ * Int32 and epoch-millis values (Date.now()) overflow — every outbox insert
+ * would fail with "does not fit in an INT column". SQLite cannot ALTER a
+ * column type, so the table is rebuilt (rows preserved) with BIGINT columns.
+ */
+async function _migratePendingMutationsBigint() {
+  if (_pendingMutationsBigintDone || !db) return
+  try {
+    const cols = await db.$queryRawUnsafe('PRAGMA table_info("_pending_mutations")')
+    if (!cols || cols.length === 0) return
+    const createdCol = cols.find((c) => c.name === 'created_at')
+    if (!createdCol || String(createdCol.type || '').toUpperCase() === 'BIGINT') {
+      _pendingMutationsBigintDone = true
+      return
+    }
+    console.log('[LocalAPI] Migrating _pending_mutations timestamps INTEGER → BIGINT')
+    await db.$executeRawUnsafe('ALTER TABLE "_pending_mutations" RENAME TO "_pending_mutations_old"')
+    await db.$executeRawUnsafe(
+      'CREATE TABLE "_pending_mutations" (' +
+      '"id" TEXT PRIMARY KEY,' +
+      '"method" TEXT NOT NULL,' +
+      '"path" TEXT NOT NULL,' +
+      '"body" TEXT,' +
+      '"headers" TEXT,' +
+      '"status" TEXT NOT NULL DEFAULT \'pending\',' +
+      '"attempts" INTEGER NOT NULL DEFAULT 0,' +
+      '"max_attempts" INTEGER NOT NULL DEFAULT 5,' +
+      '"created_at" BIGINT NOT NULL,' +
+      '"last_attempt_at" BIGINT,' +
+      '"last_error" TEXT,' +
+      '"response_data" TEXT,' +
+      '"idempotency_key" TEXT' +
+      ')'
+    )
+    // The old table's shape varies by install age — introspect before copying.
+    const oldCols = await db.$queryRawUnsafe('PRAGMA table_info("_pending_mutations_old")')
+    const oldNames = new Set((oldCols || []).map((c) => c.name))
+    const headersExpr = oldNames.has('headers') ? '"headers"' : 'NULL'
+    const idemExpr = oldNames.has('idempotency_key') ? '"idempotency_key"' : 'NULL'
+    const attemptsExpr = oldNames.has('attempts') ? '"attempts"' : '0'
+    const maxAttemptsExpr = oldNames.has('max_attempts') ? '"max_attempts"' : '5'
+    const lastAttemptExpr = oldNames.has('last_attempt_at') ? '"last_attempt_at"' : 'NULL'
+    const lastErrorExpr = oldNames.has('last_error') ? '"last_error"' : 'NULL'
+    const statusExpr = oldNames.has('status') ? '"status"' : "'pending'"
+    await db.$executeRawUnsafe(
+      'INSERT OR IGNORE INTO "_pending_mutations" ' +
+      '("id","method","path","body","headers","status","attempts","max_attempts","created_at","last_attempt_at","last_error","response_data","idempotency_key") ' +
+      'SELECT "id","method","path","body",' + headersExpr + ',' + statusExpr + ',' + attemptsExpr + ',' + maxAttemptsExpr + ',"created_at",' + lastAttemptExpr + ',' + lastErrorExpr + ',"response_data",' + idemExpr + ' ' +
+      'FROM "_pending_mutations_old"'
+    )
+    await db.$executeRawUnsafe('DROP TABLE "_pending_mutations_old"')
+    await db.$executeRawUnsafe(
+      'CREATE INDEX IF NOT EXISTS "idx_pending_mutations_status" ON "_pending_mutations"("status")'
+    )
+    await db.$executeRawUnsafe(
+      'CREATE UNIQUE INDEX IF NOT EXISTS "idx_pending_mutations_idem" ON "_pending_mutations"("idempotency_key")'
+    ).catch(() => {})
+    _pendingMutationsBigintDone = true
+    console.log('[LocalAPI] _pending_mutations timestamps migrated to BIGINT')
+  } catch (e) {
+    console.warn('[LocalAPI] _pending_mutations BIGINT migration skipped:', e.message)
+  }
+}
+
 /**
  * Create the _pending_mutations table if it doesn't exist.
+ * Also (guarded) adds the v2 `idempotency_key` column + unique index and
+ * backfills legacy rows. Existing table name/columns are never changed
+ * (backward compat).
  */
 async function ensurePendingMutationsTable() {
   if (!db) return
@@ -183,8 +284,8 @@ async function ensurePendingMutationsTable() {
       '"status" TEXT NOT NULL DEFAULT \'pending\',' +
       '"attempts" INTEGER NOT NULL DEFAULT 0,' +
       '"max_attempts" INTEGER NOT NULL DEFAULT 5,' +
-      '"created_at" INTEGER NOT NULL,' +
-      '"last_attempt_at" INTEGER,' +
+      '"created_at" BIGINT NOT NULL,' +
+      '"last_attempt_at" BIGINT,' +
       '"last_error" TEXT,' +
       '"response_data" TEXT' +
       ')'
@@ -192,30 +293,140 @@ async function ensurePendingMutationsTable() {
     await db.$executeRawUnsafe(
       'CREATE INDEX IF NOT EXISTS "idx_pending_mutations_status" ON "_pending_mutations"("status")'
     )
+
+    await _migratePendingMutationsBigint()
+
+    // ── v2: stable content-derived idempotency key column ──
+    if (!idemColumnEnsured) {
+      try {
+        // Introspection-guarded: the schema-migrations top-up (lib/db.js) or
+        // the BIGINT rebuild DDL above may already have added this column.
+        // An unguarded ALTER fails with "duplicate column name" and Prisma
+        // logs noisy prisma:error output even when the failure is swallowed.
+        const colsNow = await db.$queryRawUnsafe('PRAGMA table_info("_pending_mutations")')
+        const hasIdemCol = (colsNow || []).some((c) => c && c.name === 'idempotency_key')
+        if (!hasIdemCol) {
+          await db.$executeRawUnsafe('ALTER TABLE "_pending_mutations" ADD COLUMN "idempotency_key" TEXT')
+          console.log('[LocalAPI] Added _pending_mutations.idempotency_key column')
+        }
+      } catch (e) {
+        // ALTER unsupported or introspection failed — non-fatal (the derived
+        // -key replay fallback still works without the physical column).
+        console.warn('[LocalAPI] idempotency_key column ensure skipped:', e.message)
+      }
+      try {
+        await db.$executeRawUnsafe(
+          'CREATE UNIQUE INDEX IF NOT EXISTS "idx_pending_mutations_idem" ON "_pending_mutations"("idempotency_key")'
+        )
+      } catch (e) {
+        // Pre-existing duplicate non-NULL keys would block the index — log
+        // loudly; replay still works via the derived-key fallback.
+        console.warn('[LocalAPI] Could not create idempotency unique index:', e.message)
+      }
+      try {
+        // Backfill legacy rows (NULL keys) with the same derivation.
+        const backfillRows = await db.$queryRawUnsafe(
+          'SELECT id, method, path, body FROM "_pending_mutations" WHERE "idempotency_key" IS NULL'
+        )
+        for (const row of backfillRows || []) {
+          const key = deriveStableIdempotencyKey(row.method, row.path, row.body)
+          await db.$executeRawUnsafe(
+            'UPDATE "_pending_mutations" SET "idempotency_key" = ? WHERE id = ?',
+            key, row.id
+          ).catch(() => {}) // duplicate key on backfill → leave NULL (unique index allows NULLs)
+        }
+        if ((backfillRows || []).length > 0) {
+          console.log('[LocalAPI] Backfilled idempotency keys for', (backfillRows || []).length, 'pending mutation rows')
+        }
+      } catch (e) {
+        console.warn('[LocalAPI] idempotency key backfill failed:', e.message)
+      }
+      idemColumnEnsured = true
+    }
   } catch (e) {
     console.error('[LocalAPI] Failed to create _pending_mutations table:', e.message)
   }
 }
 
+// Volatile fields stripped before hashing (they never repeat across retries
+// of the same logical operation and would defeat content-derived keys).
+const VOLATILE_IDEM_FIELDS = ['clientTimestamp', 'clientTime', 'timestamp', 'issuedAt', 'nonce', 'requestId', 'localId']
+
+/**
+ * Recursively sort object keys and strip volatile fields, returning a
+ * deterministic JSON string (for content-derived idempotency keys).
+ */
+function stableStringify(value) {
+  if (Array.isArray(value)) return value.map(stableStringify)
+  if (value && typeof value === 'object') {
+    const sorted = {}
+    Object.keys(value).sort().forEach((k) => {
+      if (VOLATILE_IDEM_FIELDS.includes(k)) return
+      sorted[k] = stableStringify(value[k])
+    })
+    return sorted
+  }
+  return value
+}
+
+/**
+ * Derive the stable idempotency key for an outbox mutation:
+ *   `${method}:${path}:${sha256(sorted-JSON of body)}`
+ * Volatile fields (clientTimestamp, timestamp, nonce, ...) are stripped
+ * recursively before hashing so retries hash identically.
+ * @param {string} method
+ * @param {string} path
+ * @param {string|object|null} body - raw JSON string (as stored) or object
+ * @returns {string}
+ */
+function deriveStableIdempotencyKey(method, path, body) {
+  let parsed = {}
+  if (body) {
+    try {
+      parsed = typeof body === 'string' ? JSON.parse(body) : body
+    } catch {
+      parsed = { _unparseable: String(body).substring(0, 128) }
+    }
+  }
+  const hash = createHash('sha256').update(JSON.stringify(stableStringify(parsed))).digest('hex')
+  return `${method}:${path}:${hash}`
+}
+
 /**
  * Log a mutation to the pending queue.
- * Called by write handlers (POST/PUT/PATCH/DELETE) when cloud is unreachable.
+ * Called by write handlers (POST/PUT/PATCH/DELETE) after EVERY local
+ * business mutation (fire-and-forget). The sync service replays the queue
+ * to the cloud with a stable X-Idempotency-Key header, so the cloud applies
+ * each logical operation exactly once.
+ *
+ * The stable content-derived `idempotency_key` is computed here and stored
+ * with the row. A UNIQUE index on it dedupes double-logged identical
+ * operations (INSERT OR IGNORE).
  */
 async function logPendingMutation(method, path, body, responseData) {
   if (!db) return
   try {
     await ensurePendingMutationsTable()
     const id = require('crypto').randomUUID()
-    await db.$executeRawUnsafe(
-      'INSERT INTO "_pending_mutations" (id, method, path, body, status, created_at, response_data) VALUES (?, ?, ?, ?, \'pending\', ?, ?)',
+    const bodyStr = body ? JSON.stringify(body) : null
+    const idemKey = deriveStableIdempotencyKey(method, path, bodyStr)
+    const result = await db.$executeRawUnsafe(
+      'INSERT OR IGNORE INTO "_pending_mutations" (id, method, path, body, status, created_at, response_data, idempotency_key) VALUES (?, ?, ?, ?, \'pending\', ?, ?, ?)',
       id,
       method,
       path,
-      body ? JSON.stringify(body) : null,
+      bodyStr,
       Date.now(),
-      responseData ? JSON.stringify(responseData) : null
+      responseData ? JSON.stringify(responseData) : null,
+      idemKey
     )
+    if (result === 0) {
+      console.log('[LocalAPI] Deduped pending mutation (identical key already in WAL):', method, path)
+      return
+    }
     console.log('[LocalAPI] Logged pending mutation:', method, path)
+    // Fire-and-forget: let the sync service replay the outbox immediately.
+    notifyMutationLogged()
   } catch (e) {
     console.error('[LocalAPI] Failed to log pending mutation:', e.message)
   }
@@ -233,6 +444,10 @@ async function getPendingMutations() {
     )
     return (rows || []).map(row => ({
       ...row,
+      // BIGINT columns arrive as JS BigInt — JSON.stringify throws on BigInt,
+      // so convert timestamp fields to Numbers for the response payload.
+      created_at: typeof row.created_at === 'bigint' ? Number(row.created_at) : row.created_at,
+      last_attempt_at: typeof row.last_attempt_at === 'bigint' ? Number(row.last_attempt_at) : row.last_attempt_at,
       body: row.body ? JSON.parse(row.body) : null,
       responseData: row.response_data ? JSON.parse(row.response_data) : null,
     }))
@@ -2029,6 +2244,11 @@ function createApp() {
         data: { isRead: true },
       })
 
+      // v2 outbox: read-state is a business mutation → replay to the cloud.
+      // Logged with method PUT + the CLOUD path (cloud route is
+      // PUT /api/notifications/read-all) so the replay hits the live route.
+      logPendingMutation('PUT', '/api/notifications/read-all', {}, { success: true }).catch(() => {})
+
       emitEvent('notifications:read-all', { userId: user.id })
 
       return c.json({ success: true, data: { message: 'All notifications marked as read' } })
@@ -3190,26 +3410,69 @@ function createApp() {
   // checks for { service: 'blasti-lan-sync' } or { local: { ready: true } }.
   // Without this route, the sync engine never discovers the local API,
   // so WatermelonDB never syncs → offline mode has no data.
+  //
+  // v2: now also returns the LIVE background sync engine status (lazy
+  // require of sync-service to avoid a circular module dependency; falls
+  // back gracefully when the sync service isn't loadable).
   app.get('/api/sync/status', (c) => {
-    return c.json({
+    const base = {
       service: 'blasti-lan-sync',
       local: { ready: !!db, mode: 'sqlite' },
       sessionActive: !!sessionToken,
-    })
+    }
+    try {
+      const syncService = require('./sync-service')
+      const status = syncService.getStatus()
+      // getStatus is async — answer synchronously with the discovery
+      // contract + a promise-resolved snapshot is not possible here, so
+      // expose the non-async subset and let clients use /api/sync-status
+      // for the full live snapshot.
+      return c.json({
+        ...base,
+        syncServiceAvailable: true,
+        isStarted: status.isStarted,
+        hasAuth: status.hasAuth,
+        socketConnected: status.socketConnected,
+        cursor: status.cursor,
+        syncProtocolVersion: status.syncProtocolVersion,
+        syncModelCount: status.syncModelCount,
+      })
+    } catch {
+      return c.json({ ...base, syncServiceAvailable: false })
+    }
   })
 
   // GET /api/sync-status — local sync status for diagnosis panel
-  app.get('/api/sync-status', (c) => {
-    return c.json({
+  // v2: returns the live background sync engine status (awaited).
+  app.get('/api/sync-status', async (c) => {
+    const base = {
       success: true,
       localReady: !!db,
       sessionActive: !!sessionToken,
-      cloudConnected: false,
-      lastSyncAt: null,
-    })
+    }
+    try {
+      const syncService = require('./sync-service')
+      const status = await syncService.getStatus()
+      return c.json({
+        ...base,
+        syncServiceAvailable: true,
+        cloudConnected: !!(status.socketConnected || (status.lastPullAt && status.lastError === null)),
+        ...status,
+      })
+    } catch {
+      return c.json({
+        ...base,
+        syncServiceAvailable: false,
+        cloudConnected: false,
+        lastSyncAt: null,
+      })
+    }
   })
 
   // GET /api/db-status — database diagnostics for the diagnosis panel
+  // v2: extended with initialization status (AgencyLocalState), required
+  // dataset counts, sync timestamps, pending outbox size and a readiness
+  // verdict (ready = initialization READY + Agency data present).
   app.get('/api/db-status', async (c) => {
     if (!db) {
       return c.json({ success: false, error: 'Database not initialized', tables: 0 })
@@ -3218,7 +3481,7 @@ function createApp() {
       // Count tables and records in the local SQLite database
       const tablesResult = await db.$queryRawUnsafe("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
       const tables = tablesResult ? tablesResult.map(r => r.name) : []
-      
+
       // Get record counts for key tables
       const counts = {}
       for (const table of tables) {
@@ -3231,7 +3494,84 @@ function createApp() {
           counts[table] = -1 // error
         }
       }
-      
+
+      // ── v2 additions: initialization + readiness ──
+      const agencyId = sessionUser?.agencyId || null
+
+      // Initialization status from AgencyLocalState (model exists in the
+      // shared schema; older local DBs may predate it → NOT_INITIALIZED).
+      let localState = null
+      try {
+        localState = await db.agencyLocalState.findUnique({ where: { agencyId: agencyId || '__none__' } })
+      } catch {
+        localState = null
+      }
+      const initializationStatus = localState?.initializationStatus || 'NOT_INITIALIZED'
+      const effectiveAgencyId = agencyId || localState?.agencyId || null
+
+      // Required dataset counts (-1 on error): the minimum tables the app
+      // needs before it is usable offline.
+      const requiredModels = ['Agency', 'AgencyStaff', 'Service', 'Branch', 'Counter', 'QueueSettings', 'Reservation']
+      const requiredDataset = {}
+      for (const model of requiredModels) {
+        requiredDataset[model] = typeof counts[model] === 'number' ? counts[model] : -1
+      }
+
+      // Sync timestamps: prefer _sync_meta (live engine), fall back to
+      // AgencyLocalState, then null.
+      let lastFullSyncAt = null
+      let lastIncrementalSyncAt = null
+      let lastError = localState?.lastError || null
+      try {
+        const metaRows = await db.$queryRawUnsafe(
+          "SELECT key, value FROM \"_sync_meta\" WHERE key IN ('lastFullSyncAt', 'lastIncrementalSyncAt', 'lastPulledSequence')"
+        )
+        for (const row of metaRows || []) {
+          if (row.key === 'lastFullSyncAt' && row.value) lastFullSyncAt = row.value
+          if (row.key === 'lastIncrementalSyncAt' && row.value) lastIncrementalSyncAt = row.value
+        }
+      } catch { /* _sync_meta may not exist yet */ }
+      if (!lastFullSyncAt && localState?.lastFullSyncAt) {
+        lastFullSyncAt = localState.lastFullSyncAt instanceof Date ? localState.lastFullSyncAt.toISOString() : String(localState.lastFullSyncAt)
+      }
+      if (!lastIncrementalSyncAt && localState?.lastIncrementalSyncAt) {
+        lastIncrementalSyncAt = localState.lastIncrementalSyncAt instanceof Date ? localState.lastIncrementalSyncAt.toISOString() : String(localState.lastIncrementalSyncAt)
+      }
+
+      // Pending outgoing mutations
+      let pendingOutgoingMutations = 0
+      try {
+        const pendingRows = await db.$queryRawUnsafe("SELECT COUNT(*) as cnt FROM \"_pending_mutations\" WHERE status = 'pending'")
+        const rawPending = Array.isArray(pendingRows) ? pendingRows[0]?.cnt : pendingRows?.cnt
+        pendingOutgoingMutations = typeof rawPending === 'bigint' ? Number(rawPending) : (rawPending || 0)
+      } catch { /* outbox table may not exist yet */ }
+
+      // Readiness verdict: initialized AND agency data actually imported.
+      const agencyCount = typeof counts.Agency === 'number' ? counts.Agency : -1
+      const ready = initializationStatus === 'READY' && agencyCount > 0
+      let reason = 'ready'
+      if (initializationStatus !== 'READY') {
+        reason = 'initialization ' + initializationStatus
+      } else if (agencyCount <= 0) {
+        reason = 'initialization READY but no Agency records imported'
+      }
+
+      // Spec §24 contract fields
+      const { getDbStatus: _getDbStatus } = require('./lib/db')
+      const dbFileStatus = _getDbStatus()
+      let schemaVersion = null
+      try {
+        const vRows = await db.$queryRawUnsafe("SELECT value FROM \"_sync_meta\" WHERE key = 'schema_version'")
+        schemaVersion = vRows && vRows[0] ? parseInt(vRows[0].value, 10) || null : null
+      } catch { /* meta table may not exist yet */ }
+      const syncInfraTables = ['_sync_meta', '_sync_conflicts', '_pending_mutations', '_sync_applied_mutations']
+      const syncTablesStatus = {}
+      for (const t of syncInfraTables) syncTablesStatus[t] = tables.includes(t)
+      let realtimeConnected = false
+      try {
+        realtimeConnected = !!require('./sync-service').getStatus()?.socketConnected
+      } catch { /* engine not started */ }
+
       return c.json({
         success: true,
         tables: tables.length,
@@ -3240,9 +3580,93 @@ function createApp() {
         mode: 'sqlite',
         sessionActive: !!sessionToken,
         user: sessionUser ? { id: sessionUser.id, username: sessionUser.username, role: sessionUser.role } : null,
+        // v2 fields
+        agencyId: effectiveAgencyId,
+        initializationStatus,
+        initialization: {
+          status: initializationStatus,
+          currentStage: localState?.currentStage || null,
+          recordsImported: localState?.recordsImported ?? null,
+          snapshotSequence: localState?.snapshotSequence ?? null,
+        },
+        requiredDataset,
+        lastFullSyncAt,
+        lastIncrementalSyncAt,
+        lastError,
+        pendingOutgoingMutations,
+        ready,
+        readiness: { ready, reason },
+        // Spec §24 canonical names (aliases kept above for existing consumers)
+        databasePath: dbFileStatus.path,
+        databaseExists: dbFileStatus.path ? require('fs').existsSync(dbFileStatus.path) : false,
+        schemaStatus: {
+          ok: Object.values(syncTablesStatus).every(Boolean) && !!schemaVersion,
+          version: schemaVersion,
+          syncTables: syncTablesStatus,
+        },
+        initializationState: initializationStatus,
+        pendingMutations: pendingOutgoingMutations,
+        realtimeConnected,
+        lastSyncError: lastError,
       })
     } catch (err) {
       return c.json({ success: false, error: String(err), tables: 0 })
+    }
+  })
+
+  // POST /api/sync/initial-sync/run — run the stage-based initial sync
+  // (local-api/initial-sync.js runInitialSync) with the current session.
+  // This is the loading-screen fallback path (primary is the IPC bridge →
+  // cloud-sync:initial-sync). Progress events are emitted on the local
+  // event bus as 'initial-sync:progress'. On success the sync engine's
+  // pull cursor is initialized from the snapshot sequence and the
+  // background engine is started.
+  app.post('/api/sync/initial-sync/run', authMiddleware, async (c) => {
+    try {
+      const { runInitialSync } = require('./initial-sync')
+      const user = c.get('user')
+      const agencyId = user?.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      const token = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-Local-Token')
+      const cloudUrl = process.env.BLASTI_CLOUD_URL || 'http://localhost:3003'
+
+      const result = await runInitialSync({
+        agencyId,
+        cloudAuthToken: token,
+        cloudUrl,
+        db,
+        emitFn: (evt) => {
+          emitEvent('initial-sync:progress', evt)
+          console.log('[LocalAPI][InitialSync evt]', evt.type, evt.stage || '')
+        },
+      })
+
+      // Initialize the engine cursor + start the background engine.
+      try {
+        const syncService = require('./sync-service')
+        if (result && result.success && typeof result.snapshotSequence === 'number') {
+          await syncService.setInitialCursor(result.snapshotSequence)
+        }
+        if (!syncService.getStatus()?.isStarted) {
+          syncService.startSync({ localDb: db, cloudBaseUrl: cloudUrl, agencyId })
+        }
+      } catch (syncErr) {
+        console.warn('[LocalAPI] post-initial-sync engine wiring failed:', syncErr.message)
+      }
+
+      return c.json({
+        success: !!result?.success,
+        totalRecords: result?.totalRecords ?? 0,
+        duration: result?.duration ?? 0,
+        alreadyInitialized: !!result?.alreadyInitialized,
+        snapshotSequence: result?.snapshotSequence,
+        error: result?.error || undefined,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] /api/sync/initial-sync/run error:', error)
+      return c.json({ success: false, error: error?.message || 'Initial sync failed' }, 500)
     }
   })
 
@@ -3695,11 +4119,20 @@ function createApp() {
   })
 
   // GET /api/pending-mutations/count — quick count
-  app.get('/api/pending-mutations/count', (c) => {
+  // BUGFIX: the handler MUST return the awaited response to Hono. The old
+  // fire-and-forget `.then(r => c.json(...))` returned undefined from the
+  // handler → Hono threw "Context is not finalized" → 500 on every call.
+  app.get('/api/pending-mutations/count', async (c) => {
     if (!db) return c.json({ success: true, count: 0 })
-    db.$queryRawUnsafe('SELECT COUNT(*) as cnt FROM "_pending_mutations" WHERE status = \'pending\'')
-      .then(r => c.json({ success: true, count: (r[0]?.cnt || 0) }))
-      .catch(() => c.json({ success: true, count: 0 }))
+    try {
+      const r = await db.$queryRawUnsafe(
+        'SELECT COUNT(*) as cnt FROM "_pending_mutations" WHERE status = \'pending\''
+      )
+      const raw = r && r[0] ? r[0].cnt : 0
+      return c.json({ success: true, count: typeof raw === 'bigint' ? Number(raw) : (raw || 0) })
+    } catch {
+      return c.json({ success: true, count: 0 })
+    }
   })
 
   // Initialize the pending mutations table on startup
@@ -3726,9 +4159,19 @@ function createApp() {
     await next()
   }
 
-  // 404 handler
+  // Route count at registration-complete time (used by the 404 handler and
+  // the startup registry summary to prove which build is actually running).
+  let registeredRouteCount = -1
+  try { registeredRouteCount = (app.routes || []).length } catch { /* older hono — unknown */ }
+
+  // 404 handler — self-identifying (isolation aid): logs the unmatched
+  // method+path so a stale running build is immediately visible in the
+  // console (e.g. a 404 on /api/auth/import-session, which IS registered in
+  // the current checkout). The response also echoes the path so callers can
+  // distinguish this local 404 from any other server's.
   app.notFound((c) => {
-    return c.json({ success: false, error: 'Not found' }, 404)
+    console.warn(`[LocalAPI] 404 — no route matched: ${c.req.method} ${c.req.path} (registered routes: ${registeredRouteCount}) — if this path should exist, the RUNNING local-api build is older than the checkout; fully restart the app`)
+    return c.json({ success: false, error: 'Not found', path: c.req.path }, 404)
   })
 
   return app
@@ -3747,15 +4190,35 @@ async function startLocalApi(dbPath, port, options) {
   port = port || DEFAULT_PORT
   options = options || {}
 
-  // Initialize Prisma database
+  // ── Authoritative local DB startup (spec §3/§28) ────────────────────────
+  // Resolves the single authoritative path, migrates a legacy database if
+  // present (copy + verify), applies the controlled NON-DESTRUCTIVE schema
+  // lifecycle (create / adopt / upgrade / verify — never `prisma db push`
+  // with --accept-data-loss), sets pragmas, and logs the durable
+  // initialization state. Safe on every startup; idempotent.
   db = localDb
+  const dbReady = await ensureDatabaseReady()
+  if (!dbReady.ok) {
+    console.error('[LocalAPI] Local database failed startup initialization:', dbReady.error)
+    // Keep serving so /api/db-status can surface the diagnostic state; the
+    // readiness gate will block the dashboard (no READY DB → no dashboard).
+  }
   await setupPragmas()
-  // Ensure schema is pushed to the local database
-  // (The Prisma schema matches @blasti/db — same models, same structure)
   console.log(`[LocalAPI] Prisma database initialized (local SQLite)`)
 
   // Create Hono app
   const app = createApp()
+
+  // Route registry summary (isolation aid): proves which routes the RUNNING
+  // build actually registered, so "404 on a known route" is instantly
+  // diagnosable as a stale build/checkout.
+  try {
+    const registeredRoutes = (app.routes || []).map(function (r) { return r.method + ' ' + r.path })
+    const hasImportSession = registeredRoutes.indexOf('POST /api/auth/import-session') !== -1
+    console.log(`[LocalAPI] Router: ${registeredRoutes.length} routes registered — POST /api/auth/import-session: ${hasImportSession ? 'registered' : 'MISSING (stale build!)'}`)
+  } catch (routeErr) {
+    console.warn('[LocalAPI] Route registry summary unavailable:', routeErr.message)
+  }
 
   // ── IMPORTANT: DO NOT pre-create httpServer and pass it via createServer ──
   // The @hono/node-server createAdaptorServer() attaches the Hono request
@@ -3881,10 +4344,12 @@ module.exports = {
   setSession,
   clearSession,
   onEvent,
+  setMutationListener,
   getStatus,
   logPendingMutation,
   getPendingMutations,
   markMutationCompleted,
   markMutationFailed,
+  deriveStableIdempotencyKey,
   DEFAULT_PORT,
 }

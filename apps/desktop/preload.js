@@ -260,6 +260,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
    */
   initialCloudSync: () => ipcRenderer.invoke('cloud-sync:initial-sync'),
 
+  /**
+   * Listen for initial-sync progress events (v2 staged initial sync).
+   * main.js (agent 7-b) forwards runInitialSync emitFn events from the local
+   * API process to this channel via webContents.send('initial-sync:progress').
+   * Event shapes (apps/desktop/local-api/initial-sync.js):
+   *   SYNC_STARTED / SYNC_STAGE_STARTED / SYNC_STAGE_PROGRESS /
+   *   SYNC_STAGE_COMPLETED / SYNC_ERROR / SYNC_WARNING / SYNC_COMPLETED
+   * Additive + tolerant: if the channel never fires (older main.js), the
+   * callback simply is never invoked — existing flows are unaffected.
+   */
+  onInitialSyncProgress: (callback) => {
+    ipcRenderer.on('initial-sync:progress', (_event, evt) => callback(evt));
+  },
+
   // ─── Network Status (renderer → main process) ──────────────────────────────
 
   /**

@@ -949,3 +949,160 @@ model DelayedJob {
   @@index([status, executeAt])
   @@index([userId, reservationId])
 }
+
+// ─── Sync Engine (v2 — cursor-based bidirectional synchronization) ────────────
+// Shared by the cloud API (PostgreSQL/SQLite) and the desktop local SQLite.
+// The desktop pushes the SAME schema into its local database, so these models
+// exist identically on both sides.
+
+/// Append-only change log. Every create/update/delete on a synced model is
+/// recorded here (cloud-side auto-tracking middleware + explicit helpers).
+/// Desktop pulls changes with sequence > lastPulledSequence (monotonic cursor).
+model SyncChange {
+  id          String   @id @default(cuid())
+  /// Monotonic PER-AGENCY sequence, assigned application-side inside the
+  /// recording transaction (SQLite Prisma cannot autoincrement non-id fields).
+  /// The desktop's pull cursor is (agencyId, sequence).
+  sequence    Int      @unique
+  agencyId    String
+  /// Prisma model name (e.g. "Reservation")
+  model       String
+  recordId    String
+  /// create | update | delete
+  operation   String
+  syncVersion Int      @default(0)
+  /// Mutation ID of the origin push (null for cloud-originated changes).
+  /// Used for echo suppression and idempotent replay.
+  mutationId  String?
+  /// cloud | desktop | web — where the change originated
+  origin      String   @default("cloud")
+
+  changedAt   DateTime @default(now())
+
+  @@index([agencyId, sequence])
+  @@index([agencyId, model, recordId])
+  @@index([mutationId])
+}
+
+/// Durable idempotency ledger for mutations arriving from desktop/mobile.
+/// Key = stable content-derived idempotency key sent by the client.
+/// The generic cloud middleware stores the first 2xx response and returns it
+/// verbatim for duplicate submissions (exactly-once business effect).
+model SyncMutation {
+  id             String   @id @default(cuid())
+  idempotencyKey String   @unique
+  agencyId       String
+  /// Prisma model name or "route" for non-model operations
+  model          String   @default("route")
+  recordId       String?
+  /// create | update | delete | action
+  operation      String   @default("action")
+  /// completed | failed
+  status         String   @default("completed")
+  /// Serialized JSON response body (replayed for duplicates)
+  result         String?
+  processedAt    DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  @@index([agencyId, createdAt])
+  @@index([status])
+}
+
+/// Desktop-side initialization state machine, mirrored locally per agency.
+/// Stored in the LOCAL SQLite (desktop) and read by /api/db-status readiness.
+model AgencyLocalState {
+  id                       String    @id @default(cuid())
+  agencyId                 String    @unique
+  /// NOT_INITIALIZED | INITIALIZING | READY | FAILED | UPDATE_REQUIRED
+  initializationStatus     String    @default("NOT_INITIALIZED")
+  currentStage             String?
+  currentCursor            Int?
+  /// Cloud sequence snapshot captured when the initial import started
+  snapshotSequence         Int       @default(0)
+  recordsImported          Int       @default(0)
+  lastError                String?
+  initializationSessionId  String?
+  initializationStartedAt  DateTime?
+  initializationCompletedAt DateTime?
+  lastFullSyncAt           DateTime?
+  lastIncrementalSyncAt    DateTime?
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DESKTOP LOCAL SYNC INFRASTRUCTURE TABLES
+// ═══════════════════════════════════════════════════════════════════════════
+// These tables power the desktop's durable sync engine (outbox, cursors,
+// conflicts, exactly-once pull ledger). They are declared here so that ANY
+// schema reconciliation (dev `prisma db push`) can NEVER drop or truncate
+// them — historically `prisma db push --accept-data-loss` deleted
+// `_sync_meta` at desktop startup and destroyed the sync cursor.
+//
+// IMPORTANT: The column names/shapes below MUST stay byte-compatible with
+// the raw-SQL DDL in apps/desktop/local-api (sync-service.js / index.js /
+// lib/schema-migrations.js). The desktop's controlled migration layer creates
+// them with identical shapes via `CREATE TABLE IF NOT EXISTS`.
+
+/// Local key/value sync metadata: pull cursor, last sync timestamps,
+/// local schema version stamp, migration records.
+model LocalSyncMeta {
+  key   String @id @map("key")
+  value String @map("value")
+
+  @@map("_sync_meta")
+}
+
+/// Deterministic conflict records produced by LWW/reconciliation when local
+/// and cloud versions of the same record diverge.
+model LocalSyncConflict {
+  id           String  @id @map("id")
+  modelName    String  @map("modelName")
+  recordId     String  @map("recordId")
+  agencyId     String? @map("agencyId")
+  localVersion BigInt? @map("localVersion")
+  cloudVersion BigInt? @map("cloudVersion")
+  localData    String? @map("localData")
+  cloudData    String? @map("cloudData")
+  /// pending | applied_local | applied_cloud | dismissed
+  resolution   String? @default("pending") @map("resolution")
+  resolvedAt   BigInt? @map("resolvedAt")
+  createdAt    BigInt  @map("createdAt")
+
+  @@index([modelName], map: "idx_sync_conflicts_model")
+  @@index([resolution], map: "idx_sync_conflicts_resolution")
+  @@map("_sync_conflicts")
+}
+
+/// Durable outbound mutation queue (the outbox / WAL). Business writes and
+/// their outbox record commit together; entries replay to the cloud with an
+/// idempotency key and are only marked completed after a confirmed server ACK.
+model LocalPendingMutation {
+  id             String  @id @map("id")
+  method         String  @map("method")
+  path           String  @map("path")
+  body           String? @map("body")
+  headers        String? @map("headers")
+  /// pending | completed | failed | abandoned
+  status         String  @default("pending") @map("status")
+  attempts       Int     @default(0) @map("attempts")
+  maxAttempts    Int     @default(5) @map("max_attempts")
+  createdAt      BigInt  @map("created_at")
+  lastAttemptAt  BigInt? @map("last_attempt_at")
+  lastError      String? @map("last_error")
+  responseData   String? @map("response_data")
+  /// Stable content-derived idempotency key (method:path:sha256(body))
+  idempotencyKey String? @unique(map: "idx_pending_mutations_idem") @map("idempotency_key")
+
+  @@index([status], map: "idx_pending_mutations_status")
+  @@map("_pending_mutations")
+}
+
+/// Exactly-once apply ledger for pull pages: prevents re-applying the same
+/// cloud change batch after a crash between fetch and cursor advance.
+model LocalSyncAppliedMutation {
+  key       String @id @map("key")
+  appliedAt BigInt @map("appliedAt")
+
+  @@map("_sync_applied_mutations")
+}

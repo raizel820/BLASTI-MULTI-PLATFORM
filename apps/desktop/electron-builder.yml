@@ -9,22 +9,27 @@ directories:
 # ─── Files to Package ───────────────────────────────────────────────────────
 # Main process files, web app output, and local database.
 # node_modules production deps are auto-included by electron-builder.
+# NOTE: the runtime (schema migrations, sync registry) must be fully
+# self-contained — production desktop must not depend on the monorepo
+# packages/ tree, Prisma CLI, Bun or system Node (spec §27).
 files:
   - main.js
   - preload.js
-  - local-api-routes.js
-  - local-db.js
-  - cloud-sync.js
   - package.json
+  - local-api/**/*
+  - loading-screen.js
   - out/**/*
   - data/**/*
+  # Prisma query engine + generated client are picked up from
+  # node_modules automatically; the schema itself ships below via
+  # extraResources for diagnostics/reference (migrations are embedded
+  # in local-api/lib/schema-init-sql.js and need no CLI at runtime).
 
 # ─── ASAR Configuration ─────────────────────────────────────────────────────
 asar: true
 asarUnpack:
   - out/**/*
   - data/**/*
-  - node_modules/better-sqlite3/**/*
 
 npmRebuild: true
 

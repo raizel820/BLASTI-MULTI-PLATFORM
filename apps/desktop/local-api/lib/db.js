@@ -426,103 +426,268 @@ if (!PrismaClient) {
   }
 }
 
-// ─── Database Configuration ───────────────────────────────────────────────
+// ─── Database Configuration (single authoritative path) ──────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+// EXACTLY ONE authoritative local database location exists:
+//
+//     Electron main process sets BLASTI_LOCAL_DB_DIR to
+//     <app.getPath('userData')>/blasti-local  (i.e.
+//     %APPDATA%/@blasti/desktop/blasti-local on Windows) BEFORE any
+//     local-api module is required — see main.js.
+//
+// Everything (embedded API, sync service, diagnostics, migrations, IPC)
+// resolves through this module, so they all see the same file. When no
+// Electron context is present (tests, standalone runs), the fallback is
+// ~/.blasti/local — and a legacy database found at the old location is
+// MIGRATED (copied + verified) to the authoritative one, never abandoned.
+// ═══════════════════════════════════════════════════════════════════════════
 
-const DB_DIR = process.env.BLASTI_LOCAL_DB_DIR || path.join(
-  process.env.HOME || process.env.USERPROFILE || '/tmp',
-  '.blasti',
-  'local'
-)
+const { ensureSchema } = require('./schema-migrations')
 
-if (!fs.existsSync(DB_DIR)) {
-  try { fs.mkdirSync(DB_DIR, { recursive: true }) } catch { /* ignore */ }
+const HOME_DIR = process.env.HOME || process.env.USERPROFILE || '/tmp'
+
+/** Legacy DB locations (old modules resolved these independently). */
+function legacyDbCandidates() {
+  return [
+    path.join(HOME_DIR, '.blasti', 'local', 'local.db'), // pre-v2 lib/db.js default
+  ]
 }
 
-const DB_PATH = path.join(DB_DIR, 'local.db')
-const DATABASE_URL = `file:${DB_PATH}`
+let resolvedDbDir = null
+let resolvedDbPath = null
+let resolvedDatabaseUrl = null
+let clientCreationDir = null
 
-console.log(`[local-api:db] Database: ${DATABASE_URL}`)
-
-// ─── Schema Push ─────────────────────────────────────────────────────────
-// NOTE: Schema push runs synchronously at module load time on first run.
-// It uses runPrismaCommand() which finds the proper Node.js/bun runtime
-// instead of process.execPath (which would be the Electron binary).
-
-function pushSchema() {
-  if (!PrismaClient) {
-    console.warn('[local-api:db] Cannot push schema: @prisma/client not available')
-    return
-  }
-
-  if (!fs.existsSync(SCHEMA_PATH)) {
-    console.warn('[local-api:db] Prisma schema not found at:', SCHEMA_PATH)
-    return
-  }
-
-  console.log(`[local-api:db] Pushing schema with DATABASE_URL=${DATABASE_URL}`)
-
-  const result = runPrismaCommand([
-    'db', 'push',
-    `--schema=${SCHEMA_PATH}`,
-    '--accept-data-loss',
-    '--skip-generate',
-  ], {
-    cwd: path.join(MONOREPO_ROOT, 'packages', 'db'),
-    timeout: 30000,
-    env: { DATABASE_URL },
-  })
-
-  if (result.success) {
-    if (result.stdout) {
-      const lines = result.stdout.trim().split('\n').filter(l => l && !l.includes('warn'))
-      if (lines.length > 0) {
-        console.log('[local-api:db] Schema push:', lines.join(' | '))
-      }
-    }
-    return
-  }
-
-  // Handle known non-fatal errors
-  const stderr = result.stderr
-  if (stderr.includes('already in sync') || stderr.includes('Your database is already')) {
-    console.log('[local-api:db] Schema already up to date')
-    return
-  }
-
-  console.warn('[local-api:db] Schema push warning (exit', result.code + '):', stderr.substring(0, 300))
+function resolveDbDir() {
+  return process.env.BLASTI_LOCAL_DB_DIR || path.join(HOME_DIR, '.blasti', 'local')
 }
 
-// Push schema on first run — wrapped in try-catch to never crash the module load
-// IMPORTANT: Always push schema, not just on first run. If the Prisma schema
-// was updated (new fields/tables), the local DB may be outdated and queries
-// will fail with 500. `prisma db push` is a no-op when already in sync.
-try {
-  pushSchema()
-} catch (err) {
-  console.error('[local-api:db] Schema push threw unexpectedly:', err.message)
+function resolvePaths() {
+  resolvedDbDir = resolveDbDir()
+  resolvedDbPath = path.join(resolvedDbDir, 'local.db')
+  resolvedDatabaseUrl = `file:${resolvedDbPath}`
+  return { resolvedDbDir, resolvedDbPath, resolvedDatabaseUrl }
 }
+resolvePaths()
+// The directory must exist before SQLite can open the file (SQLite creates
+// the FILE, never parent DIRECTORIES). Creating the directory is a safe,
+// non-destructive operation — schema work stays inside ensureDatabaseReady().
+try { fs.mkdirSync(resolvedDbDir, { recursive: true }) } catch { /* ignore */ }
 
 // ─── PrismaClient Instance ────────────────────────────────────────────────
 
 let localDb = null
 
-if (PrismaClient) {
+function createClient() {
+  if (!PrismaClient) return null
   try {
-    localDb = new PrismaClient({
+    const client = new PrismaClient({
       datasources: {
         db: {
-          url: DATABASE_URL
+          url: resolvedDatabaseUrl
         }
       },
       log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
     })
+    clientCreationDir = resolvedDbDir
+    console.log(`[LocalDB] Authoritative DB path: ${resolvedDbPath}`)
     console.log('[local-api:db] PrismaClient initialized successfully')
+    return client
   } catch (err) {
     console.error('[local-api:db] Failed to create PrismaClient:', err.message)
     prismaRequireError = err
+    return null
   }
-} else {
-  console.error('[local-api:db] PrismaClient not created — module not found')
+}
+
+localDb = createClient()
+
+/**
+ * If BLASTI_LOCAL_DB_DIR changed after the client was created (late env
+ * wiring), recreate the client against the authoritative path. This closes
+ * the historic race where one module decided ~/.blasti/local while another
+ * decided <userData>/blasti-local.
+ */
+function reconcileClientWithEnv() {
+  const dir = resolveDbDir()
+  if (dir === resolvedDbDir && dir === clientCreationDir) return false
+  resolvePaths()
+  if (localDb && clientCreationDir !== resolvedDbDir) {
+    console.warn(`[LocalDB] DB directory changed after client creation (${clientCreationDir} → ${resolvedDbDir}) — rebinding client`)
+    try { localDb.$disconnect?.() } catch { /* ignore */ }
+    localDb = createClient()
+  }
+  return true
+}
+
+// ─── Legacy Database Migration (one-time, copy-then-verify) ───────────────
+
+function copyFileIfExists(src, dest) {
+  if (!fs.existsSync(src)) return false
+  fs.copyFileSync(src, dest)
+  return true
+}
+
+/**
+ * If the authoritative database does not exist yet but a legacy database
+ * does, migrate (COPY) it to the authoritative path and verify integrity.
+ * The legacy file is NEVER deleted — it remains as a backup; migration is
+ * recorded in `_sync_meta` for diagnostics.
+ */
+function migrateLegacyDatabase() {
+  const targetDir = resolvedDbDir
+  const targetPath = resolvedDbPath
+
+  if (fs.existsSync(targetPath)) {
+    return { migrated: false, reason: 'authoritative-exists' }
+  }
+
+  // Legacy migration applies ONLY to the Electron-managed directory
+  // convention (<userData>/blasti-local). Standalone/test directories
+  // (BLASTI_LOCAL_DB_DIR set to e.g. ~/.blasti/test-sync) must stay
+  // isolated from any pre-existing development database.
+  if (path.basename(targetDir) !== 'blasti-local') {
+    return { migrated: false, reason: 'non-app-directory' }
+  }
+
+  try { fs.mkdirSync(targetDir, { recursive: true }) } catch { /* ignore */ }
+
+  for (const legacyPath of legacyDbCandidates()) {
+    if (path.resolve(legacyPath) === path.resolve(targetPath)) continue
+    if (!fs.existsSync(legacyPath)) continue
+
+    console.log(`[LocalDB] Legacy database detected: ${legacyPath}`)
+    console.log('[LocalDB] Migrating legacy database...')
+
+    try {
+      copyFileIfExists(legacyPath, targetPath)
+      copyFileIfExists(legacyPath + '-wal', targetPath + '-wal')
+      copyFileIfExists(legacyPath + '-shm', targetPath + '-shm')
+
+      const size = fs.existsSync(targetPath) ? fs.statSync(targetPath).size : 0
+      if (size <= 0) {
+        console.warn('[LocalDB] Migration produced an empty file — discarding copy, legacy file kept intact')
+        try { fs.rmSync(targetPath, { force: true }) } catch { /* ignore */ }
+        continue
+      }
+
+      console.log(`[LocalDB] Migration verified. (${Math.round(size / 1024)}KB copied — integrity will be verified during schema check)`)
+      console.log(`[LocalDB] Using database: ${targetPath}`)
+      migrationRecord = { from: legacyPath, to: targetPath, at: new Date().toISOString(), sizeBytes: size }
+      return { migrated: true, from: legacyPath }
+    } catch (err) {
+      console.error('[LocalDB] Legacy migration failed:', err.message, '— legacy file left untouched')
+      try { fs.rmSync(targetPath, { force: true }) } catch { /* ignore */ }
+    }
+  }
+
+  return { migrated: false, reason: 'no-legacy-found' }
+}
+
+let migrationRecord = null
+
+/**
+ * Record the completed migration inside the (now authoritative) database.
+ * Called after ensureSchema has created/stamped the schema.
+ */
+async function recordMigration(db) {
+  if (!migrationRecord || !db) return
+  try {
+    await db.$executeRawUnsafe(
+      'INSERT INTO "_sync_meta" ("key", "value") VALUES (?, ?) ' +
+      'ON CONFLICT("key") DO UPDATE SET "value" = excluded."value"',
+      'migrated_from', migrationRecord.from
+    )
+    await db.$executeRawUnsafe(
+      'INSERT INTO "_sync_meta" ("key", "value") VALUES (?, ?) ' +
+      'ON CONFLICT("key") DO UPDATE SET "value" = excluded."value"',
+      'migrated_at', migrationRecord.at
+    )
+    console.log('[LocalDB] Migration recorded in _sync_meta')
+    migrationRecord = null
+  } catch (err) {
+    console.warn('[LocalDB] Could not record migration:', err.message)
+  }
+}
+
+// ─── Authoritative Startup Initialization ─────────────────────────────────
+// Replaces the destructive `prisma db push --accept-data-loss` startup push.
+// NEVER uses destructive Prisma schema synchronization — see schema-migrations.js.
+
+let ensurePromise = null
+
+async function ensureDatabaseReady() {
+  if (ensurePromise) return ensurePromise
+
+  ensurePromise = (async () => {
+    reconcileClientWithEnv()
+
+    // The authoritative directory must exist before SQLite can open the file
+    // (SQLite creates the FILE, never parent DIRECTORIES).
+    try { fs.mkdirSync(resolvedDbDir, { recursive: true }) } catch { /* ignore */ }
+
+    if (!localDb) {
+      // One retry through auto-generation (packaged/first-run scenario).
+      if (generatePrismaClient()) {
+        PrismaClient = tryResolvePrismaClient()
+        localDb = createClient()
+      }
+      if (!localDb) {
+        return { ok: false, error: prismaRequireError?.message || 'Prisma client unavailable' }
+      }
+    }
+
+    // One-time legacy migration (copy old DB → authoritative path).
+    const migration = migrateLegacyDatabase()
+    if (!migration.migrated && migration.reason === 'authoritative-exists') {
+      // Ensure the directory exists for any auxiliary writes.
+      try { fs.mkdirSync(resolvedDbDir, { recursive: true }) } catch { /* ignore */ }
+    }
+
+    // Controlled, non-destructive schema lifecycle (create/adopt/upgrade/verify).
+    const schemaResult = await ensureSchema(localDb)
+
+    await recordMigration(localDb)
+    await setupPragmas()
+
+    if (!schemaResult.ok) {
+      console.error(`[LocalDB] Schema initialization FAILED (action=${schemaResult.action}):`,
+        schemaResult.errors[0]?.error || 'unknown')
+    } else {
+      console.log(`[LocalDB] Schema ready (action=${schemaResult.action}, version=${schemaResult.version})`)
+      // Local database verified — read and log the durable initialization state.
+      try {
+        const rows = await localDb.$queryRawUnsafe(
+          'SELECT "initializationStatus", "agencyId", "recordsImported", "lastError" FROM "AgencyLocalState" LIMIT 1'
+        )
+        if (rows && rows[0]) {
+          const s = rows[0]
+          const why = s.lastError ? `, lastError=${String(s.lastError).substring(0, 80)}` : ''
+          console.log(`[LocalDB] Initialization state: ${s.initializationStatus} (agency=${s.agencyId ? String(s.agencyId).substring(0, 8) + '…' : 'none'}, recordsImported=${s.recordsImported ?? 0}${why})`)
+        } else {
+          console.log('[LocalDB] Initialization state: NOT_INITIALIZED (no AgencyLocalState row — this database has never completed a v2 initial sync; legacy data may still be present)')
+        }
+      } catch (stateErr) {
+        console.warn('[LocalDB] Initialization state read skipped:', stateErr?.message?.substring(0, 80) || stateErr)
+      }
+    }
+
+    return {
+      ok: schemaResult.ok,
+      schema: schemaResult,
+      path: resolvedDbPath,
+      error: schemaResult.ok ? null : (schemaResult.errors[0]?.error || 'schema initialization failed'),
+    }
+  })()
+
+  try {
+    return await ensurePromise
+  } finally {
+    // Allow retry after a failure (e.g. transient FS issue), but keep the
+    // in-flight promise singleton for concurrent callers.
+    const res = await ensurePromise
+    if (!res?.ok) ensurePromise = null
+  }
 }
 
 // ─── Pragmas ──────────────────────────────────────────────────────────────
@@ -546,8 +711,8 @@ async function setupPragmas() {
 function getDbStatus() {
   return {
     ready: !!localDb,
-    path: DB_PATH,
-    dir: DB_DIR,
+    path: resolvedDbPath,
+    dir: resolvedDbDir,
     error: prismaRequireError ? prismaRequireError.message : null,
     hasPrismaClient: !!PrismaClient,
   }
@@ -563,29 +728,20 @@ function reinitClient() {
   PrismaClient = tryResolvePrismaClient()
   if (!PrismaClient) return false
 
-  try {
-    localDb = new PrismaClient({
-      datasources: { db: { url: DATABASE_URL } },
-      log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
-    })
-    console.log('[local-api:db] PrismaClient re-initialized')
-    return true
-  } catch (err) {
-    console.error('[local-api:db] Re-init failed:', err.message)
-    return false
-  }
+  localDb = createClient()
+  return !!localDb
 }
 
 module.exports = {
   localDb,
   setupPragmas,
-  pushSchema,
+  ensureDatabaseReady,
   getDbStatus,
   reinitClient,
   generatePrismaClient,
-  DATABASE_URL,
-  DB_PATH,
-  DB_DIR,
+  get DATABASE_URL() { return resolvedDatabaseUrl },
+  get DB_PATH() { return resolvedDbPath },
+  get DB_DIR() { return resolvedDbDir },
   GENERATED_CLIENT_DIR,
   SCHEMA_PATH,
 }

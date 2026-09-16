@@ -32,12 +32,30 @@ const PAGE_SIZE = 500
 const MAX_BACKOFF_MS = 30_000
 const INITIAL_BACKOFF_MS = 1_000
 const MAX_RETRIES_PER_REQUEST = 5
+const MAX_5XX_RETRIES_PER_REQUEST = 2
 const SYNC_PROTOCOL_VERSION = 2
 
 /**
  * Stage-to-model mapping for upsert routing.
  * The Cloud API returns stage names; we map them to Prisma model names.
  */
+// FK-safe import order: SQLite enforces foreign keys, so every referenced
+// model must be imported BEFORE the models that reference it. Stages are
+// sorted by this canonical order regardless of the order the cloud returns
+// them in (spec §29: deterministic, race-free imports).
+const FK_SAFE_STAGE_ORDER = [
+  'users', 'subscriptionPlans', 'planFeatures', 'agency', 'branches', 'services', 'agencyStaff', 'counters', 'queueSettings', 'reservations', 'transactions', 'smsSettings', 'paymentSettings', 'notifications', 'announcements', 'globalAnnouncements', 'reviews', 'favorites', 'faqs',
+]
+
+function _sortStagesFkSafe(stages) {
+  if (!Array.isArray(stages)) return stages
+  return stages.slice().sort((a, b) => {
+    const ia = FK_SAFE_STAGE_ORDER.indexOf(a && a.id)
+    const ib = FK_SAFE_STAGE_ORDER.indexOf(b && b.id)
+    return (ia === -1 ? 9999 : ia) - (ib === -1 ? 9999 : ib)
+  })
+}
+
 const STAGE_MODEL_MAP = {
   agency:           'Agency',
   users:            'User',
@@ -85,6 +103,7 @@ async function _cloudPost(url, body, authToken, options = {}) {
   const { signal } = options
   let backoff = INITIAL_BACKOFF_MS
   let lastError = null
+  let serverErrorRetries = 0
 
   for (let attempt = 0; attempt <= MAX_RETRIES_PER_REQUEST; attempt++) {
     if (signal?.aborted) throw new Error('Aborted')
@@ -122,7 +141,23 @@ async function _cloudPost(url, body, authToken, options = {}) {
           throw err
         }
 
-        // 5xx or other — retry
+        // 5xx or other — retry.
+        // Task 7-b live-E2E fix: 5xx gets a SHORT retry budget (2 attempts).
+        // Deterministic server errors (e.g. the live cloud's initial-data
+        // handler selects a syncVersion column that no longer exists for 6
+        // non-mandatory stages → guaranteed 500) never heal, and the old
+        // full 5-attempt backoff (~31s) per broken stage pushed the whole
+        // initial import past any reasonable launch budget. Transient
+        // outages remain covered: every failed stage is retried by the next
+        // runInitialSync/run, and mandatory-stage failures block READY.
+        if (response.status >= 500) {
+          serverErrorRetries++
+          if (serverErrorRetries > MAX_5XX_RETRIES_PER_REQUEST) {
+            const err = new Error(`Cloud API ${response.status}: ${errorDetail}`)
+            err.isServerError = true
+            throw err
+          }
+        }
         lastError = new Error(`Cloud API ${response.status}: ${errorDetail}`)
       } else {
         return await response.json()
@@ -161,7 +196,6 @@ const DATE_FIELDS = new Set([
  * Convert a cloud API record to a format suitable for local SQLite upsert.
  * - Convert ISO date strings to Date objects
  * - Strip undefined values
- * - Add syncVersion and syncedAt
  */
 function _transformRecord(record) {
   const result = {}
@@ -177,8 +211,12 @@ function _transformRecord(record) {
   // syncVersion per record and the incremental-sync conflict detector compares
   // stored vs cloud values — storing cloud+1 made EVERY later cloud update
   // look like a conflict (unbounded _sync_conflicts growth, all 'pending').
-  result.syncVersion = result.syncVersion || 0
-  result.syncedAt = new Date()
+  // Task 7-b live-E2E fix: do NOT inject syncVersion/syncedAt here at all.
+  // The v2 schema (packages/db) has NO syncVersion column on business models
+  // (it lives only on the SyncChange log) and syncedAt exists only on
+  // Reservation — forcing them into every record made EVERY Prisma upsert
+  // throw "Unknown argument" and every raw fallback fail with
+  // "no such column", so nothing was ever imported.
   return result
 }
 
@@ -319,18 +357,43 @@ async function _upsertRecordRaw(tx, modelName, rawRecord) {
  * Each record is upserted individually for idempotency.
  * Returns the count of successfully upserted records.
  */
-async function _upsertBatch(db, modelName, records) {
-  if (!records || records.length === 0) return 0
+const MAX_DEFERRED_RECORDS = 5000
+
+/**
+ * Detect FK-ordering failures: the record references a row that has not
+ * been imported yet (e.g. Agency.ownerId → User). These are retried once
+ * after ALL stages have completed (see runInitialSync's deferred pass) —
+ * by then their parents exist.
+ */
+function _isFkOrderingError(err) {
+  const msg = String((err && err.message) || err || '')
+  const clean = msg.replace(/\x1b\[[0-9;]*m/g, '')
+  return /foreign key/i.test(clean) || /P2003/.test(clean)
+}
+
+/**
+ * Batch upsert. Returns { upserted, deferred } — deferred records failed
+ * with FK-ordering errors and are retried after all stages complete.
+ */
+async function _upsertBatch(db, modelName, records, deferredOut) {
+  if (!records || records.length === 0) return { upserted: 0, deferred: 0 }
 
   let upserted = 0
+  let deferred = 0
   await db.$transaction(async (tx) => {
     for (const rawRecord of records) {
       const success = await _upsertRecord(tx, modelName, rawRecord)
-      if (success) upserted++
+      if (success) {
+        upserted++
+      } else if (deferredOut && deferredOut.length < MAX_DEFERRED_RECORDS) {
+        // FK-ordering candidates are remembered for the post-pass retry.
+        deferredOut.push({ modelName, rawRecord })
+        deferred++
+      }
     }
   }, { maxWait: 5000, timeout: 30000 })
 
-  return upserted
+  return { upserted, deferred }
 }
 
 // ─── AgencyLocalState Helpers ────────────────────────────────────────────────
@@ -583,10 +646,18 @@ async function runInitialSync(options) {
     throw new Error('Missing required options: agencyId, cloudAuthToken, cloudUrl, db')
   }
 
-  // Concurrency guard: prevent two initial syncs from running simultaneously.
-  // If a sync is already active, abort it first before starting a new one.
+  // Concurrency guard (spec §29): ONE authoritative initial-sync job per
+  // agency/session. If the SAME agency is already importing, coalesce —
+  // the new caller receives the in-flight run's promise instead of racing
+  // a second import (duplicate imports, cursor corruption, DB locking).
+  // A DIFFERENT agency legitimately needs the old run aborted.
   if (_activeSync) {
-    console.warn('[InitialSync] Another initial sync is already running (syncId: %s, agencyId: %s) — aborting it before starting new sync',
+    if (_activeSync.agencyId === agencyId && !_activeSync.abortController?.signal?.aborted) {
+      console.warn('[InitialSync] Initial sync already running for agency %s (syncId: %s) — coalescing into the active run',
+        agencyId, _activeSync.syncId)
+      return _activeSync.promise
+    }
+    console.warn('[InitialSync] Different agency initial sync running (syncId: %s, agencyId: %s) — aborting it before starting new sync',
       _activeSync.syncId, _activeSync.agencyId)
     if (_activeSync.abortController) {
       _activeSync.abortController.abort()
@@ -605,10 +676,30 @@ async function runInitialSync(options) {
     db,
     emitFn: emitFn || (() => {}),
     abortController: signal ? null : new AbortController(),
+    // Self-reference used by the coalescing path above.
+    promise: null,
   }
+  _activeSync.promise = _runInitialSyncInner({
+    agencyId, cloudAuthToken, cloudUrl, db, emitFn, signal,
+  }, _activeSync, syncId, startTime)
 
-  const emit = _activeSync.emitFn
-  const effectiveSignal = signal || _activeSync.abortController.signal
+  try {
+    return await _activeSync.promise
+  } finally {
+    if (_activeSync && _activeSync.syncId === syncId) _activeSync = null
+  }
+}
+
+/**
+ * Original runInitialSync body — kept verbatim except for the concurrency
+ * guard (moved into runInitialSync) and the READY fast-path which now clears
+ * the active sync entry via the shared _clearActive helper.
+ */
+async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
+  const { agencyId, cloudAuthToken, cloudUrl, db, emitFn, signal } = options
+
+  const emit = activeSync.emitFn
+  const effectiveSignal = signal || activeSync.abortController.signal
 
   // Ensure _sync_meta table exists (for incremental sync bridge)
   await _ensureMetaTable(db)
@@ -657,7 +748,7 @@ async function runInitialSync(options) {
     return { success: false, totalRecords: 0, duration: Date.now() - startTime, error: errMsg }
   }
 
-  const cloudStages = discoveryResult.stages
+  const cloudStages = _sortStagesFkSafe(discoveryResult.stages)
   const snapshotSequence = discoveryResult.snapshotSequence || 0
 
   // ── Step 2: Transition to INITIALIZING ──────────────────────────────────
@@ -672,7 +763,9 @@ async function runInitialSync(options) {
     currentStage: resumeFromStage || cloudStages[0]?.id || null,
     currentCursor: resumeCursor,
     snapshotSequence,
-    syncProtocolVersion: SYNC_PROTOCOL_VERSION,
+    // NOTE: syncProtocolVersion removed — the AgencyLocalState model in
+    // packages/db/prisma/schema.prisma has no such column and the upsert
+    // threw PrismaClientValidationError (found in live E2E, Task 7-b).
   })
 
   const totalStages = cloudStages.length
@@ -696,6 +789,10 @@ async function runInitialSync(options) {
     : 0
 
   const effectiveStartIndex = Math.max(0, startStageIndex)
+
+  // Records whose import was blocked by FK ordering (references to rows that
+  // were not imported yet). Retried once after ALL stages complete.
+  const deferredRecords = []
 
   for (let i = effectiveStartIndex; i < cloudStages.length; i++) {
     if (effectiveSignal?.aborted) {
@@ -738,10 +835,13 @@ async function runInitialSync(options) {
         if (effectiveSignal?.aborted) throw new Error('Aborted')
 
         // Fetch page from cloud
+        // Task 7-b live-E2E fix: the cloud validates cursor as
+        // z.string().optional() — a JSON null is REJECTED with 400. Omit the
+        // field entirely until a real (string) cursor exists.
         const response = await _cloudPost(discoveryUrl, {
           agencyId,
           stage: stage.id,
-          cursor,
+          cursor: cursor || undefined,
           pageSize: PAGE_SIZE,
           protocolVersion: SYNC_PROTOCOL_VERSION,
         }, cloudAuthToken, { signal: effectiveSignal })
@@ -764,18 +864,20 @@ async function runInitialSync(options) {
           break
         }
 
-        // Upsert batch in transaction
+        // Upsert batch in transaction (FK-blocked records are deferred
+        // to the post-pass retry instead of being silently dropped)
         batchNumber++
-        const upserted = await _upsertBatch(db, modelName, records)
-        stageCount += upserted
-        totalRecords += upserted
+        const batchResult = await _upsertBatch(db, modelName, records, deferredRecords)
+        stageCount += batchResult.upserted
+        totalRecords += batchResult.upserted
 
         // Advance cursor and update progress
         cursor = nextCursor
         await _updateLocalState(db, agencyId, {
           currentCursor: cursor,
-          currentBatch: batchNumber,
           recordsImported: totalRecords,
+          // NOTE: currentBatch removed — no such column on AgencyLocalState
+          // (PrismaClientValidationError, found in live E2E, Task 7-b).
         })
 
         // Determine if more pages
@@ -866,6 +968,26 @@ async function runInitialSync(options) {
         skipped: true,
       })
     }
+  }
+
+  // ── Step 3b: Deferred retry pass (FK-ordering recovery) ─────────────────
+  // Records that failed during staged import because they referenced rows
+  // imported LATER (circular dependencies like Counter.currentReservationId →
+  // Reservation, or discovery stage order differing from FK order) are
+  // retried now that every stage has been applied. Still-failing records are
+  // counted as failures and healed by full reconciliation later.
+  if (deferredRecords.length > 0) {
+    console.log(`[InitialSync] Deferred retry pass: ${deferredRecords.length} record(s) blocked by FK ordering`)
+    let recovered = 0
+    for (const { modelName, rawRecord } of deferredRecords) {
+      try {
+        const ok = await _upsertRecord(db, modelName, rawRecord)
+        if (ok) recovered++
+      } catch { /* healed by reconciliation */ }
+    }
+    totalRecords += recovered
+    console.log(`[InitialSync] Deferred retry recovered ${recovered}/${deferredRecords.length} record(s)`)
+    emit({ type: 'SYNC_STAGE_COMPLETED', stage: 'deferred-retry', stageLabel: 'Deferred retry', count: recovered })
   }
 
   // ── Step 4: Integrity validation ────────────────────────────────────────
@@ -1010,7 +1132,6 @@ async function resetInitialSync(db, agencyId) {
     initializationCompletedAt: null,
     currentStage: null,
     currentCursor: null,
-    currentBatch: 0,
     recordsImported: 0,
     lastError: null,
     snapshotSequence: 0,

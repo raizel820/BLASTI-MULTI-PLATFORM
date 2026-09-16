@@ -60,15 +60,28 @@ const REALTIME_TOKEN = process.env.NEXT_PUBLIC_REALTIME_TOKEN || ''
 /**
  * Resolves the correct Socket.IO connection URL based on the runtime platform:
  *
- * - Electron/Capacitor (native): connect directly to cloud API / realtime server.
+ * - Electron (local-first, spec §7/§8): connect to the EMBEDDED LOCAL API on
+ *   http://127.0.0.1:3080. The local API is the operational source of truth
+ *   for the desktop UI, and agent 7-b attaches a Socket.IO server to it that
+ *   emits the same event names + relays sync events — so realtime must not
+ *   depend on cloud availability (must work offline).
+ * - Other native (Capacitor): connect directly to cloud API / realtime server.
  *   The renderer is at a different origin than the API server, and the gateway
  *   cannot proxy WebSocket upgrades reliably. Use BLASTI_CLOUD_URL or localhost:3003.
- * - If NEXT_PUBLIC_REALTIME_URL is explicitly set, use it.
+ * - If NEXT_PUBLIC_REALTIME_URL is explicitly set, use it (non-Electron only).
  * - Otherwise (web browser): use relative path "/" so the Caddy gateway proxies
  *   the connection, and pass XTransformPort=3003 as a query parameter.
  */
+function isElectronPlatform(): boolean {
+  return typeof window !== 'undefined' && !!(window as any).electronAPI
+}
+
 function resolveSocketUrl(): string {
-  // Native platform: connect directly to cloud API (no gateway proxy)
+  // Electron: connect to the LOCAL API socket server (local-first; offline-capable)
+  if (isElectronPlatform()) {
+    return 'http://127.0.0.1:3080'
+  }
+  // Other native platforms (Capacitor): connect directly to cloud API (no gateway proxy)
   if (isNativePlatform()) {
     return (typeof process !== 'undefined' && (process as any).env?.BLASTI_CLOUD_URL)
       || `http://localhost:${REALTIME_PORT}`
@@ -86,19 +99,26 @@ function resolveSocketOptions(): Parameters<typeof io>[1] {
   const isNative = isNativePlatform()
   const nativeUrl = process.env.NEXT_PUBLIC_REALTIME_URL
 
+  // Handshake credential: for the LOCAL server (Electron), the JWT session
+  // token is the right credential — prefer it over the shared realtime secret.
+  // Capacitor/web keep the previous precedence (env token first).
+  const authToken = isElectronPlatform()
+    ? useAppStore.getState().sessionToken || process.env.NEXT_PUBLIC_REALTIME_TOKEN || ''
+    : process.env.NEXT_PUBLIC_REALTIME_TOKEN || useAppStore.getState().sessionToken || ''
+
   const baseOptions: Parameters<typeof io>[1] = {
     path: '/socket.io',
     transports: ['websocket', 'polling'],
     reconnection: true,
     // On native platforms, use fewer reconnection attempts to avoid
-    // spamming "WebSocket connection failed" when cloud is down.
+    // spamming "WebSocket connection failed" when the server is down.
     // The LAN fallback (HTTP polling) handles offline events.
     reconnectionAttempts: isNative ? 5 : Infinity,
     reconnectionDelay: isNative ? 3000 : 1000,
     reconnectionDelayMax: 30000,
     timeout: 10000,
     auth: {
-      token: process.env.NEXT_PUBLIC_REALTIME_TOKEN || useAppStore.getState().sessionToken || '',
+      token: authToken,
     },
   }
 
@@ -169,10 +189,11 @@ async function connectLanSocket() {
     const server = getGlobalLanServer()
     if (!server) return
 
-    // Skip LAN socket connection — the local API (port 3080) serves HTTP only,
-    // it does not run a Socket.IO server. Attempting to connect would spam
-    // WebSocket connection refused errors in the console. The cloud Socket.IO
-    // connection handles all realtime events; LAN failover is HTTP-only.
+    // Skip LAN socket connection — under local-first the LOCAL API (:3080) IS
+    // the primary socket for Electron (see resolveSocketUrl), so this separate
+    // LAN fallback is dead code for the desktop. For Capacitor the local API
+    // is HTTP-only from the client's perspective; cloud Socket.IO handles all
+    // realtime events. Kept with an early return to preserve the structure.
     return
     const lanUrl = `http://${server.ip}:${server.port}`
     lanSocket = io(lanUrl, {

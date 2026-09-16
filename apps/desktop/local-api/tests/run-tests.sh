@@ -97,7 +97,11 @@ start_local_api() {
   # We use a small launcher script that imports and starts the API
   LAUNCHER=$(mktemp /tmp/blasti-test-api-XXXXXX.js)
   cat > "$LAUNCHER" << 'LAUNCHER_EOF'
-const localApi = require('./index');
+const path = require('path');
+// The launcher lives in /tmp, so a bare require('./index') would resolve
+// against /tmp — use the absolute entry injected via BLASTI_API_ENTRY.
+const entry = process.env.BLASTI_API_ENTRY || path.join(process.cwd(), 'index.js');
+const localApi = require(entry);
 const port = parseInt(process.env.BLASTI_TEST_API_PORT || '3081', 10);
 localApi.startLocalApi(null, port).then((result) => {
   console.log('[TestLauncher] Local API started on port', result.port);
@@ -110,7 +114,7 @@ localApi.startLocalApi(null, port).then((result) => {
 LAUNCHER_EOF
 
   # Start the launcher in the background
-  (cd "$API_DIR" && BLASTI_TEST_API_PORT=$TEST_PORT $NODE "$LAUNCHER" &>/tmp/blasti-test-api.log) &
+  (cd "$API_DIR" && BLASTI_API_ENTRY="$API_DIR/index.js" BLASTI_TEST_API_PORT=$TEST_PORT $NODE "$LAUNCHER" &>/tmp/blasti-test-api.log) &
   API_PID=$!
 
   # Wait for the API to be ready
@@ -235,6 +239,11 @@ fi
 # ── Database Layer Tests ──
 if [ "$RUN_DB" = true ]; then
   run_test_file "Database Layer" "$SCRIPT_DIR/test-db.js" || true
+fi
+
+# ── Schema Lifecycle Tests (controlled non-destructive migrations) ──
+if [ "$RUN_DB" = true ]; then
+  run_test_file "Schema Lifecycle" "$SCRIPT_DIR/test-schema-migrations.js" || true
 fi
 
 # ── Sync Engine Tests ──

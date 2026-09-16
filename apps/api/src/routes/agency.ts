@@ -407,6 +407,37 @@ app.get('/branches', async (c) => {
   }
 })
 
+// GET /agency/counters?agencyId= — agency-wide counter list.
+// The desktop's startup diagnostics/initial import probes this endpoint;
+// previously only the per-branch variant (/branches/:id/counters) existed
+// and the desktop received HTTP 404 during validation.
+app.get('/counters', async (c) => {
+  try {
+    const agencyId = c.req.query('agencyId')
+    if (!agencyId) {
+      return c.json({ success: false, error: 'agencyId is required' }, 400)
+    }
+
+    // Phase 2c: Explicit ownership check
+    await ensureAgencyIdOwnership(c, agencyId)
+    await requireAgencyAccess(c, agencyId)
+
+    const counters = await db.counter.findMany({
+      where: { branch: { agencyId } },
+      include: {
+        staff: { include: { user: { select: { fullName: true, username: true } } } },
+        currentReservation: { select: { id: true, displayNumber: true, status: true } },
+      },
+      orderBy: { number: 'asc' },
+    })
+
+    return c.json({ success: true, counters })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 // POST /agency/branches
 app.post('/branches', async (c) => {
   try {

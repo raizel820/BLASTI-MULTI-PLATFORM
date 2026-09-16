@@ -2,7 +2,7 @@
 import { apiFetch } from '@/lib/api-fetch';;
 
 import { useState, useCallback } from 'react';
-import { apiClient } from '@/lib/api-client';
+import { apiClient, setNativeSessionToken } from '@/lib/api-client';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
@@ -77,7 +77,13 @@ export function LoginForm() {
               const w = window as any;
               const isElectron = navigator.userAgent.includes('Electron') || w.electronAPI;
               if (isElectron) {
-                // 1. Store the token so buildAuthHeaders() sends it with LAN requests
+                // 0. Persist the token to the native session key too so EVERY
+                //    token consumer reads it deterministically under local-first
+                //    (buildAuthHeaders fallbacks, db/sync.ts, offline-queue.ts).
+                //    setNativeSessionToken() is a no-op outside native runtimes.
+                setNativeSessionToken(data.token);
+
+                // 1. Store the token so buildAuthHeaders() sends it with local API requests
                 localStorage.setItem('blasti-local-api-token', data.token);
 
                 // 2. Import session directly into the local API via IPC bridge
@@ -97,9 +103,10 @@ export function LoginForm() {
                   }).catch(() => { /* non-critical */ });
                 }
 
-                // 4. Trigger initial cloud→local sync to pull agency data
-                //    This downloads all agency tables (Services, Branches, Counters,
-                //    Reservations, etc.) into the local SQLite for offline use.
+                // 4. Trigger the initial workspace sync (cloud → local SQLite).
+                //    Idempotent: the v2 initial-sync state machine short-circuits
+                //    when AgencyLocalState is already READY, and the loading-screen
+                //    gate may have already run it for this workspace.
                 if (w.electronAPI?.initialCloudSync) {
                   w.electronAPI.initialCloudSync().then((syncResult: any) => {
                     if (syncResult?.success) {

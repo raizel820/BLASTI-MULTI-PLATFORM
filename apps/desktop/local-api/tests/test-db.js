@@ -531,7 +531,17 @@ async function runAllTests() {
 
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 
-runAllTests()
+// Schema lifecycle moved OUT of module load (controlled non-destructive
+// migration layer — lib/schema-migrations.js). Tests must initialize the
+// local database explicitly before touching Prisma delegates.
+require('../lib/db').ensureDatabaseReady()
+  .then((ready) => {
+    if (!ready.ok) {
+      console.error(`Database initialization failed: ${ready.error}`)
+      process.exit(1)
+    }
+    return runAllTests()
+  })
   .then((exitCode) => { process.exit(exitCode) })
   .catch((err) => {
     console.error(`${_colors.red}FATAL: ${err.message}${_colors.reset}`)

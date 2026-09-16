@@ -7,9 +7,13 @@
  *
  * Platform-specific behavior:
  * - **Web**: Uses relative URLs (same-origin) so cookies are sent automatically.
- * - **Electron**: Uses `NEXT_PUBLIC_API_URL` (falls back to `https://blasti.vercel.app`)
- *   because the renderer process is served from `file://` and needs an absolute URL.
- * - **Capacitor**: Same as Electron — native shells point to the Vercel-hosted backend.
+ * - **Electron**: Uses the EMBEDDED LOCAL API (http://127.0.0.1:3080) ALWAYS.
+ *   Local-first (spec §7/§8): the local SQLite-backed API is the operational
+ *   source of truth for the desktop UI — offline operation must be
+ *   deterministic and cloud availability must not affect data requests.
+ *   The cloud API is sync-only (pull/push driven by the desktop main process).
+ * - **Capacitor**: Native shells point to the cloud backend
+ *   (`NEXT_PUBLIC_API_URL`, falls back to `https://blasti.vercel.app`).
  * - **SSR (server-side)**: Uses `INTERNAL_API_URL` (falls back to `http://localhost:3000`).
  *
  * Usage:
@@ -139,20 +143,27 @@ function isNativeRuntime(): boolean {
 
 const DEFAULT_VERCEL_URL = 'https://blasti.vercel.app';
 const DEFAULT_INTERNAL_URL = 'http://localhost:3000';
-const DEFAULT_CLOUD_API_URL = 'http://localhost:3003';
+/**
+ * Electron local-first base URL (spec §7/§8).
+ * The embedded local API on :3080 is the ONLY data endpoint for the desktop
+ * UI. There is intentionally NO env override — pointing the renderer at the
+ * cloud would break deterministic offline operation.
+ */
+const ELECTRON_LOCAL_API_BASE = 'http://127.0.0.1:3080';
 
 /**
  * Resolve the API base URL for the current runtime environment.
  *
  * Priority:
  * 1. **SSR**: `INTERNAL_API_URL` env var → `http://localhost:3000`
- * 2. **Electron**: Cloud API directly → LAN failover to localhost:3080 on failure
+ * 2. **Electron**: the embedded LOCAL API `http://127.0.0.1:3080` ALWAYS
+ *    (local-first: cloud is sync-only and must never serve UI data requests)
  * 3. **Capacitor**: `NEXT_PUBLIC_API_URL` env var → `https://blasti.vercel.app`
  * 4. **Web (browser)**: `NEXT_PUBLIC_API_URL` → cloud API → fallback to localhost:3003
  *
  * NOTE: We removed the Next.js rewrite proxy (/api/* → localhost:3003) because
  * it crashes the dev server when the destination is unreachable (Next.js 16 bug).
- * All API routing is now handled client-side by this function + LAN failover.
+ * All API routing is now handled client-side by this function + failover.
  */
 export function getApiBaseUrl(): string {
   // Server-side: use internal URL
@@ -160,14 +171,20 @@ export function getApiBaseUrl(): string {
     return process.env.INTERNAL_API_URL || DEFAULT_INTERNAL_URL;
   }
 
-  // ── Electron: Connect to cloud API directly ─────────────────────────
-  // When online, requests go straight to the cloud API (no proxy middleman).
-  // When the cloud API is down, the LAN failover chain (requestViaLan) kicks in
-  // and redirects to localhost:3080 (the embedded local API server).
-  // This avoids the Next.js rewrite proxy which crashes the dev server when
-  // the cloud API is unreachable.
+  // ── Electron: LOCAL-FIRST — always the embedded local API (:3080) ─────────────────────────
+  // WHY (spec §7/§8): the desktop must operate fully offline. The local
+  // SQLite-backed API is the operational source of truth for the UI; the
+  // cloud API (:3003 / Vercel) is reached ONLY by the sync engine running
+  // in the desktop main process (pull/push). Pointing the renderer at the
+  // cloud would make UI data requests non-deterministic (they would depend
+  // on internet availability), so the base URL is hardcoded and there is
+  // deliberately NO env override and NO cloud failover for Electron.
+  // The old cloud-first base (BLASTI_CLOUD_URL || localhost:3003) with a
+  // LAN failover chain is retired: with a local base, the LAN/cloud failover
+  // machinery below becomes inert for Electron (requestViaLan also targets
+  // 127.0.0.1:3080 — it can never redirect data requests to the cloud).
   if (isElectronRuntime()) {
-    return process.env.BLASTI_CLOUD_URL || DEFAULT_CLOUD_API_URL;
+    return ELECTRON_LOCAL_API_BASE;
   }
 
   // Native shell (Capacitor): need absolute URL to Vercel backend
@@ -316,7 +333,10 @@ function buildUrl(baseUrl: string, path: string, params?: Record<string, string>
 
   if (Object.keys(queryParams).length > 0) {
     const searchParams = new URLSearchParams(queryParams);
-    url += `?${searchParams.toString()}`;
+    // The path may already embed a query string (e.g. "/api/x?a=b") —
+    // append with "&" in that case so XTransformPort isn't swallowed
+    // into the value of an existing param.
+    url += `${url.includes('?') ? '&' : '?'}${searchParams.toString()}`;
   }
 
   return url;
@@ -500,8 +520,10 @@ function isOnlineOnlyPath(path: string, includeAuth: boolean = true): boolean {
 }
 
 // ─── Electron LAN Pre-Discovery ─────────────────────────────────────────────
-// In Electron, the desktop app IS the LAN server. Pre-discover it on first
-// request so the failover chain works immediately — no 7s delay on first failure.
+// LOCAL-FIRST NOTE: in Electron the base URL is now ALWAYS 127.0.0.1:3080,
+// so this pre-discovery can no longer influence where requests go (it never
+// overrode the base URL — it only populates the use-lan-mode global used by
+// LAN-mode UI features). Kept for that UI state; failover-wise it is inert.
 
 let _electronLanPreDiscovered = false;
 
@@ -612,8 +634,9 @@ export class ApiClient {
     const timeoutMs = options?.timeout ?? (isElectronRuntime() ? 5_000 : this.config.timeout);
     const url = buildUrl(this.config.baseUrl, path, options?.params);
 
-    // ── Electron: Pre-discover LAN server on first request ─────────────────────
-    // Fire-and-forget: pre-populates getGlobalLanServer() for instant failover
+    // ── Electron: pre-discover local API (inert under local-first) ──────────────────
+    // Fire-and-forget: only populates use-lan-mode UI state; the request below
+    // already targets http://127.0.0.1:3080 (getApiBaseUrl), which this never overrides.
     if (isElectronRuntime()) {
       preDiscoverElectronLan(); // async, non-blocking
     }
@@ -871,8 +894,11 @@ export class ApiClient {
    * Retry a failed request against the LAN desktop server (port 3080).
    * Only called when cloud is unreachable and we're on a native platform.
    *
-   * In Electron: always tries localhost:3080 because the desktop app IS the LAN server.
-   * In Capacitor: uses getGlobalLanServer() from discovery results.
+   * LOCAL-FIRST NOTE (Electron): since getApiBaseUrl() returns
+   * http://127.0.0.1:3080 for Electron, this path can NEVER redirect data
+   * requests to the cloud — it retries the SAME local endpoint (useful for
+   * its session auto-restore on 401/503). For Capacitor it still uses
+   * getGlobalLanServer() from discovery results as before.
    * If neither is available, throws immediately.
    *
    * Session auto-restore: If the local API returns 401, it may be because the
@@ -887,7 +913,8 @@ export class ApiClient {
   ): Promise<ApiResponse<T>> {
     let lanUrl: string | null = null;
 
-    // In Electron, the desktop app IS the LAN server — always on localhost:3080
+    // In Electron this equals the primary base URL under local-first —
+    // it retries the SAME local endpoint and can never hit the cloud.
     if (isElectronRuntime()) {
       lanUrl = `http://127.0.0.1:3080${path}`;
 
@@ -1637,7 +1664,8 @@ ApiClient.prototype.request = async function<T>(
  * Default API client singleton.
  *
  * - On the web: uses relative URLs (same-origin requests)
- * - On Electron / Capacitor: uses `NEXT_PUBLIC_API_URL` or `https://blasti.vercel.app`
+ * - On Electron: uses the embedded local API http://127.0.0.1:3080 (local-first)
+ * - On Capacitor: uses `NEXT_PUBLIC_API_URL` or `https://blasti.vercel.app`
  * - On the server: uses `INTERNAL_API_URL` or `http://localhost:3000`
  *
  * Import this in client components:

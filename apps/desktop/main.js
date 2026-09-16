@@ -81,6 +81,51 @@ const isDev =
     try { return require('electron-is-dev'); } catch { return false; }
   })();
 
+// ─── Authoritative Local Database Path (single source of truth) ───────────
+// ═══════════════════════════════════════════════════════════════════════════
+// EXACTLY ONE local database location exists:
+//     <app.getPath('userData')>/blasti-local/local.db
+// i.e. %APPDATA%/@blasti/desktop/blasti-local/local.db on Windows.
+//
+// This MUST be set BEFORE any module under ./local-api is required —
+// historically lib/db.js computed its own path (~/.blasti/local) at module
+// load while the loading screen set a different one (userData/blasti-local),
+// producing two divergent databases depending on require order. lib/db.js
+// also self-heals: if the env arrives after client creation it rebinds
+// (reconcileClientWithEnv) and migrates any legacy DB (copy + verify).
+function setAuthoritativeDbPath() {
+  const dbDir = path.join(app.getPath('userData'), 'blasti-local');
+  if (!process.env.BLASTI_LOCAL_DB_DIR) {
+    process.env.BLASTI_LOCAL_DB_DIR = dbDir;
+    console.log('[BLASTI Desktop] Authoritative local DB dir:', dbDir);
+  } else if (path.resolve(process.env.BLASTI_LOCAL_DB_DIR) !== path.resolve(dbDir)) {
+    console.warn('[BLASTI Desktop] BLASTI_LOCAL_DB_DIR override in effect:', process.env.BLASTI_LOCAL_DB_DIR);
+  }
+}
+try {
+  // userData is resolvable at module scope in the Electron main process.
+  setAuthoritativeDbPath();
+} catch (err) {
+  console.warn('[BLASTI Desktop] Could not resolve userData yet — will set when app is ready:', err.message);
+}
+
+// ─── Cloud API Base URL (single source of truth) ────────────────────────
+// One resolution used by diagnostics, sync service, local API fallbacks and
+// the web shell. Precedence: BLASTI_CLOUD_URL > BLASTI_API_URL > default.
+// NOTE: in production the DEFAULT (https://blasti.vercel.app) is the static
+// web export host — set BLASTI_CLOUD_URL to the real API origin unless the
+// API is served under the same hostname via reverse proxy (spec §13).
+function resolveCloudBaseUrl() {
+  const strip = (u) => String(u || '').replace(/\/+$/, '');
+  if (process.env.BLASTI_CLOUD_URL) return strip(process.env.BLASTI_CLOUD_URL);
+  if (process.env.BLASTI_API_URL) return strip(process.env.BLASTI_API_URL);
+  return isDev ? 'http://localhost:3003' : 'https://blasti.vercel.app';
+}
+const CLOUD_BASE_URL = resolveCloudBaseUrl();
+// Publish for every other module (local API initial-sync route, sync service,
+// loading-screen fallbacks) so they can never resolve a different origin.
+process.env.BLASTI_CLOUD_URL = CLOUD_BASE_URL;
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEV_URL = 'http://localhost:3000';
@@ -1076,42 +1121,146 @@ function _normalizeClientRecord(record) {
 // The renderer process (which has access to NextAuth cookies) sends the JWT
 // token to the main process so the cloud sync loop can authenticate.
 
+/**
+ * v2: Run the stage-based initial sync (local-api/initial-sync.js) using the
+ * current session, then initialize the sync engine's pull cursor from the
+ * snapshot sequence and start the background engine. Shared by the
+ * cloud-sync:set-auth login flow and the cloud-sync:initial-sync IPC bridge
+ * (used by the loading screen).
+ */
+// Single-flight guard (spec §29): the login form, auth-provider reload,
+// fetch-with-retry and store rehydration can all call set-auth within seconds.
+// One authoritative initial-sync job per session — concurrent callers join
+// the in-flight promise instead of starting duplicate imports.
+let _initialSyncInFlight = null;
+
+async function _runInitialSyncFromSession() {
+  if (_initialSyncInFlight) {
+    console.log('[IPC] Initial sync already in flight — coalescing');
+    return _initialSyncInFlight;
+  }
+  _initialSyncInFlight = _runInitialSyncFromSessionInner().finally(() => {
+    _initialSyncInFlight = null;
+  });
+  return _initialSyncInFlight;
+}
+
+async function _runInitialSyncFromSessionInner() {
+  const localApi = require('./local-api/index');
+  let session = localApi.getSession();
+  if (!session || !session.token || !session.user) {
+    // Fall back to the persisted auth file (loading-screen flow).
+    try {
+      const authPath = path.join(app.getPath('userData'), 'blasti-auth.json');
+      if (fs.existsSync(authPath)) {
+        session = JSON.parse(fs.readFileSync(authPath, 'utf-8'));
+      }
+    } catch { /* ignore malformed auth file */ }
+  }
+  if (!session || !session.token || !session.user) {
+    return { success: false, error: 'No active session — login first' };
+  }
+
+  const { localDb } = require('./local-api/lib/db');
+  const cloudUrl = process.env.BLASTI_CLOUD_URL || CLOUD_BASE_URL;
+
+  // Readiness gate: an already-READY workspace must NEVER re-import.
+  // (Prevents the historic "Auth set — triggering immediate initial sync"
+  // spam and pointless re-downloads on every session restore.)
+  try {
+    const { checkInitialSyncStatus } = require('./local-api/initial-sync');
+    const status = await checkInitialSyncStatus(localDb, session.user.agencyId);
+    if (status && status.status === 'READY') {
+      console.log('[IPC] Workspace already READY — skipping initial sync');
+      const syncServiceReady = require('./local-api/sync-service');
+      try {
+        if (localDb && !syncServiceReady.getStatus()?.isStarted) {
+          syncServiceReady.startSync({
+            localDb,
+            cloudBaseUrl: cloudUrl,
+            agencyId: session.user.agencyId || '',
+          });
+          console.log('[IPC] Sync service started (already-READY path) — cloud:', cloudUrl);
+        }
+      } catch (startErr) {
+        console.warn('[IPC] Failed to start sync service (READY path):', startErr.message);
+      }
+      return { success: true, totalRecords: 0, duration: 0, alreadyInitialized: true };
+    }
+  } catch (statusErr) {
+    console.warn('[IPC] Could not read initialization status (continuing):', statusErr.message);
+  }
+
+  const { runInitialSync } = require('./local-api/initial-sync');
+  const result = await runInitialSync({
+    agencyId: session.user.agencyId,
+    cloudAuthToken: session.token,
+    cloudUrl: cloudUrl,
+    db: localDb,
+    emitFn: (evt) => console.log('[InitialSync evt]', evt.type, evt.stage || ''),
+  });
+
+  const syncService = require('./local-api/sync-service');
+  if (result && result.success && typeof result.snapshotSequence === 'number') {
+    // Initialize the pull cursor from the initial sync's snapshotSequence so
+    // the incremental engine continues exactly where the snapshot ended.
+    await syncService.setInitialCursor(result.snapshotSequence).catch(() => {});
+  }
+
+  // Start the background engine after the initializer finishes (success OR
+  // failure — an offline failure recovers via the pull-from-0 path once
+  // connectivity returns). Starting after completion avoids racing the
+  // staged import.
+  try {
+    if (localDb && !syncService.getStatus()?.isStarted) {
+      syncService.startSync({
+        localDb,
+        cloudBaseUrl: cloudUrl,
+        agencyId: session.user.agencyId || '',
+      });
+      console.log('[IPC] Sync service started after initial sync — cloud:', cloudUrl);
+    }
+  } catch (startErr) {
+    console.warn('[IPC] Failed to start sync service after initial sync:', startErr.message);
+  }
+
+  return result;
+}
+
 ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
   try {
     const syncService = require('./local-api/sync-service');
     syncService.setAuth(token, user);
 
-    // Ensure sync service is started (it may not have been started yet)
+    // ── v2 initial sync: stage-based initializer ────────────────────────
+    // Replaces the old syncService.initialSync() (deleted). Runs the
+    // per-stage import, sets the engine cursor from the snapshot sequence,
+    // then starts the background engine.
     try {
-      const { localDb } = require('./local-api/lib/db');
-      if (localDb && !syncService.getStatus()?.isStarted) {
-        const isDevMode = process.env.NODE_ENV === 'development' || process.env.ELECTRON_DEV === '1';
-        const syncCloudUrl = isDevMode
-          ? (process.env.BLASTI_API_URL || 'http://localhost:3003')
-          : (process.env.BLASTI_CLOUD_URL || 'https://blasti.vercel.app');
-        syncService.startSync({
-          localDb,
-          cloudBaseUrl: syncCloudUrl,
-          agencyId: user?.agencyId || '',
-        });
-        console.log('[IPC] Sync service started after auth — cloud:', syncCloudUrl);
-      }
-    } catch (startErr) {
-      console.warn('[IPC] Failed to start sync service:', startErr.message);
+      // Import the session into the local API first so the initializer and
+      // any local business calls during import have a session available.
+      const localApi = require('./local-api/index');
+      localApi.setSession(token, user);
+    } catch (sessionErr) {
+      console.warn('[IPC] Failed to import session to local API (early):', sessionErr.message);
     }
-
-    // Trigger immediate initial sync to pull all agency data from cloud
     try {
-      syncService.initialSync().then((result) => {
-        if (result?.success) {
-          console.log('[IPC] Initial sync after login: pulled', result.pulled, 'pushed', result.pushed);
+      _runInitialSyncFromSession().then((result) => {
+        if (result && result.success) {
+          if (result.alreadyInitialized) {
+            console.log('[IPC] Initial sync skipped — workspace already READY');
+          } else {
+            console.log('[IPC] Initial sync after login: imported', result.totalRecords, 'records in', Math.round((result.duration || 0) / 1000) + 's');
+          }
         } else {
-          console.warn('[IPC] Initial sync after login failed:', result?.error);
+          console.warn('[IPC] Initial sync after login failed:', result && result.error);
         }
       }).catch((err) => {
         console.warn('[IPC] Initial sync after login error:', err.message);
       });
-    } catch { /* non-blocking */ }
+    } catch (initErr) {
+      console.warn('[IPC] Failed to launch initial sync:', initErr.message);
+    }
 
     // Persist auth to file so the loading screen can import agency data on next launch
     try {
@@ -1120,15 +1269,6 @@ ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
       console.log('[IPC] Cloud sync auth saved to', authPath);
     } catch (saveErr) {
       console.warn('[IPC] Failed to save auth file:', saveErr.message);
-    }
-
-    // Also import session into local API immediately
-    try {
-      const localApi = require('./local-api/index');
-      localApi.setSession(token, user);
-      console.log('[IPC] Session imported to local API');
-    } catch (localErr) {
-      console.warn('[IPC] Failed to import session to local API:', localErr.message);
     }
 
     return { success: true };
@@ -1185,9 +1325,11 @@ ipcMain.handle('cloud-sync:trigger', async () => {
 
 ipcMain.handle('cloud-sync:initial-sync', async () => {
   try {
-    const syncService = require('./local-api/sync-service');
-    const result = await syncService.initialSync();
-    return result;
+    // v2: runs the stage-based initializer (local-api/initial-sync.js) with
+    // the current session, sets the engine cursor and starts the engine.
+    // Returns { success, totalRecords, duration, error?, alreadyInitialized? }
+    // — the shape the loading-screen IPC bridge expects.
+    return await _runInitialSyncFromSession();
   } catch (err) {
     console.error('[IPC] cloud-sync:initial-sync failed:', err.message);
     return { success: false, error: err.message };
@@ -1368,8 +1510,32 @@ app.whenReady().then(async () => {
   console.log(`[BLASTI Desktop] Dev URL: ${DEV_URL}, Prod URL: ${PROD_URL}`);
   console.log(`[BLASTI Desktop] Electron version: ${process.versions.electron}, Node: ${process.versions.node}`);
 
+  // ── DETERMINISTIC STARTUP ORDER (spec §28) ────────────────────────────
+  // 1. resolve authoritative DB path (idempotent)
+  // 2. open/init + migrate local DB (inside local API startup)
+  // 3. start local API (diagnostics, loading-screen)
+  // 4. determine initialization state → launch OR initialization screen
+  try { setAuthoritativeDbPath(); } catch (err) {
+    console.error('[BLASTI Desktop] FATAL — cannot resolve authoritative DB path:', err.message);
+  }
+
   // Set Content Security Policy
   setCSP();
+
+  // ── Wire local→cloud immediacy (v2) ─────────────────────────────────
+  // Every pending mutation logged by the local API triggers a debounced
+  // (400ms) outbox replay in the sync service. No-op when offline or
+  // unauthenticated — the 30s cycle / socket / 'online' paths cover those.
+  try {
+    const localApi = require('./local-api/index');
+    const syncService = require('./local-api/sync-service');
+    localApi.setMutationListener(() => {
+      try { syncService.onLocalMutation(); } catch { /* engine not ready */ }
+    });
+    console.log('[BLASTI Desktop] Local mutation → outbox replay listener wired');
+  } catch (wireErr) {
+    console.warn('[BLASTI Desktop] Failed to wire mutation listener:', wireErr.message);
+  }
 
   // Create the system tray
   createTray();
@@ -1384,11 +1550,7 @@ app.whenReady().then(async () => {
   try {
     const { runDiagnostics } = require('./loading-screen');
     const userDataPath = app.getPath('userData');
-    const isDevMode = process.env.NODE_ENV === 'development' ||
-              process.env.ELECTRON_DEV === '1';
-    const cloudBaseUrl = isDevMode
-      ? (process.env.BLASTI_API_URL || 'http://localhost:3003')
-      : (process.env.BLASTI_CLOUD_URL || 'https://blasti.vercel.app');
+    const cloudBaseUrl = process.env.BLASTI_CLOUD_URL || CLOUD_BASE_URL;
 
     // Wait for the loading screen renderer to register its listeners.
     // Without this, early IPC events may fire before the renderer is ready.
@@ -1407,7 +1569,7 @@ app.whenReady().then(async () => {
 
     const diagResult = await runDiagnostics(mainWindow, {
       cloudBaseUrl,
-      isDev: isDevMode,
+      isDev: isDev,
       userDataPath,
     });
 
