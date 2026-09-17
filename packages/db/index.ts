@@ -24,6 +24,7 @@ import { PrismaClient, Prisma } from '@prisma/client'
 import { resolve, dirname } from 'path'
 import { mkdirSync, existsSync } from 'fs'
 import { fileURLToPath } from 'url'
+import { AsyncLocalStorage } from 'async_hooks'
 
 // ── Robust DATABASE_URL resolution ─────────────────────────────────────────
 // On a freshly-copied/cloned project there may be no `.env` (it's gitignored),
@@ -88,6 +89,10 @@ const baseClient =
 
 if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = baseClient
 
+// P1-6/E3: install the tx-capture context BEFORE the extension reads
+// $transaction so interactive transactions get deferred capture.
+installTransactionalCaptureContext(baseClient)
+
 /**
  * Convert a Prisma model name to its delegate accessor.
  * e.g. "User" → "user", "SubscriptionPlan" → "subscriptionPlan"
@@ -123,6 +128,10 @@ export interface SyncQueryHookEvent {
   result: any
   /** For delete/deleteMany: FULL records captured before the delete executed. */
   preDeleteRecords: any[] | null
+  /** For updateMany: affected records captured BEFORE the bulk update ran
+   *  (afterwards only { count } is known — without this the event would be
+   *  silently dropped and the change feed would miss the whole updateMany). */
+  preUpdateManyRecords: any[] | null
 }
 
 type SyncQueryHook = (evt: SyncQueryHookEvent) => Promise<void>
@@ -140,6 +149,108 @@ export function setSyncTrackingEnabled(enabled: boolean): void {
 }
 
 let skipSyncTracking = process.env.SKIP_SYNC_TRACKING === '1'
+
+/**
+ * P1-6/E1: ONLY mutation operations produce SyncChange rows. The historic
+ * hook fired for EVERY operation including findFirst/findMany — every read
+ * of a tracked model polluted the change feed with phantom "update" rows,
+ * burned global sequence numbers, and (via pull's missing-record → delete
+ * downgrade) could surface to offline clients as PHANTOM DELETES.
+ */
+const SYNC_MUTATION_OPERATIONS: Set<string> = new Set([
+  'create',
+  'createMany',
+  'update',
+  'updateMany',
+  'upsert',
+  'delete',
+  'deleteMany',
+])
+
+// ── P1-6/E3: interactive-transaction capture deferral ──────────────────────
+// Empirically verified (Task 15 audit): inside an interactive $transaction,
+// the extension hook fires MID-TRANSACTION and the capture worker writes via
+// the raw client on a SEPARATE connection — which blocks on SQLite's single
+// writer (the business tx) until the tx timeout expires → P2028, the BUSINESS
+// WRITE ROLLS BACK, and the blocked capture then commits a SyncChange for a
+// mutation that never happened.
+//
+// Fix: wrap $transaction so callbacks run inside an AsyncLocalStorage
+// context; the hook DEFERS capture events collected during the callback and
+// flushes them AFTER the commit resolves. A rolled-back tx discards its
+// events (flush never runs) — no deadlock, no phantom capture, and capture
+// still happens (post-commit) so the feed stays complete.
+interface DeferredSyncEvent {
+  model: string
+  operation: string
+  args: any
+  result: any
+  preDeleteRecords: any[] | null
+  preUpdateManyRecords: any[] | null
+}
+
+const txCaptureContext = new AsyncLocalStorage<{ deferred: DeferredSyncEvent[] }>()
+
+function flushDeferredSyncEvents(events: DeferredSyncEvent[]): Promise<void> {
+  let chain: Promise<void> = Promise.resolve()
+  for (const evt of events) {
+    chain = chain.then(() => {
+      if (!syncQueryHook) return
+      return Promise.resolve()
+        .then(() => syncQueryHook!(evt))
+        .catch((err) => {
+          console.warn(
+            `[db] deferred sync-capture failed (${evt.model}.${evt.operation}):`,
+            (err as Error)?.message,
+          )
+        })
+    })
+  }
+  return chain
+}
+
+// Patch the BASE client's $transaction BEFORE the extension is created — the
+// extended client's $transaction delegates to it, so every interactive tx in
+// every consumer (apps/api business routes) gets the deferral context.
+function installTransactionalCaptureContext(client: PrismaClient): void {
+  const anyClient = client as any
+  if (typeof anyClient.$transaction !== 'function') return
+  const origTransaction = anyClient.$transaction.bind(client)
+  anyClient.$transaction = (...args: any[]) => {
+    const deferred: DeferredSyncEvent[] = []
+    const runInContext = <T,>(work: () => Promise<T>): Promise<T> =>
+      txCaptureContext.run({ deferred }, work)
+    // Interactive form: $transaction(async tx => ...)
+    if (typeof args[0] === 'function') {
+      return runInContext(() =>
+        Promise.resolve(
+          origTransaction((tx: unknown) => (args[0] as (tx: unknown) => unknown)(tx), ...args.slice(1)),
+        )
+          .then((res) => flushDeferredSyncEvents(deferred).then(() => res))
+          .catch((err) => {
+            // Rollback (or tx error): the captured events describe mutations
+            // that NEVER HAPPENED — discard them instead of poisoning the feed.
+            deferred.length = 0
+            throw err
+          }),
+      )
+    }
+    // Batch/array form: same deferral context (best-effort — op promises in
+    // the array may have been created outside the context; those fall back
+    // to the immediate-capture path).
+    if (Array.isArray(args[0])) {
+      return runInContext(() =>
+        Promise.resolve(origTransaction(args[0], ...args.slice(1)))
+          .then((res) => flushDeferredSyncEvents(deferred).then(() => res))
+          .catch((err) => {
+            deferred.length = 0
+            throw err
+          }),
+      )
+    }
+    return origTransaction(...args)
+  }
+}
 
 /**
  * The 19 synced models (single source of truth: packages/core/src/sync-registry.ts).
@@ -198,19 +309,30 @@ const extendedClient = skipGhostDelete
             // ── Sync Tracking Hook ──────────────────────────────────────
             // apps/api registers a hook via setSyncQueryHook() at startup.
             // The hook records SyncChange entries (+ tombstones for deletes)
-            // for every mutation on a synced model that flows through the
-            // extended client. Operations inside interactive $transaction
-            // callbacks do NOT flow through here — those routes call
-            // recordSyncChange() explicitly within the transaction.
+            // for every MUTATION on a synced model that flows through the
+            // extended client.
             //
+            // P1-6/E1: reads (findFirst/findMany/count/…) NEVER reach the
+            // hook — a read produces no change, and treating a read result
+            // as an "update" polluted the feed with phantom rows (and, via
+            // pull's missing-record downgrade, phantom deletes).
+            //
+            // P1-6/E3: operations inside an interactive $transaction are
+            // DEFERRED (txCaptureContext) and flushed after commit — a
+            // mid-tx capture writes on a second connection, deadlocks the
+            // business tx, and can roll the business write back (P2028).
+            const isTrackedMutation =
+              syncQueryHook !== null &&
+              !skipSyncTracking &&
+              typeof model === 'string' &&
+              SYNC_TRACKED_MODELS.has(model) &&
+              SYNC_MUTATION_OPERATIONS.has(operation)
+
             // For bulk deletes we must capture the affected ids BEFORE the
             // delete executes (they are gone afterwards).
             let preDeleteRecords: any[] | null = null
             if (
-              syncQueryHook &&
-              !skipSyncTracking &&
-              typeof model === 'string' &&
-              SYNC_TRACKED_MODELS.has(model) &&
+              isTrackedMutation &&
               (operation === 'delete' || operation === 'deleteMany')
             ) {
               try {
@@ -225,24 +347,38 @@ const extendedClient = skipGhostDelete
               } catch { /* best-effort */ }
             }
 
+            // For bulk updates the operation result is only { count } — the
+            // affected ids would be unknowable afterwards. Capture the records
+            // matching the filter BEFORE the update runs so the change feed can
+            // emit one per-record 'update' event (mark-read, OCC transitions,
+            // credit deductions, batch state sweeps…). Best-effort: if the
+            // pre-read fails we fall back to today's behavior (event skipped).
+            let preUpdateManyRecords: any[] | null = null
+            if (isTrackedMutation && operation === 'updateMany') {
+              try {
+                const delegate = (baseClient as any)[modelToDelegate(model)]
+                if (delegate && (args as any)?.where) {
+                  preUpdateManyRecords = await delegate.findMany({
+                    where: (args as any).where,
+                  })
+                }
+              } catch { /* best-effort */ }
+            }
+
             const result = await query(args)
 
-            if (
-              syncQueryHook &&
-              !skipSyncTracking &&
-              typeof model === 'string' &&
-              SYNC_TRACKED_MODELS.has(model)
-            ) {
-              try {
-                await syncQueryHook({
-                  model,
-                  operation,
-                  args,
-                  result,
-                  preDeleteRecords,
-                })
-              } catch (err) {
-                console.warn(`[db] sync-tracking hook failed (${model}.${operation}):`, (err as Error)?.message)
+            if (isTrackedMutation) {
+              const evt = { model, operation, args, result, preDeleteRecords, preUpdateManyRecords }
+              const txStore = txCaptureContext.getStore()
+              if (txStore) {
+                // Inside an interactive transaction — DEFER until commit.
+                txStore.deferred.push(evt)
+              } else {
+                try {
+                  await syncQueryHook!(evt)
+                } catch (err) {
+                  console.warn(`[db] sync-tracking hook failed (${model}.${operation}):`, (err as Error)?.message)
+                }
               }
             }
 

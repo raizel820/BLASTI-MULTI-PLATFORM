@@ -381,7 +381,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     delegate: 'smsSettings',
     label: 'SMS Settings',
     isSynced: true,
-    isAgencyScoped: true,
+    isAgencyScoped: false, // Part AF: GLOBAL platform singleton (no agencyId column)
     agencyField: null, // singleton per agency, linked via relation
     conflictStrategy: ConflictStrategy.LAST_WRITE_WINS,
     mutableFields: [
@@ -409,7 +409,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     delegate: 'paymentSettings',
     label: 'Payment Settings',
     isSynced: true,
-    isAgencyScoped: true,
+    isAgencyScoped: false, // Part AF: GLOBAL platform singleton (no agencyId column)
     agencyField: null, // singleton per agency
     conflictStrategy: ConflictStrategy.LAST_WRITE_WINS,
     mutableFields: [
@@ -556,7 +556,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     delegate: 'faq',
     label: 'FAQ',
     isSynced: true,
-    isAgencyScoped: true,
+    isAgencyScoped: false, // Part AM: global content model (no agencyId column)
     agencyField: null, // global FAQ, not directly agency-scoped in schema
     conflictStrategy: ConflictStrategy.LAST_WRITE_WINS,
     mutableFields: ['question', 'questionFr', 'questionAr', 'answer', 'answerFr', 'answerAr', 'category', 'order', 'isActive'],
@@ -580,7 +580,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     delegate: 'subscriptionPlan',
     label: 'Subscription Plan',
     isSynced: true,
-    isAgencyScoped: true,
+    isAgencyScoped: false, // Part AM: global platform model (ownerAgencyId nullable, not scoping)
     agencyField: 'ownerAgencyId',
     conflictStrategy: ConflictStrategy.CLOUD_AUTHORITATIVE,
     mutableFields: [],
@@ -613,7 +613,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     delegate: 'planFeature',
     label: 'Plan Feature',
     isSynced: true,
-    isAgencyScoped: true,
+    isAgencyScoped: false, // Part AM: global platform model, scoped via plan relation only
     agencyField: null, // scoped via SubscriptionPlan relation
     conflictStrategy: ConflictStrategy.CLOUD_AUTHORITATIVE,
     mutableFields: [],

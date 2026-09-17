@@ -4,6 +4,7 @@ import { requireAuth, requireAdmin, authErrorResponse, AuthError } from '../lib/
 import { checkRateLimit, RateLimitError, SMS_RATE_LIMIT } from '../lib/rate-limit'
 import { validateBody } from '../lib/validations'
 import { z } from 'zod'
+import { recordSyncChange, resolveAgencyIdForUser } from '../lib/sync-helpers'
 
 const app = new Hono()
 
@@ -128,6 +129,11 @@ app.post('/approve/:id', async (c) => {
     }
 
     // Phase 1e: Atomic transaction — approve purchase AND increment credits
+    // Spec Part O: resolve the user's agency BEFORE the tx so the User and
+    // Notification changes can be recorded INSIDE the tx (tx ops are invisible
+    // to the auto-tracking extension — without this the credit grant would
+    // never reach the change feed).
+    const userAgencyId = await resolveAgencyIdForUser(purchase.userId)
     const result = await db.$transaction(async (tx) => {
       const updatedPurchase = await tx.smsPurchase.update({
         where: { id: purchaseId },
@@ -138,8 +144,11 @@ app.post('/approve/:id', async (c) => {
         where: { id: purchase.userId },
         data: { freeSmsCount: { increment: purchase.quantity } },
       })
+      if (userAgencyId) {
+        await recordSyncChange({ tx, agencyId: userAgencyId, model: 'User', recordId: purchase.userId, operation: 'update' })
+      }
 
-      await tx.notification.create({
+      const notif = await tx.notification.create({
         data: {
           userId: purchase.userId,
           type: 'SMS_PURCHASED',
@@ -147,6 +156,9 @@ app.post('/approve/:id', async (c) => {
           message: `Your purchase of ${purchase.quantity} SMS credits has been approved and added to your account.`,
         },
       })
+      if (userAgencyId) {
+        await recordSyncChange({ tx, agencyId: userAgencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
+      }
 
       return updatedPurchase
     })
@@ -183,13 +195,14 @@ app.post('/reject/:id', async (c) => {
       return c.json({ success: false, error: `Purchase already ${purchase.status.toLowerCase()}` }, 400)
     }
 
+    const userAgencyId = await resolveAgencyIdForUser(purchase.userId)
     const result = await db.$transaction(async (tx) => {
       const updatedPurchase = await tx.smsPurchase.update({
         where: { id: purchaseId },
         data: { status: 'REJECTED' },
       })
 
-      await tx.notification.create({
+      const notif = await tx.notification.create({
         data: {
           userId: purchase.userId,
           type: 'SMS_PURCHASE_REJECTED',
@@ -197,6 +210,9 @@ app.post('/reject/:id', async (c) => {
           message: `Your purchase of ${purchase.quantity} SMS credits was not approved. Please contact support.`,
         },
       })
+      if (userAgencyId) {
+        await recordSyncChange({ tx, agencyId: userAgencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
+      }
 
       return updatedPurchase
     })

@@ -3,7 +3,8 @@
 // DO NOT EDIT BY HAND — regenerate instead (see lib/schema-migrations.js).
 // This is the authoritative first-creation DDL for the desktop local SQLite,
 // including the protected sync infrastructure tables (_sync_meta,
-// _sync_conflicts, _pending_mutations, _sync_applied_mutations).
+// _sync_conflicts, _pending_mutations, _sync_applied_mutations,
+// _deferred_changes) and the v2 retry/deferred columns.
 module.exports = `-- CreateTable
 CREATE TABLE "User" (
     "id" TEXT NOT NULL PRIMARY KEY,
@@ -755,6 +756,7 @@ CREATE TABLE "AgencyLocalState" (
     "initializationStatus" TEXT NOT NULL DEFAULT 'NOT_INITIALIZED',
     "currentStage" TEXT,
     "currentCursor" INTEGER,
+    "currentStageCursor" TEXT,
     "snapshotSequence" INTEGER NOT NULL DEFAULT 0,
     "recordsImported" INTEGER NOT NULL DEFAULT 0,
     "lastError" TEXT,
@@ -800,6 +802,8 @@ CREATE TABLE "_pending_mutations" (
     "max_attempts" INTEGER NOT NULL DEFAULT 5,
     "created_at" BIGINT NOT NULL,
     "last_attempt_at" BIGINT,
+    "next_retry_at" BIGINT,
+    "last_http_status" INTEGER,
     "last_error" TEXT,
     "response_data" TEXT,
     "idempotency_key" TEXT
@@ -809,6 +813,26 @@ CREATE TABLE "_pending_mutations" (
 CREATE TABLE "_sync_applied_mutations" (
     "key" TEXT NOT NULL PRIMARY KEY,
     "appliedAt" BIGINT NOT NULL
+);
+
+-- CreateTable
+CREATE TABLE "_deferred_changes" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "agencyId" TEXT NOT NULL,
+    "source" TEXT NOT NULL DEFAULT 'pull',
+    "sequence" INTEGER,
+    "stage" TEXT,
+    "model" TEXT NOT NULL,
+    "recordId" TEXT NOT NULL,
+    "operation" TEXT NOT NULL,
+    "payload" TEXT,
+    "dependencyError" TEXT,
+    "retryCount" INTEGER NOT NULL DEFAULT 0,
+    "firstSeenAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastRetryAt" DATETIME,
+    "nextRetryAt" DATETIME,
+    "status" TEXT NOT NULL DEFAULT 'PENDING',
+    "lastError" TEXT
 );
 
 -- CreateIndex
@@ -988,4 +1012,8 @@ CREATE UNIQUE INDEX "idx_pending_mutations_idem" ON "_pending_mutations"("idempo
 -- CreateIndex
 CREATE INDEX "idx_pending_mutations_status" ON "_pending_mutations"("status");
 
-`
+-- CreateIndex
+CREATE INDEX "idx_deferred_agency_status" ON "_deferred_changes"("agencyId", "status");
+
+-- CreateIndex
+CREATE INDEX "idx_deferred_status_next" ON "_deferred_changes"("status", "nextRetryAt");`

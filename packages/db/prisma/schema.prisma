@@ -1016,7 +1016,12 @@ model AgencyLocalState {
   /// NOT_INITIALIZED | INITIALIZING | READY | FAILED | UPDATE_REQUIRED
   initializationStatus     String    @default("NOT_INITIALIZED")
   currentStage             String?
+  /// LEGACY (Int, wire cursor was a cuid string — never write new values).
   currentCursor            Int?
+  /// Part G: opaque stage/page cursor from the cloud initial-sync endpoint
+  /// (tuple "<timeISO>|<id>" string) — separate concept from the global
+  /// SyncChange sequence cursor (snapshotSequence / _sync_meta cursor).
+  currentStageCursor       String?
   /// Cloud sequence snapshot captured when the initial import started
   snapshotSequence         Int       @default(0)
   recordsImported          Int       @default(0)
@@ -1083,15 +1088,23 @@ model LocalPendingMutation {
   path           String  @map("path")
   body           String? @map("body")
   headers        String? @map("headers")
-  /// pending | completed | failed | abandoned
+  /// pending | sending | retry | completed | permanent_failed | conflict
+  /// (legacy rows: failed -> treated as retry; abandoned -> permanent_failed)
   status         String  @default("pending") @map("status")
   attempts       Int     @default(0) @map("attempts")
   maxAttempts    Int     @default(5) @map("max_attempts")
   createdAt      BigInt  @map("created_at")
   lastAttemptAt  BigInt? @map("last_attempt_at")
+  /// Earliest time (epoch ms) this row becomes eligible for another retry
+  /// (exponential backoff with jitter). NULL = eligible immediately.
+  nextRetryAt    BigInt? @map("next_retry_at")
+  /// Last HTTP status observed during replay (0/NULL = network-level error)
+  lastHttpStatus Int?    @map("last_http_status")
   lastError      String? @map("last_error")
   responseData   String? @map("response_data")
-  /// Stable content-derived idempotency key (method:path:sha256(body))
+  /// Part T: UUID mutationId generated when the business operation ran —
+  /// one logical operation = one mutationId, reused across every retry.
+  /// (Legacy rows may still carry the old content-derived key format.)
   idempotencyKey String? @unique(map: "idx_pending_mutations_idem") @map("idempotency_key")
 
   @@index([status], map: "idx_pending_mutations_status")
@@ -1105,4 +1118,41 @@ model LocalSyncAppliedMutation {
   appliedAt BigInt @map("appliedAt")
 
   @@map("_sync_applied_mutations")
+}
+
+/// Part K: durable deferred-change queue. A cloud change (or initial-sync
+/// record) that failed with a genuine FK/dependency error is persisted here —
+/// NEVER held only in memory. Every change is exactly one of:
+/// APPLIED | PENDING here | CONFLICT (_sync_conflicts) | QUARANTINED here.
+/// Nothing is ever "skipped and forgotten". Rows are retried (with backoff)
+/// after their parent dependencies arrive; repeated non-FK failures
+/// quarantine the row and block READY when the source stage is mandatory.
+model LocalDeferredChange {
+  id              String    @id @default(cuid())
+  agencyId        String
+  /// pull | initial-sync
+  source          String    @default("pull")
+  /// Cloud SyncChange sequence (source=pull) — replay skips applied sequences
+  sequence        Int?
+  /// Initial-sync stage name (source=initial-sync)
+  stage           String?
+  model           String
+  recordId        String
+  /// create | update
+  operation       String
+  /// JSON payload as received from the cloud
+  payload         String?
+  /// The FK/dependency error that caused deferral
+  dependencyError String?
+  retryCount      Int       @default(0)
+  firstSeenAt     DateTime  @default(now())
+  lastRetryAt     DateTime?
+  nextRetryAt     DateTime?
+  /// PENDING | RESOLVED | QUARANTINED
+  status          String    @default("PENDING")
+  lastError       String?
+
+  @@index([agencyId, status], map: "idx_deferred_agency_status")
+  @@index([status, nextRetryAt], map: "idx_deferred_status_next")
+  @@map("_deferred_changes")
 }

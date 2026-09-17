@@ -3,6 +3,7 @@ import { db, Prisma } from '@blasti/db'
 import { requireRole, requireAgencyAccess, authErrorResponse } from '../lib/auth'
 import { adminCreateAgencySchema, updateAgencyProfileSchema, validateBody } from '../lib/validations'
 import { enforceRateLimit, getClientIp, AGENCY_LISTING_RATE_LIMIT, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordFailedRequest, recordSuccessfulRequest } from '../lib/rate-limit'
+import { recordSyncChangeNow } from '../lib/sync-helpers'
 
 const app = new Hono()
 
@@ -329,6 +330,19 @@ app.post('/', async (c) => {
         },
       },
     })
+
+    // Spec Part O: the nested queueSettings.create is INVISIBLE to the
+    // auto-tracking extension (it fires once for the top-level Agency op) —
+    // a desktop initialized from the feed would miss the agency's
+    // QueueSettings row entirely. Compensate with an explicit capture.
+    try {
+      const createdQs = await db.queueSettings.findFirst({ where: { agencyId: agency.id }, select: { id: true } })
+      if (createdQs) {
+        await recordSyncChangeNow({ agencyId: agency.id, model: 'QueueSettings', recordId: createdQs.id, operation: 'create' })
+      }
+    } catch (qsErr) {
+      console.warn('[agencies] nested QueueSettings capture failed:', (qsErr as Error)?.message)
+    }
 
     await db.auditLog.create({
       data: {

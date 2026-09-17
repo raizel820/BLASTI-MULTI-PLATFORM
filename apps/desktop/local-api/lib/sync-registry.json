@@ -91,14 +91,14 @@
     "SmsSettings": {
       "delegate": "smsSettings",
       "isSynced": true,
-      "isAgencyScoped": true,
+      "isAgencyScoped": false,
       "conflictStrategy": "LAST_WRITE_WINS",
       "syncOrder": 12
     },
     "PaymentSettings": {
       "delegate": "paymentSettings",
       "isSynced": true,
-      "isAgencyScoped": true,
+      "isAgencyScoped": false,
       "conflictStrategy": "LAST_WRITE_WINS",
       "syncOrder": 13
     },
@@ -140,21 +140,21 @@
     "FAQ": {
       "delegate": "faq",
       "isSynced": true,
-      "isAgencyScoped": true,
+      "isAgencyScoped": false,
       "conflictStrategy": "LAST_WRITE_WINS",
       "syncOrder": 19
     },
     "SubscriptionPlan": {
       "delegate": "subscriptionPlan",
       "isSynced": true,
-      "isAgencyScoped": true,
+      "isAgencyScoped": false,
       "conflictStrategy": "CLOUD_AUTHORITATIVE",
       "syncOrder": 2
     },
     "PlanFeature": {
       "delegate": "planFeature",
       "isSynced": true,
-      "isAgencyScoped": true,
+      "isAgencyScoped": false,
       "conflictStrategy": "CLOUD_AUTHORITATIVE",
       "syncOrder": 3
     },

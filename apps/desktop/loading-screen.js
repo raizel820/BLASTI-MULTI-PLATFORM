@@ -955,13 +955,38 @@ async function runDiagnostics(mainWindow, config) {
     console.log(`[Diagnostics] Complete — ${successCount}/${results.length} passed`);
     // Full per-step breakdown — the console alone isolates which steps
     // failed and why (the loading-screen panel shows the same, truncated).
+    // Problem 5 (review): results are grouped by EVIDENCE CLASS —
+    //   STRUCTURAL   → routes exist and answer with a valid shape
+    //   BEHAVIORAL   → real agency data present, offline mutations work
+    //   CONNECTIVITY → cloud origin reachable, sync API actually hosted
+    //   INITIALIZATION → workspace state machine (NOT_INITIALIZED→READY)
+    // "29/29 endpoints passed" is STRUCTURAL evidence only and must never
+    // be read as "the desktop can operate offline".
+    const STEP_CATEGORY = {
+      'local-server': 'STRUCTURAL',
+      'test-all-endpoints': 'STRUCTURAL',
+      'test-queue-crud': 'BEHAVIORAL',
+      'verify': 'BEHAVIORAL',
+      'cloud-api': 'CONNECTIVITY',
+      'reconnect-cloud': 'CONNECTIVITY',
+      'disconnect-cloud': 'CONNECTIVITY',
+      'initial-sync': 'INITIALIZATION',
+    };
+    const workspaceVerifiedReady = (() => {
+      const r = results.find(x => x.step === 'verify');
+      return !!(r && r.status === 'success' && r.detail && r.detail.readiness && r.detail.readiness.ready === true);
+    })();
     console.log('[Diagnostics] ────── RESULTS BREAKDOWN ──────');
     for (const r of results) {
       const icon = r.status === 'success' ? '✓' : r.status === 'warning' ? '▲' : '✗';
-      console.log(`[Diagnostics] ${icon} [${String(r.status).toUpperCase()}] ${r.step} — ${r.message || '(no message)'}`);
+      const category = STEP_CATEGORY[r.step] || 'GENERAL';
+      console.log(`[Diagnostics] ${icon} [${String(r.status).toUpperCase()}] (${category}) ${r.step} — ${r.message || '(no message)'}`);
       if (r.detail && r.status !== 'success') {
         try { console.log(`[Diagnostics]     ${r.step} detail: ${JSON.stringify(r.detail).substring(0, 600)}`); } catch { /* ignore */ }
       }
+    }
+    if (!workspaceVerifiedReady) {
+      console.log('[Diagnostics] NOTE: structural tests (endpoint probes) prove ROUTES answer — NOT that the workspace can operate offline. Offline-readiness requires INITIALIZATION=READY + behavioral tests passing.');
     }
     const finalErrors = results.filter(r => r.status === 'error');
     const finalWarnings = results.filter(r => r.status === 'warning');
@@ -1244,17 +1269,69 @@ async function runDiagnostics(mainWindow, config) {
       // an outdated API build) answers 404. Authenticated probing avoids
       // false "misconfigured origin" verdicts on APIs that 404 when
       // unauthenticated.
+      //
+      // P0-2 (field round 4): a single 404 observation used to permanently
+      // decide "cloud unavailable" and wedge initialization — while the
+      // realtime socket proved seconds later that /api/sync/pull WAS live
+      // (the cloud API was simply still registering routes / restarting).
+      // The probe now RETRIES (1.2s → 2.4s) and re-reads the health payload
+      // between attempts: `bootId` changes prove a process restart happened
+      // mid-probe; `sync.registered` distinguishes a stale build from a
+      // process split (two binaries answering the same origin).
       const syncProbeUrl = `${cloudBaseUrl}/api/sync/pull`;
       const probeBody = { agencyId: agencyId || 'diagnostics-probe' };
-      const syncProbe = cloudAuthToken
+
+      const readHealthMeta = (probe) => {
+        try {
+          const j = probe && probe.body ? JSON.parse(probe.body) : null;
+          return j && typeof j === 'object' ? {
+            bootId: j.bootId || null,
+            syncRegistered: !!(j.sync && j.sync.registered === true),
+            syncRoutes: Array.isArray(j.sync && j.sync.routes) ? j.sync.routes : null,
+          } : null;
+        } catch { return null; }
+      };
+      const healthMeta0 = readHealthMeta(cloudProbe);
+      if (healthMeta0) {
+        console.log(`[Diagnostics] Cloud health meta: bootId=${healthMeta0.bootId ? String(healthMeta0.bootId).substring(0, 8) + '…' : 'n/a (old build)'} | syncRoutesRegistered=${healthMeta0.syncRegistered ? 'true (' + (healthMeta0.syncRoutes || []).length + ' routes)' : 'false/unknown'}`);
+      }
+
+      let syncProbe = cloudAuthToken
         ? await postAuthUrl(syncProbeUrl, probeBody, cloudAuthToken, 5000)
         : await postUrl(syncProbeUrl, probeBody, 5000);
-      const syncStatus = syncProbe?.statusCode || 0;
+      let syncStatus = syncProbe?.statusCode || 0;
+      let attempt = 1;
+      const MAX_SYNC_PROBE_ATTEMPTS = 3;
+      const PROBE_RETRY_DELAYS = [1200, 2400];
+      let recoveredOnAttempt = 0;
+      let bootIdChanged = false;
+
+      while (syncStatus === 404 && attempt < MAX_SYNC_PROBE_ATTEMPTS) {
+        const waitMs = PROBE_RETRY_DELAYS[attempt - 1] || 2000;
+        console.log(`[Diagnostics] Sync probe got 404 (attempt ${attempt}/${MAX_SYNC_PROBE_ATTEMPTS}) — the cloud API may still be registering routes — retrying in ${waitMs}ms...`);
+        sendUpdate(mainWindow, { log: `[INFO] Sync endpoint 404 — retrying (attempt ${attempt + 1}/${MAX_SYNC_PROBE_ATTEMPTS}, the cloud API may still be starting)...`, logType: 'info' });
+        await delay(waitMs);
+        // Re-read health between attempts: a bootId change proves the cloud
+        // process restarted under us (the 404 came from the dying process).
+        const healthRetry = await probeUrl(healthUrl, 4000);
+        const healthMetaRetry = readHealthMeta(healthRetry);
+        if (healthMeta0?.bootId && healthMetaRetry?.bootId && healthMeta0.bootId !== healthMetaRetry.bootId) {
+          bootIdChanged = true;
+          console.log(`[Diagnostics] Cloud bootId CHANGED between probes (${String(healthMeta0.bootId).substring(0, 8)} → ${String(healthMetaRetry.bootId).substring(0, 8)}) — the cloud API restarted mid-probe`);
+        }
+        syncProbe = cloudAuthToken
+          ? await postAuthUrl(syncProbeUrl, probeBody, cloudAuthToken, 5000)
+          : await postUrl(syncProbeUrl, probeBody, 5000);
+        syncStatus = syncProbe?.statusCode || 0;
+        attempt++;
+        if (syncStatus > 0 && syncStatus !== 404) recoveredOnAttempt = attempt;
+      }
+
       const syncBody = String(syncProbe?.body || '').replace(/\s+/g, ' ').trim().substring(0, 140);
-      console.log(`[Diagnostics] Cloud sync probe POST ${syncProbeUrl} (${cloudAuthToken ? 'with stored token' : 'NO token'}) → ${syncProbe?.reachable ? `HTTP ${syncStatus}` : `UNREACHABLE (${syncProbe?.error || 'no connection'})`}${syncBody ? ` | body: ${syncBody}` : ''}`);
+      console.log(`[Diagnostics] Cloud sync probe POST ${syncProbeUrl} (${cloudAuthToken ? 'with stored token' : 'NO token'}, attempt ${attempt}/${MAX_SYNC_PROBE_ATTEMPTS}) → ${syncProbe?.reachable ? `HTTP ${syncStatus}` : `UNREACHABLE (${syncProbe?.error || 'no connection'})`}${syncBody ? ` | body: ${syncBody}` : ''}`);
       // 401/403 → the route EXISTS but rejected the credential (expired
-      // token): origin is correct, re-login fixes it. 404 → this origin does
-      // not host the sync API (static web host or outdated API build).
+      // token): origin is correct, re-login fixes it. 404 (after retries) →
+      // this origin does not host the sync API.
       const authRejected = syncStatus === 401 || syncStatus === 403;
       const syncEndpointOk = syncStatus > 0 && syncStatus !== 404;
       if (syncEndpointOk && !authRejected) {
@@ -1262,9 +1339,19 @@ async function runDiagnostics(mainWindow, config) {
         cloudResult = {
           step: 'cloud-api',
           status: 'success',
-          message: `السحابة متاحة — ${cloudBaseUrl} (${cloudProbe.timeMs}ms)`,
-          detail: { url: cloudBaseUrl, timeMs: cloudProbe.timeMs, healthStatus: cloudProbe.statusCode, syncEndpointStatus: syncStatus },
+          message: `السحابة متاحة — ${cloudBaseUrl} (${cloudProbe.timeMs}ms)${recoveredOnAttempt ? ` — نجحت في المحاولة ${recoveredOnAttempt}` : ''}`,
+          detail: {
+            url: cloudBaseUrl,
+            timeMs: cloudProbe.timeMs,
+            healthStatus: cloudProbe.statusCode,
+            syncEndpointStatus: syncStatus,
+            recoveredOnAttempt: recoveredOnAttempt || undefined,
+            bootIdChangedMidProbe: bootIdChanged || undefined,
+          },
         };
+        if (recoveredOnAttempt) {
+          sendUpdate(mainWindow, { log: `[OK] Sync API recovered on attempt ${recoveredOnAttempt} — the cloud API was still starting (transient 404)`, logType: 'ok' });
+        }
         sendUpdate(mainWindow, { log: `[OK] Cloud API verified at ${cloudBaseUrl} (health ${cloudProbe.statusCode}, sync endpoint ${syncStatus})`, logType: 'ok' });
       } else if (authRejected) {
         // Origin hosts the sync API — the credential is the problem, not the URL.
@@ -1277,28 +1364,38 @@ async function runDiagnostics(mainWindow, config) {
         };
         sendUpdate(mainWindow, { log: `[WARN] Sync API present at ${cloudBaseUrl} but auth rejected (HTTP ${syncStatus}) — re-login will refresh the token`, logType: 'warn' });
       } else if (syncStatus === 404) {
-        // Classification (isolation aid): the health identity tells us WHICH
-        // fix applies — restarting a stale @blasti/api build vs pointing
-        // BLASTI_CLOUD_URL at the correct origin.
+        // Classification (isolation aid), now WITH health-declared route info:
+        //   syncRegistered=true  + still 404 → PROCESS SPLIT (two binaries
+        //     answering the same origin, e.g. IPv4/IPv6 listeners) or a proxy;
+        //   syncRegistered=false/absent + @blasti/api identity → STALE BUILD;
+        //   identity unrecognized → WRONG SERVICE on the port.
         const isBlastiApi = !!(cloudIdentity && cloudIdentity.service === '@blasti/api');
-        const cloudFixHint = isBlastiApi
-          ? 'The process DID identify as @blasti/api but its RUNNING BUILD predates the v2 sync routes — restart the cloud API from the current checkout (cd apps/api && bun run dev) so /api/sync/* gets registered.'
-          : 'The process on this port did NOT identify as @blasti/api — start apps/api on this port (cd apps/api && bun run dev) or set BLASTI_CLOUD_URL to the origin that hosts the v2 sync API.';
+        let cloudFixHint;
+        if (healthMeta0?.syncRegistered) {
+          cloudFixHint = 'The health endpoint DECLARES the v2 sync routes registered, yet POST /api/sync/pull 404s — two different processes are likely answering the same origin (check IPv4/IPv6 duplicate listeners: netstat -ano | findstr :3003) or a proxy is stripping the path. Kill every process on :3003 and start ONE apps/api from the current checkout (cd apps/api && bun run dev).';
+        } else if (isBlastiApi) {
+          cloudFixHint = 'The process DID identify as @blasti/api but does not declare the v2 sync routes (health.sync.registered is missing/false) — its RUNNING BUILD predates the v2 sync routes. Restart the cloud API from the current checkout (cd apps/api && bun run dev) so /api/sync/* gets registered.';
+        } else {
+          cloudFixHint = 'The process on this port did NOT identify as @blasti/api — start apps/api on this port (cd apps/api && bun run dev) or set BLASTI_CLOUD_URL to the origin that hosts the v2 sync API.';
+        }
         cloudResult = {
           step: 'cloud-api',
           status: 'error',
-          message: `خادم السحابة لا يستضيف واجهة المزامنة — ${cloudBaseUrl} أرجع 404 لـ /api/sync/pull`,
+          message: `خادم السحابة لا يستضيف واجهة المزامنة — ${cloudBaseUrl} أرجع 404 لـ /api/sync/pull (بعد ${attempt} محاولات)`,
           detail: {
             url: cloudBaseUrl,
             healthStatus: cloudProbe.statusCode,
             syncEndpointStatus: syncStatus,
             probedWithToken: !!cloudAuthToken,
+            attempts: attempt,
             cloudIdentity: cloudIdentity || 'unrecognized',
+            healthSyncDeclared: healthMeta0 ? healthMeta0.syncRegistered : 'unknown',
+            bootIdChangedMidProbe: bootIdChanged || undefined,
             syncBody: syncBody || undefined,
             fixHint: cloudFixHint,
           },
         };
-        sendUpdate(mainWindow, { log: `[ERROR] ${cloudBaseUrl} does not host the sync API (/api/sync/pull → 404${cloudAuthToken ? ' even WITH the stored token' : ', and no token was available to retry'}). ${cloudFixHint}`, logType: 'fail' });
+        sendUpdate(mainWindow, { log: `[ERROR] ${cloudBaseUrl} does not host the sync API (/api/sync/pull → 404 after ${attempt} attempts${cloudAuthToken ? ', with the stored token' : ''}). ${cloudFixHint}`, logType: 'fail' });
       } else {
         cloudResult = {
           step: 'cloud-api',
@@ -1455,11 +1552,22 @@ async function runDiagnostics(mainWindow, config) {
 
   // ── 3.2 Run the v2 initial sync (only when needed) ──────────────────────
   // Skip when: no stored session (user will login → login flow triggers sync),
-  // cloud unreachable, local server down, or workspace already READY.
-  const mustRunSync = hasStoredSession && cloudAvailable && localApiPort
+  // local server down, or workspace already READY.
+  //
+  // P0 (initialization deadlock, field round 4): `cloudAvailable` from the
+  // ONE step-2 probe used to gate this step — a transient 404 (cloud API
+  // still registering routes) permanently deferred initialization while the
+  // realtime socket proved the cloud reachable moments later. The decision
+  // now belongs to the ENGINE's initialization coordinator
+  // (sync-service.ensureWorkspaceInitialized), which re-probes the sync
+  // routes authoritatively at attempt time, is single-flight and
+  // rate-limited, and delegates the import to initial-sync.js (the single
+  // initialization owner). A "cloud unavailable" verdict can no longer
+  // wedge the workspace — it only defers it to the next trigger.
+  const mustRunSync = hasStoredSession && localApiPort
     && serverResult.status === 'success' && !alreadyReady;
 
-  let syncOutcome = null; // { via: 'ipc'|'http', success, totalRecords?, error?, alreadyInitialized? }
+  let syncOutcome = null; // { success, totalRecords?, error?, alreadyInitialized?, skipped? }
   let syncAttempted = false;
 
   if (mustRunSync) {
@@ -1471,14 +1579,69 @@ async function runDiagnostics(mainWindow, config) {
       logType: 'info',
     });
 
-    // ── Primary path: IPC bridge via the loading-screen renderer ────────
-    // window.electronAPI lives in the RENDERER (preload contextIsolation
-    // bridge), not in this main-process diagnostics runner — so we invoke a
-    // small bridge function injected by the loading page
-    // (window.__blastiRunInitialSync → electronAPI.initialCloudSync()).
-    // Expected result shape (agent 7-b): { success, totalRecords?, error? }.
+    // Forward the initializer's engine events into the loading log panel so
+    // the user sees stage-by-stage progress (the coordinator re-emits the
+    // runInitialSync event stream through the engine's event bus).
+    let unsubscribeProgress = null;
     try {
-      if (mainWindow && !mainWindow.isDestroyed()) {
+      const ssForEvents = require('./local-api/sync-service');
+      unsubscribeProgress = ssForEvents.onSyncEvent(function (evt) {
+        if (!evt || !evt.type) return;
+        if (evt.type === 'SYNC_STAGE_STARTED') {
+          sendUpdate(mainWindow, { step: 'initial-sync', status: 'running', log: `[SYNC] المرحلة: ${evt.stageLabel || evt.stage} (${(evt.stageIndex ?? 0) + 1}/${evt.totalStages ?? '?'})`, logType: 'info' });
+        } else if (evt.type === 'SYNC_STAGE_COMPLETED') {
+          sendUpdate(mainWindow, { step: 'initial-sync', status: 'running', log: `[SYNC] اكتملت المرحلة: ${evt.stageLabel || evt.stage} — ${evt.count ?? 0} سجل`, logType: 'info' });
+        } else if (evt.type === 'SYNC_ERROR') {
+          sendUpdate(mainWindow, { step: 'initial-sync', status: 'running', log: `[SYNC] خطأ في ${evt.stage || 'الاستيراد'}: ${String(evt.error || '').substring(0, 120)}`, logType: 'fail' });
+        } else if (evt.type === 'SYNC_WARNING') {
+          sendUpdate(mainWindow, { step: 'initial-sync', status: 'running', log: `[SYNC] تحذير: ${String(evt.message || '').substring(0, 120)}`, logType: 'warn' });
+        }
+      });
+    } catch { /* event forwarding is best-effort */ }
+
+    // ── Primary path: in-process initialization coordinator ─────────────
+    // Runs in THIS (main) process — no IPC bridge, no HTTP hop, no stale
+    // route dependency. The engine was possibly not started yet (startSync
+    // normally happens in step 7), so start it first (idempotent).
+    try {
+      const syncService = require('./local-api/sync-service');
+      const { localDb: syncDb } = require('./local-api/lib/db');
+      if (syncDb) {
+        try {
+          if (!syncService.getStatus()?.isStarted) {
+            // Long first-cycle delay: the coordinator below OWNS the first
+            // post-init cycle; the engine's own startup cycle must not race it.
+            await syncService.startSync({
+              localDb: syncDb,
+              cloudBaseUrl,
+              deviceId: 'desktop-diagnostics',
+              initialDelayMs: 30000,
+            });
+            console.log('[Diagnostics] Sync engine started early (step 3) for initialization coordination');
+          }
+        } catch (startErr) {
+          console.warn('[Diagnostics] Early engine start failed (continuing):', startErr.message);
+        }
+        // Guarantee the coordinator has credentials (step 3.1 may have restored
+        // the session via the in-process fallback; make it explicit here).
+        try { syncService.setAuth(cloudAuthToken, cloudUser); } catch { /* tolerated */ }
+        syncAttempted = true;
+        syncOutcome = await syncService.ensureWorkspaceInitialized('diagnostics');
+        if (syncOutcome && syncOutcome.skipped) {
+          console.log(`[Diagnostics] Init coordinator deferred initial sync (${syncOutcome.skipped})`);
+        }
+      }
+    } catch (inProcErr) {
+      console.warn('[Diagnostics] In-process init coordinator failed:', inProcErr.message);
+    } finally {
+      try { if (unsubscribeProgress) unsubscribeProgress(); } catch { /* best-effort */ }
+    }
+
+    // ── Fallback paths: IPC bridge → local API HTTP route ───────────────
+    // Only used when the in-process coordinator could not produce a result
+    // (module load failure). A definitive coordinator result is honored.
+    if (!syncOutcome && mainWindow && !mainWindow.isDestroyed()) {
+      try {
         const bridgeResult = await Promise.race([
           mainWindow.webContents.executeJavaScript(
             '(window.__blastiRunInitialSync ? window.__blastiRunInitialSync() : Promise.resolve({ unavailable: true }))',
@@ -1495,19 +1658,14 @@ async function runDiagnostics(mainWindow, config) {
           syncAttempted = true;
           syncOutcome = { via: 'ipc', ...bridgeResult };
         }
+      } catch (bridgeErr) {
+        sendUpdate(mainWindow, {
+          log: `[WARN] IPC bridge error: ${String(bridgeErr?.message || bridgeErr).substring(0, 80)} — trying local API HTTP endpoint`,
+          logType: 'warn',
+        });
       }
-    } catch (bridgeErr) {
-      sendUpdate(mainWindow, {
-        log: `[WARN] IPC bridge error: ${String(bridgeErr?.message || bridgeErr).substring(0, 80)} — trying local API HTTP endpoint`,
-        logType: 'warn',
-      });
     }
-
-    // ── Fallback path: local API HTTP endpoint (agent 7-b route) ────────
-    // Only used when the IPC path could not produce a definitive result
-    // (no bridge / handler rejected). A definitive { success: false } from
-    // the IPC handler is honored — the sync state machine already ran.
-    if (!syncAttempted && localApiPort) {
+    if (!syncOutcome && localApiPort) {
       try {
         const httpRes = await postAuthUrl(
           `http://127.0.0.1:${localApiPort}/api/sync/initial-sync/run`,
@@ -1516,8 +1674,6 @@ async function runDiagnostics(mainWindow, config) {
           10 * 60 * 1000,
         );
         if (httpRes.reachable && httpRes.statusCode === 404) {
-          // Route not landed yet (agent 7-b) — treated as "both paths
-          // unavailable": workspace will initialize after login instead.
           sendUpdate(mainWindow, {
             log: '[INFO] /api/sync/initial-sync/run not available yet — workspace will initialize after login',
             logType: 'info',
@@ -1539,10 +1695,22 @@ async function runDiagnostics(mainWindow, config) {
       }
     }
 
-    if (syncOutcome?.alreadyInitialized) {
+    if (syncOutcome?.skipped === 'cloud-unavailable') {
+      sendUpdate(mainWindow, {
+        log: '[INFO] Cloud sync API not reachable at decision time — initialization deferred to the engine (auto-retries when the cloud becomes reachable)',
+        logType: 'info',
+      });
+    } else if (syncOutcome?.skipped === 'auth-rejected') {
+      sendUpdate(mainWindow, {
+        log: '[WARN] Cloud sync API rejected the stored token — re-login will refresh it',
+        logType: 'warn',
+      });
+    } else if (syncOutcome?.skipped === 'ready' || syncOutcome?.alreadyInitialized) {
       sendUpdate(mainWindow, { log: '[OK] Workspace already initialized (READY) — skipped re-import', logType: 'ok' });
     } else if (syncOutcome?.success === false && syncOutcome?.error) {
       sendUpdate(mainWindow, { log: `[FAIL] Initial sync failed: ${String(syncOutcome.error).substring(0, 120)}`, logType: 'fail' });
+    } else if (syncOutcome?.success === true) {
+      sendUpdate(mainWindow, { log: `[OK] Initial sync completed — ${syncOutcome.totalRecords ?? 0} records imported`, logType: 'ok' });
     }
   } else if (alreadyReady) {
     sendUpdate(mainWindow, {
@@ -1869,8 +2037,15 @@ async function runDiagnostics(mainWindow, config) {
   pushResult(disconnectResult);
 
   // ═══════════════════════════════════════════════════════════════════════
-  // STEP 5: Test Queue CRUD (create queue "next", then delete)
+  // STEP 5: Test Queue CRUD (create queue "next", then delete) — BEHAVIORAL
   // ═══════════════════════════════════════════════════════════════════════
+  // P0-4 (field round 4): this test used Prisma fields that do not exist on
+  // the Service model (nameEn, avgServiceTime), crashed, and was then
+  // reported as SKIP→SUCCESS — a false-positive diagnostic. Verdicts are now
+  // honest: unexpected errors FAIL the step, precondition-missing SKIPs are
+  // reported as warnings, and the behavioral test only runs when the
+  // workspace is actually READY (an uninitialized DB says nothing about
+  // offline operability).
   sendUpdate(mainWindow, {
     step: 'test-queue-crud',
     status: 'running',
@@ -1881,9 +2056,19 @@ async function runDiagnostics(mainWindow, config) {
 
   await delay(300);
 
-  let crudResult = { step: 'test-queue-crud', status: 'success', message: 'تم التخطي — لا توجد جلسة محلية (سيتم الاختبار بعد تسجيل الدخول)' };
+  let crudResult = { step: 'test-queue-crud', status: 'warning', message: 'تم التخطي — لا توجد جلسة محلية (سيتم الاختبار بعد تسجيل الدخول)' };
 
-  if (localApiPort && localApiToken) {
+  if (localApiPort && localApiToken && isReady !== true) {
+    // Behavioral test on an uninitialized workspace is meaningless — the DB
+    // has no agency data yet (initialization pending). Say so honestly.
+    crudResult = {
+      step: 'test-queue-crud',
+      status: 'warning',
+      message: 'تم التخطي — مساحة العمل غير مهيأة بعد (الاختبار السلوكي يتطلب READY)',
+      detail: { initializationStatus: postInitStatus || 'unknown' },
+    };
+    sendUpdate(mainWindow, { log: `[SKIP] Workspace not initialized (${postInitStatus || 'unknown'}) — behavioral CRUD test deferred`, logType: 'warn' });
+  } else if (localApiPort && localApiToken) {
     try {
       const { localDb: testDb } = require('./local-api/lib/db');
       const testAgencyId = agencyId || 'test-agency-id';
@@ -1898,15 +2083,18 @@ async function runDiagnostics(mainWindow, config) {
       if (services.length > 0) {
         testServiceId = services[0].id;
       } else {
-        // Create a test service first
+        // Create a test service first — fields MUST match the Prisma Service
+        // model (name/nameAr/nameFr/description/prefix; NO nameEn, NO
+        // avgServiceTime — those crashed this test in the field).
         const testService = await testDb.service.create({
           data: {
             id: 'test-service-next-' + Date.now(),
             name: 'خدمة اختبار next',
-            nameEn: 'Test Next Service',
+            nameAr: 'خدمة اختبار next',
+            nameFr: 'Service de test next',
+            description: 'Diagnostic CRUD test service (auto-removed)',
             agencyId: testAgencyId,
             isActive: true,
-            avgServiceTime: 5,
             prefix: 'T',
           },
         });
@@ -1987,27 +2175,31 @@ async function runDiagnostics(mainWindow, config) {
         }
       }
     } catch (err) {
+      // P0-4: an unexpected error is a REAL failure, not a skip. The old
+      // code reported error→SKIP→SUCCESS, hiding broken diagnostics.
       crudResult = {
         step: 'test-queue-crud',
-        status: 'success',
-        message: `تم التخطي — خطأ غير متوقع (${err.message.substring(0, 40)}) — سيتم الاختبار بعد تسجيل الدخول`,
+        status: 'error',
+        message: `فشل اختبار الطابور السلوكي — ${String(err.message || err).substring(0, 90)}`,
+        detail: { error: String(err.message || err).substring(0, 300) },
       };
-      sendUpdate(mainWindow, { log: `[SKIP] CRUD test error: ${err.message} — will test after login`, logType: 'info' });
+      console.error('[Diagnostics] CRUD test FAILED:', err.message);
+      sendUpdate(mainWindow, { log: `[FAIL] Queue CRUD test error: ${err.message} — see detail in the results breakdown`, logType: 'fail' });
     }
   } else if (localApiPort && !localApiToken) {
     crudResult = {
       step: 'test-queue-crud',
-      status: 'success',
+      status: 'warning',
       message: 'تم التخطي — لا توجد جلسة محلية (سيتم الاختبار بعد تسجيل الدخول)',
     };
-    sendUpdate(mainWindow, { log: `[SKIP] No local session — will test after login`, logType: 'info' });
+    sendUpdate(mainWindow, { log: `[SKIP] No local session — will test after login`, logType: 'warn' });
   } else {
     crudResult = {
       step: 'test-queue-crud',
-      status: 'success',
+      status: 'warning',
       message: 'تم التخطي — الخادم المحلي غير متاح بعد',
     };
-    sendUpdate(mainWindow, { log: `[SKIP] Local server not available — will test after startup`, logType: 'info' });
+    sendUpdate(mainWindow, { log: `[SKIP] Local server not available — will test after startup`, logType: 'warn' });
   }
 
   pushResult(crudResult);
@@ -2114,8 +2306,12 @@ async function runDiagnostics(mainWindow, config) {
       endpointsResult = {
         step: 'test-all-endpoints',
         status: 'success',
-        message: `جميع نقاط API تعمل — ${passed}/${total} نجحت`,
-        detail: { passed, failed, total },
+        // STRUCTURAL evidence only — route existence + valid shapes. When the
+        // workspace is not READY this must not be read as offline-operability.
+        message: isReady === true
+          ? `جميع نقاط API تعمل — ${passed}/${total} نجحت`
+          : `جميع نقاط API تعمل (هيكلية فقط — مساحة العمل غير مهيأة) — ${passed}/${total} نجحت`,
+        detail: { passed, failed, total, structuralOnly: isReady !== true },
       };
     } else if (passed > failed) {
       endpointsResult = {

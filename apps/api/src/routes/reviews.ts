@@ -3,6 +3,7 @@ import { db } from '@blasti/db'
 import { requireAuth, requireResourceOwnership, requireAgencyAccess, requireAdmin, authErrorResponse } from '../lib/auth'
 import { validateBody, createReviewSchema, replyToReviewSchema } from '../lib/validations'
 import { emitNotificationEvent } from '../lib/realtime-emit'
+import { recordSyncChangeNow } from '../lib/sync-helpers'
 import { z } from 'zod'
 
 const app = new Hono()
@@ -52,6 +53,10 @@ app.post('/', async (c) => {
         if (comment?.trim()) {
           await db.$executeRaw`UPDATE Reservation SET feedback = ${comment.trim()} WHERE id = ${reservationId}`
         }
+        // Spec Part O: $executeRaw writes are invisible to the auto-tracking
+        // extension — compensate with an explicit capture so the rating/feed
+        // fields reach offline desktops.
+        await recordSyncChangeNow({ agencyId, model: 'Reservation', recordId: reservationId, operation: 'update' })
       } catch {
         console.warn('[REVIEWS POST] Could not set feedback/ratedAt, columns may not exist')
       }
@@ -133,6 +138,8 @@ app.patch('/:id', async (c) => {
       if (comment !== undefined) {
         try {
           await db.$executeRaw`UPDATE Reservation SET feedback = ${comment?.trim() || null} WHERE id = ${review.reservationId}`
+          // Spec Part O: raw-SQL compensation capture.
+          await recordSyncChangeNow({ agencyId: review.agencyId, model: 'Reservation', recordId: review.reservationId, operation: 'update' })
         } catch {
           console.warn('[REVIEWS PATCH] Could not set feedback, column may not exist')
         }

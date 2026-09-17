@@ -302,10 +302,24 @@ async function _upsertRecord(tx, modelName, rawRecord) {
     })
     return true
   } catch (e) {
-    // If upsert fails due to missing relation, log and skip
-    console.warn(`[InitialSync] Upsert failed for ${modelName}/${rawRecord.id}: ${e.message}`)
-    return false
+    // Part J: classification — the caller decides defer vs retry vs fatal.
+    // Dependency (FK-ordering) failures are RETURNED as false so the batch
+    // can defer them durably; every other error is RETHROWN (schema
+    // mismatch / validation / malformed data must fail the stage, never
+    // masquerade as "deferred").
+    if (_isFkOrderingError(e) || _isTransientDbError(e)) {
+      console.warn(`[InitialSync] Upsert failed (recoverable) for ${modelName}/${rawRecord.id}: ${e.message.substring(0, 160)}`)
+      return false
+    }
+    console.error(`[InitialSync] FATAL upsert error for ${modelName}/${rawRecord.id}: ${e.message.substring(0, 240)}`)
+    throw e
   }
+}
+
+/** Transient SQLite contention — retryable in place (Part J). */
+function _isTransientDbError(err) {
+  const msg = String((err && err.message) || err || '')
+  return /SQLITE_BUSY|database is locked|SQLITE_LOCKED/i.test(msg)
 }
 
 /**
@@ -375,18 +389,31 @@ function _isFkOrderingError(err) {
  * Batch upsert. Returns { upserted, deferred } — deferred records failed
  * with FK-ordering errors and are retried after all stages complete.
  */
-async function _upsertBatch(db, modelName, records, deferredOut) {
+async function _upsertBatch(db, modelName, records, deferredOut, ctx) {
+  ctx = ctx || {}
   if (!records || records.length === 0) return { upserted: 0, deferred: 0 }
 
   let upserted = 0
   let deferred = 0
   await db.$transaction(async (tx) => {
     for (const rawRecord of records) {
-      const success = await _upsertRecord(tx, modelName, rawRecord)
+      let success = false
+      // Part J: transient SQLite contention retries in place (up to 3x).
+      for (let attempt = 0; attempt < 3 && !success; attempt++) {
+        success = await _upsertRecord(tx, modelName, rawRecord)
+        if (!success && attempt < 2) {
+          await new Promise((r) => setTimeout(r, 150 * (attempt + 1)))
+        }
+      }
       if (success) {
         upserted++
+      } else if (ctx.agencyId) {
+        // Part K: durable deferral INSIDE the same transaction — a crash can
+        // never lose a dependency-blocked record. Nothing stays in memory.
+        await _persistDeferredRecord(tx, ctx, modelName, rawRecord)
+        deferred++
+        if (deferredOut) deferredOut.push({ modelName, rawRecord })
       } else if (deferredOut && deferredOut.length < MAX_DEFERRED_RECORDS) {
-        // FK-ordering candidates are remembered for the post-pass retry.
         deferredOut.push({ modelName, rawRecord })
         deferred++
       }
@@ -394,6 +421,28 @@ async function _upsertBatch(db, modelName, records, deferredOut) {
   }, { maxWait: 5000, timeout: 30000 })
 
   return { upserted, deferred }
+}
+
+/**
+ * Part K: persist a dependency-blocked record to _deferred_changes inside the
+ * current transaction. `source='initial-sync'` + stage recorded for the
+ * READY gate (unresolved mandatory deferrals block READY).
+ */
+async function _persistDeferredRecord(tx, ctx, modelName, rawRecord) {
+  await tx.$executeRawUnsafe(
+    'INSERT INTO "_deferred_changes" ' +
+    '("id","agencyId","source","sequence","stage","model","recordId","operation","payload","dependencyError","retryCount","firstSeenAt","status","lastError") ' +
+    "VALUES (?, ?, 'initial-sync', NULL, ?, ?, ?, 'create', ?, ?, 0, ?, 'PENDING', ?)",
+    require('crypto').randomUUID(),
+    ctx.agencyId || '',
+    ctx.stage || null,
+    modelName,
+    String(rawRecord && rawRecord.id || ''),
+    JSON.stringify(rawRecord || {}),
+    'FK/dependency ordering during initial import',
+    new Date().toISOString(),
+    'deferred during initial import'
+  )
 }
 
 // ─── AgencyLocalState Helpers ────────────────────────────────────────────────
@@ -695,6 +744,46 @@ async function runInitialSync(options) {
  * guard (moved into runInitialSync) and the READY fast-path which now clears
  * the active sync entry via the shared _clearActive helper.
  */
+/**
+ * Part AE: post-snapshot bridge. Between the snapshot (sequence S) and the
+ * end of the staged import, cloud changes occurred. This closes the race by
+ * pulling and applying EVERY change > S (via the incremental pull protocol,
+ * using the same savepoint/tombstone/LWW apply machinery as the engine)
+ * BEFORE the workspace is marked READY. Deferred failures are durably
+ * persisted inside applyPullChanges.
+ *
+ * The engine cursor is then set to the bridge's final page sequence so no
+ * change is re-missed and nothing is skipped (the ORIGINAL S is retained in
+ * initialSyncSnapshotSequence for audit).
+ */
+async function _bridgeChangesSinceSnapshot(db, agencyId, cloudUrl, cloudAuthToken, snapshotSequence, signal, emit) {
+  const syncService = require('./sync-service')
+  let since = snapshotSequence
+  let pages = 0
+  let applied = 0
+  for (let guard = 0; guard < 1000; guard++) {
+    const page = await _cloudPost(`${cloudUrl}/api/sync/pull`, {
+      agencyId,
+      sinceSequence: since,
+      limit: 500,
+      protocolVersion: SYNC_PROTOCOL_VERSION,
+    }, cloudAuthToken, { signal })
+    if (!page?.success) throw new Error('Bridge pull failed: ' + (page?.error || 'unknown error'))
+    const pageLast = typeof page.pageLastSequence === 'number'
+      ? page.pageLastSequence
+      : (typeof page.latestSequence === 'number' ? page.latestSequence : since)
+    if (pageLast > since) {
+      const result = await syncService.applyPullChanges(db, page.changes || {}, { agencyId, pageLastSequence: pageLast })
+      applied += (result.applied || 0) + (result.deleted || 0)
+    }
+    since = pageLast
+    pages++
+    if (!page.hasMore) break
+  }
+  emit && emit({ type: 'SYNC_STAGE_COMPLETED', stage: 'snapshot-bridge', stageLabel: 'Snapshot bridge', count: applied })
+  return { pages, applied, finalSequence: since }
+}
+
 async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
   const { agencyId, cloudAuthToken, cloudUrl, db, emitFn, signal } = options
 
@@ -749,19 +838,28 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
   }
 
   const cloudStages = _sortStagesFkSafe(discoveryResult.stages)
-  const snapshotSequence = discoveryResult.snapshotSequence || 0
+  // Part E: ONE immutable snapshot per import. A resumed run reuses the
+  // snapshot captured when the import STARTED (a fresh value would silently
+  // widen the snapshot mid-import while part of the data is relative to the
+  // older one).
+  const snapshotSequence = (localState.initializationStatus === 'INITIALIZING' && localState.snapshotSequence > 0)
+    ? localState.snapshotSequence
+    : (discoveryResult.snapshotSequence || 0)
 
   // ── Step 2: Transition to INITIALIZING ──────────────────────────────────
   // Check for resumable state
   const resumeFromStage = localState.initializationStatus === 'INITIALIZING' ? localState.currentStage : null
-  const resumeCursor = localState.initializationStatus === 'INITIALIZING' ? localState.currentCursor : null
+  // Part G: the stage/page cursor is the OPAQUE STRING tuple from the cloud
+  // (currentStageCursor) — completely separate from the integer global
+  // SyncChange sequence cursor. Legacy currentCursor (Int) is no longer read.
+  const resumeCursor = localState.initializationStatus === 'INITIALIZING' ? localState.currentStageCursor : null
 
   await _updateLocalState(db, agencyId, {
     initializationStatus: 'INITIALIZING',
     initializationSessionId: syncId,
     initializationStartedAt: localState.initializationStartedAt || new Date(),
     currentStage: resumeFromStage || cloudStages[0]?.id || null,
-    currentCursor: resumeCursor,
+    currentStageCursor: resumeCursor,
     snapshotSequence,
     // NOTE: syncProtocolVersion removed — the AgencyLocalState model in
     // packages/db/prisma/schema.prisma has no such column and the upsert
@@ -812,7 +910,7 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     // Update current stage in state
     await _updateLocalState(db, agencyId, {
       currentStage: stage.id,
-      currentCursor: isResumeStage ? resumeCursor : null,
+      currentStageCursor: isResumeStage ? resumeCursor : null,
     })
 
     // Emit stage started
@@ -844,6 +942,8 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
           cursor: cursor || undefined,
           pageSize: PAGE_SIZE,
           protocolVersion: SYNC_PROTOCOL_VERSION,
+          // Part E: echo the pinned snapshot so EVERY page shares one snapshot.
+          snapshotSequence,
         }, cloudAuthToken, { signal: effectiveSignal })
 
         if (!response?.success) {
@@ -867,14 +967,14 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
         // Upsert batch in transaction (FK-blocked records are deferred
         // to the post-pass retry instead of being silently dropped)
         batchNumber++
-        const batchResult = await _upsertBatch(db, modelName, records, deferredRecords)
+        const batchResult = await _upsertBatch(db, modelName, records, deferredRecords, { agencyId, stage: stage.id })
         stageCount += batchResult.upserted
         totalRecords += batchResult.upserted
 
-        // Advance cursor and update progress
+        // Advance cursor and update progress (Part G: string stage cursor)
         cursor = nextCursor
         await _updateLocalState(db, agencyId, {
-          currentCursor: cursor,
+          currentStageCursor: cursor,
           recordsImported: totalRecords,
           // NOTE: currentBatch removed — no such column on AgencyLocalState
           // (PrismaClientValidationError, found in live E2E, Task 7-b).
@@ -904,7 +1004,7 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
 
       // Clear cursor for completed stage
       await _updateLocalState(db, agencyId, {
-        currentCursor: null,
+        currentStageCursor: null,
       })
 
       // Emit stage completed
@@ -970,24 +1070,96 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     }
   }
 
-  // ── Step 3b: Deferred retry pass (FK-ordering recovery) ─────────────────
+  // ── Step 3b: Deferred retry pass (Part I/K — two-phase circular import) ──
   // Records that failed during staged import because they referenced rows
-  // imported LATER (circular dependencies like Counter.currentReservationId →
-  // Reservation, or discovery stage order differing from FK order) are
-  // retried now that every stage has been applied. Still-failing records are
-  // counted as failures and healed by full reconciliation later.
-  if (deferredRecords.length > 0) {
-    console.log(`[InitialSync] Deferred retry pass: ${deferredRecords.length} record(s) blocked by FK ordering`)
-    let recovered = 0
-    for (const { modelName, rawRecord } of deferredRecords) {
-      try {
-        const ok = await _upsertRecord(db, modelName, rawRecord)
-        if (ok) recovered++
-      } catch { /* healed by reconciliation */ }
+  // imported LATER (the Counter.currentReservationId ↔ Reservation.counterId
+  // cycle, or discovery stage order differing from FK order) are durably
+  // queued in _deferred_changes (source='initial-sync'). This pass retries
+  // them IN ROUNDS until no further progress (two-phase import for the
+  // circular nullable relations): parents land, then children resolve.
+  // Still-failing rows stay PENDING (or QUARANTINE on non-FK errors).
+  //
+  // P0-3 (READY integrity): the accounting below covers ALL deferred sources —
+  // the post-snapshot bridge (Step 4c) applies pull pages through the engine,
+  // which persists failures with source='pull'. A READY workspace must not
+  // silently ignore those (the old gate only inspected source='initial-sync').
+  const MANDATORY_READY_MODELS = new Set([
+    'Agency', 'User', 'AgencyStaff', 'Branch', 'Service', 'Counter',
+  ])
+  let deferredOutcome = { pendingInitialSync: 0, pendingPull: 0, quarantinedAtGate: 0 }
+  try {
+    const syncService = require('./sync-service')
+    const allDeferred = await db.$queryRawUnsafe(
+      "SELECT COUNT(*) as n FROM _deferred_changes WHERE agencyId = ? AND source = 'initial-sync' AND status = 'PENDING'",
+      agencyId
+    ).catch(() => [{ n: 0 }])
+    const deferredCount = Number(allDeferred?.[0]?.n || 0)
+    if (deferredCount > 0) {
+      console.log(`[InitialSync] Deferred retry pass: ${deferredCount} record(s) blocked by FK ordering`)
+      let recoveredTotal = 0
+      for (let round = 0; round < 4; round++) {
+        const before = await db.$queryRawUnsafe(
+          "SELECT COUNT(*) as n FROM _deferred_changes WHERE agencyId = ? AND source = 'initial-sync' AND status = 'PENDING'", agencyId
+        )
+        const beforeCount = Number(before?.[0]?.n || 0)
+        if (beforeCount === 0) break
+        const res = await syncService.retryDeferredChanges()
+        const after = await db.$queryRawUnsafe(
+          "SELECT COUNT(*) as n FROM _deferred_changes WHERE agencyId = ? AND source = 'initial-sync' AND status = 'PENDING'", agencyId
+        )
+        const afterCount = Number(after?.[0]?.n || 0)
+        recoveredTotal += (beforeCount - afterCount)
+        if (afterCount === beforeCount) break // no progress this round
+      }
+      totalRecords += recoveredTotal
+      const remaining = await db.$queryRawUnsafe(
+        "SELECT COUNT(*) as n FROM _deferred_changes WHERE agencyId = ? AND source = 'initial-sync' AND status = 'PENDING'", agencyId
+      )
+      const remainingCount = Number(remaining?.[0]?.n || 0)
+      console.log(`[InitialSync] Deferred retry recovered ${recoveredTotal} record(s); ${remainingCount} still pending`)
+      emit({ type: 'SYNC_STAGE_COMPLETED', stage: 'deferred-retry', stageLabel: 'Deferred retry', count: recoveredTotal })
     }
-    totalRecords += recovered
-    console.log(`[InitialSync] Deferred retry recovered ${recovered}/${deferredRecords.length} record(s)`)
-    emit({ type: 'SYNC_STAGE_COMPLETED', stage: 'deferred-retry', stageLabel: 'Deferred retry', count: recovered })
+
+    // ── READY gate over ALL unresolved deferrals (any source) ─────────────
+    // The bridge (Step 4c) has NOT run yet on a fresh import, so pull-source
+    // rows here come from a RESUMED import's earlier bridge attempt. After
+    // the bridge (Step 4c) the same check re-runs with final numbers (Step 5
+    // guard below) — this placement keeps the gate BEFORE any READY flip.
+    const pendingRowsAll = await db.$queryRawUnsafe(
+      "SELECT id, source, stage, model, recordId, retryCount FROM _deferred_changes WHERE agencyId = ? AND status = 'PENDING' LIMIT 200", agencyId
+    ).catch(() => [])
+    const pendingList = pendingRowsAll || []
+    const mandatoryPending = pendingList.filter((r) => MANDATORY_READY_MODELS.has(r.model))
+    const nonMandatoryPending = pendingList.filter((r) => !MANDATORY_READY_MODELS.has(r.model))
+
+    if (mandatoryPending.length > 0) {
+      // These rows reference parents that never arrive (e.g. the cloud feed
+      // contains a Counter whose Branch was hard-deleted). Retrying forever
+      // would wedge initialization on cloud-side garbage, so they are
+      // QUARANTINED with an explicit, visible reason — the integrity
+      // validation below still FAILS READY when a core table ended up EMPTY.
+      const feedExhausted = `feed exhausted (snapshot seq ${snapshotSequence}; parents not delivered by cloud)`
+      for (const row of mandatoryPending) {
+        await db.$executeRawUnsafe(
+          "UPDATE _deferred_changes SET status = 'QUARANTINED', lastError = ? WHERE id = ?",
+          `unresolvable at init: ${feedExhausted}`, row.id
+        ).catch(() => {})
+      }
+      deferredOutcome.quarantinedAtGate = mandatoryPending.length
+      const detail = mandatoryPending.map((r) => `${r.model}/${r.recordId}`).join(', ')
+      console.warn(`[InitialSync] ${mandatoryPending.length} MANDATORY-model deferred record(s) unresolvable after all rounds → QUARANTINED (visible in db-status): ${detail}`)
+      emit({ type: 'SYNC_WARNING', stage: 'deferred-retry', message: `Mandatory deferred records quarantined: ${detail}` })
+    }
+    deferredOutcome.pendingInitialSync = nonMandatoryPending.filter((r) => r.source === 'initial-sync').length
+    deferredOutcome.pendingPull = nonMandatoryPending.filter((r) => r.source !== 'initial-sync').length
+    if (nonMandatoryPending.length > 0) {
+      // Non-core records (Reservation/Notification/Review/…) keep PENDING:
+      // the background engine re-applies them on every cycle once their
+      // parents arrive (post-READY reconciliation heals them).
+      console.warn(`[InitialSync] ${nonMandatoryPending.length} non-mandatory deferred record(s) stay PENDING (background retry after READY heals them)`)
+    }
+  } catch (deferredPassErr) {
+    console.warn('[InitialSync] Deferred retry pass error (non-fatal):', deferredPassErr.message)
   }
 
   // ── Step 4: Integrity validation ────────────────────────────────────────
@@ -1046,8 +1218,75 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     console.warn('[InitialSync] Race condition check failed (non-fatal):', e.message)
   }
 
-  // ── Step 5: Mark READY ──────────────────────────────────────────────────
+  // ── Step 4c (Part AE): snapshot bridge — apply changes > S before READY ─
+  // Do NOT mark READY before this bridge completes: the gap between the
+  // snapshot and "now" must be closed while the state is still INITIALIZING.
+  let bridgeFinalSequence = snapshotSequence
+  try {
+    const bridge = await _bridgeChangesSinceSnapshot(
+      db, agencyId, cloudUrl, cloudAuthToken, snapshotSequence, effectiveSignal, emit,
+    )
+    bridgeFinalSequence = bridge.finalSequence
+    console.log(`[InitialSync] Snapshot bridge complete: ${bridge.applied} change(s) applied across ${bridge.pages} page(s); engine cursor -> ${bridgeFinalSequence}`)
+  } catch (bridgeErr) {
+    await _updateLocalState(db, agencyId, {
+      initializationStatus: 'FAILED',
+      lastError: `Snapshot bridge failed: ${bridgeErr.message}`,
+    })
+    emit({ type: 'SYNC_ERROR', stage: 'snapshot-bridge', error: bridgeErr.message, retryable: true })
+    _activeSync = null
+    return {
+      success: false,
+      totalRecords,
+      duration: Date.now() - startTime,
+      error: `Snapshot bridge failed: ${bridgeErr.message}`,
+    }
+  }
+
+  // ── Step 4d (P0-3): FINAL deferred gate over ALL sources, post-bridge ───
+  // The bridge applies pull pages through the engine, which durably defers
+  // FK-blocked rows with source='pull'. READY must never be declared while
+  // such rows are unaccounted for (review Problem 7). Mandatory-model rows
+  // that remain unresolvable after the bridge are QUARANTINED with a visible
+  // reason (the feed is exhausted — their parents will not arrive); the
+  // integrity validation already failed READY if a core table ended empty.
+  try {
+    const postBridgePending = await db.$queryRawUnsafe(
+      "SELECT id, model, recordId, source FROM _deferred_changes WHERE agencyId = ? AND status = 'PENDING'", agencyId
+    ).catch(() => [])
+    const rows = postBridgePending || []
+    const mandatoryRows = rows.filter((r) => MANDATORY_READY_MODELS.has(r.model))
+    if (mandatoryRows.length > 0) {
+      for (const row of mandatoryRows) {
+        await db.$executeRawUnsafe(
+          "UPDATE _deferred_changes SET status = 'QUARANTINED', lastError = ? WHERE id = ?",
+          `unresolvable at init: bridge exhausted feed to seq ${bridgeFinalSequence}; parents not delivered by cloud`, row.id
+        ).catch(() => {})
+      }
+      deferredOutcome.quarantinedAtGate += mandatoryRows.length
+      console.warn(`[InitialSync] Post-bridge gate: ${mandatoryRows.length} mandatory-model deferred row(s) quarantined (${mandatoryRows.map(r => r.model + '/' + r.recordId).join(', ')})`)
+      emit({ type: 'SYNC_WARNING', stage: 'snapshot-bridge', message: `${mandatoryRows.length} mandatory deferred record(s) quarantined after bridge` })
+    }
+    deferredOutcome.pendingInitialSync = rows.filter((r) => r.source === 'initial-sync' && !MANDATORY_READY_MODELS.has(r.model)).length
+    deferredOutcome.pendingPull = rows.filter((r) => r.source !== 'initial-sync' && !MANDATORY_READY_MODELS.has(r.model)).length
+  } catch (gateErr) {
+    console.warn('[InitialSync] Post-bridge deferred gate error (non-fatal):', gateErr.message)
+  }
+
+  // ── Step 5: Mark READY (with a recorded integrity receipt) ──────────────
   const completedAt = new Date()
+  const readyChecks = {
+    agencyRow: 'checked-by-integrity-validation',
+    servicesBranches: 'checked-by-integrity-validation',
+    deferredPendingInitialSync: deferredOutcome.pendingInitialSync,
+    deferredPendingPull: deferredOutcome.pendingPull,
+    deferredQuarantinedAtGate: deferredOutcome.quarantinedAtGate,
+    snapshotSequence,
+    bridgeFinalSequence,
+    bridgeCoversSnapshot: bridgeFinalSequence >= snapshotSequence,
+    readyAt: completedAt.toISOString(),
+  }
+  await _setMeta(db, `readyChecks:${agencyId}`, JSON.stringify(readyChecks))
   await _updateLocalState(db, agencyId, {
     initializationStatus: 'READY',
     initializationCompletedAt: completedAt,
@@ -1061,7 +1300,11 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
   // so the incremental sync engine starts from the correct baseline.
   // Also store as initialSyncSnapshotSequence for clear identification of
   // the initial sync baseline (distinct from the advancing _lastPulledSequence).
-  await _setMeta(db, `_lastPulledSequence`, String(snapshotSequence))
+  // Part E/AE: the engine cursor starts at the bridge's final page sequence —
+  // every change after the ORIGINAL snapshot has already been applied by the
+  // bridge, so nothing between S and now can be missed. The original S stays
+  // recorded as initialSyncSnapshotSequence (audit + retention checks).
+  await _setMeta(db, `_lastPulledSequence`, String(bridgeFinalSequence))
   await _setMeta(db, `initialSyncSnapshotSequence`, String(snapshotSequence))
   await _setMeta(db, `agencyInitialized:${agencyId}`, 'true')
   await _setMeta(db, `initialSyncCompletedAt:${agencyId}`, String(completedAt.getTime()))
@@ -1077,6 +1320,7 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     duration,
     snapshotSequence,
     validation,
+    readyChecks,
   })
 
   _activeSync = null
@@ -1087,6 +1331,7 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     duration,
     syncId,
     snapshotSequence,
+    readyChecks,
   }
 }
 

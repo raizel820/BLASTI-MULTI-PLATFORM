@@ -5,6 +5,7 @@ import { validateBody, kioskJoinSchema } from '../lib/validations'
 import { emitQueueEvent, emitKioskEvent } from '../lib/realtime-emit'
 import { enforceRateLimit, KIOSK_RATE_LIMIT, KIOSK_READ_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
 import { calculateETA, getEffectiveServiceTime, filterGhostTickets } from '../lib/eta-calculator'
+import { recordSyncChange } from '../lib/sync-helpers'
 
 const app = new Hono()
 
@@ -89,9 +90,12 @@ app.post('/join', async (c) => {
       const res = await tx.reservation.create({
         data: { agencyId, serviceId, queueNumber: nextNumber, displayNumber, status: 'WAITING', estimatedWait, isWalkIn: true, walkInCustomerName: customerName?.trim() || 'Anonymous', userId: null },
       })
+      // Spec Part O: tx ops are invisible to the auto-tracking extension.
+      await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: res.id, operation: 'create' })
 
       if (agency.queueSettings.length > 0) {
         await tx.queueSettings.update({ where: { id: agency.queueSettings[0].id }, data: { lastIssuedNumber: nextNumber } })
+        await recordSyncChange({ tx, agencyId, model: 'QueueSettings', recordId: agency.queueSettings[0].id, operation: 'update' })
       }
 
       const importToken = randomBytes(24).toString('hex')
@@ -99,6 +103,7 @@ app.post('/join', async (c) => {
         where: { id: res.id },
         data: { importToken },
       })
+      await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: res.id, operation: 'update' })
 
       return res
     })

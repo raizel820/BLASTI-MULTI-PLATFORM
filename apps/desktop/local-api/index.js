@@ -46,6 +46,7 @@ let sessionUser = null
 let eventListeners = []
 let mutationListeners = []
 let idemColumnEnsured = false
+let outboxV3Ensured = false
 
 // ─── Event Emitter (UI reactivity) ────────────────────────────────────────
 
@@ -286,6 +287,8 @@ async function ensurePendingMutationsTable() {
       '"max_attempts" INTEGER NOT NULL DEFAULT 5,' +
       '"created_at" BIGINT NOT NULL,' +
       '"last_attempt_at" BIGINT,' +
+      '"next_retry_at" BIGINT,' +
+      '"last_http_status" INTEGER,' +
       '"last_error" TEXT,' +
       '"response_data" TEXT' +
       ')'
@@ -296,7 +299,40 @@ async function ensurePendingMutationsTable() {
 
     await _migratePendingMutationsBigint()
 
-    // ── v2: stable content-derived idempotency key column ──
+    // ── v3 (Parts R/S): retry-scheduling columns + legacy status sweep ──
+    if (!outboxV3Ensured) {
+      try {
+        const cols = await db.$queryRawUnsafe('PRAGMA table_info("_pending_mutations")')
+        const colNames = new Set((cols || []).map((c) => c && c.name))
+        for (const [col, ddl] of [
+          ['next_retry_at', 'ALTER TABLE "_pending_mutations" ADD COLUMN "next_retry_at" BIGINT'],
+          ['last_http_status', 'ALTER TABLE "_pending_mutations" ADD COLUMN "last_http_status" INTEGER'],
+        ]) {
+          if (!colNames.has(col)) {
+            await db.$executeRawUnsafe(ddl)
+            console.log('[LocalAPI] Added _pending_mutations.' + col + ' column')
+          }
+        }
+      } catch (e) {
+        console.warn('[LocalAPI] retry-column ensure skipped:', e.message)
+      }
+      try {
+        // Legacy rows: 'failed' was a permanent-quarantine bug — they become
+        // retryable again; 'abandoned' becomes visible permanent_failed.
+        const r1 = await db.$executeRawUnsafe('UPDATE "_pending_mutations" SET status = \'retry\', "next_retry_at" = NULL WHERE status = \'failed\'')
+        const r2 = await db.$executeRawUnsafe('UPDATE "_pending_mutations" SET status = \'permanent_failed\' WHERE status = \'abandoned\'')
+        // Crash sweep: 'sending' rows older than 10 min were in-flight when
+        // the process died — back to pending.
+        const r3 = await db.$executeRawUnsafe('UPDATE "_pending_mutations" SET status = \'pending\' WHERE status = \'sending\' AND "last_attempt_at" IS NOT NULL AND "last_attempt_at" < ?', Date.now() - 10 * 60 * 1000)
+        const swept = Number(r1) + Number(r2) + Number(r3)
+        if (swept > 0) console.log('[LocalAPI] Outbox legacy/crash sweep:', swept, 'row(s) rescheduled')
+      } catch (e) {
+        console.warn('[LocalAPI] outbox status sweep skipped:', e.message)
+      }
+      outboxV3Ensured = true
+    }
+
+    // ── v2: stable idempotency key column ──
     if (!idemColumnEnsured) {
       try {
         // Introspection-guarded: the schema-migrations top-up (lib/db.js) or
@@ -393,54 +429,135 @@ function deriveStableIdempotencyKey(method, path, body) {
 }
 
 /**
- * Log a mutation to the pending queue.
+ * Log a mutation to the pending outbox.
  * Called by write handlers (POST/PUT/PATCH/DELETE) after EVERY local
- * business mutation (fire-and-forget). The sync service replays the queue
- * to the cloud with a stable X-Idempotency-Key header, so the cloud applies
- * each logical operation exactly once.
+ * business mutation. The sync service replays the queue to the cloud with a
+ * stable X-Idempotency-Key header (route rows) or as canonical /api/sync/push
+ * mutations (SYNC_PUSH rows), so the cloud applies each logical operation
+ * exactly once.
  *
- * The stable content-derived `idempotency_key` is computed here and stored
- * with the row. A UNIQUE index on it dedupes double-logged identical
- * operations (INSERT OR IGNORE).
+ * Part T (identity): the idempotency key is a UUID generated when the
+ * business operation runs — ONE logical operation = ONE mutationId, reused
+ * across every retry. Two separate legitimate operations with identical
+ * payloads get DIFFERENT keys (the old content-hash collapsed them).
+ *
+ * Part Q (durability): pass opts.tx (the interactive-transaction client of
+ * the business write) to commit the business mutation and the outbox row
+ * ATOMICALLY. Without tx the row is still persisted immediately (SQLite,
+ * awaited) — a smaller but real durability window.
+ *
+ * Canonical rows (Part V): method='SYNC_PUSH', path='/api/sync/push', body =
+ * JSON { model, recordId, operation, data, localUpdatedAt } — replayed via
+ * the cloud push protocol as a deterministic outcome instead of re-running
+ * a business action.
  */
-async function logPendingMutation(method, path, body, responseData) {
-  if (!db) return
+async function logPendingMutation(method, path, body, responseData, opts) {
+  opts = opts || {}
+  const executor = opts.tx || db
+  if (!executor) return
   try {
-    await ensurePendingMutationsTable()
+    if (!opts.tx) await ensurePendingMutationsTable()
     const id = require('crypto').randomUUID()
     const bodyStr = body ? JSON.stringify(body) : null
-    const idemKey = deriveStableIdempotencyKey(method, path, bodyStr)
-    const result = await db.$executeRawUnsafe(
-      'INSERT OR IGNORE INTO "_pending_mutations" (id, method, path, body, status, created_at, response_data, idempotency_key) VALUES (?, ?, ?, ?, \'pending\', ?, ?, ?)',
-      id,
-      method,
-      path,
-      bodyStr,
-      Date.now(),
-      responseData ? JSON.stringify(responseData) : null,
-      idemKey
-    )
-    if (result === 0) {
-      console.log('[LocalAPI] Deduped pending mutation (identical key already in WAL):', method, path)
-      return
+    const mutationId = 'mut-' + id
+    const stmt = 'INSERT OR IGNORE INTO "_pending_mutations" (id, method, path, body, status, created_at, response_data, idempotency_key) VALUES (?, ?, ?, ?, \'pending\', ?, ?, ?)'
+    const params = [id, method, path, bodyStr, Date.now(), responseData ? JSON.stringify(responseData) : null, mutationId]
+    if (opts.tx) {
+      await opts.tx.$executeRawUnsafe(stmt, ...params)
+    } else {
+      await executor.$executeRawUnsafe(stmt, ...params)
     }
-    console.log('[LocalAPI] Logged pending mutation:', method, path)
-    // Fire-and-forget: let the sync service replay the outbox immediately.
-    notifyMutationLogged()
+    console.log('[LocalAPI] Logged outbox mutation:', method, path, 'id:', mutationId)
+    if (!opts.tx) {
+      // Immediate replay trigger (skip when transactional — the caller emits
+      // after commit).
+      notifyMutationLogged()
+    }
   } catch (e) {
     console.error('[LocalAPI] Failed to log pending mutation:', e.message)
+    if (opts.tx) throw e // transactional callers MUST know the outbox row failed
   }
 }
 
 /**
- * Get all pending mutations (for sync service to replay).
+ * Canonical push payload (Parts V/W): a deterministic record-level mutation
+ * for the cloud /api/sync/push protocol - "Reservation R was set to state S",
+ * never "please run action X again".
+ */
+function canonicalPushPayload(model, recordId, operation, data, localUpdatedAt) {
+  const clean = data && typeof data === 'object'
+    ? JSON.parse(JSON.stringify(data, (k, v) => (typeof v === 'bigint' ? Number(v) : v === undefined ? null : v)))
+    : {}
+  return {
+    model,
+    recordId,
+    operation,
+    data: clean,
+    localUpdatedAt: localUpdatedAt || new Date().toISOString(),
+  }
+}
+
+/**
+ * Log a canonical outcome mutation (replayed via POST /api/sync/push).
+ * Use for every state-changing action whose cloud replay must be
+ * DETERMINISTIC (queue actions, :id routes, deletes).
+ */
+async function logDeterministicOutcome(model, recordId, operation, data, localUpdatedAt, opts) {
+  // Defensive arg-shim: callers sometimes write (..., data, { tx }) placing the
+  // opts object in the localUpdatedAt slot — shift it so the outbox row really
+  // joins the caller's transaction instead of corrupting the payload.
+  // (Dates and arrays are legitimate localUpdatedAt values and are NOT opts.)
+  if (
+    localUpdatedAt &&
+    typeof localUpdatedAt === 'object' &&
+    !Array.isArray(localUpdatedAt) &&
+    !(localUpdatedAt instanceof Date)
+  ) {
+    if (!opts) opts = localUpdatedAt
+    localUpdatedAt = undefined
+  }
+  return logPendingMutation('SYNC_PUSH', '/api/sync/push',
+    canonicalPushPayload(model, recordId, operation, data, localUpdatedAt), null, opts)
+}
+
+/**
+ * P1-5 (spec Part Q): run a business mutation and its outbox row in ONE
+ * SQLite transaction — the historic pattern (business write commits, then
+ * `logPendingMutation()` afterwards) had a crash window that could produce
+ * an APPLIED local mutation with NO outbox entry: the cloud would never
+ * learn the mutation happened.
+ *
+ * The callback receives the interactive-transaction client `tx` — perform
+ * ALL business writes through it and log the outbox row inside the same
+ * callback via logDeterministicOutcome(..., { tx }) / logPendingMutation(..., { tx }).
+ * An outbox INSERT failure rolls the business write back (the client sees
+ * the 500 and retries) — the two sides can never diverge.
+ * notifyMutationLogged() fires only AFTER commit so the replay never races
+ * an uncommitted row.
+ */
+async function withOutboxTransaction(work) {
+  if (!db) throw new Error('Local database not initialized')
+  const result = await db.$transaction(async (tx) => work(tx), { maxWait: 5000, timeout: 20000 })
+  notifyMutationLogged()
+  return result
+}
+
+/**
+ * Get due outbox mutations (for sync service replay).
+ * Part R: 'retry' rows re-join the queue once their backoff expires — a
+ * transient failure NEVER removes a mutation from the retry pool.
+ * Legacy 'failed' rows (pre-v3 quarantine bug) are also retryable again.
  */
 async function getPendingMutations() {
   if (!db) return []
   try {
     await ensurePendingMutationsTable()
     const rows = await db.$queryRawUnsafe(
-      'SELECT * FROM "_pending_mutations" WHERE status = \'pending\' ORDER BY created_at ASC LIMIT 100'
+      'SELECT * FROM "_pending_mutations" ' +
+      'WHERE status IN (\'pending\', \'retry\', \'failed\') ' +
+      'AND ("next_retry_at" IS NULL OR "next_retry_at" <= ?) ' +
+      'ORDER BY created_at ASC LIMIT 100',
+      Date.now()
     )
     return (rows || []).map(row => ({
       ...row,
@@ -448,6 +565,7 @@ async function getPendingMutations() {
       // so convert timestamp fields to Numbers for the response payload.
       created_at: typeof row.created_at === 'bigint' ? Number(row.created_at) : row.created_at,
       last_attempt_at: typeof row.last_attempt_at === 'bigint' ? Number(row.last_attempt_at) : row.last_attempt_at,
+      next_retry_at: typeof row.next_retry_at === 'bigint' ? Number(row.next_retry_at) : row.next_retry_at,
       body: row.body ? JSON.parse(row.body) : null,
       responseData: row.response_data ? JSON.parse(row.response_data) : null,
     }))
@@ -458,37 +576,146 @@ async function getPendingMutations() {
 }
 
 /**
+ * Get outbox counters for /api/db-status (Part AT).
+ */
+async function getOutboxStats() {
+  if (!db) return { pending: 0, retry: 0, permanentFailed: 0, conflict: 0, completedToday: 0 }
+  try {
+    await ensurePendingMutationsTable()
+    const rows = await db.$queryRawUnsafe(
+      'SELECT status, COUNT(*) as n FROM "_pending_mutations" GROUP BY status'
+    )
+    const byStatus = {}
+    for (const r of rows || []) byStatus[r.status] = Number(r.n)
+    return {
+      pending: (byStatus.pending || 0),
+      retry: (byStatus.retry || 0) + (byStatus.failed || 0),
+      permanentFailed: (byStatus.permanent_failed || 0) + (byStatus.abandoned || 0),
+      conflict: (byStatus.conflict || 0),
+      sending: (byStatus.sending || 0),
+    }
+  } catch {
+    return { pending: 0, retry: 0, permanentFailed: 0, conflict: 0, sending: 0 }
+  }
+}
+
+/**
  * Mark a mutation as completed (successfully synced to cloud).
  */
-async function markMutationCompleted(id) {
+async function markMutationCompleted(id, responseData) {
   if (!db) return
   try {
-    await db.$executeRawUnsafe(
-      'UPDATE "_pending_mutations" SET status = \'completed\' WHERE id = ?', id
-    )
+    if (responseData !== undefined) {
+      await db.$executeRawUnsafe(
+        'UPDATE "_pending_mutations" SET status = \'completed\', "response_data" = COALESCE(?, "response_data") WHERE id = ?',
+        responseData ? JSON.stringify(responseData) : null, id
+      )
+    } else {
+      await db.$executeRawUnsafe(
+        'UPDATE "_pending_mutations" SET status = \'completed\' WHERE id = ?', id
+      )
+    }
   } catch (e) {
     console.error('[LocalAPI] Failed to mark mutation completed:', e.message)
   }
 }
 
+// --- Part R/S: failure classification + bounded exponential backoff ------
+
+/** HTTP statuses that can NEVER succeed by retrying. */
+const PERMANENT_HTTP_STATUSES = new Set([400, 401, 403, 404, 405, 410, 422])
+/** Transient statuses that MUST be retried (spec Part R). */
+const RETRYABLE_HTTP_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504])
+
 /**
- * Mark a mutation as failed (will be retried on next sync).
+ * Classify a replay failure: 'permanent' | 'transient'.
+ * Network-level errors (no HTTP status) are transient by definition — a
+ * dropped connection must never permanently silence a business operation.
  */
-async function markMutationFailed(id, error) {
+function classifyMutationFailure(httpStatus, errorMessage) {
+  const msg = String(errorMessage || '')
+  if (httpStatus === undefined || httpStatus === null || httpStatus === 0) {
+    return /validation|malformed|schema/i.test(msg) ? 'permanent' : 'transient'
+  }
+  if (RETRYABLE_HTTP_STATUSES.has(httpStatus)) return 'transient'
+  if (PERMANENT_HTTP_STATUSES.has(httpStatus)) return 'permanent'
+  if (httpStatus >= 500) return 'transient'
+  return 'transient' // unknown 4xx — retryable rather than data loss
+}
+
+/** Bounded exponential backoff with jitter: 15s * 2^n, capped at 15 min. */
+function computeRetryBackoffMs(attempts) {
+  const base = 15000 * Math.pow(2, Math.max(0, attempts - 1))
+  const capped = Math.min(base, 15 * 60 * 1000)
+  const jitter = capped * (0.15 * Math.random())
+  return Math.round(capped + jitter)
+}
+
+/**
+ * Mark a mutation as 'sending' before the replay fetch (crash-safe in-flight
+ * marker). The boot sweep returns stale 'sending' rows (>10 min) to 'pending'.
+ */
+async function markMutationSending(id) {
   if (!db) return
   try {
     await db.$executeRawUnsafe(
-      'UPDATE "_pending_mutations" SET status = \'failed\', attempts = attempts + 1, last_attempt_at = ?, last_error = ? WHERE id = ? AND attempts < max_attempts',
-      Date.now(),
-      String(error || '').substring(0, 500),
-      id
-    )
-    // If max attempts reached, mark as permanently failed
-    await db.$executeRawUnsafe(
-      'UPDATE "_pending_mutations" SET status = \'abandoned\' WHERE id = ? AND attempts >= max_attempts', id
+      'UPDATE "_pending_mutations" SET status = \'sending\', "last_attempt_at" = ? WHERE id = ?',
+      Date.now(), id
     )
   } catch (e) {
+    console.error('[LocalAPI] Failed to mark mutation sending:', e.message)
+  }
+}
+
+/**
+ * Mark a mutation failed with Part R/S semantics:
+ *   transient (network/timeout/5xx/429) -> status='retry' + exponential
+ *     backoff with jitter - retried INDEFINITELY (never abandoned;
+ *     bounded backoff keeps it visible and eligible forever).
+ *   permanent (400/401/403/404/422/malformed) -> status='permanent_failed'
+ *     - surfaced loudly; requires remediation/reconciliation.
+ */
+async function markMutationFailed(id, error, httpStatus) {
+  if (!db) return
+  try {
+    const verdict = classifyMutationFailure(httpStatus, error)
+    const now = Date.now()
+    if (verdict === 'permanent') {
+      await db.$executeRawUnsafe(
+        'UPDATE "_pending_mutations" SET status = \'permanent_failed\', attempts = attempts + 1, "last_attempt_at" = ?, "last_http_status" = ?, "last_error" = ?, "next_retry_at" = NULL WHERE id = ?',
+        now, httpStatus ?? null, String(error || '').substring(0, 500), id
+      )
+      console.error('[LocalAPI] Outbox mutation PERMANENTLY FAILED (needs attention - not retried):', id, httpStatus || '', String(error || '').substring(0, 160))
+      emitEvent('mutation:permanent-failure', { id, httpStatus: httpStatus ?? null, error: String(error || '').substring(0, 200) })
+    } else {
+      const row = await db.$queryRawUnsafe('SELECT attempts FROM "_pending_mutations" WHERE id = ?', id)
+      const attempts = Number(row?.[0]?.attempts || 0) + 1
+      const nextRetryAt = now + computeRetryBackoffMs(attempts)
+      await db.$executeRawUnsafe(
+        'UPDATE "_pending_mutations" SET status = \'retry\', attempts = ?, "last_attempt_at" = ?, "last_http_status" = ?, "last_error" = ?, "next_retry_at" = ? WHERE id = ?',
+        attempts, now, httpStatus ?? null, String(error || '').substring(0, 500), nextRetryAt, id
+      )
+      console.warn('[LocalAPI] Outbox mutation failed (transient) - retry', attempts, 'scheduled in', Math.round((nextRetryAt - now) / 1000) + 's:', String(error || '').substring(0, 120))
+    }
+  } catch (e) {
     console.error('[LocalAPI] Failed to mark mutation failed:', e.message)
+  }
+}
+
+/**
+ * Mark a mutation as conflicted (cloud rejected with a conflict verdict) -
+ * kept OUT of the retry pool; surfaced via _sync_conflicts reconciliation.
+ */
+async function markMutationConflict(id, error) {
+  if (!db) return
+  try {
+    await db.$executeRawUnsafe(
+      'UPDATE "_pending_mutations" SET status = \'conflict\', attempts = attempts + 1, "last_attempt_at" = ?, "last_error" = ? WHERE id = ?',
+      Date.now(), String(error || '').substring(0, 500), id
+    )
+    console.warn('[LocalAPI] Outbox mutation CONFLICT - needs reconciliation:', id)
+  } catch (e) {
+    console.error('[LocalAPI] Failed to mark mutation conflict:', e.message)
   }
 }
 
@@ -965,15 +1192,36 @@ function createApp() {
 
       const agency = await db.agency.findUnique({ where: { id: agencyId } })
       if (!agency) {
-        // Agency record not yet synced to local DB.
-        // Return a minimal profile using sessionUser data so the dashboard
-        // doesn't break. The profile will be fully populated after sync.
-        console.log(`[LocalAPI] Agency ${agencyId} not in local DB, returning session-based fallback`)
+        // Problem 6 (review): a session-based fallback must NEVER masquerade
+        // as a valid workspace. Session exists ≠ agency workspace initialized.
+        //   - pre-READY: fallback is legitimate bootstrap (data not imported
+        //     yet) — but flagged so the frontend knows.
+        //   - READY + missing Agency row: LOCAL DATA CORRUPTION / INCOMPLETE
+        //     WORKSPACE — reported as an error, never as a working profile.
+        let workspaceStatus = null
+        try {
+          const state = await db.agencyLocalState.findFirst({ where: { agencyId }, select: { initializationStatus: true } })
+          workspaceStatus = state?.initializationStatus || null
+        } catch { /* state table may not exist on ancient DBs */ }
+
+        if (workspaceStatus === 'READY') {
+          console.error(`[LocalAPI] CORRUPTION/INCOMPLETE WORKSPACE: status is READY but Agency ${agencyId} is missing locally — refusing the session-based fallback`)
+          return c.json({
+            success: false,
+            error: 'Local workspace incomplete: READY but agency record missing — re-run initial sync (Settings → Sync recovery) or re-login while online',
+            code: 'LOCAL_WORKSPACE_INCOMPLETE',
+            agencyId,
+            initializationStatus: workspaceStatus,
+          }, 412)
+        }
+        console.log(`[LocalAPI] Agency ${agencyId} not in local DB, returning session-based fallback (workspace status: ${workspaceStatus || 'unknown'} — pre-READY bootstrap)`)
         return c.json({
           id: agencyId,
           name: sessionUser.agencyName || sessionUser.name || 'Unknown Agency',
           _partial: true,
           _reason: 'Agency not yet synced to local database',
+          _workspaceInitialized: false,
+          _workspaceStatus: workspaceStatus,
         })
       }
 
@@ -1088,13 +1336,18 @@ function createApp() {
         return c.json({ success: false, error: 'No valid fields to update' }, 400)
       }
 
-      const updated = await db.agency.update({
-        where: { id: agencyId },
-        data: updateData,
+      // Part Q: business write + outbox row commit atomically — a crash can
+      // no longer produce an agency update the cloud never learns about.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.agency.update({
+          where: { id: agencyId },
+          data: updateData,
+        })
+        await logPendingMutation('PUT', '/api/agency/profile', body, row, { tx })
+        return row
       })
 
       emitEvent('agency:updated', { agencyId, ...updateData })
-      logPendingMutation('PUT', '/api/agency/profile', body, updated).catch(() => {})
 
       return c.json({ success: true, data: updated })
     } catch (error) {
@@ -1122,24 +1375,27 @@ function createApp() {
       const qs = await db.queueSettings.findFirst({ where: { agencyId } })
       const isPaused = !newStatus
 
-      if (qs) {
-        await db.queueSettings.update({
-          where: { id: qs.id },
-          data: { isPaused },
-        })
-      } else {
-        await db.queueSettings.create({
-          data: {
-            agencyId,
-            isPaused,
-            lastIssuedNumber: 0,
-            currentServingNumber: 0,
-          },
-        })
-      }
+      // Part Q: settings write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        if (qs) {
+          await tx.queueSettings.update({
+            where: { id: qs.id },
+            data: { isPaused },
+          })
+        } else {
+          await tx.queueSettings.create({
+            data: {
+              agencyId,
+              isPaused,
+              lastIssuedNumber: 0,
+              currentServingNumber: 0,
+            },
+          })
+        }
+        await logPendingMutation('PATCH', '/api/agency/queue-status', body, { queueOpen: !isPaused }, { tx })
+      })
 
       emitEvent('agency:queue-status', { agencyId, queueOpen: !isPaused })
-      logPendingMutation('PATCH', '/api/agency/queue-status', body, { queueOpen: !isPaused }).catch(() => {})
 
       return c.json({
         success: true,
@@ -1190,19 +1446,23 @@ function createApp() {
         return c.json({ success: false, error: 'Service name is required' }, 400)
       }
 
-      const service = await db.service.create({
-        data: {
-          agencyId,
-          name,
-          prefix: prefix || name.charAt(0).toUpperCase(),
-          // estimatedDuration: removed — not a Service schema field
-          description: description || null,
-          isActive: true,
-        },
+      // Part Q: business write + outbox row commit atomically.
+      const service = await withOutboxTransaction(async (tx) => {
+        const created = await tx.service.create({
+          data: {
+            agencyId,
+            name,
+            prefix: prefix || name.charAt(0).toUpperCase(),
+            // estimatedDuration: removed — not a Service schema field
+            description: description || null,
+            isActive: true,
+          },
+        })
+        await logPendingMutation('POST', '/api/services', body, created, { tx })
+        return created
       })
 
       emitEvent('service:created', { agencyId, service })
-      logPendingMutation('POST', '/api/services', body, service).catch(() => {})
 
       return c.json({ success: true, data: service }, 201)
     } catch (error) {
@@ -1236,10 +1496,14 @@ function createApp() {
         }
       }
 
-      const updated = await db.service.update({ where: { id }, data: updateData })
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.service.update({ where: { id }, data: updateData })
+        await logDeterministicOutcome('Service', id, 'update', row, null, { tx })
+        return row
+      })
 
       emitEvent('service:updated', { agencyId, serviceId: id, ...updateData })
-      logPendingMutation('PUT', '/api/services/:id', body, updated).catch(() => {})
 
       return c.json({ success: true, data: updated })
     } catch (error) {
@@ -1264,13 +1528,16 @@ function createApp() {
         return c.json({ success: false, error: 'Service not found' }, 404)
       }
 
-      await db.service.update({
-        where: { id },
-        data: { isActive: false },
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.service.update({
+          where: { id },
+          data: { isActive: false },
+        })
+        await logDeterministicOutcome('Service', id, 'delete', {}, null, { tx })
       })
 
       emitEvent('service:deleted', { agencyId, serviceId: id })
-      logPendingMutation('DELETE', '/api/services/:id', {}, { id, deleted: true }).catch(() => {})
 
       return c.json({ success: true, data: { id, deleted: true } })
     } catch (error) {
@@ -1318,18 +1585,22 @@ function createApp() {
         return c.json({ success: false, error: 'Branch name is required' }, 400)
       }
 
-      const branch = await db.branch.create({
-        data: {
-          agencyId,
-          name,
-          address: address || null,
-          phone: phone || null,
-          isActive: isActive !== undefined ? Boolean(isActive) : true,
-        },
+      // Part Q: business write + outbox row commit atomically.
+      const branch = await withOutboxTransaction(async (tx) => {
+        const created = await tx.branch.create({
+          data: {
+            agencyId,
+            name,
+            address: address || null,
+            phone: phone || null,
+            isActive: isActive !== undefined ? Boolean(isActive) : true,
+          },
+        })
+        await logPendingMutation('POST', '/api/agency/branches', body, created, { tx })
+        return created
       })
 
       emitEvent('branch:created', { agencyId, branch })
-      logPendingMutation('POST', '/api/agency/branches', body, branch).catch(() => {})
 
       return c.json({ success: true, data: branch }, 201)
     } catch (error) {
@@ -1365,18 +1636,22 @@ function createApp() {
           }
         }
 
-        // If setting as main, unset other main branches
-        if (updateData.isMain) {
-          await db.branch.updateMany({
-            where: { agencyId, isMain: true },
-            data: { isMain: false },
-          })
-        }
-
-        const updated = await db.branch.update({ where: { id }, data: updateData })
+        // Part Q: every write below (including the isMain sweep) + the outbox
+        // row commit atomically — a crash cannot half-apply a main-branch flip.
+        const updated = await withOutboxTransaction(async (tx) => {
+          // If setting as main, unset other main branches
+          if (updateData.isMain) {
+            await tx.branch.updateMany({
+              where: { agencyId, isMain: true },
+              data: { isMain: false },
+            })
+          }
+          const row = await tx.branch.update({ where: { id }, data: updateData })
+          await logDeterministicOutcome('Branch', id, 'update', row, null, { tx })
+          return row
+        })
 
         emitEvent('branch:updated', { agencyId, branchId: id, ...updateData })
-        logPendingMutation(method.toUpperCase(), '/api/agency/branches/:id', body, updated).catch(() => {})
 
         return c.json({ success: true, data: updated })
       } catch (error) {
@@ -1398,10 +1673,13 @@ function createApp() {
       if (!existing || existing.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Branch not found' }, 404)
       }
-      // Soft delete: set isActive = false
-      const updated = await db.branch.update({ where: { id }, data: { isActive: false } })
+      // Soft delete: set isActive = false — Part Q: atomic with the outbox row.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.branch.update({ where: { id }, data: { isActive: false } })
+        await logDeterministicOutcome('Branch', id, 'delete', {}, null, { tx })
+        return row
+      })
       emitEvent('branch:deleted', { agencyId, branchId: id })
-      logPendingMutation('DELETE', '/api/agency/branches/:id', {}, { id }).catch(() => {})
       return c.json({ success: true, data: updated })
     } catch (error) {
       console.error('[LocalAPI] Delete branch error:', error)
@@ -1460,18 +1738,22 @@ function createApp() {
         return c.json({ success: false, error: 'Counter number is required' }, 400)
       }
 
-      const counter = await db.counter.create({
-        data: {
-          // agencyId removed — Counter has no direct agencyId, only branchId
-          name: name || `Counter ${number}`,
-          number,
-          branchId: branchId || null,
-          isActive: isActive !== undefined ? Boolean(isActive) : true,
-        },
+      // Part Q: business write + outbox row commit atomically.
+      const counter = await withOutboxTransaction(async (tx) => {
+        const created = await tx.counter.create({
+          data: {
+            // agencyId removed — Counter has no direct agencyId, only branchId
+            name: name || `Counter ${number}`,
+            number,
+            branchId: branchId || null,
+            isActive: isActive !== undefined ? Boolean(isActive) : true,
+          },
+        })
+        await logPendingMutation('POST', '/api/agency/counters', body, created, { tx })
+        return created
       })
 
       emitEvent('counter:created', { agencyId, counter })
-      logPendingMutation('POST', '/api/agency/counters', body, counter).catch(() => {})
 
       return c.json({ success: true, data: counter }, 201)
     } catch (error) {
@@ -1511,10 +1793,14 @@ function createApp() {
         }
       }
 
-      const updated = await db.counter.update({ where: { id }, data: updateData })
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.counter.update({ where: { id }, data: updateData })
+        await logDeterministicOutcome('Counter', id, 'update', row, null, { tx })
+        return row
+      })
 
       emitEvent('counter:updated', { agencyId, counterId: id, ...updateData })
-      logPendingMutation('PUT', '/api/agency/counters/:id', body, updated).catch(() => {})
 
       return c.json({ success: true, data: updated })
     } catch (error) {
@@ -1577,9 +1863,13 @@ function createApp() {
         for (const field of allowedFields) {
           if (body[field] !== undefined) updateData[field] = body[field]
         }
-        const updated = await db.counter.update({ where: { id: counterId }, data: updateData })
+        // Part Q: business write + outbox row commit atomically.
+        const updated = await withOutboxTransaction(async (tx) => {
+          const row = await tx.counter.update({ where: { id: counterId }, data: updateData })
+          await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+          return row
+        })
         emitEvent('counter:updated', { agencyId, counterId, ...updateData })
-        logPendingMutation(method.toUpperCase(), '/api/agency/branches/:branchId/counters/:counterId', body, updated).catch(() => {})
         return c.json({ success: true, data: updated })
       } catch (error) {
         console.error('[LocalAPI] Update branch counter error:', error)
@@ -1598,9 +1888,12 @@ function createApp() {
       if (!existing || existing.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Counter not found' }, 404)
       }
-      await db.counter.delete({ where: { id: counterId } })
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.counter.delete({ where: { id: counterId } })
+        await logDeterministicOutcome('Counter', counterId, 'delete', {}, null, { tx })
+      })
       emitEvent('counter:deleted', { agencyId, counterId })
-      logPendingMutation('DELETE', '/api/agency/branches/:branchId/counters/:counterId', {}, { id: counterId }).catch(() => {})
       return c.json({ success: true, data: { id: counterId, deleted: true } })
     } catch (error) {
       console.error('[LocalAPI] Delete branch counter error:', error)
@@ -1722,43 +2015,52 @@ function createApp() {
         where: { agencyId, status: 'WAITING' },
       })
 
-      const reservation = await db.reservation.create({
-        data: {
-          agencyId,
-          serviceId,
-          // branchId: removed — Reservation has no branchId field
-          userId: userId || sessionUser.id,
-          queueNumber: newNumber,
-          displayNumber,
-          status: 'WAITING',
-        // position: removed — not a Reservation schema field
-          estimatedWait: estimatedWait || 0,
-          isWalkIn: !!isWalkIn,
-          walkInCustomerName: walkInCustomerName || null,
-          preferredTime: preferredTime || null,
-          fixedTimeEnabled: fixedTimeEnabled ? 1 : 0,
-        },
-      })
-
-      // Update queue settings
-      if (qs) {
-        await db.queueSettings.update({
-          where: { id: qs.id },
-          data: { lastIssuedNumber: newNumber },
-        })
-      } else {
-        await db.queueSettings.create({
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const created = await tx.reservation.create({
           data: {
             agencyId,
-            lastIssuedNumber: newNumber,
-            currentServingNumber: 0,
-            isPaused: false,
+            serviceId,
+            // branchId: removed — Reservation has no branchId field
+            userId: userId || sessionUser.id,
+            queueNumber: newNumber,
+            displayNumber,
+            status: 'WAITING',
+          // position: removed — not a Reservation schema field
+            estimatedWait: estimatedWait || 0,
+            isWalkIn: !!isWalkIn,
+            walkInCustomerName: walkInCustomerName || null,
+            preferredTime: preferredTime || null,
+            // Prisma 6 rejects Int 0/1 for Boolean fields (field-discovered by
+            // Task-15 live repro — the old `? 1 : 0` 500'd every create).
+            fixedTimeEnabled: !!fixedTimeEnabled,
           },
         })
-      }
+
+        // Update queue settings (same transaction — the counter and the
+        // ticket must commit or roll back together)
+        if (qs) {
+          await tx.queueSettings.update({
+            where: { id: qs.id },
+            data: { lastIssuedNumber: newNumber },
+          })
+        } else {
+          await tx.queueSettings.create({
+            data: {
+              agencyId,
+              lastIssuedNumber: newNumber,
+              currentServingNumber: 0,
+              isPaused: false,
+            },
+          })
+        }
+
+        // Part Q: the outbox row commits ATOMICALLY with the ticket — a crash
+        // can no longer produce an issued ticket the cloud never learns about.
+        await logPendingMutation('POST', '/api/reservations', body, created, { tx })
+        return created
+      })
 
       emitEvent('reservation:created', { agencyId, reservation })
-      logPendingMutation('POST', '/api/reservations', body, reservation).catch(() => {})
 
       return c.json({ success: true, data: reservation }, 201)
     } catch (error) {
@@ -1801,13 +2103,17 @@ function createApp() {
         return c.json({ success: false, error: 'No valid fields to update' }, 400)
       }
 
-      const updated = await db.reservation.update({
-        where: { id },
-        data: updateData,
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: updateData,
+        })
+        // Part Q: outbox row is atomic with the business write.
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
       })
 
       emitEvent('reservation:updated', { agencyId, reservationId: id, ...updateData })
-      logPendingMutation('PUT', '/api/reservations/:id', body, updated).catch(() => {})
 
       return c.json({ success: true, data: updated })
     } catch (error) {
@@ -1907,25 +2213,33 @@ function createApp() {
 
       const now = new Date()
 
-      // Call the customer
-      await db.reservation.update({
-        where: { id: next.id },
-        data: {
-          status: 'CALLED',
-          calledAt: now,
-          // calledBy: removed — not a Reservation schema field
-          counterId: counterId || null,
-        },
-      })
-
-      // Update current serving number in queue settings
-      const qs = await db.queueSettings.findFirst({ where: { agencyId } })
-      if (qs) {
-        await db.queueSettings.update({
-          where: { id: qs.id },
-          data: { currentServingNumber: next.queueNumber },
+      // P1-5 (Part Q): the CALLED flip, the serving-number advance and the
+      // outbox row commit as ONE transaction — a crash mid-call can never
+      // leave the ticket called locally while the cloud believes it WAITING.
+      const updated = await withOutboxTransaction(async (tx) => {
+        await tx.reservation.update({
+          where: { id: next.id },
+          data: {
+            status: 'CALLED',
+            calledAt: now,
+            // calledBy: removed — not a Reservation schema field
+            counterId: counterId || null,
+          },
         })
-      }
+
+        // Update current serving number in queue settings
+        const qsTx = await tx.queueSettings.findFirst({ where: { agencyId } })
+        if (qsTx) {
+          await tx.queueSettings.update({
+            where: { id: qsTx.id },
+            data: { currentServingNumber: next.queueNumber },
+          })
+        }
+
+        const row = await tx.reservation.findUnique({ where: { id: next.id } })
+        await logDeterministicOutcome('Reservation', row && row.id, 'update', row, null, { tx })
+        return row
+      })
 
       // Update positions of remaining waiting reservations
       const remainingWaiting = await db.reservation.findMany({
@@ -1934,10 +2248,7 @@ function createApp() {
       })
       // position reassignment loop removed — position is not a schema field
 
-      const updated = await db.reservation.findUnique({ where: { id: next.id } })
-
       emitEvent('queue:called', { agencyId, reservation: updated })
-      logPendingMutation('POST', '/api/queue/call-next', body, updated).catch(() => {})
 
       return c.json({ success: true, data: updated })
     } catch (error) {
@@ -1971,20 +2282,22 @@ function createApp() {
       }
 
       const now = new Date()
-      await db.reservation.update({
-        where: { id },
-        data: {
-          status: 'CALLED',
-          calledAt: now,
-          // calledBy: removed — not a Reservation schema field
-          counterId: counterId || null,
-        },
+      const updated = await withOutboxTransaction(async (tx) => {
+        await tx.reservation.update({
+          where: { id },
+          data: {
+            status: 'CALLED',
+            calledAt: now,
+            // calledBy: removed — not a Reservation schema field
+            counterId: counterId || null,
+          },
+        })
+        const row = await tx.reservation.findUnique({ where: { id } })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
       })
 
-      const updated = await db.reservation.findUnique({ where: { id } })
-
       emitEvent('queue:called', { agencyId, reservation: updated })
-      logPendingMutation('POST', '/api/queue/call/:id', body, updated).catch(() => {})
 
       return c.json({ success: true, data: updated })
     } catch (error) {
@@ -2009,13 +2322,17 @@ function createApp() {
       }
 
       const now = new Date()
-      const reservation = await db.reservation.update({
-        where: { id },
-        data: {
-          status: 'COMPLETED',
-          completedAt: now,
-          // completedBy: removed — not a Reservation schema field
-        },
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: {
+            status: 'COMPLETED',
+            completedAt: now,
+            // completedBy: removed — not a Reservation schema field
+          },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
       })
 
       // Update positions of remaining waiting
@@ -2026,7 +2343,6 @@ function createApp() {
       // position reassignment loop removed — position is not a schema field
 
       emitEvent('queue:completed', { agencyId, reservation })
-      logPendingMutation('POST', '/api/queue/complete/:id', {}, reservation).catch(() => {})
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -2051,12 +2367,16 @@ function createApp() {
       }
 
       const now = new Date()
-      const reservation = await db.reservation.update({
-        where: { id },
-        data: {
-          status: 'NO_SHOW',
-          skippedAt: now,
-        },
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: {
+            status: 'NO_SHOW',
+            skippedAt: now,
+          },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
       })
 
       // Update positions
@@ -2067,7 +2387,6 @@ function createApp() {
       // position reassignment loop removed — position is not a schema field
 
       emitEvent('queue:no-show', { agencyId, reservation })
-      logPendingMutation('POST', '/api/queue/no-show/:id', {}, reservation).catch(() => {})
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -2092,13 +2411,17 @@ function createApp() {
       }
 
       const now = new Date()
-      const reservation = await db.reservation.update({
-        where: { id },
-        data: {
-          status: 'CANCELLED',
-          cancelledAt: now,
-          // cancelledBy: removed — not a Reservation schema field
-        },
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: {
+            status: 'CANCELLED',
+            cancelledAt: now,
+            // cancelledBy: removed — not a Reservation schema field
+          },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
       })
 
       // Update positions
@@ -2109,7 +2432,6 @@ function createApp() {
       // position reassignment loop removed — position is not a schema field
 
       emitEvent('queue:cancelled', { agencyId, reservation })
-      logPendingMutation('POST', '/api/queue/cancel/:id', {}, reservation).catch(() => {})
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -2141,12 +2463,16 @@ function createApp() {
       }
 
       const now = new Date()
-      const reservation = await db.reservation.update({
-        where: { id },
-        data: {
-          status: 'POSTPONED',
-          // postponedAt: removed — not a Reservation schema field
-        },
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: {
+            status: 'POSTPONED',
+            // postponedAt: removed — not a Reservation schema field
+          },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
       })
 
       // Update positions
@@ -2157,7 +2483,6 @@ function createApp() {
       // position reassignment loop removed — position is not a schema field
 
       emitEvent('queue:postponed', { agencyId, reservation })
-      logPendingMutation('POST', '/api/queue/postpone/:id', {}, reservation).catch(() => {})
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -2189,15 +2514,18 @@ function createApp() {
       }
 
       const now = new Date()
-      const reservation = await db.reservation.update({
-        where: { id },
-        data: {
-          calledAt: now,
-        },
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: {
+            calledAt: now,
+          },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
       })
 
       emitEvent('queue:recalled', { agencyId, reservation })
-      logPendingMutation('POST', '/api/queue/recall/:id', {}, reservation).catch(() => {})
 
       return c.json({ success: true, data: reservation })
     } catch (error) {
@@ -2239,15 +2567,16 @@ function createApp() {
     try {
       const user = sessionUser
 
-      await db.notification.updateMany({
-        where: { userId: user.id, isRead: false },
-        data: { isRead: true },
-      })
-
-      // v2 outbox: read-state is a business mutation → replay to the cloud.
+      // Part Q: read-state sweep + outbox row commit atomically.
       // Logged with method PUT + the CLOUD path (cloud route is
       // PUT /api/notifications/read-all) so the replay hits the live route.
-      logPendingMutation('PUT', '/api/notifications/read-all', {}, { success: true }).catch(() => {})
+      await withOutboxTransaction(async (tx) => {
+        await tx.notification.updateMany({
+          where: { userId: user.id, isRead: false },
+          data: { isRead: true },
+        })
+        await logPendingMutation('PUT', '/api/notifications/read-all', {}, { success: true }, { tx })
+      })
 
       emitEvent('notifications:read-all', { userId: user.id })
 
@@ -2276,9 +2605,16 @@ function createApp() {
           updateData.isRead = body.isRead ? true : false
         }
 
-        const updated = await db.notification.update({
-          where: { id },
-          data: updateData,
+        // Part Q: read-state is a business mutation — write + deterministic
+        // outbox outcome atomically (this route previously had NO outbox at
+        // all: an offline mark-read never reached the cloud or other devices).
+        const updated = await withOutboxTransaction(async (tx) => {
+          const row = await tx.notification.update({
+            where: { id },
+            data: updateData,
+          })
+          await logDeterministicOutcome('Notification', id, 'update', row, null, { tx })
+          return row
         })
 
         return c.json({ success: true, data: updated })
@@ -2297,7 +2633,12 @@ function createApp() {
       if (!existing || existing.userId !== sessionUser.id) {
         return c.json({ success: false, error: 'Notification not found' }, 404)
       }
-      await db.notification.delete({ where: { id } })
+      // Part Q: delete + deterministic outbox outcome atomically (previously
+      // NO outbox — an offline notification delete never reached the cloud).
+      await withOutboxTransaction(async (tx) => {
+        await tx.notification.delete({ where: { id } })
+        await logDeterministicOutcome('Notification', id, 'delete', {}, null, { tx })
+      })
       return c.json({ success: true, data: { deleted: true } })
     } catch (error) {
       console.error('[LocalAPI] Delete notification error:', error)
@@ -2346,9 +2687,16 @@ function createApp() {
         return c.json({ success: false, error: 'No valid fields to update' }, 400)
       }
 
-      const updated = await db.user.update({
-        where: { id: user.id },
-        data: updateData,
+      // Part Q: business write + outbox row commit atomically. Session-user
+      // mirroring stays outside the tx — it touches no database rows.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.user.update({
+          where: { id: user.id },
+          data: updateData,
+        })
+        const { passwordHash: _omit, ...safeRow } = row
+        await logPendingMutation('PUT', '/api/user/profile', body, safeRow, { tx })
+        return row
       })
 
       // Update session user if name/language/avatar changed
@@ -2359,7 +2707,6 @@ function createApp() {
       const { passwordHash, ...safeUser } = updated
 
       emitEvent('user:updated', { userId: user.id, ...updateData })
-      logPendingMutation('PUT', '/api/user/profile', body, safeUser).catch(() => {})
 
       return c.json({ success: true, data: safeUser })
     } catch (error) {
@@ -2497,11 +2844,17 @@ function createApp() {
         updateData.status = 'CALLED'
       }
 
-      await db.reservation.update({ where: { id: reservationId }, data: updateData })
+      const updatedReservation = await withOutboxTransaction(async (tx) => {
+        await tx.reservation.update({ where: { id: reservationId }, data: updateData })
+        // Part Q: outcome row is atomic with the state flip. The logged
+        // outcome merges the pre-read with the intended delta (deterministic
+        // desired-state replay per Part V).
+        await logDeterministicOutcome('Reservation', reservationId, 'update', { ...reservation, ...updateData }, null, { tx })
+        return { ...reservation, ...updateData }
+      })
 
       emitEvent('queue:updated', { reservationId, action, ...updateData })
-      logPendingMutation('PATCH', '/api/agency/queue/:id', body, updateData).catch(() => {})
-      return c.json({ success: true, reservation: { ...reservation, ...updateData } })
+      return c.json({ success: true, reservation: updatedReservation })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/:id PATCH error:', error)
       return c.json({ success: false, error: 'Failed to update reservation' }, 500)
@@ -2598,19 +2951,23 @@ function createApp() {
       const body = await c.req.json()
       const { name, nameAr, nameFr, prefix, avgServiceTime } = body
       if (!name) return c.json({ success: false, error: 'Service name is required' }, 400)
-      const service = await db.service.create({
-        data: {
-          agencyId,
-          name,
-          nameAr: nameAr || null,
-          nameFr: nameFr || null,
-          prefix: prefix || null,
-          averageServiceTime: avgServiceTime ? Number(avgServiceTime) : 10,
-          isActive: true,
-        },
+      // Part Q: business write + outbox row commit atomically.
+      const service = await withOutboxTransaction(async (tx) => {
+        const created = await tx.service.create({
+          data: {
+            agencyId,
+            name,
+            nameAr: nameAr || null,
+            nameFr: nameFr || null,
+            prefix: prefix || null,
+            averageServiceTime: avgServiceTime ? Number(avgServiceTime) : 10,
+            isActive: true,
+          },
+        })
+        await logPendingMutation('POST', '/api/agency/services', body, created, { tx })
+        return created
       })
       emitEvent('service:created', { agencyId, service })
-      logPendingMutation('POST', '/api/agency/services', body, service).catch(() => {})
       return c.json({ success: true, data: service }, 201)
     } catch (error) {
       console.error('[LocalAPI] Create service error:', error)
@@ -2660,13 +3017,19 @@ function createApp() {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
       const existing = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
-      if (existing) {
-        await db.queueSettings.update({ where: { id: existing.id }, data: { isPaused: true, pausedAt: new Date() } })
-      } else {
-        await db.queueSettings.create({ data: { agencyId, isPaused: true, pausedAt: new Date() } })
-      }
+      // Part V: replayed as the DESIRED STATE (isPaused=true), not an action.
+      // Part Q: state change + outbox row commit atomically.
+      const qsOutcome = await withOutboxTransaction(async (tx) => {
+        let row = null
+        if (existing) {
+          row = await tx.queueSettings.update({ where: { id: existing.id }, data: { isPaused: true, pausedAt: new Date() } })
+        } else {
+          row = await tx.queueSettings.create({ data: { agencyId, isPaused: true, pausedAt: new Date() } })
+        }
+        await logDeterministicOutcome('QueueSettings', row && row.id, 'update', row, null, { tx })
+        return row
+      })
       emitEvent('queue:paused', {})
-      logPendingMutation('POST', '/api/queue/pause', {}, { isPaused: true }).catch(() => {})
       return c.json({ success: true, isPaused: true })
     } catch (error) {
       console.error('[LocalAPI] /api/queue/pause error:', error)
@@ -2680,11 +3043,17 @@ function createApp() {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
       const existing = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      // Part V: replayed as the DESIRED STATE (isPaused=false), not an action.
+      // Part Q: state change + outbox row commit atomically.
+      let qsOutcome = null
       if (existing) {
-        await db.queueSettings.update({ where: { id: existing.id }, data: { isPaused: false, pausedAt: null } })
+        qsOutcome = await withOutboxTransaction(async (tx) => {
+          const row = await tx.queueSettings.update({ where: { id: existing.id }, data: { isPaused: false, pausedAt: null } })
+          await logDeterministicOutcome('QueueSettings', row && row.id, 'update', row, null, { tx })
+          return row
+        })
       }
       emitEvent('queue:resumed', {})
-      logPendingMutation('POST', '/api/queue/resume', {}, { isPaused: false }).catch(() => {})
       return c.json({ success: true, isPaused: false })
     } catch (error) {
       console.error('[LocalAPI] /api/queue/resume error:', error)
@@ -2702,18 +3071,25 @@ function createApp() {
       const existing = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
       const currentPaused = existing ? (existing.isPaused === 1 || existing.isPaused === true) : false
       const now = new Date()
-      if (existing) {
-        await db.queueSettings.update({
-          where: { id: existing.id },
-          data: { isPaused: !currentPaused, pausedAt: !currentPaused ? now : null },
-        })
-      } else {
-        await db.queueSettings.create({
-          data: { agencyId, isPaused: true, pausedAt: now },
-        })
-      }
+      // Part V: the replayed mutation expresses the DESIRED STATE (paused=true/false),
+      // never a toggle instruction whose effect depends on remote state.
+      // Part Q: state change + outbox row commit atomically.
+      const qsOutcome = await withOutboxTransaction(async (tx) => {
+        let row = null
+        if (existing) {
+          row = await tx.queueSettings.update({
+            where: { id: existing.id },
+            data: { isPaused: !currentPaused, pausedAt: !currentPaused ? now : null },
+          })
+        } else {
+          row = await tx.queueSettings.create({
+            data: { agencyId, isPaused: true, pausedAt: now },
+          })
+        }
+        await logDeterministicOutcome('QueueSettings', row && row.id, 'update', row, null, { tx })
+        return row
+      })
       emitEvent('queue:pause-toggled', { isPaused: !currentPaused })
-      logPendingMutation('POST', '/api/agency/queue/toggle-pause', {}, { isPaused: !currentPaused }).catch(() => {})
       return c.json({ success: true, isPaused: !currentPaused })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/toggle-pause error:', error)
@@ -2743,25 +3119,29 @@ function createApp() {
       })
       const queueNumber = `${prefix}${String(todayCount + 1).padStart(3, '0')}`
 
-      const reservation = await db.reservation.create({
-        data: {
-          id: require('crypto').randomUUID(),
-          agencyId,
-          serviceId,
-          userId: sessionUser.id,
-          queueNumber,
-          displayNumber: queueNumber,
-          status: 'WAITING',
-          customerName,
-          walkInCustomerName: customerName,
-          isWalkIn: true,
-          joinedAt: now,
-          estimatedWait: 0,
-        },
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const created = await tx.reservation.create({
+          data: {
+            id: require('crypto').randomUUID(),
+            agencyId,
+            serviceId,
+            userId: sessionUser.id,
+            queueNumber,
+            displayNumber: queueNumber,
+            status: 'WAITING',
+            customerName,
+            walkInCustomerName: customerName,
+            isWalkIn: true,
+            joinedAt: now,
+            estimatedWait: 0,
+          },
+        })
+        // Part Q: the outbox row commits ATOMICALLY with the walk-in ticket.
+        await logPendingMutation('POST', '/api/agency/queue/walk-in', body, created, { tx })
+        return created
       })
 
       emitEvent('queue:walk-in', { reservation })
-      logPendingMutation('POST', '/api/agency/queue/walk-in', body, reservation).catch(() => {})
       return c.json({ success: true, reservation })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/walk-in error:', error)
@@ -3032,11 +3412,15 @@ function createApp() {
       // Check duplicate
       const existing = await db.counter.findFirst({ where: { branchId, number } })
       if (existing) return c.json({ success: false, error: 'Counter number already exists in this branch' }, 409)
-      const counter = await db.counter.create({
-        data: { number, name, nameAr: nameAr || null, nameFr: nameFr || null, branchId },
+      // Part Q: business write + outbox row commit atomically.
+      const counter = await withOutboxTransaction(async (tx) => {
+        const created = await tx.counter.create({
+          data: { number, name, nameAr: nameAr || null, nameFr: nameFr || null, branchId },
+        })
+        await logDeterministicOutcome('Counter', created && created.id, 'create', created, null, { tx })
+        return created
       })
       emitEvent('counter:created', { agencyId, counterId: counter.id, branchId })
-      logPendingMutation('POST', '/api/agency/branches/:id/counters', body, counter).catch(() => {})
       return c.json({ success: true, counter }, 201)
     } catch (error) {
       console.error('[LocalAPI] /api/agency/branches/:id/counters POST error:', error)
@@ -3061,9 +3445,13 @@ function createApp() {
       for (const field of allowedFields) {
         if (body[field] !== undefined) updateData[field] = body[field]
       }
-      const updated = await db.counter.update({ where: { id: counterId }, data: updateData })
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.counter.update({ where: { id: counterId }, data: updateData })
+        await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+        return row
+      })
       emitEvent('counter:updated', { agencyId, counterId, branchId })
-      logPendingMutation('PATCH', `/api/agency/branches/${branchId}/counters/${counterId}`, body, updated).catch(() => {})
       return c.json({ success: true, counter: updated })
     } catch (error) {
       console.error('[LocalAPI] PATCH counter error:', error)
@@ -3083,9 +3471,12 @@ function createApp() {
         if (body[field] !== undefined) updateData[field] = body[field]
       }
       if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields to update' }, 400)
-      await db.agency.update({ where: { id: agencyId }, data: updateData })
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.agency.update({ where: { id: agencyId }, data: updateData })
+        await logPendingMutation('PATCH', '/api/agency/profile', body, updateData, { tx })
+      })
       emitEvent('agency:updated', { agencyId, ...updateData })
-      logPendingMutation('PATCH', '/api/agency/profile', body, updateData).catch(() => {})
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] PATCH /api/agency/profile error:', error)
@@ -3132,9 +3523,12 @@ function createApp() {
       if (body.autoPauseWhenFull !== undefined) updateData.autoPauseWhenFull = Boolean(body.autoPauseWhenFull)
       if (body.kioskModeEnabled !== undefined) updateData.kioskModeEnabled = Boolean(body.kioskModeEnabled)
       if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields to update' }, 400)
-      const updated = await db.agency.update({ where: { id: agencyId }, data: updateData })
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        const row = await tx.agency.update({ where: { id: agencyId }, data: updateData })
+        await logPendingMutation('PATCH', '/api/agency/settings', body, row, { tx })
+      })
       emitEvent('agency:updated', { agencyId, action: 'settings-updated', ...updateData })
-      logPendingMutation('PATCH', '/api/agency/settings', body, updated).catch(() => {})
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] PATCH /api/agency/settings error:', error)
@@ -3158,12 +3552,17 @@ function createApp() {
         where: { userId_agencyId: { userId: user.id, agencyId: targetAgencyId } },
       })
       if (existing) return c.json({ error: 'Staff already exists in this agency' }, 409)
-      const staff = await db.agencyStaff.create({
-        data: { userId: user.id, agencyId: targetAgencyId, role: user.role === 'AGENCY_OWNER' ? 'OWNER' : 'STAFF' },
-        include: { user: { select: { id: true, username: true, fullName: true, role: true } } },
+      // Part Q: business write + outbox row commit atomically. The pre-reads
+      // (user lookup, duplicate check) stay outside — only writes join the tx.
+      const staff = await withOutboxTransaction(async (tx) => {
+        const created = await tx.agencyStaff.create({
+          data: { userId: user.id, agencyId: targetAgencyId, role: user.role === 'AGENCY_OWNER' ? 'OWNER' : 'STAFF' },
+          include: { user: { select: { id: true, username: true, fullName: true, role: true } } },
+        })
+        await logPendingMutation('POST', '/api/agency/staff', { username }, created, { tx })
+        return created
       })
       emitEvent('staff:updated', { agencyId: targetAgencyId, action: 'staff-added', staffId: staff.id })
-      logPendingMutation('POST', '/api/agency/staff', { username }, staff).catch(() => {})
       return c.json({ staff }, 201)
     } catch (error) {
       console.error('[LocalAPI] POST /api/agency/staff error:', error)
@@ -3183,9 +3582,12 @@ function createApp() {
       if (!staffMember) return c.json({ error: 'Staff member not found' }, 404)
       if (staffMember.agencyId !== queryAgencyId) return c.json({ error: 'Staff not in this agency' }, 403)
       if (staffMember.role === 'OWNER') return c.json({ error: 'Cannot remove agency owner' }, 403)
-      await db.agencyStaff.delete({ where: { id: staffId } })
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.agencyStaff.delete({ where: { id: staffId } })
+        await logPendingMutation('DELETE', '/api/agency/staff', { staffId }, null, { tx })
+      })
       emitEvent('staff:updated', { agencyId: queryAgencyId, action: 'staff-removed', staffId })
-      logPendingMutation('DELETE', '/api/agency/staff', { staffId }, null).catch(() => {})
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] DELETE /api/agency/staff error:', error)
@@ -3208,32 +3610,38 @@ function createApp() {
       if (staffMember.agencyId !== agencyId) return c.json({ error: 'Not your agency' }, 403)
       if (staffMember.role === 'OWNER') return c.json({ error: 'Cannot modify owner' }, 403)
       const { fullName, role, isActive, permissions } = body
-      // Update user fullName
-      if (fullName !== undefined && fullName.trim()) {
-        await db.user.update({ where: { id: staffMember.userId }, data: { fullName: fullName.trim() } })
-      }
-      // Update staff role
-      if (role !== undefined && ['STAFF', 'MANAGER'].includes(role)) {
-        await db.agencyStaff.update({ where: { id }, data: { role } })
-      }
-      // Update isActive
-      if (isActive !== undefined) {
-        await db.user.update({ where: { id: staffMember.userId }, data: { isActive } })
-        await db.agencyStaff.update({ where: { id }, data: { isActive } })
-      }
-      // Update permissions
-      if (permissions !== undefined) {
-        const currentPerms = staffMember.permissions ? JSON.parse(staffMember.permissions) : {}
-        const mergedPerms = { ...currentPerms, ...permissions }
-        await db.agencyStaff.update({ where: { id }, data: { permissions: JSON.stringify(mergedPerms) } })
-      }
-      // Fetch updated
-      const updated = await db.agencyStaff.findUnique({
-        where: { id },
-        include: { user: { select: { id: true, username: true, fullName: true, role: true, isActive: true } } },
+      // Part Q: ALL staff/user writes below + the outbox row commit atomically
+      // — a crash can no longer half-apply a staff edit (e.g. role changed but
+      // name not, or activation written with no outbox entry).
+      const updated = await withOutboxTransaction(async (tx) => {
+        // Update user fullName
+        if (fullName !== undefined && fullName.trim()) {
+          await tx.user.update({ where: { id: staffMember.userId }, data: { fullName: fullName.trim() } })
+        }
+        // Update staff role
+        if (role !== undefined && ['STAFF', 'MANAGER'].includes(role)) {
+          await tx.agencyStaff.update({ where: { id }, data: { role } })
+        }
+        // Update isActive
+        if (isActive !== undefined) {
+          await tx.user.update({ where: { id: staffMember.userId }, data: { isActive } })
+          await tx.agencyStaff.update({ where: { id }, data: { isActive } })
+        }
+        // Update permissions
+        if (permissions !== undefined) {
+          const currentPerms = staffMember.permissions ? JSON.parse(staffMember.permissions) : {}
+          const mergedPerms = { ...currentPerms, ...permissions }
+          await tx.agencyStaff.update({ where: { id }, data: { permissions: JSON.stringify(mergedPerms) } })
+        }
+        // Fetch updated
+        const row = await tx.agencyStaff.findUnique({
+          where: { id },
+          include: { user: { select: { id: true, username: true, fullName: true, role: true, isActive: true } } },
+        })
+        await logDeterministicOutcome('AgencyStaff', id, 'update', row, null, { tx })
+        return row
       })
       emitEvent('staff:updated', { agencyId, action: 'staff-updated', staffId: id })
-      logPendingMutation('PATCH', `/api/agency/staff/${id}`, body, updated).catch(() => {})
       return c.json({ staff: updated, success: true })
     } catch (error) {
       console.error('[LocalAPI] PATCH /api/agency/staff/:id error:', error)
@@ -3266,13 +3674,17 @@ function createApp() {
       const updateData = {}
       if (workingHoursStart !== undefined) updateData.workingHoursStart = workingHoursStart
       if (workingHoursEnd !== undefined) updateData.workingHoursEnd = workingHoursEnd
-      const updated = await db.agency.update({
-        where: { id: agencyId },
-        data: updateData,
-        select: { id: true, workingHoursStart: true, workingHoursEnd: true },
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.agency.update({
+          where: { id: agencyId },
+          data: updateData,
+          select: { id: true, workingHoursStart: true, workingHoursEnd: true },
+        })
+        await logPendingMutation('PATCH', '/api/agency/working-hours', body, row, { tx })
+        return row
       })
       emitEvent('agency:updated', { agencyId, action: 'working-hours-updated', ...updateData })
-      logPendingMutation('PATCH', '/api/agency/working-hours', body, updated).catch(() => {})
       return c.json(updated)
     } catch (error) {
       console.error('[LocalAPI] PATCH /api/agency/working-hours error:', error)
@@ -3291,9 +3703,12 @@ function createApp() {
       if (review.agencyId !== sessionUser.agencyId && review.userId !== sessionUser.id) {
         return c.json({ error: 'Not authorized to delete this review' }, 403)
       }
-      await db.review.delete({ where: { id: reviewId } })
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.review.delete({ where: { id: reviewId } })
+        await logPendingMutation('DELETE', '/api/reviews', { reviewId }, null, { tx })
+      })
       emitEvent('review:deleted', { agencyId: review.agencyId, reviewId })
-      logPendingMutation('DELETE', '/api/reviews', { reviewId }, null).catch(() => {})
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] DELETE /api/reviews error:', error)
@@ -3312,9 +3727,12 @@ function createApp() {
       if (review.agencyId !== sessionUser.agencyId) {
         return c.json({ error: 'Not authorized' }, 403)
       }
-      await db.review.delete({ where: { id: reviewId } })
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.review.delete({ where: { id: reviewId } })
+        await logPendingMutation('DELETE', '/api/agency/reviews', { reviewId }, null, { tx })
+      })
       emitEvent('review:deleted', { agencyId: review.agencyId, reviewId })
-      logPendingMutation('DELETE', '/api/agency/reviews', { reviewId }, null).catch(() => {})
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] DELETE /api/agency/reviews error:', error)
@@ -3334,21 +3752,23 @@ function createApp() {
       const existing = await db.review.findUnique({
         where: { userId_agencyId: { userId: sessionUser.id, agencyId } },
       })
-      let review
-      if (existing) {
-        review = await db.review.update({
-          where: { id: existing.id },
-          data: { rating, comment: comment || null },
-          include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
-        })
-      } else {
-        review = await db.review.create({
-          data: { agencyId, userId: sessionUser.id, rating, comment: comment || null },
-          include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
-        })
-      }
+      // Part Q: business write + outbox row commit atomically. The upsert
+      // branch decision uses the pre-read `existing` — both branches join tx.
+      const review = await withOutboxTransaction(async (tx) => {
+        const row = existing
+          ? await tx.review.update({
+              where: { id: existing.id },
+              data: { rating, comment: comment || null },
+              include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
+            })
+          : await tx.review.create({
+              data: { agencyId, userId: sessionUser.id, rating, comment: comment || null },
+              include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
+            })
+        await logPendingMutation('POST', '/api/agency/reviews', body, row, { tx })
+        return row
+      })
       emitEvent('review:created', { agencyId, review })
-      logPendingMutation('POST', '/api/agency/reviews', body, review).catch(() => {})
       return c.json({
         review: {
           id: review.id, rating: review.rating, comment: review.comment,
@@ -3538,13 +3958,49 @@ function createApp() {
         lastIncrementalSyncAt = localState.lastIncrementalSyncAt instanceof Date ? localState.lastIncrementalSyncAt.toISOString() : String(localState.lastIncrementalSyncAt)
       }
 
-      // Pending outgoing mutations
+      // Pending outgoing mutations (Part AT: full outbox breakdown)
       let pendingOutgoingMutations = 0
+      let outbox = { pending: 0, retry: 0, permanentFailed: 0, conflict: 0, sending: 0 }
       try {
-        const pendingRows = await db.$queryRawUnsafe("SELECT COUNT(*) as cnt FROM \"_pending_mutations\" WHERE status = 'pending'")
-        const rawPending = Array.isArray(pendingRows) ? pendingRows[0]?.cnt : pendingRows?.cnt
-        pendingOutgoingMutations = typeof rawPending === 'bigint' ? Number(rawPending) : (rawPending || 0)
+        const statusRows = await db.$queryRawUnsafe('SELECT status, COUNT(*) as cnt FROM "_pending_mutations" GROUP BY status')
+        const byStatus = {}
+        for (const row of statusRows || []) byStatus[row.status] = Number(row.cnt)
+        outbox = {
+          pending: byStatus.pending || 0,
+          retry: (byStatus.retry || 0) + (byStatus.failed || 0),
+          permanentFailed: (byStatus.permanent_failed || 0) + (byStatus.abandoned || 0),
+          conflict: byStatus.conflict || 0,
+          sending: byStatus.sending || 0,
+        }
+        pendingOutgoingMutations = outbox.pending + outbox.retry
       } catch { /* outbox table may not exist yet */ }
+
+      // Part K/AT: durable deferred changes + conflicts + cursor
+      let deferredChanges = 0
+      let deferredQuarantined = 0
+      try {
+        const defRows = await db.$queryRawUnsafe(
+          'SELECT status, COUNT(*) as cnt FROM "_deferred_changes" GROUP BY status'
+        )
+        for (const row of defRows || []) {
+          if (row.status === 'PENDING') deferredChanges = Number(row.cnt)
+          if (row.status === 'QUARANTINED') deferredQuarantined = Number(row.cnt)
+        }
+      } catch { /* deferred table may not exist yet */ }
+      let conflictCount = 0
+      try {
+        const confRows = await db.$queryRawUnsafe(
+          'SELECT COUNT(*) as cnt FROM "_sync_conflicts" WHERE resolution = \'pending\''
+        )
+        conflictCount = Number(confRows?.[0]?.cnt || 0)
+      } catch { /* conflicts table may not exist yet */ }
+      let cursor = null
+      try {
+        const curRows = await db.$queryRawUnsafe(
+          "SELECT value FROM \"_sync_meta\" WHERE key = 'lastPulledSequence'"
+        )
+        cursor = curRows && curRows[0] ? parseInt(curRows[0].value, 10) || null : null
+      } catch { /* meta table may not exist yet */ }
 
       // Readiness verdict: initialized AND agency data actually imported.
       const agencyCount = typeof counts.Agency === 'number' ? counts.Agency : -1
@@ -3564,7 +4020,7 @@ function createApp() {
         const vRows = await db.$queryRawUnsafe("SELECT value FROM \"_sync_meta\" WHERE key = 'schema_version'")
         schemaVersion = vRows && vRows[0] ? parseInt(vRows[0].value, 10) || null : null
       } catch { /* meta table may not exist yet */ }
-      const syncInfraTables = ['_sync_meta', '_sync_conflicts', '_pending_mutations', '_sync_applied_mutations']
+      const syncInfraTables = ['_sync_meta', '_sync_conflicts', '_pending_mutations', '_sync_applied_mutations', '_deferred_changes']
       const syncTablesStatus = {}
       for (const t of syncInfraTables) syncTablesStatus[t] = tables.includes(t)
       let realtimeConnected = false
@@ -3594,6 +4050,12 @@ function createApp() {
         lastIncrementalSyncAt,
         lastError,
         pendingOutgoingMutations,
+        // Part AT observability contract
+        cursor,
+        outbox,
+        deferredChanges,
+        deferredQuarantined,
+        conflicts: conflictCount,
         ready,
         readiness: { ready, reason },
         // Spec §24 canonical names (aliases kept above for existing consumers)
@@ -3997,11 +4459,15 @@ function createApp() {
         return c.json({ success: false, error: 'Review not found' }, 404)
       }
 
-      const updated = await db.review.update({
-        where: { id: reviewId },
-        data: { replyText: text.trim(), repliedAt: new Date() },
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.review.update({
+          where: { id: reviewId },
+          data: { replyText: text.trim(), repliedAt: new Date() },
+        })
+        await logDeterministicOutcome('Review', reviewId, 'update', { replyText: text.trim() }, null, { tx })
+        return row
       })
-      logPendingMutation('POST', `/api/reviews/${reviewId}/reply`, body, { replyText: text.trim() }).catch(() => {})
       return c.json({ success: true, data: updated })
     } catch (error) {
       console.error('[LocalAPI] Reply to review error:', error)
@@ -4347,9 +4813,17 @@ module.exports = {
   setMutationListener,
   getStatus,
   logPendingMutation,
+  logDeterministicOutcome,
+  withOutboxTransaction,
+  notifyMutationLogged,
   getPendingMutations,
+  getOutboxStats,
   markMutationCompleted,
   markMutationFailed,
+  markMutationConflict,
+  markMutationSending,
+  classifyMutationFailure,
+  computeRetryBackoffMs,
   deriveStableIdempotencyKey,
   DEFAULT_PORT,
 }

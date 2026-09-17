@@ -8,6 +8,7 @@ import { calculateETA, getEffectiveServiceTime, filterImmediateServiceWindow, fi
 import { shouldSkipForPreferredTime, getNextCustomerToCall } from '../lib/queue-scheduler'
 import { cancelPendingCustomerAlerts } from '../lib/cancel-pending-alerts'
 import { z } from 'zod'
+import { recordSyncChange } from '../lib/sync-helpers'
 
 const app = new Hono()
 
@@ -128,6 +129,10 @@ app.post('/call-next', async (c) => {
         return { updateResult: result, updatedReservation: null }
       }
 
+      // Spec Part O: tx ops are invisible to the auto-tracking extension —
+      // record the CALLED transition explicitly inside the same tx.
+      await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: nextReservation.id, operation: 'update' })
+
       // Get the updated reservation with relations
       const updated = await tx.reservation.findUnique({
         where: { id: nextReservation.id },
@@ -142,12 +147,14 @@ app.post('/call-next', async (c) => {
       const queueSettings = await tx.queueSettings.findFirst({ where: { agencyId }, orderBy: { updatedAt: 'desc' } })
       if (queueSettings) {
         await tx.queueSettings.update({ where: { id: queueSettings.id }, data: { currentServingNumber: nextReservation.queueNumber } })
+        await recordSyncChange({ tx, agencyId, model: 'QueueSettings', recordId: queueSettings.id, operation: 'update' })
       }
 
       if (nextReservation.userId) {
-        await tx.notification.create({
+        const notif = await tx.notification.create({
           data: { userId: nextReservation.userId, type: 'QUEUE_CALLED', title: 'Your Turn!', message: `Please proceed to ${nextReservation.agency.name} - ${nextReservation.service.name}. Your ticket: ${nextReservation.displayNumber}` },
         })
+        await recordSyncChange({ tx, agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
       }
 
       await tx.auditLog.create({

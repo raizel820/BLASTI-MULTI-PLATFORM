@@ -170,6 +170,8 @@ function _loadMutationFunctions() {
     _getPendingMutations = localApi.getPendingMutations;
     _markMutationCompleted = localApi.markMutationCompleted;
     _markMutationFailed = localApi.markMutationFailed;
+    _markMutationConflict = localApi.markMutationConflict;
+    _markMutationSending = localApi.markMutationSending;
   } catch (e) {
     console.warn('[SyncService] Could not load mutation functions:', e.message);
   }
@@ -599,10 +601,145 @@ async function _cloudPost(path, body, timeoutMs) {
   return response.json();
 }
 
-// ─── Backoff ───────────────────────────────────────────────────────────────────
+// ─── Backoff ──────────────────────────────────────────────────────────────────
 
 function _resetBackoff() { _backoffMs = 2000; _consecutiveFailures = 0; }
 function _increaseBackoff() { _consecutiveFailures++; _backoffMs = Math.min(_backoffMs * 2, MAX_BACKOFF_MS); }
+
+// ─── Cloud sync-route probe (initialization precondition) ────────────────────
+/**
+ * Authoritative reachability probe for the INITIALIZER: does the cloud origin
+ * actually host the v2 sync API? Health alone is NOT sufficient — a static
+ * host or a stale apps/api build can answer /health while every /api/sync/*
+ * route 404s (observed in the field, Task 12/15).
+ *
+ * Classification:
+ *   available=true            → route answered (ANY status except 404; 401/403
+ *                               mean the route EXISTS but rejected the token)
+ *   available=false, notFound → 404 — routes missing (stale build / wrong service)
+ *   available=false, network  → unreachable / offline
+ */
+async function _probeCloudSyncRoutes() {
+  var baseUrl = _config && _config.cloudBaseUrl;
+  if (!baseUrl) return { available: false, reason: 'no-base-url' };
+  var agencyId = _config.agencyId || (_userContext && _userContext.agencyId) || 'probe';
+  try {
+    var response = await fetch(baseUrl + '/api/sync/pull', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + (_authToken || 'none'),
+      },
+      body: JSON.stringify({ agencyId: agencyId, sinceSequence: 0, limit: 1 }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (response.status === 404) {
+      var body = '';
+      try { body = (await response.text()).replace(/\s+/g, ' ').substring(0, 160); } catch { }
+      return { available: false, reason: 'not-found', status: 404, body: body };
+    }
+    // ANY other status (200/400/401/403/422/500) proves the route exists.
+    return { available: true, status: response.status, authRejected: response.status === 401 || response.status === 403 };
+  } catch (e) {
+    return { available: false, reason: 'network', error: (e && e.message) || String(e) };
+  }
+}
+
+// ─── Workspace Initialization Coordinator (P0: deadlock breaker) ─────────────
+/**
+ * ONE trigger point that wakes the initializer (initial-sync.js — the single
+ * OWNER of initialization) whenever the engine observes:
+ *   NOT_INITIALIZED / FAILED workspace + auth present + cloud sync API reachable.
+ *
+ * Historic deadlock (field log, round 4): the loading-screen cloud probe made
+ * ONE 404 observation, concluded "cloud unavailable", skipped the initial
+ * import, and NOTHING ever re-tried — while the realtime socket proved the
+ * cloud WAS reachable seconds later. The pull engine correctly BLOCKS
+ * incremental sync until READY (Part D), so the workspace stayed
+ * NOT_INITIALIZED forever. This coordinator closes that loop:
+ *
+ *   NOT_INITIALIZED + cloud becomes available  →  initial sync auto-starts.
+ *   Incremental sync stays blocked until READY (unchanged, Part D).
+ *
+ * Guarantees:
+ *   - single-flight: concurrent triggers join the in-flight promise;
+ *   - rate-limited: failed attempts back off (10s) so offline machines and
+ *     wrong-origin setups don't hammer the probe every cycle;
+ *   - delegated ownership: actual import runs ONLY inside
+ *     initial-sync.js runInitialSync (its own _activeSync lock applies).
+ */
+var _initAttempt = null;
+var _lastInitAttemptAt = 0;
+var INIT_ATTEMPT_MIN_INTERVAL_MS = 10_000;
+
+function ensureWorkspaceInitialized(trigger) {
+  if (!_isStarted) return Promise.resolve({ skipped: 'engine-not-started' });
+  if (!_authToken) return Promise.resolve({ skipped: 'no-auth' });
+  var db = _config && _config.localDb;
+  if (!db) return Promise.resolve({ skipped: 'no-db' });
+  var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
+  if (!agencyId) return Promise.resolve({ skipped: 'no-agency' });
+  if (_initAttempt) return _initAttempt;
+  var now = Date.now();
+  if (now - _lastInitAttemptAt < INIT_ATTEMPT_MIN_INTERVAL_MS) {
+    return Promise.resolve({ skipped: 'rate-limited' });
+  }
+  _lastInitAttemptAt = now;
+
+  _initAttempt = (async function () {
+    // Fast path: already READY → nothing to do (5s-cached check, force=false).
+    if (await _isAgencyReady()) return { skipped: 'ready' };
+
+    // The cloud sync API must genuinely host /api/sync/* before importing.
+    var probe = await _probeCloudSyncRoutes();
+    if (!probe.available) {
+      console.log('[SyncService] Init coordinator (' + trigger + '): cloud sync API not confirmed (' +
+        probe.reason + (probe.status ? ' HTTP ' + probe.status : '') + ') — initial sync stays deferred');
+      return { skipped: 'cloud-unavailable', probe: probe };
+    }
+    if (probe.authRejected) {
+      console.warn('[SyncService] Init coordinator (' + trigger + '): sync route present but token rejected (HTTP ' + probe.status + ') — re-login required');
+      return { skipped: 'auth-rejected', probe: probe };
+    }
+
+    console.log('[SyncService] Init coordinator (' + trigger + '): workspace not READY but cloud sync API IS reachable → AUTO-STARTING initial sync');
+    var initialSync = require('./initial-sync'); // lazy — avoids the module cycle
+    var result;
+    try {
+      result = await initialSync.runInitialSync({
+        agencyId: agencyId,
+        cloudAuthToken: _authToken,
+        cloudUrl: _config.cloudBaseUrl,
+        db: db,
+        emitFn: function (evt) { try { emit(evt); } catch { } },
+      });
+    } catch (e) {
+      result = { success: false, error: (e && e.message) || String(e) };
+    }
+
+    if (result && result.success) {
+      await _isAgencyReady(true); // force-refresh the gate cache
+      console.log('[SyncService] Init coordinator: initial sync COMPLETED — workspace READY (' +
+        (result.totalRecords || 0) + ' records)');
+      emit({ type: 'workspace-ready', agencyId: agencyId, totalRecords: result.totalRecords || 0 });
+      // Kick the engine immediately — replay + pull start now, not in 30s.
+      _incrementalPullCycle('post-init').catch(function (err) {
+        console.warn('[SyncService] Post-init cycle error:', err.message);
+      });
+    } else {
+      console.warn('[SyncService] Init coordinator: auto initial sync FAILED — will re-attempt on the next trigger:',
+        (result && result.error) || 'unknown');
+      emit({ type: 'workspace-init-failed', agencyId: agencyId, error: (result && result.error) || 'unknown' });
+    }
+    return result;
+  })().catch(function (e) {
+    return { success: false, error: (e && e.message) || String(e) };
+  }).finally(function () {
+    _initAttempt = null;
+  });
+
+  return _initAttempt;
+}
 
 // ─── Local Record CRUD Helpers ───────────────────────────────────────────────
 
@@ -716,6 +853,14 @@ async function _pullFromCloud(options) {
   if (!db || !agencyId) return { applied: 0, conflicts: 0, deleted: 0, pages: 0 };
 
   var fullSync = options.fullSync === true;
+
+  // Part D hard gate: even fullSync pull-from-0 must not populate an
+  // uninitialized agency (that would fake partial progress without READY).
+  if (!(await _isAgencyReady())) {
+    console.warn('[SyncService] Pull BLOCKED - agency not READY (Part D gate)');
+    return { applied: 0, conflicts: 0, deleted: 0, pages: 0, deferred: 0, blockedNotReady: true };
+  }
+
   var applied = 0;
   var conflictCount = 0;
   var deletedCount = 0;
@@ -736,19 +881,34 @@ async function _pullFromCloud(options) {
       throw new Error('Pull failed: ' + ((pullData && pullData.error) || 'unknown error'));
     }
 
-    var latestSequence = typeof pullData.latestSequence === 'number' ? pullData.latestSequence : sinceSequence;
+    // Part L: the SAFE page cursor is pageLastSequence (last row INCLUDED in
+    // this page). The global max must NEVER advance a cursor - rows committed
+    // between the page query and a global-max query would be skipped forever.
+    var pageLastSequence = typeof pullData.pageLastSequence === 'number'
+      ? pullData.pageLastSequence
+      : (typeof pullData.latestSequence === 'number' ? pullData.latestSequence : sinceSequence);
     var cloudChanges = pullData.changes || {};
+
+    // Part AB (retention awareness): a cursor older than the prune horizon
+    // means feed changes were compacted - schedule a full reconciliation.
+    var oldestAvailable = typeof pullData.oldestAvailableSequence === 'number' ? pullData.oldestAvailableSequence : null;
+    if (!fullSync && oldestAvailable !== null && oldestAvailable > 0 && sinceSequence > 0 && sinceSequence < oldestAvailable) {
+      console.warn('[SyncService] Cursor ' + sinceSequence + ' is OLDER than the feed retention horizon (' + oldestAvailable + ') - scheduling full snapshot reconciliation (Part AB)');
+      _retentionRepairNeeded = true;
+    }
 
     // Exactly-once ledger key: re-applying the exact same page window after a
     // crash (cursor failed to advance) is skipped. Record-level LWW inside
     // _applyPullChanges keeps any other replay path idempotent as well.
-    var pageKey = 'pull:' + agencyId + ':' + sinceSequence + ':' + latestSequence;
+    // Part M: the page is only claimed applied once every failed record in it
+    // is DURABLY persisted in _deferred_changes (inside the same transaction).
+    var pageKey = 'pull:' + agencyId + ':' + sinceSequence + ':' + pageLastSequence;
     var alreadyApplied = await _isPullPageApplied(pageKey);
 
     if (alreadyApplied) {
-      console.log('[SyncService] Pull page ' + sinceSequence + '→' + latestSequence + ' already applied (ledger) — skipping');
+      console.log('[SyncService] Pull page ' + sinceSequence + ' -> ' + pageLastSequence + ' already applied (ledger) - skipping');
     } else {
-      var result = await _applyPullChanges(db, cloudChanges);
+      var result = await _applyPullChanges(db, cloudChanges, { agencyId: agencyId, pageLastSequence: pageLastSequence });
       applied += result.applied;
       conflictCount += result.conflicts;
       deletedCount += result.deleted;
@@ -756,11 +916,11 @@ async function _pullFromCloud(options) {
     }
 
     pages++;
-    sinceSequence = latestSequence;
+    sinceSequence = pageLastSequence;
     _lastPullAt = new Date();
 
-    // Advance the cursor ONLY after the page applied successfully.
-    await _setCursor(latestSequence);
+    // Advance the cursor ONLY after the page applied (failures durably deferred).
+    await _setCursor(pageLastSequence);
 
     if (!pullData.hasMore) break;
   }
@@ -775,8 +935,146 @@ async function _pullFromCloud(options) {
   }
   await _touchAgencyLocalState(db, agencyId, { full: fullSync });
 
-  console.log('[SyncService] Pull applied: ' + applied + ', conflicts: ' + conflictCount + ', deleted: ' + deletedCount + ', pages: ' + pages);
-  return { applied: applied, conflicts: conflictCount, deleted: deletedCount, pages: pages };
+  var deferredTotal = await _countDeferredChanges(db, agencyId);
+  console.log('[SyncService] Pull applied: ' + applied + ', conflicts: ' + conflictCount + ', deleted: ' + deletedCount + ', pages: ' + pages + ', deferredPending: ' + deferredTotal);
+  return { applied: applied, conflicts: conflictCount, deleted: deletedCount, pages: pages, deferred: deferredTotal };
+}
+
+// ─── Durable Deferred-Change Queue (Part K) ──────────────────────────────────
+// A cloud change that fails with a genuine dependency/FK error is PERSISTED
+// here inside the pull transaction - NEVER held only in memory. Every change
+// is exactly one of: APPLIED | PENDING here | CONFLICT (_sync_conflicts) |
+// QUARANTINED here. Nothing is ever "skipped and forgotten" (Part M).
+
+async function _ensureDeferredTable(db) {
+  if (!db) return;
+  try {
+    await db.$executeRawUnsafe(
+      'CREATE TABLE IF NOT EXISTS "_deferred_changes" (' +
+      '"id" TEXT PRIMARY KEY,' +
+      '"agencyId" TEXT NOT NULL,' +
+      '"source" TEXT NOT NULL DEFAULT \'pull\',' +
+      '"sequence" INTEGER,' +
+      '"stage" TEXT,' +
+      '"model" TEXT NOT NULL,' +
+      '"recordId" TEXT NOT NULL,' +
+      '"operation" TEXT NOT NULL,' +
+      '"payload" TEXT,' +
+      '"dependencyError" TEXT,' +
+      '"retryCount" INTEGER NOT NULL DEFAULT 0,' +
+      '"firstSeenAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+      '"lastRetryAt" DATETIME,' +
+      '"nextRetryAt" DATETIME,' +
+      '"status" TEXT NOT NULL DEFAULT \'PENDING\',' +
+      '"lastError" TEXT' +
+      ')'
+    );
+    await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "idx_deferred_agency_status" ON "_deferred_changes"("agencyId", "status")');
+    await db.$executeRawUnsafe('CREATE INDEX IF NOT EXISTS "idx_deferred_status_next" ON "_deferred_changes"("status", "nextRetryAt")');
+  } catch (e) {
+    console.error('[SyncService] Failed to ensure _deferred_changes:', e.message);
+  }
+}
+
+async function _countDeferredChanges(db, agencyId) {
+  try {
+    var rows = await db.$queryRawUnsafe(
+      'SELECT COUNT(*) as n FROM "_deferred_changes" WHERE "agencyId" = ? AND "status" = \'PENDING\'', agencyId
+    );
+    return Number(rows?.[0]?.n || 0);
+  } catch { return 0; }
+}
+
+/** Is this error a genuine FK/dependency failure (retryable, Part J)? */
+function _isDependencyError(err) {
+  var msg = String((err && err.message) || err || '');
+  return /FOREIGN KEY|SQLITE_CONSTRAINT.*FOREIGNKEY|constraint failed.*foreign/i.test(msg);
+}
+
+/**
+ * Retry due deferred changes: re-apply each persisted payload; success ->
+ * remove; repeated dependency failure -> keep pending with backoff; repeated
+ * NON-dependency failure -> QUARANTINE (visible, blocks trust in completeness).
+ */
+async function _retryDeferredChanges() {
+  var db = _config && _config.localDb;
+  var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
+  if (!db || !agencyId) return { resolved: 0, retried: 0, quarantined: 0 };
+  await _ensureDeferredTable(db);
+  var resolved = 0, attempted = 0, quarantined = 0;
+  try {
+    var due = await db.$queryRawUnsafe(
+      'SELECT * FROM "_deferred_changes" WHERE "agencyId" = ? AND "status" = \'PENDING\' ' +
+      'AND ("nextRetryAt" IS NULL OR "nextRetryAt" <= ?) ORDER BY "firstSeenAt" ASC LIMIT 100',
+      agencyId, new Date().toISOString()
+    );
+    if (!due || due.length === 0) return { resolved: 0, retried: 0, quarantined: 0 };
+
+    console.log('[SyncService] Retrying ' + due.length + ' deferred change(s)...');
+    for (var i = 0; i < due.length; i++) {
+      var row = due[i];
+      attempted++;
+      var payload = null;
+      try { payload = row.payload ? JSON.parse(row.payload) : null; } catch { payload = null; }
+      if (!payload || !payload.id) {
+        // Malformed persisted payload - cannot ever apply -> quarantine.
+        await db.$executeRawUnsafe('UPDATE "_deferred_changes" SET "status" = \'QUARANTINED\', "lastError" = ? WHERE "id" = ?', 'malformed payload', row.id);
+        quarantined++;
+        continue;
+      }
+      var op = row.operation === 'delete' ? 'delete' : 'update';
+      var ok = false, err = null;
+      try {
+        await db.$transaction(async function(tx) {
+          if (op === 'delete') {
+            await _deleteLocalRecord(tx, row.model, row.recordId);
+            await _tombstoneLocalRecord(tx, row.model, row.recordId);
+          } else {
+            var existing = await _fetchLocalRecord(tx, row.model, row.recordId);
+            var local = _cloudRecordToLocal(payload);
+            if (!existing) {
+              await _insertLocalRecord(tx, row.model, local);
+            } else {
+              var cloudMs = _recordTimeMs(local.updatedAt);
+              var localMs = _recordTimeMs(existing.updatedAt);
+              if (cloudMs >= localMs) await _updateLocalRecord(tx, row.model, local);
+            }
+          }
+        }, { maxWait: 2000, timeout: 15000 });
+        ok = true;
+      } catch (e) {
+        err = e;
+      }
+
+      if (ok) {
+        await db.$executeRawUnsafe('DELETE FROM "_deferred_changes" WHERE "id" = ?', row.id);
+        resolved++;
+        emit({ type: 'deferred-resolved', model: row.model, recordId: row.recordId });
+      } else if (_isDependencyError(err)) {
+        var retryCount = Number(row.retryCount || 0) + 1;
+        var backoffSec = Math.min(15 * 60, 15 * Math.pow(2, Math.min(retryCount, 10)));
+        await db.$executeRawUnsafe(
+          'UPDATE "_deferred_changes" SET "retryCount" = ?, "lastRetryAt" = ?, "nextRetryAt" = ?, "dependencyError" = ? WHERE "id" = ?',
+          retryCount, new Date().toISOString(), new Date(Date.now() + backoffSec * 1000).toISOString(),
+          String(err && err.message || '').substring(0, 300), row.id
+        );
+      } else {
+        // Not a dependency problem: schema/validation/data corruption must
+        // NEVER masquerade as "deferred" (Part J) - quarantine loudly.
+        await db.$executeRawUnsafe(
+          'UPDATE "_deferred_changes" SET "status" = \'QUARANTINED\', "retryCount" = "retryCount" + 1, "lastRetryAt" = ?, "lastError" = ? WHERE "id" = ?',
+          new Date().toISOString(), String(err && err.message || '').substring(0, 300), row.id
+        );
+        quarantined++;
+        console.error('[SyncService] Deferred change QUARANTINED (non-dependency failure - needs attention):', row.model + '/' + row.recordId, String(err && err.message || '').substring(0, 160));
+        emit({ type: 'deferred-quarantined', model: row.model, recordId: row.recordId, error: String(err && err.message || '').substring(0, 200) });
+      }
+    }
+    if (attempted > 0) console.log('[SyncService] Deferred retry pass: ' + resolved + ' resolved, ' + attempted + ' attempted, ' + quarantined + ' quarantined');
+  } catch (e) {
+    console.warn('[SyncService] Deferred retry pass failed:', e.message);
+  }
+  return { resolved: resolved, retried: attempted, quarantined: quarantined };
 }
 
 /**
@@ -791,29 +1089,68 @@ async function _pullFromCloud(options) {
  *    is rolled back individually, logged loudly, and does NOT abort the
  *    page — the cursor still advances so one bad row can't wedge sync.
  */
-async function _applyPullChanges(db, cloudChanges) {
+async function _applyPullChanges(db, cloudChanges, pageCtx) {
+  pageCtx = pageCtx || {};
   var applied = 0;
   var conflictCount = 0;
   var deletedCount = 0;
   var deferred = 0;
+  await _ensureDeferredTable(db);
 
   await db.$transaction(async function(tx) {
     var spCounter = 0;
 
+    var lastApplyError = null;
     async function withSavepoint(fn) {
       var sp = 'sp_pull_' + (++spCounter);
+      lastApplyError = null;
       try {
         await tx.$executeRawUnsafe('SAVEPOINT ' + sp);
         await fn();
         await tx.$executeRawUnsafe('RELEASE SAVEPOINT ' + sp);
         return true;
       } catch (e) {
+        lastApplyError = e;
         try {
           await tx.$executeRawUnsafe('ROLLBACK TO ' + sp);
           await tx.$executeRawUnsafe('RELEASE SAVEPOINT ' + sp);
         } catch { /* savepoint bookkeeping is best-effort */ }
         console.warn('[SyncService] Record apply failed (deferred, page continues): ' + e.message.substring(0, 160));
         return false;
+      }
+    }
+
+    /**
+     * Part M: persist a failed change DURABLY inside the same transaction as
+     * the page apply - the page ledger may then claim the page, because every
+     * change is either applied or durably pending in _deferred_changes.
+     */
+    async function deferChange(modelName, recordId, operation, payload, err) {
+      var isDep = _isDependencyError(err);
+      try {
+        await tx.$executeRawUnsafe(
+          'INSERT INTO "_deferred_changes" ("id","agencyId","source","sequence","model","recordId","operation","payload","dependencyError","retryCount","firstSeenAt","status","lastError") ' +
+          'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)',
+          crypto.randomUUID(),
+          pageCtx.agencyId || '',
+          'pull',
+          pageCtx.pageLastSequence != null ? pageCtx.pageLastSequence : null,
+          modelName,
+          recordId,
+          operation,
+          payload ? JSON.stringify(payload) : null,
+          isDep ? String(err && err.message || '').substring(0, 300) : null,
+          new Date().toISOString(),
+          'PENDING',
+          String(err && err.message || '').substring(0, 300)
+        );
+        if (!isDep) {
+          console.error('[SyncService] Non-dependency failure persisted as deferred for review (will quarantine on retry):', modelName + '/' + recordId, String(err && err.message || '').substring(0, 160));
+        }
+      } catch (deferErr) {
+        // The deferred row itself failed to persist - this MUST fail the page
+        // (otherwise the change would be silently forgotten, Part M violation).
+        throw new Error('Failed to persist deferred change ' + modelName + '/' + recordId + ': ' + deferErr.message + ' (original: ' + (err && err.message || '') + ')');
       }
     }
 
@@ -861,7 +1198,12 @@ async function _applyPullChanges(db, cloudChanges) {
             }
           }
         });
-        if (ok) applied++; else deferred++;
+        if (ok) {
+          applied++;
+        } else {
+          deferred++;
+          await deferChange(table, cloudRecord.id, existing ? 'update' : 'create', local, lastApplyError);
+        }
       }
 
       var deletedList = modelChanges.deleted || [];
@@ -871,13 +1213,18 @@ async function _applyPullChanges(db, cloudChanges) {
           await _deleteLocalRecord(tx, table, deleteId);
           await _tombstoneLocalRecord(tx, table, deleteId);
         });
-        if (delOk) deletedCount++; else deferred++;
+        if (delOk) {
+          deletedCount++;
+        } else {
+          deferred++;
+          await deferChange(table, deleteId, 'delete', null, lastApplyError);
+        }
       }
     }
   }, { maxWait: 5000, timeout: 60000 });
 
   if (deferred > 0) {
-    console.warn('[SyncService] ' + deferred + ' pulled record(s) deferred (FK/missing parent) — will re-apply when their parents arrive');
+    console.warn('[SyncService] ' + deferred + ' pulled record(s) DURABLY deferred to _deferred_changes (dependency failures) - will re-apply when their parents arrive');
   }
   return { applied: applied, conflicts: conflictCount, deleted: deletedCount, deferred: deferred };
 }
@@ -972,6 +1319,9 @@ async function _replayPendingMutations() {
         continue;
       }
 
+      // Crash-safe in-flight marker (boot sweep resets stale rows).
+      if (_markMutationSending) await _markMutationSending(mutation.id);
+
       var idemKey = mutation.idempotency_key
         || (mutation.idempotencyKey)
         || _deriveIdempotencyKeyFallback(method, mutation.path, typeof mutation.body === 'string' ? mutation.body : JSON.stringify(mutation.body || {}));
@@ -981,16 +1331,54 @@ async function _replayPendingMutations() {
         : (typeof mutation.body === 'string' ? mutation.body : JSON.stringify(mutation.body));
 
       try {
-        var response = await fetch(_config.cloudBaseUrl + mutation.path, {
-          method: method,
+        // Part V/W: canonical SYNC_PUSH rows replay through the cloud push
+        // protocol as deterministic record-level mutations — never by
+        // re-running business actions (whose effect depends on remote state).
+        var isCanonicalPush = method === 'SYNC_PUSH';
+        var requestUrl = isCanonicalPush
+          ? _config.cloudBaseUrl + '/api/sync/push'
+          : _config.cloudBaseUrl + mutation.path;
+        var requestMethod = isCanonicalPush ? 'POST' : method;
+        var requestBodyStr = isCanonicalPush
+          ? JSON.stringify({
+              protocolVersion: 2,
+              mutations: [Object.assign({ mutationId: idemKey }, mutation.body || {})],
+            })
+          : bodyStr;
+
+        var response = await fetch(requestUrl, {
+          method: requestMethod,
           headers: {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + _authToken,
             'X-Idempotency-Key': idemKey,
           },
-          body: bodyStr,
+          body: requestBodyStr,
           signal: AbortSignal.timeout(15000),
         });
+
+        // Canonical push: map the mutation-level result to outbox states (Part W).
+        if (isCanonicalPush && response.ok) {
+          var pushJson = await response.json().catch(function() { return null; });
+          var pushResult = pushJson && Array.isArray(pushJson.results) ? pushJson.results[0] : null;
+          var pushStatus = pushResult && pushResult.status;
+          if (pushStatus === 'applied' || pushStatus === 'duplicate') {
+            await _markMutationCompleted(mutation.id);
+            succeeded++;
+            _lastPushAt = new Date();
+            continue;
+          }
+          if (pushStatus === 'conflict') {
+            await _markMutationConflict(mutation.id, pushResult && pushResult.conflict ? JSON.stringify(pushResult.conflict) : 'conflict');
+            failed++;
+            continue;
+          }
+          // rejected / error / retryable_error → classified failure
+          var pushErrText = pushResult && pushResult.conflict ? JSON.stringify(pushResult.conflict).substring(0, 200) : 'push mutation failed';
+          await _markMutationFailed(mutation.id, 'SYNC_PUSH ' + (pushStatus || 'error') + ': ' + pushErrText, pushStatus === 'error' ? 500 : 400);
+          failed++;
+          continue;
+        }
 
         if (response.ok) {
           // 2xx (including replayed duplicates) = business effect applied.
@@ -1005,24 +1393,16 @@ async function _replayPendingMutations() {
           paused = true;
           break;
         } else if (response.status === 409) {
-          // Cloud: concurrent duplicate in progress — retry next cycle.
-          await _markMutationFailed(mutation.id, 'HTTP 409: duplicate in progress');
+          // Cloud: concurrent duplicate in progress — transient, retry with backoff.
+          await _markMutationFailed(mutation.id, 'HTTP 409: duplicate in progress', 409);
           failed++;
         } else {
+          // Part R/S: classification happens inside markMutationFailed —
+          // transient failures retry INDEFINITELY with bounded backoff;
+          // permanent ones become visible permanent_failed. No abandonment.
           var errorText = await response.text().catch(() => '');
-          var willAbandon = (mutation.attempts || 0) + 1 >= (mutation.max_attempts || 5);
-          await _markMutationFailed(mutation.id, 'HTTP ' + response.status + ': ' + errorText.substring(0, 200));
+          await _markMutationFailed(mutation.id, 'HTTP ' + response.status + ': ' + errorText.substring(0, 200), response.status);
           failed++;
-          if (willAbandon) {
-            console.error('[SyncService] Mutation abandoned after max attempts:', method, mutation.path, '—', errorText.substring(0, 200));
-            emit({
-              type: 'mutation-abandoned',
-              mutationId: mutation.id,
-              method: method,
-              path: mutation.path,
-              lastError: errorText.substring(0, 200),
-            });
-          }
         }
       } catch (e) {
         // Network error / timeout — connectivity is down; stop burning
@@ -1089,6 +1469,11 @@ async function reconcileRecords() {
   var pushed = 0;
   var conflicts = 0;
   var errors = 0;
+  // Part AD: the watermark may ONLY advance when EVERY eligible row of EVERY
+  // table was processed. Any gather/push failure or interruption keeps the
+  // old watermark so nothing is skipped on the next run.
+  var allTablesComplete = true;
+  var runStartIso = new Date().toISOString();
 
   for (var ti = 0; ti < SYNC_TABLES.length; ti++) {
     var table = SYNC_TABLES[ti];
@@ -1110,19 +1495,34 @@ async function reconcileRecords() {
       continue;
     }
 
-    var rows = [];
-    try {
-      rows = await db.$queryRawUnsafe(
-        'SELECT * FROM "' + table + '" WHERE ' + whereClause + ' AND "updatedAt" > ? ORDER BY "updatedAt" ASC LIMIT ?',
-        ...params, sinceISO, MAX_RECONCILE_ROWS_PER_TABLE
-      );
-    } catch (e) {
-      console.warn('[SyncService] Reconcile gather failed for ' + table + ':', e.message);
-      continue;
-    }
-    if (!rows || rows.length === 0) continue;
+    // Part AD: keyset pagination with a (updatedAt, id) tuple cursor — pages
+    // are walked until EXHAUSTED (never a single LIMIT-capped window whose
+    // remainder would be skipped by the advancing watermark).
+    var lastSeenUpdatedAt = sinceISO;
+    var lastSeenId = '';
+    var tableComplete = false;
+    var tableFailed = false;
 
-    for (var ri = 0; ri < rows.length; ri += RECONCILE_BATCH_SIZE) {
+    while (!tableComplete && !tableFailed) {
+      var rows = [];
+      try {
+        rows = await db.$queryRawUnsafe(
+          'SELECT * FROM "' + table + '" WHERE ' + whereClause +
+          ' AND ("updatedAt" > ? OR ("updatedAt" = ? AND "id" > ?)) ' +
+          'ORDER BY "updatedAt" ASC, "id" ASC LIMIT ?',
+          ...params, lastSeenUpdatedAt, lastSeenUpdatedAt, lastSeenId, MAX_RECONCILE_ROWS_PER_TABLE
+        );
+      } catch (e) {
+        console.warn('[SyncService] Reconcile gather failed for ' + table + ':', e.message);
+        allTablesComplete = false;
+        break;
+      }
+      if (!rows || rows.length === 0) {
+        tableComplete = true;
+        break;
+      }
+
+      for (var ri = 0; ri < rows.length; ri += RECONCILE_BATCH_SIZE) {
       var batch = rows.slice(ri, ri + RECONCILE_BATCH_SIZE);
       var mutations = batch.map(function(row) {
         var isCreate = _recordTimeMs(row.createdAt) > sinceMs;
@@ -1168,14 +1568,29 @@ async function reconcileRecords() {
         errors++;
         _lastError = 'reconcile push failed: ' + e.message;
         console.warn('[SyncService] Reconcile push failed for ' + table + ':', e.message);
-        break; // stop pushing this table; other tables continue next run
+        allTablesComplete = false;
+        tableFailed = true;
+        break; // stop pushing this table; remaining pages retry next run
+      }
+      // Advance the keyset cursor to the last row of this page.
+      var lastRow = rows[rows.length - 1];
+      lastSeenUpdatedAt = typeof lastRow.updatedAt === 'string' ? lastRow.updatedAt : new Date(lastRow.updatedAt).toISOString();
+      lastSeenId = lastRow.id;
+      if (rows.length < MAX_RECONCILE_ROWS_PER_TABLE) {
+        tableComplete = true; // page not full = table exhausted
+      }
       }
     }
   }
 
-  await _setSyncMeta('lastReconcileAt', new Date().toISOString());
-  console.log('[SyncService] Reconcile done: pushed ' + pushed + ', conflicts ' + conflicts + ', errors ' + errors);
-  return { pushed: pushed, conflicts: conflicts, errors: errors };
+  // Part AD: advance the watermark ONLY when every eligible row was processed.
+  if (allTablesComplete) {
+    await _setSyncMeta('lastReconcileAt', runStartIso);
+    console.log('[SyncService] Reconcile done (complete): pushed ' + pushed + ', conflicts ' + conflicts + ', errors ' + errors);
+  } else {
+    console.warn('[SyncService] Reconcile INCOMPLETE - watermark NOT advanced (rows remain for the next run): pushed ' + pushed + ', conflicts ' + conflicts + ', errors ' + errors);
+  }
+  return { pushed: pushed, conflicts: conflicts, errors: errors, complete: allTablesComplete };
 }
 
 // ─── Realtime Socket (cloud → local fast-path hint) ──────────────────────────
@@ -1222,6 +1637,12 @@ function _setupSocket() {
         _lastPingAt = Date.now();
         console.log('[SyncService] Realtime socket connected:', _socketId);
         if (agencyId) _socket.emit('join:agency', agencyId);
+        // The socket connect is the STRONGEST cloud-reachability signal there
+        // is: if the workspace is still NOT_INITIALIZED, wake the initializer
+        // immediately (P0 deadlock breaker — no more waiting for a screen).
+        ensureWorkspaceInitialized('socket-connected').catch(function (err) {
+          console.warn('[SyncService] Init coordinator error (socket connect):', err && err.message);
+        });
         // Trigger a pull on (re)connect — catches changes missed while offline.
         _scheduleSocketPull(SOCKET_EVENT_DEBOUNCE_MS);
       } catch (e) {
@@ -1303,10 +1724,51 @@ function _stopWatchdog() {
 
 // ─── Sync Cycles ──────────────────────────────────────────────────────────────
 
+// --- Part D: READY gate -----------------------------------------------------
+// The incremental engine MUST NOT pull/apply/replay against an uninitialized
+// or partially-initialized agency. Recovery belongs to the initializer
+// (initial-sync.js runInitialSync), never to the background engine.
+
+var _agencyReadyCache = { checkedAt: 0, ready: false };
+var _readyGateWarnedAt = 0;
+var _retentionRepairNeeded = false;
+
+async function _isAgencyReady(force) {
+  var db = _config && _config.localDb;
+  if (!db) return false;
+  var now = Date.now();
+  if (!force && now - _agencyReadyCache.checkedAt < 5000) return _agencyReadyCache.ready;
+  _agencyReadyCache.checkedAt = now;
+  _agencyReadyCache.ready = false;
+  try {
+    var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
+    var state = agencyId
+      ? await db.agencyLocalState.findFirst({ where: { agencyId: agencyId }, select: { initializationStatus: true } })
+      : await db.agencyLocalState.findFirst({ select: { initializationStatus: true } });
+    _agencyReadyCache.ready = !!(state && state.initializationStatus === 'READY');
+  } catch (e) {
+    console.warn('[SyncService] READY check failed:', e.message);
+  }
+  return _agencyReadyCache.ready;
+}
+
 async function _preCheck() {
   if (_isSyncing) return false;
   if (!_authToken) return false;
   if (!_config || !_config.localDb) return false;
+  // Part D: block pull/replay unless AgencyLocalState.initializationStatus == READY.
+  if (!(await _isAgencyReady())) {
+    if (Date.now() - _readyGateWarnedAt > 60000) {
+      _readyGateWarnedAt = Date.now();
+      console.warn('[SyncService] Pull/replay BLOCKED - AgencyLocalState is not READY yet (initial sync pending). The initializer owns recovery — waking it if the cloud is reachable.');
+    }
+    // P0 deadlock breaker: every gate block is also a chance to start the
+    // initializer (rate-limited + single-flight inside the coordinator).
+    ensureWorkspaceInitialized('gate-blocked').catch(function (err) {
+      console.warn('[SyncService] Init coordinator error (gate):', err && err.message);
+    });
+    return false;
+  }
   return true;
 }
 
@@ -1340,10 +1802,35 @@ async function _incrementalPullCycle(trigger) {
   _lastError = null;
   emit({ type: 'sync-start', trigger: trigger || 'interval' });
 
+  var replayResult = { succeeded: 0, failed: 0 };
+  var pullResult = { applied: 0, conflicts: 0, deleted: 0, pages: 0 };
+  var deferredResult = null;
   try {
     await _checkAndResetForNewAgency();
-    var replayResult = await _replayPendingMutations();
-    var pullResult = await _pullFromCloud();
+    try {
+      replayResult = await _replayPendingMutations();
+      pullResult = await _pullFromCloud();
+    } finally {
+      // Part K invariant (spec Part M): every change up to the cursor must be
+      // APPLIED, durably DEFERRED, or QUARANTINED. Deferred records are
+      // re-applied LOCALLY (no network involved), so the retry pass runs even
+      // when the pull itself failed — parents may have landed on a previous
+      // cycle and waiting a full interval adds nothing.
+      try {
+        deferredResult = await _retryDeferredChanges();
+      } catch (deferredErr) {
+        console.warn('[SyncService] Deferred retry pass error (non-fatal):', deferredErr.message);
+      }
+    }
+
+    // Part AB: a cursor older than the feed retention horizon is repaired by
+    // a full snapshot reconciliation (record-diff push + pull-from-0 LWW).
+    if (_retentionRepairNeeded) {
+      _retentionRepairNeeded = false;
+      console.log('[SyncService] Running full snapshot reconciliation (retention repair, Part AB)');
+      await reconcileRecords();
+      await _pullFromCloud({ fullSync: true });
+    }
     _resetBackoff();
 
     emit({
@@ -1354,6 +1841,7 @@ async function _incrementalPullCycle(trigger) {
         replayFailed: replayResult.failed,
         deleted: pullResult.deleted,
         conflicts: pullResult.conflicts,
+        deferredResolved: deferredResult ? deferredResult.resolved : 0,
       },
     });
   } catch (err) {
@@ -1661,6 +2149,12 @@ function setAuth(token, userContext) {
   // Trigger a cycle shortly after auth is set (post-login replay + pull).
   if (_isStarted && token) {
     setTimeout(function() {
+      // P0: auth arrival is itself a wakeup for the initializer — when the
+      // workspace is NOT_INITIALIZED and the cloud hosts the sync API, the
+      // import starts here instead of waiting for a screen or a login form.
+      ensureWorkspaceInitialized('post-auth').catch(function (err) {
+        console.error('[SyncService] Post-auth init error:', err.message);
+      });
       _incrementalPullCycle('post-auth').catch(function(err) {
         console.error('[SyncService] Post-auth sync error:', err.message);
       });
@@ -1781,4 +2275,11 @@ module.exports = {
   onLocalMutation: onLocalMutation,
   setInitialCursor: setInitialCursor,
   reconcileRecords: reconcileRecords,
+  // offline-first spec additions (Parts D/K/L/AB/AD/AE)
+  isAgencyReady: function() { return _isAgencyReady(true); },
+  applyPullChanges: function(db, cloudChanges, pageCtx) { return _applyPullChanges(db, cloudChanges, pageCtx); },
+  retryDeferredChanges: function() { return _retryDeferredChanges(); },
+  // P0 deadlock breaker: wakes the initializer when NOT_INITIALIZED + cloud reachable
+  ensureWorkspaceInitialized: ensureWorkspaceInitialized,
+  probeCloudSyncRoutes: function() { return _probeCloudSyncRoutes(); },
 };

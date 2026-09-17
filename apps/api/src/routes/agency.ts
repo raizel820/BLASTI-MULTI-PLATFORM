@@ -10,6 +10,7 @@ import { hashPassword } from '../lib/password'
 import { calculateETA, getEffectiveServiceTime } from '../lib/eta-calculator'
 import { z } from 'zod'
 import QRCode from 'qrcode'
+import { recordSyncChange } from '../lib/sync-helpers'
 
 const app = new Hono()
 
@@ -1419,6 +1420,8 @@ app.post('/queue/call-next', async (c) => {
             where: { id: called.id },
             data: { status: 'COMPLETED', completedAt: new Date() },
           })
+          // Spec Part O: tx op invisible to the auto-tracking extension.
+          await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: called.id, operation: 'update' })
           await tx.auditLog.create({
             data: {
               action: 'QUEUE_AUTO_COMPLETE',
@@ -1739,6 +1742,8 @@ app.post('/queue/walk-in', async (c) => {
           service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
         },
       })
+      // Spec Part O: tx op invisible to the auto-tracking extension.
+      await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: res.id, operation: 'create' })
 
       // Update queue settings
       if (agency.queueSettings.length > 0) {
@@ -1746,6 +1751,7 @@ app.post('/queue/walk-in', async (c) => {
           where: { id: agency.queueSettings[0].id },
           data: { lastIssuedNumber: nextNumber },
         })
+        await recordSyncChange({ tx, agencyId, model: 'QueueSettings', recordId: agency.queueSettings[0].id, operation: 'update' })
       }
 
       // Create audit log
@@ -3671,6 +3677,10 @@ async function processCandidate(tx: any, candidate: any, queueSettings: any, age
     where: { id: candidate.id },
     data: reservationData,
   })
+  // Spec Part O: transactional writes are invisible to the auto-tracking
+  // extension — record every change of the call-next flow INSIDE the tx so
+  // the change feed (and desktop realtime) never misses a call-next.
+  await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: candidate.id, operation: 'update' })
 
   // Link reservation to counter as the active serving ticket
   if (counterId) {
@@ -3678,6 +3688,7 @@ async function processCandidate(tx: any, candidate: any, queueSettings: any, age
       where: { id: counterId },
       data: { currentReservationId: candidate.id },
     })
+    await recordSyncChange({ tx, agencyId, model: 'Counter', recordId: counterId, operation: 'update' })
   }
 
   if (queueSettings) {
@@ -3685,11 +3696,12 @@ async function processCandidate(tx: any, candidate: any, queueSettings: any, age
       where: { id: queueSettings.id },
       data: { currentServingNumber: candidate.queueNumber },
     })
+    await recordSyncChange({ tx, agencyId, model: 'QueueSettings', recordId: queueSettings.id, operation: 'update' })
   }
 
   // Only create notification if user exists (not walk-in)
   if (candidate.userId) {
-    await tx.notification.create({
+    const notif = await tx.notification.create({
       data: {
         userId: candidate.userId,
         type: 'QUEUE_CALLED',
@@ -3697,6 +3709,7 @@ async function processCandidate(tx: any, candidate: any, queueSettings: any, age
         message: `Your number ${candidate.displayNumber} has been called. Please proceed.`,
       },
     })
+    await recordSyncChange({ tx, agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
   }
 
   const auditUser = candidate.userId

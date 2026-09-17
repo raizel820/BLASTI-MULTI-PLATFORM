@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { db } from '@blasti/db'
 import { normalizeDzPhone, getSmsTemplate, sendSms } from '../lib/sms-service'
+import { recordSyncChange } from '../lib/sync-helpers'
 
 const app = new Hono()
 
@@ -61,9 +62,11 @@ app.get('/auto-skip', async (c) => {
         } catch {
           console.warn('[cron/auto-skip] Could not set skippedForNoShow, column may not exist')
         }
+        // Spec Part O: tx ops are invisible to the auto-tracking extension.
+        await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Reservation', recordId: reservation.id, operation: 'update' })
 
         if (reservation.userId) {
-          await tx.notification.create({
+          const notif = await tx.notification.create({
             data: {
               userId: reservation.userId,
               type: 'NO_SHOW_WARNING',
@@ -71,6 +74,7 @@ app.get('/auto-skip', async (c) => {
               message: `Your ticket ${reservation.displayNumber} at ${agencyName} was skipped because you did not respond within ${NO_SHOW_SKIP_MINUTES} minutes. You can still reclaim your position if you arrive soon.`,
             },
           })
+          await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
         }
 
         await tx.auditLog.create({
@@ -146,9 +150,11 @@ app.get('/check-reminders', async (c) => {
             where: { id: reservation.id },
             data: { reminderSent: true, reminderSentAt: new Date() },
           })
+          // Spec Part O: tx ops are invisible to the auto-tracking extension.
+          await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Reservation', recordId: reservation.id, operation: 'update' })
 
           if (reservation.userId) {
-            await tx.notification.create({
+            const notif = await tx.notification.create({
               data: {
                 userId: reservation.userId,
                 type: 'TURN_APPROACHING',
@@ -156,6 +162,7 @@ app.get('/check-reminders', async (c) => {
                 message: `Your ticket ${reservation.displayNumber} at ${agencyName} is coming up soon. ${peopleAhead === 0 ? 'You are next!' : `Approximately ${peopleAhead} ahead of you.`}`,
               },
             })
+            await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
           }
         })
 
@@ -357,6 +364,8 @@ app.post('/sweep-offline', async (c) => {
             syncConflict: true,
           },
         })
+        // Spec Part O: tx ops are invisible to the auto-tracking extension.
+        await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Reservation', recordId: reservation.id, operation: 'update' })
 
         // Notify the customer if they have a user account
         if (reservation.userId) {
@@ -366,7 +375,7 @@ app.post('/sweep-offline', async (c) => {
               : lang === 'fr' ? (reservation.agency as any)?.nameFr || (reservation.agency as any)?.name
               : (reservation.agency as any)?.name
 
-          await tx.notification.create({
+          const notif = await tx.notification.create({
             data: {
               userId: reservation.userId,
               type: 'RESERVATION_CANCELLED',
@@ -374,6 +383,7 @@ app.post('/sweep-offline', async (c) => {
               message: `Your offline reservation at ${agencyName} could not be synced within 24 hours and has been cancelled. Please try booking again when you have internet access.`,
             },
           })
+          await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
           notified++
         }
 

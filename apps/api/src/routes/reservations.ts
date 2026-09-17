@@ -7,6 +7,7 @@ import type { QueueEventType } from '../lib/realtime-emit'
 import { calculateETA, getEffectiveServiceTime, filterImmediateServiceWindow } from '../lib/eta-calculator'
 import type { ETAResult } from '../lib/eta-calculator'
 import { z } from 'zod'
+import { recordSyncChange } from '../lib/sync-helpers'
 
 const app = new Hono()
 
@@ -191,15 +192,21 @@ app.post('/', async (c) => {
         },
       })
 
+      // Spec Part O: transactional route mutations record their own SyncChange
+      // INSIDE the tx (the extension cannot see tx ops) — the change feed must
+      // not miss a customer joining the queue.
+      await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: res.id, operation: 'create' })
+
       if (agency.queueSettings.length > 0) {
         await tx.queueSettings.update({
           where: { id: agency.queueSettings[0].id },
           data: { lastIssuedNumber: nextNumber },
         })
+        await recordSyncChange({ tx, agencyId, model: 'QueueSettings', recordId: agency.queueSettings[0].id, operation: 'update' })
       }
 
       const dateLabel = targetDate ? ` (${targetDate})` : ''
-      await tx.notification.create({
+      const notif = await tx.notification.create({
         data: {
           userId,
           type: 'QUEUE_JOINED',
@@ -207,6 +214,7 @@ app.post('/', async (c) => {
           message: `Your ticket ${displayNumber} for ${agency.name} - ${service.name}${dateLabel}. Estimated wait: ${estimatedWait} minutes.`,
         },
       })
+      await recordSyncChange({ tx, agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
 
       await tx.auditLog.create({
         data: {
@@ -512,9 +520,10 @@ app.post('/reclaim', async (c) => {
       } catch {
         await tx.reservation.update({ where: { id: reservation.id }, data: { status: newStatus } })
       }
+      await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Reservation', recordId: reservation.id, operation: 'update' })
 
       if (reservation.userId) {
-        await tx.notification.create({
+        const notif = await tx.notification.create({
           data: {
             userId: reservation.userId,
             type: 'RECLAIM_SUCCESS',
@@ -522,6 +531,7 @@ app.post('/reclaim', async (c) => {
             message: `Your ticket ${reservation.displayNumber} at ${agencyName} has been reclaimed. ${newStatus === 'WAITING' ? 'You have been placed back in the queue.' : 'You are now being served. Please proceed to the counter.'}`,
           },
         })
+        await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
       }
 
       await tx.auditLog.create({
@@ -820,13 +830,20 @@ app.post('/:id/postpone', async (c) => {
       await tx.reservation.update({ where: { id: reservation.id }, data: { queueNumber: tempQueueNumber } })
 
       await tx.$executeRaw`
-        UPDATE Reservation 
-        SET queueNumber = queueNumber - 1 
+        UPDATE Reservation
+        SET queueNumber = queueNumber - 1
         WHERE agencyId = ${reservation.agencyId}
-        AND status = 'WAITING' 
+        AND status = 'WAITING'
         AND queueNumber > ${reservation.queueNumber}
         AND queueNumber <= ${targetQueueNumber}
       `
+
+      // Spec Part O: the raw-SQL shift is INVISIBLE to the auto-tracking
+      // extension — record a change for every shifted ticket (laterReservations
+      // is exactly the affected set: same filters, ordered, take: positions).
+      for (const shifted of laterReservations) {
+        await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Reservation', recordId: shifted.id, operation: 'update' })
+      }
 
       const newQueueNumber = targetQueueNumber
       const newDisplayNumber = reservation.displayNumber
@@ -835,9 +852,10 @@ app.post('/:id/postpone', async (c) => {
         where: { id: reservation.id },
         data: { queueNumber: newQueueNumber, postponeCount: reservation.postponeCount + 1 },
       })
+      await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Reservation', recordId: result.id, operation: 'update' })
 
       if (reservation.userId) {
-        await tx.notification.create({
+        const notif = await tx.notification.create({
           data: {
             userId: reservation.userId,
             type: 'QUEUE_POSTPONED',
@@ -845,6 +863,7 @@ app.post('/:id/postpone', async (c) => {
             message: `Your reservation has been postponed by ${positions} position(s). New queue number: ${newDisplayNumber}`,
           },
         })
+        await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
       }
 
       await tx.auditLog.create({
@@ -1065,11 +1084,13 @@ app.post('/:id/cancel', async (c) => {
 
     await db.$transaction(async (tx) => {
       await tx.reservation.update({ where: { id }, data: { status: 'CANCELLED', cancelledAt: new Date() } })
+      await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Reservation', recordId: id, operation: 'update' })
 
       if (reservation.userId) {
-        await tx.notification.create({
+        const notif = await tx.notification.create({
           data: { userId: reservation.userId, type: 'RESERVATION_CANCELLED', title: 'Reservation Cancelled', message: `Your reservation ${reservation.displayNumber} has been cancelled.` },
         })
+        await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
       }
 
       await tx.auditLog.create({

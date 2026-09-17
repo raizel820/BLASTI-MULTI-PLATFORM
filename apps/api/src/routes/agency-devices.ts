@@ -3,6 +3,7 @@ import { Hono, type Context } from 'hono'
 import { db, dbRaw } from '@blasti/db'
 import { requireAuth, authErrorResponse, AuthError } from '../lib/auth'
 import { z } from 'zod'
+import { recordSyncChange } from '../lib/sync-helpers'
 import crypto from 'crypto'
 import { validateBody, kioskJoinSchema } from '../lib/validations'
 import { emitQueueEvent, emitKioskEvent, emitAgencyDeviceEvent } from '../lib/realtime-emit'
@@ -458,9 +459,12 @@ app.post('/public/join-queue', async (c) => {
           userId: null,
         },
       })
+      // Spec Part O: tx ops are invisible to the auto-tracking extension.
+      await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: res.id, operation: 'create' })
 
       if (agency.queueSettings.length > 0) {
         await tx.queueSettings.update({ where: { id: agency.queueSettings[0].id }, data: { lastIssuedNumber: nextNumber } })
+        await recordSyncChange({ tx, agencyId, model: 'QueueSettings', recordId: agency.queueSettings[0].id, operation: 'update' })
       }
 
       return res

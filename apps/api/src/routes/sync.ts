@@ -82,7 +82,17 @@ const pullSchema = z.object({
   agencyId: z.string().optional(),
   sinceSequence: z.number().int().min(0).optional(),
   limit: z.number().int().min(1).max(2000).optional(),
+  protocolVersion: z.number().optional(),
 })
+
+/**
+ * Protocol negotiation (spec Part AM): a client speaking a NEWER protocol
+ * than this server MUST be rejected with UPDATE_REQUIRED instead of silently
+ * receiving mismatched semantics.
+ */
+function checkProtocolVersion(clientVersion: number | undefined): boolean {
+  return clientVersion === undefined || clientVersion <= SYNC_PROTOCOL_VERSION
+}
 
 // POST /api/sync/pull — incremental change feed since a cursor
 app.post('/pull', async (c) => {
@@ -94,7 +104,16 @@ app.post('/pull', async (c) => {
       return c.json({ success: false, error: 'Invalid pull request', details: validation.error.issues }, 400)
     }
 
-    const { agencyId: requestedAgencyId, sinceSequence = 0, limit = 500 } = validation.data
+    const { agencyId: requestedAgencyId, sinceSequence = 0, limit = 500, protocolVersion } = validation.data
+
+    if (!checkProtocolVersion(protocolVersion)) {
+      return c.json({
+        success: false,
+        error: 'UPDATE_REQUIRED',
+        detail: `Client protocol ${protocolVersion} is newer than server protocol ${SYNC_PROTOCOL_VERSION} — update the server`,
+        serverProtocolVersion: SYNC_PROTOCOL_VERSION,
+      }, 400)
+    }
 
     const targetAgencyId = await resolveTargetAgencyId(user, requestedAgencyId)
     if (!targetAgencyId) {
@@ -110,7 +129,13 @@ app.post('/pull', async (c) => {
       protocolVersion: SYNC_PROTOCOL_VERSION,
       agencyId: targetAgencyId,
       sinceSequence,
-      latestSequence: result.latestSequence,
+      // SAFE cursor (spec Part L): last sequence INCLUDED in this page.
+      pageLastSequence: result.pageLastSequence,
+      latestSequence: result.pageLastSequence,
+      // Observability only — clients must NEVER advance to this.
+      globalCurrentSequence: result.globalCurrentSequence,
+      // Retention signal (spec Part AB): cursor < oldestAvailable → reconcile.
+      oldestAvailableSequence: result.oldestAvailableSequence,
       hasMore: result.hasMore,
       timestamp: new Date().toISOString(),
       changes: result.changes,
@@ -137,6 +162,7 @@ const pushSchemaV2 = z.object({
   mutations: z.array(pushMutationSchema).optional(),
   // Legacy WatermelonDB-shaped payload (changes map) — converted server-side.
   changes: z.record(z.string(), z.any()).optional(),
+  protocolVersion: z.number().optional(),
 })
 
 // POST /api/sync/push — idempotent, conflict-aware mutation processing
@@ -149,7 +175,16 @@ app.post('/push', async (c) => {
       return c.json({ success: false, error: 'Invalid push request', details: validation.error.issues }, 400)
     }
 
-    const { agencyId: requestedAgencyId, mutations, changes } = validation.data
+    const { agencyId: requestedAgencyId, mutations, changes, protocolVersion } = validation.data
+
+    if (!checkProtocolVersion(protocolVersion)) {
+      return c.json({
+        success: false,
+        error: 'UPDATE_REQUIRED',
+        detail: `Client protocol ${protocolVersion} is newer than server protocol ${SYNC_PROTOCOL_VERSION} — update the server`,
+        serverProtocolVersion: SYNC_PROTOCOL_VERSION,
+      }, 400)
+    }
 
     const targetAgencyId = await resolveTargetAgencyId(user, requestedAgencyId)
     if (!targetAgencyId && (mutations?.length || changes)) {

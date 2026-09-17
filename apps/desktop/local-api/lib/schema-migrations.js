@@ -75,10 +75,15 @@ const SYNC_INFRA_DDL = [
   'CREATE TABLE IF NOT EXISTS "_sync_conflicts" ("id" TEXT PRIMARY KEY, "modelName" TEXT NOT NULL, "recordId" TEXT NOT NULL, "agencyId" TEXT, "localVersion" BIGINT, "cloudVersion" BIGINT, "localData" TEXT, "cloudData" TEXT, "resolution" TEXT DEFAULT \'pending\', "resolvedAt" BIGINT, "createdAt" BIGINT NOT NULL)',
   'CREATE INDEX IF NOT EXISTS "idx_sync_conflicts_model" ON "_sync_conflicts"("modelName")',
   'CREATE INDEX IF NOT EXISTS "idx_sync_conflicts_resolution" ON "_sync_conflicts"("resolution")',
-  'CREATE TABLE IF NOT EXISTS "_pending_mutations" ("id" TEXT PRIMARY KEY, "method" TEXT NOT NULL, "path" TEXT NOT NULL, "body" TEXT, "headers" TEXT, "status" TEXT NOT NULL DEFAULT \'pending\', "attempts" INTEGER NOT NULL DEFAULT 0, "max_attempts" INTEGER NOT NULL DEFAULT 5, "created_at" BIGINT NOT NULL, "last_attempt_at" BIGINT, "last_error" TEXT, "response_data" TEXT, "idempotency_key" TEXT)',
+  'CREATE TABLE IF NOT EXISTS "_pending_mutations" ("id" TEXT PRIMARY KEY, "method" TEXT NOT NULL, "path" TEXT NOT NULL, "body" TEXT, "headers" TEXT, "status" TEXT NOT NULL DEFAULT \'pending\', "attempts" INTEGER NOT NULL DEFAULT 0, "max_attempts" INTEGER NOT NULL DEFAULT 5, "created_at" BIGINT NOT NULL, "last_attempt_at" BIGINT, "next_retry_at" BIGINT, "last_http_status" INTEGER, "last_error" TEXT, "response_data" TEXT, "idempotency_key" TEXT)',
   'CREATE INDEX IF NOT EXISTS "idx_pending_mutations_status" ON "_pending_mutations"("status")',
   'CREATE UNIQUE INDEX IF NOT EXISTS "idx_pending_mutations_idem" ON "_pending_mutations"("idempotency_key")',
   'CREATE TABLE IF NOT EXISTS "_sync_applied_mutations" ("key" TEXT PRIMARY KEY, "appliedAt" BIGINT NOT NULL)',
+  // Part K: durable deferred-change queue — a dependency-failed change is
+  // PERSISTED here before the pull cursor may advance past it. Never in-memory.
+  'CREATE TABLE IF NOT EXISTS "_deferred_changes" ("id" TEXT PRIMARY KEY, "agencyId" TEXT NOT NULL, "source" TEXT NOT NULL DEFAULT \'pull\', "sequence" INTEGER, "stage" TEXT, "model" TEXT NOT NULL, "recordId" TEXT NOT NULL, "operation" TEXT NOT NULL, "payload" TEXT, "dependencyError" TEXT, "retryCount" INTEGER NOT NULL DEFAULT 0, "firstSeenAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "lastRetryAt" DATETIME, "nextRetryAt" DATETIME, "status" TEXT NOT NULL DEFAULT \'PENDING\', "lastError" TEXT)',
+  'CREATE INDEX IF NOT EXISTS "idx_deferred_agency_status" ON "_deferred_changes"("agencyId", "status")',
+  'CREATE INDEX IF NOT EXISTS "idx_deferred_status_next" ON "_deferred_changes"("status", "nextRetryAt")',
 ]
 
 const SYNC_INFRA_TABLES = [
@@ -86,6 +91,7 @@ const SYNC_INFRA_TABLES = [
   '_sync_conflicts',
   '_pending_mutations',
   '_sync_applied_mutations',
+  '_deferred_changes',
 ]
 
 // ─── Required-table verification list ───────────────────────────────────────

@@ -20,7 +20,7 @@ import os from 'os'
 import { Server as SocketIOServer } from 'socket.io'
 import type { Socket } from 'socket.io'
 import { createServer, IncomingMessage, ServerResponse } from 'http'
-import { timingSafeEqual } from 'crypto'
+import { timingSafeEqual, randomUUID } from 'crypto'
 import { verifySessionToken, SessionToken } from './lib/auth'
 import {
   getClientIp,
@@ -280,6 +280,8 @@ app.get('/health', (c) => {
     status: 'ok',
     service: '@blasti/api',
     version: '0.2.0',
+    bootId: BOOT_ID,
+    sync: SYNC_HEALTH,
     connections: io?.engine?.clientsCount ?? 0,
     totalConnections,
     totalEventsEmitted,
@@ -295,6 +297,8 @@ app.get('/api/health', (c) => c.json({
   status: 'ok',
   service: '@blasti/api',
   version: '0.2.0',
+  bootId: BOOT_ID,
+  sync: SYNC_HEALTH,
   uptime: Math.floor(process.uptime()),
 }))
 
@@ -380,6 +384,30 @@ app.route('/api/offline-sync', offlineSyncRoutes)
 app.route('/api/qr-claim', qrClaimRoutes)
 app.route('/api/agency-devices', agencyDeviceRoutes)
 app.route('/api/app-versions', appVersionRoutes)
+
+// ─── Sync-route introspection (P0-2: make the running build self-evident) ──
+// Field round 4 showed a cloud process answering /api/health with 200 while
+// POST /api/sync/pull 404'd with the self-identifying body — impossible for
+// THIS file (routes mount synchronously above). Health now DECLARES the
+// registered sync routes + a per-boot id, so a stale build (no sync field),
+// a route-less build (sync.registered=false) and a process split (bootId
+// flapping between two values across probes) are all remotely provable.
+const SYNC_ROUTES = (() => {
+  try {
+    return (app.routes as Array<{ method: string; path: string }>)
+      .map((r) => `${r.method} ${r.path}`)
+      .filter((p) => p.includes('/api/sync'))
+      .sort()
+  } catch {
+    return [] as string[]
+  }
+})()
+const BOOT_ID = randomUUID()
+const SYNC_HEALTH = {
+  registered: SYNC_ROUTES.length > 0,
+  routes: SYNC_ROUTES,
+  protocolVersion: 2,
+}
 
 // ─── Self-identifying 404 (isolation aid) ─────────────────────────────────
 // Hono's default 404 is a plain-text "404 Not Found" with no context, which
@@ -853,18 +881,59 @@ io.on('connection', async (socket) => {
     }
   }
 
+  // ── Part AG: agency-room membership check ────────────────────────────
+  // An authenticated principal may only join agency rooms it is actually
+  // authorized for: staff member of the agency, owner of the agency, or
+  // SUPER_ADMIN. Registered devices join their OWN agency only. This is
+  // enforced in BOTH join:room('agency:*') and join:agency(id).
+  const authorizedForAgency = async (agencyId: string): Promise<boolean> => {
+    if (!agencyId) return false
+    const auth = (socket as any)._authUser
+    const isDevice = (socket as any)._isDevice
+    if (isDevice) {
+      // Devices are bound to exactly one agency at registration.
+      try {
+        const dev = (socket as any)._device
+        if (dev?.agencyId) return dev.agencyId === agencyId
+        const token = (socket as any)._deviceToken
+        if (token) {
+          const row = await db.agencyDevice.findUnique({ where: { deviceToken: token }, select: { agencyId: true } })
+          ;(socket as any)._device = row
+          return row?.agencyId === agencyId
+        }
+      } catch { /* fall through to deny */ }
+      return false
+    }
+    if (!auth) return false
+    if (auth.role === 'SUPER_ADMIN') return true
+    try {
+      const staff = await db.agencyStaff.findFirst({ where: { userId: auth.id, agencyId, isActive: true }, select: { id: true } })
+      if (staff) return true
+      const owned = await db.agency.findFirst({ where: { id: agencyId, ownerId: auth.id }, select: { id: true } })
+      return !!owned
+    } catch (err) {
+      console.error('[Socket] agency authorization check failed:', (err as Error)?.message)
+      return false
+    }
+  }
+
+
   // ─── Phase 1b: Secure Room Joining ────────────────────────────────────
 
-  socket.on('join:room', (room: string) => {
+  socket.on('join:room', async (room: string) => {
     if (room && typeof room === 'string') {
       // Phase 1b: Validate access to sensitive rooms
       if (room.startsWith('admin:global') && !isAuthenticated) {
         console.warn(`[AUTH] Unauthenticated socket ${socket.id} tried to join admin:global — rejected`)
         return
       }
-      if (room.startsWith('agency:') && !isAuthenticated && !(socket as any)._isDevice) {
-        console.warn(`[AUTH] Unauthenticated socket ${socket.id} tried to join agency room via join:room — rejected`)
-        return
+      if (room.startsWith('agency:')) {
+        const roomAgencyId = room.substring('agency:'.length)
+        const allowed = await authorizedForAgency(roomAgencyId)
+        if (!allowed) {
+          console.warn(`[AUTH] Socket ${socket.id} (user: ${(socket as any)._authUser?.username || 'device/anon'}) tried to join ${room} without membership — rejected`)
+          return
+        }
       }
       if (room.startsWith('customer:') && !isAuthenticated) {
         console.warn(`[AUTH] Unauthenticated socket ${socket.id} tried to join customer room via join:room — rejected`)
@@ -878,29 +947,28 @@ io.on('connection', async (socket) => {
     if (room && typeof room === 'string') socket.leave(room)
   })
 
-  socket.on('join:agency', (id: string) => {
-    if (id) {
-      // M36: Verify the socket is authenticated or is a device
-      const auth = (socket as any)._authUser
-      const isDevice = (socket as any)._isDevice
-      if (!auth && !isDevice) {
-        console.warn(`[Socket] Unauthenticated socket tried to join agency:${id}`)
-        return
-      }
-
-      socket.join(`agency:${id}`)
-
-      // Phase 3: Track agency presence
-      if (!agencyPresence.has(id)) agencyPresence.set(id, new Set())
-      agencyPresence.get(id)!.add(socket.id)
-      if (!socketAgencyMap.has(socket.id)) socketAgencyMap.set(socket.id, new Set())
-      socketAgencyMap.get(socket.id)!.add(id)
-
-      // Update heartbeat
-      if (!agencyHeartbeats.has(id)) agencyHeartbeats.set(id, { lastBeat: Date.now(), socketIds: new Set() })
-      agencyHeartbeats.get(id)!.lastBeat = Date.now()
-      agencyHeartbeats.get(id)!.socketIds.add(socket.id)
+  socket.on('join:agency', async (id: string) => {
+    if (!id) return
+    // Part AG: membership authorization — not merely "is authenticated".
+    const allowed = await authorizedForAgency(id)
+    if (!allowed) {
+      const who = (socket as any)._authUser?.username || ((socket as any)._isDevice ? 'device' : 'anonymous')
+      console.warn(`[Socket] Socket ${socket.id} (${who}) tried to join agency:${id} without membership — rejected`)
+      return
     }
+
+    socket.join(`agency:${id}`)
+
+    // Phase 3: Track agency presence
+    if (!agencyPresence.has(id)) agencyPresence.set(id, new Set())
+    agencyPresence.get(id)!.add(socket.id)
+    if (!socketAgencyMap.has(socket.id)) socketAgencyMap.set(socket.id, new Set())
+    socketAgencyMap.get(socket.id)!.add(id)
+
+    // Update heartbeat
+    if (!agencyHeartbeats.has(id)) agencyHeartbeats.set(id, { lastBeat: Date.now(), socketIds: new Set() })
+    agencyHeartbeats.get(id)!.lastBeat = Date.now()
+    agencyHeartbeats.get(id)!.socketIds.add(socket.id)
   })
 
   socket.on('leave:agency', (id: string) => {
@@ -1072,10 +1140,18 @@ io.on('connection', async (socket) => {
 httpServer.listen(PORT, '127.0.0.1', async () => {
   // Phase 3b: Set SQLite busy_timeout PRAGMA on startup
   await setupSQLitePragmas()
-  console.log(`🚀 @blasti/api server running on port ${PORT}`)
+  console.log(`🚀 @blasti/api server running on port ${PORT} (bootId: ${BOOT_ID.substring(0, 8)}…)`)
   console.log(`   API:    http://localhost:${PORT}/`)
   console.log(`   Health: http://localhost:${PORT}/health`)
   console.log(`   Routes: http://localhost:${PORT}/api/*`)
+  // P0-2: the sync route table is logged at boot — if a future run shows the
+  // desktop 404ing on /api/sync/pull, the ABSENCE of this line (or of the
+  // pull route in it) proves the running process predates this file.
+  if (SYNC_ROUTES.length > 0) {
+    console.log(`   🔄 Sync routes registered (${SYNC_ROUTES.length}): ${SYNC_ROUTES.join(', ')}`)
+  } else {
+    console.error('   ⛔ NO SYNC ROUTES REGISTERED — the /api/sync mount failed; desktop initial sync cannot run against this build!')
+  }
   if (INTERNAL_SECRET) {
     console.log(`   🔒 Emit endpoints secured with x-internal-secret`)
   } else {

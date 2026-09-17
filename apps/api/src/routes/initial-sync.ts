@@ -39,7 +39,7 @@
 import { Hono } from 'hono'
 import { db } from '@blasti/db'
 import { requireAuth, requireAgencyAccess, authErrorResponse, AuthError } from '../lib/auth'
-import { getLatestSequence } from '../lib/sync-helpers'
+import { getLatestSequence, redactRecord } from '../lib/sync-helpers'
 import { SYNC_PROTOCOL_VERSION, SYNC_REGISTRY } from '@blasti/core/sync-registry'
 import { serializeForCloud } from '@blasti/core/sync-serializer'
 import { z } from 'zod'
@@ -54,6 +54,10 @@ const initialSyncRequestSchema = z.object({
   cursor: z.string().optional(),
   pageSize: z.number().int().min(1).max(1000).optional(),
   protocolVersion: z.number().optional(),
+  // Part E: the client pins the snapshot ONCE at discovery and echoes it on
+  // every stage/page request — the server must NOT recompute it per page
+  // (a later value would silently widen the snapshot mid-import).
+  snapshotSequence: z.number().int().min(0).optional(),
 })
 
 interface StageMeta {
@@ -175,7 +179,8 @@ async function fetchStageData(
         where: { id: { in: Array.from(userIds) } },
         
       })
-      return { records, hasMore: false, total: records.length }
+      // Part AF: password hashes / device tokens never leave the cloud.
+      return { records: records.map((r: any) => redactRecord('User', r)), hasMore: false, total: records.length }
     }
 
     // ── 3. Services ───────────────────────────────────────────────────────
@@ -273,13 +278,14 @@ async function fetchStageData(
           db.reservation.findMany({
             where: {
               agencyId,
-              ...(cursor ? { id: { gt: cursor } } : {}),
+              ...tupleKeyset('joinedAt', parseStageCursor(cursor)),
             },
             // NOTE: Reservation has no createdAt — the queue timestamp is joinedAt.
             orderBy: [{ joinedAt: 'asc' }, { id: 'asc' }],
             take: pageSize + 1,
           }),
         pageSize,
+        'joinedAt',
       )
     }
 
@@ -291,12 +297,13 @@ async function fetchStageData(
           db.review.findMany({
             where: {
               agencyId,
-              ...(cursor ? { id: { gt: cursor } } : {}),
+              ...tupleKeyset('createdAt', parseStageCursor(cursor)),
             },
             orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
             take: pageSize + 1,
           }),
         pageSize,
+        'createdAt',
       )
     }
 
@@ -308,7 +315,7 @@ async function fetchStageData(
           db.favorite.findMany({
             where: {
               agencyId,
-              ...(cursor ? { id: { gt: cursor } } : {}),
+              ...tupleKeyset('createdAt', parseStageCursor(cursor)),
             },
             select: {
               id: true, userId: true, agencyId: true, 
@@ -318,6 +325,7 @@ async function fetchStageData(
             take: pageSize + 1,
           }),
         pageSize,
+        'createdAt',
       )
     }
 
@@ -363,12 +371,13 @@ async function fetchStageData(
           db.notification.findMany({
             where: {
               userId: { in: userIdArray },
-              ...(cursor ? { id: { gt: cursor } } : {}),
+              ...tupleKeyset('createdAt', parseStageCursor(cursor)),
             },
             orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
             take: pageSize + 1,
           }),
         pageSize,
+        'createdAt',
       )
     }
 
@@ -404,12 +413,13 @@ async function fetchStageData(
           db.transaction.findMany({
             where: {
               agencyId,
-              ...(cursor ? { id: { gt: cursor } } : {}),
+              ...tupleKeyset('createdAt', parseStageCursor(cursor)),
             },
             orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
             take: pageSize + 1,
           }),
         pageSize,
+        'createdAt',
       )
     }
 
@@ -453,16 +463,69 @@ async function fetchStageData(
  * - Cursor is the last record's ID from the previous page.
  * - Returns the actual page of records + pagination metadata.
  */
+interface StageCursorTuple {
+  time: string
+  id: string
+}
+
+/**
+ * Deterministic keyset pagination (spec Part H, Option B - tuple cursor).
+ *
+ * The old pattern `ORDER BY [timeField, id]` + `WHERE id > cursor` was an
+ * INVALID keyset: records with id <= cursor but a later sort key were skipped
+ * permanently. The cursor is now the TUPLE `<timeISO>|<id>` and the WHERE
+ * clause is the matching lexicographic condition:
+ *
+ *   timeField > t  OR  (timeField = t AND id > lastId)
+ *
+ * Legacy plain-id cursors (pre-tuple imports) parse as invalid -> the stage
+ * restarts from page 1 - safe, because every stage application is an
+ * idempotent upsert.
+ */
+function parseStageCursor(cursor: string | undefined): StageCursorTuple | null {
+  if (!cursor) return null
+  const sep = cursor.indexOf('|')
+  if (sep <= 0 || sep === cursor.length - 1) {
+    console.warn(`[initial-sync] legacy/invalid cursor ignored - stage restarts from page 1: "${cursor.substring(0, 64)}"`)
+    return null
+  }
+  const time = cursor.substring(0, sep)
+  const id = cursor.substring(sep + 1)
+  if (Number.isNaN(new Date(time).getTime())) return null
+  return { time, id }
+}
+
+/** Tuple keyset condition matching the ORDER BY [timeField, id]. */
+function tupleKeyset(timeField: string, tuple: StageCursorTuple | null) {
+  if (!tuple) return {}
+  return {
+    OR: [
+      { [timeField]: { gt: tuple.time } },
+      { [timeField]: tuple.time, id: { gt: tuple.id } },
+    ],
+  }
+}
+
+/** Tuple cursor for the last record of a page. */
+function makeStageCursor(record: any, timeField: string): string | undefined {
+  if (!record) return undefined
+  const t = record[timeField]
+  if (!t) return undefined
+  const iso = t instanceof Date ? t.toISOString() : String(t)
+  return `${iso}|${record.id}`
+}
+
 async function fetchPaginated(
   countFn: () => Promise<number>,
   findManyFn: () => Promise<any[]>,
   pageSize: number,
+  timeField: string,
 ): Promise<{ records: any[]; nextCursor?: string; hasMore: boolean; total?: number }> {
   const [allRecords, total] = await Promise.all([findManyFn(), countFn()])
 
   const hasMore = allRecords.length > pageSize
   const records = hasMore ? allRecords.slice(0, pageSize) : allRecords
-  const nextCursor = hasMore && records.length > 0 ? records[records.length - 1].id : undefined
+  const nextCursor = hasMore && records.length > 0 ? makeStageCursor(records[records.length - 1], timeField) : undefined
 
   return { records, nextCursor, hasMore, total }
 }
@@ -521,16 +584,28 @@ app.post('/initial-data', async (c) => {
       )
     }
 
-    const { agencyId, stage, cursor, pageSize: rawPageSize, protocolVersion: _pv } = validation.data
+    const { agencyId, stage, cursor, pageSize: rawPageSize, protocolVersion: _pv, snapshotSequence: clientSnapshot } = validation.data
     const pageSize = Math.min(rawPageSize ?? DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE)
+
+    // -- Protocol negotiation (spec Part AM) -----------------------------
+    if (_pv !== undefined && _pv > SYNC_PROTOCOL_VERSION) {
+      return c.json({
+        success: false,
+        error: 'UPDATE_REQUIRED',
+        detail: `Client protocol ${_pv} is newer than server protocol ${SYNC_PROTOCOL_VERSION} - update the server`,
+        serverProtocolVersion: SYNC_PROTOCOL_VERSION,
+      }, 400)
+    }
 
     // ── Authenticate & authorize ──────────────────────────────────────────
     const user = await requireAgencyAccess(c, agencyId)
 
-    // ── Read current snapshot sequence ────────────────────────────────────
-    // This is the sequence at which this snapshot was taken — all data is
-    // consistent at this point.
-    const snapshotSequence = await getLatestSequence(agencyId)
+    // -- Snapshot sequence (spec Part E: ONE immutable snapshot) ---------
+    // Discovery (no stage) allocates the snapshot. Stage/page requests ECHO
+    // the client-pinned value so every page of one import shares a snapshot.
+    const snapshotSequence = stage
+      ? (clientSnapshot ?? (await getLatestSequence(agencyId)))
+      : await getLatestSequence(agencyId)
 
     // ── Discovery mode: return stages list ────────────────────────────────
     if (!stage) {
