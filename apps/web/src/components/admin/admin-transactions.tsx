@@ -44,21 +44,12 @@ interface PendingPayment {
 }
 
 /**
- * Get a proxied URL for accessing private storage files.
- * Delegates to the shared utility from @/lib/utils.
+ * Get a safe URL for accessing uploaded files.
+ * All uploads live on the API server's local disk and are served
+ * directly — no external storage provider is involved.
  */
 function getProxiedUrl(url: string): string {
-  if (!url) return url;
-  // Blob URLs need to go through the proxy
-  if (url.includes('.blob.vercel-storage.com')) {
-    return `/api/upload/proxy?url=${encodeURIComponent(url)}`;
-  }
-  // R2 URLs without public domain need proxying
-  if (url.includes('.r2.cloudflarestorage.com')) {
-    return `/api/upload/proxy?url=${encodeURIComponent(url)}`;
-  }
-  // Local URLs and other URLs can be used directly
-  return url;
+  return url || '';
 }
 
 export function AdminTransactions() {

@@ -1693,7 +1693,7 @@ const ar = {
   availableOnAll: 'متاح على جميع الأجهزة',
   sameAccountAllDevices: 'نفس الحساب، نفس البيانات على كل الأجهزة',
   unifiedApiBackend: 'خلفية API موحدة',
-  unifiedApiDesc: 'جميع المنصات تتصل بنفس الخادم المنشور على Vercel',
+  unifiedApiDesc: 'جميع المنصات تتصل بنفس الخادم الموحد المستضاف ذاتياً',
   desktopFeatures: 'إشعارات النظام • اختصارات لوحة المفاتيح • وضع عدم الاتصال',
   mobileFeatures: 'إشعارات فورية • ماسح QR • تحديثات في الخلفية',
   webFeatures: 'بدون تثبيت • يعمل في كل مكان • دائماً محدث',

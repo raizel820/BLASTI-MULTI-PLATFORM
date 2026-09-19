@@ -52,7 +52,7 @@ const path = require('path')
 // ─── Versioning ─────────────────────────────────────────────────────────────
 
 /** Current local schema version. Bump when adding MIGRATION_STEPS. */
-const LOCAL_SCHEMA_VERSION = 2
+const LOCAL_SCHEMA_VERSION = 3
 
 /**
  * Incremental upgrade steps BETWEEN versions. Each step:
@@ -79,6 +79,17 @@ const MIGRATION_STEPS = [
       'CREATE TABLE "LocalDeviceCredential" ("id" TEXT NOT NULL PRIMARY KEY, "userId" TEXT NOT NULL, "deviceId" TEXT NOT NULL, "verifierHash" TEXT NOT NULL, "salt" TEXT NOT NULL, "algo" TEXT NOT NULL DEFAULT \'scrypt\', "scryptN" INTEGER NOT NULL DEFAULT 16384, "scryptR" INTEGER NOT NULL DEFAULT 8, "scryptP" INTEGER NOT NULL DEFAULT 1, "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" DATETIME NOT NULL, "revokedAt" DATETIME, CONSTRAINT "LocalDeviceCredential_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE)',
       'CREATE INDEX "LocalDeviceCredential_userId_idx" ON "LocalDeviceCredential"("userId")',
       'CREATE UNIQUE INDEX "LocalDeviceCredential_userId_deviceId_key" ON "LocalDeviceCredential"("userId", "deviceId")',
+    ],
+  },
+  {
+    // Task 22 — email/phone verification flags. The regenerated shared
+    // Prisma client now includes these columns on User, so the local SQLite
+    // User table MUST have them for every local profile write to succeed.
+    version: 3,
+    name: 'user-verification-flags (emailVerified/phoneVerified — Task 22)',
+    statements: [
+      'ALTER TABLE "User" ADD COLUMN "emailVerified" BOOLEAN NOT NULL DEFAULT false',
+      'ALTER TABLE "User" ADD COLUMN "phoneVerified" BOOLEAN NOT NULL DEFAULT false',
     ],
   },
 ]
@@ -369,6 +380,7 @@ async function ensureSchema(db, opts = {}) {
       return result
     }
     await _ensurePendingMutationsIdempotencyColumn(db, log)
+    await _ensureUserVerificationColumns(db, log)
     await setMeta(db, 'schema_version', LOCAL_SCHEMA_VERSION)
     await setMeta(db, 'schema_adopted_at', String(Date.now()))
     result.action = 'adopted-legacy'
@@ -399,7 +411,13 @@ async function ensureSchema(db, opts = {}) {
     // Opportunistic top-up of protected tables (IF NOT EXISTS — zero-risk).
     await runStatements(db, SYNC_INFRA_DDL.map(hardenCreate), { tolerant: true })
     await _ensurePendingMutationsIdempotencyColumn(db, log)
+    await _ensureUserVerificationColumns(db, log)
   }
+
+  // 3b. CONVERGENCE (Task 22) — ensure User.emailVerified/phoneVerified on
+  //     EVERY path (fresh DDL has them → no-op; legacy adoption skipped the
+  //     version-gated step → adds them; stamped upgrades already migrated).
+  await _ensureUserVerificationColumns(db, log)
 
   // 3. CONVERGENCE REBUILD (v2) — relax User.passwordHash to NULL-allowed.
   //    Self-guarding (no-op when already nullable) so it is safe on every
@@ -669,6 +687,27 @@ async function _ensurePendingMutationsIdempotencyColumn(db, log) {
     )
   } catch (err) {
     log(`Warning: idempotency column/index check skipped: ${err?.message || err}`)
+  }
+}
+
+/**
+ * Task 22 convergence pass — runs on EVERY ensureSchema call (legacy-adopted
+ * databases skip version-gated steps, so the User verification columns are
+ * guarded here too). Additive + idempotent: only adds what is missing.
+ */
+async function _ensureUserVerificationColumns(db, log) {
+  try {
+    const cols = await tableColumns(db, 'User')
+    if (cols.length && !cols.includes('emailVerified')) {
+      await db.$executeRawUnsafe('ALTER TABLE "User" ADD COLUMN "emailVerified" BOOLEAN NOT NULL DEFAULT false')
+      log('Added User.emailVerified column')
+    }
+    if (cols.length && !cols.includes('phoneVerified')) {
+      await db.$executeRawUnsafe('ALTER TABLE "User" ADD COLUMN "phoneVerified" BOOLEAN NOT NULL DEFAULT false')
+      log('Added User.phoneVerified column')
+    }
+  } catch (err) {
+    log(`Warning: User verification columns check skipped: ${err?.message || err}`)
   }
 }
 

@@ -17,10 +17,17 @@ import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { UserRole } from '@/store/use-app-store';
 import { usePlatform } from '@/hooks/use-platform';
+import {
+  VerificationStep,
+  type VerificationPending,
+  type VerificationTargets,
+  type VerificationDev,
+  type VerificationSuccess,
+} from './verification-step';
 
 export function LoginForm() {
   const { setUser, setView, goBack, setSessionToken } = useAppStore();
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
   const { platform } = usePlatform();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -31,7 +38,17 @@ export function LoginForm() {
   const [loginSuccess, setLoginSuccess] = useState(false);
   const [shakeError, setShakeError] = useState(false);
   const [rememberMe, setRememberMe] = useState(false);
-  const [authView, setAuthView] = useState<'login' | 'forgot-password' | 'reset-password'>('login');
+  const [authView, setAuthView] = useState<'login' | 'forgot-password' | 'reset-password' | 'verify'>('login');
+
+  // Task 22-b: pending OTP verification — when the login API answers
+  // requiresVerification, the card shows the shared VerificationStep and the
+  // session is only established once BOTH codes pass.
+  const [verificationData, setVerificationData] = useState<{
+    verificationToken: string;
+    pending: VerificationPending;
+    targets?: VerificationTargets | null;
+    dev?: VerificationDev | null;
+  } | null>(null);
   const [forgotUsername, setForgotUsername] = useState('');
   const [forgotLoading, setForgotLoading] = useState(false);
   const [forgotSent, setForgotSent] = useState(false);
@@ -61,6 +78,20 @@ export function LoginForm() {
       });
 
       const data = await res.json();
+
+      // ── Task 22-b: unverified account → OTP verification instead of a session ──
+      // The response carries a short-lived verificationToken + the pending
+      // channels/targets/dev codes. No session exists yet.
+      if (res.ok && data.requiresVerification && data.verificationToken) {
+        setVerificationData({
+          verificationToken: data.verificationToken,
+          pending: (data.pending ?? { email: true, phone: true }) as VerificationPending,
+          targets: data.targets ?? null,
+          dev: data.dev ?? null,
+        });
+        setAuthView('verify');
+        return;
+      }
 
       if (res.ok && data.user) {
         setLoginSuccess(true);
@@ -133,6 +164,68 @@ export function LoginForm() {
     } finally {
       setLoading(false);
     }
+  };
+
+  // ── Task 22-b: OTP verification finished → session bootstrap ──
+  // EXACT same session bootstrap as the login success path above:
+  // setUser → setSessionToken (store: persistence + electronAPI.
+  // setCloudSyncAuth → blasti-auth.json + sync engine auth +
+  // electronAPI.setLocalApiSession + blasti-local-api-token key) →
+  // setNativeSessionToken → HTTP import-session backup → initialCloudSync →
+  // success animation + toast.
+  const finalizeVerificationLogin = (result: VerificationSuccess) => {
+    setLoginSuccess(true);
+    setTimeout(() => {
+      setUser(result.user as any);
+      setSessionToken(result.token);
+      // ── Electron: Establish local API session for LAN failover ──
+      try {
+        const w = window as any;
+        const isElectron = navigator.userAgent.includes('Electron') || w.electronAPI;
+        if (isElectron) {
+          // 0. Native session key so EVERY token consumer reads it
+          //    deterministically under local-first.
+          setNativeSessionToken(result.token);
+
+          // 1. buildAuthHeaders() fallback for local API requests
+          try { localStorage.setItem('blasti-local-api-token', result.token); } catch { /* ignore */ }
+
+          // 2. Import session directly into the local API via IPC bridge
+          if (w.electronAPI?.setLocalApiSession) {
+            w.electronAPI.setLocalApiSession({ token: result.token, user: result.user });
+          }
+
+          // 3. HTTP import-session backup (in case IPC bridge isn't wired).
+          //    apiFetch responses carry no url — same behavior as the login
+          //    path, where the check always passes and the backup fires.
+          fetch('http://127.0.0.1:3080/api/auth/import-session', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'omit',
+            body: JSON.stringify({ token: result.token, user: result.user }),
+          }).catch(() => { /* non-critical */ });
+
+          // 4. Trigger the initial workspace sync (cloud → local SQLite).
+          if (w.electronAPI?.initialCloudSync) {
+            w.electronAPI.initialCloudSync().then((syncResult: any) => {
+              if (syncResult?.success) {
+                console.log('[Login] Initial sync complete:', syncResult.pulled, 'records pulled');
+              }
+            }).catch(() => { /* non-critical — periodic sync will handle it */ });
+          }
+        }
+      } catch { /* ignore */ }
+      toast.success(t('loginSuccess'));
+      setVerificationData(null);
+      setLoginSuccess(false);
+    }, 600);
+  };
+
+  // Verification token expired/invalid → back to the login view (a fresh
+  // login re-issues the OTPs and a new verification token).
+  const handleVerificationTokenInvalid = () => {
+    setVerificationData(null);
+    setAuthView('login');
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -279,19 +372,21 @@ export function LoginForm() {
             `}</style>
             <Card className="relative shadow-xl border-0 bg-white/95 dark:bg-gray-900/95 backdrop-blur-md z-10">
               <CardHeader className="text-center pb-2">
-                <motion.div
-                  initial={{ scale: 0.5, opacity: 0 }}
-                  animate={{ scale: 1, opacity: 1 }}
-                  transition={{ type: 'spring', stiffness: 260, damping: 20, delay: 0.1 }}
-                  className="mx-auto mb-3 h-24 w-24 rounded-2xl overflow-hidden shadow-lg shadow-emerald-500/25"
-                >
-                  <img src="/logo.png" alt="BLASTI" width={48} height={48} className="h-full w-full object-contain" />
-                </motion.div>
-                <CardTitle className="text-2xl font-bold text-foreground">
-                  {authView === 'login' && t('login')}
-                  {authView === 'forgot-password' && t('forgotPasswordTitle')}
-                  {authView === 'reset-password' && t('resetPasswordTitle')}
-                </CardTitle>
+                {authView !== 'verify' && (<>
+                  <motion.div
+                    initial={{ scale: 0.5, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={{ type: 'spring', stiffness: 260, damping: 20, delay: 0.1 }}
+                    className="mx-auto mb-3 h-24 w-24 rounded-2xl overflow-hidden shadow-lg shadow-emerald-500/25"
+                  >
+                    <img src="/logo.png" alt="BLASTI" width={48} height={48} className="h-full w-full object-contain" />
+                  </motion.div>
+                  <CardTitle className="text-2xl font-bold text-foreground">
+                    {authView === 'login' && t('login')}
+                    {authView === 'forgot-password' && t('forgotPasswordTitle')}
+                    {authView === 'reset-password' && t('resetPasswordTitle')}
+                  </CardTitle>
+                </>)}
               </CardHeader>
               <AnimatePresence mode="wait">
                 {authView === 'login' && (
@@ -492,6 +587,30 @@ export function LoginForm() {
                         </button>
                       </p>
                     </CardFooter>
+                  </motion.div>
+                )}
+
+                {/* Task 22-b: OTP verification view */}
+                {authView === 'verify' && verificationData && (
+                  <motion.div
+                    key="verify"
+                    initial={{ opacity: 0, x: 20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, x: -20 }}
+                    transition={{ duration: 0.25 }}
+                  >
+                    <CardContent className="pt-4 pb-8">
+                      <VerificationStep
+                        verificationToken={verificationData.verificationToken}
+                        pending={verificationData.pending}
+                        targets={verificationData.targets}
+                        dev={verificationData.dev}
+                        lang={lang}
+                        onVerified={finalizeVerificationLogin}
+                        onTokenInvalid={handleVerificationTokenInvalid}
+                        onBack={() => { setVerificationData(null); setAuthView('login'); }}
+                      />
+                    </CardContent>
                   </motion.div>
                 )}
 

@@ -2,7 +2,7 @@
  * BLASTI Platform Detection & Configuration
  *
  * Detects whether the app is running as:
- * - Web (browser, deployed on Vercel)
+ * - Web (browser, self-hosted on your own server)
  * - Electron (desktop app)
  * - Capacitor (mobile app - Android/iOS)
  *

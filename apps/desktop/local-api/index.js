@@ -1124,6 +1124,16 @@ function createApp() {
 
       // ── 3. Cloud login through the local API (+ device credential) ──
       const cloud = await cloudLoginProxy(username, password, body && body.rememberMe ? { rememberMe: true } : undefined)
+
+      // ── Task 22: cloud requires email/phone OTP verification ──
+      // The account exists but is NOT verified: pass the verification payload
+      // through and DO NOT establish any session (local or cloud) until the
+      // codes are confirmed via POST /api/auth/verify.
+      if (cloud.ok && cloud.data && cloud.data.requiresVerification) {
+        console.log(`[LocalAPI] Cloud login requires verification for: ${username}`)
+        return c.json(cloud.data, 200)
+      }
+
       if (cloud.ok && cloud.data && cloud.data.user && cloud.data.token) {
         const cloudUser = cloud.data.user
         try {
@@ -1168,6 +1178,423 @@ function createApp() {
       console.error('[LocalAPI] Login error:', error)
       return c.json({ success: false, error: 'Login failed' }, 500)
     }
+  })
+
+  /**
+   * Plaintext passwords stashed between REGISTER and VERIFY (Task 22).
+   * Keyed by verificationToken; only used to derive the offline unlock
+   * credential the moment verification completes. Memory-only — a restart
+   * simply means the credential is stored at the next successful login.
+   */
+  const pendingVerificationPasswords = new Map()
+
+  /**
+   * Register a new account — CLOUD-NATIVE operation proxied through the
+   * local API. The desktop UI always targets 127.0.0.1:3080 (local-first
+   * contract), so without this route account creation was impossible in the
+   * desktop app even though the web register form existed.
+   *
+   * Flow (registration REQUIRES the cloud — an offline-created account would
+   * never exist on the cloud and could never sync or log in elsewhere):
+   *   1. Forward the payload to the cloud POST /api/auth/register.
+   *   2. Cloud rejection (409 username/phone taken, validation, …) is passed
+   *      through verbatim so the form can map field errors.
+   *   3. Task 22: the cloud now returns requiresVerification=true + a
+   *      verificationToken — OTP codes are sent for email + phone and NO
+   *      session exists until the codes are confirmed (POST /api/auth/verify).
+   *      The plaintext password is stashed in memory so the offline unlock
+   *      credential can be derived the moment verification completes.
+   *   4. Legacy path (cloud WITHOUT verification enforcement): sign in
+   *      immediately as before.
+   */
+  app.post('/api/auth/register', async (c) => {
+    try {
+      if (!db) {
+        return c.json({ success: false, error: 'Local database not ready' }, 503)
+      }
+
+      let body
+      try { body = await c.req.json() } catch { body = null }
+      if (!body || typeof body !== 'object' || !String(body.username || '').trim() || !String(body.password || '') || !String(body.fullName || '').trim()) {
+        return c.json({ success: false, error: 'username, fullName and password are required' }, 400)
+      }
+      if (String(body.password).length < 6) {
+        return c.json({ success: false, error: 'Password must be at least 6 characters' }, 400)
+      }
+
+      const base = cloudBaseUrl()
+      let reg
+      try {
+        const res = await fetch(base + '/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(15000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON error body */ }
+        reg = { ok: res.ok, status: res.status, data }
+      } catch (err) {
+        console.warn('[LocalAPI] Register proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Account creation requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+
+      if (!reg.ok || !reg.data || !reg.data.user) {
+        const status = reg.status || 500
+        const errBody = reg.data && typeof reg.data === 'object'
+          ? reg.data
+          : { success: false, error: 'Registration failed' }
+        console.warn(`[LocalAPI] Register rejected by cloud: HTTP ${status} — ${errBody.error || '(no error body)'}`)
+        return c.json(errBody, status)
+      }
+
+      const cloudUser = reg.data.user
+      const password = String(body.password)
+      const username = String(body.username).trim()
+
+      // ── Task 22: account created but UNVERIFIED — no session yet ──
+      if (reg.data.requiresVerification && reg.data.verificationToken) {
+        try {
+          await upsertLocalUserFromCloud(cloudUser)
+        } catch (e) {
+          console.warn('[LocalAPI] Register: local profile upsert failed:', e?.message || e)
+        }
+        pendingVerificationPasswords.set(reg.data.verificationToken, {
+          userId: cloudUser.id,
+          password,
+          storedAt: Date.now(),
+        })
+        // Prune stashes older than 30 minutes (verificationToken TTL is 15)
+        for (const [k, v] of pendingVerificationPasswords) {
+          if (Date.now() - v.storedAt > 30 * 60 * 1000) pendingVerificationPasswords.delete(k)
+        }
+        console.log(`[LocalAPI] Account registered — awaiting email/phone verification: ${cloudUser.username || username}`)
+        return c.json(reg.data, 201)
+      }
+
+      // Legacy path — cloud without verification enforcement: sign in now
+
+      // Sign in immediately — acquire the cloud session token (best effort).
+      let token = null
+      try {
+        const cloud = await cloudLoginProxy(username, password)
+        if (cloud.ok && cloud.data && cloud.data.user && cloud.data.token) {
+          token = cloud.data.token
+        }
+      } catch { /* tolerated — local token minted below */ }
+      if (!token) {
+        token = randomBytes(32).toString('hex')
+        console.warn('[LocalAPI] Register: cloud token unavailable — minted a LOCAL session token (a cloud token will be acquired at the next login)')
+      }
+
+      try {
+        await upsertLocalUserFromCloud(cloudUser)
+      } catch (e) {
+        console.warn('[LocalAPI] Register: local profile upsert failed:', e?.message || e)
+      }
+      try {
+        await storeDeviceCredential(cloudUser.id, password)
+      } catch (e) {
+        console.warn('[LocalAPI] Register: device credential store failed:', e?.message || e)
+      }
+
+      sessionToken = token
+      sessionUser = {
+        id: cloudUser.id,
+        username: cloudUser.username || username,
+        fullName: cloudUser.fullName || '',
+        role: cloudUser.role || 'CUSTOMER',
+        language: cloudUser.language || 'ar',
+        avatarUrl: cloudUser.avatarUrl || null,
+        agencyId: cloudUser.agencyId || null,
+      }
+      emitEvent('auth:login', { user: sessionUser })
+      console.log(`[LocalAPI] Account registered + session established: ${sessionUser.username} (${sessionUser.role})`)
+      return c.json({
+        success: true,
+        user: { ...sessionUser, phoneNumber: cloudUser.phoneNumber ?? null },
+        token,
+        isNewUser: true,
+      }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Register error:', error)
+      return c.json({ success: false, error: 'Registration failed' }, 500)
+    }
+  })
+
+  // ── Task 22: OTP verification proxies (cloud-native operations) ─────────
+
+  /**
+   * POST /api/auth/verify — proxy to the cloud. On FULL verification the
+   * cloud returns { verified: true, user, token }: the local profile is
+   * upserted, the offline unlock credential is derived from the stashed
+   * register password (when available), and the local session is established
+   * with the CLOUD token — exactly the pre-Task-22 register success shape.
+   */
+  app.post('/api/auth/verify', async (c) => {
+    try {
+      let body
+      try { body = await c.req.json() } catch { body = null }
+      if (!body || !body.verificationToken) {
+        return c.json({ success: false, error: 'verificationToken is required' }, 400)
+      }
+      const base = cloudBaseUrl()
+      let cloud
+      try {
+        const res = await fetch(base + '/api/auth/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(15000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON */ }
+        cloud = { ok: res.ok, status: res.status, data }
+      } catch (err) {
+        return c.json({
+          success: false,
+          error: 'Verification requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+
+      if (!cloud.ok || !cloud.data) {
+        return c.json(cloud.data || { success: false, error: 'Verification failed' }, cloud.status || 500)
+      }
+
+      // Partial verification (one channel done, the other pending) → pass through
+      if (!cloud.data.verified) {
+        return c.json(cloud.data, cloud.status || 200)
+      }
+
+      // FULL verification → establish the local session (parity with register)
+      const verifiedUser = cloud.data.user
+      const token = cloud.data.token
+      try {
+        await upsertLocalUserFromCloud(verifiedUser)
+      } catch (e) {
+        console.warn('[LocalAPI] Verify: local profile upsert failed:', e?.message || e)
+      }
+
+      const stashed = pendingVerificationPasswords.get(body.verificationToken)
+      if (stashed && stashed.userId === verifiedUser.id) {
+        try {
+          await storeDeviceCredential(verifiedUser.id, stashed.password)
+        } catch (e) {
+          console.warn('[LocalAPI] Verify: device credential store failed:', e?.message || e)
+        }
+        pendingVerificationPasswords.delete(body.verificationToken)
+      }
+
+      sessionToken = token
+      sessionUser = {
+        id: verifiedUser.id,
+        username: verifiedUser.username || 'verified',
+        fullName: verifiedUser.fullName || '',
+        role: verifiedUser.role || 'CUSTOMER',
+        language: verifiedUser.language || 'ar',
+        avatarUrl: verifiedUser.avatarUrl || null,
+        agencyId: verifiedUser.agencyId || null,
+      }
+      emitEvent('auth:login', { user: sessionUser })
+      console.log(`[LocalAPI] Account VERIFIED + session established: ${sessionUser.username} (${sessionUser.role})`)
+      return c.json({
+        success: true,
+        verified: true,
+        user: { ...sessionUser, email: verifiedUser.email ?? null, phoneNumber: verifiedUser.phoneNumber ?? null },
+        token,
+        isNewUser: true,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] Verify error:', error)
+      return c.json({ success: false, error: 'Verification failed' }, 500)
+    }
+  })
+
+  /** POST /api/auth/resend-verification — thin proxy (rate limits live on the cloud). */
+  app.post('/api/auth/resend-verification', async (c) => {
+    try {
+      let body
+      try { body = await c.req.json() } catch { body = null }
+      if (!body || !body.verificationToken || !body.channel) {
+        return c.json({ success: false, error: 'verificationToken and channel are required' }, 400)
+      }
+      const base = cloudBaseUrl()
+      const res = await fetch(base + '/api/auth/resend-verification', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      })
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON */ }
+      return c.json(data || { success: false, error: 'Resend failed' }, res.ok ? 200 : (res.status || 500))
+    } catch (err) {
+      return c.json({
+        success: false,
+        error: 'Resending the code requires an internet connection — the cloud API is unreachable',
+        code: 'CLOUD_UNREACHABLE',
+      }, 503)
+    }
+  })
+
+  /** POST /api/auth/verification-status — thin proxy (resume an interrupted flow). */
+  app.post('/api/auth/verification-status', async (c) => {
+    try {
+      let body
+      try { body = await c.req.json() } catch { body = null }
+      if (!body || !body.verificationToken) {
+        return c.json({ success: false, error: 'verificationToken is required' }, 400)
+      }
+      const base = cloudBaseUrl()
+      const res = await fetch(base + '/api/auth/verification-status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10000),
+      })
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON */ }
+      return c.json(data || { success: false, error: 'Status check failed' }, res.ok ? 200 : (res.status || 500))
+    } catch (err) {
+      return c.json({
+        success: false,
+        error: 'The cloud API is unreachable',
+        code: 'CLOUD_UNREACHABLE',
+      }, 503)
+    }
+  })
+
+  /**
+   * Task 23: file-upload proxies — the desktop UI (apiClient) always targets
+   * 127.0.0.1:3080 (local-first contract), but file STORAGE is a cloud
+   * property (the returned URL must be reachable from every device), so the
+   * local API forwards the multipart/JSON body to the cloud verbatim. Offline
+   * → explicit 503 CLOUD_UNREACHABLE, same contract as the register/verify
+   * proxies.
+   *
+   * POST is deliberately NOT session-gated here: account creation uploads an
+   * avatar BEFORE the account exists (no session until OTP verification), so
+   * the cloud's own per-type policy applies (public avatar path under strict
+   * limits, every other type requires the forwarded cloud token).
+   */
+
+  /** POST /api/upload — forward multipart body (file + type) to the cloud. */
+  app.post('/api/upload', async (c) => {
+    try {
+      const base = cloudBaseUrl()
+      const search = new URL(c.req.url).search || ''
+      // Forward the EXACT Content-Type header — it carries the multipart
+      // boundary; replacing it would corrupt the body.
+      const contentType = c.req.header('Content-Type') || 'application/octet-stream'
+      const bodyBuffer = Buffer.from(await c.req.arrayBuffer())
+      let cloud
+      try {
+        const res = await fetch(base + '/api/upload' + search, {
+          method: 'POST',
+          headers: {
+            'Content-Type': contentType,
+            'Content-Length': String(bodyBuffer.length),
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: bodyBuffer,
+          signal: AbortSignal.timeout(30000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON error body */ }
+        cloud = { ok: res.ok, status: res.status, data }
+      } catch (err) {
+        console.warn('[LocalAPI] Upload proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Uploading files requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      if (!cloud.ok || !cloud.data || !cloud.data.url) {
+        const status = cloud.status || 500
+        const errBody = cloud.data && typeof cloud.data === 'object'
+          ? cloud.data
+          : { success: false, error: 'Upload failed' }
+        console.warn(`[LocalAPI] Upload rejected by cloud: HTTP ${status} — ${errBody.error || '(no error body)'}`)
+        return c.json(errBody, status)
+      }
+      return c.json(cloud.data, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Upload proxy error:', error)
+      return c.json({ success: false, error: 'Upload failed' }, 500)
+    }
+  })
+
+  /** DELETE /api/upload — forward the delete request to the cloud (session-gated). */
+  app.delete('/api/upload', requireAuth(), async (c) => {
+    try {
+      const base = cloudBaseUrl()
+      let body
+      try { body = await c.req.json() } catch { body = {} }
+      let cloud
+      try {
+        const res = await fetch(base + '/api/upload', {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: JSON.stringify(body || {}),
+          signal: AbortSignal.timeout(10000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON */ }
+        cloud = { ok: res.ok, status: res.status, data }
+      } catch (err) {
+        return c.json({
+          success: false,
+          error: 'Deleting files requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      return c.json(cloud.data || { success: cloud.ok }, cloud.ok ? 200 : (cloud.status || 500))
+    } catch (error) {
+      console.error('[LocalAPI] Upload delete proxy error:', error)
+      return c.json({ success: false, error: 'Delete failed' }, 500)
+    }
+  })
+
+  /**
+   * Username availability check for the register form — cloud-first (global
+   * uniqueness is a cloud property), with a LOCAL fallback so the form still
+   * behaves sensibly when the cloud is briefly unreachable. Same response
+   * contract as the cloud route: { available: boolean }.
+   */
+  app.get('/api/auth/check-username', async (c) => {
+    const username = (c.req.query('username') || '').trim()
+    const validShape = username.length >= 3 && username.length <= 30 && /^[a-zA-Z0-9_]+$/.test(username)
+    if (!validShape) {
+      // Short names never block typing (same as the cloud route); invalid
+      // shapes are reported unavailable.
+      return c.json({ available: username.length >= 3 })
+    }
+    try {
+      const res = await fetch(cloudBaseUrl() + '/api/auth/check-username?username=' + encodeURIComponent(username), {
+        signal: AbortSignal.timeout(5000),
+      })
+      const data = await res.json().catch(() => null)
+      if (data && typeof data.available === 'boolean') {
+        return c.json({ available: data.available })
+      }
+    } catch { /* fall through to the local check */ }
+    try {
+      if (db) {
+        const existing = await db.user.findUnique({ where: { username }, select: { id: true } }).catch(() => null)
+        return c.json({ available: !existing })
+      }
+    } catch { /* ignore */ }
+    // Never block registration on an unavailable check.
+    return c.json({ available: true })
   })
 
   app.get('/api/auth/session', async (c) => {

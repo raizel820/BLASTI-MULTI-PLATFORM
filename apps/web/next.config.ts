@@ -38,7 +38,7 @@ const nextConfig: NextConfig = {
   // The API client (api-client.ts) now handles routing directly:
   // - Web browser: connects to cloud API URL (NEXT_PUBLIC_API_URL or localhost:3003)
   // - Electron: connects to cloud API, with automatic LAN failover to localhost:3080
-  // - Capacitor: connects to cloud API URL (NEXT_PUBLIC_API_URL or vercel)
+  // - Capacitor: connects to cloud API URL (NEXT_PUBLIC_API_URL)
   //
   // Socket.IO: handled client-side via the useRealtime hook.
 };

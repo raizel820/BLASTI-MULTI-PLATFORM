@@ -62,6 +62,7 @@ import { reconciliationRoutes } from './routes/reconciliation'
 import { offlineSyncRoutes } from './routes/offline-sync'
 import { qrClaimRoutes } from './routes/qr-claim'
 import { agencyDeviceRoutes } from './routes/agency-devices'
+import { adminProviderRoutes } from './routes/admin-providers'
 import { appVersionRoutes } from './routes/app-versions'
 import { db, setupSQLitePragmas } from '@blasti/db'
 import { initialSyncRoutes } from './routes/initial-sync'
@@ -80,15 +81,14 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN || '*'
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET || ''
 
 // ─── Startup validation: DATABASE_URL ────────────────────────────────────────
-// The root .env is gitignored, so a freshly-cloned/copied project has NO
-// DATABASE_URL set. Prisma would then fail on every query with a cryptic
-// "Environment variable not found" error, surfacing as HTTP 500 on every
-// API call. Fail fast with an actionable message instead.
+// A freshly-cloned/copied project may have NO DATABASE_URL set (the root .env
+// is gitignored). Instead of crashing with Prisma's cryptic "Environment
+// variable not found" on every query, fall back to the standard SQLite path
+// (packages/db/data/custom.db) and log a notice.
 //
-// Additionally, .env.example uses a RELATIVE path (file:./packages/db/data/custom.db)
-// but the API's CWD is apps/api/, so Prisma would resolve it wrong. We detect
-// relative paths, resolve them against the monorepo root, and rewrite the env
-// var to an absolute path before Prisma reads it.
+// Relative paths are resolved against the monorepo root (NOT the API's CWD,
+// which is apps/api/ in dev) and rewritten to an absolute path before Prisma
+// reads them — this works identically on Linux and Windows.
 const fs = require('fs')
 const path = require('path')
 
@@ -106,12 +106,13 @@ function findMonorepoRoot(): string {
 
 let DATABASE_URL = process.env.DATABASE_URL
 if (!DATABASE_URL) {
-  console.error('\n❌ FATAL: DATABASE_URL is not set.')
-  console.error('   The root .env file is gitignored and was not included when the project was copied.')
-  console.error('   Fix: copy .env.example → .env at the project root, then restart:\n')
-  console.error('       cp .env.example .env')
-  console.error('       # then edit .env if your DB path differs\n')
-  process.exit(1)
+  // Cross-platform default (works on Linux AND Windows — no $PWD/shell
+  // syntax required). Resolved to an absolute path against the monorepo
+  // root by the block below. Set DATABASE_URL in .env to override.
+  DATABASE_URL = 'file:./packages/db/data/custom.db'
+  process.env.DATABASE_URL = DATABASE_URL
+  console.warn('[db] DATABASE_URL not set — using default SQLite database:')
+  console.warn('     packages/db/data/custom.db  (set DATABASE_URL in .env to override)')
 }
 
 // Resolve relative SQLite paths to absolute (against monorepo root) so they
@@ -354,6 +355,7 @@ app.get('/stats', (c) => {
 app.route('/api/auth', authRoutes)
 app.route('/api/agency', agencyRoutes)
 app.route('/api/admin', adminRoutes)
+app.route('/api/admin/providers', adminProviderRoutes)
 app.route('/api/agencies', agenciesRoutes)
 app.route('/api/reservations', reservationsRoutes)
 app.route('/api/queue', queueRoutes)

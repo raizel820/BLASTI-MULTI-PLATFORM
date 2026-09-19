@@ -41,6 +41,11 @@ model User {
   /// Storage key for avatar. Used with getFileUrl() for provider-neutral access.
   avatarStorageKey        String?
   freeSmsCount            Int            @default(10)
+  /// Email/phone verification (Task 22). Users registered before the
+  /// enforcement date are grandfathered: marked verified lazily at first login
+  /// (see verification-service.ts VERIFICATION_ENFORCEMENT_START).
+  emailVerified           Boolean        @default(false)
+  phoneVerified           Boolean        @default(false)
   notificationPreferences String         @default("{\"queue_called\":true,\"turn_approaching\":true,\"completed\":true}")
   reminderMinutes         Int            @default(10)
   smsNotificationsEnabled Boolean        @default(true)
@@ -65,6 +70,104 @@ model User {
   reviews                 Review[]
   devices                 DeviceRegistration[]
   deviceCredentials       LocalDeviceCredential[]
+  verificationCodes       VerificationCode[]
+}
+
+/// One-time verification codes (OTP) for email/phone verification and
+/// password reset. Codes are stored HASHED (sha256) — the plaintext code
+/// exists only inside the delivered message. Dev-mode bypass codes are
+/// accepted by verification-service.ts WITHOUT a row match.
+model VerificationCode {
+  id          String    @id @default(cuid())
+  userId      String
+  /// EMAIL_VERIFY | PHONE_VERIFY | PASSWORD_RESET
+  purpose     String
+  /// EMAIL | SMS | WHATSAPP (delivery channel used)
+  channel     String
+  /// The email address / phone number the code was sent to (dedup + audit)
+  target      String
+  /// sha256 hex of the plaintext OTP
+  codeHash    String
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  /// IP that requested the code (rate-limit + audit)
+  requestIp   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@index([target])
+}
+
+/// Per-channel messaging provider configuration (Task 22). One row per
+/// channel. Secrets (apiKey + extraConfig secrets) are stored AES-256-CBC
+/// encrypted via lib/encryption.ts. Cloud-only — never synced to desktop.
+model ProviderConfig {
+  id            String    @id @default(cuid())
+  /// EMAIL | SMS | WHATSAPP (unique — one provider per channel)
+  channel       String    @unique
+  /// resend | esmsafrica | meta_whatsapp
+  provider      String
+  enabled       Boolean   @default(false)
+  /// Resend API key / eSMS Africa API key / Meta permanent access token (encrypted)
+  apiKey        String    @default("")
+  /// Resend: verified sender address (e.g. "BLASTI <no-reply@domain.com>")
+  /// eSMS Africa: alphanumeric sender ID (e.g. BLASTI)
+  senderId      String    @default("")
+  /// Meta WhatsApp Cloud: phone number ID
+  phoneNumberId String    @default("")
+  /// Meta WhatsApp Cloud: WhatsApp Business Account ID
+  accountId     String    @default("")
+  /// Optional API base URL override (defaults baked into provider registry)
+  apiUrl        String    @default("")
+  /// JSON blob for provider-specific extras (webhook verify token, region,
+  /// otp sender channel preference SMS|WHATSAPP, test recipients...)
+  extraConfig   String    @default("{}")
+  lastTestAt    DateTime?
+  lastTestOk    Boolean?
+  lastTestError String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+/// Editable notification templates (Task 22). One row per (key, channel,
+/// language). Body uses {{variable}} placeholders. When useProviderTemplate
+/// is true, providerTemplateId names the provider-side template (e.g. a
+/// Meta-approved WhatsApp authentication template) and the app body is
+/// ignored for delivery.
+model NotificationTemplate {
+  id                  String    @id @default(cuid())
+  /// Semantic key: verify_email | verify_phone | password_reset |
+  /// turn_approaching | your_turn | no_show | welcome | custom_*
+  key                 String
+  /// EMAIL | SMS | WHATSAPP
+  channel             String
+  /// ar | fr | en
+  language            String    @default("en")
+  name                String
+  /// Email subject line (EMAIL channel only)
+  subject             String?
+  /// Plain-text body with {{variables}}
+  body                String
+  /// Optional HTML body (EMAIL channel only)
+  htmlBody            String?
+  /// JSON array of variable names for the editor UI
+  variables           String    @default("[]")
+  /// false = deliver the app-side body; true = deliver providerTemplateId
+  useProviderTemplate Boolean   @default(false)
+  /// Provider-side template name/id (e.g. Meta approved template name)
+  providerTemplateId  String?
+  /// Provider-side template language code (e.g. ar, en_US for Meta)
+  providerTemplateLang String?
+  enabled             Boolean   @default(true)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@unique([key, channel, language])
+  @@index([channel])
 }
 
 /// Desktop-only local unlock credential (NEVER synced — the cloud copy of

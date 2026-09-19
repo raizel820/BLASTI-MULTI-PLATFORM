@@ -11,10 +11,10 @@
     "cap:open:ios": "cap open ios",
     "cap:run:android": "cap run android",
     "cap:run:ios": "cap run ios",
-    "build:web": "cd ../web && NEXT_BUILD_MODE=export next build",
-    "build:android": "cd ../web && NEXT_BUILD_MODE=export next build && cd ../mobile && cap sync android && cap open android",
-    "build:android:release": "cd ../web && NEXT_BUILD_MODE=export next build && cd ../mobile && cap sync android && cd android && ./gradlew assembleRelease",
-    "build:android:debug": "cd ../web && NEXT_BUILD_MODE=export next build && cd ../mobile && cap sync android && cd android && ./gradlew assembleDebug"
+    "build:web": "cd ../web && cross-env NEXT_BUILD_MODE=export next build",
+    "build:android": "cd ../web && cross-env NEXT_BUILD_MODE=export next build && cd ../mobile && cap sync android && cap open android",
+    "build:android:release": "cd ../web && cross-env NEXT_BUILD_MODE=export next build && cd ../mobile && cap sync android && node ../../scripts/gradle.js assembleRelease",
+    "build:android:debug": "cd ../web && cross-env NEXT_BUILD_MODE=export next build && cd ../mobile && cap sync android && node ../../scripts/gradle.js assembleDebug"
   },
   "dependencies": {
     "@capacitor/app": "^5.0.0",
@@ -25,11 +25,12 @@
     "@capacitor/preferences": "^5.0.0",
     "@capacitor/push-notifications": "^5.0.0",
     "@capacitor/share": "^5.0.0",
-    "@capacitor-community/barcode-scanner": "^4.0.1",
+    "@capacitor-community/barcode-scanner": "^4.0.1"
   },
   "devDependencies": {
     "@capacitor/android": "^5.7.0",
     "@capacitor/cli": "^5.7.0",
-    "@capacitor/ios": "^5.7.0"
+    "@capacitor/ios": "^5.7.0",
+    "cross-env": "^7.0.3"
   }
 }

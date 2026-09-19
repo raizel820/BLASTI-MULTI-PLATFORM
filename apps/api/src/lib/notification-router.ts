@@ -29,6 +29,7 @@
 import type { Server as SocketIOServer } from 'socket.io'
 import { db } from '@blasti/db'
 import { sendSms, normalizeDzPhone } from './sms-service'
+import { sendWhatsAppText } from './messaging/whatsapp-service'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -425,8 +426,10 @@ export async function sendViaSms(
 /**
  * Send a notification via WhatsApp.
  *
- * NOTE: This is a stub implementation. WhatsApp Business API integration
- * will be wired here when the provider is configured.
+ * Task 22: REAL Meta WhatsApp Cloud API call (messaging/whatsapp-service.ts)
+ * replacing the previous fake-success stub. Free-form texts are delivered
+ * inside the 24h customer-service window; outside it Graph rejects with
+ * subcode 131047 and the caller (cascade) falls back to SMS.
  *
  * Balance handling follows the same agency-sponsorship logic as SMS.
  */
@@ -496,23 +499,28 @@ export async function sendViaWhatsApp(
       }
     }
 
-    // ── Stub: Simulate WhatsApp send ────────────────────────────────────
-    // TODO: Replace with actual WhatsApp Business API call:
-    //
-    // const response = await fetch('https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages', {
-    //   method: 'POST',
-    //   headers: {
-    //     'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
-    //     'Content-Type': 'application/json',
-    //   },
-    //   body: JSON.stringify({
-    //     messaging_product: 'whatsapp',
-    //     to: normalizedPhone,
-    //     type: 'text',
-    //     text: { body: message },
-    //   }),
-    // })
-    // if (!response.ok) { ... refund ...; return false }
+    // ── REAL send via Meta WhatsApp Cloud API (Task 22) ────────────────
+    const waResult = await sendWhatsAppText(normalizedPhone, message);
+
+    if (!waResult.success) {
+      console.warn(
+        `[NotificationRouter] WhatsApp send failed for user ${userId}: ${waResult.error} ${waResult.responseRaw ?? ''}`
+      )
+      // Refund the deducted balance — the message was NOT delivered
+      await refundSmsBalance(agencyId, userId)
+      // Log the failure for the admin providers page
+      await db.smsLog.create({
+        data: {
+          userId,
+          phoneNumber: normalizedPhone,
+          message,
+          status: 'FAILED',
+          provider: 'whatsapp',
+          errorMessage: waResult.error ?? waResult.responseRaw?.slice(0, 300) ?? 'WHATSAPP_SEND_FAILED',
+        },
+      })
+      return false
+    }
 
     console.log(
       `[NotificationRouter] WhatsApp → ${normalizedPhone} ` +

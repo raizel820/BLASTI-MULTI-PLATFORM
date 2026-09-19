@@ -13,7 +13,7 @@
     "build:mac": "node scripts/prebuild.js && electron-builder --mac",
     "build:linux": "node scripts/prebuild.js && electron-builder --linux",
     "build:all": "node scripts/prebuild.js && electron-builder --mac --win --linux",
-    "build:export": "cd ../web && NEXT_BUILD_MODE=export next build"
+    "build:export": "cd ../web && cross-env NEXT_BUILD_MODE=export next build"
   },
   "dependencies": {
     "@hono/node-server": "^2.0.12",
@@ -25,6 +25,7 @@
     "socket.io-client": "^4.8.1"
   },
   "devDependencies": {
+    "cross-env": "^7.0.3",
     "electron": "^42.3.3",
     "electron-builder": "^26.15.2"
   }

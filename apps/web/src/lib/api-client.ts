@@ -13,7 +13,7 @@
  *   deterministic and cloud availability must not affect data requests.
  *   The cloud API is sync-only (pull/push driven by the desktop main process).
  * - **Capacitor**: Native shells point to the cloud backend
- *   (`NEXT_PUBLIC_API_URL`, falls back to `https://blasti.vercel.app`).
+ *   (`NEXT_PUBLIC_API_URL`, falls back to `http://localhost:3003`).
  * - **SSR (server-side)**: Uses `INTERNAL_API_URL` (falls back to `http://localhost:3000`).
  *
  * Usage:
@@ -141,7 +141,12 @@ function isNativeRuntime(): boolean {
 
 // ─── Base URL Resolution ──────────────────────────────────────────────────────
 
-const DEFAULT_VERCEL_URL = 'https://blasti.vercel.app';
+/**
+ * Neutral cloud API fallback for native shells built without
+ * NEXT_PUBLIC_API_URL. On a self-hosted VPS set NEXT_PUBLIC_API_URL
+ * (web build) / BLASTI_CLOUD_URL (desktop) to your server's origin.
+ */
+const DEFAULT_CLOUD_URL = 'http://localhost:3003';
 const DEFAULT_INTERNAL_URL = 'http://localhost:3000';
 /**
  * Electron local-first base URL (spec §7/§8).
@@ -158,7 +163,7 @@ const ELECTRON_LOCAL_API_BASE = 'http://127.0.0.1:3080';
  * 1. **SSR**: `INTERNAL_API_URL` env var → `http://localhost:3000`
  * 2. **Electron**: the embedded LOCAL API `http://127.0.0.1:3080` ALWAYS
  *    (local-first: cloud is sync-only and must never serve UI data requests)
- * 3. **Capacitor**: `NEXT_PUBLIC_API_URL` env var → `https://blasti.vercel.app`
+ * 3. **Capacitor**: `NEXT_PUBLIC_API_URL` env var → `http://localhost:3003`
  * 4. **Web (browser)**: `NEXT_PUBLIC_API_URL` → cloud API → fallback to localhost:3003
  *
  * NOTE: We removed the Next.js rewrite proxy (/api/* → localhost:3003) because
@@ -174,7 +179,7 @@ export function getApiBaseUrl(): string {
   // ── Electron: LOCAL-FIRST — always the embedded local API (:3080) ─────────────────────────
   // WHY (spec §7/§8): the desktop must operate fully offline. The local
   // SQLite-backed API is the operational source of truth for the UI; the
-  // cloud API (:3003 / Vercel) is reached ONLY by the sync engine running
+  // cloud API (:3003) is reached ONLY by the sync engine running
   // in the desktop main process (pull/push). Pointing the renderer at the
   // cloud would make UI data requests non-deterministic (they would depend
   // on internet availability), so the base URL is hardcoded and there is
@@ -187,9 +192,9 @@ export function getApiBaseUrl(): string {
     return ELECTRON_LOCAL_API_BASE;
   }
 
-  // Native shell (Capacitor): need absolute URL to Vercel backend
+  // Native shell (Capacitor): need absolute URL to the cloud API backend
   if (isCapacitorRuntime()) {
-    return process.env.NEXT_PUBLIC_API_URL || DEFAULT_VERCEL_URL;
+    return process.env.NEXT_PUBLIC_API_URL || DEFAULT_CLOUD_URL;
   }
 
   // Web browser: use explicit API URL if set (e.g. for staging environments)
@@ -350,7 +355,7 @@ function sleep(ms: number): Promise<void> {
 
 // ─── API Unreachable Tracking ────────────────────────────────────────────────
 //
-// When the cloud API (port 3003 or Vercel) fails with a network error or 5xx,
+// When the cloud API (port 3003) fails with a network error or 5xx,
 // we mark it as temporarily unreachable for 30 seconds. During that window,
 // requests on native platforms (Electron/Capacitor) try the LAN server
 // (port 3080) FIRST, bypassing the slow cloud-retry cycle. This makes the
@@ -1665,7 +1670,7 @@ ApiClient.prototype.request = async function<T>(
  *
  * - On the web: uses relative URLs (same-origin requests)
  * - On Electron: uses the embedded local API http://127.0.0.1:3080 (local-first)
- * - On Capacitor: uses `NEXT_PUBLIC_API_URL` or `https://blasti.vercel.app`
+ * - On Capacitor: uses `NEXT_PUBLIC_API_URL` or `http://localhost:3003`
  * - On the server: uses `INTERNAL_API_URL` or `http://localhost:3000`
  *
  * Import this in client components:

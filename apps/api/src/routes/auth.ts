@@ -20,6 +20,15 @@ import crypto from 'crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import { validateBody, loginSchema, registerSchema, forgotPasswordSchema, resetPasswordSchema } from '../lib/validations'
 import {
+  resolveVerificationStatus,
+  issueAllPending,
+  verifyCode,
+  createVerificationToken,
+  verifyVerificationToken,
+  maskTarget,
+  type VerificationPurpose,
+} from '../lib/verification-service'
+import {
   checkRateLimit,
   checkIpBlocked,
   RateLimitError,
@@ -232,6 +241,11 @@ app.post('/login', async (c) => {
         freeSmsCount: true,
         isActive: true,
         passwordHash: true,
+        email: true,
+        phoneNumber: true,
+        emailVerified: true,
+        phoneVerified: true,
+        createdAt: true,
       },
     })
 
@@ -287,6 +301,41 @@ app.post('/login', async (c) => {
           403,
         )
       }
+    }
+
+    // ── Task 22: Email/phone verification gate ─────────────────────────
+    // Unverified accounts (registered after the enforcement date) get OTPs
+    // re-issued and a short-lived verificationToken — NO session is issued
+    // until both channels are verified.
+    const verificationStatus = await resolveVerificationStatus(user)
+    if (verificationStatus.required) {
+      const issued = await issueAllPending({
+        userId: user.id,
+        email: user.email,
+        phoneNumber: user.phoneNumber,
+        emailVerified: verificationStatus.emailVerified,
+        phoneVerified: verificationStatus.phoneVerified,
+        language: user.language,
+        ip,
+      })
+      const verificationToken = await createVerificationToken(user.id)
+      return c.json({
+        success: true,
+        requiresVerification: true,
+        verificationToken,
+        pending: {
+          email: verificationStatus.emailRequired,
+          phone: verificationStatus.phoneRequired,
+        },
+        targets: {
+          email: user.email ? maskTarget(user.email) : null,
+          phone: user.phoneNumber ? maskTarget(user.phoneNumber) : null,
+        },
+        dev: {
+          email: issued.email?.devBypass ? { devCode: issued.email.devCode, error: issued.email.error } : null,
+          phone: issued.phone?.devBypass ? { devCode: issued.phone.devCode, error: issued.phone.error } : null,
+        },
+      })
     }
 
     // Create audit log
@@ -389,7 +438,7 @@ app.post('/register', async (c) => {
       )
     }
 
-    const { username, fullName, password, phoneNumber, role, agencyCode, avatarUrl } = validation.data
+    const { username, fullName, password, email, phoneNumber, role, agencyCode, avatarUrl } = validation.data
 
     // Check for duplicate username
     const existingUser = await db.user.findUnique({
@@ -398,6 +447,18 @@ app.post('/register', async (c) => {
     if (existingUser) {
       return c.json(
         { success: false, error: 'Username already taken' },
+        409,
+      )
+    }
+
+    // Task 22: email is now REQUIRED at registration (verified via OTP)
+    const normalizedEmail = email.trim().toLowerCase()
+    const existingEmail = await db.user.findUnique({
+      where: { email: normalizedEmail },
+    })
+    if (existingEmail) {
+      return c.json(
+        { success: false, error: 'Email already registered' },
         409,
       )
     }
@@ -418,15 +479,19 @@ app.post('/register', async (c) => {
     // Hash password
     const passwordHash = hashPassword(password)
 
-    // Create user
+    // Create user (Task 22: unverified — both channels must pass OTP before
+    // a session is issued)
     const user = await db.user.create({
       data: {
         username,
         fullName,
         passwordHash,
+        email: normalizedEmail,
         phoneNumber,
         role: role || 'CUSTOMER',
         avatarUrl: avatarUrl || undefined,
+        emailVerified: false,
+        phoneVerified: false,
       },
       select: {
         id: true,
@@ -437,6 +502,7 @@ app.post('/register', async (c) => {
         avatarUrl: true,
         freeSmsCount: true,
         isActive: true,
+        email: true,
         phoneNumber: true,
         createdAt: true,
       },
@@ -466,27 +532,44 @@ app.post('/register', async (c) => {
       }
     }
 
-    // Set NextAuth session cookie so protected API routes work
-    const sessionUser: SessionUser = {
-      id: user.id,
-      username: user.username,
-      fullName: user.fullName,
-      role: user.role,
-      language: user.language ?? 'en',
-      avatarUrl: user.avatarUrl,
-      agencyId: agencyId || null,
-    }
-    await setSessionCookie(c, sessionUser)
+    // ── Task 22: verification instead of an immediate session ─────────
+    // Both email and phone must be verified via OTP before the account is
+    // usable. The client receives a short-lived verificationToken and shows
+    // the OTP step; POST /auth/verify exchanges verified codes for a session.
+    const issued = await issueAllPending({
+      userId: user.id,
+      email: user.email,
+      phoneNumber: user.phoneNumber,
+      emailVerified: false,
+      phoneVerified: false,
+      language: user.language,
+      ip,
+    })
+    const verificationToken = await createVerificationToken(user.id)
 
     return c.json(
       {
         success: true,
+        requiresVerification: true,
+        verificationToken,
         user: {
           ...user,
           agencyId,
           agencyName,
           agencyNameAr,
           agencyNameFr,
+        },
+        pending: {
+          email: true,
+          phone: Boolean(user.phoneNumber),
+        },
+        targets: {
+          email: user.email ? maskTarget(user.email) : null,
+          phone: user.phoneNumber ? maskTarget(user.phoneNumber) : null,
+        },
+        dev: {
+          email: issued.email?.devBypass ? { devCode: issued.email.devCode, error: issued.email.error } : null,
+          phone: issued.phone?.devBypass ? { devCode: issued.phone.devCode, error: issued.phone.error } : null,
         },
         isNewUser: true,
       },
@@ -499,6 +582,248 @@ app.post('/register', async (c) => {
     if (error instanceof RateLimitError || error instanceof IpBlockedError) {
       return rateLimitResponse(error)(c)
     }
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return c.json({ success: false, error: message }, 500)
+  }
+})
+
+// ─── Task 22: OTP verification endpoints ─────────────────────────────────
+
+/**
+ * POST /auth/verify
+ *
+ * Exchange OTP codes (from the verification step) for a real session.
+ * Body: { verificationToken, emailCode?, phoneCode? }
+ * At least one code must be provided. When BOTH pending channels become
+ * verified, a full session (cookie + body token) is returned.
+ */
+app.post('/verify', async (c) => {
+  try {
+    const ip = requireValidIp(c)
+    checkIpBlocked(ip)
+    checkRateLimit(ip, AUTH_RATE_LIMIT)
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400)
+    }
+    const { verificationToken, emailCode, phoneCode } = body as {
+      verificationToken?: string
+      emailCode?: string
+      phoneCode?: string
+    }
+
+    if (!verificationToken) {
+      return c.json({ success: false, error: 'verificationToken is required' }, 400)
+    }
+    const userId = await verifyVerificationToken(verificationToken)
+    if (!userId) {
+      return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
+    }
+    if (!emailCode && !phoneCode) {
+      return c.json({ success: false, error: 'Provide at least one code' }, 400)
+    }
+
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true, username: true, fullName: true, role: true, language: true,
+        avatarUrl: true, email: true, phoneNumber: true,
+        emailVerified: true, phoneVerified: true, createdAt: true, isActive: true,
+      },
+    })
+    if (!user || !user.isActive) {
+      return c.json({ success: false, error: 'USER_NOT_FOUND' }, 404)
+    }
+
+    const results: Record<string, unknown> = {}
+
+    if (emailCode) {
+      const r = await verifyCode({ userId: user.id, purpose: 'EMAIL_VERIFY' as VerificationPurpose, code: emailCode })
+      results.email = r
+      if (!r.success) {
+        return c.json({ success: false, channel: 'email', error: r.error, remainingAttempts: r.remainingAttempts, results }, 400)
+      }
+    }
+    if (phoneCode) {
+      const r = await verifyCode({ userId: user.id, purpose: 'PHONE_VERIFY' as VerificationPurpose, code: phoneCode })
+      results.phone = r
+      if (!r.success) {
+        return c.json({ success: false, channel: 'phone', error: r.error, remainingAttempts: r.remainingAttempts, results }, 400)
+      }
+    }
+
+    // Re-resolve after the successful verifications
+    const refreshed = await db.user.findUnique({
+      where: { id: user.id },
+      select: { emailVerified: true, phoneVerified: true, email: true, phoneNumber: true },
+    })
+    const emailVerified = refreshed?.emailVerified ?? false
+    const phoneVerified = refreshed?.phoneVerified ?? false
+    const stillPending = (Boolean(refreshed?.email) && !emailVerified) || (Boolean(refreshed?.phoneNumber) && !phoneVerified)
+
+    if (stillPending) {
+      return c.json({
+        success: true,
+        verified: false,
+        status: { emailVerified, phoneVerified },
+        message: 'Partial verification — the other channel is still pending',
+        results,
+      })
+    }
+
+    // Fully verified → issue the real session (cookie for web, token for native)
+    const agencyId = user.role === 'AGENCY_OWNER'
+      ? (await db.agency.findFirst({ where: { ownerId: user.id }, select: { id: true } }))?.id ?? null
+      : user.role === 'AGENCY_STAFF'
+        ? (await db.agencyStaff.findFirst({ where: { userId: user.id, isActive: true }, select: { agencyId: true } }))?.agencyId ?? null
+        : null
+
+    const sessionUser: SessionUser = {
+      id: user.id,
+      username: user.username,
+      fullName: user.fullName,
+      role: user.role,
+      language: user.language,
+      avatarUrl: user.avatarUrl,
+      agencyId: agencyId ?? null,
+    }
+    const token = await createSessionToken(sessionUser)
+    await setSessionCookie(c, sessionUser)
+
+    await db.auditLog.create({
+      data: { userId: user.id, action: 'ACCOUNT_VERIFIED', entityType: 'USER', entityId: user.id },
+    })
+
+    return c.json({
+      success: true,
+      verified: true,
+      status: { emailVerified, phoneVerified },
+      user: { ...sessionUser, email: refreshed?.email, phoneNumber: refreshed?.phoneNumber },
+      token,
+      results,
+    })
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === 'INVALID_IP') {
+      return c.json({ success: false, error: 'Unable to identify client' }, 400)
+    }
+    if (error instanceof RateLimitError || error instanceof IpBlockedError) {
+      return rateLimitResponse(error)(c)
+    }
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return c.json({ success: false, error: message }, 500)
+  }
+})
+
+/**
+ * POST /auth/resend-verification
+ *
+ * Re-issue an OTP for one channel. Rate-limited (60s cooldown, 6/hour) inside
+ * the verification service.
+ * Body: { verificationToken, channel: 'email' | 'phone' }
+ */
+app.post('/resend-verification', async (c) => {
+  try {
+    const ip = requireValidIp(c)
+    checkIpBlocked(ip)
+    checkRateLimit(ip, AUTH_RATE_LIMIT)
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400)
+    }
+    const { verificationToken, channel } = body as { verificationToken?: string; channel?: string }
+    if (!verificationToken || (channel !== 'email' && channel !== 'phone')) {
+      return c.json({ success: false, error: 'verificationToken and channel (email|phone) are required' }, 400)
+    }
+    const userId = await verifyVerificationToken(verificationToken)
+    if (!userId) {
+      return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
+    }
+
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true, phoneNumber: true, emailVerified: true, phoneVerified: true, language: true },
+    })
+    if (!user) {
+      return c.json({ success: false, error: 'USER_NOT_FOUND' }, 404)
+    }
+
+    const result = channel === 'email'
+      ? user.email && !user.emailVerified
+        ? await issueAllPending({ userId: user.id, email: user.email, phoneNumber: null, emailVerified: false, phoneVerified: true, language: user.language, ip }).then(r => r.email)
+        : { success: false, error: 'ALREADY_VERIFIED', expiresInMinutes: 0 }
+      : user.phoneNumber && !user.phoneVerified
+        ? await issueAllPending({ userId: user.id, email: null, phoneNumber: user.phoneNumber, emailVerified: true, phoneVerified: false, language: user.language, ip }).then(r => r.phone)
+        : { success: false, error: 'ALREADY_VERIFIED', expiresInMinutes: 0 }
+
+    return c.json({
+      success: result?.success ?? false,
+      error: result?.error,
+      channel,
+      target: result?.target ? maskTarget(result.target) : undefined,
+      devBypass: result?.devBypass,
+      devCode: result?.devCode,
+      retryAfterSeconds: result?.retryAfterSeconds,
+      expiresInMinutes: result?.expiresInMinutes,
+    })
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === 'INVALID_IP') {
+      return c.json({ success: false, error: 'Unable to identify client' }, 400)
+    }
+    if (error instanceof RateLimitError || error instanceof IpBlockedError) {
+      return rateLimitResponse(error)(c)
+    }
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return c.json({ success: false, error: message }, 500)
+  }
+})
+
+/**
+ * POST /auth/verification-status
+ *
+ * Resume an interrupted verification flow: returns what is still pending.
+ * Body: { verificationToken }
+ */
+app.post('/verification-status', async (c) => {
+  try {
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400)
+    }
+    const { verificationToken } = body as { verificationToken?: string }
+    if (!verificationToken) {
+      return c.json({ success: false, error: 'verificationToken is required' }, 400)
+    }
+    const userId = await verifyVerificationToken(verificationToken)
+    if (!userId) {
+      return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
+    }
+    const user = await db.user.findUnique({
+      where: { id: userId },
+      select: { email: true, phoneNumber: true, emailVerified: true, phoneVerified: true },
+    })
+    if (!user) {
+      return c.json({ success: false, error: 'USER_NOT_FOUND' }, 404)
+    }
+    return c.json({
+      success: true,
+      pending: {
+        email: Boolean(user.email) && !user.emailVerified,
+        phone: Boolean(user.phoneNumber) && !user.phoneVerified,
+      },
+      targets: {
+        email: user.email ? maskTarget(user.email) : null,
+        phone: user.phoneNumber ? maskTarget(user.phoneNumber) : null,
+      },
+    })
+  } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }

@@ -18,7 +18,15 @@ export const registerSchema = z.object({
   username: z.string().min(3, 'Username must be at least 3 characters').max(30),
   fullName: z.string().min(1, 'Full name is required').max(100),
   password: z.string().min(6, 'Password must be at least 6 characters').max(128),
-  phoneNumber: z.string().optional(),
+  // Task 22: email + phone are REQUIRED and both verified via OTP at signup
+  email: z.string().email('A valid email address is required'),
+  phoneNumber: z
+    .string()
+    .min(1, 'Phone number is required')
+    .refine(
+      (v) => /^(\+213|00213)?0?[5-7]\d{8}$/.test(v.replace(/[\s\-\.]/g, '')),
+      'Enter a valid Algerian phone number (e.g. 0555123456)',
+    ),
   role: z.enum(['CUSTOMER', 'AGENCY_OWNER']).optional().default('CUSTOMER'),
   agencyCode: z.string().optional(),
   avatarUrl: z.string().url().optional().or(z.literal('')),

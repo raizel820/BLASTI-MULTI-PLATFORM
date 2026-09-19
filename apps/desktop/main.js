@@ -112,14 +112,16 @@ try {
 // ─── Cloud API Base URL (single source of truth) ────────────────────────
 // One resolution used by diagnostics, sync service, local API fallbacks and
 // the web shell. Precedence: BLASTI_CLOUD_URL > BLASTI_API_URL > default.
-// NOTE: in production the DEFAULT (https://blasti.vercel.app) is the static
-// web export host — set BLASTI_CLOUD_URL to the real API origin unless the
-// API is served under the same hostname via reverse proxy (spec §13).
+// Self-hosted (VPS) deployments: set BLASTI_CLOUD_URL to the origin that
+// serves the Hono API (apps/api, port 3003) — e.g. https://api.your-domain.tld
+// — unless the API is served under the same hostname via reverse proxy
+// (spec §13). The neutral fallback below (localhost:3003) is only meant for
+// local development; production builds should always configure the env var.
 function resolveCloudBaseUrl() {
   const strip = (u) => String(u || '').replace(/\/+$/, '');
   if (process.env.BLASTI_CLOUD_URL) return strip(process.env.BLASTI_CLOUD_URL);
   if (process.env.BLASTI_API_URL) return strip(process.env.BLASTI_API_URL);
-  return isDev ? 'http://localhost:3003' : 'https://blasti.vercel.app';
+  return 'http://localhost:3003';
 }
 const CLOUD_BASE_URL = resolveCloudBaseUrl();
 // Publish for every other module (local API initial-sync route, sync service,
@@ -129,7 +131,7 @@ process.env.BLASTI_CLOUD_URL = CLOUD_BASE_URL;
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEV_URL = 'http://localhost:3000';
-const PROD_URL = process.env.BLASTI_API_URL || 'https://blasti.vercel.app';
+const PROD_URL = process.env.BLASTI_API_URL || 'http://localhost:3000';
 const PROTOCOL = 'blasti';
 
 // Path to bundled static web files (from Next.js export)
@@ -712,6 +714,31 @@ function loadApp() {
 
 // ─── Loading Screen ───────────────────────────────────────────────────────────
 
+// Track which launch gate is currently loaded in the window:
+//   'dev'      → the full diagnostics console (DEV MODE ONLY)
+//   'consumer' → the branded customer-facing splash (shown on EVERY launch;
+//                in production it hosts the same diagnostics invisibly and
+//                reveals an error panel ONLY when a fatal check fails)
+let launchGateMode = 'dev';
+let diagnosticsRunning = false;
+
+/**
+ * Build the launch gate HTML for the CURRENT run mode.
+ * DEV:      the diagnostics console runs first (existing behavior).
+ * PROD:     the consumer gate runs the diagnostics invisibly — errors are
+ *           revealed only if they exist when the suite finishes; otherwise
+ *           the user sees just the branded animation and a pass.
+ */
+function buildGateHTML() {
+  const { getLoadingHTML, getConsumerGateHTML } = require('./loading-screen');
+  if (isDev) {
+    launchGateMode = 'dev';
+    return getLoadingHTML();
+  }
+  launchGateMode = 'consumer';
+  return getConsumerGateHTML({ mode: 'production' });
+}
+
 /**
  * Show the branded loading screen while diagnostics run.
  * This is the FIRST thing the user sees on app launch.
@@ -719,16 +746,43 @@ function loadApp() {
 function loadLoadingScreen() {
   loadingScreenActive = true;
   try {
-    const { getLoadingHTML } = require('./loading-screen');
-    const html = getLoadingHTML();
+    const html = buildGateHTML();
     mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
-    console.log('[BLASTI Desktop] Loading screen displayed');
+    console.log(`[BLASTI Desktop] Launch gate displayed (mode: ${launchGateMode}${isDev ? ', dev' : ''})`);
   } catch (err) {
     console.error('[BLASTI Desktop] Failed to load loading screen:', err.message);
     // Fallback: just load the app directly
     loadingScreenActive = false;
     loadApp();
   }
+}
+
+/**
+ * DEV-MODE HANDOFF: the dev gate passed → show the consumer gate as a pure
+ * animation layer ("passing UI"), then load the app. No diagnostics UI here
+ * — the dev gate already enforced every check; this is the same branded
+ * splash production users see, so dev launches look like real launches.
+ */
+function showConsumerHandoff() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    const { getConsumerGateHTML } = require('./loading-screen');
+    launchGateMode = 'consumer';
+    const html = getConsumerGateHTML({ mode: 'dev-handoff' });
+    mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+    console.log('[BLASTI Desktop] Dev gate passed — consumer gate animation (handoff)');
+  } catch (err) {
+    console.warn('[BLASTI Desktop] Consumer handoff failed — launching directly:', err.message);
+    finishLoadingAndLoadApp();
+    return;
+  }
+  // Main-driven load: the handoff gate is animation-only and never calls
+  // finishLoading itself, so this timer is the single launch authority.
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      finishLoadingAndLoadApp();
+    }
+  }, 2000);
 }
 
 /**
@@ -740,6 +794,107 @@ function finishLoadingAndLoadApp() {
   loadingScreenActive = false;
   console.log('[BLASTI Desktop] Loading complete — loading main app');
   loadApp();
+}
+
+/**
+ * Run the startup diagnostics suite (the launch gate's engine).
+ * Extracted from app.whenReady so the consumer gate's RETRY can re-run the
+ * whole suite with fresh flags — a simple page reload could never do that.
+ */
+async function runStartupDiagnostics() {
+  if (diagnosticsRunning) {
+    console.warn('[BLASTI Desktop] Diagnostics already running — retry ignored');
+    return;
+  }
+  diagnosticsRunning = true;
+  try {
+    // The gate renderer must register its IPC listeners before events flow.
+    // Without this, early IPC events may fire before the renderer is ready.
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        console.warn('[BLASTI Desktop] Loading screen ready signal timed out — proceeding anyway');
+        resolve();
+      }, 5000);
+
+      ipcMain.once('loading:ready', () => {
+        clearTimeout(timeout);
+        console.log('[BLASTI Desktop] Loading screen ready — starting diagnostics');
+        resolve();
+      });
+    });
+
+    const { runDiagnostics } = require('./loading-screen');
+    const userDataPath = app.getPath('userData');
+    const cloudBaseUrl = process.env.BLASTI_CLOUD_URL || CLOUD_BASE_URL;
+
+    const diagResult = await runDiagnostics(mainWindow, {
+      cloudBaseUrl,
+      isDev: isDev,
+      userDataPath,
+    });
+
+    console.log(`[Diagnostics] All checks done — allPassed: ${diagResult.allPassed}`);
+
+    // Mark diagnostics complete. Allow launch if no errors (warnings are OK — they
+    // represent expected skip conditions like no auth before first login).
+    diagnosticsDone = true;
+    const hasErrors = diagResult.results.some(r => r.status === 'error');
+    diagnosticsAllPassed = !hasErrors;
+    console.log(`[Diagnostics] allPassed: ${diagnosticsAllPassed} — ${diagResult.results.filter(r => r.status === 'success').length}/${diagResult.results.length} success, ${diagResult.results.filter(r => r.status === 'warning').length} warnings, ${diagResult.results.filter(r => r.status === 'error').length} errors`);
+
+    // ── Consumer gate outcome (production) ─────────────────────────────
+    // The consumer gate shows NO diagnostics detail while running. Only the
+    // END verdict reaches it: errors → compact error panel + blocked launch;
+    // otherwise → success animation + auto-launch via loading:finish.
+    if (launchGateMode === 'consumer' && mainWindow && !mainWindow.isDestroyed()) {
+      if (hasErrors) {
+        const errors = diagResult.results
+          .filter(r => r.status === 'error')
+          .map(r => ({ step: r.step, message: r.message || 'فشل غير معروف' }));
+        console.warn(`[BLASTI Desktop] Consumer gate: ${errors.length} fatal error(s) — launch BLOCKED`);
+        try {
+          mainWindow.webContents.send('consumer-gate:error', { errors });
+        } catch (_) { /* window gone */ }
+      } else {
+        console.log('[BLASTI Desktop] Consumer gate: all checks passed — showing pass animation');
+        try {
+          mainWindow.webContents.send('consumer-gate:success', {});
+        } catch (_) { /* window gone */ }
+      }
+    }
+  } catch (err) {
+    console.error('[Diagnostics] Failed to run diagnostics:', err.message);
+    // Diagnostics themselves crashed — do NOT auto-launch.
+    // The loading screen will show whatever steps completed. If the local API
+    // step never reported a status, the user will see an incomplete set of
+    // steps and can click "Launch" manually if they choose to proceed.
+    diagnosticsDone = true;
+    diagnosticsAllPassed = false; // crashed = not all passed
+    if (launchGateMode === 'dev') {
+      // Send the finalized event so the dev gate knows diagnostics are done
+      // (even though some steps were skipped due to the crash).
+      try {
+        mainWindow.webContents.send('diagnostics:update', {
+          step: 'local-server',
+          status: 'error',
+          message: `فشل تشغيل الفحوصات: ${err.message.substring(0, 80)}`,
+        });
+        mainWindow.webContents.send('diagnostics:finalized', {
+          completedSteps: ['local-server', 'cloud-api'],
+          totalSteps: 7,
+        });
+      } catch (_) { /* window may be gone */ }
+    } else if (mainWindow && !mainWindow.isDestroyed()) {
+      // Consumer gate: reveal the crash as the error it is — launch blocked.
+      try {
+        mainWindow.webContents.send('consumer-gate:error', {
+          errors: [{ step: 'diagnostics', message: `فشل تشغيل الفحوصات: ${err.message.substring(0, 140)}` }],
+        });
+      } catch (_) { /* window may be gone */ }
+    }
+  } finally {
+    diagnosticsRunning = false;
+  }
 }
 
 // ─── IPC Handlers ─────────────────────────────────────────────────────────────
@@ -756,10 +911,37 @@ ipcMain.handle('get-platform', () => ({
 // Loading screen: user clicked "Launch App" — only proceed if ALL checks passed
 ipcMain.on('loading:finish', () => {
   if (diagnosticsDone && diagnosticsAllPassed) {
-    finishLoadingAndLoadApp();
+    if (isDev && launchGateMode === 'dev') {
+      // DEV LAYERING: dev gate passed → show the consumer gate as animation
+      // only, then load the app (same launch experience as production).
+      showConsumerHandoff();
+    } else {
+      finishLoadingAndLoadApp();
+    }
   } else if (diagnosticsDone && !diagnosticsAllPassed) {
     console.warn('[BLASTI Desktop] Launch blocked — not all diagnostics passed');
   }
+});
+
+// Consumer gate error panel: full retry — reload the gate and re-run the
+// ENTIRE diagnostics suite with fresh flags (not just a page reload, which
+// could never re-run main-process diagnostics).
+ipcMain.on('loading:retry', () => {
+  if (diagnosticsRunning) {
+    console.warn('[BLASTI Desktop] Retry ignored — diagnostics already running');
+    return;
+  }
+  if (!diagnosticsDone) {
+    console.warn('[BLASTI Desktop] Retry ignored — diagnostics not finished yet');
+    return;
+  }
+  diagnosticsDone = false;
+  diagnosticsAllPassed = false;
+  console.log('[BLASTI Desktop] Launch retry requested — reloading gate and re-running diagnostics');
+  loadLoadingScreen();
+  runStartupDiagnostics().catch((err) => {
+    console.error('[BLASTI Desktop] Retry diagnostics crashed:', err.message);
+  });
 });
 
 // Window controls
@@ -1567,63 +1749,15 @@ app.whenReady().then(async () => {
   console.log('[BLASTI Desktop] Window created — loading screen active');
 
   // ── Run Startup Diagnostics ──────────────────────────────────────────
-  // The loading screen is already showing. Wait for the renderer to signal
-  // that it has registered its IPC listeners, then run diagnostics.
+  // The launch gate is already showing. runStartupDiagnostics waits for the
+  // gate renderer's ready signal, runs the suite, then reports the verdict
+  // to the gate (dev gate: per-step updates; consumer gate: error/success).
   try {
-    const { runDiagnostics } = require('./loading-screen');
-    const userDataPath = app.getPath('userData');
-    const cloudBaseUrl = process.env.BLASTI_CLOUD_URL || CLOUD_BASE_URL;
-
-    // Wait for the loading screen renderer to register its listeners.
-    // Without this, early IPC events may fire before the renderer is ready.
-    await new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        console.warn('[BLASTI Desktop] Loading screen ready signal timed out — proceeding anyway');
-        resolve();
-      }, 5000);
-
-      ipcMain.once('loading:ready', () => {
-        clearTimeout(timeout);
-        console.log('[BLASTI Desktop] Loading screen ready — starting diagnostics');
-        resolve();
-      });
-    });
-
-    const diagResult = await runDiagnostics(mainWindow, {
-      cloudBaseUrl,
-      isDev: isDev,
-      userDataPath,
-    });
-
-    console.log(`[Diagnostics] All checks done — allPassed: ${diagResult.allPassed}`);
-
-    // Mark diagnostics complete. Allow launch if no errors (warnings are OK — they
-    // represent expected skip conditions like no auth before first login).
-    diagnosticsDone = true;
-    const hasErrors = diagResult.results.some(r => r.status === 'error');
-    diagnosticsAllPassed = !hasErrors;
-    console.log(`[Diagnostics] allPassed: ${diagnosticsAllPassed} — ${diagResult.results.filter(r => r.status === 'success').length}/${diagResult.results.length} success, ${diagResult.results.filter(r => r.status === 'warning').length} warnings, ${diagResult.results.filter(r => r.status === 'error').length} errors`);
+    await runStartupDiagnostics();
   } catch (err) {
-    console.error('[Diagnostics] Failed to run diagnostics:', err.message);
-    // Diagnostics themselves crashed — do NOT auto-launch.
-    // The loading screen will show whatever steps completed. If the local API
-    // step never reported a status, the user will see an incomplete set of
-    // steps and can click "Launch" manually if they choose to proceed.
-    diagnosticsDone = true;
-    diagnosticsAllPassed = false; // crashed = not all passed
-    // Send the finalized event so the loading screen knows diagnostics are done
-    // (even though some steps were skipped due to the crash).
-    try {
-      mainWindow.webContents.send('diagnostics:update', {
-        step: 'local-server',
-        status: 'error',
-        message: `فشل تشغيل الفحوصات: ${err.message.substring(0, 80)}`,
-      });
-      mainWindow.webContents.send('diagnostics:finalized', {
-        completedSteps: ['local-server', 'cloud-api'],
-        totalSteps: 7,
-      });
-    } catch (_) { /* window may be gone */ }
+    // runStartupDiagnostics handles its own errors — this guard only keeps
+    // the whenReady chain alive for the macOS activate handler below.
+    console.error('[BLASTI Desktop] Startup diagnostics runner crashed:', err.message);
   }
 
   // macOS: re-create window when dock icon is clicked

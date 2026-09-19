@@ -1,8 +1,21 @@
 /**
  * BLASTI Desktop — Loading Screen & Startup Diagnostics
  *
- * Shows a branded loading screen while running comprehensive diagnostics
- * on app startup. The new flow:
+ * TWO launch gates (layered):
+ *
+ *   1. DEV GATE (getLoadingHTML) — the full diagnostics console (step grid,
+ *      live log, per-step badges). ACTIVE ONLY IN DEV MODE (isDev). It runs
+ *      the diagnostics visibly, then hands off to the consumer gate.
+ *
+ *   2. CONSUMER GATE (getConsumerGateHTML) — the customer-facing splash that
+ *      shows on EVERY launch. Uses the app's REAL logo and name exactly as
+ *      the web app brands them. In production it runs behind the same
+ *      diagnostics: the user sees only the branded animation — and, ONLY if
+ *      a fatal diagnostic error exists at the end, an error panel that
+ *      BLOCKS launch (retry / quit). In dev mode it is shown after the dev
+ *      gate passed, as animation-only (no diagnostics UI).
+ *
+ * Diagnostics flow (unchanged — runDiagnostics):
  *
  *   1. Check local server is running; if not, start it
  *   2. Check cloud API is connected
@@ -17,12 +30,14 @@
  *   7. If all succeeded, reconnect to cloud API
  *
  * Usage (in main.js):
- *   const { getLoadingHTML, runDiagnostics } = require('./loading-screen');
- *   mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(getLoadingHTML()));
+ *   const { getLoadingHTML, getConsumerGateHTML, runDiagnostics } = require('./loading-screen');
+ *   mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(gateHTML()));
  *   await runDiagnostics(mainWindow, config);
  */
 
 const { net } = require('electron');
+const path = require('path');
+const fs = require('fs');
 const appVersion = require('../../package.json').version;
 
 // ─── Diagnostic Step Definition ───────────────────────────────────────────
@@ -691,6 +706,370 @@ function getLoadingHTML() {
       if (window.electronAPI.loadingScreenReady) window.electronAPI.loadingScreenReady();
     } else {
       progressLabel.textContent = 'خطأ: جسر الإلكترون غير متاح';
+    }
+  </script>
+</body>
+</html>`;
+}
+
+// ─── Consumer Launch Gate ─────────────────────────────────────────────────
+//
+// The customer-facing splash. Layered ON TOP of the dev gate:
+//   • PRODUCTION ('production' mode): shown on EVERY launch instead of the
+//     dev console. The same diagnostics run in the main process behind it —
+//     the user sees only the branded animation. If a FATAL error exists when
+//     diagnostics finish, the gate reveals a compact error panel and BLOCKS
+//     launch (retry / quit). On success it plays a short "ready" animation
+//     and auto-launches.
+//   • DEV ('dev-handoff' mode): shown AFTER the dev gate passed, with
+//     animation only — no diagnostics UI, no error UI (the dev gate already
+//     enforced that). main.js drives the actual app load after the animation.
+//
+// Branding: uses the app's REAL logo and name exactly as the web app
+// (apps/web/public/logo.png + "BLASTI" + Arabic subtitle). The logo is
+// embedded as a base64 data URI so the data:-URL gate needs no file:// access.
+
+let _consumerLogoDataUrl = null;
+
+function getConsumerLogoDataUrl() {
+  if (_consumerLogoDataUrl !== null) return _consumerLogoDataUrl;
+  // Same file the web app brands with, resolved for dev (monorepo), asar and
+  // extraResources layouts. First hit wins; empty string = tasteful fallback.
+  const candidates = [
+    path.join(__dirname, 'assets', 'logo.png'),
+    (typeof process !== 'undefined' && process.resourcesPath)
+      ? path.join(process.resourcesPath, 'assets', 'logo.png')
+      : null,
+    path.join(__dirname, '..', 'web', 'public', 'logo.png'),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        const buf = fs.readFileSync(candidate);
+        if (buf && buf.length > 0) {
+          _consumerLogoDataUrl = 'data:image/png;base64,' + buf.toString('base64');
+          return _consumerLogoDataUrl;
+        }
+      }
+    } catch { /* try next candidate */ }
+  }
+  _consumerLogoDataUrl = '';
+  return _consumerLogoDataUrl;
+}
+
+/**
+ * Build the consumer-facing launch gate.
+ * @param {{ mode?: 'production' | 'dev-handoff' }} opts
+ *   - 'production': diagnostics-aware (error panel + blocked launch on fatal
+ *     errors; success animation + auto-launch otherwise).
+ *   - 'dev-handoff': animation-only pass-through shown after the dev gate.
+ */
+function getConsumerGateHTML(opts = {}) {
+  const mode = opts.mode === 'dev-handoff' ? 'dev-handoff' : 'production';
+  const minDisplayMs = mode === 'dev-handoff' ? 1400 : 2400;
+  const logoUrl = getConsumerLogoDataUrl();
+
+  const logoMarkup = logoUrl
+    ? `<img class="logo-img" src="${logoUrl}" alt="BLASTI" draggable="false" />`
+    : `<div class="logo-fallback">ب</div>`;
+
+  return `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BLASTI</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --primary: #48C9B0;
+      --primary-dark: #3bae99;
+      --primary-glow: rgba(72, 201, 176, 0.35);
+      --bg: #0a0f1a;
+      --text: #e8edf5;
+      --text-dim: #7a8599;
+      --success: #34d399;
+      --error: #f87171;
+      --border: rgba(255, 255, 255, 0.08);
+    }
+    html, body { height: 100%; }
+    body {
+      font-family: 'Cairo', 'Segoe UI', 'Noto Sans Arabic', -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      overflow: hidden;
+      direction: rtl;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .glow {
+      position: fixed; inset: 0; pointer-events: none;
+      background:
+        radial-gradient(ellipse at 50% 38%, rgba(72,201,176,0.14) 0%, transparent 55%),
+        radial-gradient(ellipse at 20% 80%, rgba(72,201,176,0.06) 0%, transparent 50%),
+        radial-gradient(ellipse at 85% 15%, rgba(56,189,248,0.05) 0%, transparent 50%);
+    }
+    .stage {
+      position: relative; z-index: 1;
+      display: flex; flex-direction: column; align-items: center;
+      gap: 0; text-align: center;
+      width: min(560px, 92vw);
+    }
+    .logo-wrap {
+      width: 108px; height: 108px;
+      border-radius: 28px;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 12px 48px rgba(72,201,176,0.18), 0 0 0 1px rgba(72,201,176,0.08);
+      animation: logo-float 3.2s ease-in-out infinite;
+      overflow: hidden;
+    }
+    .logo-img { width: 82%; height: 82%; object-fit: contain; }
+    .logo-fallback {
+      width: 100%; height: 100%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 3rem; font-weight: 800; color: white;
+      background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+    }
+    @keyframes logo-float {
+      0%, 100% { transform: translateY(0); box-shadow: 0 12px 48px rgba(72,201,176,0.18), 0 0 0 1px rgba(72,201,176,0.08); }
+      50% { transform: translateY(-8px); box-shadow: 0 22px 64px rgba(72,201,176,0.30), 0 0 0 1px rgba(72,201,176,0.14); }
+    }
+    .brand-name {
+      margin-top: 1.4rem;
+      font-size: 2rem; font-weight: 800; letter-spacing: 0.5px;
+      background: linear-gradient(90deg, #34d399, #2dd4bf);
+      -webkit-background-clip: text; background-clip: text;
+      -webkit-text-fill-color: transparent; color: transparent;
+      animation: brand-in 0.7s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+    }
+    .brand-sub {
+      margin-top: 0.35rem;
+      font-size: 0.85rem; color: var(--text-dim); font-weight: 600;
+      animation: brand-in 0.7s 0.1s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+    }
+    @keyframes brand-in {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .loader {
+      margin-top: 2rem;
+      width: 220px; height: 4px; border-radius: 4px;
+      background: rgba(255,255,255,0.06);
+      overflow: hidden; position: relative;
+    }
+    .loader-fill {
+      position: absolute; top: 0; height: 100%; width: 45%;
+      border-radius: 4px;
+      background: linear-gradient(90deg, transparent, var(--primary), transparent);
+      animation: loader-sweep 1.3s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    }
+    @keyframes loader-sweep {
+      from { right: -45%; }
+      to { right: 100%; }
+    }
+    .status {
+      margin-top: 0.9rem;
+      font-size: 0.72rem; color: var(--text-dim);
+      min-height: 1.1em; transition: opacity 0.3s ease;
+    }
+    .success-badge {
+      display: none;
+      margin-top: 2rem;
+      align-items: center; gap: 0.5rem;
+      padding: 0.55rem 1.3rem;
+      border-radius: 999px;
+      background: rgba(52, 211, 153, 0.08);
+      border: 1px solid rgba(52, 211, 153, 0.25);
+      color: var(--success); font-size: 0.85rem; font-weight: 700;
+    }
+    .success-badge.visible { display: inline-flex; animation: success-pop 0.45s cubic-bezier(0.2, 1.4, 0.4, 1) both; }
+    .success-badge .check {
+      width: 20px; height: 20px; border-radius: 50%;
+      background: var(--success); color: #052e22;
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 0.7rem; font-weight: 900;
+    }
+    @keyframes success-pop {
+      from { opacity: 0; transform: scale(0.75); }
+      to { opacity: 1; transform: scale(1); }
+    }
+    .stage.done .loader, .stage.done .status { display: none; }
+
+    /* ── Error panel: ONLY revealed when diagnostics report a fatal error ── */
+    .error-panel {
+      display: none;
+      margin-top: 1.6rem;
+      width: 100%;
+      padding: 1.1rem 1.2rem;
+      border-radius: 16px;
+      background: rgba(248, 113, 113, 0.05);
+      border: 1px solid rgba(248, 113, 113, 0.22);
+      text-align: right;
+      animation: brand-in 0.4s ease both;
+    }
+    .error-panel.visible { display: block; }
+    .error-panel .err-title {
+      display: flex; align-items: center; gap: 0.55rem;
+      font-size: 0.95rem; font-weight: 800; color: var(--error);
+    }
+    .error-panel .err-list {
+      margin-top: 0.7rem;
+      display: flex; flex-direction: column; gap: 0.45rem;
+      max-height: 168px; overflow-y: auto;
+    }
+    .error-panel .err-item {
+      font-size: 0.72rem; line-height: 1.55; color: var(--text);
+      background: rgba(248, 113, 113, 0.06);
+      border: 1px solid rgba(248, 113, 113, 0.14);
+      border-radius: 10px; padding: 0.5rem 0.7rem;
+    }
+    .error-panel .err-item b { color: var(--error); font-weight: 700; }
+    .error-panel .err-actions {
+      margin-top: 1rem; display: flex; gap: 0.6rem; justify-content: center;
+    }
+    .btn {
+      border: none; cursor: pointer; border-radius: 10px;
+      font-family: inherit; font-weight: 700; font-size: 0.78rem;
+      padding: 0.55rem 1.4rem; transition: background 0.2s, box-shadow 0.2s;
+    }
+    .btn-retry {
+      background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+      color: white; box-shadow: 0 4px 16px var(--primary-glow);
+    }
+    .btn-retry:hover { box-shadow: 0 6px 24px rgba(72,201,176,0.45); }
+    .btn-quit {
+      background: rgba(255,255,255,0.05); color: var(--text-dim);
+      border: 1px solid var(--border);
+    }
+    .btn-quit:hover { background: rgba(255,255,255,0.1); }
+    .stage.failed .loader, .stage.failed .status { display: none; }
+
+    .version {
+      position: fixed; bottom: 14px; inset-inline-start: 0; inset-inline-end: 0;
+      text-align: center;
+      font-size: 0.62rem; color: rgba(122, 133, 153, 0.6);
+      letter-spacing: 0.4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="glow"></div>
+  <div class="stage" id="stage">
+    <div class="logo-wrap" id="logoWrap">${logoMarkup}</div>
+    <div class="brand-name">BLASTI</div>
+    <div class="brand-sub">بلاصتي — نظام إدارة الطوابير</div>
+    <div class="loader"><div class="loader-fill"></div></div>
+    <div class="status" id="statusText">جاري تجهيز التطبيق…</div>
+    <div class="success-badge" id="successBadge"><span class="check">✓</span> جاهز</div>
+
+    <div class="error-panel" id="errorPanel">
+      <div class="err-title">⚠️ تعذر تشغيل التطبيق</div>
+      <div class="err-list" id="errList"></div>
+      <div class="err-actions">
+        <button class="btn btn-retry" id="retryBtn">إعادة المحاولة</button>
+        <button class="btn btn-quit" id="quitBtn">إغلاق التطبيق</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="version">BLASTI Desktop v${appVersion}</div>
+
+  <script>
+    var MODE = ${JSON.stringify(mode)};
+    var MIN_DISPLAY_MS = ${minDisplayMs};
+    var loadedAt = Date.now();
+    var stage = document.getElementById('stage');
+    var statusText = document.getElementById('statusText');
+    var successBadge = document.getElementById('successBadge');
+    var errorPanel = document.getElementById('errorPanel');
+    var errList = document.getElementById('errList');
+    var finished = false;
+
+    // Rotating gentle status hints (animation only — never diagnostic detail;
+    // detail is intentionally reserved for the error panel and the dev gate).
+    var HINTS = [
+      'جاري تجهيز التطبيق…',
+      'التحقق من مساحة العمل المحلية…',
+      'استعادة بيانات الوكالة…',
+      'التحقق من الاتصال…'
+    ];
+    var hintIndex = 0;
+    var hintTimer = setInterval(function() {
+      hintIndex = (hintIndex + 1) % HINTS.length;
+      statusText.style.opacity = '0';
+      setTimeout(function() {
+        if (!finished) {
+          statusText.textContent = HINTS[hintIndex];
+          statusText.style.opacity = '1';
+        }
+      }, 280);
+    }, 2600);
+
+    function showSuccess() {
+      if (finished) return;
+      finished = true;
+      clearInterval(hintTimer);
+      stage.classList.add('done');
+      successBadge.classList.add('visible');
+      if (MODE === 'production') {
+        // Auto-launch once the success animation has been visible long enough
+        // (MIN_DISPLAY guarantees the splash never just flashes by).
+        var wait = Math.max(700, MIN_DISPLAY_MS - (Date.now() - loadedAt));
+        setTimeout(function() {
+          if (window.electronAPI && window.electronAPI.finishLoading) window.electronAPI.finishLoading();
+        }, wait);
+      }
+      // 'dev-handoff': main.js drives the app load — animation only here.
+    }
+
+    function showError(errors) {
+      if (finished) return;
+      finished = true;
+      clearInterval(hintTimer);
+      stage.classList.add('failed');
+      errList.innerHTML = '';
+      var list = (errors && errors.length) ? errors : [{ step: '', message: 'فشل غير معروف أثناء فحوصات التشغيل' }];
+      list.slice(0, 6).forEach(function(e) {
+        var row = document.createElement('div');
+        row.className = 'err-item';
+        var label = e && e.step ? '<b>' + String(e.step) + ':</b> ' : '';
+        row.innerHTML = label + String((e && e.message) || 'خطأ غير معروف').replace(/[<&]/g, '');
+        errList.appendChild(row);
+      });
+      errorPanel.classList.add('visible');
+    }
+
+    if (window.electronAPI) {
+      if (window.electronAPI.retryLoading) {
+        document.getElementById('retryBtn').addEventListener('click', function() {
+          // Full, correct retry: the main process reloads this gate and
+          // re-runs the whole diagnostics suite (a data:-URL reload alone
+          // could never re-run main-process diagnostics).
+          errorPanel.classList.remove('visible');
+          finished = false;
+          window.electronAPI.retryLoading();
+        });
+      }
+      document.getElementById('quitBtn').addEventListener('click', function() {
+        if (window.electronAPI.quitApp) window.electronAPI.quitApp();
+      });
+      if (window.electronAPI.onConsumerGateSuccess) {
+        window.electronAPI.onConsumerGateSuccess(function() { showSuccess(); });
+      }
+      if (window.electronAPI.onConsumerGateError) {
+        window.electronAPI.onConsumerGateError(function(payload) { showError(payload && payload.errors); });
+      }
+      if (window.electronAPI.loadingScreenReady) window.electronAPI.loadingScreenReady();
+    } else {
+      // No bridge (e.g. preview outside Electron) — keep the animation alive
+      // but never self-launch; the main-process timeout owns that decision.
+      statusText.textContent = 'جاري تجهيز التطبيق…';
+    }
+
+    if (MODE === 'dev-handoff') {
+      // Pure pass-through: brief branded animation then success sweep.
+      setTimeout(showSuccess, 350);
     }
   </script>
 </body>
@@ -2624,6 +3003,7 @@ function fetchWithAuth(url, token, timeoutMs = 8000) {
 
 module.exports = {
   getLoadingHTML,
+  getConsumerGateHTML,
   runDiagnostics,
   DIAGNOSTIC_STEPS,
 };

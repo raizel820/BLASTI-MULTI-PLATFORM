@@ -10,14 +10,14 @@ export type UploadType = 'general' | 'receipt' | 'logo' | 'avatar';
 export interface UploadState {
   /** Whether an upload is currently in progress */
   uploading: boolean;
-  /** Progress percentage (0-100), only available with XMLHttpRequest */
+  /** Progress percentage (0-100) */
   progress: number;
   /** The URL of the successfully uploaded file */
   url: string | null;
   /** The filename of the uploaded file */
   filename: string | null;
   /** Storage provider used */
-  provider: 'vercel-blob' | 'local' | 'r2' | null;
+  provider: 'local' | null;
   /** Error message if upload failed */
   error: string | null;
 }
@@ -32,7 +32,7 @@ export interface UseUploadOptions {
   /** Whether to auto-clear error on new upload (default: true) */
   autoClearError?: boolean;
   /** Callback on successful upload */
-  onSuccess?: (result: { url: string; filename: string; provider: 'vercel-blob' | 'local' | 'r2'; size: number }) => void;
+  onSuccess?: (result: { url: string; filename: string; provider: 'local'; size: number }) => void;
   /** Callback on upload error */
   onError?: (error: string) => void;
 }
@@ -83,7 +83,7 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
   } = options;
 
   const [state, setState] = useState<UploadState>(INITIAL_STATE);
-  const xhrRef = useRef<XMLHttpRequest | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   /** Validate a file before uploading */
   const validate = useCallback(
@@ -119,7 +119,24 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
     [maxSize, accept],
   );
 
-  /** Upload a file */
+  /**
+   * Upload a file.
+   *
+   * Task 23 FIX — this hook previously used a RAW XMLHttpRequest against the
+   * RELATIVE url `/api/upload?type=…`. That could never work:
+   *   • Web: the Next.js app has no /api/upload route (uploads live on the
+   *     cloud API) → Next.js returned an HTML 404 page → JSON.parse threw
+   *     the literal "Invalid response from server".
+   *   • Desktop (Electron static export from file://): a relative XHR has no
+   *     server to reach at all.
+   *   • Even when it reached the old cloud placeholder, no file was stored
+   *     and no url returned.
+   *
+   * It now routes through apiFetch → apiClient, which resolves the correct
+   * ABSOLUTE base url on every platform (web → cloud API url, Electron →
+   * local API 127.0.0.1:3080 whose /api/upload proxy forwards to the cloud,
+   * Capacitor → cloud API url) and keeps the built-in retry/failover chain.
+   */
   const upload = useCallback(
     async (file: File, metadata?: Record<string, string>): Promise<UploadState> => {
       // Validate first
@@ -142,6 +159,11 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
         ...(autoClearError ? {} : { error: prev.error }),
       }));
 
+      // Abort controller so reset() can cancel an in-flight upload
+      if (abortRef.current) abortRef.current.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
       try {
         const formData = new FormData();
         formData.append('file', file);
@@ -153,50 +175,36 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
           }
         }
 
-        // Use fetch with progress tracking via XMLHttpRequest
-        const result = await new Promise<{
-          url: string;
-          filename: string;
-          provider: 'vercel-blob' | 'local' | 'r2';
-          size: number;
-        }>((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhrRef.current = xhr;
-
-          xhr.upload.addEventListener('progress', (e) => {
-            if (e.lengthComputable) {
-              const progress = Math.round((e.loaded / e.total) * 100);
-              setState((prev) => ({ ...prev, progress }));
-            }
-          });
-
-          xhr.addEventListener('load', () => {
-            xhrRef.current = null;
-            try {
-              const response = JSON.parse(xhr.responseText);
-              if (xhr.status >= 200 && xhr.status < 300 && response.url) {
-                resolve(response);
-              } else {
-                reject(new Error(response.error || `Upload failed with status ${xhr.status}`));
-              }
-            } catch {
-              reject(new Error('Invalid response from server'));
-            }
-          });
-
-          xhr.addEventListener('error', () => {
-            xhrRef.current = null;
-            reject(new Error('Network error during upload'));
-          });
-
-          xhr.addEventListener('abort', () => {
-            xhrRef.current = null;
-            reject(new Error('Upload cancelled'));
-          });
-
-          xhr.open('POST', `/api/upload?type=${type}`);
-          xhr.send(formData);
+        const res = await apiFetch(`/api/upload?type=${encodeURIComponent(type)}`, {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal,
         });
+
+        if (controller.signal.aborted) {
+          const abortedState: UploadState = { ...INITIAL_STATE, error: 'Upload cancelled' };
+          return abortedState;
+        }
+
+        // The cloud route always answers JSON; guard anyway so a non-JSON
+        // body surfaces as a clear upload error instead of a parse crash.
+        let data: { url?: string; filename?: string; provider?: string; error?: string } | null = null;
+        try {
+          data = await res.json();
+        } catch {
+          data = null;
+        }
+
+        if (!res.ok || !data || !data.url) {
+          throw new Error(data?.error || `Upload failed with status ${res.status}`);
+        }
+
+        const result = {
+          url: data.url,
+          filename: data.filename || file.name,
+          provider: 'local',
+          size: file.size,
+        };
 
         const successState: UploadState = {
           uploading: false,
@@ -211,6 +219,10 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
         onSuccess?.(result);
         return successState;
       } catch (err) {
+        if (controller.signal.aborted) {
+          const abortedState: UploadState = { ...INITIAL_STATE, error: 'Upload cancelled' };
+          return abortedState;
+        }
         const message = err instanceof Error ? err.message : 'Upload failed';
         const errorState: UploadState = {
           ...INITIAL_STATE,
@@ -219,6 +231,8 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
         setState(errorState);
         onError?.(message);
         return errorState;
+      } finally {
+        if (abortRef.current === controller) abortRef.current = null;
       }
     },
     [type, validate, autoClearError, onSuccess, onError],
@@ -227,9 +241,9 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
   /** Reset the upload state */
   const reset = useCallback(() => {
     // Abort any in-flight upload
-    if (xhrRef.current) {
-      xhrRef.current.abort();
-      xhrRef.current = null;
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
     }
     setState(INITIAL_STATE);
   }, []);

@@ -97,7 +97,11 @@ function isLocalOriginAllowed(origin) {
     const host = u.hostname
     if (host === 'localhost' || host === '127.0.0.1') return true
     if (origin === 'capacitor://localhost' || origin === 'file://') return true
-    if (u.protocol === 'https:' && host.endsWith('.vercel.app')) return true
+    // Self-hosted deployments serve the web UI from the operator's own
+    // origin — extra origins can be allowed via BLASTI_LAN_ORIGINS.
+    const allowed = String(process.env.BLASTI_LAN_ORIGINS || '')
+      .split(',').map(s => s.trim()).filter(Boolean)
+    if (allowed.includes(origin)) return true
   } catch { /* malformed origin */ }
   return false
 }

@@ -11,6 +11,7 @@ import { isApiUnreachable } from '@/lib/api-client';
 // Auth Views — lazy loaded to reduce initial compilation footprint
 const LandingPage = lazy(() => import('@/components/auth/landing-page').then(m => ({ default: m.LandingPage })));
 const LoginForm = lazy(() => import('@/components/auth/login-form').then(m => ({ default: m.LoginForm })));
+const DesktopAgencyLogin = lazy(() => import('@/components/auth/desktop-agency-login').then(m => ({ default: m.DesktopAgencyLogin })));
 const RegisterForm = lazy(() => import('@/components/auth/register-form').then(m => ({ default: m.RegisterForm })));
 
 // Customer Views
@@ -92,6 +93,7 @@ function ViewSpinner() {
 
 const ViewRouter = memo(function ViewRouter() {
   const currentView = useAppStore((s) => s.currentView);
+  const { platform } = usePlatform();
 
   return (
     <ErrorBoundary>
@@ -101,7 +103,8 @@ const ViewRouter = memo(function ViewRouter() {
             case 'landing':
               return <LandingPage />;
             case 'login':
-              return <LoginForm />;
+              // Dedicated agency login page: the desktop app serves agencies only.
+              return platform.isNative ? <DesktopAgencyLogin /> : <LoginForm />;
             case 'register':
               return <RegisterForm />;
             case 'customer-home':
@@ -532,7 +535,8 @@ export default function Home() {
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.2 }}
           >
-            {fallbackView === 'login' ? <LoginForm /> : <LandingPage />}
+            {/* Native platforms get the dedicated agency login; web falls back to landing */}
+            {fallbackView === 'login' ? (platform.isNative ? <DesktopAgencyLogin /> : <LoginForm />) : <LandingPage />}
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />

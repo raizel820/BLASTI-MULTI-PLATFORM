@@ -1694,7 +1694,7 @@ const fr: Record<TranslationKeys, string> = {
   availableOnAll: 'Disponible sur tous les appareils',
   sameAccountAllDevices: 'Même compte, mêmes données sur tous les appareils',
   unifiedApiBackend: 'Backend API unifié',
-  unifiedApiDesc: 'Toutes les plateformes se connectent au même serveur déployé sur Vercel',
+  unifiedApiDesc: 'Toutes les plateformes se connectent au même serveur unifié auto-hébergé',
   desktopFeatures: 'Notifications système • Raccourcis clavier • Mode hors ligne',
   mobileFeatures: 'Notifications push • Scanner QR • Mises à jour en arrière-plan',
   webFeatures: 'Sans installation • Fonctionne partout • Toujours à jour',

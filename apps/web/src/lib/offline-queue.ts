@@ -417,7 +417,7 @@ class OfflineQueue {
         }
 
         const baseUrl = typeof window !== 'undefined' && window.electronAPI
-          ? (process.env.NEXT_PUBLIC_API_URL || 'https://blasti.vercel.app')
+          ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3003')
           : '';
 
         const response = await fetch(`${baseUrl}/api/offline-sync`, {
@@ -444,7 +444,7 @@ class OfflineQueue {
         };
 
         const baseUrl = typeof window !== 'undefined' && window.electronAPI
-          ? (process.env.NEXT_PUBLIC_API_URL || 'https://blasti.vercel.app')
+          ? (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3003')
           : '';
 
         const response = await fetch(`${baseUrl}/api/kiosk/join`, {

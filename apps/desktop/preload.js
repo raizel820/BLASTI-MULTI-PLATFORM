@@ -351,6 +351,33 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('diagnostics:finalized', (_event, data) => callback(data));
   },
 
+  // ─── Consumer Launch Gate ────────────────────────────────────────────────
+
+  /**
+   * Consumer gate: diagnostics finished with FATAL errors.
+   * The gate reveals a compact error panel and launch stays BLOCKED.
+   * Payload: { errors: [{ step: string, message: string }] }.
+   */
+  onConsumerGateError: (callback) => {
+    ipcRenderer.on('consumer-gate:error', (_event, data) => callback(data));
+  },
+
+  /**
+   * Consumer gate: diagnostics finished cleanly.
+   * The gate plays the success animation and auto-launches.
+   */
+  onConsumerGateSuccess: (callback) => {
+    ipcRenderer.on('consumer-gate:success', (_event) => callback());
+  },
+
+  /**
+   * Consumer gate retry: ask the main process to reload the gate and re-run
+   * the FULL diagnostics suite (a data:-URL page reload cannot do this).
+   */
+  retryLoading: () => {
+    ipcRenderer.send('loading:retry');
+  },
+
   /**
    * Quit the application (used by loading screen error banner).
    */

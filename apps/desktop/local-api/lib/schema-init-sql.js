@@ -24,6 +24,10 @@ CREATE TABLE "User" (
     "avatarStorageProvider" TEXT,
     "avatarStorageKey" TEXT,
     "freeSmsCount" INTEGER NOT NULL DEFAULT 10,
+    -- Task 22: email/phone verification flags (kept in sync with the cloud
+    -- schema.prisma User model — the shared Prisma client expects them).
+    "emailVerified" BOOLEAN NOT NULL DEFAULT false,
+    "phoneVerified" BOOLEAN NOT NULL DEFAULT false,
     "notificationPreferences" TEXT NOT NULL DEFAULT '{"queue_called":true,"turn_approaching":true,"completed":true}',
     "reminderMinutes" INTEGER NOT NULL DEFAULT 10,
     "smsNotificationsEnabled" BOOLEAN NOT NULL DEFAULT true,

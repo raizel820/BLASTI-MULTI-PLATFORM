@@ -1,0 +1,9 @@
+{
+  "success": true,
+  "logs": [
+    { "id": "log-1", "userId": "u1", "phoneNumber": "+213555123456", "message": "🔄 BLASTI: أحمد، اقترب دورك! تذكرتك A-001 في وكالة النور.", "status": "SENT", "provider": "esmsafrica", "errorMessage": null, "createdAt": "2026-02-10T09:30:05.000Z" },
+    { "id": "log-2", "userId": "u2", "phoneNumber": "+213661223344", "message": "🎫 BLASTI: Dear karim, it's your turn now! Ticket B-014 at Clinic El Baraka.", "status": "SENT", "provider": "esmsafrica", "errorMessage": null, "createdAt": "2026-02-10T09:12:00.000Z" },
+    { "id": "log-3", "userId": "u3", "phoneNumber": "+213770998877", "message": "⚠️ BLASTI: Dear sami, your ticket C-003 was skipped due to no-show.", "status": "FAILED", "provider": "esmsafrica", "errorMessage": "HTTP 400: invalid sender id", "createdAt": "2026-02-10T08:45:12.000Z" },
+    { "id": "log-4", "userId": "u4", "phoneNumber": "+213555000111", "message": "بلاصتي: رمز التحقق الخاص بك هو 4821.", "status": "QUEUED", "provider": "whatsapp", "errorMessage": null, "createdAt": "2026-02-09T22:10:00.000Z" }
+  ]
+}
