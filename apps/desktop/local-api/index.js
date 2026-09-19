@@ -21,8 +21,9 @@
 const { Hono } = require('hono')
 const { cors } = require('hono/cors')
 const { createServer } = require('http')
-const { randomBytes, timingSafeEqual, createHash, timingSafeEqual: _tse } = require('crypto')
+const { randomBytes, timingSafeEqual, createHash, scryptSync } = require('crypto')
 const { localDb, setupPragmas, ensureDatabaseReady } = require('./lib/db')
+const localRealtime = require('./local-realtime')
 
 // ─── Configuration ────────────────────────────────────────────────────────
 
@@ -47,6 +48,159 @@ let eventListeners = []
 let mutationListeners = []
 let idemColumnEnsured = false
 let outboxV3Ensured = false
+
+// ─── Local Device Identity & Unlock Credentials (Task 14) ───────────────
+// Desktop authentication model:
+//
+//   CLOUD LOGIN (password enters ONLY here, over 127.0.0.1 or the cloud)
+//        → create/update the LOCAL OPERATIONAL User (profile-only)
+//        → create LocalDeviceCredential for THIS user on THIS device
+//        → logout / restart
+//        → LOCAL UNLOCK (scrypt verifier check — no cloud, no User.passwordHash)
+//
+// User.passwordHash stays NULL for synced profiles: the cloud sync feed
+// never ships authentication secrets. Only the user who actually logged in
+// on THIS device receives a credential — every other synced user has none.
+// The optional "keep signed in" flag is persisted in _sync_meta and controls
+// whether the app auto-restores the session on restart or requires unlock.
+
+const UNLOCK_SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64 }
+
+async function getLocalMeta(key) {
+  try {
+    const rows = await db.$queryRawUnsafe('SELECT value FROM "_sync_meta" WHERE key = ?', key)
+    return rows && rows[0] ? String(rows[0].value) : null
+  } catch { return null }
+}
+
+async function setLocalMeta(key, value) {
+  await db.$executeRawUnsafe(
+    'INSERT INTO "_sync_meta" ("key", "value") VALUES (?, ?) ' +
+    'ON CONFLICT("key") DO UPDATE SET "value" = excluded."value"',
+    key, String(value)
+  )
+}
+
+/**
+ * Stable per-installation device id, persisted in _sync_meta on first use.
+ * LocalDeviceCredential is scoped to (user, device) — never global.
+ */
+async function getDeviceId() {
+  const existing = await getLocalMeta('device_id')
+  if (existing) return existing
+  const id = 'dev-' + randomBytes(12).toString('hex')
+  try { await setLocalMeta('device_id', id) } catch { /* next call retries */ }
+  return id
+}
+
+/** Derive the scrypt verifier hex for a password + salt hex. */
+function deriveUnlockVerifier(password, saltHex, params) {
+  const p = params || UNLOCK_SCRYPT
+  return scryptSync(
+    String(password),
+    Buffer.from(saltHex, 'hex'),
+    p.keylen,
+    { N: p.N, r: p.r, p: p.p, maxmem: 128 * 1024 * 1024 }
+  ).toString('hex')
+}
+
+/** Timing-safe verification of a password against a stored credential. */
+function verifierMatches(cred, password) {
+  try {
+    if (!cred || !cred.verifierHash || !cred.salt) return false
+    const candidate = scryptSync(
+      String(password),
+      Buffer.from(cred.salt, 'hex'),
+      UNLOCK_SCRYPT.keylen,
+      { N: cred.scryptN || UNLOCK_SCRYPT.N, r: cred.scryptR || UNLOCK_SCRYPT.r, p: cred.scryptP || UNLOCK_SCRYPT.p, maxmem: 128 * 1024 * 1024 }
+    )
+    const stored = Buffer.from(cred.verifierHash, 'hex')
+    if (stored.length !== candidate.length) return false
+    return timingSafeEqual(stored, candidate)
+  } catch { return false }
+}
+
+function cloudBaseUrl() {
+  return process.env.BLASTI_CLOUD_URL || 'http://localhost:3003'
+}
+
+/**
+ * Attempt a cloud login (username + password) from the local API. Used when
+ * the local profile has no unlock credential yet (first login through the
+ * LAN-failover path) or no local profile at all. NEVER throws.
+ */
+async function cloudLoginProxy(username, password, extra) {
+  const base = cloudBaseUrl()
+  try {
+    const res = await fetch(base + '/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ username, password }, extra || {})),
+      signal: AbortSignal.timeout(8000),
+    })
+    let data = null
+    try { data = await res.json() } catch { /* non-JSON error body */ }
+    return { ok: res.ok, status: res.status, data }
+  } catch (err) {
+    return { ok: false, status: 0, error: err?.message || 'cloud unreachable' }
+  }
+}
+
+/**
+ * Create/update the LOCAL OPERATIONAL User row from a cloud login user
+ * object — PROFILE-ONLY. Authentication secrets are never written here
+ * (passwordHash stays NULL for synced profiles).
+ */
+async function upsertLocalUserFromCloud(cloudUser) {
+  if (!cloudUser || !cloudUser.id || !db.user) return null
+  const profile = {
+    username: cloudUser.username || cloudUser.email || ('user-' + String(cloudUser.id).slice(-8)),
+    fullName: cloudUser.fullName || cloudUser.name || '',
+    email: cloudUser.email ?? null,
+    phoneNumber: cloudUser.phoneNumber ?? null,
+    shortAppId: cloudUser.shortAppId ?? null,
+    role: cloudUser.role || 'CUSTOMER',
+    language: cloudUser.language || 'ar',
+    avatarUrl: cloudUser.avatarUrl ?? null,
+    isActive: cloudUser.isActive !== false,
+  }
+  await db.user.upsert({
+    where: { id: cloudUser.id },
+    update: profile,
+    create: Object.assign({ id: cloudUser.id }, profile),
+  })
+  return Object.assign({ id: cloudUser.id }, profile)
+}
+
+/**
+ * Store/refresh THIS user's LocalDeviceCredential for THIS device from a
+ * plaintext password (the only moment the password exists locally), and
+ * optionally persist the keep-signed-in preference.
+ */
+async function storeDeviceCredential(userId, password, keepSignedIn) {
+  if (!db.localDeviceCredential) {
+    console.warn('[LocalAPI] localDeviceCredential model unavailable — regenerate the Prisma client (cd packages/db && npx prisma generate)')
+    return null
+  }
+  const deviceId = await getDeviceId()
+  const salt = randomBytes(16).toString('hex')
+  const verifierHash = deriveUnlockVerifier(password, salt)
+  const existing = await db.localDeviceCredential.findUnique({
+    where: { userId_deviceId: { userId, deviceId } },
+  }).catch(() => null)
+  if (existing) {
+    await db.localDeviceCredential.update({
+      where: { id: existing.id },
+      data: { verifierHash, salt, revokedAt: null },
+    })
+  } else {
+    await db.localDeviceCredential.create({ data: { userId, deviceId, verifierHash, salt } })
+  }
+  if (typeof keepSignedIn === 'boolean') {
+    await setLocalMeta('keep_signed_in', keepSignedIn ? 'true' : 'false')
+  }
+  return deviceId
+}
 
 // ─── Event Emitter (UI reactivity) ────────────────────────────────────────
 
@@ -667,6 +821,81 @@ async function markMutationSending(id) {
   }
 }
 
+// Legacy create-row repair map (round-7): path → Prisma model for locally
+// created records whose HTTP-replay rows could never succeed.
+const LEGACY_CREATE_PATH_MODELS = [
+  { path: '/api/reservations', model: 'Reservation' },
+  { path: '/api/agency/queue/walk-in', model: 'Reservation' },
+  { path: '/api/services', model: 'Service' },
+  { path: '/api/agency/services', model: 'Service' },
+  { path: '/api/agency/branches', model: 'Branch' },
+  { path: '/api/agency/counters', model: 'Counter' },
+]
+
+/**
+ * One-time startup repair (round-7): rows logged BEFORE the canonical
+ * SYNC_PUSH conversion as HTTP create replays are permanently failed by
+ * definition (the cloud route is customer-only / schema-incompatible), so
+ * their outbox rows sit in permanent_failed forever and any dependent
+ * SYNC_PUSH update rows retry against a cloud record that never existed.
+ *
+ * Repair: for each permanent_failed legacy create row, re-log its stored
+ * response record as a CANONICAL id-preserving SYNC_PUSH create (idempotent
+ * cloud upsert — safe even if the record already reached the cloud by
+ * another path). The original row is kept untouched as truthful history;
+ * the new canonical row tracks the real delivery exactly-once.
+ */
+async function repairLegacyReservationCreates() {
+  if (!db) return
+  try {
+    await ensurePendingMutationsTable()
+    for (const { path, model } of LEGACY_CREATE_PATH_MODELS) {
+      let rows = []
+      try {
+        rows = await db.$queryRawUnsafe(
+          'SELECT id, response_data FROM "_pending_mutations" ' +
+          "WHERE status = 'permanent_failed' AND method = 'POST' AND path = ? ORDER BY created_at ASC",
+          path
+        )
+      } catch (e) {
+        console.warn('[LocalAPI] Legacy create repair scan failed for', path, ':', e.message)
+        continue
+      }
+      for (const row of rows || []) {
+        let record = null
+        try {
+          const parsed = row.response_data ? JSON.parse(row.response_data) : null
+          // response_data stored by logPendingMutation is the created record
+          // itself (reservations/walk-in) — unwrap common wrappers too.
+          record = parsed && typeof parsed === 'object'
+            ? (parsed.data || parsed.reservation || parsed.record || parsed)
+            : null
+        } catch { record = null }
+        if (!record || typeof record !== 'object' || !record.id || typeof record.id !== 'string') {
+          continue
+        }
+        // Idempotence: skip only if a canonical CREATE row for this record
+        // already exists (a previous repair already scheduled the delivery).
+        // A SYNC_PUSH update row for the same record must NOT suppress the
+        // create repair — the update is useless until the create lands.
+        let already = []
+        try {
+          already = await db.$queryRawUnsafe(
+            'SELECT id FROM "_pending_mutations" WHERE method = \'SYNC_PUSH\' AND body LIKE ? AND body LIKE ? LIMIT 1',
+            '%"recordId":"' + record.id + '"%',
+            '%"operation":"create"%'
+          )
+        } catch { already = [] }
+        if (already && already.length > 0) continue
+        await logDeterministicOutcome(model, record.id, 'create', record, record.updatedAt || null, {})
+        console.log('[LocalAPI] Legacy create repair: re-queued', model, record.id, 'as canonical SYNC_PUSH create (was permanently-failed HTTP replay', row.id + ')')
+      }
+    }
+  } catch (e) {
+    console.warn('[LocalAPI] Legacy create repair error (non-fatal):', e.message)
+  }
+}
+
 /**
  * Mark a mutation failed with Part R/S semantics:
  *   transient (network/timeout/5xx/429) -> status='retry' + exponential
@@ -788,6 +1017,24 @@ function createApp() {
   // 2. AUTH (no auth)
   // ═══════════════════════════════════════════════════════════════════════
 
+  /**
+   * Desktop login = CLOUD LOGIN → LOCAL UNLOCK (Task 14).
+   *
+   * Resolution order (generic for every role — no per-user special cases):
+   *   1. LOCAL UNLOCK — LocalDeviceCredential (user+device) scrypt verifier.
+   *      Works with the cloud completely offline. Only the user who logged
+   *      in on THIS device has one.
+   *   2. LEGACY LOCAL HASH — pre-contract local rows that still carry a
+   *      passwordHash (dev fixtures / accounts created before the sync
+   *      contract change). A mismatch FALLS THROUGH to the cloud so a
+   *      password changed on the cloud still logs in.
+   *   3. CLOUD LOGIN PROXY — forwards the credentials to the cloud API; on
+   *      success upserts the local profile (profile-only), imports the
+   *      cloud session, and creates THIS user's device credential so the
+   *      next restart can unlock offline.
+   *   4. NO LOCAL CREDENTIAL — an explicit, machine-readable verdict so the
+   *      UI can say "log in with the cloud once to enable offline unlock".
+   */
   app.post('/api/auth/login', async (c) => {
     try {
       const body = await c.req.json()
@@ -796,89 +1043,142 @@ function createApp() {
       if (!username || !password) {
         return c.json({ success: false, error: 'Username and password required' }, 400)
       }
-
-      // Find user in local SQLite
-      const user = await db.user.findUnique({ where: { username } })
-      if (!user) {
-        return c.json({ success: false, error: 'Invalid username or password' }, 401)
+      if (!db) {
+        return c.json({ success: false, error: 'Local database not ready' }, 503)
       }
 
-      // Verify password — timing-safe comparison of stored hash
-      // (In production this would use bcrypt; for local-only we compare the stored hash)
-      const inputHash = require('crypto')
-        .createHash('sha256')
-        .update(password)
-        .digest('hex')
+      const invalid = () => c.json({ success: false, error: 'Invalid username or password' }, 401)
+      const deactivated = () => c.json({ success: false, error: 'Account is deactivated' }, 403)
 
-      try {
-        const storedBuf = Buffer.from(user.passwordHash, 'utf-8')
-        const inputBuf = Buffer.from(inputHash, 'utf-8')
-        if (
-          storedBuf.length !== inputBuf.length ||
-          !timingSafeEqual(storedBuf, inputBuf)
-        ) {
-          // If the stored hash looks like a bcrypt hash (starts with $2), try bcrypt
-          if (user.passwordHash && user.passwordHash.startsWith('$2')) {
+      const buildStaffAgencyId = async (user) => {
+        if (user.role === 'AGENCY_OWNER' || user.role === 'AGENCY_STAFF') {
+          const staff = await db.agencyStaff.findFirst({
+            where: { userId: user.id, isActive: true },
+          })
+          return staff ? staff.agencyId : null
+        }
+        return null
+      }
+
+      // Find user in local SQLite (may be absent on a fresh machine)
+      const user = await db.user.findUnique({ where: { username } }).catch(() => null)
+
+      // ── 1. Local unlock via device credential (fully offline) ──
+      if (user && db.localDeviceCredential) {
+        const deviceId = await getDeviceId()
+        const cred = await db.localDeviceCredential.findUnique({
+          where: { userId_deviceId: { userId: user.id, deviceId } },
+        }).catch(() => null)
+        if (cred && !cred.revokedAt && verifierMatches(cred, password)) {
+          if (!user.isActive) return deactivated()
+          const sessionData = {
+            id: user.id,
+            username: user.username,
+            fullName: user.fullName,
+            role: user.role,
+            language: user.language || 'ar',
+            avatarUrl: user.avatarUrl || null,
+            agencyId: await buildStaffAgencyId(user),
+          }
+          sessionToken = randomBytes(32).toString('hex')
+          sessionUser = sessionData
+          emitEvent('auth:login', { user: sessionData })
+          console.log('[LocalAPI] Local unlock via device credential:', sessionData.username)
+          return c.json({ success: true, user: sessionData, token: sessionToken, unlockedLocally: true })
+        }
+      }
+
+      // ── 2. Legacy local passwordHash (pre-contract rows only) ──
+      // NOTE: a mismatch falls through to the cloud (the local hash may be
+      // stale after a cloud-side password change) — it does NOT return 401.
+      if (user && user.passwordHash) {
+        const inputHash = createHash('sha256').update(password).digest('hex')
+        try {
+          const storedBuf = Buffer.from(user.passwordHash, 'utf-8')
+          const inputBuf = Buffer.from(inputHash, 'utf-8')
+          let ok = storedBuf.length === inputBuf.length && timingSafeEqual(storedBuf, inputBuf)
+          if (!ok && user.passwordHash.startsWith('$2')) {
             try {
               const bcrypt = require('bcryptjs')
-              if (!(await bcrypt.compare(password, user.passwordHash))) {
-                return c.json({ success: false, error: 'Invalid username or password' }, 401)
-              }
-            } catch {
-              return c.json({ success: false, error: 'Invalid username or password' }, 401)
-            }
-          } else {
-            return c.json({ success: false, error: 'Invalid username or password' }, 401)
+              ok = await bcrypt.compare(password, user.passwordHash)
+            } catch { ok = false }
           }
+          if (ok) {
+            if (!user.isActive) return deactivated()
+            const sessionData = {
+              id: user.id,
+              username: user.username,
+              fullName: user.fullName,
+              role: user.role,
+              language: user.language || 'ar',
+              avatarUrl: user.avatarUrl || null,
+              agencyId: await buildStaffAgencyId(user),
+            }
+            sessionToken = randomBytes(32).toString('hex')
+            sessionUser = sessionData
+            emitEvent('auth:login', { user: sessionData })
+            return c.json({ success: true, user: sessionData, token: sessionToken })
+          }
+        } catch { /* fall through to the cloud */ }
+      }
+
+      // ── 3. Cloud login through the local API (+ device credential) ──
+      const cloud = await cloudLoginProxy(username, password, body && body.rememberMe ? { rememberMe: true } : undefined)
+      if (cloud.ok && cloud.data && cloud.data.user && cloud.data.token) {
+        const cloudUser = cloud.data.user
+        try {
+          await upsertLocalUserFromCloud(cloudUser)
+        } catch (e) {
+          console.warn('[LocalAPI] Local profile upsert after cloud login failed:', e?.message || e)
         }
-      } catch {
-        return c.json({ success: false, error: 'Invalid username or password' }, 401)
+        try {
+          await storeDeviceCredential(cloudUser.id, password, body ? body.keepSignedIn : undefined)
+        } catch (e) {
+          console.warn('[LocalAPI] Device credential store failed:', e?.message || e)
+        }
+        sessionToken = cloud.data.token
+        sessionUser = {
+          id: cloudUser.id,
+          username: cloudUser.username || cloudUser.email || 'imported',
+          fullName: cloudUser.fullName || cloudUser.name || '',
+          role: cloudUser.role || 'CUSTOMER',
+          language: cloudUser.language || 'ar',
+          avatarUrl: cloudUser.avatarUrl || null,
+          agencyId: cloudUser.agencyId || null,
+        }
+        emitEvent('auth:login', { user: sessionUser })
+        console.log('[LocalAPI] Cloud login via local API — device credential stored:', sessionUser.username)
+        return c.json({ success: true, user: sessionUser, token: sessionToken })
       }
 
-      if (!user.isActive) {
-        return c.json({ success: false, error: 'Account is deactivated' }, 403)
+      // The cloud REJECTED the credentials — a definitive wrong-password (not offline).
+      if (cloud.status === 401 || cloud.status === 403) return invalid()
+
+      // Cloud unreachable and no local unlock is possible for this profile.
+      if (user) {
+        return c.json({
+          success: false,
+          error: 'Invalid username or password',
+          code: 'NO_LOCAL_CREDENTIAL',
+          cloudLoginRequired: true,
+        }, 401)
       }
-
-      // Build session data
-      const sessionData = {
-        id: user.id,
-        username: user.username,
-        fullName: user.fullName,
-        role: user.role,
-        language: user.language || 'ar',
-        avatarUrl: user.avatarUrl || null,
-        agencyId: null,
-      }
-
-      // Look up agencyId from agency-staff membership
-      if (user.role === 'AGENCY_OWNER' || user.role === 'AGENCY_STAFF') {
-        const staff = await db.agencyStaff.findFirst({
-          where: { userId: user.id, isActive: true },
-        })
-        if (staff) sessionData.agencyId = staff.agencyId
-      }
-
-      // Create session token (random hex, per-launch)
-      sessionToken = randomBytes(32).toString('hex')
-      sessionUser = sessionData
-
-      emitEvent('auth:login', { user: sessionData })
-
-      return c.json({
-        success: true,
-        user: sessionData,
-        token: sessionToken,
-      })
+      return invalid()
     } catch (error) {
       console.error('[LocalAPI] Login error:', error)
       return c.json({ success: false, error: 'Login failed' }, 500)
     }
   })
 
-  app.get('/api/auth/session', (c) => {
+  app.get('/api/auth/session', async (c) => {
     if (!sessionUser) {
       return c.json({ success: false, error: 'No active session' }, 401)
     }
+    // "Keep signed in on this device" preference (Task 14). Default TRUE —
+    // matches the historic auto-restore behavior — and only an explicit
+    // 'false' in _sync_meta disables it.
+    let keepSignedIn = true
+    try { keepSignedIn = (await getLocalMeta('keep_signed_in')) !== 'false' } catch { keepSignedIn = true }
     // Return in NextAuth-compatible format (same as cloud API)
     return c.json({
       user: {
@@ -891,6 +1191,7 @@ function createApp() {
         agencyId: sessionUser.agencyId,
       },
       expires: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      keepSignedIn,
     })
   })
 
@@ -965,6 +1266,94 @@ function createApp() {
   // ═══════════════════════════════════════════════════════════════════════
 
   const authMiddleware = requireAuth()
+
+  // ═════════════════════════════════════════════════════════════════
+  // LOCAL DEVICE CREDENTIAL (desktop unlock — Task 14)
+  // ═════════════════════════════════════════════════════════════════
+
+  /**
+   * Store/refresh the CURRENT session user's local unlock credential for
+   * THIS device. Callable any time while the session is valid — after a
+   * cloud login (the local login proxy already does this automatically) or
+   * explicitly from the Electron main process/renderer.
+   *
+   * Body: { password?: string, verifier?: string, salt?: string, keepSignedIn?: boolean }
+   *  - password  → server derives the scrypt verifier (request never leaves 127.0.0.1)
+   *  - verifier+salt → pre-derived by the caller (Electron main process)
+   * The credential is bound to (sessionUser.id, deviceId) — never global.
+   */
+  app.post('/api/auth/device-credential', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+      if (!db.localDeviceCredential) {
+        return c.json({ success: false, error: 'localDeviceCredential model unavailable — regenerate the Prisma client' }, 503)
+      }
+      const userId = sessionUser && sessionUser.id
+      if (!userId) return c.json({ success: false, error: 'No active session user' }, 401)
+
+      const body = await c.req.json().catch(() => ({}))
+      let verifierHash = null
+      let salt = null
+      if (body && typeof body.password === 'string' && body.password.length > 0) {
+        salt = randomBytes(16).toString('hex')
+        verifierHash = deriveUnlockVerifier(body.password, salt)
+      } else if (
+        body && typeof body.verifier === 'string' && typeof body.salt === 'string' &&
+        /^[0-9a-f]{32,}$/i.test(body.salt) && /^[0-9a-f]{64,}$/i.test(body.verifier)
+      ) {
+        verifierHash = body.verifier.toLowerCase()
+        salt = body.salt.toLowerCase()
+      } else {
+        return c.json({ success: false, error: 'password or (verifier + salt) required' }, 400)
+      }
+
+      const deviceId = await getDeviceId()
+      const existing = await db.localDeviceCredential.findUnique({
+        where: { userId_deviceId: { userId, deviceId } },
+      }).catch(() => null)
+      if (existing) {
+        await db.localDeviceCredential.update({
+          where: { id: existing.id },
+          data: { verifierHash, salt, revokedAt: null },
+        })
+      } else {
+        await db.localDeviceCredential.create({ data: { userId, deviceId, verifierHash, salt } })
+      }
+      let keepSignedIn = null
+      if (body && typeof body.keepSignedIn === 'boolean') {
+        await setLocalMeta('keep_signed_in', body.keepSignedIn ? 'true' : 'false')
+        keepSignedIn = body.keepSignedIn
+      }
+      console.log('[LocalAPI] Device credential stored for user', String(userId).substring(0, 8) + '…', 'device', deviceId.substring(0, 12) + '…')
+      return c.json({ success: true, deviceId, keepSignedIn })
+    } catch (error) {
+      console.error('[LocalAPI] Device credential error:', error)
+      return c.json({ success: false, error: 'Failed to store device credential' }, 500)
+    }
+  })
+
+  /**
+   * Revoke the CURRENT session user's local unlock credential for THIS
+   * device (e.g. "sign out of this device"). Logout alone does NOT revoke —
+   * the credential is what enables offline unlock after a restart.
+   */
+  app.delete('/api/auth/device-credential', authMiddleware, async (c) => {
+    try {
+      const userId = sessionUser && sessionUser.id
+      if (!userId || !db || !db.localDeviceCredential) {
+        return c.json({ success: false, error: 'No active session or model unavailable' }, 401)
+      }
+      const deviceId = await getDeviceId()
+      const result = await db.localDeviceCredential.updateMany({
+        where: { userId, deviceId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      })
+      return c.json({ success: true, revoked: result?.count || 0 })
+    } catch (error) {
+      console.error('[LocalAPI] Device credential revoke error:', error)
+      return c.json({ success: false, error: 'Failed to revoke device credential' }, 500)
+    }
+  })
 
   // ═══════════════════════════════════════════════════════════════════════
   // CLOUD-ONLY STUBS — return 200 with available:false so the dashboard
@@ -1458,7 +1847,10 @@ function createApp() {
             isActive: true,
           },
         })
-        await logPendingMutation('POST', '/api/services', body, created, { tx })
+        // Canonical replay (round-7): record-level create preserves the LOCAL
+        // id on the cloud — HTTP replays of create routes recreate the record
+        // under a NEW cloud id, permanently breaking later updates by id.
+        await logDeterministicOutcome('Service', created.id, 'create', created, null, { tx })
         return created
       })
 
@@ -1596,7 +1988,9 @@ function createApp() {
             isActive: isActive !== undefined ? Boolean(isActive) : true,
           },
         })
-        await logPendingMutation('POST', '/api/agency/branches', body, created, { tx })
+        // Canonical replay (round-7): see the reservation create note —
+        // id-preserving record-level create, never an HTTP route replay.
+        await logDeterministicOutcome('Branch', created.id, 'create', created, null, { tx })
         return created
       })
 
@@ -1749,7 +2143,8 @@ function createApp() {
             isActive: isActive !== undefined ? Boolean(isActive) : true,
           },
         })
-        await logPendingMutation('POST', '/api/agency/counters', body, created, { tx })
+        // Canonical replay (round-7): id-preserving record-level create.
+        await logDeterministicOutcome('Counter', created.id, 'create', created, null, { tx })
         return created
       })
 
@@ -2056,7 +2451,17 @@ function createApp() {
 
         // Part Q: the outbox row commits ATOMICALLY with the ticket — a crash
         // can no longer produce an issued ticket the cloud never learns about.
-        await logPendingMutation('POST', '/api/reservations', body, created, { tx })
+        //
+        // Round-7 fix: replay as a CANONICAL SYNC_PUSH record-level CREATE,
+        // NOT as an HTTP POST replay. The cloud's POST /api/reservations is
+        // the CUSTOMER join-queue route — it 403s for AGENCY_OWNER
+        // ("Only customers can join queues") and its Zod schema requires
+        // agencyId (the local route derives it from the session), so every
+        // replayed HTTP row failed permanently (400/403) and locally-issued
+        // tickets NEVER reached the cloud. The canonical push applies the
+        // exact local record (same id, full data) role-agnostically via
+        // POST /api/sync/push — deterministic, idempotent, id-preserving.
+        await logDeterministicOutcome('Reservation', created.id, 'create', created, null, { tx })
         return created
       })
 
@@ -2964,7 +3369,8 @@ function createApp() {
             isActive: true,
           },
         })
-        await logPendingMutation('POST', '/api/agency/services', body, created, { tx })
+        // Canonical replay (round-7): id-preserving record-level create.
+        await logDeterministicOutcome('Service', created.id, 'create', created, null, { tx })
         return created
       })
       emitEvent('service:created', { agencyId, service })
@@ -3137,7 +3543,9 @@ function createApp() {
           },
         })
         // Part Q: the outbox row commits ATOMICALLY with the walk-in ticket.
-        await logPendingMutation('POST', '/api/agency/queue/walk-in', body, created, { tx })
+        // Canonical replay (round-7): the cloud POST route is customer-only
+        // (403 for owners) — replay as a record-level create like /api/reservations.
+        await logDeterministicOutcome('Reservation', created.id, 'create', created, null, { tx })
         return created
       })
 
@@ -4109,7 +4517,12 @@ function createApp() {
       try {
         const syncService = require('./sync-service')
         if (result && result.success && typeof result.snapshotSequence === 'number') {
-          await syncService.setInitialCursor(result.snapshotSequence)
+          // CURSOR INVARIANT (field round 6): prefer the BRIDGE's final
+          // sequence (ledger-proven coverage) over the raw snapshotSequence.
+          const adoptedSeq = (typeof result.bridgeFinalSequence === 'number' && result.bridgeFinalSequence >= result.snapshotSequence)
+            ? result.bridgeFinalSequence
+            : result.snapshotSequence
+          await syncService.setInitialCursor(adoptedSeq, { source: 'http-post-init', snapshotSequence: result.snapshotSequence, bridgeFinalSequence: result.bridgeFinalSequence ?? null })
         }
         if (!syncService.getStatus()?.isStarted) {
           syncService.startSync({ localDb: db, cloudBaseUrl: cloudUrl, agencyId })
@@ -4672,6 +5085,14 @@ async function startLocalApi(dbPath, port, options) {
   await setupPragmas()
   console.log(`[LocalAPI] Prisma database initialized (local SQLite)`)
 
+  // Round-7: repair legacy permanently-failed HTTP create rows before the
+  // sync engine starts replaying (idempotent — safe on every startup).
+  try {
+    await repairLegacyReservationCreates()
+  } catch (repairErr) {
+    console.warn('[LocalAPI] Legacy create repair skipped (non-fatal):', repairErr.message)
+  }
+
   // Create Hono app
   const app = createApp()
 
@@ -4729,6 +5150,24 @@ async function startLocalApi(dbPath, port, options) {
     })
   })
 
+  // ── Local realtime socket server (local-first, spec §7/§8) ────────────────
+  // The desktop UI connects its Socket.IO client to THIS server (use-realtime
+  // resolveSocketUrl → http://127.0.0.1:3080). Without it every UI realtime
+  // connection 404'd and the dashboard showed "offline mode" even while the
+  // cloud was healthy. Attach Socket.IO to the SAME HTTP server here.
+  try {
+    localRealtime.initLocalRealtime(httpServer, {
+      getSession: () => (sessionToken && sessionUser ? { token: sessionToken, user: sessionUser } : null),
+    })
+    // Bridge the in-process event stream (emitEvent) onto the socket server —
+    // every local business mutation becomes a live UI event, OFFLINE included.
+    onEvent((event, payload) => {
+      try { localRealtime.broadcastLocalRealtime(event, payload) } catch { /* non-fatal */ }
+    })
+  } catch (rtErr) {
+    console.warn('[LocalAPI] Local realtime init failed (non-fatal — interval sync unaffected):', rtErr.message)
+  }
+
   return { port, db }
 }
 
@@ -4736,6 +5175,8 @@ async function startLocalApi(dbPath, port, options) {
  * Stop the embedded local API server.
  */
 function stopLocalApi() {
+  // Close the realtime socket server BEFORE the HTTP server (it wraps it).
+  try { localRealtime.closeLocalRealtime() } catch { /* not started */ }
   if (httpServer) {
     httpServer.close()
     httpServer = null
@@ -4825,5 +5266,10 @@ module.exports = {
   classifyMutationFailure,
   computeRetryBackoffMs,
   deriveStableIdempotencyKey,
+  broadcastLocalRealtime: (...args) => localRealtime.broadcastLocalRealtime(...args),
+  setLocalRealtimeRelayContext: (...args) => localRealtime.setLocalRealtimeRelayContext(...args),
+  relayCloudRealtime: (...args) => localRealtime.relayCloudRealtime(...args),
+  getLocalRealtimeStats: () => localRealtime.getLocalRealtimeStats(),
+  repairLegacyReservationCreates,
   DEFAULT_PORT,
 }

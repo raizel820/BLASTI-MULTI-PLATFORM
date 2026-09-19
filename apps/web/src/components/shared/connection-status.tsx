@@ -42,6 +42,29 @@ let _consecutiveLanFailures = 0;
  * Uses exponential backoff on cloud checks to avoid spamming ERR_CONNECTION_REFUSED.
  * LAN checks are lightweight (1.5s timeout) and only run when cloud is down.
  */
+/**
+ * Resolve the CLOUD API base URL for the health check.
+ *
+ * Round-7 fix: in Electron, getApiBaseUrl() intentionally returns the LOCAL
+ * API (http://127.0.0.1:3080 — local-first). Probing it here mislabeled the
+ * LOCAL API as "cloud" (cloudReachable=true even when the cloud was down, and
+ * the local-mode banner could never appear). The renderer must probe the real
+ * cloud URL — which the desktop main process knows (SyncService cloudBaseUrl,
+ * exposed via the sync:status IPC bridge).
+ */
+async function resolveCloudBaseUrl(): Promise<string> {
+  try {
+    const w = window as any;
+    if (w.electronAPI?.getSyncStatus) {
+      const status = await w.electronAPI.getSyncStatus();
+      const url = status?.cloudBaseUrl || status?.cloudUrl;
+      if (typeof url === 'string' && url.length > 0) return url;
+    }
+  } catch { /* IPC bridge unavailable — fall through to the dev default */ }
+  // Dev default: the local cloud API used by `bun run dev:api`.
+  return 'http://localhost:3003';
+}
+
 async function checkApiHealth(): Promise<ApiHealthStatus> {
   const platform = detectPlatform();
   const { isElectron } = platform;
@@ -52,16 +75,20 @@ async function checkApiHealth(): Promise<ApiHealthStatus> {
     // In Electron, use shorter timeout when cloud is known-down to fail fast
     const timeout = isElectron && _consecutiveCloudFailures > 0 ? 1_500 : 3_000;
     const timer = setTimeout(() => controller.abort(), timeout);
-    // Use the resolved API base URL + /api/health to hit the actual cloud API server.
-    // On web, getApiBaseUrl() returns '' (relative), so we add XTransformPort=3003
-    // to route through the gateway to the cloud API on port 3003. /api/health is
-    // the canonical alias — the gateway only forwards /api/* paths.
-    const baseUrl = getApiBaseUrl();
-    const healthPath = '/api/health';
-    let healthUrl = `${baseUrl}${healthPath}`;
-    // Inject XTransformPort for web platform (relative URL, not Electron/Capacitor)
-    if (!baseUrl && typeof window !== 'undefined' && !isElectron && !(window as any).Capacitor) {
-      healthUrl += '?XTransformPort=3003';
+    // Probe the REAL cloud API — never the local API. On web the base is ''
+    // (relative) so XTransformPort=3003 routes through the gateway to the
+    // cloud API on port 3003. /api/health is the canonical alias.
+    const isElectronOrigin = typeof window !== 'undefined' &&
+      (!!((window as unknown as Record<string, unknown>).electronAPI) || navigator.userAgent.includes('Electron'));
+    let healthUrl: string;
+    if (isElectronOrigin) {
+      healthUrl = `${await resolveCloudBaseUrl()}/api/health`;
+    } else {
+      const baseUrl = getApiBaseUrl();
+      healthUrl = `${baseUrl}/api/health`;
+      if (!baseUrl && typeof window !== 'undefined' && !isElectron && !(window as any).Capacitor) {
+        healthUrl += '?XTransformPort=3003';
+      }
     }
     const res = await fetch(healthUrl, { signal: controller.signal });
     clearTimeout(timer);
@@ -70,9 +97,9 @@ async function checkApiHealth(): Promise<ApiHealthStatus> {
       _consecutiveCloudFailures = 0; // Reset on success
       // Cloud is back — LAN status is no longer relevant
       _healthStatus.lanReachable = null;
-      console.log(`[HealthCheck] CLOUD OK (${res.status})`);
+      console.log(`[HealthCheck] CLOUD OK (${res.status}) — ${healthUrl}`);
     } else {
-      console.log(`[HealthCheck] CLOUD respond ${res.status} (not OK)`);
+      console.log(`[HealthCheck] CLOUD respond ${res.status} (not OK) — ${healthUrl}`);
     }
   } catch (err) {
     _healthStatus.cloudReachable = false;

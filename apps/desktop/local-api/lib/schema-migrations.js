@@ -52,15 +52,36 @@ const path = require('path')
 // ─── Versioning ─────────────────────────────────────────────────────────────
 
 /** Current local schema version. Bump when adding MIGRATION_STEPS. */
-const LOCAL_SCHEMA_VERSION = 1
+const LOCAL_SCHEMA_VERSION = 2
 
 /**
  * Incremental upgrade steps BETWEEN versions. Each step:
  *   { version: <int>, name: <string>, statements: [sql, ...] }
  * Steps run in ascending order for any DB whose stamped version is lower
  * than the step version. Statements must be idempotent/additive.
+ *
+ * v2 (Task 14 — User sync/auth contract):
+ *   - LocalDeviceCredential: desktop-only per-(user, device) unlock
+ *     verifier. NEVER synced; the cloud copy of this table stays empty.
+ *   - User.passwordHash becomes NULLABLE. SQLite cannot relax a NOT NULL
+ *     constraint in place, so the column-shape change is applied by the
+ *     guarded, data-preserving table rebuild in
+ *     _rebuildUserPasswordHashNullable() (convergence pass below) which
+ *     runs on EVERY ensureSchema call regardless of the version stamp —
+ *     legacy-adopted databases skip version-gated steps, so the rebuild
+ *     deliberately does NOT live here.
  */
-const MIGRATION_STEPS = []
+const MIGRATION_STEPS = [
+  {
+    version: 2,
+    name: 'local-device-credential (desktop unlock verifier; passwordHash → nullable handled by convergence rebuild)',
+    statements: [
+      'CREATE TABLE "LocalDeviceCredential" ("id" TEXT NOT NULL PRIMARY KEY, "userId" TEXT NOT NULL, "deviceId" TEXT NOT NULL, "verifierHash" TEXT NOT NULL, "salt" TEXT NOT NULL, "algo" TEXT NOT NULL DEFAULT \'scrypt\', "scryptN" INTEGER NOT NULL DEFAULT 16384, "scryptR" INTEGER NOT NULL DEFAULT 8, "scryptP" INTEGER NOT NULL DEFAULT 1, "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" DATETIME NOT NULL, "revokedAt" DATETIME, CONSTRAINT "LocalDeviceCredential_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE)',
+      'CREATE INDEX "LocalDeviceCredential_userId_idx" ON "LocalDeviceCredential"("userId")',
+      'CREATE UNIQUE INDEX "LocalDeviceCredential_userId_deviceId_key" ON "LocalDeviceCredential"("userId", "deviceId")',
+    ],
+  },
+]
 
 // ─── Embedded first-creation DDL ────────────────────────────────────────────
 
@@ -101,6 +122,8 @@ const SYNC_INFRA_TABLES = [
 const CORE_REQUIRED_TABLES = [
   // sessions & identity
   'User',
+  // desktop-only local unlock credential (Task 14 — never synced)
+  'LocalDeviceCredential',
   // agency + dataset
   'Agency', 'AgencyStaff', 'Service', 'Branch', 'Counter',
   'QueueSettings', 'Reservation',
@@ -378,6 +401,25 @@ async function ensureSchema(db, opts = {}) {
     await _ensurePendingMutationsIdempotencyColumn(db, log)
   }
 
+  // 3. CONVERGENCE REBUILD (v2) — relax User.passwordHash to NULL-allowed.
+  //    Self-guarding (no-op when already nullable) so it is safe on every
+  //    call path: fresh creation (new DDL already nullable → no-op), legacy
+  //    adoption (skips version-gated steps → NEEDS this pass), and stamped
+  //    upgrades. Failure is FATAL to startup (ok=false): a database that
+  //    still requires passwordHash would fail initial sync anyway, and the
+  //    transactional rebuild rolls back completely on any error.
+  try {
+    const rebuild = await _rebuildUserPasswordHashNullable(db, log)
+    if (rebuild && rebuild.rebuilt) {
+      result.userPasswordHashRebuilt = true
+    }
+  } catch (err) {
+    result.action = 'user-pwhash-rebuild-failed'
+    result.errors.push({ error: `User.passwordHash rebuild failed: ${err?.message || err}` })
+    log(`ERROR: User.passwordHash rebuild failed: ${err?.message || err}`)
+    return result
+  }
+
   // 3. CONVERGENCE TOP-UP — bring ANY database shape up to the current schema
   //    additively (data never touched):
   //    a. missing TABLES ← init DDL (hardened CREATE IF NOT EXISTS)
@@ -498,6 +540,119 @@ async function ensureSchema(db, opts = {}) {
 }
 
 /**
+ * CONVERGENCE MIGRATION (schema v2): make User.passwordHash NULL-allowed on
+ * databases created before the User sync/auth contract change.
+ *
+ * WHY: SQLite cannot ALTER a column's NOT NULL constraint. The cloud sync
+ * feed never sends passwordHash (explicit USER_SYNC projection), so synced
+ * desktop profiles must be able to store NULL — otherwise EVERY fresh
+ * initial sync dies on the Users stage with "Argument passwordHash is
+ * missing" and READY is never reached.
+ *
+ * HOW: in-place column surgery (see the detailed comment at the operation
+ * below): ADD nullable column → UPDATE copy → DROP the NOT NULL original →
+ * RENAME the replacement. The parent table is never renamed or dropped, so
+ * NO foreign-key machinery is ever involved — swap-by-rename strategies are
+ * provably dead ends (child FK clauses are always repointed on rename, and
+ * a referenced parent's DROP leaves an unresolvable deferred RESTRICT
+ * violation). All inside ONE transaction: any failure rolls the table back
+ * to its exact prior shape. Post-conditions verify nullability, hash
+ * preservation, and PRAGMA foreign_key_check cleanliness.
+ *
+ * Idempotent: exits without side effects when passwordHash is already
+ * nullable (or the table/column is absent — the verify gate handles that).
+ */
+async function _rebuildUserPasswordHashNullable(db, log) {
+  let cols
+  try {
+    cols = await db.$queryRawUnsafe('PRAGMA table_info("User")')
+  } catch {
+    return { rebuilt: false, reason: 'user-table-unreadable' }
+  }
+  if (!cols || cols.length === 0) return { rebuilt: false, reason: 'no-user-table' }
+  const pwh = cols.find((c) => String(c.name) === 'passwordHash')
+  if (!pwh) return { rebuilt: false, reason: 'no-passwordHash-column' }
+  if (!Number(pwh.notnull)) return { rebuilt: false, reason: 'already-nullable' }
+
+  log('User.passwordHash is NOT NULL (pre-v2 local shape) — relaxing to NULL-allowed non-destructively (all rows preserved)')
+
+  // Views/triggers bound to User would break column surgery (and a rebuild
+  // would silently drop them) — refuse loudly instead.
+  const deps = await db.$queryRawUnsafe(
+    "SELECT name, type FROM sqlite_master WHERE tbl_name = 'User' AND type IN ('view','trigger')"
+  )
+  if (deps && deps.length > 0) {
+    throw new Error(`User table has ${deps.length} view/trigger object(s) (${deps.map((d) => d.name).join(', ')}) — refusing automatic migration (manual migration required)`)
+  }
+
+  // Refuse if passwordHash participates in any index (none in the schema;
+  // a legacy db-push-era DB could differ — fail loudly, never guess).
+  const userIndexes = await db.$queryRawUnsafe('PRAGMA index_list("User")')
+  for (const idx of userIndexes || []) {
+    const idxCols = await db.$queryRawUnsafe(`PRAGMA index_info("${idx.name}")`)
+    if (idxCols.some((ic) => String(ic.name) === 'passwordHash')) {
+      throw new Error(`User.passwordHash is indexed by "${idx.name}" — refusing automatic migration (manual migration required)`)
+    }
+  }
+
+  // Engine capability: ADD/DROP/RENAME COLUMN surgery needs SQLite ≥ 3.35.
+  // The desktop ALWAYS uses Prisma's bundled engine (≥3.46 for Prisma 6), so
+  // this is a formality — but a version gate makes failure impossible to
+  // miss if that ever changes.
+  const ver = await db.$queryRawUnsafe('SELECT sqlite_version() AS v')
+  const sqliteVersion = String(ver?.[0]?.v || '0')
+  const [maj, min] = sqliteVersion.split('.').map((n) => parseInt(n, 10) || 0)
+  if (maj < 3 || (maj === 3 && min < 35)) {
+    throw new Error(`SQLite ${sqliteVersion} cannot relax a NOT NULL column in place (needs ≥3.35) — manual migration required`)
+  }
+
+  // ══ HOW (proven — see the diagnosis notes below) ═══════════════════════
+  // SQLite ≥3.25 ALWAYS repoints child FK clauses when a referenced table is
+  // RENAMEd (even with legacy_alter_table=ON), and DROPPing a referenced
+  // parent leaves an unresolvable deferred violation (RESTRICT fires even
+  // under defer_foreign_keys) — both swap-by-rename strategies die at COMMIT
+  // with "Foreign key constraint violated". The operation below NEVER drops
+  // or renames the parent table, so no FK machinery is ever involved:
+  //
+  //   1. ADD COLUMN "passwordHash__v2" TEXT          (NULL-able, no default)
+  //   2. UPDATE User SET passwordHash__v2 = passwordHash
+  //   3. DROP COLUMN "passwordHash"                  (no index/FK/trigger
+  //       dependents — guarded above — so the engine allows it; it rewrites
+  //       rows in place)
+  //   4. RENAME COLUMN "passwordHash__v2" → "passwordHash"
+  //
+  // Column ORDER changes (passwordHash moves to the end of the column list)
+  // — irrelevant: Prisma maps columns BY NAME, and INSERT/SELECT in this
+  // codebase always use explicit column lists. All inside ONE interactive
+  // transaction: any failure rolls the table back to its exact prior shape.
+  const NEW_COL = 'passwordHash__nullable_v2'
+  const nonNullBefore = await db.$queryRawUnsafe('SELECT COUNT(*) AS n FROM "User" WHERE "passwordHash" IS NOT NULL')
+  await db.$transaction(async (tx) => {
+    await tx.$executeRawUnsafe(`ALTER TABLE "User" ADD COLUMN "${NEW_COL}" TEXT`)
+    await tx.$executeRawUnsafe(`UPDATE "User" SET "${NEW_COL}" = "passwordHash"`)
+    await tx.$executeRawUnsafe(`ALTER TABLE "User" DROP COLUMN "passwordHash"`)
+    await tx.$executeRawUnsafe(`ALTER TABLE "User" RENAME COLUMN "${NEW_COL}" TO "passwordHash"`)
+  }, { maxWait: 5000, timeout: 120000 })
+
+  // Post-conditions (outside the transaction).
+  const post = await db.$queryRawUnsafe('PRAGMA table_info("User")')
+  const postPwh = post.find((c) => String(c.name) === 'passwordHash')
+  if (!postPwh || Number(postPwh.notnull)) {
+    throw new Error('User migration verification failed: passwordHash is still NOT NULL')
+  }
+  const nonNullAfter = await db.$queryRawUnsafe('SELECT COUNT(*) AS n FROM "User" WHERE "passwordHash" IS NOT NULL')
+  if (Number(nonNullAfter?.[0]?.n) !== Number(nonNullBefore?.[0]?.n)) {
+    throw new Error(`User migration verification failed: existing hashes changed (${nonNullBefore?.[0]?.n} → ${nonNullAfter?.[0]?.n})`)
+  }
+  const fk = await db.$queryRawUnsafe('PRAGMA foreign_key_check')
+  if (fk && fk.length > 0) {
+    throw new Error(`User migration left ${fk.length} foreign-key violation(s) — see foreign_key_check`)
+  }
+  log(`User.passwordHash is now NULL-allowed: all rows preserved (${nonNullAfter?.[0]?.n} existing hash(es) intact), FKs clean — no table rebuild needed`)
+  return { rebuilt: true, rows: Number(nonNullAfter?.[0]?.n) }
+}
+
+/**
  * Ensure the outbox idempotency column + unique index exist (v2 contract).
  * Additive-only; existing rows are never modified beyond NULL-key backfill
  * which is owned by index.js — here we only guarantee the column/index.
@@ -528,4 +683,5 @@ module.exports = {
   stripCommentLines,
   hardenCreate,
   parseDdlColumns,
+  _rebuildUserPasswordHashNullable,
 }

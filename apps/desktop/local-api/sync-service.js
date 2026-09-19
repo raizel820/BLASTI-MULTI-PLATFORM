@@ -212,10 +212,22 @@ function _isBooleanField(key) {
  * Convert a scalar-only cloud record into a local-SQLite-safe row
  * (ISO date strings stay ISO strings; booleans → 0/1; nulls kept).
  */
-function _cloudRecordToLocal(record) {
+/**
+ * Per-model fields that must never be persisted from the wire even if a
+ * cloud build regresses (Task 14 — User sync/auth contract, defense in
+ * depth; the cloud's USER_SYNC projection + REDACTED_FIELDS are the first
+ * two layers). Generic for every role.
+ */
+var SYNC_EXCLUDED_FIELDS = {
+  User: ['passwordHash', 'fcmToken'],
+}
+
+function _cloudRecordToLocal(record, modelName) {
+  const excluded = modelName ? (SYNC_EXCLUDED_FIELDS[modelName] || null) : null
   const result = { id: record.id };
   for (const [key, value] of Object.entries(record)) {
     if (key === 'id') continue;
+    if (excluded && excluded.indexOf(key) !== -1) continue;
     if (DATE_FIELDS.has(key) && typeof value === 'string' && ISO_DATE_RE.test(value)) {
       // Keep as ISO string — Prisma stores DateTime as TEXT in SQLite
       result[key] = value;
@@ -308,14 +320,42 @@ async function _getCursor() {
   // v2 cursor key. initial-sync.js bridges its snapshot with the legacy
   // '_lastPulledSequence' key — read that as a fallback so the engine
   // continues exactly where the initial import ended.
-  var v = await _getSyncMeta('lastPulledSequence');
-  if (v === null || v === undefined) {
-    v = await _getSyncMeta('_lastPulledSequence');
+  //
+  // CURSOR INVARIANT GUARD (field round 6): the two keys MUST agree.
+  // Historically the initial-sync bridge wrote ONLY the legacy key while a
+  // stale v2 key (over-advanced by an older build's pull, e.g. 893) SHADOWED
+  // the bridge's correct final sequence (890) — the engine then pulled from
+  // 893, silently skipping 891..893 relative to the import baseline. The
+  // invariant is: the cursor may only cover changes that are LEDGER-ACCOUNTED.
+  // When the keys disagree we adopt the MINIMUM (re-applying is idempotent
+  // via upserts + the page ledger; advancing past unaccounted changes is not
+  // recoverable) and heal both keys so divergence cannot persist.
+  var v2Raw = await _getSyncMeta('lastPulledSequence');
+  var legacyRaw = await _getSyncMeta('_lastPulledSequence');
+  var v2 = (v2Raw !== null && v2Raw !== undefined && v2Raw !== '') ? parseInt(v2Raw, 10) : NaN;
+  var legacy = (legacyRaw !== null && legacyRaw !== undefined && legacyRaw !== '') ? parseInt(legacyRaw, 10) : NaN;
+
+  if (!isNaN(v2) && !isNaN(legacy) && v2 !== legacy) {
+    var safe = Math.min(v2, legacy);
+    console.warn('[SyncService] CURSOR KEYS DIVERGED (lastPulledSequence=' + v2 + ', _lastPulledSequence=' + legacy +
+      ') — adopting MIN ' + safe + ' and healing both keys. NEVER skip changes that are not ledger-accounted.');
+    await _setCursor(safe);
+    return safe;
   }
-  var n = v ? parseInt(v, 10) : 0;
-  return isNaN(n) ? 0 : n;
+  if (!isNaN(v2)) return v2;
+  if (!isNaN(legacy)) {
+    // Legacy-only value (e.g. written by the initial-sync bridge): heal it
+    // into both keys so the engine and any external readers stay coherent.
+    await _setCursor(legacy);
+    return legacy;
+  }
+  return 0;
 }
 async function _setCursor(sequence) {
+  if (typeof _cursor === 'number' && _cursor > 0 && sequence < _cursor) {
+    console.warn('[SyncService] Cursor REWIND ' + _cursor + ' -> ' + sequence +
+      ' (safe: page application is ledger-idempotent via upserts; advancing past unaccounted changes would NOT be)');
+  }
   _cursor = sequence;
   await _setSyncMeta('lastPulledSequence', sequence);
   // Keep the legacy bridge key in sync (initial-sync.js consumers).
@@ -721,6 +761,15 @@ function ensureWorkspaceInitialized(trigger) {
       await _isAgencyReady(true); // force-refresh the gate cache
       console.log('[SyncService] Init coordinator: initial sync COMPLETED — workspace READY (' +
         (result.totalRecords || 0) + ' records)');
+      // CURSOR INVARIANT (field round 6): adopt the initializer's cursor
+      // BEFORE the first post-READY pull — the bridge proved coverage up to
+      // its final sequence; a stale pre-import cursor (e.g. 893 vs bridge
+      // 890) must never decide where the next pull starts.
+      try {
+        await adoptInitialSyncCursor(result, 'init-coordinator');
+      } catch (cursorErr) {
+        console.warn('[SyncService] Cursor adoption after initial sync failed (continuing):', cursorErr.message);
+      }
       emit({ type: 'workspace-ready', agencyId: agencyId, totalRecords: result.totalRecords || 0 });
       // Kick the engine immediately — replay + pull start now, not in 30s.
       _incrementalPullCycle('post-init').catch(function (err) {
@@ -1179,7 +1228,7 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
           continue;
         }
 
-        var local = _cloudRecordToLocal(cloudRecord);
+        var local = _cloudRecordToLocal(cloudRecord, modelName);
         var existing = await _fetchLocalRecord(tx, table, local.id);
         var ok = await withSavepoint(async function() {
           if (!existing) {
@@ -1329,6 +1378,29 @@ async function _replayPendingMutations() {
       var bodyStr = mutation.body === null || mutation.body === undefined
         ? undefined
         : (typeof mutation.body === 'string' ? mutation.body : JSON.stringify(mutation.body));
+
+      // Round-7 compat shim for LEGACY outbox rows: the cloud route schemas
+      // require agencyId in the body, but the local routes derive it from the
+      // session (local-first), so rows logged before the canonical SYNC_PUSH
+      // conversion carry no agencyId and every replay 400'd
+      // ("Invalid input: expected string, received undefined ... agencyId").
+      // Inject the session agency at REPLAY time. The idempotency key was
+      // derived from the RAW body above, so dedup stays stable across retries.
+      // (New rows are canonical SYNC_PUSH creates and never need this.)
+      try {
+        if (
+          method === 'POST' &&
+          typeof mutation.path === 'string' &&
+          mutation.path.indexOf('/api/reservations') === 0 &&
+          _userContext && _userContext.agencyId
+        ) {
+          var legacyBody = bodyStr ? JSON.parse(bodyStr) : {};
+          if (legacyBody && typeof legacyBody === 'object' && !Array.isArray(legacyBody) && !legacyBody.agencyId) {
+            legacyBody.agencyId = _userContext.agencyId;
+            bodyStr = JSON.stringify(legacyBody);
+          }
+        }
+      } catch (shimErr) { /* keep the original body — never block replay on the shim */ }
 
       try {
         // Part V/W: canonical SYNC_PUSH rows replay through the cloud push
@@ -1631,6 +1703,33 @@ function _setupSocket() {
       auth: { token: _authToken },
     });
 
+    // ── Cloud → local realtime relay (local-first, spec §7/§8) ──────────────
+    // The desktop UI listens for realtime events on the LOCAL API socket
+    // (127.0.0.1:3080), which must work offline. While ONLINE, this cloud
+    // socket is the desktop's window into events other clients caused
+    // (another branch calling a ticket, a customer joining, etc.) — every
+    // event the cloud sends to the agency room this engine joined is
+    // re-emitted verbatim into the local agency room by local-realtime.js.
+    // 'sync:changes' is skipped: it is the engine's internal pull trigger.
+    try {
+      var localApiModule = require('./index'); // lazy — avoids the module cycle
+      if (localApiModule && typeof localApiModule.relayCloudRealtime === 'function') {
+        if (typeof localApiModule.setLocalRealtimeRelayContext === 'function') {
+          localApiModule.setLocalRealtimeRelayContext(agencyId || null);
+        }
+        _socket.onAny(function() {
+          try {
+            var relayArgs = Array.prototype.slice.call(arguments);
+            var relayEvent = relayArgs.shift();
+            localApiModule.relayCloudRealtime(relayEvent, relayArgs);
+          } catch (relayErr) { /* relay is best-effort — never break the engine */ }
+        });
+      }
+    } catch (relayWireErr) {
+      // Local API module not loaded yet (unit tests) — relay stays disabled.
+      console.warn('[SyncService] Cloud→local realtime relay not wired (non-fatal):', relayWireErr.message);
+    }
+
     _socket.on('connect', function() {
       try {
         _socketId = _socket.id || null;
@@ -1731,6 +1830,7 @@ function _stopWatchdog() {
 
 var _agencyReadyCache = { checkedAt: 0, ready: false };
 var _readyGateWarnedAt = 0;
+var _readyGateDetailLoggedAt = 0;
 var _retentionRepairNeeded = false;
 
 async function _isAgencyReady(force) {
@@ -1740,14 +1840,29 @@ async function _isAgencyReady(force) {
   if (!force && now - _agencyReadyCache.checkedAt < 5000) return _agencyReadyCache.ready;
   _agencyReadyCache.checkedAt = now;
   _agencyReadyCache.ready = false;
+  var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
   try {
-    var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
     var state = agencyId
       ? await db.agencyLocalState.findFirst({ where: { agencyId: agencyId }, select: { initializationStatus: true } })
       : await db.agencyLocalState.findFirst({ select: { initializationStatus: true } });
     _agencyReadyCache.ready = !!(state && state.initializationStatus === 'READY');
+    // Truthful diagnostics (field round 7): a BLOCKED gate with an
+    // unexplained reason is undiscoverable — the workspace WAS READY earlier
+    // in the same session. Log WHAT the gate actually saw, rate-limited so
+    // offline retries don't spam.
+    if (!_agencyReadyCache.ready && now - (_readyGateDetailLoggedAt || 0) > 60000) {
+      _readyGateDetailLoggedAt = now;
+      if (!state) {
+        console.warn('[SyncService] READY gate detail: NO AgencyLocalState row for agency ' + (agencyId || '(none)') + ' — the initializer must create it (checkInitialSyncStatus/_getOrCreateLocalState)');
+      } else {
+        console.warn('[SyncService] READY gate detail: AgencyLocalState for agency ' + (agencyId || '(none)') + ' has initializationStatus=' + state.initializationStatus + ' (expected READY)');
+      }
+    }
   } catch (e) {
-    console.warn('[SyncService] READY check failed:', e.message);
+    if (now - (_readyGateDetailLoggedAt || 0) > 60000) {
+      _readyGateDetailLoggedAt = now;
+      console.warn('[SyncService] READY check failed:', e.message);
+    }
   }
   return _agencyReadyCache.ready;
 }
@@ -2072,12 +2187,58 @@ function onLocalMutation() {
 /**
  * Initialize the pull cursor from the initial sync's snapshotSequence.
  * Called by main.js after runInitialSync() completes successfully.
+ *
+ * `meta` (optional) tags the adoption with its source for the audit trail —
+ * every cursor rewrite outside the pull cycle must be attributable.
  */
-async function setInitialCursor(sequence) {
+async function setInitialCursor(sequence, meta) {
   var seq = parseInt(sequence, 10);
   if (isNaN(seq) || seq < 0) seq = 0;
+  var prev = _cursor;
   await _setCursor(seq);
-  console.log('[SyncService] Initial cursor set to ' + seq);
+  console.log('[SyncService] Initial cursor set to ' + seq +
+    (meta && meta.source ? ' (source: ' + meta.source + (prev ? ', previous: ' + prev : '') + ')' : ''));
+  try {
+    await _setSyncMeta('lastCursorAdoption', JSON.stringify({
+      from: prev || null,
+      to: seq,
+      source: (meta && meta.source) || 'unspecified',
+      snapshotSequence: (meta && meta.snapshotSequence) != null ? meta.snapshotSequence : null,
+      bridgeFinalSequence: (meta && meta.bridgeFinalSequence) != null ? meta.bridgeFinalSequence : null,
+      at: new Date().toISOString(),
+    }));
+  } catch { /* audit is best-effort */ }
+}
+
+/**
+ * CURSOR INVARIANT (Part M reinforcement, field round 6):
+ * Adopt the cursor produced by the initial import — preferring the BRIDGE's
+ * final sequence (every change > snapshotSequence was pulled and applied
+ * through the ledger) over the raw snapshotSequence.
+ *
+ * Proves and logs the full chain:
+ *   snapshot S → bridge pages → final F (≥ S) → engine cursor = F.
+ * "final cursor means: every change up to this sequence is durably
+ *  accounted for" — never a value that silently jumped over changes.
+ *
+ * @returns {number} the adopted sequence.
+ */
+async function adoptInitialSyncCursor(result, source) {
+  result = result || {};
+  var snapshot = parseInt(result.snapshotSequence, 10);
+  if (isNaN(snapshot) || snapshot < 0) snapshot = 0;
+  var bridge = parseInt(result.bridgeFinalSequence, 10);
+  if (isNaN(bridge) || bridge < snapshot) bridge = snapshot; // defensive: feed may never go backward
+  var prev = _cursor || (await _getCursor());
+  await setInitialCursor(bridge, {
+    source: (source || 'initial-sync') + ':bridge-adoption',
+    snapshotSequence: result.snapshotSequence != null ? snapshot : null,
+    bridgeFinalSequence: result.bridgeFinalSequence != null ? bridge : null,
+  });
+  console.log('[SyncService] Cursor invariant: snapshot=' + snapshot + ' → bridge final=' + bridge +
+    ' → engine cursor=' + bridge + ' (every change ≤ ' + bridge + ' is ledger-accounted; previous cursor=' + (prev || 0) +
+    (prev > bridge ? ' — REWIND of a stale over-advanced cursor; re-apply is idempotent' : '') + ')');
+  return bridge;
 }
 
 async function getStatus() {
@@ -2274,6 +2435,7 @@ module.exports = {
   // v2 additions
   onLocalMutation: onLocalMutation,
   setInitialCursor: setInitialCursor,
+  adoptInitialSyncCursor: adoptInitialSyncCursor,
   reconcileRecords: reconcileRecords,
   // offline-first spec additions (Parts D/K/L/AB/AD/AE)
   isAgencyReady: function() { return _isAgencyReady(true); },

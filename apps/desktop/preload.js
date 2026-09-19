@@ -366,6 +366,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
    */
   getSyncStatus: () => ipcRenderer.invoke('sync:status'),
 
+  // ─── Renderer Error Reporting ─────────────────────────────────────────────
+
+  /**
+   * Forward an uncaught renderer error (message + FULL stack) to the main
+   * process terminal. Standing directive: "add details to console log to help
+   * with isolating the errors" — this makes renderer crashes like
+   * "Cannot read properties of null (reading 'split')" visible in the same
+   * terminal that runs `bun run electron:dev`, no DevTools required.
+   * @param {{ message: string, stack?: string, kind: string, at: string, href?: string }} payload
+   */
+  reportRendererError: (payload) => {
+    try { ipcRenderer.send('renderer:error', payload); } catch { /* never throw from the bridge */ }
+  },
+
   /**
    * Trigger an immediate background sync cycle.
    * @returns {Promise<{ success: boolean, error?: string }>}

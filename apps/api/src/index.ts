@@ -262,7 +262,7 @@ app.onError((err, c) => {
 app.get('/', (c) => {
   return c.json({
     name: '@blasti/api',
-    version: '0.2.0',
+    version: '0.2.1',
     description: 'BLASTI Headless Backend Server',
     endpoints: {
       health: 'GET /health',
@@ -279,7 +279,7 @@ app.get('/health', (c) => {
   return c.json({
     status: 'ok',
     service: '@blasti/api',
-    version: '0.2.0',
+    version: '0.2.1',
     bootId: BOOT_ID,
     sync: SYNC_HEALTH,
     connections: io?.engine?.clientsCount ?? 0,
@@ -296,7 +296,7 @@ app.get('/health', (c) => {
 app.get('/api/health', (c) => c.json({
   status: 'ok',
   service: '@blasti/api',
-  version: '0.2.0',
+  version: '0.2.1',
   bootId: BOOT_ID,
   sync: SYNC_HEALTH,
   uptime: Math.floor(process.uptime()),
@@ -321,7 +321,7 @@ app.get('/api/discover', (c) => {
   }
   return c.json({
     service: 'blasti-lan',
-    version: '0.2.0',
+    version: '0.2.1',
     name: 'BLASTI Server',
     hostname,
     ip,

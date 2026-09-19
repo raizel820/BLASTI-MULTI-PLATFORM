@@ -1202,9 +1202,13 @@ async function _runInitialSyncFromSessionInner() {
 
   const syncService = require('./local-api/sync-service');
   if (result && result.success && typeof result.snapshotSequence === 'number') {
-    // Initialize the pull cursor from the initial sync's snapshotSequence so
-    // the incremental engine continues exactly where the snapshot ended.
-    await syncService.setInitialCursor(result.snapshotSequence).catch(() => {});
+    // CURSOR INVARIANT (field round 6): prefer the BRIDGE's final sequence —
+    // it proves ledger coverage up to F; the raw snapshotSequence (S) would
+    // re-pull S..F (harmless but wasteful) and never explains a jump.
+    const adoptedSeq = (typeof result.bridgeFinalSequence === 'number' && result.bridgeFinalSequence >= result.snapshotSequence)
+      ? result.bridgeFinalSequence
+      : result.snapshotSequence;
+    await syncService.setInitialCursor(adoptedSeq, { source: 'ipc-post-init', snapshotSequence: result.snapshotSequence, bridgeFinalSequence: result.bridgeFinalSequence ?? null }).catch(() => {});
   }
 
   // Start the background engine after the initializer finishes (success OR
@@ -1411,6 +1415,24 @@ ipcMain.handle('sync:status', async () => {
     return await syncService.getStatus();
   } catch {
     return { isSyncing: false, lastSyncAt: null };
+  }
+});
+
+// ─── IPC: Renderer Error Reporting ──
+// Uncaught renderer errors (window.onerror / unhandledrejection / React
+// boundaries) surface HERE with their full stack — in the same terminal that
+// runs `bun run electron:dev`. Standing directive: never hide a failure; make
+// every crash isolatable from the user's log alone (round 7: the
+// "Cannot read properties of null (reading 'split')" report had no stack).
+ipcMain.on('renderer:error', (_event, payload) => {
+  try {
+    const p = payload && typeof payload === 'object' ? payload : { message: String(payload) };
+    console.error(`[RendererError] ${p.kind || 'error'}: ${p.message}`);
+    if (p.href) console.error(`[RendererError]   at: ${p.href}`);
+    if (p.source) console.error(`[RendererError]   source: ${p.source}:${p.line ?? '?'}:${p.column ?? '?'}`);
+    if (p.stack) console.error(`[RendererError] stack:\n${p.stack}`);
+  } catch (logErr) {
+    console.error('[RendererError] (failed to format payload)', logErr && logErr.message);
   }
 });
 

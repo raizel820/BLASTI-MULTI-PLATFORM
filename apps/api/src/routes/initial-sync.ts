@@ -39,7 +39,7 @@
 import { Hono } from 'hono'
 import { db } from '@blasti/db'
 import { requireAuth, requireAgencyAccess, authErrorResponse, AuthError } from '../lib/auth'
-import { getLatestSequence, redactRecord } from '../lib/sync-helpers'
+import { getLatestSequence, redactRecord, projectUserSyncDto } from '../lib/sync-helpers'
 import { SYNC_PROTOCOL_VERSION, SYNC_REGISTRY } from '@blasti/core/sync-registry'
 import { serializeForCloud } from '@blasti/core/sync-serializer'
 import { z } from 'zod'
@@ -179,8 +179,15 @@ async function fetchStageData(
         where: { id: { in: Array.from(userIds) } },
         
       })
-      // Part AF: password hashes / device tokens never leave the cloud.
-      return { records: records.map((r: any) => redactRecord('User', r)), hasMore: false, total: records.length }
+      // Task 14 — explicit USER_SYNC allow-list projection: ONLY the listed
+      // profile fields are ever serialized (passwordHash / fcmToken and any
+      // future auth secret are excluded BY CONSTRUCTION, not by redaction).
+      // redactRecord stays as a redundant final safety net (Part AF).
+      return {
+        records: records.map((r: any) => redactRecord('User', projectUserSyncDto(r))),
+        hasMore: false,
+        total: records.length,
+      }
     }
 
     // ── 3. Services ───────────────────────────────────────────────────────

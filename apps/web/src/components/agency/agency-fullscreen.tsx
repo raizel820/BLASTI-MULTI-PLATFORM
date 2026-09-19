@@ -57,7 +57,9 @@ import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 interface QueueEntry {
   id: string;
   queueNumber: string;
-  customerName: string;
+  // The backend returns null for anonymous walk-ins (no registered user) —
+  // never assume this is non-null; use getDisplayName() for rendering.
+  customerName: string | null;
   customerPhone?: string | null;
   customerAvatar?: string | null;
   serviceName: string;
@@ -109,6 +111,13 @@ function getServiceName(entry: QueueEntry, lang: string) {
   return entry.serviceName;
 }
 
+// Server can return customerName: null (anonymous walk-in without a registered
+// user — local API: `user?.fullName || reservation.walkInCustomerName || null`).
+// Every display surface must fall back before touching the value.
+function getDisplayName(entry: QueueEntry) {
+  return entry.customerName || entry.walkInCustomerName || 'Walk-in';
+}
+
 function formatTime(dateStr: string, lang: string) {
   try {
     return new Date(dateStr).toLocaleTimeString(
@@ -131,8 +140,11 @@ function formatDate(dateStr: string, lang: string) {
   }
 }
 
-function getInitials(name: string) {
-  return name.split(' ').map(w => w[0]).join('').substring(0, 2).toUpperCase();
+function getInitials(name: string | null | undefined) {
+  if (!name || typeof name !== 'string') return '?';
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '?';
+  return words.map(w => w[0]).join('').substring(0, 2).toUpperCase();
 }
 
 // ─── QR Generation Helper ─────────────────────────────────────────────────
@@ -211,7 +223,7 @@ function CustomerDetails({ entry, lang, accent = 'emerald' }: {
   return (
     <div className="flex flex-col gap-1 text-start w-full min-w-0">
       <h2 className={`text-sm sm:text-base font-bold truncate ${accentText}`}>
-        {entry.customerName}
+        {getDisplayName(entry)}
       </h2>
       <div className="flex items-center gap-1.5">
         <Badge className={`${accentBadge} border text-[10px] px-1.5 py-0`}>
@@ -247,14 +259,14 @@ function CustomerAvatar({ entry, size = 'md' }: { entry: QueueEntry; size?: 'sm'
     return (
       <img
         src={entry.customerAvatar}
-        alt={entry.customerName}
+        alt={getDisplayName(entry)}
         className={`${sizeClasses[size]} rounded-full object-cover border-2 border-white/20 flex-shrink-0`}
       />
     );
   }
   return (
     <div className={`${sizeClasses[size]} rounded-full bg-white/10 border-2 border-white/20 flex items-center justify-center font-bold flex-shrink-0`}>
-      {getInitials(entry.customerName)}
+      {getInitials(getDisplayName(entry))}
     </div>
   );
 }
@@ -407,7 +419,13 @@ export function AgencyFullscreen() {
       const res = await apiFetch(`/api/agency/queue?agencyId=${encodeURIComponent(agencyId)}&status=WAITING,CALLED`);
       if (res.ok) {
         const data = await res.json();
-        const entries: QueueEntry[] = data.entries ?? data.reservations ?? [];
+        const rawEntries: QueueEntry[] = data.entries ?? data.reservations ?? [];
+        // Normalize at the data boundary: customerName is null for anonymous
+        // walk-ins, which crashed getInitials ('Cannot read split of null').
+        const entries: QueueEntry[] = rawEntries.map((e) => ({
+          ...e,
+          customerName: e.customerName || e.walkInCustomerName || 'Walk-in',
+        }));
         setQueueEntries(entries);
         setQueue(entries);
         const called = entries.find((e) => e.status === 'CALLED') || null;
@@ -481,7 +499,7 @@ export function AgencyFullscreen() {
       id: entry.id,
       queueNumber: entry.queueNumber,
       displayNumber: entry.queueNumber,
-      customerName: entry.customerName,
+      customerName: getDisplayName(entry),
       serviceName: getServiceName(entry, lang),
       agencyName,
       joinedAt: entry.joinedAt,

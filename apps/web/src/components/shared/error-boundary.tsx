@@ -4,6 +4,9 @@ import React from 'react'
 import { AlertTriangle, RefreshCw, Home } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useLanguage } from '@/hooks/use-language'
+// Side-effect import: installs the global uncaught-error reporter in the
+// browser (window error + unhandledrejection → console + Electron terminal).
+import { reportCaughtError } from '@/lib/error-reporter'
 
 interface ErrorBoundaryProps {
   children: React.ReactNode
@@ -81,6 +84,12 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
 
   componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
     console.error('[ErrorBoundary] Caught error:', error, errorInfo)
+    // Forward the FULL stack to the Electron main terminal (no DevTools
+    // needed) so renderer crashes like "Cannot read properties of null
+    // (reading 'split')" become isolatable from the user's log alone.
+    try {
+      reportCaughtError(error, 'ErrorBoundary: ' + (errorInfo.componentStack || '').trim().split('\n')[0])
+    } catch { /* reporter must never throw */ }
   }
 
   handleReset = () => {

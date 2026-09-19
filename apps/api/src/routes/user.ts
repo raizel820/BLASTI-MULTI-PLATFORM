@@ -145,7 +145,9 @@ app.patch('/change-password', async (c) => {
     const dbUser = await db.user.findUnique({ where: { id: user.id }, select: { id: true, passwordHash: true } })
     if (!dbUser) return c.json({ error: 'User not found' }, 404)
 
-    const isCorrect = verifyPassword(currentPassword, dbUser.passwordHash)
+    // passwordHash is nullable (Task 14): a NULL hash means no password is
+    // set cloud-side — the current-password check can never succeed.
+    const isCorrect = !!dbUser.passwordHash && verifyPassword(currentPassword, dbUser.passwordHash)
     if (!isCorrect) return c.json({ error: 'Current password is incorrect' }, 401)
 
     const newHash = hashPassword(newPassword)

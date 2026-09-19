@@ -689,6 +689,234 @@ async function runAllTests() {
   })
 
   // ═══════════════════════════════════════════════════════════════════════
+  // CURSOR INVARIANT TESTS (field round 6)
+  //
+  // Field evidence: after initial sync the bridge final cursor was 890, but
+  // the engine pulled from 893 — a stale over-advanced v2 cursor key
+  // (`lastPulledSequence`) SHADOWED the bridge-written legacy key
+  // (`_lastPulledSequence`). The invariant under test:
+  //
+  //   snapshot = 890, cloud changes = 891, 892, 893
+  //   → all three applied EXACTLY ONCE
+  //   → final cursor = 893, both cursor keys agree
+  //   → no value may ever skip unaccounted changes
+  // ═══════════════════════════════════════════════════════════════════════
+
+  await ensureSyncMetaTable(db)
+
+  // The cursor tests drive REAL Prisma delegates (AgencyLocalState,
+  // SubscriptionPlan) — the full authoritative schema must exist. The other
+  // suites create their tables ad hoc; here the production non-destructive
+  // initializer runs (idempotent — creates only what is missing).
+  try {
+    const readyResult = await require('../lib/db').ensureDatabaseReady()
+    if (!readyResult || !readyResult.ok) {
+      console.warn('[test-sync] ensureDatabaseReady did not fully succeed (continuing):', readyResult && readyResult.error)
+    }
+  } catch (e) {
+    console.warn('[test-sync] ensureDatabaseReady threw (continuing):', e.message)
+  }
+
+  async function setMetaRaw(key, value) {
+    await db.$executeRawUnsafe(
+      'INSERT INTO "_sync_meta" (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+      key, String(value),
+    )
+  }
+  async function getMetaRaw(key) {
+    const rows = await db.$queryRawUnsafe('SELECT value FROM "_sync_meta" WHERE key = ?', key)
+    return rows?.[0]?.value ?? null
+  }
+
+  await test('cursor divergence guard: stale v2 key (893) cannot shadow the bridge legacy key (890)', async () => {
+    await syncService.startSync({
+      localDb: db,
+      cloudBaseUrl: 'http://127.0.0.1:9', // never contacted in this test
+      agencyId: testAgencyId(),
+      syncIntervalMs: 120000,
+      initialDelayMs: 60000,
+    })
+    try {
+      // Normalize in-memory cursor to 0 (also writes both keys to 0).
+      await syncService.setInitialCursor(0, { source: 'test:reset' })
+      // Seed the EXACT field-round-6 divergence: stale over-advanced v2 key
+      // vs the bridge's correct legacy key.
+      await setMetaRaw('lastPulledSequence', 893)
+      await setMetaRaw('_lastPulledSequence', 890)
+
+      // getStatus() must resolve the cursor through _getCursor() (in-memory
+      // _cursor is 0 → falsy) → the divergence guard adopts MIN = 890.
+      const status = await syncService.getStatus()
+      assertEqual(status.cursor, 890, 'cursor must resolve to MIN(893, 890) = 890, never the stale 893')
+
+      // Both keys must be healed to the safe value.
+      assertEqual(await getMetaRaw('lastPulledSequence'), '890', 'v2 key healed to 890')
+      assertEqual(await getMetaRaw('_lastPulledSequence'), '890', 'legacy key healed to 890')
+    } finally {
+      syncService.stopSync()
+    }
+  })
+
+  await test('pull cycle invariant: snapshot 890 + changes 891..893 → applied exactly once, final cursor 893', async () => {
+    const http = require('http')
+    const agencyId = testAgencyId()
+
+    // Three distinct cloud changes at sequences 891, 892, 893.
+    const PLANS = [891, 892, 893].map((seq) => ({
+      id: 'plan-cursor-' + seq,
+      name: 'Cursor Invariant Plan ' + seq + ' ' + Date.now(),
+      displayName: 'Plan ' + seq,
+      price: seq,
+      currency: 'DZD',
+      isActive: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }))
+    const pullRequests = [] // every sinceSequence the engine asked for
+
+    const sendJson = (res, code, obj) => {
+      const body = JSON.stringify(obj)
+      res.writeHead(code, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) })
+      res.end(body)
+    }
+    const mockCloud = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (c) => { body += c })
+      req.on('end', () => {
+        if (req.url === '/health') return sendJson(res, 200, { ok: true })
+        if (req.url === '/api/sync/pull' && req.method === 'POST') {
+          let since = 0
+          try { since = (JSON.parse(body || '{}').sinceSequence) || 0 } catch { /* keep 0 */ }
+          pullRequests.push(since)
+          if (since <= 890) {
+            // One page carrying exactly the three changes 891..893.
+            return sendJson(res, 200, {
+              success: true, protocolVersion: 2,
+              pageLastSequence: 893, latestSequence: 893, hasMore: false,
+              changes: { SubscriptionPlan: { changed: PLANS, deleted: [] } },
+            })
+          }
+          // Anything after 893: empty page, cursor holds.
+          return sendJson(res, 200, {
+            success: true, protocolVersion: 2,
+            pageLastSequence: since, latestSequence: since, hasMore: false,
+            changes: {},
+          })
+        }
+        // Outbox replay and any other probe: generic success.
+        return sendJson(res, 200, { success: true, results: [] })
+      })
+    })
+    await new Promise((resolve) => mockCloud.listen(0, '127.0.0.1', resolve))
+    const mockUrl = 'http://127.0.0.1:' + mockCloud.address().port
+
+    try {
+      // READY workspace for THIS agency (Part D gate must pass).
+      await db.agencyLocalState.deleteMany({ where: { agencyId } })
+      await db.agencyLocalState.create({
+        data: { agencyId, initializationStatus: 'READY', snapshotSequence: 890 },
+      })
+      // Prevent the agency-change cursor reset from wiping the seeded state
+      // (the engine compares _sync_meta lastSyncAgencyId with the configured agency).
+      await setMetaRaw('lastSyncAgencyId', agencyId)
+      // Seed the field-round-6 divergence AGAIN: the stale over-advanced v2
+      // key (893, left by an older build's pull) shadowing the bridge final
+      // (890). The engine must resolve 890, pull 891..893, and land on 893.
+      await setMetaRaw('lastPulledSequence', 893)
+      await setMetaRaw('_lastPulledSequence', 890)
+
+      syncService.setAuth('test-token-cursor', { id: 'u-cursor', agencyId, role: 'AGENCY_OWNER' })
+      syncService.startSync({
+        localDb: db,
+        cloudBaseUrl: mockUrl,
+        agencyId,
+        syncIntervalMs: 120000,
+        initialDelayMs: 60000, // timer must NOT fire — cycles are driven here
+      })
+
+      // Hydration already resolved the divergence → first pull MUST start at 890.
+      const ready = await syncService.isAgencyReady() // force-refresh the Part D cache
+      assertEqual(ready, true, 'agency must be READY for the pull gate')
+
+      const firstCycle = await syncService.triggerSyncNow()
+      assert(pullRequests.length >= 1, 'engine must have issued a pull')
+      assertEqual(pullRequests[0], 890, 'first pull must start at the bridge final 890 — NOT the stale 893')
+      // The cycle's return value is intentionally not asserted (the engine
+      // emits stats via events) — the SQLite row counts below are the proof.
+
+      // Exactly-once: each of the three records exists, exactly one row each.
+      const countRows = await db.$queryRawUnsafe(
+        'SELECT COUNT(*) as cnt FROM "SubscriptionPlan" WHERE id IN (?, ?, ?)',
+        'plan-cursor-891', 'plan-cursor-892', 'plan-cursor-893',
+      )
+      const appliedCount = Number(countRows[0]?.cnt ?? 0)
+      assertEqual(appliedCount, 3, 'changes 891..893 accounted exactly once in SQLite')
+
+      // Final cursor: 893 — both keys agree.
+      const statusAfterFirst = await syncService.getStatus()
+      assertEqual(statusAfterFirst.cursor, 893, 'final cursor must be 893 (nothing skipped, nothing invented)')
+      assertEqual(await getMetaRaw('lastPulledSequence'), '893', 'v2 key at 893')
+      assertEqual(await getMetaRaw('_lastPulledSequence'), '893', 'legacy key at 893')
+
+      // Stability: a second cycle from the settled cursor must apply NOTHING
+      // (empty page) and must not duplicate rows or move the cursor.
+      await syncService.triggerSyncNow()
+      const statusAfterSecond = await syncService.getStatus()
+      assertEqual(statusAfterSecond.cursor, 893, 'cursor stays 893 after an empty cycle')
+      const countAgain = await db.$queryRawUnsafe(
+        'SELECT COUNT(*) as cnt FROM "SubscriptionPlan" WHERE id IN (?, ?, ?)',
+        'plan-cursor-891', 'plan-cursor-892', 'plan-cursor-893',
+      )
+      assertEqual(Number(countAgain[0]?.cnt ?? 0), 3, 'no duplication on re-pull (exactly-once holds)')
+    } finally {
+      syncService.stopSync()
+      await new Promise((resolve) => mockCloud.close(resolve))
+      // Cleanup test rows (never mask a failure with a cleanup error).
+      await db.subscriptionPlan.deleteMany({ where: { id: { startsWith: 'plan-cursor-' } } }).catch(() => {})
+      await db.agencyLocalState.deleteMany({ where: { agencyId } }).catch(() => {})
+    }
+  })
+
+  await test('adoptInitialSyncCursor(): bridge adoption, audit row, and stale-cursor rewind after re-import', async () => {
+    // Engine config from the previous test is stopped; setInitialCursor /
+    // adoption persist through _config.localDb — restart briefly.
+    await syncService.startSync({
+      localDb: db,
+      cloudBaseUrl: 'http://127.0.0.1:9',
+      agencyId: testAgencyId(),
+      syncIntervalMs: 120000,
+      initialDelayMs: 60000,
+    })
+    try {
+      // Normal path: snapshot 890 → bridge final 893 → cursor 893.
+      const adopted = await syncService.adoptInitialSyncCursor(
+        { snapshotSequence: 890, bridgeFinalSequence: 893 }, 'test-invariant',
+      )
+      assertEqual(adopted, 893, 'adoption must land on the bridge final sequence')
+      assertEqual((await syncService.getStatus()).cursor, 893, 'engine cursor is the bridge final')
+      const auditRaw = await getMetaRaw('lastCursorAdoption')
+      assert(auditRaw, 'adoption must persist an audit row')
+      const audit = JSON.parse(auditRaw)
+      assertEqual(audit.source, 'test-invariant:bridge-adoption', 'audit records the adoption source')
+      assertEqual(audit.to, 893, 'audit records the adopted value')
+      assertEqual(audit.snapshotSequence, 890, 'audit records the snapshot for the S → F chain')
+
+      // Re-import authority: a re-import whose bridge final is 890 MUST be
+      // able to rewind a stale higher cursor (893) — re-apply is ledger-
+      // idempotent; skipping forward past unaccounted changes is not.
+      const rewound = await syncService.adoptInitialSyncCursor(
+        { snapshotSequence: 890, bridgeFinalSequence: 890 }, 'test-reimport',
+      )
+      assertEqual(rewound, 890, 'adoption rewinds a stale over-advanced cursor to the proven bridge final')
+      assertEqual((await syncService.getStatus()).cursor, 890, 'cursor after re-import adoption is 890')
+      assertEqual(await getMetaRaw('lastPulledSequence'), '890', 'v2 key follows the rewind')
+      assertEqual(await getMetaRaw('_lastPulledSequence'), '890', 'legacy key follows the rewind')
+    } finally {
+      syncService.stopSync()
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
   // Summary
   // ═══════════════════════════════════════════════════════════════════════
 

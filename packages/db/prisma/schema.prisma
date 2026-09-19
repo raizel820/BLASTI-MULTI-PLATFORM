@@ -27,7 +27,12 @@ model User {
   email                   String?        @unique
   phoneNumber             String?        @unique
   shortAppId              String?        @unique
-  passwordHash            String
+  /// Cloud-only authentication secret. NEVER synced to the desktop: the cloud
+  /// sync feed (initial-data + incremental pull) excludes this field via the
+  /// explicit USER_SYNC projection, and synced desktop User profiles keep it
+  /// NULL. Desktop unlock uses LocalDeviceCredential (per user+device
+  /// verifier derived from a successful cloud login on that device).
+  passwordHash            String?
   role                    String         @default("CUSTOMER")
   language                String         @default("ar")
   avatarUrl               String?
@@ -59,6 +64,37 @@ model User {
   managedTransactions     Transaction[]  @relation("ReviewedBy")
   reviews                 Review[]
   devices                 DeviceRegistration[]
+  deviceCredentials       LocalDeviceCredential[]
+}
+
+/// Desktop-only local unlock credential (NEVER synced — the cloud copy of
+/// this table stays empty). After a user successfully logs in via the cloud
+/// ON a given device, the desktop derives a scrypt verifier from the entered
+/// password and stores it here, bound to (userId, deviceId). On later
+/// restarts without internet, the local API verifies the entered password
+/// against this verifier instead of User.passwordHash (which is NULL for
+/// synced profiles). One row per user per device; revocable per device.
+model LocalDeviceCredential {
+  id           String    @id @default(cuid())
+  userId       String
+  /// Stable per-installation id persisted in the desktop `_sync_meta` table.
+  deviceId     String
+  /// scrypt-derived password verifier (hex). The plaintext password is never stored.
+  verifierHash String
+  /// Random per-credential salt (hex).
+  salt         String
+  algo         String    @default("scrypt")
+  scryptN      Int       @default(16384)
+  scryptR      Int       @default(8)
+  scryptP      Int       @default(1)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  /// Set when the credential is revoked (logout-everywhere / explicit revoke).
+  revokedAt    DateTime?
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId])
+  @@index([userId])
 }
 
 model Agency {

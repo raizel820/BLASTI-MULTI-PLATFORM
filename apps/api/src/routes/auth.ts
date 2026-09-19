@@ -250,8 +250,10 @@ app.post('/login', async (c) => {
       )
     }
 
-    // Verify password
-    const isPasswordValid = verifyPassword(password, user.passwordHash)
+    // Verify password. passwordHash is nullable (Task 14 — synced desktop
+    // profiles store NULL; cloud accounts always have one): treat a NULL
+    // hash as "no password set" → cannot authenticate.
+    const isPasswordValid = !!user.passwordHash && verifyPassword(password, user.passwordHash)
     if (!isPasswordValid) {
       return c.json(
         { success: false, error: 'Invalid username or password' },

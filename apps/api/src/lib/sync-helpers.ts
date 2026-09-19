@@ -482,6 +482,53 @@ export const REDACTED_FIELDS: Record<string, string[]> = {
   User: ['passwordHash', 'fcmToken'],
 }
 
+/**
+ * USER_SYNC — explicit, allow-list projection of a User for EVERY sync
+ * channel (Task 14 — User sync/auth contract). Replaces the old pattern of
+ * serializing the complete Prisma User object and redacting fields
+ * opportunistically: an allow-list is fail-safe — a future auth-related
+ * column (or an accidental select of secrets) can never leak through the
+ * feed, because only these exact fields are ever emitted.
+ *
+ * Excluded BY CONSTRUCTION: passwordHash, fcmToken, and any future
+ * authentication secret. Identity/authorization data (role, agency
+ * relations via separate AgencyStaff records) stays intact for EVERY role
+ * — CUSTOMER, AGENCY_OWNER, AGENCY_STAFF, SUPER_ADMIN share one contract.
+ */
+export const USER_SYNC_FIELDS = [
+  'id',
+  'username',
+  'fullName',
+  'email',
+  'phoneNumber',
+  'shortAppId',
+  'role',
+  'language',
+  'avatarUrl',
+  'avatarStorageProvider',
+  'avatarStorageKey',
+  'freeSmsCount',
+  'notificationPreferences',
+  'reminderMinutes',
+  'smsNotificationsEnabled',
+  'notificationPref',
+  'isAppOnline',
+  'isActive',
+  'lastRoleChangeAt',
+  'createdAt',
+  'updatedAt',
+] as const
+
+/** Project a User record onto the explicit USER_SYNC allow-list. */
+export function projectUserSyncDto(user: any): Record<string, any> {
+  const out: Record<string, any> = {}
+  if (!user || typeof user !== 'object') return out
+  for (const f of USER_SYNC_FIELDS) {
+    if ((user as any)[f] !== undefined) out[f] = (user as any)[f]
+  }
+  return out
+}
+
 /** Strip redacted fields from a wire record (mutates a shallow copy). */
 export function redactRecord(model: string, record: any): any {
   const fields = REDACTED_FIELDS[model]
@@ -598,7 +645,11 @@ export async function getChangesSinceCursor(
         (id) => !records.some((r: any) => r.id === id),
       )
       for (const r of records) {
-        out[model].changed.push(redactRecord(model, scalarizeRecord(r)))
+        // User records pass through the explicit allow-list FIRST — the
+        // wire can only ever contain USER_SYNC_FIELDS (redactRecord below
+        // stays as a final, redundant safety net).
+        const projected = model === 'User' ? projectUserSyncDto(r) : r
+        out[model].changed.push(redactRecord(model, scalarizeRecord(projected)))
       }
       // Record deleted after the page snapshot — emit as delete
       if (missing.length > 0) {

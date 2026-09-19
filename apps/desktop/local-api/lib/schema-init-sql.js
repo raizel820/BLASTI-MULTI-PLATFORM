@@ -4,7 +4,11 @@
 // This is the authoritative first-creation DDL for the desktop local SQLite,
 // including the protected sync infrastructure tables (_sync_meta,
 // _sync_conflicts, _pending_mutations, _sync_applied_mutations,
-// _deferred_changes) and the v2 retry/deferred columns.
+// _deferred_changes), the v2 retry/deferred columns, and the local-only
+// LocalDeviceCredential table (desktop unlock verifier, never synced).
+// User.passwordHash is NULLABLE as of schema v2: the cloud sync feed never
+// sends auth secrets — synced profiles keep NULL and desktop unlock uses
+// LocalDeviceCredential.
 module.exports = `-- CreateTable
 CREATE TABLE "User" (
     "id" TEXT NOT NULL PRIMARY KEY,
@@ -13,7 +17,7 @@ CREATE TABLE "User" (
     "email" TEXT,
     "phoneNumber" TEXT,
     "shortAppId" TEXT,
-    "passwordHash" TEXT NOT NULL,
+    "passwordHash" TEXT,
     "role" TEXT NOT NULL DEFAULT 'CUSTOMER',
     "language" TEXT NOT NULL DEFAULT 'ar',
     "avatarUrl" TEXT,
@@ -30,6 +34,23 @@ CREATE TABLE "User" (
     "lastRoleChangeAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
+);
+
+-- CreateTable
+CREATE TABLE "LocalDeviceCredential" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "userId" TEXT NOT NULL,
+    "deviceId" TEXT NOT NULL,
+    "verifierHash" TEXT NOT NULL,
+    "salt" TEXT NOT NULL,
+    "algo" TEXT NOT NULL DEFAULT 'scrypt',
+    "scryptN" INTEGER NOT NULL DEFAULT 16384,
+    "scryptR" INTEGER NOT NULL DEFAULT 8,
+    "scryptP" INTEGER NOT NULL DEFAULT 1,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL,
+    "revokedAt" DATETIME,
+    CONSTRAINT "LocalDeviceCredential_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
 
 -- CreateTable
@@ -846,6 +867,12 @@ CREATE UNIQUE INDEX "User_phoneNumber_key" ON "User"("phoneNumber");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "User_shortAppId_key" ON "User"("shortAppId");
+
+-- CreateIndex
+CREATE INDEX "LocalDeviceCredential_userId_idx" ON "LocalDeviceCredential"("userId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "LocalDeviceCredential_userId_deviceId_key" ON "LocalDeviceCredential"("userId", "deviceId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Agency_customCode_key" ON "Agency"("customCode");

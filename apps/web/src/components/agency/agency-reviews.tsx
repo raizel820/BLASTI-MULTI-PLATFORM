@@ -40,7 +40,8 @@ interface Review {
   createdAt: string;
   userId: string;
   agencyId: string;
-  user: ReviewUser;
+  // The reviewer profile can be absent (deleted/unsynced user) — never dereference blindly.
+  user: ReviewUser | null;
 }
 
 type SortOption = 'newest' | 'highest' | 'lowest';
@@ -58,19 +59,21 @@ const avatarColors = [
   'bg-orange-500',
 ];
 
-function getAvatarColor(name: string) {
+function getAvatarColor(name?: string | null) {
+  const s = name || '';
   let hash = 0;
-  for (let i = 0; i < name.length; i++) {
-    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  for (let i = 0; i < s.length; i++) {
+    hash = s.charCodeAt(i) + ((hash << 5) - hash);
   }
   return avatarColors[Math.abs(hash) % avatarColors.length];
 }
 
-function getInitials(name: string) {
-  return name
-    .split(' ')
+function getInitials(name?: string | null) {
+  if (!name || typeof name !== 'string') return '?';
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '?';
+  return words
     .map((n) => n[0])
-    .filter(Boolean)
     .slice(0, 2)
     .join('')
     .toUpperCase();
@@ -222,7 +225,8 @@ function ReviewCard({
 }) {
   const { t } = useLanguage();
   const isReplying = replyingId === review.id;
-  const avatarColor = getAvatarColor(review.user.fullName);
+  const reviewerName = review.user?.fullName || 'User';
+  const avatarColor = getAvatarColor(reviewerName);
 
   return (
     <motion.div
@@ -238,7 +242,7 @@ function ReviewCard({
             {/* Avatar */}
             <div className={`h-10 w-10 rounded-full ${avatarColor} flex items-center justify-center flex-shrink-0`}>
               <span className="text-sm font-bold text-white">
-                {getInitials(review.user.fullName) || '?'}
+                {getInitials(reviewerName) || '?'}
               </span>
             </div>
 
@@ -246,7 +250,7 @@ function ReviewCard({
               {/* Header */}
               <div className="flex items-center justify-between gap-2">
                 <div>
-                  <p className="font-semibold text-sm text-foreground">{review.user.fullName}</p>
+                  <p className="font-semibold text-sm text-foreground">{reviewerName}</p>
                   <div className="flex items-center gap-2 mt-0.5">
                     <StarRating rating={review.rating} />
                     <span className="text-xs text-muted-foreground">

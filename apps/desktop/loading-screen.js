@@ -746,11 +746,26 @@ function probeUrl(url, timeoutMs = 4000) {
 
 /**
  * Make a POST request using Electron's net module.
+ *
+ * CRITICAL (Task 14, corrected in Task 17): the HTTP method MUST be passed
+ * in the OPTIONS OBJECT at construction time — `net.request({ method, url })`.
+ * The Task 14 attempt assigned `request.method = 'POST'` AFTER construction,
+ * but Electron's ClientRequest.method is not a writable instance property:
+ * the assignment is silently ignored and the request still went out as GET.
+ * That one ineffective fix is why field round 6 STILL showed all three
+ * symptoms at once:
+ *   1. cloud probe: GET /api/sync/pull → 404 (no GET route) while the engine's
+ *      real POST pulled pages fine → false "cloud does not host the sync API";
+ *   2. local POST /api/auth/import-session → GET → 404 → in-process fallback
+ *      (plus the misleading `no route matched: GET /api/auth/import-session`);
+ *   3. queue-CRUD: the "create" POST actually executed the GET list handler
+ *      → `{success:true, data:[...]}` → `data.id === undefined` → the test
+ *      printed "Queue created: id=undefined" and nothing was ever created.
  */
 function postUrl(url, body, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const start = Date.now();
-    const request = net.request(url);
+    const request = net.request({ method: 'POST', url });
     let settled = false;
     const done = (result) => {
       if (settled) return;
@@ -789,7 +804,8 @@ function postUrl(url, body, timeoutMs = 5000) {
 function postAuthUrl(url, body, token, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const start = Date.now();
-    const request = net.request(url);
+    // Method MUST be in the construction options — see the postUrl note.
+    const request = net.request({ method: 'POST', url });
     let settled = false;
     const done = (result) => {
       if (settled) return;
@@ -827,7 +843,8 @@ function postAuthUrl(url, body, token, timeoutMs = 5000) {
 function putUrl(url, body, token, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const start = Date.now();
-    const request = net.request(url);
+    // Method MUST be in the construction options — see the postUrl note.
+    const request = net.request({ method: 'PUT', url });
     let settled = false;
     const done = (result) => {
       if (settled) return;
@@ -865,7 +882,9 @@ function putUrl(url, body, token, timeoutMs = 5000) {
 function deleteUrl(url, token, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const start = Date.now();
-    const request = net.request(url);
+    // Method MUST be in the construction options (the historic in-try
+    // `request.method = 'DELETE'` assignment was silently ignored — GET).
+    const request = net.request({ method: 'DELETE', url });
     let settled = false;
     const done = (result) => {
       if (settled) return;
@@ -889,7 +908,7 @@ function deleteUrl(url, token, timeoutMs = 5000) {
       clearTimeout(timer);
       done({ reachable: false, error: err.message });
     });
-    try { request.method = 'DELETE'; request.end(); } catch { clearTimeout(timer); done({ reachable: false, error: 'delete failed' }); }
+    try { request.end(); } catch { clearTimeout(timer); done({ reachable: false, error: 'delete failed' }); }
   });
 }
 
@@ -899,7 +918,8 @@ function deleteUrl(url, token, timeoutMs = 5000) {
 function patchUrl(url, body, token, timeoutMs = 5000) {
   return new Promise((resolve) => {
     const start = Date.now();
-    const request = net.request(url);
+    // Method MUST be in the construction options — see the postUrl note.
+    const request = net.request({ method: 'PATCH', url });
     let settled = false;
     const done = (result) => {
       if (settled) return;
@@ -976,6 +996,36 @@ async function runDiagnostics(mainWindow, config) {
       const r = results.find(x => x.step === 'verify');
       return !!(r && r.status === 'success' && r.detail && r.detail.readiness && r.detail.readiness.ready === true);
     })();
+
+    // ── Launch-readiness vs cloud-sync separation (offline-first) ─────────
+    // Three-level model (strict about invariants, flexible about temporary
+    // conditions):
+    //   FATAL (blocks)      → local DB broken, schema incompatible, workspace
+    //                         not READY when it must be (fresh install offline,
+    //                         failed import) — already reported as errors above
+    //                         and left untouched here.
+    //   RECOVERABLE (warn)  → cloud API unreachable / sync endpoint missing /
+    //                         reconnect failure ONCE the local workspace is
+    //                         READY. The queue keeps operating from SQLite,
+    //                         mutations queue in the outbox, and the engine
+    //                         replays them when connectivity returns. Blocking
+    //                         a READY desktop because the CLOUD is down would
+    //                         contradict the offline-first design.
+    //   DIAGNOSTIC (report) → route-probe inconsistencies are reported
+    //                         truthfully with their evidence class; they do
+    //                         not gate launch on their own.
+    if (workspaceVerifiedReady) {
+      for (const r of results) {
+        if (r.status === 'error' && STEP_CATEGORY[r.step] === 'CONNECTIVITY') {
+          r.status = 'warning';
+          r.downgradedFromError = true;
+          r.message = `${r.message} — [مساحة العمل جاهزة: يعمل محليًا، المزامنة ستُستأنف تلقائيًا]`;
+          console.log(`[Diagnostics] Launch gate: ${r.step} error DOWNGRADED to warning — workspace is READY, cloud unavailability degrades synchronization, not the desktop (offline-first). Local queue remains fully usable; the engine replays automatically when connectivity returns.`);
+        }
+      }
+    } else {
+      console.log('[Diagnostics] Launch gate: workspace NOT verified READY — connectivity errors stay FATAL (a fresh/uninitialized install requires the cloud for the first import).');
+    }
     console.log('[Diagnostics] ────── RESULTS BREAKDOWN ──────');
     for (const r of results) {
       const icon = r.status === 'success' ? '✓' : r.status === 'warning' ? '▲' : '✗';
@@ -1053,6 +1103,28 @@ async function runDiagnostics(mainWindow, config) {
     }
   } catch (authErr) {
     console.warn('[Diagnostics] Could not read stored auth:', authErr.message);
+  }
+
+  if (storedAuth && storedAuth.token && storedAuth.user) {
+    // ── 0b. "Keep signed in on this device" gate (Task 14) ──────────
+    // LocalDeviceCredential enables offline unlock; the keep_signed_in
+    // preference (persisted in _sync_meta by the local API) decides whether
+    // the stored session is restored AUTOMATICALLY or the user must unlock
+    // with their password. Only an explicit 'false' changes behavior — the
+    // default (unset) keeps the historic always-restore semantics. Read
+    // from the authoritative local DB; a fresh/unreadable DB keeps the
+    // default (the gate is best-effort by design).
+    try {
+      const { localDb: earlyDb } = require('./local-api/lib/db');
+      if (earlyDb) {
+        const keepRows = await earlyDb.$queryRawUnsafe("SELECT value FROM \"_sync_meta\" WHERE key = 'keep_signed_in'").catch(() => null);
+        if (keepRows && keepRows[0] && String(keepRows[0].value) === 'false') {
+          console.log('[Diagnostics] Keep signed in is OFF for this device — stored session NOT auto-restored (password unlock required)');
+          sendUpdate(mainWindow, { log: '[INFO] Keep signed in is off — unlock with your password to continue', logType: 'info' });
+          storedAuth = null;
+        }
+      }
+    } catch { /* default remains auto-restore */ }
   }
 
   if (storedAuth && storedAuth.token && storedAuth.user) {
@@ -2056,7 +2128,12 @@ async function runDiagnostics(mainWindow, config) {
 
   await delay(300);
 
-  let crudResult = { step: 'test-queue-crud', status: 'warning', message: 'تم التخطي — لا توجد جلسة محلية (سيتم الاختبار بعد تسجيل الدخول)' };
+  // No verdict is pre-assigned: EVERY path below must produce an explicit,
+  // truthful verdict. If the flow ever falls through without one, the final
+  // guard reports an ERROR — a missing verdict is itself a test failure
+  // (the historic bug: the stale "no session" placeholder survived a RUN
+  // and was reported as the step's result).
+  let crudResult = null;
 
   if (localApiPort && localApiToken && isReady !== true) {
     // Behavioral test on an uninitialized workspace is meaningless — the DB
@@ -2069,12 +2146,13 @@ async function runDiagnostics(mainWindow, config) {
     };
     sendUpdate(mainWindow, { log: `[SKIP] Workspace not initialized (${postInitStatus || 'unknown'}) — behavioral CRUD test deferred`, logType: 'warn' });
   } else if (localApiPort && localApiToken) {
+    let testServiceId = null;
+    let createdTestService = false;
     try {
       const { localDb: testDb } = require('./local-api/lib/db');
       const testAgencyId = agencyId || 'test-agency-id';
 
       // Check if we have services to create a reservation with
-      let testServiceId = null;
       const services = await testDb.service.findMany({
         where: { agencyId: testAgencyId, isActive: true },
         take: 1,
@@ -2099,80 +2177,143 @@ async function runDiagnostics(mainWindow, config) {
           },
         });
         testServiceId = testService.id;
+        createdTestService = true;
         sendUpdate(mainWindow, { log: `[INFO] Created test service: ${testServiceId}`, logType: 'info' });
       }
 
-      // 1. CREATE: Create a reservation via local API with name "next"
+      // ── 1. CREATE — a REAL POST (method is set in net.request options). ──
+      // Assertions are strict (field round 6 review): the step may only claim
+      // success when the response says success AND carries a reservation id
+      // AND a ticket number. The historic bug read the GET-list response
+      // `{success:true, data:[...]}` as a create and printed id=undefined.
       sendUpdate(mainWindow, { log: '[TEST] POST /api/reservations — creating queue "next"...', logType: 'info' });
       const createRes = await postUrl(`http://127.0.0.1:${localApiPort}/api/reservations?token=${localApiToken}`, {
         serviceId: testServiceId,
-        customerName: 'next',
+        walkInCustomerName: 'next',
+        isWalkIn: true,
         customerPhone: '0000000000',
       });
 
-      let createdReservationId = null;
-      if (createRes.reachable && createRes.json?.success) {
-        createdReservationId = createRes.json.data?.id;
-        sendUpdate(mainWindow, { log: `[OK] Queue "next" created: id=${createdReservationId}, ticket=${createRes.json.data?.ticketNumber}`, logType: 'ok' });
-      } else {
-        sendUpdate(mainWindow, { log: `[FAIL] Create failed: ${createRes.body?.substring(0, 120) || 'no response'}`, logType: 'fail' });
-      }
+      const createdReservationId = createRes?.reachable && createRes.json?.success
+        ? (typeof createRes.json.data?.id === 'string' ? createRes.json.data.id : null)
+        : null;
+      const createdTicket = createRes?.json?.data
+        ? (createRes.json.data.displayNumber || createRes.json.data.queueNumber || createRes.json.data.ticketNumber || null)
+        : null;
 
-      // 2. VERIFY: Read it back
-      if (createdReservationId) {
+      if (!createRes?.reachable) {
+        crudResult = {
+          step: 'test-queue-crud',
+          status: 'error',
+          message: `فشل الاتصال عند إنشاء الطابور — ${createRes?.error || 'لا استجابة'}`,
+          detail: { phase: 'create', reachable: false, error: createRes?.error || null },
+        };
+        sendUpdate(mainWindow, { log: `[FAIL] Create request did not reach the local API: ${createRes?.error || 'no response'}`, logType: 'fail' });
+      } else if (!createRes.json?.success) {
+        const body = String(createRes.body || '').replace(/\s+/g, ' ').trim().substring(0, 160);
+        crudResult = {
+          step: 'test-queue-crud',
+          status: 'error',
+          message: `فشل إنشاء الطابور (HTTP ${createRes.statusCode || '؟'})`,
+          detail: { phase: 'create', httpStatus: createRes.statusCode || null, body: body || undefined },
+        };
+        sendUpdate(mainWindow, { log: `[FAIL] Create failed: HTTP ${createRes.statusCode || '؟'} ${body}`, logType: 'fail' });
+      } else if (!createdReservationId || !createdTicket) {
+        // success:true WITHOUT a usable id/ticket is a contract violation —
+        // never report it as created (field round 6: "id=undefined, ticket=undefined").
+        crudResult = {
+          step: 'test-queue-crud',
+          status: 'error',
+          message: 'استجابة الإنشاء غير مكتملة — نجاح منطقي بدون معرف أو رقم تذكرة',
+          detail: { phase: 'create-contract', hasId: !!createdReservationId, hasTicket: !!createdTicket, responseKeys: Object.keys(createRes.json || {}) },
+        };
+        sendUpdate(mainWindow, { log: `[FAIL] Create response contract violation: success=true but id=${createdReservationId ? 'present' : 'MISSING'}, ticket=${createdTicket ? 'present' : 'MISSING'} — NOT reporting a creation`, logType: 'fail' });
+      } else {
+        sendUpdate(mainWindow, { log: `[OK] Queue "next" created: id=${createdReservationId}, ticket=${createdTicket}`, logType: 'ok' });
+
+        // ── 2. VERIFY (list) — advisory only; SQLite below is authoritative. ──
         sendUpdate(mainWindow, { log: `[TEST] GET /api/reservations — verifying queue "next" exists...`, logType: 'info' });
+        let listWarning = null;
         const getRes = await probeUrl(`http://127.0.0.1:${localApiPort}/api/reservations?token=${localApiToken}`);
         if (getRes.reachable && getRes.json?.success) {
-          const found = getRes.json.data?.find(r => r.id === createdReservationId);
+          const found = Array.isArray(getRes.json.data) && getRes.json.data.find(r => r.id === createdReservationId);
           if (found) {
-            sendUpdate(mainWindow, { log: `[OK] Queue "next" verified in local DB: ticket=${found.ticketNumber}, status=${found.status}`, logType: 'ok' });
+            sendUpdate(mainWindow, { log: `[OK] Queue "next" verified in list: ticket=${found.displayNumber || found.queueNumber || found.ticketNumber}, status=${found.status}`, logType: 'ok' });
           } else {
-            sendUpdate(mainWindow, { log: `[WARN] Queue "next" not found in list (may be filtered)`, logType: 'fail' });
+            listWarning = 'created reservation not present in GET /api/reservations list (may be filtered)';
+            sendUpdate(mainWindow, { log: `[WARN] Queue "next" not found in list (may be filtered) — SQLite check below is authoritative`, logType: 'warn' });
+          }
+        } else {
+          listWarning = 'list probe failed (' + (getRes.error || ('HTTP ' + (getRes.statusCode || '?'))) + ')';
+          sendUpdate(mainWindow, { log: `[WARN] List probe failed — SQLite check below is authoritative`, logType: 'warn' });
+        }
+
+        // ── 3. CANCEL — the REAL cancel route (transactional + outbox). ──
+        // PUT /api/reservations/:id does NOT accept `status` (400: no valid
+        // fields) — the historic cancel here silently no-opped while the
+        // "reachable" flag made it look successful.
+        sendUpdate(mainWindow, { log: `[TEST] POST /api/queue/cancel/${createdReservationId} — canceling queue "next"...`, logType: 'info' });
+        const cancelRes = await postAuthUrl(
+          `http://127.0.0.1:${localApiPort}/api/queue/cancel/${createdReservationId}`,
+          {},
+          localApiToken,
+        );
+        if (!cancelRes?.reachable) {
+          crudResult = {
+            step: 'test-queue-crud',
+            status: 'error',
+            message: `فشل الاتصال عند إلغاء الطابور — ${cancelRes?.error || 'لا استجابة'}`,
+            detail: { phase: 'cancel', reservationId: createdReservationId, ticket: createdTicket, error: cancelRes?.error || null },
+          };
+          sendUpdate(mainWindow, { log: `[FAIL] Cancel request did not reach the local API: ${cancelRes?.error || 'no response'}`, logType: 'fail' });
+        } else if (!cancelRes.json?.success) {
+          const body = String(cancelRes.body || '').replace(/\s+/g, ' ').trim().substring(0, 160);
+          crudResult = {
+            step: 'test-queue-crud',
+            status: 'error',
+            message: `فشل إلغاء الطابور (HTTP ${cancelRes.statusCode || '؟'})`,
+            detail: { phase: 'cancel', reservationId: createdReservationId, ticket: createdTicket, httpStatus: cancelRes.statusCode || null, body: body || undefined },
+          };
+          sendUpdate(mainWindow, { log: `[FAIL] Cancel failed: HTTP ${cancelRes.statusCode || '؟'} ${body}`, logType: 'fail' });
+        } else {
+          sendUpdate(mainWindow, { log: `[OK] Queue "next" cancelled via /api/queue/cancel`, logType: 'ok' });
+
+          // ── 4. VERIFY CANCELLATION in SQLite (authoritative). ──
+          const { localDb: verifyDb } = require('./local-api/lib/db');
+          const cancelled = await verifyDb.reservation.findUnique({ where: { id: createdReservationId } });
+          if (cancelled && cancelled.status === 'CANCELLED') {
+            sendUpdate(mainWindow, { log: `[OK] Verified in SQLite: reservation ${createdReservationId} is CANCELLED`, logType: 'ok' });
+            crudResult = {
+              step: 'test-queue-crud',
+              status: 'success',
+              message: `إنشاء ✓ (تذكرة ${createdTicket}) → تحقق ✓ → إلغاء ✓ → تحقق SQLite ✓`,
+              detail: {
+                created: true, verifiedInList: !listWarning, cancelled: true, sqliteVerified: true,
+                reservationId: createdReservationId, ticket: createdTicket,
+                listWarning: listWarning || undefined,
+              },
+            };
+          } else {
+            crudResult = {
+              step: 'test-queue-crud',
+              status: 'error',
+              message: 'التحقق النهائي في SQLite فشل — الحالة ليست CANCELLED',
+              detail: {
+                phase: 'sqlite-verify', reservationId: createdReservationId, ticket: createdTicket,
+                found: !!cancelled, status: cancelled?.status || null, listWarning: listWarning || undefined,
+              },
+            };
+            sendUpdate(mainWindow, { log: `[FAIL] SQLite verify failed: reservation ${cancelled ? 'exists but status=' + cancelled.status : 'NOT FOUND'}`, logType: 'fail' });
           }
         }
       }
 
-      // 3. DELETE: Delete the reservation
-      if (createdReservationId) {
-        sendUpdate(mainWindow, { log: `[TEST] PUT /api/reservations/${createdReservationId} — canceling queue "next"...`, logType: 'info' });
-        const deleteRes = await putUrl(
-          `http://127.0.0.1:${localApiPort}/api/reservations/${createdReservationId}?token=${localApiToken}`,
-          { status: 'CANCELLED' },
-          localApiToken,
-        );
-        if (deleteRes.reachable) {
-          sendUpdate(mainWindow, { log: `[OK] Queue "next" cancelled (status: CANCELLED)`, logType: 'ok' });
-        } else {
-          sendUpdate(mainWindow, { log: `[FAIL] Cancel failed: ${deleteRes.error || 'no response'}`, logType: 'fail' });
-        }
-      }
-
-      // 4. VERIFY DELETION: Confirm it's cancelled
-      if (createdReservationId) {
-        const { localDb: verifyDb } = require('./local-api/lib/db');
-        const cancelled = await verifyDb.reservation.findUnique({ where: { id: createdReservationId } });
-        if (cancelled && cancelled.status === 'CANCELLED') {
-          sendUpdate(mainWindow, { log: `[OK] Verified: reservation ${createdReservationId} is CANCELLED in local DB`, logType: 'ok' });
-          crudResult = {
-            step: 'test-queue-crud',
-            status: 'success',
-            message: `إنشاء ✓ → تحقق ✓ → حذف ✓ — طابور "next" اختباري ناجح`,
-            detail: { created: true, verified: true, deleted: true, reservationId: createdReservationId },
-          };
-        } else {
-          crudResult = {
-            step: 'test-queue-crud',
-            status: 'warning',
-            message: 'تم الإنشاء لكن التحقق من الحذف فشل',
-          };
-        }
-
-        // Clean up test service if we created it
-        if (!services || services.length === 0) {
-          try {
-            await verifyDb.service.delete({ where: { id: testServiceId } }).catch(() => {});
-          } catch { /* ignore */ }
-        }
+      // Clean up test service if we created it (best-effort, never masks the verdict)
+      if (createdTestService && testServiceId) {
+        try {
+          const { localDb: cleanupDb } = require('./local-api/lib/db');
+          await cleanupDb.service.delete({ where: { id: testServiceId } }).catch(() => {});
+        } catch { /* ignore */ }
       }
     } catch (err) {
       // P0-4: an unexpected error is a REAL failure, not a skip. The old
@@ -2200,6 +2341,18 @@ async function runDiagnostics(mainWindow, config) {
       message: 'تم التخطي — الخادم المحلي غير متاح بعد',
     };
     sendUpdate(mainWindow, { log: `[SKIP] Local server not available — will test after startup`, logType: 'warn' });
+  }
+
+  // Final guard: a run without a verdict is itself a failure (never report
+  // a stale placeholder as the outcome).
+  if (!crudResult) {
+    crudResult = {
+      step: 'test-queue-crud',
+      status: 'error',
+      message: 'الاختبار السلوكي لم ينتج حكمًا — عيب في تشخيصات بدء التشغيل نفسها',
+      detail: { localApiPort, hadToken: !!localApiToken, initializationStatus: postInitStatus || 'unknown' },
+    };
+    console.error('[Diagnostics] CRUD test produced NO verdict — reporting as error');
   }
 
   pushResult(crudResult);

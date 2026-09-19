@@ -196,11 +196,14 @@ const DATE_FIELDS = new Set([
  * Convert a cloud API record to a format suitable for local SQLite upsert.
  * - Convert ISO date strings to Date objects
  * - Strip undefined values
+ * - Strip per-model sync-excluded fields (authentication secrets — Task 14)
  */
-function _transformRecord(record) {
+function _transformRecord(record, modelName) {
+  const excluded = modelName ? MODEL_SYNC_EXCLUDED_FIELDS[modelName] : null
   const result = {}
   for (const [key, value] of Object.entries(record)) {
     if (value === undefined) continue
+    if (excluded && excluded.indexOf(key) !== -1) continue
     if (DATE_FIELDS.has(key) && typeof value === 'string' && value.match(/^\d{4}-\d{2}-\d{2}T/)) {
       result[key] = new Date(value)
     } else {
@@ -221,6 +224,20 @@ function _transformRecord(record) {
 }
 
 // ─── Model-Specific Upsert Logic ────────────────────────────────────────────
+
+/**
+ * Fields that must NEVER be persisted from the sync feed, per model
+ * (Task 14 — User sync/auth contract). The cloud already excludes them
+ * (explicit USER_SYNC projection + REDACTED_FIELDS), but the local engine
+ * ALSO refuses them here so an authentication secret can never land in
+ * local SQLite even if a future/other cloud build regresses. Applies
+ * generically to every role (CUSTOMER, AGENCY_OWNER, AGENCY_STAFF,
+ * SUPER_ADMIN) — the sync contract is identical for all of them; only the
+ * user's authorization/agency relationship differs.
+ */
+const MODEL_SYNC_EXCLUDED_FIELDS = {
+  User: ['passwordHash', 'fcmToken'],
+}
 
 /**
  * Map of Prisma model names to their unique key fields (for upsert `where` clause).
@@ -256,7 +273,7 @@ const MODEL_IMMUTABLE_FIELDS = new Set([
  * Returns { where, update, create } for Prisma upsert.
  */
 function _buildUpsertData(modelName, rawRecord) {
-  const record = _transformRecord(rawRecord)
+  const record = _transformRecord(rawRecord, modelName)
   const id = record.id
   if (!id) return null
 
@@ -326,7 +343,7 @@ function _isTransientDbError(err) {
  * Fallback raw SQL upsert for models not in the Prisma client.
  */
 async function _upsertRecordRaw(tx, modelName, rawRecord) {
-  const record = _transformRecord(rawRecord)
+  const record = _transformRecord(rawRecord, modelName)
   const id = record.id
   if (!id) return false
 
@@ -1227,7 +1244,10 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
       db, agencyId, cloudUrl, cloudAuthToken, snapshotSequence, effectiveSignal, emit,
     )
     bridgeFinalSequence = bridge.finalSequence
-    console.log(`[InitialSync] Snapshot bridge complete: ${bridge.applied} change(s) applied across ${bridge.pages} page(s); engine cursor -> ${bridgeFinalSequence}`)
+    // CURSOR INVARIANT receipt (field round 6): the log must state the full
+    // chain — snapshot S → bridge pages → final F — and F means "every change
+    // ≤ F is durably ledger-accounted", not a value that jumped ahead.
+    console.log(`[InitialSync] Snapshot bridge complete: ${bridge.applied} change(s) applied across ${bridge.pages} page(s) — cursor invariant: snapshot=${snapshotSequence} → bridge final=${bridgeFinalSequence}${bridgeFinalSequence >= snapshotSequence ? ' (every change ≤ ' + bridgeFinalSequence + ' accounted via the apply ledger)' : ' — INVALID: bridge final < snapshot (feed went backward)'}`)
   } catch (bridgeErr) {
     await _updateLocalState(db, agencyId, {
       initializationStatus: 'FAILED',
@@ -1287,6 +1307,32 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     readyAt: completedAt.toISOString(),
   }
   await _setMeta(db, `readyChecks:${agencyId}`, JSON.stringify(readyChecks))
+
+  // ── Step 4e: adopt the engine cursor BEFORE the READY flip ─────────────
+  // The Part D gate unblocks incremental pulls the instant READY is set, so
+  // the cursor must already be correct here — a stale pre-import value (e.g.
+  // 893 from an older build) must never decide where the first post-READY
+  // pull starts (field round 6: bridge final 890 was shadowed by a stale
+  // v2 cursor key and the engine pulled from 893, skipping 891..893 of the
+  // import baseline).
+  // Write BOTH engine keys (the v2 key `lastPulledSequence` AND the legacy
+  // `_lastPulledSequence`) so no reader can be shadowed by stale history,
+  // then adopt through the RUNNING engine (in-memory _cursor + audit row).
+  await _setMeta(db, `lastPulledSequence`, String(bridgeFinalSequence))
+  await _setMeta(db, `_lastPulledSequence`, String(bridgeFinalSequence))
+  try {
+    const syncServiceForCursor = require('./sync-service') // lazy — avoids the module cycle
+    await syncServiceForCursor.setInitialCursor(bridgeFinalSequence, {
+      source: 'initial-sync-bridge',
+      snapshotSequence,
+      bridgeFinalSequence,
+    })
+  } catch (cursorAdoptErr) {
+    // Engine not started in this process (e.g. HTTP-path import): the
+    // persisted keys above are authoritative and startSync hydrates them.
+    console.log('[InitialSync] Engine cursor adoption skipped (engine not running here): ' + cursorAdoptErr.message)
+  }
+
   await _updateLocalState(db, agencyId, {
     initializationStatus: 'READY',
     initializationCompletedAt: completedAt,
@@ -1295,16 +1341,14 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     lastError: null,
   })
 
-  // ── Step 6: Bridge to incremental sync ─────────────────────────────────
-  // Store snapshotSequence in _sync_meta as _lastPulledSequence
-  // so the incremental sync engine starts from the correct baseline.
-  // Also store as initialSyncSnapshotSequence for clear identification of
-  // the initial sync baseline (distinct from the advancing _lastPulledSequence).
-  // Part E/AE: the engine cursor starts at the bridge's final page sequence —
+  // ── Step 6: Bridge to incremental sync (bookkeeping) ──────────────────
+  // The ENGINE CURSOR (lastPulledSequence + legacy _lastPulledSequence) was
+  // already adopted to bridgeFinalSequence in Step 4e BEFORE the READY flip.
+  // Here we only record the audit keys.
+  // Part E/AE: the engine cursor equals the bridge's final page sequence —
   // every change after the ORIGINAL snapshot has already been applied by the
   // bridge, so nothing between S and now can be missed. The original S stays
   // recorded as initialSyncSnapshotSequence (audit + retention checks).
-  await _setMeta(db, `_lastPulledSequence`, String(bridgeFinalSequence))
   await _setMeta(db, `initialSyncSnapshotSequence`, String(snapshotSequence))
   await _setMeta(db, `agencyInitialized:${agencyId}`, 'true')
   await _setMeta(db, `initialSyncCompletedAt:${agencyId}`, String(completedAt.getTime()))
@@ -1319,6 +1363,7 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     totalRecords,
     duration,
     snapshotSequence,
+    bridgeFinalSequence,
     validation,
     readyChecks,
   })
@@ -1331,6 +1376,7 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     duration,
     syncId,
     snapshotSequence,
+    bridgeFinalSequence,
     readyChecks,
   }
 }
