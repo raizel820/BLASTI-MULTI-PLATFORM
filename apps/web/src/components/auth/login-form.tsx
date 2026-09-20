@@ -623,6 +623,21 @@ export function LoginForm() {
                     transition={{ duration: 0.25 }}
                   >
                     <CardContent className="space-y-5 pt-4">
+                      {/* Go-back control — visible on ALL platforms (the global
+                          header arrow is hidden on the native shell, so this
+                          row is the only way back on desktop) */}
+                      <div className="flex justify-start">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => setAuthView('login')}
+                          className="h-10 w-10 -ms-2"
+                          aria-label={t('back')}
+                          title={t('back')}
+                        >
+                          <ArrowLeft className="h-5 w-5 rtl:rotate-180" />
+                        </Button>
+                      </div>
                       <p className="text-sm text-muted-foreground text-center">
                         {t('forgotPasswordDesc')}
                       </p>
@@ -710,6 +725,20 @@ export function LoginForm() {
                     transition={{ duration: 0.25 }}
                   >
                     <CardContent className="space-y-5 pt-4">
+                      {/* Go-back control — previous step (forgot-password).
+                          Visible on ALL platforms including the native shell. */}
+                      <div className="flex justify-start">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          onClick={() => setAuthView('forgot-password')}
+                          className="h-10 w-10 -ms-2"
+                          aria-label={t('back')}
+                          title={t('back')}
+                        >
+                          <ArrowLeft className="h-5 w-5 rtl:rotate-180" />
+                        </Button>
+                      </div>
                       <p className="text-sm text-muted-foreground text-center">
                         {t('resetPasswordDesc')}
                       </p>
@@ -802,7 +831,7 @@ export function LoginForm() {
 
                       <button
                         type="button"
-                        onClick={() => setAuthView('forgot-password')}
+                        onClick={() => { setAuthView('login'); setResetDone(false); }}
                         className="text-xs text-muted-foreground hover:text-emerald-600 dark:hover:text-emerald-400 transition-colors duration-200 hover:underline underline-offset-2 text-center"
                       >
                         {t('backToLogin')}

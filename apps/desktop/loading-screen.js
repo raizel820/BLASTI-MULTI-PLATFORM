@@ -1730,7 +1730,14 @@ async function runDiagnostics(mainWindow, config) {
       // mid-probe; `sync.registered` distinguishes a stale build from a
       // process split (two binaries answering the same origin).
       const syncProbeUrl = `${cloudBaseUrl}/api/sync/pull`;
-      const probeBody = { agencyId: agencyId || 'diagnostics-probe' };
+      // Round 16: NEVER invent an agencyId. A session without an agency (a
+      // fresh AGENCY_OWNER before the setup wizard runs) used to pull with
+      // the fake 'diagnostics-probe' id and got 403 "You do not have access
+      // to this agency" — reported as an auth failure that sent users into
+      // re-login loops. With no agency we probe WITHOUT one: a real sync API
+      // answers 400 (agencyId required) which still proves the route exists
+      // and the token parses; 401 alone means the credential is bad.
+      const probeBody = agencyId ? { agencyId } : {};
 
       const readHealthMeta = (probe) => {
         try {
@@ -1780,10 +1787,11 @@ async function runDiagnostics(mainWindow, config) {
 
       const syncBody = String(syncProbe?.body || '').replace(/\s+/g, ' ').trim().substring(0, 140);
       console.log(`[Diagnostics] Cloud sync probe POST ${syncProbeUrl} (${cloudAuthToken ? 'with stored token' : 'NO token'}, attempt ${attempt}/${MAX_SYNC_PROBE_ATTEMPTS}) → ${syncProbe?.reachable ? `HTTP ${syncStatus}` : `UNREACHABLE (${syncProbe?.error || 'no connection'})`}${syncBody ? ` | body: ${syncBody}` : ''}`);
-      // 401/403 → the route EXISTS but rejected the credential (expired
-      // token): origin is correct, re-login fixes it. 404 (after retries) →
-      // this origin does not host the sync API.
-      const authRejected = syncStatus === 401 || syncStatus === 403;
+      // 401 → the route EXISTS but rejected the credential (expired token):
+      // origin is correct, re-login fixes it. 403 → only an auth rejection
+      // when we actually SENT an agencyId (ownership denied). 404 (after
+      // retries) → this origin does not host the sync API.
+      const authRejected = syncStatus === 401 || (syncStatus === 403 && !!agencyId);
       const syncEndpointOk = syncStatus > 0 && syncStatus !== 404;
       if (syncEndpointOk && !authRejected) {
         cloudAvailable = true;
@@ -1998,6 +2006,59 @@ async function runDiagnostics(mainWindow, config) {
       }
     } catch (e) {
       sendUpdate(mainWindow, { log: `[WARN] Session import error: ${e.message}`, logType: 'warn' });
+    }
+  }
+
+  // ── 3.1b Round 16: Startup SESSION REFRESH ─────────────────────────────
+  // The stored token is a SNAPSHOT issued when the user last logged in. It
+  // goes stale in three common ways: (1) the account's agency was created
+  // AFTER the token was issued (agencyId: '' forever), (2) the role changed,
+  // (3) the cloud DB no longer knows the user at all (ghost token — e.g. a
+  // DB reset or a re-registered username; the cloud socket P2025 spam in the
+  // field log). POST /api/auth/refresh-session re-issues the token from the
+  // cloud DB's CURRENT state. Adoption here heals (1)/(2) for THIS launch
+  // and persists the fresh token for the next one; a 401 surfaces an honest
+  // "please sign in again" instead of cryptic 403/P2025 noise downstream.
+  if (localApiPort && serverResult.status === 'success' && sessionImported) {
+    try {
+      const refreshUrl = `http://127.0.0.1:${localApiPort}/api/auth/refresh-session`;
+      const refreshRes = await postAuthUrl(refreshUrl, {}, cloudAuthToken, 10000);
+      if (refreshRes.reachable && refreshRes.statusCode === 401) {
+        console.warn('[Diagnostics] Session refresh → 401: the cloud does not know this account (ghost/expired token) — re-login required');
+        sendUpdate(mainWindow, { log: '[WARN] انتهت صلاحية الجلسة أو الحساب غير موجود في السحابة — أعد تسجيل الدخول', logType: 'warn' });
+      } else if (refreshRes.reachable && refreshRes.json && refreshRes.json.success && refreshRes.json.token && refreshRes.json.user) {
+        const prevAgencyId = agencyId;
+        cloudAuthToken = refreshRes.json.token;
+        cloudUser = refreshRes.json.user;
+        agencyId = cloudUser.agencyId || null;
+        // Persist the refreshed session so the NEXT launch starts fresh too.
+        try {
+          const pathMod = require('path');
+          const fs = require('fs');
+          const authPath = pathMod.join(userDataPath, 'blasti-auth.json');
+          fs.writeFileSync(authPath, JSON.stringify({ token: cloudAuthToken, user: cloudUser }, null, 2));
+        } catch (persistErr) {
+          console.warn('[Diagnostics] Refreshed auth persist failed (non-fatal):', persistErr.message);
+        }
+        // Re-import so the local API session adopts the refreshed token/user
+        // (the refresh proxy already adopts internally when it succeeded —
+        // but the import here keeps main-process state and the local API in
+        // lockstep even if the proxy route is missing on an older build).
+        try {
+          await postUrl(`http://127.0.0.1:${localApiPort}/api/auth/import-session`, {
+            token: cloudAuthToken,
+            user: cloudUser,
+          });
+        } catch { /* tolerated — the proxy already imported it */ }
+        localApiToken = cloudAuthToken;
+        const changed = agencyId !== prevAgencyId;
+        console.log(`[Diagnostics] Session refreshed at startup — agency: ${agencyId ? agencyId.substring(0, 8) + '…' : 'none'}${changed ? ' (healed from stale context)' : ''}`);
+        sendUpdate(mainWindow, { log: `[OK] تم تحديث الجلسة من السحابة — ${agencyId ? 'الوكالة مرتبطة' : 'لا توجد وكالة بعد'}${changed ? ' (تمت إعادة المزامنة من سياق قديم)' : ''}`, logType: 'ok' });
+      } else {
+        console.log(`[Diagnostics] Session refresh skipped (HTTP ${refreshRes.statusCode || 'n/a'}, cloud unreachable or old build) — continuing with the stored session`);
+      }
+    } catch (refreshErr) {
+      console.warn('[Diagnostics] Session refresh error (non-fatal):', refreshErr.message);
     }
   }
 
@@ -2247,7 +2308,27 @@ async function runDiagnostics(mainWindow, config) {
     console.log('[Diagnostics] Local workspace READY — gate passed');
   } else if (isReady === false) {
     const failReason = readiness?.reason || postDbStatus?.lastError || (syncOutcome?.error ?? 'سبب غير معروف');
-    if (syncAttempted && cloudAvailable) {
+    // Round 16 (field deadlock): an authenticated AGENCY_OWNER with NO agency
+    // yet is an EXPECTED state, not a failure. The engine defers
+    // initialization (no-agency) and the agency-creation wizard inside the
+    // app is the next step. Blocking the gate here made that wizard
+    // unreachable forever — the exact "stuck at the launch screen" report.
+    const noAgencyOnboarding = hasStoredSession && !agencyId
+      && !!cloudUser && cloudUser.role !== 'CUSTOMER';
+    if (noAgencyOnboarding) {
+      initResult = {
+        step: 'initial-sync',
+        status: 'success',
+        message: 'لا توجد وكالة مرتبطة بالحساب — سيفتح معالج إنشاء الوكالة بعد الدخول',
+        detail: {
+          initializationStatus: postInitStatus,
+          onboarding: 'no-agency',
+          role: cloudUser.role || null,
+          cloudAvailable,
+        },
+      };
+      sendUpdate(mainWindow, { log: '[SKIP] No agency on the session — the agency setup wizard will open after launch', logType: 'info' });
+    } else if (syncAttempted && cloudAvailable) {
       // Sync ran (or was attempted) and the workspace is still not ready —
       // a real failure: block launch, the error banner offers retry.
       initResult = {
@@ -2407,6 +2488,16 @@ async function runDiagnostics(mainWindow, config) {
               detail: { counts: statusRes.counts, readiness: statusRes.readiness },
             };
             sendUpdate(mainWindow, { log: '[SKIP] Tables empty (no session yet) — will populate after login', logType: 'info' });
+          } else if (!agencyId && hasStoredSession && cloudUser && cloudUser.role !== 'CUSTOMER') {
+            // Round 16: session without an agency — an empty workspace is the
+            // expected pre-wizard state; the setup wizard owns the next step.
+            verifyResult = {
+              step: 'verify',
+              status: 'success',
+              message: 'قاعدة البيانات جاهزة — سيتم إنشاء الوكالة عبر المعالج',
+              detail: { counts: statusRes.counts, readiness: statusRes.readiness, onboarding: 'no-agency' },
+            };
+            sendUpdate(mainWindow, { log: '[SKIP] Workspace empty (no agency yet) — the setup wizard will create it', logType: 'info' });
           } else {
             // A session exists but the workspace is incomplete — block.
             verifyResult = {

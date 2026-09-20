@@ -1,4 +1,4 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { db } from '@blasti/db'
 import { requireAuth, requireAgencyAccess, requireResourceOwnership, resolveUserAgencyId, authErrorResponse, verifyAgencyOwnership, AuthError } from '../lib/auth'
 import { validateBody, createAnnouncementSchema, createBranchSchema, updateBranchSchema, createCounterSchema, updateCounterSchema, updateAgencyProfileSchema, updateAgencySettingsSchema, createServiceSchema, updateServiceSchema, updateStaffSchema, createStaffSchema, createReviewSchema, subscriptionPaySchema, subscriptionUnsubscribeSchema, updateWorkingHoursSchema, createHardwareOrderSchema, createEnterpriseRequestSchema } from '../lib/validations'
@@ -11,6 +11,10 @@ import { calculateETA, getEffectiveServiceTime } from '../lib/eta-calculator'
 import { z } from 'zod'
 import QRCode from 'qrcode'
 import { recordSyncChange } from '../lib/sync-helpers'
+import { normalizeRecordFileUrls } from '../lib/file-url'
+
+/** Round 15 — stable base for built file URLs when BLASTI_PUBLIC_BASE_URL is set. */
+const PUBLIC_FILE_URL_BASE = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '')
 
 const app = new Hono()
 
@@ -1187,8 +1191,10 @@ app.get('/profile', async (c) => {
       email: agency.email,
       code: agency.customCode,
       logoUrl: agency.logoUrl,
+      coverUrl: agency.coverUrl,
       workingHoursStart: agency.workingHoursStart,
       workingHoursEnd: agency.workingHoursEnd,
+      workingDays: agency.workingDays,
     })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -1196,7 +1202,10 @@ app.get('/profile', async (c) => {
   }
 })
 
-app.patch('/profile', async (c) => {
+// Round 15 — shared handler for PATCH and PUT /profile. PUT matters because
+// the desktop outbox logs agency-profile mutations as PUT /api/agency/profile
+// and replays them verbatim to the cloud; without a PUT route every replay 404'd.
+async function handleAgencyProfileUpdate(c: Context) {
   try {
     const body = await c.req.json()
     const validation = validateBody(updateAgencyProfileSchema, body)
@@ -1225,19 +1234,31 @@ app.patch('/profile', async (c) => {
     const targetAgency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!targetAgency) return c.json({ error: 'No agency found' }, 404)
 
+    // Round 15 — rewrite desktop-local/relative file URLs (logo/cover) to the
+    // cloud's own public URLs. Legacy outbox replays land here as PUT /profile
+    // (see app.put below) — both entry points share this handler.
+    const fileBase = PUBLIC_FILE_URL_BASE || new URL(c.req.url).origin
+    const normalizedData = normalizeRecordFileUrls(validatedData as Record<string, unknown>, fileBase) as typeof validatedData
+
     await db.agency.update({
       where: { id: targetAgency.id },
       data: {
-        ...(validatedData.name !== undefined && { name: validatedData.name }),
-        ...(validatedData.nameAr !== undefined && { nameAr: validatedData.nameAr }),
-        ...(validatedData.nameFr !== undefined && { nameFr: validatedData.nameFr }),
-        ...(validatedData.description !== undefined && { description: validatedData.description }),
-        ...(validatedData.descriptionAr !== undefined && { descriptionAr: validatedData.descriptionAr }),
-        ...(validatedData.descriptionFr !== undefined && { descriptionFr: validatedData.descriptionFr }),
-        ...(validatedData.address !== undefined && { address: validatedData.address }),
-        ...(validatedData.phone !== undefined && { phone: validatedData.phone }),
-        ...(validatedData.category !== undefined && { category: validatedData.category }),
-        ...(validatedData.website !== undefined && { website: validatedData.website }),
+        ...(normalizedData.name !== undefined && { name: normalizedData.name }),
+        ...(normalizedData.nameAr !== undefined && { nameAr: normalizedData.nameAr }),
+        ...(normalizedData.nameFr !== undefined && { nameFr: normalizedData.nameFr }),
+        ...(normalizedData.description !== undefined && { description: normalizedData.description }),
+        ...(normalizedData.descriptionAr !== undefined && { descriptionAr: normalizedData.descriptionAr }),
+        ...(normalizedData.descriptionFr !== undefined && { descriptionFr: normalizedData.descriptionFr }),
+        ...(normalizedData.address !== undefined && { address: normalizedData.address }),
+        ...(normalizedData.phone !== undefined && { phone: normalizedData.phone }),
+        ...(normalizedData.category !== undefined && { category: normalizedData.category }),
+        ...(normalizedData.website !== undefined && { website: normalizedData.website }),
+        // Round 15 — files + schedule fields (schema extended this round).
+        ...(('logoUrl' in normalizedData) && { logoUrl: (normalizedData as Record<string, unknown>).logoUrl as string | undefined }),
+        ...(('coverUrl' in normalizedData) && { coverUrl: (normalizedData as Record<string, unknown>).coverUrl as string | undefined }),
+        ...(('workingHoursStart' in normalizedData) && { workingHoursStart: (normalizedData as Record<string, unknown>).workingHoursStart as string | undefined }),
+        ...(('workingHoursEnd' in normalizedData) && { workingHoursEnd: (normalizedData as Record<string, unknown>).workingHoursEnd as string | undefined }),
+        ...(('workingDays' in normalizedData) && { workingDays: (normalizedData as Record<string, unknown>).workingDays as string | undefined }),
       },
     })
 
@@ -1251,7 +1272,10 @@ app.patch('/profile', async (c) => {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
-})
+}
+
+app.patch('/profile', handleAgencyProfileUpdate)
+app.put('/profile', handleAgencyProfileUpdate)
 
 // ─── agency/qr-code ───────────────────────────────────────────────────────────
 
@@ -3634,7 +3658,7 @@ app.patch('/working-hours', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    const { agencyId, workingHoursStart, workingHoursEnd } = validation.data
+    const { agencyId, workingHoursStart, workingHoursEnd, workingDays } = validation.data
 
     // Phase 2c: Explicit ownership check
     await ensureAgencyIdOwnership(c, agencyId)
@@ -3645,11 +3669,13 @@ app.patch('/working-hours', async (c) => {
       data: {
         ...(workingHoursStart !== undefined && { workingHoursStart }),
         ...(workingHoursEnd !== undefined && { workingHoursEnd }),
+        ...(workingDays !== undefined && { workingDays }),
       },
       select: {
         id: true,
         workingHoursStart: true,
         workingHoursEnd: true,
+        workingDays: true,
       },
     })
 
@@ -3658,6 +3684,7 @@ app.patch('/working-hours', async (c) => {
       action: 'working-hours-updated',
       workingHoursStart,
       workingHoursEnd,
+      workingDays,
     })
 
     return c.json(agency)

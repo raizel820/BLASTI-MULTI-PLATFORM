@@ -10,8 +10,8 @@
  *
  * Responsibilities (frontend-only):
  *  - Two OTP blocks built on the shadcn input-otp component
- *    (email = 8 digits, phone = 6 digits; the dev bypass SMS code "1234"
- *    is also accepted → submit allows 4 digits).
+ *    (email = 8 digits, phone = 6 digits — Round 15 made the dev bypass
+ *    SMS code SIX digits, 123456, so the input cap and the code match).
  *  - A single "Verify" button submits both codes at once; the failing
  *    channel from the API response gets the inline error + shake.
  *  - Partial success (one channel verified) is tracked locally so the
@@ -199,8 +199,9 @@ function verificationErrorMessage(
 
 const EMAIL_CODE_LENGTH = 8
 const PHONE_CODE_LENGTH = 6
-/** The dev bypass SMS code is 4 digits — allow submitting it too. */
-const PHONE_CODE_MIN = 4
+// Round 15: the dev bypass SMS code is now 6 digits (123456) — it fills the
+// six input boxes exactly like a real code, so no 4-digit exception exists
+// anymore.
 const RESEND_DEFAULT_COOLDOWN = 60
 
 export function VerificationStep({
@@ -282,14 +283,13 @@ export function VerificationStep({
     const submitEmail = isEmailPending && !verifiedChannels.email
     const submitPhone = isPhonePending && !verifiedChannels.phone
 
-    // Client-side completeness validation (email = 8 digits; phone = 6,
-    // or 4 for the dev bypass code)
+    // Client-side completeness validation (email = 8 digits, phone = 6)
     if (submitEmail && emailCode.length !== EMAIL_CODE_LENGTH) {
       setChannelError({ channel: 'email', message: verificationErrorMessage(c, 'INCOMPLETE') })
       triggerShake('email')
       return
     }
-    if (submitPhone && phoneCode.length !== PHONE_CODE_LENGTH && phoneCode.length !== PHONE_CODE_MIN) {
+    if (submitPhone && phoneCode.length !== PHONE_CODE_LENGTH) {
       setChannelError({ channel: 'phone', message: verificationErrorMessage(c, 'INCOMPLETE') })
       triggerShake('phone')
       return
@@ -422,7 +422,7 @@ export function VerificationStep({
       ? emailCode.length === EMAIL_CODE_LENGTH
       : true) &&
     (isPhonePending && !verifiedChannels.phone
-      ? phoneCode.length === PHONE_CODE_LENGTH || phoneCode.length === PHONE_CODE_MIN
+      ? phoneCode.length === PHONE_CODE_LENGTH
       : true) &&
     ((isEmailPending && !verifiedChannels.email) || (isPhonePending && !verifiedChannels.phone))
 

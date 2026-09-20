@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { db } from '@blasti/db'
 import { requireAdmin, authErrorResponse } from '../lib/auth'
+import { STORAGE_ROOT } from '../lib/storage'
 import { z } from 'zod'
 import crypto from 'crypto'
 import fs from 'fs'
@@ -39,13 +40,30 @@ const updateAppVersionSchema = z.object({
 })
 
 // ─── Upload directory ───────────────────────────────────────────────────────
+//
+// Round 15 storage audit FIX: app binaries used to be written into
+// os.tmpdir()/blasti-app-uploads — a directory the OS may WIPE on reboot,
+// silently breaking every previously uploaded binary. Binaries now live in
+// the central storage root (lib/storage.ts) under the app-versions bucket.
+// Reads fall back to the legacy tmpdir location so binaries uploaded before
+// this change keep downloading until re-uploaded.
 
-const UPLOAD_DIR = path.join(os.tmpdir(), 'blasti-app-uploads')
+const UPLOAD_DIR = path.join(STORAGE_ROOT, 'app-versions')
+const LEGACY_UPLOAD_DIR = path.join(os.tmpdir(), 'blasti-app-uploads')
 
 function ensureUploadDir() {
   if (!fs.existsSync(UPLOAD_DIR)) {
     fs.mkdirSync(UPLOAD_DIR, { recursive: true })
   }
+}
+
+/** Resolve a stored binary: organized dir first, legacy tmpdir second. */
+function resolveBinaryPath(storageKey: string): string | null {
+  const organized = path.resolve(UPLOAD_DIR, storageKey)
+  if (organized.startsWith(path.resolve(UPLOAD_DIR) + path.sep) && fs.existsSync(organized)) return organized
+  const legacy = path.resolve(LEGACY_UPLOAD_DIR, storageKey)
+  if (legacy.startsWith(path.resolve(LEGACY_UPLOAD_DIR) + path.sep) && fs.existsSync(legacy)) return legacy
+  return null
 }
 
 // ─── GET /app-versions — List all app versions ──────────────────────────────
@@ -225,7 +243,10 @@ app.get('/:id/download', async (c) => {
       return c.json({ success: false, error: 'File not found' }, 404)
     }
 
-    const filePath = path.join(UPLOAD_DIR, appVersion.fileStorageKey)
+    const filePath = resolveBinaryPath(appVersion.fileStorageKey)
+    if (!filePath) {
+      return c.json({ success: false, error: 'File not found' }, 404)
+    }
     if (!fs.existsSync(filePath)) {
       return c.json({ success: false, error: 'File not found on disk' }, 404)
     }
@@ -326,8 +347,8 @@ app.delete('/:id', async (c) => {
 
     // Clean up file if it exists
     if (existing.fileStorageKey) {
-      const filePath = path.join(UPLOAD_DIR, existing.fileStorageKey)
-      if (fs.existsSync(filePath)) {
+      const filePath = resolveBinaryPath(existing.fileStorageKey)
+      if (filePath && fs.existsSync(filePath)) {
         fs.unlinkSync(filePath)
       }
     }

@@ -92,6 +92,9 @@ export const rateReservationSchema = z.object({
 
 // ─── Agency ──────────────────────────────────────────────────────────────────
 
+/** Round 15 — shared working-days CSV validation (0=Sunday … 6=Saturday). */
+export const workingDaysRegex = /^([0-6])(,[0-6])*$/
+
 export const updateAgencyProfileSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   nameAr: z.string().optional(),
@@ -103,6 +106,12 @@ export const updateAgencyProfileSchema = z.object({
   phone: z.string().max(20).optional(),
   category: z.string().optional(),
   website: z.string().url().optional().or(z.literal('')),
+  logoUrl: z.string().max(2048).optional(),
+  coverUrl: z.string().max(2048).optional(),
+  workingHoursStart: z.string().optional(),
+  workingHoursEnd: z.string().optional(),
+  /// CSV of weekday numbers 0=Sunday…6=Saturday, e.g. "0,1,2,3,4"
+  workingDays: z.string().regex(workingDaysRegex, 'workingDays must be a comma-separated list of weekday numbers 0-6').optional(),
 })
 
 export const updateAgencySettingsSchema = z.object({
@@ -169,6 +178,17 @@ export const adminCreateAgencySchema = z.object({
   customCode: z.string().min(2).max(10).optional(),
   workingHoursStart: z.string().optional(),
   workingHoursEnd: z.string().optional(),
+  /// Round 15 — CSV of weekday numbers 0=Sunday…6=Saturday (default Mon–Fri).
+  workingDays: z.string().regex(workingDaysRegex, 'workingDays must be a comma-separated list of weekday numbers 0-6').optional(),
+  /// Round 15 — services created together with the agency (atomic onboarding).
+  services: z.array(z.object({
+    name: z.string().min(1).max(100),
+    nameAr: z.string().max(100).optional(),
+    nameFr: z.string().max(100).optional(),
+    description: z.string().max(500).optional(),
+    /// Single uppercase letter A–Z (auto-assigned when omitted).
+    prefix: z.string().regex(/^[A-Z]$/, 'prefix must be a single uppercase letter A-Z').optional(),
+  })).max(20).optional(),
 })
 
 export const adminUpdateAgencySchema = z.object({
@@ -330,6 +350,8 @@ export const updateWorkingHoursSchema = z.object({
   agencyId: z.string().min(1, 'Agency ID is required'),
   workingHoursStart: z.string().regex(timeFormatRegex, 'Invalid time format. Use HH:MM').optional(),
   workingHoursEnd: z.string().regex(timeFormatRegex, 'Invalid time format. Use HH:MM').optional(),
+  /// Round 15 — CSV of weekday numbers 0=Sunday…6=Saturday.
+  workingDays: z.string().regex(workingDaysRegex, 'workingDays must be a comma-separated list of weekday numbers 0-6').optional(),
 })
 
 // ─── Device Registration ────────────────────────────────────────────────────

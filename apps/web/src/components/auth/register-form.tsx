@@ -144,91 +144,149 @@ function isValidEmail(email: string): boolean {
   return EMAIL_REGEX.test(email);
 }
 
-// ─── Task 23: preset profile icons ──────────────────────────────────────────
-// Twelve brand-styled avatar icons built as compact SVG data URIs. They are
-// stored directly in `avatarUrl`, so they pass the server's z.string().url()
-// validation, render in every existing <img> (web, desktop static export,
-// mobile) with zero component changes, work offline, and stay small enough
-// for the JWT payload — no upload step needed for users who don't want to
-// upload a photo.
+// ─── Task 24: preset profile icons — PEOPLE avatars ─────────────────────────
+// Twelve ready-made "person" avatars (head-and-shoulders busts with varied
+// hairstyles, skin tones, clothing and accessories) built as compact SVG data
+// URIs. They are stored directly in `avatarUrl`, so they pass the server's
+// z.string().url() validation, render in every existing <img> (web, desktop
+// static export, mobile) with zero component changes, work offline, and stay
+// small enough for the JWT payload — no upload step needed for users who
+// don't want to upload a photo. (Task 23 shipped object glyphs; users asked
+// for people-style icons, so the whole set is illustrated people now.)
 
-type PresetSpec = { from: string; to: string; glyph: string };
+type PersonSpec = {
+  /** Background gradient stops */
+  from: string;
+  to: string;
+  /** Skin tone */
+  skin: string;
+  /** Hair colour */
+  hair: string;
+  /** Clothing colour */
+  cloth: string;
+  /** Optional SVG drawn behind the torso (long hair, hijab hood, afro…) */
+  back?: string;
+  /** Optional fringe / top hair drawn over the head */
+  top?: string;
+  /** Optional extras drawn after the hair (beard, glasses, clip…) */
+  extra?: string;
+};
 
-function buildPresetDataUri({ from, to, glyph }: PresetSpec): string {
+/** Shared face: two eyes + a warm smile. */
+const PERSON_FACE =
+  '<circle cx="43.5" cy="43.5" r="1.9" fill="#263238"/>' +
+  '<circle cx="56.5" cy="43.5" r="1.9" fill="#263238"/>' +
+  '<path d="M44.5 50.5c1.5 1.9 3.4 2.8 5.5 2.8s4-.9 5.5-2.8" fill="none" stroke="#263238" stroke-width="1.8" stroke-linecap="round"/>';
+
+/** Short-hair crescent fringe (sits on the upper half of the head). */
+function fringe(color: string): string {
+  return `<path d="M33 44c0-10.5 7.6-18 17-18s17 7.5 17 18c-2.3-7.2-8.5-11.2-17-11.2S35.3 36.8 33 44z" fill="${color}"/>`;
+}
+
+/** Round glasses (white wire frames with a bridge). */
+function glasses(): string {
+  return (
+    '<circle cx="43.5" cy="44" r="5.6" fill="none" stroke="#ffffff" stroke-width="1.9"/>' +
+    '<circle cx="56.5" cy="44" r="5.6" fill="none" stroke="#ffffff" stroke-width="1.9"/>' +
+    '<path d="M49.1 44h1.8" stroke="#ffffff" stroke-width="1.9"/>'
+  );
+}
+
+function buildPersonDataUri(s: PersonSpec): string {
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">` +
     `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">` +
-    `<stop offset="0" stop-color="${from}"/><stop offset="1" stop-color="${to}"/>` +
+    `<stop offset="0" stop-color="${s.from}"/><stop offset="1" stop-color="${s.to}"/>` +
     `</linearGradient></defs>` +
-    `<rect width="100" height="100" fill="url(#g)"/>${glyph}</svg>`;
+    `<rect width="100" height="100" fill="url(#g)"/>` +
+    (s.back || '') +
+    // Torso — fills from the shoulders to the bottom edge.
+    `<path d="M16 100c0-17 15-26.5 34-26.5s34 9.5 34 26.5z" fill="${s.cloth}"/>` +
+    // Neck + head.
+    `<rect x="43.5" y="55" width="13" height="14" rx="5.5" fill="${s.skin}"/>` +
+    `<circle cx="50" cy="42" r="17" fill="${s.skin}"/>` +
+    (s.top || '') +
+    (s.extra || '') +
+    PERSON_FACE +
+    `</svg>`;
   // encodeURIComponent keeps the data URI valid inside an src attribute.
   return 'data:image/svg+xml,' + encodeURIComponent(svg);
 }
 
-const PRESET_AVATAR_SPECS: PresetSpec[] = [
-  // 1 — person silhouette (brand emerald)
+const PRESET_PEOPLE: PersonSpec[] = [
+  // 1 — short dark hair + beard (man)
   {
-    from: '#10b981', to: '#059669',
-    glyph: '<circle cx="50" cy="36" r="15" fill="#fff"/><path d="M20 84c0-17 13-27 30-27s30 10 30 27v1H20z" fill="#fff"/>',
+    from: '#10b981', to: '#059669', skin: '#f6cfa8', hair: '#3a2e2a', cloth: '#065f46',
+    top: fringe('#3a2e2a'),
+    extra: '<path d="M34.5 45c0 11 6.5 17.5 15.5 17.5S65.5 56 65.5 45c-1.6 8.6-6.9 13-15.5 13S36.1 53.6 34.5 45z" fill="#3a2e2a"/>',
   },
-  // 2 — briefcase (agencies)
+  // 2 — long dark hair (woman)
   {
-    from: '#14b8a6', to: '#0f766e',
-    glyph: '<rect x="22" y="36" width="56" height="38" rx="7" fill="#fff"/><path d="M40 36v-7a7 7 0 0 1 7-7h6a7 7 0 0 1 7 7v7" fill="none" stroke="#fff" stroke-width="5"/><rect x="45" y="49" width="10" height="9" rx="2" fill="url(#g)"/>',
+    from: '#f43f5e', to: '#e11d48', skin: '#e8b088', hair: '#47281f', cloth: '#9f1239',
+    back: '<path d="M30 44c0-13 8.7-22.5 20-22.5S70 31 70 44v30h-40z" fill="#47281f"/>',
+    top: fringe('#47281f'),
   },
-  // 3 — star
+  // 3 — curly hair + glasses (man)
   {
-    from: '#f59e0b', to: '#d97706',
-    glyph: '<path d="M50 18l9 18.2 20 2.9-14.5 14.1 3.4 20L50 63.8 32.1 73.2l3.4-20L21 39.1l20-2.9z" fill="#fff"/>',
+    from: '#f59e0b', to: '#d97706', skin: '#a8734b', hair: '#241b16', cloth: '#b45309',
+    top: '<path d="M32.5 44c-1.5-13 6.5-21 17.5-21s19 8 17.5 21c-1.2-4.4-4.4-6.6-8-5.6-1.2-3.4-4.4-5.4-9.5-5.4-4.4 0-7.6 1.6-9.2 4.4-4.6-.6-7.1 2.4-8.3 6.6z" fill="#241b16"/>',
+    extra: glasses(),
   },
-  // 4 — heart
+  // 4 — hair bun (woman)
   {
-    from: '#f43f5e', to: '#e11d48',
-    glyph: '<path d="M50 80C27 64 18 52 18 40a16 16 0 0 1 29-9l3 4 3-4a16 16 0 0 1 29 9c0 12-9 24-32 40z" fill="#fff"/>',
+    from: '#8b5cf6', to: '#7c3aed', skin: '#f6cfa8', hair: '#2e2320', cloth: '#6d28d9',
+    top: fringe('#2e2320') + '<circle cx="50" cy="19.5" r="6.8" fill="#2e2320"/>',
   },
-  // 5 — lightning bolt
+  // 5 — spiky hair (boy)
   {
-    from: '#f97316', to: '#ea580c',
-    glyph: '<path d="M57 16L28 56h17l-5 28 32-42H54z" fill="#fff"/>',
+    from: '#14b8a6', to: '#0f766e', skin: '#f6cfa8', hair: '#4a312c', cloth: '#0f766e',
+    top: '<path d="M34 42l3-9 5.5 6L50 30l7.5 9 5.5-6 3 9c-3-7.5-8.7-11.2-16-11.2S37 34.5 34 42z" fill="#4a312c"/>',
   },
-  // 6 — sprout
+  // 6 — pigtails (girl)
   {
-    from: '#84cc16', to: '#65a30d',
-    glyph: '<path d="M50 84V46" stroke="#fff" stroke-width="6" stroke-linecap="round"/><path d="M50 50C50 34 38 25 20 23c2 17 12 26 30 27z" fill="#fff"/><path d="M50 62c0-13 10-20 26-22-2 13-11 20-26 22z" fill="#fff"/>',
+    from: '#06b6d4', to: '#0891b2', skin: '#e8b088', hair: '#3a2e2a', cloth: '#0e7490',
+    back: '<circle cx="27" cy="47" r="7.5" fill="#3a2e2a"/><circle cx="73" cy="47" r="7.5" fill="#3a2e2a"/>',
+    top: fringe('#3a2e2a'),
   },
-  // 7 — smiley
+  // 7 — bald + full beard (man)
   {
-    from: '#06b6d4', to: '#0891b2',
-    glyph: '<circle cx="50" cy="50" r="27" fill="none" stroke="#fff" stroke-width="6"/><circle cx="40" cy="43" r="4" fill="#fff"/><circle cx="60" cy="43" r="4" fill="#fff"/><path d="M37 58c3.5 6 8 8.5 13 8.5s9.5-2.5 13-8.5" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round"/>',
+    from: '#f97316', to: '#ea580c', skin: '#c98850', hair: '#4a312c', cloth: '#c2410c',
+    extra: '<path d="M34 45.5c0 11.5 6.7 18 16 18s16-6.5 16-18c-1.8 9.2-7.2 13.8-16 13.8S35.8 54.7 34 45.5z" fill="#4a312c"/>',
   },
-  // 8 — football
+  // 8 — hijab (woman)
   {
-    from: '#22c55e', to: '#16a34a',
-    glyph: '<circle cx="50" cy="50" r="26" fill="none" stroke="#fff" stroke-width="6"/><path d="M50 36l11 8-4.2 13H43.2L39 44z" fill="#fff"/><path d="M50 24v12M61 44l12-4M57 57l7 10M43 57l-7 10M39 44l-12-4" stroke="#fff" stroke-width="4"/>',
+    from: '#d946ef', to: '#c026d3', skin: '#e8b088', hair: '#86198f', cloth: '#86198f',
+    back: '<path d="M50 17.5c-13.8 0-21.5 9.8-21.5 23.5 0 7.2 2.6 13.4 6.3 17.5h30.4c3.7-4.1 6.3-10.3 6.3-17.5 0-13.7-7.7-23.5-21.5-23.5z" fill="#86198f"/>',
+    extra: '<path d="M36.5 56h27c-2.6 3.6-7.3 5.8-13.5 5.8S39.1 59.6 36.5 56z" fill="#86198f"/>',
   },
-  // 9 — camera
+  // 9 — grey hair + glasses (elder man)
   {
-    from: '#8b5cf6', to: '#7c3aed',
-    glyph: '<rect x="22" y="32" width="56" height="40" rx="7" fill="#fff"/><path d="M38 32l4-7h16l4 7z" fill="#fff"/><circle cx="50" cy="52" r="11" fill="url(#g)"/><circle cx="50" cy="52" r="5.5" fill="#fff"/>',
+    from: '#64748b', to: '#475569', skin: '#f6cfa8', hair: '#cbd5e1', cloth: '#334155',
+    top: fringe('#cbd5e1'),
+    extra: glasses(),
   },
-  // 10 — crown
+  // 10 — bob cut (woman)
   {
-    from: '#d946ef', to: '#c026d3',
-    glyph: '<path d="M20 72l-6-34 19 13 17-23 17 23 19-13-6 34z" fill="#fff"/><rect x="20" y="74" width="60" height="7" rx="3" fill="#fff"/>',
+    from: '#84cc16', to: '#65a30d', skin: '#a8734b', hair: '#1f1a17', cloth: '#4d7c0f',
+    back: '<path d="M31 45c0-13.5 8.3-23 19-23s19 9.5 19 23v9.5c0 2.5-1 4.5-2.5 6h-33c-1.5-1.5-2.5-3.5-2.5-6z" fill="#1f1a17"/>',
+    top: fringe('#1f1a17'),
   },
-  // 11 — music note
+  // 11 — afro (man)
   {
-    from: '#ef4444', to: '#dc2626',
-    glyph: '<circle cx="39" cy="70" r="9" fill="#fff"/><circle cx="65" cy="63" r="9" fill="#fff"/><path d="M46 68V26l28-7v42" fill="none" stroke="#fff" stroke-width="6" stroke-linejoin="round"/>',
+    from: '#ef4444', to: '#dc2626', skin: '#7c4a32', hair: '#17110d', cloth: '#991b1b',
+    back: '<circle cx="50" cy="31" r="15.5" fill="#17110d"/>',
+    top: '<path d="M33.5 42c1.5-8 7-12.5 16.5-12.5S65 34 66.5 42c-2.6-5.6-8.2-8.4-16.5-8.4S36.1 36.4 33.5 42z" fill="#17110d"/>',
   },
-  // 12 — shield
+  // 12 — long hair + golden clip (woman)
   {
-    from: '#64748b', to: '#475569',
-    glyph: '<path d="M50 16l26 9v22c0 17-11 30-26 37-15-7-26-20-26-37V25z" fill="#fff"/><path d="M39 50l8 8 15-16" fill="none" stroke="url(#g)" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>',
+    from: '#22c55e', to: '#16a34a', skin: '#f6cfa8', hair: '#6b4423', cloth: '#15803d',
+    back: '<path d="M30 44c0-13 8.7-22.5 20-22.5S70 31 70 44v30h-40z" fill="#6b4423"/>',
+    top: fringe('#6b4423'),
+    extra: '<rect x="59.5" y="28.5" width="9" height="4.6" rx="2.3" fill="#fbbf24" transform="rotate(-18 64 30.8)"/>',
   },
 ];
 
-const PRESET_AVATARS: string[] = PRESET_AVATAR_SPECS.map(buildPresetDataUri);
+const PRESET_AVATARS: string[] = PRESET_PEOPLE.map(buildPersonDataUri);
 
 // ─── Task 23: local bilingual UI copy for the new register UI ───────────────
 // (global i18n dictionaries intentionally untouched — same pattern as
@@ -240,8 +298,8 @@ const REGISTER_UI_COPY = {
     optional: 'اختياري',
     uploadPhoto: 'تحميل صورة',
     changePhoto: 'تغيير الصورة',
-    orPickIcon: 'أو اختر أيقونة جاهزة:',
-    pickIconAria: 'اختيار الأيقونة',
+    orPickIcon: 'أو اختر صورة شخصية جاهزة:',
+    pickIconAria: 'اختيار الصورة الشخصية',
     sizeHint: 'حتى 2 ميغابايت · JPG · PNG · GIF · WEBP',
     brandTaglineAgency: 'إدارة الطوابير ببساطة',
     brandTaglineCustomer: 'طابورك في جيبك',
@@ -266,8 +324,8 @@ const REGISTER_UI_COPY = {
     optional: 'Optional',
     uploadPhoto: 'Upload a photo',
     changePhoto: 'Change photo',
-    orPickIcon: 'Or pick a ready-made icon:',
-    pickIconAria: 'Pick icon',
+    orPickIcon: 'Or pick a ready-made avatar:',
+    pickIconAria: 'Pick avatar',
     sizeHint: 'Up to 2MB · JPG · PNG · GIF · WEBP',
     brandTaglineAgency: 'Queue management, simplified',
     brandTaglineCustomer: 'Your queue, in your pocket',
@@ -364,7 +422,7 @@ function useUsernameAvailability(username: string) {
 }
 
 export function RegisterForm() {
-  const { setUser, setView, goBack, onboarded, setOnboarded, setSessionToken } = useAppStore();
+  const { setUser, setView, goBack, setSessionToken } = useAppStore();
   const { t, lang } = useLanguage();
   // The desktop app serves agencies only → register as an agency account there.
   const { platform } = usePlatform();
@@ -381,7 +439,6 @@ export function RegisterForm() {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [phoneNumber, setPhoneNumber] = useState('');
   const [role, setRole] = useState<UserRole>(isDesktopNative ? 'AGENCY_OWNER' : 'CUSTOMER');
-  const [agencyCode, setAgencyCode] = useState('');
   const [adminCode, setAdminCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
@@ -422,9 +479,11 @@ export function RegisterForm() {
       if (error !== 'Upload cancelled') {
         toast.error(error);
       }
-      if (!selectedPreset) {
-        setAvatarPreview(null);
-      }
+      // Round 15: KEEP the local object-URL preview when an upload fails —
+      // clearing it here is what made the chosen photo "never show in the
+      // preview" whenever the (previously cloud-only) upload errored. The
+      // user still sees their picked photo; the toast explains the failure
+      // and avatarValue simply omits the avatar unless the upload succeeds.
     },
   });
 
@@ -568,9 +627,10 @@ export function RegisterForm() {
       if (phoneNumber.trim()) {
         body.phoneNumber = phoneNumber.trim();
       }
-      if (agencyCode.trim() && role === 'AGENCY_OWNER') {
-        body.agencyCode = agencyCode.trim().toUpperCase();
-      }
+      // NOTE: no agency code here BY DESIGN — the agency (and its code) is
+      // chosen ONLY in the create-agency wizard after registration. An extra
+      // code field here made users think they were reserving their code at
+      // sign-up, then the wizard rejected the same code as "already used".
       // Task 23: uploaded photo URL OR the picked preset icon (data URI)
       if (avatarValue) { body.avatarUrl = avatarValue; }
 
@@ -611,11 +671,11 @@ export function RegisterForm() {
 
         setRegistrationSuccess(true);
         toast.success(t('registerSuccess'));
-        if (data.isNewUser && !onboarded) {
-          setTimeout(() => {
-            window.dispatchEvent(new CustomEvent('blasti:show-onboarding', { detail: data.user }));
-          }, 300);
-        }
+        // NOTE: the onboarding wizard is intentionally NOT fired here.
+        // It must appear when the user enters the dashboard for the first
+        // time AFTER creating their agency (see page.tsx trigger, gated on
+        // user.agencyId) — previously it popped over the create-agency form
+        // 300ms after registration, which buried the agency wizard.
       } else {
         // Map API errors to field errors
         if (data.error?.includes('Username')) {
@@ -640,7 +700,7 @@ export function RegisterForm() {
   // Reuses THIS form's own register success path: setUser → setSessionToken
   // (store: persistence + electronAPI.setCloudSyncAuth → blasti-auth.json +
   // sync engine auth + electronAPI.setLocalApiSession + local API token key)
-  // → native session token → success animation → onboarding event.
+  // → native session token → success animation.
   const handleVerificationSuccess = (result: VerificationSuccess) => {
     setUser(result.user as any);
     setSessionToken(result.token);
@@ -648,11 +708,9 @@ export function RegisterForm() {
     setRegistrationSuccess(true);
     setVerificationData(null);
     toast.success(t('registerSuccess'));
-    if (!onboarded) {
-      setTimeout(() => {
-        window.dispatchEvent(new CustomEvent('blasti:show-onboarding', { detail: result.user }));
-      }, 300);
-    }
+    // NOTE: onboarding is NOT dispatched here — it is gated on the user
+    // having an agency and fires on first dashboard entry after agency
+    // creation (page.tsx).
   };
 
   // Verification token expired/invalid → back to the login view (a fresh
@@ -1398,22 +1456,6 @@ export function RegisterForm() {
                               </AnimatePresence>
                             </div>
 
-                            {/* Agency code (for owner only) */}
-                            {role === 'AGENCY_OWNER' && (
-                              <div className="lg:col-span-2">
-                                <FloatingInput
-                                  id="reg-agency-code"
-                                  label={t('agencyCodeField')}
-                                  value={agencyCode}
-                                  onChange={(e) => setAgencyCode(e.target.value)}
-                                  onFocus={() => setFocusedField('agency-code')}
-                                  onBlur={() => setFocusedField(null)}
-                                  placeholder={t('agencyCodePlaceholder')}
-                                  dir="ltr"
-                                  focusedField={focusedField}
-                                />
-                              </div>
-                            )}
                           </div>
                         )}
 

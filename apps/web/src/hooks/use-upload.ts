@@ -16,8 +16,9 @@ export interface UploadState {
   url: string | null;
   /** The filename of the uploaded file */
   filename: string | null;
-  /** Storage provider used */
-  provider: 'local' | null;
+  /** Storage provider used — 'local-device' = stored on the desktop's own
+   * file store and mirrored to the cloud by the file-sync worker (Round 15). */
+  provider: 'local' | 'local-device' | null;
   /** Error message if upload failed */
   error: string | null;
 }
@@ -32,7 +33,7 @@ export interface UseUploadOptions {
   /** Whether to auto-clear error on new upload (default: true) */
   autoClearError?: boolean;
   /** Callback on successful upload */
-  onSuccess?: (result: { url: string; filename: string; provider: 'local'; size: number }) => void;
+  onSuccess?: (result: { url: string; filename: string; provider: 'local' | 'local-device'; size: number }) => void;
   /** Callback on upload error */
   onError?: (error: string) => void;
 }
@@ -167,6 +168,10 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
       try {
         const formData = new FormData();
         formData.append('file', file);
+        // Task 24 FIX: also declare the type as a FORM FIELD. The cloud route
+        // reads `formData.get('type')` first; older cloud builds read ONLY the
+        // form field, so sending both keeps every deployment working.
+        formData.append('type', type);
 
         // Add metadata if provided
         if (metadata) {
@@ -199,10 +204,12 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
           throw new Error(data?.error || `Upload failed with status ${res.status}`);
         }
 
-        const result = {
+        const result: { url: string; filename: string; provider: 'local' | 'local-device'; size: number } = {
           url: data.url,
           filename: data.filename || file.name,
-          provider: 'local',
+          // The desktop local API answers provider 'local-device' (local-first
+          // storage + background cloud sync); the cloud answers 'local'.
+          provider: data.provider === 'local-device' ? 'local-device' : 'local',
           size: file.size,
         };
 

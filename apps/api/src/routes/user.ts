@@ -4,6 +4,7 @@ import { requireAuth, authErrorResponse } from '../lib/auth'
 import { validateBody, updateProfileSchema, updatePreferencesSchema, changePasswordSchema } from '../lib/validations'
 import { hashPassword, verifyPassword } from '../lib/password'
 import { checkRateLimit, RateLimitError, PASSWORD_RESET_RATE_LIMIT } from '../lib/rate-limit'
+import { normalizeRecordFileUrls } from '../lib/file-url'
 
 const app = new Hono()
 
@@ -50,7 +51,11 @@ app.patch('/profile', async (c) => {
     }
     if (reminderMinutes !== undefined) updateData.reminderMinutes = Number(reminderMinutes)
     if (smsNotificationsEnabled !== undefined) updateData.smsNotificationsEnabled = Boolean(smsNotificationsEnabled)
-    if (avatarUrl !== undefined) updateData.avatarUrl = avatarUrl
+    if (avatarUrl !== undefined) {
+      // Round 15 — rewrite desktop-local/relative file URLs to cloud URLs.
+      const fileBase = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '') || new URL(c.req.url).origin
+      updateData.avatarUrl = normalizeRecordFileUrls({ avatarUrl }, fileBase).avatarUrl
+    }
     if (fullName !== undefined) updateData.fullName = fullName
     if (notificationPref !== undefined) updateData.notificationPref = notificationPref
     if (language !== undefined) updateData.language = language

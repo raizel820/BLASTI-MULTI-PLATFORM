@@ -54,6 +54,7 @@ import { paymentSettingsRoutes } from './routes/payment-settings'
 import { qrRoutes } from './routes/qr'
 import { transactionRoutes } from './routes/transactions'
 import { uploadRoutes } from './routes/upload'
+import { filesSyncRoutes } from './routes/files-sync'
 import { syncRoutes } from './routes/sync'
 import { settingsRoutes } from './routes/settings'
 import { paymentWebhookRoutes } from './routes/payment-webhook'
@@ -76,6 +77,11 @@ import { startNotificationWorker, stopNotificationWorker } from './workers/notif
 
 const PORT = parseInt(process.env.API_PORT || '3003', 10)
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*'
+// Round 17 — bind address. 0.0.0.0 (default) makes the API reachable from
+// other devices on the LAN — a PHONE browser opening http://<pc-ip>:3000
+// talks to the API directly on http://<pc-ip>:3003 (REST + WebSocket).
+// Set HOST=127.0.0.1 to loop back only (e.g. behind a local reverse proxy).
+const HOST = process.env.HOST || '0.0.0.0'
 
 // Phase 1a: Internal secret for securing /emit and /emit-batch endpoints
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET || ''
@@ -374,6 +380,8 @@ app.route('/api/payment-settings', paymentSettingsRoutes)
 app.route('/api/qr', qrRoutes)
 app.route('/api/transactions', transactionRoutes)
 app.route('/api/upload', uploadRoutes)
+// Round 15 — desktop file-sync family (push/pull/blob/tombstone).
+app.route('/api/files/sync', filesSyncRoutes)
 app.route('/api/sync', syncRoutes)
 // Stage-based initial import (POST /api/sync/initial-data) — mounted under the
 // same prefix as the incremental pull/push surface.
@@ -723,6 +731,24 @@ const STRICT_ALLOWED_ORIGINS = new Set([
 
 const isDevelopment = process.env.NODE_ENV !== 'production'
 
+/**
+ * Round 17 — True for private-network hosts (LAN IPs, mDNS .local names,
+ * bare Windows machine hostnames). A phone browser opening the webapp via
+ * http://<pc-ip>:3000 presents such an Origin; allowing it here (dev or when
+ * CORS_ORIGIN='*') keeps realtime WebSocket upgrades working from mobile
+ * devices. JWT auth still guards every join — this only opens the handshake.
+ */
+function isPrivateLanHost(host: string): boolean {
+  if (/^10\./.test(host)) return true
+  if (/^192\.168\./.test(host)) return true
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true
+  if (host.endsWith('.local')) return true
+  // Bare single-label hostname (e.g. http://DESKTOP-ABC:3000) — if the page
+  // resolved it, the API host resolves identically on the same network.
+  if (!host.includes('.') && host !== 'localhost') return true
+  return false
+}
+
 function isOriginAllowed(origin: string | undefined): boolean {
   if (!origin) {
     // Electron desktop clients may drop the origin header.
@@ -736,12 +762,14 @@ function isOriginAllowed(origin: string | undefined): boolean {
   // from the platform preview domains (https://preview-chat-*.space-z.ai)
   // and from the local gateway port (http://localhost:81). Production
   // deployments keep the strict exact-match behavior above.
-  if (isDevelopment) {
+  if (isDevelopment || CORS_ORIGIN === '*') {
     try {
       const u = new URL(origin)
       const host = u.hostname
       if (host === 'localhost' || host === '127.0.0.1') return true
       if (host.endsWith('.space-z.ai')) return true
+      // Phone/LAN browser on the same Wi-Fi as the dev machine.
+      if (isPrivateLanHost(host)) return true
     } catch {
       // malformed Origin header → reject below
     }
@@ -867,8 +895,11 @@ io.on('connection', async (socket) => {
   // and don't need carrier (SMS/WhatsApp) alerts anymore.
   if (isAuthenticated && authUser) {
     try {
-      // Mark user as online in the database
-      await db.user.update({ where: { id: authUser.id }, data: { isAppOnline: true } })
+      // Mark user as online in the database. updateMany (not update): a
+      // stateless JWT can name a user this cloud DB does not know (e.g. an
+      // offline-issued desktop token) — update() threw P2025 on every
+      // connect; updateMany silently matches zero rows instead.
+      await db.user.updateMany({ where: { id: authUser.id }, data: { isAppOnline: true } })
 
       // Cancel any pending delayed alerts for this user's active reservations
       const activeReservations = await db.reservation.findMany({
@@ -1099,7 +1130,8 @@ io.on('connection', async (socket) => {
     const disconnectUser = (socket as any)._authUser as SessionToken | null
     if (disconnectUser) {
       try {
-        await db.user.update({ where: { id: disconnectUser.id }, data: { isAppOnline: false } })
+        // updateMany — same ghost-token tolerance as the connect handler.
+        await db.user.updateMany({ where: { id: disconnectUser.id }, data: { isAppOnline: false } })
       } catch (error) {
         console.error('[socket] Error marking user offline on disconnect:', error)
       }
@@ -1139,13 +1171,26 @@ io.on('connection', async (socket) => {
   })
 })
 
-httpServer.listen(PORT, '127.0.0.1', async () => {
+httpServer.listen(PORT, HOST, async () => {
   // Phase 3b: Set SQLite busy_timeout PRAGMA on startup
   await setupSQLitePragmas()
   console.log(`🚀 @blasti/api server running on port ${PORT} (bootId: ${BOOT_ID.substring(0, 8)}…)`)
-  console.log(`   API:    http://localhost:${PORT}/`)
+  console.log(`   API:    http://localhost:${PORT}/ (bound to ${HOST})`)
   console.log(`   Health: http://localhost:${PORT}/health`)
   console.log(`   Routes: http://localhost:${PORT}/api/*`)
+  if (HOST === '0.0.0.0') {
+    // Show the LAN addresses other devices (phone) can use.
+    const os = await import('os')
+    const lanIps: string[] = []
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const iface of list || []) {
+        if (iface.family === 'IPv4' && !iface.internal) lanIps.push(iface.address)
+      }
+    }
+    if (lanIps.length > 0) {
+      console.log(`   📱 LAN:  ${lanIps.map((ip) => `http://${ip}:${PORT}/`).join('  ')}`)
+    }
+  }
   // P0-2: the sync route table is logged at boot — if a future run shows the
   // desktop 404ing on /api/sync/pull, the ABSENCE of this line (or of the
   // pull route in it) proves the running process predates this file.

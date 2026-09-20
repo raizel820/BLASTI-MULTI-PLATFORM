@@ -274,9 +274,13 @@ export default function Home() {
     return () => window.removeEventListener('blasti:show-onboarding', handleShowOnboarding);
   }, []);
 
-  // Show onboarding for first-time logins (check localStorage key: blasti-show-onboarding)
+  // Show onboarding when the user enters the dashboard for the FIRST time
+  // WITH an agency — i.e. right after the agency-creation wizard completes
+  // (or on a later visit while the flag is still unset). It must NOT appear
+  // over the create-agency form itself, so the trigger is gated on
+  // user.agencyId being set.
   useEffect(() => {
-    if (user?.id && !onboarded) {
+    if (user?.id && user?.agencyId && !onboarded) {
       try {
         const dismissed = localStorage.getItem('blasti-show-onboarding');
         if (dismissed !== 'true') {
@@ -285,7 +289,7 @@ export default function Home() {
         }
       } catch { /* silent */ }
     }
-  }, [user?.id, onboarded]);
+  }, [user?.id, user?.agencyId, onboarded]);
 
   // Handle ?claim=TOKEN — auto-import walk-in reservation when QR is scanned externally
   useEffect(() => {

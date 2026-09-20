@@ -7,7 +7,7 @@
  *            Meta WhatsApp Cloud (WHATSAPP) per ProviderConfig extra.otpChannel.
  *
  * Dev bypass: when NODE_ENV !== 'production' (or VERIFICATION_DEV_BYPASS=true),
- * the hardcoded codes  SMS/WhatsApp → 1234   and   Email → 12345678
+ * the hardcoded codes  SMS/WhatsApp → 123456   and   Email → 12345678
  * are ALWAYS accepted without matching a stored row, and the send is
  * simulated when the provider is not configured (dev-simulate).
  *
@@ -41,11 +41,16 @@ const RESEND_COOLDOWN_SECONDS = 60
 const MAX_PER_HOUR = 6
 const MAX_ATTEMPTS = 5
 
-/** Hardcoded dev bypass codes (dev mode ONLY) */
+/**
+ * Hardcoded dev bypass codes (dev mode ONLY).
+ * Round 15: the SMS/WhatsApp code is now SIX digits (123456) so it matches the
+ * 6-box OTP input in the verification UI — previously it was 4 digits (1234),
+ * which looked wrong next to a 6-digit input cap.
+ */
 export const DEV_BYPASS_CODES = {
   EMAIL: '12345678',
-  SMS: '1234',
-  WHATSAPP: '1234',
+  SMS: '123456',
+  WHATSAPP: '123456',
 } as const
 
 function isDevMode(): boolean {

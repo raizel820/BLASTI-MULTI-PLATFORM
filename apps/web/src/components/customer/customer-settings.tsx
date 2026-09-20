@@ -225,6 +225,9 @@ export function CustomerSettings() {
       const formData = new FormData();
       formData.append('file', file);
       formData.append('userId', user.id);
+      // Task 24 FIX: declare the upload type as a form field too — the cloud
+      // route reads formData 'type' first and previously only saw 'general'.
+      formData.append('type', 'avatar');
       const res = await apiFetch('/api/upload?type=avatar', {
         method: 'POST',
         body: formData,

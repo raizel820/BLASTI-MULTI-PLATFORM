@@ -1,38 +1,43 @@
 import { Hono } from 'hono'
-import { randomUUID } from 'crypto'
 import path from 'path'
 import fs from 'fs'
-import { requireAuth, authErrorResponse } from '../lib/auth'
+import { requireAuth, getSessionUser, authErrorResponse } from '../lib/auth'
 import { enforceRateLimit, isRateLimitError, rateLimitErrorResponse, recordFailedRequest } from '../lib/rate-limit'
+import { createHash, randomUUID } from 'crypto'
+import {
+  STORAGE_TYPES,
+  SAFE_TYPE_RE,
+  SAFE_FILENAME_RE,
+  resolveStoredPath,
+  saveUpload,
+  makeFilename,
+  absoluteFileUrl,
+  publicFilePath,
+  storagePathFromUrl,
+} from '../lib/storage'
+import { db } from '@blasti/db'
 
 /**
- * Task 23: REAL file storage for the cloud API.
+ * Cloud file storage route (Round 15 refactor).
  *
- * History: this route was a placeholder that only echoed file metadata and
- * never stored anything — while the web app's use-upload hook expected a
- * `{ url }` response. Combined with the hook's raw relative XHR (which never
- * reached this service at all), profile-image upload at registration was
- * completely broken ("invalid response from the server").
+ * History: Task 23 turned this from an echo-placeholder into REAL disk
+ * storage; Task 24 fixed the type resolution (form field first, then the
+ * `?type=` query param every client sends). Round 15 moves the actual
+ * filing decisions into lib/storage.ts (organized <bucket>/<yyyy>/<mm>/
+ * layout, legacy flat fallback) and registers every upload in the FileAsset
+ * table so the desktop file-sync and the storage audit have one registry.
  *
- * Now: files are stored on local disk under <cwd>/uploads/<type>/ and served
- * back through GET /api/upload/file/:type/:name with an ABSOLUTE url so the
- * avatar renders on every client (web :3000, desktop static export, mobile)
- * regardless of its own origin.
+ * The response now carries BOTH the absolute `url` and the relative `path`
+ * (`/api/upload/file/<bucket>/<yyyy>/<mm>/<name>`), plus the storagePath.
  */
 const app = new Hono()
-
-// ─── Storage layout ─────────────────────────────────────────────────────────
-
-const STORAGE_ROOT = path.join(process.cwd(), 'uploads')
-
-/** Sub-directories accepted in the `type` form field (also URL segments). */
-const STORAGE_TYPES = new Set(['general', 'avatar', 'logo', 'receipt'])
 
 /** Per-type upload size limits (bytes). */
 const TYPE_MAX_BYTES: Record<string, number> = {
   avatar: 2 * 1024 * 1024,
   logo: 2 * 1024 * 1024,
   receipt: 5 * 1024 * 1024,
+  document: 10 * 1024 * 1024,
   general: 5 * 1024 * 1024,
 }
 
@@ -68,28 +73,25 @@ const MIME_BY_EXT: Record<string, string> = {
 
 const ALLOWED_EXTENSIONS = new Set(Object.keys(MIME_BY_EXT))
 
-/** Safe filename shape produced by this route: <timestamp>-<uuid8>.<ext> */
-const SAFE_FILENAME_RE = /^\d{13}-[a-f0-9]{8}\.[a-z0-9]{2,5}$/
-const SAFE_TYPE_RE = /^[a-z][a-z0-9-]{0,23}$/
-
-function resolveStoragePath(type: string, filename: string): string | null {
-  if (!SAFE_TYPE_RE.test(type) || !STORAGE_TYPES.has(type)) return null
-  if (!SAFE_FILENAME_RE.test(filename)) return null
-  const dir = path.join(STORAGE_ROOT, type)
-  const resolved = path.resolve(dir, filename)
-  // Defense in depth — the regexes above already forbid traversal segments.
-  if (!resolved.startsWith(path.resolve(STORAGE_ROOT) + path.sep)) return null
-  return resolved
+function mimeForFilename(name: string): string {
+  const ext = (name.split('.').pop() || '').toLowerCase()
+  return MIME_BY_EXT[ext] || 'application/octet-stream'
 }
 
-// ─── POST /api/upload — store a file (authenticated) ────────────────────────
+// ─── POST /api/upload — store a file ────────────────────────────────────────
 
 app.post('/', async (c) => {
   let clientIp: string | undefined
   try {
     const formData = await c.req.formData()
     const file = formData.get('file') as File | null
-    const rawType = ((formData.get('type') as string) || 'general').trim().toLowerCase()
+    // Task 24 fix (kept): the form field is authoritative when present, then
+    // the `?type=` query param (what every current client sends), then general.
+    const rawType = (
+      (formData.get('type') as string | null) ||
+      c.req.query('type') ||
+      'general'
+    ).trim().toLowerCase()
     const type = STORAGE_TYPES.has(rawType) && SAFE_TYPE_RE.test(rawType) ? rawType : 'general'
 
     if (!file || typeof file === 'string') {
@@ -104,13 +106,25 @@ app.post('/', async (c) => {
     // avatar path is public but hard-restricted: strict per-IP rate limit,
     // images-only whitelist (no SVG/PDF), 2MB cap, random filenames.
     // Every other upload type stays authenticated.
+    let ownerId: string | null = null
+    let agencyId: string | null = null
     if (type === 'avatar') {
       clientIp = enforceRateLimit(c, UPLOAD_RATE_LIMIT)
       if (!PUBLIC_AVATAR_EXTENSIONS.has(ext)) {
         return c.json({ success: false, error: `Invalid image type ".${ext}" — allowed: ${[...PUBLIC_AVATAR_EXTENSIONS].join(', ')}` }, 400)
       }
+      // Best-effort owner attribution — public path, so a missing session is fine.
+      try {
+        const maybeUser = await getSessionUser(c)
+        if (maybeUser) {
+          ownerId = maybeUser.id
+          agencyId = maybeUser.agencyId ?? null
+        }
+      } catch { /* anonymous */ }
     } else {
-      await requireAuth(c)
+      const user = await requireAuth(c)
+      ownerId = user.id
+      agencyId = user.agencyId ?? null
       if (!ALLOWED_EXTENSIONS.has(ext)) {
         return c.json({ success: false, error: `Invalid file type ".${ext}" — allowed: ${[...ALLOWED_EXTENSIONS].join(', ')}` }, 400)
       }
@@ -122,24 +136,47 @@ app.post('/', async (c) => {
     }
 
     // Never trust the client filename — generate an unguessable one.
-    const filename = `${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`
-    const dir = path.join(STORAGE_ROOT, type)
-    await fs.promises.mkdir(dir, { recursive: true })
+    const filename = makeFilename(ext)
     const buffer = Buffer.from(await file.arrayBuffer())
-    await fs.promises.writeFile(path.join(dir, filename), buffer)
+    const saved = await saveUpload(type, buffer, filename)
 
-    // Absolute URL (built from the request origin) so every client — web,
-    // desktop static export, mobile — can render the file regardless of its
-    // own origin.
+    const checksum = createHash('sha256').update(buffer).digest('hex')
     const origin = new URL(c.req.url).origin
-    const url = `${origin}/api/upload/file/${type}/${filename}`
+    const url = absoluteFileUrl(origin, type, saved.yyyy, saved.mm, filename)
+    const filePath = publicFilePath(type, saved.yyyy, saved.mm, filename)
+
+    // Register the file in the central FileAsset registry (best-effort —
+    // the blob is already durably stored; a registry failure must not 500
+    // a successful upload).
+    const deviceFileId = `srv-${randomUUID()}`
+    try {
+      await db.fileAsset.create({
+        data: {
+          deviceFileId,
+          bucket: type,
+          storagePath: saved.storagePath,
+          originalName: file.name.slice(0, 200),
+          mimeType: file.type || mimeForFilename(filename),
+          size: buffer.length,
+          checksum,
+          url,
+          ownerId,
+          agencyId,
+        },
+      })
+    } catch (regErr) {
+      console.warn('[upload] FileAsset registration failed:', (regErr as Error).message)
+    }
 
     return c.json({
       success: true,
       url,
+      path: filePath,
       filename,
+      storagePath: saved.storagePath,
+      deviceFileId,
       provider: 'local',
-      size: file.size,
+      size: buffer.length,
       type,
     })
   } catch (error: unknown) {
@@ -158,11 +195,46 @@ app.post('/', async (c) => {
 // Deliberately UNAUTHENTICATED: avatars/logos render through plain <img>
 // tags which cannot attach Authorization headers. Filenames are unguessable
 // (timestamp + random UUID slice), so the URLs act as capability links.
+// Two shapes are served:
+//   /file/<bucket>/<yyyy>/<mm>/<name>   (organized, Round 15+)
+//   /file/<bucket>/<name>               (legacy flat, pre-Round 15)
+
+function fileResponse(data: Buffer, name: string): Response {
+  return new Response(new Uint8Array(data), {
+    status: 200,
+    headers: {
+      'Content-Type': mimeForFilename(name),
+      'Content-Length': String(data.length),
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      'Content-Disposition': 'inline',
+    },
+  })
+}
+
+app.get('/file/:type/:yyyy/:mm/:name', async (c) => {
+  const type = c.req.param('type')
+  const yyyy = c.req.param('yyyy')
+  const mm = c.req.param('mm')
+  const name = c.req.param('name')
+  if (!SAFE_TYPE_RE.test(type) || !/^\d{4}$/.test(yyyy) || !/^(0[1-9]|1[0-2])$/.test(mm) || !SAFE_FILENAME_RE.test(name)) {
+    return c.json({ success: false, error: 'Invalid file path' }, 400)
+  }
+  const filePath = resolveStoredPath(type, `${yyyy}/${mm}/${name}`)
+  if (!filePath) {
+    return c.json({ success: false, error: 'Invalid file path' }, 400)
+  }
+  try {
+    const data = await fs.promises.readFile(filePath)
+    return fileResponse(data, name)
+  } catch {
+    return c.json({ success: false, error: 'File not found' }, 404)
+  }
+})
 
 app.get('/file/:type/:name', async (c) => {
   const type = c.req.param('type')
   const name = c.req.param('name')
-  const filePath = resolveStoragePath(type, name)
+  const filePath = resolveStoredPath(type, name)
 
   if (!filePath) {
     return c.json({ success: false, error: 'Invalid file path' }, 400)
@@ -170,17 +242,7 @@ app.get('/file/:type/:name', async (c) => {
 
   try {
     const data = await fs.promises.readFile(filePath)
-    const ext = (name.split('.').pop() || '').toLowerCase()
-    const mime = MIME_BY_EXT[ext] || 'application/octet-stream'
-    return new Response(new Uint8Array(data), {
-      status: 200,
-      headers: {
-        'Content-Type': mime,
-        'Content-Length': String(data.length),
-        'Cache-Control': 'public, max-age=31536000, immutable',
-        'Content-Disposition': 'inline',
-      },
-    })
+    return fileResponse(data, name)
   } catch {
     return c.json({ success: false, error: 'File not found' }, 404)
   }
@@ -198,19 +260,22 @@ app.delete('/', async (c) => {
       return c.json({ success: false, error: 'No URL provided' }, 400)
     }
 
-    // New canonical shape: …/api/upload/file/<type>/<name>
-    const match = url.match(/\/api\/upload\/file\/([a-z0-9-]+)\/([a-zA-Z0-9._-]+)$/)
-    if (match) {
-      const filePath = resolveStoragePath(match[1], match[2])
-      if (!filePath) {
-        return c.json({ success: false, error: 'Invalid file URL' }, 400)
-      }
+    // Canonical + legacy shapes — anything the URL parser recognizes.
+    const storagePath = storagePathFromUrl(url)
+    if (storagePath) {
+      const { deleteByStoragePath } = await import('../lib/storage')
+      const deleted = await deleteByStoragePath(storagePath)
+      // Tombstone + remove the registry row content reference (best-effort).
       try {
-        await fs.promises.unlink(filePath)
+        await db.fileAsset.updateMany({
+          where: { storagePath },
+          data: { deletedAt: new Date() },
+        })
+      } catch { /* registry is best-effort here */ }
+      if (deleted) {
         return c.json({ success: true, message: 'File deleted' })
-      } catch {
-        return c.json({ success: true, message: 'File not found — already deleted' })
       }
+      return c.json({ success: true, message: 'File not found — already deleted' })
     }
 
     // Legacy shape (pre-Task-23 /uploads/... paths pointing at the web app's

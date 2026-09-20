@@ -19,6 +19,7 @@ import { verifyPassword, hashPassword } from '../lib/password'
 import crypto from 'crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import { validateBody, loginSchema, registerSchema, forgotPasswordSchema, resetPasswordSchema } from '../lib/validations'
+import { normalizeRecordFileUrls } from '../lib/file-url'
 import {
   resolveVerificationStatus,
   issueAllPending,
@@ -438,7 +439,12 @@ app.post('/register', async (c) => {
       )
     }
 
-    const { username, fullName, password, email, phoneNumber, role, agencyCode, avatarUrl } = validation.data
+    const { username, fullName, password, email, phoneNumber, role, agencyCode } = validation.data
+    // Round 15 — the desktop local API returns LOCAL file URLs (offline-first
+    // upload); rewrite them to this API's public URLs so the stored avatar is
+    // reachable from every device once the file-sync push delivers the blob.
+    const fileBase = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '') || new URL(c.req.url).origin
+    const avatarUrl = normalizeRecordFileUrls({ avatarUrl: validation.data.avatarUrl }, fileBase).avatarUrl
 
     // Check for duplicate username
     const existingUser = await db.user.findUnique({
@@ -873,6 +879,67 @@ app.get('/session', async (c) => {
     })
   } catch {
     return c.json({})
+  }
+})
+
+/**
+ * POST /auth/refresh-session
+ *
+ * Re-issues the session token from the DATABASE's current view of the user.
+ * Round 16 (field deadlock): a session token is a SNAPSHOT — an AGENCY_OWNER
+ * that registered (or logged in) BEFORE creating their agency carries
+ * agencyId: '' until the token is re-issued. Agency creation used to leave
+ * every issued token stale, so the desktop sync engine kept seeing "no
+ * agency" and the workspace never initialized. This endpoint resolves the
+ * CURRENT role + agency ownership from the DB and returns a fresh token and
+ * user so clients can upgrade their session in place (also heals role
+ * changes, staff assignments and agencies created on another device).
+ */
+app.post('/refresh-session', async (c) => {
+  try {
+    const sessionUser = await getSessionUser(c)
+    if (!sessionUser) {
+      return c.json({ success: false, error: 'Authentication required' }, 401)
+    }
+
+    const dbUser = await db.user.findUnique({ where: { id: sessionUser.id } })
+    if (!dbUser) {
+      // A stateless JWT for an account that no longer exists (e.g. an
+      // offline-issued desktop token after a cloud DB reset) — force a
+      // clean re-login instead of perpetuating a ghost session.
+      return c.json({ success: false, error: 'Account not found — please sign in again' }, 401)
+    }
+
+    // Resolve the CURRENT agency: active staff membership first, then owned
+    // agency (mirrors sync.ts resolveTargetAgencyId).
+    const staffRecord = await db.agencyStaff.findFirst({
+      where: { userId: dbUser.id, isActive: true },
+      select: { agencyId: true },
+    })
+    let agencyId: string | null = staffRecord?.agencyId ?? null
+    if (!agencyId) {
+      const ownedAgency = await db.agency.findFirst({
+        where: { ownerId: dbUser.id },
+        select: { id: true },
+      })
+      agencyId = ownedAgency?.id ?? null
+    }
+
+    const freshUser: SessionUser = {
+      id: dbUser.id,
+      username: dbUser.username,
+      fullName: dbUser.fullName,
+      role: dbUser.role,
+      language: dbUser.language || 'ar',
+      avatarUrl: dbUser.avatarUrl ?? null,
+      agencyId,
+    }
+    const token = await createSessionToken(freshUser)
+    return c.json({ success: true, token, user: freshUser })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    console.error('[AUTH] refresh-session error:', error)
+    return c.json({ success: false, error: message }, 500)
   }
 })
 

@@ -73,7 +73,10 @@ async function checkApiHealth(): Promise<ApiHealthStatus> {
   try {
     const controller = new AbortController();
     // In Electron, use shorter timeout when cloud is known-down to fail fast
-    const timeout = isElectron && _consecutiveCloudFailures > 0 ? 1_500 : 3_000;
+    // Web: 5s — a plain GET /api/health against the local cloud API must
+    // never flap the whole UI to "offline" because the 6-connection HTTP/1.1
+    // pool was momentarily saturated by the analytics/notifications pollers.
+    const timeout = isElectron && _consecutiveCloudFailures > 0 ? 1_500 : 5_000;
     const timer = setTimeout(() => controller.abort(), timeout);
     // Probe the REAL cloud API — never the local API. On web the base is ''
     // (relative) so XTransformPort=3003 routes through the gateway to the
@@ -102,8 +105,14 @@ async function checkApiHealth(): Promise<ApiHealthStatus> {
       console.log(`[HealthCheck] CLOUD respond ${res.status} (not OK) — ${healthUrl}`);
     }
   } catch (err) {
-    _healthStatus.cloudReachable = false;
     _consecutiveCloudFailures++;
+    // Flap resistance: a single timeout/network hiccup must NOT flip the UI
+    // to "offline" — the API is demonstrably serving other requests around
+    // it (pool congestion while several pollers fire at once is the usual
+    // cause). Only report the cloud as down after 2 consecutive checks.
+    if (_consecutiveCloudFailures >= 2) {
+      _healthStatus.cloudReachable = false;
+    }
     console.log(`[HealthCheck] CLOUD FAIL (${_consecutiveCloudFailures} consecutive)`);
   }
 

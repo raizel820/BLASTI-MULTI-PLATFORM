@@ -89,6 +89,9 @@ CREATE TABLE "Agency" (
     "subscriptionStatus" TEXT NOT NULL DEFAULT 'INACTIVE',
     "workingHoursStart" TEXT NOT NULL DEFAULT '08:00',
     "workingHoursEnd" TEXT NOT NULL DEFAULT '17:00',
+    -- Round 15: working days CSV (0=Sunday … 6=Saturday) — rides with the
+    -- working hours through the v2 sync engine.
+    "workingDays" TEXT NOT NULL DEFAULT '1,2,3,4,5',
     "isQueueOpen" BOOLEAN NOT NULL DEFAULT true,
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "kioskModeEnabled" BOOLEAN NOT NULL DEFAULT false,
@@ -593,6 +596,44 @@ CREATE TABLE "UploadedFile" (
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- CreateTable
+-- Round 15: desktop file store registry — one row per locally stored file
+-- (blob lives under the local files dir; lib/file-sync.js mirrors it with the
+-- cloud FileAsset table). syncState: LOCAL_ONLY | DIRTY | SYNCED | DELETED.
+CREATE TABLE "FileAsset" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "deviceFileId" TEXT NOT NULL,
+    "bucket" TEXT NOT NULL,
+    "storagePath" TEXT NOT NULL,
+    "originalName" TEXT,
+    "mimeType" TEXT,
+    "size" INTEGER NOT NULL DEFAULT 0,
+    "checksum" TEXT,
+    "url" TEXT NOT NULL,
+    "ownerId" TEXT,
+    "agencyId" TEXT,
+    "syncState" TEXT NOT NULL DEFAULT 'LOCAL_ONLY',
+    "remoteFileId" TEXT,
+    "remoteUrl" TEXT,
+    "syncedAt" DATETIME,
+    "lastError" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL,
+    "deletedAt" DATETIME
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "FileAsset_deviceFileId_key" ON "FileAsset"("deviceFileId");
+
+-- CreateIndex
+CREATE INDEX "FileAsset_updatedAt_idx" ON "FileAsset"("updatedAt");
+
+-- CreateIndex
+CREATE INDEX "FileAsset_ownerId_idx" ON "FileAsset"("ownerId");
+
+-- CreateIndex
+CREATE INDEX "FileAsset_agencyId_idx" ON "FileAsset"("agencyId");
 
 -- CreateTable
 CREATE TABLE "DeletedRecord" (

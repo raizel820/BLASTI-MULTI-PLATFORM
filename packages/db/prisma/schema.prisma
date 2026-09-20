@@ -236,6 +236,9 @@ model Agency {
   subscriptionStatus    String          @default("INACTIVE")
   workingHoursStart     String          @default("08:00")
   workingHoursEnd       String          @default("17:00")
+  /// Round 15: working days as a CSV of weekday numbers (0=Sunday … 6=Saturday).
+  /// A plain string (not Json/array) so it syncs byte-exact through the v2 engine.
+  workingDays           String          @default("1,2,3,4,5")
   isQueueOpen           Boolean         @default(true)
   isActive              Boolean         @default(true)
   kioskModeEnabled      Boolean         @default(false)
@@ -1294,4 +1297,49 @@ model LocalDeferredChange {
   @@index([agencyId, status], map: "idx_deferred_agency_status")
   @@index([status, nextRetryAt], map: "idx_deferred_status_next")
   @@map("_deferred_changes")
+}
+
+/// Round 15 — cloud registry of every stored file (upload route + the
+/// desktop file-sync push). One row per file; `deviceFileId` is the
+/// desktop-local FileAsset id, making pushes IDEMPOTENT (a replayed push
+/// updates the same row instead of duplicating the blob).
+/// Blobs live on disk under the storage root (see apps/api/src/lib/storage.ts);
+/// this table carries metadata + the public URL + the sync cursor fields.
+model FileAsset {
+  id           String    @id @default(cuid())
+  /// Idempotency key from the uploading device (cuid from the local FileAsset).
+  /// Server-side uploads generate `srv-<uuid>`.
+  deviceFileId String    @unique
+  /// Storage bucket: avatar | logo | receipt | general | document | app-binary
+  bucket       String
+  /// Path relative to the storage root, e.g. "avatar/2025/06/1718-abc.png"
+  storagePath  String
+  originalName String?
+  mimeType     String?
+  size         Int       @default(0)
+  /// sha256 of the bytes (client-computed; cloud fills in when absent)
+  checksum     String?
+  /// Absolute public URL served by GET /api/upload/file/*
+  url          String
+  ownerId      String?
+  agencyId     String?
+  /// ── Desktop-only sync bookkeeping (always null/default on the cloud,
+  ///    maintained by the desktop file-sync worker; same pattern as
+  ///    LocalDeviceCredential). ──
+  /// LOCAL_ONLY | DIRTY | SYNCED | DELETED
+  syncState    String    @default("LOCAL_ONLY")
+  /// Cloud FileAsset.id after a successful push
+  remoteFileId String?
+  /// Cloud public URL after a successful push
+  remoteUrl    String?
+  syncedAt     DateTime?
+  lastError    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  /// Tombstone — pull filters these out; devices mirror the deletion.
+  deletedAt    DateTime?
+
+  @@index([updatedAt])
+  @@index([ownerId])
+  @@index([agencyId])
 }

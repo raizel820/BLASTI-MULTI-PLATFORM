@@ -40,9 +40,11 @@ import {
   Radio,
   Zap,
   Volume2,
+  CalendarDays,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
+import QRCode from 'qrcode';
 import type { TranslationKeys } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { apiFetch } from '@/lib/api-fetch';
@@ -61,6 +63,7 @@ interface AgencyInfo {
   logoUrl?: string;
   workingHoursStart?: string;
   workingHoursEnd?: string;
+  workingDays?: string;
 }
 
 const categoryOptions: { value: string; key: TranslationKeys }[] = [
@@ -72,6 +75,21 @@ const categoryOptions: { value: string; key: TranslationKeys }[] = [
   { value: 'OTHER', key: 'catOther' },
 ];
 
+/** Round 15 — localized weekday list for the workingDays CSV (0=Sunday). */
+function formatWorkingDays(csv: string): string {
+  try {
+    const locale = typeof navigator !== 'undefined' ? navigator.language || 'en' : 'en';
+    return csv
+      .split(',')
+      .filter((d) => /^[0-6]$/.test(d.trim()))
+      .sort((a, b) => Number(a) - Number(b))
+      .map((d) => new Intl.DateTimeFormat(locale, { weekday: 'short' }).format(new Date(2024, 9, 6 + Number(d))))
+      .join(' \u00b7 ');
+  } catch {
+    return csv;
+  }
+}
+
 export function AgencyProfile() {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
@@ -79,7 +97,10 @@ export function AgencyProfile() {
   const [loading, setLoading] = useState(true);
   const [editMode, setEditMode] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [qrSvg, setQrSvg] = useState<string | null>(null);
+  // Client-side generated QR (PNG data URL) — works OFFLINE on the desktop
+  // (the old flow fetched an SVG from /api/agency/qr-code, which the local
+  // API answered with a JSON placeholder → the QR section never rendered).
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [qrLoading, setQrLoading] = useState(false);
   const logoInputRef = useRef<HTMLInputElement>(null);
 
@@ -107,13 +128,18 @@ export function AgencyProfile() {
     if (!code) return;
     setQrLoading(true);
     try {
-      const res = await apiFetch(`/api/agency/qr-code?code=${encodeURIComponent(code)}`);
-      if (res.ok) {
-        const svg = await res.text();
-        setQrSvg(svg);
-      }
+      // Same payload the cloud endpoint encodes (<app-url>/?code=<code>),
+      // generated locally with the bundled `qrcode` package — no server
+      // round-trip, works offline on the desktop shell.
+      const base = typeof window !== 'undefined' ? window.location.origin : '';
+      const dataUrl = await QRCode.toDataURL(`${base}/?code=${encodeURIComponent(code)}`, {
+        margin: 1,
+        width: 240,
+        color: { dark: '#065f46', light: '#ffffff' },
+      });
+      setQrDataUrl(dataUrl);
     } catch {
-      // silent
+      // silent — placeholder icon renders instead
     } finally {
       setQrLoading(false);
     }
@@ -176,16 +202,13 @@ export function AgencyProfile() {
   };
 
   const handleDownloadQr = () => {
-    if (!qrSvg) return;
-    const svgBlob = new Blob([qrSvg], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(svgBlob);
+    if (!qrDataUrl) return;
     const a = document.createElement('a');
-    a.href = url;
-    a.download = `blasti-${profile?.code || 'qr'}.svg`;
+    a.href = qrDataUrl;
+    a.download = `blasti-${profile?.code || 'qr'}.png`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
     toast.success(t('downloaded'));
   };
 
@@ -348,6 +371,10 @@ export function AgencyProfile() {
                     }
                     const form = new FormData();
                     form.append('file', file);
+                    // Task 24 FIX: declare the upload type as a form field too —
+                    // the cloud route reads formData 'type' first and previously
+                    // only saw 'general'.
+                    form.append('type', 'logo');
                     try {
                       const uploadRes = await apiFetch('/api/upload?type=logo', { method: 'POST', body: form });
                       if (uploadRes.ok) {
@@ -477,6 +504,12 @@ export function AgencyProfile() {
                     <Clock className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                     <span className="text-muted-foreground">{t('workingHours')}: {profile?.workingHoursStart || '08:00'} - {profile?.workingHoursEnd || '17:00'}</span>
                   </div>
+                  {profile?.workingDays && (
+                    <div className="flex items-center gap-3 text-sm">
+                      <CalendarDays className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                      <span className="text-muted-foreground">{t('workingDays')}: {formatWorkingDays(profile.workingDays)}</span>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -499,15 +532,12 @@ export function AgencyProfile() {
           </CardHeader>
           <CardContent>
             <div className="flex flex-col sm:flex-row items-center gap-5">
-              {/* QR Code Image */}
+              {/* QR Code Image — generated client-side (offline-safe) */}
               <div className="h-32 w-32 rounded-xl bg-white dark:bg-gray-900 flex items-center justify-center border-2 border-gray-200 dark:border-gray-700 shadow-sm flex-shrink-0 overflow-hidden">
                 {qrLoading ? (
                   <Loader2 className="h-8 w-8 text-emerald-600 animate-spin" />
-                ) : qrSvg ? (
-                  <div
-                    className="h-full w-full flex items-center justify-center p-2"
-                    dangerouslySetInnerHTML={{ __html: qrSvg }}
-                  />
+                ) : qrDataUrl ? (
+                  <img src={qrDataUrl} alt={`QR code — agency ${profile?.code || ''}`} className="h-full w-full object-contain p-2" />
                 ) : (
                   <QrCode className="h-10 w-10 text-muted-foreground" />
                 )}
@@ -536,7 +566,7 @@ export function AgencyProfile() {
                     size="sm"
                     className="h-9 rounded-lg text-xs"
                     onClick={handleDownloadQr}
-                    disabled={!qrSvg}
+                    disabled={!qrDataUrl}
                   >
                     <Download className="h-3.5 w-3.5 me-1.5" />
                     {t('downloadQr')}

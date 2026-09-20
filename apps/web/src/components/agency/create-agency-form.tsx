@@ -1,7 +1,7 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
@@ -29,6 +29,11 @@ import {
   Pencil,
   QrCode,
   CircleDot,
+  Plus,
+  Trash2,
+  CalendarDays,
+  Layers,
+  X,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -338,7 +343,7 @@ interface CreateAgencyFormProps {
 
 export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   const { t } = useLanguage();
-  const { user, setUser } = useAppStore();
+  const { user, setUser, setSessionToken, logout } = useAppStore();
   const [step, setStep] = useState(0);
   const [direction, setDirection] = useState(1);
   const [creating, setCreating] = useState(false);
@@ -359,19 +364,121 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   const [description, setDescription] = useState('');
   const [customCode, setCustomCode] = useState('');
 
-  // Step 2: Working Hours
+  // Step 2: Working Hours + Working Days (Round 15 — days beside the hours)
   const [workingHoursStart, setWorkingHoursStart] = useState('08:00');
   const [workingHoursEnd, setWorkingHoursEnd] = useState('17:00');
+  // CSV of weekday numbers 0=Sunday … 6=Saturday. Algeria's work week is
+  // Sunday–Thursday, so the form prefills "0,1,2,3,4" (the schema default
+  // stays Mon–Fri for safety).
+  const [workingDays, setWorkingDays] = useState<number[]>([0, 1, 2, 3, 4]);
+
+  // Step 3: Services (Round 15 — created atomically with the agency)
+  const [services, setServices] = useState<Array<{ name: string; prefix: string }>>([
+    { name: '', prefix: 'A' },
+  ]);
+
+  // Localized weekday initials — index 0 = Sunday (matches the CSV encoding).
+  const { lang } = useLanguage();
+  const dayLabels = useMemo(() => {
+    const locale = lang === 'ar' ? 'ar' : lang === 'fr' ? 'fr' : 'en';
+    // Oct 6 2024 is a Sunday — offset i gives weekday i.
+    return Array.from({ length: 7 }, (_, i) =>
+      new Intl.DateTimeFormat(locale, { weekday: 'short' }).format(new Date(2024, 9, 6 + i))
+    );
+  }, [lang]);
+
+  const toggleWorkingDay = (day: number) => {
+    setWorkingDays((prev) => {
+      if (prev.includes(day)) {
+        // Keep at least one working day selected.
+        return prev.length > 1 ? prev.filter((d) => d !== day) : prev;
+      }
+      return [...prev, day].sort((a, b) => a - b);
+    });
+  };
+
+  const addServiceRow = () => {
+    setServices((prev) => {
+      if (prev.length >= 20) return prev;
+      // Next free letter A–Z.
+      const used = new Set(prev.map((s) => s.prefix.toUpperCase()));
+      let letter = 'A';
+      for (let i = 0; i < 26; i++) {
+        const candidate = String.fromCharCode(65 + i);
+        if (!used.has(candidate)) { letter = candidate; break; }
+      }
+      return [...prev, { name: '', prefix: letter }];
+    });
+  };
+
+  const removeServiceRow = (index: number) => {
+    setServices((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== index) : prev));
+  };
+
+  const updateServiceRow = (index: number, patch: Partial<{ name: string; prefix: string }>) => {
+    setServices((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  };
+
+  const filledServices = services.filter((s) => s.name.trim().length > 0);
 
   // Errors
   const [errors, setErrors] = useState<Record<string, string>>({});
 
-  const totalSteps = 4; // Basic Info, Contact, Working Hours, Preview
+  // ── Live agency-code availability (same UX as the username check) ──
+  // Debounced 500ms GET /api/agencies/check-code?code=XXX while the user
+  // types on the Contact step, so a colliding code is surfaced BEFORE the
+  // final submit instead of a late 409 that bounces back to this step.
+  const [codeCheck, setCodeCheck] = useState<'idle' | 'checking' | 'available' | 'taken' | 'error'>('idle');
+  const codeCheckAbortRef = useRef<AbortController | null>(null);
+  const codeCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const code = customCode.trim().toUpperCase();
+    if (!code || code.length < 2 || code.length > 10 || !/^[A-Z0-9_-]+$/.test(code)) {
+      setCodeCheck('idle');
+      return;
+    }
+    setCodeCheck('checking');
+    if (codeCheckTimerRef.current) clearTimeout(codeCheckTimerRef.current);
+    codeCheckTimerRef.current = setTimeout(async () => {
+      codeCheckAbortRef.current?.abort();
+      const controller = new AbortController();
+      codeCheckAbortRef.current = controller;
+      try {
+        const res = await apiFetch(`/api/agencies/check-code?code=${encodeURIComponent(code)}`, {
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        // apiFetch NEVER throws — only a real 200 with a boolean decides
+        // availability; anything else shows a neutral state instead of a
+        // false "taken" that would block the wizard.
+        let data: { available?: boolean } | null = null;
+        try { data = await res.json(); } catch { data = null; }
+        if (res.ok && data && typeof data.available === 'boolean') {
+          setCodeCheck(data.available ? 'available' : 'taken');
+        } else {
+          setCodeCheck('error');
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        setCodeCheck('error');
+      }
+    }, 500);
+    return () => {
+      if (codeCheckTimerRef.current) clearTimeout(codeCheckTimerRef.current);
+    };
+  }, [customCode]);
+
+  // Abort any in-flight check when the form unmounts.
+  useEffect(() => () => { codeCheckAbortRef.current?.abort(); }, []);
+
+  const totalSteps = 5; // Basic Info, Contact, Working Hours+Days, Services, Preview
 
   const stepLabels = [
     t('basicInfo' as any),
     t('contactDetails' as any),
     t('workingHours' as any),
+    t('services' as any),
     t('preview' as any),
   ];
 
@@ -392,14 +499,27 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
     const errs: Record<string, string> = {};
     if (customCode && customCode.length < 2) errs.customCode = t('agencyCodeMinLength' as any);
     if (customCode && customCode.length > 10) errs.customCode = t('agencyCodeMaxLength' as any);
+    // Live check says the code is already used — block here instead of a
+    // late 409 from the server after the user finished the whole wizard.
+    if (customCode && !errs.customCode && codeCheck === 'taken') errs.customCode = t('agencyCodeTaken' as any);
     setErrors(errs);
     return Object.keys(errs).length === 0;
   };
 
   const validateStep2 = () => {
-    // Working hours are optional with defaults, no validation needed
+    // Working hours/days are optional with defaults, no validation needed
     setErrors({});
     return true;
+  };
+
+  const validateStep3 = () => {
+    // Every STARTED service row needs a name (untouched rows are dropped).
+    const errs: Record<string, string> = {};
+    if (services.some((s) => !s.name.trim() && s.name.length > 0)) {
+      errs.serviceName = t('serviceNameRequired' as any);
+    }
+    setErrors(errs);
+    return Object.keys(errs).length === 0;
   };
 
   const handleNext = () => {
@@ -409,6 +529,8 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       goToStep(2);
     } else if (step === 2 && validateStep2()) {
       goToStep(3);
+    } else if (step === 3 && validateStep3()) {
+      goToStep(4);
     }
   };
 
@@ -434,6 +556,15 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       if (customCode.trim()) body.customCode = customCode.trim().toUpperCase();
       if (workingHoursStart) body.workingHoursStart = workingHoursStart;
       if (workingHoursEnd) body.workingHoursEnd = workingHoursEnd;
+      // Round 15 — working days + services ride along in ONE atomic create.
+      if (workingDays.length) body.workingDays = [...workingDays].sort((a, b) => a - b).join(',');
+      if (filledServices.length) {
+        body.services = filledServices.map((s) => {
+          const row: Record<string, unknown> = { name: s.name.trim() };
+          if (s.prefix.trim()) row.prefix = s.prefix.trim().toUpperCase();
+          return row;
+        });
+      }
 
       const res = await apiFetch('/api/agencies?XTransformPort=3003', {
         method: 'POST',
@@ -444,6 +575,22 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       const data = await res.json();
 
       if (!res.ok) {
+        // Ghost-session guard: the stored token belongs to an account the
+        // cloud no longer knows (DB reset / account deleted while the session
+        // survived). The API answers 401 SESSION_USER_MISSING. Clear the dead
+        // session and route to login with a clear message — retrying can
+        // never succeed, and a dead-end "Internal server error" toast left
+        // the user stuck on this wizard.
+        if (
+          res.status === 401 ||
+          data.code === 'SESSION_USER_MISSING' ||
+          (typeof data.error === 'string' && data.error.includes('no longer exists'))
+        ) {
+          console.warn('[CreateAgencyForm] Session invalid (ghost account) — clearing session, routing to login');
+          toast.error(t('sessionInvalidRelogin' as any));
+          logout();
+          return;
+        }
         if (data.error === 'Agency code already taken') {
           setErrors({ customCode: t('agencyCodeTaken' as any) });
           toast.error(t('agencyCodeTaken' as any));
@@ -463,6 +610,20 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
           agencyNameAr: data.agency.nameAr || data.agency.name,
           agencyNameFr: data.agency.nameFr || data.agency.name,
         });
+        // Round 16 — adopt the REFRESHED session token. The token used during
+        // creation was issued before this agency existed (agencyId: '') — a
+        // permanent snapshot. The cloud 201 returns an upgraded JWT with the
+        // agency embedded; setSessionToken (user updated FIRST, above) pushes
+        // it to the Electron main process (sync engine setAuth) and the local
+        // API session, so the workspace initializes immediately and the
+        // next launch restores the agency-aware session.
+        if (data.token) {
+          try {
+            setSessionToken(data.token);
+          } catch (sessionErr) {
+            console.warn('[CreateAgencyForm] Session token adoption failed (non-fatal):', sessionErr);
+          }
+        }
       }
 
       setCreatedAgencyName(data.agency?.name || name);
@@ -802,7 +963,26 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   error={errors.customCode}
                   uppercase
                 />
-                {!errors.customCode && (
+                {/* Live availability verdict (like the username check) */}
+                {!errors.customCode && customCode.trim().length >= 2 && codeCheck === 'checking' && (
+                  <p className="text-[10px] text-muted-foreground -mt-3 flex items-center gap-1.5">
+                    <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                    {t('checking' as any)}
+                  </p>
+                )}
+                {!errors.customCode && customCode.trim().length >= 2 && codeCheck === 'available' && (
+                  <p className="text-[10px] text-emerald-600 dark:text-emerald-400 -mt-3 flex items-center gap-1.5">
+                    <Check className="h-3 w-3 shrink-0" />
+                    {t('agencyCodeAvailable' as any)}
+                  </p>
+                )}
+                {!errors.customCode && customCode.trim().length >= 2 && codeCheck === 'taken' && (
+                  <p className="text-[10px] text-red-500 dark:text-red-400 -mt-3 flex items-center gap-1.5">
+                    <X className="h-3 w-3 shrink-0" />
+                    {t('agencyCodeTaken' as any)}
+                  </p>
+                )}
+                {(customCode.trim().length < 2 || codeCheck === 'idle' || codeCheck === 'error') && (
                   <p className="text-[10px] text-muted-foreground -mt-3">{t('agencyCodeAutoGenerated' as any)}</p>
                 )}
               </CardContent>
@@ -895,6 +1075,36 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   </div>
                 </div>
 
+                {/* Round 15 — Working DAYS beside the working hours */}
+                <div className="space-y-2 pt-1">
+                  <Label className="text-sm font-medium flex items-center gap-1.5">
+                    <CalendarDays className="h-3.5 w-3.5 text-emerald-500" />
+                    {t('workingDays' as any)}
+                  </Label>
+                  <p className="text-[10px] text-muted-foreground">{t('workingDaysDesc' as any)}</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {dayLabels.map((label, day) => {
+                      const active = workingDays.includes(day);
+                      return (
+                        <button
+                          key={day}
+                          type="button"
+                          onClick={() => toggleWorkingDay(day)}
+                          aria-pressed={active}
+                          aria-label={label}
+                          className={`h-9 min-w-[44px] px-2 rounded-xl text-xs font-semibold border transition-all duration-150 ${
+                            active
+                              ? 'bg-gradient-to-b from-emerald-500 to-teal-500 text-white border-emerald-500 shadow-sm shadow-emerald-500/30 scale-[1.03]'
+                              : 'bg-background text-muted-foreground border-border hover:border-emerald-300 hover:text-emerald-600'
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 {/* Quick presets */}
                 <div className="space-y-2">
                   <span className="text-xs font-medium text-muted-foreground">{t('quickPresets' as any)}</span>
@@ -929,8 +1139,87 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
             </Card>
           )}
 
-          {/* Step 3: Preview */}
+          {/* Step 3: Services (Round 15) */}
           {step === 3 && (
+            <Card className="border-0 shadow-lg shadow-black/5 dark:shadow-black/20">
+              <CardContent className="p-5 space-y-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <Layers className="h-4 w-4 text-teal-600 dark:text-teal-400" />
+                  <span className="text-sm font-semibold text-foreground">{t('services' as any)}</span>
+                </div>
+
+                <p className="text-xs text-muted-foreground -mt-2">
+                  {t('servicesStepDesc' as any)}
+                </p>
+
+                <div className="space-y-2.5">
+                  {services.map((row, index) => (
+                    <div key={index} className="flex items-center gap-2">
+                      {/* Prefix badge/input */}
+                      <div className="shrink-0">
+                        <Input
+                          value={row.prefix}
+                          onChange={(e) => {
+                            const v = e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 1);
+                            updateServiceRow(index, { prefix: v });
+                          }}
+                          className="h-11 w-11 text-center font-mono font-bold rounded-xl"
+                          maxLength={1}
+                          aria-label={t('servicePrefix' as any)}
+                          dir="ltr"
+                        />
+                      </div>
+                      {/* Service name */}
+                      <div className="flex-1">
+                        <Input
+                          value={row.name}
+                          onChange={(e) => updateServiceRow(index, { name: e.target.value })}
+                          placeholder={t('serviceNamePlaceholder' as any)}
+                          className="h-11 rounded-xl"
+                          maxLength={100}
+                          aria-label={t('serviceName' as any)}
+                        />
+                      </div>
+                      {/* Remove row */}
+                      <button
+                        type="button"
+                        onClick={() => removeServiceRow(index)}
+                        disabled={services.length <= 1}
+                        aria-label={t('delete' as any)}
+                        className="h-11 w-11 shrink-0 rounded-xl flex items-center justify-center text-muted-foreground hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors disabled:opacity-30 disabled:pointer-events-none"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                {errors.serviceName && (
+                  <motion.p
+                    initial={{ opacity: 0, y: -4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="text-xs text-red-500"
+                  >
+                    {errors.serviceName}
+                  </motion.p>
+                )}
+
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={addServiceRow}
+                  disabled={services.length >= 20}
+                  className="w-full h-10 rounded-xl gap-1.5 border-dashed text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+                >
+                  <Plus className="h-4 w-4" />
+                  {t('addService' as any)}
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Step 4: Preview */}
+          {step === 4 && (
             <Card className="border-0 shadow-lg shadow-black/5 dark:shadow-black/20">
               <CardContent className="p-5 space-y-4">
                 <div className="flex items-center gap-2 mb-2">
@@ -978,6 +1267,25 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                 >
                   <PreviewRow label={t('workingHoursStart' as any)} value={workingHoursStart} dir="ltr" />
                   <PreviewRow label={t('workingHoursEnd' as any)} value={workingHoursEnd} dir="ltr" />
+                  <PreviewRow
+                    label={t('workingDays' as any)}
+                    value={workingDays.slice().sort((a, b) => a - b).map((d) => dayLabels[d]).join(' · ')}
+                  />
+                </PreviewSection>
+
+                {/* Services Preview (Round 15) */}
+                <PreviewSection
+                  title={t('services' as any)}
+                  icon={Layers}
+                  onEdit={() => goToStep(3)}
+                >
+                  {filledServices.length ? (
+                    filledServices.map((s, i) => (
+                      <PreviewRow key={i} label={s.prefix || String.fromCharCode(65 + i)} value={s.name} />
+                    ))
+                  ) : (
+                    <span className="text-xs text-muted-foreground italic">{t('noData' as any)}</span>
+                  )}
                 </PreviewSection>
 
                 {/* Confirmation notice */}

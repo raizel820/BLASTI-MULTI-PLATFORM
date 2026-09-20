@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { ArrowLeft, Printer, Download, QrCode, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
+import QRCode from 'qrcode';
 
 export function AgencyQrDisplay() {
   const { user, goBack } = useAppStore();
@@ -24,17 +25,31 @@ export function AgencyQrDisplay() {
   const fetchQrCode = async () => {
     setLoading(true);
     try {
-      // Fetch QR code
-      const qrRes = await apiFetch('/api/agency/qr-code');
-      if (qrRes.ok) {
-        const data = await qrRes.json();
-        setQrDataUrl(data.qrCodeDataUrl);
+      // Fetch the agency profile for name + code — then generate the QR
+      // CLIENT-SIDE. The previous implementation expected
+      // { qrCodeDataUrl } from GET /api/agency/qr-code, a shape NO backend
+      // (cloud or local) ever returned, so this page always showed the
+      // placeholder. Client-side generation works offline on the desktop.
+      const params = user?.agencyId ? `?agencyId=${user.agencyId}` : '';
+      const res = await apiFetch(`/api/agency/profile${params}`);
+      if (res.ok) {
+        const data = await res.json();
+        const code = data.code || data.customCode || '';
         setAgencyData({
-          name: data.agencyName || data.agency?.name || '',
-          code: data.agencyCode || data.agency?.code || '',
-          nameAr: data.agency?.nameAr,
-          nameFr: data.agency?.nameFr,
+          name: data.name || '',
+          code,
+          nameAr: data.nameAr,
+          nameFr: data.nameFr,
         });
+        if (code) {
+          const base = typeof window !== 'undefined' ? window.location.origin : '';
+          const url = await QRCode.toDataURL(`${base}/?code=${encodeURIComponent(code)}`, {
+            margin: 2,
+            width: 512,
+            color: { dark: '#065f46', light: '#ffffff' },
+          });
+          setQrDataUrl(url);
+        }
       }
     } catch {
       toast.error(t('error'));

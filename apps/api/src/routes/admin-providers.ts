@@ -35,6 +35,7 @@ import {
   saveProviderConfig,
   recordTestResult,
 } from '../lib/messaging/provider-config'
+import { DEV_BYPASS_CODES } from '../lib/verification-service'
 import { sendTestEmail } from '../lib/messaging/email-service'
 import { sendTestSms } from '../lib/messaging/sms-sender'
 import { sendTestWhatsApp, listWhatsAppTemplates } from '../lib/messaging/whatsapp-service'
@@ -68,7 +69,7 @@ app.get('/', async (c) => {
       })),
       catalog: TEMPLATE_CATALOG,
       devBypass: process.env.NODE_ENV !== 'production' || process.env.VERIFICATION_DEV_BYPASS === 'true',
-      devCodes: process.env.NODE_ENV !== 'production' ? { SMS: '1234', EMAIL: '12345678' } : undefined,
+      devCodes: process.env.NODE_ENV !== 'production' ? { SMS: DEV_BYPASS_CODES.SMS, EMAIL: DEV_BYPASS_CODES.EMAIL } : undefined,
     })
   } catch (error) {
     const err = authErrorResponse(error)

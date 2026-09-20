@@ -76,6 +76,32 @@ function isElectronPlatform(): boolean {
   return typeof window !== 'undefined' && !!(window as any).electronAPI
 }
 
+function isLoopbackHost(h: string): boolean {
+  return h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '0.0.0.0'
+}
+
+/**
+ * Round 17 — private-network host (LAN IP / .local / bare machine hostname).
+ * A phone browser opening the webapp via http://<pc-ip>:3000 presents such a
+ * host; the realtime server on :3003 is directly reachable from it.
+ */
+function isPrivateLanHost(h: string): boolean {
+  if (/^10\./.test(h)) return true
+  if (/^192\.168\./.test(h)) return true
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true
+  if (h.endsWith('.local')) return true
+  if (!h.includes('.') && h !== 'localhost') return true
+  return false
+}
+
+/**
+ * True when the page's host can reach the realtime server on :3003 DIRECTLY
+ * (same machine or same LAN) — no gateway in between.
+ */
+function isDirectRealtimeHost(h: string): boolean {
+  return isLoopbackHost(h) || isPrivateLanHost(h)
+}
+
 function resolveSocketUrl(): string {
   // Electron: connect to the LOCAL API socket server (local-first; offline-capable)
   if (isElectronPlatform()) {
@@ -91,7 +117,16 @@ function resolveSocketUrl(): string {
   if (nativeUrl) {
     return nativeUrl
   }
-  // Web: connect via the Caddy gateway using relative path
+  // Web served from the same machine (loopback) or the same network (phone
+  // / tablet on the Wi-Fi) as the cloud API: connect DIRECTLY to the
+  // realtime server on :3003 — there is no gateway on a normal machine, so
+  // a relative "/" would hit the Next.js dev server which has no socket.io
+  // endpoint (silent connect_error loop).
+  const h = typeof window !== 'undefined' ? window.location.hostname : ''
+  if (isDirectRealtimeHost(h)) {
+    return `http://${h === '0.0.0.0' ? 'localhost' : h}:${REALTIME_PORT}`
+  }
+  // Web behind a single-port gateway: connect via relative path
   return '/'
 }
 
@@ -122,12 +157,16 @@ function resolveSocketOptions(): Parameters<typeof io>[1] {
     },
   }
 
-  // Native or explicit URL: connecting directly, no gateway needed
+  // Direct connection (native, explicit URL, or loopback web): no gateway needed
   if (isNative || nativeUrl) {
     return baseOptions
   }
+  const h = typeof window !== 'undefined' ? window.location.hostname : ''
+  if (isDirectRealtimeHost(h)) {
+    return baseOptions
+  }
 
-  // Web: route through Caddy gateway via XTransformPort
+  // Web behind a single-port gateway: route through it via XTransformPort
   return {
     ...baseOptions,
     query: {

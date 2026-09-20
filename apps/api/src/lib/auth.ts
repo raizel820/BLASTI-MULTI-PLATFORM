@@ -96,13 +96,37 @@ export async function verifySessionToken(token: string, options?: { checkStaleRo
         where: { id: sessionToken.id },
         select: { lastRoleChangeAt: true, passwordHash: true },
       })
+      if (!user) {
+        // Ghost session guard: the JWT signature is valid, but the account it
+        // refers to no longer exists in the cloud database (e.g. the DB was
+        // reset/re-seeded while a desktop or browser session survived).
+        // Without this check the ghost token passed EVERY route and the first
+        // write blew up with a raw Prisma P2003 FK violation (500) — e.g.
+        // POST /api/agencies with ownerId pointing at a non-existent User.
+        // A session for a non-existent account is not a session: force
+        // re-authentication so the client can show the login screen with a
+        // clear message instead of an "Internal server error".
+        console.warn(
+          `[AUTH] Ghost JWT rejected: user=${sessionToken.id} (${sessionToken.username ?? 'unknown'}) does not exist in the database — forcing re-authentication`,
+        )
+        return null
+      }
       if (user) {
         const iat = sessionToken.iat // seconds since epoch
-        if (iat) {
-          const iatMs = iat * 1000
-          if (iatMs < user.lastRoleChangeAt.getTime()) {
+        if (iat && user.lastRoleChangeAt) {
+          // Round 15 FIX: compare in SECONDS on both sides. The JWT `iat`
+          // claim has second resolution (floored), while lastRoleChangeAt
+          // carries milliseconds — a token issued in the SAME second as the
+          // role change compared iatMs (= second * 1000) < lastRoleChangeAt
+          // (e.g. .500s) by up to 999ms and was rejected as "stale". That is
+          // exactly the register → verify flow: the fresh session token was
+          // 401'd ("Authentication required") whenever OTP verification
+          // completed within the same second as account creation (always in
+          // dev, often in production with fast OTP entry).
+          const lastChangeSec = Math.floor(user.lastRoleChangeAt.getTime() / 1000)
+          if (iat < lastChangeSec) {
             console.warn(
-              `[AUTH] Stale JWT rejected: token iat=${new Date(iatMs).toISOString()} ` +
+              `[AUTH] Stale JWT rejected: token iat=${new Date(iat * 1000).toISOString()} ` +
               `< lastRoleChangeAt=${user.lastRoleChangeAt.toISOString()} for user=${sessionToken.id}`,
             )
             return null
@@ -110,7 +134,6 @@ export async function verifySessionToken(token: string, options?: { checkStaleRo
         }
       }
     }
-
     return sessionToken
   } catch {
     return null

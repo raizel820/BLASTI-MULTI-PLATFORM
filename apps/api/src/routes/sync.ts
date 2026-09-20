@@ -28,6 +28,7 @@
 import { Hono } from 'hono'
 import { requireAuth, authErrorResponse, AuthError, requireAgencyAccess } from '../lib/auth'
 import { SYNC_PROTOCOL_VERSION } from '@blasti/core/sync-registry'
+import { normalizeRecordFileUrls } from '../lib/file-url'
 import {
   getChangesSinceCursor,
   processPushMutation,
@@ -234,6 +235,17 @@ app.post('/push', async (c) => {
 
     // Cap batch size for responsiveness (desktop pages its outbox)
     const batch = normalized.slice(0, 500)
+
+    // Round 15 — rewrite desktop-local / relative file URLs (avatarUrl,
+    // receiptUrl, logoUrl, coverUrl, …) to this API's own public URLs BEFORE
+    // the engine applies the mutations, so records synced from the desktop
+    // never embed a 127.0.0.1:3080 URL.
+    const fileBase = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '') || new URL(c.req.url).origin
+    for (const mutation of batch) {
+      if (mutation.data && typeof mutation.data === 'object' && !Array.isArray(mutation.data)) {
+        mutation.data = normalizeRecordFileUrls(mutation.data as Record<string, unknown>, fileBase)
+      }
+    }
 
     const results: Array<{ mutationId: string | null; model: string; recordId: string; status: ProcessPushMutationResult['status']; conflict?: any }> = []
     for (const mutation of batch) {

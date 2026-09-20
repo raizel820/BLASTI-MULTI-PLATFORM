@@ -530,11 +530,20 @@ async function _getMeta(db, key) {
 
 /**
  * After all stages complete, validate that essential data exists.
- * Mandatory checks: agency exists, services/branches/counters have records.
- * Foreign key checks: counters→branches, agencyStaff→users.
+ *
+ * MANDATORY (issues → FAIL the workspace): the Agency row itself and real
+ * referential corruption (orphan FKs).
+ *
+ * WARNINGS (warnings → logged, never fail): empty services/branches/counters.
+ * A freshly wizard-created agency legitimately has NO branches and NO
+ * counters (they are created later in the dashboard) and may even have zero
+ * services — treating emptiness as a mandatory failure marked every new
+ * workspace FAILED forever, so it never reached READY, the Part-D pull gate
+ * stayed shut, and the profile/settings/QR pages rendered empty.
  */
 async function _validateIntegrity(db, agencyId) {
   const issues = []
+  const warnings = []
 
   // 1. Agency must exist
   try {
@@ -552,35 +561,35 @@ async function _validateIntegrity(db, agencyId) {
     }
   }
 
-  // 2. Services must exist (mandatory)
+  // 2. Services — WARNING ONLY (a fresh agency can have zero services)
   try {
     const svcCount = await db.service.count({ where: { agencyId } })
-    if (svcCount === 0) issues.push('No services imported')
+    if (svcCount === 0) warnings.push('No services imported')
   } catch {
     try {
       const svcCount = await db.$queryRawUnsafe(
         'SELECT COUNT(*) as cnt FROM "Service" WHERE agencyId = ?', agencyId
       )
       const count = typeof svcCount?.[0]?.cnt === 'bigint' ? Number(svcCount[0].cnt) : (svcCount?.[0]?.cnt || 0)
-      if (count === 0) issues.push('No services imported')
+      if (count === 0) warnings.push('No services imported')
     } catch { /* Service table may not exist yet */ }
   }
 
-  // 3. Branches must exist (mandatory)
+  // 3. Branches — WARNING ONLY (created later in the dashboard)
   try {
     const branchCount = await db.branch.count({ where: { agencyId } })
-    if (branchCount === 0) issues.push('No branches imported')
+    if (branchCount === 0) warnings.push('No branches imported')
   } catch {
     try {
       const branchCount = await db.$queryRawUnsafe(
         'SELECT COUNT(*) as cnt FROM "Branch" WHERE agencyId = ?', agencyId
       )
       const count = typeof branchCount?.[0]?.cnt === 'bigint' ? Number(branchCount[0].cnt) : (branchCount?.[0]?.cnt || 0)
-      if (count === 0) issues.push('No branches imported')
+      if (count === 0) warnings.push('No branches imported')
     } catch { /* Branch table may not exist yet */ }
   }
 
-  // 4. Counters must exist (mandatory)
+  // 4. Counters — WARNING ONLY (created later, inside branches)
   try {
     // Counters are linked via branches
     const branches = await db.branch.findMany({ where: { agencyId }, select: { id: true } })
@@ -588,7 +597,7 @@ async function _validateIntegrity(db, agencyId) {
       const counterCount = await db.counter.count({
         where: { branchId: { in: branches.map(b => b.id) } },
       })
-      if (counterCount === 0) issues.push('No counters imported')
+      if (counterCount === 0) warnings.push('No counters imported')
     }
   } catch {
     // Non-fatal — counters might not be in schema yet
@@ -623,6 +632,7 @@ async function _validateIntegrity(db, agencyId) {
   return {
     valid: issues.length === 0,
     issues,
+    warnings,
   }
 }
 
@@ -1202,6 +1212,12 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
         error: `Integrity validation failed: ${mandatoryIssues.join('; ')}`,
       }
     }
+  }
+  // Empty collections (services/branches/counters) are EXPECTED on a freshly
+  // wizard-created agency — surface them as warnings, never as failures.
+  if (validation.warnings && validation.warnings.length > 0) {
+    console.warn('[InitialSync] Integrity warnings (non-fatal):', validation.warnings)
+    emit({ type: 'SYNC_WARNING', stage: 'validation', message: `Non-fatal: ${validation.warnings.join('; ')}` })
   }
 
   // ── Step 4b: Race condition check ─────────────────────────────────────

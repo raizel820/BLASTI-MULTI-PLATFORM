@@ -712,13 +712,47 @@ var _initAttempt = null;
 var _lastInitAttemptAt = 0;
 var INIT_ATTEMPT_MIN_INTERVAL_MS = 10_000;
 
+// Round 16 — stale-context heal: when the session context carries NO agency
+// (fresh owner before the setup wizard, or the agency was created on another
+// device), ask the cloud to re-issue the session from the DATABASE's current
+// state. Rate-limited separately so an agency-less desktop doesn't call the
+// cloud on every engine tick.
+var _lastSessionProbeAt = 0;
+var SESSION_PROBE_MIN_INTERVAL_MS = 60_000;
+
+async function _refreshSessionFromCloud() {
+  var now = Date.now();
+  if (now - _lastSessionProbeAt < SESSION_PROBE_MIN_INTERVAL_MS) return null;
+  _lastSessionProbeAt = now;
+  if (!_authToken || !_config || !_config.cloudBaseUrl) return null;
+  try {
+    var res = await fetch(_config.cloudBaseUrl + '/api/auth/refresh-session', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + _authToken,
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) {
+      console.log('[SyncService] Session refresh probe → HTTP ' + res.status + ' (agency stays unresolved)');
+      return null;
+    }
+    var data = await res.json();
+    if (data && data.success && data.user) return data;
+    return null;
+  } catch (e) {
+    console.warn('[SyncService] Session refresh probe failed:', (e && e.message) || e);
+    return null;
+  }
+}
+
 function ensureWorkspaceInitialized(trigger) {
   if (!_isStarted) return Promise.resolve({ skipped: 'engine-not-started' });
   if (!_authToken) return Promise.resolve({ skipped: 'no-auth' });
   var db = _config && _config.localDb;
   if (!db) return Promise.resolve({ skipped: 'no-db' });
-  var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
-  if (!agencyId) return Promise.resolve({ skipped: 'no-agency' });
   if (_initAttempt) return _initAttempt;
   var now = Date.now();
   if (now - _lastInitAttemptAt < INIT_ATTEMPT_MIN_INTERVAL_MS) {
@@ -727,6 +761,25 @@ function ensureWorkspaceInitialized(trigger) {
   _lastInitAttemptAt = now;
 
   _initAttempt = (async function () {
+    var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
+
+    // Round 16 (field deadlock): a session WITHOUT an agency is not terminal.
+    // The token is a snapshot — the agency may exist in the cloud already
+    // (created by the setup wizard seconds ago, or on another device) while
+    // this context is stale. Ask the cloud for the CURRENT session truth;
+    // only skip when the cloud confirms there is genuinely no agency.
+    if (!agencyId) {
+      var refreshed = await _refreshSessionFromCloud();
+      if (!refreshed || !(refreshed.user && refreshed.user.agencyId)) {
+        return { skipped: 'no-agency' };
+      }
+      _authToken = refreshed.token || _authToken;
+      _userContext = refreshed.user;
+      agencyId = refreshed.user.agencyId;
+      if (_config && !_config.agencyId) _config.agencyId = agencyId;
+      console.log('[SyncService] Session agency resolved from cloud: ' + agencyId + ' — resuming initialization');
+    }
+
     // Fast path: already READY → nothing to do (5s-cached check, force=false).
     if (await _isAgencyReady()) return { skipped: 'ready' };
 
@@ -2297,8 +2350,24 @@ async function getStatus() {
 function setAuth(token, userContext) {
   _authToken = token;
   _userContext = userContext;
-  if (userContext && userContext.agencyId && _config && !_config.agencyId) {
-    _config.agencyId = userContext.agencyId;
+  // ── Agency REBIND (was: only fill an EMPTY pin) ──────────────────────────
+  // The engine used to pin `_config.agencyId` once at startSync (often to a
+  // demo/previous-workspace agency) and setAuth never replaced it. Every
+  // incremental pull then kept POSTing the OLD agencyId while the fresh
+  // token belonged to a NEW account/agency → the cloud answered
+  // 403 "You do not have access to this agency" on every cycle and the
+  // socket joined the wrong agency room (rejected). New-agency data never
+  // arrived, so profile/settings/QR rendered empty after re-login.
+  // Now: when the incoming session carries a DIFFERENT agencyId, rebind the
+  // engine to it. The cursor reset is NOT done here — the sync cycle's
+  // _checkAndResetForNewAgency() detects the switch via the
+  // lastSyncAgencyId meta and rewinds the cursor for a full pull of the new
+  // agency (an inline reset here would race the cursor-bridge hydration).
+  var incomingAgency = userContext && userContext.agencyId;
+  if (_config && incomingAgency && _config.agencyId !== incomingAgency) {
+    var previousAgency = _config.agencyId || null;
+    _config.agencyId = incomingAgency;
+    console.log('[SyncService] Agency rebind: ' + (previousAgency || 'none') + ' -> ' + incomingAgency + ' (cycle will reset the cursor for a full pull)');
   }
   console.log('[SyncService] Auth set - user: ' + (userContext && userContext.id) + ', role: ' + (userContext && userContext.role) + ', agency: ' + (userContext && userContext.agencyId || 'none'));
 

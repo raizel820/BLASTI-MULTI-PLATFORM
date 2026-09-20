@@ -52,7 +52,7 @@ const path = require('path')
 // ─── Versioning ─────────────────────────────────────────────────────────────
 
 /** Current local schema version. Bump when adding MIGRATION_STEPS. */
-const LOCAL_SCHEMA_VERSION = 3
+const LOCAL_SCHEMA_VERSION = 4
 
 /**
  * Incremental upgrade steps BETWEEN versions. Each step:
@@ -90,6 +90,24 @@ const MIGRATION_STEPS = [
     statements: [
       'ALTER TABLE "User" ADD COLUMN "emailVerified" BOOLEAN NOT NULL DEFAULT false',
       'ALTER TABLE "User" ADD COLUMN "phoneVerified" BOOLEAN NOT NULL DEFAULT false',
+    ],
+  },
+  {
+    // Round 15 — file system: (a) Agency.workingDays rides beside the working
+    // hours through the v2 sync engine; (b) the FileAsset registry tracks
+    // every locally stored file for the desktop file-sync worker (the shared
+    // Prisma client now includes the model, so the local table MUST exist).
+    // The convergence column/table top-up below additionally self-heals any
+    // database shape that skipped this step.
+    version: 4,
+    name: 'agency-working-days + FileAsset file-sync registry (Round 15)',
+    statements: [
+      'ALTER TABLE "Agency" ADD COLUMN "workingDays" TEXT NOT NULL DEFAULT \'1,2,3,4,5\'',
+      'CREATE TABLE "FileAsset" ("id" TEXT NOT NULL PRIMARY KEY, "deviceFileId" TEXT NOT NULL, "bucket" TEXT NOT NULL, "storagePath" TEXT NOT NULL, "originalName" TEXT, "mimeType" TEXT, "size" INTEGER NOT NULL DEFAULT 0, "checksum" TEXT, "url" TEXT NOT NULL, "ownerId" TEXT, "agencyId" TEXT, "syncState" TEXT NOT NULL DEFAULT \'LOCAL_ONLY\', "remoteFileId" TEXT, "remoteUrl" TEXT, "syncedAt" DATETIME, "lastError" TEXT, "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" DATETIME NOT NULL, "deletedAt" DATETIME)',
+      'CREATE UNIQUE INDEX "FileAsset_deviceFileId_key" ON "FileAsset"("deviceFileId")',
+      'CREATE INDEX "FileAsset_updatedAt_idx" ON "FileAsset"("updatedAt")',
+      'CREATE INDEX "FileAsset_ownerId_idx" ON "FileAsset"("ownerId")',
+      'CREATE INDEX "FileAsset_agencyId_idx" ON "FileAsset"("agencyId")',
     ],
   },
 ]
@@ -135,6 +153,9 @@ const CORE_REQUIRED_TABLES = [
   'User',
   // desktop-only local unlock credential (Task 14 — never synced)
   'LocalDeviceCredential',
+  // desktop-only file-sync registry (Round 15 — never synced as records;
+  // blobs mirror through /api/files/sync/* instead)
+  'FileAsset',
   // agency + dataset
   'Agency', 'AgencyStaff', 'Service', 'Branch', 'Counter',
   'QueueSettings', 'Reservation',

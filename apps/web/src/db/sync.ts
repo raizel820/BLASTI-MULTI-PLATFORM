@@ -21,8 +21,23 @@
 'use client';
 
 import type { Database } from '@nozbe/watermelondb';
+import { buildCloudUrl } from '@/lib/api-client';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+
+/**
+ * HTTP error with status — lets the engine distinguish "route not found"
+ * (the desktop local API predates the WatermelonDB sync endpoints) from
+ * auth/agency errors and fall back to the cloud accordingly.
+ */
+class SyncHttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+    this.name = 'SyncHttpError';
+  }
+}
 
 export interface SyncStatus {
   lastSync: string | null;
@@ -50,6 +65,7 @@ const DEFAULT_SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const LAN_PROBE_INTERVAL_MS = 30 * 1000; // Re-probe LAN every 30s
 const LAN_PROBE_TIMEOUT_MS = 2000; // 2s timeout for LAN server probe
 const LAN_SYNC_BASE_PATH = '/api/sync'; // Same path on desktop LAN server
+const LAN_UNSUPPORTED_COOLDOWN_MS = 5 * 60 * 1000; // Retry LAN sync 5 min after a 404
 
 const isBrowser = typeof window !== 'undefined';
 
@@ -67,6 +83,13 @@ class SyncEngine {
   private lanServerIp: string | null = null;
   private lanServerPort: number | null = null;
   private lastLanProbeAt: number = 0;
+
+  // When the discovered LAN server answers 404 on /api/sync/pull (an older
+  // desktop build whose local API has no WatermelonDB sync routes), stop
+  // targeting it for sync for a while instead of failing every cycle with
+  // "Sync failed: Not found". Status probing continues so we recover
+  // automatically when the desktop app is updated/restarted.
+  private lanSyncUnsupportedUntil: number = 0;
 
   private emit(event: SyncEvent): void {
     for (const listener of this.listeners) {
@@ -116,10 +139,23 @@ class SyncEngine {
   private getAuthToken(): string | null {
     if (!isBrowser) return null;
     try {
-      return (
-        localStorage.getItem('blasti-session-token') ||
-        localStorage.getItem('next-auth.session-token')
-      );
+      const native = localStorage.getItem('blasti-session-token');
+      if (native) return native;
+      const nextAuth = localStorage.getItem('next-auth.session-token');
+      if (nextAuth) return nextAuth;
+      // Web: the cloud JWT lives in the persisted zustand store
+      // ('blasti-app' → state.sessionToken). Without this fallback the web
+      // sync engine never found a token and silently skipped every cycle.
+      const storeData = localStorage.getItem('blasti-app');
+      if (storeData) {
+        try {
+          const parsed = JSON.parse(storeData);
+          return parsed?.state?.sessionToken || null;
+        } catch {
+          return null;
+        }
+      }
+      return null;
     } catch {
       return null;
     }
@@ -325,20 +361,24 @@ class SyncEngine {
    */
   private async getSyncBaseUrl(): Promise<{ baseUrl: string; target: 'lan' | 'cloud' }> {
     const lanUrl = await this.probeLanServer();
-    if (lanUrl) {
+    if (lanUrl && Date.now() >= this.lanSyncUnsupportedUntil) {
       return { baseUrl: lanUrl, target: 'lan' };
     }
-    return { baseUrl: '', target: 'cloud' }; // empty = relative path = cloud via Next.js proxy
+    // Cloud target: resolved by the shared cloud-URL helper — absolute
+    // http://localhost:3003 on a loopback host, relative + XTransformPort
+    // behind a single-port gateway.
+    return { baseUrl: '', target: 'cloud' };
   }
 
   /**
    * Build a full URL for a sync endpoint.
-   * If baseUrl is empty, returns the relative path (for cloud via Next.js proxy).
-   * If baseUrl is set (LAN), returns the absolute URL.
+   * LAN target → absolute URL on the desktop server.
+   * Cloud target → routed through the shared cloud-URL builder (direct
+   * :3003 on loopback, gateway-hinted relative path otherwise).
    */
-  private _buildUrl(baseUrl: string, path: string): string {
-    if (!baseUrl) return path; // relative → cloud
-    return `${baseUrl}${path}`;
+  private _buildUrl(baseUrl: string, path: string, target: 'lan' | 'cloud'): string {
+    if (target === 'lan' && baseUrl) return `${baseUrl}${path}`;
+    return buildCloudUrl(path);
   }
 
   // ─── Main Sync Cycle ────────────────────────────────────────────────────────
@@ -347,7 +387,7 @@ class SyncEngine {
    * Perform a full sync cycle using WatermelonDB's synchronize().
    * Dynamically imports the synchronize function to avoid SSR bundling issues.
    */
-  async sync(database: Database): Promise<void> {
+  async sync(database: Database, isRetry: boolean = false): Promise<void> {
     if (this.isSyncing) return;
     if (!isBrowser) return;
 
@@ -373,17 +413,28 @@ class SyncEngine {
 
       const lastPulledAt = this.getLastSyncTimestamp();
 
-      // Dynamic import of synchronize — avoids bundling WDB for SSR
-      const { synchronize } = await import('@nozbe/watermelondb');
+      // Dynamic import of synchronize — avoids bundling WDB for SSR.
+      // CRITICAL: WatermelonDB exports `synchronize` from the `/sync` subpath
+      // ONLY — the main entry does NOT re-export it (verified on 0.28.0).
+      // The old `import('@nozbe/watermelondb')` destructured `undefined` and
+      // every sync cycle failed with "SyncEngine] Sync failed: synchronize
+      // is not a function".
+      const { synchronize } = await import('@nozbe/watermelondb/sync');
 
       console.log(`[SyncEngine] Syncing via ${target.toUpperCase()}${baseUrl ? ` (${baseUrl})` : ''}`);
 
-      await synchronize(database, {
+      // WatermelonDB 0.28 synchronize takes a SINGLE SyncArgs object
+      // ({ database, pullChanges, pushChanges, ... }) — the legacy
+      // two-argument call shape would destructure `database` from the
+      // Database instance and crash inside the sync impl.
+      await synchronize({
+        database,
+
         pullChanges: async ({ lastPulledAt: wdbLastPulledAt }) => {
           const since = wdbLastPulledAt || lastPulledAt;
           console.log('[SyncEngine] Pulling changes since:', since);
 
-          const response = await fetch(this._buildUrl(baseUrl, '/api/sync/pull'), {
+          const response = await fetch(this._buildUrl(baseUrl, '/api/sync/pull', target), {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -397,7 +448,8 @@ class SyncEngine {
 
           if (!response.ok) {
             const errorData = await response.json().catch(() => ({}));
-            throw new Error(
+            throw new SyncHttpError(
+              response.status,
               errorData.error || `Pull failed with status ${response.status}`,
             );
           }
@@ -413,7 +465,7 @@ class SyncEngine {
         pushChanges: async ({ changes, lastPulledAt }) => {
           console.log('[SyncEngine] Pushing changes to', target);
 
-          const response = await fetch(this._buildUrl(baseUrl, '/api/sync/push'), {
+          const response = await fetch(this._buildUrl(baseUrl, '/api/sync/push', target), {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -428,7 +480,8 @@ class SyncEngine {
 
           if (!response.ok) {
             const errorData = await response.json().catch(() => ({}));
-            throw new Error(
+            throw new SyncHttpError(
+              response.status,
               errorData.error || `Push failed with status ${response.status}`,
             );
           }
@@ -449,8 +502,24 @@ class SyncEngine {
       this.lastError = message;
       console.warn('[SyncEngine] Sync failed:', message);
 
-      // If LAN sync failed, clear the LAN server cache so next cycle probes again
-      if (target === 'lan') {
+      // LAN server answered 404 on the sync endpoints — its local API build
+      // predates the WatermelonDB sync routes. Cool it down and retry this
+      // cycle against the cloud instead of failing every 5 minutes with
+      // "Sync failed: Not found".
+      if (
+        target === 'lan' &&
+        error instanceof SyncHttpError &&
+        error.status === 404
+      ) {
+        this.lanSyncUnsupportedUntil = Date.now() + LAN_UNSUPPORTED_COOLDOWN_MS;
+        this._clearLanServer();
+        console.warn('[SyncEngine] LAN server has no /api/sync/pull route — falling back to cloud for', LAN_UNSUPPORTED_COOLDOWN_MS / 1000, 's');
+        if (!isRetry) {
+          this.isSyncing = false;
+          return this.sync(database, true);
+        }
+      } else if (target === 'lan') {
+        // Any other LAN failure — clear the cache so the next cycle re-probes
         console.log('[SyncEngine] LAN sync failed — will re-probe next cycle');
         this._clearLanServer();
       }

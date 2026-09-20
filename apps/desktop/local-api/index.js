@@ -24,6 +24,8 @@ const { createServer } = require('http')
 const { randomBytes, timingSafeEqual, createHash, scryptSync } = require('crypto')
 const { localDb, setupPragmas, ensureDatabaseReady } = require('./lib/db')
 const localRealtime = require('./local-realtime')
+const fileStore = require('./lib/file-store')
+const { createFileSync } = require('./lib/file-sync')
 
 // ─── Configuration ────────────────────────────────────────────────────────
 
@@ -48,6 +50,12 @@ let eventListeners = []
 let mutationListeners = []
 let idemColumnEnsured = false
 let outboxV3Ensured = false
+
+// Round 15 — local file store origin + file-sync worker handle. The local
+// origin is what every locally stored file URL is built against; it is
+// refreshed at startLocalApi() with the actual bound port.
+let localOrigin = `http://${BIND_ADDRESS}:${DEFAULT_PORT}`
+let fileSync = null
 
 // ─── Local Device Identity & Unlock Credentials (Task 14) ───────────────
 // Desktop authentication model:
@@ -79,6 +87,57 @@ async function setLocalMeta(key, value) {
     'ON CONFLICT("key") DO UPDATE SET "value" = excluded."value"',
     key, String(value)
   )
+}
+
+/**
+ * Round 15 — LOCALIZE a file URL: when the URL points at a file that ALSO
+ * exists in this device's local file store, rewrite it to the local API
+ * origin so <img> tags render instantly and OFFLINE. Anything else (cloud
+ * URLs for files we never downloaded, data: URIs, …) passes through
+ * untouched — the cloud remains the cross-device source of truth.
+ */
+async function localizeFileUrl(url) {
+  try {
+    if (!url || typeof url !== 'string' || url.indexOf('/api/upload/file/') === -1) return url
+    const storagePath = fileStore.storagePathFromUrl(url)
+    if (!storagePath) return url
+    const abs = fileStore.resolveRelativeStoragePath(storagePath)
+    if (abs && require('fs').existsSync(abs)) {
+      return localOrigin + fileStore.publicFilePath(storagePath)
+    }
+    return url
+  } catch {
+    return url
+  }
+}
+
+/**
+ * Resolve the agency id the current session may read/write, mirroring the
+ * cloud's ensureAgencyIdOwnership/requireAgencyAccess pair.
+ *
+ * The web UI always sends ?agencyId=<user.agencyId> on /api/agency/* reads,
+ * but the local endpoints used to ignore it and read sessionUser.agencyId —
+ * when the local session carried no agencyId (e.g. an owner re-login before
+ * the owner fallback existed) every read 403'd and the profile/settings
+ * pages rendered empty. This helper accepts the explicit param ONLY when the
+ * session user genuinely has access to that agency.
+ */
+async function resolveSessionAgencyId(explicitAgencyId) {
+  const sessionAgencyId = sessionUser ? sessionUser.agencyId : null
+  if (!explicitAgencyId) return sessionAgencyId
+  if (sessionAgencyId && explicitAgencyId === sessionAgencyId) return explicitAgencyId
+  if (!sessionUser) return null
+  try {
+    if (sessionUser.role === 'AGENCY_OWNER') {
+      const owned = await db.agency.findFirst({ where: { id: explicitAgencyId, ownerId: sessionUser.id } })
+      if (owned) return explicitAgencyId
+    }
+    const staff = await db.agencyStaff.findFirst({
+      where: { agencyId: explicitAgencyId, userId: sessionUser.id, isActive: true },
+    })
+    if (staff) return explicitAgencyId
+  } catch { /* fall through */ }
+  return null
 }
 
 /**
@@ -1055,7 +1114,18 @@ function createApp() {
           const staff = await db.agencyStaff.findFirst({
             where: { userId: user.id, isActive: true },
           })
-          return staff ? staff.agencyId : null
+          if (staff) return staff.agencyId
+          // Owner fallback: the cloud's agency-create flow binds an owner via
+          // Agency.ownerId ONLY (no AgencyStaff row is ever created), so a
+          // wizard-created owner syncing locally has no staff row. Without
+          // this fallback the local session gets agencyId: null after
+          // re-login and every /api/agency/* read returns 403 → the profile,
+          // settings and QR pages all render empty (mirrors cloud auth.ts).
+          if (user.role === 'AGENCY_OWNER') {
+            const owned = await db.agency.findFirst({ where: { ownerId: user.id } })
+            if (owned) return owned.id
+          }
+          return null
         }
         return null
       }
@@ -1111,7 +1181,7 @@ function createApp() {
               fullName: user.fullName,
               role: user.role,
               language: user.language || 'ar',
-              avatarUrl: user.avatarUrl || null,
+              avatarUrl: await localizeFileUrl(user.avatarUrl || null),
               agencyId: await buildStaffAgencyId(user),
             }
             sessionToken = randomBytes(32).toString('hex')
@@ -1153,10 +1223,13 @@ function createApp() {
           fullName: cloudUser.fullName || cloudUser.name || '',
           role: cloudUser.role || 'CUSTOMER',
           language: cloudUser.language || 'ar',
-          avatarUrl: cloudUser.avatarUrl || null,
+          avatarUrl: await localizeFileUrl(cloudUser.avatarUrl || null),
           agencyId: cloudUser.agencyId || null,
         }
         emitEvent('auth:login', { user: sessionUser })
+        // Round 15 — push any local-only files (e.g. an avatar uploaded
+        // offline) now that a session exists.
+        if (fileSync) fileSync.schedule('login')
         console.log('[LocalAPI] Cloud login via local API — device credential stored:', sessionUser.username)
         return c.json({ success: true, user: sessionUser, token: sessionToken })
       }
@@ -1397,11 +1470,16 @@ function createApp() {
         fullName: verifiedUser.fullName || '',
         role: verifiedUser.role || 'CUSTOMER',
         language: verifiedUser.language || 'ar',
-        avatarUrl: verifiedUser.avatarUrl || null,
+        avatarUrl: await localizeFileUrl(verifiedUser.avatarUrl || null),
         agencyId: verifiedUser.agencyId || null,
       }
       emitEvent('auth:login', { user: sessionUser })
       console.log(`[LocalAPI] Account VERIFIED + session established: ${sessionUser.username} (${sessionUser.role})`)
+      // Round 15 — with a session in hand the file-sync worker can finally
+      // push the register-time avatar (and any other local-only files) to
+      // the cloud. Fire it now so the avatar appears on the user's OTHER
+      // devices within seconds.
+      if (fileSync) fileSync.schedule('verified')
       return c.json({
         success: true,
         verified: true,
@@ -1483,84 +1561,446 @@ function createApp() {
    * limits, every other type requires the forwarded cloud token).
    */
 
-  /** POST /api/upload — forward multipart body (file + type) to the cloud. */
+  /**
+   * Round 15 — POST /api/upload is now LOCAL-FIRST. The previous
+   * implementation forwarded the multipart body verbatim to the cloud, so a
+   * registration-time avatar upload failed the instant the cloud was
+   * unreachable (the reported "the image never shows in the preview") and
+   * the desktop stored no files at all. Now:
+   *   1. The file is written to THIS device's organized file store
+   *      (lib/file-store.js → <files>/<bucket>/<yyyy>/<mm>/…).
+   *   2. A local FileAsset row is created (syncState LOCAL_ONLY).
+   *   3. The response URL points at THIS local API, so the preview renders
+   *      immediately and offline.
+   *   4. lib/file-sync.js mirrors the file to the cloud in the background
+   *      (POST /api/files/sync/push) and flips the row to SYNCED.
+   * Cloud-side URL normalization (apps/api/src/lib/file-url.ts) rewrites the
+   * local URL carried in records (avatarUrl, receiptUrl, …) to the cloud's
+   * public URL at sync intake, so other devices keep working.
+   *
+   * Validation mirrors the cloud's per-type policy: the avatar path stays
+   * PUBLIC (register-time upload, no session yet) with the strict image-only
+   * whitelist + 2MB cap; every other bucket requires a session.
+   */
+  const UPLOAD_LIMITS = {
+    avatar: 2 * 1024 * 1024,
+    logo: 2 * 1024 * 1024,
+    receipt: 5 * 1024 * 1024,
+    document: 10 * 1024 * 1024,
+    general: 5 * 1024 * 1024,
+  }
+  const PUBLIC_AVATAR_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp'])
+  const ALL_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'pdf'])
+
   app.post('/api/upload', async (c) => {
     try {
-      const base = cloudBaseUrl()
-      const search = new URL(c.req.url).search || ''
-      // Forward the EXACT Content-Type header — it carries the multipart
-      // boundary; replacing it would corrupt the body.
-      const contentType = c.req.header('Content-Type') || 'application/octet-stream'
-      const bodyBuffer = Buffer.from(await c.req.arrayBuffer())
-      let cloud
+      let formData
       try {
-        const res = await fetch(base + '/api/upload' + search, {
-          method: 'POST',
+        formData = await c.req.formData()
+      } catch (parseErr) {
+        return c.json({ success: false, error: 'multipart/form-data body required' }, 400)
+      }
+      const file = formData.get('file')
+      const rawType = String(formData.get('type') || c.req.query('type') || 'general').trim().toLowerCase()
+      const bucket = ['general', 'avatar', 'logo', 'receipt', 'document'].includes(rawType) && /^[a-z][a-z0-9-]{0,23}$/.test(rawType)
+        ? rawType
+        : 'general'
+
+      if (!file || typeof file === 'string') {
+        return c.json({ success: false, error: 'No file provided' }, 400)
+      }
+
+      const ext = (String(file.name || '').split('.').pop() || '').toLowerCase()
+
+      // ── Auth + extension policy (mirrors the cloud route) ──
+      if (bucket === 'avatar') {
+        // PUBLIC path — registration uploads an avatar before any session exists.
+        if (!PUBLIC_AVATAR_EXTENSIONS.has(ext)) {
+          return c.json({ success: false, error: `Invalid image type ".${ext}" — allowed: ${[...PUBLIC_AVATAR_EXTENSIONS].join(', ')}` }, 400)
+        }
+      } else {
+        if (!sessionToken) {
+          return c.json({ success: false, error: 'Authentication required' }, 401)
+        }
+        if (!ALL_EXTENSIONS.has(ext)) {
+          return c.json({ success: false, error: `Invalid file type ".${ext}" — allowed: ${[...ALL_EXTENSIONS].join(', ')}` }, 400)
+        }
+      }
+
+      const maxBytes = UPLOAD_LIMITS[bucket] || UPLOAD_LIMITS.general
+      if (file.size > maxBytes) {
+        return c.json({ success: false, error: `File too large — max ${Math.round(maxBytes / 1024 / 1024)}MB` }, 400)
+      }
+
+      const buffer = Buffer.from(await file.arrayBuffer())
+      const filename = fileStore.makeFilename(ext)
+      const saved = await fileStore.saveUpload(bucket, buffer, filename)
+
+      const checksum = createHash('sha256').update(buffer).digest('hex')
+      const deviceFileId = 'dev-' + randomBytes(12).toString('hex')
+      const url = fileStore.absoluteFileUrl(localOrigin, saved.storagePath)
+
+      try {
+        await db.fileAsset.create({
+          data: {
+            deviceFileId,
+            bucket,
+            storagePath: saved.storagePath,
+            originalName: String(file.name || filename).slice(0, 200),
+            mimeType: file.type || 'application/octet-stream',
+            size: buffer.length,
+            checksum,
+            url,
+            ownerId: sessionUser ? sessionUser.id : null,
+            agencyId: sessionUser && sessionUser.agencyId ? sessionUser.agencyId : null,
+            syncState: 'LOCAL_ONLY',
+          },
+        })
+      } catch (regErr) {
+        // The blob is durably stored; a registry hiccup must not fail the upload.
+        console.warn('[LocalAPI] FileAsset registration failed:', regErr?.message || regErr)
+      }
+
+      // Kick the file-sync worker — the blob reaches the cloud in the background.
+      if (fileSync) fileSync.schedule('upload')
+
+      return c.json({
+        success: true,
+        url,
+        path: fileStore.publicFilePath(saved.storagePath),
+        filename,
+        storagePath: saved.storagePath,
+        deviceFileId,
+        provider: 'local-device',
+        size: buffer.length,
+        type: bucket,
+        syncState: 'LOCAL_ONLY',
+      }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Upload error:', error)
+      return c.json({ success: false, error: 'Upload failed' }, 500)
+    }
+  })
+
+  /**
+   * Round 15 — GET /api/upload/file/* serves the LOCAL file store (both the
+   * organized <bucket>/<yyyy>/<mm>/<name> shape and the legacy flat
+   * <bucket>/<name> shape). Public like the cloud (capability URLs — the
+   * filenames are unguessable); this is what makes uploaded avatars/logos/
+   * receipts render instantly in the desktop UI, OFFLINE included.
+   */
+  const MIME_BY_EXT = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+    webp: 'image/webp', svg: 'image/svg+xml', pdf: 'application/pdf',
+  }
+  const serveLocalFile = async (c) => {
+    const type = c.req.param('type')
+    const yyyy = c.req.param('yyyy')
+    const mm = c.req.param('mm')
+    const name = c.req.param('name') || c.req.param('rest')
+    if (!type || !name || !/^[a-z][a-z0-9-]{0,23}$/.test(type)) {
+      return c.json({ success: false, error: 'Invalid file path' }, 400)
+    }
+    // Organized route has yyyy/mm params; legacy flat route passes only the name.
+    const storagePath = yyyy && mm ? `${type}/${yyyy}/${mm}/${name}` : `${type}/${name}`
+    const data = await fileStore.readByStoragePath(storagePath)
+    if (!data) {
+      return c.json({ success: false, error: 'File not found' }, 404)
+    }
+    const ext = (name.split('.').pop() || '').toLowerCase()
+    const mime = MIME_BY_EXT[ext] || 'application/octet-stream'
+    return new Response(new Uint8Array(data), {
+      status: 200,
+      headers: {
+        'Content-Type': mime,
+        'Content-Length': String(data.length),
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Content-Disposition': 'inline',
+      },
+    })
+  }
+  app.get('/api/upload/file/:type/:yyyy/:mm/:name', serveLocalFile)
+  app.get('/api/upload/file/:type/:name', serveLocalFile)
+
+  /**
+   * Round 15 — GET /api/files/status: local file store + sync diagnostics.
+   */
+  app.get('/api/files/status', requireAuth(), async (c) => {
+    try {
+      const status = fileStore.getStatus()
+      const counts = { LOCAL_ONLY: 0, DIRTY: 0, SYNCED: 0, DELETED: 0 }
+      try {
+        const rows = await db.$queryRawUnsafe('SELECT "syncState", COUNT(*) as n FROM "FileAsset" GROUP BY "syncState"')
+        for (const row of rows || []) counts[String(row.syncState)] = Number(row.n)
+      } catch { /* table may be absent on ancient DBs */ }
+      const cursor = await getLocalMeta('file_sync_cursor')
+      return c.json({ success: true, store: status, counts, pullCursor: cursor })
+    } catch (error) {
+      return c.json({ success: false, error: 'File status failed' }, 500)
+    }
+  })
+
+  /**
+   * Round 15 — POST /api/files/sync-now: run one file-sync round on demand
+   * (diagnostics / Settings → Sync recovery).
+   */
+  app.post('/api/files/sync-now', requireAuth(), async (c) => {
+    try {
+      if (!fileSync) return c.json({ success: false, error: 'File sync not initialized' }, 503)
+      const result = await fileSync.syncNow('manual')
+      return c.json({ success: true, result })
+    } catch (error) {
+      return c.json({ success: false, error: 'File sync failed' }, 500)
+    }
+  })
+
+  /**
+   * Round 15 — DELETE /api/upload removes the LOCAL copy first (offline-safe)
+   * and mirrors the deletion to the cloud: a SYNCED file is tombstoned right
+   * away (best-effort) or, when offline, the row flips to DELETED so the
+   * file-sync worker replays the tombstone once the cloud is reachable.
+   */
+  app.delete('/api/upload', requireAuth(), async (c) => {
+    try {
+      let body
+      try { body = await c.req.json() } catch { body = {} }
+      const url = body && body.url
+      if (!url) {
+        return c.json({ success: false, error: 'No URL provided' }, 400)
+      }
+      const storagePath = fileStore.storagePathFromUrl(url)
+      if (!storagePath) {
+        return c.json({ success: false, error: 'Invalid file URL — only /api/upload/file/* paths are allowed' }, 400)
+      }
+
+      // Local removal + registry update.
+      await fileStore.deleteByStoragePath(storagePath)
+      const row = await db.fileAsset.findFirst({ where: { storagePath } })
+      if (row) {
+        if (row.syncState === 'SYNCED') {
+          // Already on the cloud — tombstone there immediately (best-effort).
+          let cloudDeleted = false
+          try {
+            const res = await fetch(cloudBaseUrl() + `/api/files/sync/${encodeURIComponent(row.deviceFileId)}`, {
+              method: 'DELETE',
+              headers: { ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}) },
+              signal: AbortSignal.timeout(10000),
+            })
+            cloudDeleted = res.ok || res.status === 404
+          } catch { /* offline — replay via the worker */ }
+          if (cloudDeleted) {
+            await db.fileAsset.delete({ where: { id: row.id } }).catch(() => {})
+          } else {
+            await db.fileAsset.update({ where: { id: row.id }, data: { syncState: 'DELETED' } }).catch(() => {})
+            if (fileSync) fileSync.schedule('delete')
+          }
+        } else if (row.syncState === 'LOCAL_ONLY' || row.syncState === 'DIRTY') {
+          // Never reached the cloud — the local row is enough.
+          await db.fileAsset.delete({ where: { id: row.id } }).catch(() => {})
+        } else {
+          await db.fileAsset.update({ where: { id: row.id }, data: { syncState: 'DELETED' } }).catch(() => {})
+        }
+      }
+      return c.json({ success: true, message: 'File deleted' })
+    } catch (error) {
+      console.error('[LocalAPI] Upload delete error:', error)
+      return c.json({ success: false, error: 'Delete failed' }, 500)
+    }
+  })
+
+  /**
+   * Task 24: /api/app-versions cloud passthrough — app binaries and version
+   * records exist ONLY on the cloud, but the admin panel (rendered inside the
+   * desktop shell too) posts uploads to the local-first base URL and used to
+   * get a bare local 404. Every method is forwarded verbatim — multipart
+   * bodies included — with the cloud session token attached when one exists.
+   * Authorization is enforced by the cloud (requireAdmin); without a session
+   * the forwarded request simply carries no token and the cloud answers 401.
+   */
+  const forwardAppVersions = async (c) => {
+    try {
+      const reqUrl = new URL(c.req.url)
+      const base = cloudBaseUrl()
+      const target = base + reqUrl.pathname + (reqUrl.search || '')
+      const method = c.req.method
+      const isBodyful = method !== 'GET' && method !== 'HEAD'
+      const contentType = c.req.header('Content-Type')
+      let bodyBuffer = null
+      if (isBodyful) {
+        try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
+      }
+      let res
+      try {
+        res = await fetch(target, {
+          method,
           headers: {
-            'Content-Type': contentType,
-            'Content-Length': String(bodyBuffer.length),
+            ...(contentType ? { 'Content-Type': contentType } : {}),
+            ...(bodyBuffer ? { 'Content-Length': String(bodyBuffer.length) } : {}),
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: bodyBuffer,
+          signal: AbortSignal.timeout(120000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] App-versions proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'App version management requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      const resContentType = res.headers.get('Content-Type') || ''
+      if (resContentType.includes('application/json')) {
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON body */ }
+        return c.json(data || { success: res.ok }, res.status)
+      }
+      // Binary passthrough (e.g. /download) — stream the bytes back untouched.
+      const buf = Buffer.from(await res.arrayBuffer())
+      return new Response(buf, {
+        status: res.status,
+        headers: {
+          'Content-Type': resContentType || 'application/octet-stream',
+          'Content-Length': String(buf.length),
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] App-versions proxy error:', error)
+      return c.json({ success: false, error: 'App version request failed' }, 500)
+    }
+  }
+  app.all('/api/app-versions', forwardAppVersions)
+  app.all('/api/app-versions/*', forwardAppVersions)
+
+  /**
+   * Round 15 — /api/agencies cloud proxy. Agency CREATION is a cloud-native
+   * operation (customCode uniqueness, the owner relation, the web/mobile
+   * catalogue), but the create-agency form posts to the local-first base
+   * URL and the local API had NO /api/agencies route — every attempt 404'd
+   * with the self-identifying "Not found" body. POST forwards to the cloud
+   * with the session token, then kicks a sync round so the new agency (and
+   * its services) land in the local DB immediately; GET forwards admin
+   * listings. Authorization stays cloud-enforced.
+   */
+  const forwardAgencies = async (c) => {
+    try {
+      const reqUrl = new URL(c.req.url)
+      // Strip the web-gateway routing hint — meaningless to the cloud.
+      reqUrl.searchParams.delete('XTransformPort')
+      const target = cloudBaseUrl() + reqUrl.pathname + (reqUrl.search || '')
+      const method = c.req.method
+      let bodyBuffer = null
+      if (method !== 'GET' && method !== 'HEAD') {
+        try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
+      }
+      let res
+      try {
+        res = await fetch(target, {
+          method,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(bodyBuffer ? { 'Content-Length': String(bodyBuffer.length) } : {}),
             ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
           },
           body: bodyBuffer,
           signal: AbortSignal.timeout(30000),
         })
-        let data = null
-        try { data = await res.json() } catch { /* non-JSON error body */ }
-        cloud = { ok: res.ok, status: res.status, data }
       } catch (err) {
-        console.warn('[LocalAPI] Upload proxy: cloud unreachable:', err?.message || err)
+        console.warn('[LocalAPI] Agencies proxy: cloud unreachable:', err?.message || err)
         return c.json({
           success: false,
-          error: 'Uploading files requires an internet connection — the cloud API is unreachable',
+          error: 'Creating an agency requires an internet connection — the cloud API is unreachable',
           code: 'CLOUD_UNREACHABLE',
         }, 503)
       }
-      if (!cloud.ok || !cloud.data || !cloud.data.url) {
-        const status = cloud.status || 500
-        const errBody = cloud.data && typeof cloud.data === 'object'
-          ? cloud.data
-          : { success: false, error: 'Upload failed' }
-        console.warn(`[LocalAPI] Upload rejected by cloud: HTTP ${status} — ${errBody.error || '(no error body)'}`)
-        return c.json(errBody, status)
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON */ }
+      if (res.ok && (method === 'POST' || method === 'PUT' || method === 'PATCH') && data && data.success) {
+        // Round 16 — agency CREATED: adopt it into the local session at once.
+        // The cloud 201 now carries an upgraded token whose JWT embeds the new
+        // agencyId; the renderer adopts it (setSessionToken → IPC setAuth),
+        // but the local session must not stay agency-less until then — every
+        // /api/agency/* read would 403 and the db-status readiness gate would
+        // keep reporting NOT_INITIALIZED.
+        if (method === 'POST' && data.agency && data.agency.id && sessionUser) {
+          sessionUser.agencyId = data.agency.id
+          console.log('[LocalAPI] Session agencyId updated after agency create:', data.agency.id)
+          emitEvent('auth:login', { user: sessionUser })
+        }
+        // Kick a sync round so the created/updated agency appears locally at once.
+        try { if (fileSync) fileSync.schedule('agency-created') } catch { /* non-fatal */ }
+        try {
+          // Lazy require — sync-service lazily requires ./index (circular dep).
+          const syncService = require('./sync-service')
+          if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+        } catch { /* non-fatal */ }
       }
-      return c.json(cloud.data, 201)
+      return c.json(data || { success: res.ok }, res.ok ? (res.status === 201 ? 201 : 200) : (res.status || 500))
     } catch (error) {
-      console.error('[LocalAPI] Upload proxy error:', error)
-      return c.json({ success: false, error: 'Upload failed' }, 500)
+      console.error('[LocalAPI] Agencies proxy error:', error)
+      return c.json({ success: false, error: 'Agency request failed' }, 500)
     }
-  })
+  }
+  app.post('/api/agencies', forwardAgencies)
+  app.get('/api/agencies', forwardAgencies)
+  // Round 17 — sub-path GETs forward too: the create-agency wizard live-checks
+  // the chosen code via GET /api/agencies/check-code?code=XXX before submit.
+  app.get('/api/agencies/*', forwardAgencies)
+  app.put('/api/agencies/*', forwardAgencies)
+  app.patch('/api/agencies/*', forwardAgencies)
 
-  /** DELETE /api/upload — forward the delete request to the cloud (session-gated). */
-  app.delete('/api/upload', requireAuth(), async (c) => {
+  /**
+   * Round 16 — /api/auth/refresh-session proxy. Asks the cloud to re-issue
+   * the session token from the DATABASE's current state (role + agency
+   * ownership). This upgrades a stale snapshot token — the exact situation
+   * of an AGENCY_OWNER whose token predates their agency (agencyId: '') —
+   * and imports the fresh token + user into THIS local session so the sync
+   * engine and every local agency endpoint see the agency immediately.
+   * No local body needed; the CURRENT stored cloud token is forwarded.
+   */
+  app.post('/api/auth/refresh-session', async (c) => {
     try {
-      const base = cloudBaseUrl()
-      let body
-      try { body = await c.req.json() } catch { body = {} }
-      let cloud
+      if (!sessionToken) {
+        return c.json({ success: false, error: 'No active session' }, 401)
+      }
+      let res
       try {
-        const res = await fetch(base + '/api/upload', {
-          method: 'DELETE',
+        res = await fetch(cloudBaseUrl() + '/api/auth/refresh-session', {
+          method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+            'Content-Length': 2,
+            Authorization: 'Bearer ' + sessionToken,
           },
-          body: JSON.stringify(body || {}),
-          signal: AbortSignal.timeout(10000),
+          body: '{}',
+          signal: AbortSignal.timeout(15000),
         })
-        let data = null
-        try { data = await res.json() } catch { /* non-JSON */ }
-        cloud = { ok: res.ok, status: res.status, data }
       } catch (err) {
-        return c.json({
-          success: false,
-          error: 'Deleting files requires an internet connection — the cloud API is unreachable',
-          code: 'CLOUD_UNREACHABLE',
-        }, 503)
+        console.warn('[LocalAPI] Refresh-session proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Refreshing the session requires an internet connection', code: 'CLOUD_UNREACHABLE' }, 503)
       }
-      return c.json(cloud.data || { success: cloud.ok }, cloud.ok ? 200 : (cloud.status || 500))
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON */ }
+      if (res.ok && data && data.success && data.token && data.user) {
+        // Adopt the refreshed session locally (same contract as import-session).
+        sessionToken = data.token
+        sessionUser = {
+          id: data.user.id,
+          username: data.user.username || data.user.email || 'imported',
+          fullName: data.user.fullName || data.user.name || '',
+          role: data.user.role || 'CUSTOMER',
+          language: data.user.language || 'ar',
+          avatarUrl: await localizeFileUrl(data.user.avatarUrl || null),
+          agencyId: data.user.agencyId || null,
+        }
+        console.log('[LocalAPI] Session refreshed from cloud:', sessionUser.username, 'agency:', sessionUser.agencyId || 'none')
+        emitEvent('auth:login', { user: sessionUser })
+        if (fileSync) fileSync.schedule('refresh-session')
+      }
+      return c.json(data || { success: res.ok }, res.ok ? 200 : (res.status || 500))
     } catch (error) {
-      console.error('[LocalAPI] Upload delete proxy error:', error)
-      return c.json({ success: false, error: 'Delete failed' }, 500)
+      console.error('[LocalAPI] Refresh-session proxy error:', error)
+      return c.json({ success: false, error: 'Session refresh failed' }, 500)
     }
   })
 
@@ -1670,12 +2110,13 @@ function createApp() {
         fullName: user.fullName || user.name || '',
         role: user.role || 'CUSTOMER',
         language: user.language || 'ar',
-        avatarUrl: user.avatarUrl || null,
+        avatarUrl: await localizeFileUrl(user.avatarUrl || null),
         agencyId: user.agencyId || null,
       }
 
       console.log('[LocalAPI] Session imported from cloud:', sessionUser.username, 'role:', sessionUser.role)
       emitEvent('auth:login', { user: sessionUser })
+      if (fileSync) fileSync.schedule('import-session')
 
       return c.json({
         success: true,
@@ -2001,7 +2442,11 @@ function createApp() {
   // GET /api/agency/profile — current agency with stats
   app.get('/api/agency/profile', authMiddleware, async (c) => {
     try {
-      const agencyId = sessionUser.agencyId
+      // The UI sends ?agencyId=<user.agencyId> — accept it when the session
+      // genuinely has access (previously the param was ignored entirely and
+      // a session without a bound agencyId 403'd, leaving the profile page
+      // with no data at all).
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
       if (!agencyId) {
         return c.json({ success: false, error: 'No agency associated with this account' }, 403)
       }
@@ -2064,9 +2509,11 @@ function createApp() {
         phone: agency.phone,
         email: agency.email,
         code: agency.customCode,
-        logoUrl: agency.logoUrl,
+        logoUrl: await localizeFileUrl(agency.logoUrl),
+        coverUrl: agency.coverUrl ? await localizeFileUrl(agency.coverUrl) : null,
         workingHoursStart: agency.workingHoursStart,
         workingHoursEnd: agency.workingHoursEnd,
+        workingDays: agency.workingDays || '1,2,3,4,5',
       })
     } catch (error) {
       console.error('[LocalAPI] Agency profile error:', error)
@@ -2139,8 +2586,8 @@ function createApp() {
 
       const body = await c.req.json()
 
-      // Only allow basic fields
-      const allowedFields = ['name', 'phone', 'workingHoursStart', 'workingHoursEnd', 'description', 'address', 'logoUrl']
+      // Only allow basic fields (Round 15: + workingDays/coverUrl)
+      const allowedFields = ['name', 'phone', 'workingHoursStart', 'workingHoursEnd', 'description', 'address', 'logoUrl', 'coverUrl', 'workingDays']
       const updateData = {}
       for (const field of allowedFields) {
         if (body[field] !== undefined) {
@@ -2730,17 +3177,31 @@ function createApp() {
   // GET /api/agency/staff
   app.get('/api/agency/staff', authMiddleware, async (c) => {
     try {
-      const agencyId = sessionUser.agencyId
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
       if (!agencyId) {
         return c.json({ success: false, error: 'No agency associated with this account' }, 403)
       }
 
+      // Cloud contract (apps/api/src/routes/agency.ts GET /staff): rows
+      // include the joined user and permissions parsed from JSON, returned
+      // as { staff: [...] } — the settings UI reads data.staff.
       const staffList = await db.agencyStaff.findMany({
         where: { agencyId },
-        orderBy: { joinedAt: 'asc' },
+        include: {
+          user: {
+            select: { id: true, username: true, fullName: true, role: true, isActive: true },
+          },
+        },
+        orderBy: { joinedAt: 'desc' },
       })
 
-      return c.json({ success: true, data: staffList })
+      const staffWithPermissions = staffList.map((s) => {
+        let permissions = {}
+        try { permissions = s.permissions ? JSON.parse(s.permissions) : {} } catch { permissions = {} }
+        return { ...s, permissions }
+      })
+
+      return c.json({ success: true, staff: staffWithPermissions, data: staffWithPermissions })
     } catch (error) {
       console.error('[LocalAPI] List staff error:', error)
       return c.json({ success: false, error: 'Failed to list staff' }, 500)
@@ -3493,6 +3954,8 @@ function createApp() {
 
       // Remove passwordHash from response
       const { passwordHash, ...safeUser } = fullUser
+      // Round 15 — serve the local copy of the avatar when we have one.
+      safeUser.avatarUrl = await localizeFileUrl(safeUser.avatarUrl)
 
       return c.json({ success: true, data: safeUser })
     } catch (error) {
@@ -3551,29 +4014,73 @@ function createApp() {
   // 12. SETTINGS (auth required)
   // ═══════════════════════════════════════════════════════════════════════
 
-  // GET /api/agency/settings — queue settings
+  // GET /api/agency/settings — MUST match the cloud contract exactly
+  // (apps/api/src/routes/agency.ts GET /settings): a FLAT object with
+  // services + working hours + queue knobs. The old local shape wrapped a
+  // bare QueueSettings row in { success, data } with NO services and NO
+  // working hours, so the desktop settings page rendered empty even when
+  // the data existed locally.
   app.get('/api/agency/settings', authMiddleware, async (c) => {
     try {
-      const agencyId = sessionUser.agencyId
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
       if (!agencyId) {
         return c.json({ success: false, error: 'No agency associated with this account' }, 403)
       }
 
-      let settings = await db.queueSettings.findFirst({ where: { agencyId } })
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId },
+        include: {
+          services: {
+            where: { isActive: true },
+            select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
+          },
+          queueSettings: true,
+        },
+      })
 
-      // Return defaults if no settings exist yet
-      if (!settings) {
-        settings = {
-          agencyId,
-          lastIssuedNumber: 0,
-          currentServingNumber: 0,
-          isPaused: false,
-          avgServiceTime: 5,
-          maxDailyTickets: 500,
-        }
+      if (!agency) {
+        // Agency not pulled yet — same defaults the cloud returns for an
+        // unknown agency (never 500, never an empty wrapped row).
+        return c.json({
+          success: true,
+          _partial: true,
+          _reason: 'Agency not yet synced to local database',
+          avgServiceTime: 10,
+          maxReservations: 50,
+          isQueueOpen: true,
+          services: [],
+          workingHoursStart: '08:00',
+          workingHoursEnd: '17:00',
+          autoPauseWhenFull: false,
+          kioskModeEnabled: false,
+          sponsorSms: false,
+          smsBalance: 0,
+        })
       }
 
-      return c.json({ success: true, data: settings })
+      const qs = agency.queueSettings
+      const settings = {
+        avgServiceTime: agency.averageServiceTime ?? qs?.avgServiceTime ?? 10,
+        maxReservations: agency.maxActiveReservations ?? 50,
+        isQueueOpen: agency.isQueueOpen ?? true,
+        services: agency.services,
+        workingHoursStart: agency.workingHoursStart ?? '08:00',
+        workingHoursEnd: agency.workingHoursEnd ?? '17:00',
+        autoPauseWhenFull: agency.autoPauseWhenFull ?? false,
+        kioskModeEnabled: agency.kioskModeEnabled ?? false,
+        sponsorSms: agency.sponsorSms ?? false,
+        smsBalance: agency.smsBalance ?? 0,
+        // Local queue runtime state (superset — other local consumers +
+        // the queue UI read these from the same endpoint)
+        workingDays: agency.workingDays || '1,2,3,4,5',
+        lastIssuedNumber: qs?.lastIssuedNumber ?? 0,
+        currentServingNumber: qs?.currentServingNumber ?? 0,
+        isPaused: qs?.isPaused ?? false,
+        maxDailyTickets: qs?.maxDailyTickets ?? 500,
+      }
+      // Flat (cloud contract) + legacy { success, data } envelope so older
+      // local consumers keep working.
+      return c.json({ success: true, data: settings, ...settings })
     } catch (error) {
       console.error('[LocalAPI] Queue settings error:', error)
       return c.json({ success: false, error: 'Failed to load queue settings', detail: error?.message || String(error) }, 500)
@@ -3988,6 +4495,12 @@ function createApp() {
   app.get('/api/agency/announcements', authMiddleware, async (c) => {
     try {
       const agencyId = sessionUser.agencyId
+      // Round 16: a session without an agency used to feed Prisma
+      // agencyId: null → validation error → 500. An empty list is the
+      // honest pre-wizard answer.
+      if (!agencyId) {
+        return c.json({ announcements: [] })
+      }
       const announcements = await db.announcement.findMany({
         where: { agencyId, isActive: true },
         orderBy: { createdAt: 'desc' },
@@ -4297,15 +4810,57 @@ function createApp() {
   // PATCH /api/agency/profile — alias for PUT (cloud uses PATCH)
   app.patch('/api/agency/profile', authMiddleware, async (c) => {
     try {
-      const agencyId = sessionUser.agencyId
-      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated with this account' }, 403)
       const body = await c.req.json()
-      const allowedFields = ['name', 'nameAr', 'nameFr', 'phone', 'description', 'descriptionAr', 'descriptionFr', 'address', 'category', 'website', 'logoUrl']
+      // Field whitelist extended to match PUT + the cloud PATCH route —
+      // the profile form updates email/working hours/days and the cover.
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'phone', 'email', 'description', 'descriptionAr', 'descriptionFr', 'address', 'city', 'category', 'website', 'logoUrl', 'coverUrl', 'workingHoursStart', 'workingHoursEnd', 'workingDays']
       const updateData = {}
       for (const field of allowedFields) {
         if (body[field] !== undefined) updateData[field] = body[field]
       }
+      // The UI may send workingDays as an array — normalize to the CSV string
+      // stored on the Agency row (same normalization the create wizard uses).
+      if (Array.isArray(updateData.workingDays)) updateData.workingDays = updateData.workingDays.join(',')
+      if (updateData.workingDays !== undefined && !/^([0-6])(,[0-6])*$/.test(String(updateData.workingDays))) {
+        return c.json({ success: false, error: 'Invalid workingDays format' }, 400)
+      }
       if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields to update' }, 400)
+
+      // The agency row may not exist locally yet (created on the cloud via
+      // the wizard and the initial sync has not completed). The old code
+      // ran tx.agency.update anyway → Prisma P2025 → 500 "Failed to update
+      // profile". Now: apply on the cloud (source of truth) and let the
+      // sync bring the row down; fail with an honest 412 when offline.
+      const agencyExists = await db.agency.findUnique({ where: { id: agencyId }, select: { id: true } })
+      if (!agencyExists) {
+        if (sessionToken) {
+          try {
+            const target = `${cloudBaseUrl()}/api/agency/profile?agencyId=${encodeURIComponent(agencyId)}`
+            const cloudRes = await fetch(target, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
+              body: JSON.stringify(body),
+              signal: AbortSignal.timeout(8000),
+            })
+            const cloudData = await cloudRes.json().catch(() => ({}))
+            if (cloudRes.ok) {
+              try { if (fileSync) fileSync.schedule('agency-profile-cloud-patch') } catch {}
+              try { const syncService = require('./sync-service'); if (syncService.triggerSyncNow) syncService.triggerSyncNow() } catch {}
+              return c.json({ success: true, appliedOn: 'cloud' })
+            }
+            if (cloudRes.status === 401 || cloudRes.status === 403) {
+              return c.json({ success: false, error: cloudData.error || 'Session not valid for this agency — please log in again', code: 'SESSION_INVALID' }, cloudRes.status)
+            }
+            return c.json({ success: false, error: cloudData.error || 'Cloud update failed', code: 'CLOUD_UPDATE_FAILED' }, 502)
+          } catch (cloudErr) {
+            return c.json({ success: false, error: 'Agency not synced to this device yet and the cloud is unreachable — reconnect to the internet and try again', code: 'AGENCY_NOT_SYNCED' }, 412)
+          }
+        }
+        return c.json({ success: false, error: 'Agency not synced to this device yet — connect to the internet and try again', code: 'AGENCY_NOT_SYNCED' }, 412)
+      }
+
       // Part Q: business write + outbox row commit atomically.
       await withOutboxTransaction(async (tx) => {
         await tx.agency.update({ where: { id: agencyId }, data: updateData })
@@ -4315,6 +4870,10 @@ function createApp() {
       return c.json({ success: true })
     } catch (error) {
       console.error('[LocalAPI] PATCH /api/agency/profile error:', error)
+      const msg = String((error && (error.message || error)) || '')
+      if (msg.includes('P2025') || msg.toLowerCase().includes('not found')) {
+        return c.json({ success: false, error: 'Agency not synced to this device yet — reconnect to the internet and try again', code: 'AGENCY_NOT_SYNCED' }, 412)
+      }
       return c.json({ success: false, error: 'Failed to update profile' }, 500)
     }
   })
@@ -4502,19 +5061,23 @@ function createApp() {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency found' }, 404)
       const body = await c.req.json()
-      const { workingHoursStart, workingHoursEnd } = body
-      if (workingHoursStart === undefined && workingHoursEnd === undefined) {
-        return c.json({ success: false, error: 'workingHoursStart or workingHoursEnd required' }, 400)
+      const { workingHoursStart, workingHoursEnd, workingDays } = body
+      if (workingHoursStart === undefined && workingHoursEnd === undefined && workingDays === undefined) {
+        return c.json({ success: false, error: 'workingHoursStart, workingHoursEnd or workingDays required' }, 400)
+      }
+      if (workingDays !== undefined && !/^([0-6])(,[0-6])*$/.test(String(workingDays))) {
+        return c.json({ success: false, error: 'workingDays must be a comma-separated list of weekday numbers 0-6' }, 400)
       }
       const updateData = {}
       if (workingHoursStart !== undefined) updateData.workingHoursStart = workingHoursStart
       if (workingHoursEnd !== undefined) updateData.workingHoursEnd = workingHoursEnd
+      if (workingDays !== undefined) updateData.workingDays = String(workingDays)
       // Part Q: business write + outbox row commit atomically.
       const updated = await withOutboxTransaction(async (tx) => {
         const row = await tx.agency.update({
           where: { id: agencyId },
           data: updateData,
-          select: { id: true, workingHoursStart: true, workingHoursEnd: true },
+          select: { id: true, workingHoursStart: true, workingHoursEnd: true, workingDays: true },
         })
         await logPendingMutation('PATCH', '/api/agency/working-hours', body, row, { tx })
         return row
@@ -5217,22 +5780,56 @@ function createApp() {
     }
   })
 
-  // GET /api/agency/qr-code — QR code info
+  // GET /api/agency/qr-code — QR code info (cloud-contract compatible)
+  // Mirrors apps/api/src/routes/agency.ts GET /qr-code: with ?code= (or the
+  // session agency's customCode) it returns a real SVG QR encoding the
+  // public queue URL — fully offline. ?format=json returns the structured
+  // info the local UI previously expected.
   app.get('/api/agency/qr-code', authMiddleware, async (c) => {
     try {
-      const agencyId = sessionUser.agencyId
-      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated with this account' }, 403)
       const agency = await db.agency.findUnique({ where: { id: agencyId } })
       if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
-      // Return a placeholder QR — actual QR generation requires the display URL
+
+      const code = c.req.query('code') || agency.customCode
+      if (!code) return c.json({ success: false, error: 'Agency has no custom code' }, 400)
+
+      // Same payload the cloud encodes: <app-url>/?code=<customCode>
+      const appUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.BLASTI_PUBLIC_BASE_URL || 'http://localhost:3000'
+      const qrData = `${appUrl}/?code=${encodeURIComponent(code)}`
+
+      if (c.req.query('format') === 'json') {
+        return c.json({
+          success: true,
+          data: {
+            qrCodeUrl: null,
+            qrData,
+            displayUrl: qrData,
+            agencyName: agency.name,
+            agencyCode: code,
+            message: 'Use qrData with a client-side QR generator (works offline)',
+          },
+        })
+      }
+
+      // Default: SVG — identical content-type contract to the cloud route.
+      let QRCode = null
+      try { QRCode = require('qrcode') } catch { /* not bundled — optional */ }
+      if (QRCode && typeof QRCode.toString === 'function') {
+        const svg = await QRCode.toString(qrData, { type: 'svg', margin: 1, width: 240 })
+        return c.body(svg, 200, { 'Content-Type': 'image/svg+xml' })
+      }
+
+      // qrcode module unavailable in this build → JSON describing the data
+      // so the renderer can generate the QR client-side (qrcode npm package
+      // is bundled with the web UI).
       return c.json({
         success: true,
-        data: {
-          qrCodeUrl: null,
-          displayUrl: null,
-          agencyName: agency.name,
-          message: 'QR code available online',
-        },
+        qrData,
+        agencyName: agency.name,
+        agencyCode: code,
+        message: 'QR generation module unavailable — render client-side from qrData',
       })
     } catch (error) {
       console.error('[LocalAPI] QR code error:', error)
@@ -5512,6 +6109,22 @@ async function startLocalApi(dbPath, port, options) {
   await setupPragmas()
   console.log(`[LocalAPI] Prisma database initialized (local SQLite)`)
 
+  // ── Round 15: local FILE STORE + FILE SYNC worker ─────────────────────
+  // Uploads land locally first (lib/file-store.js, under
+  // BLASTI_LOCAL_FILES_DIR); this worker mirrors them with the cloud
+  // (push local-only blobs / pull remote blobs / replay tombstones) as part
+  // of the sync engine. The v2 record engine above is untouched.
+  localOrigin = `http://${BIND_ADDRESS}:${port}`
+  fileSync = createFileSync({
+    db,
+    getCloudBaseUrl: cloudBaseUrl,
+    getSessionToken: () => sessionToken,
+    getSyncMeta: getLocalMeta,
+    setSyncMeta: setLocalMeta,
+  })
+  fileSync.start()
+  console.log(`[LocalAPI] File store: ${fileStore.resolveFilesRoot()} — file-sync worker started`)
+
   // Round-7: repair legacy permanently-failed HTTP create rows before the
   // sync engine starts replaying (idempotent — safe on every startup).
   try {
@@ -5604,6 +6217,7 @@ async function startLocalApi(dbPath, port, options) {
 function stopLocalApi() {
   // Close the realtime socket server BEFORE the HTTP server (it wraps it).
   try { localRealtime.closeLocalRealtime() } catch { /* not started */ }
+  try { if (fileSync) fileSync.stop() } catch { /* not started */ }
   if (httpServer) {
     httpServer.close()
     httpServer = null

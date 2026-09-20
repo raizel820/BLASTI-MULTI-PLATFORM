@@ -109,6 +109,27 @@ try {
   console.warn('[BLASTI Desktop] Could not resolve userData yet — will set when app is ready:', err.message);
 }
 
+// ─── Local FILE store dir (Round 15) ─────────────────────────────────────
+// Uploads (avatars, logos, receipts, documents, …) are stored LOCALLY FIRST
+// in an organized layout (<bucket>/<yyyy>/<mm>/…) under the Electron
+// userData dir — sibling of the local DB — and mirrored to the cloud by the
+// file-sync worker (local-api/lib/file-sync.js). Set BEFORE any local-api
+// module loads, same contract as BLASTI_LOCAL_DB_DIR.
+function setAuthoritativeFilesDir() {
+  const filesDir = path.join(app.getPath('userData'), 'blasti-files');
+  if (!process.env.BLASTI_LOCAL_FILES_DIR) {
+    process.env.BLASTI_LOCAL_FILES_DIR = filesDir;
+    console.log('[BLASTI Desktop] Local file store dir:', filesDir);
+  } else if (path.resolve(process.env.BLASTI_LOCAL_FILES_DIR) !== path.resolve(filesDir)) {
+    console.warn('[BLASTI Desktop] BLASTI_LOCAL_FILES_DIR override in effect:', process.env.BLASTI_LOCAL_FILES_DIR);
+  }
+}
+try {
+  setAuthoritativeFilesDir();
+} catch (err) {
+  console.warn('[BLASTI Desktop] Could not resolve userData for the file store yet — will set when app is ready:', err.message);
+}
+
 // ─── Cloud API Base URL (single source of truth) ────────────────────────
 // One resolution used by diagnostics, sync service, local API fallbacks and
 // the web shell. Precedence: BLASTI_CLOUD_URL > BLASTI_API_URL > default.
@@ -329,8 +350,15 @@ function setCSP() {
       isDev ? "script-src 'self' 'unsafe-eval' 'unsafe-inline'" : "script-src 'self'",
       // Allow styles from self and inline (needed for styled-components / Tailwind)
       "style-src 'self' 'unsafe-inline'",
-      // Allow images from self, data URIs, and blob URIs
-      "img-src 'self' data: blob: https:",
+      // Allow images from self, data URIs, and blob URIs — PLUS the http
+      // origins that serve user-uploaded files:
+      //   - the embedded local API (http://127.0.0.1:3080 and
+      //     http://localhost:3080) serves uploaded avatars/logos in
+      //     local-first mode (localizeFileUrl rewrites stored cloud URLs
+      //     to these). Without them every uploaded profile image is
+      //     CSP-blocked and the UI shows the generic placeholder forever.
+      //   - localhost:3000/3003 cover dev-server and cloud-served files.
+      "img-src 'self' data: blob: https: http://127.0.0.1:3080 http://localhost:3080 http://localhost:3000 http://localhost:3003 http://localhost:* http://127.0.0.1:*",
       // Allow fonts from self
       "font-src 'self' data:",
       // Allow connections to self, localhost (dev), 127.0.0.1 (local API),
@@ -1721,6 +1749,9 @@ app.whenReady().then(async () => {
   // 4. determine initialization state → launch OR initialization screen
   try { setAuthoritativeDbPath(); } catch (err) {
     console.error('[BLASTI Desktop] FATAL — cannot resolve authoritative DB path:', err.message);
+  }
+  try { setAuthoritativeFilesDir(); } catch (err) {
+    console.warn('[BLASTI Desktop] Could not resolve the local file store dir:', err.message);
   }
 
   // Set Content Security Policy

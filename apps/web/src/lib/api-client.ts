@@ -202,12 +202,107 @@ export function getApiBaseUrl(): string {
     return process.env.NEXT_PUBLIC_API_URL;
   }
 
-  // Web browser (development/production): use relative URL '' so requests go
-  // through the gateway on the same origin. The buildUrl() function injects
-  // XTransformPort=3003 to route API requests to the cloud API on port 3003.
-  // This is necessary because the sandbox gateway only exposes one port (3000)
-  // externally, and direct fetch to localhost:3003 from the browser would fail.
+  // Web browser served from the same machine that runs the cloud API
+  // (the standard `bun run dev:web` + `bun run dev:api` dev setup on the
+  // user's machine): talk to the cloud API DIRECTLY on port 3003.
+  // The cloud API has permissive CORS (it echoes any Origin with
+  // credentials enabled), so direct cross-origin calls work — and this is
+  // REQUIRED because there is no gateway on a normal machine: the previous
+  // behaviour (relative URL + XTransformPort=3003) only works behind the
+  // sandbox gateway and made every /api/* call hit the Next.js dev server,
+  // which has no API routes → 404 → "cannot login" in the browser.
+  if (isLocalWebHost()) {
+    return `http://${window.location.hostname === '0.0.0.0' ? 'localhost' : window.location.hostname}:3003`;
+  }
+
+  // Web browser served from a REMOTE origin that has NO direct route to the
+  // cloud API (sandbox preview gateway / public VPS domain): keep the
+  // relative URL — buildUrl() injects XTransformPort=3003 so the single-port
+  // gateway can route API requests to the cloud API.
   return '';
+}
+
+/**
+ * True for private-network hosts (LAN IPs, mDNS .local names, bare Windows
+ * machine hostnames) — e.g. a PHONE browser that opened the webapp via
+ * http://<pc-ip>:3000. The cloud API on :3003 is directly reachable from
+ * such origins on the same network (the cloud API's CORS echoes any Origin),
+ * which is what makes the app fully usable from a mobile browser.
+ */
+function isPrivateLanHost(h: string): boolean {
+  if (/^10\./.test(h)) return true;
+  if (/^192\.168\./.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true;
+  if (h.endsWith('.local')) return true;
+  // Bare single-label hostname (e.g. http://DESKTOP-ABC:3000) — if the page
+  // resolved it, the API host resolves identically on the same network.
+  if (!h.includes('.') && h !== 'localhost') return true;
+  return false;
+}
+
+/**
+ * True when the page is served from a host that can reach the cloud API on
+ * :3003 DIRECTLY without a gateway — i.e. the browser runs on the same
+ * machine as the dev servers (loopback), or on the same network as them
+ * (phone / tablet / second PC on the Wi-Fi opening http://<pc-ip>:3000).
+ */
+function isLocalWebHost(): boolean {
+  if (isServerSide()) return false;
+  const h = window.location.hostname;
+  if (h === 'localhost' || h === '127.0.0.1' || h === '[::1]' || h === '0.0.0.0') return true;
+  return isPrivateLanHost(h);
+}
+
+/**
+ * Resolve the CLOUD API base URL (port 3003) — as opposed to getApiBaseUrl()
+ * which returns the local-first :3080 base inside Electron.
+ *
+ * Used by raw-fetch consumers that bypass apiClient (WatermelonDB sync
+ * engine, socket.io) and need the same environment-aware resolution:
+ * - NEXT_PUBLIC_API_URL wins when set
+ * - Electron/Capacitor: explicit cloud URL env or the default :3003
+ * - Browser on a loopback host: direct http://localhost:3003 (CORS is open)
+ * - Browser on a remote origin: '' (relative + XTransformPort via gateway)
+ */
+export function getCloudApiBaseUrl(): string {
+  if (isServerSide()) {
+    return process.env.INTERNAL_API_URL || DEFAULT_INTERNAL_URL;
+  }
+
+  if (isElectronRuntime() || isCapacitorRuntime()) {
+    return process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_CLOUD_URL || DEFAULT_CLOUD_URL;
+  }
+
+  if (process.env.NEXT_PUBLIC_API_URL) {
+    return process.env.NEXT_PUBLIC_API_URL;
+  }
+
+  if (isLocalWebHost()) {
+    return `http://${window.location.hostname === '0.0.0.0' ? 'localhost' : window.location.hostname}:3003`;
+  }
+
+  return '';
+}
+
+/**
+ * Build a URL for a cloud API path, appending the gateway routing hint
+ * (XTransformPort=3003) when the page is served from a remote origin where
+ * only the gateway port is reachable. Loopback pages get an absolute URL to
+ * the cloud API directly.
+ */
+export function buildCloudUrl(path: string, params?: Record<string, string>): string {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  const base = getCloudApiBaseUrl();
+  const queryParams: Record<string, string> = { ...(params || {}) };
+  if (!base && !isServerSide() && !isNativeRuntime()) {
+    queryParams.XTransformPort = '3003';
+  }
+  let url = `${base}${normalizedPath}`;
+  if (Object.keys(queryParams).length > 0) {
+    const searchParams = new URLSearchParams(queryParams);
+    url += `${url.includes('?') ? '&' : '?'}${searchParams.toString()}`;
+  }
+  return url;
 }
 
 // ─── Auth Token Helpers ───────────────────────────────────────────────────────
@@ -309,6 +404,31 @@ function buildAuthHeaders(): Record<string, string> {
     if (token) {
       return { Authorization: `Bearer ${token}` };
     }
+  }
+
+  // ── Web browser: Bearer token from the persisted store (cookie fallback) ──
+  // The web app talks to the cloud API DIRECTLY (http://localhost:3003) — a
+  // cross-origin request. The cloud API echoes the request Origin with
+  // credentials enabled, so cookies flow, but the JWT Bearer header is the
+  // primary credential: it works even when third-party cookie policies block
+  // cross-origin cookies. (This branch previously returned {} and relied on
+  // cookies only — combined with credentials:'omit' on cross-origin it made
+  // every browser request after login unauthenticated.)
+  try {
+    const storeData = localStorage.getItem('blasti-app');
+    if (storeData) {
+      try {
+        const parsed = JSON.parse(storeData);
+        const cloudToken = parsed?.state?.sessionToken || parsed?.sessionToken;
+        if (cloudToken) {
+          return { Authorization: `Bearer ${cloudToken}` };
+        }
+      } catch {
+        // Invalid JSON — ignore
+      }
+    }
+  } catch {
+    // localStorage unavailable
   }
 
   return {};
@@ -705,15 +825,22 @@ export class ApiClient {
 
       try {
         // Determine credentials mode:
-        // - Same-origin requests (relative URL / empty base): use 'include' for cookie auth
-        // - Cross-origin requests (absolute URL to different port/host): use 'omit'
-        //   In Electron/Capacitor, auth is via Bearer token, not cookies.
-        //   Using 'include' on cross-origin causes CORS failure when the server
-        //   responds with Access-Control-Allow-Origin: *.
+        // - Web browser: ALWAYS 'include'. The browser now talks to the cloud
+        //   API on a different origin (http://localhost:3003), and the cloud
+        //   CORS middleware ECHOES the request Origin with credentials
+        //   enabled (apps/api/src/index.ts), so the session cookie flows on
+        //   cross-origin requests. The previous logic ('omit' whenever the
+        //   URL was absolute) stripped cookies from every browser request —
+        //   the user logged in once and then stayed unauthenticated.
+        // - Electron/Capacitor (native): 'omit' on cross-origin — auth is
+        //   via the Bearer token header, and 'include' against a wildcard
+        //   ACAO server would hard-fail CORS.
+        // - Same-origin requests (relative URL / empty base): 'include' for
+        //   cookie auth.
         const isCrossOrigin = url.startsWith('http://') || url.startsWith('https://');
         const credentialsMode: RequestCredentials = isServerSide()
           ? 'same-origin'
-          : isCrossOrigin
+          : isNativeRuntime() && isCrossOrigin
             ? 'omit'
             : 'include';
 
@@ -1431,7 +1558,20 @@ ApiClient.prototype.request = async function<T>(
       console.warn('[ApiClient] WatermelonDB offline mutation failed:', err);
     }
 
-    // Generic offline mutation — can't be queued in WDB, return error
+    // Generic offline mutation — can't be queued in WDB, return error.
+    // HONESTY FIX: isEffectivelyOffline() can be true even while the machine
+    // is online (it also flips when cloud AND LAN recently returned 5xx).
+    // In that case "You are offline" lied to the user — the real cause was a
+    // server error (e.g. the agency-create FK 500). Surface the truth so the
+    // user retries (server may have healed) instead of hunting for a network
+    // problem that does not exist.
+    if (navigator.onLine) {
+      throw new ApiClientError(
+        'This operation cannot be queued — the API server recently returned an error. Please try again in a few seconds.',
+        0,
+        null,
+      );
+    }
     throw new ApiClientError('You are offline and this operation cannot be queued', 0, null);
   }
 
