@@ -1,5 +1,6 @@
 'use client'
-import { apiFetch } from '@/lib/api-fetch';;
+import { apiFetch } from '@/lib/api-fetch';
+import { healSessionFromCookie, applyHealedSession, isElectronSessionContext } from '@/lib/session-heal';
 
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -522,6 +523,35 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
     return Object.keys(errs).length === 0;
   };
 
+  // ── Early session validation (web only) ─────────────────────────────
+  // The ghost-account logout used to strike only at FINAL submit — after
+  // the user had filled the whole wizard. Validate the restored session as
+  // soon as the wizard mounts (and self-heal it from the cookie when
+  // possible) so a dead session is caught BEFORE any form input is
+  // collected. Network failures never trigger a logout here (offline
+  // tolerance).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (isElectronSessionContext()) return; // desktop: local-API session machinery
+      const check = await apiFetch('/api/auth/session');
+      if (cancelled || !check.ok) return;     // unreachable/offline — do nothing
+      const payload = await check.json().catch(() => ({}) as any);
+      if (cancelled || payload?.user) return; // session valid
+      const healed = await healSessionFromCookie();
+      if (cancelled) return;
+      if (healed) {
+        console.warn('[CreateAgencyForm] Stale session on mount — healed from cookie, continuing');
+        await applyHealedSession(healed);
+        return;
+      }
+      console.warn('[CreateAgencyForm] Session invalid (ghost account) on mount — clearing session, routing to login before the form is filled');
+      toast.error(t('sessionInvalidRelogin' as any));
+      logout();
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   const handleNext = () => {
     if (step === 0 && validateStep0()) {
       goToStep(1);
@@ -566,31 +596,47 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
         });
       }
 
-      const res = await apiFetch('/api/agencies?XTransformPort=3003', {
+      const sendCreate = () => apiFetch('/api/agencies?XTransformPort=3003', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
 
-      const data = await res.json();
+      let res = await sendCreate();
+      let data = await res.json().catch(() => ({}) as any);
 
-      if (!res.ok) {
-        // Ghost-session guard: the stored token belongs to an account the
-        // cloud no longer knows (DB reset / account deleted while the session
-        // survived). The API answers 401 SESSION_USER_MISSING. Clear the dead
-        // session and route to login with a clear message — retrying can
-        // never succeed, and a dead-end "Internal server error" toast left
-        // the user stuck on this wizard.
-        if (
-          res.status === 401 ||
-          data.code === 'SESSION_USER_MISSING' ||
-          (typeof data.error === 'string' && data.error.includes('no longer exists'))
-        ) {
-          console.warn('[CreateAgencyForm] Session invalid (ghost account) — clearing session, routing to login');
+      // Ghost-session guard: the stored token belongs to an account the
+      // cloud no longer knows (DB reset / account deleted while the session
+      // survived). The API answers 401 SESSION_USER_MISSING.
+      //
+      // Session-heal (ghost-account logout fix): a stale Bearer token
+      // POISONS every apiClient request — the cloud reads the Authorization
+      // header BEFORE the cookie — even when the httpOnly session cookie is
+      // still perfectly valid. Before destroying the session (which used to
+      // throw away the ENTIRE filled wizard), re-mint the session from the
+      // cookie alone and retry the create once. Only a cookie that is dead
+      // too leads to the clean logout.
+      const isGhostReject =
+        res.status === 401 ||
+        data.code === 'SESSION_USER_MISSING' ||
+        (typeof data.error === 'string' && data.error.includes('no longer exists'));
+
+      if (!res.ok && isGhostReject) {
+        const healed = await healSessionFromCookie();
+        if (healed) {
+          console.warn('[CreateAgencyForm] 401 on create — session healed from cookie, retrying create');
+          await applyHealedSession(healed);
+          res = await sendCreate();
+          data = await res.json().catch(() => ({}) as any);
+        } else {
+          console.warn('[CreateAgencyForm] Session invalid (ghost account) — heal unavailable, clearing session, routing to login');
           toast.error(t('sessionInvalidRelogin' as any));
           logout();
           return;
         }
+      }
+
+      if (!res.ok) {
         if (data.error === 'Agency code already taken') {
           setErrors({ customCode: t('agencyCodeTaken' as any) });
           toast.error(t('agencyCodeTaken' as any));

@@ -124,9 +124,27 @@ function handleAuthExpired(): void {
         });
       }
     } else {
-      // Web/Capacitor: safe to do full logout (no local API race condition)
-      console.log(`[Auth] Web 401/403 → full logout`);
-      store.logout();
+      // Web/Capacitor: last-resort logout — but heal first.
+      //
+      // Session-heal (ghost-account logout fix): a stale Bearer token poisons
+      // every apiClient request (the cloud reads the Authorization header
+      // BEFORE the cookie), so a 401 here does NOT necessarily mean the
+      // session is unrecoverable. The httpOnly cookie may still be valid —
+      // try to re-mint the session from the cookie alone before destroying
+      // the session and throwing away whatever the user was doing.
+      (async () => {
+        try {
+          const { healSessionFromCookie, applyHealedSession } = await import('@/lib/session-heal');
+          const healed = await healSessionFromCookie();
+          if (healed) {
+            console.log(`[Auth] 401/403 → cookie heal succeeded — fresh token adopted, no logout`);
+            await applyHealedSession(healed);
+            return;
+          }
+        } catch { /* heal is best-effort — fall through to logout */ }
+        console.log(`[Auth] Web 401/403 → full logout (heal unavailable)`);
+        store.logout();
+      })();
     }
   });
 }

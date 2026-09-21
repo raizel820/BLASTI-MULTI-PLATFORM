@@ -21,9 +21,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const state = useAppStore.getState();
       if (state.user !== undefined) {
         // Persist has rehydrated — the user field will be either null or a user object
-        // After rehydration, we can check the actual auth state
         setPersistRehydrated(true);
-        setSessionChecked(true);
       } else {
         // Not yet rehydrated — check again in 50ms
         setTimeout(checkRehydration, 50);
@@ -33,19 +31,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setTimeout(checkRehydration, 100);
   }, []);
 
-  // Validate the JWT session with the server after persist rehydration
+  // ── Boot session settle (BLOCKING on web) / local session restore (Electron) ──
+  // Runs once after persist rehydration, BEFORE any authed UI is rendered.
+  //
+  // WHY BLOCKING (ghost-account logout fix): with a stale Bearer token in the
+  // rehydrated store, authed requests fired by eagerly-mounted screens 401 and
+  // handleAuthExpired() logged the user out BEFORE the (previously parallel)
+  // session heal could complete — the user landed on the landing page even
+  // though the httpOnly cookie was still perfectly valid. Settling the session
+  // first (validate → heal-or-logout) means every screen mounts with fresh,
+  // working credentials.
   useEffect(() => {
     if (!persistRehydrated) return;
-    if (!isAuthenticated || !useAppStore.getState().user) return;
 
-    // ── Electron: Restore local API session on app reload ──
+    const store = useAppStore.getState();
+
+    // Not authenticated — nothing to settle, render immediately.
+    if (!store.isAuthenticated || !store.user) {
+      setSessionChecked(true);
+      return;
+    }
+
+    // ── Electron: Restore local API session on app reload, then render ──
     // When the Electron app restarts/reloads, the local API's sessionToken
     // is null (it's module-level state), but Zustand persist still has the
     // user + token. We need to re-import the session so LAN failover works.
+    // (No cloud session check here — the desktop is local-first and has its
+    // own auth machinery; see fetch-with-retry handleAuthExpired.)
     try {
       const w = window as any;
       if (w.electronAPI || navigator.userAgent.includes('Electron')) {
-        const store = useAppStore.getState();
         const token = store.sessionToken || localStorage.getItem('blasti-local-api-token');
         if (token && store.user) {
           // 1. Restore via IPC bridge (direct)
@@ -60,36 +75,54 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             body: JSON.stringify({ token, user: store.user }),
           }).catch(() => { /* non-critical */ });
         }
+        setSessionChecked(true);
+        return;
       }
     } catch { /* ignore */ }
 
-    // Validate JWT session with the Hono backend (/api/auth/session)
-    // Returns {user: {...}, expires: "..."} for valid sessions
-    // and {} for expired/unauthenticated sessions
+    // ── Web: settle the restored session before rendering authed UI ──
+    let cancelled = false;
     (async () => {
       try {
         const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
-        const res = await fetchWithRetry('/api/auth/session', { skipAuthCheck: true });
+        // Bounded wait: an unreachable/hanging API must never stall boot —
+        // a network failure simply skips the check (offline tolerance).
+        const signal = typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+          ? AbortSignal.timeout(6000)
+          : undefined;
+        const res = await fetchWithRetry('/api/auth/session', { skipAuthCheck: true, maxRetries: 0, signal });
 
-        // Network/server error — don't clear session (user might be offline)
-        if (!res.ok) return;
-
-        const data = await res.json();
-        // If session has no user object, the session is expired/invalid
-        if (!data.user) {
-          const store = useAppStore.getState();
-          if (store.isAuthenticated) {
-            import('sonner').then(({ toast }) => {
-              toast.error(store.user?.language === 'ar' ? 'انتهت الجلسة، يرجى تسجيل الدخول مجدداً' : store.user?.language === 'fr' ? 'Session expirée, veuillez vous reconnecter' : 'Session expired, please log in again');
-            });
-            store.logout();
+        if (!cancelled && res.ok) {
+          const data = await res.json().catch(() => ({}));
+          if (!data?.user) {
+            // Session invalid per the server. A stale Bearer token poisons
+            // every apiClient request (Authorization header wins over the
+            // cookie), so the cookie may STILL be valid — try to re-mint
+            // the session from the cookie alone before destroying it.
+            const { healSessionFromCookie, applyHealedSession } = await import('@/lib/session-heal');
+            const healed = await healSessionFromCookie();
+            if (!cancelled && healed) {
+              console.log('[AuthProvider] Session reported invalid but cookie healed it — fresh token adopted');
+              await applyHealedSession(healed);
+            } else if (!cancelled && useAppStore.getState().isAuthenticated) {
+              const current = useAppStore.getState().user;
+              import('sonner').then(({ toast }) => {
+                toast.error(current?.language === 'ar' ? 'انتهت الجلسة، يرجى تسجيل الدخول مجدداً' : current?.language === 'fr' ? 'Session expirée, veuillez vous reconnecter' : 'Session expired, please log in again');
+              });
+              useAppStore.getState().logout();
+            }
           }
         }
+        // !res.ok → server unreachable/offline → proceed WITHOUT logout
       } catch {
-        // fetchWithRetry or JSON parse threw — don't clear session (might be offline)
+        // never block the app on the settle check
+      } finally {
+        if (!cancelled) setSessionChecked(true);
       }
     })();
-  }, [persistRehydrated, isAuthenticated]);
+
+    return () => { cancelled = true; };
+  }, [persistRehydrated]);
 
   // On initial load, read hash and set the appropriate view
   // BUT only if user is NOT authenticated (persist hasn't loaded a session)
