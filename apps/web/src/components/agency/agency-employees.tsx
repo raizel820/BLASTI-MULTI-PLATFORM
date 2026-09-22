@@ -72,6 +72,13 @@ interface Employee {
   permissions?: Record<string, boolean>;
 }
 
+interface BranchOption {
+  id: string;
+  name: string;
+  nameAr?: string | null;
+  nameFr?: string | null;
+}
+
 function generatePassword(): string {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#';
   let pwd = '';
@@ -97,6 +104,11 @@ export function AgencyEmployees() {
   const [newFullName, setNewFullName] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [newRole, setNewRole] = useState('STAFF');
+  // Task 31 bug 8: a staff account must be associated with a branch
+  const [newBranchId, setNewBranchId] = useState('');
+  const [branchOptions, setBranchOptions] = useState<BranchOption[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  const [branchError, setBranchError] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [createLoading, setCreateLoading] = useState(false);
 
@@ -159,6 +171,34 @@ export function AgencyEmployees() {
     fetchEmployees();
   }, [fetchEmployees]);
 
+  // Task 31 bug 8: load the agency's branches when the create dialog opens so
+  // the staff member can be associated with one at creation time.
+  const fetchBranchOptions = useCallback(async () => {
+    if (!agencyId) return;
+    setBranchesLoading(true);
+    try {
+      const res = await apiFetch(`/api/agency/branches?agencyId=${encodeURIComponent(agencyId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        // Cloud returns { branches }, local API historically { data } — accept both.
+        const list: any[] = data.branches ?? data.data ?? [];
+        setBranchOptions(
+          list.map((b) => ({ id: b.id, name: b.name, nameAr: b.nameAr, nameFr: b.nameFr }))
+        );
+      }
+    } catch {
+      // silent — empty list renders an empty select and submit validation guards
+    } finally {
+      setBranchesLoading(false);
+    }
+  }, [agencyId]);
+
+  useEffect(() => {
+    if (createOpen) {
+      fetchBranchOptions();
+    }
+  }, [createOpen, fetchBranchOptions]);
+
   // Stats
   const totalEmployees = employees.length;
   const activeEmployees = employees.filter(e => e.isActive).length;
@@ -183,6 +223,12 @@ export function AgencyEmployees() {
       toast.error(t('passwordMinLength'));
       return;
     }
+    // Task 31 bug 8: a staff account must belong to a branch — block submit.
+    if (!newBranchId) {
+      setBranchError(true);
+      toast.error(t('staffBranchRequired'));
+      return;
+    }
     setCreateLoading(true);
     try {
       const res = await apiFetch('/api/agency/staff/create', {
@@ -194,6 +240,7 @@ export function AgencyEmployees() {
           fullName: newFullName.trim(),
           password: newPassword,
           role: newRole,
+          branchId: newBranchId,
         }),
       });
       if (res.ok) {
@@ -204,6 +251,8 @@ export function AgencyEmployees() {
         setNewFullName('');
         setNewPassword('');
         setNewRole('STAFF');
+        setNewBranchId('');
+        setBranchError(false);
         setCredentialsOpen(true);
         fetchEmployees();
       } else {
@@ -585,7 +634,7 @@ export function AgencyEmployees() {
       </div>
 
       {/* Create Employee Dialog */}
-      <Dialog open={createOpen} onOpenChange={(open) => { setCreateOpen(open); if (!open) { setNewUsername(''); setNewFullName(''); setNewPassword(''); setNewRole('STAFF'); } }}>
+      <Dialog open={createOpen} onOpenChange={(open) => { setCreateOpen(open); if (!open) { setNewUsername(''); setNewFullName(''); setNewPassword(''); setNewRole('STAFF'); setNewBranchId(''); setBranchError(false); } }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -644,6 +693,28 @@ export function AgencyEmployees() {
                   <Dices className="h-4 w-4" />
                 </Button>
               </div>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs">{t('staffBranchLabel')}</Label>
+              <Select
+                value={newBranchId || undefined}
+                onValueChange={(v) => { setNewBranchId(v); setBranchError(false); }}
+              >
+                <SelectTrigger className="h-11" aria-invalid={branchError}>
+                  <SelectValue placeholder={t('staffBranchPlaceholder')} />
+                </SelectTrigger>
+                <SelectContent>
+                  {branchOptions.map((b) => (
+                    <SelectItem key={b.id} value={b.id}>
+                      {lang === 'ar' && b.nameAr ? b.nameAr : lang === 'fr' && b.nameFr ? b.nameFr : b.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {branchesLoading && <p className="text-[10px] text-muted-foreground">{t('loading' as any) || '...'}</p>}
+              {branchError && (
+                <p className="text-xs text-red-600 dark:text-red-400">{t('staffBranchRequired')}</p>
+              )}
             </div>
             <div className="space-y-2">
               <Label className="text-xs">{t('staffRoleSelect')}</Label>

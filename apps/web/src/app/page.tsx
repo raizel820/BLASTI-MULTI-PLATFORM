@@ -274,22 +274,28 @@ export default function Home() {
     return () => window.removeEventListener('blasti:show-onboarding', handleShowOnboarding);
   }, []);
 
-  // Show onboarding when the user enters the dashboard for the FIRST time
-  // WITH an agency — i.e. right after the agency-creation wizard completes
-  // (or on a later visit while the flag is still unset). It must NOT appear
-  // over the create-agency form itself, so the trigger is gated on
-  // user.agencyId being set.
+  // Show onboarding when the user enters the dashboard for the FIRST time.
+  //  - Agency users: right after the agency-creation wizard completes (or on a
+  //    later visit while the flag is still unset). It must NOT appear over the
+  //    create-agency form itself, so the trigger is gated on user.agencyId
+  //    being set.
+  //  - Customers (Task 31-A): the wizard supports them (per-role welcome +
+  //    customer tips) and they have no agency-creation step, so it fires on
+  //    first entry as soon as they are logged in (no agencyId gate).
+  // Both paths share the same `blasti-show-onboarding` localStorage flag and
+  // the store's `onboarded` marker.
   useEffect(() => {
-    if (user?.id && user?.agencyId && !onboarded) {
-      try {
-        const dismissed = localStorage.getItem('blasti-show-onboarding');
-        if (dismissed !== 'true') {
-          // Use setTimeout to avoid synchronous state update during render
-          setTimeout(() => setShowOnboarding(true), 800);
-        }
-      } catch { /* silent */ }
-    }
-  }, [user?.id, user?.agencyId, onboarded]);
+    if (!user?.id || onboarded) return;
+    const isCustomer = user?.role === 'CUSTOMER';
+    if (!isCustomer && !user?.agencyId) return;
+    try {
+      const dismissed = localStorage.getItem('blasti-show-onboarding');
+      if (dismissed !== 'true') {
+        // Use setTimeout to avoid synchronous state update during render
+        setTimeout(() => setShowOnboarding(true), 800);
+      }
+    } catch { /* silent */ }
+  }, [user?.id, user?.agencyId, user?.role, onboarded]);
 
   // Handle ?claim=TOKEN — auto-import walk-in reservation when QR is scanned externally
   useEffect(() => {

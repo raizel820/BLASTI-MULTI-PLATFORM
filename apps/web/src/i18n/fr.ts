@@ -233,6 +233,8 @@ const fr: Record<TranslationKeys, string> = {
   paymentApproved: "Paiement approuvé",
   paymentRejected: "Paiement rejeté",
   selectPlan: "Choisir le plan",
+  freePlanIncluded: "Incluse par défaut",
+  freePlanIncludedDesc: "Le plan Gratuit est le palier de départ intégré — toutes les agences l'obtiennent gratuitement. Passez à un plan supérieur à tout moment.",
   paymentProof: "Preuve de paiement",
   receiptNote: "Veuillez téléverser le reçu en format JPG, PNG ou PDF",
 
@@ -884,6 +886,10 @@ const fr: Record<TranslationKeys, string> = {
   staffRoleStaff: "Employé",
   staffRoleManager: "Responsable",
   staffCreatedWithCreds: "Compte créé ! Identifiants : {username} / {password}",
+  // Task 31 (bug 8) : le personnel doit être rattaché à une succursale
+  staffBranchLabel: 'Succursale',
+  staffBranchPlaceholder: 'Choisir une succursale',
+  staffBranchRequired: 'Veuillez sélectionner la succursale où ce membre travaille',
   changePassword: "Changer le mot de passe",
   currentPassword: "Mot de passe actuel",
   newPassword: "Nouveau mot de passe",
@@ -1284,6 +1290,9 @@ const fr: Record<TranslationKeys, string> = {
   queueUnavailable: "La file d'attente est actuellement indisponible",
   activatePlan: 'Activer le plan',
   subscriptionRequired: "Veuillez activer votre abonnement pour utiliser les fonctionnalités de file d'attente",
+  // Task 31 (bug 5) : verrouillage des fonctions payantes sans abonnement actif
+  subscriptionRequiredBranches: 'Veuillez activer votre abonnement pour créer des succursales et des guichets',
+  subscriptionLockedTooltip: 'Nécessite un abonnement actif',
   inactiveAgency: 'Inactif',
 
   // ─── Task 6: Queue Features ──────
@@ -1319,6 +1328,16 @@ const fr: Record<TranslationKeys, string> = {
   onboardingSkipped: 'Vous pouvez terminer la configuration plus tard dans les Paramètres',
   helloUser: 'Bonjour, {name} !',
   setupAccountDesc: 'Configurons votre compte rapidement',
+  // Task 31 (bug 2) : accueil et configuration personnalisés par type de compte (client / propriétaire / personnel)
+  welcomeTitleCustomer: 'Bienvenue sur BLASTI !',
+  welcomeTitleOwner: 'Bienvenue sur BLASTI — lançons votre agence',
+  welcomeTitleStaff: 'Bienvenue sur BLASTI — préparons-vous à servir',
+  setupDescCustomer: 'Votre compte est prêt — réservez votre tour dans n\'importe quelle agence et suivez-le en direct',
+  setupDescOwner: 'Configurons votre agence : informations, jours d\'ouverture, succursales et services — cela ne prend qu\'une minute',
+  setupDescStaff: 'Terminons la configuration de votre compte personnel pour servir la file à votre succursale',
+  welcomeSubtitleCustomer: 'Commencez à réserver vos tours tout de suite',
+  welcomeSubtitleOwner: 'Configurez votre agence et commencez à recevoir des clients',
+  welcomeSubtitleStaff: 'Votre compte personnel est prêt — l\'administrateur de l\'agence peut vous affecter à une succursale',
   adminOnboardingNote: 'En tant qu\'administrateur, vous pouvez gérer toutes les agences, utilisateurs et paramètres de la plateforme depuis le tableau de bord.',
   agencyTip4: 'Ajoutez des employés depuis la Gestion du personnel dans les Paramètres',
   stayNotified: 'Restez informé',

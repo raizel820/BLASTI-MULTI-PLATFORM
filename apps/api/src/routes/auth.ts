@@ -485,8 +485,12 @@ app.post('/register', async (c) => {
     // Hash password
     const passwordHash = hashPassword(password)
 
+    // Task 31-A: SUPER_ADMIN accounts are created pre-verified — they skip
+    // the email/phone OTP flow entirely (see the early return below).
+    const isSuperAdmin = role === 'SUPER_ADMIN'
+
     // Create user (Task 22: unverified — both channels must pass OTP before
-    // a session is issued)
+    // a session is issued; SUPER_ADMIN is the pre-verified exception)
     const user = await db.user.create({
       data: {
         username,
@@ -496,8 +500,8 @@ app.post('/register', async (c) => {
         phoneNumber,
         role: role || 'CUSTOMER',
         avatarUrl: avatarUrl || undefined,
-        emailVerified: false,
-        phoneVerified: false,
+        emailVerified: isSuperAdmin,
+        phoneVerified: isSuperAdmin,
       },
       select: {
         id: true,
@@ -536,6 +540,46 @@ app.post('/register', async (c) => {
         agencyNameAr = agency.nameAr ?? undefined
         agencyNameFr = agency.nameFr ?? undefined
       }
+    }
+
+    // ── Task 31-A: SUPER_ADMIN registers WITHOUT verification ──────────
+    // Platform admins must not wait for email/phone OTP: no issueAllPending
+    // and no createVerificationToken are called (zero OTP rows), and a full
+    // session is issued immediately — mirroring the verify-flow session
+    // issuance below. requiresVerification is intentionally NOT returned:
+    // the register UI would render an empty verification step.
+    if (isSuperAdmin) {
+      const sessionUser: SessionUser = {
+        id: user.id,
+        username: user.username,
+        fullName: user.fullName,
+        role: user.role,
+        language: user.language,
+        avatarUrl: user.avatarUrl,
+        agencyId: agencyId ?? null,
+      }
+      const token = await createSessionToken(sessionUser)
+      await setSessionCookie(c, sessionUser)
+
+      await db.auditLog.create({
+        data: { userId: user.id, action: 'REGISTERED', entityType: 'USER', entityId: user.id },
+      })
+
+      return c.json(
+        {
+          success: true,
+          user: {
+            ...user,
+            agencyId,
+            agencyName,
+            agencyNameAr,
+            agencyNameFr,
+          },
+          token,
+          isNewUser: true,
+        },
+        201,
+      )
     }
 
     // ── Task 22: verification instead of an immediate session ─────────

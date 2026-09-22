@@ -52,6 +52,19 @@ export function OnboardingWizard({ open, user, onComplete, onSkip }: OnboardingP
   const [reminderMinutes, setReminderMinutes] = useState(10);
   const [smsEnabled, setSmsEnabled] = useState(true);
 
+  // Task 31-A: welcome + setup copy customized per account type. SUPER_ADMIN
+  // keeps the generic welcome/setup keys (no role-specific entries exist).
+  const welcomeTitleKey =
+    user.role === 'CUSTOMER' ? 'welcomeTitleCustomer'
+      : user.role === 'AGENCY_OWNER' ? 'welcomeTitleOwner'
+        : user.role === 'AGENCY_STAFF' ? 'welcomeTitleStaff'
+          : 'welcomeTo';
+  const setupDescKey =
+    user.role === 'CUSTOMER' ? 'setupDescCustomer'
+      : user.role === 'AGENCY_OWNER' ? 'setupDescOwner'
+        : user.role === 'AGENCY_STAFF' ? 'setupDescStaff'
+          : 'setupAccountDesc';
+
   const totalSteps = user.role === 'SUPER_ADMIN' ? 2 : user.role === 'CUSTOMER' ? 3 : user.role === 'AGENCY_OWNER' ? 4 : 3;
 
   const handleFinish = () => {
@@ -85,8 +98,8 @@ export function OnboardingWizard({ open, user, onComplete, onSkip }: OnboardingP
     <Dialog open={open} onOpenChange={(v) => { if (!v) onSkip(); }}>
       <DialogContent className="sm:max-w-[480px] p-0 gap-0 overflow-hidden border-0 bg-white dark:bg-gray-950">
         <DialogHeader className="sr-only">
-          <DialogTitle>{t('welcomeTo')} BLASTI</DialogTitle>
-          <DialogDescription>{t('setupAccountDesc')}</DialogDescription>
+          <DialogTitle>{t(welcomeTitleKey)}</DialogTitle>
+          <DialogDescription>{t(setupDescKey)}</DialogDescription>
         </DialogHeader>
         {/* Step indicator */}
         <div className="px-6 pt-6 pb-4">
@@ -121,7 +134,7 @@ export function OnboardingWizard({ open, user, onComplete, onSkip }: OnboardingP
                       <img src="/logo.png" alt="BLASTI" width={48} height={48} className="h-full w-full object-contain" />
                     </div>
                     <div>
-                      <h2 className="text-lg font-bold text-foreground">{t('welcomeTo')}</h2>
+                      <h2 className="text-lg font-bold text-foreground">{t(welcomeTitleKey)}</h2>
                       <p className="text-xs text-muted-foreground">BLASTI</p>
                     </div>
                   </div>
@@ -130,7 +143,7 @@ export function OnboardingWizard({ open, user, onComplete, onSkip }: OnboardingP
                       👋 {t('helloUser', { name: user.fullName || user.username })}!
                     </p>
                     <p className="text-sm text-muted-foreground mt-1">
-                      {t('setupAccountDesc')}
+                      {t(setupDescKey)}
                     </p>
                     <p className="text-xs text-muted-foreground mt-2">
                       @{user.username} · {user.role === 'SUPER_ADMIN' ? t('superAdmin') : user.role === 'AGENCY_OWNER' ? t('agencyOwner') : user.role === 'AGENCY_STAFF' ? t('agencyStaff') : t('customer' as any)}

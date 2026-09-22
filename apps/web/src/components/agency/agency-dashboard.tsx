@@ -80,6 +80,8 @@ import { TicketConfirmation } from '@/components/agency/dashboard/ticket-confirm
 import { CreateAgencyForm } from '@/components/agency/create-agency-form';
 import { apiFetch } from '@/lib/api-fetch';
 import { isBothUnreachable } from '@/lib/api-client';
+import { isSubscriptionActive } from '@/hooks/use-subscription';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 
 interface QueueEntry {
   id: string;
@@ -330,6 +332,17 @@ export function AgencyDashboard() {
   const agencyId = user?.agencyId || '';
   const realtime = useRealtime();
 
+  // Task 31 bug 5: paid/queue feature gate — ACTIVE|TRIAL, undefined (pre-fetch)
+  // stays unlocked; the server still enforces the authoritative 403 gate.
+  const queueLocked = !isSubscriptionActive(stats?.subscriptionStatus);
+  const guardSubscription = () => {
+    if (queueLocked) {
+      toast.error(t('subscriptionRequired'));
+      return true;
+    }
+    return false;
+  };
+
   // Fetch agency profile for QR code
   const fetchAgencyCode = useCallback(async () => {
     if (!agencyId) return;
@@ -447,6 +460,7 @@ export function AgencyDashboard() {
   }, [agencyId]);
 
   const handleCallNext = async () => {
+    if (guardSubscription()) return;
     setActionLoading('call');
     try {
       const res = await apiFetch('/api/agency/queue/call-next', {
@@ -756,6 +770,7 @@ export function AgencyDashboard() {
   };
 
   const handleAddWalkIn = async () => {
+    if (guardSubscription()) return;
     if (!walkInName.trim() || !agencyId) return;
     setWalkInLoading(true);
     try {
@@ -1150,22 +1165,29 @@ export function AgencyDashboard() {
 
               {/* Right: Action buttons */}
               <div className="flex sm:flex-col gap-2 flex-shrink-0">
-                <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-                  <Button
-                    onClick={handleCallNext}
-                    disabled={actionLoading === 'call' || stats?.isPaused || (stats?.subscriptionStatus !== undefined && stats.subscriptionStatus !== 'ACTIVE')}
-                    className="h-11 px-5 rounded-xl bg-gradient-to-r from-emerald-400 to-teal-400 hover:from-emerald-300 hover:to-teal-300 text-emerald-900 font-bold shadow-lg shadow-emerald-400/30 gap-2 disabled:opacity-50 transition-all duration-200 text-sm"
-                  >
-                    {actionLoading === 'call' ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : stats?.subscriptionStatus !== undefined && stats.subscriptionStatus !== 'ACTIVE' ? (
-                      <Lock className="h-4 w-4" />
-                    ) : (
-                      <PhoneCall className="h-4 w-4" />
-                    )}
-                    {t('callNextAction') as string}
-                  </Button>
-                </motion.div>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} className={queueLocked ? 'cursor-not-allowed' : undefined}>
+                      <Button
+                        onClick={() => { if (!guardSubscription()) handleCallNext(); }}
+                        disabled={actionLoading === 'call' || stats?.isPaused || queueLocked}
+                        className="h-11 px-5 rounded-xl bg-gradient-to-r from-emerald-400 to-teal-400 hover:from-emerald-300 hover:to-teal-300 text-emerald-900 font-bold shadow-lg shadow-emerald-400/30 gap-2 disabled:opacity-50 transition-all duration-200 text-sm"
+                      >
+                        {actionLoading === 'call' ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : queueLocked ? (
+                          <Lock className="h-4 w-4" />
+                        ) : (
+                          <PhoneCall className="h-4 w-4" />
+                        )}
+                        {t('callNextAction') as string}
+                      </Button>
+                    </motion.div>
+                  </TooltipTrigger>
+                  {queueLocked && (
+                    <TooltipContent>{t('subscriptionLockedTooltip')}</TooltipContent>
+                  )}
+                </Tooltip>
                 <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
                   <Button
                     onClick={() => {
@@ -1195,22 +1217,29 @@ export function AgencyDashboard() {
         >
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             {/* Call Next */}
-            <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-              <Button
-                onClick={handleCallNext}
-                disabled={actionLoading === 'call' || stats?.isPaused || (stats?.subscriptionStatus !== undefined && stats.subscriptionStatus !== 'ACTIVE')}
-                className="w-full h-14 rounded-2xl bg-gradient-to-br from-emerald-500 to-emerald-700 hover:from-emerald-600 hover:to-emerald-800 text-white font-semibold shadow-lg shadow-emerald-500/20 gap-2 disabled:opacity-50 transition-all duration-200"
-              >
-                {actionLoading === 'call' ? (
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                ) : stats?.subscriptionStatus !== undefined && stats.subscriptionStatus !== 'ACTIVE' ? (
-                  <Lock className="h-5 w-5" />
-                ) : (
-                  <PhoneCall className="h-5 w-5" />
-                )}
-                <span className="text-sm">{t('callNext')}</span>
-              </Button>
-            </motion.div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} className={queueLocked ? 'cursor-not-allowed' : undefined}>
+                  <Button
+                    onClick={() => { if (!guardSubscription()) handleCallNext(); }}
+                    disabled={actionLoading === 'call' || stats?.isPaused || queueLocked}
+                    className="w-full h-14 rounded-2xl bg-gradient-to-br from-emerald-500 to-emerald-700 hover:from-emerald-600 hover:to-emerald-800 text-white font-semibold shadow-lg shadow-emerald-500/20 gap-2 disabled:opacity-50 transition-all duration-200"
+                  >
+                    {actionLoading === 'call' ? (
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                    ) : queueLocked ? (
+                      <Lock className="h-5 w-5" />
+                    ) : (
+                      <PhoneCall className="h-5 w-5" />
+                    )}
+                    <span className="text-sm">{t('callNext')}</span>
+                  </Button>
+                </motion.div>
+              </TooltipTrigger>
+              {queueLocked && (
+                <TooltipContent>{t('subscriptionLockedTooltip')}</TooltipContent>
+              )}
+            </Tooltip>
 
             {/* Toggle Queue (Pause/Resume) */}
             <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -1236,16 +1265,24 @@ export function AgencyDashboard() {
             </motion.div>
 
             {/* Add Walk-in Customer */}
-            <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-              <Button
-                onClick={() => setWalkInOpen(true)}
-                variant="outline"
-                className="w-full h-14 rounded-2xl font-semibold gap-2 border-2 border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-700 dark:bg-rose-900/20 dark:text-rose-400 hover:bg-rose-100 dark:hover:bg-rose-900/30 transition-all duration-200"
-              >
-                <UserPlus className="h-5 w-5" />
-                <span className="text-sm">{t('addWalkInCustomer')}</span>
-              </Button>
-            </motion.div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }} className={queueLocked ? 'cursor-not-allowed' : undefined}>
+                  <Button
+                    onClick={() => { if (!guardSubscription()) setWalkInOpen(true); }}
+                    disabled={queueLocked}
+                    variant="outline"
+                    className="w-full h-14 rounded-2xl font-semibold gap-2 border-2 border-rose-300 bg-rose-50 text-rose-700 dark:border-rose-700 dark:bg-rose-900/20 dark:text-rose-400 hover:bg-rose-100 dark:hover:bg-rose-900/30 transition-all duration-200 disabled:opacity-50"
+                  >
+                    {queueLocked ? <Lock className="h-5 w-5" /> : <UserPlus className="h-5 w-5" />}
+                    <span className="text-sm">{t('addWalkInCustomer')}</span>
+                  </Button>
+                </motion.div>
+              </TooltipTrigger>
+              {queueLocked && (
+                <TooltipContent>{t('subscriptionLockedTooltip')}</TooltipContent>
+              )}
+            </Tooltip>
 
             {/* View QR Code */}
             <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
@@ -1599,6 +1636,7 @@ export function AgencyDashboard() {
               setActionLoading(`call-${counterId}`);
               handleCallNext();
             }}
+            subscriptionActive={!queueLocked}
             lang={lang}
             t={t as any}
           />
@@ -2204,10 +2242,10 @@ export function AgencyDashboard() {
             </Button>
             <Button
               onClick={handleAddWalkIn}
-              disabled={walkInLoading || !walkInName.trim()}
+              disabled={walkInLoading || !walkInName.trim() || queueLocked}
               className="bg-rose-600 hover:bg-rose-700 text-white font-semibold rounded-xl gap-1.5"
             >
-              {walkInLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <UserPlus className="h-4 w-4" />}
+              {walkInLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : queueLocked ? <Lock className="h-4 w-4" /> : <UserPlus className="h-4 w-4" />}
               {t('addWalkInCustomer')}
             </Button>
           </DialogFooter>

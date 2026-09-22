@@ -27,7 +27,9 @@ export const registerSchema = z.object({
       (v) => /^(\+213|00213)?0?[5-7]\d{8}$/.test(v.replace(/[\s\-\.]/g, '')),
       'Enter a valid Algerian phone number (e.g. 0555123456)',
     ),
-  role: z.enum(['CUSTOMER', 'AGENCY_OWNER']).optional().default('CUSTOMER'),
+  // Task 31: SUPER_ADMIN accepted so programmatic/admin-console registrations can
+  // create platform admins; they skip email/phone verification entirely (auth.ts).
+  role: z.enum(['CUSTOMER', 'AGENCY_OWNER', 'SUPER_ADMIN']).optional().default('CUSTOMER'),
   agencyCode: z.string().optional(),
   avatarUrl: z.string().url().optional().or(z.literal('')),
 })
@@ -106,8 +108,11 @@ export const updateAgencyProfileSchema = z.object({
   phone: z.string().max(20).optional(),
   category: z.string().optional(),
   website: z.string().url().optional().or(z.literal('')),
-  logoUrl: z.string().max(2048).optional(),
-  coverUrl: z.string().max(2048).optional(),
+  // Task 31 (bug 13): nullable so desktop-synced profile saves that carry
+  // explicit nulls ("clear this field") no longer fail validation with a 400 —
+  // the outbox replay classifies 400s as permanent_failed and never retries.
+  logoUrl: z.string().max(2048).nullable().optional(),
+  coverUrl: z.string().max(2048).nullable().optional(),
   workingHoursStart: z.string().optional(),
   workingHoursEnd: z.string().optional(),
   /// CSV of weekday numbers 0=Sunday…6=Saturday, e.g. "0,1,2,3,4"
@@ -145,6 +150,8 @@ export const createStaffSchema = z.object({
   password: z.string().min(6).max(128),
   phoneNumber: z.string().optional(),
   role: z.enum(['STAFF', 'MANAGER']).optional().default('STAFF'),
+  // Task 31 (bug 8): staff must be associated with a branch of the same agency.
+  branchId: z.string().min(1).optional(),
 })
 
 export const updateStaffSchema = z.object({
@@ -152,6 +159,8 @@ export const updateStaffSchema = z.object({
   phoneNumber: z.string().optional(),
   role: z.enum(['STAFF', 'MANAGER']).optional(),
   isActive: z.boolean().optional(),
+  // Task 31 (bug 8): allow reassigning a staff member to another branch.
+  branchId: z.string().min(1).nullable().optional(),
 })
 
 // ─── Admin ───────────────────────────────────────────────────────────────────

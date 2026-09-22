@@ -228,6 +228,8 @@ const ar = {
   paymentApproved: "تمت الموافقة على الدفع",
   paymentRejected: "تم رفض الدفع",
   selectPlan: "اختر الخطة",
+  freePlanIncluded: "مضمنة افتراضياً",
+  freePlanIncludedDesc: "خطة المجاني هي الخطة الافتراضية — تحصل عليها كل الوكالات مجاناً. يمكنك الترقية في أي وقت.",
   paymentProof: "إثبات الدفع",
   receiptNote: "يرجى رفع إيصال الدفع بصيغة JPG أو PNG أو PDF",
 
@@ -883,6 +885,10 @@ const ar = {
   staffRoleStaff: 'موظف',
   staffRoleManager: 'مسؤول',
   staffCreatedWithCreds: 'تم إنشاء الحساب ! بيانات الدخول: {username} / {password}',
+  // Task 31 (bug 8): يجب ربط الموظف بفرع
+  staffBranchLabel: 'الفرع',
+  staffBranchPlaceholder: 'اختر الفرع',
+  staffBranchRequired: 'يرجى اختيار الفرع الذي يعمل فيه هذا الموظف',
   changePassword: 'تغيير كلمة المرور',
   currentPassword: 'كلمة المرور الحالية',
   newPassword: 'كلمة المرور الجديدة',
@@ -1283,6 +1289,9 @@ const ar = {
   queueUnavailable: 'الطابور غير متاح حالياً',
   activatePlan: 'تفعيل الخطة',
   subscriptionRequired: 'يرجى تفعيل الاشتراك لاستخدام ميزات الطابور',
+  // Task 31 (bug 5): قفل الميزات المدفوعة عند عدم تفعيل الاشتراك
+  subscriptionRequiredBranches: 'يرجى تفعيل الاشتراك لإنشاء الفروع والكاونترات',
+  subscriptionLockedTooltip: 'يتطلب اشتراكاً نشطاً',
   inactiveAgency: 'غير نشط',
 
   // ─── Task 6: Queue Features ──────
@@ -1318,6 +1327,16 @@ const ar = {
   onboardingSkipped: 'يمكنك إكمال الإعداد لاحقاً من الإعدادات',
   helloUser: 'مرحباً، {name}!',
   setupAccountDesc: 'لنُعدّ حسابك بسرعة',
+  // Task 31 (bug 2): ترحيب وإعداد مخصص لكل نوع حساب (عميل / مالك مؤسسة / موظف)
+  welcomeTitleCustomer: 'مرحباً بك في بلاصتي!',
+  welcomeTitleOwner: 'مرحباً بك في بلاصتي — لنطلق مؤسستك',
+  welcomeTitleStaff: 'مرحباً بك في بلاصتي — لنجهّزك لخدمة الزبائن',
+  setupDescCustomer: 'حسابك جاهز — احجز دورك في أي مؤسسة وتابعه مباشرة من لوحة التحكم',
+  setupDescOwner: 'لنُعدّ مؤسستك: معلومات النشاط، أيام العمل، الفروع والخدمات — لن يستغرق الأمر سوى دقيقة',
+  setupDescStaff: 'لنُكمل إعداد حساب الموظف حتى تتمكن من خدمة الطابور في فرعك',
+  welcomeSubtitleCustomer: 'ابدأ بحجز أدوارك على الفور',
+  welcomeSubtitleOwner: 'جهّز مؤسستك وابدأ في استقبال الزبائن',
+  welcomeSubtitleStaff: 'حساب الموظف جاهز — سيقوم مسؤول المؤسسة بتعيينك إلى فرع',
   adminOnboardingNote: 'كمدير، يمكنك إدارة جميع المؤسسات والمستخدمين وإعدادات المنصة من لوحة التحكم.',
   agencyTip4: 'أضف موظفين من "إدارة الموظفين" في الإعدادات',
   stayNotified: 'ابقَ على اطلاع',

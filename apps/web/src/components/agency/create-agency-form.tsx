@@ -109,7 +109,7 @@ function FloatingInput({
           dir={dir}
           maxLength={maxLength}
           type={type}
-          className={`h-11 rounded-xl ps-3 transition-all duration-300 ${
+          className={`h-12 rounded-xl ps-3 transition-all duration-300 ${
             error
               ? 'border-red-400 focus-visible:ring-red-400'
               : focused
@@ -831,7 +831,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
 
   // ─── Form Steps ─────────────────────────────────
   return (
-    <div className="max-w-lg mx-auto">
+    <div className="max-w-lg lg:max-w-2xl mx-auto">
       {/* Header */}
       <div className="text-center mb-6">
         <motion.div
@@ -1082,8 +1082,8 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   </motion.div>
                 </div>
 
-                {/* Time inputs */}
-                <div className="grid grid-cols-2 gap-4">
+                {/* Time inputs — stack on phones, share a row from sm+ (Task 31-A) */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div className="space-y-1.5">
                     <Label htmlFor="wh-start" className="text-sm font-medium flex items-center gap-1.5">
                       <Clock className="h-3.5 w-3.5 text-emerald-500" />
@@ -1096,7 +1096,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                         type="time"
                         value={workingHoursStart}
                         onChange={(e) => setWorkingHoursStart(e.target.value)}
-                        className="h-11 rounded-xl ps-3"
+                        className="h-12 rounded-xl ps-3"
                         dir="ltr"
                       />
                     </div>
@@ -1114,7 +1114,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                         type="time"
                         value={workingHoursEnd}
                         onChange={(e) => setWorkingHoursEnd(e.target.value)}
-                        className="h-11 rounded-xl ps-3"
+                        className="h-12 rounded-xl ps-3"
                         dir="ltr"
                       />
                     </div>
@@ -1209,7 +1209,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                             const v = e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 1);
                             updateServiceRow(index, { prefix: v });
                           }}
-                          className="h-11 w-11 text-center font-mono font-bold rounded-xl"
+                          className="h-12 w-11 text-center font-mono font-bold rounded-xl"
                           maxLength={1}
                           aria-label={t('servicePrefix' as any)}
                           dir="ltr"
@@ -1221,7 +1221,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                           value={row.name}
                           onChange={(e) => updateServiceRow(index, { name: e.target.value })}
                           placeholder={t('serviceNamePlaceholder' as any)}
-                          className="h-11 rounded-xl"
+                          className="h-12 rounded-xl"
                           maxLength={100}
                           aria-label={t('serviceName' as any)}
                         />

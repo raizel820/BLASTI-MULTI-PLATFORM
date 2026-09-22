@@ -232,7 +232,10 @@ model Agency {
   isSponsored           Boolean         @default(false)
   /// Phase 2: Dynamic subscription — now links to SubscriptionPlan instead of hardcoded enum
   subscriptionPlanId    String?
-  subscriptionTier      String          @default("BASIC")
+  /// Task 32 (bug A): new agencies start on the FREE tier (the $0 catalog plan),
+  /// NOT Basic — "BASIC" here made every fresh agency look like a paying Basic
+  /// subscriber. FREE is the default free tier; BASIC/PREMIUM require payment.
+  subscriptionTier      String          @default("FREE")
   subscriptionStatus    String          @default("INACTIVE")
   workingHoursStart     String          @default("08:00")
   workingHoursEnd       String          @default("17:00")

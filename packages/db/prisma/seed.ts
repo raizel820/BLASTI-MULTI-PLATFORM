@@ -53,6 +53,9 @@ async function seed() {
       language: 'ar',
       email: 'admin@blasti.dz',
       isActive: true,
+      // Task 31 (bug 3): SUPER_ADMIN never needs email/phone confirmation.
+      emailVerified: true,
+      phoneVerified: true,
     },
   });
 
@@ -112,6 +115,12 @@ async function seed() {
       priorityListing: false,
       customBranding: false,
       apiAccess: false,
+      // Task 32 (bug C): default multi-month discounts so agencies can pay
+      // 6/12/24 months upfront out of the box. Admins can tune these in the
+      // platform admin plan editor (3-month discount intentionally 0).
+      semiAnnualDiscount: 5,
+      annualDiscount: 10,
+      biennialDiscount: 20,
       isActive: true,
       sortOrder: 1,
     },
@@ -139,6 +148,10 @@ async function seed() {
       priorityListing: true,
       customBranding: true,
       apiAccess: true,
+      // Task 32 (bug C): same default multi-month discounts as Basic (see above).
+      semiAnnualDiscount: 5,
+      annualDiscount: 10,
+      biennialDiscount: 20,
       isActive: true,
       sortOrder: 2,
     },

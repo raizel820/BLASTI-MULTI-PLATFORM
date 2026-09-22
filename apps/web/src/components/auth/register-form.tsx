@@ -869,7 +869,7 @@ export function RegisterForm() {
           transition={{ duration: 0.5, ease: 'easeOut' }}
           className="w-full max-w-md lg:max-w-6xl"
         >
-          <div className="lg:grid lg:grid-cols-[1.05fr_minmax(0,430px)] lg:gap-12 lg:items-center">
+          <div className="lg:grid lg:grid-cols-[1.05fr_minmax(0,560px)] lg:gap-12 lg:items-center">
             {/* ── Brand panel (desktop app & PC web only, lg+) ── */}
             <div className="hidden lg:flex flex-col gap-8 select-none">
               <div className="flex items-center gap-4">
@@ -1174,9 +1174,10 @@ export function RegisterForm() {
                               </div>
                             </div>
 
-                            {/* Account fields — 2-col grid on desktop/PC (lg+),
-                                single column on phones */}
-                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 lg:gap-x-5">
+                            {/* Account fields — ONE input per line at all sizes
+                                (Task 31-A: two inputs per row looked cramped
+                                inside the desktop form card) */}
+                            <div className="grid grid-cols-1 gap-4">
                               {/* Username with availability check */}
                               <div className="space-y-1">
                                 <FloatingInput
@@ -1380,9 +1381,9 @@ export function RegisterForm() {
                           </div>
                         )}
 
-                        {/* Step 2: Profile */}
+                        {/* Step 2: Profile — ONE input per line (Task 31-A) */}
                         {step === 2 && (
-                          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 lg:gap-x-5">
+                          <div className="grid grid-cols-1 gap-4">
                             <FloatingInput
                               id="reg-fullname"
                               label={t('fullName')}
@@ -1678,7 +1679,12 @@ export function RegisterForm() {
                           className="text-center"
                         >
                           <p className="text-lg font-bold text-foreground">{t('registerSuccess')}</p>
-                          <p className="text-sm text-muted-foreground mt-1">{t('welcomeToBlasti')}</p>
+                          {/* Task 31-A: subtitle tailored to the account type being
+                              created (staff/super-admin aren't registrable via the
+                              UI — customers are the safe default). */}
+                          <p className="text-sm text-muted-foreground mt-1">
+                            {role === 'AGENCY_OWNER' ? t('welcomeSubtitleOwner') : t('welcomeSubtitleCustomer')}
+                          </p>
                         </motion.div>
                       </motion.div>
                     </motion.div>

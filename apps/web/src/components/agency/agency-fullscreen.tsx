@@ -46,11 +46,13 @@ import {
   Eye,
   Timer,
   History,
+  Lock,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
+import { isSubscriptionActive } from '@/hooks/use-subscription';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -83,6 +85,8 @@ interface DashboardStats {
   avgWaitTime: number;
   isPaused: boolean;
   currentQueueNumber: string;
+  // Task 31 bug 5: supplied by /api/agency/stats — drives the queue lock.
+  subscriptionStatus?: string;
 }
 
 interface ServiceOption {
@@ -309,6 +313,17 @@ export function AgencyFullscreen() {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [services, setServices] = useState<ServiceOption[]>([]);
   const [queueEntries, setQueueEntries] = useState<QueueEntry[]>([]);
+
+  // Task 31 bug 5: paid/queue feature gate — ACTIVE|TRIAL, undefined (pre-fetch)
+  // stays unlocked; the server still enforces the authoritative 403 gate.
+  const queueLocked = !isSubscriptionActive(stats?.subscriptionStatus);
+  const guardSubscription = () => {
+    if (queueLocked) {
+      toast.error(t('subscriptionRequired'));
+      return true;
+    }
+    return false;
+  };
 
   // Live service duration counter
   const [serviceDurationSeconds, setServiceDurationSeconds] = useState(0);
@@ -618,6 +633,7 @@ export function AgencyFullscreen() {
 
   const handleCallNext = async () => {
     if (!agencyId) return;
+    if (guardSubscription()) return;
     setActionLoading('call');
     try {
       const body: Record<string, string> = { agencyId };
@@ -690,6 +706,7 @@ export function AgencyFullscreen() {
 
   const handleWalkInSubmit = async () => {
     if (!agencyId || !walkInName.trim() || !walkInServiceId) return;
+    if (guardSubscription()) return;
     setWalkInLoading(true);
     try {
       const res = await apiFetch('/api/agency/queue/walk-in', {
@@ -1037,16 +1054,16 @@ export function AgencyFullscreen() {
         {/* ─── Action Buttons Row ────────────────────────────────────────── */}
         <div className="flex-shrink-0 grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3">
           <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-            <Button onClick={handleCallNext} disabled={actionLoading === 'call' || isPaused}
+            <Button onClick={handleCallNext} disabled={actionLoading === 'call' || isPaused || queueLocked}
               className="w-full h-12 sm:h-14 rounded-xl bg-gradient-to-br from-emerald-500 to-emerald-700 hover:from-emerald-600 hover:to-emerald-800 text-white font-bold shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2 disabled:opacity-50">
-              {actionLoading === 'call' ? <Loader2 className="h-5 w-5 animate-spin" /> : <PhoneCall className="h-5 w-5" />}
+              {actionLoading === 'call' ? <Loader2 className="h-5 w-5 animate-spin" /> : queueLocked ? <Lock className="h-5 w-5" /> : <PhoneCall className="h-5 w-5" />}
               <span className="text-xs sm:text-sm">{t('callNext') || 'Call Next'}</span>
             </Button>
           </motion.div>
           <motion.div whileHover={{ scale: 1.03 }} whileTap={{ scale: 0.97 }}>
-            <Button onClick={() => setWalkInOpen(true)}
-              className="w-full h-12 sm:h-14 rounded-xl bg-gradient-to-br from-rose-500 to-rose-700 hover:from-rose-600 hover:to-rose-800 text-white font-bold shadow-lg shadow-rose-500/20 flex items-center justify-center gap-2">
-              <UserPlus className="h-5 w-5" />
+            <Button onClick={() => { if (!guardSubscription()) setWalkInOpen(true); }} disabled={queueLocked}
+              className="w-full h-12 sm:h-14 rounded-xl bg-gradient-to-br from-rose-500 to-rose-700 hover:from-rose-600 hover:to-rose-800 text-white font-bold shadow-lg shadow-rose-500/20 flex items-center justify-center gap-2 disabled:opacity-50">
+              {queueLocked ? <Lock className="h-5 w-5" /> : <UserPlus className="h-5 w-5" />}
               <span className="text-xs sm:text-sm">{t('addWalkInCustomer') || 'Add Manual'}</span>
             </Button>
           </motion.div>
@@ -1210,9 +1227,9 @@ export function AgencyFullscreen() {
                 <Button variant="ghost" onClick={closeWalkInDialog} className="text-gray-400 hover:text-white">
                   {t('cancel') || 'Cancel'}
                 </Button>
-                <Button onClick={handleWalkInSubmit} disabled={walkInLoading || !walkInName.trim() || !walkInServiceId}
+                <Button onClick={handleWalkInSubmit} disabled={walkInLoading || !walkInName.trim() || !walkInServiceId || queueLocked}
                   className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold">
-                  {walkInLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <UserPlus className="h-4 w-4" />}
+                  {walkInLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : queueLocked ? <Lock className="h-4 w-4" /> : <UserPlus className="h-4 w-4" />}
                   {t('add')}
                 </Button>
               </DialogFooter>

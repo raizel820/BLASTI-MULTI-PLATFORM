@@ -13,7 +13,9 @@ import {
   Loader2,
   ChevronRight,
   Hash,
+  Lock,
 } from 'lucide-react';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { TranslationKeys } from '@/i18n';
 
 interface CounterInfo {
@@ -57,6 +59,10 @@ interface CounterManagementProps {
   actionLoading: string | null;
   onCallNext: () => void;
   onCallNextForCounter: (counterId: string) => void;
+  /** Task 31 bug 5: when false (subscription not ACTIVE/TRIAL) the per-counter
+   *  Call Next buttons are locked. Defaults to true so unknown state never
+   *  falsely locks — the server still enforces the real gate. */
+  subscriptionActive?: boolean;
   lang: string;
   t: (key: TranslationKeys) => string;
 }
@@ -89,6 +95,7 @@ export function CounterManagement({
   actionLoading,
   onCallNext,
   onCallNextForCounter,
+  subscriptionActive = true,
   lang,
   t,
 }: CounterManagementProps) {
@@ -211,21 +218,30 @@ export function CounterManagement({
                       <p className="text-[8px] text-muted-foreground">{t('served' as any) || 'served'}</p>
                     </div>
                     {!counter.currentTicket && waitingList.length > 0 && (
-                      <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-                        <Button
-                          size="sm"
-                          onClick={() => onCallNextForCounter(counter.id)}
-                          disabled={!!actionLoading}
-                          className="h-8 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-emerald-700 hover:from-emerald-600 hover:to-emerald-800 text-white text-xs font-semibold gap-1 shadow-sm"
-                        >
-                          {actionLoading === `call-${counter.id}` ? (
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                          ) : (
-                            <PhoneCall className="h-3 w-3" />
-                          )}
-                          <span className="hidden sm:inline">{t('callNext')}</span>
-                        </Button>
-                      </motion.div>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} className={!subscriptionActive ? 'cursor-not-allowed' : undefined}>
+                            <Button
+                              size="sm"
+                              onClick={() => { if (subscriptionActive) onCallNextForCounter(counter.id); }}
+                              disabled={!!actionLoading || !subscriptionActive}
+                              className="h-8 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-emerald-700 hover:from-emerald-600 hover:to-emerald-800 text-white text-xs font-semibold gap-1 shadow-sm disabled:opacity-50"
+                            >
+                              {actionLoading === `call-${counter.id}` ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : !subscriptionActive ? (
+                                <Lock className="h-3 w-3" />
+                              ) : (
+                                <PhoneCall className="h-3 w-3" />
+                              )}
+                              <span className="hidden sm:inline">{t('callNext')}</span>
+                            </Button>
+                          </motion.div>
+                        </TooltipTrigger>
+                        {!subscriptionActive && (
+                          <TooltipContent>{t('subscriptionLockedTooltip')}</TooltipContent>
+                        )}
+                      </Tooltip>
                     )}
                   </div>
                 </div>

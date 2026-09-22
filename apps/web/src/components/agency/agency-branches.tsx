@@ -52,10 +52,13 @@ import {
   Users,
   Power,
   Crown,
+  Lock,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
+import { useSubscriptionActive } from '@/hooks/use-subscription';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 
 // Types
 interface Branch {
@@ -97,6 +100,11 @@ export function AgencyBranches() {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
   const agencyId = user?.agencyId;
+
+  // Task 31 bug 5: branch/counter creation is a paid feature. isActive stays
+  // true until a concrete INACTIVE/TRIAL-less status arrives (offline-first),
+  // and the server enforces the authoritative gate.
+  const { isActive: subscriptionActive } = useSubscriptionActive(agencyId);
 
   // State
   const [branches, setBranches] = useState<Branch[]>([]);
@@ -222,6 +230,12 @@ export function AgencyBranches() {
 
   const handleSaveBranch = async () => {
     if (!agencyId || !branchName.trim()) return;
+    // Task 31 bug 5: creating branches requires an active subscription
+    // (editing an existing one stays allowed — server only gates POST).
+    if (!editingBranch && !subscriptionActive) {
+      toast.error(t('subscriptionRequiredBranches'));
+      return;
+    }
     setBranchSaving(true);
     try {
       if (editingBranch) {
@@ -365,6 +379,12 @@ export function AgencyBranches() {
 
   const handleSaveCounter = async () => {
     if (!expandedBranch || !counterName.trim()) return;
+    // Task 31 bug 5: creating counters requires an active subscription
+    // (editing an existing one stays allowed — server only gates POST).
+    if (!editingCounter && !subscriptionActive) {
+      toast.error(t('subscriptionRequiredBranches'));
+      return;
+    }
     setCounterSaving(true);
     try {
       if (editingCounter) {
@@ -529,14 +549,24 @@ export function AgencyBranches() {
           </h2>
           <p className="text-sm text-muted-foreground mt-1">{t('branchesDesc')}</p>
         </div>
-        <Button
-          className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl shadow-lg shadow-emerald-500/20 gap-2 h-10 px-4"
-          onClick={openCreateBranchDialog}
-        >
-          <Plus className="h-4 w-4" />
-          <span className="hidden sm:inline">{t('addBranch')}</span>
-          <span className="sm:hidden">{t('addBranch')}</span>
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex">
+              <Button
+                className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl shadow-lg shadow-emerald-500/20 gap-2 h-10 px-4 disabled:opacity-50"
+                onClick={openCreateBranchDialog}
+                disabled={!subscriptionActive}
+              >
+                {!subscriptionActive ? <Lock className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                <span className="hidden sm:inline">{t('addBranch')}</span>
+                <span className="sm:hidden">{t('addBranch')}</span>
+              </Button>
+            </span>
+          </TooltipTrigger>
+          {!subscriptionActive && (
+            <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
+          )}
+        </Tooltip>
       </motion.div>
 
       {/* Summary stats */}
@@ -587,13 +617,23 @@ export function AgencyBranches() {
           </div>
           <p className="text-lg font-semibold text-foreground">{t('noBranches')}</p>
           <p className="text-sm text-muted-foreground mt-1 max-w-sm">{t('noBranchesDesc')}</p>
-          <Button
-            className="mt-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl gap-2"
-            onClick={openCreateBranchDialog}
-          >
-            <Plus className="h-4 w-4" />
-            {t('addBranch')}
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex">
+                <Button
+                  className="mt-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl gap-2 disabled:opacity-50"
+                  onClick={openCreateBranchDialog}
+                  disabled={!subscriptionActive}
+                >
+                  {!subscriptionActive ? <Lock className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                  {t('addBranch')}
+                </Button>
+              </span>
+            </TooltipTrigger>
+            {!subscriptionActive && (
+              <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
+            )}
+          </Tooltip>
         </motion.div>
       ) : (
         <div className="space-y-3">
@@ -739,14 +779,24 @@ export function AgencyBranches() {
                               )}
                             </div>
 
-                            <Button
-                              size="sm"
-                              className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg h-8 text-xs gap-1.5"
-                              onClick={() => openCreateCounterDialog(branch.id)}
-                            >
-                              <Plus className="h-3.5 w-3.5" />
-                              {t('addCounter')}
-                            </Button>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="inline-flex">
+                                  <Button
+                                    size="sm"
+                                    className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg h-8 text-xs gap-1.5 disabled:opacity-50"
+                                    onClick={() => openCreateCounterDialog(branch.id)}
+                                    disabled={!subscriptionActive}
+                                  >
+                                    {!subscriptionActive ? <Lock className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+                                    {t('addCounter')}
+                                  </Button>
+                                </span>
+                              </TooltipTrigger>
+                              {!subscriptionActive && (
+                                <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
+                              )}
+                            </Tooltip>
                           </div>
 
                           {/* Branch Info Grid */}
@@ -982,7 +1032,7 @@ export function AgencyBranches() {
             <Button
               className="bg-emerald-600 hover:bg-emerald-700 text-white"
               onClick={handleSaveBranch}
-              disabled={branchSaving || !branchName.trim()}
+              disabled={branchSaving || !branchName.trim() || (!editingBranch && !subscriptionActive)}
             >
               {branchSaving ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : null}
               {t('save')}
@@ -1053,7 +1103,7 @@ export function AgencyBranches() {
             <Button
               className="bg-emerald-600 hover:bg-emerald-700 text-white"
               onClick={handleSaveCounter}
-              disabled={counterSaving || !counterName.trim()}
+              disabled={counterSaving || !counterName.trim() || (!editingCounter && !subscriptionActive)}
             >
               {counterSaving ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : null}
               {t('save')}

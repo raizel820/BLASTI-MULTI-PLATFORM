@@ -81,3 +81,43 @@ export function humanizeEnum(value: string): string {
     .replace(/\b\w/g, w => w.toUpperCase())
     .trim();
 }
+
+/**
+ * Formats the agency working-days CSV (0=Sunday … 6=Saturday) as a localized,
+ * comma-separated weekday list using the app language — NOT navigator.language
+ * (Task 31-A: on English-locale machines the profile row always showed English
+ * day names regardless of the selected app language).
+ *
+ * Uses the same proven base-date approach as create-agency-form.tsx: Oct 6 2024
+ * is a Sunday, so base + N lands on weekday N.
+ *
+ * opts.short — 'short' weekday names (default, matches the compact profile row)
+ *              or full names when explicitly false.
+ * Returns '' for null/empty/unparsable input so the caller can fall back.
+ */
+export function formatWorkingDaysList(
+  csv: string | null | undefined,
+  lang: 'en' | 'ar' | 'fr',
+  opts?: { short?: boolean },
+): string {
+  if (!csv) return '';
+  const days = csv
+    .split(',')
+    .map((d) => d.trim())
+    .filter((d) => /^[0-6]$/.test(d))
+    .sort((a, b) => Number(a) - Number(b));
+  if (days.length === 0) return '';
+  const locale = lang === 'ar' ? 'ar' : lang === 'fr' ? 'fr' : 'en';
+  // Arabic uses the Arabic comma (،); Latin scripts use the regular comma.
+  const separator = lang === 'ar' ? '\u060c ' : ', ';
+  try {
+    const formatter = new Intl.DateTimeFormat(locale, {
+      weekday: opts?.short === false ? 'long' : 'short',
+    });
+    return days
+      .map((d) => formatter.format(new Date(2024, 9, 6 + Number(d))))
+      .join(separator);
+  } catch {
+    return '';
+  }
+}

@@ -74,6 +74,18 @@ async function checkSubscriptionExpiry(agencyId: string) {
   }
 }
 
+// ─── Subscription gate helper ────────────────────────────────────────────────
+//
+// Single source of truth for "can this agency use paid/queue features?".
+// Keyed on subscriptionStatus ONLY — never on plan/tier (a FREE plan with an
+// ACTIVE status is fully functional). TRIAL counts as active, matching the
+// /api/queue/* gates in queue.ts so both stacks behave identically.
+// complete/no-show/cancel (PATCH /agency/queue/:id) stays intentionally
+// UNGATED so in-flight customers can finish during expiry grace.
+export function hasActiveSubscription(status: string | null | undefined): boolean {
+  return status === 'ACTIVE' || status === 'TRIAL'
+}
+
 // ─── Phase 2c: Cross-tenant agencyId ownership verification ─────────────────
 //
 // Prevents a staff member of Agency A from accessing/modifying Agency B's data
@@ -455,6 +467,22 @@ app.post('/branches', async (c) => {
     // Phase 2c: Explicit ownership check
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
+
+    // Task 31 bug 5: branch creation is a paid feature — gate on subscription
+    // status (ACTIVE|TRIAL), same contract as the queue routes.
+    const branchAgency = await db.agency.findUnique({
+      where: { id: agencyId },
+      select: { subscriptionStatus: true },
+    })
+    if (!branchAgency) {
+      return c.json({ success: false, error: 'Agency not found' }, 404)
+    }
+    if (!hasActiveSubscription(branchAgency.subscriptionStatus)) {
+      return c.json(
+        { success: false, error: 'An active subscription is required to use queue features' },
+        403
+      )
+    }
 
     const { data, error } = validateBody(createBranchSchema, body)
     if (error) {
@@ -1397,7 +1425,7 @@ app.post('/queue/call-next', async (c) => {
     if (!agencyCheck) {
       return c.json({ error: 'Agency not found' }, 404)
     }
-    if (agencyCheck.subscriptionStatus !== 'ACTIVE') {
+    if (!hasActiveSubscription(agencyCheck.subscriptionStatus)) {
       return c.json(
         { error: 'An active subscription is required to use queue features' },
         403
@@ -1580,7 +1608,7 @@ app.post('/queue/toggle-pause', async (c) => {
     if (!agencyCheck) {
       return c.json({ error: 'Agency not found' }, 404)
     }
-    if (agencyCheck.subscriptionStatus !== 'ACTIVE') {
+    if (!hasActiveSubscription(agencyCheck.subscriptionStatus)) {
       return c.json(
         { error: 'An active subscription is required to use queue features' },
         403
@@ -1657,6 +1685,14 @@ app.post('/queue/walk-in', async (c) => {
 
     if (!agency) {
       return c.json({ success: false, error: 'Agency not found' }, 404)
+    }
+
+    // Task 31 bug 5: paid/queue feature gate — same 403 contract as call-next.
+    if (!hasActiveSubscription(agency.subscriptionStatus)) {
+      return c.json(
+        { success: false, error: 'An active subscription is required to use queue features' },
+        403
+      )
     }
 
     if (!agency.isQueueOpen) {
@@ -2674,7 +2710,7 @@ app.post('/staff/create', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    const { agencyId, username, fullName, password, phoneNumber, staffRole } = validation.data
+    const { agencyId, username, fullName, password, phoneNumber, staffRole, branchId } = validation.data
 
     // Phase 2c: Verify the requesting user actually belongs to the target agency.
     // Prevents cross-tenant exploit where a staff member from Agency A could
@@ -2699,6 +2735,19 @@ app.post('/staff/create', async (c) => {
 
     if (!agency) {
       return c.json({ error: 'Agency not found' }, 404)
+    }
+
+    // Task 31 bug 8: a staff member must be associated with a branch of the
+    // SAME agency. branchId is optional at the schema level (legacy clients),
+    // but when provided it must resolve to a branch owned by this agency.
+    if (branchId) {
+      const branch = await db.branch.findFirst({
+        where: { id: branchId, agencyId },
+        select: { id: true },
+      })
+      if (!branch) {
+        return c.json({ success: false, error: 'Branch not found for this agency' }, 400)
+      }
     }
 
     // Check username uniqueness
@@ -2732,6 +2781,9 @@ app.post('/staff/create', async (c) => {
         userId: newUser.id,
         agencyId,
         role: agencyStaffRole,
+        // Task 31 bug 8: persist the branch association (null when the caller
+        // is a legacy client that did not send one).
+        branchId: branchId ?? null,
       },
       include: {
         user: {
@@ -2794,7 +2846,7 @@ app.patch('/staff/:id', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    const { fullName, role, isActive, permissions } = validation.data
+    const { fullName, role, isActive, permissions, branchId } = validation.data
 
     // Find the staff member
     const staffMember = await db.agencyStaff.findUnique({
@@ -2833,6 +2885,25 @@ app.patch('/staff/:id', async (c) => {
       await db.agencyStaff.update({
         where: { id },
         data: { role },
+      })
+    }
+
+    // Task 31 bug 8: branch (re)assignment — a string must resolve to a branch
+    // of the same agency; explicit null clears the association; undefined
+    // leaves it untouched.
+    if (branchId !== undefined) {
+      if (branchId !== null) {
+        const branch = await db.branch.findFirst({
+          where: { id: branchId, agencyId },
+          select: { id: true },
+        })
+        if (!branch) {
+          return c.json({ success: false, error: 'Branch not found for this agency' }, 400)
+        }
+      }
+      await db.agencyStaff.update({
+        where: { id },
+        data: { branchId },
       })
     }
 
@@ -2879,6 +2950,7 @@ app.patch('/staff/:id', async (c) => {
       fullName,
       role,
       isActive,
+      branchId: branchId ?? undefined,
     })
 
     return c.json({ staff: updated, success: true })
@@ -3404,7 +3476,8 @@ app.get('/subscription', async (c) => {
 
     if (!agencyId) {
       return c.json({
-        currentPlan: 'BASIC',
+        // Task 32 (bug A): the built-in default tier is FREE, not BASIC.
+        currentPlan: 'FREE',
         status: 'INACTIVE',
         subscriptionStartsAt: null,
         subscriptionExpiresAt: null,
@@ -3419,7 +3492,7 @@ app.get('/subscription', async (c) => {
     const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) {
       return c.json({
-        currentPlan: 'BASIC',
+        currentPlan: 'FREE',
         status: 'INACTIVE',
         subscriptionStartsAt: null,
         subscriptionExpiresAt: null,
@@ -3435,6 +3508,19 @@ app.get('/subscription', async (c) => {
     // and surface the daysRemaining / isExpiringSoon flags for the UI banners.
     const expiry = await checkSubscriptionExpiry(agencyId)
 
+    // Task 32 (bug A): one-time self-heal for agencies created before the
+    // FREE default — a never-paid agency (no transactions, no linked plan,
+    // INACTIVE) that still carries the legacy "BASIC" default tier is
+    // corrected to FREE so Basic stops posing as the built-in free tier.
+    let currentTier = agency.subscriptionTier
+    if (currentTier === 'BASIC' && agency.subscriptionStatus === 'INACTIVE' && !agency.subscriptionPlanId) {
+      const paidTransactions = await db.transaction.count({ where: { agencyId: agency.id } })
+      if (paidTransactions === 0) {
+        await db.agency.update({ where: { id: agency.id }, data: { subscriptionTier: 'FREE' } })
+        currentTier = 'FREE'
+      }
+    }
+
     const transactions = await db.transaction.findMany({
       where: { agencyId: agency.id },
       orderBy: { createdAt: 'desc' },
@@ -3442,7 +3528,7 @@ app.get('/subscription', async (c) => {
     })
 
     return c.json({
-      currentPlan: agency.subscriptionTier,
+      currentPlan: currentTier,
       // Use the (possibly updated) status from the expiry check so the client
       // sees EXPIRED immediately after the date passes — without a refetch.
       status: expiry?.status ?? agency.subscriptionStatus,
@@ -3499,6 +3585,16 @@ app.post('/subscription/pay', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
+    // Task 32 (bug B): desktop submissions carry receipt URLs pointing at the
+    // device-local API (http://127.0.0.1:3080/api/upload/file/...). Rewrite
+    // them to the cloud's own public URL (same suffix-preserving rule as the
+    // sync intake) so admins can open the receipt from any device once the
+    // desktop file-sync push lands the blob.
+    const receiptUrlNormalized = normalizeRecordFileUrls(
+      { receiptUrl: validation.data.receiptUrl },
+      PUBLIC_FILE_URL_BASE || new URL(c.req.url).origin,
+    ).receiptUrl
+
     const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ error: 'No agency found' }, 404)
 
@@ -3547,7 +3643,7 @@ app.post('/subscription/pay', async (c) => {
         amount,
         plan: validation.data.plan,
         paymentMethod: validation.data.method,
-        receiptUrl: validation.data.receiptUrl || null,
+        receiptUrl: receiptUrlNormalized || null,
         status: 'PENDING',
         // Phase 1d snapshot fields — freeze the plan price/currency/name at
         // transaction time so future admin edits don't rewrite history.
@@ -3616,13 +3712,15 @@ app.post('/subscription/unsubscribe', async (c) => {
       where: { id: agency.id },
       data: {
         subscriptionStatus: 'INACTIVE',
-        subscriptionTier: 'BASIC',
+        // Task 32 (bug A): unsubscribing lands back on the FREE default tier,
+        // not BASIC — Basic is a paid plan and was never the base tier.
+        subscriptionTier: 'FREE',
       },
     })
 
-    // Phase 5d: If this is a downgrade (not just unsubscribing from BASIC), handle excess resources
-    if (previousTier !== 'BASIC') {
-      const downgradeSummary = await handleDowngrade(agency.id, 'BASIC')
+    // Phase 5d: If this is a downgrade (not just unsubscribing from FREE), handle excess resources
+    if (previousTier !== 'FREE') {
+      const downgradeSummary = await handleDowngrade(agency.id, 'FREE')
 
       // Audit log for downgrade
       await db.auditLog.create({
@@ -3633,7 +3731,7 @@ app.post('/subscription/unsubscribe', async (c) => {
           entityId: agency.id,
           details: JSON.stringify({
             from: previousTier,
-            to: 'BASIC',
+            to: 'FREE',
             countersDeactivated: downgradeSummary.countersDeactivated,
             gracePeriodEndsAt: downgradeSummary.gracePeriodEndsAt?.toISOString(),
           }),

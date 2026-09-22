@@ -9,11 +9,12 @@ import { SlideToConfirm } from '@/components/shared/slide-to-confirm';
 import {
   PhoneCall, Users, Clock, CheckCircle2, Pause, Play,
   UserX, Volume2, VolumeX, Wifi, WifiOff,
-  RefreshCw, Loader2
+  RefreshCw, Loader2, Lock
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
+import { isSubscriptionActive } from '@/hooks/use-subscription';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -30,6 +31,8 @@ interface QueueStats {
   isPaused: boolean;
   noShowCount?: number;
   todayReservations?: number;
+  // Task 31 bug 5: supplied by /api/agency/stats — drives the queue lock.
+  subscriptionStatus?: string;
 }
 
 interface CurrentlyServing {
@@ -190,6 +193,7 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
           isPaused: data.isPaused ?? false,
           noShowCount: data.noShowCount ?? 0,
           todayReservations: data.todayReservations ?? 0,
+          subscriptionStatus: data.subscriptionStatus,
         });
       }
 
@@ -310,6 +314,11 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
   // ─── Actions ─────────────────────────────────────────────────────────
   const callNext = useCallback(async () => {
     if (actionLoading) return;
+    // Task 31 bug 5: client-side feedback for the subscription gate.
+    if (!isSubscriptionActive(stats?.subscriptionStatus)) {
+      toast.error(t('subscriptionRequired'));
+      return;
+    }
     setActionLoading('call');
     try {
       const res = await apiFetch('/api/agency/queue/call-next', {
@@ -334,7 +343,7 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
     } finally {
       setActionLoading(null);
     }
-  }, [agencyId, actionLoading, fetchData, playSound, t]);
+  }, [agencyId, actionLoading, stats, fetchData, playSound, t]);
 
   const markCompleted = useCallback(async () => {
     if (!currentlyServing || actionLoading) return;
@@ -434,6 +443,8 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
   const completedToday = stats?.servedToday ?? 0;
   const avgTime = stats?.avgWaitTime ?? 0;
   const isPaused = stats?.isPaused ?? false;
+  // Task 31 bug 5: unknown (pre-fetch) stays unlocked — server still enforces.
+  const queueUnlocked = isSubscriptionActive(stats?.subscriptionStatus);
   const isRTL = lang === 'ar';
 
   return (
@@ -610,16 +621,16 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
 
       {/* ─── Action Buttons ───────────────────────────────────────────── */}
       <div className="px-4 pb-4 space-y-3">
-        {/* Call Next — MASSIVE button */}
+        {/* Call Next — MASSIVE button (locked when subscription is not active) */}
         <motion.button
           onClick={callNext}
-          disabled={!!actionLoading || isPaused}
+          disabled={!!actionLoading || isPaused || !queueUnlocked}
           whileTap={{ scale: 0.96 }}
           className={`
             w-full min-h-[80px] rounded-2xl font-bold text-xl
             flex items-center justify-center gap-3
             transition-all duration-150
-            ${isPaused
+            ${isPaused || !queueUnlocked
               ? 'bg-gray-700/50 text-gray-500 cursor-not-allowed'
               : 'bg-gradient-to-r from-emerald-600 via-teal-500 to-cyan-500 text-white shadow-lg shadow-emerald-500/25 active:shadow-emerald-500/40'
             }
@@ -627,6 +638,11 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
         >
           {actionLoading === 'call' ? (
             <Loader2 className="h-7 w-7 animate-spin" />
+          ) : !queueUnlocked ? (
+            <>
+              <Lock className="h-7 w-7" />
+              <span>{t('callNext') || 'Call Next'}</span>
+            </>
           ) : (
             <>
               <PhoneCall className="h-7 w-7" />

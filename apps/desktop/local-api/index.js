@@ -1950,6 +1950,74 @@ function createApp() {
   app.patch('/api/agencies/*', forwardAgencies)
 
   /**
+   * Task 31-C (BUG 12) — password routes are cloud-native. Reset tokens live
+   * in the cloud's in-memory store and mail/SMS sending happens cloud-side,
+   * while User.passwordHash is never synced to the device — so the desktop
+   * has nothing local to implement these with, and every password call used
+   * to hit app.notFound with a bare "Not found". Three thin proxies now
+   * forward the body verbatim and pass the cloud status+body through.
+   */
+  const forwardPasswordRoute = (cloudPath, opts = {}) => async (c) => {
+    try {
+      let bodyBuffer = null
+      try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + cloudPath, {
+          method: c.req.method,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(bodyBuffer ? { 'Content-Length': String(bodyBuffer.length) } : {}),
+            // forgot/reset are public (the user may have lost the session);
+            // change-password carries the session the local middleware validated.
+            ...(opts.withAuth && sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: bodyBuffer,
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn(`[LocalAPI] ${cloudPath} proxy: cloud unreachable:`, err?.message || err)
+        return c.json({
+          success: false,
+          error: opts.unreachableMessage ||
+            'Password reset requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON body */ }
+      // GOTCHA: after a cloud-side password CHANGE, the local
+      // LocalDeviceCredential verifier still matches the OLD password —
+      // revoke it so offline unlock cannot keep authenticating the stale
+      // secret. The next login re-derives and stores a fresh credential.
+      if (res.ok && opts.revokeDeviceCredential && sessionUser && sessionUser.id && db && db.localDeviceCredential) {
+        try {
+          const removed = await db.localDeviceCredential.deleteMany({ where: { userId: sessionUser.id } })
+          if (removed && removed.count) {
+            console.log(`[LocalAPI] Revoked ${removed.count} local device credential(s) after password change — re-login required for offline unlock`)
+          }
+        } catch (credErr) {
+          console.warn('[LocalAPI] Could not revoke local device credential after password change:', credErr?.message || credErr)
+        }
+      }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error(`[LocalAPI] ${cloudPath} proxy error:`, error)
+      return c.json({ success: false, error: 'Password request failed' }, 500)
+    }
+  }
+  // POST /api/auth/forgot-password — public: request a reset token (cloud
+  // auth.ts, always answers the same message to prevent enumeration).
+  app.post('/api/auth/forgot-password', forwardPasswordRoute('/api/auth/forgot-password'))
+  // POST /api/auth/reset-password — public: redeem token + set new password.
+  app.post('/api/auth/reset-password', forwardPasswordRoute('/api/auth/reset-password'))
+  // PATCH /api/user/change-password — authenticated: swap current→new password.
+  app.patch('/api/user/change-password', forwardPasswordRoute('/api/user/change-password', {
+    withAuth: true,
+    revokeDeviceCredential: true,
+  }))
+
+  /**
    * Round 16 — /api/auth/refresh-session proxy. Asks the cloud to re-issue
    * the session token from the DATABASE's current state (role + agency
    * ownership). This upgrades a stale snapshot token — the exact situation
@@ -2824,12 +2892,21 @@ function createApp() {
         return c.json({ success: false, error: 'No agency associated with this account' }, 403)
       }
 
+      // Cloud contract (apps/api/src/routes/agency.ts GET /branches): rows
+      // carry counter/staff counts (_count) and main branches sort first.
+      // The response is DUAL-KEYED — { branches } for cloud-shape readers and
+      // { data } for the legacy local envelope — because the UI reads
+      // data.branches (Task 31-C, BUG 6: the single-key { data } shape left
+      // the desktop branch list structurally empty).
       const branches = await db.branch.findMany({
         where: { agencyId },
-        orderBy: { createdAt: 'asc' },
+        include: {
+          _count: { select: { counters: true, staff: true } },
+        },
+        orderBy: [{ isMain: 'desc' }, { name: 'asc' }],
       })
 
-      return c.json({ success: true, data: branches })
+      return c.json({ success: true, branches, data: branches })
     } catch (error) {
       console.error('[LocalAPI] List branches error:', error)
       return c.json({ success: false, error: 'Failed to list branches' }, 500)
@@ -2845,7 +2922,11 @@ function createApp() {
       }
 
       const body = await c.req.json()
-      const { name, address, phone, isActive } = body
+      // Task 31-C (BUG 6): the UI also sends nameAr/nameFr/isMain
+      // (agency-branches.tsx) — dropping them silently lost translations and
+      // the "set as main" flag on desktop. Cloud createBranchSchema accepts
+      // all of these, so the canonical replay body stays valid cloud-side.
+      const { name, nameAr, nameFr, address, phone, isActive, isMain } = body
 
       if (!name) {
         return c.json({ success: false, error: 'Branch name is required' }, 400)
@@ -2853,12 +2934,24 @@ function createApp() {
 
       // Part Q: business write + outbox row commit atomically.
       const branch = await withOutboxTransaction(async (tx) => {
+        // Cloud parity (agency.ts POST /branches): when the new branch is set
+        // as main, unset the other main branches INSIDE the same transaction
+        // — same sweep the PATCH route runs — so a crash cannot leave two mains.
+        if (isMain) {
+          await tx.branch.updateMany({
+            where: { agencyId, isMain: true },
+            data: { isMain: false },
+          })
+        }
         const created = await tx.branch.create({
           data: {
             agencyId,
             name,
+            nameAr: nameAr || null,
+            nameFr: nameFr || null,
             address: address || null,
             phone: phone || null,
+            isMain: Boolean(isMain),
             isActive: isActive !== undefined ? Boolean(isActive) : true,
           },
         })
@@ -2870,7 +2963,8 @@ function createApp() {
 
       emitEvent('branch:created', { agencyId, branch })
 
-      return c.json({ success: true, data: branch }, 201)
+      // Dual-key response — the cloud route returns { success, branch } 201.
+      return c.json({ success: true, branch, data: branch }, 201)
     } catch (error) {
       console.error('[LocalAPI] Create branch error:', error)
       return c.json({ success: false, error: 'Failed to create branch' }, 500)
@@ -3087,11 +3181,19 @@ function createApp() {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
       const branchId = c.req.param('branchId')
+      // Ownership first, then filter by branchId only — Counter has NO
+      // agencyId column (branchId → Branch → agencyId), so the old
+      // `where: { agencyId, branchId }` threw "Unknown argument" and the
+      // route 500'd on every call. Same shape as the cloud route
+      // (agency.ts GET /branches/:id/counters).
+      const branch = await db.branch.findFirst({ where: { id: branchId, agencyId } })
+      if (!branch) return c.json({ success: false, error: 'Branch not found' }, 404)
       const counters = await db.counter.findMany({
-        where: { agencyId, branchId },
+        where: { branchId },
         orderBy: { name: 'asc' },
       })
-      return c.json({ success: true, data: counters })
+      // Dual-key — the UI reads data.counters, the cloud contract is { counters }.
+      return c.json({ success: true, counters, data: counters })
     } catch (error) {
       console.error('[LocalAPI] List branch counters error:', error)
       return c.json({ success: false, error: 'Failed to list counters' }, 500)
@@ -3253,6 +3355,70 @@ function createApp() {
     } catch (error) {
       console.error('[LocalAPI] List reservations error:', error)
       return c.json({ success: false, error: 'Failed to list reservations' }, 500)
+    }
+  })
+
+  // GET /api/reservations/history — the customer's completed-reservation
+  // history (Task 31-C, BUG 4: the route did not exist locally and every
+  // desktop History tap 404'd). Mirrors the cloud contract
+  // (apps/api/src/routes/reservations.ts GET /history): scoped by the SESSION
+  // user — the ?userId= query param is ignored — with terminal statuses only,
+  // agency + service joins, localized logo, and { reservations, total,
+  // limit, offset } pagination. An empty history renders as an empty list
+  // (200), never an error.
+  app.get('/api/reservations/history', authMiddleware, async (c) => {
+    try {
+      const userId = sessionUser.id
+      const parsedLimit = parseInt(c.req.query('limit') || '20', 10)
+      const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 100) : 20
+      const parsedOffset = parseInt(c.req.query('offset') || '0', 10)
+      const offset = Number.isFinite(parsedOffset) ? Math.max(parsedOffset, 0) : 0
+
+      const completedStatuses = ['COMPLETED', 'CANCELLED', 'NO_SHOW', 'SERVED']
+      const where = { userId, status: { in: completedStatuses } }
+
+      const [reservations, total] = await Promise.all([
+        db.reservation.findMany({
+          where,
+          include: {
+            agency: { select: { id: true, name: true, nameFr: true, nameAr: true, customCode: true, category: true, logoUrl: true } },
+            service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
+          },
+          orderBy: { joinedAt: 'desc' },
+          take: limit,
+          skip: offset,
+        }),
+        db.reservation.count({ where }),
+      ])
+
+      // Same field projection as the cloud route; the agency logo is
+      // localized to the local file store when the blob is on this device
+      // so history rows render offline.
+      const mappedReservations = await Promise.all(reservations.map(async (r) => ({
+        id: r.id,
+        userId: r.userId,
+        agencyId: r.agencyId,
+        serviceId: r.serviceId,
+        queueNumber: r.queueNumber,
+        displayNumber: r.displayNumber,
+        status: r.status,
+        estimatedWait: r.estimatedWait,
+        reservedDate: r.reservedDate,
+        joinedAt: r.joinedAt,
+        calledAt: r.calledAt,
+        completedAt: r.completedAt,
+        cancelledAt: r.cancelledAt,
+        rating: r.rating,
+        feedback: r.feedback ?? null,
+        ratedAt: r.ratedAt ?? null,
+        agency: r.agency ? { ...r.agency, logoUrl: await localizeFileUrl(r.agency.logoUrl) } : null,
+        service: r.service,
+      })))
+
+      return c.json({ success: true, reservations: mappedReservations, total, limit, offset })
+    } catch (error) {
+      console.error('[LocalAPI] Reservation history error:', error)
+      return c.json({ success: false, error: 'Failed to load reservation history' }, 500)
     }
   })
 
@@ -4633,23 +4799,76 @@ function createApp() {
 
   // GET /api/agency/subscription — subscription status from local Agency record
   // Subscription data (tier, status, dates) is embedded in the Agency table and
-  // synced to local SQLite at login. SubscriptionPlan catalog and Transaction
-  // history are NOT synced, so those return empty arrays.
-  // Payment/cancellation/unsubscribe actions require cloud — not available offline.
+  // synced to local SQLite at login. Task 31-C (BUG 11): SubscriptionPlan +
+  // PlanFeature ARE synced locally (sync-registry syncOrder 2/3 — the old
+  // "NOT synced" comment was stale) and Transaction is synced APPEND_ONLY, so
+  // the plan catalog and recent payments are mirrored with the exact cloud
+  // queries (agency.ts GET /subscription) instead of hardcoded empty arrays.
+  // Payment/cancellation/unsubscribe actions still require cloud.
   app.get('/api/agency/subscription', authMiddleware, async (c) => {
     try {
-      const agencyId = sessionUser.agencyId
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+
+      // Cloud parity (agency.ts:3393-3403): the active plan catalog is
+      // embedded in EVERY response — even when the session has no agency.
+      // Enterprise custom plans appear only for their owner agency.
+      let availablePlans = []
+      try {
+        availablePlans = await db.subscriptionPlan.findMany({
+          where: {
+            isActive: true,
+            OR: [
+              { isEnterprise: false },
+              ...(agencyId ? [{ isEnterprise: true, ownerAgencyId: agencyId }] : []),
+            ],
+          },
+          include: { features: true },
+          orderBy: { sortOrder: 'asc' },
+        })
+      } catch (planErr) {
+        console.warn('[LocalAPI] subscription plan catalog query failed:', planErr?.message || planErr)
+      }
+
+      // Cloud parity (agency.ts:3455-3469): last 10 payment transactions with
+      // the snapshot fields the subscription page renders.
+      let recentTransactions = []
+      if (agencyId) {
+        try {
+          const transactions = await db.transaction.findMany({
+            where: { agencyId },
+            orderBy: { createdAt: 'desc' },
+            take: 10,
+          })
+          recentTransactions = transactions.map((tx) => ({
+            id: tx.id,
+            amount: tx.amount,
+            amountPaid: tx.amountPaid ?? null,
+            planName: tx.planName ?? null,
+            plan: tx.plan,
+            method: tx.paymentMethod,
+            status: tx.status,
+            rejectionReason: tx.rejectionReason ?? null,
+            reviewedAt: tx.reviewedAt ? new Date(tx.reviewedAt).toISOString() : null,
+            createdAt: new Date(tx.createdAt).toISOString(),
+          }))
+        } catch (txErr) {
+          console.warn('[LocalAPI] recent transactions query failed:', txErr?.message || txErr)
+        }
+      }
+
       if (!agencyId) {
         return c.json({
-          currentPlan: 'BASIC',
+          // Task 32 (bug A companion): the built-in default tier is FREE, not
+          // BASIC — mirrors the cloud's currentPlan fallback (agency.ts:3479).
+          currentPlan: 'FREE',
           status: 'INACTIVE',
           subscriptionStartsAt: null,
           subscriptionExpiresAt: null,
           daysRemaining: null,
           isExpired: false,
           isExpiringSoon: false,
-          availablePlans: [],
-          recentTransactions: [],
+          availablePlans,
+          recentTransactions,
         })
       }
 
@@ -4660,21 +4879,41 @@ function createApp() {
           subscriptionStatus: true,
           subscriptionStartsAt: true,
           subscriptionExpiresAt: true,
+          subscriptionPlanId: true,
         },
       })
 
       if (!agency) {
         return c.json({
-          currentPlan: 'BASIC',
+          // Task 32 (bug A companion): FREE, not BASIC — cloud parity.
+          currentPlan: 'FREE',
           status: 'INACTIVE',
           subscriptionStartsAt: null,
           subscriptionExpiresAt: null,
           daysRemaining: null,
           isExpired: false,
           isExpiringSoon: false,
-          availablePlans: [],
-          recentTransactions: [],
+          availablePlans,
+          recentTransactions,
         })
+      }
+
+      // Task 32 (bug A companion) — local mirror of the cloud's one-time
+      // self-heal (agency.ts:3511-3522): a never-paid agency (no transactions,
+      // no linked SubscriptionPlan, INACTIVE) still carrying the legacy
+      // "BASIC" default tier is corrected to FREE locally too, so the desktop
+      // stops posing Basic as the built-in free tier. The update also syncs
+      // back up through the regular sync engine.
+      if (agency.subscriptionTier === 'BASIC' && agency.subscriptionStatus === 'INACTIVE' && !agency.subscriptionPlanId) {
+        try {
+          const paidTransactions = await db.transaction.count({ where: { agencyId } })
+          if (paidTransactions === 0) {
+            await db.agency.update({ where: { id: agencyId }, data: { subscriptionTier: 'FREE' } })
+            agency.subscriptionTier = 'FREE'
+          }
+        } catch (healErr) {
+          console.warn('[LocalAPI] subscription tier self-heal failed (non-fatal):', healErr?.message || healErr)
+        }
       }
 
       // Calculate expiry flags (mirrors cloud's checkSubscriptionExpiry logic)
@@ -4696,19 +4935,128 @@ function createApp() {
       }
 
       return c.json({
-        currentPlan: agency.subscriptionTier || 'BASIC',
+        // Task 32 (bug A companion): the built-in default tier is FREE, not
+        // BASIC — mirrors the cloud (agency.ts:3531 uses the healed tier).
+        currentPlan: agency.subscriptionTier || 'FREE',
         status,
         subscriptionStartsAt: agency.subscriptionStartsAt?.toISOString() ?? null,
         subscriptionExpiresAt: agency.subscriptionExpiresAt?.toISOString() ?? null,
         daysRemaining,
         isExpired,
         isExpiringSoon,
-        availablePlans: [],
-        recentTransactions: [],
+        availablePlans,
+        recentTransactions,
       })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/subscription error:', error)
       return c.json({ success: false, error: 'Failed to load subscription' }, 500)
+    }
+  })
+
+  // POST /api/agency/subscription/pay — cloud-forwarding proxy (Task 32, bug B).
+  //
+  // The desktop PaymentDialog (agency-subscription.tsx handleSubmitPayment)
+  // uploads the receipt to the LOCAL /api/upload (which returns a
+  // http://127.0.0.1:3080/api/upload/file/... URL), then POSTs multipart
+  // FormData here — but this route did not exist, so every desktop payment
+  // submission 404'd with the app's bare "not found". Payment submission is
+  // CLOUD-native: the cloud validates the plan, applies the period discount,
+  // creates the PENDING Transaction and flips the agency to
+  // subscriptionStatus PENDING (apps/api agency.ts POST /subscription/pay).
+  // Same proxy contract as the Task 31-C staff-create proxy: session Bearer
+  // forwarding, cloud status+body passthrough, 503 CLOUD_UNREACHABLE offline.
+  //
+  // Deliberately NO local Transaction write and NO logPendingMutation/outbox
+  // row — the cloud is authoritative and a replayed outbox row would
+  // duplicate-create the transaction. The cloud-created Transaction + the
+  // agency's PENDING state sync back down via the regular sync engine
+  // (kicked below on success).
+  app.post('/api/agency/subscription/pay', authMiddleware, async (c) => {
+    try {
+      // Parse the multipart form the UI sends. All fields are plain strings —
+      // NO file blob in this form (the receipt was already uploaded to
+      // /api/upload and is referenced by URL).
+      let form
+      try {
+        form = await c.req.formData()
+      } catch {
+        return c.json({ success: false, error: 'multipart/form-data body required' }, 400)
+      }
+      const fields = {}
+      for (const key of ['plan', 'method', 'receiptUrl', 'agencyId', 'period']) {
+        const value = form.get(key)
+        if (typeof value === 'string' && value.length > 0) fields[key] = value
+      }
+
+      // Task 32: BEFORE forwarding, force a file-sync pass so the receipt
+      // blob reaches the cloud first — the cloud rewrites the local receipt
+      // URL to a cloud URL preserving the /api/upload/file/<suffix> path
+      // byte-exact, so the normalized URL becomes valid as soon as the blob
+      // lands. syncNow() is the awaitable handle (schedule() merely defers
+      // to it after 300ms); hard-capped at ~8s via Promise.race so a slow
+      // sync can never stall the payment. Sync failure is NON-FATAL — never
+      // block the payment because sync failed.
+      try {
+        if (fileSync && typeof fileSync.syncNow === 'function') {
+          await Promise.race([
+            fileSync.syncNow('subscription-payment'),
+            new Promise((resolve) => setTimeout(resolve, 8000)),
+          ])
+        } else if (fileSync && typeof fileSync.schedule === 'function') {
+          // Fallback: background pass (the /api/upload route already
+          // scheduled one anyway — belt and braces).
+          fileSync.schedule('subscription-payment')
+        }
+      } catch (syncErr) {
+        console.warn('[LocalAPI] subscription/pay: pre-forward receipt file-sync failed (non-fatal):', syncErr?.message || syncErr)
+      }
+
+      // Rebuild the FormData from the parsed string fields — the original
+      // body stream is never forwarded raw.
+      const forwardForm = new FormData()
+      for (const [key, value] of Object.entries(fields)) forwardForm.append(key, value)
+
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/agency/subscription/pay', {
+          method: 'POST',
+          // NOTE: no manual Content-Type — fetch sets multipart/form-data
+          // with the correct boundary for the FormData body.
+          headers: {
+            // Same session token requireAuth() validated — the cloud
+            // enforces auth + resolves the agency from the session.
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: forwardForm,
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] Subscription-pay proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Submitting a subscription payment requires an internet connection. Please connect and try again.',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) {
+        // Kick a sync round so the cloud-created PENDING Transaction and the
+        // agency's PENDING subscription state pull down at once (regular
+        // sync engine — no local subscription writes here).
+        try { if (fileSync) fileSync.schedule('subscription-paid') } catch { /* non-fatal */ }
+        try {
+          // Lazy require — sync-service lazily requires ./index (circular dep).
+          const syncService = require('./sync-service')
+          if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+        } catch { /* non-fatal */ }
+      }
+      // Cloud status + body pass through verbatim ({ success, transaction } 200
+      // or a 4xx { error }).
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] Subscription-pay proxy error:', error)
+      return c.json({ success: false, error: 'Failed to submit subscription payment' }, 500)
     }
   })
 
@@ -5003,7 +5351,21 @@ function createApp() {
       if (!staffMember) return c.json({ error: 'Staff member not found' }, 404)
       if (staffMember.agencyId !== agencyId) return c.json({ error: 'Not your agency' }, 403)
       if (staffMember.role === 'OWNER') return c.json({ error: 'Cannot modify owner' }, 403)
-      const { fullName, role, isActive, permissions } = body
+      const { fullName, role, isActive, permissions, branchId } = body
+      // Task 31-C (BUG 8 support): optional branch assignment — attach the
+      // staff member to one of the agency's branches (string) or clear the
+      // assignment (null). AgencyStaff.branchId exists in BOTH schemas but no
+      // route accepted it before. A string must reference a branch of THIS
+      // agency (same ownership rule the other branch routes enforce).
+      if (branchId !== undefined && branchId !== null) {
+        if (typeof branchId !== 'string' || !branchId) {
+          return c.json({ success: false, error: 'branchId must be a non-empty string or null' }, 400)
+        }
+        const branch = await db.branch.findFirst({ where: { id: branchId, agencyId } })
+        if (!branch) {
+          return c.json({ success: false, error: 'Branch not found in this agency' }, 400)
+        }
+      }
       // Part Q: ALL staff/user writes below + the outbox row commit atomically
       // — a crash can no longer half-apply a staff edit (e.g. role changed but
       // name not, or activation written with no outbox entry).
@@ -5020,6 +5382,10 @@ function createApp() {
         if (isActive !== undefined) {
           await tx.user.update({ where: { id: staffMember.userId }, data: { isActive } })
           await tx.agencyStaff.update({ where: { id }, data: { isActive } })
+        }
+        // Update branch assignment (string to attach, null to clear)
+        if (branchId !== undefined) {
+          await tx.agencyStaff.update({ where: { id }, data: { branchId: branchId === null ? null : branchId } })
         }
         // Update permissions
         if (permissions !== undefined) {
@@ -5043,12 +5409,28 @@ function createApp() {
     }
   })
 
-  // GET /api/agency/subscription-plans — list available plans (offline: empty)
+  // GET /api/agency/subscription-plans — list available plans
+  // Task 31-C (BUG 11): SubscriptionPlan + PlanFeature ARE synced locally
+  // (lib/sync-registry.json syncOrder 2/3 — the old "NOT synced locally"
+  // comment was stale and the route always returned an empty catalog).
+  // Mirrors the cloud query verbatim (agency.ts GET /subscription-plans,
+  // which returns { plans }) — enterprise custom plans are included only
+  // for the agency they were built for.
   app.get('/api/agency/subscription-plans', authMiddleware, async (c) => {
     try {
-      // SubscriptionPlan table is NOT synced locally.
-      // Return empty array — the subscription page will show cached plan data from session.
-      return c.json({ plans: [] })
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      const plans = await db.subscriptionPlan.findMany({
+        where: {
+          isActive: true,
+          OR: [
+            { isEnterprise: false },
+            ...(agencyId ? [{ isEnterprise: true, ownerAgencyId: agencyId }] : []),
+          ],
+        },
+        include: { features: true },
+        orderBy: { sortOrder: 'asc' },
+      })
+      return c.json({ plans })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/subscription-plans error:', error)
       return c.json({ plans: [] })
@@ -5706,34 +6088,59 @@ function createApp() {
     }
   })
 
-  // POST /api/agency/staff/create — add staff member
+  // POST /api/agency/staff/create — cloud-forwarding proxy (Task 31-C, BUG 7).
+  //
+  // The previous local handler implemented an obsolete "link an existing user
+  // by userId" contract and rejected the UI's body with "userId is required".
+  // The UI (agency-employees.tsx) and the cloud route (agency.ts POST
+  // /staff/create) both speak the "CREATE A NEW user account" contract —
+  // user creation is cloud-native: the cloud verifies agency ownership,
+  // hashes the password (scrypt), creates the User + AgencyStaff rows and
+  // returns { staff, initialPassword } 201. Deliberately NO
+  // logPendingMutation here — replaying this body would create a SECOND,
+  // divergent cloud user. The new rows reach this device through the normal
+  // sync pull instead (kicked below on success).
   app.post('/api/agency/staff/create', authMiddleware, async (c) => {
     try {
-      const agencyId = sessionUser.agencyId
-      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
-      const body = await c.req.json()
-      const { userId, role, permissions, isActive } = body
-      if (!userId) return c.json({ success: false, error: 'userId is required' }, 400)
-      // Verify user exists
-      const user = await db.user.findUnique({ where: { id: userId } })
-      if (!user) return c.json({ success: false, error: 'User not found' }, 404)
-      // Check if already a member
-      const existing = await db.agencyStaff.findFirst({ where: { agencyId, userId } })
-      if (existing) return c.json({ success: false, error: 'User is already a staff member' }, 409)
-      const staff = await db.agencyStaff.create({
-        data: {
-          agencyId,
-          userId,
-          role: role || 'AGENCY_STAFF',
-          permissions: permissions || null,
-          isActive: isActive !== undefined ? Boolean(isActive) : true,
-          joinedAt: new Date(),
-        },
-      })
-      emitEvent('staff:created', { agencyId, staff })
-      return c.json({ success: true, data: staff }, 201)
+      let bodyBuffer = null
+      try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/agency/staff/create', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(bodyBuffer ? { 'Content-Length': String(bodyBuffer.length) } : {}),
+            // Same session token requireAuth() validated — the cloud enforces
+            // agency ownership on the body's agencyId.
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: bodyBuffer,
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] Staff-create proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Creating a staff account requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) {
+        // Kick a sync round so the new User + AgencyStaff pull down at once.
+        try { if (fileSync) fileSync.schedule('staff-created') } catch { /* non-fatal */ }
+        try {
+          // Lazy require — sync-service lazily requires ./index (circular dep).
+          const syncService = require('./sync-service')
+          if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+        } catch { /* non-fatal */ }
+      }
+      // Cloud status + body pass through verbatim ({ staff, initialPassword } 201).
+      return c.json(data || { success: res.ok }, res.status)
     } catch (error) {
-      console.error('[LocalAPI] Create staff error:', error)
+      console.error('[LocalAPI] Staff-create proxy error:', error)
       return c.json({ success: false, error: 'Failed to create staff' }, 500)
     }
   })

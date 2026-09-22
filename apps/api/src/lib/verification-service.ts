@@ -78,6 +78,8 @@ interface UserLike {
   emailVerified: boolean
   phoneVerified: boolean
   createdAt: Date
+  /** Task 31-A: optional so legacy callers without the field still type-check. */
+  role?: string
 }
 
 /**
@@ -91,6 +93,14 @@ export async function resolveVerificationStatus(user: UserLike): Promise<Verific
     phoneRequired: false,
     emailVerified: user.emailVerified,
     phoneVerified: user.phoneVerified,
+  }
+
+  // ── Task 31-A: SUPER_ADMIN exemption ────────────────────────────────
+  // Platform admins are trusted accounts (created pre-verified) and must
+  // never be gated behind email/phone OTP — login returns a session
+  // directly. Same shape as "not required".
+  if (user.role === 'SUPER_ADMIN') {
+    return status
   }
 
   // Grandfathering: user registered before the enforcement date

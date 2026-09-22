@@ -233,6 +233,8 @@ const en: Record<TranslationKeys, string> = {
   paymentApproved: "Payment approved",
   paymentRejected: "Payment rejected",
   selectPlan: "Select Plan",
+  freePlanIncluded: "Included by default",
+  freePlanIncludedDesc: "The Free plan is the built-in starting tier — every agency gets it for free. Upgrade anytime.",
   paymentProof: "Payment Proof",
   receiptNote: "Please upload your receipt in JPG, PNG or PDF format",
 
@@ -883,6 +885,10 @@ const en: Record<TranslationKeys, string> = {
   staffRoleStaff: "Staff Member",
   staffRoleManager: "Manager",
   staffCreatedWithCreds: "Staff account created! Credentials: {username} / {password}",
+  // Task 31 (bug 8): staff must be associated with a branch
+  staffBranchLabel: 'Branch',
+  staffBranchPlaceholder: 'Select a branch',
+  staffBranchRequired: 'Please select the branch this staff member works at',
   changePassword: "Change Password",
   currentPassword: "Current Password",
   newPassword: "New Password",
@@ -1054,6 +1060,16 @@ const en: Record<TranslationKeys, string> = {
   onboardingSkipped: 'You can complete setup later in Settings',
   helloUser: 'Hello, {name}!',
   setupAccountDesc: 'Let\'s set up your account quickly',
+  // Task 31 (bug 2): per-role welcome + setup copy (customer / agency owner / staff)
+  welcomeTitleCustomer: 'Welcome to BLASTI!',
+  welcomeTitleOwner: 'Welcome to BLASTI — let\'s launch your agency',
+  welcomeTitleStaff: 'Welcome to BLASTI — let\'s get you ready to serve',
+  setupDescCustomer: 'Your account is ready — book your turn at any agency and track it live from your dashboard',
+  setupDescOwner: 'Let\'s set up your agency: business info, working days, branches and services — it only takes a minute',
+  setupDescStaff: 'Let\'s finish setting up your staff account so you can start serving the queue at your branch',
+  welcomeSubtitleCustomer: 'Start booking your turns right away',
+  welcomeSubtitleOwner: 'Set up your agency and start receiving customers',
+  welcomeSubtitleStaff: 'Your staff account is ready — your agency admin can assign you to a branch',
   adminOnboardingNote: 'As an admin, you can manage all agencies, users, and platform settings from the dashboard.',
   agencyTip4: 'Add staff members from Staff Management in Settings',
   stayNotified: 'Stay Notified',
@@ -1326,6 +1342,9 @@ const en: Record<TranslationKeys, string> = {
   queueUnavailable: 'Queue is currently unavailable',
   activatePlan: 'Activate Plan',
   subscriptionRequired: 'Please activate your subscription to use queue features',
+  // Task 31 (bug 5): subscription gating for paid features
+  subscriptionRequiredBranches: 'Please activate your subscription to create branches and counters',
+  subscriptionLockedTooltip: 'Requires an active subscription',
   inactiveAgency: 'Inactive',
 
   // ─── Task 6: Queue Features ──────

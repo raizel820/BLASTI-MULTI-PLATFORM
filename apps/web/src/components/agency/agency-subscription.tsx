@@ -2325,6 +2325,10 @@ export function AgencySubscription() {
   //   (or strictly lower price when sortOrder ties), excluding FREE and any
   //   enterprise plans.
   // - If no current plan: empty.
+  // FREE is deliberately NOT a downgrade target: it is the built-in default
+  // tier, not a purchasable plan. An agency returns to FREE by unsubscribing
+  // (the backend resets subscriptionTier to FREE on unsubscribe), so there is
+  // nothing to "pay" for here — the FREE card in the catalog grid is display-only.
   const downgradablePlans = useMemo(() => {
     if (!currentPlanObj) return [];
     if (currentPlanObj.isEnterprise) {
@@ -2338,7 +2342,8 @@ export function AgencySubscription() {
     return availablePlans.filter((p) => {
       if (!isRegularPlan(p)) return false;
       if (p.name === currentPlanObj.name) return false;
-      // Skip FREE — agencies can't self-subscribe to it
+      // Skip FREE — built-in default tier, not purchasable (unsubscribe
+      // already resets the agency to FREE; see downgradablePlans note above).
       if (p.name.toUpperCase() === 'FREE') return false;
       if (p.sortOrder !== currentPlanObj.sortOrder) {
         return p.sortOrder < currentPlanObj.sortOrder;
@@ -2360,11 +2365,14 @@ export function AgencySubscription() {
   // - ACTIVE & showPlansList=false  → empty (cards hidden by default)
   // - ACTIVE & plansFilter=upgrade  → upgradablePlans (already filtered)
   // - ACTIVE & plansFilter=downgrade→ downgradablePlans (already filtered)
-  // - ACTIVE & plansFilter=null & showPlansList=true → all non-FREE, owned plans
-  // - INACTIVE/EXPIRED              → all non-FREE, owned plans
+  // - ACTIVE & plansFilter=null & showPlansList=true → all owned plans (FREE included)
+  // - INACTIVE/EXPIRED              → all owned plans (FREE included)
+  // FREE IS part of the catalog: it is the built-in default tier every agency
+  // gets, so it renders as a card in the grid (muted + non-purchasable — see
+  // the isFreeTier branch in the card's action area below). Upgrade targets
+  // still exclude FREE naturally (upgradablePlans only keeps higher sortOrder).
   const visiblePlans = useMemo(() => {
-    const catalogFilter = (p: SubscriptionPlan) =>
-      p.name.toUpperCase() !== 'FREE' && ownsPlan(p);
+    const catalogFilter = (p: SubscriptionPlan) => ownsPlan(p);
     if (isActive) {
       if (!showPlansList) return [];
       if (plansFilter === 'upgrade') return upgradablePlans;
@@ -2936,6 +2944,9 @@ export function AgencySubscription() {
             const PlanIcon = accent.icon;
             const isCurrent = data?.currentPlan === plan.name;
             const isFree = plan.price === 0;
+            // FREE tier (by name, not just price) — the built-in default plan.
+            // Display-only in the catalog: never opens the payment flow.
+            const isFreeTier = plan.name.toUpperCase() === 'FREE';
             const isEnterprisePlan = !!plan.isEnterprise;
             const isPremiumLike = plan.name.toUpperCase() === 'PREMIUM' || plan.name.toUpperCase() === 'PRO';
 
@@ -3102,8 +3113,28 @@ export function AgencySubscription() {
                           <CheckCircle2 className="h-4 w-4 me-2" />
                           {t('currentPlan')}
                         </Button>
+                      ) : isFreeTier ? (
+                        // FREE tier, agency NOT currently on it: no payment CTA.
+                        // Muted disabled button + caption (mirrors the disabled
+                        // "Current Plan" styling); the subscribe handler below
+                        // is additionally guarded so it can never open the
+                        // PaymentDialog or create a transaction for FREE.
+                        <div className="space-y-1.5">
+                          <Button
+                            className="w-full h-11 bg-gray-100 dark:bg-gray-800 text-muted-foreground hover:bg-gray-100 dark:hover:bg-gray-800 cursor-not-allowed rounded-xl"
+                            disabled
+                            title={t('freePlanIncludedDesc')}
+                          >
+                            <Info className="h-4 w-4 me-2" />
+                            {t('freePlanIncluded')}
+                          </Button>
+                          <p className="text-[10px] leading-snug text-muted-foreground text-center">
+                            {t('freePlanIncludedDesc')}
+                          </p>
+                        </div>
                       ) : isFree ? (
-                        // Free plans don't require payment — show a disabled hint
+                        // Other zero-price (non-FREE) plans don't require
+                        // payment — show a disabled hint
                         <div className="w-full h-11 rounded-xl bg-gray-50 dark:bg-gray-800/40 border border-dashed border-gray-300 dark:border-gray-700 flex items-center justify-center text-xs text-muted-foreground">
                           {lang === 'ar' ? 'تواصل مع المسؤول للتفعيل' : lang === 'fr' ? 'Contactez l\'admin pour activer' : 'Contact admin to activate'}
                         </div>
@@ -3111,6 +3142,10 @@ export function AgencySubscription() {
                         <Button
                           className="w-full h-11 font-semibold rounded-xl shadow-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white shadow-emerald-500/20 transition-all duration-300"
                           onClick={() => {
+                            // Defense-in-depth: FREE is the built-in default
+                            // tier and is never purchasable — never open the
+                            // payment flow for it.
+                            if (plan.name.toUpperCase() === 'FREE') return;
                             setSelectedPlan(plan);
                             setShowPaymentDialog(true);
                           }}

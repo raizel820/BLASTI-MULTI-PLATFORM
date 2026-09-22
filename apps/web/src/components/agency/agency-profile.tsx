@@ -48,6 +48,7 @@ import QRCode from 'qrcode';
 import type { TranslationKeys } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { apiFetch } from '@/lib/api-fetch';
+import { formatWorkingDaysList } from '@/lib/enum-i18n';
 
 interface AgencyInfo {
   id: string;
@@ -75,19 +76,13 @@ const categoryOptions: { value: string; key: TranslationKeys }[] = [
   { value: 'OTHER', key: 'catOther' },
 ];
 
-/** Round 15 — localized weekday list for the workingDays CSV (0=Sunday). */
-function formatWorkingDays(csv: string): string {
-  try {
-    const locale = typeof navigator !== 'undefined' ? navigator.language || 'en' : 'en';
-    return csv
-      .split(',')
-      .filter((d) => /^[0-6]$/.test(d.trim()))
-      .sort((a, b) => Number(a) - Number(b))
-      .map((d) => new Intl.DateTimeFormat(locale, { weekday: 'short' }).format(new Date(2024, 9, 6 + Number(d))))
-      .join(' \u00b7 ');
-  } catch {
-    return csv;
-  }
+/** Round 15 — localized weekday list for the workingDays CSV (0=Sunday).
+ *  Task 31-A: delegated to the shared formatWorkingDaysList and driven by the
+ *  app language (was navigator.language, which ignored the in-app ar/fr
+ *  selection on English-locale machines). Falls back to the raw CSV when the
+ *  list cannot be formatted. */
+function formatWorkingDays(csv: string, lang: 'en' | 'ar' | 'fr'): string {
+  return formatWorkingDaysList(csv, lang, { short: true }) || csv;
 }
 
 export function AgencyProfile() {
@@ -307,8 +302,11 @@ export function AgencyProfile() {
         animate={{ opacity: 1, y: 0 }}
       >
         <Card className="border-0 shadow-sm overflow-hidden bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50">
-          {/* Hero Banner with gradient overlay */}
-          <div className="h-36 bg-gradient-to-br from-emerald-500 via-teal-500 to-emerald-600 relative overflow-hidden">
+          {/* Hero Banner with gradient overlay — Task 31-A: overflow-hidden
+              removed so the logo overhang (-bottom-12) is not clipped in
+              half; the parent Card's overflow-hidden still clips the
+              decorative circles. */}
+          <div className="h-36 bg-gradient-to-br from-emerald-500 via-teal-500 to-emerald-600 relative">
             {/* Gradient overlay */}
             <div className="absolute inset-0 hero-gradient-overlay" />
             {/* Decorative elements */}
@@ -338,18 +336,18 @@ export function AgencyProfile() {
                 </motion.span>
               </Badge>
             </div>
-            <div className="absolute -bottom-10 start-5">
+            <div className="absolute -bottom-12 start-5">
               {/* Animated agency logo/icon with floating animation */}
               <motion.div
                 animate={{ y: [0, -4, 0] }}
                 transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
-                className="h-20 w-20 rounded-2xl bg-white dark:bg-gray-800 shadow-lg flex items-center justify-center border-4 border-white dark:border-gray-800"
+                className="h-24 w-24 rounded-2xl bg-white dark:bg-gray-800 shadow-lg flex items-center justify-center border-4 border-white dark:border-gray-800"
               >
                 {profile?.logoUrl ? (
                   <img
                     src={getProxiedUrl(profile.logoUrl)}
                     alt="Logo"
-                    className="h-full w-full object-cover rounded-xl"
+                    className="h-full w-full object-contain"
                   />
                 ) : (
                   <Building2 className="h-8 w-8 text-emerald-600" />
@@ -402,7 +400,7 @@ export function AgencyProfile() {
             )}
           </div>
 
-          <CardContent className="pt-14 p-5 space-y-4">
+          <CardContent className="pt-16 p-5 space-y-4">
             {editMode ? (
               <div className="space-y-4">
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -507,7 +505,7 @@ export function AgencyProfile() {
                   {profile?.workingDays && (
                     <div className="flex items-center gap-3 text-sm">
                       <CalendarDays className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-                      <span className="text-muted-foreground">{t('workingDays')}: {formatWorkingDays(profile.workingDays)}</span>
+                      <span className="text-muted-foreground">{t('workingDays')}: {formatWorkingDays(profile.workingDays, lang)}</span>
                     </div>
                   )}
                 </div>
