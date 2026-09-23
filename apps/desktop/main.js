@@ -870,6 +870,34 @@ async function runStartupDiagnostics() {
     diagnosticsAllPassed = !hasErrors;
     console.log(`[Diagnostics] allPassed: ${diagnosticsAllPassed} — ${diagResult.results.filter(r => r.status === 'success').length}/${diagResult.results.length} success, ${diagResult.results.filter(r => r.status === 'warning').length} warnings, ${diagResult.results.filter(r => r.status === 'error').length} errors`);
 
+    // ── Task 33-C: AUTH-REJECTED routing (never downgraded, never a dead end) ──
+    // A step failure carrying authRejected (the reachable cloud confirmed the
+    // stored session is no longer authorized) is a FATAL verdict that is
+    // never downgraded to a warning. But blocking the launch gate outright
+    // would leave the user on a dead-end error panel with no way to sign in
+    // again — the user requirement is a LOGIN SCREEN. When auth-rejection is
+    // the ONLY fatal condition (no stale session was restored — it was
+    // rejected and the workspace locked), send the auth:revoked IPC and load
+    // the app: the renderer starts logged out and its auth-provider routes
+    // to the login form. Any OTHER fatal error still blocks the gate below.
+    const authRejectedErrors = (diagResult.results || []).filter(r =>
+      r && r.status === 'error' &&
+      (r.authRejected === true || (r.detail && (r.detail.authRejected === true || r.detail.code === 'AUTHORIZATION_REVOKED'))));
+    const otherErrors = (diagResult.results || []).filter(r => r && r.status === 'error' && authRejectedErrors.indexOf(r) === -1);
+    if (hasErrors && otherErrors.length === 0 && authRejectedErrors.length > 0) {
+      console.warn('[Diagnostics] AUTH-REJECTED verdict — the stale session is blocked; routing to the login screen (auth:revoked IPC + app load) instead of a dead-end gate');
+      try {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          const firstDetail = authRejectedErrors[0] && authRejectedErrors[0].detail;
+          mainWindow.webContents.send('auth:revoked', {
+            reason: (firstDetail && firstDetail.reason) || 'token-rejected',
+          });
+        }
+      } catch (_) { /* window gone */ }
+      finishLoadingAndLoadApp();
+      return; // finally below resets diagnosticsRunning
+    }
+
     // ── Consumer gate outcome (production) ─────────────────────────────
     // The consumer gate shows NO diagnostics detail while running. Only the
     // END verdict reaches it: errors → compact error panel + blocked launch;
@@ -1327,6 +1355,28 @@ function _normalizeClientRecord(record) {
   return result;
 }
 
+// ─── Task 33-C: authorization-revoked bridge (sync engine → renderer) ────────
+// When the sync engine CONFIRMS the cloud has rejected the session (401/403
+// verified through the refresh-session discriminator — a network failure
+// never revokes), the workspace locks and the renderer must force a logout →
+// login screen. Direct module subscription (same pattern as the mutation
+// listener self-wiring): events fire even before a window exists (guarded).
+try {
+  const syncServiceForEvents = require('./local-api/sync-service');
+  syncServiceForEvents.onSyncEvent((evt) => {
+    if (!evt || evt.type !== 'authorization-revoked') return;
+    console.warn('[Main] Authorization revoked by cloud — notifying renderer:', evt.reason || 'unknown');
+    try {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('auth:revoked', { reason: evt.reason || 'token-rejected' });
+      }
+    } catch (_) { /* window gone */ }
+  });
+  console.log('[Main] Sync event bridge wired (authorization-revoked → auth:revoked IPC)');
+} catch (bridgeErr) {
+  console.warn('[Main] Could not wire the authorization-revoked bridge:', bridgeErr.message);
+}
+
 // ─── IPC: Auth bridge for cloud sync ────────────────────────────────────────
 // The renderer process (which has access to NextAuth cookies) sends the JWT
 // token to the main process so the cloud sync loop can authenticate.
@@ -1455,6 +1505,16 @@ ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
       // any local business calls during import have a session available.
       const localApi = require('./local-api/index');
       localApi.setSession(token, user);
+      // Task 33-C: the renderer just completed a REAL cloud login (the cloud
+      // validated the credentials) — this is fresh proof of authorization.
+      // Record AUTHORIZED and lift any previous workspace lock.
+      try {
+        if (typeof localApi.markAuthorizationAuthorized === 'function') {
+          await localApi.markAuthorizationAuthorized();
+        }
+      } catch (authzErr) {
+        console.warn('[IPC] Could not mark authorization AUTHORIZED:', authzErr.message);
+      }
     } catch (sessionErr) {
       console.warn('[IPC] Failed to import session to local API (early):', sessionErr.message);
     }

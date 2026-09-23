@@ -2281,6 +2281,9 @@ const ar = {
   // "Save X%" / "وفّر X%" discount indicator to avoid breaking the Save button.
   savings: 'وفّر',
   totalAmount: 'المبلغ الإجمالي',
+  // Task 33-D: persistent order summary card inside the (wider) payment dialog
+  paymentSummary: 'الملخص',
+  receiptPending: 'في انتظار الإيصال',
 
   // ─── Managing Sales & Operations sidebar group ───────────────────────────
   managingSalesOps: 'إدارة المبيعات والعمليات',

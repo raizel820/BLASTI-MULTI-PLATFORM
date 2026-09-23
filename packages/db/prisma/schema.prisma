@@ -36,7 +36,7 @@ model User {
   role                    String         @default("CUSTOMER")
   language                String         @default("ar")
   avatarUrl               String?
-  /// Storage provider for avatar ('blob', 'r2', 'local'). Null = legacy URL.
+  /// Storage provider for avatar ('local'). Null = legacy URL.
   avatarStorageProvider   String?
   /// Storage key for avatar. Used with getFileUrl() for provider-neutral access.
   avatarStorageKey        String?
@@ -214,7 +214,7 @@ model Agency {
   email                 String?
   website               String?
   logoUrl               String?
-  /// Storage provider for logo ('blob', 'r2', 'local'). Null = legacy URL.
+  /// Storage provider for logo ('local'). Null = legacy URL.
   logoStorageProvider    String?
   /// Storage key for logo. Used with getFileUrl() for provider-neutral access.
   logoStorageKey         String?
@@ -567,7 +567,7 @@ model Transaction {
   plan            String
   paymentMethod   String
   receiptUrl      String?
-  /// Storage provider for receipt ('blob', 'r2', 'local'). Null = legacy URL.
+  /// Storage provider for receipt ('local'). Null = legacy URL.
   receiptStorageProvider String?
   /// Storage key for receipt. Used with getFileUrl() for provider-neutral access.
   receiptStorageKey      String?
@@ -818,7 +818,7 @@ model DeviceRegistration {
 /// for backward compatibility. New code should use storageProvider + storageKey.
 model UploadedFile {
   id              String   @id @default(cuid())
-  /// Storage provider: 'blob', 'r2', or 'local'
+  /// Storage provider: 'local'
   storageProvider String
   /// Provider-neutral storage key (e.g. "avatar/abc123.jpg")
   storageKey      String

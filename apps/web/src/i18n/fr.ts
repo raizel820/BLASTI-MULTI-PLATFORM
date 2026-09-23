@@ -2280,6 +2280,9 @@ const fr: Record<TranslationKeys, string> = {
   // "Save X%" / "Économisez X%" discount indicator to avoid breaking the Save button.
   savings: 'Économisez',
   totalAmount: 'Montant total',
+  // Task 33-D: persistent order summary card inside the (wider) payment dialog
+  paymentSummary: 'Résumé',
+  receiptPending: 'Reçu en attente',
 
   // ─── Managing Sales & Operations sidebar group ───────────────────────────
   managingSalesOps: 'Gestion des ventes et opérations',

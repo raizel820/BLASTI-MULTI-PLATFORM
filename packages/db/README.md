@@ -120,7 +120,7 @@ Reservation ─┬─── user ───→ User
 | `role` | String | `"CUSTOMER"` | See UserRole enum |
 | `language` | String | `"ar"` | ar/fr/en |
 | `avatarUrl` | String? | — | Legacy URL |
-| `avatarStorageProvider` | String? | — | 'blob', 'r2', 'local' |
+| `avatarStorageProvider` | String? | — | 'local' |
 | `avatarStorageKey` | String? | — | Provider-neutral key |
 | `freeSmsCount` | Int | `10` | Free SMS credits |
 | `notificationPreferences` | String | JSON | Queue event preferences |

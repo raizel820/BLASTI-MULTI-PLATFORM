@@ -39,6 +39,12 @@
  * - `api-client-ssr.ts` — Pre-configured server-side singleton
  */
 
+// Task 33-E — revocation-state guard (self-contained module, no cycles):
+// never re-import / re-restore a session the auth authority has explicitly
+// rejected (cloud 401/403, or the desktop local API's 423 AUTHORIZATION_REVOKED
+// lock). See lib/authz-state.ts.
+import { isRevoked, setRevoked, isRevocationStatus } from './authz-state';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /** Configuration for the ApiClient instance. */
@@ -1106,12 +1112,32 @@ export class ApiClient {
       clearTimeout(lanTimeout);
       options?.signal?.removeEventListener('abort', onCallerAbort);
 
+      // ── Task 33-E: revocation lock detection (BEFORE any restore/retry) ──
+      // The desktop local API (Task 33-C) answers its lock as 423 or
+      // 401/403 + code AUTHORIZATION_REVOKED. Clone first — the original body
+      // is still consumed by the error path below.
+      if ((response.status === 423 || response.status === 401 || response.status === 403) && isElectronRuntime()) {
+        const lockProbe = response.clone();
+        const lockBody = await lockProbe.json().catch(() => ({} as Record<string, unknown>));
+        const lockCode = typeof lockBody?.code === 'string'
+          ? lockBody.code
+          : typeof lockBody?.error === 'string'
+            ? lockBody.error
+            : null;
+        if (isRevocationStatus(response.status, lockCode)) {
+          console.warn(`[ApiClient:LAN] ${method} ${path} → local API revocation lock (${response.status} ${lockCode ?? ''}) — no restore/retry`);
+          setRevoked(lockCode && lockCode !== 'Authentication required' ? lockCode : 'local-api-lock');
+        }
+      }
+
       // ── Session auto-restore on 401 / 503 ────────────────────────
       // After a Fast Refresh or page reload, the local API's sessionUser is
       // null → authMiddleware returns 401. Or db is null → returns 503.
       // In either case, re-importing the session via IPC may also trigger
       // the local API to re-initialize. We re-import from localStorage and retry.
-      if ((response.status === 401 || response.status === 503) && isElectronRuntime()) {
+      // (Task 33-E: skipped entirely while the session is revoked — a locked-out
+      // session must never be re-imported.)
+      if ((response.status === 401 || response.status === 503) && isElectronRuntime() && !isRevoked()) {
         const elapsed = (performance.now() - lanStart).toFixed(0);
         console.log(`[ApiClient:LAN] ${method} ${path} → ${response.status} (${elapsed}ms), attempting session restore...`);
         // For 503, only retry once to avoid infinite loops if db is permanently broken
@@ -1140,6 +1166,21 @@ export class ApiClient {
               const retryElapsed = (performance.now() - lanStart).toFixed(0);
               console.log(`[ApiClient:LAN] ${method} ${path} → retry after restore OK ${retryResponse.status} (${retryElapsed}ms total)`);
               return await this.parseResponse<T>(retryResponse);
+            }
+            // Task 33-E — if the retry itself hits the revocation lock, mark it
+            // and stop (the error below propagates; no further restores).
+            if (retryResponse.status === 423 || retryResponse.status === 401) {
+              const retryLock = retryResponse.clone();
+              const retryLockBody = await retryLock.json().catch(() => ({} as Record<string, unknown>));
+              const retryLockCode = typeof retryLockBody?.code === 'string'
+                ? retryLockBody.code
+                : typeof retryLockBody?.error === 'string'
+                  ? retryLockBody.error
+                  : null;
+              if (isRevocationStatus(retryResponse.status, retryLockCode)) {
+                console.warn(`[ApiClient:LAN] ${method} ${path} → retry hit revocation lock (${retryResponse.status} ${retryLockCode ?? ''})`);
+                setRevoked(retryLockCode && retryLockCode !== 'Authentication required' ? retryLockCode : 'local-api-lock');
+              }
             }
             // Still not OK — fall through to error below
             const retryElapsed = (performance.now() - lanStart).toFixed(0);
@@ -1216,6 +1257,12 @@ export class ApiClient {
    */
   private async tryRestoreLocalSession(): Promise<boolean> {
     try {
+      // Task 33-E — never re-import a session the auth authority has revoked.
+      if (isRevoked()) {
+        console.log(`[ApiClient:SESSION_RESTORE] skipped — session is REVOKED`);
+        return false;
+      }
+
       const w = window as any;
       if (!w.electronAPI?.setLocalApiSession) {
         console.log(`[ApiClient:SESSION_RESTORE] electronAPI.setLocalApiSession not available`);
@@ -1737,15 +1784,27 @@ ApiClient.prototype.request = async function<T>(
               };
             }
             console.log(`[ApiClient:LAN_PROXY] ${method} ${path} → ${proxyRes.status}`);
-            // 401 from proxy — try session restore once
-            if (proxyRes.status === 401) {
-              const restored = await (this as any).tryRestoreLocalSession();
-              if (restored) {
-                const retryRes = await fetch(lanProxyUrl, { method, headers, credentials: 'omit', signal: AbortSignal.timeout(3000) });
-                if (retryRes.ok) {
-                  const retryData = await retryRes.json().catch(() => null);
-                  console.log(`[ApiClient:LAN_PROXY] ${method} ${path} → OK after session restore`);
-                  return { data: retryData as unknown as T, status: retryRes.status, headers: retryRes.headers };
+            // 401/423 from proxy — Task 33-E: detect the revocation lock first;
+            // only attempt a session restore when NOT revoked.
+            if ((proxyRes.status === 401 || proxyRes.status === 423) && !isRevoked()) {
+              const lockBody = await proxyRes.clone().json().catch(() => ({} as Record<string, unknown>));
+              const lockCode = typeof lockBody?.code === 'string'
+                ? lockBody.code
+                : typeof lockBody?.error === 'string'
+                  ? lockBody.error
+                  : null;
+              if (isRevocationStatus(proxyRes.status, lockCode)) {
+                console.warn(`[ApiClient:LAN_PROXY] ${method} ${path} → revocation lock (${proxyRes.status} ${lockCode ?? ''}) — no restore`);
+                setRevoked(lockCode && lockCode !== 'Authentication required' ? lockCode : 'local-api-lock');
+              } else {
+                const restored = await (this as any).tryRestoreLocalSession();
+                if (restored) {
+                  const retryRes = await fetch(lanProxyUrl, { method, headers, credentials: 'omit', signal: AbortSignal.timeout(3000) });
+                  if (retryRes.ok) {
+                    const retryData = await retryRes.json().catch(() => null);
+                    console.log(`[ApiClient:LAN_PROXY] ${method} ${path} → OK after session restore`);
+                    return { data: retryData as unknown as T, status: retryRes.status, headers: retryRes.headers };
+                  }
                 }
               }
             }

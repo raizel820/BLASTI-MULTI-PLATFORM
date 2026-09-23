@@ -89,6 +89,123 @@ async function setLocalMeta(key, value) {
   )
 }
 
+// ─── Authorization (workspace lock) state — Task 33-C ─────────────────────
+// The workspace lock lives in _sync_meta ('authorization_status') and is
+// cached in memory so requireAuth() never adds a SQL query per request.
+//   'AUTHORIZED' → fresh proof of authorization (cloud refresh 200 / fresh
+//                  cloud login / validated import).
+//   'REVOKED'    → the cloud EXPLICITLY rejected the session (401/403 from a
+//                  REACHABLE cloud) — every protected route 423s, offline
+//                  unlock is rejected, sync + file-sync are stopped.
+//   null         → unknown — behaves exactly like the pre-33-C local API.
+// The cache uses a short TTL (covers cross-module writes from sync-service)
+// plus explicit invalidation on every write performed here.
+let authzStatusCache = null
+let authzStatusReadAt = 0
+const AUTHZ_CACHE_TTL_MS = 5000
+
+function invalidateAuthzCache() {
+  authzStatusCache = null
+  authzStatusReadAt = 0
+}
+
+async function getAuthorizationStatus() {
+  const now = Date.now()
+  if (authzStatusCache && now - authzStatusReadAt < AUTHZ_CACHE_TTL_MS) {
+    return authzStatusCache
+  }
+  try {
+    const v = await getLocalMeta('authorization_status')
+    authzStatusCache = (v === 'REVOKED' || v === 'AUTHORIZED') ? v : null
+    authzStatusReadAt = now
+  } catch {
+    authzStatusCache = null
+  }
+  return authzStatusCache
+}
+
+/**
+ * Task 33-C — record FRESH PROOF of authorization. Called after a REAL cloud
+ * login (local login path 3 / main.js cloud-sync:set-auth) or a validated
+ * import-session. Clears the workspace lock (meta + cache + sync engine).
+ * Returns true when a REVOKED lock was actually lifted (restore logging).
+ */
+async function markAuthorizationAuthorized() {
+  let prev = null
+  try { prev = await getAuthorizationStatus() } catch { /* best effort */ }
+  authzStatusCache = 'AUTHORIZED'
+  authzStatusReadAt = Date.now()
+  try {
+    if (db) await setLocalMeta('authorization_status', 'AUTHORIZED')
+  } catch { /* best effort */ }
+  try {
+    const syncService = require('./sync-service')
+    if (typeof syncService.markAuthorizationAuthorized === 'function') {
+      syncService.markAuthorizationAuthorized()
+    }
+  } catch { /* engine not loaded — degrade gracefully */ }
+  if (prev === 'REVOKED') {
+    console.log('[LocalAPI] Authorization restored via fresh login')
+  }
+  return true
+}
+
+/**
+ * Task 33-C — the LOCAL revocation routine (workspace LOCK). Invoked by the
+ * sync engine (confirmed cloud rejection) and by the import-session
+ * validator. Hard user requirements honored:
+ *   - offline unlock credentials are REVOKED (revokedAt set), NEVER deleted;
+ *   - data tables (Agency, branches, reservations, transactions, …) are
+ *     NEVER touched — access is locked, data is kept for recovery/audit;
+ *   - the local session is cleared and the file-sync worker stopped;
+ *   - the sync engine is stopped + its auth cleared (guarded — safe if the
+ *     caller already did it; stopSync/clearAuth are idempotent).
+ */
+async function revokeLocalAuthorization(reason) {
+  const revokedReason = String(reason || 'token-rejected')
+  console.log(`[LocalAPI] Workspace LOCKED — authorization revoked (${revokedReason})`)
+  try {
+    if (db) {
+      await setLocalMeta('authorization_status', 'REVOKED')
+      await setLocalMeta('authorization_revoked_at', new Date().toISOString())
+      await setLocalMeta('authorization_reason', revokedReason)
+    }
+  } catch (metaErr) {
+    console.warn('[LocalAPI] Could not persist revocation meta:', metaErr?.message || metaErr)
+  }
+  try {
+    if (db && db.localDeviceCredential && sessionUser && sessionUser.id) {
+      const res = await db.localDeviceCredential.updateMany({
+        where: { userId: sessionUser.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      })
+      if (res && res.count) {
+        console.log(`[LocalAPI] Revoked ${res.count} local device credential(s) — offline unlock disabled while locked (rows kept)`)
+      }
+    }
+  } catch (credErr) {
+    console.warn('[LocalAPI] Could not revoke device credentials:', credErr?.message || credErr)
+  }
+  // Clear the local session — every protected route now fails (401/423).
+  try { clearSession() } catch { /* already cleared */ }
+  // Stop the file-sync worker (no more blob pushes/pulls while locked).
+  try { if (fileSync && typeof fileSync.stop === 'function') fileSync.stop() } catch { /* not started */ }
+  // Stop + clear the sync engine (guarded — the engine may have stopped
+  // itself already; both calls are idempotent).
+  try {
+    const syncService = require('./sync-service')
+    if (typeof syncService.markAuthorizationRevoked === 'function') syncService.markAuthorizationRevoked(revokedReason)
+    if (typeof syncService.clearAuth === 'function') syncService.clearAuth()
+    if (typeof syncService.stopSync === 'function') syncService.stopSync()
+  } catch { /* engine not loaded — degrade gracefully */ }
+  // Immediate cache hit for requireAuth (no TTL wait).
+  authzStatusCache = 'REVOKED'
+  authzStatusReadAt = Date.now()
+  // Notify in-process listeners + LAN realtime clients.
+  try { emitEvent('auth:revoked', { reason: revokedReason }) } catch { /* never fatal */ }
+  return true
+}
+
 /**
  * Round 15 — LOCALIZE a file URL: when the URL points at a file that ALSO
  * exists in this device's local file store, rewrite it to the local API
@@ -360,6 +477,22 @@ function requireAuth() {
     } catch {
       return c.json({ success: false, error: 'Invalid session token' }, 401)
     }
+
+    // Task 33-C: honor the workspace LOCK. A REVOKED authorization blocks
+    // every protected route (423 Locked) even when the token itself still
+    // matches — e.g. a renderer that re-imports a stale session from
+    // localStorage after the cloud confirmed the revocation. Cache-backed
+    // (short TTL) so this adds no per-request SQL query.
+    try {
+      const authz = await getAuthorizationStatus()
+      if (authz === 'REVOKED') {
+        return c.json({
+          success: false,
+          error: 'Authorization revoked — please sign in again',
+          code: 'AUTHORIZATION_REVOKED',
+        }, 423)
+      }
+    } catch { /* meta read failure must never wedge auth */ }
 
     // Guard: if db (PrismaClient) is not initialized, no data queries can run.
     // Return 503 so the client knows to retry later rather than getting a
@@ -1134,27 +1267,39 @@ function createApp() {
       const user = await db.user.findUnique({ where: { username } }).catch(() => null)
 
       // ── 1. Local unlock via device credential (fully offline) ──
+      // Task 33-C: when the workspace is LOCKED (authorization REVOKED), the
+      // device credential must NOT establish a session. We deliberately fall
+      // through to the cloud path below so a FRESH online login can restore
+      // authorization (Case-B recovery); only when the cloud cannot validate
+      // fresh credentials does the tail answer the explicit 423.
+      let unlockBlockedByRevocation = false
       if (user && db.localDeviceCredential) {
         const deviceId = await getDeviceId()
         const cred = await db.localDeviceCredential.findUnique({
           where: { userId_deviceId: { userId: user.id, deviceId } },
         }).catch(() => null)
         if (cred && !cred.revokedAt && verifierMatches(cred, password)) {
-          if (!user.isActive) return deactivated()
-          const sessionData = {
-            id: user.id,
-            username: user.username,
-            fullName: user.fullName,
-            role: user.role,
-            language: user.language || 'ar',
-            avatarUrl: user.avatarUrl || null,
-            agencyId: await buildStaffAgencyId(user),
+          const authzNow = await getAuthorizationStatus()
+          if (authzNow === 'REVOKED') {
+            unlockBlockedByRevocation = true
+            console.warn('[LocalAPI] Offline unlock BLOCKED — authorization REVOKED (fresh cloud login required)')
+          } else {
+            if (!user.isActive) return deactivated()
+            const sessionData = {
+              id: user.id,
+              username: user.username,
+              fullName: user.fullName,
+              role: user.role,
+              language: user.language || 'ar',
+              avatarUrl: user.avatarUrl || null,
+              agencyId: await buildStaffAgencyId(user),
+            }
+            sessionToken = randomBytes(32).toString('hex')
+            sessionUser = sessionData
+            emitEvent('auth:login', { user: sessionData })
+            console.log('[LocalAPI] Local unlock via device credential:', sessionData.username)
+            return c.json({ success: true, user: sessionData, token: sessionToken, unlockedLocally: true })
           }
-          sessionToken = randomBytes(32).toString('hex')
-          sessionUser = sessionData
-          emitEvent('auth:login', { user: sessionData })
-          console.log('[LocalAPI] Local unlock via device credential:', sessionData.username)
-          return c.json({ success: true, user: sessionData, token: sessionToken, unlockedLocally: true })
         }
       }
 
@@ -1175,19 +1320,27 @@ function createApp() {
           }
           if (ok) {
             if (!user.isActive) return deactivated()
-            const sessionData = {
-              id: user.id,
-              username: user.username,
-              fullName: user.fullName,
-              role: user.role,
-              language: user.language || 'ar',
-              avatarUrl: await localizeFileUrl(user.avatarUrl || null),
-              agencyId: await buildStaffAgencyId(user),
+            // Task 33-C: legacy unlock is also subject to the workspace lock.
+            const authzNowLegacy = await getAuthorizationStatus()
+            if (authzNowLegacy === 'REVOKED') {
+              unlockBlockedByRevocation = true
+              console.warn('[LocalAPI] Legacy local unlock BLOCKED — authorization REVOKED (fresh cloud login required)')
+              // fall through to the cloud path
+            } else {
+              const sessionData = {
+                id: user.id,
+                username: user.username,
+                fullName: user.fullName,
+                role: user.role,
+                language: user.language || 'ar',
+                avatarUrl: await localizeFileUrl(user.avatarUrl || null),
+                agencyId: await buildStaffAgencyId(user),
+              }
+              sessionToken = randomBytes(32).toString('hex')
+              sessionUser = sessionData
+              emitEvent('auth:login', { user: sessionData })
+              return c.json({ success: true, user: sessionData, token: sessionToken })
             }
-            sessionToken = randomBytes(32).toString('hex')
-            sessionUser = sessionData
-            emitEvent('auth:login', { user: sessionData })
-            return c.json({ success: true, user: sessionData, token: sessionToken })
           }
         } catch { /* fall through to the cloud */ }
       }
@@ -1226,6 +1379,15 @@ function createApp() {
           avatarUrl: await localizeFileUrl(cloudUser.avatarUrl || null),
           agencyId: cloudUser.agencyId || null,
         }
+        // Task 33-C: a fresh CLOUD login is fresh proof of authorization —
+        // clears a previous workspace lock and (via storeDeviceCredential's
+        // upsert semantics: revokedAt: null on update) makes offline unlock
+        // work again for the re-login recovery case.
+        try {
+          await markAuthorizationAuthorized()
+        } catch (authzErr) {
+          console.warn('[LocalAPI] Could not record fresh authorization:', authzErr?.message || authzErr)
+        }
         emitEvent('auth:login', { user: sessionUser })
         // Round 15 — push any local-only files (e.g. an avatar uploaded
         // offline) now that a session exists.
@@ -1236,6 +1398,17 @@ function createApp() {
 
       // The cloud REJECTED the credentials — a definitive wrong-password (not offline).
       if (cloud.status === 401 || cloud.status === 403) return invalid()
+
+      // Task 33-C: the device credential matched but the workspace is locked
+      // and the cloud could not validate fresh credentials (unreachable or
+      // wrong password answered by an unreachable cloud). Never unlock.
+      if (unlockBlockedByRevocation && cloud.status !== 401 && cloud.status !== 403) {
+        return c.json({
+          success: false,
+          error: 'Authorization revoked — please sign in again with an internet connection',
+          code: 'AUTHORIZATION_REVOKED',
+        }, 423)
+      }
 
       // Cloud unreachable and no local unlock is possible for this profile.
       if (user) {
@@ -2061,6 +2234,14 @@ function createApp() {
           avatarUrl: await localizeFileUrl(data.user.avatarUrl || null),
           agencyId: data.user.agencyId || null,
         }
+        // Task 33-C: a successful refresh is FRESH PROOF of authorization —
+        // the reachable cloud just re-issued this session from its CURRENT
+        // DB state. Record it (and lift a lock if one existed).
+        try {
+          await markAuthorizationAuthorized()
+        } catch (authzErr) {
+          console.warn('[LocalAPI] Could not record fresh authorization after refresh:', authzErr?.message || authzErr)
+        }
         console.log('[LocalAPI] Session refreshed from cloud:', sessionUser.username, 'agency:', sessionUser.agencyId || 'none')
         emitEvent('auth:login', { user: sessionUser })
         if (fileSync) fileSync.schedule('refresh-session')
@@ -2170,19 +2351,111 @@ function createApp() {
         return c.json({ success: false, error: 'Token and user required' }, 400)
       }
 
-      // Set session with the CLOUD token (so LAN failover works with the same token)
-      sessionToken = token
-      sessionUser = {
-        id: user.id,
-        username: user.username || user.email || 'imported',
-        fullName: user.fullName || user.name || '',
-        role: user.role || 'CUSTOMER',
-        language: user.language || 'ar',
-        avatarUrl: await localizeFileUrl(user.avatarUrl || null),
-        agencyId: user.agencyId || null,
+      // ── Task 33-C: workspace-LOCK gate (closes the re-import hole) ──────
+      // A locked workspace must never be resurrected by re-importing the
+      // stale token (the loading-screen fallback and a renderer rehydration
+      // both land here). Only a fresh cloud login can clear the lock.
+      try {
+        const currentAuthz = await getAuthorizationStatus()
+        if (currentAuthz === 'REVOKED') {
+          console.warn('[LocalAPI] import-session rejected — workspace authorization is REVOKED')
+          return c.json({
+            success: false,
+            error: 'Authorization revoked — please sign in again',
+            code: 'AUTHORIZATION_REVOKED',
+          }, 403)
+        }
+      } catch { /* meta read failure must never wedge the import */ }
+
+      // ── Task 33-C: cloud VALIDATION of the presented token (offline-first) ──
+      // When the cloud is REACHABLE, the presented token must be accepted by
+      // /api/auth/refresh-session — a ghost token (cloud DB reset / deleted
+      // account / revoked device) is rejected and the workspace LOCKS. When
+      // the cloud is unreachable the import is accepted as before (offline
+      // first — never block on unavailability). Validation is capped at ~5s
+      // per hop so reloads stay snappy.
+      let adopted = null
+      try {
+        let cloudReachable = false
+        try {
+          const healthRes = await fetch(cloudBaseUrl() + '/api/health', { signal: AbortSignal.timeout(5000) })
+          cloudReachable = healthRes.ok
+        } catch { cloudReachable = false }
+
+        if (!cloudReachable) {
+          console.log('[LocalAPI] Cloud unreachable — importing session offline (offline-first)')
+        } else {
+          let vStatus = 0
+          let vData = null
+          let vNetwork = false
+          try {
+            const vRes = await fetch(cloudBaseUrl() + '/api/auth/refresh-session', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: 'Bearer ' + token,
+              },
+              body: '{}',
+              signal: AbortSignal.timeout(5000),
+            })
+            vStatus = vRes.status
+            try { vData = await vRes.json() } catch { /* non-JSON */ }
+          } catch { vNetwork = true }
+
+          if (vNetwork) {
+            // Cloud flapped between the health check and the validation —
+            // treat as unavailable (offline-first accept, status unchanged).
+            console.log('[LocalAPI] Cloud unreachable — importing session offline (offline-first)')
+          } else if (vStatus === 200 && vData && vData.success && vData.token && vData.user) {
+            // Prefer the REFRESHED token+user: the response carries the
+            // session re-issued from the cloud DB's CURRENT state (current
+            // agencyId, current role) — not the possibly stale snapshot.
+            adopted = { token: vData.token, user: vData.user }
+          } else if (vStatus === 401 || vStatus === 403) {
+            const bodyMsg = (vData && (vData.error || vData.message)) || ''
+            const reason = String(bodyMsg).indexOf('Account not found') !== -1 ? 'account-not-found' : 'token-rejected'
+            console.warn(`[LocalAPI] Session rejected by cloud (HTTP ${vStatus}) — this account is no longer authorized (${reason})`)
+            await revokeLocalAuthorization(reason)
+            return c.json({
+              success: false,
+              error: 'Session rejected by cloud — this account is no longer authorized',
+              code: 'AUTHORIZATION_REVOKED',
+            }, 401)
+          } else {
+            // Any other answer (5xx, malformed) — not an explicit auth
+            // verdict; keep today's offline-first behavior.
+            console.log(`[LocalAPI] Cloud session validation inconclusive (HTTP ${vStatus}) — importing session offline (offline-first)`)
+          }
+        }
+      } catch (validationErr) {
+        // Validation is a hardening layer, never a availability requirement.
+        console.warn('[LocalAPI] import-session cloud validation skipped:', validationErr?.message || validationErr)
       }
 
-      console.log('[LocalAPI] Session imported from cloud:', sessionUser.username, 'role:', sessionUser.role)
+      const finalToken = adopted ? adopted.token : token
+      const finalUser = adopted ? adopted.user : user
+
+      // Set session with the CLOUD token (so LAN failover works with the same token)
+      sessionToken = finalToken
+      sessionUser = {
+        id: finalUser.id,
+        username: finalUser.username || finalUser.email || 'imported',
+        fullName: finalUser.fullName || finalUser.name || '',
+        role: finalUser.role || 'CUSTOMER',
+        language: finalUser.language || 'ar',
+        avatarUrl: await localizeFileUrl(finalUser.avatarUrl || null),
+        agencyId: finalUser.agencyId || null,
+      }
+
+      if (adopted) {
+        // The cloud just proved this session valid against its CURRENT DB —
+        // record AUTHORIZED (and lift a stale lock if one existed).
+        try {
+          await markAuthorizationAuthorized()
+        } catch { /* non-fatal */ }
+      }
+
+      console.log('[LocalAPI] Session imported from cloud:', sessionUser.username, 'role:', sessionUser.role, adopted ? '(cloud-validated, refreshed token adopted)' : '')
       emitEvent('auth:login', { user: sessionUser })
       if (fileSync) fileSync.schedule('import-session')
 
@@ -2190,6 +2463,7 @@ function createApp() {
         success: true,
         user: sessionUser,
         token: sessionToken,
+        cloudValidated: !!adopted || undefined,
       })
     } catch (error) {
       console.error('[LocalAPI] Import session error:', error)
@@ -5060,6 +5334,82 @@ function createApp() {
     }
   })
 
+  // POST /api/agency/subscription/cancel — cloud-forwarding proxy (Task 33).
+  //
+  // The Active-Plan card's "Manage Subscription" → Cancel flow (agency-
+  // subscription.tsx handleCancelSubscription) POSTs this route; it did not
+  // exist locally, so EVERY desktop cancel 404'd with the bare "Not found"
+  // toast (the webapp's ApiClient in Electron is pinned to 127.0.0.1:3080).
+  // Cancellation is CLOUD-native (apps/api agency.ts POST /subscription/cancel):
+  // it flips subscriptionStatus to INACTIVE, nulls the start/expiry dates and
+  // keeps the tier for history. Same proxy contract as the /pay route above.
+  //
+  // After a 2xx we ALSO mirror the status change onto the LOCAL Agency row —
+  // the UI refetches GET /api/agency/subscription from the LOCAL API right
+  // after canceling, and without the local mirror it would keep showing
+  // ACTIVE until the next sync pull lands. No outbox row: the cloud is
+  // authoritative and its own sequence bump pulls the truth back down
+  // (triggerSyncNow below).
+  app.post('/api/agency/subscription/cancel', authMiddleware, async (c) => {
+    try {
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/agency/subscription/cancel', {
+          method: 'POST',
+          headers: {
+            // Same session token requireAuth() validated — the cloud enforces
+            // auth + resolves the agency from the session.
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] Subscription-cancel proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Canceling your subscription requires an internet connection. Please connect and try again.',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) {
+        // Local mirror so the immediate local refetch reflects the cancel.
+        try {
+          const agencyId = sessionUser?.agencyId
+          if (agencyId) {
+            await db.agency.update({
+              where: { id: agencyId },
+              data: {
+                subscriptionStatus: 'INACTIVE',
+                subscriptionStartsAt: null,
+                subscriptionExpiresAt: null,
+                // subscriptionTier intentionally kept — mirrors the cloud.
+              },
+            })
+          } else {
+            console.warn('[LocalAPI] subscription/cancel: no agencyId in session — local mirror skipped')
+          }
+        } catch (mirrorErr) {
+          console.warn('[LocalAPI] subscription/cancel: local mirror failed (non-fatal):', mirrorErr?.message || mirrorErr)
+        }
+        // Pull the cloud's authoritative state down immediately.
+        try { if (fileSync) fileSync.schedule('subscription-cancelled') } catch { /* non-fatal */ }
+        try {
+          const syncService = require('./sync-service')
+          if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+        } catch { /* non-fatal */ }
+      }
+      // Cloud status + body pass through verbatim ({ success: true } 200 or a
+      // 4xx { error }). Idempotent on the cloud: canceling an INACTIVE agency
+      // still returns success.
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] Subscription-cancel proxy error:', error)
+      return c.json({ success: false, error: 'Failed to cancel subscription' }, 500)
+    }
+  })
+
   // ═══════════════════════════════════════════════════════════════════════
   // 13b. ADDITIONAL MISSING AGENCY ROUTES (offline parity with cloud API)
   // ═══════════════════════════════════════════════════════════════════════
@@ -5782,6 +6132,21 @@ function createApp() {
         cursor = curRows && curRows[0] ? parseInt(curRows[0].value, 10) || null : null
       } catch { /* meta table may not exist yet */ }
 
+      // Task 33-C: authorization (workspace lock) state from _sync_meta.
+      let authorizationStatus = null
+      let authorizationRevokedAt = null
+      let authorizationReason = null
+      try {
+        const authzRows = await db.$queryRawUnsafe(
+          "SELECT key, value FROM \"_sync_meta\" WHERE key IN ('authorization_status', 'authorization_revoked_at', 'authorization_reason')"
+        )
+        for (const row of authzRows || []) {
+          if (row.key === 'authorization_status') authorizationStatus = row.value || null
+          if (row.key === 'authorization_revoked_at') authorizationRevokedAt = row.value || null
+          if (row.key === 'authorization_reason') authorizationReason = row.value || null
+        }
+      } catch { /* meta table may not exist yet */ }
+
       // Readiness verdict: initialized AND agency data actually imported.
       const agencyCount = typeof counts.Agency === 'number' ? counts.Agency : -1
       const ready = initializationStatus === 'READY' && agencyCount > 0
@@ -5836,6 +6201,10 @@ function createApp() {
         deferredChanges,
         deferredQuarantined,
         conflicts: conflictCount,
+        // Task 33-C: authorization (workspace lock) diagnostics
+        authorizationStatus,
+        authorizationRevokedAt: authorizationStatus === 'REVOKED' ? authorizationRevokedAt : undefined,
+        authorizationReason: authorizationStatus === 'REVOKED' ? authorizationReason : undefined,
         ready,
         readiness: { ready, reason },
         // Spec §24 canonical names (aliases kept above for existing consumers)
@@ -6719,5 +7088,10 @@ module.exports = {
   relayCloudRealtime: (...args) => localRealtime.relayCloudRealtime(...args),
   getLocalRealtimeStats: () => localRealtime.getLocalRealtimeStats(),
   repairLegacyReservationCreates,
+  // Task 33-C: workspace lock / authorization surface
+  revokeLocalAuthorization,
+  markAuthorizationAuthorized,
+  getAuthorizationStatus,
+  invalidateAuthzCache,
   DEFAULT_PORT,
 }

@@ -274,6 +274,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('initial-sync:progress', (_event, evt) => callback(evt));
   },
 
+  /**
+   * Listen for workspace-authorization revocation (Task 33-C).
+   * main.js sends 'auth:revoked' when the sync engine CONFIRMS the cloud has
+   * rejected the session (401/403 verified via refresh-session — a network
+   * failure never revokes), and when startup diagnostics reach the same
+   * verdict. Payload: { reason: 'token-rejected' | 'account-not-found' | 'device-revoked' }.
+   * The renderer (auth-provider) must force a logout on this event so the
+   * user lands on the login screen.
+   * @param {(payload: { reason: string }) => void} callback
+   * @returns {() => void} unsubscribe function
+   */
+  onAuthRevoked: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('auth:revoked', listener);
+    return () => ipcRenderer.removeListener('auth:revoked', listener);
+  },
+
   // ─── Network Status (renderer → main process) ──────────────────────────────
 
   /**

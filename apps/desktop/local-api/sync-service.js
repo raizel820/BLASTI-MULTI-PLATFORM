@@ -156,6 +156,20 @@ let _realtimeEnabled = true;
 let _replayInFlight = false;
 let _replayQueued = false;
 
+// Task 33-C — authorization state cache (workspace lock).
+//   'AUTHORIZED' → fresh proof of authorization (refresh 200 / fresh login).
+//   'REVOKED'    → the cloud EXPLICITLY rejected the session (401/403 verified
+//                  through the refresh-session discriminator) — the workspace
+//                  is LOCKED: no pull/push/replay, engine stopped, re-login required.
+//   null         → unknown / not yet proven — behaves exactly like the
+//                  pre-33-C offline-first engine (never blocks on its own).
+// Mirrored in _sync_meta ('authorization_status') so the lock survives restarts.
+let _authzStatus = null;
+let _authzRevokedAt = null;
+let _authzReason = null;
+let _authzBlockedWarnedAt = 0;
+let _lastRevocationReason = null;
+
 // ─── Pending Mutations (Write-Ahead Log) — lazy circular-dep-safe loading ────
 
 let _getPendingMutations = null;
@@ -646,6 +660,31 @@ async function _cloudPost(path, body, timeoutMs) {
 function _resetBackoff() { _backoffMs = 2000; _consecutiveFailures = 0; }
 function _increaseBackoff() { _consecutiveFailures++; _backoffMs = Math.min(_backoffMs * 2, MAX_BACKOFF_MS); }
 
+// ─── Cloud error classification (Task 33-C) ──────────────────────────────
+/**
+ * HARD USER REQUIREMENT: an explicit cloud REJECTION (401/403) is NEVER
+ * "offline". Offline mode is only allowed when the cloud is unreachable
+ * (network failure / timeout) or answering 5xx. Classification:
+ *
+ *   'UNREACHABLE'    → no HTTP response at all (ECONNREFUSED / ENOTFOUND /
+ *                      abort / timeout / connection reset) OR a cloud 5xx.
+ *   'AUTH_REJECTED'  → the cloud ANSWERED 401/403 — explicit rejection.
+ *   'TRANSIENT'      → any other 4xx (request problem, not an auth verdict).
+ */
+function classifyCloudError(err) {
+  var status = (err && typeof err.status === 'number') ? err.status : null;
+  if (status === null && err && err.cause && typeof err.cause === 'object' && typeof err.cause.status === 'number') {
+    status = err.cause.status;
+  }
+  if (status !== null) {
+    if (status === 401 || status === 403) return 'AUTH_REJECTED';
+    if (status >= 500) return 'UNREACHABLE';
+    return 'TRANSIENT';
+  }
+  // No HTTP status anywhere in the chain → the request never got a response.
+  return 'UNREACHABLE';
+}
+
 // ─── Cloud sync-route probe (initialization precondition) ────────────────────
 /**
  * Authoritative reachability probe for the INITIALIZER: does the cloud origin
@@ -748,6 +787,144 @@ async function _refreshSessionFromCloud() {
   }
 }
 
+/**
+ * Task 33-C — status-PROPAGATING variant of _refreshSessionFromCloud.
+ * The stale-context probe above swallows every non-OK answer (it only heals
+ * an unresolved agency); the revocation discriminator NEEDS the verdict:
+ * 200 (authorized), 401/403 (explicitly rejected) or a network failure.
+ * Returns { kind: 'ok'|'rejected'|'network', status?, body?, error? }.
+ */
+async function _refreshSessionStrict() {
+  if (!_authToken || !_config || !_config.cloudBaseUrl) {
+    return { kind: 'network', error: 'no-auth-or-config' };
+  }
+  try {
+    var res = await fetch(_config.cloudBaseUrl + '/api/auth/refresh-session', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + _authToken,
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(10000),
+    });
+    var data = null;
+    try { data = await res.json(); } catch { /* non-JSON error body */ }
+    return { kind: res.ok ? 'ok' : 'rejected', status: res.status, body: data };
+  } catch (e) {
+    return { kind: 'network', error: (e && e.message) || String(e) };
+  }
+}
+
+/**
+ * Task 33-C — the revocation DISCRIMINATOR. A single 401 on pull/replay may
+ * mean an expired token OR a dead account; only an explicit rejection from a
+ * REACHABLE cloud (the refresh attempt itself being answered) may revoke.
+ * A network failure NEVER revokes (hard invariant 1).
+ *
+ * Returns:
+ *   'RESTORED' → refresh 200: session re-issued from the cloud DB's CURRENT
+ *                state — adopt token+user (same adoption as the stale-context
+ *                probe) and record AUTHORIZED.
+ *   'REVOKED'  → refresh 401/403 from the reachable cloud: the account/token
+ *                is genuinely rejected (ghost session after a cloud DB reset,
+ *                deleted user, revoked device).
+ *   'OFFLINE'  → cloud unreachable / inconclusive — stay offline-first, DO
+ *                NOT revoke.
+ */
+async function _confirmRevocation() {
+  // (a) A network failure is never a revocation — reachability first.
+  if (!(await _isOnline())) {
+    console.log('[SyncService] Cloud unreachable — staying in offline mode (not revoked)');
+    return 'OFFLINE';
+  }
+  if (!_authToken || !_config || !_config.cloudBaseUrl) return 'OFFLINE';
+  // (b) Ask the cloud to re-issue the session from its CURRENT DB state.
+  var attempt = await _refreshSessionStrict();
+  if (attempt.kind === 'network') {
+    console.log('[SyncService] Cloud unreachable — staying in offline mode (not revoked)');
+    return 'OFFLINE';
+  }
+  if (attempt.kind === 'ok' && attempt.body && attempt.body.success && attempt.body.token && attempt.body.user) {
+    // (c) Fresh proof of authorization — adopt the re-issued session.
+    _authToken = attempt.body.token;
+    _userContext = attempt.body.user;
+    if (_config && !_config.agencyId && attempt.body.user.agencyId) _config.agencyId = attempt.body.user.agencyId;
+    _authzStatus = 'AUTHORIZED';
+    _authzRevokedAt = null;
+    _authzReason = null;
+    _setSyncMeta('authorization_status', 'AUTHORIZED').catch(function () { });
+    console.log('[SyncService] Refresh confirmed the session — authorization RESTORED (token re-issued from the cloud DB)');
+    return 'RESTORED';
+  }
+  if (attempt.status === 401 || attempt.status === 403) {
+    // (d) EXPLICIT rejection from a reachable cloud.
+    var bodyMsg = (attempt.body && (attempt.body.error || attempt.body.message)) || '';
+    _lastRevocationReason = String(bodyMsg).indexOf('Account not found') !== -1 ? 'account-not-found' : 'token-rejected';
+    return 'REVOKED';
+  }
+  // (e) Any other answer (5xx, malformed body) — not an explicit auth verdict.
+  return 'OFFLINE';
+}
+
+/**
+ * Shared handler for every explicit 401/403 observed on a cloud call.
+ * Confirms via the refresh discriminator, then — and ONLY then — locks the
+ * workspace. Idempotent once REVOKED.
+ */
+async function _handleAuthRejection(source) {
+  if (_authzStatus === 'REVOKED') return 'REVOKED';
+  console.log('[SyncService] Cloud rejected the session (HTTP 401/403) — confirming with refresh… (' + source + ')');
+  var verdict = await _confirmRevocation();
+  if (verdict === 'REVOKED') {
+    await _executeRevocation(_lastRevocationReason || 'token-rejected');
+  }
+  // 'OFFLINE' already logged its "staying in offline mode" line; 'RESTORED'
+  // logged the adoption. The caller decides what each verdict means for it.
+  return verdict;
+}
+
+/**
+ * Task 33-C — the revocation routine (sync-engine side). Locks the sync
+ * surface, delegates the LOCAL lock (device credential revocation, session
+ * clear, file-sync stop) to local-api/index.js revokeLocalAuthorization via
+ * the established lazy require (module cycle), and notifies the app through
+ * the event bus. Data rows are NEVER touched (lock access only).
+ */
+async function _executeRevocation(reason) {
+  if (_authzStatus === 'REVOKED' && _authzRevokedAt) {
+    return; // already locked
+  }
+  console.log('[SyncService] Authorization REVOKED — locking workspace (reason: ' + reason + ')');
+  _authzStatus = 'REVOKED';
+  _authzRevokedAt = new Date().toISOString();
+  _authzReason = reason;
+  try {
+    await _setSyncMeta('authorization_status', 'REVOKED');
+    await _setSyncMeta('authorization_revoked_at', _authzRevokedAt);
+    await _setSyncMeta('authorization_reason', reason);
+  } catch (metaErr) {
+    console.warn('[SyncService] Could not persist revocation meta:', metaErr.message);
+  }
+  var locked = false;
+  try {
+    var localApi = require('./index'); // lazy — existing module-cycle pattern
+    if (typeof localApi.revokeLocalAuthorization === 'function') {
+      locked = await localApi.revokeLocalAuthorization(reason);
+    }
+  } catch (e) {
+    console.warn('[SyncService] Local revocation routine unavailable:', (e && e.message) || e);
+  }
+  if (!locked) {
+    // Graceful degradation: still stop the engine + clear the credential
+    // cache here so no further cloud calls carry the rejected token.
+    try { clearAuth(); } catch { }
+    try { stopSync(); } catch { }
+  }
+  console.log('[SyncService] Workspace LOCKED — sync stopped, re-login required (local data kept for recovery/audit)');
+  emit({ type: 'authorization-revoked', reason: reason });
+}
+
 function ensureWorkspaceInitialized(trigger) {
   if (!_isStarted) return Promise.resolve({ skipped: 'engine-not-started' });
   if (!_authToken) return Promise.resolve({ skipped: 'no-auth' });
@@ -791,8 +968,21 @@ function ensureWorkspaceInitialized(trigger) {
       return { skipped: 'cloud-unavailable', probe: probe };
     }
     if (probe.authRejected) {
-      console.warn('[SyncService] Init coordinator (' + trigger + '): sync route present but token rejected (HTTP ' + probe.status + ') — re-login required');
-      return { skipped: 'auth-rejected', probe: probe };
+      // Task 33-C: the sync route EXPLICITLY rejected the token — confirm
+      // with the refresh discriminator before deciding anything. A confirmed
+      // rejection locks the workspace (STOP, no retries); an unreachable
+      // cloud keeps the offline-first deferral.
+      console.warn('[SyncService] Init coordinator (' + trigger + '): sync route present but token rejected (HTTP ' + probe.status + ') — confirming with refresh…');
+      var authzVerdict = await _handleAuthRejection('init-coordinator');
+      if (authzVerdict === 'REVOKED') {
+        return { skipped: 'authorization-revoked', probe: probe };
+      }
+      if (authzVerdict === 'RESTORED') {
+        console.log('[SyncService] Init coordinator (' + trigger + '): session restored via refresh — continuing initialization with the re-issued token');
+        // fall through: runInitialSync below uses the ADOPTED _authToken.
+      } else {
+        return { skipped: 'auth-rejected', probe: probe };
+      }
     }
 
     console.log('[SyncService] Init coordinator (' + trigger + '): workspace not READY but cloud sync API IS reachable → AUTO-STARTING initial sync');
@@ -1510,11 +1700,20 @@ async function _replayPendingMutations() {
           await _markMutationCompleted(mutation.id);
           succeeded++;
           _lastPushAt = new Date();
-        } else if (response.status === 401) {
-          // Auth expired — pause replay, do NOT burn attempts.
-          console.warn('[SyncService] Replay got 401 — pausing outbox (auth expired)');
+        } else if (response.status === 401 || response.status === 403) {
+          // Task 33-C: the cloud EXPLICITLY rejected the session (NOT an
+          // offline condition). Confirm with the refresh-session
+          // discriminator: a confirmed revocation locks the workspace and
+          // stops the engine; an unreachable cloud keeps the historic pause
+          // (offline-first, do NOT burn attempts).
+          console.warn('[SyncService] Replay got ' + response.status + ' — cloud rejected the session');
+          var authzVerdict = await _handleAuthRejection('replay');
+          if (authzVerdict === 'REVOKED') {
+            paused = true;
+            break;
+          }
           emit({ type: 'auth-expired' });
-          _lastError = 'auth-expired (401 during replay)';
+          _lastError = 'auth-rejected (HTTP ' + response.status + ' during replay, not confirmed)';
           paused = true;
           break;
         } else if (response.status === 409) {
@@ -1924,6 +2123,16 @@ async function _preCheck() {
   if (_isSyncing) return false;
   if (!_authToken) return false;
   if (!_config || !_config.localDb) return false;
+  // Task 33-C: a confirmed revocation LOCKS the workspace — no pull/push/
+  // replay until a fresh login proves authorization again. Rate-limited log
+  // (the engine timer keeps firing while locked).
+  if (_authzStatus === 'REVOKED') {
+    if (Date.now() - _authzBlockedWarnedAt > 60000) {
+      _authzBlockedWarnedAt = Date.now();
+      console.warn('[SyncService] Pull/replay BLOCKED — authorization REVOKED (' + (_authzReason || 'unknown') + '). Re-login required; local data is kept for recovery/audit.');
+    }
+    return false;
+  }
   // Part D: block pull/replay unless AgencyLocalState.initializationStatus == READY.
   if (!(await _isAgencyReady())) {
     if (Date.now() - _readyGateWarnedAt > 60000) {
@@ -1977,6 +2186,13 @@ async function _incrementalPullCycle(trigger) {
     await _checkAndResetForNewAgency();
     try {
       replayResult = await _replayPendingMutations();
+      // Task 33-C: the replay may have confirmed a revocation (401/403 →
+      // refresh rejected). The workspace is locked and the engine stopped —
+      // skip the pull and leave WITHOUT a backoff retry.
+      if (_authzStatus === 'REVOKED') {
+        _lastError = 'authorization-revoked';
+        return { revoked: true };
+      }
       pullResult = await _pullFromCloud();
     } finally {
       // Part K invariant (spec Part M): every change up to the cursor must be
@@ -2013,6 +2229,19 @@ async function _incrementalPullCycle(trigger) {
       },
     });
   } catch (err) {
+    // Task 33-C: classify BEFORE backing off — an explicit cloud rejection
+    // (401/403) is NEVER "offline". Confirm via the refresh discriminator;
+    // only a CONFIRMED rejection locks the workspace (and stops the cycle).
+    var cloudClass = classifyCloudError(err);
+    if (cloudClass === 'AUTH_REJECTED') {
+      var authzVerdict = await _handleAuthRejection('pull');
+      if (authzVerdict === 'REVOKED') {
+        _lastError = 'authorization-revoked';
+        return { revoked: true }; // STOP — no backoff retries while locked
+      }
+      // OFFLINE (cloud flapped between calls) or RESTORED (token re-issued,
+      // the next cycle succeeds with the adopted token) → normal handling.
+    }
     _lastError = err.message;
     _increaseBackoff();
     console.error('[SyncService] Sync failed (' + _backoffMs + 'ms backoff):', err.message);
@@ -2059,6 +2288,17 @@ async function _fullReconcileCycle() {
     });
     console.log('[SyncService] Full reconciliation complete');
   } catch (err) {
+    // Task 33-C: same classification contract as the incremental cycle —
+    // an explicit 401/403 must be CONFIRMED (refresh discriminator) before
+    // it may lock the workspace; network failures never revoke.
+    var cloudClass = classifyCloudError(err);
+    if (cloudClass === 'AUTH_REJECTED') {
+      var authzVerdict = await _handleAuthRejection('full-reconcile');
+      if (authzVerdict === 'REVOKED') {
+        _lastError = 'authorization-revoked';
+        return { revoked: true }; // STOP — no backoff retries while locked
+      }
+    }
     _lastError = err.message;
     _increaseBackoff();
     console.error('[SyncService] Full reconciliation failed:', err.message);
@@ -2121,6 +2361,25 @@ async function startSync(config) {
   _isStarted = true;
   await _ensureConflictsTable();
   await _ensureAppliedMutationsTable();
+
+  // Task 33-C: hydrate the persisted authorization state so a REVOKED
+  // workspace stays locked across restarts (the lock lives in _sync_meta,
+  // NOT in memory only).
+  try {
+    var storedAuthz = await _getSyncMeta('authorization_status');
+    if (storedAuthz === 'REVOKED' || storedAuthz === 'AUTHORIZED') {
+      _authzStatus = storedAuthz;
+    }
+    var storedRevokedAt = await _getSyncMeta('authorization_revoked_at');
+    if (storedRevokedAt) _authzRevokedAt = storedRevokedAt;
+    var storedAuthzReason = await _getSyncMeta('authorization_reason');
+    if (storedAuthzReason) _authzReason = storedAuthzReason;
+    if (_authzStatus === 'REVOKED') {
+      console.warn('[SyncService] Persisted authorization status is REVOKED (' + (_authzReason || 'unknown') + ') — workspace stays locked until a fresh login');
+    }
+  } catch (authzErr) {
+    console.warn('[SyncService] Could not hydrate authorization status:', authzErr.message);
+  }
 
   // ── Self-wire the local-mutation → outbox-replay fast path ──────────────
   // The engine registers its own mutation listener so the replay is
@@ -2320,6 +2579,10 @@ async function getStatus() {
     isSyncing: _isSyncing,
     isStarted: _isStarted,
     hasAuth: !!_authToken,
+    // Task 33-C: authorization (workspace lock) state
+    authorizationStatus: _authzStatus || null,
+    authorizationRevokedAt: _authzRevokedAt || null,
+    authorizationReason: _authzReason || null,
     agencyId: (_config && _config.agencyId) || (_userContext && _userContext.agencyId) || null,
     cloudBaseUrl: (_config && _config.cloudBaseUrl) || null,
     socketConnected: !!(_socket && _socket.connected),
@@ -2350,6 +2613,17 @@ async function getStatus() {
 function setAuth(token, userContext) {
   _authToken = token;
   _userContext = userContext;
+  // Task 33-C: a session being set is treated as authorized UNLESS the
+  // workspace is locked — a REVOKED status can only be cleared by an
+  // explicit fresh-proof signal (markAuthorizationAuthorized from the local
+  // API after a REAL cloud login, or a refresh 200 in _confirmRevocation),
+  // never by re-arming a stale token behind the engine's back.
+  if (_authzStatus !== 'REVOKED') {
+    _authzStatus = 'AUTHORIZED';
+    _setSyncMeta('authorization_status', 'AUTHORIZED').catch(function () { });
+  } else {
+    console.warn('[SyncService] setAuth: workspace authorization is REVOKED — engine stays locked (fresh cloud login required)');
+  }
   // ── Agency REBIND (was: only fill an EMPTY pin) ──────────────────────────
   // The engine used to pin `_config.agencyId` once at startSync (often to a
   // demo/previous-workspace agency) and setAuth never replaced it. Every
@@ -2396,7 +2670,42 @@ function clearAuth() {
   _authToken = null;
   _userContext = null;
   _destroySocket();
+  // Task 33-C: deliberately do NOT touch _authzStatus here — a REVOKED lock
+  // must survive logout/clear (it only clears via fresh-proof signals).
   console.log('[SyncService] Auth cleared');
+}
+
+/**
+ * Task 33-C: fresh proof of authorization (a REAL cloud login succeeded and
+ * the local API confirmed it). Clears the workspace lock — both the in-memory
+ * cache and the persisted meta. Called by local-api/index.js
+ * markAuthorizationAuthorized() (login path 3 / main.js cloud-sync:set-auth).
+ * Returns true when a REVOKED lock was actually lifted (restore logging).
+ */
+function markAuthorizationAuthorized() {
+  var wasRevoked = _authzStatus === 'REVOKED';
+  _authzStatus = 'AUTHORIZED';
+  _authzRevokedAt = null;
+  _authzReason = null;
+  _setSyncMeta('authorization_status', 'AUTHORIZED').catch(function () { });
+  if (wasRevoked) {
+    console.log('[SyncService] Authorization restored — workspace unlocked (fresh session accepted)');
+  }
+  return wasRevoked;
+}
+
+/**
+ * Task 33-C: mark the workspace REVOKED from the local-API side (import-time
+ * cloud rejection). Keeps the sync-service cache in lockstep with the
+ * _sync_meta keys written by revokeLocalAuthorization().
+ */
+function markAuthorizationRevoked(reason) {
+  if (_authzStatus !== 'REVOKED') {
+    _authzStatus = 'REVOKED';
+    _authzRevokedAt = new Date().toISOString();
+    _authzReason = reason || 'token-rejected';
+    _setSyncMeta('authorization_status', 'REVOKED').catch(function () { });
+  }
 }
 
 async function getConflicts() {
@@ -2513,4 +2822,9 @@ module.exports = {
   // P0 deadlock breaker: wakes the initializer when NOT_INITIALIZED + cloud reachable
   ensureWorkspaceInitialized: ensureWorkspaceInitialized,
   probeCloudSyncRoutes: function() { return _probeCloudSyncRoutes(); },
+  // Task 33-C: authorization (workspace lock) surface
+  classifyCloudError: classifyCloudError,
+  markAuthorizationAuthorized: markAuthorizationAuthorized,
+  markAuthorizationRevoked: markAuthorizationRevoked,
+  getAuthorizationStatus: function () { return _authzStatus; },
 };

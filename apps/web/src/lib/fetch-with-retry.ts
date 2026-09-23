@@ -16,6 +16,7 @@
  */
 
 import { apiFetch } from './api-fetch';
+import { isRevoked, setRevoked, isRevocationStatus } from './authz-state';
 
 export interface FetchWithRetryOptions {
   /** HTTP method (default: 'GET') */
@@ -53,6 +54,20 @@ let authExpiredTimer: ReturnType<typeof setTimeout> | null = null;
  * to re-import the session via IPC.
  */
 function handleAuthExpired(): void {
+  // Task 33-E — REVOKED session: never re-import/restore a session the auth
+  // authority has explicitly rejected. Perform the clear and let the 401
+  // propagate once so callers hit their error path and the UI lands on login.
+  // Checked BEFORE everything else — the revoked flag outranks the debounce.
+  if (isRevoked()) {
+    console.log('[Auth] 401/403 with revoked authz state → clearing session (no restore)');
+    import('@/store/use-app-store')
+      .then(({ useAppStore }) => {
+        useAppStore.setState({ user: null, isAuthenticated: false, sessionToken: '' });
+      })
+      .catch(() => { /* store unavailable — revoked flag still guards */ });
+    return;
+  }
+
   if (authExpiredHandled) {
     console.log(`[Auth] 401/403 received but authExpiredHandled=true, skipping (debounce active)`);
     return;
@@ -71,7 +86,7 @@ function handleAuthExpired(): void {
   );
   console.log(`[Auth] 401/403 → handleAuthExpired (electron=${isElectron})`);
 
-  import('@/store/use-app-store').then(({ useAppStore }) => {
+  import('@/store/use-app-store').then(async ({ useAppStore }) => {
     const store = useAppStore.getState();
     if (!store.isAuthenticated) {
       console.log(`[Auth] 401/403 but store.isAuthenticated=false, ignoring`);
@@ -106,6 +121,38 @@ function handleAuthExpired(): void {
           w.electronAPI.setLocalApiSession({ token, user: currentUser });
           sessionRestored = true;
           console.log(`[Auth] session restored via IPC (source=${localToken ? 'local' : 'cloud'})`);
+
+          // Task 33-E — the IPC restore cannot tell us whether the local API is
+          // LOCKED (Task 33-C revocation state machine: requireAuth → 423
+          // AUTHORIZATION_REVOKED). Verify once against the local API's session
+          // endpoint; if it answers with the revocation lock, mark revoked,
+          // clear the session and stop retrying (the desktop's own revocation
+          // flow owns the rest). Network failure keeps the transient behavior.
+          try {
+            const probe = await fetch('http://127.0.0.1:3080/api/auth/session', {
+              headers: { Authorization: `Bearer ${token}` },
+              credentials: 'omit',
+              signal: typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+                ? AbortSignal.timeout(3000)
+                : undefined,
+            });
+            if (!probe.ok && probe.status !== 404) {
+              const probeBody = await probe.json().catch(() => ({} as Record<string, unknown>));
+              const code = typeof probeBody?.code === 'string'
+                ? probeBody.code
+                : typeof probeBody?.error === 'string'
+                  ? probeBody.error
+                  : null;
+              if (isRevocationStatus(probe.status, code)) {
+                console.warn(`[Auth] local API session probe → ${probe.status} ${code ?? ''} — session REVOKED`);
+                setRevoked(code && code !== 'Authentication required' ? code : 'local-api-lock');
+                useAppStore.setState({ user: null, isAuthenticated: false, sessionToken: '' });
+                return; // stop — never re-import a locked-out session
+              }
+            }
+          } catch {
+            // probe unreachable — transient; keep today's restore behavior
+          }
         } else {
           console.log(`[Auth] session restore FAILED: no token (${!token}) or no IPC (${!w.electronAPI?.setLocalApiSession})`);
         }
@@ -132,6 +179,8 @@ function handleAuthExpired(): void {
       // session is unrecoverable. The httpOnly cookie may still be valid —
       // try to re-mint the session from the cookie alone before destroying
       // the session and throwing away whatever the user was doing.
+      // (Task 33-E: isRevoked() is checked at the top of handleAuthExpired —
+      // a revoked session never reaches this heal branch.)
       (async () => {
         try {
           const { healSessionFromCookie, applyHealedSession } = await import('@/lib/session-heal');

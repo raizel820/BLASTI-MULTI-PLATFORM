@@ -436,9 +436,15 @@ function PaymentDialog({
     },
   });
 
-  // Reset state when dialog opens/closes
+  // Reset state when the dialog OPENS (Task 33-D fix: transition-guarded).
+  // The reset used to run on every change of [open, hardware] — but `hardware`
+  // is passed as an inline object by the parent, so its identity changes on
+  // every parent re-render (notifications poll, health check, fetches). That
+  // re-ran the reset MID-FLOW: the user's chosen period/step silently reverted
+  // while the dialog was open. Only an open=false→true transition may reset.
+  const prevDialogOpen = useRef(false);
   useEffect(() => {
-    if (open) {
+    if (open && !prevDialogOpen.current) {
       setPaymentStep(1);
       setPaymentMethod('CCP');
       setReceiptFile(null);
@@ -453,6 +459,7 @@ function PaymentDialog({
       // re-picks an extended period each time they open the dialog.
       setPeriod(1);
     }
+    prevDialogOpen.current = open;
   }, [open, hardware]);
 
   const getLocalizedPlanName = (plan: SubscriptionPlan | null) => {
@@ -691,38 +698,57 @@ function PaymentDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg p-0 gap-0 overflow-hidden" showCloseButton={!submitting}>
+      {/* Wide on desktop (tailwind-merge overrides the base sm:max-w-lg); the
+          base max-w-[calc(100%-2rem)] still keeps phones safe. On lg+ the body
+          switches to a two-pane layout (steps left, live summary right). */}
+      <DialogContent
+        className="sm:max-w-2xl md:max-w-3xl lg:max-w-4xl flex flex-col max-h-[90dvh] p-0 gap-0 overflow-hidden rounded-2xl [&>button]:rounded-full [&>button]:text-white/90 [&>button]:hover:text-white [&>button]:hover:bg-white/20"
+        showCloseButton={!submitting}
+      >
         {/* ─── Dialog Header with Plan Info ─── */}
-        <div className="relative overflow-hidden bg-gradient-to-br from-emerald-600 via-emerald-500 to-teal-500 p-5 text-white">
-          <div className="absolute -top-6 -right-6 h-24 w-24 rounded-full bg-white/10" />
-          <div className="absolute bottom-2 -left-4 h-16 w-16 rounded-full bg-white/5" />
+        <div className="relative shrink-0 overflow-hidden bg-gradient-to-r from-emerald-700 via-emerald-600 to-teal-600 px-5 py-4 sm:px-6 text-white">
+          <div className="absolute -top-8 -end-8 h-28 w-28 rounded-full bg-white/10" />
+          <div className="absolute -bottom-6 -start-6 h-20 w-20 rounded-full bg-white/5" />
 
           {!showSuccessAnimation ? (
             <div className="relative z-10">
               <DialogHeader>
-                <DialogTitle className="text-white flex items-center gap-2 text-lg">
-                  <CreditCard className="h-5 w-5" />
+                <DialogTitle className="text-white flex items-center gap-2.5 text-lg font-bold">
+                  <span className="h-9 w-9 rounded-xl bg-white/20 flex items-center justify-center flex-shrink-0">
+                    <CreditCard className="h-4.5 w-4.5" />
+                  </span>
                   {t('paymentDialogTitle')}
                 </DialogTitle>
                 <DialogDescription className="text-emerald-100 text-sm">
                   {t('paymentDialogDesc')}
                 </DialogDescription>
               </DialogHeader>
-              {/* Selected plan badge */}
-              <div className="mt-3 flex items-center gap-3 bg-white/15 backdrop-blur-sm rounded-xl p-3">
+              {/* Selected plan chip: name + tier badge + live discounted price */}
+              <div className="mt-3 flex items-center gap-3 bg-white/15 backdrop-blur-sm rounded-2xl px-3.5 py-2.5">
                 <div className="h-10 w-10 rounded-xl bg-white/20 flex items-center justify-center flex-shrink-0">
                   <PlanIcon className="h-5 w-5 text-white" />
                 </div>
-                <div className="flex-1">
-                  <p className="text-sm font-semibold text-white">{getLocalizedPlanName(selectedPlan)}</p>
-                  <p className="text-xs text-emerald-100">
-                    {selectedPlan ? selectedPlan.name : ''}
-                    {selectedPlan && selectedPlan.billingCycle ? ` · ${selectedPlan.billingCycle}` : ''}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <p className="text-sm font-bold text-white truncate">{getLocalizedPlanName(selectedPlan)}</p>
+                    {selectedPlan && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[9px] font-bold uppercase tracking-wide bg-white/25 text-white">
+                        {selectedPlan.name}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-emerald-100">
+                    {cycleLabel}
                   </p>
                 </div>
-                <div className="text-end">
-                  <p className="text-xl font-extrabold text-white">{priceLabel}</p>
-                  <p className="text-[10px] text-emerald-100">{cycleLabel}</p>
+                <div className="text-end flex-shrink-0">
+                  <p className="text-xl font-extrabold text-white leading-tight">{priceLabel}</p>
+                  {currentDiscount > 0 && (
+                    <p className="text-[10px] font-semibold text-emerald-100 inline-flex items-center gap-1">
+                      <Sparkles className="h-3 w-3" />
+                      {t('savings')} {currentDiscount}%
+                    </p>
+                  )}
                 </div>
               </div>
             </div>
@@ -763,45 +789,65 @@ function PaymentDialog({
         </div>
 
         {/* ─── Step Indicator ─── */}
+        {/* Segmented progress: numbered pills + connector line; completed
+            steps collapse to a check icon. aria-current + sr-only copy keep it
+            accessible (visible labels hide below sm). */}
         {!showSuccessAnimation && (
-          <div className="px-5 pt-4 pb-2">
-            <div className="flex items-center gap-2">
+          <div className="px-5 sm:px-6 pt-4 pb-2">
+            <div className="flex items-center gap-2" role="group" aria-label={t('paymentDialogTitle')}>
               {dialogSteps.map((item, idx) => {
-                const StepIcon = item.icon;
                 const isActive = paymentStep >= item.step;
                 const isCurrent = paymentStep === item.step;
                 const isCompleted = paymentStep > item.step;
                 return (
                   <div key={item.step} className="flex items-center flex-1">
-                    <div className="flex items-center gap-2 flex-1">
+                    <div
+                      className="flex items-center gap-2 flex-1 min-w-0"
+                      aria-current={isCurrent ? 'step' : undefined}
+                    >
                       <motion.div
-                        animate={isCurrent ? { scale: [1, 1.05, 1] } : {}}
+                        animate={isCurrent ? { scale: [1, 1.06, 1] } : {}}
                         transition={{ duration: 0.3 , ease: 'easeInOut' }}
-                        className={`h-8 w-8 rounded-full flex items-center justify-center flex-shrink-0 transition-all duration-300 ${
-                          isActive
-                            ? 'bg-gradient-to-br from-emerald-500 to-teal-500 text-white shadow-md shadow-emerald-500/20'
-                            : 'bg-gray-100 dark:bg-gray-800 text-muted-foreground'
+                        className={`h-8 w-8 rounded-full flex items-center justify-center flex-shrink-0 text-xs font-bold transition-all duration-300 ${
+                          isCompleted
+                            ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400'
+                            : isActive
+                              ? 'bg-gradient-to-br from-emerald-500 to-teal-500 text-white shadow-md shadow-emerald-500/25'
+                              : 'bg-gray-100 dark:bg-gray-800 text-muted-foreground'
                         }`}
                       >
                         {isCompleted ? (
-                          <Check className="h-3.5 w-3.5" />
+                          <Check className="h-4 w-4" strokeWidth={3} />
                         ) : (
-                          <StepIcon className="h-3.5 w-3.5" />
+                          item.step
                         )}
                       </motion.div>
-                      <span className={`text-[11px] font-medium transition-colors duration-300 hidden sm:block ${
-                        isActive ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'
-                      }`}>
+                      <span
+                        className={`text-xs font-semibold transition-colors duration-300 truncate hidden sm:block ${
+                          isCurrent
+                            ? 'text-emerald-700 dark:text-emerald-400'
+                            : isActive
+                              ? 'text-foreground/80'
+                              : 'text-muted-foreground'
+                        }`}
+                      >
                         {item.label}
+                        <span className="sr-only">
+                          {lang === 'ar'
+                            ? ` (الخطوة ${item.step} من ${dialogSteps.length})`
+                            : lang === 'fr'
+                              ? ` (Étape ${item.step} sur ${dialogSteps.length})`
+                              : ` (Step ${item.step} of ${dialogSteps.length})`}
+                        </span>
                       </span>
                     </div>
                     {idx < dialogSteps.length - 1 && (
-                      <div className="relative h-0.5 flex-1 mx-1 rounded-full overflow-hidden bg-gray-200 dark:bg-gray-700">
+                      <div className="relative h-0.5 flex-1 mx-1.5 rounded-full overflow-hidden bg-gray-200 dark:bg-gray-700">
                         <motion.div
                           initial={{ width: 0 }}
                           animate={{ width: isCompleted ? '100%' : isCurrent ? '50%' : '0%' }}
                           transition={{ duration: 0.4 }}
-                          className="absolute inset-y-0 left-0 bg-gradient-to-r from-emerald-500 to-teal-500 rounded-full"
+                          className="absolute inset-y-0 start-0 bg-gradient-to-r from-emerald-500 to-teal-500 rounded-full"
                         />
                       </div>
                     )}
@@ -813,8 +859,13 @@ function PaymentDialog({
         )}
 
         {/* ─── Step Content ─── */}
+        {/* Two-pane on lg+: interactive steps on the left, a persistent live
+            order summary pinned on the right. Mobile keeps the single column
+            (the summary renders inside step 3 as before). */}
         {!showSuccessAnimation && (
-          <div className="px-5 py-4 min-h-[320px]">
+          <div className="px-5 sm:px-6 py-4 lg:py-5 flex-1 min-h-0 overflow-y-auto">
+            <div className="lg:grid lg:grid-cols-[1fr_340px] lg:gap-6 lg:items-start">
+              <div className="min-h-[300px] lg:min-h-0">
             <AnimatePresence mode="wait">
               {/* Step 1: Payment Method */}
               {paymentStep === 1 && (
@@ -830,12 +881,12 @@ function PaymentDialog({
                       least one extended-period discount configured. The default
                       "Monthly" option is always available. */}
                   {selectedPlan && availablePeriods.length > 1 && (
-                    <div className="space-y-2">
+                    <div className="space-y-2.5">
                       <Label className="text-sm font-semibold flex items-center gap-2">
                         <Clock className="h-4 w-4 text-emerald-600" />
                         {t('billingPeriod')}
                       </Label>
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      <div className="grid grid-cols-2 gap-2.5" role="radiogroup" aria-label={t('billingPeriod')}>
                         {availablePeriods.map((p) => {
                           const discount = getDiscountForPeriod(selectedPlan, p);
                           const total = getTotalForPeriod(selectedPlan, p);
@@ -844,37 +895,56 @@ function PaymentDialog({
                             <button
                               key={p}
                               type="button"
+                              role="radio"
+                              aria-checked={isSel}
                               onClick={() => setPeriod(p)}
-                              className={`relative text-start rounded-xl border-2 p-2.5 transition-all ${
+                              className={`relative flex flex-col gap-1.5 text-start rounded-2xl border-2 p-4 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 ${
                                 isSel
-                                  ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 shadow-sm'
-                                  : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900/50 hover:border-emerald-300'
+                                  ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 ring-2 ring-emerald-500/20 shadow-sm'
+                                  : 'border-border bg-white dark:bg-gray-900/50 hover:border-emerald-400 dark:hover:border-emerald-600 hover:shadow-sm'
                               }`}
                             >
-                              {isSel && (
-                                <span className="absolute top-1.5 end-1.5 h-4 w-4 rounded-full bg-emerald-500 flex items-center justify-center">
-                                  <Check className="h-2.5 w-2.5 text-white" />
+                              <div className="flex items-center justify-between gap-2">
+                                <span className="text-sm font-bold text-foreground">
+                                  {p === 1 ? t('monthly') : getPeriodLabel(p, lang)}
                                 </span>
-                              )}
-                              <p className="text-xs font-semibold text-foreground">
-                                {p === 1 ? t('monthly') : getPeriodLabel(p, lang)}
-                              </p>
-                              <p className="text-[11px] text-muted-foreground mt-0.5">
-                                {total.toLocaleString()} {selectedPlan.currency}
-                              </p>
-                              {discount > 0 && (
-                                <p className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400 mt-0.5">
-                                  {t('savings')} {discount}%
-                                </p>
-                              )}
+                                {isSel && (
+                                  <span className="h-5 w-5 rounded-full bg-emerald-500 flex items-center justify-center flex-shrink-0">
+                                    <Check className="h-3 w-3 text-white" strokeWidth={3} />
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-baseline gap-1.5">
+                                <span className="text-base font-extrabold text-foreground">
+                                  {total.toLocaleString()}
+                                </span>
+                                <span className="text-[11px] font-medium text-muted-foreground">
+                                  {selectedPlan.currency}
+                                </span>
+                              </div>
+                              <div className="flex items-center justify-between gap-2 min-h-[16px]">
+                                {discount > 0 ? (
+                                  <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400">
+                                    <Sparkles className="h-2.5 w-2.5" />
+                                    {t('savings')} {discount}%
+                                  </span>
+                                ) : (
+                                  <span />
+                                )}
+                                {p > 1 && (
+                                  <span className="text-[10px] text-muted-foreground">
+                                    ≈ {Math.round(total / p).toLocaleString()}{t('perMonth')}
+                                  </span>
+                                )}
+                              </div>
                             </button>
                           );
                         })}
                       </div>
                       {period > 1 && savingsAmount > 0 && (
-                        <div className="flex items-center gap-2 p-2.5 rounded-lg bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800/40">
+                        <div className="flex items-center gap-2 p-3 rounded-2xl bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800/40">
                           <Sparkles className="h-4 w-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
-                          <p className="text-[11px] text-emerald-700 dark:text-emerald-400">
+                          <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400">
                             {t('savings')} {savingsAmount.toLocaleString()} {selectedPlan.currency}
                             {' · '}
                             {lang === 'ar' ? 'ما يعادل' : lang === 'fr' ? 'équivalent' : 'equiv.'}
@@ -900,27 +970,32 @@ function PaymentDialog({
 
                         return (
                           <div key={method.id} className="space-y-1.5">
-                            <motion.div
+                            {/* Real button (was a clickable div) so the card is
+                                keyboard-operable; the instructions toggle stays a
+                                separate sibling button — never nested. */}
+                            <motion.button
+                              type="button"
+                              aria-pressed={isSelected}
                               whileHover={{ scale: 1.01 }}
                               whileTap={{ scale: 0.99 }}
                               onClick={() => setPaymentMethod(method.id)}
-                              className={`relative cursor-pointer rounded-xl border-2 p-3.5 transition-all duration-300 ${
+                              className={`relative w-full cursor-pointer text-start rounded-2xl border-2 p-4 transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 ${
                                 isSelected
-                                  ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 shadow-md'
-                                  : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900/50 hover:border-emerald-300 dark:hover:border-emerald-700'
+                                  ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 ring-2 ring-emerald-500/20 shadow-md'
+                                  : 'border-border bg-white dark:bg-gray-900/50 hover:border-emerald-400 dark:hover:border-emerald-600 hover:shadow-sm'
                               }`}
                             >
                               {isSelected && (
                                 <motion.div
                                   initial={{ scale: 0 }}
                                   animate={{ scale: 1 }}
-                                  className="absolute top-2 end-2 h-5 w-5 rounded-full bg-emerald-500 flex items-center justify-center"
+                                  className="absolute top-3 end-3 h-5 w-5 rounded-full bg-emerald-500 flex items-center justify-center"
                                 >
-                                  <Check className="h-3 w-3 text-white" />
+                                  <Check className="h-3 w-3 text-white" strokeWidth={3} />
                                 </motion.div>
                               )}
-                              <div className="flex items-center gap-3">
-                                <div className={`h-10 w-10 rounded-xl flex items-center justify-center flex-shrink-0 ${
+                              <div className="flex items-center gap-3 pe-7">
+                                <div className={`h-11 w-11 rounded-xl flex items-center justify-center flex-shrink-0 ${
                                   isSelected
                                     ? 'bg-emerald-500 text-white'
                                     : 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400'
@@ -928,17 +1003,18 @@ function PaymentDialog({
                                   <MethodIcon className="h-5 w-5" />
                                 </div>
                                 <div className="flex-1 min-w-0">
-                                  <p className="text-sm font-semibold text-foreground">{method.label}</p>
-                                  <p className="text-[11px] text-muted-foreground mt-0.5">{method.description}</p>
+                                  <p className="text-sm font-bold text-foreground">{method.label}</p>
+                                  <p className="text-xs text-muted-foreground mt-0.5">{method.description}</p>
                                 </div>
                               </div>
-                            </motion.div>
+                            </motion.button>
 
                             {/* Expand/Collapse instructions */}
                             <button
                               type="button"
+                              aria-expanded={isExpanded}
                               onClick={() => setExpandedInstructions(isExpanded ? null : method.id)}
-                              className={`w-full text-xs flex items-center justify-center gap-1 py-1 rounded-lg transition-colors ${
+                              className={`w-full text-xs flex items-center justify-center gap-1 py-1.5 rounded-xl transition-colors ${
                                 isSelected
                                   ? 'text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20'
                                   : 'text-muted-foreground hover:text-foreground hover:bg-gray-50 dark:hover:bg-gray-800/30'
@@ -958,7 +1034,7 @@ function PaymentDialog({
                                   exit={{ opacity: 0, height: 0 }}
                                   className="overflow-hidden"
                                 >
-                                  <div className="p-3 rounded-xl bg-amber-50 dark:bg-amber-900/10 border border-amber-200/60 dark:border-amber-800/30">
+                                  <div className="p-3.5 rounded-2xl bg-amber-50 dark:bg-amber-900/10 border border-amber-200/60 dark:border-amber-800/30">
                                     <div className="flex items-start gap-2 mb-2">
                                       <Info className="h-4 w-4 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
                                       <div>
@@ -1041,27 +1117,27 @@ function PaymentDialog({
                       onDrop={handleDrop}
                       onDragOver={handleDragOver}
                       onDragLeave={handleDragLeave}
-                      className={`relative rounded-xl border-2 border-dashed transition-all duration-300 ${
+                      className={`relative rounded-2xl border-2 border-dashed transition-all duration-300 ${
                         isDragOver
                           ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-900/20 scale-[1.01]'
                           : 'border-gray-300 dark:border-gray-700 hover:border-emerald-400 dark:hover:border-emerald-600 hover:bg-emerald-50/30 dark:hover:bg-emerald-900/10'
                       }`}
                     >
-                      <label className="flex flex-col items-center justify-center gap-3 p-8 cursor-pointer">
+                      <label className="flex flex-col items-center justify-center gap-2.5 p-6 cursor-pointer">
                         <motion.div
                           animate={isDragOver ? { scale: 1.1, rotate: 5 } : { scale: 1, rotate: 0 }}
-                          className={`h-14 w-14 rounded-2xl flex items-center justify-center transition-colors ${
+                          className={`h-12 w-12 rounded-2xl flex items-center justify-center transition-colors ${
                             isDragOver
                               ? 'bg-emerald-200 dark:bg-emerald-800/50'
                               : 'bg-emerald-100 dark:bg-emerald-900/30'
                           }`}
                         >
-                          <Upload className={`h-7 w-7 transition-colors ${
+                          <Upload className={`h-6 w-6 transition-colors ${
                             isDragOver ? 'text-emerald-700 dark:text-emerald-300' : 'text-emerald-600 dark:text-emerald-400'
                           }`} />
                         </motion.div>
                         <div className="text-center">
-                          <p className="text-sm font-medium text-foreground">
+                          <p className="text-sm font-semibold text-foreground">
                             {isDragOver
                               ? (lang === 'ar' ? 'أفلت الملف هنا' : lang === 'fr' ? 'Déposez le fichier ici' : 'Drop file here')
                               : t('uploadReceipt')
@@ -1411,27 +1487,160 @@ function PaymentDialog({
                 </motion.div>
               )}
             </AnimatePresence>
+              </div>
+
+              {/* ─── Right pane: persistent live order summary (lg+ only) ─── */}
+              <aside className="hidden lg:block lg:sticky lg:top-0" aria-label={t('paymentSummary')}>
+                <div className="rounded-2xl border border-emerald-200/70 dark:border-emerald-800/40 bg-gradient-to-b from-emerald-50/70 to-teal-50/40 dark:from-emerald-900/10 dark:to-teal-900/10 p-5">
+                  <h4 className="text-sm font-bold text-foreground flex items-center gap-2 mb-4">
+                    <ClipboardCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                    {t('paymentSummary')}
+                  </h4>
+
+                  {/* Selected plan */}
+                  <div className="flex items-center gap-2.5 mb-4">
+                    <div className="h-9 w-9 rounded-xl bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center flex-shrink-0">
+                      <PlanIcon className="h-4.5 w-4.5 text-emerald-600 dark:text-emerald-400" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-sm font-bold text-foreground truncate">{getLocalizedPlanName(selectedPlan)}</p>
+                      {selectedPlan && (
+                        <p className="text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
+                          {selectedPlan.name}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="space-y-2.5 text-xs">
+                    {/* Billing period + discount badge */}
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-muted-foreground flex-shrink-0">{t('billingPeriod')}</span>
+                      <span className="font-semibold text-foreground inline-flex items-center gap-1.5 flex-wrap justify-end">
+                        <Clock className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+                        {period > 1 ? getPeriodLabel(period, lang) : t('monthly')}
+                        {currentDiscount > 0 && (
+                          <span className="inline-flex items-center px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400">
+                            {t('savings')} {currentDiscount}%
+                          </span>
+                        )}
+                      </span>
+                    </div>
+
+                    {/* Payment method */}
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-muted-foreground flex-shrink-0">{t('stepPaymentMethod')}</span>
+                      <span className="font-semibold text-foreground truncate">{getPaymentMethodLabel(paymentMethod)}</span>
+                    </div>
+
+                    {/* Receipt status + thumbnail */}
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-muted-foreground flex-shrink-0">{t('stepReceipt')}</span>
+                      {receiptFile ? (
+                        <span className="flex items-center gap-1.5 min-w-0 justify-end">
+                          {receiptPreview ? (
+                            <img
+                              src={receiptPreview}
+                              alt=""
+                              className="h-8 w-8 rounded-lg object-cover border border-border flex-shrink-0"
+                            />
+                          ) : (
+                            <span className="h-8 w-8 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center flex-shrink-0">
+                              {receiptFile.type === 'application/pdf' ? (
+                                <FileText className="h-3.5 w-3.5 text-red-500" />
+                              ) : (
+                                <ImageIcon className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                              )}
+                            </span>
+                          )}
+                          <span className="min-w-0 text-end">
+                            <span className="flex items-center justify-end gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                              <CheckCircle2 className="h-3 w-3 flex-shrink-0" />
+                              <span className="truncate max-w-[110px]">{receiptFile.name}</span>
+                            </span>
+                            <span className="block text-[10px] text-muted-foreground">{getFileSize()}</span>
+                          </span>
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                          <Clock className="h-3 w-3" />
+                          {t('receiptPending')}
+                        </span>
+                      )}
+                    </div>
+
+                    <Separator className="bg-emerald-200/60 dark:bg-emerald-800/30" />
+
+                    {/* Savings breakdown when an extended period applies */}
+                    {period > 1 && selectedPlan && savingsAmount > 0 && (
+                      <>
+                        <div className="flex items-center justify-between">
+                          <span className="text-muted-foreground">{t('totalAmount')}</span>
+                          <span className="text-muted-foreground line-through">
+                            {(selectedPlan.price * period).toLocaleString()} {selectedPlan.currency}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between text-emerald-700 dark:text-emerald-400">
+                          <span className="inline-flex items-center gap-1">
+                            <Sparkles className="h-3 w-3" />
+                            {t('savings')}
+                          </span>
+                          <span className="font-bold">
+                            −{savingsAmount.toLocaleString()} {selectedPlan.currency}
+                          </span>
+                        </div>
+                      </>
+                    )}
+
+                    {/* Live discounted total */}
+                    <div className="flex items-center justify-between pt-1">
+                      <span className="text-sm font-bold text-foreground">{t('totalAmount')}</span>
+                      <span className="text-end">
+                        <span className="block text-lg font-extrabold text-emerald-600 dark:text-emerald-400 leading-tight">
+                          {priceLabel}
+                        </span>
+                        <span className="block text-[10px] text-muted-foreground">{cycleLabel}</span>
+                      </span>
+                    </div>
+                    {period > 1 && selectedPlan && (
+                      <p className="text-[10px] text-muted-foreground text-end">
+                        {lang === 'ar' ? 'ما يعادل' : lang === 'fr' ? 'équivalent' : 'equiv.'}
+                        {' '}
+                        {Math.round(monthlyEquivalent).toLocaleString()} {selectedPlan.currency}
+                        {t('perMonth')}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </aside>
+            </div>
           </div>
         )}
 
         {/* ─── Dialog Footer with Navigation ─── */}
+        {/* Sticky-feeling action bar: Back (ghost) left, Next/Confirm right.
+            Confirm shows the live discounted total on lg. Disabled logic
+            unchanged (canGoNext / submitting). */}
         {!showSuccessAnimation && (
-          <DialogFooter className="px-5 pb-5 pt-2 gap-2 sm:gap-0 border-t border-border/50">
+          <DialogFooter className="shrink-0 px-5 sm:px-6 pb-4 sm:pb-5 pt-3 gap-2 sm:gap-0 border-t border-border/60 bg-gradient-to-t from-gray-50/90 dark:from-gray-900/60 to-transparent">
             <div className="flex items-center gap-2 w-full">
               {paymentStep > 1 && (
                 <Button
-                  variant="outline"
+                  variant="ghost"
                   onClick={handleBack}
                   disabled={submitting}
-                  className="flex-1 sm:flex-none"
+                  className="flex-1 sm:flex-none text-muted-foreground hover:text-foreground"
                 >
                   <ChevronLeft className={`h-4 w-4 ${lang === 'ar' ? 'rotate-180' : ''} me-1`} />
                   {t('back')}
                 </Button>
               )}
+              <div className="flex-1 hidden sm:block" />
               <Button
-                className={`bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-semibold ${
-                  paymentStep === 1 ? 'w-full' : 'flex-1'
+                className={`font-semibold flex-1 sm:flex-none ${
+                  paymentStep === 3
+                    ? 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white shadow-md shadow-emerald-500/20'
+                    : ''
                 }`}
                 onClick={handleNext}
                 disabled={submitting || !canGoNext()}
@@ -1444,6 +1653,11 @@ function PaymentDialog({
                   <ChevronRight className={`h-4 w-4 ${lang === 'ar' ? 'rotate-180' : ''} me-1`} />
                 )}
                 {paymentStep === 3 ? t('confirm') : t('next')}
+                {paymentStep === 3 && selectedPlan && (
+                  <span className="hidden lg:inline ms-1 opacity-90">
+                    · {priceLabel}
+                  </span>
+                )}
               </Button>
             </div>
           </DialogFooter>
@@ -1829,13 +2043,16 @@ function EnterpriseRequestDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg p-0 gap-0 overflow-hidden">
-        <div className="relative overflow-hidden bg-gradient-to-br from-purple-600 via-fuchsia-600 to-pink-500 p-5 text-white">
-          <div className="absolute -top-6 -right-6 h-24 w-24 rounded-full bg-white/10" />
-          <div className="absolute bottom-2 -left-4 h-16 w-16 rounded-full bg-white/5" />
+      {/* Wide on desktop so the feature grid and message box breathe (Task 33-D) */}
+      <DialogContent className="sm:max-w-2xl lg:max-w-3xl p-0 gap-0 overflow-hidden rounded-2xl">
+        <div className="relative overflow-hidden bg-gradient-to-r from-purple-700 via-fuchsia-600 to-pink-500 px-5 py-4 sm:px-6 text-white">
+          <div className="absolute -top-8 -end-8 h-28 w-28 rounded-full bg-white/10" />
+          <div className="absolute -bottom-6 -start-6 h-20 w-20 rounded-full bg-white/5" />
           <DialogHeader>
-            <DialogTitle className="text-white flex items-center gap-2 text-lg">
-              <Sparkles className="h-5 w-5" />
+            <DialogTitle className="text-white flex items-center gap-2.5 text-lg font-bold">
+              <span className="h-9 w-9 rounded-xl bg-white/20 flex items-center justify-center flex-shrink-0">
+                <Sparkles className="h-4.5 w-4.5" />
+              </span>
               {t('requestEnterprise')}
             </DialogTitle>
             <DialogDescription className="text-purple-100 text-sm">
@@ -1844,7 +2061,7 @@ function EnterpriseRequestDialog({
           </DialogHeader>
         </div>
 
-        <div className="p-5 space-y-4 max-h-[60vh] overflow-y-auto">
+        <div className="p-5 sm:px-6 space-y-4 max-h-[65vh] overflow-y-auto">
           {/* Message */}
           <div className="space-y-1.5">
             <Label className="text-sm font-semibold flex items-center gap-2">
@@ -1937,25 +2154,50 @@ function EnterpriseRequestDialog({
           </div>
 
           {/* Requested features */}
+          {/* Task 33-D nesting fix: the outer element used to be a <button>
+              wrapping a shadcn <Checkbox> (which renders <button role="checkbox">)
+              → React DOM nesting error "<button> cannot be a descendant of
+              <button>". It is now a keyboard-operable div[role=checkbox] and the
+              visual check indicator is a plain span (no nested interactive
+              elements; click + Enter/Space both toggle). */}
           <div className="space-y-2">
             <Label className="text-sm font-semibold">{t('requestedFeatures')}</Label>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
               {featureOptions.map((f) => {
                 const checked = requestedFeatures.includes(f.key);
                 return (
-                  <button
+                  <div
                     key={f.key}
-                    type="button"
+                    role="checkbox"
+                    aria-checked={checked}
+                    tabIndex={0}
                     onClick={() => toggleFeature(f.key)}
-                    className={`flex items-center gap-2 rounded-lg border-2 p-2.5 text-start transition-all ${
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        toggleFeature(f.key);
+                      }
+                    }}
+                    className={`flex items-center gap-2.5 rounded-xl border-2 p-3 text-start transition-all cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-500/40 ${
                       checked
                         ? 'border-purple-500 bg-purple-50 dark:bg-purple-900/20'
-                        : 'border-border hover:border-purple-300'
+                        : 'border-border hover:border-purple-300 dark:hover:border-purple-700'
                     }`}
                   >
-                    <Checkbox checked={checked} className="pointer-events-none" />
+                    {/* Purely visual check badge (mirrors the payment-method
+                        selected-check pattern) — NOT a <Checkbox> button. */}
+                    <span
+                      aria-hidden="true"
+                      className={`h-5 w-5 rounded-md border-2 flex items-center justify-center flex-shrink-0 transition-colors ${
+                        checked
+                          ? 'bg-purple-600 border-purple-600'
+                          : 'bg-transparent border-gray-300 dark:border-gray-600'
+                      }`}
+                    >
+                      {checked && <Check className="h-3 w-3 text-white" strokeWidth={3} />}
+                    </span>
                     <span className="text-xs font-medium text-foreground">{f.label}</span>
-                  </button>
+                  </div>
                 );
               })}
             </div>

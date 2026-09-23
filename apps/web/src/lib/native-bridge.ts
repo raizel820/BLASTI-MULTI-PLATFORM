@@ -33,6 +33,8 @@ interface ElectronAPI {
   installUpdate: () => void;
   getAppVersion: () => Promise<string>;
   getPlatform: () => Promise<{ platform: string; arch: string; electronVersion: string; chromeVersion: string; nodeVersion: string }>;
+  /** Task 33-C/33-E — desktop revocation push: cb({reason}) → unsubscribe fn. */
+  onAuthRevoked?: (callback: (payload: { reason?: string }) => void) => () => void;
 }
 
 /** Minimal shape of window.Capacitor for plugin access */

@@ -18,45 +18,9 @@
 # ============================================================================
 #
 # This script documents how to:
-#   1. Deploy the BLASTI frontend to Vercel
-#   2. Build the Windows .exe (Electron desktop app)
-#   3. Build the Android .apk (Capacitor mobile app)
-#   4. Self-host the full stack (API + Web + Database)
-#
-# ============================================================================
-
-# ============================================================================
-# SECTION 1: DEPLOY TO VERCEL (Frontend Only)
-# ============================================================================
-#
-# BLASTI's frontend (apps/web) uses Next.js with `output: "export"`,
-# generating static HTML/JS/CSS files — perfect for Vercel's CDN.
-#
-# IMPORTANT: The Hono API server (apps/api) and Socket.IO real-time
-# features CANNOT run on Vercel. You need a separate backend host.
-#
-# --- Step-by-Step ---
-#
-# 1. Push your code to GitHub
-#
-# 2. Go to https://vercel.com/new and import your repository
-#
-# 3. Configure the project:
-#    - Framework Preset: Other
-#    - Root Directory: / (leave as root, vercel.json handles paths)
-#    - Build Command: (auto-detected from vercel.json)
-#    - Output Directory: (auto-detected from vercel.json)
-#
-# 4. Set environment variables in Vercel dashboard:
-#    NEXT_PUBLIC_API_URL=https://your-api-server.com
-#
-# 5. Deploy!
-#
-# --- Using Vercel CLI ---
-#
-# npm i -g vercel
-# vercel login
-# vercel --prod
+#   1. Build the Windows .exe (Electron desktop app)
+#   2. Build the Android .apk (Capacitor mobile app)
+#   3. Self-host the full stack (API + Web + Database)
 #
 # ============================================================================
 

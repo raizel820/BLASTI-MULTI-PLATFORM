@@ -3,6 +3,11 @@ import { persist } from 'zustand/middleware';
 import type { Language } from '@/i18n';
 import { isRTL } from '@/i18n';
 import { apiFetch } from '@/lib/api-fetch';
+// Task 33-E — fresh auth must re-enable everything the revocation guards
+// locked (authz flag + sync engine). authz-state is dependency-free (no
+// cycles); sync.ts does not statically import this store (dynamic import only).
+import { clearRevoked } from '@/lib/authz-state';
+import { syncEngine } from '@/db/sync';
 
 export type UserRole = 'CUSTOMER' | 'AGENCY_STAFF' | 'AGENCY_OWNER' | 'SUPER_ADMIN';
 export type ViewName =
@@ -342,6 +347,13 @@ export const useAppStore = create<AppState>()(
       onboarded: false,
 
       setSessionToken: (token) => {
+        // Task 33-E — fresh auth re-enables everything the revocation guards
+        // locked: clear the persisted revoked flag, resume the sync engine's
+        // periodic loop (after a 401/403 pause), and drop the pull cursor so
+        // the (possibly different) account re-pulls from scratch.
+        clearRevoked();
+        syncEngine.clearSyncCursor();
+        syncEngine.resumeAfterAuth();
         set({ sessionToken: token });
         // Pass auth token to Electron main process for cloud sync
         const w = window as any;
@@ -432,6 +444,11 @@ export const useAppStore = create<AppState>()(
           w.electronAPI.clearLocalApiSession();
         }
         try { localStorage.removeItem('blasti-local-api-token'); } catch { /* ignore */ }
+        // Task 33-E — drop the sync pull cursor: the next login may be a
+        // different account/agency, which must re-pull from sequence 0.
+        // NOTE: the revoked flag is deliberately NOT cleared here — only a
+        // successful login (setSessionToken → clearRevoked) recovers it.
+        syncEngine.clearSyncCursor();
         // Clear persisted storage AFTER set (persist middleware writes during set)
         // Also call the Hono backend logout endpoint to clear the JWT session cookie
         setTimeout(() => {

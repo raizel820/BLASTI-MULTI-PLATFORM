@@ -4269,20 +4269,32 @@ app.post('/subscription/cancel', async (c) => {
       },
     })
 
-    await db.auditLog.create({
-      data: {
-        userId: user.id,
-        action: 'SUBSCRIPTION_CANCEL',
-        entityType: 'AGENCY',
-        entityId: agencyId,
-        details: JSON.stringify({
-          agencyId,
-          previousTier: agency.subscriptionTier,
-          previousStatus: agency.subscriptionStatus,
-        }),
-      },
-    })
+    // Audit logging is best-effort (Task 33-D): the agency row above is the
+    // source of truth and the cancel already succeeded — an audit-write
+    // failure (DB hiccup, etc.) must never bubble up as a 500 and make the
+    // client think the cancellation failed.
+    try {
+      await db.auditLog.create({
+        data: {
+          userId: user.id,
+          action: 'SUBSCRIPTION_CANCEL',
+          entityType: 'AGENCY',
+          entityId: agencyId,
+          details: JSON.stringify({
+            agencyId,
+            previousTier: agency.subscriptionTier,
+            previousStatus: agency.subscriptionStatus,
+          }),
+        },
+      })
+    } catch (auditError) {
+      console.error('[agency] subscription/cancel: audit log write failed (cancel still succeeded):', auditError)
+    }
 
+    // Idempotent by design: calling cancel on an already-INACTIVE agency just
+    // rewrites the same values and returns success. PENDING payment
+    // transactions are intentionally left untouched (admins still review the
+    // last receipt).
     return c.json({ success: true })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -4488,40 +4500,12 @@ app.post('/enterprise-request', async (c) => {
 })
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SUBSCRIPTION CANCEL ENDPOINT
+// SUBSCRIPTION CANCEL ENDPOINT — REMOVED (Task 33-D)
 // ═══════════════════════════════════════════════════════════════════════════════
-
-// POST /agency/subscription/cancel — cancel subscription
-app.post('/subscription/cancel', async (c) => {
-  try {
-    const user = await requireAuth(c)
-    const agencyId = user.agencyId || await resolveUserAgencyId(user)
-    if (!agencyId) return c.json({ error: 'No agency found' }, 404)
-
-    await db.agency.update({
-      where: { id: agencyId },
-      data: {
-        subscriptionStatus: 'INACTIVE',
-        subscriptionStartsAt: null,
-        subscriptionExpiresAt: null,
-      },
-    })
-
-    await db.auditLog.create({
-      data: {
-        userId: user.id,
-        action: 'SUBSCRIPTION_CANCEL',
-        entityType: 'AGENCY',
-        entityId: agencyId,
-        details: JSON.stringify({}),
-      },
-    })
-
-    return c.json({ success: true })
-  } catch (error) {
-    const err = authErrorResponse(error)
-    return c.json({ success: err.success, error: err.error }, err.status as any)
-  }
-})
+// A second, legacy `app.post('/subscription/cancel', …)` used to live here. It
+// was DEAD CODE: Hono matches routes in registration order, so the richer
+// handler above (which snapshots the previous tier/status into the audit log)
+// always won and this one never executed. Deleted to avoid drift between the
+// two copies.
 
 export const agencyRoutes = app

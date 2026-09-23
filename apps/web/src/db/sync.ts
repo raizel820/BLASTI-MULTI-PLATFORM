@@ -22,6 +22,7 @@
 
 import type { Database } from '@nozbe/watermelondb';
 import { buildCloudUrl } from '@/lib/api-client';
+import { isRevoked, setRevoked, clearRevoked } from '@/lib/authz-state';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -32,11 +33,25 @@ import { buildCloudUrl } from '@/lib/api-client';
  */
 class SyncHttpError extends Error {
   status: number;
+  /** Machine-readable error code from the body (e.g. AUTHORIZATION_REVOKED). */
+  code: string | null = null;
   constructor(status: number, message: string) {
     super(message);
     this.status = status;
     this.name = 'SyncHttpError';
   }
+}
+
+/**
+ * One model's slice of a pull response. Accepts BOTH wire shapes:
+ *   - protocol-v2 (cloud): { changed: [...full rows...], deleted: [...ids] }
+ *   - legacy (LAN/desktop): { created: [...], updated: [...], deleted: [...ids] }
+ */
+interface PullPageBucket {
+  changed?: unknown[];
+  created?: unknown[];
+  updated?: unknown[];
+  deleted?: unknown[];
 }
 
 export interface SyncStatus {
@@ -66,6 +81,13 @@ const LAN_PROBE_INTERVAL_MS = 30 * 1000; // Re-probe LAN every 30s
 const LAN_PROBE_TIMEOUT_MS = 2000; // 2s timeout for LAN server probe
 const LAN_SYNC_BASE_PATH = '/api/sync'; // Same path on desktop LAN server
 const LAN_UNSUPPORTED_COOLDOWN_MS = 5 * 60 * 1000; // Retry LAN sync 5 min after a 404
+// Task 33-E: cloud protocol-v2 pull cursor + pagination. The cloud's
+// POST /api/sync/pull expects { sinceSequence } and answers with
+// pageLastSequence + hasMore; we persist the safe cursor and page through
+// hasMore responses (bounded per cycle). Stored in localStorage — cleared on
+// login/logout (store) so a new account/agency always re-pulls from 0.
+const SYNC_CURSOR_KEY = 'blasti-sync-cursor';
+const MAX_PULL_PAGES_PER_CYCLE = 5;
 
 const isBrowser = typeof window !== 'undefined';
 
@@ -90,6 +112,47 @@ class SyncEngine {
   // "Sync failed: Not found". Status probing continues so we recover
   // automatically when the desktop app is updated/restarted.
   private lanSyncUnsupportedUntil: number = 0;
+
+  // Task 33-E — explicit-rejection awareness. When the cloud rejects the
+  // session (401/403), sync must NOT retry forever: in Electron we pause and
+  // let the desktop revocation flow (Task 33-C) confirm; in the browser we
+  // heal-or-revoke and stop until the next successful login. Cleared by
+  // resumeAfterAuth() (wired to the store's setSessionToken).
+  private revokedSession: boolean = false;
+  private lastDatabase: Database | null = null;
+  private lastIntervalMs: number = DEFAULT_SYNC_INTERVAL_MS;
+
+  /** Persisted protocol-v2 pull cursor (cloud pageLastSequence). */
+  private getSyncCursor(): number | null {
+    if (!isBrowser) return null;
+    try {
+      const raw = localStorage.getItem(SYNC_CURSOR_KEY);
+      if (!raw) return null;
+      const n = parseInt(raw, 10);
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private setSyncCursor(seq: number): void {
+    if (!isBrowser) return;
+    try {
+      localStorage.setItem(SYNC_CURSOR_KEY, String(seq));
+    } catch {
+      // ignore
+    }
+  }
+
+  /** Drop the pull cursor — call on login/logout so a new account re-pulls fully. */
+  clearSyncCursor(): void {
+    if (!isBrowser) return;
+    try {
+      localStorage.removeItem(SYNC_CURSOR_KEY);
+    } catch {
+      // ignore
+    }
+  }
 
   private emit(event: SyncEvent): void {
     for (const listener of this.listeners) {
@@ -391,6 +454,18 @@ class SyncEngine {
     if (this.isSyncing) return;
     if (!isBrowser) return;
 
+    // Task 33-E — short-circuit while the session is rejected. The soft flag
+    // is set by handleAuthRejected (cloud 401/403) or via authz-state
+    // (electronAPI.onAuthRevoked → auth-provider → setRevoked). A successful
+    // setSessionToken/login calls resumeAfterAuth() which clears both, so a
+    // legitimate re-login re-enables sync.
+    if (this.revokedSession || isRevoked()) {
+      console.log('[SyncEngine] Session revoked — skipping sync until re-login');
+      return;
+    }
+
+    this.lastDatabase = database;
+
     // Check connectivity — but only skip if BOTH internet AND LAN are down
     const { baseUrl, target } = await this.getSyncBaseUrl();
 
@@ -434,32 +509,94 @@ class SyncEngine {
           const since = wdbLastPulledAt || lastPulledAt;
           console.log('[SyncEngine] Pulling changes since:', since);
 
-          const response = await fetch(this._buildUrl(baseUrl, '/api/sync/pull', target), {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Authorization: `Bearer ${token}`,
-            },
-            credentials: 'include',
-            body: JSON.stringify({
-              lastPulledAt: since || undefined,
-            }),
-          });
+          // Task 33-E — protocol-v2 adaptation: the cloud pull expects
+          // { sinceSequence } (it IGNORES lastPulledAt — that field only made
+          // sense to the legacy LAN protocol) and answers with a page of
+          // changes + pageLastSequence + hasMore. We page through hasMore
+          // responses (bounded) and advance the persisted cursor only AFTER
+          // the rows are applied (onDidPullChanges below), so a failed apply
+          // never skips a page. MISMATCH NOTE (documented, not redesigned in
+          // this pass): the retention/reconcile signal (cursor older than the
+          // feed's oldestAvailableSequence) is not implemented — if the server
+          // ever truncates the feed, a manual logout/login (which clears the
+          // cursor) forces a full re-pull.
+          let pageCursor = target === 'cloud' ? this.getSyncCursor() : null;
+          let collected: Record<string, PullPageBucket> = {};
+          let timestamp: number | null = null;
+          let latestPageSequence: number | null = null;
 
-          if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new SyncHttpError(
-              response.status,
-              errorData.error || `Pull failed with status ${response.status}`,
-            );
+          for (let page = 0; page < MAX_PULL_PAGES_PER_CYCLE; page++) {
+            const body: Record<string, unknown> = {
+              lastPulledAt: since ?? undefined, // legacy LAN servers; ignored by the cloud
+            };
+            if (target === 'cloud' && pageCursor != null) {
+              body.sinceSequence = pageCursor;
+            }
+
+            const response = await fetch(this._buildUrl(baseUrl, '/api/sync/pull', target), {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+              },
+              credentials: 'include',
+              body: JSON.stringify(body),
+            });
+
+            if (!response.ok) {
+              const errorData = await response.json().catch(() => ({}));
+              throw syncHttpErrorFromResponse(response.status, errorData, `Pull failed with status ${response.status}`);
+            }
+
+            const data = await response.json().catch(() => null);
+            if (!data || typeof data !== 'object') {
+              throw new SyncHttpError(0, 'Pull returned an invalid JSON body');
+            }
+
+            collected = mergePullPage(collected, data.changes);
+            // WDB requires a non-zero NUMBER timestamp; the cloud returns an
+            // ISO string. Convert (also tolerate servers already sending ms).
+            const ts = toEpochMs(data.timestamp);
+            if (ts != null) timestamp = ts;
+
+            if (target !== 'cloud') break; // legacy LAN protocol — single page
+
+            const seq = typeof data.pageLastSequence === 'number' ? data.pageLastSequence : null;
+            if (seq != null) latestPageSequence = seq;
+            // Keep pulling only while the server reports more pages AND its
+            // safe cursor advances (guards against legacy/non-advancing loops).
+            if (data.hasMore !== true || seq == null || seq <= (pageCursor ?? 0)) break;
+            pageCursor = seq;
           }
 
-          const data = await response.json();
-          const timestamp = data.timestamp;
-          const changes = transformPullChanges(data.changes);
+          // Local existence index lets the transformer split v2 `changed` rows
+          // into WDB's created/updated buckets cleanly (no update-nonexistent
+          // log spam). Any failure → null → safe all-`updated` upsert fallback.
+          let localIdIndex: Map<string, Set<string>> | null = null;
+          try {
+            localIdIndex = await buildLocalIdIndex(database, collected);
+          } catch {
+            localIdIndex = null;
+          }
+
+          const changes = transformPullChanges(collected, { localIdIndex });
 
           console.log('[SyncEngine] Pull complete, timestamp:', timestamp);
-          return { changes, timestamp };
+          return {
+            changes,
+            timestamp: timestamp ?? Date.now(),
+            // Extra field rides alongside the WDB result; consumed below.
+            pageLastSequence: target === 'cloud' ? latestPageSequence : null,
+          };
+        },
+
+        onDidPullChanges: async (result) => {
+          // Rows are now APPLIED to the local DB — only now advance the pull
+          // cursor so a crashed apply re-pulls the same page next cycle.
+          const seq = (result as { pageLastSequence?: unknown })?.pageLastSequence;
+          if (target === 'cloud' && typeof seq === 'number') {
+            this.setSyncCursor(seq);
+          }
         },
 
         pushChanges: async ({ changes, lastPulledAt }) => {
@@ -480,10 +617,7 @@ class SyncEngine {
 
           if (!response.ok) {
             const errorData = await response.json().catch(() => ({}));
-            throw new SyncHttpError(
-              response.status,
-              errorData.error || `Push failed with status ${response.status}`,
-            );
+            throw syncHttpErrorFromResponse(response.status, errorData, `Push failed with status ${response.status}`);
           }
 
           console.log('[SyncEngine] Push complete');
@@ -492,7 +626,9 @@ class SyncEngine {
         sendCreatedAsUpdated: false,
       });
 
-      const now = new Date().toISOString();
+      // Store epoch ms (WatermelonDB lastPulledAt semantics) — the previous
+      // ISO string was never comparable with the WDB timestamp domain.
+      const now = String(Date.now());
       this.setLastSyncTimestamp(now);
 
       this.emit({ type: 'sync-complete', status: this.getStatus() });
@@ -502,11 +638,29 @@ class SyncEngine {
       this.lastError = message;
       console.warn('[SyncEngine] Sync failed:', message);
 
+      // Task 33-E — explicit rejection (cloud 401/403, or the desktop local
+      // API answering with its AUTHORIZATION_REVOKED lock). Handled BEFORE the
+      // LAN branches so a rejected session never loops every 5 min forever.
+      // Network-level failures never land here (they don't throw SyncHttpError)
+      // and the LAN-404 cooldown below is untouched.
+      // NOTE (deliberate refinement of the blanket 401/403 rule): a plain 401
+      // from the LAN target inside Electron is the documented TRANSIENT
+      // post-reload race (local API sessionUser null before the IPC import
+      // fires) — revocation from the local API is signaled distinctly
+      // (423 / AUTHORIZATION_REVOKED), so only those plus cloud-target
+      // rejections take the revocation path.
+      if (
+        error instanceof SyncHttpError &&
+        (error.status === 401 || error.status === 403) &&
+        (target === 'cloud' || error.code === 'AUTHORIZATION_REVOKED')
+      ) {
+        await this.handleAuthRejected(target, error);
+      }
       // LAN server answered 404 on the sync endpoints — its local API build
       // predates the WatermelonDB sync routes. Cool it down and retry this
       // cycle against the cloud instead of failing every 5 minutes with
       // "Sync failed: Not found".
-      if (
+      else if (
         target === 'lan' &&
         error instanceof SyncHttpError &&
         error.status === 404
@@ -530,8 +684,99 @@ class SyncEngine {
     }
   }
 
+  /**
+   * Task 33-E — clear the revoked/paused state and restart the periodic sync
+   * intervals after a successful (re-)authentication. Called by the app
+   * store's setSessionToken (fresh login). The persisted revoked flag is
+   * cleared separately via clearRevoked() by the same caller/auth-provider.
+   */
+  resumeAfterAuth(): void {
+    this.revokedSession = false;
+    if (!isBrowser || !this.lastDatabase) return;
+    // Intervals still running (e.g. pause never happened) — nothing to do
+    // (also avoids duplicating the online/offline listeners startPeriodicSync owns).
+    if (this.syncIntervalId || this.lanProbeIntervalId) return;
+    console.log('[SyncEngine] Session re-authenticated — resuming periodic sync');
+    this.syncIntervalId = setInterval(() => {
+      if (this.lastDatabase) this.sync(this.lastDatabase);
+    }, this.lastIntervalMs);
+    this.lanProbeIntervalId = setInterval(() => {
+      this.probeLanServer().catch(() => {});
+    }, LAN_PROBE_INTERVAL_MS);
+  }
+
+  /**
+   * Task 33-E — the cloud (or the desktop local API with AUTHORIZATION_REVOKED)
+   * explicitly rejected this session. Terminal handling per runtime:
+   *   - Electron: NEVER self-logout — the desktop revocation flow (Task 33-C)
+   *     owns confirmation (refresh → restore, or lock + onAuthRevoked push).
+   *     We only pause client sync (soft flag) until the next successful auth.
+   *   - Browser + LAN: transient — keep today's re-probe behavior, no logout.
+   *   - Browser + cloud: ONE cookie-heal attempt (fresh token without the
+   *     poisoned Bearer); if the cookie is dead too → revoke, clear tokens,
+   *     stop sync. The next auth-provider render/login flow takes over.
+   */
+  private async handleAuthRejected(target: 'lan' | 'cloud', error: SyncHttpError): Promise<void> {
+    const isElectron = isBrowser && !!(window as any).electronAPI;
+
+    if (isElectron) {
+      this.stopPeriodicSync();
+      console.log('[SyncEngine] Cloud rejected the session (401/403) — pausing client sync (desktop will confirm revocation)');
+      this.revokedSession = true;
+      this.lastError = 'Session rejected — sync paused pending revocation check';
+      this.emit({ type: 'sync-error', status: this.getStatus(), error: this.lastError });
+      return;
+    }
+
+    if (target === 'lan') {
+      console.log('[SyncEngine] LAN server rejected the session (401/403) — will re-probe next cycle (no logout)');
+      this._clearLanServer();
+      this.emit({ type: 'sync-error', status: this.getStatus(), error: error.message });
+      return;
+    }
+
+    // Browser + cloud — attempt ONE refresh via the cookie-heal mechanism
+    // (POST /api/auth/refresh-session with the httpOnly cookie, no Bearer).
+    try {
+      const { healSessionFromCookie, applyHealedSession } = await import('@/lib/session-heal');
+      const healed = await healSessionFromCookie();
+      if (healed) {
+        console.log('[SyncEngine] Cloud rejected the session but the cookie healed it — fresh token adopted, sync continues');
+        await applyHealedSession(healed);
+        clearRevoked();
+        this.revokedSession = false;
+        return; // intervals untouched — the next cycle syncs with fresh credentials
+      }
+    } catch {
+      // heal is best-effort — fall through to rejection
+    }
+
+    this.stopPeriodicSync();
+    console.warn('[SyncEngine] Cloud rejected the session (401/403) — stopping sync until re-login');
+    setRevoked('sync-auth-rejected');
+    this.revokedSession = true;
+    // Minimal token clear (dynamic import — avoids a static cycle with the
+    // store; the store's logout() would also navigate, while this minimal
+    // clear lets the revoked-flag guards + auth-provider render the login).
+    try {
+      const { useAppStore } = await import('@/store/use-app-store');
+      useAppStore.setState({ user: null, isAuthenticated: false, sessionToken: '' });
+    } catch {
+      // store unavailable — the persisted revoked flag still guards every path
+    }
+    try {
+      localStorage.removeItem('blasti-session-token');
+    } catch {
+      // ignore
+    }
+    this.lastError = 'Authentication required — session rejected, please log in again';
+    this.emit({ type: 'sync-error', status: this.getStatus(), error: this.lastError });
+  }
+
   startPeriodicSync(database: Database, intervalMs: number = DEFAULT_SYNC_INTERVAL_MS): () => void {
     this.stopPeriodicSync();
+    this.lastDatabase = database;
+    this.lastIntervalMs = intervalMs;
 
     if (!isBrowser) return () => {};
 
@@ -588,22 +833,161 @@ class SyncEngine {
 
 // ─── Pull Changes Transformer ───────────────────────────────────────────────
 
-function transformPullChanges(
-  serverChanges: Record<string, { created: any[]; updated: any[]; deleted: string[] }>,
+/**
+ * Build a SyncHttpError from an error body, capturing a machine-readable
+ * code (SCREAMING_SNAKE, e.g. AUTHORIZATION_REVOKED) when present.
+ */
+function syncHttpErrorFromResponse(status: number, errorData: unknown, fallbackMessage: string): SyncHttpError {
+  const err = (errorData && typeof errorData === 'object' ? (errorData as Record<string, unknown>) : {});
+  const raw = typeof err.error === 'string' ? err.error : '';
+  const httpError = new SyncHttpError(status, raw || fallbackMessage);
+  httpError.code = /^[A-Z][A-Z0-9_]{5,}$/.test(raw) ? raw : null;
+  return httpError;
+}
+
+/** Coerce a pull timestamp (epoch ms number, epoch-ms string, or ISO string) to epoch ms. */
+export function toEpochMs(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+  if (typeof value === 'string') {
+    if (/^\d+$/.test(value)) {
+      const n = Number(value);
+      return n > 0 ? n : null;
+    }
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+/**
+ * Merge one pull page into the accumulator. Accepts v2 {changed, deleted} and
+ * legacy {created, updated, deleted} buckets; never throws on malformed pages.
+ */
+export function mergePullPage(
+  acc: Record<string, PullPageBucket>,
+  page: unknown,
+): Record<string, PullPageBucket> {
+  if (!page || typeof page !== 'object') return acc;
+  for (const [modelName, modelChanges] of Object.entries(page as Record<string, unknown>)) {
+    if (!modelChanges || typeof modelChanges !== 'object') continue;
+    const mc = modelChanges as PullPageBucket;
+    const bucket = acc[modelName] || (acc[modelName] = {});
+    if (Array.isArray(mc.changed)) {
+      bucket.changed = [...(bucket.changed || []), ...mc.changed];
+    }
+    if (Array.isArray(mc.created)) {
+      bucket.created = [...(bucket.created || []), ...mc.created];
+    }
+    if (Array.isArray(mc.updated)) {
+      bucket.updated = [...(bucket.updated || []), ...mc.updated];
+    }
+    if (Array.isArray(mc.deleted)) {
+      bucket.deleted = [...(bucket.deleted || []), ...mc.deleted];
+    }
+  }
+  return acc;
+}
+
+/**
+ * Pre-fetch which of the incoming v2 `changed` row ids already exist locally,
+ * per WDB table. Unknown tables (the web schema mirrors only a subset of the
+ * cloud's 19 synced models — e.g. User/Transaction) resolve to no collection
+ * and are omitted; WDB itself skips those tables with a forward-compat log.
+ * On any failure the table is omitted → the transformer falls back to the
+ * safe all-`updated` upsert.
+ */
+async function buildLocalIdIndex(
+  database: Database,
+  serverChanges: Record<string, PullPageBucket> | null | undefined,
+): Promise<Map<string, Set<string>>> {
+  const index = new Map<string, Set<string>>();
+  if (!serverChanges || typeof serverChanges !== 'object') return index;
+
+  for (const [modelName, modelChanges] of Object.entries(serverChanges)) {
+    const rows = Array.isArray(modelChanges?.changed) ? modelChanges!.changed : [];
+    if (!rows.length) continue;
+    const ids = rows
+      .filter(isSyncRow)
+      .map((row) => row.id as string);
+    if (!ids.length) continue;
+
+    const tableName = modelNameToTableName(modelName);
+    try {
+      const collection = (database as unknown as { get: (t: string) => unknown }).get(tableName);
+      if (!collection) continue;
+      const existingIds = await (collection as { query: () => { fetchIds: () => Promise<string[]> } }).query().fetchIds();
+      index.set(tableName, new Set(existingIds));
+    } catch {
+      // Index unavailable for this table — transformer falls back to all-updated
+    }
+  }
+
+  return index;
+}
+
+/**
+ * Normalize the server pull payload into the shape WatermelonDB's
+ * synchronize() consumes: { [tableName]: { created, updated, deleted } }.
+ *
+ * Task 33-E — DUAL SHAPE (the v2 mismatch crashed every non-empty pull page
+ * with "Cannot read properties of undefined (reading 'map')"):
+ *   - v2 { changed: [...full rows...], deleted: [...ids] } (cloud)
+ *   - legacy { created, updated, deleted } (LAN/desktop)
+ *
+ * v2 mapping: WDB treats created vs updated identically EXCEPT for records
+ * that are locally soft-deleted (created recreates them; updated defers to
+ * the local deletion and pushes it later). When a local existence index is
+ * available, rows are split by existence (existing → updated, new → created);
+ * without it every row goes into `updated`, which WDB applies as a true
+ * upsert (missing rows are created). Zero data loss either way.
+ */
+export function transformPullChanges(
+  serverChanges: Record<string, PullPageBucket> | null | undefined,
+  opts: { localIdIndex?: Map<string, Set<string>> | null } = {},
 ): Record<string, { created: any[]; updated: any[]; deleted: string[] }> {
   const result: Record<string, { created: any[]; updated: any[]; deleted: string[] }> = {};
 
-  for (const [modelName, modelChanges] of Object.entries(serverChanges)) {
-    const tableName = modelNameToTableName(modelName);
+  // Crash guard: empty/undefined serverChanges → empty change set (no throw).
+  if (!serverChanges || typeof serverChanges !== 'object') return result;
 
-    result[tableName] = {
-      created: modelChanges.created.map(transformRecord),
-      updated: modelChanges.updated.map(transformRecord),
-      deleted: modelChanges.deleted,
-    };
+  for (const [modelName, modelChanges] of Object.entries(serverChanges)) {
+    const mc = (modelChanges && typeof modelChanges === 'object' ? modelChanges : {}) as PullPageBucket;
+    const tableName = modelNameToTableName(modelName);
+    // Crash guard: every array access defaults to [] (never trust the wire).
+    const deleted = (Array.isArray(mc.deleted) ? mc.deleted : []).filter(
+      (id): id is string => typeof id === 'string',
+    );
+
+    if (Array.isArray(mc.changed)) {
+      // protocol-v2: rows carry the FULL record (no op flag).
+      const changed = mc.changed.filter(isSyncRow);
+      const index = opts.localIdIndex?.get(tableName);
+      const created: any[] = [];
+      const updated: any[] = [];
+      for (const row of changed) {
+        if (index ? index.has(row.id as string) : true) {
+          updated.push(transformRecord(row));
+        } else {
+          created.push(transformRecord(row));
+        }
+      }
+      result[tableName] = { created, updated, deleted };
+    } else {
+      // Legacy LAN shape — created/updated kept as-is (existing behavior).
+      result[tableName] = {
+        created: (Array.isArray(mc.created) ? mc.created : []).filter(isSyncRow).map(transformRecord),
+        updated: (Array.isArray(mc.updated) ? mc.updated : []).filter(isSyncRow).map(transformRecord),
+        deleted,
+      };
+    }
   }
 
   return result;
+}
+
+/** WDB requires raw rows to be objects with an id (validateRemoteRaw). */
+function isSyncRow(row: unknown): row is Record<string, unknown> {
+  return !!row && typeof row === 'object' && typeof (row as Record<string, unknown>).id === 'string';
 }
 
 function modelNameToTableName(modelName: string): string {

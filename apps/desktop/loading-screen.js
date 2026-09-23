@@ -1395,11 +1395,20 @@ async function runDiagnostics(mainWindow, config) {
     //                         not gate launch on their own.
     if (workspaceVerifiedReady) {
       for (const r of results) {
-        if (r.status === 'error' && STEP_CATEGORY[r.step] === 'CONNECTIVITY') {
+        // Task 33-C: an explicit AUTH rejection (the reachable cloud confirmed
+        // the session is no longer authorized) is NEVER downgraded — a READY
+        // workspace with a revoked authorization is NOT usable, and hiding
+        // the failure behind the offline-first downgrade would resurrect the
+        // exact "stale account served normally" incident.
+        const authRejectedFailure = r.authRejected === true ||
+          (r.detail && (r.detail.authRejected === true || r.detail.code === 'AUTHORIZATION_REVOKED'));
+        if (r.status === 'error' && STEP_CATEGORY[r.step] === 'CONNECTIVITY' && !authRejectedFailure) {
           r.status = 'warning';
           r.downgradedFromError = true;
           r.message = `${r.message} — [مساحة العمل جاهزة: يعمل محليًا، المزامنة ستُستأنف تلقائيًا]`;
           console.log(`[Diagnostics] Launch gate: ${r.step} error DOWNGRADED to warning — workspace is READY, cloud unavailability degrades synchronization, not the desktop (offline-first). Local queue remains fully usable; the engine replays automatically when connectivity returns.`);
+        } else if (r.status === 'error' && authRejectedFailure) {
+          console.log(`[Diagnostics] Launch gate: ${r.step} auth-rejected failure is NEVER downgraded — the workspace authorization is revoked, re-login required.`);
         }
       }
     } else {
@@ -1504,6 +1513,94 @@ async function runDiagnostics(mainWindow, config) {
         }
       }
     } catch { /* default remains auto-restore */ }
+  }
+
+  if (storedAuth && storedAuth.token && storedAuth.user) {
+    cloudAuthToken = storedAuth.token;
+    cloudUser = storedAuth.user;
+    agencyId = cloudUser.agencyId || null;
+  }
+
+  // ── 0c. Stored authorization revalidation (Task 33-C) ──────────────────
+  // A persisted REVOKED status means the cloud ALREADY confirmed (on a
+  // previous run) that this session is no longer authorized. The stale
+  // session must NOT be restored; instead the cloud gets exactly ONE chance
+  // to revalidate: reachable + refresh 200 → the lock clears and the flow
+  // continues with the REFRESHED session (revalidation-on-reconnect);
+  // reachable + refresh 401/403 → the lock stands and the startup verdict
+  // becomes an explicit AUTH-REJECTED failure; unreachable → the lock stands
+  // (offline-first: no session restored, the login screen will need internet).
+  let authRejectedAtStartup = null; // { confirmed, reason, httpStatus?, cloudReachable }
+  if (storedAuth && storedAuth.token) {
+    let storedAuthzRevoked = false;
+    let storedAuthzReason = null;
+    try {
+      const { localDb: authzDb } = require('./local-api/lib/db');
+      if (authzDb) {
+        const authzRows = await authzDb.$queryRawUnsafe(
+          "SELECT key, value FROM \"_sync_meta\" WHERE key IN ('authorization_status', 'authorization_reason')"
+        ).catch(() => null);
+        for (const row of authzRows || []) {
+          if (row.key === 'authorization_status' && String(row.value) === 'REVOKED') storedAuthzRevoked = true;
+          if (row.key === 'authorization_reason' && row.value) storedAuthzReason = String(row.value);
+        }
+      }
+    } catch { /* best-effort read — the import-session gate below still protects */ }
+
+    if (storedAuthzRevoked) {
+      console.log('[Diagnostics] Stored authorization REVOKED — re-login required');
+      sendUpdate(mainWindow, { log: '[INFO] تم إلغاء تصريح هذا الحساب — يُرجى تسجيل الدخول من جديد (this account is no longer authorized — please sign in again)', logType: 'warn' });
+
+      // Revalidation-on-reconnect: one refresh attempt against the cloud.
+      let cloudReachableNow = false;
+      try {
+        const healthProbe = await probeUrl(`${cloudBaseUrl}/api/health`, 5000);
+        cloudReachableNow = !!(healthProbe.reachable && healthProbe.statusCode === 200);
+      } catch { cloudReachableNow = false; }
+
+      let revalidated = false;
+      if (cloudReachableNow) {
+        const revRes = await postAuthUrl(`${cloudBaseUrl}/api/auth/refresh-session`, {}, storedAuth.token, 8000);
+        if (revRes.reachable && revRes.statusCode === 200 && revRes.json && revRes.json.success && revRes.json.token && revRes.json.user) {
+          // Fresh proof of authorization — clear the lock and continue with
+          // the REFRESHED session (the stale token stays rejected forever).
+          try {
+            const { localDb: clearDb } = require('./local-api/lib/db');
+            await clearDb.$executeRawUnsafe(
+              "INSERT INTO \"_sync_meta\" (key, value) VALUES ('authorization_status', 'AUTHORIZED') ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            );
+          } catch (clearErr) {
+            console.warn('[Diagnostics] Could not clear REVOKED meta:', clearErr.message);
+          }
+          storedAuth = { token: revRes.json.token, user: revRes.json.user };
+          storedAuthzRevoked = false;
+          revalidated = true;
+          console.log('[Diagnostics] Stored authorization REVALIDATED via cloud refresh — lock cleared, continuing with the refreshed session');
+          sendUpdate(mainWindow, { log: '[OK] تم استعادة التصريح من السحابة — متابعة بالجلسة المحدثة', logType: 'ok' });
+        } else if (revRes.reachable && (revRes.statusCode === 401 || revRes.statusCode === 403)) {
+          // The reachable cloud confirmed the rejection AGAIN — the lock stands.
+          const bodyMsg = (revRes.json && (revRes.json.error || revRes.json.message)) || '';
+          const reason = String(bodyMsg).indexOf('Account not found') !== -1
+            ? 'account-not-found'
+            : (storedAuthzReason || 'token-rejected');
+          authRejectedAtStartup = { confirmed: true, reason, httpStatus: revRes.statusCode, cloudReachable: true };
+          console.log(`[Diagnostics] Cloud confirmed the rejection (HTTP ${revRes.statusCode}) — authorization stays REVOKED (${reason})`);
+        } else {
+          // Unreachable / inconclusive between the health probe and the
+          // refresh — the lock stands, nothing is restored.
+          authRejectedAtStartup = { confirmed: false, reason: storedAuthzReason || 'token-rejected', cloudReachable: false };
+          console.log('[Diagnostics] Cloud unreachable for the revalidation refresh — REVOKED status kept, stale session NOT restored');
+        }
+      } else {
+        authRejectedAtStartup = { confirmed: false, reason: storedAuthzReason || 'token-rejected', cloudReachable: false };
+        console.log('[Diagnostics] Cloud unreachable at startup — REVOKED status kept, stale session NOT restored');
+      }
+
+      if (storedAuthzRevoked && !revalidated) {
+        // NEVER auto-restore a locked session.
+        storedAuth = null;
+      }
+    }
   }
 
   if (storedAuth && storedAuth.token && storedAuth.user) {
@@ -1877,6 +1974,33 @@ async function runDiagnostics(mainWindow, config) {
     sendUpdate(mainWindow, { log: `[WARN] Cloud check error: ${err.message}`, logType: 'fail' });
   }
 
+  // ── Task 33-C: an explicit AUTH rejection is NEVER downgradable/hideable ──
+  // When the reachable cloud confirmed the stored session is no longer
+  // authorized (startup revalidation or the import below), the cloud-api step
+  // becomes a FATAL, non-downgradable failure with a bilingual human message.
+  // main.js routes this verdict to the login screen instead of a dead-end
+  // gate (see runStartupDiagnostics auth-rejected routing).
+  if (authRejectedAtStartup && authRejectedAtStartup.confirmed) {
+    cloudAvailable = true; // the origin IS reachable — the ACCOUNT is the problem
+    cloudResult = {
+      step: 'cloud-api',
+      status: 'error',
+      message: 'تم إلغاء تصريح هذا الحساب — يُرجى تسجيل الدخول من جديد / This account is no longer authorized — please sign in again',
+      detail: {
+        url: cloudBaseUrl,
+        authRejected: true,
+        reason: authRejectedAtStartup.reason || 'token-rejected',
+        httpStatus: authRejectedAtStartup.httpStatus || undefined,
+        cloudReachable: true,
+      },
+      authRejected: true,
+    };
+    sendUpdate(mainWindow, {
+      log: '[FAIL] Cloud rejected the stored session — sign in again (this failure is never downgraded while the workspace is locked)',
+      logType: 'fail',
+    });
+  }
+
   pushResult(cloudResult);
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -1965,6 +2089,28 @@ async function runDiagnostics(mainWindow, config) {
         user: cloudUser,
       });
       if (importSession.reachable && importSession.json?.success) {
+        // Task 33-C: the local API may have CLOUD-VALIDATED the presented
+        // token and adopted a REFRESHED token+user (current agencyId/role).
+        // Use the adopted session for every later step and persist it so the
+        // NEXT launch starts fresh too.
+        const adoptedToken = importSession.json.token || cloudAuthToken;
+        const adoptedUser = importSession.json.user || cloudUser;
+        if (adoptedToken !== cloudAuthToken || adoptedUser !== cloudUser) {
+          console.log('[Diagnostics] import-session adopted a cloud-validated session — updating the stored session');
+          cloudAuthToken = adoptedToken;
+          cloudUser = adoptedUser;
+          agencyId = cloudUser.agencyId || agencyId;
+          try {
+            const pathMod = require('path');
+            const fs = require('fs');
+            fs.writeFileSync(
+              pathMod.join(userDataPath, 'blasti-auth.json'),
+              JSON.stringify({ token: cloudAuthToken, user: cloudUser }, null, 2),
+            );
+          } catch (persistErr) {
+            console.warn('[Diagnostics] Adopted session persist failed (non-fatal):', persistErr.message);
+          }
+        }
         localApiToken = cloudAuthToken;
         sessionImported = true;
         sendUpdate(mainWindow, {
@@ -1978,30 +2124,59 @@ async function runDiagnostics(mainWindow, config) {
           logType: 'warn',
         });
         console.log(`[Diagnostics] Session import failed: POST ${importUrl} → HTTP ${importSession.statusCode || 'n/a'} | body: ${importBody || '(none)'} | local identity: ${localIdentity ? localIdentity.service : 'unrecognized'}`);
-        // ── Isolation hint + in-process fallback ─────────────────────────
-        // POST /api/auth/import-session is registered in THIS checkout; a 404
-        // from the local notFound handler means the RUNNING local-api code is
-        // older than this checkout (stale process or stale file). Recover by
-        // importing the session directly in-process — the same primitives the
-        // IPC handlers (local-api:set-session / cloud-sync:set-auth) use:
-        try {
-          const localApiModule = require('./local-api/index');
-          localApiModule.setSession(cloudAuthToken, cloudUser);
-          try {
-            const syncServiceModule = require('./local-api/sync-service');
-            syncServiceModule.setAuth(cloudAuthToken, cloudUser);
-          } catch (authErr) {
-            console.warn('[Diagnostics] SyncService setAuth fallback skipped:', authErr.message);
-          }
-          localApiToken = cloudAuthToken;
-          sessionImported = true;
-          console.log(`[Diagnostics] Session import FALLBACK via in-process setSession+setAuth succeeded — user: ${cloudUser.username || cloudUser.email || cloudUser.id || 'unknown'}`);
+
+        // ── Task 33-C: the import was REJECTED by the workspace lock or the
+        // cloud validator (401/403 AUTHORIZATION_REVOKED) — the session is
+        // NOT restored, the revocation is already applied inside the local
+        // API, and the cloud-api step becomes a fatal AUTH-REJECTED failure.
+        if (
+          importSession.reachable &&
+          (importSession.statusCode === 401 || importSession.statusCode === 403) &&
+          importSession.json && importSession.json.code === 'AUTHORIZATION_REVOKED'
+        ) {
+          const reason = (importSession.json && importSession.json.reason) || 'token-rejected';
+          authRejectedAtStartup = { confirmed: true, reason, httpStatus: importSession.statusCode, cloudReachable: true };
+          cloudResult.status = 'error';
+          cloudResult.authRejected = true;
+          cloudResult.message = 'تم إلغاء تصريح هذا الحساب — يُرجى تسجيل الدخول من جديد / This account is no longer authorized — please sign in again';
+          cloudResult.detail = {
+            url: cloudBaseUrl,
+            authRejected: true,
+            reason,
+            httpStatus: importSession.statusCode,
+            source: 'import-session',
+          };
           sendUpdate(mainWindow, {
-            log: `[OK] Session restored via in-process fallback (HTTP import was rejected) — user: ${cloudUser.username || cloudUser.email}`,
-            logType: 'ok',
+            log: '[FAIL] Cloud rejected the stored session — sign in again (stale session NOT restored)',
+            logType: 'fail',
           });
-        } catch (fallbackErr) {
-          console.error('[Diagnostics] Session fallback FAILED:', fallbackErr.message);
+        } else {
+          // ── Isolation hint + in-process fallback ───────────────────────
+          // POST /api/auth/import-session is registered in THIS checkout; a 404
+          // from the local notFound handler means the RUNNING local-api code is
+          // older than this checkout (stale process or stale file). Recover by
+          // importing the session directly in-process — the same primitives the
+          // IPC handlers (local-api:set-session / cloud-sync:set-auth) use:
+          // ONLY for 404/unreachable — never for an explicit rejection above.
+          try {
+            const localApiModule = require('./local-api/index');
+            localApiModule.setSession(cloudAuthToken, cloudUser);
+            try {
+              const syncServiceModule = require('./local-api/sync-service');
+              syncServiceModule.setAuth(cloudAuthToken, cloudUser);
+            } catch (authErr) {
+              console.warn('[Diagnostics] SyncService setAuth fallback skipped:', authErr.message);
+            }
+            localApiToken = cloudAuthToken;
+            sessionImported = true;
+            console.log(`[Diagnostics] Session import FALLBACK via in-process setSession+setAuth succeeded — user: ${cloudUser.username || cloudUser.email || cloudUser.id || 'unknown'}`);
+            sendUpdate(mainWindow, {
+              log: `[OK] Session restored via in-process fallback (HTTP import was rejected) — user: ${cloudUser.username || cloudUser.email}`,
+              logType: 'ok',
+            });
+          } catch (fallbackErr) {
+            console.error('[Diagnostics] Session fallback FAILED:', fallbackErr.message);
+          }
         }
       }
     } catch (e) {
@@ -2023,9 +2198,38 @@ async function runDiagnostics(mainWindow, config) {
     try {
       const refreshUrl = `http://127.0.0.1:${localApiPort}/api/auth/refresh-session`;
       const refreshRes = await postAuthUrl(refreshUrl, {}, cloudAuthToken, 10000);
-      if (refreshRes.reachable && refreshRes.statusCode === 401) {
-        console.warn('[Diagnostics] Session refresh → 401: the cloud does not know this account (ghost/expired token) — re-login required');
-        sendUpdate(mainWindow, { log: '[WARN] انتهت صلاحية الجلسة أو الحساب غير موجود في السحابة — أعد تسجيل الدخول', logType: 'warn' });
+      if (refreshRes.reachable && (refreshRes.statusCode === 401 || refreshRes.statusCode === 403)) {
+        // ── Task 33-C: the reachable cloud REJECTED the session at startup ──
+        // NEVER continue with the stale session (the incident's core
+        // failure). Trigger the local revocation directly (the local API
+        // module is already loaded in this process), then surface an honest,
+        // NON-DOWNGRADABLE auth-rejected failure.
+        console.warn(`[Diagnostics] Session refresh → ${refreshRes.statusCode}: the cloud rejects this account — triggering local revocation (workspace LOCKED)`);
+        try {
+          const localApiModule = require('./local-api/index');
+          if (typeof localApiModule.revokeLocalAuthorization === 'function') {
+            const rejectMsg = (refreshRes.json && (refreshRes.json.error || refreshRes.json.message)) || '';
+            await localApiModule.revokeLocalAuthorization(
+              String(rejectMsg).indexOf('Account not found') !== -1 ? 'account-not-found' : 'token-rejected'
+            );
+          }
+        } catch (revokeErr) {
+          console.error('[Diagnostics] Local revocation trigger failed:', revokeErr.message);
+        }
+        authRejectedAtStartup = { confirmed: true, reason: (authRejectedAtStartup && authRejectedAtStartup.reason) || 'token-rejected', httpStatus: refreshRes.statusCode, cloudReachable: true };
+        sessionImported = false;
+        localApiToken = null;
+        cloudResult.status = 'error';
+        cloudResult.authRejected = true;
+        cloudResult.message = 'تم إلغاء تصريح هذا الحساب — يُرجى تسجيل الدخول من جديد / This account is no longer authorized — please sign in again';
+        cloudResult.detail = {
+          url: cloudBaseUrl,
+          authRejected: true,
+          reason: authRejectedAtStartup.reason,
+          httpStatus: refreshRes.statusCode,
+          source: 'startup-refresh',
+        };
+        sendUpdate(mainWindow, { log: '[FAIL] تم إلغاء تصريح هذا الحساب — يُرجى تسجيل الدخول من جديد / This account is no longer authorized — please sign in again', logType: 'fail' });
       } else if (refreshRes.reachable && refreshRes.json && refreshRes.json.success && refreshRes.json.token && refreshRes.json.user) {
         const prevAgencyId = agencyId;
         cloudAuthToken = refreshRes.json.token;
@@ -2076,8 +2280,11 @@ async function runDiagnostics(mainWindow, config) {
   // rate-limited, and delegates the import to initial-sync.js (the single
   // initialization owner). A "cloud unavailable" verdict can no longer
   // wedge the workspace — it only defers it to the next trigger.
+  // Task 33-C: never run the initializer with a session the cloud just
+  // rejected — the workspace is locked and re-login owns recovery.
   const mustRunSync = hasStoredSession && localApiPort
-    && serverResult.status === 'success' && !alreadyReady;
+    && serverResult.status === 'success' && !alreadyReady
+    && !authRejectedAtStartup;
 
   let syncOutcome = null; // { success, totalRecords?, error?, alreadyInitialized?, skipped? }
   let syncAttempted = false;
