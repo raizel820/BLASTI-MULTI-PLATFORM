@@ -120,7 +120,12 @@ export const updateAgencyProfileSchema = z.object({
 })
 
 export const updateAgencySettingsSchema = z.object({
+  // Task 37: maxReservations is the PRIMARY capacity key (what GET /settings
+  // returns and what the UI PATCHes back). maxQueueSize is kept as a legacy
+  // alias for older clients. The route resolves:
+  //   maxQueueSize = data.maxQueueSize ?? data.maxReservations
   maxQueueSize: z.number().int().min(1).max(1000).optional(),
+  maxReservations: z.number().int().min(1).max(1000).optional(),
   avgServiceTime: z.number().int().min(1).max(480).optional(),
   sponsorSms: z.boolean().optional(),
   smsBalance: z.number().int().min(0).optional(),

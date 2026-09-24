@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useAppStore, updateDocumentDirection, hydrateFromSession, setViewFromHash, parseHashToView, parseJoinCodeFromHash, updateHashForView, isHashChangeSuppressed } from '@/store/use-app-store';
 import { isRevoked, setRevoked, clearRevoked } from '@/lib/authz-state';
+import { adoptImportedLocalSessionUser } from '@/lib/session-heal';
 import { Loader2 } from 'lucide-react';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -103,13 +104,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           if (w.electronAPI?.setLocalApiSession) {
             w.electronAPI.setLocalApiSession({ token, user: store.user });
           }
-          // 2. Also call HTTP import-session as backup
-          fetch('http://127.0.0.1:3080/api/auth/import-session', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'omit',
-            body: JSON.stringify({ token, user: store.user }),
-          }).catch(() => { /* non-critical */ });
+          // 2. Also call HTTP import-session as backup. Task 37-a: ADOPT the
+          //    refreshed user the local API returns after its cloud validation
+          //    — the response used to be discarded, leaving the persisted
+          //    user (and its agencyId) stale while the local session moved on
+          //    (the root cause of the desktop branch list showing nothing).
+          //    Only success:false responses (e.g. AUTHORIZATION_REVOKED)
+          //    carry no user — the adoption helper no-ops on them, so the
+          //    Task 33-E revoked handling above is unaffected.
+          (async () => {
+            try {
+              const res = await fetch('http://127.0.0.1:3080/api/auth/import-session', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'omit',
+                body: JSON.stringify({ token, user: store.user }),
+              });
+              if (!res.ok) return; // non-critical — offline / rejected
+              const data = await res.json().catch(() => null);
+              await adoptImportedLocalSessionUser(data);
+            } catch { /* non-critical */ }
+          })();
         }
         setSessionChecked(true);
         return;

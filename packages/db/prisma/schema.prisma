@@ -446,6 +446,9 @@ model AgencyStaff {
   branchId    String?
   role        String   @default("STAFF")
   /// Phase 2: Normalized permissions as boolean columns (replacing JSON string)
+  /// Task 37-c: canManageQueue + canViewAnalytics are ALWAYS-SHARED authorities
+  /// (both tiers default true); the 4 columns below are the MANAGER-tier
+  /// authorities an owner can grant/limit per staff member.
   canManageQueue       Boolean @default(true)
   canManageServices    Boolean @default(false)
   canManageStaff       Boolean @default(false)
@@ -454,6 +457,11 @@ model AgencyStaff {
   canManageWorkingHours Boolean @default(false)
   canExportData        Boolean @default(false)
   canManageProfile     Boolean @default(false)
+  /// Task 37-c: 2-tier staff authority — manager-only grants (owner-limited).
+  canCreateBranches       Boolean @default(false)
+  canDeleteBranches       Boolean @default(false)
+  canPurchaseSubscription Boolean @default(false)
+  canManageSubscription   Boolean @default(false)
   /// Legacy JSON permissions field — kept for backward compatibility, migrated from on startup
   permissions String   @default("{\"canManageQueue\":true,\"canManageServices\":false,\"canManageStaff\":false,\"canViewAnalytics\":true,\"canManageBranches\":false,\"canManageWorkingHours\":false,\"canExportData\":false,\"canManageProfile\":false}")
   isActive    Boolean  @default(true)
@@ -787,6 +795,11 @@ model Counter {
   branch               Branch       @relation(fields: [branchId], references: [id], onDelete: Cascade)
   staffId              String?
   staff                AgencyStaff? @relation(fields: [staffId], references: [id])
+  /// Task 37-c: counter OCCUPATION timestamp. `staffId` is repurposed as
+  /// "occupied by" (no new staff relation column): staff occupation sets BOTH
+  /// staffId + occupiedAt; an owner occupation sets occupiedAt ONLY. Release
+  /// clears staffId (when it was the releaser's) + occupiedAt=null.
+  occupiedAt           DateTime?
   currentReservationId String?       @unique
   currentReservation   Reservation?  @relation("CurrentReservation", fields: [currentReservationId], references: [id])
   createdAt            DateTime     @default(now())

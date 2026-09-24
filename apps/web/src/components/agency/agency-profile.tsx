@@ -65,6 +65,10 @@ interface AgencyInfo {
   workingHoursStart?: string;
   workingHoursEnd?: string;
   workingDays?: string;
+  // Task 37: real queue state from GET /api/agency/profile. Optional so the
+  // component still renders against older payloads (desktop local API).
+  isQueueOpen?: boolean;
+  queuePaused?: boolean;
 }
 
 const categoryOptions: { value: string; key: TranslationKeys }[] = [
@@ -324,17 +328,45 @@ export function AgencyProfile() {
                   {isCurrentlyOpen ? t('openNow') : t('closed')}
                 </Badge>
               )}
-              {/* Queue Status Badge */}
-              <Badge className="bg-white/20 text-white border-white/30 text-xs px-2.5 py-1">
-                <motion.span
-                  animate={{ scale: [1, 1.2, 1] }}
-                  transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
-                  className="inline-flex items-center gap-1"
-                >
-                  <Radio className="h-3 w-3" />
-                  {t('queueActive') || 'Queue Active'}
-                </motion.span>
-              </Badge>
+              {/* Queue Status Badge — Task 37: renders the REAL queue state
+                  (paused / closed / active) instead of a hardcoded
+                  "Queue Active". When the payload carries no isQueueOpen
+                  (older desktop builds), the legacy always-active badge is
+                  preserved. */}
+              {profile?.queuePaused === true ? (
+                <Badge className="bg-amber-400/20 text-white border-amber-400/30 text-xs px-2.5 py-1">
+                  <motion.span
+                    animate={{ scale: [1, 1.2, 1] }}
+                    transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
+                    className="inline-flex items-center gap-1"
+                  >
+                    <Radio className="h-3 w-3" />
+                    {t('queuePaused')}
+                  </motion.span>
+                </Badge>
+              ) : profile?.isQueueOpen === false ? (
+                <Badge className="bg-red-400/20 text-white border-red-400/30 text-xs px-2.5 py-1">
+                  <motion.span
+                    animate={{ scale: [1, 1.2, 1] }}
+                    transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
+                    className="inline-flex items-center gap-1"
+                  >
+                    <Radio className="h-3 w-3" />
+                    {t('queueClosed')}
+                  </motion.span>
+                </Badge>
+              ) : (
+                <Badge className="bg-white/20 text-white border-white/30 text-xs px-2.5 py-1">
+                  <motion.span
+                    animate={{ scale: [1, 1.2, 1] }}
+                    transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
+                    className="inline-flex items-center gap-1"
+                  >
+                    <Radio className="h-3 w-3" />
+                    {t('queueActive') || 'Queue Active'}
+                  </motion.span>
+                </Badge>
+              )}
             </div>
             <div className="absolute -bottom-12 start-5">
               {/* Animated agency logo/icon with floating animation */}

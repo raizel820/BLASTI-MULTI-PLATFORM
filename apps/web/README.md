@@ -221,8 +221,8 @@ The `ApiClient` class automatically resolves the correct base URL based on the r
 | Runtime | Base URL | Auth Method |
 |---|---|---|
 | **Web (browser)** | `""` (relative/same-origin) | Session cookie (automatic) |
-| **Electron** | `NEXT_PUBLIC_API_URL` or `https://blasti.vercel.app` | `Authorization: Bearer <token>` |
-| **Capacitor** | `NEXT_PUBLIC_API_URL` or `https://blasti.vercel.app` | `Authorization: Bearer <token>` |
+| **Electron** | `NEXT_PUBLIC_API_URL` or `BLASTI_CLOUD_URL` | `Authorization: Bearer <token>` |
+| **Capacitor** | `NEXT_PUBLIC_API_URL` or `BLASTI_CLOUD_URL` | `Authorization: Bearer <token>` |
 | **SSR (server)** | `INTERNAL_API_URL` or `http://localhost:3000` | Cookie forwarding |
 
 ### Features

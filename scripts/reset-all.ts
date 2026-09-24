@@ -15,7 +15,8 @@
  *    → includes ALL tokens, sessions, verification codes, device registrations,
  *      sync state, transactions (everything lives in the DB).
  *    Then recreated with `prisma db push` + the fresh-start seed, which creates
- *    EXACTLY ONE account: the super admin (admin / admin123).
+ *    the super admin (admin / admin123) and ONE fresh agency account
+ *    (owner / owner123 — agency "My Agency", code MYA, no other data).
  * 2. Uploaded user files (images, PDFs, receipts, avatars, logos…):
  *      apps/api/uploads/<bucket>/…     buckets: avatar, logo, receipt, document, general
  *      apps/web/public/uploads/…       (legacy upload location)
@@ -41,14 +42,18 @@
  *   --wipe-app-binaries is passed.
  * • Source code, .env files, prisma schema.
  *
- * ⚠️  STOP the BLASTI apps first (bun run dev and the Electron desktop app):
- *     files held open by a running process cannot be deleted (EBUSY on Windows).
- *     Afterwards: restart bun run dev, and FULLY restart the desktop app — it
- *     will show the login screen. Browser sessions are invalidated too (the
- *     accounts behind them no longer exist) — just log in again as admin.
+ * ⚠️  Safe to run while the services are UP (Linux/macOS): the running cloud
+ *     API hot-swaps onto the fresh database automatically — old session tokens
+ *     are rejected from the moment the reset starts, and the fresh file is
+ *     adopted within ~2s (no restart needed). On Windows the DB file may be
+ *     EBUSY-locked by a running app — close the apps in that case.
+ *     The Electron desktop app must still be FULLY restarted (or just
+ *     re-logged-in) — and it needs a REBUILT bundle to contain the newer
+ *     revocation logic (see worklog Tasks 33/35).
  */
 
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -67,12 +72,54 @@ const doCloudFiles = !DESKTOP_ONLY;
 const doDesktop = !CLOUD_ONLY && !FILES_ONLY;
 
 const DB_FILE = path.join(ROOT, 'packages', 'db', 'data', 'custom.db');
+const DB_GENERATION_FILE = path.join(ROOT, 'packages', 'db', 'data', '.db-generation.json');
 const API_UPLOADS = path.join(ROOT, 'apps', 'api', 'uploads');
 const WEB_LEGACY_UPLOADS = path.join(ROOT, 'apps', 'web', 'public', 'uploads');
 const TMP_LEGACY_APP_UPLOADS = path.join(os.tmpdir(), 'blasti-app-uploads');
 const SCHEMA_STAMP = path.join(ROOT, 'packages', 'db', '.schema-stamp');
 
 const failures: string[] = [];
+
+/**
+ * Token/DB-generation marker consumed by packages/db (watcher + apps/api
+ * auth guard). Phase 1 (ready:false) is written the moment the old DB file
+ * is gone: every session JWT issued before `epoch` is rejected from then on.
+ * Phase 2 (ready:true) is written after the fresh seed: the running API's
+ * watcher hot-swaps its Prisma client onto the recreated file within ~1s.
+ */
+function writeGenerationFile(epoch: number, ready: boolean): void {
+  try {
+    fs.writeFileSync(DB_GENERATION_FILE, `${JSON.stringify({ epoch, ready }, null, 2)}\n`);
+    console.log(
+      ready
+        ? `   🔓  invalidation epoch ${epoch} armed — pre-reset session tokens are now rejected`
+        : `   🔓  invalidation epoch ${epoch} written — ALL pre-reset session tokens are dead`,
+    );
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code ?? 'UNKNOWN';
+    failures.push('.db-generation.json (token-invalidation marker)');
+    console.warn(
+      `   ⚠️  could not write the token-invalidation marker (${code}) — ` +
+      'restart the API after the reset so old sessions are refused',
+    );
+  }
+}
+
+function isPortOpen(port: number): Promise<boolean> {
+  return new Promise((resolvePort) => {
+    const socket = new net.Socket();
+    const finish = (open: boolean) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolvePort(open);
+    };
+    socket.setTimeout(400);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+    socket.connect(port, '127.0.0.1');
+  });
+}
 
 function rm(target: string, label: string): void {
   try {
@@ -136,8 +183,8 @@ function runBunStep(stepArgs: string[], cwd: string, label: string): void {
 console.log('════════════════════════════════════════════════════════════');
 console.log('  BLASTI MULTI — FULL RESET');
 console.log('  Permanently deletes ALL databases, tokens, sessions and');
-console.log('  uploaded files. Only the super-admin account is recreated.');
-if (doCloudDb) console.log('  • cloud database (packages/db/data/custom.db)');
+console.log('  uploaded files. Only the super-admin and one fresh agency owner are recreated.');
+if (doCloudDb) console.log('  • cloud database (packages/db/data/custom.db) + ALL tokens/sessions');
 if (doCloudFiles) console.log('  • uploaded files (apps/api/uploads + apps/web/public/uploads)');
 if (doDesktop) console.log('  • desktop local data (local DB + files + stored session)');
 console.log('════════════════════════════════════════════════════════════');
@@ -151,17 +198,33 @@ if (!ASSUME_YES) {
 }
 console.log('');
 
+const apiWasRunning = doCloudDb ? await isPortOpen(3003) : false;
+if (apiWasRunning) {
+  console.log('ℹ️  Cloud API detected on :3003 — it will adopt the fresh database automatically');
+  console.log('   (hot-swap) and old sessions are invalidated the moment the reset starts.');
+  console.log('');
+}
+
 // ─── 1. Cloud database ─────────────────────────────────────────────────────────
 if (doCloudDb) {
-  console.log('🗄  [1/3] Cloud database');
+  console.log('🗄  [1/3] Cloud database (DB + tokens + sessions)');
   for (const suffix of ['', '-journal', '-wal', '-shm']) {
     rm(`${DB_FILE}${suffix}`, `packages/db/data/custom.db${suffix}`);
   }
   // Defensive: force dev-api.cjs to re-run `prisma db push` on next start.
   rm(SCHEMA_STAMP, 'packages/db/.schema-stamp');
 
+  // Phase 1: invalidate every pre-reset session token IMMEDIATELY (stateless
+  // JWTs would otherwise survive the wipe until each client re-authenticates).
+  const resetEpoch = Date.now();
+  writeGenerationFile(resetEpoch, false);
+
   runBunStep(['run', 'db:push'], path.join(ROOT, 'packages', 'db'), 'prisma db push (recreate empty schema)');
-  runBunStep(['run', 'db:seed'], path.join(ROOT, 'packages', 'db'), 'fresh-start seed (super admin only)');
+  runBunStep(['run', 'db:seed'], path.join(ROOT, 'packages', 'db'), 'fresh-start seed (admin + fresh agency)');
+
+  // Phase 2: the running API's generation watcher hot-swaps its DB client
+  // onto the freshly recreated file — no restart required.
+  writeGenerationFile(resetEpoch, true);
 }
 
 // ─── 2. Uploaded user files ────────────────────────────────────────────────────
@@ -211,11 +274,21 @@ if (failures.length > 0) {
 }
 console.log('✅ RESET COMPLETE — the platform is FRESH.');
 console.log('');
-console.log('   👤 Only account:  admin / admin123  (admin@blasti.dz)');
+console.log('   👤 Super Admin:   admin / admin123  (admin@blasti.dz)');
+console.log('   👤 Agency Owner:  owner / owner123  (owner@blasti.dz)');
+console.log('   🏢 Fresh agency:  "My Agency" (code MYA) — FREE tier, no branches/services/staff');
+console.log('');
+console.log('   All pre-reset tokens/sessions were invalidated the moment the reset');
+console.log('   started — desktops/browsers show the login screen on next use.');
+if (apiWasRunning) {
+  console.log('   ♻  The cloud API was running — it already adopted the fresh database');
+  console.log('      automatically (hot-swap). A restart is optional, not required.');
+}
 console.log('');
 console.log('   Next steps:');
-console.log('   1. Start/restart the services:  bun run dev');
+console.log('   1. Start the services if they were stopped:  bun run dev');
 console.log('   2. FULLY restart the Electron desktop app → it shows the login screen');
-console.log('   3. In browsers, old sessions are invalid — log in again as admin');
-console.log('   4. Register new agency/customer accounts from scratch');
+console.log('      (an INSTALLED desktop build must be rebuilt first: bun run build:desktop)');
+console.log('   3. In browsers, just log in again (admin or the fresh agency owner)');
+console.log('   4. Register additional agency/customer accounts from scratch');
 console.log('════════════════════════════════════════════════════════════');

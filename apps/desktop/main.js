@@ -28,6 +28,7 @@ const {
   Tray,
   Menu,
   session,
+  dialog,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
@@ -258,7 +259,72 @@ let discoveryInterval = null;
 const gotTheLock = app.requestSingleInstanceLock();
 
 if (!gotTheLock) {
-  app.quit();
+  // Task 42: a second launch usually just means "the app is in the tray —
+  // show its window" (the running instance restores its window through its
+  // second-instance handler and this process quits silently). BUT when the
+  // ALREADY-RUNNING instance is an OLDER BUILD (e.g. left in the tray across
+  // an app update), silently quitting makes the user believe they just
+  // launched the NEW build while they keep testing the OLD one — the exact
+  // "rebuilt but the old bug is still there" loop reported repeatedly for the
+  // desktop branch list. Detect the running instance's build identity via its
+  // local API health endpoint and warn LOUDLY when it is stale/old.
+  // (Node http — Electron's net module is only usable after the ready event;
+  // dialog.showErrorBox is explicitly safe before ready.)
+  ;(async () => {
+    try {
+      const running = await new Promise((resolve) => {
+        try {
+          const http = require('http');
+          const req = http.get('http://127.0.0.1:3080/api/health', { timeout: 1500 }, (res) => {
+            let body = '';
+            res.on('data', (ch) => { body += ch.toString(); });
+            res.on('end', () => {
+              try {
+                const j = JSON.parse(body);
+                // mode:'local' is the cross-version BLASTI local-API fingerprint
+                // (older builds return { status, mode, uptime, dbReady } with no
+                // service/version — the absence of a version IS the staleness
+                // signal, so resolve the parsed body whenever mode==='local').
+                resolve(j && j.mode === 'local' ? j : null);
+              } catch { resolve(null); }
+            });
+          });
+          req.on('timeout', () => { try { req.destroy(); } catch { /* */ } resolve(null); });
+          req.on('error', () => resolve(null));
+        } catch { resolve(null); }
+      });
+
+      const myVersion = app.getVersion();
+      const runningVersion = running && typeof running.version === 'string' ? running.version : null;
+      const compareVersions = (a, b) => {
+        const pa = String(a).split('.').map((n) => parseInt(n, 10) || 0);
+        const pb = String(b).split('.').map((n) => parseInt(n, 10) || 0);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+          const d = (pa[i] || 0) - (pb[i] || 0);
+          if (d !== 0) return d;
+        }
+        return 0;
+      };
+      const staleRunning = !!running && (!runningVersion || compareVersions(runningVersion, myVersion) < 0);
+
+      if (staleRunning) {
+        console.warn(`[BLASTI Desktop] Second launch aborted — an ${runningVersion ? 'OLDER (v' + runningVersion + ')' : 'STALE/UNIDENTIFIED'} BLASTI instance still owns the workspace (local API on :3080). The user must exit it fully (tray → Exit / Task Manager) before the new build can run.`);
+        try {
+          dialog.showErrorBox(
+            'BLASTI — a previous instance is still running',
+            'An older BLASTI instance is still running in the background and owns the local workspace, so the updated app cannot start.\n\n' +
+              'Exit it completely: right-click the BLASTI icon in the system tray (near the clock) → Exit — or open Task Manager and end any running BLASTI process. Then launch the app again.\n\n' +
+              '—\nنسخة قديمة من BLASTI لا تزال تعمل في الخلفية وتحجز مساحة العمل المحلية، لذا لا يمكن تشغيل النسخة المحدّثة.\n\n' +
+              'أغلقها تمامًا: انقر بزر الفأرة الأيمن على أيقونة BLASTI بجوار الساعة → Exit، أو من مدير المهام أنهِ أي عملية BLASTI، ثم شغّل التطبيق من جديد.'
+          );
+        } catch { /* dialog unavailable — still quit below */ }
+      } else {
+        console.log('[BLASTI Desktop] Second instance detected — the running instance will show its window (running identity: ' + (running ? (runningVersion ? 'v' + runningVersion : 'old-shape health') : 'not up yet') + ', this launcher: v' + myVersion + ')');
+      }
+    } finally {
+      app.quit();
+    }
+  })();
 } else {
   app.on('second-instance', (_event, commandLine) => {
     // Someone tried to run a second instance, focus our window instead
@@ -1801,6 +1867,12 @@ app.whenReady().then(async () => {
   console.log(`[BLASTI Desktop] App ready — isDev: ${isDev}, platform: ${process.platform}`);
   console.log(`[BLASTI Desktop] Dev URL: ${DEV_URL}, Prod URL: ${PROD_URL}`);
   console.log(`[BLASTI Desktop] Electron version: ${process.versions.electron}, Node: ${process.versions.node}`);
+  // Task 40: stale-bundle guard — the build stamp is written by prebuild.js on
+  // every package. An installed app whose stamp predates the latest fixes is
+  // STALE: rebuild (bun run build:desktop) instead of debugging old code.
+  let buildStamp = null;
+  try { buildStamp = require('./build-stamp.json'); } catch { buildStamp = null; }
+  console.log(`[BLASTI Desktop] Build: ${buildStamp && buildStamp.builtAt ? buildStamp.builtAt + (buildStamp.git ? ' (git ' + buildStamp.git + ')' : '') : 'SOURCE (no stamp — dev run)'}${buildStamp && buildStamp.builtAt && new Date(buildStamp.builtAt) < new Date(Date.now() - 30 * 24 * 3600 * 1000) ? ' — WARNING: build is over 30 days old' : ''}`);
 
   // ── DETERMINISTIC STARTUP ORDER (spec §28) ────────────────────────────
   // 1. resolve authoritative DB path (idempotent)

@@ -4,6 +4,7 @@ import { apiFetch } from '@/lib/api-fetch';;
 import { useState } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
+import { useAgencyAuthority, canAccessAgencySection, type AgencySectionView } from '@/hooks/use-agency-authority';
 import { isRTL, type TranslationKeys } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { usePlatform } from '@/hooks/use-platform';
@@ -121,6 +122,9 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
   const { currentView, setView, logout, user } = useAppStore();
   const { t } = useLanguage();
   const { platform, capabilities } = usePlatform();
+  // Task 37-e: authority-aware navigation — sections a staff/manager has no
+  // authority for are hidden (matrix shared with the page guards).
+  const { authority } = useAgencyAuthority();
   const [changePasswordOpen, setChangePasswordOpen] = useState(false);
   const [cpCurrentPwd, setCpCurrentPwd] = useState('');
   const [cpNewPwd, setCpNewPwd] = useState('');
@@ -177,6 +181,22 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
     { view: 'agency-subscription', icon: CreditCard, label: t('subscription') },
   ];
 
+  // Task 37-e: filter the nav by the caller's agency authority.
+  //   - AGENCY_OWNER / SUPER_ADMIN → all items (unchanged).
+  //   - MANAGER → dashboard, history, branches*, subscription*, profile*,
+  //     settings* (*only with the matching authority); employees/devices/reviews hidden.
+  //   - STAFF → dashboard + history only.
+  // While the authority fetch is in flight the FULL list renders (the shared
+  // matrix returns true) so the sidebar never flickers blank.
+  const visibleNavItems = navItems.filter((item) =>
+    canAccessAgencySection(item.view as AgencySectionView, authority, user?.role)
+  );
+
+  // Group divider stays "before the first item after dashboard + history".
+  const firstRestrictedIdx = visibleNavItems.findIndex(
+    (item) => item.view !== 'agency-dashboard' && item.view !== 'agency-history'
+  );
+
   const sidebar = (
     <div className="flex flex-col h-full">
       {/* Gradient Header */}
@@ -206,11 +226,11 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
 
       {/* Navigation */}
       <nav className="flex-1 px-3 py-3 space-y-1 overflow-y-auto">
-        {navItems.map((item, index) => {
+        {visibleNavItems.map((item, index) => {
           const active = currentView === item.view;
           const Icon = item.icon;
           // Group divider after dashboard + history
-          const showDividerBefore = index === 2;
+          const showDividerBefore = firstRestrictedIdx >= 0 && index === firstRestrictedIdx;
           return (
             <div key={item.view}>
               {showDividerBefore && <div className="my-2 mx-2 border-t border-border/50" />}

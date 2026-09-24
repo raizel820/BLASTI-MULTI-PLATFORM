@@ -209,6 +209,13 @@ const fr: Record<TranslationKeys, string> = {
   maxReservations: "Max. réservations actives",
   queueOpen: "Ouvrir la file",
   queueClosedStatus: "Fermer la file",
+  // Task 37: real queue-state badges + plan capacity helpers
+  // (badge reuses the pre-existing `queueClosed` key from the queue section)
+  unlimited: "Illimité",
+  planCapacityLimit: "Limite du plan : {n} (mettre à niveau pour plus)",
+  capacityExceedsPlan: "La valeur dépasse la limite de votre plan ({n})",
+  branch: "Succursale",
+  selectBranch: "Choisir une succursale",
   addService: "Ajouter un service",
   serviceName: "Nom du service",
   servicePrefix: "Préfixe du numéro",
@@ -1559,6 +1566,8 @@ const fr: Record<TranslationKeys, string> = {
   setAsMain: 'Définir comme principal',
   noBranches: 'Aucune succursale',
   noBranchesDesc: 'Ajoutez votre première succursale pour organiser les guichets',
+  branchesLoadFailed: 'Échec du chargement des succursales',
+  retry: 'Réessayer',
   confirmDeleteBranch: 'Voulez-vous vraiment supprimer cette succursale ? Tous les guichets seront supprimés.',
   branchDeleted: 'Succursale désactivée',
   branchCreated: 'Succursale créée avec succès',
@@ -1735,6 +1744,12 @@ const fr: Record<TranslationKeys, string> = {
   pendingSyncEvents: 'Événements en attente de sync',
   reconnect: 'Reconnecter',
   reconnected: 'Reconnecté',
+
+  // ─── Boot splash (Task 41) ──────────────
+  bootPreparing: 'Préparation de vos données…',
+  bootSyncing: 'Synchronisation de vos données…',
+  bootAlmostReady: 'Presque prêt…',
+  bootSlowNote: "Cela prend plus de temps que d'habitude — ouverture du tableau de bord imminent",
 
   // ─── Offline Reservation Sync ──────────────
   offlineReservationsPending: '{count} réservation(s) hors ligne en attente de sync',
@@ -2709,6 +2724,31 @@ const fr: Record<TranslationKeys, string> = {
   auditReconciliationRun: 'Réconciliation exécutée',
   auditCronExecute: 'Tâche planifiée exécutée',
   auditPush: 'Notification push',
+  // ─── Task 37-e: autorités agence, compteur de personnel & occupation des guichets ───
+  selectCounter: 'Choisir un guichet',
+  authorities: 'Autorités',
+  authorityCreateBranches: 'Créer des succursales',
+  authorityDeleteBranches: 'Supprimer des succursales',
+  authorityMakePurchase: 'Effectuer des achats',
+  authorityManageSubscription: 'Gérer l\'abonnement',
+  authorityProfileSettings: 'Paramètres du profil',
+  staffMeter: '{x} employés sur {n}',
+  staffUnlimited: '{x} employés · illimité',
+  staffLimitReached: 'Limite de personnel atteinte pour votre forfait — passez à un forfait supérieur pour en ajouter.',
+  ownerOnlySection: 'Cette section est réservée au propriétaire de l\'agence.',
+  noSubscriptionAccess: 'Vous n\'avez pas accès à la gestion des abonnements.',
+  paymentHistory: 'Historique des paiements',
+  noTransactions: 'Aucun paiement pour le moment.',
+  occupyCounter: 'Guichet occupé',
+  releaseCounter: 'Libérer le guichet',
+  counterReleased: 'Guichet libéré',
+  counterOccupied: 'Occupé',
+  counterOccupiedBy: 'Occupé par {name}',
+  counterMine: 'Le vôtre',
+  counterFree: 'Libre',
+  occupyFirst: 'Occupez d\'abord un guichet pour appeler le client suivant.',
+  counterPermissionDenied: 'Vous n\'avez pas la permission pour ce guichet.',
+
 };
 
 export default fr;

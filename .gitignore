@@ -65,6 +65,8 @@ api.log
 !packages/db/
 !packages/db/data/
 !packages/db/data/*.db
+# Reset-generation marker — runtime state written by scripts/reset-all.ts
+packages/db/data/.db-generation.json
 
 # Skills directory
 /skills/
@@ -81,3 +83,7 @@ ops/.next/
 # dev tooling caches
 .schema-stamp
 packages/db/.schema-stamp
+
+# Desktop build stamp (written by apps/desktop/scripts/prebuild.js on every package)
+apps/desktop/build-stamp.json
+apps/desktop/out/

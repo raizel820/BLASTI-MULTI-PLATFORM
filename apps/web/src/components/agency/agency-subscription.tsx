@@ -93,6 +93,7 @@ import {
   Layers,
   ArrowUpCircle,
   ArrowDownCircle,
+  Lock,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -161,6 +162,9 @@ interface Transaction {
   plan: string;
   planName?: string | null;
   method: string;
+  // GET /api/transactions returns the raw column name `paymentMethod` while
+  // the subscription payload maps it to `method` — accept both.
+  paymentMethod?: string | null;
   status: string;
   rejectionReason?: string | null;
   reviewedAt?: string | null;
@@ -2260,8 +2264,18 @@ export function AgencySubscription() {
   const { t, lang } = useLanguage();
   const [data, setData] = useState<SubscriptionData | null>(null);
   const [loading, setLoading] = useState(true);
+  // Task 37-e: normal staff (no purchase/subscription authority) get a 403
+  // PERMISSION_DENIED from GET /api/agency/subscription — flip to a graceful
+  // no-access card instead of an empty shell.
+  const [noAccess, setNoAccess] = useState(false);
   const [selectedPlan, setSelectedPlan] = useState<SubscriptionPlan | null>(null);
   const [showPaymentDialog, setShowPaymentDialog] = useState(false);
+
+  // Task 37-e: Payment History — agency-scoped transaction history from
+  // GET /api/transactions?limit=20. On failure it falls back to the
+  // subscription response's recentTransactions.
+  const [paymentHistory, setPaymentHistory] = useState<Transaction[] | null>(null);
+  const [paymentHistoryFailed, setPaymentHistoryFailed] = useState(false);
 
   // ─── New state for the rewrite ────────────────────────────────────────────
   // `showPlansList` toggles the plans grid open when an ACTIVE subscriber
@@ -2303,6 +2317,7 @@ export function AgencySubscription() {
 
   useEffect(() => {
     fetchSubscription();
+    fetchPaymentHistory();
     fetchFaqs();
     fetchHardware();
     fetchHardwareOrders();
@@ -2329,11 +2344,32 @@ export function AgencySubscription() {
       if (res.ok) {
         const result = await res.json();
         setData(result);
+      } else if (res.status === 403) {
+        // Task 37-e: staff without subscription/purchase authority — show the
+        // no-access state, never a silent blank page.
+        setNoAccess(true);
       }
     } catch {
       toast.error(t('error'));
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Task 37-e: Payment History — real transaction feed (agency-scoped
+  // server-side; owner + payment/subscription managers reach this page).
+  const fetchPaymentHistory = async () => {
+    try {
+      const res = await apiFetch('/api/transactions?limit=20');
+      if (res.ok) {
+        const result = await res.json();
+        setPaymentHistory(result.transactions ?? []);
+        setPaymentHistoryFailed(false);
+      } else {
+        setPaymentHistoryFailed(true);
+      }
+    } catch {
+      setPaymentHistoryFailed(true);
     }
   };
 
@@ -2457,6 +2493,13 @@ export function AgencySubscription() {
     if (method === 'BANK_TRANSFER' || method === 'BANK') return t('bankTransfer');
     return t('electronicPayment');
   };
+
+  // Task 37-e: the list feeding the Payment History section — the real
+  // /api/transactions feed, or the subscription response's recentTransactions
+  // when that fetch failed (error fallback, per spec).
+  const effectivePaymentHistory: Transaction[] = paymentHistoryFailed
+    ? (data?.recentTransactions ?? [])
+    : (paymentHistory ?? []);
 
   // ─── Feature badge config ─────────────────────────────────────────────────
   // Maps the 5 boolean feature flags on SubscriptionPlan to a localized label
@@ -2700,6 +2743,23 @@ export function AgencySubscription() {
         </div>
         <Skeleton className="h-48 rounded-2xl" />
         <Skeleton className="h-64 rounded-2xl" />
+      </div>
+    );
+  }
+
+  // Task 37-e: graceful no-access state — normal staff hitting this page
+  // directly (the page guard already redirects most) see a friendly card
+  // instead of an empty shell or a silent failure.
+  if (noAccess) {
+    return (
+      <div className="p-4 lg:p-6">
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80">
+          <CardContent className="p-10 text-center">
+            <Lock className="h-12 w-12 text-muted-foreground/30 mx-auto mb-3" />
+            <p className="text-sm font-medium text-foreground">{t('noSubscriptionAccess')}</p>
+            <p className="text-xs text-muted-foreground mt-1">{t('ownerOnlySection')}</p>
+          </CardContent>
+        </Card>
       </div>
     );
   }
@@ -3782,23 +3842,39 @@ export function AgencySubscription() {
         </Card>
       </motion.div>
 
-      {/* ─── Transaction History ─── */}
-      {data?.recentTransactions && data.recentTransactions.length > 0 && (
-        <motion.div
-          initial={{ opacity: 0, y: 15 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.3 }}
-        >
-          <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:shadow-gray-900/50">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base flex items-center gap-2">
-                <Clock className="h-4 w-4 text-emerald-600" />
-                {t('transactions')}
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="pt-0">
-              <div className="space-y-3 max-h-96 overflow-y-auto">
-                {data.recentTransactions.map((tx) => {
+      {/* ─── Payment History (Task 37-e) ─── */}
+      {/* Promoted from the old inline recentTransactions card into a proper
+          section fed by GET /api/transactions?limit=20. Falls back to the
+          subscription response's recentTransactions when the feed fails. */}
+      <motion.div
+        initial={{ opacity: 0, y: 15 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.3 }}
+      >
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:shadow-gray-900/50">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Receipt className="h-4 w-4 text-emerald-600" />
+              {t('paymentHistory')}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0">
+            {paymentHistory === null && !paymentHistoryFailed ? (
+              /* Loading skeleton rows */
+              <div className="space-y-3">
+                {[1, 2, 3].map((i) => (
+                  <Skeleton key={i} className="h-16 rounded-xl" />
+                ))}
+              </div>
+            ) : effectivePaymentHistory.length === 0 ? (
+              /* Empty state */
+              <div className="py-8 text-center">
+                <Receipt className="h-10 w-10 text-muted-foreground/30 mx-auto mb-3" />
+                <p className="text-sm text-muted-foreground">{t('noTransactions')}</p>
+              </div>
+            ) : (
+              <div className="space-y-3 max-h-96 overflow-y-auto custom-scrollbar">
+                {effectivePaymentHistory.map((tx) => {
                   const isApproved = tx.status === 'APPROVED';
                   const isPending = tx.status === 'PENDING';
                   // Prefer the snapshot planName (frozen at transaction time)
@@ -3812,6 +3888,9 @@ export function AgencySubscription() {
                   // Prefer amountPaid snapshot when present, else the legacy amount
                   const displayAmount =
                     tx.amountPaid != null ? tx.amountPaid : tx.amount;
+                  // Cloud /transactions returns the raw `paymentMethod` column;
+                  // the subscription payload maps it to `method` — accept both.
+                  const method = tx.paymentMethod ?? tx.method;
 
                   return (
                     <motion.div
@@ -3855,7 +3934,7 @@ export function AgencySubscription() {
                           </Badge>
                         </div>
                         <p className="text-xs text-muted-foreground mt-0.5">
-                          {formatDate(tx.createdAt)} &middot; {getPaymentMethodLabel(tx.method)}
+                          {formatDate(tx.createdAt)} &middot; {getPaymentMethodLabel(method)}
                         </p>
                         {tx.rejectionReason && !isApproved && !isPending && (
                           <p className="text-[11px] text-red-600 dark:text-red-400 mt-0.5 line-clamp-1">
@@ -3872,10 +3951,10 @@ export function AgencySubscription() {
                   );
                 })}
               </div>
-            </CardContent>
-          </Card>
-        </motion.div>
-      )}
+            )}
+          </CardContent>
+        </Card>
+      </motion.div>
 
       {/* ─── Payment Dialog (with optional hardware picker) ─── */}
       <PaymentDialog

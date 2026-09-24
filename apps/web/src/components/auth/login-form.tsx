@@ -4,6 +4,7 @@ import { apiFetch } from '@/lib/api-fetch';;
 import { useState, useCallback } from 'react';
 import { apiClient, setNativeSessionToken } from '@/lib/api-client';
 import { useAppStore } from '@/store/use-app-store';
+import { adoptImportedLocalSessionUser } from '@/lib/session-heal';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
@@ -124,14 +125,20 @@ export function LoginForm() {
                 }
 
                 // 3. Also call the HTTP import-session endpoint as a backup
-                //    (in case IPC bridge isn't wired up correctly)
+                //    (in case IPC bridge isn't wired up correctly).
+                //    Task 37-a: adopt the refreshed user the local API returns
+                //    after its cloud validation so the persisted user (and its
+                //    agencyId) can never go stale relative to the session.
                 if (!res.url || !res.url.includes('localhost:3080')) {
                   fetch('http://127.0.0.1:3080/api/auth/import-session', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     credentials: 'omit',
                     body: JSON.stringify({ token: data.token, user: data.user }),
-                  }).catch(() => { /* non-critical */ });
+                  })
+                    .then((importRes) => (importRes.ok ? importRes.json().catch(() => null) : null))
+                    .then((importData) => adoptImportedLocalSessionUser(importData))
+                    .catch(() => { /* non-critical */ });
                 }
 
                 // 4. Trigger the initial workspace sync (cloud → local SQLite).
@@ -198,12 +205,16 @@ export function LoginForm() {
           // 3. HTTP import-session backup (in case IPC bridge isn't wired).
           //    apiFetch responses carry no url — same behavior as the login
           //    path, where the check always passes and the backup fires.
+          //    Task 37-a: adopt the refreshed user the local API returns.
           fetch('http://127.0.0.1:3080/api/auth/import-session', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             credentials: 'omit',
             body: JSON.stringify({ token: result.token, user: result.user }),
-          }).catch(() => { /* non-critical */ });
+          })
+            .then((importRes) => (importRes.ok ? importRes.json().catch(() => null) : null))
+            .then((importData) => adoptImportedLocalSessionUser(importData))
+            .catch(() => { /* non-critical */ });
 
           // 4. Trigger the initial workspace sync (cloud → local SQLite).
           if (w.electronAPI?.initialCloudSync) {

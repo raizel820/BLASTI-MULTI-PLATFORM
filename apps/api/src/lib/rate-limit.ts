@@ -162,19 +162,13 @@ export function getClientIp(c: Context): string {
     }
   }
 
-  // Priority 3: X-Real-IP (usually set by nginx/Cloudflare)
+  // Priority 3: X-Real-IP (usually set by nginx)
   const realIp = c.req.header('x-real-ip')
   if (realIp) {
     return realIp.trim()
   }
 
-  // Priority 4: Use CF-Connecting-IP (Cloudflare-specific)
-  const cfIp = c.req.header('cf-connecting-ip')
-  if (cfIp) {
-    return cfIp.trim()
-  }
-
-  // Priority 5: Hash of user-agent as a secondary identifier
+  // Priority 4: Hash of user-agent as a secondary identifier
   const ua = c.req.header('user-agent') || ''
   if (ua) {
     let hash = 0

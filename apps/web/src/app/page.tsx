@@ -53,6 +53,7 @@ const AdminHardwareRequests = lazy(() => import('@/components/admin/admin-hardwa
 const AdminEnterpriseRequests = lazy(() => import('@/components/admin/admin-enterprise-requests').then(m => ({ default: m.AdminEnterpriseRequests })));
 
 // Shared (eagerly imported — lightweight)
+import { AgencyAuthorityGate } from '@/components/agency/agency-authority-gate';
 import { ErrorBoundary } from '@/components/shared/error-boundary';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
@@ -62,6 +63,7 @@ import { ConnectionStatus, ConnectionDot, onCloudStatusChange } from '@/componen
 import { OfflineDiagnosisPanel } from '@/components/shared/offline-diagnosis-panel';
 import { NotificationBadge } from '@/components/shared/notification-badge';
 import { BlastiSkeleton, BlastiSkeletonCompact } from '@/components/shared/blasti-skeleton';
+import { BootGate } from '@/components/shared/boot-gate';
 import { usePlatform } from '@/hooks/use-platform';
 import { Button } from '@/components/ui/button';
 
@@ -123,20 +125,23 @@ const ViewRouter = memo(function ViewRouter() {
               return <CustomerSettings />;
             case 'agency-dashboard':
               return <AgencyDashboard />;
+            // Task 37-e: restricted agency sections pass through the authority
+            // gate (owners/managers/staff matrix) — dashboard + history are
+            // never gated.
             case 'agency-settings':
-              return <AgencySettings />;
+              return <AgencyAuthorityGate view="agency-settings"><AgencySettings /></AgencyAuthorityGate>;
             case 'agency-profile':
-              return <AgencyProfile />;
+              return <AgencyAuthorityGate view="agency-profile"><AgencyProfile /></AgencyAuthorityGate>;
             case 'agency-subscription':
-              return <AgencySubscription />;
+              return <AgencyAuthorityGate view="agency-subscription"><AgencySubscription /></AgencyAuthorityGate>;
             case 'agency-reviews':
-              return <AgencyReviews />;
+              return <AgencyAuthorityGate view="agency-reviews"><AgencyReviews /></AgencyAuthorityGate>;
             case 'agency-employees':
-              return <AgencyEmployees />;
+              return <AgencyAuthorityGate view="agency-employees"><AgencyEmployees /></AgencyAuthorityGate>;
             case 'agency-branches':
-              return <AgencyBranches />;
+              return <AgencyAuthorityGate view="agency-branches"><AgencyBranches /></AgencyAuthorityGate>;
             case 'agency-devices':
-              return <AgencyDevices />;
+              return <AgencyAuthorityGate view="agency-devices"><AgencyDevices /></AgencyAuthorityGate>;
             case 'agency-fullscreen':
               return <AgencyFullscreen />;
             case 'agency-fullscreen-history':
@@ -227,6 +232,9 @@ export default function Home() {
   const [globalAnnouncements, setGlobalAnnouncements] = useState<Array<{ id: string; message: string; type: string; createdAt: string }>>([]);
   const [dismissedIds, setDismissedIds] = useState<Set<string>>(new Set());
   const [showOnboarding, setShowOnboarding] = useState(false);
+  // Task 41 — boot splash gate: true once the post-login/reload data sync
+  // settled and the authenticated shell may mount. Rearmed on logout.
+  const [bootReady, setBootReady] = useState(false);
 
   // Auto-show diagnosis panel when cloud goes down (desktop app offline transition)
   useEffect(() => {
@@ -266,6 +274,15 @@ export default function Home() {
       setView('login');
     }
   }, [mounted, platform.isNative, isAuthenticated, currentView, setView]);
+
+  // Task 41 — rearm the boot gate whenever the session ends, so the next
+  // login (or reload) shows the splash again. Login flips isAuthenticated
+  // to true without touching bootReady — it starts false and the gate
+  // releases it once the first sync settles.
+  useEffect(() => {
+    if (isAuthenticated) return;
+    queueMicrotask(() => setBootReady(false));
+  }, [isAuthenticated]);
 
   // Listen for onboarding trigger from register form
   useEffect(() => {
@@ -581,6 +598,14 @@ export default function Home() {
         />
       </>
     );
+  }
+
+  // Task 41 — Boot splash: wait for the offline DB + the first real sync of
+  // this session before mounting the authenticated shell. Replaces (not
+  // overlays) the shell so dashboard screens cannot fire their fetches
+  // mid-sync and flash "Failed to load data". Bounded — see boot-gate.tsx.
+  if (!bootReady) {
+    return <BootGate onDone={() => setBootReady(true)} />;
   }
 
   return (

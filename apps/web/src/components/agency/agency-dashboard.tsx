@@ -473,8 +473,11 @@ export function AgencyDashboard() {
         fetchData();
       } else {
         const data = await res.json();
-        // Show details if available for debugging, otherwise show error or default
-        const errorMsg = data.details || data.error || t('noQueue');
+        // Task 37-e: staff must operate from an occupied counter — surface the
+        // authority errors as friendly messages instead of raw codes.
+        let errorMsg: string = data.details || data.error || t('noQueue');
+        if (data.error === 'OCCUPY_COUNTER_FIRST') errorMsg = t('occupyFirst');
+        else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) errorMsg = t('counterPermissionDenied');
         toast.error(errorMsg);
       }
     } catch {
@@ -1624,7 +1627,7 @@ export function AgencyDashboard() {
       <section>
         <SectionHeader icon={Layers} title={t('countersTimeline') || 'Counters & Timeline'} />
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-          {/* Counter Management */}
+          {/* Counter Management — Task 37-e: real counters + agencyId */}
           <CounterManagement
             waitingList={waitingList.filter(e => e.status === 'WAITING')}
             calledEntry={waitingList.filter(e => e.status === 'CALLED')}
@@ -1632,10 +1635,7 @@ export function AgencyDashboard() {
             avgWaitTime={avgWait}
             actionLoading={actionLoading}
             onCallNext={handleCallNext}
-            onCallNextForCounter={(counterId: string) => {
-              setActionLoading(`call-${counterId}`);
-              handleCallNext();
-            }}
+            agencyId={agencyId}
             subscriptionActive={!queueLocked}
             lang={lang}
             t={t as any}

@@ -52,7 +52,7 @@ const path = require('path')
 // ─── Versioning ─────────────────────────────────────────────────────────────
 
 /** Current local schema version. Bump when adding MIGRATION_STEPS. */
-const LOCAL_SCHEMA_VERSION = 4
+const LOCAL_SCHEMA_VERSION = 5
 
 /**
  * Incremental upgrade steps BETWEEN versions. Each step:
@@ -108,6 +108,26 @@ const MIGRATION_STEPS = [
       'CREATE INDEX "FileAsset_updatedAt_idx" ON "FileAsset"("updatedAt")',
       'CREATE INDEX "FileAsset_ownerId_idx" ON "FileAsset"("ownerId")',
       'CREATE INDEX "FileAsset_agencyId_idx" ON "FileAsset"("agencyId")',
+    ],
+  },
+  {
+    // Task 37-d — 2-tier staff authority + counter occupation:
+    //   AgencyStaff.canCreateBranches / canDeleteBranches /
+    //   canPurchaseSubscription / canManageSubscription (normalized boolean
+    //   columns mirroring the cloud schema) and Counter.occupiedAt (occupation
+    //   timestamp for the repurposed Counter.staffId "occupied by" pointer).
+    // The shared Prisma client is generated from the same schema, so the local
+    // SQLite tables MUST carry these columns for every authority write to
+    // succeed. The convergence pass below additionally self-heals any database
+    // shape that skipped this step (legacy-adopted DBs, crash mid-step).
+    version: 5,
+    name: 'staff-authority booleans + counter occupation timestamp (Task 37-d)',
+    statements: [
+      'ALTER TABLE "AgencyStaff" ADD COLUMN "canCreateBranches" BOOLEAN NOT NULL DEFAULT false',
+      'ALTER TABLE "AgencyStaff" ADD COLUMN "canDeleteBranches" BOOLEAN NOT NULL DEFAULT false',
+      'ALTER TABLE "AgencyStaff" ADD COLUMN "canPurchaseSubscription" BOOLEAN NOT NULL DEFAULT false',
+      'ALTER TABLE "AgencyStaff" ADD COLUMN "canManageSubscription" BOOLEAN NOT NULL DEFAULT false',
+      'ALTER TABLE "Counter" ADD COLUMN "occupiedAt" DATETIME',
     ],
   },
 ]
@@ -332,8 +352,12 @@ async function runStatements(db, statements, { tolerant = false } = {}) {
       await db.$executeRawUnsafe(stmt)
     } catch (err) {
       const msg = err?.message || String(err)
-      // Benign when running hardened DDL over existing objects.
-      const benign = /already exists/i.test(msg)
+      // Benign when running hardened DDL over existing objects. "duplicate
+      // column name" is equally benign for ALTER TABLE ADD COLUMN steps: it
+      // means a previous run (or the convergence top-up) already added the
+      // column — e.g. a crash between one ALTER and the version stamp must
+      // never wedge the next startup (Task 37-d idempotency requirement).
+      const benign = /already exists|duplicate column/i.test(msg)
       if (tolerant && benign) continue
       errors.push({ statement: stmt.substring(0, 100), error: msg })
     }
@@ -413,7 +437,10 @@ async function ensureSchema(db, opts = {}) {
     for (const step of MIGRATION_STEPS) {
       if (step.version > stampedVersion && step.version <= LOCAL_SCHEMA_VERSION) {
         log(`Applying migration v${step.version}: ${step.name}`)
-        const errs = await runStatements(db, step.statements.map(hardenCreate))
+        // tolerant: benign "already exists / duplicate column" failures are
+        // skipped so a crash between two statements of one step (ALTER is
+        // auto-committed per statement) re-runs cleanly on the next start.
+        const errs = await runStatements(db, step.statements.map(hardenCreate), { tolerant: true })
         if (errs.length) {
           result.action = 'upgrade-failed'
           result.errors.push(...errs)
@@ -439,6 +466,12 @@ async function ensureSchema(db, opts = {}) {
   //     EVERY path (fresh DDL has them → no-op; legacy adoption skipped the
   //     version-gated step → adds them; stamped upgrades already migrated).
   await _ensureUserVerificationColumns(db, log)
+
+  // 3b-bis. CONVERGENCE (Task 37-d) — ensure the staff-authority booleans on
+  //     AgencyStaff + Counter.occupiedAt on EVERY path (same rationale as the
+  //     Task 22 pass: legacy-adopted databases skip version-gated steps, and
+  //     a crash mid-step must self-heal on the next start).
+  await _ensureStaffAuthorityColumns(db, log)
 
   // 3. CONVERGENCE REBUILD (v2) — relax User.passwordHash to NULL-allowed.
   //    Self-guarding (no-op when already nullable) so it is safe on every
@@ -729,6 +762,48 @@ async function _ensureUserVerificationColumns(db, log) {
     }
   } catch (err) {
     log(`Warning: User verification columns check skipped: ${err?.message || err}`)
+  }
+}
+
+/**
+ * Task 37-d convergence pass — runs on EVERY ensureSchema call (mirrors the
+ * Task 22 pass above): PRAGMA table_info checks + guarded ALTER TABLE ADD
+ * COLUMN for the 2-tier staff authority booleans (AgencyStaff) and the
+ * counter occupation timestamp (Counter.occupiedAt). Additive + idempotent:
+ * only adds what is missing; existing rows keep their defaults (booleans
+ * false — fail-closed — and occupiedAt NULL = unoccupied).
+ */
+async function _ensureStaffAuthorityColumns(db, log) {
+  try {
+    const staffCols = await tableColumns(db, 'AgencyStaff')
+    if (staffCols.length) {
+      const staffAdds = [
+        ['canCreateBranches', 'BOOLEAN NOT NULL DEFAULT false'],
+        ['canDeleteBranches', 'BOOLEAN NOT NULL DEFAULT false'],
+        ['canPurchaseSubscription', 'BOOLEAN NOT NULL DEFAULT false'],
+        ['canManageSubscription', 'BOOLEAN NOT NULL DEFAULT false'],
+      ]
+      for (const [col, def] of staffAdds) {
+        if (staffCols.includes(col)) continue
+        try {
+          await db.$executeRawUnsafe(`ALTER TABLE "AgencyStaff" ADD COLUMN "${col}" ${def}`)
+          log(`Added AgencyStaff.${col} column`)
+        } catch (err) {
+          if (!/duplicate column|already exists/i.test(err?.message || '')) throw err
+        }
+      }
+    }
+    const counterCols = await tableColumns(db, 'Counter')
+    if (counterCols.length && !counterCols.includes('occupiedAt')) {
+      try {
+        await db.$executeRawUnsafe('ALTER TABLE "Counter" ADD COLUMN "occupiedAt" DATETIME')
+        log('Added Counter.occupiedAt column')
+      } catch (err) {
+        if (!/duplicate column|already exists/i.test(err?.message || '')) throw err
+      }
+    }
+  } catch (err) {
+    log(`Warning: staff authority columns check skipped: ${err?.message || err}`)
   }
 }
 

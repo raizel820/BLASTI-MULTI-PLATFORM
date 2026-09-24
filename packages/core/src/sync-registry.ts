@@ -189,6 +189,10 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
       'role', 'branchId', 'canManageQueue', 'canManageServices',
       'canManageStaff', 'canViewAnalytics', 'canManageBranches',
       'canManageWorkingHours', 'canExportData', 'canManageProfile',
+      // Task 37-c: 2-tier staff authority — manager-only grants synced like
+      // the other normalized permission booleans.
+      'canCreateBranches', 'canDeleteBranches', 'canPurchaseSubscription',
+      'canManageSubscription',
       'permissions', 'isActive',
     ],
     immutableFields: ['id', 'userId', 'agencyId', 'joinedAt', 'createdAt', 'updatedAt'],
@@ -262,7 +266,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     isAgencyScoped: true,
     agencyField: null, // scoped via Branch relation
     conflictStrategy: ConflictStrategy.VERSION_AWARE,
-    mutableFields: ['number', 'name', 'nameAr', 'nameFr', 'isActive', 'branchId', 'staffId', 'currentReservationId'],
+    mutableFields: ['number', 'name', 'nameAr', 'nameFr', 'isActive', 'branchId', 'staffId', 'occupiedAt', 'currentReservationId'],
     immutableFields: ['id', 'createdAt', 'updatedAt'],
     localOnlyFields: ['syncVersion', 'syncedAt'],
     cloudOnlyFields: [],

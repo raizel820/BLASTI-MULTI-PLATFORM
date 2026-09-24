@@ -30,7 +30,7 @@ function isDirectReachablePageHost(pageHost: string): boolean {
  * All uploads are stored on the API server's local disk
  * (<api>/uploads/<type>/) and served through
  * GET /api/upload/file/:type/:name — no external storage provider
- * (Vercel Blob / Cloudflare R2 / S3) is involved.
+ * (external object-storage services) is involved.
  *
  * Round 17 — the API normalizes intake URLs to ABSOLUTE addresses based on
  * the origin it was reached through (usually http://localhost:3003). When a

@@ -1,7 +1,18 @@
 'use client';
 
-import { useState, useMemo } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+// Task 37-e: real counter cards — replaces the fabricated STAFF_NAMES mock
+// with the agency's ACTUAL counters (GET /api/agency/counters, enriched with
+// branch names from GET /api/agency/branches — the endpoints the branches
+// page / fullscreen consume). Each card shows the counter's occupation state
+// (occupied-by name via counter.staff.user.fullName, or Free) and a Call Next
+// button that posts { agencyId, counterId } to /api/agency/queue/call-next —
+// surfacing OCCUPY_COUNTER_FIRST / PERMISSION_DENIED as friendly toasts
+// (the server enforces the authority contract).
+
+import { useState, useEffect, useCallback } from 'react';
+import { motion } from 'framer-motion';
+import { useAppStore } from '@/store/use-app-store';
+import { useAgencyAuthority } from '@/hooks/use-agency-authority';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -9,23 +20,26 @@ import {
   Monitor,
   PhoneCall,
   User,
-  Clock,
   Loader2,
-  ChevronRight,
   Hash,
   Lock,
 } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { toast } from 'sonner';
+import { apiFetch } from '@/lib/api-fetch';
 import type { TranslationKeys } from '@/i18n';
 
 interface CounterInfo {
   id: string;
   number: number;
-  staffName: string;
+  name: string;
+  nameAr?: string | null;
+  nameFr?: string | null;
+  branchId: string | null;
+  branchName: string;
+  staffId: string | null;
+  staffName: string | null;
   currentTicket: string | null;
-  currentCustomer: string | null;
-  currentService: string | null;
-  servedToday: number;
   isActive: boolean;
 }
 
@@ -58,13 +72,14 @@ interface CounterManagementProps {
   avgWaitTime: number;
   actionLoading: string | null;
   onCallNext: () => void;
-  onCallNextForCounter: (counterId: string) => void;
+  /** Task 37-e: the agency scope — counters are fetched for this agency. */
+  agencyId?: string;
   /** Task 31 bug 5: when false (subscription not ACTIVE/TRIAL) the per-counter
    *  Call Next buttons are locked. Defaults to true so unknown state never
    *  falsely locks — the server still enforces the real gate. */
   subscriptionActive?: boolean;
   lang: string;
-  t: (key: TranslationKeys) => string;
+  t: (key: TranslationKeys, params?: Record<string, string>) => string;
 }
 
 const COUNTER_COLORS = [
@@ -85,51 +100,130 @@ const COUNTER_BG_COLORS = [
   'bg-violet-50 dark:bg-violet-900/20 border-violet-200 dark:border-violet-800',
 ];
 
-const STAFF_NAMES = ['Ahmed', 'Sara', 'Youcef', 'Amina', 'Karim', 'Leila'];
-
 export function CounterManagement({
-  waitingList,
-  calledEntry,
   servedToday,
   avgWaitTime,
-  actionLoading,
   onCallNext,
-  onCallNextForCounter,
+  agencyId,
   subscriptionActive = true,
   lang,
   t,
 }: CounterManagementProps) {
-  // Generate counter data based on current queue state
-  const counters: CounterInfo[] = useMemo(() => {
-    const numCounters = Math.max(2, Math.min(4, Math.ceil((waitingList.length + calledEntry.length) / 3)));
-    const result: CounterInfo[] = [];
+  const user = useAppStore((s) => s.user);
+  const { authority } = useAgencyAuthority();
+  const effectiveAgencyId = agencyId || user?.agencyId || '';
 
-    for (let i = 0; i < numCounters; i++) {
-      const calledForCounter = calledEntry[i] || null;
-      const staffIdx = i % STAFF_NAMES.length;
-      result.push({
-        id: `counter-${i + 1}`,
-        number: i + 1,
-        staffName: STAFF_NAMES[staffIdx],
-        currentTicket: calledForCounter?.queueNumber || null,
-        currentCustomer: calledForCounter?.customerName || null,
-        currentService: calledForCounter?.serviceName || null,
-        servedToday: Math.floor(servedToday / numCounters) + (i === 0 ? servedToday % numCounters : 0),
-        isActive: true,
-      });
+  const [counters, setCounters] = useState<CounterInfo[]>([]);
+  const [loadingCounters, setLoadingCounters] = useState(true);
+  const [callingCounterId, setCallingCounterId] = useState<string | null>(null);
+
+  const myStaffId = authority?.staffId ?? null;
+  const isOwnerCaller = authority?.isOwner === true || user?.role === 'AGENCY_OWNER' || user?.role === 'SUPER_ADMIN';
+
+  const fetchCounters = useCallback(async () => {
+    if (!effectiveAgencyId) {
+      setLoadingCounters(false);
+      return;
     }
-    return result;
-  }, [waitingList, calledEntry, servedToday]);
+    try {
+      // Counters + branches in parallel (same endpoints the branches page and
+      // the fullscreen console consume). Dual-envelope tolerant: the cloud
+      // returns { counters } / { branches }, the desktop local API returns
+      // { data } for the agency-wide counters list.
+      const [cRes, bRes] = await Promise.all([
+        apiFetch(`/api/agency/counters?agencyId=${encodeURIComponent(effectiveAgencyId)}`),
+        apiFetch(`/api/agency/branches?agencyId=${encodeURIComponent(effectiveAgencyId)}`).catch(() => null),
+      ]);
+      const branchNames = new Map<string, string>();
+      if (bRes && bRes.ok) {
+        const bData = await bRes.json();
+        const branches: Array<{ id: string; name: string }> = bData.branches ?? bData.data ?? [];
+        branches.forEach((b) => branchNames.set(b.id, b.name));
+      }
+      if (cRes.ok) {
+        const cData = await cRes.json();
+        const raw: Array<Record<string, unknown>> = cData.counters ?? cData.data ?? [];
+        setCounters(
+          raw.map((c) => {
+            const staff = c.staff as { user?: { fullName?: string; username?: string } } | null | undefined;
+            const reservation = c.currentReservation as { displayNumber?: string; status?: string } | null | undefined;
+            const branchId = typeof c.branchId === 'string' ? c.branchId : null;
+            return {
+              id: String(c.id),
+              number: Number(c.number ?? 0),
+              name: String(c.name ?? ''),
+              nameAr: (c.nameAr as string | null) ?? null,
+              nameFr: (c.nameFr as string | null) ?? null,
+              branchId,
+              branchName: (branchId ? branchNames.get(branchId) : '') || '',
+              staffId: (c.staffId as string | null) ?? null,
+              staffName: staff?.user?.fullName ?? null,
+              // Only a CALLED reservation counts as "serving" on this counter.
+              currentTicket:
+                reservation && reservation.status === 'CALLED'
+                  ? reservation.displayNumber ?? null
+                  : null,
+              isActive: c.isActive !== false,
+            };
+          })
+        );
+      }
+    } catch {
+      // silent — the card renders its empty state; the server still gates
+    } finally {
+      setLoadingCounters(false);
+    }
+  }, [effectiveAgencyId]);
 
-  const getServiceName = (name?: string | null, nameAr?: string, nameFr?: string) => {
-    if (!name) return '';
-    if (lang === 'ar' && nameAr) return nameAr;
-    if (lang === 'fr' && nameFr) return nameFr;
-    return name;
+  useEffect(() => {
+    fetchCounters();
+    // Lightweight refresh cadence — this is a dashboard card, not a console.
+    const interval = setInterval(fetchCounters, 20_000);
+    return () => clearInterval(interval);
+  }, [fetchCounters]);
+
+  const localizeCounterName = (c: CounterInfo) => {
+    if (lang === 'ar' && c.nameAr) return c.nameAr;
+    if (lang === 'fr' && c.nameFr) return c.nameFr;
+    return c.name || `#${c.number}`;
   };
 
-  const totalServing = counters.filter(c => c.currentTicket).length;
-  const totalIdle = counters.filter(c => !c.currentTicket).length;
+  const handleCallNextForCounter = async (counterId: string) => {
+    if (!effectiveAgencyId) return;
+    setCallingCounterId(counterId);
+    try {
+      const res = await apiFetch('/api/agency/queue/call-next', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agencyId: effectiveAgencyId, counterId }),
+      });
+      if (res.ok) {
+        toast.success(t('statusCalled'));
+        fetchCounters();
+        onCallNext();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        // Task 37-c contract: friendly toasts for the authority errors.
+        if (data.error === 'OCCUPY_COUNTER_FIRST') {
+          toast.error(t('occupyFirst'));
+        } else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) {
+          toast.error(t('counterPermissionDenied'));
+        } else if (data.error === 'COUNTER_OCCUPIED') {
+          toast.error(t('counterOccupied'));
+          fetchCounters();
+        } else {
+          toast.error(data.error || t('noQueue'));
+        }
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setCallingCounterId(null);
+    }
+  };
+
+  const occupiedCounters = counters.filter((c) => c.staffId).length;
+  const freeCounters = counters.length - occupiedCounters;
 
   return (
     <motion.div
@@ -148,114 +242,139 @@ export function CounterManagement({
             <div className="flex items-center gap-2">
               <div className="flex items-center gap-1">
                 <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                <span className="text-[10px] text-muted-foreground">{totalServing} {t('active' as any) || 'active'}</span>
+                <span className="text-[10px] text-muted-foreground">{occupiedCounters} {t('active' as any) || 'active'}</span>
               </div>
               <div className="flex items-center gap-1">
                 <span className="h-2 w-2 rounded-full bg-gray-300 dark:bg-gray-600" />
-                <span className="text-[10px] text-muted-foreground">{totalIdle} {t('idle' as any) || 'idle'}</span>
+                <span className="text-[10px] text-muted-foreground">{freeCounters} {t('idle' as any) || 'idle'}</span>
               </div>
             </div>
           </div>
         </CardHeader>
         <CardContent className="pt-0">
-          <div className="space-y-2.5">
-            {counters.map((counter, idx) => (
-              <motion.div
-                key={counter.id}
-                initial={{ opacity: 0, x: -10 }}
-                animate={{ opacity: 1, x: 0 }}
-                transition={{ delay: idx * 0.06 }}
-                className={`relative rounded-xl border p-3 transition-all duration-200 ${COUNTER_BG_COLORS[idx % COUNTER_BG_COLORS.length]} ${
-                  counter.currentTicket ? 'ring-1 ring-emerald-300/50 dark:ring-emerald-700/50' : ''
-                }`}
-              >
-                <div className="flex items-center gap-3">
-                  {/* Counter Number Badge */}
-                  <div className={`h-10 w-10 rounded-xl bg-gradient-to-br ${COUNTER_COLORS[idx % COUNTER_COLORS.length]} flex items-center justify-center flex-shrink-0 shadow-md`}>
-                    <span className="text-sm font-black text-white">{counter.number}</span>
-                  </div>
-
-                  {/* Counter Info */}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2">
-                      <div className="flex items-center gap-1.5">
-                        <User className="h-3 w-3 text-muted-foreground" />
-                        <span className="text-xs font-medium text-foreground truncate">{counter.staffName}</span>
-                      </div>
-                      {counter.currentTicket && (
-                        <Badge className="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400 text-[9px] px-1.5 py-0 h-4 border-0">
-                          {t('serving' as any) || 'Serving'}
-                        </Badge>
-                      )}
-                      {!counter.currentTicket && (
-                        <Badge className="bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 text-[9px] px-1.5 py-0 h-4 border-0">
-                          {t('idle' as any) || 'Idle'}
-                        </Badge>
-                      )}
-                    </div>
-
-                    {/* Current Ticket Info */}
-                    {counter.currentTicket ? (
-                      <div className="flex items-center gap-2 mt-1">
-                        <div className="flex items-center gap-1">
-                          <Hash className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
-                          <span className="text-sm font-bold text-emerald-700 dark:text-emerald-400">{counter.currentTicket}</span>
-                        </div>
-                        <span className="text-[10px] text-muted-foreground truncate">· {counter.currentCustomer}</span>
-                        {counter.currentService && (
-                          <span className="text-[10px] text-muted-foreground truncate hidden lg:inline">· {counter.currentService}</span>
-                        )}
-                      </div>
-                    ) : (
-                      <p className="text-[10px] text-muted-foreground mt-1">{t('noTicketBeingServed' as any)}</p>
-                    )}
-                  </div>
-
-                  {/* Actions */}
-                  <div className="flex items-center gap-1.5 flex-shrink-0">
-                    <div className="text-center px-1">
-                      <p className="text-xs font-bold text-foreground">{counter.servedToday}</p>
-                      <p className="text-[8px] text-muted-foreground">{t('served' as any) || 'served'}</p>
-                    </div>
-                    {!counter.currentTicket && waitingList.length > 0 && (
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} className={!subscriptionActive ? 'cursor-not-allowed' : undefined}>
-                            <Button
-                              size="sm"
-                              onClick={() => { if (subscriptionActive) onCallNextForCounter(counter.id); }}
-                              disabled={!!actionLoading || !subscriptionActive}
-                              className="h-8 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-emerald-700 hover:from-emerald-600 hover:to-emerald-800 text-white text-xs font-semibold gap-1 shadow-sm disabled:opacity-50"
-                            >
-                              {actionLoading === `call-${counter.id}` ? (
-                                <Loader2 className="h-3 w-3 animate-spin" />
-                              ) : !subscriptionActive ? (
-                                <Lock className="h-3 w-3" />
-                              ) : (
-                                <PhoneCall className="h-3 w-3" />
-                              )}
-                              <span className="hidden sm:inline">{t('callNext')}</span>
-                            </Button>
-                          </motion.div>
-                        </TooltipTrigger>
-                        {!subscriptionActive && (
-                          <TooltipContent>{t('subscriptionLockedTooltip')}</TooltipContent>
-                        )}
-                      </Tooltip>
-                    )}
-                  </div>
-                </div>
-
-                {/* Pulse indicator for active counter */}
-                {counter.currentTicket && (
+          <div className="space-y-2.5 max-h-96 overflow-y-auto custom-scrollbar">
+            {loadingCounters && counters.length === 0 ? (
+              <p className="text-xs text-muted-foreground py-4 text-center">{t('loading' as any) || '...'}</p>
+            ) : counters.length === 0 ? (
+              <p className="text-xs text-muted-foreground py-4 text-center">{t('noData' as any)}</p>
+            ) : (
+              counters.map((counter, idx) => {
+                const occupiedByOther =
+                  !!counter.staffId && !isOwnerCaller && counter.staffId !== myStaffId;
+                return (
                   <motion.div
-                    className="absolute top-2 end-2 h-2 w-2 rounded-full bg-emerald-500"
-                    animate={{ opacity: [1, 0.3, 1] }}
-                    transition={{ duration: 2, repeat: Infinity , ease: 'easeInOut' }}
-                  />
-                )}
-              </motion.div>
-            ))}
+                    key={counter.id}
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: Math.min(idx * 0.06, 0.3) }}
+                    className={`relative rounded-xl border p-3 transition-all duration-200 ${COUNTER_BG_COLORS[idx % COUNTER_BG_COLORS.length]} ${
+                      counter.currentTicket ? 'ring-1 ring-emerald-300/50 dark:ring-emerald-700/50' : ''
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      {/* Counter Number Badge */}
+                      <div className={`h-10 w-10 rounded-xl bg-gradient-to-br ${COUNTER_COLORS[idx % COUNTER_COLORS.length]} flex items-center justify-center flex-shrink-0 shadow-md`}>
+                        <span className="text-sm font-black text-white">{counter.number}</span>
+                      </div>
+
+                      {/* Counter Info */}
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-xs font-semibold text-foreground truncate max-w-[120px]">
+                            {localizeCounterName(counter)}
+                          </span>
+                          {counter.branchName && (
+                            <span className="text-[10px] text-muted-foreground truncate max-w-[100px]">
+                              · {counter.branchName}
+                            </span>
+                          )}
+                          {/* Occupation state — real staff relation */}
+                          {counter.staffId ? (
+                            <Badge className="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400 text-[9px] px-1.5 py-0 h-4 border-0">
+                              <User className="h-2.5 w-2.5 me-0.5" />
+                              {counter.staffName
+                                ? t('counterOccupiedBy', { name: counter.staffName })
+                                : t('counterOccupied')}
+                            </Badge>
+                          ) : (
+                            <Badge className="bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 text-[9px] px-1.5 py-0 h-4 border-0">
+                              {t('counterFree')}
+                            </Badge>
+                          )}
+                          {counter.currentTicket && (
+                            <Badge className="bg-white/80 dark:bg-gray-900/60 text-emerald-700 dark:text-emerald-400 text-[9px] px-1.5 py-0 h-4 border border-emerald-200 dark:border-emerald-800">
+                              {t('serving' as any) || 'Serving'}
+                            </Badge>
+                          )}
+                        </div>
+
+                        {/* Current Ticket Info */}
+                        {counter.currentTicket ? (
+                          <div className="flex items-center gap-2 mt-1">
+                            <div className="flex items-center gap-1">
+                              <Hash className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+                              <span className="text-sm font-bold text-emerald-700 dark:text-emerald-400">{counter.currentTicket}</span>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-[10px] text-muted-foreground mt-1">{t('noTicketBeingServed' as any)}</p>
+                        )}
+                      </div>
+
+                      {/* Actions */}
+                      <div className="flex items-center gap-1.5 flex-shrink-0">
+                        {occupiedByOther ? (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <div className="cursor-not-allowed">
+                                <Button
+                                  size="sm"
+                                  disabled
+                                  className="h-8 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-emerald-700 text-white text-xs font-semibold gap-1 shadow-sm disabled:opacity-50"
+                                >
+                                  <Lock className="h-3 w-3" />
+                                  <span className="hidden sm:inline">{t('callNext')}</span>
+                                </Button>
+                              </div>
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-[220px]">
+                              {counter.staffName
+                                ? t('counterOccupiedBy', { name: counter.staffName })
+                                : t('counterOccupied')}
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} className={!subscriptionActive ? 'cursor-not-allowed' : undefined}>
+                                <Button
+                                  size="sm"
+                                  onClick={() => { if (subscriptionActive) handleCallNextForCounter(counter.id); }}
+                                  disabled={!!callingCounterId || !subscriptionActive}
+                                  className="h-8 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-emerald-700 hover:from-emerald-600 hover:to-emerald-800 text-white text-xs font-semibold gap-1 shadow-sm disabled:opacity-50"
+                                >
+                                  {callingCounterId === counter.id ? (
+                                    <Loader2 className="h-3 w-3 animate-spin" />
+                                  ) : !subscriptionActive ? (
+                                    <Lock className="h-3 w-3" />
+                                  ) : (
+                                    <PhoneCall className="h-3 w-3" />
+                                  )}
+                                  <span className="hidden sm:inline">{t('callNext')}</span>
+                                </Button>
+                              </motion.div>
+                            </TooltipTrigger>
+                            {!subscriptionActive && (
+                              <TooltipContent>{t('subscriptionLockedTooltip')}</TooltipContent>
+                            )}
+                          </Tooltip>
+                        )}
+                      </div>
+                    </div>
+                  </motion.div>
+                );
+              })
+            )}
           </div>
 
           {/* Summary */}
@@ -266,8 +385,8 @@ export function CounterManagement({
                 <p className="text-[9px] text-muted-foreground">{t('totalCounters' as any)}</p>
               </div>
               <div>
-                <p className="text-sm font-bold text-emerald-600 dark:text-emerald-400">{totalServing}</p>
-                <p className="text-[9px] text-muted-foreground">{t('activeCounters' as any) || 'Active'}</p>
+                <p className="text-sm font-bold text-emerald-600 dark:text-emerald-400">{servedToday}</p>
+                <p className="text-[9px] text-muted-foreground">{t('served' as any) || 'served'}</p>
               </div>
               <div>
                 <p className="text-sm font-bold text-foreground">~{avgWaitTime}{t('min')}</p>

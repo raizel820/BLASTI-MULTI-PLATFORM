@@ -90,6 +90,27 @@ export async function verifySessionToken(token: string, options?: { checkStaleRo
     const { payload } = await jwtVerify(token, secret, { algorithms: ['HS256'] })
     const sessionToken = payload as unknown as SessionToken
 
+    // ── Task 36: database-reset invalidation ─────────────────────────────────
+    // scripts/reset-all.ts stamps .db-generation.json with the reset epoch.
+    // EVERY session JWT issued before that moment is dead — even when its
+    // signature still verifies and (while the API is still serving the deleted
+    // pre-reset database file through its old handle) the account behind it
+    // still "exists". Without this, a desktop or browser session survives a
+    // full cloud reset and keeps loading the deleted account. The 1s grace
+    // absorbs the JWT `iat` second-flooring: a token legitimately created in
+    // the same wall-second as the epoch write must stay valid.
+    const invalidationEpoch = getInvalidationEpochMs()
+    if (invalidationEpoch !== null) {
+      const issuedAt = sessionToken.iat
+      if (!issuedAt || issuedAt * 1000 < invalidationEpoch - 1000) {
+        console.warn(
+          `[AUTH] Pre-reset session rejected: user=${sessionToken.id} (${sessionToken.username ?? 'unknown'}) ` +
+          `iat=${issuedAt ?? 'none'} is older than resetEpoch=${invalidationEpoch} — forcing re-authentication`,
+        )
+        return null
+      }
+    }
+
     // Phase 2b: Stale JWT escalation check
     if (options?.checkStaleRole && sessionToken.id) {
       const user = await db.user.findUnique({
@@ -215,7 +236,7 @@ export class AuthError extends Error {
 
 // ─── Auth Requirements (same API as original auth-guard.ts) ────────────────
 
-import { db } from '@blasti/db'
+import { db, getInvalidationEpochMs } from '@blasti/db'
 
 /**
  * Requires authentication. Throws AuthError if not logged in.
@@ -282,7 +303,7 @@ export async function requireResourceOwnership(c: Context, resourceUserId: strin
 
 /**
  * Staff permission field names on the AgencyStaff model.
- * These correspond to the boolean columns added in Phase 2.
+ * These correspond to the boolean columns added in Phase 2 (+ Task 37-c).
  */
 export type StaffPermission =
   | 'canManageQueue'
@@ -293,6 +314,115 @@ export type StaffPermission =
   | 'canManageWorkingHours'
   | 'canExportData'
   | 'canManageProfile'
+  // Task 37-c: 2-tier staff authority — manager-only grants the owner can
+  // limit per staff member. canManageQueue/canViewAnalytics stay ALWAYS-SHARED.
+  | 'canCreateBranches'
+  | 'canDeleteBranches'
+  | 'canPurchaseSubscription'
+  | 'canManageSubscription'
+
+/** Every StaffPermission key, used to build full-true maps for owners. */
+export const STAFF_PERMISSION_KEYS: StaffPermission[] = [
+  'canManageQueue',
+  'canManageServices',
+  'canManageStaff',
+  'canViewAnalytics',
+  'canManageBranches',
+  'canManageWorkingHours',
+  'canExportData',
+  'canManageProfile',
+  'canCreateBranches',
+  'canDeleteBranches',
+  'canPurchaseSubscription',
+  'canManageSubscription',
+]
+
+/** Role of the caller inside an agency (Task 37-c authority model). */
+export type AgencyRole = 'OWNER' | 'MANAGER' | 'STAFF'
+
+export interface AgencyAuthority {
+  isOwner: boolean
+  role: AgencyRole | null
+  staffId: string | null
+  permissions: Record<StaffPermission, boolean>
+}
+
+function allPermissionsTrue(): Record<StaffPermission, boolean> {
+  const map = {} as Record<StaffPermission, boolean>
+  for (const key of STAFF_PERMISSION_KEYS) map[key] = true
+  return map
+}
+
+/**
+ * Task 37-c: resolve the caller's authority inside an agency.
+ *
+ * - OWNER: resolved via Agency.ownerId — isOwner=true, ALL permissions true,
+ *   staffId=null (owners have no AgencyStaff row).
+ * - MANAGER/STAFF: resolved via the ACTIVE AgencyStaff row — role + the
+ *   normalized boolean columns.
+ * - Nobody: nulls + all-false (the record itself is still returned so callers
+ *   can render a consistent shape).
+ *
+ * SUPER_ADMIN is intentionally NOT handled here — callers decide how the
+ * platform admin bypasses (usually by treating them as owner upstream).
+ */
+export async function getAgencyAuthority(userId: string, agencyId: string): Promise<AgencyAuthority> {
+  const ownership = await db.agency.findFirst({
+    where: { id: agencyId, ownerId: userId },
+    select: { id: true },
+  })
+  if (ownership) {
+    return { isOwner: true, role: 'OWNER', staffId: null, permissions: allPermissionsTrue() }
+  }
+
+  const staffRow = await db.agencyStaff.findFirst({
+    where: { userId, agencyId, isActive: true },
+  })
+  if (staffRow) {
+    const role: AgencyRole = staffRow.role === 'OWNER' ? 'OWNER' : staffRow.role === 'MANAGER' ? 'MANAGER' : 'STAFF'
+    const permissions = {} as Record<StaffPermission, boolean>
+    for (const key of STAFF_PERMISSION_KEYS) {
+      permissions[key] = Boolean((staffRow as Record<string, unknown>)[key])
+    }
+    return { isOwner: role === 'OWNER', role, staffId: staffRow.id, permissions }
+  }
+
+  const none = {} as Record<StaffPermission, boolean>
+  for (const key of STAFF_PERMISSION_KEYS) none[key] = false
+  return { isOwner: false, role: null, staffId: null, permissions: none }
+}
+
+/**
+ * Task 37-c: require the caller to hold EVERY listed permission inside an
+ * agency. Resolution order:
+ *   1. requireAuth (401 when anonymous)
+ *   2. SUPER_ADMIN passes (platform admin bypass)
+ *   3. Agency owner passes (Agency.ownerId)
+ *   4. ACTIVE AgencyStaff row must carry ALL listed permissions
+ * On failure: AuthError 403 with a single detectable string:
+ *   'PERMISSION_DENIED:<permission>' (first missing permission wins).
+ */
+export async function requireAgencyAuthority(
+  c: Context,
+  agencyId: string,
+  permission: StaffPermission | StaffPermission[],
+): Promise<SessionUser> {
+  const user = await requireAuth(c)
+
+  if (user.role === 'SUPER_ADMIN') return user
+
+  const required = Array.isArray(permission) ? permission : [permission]
+  const authority = await getAgencyAuthority(user.id, agencyId)
+
+  if (authority.isOwner) return user
+
+  for (const perm of required) {
+    if (!authority.permissions[perm]) {
+      throw new AuthError(`PERMISSION_DENIED:${perm}`, 403)
+    }
+  }
+  return user
+}
 
 /**
  * Requires the authenticated user to have a specific staff permission.

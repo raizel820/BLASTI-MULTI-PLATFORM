@@ -35,6 +35,24 @@ const errors = [];
   }
 }
 
+// ─── Step 2: Build stamp (Task 40 — stale-bundle guard) ───────────────────────
+// Every packaged build writes a timestamp (+ git sha) that the loading screen
+// and the main-process boot log surface. If a desktop install shows an old
+// build date, its bundle predates the latest fixes — rebuild, don't debug.
+{
+  let git = null;
+  try {
+    git = require('child_process').execSync('git rev-parse --short HEAD', {
+      cwd: path.resolve(__dirname, '../..'),
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch { git = null; } // not a git checkout — timestamp alone still identifies the build
+  const stamp = { builtAt: new Date().toISOString(), git };
+  fs.writeFileSync(path.resolve(__dirname, '../build-stamp.json'), JSON.stringify(stamp, null, 2) + '\n');
+  console.log('[prebuild] Wrote build-stamp.json:', stamp.builtAt, git ? '(git ' + git + ')' : '');
+}
+
 // ─── Summary ────────────────────────────────────────────────────────────────────
 if (errors.length > 0) {
   console.error('\n[prebuild] FAILED with ' + errors.length + ' error(s)');

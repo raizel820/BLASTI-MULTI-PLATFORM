@@ -47,12 +47,14 @@ import {
   Timer,
   History,
   Lock,
+  DoorOpen,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
+import { useAgencyAuthority } from '@/hooks/use-agency-authority';
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -329,10 +331,30 @@ export function AgencyFullscreen() {
   const [serviceDurationSeconds, setServiceDurationSeconds] = useState(0);
   const durationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Counter / Reception selection — for per-reception serving
-  interface CounterOption { id: string; number: number; name: string; nameAr?: string | null; nameFr?: string | null; branchName: string }
+  // Counter / Reception selection — for per-reception serving.
+  // Task 37-e: the STAFF MEMBER now OCCUPIES the counter they pick (real
+  // server-side occupation, mirrored by Counter.staffId / occupiedAt) —
+  // call-next requires the target counter to be occupied by the caller.
+  interface CounterOption {
+    id: string;
+    number: number;
+    name: string;
+    nameAr?: string | null;
+    nameFr?: string | null;
+    branchName: string;
+    staffId?: string | null;
+    occupiedBy?: string | null;
+    occupiedAt?: string | null;
+  }
   const [counters, setCounters] = useState<CounterOption[]>([]);
   const [selectedCounterId, setSelectedCounterId] = useState<string>('');
+  const [occupationLoading, setOccupationLoading] = useState<string | null>(null);
+
+  // Agency authority — gives the fullscreen the caller's staffId (for "is
+  // this counter mine?") and the owner bypass.
+  const { authority } = useAgencyAuthority();
+  const myStaffId = authority?.staffId ?? null;
+  const isOwnerCaller = authority?.isOwner === true;
 
   // Fetch counters for this agency (all branches)
   const fetchCounters = useCallback(async () => {
@@ -347,29 +369,42 @@ export function AgencyFullscreen() {
         const cRes = await apiFetch(`/api/agency/branches/${branch.id}/counters`);
         if (!cRes.ok) continue;
         const cData = await cRes.json();
-        if (!cData.success || !cData.counters) continue;
-        for (const c of cData.counters) {
-          if (!c.isActive) continue;
+        const list: Array<Record<string, unknown>> = cData.counters ?? cData.data ?? [];
+        for (const c of list) {
+          if (c.isActive === false) continue;
+          const staff = c.staff as { user?: { fullName?: string; username?: string } } | null | undefined;
           allCounters.push({
-            id: c.id,
-            number: c.number,
-            name: c.name,
-            nameAr: c.nameAr,
-            nameFr: c.nameFr,
+            id: String(c.id),
+            number: Number(c.number ?? 0),
+            name: String(c.name ?? ''),
+            nameAr: (c.nameAr as string | null) ?? null,
+            nameFr: (c.nameFr as string | null) ?? null,
             branchName: branch.name,
+            staffId: (c.staffId as string | null) ?? null,
+            occupiedBy: staff?.user?.fullName ?? null,
+            occupiedAt: (c.occupiedAt as string | null) ?? null,
           });
         }
       }
       setCounters(allCounters);
-      // Restore saved counter from localStorage
+      // Task 37-e: the previous localStorage-only restore is now backed by the
+      // server's occupation state. A saved counter is only restored when it is
+      // REALLY occupied by this caller (staff) or the caller is an owner
+      // (owners don't hold counters via staffId — keep the old convenience).
       const saved = localStorage.getItem(`blasti_counter_${agencyId}`);
-      if (saved && allCounters.some(c => c.id === saved)) {
+      const savedCounter = saved ? allCounters.find(c => c.id === saved) : undefined;
+      if (saved && savedCounter && (isOwnerCaller || (!!myStaffId && savedCounter.staffId === myStaffId))) {
         setSelectedCounterId(saved);
+      } else if (myStaffId) {
+        // Already occupying one of the agency's counters? Re-attach to it.
+        const mine = allCounters.find(c => !!c.staffId && c.staffId === myStaffId);
+        if (mine) setSelectedCounterId(mine.id);
+        else setSelectedCounterId('');
       } else if (allCounters.length === 1) {
         setSelectedCounterId(allCounters[0].id);
       }
     } catch { /* ignore */ }
-  }, [agencyId]);
+  }, [agencyId, myStaffId, isOwnerCaller]);
 
   // Calculate live duration from currentServing's calledAt
   useEffect(() => {
@@ -637,6 +672,9 @@ export function AgencyFullscreen() {
     setActionLoading('call');
     try {
       const body: Record<string, string> = { agencyId };
+      // Task 37-c contract: staff MUST call from a counter they personally
+      // occupy — the counterId is sent whenever one is selected, and a staff
+      // caller with no occupied counter gets the friendly occupyFirst toast.
       if (selectedCounterId) body.counterId = selectedCounterId;
       const res = await apiFetch('/api/agency/queue/call-next', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -646,9 +684,81 @@ export function AgencyFullscreen() {
         if (selectedCounterId) localStorage.setItem(`blasti_counter_${agencyId}`, selectedCounterId);
         toast.success(t('statusCalled')); fetchAll();
       }
-      else { const data = await res.json(); toast.error(data.details || data.error || t('noQueue')); }
+      else {
+        const data = await res.json();
+        let errorMsg: string = data.details || data.error || t('noQueue');
+        if (data.error === 'OCCUPY_COUNTER_FIRST') errorMsg = t('occupyFirst');
+        else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) errorMsg = t('counterPermissionDenied');
+        toast.error(errorMsg);
+      }
     } catch { toast.error(t('error')); }
     finally { setActionLoading(null); }
+  };
+
+  // ─── Task 37-e: counter OCCUPATION (staff self-service) ─────────────────
+  // Picking a counter in the selector now OCCUPIES it server-side
+  // (POST /api/agency/counters/:id/occupy). 409 COUNTER_OCCUPIED (another
+  // active staff holds it) toasts + refreshes the list; PERMISSION_DENIED
+  // surfaces a friendly message. The Release action frees it again.
+
+  const handleCounterSelect = async (counterId: string) => {
+    if (!agencyId || counterId === selectedCounterId) return;
+    setOccupationLoading(counterId);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(counterId)}/occupy`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        setSelectedCounterId(counterId);
+        localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
+        toast.success(t('occupyCounter'));
+        fetchCounters();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        if (data.error === 'COUNTER_OCCUPIED') {
+          toast.error(t('counterOccupied'));
+          fetchCounters(); // refresh the occupied-by states
+        } else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) {
+          toast.error(t('counterPermissionDenied'));
+        } else {
+          toast.error(data.error || t('error'));
+        }
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setOccupationLoading(null);
+    }
+  };
+
+  const handleReleaseCounter = async () => {
+    if (!agencyId || !selectedCounterId) return;
+    setOccupationLoading(selectedCounterId);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(selectedCounterId)}/release`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        localStorage.removeItem(`blasti_counter_${agencyId}`);
+        setSelectedCounterId('');
+        toast.success(t('counterReleased'));
+        fetchCounters();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        if (data.error === 'COUNTER_OCCUPIED') {
+          toast.error(t('counterOccupied'));
+          fetchCounters();
+        } else if (typeof data.error === 'string' && (data.error.startsWith('PERMISSION_DENIED') || data.error === 'NOT_COUNTER_OCCUPIER')) {
+          toast.error(t('counterPermissionDenied'));
+        } else {
+          toast.error(data.error || t('error'));
+        }
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setOccupationLoading(null);
+    }
   };
 
   const handleComplete = async (reservationId: string) => {
@@ -838,23 +948,62 @@ export function AgencyFullscreen() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {/* Counter / Reception Selector */}
+          {/* Counter / Reception Selector — Task 37-e: picking a counter
+              OCCUPIES it (staff self-service); occupied state is shown per
+              item, and a Release action frees the counter again. */}
           {counters.length > 0 && (
-            <Select value={selectedCounterId} onValueChange={(v) => setSelectedCounterId(v)}>
-              <SelectTrigger className="h-7 px-2 bg-gray-800 border-gray-700 text-[11px] text-gray-300 rounded-lg gap-1 min-w-[120px] max-w-[180px]">
-                <SelectValue placeholder={t('selectCounter') || 'Select Counter'} />
-              </SelectTrigger>
-              <SelectContent className="bg-gray-900 border-gray-700">
-                {counters.map((c) => (
-                  <SelectItem key={c.id} value={c.id} className="text-xs text-gray-300">
-                    <div className="flex items-center gap-2">
-                      <span className="font-bold text-emerald-400">#{c.number}</span>
-                      <span>{lang === 'ar' ? (c.nameAr || c.name) : lang === 'fr' ? (c.nameFr || c.name) : c.name}</span>
-                    </div>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <div className="flex items-center gap-1">
+              <Select
+                value={selectedCounterId || undefined}
+                onValueChange={handleCounterSelect}
+                disabled={!!occupationLoading}
+              >
+                <SelectTrigger className="h-7 px-2 bg-gray-800 border-gray-700 text-[11px] text-gray-300 rounded-lg gap-1 min-w-[120px] max-w-[180px]">
+                  <SelectValue placeholder={t('selectCounter') || 'Select Counter'} />
+                </SelectTrigger>
+                <SelectContent className="bg-gray-900 border-gray-700">
+                  {counters.map((c) => {
+                    const mine = !!myStaffId && c.staffId === myStaffId;
+                    return (
+                      <SelectItem key={c.id} value={c.id} className="text-xs text-gray-300">
+                        <div
+                          className="flex items-center gap-2"
+                          title={c.staffId ? `${t('counterOccupiedBy', { name: c.occupiedBy || '' })}${c.occupiedAt ? ` · ${formatTime(c.occupiedAt, lang)}` : ''}` : t('counterFree')}
+                        >
+                          <span className="font-bold text-emerald-400">#{c.number}</span>
+                          <span>{lang === 'ar' ? (c.nameAr || c.name) : lang === 'fr' ? (c.nameFr || c.name) : c.name}</span>
+                          <span className={`text-[10px] ${mine ? 'text-emerald-400' : c.staffId ? 'text-amber-400' : 'text-gray-500'}`}>
+                            {c.staffId
+                              ? (mine
+                                ? t('counterMine')
+                                : c.occupiedBy
+                                  ? t('counterOccupiedBy', { name: c.occupiedBy })
+                                  : t('counterOccupied'))
+                              : t('counterFree')}
+                          </span>
+                        </div>
+                      </SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
+              {selectedCounterId && (isOwnerCaller || counters.some((c) => c.id === selectedCounterId && (!!myStaffId && c.staffId === myStaffId))) && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleReleaseCounter}
+                  disabled={!!occupationLoading}
+                  className="h-7 px-2 gap-1 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg text-[11px]"
+                >
+                  {occupationLoading === selectedCounterId ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <DoorOpen className="h-3 w-3" />
+                  )}
+                  <span className="hidden sm:inline">{t('releaseCounter')}</span>
+                </Button>
+              )}
+            </div>
           )}
           <div className="flex items-center gap-1.5">
             <motion.div

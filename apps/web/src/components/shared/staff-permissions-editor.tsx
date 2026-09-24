@@ -1,12 +1,34 @@
 'use client';
 
+// Task 37-e: extended with the 4 manager-tier authority toggles
+// (canCreateBranches / canDeleteBranches / canPurchaseSubscription /
+// canManageSubscription) — 12 toggles total, matching the normalized
+// permission columns written by POST /api/agency/staff/create and
+// PATCH /api/agency/staff/:id. The 'manager' preset now sets the exact
+// MANAGER tier grants from the Task 37-c backend defaults.
+
 import { useState, useEffect } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { isRTL } from '@/i18n';
 import { motion } from 'framer-motion';
-import { Shield, Check, Zap, UserCheck, Settings, Eye, GitBranch, Clock, Download, User } from 'lucide-react';
+import {
+  Shield,
+  Check,
+  Zap,
+  UserCheck,
+  Settings,
+  Eye,
+  GitBranch,
+  Clock,
+  Download,
+  User,
+  Building2,
+  Trash2,
+  CreditCard,
+  Crown,
+} from 'lucide-react';
 
-interface StaffPermissions {
+export interface StaffPermissions {
   canManageQueue: boolean;
   canManageServices: boolean;
   canManageStaff: boolean;
@@ -15,6 +37,10 @@ interface StaffPermissions {
   canManageWorkingHours: boolean;
   canExportData: boolean;
   canManageProfile: boolean;
+  canCreateBranches: boolean;
+  canDeleteBranches: boolean;
+  canPurchaseSubscription: boolean;
+  canManageSubscription: boolean;
 }
 
 interface StaffPermissionsEditorProps {
@@ -33,6 +59,10 @@ const PERMISSION_PRESETS: Record<string, Partial<StaffPermissions>> = {
     canManageWorkingHours: true,
     canExportData: true,
     canManageProfile: true,
+    canCreateBranches: true,
+    canDeleteBranches: true,
+    canPurchaseSubscription: true,
+    canManageSubscription: true,
   },
   queueOnly: {
     canManageQueue: true,
@@ -43,6 +73,10 @@ const PERMISSION_PRESETS: Record<string, Partial<StaffPermissions>> = {
     canManageWorkingHours: false,
     canExportData: false,
     canManageProfile: false,
+    canCreateBranches: false,
+    canDeleteBranches: false,
+    canPurchaseSubscription: false,
+    canManageSubscription: false,
   },
   basicStaff: {
     canManageQueue: true,
@@ -53,16 +87,26 @@ const PERMISSION_PRESETS: Record<string, Partial<StaffPermissions>> = {
     canManageWorkingHours: false,
     canExportData: false,
     canManageProfile: false,
+    canCreateBranches: false,
+    canDeleteBranches: false,
+    canPurchaseSubscription: false,
+    canManageSubscription: false,
   },
+  // Task 37-e: the exact MANAGER tier grants from the server's
+  // tierDefaultsForRole('MANAGER') — STAFF tier + the 5 business authorities.
   manager: {
     canManageQueue: true,
-    canManageServices: true,
+    canManageServices: false,
     canManageStaff: false,
     canViewAnalytics: true,
-    canManageBranches: true,
-    canManageWorkingHours: true,
+    canManageBranches: false,
+    canManageWorkingHours: false,
     canExportData: false,
     canManageProfile: true,
+    canCreateBranches: true,
+    canDeleteBranches: true,
+    canPurchaseSubscription: true,
+    canManageSubscription: true,
   },
 };
 
@@ -75,6 +119,10 @@ export const DEFAULT_PERMISSIONS: StaffPermissions = {
   canManageWorkingHours: false,
   canExportData: false,
   canManageProfile: false,
+  canCreateBranches: false,
+  canDeleteBranches: false,
+  canPurchaseSubscription: false,
+  canManageSubscription: false,
 };
 
 export function parsePermissions(permStr: string | null | undefined): StaffPermissions {
@@ -100,6 +148,11 @@ export function StaffPermissionsEditor({ permissions, onChange, staffRole }: Sta
     { key: 'canManageWorkingHours', icon: <Clock className="h-4 w-4" />, labelKey: 'manageWorkingHours' },
     { key: 'canExportData', icon: <Download className="h-4 w-4" />, labelKey: 'exportData' },
     { key: 'canManageProfile', icon: <User className="h-4 w-4" />, labelKey: 'manageProfile' },
+    // Task 37-e: manager-tier authorities
+    { key: 'canCreateBranches', icon: <Building2 className="h-4 w-4" />, labelKey: 'authorityCreateBranches' },
+    { key: 'canDeleteBranches', icon: <Trash2 className="h-4 w-4" />, labelKey: 'authorityDeleteBranches' },
+    { key: 'canPurchaseSubscription', icon: <CreditCard className="h-4 w-4" />, labelKey: 'authorityMakePurchase' },
+    { key: 'canManageSubscription', icon: <Crown className="h-4 w-4" />, labelKey: 'authorityManageSubscription' },
   ];
 
   const presets = [

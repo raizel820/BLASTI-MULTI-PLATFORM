@@ -26,6 +26,7 @@ const nextConfig: NextConfig = {
     'preview-chat-*.space-z.ai',
     'localhost',
     '127.0.0.1',
+    '192.168.100.5'
   ],
 
   // NOTE: API proxy rewrites have been REMOVED.

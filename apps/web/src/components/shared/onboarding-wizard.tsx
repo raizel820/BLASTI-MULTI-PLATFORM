@@ -258,8 +258,12 @@ export function OnboardingWizard({ open, user, onComplete, onSkip }: OnboardingP
                       aria-checked={smsEnabled}
                     >
                       <span
-                        className="absolute top-[3px] start-[3px] h-[18px] w-[18px] rounded-full bg-white shadow-sm transition-transform duration-200 pointer-events-none"
-                        style={{ transform: smsEnabled ? 'translateX(20px)' : 'translateX(0)' }}
+                        className={`absolute top-[3px] h-[18px] w-[18px] rounded-full bg-white shadow-sm transition-all duration-200 pointer-events-none ${
+                          // Task 39: logical inset instead of translateX —
+                          // translateX slid the knob 20px PAST the track edge
+                          // in RTL (the app's default Arabic direction).
+                          smsEnabled ? 'start-[23px]' : 'start-[3px]'
+                        }`}
                       />
                     </button>
                   </div>

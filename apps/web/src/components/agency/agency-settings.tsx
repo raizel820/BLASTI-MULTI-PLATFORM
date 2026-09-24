@@ -89,6 +89,20 @@ interface AgencySettingsData {
   smsBalance: number;
 }
 
+// Task 37: read-only branch summary rendered inside the settings page (the
+// full CRUD lives in the dedicated Branches view).
+interface BranchSummary {
+  id: string;
+  name: string;
+  nameAr?: string | null;
+  nameFr?: string | null;
+  address?: string | null;
+  phone?: string | null;
+  isActive: boolean;
+  isMain: boolean;
+  _count?: { counters?: number; staff?: number };
+}
+
 interface SettingsSection {
   id: string;
   icon: React.ElementType;
@@ -138,6 +152,17 @@ export function AgencySettings() {
   const [newStaffFullName, setNewStaffFullName] = useState('');
   const [newStaffPassword, setNewStaffPassword] = useState('');
   const [newStaffRole, setNewStaffRole] = useState<'STAFF' | 'MANAGER'>('STAFF');
+  // Task 37: staff accounts must be linked to a branch (mirrors the
+  // agency-employees dialog) — required select fed by the branches GET.
+  const [newStaffBranchId, setNewStaffBranchId] = useState('');
+  const [newStaffBranchError, setNewStaffBranchError] = useState(false);
+
+  // Task 37: read-only branches summary + plan capacity cap state
+  const [branchList, setBranchList] = useState<BranchSummary[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  // number > 0 = hard cap, -1 = unlimited, null = unknown (fail open, no UI hint)
+  const [planCapacityCap, setPlanCapacityCap] = useState<number | null>(null);
+  const [capacityWarning, setCapacityWarning] = useState(false);
 
   // Staff credentials dialog state
   const [credentialsDialogOpen, setCredentialsDialogOpen] = useState(false);
@@ -164,13 +189,18 @@ export function AgencySettings() {
   useEffect(() => {
     fetchSettings();
     fetchStaff();
+    fetchBranches();
+    fetchPlanCap();
   }, []);
 
+  // Task 37: no early return when the session user lacks agencyId — the APIs
+  // (cloud + desktop local) resolve the agency from the session now. The
+  // agencyId query param is only sent when the session actually has one.
   const fetchStaff = async () => {
-    if (!user?.agencyId) return;
     setStaffLoading(true);
     try {
-      const res = await apiFetch(`/api/agency/staff?agencyId=${user.agencyId}`);
+      const params = user?.agencyId ? `?agencyId=${encodeURIComponent(user.agencyId)}` : '';
+      const res = await apiFetch(`/api/agency/staff${params}`);
       if (res.ok) {
         const data = await res.json();
         setStaffList(data.staff ?? []);
@@ -182,11 +212,61 @@ export function AgencySettings() {
     }
   };
 
+  // Task 37: real branch summary for the settings page. Dual envelope
+  // (cloud { branches } / local historically { data }) like agency-branches.
+  const fetchBranches = async () => {
+    setBranchesLoading(true);
+    try {
+      const params = user?.agencyId ? `?agencyId=${encodeURIComponent(user.agencyId)}` : '';
+      const res = await apiFetch(`/api/agency/branches${params}`);
+      if (res.ok) {
+        const data = await res.json();
+        setBranchList(data.branches ?? data.data ?? []);
+      }
+    } catch {
+      // silent — the summary section renders its empty state
+    } finally {
+      setBranchesLoading(false);
+    }
+  };
+
+  // Task 37: resolve the current plan's capacity cap from the subscription
+  // endpoint (availablePlans rows carry maxActiveReservations; currentPlan is
+  // the tier name matching plan.name). Unknown plan → null → fail open.
+  const fetchPlanCap = async () => {
+    try {
+      const params = user?.agencyId ? `?agencyId=${encodeURIComponent(user.agencyId)}` : '';
+      const res = await apiFetch(`/api/agency/subscription${params}`);
+      if (res.ok) {
+        const data = await res.json();
+        const plans: Array<{ name?: string; maxActiveReservations?: number }> = data.availablePlans ?? [];
+        const current = String(data.currentPlan ?? '').toUpperCase();
+        const match = plans.find((p) => (p.name ?? '').toUpperCase() === current);
+        setPlanCapacityCap(
+          typeof match?.maxActiveReservations === 'number' ? match.maxActiveReservations : null
+        );
+      }
+    } catch {
+      // silent — no cap info, the input stays unclamped (server still gates)
+    }
+  };
+
   const resetStaffForm = () => {
     setNewStaffUsername('');
     setNewStaffFullName('');
     setNewStaffPassword('');
     setNewStaffRole('STAFF');
+    setNewStaffBranchId('');
+    setNewStaffBranchError(false);
+  };
+
+  // Task 37: clamp a capacity value against the plan cap (null = unknown →
+  // pass through; -1 = unlimited → pass through). Returns the clamped value
+  // and whether a clamp happened, so callers can toast.
+  const clampCapacity = (value: number): { value: number; clamped: boolean } => {
+    if (planCapacityCap === null || planCapacityCap === -1) return { value, clamped: false };
+    if (value > planCapacityCap) return { value: planCapacityCap, clamped: true };
+    return { value, clamped: false };
   };
 
   const openEditStaffDialog = (staff: { id: string; role: string; user: { fullName: string; isActive: boolean }; permissions?: string | Record<string, boolean> | null }) => {
@@ -251,6 +331,13 @@ export function AgencySettings() {
 
   const handleCreateStaff = async () => {
     if (!newStaffUsername.trim() || !newStaffFullName.trim() || !newStaffPassword || !user?.agencyId) return;
+    // Task 31 bug 8 parity: a staff account must belong to a branch — block
+    // submit when none selected (same contract as agency-employees.tsx).
+    if (!newStaffBranchId) {
+      setNewStaffBranchError(true);
+      toast.error(t('staffBranchRequired'));
+      return;
+    }
     setAddStaffLoading(true);
     try {
       const res = await apiFetch('/api/agency/staff/create', {
@@ -262,6 +349,7 @@ export function AgencySettings() {
           fullName: newStaffFullName.trim(),
           password: newStaffPassword,
           staffRole: newStaffRole,
+          branchId: newStaffBranchId,
         }),
       });
       if (res.ok) {
@@ -336,14 +424,24 @@ export function AgencySettings() {
   const handleSave = async () => {
     setSaving(true);
     try {
+      // Task 37: belt-and-braces plan clamp before the PATCH — never send a
+      // capacity value above the plan cap (the server rejects it with 403).
+      // Covers the race where the plan cap loaded after the value was typed.
+      let payload = settings;
+      if (payload) {
+        const { value, clamped } = clampCapacity(payload.maxReservations);
+        if (clamped) payload = { ...payload, maxReservations: value };
+      }
       const res = await apiFetch('/api/agency/settings', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...settings, agencyId: user?.agencyId }),
+        // Strip the legacy maxQueueSize alias echoed back by GET — the UI
+        // edits maxReservations and the server must never see a stale alias.
+        body: JSON.stringify(payload ? (() => { const { maxQueueSize: _legacy, ...rest } = payload; return rest; })() : payload,),
       });
       if (res.ok) {
         toast.success(t('success'));
-        originalSettingsRef.current = JSON.parse(JSON.stringify(settings));
+        originalSettingsRef.current = JSON.parse(JSON.stringify(payload));
         setHasUnsavedChanges(false);
       } else {
         const data = await res.json();
@@ -689,11 +787,44 @@ export function AgencySettings() {
                               min={1}
                               max={500}
                               value={settings?.maxReservations ?? 50}
-                              onChange={(e) =>
-                                updateSetting('maxReservations', parseInt(e.target.value) || 50)
-                              }
+                              onChange={(e) => {
+                                // Task 37: clamp against the subscription plan's
+                                // capacity cap (-1 = unlimited, null = unknown).
+                                const parsed = parseInt(e.target.value);
+                                const raw = Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+                                const { value, clamped } = clampCapacity(raw);
+                                if (clamped) {
+                                  setCapacityWarning(true);
+                                  toast.warning(t('capacityExceedsPlan', { n: String(planCapacityCap) }));
+                                } else {
+                                  setCapacityWarning(false);
+                                }
+                                updateSetting('maxReservations', value);
+                              }}
                               className="h-11 w-40"
                             />
+                            {/* Plan limit helper text — Task 37 */}
+                            {planCapacityCap !== null && (
+                              <p className={`text-[11px] flex items-center gap-1 ${capacityWarning ? 'text-amber-600 dark:text-amber-400 font-medium' : 'text-muted-foreground'}`}>
+                                {planCapacityCap === -1 ? (
+                                  <>
+                                    <CheckCircle2 className="h-3 w-3" />
+                                    {t('unlimited')}
+                                  </>
+                                ) : (
+                                  <>
+                                    <Info className="h-3 w-3" />
+                                    {t('planCapacityLimit', { n: String(planCapacityCap) })}
+                                  </>
+                                )}
+                              </p>
+                            )}
+                            {capacityWarning && planCapacityCap !== -1 && (
+                              <p className="text-[11px] text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                                <AlertTriangle className="h-3 w-3" />
+                                {t('capacityExceedsPlan', { n: String(planCapacityCap ?? 0) })}
+                              </p>
+                            )}
                           </div>
 
                           <Separator />
@@ -815,6 +946,38 @@ export function AgencySettings() {
                                         <SelectItem value="MANAGER">{t('staffRoleManager')}</SelectItem>
                                       </SelectContent>
                                     </Select>
+                                  </div>
+                                  {/* Task 37: required branch select — a staff
+                                      account must be linked to a branch (same
+                                      contract as agency-employees.tsx). */}
+                                  <div className="space-y-2">
+                                    <Label className={newStaffBranchError ? 'text-red-600 dark:text-red-400' : undefined}>
+                                      {t('branch')}
+                                      <span className="text-red-500 ms-0.5">*</span>
+                                    </Label>
+                                    <Select
+                                      value={newStaffBranchId || undefined}
+                                      onValueChange={(v) => { setNewStaffBranchId(v); setNewStaffBranchError(false); }}
+                                    >
+                                      <SelectTrigger className={`h-11 ${newStaffBranchError ? 'border-red-400 dark:border-red-500' : ''}`}>
+                                        <SelectValue placeholder={t('selectBranch')} />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        {branchList.length === 0 ? (
+                                          <div className="px-3 py-2 text-xs text-muted-foreground">{t('noBranches')}</div>
+                                        ) : (
+                                          branchList.map((b) => (
+                                            <SelectItem key={b.id} value={b.id}>
+                                              {(lang === 'ar' && b.nameAr) || (lang === 'fr' && b.nameFr) || b.name}
+                                              {b.isMain ? ` — ${t('mainBranch')}` : ''}
+                                            </SelectItem>
+                                          ))
+                                        )}
+                                      </SelectContent>
+                                    </Select>
+                                    {newStaffBranchError && (
+                                      <p className="text-[11px] text-red-500">{t('staffBranchRequired')}</p>
+                                    )}
                                   </div>
                                 </div>
                                 <DialogFooter>
@@ -1100,16 +1263,81 @@ export function AgencySettings() {
                         </div>
                       )}
 
-                      {/* Branches Section */}
+                      {/* Branches Section — Task 37: real read-only summary
+                          (the full CRUD lives in the dedicated Branches view) */}
                       {section.id === 'branches' && (
                         <div className="space-y-4">
-                          <p className="text-xs text-muted-foreground -mt-1 mb-2">{t('branchManagementDesc') || 'Manage your branches, counters, and staff assignments'}</p>
-                          <div className="flex flex-col items-center justify-center py-6 text-center">
-                            <div className="h-16 w-16 rounded-2xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center mb-4">
-                              <Building2 className="h-8 w-8 text-emerald-600 dark:text-emerald-400" />
+                          <p className="text-xs text-muted-foreground -mt-1 mb-2">{t('branchManagementDesc') || 'Manage branches and service counters for your agency'}</p>
+                          {branchesLoading ? (
+                            <div className="space-y-2">
+                              {[...Array(2)].map((_, i) => (
+                                <Skeleton key={i} className="h-16 rounded-xl" />
+                              ))}
                             </div>
-                            <p className="text-sm font-medium text-foreground mb-1">{t('manageBranchesCounters') || 'Manage Branches & Counters'}</p>
-                            <p className="text-xs text-muted-foreground max-w-sm mb-4">{t('branchesFullManageDesc') || 'Create branches, assign counters, and manage staff assignments from the dedicated Branches page.'}</p>
+                          ) : branchList.length === 0 ? (
+                            <div className="flex flex-col items-center justify-center py-6 text-center">
+                              <div className="h-16 w-16 rounded-2xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center mb-4">
+                                <Building2 className="h-8 w-8 text-emerald-600 dark:text-emerald-400" />
+                              </div>
+                              <p className="text-sm font-medium text-foreground mb-1">{t('noBranches')}</p>
+                              <p className="text-xs text-muted-foreground max-w-sm mb-4">{t('noBranchesDesc')}</p>
+                            </div>
+                          ) : (
+                            <div className="space-y-2 max-h-96 overflow-y-auto">
+                              {branchList.map((branch) => {
+                                const branchLabel = (lang === 'ar' && branch.nameAr) || (lang === 'fr' && branch.nameFr) || branch.name;
+                                const counterCount = branch._count?.counters ?? 0;
+                                return (
+                                  <div
+                                    key={branch.id}
+                                    className={`p-3 rounded-xl transition-colors hover:bg-gray-100 dark:hover:bg-gray-800/50 ${
+                                      branch.isActive ? 'bg-gray-50 dark:bg-gray-900/50' : 'bg-gray-50/50 dark:bg-gray-900/30 opacity-70'
+                                    }`}
+                                  >
+                                    <div className="flex items-start justify-between gap-2">
+                                      <div className="flex items-start gap-3 min-w-0">
+                                        <div className={`h-9 w-9 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                                          branch.isMain
+                                            ? 'bg-amber-100 dark:bg-amber-900/30'
+                                            : 'bg-emerald-100 dark:bg-emerald-900/30'
+                                        }`}>
+                                          <Building2 className={`h-4.5 w-4.5 ${
+                                            branch.isMain
+                                              ? 'text-amber-700 dark:text-amber-400'
+                                              : 'text-emerald-700 dark:text-emerald-400'
+                                          }`} />
+                                        </div>
+                                        <div className="min-w-0">
+                                          <div className="flex items-center gap-2 flex-wrap">
+                                            <p className="text-sm font-medium text-foreground truncate">{branchLabel}</p>
+                                            {branch.isMain && (
+                                              <span className="text-[9px] font-bold bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400 px-1.5 py-0.5 rounded-full flex-shrink-0">{t('mainBranch')}</span>
+                                            )}
+                                            {!branch.isActive && (
+                                              <span className="text-[9px] font-bold bg-gray-200 dark:bg-gray-700/60 text-gray-500 dark:text-gray-400 px-1.5 py-0.5 rounded-full flex-shrink-0">{t('inactive')}</span>
+                                            )}
+                                          </div>
+                                          {branch.address && (
+                                            <p className="text-xs text-muted-foreground truncate mt-0.5">{branch.address}</p>
+                                          )}
+                                          <div className="flex items-center gap-3 mt-1">
+                                            {branch.phone && (
+                                              <span className="text-[10px] text-muted-foreground" dir="ltr">{branch.phone}</span>
+                                            )}
+                                            <span className="text-[10px] text-muted-foreground">
+                                              {t('counters')}: {counterCount}
+                                            </span>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          <div className="flex flex-col items-center justify-center pt-2 text-center">
+                            <p className="text-xs text-muted-foreground max-w-sm mb-3">{t('branchesFullManageDesc')}</p>
                             <Button
                               className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl gap-2"
                               onClick={() => {
@@ -1118,7 +1346,7 @@ export function AgencySettings() {
                               }}
                             >
                               <Building2 className="h-4 w-4" />
-                              {t('goToBranches') || 'Go to Branches'}
+                              {t('goToBranches')}
                               <ArrowRight className="h-4 w-4 rtl:rotate-180" />
                             </Button>
                           </div>

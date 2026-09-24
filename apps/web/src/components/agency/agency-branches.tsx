@@ -53,6 +53,7 @@ import {
   Power,
   Crown,
   Lock,
+  RefreshCw,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -109,6 +110,10 @@ export function AgencyBranches() {
   // State
   const [branches, setBranches] = useState<Branch[]>([]);
   const [loading, setLoading] = useState(true);
+  // Task 37-a: list-load failures used to be swallowed (non-ok responses left
+  // an empty list that looked like "no branches"). Track the error and offer
+  // a retry instead.
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [expandedBranch, setExpandedBranch] = useState<string | null>(null);
   const [counters, setCounters] = useState<CounterWithStaff[]>([]);
   const [countersLoading, setCountersLoading] = useState(false);
@@ -153,9 +158,26 @@ export function AgencyBranches() {
       const res = await apiFetch(`/api/agency/branches?agencyId=${agencyId}`);
       if (res.ok) {
         const data = await res.json();
-        setBranches(data.branches || []);
+        // Task 35 (bug A): accept BOTH envelopes — cloud returns { branches },
+        // older local-API builds returned the legacy { data } key. Reading
+        // only data.branches structurally emptied the desktop branch list
+        // (and with it the staff dialog's branch selector) against stale builds.
+        setBranches(data.branches ?? data.data ?? []);
+        setLoadError(null);
+      } else {
+        // Task 37-a: a non-ok response used to be swallowed silently — the
+        // page rendered an EMPTY list (the exact "branch created on the
+        // desktop is invisible in the desktop app" symptom). Surface the
+        // server's message and offer a retry.
+        const data = await res.json().catch(() => null);
+        const message = (data && (data.error || data.message)) || t('branchesLoadFailed');
+        setBranches([]);
+        setLoadError(message);
+        toast.error(message);
       }
     } catch {
+      setBranches([]);
+      setLoadError(t('branchesLoadFailed'));
       toast.error(t('error'));
     } finally {
       setLoading(false);
@@ -260,7 +282,10 @@ export function AgencyBranches() {
           toast.error(data.error || t('error'));
         }
       } else {
-        const res = await apiFetch('/api/agency/branches', {
+        // Task 37-a: send agencyId as a QUERY param too (kept in the body for
+        // the cloud contract) so the local resolver and the cloud resolver
+        // both see the SAME target agency on create.
+        const res = await apiFetch(`/api/agency/branches?agencyId=${encodeURIComponent(agencyId)}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -568,6 +593,36 @@ export function AgencyBranches() {
           )}
         </Tooltip>
       </motion.div>
+
+      {/* Task 37-a: load failure surfaced with a retry (previously a silent
+          empty list indistinguishable from "no branches yet") */}
+      {loadError && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 rounded-2xl border border-red-200 dark:border-red-900/40 bg-red-50 dark:bg-red-950/30 p-4"
+          role="alert"
+        >
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="h-9 w-9 rounded-xl bg-red-100 dark:bg-red-900/40 flex items-center justify-center flex-shrink-0">
+              <Building2 className="h-4 w-4 text-red-600 dark:text-red-400" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-red-700 dark:text-red-300">{t('branchesLoadFailed')}</p>
+              <p className="text-xs text-red-600/80 dark:text-red-400/80 truncate">{loadError}</p>
+            </div>
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={fetchBranches}
+            className="gap-2 border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-xl flex-shrink-0"
+          >
+            <RefreshCw className="h-4 w-4" />
+            {t('retry')}
+          </Button>
+        </motion.div>
+      )}
 
       {/* Summary stats */}
       {branches.length > 0 && (

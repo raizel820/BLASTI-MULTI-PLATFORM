@@ -3,6 +3,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import { ThemeProvider } from "next-themes";
 import { AuthProvider } from "@/components/providers/auth-provider";
 import { ErrorBoundary } from "@/components/shared/error-boundary";
+import { ClientBootHardening } from "@/components/shared/client-boot-hardening";
 import { PlatformProvider } from "@/hooks/use-platform";
 import { DatabaseProvider } from "@/db/provider";
 import "./globals.css";
@@ -41,6 +42,8 @@ export default function RootLayout({
     <html lang="ar" data-scroll-behavior="smooth" suppressHydrationWarning>
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground font-[family-name:var(--font-geist-sans)]`}>
         <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
+          {/* Task 41 — legacy SW unregister + chunk-error auto-recovery (phone flicker fix) */}
+          <ClientBootHardening />
           <PlatformProvider>
             <DatabaseProvider>
               <AuthProvider>

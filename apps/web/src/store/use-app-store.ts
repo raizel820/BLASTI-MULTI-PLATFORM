@@ -62,11 +62,31 @@ interface UserState {
   createdAt?: string;
 }
 
+// ─── Task 37-e: agency authority cache ──────────────────────────────────────
+// Mirrors GET /api/agency/my-authority (Task 37-c backend contract). Cached in
+// the store so the sidebar, page guards and dashboards share ONE fetch per
+// session. Deliberately NOT persisted (partialize excludes it) — a stale
+// authority across reloads/accounts would be a security smell; the hook
+// refetches when the cache is empty.
+export type AgencyAuthorityRole = 'OWNER' | 'MANAGER' | 'STAFF' | null;
+
+export interface AgencyAuthorityState {
+  isOwner: boolean;
+  role: AgencyAuthorityRole;
+  staffId: string | null;
+  permissions: Record<string, boolean>;
+  /** Date.now() when the cache was (re)filled — lets the hook expire stale entries. */
+  loadedAt: number;
+}
+
 interface AppState {
   // Auth
   user: UserState | null;
   isAuthenticated: boolean;
   sessionToken: string;
+
+  // Task 37-e: cached agency authority (session-scoped, not persisted)
+  agencyAuthority: AgencyAuthorityState | null;
 
   // Navigation
   currentView: ViewName;
@@ -84,6 +104,7 @@ interface AppState {
   // Actions
   setUser: (user: UserState | null) => void;
   setSessionToken: (token: string) => void;
+  setAgencyAuthority: (authority: AgencyAuthorityState | null) => void;
   setView: (view: ViewName) => void;
   goBack: () => void;
   toggleSidebar: () => void;
@@ -310,12 +331,19 @@ function sanitizePersistedState(state: any): {
   currentView: ViewName;
   pendingAgencyCode: string | null;
   onboarded: boolean;
+  sessionToken: string;
 } {
   const user = sanitizeUser(state?.user);
   const isAuthenticated = sanitizeIsAuthenticated(state?.isAuthenticated);
   const currentView = sanitizeViewName(state?.currentView);
   const pendingAgencyCode = typeof state?.pendingAgencyCode === 'string' ? state.pendingAgencyCode : null;
   const onboarded = state?.onboarded === true;
+  // Task 41 — the session token MUST survive rehydration: it was silently
+  // dropped here, so after every reload the UI stayed logged in (the httpOnly
+  // cookie kept the API working) while the sync engine found no token and
+  // skipped every cycle — the offline DB never caught up until the next
+  // fresh login. Validate as a plain string; default to '' when corrupted.
+  const sessionToken = typeof state?.sessionToken === 'string' ? state.sessionToken : '';
 
   // If user is null but isAuthenticated is true, fix the inconsistency
   const safeIsAuthenticated = user ? isAuthenticated : false;
@@ -329,6 +357,7 @@ function sanitizePersistedState(state: any): {
     currentView: safeView,
     pendingAgencyCode,
     onboarded,
+    sessionToken,
   };
 }
 
@@ -340,6 +369,7 @@ export const useAppStore = create<AppState>()(
       user: null,
       isAuthenticated: false,
       sessionToken: '',
+      agencyAuthority: null,
       currentView: 'landing',
       previousView: null,
       sidebarOpen: false,
@@ -354,7 +384,7 @@ export const useAppStore = create<AppState>()(
         clearRevoked();
         syncEngine.clearSyncCursor();
         syncEngine.resumeAfterAuth();
-        set({ sessionToken: token });
+        set({ sessionToken: token, agencyAuthority: null });
         // Pass auth token to Electron main process for cloud sync
         const w = window as any;
         const currentUser = useAppStore.getState().user;
@@ -421,6 +451,9 @@ export const useAppStore = create<AppState>()(
 
       setPendingAgencyCode: (code) => set({ pendingAgencyCode: code }),
 
+      // Task 37-e: cache/refill/clear the agency authority. `null` clears.
+      setAgencyAuthority: (authority) => set({ agencyAuthority: authority }),
+
       setOnboarded: (v: boolean) => set({ onboarded: v }),
 
       logout: () => {
@@ -428,6 +461,9 @@ export const useAppStore = create<AppState>()(
           user: null,
           isAuthenticated: false,
           sessionToken: '',
+          // Task 37-e: never leak the previous account's authority cache into
+          // the next session.
+          agencyAuthority: null,
           currentView: 'landing',
           previousView: null,
           sidebarOpen: false,
@@ -502,6 +538,7 @@ export const useAppStore = create<AppState>()(
             currentView: 'landing',
             pendingAgencyCode: null,
             onboarded: false,
+            sessionToken: '',
           };
         }
 

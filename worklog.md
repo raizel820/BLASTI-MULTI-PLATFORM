@@ -1461,3 +1461,219 @@ Stage Summary:
 - Desktop branches + staff-branch-link root causes fixed in code (agencyId resolution + dual-envelope tolerance); NOTE for the user: rebuild/reinstall the desktop app (bun run build:desktop) or run it from source — the installed bundle predates Tasks 31-35 entirely.
 - Branch and staff creation are now hard-limited by SubscriptionPlan.maxBranches/maxStaff on the cloud AND the desktop local API (offline-safe), with clear upgrade messages surfaced in the UI; -1 (PREMIUM) = unlimited; FREE=1 branch/2 staff, BASIC=2/5.
 - tests/ folder removed; the monorepo contains no Cloudflare/Vercel/blob/D1/R2 code, config, docs or dependencies anymore (only historical worklog text mentions them).
+
+---
+Task ID: 36
+Agent: Z.ai Code (main)
+Task: Fix "desktop loads the OLD DELETED agency account after cloud data is deleted and the app reopens" — the post-reset stale-session hole that survived Tasks 33/34.
+
+Work Log:
+- ROOT CAUSE (two stacked holes, both closed):
+  1. STALE-INODE: the cloud API (apps/api, :3003) is a long-lived process holding an open SQLite handle. `reset:all` deletes custom.db and `prisma db push`+seed create a NEW file at the same path, but the RUNNING process keeps serving the OLD (deleted) database through its open handle — so the desktop's stored token validated fine (the old user still "existed" in the old inode) and the deleted account loaded. Task 33's revocation never triggered because the cloud genuinely answered 200.
+  2. STATELESS JWTs: session tokens (jose HS256, 30d) survive a DB wipe by design; the ghost-guard in verifySessionToken checks DB user existence — but against the SAME stale inode (hole 1), so it passed too. Task 34's reset relied on "restart the services" which the user does not do.
+- FIX 1 — invalidation epoch (packages/db/index.ts + apps/api/src/lib/auth.ts + scripts/reset-all.ts): reset-all.ts writes packages/db/data/.db-generation.json {epoch, ready:false} the moment the old DB file is deleted (phase 1) and {epoch, ready:true} after the seed (phase 2). packages/db exports getInvalidationEpochMs() (sticky+monotonic, mtime-cached statSync per call — no TTL lag, survives marker deletion). lib/auth.ts verifySessionToken now rejects ANY session JWT whose iat predates the epoch (with 1s grace for JWT second-flooring) BEFORE any DB access — one injection point covers every authed route incl. the desktop's POST /auth/refresh-session and idempotency middleware.
+- FIX 2 — DB hot-swap (packages/db/index.ts): `db`/`dbRaw` are now live Proxies forwarding to the current client pair; a 1s-interval unref'd watcher polls the generation file and, on ready:true with a NEW epoch, builds a fresh PrismaClient (tx-capture patch + ghost-delete extension rebuilt per instance, PRAGMAs re-applied, globalForPrisma updated), swaps it in, and $disconnects the old client after a 10s drain. A running API therefore adopts the fresh database file within ~1s of the seed finishing — NO restart needed. Boot after a reset records the marker as applied (no pointless swap). One-shot scripts skip the watcher (SKIP_GHOST_DELETE/BLASTI_DISABLE_DB_GENERATION_WATCH). reset-all.ts also detects a running :3003 API pre-reset and prints matching guidance.
+- Desktop source audited (no changes needed): Task 33 revocation machinery intact in current source (sync-service.js _confirmRevocation:835, index.js revokeLocalAuthorization, loading-screen.js startup refresh → revoke on reachable-cloud 401). The user's INSTALLED desktop bundle predates Tasks 31–35 (worklog Task 35 note stands): it must be rebuilt (`bun run build:desktop`) or run from source — but with the cloud fix, even a stale bundle now gets an explicit 401 instead of a silent 200.
+- Verification (live E2E, API NEVER restarted during the test): restarted API once to load the new code → inserted marker FAQ row + logged in (TOKEN_A, pre-reset era) → marker visible via API → `bun run reset:all -y` with API left running → (1) TOKEN_A on GET /api/admin/faq → 401 immediately; (2) POST /auth/refresh-session with TOKEN_A (the desktop's exact startup call) → 401; (3) fresh admin login → 200 TOKEN_B; (4) GET /api/faqs via the UNRESTARTED API → marker GONE (fresh file being served); (5) authed admin endpoint with TOKEN_B → 200. API log shows "[db] Prisma client hot-swapped onto database generation 1790169116365" + "[AUTH] Pre-reset session rejected ... forcing re-authentication". Platform fresh: 1 user / 0 agencies / 0 branches / 0 staff / 0 FAQs / 3 plans. Web :3000 200, public API healthy, lint clean, tsc: 0 new errors (119 pre-existing API baseline, none in touched files).
+
+Stage Summary:
+- A full platform reset now kills ALL pre-reset tokens/sessions INSTANTLY and the running cloud API hot-swaps onto the fresh database without a restart — the desktop can no longer load a deleted account, whether the services were restarted or not. Desktop reopened after a reset → cloud 401 → Task 33 revocation → login screen.
+- USER ACTION (unchanged from Task 35): the installed desktop bundle predates Tasks 31–35 — rebuild (`bun run build:desktop`) or run from source (`bun run electron:dev`) to get the branch display fix (Task 35-A) and revocation UX.
+- New runtime artifact: packages/db/data/.db-generation.json (gitignored; recreated by every reset; harmless to delete after a restart).
+
+---
+Task ID: 37-a
+Agent: Z.ai Code (full-stack developer agent)
+Task: Fix "branch created in the desktop app is visible on the webapp but NOT in the desktop app's branch list" — local-API agency resolution (ownership-failure fallback + body.agencyId on create), surface swallowed branch-list errors in the UI, adopt the import-session refreshed user in the renderer, plus the confirmed desktop services/settings bugs in the same file.
+
+Work Log:
+- Verified the researched root cause in the current tree (line numbers drifted slightly from the task brief): resolveSessionAgencyId (local-api/index.js) hard-returned null on ownership failure; POST /api/agency/branches resolved ONLY the query param while the UI sends agencyId in the BODY; GET silently-empty on 403 via the UI swallowing non-ok responses; renderer persisted user went stale because every import-session caller discarded the refreshed response user.
+- FIX 1a (index.js:257-266): resolveSessionAgencyId now falls back to the session agency (with console.warn '[branches] requested agencyId %s failed ownership — falling back to session agency %s') when an explicit param fails the owner/staff ownership checks; still null only when the session itself has no agency. No privilege change — the fallback is always the session's OWN agency.
+- FIX 1b (index.js:3205-3218): POST /api/agency/branches parses the body FIRST and resolves via resolveSessionAgencyId(query.agencyId || body.agencyId), matching the cloud contract (agency.ts POST /branches requires body.agencyId). Plan-limit mirror, isMain sweep, outbox transaction and dual-key response untouched.
+- FIX 1c: aligned the enumerated sibling routes off raw sessionUser.agencyId: PUT/PATCH /api/agency/branches/:id (index.js:3303-3311, body parsed first, query||body), DELETE /api/agency/branches/:id (:3354-3361, query only — no body), branch-nested counters POST /api/agency/branches/:id/counters (:5502-5508, query||body), counter PATCH /api/agency/branches/:id/counters/:counterId (:5534-5539, query||body), counter DELETE /api/agency/branches/:branchId/counters/:counterId (:3582-3586, query only). All ownership 404 checks, outbox rows and events byte-identical otherwise.
+- FIX 1d (confirmed same-file bugs):
+  - POST /api/agency/services (index.js:4782-4809): removed averageServiceTime from service.create (Service has NO such column — it lives on Agency; PrismaClientValidationError → guaranteed 500 on every add) and changed prefix to `prefix || ''` because schema.prisma Service.prefix is `String @default("A")` NOT NULL (the old `prefix || null` was a second guaranteed throw). Outbox create row kept.
+  - PATCH /api/agency/services/:id (index.js:6490-6506): allowedFields extended with nameAr/nameFr (real Service columns the UI sends) and the update wrapped in withOutboxTransaction + logDeterministicOutcome('Service', id, 'update', …, { tx }) — same pattern as branch create — so offline edits replay deterministically to the cloud.
+  - DELETE /api/agency/services/:id (index.js:6521-6526): soft-delete wrapped in the same outbox transaction (logDeterministicOutcome 'Service' 'delete').
+  - PATCH /api/agency/settings (index.js:5672-5678): accepts BOTH maxQueueSize and maxReservations (cloud GET /settings returns the key as maxReservations; Agency column = maxActiveReservations per schema.prisma) — previously clients echoing the GET shape silently dropped the value.
+- FIX 2 (agency-branches.tsx): non-ok list responses no longer swallowed — server error surfaced via toast + a loadError state rendered as an accessible error banner (role="alert") with a Retry button re-running fetchBranches; dual-envelope parse (data.branches ?? data.data ?? []) kept. CREATE now also sends agencyId as a QUERY param (kept in the body) so local and cloud resolvers agree (ts:284-299). New i18n keys branchesLoadFailed + retry added to en/ar/fr.
+- FIX 3 (renderer stale-user adoption): new adoptImportedLocalSessionUser() in lib/session-heal.ts:115-158 — merges the import-session response user into the zustand store via a raw setState (NOT setUser — that resets currentView; same gentle pattern as applyHealedSession), same-account guard (never cross-account), avatar-null guard, no-op on success:false (AUTHORIZATION_REVOKED) so Task 33-E revocation handling is untouched, deliberately does NOT adopt the response token. Wired into ALL FIVE import-session call sites: auth-provider.tsx boot restore (now awaited+parsed async IIFE, :107-127), login-form.tsx login (:127-142) and OTP-finalize (:205-217), desktop-agency-login.tsx login (:200-215) and OTP-finalize (:277-288).
+- Validation: node --check apps/desktop/local-api/index.js PASS after every edit batch (final PASS). bun run lint (eslint, repo root) PASS clean. apps/web tsc total 310 errors = EXACT documented baseline (0 new; the only errors matching touched files are pre-existing — login-form res.url TS2339 on a line I did not touch, and pre-existing ar.ts TS1117 duplicate-key errors far from my insertion; verified my new i18n keys exist exactly once per dictionary).
+- Deliberately NOT done (out of scope / flagged): (1) the nested-counter routes GET single (:3533 family) and DELETE (:3588) compare `counter.agencyId` but the Counter model has NO agencyId column (schema.prisma:779-796) — those checks are always-404 today; left untouched per "keep 404s" — needs an owner decision (route through branch like the PATCH route at :5542 does). (2) GET /api/agency/counters (:3386), PUT /api/agency/counters/:id (:3458), GET nested counters list (:3508), GET single nested counter, PUT/PATCH nested (:3550), GET /api/agency/branches/:id (:5473), and the sibling /api/services PUT/DELETE (:3083/:3124) still use raw sessionUser.agencyId — not in the enumeration, untouched. (3) No changes to apps/api, schema.prisma, sync-service.js, staff/queue/subscription logic, adaptive-sidebar, agency-settings.tsx (parallel agent work visible in the tree — respected). (4) Did not adopt the import-session refreshed TOKEN (only the user) — the renderer token is owned by setSessionToken's Electron handoff.
+
+Stage Summary:
+- Desktop branch visibility fixed end-to-end: a create from the desktop now lands under the REQUESTED agency (query||body resolution — same contract as the cloud), a stale renderer agencyId can no longer 403 reads/writes (session-agency fallback in the shared resolver), and the renderer adopts the cloud-validated refreshed user at every import-session path so persisted user.agencyId can no longer drift from the local session. Even an installed desktop build with the OLD UI now gets a correct list against the NEW local API.
+- The branches page can no longer lie: any non-ok list response surfaces its real error with a Retry button instead of rendering "no branches".
+- Desktop services/settings hardening shipped in the same batch: service add no longer guaranteed-500s (missing column + NOT-NULL prefix), service edits/deletes now replay to the cloud offline (outbox), translations survive edits, and the settings PATCH honors maxReservations.
+- USER ACTION (unchanged from Tasks 35/36): the installed desktop bundle predates these fixes — rebuild (bun run build:desktop) or run from source (bun run electron:dev).
+
+---
+Task ID: 37-b-cloud
+Agent: full-stack-developer (finished mid-flight; coordinator audited + appended)
+Task: Cloud settings/profile/plan-limits + shared settings/profile UI (queue status in profile, capacity alias + plan clamp, services plan gate, settings branches/staff fixes).
+
+Work Log:
+- apps/api/src/lib/validations.ts: updateAgencySettingsSchema now accepts maxReservations (primary) alongside maxQueueSize (legacy alias).
+- apps/api/src/routes/agency.ts: checkPlanLimit extended to kinds 'services' (counts active services) and 'reservations' (config cap via `proposed` — rejects capacity > plan.maxActiveReservations, -1 = unlimited); POST /api/agency/services gated (:2397); PATCH /api/agency/settings resolves maxReservations ?? maxQueueSize and clamps capacity against the plan (:2637, :2665); GET /settings + GET /agency/profile payloads now return maxReservations + isQueueOpen (+queuePaused where available) (:1332-1336, :2601-2605).
+- apps/web/src/components/agency/agency-settings.tsx: staff/settings fetches no longer early-return without user.agencyId (APIs resolve the session agency); real branch summary section (dual envelope) replaces the link-only stub; plan capacity cap fetched from GET /api/agency/subscription availablePlans + currentPlan, input clamped with toasts + helper text (planCapacityLimit / capacityExceedsPlan / unlimited); settings staff-create dialog now sends branchId.
+- apps/web/src/components/agency/agency-profile.tsx: real Queue Open/Closed + Paused badges replace the hardcoded "Queue Active" badge (working-hours badge kept).
+- i18n en/ar/fr: queueClosed (reused), queuePaused, planCapacityLimit, capacityExceedsPlan + branches summary keys.
+- Verification (coordinator audit after agent timeout): all spec hunks present; `bun run lint` clean; worklog entry appended by coordinator.
+
+Stage Summary:
+- Queue open/closed is now REAL in the agency profile (badges driven by API payload); capacity edits actually persist (maxReservations alias) and are hard-capped by the subscription plan (403 PLAN_LIMIT_REACHED + UI clamp); service creation is plan-limited; settings page shows real branch data and no longer hides staff behind a missing agencyId. Web + desktop UI share these components; desktop local-API keys accepted (both maxQueueSize and maxReservations).
+
+---
+Task ID: 37-c-cloud
+Agent: full-stack-developer (finished mid-flight; coordinator audited, wired the last hunks + verified)
+Task: Cloud 2-tier staff authority system — schema, sync registry, enforcement, counter occupation, staff-create role fix.
+
+Work Log:
+- Schema (packages/db/prisma/schema.prisma): AgencyStaff += canCreateBranches/canDeleteBranches/canPurchaseSubscription/canManageSubscription (all default false); Counter += occupiedAt (occupation = Counter.staffId repurposed as "occupied by" + timestamp). db:push applied (columns verified in the live DB); prisma client regenerated.
+- packages/core/src/sync-registry.ts: AgencyStaff mutableFields += the 4 grants; Counter mutableFields += 'occupiedAt'.
+- apps/api/src/lib/auth.ts: StaffPermission extended with the 4 grants; NEW getAgencyAuthority(userId, agencyId) ({isOwner, role OWNER|MANAGER|STAFF, staffId, permissions}) + requireAgencyAuthority(c, agencyId, perm|perms) (SUPER_ADMIN/owner bypass; staff need ALL listed; 403 PERMISSION_DENIED:<perm>) + STAFF_PERMISSION_KEYS export.
+- apps/api/src/routes/agency.ts enforcement matrix (all live-verified): branches POST canCreateBranches / PATCH both grants / DELETE canDeleteBranches; counter CRUD canManageBranches; staff create/patch/delete OWNER-only (PERMISSION_DENIED:canManageStaff); settings/profile/working-hours PATCH canManageProfile; services POST/PATCH/DELETE canManageServices; subscription GET owner|canPurchase|canManage (else 403), pay canPurchaseSubscription, cancel/unsubscribe canManageSubscription; call-next + walk-in: owner pass, staff need canManageQueue AND must OCCUPY the exact counter passed (new enforceQueueStaffAuthority → 403 OCCUPY_COUNTER_FIRST, incl. no-counterId case).
+- NEW routes: GET /api/agency/my-authority (self-inspection for the UI); POST /api/agency/counters/:counterId/occupy|release (staff self-occupation; 409 COUNTER_OCCUPIED when another ACTIVE staff holds it; owner may release any).
+- Staff-create fixed: role/staffRole mismatch resolved (staffRole ?? role ?? STAFF); tier defaults written to booleans + legacy JSON (STAFF = queue+analytics; MANAGER = + create/delete branches, purchase, subscription mgmt, profile); optional permissions overlay accepted at creation (z.record(z.string(), z.boolean()) — fixed the zod arity the coordinator introduced); PATCH /staff/:id writes permissions to BOTH JSON and normalized columns + re-applies tier defaults on role change; staff list carries normalized booleans.
+- Coordinator additions after the agent died: permissions overlay in create (above), tsc back to the 119 baseline.
+
+Stage Summary:
+- The cloud API now enforces the full 2-tier model: normal staff can ONLY occupy a counter → manage the queue → see stats; managers are owner-like minus staff management, limited to exactly the grants the owner enables; owners/SUPER_ADMIN bypass everything. Counter occupation is staff-self-service (occupy/release) with single-holder enforcement.
+
+---
+Task ID: 37-d-desktop
+Agent: full-stack-developer (finished mid-flight; coordinator wired the remaining gates + verified)
+Task: Desktop local-API mirror of the authority system + ticket-issuance gates + walk-in fixes.
+
+Work Log:
+- apps/desktop/local-api/lib/schema-init-sql.js + schema-migrations.js: new AgencyStaff columns + Counter.occupiedAt in the DDL AND idempotent ALTER TABLE migration steps for existing local DBs (version-stamped, convergence pass).
+- Helper layer: STAFF_PERMISSION_KEYS, STAFF_TIER_DEFAULTS/MANAGER_TIER_DEFAULTS, resolveAuthorityContext, checkAgencyPermission (owner bypass + ALL-permission check), checkAgencyOwnerOnly (strict owner gate, no silent session fallback), checkCounterOccupancy (OCCUPY_COUNTER_FIRST for non-owners without/with foreign counter), checkQueueIssuanceGates (closed → 400 'Queue is currently closed', paused → 'Queue is currently paused', WAITING|CALLED >= maxActiveReservations → 'Queue is full'), isUnknownColumnError (pre-regenerated-client transition defense).
+- NEW local routes: GET /api/agency/my-authority (mirrors cloud shape), POST /api/agency/counters/:counterId/occupy|release (409 COUNTER_OCCUPIED, outbox-wrapped so occupations replay to the cloud).
+- Enforcement matrix wired by the coordinator (the agent defined everything but died before wiring): staff routes (legacy link, DELETE ?staffId, PATCH /:id, DELETE /:id, cloud-forwarding create proxy) → checkAgencyOwnerOnly; settings/profile/working-hours PATCH → canManageProfile; services POST/PATCH/DELETE (legacy /api/services + /api/agency/services) → canManageServices; counter CRUD (top-level + branch-nested) → canManageBranches; subscription pay → canPurchaseSubscription, cancel → canManageSubscription (local gates before the cloud forward); ALL queue action routes (call-next ×2, call/:id ×2, complete, no-show, cancel, postpone, recall, pause, resume, toggle-pause) → canManageQueue + occupancy rule on the counter-targeted ones; ticket issuance (POST /api/reservations, walk-in, walk-in-token) → checkQueueIssuanceGates.
+- Walk-in fixes (guaranteed-500 bugs): queueNumber is an Int column (was a prefixed string) — numbering now comes from queueSettings.lastIssuedNumber (same as /api/reservations, updated in-tx); nonexistent Reservation.customerName removed (walkInCustomerName kept); displayNumber = prefix+number; walk-in-token: Int queueNumber + 6-digit token as displayNumber; service ownership validated.
+- staff PATCH: role change re-applies tier defaults; permissions write BOTH legacy JSON + normalized booleans (unknown-column degrade to JSON-only).
+- node --check PASS on index.js, schema-init-sql.js, schema-migrations.js (after every batch).
+
+Stage Summary:
+- The desktop embedded API mirrors the cloud enforcement 1:1 (offline-safe): authority gates on every management surface, staff self-serve counter occupation with outbox replay, and no ticket can be issued while the queue is closed/paused/full. Two long-standing guaranteed-500 walk-in bugs fixed as a side effect.
+
+---
+Task ID: 37-e-web
+Agent: full-stack-developer (finished mid-flight; coordinator audited + browser-verified)
+Task: Authority-aware shared UI (webapp + desktop bundle): hook, sidebar/page hiding, staff meter, manager authorities, occupy flow, payment history, i18n.
+
+Work Log:
+- NEW apps/web/src/hooks/use-agency-authority.ts: fetches GET /api/agency/my-authority once per session, caches in the zustand store (setAgencyAuthority), exposes { authority, loading, refresh, has() } with fail-open role defaults on fetch failure; canAccessAgencySection(view, authority, role) = the shared section matrix.
+- NEW components/agency/agency-authority-gate.tsx wired through the SPA view switch (apps/web/src/app/page.tsx): unauthorized sections redirect to the agency dashboard.
+- adaptive-sidebar.tsx: nav filtered by the matrix — OWNER all; MANAGER dashboard+history+branches*(grants)+subscription*(purchase|manage)+profile/settings*(canManageProfile); STAFF dashboard+history only; full list while loading (no flicker).
+- agency-employees.tsx (owner-only): staff count meter "X / N" from the subscription endpoint's plan maxStaff (-1 = unlimited; Add disabled at cap with the PLAN_LIMIT message); MANAGER create/edit dialogs show the Authorities checkbox group (create/delete branches, make purchase, subscription management, profile settings; tier defaults pre-checked) sent as `permissions` to create/PATCH; per-employee permissions editor extended.
+- components/shared/staff-permissions-editor.tsx: + canCreateBranches/canDeleteBranches/canPurchaseSubscription/canManageSubscription toggles (presets kept).
+- agency-fullscreen.tsx: real counter OCCUPATION replaces the localStorage-only selector — occupy/release via the new endpoints, 409 COUNTER_OCCUPIED + OCCUPY_COUNTER_FIRST surfaced as friendly toasts, occupied-by shown.
+- dashboard/counter-management.tsx: the fabricated STAFF_NAMES mock replaced with REAL counters (branch-scoped, occupied-by name or Free) + per-counter Call Next posting {agencyId, counterId}.
+- agency-subscription.tsx: graceful no-access state on 403; PAYMENT HISTORY section fed by GET /api/transactions?limit=20 (falls back to the subscription response's recentTransactions).
+- i18n en/ar/fr: authority*/occupy*/paymentHistory/staffMeter/ownerOnlySection keys (ar.ts source-of-truth mirrored).
+- Verification (coordinator): lint clean; web tsc = 310 exact baseline (0 new); live browser: staff login → sidebar shows EXACTLY dashboard+history, queue console renders (C-001, Call Next), staff badge shown; screenshots tool-results/t37-landing.png + t37-staff-console.png.
+
+Stage Summary:
+- The UI now matches the 2-tier model end-to-end: sections a caller has no authority for are hidden AND server-redirected, staff occupy their own counters, managers carry owner-granted authorities, and owners see payment history + the staff-limit meter. The desktop app inherits all of it via the shared bundle (rebuild required).
+
+---
+Task ID: 37-verify
+Agent: Z.ai Code (main, coordinator)
+Task: End-to-end verification of the whole batch + platform cleanup.
+
+Work Log:
+- Live E2E vs the restarted cloud API (tool-results/t37-authority-e2e.cjs): 42/42 PASS — registration→agency→BASIC plan→service/branch/counter; manager+staff tier defaults via my-authority; staff branch 403 / manager branch 201+delete 200; staff & manager cannot create staff; staff subscription 403 / manager 200; staff settings 403 / manager 200 (canManageProfile); owner revokes manager grants → manager branch 403; staff call-next without counter 403 OCCUPY_COUNTER_FIRST → occupy 200 → manager occupy same counter 409 COUNTER_OCCUPIED → call-next from own counter 200 → release → 403 again; walk-in works (Int queueNumber fix); queue closed → walk-in 400; capacity 200 > BASIC 100 → 403 PLAN_LIMIT_REACHED; branch cap → 403 (Task 35 intact).
+- Browser: staff console renders with a filtered sidebar (screenshots saved).
+- Platform reset to the fresh admin-only state afterwards (bun run reset:all -y with the API running — hot-swap adopted the fresh DB, Task 36 behavior re-proven on the new schema); web 200, API healthy; api log clean.
+- lint clean; apps/web tsc 310 = baseline; apps/api tsc 119 = baseline; node --check on all touched desktop JS files PASS.
+
+Stage Summary:
+- The full batch is live and verified: desktop branch visibility, queue-status honesty (profile badges + join gating on both APIs), plan-limited capacity/services, services/branches/staff management in settings, the 2-tier staff authority system (enforced on cloud + desktop + hidden in UI), staff self-serve counter occupation, payment history for paying roles, and the staff counting meter. USER ACTION: rebuild the desktop app (bun run build:desktop) to ship the shared-UI + local-API changes.
+---
+Task ID: 38
+Agent: Z.ai Code (main, coordinator)
+Task: Add a fresh agency account (agency owner only, no other data — "as if just created") to the seed file.
+
+Work Log:
+- Studied the real creation flow to mirror it byte-for-byte: POST /api/agencies creates Agency + nested empty QueueSettings and NOTHING else (no AgencyStaff OWNER row — owner is resolved via Agency.ownerId, confirmed in auth.ts login); schema defaults supply subscriptionTier FREE / status INACTIVE / city M'Sila / wilaya 28 / hours 08:00–17:00 / workingDays 1,2,3,4,5 / isQueueOpen true / maxActiveReservations 50.
+- packages/db/prisma/seed.ts: new section 3 — user owner/owner123 (AGENCY_OWNER, owner@blasti.dz, pre-verified like the admin per the Task 31-A precedent so it logs in without OTP — documented deviation) + agency "My Agency" (customCode MYA = the exact auto-derive name.slice(0,3).toUpperCase(), category OTHER = route default, queueSettings { create: {} }). Zero branches/services/staff/counters/reservations/subscription/AgencyStaff rows. Header docs + console summary updated; stale "only account" log lines fixed.
+- scripts/reset-all.ts: messaging updated everywhere it claimed "EXACTLY ONE account" — header comment, confirmation banner, seed step label ('fresh-start seed (admin + fresh agency)'), completion summary (Super Admin + Agency Owner + fresh agency lines), next-steps text.
+- Ran bun run db:seed (API stayed up): verified via @blasti/db — USERS [admin SUPER_ADMIN, owner AGENCY_OWNER both verified], AGENCIES ["My Agency"/MYA/OTHER/FREE/INACTIVE/queue open/cap 50/defaults], queueSettings=1, branches=0, services=0, agencyStaff=0, counters=0, plans=3, reservations=0.
+- Live E2E vs the running cloud API: POST /api/auth/login owner/owner123 → 200 with token AND agencyId resolved via ownerId; GET /api/agency/profile → fresh profile (no logo/cover/address/phone, default hours/days, queue open, cap 50); GET /api/agency/branches → []; GET /api/services → [].
+- bun run lint clean.
+
+Stage Summary:
+- Every fresh reset now yields the super admin PLUS one untouched agency ready for onboarding testing: owner / owner123 → "My Agency" (code MYA), FREE tier, INACTIVE subscription, empty queue settings, and no other data — byte-identical to an agency the owner just created through the real flow. reset-all docs/output match the new seed.
+---
+Task ID: 39
+Agent: Z.ai Code (main, coordinator)
+Task: Scan the whole UI/frontend and fix corrupted/collapsed switches & toggles (thumb outside boundary / not moving / wrong position / not showing).
+
+Work Log:
+- Full inventory: 16 files use the shared ui/switch.tsx (~40 instances); 7 hand-rolled role="switch" buttons (onboarding-wizard, 3 identical customer-profile copies, 3 in agency-settings); no peer-checked CSS toggles; 3 Switch className overrides are colors only; agency-subscription uses card selectors (not thumbs). Root cause found: the app defaults to Arabic → document.documentElement.dir='rtl', and broken toggles anchored thumbs at flex-start/start (RIGHT in RTL) but slid them with LTR-positive translateX/left math.
+- ui/switch.tsx REWRITTEN (fixes all 16 consumers at once): thumb now absolutely positioned with LOGICAL insets — top-1/2 start-[2px] -translate-y-1/2 size-4, checked = start-[14px], transition-all — zero translate-x, zero calc() risk; root got `relative` (kept shrink-0 so flex rows can't collapse it). RTL-checked used to throw the thumb 14px PAST the track (clipped to invisible inside overflow-hidden cards); LTR calc(100%-2px) class was also fragile.
+- onboarding-wizard.tsx: inline style transform translateX(20px) → conditional start-[3px]/start-[23px] (w-11 track, 18px thumb, 3px margins).
+- customer-profile.tsx + profile/notification-prefs.tsx + profile/profile-sms-settings.tsx (identical copies): physical style={{left}} + framer-motion `layout` (wrong side in RTL, spring jitter) → conditional start-[2px]/start-[22px] CSS transition; motion.span → span (track keeps its motion.div color fade).
+- agency-settings.tsx CustomToggle + staff + edit-dialog toggles left untouched — they already used logical start-* for both states (the pattern the fixes standardize on).
+- Verified numerically in the live app via agent-browser (admin → Platform Settings, 7 switches): RTL — unchecked thumb at 13px (right), checked thumb at 1px (left), inside:true, zero overhang; LTR — unchecked 3px (left), checked 15px (right), inside:true; toggling slides fully WITHIN the pill in both directions. Screenshots: tool-results/t39-switches-rtl.png, t39-switches-ltr.png, t39-rtl-checked-zoom.png (checked = dark track + thumb left in RTL, perfect). Console errors seen are pre-existing/unrelated (/api/admin/sms-settings 404, notifications timeout).
+- bun run lint clean.
+
+Stage Summary:
+- Every switch/toggle in the app (shared Radix Switch on 16 pages + onboarding wizard + 3 customer profile toggles) now uses direction-aware logical insets: the thumb can never leave the track, always moves, correct end in both Arabic (RTL) and English/French (LTR), and no more flex/animation fights. Desktop inherits the fix automatically: electron:dev loads the live localhost:3000 bundle; installed builds need bun run build:desktop.
+---
+Task ID: 40
+Agent: Z.ai Code (main, coordinator)
+Task: "In desktop app, created branches still not showing in branch section — showing in webapp but not in desktop app."
+
+Work Log:
+- Read the Task 35-A + 37-a history first (strict no-redo rule): both already fixed the reported shape in source (resolveSessionAgencyId fallback, body.agencyId on POST branches, dual-envelope UI parse, refreshed-token adoption in the renderer). Cloud-side E2E existed, but the desktop LOCAL flow had never been live-verified — so I verified it for real instead of touching code.
+- Built a standalone Electron-free harness (tool-results/t40-branch-harness.cjs) that boots the REAL local API (startLocalApi on :3081, BLASTI_LOCAL_DB_DIR=/tmp/t40-desktop), logs in as the fresh seeded owner against the live cloud, runs the EXACT renderer flow (POST /api/auth/import-session → cloud-validated refreshed-token adoption) and the EXACT main.js initial-sync recipe (checkInitialSyncStatus → runInitialSync → setInitialCursor → syncService.setAuth + startSync), then exercises both directions.
+- HARNESS RESULTS (all against the live cloud + real local API): Test A create-in-desktop → local GET /api/agency/branches lists it 201/PASS; Test A2 outbox SYNC_PUSH reaches the cloud in ~2s PASS (this is exactly why the user's webapp shows desktop-created branches); Test B create-in-webapp (cloud POST) → realtime/pull delivers it to the local list in ~2s PASS. The CURRENT SOURCE desktop branch flow is fully healthy end-to-end.
+- Harness-findings en route: (1) import-session adopts a REFRESHED token — the original login token stops matching local requireAuth when login/refresh cross a second boundary (the real renderer already stores the response token — Task 37-a FIX 3); (2) cloud POST /api/agency/branches is now subscription-gated (Task 37: FREE/INACTIVE agency → 403 "An active subscription is required") while the desktop local route is not (documented Task 37 product decision) — desktop-created branches still reach the cloud via the role-agnostic SYNC_PUSH replay; (3) Task 35 plan limits fire locally too (FREE=1 branch).
+- ROOT CAUSE of the user's report: their installed desktop bundle predates Task 37-a (flagged since Task 35 — the bundle also predates Tasks 31-36 fixes). Code fix is complete; the running app is old. No source changes needed for the branch flow itself.
+- STALE-BUNDLE GUARD added so this confusion loop ends: apps/desktop/scripts/prebuild.js now writes build-stamp.json {builtAt, git sha} on every package; loading-screen.js shows "v0.2.0 · Build YYYY-MM-DD HH:MM" on the first screen (dev/source runs show no label); main.js boot log prints the stamp with a 30-day-staleness warning. .gitignore: apps/desktop/build-stamp.json + apps/desktop/out/.
+- Verification: node --check main.js / loading-screen.js / prebuild.js PASS; stamp write exercised (git d7b7e8f, 2026-09-24T06:47Z); lint clean; platform restored pristine after testing (fresh agency 0 branches, INACTIVE/FREE — sub-toggle script reverted everything; T40 test rows deleted from cloud + local).
+- USER ACTION (unchanged, now self-verifiable): update the Windows project copy from this repo, then bun run build:desktop + reinstall (or bun run electron:dev from source). The loading screen must show TODAY's build date — an old date = stale bundle = none of the Tasks 31-40 fixes are in it.
+
+Stage Summary:
+- Proven with a live three-direction E2E that the current source displays desktop-created branches, pushes them to the cloud, and pulls webapp-created branches — the desktop branch section bug exists only in stale installed bundles. Added the build-stamp guard rail (loading screen + boot log) so anyone can confirm at a glance whether a desktop install carries the current fixes.
+---
+Task ID: 41
+Agent: Z.ai Code (main, coordinator)
+Task: (a) Post-login splash screen with the big app logo that waits for data sync before the dashboard ("data load failed" flash); (b) real-phone webapp flicker / components appearing-disappearing / endless agency loading + ChunkLoadError logs.
+
+Work Log:
+- Root causes found (4, all in apps/web):
+  1. The authenticated shell mounted immediately after login/reload while the offline DB + first pull were still running → dashboards fired API calls mid-sync → "Failed to load data" (errorLoadingData) until a manual refresh.
+  2. PRE-EXISTING BUG in use-app-store.ts: sanitizePersistedState() (used by BOTH persist merge and migrate) DROPPED sessionToken — after every reload the UI stayed logged in (httpOnly cookie kept the API alive) while the sync engine's getAuthToken() found nothing and "[SyncEngine] No auth token — skipping sync" on every cycle; the offline DB never caught up. Fixed: sessionToken now survives rehydration (validated as string, '' on corruption; migrate's corrupted-state guard also returns it).
+  3. probeLanServer() Strategy 1 ran the FULL quickDiscover() inline — a 254-IP subnet scan (1.5 s timeout/IP, batches of 10 → up to ~40 s) on EVERY sync cycle/probe whenever no desktop app was on the LAN. This was the "syncing takes some time" stall. Fixed: raced with a 3.5 s budget (LAN_DISCOVERY_BUDGET_MS); the background scan still caches any desktop it finds for the next probe; Strategy 2's cheap derived-URL probes decide the current cycle.
+  4. Phone flicker: current source never registers public/sw.js (dead code), but phones that got it from an OLD bundle keep the SW (cache-first static, 30-day TTL) serving stale Turbopack chunk URLs → ChunkLoadError → Suspense/error-boundary swap loop ("components appear and disappear"). Fixed with ClientBootHardening mounted in layout.tsx: unregisters ALL service workers + purges blasti-* CacheStorage buckets on every load, plus a one-shot ChunkLoadError auto-reload (15 s sessionStorage cooldown — heals dev chunk churn without reload loops).
+- NEW syncEngine.runSyncAndWait(database) (db/sync.ts): deterministic one-cycle primitive — pre-waits a running cycle (its isSyncing guard would otherwise swallow the call), then runs a fresh cycle and resolves on sync-complete/sync-error; .finally() covers sync()'s silent early-return paths (offline+no-LAN, revoked).
+- NEW components/shared/boot-gate.tsx (BootGate): full-screen splash replacing the authed shell (not an overlay — dashboards cannot mount mid-sync): big /logo.png card + emerald glow, BLASTI gradient title + بلاصتي, pulsing emerald bar, i18n phase text (preparing → syncing → almost ready + slow note at 8 s). Waits DB init → one real sync for the CURRENT token; bounded: DB cap 6 s, overall cap 15 s, min display 900 ms, proceeds on sync-error (offline-first).
+- page.tsx: bootReady state + gate render before the authed shell (device-kiosk/TV and agency-fullscreen branches intentionally bypass it), re-armed on logout via an isAuthenticated effect.
+- i18n en/ar/fr: bootPreparing / bootSyncing / bootAlmostReady / bootSlowNote.
+- Verified live (agent-browser): fresh login owner/owner123 → splash renders (screenshots t41-splash-during.png, t41-e2e-splash.png "شبه جاهز…") → releases right after "[SyncEngine] Sync complete via cloud" (zero max-wait warnings) → dashboard renders (incl. onboarding wizard); reload keeps the token (localStorage verified) and a REAL pull runs under the splash (was "No auth token" before the sanitizer fix); logout → re-login re-arms the splash; iPhone-14 viewport renders the dashboard cleanly; no ChunkLoadError/console errors; bun run lint clean.
+
+Stage Summary:
+- Post-login/reload now shows a branded splash and the dashboard mounts only after the first sync settles (bounded, offline-tolerant), the session token survives reloads so the sync engine actually works after refresh, LAN discovery no longer stalls every sync cycle for up to ~40 s, and phones with a legacy service worker are healed on load + auto-recover once from chunk-load failures. Desktop electron:dev inherits everything (same webapp bundle); installed desktop builds need bun run build:desktop as usual. The "[SyncEngine] LAN server has no /api/sync/pull route" line in the user's terminal is their STALE desktop local API (Task 40) — already handled by the 5-min cooldown + cloud fallback.
+
+---
+Task ID: 42
+Agent: Z.ai Code (main, coordinator)
+Task: "Desktop app still doesn't show created branches — can create 2, then the standard-branches limit message shows, but the branch section says 'there are no branches yet'."
+
+Work Log:
+- Read Task 40 history first (no-redo rule): source-level branch flow was harness-proven healthy then; stale installed bundle was blamed. The NEW report adds a decisive datum: the plan-limit counter SEES the 2 created branches while the LIST renders empty — same-storage disagreement.
+- Traced the whole read path: agency-branches.tsx (dual-envelope parse, error+retry on non-OK, refetch after create) → apiFetch/apiClient (Electron = hardcoded 127.0.0.1:3080 local-first, cloud failover inert; WatermelonDB cache branch inert for the branches route because apiFetch embeds agencyId in the query string, not params) → local GET/POST /api/agency/branches (identical resolveSessionAgencyId, same SQLite file, single process). Conclusion: on CURRENT source the symptom is structurally impossible.
+- initial-sync.js verified per-agency: checkInitialSyncStatus keys AgencyLocalState by agencyId — a READY row for an old agency cannot suppress re-import for a new one (cloud-reset poisoning handled).
+- Wrote tool-results/t42-sub-standard.ts (activates the 2-branch tier — BASIC here, the user's "standard" — then reverts) + tool-results/t42-desktop-branch-standard.cjs (real local API on :3082, temp DB, real cloud, exact renderer flow). VERDICT 4/4 PASS: create×2 → 201+201; 3rd create → 403 PLAN_LIMIT_REACHED "Your Basic plan allows up to 2 branches…"; local list shows BOTH branches (the user's failure point); outbox push → cloud list shows both. Platform restored pristine afterwards.
+- ROOT CAUSE (refined): the user keeps testing an OLD process/bundle. New mechanism found this round: main.js already holds the single-instance lock, and window-close keeps the app alive in the tray — so when the OLD app sits in the tray holding the lock, launching the NEW build silently quits (app.quit()) and focuses the OLD window. The user believes they launched the new build; every test hits old code. Fallback variant: two instances → EADDRINUSE with a cryptic message.
+- FIX 1 (local-api/index.js /api/health): build identity added — service:'blasti-local-api', version (desktop package.json), build (prebuild stamp; null in dev). Old bundles return none of these fields → reliable staleness fingerprint. Verified live: 200 {service, version:'0.2.0', build:null, ...}.
+- FIX 2 (main.js !gotTheLock): before quitting, probe the running instance's 127.0.0.1:3080/api/health (Node http, pre-ready-safe); if it answers with mode:'local' and an OLDER/missing version → bilingual dialog.showErrorBox: "an older BLASTI instance is still running — exit it from the system tray / Task Manager, then relaunch". Same-version → silent quit (normal tray case unchanged). dialog added to the electron imports.
+- FIX 3 (loading-screen.js diagnostics local-server step): port-conflict pre-probe BEFORE startLocalApi — if :3080 is already occupied, report a SPECIFIC bilingual error (BLASTI instance w/ version + build hint vs. foreign app) with detail.portConflict, and early-return finalizeDiagnostics so the endpoint tests never probe the WRONG (stale) server and falsely pass.
+- Verification: node --check main.js / loading-screen.js / local-api/index.js PASS; live boot + health identity check PASS; bun run lint clean (web untouched); t42 harness 4/4 PASS pre-edit (edit orthogonal to branch routes, isolated to /api/health).
+- USER ACTION (critical, now self-verifying): update the Windows copy → bun run build:desktop → uninstall/close the OLD app COMPLETELY (tray icon → Exit; check Task Manager for leftover BLASTI processes) → install the new build → launch: the loading screen must show TODAY's build date. If a dialog about an older instance appears, that IS the old app still running — exit it. In electron:dev, restart the app so main.js + local-api reload.
+
+Stage Summary:
+- Current source re-proven 4/4 on the exact reported scenario (2 creates → limit message → list shows both → cloud push); the reported symptom cannot occur on it. The recurrence is explained by a stale desktop PROCESS (tray-resident old instance silently winning the single-instance race) — now impossible to miss: a stale-running instance triggers an explicit bilingual dialog on next launch, the diagnostics pre-probe names the port conflict and identifies the running build, and /api/health exposes service/version/build identity. The desktop branch-list fix itself remains Task 40's (source healthy; ships with bun run build:desktop).

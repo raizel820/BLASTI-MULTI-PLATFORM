@@ -81,6 +81,14 @@ const LAN_PROBE_INTERVAL_MS = 30 * 1000; // Re-probe LAN every 30s
 const LAN_PROBE_TIMEOUT_MS = 2000; // 2s timeout for LAN server probe
 const LAN_SYNC_BASE_PATH = '/api/sync'; // Same path on desktop LAN server
 const LAN_UNSUPPORTED_COOLDOWN_MS = 5 * 60 * 1000; // Retry LAN sync 5 min after a 404
+// Task 41 — hard budget for the inline LAN discovery on the sync path.
+// quickDiscover() includes a 254-IP subnet scan (1.5 s timeout per IP,
+// batches of 10 → up to ~40 s) which stalled EVERY sync cycle on devices
+// with no desktop app running — the direct cause of "syncing takes some
+// time" after login. The race keeps the cheap strategies (cache, localhost,
+// mDNS) inside the budget and lets a running scan finish in the background
+// (it caches its result for the next probe/cycle).
+const LAN_DISCOVERY_BUDGET_MS = 3500;
 // Task 33-E: cloud protocol-v2 pull cursor + pagination. The cloud's
 // POST /api/sync/pull expects { sinceSequence } and answers with
 // pageLastSequence + hasMore; we persist the safe cursor and page through
@@ -262,7 +270,15 @@ class SyncEngine {
       const { getCachedServer, quickDiscover } = await import('@/lib/lan-discovery');
       let server = getCachedServer();
       if (!server) {
-        server = await quickDiscover().catch(() => null);
+        // Task 41 — bounded discovery: never let the 254-IP subnet scan
+        // stall the sync path (see LAN_DISCOVERY_BUDGET_MS). If the scan
+        // hasn't answered within the budget, Strategy 2's cheap derived-URL
+        // probes decide THIS cycle; the background scan still caches any
+        // desktop it eventually finds for the next probe.
+        server = await Promise.race([
+          quickDiscover().catch(() => null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), LAN_DISCOVERY_BUDGET_MS)),
+        ]);
       }
       if (server && server.ip && (server.apiPort || server.port)) {
         const port = server.apiPort || server.port;
@@ -828,6 +844,58 @@ class SyncEngine {
       clearInterval(this.lanProbeIntervalId);
       this.lanProbeIntervalId = null;
     }
+  }
+
+  /**
+   * Task 41 — run ONE sync cycle and resolve when it actually finishes.
+   *
+   * The boot gate (post-login splash) needs a deterministic "wait for the
+   * first real sync" primitive: the periodic loop's initial sync fires 3 s
+   * after DB init (often BEFORE the login token exists — it then no-ops) and
+   * `resumeAfterAuth()` deliberately does nothing while intervals are already
+   * running, so after a login the next real pull could be up to 5 minutes
+   * away. That race is exactly why the dashboard used to mount mid-sync and
+   * flash "Failed to load data" until the user refreshed.
+   *
+   * Semantics:
+   *   - If a cycle is already running, wait for its terminal event first
+   *     (otherwise the follow-up call would be swallowed by the isSyncing
+   *     guard and resolve without any sync having run for this token).
+   *   - Then run a fresh cycle and resolve on its sync-complete/sync-error.
+   *   - sync() has early-return paths that resolve WITHOUT emitting
+   *     (offline + no LAN, revoked session, SSR) — the trailing .then()
+   *     still resolves so callers with their own timeout are never hung.
+   */
+  async runSyncAndWait(database: Database): Promise<void> {
+    if (!isBrowser) return;
+
+    if (this.isSyncing) {
+      await new Promise<void>((resolve) => {
+        const unsub = this.onEvent((e) => {
+          if (e.type === 'sync-complete' || e.type === 'sync-error') {
+            unsub();
+            resolve();
+          }
+        });
+      });
+    }
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const unsub = this.onEvent((e) => {
+        if (e.type === 'sync-complete' || e.type === 'sync-error') {
+          unsub();
+          finish();
+        }
+      });
+      // Never leave the caller hanging on the no-event early returns.
+      void this.sync(database).finally(() => setTimeout(finish, 0));
+    });
   }
 }
 

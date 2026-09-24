@@ -209,6 +209,13 @@ const en: Record<TranslationKeys, string> = {
   maxReservations: "Max Active Reservations",
   queueOpen: "Open Queue",
   queueClosedStatus: "Close Queue",
+  // Task 37: real queue-state badges + plan capacity helpers
+  // (badge reuses the pre-existing `queueClosed` key from the queue section)
+  unlimited: "Unlimited",
+  planCapacityLimit: "Plan limit: {n} (upgrade for more)",
+  capacityExceedsPlan: "Value exceeds your plan limit ({n})",
+  branch: "Branch",
+  selectBranch: "Select branch",
   addService: "Add Service",
   serviceName: "Service Name",
   servicePrefix: "Queue Number Prefix",
@@ -1570,6 +1577,8 @@ const en: Record<TranslationKeys, string> = {
   setAsMain: 'Set as Main',
   noBranches: 'No branches yet',
   noBranchesDesc: 'Add your first branch to start organizing service counters',
+  branchesLoadFailed: 'Failed to load branches',
+  retry: 'Retry',
   confirmDeleteBranch: 'Are you sure you want to delete this branch? All counters will be deleted too.',
   branchDeleted: 'Branch deactivated',
   branchCreated: 'Branch created successfully',
@@ -1733,6 +1742,12 @@ const en: Record<TranslationKeys, string> = {
   pendingSyncEvents: 'Events pending sync',
   reconnect: 'Reconnect',
   reconnected: 'Reconnected',
+
+  // ─── Boot splash (Task 41) ──────────────
+  bootPreparing: 'Preparing your data…',
+  bootSyncing: 'Syncing your data…',
+  bootAlmostReady: 'Almost ready…',
+  bootSlowNote: 'Taking longer than usual — opening your dashboard shortly',
 
   // ─── Offline Reservation Sync ──────────────
   offlineReservationsPending: '{count} offline reservation(s) pending sync',
@@ -2709,6 +2724,31 @@ const en: Record<TranslationKeys, string> = {
   auditReconciliationRun: 'Reconciliation Run',
   auditCronExecute: 'Cron Executed',
   auditPush: 'Push Notification',
+  // ─── Task 37-e: agency authority, staff meter & counter occupation ───
+  selectCounter: 'Select Counter',
+  authorities: 'Authorities',
+  authorityCreateBranches: 'Create branches',
+  authorityDeleteBranches: 'Delete branches',
+  authorityMakePurchase: 'Make purchases',
+  authorityManageSubscription: 'Manage subscription',
+  authorityProfileSettings: 'Profile settings',
+  staffMeter: '{x} of {n} staff',
+  staffUnlimited: '{x} staff · unlimited',
+  staffLimitReached: 'Staff limit reached for your plan — upgrade your subscription to add more.',
+  ownerOnlySection: 'This section is only available to the agency owner.',
+  noSubscriptionAccess: 'You do not have access to subscription management.',
+  paymentHistory: 'Payment History',
+  noTransactions: 'No payments yet.',
+  occupyCounter: 'Counter occupied',
+  releaseCounter: 'Release counter',
+  counterReleased: 'Counter released',
+  counterOccupied: 'Occupied',
+  counterOccupiedBy: 'Occupied by {name}',
+  counterMine: 'Yours',
+  counterFree: 'Free',
+  occupyFirst: 'Occupy a counter first to call the next customer.',
+  counterPermissionDenied: 'You do not have permission for this counter.',
+
 };
 
 export default en;

@@ -39,6 +39,14 @@ const { net } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const appVersion = require('../../package.json').version;
+// Task 40: build stamp — makes a stale installed bundle instantly visible on
+// the first screen. prebuild.js writes build-stamp.json on every package;
+// a dev/source run has no stamp and shows no build label.
+let buildStamp = null;
+try { buildStamp = require('./build-stamp.json'); } catch { buildStamp = null; }
+const buildLabel = buildStamp && buildStamp.builtAt
+  ? ` · Build ${String(buildStamp.builtAt).slice(0, 16).replace('T', ' ')}`
+  : '';
 
 // ─── Diagnostic Step Definition ───────────────────────────────────────────
 
@@ -404,7 +412,7 @@ function getLoadingHTML() {
       <div class="brand-info">
         <div class="brand-name">BLASTI</div>
         <div class="brand-sub">بلاصتي — نظام إدارة الطوابير</div>
-        <div class="brand-version">v${appVersion}</div>
+        <div class="brand-version">v${appVersion}${buildLabel}</div>
       </div>
       <div class="header-progress">
         <div class="progress-row">
@@ -1729,6 +1737,42 @@ async function runDiagnostics(mainWindow, config) {
 
         // Start the local API server
         const localApi = require('./local-api/index');
+
+        // ── Task 42: port-conflict pre-probe ─────────────────────────────
+        // If ANOTHER server already owns :3080 (an old BLASTI left running in
+        // the tray across an update, or a second dev/installed pair sharing
+        // the port), startLocalApi fails with a cryptic EADDRINUSE — and any
+        // session that somehow proceeded would silently talk to that STALE
+        // server (old code + old DB): the recurring "my updated app still
+        // shows the old bug" divergence. Detect it FIRST with an actionable
+        // message and SKIP the endpoint tests (they would probe the WRONG
+        // server and could falsely pass on stale code).
+        const conflictProbe = await probeUrl(`http://127.0.0.1:${localApi.DEFAULT_PORT}/api/health`, 1500);
+        if (conflictProbe.reachable) {
+          let identity = null;
+          try { identity = conflictProbe.body ? JSON.parse(conflictProbe.body) : null; } catch { /* non-JSON */ }
+          const isBlastiLocal = !!(identity && (identity.mode === 'local' || identity.service === 'blasti-local-api'));
+          const identityLabel = identity && identity.version
+            ? ` (إصدار ${identity.version}${identity.build ? '، بناء ' + String(identity.build).slice(0, 10) : ''})`
+            : ' — على الأرجح نسخة قديمة';
+          const identityLabelEn = identity && identity.version
+            ? ` (v${identity.version}${identity.build ? ', build ' + String(identity.build).slice(0, 10) : ''})`
+            : ' (likely an older build)';
+          serverResult = {
+            step: 'local-server',
+            status: 'error',
+            message: isBlastiLocal
+              ? `مثيل BLASTI آخر يعمل بالفعل ويحجز الخادم المحلي${identityLabel} — أغلقه من أيقونة النظام (Exit) أو مدير المهام ثم أعد التشغيل / Another BLASTI instance is already running and holds the local server${identityLabelEn} — exit it from the system tray (Exit) or Task Manager, then relaunch`
+              : `المنفذ ${localApi.DEFAULT_PORT} محجوز من تطبيق آخر — أغلق ذلك التطبيق ثم أعد التشغيل / Port ${localApi.DEFAULT_PORT} is occupied by another application — close it, then relaunch`,
+            detail: {
+              portConflict: true,
+              identity: identity ? { service: identity.service || null, version: identity.version || null, build: identity.build || null } : null,
+            },
+          };
+          pushResult(serverResult);
+          return finalizeDiagnostics();
+        }
+
         const startResult = await localApi.startLocalApi(
           null,
           localApi.DEFAULT_PORT,

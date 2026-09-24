@@ -260,6 +260,14 @@ CREATE TABLE "AgencyStaff" (
     "canManageWorkingHours" BOOLEAN NOT NULL DEFAULT false,
     "canExportData" BOOLEAN NOT NULL DEFAULT false,
     "canManageProfile" BOOLEAN NOT NULL DEFAULT false,
+    -- Task 37-d: 2-tier staff authority — normalized boolean columns for the
+    -- new branch-create/delete + subscription-management permissions (kept in
+    -- sync with the cloud schema.prisma AgencyStaff model — the shared Prisma
+    -- client expects them; see the guarded migration in schema-migrations.js).
+    "canCreateBranches" BOOLEAN NOT NULL DEFAULT false,
+    "canDeleteBranches" BOOLEAN NOT NULL DEFAULT false,
+    "canPurchaseSubscription" BOOLEAN NOT NULL DEFAULT false,
+    "canManageSubscription" BOOLEAN NOT NULL DEFAULT false,
     "permissions" TEXT NOT NULL DEFAULT '{"canManageQueue":true,"canManageServices":false,"canManageStaff":false,"canViewAnalytics":true,"canManageBranches":false,"canManageWorkingHours":false,"canExportData":false,"canManageProfile":false}',
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "joinedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -562,6 +570,11 @@ CREATE TABLE "Counter" (
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "branchId" TEXT NOT NULL,
     "staffId" TEXT,
+    -- Task 37-d: counter OCCUPATION timestamp — Counter.staffId is repurposed
+    -- as "occupied by" (the occupying AgencyStaff row, or NULL for an
+    -- owner-held counter) and occupiedAt records WHEN it was occupied.
+    -- Nullable; set by POST /api/agency/counters/:id/occupy, cleared by release.
+    "occupiedAt" DATETIME,
     "currentReservationId" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,

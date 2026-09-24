@@ -14,21 +14,26 @@ function hashPassword(password: string): string {
 }
 
 /**
- * Task 34 — FRESH-START SEED.
+ * Task 34 — FRESH-START SEED (amended by Task 38).
  *
- * Seeds ONLY platform-admin data:
+ * Seeds ONLY platform-admin data plus ONE untouched agency account:
  *   1. The single SUPER_ADMIN account → admin / admin123 (admin@blasti.dz)
  *   2. The subscription-plan catalog  → FREE / BASIC / PREMIUM + plan features
  *      (platform data the subscription flow requires — not user accounts)
+ *   3. Task 38 — ONE fresh agency account → owner / owner123 (owner@blasti.dz)
+ *      with agency "My Agency" (code MYA) in the exact state the real
+ *      POST /agencies flow leaves it after creation: empty QueueSettings row
+ *      (schema defaults), FREE tier / INACTIVE subscription, and NOTHING else
+ *      — no branches, no services, no staff, no counters, no reservations, no
+ *      AgencyStaff row (the real create flow resolves the owner via ownerId
+ *      and never creates one). Fresh as if the owner just created it.
  *
- * Deliberately creates NO customer / agency-owner / staff accounts, NO demo
- * agencies, branches, services, counters, reservations, reviews, notifications,
- * FAQs or global settings rows (the API self-heals its SmsSettings /
- * PaymentSettings singletons on first use). After a reset the database contains
- * exactly ONE account: the super admin. Everything else is created by real usage.
+ * Deliberately creates NO customer accounts, NO demo branches/services/counters/
+ * reservations/reviews/notifications/FAQs or global settings rows (the API
+ * self-heals its SmsSettings / PaymentSettings singletons on first use).
  */
 async function seed() {
-  console.log('🌱 Seeding database (fresh platform setup — admin only)...');
+  console.log('🌱 Seeding database (fresh platform setup — admin + one fresh agency)...');
 
   // ─── Clean up ALL existing data (children first, parents last) ─────────────────
   console.log('🧹 Cleaning existing data...');
@@ -85,9 +90,9 @@ async function seed() {
   await db.subscriptionPlan.deleteMany();
 
   // ═══════════════════════════════════════════════════════════════════════════════
-  // ─── 1. Create the (only) Admin User ──────────────────────────────────────────
+  // ─── 1. Create the Super Admin ─────────────────────────────────────────
   // ═══════════════════════════════════════════════════════════════════════════════
-  console.log('👤 Creating super admin (the only account)...');
+  console.log('👤 Creating super admin...');
 
   await db.user.create({
     data: {
@@ -244,14 +249,60 @@ async function seed() {
 
   console.log(`   📋 Created 3 subscription plans with ${allFeatures.length * 3} features`);
 
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // ─── 3. Fresh Agency Account (Task 38) ─────────────────────────────────────
+  //   Mirrors the real flow byte-for-byte: a freshly registered AGENCY_OWNER
+  //   who has just created ONE agency and done nothing else.
+  // ═══════════════════════════════════════════════════════════════════════════════
+  console.log('🏢 Creating fresh agency account (owner only, no other data)...');
+
+  const owner = await db.user.create({
+    data: {
+      username: 'owner',
+      fullName: 'Agency Owner',
+      passwordHash: hashPassword('owner123'),
+      role: 'AGENCY_OWNER',
+      email: 'owner@blasti.dz',
+      // Deviation note: a literally-fresh registration is unverified until the
+      // email/phone OTP passes (Task 22). The seeded account is pre-verified —
+      // same precedent as the super admin (Task 31-A) — so it can log in and
+      // be used immediately without an OTP round-trip.
+      emailVerified: true,
+      phoneVerified: true,
+    },
+    select: { id: true },
+  });
+
+  await db.agency.create({
+    data: {
+      name: 'My Agency',
+      // Exactly what the real auto-derive produces: name.slice(0, 3).toUpperCase()
+      customCode: 'MYA',
+      // Route default when the create form omits a category
+      category: 'OTHER',
+      ownerId: owner.id,
+      // The real POST /agencies always creates the queue settings row with
+      // schema defaults (counters 0, not paused). Every other agency field
+      // (FREE tier, INACTIVE status, city/wilaya, working hours/days,
+      // isQueueOpen, maxActiveReservations…) rides on schema defaults.
+      queueSettings: {
+        create: {},
+      },
+    },
+  });
+
+  console.log('   🏢 Agency "My Agency" (MYA) created — FREE tier, no branches/services/staff');
+
   console.log('');
   console.log('✅ Fresh seed completed successfully!');
   console.log('');
   console.log('📋 Summary:');
-  console.log('   👤 Super Admin: admin / admin123 (admin@blasti.dz) — the ONLY account');
+  console.log('   👤 Super Admin: admin / admin123 (admin@blasti.dz)');
+  console.log('   👤 Agency Owner: owner / owner123 (owner@blasti.dz) — fresh agency, owner only');
+  console.log('   🏢 Agency: "My Agency" (code MYA) — FREE tier · INACTIVE · no branches/services/staff');
   console.log('   📋 Plans: FREE (0 DZD) · BASIC (2,000 DZD/mo) · PREMIUM (5,000 DZD/mo)');
   console.log('      Period discounts: 6 months -5% · 12 months -10% · 24 months -20%');
-  console.log('   🚫 No customers / agency owners / staff / demo agencies (fresh start)');
+  console.log('   🚫 No customers / demo data — the agency is exactly as if just created');
 }
 
 seed()

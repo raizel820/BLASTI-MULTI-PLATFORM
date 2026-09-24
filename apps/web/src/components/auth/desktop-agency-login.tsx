@@ -28,6 +28,7 @@ import { useState, useCallback } from 'react'
 import { apiFetch } from '@/lib/api-fetch'
 import { apiClient, setNativeSessionToken } from '@/lib/api-client'
 import { useAppStore } from '@/store/use-app-store'
+import { adoptImportedLocalSessionUser } from '@/lib/session-heal'
 import { useLanguage } from '@/hooks/use-language'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -196,7 +197,10 @@ export function DesktopAgencyLogin() {
                 setNativeSessionToken(data.token)
                 // buildAuthHeaders() fallback for local API requests
                 try { localStorage.setItem('blasti-local-api-token', data.token) } catch { /* ignore */ }
-                // HTTP import-session backup (IPC bridge may not be enough)
+                // HTTP import-session backup (IPC bridge may not be enough).
+                // Task 37-a: adopt the refreshed user the local API returns
+                // after its cloud validation so the persisted user (and its
+                // agencyId) can never go stale relative to the session.
                 const servedUrl = (res as unknown as { url?: string }).url
                 if (!servedUrl || !servedUrl.includes('localhost:3080')) {
                   fetch('http://127.0.0.1:3080/api/auth/import-session', {
@@ -204,7 +208,10 @@ export function DesktopAgencyLogin() {
                     headers: { 'Content-Type': 'application/json' },
                     credentials: 'omit',
                     body: JSON.stringify({ token: data.token, user: data.user }),
-                  }).catch(() => { /* non-critical */ })
+                  })
+                    .then((importRes) => (importRes.ok ? importRes.json().catch(() => null) : null))
+                    .then((importData) => adoptImportedLocalSessionUser(importData))
+                    .catch(() => { /* non-critical */ })
                 }
                 // Trigger the initial workspace sync (cloud → local SQLite).
                 if (w.electronAPI?.initialCloudSync) {
@@ -269,12 +276,16 @@ export function DesktopAgencyLogin() {
           try { localStorage.setItem('blasti-local-api-token', result.token) } catch { /* ignore */ }
           // HTTP import-session backup (IPC bridge may not be enough).
           // apiFetch responses carry no url — same behavior as the login path.
+          // Task 37-a: adopt the refreshed user the local API returns.
           fetch('http://127.0.0.1:3080/api/auth/import-session', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             credentials: 'omit',
             body: JSON.stringify({ token: result.token, user: result.user }),
-          }).catch(() => { /* non-critical */ })
+          })
+            .then((importRes) => (importRes.ok ? importRes.json().catch(() => null) : null))
+            .then((importData) => adoptImportedLocalSessionUser(importData))
+            .catch(() => { /* non-critical */ })
           // Trigger the initial workspace sync (cloud → local SQLite).
           if (w.electronAPI?.initialCloudSync) {
             w.electronAPI.initialCloudSync().then((syncResult: any) => {

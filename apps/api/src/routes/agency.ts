@@ -1,6 +1,6 @@
 import { Hono, type Context } from 'hono'
 import { db } from '@blasti/db'
-import { requireAuth, requireAgencyAccess, requireResourceOwnership, resolveUserAgencyId, authErrorResponse, verifyAgencyOwnership, AuthError } from '../lib/auth'
+import { requireAuth, requireAgencyAccess, requireResourceOwnership, resolveUserAgencyId, authErrorResponse, verifyAgencyOwnership, requireAgencyAuthority, getAgencyAuthority, STAFF_PERMISSION_KEYS, AuthError, type StaffPermission, type SessionUser } from '../lib/auth'
 import { validateBody, createAnnouncementSchema, createBranchSchema, updateBranchSchema, createCounterSchema, updateCounterSchema, updateAgencyProfileSchema, updateAgencySettingsSchema, createServiceSchema, updateServiceSchema, updateStaffSchema, createStaffSchema, createReviewSchema, subscriptionPaySchema, subscriptionUnsubscribeSchema, updateWorkingHoursSchema, createHardwareOrderSchema, createEnterpriseRequestSchema } from '../lib/validations'
 import { emitQueueEvent, emitNotificationEvent, emitKioskEvent, emitReservationEvent, emitAgencyEvent, emitStaffEvent } from '../lib/realtime-emit'
 import { getNextCustomerToCall } from '../lib/queue-scheduler'
@@ -10,7 +10,7 @@ import { hashPassword } from '../lib/password'
 import { calculateETA, getEffectiveServiceTime } from '../lib/eta-calculator'
 import { z } from 'zod'
 import QRCode from 'qrcode'
-import { recordSyncChange } from '../lib/sync-helpers'
+import { recordSyncChange, recordSyncChangeNow } from '../lib/sync-helpers'
 import { normalizeRecordFileUrls } from '../lib/file-url'
 
 /** Round 15 — stable base for built file URLs when BLASTI_PUBLIC_BASE_URL is set. */
@@ -84,6 +84,210 @@ async function checkSubscriptionExpiry(agencyId: string) {
 // UNGATED so in-flight customers can finish during expiry grace.
 export function hasActiveSubscription(status: string | null | undefined): boolean {
   return status === 'ACTIVE' || status === 'TRIAL'
+}
+
+// ─── Subscription plan limit helper (Task 35, extended in Task 37) ────────
+//
+// Enforces the per-plan resource limits (SubscriptionPlan.maxBranches /
+// maxStaff / maxServices / maxActiveReservations). -1 means unlimited
+// (PREMIUM). The plan is resolved from the agency's subscriptionPlanId; when
+// missing it falls back to the built-in FREE plan row. If no plan row exists
+// at all the check fails OPEN — a missing catalog must never block core
+// business operations.
+//
+// Kinds:
+//  - 'branches'       counts every branch row (a deactivated branch still
+//                     occupies a slot)
+//  - 'staff'          counts ACTIVE roster rows only (deactivated members
+//                     free their seat)
+//  - 'services'       counts ACTIVE services (DELETE /services soft-deletes
+//                     by flipping isActive:false, so deleted services free
+//                     their slot)
+//  - 'reservations'   a CONFIG cap, not a count cap: nothing is counted.
+//                     Pass the PROPOSED capacity as `proposed` — the check
+//                     rejects values greater than plan.maxActiveReservations.
+//                     Without `proposed` it always passes (the caller is only
+//                     asking whether a cap exists).
+async function checkPlanLimit(
+  agencyId: string,
+  kind: 'branches' | 'staff' | 'services' | 'reservations',
+  proposed?: number,
+): Promise<{ ok: true } | { ok: false; limit: number; current: number; message: string }> {
+  const agency = await db.agency.findUnique({
+    where: { id: agencyId },
+    select: { subscriptionPlanId: true },
+  })
+  if (!agency) return { ok: true }
+
+  let plan = agency.subscriptionPlanId
+    ? await db.subscriptionPlan.findUnique({ where: { id: agency.subscriptionPlanId } })
+    : null
+  if (!plan) {
+    plan = await db.subscriptionPlan.findFirst({ where: { name: 'FREE' } })
+  }
+  if (!plan) return { ok: true }
+
+  const limit =
+    kind === 'branches'
+      ? plan.maxBranches
+      : kind === 'staff'
+        ? plan.maxStaff
+        : kind === 'services'
+          ? plan.maxServices
+          : plan.maxActiveReservations
+  if (limit === null || limit === undefined || limit === -1) return { ok: true }
+
+  if (kind === 'reservations') {
+    // Config cap: compare the proposed capacity against the plan limit —
+    // no DB count involved.
+    if (proposed !== undefined && proposed > limit) {
+      return {
+        ok: false,
+        limit,
+        current: proposed,
+        message: `Your ${plan.displayName} plan allows up to ${limit} active reservations. Upgrade your subscription to raise the limit.`,
+      }
+    }
+    return { ok: true }
+  }
+
+  const current =
+    kind === 'branches'
+      ? await db.branch.count({ where: { agencyId } })
+      : kind === 'services'
+        ? await db.service.count({ where: { agencyId, isActive: true } })
+        : await db.agencyStaff.count({ where: { agencyId, isActive: true } })
+
+  if (current >= limit) {
+    const label =
+      kind === 'branches' ? 'branches' : kind === 'services' ? 'services' : 'staff members'
+    return {
+      ok: false,
+      limit,
+      current,
+      message: `Your ${plan.displayName} plan allows up to ${limit} ${label}. Upgrade your subscription to add more.`,
+    }
+  }
+  return { ok: true }
+}
+
+// ─── Task 37-c: 2-tier staff authority helpers ────────────────────────────
+//
+// Authority model (user-facing):
+//   OWNER       — bypasses everything (Agency.ownerId). SUPER_ADMIN likewise.
+//   MANAGER     — owner-like, but the owner can LIMIT the manager's grants to:
+//                 canCreateBranches / canDeleteBranches /
+//                 canPurchaseSubscription / canManageSubscription (+ the
+//                 pre-existing booleans like canManageProfile).
+//   STAFF       — ALWAYS-SHARED authorities only: occupy a counter, manage the
+//                 queue (canManageQueue, default true), see statistics
+//                 (canViewAnalytics, default true).
+// The STAFF MEMBER (never the owner) decides which counter to occupy —
+// see the /counters/:counterId/occupy|release endpoints below.
+
+/** Tier defaults written to the normalized boolean columns (+ legacy JSON). */
+const STAFF_TIER_DEFAULTS: Record<'STAFF' | 'MANAGER', Record<StaffPermission, boolean>> = {
+  STAFF: {
+    canManageQueue: true,
+    canViewAnalytics: true,
+    canManageServices: false,
+    canManageStaff: false,
+    canManageBranches: false,
+    canManageWorkingHours: false,
+    canExportData: false,
+    canManageProfile: false,
+    canCreateBranches: false,
+    canDeleteBranches: false,
+    canPurchaseSubscription: false,
+    canManageSubscription: false,
+  },
+  MANAGER: {
+    canManageQueue: true,
+    canViewAnalytics: true,
+    canCreateBranches: true,
+    canDeleteBranches: true,
+    canPurchaseSubscription: true,
+    canManageSubscription: true,
+    canManageProfile: true,
+    canManageServices: false,
+    canManageStaff: false,
+    canManageBranches: false,
+    canManageWorkingHours: false,
+    canExportData: false,
+  },
+}
+
+/** OWNER-tier AgencyStaff rows get MANAGER defaults (real owners bypass via Agency.ownerId). */
+function tierDefaultsForRole(role: string): Record<StaffPermission, boolean> {
+  return role === 'STAFF' ? { ...STAFF_TIER_DEFAULTS.STAFF } : { ...STAFF_TIER_DEFAULTS.MANAGER }
+}
+
+/** Parse the legacy permissions JSON defensively (corrupt string → {}). */
+function parseLegacyPermissions(raw: string | null | undefined): Record<string, unknown> {
+  if (!raw) return {}
+  try {
+    const parsed = JSON.parse(raw)
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/** Pick only known StaffPermission booleans out of an arbitrary object (ignore unknown keys). */
+function pickKnownPermissions(input: unknown): Partial<Record<StaffPermission, boolean>> {
+  const out: Partial<Record<StaffPermission, boolean>> = {}
+  if (typeof input !== 'object' || input === null) return out
+  for (const key of STAFF_PERMISSION_KEYS) {
+    const value = (input as Record<string, unknown>)[key]
+    if (typeof value === 'boolean') out[key] = value
+  }
+  return out
+}
+
+/**
+ * Queue authority + counter-occupancy gate (Task 37-c).
+ *
+ * Owner/SUPER_ADMIN pass untouched (owner keeps counterId optional). Staff
+ * need the ALWAYS-SHARED canManageQueue authority AND an occupied counter:
+ *   - counterId provided → that counter MUST be occupied by the caller
+ *     (Counter.staffId === caller's AgencyStaff.id) → else 403
+ *     OCCUPY_COUNTER_FIRST (also 403 when the counter is not theirs).
+ *   - no counterId → caller must occupy SOME active counter in the agency.
+ * A staff member without an active AgencyStaff row or without canManageQueue
+ * gets 403 PERMISSION_DENIED:canManageQueue.
+ */
+async function enforceQueueStaffAuthority(
+  user: SessionUser,
+  agencyId: string,
+  counterId?: string | null,
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  if (user.role === 'SUPER_ADMIN') return { ok: true }
+
+  const authority = await getAgencyAuthority(user.id, agencyId)
+  if (authority.isOwner) return { ok: true }
+  if (!authority.staffId || !authority.permissions.canManageQueue) {
+    return { ok: false, status: 403, error: 'PERMISSION_DENIED:canManageQueue' }
+  }
+
+  if (counterId) {
+    const counter = await db.counter.findFirst({
+      where: { id: counterId, branch: { agencyId } },
+      select: { id: true, staffId: true },
+    })
+    if (!counter || counter.staffId !== authority.staffId) {
+      return { ok: false, status: 403, error: 'OCCUPY_COUNTER_FIRST' }
+    }
+    return { ok: true }
+  }
+
+  const occupied = await db.counter.findFirst({
+    where: { staffId: authority.staffId, branch: { agencyId }, isActive: true },
+    select: { id: true },
+  })
+  if (!occupied) {
+    return { ok: false, status: 403, error: 'OCCUPY_COUNTER_FIRST' }
+  }
+  return { ok: true }
 }
 
 // ─── Phase 2c: Cross-tenant agencyId ownership verification ─────────────────
@@ -468,6 +672,10 @@ app.post('/branches', async (c) => {
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
 
+    // Task 37-c: 2-tier authority — a manager/staff member may create a branch
+    // ONLY when the owner granted canCreateBranches (owner/SUPER_ADMIN pass).
+    await requireAgencyAuthority(c, agencyId, 'canCreateBranches')
+
     // Task 31 bug 5: branch creation is a paid feature — gate on subscription
     // status (ACTIVE|TRIAL), same contract as the queue routes.
     const branchAgency = await db.agency.findUnique({
@@ -480,6 +688,22 @@ app.post('/branches', async (c) => {
     if (!hasActiveSubscription(branchAgency.subscriptionStatus)) {
       return c.json(
         { success: false, error: 'An active subscription is required to use queue features' },
+        403
+      )
+    }
+
+    // Task 35: enforce the subscription plan's branch limit (maxBranches,
+    // -1 = unlimited) on top of the status gate above.
+    const branchLimit = await checkPlanLimit(agencyId, 'branches')
+    if (!branchLimit.ok) {
+      return c.json(
+        {
+          success: false,
+          error: branchLimit.message,
+          code: 'PLAN_LIMIT_REACHED',
+          limit: branchLimit.limit,
+          current: branchLimit.current,
+        },
         403
       )
     }
@@ -555,8 +779,11 @@ app.get('/branches/:id', async (c) => {
   }
 })
 
-// PATCH /agency/branches/:id
-app.patch('/branches/:id', async (c) => {
+// PATCH/PUT /agency/branches/:id — shared handler. Task 37-c: edit requires
+// canCreateBranches OR canDeleteBranches (both must hold for non-owners, per
+// contract). PUT registered alongside PATCH so legacy desktop outbox replays
+// that log PUT never 404 on the cloud.
+async function handleBranchUpdate(c: Context) {
   try {
     const id = c.req.param('id')
     const branch = await db.branch.findUnique({ where: { id } })
@@ -565,6 +792,10 @@ app.patch('/branches/:id', async (c) => {
     }
 
     await requireAgencyAccess(c, branch.agencyId)
+
+    // Task 37-c: 2-tier authority — branch editing is owner territory unless
+    // the staff member holds BOTH manager-tier branch grants.
+    await requireAgencyAuthority(c, branch.agencyId, ['canCreateBranches', 'canDeleteBranches'])
 
     const body = await c.req.json()
     const { data, error } = validateBody(updateBranchSchema, body)
@@ -596,7 +827,10 @@ app.patch('/branches/:id', async (c) => {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
-})
+}
+
+app.patch('/branches/:id', handleBranchUpdate)
+app.put('/branches/:id', handleBranchUpdate)
 
 // DELETE /agency/branches/:id (soft delete)
 app.delete('/branches/:id', async (c) => {
@@ -608,6 +842,10 @@ app.delete('/branches/:id', async (c) => {
     }
 
     await requireAgencyAccess(c, branch.agencyId)
+
+    // Task 37-c: 2-tier authority — only the owner (or a manager explicitly
+    // granted canDeleteBranches) may delete a branch.
+    await requireAgencyAuthority(c, branch.agencyId, 'canDeleteBranches')
 
     const updated = await db.branch.update({
       where: { id },
@@ -667,6 +905,10 @@ app.post('/branches/:id/counters', async (c) => {
 
     await requireAgencyAccess(c, branch.agencyId)
 
+    // Task 37-c: counter CRUD is an owner/manager domain — gated to
+    // canManageBranches (owner/SUPER_ADMIN pass).
+    await requireAgencyAuthority(c, branch.agencyId, 'canManageBranches')
+
     const body = await c.req.json()
     const { data, error } = validateBody(createCounterSchema, body)
     if (error) {
@@ -722,6 +964,9 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
 
     await requireAgencyAccess(c, counter.branch.agencyId)
 
+    // Task 37-c: counter CRUD is gated to canManageBranches (owner/SUPER_ADMIN pass).
+    await requireAgencyAuthority(c, counter.branch.agencyId, 'canManageBranches')
+
     const body = await c.req.json()
     const { data, error } = validateBody(updateCounterSchema, body)
     if (error) {
@@ -776,6 +1021,9 @@ app.delete('/branches/:id/counters/:counterId', async (c) => {
 
     await requireAgencyAccess(c, counter.branch.agencyId)
 
+    // Task 37-c: counter CRUD is gated to canManageBranches (owner/SUPER_ADMIN pass).
+    await requireAgencyAuthority(c, counter.branch.agencyId, 'canManageBranches')
+
     const updated = await db.counter.update({
       where: { id: counterId },
       data: { isActive: false },
@@ -793,6 +1041,169 @@ app.delete('/branches/:id/counters/:counterId', async (c) => {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }
+})
+
+// ─── Task 37-c: counter OCCUPATION (occupy / release) ─────────────────────────
+//
+// The STAFF MEMBER (never the owner) decides which counter to occupy.
+// Occupation state lives on the Counter row itself (NO new columns beyond
+// occupiedAt): Counter.staffId is repurposed as "occupied by" for staff, and
+// occupiedAt marks WHEN it was taken. An owner/SUPER_ADMIN occupation stores
+// occupiedAt ONLY (owners have no AgencyStaff row — staffId stays untouched).
+//
+//   POST /api/agency/counters/:counterId/occupy   ← CANONICAL path
+//   POST /api/agency/counters/:counterId/release
+//   POST /api/agency/branches/:id/counters/:counterId/occupy    ← nested alias
+//   POST /api/agency/branches/:id/counters/:counterId/release   ← nested alias
+//
+// Responses:
+//   200 { success:true, counter }            (counter includes branch name)
+//   404 { success:false, error:'Counter not found' }
+//   403 { success:false, error:'PERMISSION_DENIED:…' }   not an agency member
+//   403 { success:false, error:'NOT_COUNTER_OCCUPIER' }  staff releasing a
+//                                                        counter they don't hold
+//   409 { success:false, error:'COUNTER_OCCUPIED' }      held by ANOTHER
+//                                                        ACTIVE staff member
+
+interface OccupationCounter {
+  id: string
+  staffId: string | null
+  branch: { id: string; name: string; agencyId: string }
+}
+
+async function resolveCounterForOccupation(c: Context): Promise<
+  { ok: false; status: number; body: Record<string, unknown> } | { ok: true; counter: OccupationCounter }
+> {
+  const counterId = c.req.param('counterId')
+  const counter = await db.counter.findUnique({
+    where: { id: counterId },
+    include: { branch: { select: { id: true, name: true, agencyId: true } } },
+  })
+  if (!counter) {
+    return { ok: false, status: 404, body: { success: false, error: 'Counter not found' } }
+  }
+  // Cross-tenant guard: the counter's agency (via branch) must be the caller's.
+  await ensureAgencyIdOwnership(c, counter.branch.agencyId)
+  await requireAgencyAccess(c, counter.branch.agencyId)
+  return { ok: true, counter: { id: counter.id, staffId: counter.staffId, branch: counter.branch } }
+}
+
+async function handleCounterOccupy(c: Context) {
+  try {
+    const resolved = await resolveCounterForOccupation(c)
+    if (!resolved.ok) {
+      return c.json(resolved.body, resolved.status as any)
+    }
+    const counter = resolved.counter
+    const agencyId = counter.branch.agencyId
+    const user = await requireAuth(c)
+
+    // Caller must be an ACTIVE member: the agency owner or an active staff row.
+    const authority = await getAgencyAuthority(user.id, agencyId)
+    if (user.role !== 'SUPER_ADMIN' && !authority.isOwner && !authority.staffId) {
+      return c.json({ success: false, error: 'PERMISSION_DENIED:canManageQueue' }, 403)
+    }
+
+    // Held by ANOTHER ACTIVE staff member? → 409. A stale staffId pointing at
+    // a deleted/inactive row is treated as free and gets taken over.
+    if (counter.staffId && counter.staffId !== authority.staffId) {
+      const occupier = await db.agencyStaff.findUnique({
+        where: { id: counter.staffId },
+        select: { isActive: true },
+      })
+      if (occupier?.isActive) {
+        return c.json({ success: false, error: 'COUNTER_OCCUPIED' }, 409)
+      }
+    }
+
+    // Staff occupation sets BOTH staffId + occupiedAt; owner/SUPER_ADMIN sets
+    // occupiedAt ONLY (staffId stays untouched — owners have no staff row).
+    const updated = await db.counter.update({
+      where: { id: counter.id },
+      data: {
+        ...(authority.staffId ? { staffId: authority.staffId } : {}),
+        occupiedAt: new Date(),
+      },
+      include: { branch: { select: { id: true, name: true } } },
+    })
+
+    // Fire-safe change-feed row so desktop sync + realtime see the occupation.
+    await recordSyncChangeNow({ agencyId, model: 'Counter', recordId: counter.id, operation: 'update' })
+    emitAgencyEvent('agency:updated', agencyId, {
+      action: 'counter-occupied',
+      counterId: counter.id,
+      staffId: authority.staffId,
+      branchId: counter.branch.id,
+    })
+
+    return c.json({ success: true, counter: updated })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+}
+
+async function handleCounterRelease(c: Context) {
+  try {
+    const resolved = await resolveCounterForOccupation(c)
+    if (!resolved.ok) {
+      return c.json(resolved.body, resolved.status as any)
+    }
+    const counter = resolved.counter
+    const agencyId = counter.branch.agencyId
+    const user = await requireAuth(c)
+
+    const authority = await getAgencyAuthority(user.id, agencyId)
+    // Staff can release ONLY their own occupation; owner/SUPER_ADMIN can
+    // release any counter in their agency.
+    if (user.role !== 'SUPER_ADMIN' && !authority.isOwner) {
+      if (!authority.staffId || counter.staffId !== authority.staffId) {
+        return c.json({ success: false, error: 'NOT_COUNTER_OCCUPIER' }, 403)
+      }
+    }
+
+    const updated = await db.counter.update({
+      where: { id: counter.id },
+      data: { staffId: null, occupiedAt: null },
+      include: { branch: { select: { id: true, name: true } } },
+    })
+
+    await recordSyncChangeNow({ agencyId, model: 'Counter', recordId: counter.id, operation: 'update' })
+    emitAgencyEvent('agency:updated', agencyId, {
+      action: 'counter-released',
+      counterId: counter.id,
+      branchId: counter.branch.id,
+    })
+
+    return c.json({ success: true, counter: updated })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+}
+
+// CANONICAL paths
+app.post('/counters/:counterId/occupy', handleCounterOccupy)
+app.post('/counters/:counterId/release', handleCounterRelease)
+
+// Nested aliases (branch-scoped style used elsewhere in this router). The
+// branchId param is validated against the counter's actual branch → 404 on
+// mismatch, mirroring the sibling counter PATCH/DELETE routes.
+app.post('/branches/:id/counters/:counterId/occupy', async (c) => {
+  const branchId = c.req.param('id')
+  const counter = await db.counter.findUnique({ where: { id: c.req.param('counterId') }, select: { branchId: true } })
+  if (!counter || counter.branchId !== branchId) {
+    return c.json({ success: false, error: 'Counter not found' }, 404)
+  }
+  return handleCounterOccupy(c)
+})
+app.post('/branches/:id/counters/:counterId/release', async (c) => {
+  const branchId = c.req.param('id')
+  const counter = await db.counter.findUnique({ where: { id: c.req.param('counterId') }, select: { branchId: true } })
+  if (!counter || counter.branchId !== branchId) {
+    return c.json({ success: false, error: 'Counter not found' }, 404)
+  }
+  return handleCounterRelease(c)
 })
 
 // ─── agency/daily-chart ───────────────────────────────────────────────────────
@@ -1223,6 +1634,17 @@ app.get('/profile', async (c) => {
       workingHoursStart: agency.workingHoursStart,
       workingHoursEnd: agency.workingHoursEnd,
       workingDays: agency.workingDays,
+      // Task 37: the profile page must show the REAL queue state instead of a
+      // hardcoded "Queue Active" badge. isQueueOpen lives on the Agency row;
+      // queuePaused mirrors QueueSettings.isPaused (the include above already
+      // fetches the singleton row) so the UI can render a distinct "Paused"
+      // badge. Additive keys — older desktop builds ignore them safely.
+      isQueueOpen: agency.isQueueOpen,
+      queuePaused: agency.queueSettings[0]?.isPaused ?? false,
+      // Capacity under the same convention as GET /settings: maxReservations
+      // (primary) + maxQueueSize (legacy alias).
+      maxReservations: agency.maxActiveReservations,
+      maxQueueSize: agency.maxActiveReservations,
     })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -1258,6 +1680,10 @@ async function handleAgencyProfileUpdate(c: Context) {
     if (!agencyId) {
       return c.json({ error: 'No agency found' }, 404)
     }
+
+    // Task 37-c: profile edits are owner territory unless the staff member was
+    // granted canManageProfile (owner/SUPER_ADMIN pass; GETs stay open).
+    await requireAgencyAuthority(c, agencyId, 'canManageProfile')
 
     const targetAgency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!targetAgency) return c.json({ error: 'No agency found' }, 404)
@@ -1419,6 +1845,14 @@ app.post('/queue/call-next', async (c) => {
 
     // Rate limit by user ID
     checkRateLimit(user.id, QUEUE_RATE_LIMIT)
+
+    // Task 37-c: staff queue authority + counter occupancy. Owner/SUPER_ADMIN
+    // pass (counterId stays optional for them); staff must hold canManageQueue
+    // AND occupy the exact counter they pass (OCCUPY_COUNTER_FIRST otherwise).
+    const queueGate = await enforceQueueStaffAuthority(user, agencyId, counterId)
+    if (!queueGate.ok) {
+      return c.json({ success: false, error: queueGate.error }, queueGate.status as any)
+    }
 
     // Check agency has an active subscription
     const agencyCheck = await db.agency.findUnique({ where: { id: agencyId } })
@@ -1601,7 +2035,14 @@ app.post('/queue/toggle-pause', async (c) => {
 
     // Phase 2c: Explicit ownership check
     await ensureAgencyIdOwnership(c, agencyId)
-    await requireAgencyAccess(c, agencyId)
+    const pauseCaller = await requireAgencyAccess(c, agencyId)
+
+    // Task 37-c: pause/resume is queue management — staff need canManageQueue
+    // AND an occupied counter (owner/SUPER_ADMIN pass).
+    const pauseGate = await enforceQueueStaffAuthority(pauseCaller, agencyId)
+    if (!pauseGate.ok) {
+      return c.json({ success: false, error: pauseGate.error }, pauseGate.status as any)
+    }
 
     // Check agency has an active subscription
     const agencyCheck = await db.agency.findUnique({ where: { id: agencyId } })
@@ -1675,7 +2116,14 @@ app.post('/queue/walk-in', async (c) => {
 
     // Phase 2c: Explicit ownership check
     await ensureAgencyIdOwnership(c, agencyId)
-    await requireAgencyAccess(c, agencyId)
+    const walkInCaller = await requireAgencyAccess(c, agencyId)
+
+    // Task 37-c: walk-in creation is queue management — staff need
+    // canManageQueue AND an occupied counter (owner/SUPER_ADMIN pass).
+    const walkInGate = await enforceQueueStaffAuthority(walkInCaller, agencyId)
+    if (!walkInGate.ok) {
+      return c.json({ success: false, error: walkInGate.error }, walkInGate.status as any)
+    }
 
     // Check agency exists and queue is open
     const agency = await db.agency.findUnique({
@@ -1904,7 +2352,14 @@ app.post('/queue/walk-in-token', async (c) => {
 
     // Agency ownership check
     await ensureAgencyIdOwnership(c, reservation.agencyId)
-    await requireAgencyAccess(c, reservation.agencyId)
+    const tokenCaller = await requireAgencyAccess(c, reservation.agencyId)
+
+    // Task 37-c: issuing a walk-in import token is queue management — staff
+    // need canManageQueue AND an occupied counter (owner/SUPER_ADMIN pass).
+    const tokenGate = await enforceQueueStaffAuthority(tokenCaller, reservation.agencyId)
+    if (!tokenGate.ok) {
+      return c.json({ success: false, error: tokenGate.error }, tokenGate.status as any)
+    }
 
     // Generate import token (customerId = walk-in name for identification)
     const crypto = require('crypto')
@@ -1960,7 +2415,16 @@ app.patch('/queue/:id', async (c) => {
     }
 
     // Verify the authenticated user has access to this reservation's agency
-    await requireAgencyAccess(c, reservation.agencyId)
+    const queueActionCaller = await requireAgencyAccess(c, reservation.agencyId)
+
+    // Task 37-c: complete/no-show/cancel is queue management — staff need
+    // canManageQueue AND an occupied counter (owner/SUPER_ADMIN pass). NOTE:
+    // this stays intentionally UNGATED by subscription status so in-flight
+    // customers can finish during an expiry grace period (unchanged policy).
+    const queueActionGate = await enforceQueueStaffAuthority(queueActionCaller, reservation.agencyId)
+    if (!queueActionGate.ok) {
+      return c.json({ success: false, error: queueActionGate.error }, queueActionGate.status as any)
+    }
 
     const statusMap: Record<string, string> = {
       complete: 'COMPLETED',
@@ -2280,6 +2744,26 @@ app.post('/services', async (c) => {
       return c.json({ error: 'No active agency found' }, 404)
     }
 
+    // Task 37-c: service writes need canManageServices for non-owners (GET
+    // stays open — the queue UI needs to read services).
+    await requireAgencyAuthority(c, agencyId, 'canManageServices')
+
+    // Task 37: enforce the subscription plan's service limit (maxServices,
+    // -1 = unlimited) — same 403 shape as the branch/staff gates.
+    const serviceLimit = await checkPlanLimit(agencyId, 'services')
+    if (!serviceLimit.ok) {
+      return c.json(
+        {
+          success: false,
+          error: serviceLimit.message,
+          code: 'PLAN_LIMIT_REACHED',
+          limit: serviceLimit.limit,
+          current: serviceLimit.current,
+        },
+        403
+      )
+    }
+
     const body = await c.req.json()
     const validation = validateBody(createServiceSchema, body)
     if (validation.error) {
@@ -2340,6 +2824,9 @@ app.patch('/services/:id', async (c) => {
       return c.json({ error: 'Service not found or access denied' }, 404)
     }
 
+    // Task 37-c: service writes need canManageServices for non-owners.
+    await requireAgencyAuthority(c, agencyId, 'canManageServices')
+
     const body = await c.req.json()
     const validation = validateBody(updateServiceSchema, body)
     if (validation.error) {
@@ -2392,6 +2879,9 @@ app.delete('/services/:id', async (c) => {
     if (!existingService || existingService.agencyId !== agencyId) {
       return c.json({ error: 'Service not found or access denied' }, 404)
     }
+
+    // Task 37-c: service writes need canManageServices for non-owners.
+    await requireAgencyAuthority(c, agencyId, 'canManageServices')
 
     await db.service.update({
       where: { id },
@@ -2448,6 +2938,7 @@ app.get('/settings', async (c) => {
       return c.json({
         avgServiceTime: 10,
         maxReservations: 50,
+        maxQueueSize: 50,
         isQueueOpen: true,
         services: [],
         workingHoursStart: '08:00',
@@ -2459,6 +2950,7 @@ app.get('/settings', async (c) => {
       return c.json({
         avgServiceTime: 10,
         maxReservations: 50,
+        maxQueueSize: 50,
         isQueueOpen: true,
         services: [],
         workingHoursStart: '08:00',
@@ -2469,6 +2961,9 @@ app.get('/settings', async (c) => {
     return c.json({
       avgServiceTime: agency.averageServiceTime,
       maxReservations: agency.maxActiveReservations,
+      // Task 37: legacy alias so older clients reading maxQueueSize keep
+      // working — maxReservations stays the primary key (the UI contract).
+      maxQueueSize: agency.maxActiveReservations,
       isQueueOpen: agency.isQueueOpen,
       services: agency.services,
       workingHoursStart: agency.workingHoursStart,
@@ -2493,7 +2988,16 @@ app.patch('/settings', async (c) => {
     }
 
     const { agencyId: agencyIdParam, isQueueOpen, workingHoursStart, workingHoursEnd, autoPauseWhenFull, kioskModeEnabled, sponsorSms, smsBalance } = body
-    const { maxQueueSize, avgServiceTime } = validation.data
+    // Task 37: the UI PATCHes the full settings object whose capacity key is
+    // `maxReservations` (the key GET /settings returns). The zod schema used
+    // to strip it, silently dropping every capacity edit. Accept BOTH keys —
+    // maxReservations (PRIMARY) and maxQueueSize (legacy alias for old
+    // clients) — with maxReservations winning when both are present: GET
+    // returns both keys, so a full-object PATCH echoes back a STALE
+    // maxQueueSize alongside the fresh maxReservations and the alias must
+    // never override the primary value.
+    const maxQueueSize = validation.data.maxReservations ?? validation.data.maxQueueSize
+    const { avgServiceTime } = validation.data
 
     let agencyId: string | null
     if (agencyIdParam) {
@@ -2510,9 +3014,33 @@ app.patch('/settings', async (c) => {
       return c.json({ error: 'No agency found' }, 404)
     }
 
+    // Task 37-c: settings edits are owner territory unless the staff member
+    // was granted canManageProfile (owner/SUPER_ADMIN pass; GET stays open).
+    await requireAgencyAuthority(c, agencyId, 'canManageProfile')
+
     const targetAgency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!targetAgency) {
       return c.json({ error: 'No agency found' }, 404)
+    }
+
+    // Task 37: plan limit on queue capacity (SubscriptionPlan.maxActiveReservations,
+    // -1 = unlimited). Only gates CAPACITY CHANGES — an unchanged value rides
+    // along on every full-settings save (even one that is over the cap after a
+    // plan downgrade) without blocking unrelated toggles from saving.
+    if (maxQueueSize !== undefined && maxQueueSize !== targetAgency.maxActiveReservations) {
+      const capacityLimit = await checkPlanLimit(agencyId, 'reservations', maxQueueSize)
+      if (!capacityLimit.ok) {
+        return c.json(
+          {
+            success: false,
+            error: capacityLimit.message,
+            code: 'PLAN_LIMIT_REACHED',
+            limit: capacityLimit.limit,
+            current: capacityLimit.current,
+          },
+          403
+        )
+      }
     }
 
     await db.agency.update({
@@ -2569,10 +3097,13 @@ app.get('/staff', async (c) => {
       orderBy: { joinedAt: 'desc' },
     })
 
-    // Parse permissions JSON for each staff member
+    // Parse permissions JSON for each staff member. The spread already carries
+    // the Task 37-c normalized boolean columns (canCreateBranches,
+    // canDeleteBranches, canPurchaseSubscription, canManageSubscription, …)
+    // alongside the parsed legacy `permissions` object for backward compat.
     const staffWithPermissions = staff.map((s) => ({
       ...s,
-      permissions: s.permissions ? JSON.parse(s.permissions as string) : {},
+      permissions: parseLegacyPermissions(s.permissions),
     }))
 
     return c.json({ staff: staffWithPermissions })
@@ -2592,7 +3123,16 @@ app.post('/staff', async (c) => {
 
     // Phase 2c: Explicit ownership check
     await ensureAgencyIdOwnership(c, agencyId)
-    await requireAgencyAccess(c, agencyId)
+    const caller = await requireAgencyAccess(c, agencyId)
+
+    // Task 37-c: staff management is OWNER (or SUPER_ADMIN) only — staff can
+    // no longer link/unlink staff rows.
+    if (caller.role !== 'SUPER_ADMIN') {
+      const callerOwnership = await verifyAgencyOwnership(caller.id, agencyId)
+      if (!callerOwnership?.isOwner) {
+        return c.json({ success: false, error: 'PERMISSION_DENIED:canManageStaff' }, 403)
+      }
+    }
 
     // Find user by username
     const user = await db.user.findUnique({
@@ -2658,7 +3198,15 @@ app.delete('/staff', async (c) => {
 
     // Phase 2c: Explicit ownership check
     await ensureAgencyIdOwnership(c, agencyId)
-    await requireAgencyAccess(c, agencyId)
+    const deleteCaller = await requireAgencyAccess(c, agencyId)
+
+    // Task 37-c: staff management is OWNER (or SUPER_ADMIN) only.
+    if (deleteCaller.role !== 'SUPER_ADMIN') {
+      const callerOwnership = await verifyAgencyOwnership(deleteCaller.id, agencyId)
+      if (!callerOwnership?.isOwner) {
+        return c.json({ success: false, error: 'PERMISSION_DENIED:canManageStaff' }, 403)
+      }
+    }
 
     // Verify it's not an owner
     const staffMember = await db.agencyStaff.findUnique({
@@ -2703,22 +3251,36 @@ app.post('/staff/create', async (c) => {
     const body = await c.req.json()
     const createStaffBodySchema = createStaffSchema.extend({
       agencyId: z.string().min(1, 'Agency ID is required'),
-      staffRole: z.enum(['STAFF', 'MANAGER', 'AGENCY_STAFF', 'AGENCY_OWNER']).optional().default('STAFF'),
+      // Task 37-c fix: NO .default('STAFF') here anymore — the old default made
+      // an explicit `staffRole` always win as 'STAFF' and shadow the `role`
+      // field the UI actually sends (a `role: 'MANAGER'` request silently
+      // created a plain STAFF). Resolution below: staffRole ?? role ?? STAFF.
+      staffRole: z.enum(['STAFF', 'MANAGER', 'AGENCY_STAFF', 'AGENCY_OWNER']).optional(),
+      // Task 37-c: optional manager-authority grants at creation time — the
+      // owner picks them in the create dialog; unknown keys are ignored and
+      // the values overlay the tier defaults.
+      permissions: z.record(z.string(), z.boolean()).optional(),
     })
     const validation = validateBody(createStaffBodySchema, body)
     if (validation.error) {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    const { agencyId, username, fullName, password, phoneNumber, staffRole, branchId } = validation.data
+    const { agencyId, username, fullName, password, phoneNumber, branchId } = validation.data
+    // Task 37-c: accept BOTH keys — `staffRole` (legacy callers) and `role`
+    // (what the UI sends; createStaffSchema defaults it to 'STAFF'). Explicit
+    // staffRole wins when both are present.
+    const staffRole = validation.data.staffRole ?? validation.data.role ?? 'STAFF'
 
     // Phase 2c: Verify the requesting user actually belongs to the target agency.
     // Prevents cross-tenant exploit where a staff member from Agency A could
     // create staff in Agency B by supplying a different agencyId in the body.
+    // Task 37-c: staff management is OWNER (or SUPER_ADMIN) only — staff can
+    // no longer create staff.
     const user = await requireAuth(c)
     const ownership = await verifyAgencyOwnership(user.id, agencyId)
-    if (!ownership) {
-      return c.json({ success: false, error: 'You do not have access to this agency' }, 403)
+    if (!ownership || (!ownership.isOwner && user.role !== 'SUPER_ADMIN')) {
+      return c.json({ success: false, error: 'PERMISSION_DENIED:canManageStaff' }, 403)
     }
 
     await requireAgencyAccess(c, agencyId)
@@ -2735,6 +3297,22 @@ app.post('/staff/create', async (c) => {
 
     if (!agency) {
       return c.json({ error: 'Agency not found' }, 404)
+    }
+
+    // Task 35: enforce the subscription plan's staff limit (maxStaff,
+    // -1 = unlimited).
+    const staffLimit = await checkPlanLimit(agencyId, 'staff')
+    if (!staffLimit.ok) {
+      return c.json(
+        {
+          success: false,
+          error: staffLimit.message,
+          code: 'PLAN_LIMIT_REACHED',
+          limit: staffLimit.limit,
+          current: staffLimit.current,
+        },
+        403
+      )
     }
 
     // Task 31 bug 8: a staff member must be associated with a branch of the
@@ -2775,7 +3353,23 @@ app.post('/staff/create', async (c) => {
       },
     })
 
-    // Create AgencyStaff link
+    // Create AgencyStaff link. Task 37-c: write the 2-tier DEFAULTS to the
+    // normalized boolean columns AND the legacy JSON string (kept in sync):
+    //   STAFF   → canManageQueue + canViewAnalytics true, everything else false.
+    //   MANAGER → + canCreateBranches / canDeleteBranches /
+    //             canPurchaseSubscription / canManageSubscription /
+    //             canManageProfile true (canManageStaff, canManageServices,
+    //             canManageBranches, canManageWorkingHours, canExportData false).
+    const tierDefaults = tierDefaultsForRole(agencyStaffRole)
+    // Task 37-c: overlay explicitly-granted authorities (manager create dialog)
+    // onto the tier defaults — both the normalized columns and the legacy JSON.
+    const effectivePermissions: Record<string, boolean> = { ...tierDefaults }
+    if (validation.data.permissions) {
+      for (const key of STAFF_PERMISSION_KEYS) {
+        const value = (validation.data.permissions as Record<string, unknown>)[key]
+        if (typeof value === 'boolean') effectivePermissions[key] = value
+      }
+    }
     const staffLink = await db.agencyStaff.create({
       data: {
         userId: newUser.id,
@@ -2784,6 +3378,8 @@ app.post('/staff/create', async (c) => {
         // Task 31 bug 8: persist the branch association (null when the caller
         // is a legacy client that did not send one).
         branchId: branchId ?? null,
+        ...effectivePermissions,
+        permissions: JSON.stringify(effectivePermissions),
       },
       include: {
         user: {
@@ -2818,14 +3414,11 @@ app.patch('/staff/:id', async (c) => {
   try {
     const id = c.req.param('id')
     const user = await requireAuth(c)
-    const agencyId = user.agencyId || await resolveUserAgencyId(user)
-    if (!agencyId) {
-      return c.json({ error: 'No agency found' }, 403)
-    }
 
     const body = await c.req.json()
 
-    // Permissions schema for fine-grained staff access control
+    // Permissions schema for fine-grained staff access control. Task 37-c:
+    // extended with the four manager-tier grants so the owner can tune them.
     const staffPermissionsSchema = z.object({
       canManageQueue: z.boolean().optional(),
       canManageServices: z.boolean().optional(),
@@ -2835,6 +3428,10 @@ app.patch('/staff/:id', async (c) => {
       canManageWorkingHours: z.boolean().optional(),
       canExportData: z.boolean().optional(),
       canManageProfile: z.boolean().optional(),
+      canCreateBranches: z.boolean().optional(),
+      canDeleteBranches: z.boolean().optional(),
+      canPurchaseSubscription: z.boolean().optional(),
+      canManageSubscription: z.boolean().optional(),
     })
 
     const patchStaffSchema = updateStaffSchema.extend({
@@ -2862,12 +3459,20 @@ app.patch('/staff/:id', async (c) => {
       return c.json({ error: 'Staff member not found' }, 404)
     }
 
-    // Verify the staff member belongs to the user's agency
-    if (staffMember.agencyId !== agencyId) {
-      return c.json({ error: 'Staff member does not belong to your agency' }, 403)
+    // The staff row's own agencyId is authoritative (SUPER_ADMIN has no
+    // session agencyId but must still be able to manage any roster).
+    const agencyId = staffMember.agencyId
+
+    // Task 37-c: staff management is OWNER (or SUPER_ADMIN) only — staff can
+    // no longer edit other staff members.
+    if (user.role !== 'SUPER_ADMIN') {
+      const callerOwnership = await verifyAgencyOwnership(user.id, agencyId)
+      if (!callerOwnership?.isOwner) {
+        return c.json({ success: false, error: 'PERMISSION_DENIED:canManageStaff' }, 403)
+      }
     }
 
-    // Cannot modify the owner
+    // Cannot modify the owner (OWNER-row protection kept)
     if (staffMember.role === 'OWNER') {
       return c.json({ error: 'Cannot modify agency owner' }, 403)
     }
@@ -2880,11 +3485,21 @@ app.patch('/staff/:id', async (c) => {
       })
     }
 
-    // Update staff role if provided
-    if (role !== undefined && ['STAFF', 'MANAGER'].includes(role)) {
+    // Update staff role if provided. Task 37-c: switching between STAFF and
+    // MANAGER RE-APPLIES the tier defaults to the boolean columns + legacy JSON
+    // (any explicitly submitted permissions are layered on top below).
+    const validRole = role !== undefined && ['STAFF', 'MANAGER'].includes(role) ? role : null
+    const roleChanged = validRole !== null && validRole !== staffMember.role
+    if (validRole !== null) {
       await db.agencyStaff.update({
         where: { id },
-        data: { role },
+        data: roleChanged
+          ? {
+              role: validRole,
+              ...tierDefaultsForRole(validRole),
+              permissions: JSON.stringify(tierDefaultsForRole(validRole)),
+            }
+          : { role: validRole },
       })
     }
 
@@ -2920,16 +3535,23 @@ app.patch('/staff/:id', async (c) => {
       })
     }
 
-    // Update permissions if provided
+    // Update permissions if provided. Task 37-c DUAL-WRITE: only known
+    // permission keys (unknown ones are ignored) are written to BOTH the
+    // legacy JSON string AND the normalized boolean columns so the two stores
+    // can never drift. Base = tier defaults when the role just changed,
+    // otherwise the existing legacy JSON.
     if (permissions !== undefined) {
-      // Merge with existing permissions
-      const currentPerms = staffMember.permissions
-        ? JSON.parse(staffMember.permissions as string)
-        : {}
-      const mergedPerms = { ...currentPerms, ...permissions }
+      const submitted = pickKnownPermissions(permissions)
+      const base = roleChanged
+        ? tierDefaultsForRole(validRole as 'STAFF' | 'MANAGER')
+        : parseLegacyPermissions(staffMember.permissions)
+      const mergedPerms = { ...base, ...submitted }
       await db.agencyStaff.update({
         where: { id },
-        data: { permissions: JSON.stringify(mergedPerms) },
+        data: {
+          permissions: JSON.stringify(mergedPerms),
+          ...submitted,
+        },
       })
     }
 
@@ -2965,10 +3587,6 @@ app.delete('/staff/:id', async (c) => {
   try {
     const id = c.req.param('id')
     const user = await requireAuth(c)
-    const agencyId = user.agencyId || await resolveUserAgencyId(user)
-    if (!agencyId) {
-      return c.json({ error: 'No agency found' }, 403)
-    }
 
     // Find the staff member
     const staffMember = await db.agencyStaff.findUnique({
@@ -2979,9 +3597,16 @@ app.delete('/staff/:id', async (c) => {
       return c.json({ error: 'Staff member not found' }, 404)
     }
 
-    // Verify the staff member belongs to the user's agency
-    if (staffMember.agencyId !== agencyId) {
-      return c.json({ error: 'Staff member does not belong to your agency' }, 403)
+    // The staff row's own agencyId is authoritative (SUPER_ADMIN has no
+    // session agencyId but must still be able to manage any roster).
+    const agencyId = staffMember.agencyId
+
+    // Task 37-c: staff management is OWNER (or SUPER_ADMIN) only.
+    if (user.role !== 'SUPER_ADMIN') {
+      const callerOwnership = await verifyAgencyOwnership(user.id, agencyId)
+      if (!callerOwnership?.isOwner) {
+        return c.json({ success: false, error: 'PERMISSION_DENIED:canManageStaff' }, 403)
+      }
     }
 
     // Cannot remove the owner
@@ -3446,6 +4071,7 @@ app.get('/subscription', async (c) => {
   try {
     const agencyIdParam = c.req.query('agencyId')
 
+    const subCaller = await requireAuth(c)
     let agencyId: string | null
     if (agencyIdParam) {
       // Phase 2c: Explicit ownership check when agencyId comes from the request
@@ -3453,8 +4079,21 @@ app.get('/subscription', async (c) => {
       await requireAgencyAccess(c, agencyIdParam)
       agencyId = agencyIdParam
     } else {
-      const user = await requireAuth(c)
-      agencyId = user.agencyId || await resolveUserAgencyId(user)
+      agencyId = subCaller.agencyId || await resolveUserAgencyId(subCaller)
+    }
+
+    // Task 37-c: subscription visibility — the OWNER, a staff member holding
+    // canPurchaseSubscription OR canManageSubscription, or SUPER_ADMIN.
+    // Everyone else gets 403 PERMISSION_DENIED (the UI hides the section).
+    if (agencyId && subCaller.role !== 'SUPER_ADMIN') {
+      const subAuthority = await getAgencyAuthority(subCaller.id, agencyId)
+      if (
+        !subAuthority.isOwner &&
+        !subAuthority.permissions.canPurchaseSubscription &&
+        !subAuthority.permissions.canManageSubscription
+      ) {
+        return c.json({ success: false, error: 'PERMISSION_DENIED:canPurchaseSubscription' }, 403)
+      }
     }
 
     // Always include the catalog of active plans so the agency page can render
@@ -3569,6 +4208,11 @@ app.post('/subscription/pay', async (c) => {
     if (!agencyId) {
       return c.json({ error: 'No agency found' }, 404)
     }
+
+    // Task 37-c: paying for a subscription (making a purchase) requires the
+    // canPurchaseSubscription grant for non-owners. Desktop pay proxy
+    // passthrough contract unchanged.
+    await requireAgencyAuthority(c, agencyId, 'canPurchaseSubscription')
 
     const formData = await c.req.formData()
     const plan = formData.get('plan') as string
@@ -3703,6 +4347,10 @@ app.post('/subscription/unsubscribe', async (c) => {
       return c.json({ error: 'No agency found' }, 404)
     }
 
+    // Task 37-c: subscription management (unsubscribe) requires the
+    // canManageSubscription grant for non-owners.
+    await requireAgencyAuthority(c, agencyId, 'canManageSubscription')
+
     const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ error: 'No agency found' }, 404)
 
@@ -3761,6 +4409,10 @@ app.patch('/working-hours', async (c) => {
     // Phase 2c: Explicit ownership check
     await ensureAgencyIdOwnership(c, agencyId)
     await requireAgencyAccess(c, agencyId)
+
+    // Task 37-c: working-hours edits need canManageProfile for non-owners
+    // (owner/SUPER_ADMIN pass).
+    await requireAgencyAuthority(c, agencyId, 'canManageProfile')
 
     const agency = await db.agency.update({
       where: { id: agencyId },
@@ -4250,6 +4902,11 @@ app.post('/subscription/cancel', async (c) => {
       return c.json({ success: false, error: 'No agency found for this user' }, 404)
     }
 
+    // Task 37-c: subscription management (cancel) requires the
+    // canManageSubscription grant for non-owners. Desktop cancel proxy
+    // passthrough contract unchanged.
+    await requireAgencyAuthority(c, agencyId, 'canManageSubscription')
+
     const agency = await db.agency.findUnique({
       where: { id: agencyId },
       select: { id: true, subscriptionTier: true, subscriptionStatus: true },
@@ -4507,5 +5164,43 @@ app.post('/enterprise-request', async (c) => {
 // handler above (which snapshots the previous tier/status into the audit log)
 // always won and this one never executed. Deleted to avoid drift between the
 // two copies.
+
+// ─── agency/my-authority (Task 37-c) ─────────────────────────────────────────
+//
+// Self-inspection endpoint for the 2-tier staff authority model. The UI calls
+// this after login to decide which sections to render (staff tabs, branch
+// buttons, subscription section, counter occupation prompts).
+//
+// Response: { success, isOwner, role, staffId, permissions } where role is
+// 'OWNER' | 'MANAGER' | 'STAFF' | null, staffId is the caller's ACTIVE
+// AgencyStaff row id (null for owners), and permissions is the FULL
+// Record<StaffPermission, boolean> map. SUPER_ADMIN reports isOwner=true /
+// role 'OWNER' / all permissions true. A caller with no agency reports the
+// consistent all-empty shape (isOwner false, role null, all permissions false).
+
+app.get('/my-authority', async (c) => {
+  try {
+    const user = await requireAuth(c)
+
+    if (user.role === 'SUPER_ADMIN') {
+      const allTrue = {} as Record<StaffPermission, boolean>
+      for (const key of STAFF_PERMISSION_KEYS) allTrue[key] = true
+      return c.json({ success: true, isOwner: true, role: 'OWNER', staffId: null, permissions: allTrue })
+    }
+
+    const agencyId = user.agencyId || await resolveUserAgencyId(user)
+    if (!agencyId) {
+      const allFalse = {} as Record<StaffPermission, boolean>
+      for (const key of STAFF_PERMISSION_KEYS) allFalse[key] = false
+      return c.json({ success: true, isOwner: false, role: null, staffId: null, permissions: allFalse })
+    }
+
+    const authority = await getAgencyAuthority(user.id, agencyId)
+    return c.json({ success: true, ...authority })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
 
 export const agencyRoutes = app

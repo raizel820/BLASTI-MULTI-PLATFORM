@@ -47,19 +47,16 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
-import { StaffPermissionsEditor, parsePermissions, DEFAULT_PERMISSIONS } from '@/components/shared/staff-permissions-editor';
+import {
+  StaffPermissionsEditor,
+  parsePermissions,
+  DEFAULT_PERMISSIONS,
+  type StaffPermissions,
+} from '@/components/shared/staff-permissions-editor';
+import { useAgencyAuthority, MANAGER_TIER_DEFAULTS } from '@/hooks/use-agency-authority';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { apiFetch } from '@/lib/api-fetch';
-
-type StaffPermissions = {
-  canManageQueue: boolean;
-  canManageServices: boolean;
-  canManageStaff: boolean;
-  canViewAnalytics: boolean;
-  canManageBranches: boolean;
-  canManageWorkingHours: boolean;
-  canExportData: boolean;
-  canManageProfile: boolean;
-};
 
 interface Employee {
   id: string;
@@ -88,10 +85,25 @@ function generatePassword(): string {
   return pwd;
 }
 
+// Task 37-e: the 5 manager-tier authorities the owner can grant in the
+// create/edit dialogs — mirrored by the checkboxes of the shared
+// StaffPermissionsEditor. Keys match the backend's normalized columns.
+const MANAGER_AUTHORITIES: { key: keyof StaffPermissions; labelKey: string }[] = [
+  { key: 'canCreateBranches', labelKey: 'authorityCreateBranches' },
+  { key: 'canDeleteBranches', labelKey: 'authorityDeleteBranches' },
+  { key: 'canPurchaseSubscription', labelKey: 'authorityMakePurchase' },
+  { key: 'canManageSubscription', labelKey: 'authorityManageSubscription' },
+  { key: 'canManageProfile', labelKey: 'authorityProfileSettings' },
+];
+
 export function AgencyEmployees() {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
   const agencyId = user?.agencyId || '';
+  // Task 37-e: the employees page is OWNER territory — staff/manager sessions
+  // get an owner-only empty state (the ViewRouter gate already redirects, this
+  // is the direct-navigation belt-and-braces).
+  const { authority } = useAgencyAuthority();
 
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [loading, setLoading] = useState(true);
@@ -104,6 +116,9 @@ export function AgencyEmployees() {
   const [newFullName, setNewFullName] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [newRole, setNewRole] = useState('STAFF');
+  // Task 37-e: manager authority grants — ALL CHECKED (tier defaults) so the
+  // owner can simply untick what they don't want to grant.
+  const [newPermissions, setNewPermissions] = useState<StaffPermissions>({ ...MANAGER_TIER_DEFAULTS });
   // Task 31 bug 8: a staff account must be associated with a branch
   const [newBranchId, setNewBranchId] = useState('');
   const [branchOptions, setBranchOptions] = useState<BranchOption[]>([]);
@@ -121,6 +136,9 @@ export function AgencyEmployees() {
   const [editEmployee, setEditEmployee] = useState<Employee | null>(null);
   const [editFullName, setEditFullName] = useState('');
   const [editRole, setEditRole] = useState('STAFF');
+  // Task 37-e: the existing editPermissions state (shared with the per-worker
+  // permissions dialog below) doubles as the edit dialog's authority editor —
+  // seeded by openEdit() from the member's stored grants.
   const [editLoading, setEditLoading] = useState(false);
 
   // Remove dialog
@@ -199,6 +217,30 @@ export function AgencyEmployees() {
     }
   }, [createOpen, fetchBranchOptions]);
 
+  // Task 37-e: staff count meter — resolve the current plan's maxStaff from
+  // GET /api/agency/subscription (availablePlans + currentPlan, same pattern
+  // as agency-settings' capacity cap). null = unknown → no meter; -1 = unlimited.
+  const [planMaxStaff, setPlanMaxStaff] = useState<number | null>(null);
+  const fetchPlanStaffCap = useCallback(async () => {
+    try {
+      const params = agencyId ? `?agencyId=${encodeURIComponent(agencyId)}` : '';
+      const res = await apiFetch(`/api/agency/subscription${params}`);
+      if (res.ok) {
+        const data = await res.json();
+        const plans: Array<{ name?: string; maxStaff?: number }> = data.availablePlans ?? [];
+        const current = String(data.currentPlan ?? '').toUpperCase();
+        const match = plans.find((p) => (p.name ?? '').toUpperCase() === current);
+        setPlanMaxStaff(typeof match?.maxStaff === 'number' ? match.maxStaff : null);
+      }
+    } catch {
+      // silent — the meter simply doesn't render; the server still gates create
+    }
+  }, [agencyId]);
+
+  useEffect(() => {
+    fetchPlanStaffCap();
+  }, [fetchPlanStaffCap]);
+
   // Stats
   const totalEmployees = employees.length;
   const activeEmployees = employees.filter(e => e.isActive).length;
@@ -241,6 +283,10 @@ export function AgencyEmployees() {
           password: newPassword,
           role: newRole,
           branchId: newBranchId,
+          // Task 37-e: manager authority grants overlay the tier defaults
+          // server-side; STAFF needs no authority payload (queue + analytics
+          // are automatic).
+          ...(newRole === 'MANAGER' ? { permissions: newPermissions } : {}),
         }),
       });
       if (res.ok) {
@@ -251,6 +297,7 @@ export function AgencyEmployees() {
         setNewFullName('');
         setNewPassword('');
         setNewRole('STAFF');
+        setNewPermissions({ ...MANAGER_TIER_DEFAULTS });
         setNewBranchId('');
         setBranchError(false);
         setCredentialsOpen(true);
@@ -279,6 +326,9 @@ export function AgencyEmployees() {
         body: JSON.stringify({
           fullName: editFullName.trim(),
           role: editRole,
+          // Task 37-e: MANAGER members carry the authority editor's state —
+          // the server overlays it on the (possibly re-applied) tier defaults.
+          ...(editRole === 'MANAGER' ? { permissions: editPermissions } : {}),
         }),
       });
       if (res.ok) {
@@ -344,6 +394,9 @@ export function AgencyEmployees() {
     setEditFullName(emp.fullName || '');
     // Backend expects 'STAFF' or 'MANAGER' — convert from normalized role
     setEditRole(emp.role === 'AGENCY_OWNER' ? 'OWNER' : emp.role === 'AGENCY_MANAGER' ? 'MANAGER' : 'STAFF');
+    // Task 37-e: seed the authority editor from the member's stored grants.
+    const permStr = emp.permissions ? JSON.stringify(emp.permissions) : null;
+    setEditPermissions(parsePermissions(permStr));
     setEditOpen(true);
   };
 
@@ -416,6 +469,28 @@ export function AgencyEmployees() {
     { label: t('employeeManagers' as any), value: managerCount, icon: Shield, color: 'from-amber-500 to-amber-700', shadow: 'shadow-amber-500/15' },
   ];
 
+  // Task 37-e: plan staff-cap — when the active roster reaches the plan's
+  // maxStaff the Add button locks (the server's 403 PLAN_LIMIT_REACHED stays
+  // the authoritative gate).
+  const staffCapReached =
+    planMaxStaff !== null && planMaxStaff !== -1 && activeEmployees >= planMaxStaff;
+
+  // Task 37-e: OWNER-only content guard — a staff/manager that reaches this
+  // view directly (deep link / stale view) gets an explicit empty state.
+  if (user?.role === 'AGENCY_STAFF' && authority && !authority.isOwner) {
+    return (
+      <div className="p-4 lg:p-5">
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80">
+          <CardContent className="p-10 text-center">
+            <Shield className="h-12 w-12 text-muted-foreground/30 mx-auto mb-3" />
+            <p className="text-sm font-medium text-foreground">{t('ownerOnlySection')}</p>
+            <p className="text-xs text-muted-foreground mt-1">{t('employeeManagementDesc' as any)}</p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   if (loading) {
     return (
       <div className="p-4 lg:p-5 space-y-4">
@@ -441,6 +516,22 @@ export function AgencyEmployees() {
           <p className="text-sm text-muted-foreground mt-0.5">{t('employeeManagementDesc' as any)}</p>
         </div>
         <div className="flex items-center gap-2">
+          {/* Task 37-e: staff count meter — "X / N staff" (or unlimited) */}
+          {planMaxStaff !== null && (
+            <div
+              className={`hidden sm:flex items-center gap-1.5 px-3 h-9 rounded-xl border text-xs font-medium ${
+                staffCapReached
+                  ? 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-700/50 dark:bg-amber-900/20 dark:text-amber-400'
+                  : 'border-border bg-muted/40 text-muted-foreground'
+              }`}
+              title={staffCapReached ? t('staffLimitReached') : undefined}
+            >
+              <Users className="h-3.5 w-3.5" />
+              {planMaxStaff === -1
+                ? t('staffUnlimited', { x: String(activeEmployees) })
+                : t('staffMeter', { x: String(activeEmployees), n: String(planMaxStaff) })}
+            </div>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -449,14 +540,24 @@ export function AgencyEmployees() {
           >
             <RefreshCw className="h-4 w-4" />
           </Button>
-          <Button
-            onClick={() => setCreateOpen(true)}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white gap-2 rounded-xl h-10"
-          >
-            <UserPlus className="h-4 w-4" />
-            <span className="hidden sm:inline">{t('createStaffAccount')}</span>
-            <span className="sm:hidden">{t('addStaff')}</span>
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div className={staffCapReached ? 'cursor-not-allowed' : ''}>
+                <Button
+                  onClick={() => setCreateOpen(true)}
+                  disabled={staffCapReached}
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white gap-2 rounded-xl h-10"
+                >
+                  <UserPlus className="h-4 w-4" />
+                  <span className="hidden sm:inline">{t('createStaffAccount')}</span>
+                  <span className="sm:hidden">{t('addStaff')}</span>
+                </Button>
+              </div>
+            </TooltipTrigger>
+            {staffCapReached && (
+              <TooltipContent className="max-w-[240px]">{t('staffLimitReached')}</TooltipContent>
+            )}
+          </Tooltip>
         </div>
       </div>
 
@@ -634,7 +735,7 @@ export function AgencyEmployees() {
       </div>
 
       {/* Create Employee Dialog */}
-      <Dialog open={createOpen} onOpenChange={(open) => { setCreateOpen(open); if (!open) { setNewUsername(''); setNewFullName(''); setNewPassword(''); setNewRole('STAFF'); setNewBranchId(''); setBranchError(false); } }}>
+      <Dialog open={createOpen} onOpenChange={(open) => { setCreateOpen(open); if (!open) { setNewUsername(''); setNewFullName(''); setNewPassword(''); setNewRole('STAFF'); setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); setNewBranchId(''); setBranchError(false); } }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
@@ -718,7 +819,7 @@ export function AgencyEmployees() {
             </div>
             <div className="space-y-2">
               <Label className="text-xs">{t('staffRoleSelect')}</Label>
-              <Select value={newRole} onValueChange={setNewRole}>
+              <Select value={newRole} onValueChange={(v) => { setNewRole(v); if (v === 'MANAGER') setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); }}>
                 <SelectTrigger className="h-11">
                   <SelectValue />
                 </SelectTrigger>
@@ -728,6 +829,30 @@ export function AgencyEmployees() {
                 </SelectContent>
               </Select>
             </div>
+            {/* Task 37-e: manager authorities — defaults to ALL CHECKED (tier
+                defaults); the owner unticks what they don't want to grant.
+                Plain STAFF get queue + analytics automatically, no editor. */}
+            {newRole === 'MANAGER' && (
+              <div className="space-y-2">
+                <Label className="text-xs">{t('authorities')}</Label>
+                <div className="rounded-xl border border-border p-3 space-y-2.5">
+                  {MANAGER_AUTHORITIES.map(({ key, labelKey }) => (
+                    <label
+                      key={key}
+                      className="flex items-center gap-3 cursor-pointer select-none"
+                    >
+                      <Checkbox
+                        checked={newPermissions[key]}
+                        onCheckedChange={(v) =>
+                          setNewPermissions((prev) => ({ ...prev, [key]: v === true }))
+                        }
+                      />
+                      <span className="text-sm text-foreground">{t(labelKey as any)}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
           <div className="flex gap-2 justify-end">
             <Button variant="outline" onClick={() => setCreateOpen(false)}>{t('cancel')}</Button>
@@ -803,7 +928,7 @@ export function AgencyEmployees() {
             </div>
             <div className="space-y-2">
               <Label className="text-xs">{t('staffRoleSelect')}</Label>
-              <Select value={editRole} onValueChange={setEditRole}>
+              <Select value={editRole} onValueChange={(v) => { setEditRole(v); if (v === 'MANAGER' && editEmployee?.role !== 'MANAGER' && editEmployee?.role !== 'AGENCY_MANAGER') setEditPermissions({ ...MANAGER_TIER_DEFAULTS }); }}>
                 <SelectTrigger className="h-11">
                   <SelectValue />
                 </SelectTrigger>
@@ -813,6 +938,29 @@ export function AgencyEmployees() {
                 </SelectContent>
               </Select>
             </div>
+            {/* Task 37-e: same authority editor as the create dialog, shown
+                when the member's role is (or is being switched to) MANAGER. */}
+            {editRole === 'MANAGER' && (
+              <div className="pt-1">
+                <Label className="text-xs">{t('authorities')}</Label>
+                <div className="mt-2 rounded-xl border border-border p-3 space-y-2.5">
+                  {MANAGER_AUTHORITIES.map(({ key, labelKey }) => (
+                    <label
+                      key={key}
+                      className="flex items-center gap-3 cursor-pointer select-none"
+                    >
+                      <Checkbox
+                        checked={editPermissions[key]}
+                        onCheckedChange={(v) =>
+                          setEditPermissions((prev) => ({ ...prev, [key]: v === true }))
+                        }
+                      />
+                      <span className="text-sm text-foreground">{t(labelKey as any)}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
           <div className="flex gap-2 justify-end">
             <Button variant="outline" onClick={() => setEditOpen(false)}>{t('cancel')}</Button>

@@ -204,6 +204,13 @@ const ar = {
   maxReservations: "الحد الأقصى للحجوزات",
   queueOpen: "فتح الطابور",
   queueClosedStatus: "إغلاق الطابور",
+  // Task 37: real queue-state badges + plan capacity helpers
+  // (badge reuses the pre-existing `queueClosed` key from the queue section)
+  unlimited: "غير محدود",
+  planCapacityLimit: "حد الخطة: {n} (قم بالترقية لمزيد)",
+  capacityExceedsPlan: "القيمة تتجاوز حد الخطة ({n})",
+  branch: "الفرع",
+  selectBranch: "اختر الفرع",
   addService: "إضافة خدمة",
   serviceName: "اسم الخدمة",
   servicePrefix: "بادئة رقم الطابور",
@@ -1572,6 +1579,8 @@ const ar = {
   setAsMain: 'تعيين كفرع رئيسي',
   noBranches: 'لا توجد فروع بعد',
   noBranchesDesc: 'أضف فرعك الأول لبدء تنظيم مكاتب الخدمة',
+  branchesLoadFailed: 'فشل تحميل الفروع',
+  retry: 'إعادة المحاولة',
   confirmDeleteBranch: 'هل أنت متأكد من حذف هذا الفرع؟ سيتم حذف جميع الشبابيك أيضاً.',
   branchDeleted: 'تم تعطيل الفرع',
   branchCreated: 'تم إنشاء الفرع بنجاح',
@@ -1735,6 +1744,12 @@ const ar = {
   pendingSyncEvents: 'أحداث تنتظر المزامنة',
   reconnect: 'إعادة الاتصال',
   reconnected: 'تم إعادة الاتصال',
+
+  // ─── Boot splash (Task 41) ──────────────
+  bootPreparing: 'جارٍ تحضير بياناتك…',
+  bootSyncing: 'جارٍ مزامنة بياناتك…',
+  bootAlmostReady: 'شبه جاهز…',
+  bootSlowNote: 'يستغرق هذا وقتًا أطول من المعتاد — سيتم فتح لوحة التحكم قريبًا',
 
   // ─── Offline Reservation Sync ──────────────
   offlineReservationsPending: '{count} حجز(حجوزات) غير متصل بانتظار المزامنة',
@@ -2709,6 +2724,31 @@ const ar = {
   auditReconciliationRun: 'تم تشغيل التسوية',
   auditCronExecute: 'تم تشغيل المهامة المجدولة',
   auditPush: 'إشعار دفع',
+  // ─── Task 37-e: صلاحيات المؤسسة وعدّاد الموظفين واحتلال الشبابيك ───
+  selectCounter: 'اختر الشباك',
+  authorities: 'الصلاحيات',
+  authorityCreateBranches: 'إنشاء الفروع',
+  authorityDeleteBranches: 'حذف الفروع',
+  authorityMakePurchase: 'إجراء عمليات الشراء',
+  authorityManageSubscription: 'إدارة الاشتراك',
+  authorityProfileSettings: 'إعدادات الملف الشخصي',
+  staffMeter: '{x} من {n} موظفين',
+  staffUnlimited: '{x} موظفين · غير محدود',
+  staffLimitReached: 'تم الوصول إلى الحد الأقصى للموظفين في خطتك — قم بترقية الاشتراك لإضافة المزيد.',
+  ownerOnlySection: 'هذا القسم متاح فقط لصاحب المؤسسة.',
+  noSubscriptionAccess: 'ليست لديك صلاحية الوصول إلى إدارة الاشتراك.',
+  paymentHistory: 'سجل المدفوعات',
+  noTransactions: 'لا توجد مدفوعات بعد.',
+  occupyCounter: 'تم احتلال الشباك',
+  releaseCounter: 'تحرير الشباك',
+  counterReleased: 'تم تحرير الشباك',
+  counterOccupied: 'مشغول',
+  counterOccupiedBy: 'مشغول بواسطة {name}',
+  counterMine: 'الشباك الخاص بك',
+  counterFree: 'متاح',
+  occupyFirst: 'احتل شباكاً أولاً لاستدعاء العميل التالي.',
+  counterPermissionDenied: 'ليست لديك صلاحية لهذا الشباك.',
+
 };
 
 export default ar;

@@ -22,7 +22,7 @@
 
 import { PrismaClient, Prisma } from '@prisma/client'
 import { resolve, dirname } from 'path'
-import { mkdirSync, existsSync } from 'fs'
+import { mkdirSync, existsSync, statSync, readFileSync } from 'fs'
 import { fileURLToPath } from 'url'
 import { AsyncLocalStorage } from 'async_hooks'
 
@@ -79,19 +79,23 @@ const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
 }
 
-// Base PrismaClient — cached globally in development to prevent
-// duplicate instances on hot-reload
-const baseClient =
-  globalForPrisma.prisma ??
-  new PrismaClient({
+function createBaseClient(): PrismaClient {
+  return new PrismaClient({
     log: process.env.NODE_ENV === 'development' ? ['warn', 'error'] : ['error'],
   })
+}
 
-if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = baseClient
+// Base PrismaClient — cached globally in development to prevent
+// duplicate instances on hot-reload. Held in `currentBase` (not a const)
+// because a full platform reset hot-swaps the client onto the freshly
+// recreated database file — see the generation watcher at the bottom.
+let currentBase: PrismaClient = globalForPrisma.prisma ?? createBaseClient()
+
+if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = currentBase
 
 // P1-6/E3: install the tx-capture context BEFORE the extension reads
 // $transaction so interactive transactions get deferred capture.
-installTransactionalCaptureContext(baseClient)
+installTransactionalCaptureContext(currentBase)
 
 /**
  * Convert a Prisma model name to its delegate accessor.
@@ -300,9 +304,15 @@ export const SYNC_TRACKED_MODELS: Set<string> = new Set([
  * skipped in that path (the findMany for tombstones would also need to run
  * outside the tx, which is acceptable — tombstones are best-effort).
  */
-const extendedClient = skipGhostDelete
-  ? baseClient // No extension when skip flag is set
-  : baseClient.$extends({
+type GhostDeleteExtensionDef = Parameters<PrismaClient['$extends']>[0]
+
+/**
+ * Builds the ghost-delete extension bound to a SPECIFIC base client — the
+ * pre-delete / pre-updateMany captures below read through it. Rebuilt on
+ * every hot-swap so captures always target the live database file.
+ */
+function buildGhostDeleteExtension(base: PrismaClient): GhostDeleteExtensionDef {
+  return {
       query: {
         $allModels: {
           async $allOperations({ model, operation, args, query }) {
@@ -336,7 +346,7 @@ const extendedClient = skipGhostDelete
               (operation === 'delete' || operation === 'deleteMany')
             ) {
               try {
-                const delegate = (baseClient as any)[modelToDelegate(model)]
+                const delegate = (base as any)[modelToDelegate(model)]
                 if (delegate) {
                   // Full records — agency resolution for the SyncChange needs
                   // fields like agencyId/branchId/userId, not just the id.
@@ -356,7 +366,7 @@ const extendedClient = skipGhostDelete
             let preUpdateManyRecords: any[] | null = null
             if (isTrackedMutation && operation === 'updateMany') {
               try {
-                const delegate = (baseClient as any)[modelToDelegate(model)]
+                const delegate = (base as any)[modelToDelegate(model)]
                 if (delegate && (args as any)?.where) {
                   preUpdateManyRecords = await delegate.findMany({
                     where: (args as any).where,
@@ -386,9 +396,38 @@ const extendedClient = skipGhostDelete
           },
         },
       },
-    })
+    }
+}
 
-export const db = extendedClient
+// The live client pair. `db` / `dbRaw` below are PROXIES that always forward
+// to these — the generation watcher at the bottom of this file swaps them
+// after a platform reset.
+const initialGhostExtension = skipGhostDelete ? null : buildGhostDeleteExtension(currentBase)
+let currentExtended: PrismaClient = initialGhostExtension
+  ? (currentBase.$extends(initialGhostExtension) as unknown as PrismaClient)
+  : currentBase
+
+// ── Live client proxies (Task 36) ──────────────────────────────────────────
+// A PrismaClient opened BEFORE a full platform reset keeps reading the
+// DELETED database file through its open handle (the classic unlink
+// stale-inode trap) while `prisma db push` + seed recreate the file at the
+// same path. These proxies let the generation watcher swap every consumer
+// onto a freshly-opened client WITHOUT restarting the process —
+// `import { db } from '@blasti/db'` keeps working everywhere, unchanged.
+
+function liveClientProxy(getClient: () => PrismaClient): PrismaClient {
+  return new Proxy({} as PrismaClient, {
+    get(_target, prop) {
+      const client = getClient() as any
+      const value = Reflect.get(client, prop, client)
+      // Bind top-level methods ($transaction, $queryRaw, $disconnect…) to
+      // the CURRENT client so extracted/unbound references stay correct.
+      return typeof value === 'function' ? value.bind(client) : value
+    },
+  })
+}
+
+export const db = liveClientProxy(() => currentExtended)
 
 /**
  * Raw (un-extended) Prisma client — use this for `$transaction` callbacks that
@@ -399,7 +438,7 @@ export const db = extendedClient
  * (DeletedRecord) creation is skipped — acceptable since offline sync is
  * best-effort and tombstones can be reconstructed from audit logs.
  */
-export const dbRaw = baseClient
+export const dbRaw = liveClientProxy(() => currentBase)
 
 // Re-export Prisma namespace for type access (Prisma.TransactionWhereInput, etc.)
 export { Prisma, PrismaClient }
@@ -419,7 +458,7 @@ export async function setupSQLitePragmas(): Promise<void> {
   try {
     // Use $runCommandRaw or raw query with proper handling for SQLite PRAGMA
     // $executeRawUnsafe returns results which SQLite doesn't allow, so we use $queryRaw instead
-    await baseClient.$queryRaw`PRAGMA busy_timeout = 5000`
+    await currentBase.$queryRaw`PRAGMA busy_timeout = 5000`
     pragmaInitialized = true
   } catch (err) {
     // Non-fatal — the default busy_timeout is 0, but the retry logic in
@@ -427,3 +466,107 @@ export async function setupSQLitePragmas(): Promise<void> {
     console.warn('[db] Failed to set PRAGMA busy_timeout:', err)
   }
 }
+
+// ── Reset-generation invalidation + DB hot-swap (Task 36) ───────────────────
+// scripts/reset-all.ts writes .db-generation.json NEXT to the database file:
+//   phase 1 (old DB file deleted):  { "epoch": <ms>, "ready": false }
+//   phase 2 (db push + seed done):  { "epoch": <ms>, "ready": true  }
+//
+// 1) apps/api/src/lib/auth.ts calls getInvalidationEpochMs() on EVERY session
+//    verification and rejects any JWT whose `iat` predates the epoch — a
+//    platform reset kills ALL pre-reset tokens/sessions IMMEDIATELY, even
+//    while the API was still serving the deleted file through its old handle.
+// 2) The watcher below hot-swaps the Prisma client onto the freshly
+//    recreated database file, so the RUNNING process starts serving the NEW
+//    data without a restart (the old client drains for 10s, disconnects).
+
+const DB_GENERATION_FILE = (() => {
+  const dbPath = resolvedDbUrl.startsWith('file:')
+    ? resolvedDbUrl.slice('file:'.length).replace(/^\/(?=[A-Za-z]:)/, '')
+    : resolvedDbUrl
+  return resolve(dirname(dbPath), '.db-generation.json')
+})()
+
+export interface DbGeneration {
+  epoch: number
+  ready: boolean
+}
+
+const generationCache: { mtimeMs: number; gen: DbGeneration | null } = { mtimeMs: -1, gen: null }
+
+function readDbGeneration(): DbGeneration | null {
+  try {
+    const stat = statSync(DB_GENERATION_FILE)
+    if (stat.mtimeMs === generationCache.mtimeMs) return generationCache.gen
+    const raw = JSON.parse(readFileSync(DB_GENERATION_FILE, 'utf8')) as Partial<DbGeneration>
+    const gen: DbGeneration | null =
+      raw && typeof raw.epoch === 'number' && Number.isFinite(raw.epoch)
+        ? { epoch: raw.epoch, ready: raw.ready === true }
+        : null
+    generationCache.mtimeMs = stat.mtimeMs
+    generationCache.gen = gen
+    return gen
+  } catch {
+    generationCache.mtimeMs = -1
+    generationCache.gen = null
+    return null
+  }
+}
+
+// Sticky + monotonic: once a reset epoch is observed it stays in force even if
+// the marker file is later deleted — pre-reset tokens can never be resurrected.
+let invalidationEpoch: number | null = readDbGeneration()?.epoch ?? null
+
+/** Epoch (ms) of the latest observed database reset, or null if none ever. */
+export function getInvalidationEpochMs(): number | null {
+  const gen = readDbGeneration()
+  if (gen && (invalidationEpoch === null || gen.epoch > invalidationEpoch)) {
+    invalidationEpoch = gen.epoch
+  }
+  return invalidationEpoch
+}
+
+// If this process booted AFTER a completed reset it already opened the fresh
+// file — record that generation as applied so the watcher does not re-swap.
+const initialGeneration = readDbGeneration()
+let lastAppliedGeneration: number | null = initialGeneration?.ready ? initialGeneration.epoch : null
+
+function swapDbClient(): void {
+  const previousBase = currentBase
+  const base = createBaseClient()
+  installTransactionalCaptureContext(base)
+  const extension = skipGhostDelete ? null : buildGhostDeleteExtension(base)
+  currentBase = base
+  currentExtended = extension ? (base.$extends(extension) as unknown as PrismaClient) : base
+  if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = base
+  // Re-apply connection PRAGMAs on the new client and release the old file
+  // handle after in-flight operations drain (best-effort).
+  pragmaInitialized = false
+  void setupSQLitePragmas().catch(() => {})
+  const drain = setTimeout(() => {
+    previousBase.$disconnect().catch(() => {})
+  }, 10_000)
+  if (typeof drain.unref === 'function') drain.unref()
+  console.log(`[db] Prisma client hot-swapped onto database generation ${lastAppliedGeneration}`)
+}
+
+function startDbGenerationWatcher(): void {
+  // One-shot scripts (seed/migrations) and explicitly opted-out processes
+  // never need the swap.
+  if (process.env.BLASTI_DISABLE_DB_GENERATION_WATCH === '1') return
+  if (skipGhostDelete) return
+  const timer = setInterval(() => {
+    try {
+      const gen = readDbGeneration()
+      if (gen?.ready && gen.epoch > (lastAppliedGeneration ?? Number.NEGATIVE_INFINITY)) {
+        lastAppliedGeneration = gen.epoch
+        swapDbClient()
+      }
+    } catch (err) {
+      console.warn('[db] db-generation watcher error:', (err as Error)?.message)
+    }
+  }, 1000)
+  if (typeof timer.unref === 'function') timer.unref()
+}
+
+startDbGenerationWatcher()

@@ -836,11 +836,13 @@ export function CustomerProfile() {
                   transition={{ duration: 0.2 }}
                   className="absolute inset-0 rounded-full"
                 />
-                <motion.span
-                  layout
-                  transition={{ type: 'spring', stiffness: 500, damping: 30 }}
-                  className="absolute top-0.5 h-6 w-6 bg-white rounded-full shadow-md pointer-events-none"
-                  style={{ left: smsNotifEnabled ? '23px' : '2px' }}
+                <span
+                  className={`absolute top-0.5 h-6 w-6 bg-white rounded-full shadow-md pointer-events-none transition-all duration-300 ${
+                    // Task 39: logical inset instead of a physical `left`
+                    // style — `left` put the knob on the wrong side in RTL
+                    // and fought the layout animation (jitter / stale spot).
+                    smsNotifEnabled ? 'start-[22px]' : 'start-[2px]'
+                  }`}
                 />
               </motion.button>
             </div>

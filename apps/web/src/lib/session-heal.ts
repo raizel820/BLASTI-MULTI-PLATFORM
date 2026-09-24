@@ -111,3 +111,48 @@ export async function applyHealedSession(healed: HealedSession): Promise<void> {
     sessionToken: healed.token,
   });
 }
+
+/**
+ * Task 37-a — adopt the LOCAL API's session user after an import-session call.
+ *
+ * THE BUG: the desktop's POST /api/auth/import-session cloud-validates the
+ * presented token and, when the cloud answers, adopts the REFRESHED user
+ * (local-api/index.js — current agencyId, current role). The local session
+ * therefore moved on, but every renderer caller discarded the response — so
+ * the persisted zustand user kept a STALE agencyId while the local session
+ * carried the fresh one. Reads/writes then went out as
+ * ?agencyId=<stale> → 403 → the branches page silently rendered an empty
+ * list ("branch created on the desktop is invisible in the desktop app").
+ *
+ * This merges the response user into the store WITHOUT touching navigation
+ * (same gentle pattern as applyHealedSession above — deliberately NOT
+ * setUser(), which resets currentView to the role's default view) and
+ * WITHOUT adopting the response token: the renderer's token is still valid
+ * for the cloud and is owned by setSessionToken's Electron handoff.
+ *
+ * No-op when: the payload is malformed, the import was rejected (success:
+ * false — e.g. the Task 33 AUTHORIZATION_REVOKED response, which carries no
+ * user), there is no logged-in user, or the response user is a DIFFERENT
+ * account (never cross-account adopt).
+ */
+export async function adoptImportedLocalSessionUser(data: unknown): Promise<void> {
+  try {
+    if (!data || typeof data !== 'object') return;
+    const payload = data as {
+      success?: boolean;
+      user?: { id?: string; avatarUrl?: string | null; [key: string]: unknown } | null;
+    };
+    if (payload.success === false || !payload.user || typeof payload.user !== 'object') return;
+    const refreshed = payload.user;
+    if (!refreshed.id) return;
+    const { useAppStore } = await import('@/store/use-app-store');
+    const prev = useAppStore.getState().user;
+    if (!prev || prev.id !== refreshed.id) return;
+    const merged = { ...prev, ...refreshed } as typeof prev;
+    // A null avatar on the import projection must not erase a known avatar.
+    if (refreshed.avatarUrl == null && prev.avatarUrl) merged.avatarUrl = prev.avatarUrl;
+    useAppStore.setState({ user: merged });
+  } catch {
+    // adoption is best-effort — never break the auth flow
+  }
+}
