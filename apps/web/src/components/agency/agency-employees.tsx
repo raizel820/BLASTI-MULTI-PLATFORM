@@ -57,6 +57,7 @@ import { useAgencyAuthority, MANAGER_TIER_DEFAULTS } from '@/hooks/use-agency-au
 import { Checkbox } from '@/components/ui/checkbox';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { apiFetch } from '@/lib/api-fetch';
+import { unwrapListPayload } from '@/lib/list-payload';
 
 interface Employee {
   id: string;
@@ -164,7 +165,11 @@ export function AgencyEmployees() {
       if (res.ok) {
         const data = await res.json();
         // Map nested user object to flat fields — backend returns { staff: [{ user: {...}, ... }] }
-        setEmployees((data.staff ?? []).map((s: any) => ({
+        // Task 45 root cause: apiClient's parseResponse auto-unwrap collapses
+        // the local dual envelope { success, staff, data } to the RAW ARRAY —
+        // `data.staff` on an array was always undefined (empty staff list on
+        // desktop). Accept every envelope outcome.
+        setEmployees(unwrapListPayload(data, ['staff']).map((s: any) => ({
           id: s.id,
           userId: s.userId,
           username: s.user?.username ?? '',
@@ -199,7 +204,9 @@ export function AgencyEmployees() {
       if (res.ok) {
         const data = await res.json();
         // Cloud returns { branches }, local API historically { data } — accept both.
-        const list: any[] = data.branches ?? data.data ?? [];
+        // Task 45 root cause: the local dual envelope arrives UNWRAPPED as a
+        // raw array (see list-payload.ts) — accept every outcome.
+        const list: any[] = unwrapListPayload(data, ['branches', 'data']);
         setBranchOptions(
           list.map((b) => ({ id: b.id, name: b.name, nameAr: b.nameAr, nameFr: b.nameFr }))
         );

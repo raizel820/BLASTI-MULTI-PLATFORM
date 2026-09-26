@@ -19,12 +19,6 @@ import {
   ChevronRight,
   ChevronLeft,
   Users,
-  Stethoscope,
-  Globe,
-  Scale,
-  FlaskConical,
-  Landmark,
-  Building2,
   Briefcase,
   Loader2,
   TicketCheck,
@@ -66,6 +60,10 @@ import { AgencyRatingDisplay } from '@/components/shared/agency-rating-display';
 import { EnhancedRatingCard } from '@/components/shared/EnhancedRatingCard';
 import { RecentActivityFeed } from '@/components/customer/home/RecentActivityFeed';
 import { RecentlyVisited } from '@/components/customer/home/RecentlyVisited';
+// Task 42 — shared category source (25 built-ins) + filter rail that appends
+// user-created custom categories (fetched via useAgencyCategories).
+import { categoryKeys } from './home/types';
+import { CategoryFilters } from './home/CategoryFilters';
 
 interface AgencyListItem {
   id: string;
@@ -110,15 +108,9 @@ interface AgencyDetail {
   subscriptionStatus?: string;
 }
 
-const categoryKeys: { key: TranslationKeys; value: string; icon: React.ElementType }[] = [
-  { key: 'catAll', value: 'ALL', icon: Navigation },
-  { key: 'catClinic', value: 'CLINIC', icon: Stethoscope },
-  { key: 'catAgency', value: 'AGENCY', icon: Globe },
-  { key: 'catLawFirm', value: 'LAW_FIRM', icon: Scale },
-  { key: 'catLaboratory', value: 'LABORATORY', icon: FlaskConical },
-  { key: 'catGovernment', value: 'GOVERNMENT', icon: Landmark },
-  { key: 'catOther', value: 'OTHER', icon: Building2 },
-];
+// categoryKeys (25 built-ins, ALL first) now lives in ./home/types.ts and is
+// shared with the filter rail; custom categories are appended in
+// ./home/CategoryFilters.tsx via useAgencyCategories().
 
 export function CustomerHome() {
   const setView = useAppStore((s) => s.setView);
@@ -1418,8 +1410,8 @@ export function CustomerHome() {
         </motion.div>
       )}
 
-      {/* Category Filter Pills */}
-      <CategoryFiltersWithCounts
+      {/* Category Filter Pills (built-ins + custom categories) */}
+      <CategoryFilters
         selectedCategory={selectedCategory}
         onCategoryChange={setSelectedCategory}
         categoryCounts={categoryCounts}
@@ -1748,68 +1740,8 @@ export function CustomerHome() {
 }
 
 // ─── Category Filters wrapper with counts ────
-function CategoryFiltersWithCounts({
-  selectedCategory,
-  onCategoryChange,
-  categoryCounts,
-  t,
-}: {
-  selectedCategory: string;
-  onCategoryChange: (cat: string) => void;
-  categoryCounts: Record<string, number>;
-  t: (key: import("@/i18n").TranslationKeys) => string;
-}) {
-  return (
-    <div className="flex gap-2 overflow-x-auto pb-3 mb-5 no-scrollbar snap-x snap-mandatory scroll-smooth" style={{ WebkitOverflowScrolling: 'touch' }}>
-      {categoryKeys.map((cat) => {
-        const Icon = cat.icon;
-        const isActive = selectedCategory === cat.value;
-        const count = cat.value === 'ALL'
-          ? Object.values(categoryCounts).reduce((s, c) => s + c, 0)
-          : categoryCounts[cat.value] || 0;
-        return (
-          <motion.button
-            key={cat.value}
-            onClick={() => onCategoryChange(cat.value)}
-            layout
-            className={`snap-start flex items-center gap-1.5 px-3.5 py-2 rounded-full text-xs font-medium whitespace-nowrap transition-all min-h-9 active:scale-95 relative ${
-              isActive
-                ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-lg shadow-emerald-500/30'
-                : 'bg-white/60 dark:bg-gray-800/60 text-muted-foreground hover:bg-gray-200 dark:hover:bg-gray-700 backdrop-blur-sm border border-gray-200/50 dark:border-gray-700/50'
-            }`}
-          >
-            <motion.span
-              initial={false}
-              animate={{ scale: isActive ? 1.1 : 1, rotate: isActive ? 10 : 0 }}
-              transition={{ type: 'spring', stiffness: 300, damping: 20 }}
-            >
-              <Icon className="h-3.5 w-3.5" />
-            </motion.span>
-            {t(cat.key)}
-            {/* Count badge */}
-            {count > 0 && (
-              <span className={`text-[9px] font-bold min-w-[16px] h-4 px-1 rounded-full flex items-center justify-center ${
-                isActive
-                  ? 'bg-white/25 text-white'
-                  : 'bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400'
-              }`}>
-                {count > 99 ? '99+' : count}
-              </span>
-            )}
-            {/* Animated selection indicator */}
-            {isActive && (
-              <motion.div
-                layoutId="categoryIndicator"
-                className="absolute inset-0 rounded-full bg-gradient-to-r from-emerald-600 to-teal-600 -z-10"
-                transition={{ type: 'spring', stiffness: 400, damping: 30 }}
-              />
-            )}
-          </motion.button>
-        );
-      })}
-    </div>
-  );
-}
+// (Task 42 — removed: replaced by the shared CategoryFilters from
+// ./home/CategoryFilters.tsx, which also appends custom categories.)
 
 // ─── Agency Reviews Preview (for customer agency detail dialog) ────
 function AgencyReviewsPreview({ agencyId, averageRating, reviewCount }: { agencyId: string; averageRating?: number; reviewCount?: number }) {
@@ -1895,7 +1827,12 @@ function AgencyReviewsPreview({ agencyId, averageRating, reviewCount }: { agency
       <div className="space-y-2">
         <AnimatePresence>
           {displayReviews.map((review, idx) => {
-            const initials = review.user.fullName
+            // Fresh-account safety: a review row can arrive with the user
+            // relation absent (deleted user / partial sync payload). Guard
+            // instead of crashing on null.split (the historic CustomerAvatar
+            // class of bug).
+            const reviewerName: string = review.user?.fullName || 'Customer';
+            const initials = reviewerName
               .split(' ')
               .map((n: string) => n[0])
               .filter(Boolean)
@@ -1903,7 +1840,7 @@ function AgencyReviewsPreview({ agencyId, averageRating, reviewCount }: { agency
               .join('')
               .toUpperCase();
             const colors = ['bg-emerald-500', 'bg-teal-500', 'bg-amber-500', 'bg-rose-500', 'bg-violet-500'];
-            const colorClass = colors[review.user.fullName.length % colors.length];
+            const colorClass = colors[reviewerName.length % colors.length];
 
             return (
               <motion.div
@@ -1918,7 +1855,7 @@ function AgencyReviewsPreview({ agencyId, averageRating, reviewCount }: { agency
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-semibold text-foreground">{review.user.fullName}</span>
+                    <span className="text-xs font-semibold text-foreground">{reviewerName}</span>
                     <div className="flex gap-0.5">
                       {[1, 2, 3, 4, 5].map((star) => (
                         <Star

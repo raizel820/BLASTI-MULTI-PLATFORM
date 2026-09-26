@@ -7,7 +7,7 @@ import type { QueueEventType } from '../lib/realtime-emit'
 import { calculateETA, getEffectiveServiceTime, filterImmediateServiceWindow } from '../lib/eta-calculator'
 import type { ETAResult } from '../lib/eta-calculator'
 import { z } from 'zod'
-import { recordSyncChange } from '../lib/sync-helpers'
+import { recordSyncChange, recordSyncChangeNow } from '../lib/sync-helpers'
 
 const app = new Hono()
 
@@ -575,6 +575,11 @@ app.delete('/cancel-active', async (c) => {
       data: { status: 'CANCELLED', cancelledAt: new Date() },
     })
 
+    // Task 44: explicit SyncChange capture (see agency.ts POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: updated.agencyId, model: 'Reservation', recordId: updated.id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
+
     await db.notification.create({
       data: { userId, type: 'CANCELLED', title: 'Queue Cancelled', message: `Your reservation ${updated.displayNumber} has been cancelled.` },
     })
@@ -627,6 +632,14 @@ app.post('/batch-complete', async (c) => {
       where: { id: { in: reservationIds }, agencyId: resolvedAgencyId, status: { in: ['WAITING', 'CALLED'] } },
       data: { status: 'COMPLETED', completedAt: new Date() },
     })
+
+    // Task 44: explicit per-record SyncChange capture for the bulk complete
+    // (see agency.ts POST /branches note).
+    for (const r of originalReservations) {
+      try {
+        await recordSyncChangeNow({ agencyId: resolvedAgencyId, model: 'Reservation', recordId: r.id, operation: 'update' })
+      } catch { /* capture must never fail the business write */ }
+    }
 
     // Phase 3a: Merge original data with the mutation state for complete realtime event data
     const completedNow = new Date()
@@ -925,6 +938,11 @@ app.post('/:id/rate', async (c) => {
       console.warn('[RATE] Could not set feedback/ratedAt, columns may not exist in Prisma Client')
     }
 
+    // Task 44: explicit SyncChange capture (see agency.ts POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: reservation.agencyId, model: 'Reservation', recordId: id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
+
     emitAgencyEvent('agency:updated', reservation.agencyId, { action: 'rating-submitted', reservationId: reservation.id, rating })
 
     await db.auditLog.create({
@@ -1163,6 +1181,11 @@ app.put('/:id/status', async (c) => {
 
     const updatedReservation = await db.reservation.update({ where: { id }, data: updateData })
 
+    // Task 44: explicit SyncChange capture (see agency.ts POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: reservation.agencyId, model: 'Reservation', recordId: id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
+
     if (reservation.userId) {
       const notificationType = `QUEUE_${status}` as const
       const titleMap: Record<string, string> = { CALLED: 'Your Turn!', COMPLETED: 'Service Completed', CANCELLED: 'Reservation Cancelled', NO_SHOW: 'Missed Your Turn', SERVING: 'Being Served' }
@@ -1241,6 +1264,11 @@ app.post('/:id/toggle-fixed-time', async (c) => {
     }
 
     const updated = await db.reservation.update({ where: { id }, data: { fixedTimeEnabled } })
+
+    // Task 44: explicit SyncChange capture (see agency.ts POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: reservation.agencyId, model: 'Reservation', recordId: id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
 
     if (reservation.userId) {
       await db.notification.create({
@@ -1438,6 +1466,11 @@ app.post('/import-walk-in', async (c) => {
         qrClaimedAt: new Date(),
       },
     })
+
+    // Task 44: explicit SyncChange capture (see agency.ts POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: reservation.agencyId, model: 'Reservation', recordId: reservation.id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
 
     // Emit realtime events
     try {

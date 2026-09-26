@@ -171,6 +171,9 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
 
   const navItems: SidebarNavItem[] = [
     { view: 'agency-dashboard', icon: LayoutDashboard, label: t('dashboard') },
+    // Task 42-e: dedicated Analytics & Statistics section (deep analytics moved
+    // out of the dashboard). Key added to i18n by the main agent.
+    { view: 'agency-analytics', icon: BarChart3, label: t('analyticsStatistics' as TranslationKeys) },
     { view: 'agency-history', icon: History, label: t('history') },
     { view: 'agency-employees', icon: UserCog, label: t('employeeManagement') },
     { view: 'agency-branches', icon: GitBranch, label: t('branchesCounters') },
@@ -183,18 +186,20 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
 
   // Task 37-e: filter the nav by the caller's agency authority.
   //   - AGENCY_OWNER / SUPER_ADMIN → all items (unchanged).
-  //   - MANAGER → dashboard, history, branches*, subscription*, profile*,
-  //     settings* (*only with the matching authority); employees/devices/reviews hidden.
-  //   - STAFF → dashboard + history only.
+  //   - MANAGER → dashboard, history, analytics*, branches*, subscription*,
+  //     profile*, settings* (*only with the matching authority); employees/
+  //     devices/reviews hidden.
+  //   - STAFF → dashboard + history + analytics (canViewAnalytics) only.
   // While the authority fetch is in flight the FULL list renders (the shared
   // matrix returns true) so the sidebar never flickers blank.
   const visibleNavItems = navItems.filter((item) =>
     canAccessAgencySection(item.view as AgencySectionView, authority, user?.role)
   );
 
-  // Group divider stays "before the first item after dashboard + history".
+  // Group divider stays "before the first item after dashboard + history"
+  // (agency-analytics sits between them and is part of the overview group).
   const firstRestrictedIdx = visibleNavItems.findIndex(
-    (item) => item.view !== 'agency-dashboard' && item.view !== 'agency-history'
+    (item) => item.view !== 'agency-dashboard' && item.view !== 'agency-history' && item.view !== 'agency-analytics'
   );
 
   const sidebar = (

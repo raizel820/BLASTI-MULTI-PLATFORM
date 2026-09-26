@@ -26,6 +26,14 @@
 
 const { randomUUID } = require('crypto')
 
+// Task 46: schema-aware record sanitizer shared by EVERY sync import path
+// (staged import, reconciliation, snapshot bridge — and, via its own wiring,
+// the incremental pull in sync-service). Makes the local DB functional when
+// some fields are NULL (webapp-registered agency completing setup on
+// desktop) by dropping unknown columns / null-on-not-null values instead of
+// failing the whole stage.
+const { sanitizeSyncRecord, formatDropped, copyFallbackTags, getFallbackKeys } = require('./lib/sync-record-sanitize')
+
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const PAGE_SIZE = 500
@@ -44,7 +52,7 @@ const SYNC_PROTOCOL_VERSION = 2
 // sorted by this canonical order regardless of the order the cloud returns
 // them in (spec §29: deterministic, race-free imports).
 const FK_SAFE_STAGE_ORDER = [
-  'users', 'subscriptionPlans', 'planFeatures', 'agency', 'branches', 'services', 'agencyStaff', 'counters', 'queueSettings', 'reservations', 'transactions', 'smsSettings', 'paymentSettings', 'notifications', 'announcements', 'globalAnnouncements', 'reviews', 'favorites', 'faqs',
+  'users', 'subscriptionPlans', 'planFeatures', 'agency', 'branches', 'services', 'agencyStaff', 'counters', 'queueSettings', 'reservations', 'transactions', 'smsSettings', 'paymentSettings', 'notifications', 'announcements', 'globalAnnouncements', 'reviews', 'favorites', 'faqs', 'agencyCategories',
 ]
 
 function _sortStagesFkSafe(stages) {
@@ -81,11 +89,85 @@ const STAGE_MODEL_MAP = {
   transactions:     'Transaction',
   subscriptionPlans: 'SubscriptionPlan',
   planFeatures:     'PlanFeature',
+  // Task 42-a: user-created agency fields (shared dictionary, global model)
+  agencyCategories: 'AgencyCategory',
 }
 
 // ─── Module State ───────────────────────────────────────────────────────────
 
 let _activeSync = null  // { syncId, agencyId, cloudUrl, authToken, db, emitFn, abortController }
+
+// ─── Task 46: [SyncDiag] diagnostics ring buffer + live progress ────────────
+// The user-facing ask: "enhance console log to help find the issue with the
+// branches in the desktop app". EVERY import-relevant event now flows through
+// _diagPush → console ([SyncDiag]-prefixed, greppable) AND a bounded ring
+// buffer exposed by GET /api/sync/initial-sync/status + /api/sync/diagnostics,
+// so a support session can see exactly what the last run did without
+// reproducing it.
+const _diagLog = []
+const _DIAG_LOG_MAX = 300
+let _lastProgress = null
+
+const CORE_DIAG_MODELS = new Set(['agency', 'users', 'branches', 'services', 'counters', 'agencyStaff'])
+
+function _diagPush(level, msg) {
+  const entry = { at: new Date().toISOString(), level, msg: String(msg).substring(0, 600) }
+  _diagLog.push(entry)
+  if (_diagLog.length > _DIAG_LOG_MAX) _diagLog.splice(0, _diagLog.length - _DIAG_LOG_MAX)
+  const line = `[SyncDiag] ${entry.msg}`
+  if (level === 'error') console.error(line)
+  else if (level === 'warn') console.warn(line)
+  else console.log(line)
+}
+
+/**
+ * Task 46: branch-focused pre-flight diagnostic — before the first batch of
+ * a core stage is imported, run ONE sample record through the sanitizer and
+ * log exactly what would be dropped and why. A "0 branches imported" report
+ * can now be answered from the log alone (cloud sent 0? dropped keys?
+ * null-on-not-null? relation objects?).
+ */
+function _diagStageSample(stageId, modelName, records) {
+  if (!CORE_DIAG_MODELS.has(stageId) || !Array.isArray(records) || records.length === 0) return
+  const sample = records[0]
+  try {
+    const preview = sanitizeSyncRecord(modelName, sample)
+    _diagPush('info', `stage=${stageId} model=${modelName} fetched=${records.length} sampleId=${sample && sample.id} sampleKeys=[${Object.keys(sample || {}).join(',')}]`)
+    if (preview.dropped.length > 0) {
+      _diagPush('warn', `stage=${stageId} record=${sample && sample.id} sanitizer drops: ${formatDropped(preview.dropped)}`)
+    }
+  } catch (e) {
+    _diagPush('warn', `stage=${stageId} sample diagnostic failed: ${e.message}`)
+  }
+}
+
+/**
+ * Task 46: post-stage table count — the log now states the LOCAL table count
+ * after each core stage so "imported N but the list is empty" is instantly
+ * attributable (0 imported vs N imported-but-not-rendered).
+ */
+async function _diagStageCount(stageId, modelName, db, agencyId) {
+  if (!CORE_DIAG_MODELS.has(stageId)) return
+  try {
+    const modelAccessors = {
+      agency: 'agency', users: 'user', branches: 'branch',
+      services: 'service', counters: 'counter', agencyStaff: 'agencyStaff',
+    }
+    const accessor = modelAccessors[stageId]
+    if (!accessor || !db[accessor]) return
+    let count = 0
+    if (stageId === 'counters') {
+      count = await db.counter.count({ where: { branch: { agencyId } } })
+    } else if (stageId === 'agency' || stageId === 'users') {
+      count = await db[accessor].count()
+    } else {
+      count = await db[accessor].count({ where: { agencyId } })
+    }
+    _diagPush('info', `stage=${stageId} done — local ${modelName} table count for agency=${agencyId}: ${count}`)
+  } catch (e) {
+    _diagPush('warn', `stage=${stageId} local count failed: ${e.message}`)
+  }
+}
 
 // ─── Cloud HTTP Helpers ─────────────────────────────────────────────────────
 
@@ -99,6 +181,35 @@ let _activeSync = null  // { syncId, agencyId, cloudUrl, authToken, db, emitFn, 
  *   - 5xx             → retry with backoff
  *   - Database error  → handled by caller
  */
+/**
+ * GET with the same auth/error contract as _cloudPost (Task 43).
+ * Used by the empty-stage reconciliation importer, which reads the cloud's
+ * canonical list endpoints (GET /api/agency/branches, GET /api/services)
+ * instead of trusting a stage that came back empty.
+ */
+async function _cloudGet(url, authToken, options = {}) {
+  const { signal } = options
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${authToken}` },
+      signal: signal || AbortSignal.timeout(30000),
+    })
+    if (response.status === 401 || response.status === 403) {
+      const err = new Error(`Cloud GET ${url} rejected auth (HTTP ${response.status})`)
+      err.isAuthFailure = true
+      throw err
+    }
+    if (!response.ok) {
+      throw new Error(`Cloud GET ${url} failed (HTTP ${response.status})`)
+    }
+    return await response.json().catch(() => null)
+  } catch (e) {
+    if (e.isAuthFailure) throw e
+    throw new Error(`Cloud GET ${url} error: ${e.message}`)
+  }
+}
+
 async function _cloudPost(url, body, authToken, options = {}) {
   const { signal } = options
   let backoff = INITIAL_BACKOFF_MS
@@ -200,8 +311,20 @@ const DATE_FIELDS = new Set([
  */
 function _transformRecord(record, modelName) {
   const excluded = modelName ? MODEL_SYNC_EXCLUDED_FIELDS[modelName] : null
+
+  // Task 46: schema-aware sanitize FIRST — drops unknown columns (relation
+  // objects, _count, fields the local schema lacks) and null values on NOT
+  // NULL columns (their DEFAULT applies instead), repairs type drift. NULL
+  // on nullable columns is preserved: "not set by the user yet" is real data.
+  const sanitized = sanitizeSyncRecord(modelName, record)
+  if (sanitized.dropped.length > 0 && modelName &&
+      ['Branch', 'Agency', 'User', 'Service', 'Counter', 'AgencyStaff'].includes(modelName)) {
+    _diagPush('warn', `sanitize ${modelName}/${record && record.id}: dropped ${formatDropped(sanitized.dropped)}`)
+  }
+  const source = sanitized.clean || {}
+
   const result = {}
-  for (const [key, value] of Object.entries(record)) {
+  for (const [key, value] of Object.entries(source)) {
     if (value === undefined) continue
     if (excluded && excluded.indexOf(key) !== -1) continue
     if (DATE_FIELDS.has(key) && typeof value === 'string' && value.match(/^\d{4}-\d{2}-\d{2}T/)) {
@@ -210,6 +333,10 @@ function _transformRecord(record, modelName) {
       result[key] = value
     }
   }
+  // Task 46: carry the fallback-fabrication tag (symbol prop — invisible to
+  // Object.entries/JSON) so _buildUpsertData can keep fabricated values out
+  // of the UPDATE branch.
+  copyFallbackTags(source, result)
   // D6 fix (Task 3-b): do NOT inflate syncVersion. The cloud sends its own
   // syncVersion per record and the incremental-sync conflict detector compares
   // stored vs cloud values — storing cloud+1 made EVERY later cloud update
@@ -286,11 +413,19 @@ function _buildUpsertData(modelName, rawRecord) {
   // For create, include all fields
   const create = { ...record }
 
-  // For update, exclude immutable fields and the unique key fields
+  // Task 46: values the sanitizer FABRICATED (fallbacks for NOT NULL
+  // columns the cloud sent null or omitted) are CREATE-ONLY — the UPDATE
+  // branch must never push them, or a drifted cloud payload would reset
+  // the user's real category/customCode on every sync.
+  const createOnlyKeys = getFallbackKeys(record)
+
+  // For update, exclude immutable fields, the unique key fields, and
+  // create-only fallbacks
   const update = {}
   for (const [key, value] of Object.entries(record)) {
     if (MODEL_IMMUTABLE_FIELDS.has(key)) continue
     if (uniqueFields.includes(key)) continue
+    if (createOnlyKeys.indexOf(key) !== -1) continue
     update[key] = value
   }
 
@@ -541,6 +676,121 @@ async function _getMeta(db, key) {
  * workspace FAILED forever, so it never reached READY, the Part-D pull gate
  * stayed shut, and the profile/settings/QR pages rendered empty.
  */
+/**
+ * Task 43 — empty-business-stage reconciliation.
+ *
+ * Live incident (desktop log): a fresh local DB logged in to a cloud that
+ * HAS branches visible in the webapp, yet the initial-data `branches`/`services`
+ * stages delivered 0 records ("No branches imported" integrity warning) and
+ * the workspace went READY with an empty branch list — the exact "desktop
+ * shows no branches" report. The staged importer is proven healthy (E2E
+ * imports what the cloud sends), so the remaining failure mode is a
+ * stage-level gap (old/stale feed, per-stage filtering, drifted cloud build).
+ *
+ * This step cross-checks the TWO critical business stages against the
+ * cloud's CANONICAL list endpoints (the same HTTP reads the webapp UI uses)
+ * and imports directly when the stage came back empty but the endpoint
+ * still returns rows. It also makes the warning text HONEST about which
+ * side is empty, so "no branches yet" can never again be silent.
+ */
+/**
+ * Project a RAW cloud list-endpoint row (GET /api/agency/branches etc.)
+ * down to the flat scalar shape the staged import path receives from
+ * serializeForCloud. List routes add relational payloads (_count includes,
+ * nested objects) that the upsert contract cannot persist — strip them.
+ * Task 44: null RELATION names (Counter.staff: null, Counter.currentReservation:
+ * null, …) also crash the upsert ("Unknown argument `staff`") — strip any
+ * key that names a Prisma relation across the synced models. The FK scalar
+ * columns (staffId, branchId, …) are untouched, so null-clearing semantics
+ * are preserved.
+ */
+const SYNC_RELATION_NAMES = new Set([
+  // Agency
+  'owner', 'branches', 'services', 'counters', 'staffMembers', 'staff', 'queueSettings',
+  'reservations', 'workingHours', 'announcements', 'reviews', 'favorites', 'transactions',
+  'subscriptionPlan', 'smsSettings', 'paymentSettings', 'smsPurchases',
+  // User
+  'ownedAgencies', 'staffAgencies', 'auditLogs', 'notifications', 'devices',
+  'deviceCredentials', 'verificationCodes', 'managedTransactions', 'smsPurchase',
+  // AgencyStaff
+  'userRef', 'agencyRef', 'branchRef', 'counterRef',
+  // Branch / Counter / Reservation
+  'agency', 'branch', 'countersList', 'currentReservation', 'service', 'counter',
+  'user', 'reservation', 'reviewsList', 'servedReservations',
+])
+
+function _sanitizeListRowForUpsert(row) {
+  if (!row || typeof row !== 'object') return row
+  const out = {}
+  for (const [k, v] of Object.entries(row)) {
+    if (k === '_count') continue
+    if (SYNC_RELATION_NAMES.has(k)) continue
+    if (v !== null && typeof v === 'object') continue // nested relations/arrays are not upsertable scalars
+    out[k] = v
+  }
+  return out
+}
+
+async function _reconcileEmptyBusinessStages(db, agencyId, cloudUrl, authToken, signal, emit) {
+  const report = {}
+  const targets = [
+    { stage: 'branches', model: 'Branch', localPath: 'branch', localWhere: { agencyId }, url: `${cloudUrl}/api/agency/branches?agencyId=${encodeURIComponent(agencyId)}`, keys: ['branches', 'data'] },
+    { stage: 'services', model: 'Service', localPath: 'service', localWhere: { agencyId }, url: `${cloudUrl}/api/services?agencyId=${encodeURIComponent(agencyId)}`, keys: ['services', 'data'] },
+    // Task 44: counters joined the reconciliation set — a Counter whose
+    // Branch arrives only through this reconciliation is exactly the shape
+    // that produced the endless FK-787 deferral in the field. FK-blocked
+    // counter rows are durably deferred by _upsertBatch (ctx.agencyId set)
+    // and the background retry pass heals them once the branch lands.
+    // NOTE: Counter has NO agencyId column — the local count goes through
+    // the branch relation instead.
+    { stage: 'counters', model: 'Counter', localPath: 'counter', localWhere: { branch: { agencyId } }, url: `${cloudUrl}/api/agency/counters?agencyId=${encodeURIComponent(agencyId)}`, keys: ['counters', 'data'] },
+  ]
+  for (const t of targets) {
+    let localCount = 0
+    try {
+      localCount = await db[t.localPath].count({ where: t.localWhere || { agencyId } })
+    } catch (e) {
+      console.warn(`[InitialSync] Reconciliation: local ${t.stage} count failed:`, e.message)
+      continue
+    }
+    if (localCount > 0) {
+      report[t.stage] = { localCount, cloudCount: null, reconciled: 0 }
+      continue
+    }
+    // Local table is EMPTY — ask the cloud's canonical list endpoint.
+    let cloudRows = null
+    try {
+      const body = await _cloudGet(t.url, authToken, { signal })
+      if (body && body.success !== false) {
+        for (const k of t.keys) {
+          if (Array.isArray(body && body[k])) { cloudRows = body[k]; break }
+        }
+      }
+    } catch (e) {
+      console.warn(`[InitialSync] Reconciliation: cloud check for ${t.stage} failed:`, e.message)
+      report[t.stage] = { localCount, cloudCount: null, reconciled: 0, cloudCheckError: e.message }
+      continue
+    }
+    const cloudCount = Array.isArray(cloudRows) ? cloudRows.length : 0
+    let reconciled = 0
+    if (cloudCount > 0) {
+      console.warn(`[InitialSync] RECONCILIATION: stage "${t.stage}" imported 0 rows but the cloud list endpoint reports ${cloudCount} — importing directly`)
+      const sanitized = cloudRows.map(_sanitizeListRowForUpsert)
+      const deferredOut = []
+      try {
+        const batchResult = await _upsertBatch(db, t.model, sanitized, deferredOut, { agencyId, stage: `reconciliation:${t.stage}` })
+        reconciled = batchResult.upserted
+        console.log(`[InitialSync] Reconciliation: imported ${reconciled}/${cloudCount} ${t.stage} record(s) directly from the cloud list endpoint`)
+        emit({ type: 'SYNC_STAGE_COMPLETED', stage: `reconciliation-${t.stage}`, stageLabel: `Reconciliation (${t.stage})`, count: reconciled })
+      } catch (e) {
+        console.error(`[InitialSync] Reconciliation import for ${t.stage} failed:`, e.message)
+      }
+    }
+    report[t.stage] = { localCount, cloudCount, reconciled }
+  }
+  return report
+}
+
 async function _validateIntegrity(db, agencyId) {
   const issues = []
   const warnings = []
@@ -752,6 +1002,7 @@ async function runInitialSync(options) {
     db,
     emitFn: emitFn || (() => {}),
     abortController: signal ? null : new AbortController(),
+    startedAt: new Date().toISOString(),
     // Self-reference used by the coalescing path above.
     promise: null,
   }
@@ -814,8 +1065,26 @@ async function _bridgeChangesSinceSnapshot(db, agencyId, cloudUrl, cloudAuthToke
 async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
   const { agencyId, cloudAuthToken, cloudUrl, db, emitFn, signal } = options
 
-  const emit = activeSync.emitFn
+  const rawEmit = activeSync.emitFn
   const effectiveSignal = signal || activeSync.abortController.signal
+
+  // Task 46: single funnel wrapper — every event updates the module-level
+  // live progress snapshot (polled by the post-login loading gate via
+  // GET /api/sync/initial-sync/status) and the [SyncDiag] ring buffer.
+  const emit = (evt) => {
+    try {
+      if (evt && evt.type) {
+        _lastProgress = { ...evt, agencyId, at: new Date().toISOString() }
+        const bits = [`evt ${evt.type}`]
+        if (evt.stage) bits.push(`stage=${evt.stage}`)
+        if (evt.count != null) bits.push(`count=${evt.count}`)
+        if (evt.stageIndex != null && evt.totalStages != null) bits.push(`(${evt.stageIndex + 1}/${evt.totalStages})`)
+        if (evt.error) bits.push(`error=${String(evt.error).substring(0, 240)}`)
+        _diagPush(evt.type === 'SYNC_ERROR' ? 'error' : (evt.type === 'SYNC_WARNING' ? 'warn' : 'info'), bits.join(' '))
+      }
+    } catch { /* diagnostics must never break the sync */ }
+    return rawEmit(evt)
+  }
 
   // Ensure _sync_meta table exists (for incremental sync bridge)
   await _ensureMetaTable(db)
@@ -981,6 +1250,17 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
         const nextCursor = response.nextCursor || null
         hasMore = response.hasMore === true
 
+        // Task 43: make the per-stage fetch VISIBLE in the main log (the
+        // evt printer only logs types, so a stage that quietly got 0 rows
+        // from the cloud was indistinguishable from one that got 50).
+        console.log(`[InitialSync] stage ${stage.id}: fetched ${records.length} record(s) from cloud (page hasMore=${hasMore})`)
+
+        // Task 46: branch-focused pre-flight diagnostics — sample keys + what
+        // the sanitizer would drop, for the FIRST page of each core stage.
+        if (cursor === null || cursor === undefined) {
+          _diagStageSample(stage.id, modelName, records)
+        }
+
         if (records.length === 0 && !hasMore) {
           break
         }
@@ -997,6 +1277,16 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
         const batchResult = await _upsertBatch(db, modelName, records, deferredRecords, { agencyId, stage: stage.id })
         stageCount += batchResult.upserted
         totalRecords += batchResult.upserted
+
+        // Task 46: post-batch visibility for core stages — imported vs
+        // deferred vs the resulting LOCAL table count ("0 imported" and
+        // "imported but list empty" are now distinguishable from the log).
+        if (batchResult.deferred > 0 && CORE_DIAG_MODELS.has(stage.id)) {
+          _diagPush('warn', `stage=${stage.id} batch #${batchNumber}: ${batchResult.deferred} record(s) deferred (FK/dependency) — they retry after all stages finish`)
+        }
+        if (CORE_DIAG_MODELS.has(stage.id) && !hasMore) {
+          await _diagStageCount(stage.id, modelName, db, agencyId)
+        }
 
         // Advance cursor and update progress (Part G: string stage cursor)
         cursor = nextCursor
@@ -1189,6 +1479,27 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
     console.warn('[InitialSync] Deferred retry pass error (non-fatal):', deferredPassErr.message)
   }
 
+  // ── Step 3d (Task 43): empty-business-stage reconciliation ─────────────
+  // The staged importer is proven healthy, but a live incident showed a
+  // workspace going READY with 0 branches/services while the cloud's own
+  // list endpoints still returned rows. Cross-check BOTH critical stages
+  // against the canonical list endpoints and import directly on a gap —
+  // and record the cloud counts so the integrity warnings below state
+  // WHICH side is empty instead of a bare "No branches imported".
+  let reconciliation = null
+  try {
+    reconciliation = await _reconcileEmptyBusinessStages(db, agencyId, cloudUrl, cloudAuthToken, effectiveSignal, emit)
+    for (const [stageName, r] of Object.entries(reconciliation)) {
+      if (r.cloudCheckError) {
+        console.warn(`[InitialSync] Reconciliation ${stageName}: cloud check failed — ${r.cloudCheckError}`)
+      } else if (r.localCount === 0 && r.cloudCount > 0 && r.reconciled > 0) {
+        console.log(`[InitialSync] Reconciliation ${stageName}: HEALED — imported ${r.reconciled} row(s) after the stage came back empty`)
+      }
+    }
+  } catch (reconErr) {
+    console.warn('[InitialSync] Reconciliation step error (non-fatal):', reconErr.message)
+  }
+
   // ── Step 4: Integrity validation ────────────────────────────────────────
   const validation = await _validateIntegrity(db, agencyId)
   if (!validation.valid) {
@@ -1215,9 +1526,27 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
   }
   // Empty collections (services/branches/counters) are EXPECTED on a freshly
   // wizard-created agency — surface them as warnings, never as failures.
+  // Task 43: when a reconciled stage is STILL empty locally, the warning now
+  // says what the cloud's canonical endpoint reported, so "no branches yet"
+  // on the desktop always tells the user which side holds the data.
   if (validation.warnings && validation.warnings.length > 0) {
-    console.warn('[InitialSync] Integrity warnings (non-fatal):', validation.warnings)
-    emit({ type: 'SYNC_WARNING', stage: 'validation', message: `Non-fatal: ${validation.warnings.join('; ')}` })
+    const enriched = validation.warnings.map((w) => {
+      if (reconciliation && w === 'No branches imported' && reconciliation.branches) {
+        const r = reconciliation.branches
+        if (r.cloudCount === 0) return 'No branches imported (the cloud also reports 0 branches for this agency — nothing to import; create branches here or in the webapp and re-login/sync)'
+        if (r.cloudCount > 0 && r.reconciled > 0) return `No branches imported by the staged pass — ${r.reconciled} branch(es) recovered via reconciliation`
+        if (r.cloudCount > 0) return `No branches imported (the cloud DOES report ${r.cloudCount} branch(es) — reconciliation could not import them; check the log)`
+      }
+      if (reconciliation && w === 'No services imported' && reconciliation.services) {
+        const r = reconciliation.services
+        if (r.cloudCount === 0) return 'No services imported (the cloud also reports 0 services for this agency — nothing to import; create services here or in the webapp and re-login/sync)'
+        if (r.cloudCount > 0 && r.reconciled > 0) return `No services imported by the staged pass — ${r.reconciled} service(s) recovered via reconciliation`
+        if (r.cloudCount > 0) return `No services imported (the cloud DOES report ${r.cloudCount} service(s) — reconciliation could not import them; check the log)`
+      }
+      return w
+    })
+    console.warn('[InitialSync] Integrity warnings (non-fatal):', enriched)
+    emit({ type: 'SYNC_WARNING', stage: 'validation', message: `Non-fatal: ${enriched.join('; ')}` })
   }
 
   // ── Step 4b: Race condition check ─────────────────────────────────────
@@ -1411,13 +1740,44 @@ function abortInitialSync() {
 
 /**
  * Get the current active sync state.
+ * Task 46: enriched with live stage/progress info from _lastProgress so the
+ * post-login loading gate can render stage names and counts.
  */
 function getActiveSyncStatus() {
   if (!_activeSync) return null
+  const p = _lastProgress && _lastProgress.agencyId === _activeSync.agencyId ? _lastProgress : null
   return {
     syncId: _activeSync.syncId,
     agencyId: _activeSync.agencyId,
     active: true,
+    startedAt: _activeSync.startedAt,
+    stage: p?.stage || null,
+    stageIndex: p?.stageIndex ?? null,
+    totalStages: p?.totalStages ?? null,
+    recordsImported: p?.count ?? null,
+    lastEventType: p?.type || null,
+    lastEventAt: p?.at || null,
+  }
+}
+
+/**
+ * Task 46: one-call snapshot of the initial-sync engine for the status and
+ * diagnostics endpoints — active run, live progress, and the [SyncDiag]
+ * ring buffer (last entries first for easy reading).
+ */
+function getInitialSyncSnapshot() {
+  return {
+    active: !!_activeSync,
+    activeSync: _activeSync
+      ? {
+          syncId: _activeSync.syncId,
+          agencyId: _activeSync.agencyId,
+          startedAt: _activeSync.startedAt,
+          stage: (_lastProgress && _lastProgress.agencyId === _activeSync.agencyId && _lastProgress.stage) || null,
+        }
+      : null,
+    lastProgress: _lastProgress,
+    diag: _diagLog.slice(-80).reverse(),
   }
 }
 
@@ -1475,7 +1835,17 @@ module.exports = {
   checkInitialSyncStatus,
   abortInitialSync,
   getActiveSyncStatus,
+  // Task 46: live snapshot (active run + last progress + [SyncDiag] ring)
+  // consumed by GET /api/sync/initial-sync/status and /api/sync/diagnostics.
+  getInitialSyncSnapshot,
   resetInitialSync,
   isAgencyReady,
+  // Task 43: exported for diagnostics/repair tooling — heals a workspace
+  // whose staged import delivered 0 branches/services while the cloud's
+  // canonical list endpoints still return rows.
+  reconcileEmptyBusinessStages: _reconcileEmptyBusinessStages,
+  // Task 46: exported for E2E harnesses/diagnostics — the REAL batch import
+  // path (transform → sanitize → upsert → FK deferral) without a cloud.
+  upsertBatch: _upsertBatch,
   SYNC_PROTOCOL_VERSION,
 }

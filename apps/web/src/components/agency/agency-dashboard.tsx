@@ -13,7 +13,6 @@ import { ErrorState } from '@/components/shared/error-state';
 import { EmptyState } from '@/components/shared/empty-state';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
-import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import {
   Dialog,
@@ -37,26 +36,18 @@ import {
   Loader2,
   Radio,
   Layers,
-  Activity,
   UserPlus,
   Volume2,
   CircleCheckBig,
   Ban,
-  Rss,
   CheckSquare,
   Square,
   X,
-  Megaphone,
   Download,
-  Plus,
-  Trash2,
-  Star,
   AlertTriangle,
-  ChevronDown,
   BarChart3,
   QrCode,
   Zap,
-  Eye,
   Lock,
   AlertCircle,
   Building2,
@@ -65,11 +56,9 @@ import {
 import { motion, useInView, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { useRef } from 'react';
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
-import { WaitTimeChart } from '@/components/agency/wait-time-chart';
-import { RatingDistribution } from '@/components/agency/rating-distribution';
-import { NoShowAnalytics } from '@/components/agency/no-show-analytics';
-import { PeakHoursAnalytics } from '@/components/agency/peak-hours-analytics';
+// Task 42-e + 46: NoShowAnalytics + PeakHoursAnalytics + WaitTimeChart +
+// RatingDistribution + activity feed removed — all deep analytics live in the
+// dedicated 'agency-analytics' sidebar section (components/agency/analytics/).
 import QRCode from 'qrcode';
 import { useRealtime } from '@/hooks/use-realtime';
 import { CounterManagement } from '@/components/agency/dashboard/counter-management';
@@ -183,32 +172,6 @@ function MiniSparkline({ data, color = 'bg-emerald-400' }: { data: number[]; col
   );
 }
 
-// ─── Activity Event ─────────────────────────────
-interface ActivityEvent {
-  id: string;
-  eventType: string;
-  eventKey: string;
-  customerName: string;
-  queueNumber: string;
-  timestamp: string;
-  serviceName?: string;
-}
-
-function getEventConfig(eventType: string) {
-  switch (eventType) {
-    case 'joined':
-      return { icon: UserPlus, color: 'bg-emerald-500', dotColor: 'bg-emerald-500', badgeClass: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400', label: 'Joined' };
-    case 'called':
-      return { icon: Volume2, color: 'bg-sky-500', dotColor: 'bg-sky-500', badgeClass: 'bg-sky-100 text-sky-700 dark:bg-sky-900/30 dark:text-sky-400', label: 'Called' };
-    case 'completed':
-      return { icon: CircleCheckBig, color: 'bg-gray-400', dotColor: 'bg-gray-400', badgeClass: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400', label: 'Done' };
-    case 'cancelled':
-      return { icon: Ban, color: 'bg-red-500', dotColor: 'bg-red-500', badgeClass: 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400', label: 'Cancelled' };
-    default:
-      return { icon: Activity, color: 'bg-gray-400', dotColor: 'bg-gray-400', badgeClass: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400', label: 'Action' };
-  }
-}
-
 // ─── Circular Progress ──────────────────────────
 function CircularProgress({ value, size = 80, strokeWidth = 6 }: { value: number; size?: number; strokeWidth?: number }) {
   const radius = (size - strokeWidth) / 2;
@@ -249,22 +212,6 @@ function CircularProgress({ value, size = 80, strokeWidth = 6 }: { value: number
   );
 }
 
-// ─── User Initials Avatar ───────────────────────
-function UserAvatar({ name, colorClass }: { name: string; colorClass: string }) {
-  const initials = name
-    .split(' ')
-    .map((n) => n[0])
-    .filter(Boolean)
-    .slice(0, 2)
-    .join('')
-    .toUpperCase();
-  return (
-    <div className={`h-7 w-7 rounded-full ${colorClass} flex items-center justify-center flex-shrink-0`}>
-      <span className="text-[10px] font-bold text-white">{initials || '?'}</span>
-    </div>
-  );
-}
-
 // ─── Section Header (unified section title) ────
 function SectionHeader({ icon: Icon, title, count, action }: { icon: any; title: string; count?: number; action?: React.ReactNode }) {
   return (
@@ -294,25 +241,10 @@ export function AgencyDashboard() {
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const [activityEvents, setActivityEvents] = useState<ActivityEvent[]>([]);
   const [batchMode, setBatchMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchLoading, setBatchLoading] = useState(false);
-  const [announcements, setAnnouncements] = useState<Array<{ id: string; message: string; createdAt: string; type?: string }>>([]);
-  const [newAnnouncement, setNewAnnouncement] = useState('');
-  const [announcementLoading, setAnnouncementLoading] = useState(false);
   const [exportLoading, setExportLoading] = useState(false);
-  const [analyticsOpen, setAnalyticsOpen] = useState(true);
-  const [serviceAnalytics, setServiceAnalytics] = useState<Array<{
-    serviceId: string;
-    serviceName: string;
-    serviceNameAr?: string;
-    serviceNameFr?: string;
-    avgWaitTime: number;
-    totalServed: number;
-    avgRating: number;
-  }>>([]);
-  const [analyticsLoading, setAnalyticsLoading] = useState(false);
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string>('');
   const [agencyCode, setAgencyCode] = useState<string>('');
   const [showQrModal, setShowQrModal] = useState(false);
@@ -324,6 +256,7 @@ export function AgencyDashboard() {
   const [ticketConfirmation, setTicketConfirmation] = useState<{ visible: boolean; ticketNumber: string; customerName: string; serviceName: string }>({ visible: false, ticketNumber: '', customerName: '', serviceName: '' });
   const [wasOffline, setWasOffline] = useState(false);
   const fetchInProgressRef = useRef(false);
+  const autoRetryCountRef = useRef(0); // Task 41 — bounded silent auto-retry
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollErrorShownRef = useRef(false); // Prevent toast spam during polling
   const currentPollMsRef = useRef(10000);
@@ -370,7 +303,7 @@ export function AgencyDashboard() {
       .catch(() => { /* silent */ });
   }, [agencyCode]);
 
-  const fetchData = useCallback(async () => {
+  const fetchData = useCallback(async (allowAutoRetry = true) => {
     if (!agencyId) {
       // No agency assigned — show setup prompt instead of error
       setLoading(false);
@@ -380,6 +313,7 @@ export function AgencyDashboard() {
     if (fetchInProgressRef.current) return;
     fetchInProgressRef.current = true;
     setFetchError(false);
+    let willAutoRetry = false;
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
 
@@ -389,29 +323,38 @@ export function AgencyDashboard() {
         fetchWithRetry(`/api/agency/stats?agencyId=${encodeURIComponent(agencyId)}`, { maxRetries: 0 }),
         fetchWithRetry(`/api/agency/queue?agencyId=${encodeURIComponent(agencyId)}&status=WAITING,CALLED`, { maxRetries: 0 }),
         fetchWithRetry(`/api/agency/services?agencyId=${encodeURIComponent(agencyId)}`, { maxRetries: 0 }),
-        fetchWithRetry(`/api/agency/activity?agencyId=${encodeURIComponent(agencyId)}`, { maxRetries: 0 }),
       ]);
 
       // Extract responses; rejected promises yield null
       const statsRes = results[0].status === 'fulfilled' ? results[0].value : null;
       const listRes = results[1].status === 'fulfilled' ? results[1].value : null;
       const servicesRes = results[2].status === 'fulfilled' ? results[2].value : null;
-      const activityRes = results[3].status === 'fulfilled' ? results[3].value : null;
 
       // Only fatal if EVERY section failed
-      const anySuccess = [statsRes, listRes, servicesRes, activityRes].some(r => r?.ok);
+      const anySuccess = [statsRes, listRes, servicesRes].some(r => r?.ok);
       if (!anySuccess) {
+        // Task 41 — bounded SILENT auto-retry. Brief transient windows (token
+        // rotation catch-up after import-session, local DB warming at boot →
+        // 503, cloud blip during login) used to surface the full
+        // "data loading failed" ErrorState on first paint. Keep the loading
+        // state and retry quietly up to twice before showing the error UI.
+        const attempt = autoRetryCountRef.current;
+        const statuses = results.map((r, i) =>
+          r.status === 'rejected' ? `${['stats','queue','services'][i]}:ERR` : `${['stats','queue','services'][i]}:${r.value?.status}`
+        ).join(' ');
+        if (allowAutoRetry && attempt < 2) {
+          autoRetryCountRef.current = attempt + 1;
+          willAutoRetry = true;
+          console.warn(`[Dashboard] all section fetches failed (${statuses}) — auto-retry ${attempt + 1}/2 in 1.5s`);
+          setTimeout(() => {
+            fetchInProgressRef.current = false;
+            fetchData(true);
+          }, 1500);
+          return;
+        }
+        console.warn(`[Dashboard] all section fetches failed after auto-retries (${statuses}) — showing error state`);
         setFetchError(true);
         if (!pollErrorShownRef.current) {
-          // Log individual failures for debugging
-          const sections = ['stats', 'queue', 'services', 'activity'];
-          results.forEach((r, i) => {
-            if (r.status === 'rejected') {
-              console.warn(`[Dashboard] ${sections[i]} fetch rejected:`, r.reason);
-            } else if (r.value && !r.value.ok) {
-              console.warn(`[Dashboard] ${sections[i]} returned ${r.value.status}:`, r.value.statusText);
-            }
-          });
           toast.error(t('error'));
           pollErrorShownRef.current = true;
         }
@@ -439,11 +382,8 @@ export function AgencyDashboard() {
           );
         }
       }
-      if (activityRes?.ok) {
-        const data = await activityRes.json();
-        setActivityEvents(data.events ?? []);
-      }
       setLastUpdated(new Date());
+      autoRetryCountRef.current = 0; // Task 41 — success resets the auto-retry budget
       pollErrorShownRef.current = false; // Reset on success so next poll failure can toast once
     } catch {
       // This catch is a safety net for truly unexpected errors (e.g. dynamic import failure).
@@ -454,8 +394,10 @@ export function AgencyDashboard() {
         pollErrorShownRef.current = true;
       }
     } finally {
-      setLoading(false);
       fetchInProgressRef.current = false;
+      // Task 41 — while a silent auto-retry is pending, keep the loading
+      // skeletons up instead of flashing an empty dashboard or the error UI.
+      if (!willAutoRetry) setLoading(false);
     }
   }, [agencyId]);
 
@@ -582,21 +524,9 @@ export function AgencyDashboard() {
     setSelectedIds(new Set());
   };
 
-  const fetchAnnouncements = useCallback(async () => {
-    if (!agencyId) return;
-    try {
-      const res = await apiFetch(`/api/agency/announcements?agencyId=${encodeURIComponent(agencyId)}`);
-      if (res.ok) {
-        const data = await res.json();
-        setAnnouncements(data.announcements ?? []);
-      }
-    } catch { /* silent */ }
-  }, [agencyId]);
-
   // Adaptive polling: starts at 10s, backs off to 30s on 429 rate limits
   useEffect(() => {
     fetchData();
-    fetchAnnouncements();
     fetchAgencyCode();
 
     const scheduleNextPoll = () => {
@@ -612,7 +542,7 @@ export function AgencyDashboard() {
     return () => {
       if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
     };
-  }, [fetchData, fetchAnnouncements, fetchAgencyCode, agencyId]);
+  }, [fetchData, fetchAgencyCode, agencyId]);
 
   // Watch for 429 responses and back off polling
   useEffect(() => {
@@ -656,10 +586,9 @@ export function AgencyDashboard() {
     // (small buffer to ensure the flag has actually expired).
     const timer = setTimeout(() => {
       fetchData();
-      fetchAnnouncements();
     }, 31_000);
     return () => clearTimeout(timer);
-  }, [isBothUnreachable(), fetchData, fetchAnnouncements]);
+  }, [isBothUnreachable(), fetchData]);
 
   // ─── Realtime: Join agency room for instant updates ──────────────────
   useEffect(() => {
@@ -693,60 +622,6 @@ export function AgencyDashboard() {
       unsubscribers.forEach(unsub => unsub());
     };
   }, [realtime, fetchData]);
-
-  const handleCreateAnnouncement = async () => {
-    if (!newAnnouncement.trim() || !agencyId) return;
-    setAnnouncementLoading(true);
-    try {
-      const res = await apiFetch(`/api/agency/announcements`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agencyId, message: newAnnouncement.trim() }),
-      });
-      if (res.ok) {
-        setNewAnnouncement('');
-        toast.success(t('announcementCreated') || 'Announcement created');
-        fetchAnnouncements();
-      } else {
-        const data = await res.json();
-        toast.error(data.error || t('error'));
-      }
-    } catch {
-      toast.error(t('error'));
-    } finally {
-      setAnnouncementLoading(false);
-    }
-  };
-
-  const handleDeleteAnnouncement = async (id: string) => {
-    if (!agencyId) return;
-    try {
-      const res = await apiFetch(`/api/agency/announcements?id=${id}`, {
-        method: 'DELETE',
-      });
-      if (res.ok) {
-        toast.success(t('announcementDeleted') || 'Announcement deleted');
-        fetchAnnouncements();
-      }
-    } catch {
-      toast.error(t('error'));
-    }
-  };
-
-  const fetchServiceAnalytics = useCallback(async () => {
-    if (!agencyId) return;
-    setAnalyticsLoading(true);
-    try {
-      const res = await apiFetch(`/api/agency/analytics?agencyId=${encodeURIComponent(agencyId)}`);
-      if (res.ok) {
-        const data = await res.json();
-        setServiceAnalytics(data.services ?? []);
-      }
-    } catch { /* silent */ }
-    finally {
-      setAnalyticsLoading(false);
-    }
-  }, [agencyId]);
 
   const handleExportCsv = async () => {
     if (!agencyId) return;
@@ -827,12 +702,6 @@ export function AgencyDashboard() {
     return s.name;
   };
 
-  const getAnalyticsServiceName = (s: { serviceName: string; serviceNameAr?: string; serviceNameFr?: string }) => {
-    if (lang === 'ar' && s.serviceNameAr) return s.serviceNameAr;
-    if (lang === 'fr' && s.serviceNameFr) return s.serviceNameFr;
-    return s.serviceName;
-  };
-
   const formatTime = (dateStr: string) => {
     try {
       return new Date(dateStr).toLocaleTimeString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US', {
@@ -848,12 +717,6 @@ export function AgencyDashboard() {
   const served = stats?.servedToday ?? 0;
   const noShows = stats?.noShowCount ?? 0;
   const cancelled = stats?.cancelledCount ?? 0;
-  const totalProcessed = served + noShows + cancelled;
-  const completionRate = totalProcessed > 0 ? (served / totalProcessed) * 100 : 0;
-  const safeCompletionRate = isNaN(completionRate) ? 0 : completionRate;
-
-  // Max waiting count for service breakdown bars
-  const maxWaiting = serviceStats.length > 0 ? Math.max(...serviceStats.map(s => s.waitingCount), 1) : 1;
 
   // Queue progress calculation
   const totalToday = stats?.todayReservations ?? 0;
@@ -1020,7 +883,7 @@ export function AgencyDashboard() {
             <Button
               variant="ghost"
               size="icon"
-              onClick={fetchData}
+              onClick={() => fetchData()}
               className="h-8 w-8"
             >
               <RefreshCw className="h-4 w-4" />
@@ -1652,546 +1515,6 @@ export function AgencyDashboard() {
             t={t as any}
           />
         </div>
-      </section>
-
-      {/* ═══ SECTION 6: PERFORMANCE ═══ */}
-      <section>
-        <SectionHeader icon={Activity} title={t('performance') || 'Performance'} />
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-          {/* Left: Service Breakdown */}
-          <motion.div
-            initial={{ opacity: 0, y: 15 }}
-            animate={isInView ? { opacity: 1, y: 0 } : {}}
-            transition={{ delay: 0.15 }}
-          >
-            <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50 h-full overflow-hidden">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <div className="h-7 w-7 rounded-lg bg-gradient-to-br from-emerald-500 to-teal-500 flex items-center justify-center">
-                    <Layers className="h-3.5 w-3.5 text-white" />
-                  </div>
-                  {t('serviceDistribution') as string}
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="pt-0">
-                {serviceStats.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center py-6 text-center text-muted-foreground">
-                    <Layers className="h-8 w-8 text-emerald-400 mb-2" />
-                    <p className="text-sm text-muted-foreground">{t('noServiceEntries') as string}</p>
-                  </div>
-                ) : (
-                  <div className="space-y-3.5 max-h-80 overflow-y-auto custom-scrollbar">
-                    {serviceStats.map((service, idx) => {
-                      const barWidth = maxWaiting > 0 ? (service.waitingCount / maxWaiting) * 100 : 0;
-                      const completionPct = (service.waitingCount + service.completedCount) > 0
-                        ? (service.completedCount / (service.waitingCount + service.completedCount)) * 100
-                        : 0;
-                      const isMostPopular = idx === 0 && service.waitingCount > 0;
-                      // Assign gradient colors by index: emerald, teal, cyan, repeating
-                      const gradients = [
-                        'from-emerald-500 to-emerald-400',
-                        'from-teal-500 to-teal-400',
-                        'from-cyan-500 to-cyan-400',
-                        'from-emerald-400 to-teal-400',
-                        'from-teal-400 to-cyan-400',
-                      ];
-                      const barGradient = gradients[idx % gradients.length];
-                      return (
-                        <motion.div
-                          key={service.id}
-                          initial={{ opacity: 0, x: -10 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          transition={{ delay: idx * 0.06, type: 'spring', stiffness: 180, damping: 20 }}
-                          className="space-y-1.5"
-                        >
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-1.5 min-w-0">
-                              <span className="font-medium text-sm text-foreground truncate max-w-[55%]">
-                                {getServiceDisplayName(service)}
-                              </span>
-                              {isMostPopular && (
-                                <Badge className="text-[8px] px-1.5 py-0 h-4 bg-gradient-to-r from-emerald-500 to-teal-500 text-white border-0">
-                                  {t('mostPopular') as string}
-                                </Badge>
-                              )}
-                            </div>
-                            <div className="flex items-center gap-2 text-xs text-muted-foreground flex-shrink-0">
-                              <span className="font-semibold bg-gradient-to-r from-emerald-600 to-teal-600 dark:from-emerald-400 dark:to-teal-400 bg-clip-text text-transparent">
-                                {service.waitingCount} {t('waiting')}
-                              </span>
-                              <span className="text-xs opacity-50">
-                                {Math.round(completionPct)}%
-                              </span>
-                            </div>
-                          </div>
-                          <div className="h-3 w-full rounded-full bg-gray-100 dark:bg-gray-800 overflow-hidden">
-                            <motion.div
-                              initial={{ width: 0 }}
-                              animate={{ width: `${Math.max(barWidth, 2)}%` }}
-                              transition={{ duration: 0.7, delay: idx * 0.08, ease: 'easeOut' }}
-                              className={`h-full rounded-full bg-gradient-to-r ${barGradient}`}
-                            />
-                          </div>
-                        </motion.div>
-                      );
-                    })}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          </motion.div>
-
-          {/* Right: Performance Overview glass card */}
-          <motion.div
-            initial={{ opacity: 0, y: 15 }}
-            animate={isInView ? { opacity: 1, y: 0 } : {}}
-            transition={{ delay: 0.3 }}
-          >
-            <div className="relative overflow-hidden rounded-2xl bg-gradient-to-br from-emerald-600/90 via-teal-600/90 to-cyan-600/90 p-4 sm:p-5 text-white shadow-lg shadow-emerald-500/20 backdrop-blur-xl border border-white/10 h-full">
-              {/* Decorative circles */}
-              <div className="absolute top-0 end-0 h-24 w-24 rounded-full bg-white/10 -translate-y-8 translate-x-8" />
-              <div className="absolute bottom-0 start-0 h-16 w-16 rounded-full bg-white/5 translate-y-6 -translate-x-6" />
-              <div className="relative">
-                <div className="flex items-center gap-2 mb-3">
-                  <Activity className="h-3.5 w-3.5 text-emerald-200" />
-                  <p className="text-xs font-semibold text-emerald-100">{t('performanceMetrics')}</p>
-                </div>
-                <div className="grid grid-cols-2 gap-3">
-                  {/* Avg Rating */}
-                  <div className="bg-white/15 backdrop-blur-sm rounded-xl p-3">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <Star className="h-3.5 w-3.5 text-amber-300" />
-                      <span className="text-[10px] text-emerald-200">{t('avgRatingStat')}</span>
-                    </div>
-                    <p className="text-2xl font-bold">{(stats?.avgRating ?? 0).toFixed(1)}</p>
-                    <div className="flex items-center gap-0.5 mt-1">
-                      {[1, 2, 3, 4, 5].map((s) => (
-                        <Star
-                          key={s}
-                          className={`h-3 w-3 ${s <= Math.round(stats?.avgRating ?? 0) ? 'text-amber-300 fill-amber-300' : 'text-white/30'}`}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                  {/* Total Ratings */}
-                  <div className="bg-white/15 backdrop-blur-sm rounded-xl p-3">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <Users className="h-3.5 w-3.5 text-emerald-200" />
-                      <span className="text-[10px] text-emerald-200">{t('totalRatingsStat')}</span>
-                    </div>
-                    <p className="text-2xl font-bold">{stats?.totalRatings ?? 0}</p>
-                    <p className="text-[10px] text-emerald-300/70 mt-1">{t('totalRatings')}</p>
-                  </div>
-                  {/* Completion Rate */}
-                  <div className="bg-white/15 backdrop-blur-sm rounded-xl p-3">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-200" />
-                      <span className="text-[10px] text-emerald-200">{t('completionRateStat')}</span>
-                    </div>
-                    <p className="text-2xl font-bold">{safeCompletionRate.toFixed(0)}%</p>
-                    <div className="h-1.5 w-full rounded-full bg-white/20 mt-1.5 overflow-hidden">
-                      <motion.div
-                        initial={{ width: 0 }}
-                        animate={{ width: `${Math.min(safeCompletionRate, 100)}%` }}
-                        transition={{ duration: 1, ease: 'easeOut' }}
-                        className="h-full rounded-full bg-gradient-to-r from-emerald-300 to-cyan-300"
-                      />
-                    </div>
-                  </div>
-                  {/* No-Show Rate */}
-                  <div className="bg-white/15 backdrop-blur-sm rounded-xl p-3">
-                    <div className="flex items-center gap-1.5 mb-1">
-                      <AlertTriangle className="h-3.5 w-3.5 text-amber-200" />
-                      <span className="text-[10px] text-emerald-200">{t('noShowRateStat')}</span>
-                    </div>
-                    <p className="text-2xl font-bold">{stats?.noShowRate ?? 0}%</p>
-                    <p className="text-[10px] text-emerald-300/70 mt-1">{t('noShowRate')}</p>
-                  </div>
-                </div>
-                {/* Legend for completion rate color thresholds */}
-                <div className="flex flex-wrap gap-3 mt-3 pt-3 border-t border-white/10">
-                  <div className="flex items-center gap-1.5 text-[10px] text-emerald-100/80">
-                    <span className="h-2.5 w-2.5 rounded-full bg-emerald-300" />
-                    &gt; 80%
-                  </div>
-                  <div className="flex items-center gap-1.5 text-[10px] text-emerald-100/80">
-                    <span className="h-2.5 w-2.5 rounded-full bg-amber-300" />
-                    50-80%
-                  </div>
-                  <div className="flex items-center gap-1.5 text-[10px] text-emerald-100/80">
-                    <span className="h-2.5 w-2.5 rounded-full bg-red-300" />
-                    &lt; 50%
-                  </div>
-                  <div className="ms-auto text-[10px] text-emerald-100/60">
-                    {t('servedToday')}: {served} · {t('noShowRate')}: {noShows} · {t('cancelled')}: {cancelled}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </motion.div>
-        </div>
-      </section>
-
-      {/* ═══ SECTION 7: CHARTS ═══ */}
-      <section>
-        <SectionHeader icon={BarChart3} title={t('charts') || 'Charts'} />
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-          <motion.div
-            initial={{ opacity: 0, y: 15 }}
-            animate={isInView ? { opacity: 1, y: 0 } : {}}
-            transition={{ delay: 0.35 }}
-          >
-            <WaitTimeChart
-              data={(stats?.hourlyWaitTime ?? []).map((val: number, hour: number) => ({
-                hour,
-                avgWaitTime: typeof val === 'number' ? val : (val as any)?.avgWaitTime ?? 0,
-                servedCount: 0,
-              }))}
-              currentHour={new Date().getHours()}
-            />
-          </motion.div>
-          <motion.div
-            initial={{ opacity: 0, y: 15 }}
-            animate={isInView ? { opacity: 1, y: 0 } : {}}
-            transition={{ delay: 0.4 }}
-          >
-            <RatingDistribution
-              ratings={(stats?.ratingDistribution ?? []).map((count: number, i: number) => ({
-                rating: i + 1,
-                count: typeof count === 'number' ? count : (count as any)?.count ?? 0,
-              }))}
-              averageRating={stats?.avgRating}
-              totalRatings={stats?.totalRatings}
-            />
-          </motion.div>
-        </div>
-      </section>
-
-      {/* ═══ SECTION 8: ACTIVITY & TOOLS ═══ */}
-      <section>
-        <SectionHeader icon={Activity} title={t('activityTools') || 'Activity & Tools'} />
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
-          {/* Left (2/3): Recent Activity feed (richer version with avatars) */}
-          <motion.div
-            initial={{ opacity: 0, y: 15 }}
-            animate={isInView ? { opacity: 1, y: 0 } : {}}
-            transition={{ delay: 0.15 }}
-            className="lg:col-span-2"
-          >
-            <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50 h-full">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <Rss className="h-4 w-4 text-emerald-600" />
-                  {t('recentActivity')}
-                  <motion.span
-                    animate={{ opacity: [1, 0.3, 1] }}
-                    transition={{ duration: 2, repeat: Infinity , ease: 'easeInOut' }}
-                    className="flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400 ms-auto"
-                  >
-                    <span className="h-2 w-2 rounded-full bg-emerald-500 inline-block" />
-                    {t('live')}
-                  </motion.span>
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="pt-0">
-                {activityEvents.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center py-6 text-center text-muted-foreground">
-                    <Activity className="h-8 w-8 text-emerald-400 mb-2" />
-                    <p className="text-sm text-muted-foreground">{t('noRecentActivity')}</p>
-                  </div>
-                ) : (
-                  <div className="relative space-y-0 max-h-80 overflow-y-auto custom-scrollbar">
-                    {/* Timeline line */}
-                    <div className="absolute start-[15px] top-2 bottom-2 w-px bg-border" />
-                    {activityEvents.map((event, idx) => {
-                      const config = getEventConfig(event.eventType);
-                      const timeAgoStr = (() => {
-                        const diff = Math.floor((Date.now() - new Date(event.timestamp).getTime()) / 1000);
-                        if (diff < 60) return t('justNow');
-                        if (diff < 3600) return `${Math.floor(diff / 60)} ${t('min')}`;
-                        if (diff < 86400) return `${Math.floor(diff / 3600)} ${t('hours')}`;
-                        return `${Math.floor(diff / 86400)} ${t('date')}`;
-                      })();
-                      const label = (t(event.eventKey as 'customerJoinedQueue') || event.eventKey).replace('{name}', event.customerName);
-
-                      return (
-                        <motion.div
-                          key={event.id}
-                          initial={{ opacity: 0, x: -10 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          transition={{ delay: idx * 0.05 }}
-                          className="relative flex items-start gap-3 pb-4 last:pb-0"
-                        >
-                          {/* User avatar with initials */}
-                          <UserAvatar name={event.customerName} colorClass={config.color} />
-
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <p className="text-sm text-foreground leading-snug">{label}</p>
-                              <Badge className={`text-[9px] px-1.5 py-0 h-4 ${config.badgeClass}`}>
-                                {config.label}
-                              </Badge>
-                            </div>
-                            <div className="flex items-center gap-2 mt-0.5">
-                              <span className="text-[10px] text-muted-foreground font-mono">#{event.queueNumber}</span>
-                              {event.serviceName && (
-                                <span className="text-[10px] text-muted-foreground">· {event.serviceName}</span>
-                              )}
-                              <span className="text-[10px] text-muted-foreground">· {timeAgoStr}</span>
-                            </div>
-                          </div>
-                        </motion.div>
-                      );
-                    })}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          </motion.div>
-
-          {/* Right (1/3): Tools card — QR Code display + Announcements combined */}
-          <motion.div
-            initial={{ opacity: 0, y: 15 }}
-            animate={isInView ? { opacity: 1, y: 0 } : {}}
-            transition={{ delay: 0.2 }}
-          >
-            <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50 h-full">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <QrCode className="h-4 w-4 text-emerald-600" />
-                  {t('qrCodeAgency')}
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="pt-0 space-y-3">
-                {/* Small QR with View Full QR button */}
-                <div className="flex flex-col items-center justify-center">
-                  {qrCodeDataUrl ? (
-                    <motion.div
-                      initial={{ opacity: 0, scale: 0.8 }}
-                      animate={{ opacity: 1, scale: 1 }}
-                      transition={{ duration: 0.5 }}
-                      className="relative"
-                    >
-                      <div className="p-2 rounded-2xl bg-white shadow-inner border border-gray-100 dark:border-gray-700">
-                        <img
-                          src={qrCodeDataUrl}
-                          alt={t('qrCodeAgency')}
-                          className="h-32 w-32"
-                        />
-                      </div>
-                      {/* Decorative glow */}
-                      <div className="absolute -inset-2 rounded-3xl bg-emerald-500/5 -z-10 blur-sm" />
-                    </motion.div>
-                  ) : (
-                    <div className="h-32 w-32 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center">
-                      <QrCode className="h-12 w-12 text-gray-300 dark:text-gray-600" />
-                    </div>
-                  )}
-                  {agencyCode && (
-                    <div className="mt-2 text-center">
-                      <Badge variant="secondary" className="text-xs font-mono px-2.5 py-1">
-                        {agencyCode}
-                      </Badge>
-                      <p className="text-[10px] text-muted-foreground mt-1.5">{t('qrCodeScanHint')}</p>
-                    </div>
-                  )}
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="mt-2 h-8 rounded-lg gap-1.5 text-xs"
-                    onClick={() => setShowQrModal(true)}
-                  >
-                    <Eye className="h-3.5 w-3.5" />
-                    {t('viewQrCode')}
-                  </Button>
-                </div>
-
-                {/* Divider */}
-                <div className="border-t border-border" />
-
-                {/* Announcements */}
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <p className="text-xs font-semibold text-muted-foreground flex items-center gap-1.5">
-                      <Megaphone className="h-3.5 w-3.5" />
-                      {t('announcements')}
-                    </p>
-                    <Badge variant="secondary" className="text-xs">{announcements.length}</Badge>
-                  </div>
-                  {/* Create new announcement */}
-                  <div className="flex gap-2 mb-2">
-                    <Textarea
-                      value={newAnnouncement}
-                      onChange={(e) => setNewAnnouncement(e.target.value)}
-                      placeholder={t('announcementPlaceholder') || 'Write an announcement...'}
-                      className="min-h-[60px] text-sm rounded-xl border-border resize-none"
-                      rows={2}
-                    />
-                    <Button
-                      size="sm"
-                      onClick={handleCreateAnnouncement}
-                      disabled={!newAnnouncement.trim() || announcementLoading}
-                      className="self-end h-9 px-3 rounded-xl gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-xs"
-                    >
-                      {announcementLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
-                    </Button>
-                  </div>
-                  {/* Announcements list */}
-                  {announcements.length === 0 ? (
-                    <div className="flex flex-col items-center justify-center py-3 text-center text-muted-foreground">
-                      <Megaphone className="h-6 w-6 text-emerald-400 mb-1 opacity-70" />
-                      <p className="text-xs text-muted-foreground">{t('noAnnouncements')}</p>
-                    </div>
-                  ) : (
-                    <div className="space-y-2 max-h-80 overflow-y-auto custom-scrollbar">
-                      <AnimatePresence>
-                        {announcements.map((a) => (
-                          <motion.div
-                            key={a.id}
-                            initial={{ opacity: 0, x: -10 }}
-                            animate={{ opacity: 1, x: 0 }}
-                            exit={{ opacity: 0, x: 10 }}
-                            className="flex items-start gap-2 p-2 rounded-xl bg-gradient-to-r from-amber-50 to-orange-50 dark:from-amber-900/10 dark:to-orange-900/10 border border-amber-100 dark:border-amber-900/20 group"
-                          >
-                            <div className="h-7 w-7 rounded-lg bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center flex-shrink-0 mt-0.5">
-                              <Megaphone className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400" />
-                            </div>
-                            <div className="flex-1 min-w-0">
-                              <p className="text-xs text-foreground leading-relaxed">{a.message}</p>
-                              <p className="text-[10px] text-muted-foreground mt-0.5">
-                                {new Date(a.createdAt).toLocaleDateString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US', {
-                                  month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-                                })}
-                              </p>
-                            </div>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-6 w-6 p-0 text-muted-foreground hover:text-red-600 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0"
-                              onClick={() => handleDeleteAnnouncement(a.id)}
-                            >
-                              <Trash2 className="h-3 w-3" />
-                            </Button>
-                          </motion.div>
-                        ))}
-                      </AnimatePresence>
-                    </div>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          </motion.div>
-        </div>
-      </section>
-
-      {/* ═══ SECTION 9: ADVANCED ANALYTICS (Collapsible) ═══ */}
-      <section>
-        <Collapsible open={analyticsOpen} onOpenChange={(open) => { setAnalyticsOpen(open); if (open) fetchServiceAnalytics(); }}>
-          <CollapsibleTrigger asChild>
-            <button className="flex items-center justify-between gap-3 w-full mb-3 group">
-              <div className="flex items-center gap-2">
-                <div className="h-8 w-8 rounded-lg bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center flex-shrink-0">
-                  <BarChart3 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                </div>
-                <h2 className="text-base font-bold text-foreground">{t('advancedAnalytics') || 'Advanced Analytics'}</h2>
-              </div>
-              <motion.div animate={{ rotate: analyticsOpen ? 180 : 0 }} transition={{ duration: 0.2 }}>
-                <ChevronDown className="h-5 w-5 text-muted-foreground group-hover:text-foreground transition-colors" />
-              </motion.div>
-            </button>
-          </CollapsibleTrigger>
-          <CollapsibleContent className="space-y-3">
-            {/* Service Analytics table */}
-            <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <BarChart3 className="h-4 w-4 text-emerald-600" />
-                  {t('serviceAnalytics')}
-                  <Badge variant="secondary" className="text-[10px] px-1.5">{t('last7Days')}</Badge>
-                </CardTitle>
-                <p className="text-xs text-muted-foreground mt-1">{t('serviceAnalyticsDesc')}</p>
-              </CardHeader>
-              <CardContent className="pt-0">
-                {analyticsLoading ? (
-                  <div className="flex items-center justify-center py-6">
-                    <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
-                  </div>
-                ) : serviceAnalytics.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center py-6 text-center text-muted-foreground">
-                    <BarChart3 className="h-8 w-8 text-emerald-400 mb-2" />
-                    <p className="text-sm text-muted-foreground">{t('noAnalyticsForPeriod')}</p>
-                  </div>
-                ) : (
-                  <div className="overflow-x-auto custom-scrollbar">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="border-b border-border">
-                          <th className="text-start py-2.5 px-3 text-xs font-semibold text-muted-foreground">{t('serviceName')}</th>
-                          <th className="text-center py-2.5 px-3 text-xs font-semibold text-muted-foreground">{t('avgWaitTimePerService')}</th>
-                          <th className="text-center py-2.5 px-3 text-xs font-semibold text-muted-foreground">{t('totalServed')}</th>
-                          <th className="text-center py-2.5 px-3 text-xs font-semibold text-muted-foreground">{t('avgRatingPerService')}</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {serviceAnalytics.map((s, idx) => (
-                          <tr key={s.serviceId} className={idx % 2 === 0 ? 'bg-gray-50/50 dark:bg-gray-800/20' : ''}>
-                            <td className="py-2.5 px-3 font-medium text-foreground">{getAnalyticsServiceName(s)}</td>
-                            <td className="py-2.5 px-3 text-center">
-                              <span className="inline-flex items-center gap-1">
-                                <Clock className="h-3 w-3 text-amber-500" />
-                                <span className="font-semibold text-amber-700 dark:text-amber-400">{s.avgWaitTime ?? 0} {t('min')}</span>
-                              </span>
-                            </td>
-                            <td className="py-2.5 px-3 text-center">
-                              <span className="inline-flex items-center gap-1">
-                                <Users className="h-3 w-3 text-emerald-500" />
-                                <span className="font-semibold">{s.totalServed ?? 0}</span>
-                              </span>
-                            </td>
-                            <td className="py-2.5 px-3 text-center">
-                              <span className="inline-flex items-center gap-1">
-                                <Star className="h-3 w-3 text-amber-500" />
-                                <span className="font-semibold">{(s.avgRating ?? 0) > 0 ? (s.avgRating ?? 0).toFixed(1) : '—'}</span>
-                              </span>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-
-            {/* No-Show Analytics */}
-            <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <UserX className="h-4 w-4 text-rose-500" />
-                  {t('noShowAnalytics')}
-                  <Badge variant="secondary" className="text-[10px] px-1.5">{t('last30Days')}</Badge>
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="pt-0">
-                <NoShowAnalytics agencyId={agencyId} />
-              </CardContent>
-            </Card>
-
-            {/* Peak Hours Analytics */}
-            <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50">
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <Zap className="h-4 w-4 text-orange-500" />
-                  {t('peakHours')}
-                  <Badge variant="secondary" className="text-[10px] px-1.5">{t('last30Days')}</Badge>
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="pt-0">
-                <PeakHoursAnalytics agencyId={agencyId} />
-              </CardContent>
-            </Card>
-          </CollapsibleContent>
-        </Collapsible>
       </section>
 
       {/* ═══ MODALS ═══ */}

@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { useAppStore } from '@/store/use-app-store';
+import { unwrapListPayload } from '@/lib/list-payload';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -54,10 +55,12 @@ import {
   Crown,
   Lock,
   RefreshCw,
+  AlertTriangle,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
+import { getApiBaseUrl, isElectronRuntime } from '@/lib/api-client';
 import { useSubscriptionActive } from '@/hooks/use-subscription';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 
@@ -74,6 +77,32 @@ interface Branch {
   agencyId: string;
   createdAt: string;
   _count?: { counters: number; staff: number };
+}
+
+// Task 40 (round 4): the recurring "branches created but the desktop shows
+// none" report traced every time to the renderer talking to a STALE embedded
+// local API (an old installed bundle, or an old tray-resident instance that
+// still owns :3080). The current local API answers /api/health with a build
+// identity (service + version — Task 42). Probe it once on Electron and warn
+// inline when the running server predates the first build carrying every
+// branch-list fix, so the exact screen with the symptom self-identifies the
+// stale server instead of showing a misleading "no branches yet".
+//
+// Task 45: raised to 0.3.0 — the first build carrying the Task 44 batch
+// (READY-workspace empty-core self-heal, explicit cloud sync-capture,
+// deterministic agency resolvers). Every fix before this shipped while the
+// package version stayed 0.2.1, which made a pre-fix :3080 INDISTINGUISHABLE
+// from a current one — the exact reason "restart the app" kept failing to
+// verify. A 0.2.1 server is now flagged stale by name.
+const MIN_LOCAL_API_VERSION = '0.3.0';
+
+function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = b.split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
+  }
+  return 0;
 }
 
 interface CounterWithStaff {
@@ -151,8 +180,97 @@ export function AgencyBranches() {
   const [togglingBranchId, setTogglingBranchId] = useState<string | null>(null);
   const [togglingCounterId, setTogglingCounterId] = useState<string | null>(null);
 
-  const fetchBranches = useCallback(async () => {
-    if (!agencyId) return;
+  // Stale-local-API awareness (see MIN_LOCAL_API_VERSION note). null = probe
+  // still running / not Electron / probe failed — never blocks the UI, and a
+  // server that is simply DOWN is surfaced by the load error path instead.
+  const [localApiStale, setLocalApiStale] = useState<{ version: string | null } | null>(null);
+
+  // Task 45: post-create consistency verification. When a create returns 201
+  // the row MUST appear in the very next list fetch of the SAME server (the
+  // local write + outbox row commit atomically — proven by the Task 45 HTTP
+  // harness). If it does NOT, the renderer is talking to a server whose
+  // behavior diverges from its own create — an old/mismatched :3080 instance.
+  // Instead of the historical silent "no branches yet", say exactly that,
+  // enriched with the server's workspace identity (Task 45 /api/health).
+  const pendingVerifyIdRef = useRef<string | null>(null);
+  const divergenceNameRef = useRef<string>('');
+  const [createDivergence, setCreateDivergence] = useState<{
+    createdName: string;
+    serverBranchCount: number | null;
+    serverAgencyId: string | null;
+    serverStatus: string | null;
+  } | null>(null);
+
+  // Task 45: enrich the divergence alert with the server's own view of the
+  // workspace (/api/health workspace identity — Task 45). Server simply old
+  // (no workspace field) → nulls; the alert text degrades gracefully.
+  const probeWorkspaceForDivergence = useCallback(async () => {
+    if (!isElectronRuntime()) return;
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3500);
+      const res = await fetch(`${getApiBaseUrl()}/api/health`, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) return; // keep the alert with unknown server detail
+      const data = await res.json().catch(() => null);
+      const ws = data && typeof data === 'object'
+        ? (data as { workspace?: { agencyId?: string; status?: string; branchCount?: number } }).workspace
+        : undefined;
+      if (!ws || typeof ws !== 'object') return;
+      setCreateDivergence((prev) => prev
+        ? {
+            ...prev,
+            serverBranchCount: typeof ws.branchCount === 'number' ? ws.branchCount : null,
+            serverAgencyId: typeof ws.agencyId === 'string' ? ws.agencyId : null,
+            serverStatus: typeof ws.status === 'string' ? ws.status : null,
+          }
+        : prev);
+    } catch { /* keep the alert with unknown server detail */ }
+  }, []);
+
+  useEffect(() => {
+    if (!isElectronRuntime()) return;
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    fetch(`${getApiBaseUrl()}/api/health`, { signal: controller.signal })
+      .then(async (res) => {
+        if (!res.ok) return null;
+        return res.json().catch(() => null);
+      })
+      .then((data: { service?: string; version?: string | null } | null) => {
+        if (cancelled || !data || typeof data !== 'object') return;
+        const version = typeof data.version === 'string' ? data.version : null;
+        // A server that answers but carries NO version identity predates the
+        // Task 42 build stamp — stale. A version older than the first build
+        // with every branch-list fix is stale too. Anything else is current.
+        if (data.service === 'blasti-local-api' && version && compareSemver(version, MIN_LOCAL_API_VERSION) >= 0) {
+          return;
+        }
+        setLocalApiStale({ version });
+      })
+      .catch(() => {
+        /* server unreachable / aborted — other flows already surface that */
+      })
+      .finally(() => clearTimeout(timer));
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, []);
+
+  const fetchBranches = useCallback(async (): Promise<Branch[]> => {
+    if (!agencyId) {
+      // Task 40: a user object without agencyId (stale session snapshot from
+      // an older build, or a cloud login whose response predates the local
+      // agency hydration) used to leave `loading` true forever — an endless
+      // skeleton — or, after other state churn, an unexplained "no branches
+      // yet". Surface an actionable error with a retry instead.
+      setBranches([]);
+      setLoadError(t('agencyNotLinked'));
+      setLoading(false);
+      return [];
+    }
     setLoading(true);
     try {
       const res = await apiFetch(`/api/agency/branches?agencyId=${agencyId}`);
@@ -162,8 +280,31 @@ export function AgencyBranches() {
         // older local-API builds returned the legacy { data } key. Reading
         // only data.branches structurally emptied the desktop branch list
         // (and with it the staff dialog's branch selector) against stale builds.
-        setBranches(data.branches ?? data.data ?? []);
+        // Task 45 root cause: apiClient's parseResponse auto-unwrap collapses
+        // the local dual envelope { success, branches, data } to the RAW ARRAY
+        // before this reader runs — `data.branches ?? data.data` on an array
+        // was ALWAYS [] (the desktop's permanent "no branches yet"). Accept
+        // every observable envelope outcome instead.
+        const rows: Branch[] = unwrapListPayload<Branch>(data, ['branches']);
+        setBranches(rows);
         setLoadError(null);
+
+        // Task 45: verify a just-created branch actually landed in the list
+        // served by this server. The ref stays set until the row shows up, so
+        // manual retries re-verify and the alert auto-clears when healed.
+        const verifyId = pendingVerifyIdRef.current;
+        if (verifyId) {
+          if (rows.some((b) => b.id === verifyId)) {
+            pendingVerifyIdRef.current = null;
+            setCreateDivergence(null);
+          } else {
+            setCreateDivergence((prev) =>
+              prev ?? { createdName: divergenceNameRef.current, serverBranchCount: null, serverAgencyId: null, serverStatus: null },
+            );
+            void probeWorkspaceForDivergence();
+          }
+        }
+        return rows;
       } else {
         // Task 37-a: a non-ok response used to be swallowed silently — the
         // page rendered an EMPTY list (the exact "branch created on the
@@ -174,11 +315,13 @@ export function AgencyBranches() {
         setBranches([]);
         setLoadError(message);
         toast.error(message);
+        return [];
       }
     } catch {
       setBranches([]);
       setLoadError(t('branchesLoadFailed'));
       toast.error(t('error'));
+      return [];
     } finally {
       setLoading(false);
     }
@@ -190,7 +333,9 @@ export function AgencyBranches() {
       const res = await apiFetch(`/api/agency/staff?agencyId=${agencyId}`);
       if (res.ok) {
         const data = await res.json();
-        setStaffList(data.staff || []);
+        // Task 45 root cause: same unwrap collapse as the branch list — the
+        // local dual envelope arrives here as a raw array.
+        setStaffList(unwrapListPayload<StaffMember>(data, ['staff']));
       }
     } catch {
       // silent
@@ -208,7 +353,8 @@ export function AgencyBranches() {
       const res = await apiFetch(`/api/agency/branches/${branchId}/counters`);
       if (res.ok) {
         const data = await res.json();
-        setCounters(data.counters || []);
+        // Task 45 root cause: same unwrap collapse as the branch list.
+        setCounters(unwrapListPayload<CounterWithStaff>(data, ['counters']));
       }
     } catch {
       toast.error(t('error'));
@@ -299,9 +445,24 @@ export function AgencyBranches() {
           }),
         });
         if (res.ok) {
+          const body = await res.json().catch(() => ({}));
+          // Task 45 root cause: against the local API the response envelope
+          // { success, branch, data } is auto-unwrapped by apiClient to the
+          // branch ROW itself — `body.branch ?? body.data` was undefined and
+          // the consistency verification never armed. Fall back to the row.
+          const created: Branch | undefined =
+            body.branch ?? body.data ?? (body && typeof body === 'object' && !Array.isArray(body) && typeof body.id === 'string' ? (body as Branch) : undefined);
           toast.success(t('branchCreated'));
           setBranchDialogOpen(false);
-          fetchBranches();
+          // Task 45: arm the consistency verification BEFORE refetching — the
+          // freshly created row MUST be in the very next list of the same
+          // server. If it is not, the divergence alert renders with the
+          // server's workspace identity instead of a silent "no branches yet".
+          if (created?.id) {
+            divergenceNameRef.current = created.name || branchName.trim();
+            pendingVerifyIdRef.current = created.id;
+          }
+          await fetchBranches();
         } else {
           const data = await res.json();
           toast.error(data.error || t('error'));
@@ -593,6 +754,71 @@ export function AgencyBranches() {
           )}
         </Tooltip>
       </motion.div>
+
+      {/* Task 40 round 4: the embedded local API predates the branch-list
+          fixes (old install / old tray instance still owning :3080) — say so
+          HERE instead of letting the list render a misleading empty state. */}
+      {localApiStale && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex items-start gap-3 rounded-2xl border border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-950/30 p-4"
+          role="alert"
+        >
+          <div className="h-9 w-9 rounded-xl bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center flex-shrink-0">
+            <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+          </div>
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">{t('desktopApiStaleTitle')}</p>
+            <p className="text-xs text-amber-700/80 dark:text-amber-400/80 mt-0.5">
+              {t('desktopApiStaleDesc')}{' '}
+              <span className="font-mono font-semibold">{localApiStale.version ?? 'unknown'}</span>
+            </p>
+          </div>
+        </motion.div>
+      )}
+
+      {/* Task 45: a create returned 201 but the very next list of the SAME
+          server did not contain the row — historically the silent "created a
+          branch and the desktop keeps showing no branches yet". Name the
+          divergence, show the server's workspace identity (Task 45
+          /api/health), and give the exact remediation. Auto-clears once a
+          refetch returns the row (e.g. after restart + sync). */}
+      {createDivergence && (
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex items-start gap-3 rounded-2xl border border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-950/30 p-4"
+          role="alert"
+        >
+          <div className="h-9 w-9 rounded-xl bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center flex-shrink-0">
+            <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+          </div>
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-amber-800 dark:text-amber-300">
+              {t('branchDivergenceTitle')}
+              {createDivergence.createdName ? ` — ${createDivergence.createdName}` : ''}
+            </p>
+            <p className="text-xs text-amber-700/80 dark:text-amber-400/80 mt-0.5">{t('branchDivergenceDesc')}</p>
+            {(createDivergence.serverBranchCount !== null || createDivergence.serverAgencyId || createDivergence.serverStatus) && (
+              <p className="text-xs font-mono text-amber-700/80 dark:text-amber-400/80 mt-1 break-all">
+                {t('branchDivergenceServerDetail')}:{' '}
+                {createDivergence.serverBranchCount ?? '—'} · {createDivergence.serverAgencyId ?? '—'} ·{' '}
+                {createDivergence.serverStatus ?? '—'}
+              </p>
+            )}
+          </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={fetchBranches}
+            className="gap-2 border-amber-300 dark:border-amber-800 text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40 rounded-xl flex-shrink-0"
+          >
+            <RefreshCw className="h-4 w-4" />
+            {t('retry')}
+          </Button>
+        </motion.div>
+      )}
 
       {/* Task 37-a: load failure surfaced with a retry (previously a silent
           empty list indistinguishable from "no branches yet") */}

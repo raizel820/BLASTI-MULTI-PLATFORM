@@ -2,7 +2,7 @@
   "_comment": "GENERATED ARTIFACT — DO NOT EDIT BY HAND. Single source of truth: packages/core/src/sync-registry.ts (regenerate with packages/core/scripts/generate-sync-registry-json.js whenever the .ts changes). The desktop local-api (plain JS in Electron, cannot import TypeScript) requires this file: apps/desktop/local-api/sync-service.js.",
   "protocolVersion": 2,
   "generatedFrom": "packages/core/src/sync-registry.ts",
-  "syncedModelCount": 19,
+  "syncedModelCount": 20,
   "syncedModels": [
     "Agency",
     "User",
@@ -22,7 +22,8 @@
     "Favorite",
     "FAQ",
     "SubscriptionPlan",
-    "PlanFeature"
+    "PlanFeature",
+    "AgencyCategory"
   ],
   "models": {
     "Agency": {
@@ -157,6 +158,13 @@
       "isAgencyScoped": false,
       "conflictStrategy": "CLOUD_AUTHORITATIVE",
       "syncOrder": 3
+    },
+    "AgencyCategory": {
+      "delegate": "agencyCategory",
+      "isSynced": true,
+      "isAgencyScoped": false,
+      "conflictStrategy": "LAST_WRITE_WINS",
+      "syncOrder": 20
     },
     "HardwareProduct": {
       "delegate": "hardwareProduct",

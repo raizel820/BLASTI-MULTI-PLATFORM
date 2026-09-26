@@ -19,11 +19,17 @@ export function AgencyRatingDisplay({
   const textSize = size === 'sm' ? 'text-xs' : 'text-sm';
   const countSize = size === 'sm' ? 'text-[10px]' : 'text-xs';
 
-  if (totalCount === 0 && compact) {
+  // Fresh-account safety: normalize possibly-null/undefined inputs so a
+  // review-less agency (averageRating null) or a caller that omits totalCount
+  // never crashes on .toFixed/Math.floor. Everything below reads the safe copies.
+  const safeTotal = totalCount ?? 0;
+  const safeAverage = Number.isFinite(averageRating) ? averageRating : 0;
+
+  if (safeTotal === 0 && compact) {
     return null;
   }
 
-  if (totalCount === 0) {
+  if (safeTotal === 0) {
     return (
       <div className="flex items-center gap-1 text-muted-foreground">
         {[1, 2, 3, 4, 5].map((star) => (
@@ -38,8 +44,8 @@ export function AgencyRatingDisplay({
   }
 
   // Calculate filled, half, and empty stars
-  const fullStars = Math.floor(averageRating);
-  const hasHalfStar = averageRating - fullStars >= 0.25 && averageRating - fullStars < 0.75;
+  const fullStars = Math.floor(safeAverage);
+  const hasHalfStar = safeAverage - fullStars >= 0.25 && safeAverage - fullStars < 0.75;
   const emptyStars = 5 - fullStars - (hasHalfStar ? 1 : 0);
 
   if (compact) {
@@ -47,11 +53,11 @@ export function AgencyRatingDisplay({
       <div className="flex items-center gap-1">
         <Star className={`${starSize} fill-amber-400 text-amber-400`} />
         <span className={`${textSize} font-semibold text-foreground`}>
-          {averageRating.toFixed(1)}
+          {safeAverage.toFixed(1)}
         </span>
-        {totalCount > 0 && (
+        {safeTotal > 0 && (
           <span className={`${countSize} text-muted-foreground`}>
-            ({totalCount})
+            ({safeTotal})
           </span>
         )}
       </div>
@@ -86,11 +92,11 @@ export function AgencyRatingDisplay({
         ))}
       </div>
       <span className={`${textSize} font-semibold text-foreground`}>
-        {averageRating.toFixed(1)}
+        {safeAverage.toFixed(1)}
       </span>
-      {totalCount > 0 && (
+      {safeTotal > 0 && (
         <span className={`${countSize} text-muted-foreground`}>
-          ({totalCount})
+          ({safeTotal})
         </span>
       )}
     </div>

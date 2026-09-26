@@ -162,6 +162,27 @@ class SyncEngine {
     }
   }
 
+  /**
+   * Task 41 — the persisted session user's agencyId (zustand store mirror in
+   * localStorage 'blasti-app'). The CLOUD refuses SUPER_ADMIN pulls/pushes
+   * without an explicit agencyId ("agencyId is required for SUPER_ADMIN
+   * pull", 400) — the cloud login resolves the admin's agency into
+   * user.agencyId, so forward it. Non-admin users are resolved server-side
+   * from their own session; sending it is harmless (validated access).
+   */
+  private getStoredUserAgencyId(): string | null {
+    if (!isBrowser) return null;
+    try {
+      const storeData = localStorage.getItem('blasti-app');
+      if (!storeData) return null;
+      const parsed = JSON.parse(storeData);
+      const agencyId = parsed?.state?.user?.agencyId;
+      return typeof agencyId === 'string' && agencyId ? agencyId : null;
+    } catch {
+      return null;
+    }
+  }
+
   private emit(event: SyncEvent): void {
     for (const listener of this.listeners) {
       try {
@@ -482,17 +503,29 @@ class SyncEngine {
 
     this.lastDatabase = database;
 
-    // Check connectivity — but only skip if BOTH internet AND LAN are down
-    const { baseUrl, target } = await this.getSyncBaseUrl();
-
-    if (target === 'cloud' && !navigator.onLine) {
-      console.log('[SyncEngine] Offline and no LAN server — skipping sync');
-      return;
-    }
-
+    // Task 41 — claim the cycle BEFORE the (up to LAN_DISCOVERY_BUDGET_MS)
+    // LAN-discovery await in getSyncBaseUrl(). Two overlapping sync() calls
+    // used to both pass the guard while discovery was pending and race into
+    // synchronize(), which aborts the later one with the fatal
+    // "Concurrent synchronization is not allowed" error.
     this.isSyncing = true;
     this.lastError = null;
     this.emit({ type: 'sync-start', status: this.getStatus() });
+
+    // Check connectivity — but only skip if BOTH internet AND LAN are down
+    const { baseUrl, target } = await this.getSyncBaseUrl();
+
+    // Task 41 — set when the LAN target answered 404 on the sync endpoints:
+    // after the finally releases the claim, ONE retry runs against the cloud.
+    // Declared here (not inside try) so the post-finally retry can read it.
+    let retryAgainstCloud = false;
+
+    if (target === 'cloud' && !navigator.onLine) {
+      console.log('[SyncEngine] Offline and no LAN server — skipping sync');
+      // Early return outside the try/finally — release the claim manually.
+      this.isSyncing = false;
+      return;
+    }
 
     try {
       const token = this.getAuthToken();
@@ -547,6 +580,15 @@ class SyncEngine {
             };
             if (target === 'cloud' && pageCursor != null) {
               body.sinceSequence = pageCursor;
+            }
+            // Task 41 — SUPER_ADMIN pulls REQUIRE an explicit agencyId (the
+            // cloud refuses to guess — 400 "agencyId is required for
+            // SUPER_ADMIN pull"). The cloud login already resolves the
+            // admin's first agency into user.agencyId; forward it. Non-admin
+            // users are resolved server-side; sending it is harmless.
+            if (target === 'cloud') {
+              const sessionAgencyId = this.getStoredUserAgencyId();
+              if (sessionAgencyId) body.agencyId = sessionAgencyId;
             }
 
             const response = await fetch(this._buildUrl(baseUrl, '/api/sync/pull', target), {
@@ -628,6 +670,11 @@ class SyncEngine {
             body: JSON.stringify({
               changes,
               lastPulledAt,
+              // Task 41 — same SUPER_ADMIN contract as pull: the push also
+              // 400s without an explicit agencyId for admin sessions.
+              ...(target === 'cloud' && this.getStoredUserAgencyId()
+                ? { agencyId: this.getStoredUserAgencyId() }
+                : {}),
             }),
           });
 
@@ -685,8 +732,7 @@ class SyncEngine {
         this._clearLanServer();
         console.warn('[SyncEngine] LAN server has no /api/sync/pull route — falling back to cloud for', LAN_UNSUPPORTED_COOLDOWN_MS / 1000, 's');
         if (!isRetry) {
-          this.isSyncing = false;
-          return this.sync(database, true);
+          retryAgainstCloud = true;
         }
       } else if (target === 'lan') {
         // Any other LAN failure — clear the cache so the next cycle re-probes
@@ -697,6 +743,15 @@ class SyncEngine {
       this.emit({ type: 'sync-error', status: this.getStatus(), error: message });
     } finally {
       this.isSyncing = false;
+    }
+
+    // Task 41 — LAN-404 cloud retry AFTER the finally released the claim.
+    // The previous `return this.sync(database, true)` ran the recursive call
+    // while the outer finally still executed afterwards, releasing the
+    // isSyncing claim MID-FLIGHT of the retry (re-opening the concurrent-
+    // synchronize race this file just fixed).
+    if (retryAgainstCloud) {
+      return this.sync(database, true);
     }
   }
 

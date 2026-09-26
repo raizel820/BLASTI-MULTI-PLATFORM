@@ -44,6 +44,7 @@ const { timingSafeEqual } = require('crypto')
 
 let _io = null
 let _getSession = null // () => ({ token, user } | null)
+let _getPreviousSessionToken = null // Task 41 — () => previous-token | null (rotation grace)
 let _relayAgencyId = null // agency room the cloud relay targets
 let _startedAt = null
 
@@ -106,6 +107,13 @@ function isLocalOriginAllowed(origin) {
   return false
 }
 
+/** Short SAFE fingerprint for logs — never log the full token. */
+function tokenFingerprint(token) {
+  if (!token) return '(null)'
+  const s = String(token)
+  return s.slice(0, 10) + '…(len ' + s.length + ')'
+}
+
 /** Resolve the current local session (token + user) safely. */
 function currentSession() {
   try {
@@ -117,15 +125,23 @@ function currentSession() {
 }
 
 /**
- * Validate an incoming token against the CURRENT session. Returns the
- * session user when valid, else null. (Re-checked on every `auth` event so
- * token rotations are picked up mid-connection.)
+ * Validate an incoming token against the CURRENT session (or, Task 41, the
+ * rotation-grace predecessor of the same session). Returns the session user
+ * when valid, else null. (Re-checked on every `auth` event so token rotations
+ * are picked up mid-connection.)
  */
 function authenticateToken(token) {
   const session = currentSession()
   if (!session) return null
-  if (!timingSafeTokenCompare(token, session.token)) return null
-  return session.user
+  if (timingSafeTokenCompare(token, session.token)) return session.user
+  // Task 41 — the cloud re-issues tokens on import/refresh; a renderer socket
+  // presenting the IMMEDIATE predecessor token of the same session must not
+  // be rejected (this was the "auth event rejected" spam in the field logs).
+  try {
+    const prev = _getPreviousSessionToken && _getPreviousSessionToken()
+    if (prev && timingSafeTokenCompare(token, prev)) return session.user
+  } catch { /* grace lookup is best-effort */ }
+  return null
 }
 
 // ─── Room protocol ───────────────────────────────────────────────────────────
@@ -231,7 +247,12 @@ function _registerRoomHandlers(socket, authRef) {
         _stats.authenticatedTotal++
         log('socket', socket.id, 'authenticated via auth event (user:', (user.username || user.id) + ')')
       } else {
-        warn('socket', socket.id, 'auth event rejected — token does not match the current local session')
+        // Task 41 — actionable rejection log: fingerprint what was presented
+        // vs what the session holds, so mismatch reports are diagnosable.
+        const session = currentSession()
+        warn('socket', socket.id, 'auth event rejected — token', tokenFingerprint(token),
+          'does not match the current local session',
+          session ? '(current=' + tokenFingerprint(session.token) + ')' : '(no active session)')
       }
     } catch (e) {
       warn('auth event error (non-fatal):', e.message)
@@ -249,6 +270,7 @@ function _registerRoomHandlers(socket, authRef) {
 function initLocalRealtime(httpServer, options) {
   if (_io) return _io
   _getSession = (options && options.getSession) || null
+  _getPreviousSessionToken = (options && options.getPreviousSessionToken) || null
 
   let ServerCtor
   try {

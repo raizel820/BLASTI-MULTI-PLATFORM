@@ -26,6 +26,12 @@ import {
   type VerificationDev,
   type VerificationSuccess,
 } from './verification-step';
+// Task 5 — Algeria address selectors (58 wilayas + their communes).
+import {
+  WilayaSelect,
+  CommuneSelect,
+  composeLocationLabel,
+} from '@/components/shared/algeria-location-selects';
 
 // FloatingInput component defined OUTSIDE RegisterForm to prevent remounting on state changes
 function FloatingInput({ id, label, type = 'text', value, onChange, onFocus, onBlur, placeholder, dir, prefix, suffix, children, hasToggle, toggleVisible, onToggle, focusedField, error, autoComplete }: {
@@ -440,6 +446,10 @@ export function RegisterForm() {
   const [phoneNumber, setPhoneNumber] = useState('');
   const [role, setRole] = useState<UserRole>(isDesktopNative ? 'AGENCY_OWNER' : 'CUSTOMER');
   const [adminCode, setAdminCode] = useState('');
+  // Task 5 — optional Algeria address: wilaya = two-digit official code,
+  // commune = baladiya LATIN name (the canonical form the API stores).
+  const [wilayaCode, setWilayaCode] = useState('');
+  const [communeName, setCommuneName] = useState('');
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
@@ -633,6 +643,22 @@ export function RegisterForm() {
       // sign-up, then the wizard rejected the same code as "already used".
       // Task 23: uploaded photo URL OR the picked preset icon (data URI)
       if (avatarValue) { body.avatarUrl = avatarValue; }
+
+      // Task 5 — Algeria address selectors. When BOTH wilaya and commune are
+      // chosen, the selection is handed to the create-agency wizard through
+      // localStorage ('blasti:reg-location', one-shot prefill) regardless of
+      // the chosen role. CUSTOMER accounts additionally persist the address
+      // on their User row via the register payload (AGENCY_OWNER owners set
+      // the agency's address in the wizard instead). Omitted when not chosen.
+      if (wilayaCode && communeName) {
+        try {
+          localStorage.setItem('blasti:reg-location', JSON.stringify({ wilaya: wilayaCode, commune: communeName }));
+        } catch { /* storage unavailable — the wizard prefill is simply skipped */ }
+      }
+      if (role === 'CUSTOMER') {
+        if (wilayaCode) body.wilaya = wilayaCode;
+        if (communeName) body.commune = communeName;
+      }
 
       const res = await apiFetch('/api/auth/register', {
         method: 'POST',
@@ -1457,6 +1483,48 @@ export function RegisterForm() {
                               </AnimatePresence>
                             </div>
 
+                            {/* Task 5 — Location (Algeria): optional wilaya +
+                                baladiya selectors, shown for BOTH roles. The
+                                commune list stays disabled until a wilaya is
+                                picked; values follow the UI language. */}
+                            <div className="space-y-1.5">
+                              <div className="flex items-center gap-1.5 px-1">
+                                <MapPin className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                                <span className="text-xs font-medium text-muted-foreground">
+                                  {t('location.wilaya' as any)}
+                                </span>
+                              </div>
+                              <WilayaSelect
+                                value={wilayaCode}
+                                onValueChange={(code) => {
+                                  setWilayaCode(code);
+                                  // Dependent list — reset the commune when
+                                  // the wilaya changes.
+                                  setCommuneName('');
+                                }}
+                                lang={lang}
+                                placeholder={t('location.selectWilaya' as any)}
+                                id="reg-wilaya"
+                                aria-label={t('location.wilaya' as any)}
+                                triggerClassName={`h-12 rounded-xl text-sm font-medium border-gray-200 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50 data-[state=open]:border-emerald-400 focus-visible:border-emerald-400 focus-visible:ring-emerald-500/20 dark:focus-visible:ring-emerald-400/20`}
+                              />
+                              <div className="flex items-center gap-1.5 px-1 pt-1">
+                                <span className="text-xs font-medium text-muted-foreground">
+                                  {t('location.commune' as any)}
+                                </span>
+                              </div>
+                              <CommuneSelect
+                                wilayaCode={wilayaCode}
+                                value={communeName}
+                                onValueChange={setCommuneName}
+                                lang={lang}
+                                placeholder={t('location.selectCommune' as any)}
+                                id="reg-commune"
+                                aria-label={t('location.commune' as any)}
+                                triggerClassName={`h-12 rounded-xl text-sm font-medium border-gray-200 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50 data-[state=open]:border-emerald-400 focus-visible:border-emerald-400 focus-visible:ring-emerald-500/20 dark:focus-visible:ring-emerald-400/20`}
+                              />
+                            </div>
+
                           </div>
                         )}
 
@@ -1507,6 +1575,15 @@ export function RegisterForm() {
                                   <div className="flex items-center justify-between text-sm">
                                     <span className="text-muted-foreground">{t('phoneNumber')}</span>
                                     <span className="font-semibold text-foreground" dir="ltr">{phoneNumber}</span>
+                                  </div>
+                                )}
+                                {/* Task 5 — chosen Algeria location (optional) */}
+                                {(wilayaCode || communeName) && (
+                                  <div className="flex items-center justify-between text-sm">
+                                    <span className="text-muted-foreground">{t('location.wilaya' as any)}</span>
+                                    <span className="font-semibold text-foreground">
+                                      {composeLocationLabel(wilayaCode, communeName, lang) || communeName}
+                                    </span>
                                   </div>
                                 )}
                                 <div className="flex items-center justify-between text-sm">

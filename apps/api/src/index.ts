@@ -63,6 +63,7 @@ import { reconciliationRoutes } from './routes/reconciliation'
 import { offlineSyncRoutes } from './routes/offline-sync'
 import { qrClaimRoutes } from './routes/qr-claim'
 import { agencyDeviceRoutes } from './routes/agency-devices'
+import { agencyCategoriesRoutes } from './routes/agency-categories'
 import { adminProviderRoutes } from './routes/admin-providers'
 import { appVersionRoutes } from './routes/app-versions'
 import { db, setupSQLitePragmas } from '@blasti/db'
@@ -393,6 +394,8 @@ app.route('/api/reconciliation', reconciliationRoutes)
 app.route('/api/offline-sync', offlineSyncRoutes)
 app.route('/api/qr-claim', qrClaimRoutes)
 app.route('/api/agency-devices', agencyDeviceRoutes)
+// Task 42-b — user-created agency fields/industries (global dictionary).
+app.route('/api/agency-categories', agencyCategoriesRoutes)
 app.route('/api/app-versions', appVersionRoutes)
 
 // ─── Sync-route introspection (P0-2: make the running build self-evident) ──

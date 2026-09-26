@@ -15,6 +15,7 @@ export const viewToUrl: Record<ViewName, string> = {
   'customer-profile': '/customer/profile',
   'customer-favorites': '/customer/favorites',
   'customer-settings': '/customer/settings',
+  'customer-sms-wallet': '/customer/sms-wallet',
   'agency-dashboard': '/agency',
   'agency-settings': '/agency/settings',
   'agency-employees': '/agency/employees',
@@ -22,6 +23,14 @@ export const viewToUrl: Record<ViewName, string> = {
   'agency-reviews': '/agency/reviews',
   'agency-subscription': '/agency/subscription',
   'agency-branches': '/agency/branches',
+  // Task 42-e: dedicated Analytics & Statistics section. While wiring the new
+  // view, this legacy map was also completed to be exhaustive over ViewName
+  // (it previously missed 9 views and failed the Record<ViewName,string>
+  // typecheck; it is not imported anywhere today, but kept type-safe).
+  'agency-analytics': '/agency/analytics',
+  'agency-devices': '/agency/devices',
+  'agency-fullscreen': '/agency/fullscreen',
+  'agency-fullscreen-history': '/agency/fullscreen/history',
   'admin-dashboard': '/admin',
   'admin-transactions': '/admin/transactions',
   'admin-agencies': '/admin/agencies',
@@ -29,6 +38,11 @@ export const viewToUrl: Record<ViewName, string> = {
   'admin-users': '/admin/users',
   'admin-analytics': '/admin/analytics',
   'admin-settings': '/admin/settings',
+  'admin-subscription-plans': '/admin/subscription-plans',
+  'admin-app-settings': '/admin/app-settings',
+  'admin-hardware': '/admin/hardware',
+  'admin-hardware-requests': '/admin/hardware-requests',
+  'admin-enterprise-requests': '/admin/enterprise-requests',
   'kiosk': '/kiosk',
 };
 

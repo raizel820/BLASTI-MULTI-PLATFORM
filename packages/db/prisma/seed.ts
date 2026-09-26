@@ -31,6 +31,19 @@ function hashPassword(password: string): string {
  * Deliberately creates NO customer accounts, NO demo branches/services/counters/
  * reservations/reviews/notifications/FAQs or global settings rows (the API
  * self-heals its SmsSettings / PaymentSettings singletons on first use).
+ *
+ * Task 47 — EXPLICIT FRESH-ACCOUNT INITIAL VALUES. A fresh account is
+ * intentionally 90% empty: the owner may fill the rest from the webapp OR the
+ * desktop, across sessions, while sync keeps both sides converging. To make
+ * that safe the seed no longer relies on schema defaults silently — every
+ * scalar the UI/sync touches is written EXPLICITLY here, byte-for-byte equal
+ * to what the real POST /agencies + POST /auth/register flows produce:
+ *   • numeric counters are 0 (never null) — smsBalance 0, queue counters 0;
+ *   • text defaults are present (wilaya '28', city "M'Sila", working hours);
+ *   • subscription state is FREE + INACTIVE (never a paid tier by accident).
+ * This guards against future schema-default drift: if the schema default ever
+ * changes, the seed still pins the known-good fresh-account state that the
+ * webapp and desktop are hardened against.
  */
 async function seed() {
   console.log('🌱 Seeding database (fresh platform setup — admin + one fresh agency)...');
@@ -263,6 +276,13 @@ async function seed() {
       passwordHash: hashPassword('owner123'),
       role: 'AGENCY_OWNER',
       email: 'owner@blasti.dz',
+      // Task 47 — explicit fresh-account initial values (mirror POST
+      // /auth/register defaults). wilaya/commune stay NULL: a real fresh
+      // registration only sets them when the user picks them, and both apps
+      // treat null address as "not set yet" (UI shows the empty selector).
+      language: 'ar',
+      freeSmsCount: 10,
+      reminderMinutes: 10,
       // Deviation note: a literally-fresh registration is unverified until the
       // email/phone OTP passes (Task 22). The seeded account is pre-verified —
       // same precedent as the super admin (Task 31-A) — so it can log in and
@@ -281,12 +301,43 @@ async function seed() {
       // Route default when the create form omits a category
       category: 'OTHER',
       ownerId: owner.id,
+      // ── Task 47 — EXPLICIT initial values, identical to the schema
+      // defaults the real POST /agencies flow lands on. Written out so a
+      // future schema-default change can never silently re-shape the
+      // fresh-account state the webapp + desktop sync rely on.
+      //
+      // Address: Algeria defaults (wilaya 28 = M'Sila) — same as the create
+      // route when the wizard omits the address step.
+      wilaya: '28',
+      city: "M'Sila",
+      // Working schedule defaults.
+      workingHoursStart: '08:00',
+      workingHoursEnd: '17:00',
+      workingDays: '1,2,3,4,5',
+      // Subscription: never-paid fresh agency → built-in FREE tier,
+      // INACTIVE status, no plan row, zero SMS balance.
+      subscriptionTier: 'FREE',
+      subscriptionStatus: 'INACTIVE',
+      smsBalance: 0,
+      // Capacity/service defaults (queue engine + analytics read these).
+      averageServiceTime: 10,
+      maxActiveReservations: 50,
+      // Operational flags.
+      isQueueOpen: true,
+      isActive: true,
+      kioskModeEnabled: false,
+      autoPauseWhenFull: false,
+      isSponsored: false,
+      sponsorSms: false,
       // The real POST /agencies always creates the queue settings row with
-      // schema defaults (counters 0, not paused). Every other agency field
-      // (FREE tier, INACTIVE status, city/wilaya, working hours/days,
-      // isQueueOpen, maxActiveReservations…) rides on schema defaults.
+      // counters at 0 and the queue not paused — now pinned explicitly so
+      // "initial value is 0" stays true even if defaults drift.
       queueSettings: {
-        create: {},
+        create: {
+          currentServingNumber: 0,
+          lastIssuedNumber: 0,
+          isPaused: false,
+        },
       },
     },
   });
@@ -299,7 +350,7 @@ async function seed() {
   console.log('📋 Summary:');
   console.log('   👤 Super Admin: admin / admin123 (admin@blasti.dz)');
   console.log('   👤 Agency Owner: owner / owner123 (owner@blasti.dz) — fresh agency, owner only');
-  console.log('   🏢 Agency: "My Agency" (code MYA) — FREE tier · INACTIVE · no branches/services/staff');
+  console.log('   🏢 Agency: "My Agency" (code MYA) — FREE tier · INACTIVE · smsBalance 0 · counters 0 · no branches/services/staff');
   console.log('   📋 Plans: FREE (0 DZD) · BASIC (2,000 DZD/mo) · PREMIUM (5,000 DZD/mo)');
   console.log('      Period discounts: 6 months -5% · 12 months -10% · 24 months -20%');
   console.log('   🚫 No customers / demo data — the agency is exactly as if just created');

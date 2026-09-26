@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useUpload } from '@/hooks/use-upload';
@@ -11,13 +11,6 @@ import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Badge } from '@/components/ui/badge';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
 import {
   Building2,
   MapPin,
@@ -49,6 +42,15 @@ import type { TranslationKeys } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { apiFetch } from '@/lib/api-fetch';
 import { formatWorkingDaysList } from '@/lib/enum-i18n';
+import { AgencyCategorySelect } from '@/components/agency/agency-category-select';
+import { BUILT_IN_CATEGORY_OPTIONS } from '@/hooks/use-agency-categories';
+// Task 5 — Algeria address selectors (58 wilayas + their communes).
+import {
+  WilayaSelect,
+  CommuneSelect,
+  composeLocationLabel,
+} from '@/components/shared/algeria-location-selects';
+import { findWilayaByCode } from '@/lib/algeria-locations';
 
 interface AgencyInfo {
   id: string;
@@ -69,16 +71,11 @@ interface AgencyInfo {
   // component still renders against older payloads (desktop local API).
   isQueueOpen?: boolean;
   queuePaused?: boolean;
+  // Task 5: Algeria address (wilaya = two-digit official code, city =
+  // commune/baladiya Latin name). Optional — older payloads omit them.
+  wilaya?: string;
+  city?: string;
 }
-
-const categoryOptions: { value: string; key: TranslationKeys }[] = [
-  { value: 'CLINIC', key: 'catClinic' },
-  { value: 'AGENCY', key: 'catAgency' },
-  { value: 'LAW_FIRM', key: 'catLawFirm' },
-  { value: 'LABORATORY', key: 'catLaboratory' },
-  { value: 'GOVERNMENT', key: 'catGovernment' },
-  { value: 'OTHER', key: 'catOther' },
-];
 
 /** Round 15 — localized weekday list for the workingDays CSV (0=Sunday).
  *  Task 31-A: delegated to the shared formatWorkingDaysList and driven by the
@@ -153,14 +150,33 @@ export function AgencyProfile() {
   const handleSave = async () => {
     setSaving(true);
     try {
+      // Task 5 — wilaya/city are sent as a coherent PAIR only: the stored
+      // city counts as selected when it belongs to the selected wilaya's
+      // commune list (case-insensitive). Empty strings are never sent (they
+      // would fail the API's min(1) validation); absent keys leave the
+      // currently stored values untouched, so the UI cannot crash against a
+      // cloud that does not accept the fields yet either.
+      const { wilaya: _saveWilaya, city: _saveCity, ...restProfile } = profile ?? {};
+      const payload: Record<string, unknown> = { ...restProfile, agencyId: user?.agencyId };
+      const pairWilaya = profile?.wilaya ?? '';
+      const pairCity = selectedCommune;
+      if (pairWilaya && pairCity) {
+        payload.wilaya = pairWilaya;
+        payload.city = pairCity;
+      }
       const res = await apiFetch('/api/agency/profile', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...profile, agencyId: user?.agencyId }),
+        body: JSON.stringify(payload),
       });
       if (res.ok) {
         toast.success(t('success'));
         setEditMode(false);
+        // Task 5 — re-sync local state with the server truth: location pairs
+        // that were omitted from the payload (no coherent wilaya+commune)
+        // keep their stored values, so the read view must reflect the
+        // server, not the half-edited local draft.
+        fetchProfile();
       } else {
         const data = await res.json();
         toast.error(data.error || t('error'));
@@ -176,9 +192,26 @@ export function AgencyProfile() {
     setProfile((prev) => (prev ? { ...prev, [field]: value } : prev));
   };
 
+  // Task 5 — effective commune selection: the stored city only counts as
+  // selected when it belongs to the currently-selected wilaya (case-
+  // insensitive match against that wilaya's commune list). A city that does
+  // not match (legacy default "M'Sila" under a different wilaya, an older
+  // payload, …) leaves the commune selector unselected instead of showing a
+  // bogus value. Recomputed on profile changes so a wilaya switch resets it.
+  const selectedCommune = useMemo(() => {
+    const city = profile?.city ?? '';
+    const wilayaCodeValue = profile?.wilaya ?? '';
+    if (!city || !wilayaCodeValue) return '';
+    const wilaya = findWilayaByCode(wilayaCodeValue);
+    if (!wilaya) return '';
+    return wilaya.communes.some((c) => c.name.toLowerCase() === city.toLowerCase()) ? city : '';
+  }, [profile?.city, profile?.wilaya]);
+
   const getCategoryLabel = (cat: string) => {
-    const found = categoryOptions.find((c) => c.value === cat.toUpperCase());
-    return found ? t(found.key) : cat;
+    // Built-ins resolve through the shared 25-option list; custom categories
+    // (user-entered names) display as-is.
+    const found = BUILT_IN_CATEGORY_OPTIONS.find((c) => c.value === cat.toUpperCase());
+    return found ? t(found.labelKey as TranslationKeys) : cat;
   };
 
   const agencyLink = profile?.code ? `${typeof window !== 'undefined' ? window.location.origin : ''}/?code=${profile.code}` : '';
@@ -463,21 +496,50 @@ export function AgencyProfile() {
                   </div>
                   <div className="space-y-2">
                     <Label>{t('agencyCategory')}</Label>
-                    <Select
+                    {/* Task 42 — shared picker (compact trigger opens the searchable
+                        25-built-in + custom-fields dialog); value shape unchanged. */}
+                    <AgencyCategorySelect
+                      variant="compact"
                       value={profile?.category ?? 'OTHER'}
-                      onValueChange={(v) => updateField('category', v)}
-                    >
-                      <SelectTrigger className="h-11 rounded-xl">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {categoryOptions.map((opt) => (
-                          <SelectItem key={opt.value} value={opt.value}>
-                            {t(opt.key)}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                      onChange={(v) => updateField('category', v)}
+                      disabled={saving}
+                    />
+                  </div>
+                  {/* Task 5 — Algeria location selectors. Initialized from the
+                      agency's stored wilaya/city; a stored city that does not
+                      belong to the selected wilaya starts unselected. */}
+                  <div className="space-y-2">
+                    <Label>{t('location.wilaya' as any)}</Label>
+                    <WilayaSelect
+                      value={profile?.wilaya ?? ''}
+                      onValueChange={(code) => {
+                        if (code === profile?.wilaya) return;
+                        updateField('wilaya', code);
+                        // Dependent list — the commune must belong to the
+                        // newly selected wilaya, so reset it.
+                        updateField('city', '');
+                      }}
+                      lang={lang}
+                      placeholder={t('location.selectWilaya' as any)}
+                      id="profile-wilaya"
+                      aria-label={t('location.wilaya' as any)}
+                      disabled={saving}
+                      triggerClassName="h-11 rounded-xl border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 data-[state=open]:border-emerald-400 focus-visible:border-emerald-400 focus-visible:ring-emerald-500/20"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>{t('location.commune' as any)}</Label>
+                    <CommuneSelect
+                      wilayaCode={profile?.wilaya ?? ''}
+                      value={selectedCommune}
+                      onValueChange={(name) => updateField('city', name)}
+                      lang={lang}
+                      placeholder={t('location.selectCommune' as any)}
+                      id="profile-commune"
+                      aria-label={t('location.commune' as any)}
+                      disabled={saving}
+                      triggerClassName="h-11 rounded-xl border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 data-[state=open]:border-emerald-400 focus-visible:border-emerald-400 focus-visible:ring-emerald-500/20"
+                    />
                   </div>
                   <div className="space-y-2 sm:col-span-2">
                     <Label>{t('agencyAddress')}</Label>
@@ -520,6 +582,15 @@ export function AgencyProfile() {
                     <MapPin className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                     <span className="text-muted-foreground">{profile?.address}</span>
                   </div>
+                  {/* Task 5 — composed Algeria location (wilaya · commune) */}
+                  {composeLocationLabel(profile?.wilaya ?? '', selectedCommune, lang) && (
+                    <div className="flex items-center gap-3 text-sm">
+                      <MapPin className="h-4 w-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+                      <span className="text-muted-foreground">
+                        {composeLocationLabel(profile?.wilaya ?? '', selectedCommune, lang)}
+                      </span>
+                    </div>
+                  )}
                   <div className="flex items-center gap-3 text-sm">
                     <Phone className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                     <span className="text-muted-foreground">{profile?.phone}</span>

@@ -211,6 +211,25 @@ function onSyncEvent(callback) {
 
 // ─── Internal Helpers ─────────────────────────────────────────────────────────
 
+// Task 46: schema-aware record sanitizer shared with initial-sync. The
+// incremental pull path previously passed relation objects / unknown columns
+// / null-on-NOT-NULL values straight into raw INSERT/UPDATE — one `staff:
+// null` or a drifted field wedged the record in _deferred_changes forever.
+// The sanitizer drops unknown columns, keeps null only on NULLABLE columns
+// ("not set by the user yet" is real data), and repairs type drift.
+var _recordSanitizer = null
+function _getRecordSanitizer() {
+  if (_recordSanitizer === null) {
+    try {
+      _recordSanitizer = require('./lib/sync-record-sanitize')
+    } catch (e) {
+      console.warn('[SyncService] record sanitizer unavailable (pass-through): ' + e.message)
+      _recordSanitizer = false
+    }
+  }
+  return _recordSanitizer || null
+}
+
 // Fields known to be Boolean in the Prisma schema that don't match the pattern
 const BOOLEAN_FIELDS = new Set([
   'reminderSent', 'smsReminderSent', 'syncConflict', 'skippedForNoShow',
@@ -237,9 +256,26 @@ var SYNC_EXCLUDED_FIELDS = {
 }
 
 function _cloudRecordToLocal(record, modelName) {
+  // Task 46: sanitize FIRST (schema-aware drop/repair), then the existing
+  // scalar conversions. Dropped keys are logged for core models so a wedged
+  // record can be diagnosed from the console alone.
+  var sanitizer = _getRecordSanitizer()
+  var source = record
+  if (sanitizer) {
+    try {
+      var s = sanitizer.sanitizeSyncRecord(modelName, record)
+      if (s.dropped.length > 0) {
+        console.log('[SyncService] sanitize ' + modelName + '/' + record.id + ': dropped ' + sanitizer.formatDropped(s.dropped))
+      }
+      source = s.clean || {}
+    } catch (e) {
+      console.warn('[SyncService] sanitize failed for ' + modelName + '/' + record.id + ' (pass-through): ' + e.message)
+      source = record
+    }
+  }
   const excluded = modelName ? (SYNC_EXCLUDED_FIELDS[modelName] || null) : null
-  const result = { id: record.id };
-  for (const [key, value] of Object.entries(record)) {
+  const result = { id: source.id };
+  for (const [key, value] of Object.entries(source)) {
     if (key === 'id') continue;
     if (excluded && excluded.indexOf(key) !== -1) continue;
     if (DATE_FIELDS.has(key) && typeof value === 'string' && ISO_DATE_RE.test(value)) {
@@ -253,6 +289,11 @@ function _cloudRecordToLocal(record, modelName) {
     } else {
       result[key] = value;
     }
+  }
+  // Task 46: carry the fallback-fabrication tag (symbol — invisible to
+  // Object.entries/JSON) so the UPDATE branch can exclude fabricated values.
+  if (sanitizer && typeof sanitizer.copyFallbackTags === 'function') {
+    sanitizer.copyFallbackTags(source, result);
   }
   return result;
 }
@@ -925,6 +966,49 @@ async function _executeRevocation(reason) {
   emit({ type: 'authorization-revoked', reason: reason });
 }
 
+// ─── Task 44: READY-workspace empty-core reconciliation ─────────────────────
+//
+// Rate-limited (once per hour, in-memory — an app restart deliberately
+// re-arms it) cross-check of the two tables whose emptiness breaks the
+// workspace UI. Delegates to initial-sync.reconcileEmptyBusinessStages,
+// which itself no-ops for any table with rows and imports straight from the
+// cloud's canonical list endpoints when a table is empty AND the cloud
+// still reports rows. Emits the same SYNC_STAGE_COMPLETED events the
+// initializer emits so the UI/diagnostics stay uniform.
+var _lastReadyReconcileAt = 0;
+var READY_RECONCILE_MIN_INTERVAL_MS = 60 * 60 * 1000;
+
+async function _reconcileReadyWorkspace(agencyId) {
+  var db = _config && _config.localDb;
+  if (!db || !agencyId || !_authToken || !_config || !_config.cloudBaseUrl) return null;
+  var now = Date.now();
+  if (now - _lastReadyReconcileAt < READY_RECONCILE_MIN_INTERVAL_MS) return null;
+  _lastReadyReconcileAt = now;
+
+  var initialSync = require('./initial-sync'); // lazy — module cycle
+  if (typeof initialSync.reconcileEmptyBusinessStages !== 'function') return null;
+
+  var report = await initialSync.reconcileEmptyBusinessStages(db, agencyId, _config.cloudBaseUrl, _authToken, null, function (evt) {
+    try { emit(evt); } catch { }
+  });
+
+  if (report) {
+    var healed = [];
+    Object.keys(report).forEach(function (stage) {
+      var r = report[stage];
+      if (r && r.reconciled > 0) healed.push(stage + '=' + r.reconciled);
+      else if (r && r.cloudCheckError) console.warn('[SyncService] Ready-reconcile ' + stage + ': cloud check failed — ' + r.cloudCheckError);
+    });
+    if (healed.length > 0) {
+      console.log('[SyncService] READY-workspace reconciliation HEALED empty core tables: ' + healed.join(', ') + ' (agency ' + agencyId + ')');
+      emit({ type: 'workspace-reconciled', agencyId: agencyId, report: report });
+    } else {
+      console.log('[SyncService] Ready-reconcile check: no empty core tables to heal (or the cloud is empty too)');
+    }
+  }
+  return report;
+}
+
 function ensureWorkspaceInitialized(trigger) {
   if (!_isStarted) return Promise.resolve({ skipped: 'engine-not-started' });
   if (!_authToken) return Promise.resolve({ skipped: 'no-auth' });
@@ -958,7 +1042,22 @@ function ensureWorkspaceInitialized(trigger) {
     }
 
     // Fast path: already READY → nothing to do (5s-cached check, force=false).
-    if (await _isAgencyReady()) return { skipped: 'ready' };
+    if (await _isAgencyReady()) {
+      // Task 44: READY does not mean CORRECT. A workspace that imported while
+      // the cloud genuinely had no branches/services (or whose change feed
+      // could not deliver them — pre-extension cloud build, pruned
+      // SyncChange rows, agency resolved differently at import time) stays
+      // READY forever with EMPTY core tables: the exact "webapp shows
+      // branches, desktop shows none" incident. Task 43's reconciliation
+      // only runs INSIDE runInitialSync — which never re-runs for a READY
+      // workspace — so it could never heal this state. Fire the same
+      // empty-core reconciliation here (rate-limited, no-op when the tables
+      // are populated or the cloud reports 0 too).
+      _reconcileReadyWorkspace(agencyId).catch(function (e) {
+        console.warn('[SyncService] READY-workspace reconciliation failed (non-fatal):', (e && e.message) || e);
+      });
+      return { skipped: 'ready' };
+    }
 
     // The cloud sync API must genuinely host /api/sync/* before importing.
     var probe = await _probeCloudSyncRoutes();
@@ -1344,6 +1443,23 @@ async function _retryDeferredChanges() {
         emit({ type: 'deferred-resolved', model: row.model, recordId: row.recordId });
       } else if (_isDependencyError(err)) {
         var retryCount = Number(row.retryCount || 0) + 1;
+        // Task 43: dependency deferrals used to retry FOREVER (15-min backoff
+        // cap) when the parent row no longer exists in the cloud feed (e.g.
+        // orphaned child of a branch that was hard-deleted cloud-side). Cap
+        // it: after 20 dependency retries (~1 day of backoff), QUARANTINE
+        // with an explicit reason instead of spinning + spamming every cycle.
+        if (retryCount >= 20) {
+          await db.$executeRawUnsafe(
+            'UPDATE "_deferred_changes" SET "status" = \'QUARANTINED\', "retryCount" = ?, "lastRetryAt" = ?, "dependencyError" = ? WHERE "id" = ?',
+            retryCount, new Date().toISOString(),
+            'dependency never resolved after 20 retries — parent row not delivered by the cloud (likely orphaned data whose parent was deleted cloud-side); quarantined to stop infinite retries',
+            row.id
+          );
+          quarantined++;
+          console.error('[SyncService] Deferred change QUARANTINED (dependency unresolved after 20 retries — parent never arrives):', row.model + '/' + row.recordId);
+          emit({ type: 'deferred-quarantined', model: row.model, recordId: row.recordId, error: 'dependency unresolved after 20 retries' });
+          continue;
+        }
         var backoffSec = Math.min(15 * 60, 15 * Math.pow(2, Math.min(retryCount, 10)));
         await db.$executeRawUnsafe(
           'UPDATE "_deferred_changes" SET "retryCount" = ?, "lastRetryAt" = ?, "nextRetryAt" = ?, "dependencyError" = ? WHERE "id" = ?',
@@ -1482,7 +1598,15 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
             var cloudMs = _recordTimeMs(local.updatedAt);
             var localMs = _recordTimeMs(existing.updatedAt);
             if (cloudMs >= localMs) {
-              await _updateLocalRecord(tx, table, local);
+              // Task 46: exclude fallback-fabricated values from the UPDATE —
+              // they are create-only (a drifted payload must never reset the
+              // user's real category/customCode already stored locally).
+              var updatePayload = local;
+              var sanitizerModule = _getRecordSanitizer();
+              if (sanitizerModule && typeof sanitizerModule.stripFallbackKeys === 'function') {
+                updatePayload = sanitizerModule.stripFallbackKeys(local);
+              }
+              await _updateLocalRecord(tx, table, updatePayload);
             } else {
               await _logConflict(tx, table, local.id, existing.updatedAt, local.updatedAt, existing, local);
               conflictCount++;

@@ -1,5 +1,6 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';
+import { unwrapListPayload } from '@/lib/list-payload';
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useLanguage } from '@/hooks/use-language';
@@ -241,7 +242,11 @@ export function AgencyDevices() {
       const res = await apiFetch(`/api/agency/branches?agencyId=${agencyId}&${PORT_Q}`);
       if (res.ok) {
         const data = await res.json();
-        setBranches(data.branches ?? []);
+        // Task 45 root cause: apiClient's parseResponse auto-unwrap collapses
+        // the local dual envelope { success, branches, data } to the RAW ARRAY
+        // — `data.branches` on an array was always undefined. Accept every
+        // envelope outcome.
+        setBranches(unwrapListPayload(data, ['branches', 'data']));
       }
     } catch {
       // Silent

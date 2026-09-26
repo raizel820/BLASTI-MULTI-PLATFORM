@@ -175,6 +175,11 @@ const GLOBAL_MODELS = new Set([
   'GlobalAnnouncement',
   'SubscriptionPlan',
   'PlanFeature',
+  // Task 42-a/42-b: user-created agency categories are a GLOBAL dictionary
+  // (no agencyId column). Without this the auto-tracking hook resolves null
+  // and silently DROPS the SyncChange — desktops would never pull new custom
+  // categories incrementally.
+  'AgencyCategory',
 ])
 
 /**
@@ -504,6 +509,12 @@ export const USER_SYNC_FIELDS = [
   'shortAppId',
   'role',
   'language',
+  // Task 5/47 — Algeria address fields. Nullable (null = not set yet); both
+  // apps treat null as "user hasn't picked a location". Without these the
+  // address picked in one app never reaches the other (pull projection AND
+  // push update-filter both use this allow-list).
+  'wilaya',
+  'commune',
   'avatarUrl',
   'avatarStorageProvider',
   'avatarStorageKey',

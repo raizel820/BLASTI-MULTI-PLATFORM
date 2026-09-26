@@ -158,6 +158,10 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     mutableFields: [
       'username', 'fullName', 'email', 'phoneNumber', 'shortAppId',
       'role', 'language', 'avatarUrl', 'avatarStorageProvider', 'avatarStorageKey',
+      // Task 5/47 — Algeria address fields must survive a desktop-pushed
+      // profile update (user completes their address on one app; without
+      // these the cloud update branch silently drops them).
+      'wilaya', 'commune',
       'freeSmsCount', 'notificationPreferences', 'reminderMinutes',
       'smsNotificationsEnabled', 'notificationPref', 'isAppOnline', 'fcmToken',
       'isActive', 'lastRoleChangeAt',
@@ -633,6 +637,36 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canDeleteOffline: false,
     isReadOnly: true,
     syncOrder: 3,
+    dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
+  },
+
+  {
+    // Task 42-a: user-created agency fields/industries (shared dictionary).
+    // An owner who does not find their field among the BUILT-IN categories can
+    // create one from the desktop (offline) or the webapp; every other agency
+    // owner can then select it. Global model — categories are NOT
+    // agency-scoped, so like FAQ they flow to every agency's desktop via the
+    // GLOBAL_AGENCY feed + the initial-sync 'agencyCategories' stage.
+    model: 'AgencyCategory',
+    delegate: 'agencyCategory',
+    label: 'Agency Category',
+    isSynced: true,
+    isAgencyScoped: false,
+    agencyField: null,
+    conflictStrategy: ConflictStrategy.LAST_WRITE_WINS,
+    mutableFields: ['name', 'nameFr', 'nameAr', 'icon', 'isCustom', 'createdBy'],
+    immutableFields: ['id', 'createdAt', 'updatedAt'],
+    localOnlyFields: ['syncVersion', 'syncedAt'],
+    cloudOnlyFields: [],
+    lwwFields: ['updatedAt'],
+    versionField: 'syncVersion',
+    syncedAtField: 'syncedAt',
+    dependencies: [],
+    canCreateOffline: true,
+    canUpdateOffline: false,
+    canDeleteOffline: false,
+    isReadOnly: false,
+    syncOrder: 20,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 

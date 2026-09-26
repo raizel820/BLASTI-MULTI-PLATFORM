@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import type { TranslationKeys } from '@/i18n';
+import { unwrapListPayload } from '@/lib/list-payload';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -203,7 +204,11 @@ export function AgencySettings() {
       const res = await apiFetch(`/api/agency/staff${params}`);
       if (res.ok) {
         const data = await res.json();
-        setStaffList(data.staff ?? []);
+        // Task 45 root cause: apiClient's parseResponse auto-unwrap collapses
+        // the local dual envelope { success, staff, data } to the RAW ARRAY —
+        // `data.staff` on an array was always undefined (empty staff list on
+        // desktop). Accept every envelope outcome.
+        setStaffList(unwrapListPayload(data, ['staff']));
       }
     } catch {
       toast.error(t('error'));
@@ -221,7 +226,10 @@ export function AgencySettings() {
       const res = await apiFetch(`/api/agency/branches${params}`);
       if (res.ok) {
         const data = await res.json();
-        setBranchList(data.branches ?? data.data ?? []);
+        // Task 45 root cause: same unwrap collapse as agency-branches — the
+        // local dual envelope { success, branches, data } arrives as a raw
+        // array and `data.branches ?? data.data` always read [].
+        setBranchList(unwrapListPayload(data, ['branches', 'data']));
       }
     } catch {
       // silent — the summary section renders its empty state

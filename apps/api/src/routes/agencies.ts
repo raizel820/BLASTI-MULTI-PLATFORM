@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { db, Prisma } from '@blasti/db'
 import { requireRole, requireAgencyAccess, authErrorResponse, createSessionToken } from '../lib/auth'
-import { adminCreateAgencySchema, updateAgencyProfileSchema, validateBody } from '../lib/validations'
+import { adminCreateAgencySchema, updateAgencyProfileSchema, validateBody, wilayaCodeRegex } from '../lib/validations'
 import { enforceRateLimit, getClientIp, AGENCY_LISTING_RATE_LIMIT, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordFailedRequest, recordSuccessfulRequest } from '../lib/rate-limit'
 import { recordSyncChangeNow } from '../lib/sync-helpers'
 
@@ -365,6 +365,18 @@ app.post('/', async (c) => {
 
     const { name, nameAr, nameFr, customCode, category, address, phone, ownerId, description, workingHoursStart, workingHoursEnd, workingDays, services } = validation.data
 
+    // Task 5 — Algeria address selectors (create-agency wizard address step).
+    // wilaya is normalized to the canonical two-digit code and only stored
+    // when it matches ^(0[1-9]|[1-5][0-8])$; city (commune Latin name) is
+    // trimmed. When either is absent the Agency row keeps its DB defaults
+    // (wilaya='28', city="M'Sila"). Sent as a pair by the UI so a wilaya
+    // without a matching commune never lands on the row half-set.
+    const bodyWilaya = typeof body.wilaya === 'string' && body.wilaya.trim()
+      ? body.wilaya.trim().padStart(2, '0')
+      : ''
+    const agencyWilaya = wilayaCodeRegex.test(bodyWilaya) ? bodyWilaya : undefined
+    const agencyCity = typeof body.city === 'string' && body.city.trim() ? body.city.trim() : undefined
+
     const resolvedOwnerId = user.role === 'SUPER_ADMIN' ? (ownerId || user.id) : user.id
 
     if (customCode) {
@@ -428,6 +440,9 @@ app.post('/', async (c) => {
           ...(workingHoursEnd ? { workingHoursEnd } : {}),
           // Round 15 — working days ride along with the working hours.
           ...(workingDays ? { workingDays } : {}),
+          // Task 5 — Algeria address selectors (absent → DB defaults).
+          ...(agencyWilaya ? { wilaya: agencyWilaya } : {}),
+          ...(agencyCity ? { city: agencyCity } : {}),
           ownerId: resolvedOwnerId,
           queueSettings: {
             create: {},

@@ -334,7 +334,10 @@ function AgencyReviewsPreview({ agencyId, averageRating, reviewCount }: { agency
       <div className="space-y-2">
         <AnimatePresence>
           {displayReviews.map((review, idx) => {
-            const initials = review.user.fullName
+            // Fresh-account safety: guard absent user relation (see
+            // customer-home.tsx) — null.split must never reach the render.
+            const reviewerName: string = review.user?.fullName || 'Customer';
+            const initials = reviewerName
               .split(' ')
               .map((n: string) => n[0])
               .filter(Boolean)
@@ -342,7 +345,7 @@ function AgencyReviewsPreview({ agencyId, averageRating, reviewCount }: { agency
               .join('')
               .toUpperCase();
             const colors = ['bg-emerald-500', 'bg-teal-500', 'bg-amber-500', 'bg-rose-500', 'bg-violet-500'];
-            const colorClass = colors[review.user.fullName.length % colors.length];
+            const colorClass = colors[reviewerName.length % colors.length];
 
             return (
               <motion.div
@@ -357,7 +360,7 @@ function AgencyReviewsPreview({ agencyId, averageRating, reviewCount }: { agency
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-semibold text-foreground">{review.user.fullName}</span>
+                    <span className="text-xs font-semibold text-foreground">{reviewerName}</span>
                     <div className="flex gap-0.5">
                       {[1, 2, 3, 4, 5].map((star) => (
                         <Star

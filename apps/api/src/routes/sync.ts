@@ -54,17 +54,27 @@ async function resolveTargetAgencyId(
   if (user.role === 'SUPER_ADMIN') return null
 
   const { db } = await import('@blasti/db')
+
+  // Task 44: RESOLVER ALIGNMENT. The business surface (verifyAgencyOwnership /
+  // getUserAgencyId in lib/auth.ts) resolves OWNED-AGENCY-FIRST with a
+  // deterministic createdAt-asc pick; this sync resolver used to try the
+  // staff row FIRST with an unordered findFirst. For an owner who also has a
+  // staff row (or owns several agencies) the two surfaces could bind
+  // DIFFERENT agencies for the same user — the webapp would show branches of
+  // one agency while the sync feed served another (0 branches). Aligned to
+  // the exact same contract now.
+  const ownedAgency = await db.agency.findFirst({
+    where: { ownerId: user.id },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true },
+  })
+  if (ownedAgency) return ownedAgency.id
+
   const staffRecord = await db.agencyStaff.findFirst({
     where: { userId: user.id, isActive: true },
     select: { agencyId: true },
   })
-  if (staffRecord?.agencyId) return staffRecord.agencyId
-
-  const ownedAgency = await db.agency.findFirst({
-    where: { ownerId: user.id },
-    select: { id: true },
-  })
-  return ownedAgency?.id ?? null
+  return staffRecord?.agencyId ?? null
 }
 
 function authError(c: any, error: unknown) {

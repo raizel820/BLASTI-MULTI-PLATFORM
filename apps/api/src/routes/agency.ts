@@ -12,6 +12,7 @@ import { z } from 'zod'
 import QRCode from 'qrcode'
 import { recordSyncChange, recordSyncChangeNow } from '../lib/sync-helpers'
 import { normalizeRecordFileUrls } from '../lib/file-url'
+import { computeAnalyticsDashboard, DASHBOARD_PERIODS, type DashboardPeriod } from '../lib/analytics-dashboard'
 
 /** Round 15 — stable base for built file URLs when BLASTI_PUBLIC_BASE_URL is set. */
 const PUBLIC_FILE_URL_BASE = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '')
@@ -564,6 +565,11 @@ app.post('/announcements', async (c) => {
       },
     })
 
+    // Task 44: explicit SyncChange capture — see POST /branches note.
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'Announcement', recordId: announcement.id, operation: 'create' })
+    } catch { /* capture must never fail the business write */ }
+
     return c.json({ success: true, announcement })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -733,6 +739,15 @@ app.post('/branches', async (c) => {
       },
     })
 
+    // Task 44: EXPLICIT SyncChange capture. The auto-tracking extension also
+    // covers this write, but the desktop pull feed is blind to branch creates
+    // whenever the running cloud build predates the extension (the exact
+    // "webapp shows branches, desktop never will" incident). Recording here
+    // makes the feed independent of the extension's presence/version.
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'Branch', recordId: branch.id, operation: 'create' })
+    } catch { /* capture must never fail the business write */ }
+
     // Emit realtime event (fire-and-forget)
     emitAgencyEvent('agency:updated', agencyId, {
       action: 'branch-created',
@@ -816,6 +831,11 @@ async function handleBranchUpdate(c: Context) {
       data,
     })
 
+    // Task 44: explicit SyncChange capture (see POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: branch.agencyId, model: 'Branch', recordId: updated.id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
+
     // Emit realtime event (fire-and-forget)
     emitAgencyEvent('agency:updated', branch.agencyId, {
       action: 'branch-updated',
@@ -851,6 +871,12 @@ app.delete('/branches/:id', async (c) => {
       where: { id },
       data: { isActive: false },
     })
+
+    // Task 44: explicit SyncChange capture (soft delete → 'update' — the row
+    // remains and the desktop applies isActive:false the same way).
+    try {
+      await recordSyncChangeNow({ agencyId: branch.agencyId, model: 'Branch', recordId: id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
 
     // Emit realtime event (fire-and-forget)
     emitAgencyEvent('agency:updated', branch.agencyId, {
@@ -936,6 +962,11 @@ app.post('/branches/:id/counters', async (c) => {
       },
     })
 
+    // Task 44: explicit SyncChange capture (see POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: branch.agencyId, model: 'Counter', recordId: counter.id, operation: 'create' })
+    } catch { /* capture must never fail the business write */ }
+
     // Emit realtime event (fire-and-forget)
     emitAgencyEvent('agency:updated', branch.agencyId, {
       action: 'counter-created',
@@ -995,6 +1026,11 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
       },
     })
 
+    // Task 44: explicit SyncChange capture (see POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: counter.branch.agencyId, model: 'Counter', recordId: counterId, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
+
     // Emit realtime event (fire-and-forget)
     emitAgencyEvent('agency:updated', counter.branch.agencyId, {
       action: 'counter-updated',
@@ -1028,6 +1064,11 @@ app.delete('/branches/:id/counters/:counterId', async (c) => {
       where: { id: counterId },
       data: { isActive: false },
     })
+
+    // Task 44: explicit SyncChange capture (soft delete → 'update').
+    try {
+      await recordSyncChangeNow({ agencyId: counter.branch.agencyId, model: 'Counter', recordId: counterId, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
 
     // Emit realtime event (fire-and-forget)
     emitAgencyEvent('agency:updated', counter.branch.agencyId, {
@@ -1589,6 +1630,61 @@ app.get('/peak-hours', async (c) => {
   }
 })
 
+// ─── agency/analytics/dashboard (Task 42-b) ──────────────────────────────────
+//
+// GET /api/agency/analytics/dashboard?period=7d|30d|90d|12m
+//
+// Consolidated dashboard analytics for the caller's agency (owner AND staff —
+// same resolution as /history). ALL bucketing/math is UTC. The desktop local
+// API (Task 42-c) implements the IDENTICAL response shape — change both or
+// neither. Semantics:
+//   - end = now; 7d/30d/90d → start = end − N×24h; 12m → 00:00 UTC of the
+//     month 11 months before the current month (12 calendar months incl. current)
+//   - previous period = [start − length, start)
+//   - every count is keyed on joinedAt falling in the range (current status)
+//   - avgWaitMinutes   = mean(calledAt − joinedAt)     over rows that have calledAt
+//   - avgServiceMinutes = mean(completedAt − calledAt) over rows that have both
+//   - walkIn = isWalkIn true; online = !isWalkIn AND userId != null (same
+//     convention as GET /agency/stats)
+//   - uniqueCustomers = distinct non-null userId (walk-ins carry no account)
+//   - rates are 0–100 with one decimal (0 when total = 0); durations/ratings
+//     one decimal or null when there is no data
+//   - deltas vs previous period: count/duration metrics are percent change
+//     (null when previous is 0/none); noShowRate is a percentage-point delta
+//   - timeseries buckets: calendar days (UTC) from start to end for 7d/30d/90d,
+//     calendar months for 12m — every bucket present, zero-filled
+// Implementation: ONE findMany for the current range + one for the previous
+// range, aggregated in JS; Service/Branch/Counter names via lookup maps.
+// Task 3: helpers + computation extracted to lib/analytics-dashboard.ts
+// (shared with GET /api/admin/analytics/*); GLOBAL mode = agencyId null.
+
+app.get('/analytics/dashboard', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const agencyId = await resolveUserAgencyId(user)
+    if (!agencyId) {
+      return c.json({ error: 'No agency associated with this account' }, 403)
+    }
+
+    const rawPeriod = c.req.query('period') || '30d'
+    const period: DashboardPeriod = (DASHBOARD_PERIODS as readonly string[]).includes(rawPeriod)
+      ? (rawPeriod as DashboardPeriod)
+      : '30d'
+
+    // Task 3: computation (range math, aggregation, payload assembly) moved to
+    // lib/analytics-dashboard.ts so the SUPER ADMIN analytics endpoints run the
+    // EXACT same engine (GLOBAL mode = agencyId null). The returned payload is
+    // the 42-b contract plus ADDITIVE extensions (kpis.walkInRate/onlineRate,
+    // timeseries.walkIn/online per point, trailing `channel` block); auth,
+    // agency resolution and the response envelope are unchanged.
+    const data = await computeAnalyticsDashboard({ agencyId, period })
+    return c.json({ success: true, data })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 // ─── agency/profile ───────────────────────────────────────────────────────────
 
 app.get('/profile', async (c) => {
@@ -1694,6 +1790,25 @@ async function handleAgencyProfileUpdate(c: Context) {
     const fileBase = PUBLIC_FILE_URL_BASE || new URL(c.req.url).origin
     const normalizedData = normalizeRecordFileUrls(validatedData as Record<string, unknown>, fileBase) as typeof validatedData
 
+    // Task 42: the three schedule columns are NOT NULL with DB defaults — a
+    // null from a "spread the GET response back" client must be DROPPED here
+    // (keep the stored value), never written. Nullable columns legitimately
+    // write null ("clear this field").
+    if ((normalizedData as Record<string, unknown>).workingHoursStart === null) delete (normalizedData as Record<string, unknown>).workingHoursStart
+    if ((normalizedData as Record<string, unknown>).workingHoursEnd === null) delete (normalizedData as Record<string, unknown>).workingHoursEnd
+    if ((normalizedData as Record<string, unknown>).workingDays === null) delete (normalizedData as Record<string, unknown>).workingDays
+
+    // Task 5 — Algeria address selectors: wilaya (two-digit code) + city
+    // (commune Latin name). The UI always sends them as a coherent PAIR.
+    // Null-tolerant: null means "not set yet" → keep the stored value
+    // (matches the schedule-fields contract above). A lone null is dropped
+    // so a half-set location can never land on the row.
+    const locationData = normalizedData as Record<string, unknown>
+    if (locationData.wilaya === null || locationData.city === null) {
+      delete locationData.wilaya
+      delete locationData.city
+    }
+
     await db.agency.update({
       where: { id: targetAgency.id },
       data: {
@@ -1713,8 +1828,17 @@ async function handleAgencyProfileUpdate(c: Context) {
         ...(('workingHoursStart' in normalizedData) && { workingHoursStart: (normalizedData as Record<string, unknown>).workingHoursStart as string | undefined }),
         ...(('workingHoursEnd' in normalizedData) && { workingHoursEnd: (normalizedData as Record<string, unknown>).workingHoursEnd as string | undefined }),
         ...(('workingDays' in normalizedData) && { workingDays: (normalizedData as Record<string, unknown>).workingDays as string | undefined }),
+        // Task 5 — Algeria address (wilaya two-digit code + commune Latin name)
+        ...(('wilaya' in normalizedData) && { wilaya: (normalizedData as Record<string, unknown>).wilaya as string | undefined }),
+        ...(('city' in normalizedData) && { city: (normalizedData as Record<string, unknown>).city as string | undefined }),
       },
     })
+
+    // Task 44: explicit SyncChange capture — profile edits must reach the
+    // desktop feed (see POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: targetAgency.id, model: 'Agency', recordId: targetAgency.id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
 
     // Emit realtime event (fire-and-forget)
     emitAgencyEvent('agency:updated', targetAgency.id, {
@@ -2071,6 +2195,12 @@ app.post('/queue/toggle-pause', async (c) => {
         updatedAt: new Date(),
       },
     })
+
+    // Task 44: explicit SyncChange capture — pause state must reach the
+    // desktop feed (see POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'QueueSettings', recordId: queueSettings.id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
 
     await db.auditLog.create({
       data: {
@@ -2444,12 +2574,23 @@ app.patch('/queue/:id', async (c) => {
       data: updateData,
     })
 
+    // Task 44: explicit SyncChange capture — queue actions performed from the
+    // desktop's own UI still flow through this CLOUD route on replay, and
+    // webapp/kiosk actions must reach every other device (see POST /branches
+    // note).
+    try {
+      await recordSyncChangeNow({ agencyId: reservation.agencyId, model: 'Reservation', recordId: id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
+
     // Clear the counter's currentReservationId when this reservation is completed/cancelled/no-show
     if (reservation.counterId) {
       await db.counter.updateMany({
         where: { currentReservationId: id },
         data: { currentReservationId: null },
       })
+      try {
+        await recordSyncChangeNow({ agencyId: reservation.agencyId, model: 'Counter', recordId: reservation.counterId, operation: 'update' })
+      } catch { /* capture must never fail the business write */ }
     }
 
     // Create notification (only for registered users)
@@ -2789,6 +2930,11 @@ app.post('/services', async (c) => {
       },
     })
 
+    // Task 44: explicit SyncChange capture — see POST /branches note.
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'Service', recordId: service.id, operation: 'create' })
+    } catch { /* capture must never fail the business write */ }
+
     // Emit realtime events (fire-and-forget)
     emitQueueEvent('queue:settings-updated', agencyId, {
       action: 'service-created',
@@ -2848,6 +2994,11 @@ app.patch('/services/:id', async (c) => {
       },
     })
 
+    // Task 44: explicit SyncChange capture — see POST /branches note.
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'Service', recordId: id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
+
     // Emit realtime events (fire-and-forget)
     emitQueueEvent('queue:settings-updated', agencyId, {
       action: 'service-updated',
@@ -2883,10 +3034,15 @@ app.delete('/services/:id', async (c) => {
     // Task 37-c: service writes need canManageServices for non-owners.
     await requireAgencyAuthority(c, agencyId, 'canManageServices')
 
-    await db.service.update({
+    const deletedService = await db.service.update({
       where: { id },
       data: { isActive: false },
     })
+
+    // Task 44: explicit SyncChange capture (soft delete → 'update').
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'Service', recordId: id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
 
     // Emit realtime events (fire-and-forget)
     emitQueueEvent('queue:settings-updated', agencyId, {
@@ -3058,6 +3214,12 @@ app.patch('/settings', async (c) => {
       },
     })
 
+    // Task 44: explicit SyncChange capture — settings edits must reach the
+    // desktop feed (see POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId: targetAgency.id, model: 'Agency', recordId: targetAgency.id, operation: 'update' })
+    } catch { /* capture must never fail the business write */ }
+
     // Emit realtime event (fire-and-forget)
     emitAgencyEvent('agency:updated', targetAgency.id, {
       action: 'settings-updated',
@@ -3171,6 +3333,11 @@ app.post('/staff', async (c) => {
       },
     })
 
+    // Task 44: explicit SyncChange capture — see POST /branches note.
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'AgencyStaff', recordId: staff.id, operation: 'create' })
+    } catch { /* capture must never fail the business write */ }
+
     // Emit realtime event (fire-and-forget)
     emitStaffEvent('staff:updated', agencyId, {
       action: 'staff-added',
@@ -3229,6 +3396,12 @@ app.delete('/staff', async (c) => {
     await db.agencyStaff.delete({
       where: { id: staffId },
     })
+
+    // Task 44: explicit SyncChange capture (hard delete → tombstone feeds a
+    // 'delete' change the desktop applies as a local delete).
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'AgencyStaff', recordId: staffId, operation: 'delete' })
+    } catch { /* capture must never fail the business write */ }
 
     // Emit realtime event (fire-and-forget)
     emitStaffEvent('staff:updated', agencyId, {
@@ -3387,6 +3560,13 @@ app.post('/staff/create', async (c) => {
         },
       },
     })
+
+    // Task 44: explicit SyncChange capture — the staff User row AND the link
+    // both reach the desktop feed (see POST /branches note).
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'User', recordId: newUser.id, operation: 'create' })
+      await recordSyncChangeNow({ agencyId, model: 'AgencyStaff', recordId: staffLink.id, operation: 'create' })
+    } catch { /* capture must never fail the business write */ }
 
     // Return the created staff with initial password so owner can share it
     // Emit realtime event (fire-and-forget)
@@ -3565,6 +3745,15 @@ app.patch('/staff/:id', async (c) => {
       },
     })
 
+    // Task 44: explicit SyncChange capture — covers the AgencyStaff row AND
+    // the linked User (fullName/isActive may have changed too).
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'AgencyStaff', recordId: id, operation: 'update' })
+      if (updated?.userId) {
+        await recordSyncChangeNow({ agencyId, model: 'User', recordId: updated.userId, operation: 'update' })
+      }
+    } catch { /* capture must never fail the business write */ }
+
     // Emit realtime event (fire-and-forget)
     emitStaffEvent('staff:updated', agencyId, {
       action: 'staff-updated',
@@ -3639,8 +3828,16 @@ app.delete('/staff/:id', async (c) => {
           where: { id: staffUser.id },
           data: { isActive: false },
         })
+        try {
+          await recordSyncChangeNow({ agencyId, model: 'User', recordId: staffUser.id, operation: 'update' })
+        } catch { /* capture must never fail the business write */ }
       }
     }
+
+    // Task 44: explicit SyncChange capture (hard delete of the staff link).
+    try {
+      await recordSyncChangeNow({ agencyId, model: 'AgencyStaff', recordId: id, operation: 'delete' })
+    } catch { /* capture must never fail the business write */ }
 
     // Emit realtime event (fire-and-forget)
     emitStaffEvent('staff:updated', agencyId, {

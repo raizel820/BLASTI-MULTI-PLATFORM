@@ -27,6 +27,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
+import { unwrapListPayload } from '@/lib/list-payload';
 import type { TranslationKeys } from '@/i18n';
 
 interface CounterInfo {
@@ -137,12 +138,15 @@ export function CounterManagement({
       const branchNames = new Map<string, string>();
       if (bRes && bRes.ok) {
         const bData = await bRes.json();
-        const branches: Array<{ id: string; name: string }> = bData.branches ?? bData.data ?? [];
+        // Task 45 root cause: the local dual envelope arrives UNWRAPPED as a
+        // raw array (see list-payload.ts) — accept every outcome.
+        const branches = unwrapListPayload<{ id: string; name: string }>(bData, ['branches', 'data']);
         branches.forEach((b) => branchNames.set(b.id, b.name));
       }
       if (cRes.ok) {
         const cData = await cRes.json();
-        const raw: Array<Record<string, unknown>> = cData.counters ?? cData.data ?? [];
+        // Task 45 root cause: same unwrap collapse as the branch list.
+        const raw = unwrapListPayload<Record<string, unknown>>(cData, ['counters', 'data']);
         setCounters(
           raw.map((c) => {
             const staff = c.staff as { user?: { fullName?: string; username?: string } } | null | undefined;

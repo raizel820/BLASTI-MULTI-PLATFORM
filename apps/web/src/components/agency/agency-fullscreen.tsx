@@ -52,6 +52,7 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
+import { unwrapListPayload } from '@/lib/list-payload';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
 import { useAgencyAuthority } from '@/hooks/use-agency-authority';
@@ -363,13 +364,17 @@ export function AgencyFullscreen() {
       const res = await apiFetch(`/api/agency/branches?agencyId=${encodeURIComponent(agencyId)}`);
       if (!res.ok) return;
       const data = await res.json();
-      if (!data.success || !data.branches) return;
+      // Task 45 root cause: apiClient's parseResponse auto-unwrap collapses
+      // the local dual envelope { success, branches, data } to the RAW ARRAY —
+      // `data.success`/`data.branches` on an array was always undefined, which
+      // silently emptied the fullscreen counter picker on desktop.
+      const branchRows = unwrapListPayload<{ id: string; name: string }>(data, ['branches']);
       const allCounters: CounterOption[] = [];
-      for (const branch of data.branches) {
+      for (const branch of branchRows) {
         const cRes = await apiFetch(`/api/agency/branches/${branch.id}/counters`);
         if (!cRes.ok) continue;
         const cData = await cRes.json();
-        const list: Array<Record<string, unknown>> = cData.counters ?? cData.data ?? [];
+        const list: Array<Record<string, unknown>> = unwrapListPayload(cData, ['counters', 'data']);
         for (const c of list) {
           if (c.isActive === false) continue;
           const staff = c.staff as { user?: { fullName?: string; username?: string } } | null | undefined;

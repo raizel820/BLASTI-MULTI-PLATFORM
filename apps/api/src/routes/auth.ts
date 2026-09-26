@@ -364,6 +364,11 @@ app.post('/login', async (c) => {
       if (user.role === 'AGENCY_OWNER') {
         const ownedAgency = await db.agency.findFirst({
           where: { ownerId: user.id },
+          // Task 43: deterministic pick (oldest owned agency) — must match
+          // getUserAgencyId/verifyAgencyOwnership/resolveUserAgencyId so the
+          // login-bound agency, the ownership checks and the sync importer
+          // all agree even when an owner somehow owns multiple agencies.
+          orderBy: { createdAt: 'asc' },
           select: { id: true },
         })
         agencyId = ownedAgency?.id
@@ -440,6 +445,14 @@ app.post('/register', async (c) => {
     }
 
     const { username, fullName, password, email, phoneNumber, role, agencyCode } = validation.data
+    // Task 5 — optional Algeria address (register form location selectors).
+    // wilaya arrives as the canonical two-digit code (schema regex enforced);
+    // padStart is defense in depth for unpadded '1'..'9' style clients. An
+    // invalid/empty commune is dropped rather than stored.
+    const registerWilaya = validation.data.wilaya
+      ? (validation.data.wilaya.padStart(2, '0').match(/^(0[1-9]|[1-5][0-8])$/) ? validation.data.wilaya.padStart(2, '0') : undefined)
+      : undefined
+    const registerCommune = validation.data.commune?.trim() || undefined
     // Round 15 — the desktop local API returns LOCAL file URLs (offline-first
     // upload); rewrite them to this API's public URLs so the stored avatar is
     // reachable from every device once the file-sync push delivers the blob.
@@ -502,6 +515,9 @@ app.post('/register', async (c) => {
         avatarUrl: avatarUrl || undefined,
         emailVerified: isSuperAdmin,
         phoneVerified: isSuperAdmin,
+        // Task 5 — optional Algeria address (absent → NULL columns).
+        wilaya: registerWilaya,
+        commune: registerCommune,
       },
       select: {
         id: true,
@@ -514,6 +530,10 @@ app.post('/register', async (c) => {
         isActive: true,
         email: true,
         phoneNumber: true,
+        // Task 5 — included so the desktop register proxy can mirror the
+        // address onto the local operational User row.
+        wilaya: true,
+        commune: true,
         createdAt: true,
       },
     })
@@ -954,19 +974,25 @@ app.post('/refresh-session', async (c) => {
       return c.json({ success: false, error: 'Account not found — please sign in again' }, 401)
     }
 
-    // Resolve the CURRENT agency: active staff membership first, then owned
-    // agency (mirrors sync.ts resolveTargetAgencyId).
-    const staffRecord = await db.agencyStaff.findFirst({
-      where: { userId: dbUser.id, isActive: true },
-      select: { agencyId: true },
+    // Resolve the CURRENT agency: OWNED agency first (deterministic oldest
+    // pick), then active staff membership — Task 44: ALIGNED with the
+    // business surface (verifyAgencyOwnership / getUserAgencyId /
+    // resolveUserAgencyId all own-first + createdAt-asc). The previous
+    // staff-first order could bind a DIFFERENT agency than every business
+    // route for an owner who also has a staff row.
+    let agencyId: string | null = null
+    const ownedAgency = await db.agency.findFirst({
+      where: { ownerId: dbUser.id },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
     })
-    let agencyId: string | null = staffRecord?.agencyId ?? null
+    agencyId = ownedAgency?.id ?? null
     if (!agencyId) {
-      const ownedAgency = await db.agency.findFirst({
-        where: { ownerId: dbUser.id },
-        select: { id: true },
+      const staffRecord = await db.agencyStaff.findFirst({
+        where: { userId: dbUser.id, isActive: true },
+        select: { agencyId: true },
       })
-      agencyId = ownedAgency?.id ?? null
+      agencyId = staffRecord?.agencyId ?? null
     }
 
     const freshUser: SessionUser = {

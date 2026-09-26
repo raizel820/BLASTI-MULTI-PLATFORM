@@ -145,7 +145,12 @@ export function QueueReservationCard({
   // The backend calculateETA() engine provides min/max range + confidence.
   // We display that directly instead of applying arbitrary ±20% math.
   const formatEtaBadge = (reservation: Reservation): string => {
+    // estimatedWait is nullable in the schema (Int?) — null means "the engine
+    // hasn't produced an estimate yet" (fresh account / queue not started),
+    // which is NOT the same as paused. Render a neutral dash instead of
+    // wrongly labelling the ticket Paused.
     const wait = reservation.estimatedWait;
+    if (wait == null) return '—';
     if (wait <= 0) return t('paused') || 'Paused';
     if (wait >= 60) {
       const hrs = Math.floor(wait / 60);
@@ -223,8 +228,8 @@ export function QueueReservationCard({
                   {isCalled ? t('statusCalled') : t('statusWaiting')}
                 </span>
                 <div className="flex items-center gap-1.5 ms-auto flex-shrink-0">
-                  {/* Estimated Wait Time Badge for WAITING status */}
-                  {res.status === 'WAITING' && !isCalled && res.estimatedWait > 0 && (
+                  {/* Estimated Wait Time Badge for WAITING status (null estimate = not computed yet → neutral dash, not "Paused") */}
+                  {res.status === 'WAITING' && !isCalled && res.estimatedWait != null && res.estimatedWait > 0 && (
                     <motion.span
                       initial={{ opacity: 0, scale: 0.8 }}
                       animate={{ opacity: 1, scale: 1 }}
@@ -237,7 +242,7 @@ export function QueueReservationCard({
                       }
                     </motion.span>
                   )}
-                  {res.status === 'WAITING' && !isCalled && res.estimatedWait <= 0 && (
+                  {res.status === 'WAITING' && !isCalled && res.estimatedWait != null && res.estimatedWait <= 0 && (
                     <span className="text-xs font-medium bg-amber-400/30 px-2.5 py-0.5 rounded-full whitespace-nowrap">
                       {t('paused')}
                     </span>

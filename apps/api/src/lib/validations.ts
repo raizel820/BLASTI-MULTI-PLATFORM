@@ -6,6 +6,13 @@
  */
 import { z } from 'zod'
 
+/**
+ * Task 5 — Algeria address selectors. Official two-digit ANI wilaya codes
+ * '01'-'58'. Only the canonical padded form passes; route handlers normalize
+ * client values with padStart(2,'0') before persisting.
+ */
+export const wilayaCodeRegex = /^(0[1-9]|[1-5][0-8])$/
+
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
 export const loginSchema = z.object({
@@ -32,6 +39,10 @@ export const registerSchema = z.object({
   role: z.enum(['CUSTOMER', 'AGENCY_OWNER', 'SUPER_ADMIN']).optional().default('CUSTOMER'),
   agencyCode: z.string().optional(),
   avatarUrl: z.string().url().optional().or(z.literal('')),
+  // Task 5 — optional Algeria address (register form location selectors).
+  // wilaya = two-digit official code, commune = baladiya Latin name.
+  wilaya: z.string().regex(wilayaCodeRegex, 'wilaya must be a two-digit wilaya code (01-58)').optional(),
+  commune: z.string().min(1).max(120).optional(),
 })
 
 export const changePasswordSchema = z.object({
@@ -98,25 +109,36 @@ export const rateReservationSchema = z.object({
 export const workingDaysRegex = /^([0-6])(,[0-6])*$/
 
 export const updateAgencyProfileSchema = z.object({
+  // Task 42: null-tolerant profile saves. The webapp spreads the GET response
+  // straight back into the PATCH body — nullable columns (String? in Prisma)
+  // legitimately carry `null` ("not set by the user yet" / "clear this field"),
+  // and `z.string().optional()` REJECTS null with a 400. Every nullable column
+  // now accepts null; the three NOT-NULL-with-default schedule fields accept
+  // null in the schema but the handler strips it (they must never write null).
   name: z.string().min(1).max(100).optional(),
-  nameAr: z.string().optional(),
-  nameFr: z.string().optional(),
-  description: z.string().max(500).optional(),
-  descriptionAr: z.string().max(500).optional(),
-  descriptionFr: z.string().max(500).optional(),
-  address: z.string().max(200).optional(),
-  phone: z.string().max(20).optional(),
+  nameAr: z.string().nullable().optional(),
+  nameFr: z.string().nullable().optional(),
+  description: z.string().max(500).nullable().optional(),
+  descriptionAr: z.string().max(500).nullable().optional(),
+  descriptionFr: z.string().max(500).nullable().optional(),
+  address: z.string().max(200).nullable().optional(),
+  phone: z.string().max(20).nullable().optional(),
   category: z.string().optional(),
-  website: z.string().url().optional().or(z.literal('')),
+  website: z.string().url().optional().or(z.literal('')).nullable().optional(),
   // Task 31 (bug 13): nullable so desktop-synced profile saves that carry
   // explicit nulls ("clear this field") no longer fail validation with a 400 —
   // the outbox replay classifies 400s as permanent_failed and never retries.
   logoUrl: z.string().max(2048).nullable().optional(),
   coverUrl: z.string().max(2048).nullable().optional(),
-  workingHoursStart: z.string().optional(),
-  workingHoursEnd: z.string().optional(),
+  workingHoursStart: z.string().nullable().optional(),
+  workingHoursEnd: z.string().nullable().optional(),
   /// CSV of weekday numbers 0=Sunday…6=Saturday, e.g. "0,1,2,3,4"
-  workingDays: z.string().regex(workingDaysRegex, 'workingDays must be a comma-separated list of weekday numbers 0-6').optional(),
+  workingDays: z.string().regex(workingDaysRegex, 'workingDays must be a comma-separated list of weekday numbers 0-6').nullable().optional(),
+  // Task 5 — Algeria address selectors (agency profile). Nullable to follow
+  // the established null-tolerant spread-the-GET-response pattern; wilaya is
+  // the two-digit official code, city is the commune (baladiya) Latin name.
+  wilaya: z.string().regex(wilayaCodeRegex, 'wilaya must be a two-digit wilaya code (01-58)').nullable().optional(),
+  city: z.string().min(1).max(120).nullable().optional(),
 })
 
 export const updateAgencySettingsSchema = z.object({
@@ -203,6 +225,11 @@ export const adminCreateAgencySchema = z.object({
     /// Single uppercase letter A–Z (auto-assigned when omitted).
     prefix: z.string().regex(/^[A-Z]$/, 'prefix must be a single uppercase letter A-Z').optional(),
   })).max(20).optional(),
+  // Task 5 — Algeria address selectors (create-agency wizard address step).
+  // wilaya = two-digit official code, city = commune (baladiya) Latin name.
+  // Both optional — when omitted the Agency row keeps its DB defaults.
+  wilaya: z.string().regex(wilayaCodeRegex, 'wilaya must be a two-digit wilaya code (01-58)').optional(),
+  city: z.string().min(1).max(120).optional(),
 })
 
 export const adminUpdateAgencySchema = z.object({

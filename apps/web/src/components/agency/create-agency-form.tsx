@@ -38,15 +38,14 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
-
-const categoryOptions = [
-  { value: 'CLINIC', labelKey: 'catClinic', icon: '🏥' },
-  { value: 'AGENCY', labelKey: 'catAgency', icon: '🏢' },
-  { value: 'LAW_FIRM', labelKey: 'catLawFirm', icon: '⚖️' },
-  { value: 'LABORATORY', labelKey: 'catLaboratory', icon: '🔬' },
-  { value: 'GOVERNMENT', labelKey: 'catGovernment', icon: '🏛️' },
-  { value: 'OTHER', labelKey: 'catOther', icon: '📋' },
-] as const;
+import { AgencyCategorySelect } from '@/components/agency/agency-category-select';
+import { BUILT_IN_CATEGORY_OPTIONS } from '@/hooks/use-agency-categories';
+// Task 5 — Algeria address selectors (58 wilayas + their communes).
+import {
+  WilayaSelect,
+  CommuneSelect,
+  composeLocationLabel,
+} from '@/components/shared/algeria-location-selects';
 
 // ─── Floating Label Input ─────────────────────────────
 function FloatingInput({
@@ -213,61 +212,6 @@ function StepIndicator({
   );
 }
 
-// ─── Category Selection Card ──────────────────────────
-function CategoryCard({
-  option,
-  isSelected,
-  onClick,
-  label,
-}: {
-  option: typeof categoryOptions[number];
-  isSelected: boolean;
-  onClick: () => void;
-  label: string;
-}) {
-  return (
-    <motion.button
-      type="button"
-      onClick={onClick}
-      whileTap={{ scale: 0.97 }}
-      className={`relative flex flex-col items-center justify-center gap-1.5 p-3 sm:p-4 rounded-xl border-2 transition-all duration-300 cursor-pointer group ${
-        isSelected
-          ? 'border-emerald-500 dark:border-emerald-400 bg-emerald-50 dark:bg-emerald-900/20 shadow-md shadow-emerald-500/10'
-          : 'border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 hover:border-emerald-300 dark:hover:border-emerald-700 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10'
-      }`}
-    >
-      {/* Checkmark badge */}
-      <AnimatePresence>
-        {isSelected && (
-          <motion.div
-            initial={{ scale: 0, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            exit={{ scale: 0, opacity: 0 }}
-            transition={{ type: 'spring', stiffness: 300, damping: 20 }}
-            className="absolute -top-1.5 -end-1.5 w-5 h-5 bg-gradient-to-br from-emerald-500 to-teal-500 rounded-full flex items-center justify-center shadow-sm"
-          >
-            <Check className="h-3 w-3 text-white" strokeWidth={3} />
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      {/* Emoji icon */}
-      <span className="text-2xl sm:text-3xl select-none">{option.icon}</span>
-
-      {/* Category name */}
-      <span
-        className={`text-xs sm:text-sm font-medium text-center leading-tight transition-colors duration-200 ${
-          isSelected
-            ? 'text-emerald-700 dark:text-emerald-300'
-            : 'text-gray-600 dark:text-gray-400 group-hover:text-emerald-600 dark:group-hover:text-emerald-400'
-        }`}
-      >
-        {label}
-      </span>
-    </motion.button>
-  );
-}
-
 // ─── Confetti Circle ──────────────────────────────────
 function ConfettiCircle({ delay, x, size, color, duration }: { delay: number; x: string; size: number; color: string; duration: number }) {
   return (
@@ -360,6 +304,11 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
 
   // Step 1: Contact Details
   const [address, setAddress] = useState('');
+  // Task 5 — REQUIRED Algeria address: wilaya = two-digit official code,
+  // city/commune = baladiya LATIN name. Pre-filled one-shot from the register
+  // form handoff (localStorage 'blasti:reg-location') when present.
+  const [wilayaCode, setWilayaCode] = useState('');
+  const [communeName, setCommuneName] = useState('');
   const [phone, setPhone] = useState('');
   const [email, setEmail] = useState('');
   const [description, setDescription] = useState('');
@@ -421,6 +370,25 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   };
 
   const filledServices = services.filter((s) => s.name.trim().length > 0);
+
+  // Task 5 — one-shot location handoff from the register form. Read + REMOVE
+  // 'blasti:reg-location' on mount so the selection pre-fills this wizard
+  // exactly once (re-opening the wizard later must not resurrect a stale
+  // choice). A corrupted/invalid payload is ignored silently.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('blasti:reg-location');
+      if (!raw) return;
+      localStorage.removeItem('blasti:reg-location');
+      const parsed = JSON.parse(raw) as { wilaya?: unknown; commune?: unknown };
+      const w = typeof parsed.wilaya === 'string' ? parsed.wilaya.trim().padStart(2, '0') : '';
+      const c = typeof parsed.commune === 'string' ? parsed.commune.trim() : '';
+      if (w) {
+        setWilayaCode(w);
+        if (c) setCommuneName(c);
+      }
+    } catch { /* corrupted payload — ignore, leave the selectors empty */ }
+  }, []);
 
   // Errors
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -580,6 +548,14 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       if (nameAr.trim()) body.nameAr = nameAr.trim();
       if (nameFr.trim()) body.nameFr = nameFr.trim();
       if (address.trim()) body.address = address.trim();
+      // Task 5 — Algeria address selectors: sent as a PAIR (two-digit wilaya
+      // code + commune Latin name) only when both are chosen. Skipping them
+      // keeps the request valid and lets the server defaults apply
+      // coherently (wilaya '28' + city "M'Sila").
+      if (wilayaCode && communeName) {
+        body.wilaya = wilayaCode;
+        body.city = communeName;
+      }
       if (phone.trim()) body.phone = phone.trim();
       if (email.trim()) body.email = email.trim();
       if (description.trim()) body.description = description.trim();
@@ -696,9 +672,11 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   };
 
   // ─── Get selected category label ─────────────────
+  // Built-ins resolve through the shared 25-option list; custom categories
+  // (user-entered names) display as-is.
   const getSelectedCategoryLabel = () => {
-    const found = categoryOptions.find((o) => o.value === category);
-    return found ? t(found.labelKey as any) : category;
+    const found = BUILT_IN_CATEGORY_OPTIONS.find((o) => o.value === category);
+    return found ? `${found.icon} ${t(found.labelKey as any)}` : category;
   };
 
   // ─── Confetti colors ────────────────────────────
@@ -908,22 +886,15 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   dir="ltr"
                 />
 
-                {/* Category Selection Grid */}
+                {/* Category Selection — shared searchable picker (25 built-ins + custom fields) */}
                 <div className="space-y-2.5">
                   <Label className="text-sm font-medium">
                     {t('agencyCategory' as any)} <span className="text-red-500">*</span>
                   </Label>
-                  <div className="grid grid-cols-3 gap-2 sm:gap-3">
-                    {categoryOptions.map((opt) => (
-                      <CategoryCard
-                        key={opt.value}
-                        option={opt}
-                        isSelected={category === opt.value}
-                        onClick={() => { setCategory(opt.value); setErrors((p) => ({ ...p, category: '' })); }}
-                        label={t(opt.labelKey as any)}
-                      />
-                    ))}
-                  </div>
+                  <AgencyCategorySelect
+                    value={category}
+                    onChange={(v) => { setCategory(v); setErrors((p) => ({ ...p, category: '' })); }}
+                  />
                   {errors.category && (
                     <motion.p
                       initial={{ opacity: 0, y: -4 }}
@@ -947,12 +918,56 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   <span className="text-sm font-semibold text-foreground">{t('contactDetails' as any)}</span>
                 </div>
 
-                {/* Address */}
+                {/* Task 5 — REQUIRED Algeria location: wilaya + commune
+                    (baladiya). Marked required; the request simply omits
+                    them if skipped so the server defaults apply. */}
+                <div className="space-y-2.5">
+                  <Label className="text-sm font-medium flex items-center gap-1.5">
+                    <MapPin className="h-3.5 w-3.5 text-muted-foreground" />
+                    {t('location.wilaya' as any)} <span className="text-red-500">*</span>
+                  </Label>
+                  <WilayaSelect
+                    value={wilayaCode}
+                    onValueChange={(code) => {
+                      setWilayaCode(code);
+                      // Dependent list — reset the commune on wilaya change.
+                      setCommuneName('');
+                    }}
+                    lang={lang}
+                    placeholder={t('location.selectWilaya' as any)}
+                    id="agency-wilaya"
+                    aria-label={t('location.wilaya' as any)}
+                    triggerClassName="h-12 rounded-xl text-sm font-medium data-[state=open]:border-emerald-300 dark:data-[state=open]:border-emerald-700 focus-visible:border-emerald-300 dark:focus-visible:border-emerald-700 focus-visible:ring-emerald-500/10"
+                  />
+                  <Label className="text-sm font-medium">
+                    {t('location.commune' as any)} <span className="text-red-500">*</span>
+                  </Label>
+                  <CommuneSelect
+                    wilayaCode={wilayaCode}
+                    value={communeName}
+                    onValueChange={setCommuneName}
+                    lang={lang}
+                    placeholder={t('location.selectCommune' as any)}
+                    id="agency-commune"
+                    aria-label={t('location.commune' as any)}
+                    triggerClassName="h-12 rounded-xl text-sm font-medium data-[state=open]:border-emerald-300 dark:data-[state=open]:border-emerald-700 focus-visible:border-emerald-300 dark:focus-visible:border-emerald-700 focus-visible:ring-emerald-500/10"
+                  />
+                  {/* Composed location hint, e.g. "16 - Alger · Bab El Oued" */}
+                  {composeLocationLabel(wilayaCode, communeName, lang) && (
+                    <p className="text-[10px] text-muted-foreground flex items-center gap-1">
+                      <MapPin className="h-3 w-3 shrink-0 text-emerald-500" />
+                      {composeLocationLabel(wilayaCode, communeName, lang)}
+                    </p>
+                  )}
+                </div>
+
+                {/* Address — optional street detail under the selected
+                    wilaya/commune (Task 5 relabel). */}
                 <FloatingInput
                   id="agency-address"
                   value={address}
                   onChange={setAddress}
-                  label={`${t('agencyAddress' as any)} (${t('optional' as any)})`}
+                  label={t('location.streetAddress' as any)}
                   placeholder={t('agencyAddressPlaceholder' as any)}
                   icon={MapPin}
                 />
@@ -1286,7 +1301,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   <PreviewRow label={t('agencyName' as any)} value={name} />
                   {nameAr && <PreviewRow label={t('agencyNameAr' as any)} value={nameAr} dir="rtl" />}
                   {nameFr && <PreviewRow label={t('agencyNameFr' as any)} value={nameFr} dir="ltr" />}
-                  <PreviewRow label={t('agencyCategory' as any)} value={`${categoryOptions.find(o => o.value === category)?.icon} ${getSelectedCategoryLabel()}`} />
+                  <PreviewRow label={t('agencyCategory' as any)} value={getSelectedCategoryLabel()} />
                 </PreviewSection>
 
                 {/* Contact Details Preview */}
@@ -1295,12 +1310,15 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   icon={Briefcase}
                   onEdit={() => goToStep(1)}
                 >
+                  {composeLocationLabel(wilayaCode, communeName, lang) && (
+                    <PreviewRow label={t('location.wilaya' as any)} value={composeLocationLabel(wilayaCode, communeName, lang) || ''} />
+                  )}
                   {address && <PreviewRow label={t('agencyAddress' as any)} value={address} />}
                   {phone && <PreviewRow label={t('phoneNumber' as any)} value={phone} dir="ltr" />}
                   {email && <PreviewRow label={t('email' as any)} value={email} dir="ltr" />}
                   {description && <PreviewRow label={t('description' as any)} value={description.length > 80 ? `${description.slice(0, 80)}...` : description} />}
                   {customCode && <PreviewRow label={t('agencyCodeField' as any)} value={customCode} dir="ltr" />}
-                  {!address && !phone && !email && !description && !customCode && (
+                  {!address && !phone && !email && !description && !customCode && !composeLocationLabel(wilayaCode, communeName, lang) && (
                     <span className="text-xs text-muted-foreground italic">{t('noData' as any)}</span>
                   )}
                 </PreviewSection>

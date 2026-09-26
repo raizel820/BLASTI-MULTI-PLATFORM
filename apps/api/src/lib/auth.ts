@@ -469,6 +469,11 @@ export async function requireStaffPermission(
 export async function getUserAgencyId(userId: string): Promise<string | null> {
   const ownedAgency = await db.agency.findFirst({
     where: { ownerId: userId },
+    // Task 43: WITHOUT an explicit order, SQLite's pick among multiple owned
+    // agencies is undefined — login/ownership/sync could each bind a DIFFERENT
+    // agency (split-brain: branches visible in webapp, empty on desktop).
+    // Deterministic: the OLDEST owned agency wins everywhere.
+    orderBy: { createdAt: 'asc' },
     select: { id: true },
   })
   if (ownedAgency) return ownedAgency.id
@@ -486,6 +491,8 @@ export async function verifyAgencyOwnership(
 ): Promise<{ agencyId: string; isOwner: boolean } | null> {
   const ownedAgency = await db.agency.findFirst({
     where: { ownerId: userId },
+    // Task 43: same deterministic pick as getUserAgencyId/resolveUserAgencyId.
+    orderBy: { createdAt: 'asc' },
     select: { id: true },
   })
   if (ownedAgency) {
@@ -510,6 +517,8 @@ export async function resolveUserAgencyId(user: SessionUser): Promise<string | n
   if (user.role === 'SUPER_ADMIN') return null
   const ownedAgency = await db.agency.findFirst({
     where: { ownerId: user.id },
+    // Task 43: same deterministic pick as getUserAgencyId/verifyAgencyOwnership.
+    orderBy: { createdAt: 'asc' },
     select: { id: true },
   })
   if (ownedAgency) return ownedAgency.id

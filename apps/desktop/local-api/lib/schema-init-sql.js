@@ -16,6 +16,11 @@ CREATE TABLE "User" (
     "fullName" TEXT NOT NULL,
     "email" TEXT,
     "phoneNumber" TEXT,
+    -- Task 5: Algeria address selectors (manual sync from the shared
+    -- schema.prisma User model — the ensureSchema column top-up auto-adds
+    -- these to pre-existing local DBs from this DDL).
+    "wilaya" TEXT,
+    "commune" TEXT,
     "shortAppId" TEXT,
     "passwordHash" TEXT,
     "role" TEXT NOT NULL DEFAULT 'CUSTOMER',
@@ -85,7 +90,7 @@ CREATE TABLE "Agency" (
     "autoPauseWhenFull" BOOLEAN NOT NULL DEFAULT false,
     "isSponsored" BOOLEAN NOT NULL DEFAULT false,
     "subscriptionPlanId" TEXT,
-    "subscriptionTier" TEXT NOT NULL DEFAULT 'BASIC',
+    "subscriptionTier" TEXT NOT NULL DEFAULT 'FREE',
     "subscriptionStatus" TEXT NOT NULL DEFAULT 'INACTIVE',
     "workingHoursStart" TEXT NOT NULL DEFAULT '08:00',
     "workingHoursEnd" TEXT NOT NULL DEFAULT '17:00',
@@ -527,6 +532,22 @@ CREATE TABLE "FAQ" (
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
 );
+
+-- CreateTable (Task 42-a: user-created agency fields/industries — shared dictionary)
+CREATE TABLE "AgencyCategory" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "name" TEXT NOT NULL,
+    "nameFr" TEXT,
+    "nameAr" TEXT,
+    "icon" TEXT,
+    "isCustom" BOOLEAN NOT NULL DEFAULT true,
+    "createdBy" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "AgencyCategory_name_key" ON "AgencyCategory"("name");
 
 -- CreateTable
 CREATE TABLE "PaymentSettings" (

@@ -30,6 +30,7 @@ export type ViewName =
   | 'agency-subscription'
   | 'agency-branches'
   | 'agency-devices'
+  | 'agency-analytics'
   | 'admin-dashboard'
   | 'admin-transactions'
   | 'admin-agencies'
@@ -135,6 +136,7 @@ const viewHashMap: Record<ViewName, string> = {
   'agency-subscription': '#/agency/subscription',
   'agency-branches': '#/agency/branches',
   'agency-devices': '#/agency/devices',
+  'agency-analytics': '#/agency/analytics',
   'admin-dashboard': '#/admin',
   'admin-transactions': '#/admin/transactions',
   'admin-agencies': '#/admin/agencies',
@@ -251,6 +253,7 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'customer-profile', 'customer-favorites', 'customer-settings', 'customer-sms-wallet',
   'agency-dashboard', 'agency-settings', 'agency-employees', 'agency-profile',
   'agency-reviews', 'agency-subscription', 'agency-branches', 'agency-devices',
+  'agency-analytics',
   'admin-dashboard', 'admin-transactions', 'admin-agencies', 'admin-audit',
   'admin-users', 'admin-analytics', 'admin-settings', 'admin-subscription-plans', 'admin-app-settings',
   'admin-hardware', 'admin-enterprise-requests',

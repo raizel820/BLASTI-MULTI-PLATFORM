@@ -101,10 +101,27 @@ function handleAuthExpired(): void {
       const currentUser = store.user;
       console.log(`[Auth] Electron 401 → attempting session restore (user=${currentUser?.id || 'null'})`);
 
-      // Try to re-import the session from persisted storage into the local API FIRST.
-      // If successful, the next request will succeed without any UI disruption.
       const w = window as any;
       let sessionRestored = false;
+
+      // ── Task 41: token CATCH-UP before any destructive restore ──────────
+      // The local API may hold a NEWER token than the renderer (the main
+      // process's import-session adopted a cloud-refreshed token). First ask
+      // it to hand us the current token for our session chain; only if that
+      // fails do we fall back to re-importing (which — with the local API's
+      // new rotation grace — no longer hard-invalidates the fresh token).
+      try {
+        const { adoptLocalSession } = await import('@/lib/session-adopt');
+        const adopt = await adoptLocalSession();
+        if (adopt.adopted) {
+          sessionRestored = true;
+          console.log('[Auth] Electron 401 → session adopted (renderer token caught up to the local session) — no state reset needed');
+          return; // done — the next request carries the current token
+        }
+      } catch { /* fall through to the legacy restore path */ }
+
+      // Try to re-import the session from persisted storage into the local API FIRST.
+      // If successful, the next request will succeed without any UI disruption.
       try {
         // Try local API token first (used for port 3080 requests)
         const localToken = localStorage.getItem('blasti-local-api-token');

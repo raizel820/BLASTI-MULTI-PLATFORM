@@ -36,6 +36,11 @@ model User {
   role                    String         @default("CUSTOMER")
   language                String         @default("ar")
   avatarUrl               String?
+  /// Algeria address selectors (Task 5): optional home wilaya (official
+  /// two-digit ANI code '01'-'58') + commune (baladiya, Latin name). Nullable
+  /// — only set when the user picks them in the register/location UI.
+  wilaya                  String?
+  commune                 String?
   /// Storage provider for avatar ('local'). Null = legacy URL.
   avatarStorageProvider   String?
   /// Storage key for avatar. Used with getFileUrl() for provider-neutral access.
@@ -749,6 +754,23 @@ model FAQ {
   isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+}
+
+// Task 42-a: user-created agency fields/industries. When an agency owner does
+// not find their field among the BUILT-IN categories (see apps/web/src/lib/enums.ts
+// AgencyCategory), they can create a new one — and every other agency owner
+// can then select it too. Global model (not agency-scoped): categories are a
+// shared platform dictionary. `name` is the value stored in Agency.category.
+model AgencyCategory {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  nameFr    String?
+  nameAr    String?
+  icon      String?
+  isCustom  Boolean  @default(true)
+  createdBy String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model PaymentSettings {

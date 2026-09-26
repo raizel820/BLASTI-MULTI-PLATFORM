@@ -212,10 +212,13 @@ export function useAgencyAuthority(): UseAgencyAuthorityResult {
 // ─── Shared access matrix (sidebar + page guards) ───────────────────────────
 //
 //   AGENCY_OWNER / SUPER_ADMIN → everything (unchanged).
-//   MANAGER  → dashboard + history always; branches when ANY branch authority;
-//              subscription when a purchase/subscription authority; profile +
-//              settings when canManageProfile; devices/reviews/employees never.
-//   STAFF    → dashboard + history only.
+//   MANAGER  → dashboard + history always; analytics when canViewAnalytics
+//              (STAFF tier default → managers keep it too); branches when ANY
+//              branch authority; subscription when a purchase/subscription
+//              authority; profile + settings when canManageProfile;
+//              devices/reviews/employees never.
+//   STAFF    → dashboard + history always; analytics when canViewAnalytics
+//              (true in the STAFF tier defaults — STAFF_TIER_DEFAULTS above).
 //   CUSTOMER / other roles → unrestricted here (they never reach agency views
 //              through the normal flow; existing role checks still apply).
 //
@@ -226,6 +229,7 @@ export function useAgencyAuthority(): UseAgencyAuthorityResult {
 export type AgencySectionView =
   | 'agency-dashboard'
   | 'agency-history'
+  | 'agency-analytics'
   | 'agency-employees'
   | 'agency-branches'
   | 'agency-devices'
@@ -251,6 +255,10 @@ export function canAccessAgencySection(
       case 'agency-dashboard':
       case 'agency-history':
         return true;
+      case 'agency-analytics':
+        // Task 42-e: the analytics section follows canViewAnalytics (STAFF
+        // tier default is true — see STAFF_TIER_DEFAULTS).
+        return has('canViewAnalytics');
       case 'agency-branches':
         return has('canCreateBranches') || has('canDeleteBranches') || has('canManageBranches');
       case 'agency-subscription':
@@ -263,6 +271,8 @@ export function canAccessAgencySection(
     }
   }
 
-  // Plain STAFF (or unknown role) → dashboard + history only.
+  // Plain STAFF (or unknown role) → dashboard + history always; analytics when
+  // canViewAnalytics (true per the STAFF tier defaults). Task 42-e.
+  if (view === 'agency-analytics') return has('canViewAnalytics');
   return view === 'agency-dashboard' || view === 'agency-history';
 }

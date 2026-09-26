@@ -3,6 +3,7 @@ import { db, dbRaw } from '@blasti/db'
 import { requireAuth, requireAdmin, authErrorResponse } from '../lib/auth'
 import { validateBody, adminCreateAgencySchema, adminUserActionSchema, faqSchema, paymentSettingsSchema, createSubscriptionPlanSchema, updateSubscriptionPlanSchema, createHardwareProductSchema, updateHardwareProductSchema, updateHardwareSettingsSchema, updateHardwareCommitmentTierSchema, updateEnterpriseRequestStatusSchema, createEnterprisePlanFromRequestSchema } from '../lib/validations'
 import { getTodayStart, getTodayEnd } from '../lib/date-utils'
+import { computeAnalyticsDashboard, DASHBOARD_PERIODS, round1, type AnalyticsDashboardPayload, type DashboardPeriod } from '../lib/analytics-dashboard'
 import { z } from 'zod'
 import { scryptSync } from 'crypto'
 import path from 'path'
@@ -72,6 +73,20 @@ app.get('/agencies', async (c) => {
     const where: Record<string, unknown> = {}
     if (status) {
       where.subscriptionStatus = status
+    }
+
+    // Task 3: optional free-text search over name / customCode / city.
+    // NOTE: Prisma `mode: 'insensitive'` is NOT supported on SQLite (it throws
+    // at runtime — the /audit-logs search already breaks on this); SQLite's
+    // `contains` maps to LIKE, which is case-insensitive for ASCII anyway.
+    const search = c.req.query('search')
+    if (search && search.trim()) {
+      const q = search.trim()
+      where.OR = [
+        { name: { contains: q } },
+        { customCode: { contains: q } },
+        { city: { contains: q } },
+      ]
     }
 
     const [agencies, total] = await Promise.all([
@@ -496,6 +511,256 @@ app.get('/analytics', async (c) => {
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status)
+  }
+})
+
+// ─── Analytics dashboard (Task 3 — SUPER ADMIN) ──────────────────────────────
+//
+// GET /admin/analytics/dashboard?period=7d|30d|90d|12m&scope=global|average
+//
+// Runs the SAME shared engine as GET /api/agency/analytics/dashboard
+// (lib/analytics-dashboard.ts) in GLOBAL mode (agencyId = null) — identical
+// UTC bucketing and walkIn/online convention (walkIn = isWalkIn true; online =
+// !isWalkIn AND userId != null).
+//   - scope=global (default): platform-wide values as computed.
+//   - scope=average: COUNT metrics divided by the number of ACTIVE agencies
+//     (Agency.isActive), rounded to 1 decimal — rates/averages/deltas stay as
+//     the global values. ratings counts are divided too (they are count
+//     metrics; ratings.count mirrors kpis.ratingCount). topAgencies and the
+//     platform block are ALWAYS raw global numbers. If there are 0 active
+//     agencies the global values are returned unchanged (zero-division safety).
+// The legacy GET /admin/analytics (thin stats, no envelope) is kept untouched
+// above for backward compatibility.
+
+/** Divide a count by d, rounded to 1 decimal (callers guarantee d > 0). */
+function avgPerAgency(n: number, d: number): number {
+  return round1(n / d)
+}
+
+app.get('/analytics/dashboard', async (c) => {
+  try {
+    await requireAdmin(c)
+
+    const rawPeriod = c.req.query('period') || '30d'
+    const period: DashboardPeriod = (DASHBOARD_PERIODS as readonly string[]).includes(rawPeriod)
+      ? (rawPeriod as DashboardPeriod)
+      : '30d'
+    const scope = c.req.query('scope') === 'average' ? 'average' : 'global'
+
+    const base = await computeAnalyticsDashboard({ agencyId: null, period })
+    const rangeStart = new Date(base.range.start)
+    const rangeEnd = new Date(base.range.end)
+
+    // ── Platform block (ALWAYS raw global numbers, never averaged) ──────────
+    const [
+      totalAgencies,
+      activeAgencies,
+      totalCustomers,
+      newCustomersInPeriod,
+      totalReservationsAllTime,
+      allTimeWalkInCount,
+      allTimeOnlineCount,
+    ] = await Promise.all([
+      db.agency.count(),
+      db.agency.count({ where: { isActive: true } }),
+      db.user.count({ where: { role: 'CUSTOMER' } }),
+      db.user.count({ where: { role: 'CUSTOMER', createdAt: { gte: rangeStart, lte: rangeEnd } } }),
+      db.reservation.count(),
+      db.reservation.count({ where: { isWalkIn: true } }),
+      db.reservation.count({ where: { isWalkIn: false, userId: { not: null } } }),
+    ])
+
+    const platform = {
+      totalAgencies,
+      activeAgencies,
+      totalCustomers,
+      newCustomersInPeriod,
+      totalReservationsAllTime,
+      onlineRateAllTime: totalReservationsAllTime > 0 ? round1((allTimeOnlineCount / totalReservationsAllTime) * 100) : 0,
+      walkInRateAllTime: totalReservationsAllTime > 0 ? round1((allTimeWalkInCount / totalReservationsAllTime) * 100) : 0,
+    }
+
+    // ── Top agencies (raw global values — top 8 by reservations in period) ──
+    const topRows = await db.reservation.findMany({
+      where: { joinedAt: { gte: rangeStart, lte: rangeEnd } },
+      select: {
+        agencyId: true,
+        status: true,
+        isWalkIn: true,
+        userId: true,
+        joinedAt: true,
+        calledAt: true,
+        rating: true,
+      },
+    })
+
+    interface TopAgencyAgg { total: number; completed: number; walkInCount: number; onlineCount: number; waitSumMs: number; waitCount: number; ratingSum: number; ratingCount: number }
+    const topAggs = new Map<string, TopAgencyAgg>()
+    for (const r of topRows) {
+      const a = topAggs.get(r.agencyId) || { total: 0, completed: 0, walkInCount: 0, onlineCount: 0, waitSumMs: 0, waitCount: 0, ratingSum: 0, ratingCount: 0 }
+      a.total++
+      if (r.status === 'COMPLETED') a.completed++
+      if (r.isWalkIn) a.walkInCount++
+      else if (r.userId) a.onlineCount++
+      if (r.calledAt) {
+        a.waitSumMs += r.calledAt.getTime() - r.joinedAt.getTime()
+        a.waitCount++
+      }
+      if (r.rating !== null && r.rating >= 1 && r.rating <= 5) {
+        a.ratingSum += r.rating
+        a.ratingCount++
+      }
+      topAggs.set(r.agencyId, a)
+    }
+
+    const topEntries = Array.from(topAggs.entries())
+      .sort(([idA, a], [idB, b]) => b.total - a.total || idA.localeCompare(idB))
+      .slice(0, 8)
+
+    const topAgencyInfos = topEntries.length
+      ? await db.agency.findMany({
+          where: { id: { in: topEntries.map(([id]) => id) } },
+          select: { id: true, name: true, customCode: true, category: true },
+        })
+      : []
+    const topInfoMap = new Map(topAgencyInfos.map((a) => [a.id, a]))
+
+    const topAgencies = topEntries.map(([agencyId, a]) => {
+      const info = topInfoMap.get(agencyId)
+      return {
+        agencyId,
+        name: info?.name ?? 'Unknown',
+        customCode: info?.customCode ?? null,
+        category: info?.category ?? null,
+        total: a.total,
+        completed: a.completed,
+        completionRate: a.total > 0 ? round1((a.completed / a.total) * 100) : 0,
+        onlineCount: a.onlineCount,
+        walkInCount: a.walkInCount,
+        onlineRate: a.total > 0 ? round1((a.onlineCount / a.total) * 100) : 0,
+        walkInRate: a.total > 0 ? round1((a.walkInCount / a.total) * 100) : 0,
+        avgWaitMinutes: a.waitCount > 0 ? round1(a.waitSumMs / a.waitCount / 60000) : null,
+        avgRating: a.ratingCount > 0 ? round1(a.ratingSum / a.ratingCount) : null,
+      }
+    })
+
+    // ── Assemble the response (average scope divides COUNT metrics only) ────
+    let data: AnalyticsDashboardPayload & {
+      scope: 'global' | 'average'
+      topAgencies: typeof topAgencies
+      platform: typeof platform
+    }
+
+    if (scope === 'average' && activeAgencies > 0) {
+      const d = activeAgencies
+      data = {
+        ...base,
+        scope,
+        kpis: {
+          ...base.kpis,
+          total: avgPerAgency(base.kpis.total, d),
+          completed: avgPerAgency(base.kpis.completed, d),
+          cancelled: avgPerAgency(base.kpis.cancelled, d),
+          noShow: avgPerAgency(base.kpis.noShow, d),
+          walkInCount: avgPerAgency(base.kpis.walkInCount, d),
+          onlineCount: avgPerAgency(base.kpis.onlineCount, d),
+          ratingCount: avgPerAgency(base.kpis.ratingCount, d),
+          uniqueCustomers: avgPerAgency(base.kpis.uniqueCustomers, d),
+          // rates / averages / deltas stay as the global values
+        },
+        timeseries: base.timeseries.map((p) => ({
+          ...p,
+          total: avgPerAgency(p.total, d),
+          completed: avgPerAgency(p.completed, d),
+          cancelled: avgPerAgency(p.cancelled, d),
+          noShow: avgPerAgency(p.noShow, d),
+          walkIn: avgPerAgency(p.walkIn, d),
+          online: avgPerAgency(p.online, d),
+          // avgWaitMinutes (an average) stays global
+        })),
+        statusDistribution: base.statusDistribution.map((s) => ({ ...s, count: avgPerAgency(s.count, d) })),
+        hourlyTraffic: base.hourlyTraffic.map((h) => ({ ...h, count: avgPerAgency(h.count, d) })),
+        weekdayHourMatrix: base.weekdayHourMatrix.map((m) => ({ ...m, count: avgPerAgency(m.count, d) })),
+        services: base.services.map((s) => ({
+          ...s,
+          count: avgPerAgency(s.count, d),
+          completed: avgPerAgency(s.completed, d),
+          cancelled: avgPerAgency(s.cancelled, d),
+          noShow: avgPerAgency(s.noShow, d),
+          // completionRate / avgWaitMinutes stay global
+        })),
+        ratings: {
+          ...base.ratings,
+          count: avgPerAgency(base.ratings.count, d),
+          distribution: base.ratings.distribution.map((r) => ({ ...r, count: avgPerAgency(r.count, d) })),
+          // average stays global
+        },
+        channel: {
+          ...base.channel,
+          onlineCount: avgPerAgency(base.channel.onlineCount, d),
+          walkInCount: avgPerAgency(base.channel.walkInCount, d),
+          total: avgPerAgency(base.channel.total, d),
+          // onlineRate / walkInRate stay global
+          daily: base.channel.daily.map((p) => ({
+            date: p.date,
+            online: avgPerAgency(p.online, d),
+            walkIn: avgPerAgency(p.walkIn, d),
+          })),
+        },
+        topAgencies,
+        platform,
+      }
+    } else {
+      // scope=global (default) — and scope=average with 0 active agencies
+      // returns the global values unchanged.
+      data = { ...base, scope, topAgencies, platform }
+    }
+
+    return c.json({ success: true, data })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/agency/:agencyId?period=7d|30d|90d|12m
+//
+// Full per-agency analytics payload (identical shared engine — branches and
+// counters included) for ANY agency, plus an `agency` identity block.
+
+app.get('/analytics/agency/:agencyId', async (c) => {
+  try {
+    await requireAdmin(c)
+
+    const agencyId = c.req.param('agencyId')
+    const agency = await db.agency.findUnique({
+      where: { id: agencyId },
+      select: {
+        id: true,
+        name: true,
+        customCode: true,
+        category: true,
+        wilaya: true,
+        city: true,
+        isActive: true,
+        subscriptionTier: true,
+      },
+    })
+    if (!agency) {
+      return c.json({ success: false, error: 'Agency not found' }, 404)
+    }
+
+    const rawPeriod = c.req.query('period') || '30d'
+    const period: DashboardPeriod = (DASHBOARD_PERIODS as readonly string[]).includes(rawPeriod)
+      ? (rawPeriod as DashboardPeriod)
+      : '30d'
+
+    const payload = await computeAnalyticsDashboard({ agencyId, period })
+
+    return c.json({ success: true, data: { ...payload, agency } })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 

@@ -107,6 +107,7 @@ const STAGE_DEFINITIONS: StageMeta[] = [
   { id: 'reviews', label: 'Reviews', mandatory: false },
   { id: 'favorites', label: 'Favorites', mandatory: false },
   { id: 'faqs', label: 'FAQs', mandatory: false },
+  { id: 'agencyCategories', label: 'Agency Categories', mandatory: false },
 ]
 
 const VALID_STAGES = new Set(STAGE_DEFINITIONS.map((s) => s.id))
@@ -353,6 +354,20 @@ async function fetchStageData(
       return { records, hasMore: false, total: records.length }
     }
 
+    // ── 9d. Agency Categories (Task 42-a: shared custom-fields dictionary) ──
+    case 'agencyCategories': {
+      // Global dictionary model (no agency scoping) — every agency's desktop
+      // receives ALL user-created categories so any owner can select them.
+      const records = await db.agencyCategory.findMany({
+        select: {
+          id: true, name: true, nameFr: true, nameAr: true, icon: true,
+          isCustom: true, createdBy: true, createdAt: true, updatedAt: true,
+        },
+        orderBy: [{ createdAt: 'asc' }],
+      })
+      return { records, hasMore: false, total: records.length }
+    }
+
     // ── 10. Notifications (paginated) ─────────────────────────────────────
     case 'notifications': {
       // Get user IDs for this agency to filter notifications
@@ -565,6 +580,7 @@ function serializeRecords(stage: string, records: any[]): any[] {
     faqs: 'FAQ',
     smsSettings: 'SmsSettings',
     paymentSettings: 'PaymentSettings',
+    agencyCategories: 'AgencyCategory',
   }
 
   const modelName = stageToModel[stage]
@@ -763,6 +779,8 @@ async function estimateStageCount(stage: string, agencyId: string): Promise<numb
       return db.favorite.count({ where: { agencyId } })
     case 'faqs':
       return db.fAQ.count()
+    case 'agencyCategories':
+      return db.agencyCategory.count()
     case 'smsSettings':
       return db.smsSettings.count()
     case 'paymentSettings':

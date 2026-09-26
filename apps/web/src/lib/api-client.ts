@@ -121,8 +121,10 @@ function isServerSide(): boolean {
 /**
  * Detect if we are running inside an Electron shell.
  * SSR-safe: returns false on the server.
+ * Exported for UI staleness guards (agency-branches Task 40 round 4) that
+ * probe the embedded local API's build identity.
  */
-function isElectronRuntime(): boolean {
+export function isElectronRuntime(): boolean {
   if (isServerSide()) return false;
   const ua = navigator.userAgent;
   return !!(window as unknown as Record<string, unknown>).electronAPI || ua.includes('Electron');
@@ -1262,6 +1264,21 @@ export class ApiClient {
         console.log(`[ApiClient:SESSION_RESTORE] skipped — session is REVOKED`);
         return false;
       }
+
+      // ── Task 41: token catch-up FIRST ────────────────────────────────────
+      // The local API may hold a NEWER token than the renderer (main-process
+      // import-session adopted a cloud-refreshed token). Ask it to hand us
+      // the current token for our session chain before re-importing the
+      // stale one over it (the old behavior created a token tug-of-war and
+      // the intermittent "data loading failed" dashboard error).
+      try {
+        const { adoptLocalSession } = await import('@/lib/session-adopt');
+        const adopt = await adoptLocalSession();
+        if (adopt.adopted) {
+          console.log(`[ApiClient:SESSION_RESTORE] adopted the local session's current token (catch-up) — no IPC re-import needed`);
+          return true;
+        }
+      } catch { /* fall through to the legacy IPC restore */ }
 
       const w = window as any;
       if (!w.electronAPI?.setLocalApiSession) {

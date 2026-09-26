@@ -123,12 +123,35 @@ export const UserLanguage = {
 export type UserLanguage = (typeof UserLanguage)[keyof typeof UserLanguage]
 
 // ─── Agency Category ──────────────────────────────────────────────────────────
+// Task 42: expanded from 6 to 25 built-ins. Keys map 1:1 to i18n `catXxx`
+// translation keys (CLINIC → catClinic, DENTAL_CLINIC → catDentalClinic, …).
+// User-created categories live in the synced AgencyCategory table and are
+// referenced by their (unique, user-entered) `name`, not by these keys.
 export const AgencyCategory = {
   CLINIC: 'CLINIC',
-  AGENCY: 'AGENCY',
-  LAW_FIRM: 'LAW_FIRM',
+  HOSPITAL: 'HOSPITAL',
+  DENTAL_CLINIC: 'DENTAL_CLINIC',
   LABORATORY: 'LABORATORY',
+  PHARMACY: 'PHARMACY',
+  VETERINARY: 'VETERINARY',
+  BANK: 'BANK',
+  POST_OFFICE: 'POST_OFFICE',
+  TELECOM: 'TELECOM',
+  INSURANCE: 'INSURANCE',
+  LAW_FIRM: 'LAW_FIRM',
+  NOTARY: 'NOTARY',
   GOVERNMENT: 'GOVERNMENT',
+  EDUCATION: 'EDUCATION',
+  AGENCY: 'AGENCY',
+  TRAVEL: 'TRAVEL',
+  REAL_ESTATE: 'REAL_ESTATE',
+  CAR_SERVICE: 'CAR_SERVICE',
+  BARBER: 'BARBER',
+  BEAUTY_SALON: 'BEAUTY_SALON',
+  RESTAURANT: 'RESTAURANT',
+  CAFE: 'CAFE',
+  RETAIL: 'RETAIL',
+  HOTEL: 'HOTEL',
   OTHER: 'OTHER',
 } as const
 export type AgencyCategory = (typeof AgencyCategory)[keyof typeof AgencyCategory]

@@ -32,6 +32,9 @@ const AgencyReviews = lazy(() => import('@/components/agency/agency-reviews').th
 const AgencyEmployees = lazy(() => import('@/components/agency/agency-employees').then(m => ({ default: m.AgencyEmployees })));
 const AgencyBranches = lazy(() => import('@/components/agency/agency-branches').then(m => ({ default: m.AgencyBranches })));
 const AgencyDevices = lazy(() => import('@/components/agency/agency-devices').then(m => ({ default: m.AgencyDevices })));
+// Task 42-e: dedicated Analytics & Statistics section (self-handles authority
+// empty/error states — no AuthorityGate wrapper, like admin-analytics).
+const AgencyAnalytics = lazy(() => import('@/components/agency/analytics/analytics-dashboard').then(m => ({ default: m.AgencyAnalytics })));
 const AgencyFullscreen = lazy(() => import('@/components/agency/agency-fullscreen').then(m => ({ default: m.AgencyFullscreen })));
 const AgencyFullscreenHistory = lazy(() => import('@/components/agency/agency-fullscreen-history').then(m => ({ default: m.AgencyFullscreenHistory })));
 // Device Views (standalone kiosk, TV board — accessed via ?mode=device&type=KIOSK|TV)
@@ -64,6 +67,7 @@ import { OfflineDiagnosisPanel } from '@/components/shared/offline-diagnosis-pan
 import { NotificationBadge } from '@/components/shared/notification-badge';
 import { BlastiSkeleton, BlastiSkeletonCompact } from '@/components/shared/blasti-skeleton';
 import { BootGate } from '@/components/shared/boot-gate';
+import { PostLoginSyncGate } from '@/components/shared/post-login-sync-gate';
 import { usePlatform } from '@/hooks/use-platform';
 import { Button } from '@/components/ui/button';
 
@@ -142,6 +146,10 @@ const ViewRouter = memo(function ViewRouter() {
               return <AgencyAuthorityGate view="agency-branches"><AgencyBranches /></AgencyAuthorityGate>;
             case 'agency-devices':
               return <AgencyAuthorityGate view="agency-devices"><AgencyDevices /></AgencyAuthorityGate>;
+            case 'agency-analytics':
+              // Task 42-e: the section self-handles empty/error/unauthorized
+              // states — no AuthorityGate (mirrors admin-analytics wiring).
+              return <AgencyAnalytics />;
             case 'agency-fullscreen':
               return <AgencyFullscreen />;
             case 'agency-fullscreen-history':
@@ -439,6 +447,7 @@ export default function Home() {
       'agency-profile': t('profile') + ' - BLASTI',
       'agency-subscription': t('subscription') + ' - BLASTI',
       'agency-devices': t('devicesConnection') + ' - BLASTI',
+      'agency-analytics': t('analytics') + ' - BLASTI',
       'admin-dashboard': t('dashboard') + ' - BLASTI',
       'admin-transactions': t('transactions') + ' - BLASTI',
       'admin-agencies': t('agencies') + ' - BLASTI',
@@ -743,6 +752,11 @@ export default function Home() {
       </main>
 
       <Toaster richColors position="top-center" />
+
+      {/* Task 46: Post-login initial-sync loading gate — holds the UI on a
+          branded progress screen until the desktop workspace import is done
+          (Electron only, only when the workspace is not READY yet). */}
+      <PostLoginSyncGate />
 
       {/* Aggressive Turn Alert — full-screen overlay for customers */}
       <AggressiveTurnAlert

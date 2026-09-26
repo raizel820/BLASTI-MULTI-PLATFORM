@@ -46,6 +46,21 @@ let db = null
 let httpServer = null
 let sessionToken = null
 let sessionUser = null
+
+// Task 41 — token-rotation grace.
+// WHY: the cloud re-issues the session token on every import-session /
+// refresh-session validation. The MAIN process imports the session at startup
+// and adopts the refreshed token, while the RENDERER keeps presenting the
+// previous token from localStorage until it re-imports. With a strict
+// current-token-only compare, every renderer request in that window 401s —
+// the direct cause of the intermittent "data loading failed" dashboard popup
+// (all 4 dashboard fetches fail at once) and of the local-realtime
+// "auth event rejected" spam. We therefore keep the IMMEDIATE predecessor
+// token (same session, rotated by our own code) valid for a grace window.
+let previousSessionToken = null
+let previousSessionTokenAt = 0
+const SESSION_TOKEN_GRACE_MS = 30 * 60 * 1000 // 30 minutes
+
 let eventListeners = []
 let mutationListeners = []
 let idemColumnEnsured = false
@@ -239,6 +254,65 @@ async function localizeFileUrl(url) {
  * pages rendered empty. This helper accepts the explicit param ONLY when the
  * session user genuinely has access to that agency.
  */
+// ─── Task 40: shared local agency resolution (owner fallback) ───────────────
+//
+// Wizard-created agency owners are bound via Agency.ownerId ONLY — the real
+// create flow never creates an AgencyStaff row and the cloud User row keeps
+// agencyId NULL. The local-unlock login path already resolved the agency via
+// buildStaffAgencyId(), but the CLOUD-login path and import-session copied
+// `agencyId` from the payload verbatim — a null there produced a session (and
+// a renderer user object) with agencyId:null, and every route that trusts the
+// session agency (branch list, staff, profile …) then 403'd or silently
+// returned an empty list on desktop while the SAME account worked on the
+// webapp (cloud routes self-resolve per request via resolveUserAgencyId).
+//
+// This module-level helper mirrors the cloud contract (auth.ts
+// resolveUserAgencyId) against the LOCAL database: staff row first, then
+// owned agency. Safe to call with any partial user object.
+
+async function lookupLocalAgencyIdForUser(userData) {
+  if (!userData || !userData.id || !db) return null
+  try {
+    if (userData.role === 'AGENCY_OWNER' || userData.role === 'AGENCY_STAFF') {
+      const staff = await db.agencyStaff.findFirst({
+        where: { userId: userData.id, isActive: true },
+      })
+      if (staff) return staff.agencyId
+      if (userData.role === 'AGENCY_OWNER') {
+        const owned = await db.agency.findFirst({
+          where: { ownerId: userData.id },
+          // Task 43: deterministic pick — mirrors the cloud contract
+          // (oldest owned agency wins) so the local session can never bind
+          // a different agency than the cloud login did.
+          orderBy: { createdAt: 'asc' },
+        })
+        if (owned) return owned.id
+      }
+    }
+  } catch (e) {
+    console.warn('[LocalAPI] Agency lookup for user failed (non-fatal):', e && e.message)
+  }
+  return null
+}
+
+/**
+ * Task 40: fill in a null/blank agencyId on a session-shaped user object.
+ * Mutates and returns the same object; returns the input untouched when an
+ * agencyId is already present. Used by the cloud-login and import-session
+ * paths so the renderer ALWAYS receives a usable agencyId for owners/staff.
+ */
+async function hydrateSessionAgencyId(sessionData) {
+  if (!sessionData || sessionData.agencyId) return sessionData
+  try {
+    const resolved = await lookupLocalAgencyIdForUser(sessionData)
+    if (resolved) {
+      sessionData.agencyId = resolved
+      console.log('[LocalAPI] Session agencyId hydrated from local ownership:', sessionData.username, '→', resolved)
+    }
+  } catch { /* keep null — routes will report the actionable 403 */ }
+  return sessionData
+}
+
 async function resolveSessionAgencyId(explicitAgencyId) {
   const sessionAgencyId = sessionUser ? sessionUser.agencyId : null
   if (!explicitAgencyId) return sessionAgencyId
@@ -262,6 +336,18 @@ async function resolveSessionAgencyId(explicitAgencyId) {
   if (sessionAgencyId) {
     console.warn('[branches] requested agencyId %s failed ownership — falling back to session agency %s', explicitAgencyId, sessionAgencyId)
     return sessionAgencyId
+  }
+  // Task 40: the session has no agencyId (cloud login for an account row
+  // without one, or an import-session payload snapshot) — try the LOCAL
+  // ownership lookup once before giving up, mirroring the cloud's
+  // resolveUserAgencyId contract.
+  const hydrated = await lookupLocalAgencyIdForUser(sessionUser)
+  if (hydrated) {
+    try {
+      sessionUser.agencyId = hydrated
+    } catch { /* session object read-only — ignore */ }
+    console.warn('[branches] session agencyId was null — hydrated from local ownership:', hydrated)
+    return explicitAgencyId === hydrated ? explicitAgencyId : hydrated
   }
   return null
 }
@@ -605,8 +691,15 @@ async function cloudLoginProxy(username, password, extra) {
  * Create/update the LOCAL OPERATIONAL User row from a cloud login user
  * object — PROFILE-ONLY. Authentication secrets are never written here
  * (passwordHash stays NULL for synced profiles).
+ *
+ * Task 5: `overrides` carries Algeria address fields captured from a
+ * register request body (wilaya two-digit code + commune Latin name) — the
+ * cloud register projection may not include them on older clouds, so the
+ * request body is the source of truth at registration time. Only non-empty
+ * string values are written; login/verify flows pass no overrides and never
+ * clear existing values.
  */
-async function upsertLocalUserFromCloud(cloudUser) {
+async function upsertLocalUserFromCloud(cloudUser, overrides) {
   if (!cloudUser || !cloudUser.id || !db.user) return null
   const profile = {
     username: cloudUser.username || cloudUser.email || ('user-' + String(cloudUser.id).slice(-8)),
@@ -619,6 +712,16 @@ async function upsertLocalUserFromCloud(cloudUser) {
     avatarUrl: cloudUser.avatarUrl ?? null,
     isActive: cloudUser.isActive !== false,
   }
+  // Task 5 — Algeria address (cloud value first, request-body override as
+  // fallback; only non-empty strings, never cleared).
+  const wilaya = (typeof overrides?.wilaya === 'string' && overrides.wilaya.trim())
+    ? overrides.wilaya.trim().padStart(2, '0')
+    : (typeof cloudUser.wilaya === 'string' && cloudUser.wilaya.trim() ? cloudUser.wilaya.trim().padStart(2, '0') : null)
+  const commune = (typeof overrides?.commune === 'string' && overrides.commune.trim())
+    ? overrides.commune.trim()
+    : (typeof cloudUser.commune === 'string' && cloudUser.commune.trim() ? cloudUser.commune.trim() : null)
+  if (wilaya) profile.wilaya = wilaya
+  if (commune) profile.commune = commune
   await db.user.upsert({
     where: { id: cloudUser.id },
     update: profile,
@@ -716,6 +819,59 @@ function notifyMutationLogged() {
 
 // ─── Auth Middleware ──────────────────────────────────────────────────────
 
+/** Short fingerprint of a token for SAFE console logging (never the full token). */
+function tokenFingerprint(token) {
+  if (!token) return '(null)'
+  const s = String(token)
+  return s.slice(0, 10) + '…(len ' + s.length + ')'
+}
+
+/**
+ * Is the given token the previous session token, still inside the grace
+ * window? (Task 41 — see the rotation-grace note at the top of this file.)
+ * Timing-safe, same as the current-token compare.
+ */
+function matchesPreviousSessionToken(token) {
+  if (!token || !previousSessionToken) return false
+  if (Date.now() - previousSessionTokenAt > SESSION_TOKEN_GRACE_MS) return false
+  try {
+    const a = Buffer.from(previousSessionToken, 'utf-8')
+    const b = Buffer.from(token, 'utf-8')
+    return a.length === b.length && timingSafeEqual(a, b)
+  } catch {
+    return false
+  }
+}
+
+function previousSessionTokenValid() {
+  return !!previousSessionToken && Date.now() - previousSessionTokenAt <= SESSION_TOKEN_GRACE_MS
+}
+
+/**
+ * Assign a new session (token + user). Whenever the token CHANGES, the
+ * outgoing token is kept as the rotation-grace predecessor so in-flight
+ * renderer sessions (stale localStorage token) keep working instead of
+ * 401-ing mid-rotation. `source` labels the rotation in the console log.
+ */
+function assignSession(token, user, source) {
+  if (!token || !user || typeof user !== 'object') {
+    console.warn('[LocalAPI] assignSession called with invalid args — skipping (source=' + (source || 'unknown') + ')')
+    return
+  }
+  const rotated = !!sessionToken && sessionToken !== token
+  if (rotated) {
+    previousSessionToken = sessionToken
+    previousSessionTokenAt = Date.now()
+    console.log('[LocalAPI] Session token rotated (source=' + (source || 'unknown') + ') ' +
+      tokenFingerprint(sessionToken) + ' → ' + tokenFingerprint(token) +
+      ' — previous token accepted for ' + Math.round(SESSION_TOKEN_GRACE_MS / 60000) + 'm grace')
+  } else if (!sessionToken) {
+    console.log('[LocalAPI] Session established (source=' + (source || 'unknown') + ') token=' + tokenFingerprint(token) + ' user=' + (user.username || user.id))
+  }
+  sessionToken = token
+  sessionUser = user
+}
+
 /**
  * Middleware that validates the session token and attaches user + db to context.
  */
@@ -743,18 +899,34 @@ function requireAuth() {
       return c.json({ success: false, error: 'No active session (user not loaded)' }, 401)
     }
 
-    // Timing-safe comparison
+    // Timing-safe comparison — current token first, then the rotation-grace
+    // predecessor (Task 41). A stale renderer token must NOT 401 mid-rotation.
+    let tokenValid = false
+    let viaGrace = false
     try {
       const expectedBuf = Buffer.from(sessionToken, 'utf-8')
       const providedBuf = Buffer.from(token, 'utf-8')
-      if (
-        expectedBuf.length !== providedBuf.length ||
-        !timingSafeEqual(expectedBuf, providedBuf)
-      ) {
-        return c.json({ success: false, error: 'Invalid session token' }, 401)
+      tokenValid =
+        expectedBuf.length === providedBuf.length &&
+        timingSafeEqual(expectedBuf, providedBuf)
+      if (!tokenValid && matchesPreviousSessionToken(token)) {
+        tokenValid = true
+        viaGrace = true
       }
     } catch {
+      tokenValid = false
+    }
+    if (!tokenValid) {
+      // Task 41 — actionable rejection log: fingerprints of what was presented
+      // vs what the session holds, so token-mismatch reports are diagnosable
+      // from the console alone.
+      console.warn('[LocalAPI] Auth rejected — token mismatch: presented=' + tokenFingerprint(token) +
+        ' current=' + tokenFingerprint(sessionToken) +
+        ' previous=' + (previousSessionTokenValid() ? tokenFingerprint(previousSessionToken) : '(none/expired)'))
       return c.json({ success: false, error: 'Invalid session token' }, 401)
+    }
+    if (viaGrace) {
+      console.log('[LocalAPI] Auth: previous (rotated) token accepted via grace window (user=' + (sessionUser.username || sessionUser.id) + ') — renderer should adopt the fresh token via POST /api/auth/adopt-session')
     }
 
     // Task 33-C: honor the workspace LOCK. A REVOKED authorization blocks
@@ -1419,6 +1591,405 @@ async function markMutationConflict(id, error) {
   }
 }
 
+// ─── Agency analytics dashboard (Task 42-c) ──────────────────────────────
+// Standalone, pure computation — NO db access — so the harness can drive it
+// directly with synthetic rows (module.exports). The route below only fetches
+// (current range, previous range, Service/Branch/Counter lookups) and delegates.
+
+const ANALYTICS_PERIODS = ['7d', '30d', '90d', '12m']
+const ANALYTICS_STATUSES = ['WAITING', 'CALLED', 'SERVING', 'COMPLETED', 'CANCELLED', 'NO_SHOW']
+
+function asAnalyticsDate(value) {
+  if (value == null) return null
+  const d = value instanceof Date ? value : new Date(value)
+  return isNaN(d.getTime()) ? null : d
+}
+
+function round1(n) {
+  return Math.round(n * 10) / 10
+}
+
+/** Percent change (1 decimal); null when the previous value is 0/absent. */
+function analyticsPctChange(current, previous) {
+  if (previous == null || previous === 0) return null
+  return round1((((current || 0) - previous) / previous) * 100)
+}
+
+function computeAnalyticsRange(period, now) {
+  const end = asAnalyticsDate(now) || new Date()
+  let start
+  if (period === '12m') {
+    // 00:00 UTC of the month 11 months before the CURRENT month (12 buckets).
+    start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - 11, 1, 0, 0, 0, 0))
+  } else {
+    const days = period === '7d' ? 7 : period === '90d' ? 90 : 30
+    start = new Date(end.getTime() - days * 86400000)
+  }
+  const spanMs = end.getTime() - start.getTime()
+  const previousEnd = new Date(start.getTime())
+  const previousStart = new Date(start.getTime() - spanMs)
+  return { start, end, previousStart, previousEnd }
+}
+
+/**
+ * Normalize one reservation record into the plain shape the aggregation uses.
+ * Accepts Prisma rows (Date objects, boolean isWalkIn) and raw test records
+ * (ISO strings, 0/1 booleans) alike.
+ */
+function normalizeAnalyticsReservation(raw) {
+  return {
+    status: raw.status,
+    joinedAt: asAnalyticsDate(raw.joinedAt),
+    calledAt: asAnalyticsDate(raw.calledAt),
+    completedAt: asAnalyticsDate(raw.completedAt),
+    rating: raw.rating == null ? null : Number(raw.rating),
+    isWalkIn: raw.isWalkIn === 1 || raw.isWalkIn === true,
+    userId: raw.userId || null,
+    serviceId: raw.serviceId || null,
+    counterId: raw.counterId || null,
+  }
+}
+
+/** Zero-filled timeseries buckets (UTC). 7d/30d/90d → daily 'YYYY-MM-DD' from
+ * range.start's day through range.end's day inclusive; 12m → monthly 'YYYY-MM'. */
+function buildAnalyticsBuckets(period, range) {
+  const buckets = []
+  const indexByKey = new Map()
+  if (period === '12m') {
+    const endKey = range.end.toISOString().slice(0, 7)
+    let y = range.start.getUTCFullYear()
+    let m = range.start.getUTCMonth()
+    for (let i = 0; i < 24; i++) { // 12 real buckets; 24 = hard safety bound
+      const key = `${y}-${String(m + 1).padStart(2, '0')}`
+      indexByKey.set(key, buckets.length)
+      buckets.push({ date: key, total: 0, completed: 0, cancelled: 0, noShow: 0, walkIn: 0, online: 0, _waitSum: 0, _waitN: 0 })
+      if (key === endKey) break
+      m += 1
+      if (m > 11) { m = 0; y += 1 }
+    }
+  } else {
+    const startDay = Date.UTC(range.start.getUTCFullYear(), range.start.getUTCMonth(), range.start.getUTCDate())
+    const endDay = Date.UTC(range.end.getUTCFullYear(), range.end.getUTCMonth(), range.end.getUTCDate())
+    for (let t = startDay; t <= endDay; t += 86400000) {
+      const key = new Date(t).toISOString().slice(0, 10)
+      indexByKey.set(key, buckets.length)
+      buckets.push({ date: key, total: 0, completed: 0, cancelled: 0, noShow: 0, walkIn: 0, online: 0, _waitSum: 0, _waitN: 0 })
+    }
+  }
+  return { buckets, indexByKey }
+}
+
+function analyticsMeanWaitMinutes(rows) {
+  let sum = 0
+  let n = 0
+  for (const r of rows) {
+    if (r.calledAt && r.joinedAt) {
+      sum += (r.calledAt.getTime() - r.joinedAt.getTime()) / 60000
+      n += 1
+    }
+  }
+  return n > 0 ? round1(sum / n) : null
+}
+
+function analyticsMeanServiceMinutes(rows) {
+  let sum = 0
+  let n = 0
+  for (const r of rows) {
+    if (r.completedAt && r.calledAt) {
+      sum += (r.completedAt.getTime() - r.calledAt.getTime()) / 60000
+      n += 1
+    }
+  }
+  return n > 0 ? round1(sum / n) : null
+}
+
+function analyticsRatingStats(rows) {
+  let sum = 0
+  let n = 0
+  const distribution = [1, 2, 3, 4, 5].map((stars) => ({ stars, count: 0 }))
+  for (const r of rows) {
+    if (r.rating != null && r.rating >= 1 && r.rating <= 5) {
+      const stars = Math.round(r.rating)
+      sum += stars
+      n += 1
+      distribution[stars - 1].count += 1
+    }
+  }
+  return { average: n > 0 ? round1(sum / n) : null, count: n, distribution }
+}
+
+/**
+ * Compute the agency analytics dashboard payload (Task 42-c contract — the
+ * SAME shape the cloud route implements).
+ *
+ * @param {Array} rows     reservations with joinedAt in the CURRENT range
+ * @param {Array} prevRows reservations with joinedAt in the PREVIOUS range
+ * @param {Object} lookups { services: {id:name}, branches: {id:name},
+ *                           counters: {id:{name,branchId}} }
+ * @param {string} period  '7d' | '30d' | '90d' | '12m'
+ * @param {Object} range   { start, end, previousStart, previousEnd } Dates
+ */
+function computeAgencyAnalyticsDashboard(rows, prevRows, lookups, period, range) {
+  const cur = (rows || []).map(normalizeAnalyticsReservation)
+  const prev = (prevRows || []).map(normalizeAnalyticsReservation)
+  lookups = lookups || {}
+  const serviceName = (id) => (id && lookups.services && lookups.services[id]) || 'Unknown'
+  const branchName = (id) => (id && lookups.branches && lookups.branches[id]) || 'Unknown'
+  const counterInfo = (id) => (id && lookups.counters && lookups.counters[id]) || null
+
+  // ── Current-range KPIs ──────────────────────────────────────────────────
+  const total = cur.length
+  let completed = 0
+  let cancelled = 0
+  let noShow = 0
+  for (const r of cur) {
+    if (r.status === 'COMPLETED') completed += 1
+    else if (r.status === 'CANCELLED') cancelled += 1
+    else if (r.status === 'NO_SHOW') noShow += 1
+  }
+  const completionRate = total > 0 ? round1((completed / total) * 100) : 0
+  const cancellationRate = total > 0 ? round1((cancelled / total) * 100) : 0
+  const noShowRate = total > 0 ? round1((noShow / total) * 100) : 0
+  const avgWaitMinutes = analyticsMeanWaitMinutes(cur)
+  const avgServiceMinutes = analyticsMeanServiceMinutes(cur)
+  // SAME walk-in / online convention as GET /api/agency/stats:
+  //   walkIn = isWalkIn true · online = isWalkIn false with a userId.
+  const walkInCount = cur.filter((r) => r.isWalkIn).length
+  const onlineCount = cur.filter((r) => !r.isWalkIn && r.userId).length
+  // Task 46 — online vs walk-in rates (0-100, one decimal; 0 when empty)
+  const walkInRate = total > 0 ? round1((walkInCount / total) * 100) : 0
+  const onlineRate = total > 0 ? round1((onlineCount / total) * 100) : 0
+  const uniqueCustomers = new Set(cur.map((r) => r.userId).filter(Boolean)).size
+  const ratings = analyticsRatingStats(cur)
+
+  // ── Previous-range aggregates (for deltas) ─────────────────────────────
+  const prevTotal = prev.length
+  const prevCompleted = prev.filter((r) => r.status === 'COMPLETED').length
+  const prevNoShow = prev.filter((r) => r.status === 'NO_SHOW').length
+  const prevNoShowRate = prevTotal > 0 ? round1((prevNoShow / prevTotal) * 100) : 0
+  const prevAvgWaitMinutes = analyticsMeanWaitMinutes(prev)
+  const prevRatings = analyticsRatingStats(prev)
+  const prevUniqueCustomers = new Set(prev.map((r) => r.userId).filter(Boolean)).size
+
+  // ── Timeseries (zero-filled over joinedAt, UTC) ────────────────────────
+  const { buckets, indexByKey } = buildAnalyticsBuckets(period, range)
+  const hourly = new Array(24).fill(0)
+  const weekdayCounts = new Array(7).fill(0)
+  const matrix = new Map()
+  const dailyCounts = new Map() // always daily — busiestDay, any period
+  for (const r of cur) {
+    const j = r.joinedAt
+    if (j) {
+      const key = period === '12m' ? j.toISOString().slice(0, 7) : j.toISOString().slice(0, 10)
+      const bi = indexByKey.get(key)
+      if (bi != null) {
+        const b = buckets[bi]
+        b.total += 1
+        if (r.status === 'COMPLETED') b.completed += 1
+        else if (r.status === 'CANCELLED') b.cancelled += 1
+        else if (r.status === 'NO_SHOW') b.noShow += 1
+        // Task 46 — channel split per bucket (same convention as KPIs)
+        if (r.isWalkIn) b.walkIn += 1
+        else if (r.userId) b.online += 1
+        if (r.calledAt && r.joinedAt) {
+          b._waitSum += (r.calledAt.getTime() - r.joinedAt.getTime()) / 60000
+          b._waitN += 1
+        }
+      }
+      hourly[j.getUTCHours()] += 1
+      weekdayCounts[j.getUTCDay()] += 1
+      const mk = j.getUTCDay() + ':' + j.getUTCHours()
+      matrix.set(mk, (matrix.get(mk) || 0) + 1)
+      const dayKey = j.toISOString().slice(0, 10)
+      dailyCounts.set(dayKey, (dailyCounts.get(dayKey) || 0) + 1)
+    }
+  }
+
+  // ── Per-service / per-branch / per-counter rollups ──────────────────────
+  const serviceAgg = new Map()
+  const branchAgg = new Map()
+  const counterAgg = new Map()
+  for (const r of cur) {
+    // services
+    const sKey = r.serviceId
+    if (!serviceAgg.has(sKey)) serviceAgg.set(sKey, { count: 0, completed: 0, cancelled: 0, noShow: 0, _waitSum: 0, _waitN: 0 })
+    const s = serviceAgg.get(sKey)
+    s.count += 1
+    if (r.status === 'COMPLETED') s.completed += 1
+    else if (r.status === 'CANCELLED') s.cancelled += 1
+    else if (r.status === 'NO_SHOW') s.noShow += 1
+    if (r.calledAt && r.joinedAt) {
+      s._waitSum += (r.calledAt.getTime() - r.joinedAt.getTime()) / 60000
+      s._waitN += 1
+    }
+    // branches — via counterId → Counter.branchId → Branch
+    let branchId = null
+    if (r.counterId) {
+      const info = counterInfo(r.counterId)
+      branchId = info ? info.branchId : r.counterId + ':missing-counter'
+    }
+    if (!branchAgg.has(branchId)) branchAgg.set(branchId, { count: 0, completed: 0, noShow: 0, _waitSum: 0, _waitN: 0 })
+    const br = branchAgg.get(branchId)
+    br.count += 1
+    if (r.status === 'COMPLETED') br.completed += 1
+    else if (r.status === 'NO_SHOW') br.noShow += 1
+    if (r.calledAt && r.joinedAt) {
+      br._waitSum += (r.calledAt.getTime() - r.joinedAt.getTime()) / 60000
+      br._waitN += 1
+    }
+    // counters — rows actually served by a counter
+    if (r.counterId) {
+      if (!counterAgg.has(r.counterId)) counterAgg.set(r.counterId, { served: 0, _svcSum: 0, _svcN: 0 })
+      const ct = counterAgg.get(r.counterId)
+      if (r.status === 'COMPLETED') {
+        ct.served += 1
+        if (r.completedAt && r.calledAt) {
+          ct._svcSum += (r.completedAt.getTime() - r.calledAt.getTime()) / 60000
+          ct._svcN += 1
+        }
+      }
+    }
+  }
+
+  const timeseries = buckets.map((b) => ({
+    date: b.date,
+    total: b.total,
+    completed: b.completed,
+    cancelled: b.cancelled,
+    noShow: b.noShow,
+    walkIn: b.walkIn,
+    online: b.online,
+    avgWaitMinutes: b._waitN > 0 ? round1(b._waitSum / b._waitN) : null,
+  }))
+
+  // Task 46 — online vs walk-in channel block (mirrors the cloud payload)
+  const channel = {
+    onlineCount,
+    walkInCount,
+    total,
+    onlineRate,
+    walkInRate,
+    daily: buckets.map((b) => ({ date: b.date, online: b.online, walkIn: b.walkIn })),
+  }
+
+  const statusDistribution = ANALYTICS_STATUSES.map((status) => ({
+    status,
+    count: cur.filter((r) => r.status === status).length,
+  }))
+
+  const hourlyTraffic = hourly.map((count, hour) => ({ hour, count }))
+
+  const weekdayHourMatrix = []
+  for (const [mk, count] of matrix) {
+    const [weekday, hour] = mk.split(':').map((v) => parseInt(v, 10))
+    weekdayHourMatrix.push({ weekday, hour, count })
+  }
+  weekdayHourMatrix.sort((a, b) => (a.weekday - b.weekday) || (a.hour - b.hour))
+
+  const services = [...serviceAgg.entries()]
+    .map(([serviceId, s]) => ({
+      serviceId,
+      name: serviceName(serviceId),
+      count: s.count,
+      completed: s.completed,
+      cancelled: s.cancelled,
+      noShow: s.noShow,
+      completionRate: s.count > 0 ? round1((s.completed / s.count) * 100) : 0,
+      avgWaitMinutes: s._waitN > 0 ? round1(s._waitSum / s._waitN) : null,
+    }))
+    .sort((a, b) => (b.count - a.count) || String(a.serviceId).localeCompare(String(b.serviceId)))
+
+  const branches = [...branchAgg.entries()]
+    .map(([branchId, b]) => ({
+      branchId: branchId && !String(branchId).includes(':missing-counter') ? branchId : null,
+      name: branchId === null ? '—' : branchName(branchId),
+      count: b.count,
+      completed: b.completed,
+      noShowRate: b.count > 0 ? round1((b.noShow / b.count) * 100) : 0,
+      avgWaitMinutes: b._waitN > 0 ? round1(b._waitSum / b._waitN) : null,
+    }))
+    .sort((a, b) => (b.count - a.count) || String(a.name).localeCompare(String(b.name)))
+
+  const counters = [...counterAgg.entries()]
+    .map(([counterId, ct]) => {
+      const info = counterInfo(counterId)
+      return {
+        counterId,
+        name: info ? info.name : 'Unknown',
+        branchName: info && info.branchId ? branchName(info.branchId) : 'Unknown',
+        served: ct.served,
+        avgServiceMinutes: ct._svcN > 0 ? round1(ct._svcSum / ct._svcN) : null,
+      }
+    })
+    .sort((a, b) => (b.served - a.served) || String(a.counterId).localeCompare(String(b.counterId)))
+    .slice(0, 12)
+
+  // ── Peaks ───────────────────────────────────────────────────────────────
+  const argmax = (arr) => {
+    let best = -1
+    let bestIndex = -1
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] > best) { best = arr[i]; bestIndex = i }
+    }
+    return bestIndex
+  }
+  let busiestDay = null
+  let busiestDayCount = 0
+  for (const [dayKey, count] of dailyCounts) {
+    if (count > busiestDayCount) { busiestDayCount = count; busiestDay = dayKey }
+  }
+  const peak = total > 0
+    ? { busiestHour: argmax(hourly), busiestWeekday: argmax(weekdayCounts), busiestDay }
+    : { busiestHour: null, busiestWeekday: null, busiestDay: null }
+
+  return {
+    period,
+    generatedAt: new Date().toISOString(),
+    range: {
+      start: range.start.toISOString(),
+      end: range.end.toISOString(),
+      previousStart: range.previousStart.toISOString(),
+      previousEnd: range.previousEnd.toISOString(),
+    },
+    kpis: {
+      total,
+      completed,
+      cancelled,
+      noShow,
+      completionRate,
+      cancellationRate,
+      noShowRate,
+      avgWaitMinutes,
+      avgServiceMinutes,
+      avgRating: ratings.average,
+      ratingCount: ratings.count,
+      walkInCount,
+      onlineCount,
+      walkInRate,
+      onlineRate,
+      uniqueCustomers,
+      deltas: {
+        total: analyticsPctChange(total, prevTotal),
+        completed: analyticsPctChange(completed, prevCompleted),
+        noShowRate: round1(noShowRate - prevNoShowRate), // percentage POINTS
+        avgWaitMinutes: analyticsPctChange(avgWaitMinutes, prevAvgWaitMinutes),
+        avgRating: analyticsPctChange(ratings.average, prevRatings.average),
+        uniqueCustomers: analyticsPctChange(uniqueCustomers, prevUniqueCustomers),
+      },
+    },
+    timeseries,
+    statusDistribution,
+    hourlyTraffic,
+    weekdayHourMatrix,
+    services,
+    branches,
+    counters,
+    ratings: { distribution: ratings.distribution, average: ratings.average, count: ratings.count },
+    peak,
+    channel,
+  }
+}
+
 // ─── Create Hono App ─────────────────────────────────────────────────────
 
 function createApp() {
@@ -1450,7 +2021,7 @@ function createApp() {
   })
 
   // Alias: /api/health (used by loading-screen diagnostics probe)
-  app.get('/api/health', (c) => {
+  app.get('/api/health', async (c) => {
     // Task 42: build identity — lets diagnostics (and the second-launch guard
     // in main.js) tell a CURRENT local API from a STALE one left running by an
     // older install (the recurring "old server on :3080" divergence).
@@ -1461,6 +2032,34 @@ function createApp() {
     try { build = require('../build-stamp.json').builtAt || null } catch { /* dev run — no stamp */ }
     let version = null
     try { version = require('../package.json').version || null } catch { /* never in a packaged app */ }
+
+    // Task 45: workspace identity — WHAT the synced workspace actually holds.
+    // This is the decisive diagnostic for the recurring "created a branch but
+    // the list stays empty" reports: the UI (and any human reading /api/health)
+    // can now see whether the SERVER's workspace is READY, which agency it is
+    // bound to, and how many branches/services it holds — i.e. WHICH side of
+    // the divergence is empty, with zero guessing.
+    let workspace = null
+    try {
+      if (db) {
+        const state = await db.agencyLocalState.findFirst({
+          select: { agencyId: true, initializationStatus: true, recordsImported: true, lastError: true },
+        }).catch(() => null)
+        if (state && state.agencyId) {
+          const branchCount = await db.branch.count({ where: { agencyId: state.agencyId } }).catch(() => null)
+          const serviceCount = await db.service.count({ where: { agencyId: state.agencyId } }).catch(() => null)
+          workspace = {
+            agencyId: state.agencyId,
+            status: state.initializationStatus || null,
+            recordsImported: state.recordsImported ?? null,
+            branchCount,
+            serviceCount,
+            lastError: state.lastError || null,
+          }
+        }
+      }
+    } catch { /* health must never fail because of diagnostics */ }
+
     return c.json({
       status: 'ok',
       mode: 'local',
@@ -1469,6 +2068,7 @@ function createApp() {
       build,
       uptime: Math.floor(process.uptime()),
       dbReady: !!db,
+      workspace,
     })
   })
 
@@ -1586,8 +2186,9 @@ function createApp() {
               avatarUrl: user.avatarUrl || null,
               agencyId: await buildStaffAgencyId(user),
             }
-            sessionToken = randomBytes(32).toString('hex')
-            sessionUser = sessionData
+            // Task 41 — route through assignSession so the outgoing token
+            // becomes the rotation-grace predecessor (never 401 a stale renderer).
+            assignSession(randomBytes(32).toString('hex'), sessionData, 'login:device-unlock')
             emitEvent('auth:login', { user: sessionData })
             console.log('[LocalAPI] Local unlock via device credential:', sessionData.username)
             return c.json({ success: true, user: sessionData, token: sessionToken, unlockedLocally: true })
@@ -1628,8 +2229,8 @@ function createApp() {
                 avatarUrl: await localizeFileUrl(user.avatarUrl || null),
                 agencyId: await buildStaffAgencyId(user),
               }
-              sessionToken = randomBytes(32).toString('hex')
-              sessionUser = sessionData
+              // Task 41 — rotation-grace-aware assignment (see assignSession).
+              assignSession(randomBytes(32).toString('hex'), sessionData, 'login:legacy-unlock')
               emitEvent('auth:login', { user: sessionData })
               return c.json({ success: true, user: sessionData, token: sessionToken })
             }
@@ -1661,8 +2262,9 @@ function createApp() {
         } catch (e) {
           console.warn('[LocalAPI] Device credential store failed:', e?.message || e)
         }
-        sessionToken = cloud.data.token
-        sessionUser = {
+        // Task 41 — assignSession keeps the pre-login token (if any) valid for
+        // the grace window, so a renderer that still presents it never 401s.
+        assignSession(cloud.data.token, {
           id: cloudUser.id,
           username: cloudUser.username || cloudUser.email || 'imported',
           fullName: cloudUser.fullName || cloudUser.name || '',
@@ -1670,7 +2272,12 @@ function createApp() {
           language: cloudUser.language || 'ar',
           avatarUrl: await localizeFileUrl(cloudUser.avatarUrl || null),
           agencyId: cloudUser.agencyId || null,
-        }
+        }, 'login:cloud')
+        // Task 40: wizard-created owners have a NULL cloud User.agencyId (the
+        // agency binds via Agency.ownerId) — hydrate from LOCAL ownership so
+        // the renderer receives a usable agencyId and the branch/staff lists
+        // stop rendering silently empty on desktop.
+        await hydrateSessionAgencyId(sessionUser)
         // Task 33-C: a fresh CLOUD login is fresh proof of authorization —
         // clears a previous workspace lock and (via storeDeviceCredential's
         // upsert semantics: revokedAt: null on update) makes offline unlock
@@ -1797,7 +2404,10 @@ function createApp() {
       // ── Task 22: account created but UNVERIFIED — no session yet ──
       if (reg.data.requiresVerification && reg.data.verificationToken) {
         try {
-          await upsertLocalUserFromCloud(cloudUser)
+          // Task 5 — mirror the Algeria address onto the local User row from
+          // the register request body (cloud value preferred inside the
+          // helper; the body is the fallback for older clouds).
+          await upsertLocalUserFromCloud(cloudUser, { wilaya: body.wilaya, commune: body.commune })
         } catch (e) {
           console.warn('[LocalAPI] Register: local profile upsert failed:', e?.message || e)
         }
@@ -1830,7 +2440,9 @@ function createApp() {
       }
 
       try {
-        await upsertLocalUserFromCloud(cloudUser)
+        // Task 5 — mirror the Algeria address onto the local User row (see
+        // the requiresVerification path above for the override rationale).
+        await upsertLocalUserFromCloud(cloudUser, { wilaya: body.wilaya, commune: body.commune })
       } catch (e) {
         console.warn('[LocalAPI] Register: local profile upsert failed:', e?.message || e)
       }
@@ -2516,8 +3128,10 @@ function createApp() {
       try { data = await res.json() } catch { /* non-JSON */ }
       if (res.ok && data && data.success && data.token && data.user) {
         // Adopt the refreshed session locally (same contract as import-session).
-        sessionToken = data.token
-        sessionUser = {
+        // Task 41 — assignSession (NOT a raw overwrite): the outgoing token
+        // stays valid for the grace window so a renderer presenting it does
+        // not get 401s between the refresh and its own token catch-up.
+        assignSession(data.token, {
           id: data.user.id,
           username: data.user.username || data.user.email || 'imported',
           fullName: data.user.fullName || data.user.name || '',
@@ -2525,7 +3139,7 @@ function createApp() {
           language: data.user.language || 'ar',
           avatarUrl: await localizeFileUrl(data.user.avatarUrl || null),
           agencyId: data.user.agencyId || null,
-        }
+        }, 'refresh-session')
         // Task 33-C: a successful refresh is FRESH PROOF of authorization —
         // the reachable cloud just re-issued this session from its CURRENT
         // DB state. Record it (and lift a lock if one existed).
@@ -2607,8 +3221,71 @@ function createApp() {
     const previousUser = sessionUser
     sessionToken = null
     sessionUser = null
+    // Task 41 — a logout invalidates the WHOLE session chain (no grace).
+    previousSessionToken = null
+    previousSessionTokenAt = 0
     emitEvent('auth:logout', { previousUser })
     return c.json({ success: true, data: { message: 'Logged out' } })
+  })
+
+  /**
+   * POST /api/auth/adopt-session — Task 41 token catch-up (rotation grace).
+   * ────────────────────────────────────────────────────────────────────────
+   * WHY: the cloud re-issues the token whenever import-session /
+   * refresh-session validate it, so the MAIN process can hold a NEWER token
+   * than the renderer's localStorage. Instead of the renderer blindly
+   * re-importing its STALE token over the fresh one (the tug-of-war that
+   * produced the intermittent "data loading failed" dashboard error), the
+   * renderer presents ITS token here and, when it matches the current OR the
+   * rotation-grace predecessor of the SAME session, receives the CURRENT
+   * token + user back — converging both sides on the newest credential.
+   *
+   * SECURITY: loopback-only server; the presented credential must be the
+   * current token or its immediate predecessor (timing-safe compared) —
+   * i.e. proof of possession of the same session chain. A foreign token is
+   * answered 401 exactly like any other authenticated route.
+   */
+  app.post('/api/auth/adopt-session', async (c) => {
+    try {
+      const presented =
+        c.req.header('Authorization')?.replace('Bearer ', '') ||
+        c.req.header('X-Local-Token') ||
+        null
+      if (!presented || !sessionToken || !sessionUser) {
+        return c.json({ success: false, error: 'No active session to adopt' }, 401)
+      }
+
+      let isCurrent = false
+      try {
+        const a = Buffer.from(sessionToken, 'utf-8')
+        const b = Buffer.from(presented, 'utf-8')
+        isCurrent = a.length === b.length && timingSafeEqual(a, b)
+      } catch { isCurrent = false }
+
+      const isPrev = matchesPreviousSessionToken(presented)
+      if (!isCurrent && !isPrev) {
+        console.warn('[LocalAPI] adopt-session rejected — presented=' + tokenFingerprint(presented) +
+          ' current=' + tokenFingerprint(sessionToken) +
+          ' previous=' + (previousSessionTokenValid() ? tokenFingerprint(previousSessionToken) : '(none/expired)'))
+        return c.json({ success: false, error: 'Invalid session token' }, 401)
+      }
+
+      if (!isCurrent) {
+        console.log('[LocalAPI] adopt-session: stale renderer token ' + tokenFingerprint(presented) +
+          ' matched the rotation-grace predecessor — returning the CURRENT token ' + tokenFingerprint(sessionToken))
+      }
+
+      return c.json({
+        success: true,
+        token: sessionToken,
+        user: sessionUser,
+        adopted: !isCurrent,
+        graceRemainingMs: isCurrent ? 0 : Math.max(0, SESSION_TOKEN_GRACE_MS - (Date.now() - previousSessionTokenAt)),
+      })
+    } catch (error) {
+      console.error('[LocalAPI] adopt-session error:', error)
+      return c.json({ success: false, error: 'Adopt failed' }, 500)
+    }
   })
 
   /**
@@ -2728,8 +3405,9 @@ function createApp() {
       const finalUser = adopted ? adopted.user : user
 
       // Set session with the CLOUD token (so LAN failover works with the same token)
-      sessionToken = finalToken
-      sessionUser = {
+      // Task 41 — assignSession records the rotation (stale renderer token
+      // stays valid via grace + POST /api/auth/adopt-session catch-up).
+      assignSession(finalToken, {
         id: finalUser.id,
         username: finalUser.username || finalUser.email || 'imported',
         fullName: finalUser.fullName || finalUser.name || '',
@@ -2737,7 +3415,11 @@ function createApp() {
         language: finalUser.language || 'ar',
         avatarUrl: await localizeFileUrl(finalUser.avatarUrl || null),
         agencyId: finalUser.agencyId || null,
-      }
+      }, adopted ? 'import-session:adopted' : 'import-session:offline')
+      // Task 40: offline import of a payload snapshot whose agencyId is null
+      // (stale renderer user, wizard-created owner) — hydrate from LOCAL
+      // ownership so boot-restore lands with a usable agencyId every time.
+      await hydrateSessionAgencyId(sessionUser)
 
       if (adopted) {
         // The cloud just proved this session valid against its CURRENT DB —
@@ -3062,6 +3744,70 @@ function createApp() {
     }
   })
 
+  // GET /api/agency/analytics/dashboard?period=7d|30d|90d|12m — Task 42-c
+  // Cloud-parity analytics dashboard contract: the SAME JSON shape the cloud
+  // route implements (KPIs + timeseries + distributions + rollups + peaks).
+  // All aggregation lives in the pure computeAgencyAnalyticsDashboard() above;
+  // this route only resolves the agency, computes the ranges, and fetches.
+  app.get('/api/agency/analytics/dashboard', authMiddleware, async (c) => {
+    try {
+      const agencyId = requireAgencyId(c)
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+      const periodParam = c.req.query('period') || '30d'
+      const period = ANALYTICS_PERIODS.includes(periodParam) ? periodParam : '30d'
+      const range = computeAnalyticsRange(period, new Date())
+
+      const reservationSelect = {
+        status: true,
+        joinedAt: true,
+        calledAt: true,
+        completedAt: true,
+        rating: true,
+        isWalkIn: true,
+        userId: true,
+        serviceId: true,
+        counterId: true,
+      }
+
+      // In-range reservations (current + previous) and dictionary lookups.
+      // Lookups loaded with separate findMany calls (no joins) per contract.
+      const [rows, prevRows, serviceRows, branchRows] = await Promise.all([
+        db.reservation.findMany({
+          where: { agencyId, joinedAt: { gte: range.start, lte: range.end } },
+          select: reservationSelect,
+        }),
+        db.reservation.findMany({
+          where: { agencyId, joinedAt: { gte: range.previousStart, lte: range.previousEnd } },
+          select: reservationSelect,
+        }),
+        db.service.findMany({ where: { agencyId }, select: { id: true, name: true } }),
+        db.branch.findMany({ where: { agencyId }, select: { id: true, name: true } }),
+      ])
+      const branchIds = branchRows.map((b) => b.id)
+      const counterRows = branchIds.length > 0
+        ? await db.counter.findMany({
+            where: { branchId: { in: branchIds } },
+            select: { id: true, name: true, branchId: true },
+          })
+        : []
+
+      const lookups = {
+        services: Object.fromEntries(serviceRows.map((s) => [s.id, s.name])),
+        branches: Object.fromEntries(branchRows.map((b) => [b.id, b.name])),
+        counters: Object.fromEntries(counterRows.map((ct) => [ct.id, { name: ct.name, branchId: ct.branchId }])),
+      }
+
+      const data = computeAgencyAnalyticsDashboard(rows, prevRows, lookups, period, range)
+      console.log('[LocalAPI] /api/agency/analytics/dashboard period=' + period +
+        ' rows=' + rows.length + ' prevRows=' + prevRows.length)
+      return c.json({ success: true, data })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/analytics/dashboard error:', error)
+      return c.json({ success: false, error: 'Failed to compute analytics dashboard', detail: error?.message || String(error) }, 500)
+    }
+  })
+
   app.get('/api/admin/announcements', authMiddleware, async (c) => {
     return c.json({
       success: true,
@@ -3143,6 +3889,10 @@ function createApp() {
         phone: agency.phone,
         email: agency.email,
         code: agency.customCode,
+        // Task 5 — Algeria address (mirrors the cloud profile projection so
+        // the profile page location selectors initialize from stored values).
+        wilaya: agency.wilaya ?? null,
+        city: agency.city ?? null,
         logoUrl: await localizeFileUrl(agency.logoUrl),
         coverUrl: agency.coverUrl ? await localizeFileUrl(agency.coverUrl) : null,
         workingHoursStart: agency.workingHoursStart,
@@ -3460,6 +4210,112 @@ function createApp() {
   })
 
   // ═══════════════════════════════════════════════════════════════════════
+  // 4b. AGENCY CATEGORIES (Task 42-c — global dictionary, mirror of the
+  // cloud /api/agency-categories routes). NOT agency-scoped: the rows are
+  // platform-wide (Task 42-a sync registry — isAgencyScoped false). Offline
+  // creates replay to the cloud via the outbox (logDeterministicOutcome →
+  // /api/sync/push → registry-driven applyMutationInTx).
+
+  // The 25 built-in category keys (cloud parity) — case-insensitive collision
+  // targets for custom names.
+  const AGENCY_CATEGORY_BUILTIN_KEYS = [
+    'CLINIC', 'HOSPITAL', 'DENTAL_CLINIC', 'LABORATORY', 'PHARMACY',
+    'VETERINARY', 'BANK', 'POST_OFFICE', 'TELECOM', 'INSURANCE',
+    'LAW_FIRM', 'NOTARY', 'GOVERNMENT', 'EDUCATION', 'AGENCY',
+    'TRAVEL', 'REAL_ESTATE', 'CAR_SERVICE', 'BARBER', 'BEAUTY_SALON',
+    'RESTAURANT', 'CAFE', 'RETAIL', 'HOTEL', 'OTHER',
+  ]
+
+  /** Plain JSON record with booleans + ISO datetimes (also the outbox payload). */
+  function serializeAgencyCategory(row) {
+    return {
+      id: row.id,
+      name: row.name,
+      nameFr: row.nameFr == null ? null : String(row.nameFr),
+      nameAr: row.nameAr == null ? null : String(row.nameAr),
+      icon: row.icon == null ? null : String(row.icon),
+      isCustom: row.isCustom === 1 || row.isCustom === true,
+      createdBy: row.createdBy == null ? null : String(row.createdBy),
+      createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : (row.createdAt ? new Date(row.createdAt).toISOString() : null),
+      updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : (row.updatedAt ? new Date(row.updatedAt).toISOString() : null),
+    }
+  }
+
+  // GET /api/agency-categories — ANY authenticated session (any role incl. customer)
+  app.get('/api/agency-categories', authMiddleware, async (c) => {
+    try {
+      const rows = await db.agencyCategory.findMany({ orderBy: [{ createdAt: 'asc' }] })
+      const data = rows.map(serializeAgencyCategory)
+      console.log('[LocalAPI] agency-categories list read: rows=' + data.length)
+      return c.json({ success: true, data })
+    } catch (error) {
+      console.error('[LocalAPI] List agency-categories error:', error)
+      return c.json({ success: false, error: 'Failed to list agency categories' }, 500)
+    }
+  })
+
+  // POST /api/agency-categories — owners/staff/super-admin create a custom
+  // category; commit + outbox row in ONE transaction (Part Q).
+  app.post('/api/agency-categories', authMiddleware, async (c) => {
+    try {
+      const role = sessionUser ? sessionUser.role : null
+      if (!['AGENCY_OWNER', 'AGENCY_STAFF', 'SUPER_ADMIN'].includes(role)) {
+        return c.json({ success: false, error: 'Only agency owners, staff, or super admins can create agency categories' }, 403)
+      }
+
+      const body = await c.req.json().catch(() => ({}))
+      // Normalize: trim + collapse internal whitespace; 2–40 chars required.
+      const name = typeof body?.name === 'string' ? body.name.replace(/\s+/g, ' ').trim() : ''
+      if (name.length < 2 || name.length > 40) {
+        return c.json({ success: false, error: 'INVALID_NAME' }, 400)
+      }
+      const nameFr = typeof body?.nameFr === 'string' && body.nameFr.trim() !== '' ? body.nameFr.trim() : null
+      const nameAr = typeof body?.nameAr === 'string' && body.nameAr.trim() !== '' ? body.nameAr.trim() : null
+      const icon = typeof body?.icon === 'string' && body.icon.trim() !== '' ? body.icon.trim() : null
+
+      // Case-insensitive collision check — built-in keys first, then local rows.
+      const lower = name.toLowerCase()
+      if (AGENCY_CATEGORY_BUILTIN_KEYS.some((k) => k.toLowerCase() === lower)) {
+        return c.json({ success: false, error: 'CATEGORY_EXISTS' }, 409)
+      }
+      const existing = await db.agencyCategory.findMany({ select: { name: true } })
+      if (existing.some((r) => String(r.name || '').trim().toLowerCase() === lower)) {
+        return c.json({ success: false, error: 'CATEGORY_EXISTS' }, 409)
+      }
+
+      const categoryId = require('crypto').randomUUID()
+      const created = await withOutboxTransaction(async (tx) => {
+        const row = await tx.agencyCategory.create({
+          data: {
+            id: categoryId,
+            name,
+            nameFr,
+            nameAr,
+            icon,
+            isCustom: true,
+            createdBy: sessionUser.id || null,
+          },
+        })
+        // Canonical replay (round-7): id-preserving record-level create with a
+        // plain payload (ISO dates + booleans) so the cloud push is schema-clean.
+        await logDeterministicOutcome('AgencyCategory', row.id, 'create', serializeAgencyCategory(row), new Date().toISOString(), { tx })
+        return row
+      })
+
+      console.log('[LocalAPI] agency-category created: id=' + created.id + ' name="' + created.name + '"')
+      return c.json({ success: true, data: serializeAgencyCategory(created) }, 201)
+    } catch (error) {
+      // Race with a concurrent create (or a synced row that landed between the
+      // pre-check and the INSERT) → unique constraint on name → CATEGORY_EXISTS.
+      if (error && (error.code === 'P2002' || /UNIQUE constraint failed/i.test(String(error?.message || '')))) {
+        return c.json({ success: false, error: 'CATEGORY_EXISTS' }, 409)
+      }
+      console.error('[LocalAPI] Create agency-category error:', error)
+      return c.json({ success: false, error: 'Failed to create agency category' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
   // 5. BRANCHES (auth required)
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -3490,6 +4346,11 @@ function createApp() {
         },
         orderBy: [{ isMain: 'desc' }, { name: 'asc' }],
       })
+
+      // Task 46 [SyncDiag]: every list read is traceable — if the UI shows
+      // "no branches yet" while this line says N rows, the defect is in the
+      // client render layer, not the data.
+      console.log(`[SyncDiag] branches list read: agencyId=${agencyId} rows=${branches.length}`)
 
       return c.json({ success: true, branches, data: branches })
     } catch (error) {
@@ -3587,6 +4448,15 @@ function createApp() {
       })
 
       emitEvent('branch:created', { agencyId, branch })
+
+      // Task 46 [SyncDiag]: the branch-visibility incident needs the CREATE
+      // side to be as traceable as the import side — log the created row and
+      // the resulting local table count so "created but list empty" is
+      // attributable to the read/render layer, never ambiguous again.
+      try {
+        const localBranchCount = await db.branch.count({ where: { agencyId } })
+        console.log(`[SyncDiag] branch created locally: id=${branch.id} name="${branch.name}" agencyId=${agencyId} — local Branch table now holds ${localBranchCount} row(s) for this agency`)
+      } catch { /* diagnostics must never fail the request */ }
 
       // Dual-key response — the cloud route returns { success, branch } 201.
       return c.json({ success: true, branch, data: branch }, 201)
@@ -6129,7 +6999,9 @@ function createApp() {
       const body = await c.req.json()
       // Field whitelist extended to match PUT + the cloud PATCH route —
       // the profile form updates email/working hours/days and the cover.
-      const allowedFields = ['name', 'nameAr', 'nameFr', 'phone', 'email', 'description', 'descriptionAr', 'descriptionFr', 'address', 'city', 'category', 'website', 'logoUrl', 'coverUrl', 'workingHoursStart', 'workingHoursEnd', 'workingDays']
+      // Task 5: 'wilaya' joins 'city' (both Algeria address columns on the
+      // Agency row) so desktop profile saves persist the full location.
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'phone', 'email', 'description', 'descriptionAr', 'descriptionFr', 'address', 'city', 'wilaya', 'category', 'website', 'logoUrl', 'coverUrl', 'workingHoursStart', 'workingHoursEnd', 'workingDays']
       const updateData = {}
       for (const field of allowedFields) {
         if (body[field] !== undefined) updateData[field] = body[field]
@@ -6650,6 +7522,45 @@ function createApp() {
     }
   })
 
+  // POST /api/sync/pull — Task 41: protocol-v2 pull answer for the RENDERER's
+  // web sync engine (apps/web/src/db/sync.ts). The embedded local API is the
+  // renderer's primary base in Electron, so its periodic sync cycle POSTs
+  // HERE first. This route previously did not exist → 404 noise in the
+  // console ("no route matched: POST /api/sync/pull") AND, worse, the
+  // renderer fell back to pulling the CLOUD directly behind the main
+  // process's SyncService (duplicate puller, racing cursors, duplicate
+  // 401-revocation risk). The authoritative cloud pulls belong to the
+  // SyncService; this endpoint answers a well-formed EMPTY page so the
+  // renderer's cycle completes cleanly against the local-first source.
+  app.post('/api/sync/pull', authMiddleware, async (c) => {
+    try {
+      let body = {}
+      try { body = await c.req.json() } catch { /* empty body is fine */ }
+      const since = Number.isFinite(Number(body && body.sinceSequence))
+        ? Math.max(0, Math.floor(Number(body.sinceSequence)))
+        : 0
+      const agencyId = sessionUser?.agencyId || body?.agencyId || null
+      if (Math.random() < 0.15) { // log occasionally — a per-5-min cycle, but never spam
+        console.log('[LocalAPI] /api/sync/pull (renderer cycle) → empty page answer (sinceSequence=' + since +
+          ', agency=' + (agencyId ? agencyId.slice(0, 8) + '…' : 'none') + ') — cloud pulls are owned by the desktop SyncService')
+      }
+      return c.json({
+        success: true,
+        protocolVersion: 2,
+        agencyId,
+        sinceSequence: since,
+        pageLastSequence: since,
+        latestSequence: since,
+        rows: [],
+        hasMore: false,
+        source: 'local-embedded-api',
+      })
+    } catch (error) {
+      console.error('[LocalAPI] /api/sync/pull error:', error)
+      return c.json({ success: false, error: 'Pull failed' }, 500)
+    }
+  })
+
   // GET /api/sync-status — local sync status for diagnosis panel
   // v2: returns the live background sync engine status (awaited).
   app.get('/api/sync-status', async (c) => {
@@ -6674,6 +7585,167 @@ function createApp() {
         cloudConnected: false,
         lastSyncAt: null,
       })
+    }
+  })
+
+  // GET /api/sync/initial-sync/status — Task 46: live workspace-import status
+  // for the post-login loading gate. Read-only and loopback-only (the local
+  // API binds 127.0.0.1), mirroring the /api/db-status exposure precedent.
+  // Combines: the AgencyLocalState state machine (READY/INITIALIZING/…),
+  // the live engine run (stage/counts via getInitialSyncSnapshot), core
+  // table counts, deferred/quarantine stats and the [SyncDiag] ring buffer.
+  app.get('/api/sync/initial-sync/status', async (c) => {
+    try {
+      const { checkInitialSyncStatus, getInitialSyncSnapshot } = require('./initial-sync')
+      const agencyId = sessionUser?.agencyId || c.req.query('agencyId') || null
+
+      let state = null
+      if (db && agencyId) {
+        state = await checkInitialSyncStatus(db, agencyId).catch((e) => {
+          console.warn('[LocalAPI] initial-sync/status state check failed:', e.message)
+          return null
+        })
+      }
+
+      const snapshot = getInitialSyncSnapshot()
+
+      // Core table counts (−1 on error) — the gate renders these as a
+      // checklist so "what arrived" is visible without opening devtools.
+      const counts = {}
+      const countQueries = {
+        Agency: () => db.agency.count(),
+        Branch: () => db.branch.count({ where: agencyId ? { agencyId } : undefined }),
+        Service: () => db.service.count({ where: agencyId ? { agencyId } : undefined }),
+        Counter: () => db.counter.count({ where: agencyId ? { branch: { agencyId } } : undefined }),
+        AgencyStaff: () => db.agencyStaff.count({ where: agencyId ? { agencyId } : undefined }),
+        Reservation: () => db.reservation.count({ where: agencyId ? { agencyId } : undefined }),
+        User: () => db.user.count(),
+      }
+      if (db) {
+        for (const [model, fn] of Object.entries(countQueries)) {
+          try { counts[model] = await fn() } catch { counts[model] = -1 }
+        }
+      }
+
+      // Deferred/quarantined changes (FK-blocked rows awaiting parents)
+      const deferred = { pending: 0, quarantined: 0 }
+      if (db) {
+        try {
+          const rows = await db.$queryRawUnsafe(
+            'SELECT status, COUNT(*) as cnt FROM "_deferred_changes" GROUP BY status'
+          )
+          for (const row of rows || []) {
+            if (row.status === 'PENDING') deferred.pending = Number(row.cnt)
+            if (row.status === 'QUARANTINED') deferred.quarantined = Number(row.cnt)
+          }
+        } catch { /* table may not exist yet */ }
+      }
+
+      return c.json({
+        success: true,
+        serverTime: new Date().toISOString(),
+        sessionActive: !!sessionToken,
+        agencyId,
+        state: state?.status || (snapshot.active ? 'INITIALIZING' : 'UNKNOWN'),
+        needsInitialSync: state ? !!state.needsInitialSync : null,
+        lastError: state?.lastError || null,
+        active: snapshot.active,
+        activeSync: snapshot.activeSync,
+        lastProgress: snapshot.lastProgress,
+        counts,
+        deferred,
+        diag: snapshot.diag,
+      })
+    } catch (err) {
+      console.error('[LocalAPI] /api/sync/initial-sync/status error:', err)
+      return c.json({ success: false, error: err?.message || 'status failed' }, 500)
+    }
+  })
+
+  // GET /api/sync/diagnostics — Task 46: one-shot branch-focused support
+  // report (auth required). Everything needed to answer "why doesn't the
+  // desktop show my branches" without reproducing the incident: workspace
+  // identity, initialization state, core counts, the actual branch rows,
+  // deferred/quarantine stats, engine cursor, and the [SyncDiag] ring.
+  app.get('/api/sync/diagnostics', requireAuth(), async (c) => {
+    try {
+      const { checkInitialSyncStatus, getInitialSyncSnapshot } = require('./initial-sync')
+      const user = c.get('user')
+      const agencyId = user?.agencyId || sessionUser?.agencyId || null
+
+      const state = agencyId && db
+        ? await checkInitialSyncStatus(db, agencyId).catch(() => null)
+        : null
+      const snapshot = getInitialSyncSnapshot()
+
+      const counts = {}
+      for (const [model, fn] of Object.entries({
+        Agency: () => db.agency.count(),
+        Branch: () => db.branch.count({ where: agencyId ? { agencyId } : undefined }),
+        Service: () => db.service.count({ where: agencyId ? { agencyId } : undefined }),
+        Counter: () => db.counter.count({ where: agencyId ? { branch: { agencyId } } : undefined }),
+        AgencyStaff: () => db.agencyStaff.count({ where: agencyId ? { agencyId } : undefined }),
+        Reservation: () => db.reservation.count({ where: agencyId ? { agencyId } : undefined }),
+      })) {
+        try { counts[model] = await fn() } catch { counts[model] = -1 }
+      }
+
+      // The actual branch rows (first 50) — names/ids/timestamps for support
+      let branches = []
+      try {
+        branches = await db.branch.findMany({
+          where: agencyId ? { agencyId } : undefined,
+          select: { id: true, name: true, phone: true, address: true, isActive: true, createdAt: true, updatedAt: true },
+          take: 50,
+          orderBy: { createdAt: 'asc' },
+        })
+      } catch { /* non-fatal */ }
+
+      // Deferred summary by model
+      const deferredByModel = {}
+      try {
+        const rows = await db.$queryRawUnsafe(
+          "SELECT model, status, COUNT(*) as cnt FROM \"_deferred_changes\" WHERE agencyId = ? GROUP BY model, status",
+          agencyId || ''
+        )
+        for (const row of rows || []) {
+          deferredByModel[`${row.model}:${row.status}`] = Number(row.cnt)
+        }
+      } catch { /* non-fatal */ }
+
+      // Engine cursor + ready-check receipt
+      const meta = {}
+      try {
+        const rows = await db.$queryRawUnsafe(
+          "SELECT key, value FROM \"_sync_meta\" WHERE key IN ('lastPulledSequence', 'initialSyncSnapshotSequence', 'readyChecks') OR key LIKE 'readyChecks:%'"
+        )
+        for (const row of rows || []) meta[row.key] = row.value
+      } catch { /* non-fatal */ }
+
+      return c.json({
+        success: true,
+        generatedAt: new Date().toISOString(),
+        workspace: {
+          agencyId,
+          user: user ? { id: user.id, username: user.username, role: user.role } : null,
+          initialization: state ? {
+            status: state.status,
+            needsInitialSync: state.needsInitialSync,
+            currentStage: state.currentStage || null,
+            recordsImported: state.recordsImported ?? null,
+            lastError: state.lastError || null,
+          } : null,
+        },
+        counts,
+        branches,
+        deferredByModel,
+        engineCursor: meta,
+        initialSync: snapshot,
+        apiVersion: '0.3.0',
+      })
+    } catch (err) {
+      console.error('[LocalAPI] /api/sync/diagnostics error:', err)
+      return c.json({ success: false, error: err?.message || 'diagnostics failed' }, 500)
     }
   })
 
@@ -7602,6 +8674,31 @@ async function startLocalApi(dbPath, port, options) {
   await setupPragmas()
   console.log(`[LocalAPI] Prisma database initialized (local SQLite)`)
 
+  // ── Task 47: startup self-heal for the stale 'BASIC' tier default ─────
+  // The pre-Task-32 local DDL defaulted Agency.subscriptionTier to 'BASIC',
+  // so any agency row created LOCALLY (before its first sync pull) still
+  // carries that legacy default on existing Windows databases — SQLite can't
+  // ALTER a column DEFAULT, so the DDL fix alone can't reach them. Mirror of
+  // the cloud's one-time heal (agency.ts) and the subscription-endpoint heal
+  // below, hoisted to startup so the desktop never poses Basic as the built-in
+  // free tier anywhere (profile cards, kiosk, sync pushes). Idempotent,
+  // non-fatal; runs before the sync engine so pushes carry the healed tier.
+  try {
+    const healed = await db.$executeRawUnsafe(`
+      UPDATE Agency SET subscriptionTier = 'FREE', updatedAt = '${new Date().toISOString()}'
+      WHERE subscriptionTier = 'BASIC'
+        AND subscriptionStatus = 'INACTIVE'
+        AND subscriptionPlanId IS NULL
+        AND id NOT IN (SELECT DISTINCT agencyId FROM "Transaction" WHERE agencyId IS NOT NULL)
+    `)
+    if (healed > 0) {
+      console.log(`[LocalAPI] Startup tier heal: ${healed} never-paid agency row(s) 'BASIC' → 'FREE' (legacy local default)`)
+    }
+  } catch (tierHealErr) {
+    console.warn('[LocalAPI] Startup tier heal skipped (non-fatal):', tierHealErr?.message || tierHealErr)
+  }
+
+
   // ── Round 15: local FILE STORE + FILE SYNC worker ─────────────────────
   // Uploads land locally first (lib/file-store.js, under
   // BLASTI_LOCAL_FILES_DIR); this worker mirrors them with the cloud
@@ -7691,6 +8788,12 @@ async function startLocalApi(dbPath, port, options) {
   try {
     localRealtime.initLocalRealtime(httpServer, {
       getSession: () => (sessionToken && sessionUser ? { token: sessionToken, user: sessionUser } : null),
+      // Task 41 — rotation-grace awareness for socket auth: a renderer socket
+      // presenting the PREVIOUS token of the same session is accepted during
+      // the grace window instead of being rejected with
+      // "auth event rejected — token does not match the current local session".
+      getPreviousSessionToken: () =>
+        previousSessionTokenValid() ? previousSessionToken : null,
     })
     // Bridge the in-process event stream (emitEvent) onto the socket server —
     // every local business mutation becomes a live UI event, OFFLINE included.
@@ -7725,6 +8828,8 @@ function stopLocalApi() {
   }
   sessionToken = null
   sessionUser = null
+  previousSessionToken = null
+  previousSessionTokenAt = 0
   eventListeners = []
   console.log('[LocalAPI] Stopped')
 }
@@ -7740,6 +8845,10 @@ function getSession() {
 
 /**
  * Set an active session (called from Electron main process).
+ * Task 41 — routed through assignSession: an IPC re-import of a STALE renderer
+ * token after a cloud-validated rotation no longer hard-invalidates the fresh
+ * token — it becomes the grace predecessor, ending the token tug-of-war that
+ * produced the intermittent "data loading failed" dashboard error.
  * @param {string} token
  * @param {object} user
  */
@@ -7750,8 +8859,7 @@ function setSession(token, user) {
     console.warn('[LocalAPI] setSession called with invalid args — skipping')
     return
   }
-  sessionToken = token
-  sessionUser = user
+  assignSession(token, user, 'ipc:set-session')
 }
 
 /**
@@ -7760,6 +8868,8 @@ function setSession(token, user) {
 function clearSession() {
   sessionToken = null
   sessionUser = null
+  previousSessionToken = null
+  previousSessionTokenAt = 0
 }
 
 /**
@@ -7805,6 +8915,9 @@ module.exports = {
   relayCloudRealtime: (...args) => localRealtime.relayCloudRealtime(...args),
   getLocalRealtimeStats: () => localRealtime.getLocalRealtimeStats(),
   repairLegacyReservationCreates,
+  // Task 42-c: pure analytics computation (harness-testable, no db access)
+  computeAgencyAnalyticsDashboard,
+  computeAnalyticsRange,
   // Task 33-C: workspace lock / authorization surface
   revokeLocalAuthorization,
   markAuthorizationAuthorized,

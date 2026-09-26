@@ -282,6 +282,7 @@ export const SYNC_TRACKED_MODELS: Set<string> = new Set([
   'FAQ',
   'SubscriptionPlan',
   'PlanFeature',
+  'AgencyCategory', // Task 42-a: user-created agency fields (shared dictionary)
 ])
 
 

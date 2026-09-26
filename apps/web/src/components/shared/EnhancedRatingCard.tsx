@@ -222,10 +222,10 @@ export function EnhancedRatingCard({ agency, onJoinQueue, compact = false }: Enh
                 </motion.div>
               ))}
             </motion.div>
-            <span className="text-lg font-bold text-foreground">{agency.averageRating.toFixed(1)}</span>
+            <span className="text-lg font-bold text-foreground">{(agency.averageRating ?? 0).toFixed(1)}</span>
             {/* Review count badge */}
             <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border border-emerald-200/50 dark:border-emerald-700/30">
-              {agency.reviewCount} {t('reviews') || 'reviews'}
+              {agency.reviewCount ?? 0} {t('reviews') || 'reviews'}
             </span>
           </div>
 
