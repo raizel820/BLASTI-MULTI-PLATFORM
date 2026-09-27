@@ -4,19 +4,27 @@
 // Replaces the previous admin-analytics behind the existing 'admin-analytics'
 // view (same `AdminAnalytics` export, same lazy import in src/app/page.tsx).
 //
-// Layout: header (title + period + refresh) → scope tabs (Global | Average per
-// agency) + agency search (a selected agency overrides the tabs and shows a
-// clearable chip) → platform stats row → KPI cards (+ average caption) →
-// CHANNEL panel (online vs walk-in, prominent) → trend + status donut →
-// hourly traffic + no-show → heatmap → services (+ branches/counters in
-// per-agency mode / + top agencies in global & average scope) → ratings.
+// Task 54-b: the export is now the SECTION SHELL — a horizontal sub-nav strip
+// (doc-2 §5.1: Overview/Users/Agencies/Categories/Reservations/Queues/Services/
+// Customers/Subscriptions/Payments/SMS/Notifications/Devices/Security & Audit)
+// with 'overview' rendering the ORIGINAL dashboard one-to-one below it (its
+// header, scope tabs, agency search, period select and RefreshObserver-protected
+// charts are untouched) and every other section rendering a shared toolbar
+// (period selector incl. custom range + refresh) above its own body.
+//
+// Original overview layout: header (title + period + refresh) → scope tabs
+// (Global | Average per agency) + agency search → platform stats row → KPI
+// cards → CHANNEL panel → trend + status donut → hourly traffic + no-show →
+// heatmap → services (+ branches/counters / top agencies) → ratings.
 //
 // Agency panel components are REUSED as-is (pure presentational). States:
 // loading skeletons · 404 → "update required" · error + retry · empty.
 // Palette: emerald/teal/cyan primary, amber warning, rose negative — no
 // indigo/blue. RTL-aware with LTR-wrapped numeric/chart zones.
 
+import { useState } from 'react';
 import { useLanguage } from '@/hooks/use-language';
+import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -29,6 +37,12 @@ import { getLocale } from '@/components/agency/dashboard/helpers';
 import { translateCategory } from '@/lib/enum-i18n';
 import { ak } from './i18n-keys';
 import { useAdminAnalyticsData } from './use-admin-analytics-data';
+import { ADMIN_SECTION_PERIODS, type AdminSectionId, type AdminSectionPeriod } from './section-types';
+import {
+  ADMIN_SECTION_COMPONENTS,
+  ADMIN_SECTION_NAV,
+  ADMIN_SECTION_TITLE_KEYS,
+} from './section-registry';
 import {
   isAgencyScopedPayload,
   type AdminAgencyInfo,
@@ -51,6 +65,35 @@ import { ChannelPanel } from './channel-panel';
 import { PlatformStatsRow } from './platform-stats-row';
 import { AgencySearch } from './agency-search';
 import { TopAgenciesPanel } from './top-agencies-panel';
+
+// ─── Task 54-b: sub-navigation period labels ────────────────────────────────
+function sectionPeriodLabelKey(period: AdminSectionPeriod): string {
+  switch (period) {
+    case '7d':
+      return 'analyticsSection.period7d';
+    case '30d':
+      return 'analyticsSection.period30d';
+    case 'today':
+      return 'adminAnalytics.period.today';
+    case 'this-month':
+      return 'adminAnalytics.period.thisMonth';
+    case 'this-year':
+      return 'adminAnalytics.period.thisYear';
+    case 'custom':
+      return 'adminAnalytics.period.custom';
+  }
+}
+
+/** ISO date (yyyy-mm-dd) for `days` days before today (UTC — matches backend). */
+function isoDaysAgo(days: number): string {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - days);
+  return d.toISOString().slice(0, 10);
+}
+
+// ─── Task 54-b: sub-navigation strip ─────────────────────────────────────────
+// Horizontal scrollable strip on mobile (with the app's custom scrollbar),
+// fully wrapped layout on desktop. role=tablist/tab with aria-selected.
 
 function periodLabelKey(period: AnalyticsPeriod): string {
   switch (period) {
@@ -190,7 +233,171 @@ function AgencyInfoStrip({
   );
 }
 
+/** Task 54-b: sub-navigation strip — horizontal scroll on mobile, wrap on lg. */
+function SectionNav({
+  active,
+  onChange,
+}: {
+  active: AdminSectionId;
+  onChange: (id: AdminSectionId) => void;
+}) {
+  const { t } = useLanguage();
+  return (
+    <nav
+      className="flex gap-1.5 overflow-x-auto pb-1.5 -mx-1 px-1 lg:flex-wrap lg:overflow-x-visible lg:mx-0 lg:px-0 custom-scrollbar"
+      role="tablist"
+      aria-label={t('analyticsSection.title')}
+    >
+      {ADMIN_SECTION_NAV.map((item) => {
+        const Icon = item.icon;
+        const selected = active === item.id;
+        return (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            id={`admin-analytics-tab-${item.id}`}
+            aria-selected={selected}
+            aria-controls="admin-analytics-section-panel"
+            onClick={() => onChange(item.id)}
+            className={`shrink-0 lg:shrink inline-flex items-center gap-1.5 h-9 px-3 rounded-xl text-xs font-bold transition-colors border ${
+              selected
+                ? 'bg-emerald-600 text-white border-transparent shadow-sm shadow-emerald-600/30'
+                : 'bg-white dark:bg-gray-900/80 text-muted-foreground hover:text-emerald-700 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 border-border'
+            }`}
+          >
+            <Icon className="h-3.5 w-3.5" aria-hidden="true" />
+            {t(ak(item.labelKey))}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+// ─── Task 54-b: shell — sub-nav + (overview dashboard | section page) ────────
 export function AdminAnalytics() {
+  const { t } = useLanguage();
+  const [activeSection, setActiveSection] = useState<AdminSectionId>('overview');
+  const [period, setPeriod] = useState<AdminSectionPeriod>('30d');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+  const [reloadToken, setReloadToken] = useState(0);
+
+  const isCustom = period === 'custom';
+  const customReady = Boolean(customFrom) && Boolean(customTo);
+
+  const handlePeriodChange = (p: AdminSectionPeriod) => {
+    setPeriod(p);
+    // Pre-fill the custom range (last 30 days incl. today) so the first
+    // selection is immediately valid — the backend 400s on missing dates.
+    if (p === 'custom') {
+      setCustomFrom((prev) => prev || isoDaysAgo(29));
+      setCustomTo((prev) => prev || isoDaysAgo(0));
+    }
+  };
+
+  const query = { period, from: customFrom || undefined, to: customTo || undefined, reloadToken };
+
+  // Overview: the pre-existing dashboard, rendering exactly as before —
+  // only re-homed under the sub-navigation strip.
+  if (activeSection === 'overview') {
+    return (
+      <>
+        <div className="p-4 sm:p-6 pb-0 sm:pb-0 max-w-6xl mx-auto">
+          <SectionNav active={activeSection} onChange={setActiveSection} />
+        </div>
+        <OverviewDashboard />
+      </>
+    );
+  }
+
+  const SectionBody = ADMIN_SECTION_COMPONENTS[activeSection];
+  const customHint = t(ak('adminAnalytics.period.customHint'));
+
+  return (
+    <div className="p-4 sm:p-6 max-w-6xl mx-auto space-y-4">
+      <SectionNav active={activeSection} onChange={setActiveSection} />
+
+      {/* ── Section toolbar: title + period selector + refresh ── */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shrink-0 shadow-sm shadow-emerald-500/20">
+            <BarChart3 className="h-5 w-5 text-white" />
+          </div>
+          <h1 className="text-lg font-black text-foreground leading-tight truncate">
+            {t(ak(ADMIN_SECTION_TITLE_KEYS[activeSection]))}
+          </h1>
+        </div>
+        <div className="flex items-center gap-2 self-start sm:self-auto">
+          <Select value={period} onValueChange={(v) => handlePeriodChange(v as AdminSectionPeriod)}>
+            <SelectTrigger className="h-9 w-[150px] text-xs" aria-label={t('analyticsSection.title')}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {ADMIN_SECTION_PERIODS.map((p) => (
+                <SelectItem key={p} value={p} className="text-xs">
+                  {t(ak(sectionPeriodLabelKey(p)))}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Button
+            variant="outline"
+            size="icon"
+            className="h-9 w-9 shrink-0"
+            onClick={() => setReloadToken((n) => n + 1)}
+            aria-label={t('refresh')}
+            title={t('refresh')}
+          >
+            <RefreshCw className="h-4 w-4" />
+          </Button>
+        </div>
+      </div>
+
+      {/* ── Custom range row (period === custom) ── */}
+      {isCustom && (
+        <div className="flex flex-col sm:flex-row sm:items-center gap-2 rounded-xl border border-border bg-white dark:bg-gray-900/80 p-3">
+          <label className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+            {t(ak('adminAnalytics.period.from'))}
+            <Input
+              type="date"
+              value={customFrom}
+              max={customTo || undefined}
+              onChange={(e) => setCustomFrom(e.target.value)}
+              className="h-8 w-40 text-xs"
+              dir="ltr"
+            />
+          </label>
+          <label className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground">
+            {t(ak('adminAnalytics.period.to'))}
+            <Input
+              type="date"
+              value={customTo}
+              min={customFrom || undefined}
+              onChange={(e) => setCustomTo(e.target.value)}
+              className="h-8 w-40 text-xs"
+              dir="ltr"
+            />
+          </label>
+          {!customReady && (
+            <p className="text-[11px] text-amber-600 dark:text-amber-400 font-medium">
+              {t(ak('adminAnalytics.period.customHint'))}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* ── Section body ── */}
+      <div id="admin-analytics-section-panel" role="tabpanel" aria-labelledby={`admin-analytics-tab-${activeSection}`}>
+        <SectionBody query={query} customHint={customHint} />
+      </div>
+    </div>
+  );
+}
+
+// ─── Original overview dashboard (Task 4) — behavior unchanged ───────────────
+function OverviewDashboard() {
   const { t, lang } = useLanguage();
   const {
     period,

@@ -24,13 +24,56 @@
  *
  *   // Staff change:
  *   await emitStaffEvent('staff:updated', agencyId, { ...data })
+ *
+ * Task 55-b: every successful emit fetch records ONE DataUsageEvent
+ * (trafficType REALTIME) through lib/data-usage.ts — see recordEmitUsage.
  */
+
+import { recordDataUsage } from './data-usage'
 
 const REALTIME_SERVICE_PORT = 3003
 // Prefer the env var (set in .env as REALTIME_SERVICE_URL); fall back to localhost
 const REALTIME_SERVICE_URL = process.env.REALTIME_SERVICE_URL || `http://localhost:${REALTIME_SERVICE_PORT}`
 // Phase 1a: Use INTERNAL_SECRET for service-to-service auth (x-internal-secret header)
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET || process.env.REALTIME_SECRET || ''
+
+// ─── Task 55-b — data-usage instrumentation ────────────────────────────────
+//
+// APPROXIMATION: one DataUsageEvent per successful EMIT (the API → realtime
+// service POST), NOT per connected client — a fan-out to N sockets still
+// counts as one event. downloadBytes approximates the JSON payload length the
+// service will relay to clients (JSON.stringify(...).length per contract
+// §2.3); the API's own loopback upload to the realtime service is deliberately
+// not metered. Attribution (agencyId/userId) rides along when the helper
+// knows it — notification/device emits attribute to the user, room emits to
+// the agency, admin emits stay platform-level (null).
+function recordEmitUsage(
+  payloadJson: string,
+  attribution: { agencyId?: string | null; userId?: string | null },
+  status: number,
+  path: string,
+): void {
+  recordDataUsage({
+    trafficType: 'REALTIME',
+    downloadBytes: payloadJson.length,
+    agencyId: attribution.agencyId ?? null,
+    userId: attribution.userId ?? null,
+    path,
+    method: 'POST',
+    status,
+  })
+}
+
+/** Shared header builder — keeps every emit fetch identical. */
+function emitHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  if (INTERNAL_SECRET) {
+    headers['x-internal-secret'] = INTERNAL_SECRET
+  }
+  return headers
+}
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -136,18 +179,14 @@ export async function emitQueueEvent(
   data: Record<string, unknown> = {}
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ type, agencyId, data })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ type, agencyId, data }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(3000),
     })
+    if (response.ok) recordEmitUsage(body, { agencyId }, response.status, '/realtime/emit')
     return response.ok
   } catch (error) {
     console.warn(`[Realtime] Failed to emit ${type} for agency ${agencyId}:`, error instanceof Error ? error.message : error)
@@ -165,18 +204,14 @@ export async function emitReservationEvent(
   data: Record<string, unknown> = {}
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ type, agencyId, userId, data })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ type, agencyId, userId, data }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(3000),
     })
+    if (response.ok) recordEmitUsage(body, { agencyId, userId: userId ?? null }, response.status, '/realtime/emit')
     return response.ok
   } catch (error) {
     console.warn(`[Realtime] Failed to emit ${type} for agency ${agencyId}:`, error instanceof Error ? error.message : error)
@@ -194,18 +229,14 @@ export async function emitNotificationEvent(
   data: Record<string, unknown> = {}
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ type, userId, data })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ type, userId, data }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(3000),
     })
+    if (response.ok) recordEmitUsage(body, { userId }, response.status, '/realtime/emit')
     return response.ok
   } catch (error) {
     console.warn(`[Realtime] Failed to emit ${type} for user ${userId}:`, error instanceof Error ? error.message : error)
@@ -222,18 +253,14 @@ export async function emitKioskEvent(
   data: Record<string, unknown> = {}
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ type: 'kiosk:update', agencyId, data })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ type: 'kiosk:update', agencyId, data }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(3000),
     })
+    if (response.ok) recordEmitUsage(body, { agencyId }, response.status, '/realtime/emit')
     return response.ok
   } catch (error) {
     console.warn(`[Realtime] Failed to emit kiosk:update for agency ${agencyId}:`, error instanceof Error ? error.message : error)
@@ -251,18 +278,14 @@ export async function emitAgencyEvent(
   data: Record<string, unknown> = {}
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ type, agencyId, data })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ type, agencyId, data }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(3000),
     })
+    if (response.ok) recordEmitUsage(body, { agencyId }, response.status, '/realtime/emit')
     return response.ok
   } catch (error) {
     console.warn(`[Realtime] Failed to emit ${type} for agency ${agencyId}:`, error instanceof Error ? error.message : error)
@@ -280,18 +303,14 @@ export async function emitStaffEvent(
   data: Record<string, unknown> = {}
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ type, agencyId, data })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ type, agencyId, data }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(3000),
     })
+    if (response.ok) recordEmitUsage(body, { agencyId }, response.status, '/realtime/emit')
     return response.ok
   } catch (error) {
     console.warn(`[Realtime] Failed to emit ${type} for agency ${agencyId}:`, error instanceof Error ? error.message : error)
@@ -309,18 +328,14 @@ export async function emitDeviceEvent(
   data: Record<string, unknown> = {}
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ type, userId, data })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ type, userId, data }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(3000),
     })
+    if (response.ok) recordEmitUsage(body, { userId }, response.status, '/realtime/emit')
     return response.ok
   } catch (error) {
     console.warn(`[Realtime] Failed to emit ${type} for user ${userId}:`, error instanceof Error ? error.message : error)
@@ -338,18 +353,14 @@ export async function emitAgencyDeviceEvent(
   data: Record<string, unknown> = {}
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ type, agencyId, data })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ type, agencyId, data }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(3000),
     })
+    if (response.ok) recordEmitUsage(body, { agencyId }, response.status, '/realtime/emit')
     return response.ok
   } catch (error) {
     console.warn(`[Realtime] Failed to emit ${type} for agency ${agencyId}:`, error instanceof Error ? error.message : error)
@@ -366,18 +377,14 @@ export async function emitAdminEvent(
   data: Record<string, unknown> = {}
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ type, data })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ type, data }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(3000),
     })
+    if (response.ok) recordEmitUsage(body, {}, response.status, '/realtime/emit')
     return response.ok
   } catch (error) {
     console.warn(`[Realtime] Failed to emit ${type}:`, error instanceof Error ? error.message : error)
@@ -388,23 +395,23 @@ export async function emitAdminEvent(
 /**
  * Emit multiple events at once (batch).
  * Useful when a single action triggers multiple events.
+ *
+ * Data-usage note: a batch is recorded as ONE event (path /realtime/emit-batch)
+ * with the full batch payload length; attribution stays null because a batch
+ * can mix events for several agencies/users.
  */
 export async function emitBatch(
   events: Array<QueueEventPayload | ReservationEventPayload | NotificationEventPayload | KioskEventPayload | AgencyEventPayload | StaffEventPayload | DeviceEventPayload | AdminEventPayload>
 ): Promise<boolean> {
   try {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    }
-    if (INTERNAL_SECRET) {
-      headers['x-internal-secret'] = INTERNAL_SECRET
-    }
+    const body = JSON.stringify({ events })
     const response = await fetch(`${REALTIME_SERVICE_URL}/emit-batch`, {
       method: 'POST',
-      headers,
-      body: JSON.stringify({ events }),
+      headers: emitHeaders(),
+      body,
       signal: AbortSignal.timeout(5000),
     })
+    if (response.ok) recordEmitUsage(body, {}, response.status, '/realtime/emit-batch')
     return response.ok
   } catch (error) {
     console.warn('[Realtime] Failed to emit batch:', error instanceof Error ? error.message : error)

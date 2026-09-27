@@ -69,6 +69,12 @@ export interface AgencyDetail {
   averageRating?: number;
   reviewCount?: number;
   subscriptionStatus?: string;
+  // Task 51-b: canonical agency location (spec §2). Optional — older
+  // payloads / desktop local builds omit them entirely.
+  latitude?: number | null;
+  longitude?: number | null;
+  postalCode?: string | null;
+  locationVerified?: string | null;
 }
 
 export interface ActiveReservation {

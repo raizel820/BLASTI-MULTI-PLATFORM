@@ -258,6 +258,22 @@ model Agency {
   subscriptionStartsAt  DateTime?
   /// Subscription Expiry: When the current subscription period expires. null = no expiry (e.g. ONE_TIME plans). When this date passes, the app blocks until renewed.
   subscriptionExpiresAt DateTime?
+  /// Task 51 — Agency Location & Maps: canonical location fields. Stored
+  /// independently of the map provider (spec §2) — the DB is the source of
+  /// truth and changing providers never invalidates a location. Nullable =
+  /// "not set yet". `locationUpdatedAt` tracks when lat/lng last changed.
+  latitude             Float?
+  longitude            Float?
+  postalCode           String?
+  /// VERIFIED | UNVERIFIED | MANUAL (default UNVERIFIED)
+  locationVerified     String?       @default("UNVERIFIED")
+  /// GOOGLE | OPENFREEMAP | MANUAL | DEVICE_GPS — how the location was picked
+  locationSource       String?
+  locationUpdatedAt    DateTime?
+  /// Optional provider metadata (spec §3) — never required to render a map,
+  /// never required for directions, and never invalidated by provider switch.
+  googlePlaceId        String?
+  providerLocationId   String?
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt
   ownerId               String
@@ -1380,4 +1396,42 @@ model FileAsset {
   @@index([updatedAt])
   @@index([ownerId])
   @@index([agencyId])
+}
+
+// ─── Task 55 — Data-consumption ledger (doc-2 §14 SUPER ADMIN — Data
+// Consumption Analytics) ─────────────────────────────────────────────────────
+// One row per measured cloud-API exchange (request upload + response download
+// bytes). This is the source-of-truth for the super-admin Data Consumption
+// analytics and the sponsored-data cost estimator. Loose attribution: NO
+// foreign keys on purpose — users/agencies/devices can be deleted without
+// cascading metrics rows, and the ledger survives account churn.
+//   • uploadBytes   = client → cloud bytes (request content-length)
+//   • downloadBytes = cloud → client bytes (response body length)
+//   • networkType   = WIFI | MOBILE | UNKNOWN (client-reported via the
+//     `x-blasti-network` header; UNKNOWN = header absent/unrecognized —
+//     counted in TOTAL, never in WIFI or MOBILE buckets)
+//   • trafficType   = API | SYNC | REALTIME | NOTIFICATIONS | FILES | UPDATES
+//     (classified from the request path / emit origin)
+model DataUsageEvent {
+  id            String   @id @default(cuid())
+  uploadBytes   Int      @default(0)
+  downloadBytes Int      @default(0)
+  networkType   String   @default("UNKNOWN")
+  trafficType   String   @default("API")
+  method        String?
+  path          String?
+  status        Int?
+  /// Attributed user (JWT payload decode; null for anonymous traffic)
+  userId        String?
+  /// Attributed agency: JWT agencyId claim (owner/staff) or /api/agencies/:id
+  /// path match. Null = platform-level traffic (directory browsing, auth).
+  agencyId      String?
+  deviceId      String?
+  createdAt     DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([agencyId, createdAt])
+  @@index([userId, createdAt])
+  @@index([trafficType])
+  @@index([networkType])
 }

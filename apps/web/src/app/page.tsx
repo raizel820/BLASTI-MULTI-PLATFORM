@@ -22,6 +22,9 @@ const CustomerProfile = lazy(() => import('@/components/customer/customer-profil
 const CustomerNotifications = lazy(() => import('@/components/customer/customer-notifications').then(m => ({ default: m.CustomerNotifications })));
 const CustomerFavorites = lazy(() => import('@/components/customer/customer-favorites').then(m => ({ default: m.CustomerFavorites })));
 const CustomerSettings = lazy(() => import('@/components/customer/customer-settings').then(m => ({ default: m.CustomerSettings })));
+// Task 54-d: personal "My Analytics" module (doc-2 §38-44) over the frozen
+// 54-a customer endpoints (GET /api/customer/analytics/*).
+const CustomerAnalytics = lazy(() => import('@/components/customer/customer-analytics').then(m => ({ default: m.CustomerAnalytics })));
 
 // Agency Views
 const AgencyDashboard = lazy(() => import('@/components/agency/agency-dashboard').then(m => ({ default: m.AgencyDashboard })));
@@ -127,6 +130,10 @@ const ViewRouter = memo(function ViewRouter() {
               return <CustomerFavorites />;
             case 'customer-settings':
               return <CustomerSettings />;
+            case 'customer-analytics':
+              // Task 54-d: personal analytics — scope is server-locked to the
+              // caller (userId); 403/404 handled inside the module.
+              return <CustomerAnalytics />;
             case 'agency-dashboard':
               return <AgencyDashboard />;
             // Task 37-e: restricted agency sections pass through the authority
@@ -442,6 +449,7 @@ export default function Home() {
       'customer-profile': t('profile') + ' - BLASTI',
       'customer-notifications': t('notifications') + ' - BLASTI',
       'customer-favorites': t('favorites') + ' - BLASTI',
+      'customer-analytics': t('myAnalytics.nav.title') + ' - BLASTI',
       'agency-dashboard': t('dashboard') + ' - BLASTI',
       'agency-settings': t('settings') + ' - BLASTI',
       'agency-profile': t('profile') + ' - BLASTI',
@@ -635,7 +643,10 @@ export default function Home() {
             <Button variant="ghost" size="icon" className="lg:hidden h-10 w-10" onClick={toggleSidebar}>
               <Menu className="h-5 w-5" />
             </Button>
-            <div className="flex items-center gap-2 ms-auto">
+            {/* max-w + overflow-x: on narrow phones the 7 icon controls exceed the
+                viewport and used to force page-wide horizontal overflow (Task 54-b
+                mobile audit). They now shrink into a swipeable strip instead. */}
+            <div className="flex items-center gap-2 ms-auto min-w-0 max-w-[calc(100vw-5.5rem)] overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
               <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <ConnectionDot />
               </span>

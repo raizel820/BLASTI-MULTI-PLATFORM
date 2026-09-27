@@ -12,7 +12,18 @@ import { z } from 'zod'
 import QRCode from 'qrcode'
 import { recordSyncChange, recordSyncChangeNow } from '../lib/sync-helpers'
 import { normalizeRecordFileUrls } from '../lib/file-url'
-import { computeAnalyticsDashboard, DASHBOARD_PERIODS, type DashboardPeriod } from '../lib/analytics-dashboard'
+import { computeAnalyticsDashboard, DASHBOARD_PERIODS, round1, type DashboardPeriod } from '../lib/analytics-dashboard'
+import {
+  aggregateReservations,
+  aggregateRatings,
+  groupReservationStats,
+  resolvePeriodFromQuery,
+  resolvedWindowPayload,
+  rateOf,
+  hoursSpan,
+} from '../lib/analytics-engine'
+// Task 51 — Agency Location & Maps: location pair rule + timestamp stamping
+import { buildAgencyLocationPatch } from '../lib/map-settings'
 
 /** Round 15 — stable base for built file URLs when BLASTI_PUBLIC_BASE_URL is set. */
 const PUBLIC_FILE_URL_BASE = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '')
@@ -1685,6 +1696,759 @@ app.get('/analytics/dashboard', async (c) => {
   }
 })
 
+// ─── Task 54-a — AGENCY OWNER analytics sections (doc-2 spec §15-28) ─────────
+//
+// One endpoint per owner sidebar section (§16). ALL of them:
+//   - resolve the caller's agency FIRST (ownership/staff row via the same
+//     resolver as /analytics/dashboard) and scope EVERY query by agencyId
+//     BEFORE aggregation (spec §4 data-scope rule + §50 multi-tenancy) —
+//     an owner can never widen the window by changing parameters (§49),
+//   - SUPER_ADMIN may pass ?agencyId= to inspect a specific agency (the same
+//     bypass requireAgencyAccess grants elsewhere); owners/staff CANNOT —
+//     a provided agencyId that is not theirs → 403,
+//   - accept the full §3.1 period set through the shared resolver and return
+//     `resolved: { period, granularity, from, to, previousFrom, previousTo }`,
+//   - zero-safe: an empty agency returns zeroed counters, never errors.
+
+/** Common scope resolution for the owner sections. */
+async function resolveOwnerAnalyticsScope(c: Context): Promise<{ ok: true; agencyId: string; user: SessionUser } | { ok: false; status: number; message: string }> {
+  const agencyIdParam = c.req.query('agencyId')
+  const user = await requireAuth(c)
+
+  if (agencyIdParam) {
+    // Explicit agencyId → same ownership gate as /profile (owner, staff of
+    // that agency, or SUPER_ADMIN).
+    const ownership = await verifyAgencyOwnership(user.id, agencyIdParam)
+    const isAdmin = user.role === 'SUPER_ADMIN'
+    if (!isAdmin && !ownership) {
+      return { ok: false, status: 403, message: 'You do not have access to this agency' }
+    }
+    const exists = await db.agency.findFirst({ where: { id: agencyIdParam }, select: { id: true } })
+    if (!exists) return { ok: false, status: 404, message: 'Agency not found' }
+    return { ok: true, agencyId: agencyIdParam, user }
+  }
+
+  const agencyId = await resolveUserAgencyId(user)
+  if (!agencyId) {
+    return { ok: false, status: 403, message: 'No agency associated with this account' }
+  }
+  return { ok: true, agencyId, user }
+}
+
+/**
+ * §37 RESTRICTED ANALYTICS: financial + working-hours sections are owner/level
+ * management data — an AGENCY_STAFF caller gets 403 even though they belong to
+ * the agency (server-side enforcement; hiding the nav item is NOT sufficient).
+ */
+async function resolveOwnerOnlyScope(c: Context): Promise<{ ok: true; agencyId: string; user: SessionUser } | { ok: false; status: number; message: string }> {
+  const scope = await resolveOwnerAnalyticsScope(c)
+  if (!scope.ok) return scope
+  if (scope.user.role === 'SUPER_ADMIN') return scope
+  const ownership = await verifyAgencyOwnership(scope.user.id, scope.agencyId)
+  if (ownership?.isOwner) return scope
+  return { ok: false, status: 403, message: 'FORBIDDEN' }
+}
+
+/** Owner-side reservation rows: agency-scoped + optional §3.2 org filters. */
+async function fetchOwnerReservationRows(c: Context, agencyId: string, rangeStart: Date, rangeEnd: Date) {
+  const where: Record<string, unknown> = { agencyId, joinedAt: { gte: rangeStart, lte: rangeEnd } }
+  const serviceId = c.req.query('serviceId')
+  if (serviceId) where.serviceId = serviceId
+  const counterId = c.req.query('counterId')
+  if (counterId) where.counterId = counterId
+  const branchId = c.req.query('branchId')
+  const staffId = c.req.query('staffId')
+  if (branchId || staffId) {
+    const counterFilter: Record<string, unknown> = {}
+    if (branchId) counterFilter.branchId = branchId
+    if (staffId) counterFilter.staffId = staffId
+    where.counter = counterFilter
+  }
+  const status = c.req.query('status')
+  if (status) where.status = status
+  const channel = c.req.query('channel')
+  if (channel === 'walkIn') where.isWalkIn = true
+  if (channel === 'online') where.isWalkIn = false
+
+  return db.reservation.findMany({
+    where,
+    select: {
+      status: true,
+      joinedAt: true,
+      calledAt: true,
+      completedAt: true,
+      cancelledAt: true,
+      rating: true,
+      isWalkIn: true,
+      userId: true,
+      serviceId: true,
+      counterId: true,
+      agencyId: true,
+    },
+  })
+}
+
+// GET /agency/analytics/overview — §17 Owner Overview.
+app.get('/analytics/overview', async (c) => {
+  try {
+    const scope = await resolveOwnerAnalyticsScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const [rows, agency, branchRows, staffRows, deviceRows, todayStart] = await Promise.all([
+      fetchOwnerReservationRows(c, agencyId, pq.range.start, pq.range.end),
+      db.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, category: true, isQueueOpen: true, workingHoursStart: true, workingHoursEnd: true } }),
+      db.branch.findMany({ where: { agencyId }, select: { id: true, name: true, isActive: true } }),
+      db.agencyStaff.findMany({ where: { agencyId, isActive: true }, select: { id: true } }),
+      db.agencyDevice.findMany({ where: { agencyId }, select: { id: true, status: true, lastHeartbeatAt: true } }),
+      Promise.resolve(new Date(new Date().setUTCHours(0, 0, 0, 0))),
+    ])
+
+    const agg = aggregateReservations(rows, pq.range)
+    const servedToday = rows.filter((r) => r.status === 'COMPLETED' && r.completedAt !== null && r.completedAt >= todayStart).length
+    const onlineDevices = deviceRows.filter((d) => d.status === 'ONLINE' || (d.lastHeartbeatAt !== null && d.lastHeartbeatAt >= new Date(Date.now() - 15 * 60 * 1000))).length
+    const ratings = aggregateRatings(rows)
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        agency: agency ? { id: agency.id, name: agency.name, category: agency.category, isQueueOpen: agency.isQueueOpen } : null,
+        kpis: agg.kpis,
+        statusDistribution: agg.statusDistribution,
+        ratings: { average: ratings.average, count: ratings.count, distribution: ratings.distribution },
+        resources: {
+          branchesTotal: branchRows.length,
+          branchesActive: branchRows.filter((b) => b.isActive).length,
+          staffActive: staffRows.length,
+          countersTotal: await db.counter.count({ where: { branch: { agencyId } } }),
+          devicesTotal: deviceRows.length,
+          devicesOnline: onlineDevices,
+        },
+        today: { servedToday },
+        timeseries: agg.timeseries,
+        peak: agg.peak,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /agency/analytics/reservations — §18 Owner Reservation Analytics.
+app.get('/analytics/reservations', async (c) => {
+  try {
+    const scope = await resolveOwnerAnalyticsScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const [rows, counterRows, serviceRows, branchRows] = await Promise.all([
+      fetchOwnerReservationRows(c, agencyId, pq.range.start, pq.range.end),
+      db.counter.findMany({ where: { branch: { agencyId } }, select: { id: true, name: true, branchId: true, branch: { select: { name: true } } } }),
+      db.service.findMany({ where: { agencyId }, select: { id: true, name: true } }),
+      db.branch.findMany({ where: { agencyId }, select: { id: true, name: true } }),
+    ])
+
+    const agg = aggregateReservations(rows, pq.range)
+    const counterInfo = new Map(counterRows.map((ct) => [ct.id, ct]))
+    const branchName = new Map(branchRows.map((b) => [b.id, b.name]))
+    const serviceName = new Map(serviceRows.map((s) => [s.id, s.name]))
+
+    const byService = groupReservationStats(rows, (r) => r.serviceId)
+      .map((s) => ({ serviceId: s.key, name: serviceName.get(s.key) ?? 'Unknown', ...s }))
+      .sort((a, b) => b.count - a.count)
+    const byBranch = groupReservationStats(rows, (r) => (r.counterId ? counterInfo.get(r.counterId)?.branchId ?? null : null))
+      .map((s) => ({ branchId: s.key, name: branchName.get(s.key) ?? 'Unknown branch', ...s }))
+      .sort((a, b) => b.count - a.count)
+    const byCounter = groupReservationStats(rows, (r) => r.counterId)
+      .map((s) => {
+        const info = counterInfo.get(s.key)
+        return { counterId: s.key, name: info?.name ?? 'Unknown counter', branchName: info ? branchName.get(info.branchId) ?? '—' : '—', ...s }
+      })
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 12)
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        kpis: agg.kpis,
+        statusDistribution: agg.statusDistribution,
+        channel: {
+          onlineCount: agg.kpis.onlineCount,
+          walkInCount: agg.kpis.walkInCount,
+          total: agg.kpis.total,
+          onlineRate: agg.kpis.onlineRate,
+          walkInRate: agg.kpis.walkInRate,
+          daily: agg.timeseries.map((t) => ({ bucket: t.bucket, online: t.online, walkIn: t.walkIn })),
+        },
+        timeseries: agg.timeseries,
+        hourlyTraffic: agg.hourlyTraffic,
+        weekdayTraffic: agg.weekdayTraffic,
+        peak: agg.peak,
+        byService,
+        byBranch,
+        byCounter,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /agency/analytics/queue — §19 Owner Queue Analytics.
+app.get('/analytics/queue', async (c) => {
+  try {
+    const scope = await resolveOwnerAnalyticsScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const [rows, agency, queueSettings, waitingRows, counterRows] = await Promise.all([
+      fetchOwnerReservationRows(c, agencyId, pq.range.start, pq.range.end),
+      db.agency.findUnique({ where: { id: agencyId }, select: { isQueueOpen: true } }),
+      db.queueSettings.findFirst({ where: { agencyId }, select: { isPaused: true, pausedAt: true, openedAt: true } }),
+      db.reservation.findMany({ where: { agencyId, status: { in: ['WAITING', 'CALLED', 'SERVING'] } }, select: { id: true, displayNumber: true, status: true, joinedAt: true, calledAt: true }, orderBy: { joinedAt: 'asc' } }),
+      db.counter.findMany({ where: { branch: { agencyId } }, select: { id: true, name: true, isActive: true } }),
+    ])
+
+    const agg = aggregateReservations(rows, pq.range)
+    const now = new Date()
+    const liveCounts = { WAITING: 0, CALLED: 0, SERVING: 0 }
+    let currentWaitSumMs = 0
+    for (const r of waitingRows) {
+      if (r.status in liveCounts) liveCounts[r.status as keyof typeof liveCounts]++
+      if (r.status === 'WAITING') currentWaitSumMs += now.getTime() - r.joinedAt.getTime()
+    }
+    const nextTicket = waitingRows.find((r) => r.status === 'WAITING') ?? null
+    const avgCurrentWaitMinutes = liveCounts.WAITING > 0 ? round1(currentWaitSumMs / liveCounts.WAITING / 60000) : null
+
+    const counterStats = groupReservationStats(rows, (r) => r.counterId)
+      .map((s) => {
+        const info = counterRows.find((ct) => ct.id === s.key)
+        return {
+          counterId: s.key,
+          name: info?.name ?? 'Unknown counter',
+          isActive: info?.isActive ?? false,
+          served: s.completed,
+          utilizationPct: rateOf(s.completed, agg.kpis.total),
+          avgServiceMinutes: s.avgServiceMinutes,
+        }
+      })
+      .sort((a, b) => b.served - a.served)
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        queueStatus: {
+          isQueueOpen: agency?.isQueueOpen ?? false,
+          isPaused: queueSettings?.isPaused ?? false,
+          pausedAt: queueSettings?.pausedAt?.toISOString() ?? null,
+          openedAt: queueSettings?.openedAt?.toISOString() ?? null,
+        },
+        live: {
+          currentlyWaiting: liveCounts.WAITING,
+          currentlyCalled: liveCounts.CALLED,
+          currentlyServing: liveCounts.SERVING,
+          queueLength: liveCounts.WAITING,
+          nextTicket: nextTicket ? { id: nextTicket.id, displayNumber: nextTicket.displayNumber, joinedAt: nextTicket.joinedAt.toISOString() } : null,
+          avgCurrentWaitMinutes,
+        },
+        period: {
+          avgWaitingTimeMinutes: agg.kpis.avgWaitMinutes,
+          medianWaitingTimeMinutes: agg.kpis.medianWaitMinutes,
+          maxWaitingTimeMinutes: agg.kpis.maxWaitMinutes,
+          avgServiceDurationMinutes: agg.kpis.avgServiceMinutes,
+          callsPerHour: round1(rows.filter((r) => r.calledAt).length / hoursSpan(pq.range.start, pq.range.end)),
+          customersServedPerHour: round1(agg.kpis.completed / hoursSpan(pq.range.start, pq.range.end)),
+          noShowRate: agg.kpis.noShowRate,
+          abandonmentRate: agg.kpis.noShowRate,
+          queueSizeByHour: agg.hourlyTraffic,
+          counterUtilization: counterStats,
+        },
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /agency/analytics/branches — §20 Owner Branch Analytics (own agency only).
+app.get('/analytics/branches', async (c) => {
+  try {
+    const scope = await resolveOwnerAnalyticsScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const [rows, branchRows, counterRows, deviceRows, staffRows] = await Promise.all([
+      fetchOwnerReservationRows(c, agencyId, pq.range.start, pq.range.end),
+      db.branch.findMany({ where: { agencyId }, select: { id: true, name: true, nameAr: true, nameFr: true, isActive: true, isMain: true, createdAt: true } }),
+      db.counter.findMany({ where: { branch: { agencyId } }, select: { id: true, branchId: true, isActive: true, staffId: true } }),
+      db.agencyDevice.findMany({ where: { agencyId }, select: { id: true, branchId: true, status: true, lastHeartbeatAt: true } }),
+      db.agencyStaff.findMany({ where: { agencyId, isActive: true }, select: { id: true, branchId: true } }),
+    ])
+
+    const agg = aggregateReservations(rows, pq.range)
+    const counterBranch = new Map(counterRows.map((ct) => [ct.id, ct.branchId]))
+    const branchStats = groupReservationStats(rows, (r) => (r.counterId ? counterBranch.get(r.counterId) ?? null : null))
+    const statsByBranch = new Map(branchStats.map((s) => [s.key, s]))
+
+    const branches = branchRows.map((b) => {
+      const s = statsByBranch.get(b.id)
+      const branchCounters = counterRows.filter((ct) => ct.branchId === b.id)
+      const branchStaff = staffRows.filter((st) => st.branchId === b.id)
+      const branchDevices = deviceRows.filter((d) => d.branchId === b.id)
+      return {
+        branchId: b.id,
+        name: b.name,
+        nameAr: b.nameAr,
+        nameFr: b.nameFr,
+        isActive: b.isActive,
+        isMain: b.isMain,
+        countersTotal: branchCounters.length,
+        countersActive: branchCounters.filter((ct) => ct.isActive).length,
+        staffActive: branchStaff.length,
+        devicesTotal: branchDevices.length,
+        devicesOnline: branchDevices.filter((d) => d.status === 'ONLINE' || (d.lastHeartbeatAt !== null && d.lastHeartbeatAt >= new Date(Date.now() - 15 * 60 * 1000))).length,
+        reservations: s?.count ?? 0,
+        customersServed: s?.completed ?? 0,
+        completed: s?.completed ?? 0,
+        cancelled: s?.cancelled ?? 0,
+        noShow: s?.noShow ?? 0,
+        completionRate: s?.completionRate ?? 0,
+        avgWaitMinutes: s?.avgWaitMinutes ?? null,
+        avgServiceMinutes: s?.avgServiceMinutes ?? null,
+      }
+    }).sort((a, b) => b.reservations - a.reservations || a.name.localeCompare(b.name))
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: { branches: branchRows.length, reservationsInPeriod: agg.kpis.total },
+        branches,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /agency/analytics/staff — §21 Owner Staff Analytics (own agency only).
+// Staff attribution uses the ONLY historical link the data model offers:
+// Reservation.counterId → Counter.staffId ("occupied by" at serve time).
+app.get('/analytics/staff', async (c) => {
+  try {
+    const scope = await resolveOwnerAnalyticsScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const [rows, staffRows, counterRows] = await Promise.all([
+      fetchOwnerReservationRows(c, agencyId, pq.range.start, pq.range.end),
+      db.agencyStaff.findMany({
+        where: { agencyId },
+        select: { id: true, role: true, isActive: true, joinedAt: true, branchId: true, user: { select: { id: true, fullName: true } } },
+      }),
+      db.counter.findMany({ where: { branch: { agencyId } }, select: { id: true, name: true, branchId: true, staffId: true } }),
+    ])
+
+    const counterToStaff = new Map(counterRows.map((ct) => [ct.id, ct.staffId]))
+    const stats = groupReservationStats(rows, (r) => (r.counterId ? counterToStaff.get(r.counterId) ?? null : null))
+    const statsByStaff = new Map(stats.map((s) => [s.key, s]))
+
+    const staff = staffRows.map((st) => {
+      const s = statsByStaff.get(st.id)
+      const staffCounters = counterRows.filter((ct) => ct.staffId === st.id)
+      return {
+        staffId: st.id,
+        userId: st.user.id,
+        name: st.user.fullName,
+        role: st.role,
+        isActive: st.isActive,
+        branchId: st.branchId,
+        countersAssigned: staffCounters.length,
+        reservationsHandled: s?.count ?? 0,
+        completed: s?.completed ?? 0,
+        cancelled: s?.cancelled ?? 0,
+        noShow: s?.noShow ?? 0,
+        completionRate: s?.completionRate ?? 0,
+        avgServiceMinutes: s?.avgServiceMinutes ?? null,
+        avgWaitMinutes: s?.avgWaitMinutes ?? null,
+      }
+    }).sort((a, b) => b.reservationsHandled - a.reservationsHandled || a.name.localeCompare(b.name))
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: { staff: staffRows.length, active: staffRows.filter((s) => s.isActive).length },
+        staff,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /agency/analytics/customers — §22 Owner Customer Analytics.
+// Scope: ONLY customers who interacted with THIS agency (§22 forbids using
+// analytics to discover unrelated customers). Rows carry id + name only.
+app.get('/analytics/customers', async (c) => {
+  try {
+    const scope = await resolveOwnerAnalyticsScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [rows, firstEverRows, topRows, serviceRows] = await Promise.all([
+      fetchOwnerReservationRows(c, agencyId, start, end),
+      db.reservation.groupBy({ by: ['userId'], where: { agencyId, userId: { not: null } }, _min: { joinedAt: true } }),
+      db.reservation.groupBy({ by: ['userId'], where: { agencyId, joinedAt: { gte: start, lte: end }, userId: { not: null } }, _count: { id: true }, orderBy: { _count: { id: 'desc' } }, take: 10 }),
+      db.service.findMany({ where: { agencyId }, select: { id: true, name: true } }),
+    ])
+    // Second round-trip (needs topRows first) — ONE extra query, still no N+1.
+    const topUsers = topRows.length
+      ? await db.user.findMany({ where: { id: { in: topRows.map((t) => t.userId as string) } }, select: { id: true, fullName: true } })
+      : []
+
+    const onlineRows = rows.filter((r) => r.userId)
+    const uniqueCustomers = new Set(onlineRows.map((r) => r.userId as string)).size
+    // New = first-ever reservation at this agency falls inside the window.
+    const newCustomers = firstEverRows.filter((f) => {
+      const min = f._min.joinedAt
+      return min !== null && min >= start && min <= end
+    }).length
+    const repeatVisits = onlineRows.length - uniqueCustomers
+    const cancelled = aggCancelled(rows)
+    const noShow = aggNoShow(rows)
+
+    const serviceName = new Map(serviceRows.map((s) => [s.id, s.name]))
+    const byService = groupReservationStats(rows, (r) => r.serviceId)
+      .map((s) => ({ serviceId: s.key, name: serviceName.get(s.key) ?? 'Unknown', count: s.count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 8)
+
+    const nameMap = new Map(topUsers.map((u) => [u.id, u.fullName]))
+    const reservationsPerCustomer = uniqueCustomers > 0 ? round1(onlineRows.length / uniqueCustomers) : 0
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: {
+          uniqueCustomers,
+          newCustomers,
+          returningCustomers: firstEverRows.filter((f) => {
+            const min = f._min.joinedAt
+            return min !== null && min < start
+          }).length,
+          repeatVisits,
+          reservationsPerCustomer,
+          cancellationRate: rateOf(cancelled, rows.length),
+          noShowRate: rateOf(noShow, rows.length),
+        },
+        mostRequestedServices: byService,
+        topCustomers: topRows.map((t) => ({ userId: t.userId, name: nameMap.get(t.userId as string) ?? 'Unknown', reservations: t._count.id })),
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+function aggCancelled(rows: Array<{ status: string }>): number {
+  return rows.filter((r) => r.status === 'CANCELLED').length
+}
+function aggNoShow(rows: Array<{ status: string }>): number {
+  return rows.filter((r) => r.status === 'NO_SHOW').length
+}
+
+// GET /agency/analytics/satisfaction — §23 Owner Customer Satisfaction (Review).
+app.get('/analytics/satisfaction', async (c) => {
+  try {
+    const scope = await resolveOwnerAnalyticsScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [reviews, counterRows, branchRows, serviceRows] = await Promise.all([
+      db.review.findMany({
+        where: { agencyId, createdAt: { gte: start, lte: end } },
+        select: { rating: true, replyText: true, createdAt: true, reservation: { select: { serviceId: true, counterId: true } } },
+        orderBy: { createdAt: 'desc' },
+      }),
+      db.counter.findMany({ where: { branch: { agencyId } }, select: { id: true, branchId: true } }),
+      db.branch.findMany({ where: { agencyId }, select: { id: true, name: true } }),
+      db.service.findMany({ where: { agencyId }, select: { id: true, name: true } }),
+    ])
+
+    const agg = aggregateRatings(reviews)
+
+    const counterBranch = new Map(counterRows.map((ct) => [ct.id, ct.branchId]))
+    const branchName = new Map(branchRows.map((b) => [b.id, b.name]))
+    const serviceName = new Map(serviceRows.map((s) => [s.id, s.name]))
+
+    const ratingTrends = new Map<string, { sum: number; count: number }>()
+    for (const r of reviews) {
+      if (r.rating < 1 || r.rating > 5) continue
+      const key = `${r.createdAt.getUTCFullYear()}-${String(r.createdAt.getUTCMonth() + 1).padStart(2, '0')}`
+      const t = ratingTrends.get(key) ?? { sum: 0, count: 0 }
+      t.sum += r.rating
+      t.count++
+      ratingTrends.set(key, t)
+    }
+
+    const byService = new Map<string, { count: number; sum: number }>()
+    const byBranch = new Map<string, { count: number; sum: number }>()
+    for (const r of reviews) {
+      if (r.rating >= 1 && r.rating <= 5) {
+        const serviceId = r.reservation?.serviceId
+        if (serviceId) {
+          const s = byService.get(serviceId) ?? { count: 0, sum: 0 }
+          s.count++
+          s.sum += r.rating
+          byService.set(serviceId, s)
+        }
+        const branchId = r.reservation?.counterId ? counterBranch.get(r.reservation.counterId) : undefined
+        if (branchId) {
+          const b = byBranch.get(branchId) ?? { count: 0, sum: 0 }
+          b.count++
+          b.sum += r.rating
+          byBranch.set(branchId, b)
+        }
+      }
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        summary: {
+          average: agg.average,
+          count: agg.count,
+          distribution: agg.distribution,
+          responseRate: agg.responseRate,
+          responded: agg.withResponse,
+        },
+        byService: Array.from(byService.entries()).map(([serviceId, s]) => ({ serviceId, name: serviceName.get(serviceId) ?? 'Unknown', count: s.count, avgRating: round1(s.sum / s.count) })).sort((a, b) => b.count - a.count),
+        byBranch: Array.from(byBranch.entries()).map(([branchId, s]) => ({ branchId, name: branchName.get(branchId) ?? 'Unknown branch', count: s.count, avgRating: round1(s.sum / s.count) })).sort((a, b) => b.count - a.count),
+        ratingTrend: Array.from(ratingTrends.entries()).sort(([a], [b]) => a.localeCompare(b)).map(([bucket, t]) => ({ bucket, avgRating: round1(t.sum / t.count), count: t.count })),
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /agency/analytics/working-hours — §24 Owner Working Hours (agency-level
+// operational report; NOT available to Agency Staff per §37).
+app.get('/analytics/working-hours', async (c) => {
+  try {
+    const scope = await resolveOwnerOnlyScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const rows = await fetchOwnerReservationRows(c, agencyId, pq.range.start, pq.range.end)
+    const agg = aggregateReservations(rows, pq.range)
+    const agency = await db.agency.findUnique({ where: { id: agencyId }, select: { workingHoursStart: true, workingHoursEnd: true, workingDays: true } })
+
+    // Served-by-hour uses completedAt (when the work actually happened).
+    const servedByHourCounts = new Array<number>(24).fill(0)
+    const waitByHour: Array<{ sum: number; count: number }> = Array.from({ length: 24 }, () => ({ sum: 0, count: 0 }))
+    for (const r of rows) {
+      if (r.completedAt) servedByHourCounts[r.completedAt.getUTCHours()]++
+      if (r.calledAt) {
+        const h = r.joinedAt.getUTCHours()
+        waitByHour[h].sum += r.calledAt.getTime() - r.joinedAt.getTime()
+        waitByHour[h].count++
+      }
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        operatingHours: {
+          start: agency?.workingHoursStart ?? null,
+          end: agency?.workingHoursEnd ?? null,
+          workingDays: agency?.workingDays ?? null,
+        },
+        reservationsByHour: agg.hourlyTraffic,
+        servedByHour: servedByHourCounts.map((count, hour) => ({ hour, count })),
+        avgWaitByHour: waitByHour.map((w, hour) => ({ hour, avgWaitMinutes: w.count > 0 ? round1(w.sum / w.count / 60000) : null })),
+        weekdayTraffic: agg.weekdayTraffic,
+        peak: agg.peak,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /agency/analytics/payments — §26 Owner Payments (OWN agency only; §15
+// forbids cross-agency financial visibility, §37 forbids staff financial
+// analytics entirely).
+app.get('/analytics/payments', async (c) => {
+  try {
+    const scope = await resolveOwnerOnlyScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [rows, agency] = await Promise.all([
+      db.transaction.findMany({
+        where: { agencyId, createdAt: { gte: start, lte: end } },
+        select: { amount: true, amountPaid: true, priceSnapshot: true, currencySnapshot: true, status: true, paymentMethod: true, createdAt: true },
+      }),
+      db.agency.findUnique({ where: { id: agencyId }, select: { subscriptionTier: true, subscriptionStatus: true, subscriptionPlanId: true, subscriptionExpiresAt: true, subscriptionStartsAt: true } }),
+    ])
+
+    const paidOf = (r: { amount: number; amountPaid: number | null; priceSnapshot: number | null }) => r.amountPaid ?? r.priceSnapshot ?? r.amount
+    const byStatus: Record<string, { count: number; value: number }> = {}
+    const byMethod: Record<string, number> = {}
+    const bucketValues = new Map<string, number>()
+    for (const key of pq.range.bucketKeys) bucketValues.set(key, 0)
+    let totalPaid = 0
+    let currency: string | null = null
+
+    for (const r of rows) {
+      const value = paidOf(r)
+      if (!currency && r.currencySnapshot) currency = r.currencySnapshot
+      const s = (byStatus[r.status] ??= { count: 0, value: 0 })
+      s.count++
+      byMethod[r.paymentMethod] = (byMethod[r.paymentMethod] ?? 0) + 1
+      if (r.status === 'APPROVED') {
+        s.value += value
+        totalPaid += value
+        const bucketKey = pq.range.granularity === 'monthly'
+          ? `${r.createdAt.getUTCFullYear()}-${String(r.createdAt.getUTCMonth() + 1).padStart(2, '0')}`
+          : `${r.createdAt.getUTCFullYear()}-${String(r.createdAt.getUTCMonth() + 1).padStart(2, '0')}-${String(r.createdAt.getUTCDate()).padStart(2, '0')}`
+        if (bucketValues.has(bucketKey)) bucketValues.set(bucketKey, (bucketValues.get(bucketKey) ?? 0) + value)
+      }
+    }
+
+    const plan = agency?.subscriptionPlanId
+      ? await db.subscriptionPlan.findUnique({ where: { id: agency.subscriptionPlanId }, select: { name: true, displayName: true, price: true, billingCycle: true } })
+      : null
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        subscription: agency
+          ? {
+              tier: agency.subscriptionTier,
+              status: agency.subscriptionStatus,
+              startsAt: agency.subscriptionStartsAt?.toISOString() ?? null,
+              expiresAt: agency.subscriptionExpiresAt?.toISOString() ?? null,
+              plan,
+            }
+          : null,
+        totals: {
+          transactionsInPeriod: rows.length,
+          paid: byStatus.APPROVED?.count ?? 0,
+          pending: byStatus.PENDING?.count ?? 0,
+          rejected: byStatus.REJECTED?.count ?? 0,
+          totalPaid,
+          currency: currency ?? 'DZD',
+        },
+        byStatus,
+        byPaymentMethod: byMethod,
+        paymentTimeseries: Array.from(bucketValues.entries()).map(([bucket, value]) => ({ bucket, value })),
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /agency/analytics/devices — §27 Owner Hardware & Devices (own agency).
+app.get('/analytics/devices', async (c) => {
+  try {
+    const scope = await resolveOwnerAnalyticsScope(c)
+    if (!scope.ok) return c.json({ success: false, error: scope.message }, scope.status as any)
+    const agencyId = scope.agencyId
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [deviceRows, hardwareOrders] = await Promise.all([
+      db.agencyDevice.findMany({ where: { agencyId }, select: { id: true, name: true, type: true, status: true, connectionType: true, branchId: true, lastHeartbeatAt: true, totalUptimeSec: true, offlineCapable: true, updatedAt: true } }),
+      db.hardwareOrder.findMany({ where: { agencyId, createdAt: { gte: start, lte: end } }, select: { id: true, status: true } }),
+    ])
+
+    const byStatus: Record<string, number> = {}
+    const byType: Record<string, number> = {}
+    const byConnection: Record<string, number> = {}
+    let totalUptimeSec = 0
+    const heartbeatCutoff = new Date(Date.now() - 15 * 60 * 1000)
+    let online = 0
+    let offline = 0
+    for (const d of deviceRows) {
+      byStatus[d.status] = (byStatus[d.status] ?? 0) + 1
+      byType[d.type] = (byType[d.type] ?? 0) + 1
+      byConnection[d.connectionType] = (byConnection[d.connectionType] ?? 0) + 1
+      totalUptimeSec += d.totalUptimeSec
+      if (d.status === 'ONLINE' || (d.lastHeartbeatAt !== null && d.lastHeartbeatAt >= heartbeatCutoff)) online++
+      else offline++
+    }
+
+    const hardwareByStatus: Record<string, number> = {}
+    for (const o of hardwareOrders) hardwareByStatus[o.status] = (hardwareByStatus[o.status] ?? 0) + 1
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: { devices: deviceRows.length, online, offline, totalUptimeSec },
+        byStatus,
+        byType,
+        byConnection,
+        devices: deviceRows.map((d) => ({
+          id: d.id,
+          name: d.name,
+          type: d.type,
+          status: d.status,
+          branchId: d.branchId,
+          lastHeartbeatAt: d.lastHeartbeatAt?.toISOString() ?? null,
+          offlineCapable: d.offlineCapable,
+        })),
+        hardwareOrdersInPeriod: { count: hardwareOrders.length, byStatus: hardwareByStatus },
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 // ─── agency/profile ───────────────────────────────────────────────────────────
 
 app.get('/profile', async (c) => {
@@ -1730,6 +2494,14 @@ app.get('/profile', async (c) => {
       workingHoursStart: agency.workingHoursStart,
       workingHoursEnd: agency.workingHoursEnd,
       workingDays: agency.workingDays,
+      // Task 51 — canonical location fields (spec §2). locationUpdatedAt is
+      // server-managed freshness metadata; null = "not set yet".
+      latitude: agency.latitude,
+      longitude: agency.longitude,
+      postalCode: agency.postalCode,
+      locationVerified: agency.locationVerified,
+      locationSource: agency.locationSource,
+      locationUpdatedAt: agency.locationUpdatedAt,
       // Task 37: the profile page must show the REAL queue state instead of a
       // hardcoded "Queue Active" badge. isQueueOpen lives on the Agency row;
       // queuePaused mirrors QueueSettings.isPaused (the include above already
@@ -1809,6 +2581,14 @@ async function handleAgencyProfileUpdate(c: Context) {
       delete locationData.city
     }
 
+    // Task 51 — Agency Location & Maps: canonical location fields (lat/lng
+    // PAIR rule + locationUpdatedAt=now stamping live in the helper; range
+    // checks already ran in updateAgencyProfileSchema).
+    const locationPatch = buildAgencyLocationPatch(locationData)
+    if (locationPatch.error) {
+      return c.json({ success: false, error: locationPatch.error }, 400)
+    }
+
     await db.agency.update({
       where: { id: targetAgency.id },
       data: {
@@ -1831,6 +2611,8 @@ async function handleAgencyProfileUpdate(c: Context) {
         // Task 5 — Algeria address (wilaya two-digit code + commune Latin name)
         ...(('wilaya' in normalizedData) && { wilaya: (normalizedData as Record<string, unknown>).wilaya as string | undefined }),
         ...(('city' in normalizedData) && { city: (normalizedData as Record<string, unknown>).city as string | undefined }),
+        // Task 51 — canonical location (lat/lng pair + stamp + metadata)
+        ...locationPatch.data,
       },
     })
 

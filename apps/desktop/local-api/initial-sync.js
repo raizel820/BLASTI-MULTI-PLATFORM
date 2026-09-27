@@ -463,6 +463,25 @@ async function _upsertRecord(tx, modelName, rawRecord) {
       console.warn(`[InitialSync] Upsert failed (recoverable) for ${modelName}/${rawRecord.id}: ${e.message.substring(0, 160)}`)
       return false
     }
+    // Task 48 layer 1: stale-unique row rescue — the cloud re-seeded, this
+    // row's email/username/code already exists locally under an OLD id.
+    if (_isUniqueConstraintError(e)) {
+      const rescued = await _resolveStaleUniqueRow(tx, modelName, e, rawRecord).catch(() => false)
+      if (rescued) {
+        try {
+          await tx[modelName].upsert({
+            where: upsertData.where,
+            update: upsertData.update,
+            create: upsertData.create,
+          })
+          console.warn(`[InitialSync] Unique-conflict resolved for ${modelName}/${rawRecord.id} — stale-generation row replaced`)
+          return true
+        } catch (retryErr) {
+          console.error(`[InitialSync] FATAL upsert retry error for ${modelName}/${rawRecord.id}: ${retryErr.message.substring(0, 240)}`)
+          throw retryErr
+        }
+      }
+    }
     console.error(`[InitialSync] FATAL upsert error for ${modelName}/${rawRecord.id}: ${e.message.substring(0, 240)}`)
     throw e
   }
@@ -472,6 +491,84 @@ async function _upsertRecord(tx, modelName, rawRecord) {
 function _isTransientDbError(err) {
   const msg = String((err && err.message) || err || '')
   return /SQLITE_BUSY|database is locked|SQLITE_LOCKED/i.test(msg)
+}
+
+// ─── Task 48: stale-generation defenses (layer 1 of 3) ────────────────────
+// A cloud re-seed keeps emails/usernames but mints NEW cuids. Upsert-by-id
+// then collides on the OTHER unique columns (P2002). These helpers rescue
+// individual rows by probing the conflicting unique fields and deleting the
+// stale-generation row (different id) before retrying once.
+
+/** True for Prisma P2002 or raw SQLite UNIQUE constraint failures. */
+function _isUniqueConstraintError(err) {
+  if (!err) return false
+  if (err.code === 'P2002') return true
+  return /UNIQUE constraint failed|unique constraint/i.test(String(err.message || ''))
+}
+
+/**
+ * Extract the conflicting unique field names from a unique-constraint error.
+ * Handles Prisma P2002 (meta.target entries like "User.email_key" or "email")
+ * and raw SQLite messages ("UNIQUE constraint failed: User.email, User.username").
+ */
+function _extractConflictFields(err) {
+  const fields = []
+  const target = err && err.meta && err.meta.target
+  if (Array.isArray(target)) {
+    for (const t of target) {
+      const f = String(t).replace(/_key$/, '').split('.').pop()
+      if (f && !fields.includes(f)) fields.push(f)
+    }
+  }
+  if (!fields.length) {
+    const m = /UNIQUE constraint failed: (.+)$/i.exec(String((err && err.message) || ''))
+    if (m) {
+      for (const part of m[1].split(',')) {
+        const seg = part.trim().split('.')
+        const f = seg[seg.length - 1]
+        if (f && f !== 'id' && !fields.includes(f)) fields.push(f)
+      }
+    }
+  }
+  return fields
+}
+
+/**
+ * Identity-like unique fields the row-level rescue may probe. Probing is
+ * limited to these to avoid deleting legitimate rows on arbitrary unique
+ * indexes (e.g. numeric counters).
+ */
+const _RESOLVABLE_UNIQUE_FIELDS = ['email', 'username', 'customCode', 'code', 'phoneNumber']
+
+/**
+ * Task 48 layer 1: try to rescue a unique-constraint failure by deleting the
+ * STALE row (same identity values, different id) so the cloud's new row can
+ * be written. Returns true when a stale row was removed (caller retries).
+ */
+async function _resolveStaleUniqueRow(tx, modelName, error, incoming) {
+  if (!tx || !modelName || !incoming) return false
+  const fields = _extractConflictFields(error)
+  if (!fields.length) return false
+  let record
+  try {
+    record = _transformRecord(incoming, modelName)
+  } catch {
+    return false
+  }
+  for (const field of fields) {
+    if (!_RESOLVABLE_UNIQUE_FIELDS.includes(field)) continue
+    const value = record[field]
+    if (value === undefined || value === null || value === '') continue
+    try {
+      const model = tx[modelName]
+      if (!model || typeof model.findFirst !== 'function') continue
+      const stale = await model.findFirst({ where: { [field]: value } })
+      if (!stale || stale.id === record.id) continue
+      await model.delete({ where: { id: stale.id } })
+      return true
+    } catch { /* probe/delete failures fall through to the next field */ }
+  }
+  return false
 }
 
 /**
@@ -893,6 +990,133 @@ async function _validateIntegrity(db, agencyId) {
  * Returns { needsInitialSync, agencyId, status, currentStage, stages }
  * Uses AgencyLocalState table instead of _sync_meta.
  */
+// ─── Task 48: stale cloud-generation pre-flight (layers 2 of 3) ───────────
+// When the cloud database is re-seeded, previously-synced local rows keep the
+// OLD ids while emails/usernames persist. Importing the new generation then
+// collides on every unique column. The pre-flight detects that exact shape
+// (same email/username, different id) and rebuilds the local mirror BEFORE
+// the import starts — instead of dying mid-stage on the first P2002.
+
+/**
+ * Child-first wipe order. Every table that holds SYNCED business data, the
+ * sync engine's ledgers/cursors, and AgencyLocalState. Local-only device
+ * infrastructure (AppVersion, printers, TV pairing, uploaded files, system
+ * settings) is deliberately KEPT — it is id-tolerant.
+ */
+const STALE_WIPE_ORDER = [
+  // children (reference User/Agency/others)
+  'SmsLog', 'Notification', 'Favorite', 'Review', 'AuditLog',
+  'Announcement', 'GlobalAnnouncement', 'Reservation', 'Transaction',
+  'SmsPurchase', 'QueueSettings', 'Counter', 'Branch', 'Service',
+  'HardwareOrderItem', 'HardwareOrder', 'HardwareSettings',
+  'HardwareCommitmentTier', 'HardwareProduct', 'EnterpriseContractRequest',
+  'AgencyStaff', 'AgencyCategory', 'PaymentSettings', 'FAQ', 'PlanFeature',
+  // parents
+  'LocalDeviceCredential', 'User', 'Agency', 'SubscriptionPlan',
+  // sync engine ledgers + cursors (engine pulls from 0 afterwards)
+  'SyncChange', 'SyncMutation', 'DeletedRecord',
+  '_pending_mutations', '_sync_applied_mutations', '_deferred_changes',
+  '_sync_conflicts', '_sync_meta',
+  // local state (re-created NOT_INITIALIZED by Step 0 right after)
+  'AgencyLocalState',
+]
+
+/**
+ * Detect a stale local generation: a local User row whose email/username
+ * matches the session identity but whose id differs from the cloud's.
+ */
+async function _detectStaleGeneration(db, identity) {
+  if (!db || !identity) return { stale: false }
+  const { userId, email, username } = identity
+  if (!userId || (!email && !username)) return { stale: false }
+  try {
+    if (email) {
+      const row = await db.user.findFirst({ where: { email } })
+      if (row && row.id !== userId) {
+        return { stale: true, reason: `User email=${email} exists locally as ${row.id} but cloud id is ${userId}` }
+      }
+    }
+  } catch { /* table may not exist on a brand-new DB */ }
+  try {
+    if (username) {
+      const row = await db.user.findFirst({ where: { username } })
+      if (row && row.id !== userId && (!email || row.email !== email)) {
+        return { stale: true, reason: `User username=${username} exists locally as ${row.id} but cloud id is ${userId}` }
+      }
+    }
+  } catch { /* ignore */ }
+  return { stale: false }
+}
+
+/**
+ * Delete every row of every synced table. Multi-pass (FK-safe ordering gets
+ * most of it); if a pass leaves rows behind (FK cycles like
+ * Agency ↔ SubscriptionPlan), the blocking tables' FK columns are nulled to
+ * break the cycle and deletion is retried. Best-effort by design — every
+ * per-table failure is logged and skipped.
+ */
+async function _wipeAllSyncedData(db) {
+  let remaining = []
+  for (let pass = 0; pass < 3; pass++) {
+    remaining = []
+    for (const table of STALE_WIPE_ORDER) {
+      try {
+        await db.$executeRawUnsafe(`DELETE FROM "${table}"`)
+      } catch (e) {
+        remaining.push(table)
+        if (pass === 2) {
+          console.warn(`[InitialSync] Stale wipe: could not clear ${table}: ${String((e && e.message) || e).substring(0, 140)}`)
+        }
+      }
+    }
+    if (!remaining.length) return
+    if (pass === 0) {
+      // Break FK cycles by nulling FK columns on the two parent tables.
+      for (const table of ['Agency', 'User']) {
+        try {
+          const fks = await db.$queryRawUnsafe(`PRAGMA foreign_key_list("${table}")`)
+          for (const fk of (fks || [])) {
+            const col = fk && (fk.from || fk['from'])
+            if (!col) continue
+            try {
+              await db.$executeRawUnsafe(`UPDATE "${table}" SET "${col}" = NULL`)
+            } catch { /* NOT NULL column — leave it */ }
+          }
+        } catch { /* table missing on old DBs */ }
+      }
+    }
+  }
+}
+
+/**
+ * Guarded wipe entry point. Skipped while a staged import is resuming
+ * (INITIALIZING) — a mid-import wipe would corrupt the resume state.
+ */
+async function _wipeIfStaleGeneration(db, identity, emit) {
+  if (!db || !identity || !(identity.email || identity.username)) {
+    return { wiped: false, skipped: true }
+  }
+  try {
+    const state = await db.agencyLocalState
+      .findUnique({ where: { agencyId: identity.agencyId }, select: { initializationStatus: true } })
+      .catch(() => null)
+    if (state && state.initializationStatus === 'INITIALIZING') {
+      console.log('[InitialSync] Stale-generation check skipped — a staged import is already in progress (resume-safe)')
+      return { wiped: false, skipped: true }
+    }
+    const verdict = await _detectStaleGeneration(db, identity)
+    if (!verdict.stale) return { wiped: false }
+    console.warn('[InitialSync] Stale cloud generation detected — wiping local mirror before import:', verdict.reason)
+    emit && emit({ type: 'SYNC_STAGE_STARTED', stage: 'stale-wipe', stageLabel: 'Rebuilding stale local mirror', count: 0 })
+    await _wipeAllSyncedData(db)
+    emit && emit({ type: 'SYNC_STAGE_COMPLETED', stage: 'stale-wipe', stageLabel: 'Rebuilding stale local mirror', count: 1 })
+    return { wiped: true, reason: verdict.reason }
+  } catch (e) {
+    console.warn('[InitialSync] Stale-generation pre-flight failed (continuing):', (e && e.message) || e)
+    return { wiped: false, error: (e && e.message) || String(e) }
+  }
+}
+
 async function checkInitialSyncStatus(db, agencyId) {
   if (!db) {
     return { needsInitialSync: true, agencyId, status: 'NOT_INITIALIZED', currentStage: null, stages: [] }
@@ -972,6 +1196,15 @@ async function runInitialSync(options) {
     throw new Error('Missing required options: agencyId, cloudAuthToken, cloudUrl, db')
   }
 
+  // Task 48: session identity for the stale-generation pre-flight (Step 0b).
+  // Optional — without it the pre-flight is a no-op and layer-1 row rescue
+  // still applies during import.
+  const identityFields = {
+    sessionUserId: options.sessionUserId || null,
+    sessionUserEmail: options.sessionUserEmail || null,
+    sessionUsername: options.sessionUsername || null,
+  }
+
   // Concurrency guard (spec §29): ONE authoritative initial-sync job per
   // agency/session. If the SAME agency is already importing, coalesce —
   // the new caller receives the in-flight run's promise instead of racing
@@ -1003,11 +1236,13 @@ async function runInitialSync(options) {
     emitFn: emitFn || (() => {}),
     abortController: signal ? null : new AbortController(),
     startedAt: new Date().toISOString(),
+    ...identityFields,
     // Self-reference used by the coalescing path above.
     promise: null,
   }
   _activeSync.promise = _runInitialSyncInner({
     agencyId, cloudAuthToken, cloudUrl, db, emitFn, signal,
+    ...identityFields,
   }, _activeSync, syncId, startTime)
 
   try {
@@ -1088,6 +1323,20 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
 
   // Ensure _sync_meta table exists (for incremental sync bridge)
   await _ensureMetaTable(db)
+
+  // ── Step 0b (Task 48): stale cloud-generation pre-flight ─────────────
+  // A cloud re-seed keeps emails/usernames but mints NEW row ids. A local
+  // mirror of the previous generation would then collide on every unique
+  // column during import (P2002 on email — the reported login crash).
+  // Detect that BEFORE importing and rebuild the local mirror. Skipped
+  // while a staged import is resuming, so resume stays safe.
+  const identity = {
+    agencyId,
+    userId: options.sessionUserId || activeSync.sessionUserId || null,
+    email: options.sessionUserEmail || activeSync.sessionUserEmail || null,
+    username: options.sessionUsername || activeSync.sessionUsername || null,
+  }
+  await _wipeIfStaleGeneration(db, identity, emit)
 
   // ── Step 0: Read or create AgencyLocalState ──────────────────────────────
   let localState = await _getOrCreateLocalState(db, agencyId)
@@ -1844,6 +2093,14 @@ module.exports = {
   // whose staged import delivered 0 branches/services while the cloud's
   // canonical list endpoints still return rows.
   reconcileEmptyBusinessStages: _reconcileEmptyBusinessStages,
+  // Task 48: stale-generation defenses (exported for tests + diagnostics).
+  detectStaleGeneration: _detectStaleGeneration,
+  wipeAllSyncedData: _wipeAllSyncedData,
+  wipeIfStaleGeneration: _wipeIfStaleGeneration,
+  resolveStaleUniqueRow: _resolveStaleUniqueRow,
+  isUniqueConstraintError: _isUniqueConstraintError,
+  extractConflictFields: _extractConflictFields,
+  STALE_WIPE_ORDER,
   // Task 46: exported for E2E harnesses/diagnostics — the REAL batch import
   // path (transform → sanitize → upsert → FK deferral) without a cloud.
   upsertBatch: _upsertBatch,

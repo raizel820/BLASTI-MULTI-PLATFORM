@@ -27,6 +27,9 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import { useLanguage } from '@/hooks/use-language';
 import { AgencyRatingDisplay } from '@/components/shared/agency-rating-display';
+import { apiFetch } from '@/lib/api-fetch';
+// Task 51-b — read-only agency location map + Get Directions (spec §26/§31).
+import { AgencyLocationMap } from '@/components/shared/map/agency-location-map';
 import type { AgencyDetail } from './types';
 import { getAgencyName, getCategoryLabel, isOpenNow } from './types';
 
@@ -94,6 +97,25 @@ export function AgencyDetailSheet({
             <MapPin className="h-4 w-4" />
             <span>{agency.address}</span>
           </div>
+          {/* Task 51-b — agency location map + Get Directions (spec §26/§31).
+              Renders ONLY when the agency has canonical coordinates and maps
+              are enabled; otherwise the address line above stays the sole
+              reference (the customer is never asked to select the location). */}
+          {(typeof agency.latitude === 'number' && typeof agency.longitude === 'number') && (
+            <div className="mb-4">
+              <AgencyLocationMap
+                agency={{
+                  latitude: agency.latitude,
+                  longitude: agency.longitude,
+                  name: getAgencyName(agency, lang),
+                  address: agency.address,
+                  city: null,
+                }}
+                showDirections
+                height={200}
+              />
+            </div>
+          )}
           <div className="flex items-center gap-2 mb-4 flex-wrap">
             <Badge variant="outline" className="text-xs">
               <CatIcon className="h-3 w-3 me-1" />

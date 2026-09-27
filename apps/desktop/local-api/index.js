@@ -72,6 +72,61 @@ let outboxV3Ensured = false
 let localOrigin = `http://${BIND_ADDRESS}:${DEFAULT_PORT}`
 let fileSync = null
 
+// ─── Task 51: Map configuration cache (GET /api/config/maps) ────────────────
+// Desktop parity of the cloud's public map config (spec §39 Electron: "use the
+// same provider abstraction"; §40: offline behavior). The route tries the
+// cloud FIRST (freshest Super-Admin configuration), and falls back to the last
+// cached config while offline.
+//
+// SECRETS (spec §45/§46) — the Google Maps JS key (jsApiKey) is
+// referrer-restricted by design and the cloud serves it to browsers, but the
+// desktop must NEVER persist API keys in the local SQLite database:
+//   - `mapsConfigMemoryCache` (module variable) holds the FULL cloud response,
+//     jsApiKey included, for the lifetime of this process only (memory).
+//   - the `_sync_meta` persisted copy (`maps_config_cache`) carries
+//     jsApiKey: null — see stripMapsSecretsForPersist() below.
+// Server-side Google keys (maps.google.apiKey / maps.geocoding.apiKey) never
+// appear in this config at any layer — the cloud itself withholds them.
+let mapsConfigMemoryCache = null // { config, fetchedAt (epoch ms) }
+const MAPS_CONFIG_MEMORY_TTL_MS = 30 * 1000 // serve from memory without re-probing the cloud
+const MAPS_CONFIG_META_KEY = 'maps_config_cache'
+const MAPS_CLOUD_PROBE_TIMEOUT_MS = 5000
+
+/**
+ * Task 51 — the built-in default map configuration (offline fallback tier 3).
+ * Mirrors the cloud's MAPS_DEFAULTS + buildMapsConfig() output (apps/api/src/
+ * lib/map-settings.ts) and the verified 51-a contract envelope byte-for-byte:
+ * OpenFreeMap-first so the map works with zero configuration.
+ */
+const DEFAULT_MAPS_CONFIG = {
+  provider: 'OPENFREEMAP',
+  fallbackProvider: 'NONE',
+  mapsEnabled: true,
+  directionsEnabled: true,
+  openfreemap: { styleUrl: 'https://tiles.openfreemap.org/styles/liberty' },
+  google: { configured: false, geocodingEnabled: true, jsApiKey: null },
+  geocoding: { provider: 'OSM' },
+  directions: {
+    destinationMode: 'COORDINATES',
+    origin: 'CURRENT_LOCATION',
+    openBehavior: 'AUTO',
+    buttonLabel: null,
+  },
+}
+
+/**
+ * Task 51 (spec §45/§46) — copy of a maps config that is SAFE TO PERSIST.
+ * Strips the Google Maps JS key (jsApiKey → null) so no API key is ever
+ * written to the local database; the live value passes through memory only.
+ */
+function stripMapsSecretsForPersist(config) {
+  if (!config || typeof config !== 'object') return config
+  let copy
+  try { copy = JSON.parse(JSON.stringify(config)) } catch { return null }
+  if (copy.google && typeof copy.google === 'object') copy.google.jsApiKey = null
+  return copy
+}
+
 // ─── Local Device Identity & Unlock Credentials (Task 14) ───────────────
 // Desktop authentication model:
 //
@@ -722,12 +777,129 @@ async function upsertLocalUserFromCloud(cloudUser, overrides) {
     : (typeof cloudUser.commune === 'string' && cloudUser.commune.trim() ? cloudUser.commune.trim() : null)
   if (wilaya) profile.wilaya = wilaya
   if (commune) profile.commune = commune
-  await db.user.upsert({
-    where: { id: cloudUser.id },
-    update: profile,
-    create: Object.assign({ id: cloudUser.id }, profile),
-  })
+  // Task 48 (layer 3): login-path stale-generation rescue. The cloud may
+  // have re-seeded — same email/username, NEW user id — while the local User
+  // table still holds the previous generation's row. Upsert-by-id then dies
+  // with P2002 on the unique columns. Probe the identity columns, delete the
+  // stale row (different id), and retry the upsert exactly once.
+  try {
+    await db.user.upsert({
+      where: { id: cloudUser.id },
+      update: profile,
+      create: Object.assign({ id: cloudUser.id }, profile),
+    })
+  } catch (e) {
+    const isUnique = (e && e.code === 'P2002') || /UNIQUE constraint failed/i.test(String((e && e.message) || ''))
+    if (!isUnique) throw e
+    let rescued = false
+    for (const field of ['email', 'username']) {
+      const value = profile[field]
+      if (!value) continue
+      const stale = await db.user.findFirst({ where: { [field]: value } }).catch(() => null)
+      if (stale && stale.id !== cloudUser.id) {
+        await db.user.delete({ where: { id: stale.id } }).catch(() => null)
+        rescued = true
+      }
+    }
+    if (!rescued) throw e
+    await db.user.upsert({
+      where: { id: cloudUser.id },
+      update: profile,
+      create: Object.assign({ id: cloudUser.id }, profile),
+    })
+    console.warn('[LocalAPI] Unique-conflict resolved for user ' + cloudUser.id + ' — stale-generation row replaced')
+  }
   return Object.assign({ id: cloudUser.id }, profile)
+}
+
+// ─── Task 51: Agency location payload builder (spec §2/§3) ──────────────────
+// Mirrors the CLOUD contract exactly — apps/api/src/lib/validations.ts range/
+// enum checks + buildAgencyLocationPatch (apps/api/src/lib/map-settings.ts)
+// pair semantics — so an offline save written locally replays to the cloud
+// with the SAME acceptance rules (a locally-accepted payload the cloud would
+// 400 would otherwise loop as permanent_failed in the outbox).
+//
+//   - latitude  −90..90 or null   → else 400 "latitude must be between -90 and 90"
+//   - longitude −180..180 or null → else 400 "longitude must be between -180 and 180"
+//   - both numbers → pair write + locationUpdatedAt = now (SERVER-stamped,
+//     never client-set — the UI strips it from the body)
+//   - both null   → explicit clear ("not set by the user yet" round-trip);
+//     locationUpdatedAt is left untouched, same as the cloud
+//   - half pair   → 400 "latitude and longitude must be provided together ..."
+//   - postalCode: string ≤ 20 chars or null
+//   - locationVerified ∈ VERIFIED | UNVERIFIED | MANUAL
+//   - locationSource  ∈ GOOGLE | OPENFREEMAP | MANUAL | DEVICE_GPS
+//
+// Returns { ok: true, data } where data contains ONLY the location fields
+// present in the body (undefined = unchanged), or { ok: false, error } for the
+// caller to answer 400.
+const AGENCY_LOCATION_VERIFIED_VALUES = ['VERIFIED', 'UNVERIFIED', 'MANUAL']
+const AGENCY_LOCATION_SOURCE_VALUES = ['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']
+
+function buildAgencyLocationUpdate(body) {
+  const data = {}
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { ok: true, data }
+
+  // Coordinate range/type checks (before pair semantics — same order as the
+  // cloud: zod rejects a bad coordinate 400 before buildAgencyLocationPatch).
+  // null is NOT a type error here — it is nullable in the cloud schema and
+  // drives the explicit-clear case in the pair semantics below.
+  for (const field of ['latitude', 'longitude']) {
+    const v = body[field]
+    if (v === undefined || v === null) continue
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      return { ok: false, error: `${field} must be a number` }
+    }
+    const min = field === 'latitude' ? -90 : -180
+    const max = field === 'latitude' ? 90 : 180
+    if (v < min || v > max) {
+      return { ok: false, error: `${field} must be between ${min} and ${max}` }
+    }
+  }
+
+  // Pair semantics (mirrors buildAgencyLocationPatch).
+  const latPresent = body.latitude !== undefined
+  const lngPresent = body.longitude !== undefined
+  if (latPresent || lngPresent) {
+    const lat = latPresent ? body.latitude : undefined
+    const lng = lngPresent ? body.longitude : undefined
+    if (lat === null && lng === null) {
+      data.latitude = null
+      data.longitude = null
+    } else if (typeof lat === 'number' && typeof lng === 'number') {
+      data.latitude = lat
+      data.longitude = lng
+      data.locationUpdatedAt = new Date()
+    } else {
+      return {
+        ok: false,
+        error: 'latitude and longitude must be provided together (both numbers, or both null to clear the location)',
+      }
+    }
+  }
+
+  if (body.postalCode !== undefined) {
+    if (body.postalCode !== null && (typeof body.postalCode !== 'string' || body.postalCode.length > 20)) {
+      return { ok: false, error: 'postalCode must be a string of at most 20 characters' }
+    }
+    data.postalCode = body.postalCode
+  }
+
+  if (body.locationVerified !== undefined) {
+    if (!AGENCY_LOCATION_VERIFIED_VALUES.includes(body.locationVerified)) {
+      return { ok: false, error: 'locationVerified must be one of VERIFIED, UNVERIFIED, MANUAL' }
+    }
+    data.locationVerified = body.locationVerified
+  }
+
+  if (body.locationSource !== undefined) {
+    if (!AGENCY_LOCATION_SOURCE_VALUES.includes(body.locationSource)) {
+      return { ok: false, error: 'locationSource must be one of GOOGLE, OPENFREEMAP, MANUAL, DEVICE_GPS' }
+    }
+    data.locationSource = body.locationSource
+  }
+
+  return { ok: true, data }
 }
 
 /**
@@ -2958,6 +3130,14 @@ function createApp() {
    * with the session token, then kicks a sync round so the new agency (and
    * its services) land in the local DB immediately; GET forwards admin
    * listings. Authorization stays cloud-enforced.
+   *
+   * Task 51: the create/UPDATE payloads carry the map/location fields
+   * (latitude, longitude, postalCode, locationVerified, locationSource —
+   * see spec docs/chatgpt-doc1-map-location-spec.md §2/§27). They ride
+   * through this proxy VERBATIM: the cloud validates the ranges/pair
+   * (400 on violation) and stamps locationUpdatedAt, then the ordinary v2
+   * sync brings the row (all 8 location columns) down to the local DB —
+   * no second mechanism (spec §41).
    */
   const forwardAgencies = async (c) => {
     try {
@@ -3540,6 +3720,105 @@ function createApp() {
   })
 
   // ═══════════════════════════════════════════════════════════════════════
+  // APP CONFIG (Task 51 — Maps & Location, spec §39/§40/§47)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * GET /api/config/maps — desktop parity of the cloud's public map config.
+   *
+   * CONTRACT (identical envelope to the cloud GET /api/config/maps — Task 51,
+   * do not deviate): { success: true, data: { provider, fallbackProvider,
+   * mapsEnabled, directionsEnabled, openfreemap: { styleUrl },
+   * google: { configured, geocodingEnabled, jsApiKey }, geocoding: { provider },
+   * directions: { destinationMode, origin, openBehavior, buttonLabel } } }
+   *
+   * Behavior:
+   *   1. FRESH — probe the cloud ({BLASTI_CLOUD_URL}/api/config/maps with the
+   *      session token) unless the in-memory cache is younger than
+   *      MAPS_CONFIG_MEMORY_TTL_MS (a config read happens on every map-view
+   *      mount; the short TTL keeps the offline-path latency at zero without
+   *      serving stale settings for long).
+   *   2. Cache the successful cloud response: FULL config (jsApiKey included)
+   *      in the module memory cache, and a STRIPPED copy (jsApiKey → null) in
+   *      _sync_meta — see the Task 51 secrets note at the top of this file:
+   *      NO API key is ever persisted to the local SQLite database (spec §45/
+   *      §46); the live jsApiKey passes through memory only.
+   *   3. OFFLINE FALLBACK (spec §40) — cloud unreachable/error: serve the last
+   *      cached config (memory first, then the persisted stripped copy — it
+   *      survives an app restart), else the built-in default (OpenFreeMap
+   *      zero-config). The envelope shape is ALWAYS the same, so the UI map
+   *      widgets degrade gracefully instead of crashing offline.
+   */
+  app.get('/api/config/maps', authMiddleware, async (c) => {
+    try {
+      // 1) Fresh probe — skipped while the memory cache is hot.
+      const cacheHot = mapsConfigMemoryCache &&
+        (Date.now() - mapsConfigMemoryCache.fetchedAt) < MAPS_CONFIG_MEMORY_TTL_MS &&
+        mapsConfigMemoryCache.config
+      if (!cacheHot && sessionToken) {
+        try {
+          const res = await fetch(cloudBaseUrl() + '/api/config/maps', {
+            method: 'GET',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${sessionToken}`,
+            },
+            signal: AbortSignal.timeout(MAPS_CLOUD_PROBE_TIMEOUT_MS),
+          })
+          if (res.ok) {
+            const body = await res.json().catch(() => null)
+            const cfg = body && body.success && body.data && typeof body.data === 'object' ? body.data : null
+            if (cfg) {
+              // Memory cache — full config (jsApiKey included, memory only).
+              mapsConfigMemoryCache = { config: cfg, fetchedAt: Date.now() }
+              // Persisted cache — STRIPPED copy (never store keys in the DB).
+              try {
+                await setLocalMeta(
+                  MAPS_CONFIG_META_KEY,
+                  JSON.stringify({ config: stripMapsSecretsForPersist(cfg), fetchedAt: Date.now() })
+                )
+              } catch (metaErr) {
+                console.warn('[LocalAPI] Maps config cache persist failed (non-fatal):', metaErr?.message || metaErr)
+              }
+            }
+          } else {
+            // Reachable cloud refused (e.g. session revoked server-side) —
+            // fall through to the cached/default config; the workspace-lock
+            // machinery (Task 33-C) owns revocation handling elsewhere.
+            console.warn('[LocalAPI] Maps config proxy: cloud answered HTTP', res.status, '— using cached/default config')
+          }
+        } catch (probeErr) {
+          // Offline or cloud unreachable (spec §40) — fall through.
+          console.warn('[LocalAPI] Maps config proxy: cloud unreachable:', probeErr?.message || probeErr)
+        }
+      }
+
+      // 2) Success path — the probe just refreshed the memory cache.
+      if (mapsConfigMemoryCache && mapsConfigMemoryCache.config) {
+        return c.json({ success: true, data: mapsConfigMemoryCache.config })
+      }
+
+      // 3) Offline fallback (spec §40) — persisted stripped cache first
+      //    (survives an app restart), then the built-in default.
+      try {
+        const raw = await getLocalMeta(MAPS_CONFIG_META_KEY)
+        if (raw) {
+          const parsed = JSON.parse(raw)
+          if (parsed && parsed.config && typeof parsed.config === 'object') {
+            console.log('[LocalAPI] Maps config served from persisted offline cache (fetchedAt', new Date(parsed.fetchedAt || 0).toISOString() + ')')
+            return c.json({ success: true, data: parsed.config })
+          }
+        }
+      } catch { /* corrupted cache row → default */ }
+
+      return c.json({ success: true, data: DEFAULT_MAPS_CONFIG })
+    } catch (error) {
+      console.error('[LocalAPI] Maps config error:', error)
+      return c.json({ success: false, error: 'Failed to load map configuration' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
   // CLOUD-ONLY STUBS — return 200 with available:false so the dashboard
   // knows the feature exists but requires a cloud connection, instead of
   // letting the request fall through to a 404 (which would incorrectly
@@ -3898,6 +4177,15 @@ function createApp() {
         workingHoursStart: agency.workingHoursStart,
         workingHoursEnd: agency.workingHoursEnd,
         workingDays: agency.workingDays || '1,2,3,4,5',
+        // Task 51: canonical location fields (provider-independent; mirrors the
+        // cloud GET /profile payload). locationVerified falls back to the
+        // schema default for rows created before the additive column top-up.
+        latitude: agency.latitude ?? null,
+        longitude: agency.longitude ?? null,
+        postalCode: agency.postalCode ?? null,
+        locationVerified: agency.locationVerified ?? 'UNVERIFIED',
+        locationSource: agency.locationSource ?? null,
+        locationUpdatedAt: agency.locationUpdatedAt ?? null,
       })
     } catch (error) {
       console.error('[LocalAPI] Agency profile error:', error)
@@ -3982,6 +4270,16 @@ function createApp() {
           updateData[field] = body[field]
         }
       }
+
+      // Task 51: map/location fields (latitude, longitude, postalCode,
+      // locationVerified, locationSource) — cloud-identical validation
+      // (range/pair/enum → 400) + locationUpdatedAt stamping. Applied through
+      // the same outbox transaction so the replay carries the exact fields.
+      const locationUpdate = buildAgencyLocationUpdate(body)
+      if (!locationUpdate.ok) {
+        return c.json({ success: false, error: locationUpdate.error }, 400)
+      }
+      Object.assign(updateData, locationUpdate.data)
 
       if (Object.keys(updateData).length === 0) {
         return c.json({ success: false, error: 'No valid fields to update' }, 400)
@@ -7012,6 +7310,18 @@ function createApp() {
       if (updateData.workingDays !== undefined && !/^([0-6])(,[0-6])*$/.test(String(updateData.workingDays))) {
         return c.json({ success: false, error: 'Invalid workingDays format' }, 400)
       }
+      // Task 51: map/location fields (latitude, longitude, postalCode,
+      // locationVerified, locationSource) — validated with the SAME rules the
+      // cloud applies (range/pair/enum → 400) BEFORE both the local write and
+      // the cloud-forward path below, so an offline save can never produce an
+      // outbox payload the cloud replay would permanently reject. A valid
+      // lat/lng pair gets locationUpdatedAt = now (server-stamped, never
+      // client-set — the UI strips it from the body).
+      const locationUpdate = buildAgencyLocationUpdate(body)
+      if (!locationUpdate.ok) {
+        return c.json({ success: false, error: locationUpdate.error }, 400)
+      }
+      Object.assign(updateData, locationUpdate.data)
       if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields to update' }, 400)
 
       // The agency row may not exist locally yet (created on the cloud via
@@ -7978,6 +8288,10 @@ function createApp() {
         cloudAuthToken: token,
         cloudUrl,
         db,
+        // Task 48: session identity → stale-generation pre-flight (Step 0b).
+        sessionUserId: user?.id || null,
+        sessionUserEmail: user?.email || null,
+        sessionUserUsername: user?.username || null,
         emitFn: (evt) => {
           emitEvent('initial-sync:progress', evt)
           console.log('[LocalAPI][InitialSync evt]', evt.type, evt.stage || '')

@@ -22,6 +22,9 @@ import type { Socket } from 'socket.io'
 import { createServer, IncomingMessage, ServerResponse } from 'http'
 import { timingSafeEqual, randomUUID } from 'crypto'
 import { verifySessionToken, SessionToken } from './lib/auth'
+// Task 55-b — data-consumption recorder (contract agent-ctx/55-data-consumption-contract.md §2.2)
+import { recordDataUsage, classifyTrafficType, normalizeNetworkType, resolveAgencyIdFallback } from './lib/data-usage'
+import { decodeJwt } from 'jose'
 import {
   getClientIp,
   checkRateLimit,
@@ -66,6 +69,11 @@ import { agencyDeviceRoutes } from './routes/agency-devices'
 import { agencyCategoriesRoutes } from './routes/agency-categories'
 import { adminProviderRoutes } from './routes/admin-providers'
 import { appVersionRoutes } from './routes/app-versions'
+// Task 54-a — doc-2 role-scoped analytics (staff + customer modules)
+import { staffAnalyticsRoutes } from './routes/staff-analytics'
+import { customerAnalyticsRoutes } from './routes/customer-analytics'
+// Task 51 — public-ish runtime configuration (GET /api/config/maps)
+import { configRoutes } from './routes/config'
 import { db, setupSQLitePragmas } from '@blasti/db'
 import { initialSyncRoutes } from './routes/initial-sync'
 import { idempotencyGuard } from './lib/idempotency-middleware'
@@ -166,7 +174,11 @@ app.use('*', cors({
     'file://',
   ],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-internal-secret', 'X-Idempotency-Key'],
+  // Task 55: x-blasti-network (web network-type attribution) + x-blasti-device
+  // (device attribution) MUST be allowed or every browser request carrying
+  // them dies at preflight ("Failed to fetch") — this silently broke the
+  // login form when 55-c introduced the header.
+  allowHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-internal-secret', 'X-Idempotency-Key', 'x-blasti-network', 'x-blasti-device'],
   exposeHeaders: ['Set-Cookie', 'X-Idempotency-Replayed'],
   credentials: true,
   maxAge: 86400,
@@ -178,6 +190,147 @@ app.use('*', logger())
 // replays via the SyncMutation ledger and stamps the sync request context so
 // SyncChange rows carry the origin mutationId. No-op without the header.
 app.use('/api/*', idempotencyGuard)
+
+// Task 55: data-usage middleware mount point (recorder lives in lib/data-usage.ts)
+//
+// ─── Data-Usage Recorder Middleware (Task 55-b, doc-2 §14) ──────────────────
+//
+// Measures request/response bytes for EVERY /api/* call and records a
+// DataUsageEvent via the fire-and-forget recorder (lib/data-usage.ts).
+// Mounted AFTER cors+logger and BEFORE the rate limiter (below) so even 429
+// responses count as served traffic.
+//
+// EXCLUDED FROM RECORDING ON PURPOSE (skip list):
+//   - /api/health      → liveness probes are not user traffic,
+//   - /api/dev-tools/* → sandbox tooling, not product traffic,
+//   - /api/admin/*     → SUPER_ADMIN console traffic — WITHOUT this exclusion
+//     the data-consumption dashboard would inflate customer/agency
+//     consumption with its own polling every time it is opened (dashboard
+//     self-inflation guard, contract §2.2/§2.6),
+//   - WebSocket upgrades → socket.io frames are not HTTP byte traffic.
+//
+// Attribution decodes the JWT payload UNVERIFIED (verification happens in the
+// route handlers) — a forged token can only pollute analytics, never
+// authorize anything. Errors thrown by route handlers are recorded as 500s
+// and re-thrown so app.onError still answers them; the recorder itself is
+// fully try/catch-wrapped — a recorder bug must NEVER affect a response.
+app.use('/api/*', async (c, next) => {
+  const requestPath = c.req.path
+  const isWebSocketUpgrade = (c.req.header('upgrade') ?? '').toLowerCase() === 'websocket'
+
+  if (
+    requestPath === '/api/health' ||
+    requestPath.startsWith('/api/dev-tools/') ||
+    requestPath === '/api/admin' ||
+    requestPath.startsWith('/api/admin/') ||
+    isWebSocketUpgrade
+  ) {
+    await next()
+    return
+  }
+
+  // Upload side: content-length only — NEVER read/buffer request bodies.
+  const uploadBytes = Number(c.req.header('content-length') ?? 0)
+  const method = c.req.method
+  const deviceId = c.req.header('x-blasti-device') || null
+  const networkType = normalizeNetworkType(c.req.header('x-blasti-network'))
+  const trafficType = classifyTrafficType(requestPath)
+
+  // Cheap attribution — decodeJwt never verifies, so guard against garbage.
+  let userId: string | null = null
+  let role: string | null = null
+  let agencyId: string | null = null
+  try {
+    const auth = c.req.header('authorization') ?? ''
+    const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+    if (token) {
+      const payload = decodeJwt(token) as { id?: unknown; role?: unknown; agencyId?: unknown }
+      if (typeof payload.id === 'string' && payload.id) userId = payload.id
+      if (typeof payload.role === 'string' && payload.role) role = payload.role
+      if (typeof payload.agencyId === 'string' && payload.agencyId) agencyId = payload.agencyId
+    }
+  } catch {
+    // malformed/expired-encoding token → anonymous traffic (null attribution)
+  }
+
+  // Path fallback: /api/agencies/:id or /api/agency/:id — only when the
+  // segment is cuid-shaped (length ≥ 20) to avoid attributing sub-resources
+  // like /api/agencies/featured to a fake "agency".
+  if (!agencyId) {
+    const agencyPathMatch = /^\/api\/(agencies|agency)\/([^/]+)/.exec(requestPath)
+    if (agencyPathMatch && agencyPathMatch[2].length >= 20) agencyId = agencyPathMatch[2]
+  }
+
+  // Record after the response is known. Thrown route errors are recorded as
+  // 500-class events (approximation — app.onError may map some to 4xx) and
+  // re-thrown so the global error handler still produces the response.
+  const emitUsage = (downloadBytes: number, status: number) => {
+    const base = { uploadBytes, downloadBytes, networkType, trafficType, method, path: requestPath, status, userId, deviceId }
+    if (agencyId) {
+      recordDataUsage({ ...base, agencyId })
+    } else if (role) {
+      // Empty agencyId claim on owner/staff tokens: resolve via the 60s-TTL
+      // cached DB fallback INSIDE the fire-and-forget chain — the response
+      // never waits on this.
+      void resolveAgencyIdFallback(role, userId)
+        .then((resolved) => recordDataUsage({ ...base, agencyId: resolved }))
+        .catch(() => {
+          // swallow — the event is lost, never the response
+        })
+    } else {
+      recordDataUsage(base)
+    }
+  }
+
+  try {
+    await next()
+  } catch (routeError) {
+    try {
+      emitUsage(0, 500)
+    } catch {
+      // recorder bug — ignore
+    }
+    throw routeError
+  }
+
+  try {
+    const res = c.res
+    const status = res.status
+    const contentLength = res.headers.get('content-length')
+    if (contentLength !== null) {
+      emitUsage(Number(contentLength) || 0, status)
+    } else if (res.body === null) {
+      // 204/304 (and HEAD) — null body → 0 download bytes
+      emitUsage(0, status)
+    } else {
+      // Streamed response WITHOUT content-length: count bytes as they flow
+      // through a TransformStream — NEVER buffer. The event is recorded when
+      // the body stream completes (a client abort loses the count, which is
+      // honest: those bytes were not fully delivered).
+      let counted = 0
+      const byteCounter = new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          counted += chunk.byteLength
+          controller.enqueue(chunk)
+        },
+        flush() {
+          try {
+            emitUsage(counted, status)
+          } catch {
+            // recorder bug must not break the stream
+          }
+        },
+      })
+      c.res = new Response(res.body.pipeThrough(byteCounter), {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      })
+    }
+  } catch (recorderError) {
+    console.error('[DATA-USAGE] recorder error (ignored — response unaffected):', recorderError)
+  }
+})
 
 // ─── Global API Rate Limiting Middleware ────────────────────────────────────
 //
@@ -310,6 +463,63 @@ app.get('/api/health', (c) => c.json({
   uptime: Math.floor(process.uptime()),
 }))
 
+// ─── DEV-ONLY: Web Dev Server Supervisor (sandbox lifecycle fix, Task 53) ──
+// Sandbox-only problem: the harness reaps every process an agent tool command
+// spawned as soon as that command ends — so a Next.js dev server restarted
+// from a shell (`bun run dev:web`, even setsid+nohup+disown) dies within
+// seconds and the user's preview panel goes dark. Processes belonging to the
+// boot-time tree (this API server is part of it) are exempt — that is why the
+// API itself survives restart attempts of its siblings.
+//
+// Fix: a dev-only endpoint that makes the API (re)materialize the web dev
+// server as a detached orphan (setsid + nohup → adopted by PID 1, exactly
+// like the boot-spawned dev tree). The spawn is DELAYED a few seconds so it
+// happens OUTSIDE any tool-command window. Idempotent: probes :3000 first.
+//
+// Enabled only when running outside production AND inside the sandbox repo
+// layout (.zscripts exists). Harmless in normal deployments where neither
+// condition holds.
+if (process.env.NODE_ENV !== 'production' && fs.existsSync('/home/z/my-project/.zscripts')) {
+  const spawnSync = require('child_process').spawnSync as typeof import('child_process').spawnSync
+  let webSpawnTimer: ReturnType<typeof setTimeout> | null = null
+
+  const probeWebDevServer = async (): Promise<boolean> => {
+    try {
+      // Any HTTP response (even 404/500) proves something listens on :3000.
+      const res = await fetch('http://127.0.0.1:3000/', { method: 'HEAD', signal: AbortSignal.timeout(2500) })
+      return res.status > 0
+    } catch {
+      return false
+    }
+  }
+
+  const webSupervisorHandler = async (c) => {
+    const alive = c.req.query('force') === '1' ? false : await probeWebDevServer()
+    if (alive) {
+      return c.json({ ok: true, spawned: false, reason: 'web dev server already responding on :3000' })
+    }
+    const delayMs = Math.min(Math.max(parseInt(c.req.query('delayMs') || '3000', 10) || 3000, 0), 30000)
+    if (webSpawnTimer) clearTimeout(webSpawnTimer)
+    webSpawnTimer = setTimeout(() => {
+      webSpawnTimer = null
+      try {
+        const result = spawnSync(
+          'sh',
+          ['-c', 'cd /home/z/my-project && setsid nohup bun run dev:web >> dev.log 2>&1 < /dev/null & echo spawned-pid $!'],
+          { stdin: 'ignore' as const, timeout: 10000 },
+        )
+        console.log('[dev-tools] web dev server spawn requested →', String(result.stdout || '').trim() || 'no output')
+      } catch (err) {
+        console.error('[dev-tools] web dev server spawn failed:', err)
+      }
+    }, delayMs)
+    return c.json({ ok: true, spawned: true, delayMs })
+  }
+
+  app.get('/api/dev-tools/web', webSupervisorHandler)
+  app.post('/api/dev-tools/web', webSupervisorHandler)
+}
+
 // ─── LAN Discovery Endpoint ──────────────────────────────────────────────────
 // Used by kiosk devices to auto-discover the BLASTI server on the local network.
 // Scanned by the client at http://{ip}:{port}/api/discover
@@ -397,6 +607,11 @@ app.route('/api/agency-devices', agencyDeviceRoutes)
 // Task 42-b — user-created agency fields/industries (global dictionary).
 app.route('/api/agency-categories', agencyCategoriesRoutes)
 app.route('/api/app-versions', appVersionRoutes)
+// Task 54-a — role-scoped analytics modules (doc-2 spec §29-44)
+app.route('/api/staff/analytics', staffAnalyticsRoutes)
+app.route('/api/customer/analytics', customerAnalyticsRoutes)
+// Task 51 — Agency Location & Maps: effective map config for any authed user
+app.route('/api/config', configRoutes)
 
 // ─── Sync-route introspection (P0-2: make the running build self-evident) ──
 // Field round 4 showed a cloud process answering /api/health with 200 while

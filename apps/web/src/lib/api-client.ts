@@ -147,6 +147,64 @@ function isNativeRuntime(): boolean {
   return isElectronRuntime() || isCapacitorRuntime();
 }
 
+// ─── Client Network Classification (Task 55-c) ────────────────────────────────
+
+/** Minimal shape of the W3C Network Information API (not in TS DOM lib yet). */
+interface NetworkInformationLike {
+  type?: string;
+  effectiveType?: string;
+}
+
+/**
+ * Derive the `x-blasti-network` header value fed to the server-side
+ * data-usage ledger (Task 55: DataUsageEvent.networkType WIFI|MOBILE|UNKNOWN).
+ *
+ * Exact derivation (evaluated ONCE in the browser, then module-cached):
+ *   1. SSR / no navigator            → header OMITTED (a server cannot know
+ *      the client's network; sending UNKNOWN would mislabel real traffic).
+ *   2. navigator.connection.type:
+ *        'wifi' | 'ethernet'         → 'WIFI'
+ *        'cellular'                  → 'MOBILE'
+ *   3. otherwise navigator.connection.effectiveType:
+ *        'slow-2g' | '2g' | '3g'     → 'MOBILE'  (cellular-grade links)
+ *   4. anything else ('4g', missing connection API, …) → 'UNKNOWN'
+ *
+ * The header is ALWAYS sent in the browser (even as UNKNOWN) so the ledger
+ * can distinguish "web client reported nothing useful" from "desktop
+ * client (no header at all) → UNKNOWN by absence".
+ */
+let cachedBlastiNetwork: 'WIFI' | 'MOBILE' | 'UNKNOWN' | null | undefined;
+
+function deriveBlastiNetwork(): 'WIFI' | 'MOBILE' | 'UNKNOWN' | null {
+  if (cachedBlastiNetwork !== undefined) return cachedBlastiNetwork;
+  // SSR guard — never touch navigator on the server.
+  if (typeof navigator === 'undefined') {
+    cachedBlastiNetwork = null;
+    return cachedBlastiNetwork;
+  }
+  const conn = (navigator as Navigator & { connection?: NetworkInformationLike }).connection;
+  let result: 'WIFI' | 'MOBILE' | 'UNKNOWN' = 'UNKNOWN';
+  const rawType = typeof conn?.type === 'string' ? conn.type.toLowerCase() : '';
+  if (rawType === 'wifi' || rawType === 'ethernet') {
+    result = 'WIFI';
+  } else if (rawType === 'cellular') {
+    result = 'MOBILE';
+  } else {
+    const effective = typeof conn?.effectiveType === 'string' ? conn.effectiveType.toLowerCase() : '';
+    if (effective === 'slow-2g' || effective === '2g' || effective === '3g') {
+      result = 'MOBILE';
+    }
+  }
+  cachedBlastiNetwork = result;
+  return cachedBlastiNetwork;
+}
+
+/** Header fragment for the request pipeline — {} on the server. */
+function blastiNetworkHeaders(): Record<string, string> {
+  const network = deriveBlastiNetwork();
+  return network === null ? {} : { 'x-blasti-network': network };
+}
+
 // ─── Base URL Resolution ──────────────────────────────────────────────────────
 
 /**
@@ -779,6 +837,9 @@ export class ApiClient {
       ...buildAuthHeaders(),
       // Don't set Content-Type for FormData — browser sets it with correct boundary
       ...(body !== undefined && !isFormData ? { 'Content-Type': 'application/json' } : {}),
+      // Task 55-c: client network classification for the server-side data-usage
+      // ledger ({} during SSR — derivation documented in blastiNetworkHeaders).
+      ...blastiNetworkHeaders(),
       ...options?.headers,
     };
 

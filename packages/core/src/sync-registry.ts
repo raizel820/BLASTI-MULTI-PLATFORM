@@ -131,6 +131,12 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
       'workingHoursStart', 'workingHoursEnd', 'isQueueOpen', 'isActive',
       'kioskModeEnabled', 'sponsorSms', 'smsBalance', 'gracePeriodEndsAt',
       'subscriptionStartsAt', 'subscriptionExpiresAt', 'ownerId',
+      // Task 51 — Agency Location & Maps (spec §2/§41): canonical provider-
+      // independent location fields ride the EXISTING sync system (no second
+      // location sync mechanism). Nullable scalars serialize byte-exact.
+      'latitude', 'longitude', 'postalCode', 'locationVerified',
+      'locationSource', 'locationUpdatedAt', 'googlePlaceId',
+      'providerLocationId',
     ],
     immutableFields: ['id', 'createdAt', 'updatedAt'],
     localOnlyFields: ['syncVersion', 'syncedAt'],
@@ -144,7 +150,9 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canDeleteOffline: false,
     isReadOnly: false,
     syncOrder: 4,
-    dateFields: ['createdAt', 'updatedAt', 'gracePeriodEndsAt', 'subscriptionStartsAt', 'subscriptionExpiresAt', 'syncedAt'],
+    dateFields: ['createdAt', 'updatedAt', 'gracePeriodEndsAt', 'subscriptionStartsAt', 'subscriptionExpiresAt', 'syncedAt',
+      // Task 51 — location timestamp must serialize as ISO through the v2 engine.
+      'locationUpdatedAt'],
   },
 
   {

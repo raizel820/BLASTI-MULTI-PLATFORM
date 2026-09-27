@@ -47,11 +47,13 @@ const nextConfig: NextConfig = {
 
   // Allow cross-origin dev resources from the preview panel, local loopback,
   // and this machine's private LAN IPs (phones/tablets on the same Wi-Fi).
+  // NOTE: `*` only matches ONE full DNS label — `preview-chat-*.space-z.ai`
+  // never matched the real hosts (preview-chat-<uuid>.space-z.ai) and dev
+  // kept blocking /_next fonts/chunks. `*.space-z.ai` covers every preview
+  // session regardless of chat id.
   allowedDevOrigins: [
     ...privateLanOrigins(),
-    'preview-chat-2e8b7d42-6f74-44df-9f2e-5f3c396ddc2e.space-z.ai',
-    'preview-chat-4b670b32-18b3-4e14-a814-00deda25e06f.space-z.ai',
-    'preview-chat-*.space-z.ai',
+    '*.space-z.ai',
     'localhost',
     '127.0.0.1',
   ],

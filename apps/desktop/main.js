@@ -1523,6 +1523,12 @@ async function _runInitialSyncFromSessionInner() {
     cloudAuthToken: session.token,
     cloudUrl: cloudUrl,
     db: localDb,
+    // Task 48: session identity → stale-generation pre-flight (Step 0b) —
+    // detects the re-seeded cloud (same email, new user id) and rebuilds the
+    // local mirror BEFORE the staged import instead of crashing on P2002.
+    sessionUserId: session.user.id || null,
+    sessionUserEmail: session.user.email || null,
+    sessionUserUsername: session.user.username || null,
     emitFn: (evt) => console.log('[InitialSync evt]', evt.type, evt.stage || ''),
   });
 

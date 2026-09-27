@@ -46,6 +46,11 @@ import {
   CommuneSelect,
   composeLocationLabel,
 } from '@/components/shared/algeria-location-selects';
+import { ALGERIA_WILAYAS, findWilayaByCode } from '@/lib/algeria-locations';
+// Task 51-b — agency location map picker (provider abstraction, spec §27-30).
+import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
+import { useMapConfig } from '@/lib/map/use-map-config';
+import type { GeocodeComponents } from '@/lib/map';
 
 // ─── Floating Label Input ─────────────────────────────
 function FloatingInput({
@@ -314,6 +319,19 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   const [description, setDescription] = useState('');
   const [customCode, setCustomCode] = useState('');
 
+  // Task 51-b — agency location (map picker, spec §27-30). Coordinates live
+  // in TEMPORARY form state until the final submit (spec §28 — "Do not
+  // immediately persist every drag event").
+  const [latitude, setLatitude] = useState<number | null>(null);
+  const [longitude, setLongitude] = useState<number | null>(null);
+  const [postalCode, setPostalCode] = useState('');
+  const [locationSource, setLocationSource] = useState<'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS' | null>(null);
+  // Manual-override guard (spec §30): raised whenever the user edits an
+  // address field, RESET on an explicit location change (picker onChange),
+  // so a new detection only overwrites text the user has not typed since.
+  const manualTouchedRef = useRef(false);
+  const { config: mapsConfig } = useMapConfig();
+
   // Step 2: Working Hours + Working Days (Round 15 — days beside the hours)
   const [workingHoursStart, setWorkingHoursStart] = useState('08:00');
   const [workingHoursEnd, setWorkingHoursEnd] = useState('17:00');
@@ -370,6 +388,59 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   };
 
   const filledServices = services.filter((s) => s.name.trim().length > 0);
+
+  // Task 51-b — explicit location change (map click / drag settle / GPS).
+  // Resets the manual-override guard FIRST so the follow-up detection (spec
+  // §29) may overwrite fields the user has not typed since this new pick
+  // (spec §30 — "unless the owner explicitly selects another location").
+  const handlePickerChange = (lat: number | null, lng: number | null) => {
+    setLatitude(lat);
+    setLongitude(lng);
+    manualTouchedRef.current = false;
+  };
+
+  // Task 51-b — match a geocoded wilaya name (Latin OR Arabic — Nominatim
+  // answers in the UI language) to the official dataset. No match → null:
+  // NEVER invent a wilaya (spec §29).
+  const findWilayaCodeByGeocodeName = (name: string | null): string | null => {
+    if (!name) return null;
+    const q = name.trim().toLowerCase();
+    const hit = ALGERIA_WILAYAS.find(
+      (w) =>
+        w.name.toLowerCase() === q ||
+        w.nameAr.replace(/\s/g, '') === name.replace(/\s/g, ''),
+    );
+    return hit ? hit.code : null;
+  };
+
+  // Task 51-b — automatic address extraction (spec §29): fill available
+  // address fields from the geocoder, then show the human-readable address.
+  // Missing components are null and simply leave their field untouched.
+  const handleDetectedAddress = (components: GeocodeComponents) => {
+    if (manualTouchedRef.current) return; // manual override wins (spec §30)
+
+    if (components.street && !address.trim()) setAddress(components.street);
+
+    const code = findWilayaCodeByGeocodeName(components.wilaya);
+    if (code && code !== wilayaCode) {
+      setWilayaCode(code);
+      setCommuneName(''); // dependent list — reset the commune
+    }
+    const effectiveCode = code || wilayaCode;
+    if (components.city && effectiveCode) {
+      const wilaya = findWilayaByCode(effectiveCode);
+      const q = components.city.trim().toLowerCase();
+      const match = wilaya?.communes.find(
+        (c) =>
+          c.name.toLowerCase() === q ||
+          c.nameAr.replace(/\s/g, '') === components.city!.replace(/\s/g, ''),
+      );
+      // Only a commune that exists in the selected wilaya is applied; the
+      // commune field only auto-fills while the user has not chosen one.
+      if (match && !communeName) setCommuneName(match.name);
+    }
+    if (components.postalCode && !postalCode.trim()) setPostalCode(components.postalCode);
+  };
 
   // Task 5 — one-shot location handoff from the register form. Read + REMOVE
   // 'blasti:reg-location' on mount so the selection pre-fills this wizard
@@ -560,6 +631,18 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       if (email.trim()) body.email = email.trim();
       if (description.trim()) body.description = description.trim();
       if (customCode.trim()) body.customCode = customCode.trim().toUpperCase();
+      // Task 51-b — canonical agency location (spec §2). Sent only when the
+      // owner actually set coordinates; locationSource/locationVerified ride
+      // along per the 51-a contract (source per spec §2/§35).
+      if (postalCode.trim()) body.postalCode = postalCode.trim();
+      if (latitude != null && longitude != null) {
+        body.latitude = latitude;
+        body.longitude = longitude;
+        if (locationSource) {
+          body.locationSource = locationSource;
+          body.locationVerified = locationSource === 'DEVICE_GPS' ? 'VERIFIED' : 'UNVERIFIED';
+        }
+      }
       if (workingHoursStart) body.workingHoursStart = workingHoursStart;
       if (workingHoursEnd) body.workingHoursEnd = workingHoursEnd;
       // Round 15 — working days + services ride along in ONE atomic create.
@@ -932,6 +1015,8 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                       setWilayaCode(code);
                       // Dependent list — reset the commune on wilaya change.
                       setCommuneName('');
+                      // Task 51-b — manual edit guard (spec §30).
+                      manualTouchedRef.current = true;
                     }}
                     lang={lang}
                     placeholder={t('location.selectWilaya' as any)}
@@ -945,7 +1030,11 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   <CommuneSelect
                     wilayaCode={wilayaCode}
                     value={communeName}
-                    onValueChange={setCommuneName}
+                    onValueChange={(name) => {
+                      setCommuneName(name);
+                      // Task 51-b — manual edit guard (spec §30).
+                      manualTouchedRef.current = true;
+                    }}
                     lang={lang}
                     placeholder={t('location.selectCommune' as any)}
                     id="agency-commune"
@@ -966,11 +1055,51 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                 <FloatingInput
                   id="agency-address"
                   value={address}
-                  onChange={setAddress}
+                  onChange={(v) => {
+                    setAddress(v);
+                    // Task 51-b — manual edit guard (spec §30).
+                    manualTouchedRef.current = true;
+                  }}
                   label={t('location.streetAddress' as any)}
                   placeholder={t('agencyAddressPlaceholder' as any)}
                   icon={MapPin}
                 />
+
+                {/* Task 51-b — Location block (spec §27): map picker + postal
+                    code. Rendered whenever maps are not explicitly disabled;
+                    when the config endpoint is unreachable the picker itself
+                    degrades to the offline box while GPS stays functional. */}
+                {mapsConfig?.mapsEnabled !== false && (
+                  <div className="space-y-3 rounded-xl border border-gray-100 dark:border-gray-800 bg-gray-50/40 dark:bg-gray-900/40 p-3">
+                    <Label className="text-sm font-medium flex items-center gap-1.5">
+                      <MapPin className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                      {t('maps.location' as any)}
+                      <span className="text-xs text-muted-foreground">({t('optional' as any)})</span>
+                    </Label>
+                    <MapLocationPicker
+                      value={{ latitude, longitude }}
+                      onChange={handlePickerChange}
+                      onLocationSource={setLocationSource}
+                      addressFields={{ onDetected: handleDetectedAddress }}
+                      height={260}
+                    />
+                    {/* Postal code (spec §27 — Postal Code field) */}
+                    <FloatingInput
+                      id="agency-postal-code"
+                      value={postalCode}
+                      onChange={(v) => {
+                        setPostalCode(v);
+                        // Task 51-b — manual edit guard (spec §30).
+                        manualTouchedRef.current = true;
+                      }}
+                      label={t('maps.postalCode' as any)}
+                      placeholder="28019"
+                      dir="ltr"
+                      icon={Hash}
+                      maxLength={10}
+                    />
+                  </div>
+                )}
 
                 {/* Phone */}
                 <FloatingInput
@@ -1314,6 +1443,14 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                     <PreviewRow label={t('location.wilaya' as any)} value={composeLocationLabel(wilayaCode, communeName, lang) || ''} />
                   )}
                   {address && <PreviewRow label={t('agencyAddress' as any)} value={address} />}
+                  {postalCode && <PreviewRow label={t('maps.postalCode' as any)} value={postalCode} dir="ltr" />}
+                  {latitude != null && longitude != null && (
+                    <PreviewRow
+                      label={t('maps.location' as any)}
+                      value={`${latitude.toFixed(6)}, ${longitude.toFixed(6)}`}
+                      dir="ltr"
+                    />
+                  )}
                   {phone && <PreviewRow label={t('phoneNumber' as any)} value={phone} dir="ltr" />}
                   {email && <PreviewRow label={t('email' as any)} value={email} dir="ltr" />}
                   {description && <PreviewRow label={t('description' as any)} value={description.length > 80 ? `${description.slice(0, 80)}...` : description} />}

@@ -90,6 +90,17 @@ export function ClientBootHardening() {
       maybeReload(message);
     };
     const onErrorEvent = (event: ErrorEvent) => {
+      // Task 53 — benign browser notification from ResizeObserver feedback
+      // loops (recharts dashboards, e.g. #/admin/analytics). The early
+      // beforeInteractive script (public/resize-observer-fix.js) already
+      // prevents it at the source AND suppresses it; this is a last-resort
+      // guard for tabs running stale cached HTML without that script, so the
+      // message can never reach the reload path or later error reporters.
+      if (typeof event?.message === 'string' && /ResizeObserver loop (completed with undelivered notifications|limit exceeded)/i.test(event.message)) {
+        event.stopImmediatePropagation();
+        event.preventDefault();
+        return;
+      }
       const fromErrorObj = event?.error instanceof Error ? event.error.message : '';
       maybeReload(fromErrorObj || event?.message || '');
     };

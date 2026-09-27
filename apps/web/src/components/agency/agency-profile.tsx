@@ -51,6 +51,9 @@ import {
   composeLocationLabel,
 } from '@/components/shared/algeria-location-selects';
 import { findWilayaByCode } from '@/lib/algeria-locations';
+// Task 51-b — agency location map (provider abstraction, spec §31/§35).
+import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
+import { AgencyLocationMap } from '@/components/shared/map/agency-location-map';
 
 interface AgencyInfo {
   id: string;
@@ -75,6 +78,13 @@ interface AgencyInfo {
   // commune/baladiya Latin name). Optional — older payloads omit them.
   wilaya?: string;
   city?: string;
+  // Task 51-b: canonical agency location (spec §2). Optional — payloads
+  // from older cloud/desktop builds omit them entirely.
+  latitude?: number | null;
+  longitude?: number | null;
+  postalCode?: string | null;
+  locationVerified?: string | null;
+  locationSource?: string | null;
 }
 
 /** Round 15 — localized weekday list for the workingDays CSV (0=Sunday).
@@ -99,6 +109,10 @@ export function AgencyProfile() {
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [qrLoading, setQrLoading] = useState(false);
   const logoInputRef = useRef<HTMLInputElement>(null);
+  // Task 51-b — set when the owner re-picks the pin this session; drives the
+  // locationSource/locationVerified overrides in the save payload (spec §35).
+  const [locationChanged, setLocationChanged] = useState(false);
+  const [locationSourceOverride, setLocationSourceOverride] = useState<'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS' | null>(null);
 
   useEffect(() => {
     fetchProfile();
@@ -164,6 +178,16 @@ export function AgencyProfile() {
         payload.wilaya = pairWilaya;
         payload.city = pairCity;
       }
+      // Task 51-b — canonical location (spec §2/§28): coordinates live in
+      // TEMPORARY state until Save; when the owner re-picked the pin this
+      // session the source/verified pair is refreshed too (spec §35).
+      if (locationChanged) {
+        payload.latitude = profile?.latitude ?? null;
+        payload.longitude = profile?.longitude ?? null;
+        payload.locationSource = locationSourceOverride ?? profile?.locationSource ?? 'MANUAL';
+        payload.locationVerified =
+          locationSourceOverride === 'DEVICE_GPS' ? 'VERIFIED' : 'UNVERIFIED';
+      }
       const res = await apiFetch('/api/agency/profile', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -190,6 +214,16 @@ export function AgencyProfile() {
 
   const updateField = (field: keyof AgencyInfo, value: string) => {
     setProfile((prev) => (prev ? { ...prev, [field]: value } : prev));
+  };
+
+  // Task 51-b — picker → TEMPORARY profile state (spec §28); persistence
+  // happens through the existing Save button (handleSave payload override).
+  const handleLocationChange = (lat: number | null, lng: number | null) => {
+    setProfile((prev) => (prev ? { ...prev, latitude: lat, longitude: lng } : prev));
+    setLocationChanged(true);
+  };
+  const handleLocationSource = (source: 'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS') => {
+    setLocationSourceOverride(source);
   };
 
   // Task 5 — effective commune selection: the stored city only counts as
@@ -614,6 +648,69 @@ export function AgencyProfile() {
                 </div>
               </div>
             )}
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* Task 51-b — Location card (spec §31): saved location + marker +
+          agency name/address; editable via the picker in edit mode and
+          persisted by the same Save button. Verified badge per spec §35. */}
+      <motion.div
+        initial={{ opacity: 0, y: 15 }}
+        animate={{ opacity: 1, y: 0 }}
+      >
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50">
+          <CardHeader className="pb-3">
+            <div className="flex items-center justify-between gap-2">
+              <CardTitle className="text-base flex items-center gap-2">
+                <MapPin className="h-4 w-4 text-emerald-600" />
+                {t('maps.location')}
+              </CardTitle>
+              {profile?.locationVerified === 'VERIFIED' ? (
+                <Badge className="text-[10px] px-2 py-0.5 bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
+                  <BadgeCheck className="h-3 w-3 me-1" />
+                  {t('maps.locationVerified')}
+                </Badge>
+              ) : profile?.locationVerified ? (
+                <Badge variant="outline" className="text-[10px] px-2 py-0.5 text-muted-foreground">
+                  {t('maps.locationUnverified')}
+                </Badge>
+              ) : null}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {editMode ? (
+              <MapLocationPicker
+                value={{ latitude: profile?.latitude ?? null, longitude: profile?.longitude ?? null }}
+                onChange={handleLocationChange}
+                onLocationSource={handleLocationSource}
+                height={240}
+              />
+            ) : (
+              <AgencyLocationMap
+                agency={{
+                  latitude: profile?.latitude ?? null,
+                  longitude: profile?.longitude ?? null,
+                  name: profile?.name ?? '',
+                  address: profile?.address ?? null,
+                  city: composeLocationLabel(profile?.wilaya ?? '', selectedCommune, lang) || null,
+                }}
+                height={220}
+              />
+            )}
+            {/* Postal code (spec §27/§30 — editable, saved with the profile) */}
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">{t('maps.postalCode')}</Label>
+              <Input
+                value={profile?.postalCode ?? ''}
+                onChange={(e) => updateField('postalCode', e.target.value)}
+                disabled={!editMode || saving}
+                dir="ltr"
+                maxLength={10}
+                placeholder="28019"
+                className="h-11 rounded-xl border-gray-200 dark:border-gray-700 focus:border-emerald-400 focus:ring-2 focus:ring-emerald-500/20 disabled:opacity-70"
+              />
+            </div>
           </CardContent>
         </Card>
       </motion.div>

@@ -16,6 +16,8 @@ export const viewToUrl: Record<ViewName, string> = {
   'customer-favorites': '/customer/favorites',
   'customer-settings': '/customer/settings',
   'customer-sms-wallet': '/customer/sms-wallet',
+  // Task 54-d: personal "My Analytics" module (doc-2 §38-44).
+  'customer-analytics': '/customer/analytics',
   'agency-dashboard': '/agency',
   'agency-settings': '/agency/settings',
   'agency-employees': '/agency/employees',

@@ -1,0 +1,12 @@
+const BASE = 'http://localhost:3003'
+const login = await fetch(`${BASE}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'owner', password: 'owner123' }) })
+console.log('login status', login.status)
+const lj: any = await login.json()
+const agencies = await fetch(`${BASE}/api/agencies`)
+console.log('agencies status', agencies.status, 'content-length header:', agencies.headers.get('content-length'))
+await new Promise((r) => setTimeout(r, 6500))
+const { db } = await import('@blasti/db')
+const events = await db.dataUsageEvent.findMany({ orderBy: { createdAt: 'desc' }, take: 10 })
+console.log('events recorded:', events.length)
+for (const e of events) console.log(JSON.stringify({ path: e.path, method: e.method, status: e.status, up: e.uploadBytes, down: e.downloadBytes, net: e.networkType, tt: e.trafficType, userId: e.userId ? 'set' : null, agencyId: e.agencyId ? e.agencyId.slice(0, 8) : null }))
+process.exit(0)

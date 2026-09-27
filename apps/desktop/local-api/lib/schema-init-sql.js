@@ -105,6 +105,17 @@ CREATE TABLE "Agency" (
     "gracePeriodEndsAt" DATETIME,
     "subscriptionStartsAt" DATETIME,
     "subscriptionExpiresAt" DATETIME,
+    -- Task 51: map/location columns (manual sync from the shared
+    -- schema.prisma Agency model — the ensureSchema column top-up auto-adds
+    -- these to pre-existing local DBs from this DDL).
+    "latitude" REAL,
+    "longitude" REAL,
+    "postalCode" TEXT,
+    "locationVerified" TEXT DEFAULT 'UNVERIFIED',
+    "locationSource" TEXT,
+    "locationUpdatedAt" DATETIME,
+    "googlePlaceId" TEXT,
+    "providerLocationId" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
     "ownerId" TEXT NOT NULL,

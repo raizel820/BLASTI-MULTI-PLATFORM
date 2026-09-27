@@ -62,6 +62,301 @@ export function utcMonthKey(d: Date): string {
 export const DASHBOARD_PERIODS = ['7d', '30d', '90d', '12m'] as const
 export type DashboardPeriod = (typeof DASHBOARD_PERIODS)[number]
 
+// ─── Task 54-a — Shared period engine (doc-2 spec §3.1) ─────────────────────
+//
+// ONE resolver for every analytics endpoint that accepts `period`:
+//   today, yesterday, 7d, 30d, 90d, 12m, this-week, last-week, this-month,
+//   last-month, this-quarter, last-quarter, this-year, last-year, custom
+//
+// Backward compatibility:
+//   - 7d/30d produce EXACTLY the same [start,end) as the legacy engine math
+//     (end = now, start = end − N×24h); 90d and 12m are accepted directly
+//     (90d→90d, 12m→rolling 12 calendar months incl. current — the same
+//     definition the existing dashboard uses).
+//   - The legacy routes keep using DASHBOARD_PERIODS/computeAnalyticsDashboard
+//     untouched; new routes use resolvePeriodRange.
+//
+// All math is UTC. `end` for LIVE windows (today, 7d/30d/90d, 12m, this-*)
+// is `now`; fixed windows in the past (yesterday, last-*) end at 23:59:59.999
+// of their last day. previousStart/previousEnd cover the immediately preceding
+// window of the same length (for fixed past windows this is the preceding
+// calendar twin; for live windows it is [start − length, start), matching the
+// legacy delta convention).
+//
+// Granularity follows spec §52: today/yesterday → hourly; week/30d/7d/90d →
+// daily; month/quarter/year/12m → monthly; custom → daily up to 92 days,
+// monthly beyond.
+
+/** 'YYYY-MM-DDTHH' (UTC) — hourly bucket key. */
+export function utcHourKey(d: Date): string {
+  return `${utcDateKey(d)}T${String(d.getUTCHours()).padStart(2, '0')}`
+}
+
+export const ANALYTICS_PERIODS = [
+  'today',
+  'yesterday',
+  '7d',
+  '30d',
+  '90d',
+  '12m',
+  'this-week',
+  'last-week',
+  'this-month',
+  'last-month',
+  'this-quarter',
+  'last-quarter',
+  'this-year',
+  'last-year',
+  'custom',
+] as const
+
+export type AnalyticsPeriod = (typeof ANALYTICS_PERIODS)[number]
+
+export type AnalyticsGranularity = 'hourly' | 'daily' | 'monthly'
+
+export interface ResolvedPeriodRange {
+  period: AnalyticsPeriod
+  /** Inclusive window start (UTC). */
+  start: Date
+  /** Inclusive window end — `now` for live windows. */
+  end: Date
+  previousStart: Date
+  previousEnd: Date
+  granularity: AnalyticsGranularity
+  /** Ordered, zero-fillable bucket keys ('YYYY-MM-DDTHH' | 'YYYY-MM-DD' | 'YYYY-MM'). */
+  bucketKeys: string[]
+  /** ISO echoes for the UI label (spec §3.1 — the payload carries its window). */
+  from: string
+  to: string
+}
+
+function isIsoDateString(v: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(v.trim())
+}
+
+/** Parse a from/to pair for `custom`. Date-only values expand to full UTC days. */
+function parseCustomBounds(fromRaw: string, toRaw: string): { start: Date; end: Date } {
+  if (!isIsoDateString(fromRaw) || !isIsoDateString(toRaw)) {
+    throw new Error('PERIOD_INVALID: custom requires ISO from and to (YYYY-MM-DD or full timestamp)')
+  }
+  const fromOnly = /^\d{4}-\d{2}-\d{2}$/.test(fromRaw.trim())
+  const toOnly = /^\d{4}-\d{2}-\d{2}$/.test(toRaw.trim())
+  const start = new Date(fromRaw.trim().replace(' ', 'T'))
+  const end = new Date(toRaw.trim().replace(' ', 'T'))
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    throw new Error('PERIOD_INVALID: from/to are not valid dates')
+  }
+  if (fromOnly) start.setUTCHours(0, 0, 0, 0)
+  if (toOnly) end.setUTCHours(23, 59, 59, 999)
+  if (end.getTime() < start.getTime()) {
+    throw new Error('PERIOD_INVALID: to must not be before from')
+  }
+  return { start, end }
+}
+
+/** Ordered zero-fill bucket keys for a resolved range at its granularity. */
+function buildBucketKeys(start: Date, end: Date, granularity: AnalyticsGranularity): string[] {
+  const keys: string[] = []
+  if (granularity === 'hourly') {
+    const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate(), start.getUTCHours()))
+    while (cursor.getTime() <= end.getTime()) {
+      keys.push(utcHourKey(cursor))
+      cursor.setUTCHours(cursor.getUTCHours() + 1)
+    }
+  } else if (granularity === 'daily') {
+    const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()))
+    while (cursor.getTime() <= end.getTime()) {
+      keys.push(utcDateKey(cursor))
+      cursor.setUTCDate(cursor.getUTCDate() + 1)
+    }
+  } else {
+    const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), 1))
+    while (cursor.getTime() <= end.getTime()) {
+      keys.push(utcMonthKey(cursor))
+      cursor.setUTCMonth(cursor.getUTCMonth() + 1)
+    }
+  }
+  return keys
+}
+
+function granularityFor(period: AnalyticsPeriod, start: Date, end: Date): AnalyticsGranularity {
+  if (period === 'today' || period === 'yesterday') return 'hourly'
+  if (period === 'this-week' || period === 'last-week' || period === '7d' || period === '30d' || period === '90d') return 'daily'
+  if (period === 'custom') {
+    const daySpanMs = 92 * 24 * 60 * 60 * 1000
+    return end.getTime() - start.getTime() <= daySpanMs ? 'daily' : 'monthly'
+  }
+  return 'monthly'
+}
+
+/** Monday 00:00 UTC of the week containing `d`. */
+function startOfUtcWeek(d: Date): Date {
+  const day = d.getUTCDay() // 0 = Sunday
+  const backToMonday = (day + 6) % 7
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - backToMonday, 0, 0, 0, 0))
+}
+
+function startOfUtcQuarter(d: Date): Date {
+  const quarterMonth = Math.floor(d.getUTCMonth() / 3) * 3
+  return new Date(Date.UTC(d.getUTCFullYear(), quarterMonth, 1, 0, 0, 0, 0))
+}
+
+/**
+ * Resolve any doc-2 §3.1 period (or `custom` with from/to) to a concrete UTC
+ * window + previous window + granularity + zero-fill bucket keys.
+ * Throws `Error('PERIOD_INVALID: …')` for bad input — route helpers turn that
+ * into a 400 response.
+ */
+export function resolvePeriodRange(
+  period: AnalyticsPeriod,
+  from?: string | null,
+  to?: string | null,
+): ResolvedPeriodRange {
+  const now = new Date()
+  let start: Date
+  let end: Date
+  let prevStart: Date
+  let prevEnd: Date
+
+  switch (period) {
+    case 'today': {
+      start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0))
+      end = now
+      const lengthMs = Math.max(end.getTime() - start.getTime(), 1)
+      prevStart = new Date(start.getTime() - lengthMs)
+      prevEnd = start
+      break
+    }
+    case 'yesterday': {
+      const dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 0, 0, 0, 0))
+      const dayEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 23, 59, 59, 999))
+      start = dayStart
+      end = dayEnd
+      prevStart = new Date(dayStart.getTime() - 24 * 60 * 60 * 1000)
+      prevEnd = new Date(dayEnd.getTime() - 24 * 60 * 60 * 1000)
+      break
+    }
+    case '7d':
+    case '30d':
+    case '90d': {
+      // EXACT legacy math (computeAnalyticsDashboard) so both engines agree.
+      const days = period === '7d' ? 7 : period === '30d' ? 30 : 90
+      end = now
+      start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000)
+      prevStart = new Date(start.getTime() - days * 24 * 60 * 60 * 1000)
+      prevEnd = start
+      break
+    }
+    case '12m': {
+      // EXACT legacy math: 00:00 UTC of the month 11 months before current.
+      end = now
+      start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - 11, 1, 0, 0, 0, 0))
+      prevStart = new Date(start.getTime() - (end.getTime() - start.getTime()))
+      prevEnd = start
+      break
+    }
+    case 'this-week': {
+      start = startOfUtcWeek(now)
+      end = now
+      const lengthMs = Math.max(end.getTime() - start.getTime(), 1)
+      prevStart = new Date(start.getTime() - lengthMs)
+      prevEnd = start
+      break
+    }
+    case 'last-week': {
+      const weekStart = startOfUtcWeek(now)
+      start = new Date(weekStart.getTime() - 7 * 24 * 60 * 60 * 1000)
+      end = new Date(weekStart.getTime() - 1)
+      prevStart = new Date(start.getTime() - 7 * 24 * 60 * 60 * 1000)
+      prevEnd = new Date(start.getTime() - 1)
+      break
+    }
+    case 'this-month': {
+      start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0))
+      end = now
+      const lengthMs = Math.max(end.getTime() - start.getTime(), 1)
+      prevStart = new Date(start.getTime() - lengthMs)
+      prevEnd = start
+      break
+    }
+    case 'last-month': {
+      const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0))
+      start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1, 0, 0, 0, 0))
+      end = new Date(monthStart.getTime() - 1)
+      prevStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 2, 1, 0, 0, 0, 0))
+      prevEnd = new Date(start.getTime() - 1)
+      break
+    }
+    case 'this-quarter': {
+      start = startOfUtcQuarter(now)
+      end = now
+      const lengthMs = Math.max(end.getTime() - start.getTime(), 1)
+      prevStart = new Date(start.getTime() - lengthMs)
+      prevEnd = start
+      break
+    }
+    case 'last-quarter': {
+      const quarterStart = startOfUtcQuarter(now)
+      start = new Date(Date.UTC(quarterStart.getUTCFullYear(), quarterStart.getUTCMonth() - 3, 1, 0, 0, 0, 0))
+      end = new Date(quarterStart.getTime() - 1)
+      prevStart = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() - 3, 1, 0, 0, 0, 0))
+      prevEnd = new Date(start.getTime() - 1)
+      break
+    }
+    case 'this-year': {
+      start = new Date(Date.UTC(now.getUTCFullYear(), 0, 1, 0, 0, 0, 0))
+      end = now
+      const lengthMs = Math.max(end.getTime() - start.getTime(), 1)
+      prevStart = new Date(start.getTime() - lengthMs)
+      prevEnd = start
+      break
+    }
+    case 'last-year': {
+      const yearStart = new Date(Date.UTC(now.getUTCFullYear(), 0, 1, 0, 0, 0, 0))
+      start = new Date(Date.UTC(now.getUTCFullYear() - 1, 0, 1, 0, 0, 0, 0))
+      end = new Date(yearStart.getTime() - 1)
+      prevStart = new Date(Date.UTC(now.getUTCFullYear() - 2, 0, 1, 0, 0, 0, 0))
+      prevEnd = new Date(start.getTime() - 1)
+      break
+    }
+    case 'custom': {
+      if (!from || !to) {
+        throw new Error('PERIOD_INVALID: custom requires both from and to')
+      }
+      const bounds = parseCustomBounds(from, to)
+      start = bounds.start
+      end = bounds.end
+      const lengthMs = end.getTime() - start.getTime()
+      prevStart = new Date(start.getTime() - lengthMs)
+      prevEnd = start
+      break
+    }
+    default:
+      throw new Error('PERIOD_INVALID: unknown period')
+  }
+
+  const granularity = granularityFor(period, start, end)
+  const bucketKeys = buildBucketKeys(start, end, granularity)
+
+  return {
+    period,
+    start,
+    end,
+    previousStart: prevStart,
+    previousEnd: prevEnd,
+    granularity,
+    bucketKeys,
+    from: start.toISOString(),
+    to: end.toISOString(),
+  }
+}
+
+/** Parse the `period` query param against ANALYTICS_PERIODS with a fallback. */
+export function parseAnalyticsPeriod(raw: string | undefined, fallback: AnalyticsPeriod = '30d'): AnalyticsPeriod {
+  if (!raw) return fallback
+  return (ANALYTICS_PERIODS as readonly string[]).includes(raw) ? (raw as AnalyticsPeriod) : fallback
+}
+
 export interface AnalyticsDashboardPayload {
   period: DashboardPeriod
   generatedAt: string

@@ -26,6 +26,7 @@ import {
   Heart,
   Settings2,
   LogOut,
+  BarChart3,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 
@@ -62,7 +63,7 @@ function CustomerTopTabBar({ mainItems, currentView, setView, moreOpen, setMoreO
 }) {
   const { capabilities } = usePlatform();
 
-  const handleMoreNav = (view: 'customer-favorites' | 'customer-notifications' | 'customer-settings') => {
+  const handleMoreNav = (view: 'customer-favorites' | 'customer-notifications' | 'customer-settings' | 'customer-analytics') => {
     setMoreOpen(false);
     setView(view);
   };
@@ -136,6 +137,13 @@ function CustomerTopTabBar({ mainItems, currentView, setView, moreOpen, setMoreO
             <div className="h-px bg-border mx-2" />
             <div className="px-1 py-3 space-y-1">
               <button
+                onClick={() => handleMoreNav('customer-analytics')}
+                className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-muted dark:hover:bg-gray-800 transition-colors"
+              >
+                <BarChart3 className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                <span className="text-sm font-medium text-foreground">{t('myAnalytics.nav.title')}</span>
+              </button>
+              <button
                 onClick={() => handleMoreNav('customer-favorites')}
                 className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-muted dark:hover:bg-gray-800 transition-colors"
               >
@@ -192,7 +200,7 @@ function CustomerMobileBottomNav({ mainItems, currentView, setView, moreOpen, se
 }) {
   const { capabilities } = usePlatform();
 
-  const handleMoreNav = (view: 'customer-favorites' | 'customer-notifications' | 'customer-settings') => {
+  const handleMoreNav = (view: 'customer-favorites' | 'customer-notifications' | 'customer-settings' | 'customer-analytics') => {
     setMoreOpen(false);
     setView(view);
   };
@@ -280,6 +288,13 @@ function CustomerMobileBottomNav({ mainItems, currentView, setView, moreOpen, se
               </div>
               <div className="h-px bg-border mx-5" />
               <div className="px-3 py-3 space-y-1">
+                <button
+                  onClick={() => handleMoreNav('customer-analytics')}
+                  className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-muted dark:hover:bg-gray-800 transition-colors"
+                >
+                  <BarChart3 className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                  <span className="text-sm font-medium text-foreground">{t('myAnalytics.nav.title')}</span>
+                </button>
                 <button
                   onClick={() => handleMoreNav('customer-favorites')}
                   className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-muted dark:hover:bg-gray-800 transition-colors"

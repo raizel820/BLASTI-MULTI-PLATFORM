@@ -139,6 +139,16 @@ export const updateAgencyProfileSchema = z.object({
   // the two-digit official code, city is the commune (baladiya) Latin name.
   wilaya: z.string().regex(wilayaCodeRegex, 'wilaya must be a two-digit wilaya code (01-58)').nullable().optional(),
   city: z.string().min(1).max(120).nullable().optional(),
+  // Task 51 — Agency Location & Maps (spec §2): canonical provider-independent
+  // location fields. Nullable so "spread the GET response back" saves can
+  // clear them; lat/lng range violations 400 at validation time, and the
+  // handlers enforce pair semantics + locationUpdatedAt stamping via
+  // buildAgencyLocationPatch (lib/map-settings.ts).
+  latitude: z.number().min(-90, 'latitude must be between -90 and 90').max(90, 'latitude must be between -90 and 90').nullable().optional(),
+  longitude: z.number().min(-180, 'longitude must be between -180 and 180').max(180, 'longitude must be between -180 and 180').nullable().optional(),
+  postalCode: z.string().max(20).nullable().optional(),
+  locationVerified: z.enum(['VERIFIED', 'UNVERIFIED', 'MANUAL']).nullable().optional(),
+  locationSource: z.enum(['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']).nullable().optional(),
 })
 
 export const updateAgencySettingsSchema = z.object({
@@ -230,6 +240,15 @@ export const adminCreateAgencySchema = z.object({
   // Both optional — when omitted the Agency row keeps its DB defaults.
   wilaya: z.string().regex(wilayaCodeRegex, 'wilaya must be a two-digit wilaya code (01-58)').optional(),
   city: z.string().min(1).max(120).optional(),
+  // Task 51 — Agency Location & Maps (spec §27/§28): optional location picked
+  // on the create-agency map. Range violations 400 at validation time; the
+  // routes enforce pair semantics (lat/lng together) and stamp
+  // locationUpdatedAt when a valid pair lands.
+  latitude: z.number().min(-90, 'latitude must be between -90 and 90').max(90, 'latitude must be between -90 and 90').nullable().optional(),
+  longitude: z.number().min(-180, 'longitude must be between -180 and 180').max(180, 'longitude must be between -180 and 180').nullable().optional(),
+  postalCode: z.string().max(20).nullable().optional(),
+  locationVerified: z.enum(['VERIFIED', 'UNVERIFIED', 'MANUAL']).nullable().optional(),
+  locationSource: z.enum(['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']).nullable().optional(),
 })
 
 export const adminUpdateAgencySchema = z.object({

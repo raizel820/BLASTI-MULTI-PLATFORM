@@ -22,6 +22,7 @@ export type ViewName =
   | 'customer-favorites'
   | 'customer-settings'
   | 'customer-sms-wallet'
+  | 'customer-analytics'
   | 'agency-dashboard'
   | 'agency-settings'
   | 'agency-employees'
@@ -127,6 +128,7 @@ const viewHashMap: Record<ViewName, string> = {
   'customer-profile': '#/customer/profile',
   'customer-favorites': '#/customer/favorites',
   'customer-settings': '#/customer/settings',
+  'customer-analytics': '#/customer/analytics',
   'customer-sms-wallet': '#/customer/sms-wallet',
   'agency-dashboard': '#/agency',
   'agency-settings': '#/agency/settings',
@@ -251,6 +253,7 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'landing', 'login', 'register',
   'customer-home', 'customer-queue', 'customer-history', 'customer-notifications',
   'customer-profile', 'customer-favorites', 'customer-settings', 'customer-sms-wallet',
+  'customer-analytics',
   'agency-dashboard', 'agency-settings', 'agency-employees', 'agency-profile',
   'agency-reviews', 'agency-subscription', 'agency-branches', 'agency-devices',
   'agency-analytics',

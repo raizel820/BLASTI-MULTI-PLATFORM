@@ -24,6 +24,7 @@ import { AdminFaqManager } from '@/components/admin/admin-faq-manager';
 import { SystemSettingsConfig } from '@/components/admin/admin-settings-config';
 import { AdminPaymentEngine } from '@/components/admin/admin-payment-engine';
 import { AdminProvidersSettings } from '@/components/admin/admin-providers-settings';
+import { AdminMapsSettings } from '@/components/admin/admin-maps-settings';
 
 // ─── Animation variants ───────────────────────────────────────────
 const fadeUp = {
@@ -133,6 +134,11 @@ export function AdminSettings() {
       {/* ─── Notifications & Providers hub (SMS · Email · WhatsApp · Templates · Logs) ─── */}
       <motion.div {...fadeUp} transition={{ delay: 0.1 }}>
         <AdminProvidersSettings />
+      </motion.div>
+
+      {/* ─── Maps & Location (Task 51-c — provider / geocoding / directions / status) ─── */}
+      <motion.div {...fadeUp} transition={{ delay: 0.2 }}>
+        <AdminMapsSettings />
       </motion.div>
 
       {/* ─── Gateway/Payment Settings ─── */}

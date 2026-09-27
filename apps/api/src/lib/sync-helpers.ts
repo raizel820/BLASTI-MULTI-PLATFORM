@@ -540,6 +540,25 @@ export function projectUserSyncDto(user: any): Record<string, any> {
   return out
 }
 
+/**
+ * Task 51 — Agency Location & Maps: sync coverage of the 8 new Agency
+ * location columns (latitude, longitude, postalCode, locationVerified,
+ * locationSource, locationUpdatedAt, googlePlaceId, providerLocationId).
+ *
+ * NOTE: there is deliberately NO AGENCY_SYNC_FIELDS allow-list equivalent to
+ * USER_SYNC_FIELDS. Agency records carry no auth secrets, so the pull feed
+ * serializes the FULL scalar row (scalarizeRecord below — relations are
+ * dropped, every scalar column incl. the 8 location fields flows through
+ * automatically), and desktop→cloud pushes are gated per-field by
+ * SYNC_REGISTRY.Agency.mutableFields in packages/core/src/sync-registry.ts
+ * (extended with the same 8 fields — regenerate sync-registry.json when
+ * touching it). Agency.locationUpdatedAt ends in "At", so the cloud-side
+ * sanitizeDateStrings() helper and the registry dateFields list both treat
+ * it as a Date field (ISO string ⇄ Date) on the wire. Spec §41: location
+ * changes are ordinary business mutations riding the existing v2 engine —
+ * no second location sync mechanism.
+ */
+
 /** Strip redacted fields from a wire record (mutates a shallow copy). */
 export function redactRecord(model: string, record: any): any {
   const fields = REDACTED_FIELDS[model]

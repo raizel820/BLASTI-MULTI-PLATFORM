@@ -14,7 +14,16 @@ function hashPassword(password: string): string {
 }
 
 /**
- * Task 34 — FRESH-START SEED (amended by Task 38).
+ * Task 34 — FRESH-START SEED (amended by Task 38, Task 47, Task 55).
+ *
+ * Task 55 — full reset semantics: this seed is the ONE canonical way to reset
+ * the platform to a pristine state. It wipes EVERY table (including the
+ * data-consumption ledger) and leaves exactly ONE fresh agency owner + ONE
+ * fresh agency (plus the platform admin + plan catalog the flows require).
+ * Pair it with the .db-generation.json epoch stamp (scripts that reseed should
+ * write {epoch, ready:false} before and {epoch, ready:true} after) so every
+ * pre-reset browser/desktop session is force-invalidated (Task 36) and the
+ * desktop's stale-generation pre-flight (Task 48) wipes its local mirror.
  *
  * Seeds ONLY platform-admin data plus ONE untouched agency account:
  *   1. The single SUPER_ADMIN account → admin / admin123 (admin@blasti.dz)
@@ -46,7 +55,7 @@ function hashPassword(password: string): string {
  * webapp and desktop are hardened against.
  */
 async function seed() {
-  console.log('🌱 Seeding database (fresh platform setup — admin + one fresh agency)...');
+  console.log('🌱 Seeding database (fresh platform setup — admin + one fresh agency owner + one agency)...');
 
   // ─── Clean up ALL existing data (children first, parents last) ─────────────────
   console.log('🧹 Cleaning existing data...');
@@ -97,6 +106,9 @@ async function seed() {
   await db.notificationTemplate.deleteMany();
   await db.systemSetting.deleteMany();
   await db.appVersion.deleteMany();
+  // Task 55 — data-consumption ledger: always reset with everything else so a
+  // fresh platform starts with a pristine (empty) usage history.
+  await db.dataUsageEvent.deleteMany();
   await db.agency.deleteMany();
   await db.user.deleteMany();
   await db.planFeature.deleteMany();
@@ -354,6 +366,7 @@ async function seed() {
   console.log('   📋 Plans: FREE (0 DZD) · BASIC (2,000 DZD/mo) · PREMIUM (5,000 DZD/mo)');
   console.log('      Period discounts: 6 months -5% · 12 months -10% · 24 months -20%');
   console.log('   🚫 No customers / demo data — the agency is exactly as if just created');
+  console.log('   📊 Data-consumption ledger wiped — analytics restart from zero');
 }
 
 seed()

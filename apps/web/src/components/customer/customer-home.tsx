@@ -106,6 +106,12 @@ interface AgencyDetail {
   averageRating?: number;
   reviewCount?: number;
   subscriptionStatus?: string;
+  // Task 51-b: canonical agency location (spec §2) — flows through to the
+  // detail sheet's map + Get Directions when present.
+  latitude?: number | null;
+  longitude?: number | null;
+  postalCode?: string | null;
+  locationVerified?: string | null;
 }
 
 // categoryKeys (25 built-ins, ALL first) now lives in ./home/types.ts and is

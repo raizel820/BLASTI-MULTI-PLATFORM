@@ -1,9 +1,19 @@
 import { Hono } from 'hono'
-import { db, dbRaw } from '@blasti/db'
+import { db, dbRaw, Prisma } from '@blasti/db'
 import { requireAuth, requireAdmin, authErrorResponse } from '../lib/auth'
 import { validateBody, adminCreateAgencySchema, adminUserActionSchema, faqSchema, paymentSettingsSchema, createSubscriptionPlanSchema, updateSubscriptionPlanSchema, createHardwareProductSchema, updateHardwareProductSchema, updateHardwareSettingsSchema, updateHardwareCommitmentTierSchema, updateEnterpriseRequestStatusSchema, createEnterprisePlanFromRequestSchema } from '../lib/validations'
 import { getTodayStart, getTodayEnd } from '../lib/date-utils'
 import { computeAnalyticsDashboard, DASHBOARD_PERIODS, round1, type AnalyticsDashboardPayload, type DashboardPeriod } from '../lib/analytics-dashboard'
+import {
+  aggregateReservations,
+  groupReservationStats,
+  resolvePeriodFromQuery,
+  resolvedWindowPayload,
+  rateOf,
+  hoursSpan,
+} from '../lib/analytics-engine'
+import { getMapsSettingsAdmin, validateMapsSettingsPayload, applyMapsSettingsWrites, validateGoogleMaps, validateOpenFreeMap, validateGeocoding, type MapsValidationResult } from '../lib/map-settings'
+import { getSettingRaw } from '../lib/config-manager'
 import { z } from 'zod'
 import { scryptSync } from 'crypto'
 import path from 'path'
@@ -537,6 +547,184 @@ function avgPerAgency(n: number, d: number): number {
   return round1(n / d)
 }
 
+/**
+ * Task 54-a: extracted (unchanged) body of the legacy dashboard handler so the
+ * new GET /analytics/overview section endpoint can serve the identical payload
+ * (plus additive platform user counters) without duplicating the logic.
+ */
+async function buildSuperAdminDashboard(period: DashboardPeriod, scope: 'global' | 'average') {
+  const base = await computeAnalyticsDashboard({ agencyId: null, period })
+  const rangeStart = new Date(base.range.start)
+  const rangeEnd = new Date(base.range.end)
+
+  // ── Platform block (ALWAYS raw global numbers, never averaged) ──────────
+  const [
+    totalAgencies,
+    activeAgencies,
+    totalCustomers,
+    newCustomersInPeriod,
+    totalReservationsAllTime,
+    allTimeWalkInCount,
+    allTimeOnlineCount,
+  ] = await Promise.all([
+    db.agency.count(),
+    db.agency.count({ where: { isActive: true } }),
+    db.user.count({ where: { role: 'CUSTOMER' } }),
+    db.user.count({ where: { role: 'CUSTOMER', createdAt: { gte: rangeStart, lte: rangeEnd } } }),
+    db.reservation.count(),
+    db.reservation.count({ where: { isWalkIn: true } }),
+    db.reservation.count({ where: { isWalkIn: false, userId: { not: null } } }),
+  ])
+
+  const platform = {
+    totalAgencies,
+    activeAgencies,
+    totalCustomers,
+    newCustomersInPeriod,
+    totalReservationsAllTime,
+    onlineRateAllTime: totalReservationsAllTime > 0 ? round1((allTimeOnlineCount / totalReservationsAllTime) * 100) : 0,
+    walkInRateAllTime: totalReservationsAllTime > 0 ? round1((allTimeWalkInCount / totalReservationsAllTime) * 100) : 0,
+  }
+
+  // ── Top agencies (raw global values — top 8 by reservations in period) ──
+  const topRows = await db.reservation.findMany({
+    where: { joinedAt: { gte: rangeStart, lte: rangeEnd } },
+    select: {
+      agencyId: true,
+      status: true,
+      isWalkIn: true,
+      userId: true,
+      joinedAt: true,
+      calledAt: true,
+      rating: true,
+    },
+  })
+
+  interface TopAgencyAgg { total: number; completed: number; walkInCount: number; onlineCount: number; waitSumMs: number; waitCount: number; ratingSum: number; ratingCount: number }
+  const topAggs = new Map<string, TopAgencyAgg>()
+  for (const r of topRows) {
+    const a = topAggs.get(r.agencyId) || { total: 0, completed: 0, walkInCount: 0, onlineCount: 0, waitSumMs: 0, waitCount: 0, ratingSum: 0, ratingCount: 0 }
+    a.total++
+    if (r.status === 'COMPLETED') a.completed++
+    if (r.isWalkIn) a.walkInCount++
+    else if (r.userId) a.onlineCount++
+    if (r.calledAt) {
+      a.waitSumMs += r.calledAt.getTime() - r.joinedAt.getTime()
+      a.waitCount++
+    }
+    if (r.rating !== null && r.rating >= 1 && r.rating <= 5) {
+      a.ratingSum += r.rating
+      a.ratingCount++
+    }
+    topAggs.set(r.agencyId, a)
+  }
+
+  const topEntries = Array.from(topAggs.entries())
+    .sort(([idA, a], [idB, b]) => b.total - a.total || idA.localeCompare(idB))
+    .slice(0, 8)
+
+  const topAgencyInfos = topEntries.length
+    ? await db.agency.findMany({
+        where: { id: { in: topEntries.map(([id]) => id) } },
+        select: { id: true, name: true, customCode: true, category: true },
+      })
+    : []
+  const topInfoMap = new Map(topAgencyInfos.map((a) => [a.id, a]))
+
+  const topAgencies = topEntries.map(([agencyId, a]) => {
+    const info = topInfoMap.get(agencyId)
+    return {
+      agencyId,
+      name: info?.name ?? 'Unknown',
+      customCode: info?.customCode ?? null,
+      category: info?.category ?? null,
+      total: a.total,
+      completed: a.completed,
+      completionRate: a.total > 0 ? round1((a.completed / a.total) * 100) : 0,
+      onlineCount: a.onlineCount,
+      walkInCount: a.walkInCount,
+      onlineRate: a.total > 0 ? round1((a.onlineCount / a.total) * 100) : 0,
+      walkInRate: a.total > 0 ? round1((a.walkInCount / a.total) * 100) : 0,
+      avgWaitMinutes: a.waitCount > 0 ? round1(a.waitSumMs / a.waitCount / 60000) : null,
+      avgRating: a.ratingCount > 0 ? round1(a.ratingSum / a.ratingCount) : null,
+    }
+  })
+
+  // ── Assemble the response (average scope divides COUNT metrics only) ────
+  let data: AnalyticsDashboardPayload & {
+    scope: 'global' | 'average'
+    topAgencies: typeof topAgencies
+    platform: typeof platform
+  }
+
+  if (scope === 'average' && activeAgencies > 0) {
+    const d = activeAgencies
+    data = {
+      ...base,
+      scope,
+      kpis: {
+        ...base.kpis,
+        total: avgPerAgency(base.kpis.total, d),
+        completed: avgPerAgency(base.kpis.completed, d),
+        cancelled: avgPerAgency(base.kpis.cancelled, d),
+        noShow: avgPerAgency(base.kpis.noShow, d),
+        walkInCount: avgPerAgency(base.kpis.walkInCount, d),
+        onlineCount: avgPerAgency(base.kpis.onlineCount, d),
+        ratingCount: avgPerAgency(base.kpis.ratingCount, d),
+        uniqueCustomers: avgPerAgency(base.kpis.uniqueCustomers, d),
+        // rates / averages / deltas stay as the global values
+      },
+      timeseries: base.timeseries.map((p) => ({
+        ...p,
+        total: avgPerAgency(p.total, d),
+        completed: avgPerAgency(p.completed, d),
+        cancelled: avgPerAgency(p.cancelled, d),
+        noShow: avgPerAgency(p.noShow, d),
+        walkIn: avgPerAgency(p.walkIn, d),
+        online: avgPerAgency(p.online, d),
+        // avgWaitMinutes (an average) stays global
+      })),
+      statusDistribution: base.statusDistribution.map((s) => ({ ...s, count: avgPerAgency(s.count, d) })),
+      hourlyTraffic: base.hourlyTraffic.map((h) => ({ ...h, count: avgPerAgency(h.count, d) })),
+      weekdayHourMatrix: base.weekdayHourMatrix.map((m) => ({ ...m, count: avgPerAgency(m.count, d) })),
+      services: base.services.map((s) => ({
+        ...s,
+        count: avgPerAgency(s.count, d),
+        completed: avgPerAgency(s.completed, d),
+        cancelled: avgPerAgency(s.cancelled, d),
+        noShow: avgPerAgency(s.noShow, d),
+        // completionRate / avgWaitMinutes stay global
+      })),
+      ratings: {
+        ...base.ratings,
+        count: avgPerAgency(base.ratings.count, d),
+        distribution: base.ratings.distribution.map((r) => ({ ...r, count: avgPerAgency(r.count, d) })),
+        // average stays global
+      },
+      channel: {
+        ...base.channel,
+        onlineCount: avgPerAgency(base.channel.onlineCount, d),
+        walkInCount: avgPerAgency(base.channel.walkInCount, d),
+        total: avgPerAgency(base.channel.total, d),
+        // onlineRate / walkInRate stay global
+        daily: base.channel.daily.map((p) => ({
+          date: p.date,
+          online: avgPerAgency(p.online, d),
+          walkIn: avgPerAgency(p.walkIn, d),
+        })),
+      },
+      topAgencies,
+      platform,
+    }
+  } else {
+    // scope=global (default) — and scope=average with 0 active agencies
+    // returns the global values unchanged.
+    data = { ...base, scope, topAgencies, platform }
+  }
+
+  return data
+}
+
 app.get('/analytics/dashboard', async (c) => {
   try {
     await requireAdmin(c)
@@ -547,175 +735,7 @@ app.get('/analytics/dashboard', async (c) => {
       : '30d'
     const scope = c.req.query('scope') === 'average' ? 'average' : 'global'
 
-    const base = await computeAnalyticsDashboard({ agencyId: null, period })
-    const rangeStart = new Date(base.range.start)
-    const rangeEnd = new Date(base.range.end)
-
-    // ── Platform block (ALWAYS raw global numbers, never averaged) ──────────
-    const [
-      totalAgencies,
-      activeAgencies,
-      totalCustomers,
-      newCustomersInPeriod,
-      totalReservationsAllTime,
-      allTimeWalkInCount,
-      allTimeOnlineCount,
-    ] = await Promise.all([
-      db.agency.count(),
-      db.agency.count({ where: { isActive: true } }),
-      db.user.count({ where: { role: 'CUSTOMER' } }),
-      db.user.count({ where: { role: 'CUSTOMER', createdAt: { gte: rangeStart, lte: rangeEnd } } }),
-      db.reservation.count(),
-      db.reservation.count({ where: { isWalkIn: true } }),
-      db.reservation.count({ where: { isWalkIn: false, userId: { not: null } } }),
-    ])
-
-    const platform = {
-      totalAgencies,
-      activeAgencies,
-      totalCustomers,
-      newCustomersInPeriod,
-      totalReservationsAllTime,
-      onlineRateAllTime: totalReservationsAllTime > 0 ? round1((allTimeOnlineCount / totalReservationsAllTime) * 100) : 0,
-      walkInRateAllTime: totalReservationsAllTime > 0 ? round1((allTimeWalkInCount / totalReservationsAllTime) * 100) : 0,
-    }
-
-    // ── Top agencies (raw global values — top 8 by reservations in period) ──
-    const topRows = await db.reservation.findMany({
-      where: { joinedAt: { gte: rangeStart, lte: rangeEnd } },
-      select: {
-        agencyId: true,
-        status: true,
-        isWalkIn: true,
-        userId: true,
-        joinedAt: true,
-        calledAt: true,
-        rating: true,
-      },
-    })
-
-    interface TopAgencyAgg { total: number; completed: number; walkInCount: number; onlineCount: number; waitSumMs: number; waitCount: number; ratingSum: number; ratingCount: number }
-    const topAggs = new Map<string, TopAgencyAgg>()
-    for (const r of topRows) {
-      const a = topAggs.get(r.agencyId) || { total: 0, completed: 0, walkInCount: 0, onlineCount: 0, waitSumMs: 0, waitCount: 0, ratingSum: 0, ratingCount: 0 }
-      a.total++
-      if (r.status === 'COMPLETED') a.completed++
-      if (r.isWalkIn) a.walkInCount++
-      else if (r.userId) a.onlineCount++
-      if (r.calledAt) {
-        a.waitSumMs += r.calledAt.getTime() - r.joinedAt.getTime()
-        a.waitCount++
-      }
-      if (r.rating !== null && r.rating >= 1 && r.rating <= 5) {
-        a.ratingSum += r.rating
-        a.ratingCount++
-      }
-      topAggs.set(r.agencyId, a)
-    }
-
-    const topEntries = Array.from(topAggs.entries())
-      .sort(([idA, a], [idB, b]) => b.total - a.total || idA.localeCompare(idB))
-      .slice(0, 8)
-
-    const topAgencyInfos = topEntries.length
-      ? await db.agency.findMany({
-          where: { id: { in: topEntries.map(([id]) => id) } },
-          select: { id: true, name: true, customCode: true, category: true },
-        })
-      : []
-    const topInfoMap = new Map(topAgencyInfos.map((a) => [a.id, a]))
-
-    const topAgencies = topEntries.map(([agencyId, a]) => {
-      const info = topInfoMap.get(agencyId)
-      return {
-        agencyId,
-        name: info?.name ?? 'Unknown',
-        customCode: info?.customCode ?? null,
-        category: info?.category ?? null,
-        total: a.total,
-        completed: a.completed,
-        completionRate: a.total > 0 ? round1((a.completed / a.total) * 100) : 0,
-        onlineCount: a.onlineCount,
-        walkInCount: a.walkInCount,
-        onlineRate: a.total > 0 ? round1((a.onlineCount / a.total) * 100) : 0,
-        walkInRate: a.total > 0 ? round1((a.walkInCount / a.total) * 100) : 0,
-        avgWaitMinutes: a.waitCount > 0 ? round1(a.waitSumMs / a.waitCount / 60000) : null,
-        avgRating: a.ratingCount > 0 ? round1(a.ratingSum / a.ratingCount) : null,
-      }
-    })
-
-    // ── Assemble the response (average scope divides COUNT metrics only) ────
-    let data: AnalyticsDashboardPayload & {
-      scope: 'global' | 'average'
-      topAgencies: typeof topAgencies
-      platform: typeof platform
-    }
-
-    if (scope === 'average' && activeAgencies > 0) {
-      const d = activeAgencies
-      data = {
-        ...base,
-        scope,
-        kpis: {
-          ...base.kpis,
-          total: avgPerAgency(base.kpis.total, d),
-          completed: avgPerAgency(base.kpis.completed, d),
-          cancelled: avgPerAgency(base.kpis.cancelled, d),
-          noShow: avgPerAgency(base.kpis.noShow, d),
-          walkInCount: avgPerAgency(base.kpis.walkInCount, d),
-          onlineCount: avgPerAgency(base.kpis.onlineCount, d),
-          ratingCount: avgPerAgency(base.kpis.ratingCount, d),
-          uniqueCustomers: avgPerAgency(base.kpis.uniqueCustomers, d),
-          // rates / averages / deltas stay as the global values
-        },
-        timeseries: base.timeseries.map((p) => ({
-          ...p,
-          total: avgPerAgency(p.total, d),
-          completed: avgPerAgency(p.completed, d),
-          cancelled: avgPerAgency(p.cancelled, d),
-          noShow: avgPerAgency(p.noShow, d),
-          walkIn: avgPerAgency(p.walkIn, d),
-          online: avgPerAgency(p.online, d),
-          // avgWaitMinutes (an average) stays global
-        })),
-        statusDistribution: base.statusDistribution.map((s) => ({ ...s, count: avgPerAgency(s.count, d) })),
-        hourlyTraffic: base.hourlyTraffic.map((h) => ({ ...h, count: avgPerAgency(h.count, d) })),
-        weekdayHourMatrix: base.weekdayHourMatrix.map((m) => ({ ...m, count: avgPerAgency(m.count, d) })),
-        services: base.services.map((s) => ({
-          ...s,
-          count: avgPerAgency(s.count, d),
-          completed: avgPerAgency(s.completed, d),
-          cancelled: avgPerAgency(s.cancelled, d),
-          noShow: avgPerAgency(s.noShow, d),
-          // completionRate / avgWaitMinutes stay global
-        })),
-        ratings: {
-          ...base.ratings,
-          count: avgPerAgency(base.ratings.count, d),
-          distribution: base.ratings.distribution.map((r) => ({ ...r, count: avgPerAgency(r.count, d) })),
-          // average stays global
-        },
-        channel: {
-          ...base.channel,
-          onlineCount: avgPerAgency(base.channel.onlineCount, d),
-          walkInCount: avgPerAgency(base.channel.walkInCount, d),
-          total: avgPerAgency(base.channel.total, d),
-          // onlineRate / walkInRate stay global
-          daily: base.channel.daily.map((p) => ({
-            date: p.date,
-            online: avgPerAgency(p.online, d),
-            walkIn: avgPerAgency(p.walkIn, d),
-          })),
-        },
-        topAgencies,
-        platform,
-      }
-    } else {
-      // scope=global (default) — and scope=average with 0 active agencies
-      // returns the global values unchanged.
-      data = { ...base, scope, topAgencies, platform }
-    }
-
+    const data = await buildSuperAdminDashboard(period, scope)
     return c.json({ success: true, data })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -758,6 +778,1178 @@ app.get('/analytics/agency/:agencyId', async (c) => {
     const payload = await computeAnalyticsDashboard({ agencyId, period })
 
     return c.json({ success: true, data: { ...payload, agency } })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── Task 54-a — SUPER ADMIN analytics sections (doc-2 spec §5-14) ───────────
+//
+// One endpoint per sidebar section (§5.1). ALL of them:
+//   - are requireAdmin (SUPER_ADMIN only — §47 permission matrix, §55 the
+//     backend must enforce authorization, hiding nav is NOT sufficient),
+//   - accept `period` (§3.1) + `from`/`to` for custom via the ONE shared
+//     resolver (resolvePeriodFromQuery → lib/analytics-dashboard.ts),
+//   - answer { success: true, data: { ...section, resolved: { period,
+//     granularity, from, to, previousFrom, previousTo } } } so the UI can
+//     label the window it is looking at,
+//   - aggregate ONLY over real models, zero-safe (empty data → zeroed
+//     counters, never errors),
+//   - round-trip their Prisma work in ONE Promise.all set (no N+1 loops).
+
+/** Minimal reservation select shared by the row-aggregating sections. */
+const SECTION_RESERVATION_SELECT = {
+  status: true,
+  joinedAt: true,
+  calledAt: true,
+  completedAt: true,
+  cancelledAt: true,
+  isWalkIn: true,
+  userId: true,
+  serviceId: true,
+  counterId: true,
+  agencyId: true,
+} as const
+
+/** Optional org filters (§3.2, super-admin = full chain). */
+async function buildSectionReservationWhere(c: { req: { query: (k: string) => string | undefined } }): Promise<Record<string, unknown>> {
+  const where: Record<string, unknown> = {}
+  const agencyId = c.req.query('agencyId')
+  const category = c.req.query('category')
+  const wilaya = c.req.query('wilaya')
+  if (category || wilaya) {
+    const scoped = await db.agency.findMany({
+      where: {
+        ...(category ? { category } : {}),
+        ...(wilaya ? { wilaya } : {}),
+      },
+      select: { id: true },
+    })
+    where.agencyId = { in: scoped.map((a) => a.id) }
+    if (agencyId) where.agencyId = agencyId
+  } else if (agencyId) {
+    where.agencyId = agencyId
+  }
+  const serviceId = c.req.query('serviceId')
+  if (serviceId) where.serviceId = serviceId
+  const counterId = c.req.query('counterId')
+  if (counterId) where.counterId = counterId
+  const branchId = c.req.query('branchId')
+  const staffId = c.req.query('staffId')
+  if (branchId || staffId) {
+    const counterFilter: Record<string, unknown> = {}
+    if (branchId) counterFilter.branchId = branchId
+    if (staffId) counterFilter.staffId = staffId
+    where.counter = counterFilter
+  }
+  const status = c.req.query('status')
+  if (status) where.status = status
+  const channel = c.req.query('channel')
+  if (channel === 'walkIn') where.isWalkIn = true
+  if (channel === 'online') where.isWalkIn = false
+  return where
+}
+
+/** Zero-filled count timeseries from raw date rows at the range granularity. */
+function timeseriesFromDates(dates: Date[], range: { bucketKeys: string[]; granularity: string }): Array<{ bucket: string; count: number }> {
+  const counts = new Map<string, number>()
+  for (const key of range.bucketKeys) counts.set(key, 0)
+  for (const d of dates) {
+    const key = range.granularity === 'hourly'
+      ? `${utcDateKeyOf(d)}T${String(d.getUTCHours()).padStart(2, '0')}`
+      : range.granularity === 'monthly'
+        ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+        : utcDateKeyOf(d)
+    if (counts.has(key)) counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+  return Array.from(counts.entries()).map(([bucket, count]) => ({ bucket, count }))
+}
+
+function utcDateKeyOf(d: Date): string {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`
+}
+
+// GET /admin/analytics/overview — §6 Platform Overview.
+// Same payload as the legacy /analytics/dashboard (shared builder) plus
+// ADDITIVE platform user counters (totalUsers/newUsersInPeriod/byRoleCounts)
+// — older consumers ignore unknown keys safely. Accepts the full §3.1 period
+// set; legacy 4 periods map to the untouched dashboard engine, the rest run
+// through the shared resolver for the `resolved` window block.
+app.get('/analytics/overview', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const legacy: DashboardPeriod = pq.period === '7d' || pq.period === '30d' || pq.period === '90d' || pq.period === '12m'
+      ? pq.period
+      : '30d'
+    const scope = c.req.query('scope') === 'average' ? 'average' : 'global'
+    const data = await buildSuperAdminDashboard(legacy, scope)
+
+    // Additive platform user counters (§6: total/new users + role mix).
+    const rangeStart = pq.range.start
+    const rangeEnd = pq.range.end
+    const [totalUsers, newUsersInPeriod, roleGroups] = await Promise.all([
+      db.user.count(),
+      db.user.count({ where: { createdAt: { gte: rangeStart, lte: rangeEnd } } }),
+      db.user.groupBy({ by: ['role'], _count: { id: true } }),
+    ])
+    const byRoleCounts: Record<string, number> = {}
+    for (const g of roleGroups) byRoleCounts[g.role] = g._count.id
+
+    return c.json({
+      success: true,
+      data: {
+        ...data,
+        resolved: resolvedWindowPayload(pq.range),
+        platform: {
+          ...data.platform,
+          totalUsers,
+          newUsersInPeriod,
+          byRoleCounts,
+        },
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/users — §11 User Analytics.
+app.get('/analytics/users', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+    const roleFilter = c.req.query('role')
+
+    const now = new Date()
+    const [totalUsers, activeUsers, suspendedUsers, verifiedUsers, newUsersInPeriod, byRole, newByRole, newRows, dau, wau, mau] = await Promise.all([
+      db.user.count(),
+      db.user.count({ where: { isActive: true } }),
+      db.user.count({ where: { isActive: false } }),
+      db.user.count({ where: { OR: [{ emailVerified: true }, { phoneVerified: true }] } }),
+      db.user.count({ where: { createdAt: { gte: start, lte: end } } }),
+      db.user.groupBy({ by: ['role'], _count: { id: true } }),
+      db.user.groupBy({ by: ['role'], where: { createdAt: { gte: start, lte: end } }, _count: { id: true } }),
+      db.user.findMany({ where: { createdAt: { gte: start, lte: end } }, select: { createdAt: true } }),
+      // Activity proxies (§11 DAU/WAU/MAU) = distinct users with ≥1 reservation
+      // in the trailing 24h / 7d / 30d windows.
+      db.reservation.findMany({ where: { joinedAt: { gte: new Date(now.getTime() - 24 * 3600e3) }, userId: { not: null } }, select: { userId: true }, distinct: ['userId'] }),
+      db.reservation.findMany({ where: { joinedAt: { gte: new Date(now.getTime() - 7 * 24 * 3600e3) }, userId: { not: null } }, select: { userId: true }, distinct: ['userId'] }),
+      db.reservation.findMany({ where: { joinedAt: { gte: new Date(now.getTime() - 30 * 24 * 3600e3) }, userId: { not: null } }, select: { userId: true }, distinct: ['userId'] }),
+    ])
+
+    const byRoleCounts: Record<string, number> = {}
+    for (const g of byRole) byRoleCounts[g.role] = g._count.id
+    const newByRoleCounts: Record<string, number> = {}
+    for (const g of newByRole) newByRoleCounts[g.role] = g._count.id
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        ...(roleFilter ? { filters: { role: roleFilter } } : {}),
+        totals: {
+          totalUsers,
+          activeUsers,
+          suspendedUsers,
+          verifiedUsers,
+          unverifiedUsers: totalUsers - verifiedUsers,
+          newUsersInPeriod,
+        },
+        byRole: byRoleCounts,
+        newByRole: newByRoleCounts,
+        activity: {
+          dau: dau.length,
+          wau: wau.length,
+          mau: mau.length,
+        },
+        newUsersTimeseries: timeseriesFromDates(newRows.map((r) => r.createdAt), pq.range),
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/agencies — Agencies section (§5.1).
+app.get('/analytics/agencies', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [total, active, inactive, byCategory, byTier, byStatus, newInPeriod, newRows, totalBranches, totalServices, totalCounters] = await Promise.all([
+      db.agency.count(),
+      db.agency.count({ where: { isActive: true } }),
+      db.agency.count({ where: { isActive: false } }),
+      db.agency.groupBy({ by: ['category'], _count: { id: true } }),
+      db.agency.groupBy({ by: ['subscriptionTier'], _count: { id: true } }),
+      db.agency.groupBy({ by: ['subscriptionStatus'], _count: { id: true } }),
+      db.agency.count({ where: { createdAt: { gte: start, lte: end } } }),
+      db.agency.findMany({ where: { createdAt: { gte: start, lte: end } }, select: { createdAt: true } }),
+      db.branch.count(),
+      db.service.count(),
+      db.counter.count(),
+    ])
+
+    const dist = (groups: Array<Record<string, unknown>>) => {
+      const out: Record<string, number> = {}
+      for (const g of groups as Array<{ [k: string]: string | number } & { _count: { id: number } }>) {
+        const key = ('category' in g ? g.category : 'subscriptionTier' in g ? g.subscriptionTier : g.subscriptionStatus) as string
+        out[key] = g._count.id
+      }
+      return out
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: { total, active, inactive, pendingApprovals: 0, newInPeriod },
+        byCategory: dist(byCategory),
+        bySubscriptionTier: dist(byTier),
+        bySubscriptionStatus: dist(byStatus),
+        newAgenciesTimeseries: timeseriesFromDates(newRows.map((r) => r.createdAt), pq.range),
+        platform: { totalBranches, totalServices, totalCounters },
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/categories — §7 Category Analytics (platform-wide,
+// database-driven from AgencyCategory + the Agency.category strings).
+app.get('/analytics/categories', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [categoryRows, agencyRows, reservationRows, branchRows, serviceRows, counterRows, staffRows] = await Promise.all([
+      db.agencyCategory.findMany({ select: { name: true } }),
+      db.agency.findMany({ select: { id: true, category: true, createdAt: true, isActive: true } }),
+      db.reservation.findMany({ where: { joinedAt: { gte: start, lte: end } }, select: { agencyId: true, status: true, joinedAt: true, calledAt: true } }),
+      db.branch.findMany({ select: { id: true, agencyId: true } }),
+      db.service.findMany({ select: { id: true, agencyId: true } }),
+      db.counter.findMany({ select: { id: true, branchId: true } }),
+      db.agencyStaff.findMany({ select: { id: true, agencyId: true, isActive: true } }),
+    ])
+
+    const categoryByAgency = new Map(agencyRows.map((a) => [a.id, a.category]))
+    const knownCategories = new Set(categoryRows.map((c) => c.name))
+    for (const a of agencyRows) knownCategories.add(a.category)
+
+    interface CategoryAgg {
+      agencies: number
+      activeAgencies: number
+      newAgencies: number
+      branches: number
+      services: number
+      counters: number
+      staff: number
+      activeStaff: number
+      reservations: number
+      completed: number
+      cancelled: number
+      noShow: number
+      waitMs: number
+      waitCount: number
+    }
+    const aggs = new Map<string, CategoryAgg>()
+    const ensure = (cat: string): CategoryAgg => {
+      let a = aggs.get(cat)
+      if (!a) {
+        a = { agencies: 0, activeAgencies: 0, newAgencies: 0, branches: 0, services: 0, counters: 0, staff: 0, activeStaff: 0, reservations: 0, completed: 0, cancelled: 0, noShow: 0, waitMs: 0, waitCount: 0 }
+        aggs.set(cat, a)
+      }
+      return a
+    }
+    for (const cat of knownCategories) ensure(cat)
+
+    for (const a of agencyRows) {
+      const agg = ensure(a.category)
+      agg.agencies++
+      if (a.isActive) agg.activeAgencies++
+      if (a.createdAt >= start && a.createdAt <= end) agg.newAgencies++
+    }
+    const branchAgency = new Map(branchRows.map((b) => [b.id, b.agencyId]))
+    for (const b of branchRows) {
+      const cat = categoryByAgency.get(b.agencyId)
+      if (cat) ensure(cat).branches++
+    }
+    for (const s of serviceRows) {
+      const cat = categoryByAgency.get(s.agencyId)
+      if (cat) ensure(cat).services++
+    }
+    for (const ct of counterRows) {
+      const agencyId = branchAgency.get(ct.branchId)
+      const cat = agencyId ? categoryByAgency.get(agencyId) : undefined
+      if (cat) ensure(cat).counters++
+    }
+    for (const st of staffRows) {
+      const cat = categoryByAgency.get(st.agencyId)
+      if (cat) {
+        ensure(cat).staff++
+        if (st.isActive) ensure(cat).activeStaff++
+      }
+    }
+    for (const r of reservationRows) {
+      const cat = categoryByAgency.get(r.agencyId)
+      if (!cat) continue
+      const agg = ensure(cat)
+      agg.reservations++
+      if (r.status === 'COMPLETED') agg.completed++
+      if (r.status === 'CANCELLED') agg.cancelled++
+      if (r.status === 'NO_SHOW') agg.noShow++
+      if (r.calledAt) {
+        agg.waitMs += r.calledAt.getTime() - r.joinedAt.getTime()
+        agg.waitCount++
+      }
+    }
+
+    const categories = Array.from(aggs.entries())
+      .map(([category, a]) => ({
+        category,
+        agencies: a.agencies,
+        activeAgencies: a.activeAgencies,
+        newAgencies: a.newAgencies,
+        branches: a.branches,
+        services: a.services,
+        counters: a.counters,
+        staff: a.staff,
+        activeStaff: a.activeStaff,
+        reservations: a.reservations,
+        completed: a.completed,
+        cancelled: a.cancelled,
+        noShow: a.noShow,
+        completionRate: rateOf(a.completed, a.reservations),
+        cancellationRate: rateOf(a.cancelled, a.reservations),
+        noShowRate: rateOf(a.noShow, a.reservations),
+        avgWaitMinutes: a.waitCount > 0 ? round1(a.waitMs / a.waitCount / 60000) : null,
+      }))
+      .sort((x, y) => y.reservations - x.reservations || x.category.localeCompare(y.category))
+
+    return c.json({ success: true, data: { resolved: resolvedWindowPayload(pq.range), categories } })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/reservations — §8 Reservation Analytics.
+app.get('/analytics/reservations', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const scopeWhere = await buildSectionReservationWhere(c)
+    const [rows, counterRows, serviceRows, agencyRows, branchRows] = await Promise.all([
+      db.reservation.findMany({
+        where: { ...scopeWhere, joinedAt: { gte: pq.range.start, lte: pq.range.end } },
+        select: SECTION_RESERVATION_SELECT,
+      }),
+      db.counter.findMany({ select: { id: true, branchId: true, branch: { select: { name: true } } } }),
+      db.service.findMany({ select: { id: true, name: true } }),
+      db.agency.findMany({ select: { id: true, name: true, customCode: true, category: true } }),
+      db.branch.findMany({ select: { id: true, name: true } }),
+    ])
+
+    const agg = aggregateReservations(rows, pq.range)
+
+    const counterToBranch = new Map(counterRows.map((ct) => [ct.id, { branchId: ct.branchId, branchName: ct.branch.name }]))
+    const branchName = new Map(branchRows.map((b) => [b.id, b.name]))
+    const serviceName = new Map(serviceRows.map((s) => [s.id, s.name]))
+    const agencyName = new Map(agencyRows.map((a) => [a.id, a]))
+
+    const branchStats = groupReservationStats(rows, (r) => {
+      const info = r.counterId ? counterToBranch.get(r.counterId) : undefined
+      return info ? info.branchId : null
+    })
+      .map((s) => ({ branchId: s.key, name: branchName.get(s.key) ?? 'Unknown branch', ...s }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10)
+
+    const serviceStats = groupReservationStats(rows, (r) => r.serviceId)
+      .map((s) => ({ serviceId: s.key, name: serviceName.get(s.key) ?? 'Unknown service', ...s }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10)
+
+    const agencyStats = groupReservationStats(rows, (r) => r.agencyId)
+      .map((s) => {
+        const info = agencyName.get(s.key)
+        return { agencyId: s.key, name: info?.name ?? 'Unknown', customCode: info?.customCode ?? null, category: info?.category ?? null, ...s }
+      })
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10)
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        kpis: agg.kpis,
+        statusDistribution: agg.statusDistribution,
+        channel: {
+          onlineCount: agg.kpis.onlineCount,
+          walkInCount: agg.kpis.walkInCount,
+          total: agg.kpis.total,
+          onlineRate: agg.kpis.onlineRate,
+          walkInRate: agg.kpis.walkInRate,
+          daily: agg.timeseries.map((t) => ({ bucket: t.bucket, online: t.online, walkIn: t.walkIn })),
+        },
+        timeseries: agg.timeseries,
+        hourlyTraffic: agg.hourlyTraffic,
+        weekdayTraffic: agg.weekdayTraffic,
+        peak: agg.peak,
+        topBranches: branchStats,
+        topServices: serviceStats,
+        topAgencies: agencyStats,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/queues — §9 Queue Analytics (platform).
+app.get('/analytics/queues', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+    const now = new Date()
+    const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0))
+
+    const [openAgencies, pausedAgencies, rows, servedToday, liveStatus] = await Promise.all([
+      db.agency.count({ where: { isQueueOpen: true } }),
+      db.queueSettings.findMany({ where: { isPaused: true }, select: { agencyId: true } }),
+      db.reservation.findMany({ where: { joinedAt: { gte: start, lte: end } }, select: { status: true, joinedAt: true, calledAt: true, completedAt: true } }),
+      db.reservation.count({ where: { status: 'COMPLETED', completedAt: { gte: todayStart, lte: now } } }),
+      db.reservation.groupBy({ by: ['status'], where: { status: { in: ['WAITING', 'CALLED', 'SERVING'] } }, _count: { id: true } }),
+    ])
+
+    const agg = aggregateReservations(rows.map((r) => ({ ...r, isWalkIn: false, cancelledAt: null })), pq.range)
+    const liveCounts: Record<string, number> = { WAITING: 0, CALLED: 0, SERVING: 0 }
+    for (const g of liveStatus) liveCounts[g.status] = g._count.id
+
+    const callsInPeriod = rows.filter((r) => r.calledAt !== null).length
+    const servedInPeriod = agg.kpis.completed
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        live: {
+          agenciesWithOpenQueue: openAgencies,
+          agenciesPaused: new Set(pausedAgencies.map((q) => q.agencyId)).size,
+          currentlyWaiting: liveCounts.WAITING,
+          currentlyCalled: liveCounts.CALLED,
+          currentlyServing: liveCounts.SERVING,
+        },
+        today: {
+          ticketsServedToday: servedToday,
+        },
+        period: {
+          ticketsInPeriod: agg.kpis.total,
+          ticketsServedInPeriod: servedInPeriod,
+          callsInPeriod,
+          avgWaitingTimeMinutes: agg.kpis.avgWaitMinutes,
+          medianWaitingTimeMinutes: agg.kpis.medianWaitMinutes,
+          avgServiceDurationMinutes: agg.kpis.avgServiceMinutes,
+          callsPerHour: round1(callsInPeriod / hoursSpan(start, end)),
+          customersServedPerHour: round1(servedInPeriod / hoursSpan(start, end)),
+          noShowRate: agg.kpis.noShowRate,
+          abandonmentRate: agg.kpis.noShowRate, // no separate abandonment event exists — same signal (§9)
+          hourlyCalls: agg.hourlyTraffic,
+        },
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/services — §10 Service Analytics.
+app.get('/analytics/services', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const [rows, serviceRows, totalServices, activeServices, totalAgencies] = await Promise.all([
+      db.reservation.findMany({ where: { joinedAt: { gte: pq.range.start, lte: pq.range.end } }, select: { serviceId: true, status: true, joinedAt: true, calledAt: true, completedAt: true, cancelledAt: true, isWalkIn: true, userId: true } }),
+      db.service.findMany({ select: { id: true, name: true, agencyId: true, isActive: true } }),
+      db.service.count(),
+      db.service.count({ where: { isActive: true } }),
+      db.agency.count(),
+    ])
+
+    const stats = groupReservationStats(rows, (r) => r.serviceId)
+      .map((s) => {
+        const svc = serviceRows.find((x) => x.id === s.key)
+        return { serviceId: s.key, name: svc?.name ?? 'Unknown service', agencyId: svc?.agencyId ?? null, ...s }
+      })
+      .sort((a, b) => b.count - a.count || a.serviceId.localeCompare(b.serviceId))
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: {
+          totalServices,
+          activeServices,
+          servicesPerAgencyAvg: totalAgencies > 0 ? round1(totalServices / totalAgencies) : 0,
+        },
+        topServices: stats.slice(0, 15),
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/customers — §22-scope Customers section (platform view).
+// Privacy: top customers return id + display name ONLY (§49 export security).
+app.get('/analytics/customers', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [totalCustomers, newCustomersInPeriod, activeRows, onlineRows, topRows] = await Promise.all([
+      db.user.count({ where: { role: 'CUSTOMER' } }),
+      db.user.count({ where: { role: 'CUSTOMER', createdAt: { gte: start, lte: end } } }),
+      db.reservation.findMany({ where: { joinedAt: { gte: start, lte: end }, userId: { not: null } }, select: { userId: true }, distinct: ['userId'] }),
+      db.reservation.count({ where: { joinedAt: { gte: start, lte: end }, isWalkIn: false, userId: { not: null } } }),
+      db.reservation.groupBy({ by: ['userId'], where: { joinedAt: { gte: start, lte: end }, userId: { not: null } }, _count: { id: true }, orderBy: { _count: { id: 'desc' } }, take: 10 }),
+    ])
+    // Second round-trip (needs topRows first) — ONE extra query, still no N+1.
+    const topUsers = topRows.length
+      ? await db.user.findMany({ where: { id: { in: topRows.map((t) => t.userId as string) } }, select: { id: true, fullName: true } })
+      : []
+
+    const nameMap = new Map(topUsers.map((u) => [u.id, u.fullName]))
+    const totalOnlineReservations = onlineRows
+    const reservationsPerCustomer = activeRows.length > 0 ? round1(totalOnlineReservations / activeRows.length) : 0
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: {
+          totalCustomers,
+          newCustomersInPeriod,
+          customersWithReservationInPeriod: activeRows.length,
+          reservationsPerCustomer,
+        },
+        topCustomers: topRows.map((t) => ({ userId: t.userId, name: nameMap.get(t.userId as string) ?? 'Unknown', reservations: t._count.id })),
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/subscriptions — §12 Subscription Analytics.
+app.get('/analytics/subscriptions', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+    const now = new Date()
+    const in30Days = new Date(now.getTime() + 30 * 24 * 3600e3)
+
+    const [byPlan, byTier, byStatus, activeSubscriptions, newInPeriod, expiringSoon, plansCatalog] = await Promise.all([
+      db.agency.groupBy({ by: ['subscriptionPlanId'], _count: { id: true } }),
+      db.agency.groupBy({ by: ['subscriptionTier'], _count: { id: true } }),
+      db.agency.groupBy({ by: ['subscriptionStatus'], _count: { id: true } }),
+      db.agency.count({ where: { subscriptionStatus: 'ACTIVE' } }),
+      db.agency.count({ where: { subscriptionStartsAt: { gte: start, lte: end } } }),
+      db.agency.count({ where: { subscriptionExpiresAt: { gte: now, lte: in30Days } } }),
+      db.subscriptionPlan.findMany({ where: { isActive: true }, select: { id: true, name: true, displayName: true, price: true, billingCycle: true } }),
+    ])
+
+    const planNameById = new Map(plansCatalog.map((p) => [p.id, p]))
+    const planDistribution = byPlan
+      .filter((g) => g.subscriptionPlanId !== null)
+      .map((g) => {
+        const plan = planNameById.get(g.subscriptionPlanId as string)
+        return {
+          planId: g.subscriptionPlanId,
+          name: plan?.name ?? 'Unknown plan',
+          displayName: plan?.displayName ?? null,
+          price: plan?.price ?? null,
+          billingCycle: plan?.billingCycle ?? null,
+          agencies: g._count.id,
+        }
+      })
+      .sort((a, b) => b.agencies - a.agencies)
+    const unassigned = byPlan.find((g) => g.subscriptionPlanId === null)
+
+    const tierDist: Record<string, number> = {}
+    for (const g of byTier) tierDist[g.subscriptionTier] = g._count.id
+    const statusDist: Record<string, number> = {}
+    for (const g of byStatus) statusDist[g.subscriptionStatus] = g._count.id
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: {
+          activeSubscriptions,
+          newSubscriptionsInPeriod: newInPeriod,
+          expiringWithin30Days: expiringSoon,
+          agenciesWithoutPlan: unassigned?._count.id ?? 0,
+          plansInCatalog: plansCatalog.length,
+        },
+        planDistribution,
+        byTier: tierDist,
+        byStatus: statusDist,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/payments — §13 Payment & Revenue Analytics (Transaction).
+app.get('/analytics/payments', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const rows = await db.transaction.findMany({
+      where: { createdAt: { gte: start, lte: end } },
+      select: { amount: true, amountPaid: true, priceSnapshot: true, currencySnapshot: true, status: true, paymentMethod: true, paymentProvider: true, createdAt: true },
+    })
+
+    const paidOf = (r: { amount: number; amountPaid: number | null; priceSnapshot: number | null }) => r.amountPaid ?? r.priceSnapshot ?? r.amount
+    const byStatus: Record<string, { count: number; value: number }> = {}
+    const byMethod: Record<string, { count: number; value: number }> = {}
+    const bucketValues = new Map<string, number>()
+    for (const key of pq.range.bucketKeys) bucketValues.set(key, 0)
+    let totalRevenue = 0
+    let currency: string | null = null
+
+    for (const r of rows) {
+      const value = paidOf(r)
+      if (!currency && r.currencySnapshot) currency = r.currencySnapshot
+      const s = (byStatus[r.status] ??= { count: 0, value: 0 })
+      s.count++
+      const m = (byMethod[r.paymentMethod] ??= { count: 0, value: 0 })
+      m.count++
+      if (r.status === 'APPROVED') {
+        s.value += value
+        m.value += value
+        totalRevenue += value
+        const bucketKey = pq.range.granularity === 'monthly'
+          ? `${r.createdAt.getUTCFullYear()}-${String(r.createdAt.getUTCMonth() + 1).padStart(2, '0')}`
+          : utcDateKeyOf(r.createdAt)
+        if (bucketValues.has(bucketKey)) bucketValues.set(bucketKey, (bucketValues.get(bucketKey) ?? 0) + value)
+      }
+    }
+
+    const approvedCount = byStatus.APPROVED?.count ?? 0
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: {
+          transactionsInPeriod: rows.length,
+          successfulPayments: approvedCount,
+          pendingPayments: byStatus.PENDING?.count ?? 0,
+          rejectedPayments: byStatus.REJECTED?.count ?? 0,
+          totalRevenue,
+          currency: currency ?? 'DZD',
+          avgTransactionValue: approvedCount > 0 ? round1(totalRevenue / approvedCount) : null,
+        },
+        byStatus,
+        byPaymentMethod: byMethod,
+        revenueTimeseries: Array.from(bucketValues.entries()).map(([bucket, value]) => ({ bucket, revenue: value })),
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/sms — SMS section (SmsLog + SmsPurchase).
+app.get('/analytics/sms', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [sentInPeriod, byStatus, purchaseRows, smsSettingsEnabled] = await Promise.all([
+      db.smsLog.count({ where: { createdAt: { gte: start, lte: end } } }),
+      db.smsLog.groupBy({ by: ['status'], where: { createdAt: { gte: start, lte: end } }, _count: { id: true } }),
+      db.smsPurchase.findMany({ where: { createdAt: { gte: start, lte: end } }, select: { quantity: true, price: true, status: true } }),
+      db.smsSettings.findFirst({ select: { enabled: true, provider: true } }),
+    ])
+
+    const statusCounts: Record<string, number> = {}
+    for (const g of byStatus) statusCounts[g.status] = g._count.id
+    const failed = (statusCounts.FAILED ?? 0) + (statusCounts.EXPIRED ?? 0)
+
+    const purchasedUnits = purchaseRows.reduce((sum, p) => sum + p.quantity, 0)
+    const purchasedValue = purchaseRows.reduce((sum, p) => sum + p.price, 0)
+    const purchasesByStatus: Record<string, number> = {}
+    for (const p of purchaseRows) purchasesByStatus[p.status] = (purchasesByStatus[p.status] ?? 0) + 1
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        messages: {
+          sentInPeriod,
+          delivered: statusCounts.DELIVERED ?? 0,
+          failed,
+          byStatus: statusCounts,
+        },
+        purchases: {
+          count: purchaseRows.length,
+          units: purchasedUnits,
+          value: purchasedValue,
+          byStatus: purchasesByStatus,
+        },
+        provider: { enabled: smsSettingsEnabled?.enabled ?? false, provider: smsSettingsEnabled?.provider ?? null },
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/notifications — Notifications section.
+app.get('/analytics/notifications', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [countInPeriod, byType, unreadInPeriod, totalAllTime] = await Promise.all([
+      db.notification.count({ where: { createdAt: { gte: start, lte: end } } }),
+      db.notification.groupBy({ by: ['type'], where: { createdAt: { gte: start, lte: end } }, _count: { id: true } }),
+      db.notification.count({ where: { createdAt: { gte: start, lte: end }, isRead: false } }),
+      db.notification.count(),
+    ])
+
+    const typeCounts: Record<string, number> = {}
+    for (const g of byType) typeCounts[g.type] = g._count.id
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: { countInPeriod, unreadInPeriod, totalAllTime },
+        byType: typeCounts,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/devices — Devices section (DeviceRegistration + AgencyDevice).
+app.get('/analytics/devices', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+    const now = new Date()
+    const heartbeatCutoff = new Date(now.getTime() - 15 * 60 * 1000)
+
+    const [regTotal, regNew, byPlatform, regActive, devRows, uptimeAgg] = await Promise.all([
+      db.deviceRegistration.count(),
+      db.deviceRegistration.count({ where: { createdAt: { gte: start, lte: end } } }),
+      db.deviceRegistration.groupBy({ by: ['platform'], _count: { id: true } }),
+      db.deviceRegistration.count({ where: { lastActiveAt: { gte: new Date(now.getTime() - 7 * 24 * 3600e3) } } }),
+      db.agencyDevice.findMany({ where: { OR: [{ createdAt: { gte: start, lte: end } }, { updatedAt: { gte: start, lte: end } }, { lastHeartbeatAt: { gte: start, lte: end } }, { statusChangedAt: { gte: start, lte: end } }] }, select: { status: true, type: true, lastHeartbeatAt: true, connectionType: true } }),
+      db.agencyDevice.aggregate({ _sum: { totalUptimeSec: true } }),
+    ])
+
+    const allDevices = await db.agencyDevice.count()
+    const byStatus: Record<string, number> = {}
+    const byType: Record<string, number> = {}
+    const byConnection: Record<string, number> = {}
+    for (const d of devRows) {
+      byStatus[d.status] = (byStatus[d.status] ?? 0) + 1
+      byType[d.type] = (byType[d.type] ?? 0) + 1
+      byConnection[d.connectionType] = (byConnection[d.connectionType] ?? 0) + 1
+    }
+    const onlineByHeartbeat = devRows.filter((d) => d.lastHeartbeatAt !== null && d.lastHeartbeatAt >= heartbeatCutoff).length
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        agencyDevices: {
+          total: allDevices,
+          activeInPeriod: devRows.length,
+          online: byStatus.ONLINE ?? 0,
+          offline: byStatus.OFFLINE ?? 0,
+          onlineByHeartbeat15m: onlineByHeartbeat,
+          byStatus,
+          byType,
+          byConnection,
+          totalUptimeSec: uptimeAgg._sum.totalUptimeSec ?? 0,
+        },
+        customerDevices: {
+          total: regTotal,
+          newInPeriod: regNew,
+          activeLast7d: regActive,
+          byPlatform: Object.fromEntries(byPlatform.map((g) => [g.platform, g._count.id])),
+        },
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// GET /admin/analytics/security-audit — §5.1 Security & Audit. AGGREGATE ONLY:
+// never returns raw `details` payloads (§49 export security).
+app.get('/analytics/security-audit', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const [countInPeriod, topActions, byEntityType, distinctRows] = await Promise.all([
+      db.auditLog.count({ where: { createdAt: { gte: start, lte: end } } }),
+      db.auditLog.groupBy({ by: ['action'], where: { createdAt: { gte: start, lte: end } }, _count: { id: true }, orderBy: { _count: { id: 'desc' } }, take: 10 }),
+      db.auditLog.groupBy({ by: ['entityType'], where: { createdAt: { gte: start, lte: end } }, _count: { id: true } }),
+      db.auditLog.findMany({ where: { createdAt: { gte: start, lte: end }, userId: { not: null } }, select: { userId: true }, distinct: ['userId'] }),
+    ])
+
+    const actionCounts = topActions.map((g) => ({ action: g.action, count: g._count.id }))
+    const entityCounts: Record<string, number> = {}
+    for (const g of byEntityType) entityCounts[g.entityType ?? 'UNSPECIFIED'] = g._count.id
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        totals: { eventsInPeriod: countInPeriod, distinctActors: distinctRows.length },
+        topActions: actionCounts,
+        byEntityType: entityCounts,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── Task 55-b — SUPER ADMIN Data-Consumption (doc-2 §14 + Task 55 request) ──
+//
+// GET /analytics/data-consumption — reads the DataUsageEvent ledger written by
+// the /api/* recorder middleware (index.ts) + the realtime emit instrumentation
+// (lib/realtime-emit.ts). All byte counters are RAW INTEGER BYTES — the
+// frontend does the B/KB/MB/GB/TB unit math and the price-per-GB cost
+// estimation (contract §3.2).
+//
+// Semantics implemented EXACTLY per contract §2.4:
+//   - resolve the period window FIRST, then filters, then aggregate (doc-2 §4),
+//   - network=ALL includes UNKNOWN; WIFI/MOBILE narrow to that bucket only,
+//   - events with agencyId=null are platform-level: they stay in totals /
+//     timeseries / peaks but get NO byAgency row (ΣbyAgency ≤ totals, by design),
+//   - when category/wilaya/agencyId filters are active the EVENT SET is scoped
+//     (events without an agency cannot match an agency filter),
+//   - empty window → zeroed counters + empty arrays,
+//   - ONE Promise.all for the independent aggregations; the metadata joins
+//     (agency names / customer names / branch counts) run after it because
+//     they depend on the grouped ids.
+
+const DATA_NETWORK_KEYS = ['WIFI', 'MOBILE', 'UNKNOWN'] as const
+const DATA_TRAFFIC_KEYS = ['API', 'SYNC', 'REALTIME', 'NOTIFICATIONS', 'FILES', 'UPDATES'] as const
+
+const dataConsumptionQuerySchema = z.object({
+  category: z.string().trim().min(1).max(64).optional(),
+  wilaya: z.string().trim().min(1).max(4).optional(),
+  agencyId: z.string().trim().min(1).max(64).optional(),
+  network: z.enum(['ALL', 'WIFI', 'MOBILE']).default('ALL'),
+  trafficType: z.enum(['ALL', 'API', 'SYNC', 'REALTIME', 'NOTIFICATIONS', 'FILES', 'UPDATES']).default('ALL'),
+})
+
+/** Zero-filled byte timeseries — SAME bucketing convention as the 54-a
+ * timeseriesFromDates helper above (resolved range bucketKeys, UTC keys:
+ * hourly 'YYYY-MM-DDTHH' / daily 'YYYY-MM-DD' / monthly 'YYYY-MM'). */
+function byteTimeseriesFromRows(
+  rows: Array<{ createdAt: Date; uploadBytes: number; downloadBytes: number }>,
+  range: { bucketKeys: string[]; granularity: string },
+): Array<{ date: string; uploadBytes: number; downloadBytes: number; totalBytes: number }> {
+  interface BucketAcc { upload: number; download: number }
+  const buckets = new Map<string, BucketAcc>()
+  for (const key of range.bucketKeys) buckets.set(key, { upload: 0, download: 0 })
+  for (const row of rows) {
+    const key = range.granularity === 'hourly'
+      ? `${utcDateKeyOf(row.createdAt)}T${String(row.createdAt.getUTCHours()).padStart(2, '0')}`
+      : range.granularity === 'monthly'
+        ? `${row.createdAt.getUTCFullYear()}-${String(row.createdAt.getUTCMonth() + 1).padStart(2, '0')}`
+        : utcDateKeyOf(row.createdAt)
+    const bucket = buckets.get(key)
+    if (!bucket) continue
+    bucket.upload += row.uploadBytes
+    bucket.download += row.downloadBytes
+  }
+  return Array.from(buckets.entries()).map(([date, b]) => ({
+    date,
+    uploadBytes: b.upload,
+    downloadBytes: b.download,
+    totalBytes: b.upload + b.download,
+  }))
+}
+
+app.get('/analytics/data-consumption', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '30d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+
+    const parsed = dataConsumptionQuerySchema.safeParse({
+      category: c.req.query('category') || undefined,
+      wilaya: c.req.query('wilaya') || undefined,
+      agencyId: c.req.query('agencyId') || undefined,
+      network: c.req.query('network') || undefined,
+      trafficType: c.req.query('trafficType') || undefined,
+    })
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0]
+      const field = issue?.path?.join('.') || 'query'
+      return c.json({ success: false, error: `Invalid ${field}: ${issue?.message ?? 'invalid value'}` }, 400)
+    }
+    const { category, wilaya, agencyId, network, trafficType } = parsed.data
+    const { start, end } = pq.range
+
+    // Agency scope: category/wilaya → matching agency ids; an explicit
+    // agencyId wins (same convention as buildSectionReservationWhere).
+    let scopedAgencyIds: string[] | null = null
+    if (category || wilaya) {
+      const scoped = await db.agency.findMany({
+        where: {
+          ...(category ? { category } : {}),
+          ...(wilaya ? { wilaya } : {}),
+        },
+        select: { id: true },
+      })
+      scopedAgencyIds = scoped.map((a) => a.id)
+    }
+
+    const baseWhere: Prisma.DataUsageEventWhereInput = { createdAt: { gte: start, lte: end } }
+    if (trafficType !== 'ALL') baseWhere.trafficType = trafficType
+    if (agencyId) baseWhere.agencyId = agencyId
+    else if (scopedAgencyIds) baseWhere.agencyId = { in: scopedAgencyIds }
+
+    // The fully-filtered set (network filter applied on top of the base).
+    const filteredWhere: Prisma.DataUsageEventWhereInput = { ...baseWhere }
+    if (network === 'WIFI') filteredWhere.networkType = 'WIFI'
+    if (network === 'MOBILE') filteredWhere.networkType = 'MOBILE'
+
+    // ONE Promise.all for the independent aggregations (contract §2.4).
+    // cellGroups is deliberately NOT network-filtered so the UNKNOWN bucket
+    // (and meta.excludedUnknownNetworkBytes) stays honest when
+    // network=WIFI/MOBILE hides it; everything else uses filteredWhere.
+    const [cellGroups, agencyGroups, userGroups, deviceRows, seriesRows, recordedSinceAgg] = await Promise.all([
+      db.dataUsageEvent.groupBy({ by: ['trafficType', 'networkType'], where: baseWhere, _sum: { uploadBytes: true, downloadBytes: true }, _count: { id: true } }),
+      db.dataUsageEvent.groupBy({ by: ['agencyId'], where: { ...filteredWhere, agencyId: { not: null } }, _sum: { uploadBytes: true, downloadBytes: true }, _count: { id: true } }),
+      db.dataUsageEvent.groupBy({ by: ['userId'], where: { ...filteredWhere, userId: { not: null } }, _sum: { uploadBytes: true, downloadBytes: true }, _count: { id: true }, _max: { createdAt: true } }),
+      db.dataUsageEvent.findMany({ where: { ...filteredWhere, deviceId: { not: null } }, select: { deviceId: true }, distinct: ['deviceId'] }),
+      db.dataUsageEvent.findMany({ where: filteredWhere, select: { createdAt: true, uploadBytes: true, downloadBytes: true } }),
+      db.dataUsageEvent.aggregate({ _min: { createdAt: true } }),
+    ])
+
+    // ── totals / byNetwork / byTrafficType from the traffic×network cells ──
+    interface Cell { upload: number; download: number; events: number }
+    const cells = new Map<string, Cell>()
+    for (const g of cellGroups) {
+      cells.set(`${g.trafficType}|${g.networkType}`, {
+        upload: g._sum.uploadBytes ?? 0,
+        download: g._sum.downloadBytes ?? 0,
+        events: g._count.id,
+      })
+    }
+    const cellOf = (traffic: string, net: string): Cell => cells.get(`${traffic}|${net}`) ?? { upload: 0, download: 0, events: 0 }
+
+    const byNetwork = { WIFI: 0, MOBILE: 0, UNKNOWN: 0 }
+    const byTrafficType = { API: 0, SYNC: 0, REALTIME: 0, NOTIFICATIONS: 0, FILES: 0, UPDATES: 0 }
+    let totalsUpload = 0
+    let totalsDownload = 0
+    let totalsEvents = 0
+    let unknownNetworkBytes = 0
+    for (const traffic of DATA_TRAFFIC_KEYS) {
+      for (const net of DATA_NETWORK_KEYS) {
+        const cell = cellOf(traffic, net)
+        if (net === 'UNKNOWN') unknownNetworkBytes += cell.upload + cell.download
+        // network=ALL keeps every bucket (incl. UNKNOWN); WIFI/MOBILE keep only theirs.
+        if (network !== 'ALL' && net !== network) continue
+        byNetwork[net] += cell.upload + cell.download
+        byTrafficType[traffic] += cell.upload + cell.download
+        totalsUpload += cell.upload
+        totalsDownload += cell.download
+        totalsEvents += cell.events
+      }
+    }
+    const totalsBytes = totalsUpload + totalsDownload
+    // "Excluded" UNKNOWN bytes only mean something when the network filter
+    // hides that bucket; network=ALL excludes nothing by definition.
+    const excludedUnknownNetworkBytes = network === 'ALL' ? 0 : unknownNetworkBytes
+
+    // ── byAgency (dependent join: metadata + branch counts) ──
+    const agencyIdsWithEvents = agencyGroups.map((g) => g.agencyId).filter((id): id is string => id !== null)
+    const agencyMetaRows = agencyIdsWithEvents.length > 0
+      ? await db.agency.findMany({
+          where: { id: { in: agencyIdsWithEvents } },
+          select: { id: true, name: true, customCode: true, wilaya: true, category: true, isActive: true, _count: { select: { branches: true } } },
+        })
+      : []
+    const agencyMetaById = new Map(agencyMetaRows.map((a) => [a.id, a]))
+    const byAgency = agencyGroups
+      .map((g) => {
+        if (g.agencyId === null) return null
+        const meta = agencyMetaById.get(g.agencyId)
+        // Ledger rows referencing a since-deleted agency still count toward
+        // totals/averages (loose ledger, no FK) but have no metadata to show.
+        if (!meta) return null
+        const upload = g._sum.uploadBytes ?? 0
+        const download = g._sum.downloadBytes ?? 0
+        const rowTotal = upload + download
+        return {
+          agencyId: g.agencyId,
+          agencyName: meta.name,
+          agencyCode: meta.customCode,
+          wilaya: meta.wilaya,
+          category: meta.category,
+          isActive: meta.isActive,
+          uploadBytes: upload,
+          downloadBytes: download,
+          totalBytes: rowTotal,
+          events: g._count.id,
+          branchCount: meta._count.branches,
+          sharePercent: totalsBytes > 0 ? round1((rowTotal / totalsBytes) * 100) : 0,
+        }
+      })
+      .filter((row): row is NonNullable<typeof row> => row !== null)
+      .sort((a, b) => b.totalBytes - a.totalBytes)
+
+    // ── topCustomers (dependent join: role filter needs the User table) ──
+    const userIdsWithEvents = userGroups.map((g) => g.userId).filter((id): id is string => id !== null)
+    const customerUsers = userIdsWithEvents.length > 0
+      ? await db.user.findMany({ where: { id: { in: userIdsWithEvents }, role: 'CUSTOMER' }, select: { id: true, fullName: true, username: true } })
+      : []
+    const customerById = new Map(customerUsers.map((u) => [u.id, u]))
+    let customerBytes = 0
+    let customerCount = 0
+    const topCustomers = userGroups
+      .map((g) => {
+        if (g.userId === null) return null
+        const user = customerById.get(g.userId)
+        if (!user) return null
+        const rowTotal = (g._sum.uploadBytes ?? 0) + (g._sum.downloadBytes ?? 0)
+        customerCount += 1
+        customerBytes += rowTotal
+        return {
+          userId: g.userId,
+          customerName: user.fullName,
+          username: user.username,
+          totalBytes: rowTotal,
+          events: g._count.id,
+          lastActivityAt: (g._max.createdAt ?? new Date(0)).toISOString(),
+        }
+      })
+      .filter((row): row is NonNullable<typeof row> => row !== null)
+      .sort((a, b) => b.totalBytes - a.totalBytes)
+      .slice(0, 20)
+
+    // ── averages (contract §2.4 semantics, whole bytes) ──
+    const agencyCount = agencyGroups.length // distinct agencies with ≥1 event in the filtered window
+    const branchCount = agencyMetaRows.reduce((acc, a) => acc + a._count.branches, 0)
+    const deviceCount = deviceRows.length
+    const averages = {
+      perAgency: agencyCount > 0 ? Math.round(totalsBytes / agencyCount) : 0,
+      perBranch: branchCount > 0 ? Math.round(totalsBytes / branchCount) : 0,
+      perCustomer: customerCount > 0 ? Math.round(customerBytes / customerCount) : 0,
+      perDevice: deviceCount > 0 ? Math.round(totalsBytes / deviceCount) : 0,
+      agencyCount,
+      branchCount,
+      customerCount,
+      deviceCount,
+    }
+
+    // ── peaks: hour-of-day in SERVER-LOCAL time (contract §2.4); peak day on
+    // the same UTC date keys as the timeseries (54-a convention) ──
+    const hourBytes = new Array<number>(24).fill(0)
+    const dayBytes = new Map<string, number>()
+    for (const row of seriesRows) {
+      const bytes = row.uploadBytes + row.downloadBytes
+      hourBytes[row.createdAt.getHours()] += bytes
+      const dayKey = utcDateKeyOf(row.createdAt)
+      dayBytes.set(dayKey, (dayBytes.get(dayKey) ?? 0) + bytes)
+    }
+    let peakHour: number | null = null
+    let peakHourBytes = 0
+    hourBytes.forEach((bytes, hour) => {
+      if (bytes > peakHourBytes) {
+        peakHourBytes = bytes
+        peakHour = hour
+      }
+    })
+    let peakDay: string | null = null
+    let peakDayBytes = 0
+    for (const [dayKey, bytes] of dayBytes) {
+      if (bytes > peakDayBytes) {
+        peakDayBytes = bytes
+        peakDay = dayKey
+      }
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        totals: { uploadBytes: totalsUpload, downloadBytes: totalsDownload, totalBytes: totalsBytes, events: totalsEvents },
+        byNetwork,
+        byTrafficType,
+        averages,
+        byAgency,
+        topCustomers,
+        timeseries: byteTimeseriesFromRows(seriesRows, pq.range),
+        peaks: { hour: peakHour, hourBytes: peakHourBytes, day: peakDay, dayBytes: peakDayBytes },
+        resolved: resolvedWindowPayload(pq.range),
+        meta: {
+          recordedSince: recordedSinceAgg._min.createdAt ? recordedSinceAgg._min.createdAt.toISOString() : null,
+          excludedUnknownNetworkBytes,
+        },
+      },
+    })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -3317,6 +4509,137 @@ app.post('/hardware/orders/:id', async (c) => {
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status)
+  }
+})
+
+// ─── Maps & Location Settings (Task 51) ─────────────────────────────────────
+//
+// Super Admin configuration for the Agency Location & Maps system. Storage =
+// SystemSetting rows under category "maps" (see lib/map-settings.ts for the
+// precedence contract: DB → env → built-in defaults, spec §47).
+
+// GET /admin/settings/maps — effective config + MASKED secrets + per-key
+// lastUpdatedAt/source. Full secret values NEVER appear in this response
+// (spec §45): keys are masked as "••••" + last 4.
+app.get('/settings/maps', async (c) => {
+  try {
+    await requireAdmin(c)
+
+    const settings = await getMapsSettingsAdmin()
+    return c.json({ success: true, data: settings })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// PUT /admin/settings/maps — atomic multi-key save. The WHOLE payload is
+// validated up front (validate-all-then-write: a bad enum anywhere aborts
+// before a single key is written), then every changed key is persisted and
+// audit-logged individually. Audit entries log the EVENT (from → to) —
+// NEVER a secret value (spec §42).
+app.put('/settings/maps', async (c) => {
+  try {
+    const admin = await requireAdmin(c)
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400)
+    }
+
+    const validation = validateMapsSettingsPayload(body)
+    if (!validation.ok || !validation.writes) {
+      return c.json({ success: false, error: validation.error || 'Invalid payload' }, 400)
+    }
+    if (validation.writes.length === 0) {
+      return c.json({ success: false, error: 'No map settings provided' }, 400)
+    }
+
+    // Snapshot the previous values for audit diffs. Secrets are audited as
+    // configured/unconfigured only — never their values.
+    const previousValues = new Map<string, string | null>()
+    for (const w of validation.writes) {
+      const raw = await getSettingRaw(w.key)
+      if (raw) {
+        previousValues.set(w.key, w.encrypted ? (raw.value ? 'CONFIGURED' : null) : raw.value)
+      } else {
+        previousValues.set(w.key, null)
+      }
+    }
+
+    // Persist everything (validation already passed for all keys).
+    const persistedKeys = await applyMapsSettingsWrites(validation.writes)
+
+    // Audit each change individually (event name = `${key}.changed`).
+    for (const w of validation.writes) {
+      const prev = previousValues.get(w.key) ?? null
+      const next = w.encrypted ? (w.value === '' ? null : 'CONFIGURED') : w.value
+      if (prev === next) continue // unchanged — no event
+      try {
+        await db.auditLog.create({
+          data: {
+            userId: admin.id,
+            action: `${w.key}.changed`,
+            entityType: 'SYSTEM_SETTING',
+            entityId: w.key,
+            details: JSON.stringify({
+              setting: w.label,
+              category: 'maps',
+              // Secrets: presence change only — NEVER the value (spec §42).
+              ...(w.encrypted
+                ? { change: prev === null ? 'key-added' : next === null ? 'key-removed' : 'key-replaced' }
+                : { from: prev, to: next }),
+            }),
+          },
+        })
+      } catch (auditErr) {
+        console.warn(`[admin settings/maps] audit write failed for ${w.key}:`, (auditErr as Error)?.message)
+      }
+    }
+
+    const settings = await getMapsSettingsAdmin()
+    return c.json({ success: true, data: { persistedKeys, ...settings } })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// POST /admin/settings/maps/validate — live/format validation per target.
+// Body: { target: "google" | "openfreemap" | "geocoding", live?: boolean }.
+// google: key presence + format + optional live geocoding probe (5s timeout);
+// openfreemap: style URL reachable; geocoding: provider-specific. Network
+// failures degrade to inconclusive checks, never a 500.
+app.post('/settings/maps/validate', async (c) => {
+  try {
+    await requireAdmin(c)
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400)
+    }
+    const { target, live } = (body ?? {}) as { target?: unknown; live?: unknown }
+    if (typeof target !== 'string' || !['google', 'openfreemap', 'geocoding'].includes(target)) {
+      return c.json({ success: false, error: 'target must be one of: google, openfreemap, geocoding' }, 400)
+    }
+    const doLive = live !== false
+
+    let result: MapsValidationResult
+    if (target === 'google') result = await validateGoogleMaps(doLive)
+    else if (target === 'openfreemap') result = await validateOpenFreeMap()
+    else result = await validateGeocoding(doLive)
+
+    return c.json({
+      success: true,
+      data: { target, valid: result.valid, checks: result.checks, ...(result.error ? { error: result.error } : {}) },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 

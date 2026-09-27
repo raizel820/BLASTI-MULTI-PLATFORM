@@ -4,6 +4,8 @@ import { requireRole, requireAgencyAccess, authErrorResponse, createSessionToken
 import { adminCreateAgencySchema, updateAgencyProfileSchema, validateBody, wilayaCodeRegex } from '../lib/validations'
 import { enforceRateLimit, getClientIp, AGENCY_LISTING_RATE_LIMIT, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordFailedRequest, recordSuccessfulRequest } from '../lib/rate-limit'
 import { recordSyncChangeNow } from '../lib/sync-helpers'
+// Task 51 — Agency Location & Maps: location pair rule + timestamp stamping
+import { buildAgencyLocationPatch } from '../lib/map-settings'
 
 const app = new Hono()
 
@@ -98,6 +100,12 @@ app.get('/', async (c) => {
         waitingCount: agency.reservations.length,
         workingHoursStart: agency.workingHoursStart,
         workingHoursEnd: agency.workingHoursEnd,
+        // Task 51 — canonical location fields (customer map/list rendering,
+        // spec §2/§36). locationVerified lets the UI badge verified agencies.
+        latitude: agency.latitude,
+        longitude: agency.longitude,
+        postalCode: agency.postalCode,
+        locationVerified: agency.locationVerified,
         isPaused: agency.queueSettings.length > 0 ? agency.queueSettings[0].isPaused : false,
         avgServiceTime: agency.averageServiceTime,
         averageRating: ratingInfo.avgRating,
@@ -365,6 +373,15 @@ app.post('/', async (c) => {
 
     const { name, nameAr, nameFr, customCode, category, address, phone, ownerId, description, workingHoursStart, workingHoursEnd, workingDays, services } = validation.data
 
+    // Task 51 — Agency Location & Maps: optional canonical location picked on
+    // the create-agency map (spec §27/§28). PAIR rule enforced here (lat/lng
+    // together, or absent); a valid pair stamps locationUpdatedAt=now. Range
+    // checks already ran in adminCreateAgencySchema.
+    const locationPatch = buildAgencyLocationPatch(validation.data as Record<string, unknown>)
+    if (locationPatch.error) {
+      return c.json({ success: false, error: locationPatch.error }, 400)
+    }
+
     // Task 5 — Algeria address selectors (create-agency wizard address step).
     // wilaya is normalized to the canonical two-digit code and only stored
     // when it matches ^(0[1-9]|[1-5][0-8])$; city (commune Latin name) is
@@ -443,6 +460,9 @@ app.post('/', async (c) => {
           // Task 5 — Algeria address selectors (absent → DB defaults).
           ...(agencyWilaya ? { wilaya: agencyWilaya } : {}),
           ...(agencyCity ? { city: agencyCity } : {}),
+          // Task 51 — canonical location (lat/lng pair + stamp + metadata;
+          // absent → nullable DB columns stay null).
+          ...locationPatch.data,
           ownerId: resolvedOwnerId,
           queueSettings: {
             create: {},
@@ -570,6 +590,17 @@ app.put('/:id', async (c) => {
     }
     // Drop relations that may ride along from client payloads.
     delete (updateData as Record<string, unknown>).services
+
+    // Task 51 — canonical location fields: replace the raw location keys with
+    // the pair-checked, timestamp-stamped patch (half-set lat/lng → 400).
+    const locationPatch = buildAgencyLocationPatch(updateData)
+    if (locationPatch.error) {
+      return c.json({ success: false, error: locationPatch.error }, 400)
+    }
+    for (const k of ['latitude', 'longitude', 'postalCode', 'locationVerified', 'locationSource']) {
+      delete (updateData as Record<string, unknown>)[k]
+    }
+    Object.assign(updateData, locationPatch.data)
 
     const agency = await db.agency.update({
       where: { id },

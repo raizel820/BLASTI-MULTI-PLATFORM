@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Script from "next/script";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ThemeProvider } from "next-themes";
 import { AuthProvider } from "@/components/providers/auth-provider";
@@ -41,6 +42,13 @@ export default function RootLayout({
     // The DirectionManager component in AuthProvider handles document direction updates
     <html lang="ar" data-scroll-behavior="smooth" suppressHydrationWarning>
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased bg-background text-foreground font-[family-name:var(--font-geist-sans)]`}>
+        {/* ResizeObserver loop fix (Task 53) — must run before any Next.js
+            code, hydration, or recharts observers are created. Wraps
+            window.ResizeObserver with a rAF-deferred version (source fix for
+            "ResizeObserver loop completed with undelivered notifications" on
+            chart-heavy screens like #/admin/analytics) and swallows that one
+            benign error message as a backstop. */}
+        <Script src="/resize-observer-fix.js" strategy="beforeInteractive" />
         <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
           {/* Task 41 — legacy SW unregister + chunk-error auto-recovery (phone flicker fix) */}
           <ClientBootHardening />
