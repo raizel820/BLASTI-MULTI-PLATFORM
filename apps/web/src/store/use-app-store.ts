@@ -39,6 +39,9 @@ export type ViewName =
   | 'admin-users'
   | 'admin-analytics'
   | 'admin-settings'
+  // Task 2-b: dedicated super-admin Maps & Location page (standalone wrapper
+  // around AdminMapsSettings, which is also embedded in admin-settings).
+  | 'admin-maps'
   | 'admin-subscription-plans'
   | 'admin-app-settings'
   | 'admin-hardware'
@@ -146,6 +149,7 @@ const viewHashMap: Record<ViewName, string> = {
   'admin-users': '#/admin/users',
   'admin-analytics': '#/admin/analytics',
   'admin-settings': '#/admin/settings',
+  'admin-maps': '#/admin/maps', // Task 2-b
   'admin-subscription-plans': '#/admin/subscription-plans',
   'admin-app-settings': '#/admin/app-settings',
   'admin-hardware': '#/admin/hardware',
@@ -258,7 +262,7 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'agency-reviews', 'agency-subscription', 'agency-branches', 'agency-devices',
   'agency-analytics',
   'admin-dashboard', 'admin-transactions', 'admin-agencies', 'admin-audit',
-  'admin-users', 'admin-analytics', 'admin-settings', 'admin-subscription-plans', 'admin-app-settings',
+  'admin-users', 'admin-analytics', 'admin-settings', 'admin-maps', 'admin-subscription-plans', 'admin-app-settings',
   'admin-hardware', 'admin-enterprise-requests',
   'admin-hardware-requests',
   'kiosk', 'agency-fullscreen', 'agency-fullscreen-history',

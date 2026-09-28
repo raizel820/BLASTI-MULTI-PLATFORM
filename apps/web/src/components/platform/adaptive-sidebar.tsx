@@ -45,6 +45,7 @@ import {
   GitBranch,
   ClipboardList,
   Users,
+  MapPin,
   BarChart3,
   ShieldCheck,
   Crown,
@@ -518,6 +519,9 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
 
   const navItems: SidebarNavItem[] = [
     { view: 'admin-dashboard', icon: LayoutDashboard, label: t('dashboard') },
+    // Task 2-b: Maps & Location promoted to its own findable entry, directly
+    // above the general platform settings where the same panel is also embedded.
+    { view: 'admin-maps', icon: MapPin, label: t('adminMaps') },
     { view: 'admin-settings', icon: Settings, label: t('platformSettings') },
     { view: 'admin-app-settings', icon: Smartphone, label: t('publicAppsSettings') },
     { view: 'admin-analytics', icon: BarChart3, label: t('analytics') },

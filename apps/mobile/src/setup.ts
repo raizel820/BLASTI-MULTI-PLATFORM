@@ -26,9 +26,9 @@
  */
 
 import { Capacitor } from '@capacitor/core';
-import { App, AppUrlOpenEvent } from '@capacitor/app';
-import { PushNotifications, PushNotificationDeliverObject, PushNotificationActionPerformedObject } from '@capacitor/push-notifications';
-import { LocalNotifications, LocalNotificationActionPerformedEvent } from '@capacitor/local-notifications';
+import { App, URLOpenListenerEvent } from '@capacitor/app';
+import { PushNotifications, PushNotificationSchema, PushNotificationActionPerformed } from '@capacitor/push-notifications';
+import { LocalNotifications, LocalNotificationActionPerformed } from '@capacitor/local-notifications';
 import { blastiNativePlugin, exposeOnWindow, plugins } from './plugin';
 
 // ─── Types ──────────────────────────────────────────────────────────────────────
@@ -55,17 +55,17 @@ export interface BlastiMobileConfig {
   /**
    * Callback when a push notification is received while the app is in foreground.
    */
-  onPushNotificationReceived?: (notification: PushNotificationDeliverObject) => void;
+  onPushNotificationReceived?: (notification: PushNotificationSchema) => void;
 
   /**
    * Callback when a push notification action is performed (tap).
    */
-  onPushNotificationActionPerformed?: (action: PushNotificationActionPerformedObject) => void;
+  onPushNotificationActionPerformed?: (action: PushNotificationActionPerformed) => void;
 
   /**
    * Callback when a local notification action is performed (tap).
    */
-  onLocalNotificationActionPerformed?: (action: LocalNotificationActionPerformedEvent) => void;
+  onLocalNotificationActionPerformed?: (action: LocalNotificationActionPerformed) => void;
 
   /**
    * Callback when the app is paused (sent to background).
@@ -112,7 +112,7 @@ const cleanupFns: Array<() => void> = [];
  */
 function setupDeepLinks(config: BlastiMobileConfig): void {
   try {
-    const listener = App.addListener('appUrlOpen', (event: AppUrlOpenEvent) => {
+    const listener = App.addListener('appUrlOpen', (event: URLOpenListenerEvent) => {
       console.log('[BlastiMobile] Deep link received:', event.url);
 
       // Forward to the callback if provided
@@ -302,7 +302,7 @@ function setupLocalNotifications(config: BlastiMobileConfig): void {
   try {
     const tapListener = LocalNotifications.addListener(
       'localNotificationActionPerformed',
-      (event: LocalNotificationActionPerformedEvent) => {
+      (event: LocalNotificationActionPerformed) => {
         console.log('[BlastiMobile] Local notification action performed:', event.actionId);
 
         if (config.onLocalNotificationActionPerformed) {
@@ -395,6 +395,38 @@ function setupAppLifecycle(config: BlastiMobileConfig): void {
   }
 }
 
+// ─── Keep-Awake Bridge ─────────────────────────────────────────────────────────
+
+/**
+ * Expose `window.__CAPACITOR_KEEP_AWAKE__` backed by the native KeepAwake
+ * plugin (@capacitor-community/keep-awake).
+ *
+ * The web app's SimpleMobileDashboard calls `__CAPACITOR_KEEP_AWAKE__.keepAwake()`
+ * to keep the screen on while an agency dashboard is active and
+ * `allowSleep()` when it deactivates. Without this bridge the web app
+ * silently falls back to the browser Screen Wake Lock API.
+ */
+function setupKeepAwakeBridge(): void {
+  if (typeof window === 'undefined') return;
+  const cap = window as unknown as {
+    Capacitor?: {
+      isNativePlatform?: () => boolean;
+      Plugins?: Record<string, { keepAwake?: () => Promise<void>; allowSleep?: () => Promise<void> }>;
+    };
+    __CAPACITOR_KEEP_AWAKE__?: unknown;
+  };
+
+  const KeepAwake = cap.Capacitor?.Plugins?.KeepAwake;
+  if (!KeepAwake || typeof KeepAwake.keepAwake !== 'function') return;
+  if (cap.__CAPACITOR_KEEP_AWAKE__) return; // already exposed
+
+  cap.__CAPACITOR_KEEP_AWAKE__ = {
+    keepAwake: () => KeepAwake.keepAwake!(),
+    allowSleep: () => (KeepAwake.allowSleep ? KeepAwake.allowSleep() : Promise.resolve()),
+  };
+  console.info('[BlastiMobile] KeepAwake bridge exposed on window.__CAPACITOR_KEEP_AWAKE__');
+}
+
 // ─── Storage Bridge ─────────────────────────────────────────────────────────────
 
 /**
@@ -469,7 +501,10 @@ export function setupBlastiMobile(config: BlastiMobileConfig = {}): BlastiMobile
   // 6. Initialize storage bridge
   setupStorageBridge();
 
-  // 7. Store platform info in preferences for the web app to read
+  // 7. Expose the native keep-awake bridge for the web app
+  setupKeepAwakeBridge();
+
+  // 8. Store platform info in preferences for the web app to read
   blastiNativePlugin.setPreference('blasti:platform', platform);
   blastiNativePlugin.setPreference('blasti:native', String(Capacitor.isNativePlatform()));
 

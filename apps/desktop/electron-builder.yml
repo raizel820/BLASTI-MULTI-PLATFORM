@@ -72,9 +72,12 @@ nsis:
   perMachine: false
   allowToChangeInstallationDirectory: true
   deleteAppDataOnUninstall: false
-  installerIcon: assets/icon.png
-  uninstallerIcon: assets/icon.png
-  installerHeaderIcon: assets/icon.png
+  # NOTE: installerIcon/uninstallerIcon/installerHeaderIcon overrides REMOVED.
+  # electron-builder now derives them from win.icon (assets/icon.png) and its
+  # built-in header BMP. Forcing a 512x512 PNG into installerHeaderIcon made
+  # NSIS abort with: Error in macro MUI_UNPAGE_INIT / MUI_UNPAGE_WELCOME /
+  # !include: error in script: assistedInstaller.nsh (MUI2 header expects a
+  # small BMP, not a large PNG).
   createDesktopShortcut: true
   createStartMenuShortcut: true
   shortcutName: BLASTI

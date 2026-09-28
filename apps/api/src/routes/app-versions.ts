@@ -116,6 +116,50 @@ app.get('/latest', async (c) => {
   }
 })
 
+// ─── GET /app-versions/check — PUBLIC update check (Task 47-b) ─────────────
+//
+// Query params: platform (android|ios|electron|windows|mac|linux), version.
+// Compares the provided version against the latest PUBLISHED version for the
+// platform (ordered by versionCode desc, then createdAt desc).
+//
+// IMPORTANT: this must stay PUBLIC (no requireAdmin) and be registered
+// BEFORE the GET /:id route below — Hono matches routes in registration
+// order and /check would otherwise be captured by the /:id handler.
+
+app.get('/check', async (c) => {
+  try {
+    const platform = c.req.query('platform')
+    const version = c.req.query('version')
+
+    if (!platform || !version) {
+      return c.json({ success: false, error: 'platform and version query params are required' }, 400)
+    }
+
+    const latestVersion = await db.appVersion.findFirst({
+      where: { platform, isPublished: true },
+      orderBy: [{ versionCode: 'desc' }, { createdAt: 'desc' }],
+    })
+
+    const updateAvailable = !!latestVersion && compareVersions(latestVersion.version, version) > 0
+
+    return c.json({
+      success: true,
+      platform,
+      currentVersion: version,
+      latestVersion: latestVersion?.version ?? '',
+      versionCode: latestVersion?.versionCode ?? 0,
+      updateAvailable,
+      isMandatory: updateAvailable ? (latestVersion?.isMandatory ?? false) : false,
+      downloadUrl: updateAvailable ? (latestVersion?.downloadUrl ?? '') : '',
+      releaseNotes: latestVersion?.releaseNotes ?? '',
+      releaseNotesAr: latestVersion?.releaseNotesAr ?? '',
+      releaseNotesFr: latestVersion?.releaseNotesFr ?? '',
+    })
+  } catch (error: unknown) {
+    return c.json({ success: false, error: 'Update check failed' }, 500)
+  }
+})
+
 // ─── POST /app-versions — Create a new app version ──────────────────────────
 
 app.post('/', async (c) => {

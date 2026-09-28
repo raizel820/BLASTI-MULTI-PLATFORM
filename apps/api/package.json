@@ -10,6 +10,7 @@
   "dependencies": {
     "@blasti/db": "workspace:*",
     "@hono/node-server": "^1.14.0",
+    "firebase-admin": "^12",
     "hono": "^4.7.0",
     "jose": "^6.0.0",
     "qrcode": "^1.5.4",

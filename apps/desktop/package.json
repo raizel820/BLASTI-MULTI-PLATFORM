@@ -1,6 +1,6 @@
 {
   "name": "@blasti/desktop",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "BLASTI Desktop — Multi-agency queue management system",
   "main": "main.js",
@@ -13,7 +13,8 @@
     "build:mac": "node scripts/prebuild.js && electron-builder --mac",
     "build:linux": "node scripts/prebuild.js && electron-builder --linux",
     "build:all": "node scripts/prebuild.js && electron-builder --mac --win --linux",
-    "build:export": "cd ../web && cross-env NEXT_BUILD_MODE=export next build"
+    "build:export": "bun run --filter @blasti/web build:export",
+    "build:portable": "node scripts/prebuild.js && electron-builder --dir"
   },
   "dependencies": {
     "@hono/node-server": "^2.0.12",

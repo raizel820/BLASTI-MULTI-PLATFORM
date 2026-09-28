@@ -40,6 +40,10 @@ export const viewToUrl: Record<ViewName, string> = {
   'admin-users': '/admin/users',
   'admin-analytics': '/admin/analytics',
   'admin-settings': '/admin/settings',
+  // Task 2-b: dedicated super-admin Maps & Location view. The role guard is
+  // inherited from the `admin-` prefix branch in getAllowedRolesForView below
+  // (same pattern as every other admin view → SUPER_ADMIN only).
+  'admin-maps': '/admin/maps',
   'admin-subscription-plans': '/admin/subscription-plans',
   'admin-app-settings': '/admin/app-settings',
   'admin-hardware': '/admin/hardware',

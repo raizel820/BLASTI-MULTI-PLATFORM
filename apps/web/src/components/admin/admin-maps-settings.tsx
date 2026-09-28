@@ -46,6 +46,8 @@ import { Separator } from '@/components/ui/separator';
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  Database,
   ExternalLink,
   Loader2,
   Map as MapIcon,
@@ -53,6 +55,7 @@ import {
   Navigation,
   RefreshCw,
   Save,
+  Search,
   ShieldCheck,
   Trash2,
   XCircle,
@@ -70,6 +73,14 @@ import {
   type MapsProviderSettings,
 } from '@/lib/map';
 import { useMapConfig } from '@/lib/map/use-map-config';
+// Task 2-b — offline Algeria administrative dataset (already in the main
+// bundle via the wilaya/commune selectors, so a direct import adds no extra
+// admin-only chunk).
+import {
+  ALGERIA_WILAYAS,
+  type AlgeriaCommune,
+  type AlgeriaWilaya,
+} from '@/lib/algeria-locations';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
 // ─── Backend snapshot types (GET /api/admin/settings/maps, Task 51-a) ──────
@@ -200,6 +211,16 @@ const fadeUp = {
   initial: { opacity: 0, y: 15 },
   animate: { opacity: 1, y: 0 },
 };
+
+// ─── Location Editor (Task 2-b) — offline Algeria dataset totals ───────────
+// Computed from the data itself, never hardcoded.
+const WILAYA_TOTAL = ALGERIA_WILAYAS.length;
+const COMMUNE_TOTAL = ALGERIA_WILAYAS.reduce((sum, w) => sum + w.communes.length, 0);
+
+/** Case- and diacritics-insensitive Latin folding (Arabic needs no folding). */
+function normalizeSearchText(value: string): string {
+  return value.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
 
 // ─── Component ─────────────────────────────────────────────────────────────
 export function AdminMapsSettings() {
@@ -457,6 +478,12 @@ export function AdminMapsSettings() {
         </h2>
         <p className="text-xs text-muted-foreground mt-0.5">{t('adminMapsSettings.subtitle')}</p>
       </div>
+
+      {/* ─── Location Editor (Task 2-b — offline Algeria wilaya/commune
+           browser) — pinned to the TOP so it is the first thing admins see ─── */}
+      <motion.div {...fadeUp} transition={{ delay: 0.05 }}>
+        <LocationEditor onShowTestMap={openTestMap} />
+      </motion.div>
 
       {/* ─── General (spec §8/§33 + feature flags) ─── */}
       <motion.div {...fadeUp} transition={{ delay: 0.1 }}>
@@ -881,6 +908,165 @@ export function AdminMapsSettings() {
         {testOpen && <MapsTestMapCard key={testRunId} config={testConfig} />}
       </div>
     </div>
+  );
+}
+
+// ─── Location Editor (Task 2-b) — searchable read-only browser of the
+// ── offline Algeria wilaya/commune dataset used by address selectors.
+
+interface WilayaSearchMatch {
+  wilaya: AlgeriaWilaya;
+  /** null → the wilaya itself matched (expanded list shows ALL its communes);
+   *  array → only these communes matched (parent wilaya shown as carrier). */
+  matchedCommunes: AlgeriaCommune[] | null;
+}
+
+function matchWilayas(rawQuery: string): WilayaSearchMatch[] {
+  const trimmed = rawQuery.trim();
+  const q = normalizeSearchText(trimmed);
+  if (!q) {
+    return ALGERIA_WILAYAS.map((wilaya) => ({ wilaya, matchedCommunes: null }));
+  }
+  const codeQuery = /^[0-9]+$/.test(q);
+  const matches: WilayaSearchMatch[] = [];
+  for (const wilaya of ALGERIA_WILAYAS) {
+    // '19' → code '19'; '9' → code '09'; '1' → codes '01'..'19'
+    const codeHit =
+      codeQuery && (wilaya.code.startsWith(q) || wilaya.code === q.padStart(2, '0'));
+    const wilayaHit =
+      !!codeHit ||
+      normalizeSearchText(wilaya.name).includes(q) ||
+      wilaya.nameAr.includes(trimmed);
+    if (wilayaHit) {
+      matches.push({ wilaya, matchedCommunes: null });
+      continue;
+    }
+    const communeHits = wilaya.communes.filter(
+      (c) => normalizeSearchText(c.name).includes(q) || c.nameAr.includes(trimmed)
+    );
+    if (communeHits.length > 0) {
+      matches.push({ wilaya, matchedCommunes: communeHits });
+    }
+  }
+  return matches;
+}
+
+function LocationEditor({ onShowTestMap }: { onShowTestMap?: () => void }) {
+  const { t } = useLanguage();
+  const [query, setQuery] = useState('');
+  const [expandedCode, setExpandedCode] = useState<string | null>(null);
+
+  const results = useMemo(() => matchWilayas(query), [query]);
+
+  return (
+    <Card
+      className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50"
+      data-testid="admin-location-editor"
+    >
+      <CardHeader className="pb-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <CardTitle className="text-base flex items-center gap-2">
+            <MapPin className="h-4 w-4 text-emerald-600" />
+            {t('adminMapsSettings.locationEditor')}
+          </CardTitle>
+          {onShowTestMap && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-8 text-[11px] gap-1.5"
+              onClick={onShowTestMap}
+            >
+              <MapIcon className="h-3 w-3 text-emerald-600" />
+              {t('adminMapsSettings.testMap')}
+            </Button>
+          )}
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          {t('adminMapsSettings.locationEditorDesc')}
+        </p>
+      </CardHeader>
+      <CardContent className="pt-0 space-y-4">
+        {/* Search — wilaya code / Latin name (diacritics-insensitive) / Arabic name, plus communes */}
+        <div className="space-y-1.5">
+          <div className="relative">
+            <Search className="absolute start-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none" />
+            <Input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={t('adminMapsSettings.locationSearchPlaceholder')}
+              className="h-9 text-xs ps-9"
+            />
+          </div>
+          <p className="text-[10px] text-muted-foreground">{t('adminMapsSettings.expandHint')}</p>
+        </div>
+
+        {/* Wilaya list — capped height, rows expand into a scrollable commune sub-list */}
+        <div
+          className="max-h-96 overflow-y-auto rounded-xl border border-gray-100 dark:border-gray-800 divide-y divide-gray-100 dark:divide-gray-800/60"
+          data-testid="admin-location-editor-list"
+        >
+          {results.length === 0 && (
+            <p className="p-4 text-xs text-muted-foreground text-center">
+              {t('adminMapsSettings.locationNoResults')}
+            </p>
+          )}
+          {results.map(({ wilaya, matchedCommunes }) => {
+            const expanded = expandedCode === wilaya.code;
+            const communes = matchedCommunes ?? wilaya.communes;
+            return (
+              <div key={wilaya.code}>
+                <button
+                  type="button"
+                  onClick={() => setExpandedCode(expanded ? null : wilaya.code)}
+                  aria-expanded={expanded}
+                  className="w-full flex items-center gap-2.5 px-3 py-2.5 text-start hover:bg-gray-50 dark:hover:bg-gray-800/40 transition-colors"
+                >
+                  <Badge
+                    variant="outline"
+                    className="shrink-0 text-[10px] px-1.5 bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/60"
+                  >
+                    {wilaya.code}
+                  </Badge>
+                  <span className="text-xs font-medium truncate">{wilaya.name}</span>
+                  <span className="text-xs text-muted-foreground truncate">{wilaya.nameAr}</span>
+                  <span className="ms-auto flex items-center gap-1.5 shrink-0 text-[10px] text-muted-foreground">
+                    {t('adminMapsSettings.communeCount', { count: String(communes.length) })}
+                    <ChevronDown
+                      className={`h-3.5 w-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`}
+                    />
+                  </span>
+                </button>
+                {expanded && (
+                  <div className="max-h-48 overflow-y-auto bg-gray-50/60 dark:bg-gray-800/20">
+                    {communes.map((commune) => (
+                      <div
+                        key={`${wilaya.code}-${commune.name}`}
+                        className="flex items-center justify-between gap-3 px-3 ps-9 py-1.5 border-t border-gray-100 dark:border-gray-800/40"
+                      >
+                        <span className="text-[11px] truncate">{commune.name}</span>
+                        <span className="text-[11px] text-muted-foreground truncate">
+                          {commune.nameAr}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Offline static dataset note — counts computed from the data above */}
+        <p className="text-[10px] text-muted-foreground flex items-start gap-1.5">
+          <Database className="h-3 w-3 mt-0.5 shrink-0 text-emerald-600" />
+          {t('adminMapsSettings.datasetNote', {
+            wilayas: String(WILAYA_TOTAL),
+            communes: String(COMMUNE_TOTAL),
+          })}
+        </p>
+      </CardContent>
+    </Card>
   );
 }
 

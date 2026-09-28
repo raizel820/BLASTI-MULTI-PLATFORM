@@ -1,9 +1,9 @@
 'use client';
 
 /**
- * BLASTI Client Boot Hardening (Task 41)
+ * BLASTI Client Boot Hardening (Task 41, extended by Task 47-b)
  *
- * Two independent heals that run once per page load:
+ * Three independent boot tasks that run once per page load:
  *
  * 1. LEGACY SERVICE-WORKER CLEANUP
  *    Older builds of the app shipped public/sw.js (cache-first static caching
@@ -27,9 +27,16 @@
  *    and heals the session. The sessionStorage cooldown guarantees at most
  *    ONE automatic reload per 15 s so a persistent failure shows the error
  *    UI instead of reload-looping.
+ *
+ * 3. MOBILE PUSH REGISTRATION (Task 47-b)
+ *    Inside the Capacitor WebView, wires the PushNotifications plugin
+ *    (listeners + permission + register) and uploads the FCM token to the
+ *    API, so push works even when the native shell's auto-setup did not
+ *    run. No-op on plain browsers / Electron (Capacitor absent).
  */
 
 import { useEffect } from 'react';
+import { initMobilePushRegistration } from '@/lib/push-registration';
 
 const CHUNK_RELOAD_KEY = 'blasti-chunk-reload-at';
 const CHUNK_RELOAD_COOLDOWN_MS = 15000;
@@ -40,6 +47,12 @@ function isChunkLoadErrorMessage(message: string): boolean {
 
 export function ClientBootHardening() {
   useEffect(() => {
+    // ── 0. Mobile push registration (Capacitor only; no-op elsewhere) ────
+    // Fire-and-forget: a hardened boot task must never block or throw.
+    initMobilePushRegistration().catch((error) => {
+      console.warn('[BootHardening] Mobile push registration failed:', error);
+    });
+
     // ── 1. Legacy service worker cleanup ──────────────────────────────────
     (async () => {
       try {

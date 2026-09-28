@@ -52,6 +52,9 @@ const AdminAuditLogs = lazy(() => import('@/components/admin/admin-audit-logs').
 const AdminUsers = lazy(() => import('@/components/admin/admin-users').then(m => ({ default: m.AdminUsers })));
 const AdminAnalytics = lazy(() => import('@/components/admin/admin-analytics').then(m => ({ default: m.AdminAnalytics })));
 const AdminSettings = lazy(() => import('@/components/admin/admin-settings').then(m => ({ default: m.AdminSettings })));
+// Task 2-b: standalone super-admin Maps & Location page (same component that
+// is embedded mid-page inside admin-settings — promoted to its own view).
+const AdminMaps = lazy(() => import('@/components/admin/admin-maps-settings').then(m => ({ default: m.AdminMapsSettings })));
 const AdminSubscriptionPlans = lazy(() => import('@/components/admin/admin-subscription-plans').then(m => ({ default: m.AdminSubscriptionPlans })));
 const AdminAppSettings = lazy(() => import('@/components/admin/admin-app-settings').then(m => ({ default: m.AdminAppSettings })));
 const AdminHardware = lazy(() => import('@/components/admin/admin-hardware').then(m => ({ default: m.AdminHardware })));
@@ -175,6 +178,11 @@ const ViewRouter = memo(function ViewRouter() {
               return <AdminAnalytics />;
             case 'admin-settings':
               return <AdminSettings />;
+            case 'admin-maps':
+              // Task 2-b: standalone Maps & Location — AdminMapsSettings owns
+              // no page padding (it is embedded in admin-settings), so the
+              // view root provides the standard admin padding here.
+              return <div className="p-4 lg:p-6"><AdminMaps /></div>;
             case 'admin-subscription-plans':
               return <AdminSubscriptionPlans />;
             case 'admin-app-settings':
@@ -463,6 +471,7 @@ export default function Home() {
       'admin-users': t('userManagement') + ' - BLASTI',
       'admin-analytics': t('analytics') + ' - BLASTI',
     'admin-settings': t('platformSettings') + ' - BLASTI',
+    'admin-maps': t('adminMaps') + ' - BLASTI',
     'admin-subscription-plans': t('subscriptionPlans') + ' - BLASTI',
     'admin-app-settings': t('publicAppsSettings') + ' - BLASTI',
     };

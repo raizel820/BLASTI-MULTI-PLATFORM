@@ -95,8 +95,8 @@ export async function scheduleTurnNotification(title: string, body: string, tick
             id: Date.now() % 100000,
             channelId: BLASTI_TURN_CHANNEL.id,
             sound: 'blasti_alarm.wav',
-            smallIcon: 'ic_notification',
-            largeIcon: 'blasti_icon',
+            smallIcon: 'ic_launcher',
+            iconColor: '#10b981',
             extra: { ticketNumber, type: 'TURN_CALLED' },
           }],
         });

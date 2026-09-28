@@ -3626,6 +3626,69 @@ function createApp() {
   })
 
   // ═══════════════════════════════════════════════════════════════════════
+  // PUBLIC FAQ (Task 2-d) — cloud parity with apps/api/src/routes/faqs.ts
+  // L8-69 (mounted at /api/faq + /api/faqs). Public — no auth, same as the
+  // cloud. The local FAQ table is populated by the sync engine (isSynced:
+  // true in lib/sync-registry.json, syncOrder 19); an empty table simply
+  // renders as an empty list.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/faq — non-localized variant (cloud faqs.ts GET '/' L8-30):
+  // full active rows ordered by (order asc, createdAt desc).
+  app.get('/api/faq', async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      // The generated client exposes the FAQ model as `fAQ`; `faq` is a
+      // defensive fallback for alternate client generations.
+      const faqModel = db.fAQ || db.faq
+      if (!faqModel) return c.json({ success: true, faqs: [] })
+      const faqs = await faqModel.findMany({
+        where: { isActive: true },
+        orderBy: [{ order: 'asc' }, { createdAt: 'desc' }],
+      })
+      return c.json({ success: true, faqs })
+    } catch (error) {
+      console.error('[LocalAPI] /api/faq error:', error)
+      return c.json({ success: false, error: 'Failed to load FAQs' }, 500)
+    }
+  })
+
+  // GET /api/faqs — localized variant (cloud faqs.ts GET '/faqs' L33-69):
+  // ?category filters; ?lang (ar|fr|en, default 'en') picks the localized
+  // question/answer with fallback to the base field — trimmed row shape
+  // { id, question, answer, category, order } mapped exactly as the cloud.
+  app.get('/api/faqs', async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      const faqModel = db.fAQ || db.faq
+      if (!faqModel) return c.json({ success: true, faqs: [] })
+      const category = c.req.query('category')
+      const lang = c.req.query('lang') || 'en'
+
+      const where = { isActive: true }
+      if (category) where.category = category
+
+      const rows = await faqModel.findMany({
+        where,
+        orderBy: { order: 'asc' },
+      })
+
+      const faqs = rows.map((faq) => ({
+        id: faq.id,
+        question: lang === 'ar' && faq.questionAr ? faq.questionAr : lang === 'fr' && faq.questionFr ? faq.questionFr : faq.question,
+        answer: lang === 'ar' && faq.answerAr ? faq.answerAr : lang === 'fr' && faq.answerFr ? faq.answerFr : faq.answer,
+        category: faq.category,
+        order: faq.order,
+      }))
+
+      return c.json({ success: true, faqs })
+    } catch (error) {
+      console.error('[LocalAPI] /api/faqs error:', error)
+      return c.json({ success: false, error: 'Failed to load FAQs' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
   // ALL ROUTES BELOW REQUIRE AUTH
   // ═══════════════════════════════════════════════════════════════════════
 
@@ -7180,6 +7243,535 @@ function createApp() {
     } catch (error) {
       console.error('[LocalAPI] Subscription-cancel proxy error:', error)
       return c.json({ success: false, error: 'Failed to cancel subscription' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 13c. TRANSACTIONS / HARDWARE / ENTERPRISE REQUEST (Task 2-d)
+  //
+  // Cloud-parity gap routes ported LOCAL-FIRST from apps/api/src/routes:
+  // transactions.ts L18-111 and agency.ts L5580-5867. Every handler scopes
+  // to the session agency (resolveSessionAgencyId / lookupLocalAgencyIdForUser
+  // — the local mirror of the cloud's resolveUserAgencyId). The desktop local
+  // API is agent-level by design: there is NO SUPER_ADMIN branch and the
+  // transaction-review endpoint (cloud transactions.ts PUT /:id/review,
+  // super-admin-only) is deliberately NOT ported.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/transactions — list (cloud transactions.ts GET '/' L62-111).
+  // ?status filters; ?limit (default 50, clamped 1..200 — the local
+  // parsePagination clamp) + ?offset page the result. Rows carry the same
+  // agency/reviewer select projections the cloud includes. Sessions without
+  // an agency get the cloud's empty envelope, never an error.
+  app.get('/api/transactions', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      const status = c.req.query('status')
+
+      const parsedLimit = parseInt(c.req.query('limit') || '50', 10)
+      const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 200) : 50
+      const parsedOffset = parseInt(c.req.query('offset') || '0', 10)
+      const offset = Number.isFinite(parsedOffset) ? Math.max(parsedOffset, 0) : 0
+
+      if (!agencyId) {
+        return c.json({ success: true, transactions: [], total: 0, limit, offset })
+      }
+
+      const where = { agencyId }
+      if (status) where.status = status
+
+      const [transactions, total] = await Promise.all([
+        db.transaction.findMany({
+          where,
+          include: {
+            agency: { select: { id: true, name: true, customCode: true, category: true, subscriptionTier: true, subscriptionStatus: true } },
+            reviewer: { select: { id: true, fullName: true, username: true } },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+          skip: offset,
+        }),
+        db.transaction.count({ where }),
+      ])
+
+      return c.json({ success: true, transactions, total, limit, offset })
+    } catch (error) {
+      console.error('[LocalAPI] /api/transactions error:', error)
+      return c.json({ success: false, error: 'Failed to list transactions' }, 500)
+    }
+  })
+
+  // POST /api/transactions — create a PENDING payment transaction
+  // (cloud transactions.ts POST '/' L18-59). Body validation mirrors the
+  // cloud's createTransactionSchema; the agency resolves LOCALLY — the
+  // session agency wins and a differing body.agencyId is a 403 (the local
+  // API has no SUPER_ADMIN bypass). planName/amountPaid are snapshotted from
+  // the local SubscriptionPlan catalog when the plan row exists (cloud
+  // parity), else they fall back to the request's plan/amount; the agency
+  // flips to subscriptionStatus PENDING like the cloud does.
+  //
+  // Local-first write with the file's Part-Q convention: the business writes
+  // and a canonical SYNC_PUSH outbox row commit ATOMICALLY, exactly like
+  // POST /api/reservations. The push is id-preserving (Transaction is
+  // APPEND_ONLY — create-only pushes are accepted by the cloud push engine),
+  // so the cloud learns the SAME transaction record. Deliberately NO HTTP
+  // POST replay / cloud /transactions forward — that WOULD double-create.
+  app.post('/api/transactions', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      const body = (await c.req.json().catch(() => ({}))) || {}
+      const bodyAgencyId = typeof body.agencyId === 'string' && body.agencyId.length > 0 ? body.agencyId : null
+      const { amount, plan, paymentMethod } = body
+      const receiptUrl = typeof body.receiptUrl === 'string' && body.receiptUrl.length > 0 ? body.receiptUrl : null
+
+      // Cloud createTransactionSchema messages (transactions.ts L9-15).
+      if (!bodyAgencyId) {
+        return c.json({ success: false, error: 'Agency ID is required' }, 400)
+      }
+      if (!Number.isInteger(amount) || amount <= 0) {
+        return c.json({ success: false, error: 'Amount must be a positive number' }, 400)
+      }
+      if (plan !== 'BASIC' && plan !== 'PREMIUM') {
+        return c.json({ success: false, error: 'Invalid plan. Must be BASIC or PREMIUM' }, 400)
+      }
+      if (!['CCP', 'BANK_TRANSFER', 'E_WALLET', 'CASH'].includes(paymentMethod)) {
+        return c.json({ success: false, error: 'Invalid payment method' }, 400)
+      }
+
+      // Local requireAgencyAccess equivalent: the SESSION agency wins; a
+      // differing body.agencyId is rejected — no SUPER_ADMIN bypass locally.
+      const sessionAgencyId = sessionUser ? sessionUser.agencyId : null
+      if (sessionAgencyId && bodyAgencyId !== sessionAgencyId) {
+        return c.json({ success: false, error: 'You do not have access to this agency' }, 403)
+      }
+      let agencyId = sessionAgencyId
+      if (!agencyId) {
+        // Session without an agencyId: accept the body agencyId only when the
+        // session user genuinely has access (ownership/staff checks inside).
+        agencyId = await lookupLocalAgencyIdForUser(sessionUser)
+        if (!agencyId || agencyId !== bodyAgencyId) {
+          return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+        }
+      }
+
+      const agency = await db.agency.findUnique({ where: { id: agencyId } })
+      if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
+
+      // Snapshot: freeze the current SubscriptionPlan price & name (cloud L33-46).
+      let planName
+      let amountPaid
+      let subscriptionPlan = null
+      try {
+        subscriptionPlan = await db.subscriptionPlan.findFirst({ where: { name: plan, isActive: true } })
+      } catch (planErr) {
+        console.warn('[LocalAPI] transaction plan snapshot lookup failed (non-fatal):', planErr?.message || planErr)
+      }
+      if (subscriptionPlan) {
+        planName = subscriptionPlan.displayName || subscriptionPlan.name
+        amountPaid = subscriptionPlan.price
+      } else {
+        planName = plan
+        amountPaid = amount
+      }
+
+      // Part Q: business writes + the canonical outbox row commit atomically.
+      const transaction = await withOutboxTransaction(async (tx) => {
+        const created = await tx.transaction.create({
+          data: {
+            agencyId,
+            amount,
+            plan,
+            paymentMethod,
+            receiptUrl,
+            status: 'PENDING',
+            amountPaid,
+            planName,
+          },
+        })
+        await tx.agency.update({ where: { id: agencyId }, data: { subscriptionStatus: 'PENDING' } })
+        // Canonical id-preserving SYNC_PUSH create — never an HTTP POST replay
+        // (see the POST /api/reservations comment for why replays double-create).
+        await logDeterministicOutcome('Transaction', created.id, 'create', created, null, { tx })
+        return created
+      })
+
+      // Kick a file-sync round (receipt blob ride-along) + a record-sync pass —
+      // the same non-fatal pairing the other local mutations use.
+      try { if (fileSync) fileSync.schedule('transaction-created') } catch { /* non-fatal */ }
+      try {
+        const syncService = require('./sync-service')
+        if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+      } catch { /* non-fatal */ }
+
+      return c.json({ success: true, transaction }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/transactions error:', error)
+      return c.json({ success: false, error: 'Failed to create transaction' }, 500)
+    }
+  })
+
+  // GET /api/agency/hardware — catalog for the hardware ordering UI
+  // (cloud agency.ts GET /hardware L5580-5612). Reads the LOCAL
+  // HardwareSettings singleton. The Hardware* models are cloud-only
+  // (isSynced: false in lib/sync-registry.json), so an unpopulated local
+  // table degrades to the exact disabled shape the cloud returns and the UI
+  // hides the ordering section. Success-branch shapes are cloud-identical.
+  app.get('/api/agency/hardware', authMiddleware, async (c) => {
+    try {
+      if (!db || !db.hardwareSettings) {
+        return c.json({ products: [], commitmentTiers: [], settings: { hardwareEnabled: false } })
+      }
+      const settings = await db.hardwareSettings.findUnique({ where: { id: 'singleton' } })
+      if (!settings || !settings.hardwareEnabled) {
+        return c.json({ products: [], commitmentTiers: [], settings: { hardwareEnabled: false } })
+      }
+      const [products, commitmentTiers] = await Promise.all([
+        db.hardwareProduct.findMany({
+          where: { isActive: true },
+          orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+        }),
+        db.hardwareCommitmentTier.findMany({
+          where: { isActive: true },
+          orderBy: { sortOrder: 'asc' },
+        }),
+      ])
+      return c.json({ products, commitmentTiers, settings })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/hardware error:', error)
+      return c.json({ success: false, error: 'Failed to load hardware catalog' }, 500)
+    }
+  })
+
+  // GET /api/agency/hardware/orders — agency-scoped order history
+  // (cloud agency.ts GET /hardware/orders L5616-5637): items include their
+  // product, newest first.
+  app.get('/api/agency/hardware/orders', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId || !db.hardwareOrder) {
+        return c.json({ success: true, orders: [] })
+      }
+      const orders = await db.hardwareOrder.findMany({
+        where: { agencyId },
+        include: { items: { include: { product: true } } },
+        orderBy: { createdAt: 'desc' },
+      })
+      return c.json({ success: true, orders })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/hardware/orders error:', error)
+      return c.json({ success: false, error: 'Failed to load hardware orders' }, 500)
+    }
+  })
+
+  // POST /api/agency/hardware/orders — create a hardware order
+  // (cloud agency.ts POST /hardware/orders L5651-5768). Body validation
+  // mirrors the cloud's createHardwareOrderSchema (validations.ts L491-513):
+  // items[{productId, quantity>=1}], paymentModel 'UPFRONT'|'MONTHLY',
+  // commitmentMonths one of 12/24/36/48/60 (required for MONTHLY). Price
+  // math is byte-identical to the cloud:
+  //   UPFRONT: upfrontTotal = round(total * (1 - upfrontDiscount/100))
+  //   MONTHLY: monthlyExtra = round(total * (1 + extraPercentage/100) / months)
+  // Line items snapshot each product's current basePrice; order + items are
+  // created in ONE local $transaction with status PENDING. No auditLog row —
+  // the local file has no audit-log convention. Hardware* models are
+  // cloud-only locally, so an unpopulated catalog fails the same gates the
+  // cloud enforces (403 disabled / 400 unavailable / 400 invalid tier).
+  app.post('/api/agency/hardware/orders', authMiddleware, async (c) => {
+    try {
+      if (!db || !db.hardwareOrder) {
+        return c.json({ success: false, error: 'Hardware order model unavailable — regenerate the Prisma client' }, 503)
+      }
+      // Cloud L5654: user.agencyId || resolveUserAgencyId(user) — the local
+      // mirror is lookupLocalAgencyIdForUser.
+      const agencyId = (sessionUser && sessionUser.agencyId) || await lookupLocalAgencyIdForUser(sessionUser)
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency found for this user' }, 404)
+      }
+
+      const body = (await c.req.json().catch(() => ({}))) || {}
+      const items = Array.isArray(body.items) ? body.items : null
+      if (!items || items.length === 0) {
+        return c.json({ success: false, error: 'At least one item is required' }, 400)
+      }
+      for (const item of items) {
+        if (!item || typeof item.productId !== 'string' || item.productId.length === 0) {
+          return c.json({ success: false, error: 'Product ID is required' }, 400)
+        }
+        if (!Number.isInteger(item.quantity) || item.quantity < 1) {
+          return c.json({ success: false, error: 'Quantity must be at least 1' }, 400)
+        }
+      }
+      const paymentModel = body.paymentModel
+      if (paymentModel !== 'UPFRONT' && paymentModel !== 'MONTHLY') {
+        return c.json({ success: false, error: 'Payment model must be UPFRONT or MONTHLY' }, 400)
+      }
+      const commitmentMonths = body.commitmentMonths
+      if (paymentModel === 'MONTHLY' && !commitmentMonths) {
+        return c.json({ success: false, error: 'commitmentMonths is required when paymentModel is MONTHLY' }, 400)
+      }
+      if (commitmentMonths !== undefined && commitmentMonths !== null &&
+          (!Number.isInteger(commitmentMonths) || ![12, 24, 36, 48, 60].includes(commitmentMonths))) {
+        return c.json({ success: false, error: 'commitmentMonths must be one of 12, 24, 36, 48, 60' }, 400)
+      }
+
+      // 1. Hardware must be enabled globally (cloud L5668-5671 — 403).
+      const settings = db.hardwareSettings
+        ? await db.hardwareSettings.findUnique({ where: { id: 'singleton' } })
+        : null
+      if (!settings || !settings.hardwareEnabled) {
+        return c.json({ success: false, error: 'Hardware ordering is currently disabled' }, 403)
+      }
+
+      // 2. Snapshot current product prices (only active products orderable).
+      const productIds = items.map((i) => i.productId)
+      const products = await db.hardwareProduct.findMany({
+        where: { id: { in: productIds }, isActive: true },
+      })
+      const productMap = new Map(products.map((p) => [p.id, p]))
+      for (const item of items) {
+        if (!productMap.has(item.productId)) {
+          return c.json({ success: false, error: `Product ${item.productId} is not available` }, 400)
+        }
+      }
+
+      // 3. Compute totals — identical math to the cloud (L5687-5719).
+      const orderItems = items.map((i) => {
+        const product = productMap.get(i.productId)
+        return { productId: i.productId, quantity: i.quantity, unitPrice: product.basePrice }
+      })
+      const totalBasePrice = orderItems.reduce((sum, i) => sum + i.unitPrice * i.quantity, 0)
+
+      let upfrontTotal = 0
+      let monthlyExtra = 0
+      let extraPercentage = 0
+      let commitmentMonthsDb = null
+
+      if (paymentModel === 'UPFRONT') {
+        const discount = settings.upfrontDiscount || 0
+        upfrontTotal = Math.round(totalBasePrice * (1 - discount / 100))
+        monthlyExtra = 0
+      } else {
+        // MONTHLY — look up the commitment tier.
+        const tier = await db.hardwareCommitmentTier.findFirst({
+          where: { months: commitmentMonths, isActive: true },
+        })
+        if (!tier) {
+          return c.json({ success: false, error: `Invalid commitment tier: ${commitmentMonths} months` }, 400)
+        }
+        extraPercentage = tier.extraPercentage
+        commitmentMonthsDb = tier.months
+        monthlyExtra = Math.round((totalBasePrice * (1 + extraPercentage / 100)) / tier.months)
+        upfrontTotal = 0
+      }
+
+      // 4. Create the order + items in a single local transaction (cloud L5722).
+      const order = await db.$transaction(async (tx) => {
+        return tx.hardwareOrder.create({
+          data: {
+            agencyId,
+            paymentModel,
+            commitmentMonths: commitmentMonthsDb,
+            totalBasePrice,
+            extraPercentage,
+            monthlyExtra,
+            upfrontTotal,
+            status: 'PENDING',
+            items: { create: orderItems },
+          },
+          include: { items: { include: { product: true } } },
+        })
+      }, { maxWait: 5000, timeout: 20000 })
+
+      return c.json({ success: true, order }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/agency/hardware/orders error:', error)
+      return c.json({ success: false, error: 'Failed to create hardware order' }, 500)
+    }
+  })
+
+  // POST /api/agency/enterprise-request — submit an enterprise contract
+  // request (cloud agency.ts POST /enterprise-request L5776-5845).
+  // CLOUD-MIRROR-FIRST (Task 2-d): enterprise requests need SUPER_ADMIN
+  // attention in the cloud, so when online the validated payload is
+  // forwarded to the cloud FIRST (session Bearer, 10s timeout) and the cloud
+  // response passes through verbatim — NO local write (the cloud row is the
+  // source of truth for admin-visible data and the local table is not
+  // synced, so a local copy would be a dead-end duplicate). Only when the
+  // forward is skipped (offline) or fails does the handler write locally
+  // (status PENDING, agencyName snapshotted, requestedFeatures
+  // JSON-stringified) so the submission is never lost.
+  app.post('/api/agency/enterprise-request', authMiddleware, async (c) => {
+    try {
+      if (!db || !db.enterpriseContractRequest) {
+        return c.json({ success: false, error: 'Enterprise request model unavailable — regenerate the Prisma client' }, 503)
+      }
+      const agencyId = (sessionUser && sessionUser.agencyId) || await lookupLocalAgencyIdForUser(sessionUser)
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency found for this user' }, 404)
+      }
+
+      const body = (await c.req.json().catch(() => ({}))) || {}
+      const message = body.message
+      const contactEmail = body.contactEmail
+      const contactPhone = body.contactPhone
+      const branchesNeeded = body.branchesNeeded
+      const countersNeeded = body.countersNeeded
+      const hardwareNeeded = body.hardwareNeeded
+      const requestedFeatures = body.requestedFeatures
+
+      // Manual mirror of the cloud's createEnterpriseRequestSchema
+      // (apps/api/src/lib/validations.ts L517-525) — same fields, same bounds.
+      if (typeof message !== 'string' || message.length === 0) {
+        return c.json({ success: false, error: 'Message is required' }, 400)
+      }
+      if (message.length > 2000) {
+        return c.json({ success: false, error: 'Message must be at most 2000 characters' }, 400)
+      }
+      if (typeof contactEmail !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) {
+        return c.json({ success: false, error: 'Valid contact email is required' }, 400)
+      }
+      if (contactPhone !== undefined && contactPhone !== null &&
+          (typeof contactPhone !== 'string' || contactPhone.length > 30)) {
+        return c.json({ success: false, error: 'Contact phone must be at most 30 characters' }, 400)
+      }
+      for (const pair of [['branchesNeeded', branchesNeeded], ['countersNeeded', countersNeeded]]) {
+        const value = pair[1]
+        if (value !== undefined && value !== null &&
+            (!Number.isInteger(value) || value < 1 || value > 1000)) {
+          return c.json({ success: false, error: `${pair[0]} must be an integer between 1 and 1000` }, 400)
+        }
+      }
+      if (hardwareNeeded !== undefined && hardwareNeeded !== null && typeof hardwareNeeded !== 'boolean') {
+        return c.json({ success: false, error: 'hardwareNeeded must be a boolean' }, 400)
+      }
+      if (requestedFeatures !== undefined && requestedFeatures !== null && !Array.isArray(requestedFeatures)) {
+        return c.json({ success: false, error: 'requestedFeatures must be an array of strings' }, 400)
+      }
+      if (Array.isArray(requestedFeatures)) {
+        if (requestedFeatures.length > 50) {
+          return c.json({ success: false, error: 'requestedFeatures must contain at most 50 items' }, 400)
+        }
+        for (const feature of requestedFeatures) {
+          if (typeof feature !== 'string' || feature.length === 0 || feature.length > 100) {
+            return c.json({ success: false, error: 'Each requested feature must be a string of at most 100 characters' }, 400)
+          }
+        }
+      }
+
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId },
+        select: { id: true, name: true },
+      })
+      if (!agency) {
+        return c.json({ success: false, error: 'Agency not found' }, 404)
+      }
+
+      const payload = {
+        message,
+        contactEmail,
+        contactPhone: contactPhone ?? null,
+        branchesNeeded: branchesNeeded ?? 1,
+        countersNeeded: countersNeeded ?? 1,
+        hardwareNeeded: hardwareNeeded ?? true,
+        requestedFeatures: requestedFeatures ?? [],
+      }
+
+      // Best-effort CLOUD MIRROR FIRST — failures are IGNORED (the local
+      // fallback write below still succeeds); a cloud success short-circuits
+      // the local write so the request is never double-created.
+      try {
+        const res = await fetch(cloudBaseUrl() + '/api/agency/enterprise-request', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(10000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON error body */ }
+        if (res.ok && data && data.success && data.request) {
+          console.log('[LocalAPI] enterprise-request created in the cloud — skipping local write (cloud is source of truth)')
+          return c.json(data, res.status)
+        }
+        console.warn('[LocalAPI] enterprise-request cloud mirror failed (status ' + res.status + ') — falling back to the local write')
+      } catch (mirrorErr) {
+        console.warn('[LocalAPI] enterprise-request cloud mirror failed (cloud unreachable):', mirrorErr?.message || mirrorErr)
+      }
+
+      // Local fallback write — cloud L5808-5821 field-for-field.
+      const request = await db.enterpriseContractRequest.create({
+        data: {
+          agencyId,
+          agencyName: agency.name,
+          contactEmail: payload.contactEmail,
+          contactPhone: payload.contactPhone,
+          message: payload.message,
+          requestedFeatures: JSON.stringify(payload.requestedFeatures ?? []),
+          branchesNeeded: payload.branchesNeeded ?? 1,
+          countersNeeded: payload.countersNeeded ?? 1,
+          hardwareNeeded: payload.hardwareNeeded ?? true,
+          status: 'PENDING',
+        },
+      })
+
+      return c.json({ success: true, request }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/agency/enterprise-request error:', error)
+      return c.json({ success: false, error: 'Failed to submit enterprise request' }, 500)
+    }
+  })
+
+  // GET /api/agency/enterprise-request — agency-scoped request history
+  // (cloud agency.ts GET /enterprise-request L5849-5867). Local rows win;
+  // when the local table is empty AND the cloud is reachable, the cloud's
+  // rows are mirrored best-effort (source: 'cloud') so submissions created
+  // through the cloud-mirror path still render offline. Simple precedence:
+  // local rows if any, else cloud rows if reachable, else empty.
+  app.get('/api/agency/enterprise-request', authMiddleware, async (c) => {
+    try {
+      if (!db || !db.enterpriseContractRequest) {
+        return c.json({ success: true, requests: [] })
+      }
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) {
+        return c.json({ success: true, requests: [] })
+      }
+
+      const requests = await db.enterpriseContractRequest.findMany({
+        where: { agencyId },
+        orderBy: { createdAt: 'desc' },
+      })
+      if (requests.length > 0) {
+        return c.json({ success: true, requests })
+      }
+
+      // Local table empty — best-effort cloud mirror (failures ignored).
+      try {
+        const res = await fetch(cloudBaseUrl() + '/api/agency/enterprise-request', {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          signal: AbortSignal.timeout(10000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON error body */ }
+        if (res.ok && data && Array.isArray(data.requests)) {
+          return c.json({ success: true, requests: data.requests, source: 'cloud' })
+        }
+      } catch (mirrorErr) {
+        console.warn('[LocalAPI] enterprise-request cloud mirror (GET) failed:', mirrorErr?.message || mirrorErr)
+      }
+
+      return c.json({ success: true, requests })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/enterprise-request error:', error)
+      return c.json({ success: false, error: 'Failed to load enterprise requests' }, 500)
     }
   })
 

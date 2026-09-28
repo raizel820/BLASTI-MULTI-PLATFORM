@@ -136,7 +136,9 @@ export function AdminSettings() {
         <AdminProvidersSettings />
       </motion.div>
 
-      {/* ─── Maps & Location (Task 51-c — provider / geocoding / directions / status) ─── */}
+      {/* ─── Maps & Location (Task 51-c — provider / geocoding / directions / status).
+           Task 2-b: this panel is ALSO available standalone at #/admin/maps
+           (sidebar entry "Locations & Maps"), with the Location Editor on top. ─── */}
       <motion.div {...fadeUp} transition={{ delay: 0.2 }}>
         <AdminMapsSettings />
       </motion.div>

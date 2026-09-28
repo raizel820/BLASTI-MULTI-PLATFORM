@@ -3427,6 +3427,16 @@ const en: Record<TranslationKeys, string> = {
   'adminMapsSettings.validationValid': 'Configuration valid',
   'adminMapsSettings.webBehavior': 'Open the Google Maps web fallback',
 
+  // ─── Task 2-b — admin location editor ────────────────────────────────────
+  'adminMaps': 'Locations & Maps',
+  'adminMapsSettings.locationEditor': 'Location Editor',
+  'adminMapsSettings.locationEditorDesc': 'Browse the offline Algeria wilaya/commune dataset used by the address selectors.',
+  'adminMapsSettings.locationSearchPlaceholder': 'Search a wilaya or commune — code, name, Arabic name…',
+  'adminMapsSettings.expandHint': 'Click a wilaya to expand its communes.',
+  'adminMapsSettings.communeCount': '{count} communes',
+  'adminMapsSettings.datasetNote': 'Offline static dataset powering the wilaya/commune selectors: {wilayas} wilayas · {communes} communes.',
+  'adminMapsSettings.locationNoResults': 'No wilaya or commune matches this search.',
+
 };
 
 export default en;

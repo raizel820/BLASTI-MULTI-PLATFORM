@@ -36,6 +36,7 @@ import { Share } from '@capacitor/share';
 import { PushNotifications } from '@capacitor/push-notifications';
 import { Camera } from '@capacitor/camera';
 import { Preferences } from '@capacitor/preferences';
+import { Device } from '@capacitor/device';
 
 // ─── Types ──────────────────────────────────────────────────────────────────────
 
@@ -118,12 +119,23 @@ export const blastiNativePlugin: BlastiNativePlugin = {
     const platform = Capacitor.getPlatform() as 'android' | 'ios' | 'web';
     const appInfo = await App.getInfo();
 
+    // Fill real device info via the Device plugin (Capacitor 8)
+    let osVersion = '';
+    let deviceModel = '';
+    try {
+      const info = await Device.getInfo();
+      osVersion = info.osVersion || '';
+      deviceModel = info.model || '';
+    } catch {
+      // Device plugin unavailable — keep empty fallbacks
+    }
+
     return {
       platform,
       isNative: Capacitor.isNativePlatform(),
       appVersion: appInfo.version,
-      osVersion: '', // Filled by Device plugin if available; left empty as fallback
-      deviceModel: '', // Filled by Device plugin if available
+      osVersion,
+      deviceModel,
     };
   },
 
@@ -174,7 +186,7 @@ export const blastiNativePlugin: BlastiNativePlugin = {
             schedule: { at: new Date(Date.now()) },
             extra: options.data ?? {},
             sound: undefined,
-            smallIcon: 'ic_stat_blasti',
+            smallIcon: 'ic_launcher',
             iconColor: '#10b981',
           },
         ],
@@ -201,10 +213,16 @@ export const blastiNativePlugin: BlastiNativePlugin = {
 
   async openUrl(url: string): Promise<void> {
     try {
-      // The App plugin can open URLs using the system's URL handler.
-      // For deep links (blasti://), this routes back to the app.
-      // For http(s) URLs, this opens in the system browser.
-      await App.openUrl({ url });
+      // Deep links (blasti://) are routed inside the app — the App plugin's
+      // appUrlOpen listener (setup.ts) picks up the hash change.
+      if (url.startsWith('blasti://')) {
+        window.location.href = url;
+        return;
+      }
+      // External http(s) URLs: open in the system browser. Capacitor's
+      // WebChromeClient routes window.open() targets to the default browser.
+      // (App.openUrl() was removed from the App plugin in Capacitor 8.)
+      window.open(url, '_blank');
     } catch (error) {
       console.error('[BlastiNativePlugin] openUrl failed:', error);
     }

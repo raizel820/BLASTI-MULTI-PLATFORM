@@ -27,6 +27,10 @@
  */
 
 import type { Server as SocketIOServer } from 'socket.io'
+import type { Message, Messaging } from 'firebase-admin/messaging'
+import { initializeApp, getApps, cert } from 'firebase-admin/app'
+import { getMessaging } from 'firebase-admin/messaging'
+import { readFileSync } from 'fs'
 import { db } from '@blasti/db'
 import { sendSms, normalizeDzPhone } from './sms-service'
 import { sendWhatsAppText } from './messaging/whatsapp-service'
@@ -63,6 +67,63 @@ export interface RouteResult {
 /** Cost per SMS/WhatsApp in Algerian Dinars (approximate) */
 const SMS_COST_DZD = 3
 const WHATSAPP_COST_DZD = 2
+
+// ─── Firebase Admin (FCM) — Lazy Init ───────────────────────────────────────
+
+/**
+ * Module-level Firebase messaging singleton.
+ *
+ * Credentials come from either (checked in this order):
+ *   - FIREBASE_SERVICE_ACCOUNT_JSON  — inline JSON string of the service
+ *     account (recommended; e.g. set from a platform secret manager)
+ *   - FIREBASE_SERVICE_ACCOUNT_PATH  — path to the service-account JSON file
+ *
+ * When neither variable is set (or init fails), push is DISABLED gracefully:
+ * sendViaPushNotification() logs one clear line and returns false so the
+ * router falls back to SMS/WhatsApp as designed.
+ */
+let cachedMessaging: Messaging | null = null
+let firebaseInitAttempted = false
+
+function getFirebaseMessaging(): Messaging | null {
+  if (firebaseInitAttempted) return cachedMessaging
+  firebaseInitAttempted = true
+
+  const jsonRaw = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim()
+  const jsonPath = (process.env.FIREBASE_SERVICE_ACCOUNT_PATH || '').trim()
+
+  if (!jsonRaw && !jsonPath) {
+    console.log(
+      '[NotificationRouter] Push disabled: FIREBASE_SERVICE_ACCOUNT_JSON not configured'
+    )
+    return null
+  }
+
+  try {
+    const serviceAccount: Record<string, unknown> = jsonRaw
+      ? JSON.parse(jsonRaw)
+      : JSON.parse(readFileSync(jsonPath, 'utf-8'))
+
+    // Reuse an already-initialized app (e.g. after hot reload) instead of
+    // re-initializing, which Firebase throws on.
+    const existingApps = getApps()
+    const app =
+      existingApps.length > 0
+        ? initializeApp({ credential: cert(serviceAccount) }, existingApps[0].name)
+        : initializeApp({ credential: cert(serviceAccount) })
+
+    cachedMessaging = getMessaging(app)
+    console.log('[NotificationRouter] Firebase Admin initialized — FCM push enabled')
+  } catch (error) {
+    console.warn(
+      '[NotificationRouter] Firebase Admin init failed — push disabled:',
+      error instanceof Error ? error.message : error
+    )
+    cachedMessaging = null
+  }
+
+  return cachedMessaging
+}
 
 // ─── Main Router Function ───────────────────────────────────────────────────
 
@@ -263,44 +324,61 @@ export async function sendViaWebSocket(
 // ─── Helper: Send via FCM Push Notification ──────────────────────────────────
 
 /**
- * Send a push notification via Firebase Cloud Messaging.
+ * Send a push notification via Firebase Cloud Messaging (Task 47-b: REAL).
  *
- * NOTE: This is a stub implementation. When the Firebase Admin SDK is
- * configured, replace the stub body with actual FCM dispatch logic.
- * The stub logs the attempt and returns true to simulate successful delivery.
+ * Requires the Firebase Admin SDK credentials via FIREBASE_SERVICE_ACCOUNT_JSON
+ * (inline service-account JSON, recommended) or FIREBASE_SERVICE_ACCOUNT_PATH
+ * (file path). When neither is configured, this logs ONE clear line and returns
+ * false so the router falls back to SMS/WhatsApp as designed.
  */
 export async function sendViaPushNotification(
   fcmToken: string,
   payload: NotificationPayload
 ): Promise<boolean> {
   try {
-    // ── Stub: Simulate FCM push ─────────────────────────────────────────
-    // TODO: Replace with actual Firebase Admin SDK call:
-    //
-    // import * as admin from 'firebase-admin'
-    // const message: admin.messaging.Message = {
-    //   token: fcmToken,
-    //   notification: {
-    //     title: payload.type === 'TURN_CALL' ? 'Your Turn!' : 'Queue Update',
-    //     body: payload.messageAr || payload.message,
-    //   },
-    //   data: {
-    //     type: payload.type,
-    //     reservationId: payload.reservationId,
-    //     agencyId: payload.agencyId,
-    //   },
-    //   android: { priority: 'high' },
-    //   apns: { payload: { aps: { sound: 'default' } } },
-    // }
-    // const response = await admin.messaging().send(message)
-    // return !!response
+    const messaging = getFirebaseMessaging()
+    if (!messaging) return false
+
+    const message: Message = {
+      token: fcmToken,
+      notification: {
+        // TURN_CALL gets an immediate "your turn" title (Arabic-first);
+        // other types use the app name.
+        title:
+          payload.type === 'TURN_CALL'
+            ? payload.messageAr || 'دورك الآن!'
+            : 'BLASTI',
+        body: payload.messageAr || payload.message,
+      },
+      // FCM data payload values MUST all be strings.
+      data: {
+        type: payload.type,
+        reservationId: payload.reservationId ?? '',
+        agencyId: payload.agencyId ?? '',
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          // Matches the notification channel the mobile shell creates
+          // for turn alerts (high-importance, alarm sound).
+          channelId: 'blasti-turn-alert',
+          sound: 'blasti_alarm.wav',
+        },
+      },
+      apns: {
+        payload: {
+          aps: { sound: 'default' },
+        },
+      },
+    }
+
+    const messageId = await messaging.send(message)
 
     console.log(
       `[NotificationRouter] FCM Push → token:${fcmToken.substring(0, 8)}… ` +
-        `(type: ${payload.type}, msg: "${(payload.messageAr || payload.message).substring(0, 40)}…")`
+        `(type: ${payload.type}, msg: "${(payload.messageAr || payload.message).substring(0, 40)}…", messageId: ${messageId})`
     )
 
-    // Stub returns true to simulate successful delivery
     return true
   } catch (error) {
     console.warn(

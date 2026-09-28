@@ -227,6 +227,34 @@ export const nativeBridge = {
     try {
       if (isCapacitorNative()) {
         const plugin = getCapacitorPlugin('BarcodeScanner');
+
+        // ── MLKit barcode scanning (@capacitor-mlkit/barcode-scanning) ──
+        // Registered plugin name IS "BarcodeScanner"; its API is scan()
+        // (the old community plugin's start() shape is handled below).
+        if (plugin && typeof plugin.scan === 'function') {
+          // Best-effort camera permission request. Depending on the MLKit
+          // version this resolves as { camera: 'granted' } (state enum) or
+          // { granted: boolean }. Ignore the shape AND any failure — scan()
+          // surfaces the real permission state when it runs.
+          if (typeof plugin.requestCameraPermission === 'function') {
+            try {
+              await (plugin.requestCameraPermission as () => Promise<unknown>)();
+            } catch {
+              // Advisory only — scan() reports the actual permission result
+            }
+          }
+
+          const result = await (plugin.scan as (opts: unknown) => Promise<{
+            barcodes?: Array<{ rawValue?: string; displayValue?: string; format: string }>;
+          }>)({ formats: ['QR_CODE'] });
+
+          const barcode = (result.barcodes ?? []).find(
+            (b) => ((b.rawValue ?? b.displayValue) ?? '').trim() !== '',
+          );
+          return barcode ? ((barcode.rawValue ?? barcode.displayValue) ?? null) : null;
+        }
+
+        // ── Legacy fallback: old community plugin ({ hasContent, content }) ──
         if (plugin && typeof plugin.start === 'function') {
           const result = await (plugin.start as (opts?: unknown) => Promise<{ hasContent: boolean; content?: string }>)(
             { targetedFormats: ['QR_CODE'] },
@@ -571,6 +599,200 @@ export const nativeBridge = {
     }
   },
 
+  // ── Biometrics ────────────────────────────────────────────────────────────
+
+  /**
+   * Check whether biometric authentication (fingerprint / Face ID) is
+   * available on this device.
+   * - Capacitor: NativeBiometric plugin (@capgo/capacitor-native-biometric)
+   * - Web / Electron: false (no secure-enclave bridge)
+   */
+  async isBiometricsAvailable(): Promise<boolean> {
+    if (!isCapacitorNative()) return false;
+
+    try {
+      const plugin = getCapacitorPlugin('NativeBiometric');
+      if (!plugin || typeof plugin.isAvailable !== 'function') return false;
+
+      const result = await (plugin.isAvailable as (opts?: unknown) => Promise<{ isAvailable: boolean }>)(
+        {},
+      );
+      return !!result?.isAvailable;
+    } catch (error) {
+      console.error('[nativeBridge] isBiometricsAvailable failed:', error);
+      return false;
+    }
+  },
+
+  /**
+   * Prompt the user to authenticate with biometrics.
+   * Resolves true ONLY when the device confirms a successful verification;
+   * any error, cancellation, or missing plugin resolves false.
+   */
+  async authenticateWithBiometrics(reason?: string): Promise<boolean> {
+    if (!isCapacitorNative()) return false;
+
+    try {
+      const plugin = getCapacitorPlugin('NativeBiometric');
+      if (!plugin || typeof plugin.verifyIdentity !== 'function') return false;
+
+      await (plugin.verifyIdentity as (opts: unknown) => Promise<void>)({
+        reason: reason ?? 'Log in to BLASTI',
+        title: 'BLASTI',
+        subtitle: reason ?? '',
+      });
+      return true;
+    } catch (error) {
+      console.error('[nativeBridge] authenticateWithBiometrics failed:', error);
+      return false;
+    }
+  },
+
+  /**
+   * Securely store a credential for `service` in the device's keystore
+   * (Keychain on iOS, Keystore + EncryptedSharedPreferences on Android).
+   * No-op when the plugin is unavailable.
+   */
+  async setBiometricCredentials(service: string, password: string): Promise<void> {
+    if (!isCapacitorNative()) return;
+
+    try {
+      const plugin = getCapacitorPlugin('NativeBiometric');
+      if (!plugin || typeof plugin.setCredentials !== 'function') return;
+
+      await (plugin.setCredentials as (opts: unknown) => Promise<void>)({
+        username: service,
+        password,
+      });
+    } catch (error) {
+      console.error('[nativeBridge] setBiometricCredentials failed:', error);
+    }
+  },
+
+  /**
+   * Read the stored password for `service` from the device keystore.
+   * Returns null when nothing is stored, the plugin is unavailable,
+   * or the read fails (a normal, non-fatal state).
+   */
+  async getBiometricCredentials(service: string): Promise<string | null> {
+    if (!isCapacitorNative()) return null;
+
+    try {
+      const plugin = getCapacitorPlugin('NativeBiometric');
+      if (!plugin || typeof plugin.getCredentials !== 'function') return null;
+
+      const result = await (plugin.getCredentials as (opts: unknown) => Promise<{ password?: string }>)(
+        { username: service },
+      );
+      return result?.password ?? null;
+    } catch (error) {
+      console.warn('[nativeBridge] getBiometricCredentials failed:', error);
+      return null;
+    }
+  },
+
+  // ── Geolocation ───────────────────────────────────────────────────────────
+
+  /**
+   * Get the device's current position.
+   * - Capacitor: Geolocation plugin (high accuracy, 10s timeout)
+   * - Web: navigator.geolocation
+   * Returns null when the position cannot be determined.
+   */
+  async getCurrentPosition(): Promise<{ lat: number; lng: number; accuracy?: number } | null> {
+    try {
+      if (isCapacitorNative()) {
+        const plugin = getCapacitorPlugin('Geolocation');
+        if (plugin && typeof plugin.getCurrentPosition === 'function') {
+          const result = await (plugin.getCurrentPosition as (opts: unknown) => Promise<{
+            coords: { latitude: number; longitude: number; accuracy?: number };
+          }>)({ enableHighAccuracy: true, timeout: 10000 });
+
+          const coords = result?.coords;
+          if (
+            coords &&
+            typeof coords.latitude === 'number' &&
+            typeof coords.longitude === 'number'
+          ) {
+            return {
+              lat: coords.latitude,
+              lng: coords.longitude,
+              ...(typeof coords.accuracy === 'number' ? { accuracy: coords.accuracy } : {}),
+            };
+          }
+          return null;
+        }
+      }
+
+      // Web fallback: W3C Geolocation API
+      if (typeof navigator !== 'undefined' && navigator.geolocation) {
+        return await new Promise<{ lat: number; lng: number; accuracy?: number } | null>(
+          (resolve) => {
+            navigator.geolocation.getCurrentPosition(
+              (position) => {
+                resolve({
+                  lat: position.coords.latitude,
+                  lng: position.coords.longitude,
+                  accuracy: position.coords.accuracy,
+                });
+              },
+              (error) => {
+                console.warn('[nativeBridge] getCurrentPosition (web) failed:', error.message);
+                resolve(null);
+              },
+              { enableHighAccuracy: true, timeout: 10000 },
+            );
+          },
+        );
+      }
+    } catch (error) {
+      console.error('[nativeBridge] getCurrentPosition failed:', error);
+    }
+
+    return null;
+  },
+
+  // ── Motion / Sensors ──────────────────────────────────────────────────────
+
+  /**
+   * Check whether motion (accelerometer) events are available.
+   * DeviceMotionEvent works inside both native WebViews and plain browsers
+   * — no native plugin is required (@capacitor/motion is JS-only).
+   */
+  isMotionAvailable(): boolean {
+    return typeof window !== 'undefined' && 'DeviceMotionEvent' in window;
+  },
+
+  /**
+   * Subscribe to device motion (accelerometer) updates.
+   * Maps `devicemotion` events' accelerationIncludingGravity to {x, y, z}.
+   * Returns a removal function; a no-op when motion is unavailable.
+   */
+  startMotionUpdates(
+    cb: (accel: { x: number; y: number; z: number }) => void,
+  ): () => void {
+    if (typeof window === 'undefined' || !('DeviceMotionEvent' in window)) {
+      return () => {};
+    }
+
+    const handler = (event: DeviceMotionEvent) => {
+      const accel = event.accelerationIncludingGravity;
+      if (
+        accel &&
+        typeof accel.x === 'number' &&
+        typeof accel.y === 'number' &&
+        typeof accel.z === 'number'
+      ) {
+        cb({ x: accel.x, y: accel.y, z: accel.z });
+      }
+    };
+
+    window.addEventListener('devicemotion', handler);
+    return () => {
+      window.removeEventListener('devicemotion', handler);
+    };
+  },
+
   // ── Permissions ───────────────────────────────────────────────────────────
 
   /**
@@ -715,16 +937,11 @@ async function requestSinglePermission(permission: NativePermission): Promise<bo
       return false;
     }
 
-    case 'biometrics': {
-      if (isCapacitorNative()) {
-        const plugin = getCapacitorPlugin('BiometricAuth');
-        if (plugin && typeof plugin.checkBiometrics === 'function') {
-          const status = await (plugin.checkBiometrics as () => Promise<{ isAvailable: boolean }>)();
-          return status.isAvailable;
-        }
-      }
-      return false;
-    }
+    case 'biometrics':
+      // Task 47-b: probe the real NativeBiometric plugin
+      // (@capgo/capacitor-native-biometric) — the previous 'BiometricAuth'
+      // checkBiometrics() path targeted a plugin that was never registered.
+      return nativeBridge.isBiometricsAvailable();
 
     default:
       return false;

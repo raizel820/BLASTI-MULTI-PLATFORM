@@ -3428,6 +3428,16 @@ const fr: Record<TranslationKeys, string> = {
   'adminMapsSettings.validationValid': 'Configuration valide',
   'adminMapsSettings.webBehavior': 'Ouvrir la version web de Google Maps',
 
+  // ─── Task 2-b — admin location editor ────────────────────────────────────
+  'adminMaps': 'Localisation & Cartes',
+  'adminMapsSettings.locationEditor': 'Éditeur de localisation',
+  'adminMapsSettings.locationEditorDesc': 'Parcourez le jeu de données hors ligne des wilayas/communes d’Algérie utilisé par les sélecteurs d’adresse.',
+  'adminMapsSettings.locationSearchPlaceholder': 'Rechercher une wilaya ou une commune — code, nom, nom arabe…',
+  'adminMapsSettings.expandHint': 'Cliquez sur une wilaya pour déplier ses communes.',
+  'adminMapsSettings.communeCount': '{count} communes',
+  'adminMapsSettings.datasetNote': 'Jeu de données statique hors ligne des sélecteurs wilaya/commune : {wilayas} wilayas · {communes} communes.',
+  'adminMapsSettings.locationNoResults': 'Aucune wilaya ou commune ne correspond à cette recherche.',
+
 };
 
 export default fr;

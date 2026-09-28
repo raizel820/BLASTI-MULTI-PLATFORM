@@ -3,9 +3,8 @@
 	"appName": "BLASTI",
 	"webDir": "../../apps/web/out",
 	"server": {
-		"url": "http://192.168.100.5:3000",
-		"cleartext": true,
-		"androidScheme": "http"
+		"cleartext": false,
+		"androidScheme": "https"
 	},
 	"plugins": {
 		"SplashScreen": {
@@ -29,7 +28,7 @@
 			]
 		},
 		"LocalNotifications": {
-			"smallIcon": "ic_stat_blasti",
+			"smallIcon": "ic_launcher",
 			"iconColor": "#10b981",
 			"sound": "default"
 		},

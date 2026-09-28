@@ -52,6 +52,49 @@ import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
 import { useMapConfig } from '@/lib/map/use-map-config';
 import type { GeocodeComponents } from '@/lib/map';
 
+// ─── Task 2-c — tolerant wilaya helpers (client-side copies; server code is
+// NOT imported on purpose — apps/api/src/lib/validations.ts owns the same
+// logic: canonicalWilayaCode + the corrected 01-58 regex) ─────────────────
+
+/** Official two-digit ANI wilaya codes 01-58 (corrected: the old
+ * [1-5][0-8] class silently rejected the real codes 19/29/39/49). */
+const WILAYA_CODE_REGEX = /^(0[1-9]|[1-4][0-9]|5[0-8])$/;
+
+/** "19", 19, " 19 ", "١٩", "۱۹" → "19"; "9" → "09". Anything that is not a
+ * 1-2 digit value after mapping Arabic-Indic (U+0660-0669) and Eastern
+ * Arabic-Indic (U+06F0-06F9) digits to ASCII is returned unchanged so
+ * downstream validation still rejects it (e.g. a 5-digit postal code must
+ * never become a wilaya). */
+const normalizeWilayaInput = (v: string): string => {
+  const mapped = v
+    .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06F0));
+  const digits = mapped.replace(/\D/g, '');
+  if (digits.length >= 1 && digits.length <= 2) return digits.padStart(2, '0');
+  return mapped.trim();
+};
+
+/** Fold a Latin name for comparison: strip diacritics (NFD + combining
+ * marks), lowercase, drop everything but [a-z0-9] so "Sétif" ≍ "Setif",
+ * "Ain-Legradj" ≍ "Ain Legradj", "M'Sila" ≍ "Msila". */
+const foldLatinName = (v: string): string =>
+  v
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+
+/** Strip the common wilaya prefixes/suffixes geocoders prepend/append
+ * ("Wilaya de Sétif", "Province of Sétif", "Sétif Province") and the Arabic
+ * "ولاية" prefix so either side matches the bare dataset name. */
+const stripWilayaAffixes = (v: string): string =>
+  v
+    .replace(/^\s*(?:wilaya|province|governorate)\s*(?:de\s+|d'|du\s+|of\s+|el\s+)?\s*/i, '')
+    .replace(/\s+(?:province|wilaya|governorate)\s*$/i, '')
+    .replace(/ولاية/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
 // ─── Floating Label Input ─────────────────────────────
 function FloatingInput({
   id,
@@ -402,14 +445,37 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   // Task 51-b — match a geocoded wilaya name (Latin OR Arabic — Nominatim
   // answers in the UI language) to the official dataset. No match → null:
   // NEVER invent a wilaya (spec §29).
+  // Task 2-c — normalized matching, in order:
+  //  1. Digit input ("19", " 19 ", "١٩", "Wilaya 19") → canonical two-digit
+  //     code, accepted only when it is a real 01-58 code (never invented);
+  //  2. Latin match after stripping geocoder prefixes/suffixes and folding
+  //     diacritics/case/punctuation ("Wilaya de Sétif" ≍ "Sétif" ≍ "Setif");
+  //  3. Arabic match, whitespace-insensitive with "ولاية" stripped from BOTH
+  //     the geocoded name and the dataset's nameAr.
   const findWilayaCodeByGeocodeName = (name: string | null): string | null => {
     if (!name) return null;
-    const q = name.trim().toLowerCase();
-    const hit = ALGERIA_WILAYAS.find(
-      (w) =>
-        w.name.toLowerCase() === q ||
-        w.nameAr.replace(/\s/g, '') === name.replace(/\s/g, ''),
-    );
+    const raw = name.trim();
+    if (!raw) return null;
+
+    // 1) digit-bearing geocode name → canonical code or nothing
+    const mapped = raw
+      .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+      .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06F0));
+    const digits = mapped.replace(/\D/g, '');
+    if (digits.length >= 1 && digits.length <= 2) {
+      const code = digits.padStart(2, '0');
+      return WILAYA_CODE_REGEX.test(code) ? code : null;
+    }
+
+    // 2) folded Latin match (prefix/suffix-stripped, diacritic-insensitive)
+    const qLatin = foldLatinName(stripWilayaAffixes(mapped));
+    // 3) Arabic match ("ولاية سطيف" ≍ "سطيف" ≍ dataset "سطيف")
+    const qArabic = mapped.replace(/ولاية/g, '').replace(/\s/g, '');
+    const hit = ALGERIA_WILAYAS.find((w) => {
+      const latin = foldLatinName(w.name);
+      const arabic = w.nameAr.replace(/ولاية/g, '').replace(/\s/g, '');
+      return (qLatin !== '' && latin === qLatin) || (qArabic !== '' && arabic === qArabic);
+    });
     return hit ? hit.code : null;
   };
 
@@ -421,19 +487,26 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
 
     if (components.street && !address.trim()) setAddress(components.street);
 
-    const code = findWilayaCodeByGeocodeName(components.wilaya);
-    if (code && code !== wilayaCode) {
-      setWilayaCode(code);
+    // Task 2-c — the matcher already returns a canonical two-digit code;
+    // normalizeWilayaInput again as belt-and-braces before comparing/storing.
+    const code = normalizeWilayaInput(findWilayaCodeByGeocodeName(components.wilaya) || '');
+    const validCode = WILAYA_CODE_REGEX.test(code) ? code : null;
+    if (validCode && validCode !== wilayaCode) {
+      setWilayaCode(validCode);
       setCommuneName(''); // dependent list — reset the commune
     }
-    const effectiveCode = code || wilayaCode;
-    if (components.city && effectiveCode) {
+    const effectiveCode = validCode || normalizeWilayaInput(wilayaCode);
+    if (components.city && WILAYA_CODE_REGEX.test(effectiveCode)) {
       const wilaya = findWilayaByCode(effectiveCode);
-      const q = components.city.trim().toLowerCase();
+      // Task 2-c — folded Latin + raw Arabic commune matching, same
+      // normalization as the wilaya matcher (diacritics/punctuation/
+      // whitespace-insensitive).
+      const qLatin = foldLatinName(components.city);
+      const qArabic = components.city.replace(/\s/g, '');
       const match = wilaya?.communes.find(
         (c) =>
-          c.name.toLowerCase() === q ||
-          c.nameAr.replace(/\s/g, '') === components.city!.replace(/\s/g, ''),
+          (qLatin !== '' && foldLatinName(c.name) === qLatin) ||
+          (qArabic !== '' && c.nameAr.replace(/\s/g, '') === qArabic),
       );
       // Only a commune that exists in the selected wilaya is applied; the
       // commune field only auto-fills while the user has not chosen one.
@@ -619,13 +692,16 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       if (nameAr.trim()) body.nameAr = nameAr.trim();
       if (nameFr.trim()) body.nameFr = nameFr.trim();
       if (address.trim()) body.address = address.trim();
-      // Task 5 — Algeria address selectors: sent as a PAIR (two-digit wilaya
-      // code + commune Latin name) only when both are chosen. Skipping them
-      // keeps the request valid and lets the server defaults apply
-      // coherently (wilaya '28' + city "M'Sila").
-      if (wilayaCode && communeName) {
-        body.wilaya = wilayaCode;
-        body.city = communeName;
+      // Task 2-c — wilaya is sent whenever a canonical 01-58 code is known;
+      // the commune rides along only when one is selected (city is optional
+      // server-side). Requiring BOTH (the old pair rule) silently dropped a
+      // geocode-matched wilaya whose commune did not match, letting the
+      // server default (wilaya '28' / M'Sila) land instead — and the strict
+      // raw-value 400 on "19" blocked the whole wizard.
+      const canonicalWilaya = normalizeWilayaInput(wilayaCode);
+      if (WILAYA_CODE_REGEX.test(canonicalWilaya)) {
+        body.wilaya = canonicalWilaya;
+        if (communeName.trim()) body.city = communeName.trim();
       }
       if (phone.trim()) body.phone = phone.trim();
       if (email.trim()) body.email = email.trim();
@@ -1089,6 +1165,18 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                       value={postalCode}
                       onChange={(v) => {
                         setPostalCode(v);
+                        // Task 2-c — manual zip edit → related fields auto-update:
+                        // an Algerian postal code's first TWO digits ARE the wilaya
+                        // code, so a valid 01-58 prefix (once the user has typed at
+                        // least two characters) selects that wilaya and resets the
+                        // dependent commune list, keeping the pair coherent.
+                        if (v.trim().length >= 2) {
+                          const prefix = normalizeWilayaInput(v.slice(0, 2));
+                          if (WILAYA_CODE_REGEX.test(prefix) && prefix !== wilayaCode) {
+                            setWilayaCode(prefix);
+                            setCommuneName('');
+                          }
+                        }
                         // Task 51-b — manual edit guard (spec §30).
                         manualTouchedRef.current = true;
                       }}

@@ -10,6 +10,7 @@
 
 import { db } from '@blasti/db'
 import { sendSms, type SendSmsResult } from '../lib/sms-service'
+import { sendViaPushNotification, type NotificationPayload } from '../lib/notification-router'
 
 const POLL_INTERVAL_MS = 30_000 // 30 seconds
 let workerInterval: ReturnType<typeof setInterval> | null = null
@@ -49,6 +50,8 @@ interface DelayedJobPayload {
   agencyId: string
   userId: string
   channel?: 'SMS' | 'WHATSAPP' | 'BOTH' // defaults to SMS
+  reservationId?: string
+  type?: string // TURN_CALL | ADVANCE_WARNING | ...
 }
 
 async function processPendingJobs(): Promise<number> {
@@ -66,6 +69,8 @@ async function processPendingJobs(): Promise<number> {
           phoneNumber: true,
           notificationPref: true,
           freeSmsCount: true,
+          isAppOnline: true,
+          fcmToken: true,
         },
       },
     },
@@ -114,6 +119,42 @@ async function processPendingJobs(): Promise<number> {
       }
 
       const effectiveChannel = channel || resolveChannel(job.user.notificationPref)
+
+      // ── Step 2.5: Try free FCM push before any paid carrier channel ──
+      // Push costs 0 DZD and works regardless of the user's carrier-channel
+      // preference (even APP_ONLY users should receive free push). If the
+      // push infrastructure is not configured (no FIREBASE_SERVICE_ACCOUNT_*)
+      // or the token is stale, this returns false and we fall through to
+      // the carrier flow below, unchanged.
+      if (job.user.fcmToken) {
+        try {
+          const pushSent = await sendViaPushNotification(job.user.fcmToken, {
+            userId,
+            reservationId: payload.reservationId ?? '',
+            agencyId,
+            type: (payload.type as NotificationPayload['type']) || 'ADVANCE_WARNING',
+            message,
+            messageAr: message,
+          })
+          if (pushSent) {
+            await db.delayedJob.update({
+              where: { id: job.id },
+              data: { status: 'SENT' },
+            })
+            console.log(`[notification-worker] Job ${job.id} SENT via FCM push (free) — carrier SMS skipped`)
+            processed++
+            continue
+          }
+          console.log(
+            `[notification-worker] Push unavailable for job ${job.id} — falling back to carrier channel ${effectiveChannel}`
+          )
+        } catch (pushError) {
+          console.warn(
+            `[notification-worker] Push attempt failed for job ${job.id} — falling back to carrier channel:`,
+            pushError instanceof Error ? pushError.message : pushError
+          )
+        }
+      }
 
       // APP_ONLY preference → no carrier alert needed
       if (effectiveChannel === 'APP_ONLY') {

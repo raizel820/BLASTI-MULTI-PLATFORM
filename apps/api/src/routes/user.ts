@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { z } from 'zod'
 import { db, dbRaw } from '@blasti/db'
 import { requireAuth, authErrorResponse } from '../lib/auth'
 import { validateBody, updateProfileSchema, updatePreferencesSchema, changePasswordSchema } from '../lib/validations'
@@ -7,6 +8,15 @@ import { checkRateLimit, RateLimitError, PASSWORD_RESET_RATE_LIMIT } from '../li
 import { normalizeRecordFileUrls } from '../lib/file-url'
 
 const app = new Hono()
+
+// ─── Validation Schemas ─────────────────────────────────────────────────────
+
+// Task 47-b — FCM push token registration (POST /push-token)
+const pushTokenSchema = z.object({
+  token: z.string().min(10).max(4096),
+  platform: z.string().max(20).optional(),
+  deviceId: z.string().max(100).optional(),
+})
 
 // GET /user/profile — Fetch user profile
 app.get('/profile', async (c) => {
@@ -382,6 +392,53 @@ app.get('/customer/service-stats', async (c) => {
       totalCompleted,
       averageAll,
     })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// POST /user/push-token — Register the current user's FCM push token (Task 47-b)
+// Called by the mobile app (apps/web/src/lib/push-registration.ts) after the
+// Capacitor PushNotifications plugin fires its 'registration' event.
+app.post('/push-token', async (c) => {
+  try {
+    const user = await requireAuth(c)
+
+    const body = await c.req.json()
+    const validation = pushTokenSchema.safeParse(body)
+    if (!validation.success) {
+      return c.json({ success: false, error: 'Invalid input', details: validation.error.errors }, 400)
+    }
+
+    const { token, platform, deviceId } = validation.data
+
+    // 1. Store the token on the user — the notification router uses
+    //    user.fcmToken for free-channel push delivery.
+    await db.user.update({
+      where: { id: user.id },
+      data: { fcmToken: token },
+    })
+
+    // 2. Optionally track the device registration for multi-device support.
+    if (deviceId) {
+      await db.deviceRegistration.upsert({
+        where: { userId_deviceId: { userId: user.id, deviceId } },
+        create: {
+          userId: user.id,
+          deviceId,
+          deviceToken: token,
+          platform: platform ?? 'unknown',
+        },
+        update: {
+          deviceToken: token,
+          platform: platform ?? 'unknown',
+          lastActiveAt: new Date(),
+        },
+      })
+    }
+
+    return c.json({ success: true })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

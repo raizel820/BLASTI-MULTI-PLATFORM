@@ -10,8 +10,42 @@ import { z } from 'zod'
  * Task 5 — Algeria address selectors. Official two-digit ANI wilaya codes
  * '01'-'58'. Only the canonical padded form passes; route handlers normalize
  * client values with padStart(2,'0') before persisting.
+ *
+ * Task 2-c — CORRECTED the class: the old pattern (0[1-9]|[1-5][0-8]) had a
+ * latent typo ([0-8] excludes 9) that silently rejected the REAL wilaya
+ * codes 19 (Sétif), 29 (El M'Ghair), 39 (El Meniaa), 49 (Timimoun) — the
+ * exact "wilaya must be a two-digit wilaya code (01-58)" failure users hit
+ * when geocoding auto-filled Sétif. The corrected form covers exactly
+ * 01-09, 10-49 and 50-58 and still rejects 00, 59+ and non-canonical
+ * values.
  */
-export const wilayaCodeRegex = /^(0[1-9]|[1-5][0-8])$/
+export const wilayaCodeRegex = /^(0[1-9]|[1-4][0-9]|5[0-8])$/
+
+/**
+ * Task 2-c — tolerant wilaya-code canonicalization (fixes "wilaya must be a
+ * two-digit wilaya code" 400s on geocode-filled values). Maps Arabic-Indic
+ * digits ٠١٢٣٤٥٦٧٨٩ (U+0660-0669) AND Eastern Arabic-Indic ۰۱۲۳۴۵۶۷۸۹
+ * (U+06F0-06F9) to ASCII, strips non-digits, and pads a 1-2 digit value to
+ * the canonical two-digit form. Anything else (3+ digits, letters, "019")
+ * is returned unchanged so the schema regex still rejects it — e.g. a
+ * 5-digit postal code must NOT be mistaken for a wilaya code.
+ */
+export function canonicalWilayaCode(input: unknown): string {
+  const raw = String(input ?? '')
+    .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06F0));
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length >= 1 && digits.length <= 2) return digits.padStart(2, '0');
+  return raw;
+}
+
+/** Task 2-c — tolerant wilaya field: string OR number in, canonical
+ * two-digit code out (regex still rejects non-canonical garbage). The
+ * transformed value is what handlers receive via validateBody. */
+const wilayaField = z
+  .union([z.string(), z.number()])
+  .transform(canonicalWilayaCode)
+  .refine((v) => wilayaCodeRegex.test(v), 'wilaya must be a two-digit wilaya code (01-58)');
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
@@ -41,7 +75,8 @@ export const registerSchema = z.object({
   avatarUrl: z.string().url().optional().or(z.literal('')),
   // Task 5 — optional Algeria address (register form location selectors).
   // wilaya = two-digit official code, commune = baladiya Latin name.
-  wilaya: z.string().regex(wilayaCodeRegex, 'wilaya must be a two-digit wilaya code (01-58)').optional(),
+  // Task 2-c — tolerant pipeline (string|number → canonical two-digit code).
+  wilaya: wilayaField.optional(),
   commune: z.string().min(1).max(120).optional(),
 })
 
@@ -137,7 +172,10 @@ export const updateAgencyProfileSchema = z.object({
   // Task 5 — Algeria address selectors (agency profile). Nullable to follow
   // the established null-tolerant spread-the-GET-response pattern; wilaya is
   // the two-digit official code, city is the commune (baladiya) Latin name.
-  wilaya: z.string().regex(wilayaCodeRegex, 'wilaya must be a two-digit wilaya code (01-58)').nullable().optional(),
+  // Task 2-c — tolerant pipeline (string|number → canonical two-digit code);
+  // null/undefined short-circuit BEFORE the transform, so optionality and
+  // "explicit null clears the field" semantics are unchanged.
+  wilaya: wilayaField.nullable().optional(),
   city: z.string().min(1).max(120).nullable().optional(),
   // Task 51 — Agency Location & Maps (spec §2): canonical provider-independent
   // location fields. Nullable so "spread the GET response back" saves can
@@ -238,7 +276,8 @@ export const adminCreateAgencySchema = z.object({
   // Task 5 — Algeria address selectors (create-agency wizard address step).
   // wilaya = two-digit official code, city = commune (baladiya) Latin name.
   // Both optional — when omitted the Agency row keeps its DB defaults.
-  wilaya: z.string().regex(wilayaCodeRegex, 'wilaya must be a two-digit wilaya code (01-58)').optional(),
+  // Task 2-c — tolerant pipeline (string|number → canonical two-digit code).
+  wilaya: wilayaField.optional(),
   city: z.string().min(1).max(120).optional(),
   // Task 51 — Agency Location & Maps (spec §27/§28): optional location picked
   // on the create-agency map. Range violations 400 at validation time; the

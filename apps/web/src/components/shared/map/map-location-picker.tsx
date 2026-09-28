@@ -88,6 +88,7 @@ export function MapLocationPicker({
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const providerRef = useRef<MapProviderInstance | null>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const initSeqRef = useRef(0);
   const lastEmittedRef = useRef<string>('');
   const zoomLiftedRef = useRef(false);
@@ -186,6 +187,16 @@ export function MapLocationPicker({
       .then(() => {
         if (initSeqRef.current !== seq) return; // superseded by a re-init
         setMapState('ready');
+        // Task 2-a (g): containers that were 0-size at init (hidden tab/step,
+        // late layout) keep a stale canvas forever — re-measure on change.
+        if (typeof ResizeObserver !== 'undefined') {
+          resizeObserverRef.current?.disconnect();
+          const ro = new ResizeObserver(() => {
+            window.requestAnimationFrame(() => provider.resize?.());
+          });
+          ro.observe(container);
+          resizeObserverRef.current = ro;
+        }
       })
       .catch((err) => {
         if (initSeqRef.current !== seq) return;
@@ -195,6 +206,8 @@ export function MapLocationPicker({
 
     return () => {
       initSeqRef.current += 1; // invalidate in-flight init callbacks
+      resizeObserverRef.current?.disconnect();
+      resizeObserverRef.current = null;
       provider.destroy();
       if (providerRef.current === provider) providerRef.current = null;
     };
@@ -267,7 +280,11 @@ export function MapLocationPicker({
           className="relative w-full rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800"
           style={{ height }}
         >
-          <div ref={containerRef} className="absolute inset-0" dir="ltr" />
+          {/* NOTE: h-full w-full instead of `absolute inset-0` — maplibre-gl.css
+              sets `.maplibregl-map { position: relative }` UNLAYERED, which beats
+              Tailwind 4's layered `absolute` utility → the container collapsed to
+              0 height and the map was invisible (same fix as agency-location-map). */}
+          <div ref={containerRef} className="h-full w-full" dir="ltr" />
           {mapState === 'loading' && (
             <div className="absolute inset-0 flex items-center justify-center bg-gray-100/80 dark:bg-gray-800/80 z-10">
               <Loader2 className="h-6 w-6 animate-spin text-emerald-600" />

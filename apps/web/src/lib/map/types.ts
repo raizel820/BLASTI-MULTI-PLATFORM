@@ -87,6 +87,13 @@ export interface MapProviderInstance {
   /** Optional: provider-native popup anchored to the marker (read-only views). */
   showMarkerInfo?(title: string, description?: string): void;
 
+  /**
+   * Optional: recompute the canvas size from the container (Task 2-a).
+   * Providers that need it re-measure on demand; components call it from a
+   * ResizeObserver so containers laid out after `init()` recover.
+   */
+  resize?(): void;
+
   /** Tear down listeners, marker and map instance. Safe to call twice. */
   destroy(): void;
 }

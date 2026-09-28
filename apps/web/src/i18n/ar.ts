@@ -3427,6 +3427,16 @@ const ar = {
   'adminMapsSettings.validationValid': 'الإعدادات صالحة',
   'adminMapsSettings.webBehavior': 'فتح نسخة الويب من خرائط جوجل',
 
+  // ─── Task 2-b — admin location editor ────────────────────────────────────
+  'adminMaps': 'المواقع والخرائط',
+  'adminMapsSettings.locationEditor': 'محرر المواقع',
+  'adminMapsSettings.locationEditorDesc': 'استعرض مجموعة بيانات الولايات والبلديات الجزائرية غير المتصلة المستخدمة في محدّدات العنوان.',
+  'adminMapsSettings.locationSearchPlaceholder': 'ابحث عن ولاية أو بلدية — الرمز، الاسم، الاسم العربي…',
+  'adminMapsSettings.expandHint': 'انقر على ولاية لعرض بلدياتها.',
+  'adminMapsSettings.communeCount': '{count} بلدية',
+  'adminMapsSettings.datasetNote': 'مجموعة بيانات ثابتة غير متصلة تُغذّي محدّدات الولايات والبلديات: {wilayas} ولاية · {communes} بلدية.',
+  'adminMapsSettings.locationNoResults': 'لا توجد ولاية أو بلدية مطابقة لهذا البحث.',
+
 };
 
 export default ar;

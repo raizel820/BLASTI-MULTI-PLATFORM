@@ -384,15 +384,19 @@ app.post('/', async (c) => {
 
     // Task 5 — Algeria address selectors (create-agency wizard address step).
     // wilaya is normalized to the canonical two-digit code and only stored
-    // when it matches ^(0[1-9]|[1-5][0-8])$; city (commune Latin name) is
+    // when it matches the official 01-58 set; city (commune Latin name) is
     // trimmed. When either is absent the Agency row keeps its DB defaults
-    // (wilaya='28', city="M'Sila"). Sent as a pair by the UI so a wilaya
-    // without a matching commune never lands on the row half-set.
-    const bodyWilaya = typeof body.wilaya === 'string' && body.wilaya.trim()
-      ? body.wilaya.trim().padStart(2, '0')
-      : ''
+    // (wilaya='28', city="M'Sila"). The UI may send wilaya alone (Task 2-c)
+    // so a geocode-matched wilaya without a commune is no longer dropped.
+    // Task 2-c — the schema itself canonicalizes wilaya (trims, Arabic-Indic
+    // digits, padStart), so validation.data.wilaya is already canonical;
+    // reading it here (instead of raw body.wilaya) is belt-and-braces and
+    // keeps number/string inputs consistent.
+    const bodyWilaya = typeof validation.data.wilaya === 'string' ? validation.data.wilaya : ''
     const agencyWilaya = wilayaCodeRegex.test(bodyWilaya) ? bodyWilaya : undefined
-    const agencyCity = typeof body.city === 'string' && body.city.trim() ? body.city.trim() : undefined
+    const agencyCity = typeof validation.data.city === 'string' && validation.data.city.trim()
+      ? validation.data.city
+      : undefined
 
     const resolvedOwnerId = user.role === 'SUPER_ADMIN' ? (ownerId || user.id) : user.id
 

@@ -69,7 +69,9 @@ const config: CapacitorConfig = {
     },
 
     LocalNotifications: {
-      smallIcon: 'ic_stat_blasti',
+      // 'ic_launcher' is guaranteed to exist; a dedicated monochrome
+      // ic_stat_blasti drawable can replace it later
+      smallIcon: 'ic_launcher',
       iconColor: '#10b981',
       sound: 'default',
     },

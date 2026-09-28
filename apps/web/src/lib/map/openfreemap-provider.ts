@@ -12,10 +12,46 @@
  * separate geocoding abstraction (`geocoding.ts`, spec §6).
  */
 import type { LatLng, MapInitOptions, MapProviderId, MapProviderInstance } from './types';
-import type { Map as MlMap, Marker as MlMarker, Popup as MlPopup } from 'maplibre-gl';
+import type {
+  Map as MlMap,
+  Marker as MlMarker,
+  Popup as MlPopup,
+  ErrorEvent as MlErrorEvent,
+} from 'maplibre-gl';
 
-/** The part of maplibre-gl this provider touches (kept minimal on purpose). */
-type MapLibreModule = typeof import('maplibre-gl');
+/**
+ * The part of maplibre-gl this provider touches (kept minimal on purpose).
+ * `supported` exists in some maplibre builds (removed in v5) — declared
+ * optional so the WebGL probe degrades to a manual canvas check.
+ */
+type MapLibreModule = typeof import('maplibre-gl') & {
+  supported?: (opts?: { failIfMajorPerformanceCaveat?: boolean }) => boolean;
+};
+
+/**
+ * True when the browser can provide a usable WebGL context. maplibre-gl v5
+ * removed the `supported()` export, so: call it when present, otherwise probe
+ * for a live context the same way maplibre does internally. Without this
+ * check a WebGL-blocked browser (disabled / GPU blacklisted) still constructs
+ * the Map — and then paints a dead grey canvas forever (Task 2-a).
+ */
+function webGLSupported(mod: MapLibreModule): boolean {
+  if (typeof mod.supported === 'function') {
+    try {
+      return Boolean(mod.supported({ failIfMajorPerformanceCaveat: false }));
+    } catch {
+      // Probe below.
+    }
+  }
+  try {
+    if (typeof window === 'undefined' || typeof window.document === 'undefined') return false;
+    const canvas = window.document.createElement('canvas');
+    const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+    return gl != null;
+  } catch {
+    return false;
+  }
+}
 
 let maplibrePromise: Promise<MapLibreModule> | null = null;
 
@@ -43,6 +79,7 @@ export function createOpenFreeMapProvider(opts: { styleUrl: string }): MapProvid
   let popup: MlPopup | null = null;
   let clickCb: ((ll: LatLng) => void) | null = null;
   let markerMoveCb: ((ll: LatLng) => void) | null = null;
+  let errorHandler: ((event: MlErrorEvent) => void) | null = null;
   let destroyed = false;
 
   const ensureMarker = (mod: MapLibreModule, ll: LatLng): MlMarker => {
@@ -66,6 +103,14 @@ export function createOpenFreeMapProvider(opts: { styleUrl: string }): MapProvid
       const mod = await loadMaplibre();
       if (destroyed) return; // unmounted while the chunk was downloading
 
+      // Task 2-a (a): WebGL capability check BEFORE constructing the Map —
+      // a WebGL-blocked browser otherwise constructs the Map and paints a
+      // dead grey canvas forever. Throwing routes the component into its
+      // existing 'failed' ("map unavailable") state instead.
+      if (!webGLSupported(mod)) {
+        throw new Error('WebGL not supported');
+      }
+
       map = new mod.Map({
         container,
         style: opts.styleUrl || 'https://tiles.openfreemap.org/styles/liberty',
@@ -78,6 +123,53 @@ export function createOpenFreeMapProvider(opts: { styleUrl: string }): MapProvid
         attributionControl: { compact: true },
       });
 
+      // Task 2-a (b): style-load errors used to be completely silent (the
+      // 6s timeout resolved regardless → 'ready' → grey canvas). Listen for
+      // maplibre `error` events: fatal-looking ones BEFORE `load` reject
+      // init; everything after `load` is non-fatal (warn once, never reject).
+      let loadFired = false;
+      let fatal: Error | null = null;
+      let warnedError = false;
+      let onFatal: ((err: Error) => void) | null = null;
+
+      errorHandler = (event: MlErrorEvent) => {
+        const err = event?.error;
+        const message = err?.message ?? '';
+        const name = (err as { name?: string } | null)?.name ?? '';
+        const status = (err as { status?: number } | null)?.status;
+        const looksFatal =
+          status === 0 ||
+          /webgl|context (lost|created)|failed to fetch|style/i.test(message) ||
+          /WebGL|SecurityError/.test(name);
+        if (!loadFired) {
+          if (looksFatal) {
+            fatal ??= new Error(
+              `OPENFREEMAP_INIT_FAILED: ${name || 'Error'}: ${message || 'map failed before load'}`,
+            );
+            onFatal?.(fatal);
+          }
+          return;
+        }
+        // After `load`: tile hiccups etc. must NOT reject — warn once.
+        if (!warnedError) {
+          warnedError = true;
+          console.warn(
+            '[OpenFreeMapProvider] non-fatal map error (after load):',
+            message || name || 'unknown',
+          );
+        }
+      };
+      map.on('error', errorHandler);
+
+      // Task 2-a (d): recover canvases whose container was laid out AFTER
+      // construction (hidden tab/step → 0-size canvas kept forever).
+      const scheduleResize = () => {
+        if (!map || destroyed) return;
+        window.requestAnimationFrame(() => {
+          if (!destroyed) map?.resize();
+        });
+      };
+
       map.on('click', (e) => {
         if (clickCb) clickCb({ lat: e.lngLat.lat, lng: e.lngLat.lng });
       });
@@ -85,13 +177,41 @@ export function createOpenFreeMapProvider(opts: { styleUrl: string }): MapProvid
       // Resolve when tiles/styles are ready so `placeMarker` right after
       // init never races the style (MapLibre markers need the map to exist,
       // but a loaded map avoids first-render flicker).
-      await new Promise<void>((resolve) => {
+      // Task 2-a (c): genuine settle — a fatal pre-load error rejects
+      // immediately; the legacy 6s hard fallback stays ONLY for browsers
+      // that never fire `load` and never reported a fatal error.
+      await new Promise<void>((resolve, reject) => {
         if (!map) return resolve();
-        if (map.loaded()) return resolve();
-        const done = () => resolve();
-        map.once('load', done);
-        // Hard fallback: some browsers with stale caches never fire `load`.
-        setTimeout(done, 6000);
+        if (map.loaded()) {
+          loadFired = true;
+          return resolve();
+        }
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        onFatal = (err) => {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          reject(err);
+        };
+        map.once('load', () => {
+          loadFired = true;
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          resolve();
+          scheduleResize();
+        });
+        timer = setTimeout(() => {
+          timer = null;
+          if (fatal) {
+            reject(fatal); // fatal error seen before `load` — never fake-ready
+            return;
+          }
+          resolve();
+          scheduleResize();
+        }, 6000);
       });
     },
 
@@ -132,6 +252,12 @@ export function createOpenFreeMapProvider(opts: { styleUrl: string }): MapProvid
       return lngLat ? { lat: lngLat.lat, lng: lngLat.lng } : null;
     },
 
+    // Task 2-a (e): recompute the canvas size from the current container
+    // size (called by the components' ResizeObserver on layout changes).
+    resize(): void {
+      map?.resize();
+    },
+
     showMarkerInfo(title: string, description?: string): void {
       if (!map || !marker || destroyed) return;
       void loadMaplibre().then((mod) => {
@@ -150,6 +276,9 @@ export function createOpenFreeMapProvider(opts: { styleUrl: string }): MapProvid
 
     destroy(): void {
       destroyed = true;
+      // Task 2-a (f): the error listener must not outlive the map instance.
+      if (map && errorHandler) map.off('error', errorHandler);
+      errorHandler = null;
       clickCb = null;
       markerMoveCb = null;
       popup?.remove();

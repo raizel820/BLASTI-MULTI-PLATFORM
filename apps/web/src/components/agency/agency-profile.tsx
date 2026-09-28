@@ -55,6 +55,25 @@ import { findWilayaByCode } from '@/lib/algeria-locations';
 import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
 import { AgencyLocationMap } from '@/components/shared/map/agency-location-map';
 
+// ─── Task 2-c — tolerant wilaya helpers (client-side copies, same logic as
+// create-agency-form.tsx; server code is NOT imported on purpose) ──────────
+
+/** Official two-digit ANI wilaya codes 01-58 (corrected class — the old
+ * [1-5][0-8] silently rejected the real codes 19/29/39/49). */
+const WILAYA_CODE_REGEX = /^(0[1-9]|[1-4][0-9]|5[0-8])$/;
+
+/** Arabic-Indic/Eastern Arabic-Indic digits → ASCII, non-digits stripped,
+ * 1-2 digit values padded to the canonical two-digit form; anything else
+ * (e.g. a full 5-digit postal code) is returned unchanged. */
+const normalizeWilayaInput = (v: string): string => {
+  const mapped = v
+    .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06F0));
+  const digits = mapped.replace(/\D/g, '');
+  if (digits.length >= 1 && digits.length <= 2) return digits.padStart(2, '0');
+  return mapped.trim();
+};
+
 interface AgencyInfo {
   id: string;
   name: string;
@@ -703,7 +722,23 @@ export function AgencyProfile() {
               <Label className="text-sm font-medium">{t('maps.postalCode')}</Label>
               <Input
                 value={profile?.postalCode ?? ''}
-                onChange={(e) => updateField('postalCode', e.target.value)}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  updateField('postalCode', value);
+                  // Task 2-c — manual zip edit → related fields auto-update
+                  // (parity with the create-agency wizard): an Algerian postal
+                  // code's first TWO digits ARE the wilaya code, so a valid
+                  // 01-58 prefix (once at least two characters exist) switches
+                  // the wilaya and resets the dependent commune so the pair
+                  // stays coherent.
+                  if (editMode && value.trim().length >= 2) {
+                    const prefix = normalizeWilayaInput(value.slice(0, 2));
+                    if (WILAYA_CODE_REGEX.test(prefix) && prefix !== (profile?.wilaya ?? '')) {
+                      updateField('wilaya', prefix);
+                      updateField('city', '');
+                    }
+                  }
+                }}
                 disabled={!editMode || saving}
                 dir="ltr"
                 maxLength={10}
