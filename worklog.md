@@ -2381,3 +2381,116 @@ Work Log:
 Stage Summary:
 - Build blocker was repo-borne (README.md inside res/raw since ecc5cec — would ALSO break Android Studio builds). User fix = delete every file in res\raw except blasti_alarm.wav, then re-run bun run mobile:apk.
 - mobile:apk chain now proven working through export → cap sync → Java/SDK detection → Gradle launch; only the resource merger was failing.
+
+---
+Task ID: 54
+Agent: Z.ai Code (main orchestrator — ExampleUnitTest in wrong source set)
+Task: After user removed res/raw/README.md, next mobile:apk failure: :app:compileDebugJavaWithJavac — "package org.junit does not exist" from ExampleUnitTest.java.
+
+Work Log:
+- Diagnosed: ExampleUnitTest.java (JUnit boilerplate) was sitting in src/MAIN/java/com/blasti/mobile/ next to MainActivity.java; main source set has no junit (it's testImplementation-only) → 4 compile errors. The proper src/test/java tree did not exist at all in the project.
+- Fixed repo: created apps/mobile/android/app/src/test/java/com/blasti/mobile/ and moved ExampleUnitTest.java there (testImplementation junit:junit exists in app/build.gradle, so it now compiles where it belongs). main/java now contains only MainActivity.java.
+- User delivery: 2 PowerShell commands (mkdir + Move-Item) — no file download needed.
+- Audit of remaining log noise: all deprecation/unchecked/Kotlin warnings come from plugin node_modules code and compile fine; flatDir warnings are cosmetic (Capacitor standard). No further known landmines before APK packaging.
+
+Stage Summary:
+- src/main/java now contains only MainActivity.java; test boilerplate relocated to src/test (standard Capacitor layout restored).
+- mobile:apk chain: export ✓ sync ✓ Java ✓ SDK ✓ resources ✓ 16 plugin modules compile ✓ app compile — pending user's re-run; expected to reach APK packaging next.
+
+---
+Task ID: 55
+Agent: Z.ai Code (main orchestrator — desktop startup TypeError + missing packaged Prisma)
+Task: User's packaged app (win-unpacked, v0.3.1) showed the new error dialog "Cannot convert object to primitive value" + main.log revealed 6 failed @prisma/client resolutions and a rejection at main.js:2001:54. Root-cause both.
+
+Work Log:
+- main.js:2001:54 = `${isDev}` in the "App ready" log — the template conversion of isDev threw. Traced to the `||` chain's last operand: require('electron-is-dev'). VERIFIED electron-is-dev@^3.0.1 is ESM-only; Electron 42 (Node ≥22, require(esm) on) returns the null-prototype namespace OBJECT instead of throwing → truthy object poisons the chain in EVERY packaged build → ${isDev} throws TypeError → whenReady dies before createWindow. Dev runs short-circuit on ELECTRON_DEV/NODE_ENV so it never fired there. THIS IS THE ROOT CAUSE of the original invisible-app bug (previously swallowed silently).
+- Fix A: replaced the electron-is-dev IIFE in main.js with Electron-native `!app.isPackaged` (always boolean, zero resolution).
+- Fix B (packaged Prisma missing): electron-builder cannot follow bun's isolated store, so the client never got packaged. New hook apps/desktop/scripts/after-pack.js (registered as afterPack in electron-builder.yml): locates @prisma/client via root realpath → bun-store scan fallback, copies @prisma/client + sibling .prisma/client (schema + platform query engine) + its runtime deps into <appOutDir>/resources/node_modules — the exact path local-api/lib/db.js already searches; hard-fails the build with clear instructions if either package or the engine binary is missing.
+- Fixed a hook path bug during testing (dirname of @prisma/client is the @prisma SCOPE dir; .prisma lives one level up).
+- Sandbox verification: hook run against a fake appOutDir — @prisma/client ✓ .prisma/client ✓ schema.prisma ✓ libquery_engine-*.so.node ✓ and the COPIED generated client actually loads at runtime (typeof PrismaClient === 'function'). node --check on both files OK.
+- Version bumped 0.3.1 → 0.3.2. Downloads refreshed: /blasti-fix/main.js (87,368 B) and /blasti-fix/after-pack.js (5,799 B), both HTTP 200.
+
+Stage Summary:
+- Two independent packaged-app defects closed: (1) isDev ESM-namespace poisoning — the actual window-killer, (2) Prisma client never packaged — would have broken the local DB next. User needs: re-download main.js, add scripts/after-pack.js, add one afterPack line to electron-builder.yml, rebuild.
+- Note: userData (and thus main.log) resolves to %APPDATA%\@blasti\desktop\ (package name), not %APPDATA%\BLASTI.
+
+---
+Task ID: 56
+Agent: Z.ai Code (main orchestrator — desktop rebuild EBUSY)
+Task: User re-ran bun run build:desktop (after applying the ExampleUnitTest move) and electron-builder 26.15.3 died at packaging with "EBUSY: resource busy or locked, rmdir ...dist\win-unpacked".
+
+Work Log:
+- Diagnosis: win-unpacked is the folder the user launched BLASTI.exe from for testing (source of the Task 55 TypeError report). Windows keeps the process image + CWD handles locked, so electron-builder's rmdir of the previous appOutDir fails. Earlier steps in the log (web export, prebuild, @electron/rebuild) were all fine — failure is purely the locked output dir, not the repo.
+- Fix given: PowerShell `Get-Process -Name "BLASTI*" -ErrorAction SilentlyContinue | Stop-Process -Force` (catches BLASTI + all Helper processes), sleep, then optional `Remove-Item -Recurse -Force apps\desktop\dist`, then rebuild.
+- CRITICAL pre-rebuild reminder re-issued: Task 55 fixes (main.js 0.3.2 with app.isPackaged isDev fix, scripts/after-pack.js Prisma hook, afterPack line in electron-builder.yml) were NOT yet in the user's tree — their last successful installer was still BLASTI-Setup-0.3.1.exe (git 842057c). Rebuilding without them reproduces the exact TypeError.
+- Verified delivery channel: /blasti-fix/main.js (87,368 B) and /blasti-fix/after-pack.js (5,799 B) both HTTP 200 and byte-identical to sandbox copies; node --check on both OK; apps/desktop/package.json at 0.3.2.
+
+Stage Summary:
+- EBUSY = stale BLASTI.exe from win-unpacked still running; kill processes → delete dist → rebuild.
+- User must apply Task 55 files BEFORE the rebuild or the packaged app will fail identically; suggested bumping apps/desktop/package.json to 0.3.2 so the new installer name (BLASTI-Setup-0.3.2.exe) proves the fix shipped.
+
+---
+Task ID: 57
+Agent: Z.ai Code (main orchestrator — one-click desktop fix patcher)
+Task: User asked "did you applied this fix or i need to do it? i want to just download from you" — consolidate all desktop fixes into a single downloadable file that applies itself.
+
+Work Log:
+- Built scripts/blasti-fix-template.ps1: a self-contained PowerShell patcher (PS 5.1-compatible, ASCII-only) that (1) auto-locates the repo by walking up from its own path, then CWD, then prompts; (2) kills running BLASTI* processes (also unblocks the EBUSY rebuild error); (3) backs up existing main.js and after-pack.js with a timestamp suffix; (4) writes the fixed main.js + scripts/after-pack.js from embedded base64; (5) registers afterPack: scripts/after-pack.js in electron-builder.yml if missing (inserted after npmRebuild, line-based, no regex fragility); (6) bumps apps/desktop/package.json version to 0.3.2; prints per-step progress and next-step instructions, pauses on finish.
+- Generator (node one-liner) embeds main.js (87,368 B) and after-pack.js (5,799 B) as 120-col chunked base64 here-strings into apps/web/public/blasti-fix/BLASTI-fix-0.3.2.ps1 (129,618 chars).
+- Validation: decoded both here-strings from the GENERATED file and byte-compared with sources — EXACT MATCH for both; ASCII-only confirmed; no placeholders remain; served at /blasti-fix/BLASTI-fix-0.3.2.ps1 (HTTP 200).
+- Kept individual-file fallbacks in /blasti-fix/ (main.js, after-pack.js) for manual installers.
+
+Stage Summary:
+- User flow is now: download ONE file → put it in BLASTI-MULTI root → run powershell -ExecutionPolicy Bypass -File .\BLASTI-fix-0.3.2.ps1 → bun run build:desktop. No manual editing of any file.
+- Patcher doubles as the EBUSY remedy (kills the locked BLASTI.exe processes before rebuild).
+
+---
+Task ID: 58
+Agent: Z.ai Code (main orchestrator — packaged app stuck on blue window)
+Task: User's v0.3.2 packaged app now opens a window (Task 55 fixes confirmed working in their log: isDev fine, PrismaClient initialized, tray icon found) but sticks on a blue screen. Log showed "Cannot find module '../../package.json'" (loading screen + diagnostics) and Prod URL = http://localhost:3000.
+
+Work Log:
+- Root cause chain: loading-screen.js:41 `require('../../package.json')` throws packaged (app.asar root is one level up) → gate never renders, `loading:ready` never fires → 5s timeout proceeds → `require('./loading-screen')` throws AGAIN in runStartupDiagnostics → finishLoadingAndLoadApp never runs → permanent blue window. Secondary: even the loadLoadingScreen catch→loadApp() fallback loads out/index.html via file://, which can never work because the Next export uses ABSOLUTE /_next/* paths (verified in the real export) → blank shell either way.
+- Fix 1 (loading-screen.js): appVersion now resolves through try/catch chain ('./package.json' → '../../package.json' → app.getVersion() → '0.0.0'); a version label can no longer kill the launch gate.
+- Fix 2 (main.js): PROD_URL = 'http://127.0.0.1:3080/' (embedded local API) instead of BLASTI_API_URL/localhost:3000 (BLASTI_API_URL is the CLOUD base — never a window URL); bundled branch now loadURL(PROD_URL) with logged fallback loadFile→OFFLINE_HTML; will-navigate allowlist + localhost:3080/127.0.0.1:3080.
+- Fix 3 (local-api/index.js): new Task 58 static UI server — catch-all GET registered last (API routes keep priority, auth stays per-route), serves app.asar/out with 28-entry MIME map, candidate chain exact → dir/index.html → .html (covers both export layouts), traversal-guarded, html no-cache / _next/static immutable, unknown paths → app-shaped JSON 404.
+- Fix 4 (electron-builder.yml): build-stamp.json added to files (log showed "Build: SOURCE (no stamp)" packaged — stale-bundle guard was defeated).
+- Version 0.3.2 → 0.3.3. Sandbox verified: node --check ×4 OK; bun run lint OK; REAL e2e — built the actual export, extracted the exact handler block from index.js onto a live Hono server: 10/10 (/, /customer, /customer/queue, /admin, 404.html, missing→404, real /_next chunk 200 text/javascript, 3 traversal attacks blocked).
+- Delivery: BLASTI-fix-0.3.3.ps1 (943 KB) embeds 5 files (main.js, loading-screen.js, local-api/index.js, after-pack.js, electron-builder.yml) base64 — all roundtrip EXACT MATCH, ASCII-only; individual fallbacks refreshed in /blasti-fix/ (main.js, loading-screen.js, local-api-index.js, after-pack.js, electron-builder.yml) — all HTTP 200.
+
+Stage Summary:
+- Blue-window root causes closed: (1) gate-crashing require, (2) window loading a URL that cannot exist packaged, (3) file:// + absolute asset paths. The packaged app now self-serves its UI on 127.0.0.1:3080 — fully offline-capable.
+- User flow unchanged: download ONE file (BLASTI-fix-0.3.3.ps1) → run → bun run build:desktop. Patcher kills stuck processes first (EBUSY guard).
+
+---
+Task ID: 59
+Agent: Z.ai Code (main orchestrator — packaged app stuck at loading screen)
+Task: v0.3.3 packaged app displays the consumer launch gate, diagnostics all pass (allPassed: true, "showing pass animation" logged) but the app never loads — stuck at the gate. Also loading:ready timed out every launch.
+
+Work Log:
+- First suspect (gate script typo `HINTSintIndex]`) turned out to be a TERMINAL BIDI DISPLAY ARTIFACT: grep -c found 0 occurrences, node --check passed, od showed correct bytes `HINTS[hintIndex]`. The Arabic strings near the line scramble some terminal renderings. File was never broken.
+- Structure verified by generating the real gate HTML in node: 1 inline script, SYNTAX OK via new Function, all 7 getElementById targets exist, onConsumerGateSuccess registered, electronAPI used, preload.js is clean (single require('electron')).
+- EMPIRICAL ROOT CAUSE (xvfb + real Electron probe against the real gate HTML + real preload): Electron 42 applies webRequest onHeadersReceived CSP to data: URLs. Production CSP script-src 'self' → Chromium refused EVERY inline script on the gate: "Executing inline script violates ... script-src 'self'" → no loading:ready, no success listener, no finishLoading → gate forever. With CSP removed → loading:ready RECEIVED. Also verified Next's static export embeds hydration as INLINE scripts (self.__next_f.push) → the same CSP would have made the real UI render but never become interactive.
+- Fixes in main.js: (1) setCSP exempts data: URLs from CSP injection (they are first-party generated pages: gate, offline, error — all inline-script based); (2) production script-src gains 'unsafe-inline' (static export cannot do nonce-CSP; same as Capacitor for the same build); (3) gateReadyReceived top-level latch + skip-wait (the gate sent ready before runStartupDiagnostics registered its once() → deterministic 5s pointless timeout every launch); (4) 12s renderer-independent fallback after pass verdict → finishLoadingAndLoadApp (now idempotent, reset on retry) so a dead gate script can never strand the app again.
+- Verified: probe re-run with new CSP logic → loading:ready RECEIVED, gate alive. node --check OK, lint OK.
+- Version 0.3.3 → 0.3.4. Regenerated BLASTI-fix-0.3.4.ps1 (947 KB, 5 embedded files, all roundtrip EXACT MATCH); /blasti-fix/main.js refreshed; all downloads HTTP 200.
+
+Stage Summary:
+- Stuck-gate root cause closed with empirical proof (CSP-vs-data:-URL behavior). Three defense layers now guarantee launch: healthy gate → ~2.5s auto-launch; broken gate script → 12s main-process fallback; both idempotent.
+- Launch also got ~5s faster (no more deterministic ready-timeout wait).
+- User flow: same one-file patcher (BLASTI-fix-0.3.4.ps1) → run → bun run build:desktop.
+
+---
+Task ID: 60
+Agent: Z.ai Code (main orchestrator — delivery confirmation + download page)
+Task: User asked (1) whether fixes are applied so they can just re-download and rebuild, (2) where the ".psi" file is (they meant the .ps1 patcher).
+
+Work Log:
+- Verified all Task 59 (v0.3.4) fixes present in sandbox sources: main.js (gateReadyReceived latch ×3, 12000ms fallback, CSP data:-URL exemption), loading-screen.js (app.getVersion fallback), local-api/index.js (STATIC_MIME + index.html candidate chain + traversal guard at lines 9554-9621), electron-builder.yml (build-stamp.json + afterPack), package.json version = 0.3.4.
+- Byte-verified BLASTI-fix-0.3.4.ps1: decoded all 5 embedded here-strings ($MAIN_B64, $LOADING_B64, $LOCALAPI_B64, $HOOK_B64, $YML_B64) and compared with sources — ALL EXACT MATCH (91918 / 168492 / 447889 / 5799 / 3501 bytes).
+- All download URLs HTTP 200: BLASTI-fix-0.3.4.ps1 (969,498 B), main.js, loading-screen.js, local-api-index.js, after-pack.js, electron-builder.yml.
+- NEW: created apps/web/public/blasti-fix/index.html — a download landing page (latest patcher hero button, usage steps, individual-file fallback list, older patchers) so the user no longer needs to guess URLs. Verified HTTP 200 (4,406 B).
+
+Stage Summary:
+- Fixes are baked into the source (v0.3.4) AND into the patcher; either route delivers them.
+- User-facing answer: download BLASTI-fix-0.3.4.ps1 via the preview URL path /blasti-fix/index.html (clickable page) or /blasti-fix/BLASTI-fix-0.3.4.ps1 directly; extension is .ps1 (PowerShell), not ".psi".

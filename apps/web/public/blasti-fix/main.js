@@ -123,9 +123,17 @@ const isDev =
   process.env.NODE_ENV === 'development' ||
   !!process.env.ELECTRON_DEV ||
   (process.argv && process.argv.includes('--dev')) ||
-  (function () {
-    try { return require('electron-is-dev'); } catch { return false; }
-  })();
+  // Task 55: electron-is-dev ≥3 is ESM-only. Under Electron 42 (Node ≥22,
+  // where require(esm) is enabled by default) require('electron-is-dev')
+  // returns the module NAMESPACE object (null prototype) instead of
+  // throwing. That object is truthy, poisoned this `||` chain in every
+  // PACKAGED build, and templating `${isDev}` then threw
+  // "Cannot convert object to primitive value" — killing the whenReady
+  // chain before the window could open (the root cause of the
+  // "running in Task Manager but never opens" bug). Dev runs never hit it
+  // because ELECTRON_DEV/NODE_ENV short-circuit the chain earlier.
+  // electron-is-dev is literally just `!app.isPackaged` — use the native.
+  !app.isPackaged;
 
 // ─── Authoritative Local Database Path (single source of truth) ───────────
 // ═══════════════════════════════════════════════════════════════════════════
@@ -198,7 +206,16 @@ process.env.BLASTI_CLOUD_URL = CLOUD_BASE_URL;
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const DEV_URL = 'http://localhost:3000';
-const PROD_URL = process.env.BLASTI_API_URL || 'http://localhost:3000';
+// Task 58: the packaged UI is served by the EMBEDDED local API from the
+// bundled static export (app.asar/out). Two broken ideas are now dead:
+//   - loading http://localhost:3000 when packaged (no dev server exists on
+//     the user's machine → the window sat on a blue screen forever), and
+//   - file:// loading of out/index.html (Next's absolute /_next/* asset
+//     paths resolve against the filesystem root → blank shell).
+// The local API (already running on :3080 before the window loads) serves
+// every asset over http instead. NOTE: BLASTI_API_URL is the CLOUD base url
+// (see resolveCloudBaseUrl) — it must never be the window URL.
+const PROD_URL = 'http://127.0.0.1:3080/';
 const PROTOCOL = 'blasti';
 
 // Path to bundled static web files (from Next.js export)
@@ -536,10 +553,26 @@ const OFFLINE_HTML = `<!DOCTYPE html>
 
 function setCSP() {
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    // Task 59: Electron applies onHeadersReceived CSP to data: URLs too.
+    // The launch gate (and the offline/error pages) are first-party data:
+    // pages that RELY on inline scripts — under the production CSP
+    // (script-src 'self') Chromium silently refused to execute the whole
+    // gate script, so the packaged app sat on the loading screen forever
+    // (empirically proven: with CSP → no loading:ready; without → received).
+    // data: pages here are always our own generated HTML — skip the CSP.
+    if (details.url.startsWith('data:')) {
+      return callback({ responseHeaders: details.responseHeaders });
+    }
     const csp = [
       "default-src 'self'",
-      // Allow scripts from self and eval (needed for Next.js HMR in dev)
-      isDev ? "script-src 'self' 'unsafe-eval' 'unsafe-inline'" : "script-src 'self'",
+      // Allow scripts from self and eval (Next.js HMR in dev).
+      // Task 59: 'unsafe-inline' is REQUIRED in production too — the Next.js
+      // static export embeds its hydration payload as INLINE scripts
+      // (self.__next_f.push(...) in out/index.html). Blocking them renders
+      // the UI but it never becomes interactive. Static exports cannot use
+      // nonce-based CSP (no server), so inline is unavoidable (same choice
+      // Capacitor makes for the identical web build on mobile).
+      isDev ? "script-src 'self' 'unsafe-eval' 'unsafe-inline'" : "script-src 'self' 'unsafe-inline'",
       // Allow styles from self and inline (needed for styled-components / Tailwind)
       "style-src 'self' 'unsafe-inline'",
       // Allow images from self, data URIs, and blob URIs — PLUS the http
@@ -701,6 +734,9 @@ function createWindow() {
   mainWindow.webContents.on('will-navigate', (event, url) => {
     const allowedOrigins = [
       'http://localhost:3000',
+      // Task 58: the packaged UI origin is the embedded local API.
+      'http://localhost:3080',
+      'http://127.0.0.1:3080',
       PROD_URL,
     ];
 
@@ -902,9 +938,19 @@ function loadApp() {
     return;
   }
 
-  // Default production: load bundled static files
+  // Default production: the embedded local API serves the bundled static
+  // export over http (Task 58) — absolute /_next/* paths only work over an
+  // http origin. loadFile() is now the last-ditch fallback only.
   if (hasBundledFiles) {
-    mainWindow.loadFile(indexPath);
+    console.log('[BLASTI Desktop] Bundled UI found — loading ' + PROD_URL);
+    mainWindow.loadURL(PROD_URL).catch((loadErr) => {
+      console.warn('[BLASTI Desktop] loadURL(' + PROD_URL + ') failed:', loadErr && loadErr.message, '— falling back to file://');
+      mainWindow.loadFile(indexPath).catch(() => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(OFFLINE_HTML));
+        }
+      });
+    });
     return;
   }
 
@@ -1010,13 +1056,28 @@ function showConsumerHandoff() {
 /**
  * Called when diagnostics are done (or user clicks "Launch" on error).
  * Dismisses the loading screen and loads the main web app.
+ * Task 59: idempotent — the renderer (loading:finish) AND the main-process
+ * fallback timer can both call this; only the first call may load the app.
  */
+let appLoadStarted = false;
 function finishLoadingAndLoadApp() {
+  if (appLoadStarted) {
+    console.log('[BLASTI Desktop] App load already started — ignoring duplicate launch trigger');
+    return;
+  }
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  appLoadStarted = true;
   loadingScreenActive = false;
   console.log('[BLASTI Desktop] Loading complete — loading main app');
   loadApp();
 }
+
+// Task 59: ready-signal latch — the gate script sends 'loading:ready' the
+// moment it executes, often BEFORE runStartupDiagnostics registers its
+// once() listener (the old code then sat through a pointless 5s timeout on
+// every launch). Record the arrival at all times.
+let gateReadyReceived = false;
+ipcMain.on('loading:ready', () => { gateReadyReceived = true; });
 
 /**
  * Run the startup diagnostics suite (the launch gate's engine).
@@ -1032,18 +1093,24 @@ async function runStartupDiagnostics() {
   try {
     // The gate renderer must register its IPC listeners before events flow.
     // Without this, early IPC events may fire before the renderer is ready.
-    await new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        console.warn('[BLASTI Desktop] Loading screen ready signal timed out — proceeding anyway');
-        resolve();
-      }, 5000);
+    // Task 59: skip the wait entirely when the latch already caught the
+    // signal (typical case — the gate executes its script within ms).
+    if (!gateReadyReceived) {
+      await new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          console.warn('[BLASTI Desktop] Loading screen ready signal timed out — proceeding anyway');
+          resolve();
+        }, 5000);
 
-      ipcMain.once('loading:ready', () => {
-        clearTimeout(timeout);
-        console.log('[BLASTI Desktop] Loading screen ready — starting diagnostics');
-        resolve();
+        ipcMain.once('loading:ready', () => {
+          clearTimeout(timeout);
+          console.log('[BLASTI Desktop] Loading screen ready — starting diagnostics');
+          resolve();
+        });
       });
-    });
+    } else {
+      console.log('[BLASTI Desktop] Loading screen ready already received — starting diagnostics immediately');
+    }
 
     const { runDiagnostics } = require('./loading-screen');
     const userDataPath = app.getPath('userData');
@@ -1110,6 +1177,20 @@ async function runStartupDiagnostics() {
         try {
           mainWindow.webContents.send('consumer-gate:success', {});
         } catch (_) { /* window gone */ }
+        // Task 59: renderer-independent safety net. The gate script normally
+        // plays the success animation and calls loading:finish — but a single
+        // syntax error in the generated gate HTML once killed that whole
+        // script (v0.3.3 shipped with `HINTSintIndex]`), leaving the user on
+        // the gate FOREVER with a green checkmark. If the app has not loaded
+        // 12s after the pass verdict, launch from the main process instead.
+        // finishLoadingAndLoadApp is idempotent, so a healthy gate finishing
+        // at ~2.5s makes this a no-op.
+        setTimeout(() => {
+          if (!diagnosticsDone || !diagnosticsAllPassed) return; // state changed (retry etc.)
+          if (!mainWindow || mainWindow.isDestroyed()) return;
+          console.warn('[BLASTI Desktop] Fallback: app not loaded 12s after pass verdict — launching from main process');
+          finishLoadingAndLoadApp();
+        }, 12000);
       }
     }
   } catch (err) {
@@ -1187,6 +1268,7 @@ ipcMain.on('loading:retry', () => {
   }
   diagnosticsDone = false;
   diagnosticsAllPassed = false;
+  appLoadStarted = false; // Task 59: allow a fresh launch after a retry
   console.log('[BLASTI Desktop] Launch retry requested — reloading gate and re-running diagnostics');
   loadLoadingScreen();
   runStartupDiagnostics().catch((err) => {
