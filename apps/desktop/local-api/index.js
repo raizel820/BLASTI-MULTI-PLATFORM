@@ -27,6 +27,16 @@ const localRealtime = require('./local-realtime')
 const fileStore = require('./lib/file-store')
 const { createFileSync } = require('./lib/file-sync')
 
+// ─── Diagnostic file logger ("data loading failed" investigation) ───────────
+// Shared with the main process (initial sync) so both sides land in ONE
+// rolling timeline: <userData>/logs/local-api-diag.log. See lib/diag-log.js.
+const { diagLog } = require('./lib/diag-log')
+
+// Agency device management + embedded LAN discovery + cast (Task A 2-c).
+// Port of apps/api/src/routes/agency-devices.ts — serves the device-management
+// UI fully offline against the local SQLite mirror.
+const registerAgencyDeviceRoutes = require('./agency-devices')
+
 // ─── Configuration ────────────────────────────────────────────────────────
 
 const DEFAULT_PORT = 3080
@@ -1028,17 +1038,19 @@ function previousSessionTokenValid() {
 function assignSession(token, user, source) {
   if (!token || !user || typeof user !== 'object') {
     console.warn('[LocalAPI] assignSession called with invalid args — skipping (source=' + (source || 'unknown') + ')')
+    diagLog('SESSION assign REJECTED — invalid args (source=' + (source || 'unknown') + ')')
     return
   }
   const rotated = !!sessionToken && sessionToken !== token
   if (rotated) {
     previousSessionToken = sessionToken
     previousSessionTokenAt = Date.now()
-    console.log('[LocalAPI] Session token rotated (source=' + (source || 'unknown') + ') ' +
+    // Token rotation is the #1 suspect for transient 401s → always record it.
+    diagLog('SESSION token ROTATED (source=' + (source || 'unknown') + ') ' +
       tokenFingerprint(sessionToken) + ' → ' + tokenFingerprint(token) +
-      ' — previous token accepted for ' + Math.round(SESSION_TOKEN_GRACE_MS / 60000) + 'm grace')
+      ' — predecessor valid for ' + Math.round(SESSION_TOKEN_GRACE_MS / 60000) + 'm grace')
   } else if (!sessionToken) {
-    console.log('[LocalAPI] Session established (source=' + (source || 'unknown') + ') token=' + tokenFingerprint(token) + ' user=' + (user.username || user.id))
+    diagLog('SESSION established (source=' + (source || 'unknown') + ') token=' + tokenFingerprint(token) + ' user=' + (user.username || user.id))
   }
   sessionToken = token
   sessionUser = user
@@ -1055,11 +1067,13 @@ function requireAuth() {
       c.req.query('token')
 
     if (!token) {
-      return c.json({ success: false, error: 'Authentication required' }, 401)
+      diagLog('AUTH 401 AUTH_NO_TOKEN — request presented no token')
+      return c.json({ success: false, error: 'Authentication required', code: 'AUTH_NO_TOKEN' }, 401)
     }
 
     if (!sessionToken) {
-      return c.json({ success: false, error: 'No active session' }, 401)
+      diagLog('AUTH 401 AUTH_NO_SESSION — local API has no active session (IPC import not yet fired?)')
+      return c.json({ success: false, error: 'No active session', code: 'AUTH_NO_SESSION' }, 401)
     }
 
     // Critical: also check sessionUser is non-null.
@@ -1068,7 +1082,8 @@ function requireAuth() {
     // have fired yet, leaving sessionToken set (from a previous import-session
     // HTTP call or IPC) but sessionUser null.
     if (!sessionUser) {
-      return c.json({ success: false, error: 'No active session (user not loaded)' }, 401)
+      diagLog('AUTH 401 AUTH_USER_NOT_LOADED — token present but sessionUser null (sessionUser/token desync)')
+      return c.json({ success: false, error: 'No active session (user not loaded)', code: 'AUTH_USER_NOT_LOADED' }, 401)
     }
 
     // Timing-safe comparison — current token first, then the rotation-grace
@@ -1091,14 +1106,14 @@ function requireAuth() {
     if (!tokenValid) {
       // Task 41 — actionable rejection log: fingerprints of what was presented
       // vs what the session holds, so token-mismatch reports are diagnosable
-      // from the console alone.
-      console.warn('[LocalAPI] Auth rejected — token mismatch: presented=' + tokenFingerprint(token) +
+      // from the console alone. Also written to the rolling diag file.
+      diagLog('AUTH 401 AUTH_TOKEN_MISMATCH — presented=' + tokenFingerprint(token) +
         ' current=' + tokenFingerprint(sessionToken) +
         ' previous=' + (previousSessionTokenValid() ? tokenFingerprint(previousSessionToken) : '(none/expired)'))
-      return c.json({ success: false, error: 'Invalid session token' }, 401)
+      return c.json({ success: false, error: 'Invalid session token', code: 'AUTH_TOKEN_MISMATCH' }, 401)
     }
     if (viaGrace) {
-      console.log('[LocalAPI] Auth: previous (rotated) token accepted via grace window (user=' + (sessionUser.username || sessionUser.id) + ') — renderer should adopt the fresh token via POST /api/auth/adopt-session')
+      diagLog('AUTH grace-window accept — predecessor (rotated) token accepted (user=' + (sessionUser.username || sessionUser.id) + ') — renderer should adopt the fresh token via POST /api/auth/adopt-session')
     }
 
     // Task 33-C: honor the workspace LOCK. A REVOKED authorization blocks
@@ -1121,7 +1136,8 @@ function requireAuth() {
     // Return 503 so the client knows to retry later rather than getting a
     // cryptic 500 from a null-pointer crash inside the route handler.
     if (!db) {
-      return c.json({ success: false, error: 'Local database not ready (PrismaClient not initialized)' }, 503)
+      diagLog('AUTH ok but 503 DB_NOT_READY — PrismaClient not initialized yet (dashboard must retry)')
+      return c.json({ success: false, error: 'Local database not ready (PrismaClient not initialized)', code: 'DB_NOT_READY' }, 503)
     }
 
     // Attach user and db to context
@@ -2178,6 +2194,41 @@ function createApp() {
       maxAge: 86400,
     }),
   )
+
+  // ─── Request diagnostics — "data loading failed" investigation ───────────
+  // Every /api/* request is timed. Failures (status ≥ 400) are ALWAYS logged
+  // with a response-body snippet; slow responses (>1500 ms) and
+  // auth/session/sync-relevant paths are logged too. Output goes to the
+  // console AND the rolling diag file, giving the exact server-side answer
+  // (401 AUTH_*, 503 db-warming, 404 route-missing, …) that pairs with the
+  // renderer's persistent diagnostic timeline.
+  app.use('/api/*', async (c, next) => {
+    const startedAt = Date.now()
+    const method = c.req.method
+    let path = '/api'
+    try { path = new URL(c.req.url).pathname } catch { /* keep fallback */ }
+    const alwaysLog = /\/api\/(auth\/|sync|initial-sync|agency\/(stats|queue|services))/.test(path)
+    try {
+      await next()
+    } catch (err) {
+      const ms = Date.now() - startedAt
+      const stack = err && err.stack ? String(err.stack).split('\n').slice(0, 4).join(' | ') : String(err)
+      diagLog(`API ${method} ${path} → THREW after ${ms}ms :: ${stack}`)
+      throw err
+    }
+    const ms = Date.now() - startedAt
+    const status = c.res && typeof c.res.status === 'number' ? c.res.status : 0
+    if (status >= 400) {
+      let snippet = ''
+      try {
+        const text = await c.res.clone().text()
+        snippet = ' :: ' + text.slice(0, 240)
+      } catch { /* body unreadable */ }
+      diagLog(`API ${method} ${path} → ${status} ${ms}ms${snippet}`)
+    } else if (alwaysLog || ms > 1500) {
+      diagLog(`API ${method} ${path} → ${status} ${ms}ms`)
+    }
+  })
 
   // ═══════════════════════════════════════════════════════════════════════
   // 1. HEALTH / DISCOVERY (no auth)
@@ -9537,6 +9588,22 @@ function createApp() {
   // the startup registry summary to prove which build is actually running).
   let registeredRouteCount = -1
   try { registeredRouteCount = (app.routes || []).length } catch { /* older hono — unknown */ }
+
+  // ═══ Agency devices + embedded discovery (Task A 2-c) ═══════════════════
+  // Device management + multi-protocol LAN discovery + cast for the local
+  // UI — registered BEFORE the static-UI catch-all below. Every route uses
+  // the session-scoped authMiddleware; agencyId always comes from the
+  // session (never from client query params).
+  registerAgencyDeviceRoutes(app, {
+    authMiddleware,
+    requireAgencyId,
+    getDb: () => db,
+    broadcast: (type, payload) => {
+      try { emitEvent(type, payload) } catch { /* non-fatal */ }
+      try { localRealtime.broadcastLocalRealtime(type, payload) } catch { /* non-fatal */ }
+    },
+    diagLog,
+  })
 
   // ═══ Static UI server (Task 58) ═════════════════════════════════════════
   // Serves the bundled Next.js static export (../out) so the packaged desktop

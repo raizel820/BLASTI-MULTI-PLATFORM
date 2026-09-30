@@ -107,10 +107,14 @@ function resolveSocketUrl(): string {
   if (isElectronPlatform()) {
     return 'http://127.0.0.1:3080'
   }
-  // Other native platforms (Capacitor): connect directly to cloud API (no gateway proxy)
+  // Other native platforms (Capacitor): connect directly to the cloud API's
+  // realtime server. NEXT_PUBLIC_API_URL is baked in at build time
+  // (apps/web/.env.production); the 10.0.2.2 fallback is the emulator's
+  // alias for the host machine — localhost would be the device itself.
   if (isNativePlatform()) {
-    return (typeof process !== 'undefined' && (process as any).env?.BLASTI_CLOUD_URL)
-      || `http://localhost:${REALTIME_PORT}`
+    return process.env.NEXT_PUBLIC_API_URL
+      || (typeof process !== 'undefined' && (process as any).env?.BLASTI_CLOUD_URL)
+      || `http://10.0.2.2:${REALTIME_PORT}`
   }
   // Explicit env override (e.g. for Capacitor builds with a specific URL)
   const nativeUrl = process.env.NEXT_PUBLIC_REALTIME_URL

@@ -1728,6 +1728,12 @@ async function _runInitialSyncFromSessionInner() {
   }
 
   const { runInitialSync } = require('./local-api/initial-sync');
+  // "data loading failed" investigation — the initial sync runs concurrently
+  // with the renderer's first dashboard load; its duration and outcome go
+  // into the SAME rolling diag file the local API writes to.
+  const { diagLog } = require('./local-api/lib/diag-log');
+  const initialSyncStartedAt = Date.now();
+  diagLog('INITIAL-SYNC start (user=' + (session.user.username || session.user.id) + ', agency=' + (session.user.agencyId || 'none') + ', cloud=' + cloudUrl + ')');
   const result = await runInitialSync({
     agencyId: session.user.agencyId,
     cloudAuthToken: session.token,
@@ -1741,6 +1747,8 @@ async function _runInitialSyncFromSessionInner() {
     sessionUserUsername: session.user.username || null,
     emitFn: (evt) => console.log('[InitialSync evt]', evt.type, evt.stage || ''),
   });
+  diagLog('INITIAL-SYNC finished in ' + ((Date.now() - initialSyncStartedAt) / 1000).toFixed(1) + 's — success=' + (result ? !!result.success : 'null') +
+    (result && result.success ? ' totalRecords=' + (result.totalRecords ?? '?') : ' error=' + (result && result.error ? result.error : 'unknown')));
 
   const syncService = require('./local-api/sync-service');
   if (result && result.success && typeof result.snapshotSequence === 'number') {

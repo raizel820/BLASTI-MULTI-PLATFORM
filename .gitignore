@@ -39,6 +39,9 @@ yarn-error.log*
 # Keep .env.example files — they are templates without real secrets
 !.env.example
 !apps/*/.env.example
+# Mobile build target config (no secrets — emulator/phone API URL so the
+# Android build works out of the box; committed on purpose)
+!apps/web/.env.production
 
 # typescript
 *.tsbuildinfo

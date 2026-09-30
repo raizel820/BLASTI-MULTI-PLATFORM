@@ -11,6 +11,7 @@ import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ErrorState } from '@/components/shared/error-state';
 import { EmptyState } from '@/components/shared/empty-state';
+import { diag, diagDump } from '@/lib/diag-log';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -313,6 +314,7 @@ export function AgencyDashboard() {
     if (fetchInProgressRef.current) return;
     fetchInProgressRef.current = true;
     setFetchError(false);
+    const fetchStartedAt = Date.now();
     let willAutoRetry = false;
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
@@ -342,6 +344,29 @@ export function AgencyDashboard() {
         const statuses = results.map((r, i) =>
           r.status === 'rejected' ? `${['stats','queue','services'][i]}:ERR` : `${['stats','queue','services'][i]}:${r.value?.status}`
         ).join(' ');
+        // Enhanced diagnostics — per-section status AND response body snippet
+        // so the "data loading failed" popup can be root-caused from the
+        // persistent diagnostic timeline alone (status 401 → token rotation,
+        // 503 → local DB still warming, 0 → local API down, etc.).
+        const sectionDetail = await Promise.all(results.map(async (r, i) => {
+          const name = ['stats', 'queue', 'services'][i];
+          if (r.status === 'rejected') {
+            const reason = r.reason instanceof Error ? r.reason.message : String(r.reason);
+            return `${name}:REJECTED:${reason.slice(0, 150)}`;
+          }
+          const res = r.value;
+          if (!res) return `${name}:NO_RESPONSE`;
+          if (res.ok) return `${name}:OK`;
+          let body = '';
+          try { body = (await res.text()).slice(0, 200); } catch { /* ignore */ }
+          return `${name}:${res.status}:${body}`;
+        }));
+        diag('dashboard-fail', {
+          attempt,
+          sections: sectionDetail,
+          ms: Date.now() - fetchStartedAt,
+          autoRetry: allowAutoRetry,
+        });
         if (allowAutoRetry && attempt < 2) {
           autoRetryCountRef.current = attempt + 1;
           willAutoRetry = true;
@@ -354,6 +379,9 @@ export function AgencyDashboard() {
         }
         console.warn(`[Dashboard] all section fetches failed after auto-retries (${statuses}) — showing error state`);
         setFetchError(true);
+        // Full timeline dump — copyable from the console (or
+        // window.__blastiDiag.dump()) and persisted across reloads.
+        diagDump('dashboard-error');
         if (!pollErrorShownRef.current) {
           toast.error(t('error'));
           pollErrorShownRef.current = true;

@@ -48,7 +48,9 @@ const config: CapacitorConfig = {
   // ─── Plugins ─────────────────────────────────────────────────────────────────
   plugins: {
     SplashScreen: {
-      launchShowDuration: 2000,
+      // Brief static splash only — the animated intro (AppIntroAnimation in the
+      // web bundle) takes over as soon as the WebView paints.
+      launchShowDuration: 400,
       launchAutoHide: true,
       backgroundColor: '#10b981',
       showSpinner: true,

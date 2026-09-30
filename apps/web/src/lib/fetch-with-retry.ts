@@ -17,6 +17,7 @@
 
 import { apiFetch } from './api-fetch';
 import { isRevoked, setRevoked, isRevocationStatus } from './authz-state';
+import { diag } from './diag-log';
 
 export interface FetchWithRetryOptions {
   /** HTTP method (default: 'GET') */
@@ -60,6 +61,7 @@ function handleAuthExpired(): void {
   // Checked BEFORE everything else — the revoked flag outranks the debounce.
   if (isRevoked()) {
     console.log('[Auth] 401/403 with revoked authz state → clearing session (no restore)');
+    diag('auth-expired', { outcome: 'revoked-clear' });
     import('@/store/use-app-store')
       .then(({ useAppStore }) => {
         useAppStore.setState({ user: null, isAuthenticated: false, sessionToken: '' });
@@ -116,6 +118,7 @@ function handleAuthExpired(): void {
         if (adopt.adopted) {
           sessionRestored = true;
           console.log('[Auth] Electron 401 → session adopted (renderer token caught up to the local session) — no state reset needed');
+          diag('auth-expired', { outcome: 'adopted' });
           return; // done — the next request carries the current token
         }
       } catch { /* fall through to the legacy restore path */ }
@@ -138,6 +141,7 @@ function handleAuthExpired(): void {
           w.electronAPI.setLocalApiSession({ token, user: currentUser });
           sessionRestored = true;
           console.log(`[Auth] session restored via IPC (source=${localToken ? 'local' : 'cloud'})`);
+          diag('auth-expired', { outcome: 'ipc-restored', source: localToken ? 'local' : 'cloud' });
 
           // Task 33-E — the IPC restore cannot tell us whether the local API is
           // LOCKED (Task 33-C revocation state machine: requireAuth → 423
@@ -181,6 +185,7 @@ function handleAuthExpired(): void {
       // 401 is a genuine auth expiry, not a transient race condition.
       if (!sessionRestored) {
         console.log(`[Auth] session restore failed → clearing Zustand state (genuine auth expiry)`);
+        diag('auth-expired', { outcome: 'state-cleared' });
         store.setState({
           user: null,
           isAuthenticated: false,

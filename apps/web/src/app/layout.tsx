@@ -5,6 +5,7 @@ import { ThemeProvider } from "next-themes";
 import { AuthProvider } from "@/components/providers/auth-provider";
 import { ErrorBoundary } from "@/components/shared/error-boundary";
 import { ClientBootHardening } from "@/components/shared/client-boot-hardening";
+import { AppIntroAnimation } from "@/components/shared/app-intro-animation";
 import { PlatformProvider } from "@/hooks/use-platform";
 import { DatabaseProvider } from "@/db/provider";
 import "./globals.css";
@@ -50,6 +51,8 @@ export default function RootLayout({
             benign error message as a backstop. */}
         <Script src="/resize-observer-fix.js" strategy="beforeInteractive" />
         <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
+          {/* Launch intro — Capacitor shells only (web/desktop skip; ?intro=1 previews) */}
+          <AppIntroAnimation />
           {/* Task 41 — legacy SW unregister + chunk-error auto-recovery (phone flicker fix) */}
           <ClientBootHardening />
           <PlatformProvider>

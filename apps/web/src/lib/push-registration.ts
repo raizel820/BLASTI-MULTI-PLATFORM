@@ -20,6 +20,14 @@
  * - Re-registers on the existing `blasti:app-resume` window event (OS push
  *   services can invalidate tokens while backgrounded), while keeping token
  *   dedupe so unchanged tokens are never re-uploaded.
+ * - Firebase-readiness guard: before touching PushNotifications the native
+ *   BlastiNativeStatus plugin is asked whether Firebase is configured in the
+ *   build. On builds without google-services.json the FCM flow is skipped
+ *   entirely — calling register() there used to kill the whole app with a
+ *   native "Default FirebaseApp is not initialized" FATAL EXCEPTION (Sept
+ *   2026 crash loop in the field logcat). When the native status plugin is
+ *   absent (older shell), the legacy behavior is kept — the native shell
+ *   installs its own placeholder-Firebase + crash-guard layers as backstop.
  */
 
 import { apiClient } from '@/lib/api-client';
@@ -48,6 +56,11 @@ interface CapacitorShape {
   isNativePlatform?: () => boolean;
   getPlatform?: () => string;
   Plugins?: Record<string, PushPluginShape | undefined>;
+}
+
+/** Minimal shape of the BLASTI native status plugin (registered in MainActivity). */
+interface NativeStatusPluginShape {
+  isFirebaseReady?: () => Promise<{ ready?: boolean; reason?: string }>;
 }
 
 // ─── Internal State ──────────────────────────────────────────────────────────
@@ -84,6 +97,32 @@ async function uploadPushToken(token: string, platform: string): Promise<void> {
   } catch (error) {
     // Console-only per design: push registration must never surface UI errors.
     console.warn('[PushRegistration] FCM token upload failed:', error);
+  }
+}
+
+// ─── Firebase Readiness Guard ───────────────────────────────────────────────
+
+/**
+ * Ask the native shell whether Firebase (FCM) is configured in this build.
+ *
+ * Returns:
+ *   true  → google-services.json is compiled in; FCM registration is safe.
+ *   false → Firebase is unconfigured; register() must be skipped (it used to
+ *           hard-crash the app natively before the native hardening landed).
+ *   undefined → the native status plugin is not available (older shell or
+ *           probe failed); callers keep the legacy behavior — the native
+ *           placeholder-Firebase + crash-guard layers still protect the app.
+ */
+async function isFirebaseConfigured(capacitor: CapacitorShape): Promise<boolean | undefined> {
+  try {
+    const statusPlugin = capacitor.Plugins?.BlastiNativeStatus as NativeStatusPluginShape | undefined;
+    if (!statusPlugin || typeof statusPlugin.isFirebaseReady !== 'function') {
+      return undefined;
+    }
+    const status = await statusPlugin.isFirebaseReady();
+    return status?.ready === true;
+  } catch {
+    return undefined;
   }
 }
 
@@ -155,6 +194,20 @@ export function initMobilePushRegistration(): Promise<void> {
 
       const platform =
         typeof capacitor.getPlatform === 'function' ? String(capacitor.getPlatform()) : 'unknown';
+
+      // ── Firebase availability guard (MUST run before any register attempt)
+      const firebaseReady = await isFirebaseConfigured(capacitor);
+      if (firebaseReady === false) {
+        // Unconfigured build: skip the FCM flow entirely — no permission
+        // prompt, no register() call. In-app + local notifications keep
+        // working without it.
+        console.warn(
+          '[PushRegistration] Firebase not configured in this native build ' +
+            '(google-services.json missing from android/app/) — skipping FCM ' +
+            'registration. In-app and local notifications still work.',
+        );
+        return;
+      }
 
       // ── Listeners MUST be wired before register() so no token event is lost
       await plugin.addListener('registration', (event: unknown) => {

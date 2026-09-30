@@ -45,6 +45,10 @@
 // lock). See lib/authz-state.ts.
 import { isRevoked, setRevoked, isRevocationStatus } from './authz-state';
 
+// Diagnostics ring buffer (persistent) — every failure below records a
+// machine-readable timeline event. See lib/diag-log.ts.
+import { diag } from './diag-log';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /** Configuration for the ApiClient instance. */
@@ -213,6 +217,16 @@ function blastiNetworkHeaders(): Record<string, string> {
  * (web build) / BLASTI_CLOUD_URL (desktop) to your server's origin.
  */
 const DEFAULT_CLOUD_URL = 'http://localhost:3003';
+/**
+ * Fallback for CAPACITOR builds built without NEXT_PUBLIC_API_URL.
+ * `localhost` inside the Android WebView is the DEVICE itself — nothing
+ * listens there, so every request dies with an instant "Failed to fetch".
+ * The Android emulator reaches the host machine through the reserved
+ * alias 10.0.2.2, making it the only sane native-shell default.
+ * (Physical devices: set NEXT_PUBLIC_API_URL to the PC's LAN IP —
+ * see apps/web/.env.production — or use `adb reverse tcp:3003 tcp:3003`.)
+ */
+const DEFAULT_NATIVE_CLOUD_URL = 'http://10.0.2.2:3003';
 const DEFAULT_INTERNAL_URL = 'http://localhost:3000';
 /**
  * Electron local-first base URL (spec §7/§8).
@@ -258,9 +272,11 @@ export function getApiBaseUrl(): string {
     return ELECTRON_LOCAL_API_BASE;
   }
 
-  // Native shell (Capacitor): need absolute URL to the cloud API backend
+  // Native shell (Capacitor): need absolute URL to the cloud API backend.
+  // Emulator default 10.0.2.2 (host loopback alias) — NEVER localhost,
+  // which inside the WebView is the device itself.
   if (isCapacitorRuntime()) {
-    return process.env.NEXT_PUBLIC_API_URL || DEFAULT_CLOUD_URL;
+    return process.env.NEXT_PUBLIC_API_URL || DEFAULT_NATIVE_CLOUD_URL;
   }
 
   // Web browser: use explicit API URL if set (e.g. for staging environments)
@@ -335,8 +351,16 @@ export function getCloudApiBaseUrl(): string {
     return process.env.INTERNAL_API_URL || DEFAULT_INTERNAL_URL;
   }
 
-  if (isElectronRuntime() || isCapacitorRuntime()) {
-    return process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_CLOUD_URL || DEFAULT_CLOUD_URL;
+  // Desktop is local-first and must NEVER pick up the mobile build's
+  // NEXT_PUBLIC_API_URL (the emulator host 10.0.2.2 is unreachable from
+  // a desktop machine). The API runs on the same machine → localhost:3003.
+  if (isElectronRuntime()) {
+    return process.env.NEXT_PUBLIC_CLOUD_URL || DEFAULT_CLOUD_URL;
+  }
+
+  // Capacitor: build-time NEXT_PUBLIC_API_URL wins, emulator alias fallback.
+  if (isCapacitorRuntime()) {
+    return process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_CLOUD_URL || DEFAULT_NATIVE_CLOUD_URL;
   }
 
   if (process.env.NEXT_PUBLIC_API_URL) {
@@ -934,6 +958,7 @@ export class ApiClient {
           const errorBody = await this.safeParseBody(response);
           const elapsed = (performance.now() - attemptStart).toFixed(0);
           console.log(`[ApiClient:CLOUD] ${method} ${path} → 4xx (${response.status}, ${elapsed}ms), no retry`);
+          diag('req-4xx', { method, path, status: response.status, ms: elapsed, body: errorBody });
           throw new ApiClientError(
             this.buildErrorMessage(response.status, errorBody),
             response.status,
@@ -954,6 +979,7 @@ export class ApiClient {
           );
           markApiUnreachable(); // Mark as unreachable for the 30s cache
           console.log(`[ApiClient:CLOUD] ${method} ${path} → 503 (${elapsed}ms), skipping retries → LAN failover`);
+          diag('req-503', { method, path, ms: elapsed, body: errorBody });
           break; // Skip remaining retries — go straight to LAN failover
         }
 
@@ -1005,6 +1031,7 @@ export class ApiClient {
             throw new ApiClientError('Request was cancelled', 0, null);
           }
           console.log(`[ApiClient:CLOUD] ${method} ${path} → timed out after ${timeoutMs}ms (${elapsed}ms actual, attempt ${attempt}/${maxRetries})`);
+          diag('req-timeout', { method, path, timeoutMs, attempt, ms: elapsed });
           // CRITICAL FIX: Use `break` instead of `throw` so LAN failover at line 818 runs.
           // Previously, `throw` here exited the retry loop entirely, skipping the
           // LAN failover code. On native platforms, a cloud timeout should fall
@@ -1021,6 +1048,7 @@ export class ApiClient {
         const errMsg = error instanceof Error ? error.message : 'Unknown';
         const elapsed = (performance.now() - attemptStart).toFixed(0);
         console.log(`[ApiClient:CLOUD] ${method} ${path} → network error: ${errMsg} (${elapsed}ms, attempt ${attempt}/${maxRetries})`);
+        diag('req-network-error', { method, path, message: errMsg, attempt });
 
         // Network error — retry if attempts remain
         if (attempt < maxRetries) {
@@ -1286,6 +1314,7 @@ export class ApiClient {
         } else {
           console.warn(`[LAN ${response.status}] ${method} ${path} (${elapsed}ms):`, errorText);
         }
+        diag('lan-fail', { method, path, status: response.status, ms: elapsed, body: errorText ? String(errorText).slice(0, 300) : '' });
         throw new ApiClientError(
           `LAN request failed: ${response.status}`,
           response.status,
@@ -1303,6 +1332,7 @@ export class ApiClient {
         throw error;
       }
       console.log(`[ApiClient:LAN] ${method} ${path} → network error (${elapsed}ms): ${error instanceof Error ? error.message : 'unknown'}`);
+      diag('lan-network-error', { method, path, message: error instanceof Error ? error.message : 'unknown', ms: elapsed });
       throw new ApiClientError(
         error instanceof Error ? error.message : 'LAN request failed',
         0,
@@ -1319,6 +1349,12 @@ export class ApiClient {
    * @returns true if session was successfully restored, false otherwise
    */
   private async tryRestoreLocalSession(): Promise<boolean> {
+    const ok = await this.tryRestoreLocalSessionImpl();
+    diag('session-restore', { ok });
+    return ok;
+  }
+
+  private async tryRestoreLocalSessionImpl(): Promise<boolean> {
     try {
       // Task 33-E — never re-import a session the auth authority has revoked.
       if (isRevoked()) {

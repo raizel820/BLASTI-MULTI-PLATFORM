@@ -27,6 +27,7 @@ import { useEffect, useRef, useState } from 'react';
 import { syncEngine } from '@/db/sync';
 import { useDatabase, useDatabaseReady } from '@/db/provider';
 import { useLanguage } from '@/hooks/use-language';
+import { diag, diagReset } from '@/lib/diag-log';
 
 const MIN_DISPLAY_MS = 900;
 const DB_WAIT_CAP_MS = 6000;
@@ -53,10 +54,18 @@ export function BootGate({ onDone }: { onDone: () => void }) {
     const startedAt = Date.now();
     const timers: ReturnType<typeof setTimeout>[] = [];
 
-    const finish = () => {
+    // Fresh timeline for this boot/login — the dashboard failure diagnostics
+    // read the events recorded between here and the gate release.
+    diagReset('boot-gate');
+    diag('boot-gate-start', { dbReady: !!dbReady && !!database });
+
+    const finish = (reason: string) => {
       if (cancelled || doneRef.current) return;
       doneRef.current = true;
       setPhase('finishing');
+      // Record WHY the gate released — the "waiting for syncing" splash
+      // releasing before the sync finished is diagnosed from this event.
+      diag('boot-gate-release', { reason, elapsedMs: Date.now() - startedAt });
       // Respect the minimum display time so fast boots don't flash.
       const remaining = Math.max(0, MIN_DISPLAY_MS - (Date.now() - startedAt));
       timers.push(setTimeout(() => {
@@ -67,7 +76,7 @@ export function BootGate({ onDone }: { onDone: () => void }) {
     // Hard overall bound — never trap the user behind the splash.
     timers.push(setTimeout(() => {
       console.warn('[BootGate] Max wait elapsed — proceeding to the dashboard');
-      finish();
+      finish('max-wait-elapsed');
     }, MAX_WAIT_MS));
 
     // Slow-network courtesy note (does not release the gate by itself).
@@ -78,15 +87,20 @@ export function BootGate({ onDone }: { onDone: () => void }) {
       // dashboard still works off the API layer and the periodic loop.
       timers.push(setTimeout(() => {
         console.warn('[BootGate] Offline DB not ready in time — proceeding without initial sync');
-        finish();
+        finish('db-not-ready');
       }, DB_WAIT_CAP_MS));
     } else {
       setPhase('syncing');
+      let syncErrorMessage: string | null = null;
       syncEngine
         .runSyncAndWait(database)
-        .catch(() => { /* sync errors already surfaced via sync-error */ })
+        .catch((err) => {
+          syncErrorMessage = err instanceof Error ? err.message : String(err);
+        })
         .finally(() => {
-          if (!cancelled) finish();
+          if (!cancelled) {
+            finish(syncErrorMessage ? `sync-error: ${syncErrorMessage}` : 'sync-done');
+          }
         });
     }
 

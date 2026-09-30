@@ -24,6 +24,8 @@ const LOCAL_API_BASE = 'http://127.0.0.1:3080';
 const LOCAL_TOKEN_KEY = 'blasti-local-api-token';
 const STORE_KEY = 'blasti-app';
 
+import { diag } from '@/lib/diag-log';
+
 export interface AdoptSessionResult {
   adopted: boolean;
   /** true → the local API is reachable but rejected our token (foreign session) */
@@ -109,8 +111,10 @@ export async function adoptLocalSession(): Promise<AdoptSessionResult> {
         if (changed) {
           console.log(`[SessionAdopt] renderer token caught up to the local session's current token (rotated=${!!data.adopted})`);
         }
+        diag('session-adopt', { ok: true, rotated: changed });
         return { adopted: true, rejected: false, token: data.token };
       }
+      diag('session-adopt', { ok: false, why: 'bad-body' });
       return { adopted: false, rejected: false };
     }
 
@@ -118,12 +122,15 @@ export async function adoptLocalSession(): Promise<AdoptSessionResult> {
       // The local API has a DIFFERENT session (or a lock). Let the caller run
       // its existing revocation/restore logic — do not mark adopted.
       console.log(`[SessionAdopt] adopt-session → ${res.status} (not our session / lock)`);
+      diag('session-adopt', { ok: false, why: 'rejected', status: res.status });
       return { adopted: false, rejected: true };
     }
 
+    diag('session-adopt', { ok: false, why: 'http-' + res.status });
     return { adopted: false, rejected: false };
-  } catch {
+  } catch (err) {
     // Local API unreachable — not an adopt failure per se.
+    diag('session-adopt', { ok: false, why: 'unreachable', message: err instanceof Error ? err.message : String(err) });
     return { adopted: false, rejected: false };
   }
 }

@@ -23,6 +23,7 @@
 import type { Database } from '@nozbe/watermelondb';
 import { buildCloudUrl } from '@/lib/api-client';
 import { isRevoked, setRevoked, clearRevoked } from '@/lib/authz-state';
+import { diag } from '@/lib/diag-log';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -498,6 +499,7 @@ class SyncEngine {
     // legitimate re-login re-enables sync.
     if (this.revokedSession || isRevoked()) {
       console.log('[SyncEngine] Session revoked — skipping sync until re-login');
+      diag('sync-skip', { why: 'revoked' });
       return;
     }
 
@@ -514,6 +516,8 @@ class SyncEngine {
 
     // Check connectivity — but only skip if BOTH internet AND LAN are down
     const { baseUrl, target } = await this.getSyncBaseUrl();
+    const syncStartedAt = Date.now();
+    diag('sync-start', { target, baseUrl: target === 'lan' ? baseUrl : undefined });
 
     // Task 41 — set when the LAN target answered 404 on the sync endpoints:
     // after the finally releases the claim, ONE retry runs against the cloud.
@@ -522,6 +526,7 @@ class SyncEngine {
 
     if (target === 'cloud' && !navigator.onLine) {
       console.log('[SyncEngine] Offline and no LAN server — skipping sync');
+      diag('sync-skip', { why: 'offline-no-lan', target });
       // Early return outside the try/finally — release the claim manually.
       this.isSyncing = false;
       return;
@@ -531,6 +536,7 @@ class SyncEngine {
       const token = this.getAuthToken();
       if (!token) {
         console.log('[SyncEngine] No auth token — skipping sync');
+        diag('sync-skip', { why: 'no-token', target });
         this.emit({ type: 'sync-complete', status: this.getStatus() });
         return;
       }
@@ -696,10 +702,18 @@ class SyncEngine {
 
       this.emit({ type: 'sync-complete', status: this.getStatus() });
       console.log('[SyncEngine] Sync complete at', now, 'via', target);
+      diag('sync-complete', { target, ms: Date.now() - syncStartedAt });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Sync failed';
       this.lastError = message;
       console.warn('[SyncEngine] Sync failed:', message);
+      diag('sync-error', {
+        target,
+        message,
+        status: error instanceof SyncHttpError ? error.status : undefined,
+        code: error instanceof SyncHttpError ? error.code : undefined,
+        ms: Date.now() - syncStartedAt,
+      });
 
       // Task 33-E — explicit rejection (cloud 401/403, or the desktop local
       // API answering with its AUTHORIZATION_REVOKED lock). Handled BEFORE the

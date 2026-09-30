@@ -2494,3 +2494,102 @@ Work Log:
 Stage Summary:
 - Fixes are baked into the source (v0.3.4) AND into the patcher; either route delivers them.
 - User-facing answer: download BLASTI-fix-0.3.4.ps1 via the preview URL path /blasti-fix/index.html (clickable page) or /blasti-fix/BLASTI-fix-0.3.4.ps1 directly; extension is .ps1 (PowerShell), not ".psi".
+
+---
+Task ID: 2-b
+Agent: Z.ai Code (subagent, general-purpose — cast service CommonJS re-port)
+Task: Re-port apps/api/src/lib/discovery/cast-service.ts to CommonJS at apps/desktop/local-api/lib/cast-service.js (lost in workspace reset).
+
+Work Log:
+- Confirmed the reset: apps/desktop/local-api/lib/ contained 7 files, cast-service.js absent; no reference to it anywhere in apps/desktop (grep cast-service|castToTv|detectCastProtocols = 0 hits) — so this port re-introduces the module with the canonical export surface for later wiring.
+- Read the TS source fully (21,088 B, 562 lines). Key finding: it has ZERO import statements — it uses only platform globals (fetch, AbortSignal.timeout, WebSocket, URL, setTimeout) plus regex XML handling; nothing to inline, nothing to require. The only non-runtime exports are 4 type/interface declarations (CastProtocol, CastTarget, CastResult, CastProtocolInfo — plus private DlnaServiceUrls), all stripped in the JS port; the runtime surface is exactly 7 functions (detectCastProtocols, castViaDlna, castViaSamsungTizen, castViaLgWebOS, castViaRokuEcp, stopDlnaCast, castToTv).
+- Wrote apps/desktop/local-api/lib/cast-service.js as a 1:1 CommonJS port: every function ported complete (resolveDlnaServices candidate/batch logic, parseDlnaServices regexes, extractBaseURL, resolveUrl, soapRequest, escapeXml, all 6 cast/stop/orchestrator functions); same names, same defaults, same timeouts (SSDP-description fetch 3s in batches of 10, SOAP 5s, Samsung WS 6s + 800ms ack window, LG WS 7s, Roku ECP 4s), same XML SOAP payloads (SetAVTransportURI / Play / Stop envelopes byte-identical), same result-message strings, same detectCastProtocols precedence (hasDlna || !isSamsung && !isLg && !isRoku kept verbatim). Header comment documents why no requires are needed (globals: fetch/AbortSignal since Node 18, global WebSocket stable since Node 22 — Electron 42 embeds Node ≥ 22) and that TS types were stripped.
+- module.exports = { detectCastProtocols, castToTv, castViaDlna, castViaSamsungTizen, castViaLgWebOS, castViaRokuEcp, stopDlnaCast } — exactly the TS runtime export set, no extras. Internal helpers (resolveDlnaServices, parseDlnaServices, extractBaseURL, resolveUrl, soapRequest, escapeXml) kept private, matching the TS surface. No other file touched.
+- Verification 1: node --check apps/desktop/local-api/lib/cast-service.js → SYNTAX OK.
+- Verification 2 (node -e smoke test, no test files, no real cast): require OK on Node 24; Object.keys = exactly the 7 expected exports, zero extras; each is a function (6 AsyncFunction + sync detectCastProtocols). Pure no-network behavior checks of detectCastProtocols: {manufacturer Samsung, port 8001} → samsung-tizen true / dlna false; generic {} → dlna true + url always true; {manufacturer Roku, port 8060} → roku-ecp true; {manufacturer LG} → lg-webos true; labels 'DLNA / UPnP | Samsung Tizen | LG webOS | Roku ECP | Open URL'.
+- Verification 3 (TS↔JS parity proof): programmatic byte-compare of the three SOAP command bodies extracted from both files — SetAVTransportURI (248 chars), Play (143), Stop (108) all EXACT MATCH; <s:Envelope> header line identical; AbortSignal.timeout multiset identical in both files (3000/4000/5000); regex scan of the JS for TS/ESM leftovers (interface /: type annotations /export /as-casts/generics) = 0 hits.
+
+Stage Summary:
+- apps/desktop/local-api/lib/cast-service.js created: 20,515 bytes, CommonJS, zero dependencies (Node globals only), full 1:1 port of all 562 TS lines — supported protocols dlna / samsung-tizen / lg-webos / roku-ecp / url.
+- Exports (7): detectCastProtocols, castToTv, castViaDlna, castViaSamsungTizen, castViaLgWebOS, castViaRokuEcp, stopDlnaCast. Verified: node --check PASS; smoke test PASS (all exports valid functions, detect logic behaviorally identical); SOAP payloads + timeouts byte-proven identical to the cloud TS reference.
+- Next actions: wire it into local-api/index.js routes (cast/discovery endpoints) and/or main.js as a separate task; the module is standalone and safe to require today.
+
+---
+Task ID: 2-a
+Agent: Z.ai Code (subagent, general-purpose)
+Task: Re-port apps/api/src/lib/discovery/scanner.ts to CommonJS at apps/desktop/local-api/lib/discovery-scanner.js (lost in workspace reset).
+
+Work Log:
+- Read worklog tail (last 200 lines) + searched for prior discovery-scanner entries — none exist (prior port was uncommitted and wiped by the reset), so the file was rebuilt from the TypeScript source.
+- Read apps/api/src/lib/discovery/scanner.ts fully in 7 sequential chunks (3,128 lines / 127,774 bytes). Confirmed it is self-contained: only node builtin imports (node:os, node:fs, node:dgram, node:net, node:dns/promises, node:child_process{spawn}, node:buffer{Buffer}); `net` and the USB_PRINTER_DEVICE_CLASSES / USB_VENDOR_SUBCLASS_PRINTER sets are declared-but-unused in the TS and were kept for 1:1 parity. No relative imports — nothing needed inlining.
+- Enumerated the TS export surface: 27 runtime exports (SCAN_PORTS, getLocalSubnets, getNetworkInterfacesDetailed, lookupMacVendor, isRandomizedMac, readArpTable, pingSweep, pingHost, mdnsQuery, ssdpDiscover, reverseDnsLookup, reverseDnsBatch, cleanReverseDnsHostname, nbnsQueryHost, nbnsBatch, readDhcpLeases, cleanDhcpHostname, httpProbe, fetchUpnpDescription, discoverLocalPrinters, isPrinterMacVendor, isVirtualPrinterName, nameQuality, cleanMdnsName, fingerprintDevice, runDiscoveryScan, getProtocolAvailability) + 22 type-only exports (interfaces/unions — erased in JS). Task also mandates exporting `sourcePriority` (module-private in TS) → 28 total module.exports.
+- Wrote the CommonJS port section-by-section preserving every function body, constant, regex, default, and timeout value exactly: SCAN_PORTS (13 ports), PING_CONCURRENCY=64, PING_TIMEOUT_MS=1000, HTTP_CONCURRENCY=16, HTTP_TIMEOUT_MS=1500, MDNS_TIMEOUT_MS=5000, SSDP_TIMEOUT_MS=6000, mDNS 224.0.0.251:5353, SSDP 239.255.255.250:1900, 41-entry MDNS_SERVICE_TYPES, 10-entry SSDP search list, DHCP lease-file list, MAC_OUI_VENDORS (~200 OUIs), virtual-printer/Vendor-token/printer-OUI tables, full runDiscoveryScan 7-phase orchestrator (ARP → ping → ARP refresh → mDNS → SSDP → rDNS/NBNS → DHCP → local USB/CUPS → HTTP-last → fingerprint). All comments kept in English. module.exports block mirrors the TS export list + sourcePriority.
+- Verification: node --check apps/desktop/local-api/lib/discovery-scanner.js → PASS. Mechanical parity: function-name sets diffed TS vs JS → 49/49 identical; module-level const sets identical (+ require bindings); zero TypeScript/ESM residue (regex scan for `export`/`interface`/`type`/annotations → empty); byte-identical spot diffs on critical lines (ARP/NBNS/dhcpd regexes, OUI encoder, 41 `joined.includes` fingerprint hints, ping-progress math, SSDP desc fetch).
+- Smoke test with plain node (no test files, node -e): required the module from apps/desktop, printed 28 exports; called getLocalSubnets() → ["21.0.13"], getNetworkInterfacesDetailed() → 2 IPv4 entries, readArpTable() → 3 entries; parity spot checks: fingerprintDevice(Apple OUI)=NETWORK/PHONE/"Apple Phone", nameQuality("Canon TS3400 series")=100, nameQuality("Adobe PDF")=0, isVirtualPrinterName("Microsoft Print to PDF")=true, cleanMdnsName("Poco X6 Pro._android._tcp.local")="Poco X6 Pro", cleanDhcpHostname("SM-S901B")="Samsung SM-S901B", lookupMacVendor("00:1B:A9:..")=Epson/PRINTER, isRandomizedMac("6a:fb:..")=true, sourcePriority ssdp=5/arp=1, getProtocolAvailability()=10 rows. runDiscoveryScan NOT invoked (long-running), per instructions.
+- Worked only in apps/desktop/local-api/lib/discovery-scanner.js + this worklog append; temp staging chunks deleted; no other repo file touched, no new dependencies.
+
+Stage Summary:
+- apps/desktop/local-api/lib/discovery-scanner.js rebuilt: 120,512 bytes, 2,954 lines, CommonJS, node-core-only. 28 exports: SCAN_PORTS, getLocalSubnets, getNetworkInterfacesDetailed, lookupMacVendor, isRandomizedMac, isPrinterMacVendor, readArpTable, pingSweep, pingHost, mdnsQuery, ssdpDiscover, reverseDnsLookup, reverseDnsBatch, nbnsQueryHost, nbnsBatch, readDhcpLeases, httpProbe, fetchUpnpDescription, discoverLocalPrinters, cleanReverseDnsHostname, cleanDhcpHostname, cleanMdnsName, isVirtualPrinterName, nameQuality, fingerprintDevice, runDiscoveryScan, sourcePriority, getProtocolAvailability.
+- node --check PASS; smoke test PASS (28 exports, async probes run clean, 12/12 behavior-parity spot checks match the TS source).
+- Local-api/index.js currently has no require() of this module — wiring the /api/agency-devices/discovery/* routes onto it is the natural next step for a follow-up task.
+
+---
+Task ID: 2-c + reset-recovery
+Agent: Z.ai Code (main orchestrator)
+Task: Rebuild everything lost in the 09:15 workspace reset — Task B diagnostics, Task A 2-c agency-device routes — and COMMIT locally so future resets cannot wipe uncommitted work.
+
+Work Log:
+- Confirmed reset: git tree clean at 09:15:54, all uncommitted files wiped (incl. worklog section — worklog.md is tracked, so resets revert it too).
+- Relaunched 2-a/2-b subagents: discovery-scanner.js re-ported (120,512 B, 28 exports, parity-verified) and cast-service.js (20,515 B, 7 exports, SOAP byte-exact vs TS).
+- Redid ALL Task B diagnostics edits (diag-log.ts + api-client + boot-gate + sync + session-adopt + fetch-with-retry + agency-dashboard + diag-log.js + index.js middleware/auth-codes/assignSession + main.js initial-sync).
+- Wrote apps/desktop/local-api/agency-devices.js (~1,060 lines): full CommonJS port of the agency-facing parts of apps/api/src/routes/agency-devices.ts — management (list/unpaired/create/get/patch/delete/pair/unpair/pairing-request/command/commands/kiosk-credentials+regenerate/reboot/refresh/connect/disconnect/scan-network/scan/discovery-token), embedded discovery suite (health/devices/scan start-stop-status/protocols/diagnostics using lib/discovery-scanner.js), saved-tvs + default-printer (upsert semantics), and the cast suite — including /cast/dlna|samsung|lg|roku, /cast/stop, /cast/protocols which the cast dialog calls but the CLOUD API does not implement (desktop now casts for real via lib/cast-service.js).
+- Registered the module in local-api/index.js BEFORE the static-UI catch-all, with ctx { authMiddleware, requireAgencyId, getDb, broadcast (emitEvent + broadcastLocalRealtime), diagLog }.
+- Fixed one bug found in smoke testing: GET /discovery/default-printer needs optional auth (kiosk ?agencyId= path vs staff auth path) — added defaultPrinterAuth wrapper + getDb ctx hook.
+- End-to-end smoke test against the live local API (seeded agency): create/list/pair/command/commands/kiosk-credentials/patch/unpair/saved-tvs/default-printer(authed+kiosk)/scan start-stop/cast-protocols/no-auth-401 — ALL PASS.
+- Verification: node --check all desktop files; eslint 0/0; browser render OK with __blastiDiag live.
+- COMMITTED all work locally (protection against working-tree resets; not pushed).
+
+Stage Summary:
+- Desktop device management + discovery + cast now WORK OFFLINE: the previously dead buttons have real local endpoints mirroring the cloud contract.
+- Diagnostics instrumentation (Task B) reapplied and verified.
+- All work committed locally at HEAD — future `git checkout .`/reset-to-HEAD can no longer destroy it (only a hard reset to origin/master would).
+- Kiosk-side /public/* + /device/* endpoints (deviceToken auth) remain a separate follow-up if kiosk mode on desktop is needed.
+
+---
+Task ID: 9
+Agent: Z.ai Code (main agent)
+Task: User asked whether the workspace reset lost only the last fix or the whole session's updates
+
+Work Log:
+- Audited git history + disk artifacts against the full session: commits 2cdc744 (Firebase crash-proof push), 64d37af (debug cleartext LAN/emulator), fd4b5ea (Capacitor 10.0.2.2 default + .env.production) all present
+- Verified on disk: BlastiNativeStatus.java, MainActivity.java, push-registration.ts isFirebaseConfigured, google-services.json.example, firebase-push-setup.md, network_security_config.xml (main debug-permissive + release overlay), apps/web/.env.production, DEFAULT_NATIVE_CLOUD_URL in api-client.ts
+- Found TWO resets occurred: reset #1 wiped only the uncommitted Task 7 API-URL fix (cause of "still same issue"); reset #2 wiped the uncommitted Task 8 worklog append
+- Lesson applied: every fix is now committed immediately; worklog committed going forward
+
+Stage Summary:
+- Answer: only UNCOMMITTED work was ever lost (the API-URL fix once, worklog entries twice); all committed session work survived both resets
+- Current HEAD fd4b5ea contains 100% of the session's fixes; user should download from this state
+
+---
+Task ID: 10
+Agent: Z.ai Code (main agent)
+Task: Generate dedicated desktop icon, phone app icon, and phone launch intro animation based on the BLASTI logo + emerald theme
+
+Work Log:
+- Studied branding: logo = teal 3-seat waiting bench + orange dot; theme emerald #10b981; desktop assets at apps/desktop/assets/; Android had generic Capacitor placeholder X launcher icon
+- Loaded image-generation skill, generated AI masters (desktop one excellent; phone foreground too large/off-brand -> discarded)
+- Authored vector bench glyph (SVG, 512 viewBox, white glyph + orange dot + ground shadow) as the single source of truth for all assets; render loop via sharp in upload/blasti-branding (gitignored scratch)
+- Desktop: icon.png (1024) + icon.ico (16,24,32,48,64,128,256 via png-to-ico)
+- Android: ic_launcher + ic_launcher_round (48/72/96/144/192) + adaptive ic_launcher_foreground (108/162/216/324/432, glyph ~56% of canvas -> inside 66% safe zone); @color/ic_launcher_background already #10b981
+- Splash: regenerated drawable + port/land densities (320x480..1920x1280) solid emerald + centered glyph
+- Web/PWA: favicon.png (64), apple-touch-icon (180), logo-192, logo-512 re-rendered; logo.png/logo.svg (UI brand) left untouched
+- New AppIntroAnimation (Framer Motion, apps/web/src/components/shared/): backrests spring in staggered -> armrest path draws -> seats/beam/legs assemble -> shadow grounds -> orange dot drops with spring bounce + 2 ripple pings -> BLASTI + بلاصتي wordmark stagger -> curtain fade. Capacitor-only once per launch (sessionStorage blasti-intro-played), ?intro=1 web preview, prefers-reduced-motion static card, AnimatePresence unmount
+- Fixed SVG transform-origin bug (originX/Y px unreliable on SVG in motion) -> transformBox fill-box + transformOrigin center; verified centered ripple in browser
+- capacitor.config.ts launchShowDuration 2000->400 (animated intro takes over after webview paint)
+- Browser-verified via agent-browser: mid-assembly frame, centered ripple + staggered wordmark frame, clean unmount into app, no console/page errors, plain web boot shows no intro; lint exit 0
+- COMMITTED a35ee6a (35 files) so the suite survives resets
+
+Stage Summary:
+- All three deliverables done and committed: desktop icon (.ico+.png), full Android launcher set (adaptive + legacy + round), launch intro animation
+- Rebrand takes effect on device after: bun run build:mobile (cap sync copies icons? icons are res/ files -> picked up by gradle build) then Run in Studio; uninstall old APK first if launcher icon is cached
+- Electron desktop picks up icon.ico/icon.png on next electron-builder run
