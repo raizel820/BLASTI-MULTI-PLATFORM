@@ -106,9 +106,7 @@ apps/web/src/
 │   ├── use-platform.ts     → Platform detection (web/electron/capacitor)
 │   ├── use-online-status.ts → Online/offline detection
 │   ├── use-upload.ts       → File upload hook
-│   ├── use-toast.ts        → Toast notification hook
 │   ├── use-debounce.ts     → Debounce utility hook
-│   ├── use-local-storage.ts → localStorage hook
 │   └── use-mobile.ts       → Mobile detection hook
 ├── lib/
 │   ├── api-client.ts       → Cross-platform HTTP client
@@ -117,13 +115,10 @@ apps/web/src/
 │   ├── platform.ts         → Platform detection utilities
 │   ├── platform-capabilities.ts → Platform feature detection
 │   ├── native-bridge.ts    → Capacitor/Electron bridge
-│   ├── rbac.ts             → Role-based access control
 │   ├── enums.ts            → String enum constants
 │   ├── validations.ts      → Zod validation schemas
-│   ├── cache.ts            → Client-side caching
 │   ├── sounds.ts           → Audio notification sounds
 │   ├── utils.ts            → Shared utilities
-│   ├── route-map.ts        → Route/view mapping
 │   ├── date-utils.ts       → Date formatting
 │   ├── fetch-with-retry.ts → Fetch with retry logic
 │   ├── password.ts         → Password validation

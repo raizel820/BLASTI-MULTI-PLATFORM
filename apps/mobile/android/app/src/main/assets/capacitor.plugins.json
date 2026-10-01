@@ -12,14 +12,6 @@
 		"classpath": "com.capacitorjs.plugins.device.DevicePlugin"
 	},
 	{
-		"pkg": "@capacitor/filesystem",
-		"classpath": "com.capacitorjs.plugins.filesystem.FilesystemPlugin"
-	},
-	{
-		"pkg": "@capacitor/geolocation",
-		"classpath": "com.capacitorjs.plugins.geolocation.GeolocationPlugin"
-	},
-	{
 		"pkg": "@capacitor/haptics",
 		"classpath": "com.capacitorjs.plugins.haptics.HapticsPlugin"
 	},
@@ -46,21 +38,5 @@
 	{
 		"pkg": "@capacitor/status-bar",
 		"classpath": "com.capacitorjs.plugins.statusbar.StatusBarPlugin"
-	},
-	{
-		"pkg": "@capacitor-mlkit/barcode-scanning",
-		"classpath": "io.capawesome.capacitorjs.plugins.mlkit.barcodescanning.BarcodeScannerPlugin"
-	},
-	{
-		"pkg": "@capacitor-community/keep-awake",
-		"classpath": "com.getcapacitor.community.keepawake.KeepAwakePlugin"
-	},
-	{
-		"pkg": "@capgo/capacitor-native-biometric",
-		"classpath": "ee.forgr.biometric.NativeBiometric"
-	},
-	{
-		"pkg": "@capawesome/capacitor-badge",
-		"classpath": "io.capawesome.capacitorjs.plugins.badge.BadgePlugin"
 	}
 ]

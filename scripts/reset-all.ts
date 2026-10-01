@@ -33,8 +33,8 @@
  *    Plus the legacy standalone fallback ~/.blasti/local and ~/.blasti/files.
  *
  * ─── WHAT IS PRESERVED (app-needed files) ─────────────────────────────────────
- * • Web app logo/icons in apps/web/public/ (logo.svg, logo.png, logo-192.png,
- *   logo-512.png, favicon.png, apple-touch-icon.png, blasti-icon.png) — they
+ * • Web app logo/icons in apps/web/public/ (logo.png, logo-192.png,
+  *   logo-512.png, favicon.png, apple-touch-icon.png, blasti-icon.png) — they
  *   live OUTSIDE uploads/ and are never touched.
  * • The preset/basic registration avatars are SVG data URIs generated in code
  *   (apps/web/src/components/auth/register-form.tsx) — nothing on disk to keep.
@@ -211,7 +211,7 @@ if (doCloudDb) {
   for (const suffix of ['', '-journal', '-wal', '-shm']) {
     rm(`${DB_FILE}${suffix}`, `packages/db/data/custom.db${suffix}`);
   }
-  // Defensive: force dev-api.cjs to re-run `prisma db push` on next start.
+  // Defensive: force the API to re-run `prisma db push` on next start.
   rm(SCHEMA_STAMP, 'packages/db/.schema-stamp');
 
   // Phase 1: invalidate every pre-reset session token IMMEDIATELY (stateless

@@ -355,5 +355,4 @@ apps/api/src/
     ├── upload.ts         → File upload/storage abstraction
     ├── audit.ts          → Audit logging helpers
     ├── date-utils.ts     → Date/timezone utilities
-    └── device-fingerprint.ts → Device fingerprinting
 ```

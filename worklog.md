@@ -2593,3 +2593,102 @@ Stage Summary:
 - All three deliverables done and committed: desktop icon (.ico+.png), full Android launcher set (adaptive + legacy + round), launch intro animation
 - Rebrand takes effect on device after: bun run build:mobile (cap sync copies icons? icons are res/ files -> picked up by gradle build) then Run in Studio; uninstall old APK first if launcher icon is cached
 - Electron desktop picks up icon.ico/icon.png on next electron-builder run
+
+---
+Task ID: 11
+Agent: Z.ai Code (main agent)
+Task: Rebrand phone + desktop icons and the phone launch intro to use the ORIGINAL logo artwork as base, without changes (user supplied pasted_image_1790838825613.png) — the Task-10 redrawn glyph had damaged app identity
+
+Work Log:
+- Confirmed workspace intact at 52d21b7 (Task 10 suite committed); diagnosed identity break: Task-10 favicon/launcher/desktop icons were a redrawn abstract bench (emerald tile + white glyph), not the original bench
+- New single source of truth: the user's original 1024 logo (white rounded tile + teal bench + orange dot). Render pipeline: upload/blasti-branding/generate-original.ts (sharp + png-to-ico)
+- Measured tile bounds programmatically (x 0.180-0.820, y 0.191-0.844 → tile-fill scale ×1.533)
+- Desktop: icon.png 1024 + icon.ico (16-256) — original artwork, tile-fill framing (bench reads at small sizes)
+- Android: legacy ic_launcher = original as-is (48-192); ic_launcher_round = tile-fill + circular mask; adaptive ic_launcher_foreground = original at 92% on white (tile ≈57% of canvas, inside 66% safe zone); ic_launcher_background color emerald → #FFFFFF so the white tile blends seamlessly
+- Android splash: all 11 port/land/fallback densities regenerated — white bg + original centered (65% of min dim)
+- Web/PWA: favicon 64, apple-touch 180, logo-192, logo-512 — tile-fill original; blasti-icon.png + logo.png (UI brand) untouched (already original artwork)
+- Intro animation rewritten (app-intro-animation.tsx): vector assembly replaced by the original artwork as one piece — spring scale-in (0.55→1, rotate settle), ground shadow, "ticket called" ripples anchored at the measured orange-dot centroid (50.56%, 78.24% of the tile-fill asset), emerald-900 wordmark on soft emerald-tinted white backdrop; gating/gating timings/reduced-motion/exit preserved
+- Intro asset public/blasti-app-icon.png = tile-fill 512 (framing matches launcher icon)
+- Verified in browser (480x900, ?intro=1): spring frame, ripple+wordmark frame, clean unmount into landing; plain / shows no intro; console 0 errors, API 200s; lint exit 0
+
+Stage Summary:
+- Every asset now derives from the untouched original logo — identity restored; no redrawn geometry anywhere
+- Commit 35-file style rebrand: desktop .ico/.png, full Android launcher set + adaptive white bg + splashes, web/PWA icons, intro animation + asset
+- On-device effect: bun run build:mobile then Studio Run (uninstall old APK if launcher icon cached); Electron picks up icon on next build
+
+---
+Task ID: 12-b
+Agent: Explore (api/desktop/mobile/packages audit)
+Task: audit backend, desktop, mobile, packages for dead files and artifacts
+Work Log:
+- API routes: index.ts imports 36 route modules / mounts them via 37 app.route() calls; 37 route files exist on disk. Exactly ONE unmounted: routes/kiosk.ts (348 L, 0 importers repo-wide), yet apps/web/src/lib/offline-queue.ts:454 still calls POST /api/kiosk/join → endpoint 404s today. NEEDS-REVIEW (mount or delete both sides).
+- API libs verified USED (not dead): cancel-pending-alerts.ts (index.ts:82 + routes/queue.ts:9), eccp-reconciler.ts (routes/reconciliation.ts:15), idempotency-middleware.ts (index.ts:79), workers/notification-worker.ts (index.ts:83 startNotificationWorker; api pkg has only dev/start on src/index.ts so worker IS scheduled), types/qrcode.d.ts (ambient types for qrcode dep used in routes/agency.ts + qr.ts).
+- API libs DEAD: lib/device-fingerprint.ts (95 L; grep "device-fingerprint" in apps/api → only README.md:358; it's a client-side localStorage util duplicated in apps/web/src/lib) and lib/discovery/cast-service.ts (561 L; grep "discovery/cast-service" → 0 hits; casting implemented inline in routes/agency-devices.ts:2993+ and fully ported to apps/desktop/local-api/lib/cast-service.js).
+- DESKTOP: 33 files, ZERO dead. main.js→preload.js (680,1519) + loading-screen.js (1001/1037/1115); local-api/index.js requires lib/db, local-realtime, file-store, file-sync, diag-log, agency-devices, sync-service, initial-sync; agency-devices→discovery-scanner+cast-service; sync-service/initial-sync→sync-record-sanitize; db→schema-migrations→schema-init-sql; scripts/prebuild.js (pkg prebuild+build*), scripts/after-pack.js (electron-builder.yml:40); assets icon.png/icon.ico/tray-icon.png/logo.png all referenced (builder config + main.js:615,1309 + loading-screen.js:757). Note: tests/test-stale-generation.js is executable (node test-stale-generation.js, Task-48) but NOT wired into run-tests.sh (which runs db/schema-migrations/sync/local-api only) → recommend adding.
+- MOBILE: src/ = only setup.ts (564 L) + plugin.ts (401 L). WIRING NOT FOUND: capacitor.config.ts does NOT import them (0 hits); no build step compiles apps/mobile/src (root build:mobile = web build:export + cap sync which copies apps/web/out only); web never imports @blasti/mobile (only a comment at push-registration.ts:5); 0 web refs to __BLASTI_NATIVE__/blasti:deep-link/blasti:app-resume (web uses window.Capacitor.Plugins directly). Per brief treated as entry points → NEEDS-REVIEW: wire into web bundle or accept ~965 L dead. RES-RAW-NOTES.md (30 L) = genuine but DUPLICATE of docs/alarm-sound.md (same blasti_alarm.wav instructions) → stale duplicate, SAFE-TO-DELETE.
+- PACKAGES core: USED = sync-registry.ts (api initial-sync.ts:43, sync.ts:30, lib/sync-helpers.ts:29), sync-serializer.ts (api initial-sync.ts:44; imports ./sync-registry), sync-registry.json (desktop local-api/sync-service.js:64 fallback). DEAD (0 external importers; only intra-core consumers are dead or the unused barrel): index.ts barrel (0 bare '@blasti/core' imports), types.ts, enums.ts, auth.ts, config.ts, realtime.ts, sqlite-adapter.ts, schema.ts = 1,772 L; also orphan dep better-sqlite3 (only used by the dead two). Cleanup requires package.json exports/main edits → code SAFE-TO-DELETE, packaging NEEDS-REVIEW. scripts/generate-sync-registry-json.js = 0 refs anywhere but regenerates the USED sync-registry.json → NEEDS-REVIEW.
+- PACKAGES db: no dead files. index.ts used by 51 api files (web/desktop/mobile 0 by design); seed.ts wired via db pkg db:seed + prisma.seed; schema.prisma used by db:* scripts; data/custom.db = runtime DB.
+- JUNK: .tmp-verify/ 8 PNGs ~960KB (one-off verification screenshots), apps/api/tool-results/tmp/ 6 tmp ts scripts, root file "git test" (1 byte, "G") — all git-tracked, SAFE-TO-DELETE. Root tool-results/ = agent-harness scratch (session outputs), not project junk. 0 *.bak/*.old/*copy*/*.tmp/*.orig/~ files; 0 empty files; 0 empty dirs in scope.
+- ROOT SCRIPTS: USED-BY-NPM-SCRIPT: dev-web.mjs (dev:web), reset-all.ts (reset:all/cloud/desktop/files), gradle.js (mobile:apk*, mobile build:android:*). USED-BY-DOC: generate-alarm-wav.ts (apps/mobile/docs/alarm-sound.md). start.sh KEEP (apps/mobile/docs/local-api-testing.md:47 + sandbox session entry). ORPHAN: dev-web.cjs (superseded by .mjs), dev-api.cjs (only a comment in reset-all.ts:214), gen-algeria-locations.js (one-shot, reads /tmp/dz1.json, output committed as web algeria-locations.ts). NEEDS-REVIEW: web-startup-test.mjs (manual dev-crash regression test), deploy-guide.sh (self-documenting ops runbook), blasti-fix-template.ps1 (template for shipped apps/web/public/blasti-fix/BLASTI-fix-0.3.x.ps1), keep-api-alive.sh + daemon-start.sh (sandbox-only watchdogs, worklog-documented resource-exhaustion fixes).
+Stage Summary:
+- 1 unmounted API route (kiosk.ts 348 L, live 404 caller in web) + 2 dead API libs (727 L) + 8 dead core modules (1,772 L incl. unused better-sqlite3 dep) + 2 unwired mobile src files (~965 L) + 1 duplicate doc + 3 junk artifact locations + 3 orphan scripts.
+- Desktop is 100% clean (0 dead files); API is clean except kiosk/device-fingerprint/cast-service; @blasti/db fully used.
+- Highest-value deletions: core dead modules, api lib/device-fingerprint.ts, api lib/discovery/cast-service.ts, .tmp-verify/, api tool-results/tmp/, "git test", dev-web.cjs/dev-api.cjs/gen-algeria-locations.js, RES-RAW-NOTES.md.
+- Decisions needed from orchestrator: kiosk.ts (mount vs delete+web fix), mobile setup/plugin wiring, core package.json exports cleanup, test-stale-generation.js into run-tests.sh.
+---
+Task ID: 12-c
+Agent: Explore (dependency audit)
+Task: find unused npm dependencies across all package.json files (root, apps/api, apps/web, apps/mobile, apps/desktop, packages/core, packages/db)
+
+Work Log:
+- Read all 7 package.json files; grep-audited every non-keep-listed dep across repo (excluded node_modules/bun.lock/worklog/agent-ctx/tool-results/generated android assets) via import/require/config patterns
+- USED confirmed (highlights): firebase-admin (notification-router.ts), jose (api+core auth), qrcode (api routes/qr.ts+agency.ts, web agency-qr-display etc., desktop local-api/index.js — desktop does NOT declare it), socket.io (api index+notification-router, desktop local-realtime.js), socket.io-client (web use-realtime.tsx, desktop sync-service.js), zod (api ~20 files + web validations.ts — web does NOT declare it), @nozbe/watermelondb (8 files in web src/db — genuinely used), framer-motion (80+ files), recharts (~36), lucide-react (100+), maplibre-gl (lib/map/*), sonner (~20 direct), next-themes, qrcode.react (QueuePositionQR), jsqr (2 scanners), cmdk (ui/command.tsx <- agency-search), input-otp (verification-step), react-day-picker (ui/calendar.tsx <- 4 customer components), all 28 @radix-ui/* (each imported by its ui/<name>.tsx), zustand (store/use-app-store.ts; store consumed by 40+ files), bcryptjs/@prisma/client/electron-is-dev/hono/@hono/node-server (desktop local-api), better-sqlite3 (core sqlite-adapter.ts)
+- UNUSED-CANDIDATES: packages/core "hono" (0 imports anywhere in packages/core/src — only its package.json), apps/web "tailwindcss-animate" (only referenced by tailwind.config.ts, which Tailwind v4 never loads — globals.css uses @import "tailwindcss" + @import "tw-animate-css", no @config directive; the whole tailwind.config.ts is dead legacy)
+- apps/mobile: 0 JS imports for @capacitor/filesystem, @capacitor/geolocation, @capacitor/motion (web src deliberately avoids importing capacitor JS — native-bridge uses globals); @capacitor-mlkit/barcode-scanning, @capacitor-community/keep-awake, @capgo/capacitor-native-biometric appear only in COMMENTS (native-bridge.ts:231/607/942, SimpleMobileDashboard.tsx:93); @capawesome/capacitor-badge has zero non-lockfile refs; devDep @capacitor/ios has no ios/ platform dir. @capacitor/splash-screen + status-bar are config-referenced in capacitor.config.ts -> KEEP
+- DEAD-COMPONENT radix deps (imported only by shadcn ui files with zero app importers -> REVIEW): react-accordion, react-aspect-ratio, react-hover-card, react-menubar, react-navigation-menu, react-toggle-group, react-toggle. Related: ui/carousel.tsx, ui/form.tsx, ui/drawer.tsx, ui/resizable.tsx import embla-carousel-react / react-hook-form / vaul / react-resizable-panels which are NOT declared anywhere (dead components that would break if ever bundled)
+- Verified per instructions: @tanstack/react-query NOT declared in apps/web and 0 imports repo-wide (only a worklog mention); zustand heavily used; chargily-service.ts imports no payment SDK (crypto builtin only); no axios/moment/lodash/rxjs/bcrypt/jsonwebtoken/nodemailer/twilio/stripe/jspdf/otplib/speakeasy declared anywhere
+- Reverse findings (undeclared but imported): web->zod (hoisted), desktop->qrcode + @blasti/core/sync-registry.json (local-api/index.js, sync-service.js:64) — fragile under electron-builder packaging
+- Dup versions: jose ^5 (core) vs ^6 (api); hono in api+desktop (used) but core copy unused; cross-env duplicated in 4 devDeps (keep-list, not flagged)
+
+Stage Summary:
+- 10 unused-candidate deps (2 clean REMOVE: core/hono, web/tailwindcss-animate; 5 mobile capacitor plugins/platforms to REVIEW/REMOVE: filesystem, geolocation, motion, mlkit-barcode, keep-awake, native-biometric, badge, ios platform), 8 radix deps flagged REVIEW (only consumed by dead shadcn components), 1 REVIEW: core/better-sqlite3 (no confirmed runtime consumer — desktop local-api uses Prisma). All other deps classified USED or keep-list KEEP; full tables returned to orchestrator
+
+---
+Task ID: 12-a
+Agent: Explore (web audit)
+Task: audit apps/web for dead files, unused public assets, legacy code (RESEARCH-ONLY, no code changes)
+Work Log:
+- Built candidate list: 322 files in apps/web/src/{components(excl ui),hooks,lib,store,db,i18n,types}; checked each for alias `@/...` imports (both quote styles), relative `./x` imports in same dir, path-string refs, and repo-wide stem refs (apps/*, packages/*, scripts/*, root configs; excluded node_modules/.next/bun.lock).
+- 47 files with ZERO inbound references; verified each with repo-wide stem grep (worklog/agent-ctx doc mentions excluded from "alive" verdicts).
+- Transitive-death pass (all referencers themselves dead) found 30 more: 7 admin/dashboard/* + 10 customer/profile/* + 7 customer/home/* + 3 customer/queue/* orphaned ONLY via 4 dead index.ts barrels; subscription/types.ts via dead plan-card/transaction-history; use-offline-aware-polling via dead use-dashboard-data; lib/google-cast via dead cast-dialog. All 30 spot-verified repo-wide (hits = self-only or substring false positives like RecentActivityFeed vs ActivityFeed).
+- hooks/use-toast.ts: only importer is vendored ui/toaster.tsx, which itself has ZERO importers (66 files use sonner) → chain-dead pair.
+- Ambiguities resolved: agency/dashboard/service-breakdown (importers use agency/analytics twin); profile/notification-prefs (customer-settings imports top-level twin); queue-controls/queue-efficiency (i18n hits are comment section headers only); rbac.ts hit was "Ba-rbacha" substring; route-map.ts only referenced in a comment; cache.ts only in its own doc comment.
+- Public assets: logo.svg = 0 code refs (only reset-all.ts doc comment + sw.js generic extension list) → unused. public/blasti-fix/ = 0 in-app refs but self-linked download hub (index.html hrefs all 9 files; intentional per Task 60) → keep, prune old patchers 0.3.2/0.3.3 if desired. BUG found: sw.js precacheUrls lists /manifest.json which does NOT exist in apps/web/public (non-fatal precache failure). All other assets (favicon/logo-192/logo-512/apple-touch-icon/blasti-icon/blasti-app-icon/logo.png/blasti_alarm.wav/resize-observer-fix.js/sw.js/robots.txt) referenced in layout.tsx/sw.js/client-boot-hardening/notification-channel/app-intro-animation.
+- Legacy scan: no TODO/FIXME hotspots, no *.bak/*copy*/*old*/*tmp*/*test* files under apps/web (testimonials-section was a "test*" substring false positive). dev-debug-hud.tsx confirmed never mounted. "legacy" words in db/sync.ts, list-payload.ts, qr-scanner, client-boot-hardening = intentional protocol support, NOT dead. Orphaned i18n key sections for dead components (queue-controls/queue-efficiency) noted as follow-up.
+- Duplicates: api-fetch.ts (154 importers) / fetch-with-retry.ts (20) / api-client.ts (44) are all LIVE layered fetch stacks — not dead; offline-layer.ts explicitly replaces offline-queue/offline-cache (comments at api-client.ts:1563, offline-layer.ts:4). All package.json deps used (watermelondb 8 files, react-day-picker/input-otp/cmdk via ui kit).
+- types/css.d.ts: ambient *.css module declaration needed for globals.css import typing — NOT dead, keep.
+Stage Summary:
+- 76 dead code files confirmed (46 zero-inbound + 30 transitive; ~536 KB): full list with evidence returned to orchestrator. +1 chain-dead (hooks/use-toast.ts with vendored ui/toaster.tsx). 1 unused public asset (logo.svg) + 2 legacy patcher versions (blasti-fix 0.3.2/0.3.3) optional. 1 config bug (sw.js precaches missing /manifest.json). No deletions performed (research-only).
+
+---
+Task ID: 12
+Agent: Z.ai Code (main agent) + 3 Explore auditors (12-a web, 12-b api/desktop/mobile/packages, 12-c deps)
+Task: Clean the app of dead code, dead files, unused code and legacy code (user request)
+
+Work Log:
+- 3 parallel evidence-based audits: zero-inbound import analysis (322 web candidates), repo-wide reference greps, dependency usage matrix
+- Commit a7897b8: normalized 680 file-mode-only changes (workspace-restore noise) so future diffs are readable
+- Commit f048308 (junk): .tmp-verify/ (8 PNGs), apps/api/tool-results/tmp/ (6 scripts), "git test" root file, mobile RES-RAW-NOTES.md (dupe of docs/alarm-sound.md), public/logo.svg, scripts/{dev-web.cjs,dev-api.cjs,gen-algeria-locations.js,web-startup-test.mjs}
+- Commit a672069 (dead code, 103 files):
+  - web: 46 zero-import + 30 transitively-dead components/hooks/lib; 14 dead shadcn ui (incl. toast/toaster/use-toast trio — 66 files use sonner); legacy lib (offline-queue, offline-cache, cache, rbac, route-map, google-cast); tailwind.config.ts (v3 config, never loaded by v4); 7 orphan i18n keys pruned en/fr/ar; 10 radix deps + qrcode.react + tailwindcss-animate pruned; sw.js precache of nonexistent manifest.json removed
+  - api: routes/kiosk.ts (never mounted; only caller = dead offline-queue), lib/device-fingerprint.ts, lib/discovery/cast-service.ts (desktop JS port is live)
+  - core: 8 dead modules (~1.8k lines) — package.json exports now only sync-registry/sync-serializer/sync-registry.json; hono/better-sqlite3/jose removed
+  - mobile: src/setup.ts + plugin.ts (~965 lines, zero wiring); 7 unused plugin deps + @capacitor/ios pruned; cap sync android → plugins.json 16→10, settings.gradle clean
+  - fixups: web/api README tree lines, reset-all.ts comments, test-stale-generation.js wired into desktop run-tests.sh; brand/original-logo.png + scripts/brand/generate-original.ts committed (branding master survives resets)
+- Verification: bun install OK; tsc vs baseline — web 373→289 err-lines, api 407→398, ZERO new error locations (157 TS1117s pre-existing); grep proof of zero lingering imports; eslint exit 0; dev server restarted after hot-reload crash during deletion; browser smoke / + /auth/login render perfect, console clean (matches only info logs), GETs 200
+
+Stage Summary:
+- ~220 files removed (~1MB+ of dead weight: 77 web src files + 14 ui + 3 api + 8 core + 2 mobile + 18 artifacts/scripts + lockfile/deps)
+- Deliberately KEPT: blasti-fix/* download hub (user-facing feature), deploy-guide.sh, keep-alive/daemon watchdogs, blasti-fix-template.ps1, generate-alarm-wav.ts (doc-referenced), generate-sync-registry-json.js (regenerates used JSON), desktop tests (now all wired)
+- Known-fragile (noted, not changed): web imports zod undeclared (hoisted); desktop requires qrcode + @blasti/core undeclared; two jose majors in tree (core removed anyway)
+- Pre-existing TS errors (289/398 lines) are a separate baseline — not touched in this cleanup

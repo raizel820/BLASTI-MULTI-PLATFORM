@@ -2497,17 +2497,6 @@ const fr: Record<TranslationKeys, string> = {
   noTicketBeingServed: "Aucun ticket en cours de service",
   totalCounters: "Total des guichets",
 
-  // ─── queue-controls.tsx ────────────────────────────────────────
-  confirmCancelTicket: "Annuler ce ticket ?",
-  actionCannotBeUndone: "Cette action est irréversible",
-  confirmNoShowTicket: "Marquer comme absent ?",
-  asNoShow: "comme absent",
-  goBack: "Retour",
-
-  // ─── queue-efficiency.tsx ─────────────────────────────────────
-  excellent: "Excellent",
-  needsAttention: "Nécessite attention",
-
   // ─── SimpleMobileDashboard.tsx ────────────────────────────────
   slideNoShow: "Absent",
 

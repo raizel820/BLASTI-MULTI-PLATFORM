@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- BLASTI emerald color for adaptive icon background -->
-    <color name="ic_launcher_background">#10b981</color>
+    <!-- White background so the adaptive icon shows the ORIGINAL logo tile
+         exactly as designed (white rounded tile + teal bench + orange dot) -->
+    <color name="ic_launcher_background">#FFFFFF</color>
 </resources>

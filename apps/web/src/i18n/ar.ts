@@ -2498,17 +2498,6 @@ const ar = {
   noTicketBeingServed: "لا توجد تذكرة قيد الخدمة",
   totalCounters: "إجمالي الأرصفة",
 
-  // ─── queue-controls.tsx ────────────────────────────────────────
-  confirmCancelTicket: "إلغاء هذه التذكرة؟",
-  actionCannotBeUndone: "لا يمكن التراجع عن هذا الإجراء",
-  confirmNoShowTicket: "تحديد كحضور غائب؟",
-  asNoShow: "كحضور غائب",
-  goBack: "رجوع",
-
-  // ─── queue-efficiency.tsx ─────────────────────────────────────
-  excellent: "ممتاز",
-  needsAttention: "يحتاج انتباهاً",
-
   // ─── SimpleMobileDashboard.tsx ────────────────────────────────
   slideNoShow: "حضور غائب",
 

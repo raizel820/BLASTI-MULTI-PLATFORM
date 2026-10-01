@@ -256,6 +256,7 @@ if [ "$RUN_API" = true ]; then
   start_local_api
   export BLASTI_TEST_API_PORT=$TEST_PORT
   run_test_file "Local API Integration" "$SCRIPT_DIR/test-local-api.js" || true
+  run_test_file "Stale Generation" "$SCRIPT_DIR/test-stale-generation.js" || true
 fi
 
 # ─── Final Report ─────────────────────────────────────────────────────────────

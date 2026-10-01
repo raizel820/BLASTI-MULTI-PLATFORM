@@ -2498,17 +2498,6 @@ const en: Record<TranslationKeys, string> = {
   noTicketBeingServed: "No ticket being served",
   totalCounters: "Total Counters",
 
-  // ─── queue-controls.tsx ────────────────────────────────────────
-  confirmCancelTicket: "Cancel this ticket?",
-  actionCannotBeUndone: "This action cannot be undone",
-  confirmNoShowTicket: "Mark as no-show?",
-  asNoShow: "as no-show",
-  goBack: "Go Back",
-
-  // ─── queue-efficiency.tsx ─────────────────────────────────────
-  excellent: "Excellent",
-  needsAttention: "Needs Attention",
-
   // ─── SimpleMobileDashboard.tsx ────────────────────────────────
   slideNoShow: "No Show",
 

@@ -12,8 +12,6 @@ dependencies {
     implementation project(':capacitor-app')
     implementation project(':capacitor-camera')
     implementation project(':capacitor-device')
-    implementation project(':capacitor-filesystem')
-    implementation project(':capacitor-geolocation')
     implementation project(':capacitor-haptics')
     implementation project(':capacitor-local-notifications')
     implementation project(':capacitor-preferences')
@@ -21,10 +19,6 @@ dependencies {
     implementation project(':capacitor-share')
     implementation project(':capacitor-splash-screen')
     implementation project(':capacitor-status-bar')
-    implementation project(':capacitor-mlkit-barcode-scanning')
-    implementation project(':capacitor-community-keep-awake')
-    implementation project(':capgo-capacitor-native-biometric')
-    implementation project(':capawesome-capacitor-badge')
 
 }
 

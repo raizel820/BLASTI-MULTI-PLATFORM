@@ -5,15 +5,23 @@
  * app launch (once per app session). Web/desktop boots skip it entirely so
  * the browser preview is unaffected; append `?intro=1` to preview it.
  *
- * Story (matches the brand): the waiting bench assembles itself, the orange
- * "your turn" dot drops in and pings — then the wordmark appears and the
- * curtain lifts into the app.
+ * Story (matches the brand): the ORIGINAL BLASTI logo — the teal waiting
+ * bench + orange "your turn" dot on its white tile, exactly as designed,
+ * no redrawn geometry — springs in, the dot pings a "ticket called" ripple,
+ * the wordmark lands, and the curtain lifts into the app. The artwork is the
+ * very same file the launcher icon and native splash show, so the launch
+ * flow reads as one continuous identity.
  */
 
 import { useEffect, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 
 const INTRO_KEY = 'blasti-intro-played';
+/** The original artwork, tile-fill framing (matches the launcher icon file). */
+const LOGO_SRC = '/blasti-app-icon.png';
+/** Orange dot centroid inside LOGO_SRC (measured from the artwork itself). */
+const DOT_X = '50.56%';
+const DOT_Y = '78.24%';
 
 /** Main scene length before the fade-out begins (ms). */
 const SCENE_MS = 2750;
@@ -55,16 +63,16 @@ export function AppIntroAnimation() {
         <motion.div
           key="blasti-intro"
           aria-hidden="true"
-          className="fixed inset-0 z-[9999] flex flex-col items-center justify-center overflow-hidden"
+          className="fixed inset-0 z-[9999] flex select-none flex-col items-center justify-center overflow-hidden"
           style={{
             background:
-              'radial-gradient(120% 90% at 50% 42%, #14b8a6 0%, #10b981 55%, #065f46 100%)',
+              'radial-gradient(120% 90% at 50% 42%, #ffffff 0%, #f0fdf4 55%, #d1fae5 100%)',
           }}
           initial={{ opacity: 1 }}
           exit={{ opacity: 0 }}
           transition={{ duration: reduceMotion ? 0.35 : 0.55, ease: 'easeInOut' }}
         >
-          <BenchScene reduceMotion={!!reduceMotion} />
+          <OriginalLogoScene reduceMotion={!!reduceMotion} />
 
           {/* Wordmark */}
           <motion.div
@@ -80,7 +88,7 @@ export function AppIntroAnimation() {
               {'BLASTI'.split('').map((ch, i) => (
                 <motion.span
                   key={`${ch}-${i}`}
-                  className="text-4xl font-extrabold tracking-[0.18em] text-white sm:text-5xl"
+                  className="text-4xl font-extrabold tracking-[0.18em] text-emerald-900 sm:text-5xl"
                   variants={
                     reduceMotion
                       ? undefined
@@ -93,7 +101,7 @@ export function AppIntroAnimation() {
               ))}
             </div>
             <motion.p
-              className="mt-2 text-lg font-medium text-white/90"
+              className="mt-2 text-lg font-medium text-emerald-700/90"
               initial={reduceMotion ? undefined : { opacity: 0, y: 10 }}
               animate={reduceMotion ? undefined : { opacity: 1, y: 0 }}
               transition={reduceMotion ? undefined : { delay: 2.0, duration: 0.4 }}
@@ -107,112 +115,58 @@ export function AppIntroAnimation() {
   );
 }
 
-/** The bench glyph, assembled piece by piece. Same geometry as the app icons. */
-function BenchScene({ reduceMotion }: { reduceMotion: boolean }) {
-  const spring = { type: 'spring' as const, stiffness: 260, damping: 20 };
+/**
+ * The original logo, animated as one piece — no re-drawn geometry. It
+ * springs in, the painted-in orange dot pings ripples, a soft ground
+ * shadow grounds it. Ripples are anchored to the dot's measured centroid
+ * so they read as part of the artwork.
+ */
+function OriginalLogoScene({ reduceMotion }: { reduceMotion: boolean }) {
+  const spring = { type: 'spring' as const, stiffness: 240, damping: 19 };
 
-  if (reduceMotion) {
-    return (
-      <svg width="240" height="240" viewBox="0 0 512 512" className="drop-shadow-lg">
-        <ellipse cx="256" cy="398" rx="180" ry="20" fill="#022c22" opacity="0.35" />
-        <rect x="78" y="64" width="106" height="148" rx="20" fill="#fff" />
-        <rect x="203" y="64" width="106" height="148" rx="20" fill="#fff" />
-        <rect x="328" y="64" width="106" height="148" rx="20" fill="#fff" />
-        <path d="M 56 128 V 190 a 28 28 0 0 0 28 28 H 428 a 28 28 0 0 0 28 -28 V 128" fill="none" stroke="#fff" strokeWidth="26" strokeLinecap="round" />
-        <rect x="78" y="236" width="106" height="28" rx="14" fill="#fff" />
-        <rect x="203" y="236" width="106" height="28" rx="14" fill="#fff" />
-        <rect x="328" y="236" width="106" height="28" rx="14" fill="#fff" />
-        <rect x="72" y="282" width="368" height="16" rx="8" fill="#fff" />
-        <path d="M 122 298 L 106 356" stroke="#fff" strokeWidth="24" strokeLinecap="round" />
-        <path d="M 106 356 L 86 370" stroke="#fff" strokeWidth="24" strokeLinecap="round" />
-        <path d="M 390 298 L 406 356" stroke="#fff" strokeWidth="24" strokeLinecap="round" />
-        <path d="M 406 356 L 426 370" stroke="#fff" strokeWidth="24" strokeLinecap="round" />
-        <circle cx="256" cy="372" r="30" fill="#F97316" />
-      </svg>
-    );
-  }
+  const logo = (
+    <div className="relative h-56 w-56 sm:h-64 sm:w-64">
+      {/* soft ground shadow under the tile */}
+      {!reduceMotion && (
+        <motion.div
+          className="absolute -bottom-5 left-1/2 h-4 w-44 -translate-x-1/2 rounded-[100%] bg-emerald-900/20 blur-md"
+          initial={{ opacity: 0, scaleX: 0.4 }}
+          animate={{ opacity: 1, scaleX: 1 }}
+          transition={{ delay: 0.55, duration: 0.45, ease: 'easeOut' }}
+        />
+      )}
 
-  return (
-    <svg width="280" height="280" viewBox="0 0 512 512" className="drop-shadow-lg">
-      {/* ground shadow */}
-      <motion.ellipse
-        cx="256" cy="398" rx="180" ry="20" fill="#022c22"
-        initial={{ opacity: 0, scaleX: 0.4 }}
-        animate={{ opacity: 0.35, scaleX: 1 }}
-        style={{ transformBox: 'fill-box', transformOrigin: 'center' }}
-        transition={{ delay: 0.85, duration: 0.5, ease: 'easeOut' }}
+      {/* the original artwork itself */}
+      <motion.img
+        src={LOGO_SRC}
+        alt=""
+        draggable={false}
+        className="h-full w-full object-contain drop-shadow-xl"
+        initial={reduceMotion ? undefined : { opacity: 0, scale: 0.55, y: -44, rotate: -5 }}
+        animate={reduceMotion ? undefined : { opacity: 1, scale: 1, y: 0, rotate: 0 }}
+        transition={reduceMotion ? undefined : spring}
       />
-      {/* backrests */}
-      {[78, 203, 328].map((x, i) => (
-        <motion.rect
-          key={`back-${x}`}
-          x={x} y="64" width="106" height="148" rx="20" fill="#fff"
-          initial={{ opacity: 0, y: -26, scale: 0.9 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
-          style={{ transformBox: 'fill-box', transformOrigin: 'center' }}
-          transition={{ ...spring, delay: 0.15 + i * 0.1 }}
-        />
-      ))}
-      {/* armrest bar draws itself */}
-      <motion.path
-        d="M 56 128 V 190 a 28 28 0 0 0 28 28 H 428 a 28 28 0 0 0 28 -28 V 128"
-        fill="none" stroke="#fff" strokeWidth="26" strokeLinecap="round"
-        initial={{ pathLength: 0, opacity: 0 }}
-        animate={{ pathLength: 1, opacity: 1 }}
-        transition={{ delay: 0.35, duration: 0.6, ease: 'easeInOut' }}
-      />
-      {/* seats */}
-      {[78, 203, 328].map((x, i) => (
-        <motion.rect
-          key={`seat-${x}`}
-          x={x} y="236" width="106" height="28" rx="14" fill="#fff"
-          initial={{ opacity: 0, y: 14 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ ...spring, delay: 0.55 + i * 0.08 }}
-        />
-      ))}
-      {/* base beam */}
-      <motion.rect
-        x="72" y="282" width="368" height="16" rx="8" fill="#fff"
-        initial={{ scaleX: 0 }}
-        animate={{ scaleX: 1 }}
-        style={{ transformBox: 'fill-box', transformOrigin: 'center' }}
-        transition={{ delay: 0.72, duration: 0.45, ease: 'easeOut' }}
-      />
-      {/* legs */}
-      {[
-        'M 122 298 L 106 356',
-        'M 106 356 L 86 370',
-        'M 390 298 L 406 356',
-        'M 406 356 L 426 370',
-      ].map((d, i) => (
-        <motion.path
-          key={`leg-${i}`}
-          d={d} stroke="#fff" strokeWidth="24" strokeLinecap="round" fill="none"
-          initial={{ opacity: 0, pathLength: 0 }}
-          animate={{ opacity: 1, pathLength: 1 }}
-          transition={{ delay: 0.8 + i * 0.06, duration: 0.25, ease: 'easeOut' }}
-        />
-      ))}
-      {/* the orange "your turn" dot drops in and pings */}
-      <motion.g
-        initial={{ y: -170, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        transition={{ delay: 1.1, type: 'spring', stiffness: 380, damping: 15 }}
-      >
-        <circle cx="256" cy="372" r="30" fill="#F97316" />
-      </motion.g>
-      {/* ripples — "ticket called" ping */}
-      {[0, 0.35].map((lag) => (
-        <motion.circle
-          key={`ripple-${lag}`}
-          cx="256" cy="372" r="30" fill="none" stroke="#F97316" strokeWidth="5"
-          initial={{ scale: 1, opacity: 0 }}
-          animate={{ scale: [1, 2.6], opacity: [0.7, 0] }}
-          style={{ transformBox: 'fill-box', transformOrigin: 'center' }}
-          transition={{ delay: 1.5 + lag, duration: 0.9, ease: 'easeOut', repeat: 1, repeatDelay: 0.15 }}
-        />
-      ))}
-    </svg>
+
+      {/* ripples from the painted orange dot — "ticket called" ping */}
+      {!reduceMotion && (
+        <div
+          className="pointer-events-none absolute"
+          style={{ left: DOT_X, top: DOT_Y, width: 0, height: 0 }}
+        >
+          {[0, 0.35].map((lag) => (
+            <motion.span
+              key={`ripple-${lag}`}
+              className="absolute block rounded-full border-[3px] border-orange-500"
+              style={{ width: 40, height: 40, left: -20, top: -20 }}
+              initial={{ scale: 0.9, opacity: 0.7 }}
+              animate={{ scale: 2.4, opacity: 0 }}
+              transition={{ delay: 1.5 + lag, duration: 0.9, ease: 'easeOut', repeat: 1, repeatDelay: 0.15 }}
+            />
+          ))}
+        </div>
+      )}
+    </div>
   );
+
+  return logo;
 }

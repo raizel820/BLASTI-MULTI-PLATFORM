@@ -77,7 +77,6 @@ const CONFIG = {
     '/logo-512.png',
     '/apple-touch-icon.png',
     '/blasti-icon.png',
-    '/manifest.json',
   ],
 };
 
