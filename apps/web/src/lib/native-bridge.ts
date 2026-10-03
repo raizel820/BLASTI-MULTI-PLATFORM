@@ -20,6 +20,15 @@ import { getPlatformCapabilities, type PlatformCapabilities, type CapabilityKey 
 
 /** Shape of the Electron API exposed via preload contextBridge */
 interface ElectronAPI {
+  /**
+   * CLOUD API base URL resolved by the Electron main process (Task 65).
+   * Injected via webPreferences.additionalArguments and parsed in preload.js.
+   * '' when the main process has no configured cloud URL — callers must
+   * fall back to their own defaults. This is the SAME value the main process
+   * uses for login proxying / sync / realtime, so the renderer can never
+   * disagree about which server is "the cloud" (e.g. a self-hosted VPS).
+   */
+  cloudBaseUrl?: string;
   sendNotification: (title: string, body: string) => void;
   setBadge: (count: number) => void;
   minimize: () => void;

@@ -1,0 +1,930 @@
+diff --git a/.gitignore b/.gitignore
+index a363ac3..8472f0c 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -83,7 +83,11 @@ packages/db/data/.db-generation.json
+ /download/
+ /upload/
+ /examples/
+-Caddyfile
++# root-level Caddyfile only — ops/Caddyfile (docker-compose mount) MUST be
++# tracked; a bare "Caddyfile" pattern here silently excluded it from every
++# commit, so the GitHub repo never had it and fresh server deploys crashed
++# on `docker compose up` (compose bind-mounts ./Caddyfile).
++/Caddyfile
+ ops/.next/
+ 
+ # dev tooling caches
+diff --git a/DEPLOY-GUIDE.md b/DEPLOY-GUIDE.md
+new file mode 100644
+index 0000000..4660354
+--- /dev/null
++++ b/DEPLOY-GUIDE.md
+@@ -0,0 +1,426 @@
++# BLASTI — Step-by-Step DigitalOcean Droplet Deployment Guide
++
++A complete, copy-paste walkthrough: **from "I have a DigitalOcean account" to
++"BLASTI is live on my droplet with HTTPS, and my desktop app talks to it."**
++
++Everything here uses one script — `scripts/deploy-digitalocean.sh` — which
++automates Docker, firewall, secrets, build and startup. No manual server
++configuration is required.
++
++> Reference for every internal detail (compose layout, Caddyfile, env vars,
++> backups, restore): see `DEPLOYMENT.md`.
++
++---
++
++## Part 0 — What you will end up with (30 seconds)
++
++One droplet running the full production stack in Docker:
++
++```
++                    Internet
++                        │
++              ┌─────────▼─────────┐
++              │   Droplet (VPS)   │
++              │  ports 80 + 443   │
++              │  ┌─────────────┐  │
++              │  │    Caddy    │  │  automatic HTTPS (Let's Encrypt)
++              │  └──┬───────┬──┘  │
++              │     │       │     │
++              │ ┌───▼──┐ ┌──▼───┐ │
++              │ │ web  │ │ api  │ │  Next.js UI  +  Hono API (:3003)
++              │ └──────┘ └──┬───┘ │                 │
++              │         ┌───▼───┐ │         ┌──────▼──────┐
++              │         │ postgres│ │        │ /socket.io  │
++              │         └───────┘ │         │ realtime    │
++              │                   │         └─────────────┘
++              └───────────────────┘
++   ▲                                    ▲
++   │ browser / phone browser            │ desktop app (login + sync + realtime)
++   └── http(s)://your-domain ───────────┴── BLASTI_CLOUD_URL="https://your-domain"
++```
++
++- **Browser users** open `https://your-domain` (or `http://<droplet-ip>` for testing).
++- **Desktop app** keeps running its local SQLite database offline, and uses
++  your droplet for login, cloud sync and realtime — configured with ONE
++  variable: `BLASTI_CLOUD_URL` (Part 6).
++
++---
++
++## Part 1 — What you need
++
++| # | Requirement | Notes |
++|---|-------------|-------|
++| 1 | DigitalOcean account | [digitalocean.com](https://www.digitalocean.com) |
++| 2 | A machine with `bash` + `ssh` + `tar` | Windows 10/11: use **Git Bash** or **WSL** (both ship ssh/tar) |
++| 3 | An SSH key added to your DO account | Part 2, Step 2 |
++| 4 | `doctl` CLI (optional) | Only for Path A (one-command droplet creation). Path B uses the DO website instead |
++| 5 | A domain name (recommended) | Needed for automatic HTTPS. You can start without one |
++| 6 | ~10–15 minutes | Most of it is the Docker build, which runs unattended |
++
++**Recommended droplet:** Basic → Regular → **s-2vcpu-4gb** (2 vCPU / 4 GB /
++80 GB SSD, ~$18/mo). The script auto-adds 2 GB swap on smaller droplets so
++even s-1vcpu-2gb can build, but 4 GB is noticeably faster and safer for
++production. Region: pick the one closest to your users (default `ams3`).
++
++---
++
++## Part 2 — One-time local setup
++
++### Step 1 — Get the BLASTI code
++
++```bash
++git clone https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git blasti
++cd blasti
++```
++
++(Already have it? `git pull` and make sure you are on the latest `master`.)
++
++### Step 2 — Add your SSH key to DigitalOcean
++
++If you already have a key, note its fingerprint/ID and skip to Step 3.
++
++1. DigitalOcean console → **Settings → Security → SSH keys → Add SSH key**.
++2. Paste your **public** key (`~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`).
++   - No key yet? Generate one: `ssh-keygen -t ed25519` (accept defaults).
++3. Give it a name you will recognise, e.g. `my-laptop`.
++
++### Step 3 (optional, Path A only) — Install & authenticate doctl
++
++```bash
++# macOS
++brew install doctl
++# Linux — see https://docs.digitalocean.com/reference/doctl/how-to/install/
++# Windows — choco install doctl  (or scoop install doctl)
++
++doctl auth init          # paste your API token
++                         # (DO console → API → Generate New Token, Read+Write)
++```
++
++Verify your key is visible (note the **ID** or **Name** — you will use it):
++
++```bash
++doctl compute ssh-key list
++```
++
++---
++
++## Part 3 — Deploy
++
++Pick **ONE** path:
++
++- **Path A (recommended)** — you installed `doctl`: one command creates the
++  droplet AND deploys BLASTI.
++- **Path B** — no `doctl`: create the droplet on the DO website, then one
++  command deploys BLASTI to it.
++
++### ── Path A: one command from zero ──────────────────────────────
++
++```bash
++./scripts/deploy-digitalocean.sh create \
++    --ssh-key my-laptop \
++    --region ams3 \
++    --size s-2vcpu-4gb \
++    --name blasti \
++    --domain blasti.example.com
++```
++
++- `--ssh-key` accepts the key **name** or **ID** from `doctl compute ssh-key list`.
++- `--domain` is optional — include it only if the DNS A-record already points
++  this hostname at the IP the script prints (see Part 4). Without it the site
++  runs on plain HTTP at the raw IP.
++- Add `--yes` to skip the confirmation prompt.
++
++What happens (fully automated, ~10 min):
++
++1. Creates Ubuntu 24.04 droplet, waits until it is network-active.
++2. Uploads the code and runs the server bootstrap (see below).
++3. Prints your URLs + the droplet IP at the end. **Write the IP down.**
++
++### ── Path B: droplet via the DO website, then one command ───────
++
++1. DO console → **Create → Droplets**.
++2. **Region:** closest to your users. **Image:** Ubuntu 24.04 LTS.
++3. **Size:** Basic → Regular → **4 GB / 2 vCPU** (s-2vcpu-4gb).
++4. **Authentication:** SSH key → select `my-laptop`.
++5. **Hostname:** `blasti`. → **Create Droplet**.
++6. Copy the droplet's public IP (e.g. `203.0.113.10`), then from the repo:
++
++   ```bash
++   ./scripts/deploy-digitalocean.sh deploy root@203.0.113.10 \
++       --domain blasti.example.com
++   ```
++
++   (Omit `--domain` if you have none yet.) This uploads the code, installs
++   Docker, configures the firewall, generates secrets, builds and starts
++   everything. **Safe to re-run any time** to ship an update.
++
++### What the server bootstrap does (both paths, automatic)
++
++- Installs Docker + git (skipped when already present)
++- Firewall: `ufw` allows only **22 / 80 / 443**
++- Generates `ops/.env` with **random** Postgres password + secrets
++  (never overwrites an existing one — redeploys keep your data)
++- Adds 2 GB swap on small droplets (build headroom)
++- `docker compose up -d --build` → postgres → migrations → api → web → caddy
++- Waits until `GET /api/health` returns OK (up to 5 min), then prints URLs
++
++---
++
++## Part 4 — Domain + HTTPS
++
++If you deployed **without** a domain, the app is live at
++`http://<droplet-ip>` (plain HTTP — fine for testing).
++
++To go to proper HTTPS:
++
++1. In your DNS provider create an **A record**:
++
++   | Type | Name | Value |
++   |------|------|-------|
++   | A | `blasti` (or `@` for the root domain) | `<droplet IP>` |
++
++2. Wait until it resolves (check: `ping blasti.example.com` → your IP), then
++   re-run the deploy with the domain so Caddy picks it up:
++
++   ```bash
++   ./scripts/deploy-digitalocean.sh deploy root@<droplet-ip> \
++       --domain blasti.example.com
++   ```
++
++3. Caddy automatically obtains and later **renews** the Let's Encrypt
++   certificate. Verify: open `https://blasti.example.com` — padlock, no
++   warnings.
++
++> ⚠️ Do the DNS step BEFORE the very first start when you can — Caddy gets
++> the certificate immediately on first boot. Adding it later still works via
++> the redeploy above.
++
++---
++
++## Part 5 — Verify the deployment (2-minute checklist)
++
++```bash
++# 1. Everything running?
++./scripts/deploy-digitalocean.sh status root@<droplet-ip>
++#    → 5 containers: caddy, web, api, migrate (exited 0), postgres
++
++# 2. API health from the outside  (NOTE: /api/health — never /api/api/health)
++curl https://blasti.example.com/api/health        # → {"status":"ok",...}
++
++# 3. Web UI loads
++open https://blasti.example.com                    # login page renders
++
++# 4. Realtime endpoint reachable
++curl -i https://blasti.example.com/socket.io/?EIO=4&transport=polling
++#    → HTTP 200 with an engine.io handshake payload
++
++# 5. Live logs (Ctrl-C to stop)
++./scripts/deploy-digitalocean.sh logs root@<droplet-ip> api
++```
++
++**First login — change the defaults NOW:**
++The database is seeded with two accounts. Log in at `https://blasti.example.com`
++and change both passwords immediately:
++
++| Role | Username | Default password |
++|------|----------|------------------|
++| Admin | `admin` | `admin123` |
++| Owner | `owner` | `owner123` |
++
++---
++
++## Part 6 — Point the desktop app at YOUR droplet
++
++The desktop app is **local-first**: its UI and working data always come from
++the embedded local API, while **login, cloud sync and realtime** go to the
++server you configure below. One variable controls everything:
++
++```
++BLASTI_CLOUD_URL
++```
++
++### ⚠️ The value must be the ORIGIN — never append `/api`
++
++The app appends `/api/*` paths **itself**. Writing the suffix yourself
++doubles the path and breaks everything:
++
++```
++✅ BLASTI_CLOUD_URL="http://68.183.137.227"          ← raw IP, HTTP (testing)
++✅ BLASTI_CLOUD_URL="https://blasti.example.com"     ← domain + HTTPS (production)
++❌ BLASTI_CLOUD_URL="http://68.183.137.227/api"      ← DO NOT — probes /api/api/health → 404
++```
++
++Recent builds **auto-correct** a trailing `/api` and print a warning, but
++fix the value anyway.
++
++### Dev mode (`bun run electron:dev`)
++
++The app reads `.env` files automatically at startup (Electron does not do
++this by itself — BLASTI ships its own loader). The printed startup line is
++the ground truth of what will be used:
++
++```
++[BLASTI Desktop] Cloud API → https://blasti.example.com  [source: …\.env]
++```
++
++Pick **any one** of these three places (first match wins):
++
++1. **Project root `.env`** — the file you already have for web/api vars.
++   Add one line (only `BLASTI_*` keys are read from this file):
++
++   ```bash
++   # at the repository root, .env
++   BLASTI_CLOUD_URL="https://blasti.example.com"
++   ```
++
++2. **`apps/desktop/.env`** — the dedicated desktop file (create it if
++   missing; it is gitignored so it stays on your machine):
++
++   ```bash
++   cp apps/desktop/.env.example apps/desktop/.env
++   # then edit: BLASTI_CLOUD_URL="https://blasti.example.com"
++   ```
++
++3. **OS environment variable** (overrides both files):
++
++   ```bash
++   export BLASTI_CLOUD_URL="https://blasti.example.com"   # macOS/Linux
++   set BLASTI_CLOUD_URL=https://blasti.example.com        # Windows cmd
++   ```
++
++Then start the app and **check the console line**:
++
++```bash
++bun run electron:dev
++```
++
++- ✅ `[BLASTI Desktop] Cloud API → https://blasti.example.com  [source: …\.env]`
++  → the app will log in against, sync with, and receive realtime events from
++  your droplet.
++- ❌ `[source: built-in default — NO cloud URL configured]` → the variable
++  was not found; the banner lists every location it looked in. Fix the
++  location/name and restart.
++
++> `BLASTI_API_URL` still works as a legacy alias but has **lower** precedence
++> than `BLASTI_CLOUD_URL`.
++
++### Installed app (.exe) — no rebuild needed
++
++After installing, edit this file with Notepad (create it if missing):
++
++```
++%LOCALAPPDATA%\Programs\BLASTI\resources\.env
++```
++
++```
++BLASTI_CLOUD_URL="https://blasti.example.com"
++```
++
++Restart the app — it repoints without reinstalling or rebuilding.
++
++### Verify the connection inside the app
++
++1. Log in with an account that exists **on the VPS** (e.g. the ones from
++   Part 5). Success = the login was proxied to your droplet.
++2. Create something (a queue/ticket) → it should appear on the web UI at
++   `https://blasti.example.com` after the next sync tick.
++3. Offline test: disable Wi-Fi, keep working; re-enable → data syncs up.
++
++> First run shows `initial-sync: ERROR — الإعداد الأول يتطلب اتصالاً بالإنترنت`
++> until the cloud is reachable AND you log in once — that is expected: the
++> very first workspace import needs the VPS. With the URL fixed, the
++> cloud-api diagnostic must turn ✓ before login will work.
++
++---
++
++## Part 7 — Ship updates (and optional auto-deploy)
++
++### Manual update — one command, whenever you want
++
++```bash
++git pull                                        # get the latest code
++./scripts/deploy-digitalocean.sh deploy root@<droplet-ip> --domain blasti.example.com
++```
++
++Zero-downtime restart of changed containers; **secrets and database are
++never touched**. (`status` / `logs` subcommands help you watch it land.)
++
++### Auto-deploy on every new commit (git watcher)
++
++```bash
++# From your machine — every new commit triggers the same upload+rebuild:
++./scripts/watch-and-deploy.sh watch root@<droplet-ip> --domain blasti.example.com
++
++# Or ON the server via cron (recommended for always-on):
++ssh root@<droplet-ip>
++crontab -e
++# add:
++*/5 * * * * /opt/blasti/scripts/watch-and-deploy.sh watch --on-server --once >> /var/log/blasti-watch.log 2>&1
++```
++
++Useful flags: `--once` (single check), `--dry-run`, `--force`, `--branch master`,
++`--deploy-now`. Private repos need a read-only PAT or deploy key on the
++machine running the watcher.
++
++---
++
++## Part 8 — Everyday operations cheat sheet
++
++```bash
++# Container status
++./scripts/deploy-digitalocean.sh status root@IP
++
++# Follow logs: api | web | db | caddy
++./scripts/deploy-digitalocean.sh logs root@IP api
++
++# SSH in
++ssh root@IP
++
++# Inside the server
++cd /opt/blasti
++docker compose ps                 # what is running
++docker compose logs -f api        # any service's logs
++docker compose restart api        # restart one service
++docker compose up -d --build      # rebuild everything
++
++# Database backup (weekly at least — see DEPLOYMENT.md §10.1 for automation)
++ssh root@IP "docker compose -f /opt/blasti/ops/docker-compose.yml exec -T db \
++  pg_dump -U blasti blasti" > blasti-$(date +%F).sql
++```
++
++---
++
++## Part 9 — Troubleshooting
++
++| Symptom | Likely cause → Fix |
++|---|---|
++| Diagnostics probe shows **`/api/api/health` → 404** | `BLASTI_CLOUD_URL` has a trailing `/api` → remove it (origin only). Recent builds auto-strip it with a warning |
++| Desktop console: `[source: built-in default — NO cloud URL configured]` | Variable missing → Part 6; the banner lists all checked locations |
++| `deploy` fails at upload | `ssh root@IP` asks for a password → your local key is not the DO-registered one. `ssh -i ~/.ssh/id_ed25519 root@IP` to test |
++| Build killed / "Killed" during `web` build | Droplet too small for the build → the script adds swap automatically on ≤4 GB; if you built manually, add swap or use s-2vcpu-4gb |
++| Site loads but login spins forever | API not healthy → `./scripts/deploy-digitalocean.sh logs root@IP api`; check `/api/health` |
++| No HTTPS / certificate pending | DNS A-record not pointing at the droplet yet, or deployed <1 min ago. `dig +short blasti.example.com` must return the droplet IP; Caddy retries automatically |
++| Desktop: login fails with "cloud unreachable" | `BLASTI_CLOUD_URL` typo'd, or the droplet firewall blocks you, or the domain's cert is pending → test `curl https://your-domain/api/health` from the same machine |
++| Desktop: logs in but never syncs | The VPS account's agency must exist on the cloud; check api logs for `/api/sync/*` calls; realtime uses `/socket.io/*` (Caddy proxies it automatically) |
++| Workspace stays locked / REVOKED after a wrong URL was used | Fix the URL, then log in **fresh** — a successful cloud login clears the revoked state (offline unlock stays disabled until then) |
++| `curl http://<ip>/api/health` works, HTTPS doesn't | You added the domain after the first boot → re-run `deploy --domain` (Part 4) |
++
++---
++
++## Part 10 — Cost & sizing notes
++
++| Droplet | RAM/vCPU | Verdict |
++|---|---|---|
++| s-1vcpu-1gb | 1 GB | ❌ Not enough for the Next.js build |
++| s-1vcpu-2gb | 2 GB | ⚠️ Works (script adds 2 GB swap) — slow builds, dev/testing only |
++| **s-2vcpu-4gb** | 4 GB | ✅ **Recommended** — comfortable builds + headroom for Postgres |
++| s-4vcpu-8gb | 8 GB | For many agencies / heavy ticket volume |
++
++Backups: enable **Droplet → Backups** in the DO panel (weekly, +20% cost) on
++top of the `pg_dump` routine in Part 8.
++
++---
++
++*Automation behind this guide: `scripts/deploy-digitalocean.sh`
++(create/deploy/bootstrap/status/logs) + `scripts/watch-and-deploy.sh`
++(commit watcher). Full reference: `DEPLOYMENT.md`.*
+diff --git a/DEPLOYMENT.md b/DEPLOYMENT.md
+index 1e9c618..a67e291 100644
+--- a/DEPLOYMENT.md
++++ b/DEPLOYMENT.md
+@@ -10,6 +10,78 @@ using **PostgreSQL** as the database. Every step is copy-paste.
+ 
+ ---
+ 
++## Fast path — DigitalOcean (one command)
++
++> 📘 **New to this? Use the dedicated walkthrough instead:**
++> **`DEPLOY-GUIDE.md`** — a numbered, copy-paste, step-by-step DigitalOcean
++> droplet guide (account → SSH key → droplet → deploy → DNS/HTTPS →
++> verification checklist → connecting the desktop app → updates →
++> troubleshooting). Everything below is the condensed version.
++
++Prefer **DigitalOcean** over OVHcloud? The exact same stack (Docker + PostgreSQL 16 + Caddy HTTPS)
++deploys itself with one script — `scripts/deploy-digitalocean.sh`:
++
++```bash
++# 0) One-time: install the doctl CLI and authenticate
++#    https://docs.digitalocean.com/reference/doctl/how-to/install/
++doctl auth init
++
++# 1) Create a droplet and deploy BLASTI to it in one shot:
++./scripts/deploy-digitalocean.sh create --ssh-key <your-do-ssh-key> --domain blasti.example.com
++
++#    No domain yet? Deploy on the raw IP first (plain HTTP), add DNS later:
++./scripts/deploy-digitalocean.sh create --ssh-key <your-do-ssh-key>
++
++# 2) Later — ship updates with the same one-liner (server secrets are never touched):
++./scripts/deploy-digitalocean.sh deploy root@<DROPLET_IP> --domain blasti.example.com
++
++#    Helpers:
++./scripts/deploy-digitalocean.sh status root@<DROPLET_IP>
++./scripts/deploy-digitalocean.sh logs   root@<DROPLET_IP> api
++```
++
++Notes:
++- **Recommended droplet:** Basic / 2 vCPU / 4 GB (`s-2vcpu-4gb`), image **Ubuntu 24.04** — the script
++  adds swap automatically on smaller sizes so the first build never runs out of memory.
++- The script generates `ops/.env` on the server with **random secrets** and never overwrites one that
++  already exists — re-running `deploy` is always safe.
++- Windows: run it from **WSL or Git Bash** (needs only `ssh` + `tar`; `doctl` only for `create`).
++- Everything else in this guide (first login, DNS, backups, troubleshooting) applies unchanged —
++  just replace "OVH Manager" with the DigitalOcean control panel.
++
++---
++
++## Auto-deploy on new commits (git watcher)
++
++`scripts/watch-and-deploy.sh` polls the GitHub repo
++(`https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git`) and applies new commits to the VPS
++automatically — no manual deploy step.
++
++**On the VPS (recommended, cron-driven):** the VPS holds a git clone of the repo
++(`git clone https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git /opt/blasti`),
++then cron checks every 5 minutes and on a new commit runs `git fetch + reset --hard`
++plus the docker rebuild (your `ops/.env` secrets are never touched):
++
++```bash
++sudo crontab -e
++# add:
++*/5 * * * * /opt/blasti/scripts/watch-and-deploy.sh watch --on-server --once >> /var/log/blasti-watch.log 2>&1
++```
++
++**From your own machine (no git needed on the VPS):** uploads the changed code with the
++same tar-over-ssh path as a manual deploy, in a long-running loop:
++
++```bash
++./scripts/watch-and-deploy.sh watch root@<DROPLET_IP> --domain blasti.example.com
++```
++
++Useful flags: `--branch master` (default), `--interval 300`, `--once` (single check),
++`--dry-run` (show what would happen), `--deploy-now` (deploy on first run instead of just
++recording a baseline). Private repos need a PAT/deploy key on the machine running the
++watcher. The watcher never deploys on its very first check unless `--deploy-now` is given.
++
++---
++
+ ## 0. What you are deploying (30 seconds)
+ 
+ ```
+@@ -227,8 +299,12 @@ The phone app is built with the server address **baked in**:
+    bun run build:mobile
+    ```
+    then open Android Studio → ▶ Run / build the APK as usual.
+-3. **Desktop (Electron):** set `BLASTI_CLOUD_URL=https://blasti.example.com` before
+-   `bun run electron:build` — or configure it in the desktop app's cloud-sync settings.
++3. **Desktop (Electron):** put `BLASTI_CLOUD_URL="https://blasti.example.com"`
++   into **`apps/desktop/.env`** and rebuild (`bun run electron:build:win`). The
++   `.env` is baked into the installer, and can also be edited **after**
++   installation at `<install>\resources\.env` without rebuilding. (OS environment
++   variables do NOT travel into the installer — the `.env` file is the only
++   supported build-time configuration.)
+ 
+ ---
+ 
+diff --git a/apps/desktop/.env.example b/apps/desktop/.env.example
+new file mode 100755
+index 0000000..c97879a
+--- /dev/null
++++ b/apps/desktop/.env.example
+@@ -0,0 +1,79 @@
++# ──────────────────────────────────────────────────────
++# BLASTI Desktop App — Environment Variables
++# ──────────────────────────────────────────────────────
++# This file documents ALL environment variables used by the Electron desktop app.
++# Copy this to .env and fill in your values.
++#
++# NOTE: The desktop app is an Electron shell that loads the web app.
++# Most configuration comes from the web app it connects to.
++# ──────────────────────────────────────────────────────
++
++# ─── CONNECTION (the one setting that matters for VPS deploys) ────────
++# The CLOUD ORIGIN the desktop app talks to for login, sync and realtime —
++# the machine that actually serves /api/* and /socket.io/* (apps/api, the
++# Hono server, usually behind a reverse proxy). The UI itself is always
++# served locally by the embedded local API, so this is the ONLY URL you
++# normally need to set.
++#
++# ⚠️ ORIGIN ONLY — NEVER append a path (this is the #1 misconfiguration):
++#   ✅ BLASTI_CLOUD_URL="http://203.0.113.227"        (raw IP, HTTP testing)
++#   ✅ BLASTI_CLOUD_URL="https://blasti.example.com"  (domain + HTTPS)
++#   ❌ BLASTI_CLOUD_URL="http://203.0.113.227/api"    → app probes
++#      /api/api/health → 404 → "cloud unreachable". The app appends
++#      /api/* ITSELF. (Newer builds auto-strip the suffix with a warning.)
++#
++# HOW .env IS LOADED (Electron does NOT read .env by itself — BLASTI does,
++# see load-env.js / main.js; first match wins, OS environment overrides):
++#   1. OS environment variables      (runtime override, advanced use)
++#   2. <install>\resources\.env      (packaged app — EDITABLE AFTER INSTALL
++#       without rebuilding, e.g.
++#       %LOCALAPPDATA%\Programs\BLASTI\resources\.env on Windows)
++#   3. apps/desktop/.env             (baked into the installer at build time)
++#   4. project root .env             (DEV MODE ONLY — BLASTI_* keys ONLY;
++#       lets you keep the VPS URL next to the web/api vars you already have
++#       in the monorepo root .env. All other root keys are ignored by the
++#       desktop app so cloud secrets never leak into it.)
++#   5. built-in default              (http://localhost:3003 — dev only)
++#
++# The EFFECTIVE cloud URL is printed once at startup:
++#   [BLASTI Desktop] Cloud API → https://…  [source: …]
++# If you see "[source: built-in default — NO cloud URL configured]" the app
++# WILL keep using localhost:3003 until you set the variable in one of the
++# places above and restart.
++#
++# FOR A VPS DEPLOYMENT (dev / electron:dev) — either create
++#   apps/desktop/.env        with:  BLASTI_CLOUD_URL="https://blasti.example.com"
++# or add the same line to the PROJECT ROOT .env (picked up automatically).
++# For an INSTALLED app edit <install>\resources\.env instead — no rebuild needed.
++#
++# Do NOT point it at a static web host — it must be the origin that
++# actually serves the /api/* routes.
++#
++# BLASTI_API_URL is accepted as a legacy alias with LOWER precedence:
++# BLASTI_CLOUD_URL > BLASTI_API_URL > default (localhost:3003).
++# BLASTI_API_URL="https://blasti.example.com"
++
++# ─── LOCAL DATABASE (single authoritative location) ─────────────────
++# Optional override. Default (recommended): <userData>/blasti-local/local.db
++# i.e. %APPDATA%/@blasti/desktop/blasti-local/local.db on Windows.
++# Legacy databases at ~/.blasti/local are auto-migrated (copied + verified)
++# to the authoritative path at first startup — the old file is kept as backup.
++# BLASTI_LOCAL_DB_DIR=""
++
++# ─── LAN SERVER ─────────────────────────────────────
++# Comma-separated list of allowed CORS origins for the LAN server (port 3080).
++# This controls which devices on the local network can connect.
++# Development: "http://localhost:3000"
++# Production: "http://192.168.1.100:3000,http://192.168.1.50:3000"
++# BLASTI_LAN_ORIGINS="http://localhost:3000"
++
++# ─── AUTHENTICATION ──────────────────────────────────
++# Secret for JWT signing on the LAN server.
++# Should match NEXTAUTH_SECRET from the web/API .env files.
++# NEXTAUTH_SECRET="blast1-dev-s3cr3t-k3y-f0r-d3v3l0pm3nt-0nly"
++
++# ─── DEVELOPMENT ─────────────────────────────────────
++# Set ELECTRON_DEV=1 or pass --dev flag to run in development mode.
++# This loads http://localhost:3000 instead of the production URL.
++# ELECTRON_DEV="1"
++# NODE_ENV="development"
+diff --git a/apps/desktop/load-env.js b/apps/desktop/load-env.js
+index 6d59ffc..bafc5bc 100644
+--- a/apps/desktop/load-env.js
++++ b/apps/desktop/load-env.js
+@@ -17,10 +17,19 @@
+  *   2. <app dir>\.env     development: apps/desktop/.env. Packaged: the copy
+  *                         baked into app.asar at build time (same file the
+  *                         developer had when running electron-builder).
++ *   3. <project root>\.env development only (apps/desktop/../../.env — TWO
++ *                         levels up). BLASTI_* KEYS ONLY. The monorepo root
++ *                         .env already exists for the web/api stack, so
++ *                         developers naturally put BLASTI_CLOUD_URL there —
++ *                         reading it makes that intuition work. Restricting
++ *                         it to the BLASTI_* namespace keeps cloud-only
++ *                         secrets (DATABASE_URL, POSTGRES_PASSWORD,
++ *                         NEXTAUTH_SECRET…) out of the desktop process.
+  *
+  * PRECEDENCE RULES
+  *   - OS environment variables ALWAYS win: fill-only-unset, dotenv-style.
+- *   - Therefore: OS env  >  resources\.env  >  bundled .env  >  built-in defaults.
++ *   - Therefore: OS env  >  resources\.env  >  apps/desktop .env  >
++ *     project root .env (BLASTI_* only, dev)  >  built-in defaults.
+  *
+  * PARSER NOTES (kept deliberately simple and predictable)
+  *   - UTF-8 BOM stripped; both LF and CRLF line endings accepted (Windows).
+@@ -86,6 +95,7 @@ function readEnvVars(filePath) {
+  * Fill process.env from the .env candidates. Existing (non-empty) OS
+  * environment variables are never overwritten.
+  * @param {{ isPackaged?: boolean, verbose?: boolean }} [opts]
++ * @returns {{ loaded: Array<{file: string, why: string, total: number, filled: string[]}>, applied: number }}
+  */
+ function loadDesktopEnv(opts) {
+   const isPackaged = !!(opts && opts.isPackaged);
+@@ -96,17 +106,28 @@ function loadDesktopEnv(opts) {
+     candidates.push({
+       file: path.join(process.resourcesPath, '.env'),
+       why: 'installed resources (editable after install)',
++      filter: null,
++    });
++  }
++  candidates.push({ file: path.join(__dirname, '.env'), why: 'app directory', filter: null });
++  if (!isPackaged) {
++    // Dev convenience: the monorepo root .env (shared with web/api) is read
++    // too, but ONLY its BLASTI_* keys — see the header note for why.
++    // NOTE: __dirname is apps/desktop, so the project root is TWO levels up.
++    candidates.push({
++      file: path.join(__dirname, '..', '..', '.env'),
++      why: 'project root (BLASTI_* keys only, dev)',
++      filter: (key) => key.startsWith('BLASTI_'),
+     });
+   }
+-  candidates.push({ file: path.join(__dirname, '.env'), why: 'app directory' });
+ 
+   const loaded = [];
+   let applied = 0;
+ 
+-  for (const { file, why } of candidates) {
++  for (const { file, why, filter } of candidates) {
+     const vars = readEnvVars(file);
+     if (!vars) continue;
+-    const keys = Object.keys(vars);
++    const keys = Object.keys(vars).filter((k) => (filter ? filter(k) : true));
+     const filled = [];
+     for (const k of keys) {
+       if (process.env[k] === undefined || process.env[k] === '') {
+@@ -118,7 +139,7 @@ function loadDesktopEnv(opts) {
+     loaded.push({ file, why, total: keys.length, filled });
+     if (verbose) {
+       console.log(
+-        `[BLASTI Desktop] .env (${why}): ${file} — ${keys.length} var(s) in file, ${filled.length} applied [${filled.join(', ') || '-'}]`
++        `[BLASTI Desktop] .env (${why}): ${file} — ${keys.length} var(s) in scope, ${filled.length} applied [${filled.join(', ') || '-'}]`
+       );
+     }
+   }
+diff --git a/apps/desktop/main.js b/apps/desktop/main.js
+index bfca11e..670ad4e 100644
+--- a/apps/desktop/main.js
++++ b/apps/desktop/main.js
+@@ -78,6 +78,21 @@ initFileLogger();
+   }
+ })();
+ 
++// ─── .env loading (MUST run before anything reads BLASTI_* variables) ──────
++// Electron does not read .env files, and OS env vars from the BUILD machine
++// do not travel into the packaged installer. loadDesktopEnv() fills
++// process.env from (first match wins, OS environment always overrides):
++//   1. <resources>\.env   packaged only — editable AFTER install (no rebuild)
++//   2. apps/desktop/.env  dev directory; baked into app.asar when packaged
++// See load-env.js for the full contract. Without this, the ".env" workflow
++// documented in .env.example silently did nothing (cloud URL stayed at the
++// http://localhost:3003 default on every installed machine).
++const DESKTOP_ENV_LOAD = require('./load-env').loadDesktopEnv({ isPackaged: app.isPackaged });
++// Task 65: remember whether the OS environment already carried a cloud URL
++// BEFORE any .env file was applied — used below to label the source of the
++// effective Cloud API URL in the startup banner.
++const OS_HAD_CLOUD_URL = !!(process.env.BLASTI_CLOUD_URL || process.env.BLASTI_API_URL);
++
+ // ─── Monorepo Module Resolution ────────────────────────────────────────────
+ // In bun workspaces, packages are hoisted to the root node_modules.
+ // Electron uses Node.js require() which may not follow bun's symlink structure.
+@@ -212,8 +227,25 @@ try {
+ // local development; production builds should always configure the env var.
+ function resolveCloudBaseUrl() {
+   const strip = (u) => String(u || '').replace(/\/+$/, '');
+-  if (process.env.BLASTI_CLOUD_URL) return strip(process.env.BLASTI_CLOUD_URL);
+-  if (process.env.BLASTI_API_URL) return strip(process.env.BLASTI_API_URL);
++  const key = process.env.BLASTI_CLOUD_URL ? 'BLASTI_CLOUD_URL'
++    : (process.env.BLASTI_API_URL ? 'BLASTI_API_URL' : '');
++  const raw = key ? process.env[key] : '';
++  const base = strip(raw);
++  // Task 65 — field report: BLASTI_CLOUD_URL="http://203.0.113.10/api" made
++  // diagnostics probe http://…/api/api/health → 404 → "cloud unreachable"
++  // → first-run initial sync FATAL. BLASTI always appends /api/* itself
++  // (login proxy, sync, realtime and diagnostics all do base + '/api/…'),
++  // and the Caddy site serves /api/* at the ORIGIN root, so the value must
++  // be the bare origin. Auto-correct this exact mistake and say so loudly.
++  if (/\/api$/i.test(base)) {
++    const fixed = strip(base.replace(/\/api$/i, ''));
++    if (/^https?:\/\//i.test(fixed) && fixed.length > 'http://x'.length) {
++      console.warn('[BLASTI Desktop] ' + key + '="' + raw + '" ends with "/api" — auto-corrected to "' + fixed + '"');
++      console.warn('[BLASTI Desktop] BLASTI_CLOUD_URL must be the server ORIGIN only (no path) — the app appends /api/* itself.');
++      return fixed;
++    }
++  }
++  if (base) return base;
+   return 'http://localhost:3003';
+ }
+ const CLOUD_BASE_URL = resolveCloudBaseUrl();
+@@ -221,6 +253,29 @@ const CLOUD_BASE_URL = resolveCloudBaseUrl();
+ // loading-screen fallbacks) so they can never resolve a different origin.
+ process.env.BLASTI_CLOUD_URL = CLOUD_BASE_URL;
+ 
++// Task 65: make the effective cloud URL IMPOSSIBLE to miss at startup.
++// The #1 misconfiguration report is "the desktop app is not using my VPS" —
++// this banner is the authoritative answer, printed once, in plain sight
++// (also mirrored into main.log by the console-mirror above).
++const cloudUrlSource = (() => {
++  if (OS_HAD_CLOUD_URL) return 'OS environment variable';
++  const provider = ((DESKTOP_ENV_LOAD && DESKTOP_ENV_LOAD.loaded) || []).find(
++    (l) => l && ((l.filled || []).includes('BLASTI_CLOUD_URL') || (l.filled || []).includes('BLASTI_API_URL'))
++  );
++  return provider ? provider.file : null;
++})();
++if (cloudUrlSource) {
++  console.log('[BLASTI Desktop] Cloud API → ' + CLOUD_BASE_URL + '  [source: ' + cloudUrlSource + ']');
++} else {
++  console.warn('[BLASTI Desktop] Cloud API → ' + CLOUD_BASE_URL + '  [source: built-in default — NO cloud URL configured]');
++  console.warn('[BLASTI Desktop] Login, sync and realtime will target ' + CLOUD_BASE_URL + '.');
++  console.warn('[BLASTI Desktop] To use your VPS instead, set one of (first that exists wins):');
++  console.warn('[BLASTI Desktop]   1. OS environment variable  BLASTI_CLOUD_URL="https://your-vps-domain"');
++  console.warn('[BLASTI Desktop]   2. apps/desktop/.env        BLASTI_CLOUD_URL="https://your-vps-domain"');
++  console.warn('[BLASTI Desktop]   3. project root .env        BLASTI_CLOUD_URL="https://your-vps-domain"  (BLASTI_* keys only)');
++  console.warn('[BLASTI Desktop] Then restart the app. See apps/desktop/.env.example and DEPLOY-GUIDE.md.');
++}
++
+ // ─── Constants ────────────────────────────────────────────────────────────────
+ 
+ const DEV_URL = 'http://localhost:3000';
+@@ -783,6 +838,12 @@ function createWindow() {
+       contextIsolation: true,
+       nodeIntegration: false,
+       sandbox: false, // Needed for some IPC patterns
++      // Task 65: hand the resolved CLOUD base URL to the renderer WITHOUT a
++      // sync IPC roundtrip. The preload script parses this flag out of
++      // process.argv and exposes it as window.electronAPI.cloudBaseUrl, so
++      // the web bundle's few direct-cloud calls (session healing, browser
++      // sync fallback) target the SAME server the main process uses.
++      additionalArguments: ['--blasti-cloud-url=' + CLOUD_BASE_URL],
+     },
+   });
+ 
+diff --git a/apps/desktop/preload.js b/apps/desktop/preload.js
+index 8d740e9..b217069 100644
+--- a/apps/desktop/preload.js
++++ b/apps/desktop/preload.js
+@@ -15,6 +15,26 @@
+ 
+ const { contextBridge, ipcRenderer } = require('electron');
+ 
++// ─── Cloud API base URL (injected by main.js via additionalArguments) ──────
++// The main process resolves the CLOUD API origin (BLASTI_CLOUD_URL >
++// BLASTI_API_URL > default, after .env files are applied — see load-env.js)
++// and passes it as a --blasti-cloud-url=… flag. Reading it here (instead of
++// an IPC call) gives the web bundle a synchronous, zero-roundtrip answer for
++// its few direct-cloud calls (session healing, browser-side sync fallback),
++// so the renderer and the main process can never disagree about which
++// server is "the cloud" — including a self-hosted VPS.
++function resolveInjectedCloudUrl() {
++  const flag = '--blasti-cloud-url=';
++  for (const arg of process.argv || []) {
++    if (typeof arg === 'string' && arg.startsWith(flag)) {
++      const value = arg.slice(flag.length).trim();
++      if (value) return value;
++    }
++  }
++  return '';
++}
++const CLOUD_BASE_URL = resolveInjectedCloudUrl();
++
+ contextBridge.exposeInMainWorld('electronAPI', {
+   // ─── Platform Detection ────────────────────────────────────────────────────
+ 
+@@ -24,6 +44,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
+    */
+   isElectron: true,
+ 
++  /**
++   * CLOUD API base URL resolved by the main process ('' when absent — the
++   * web bundle then falls back to its own defaults). Mirrors the value used
++   * for login proxying, sync and realtime inside the main process.
++   */
++  cloudBaseUrl: CLOUD_BASE_URL,
++
+   /**
+    * Returns 'electron' — used by native-bridge.ts and adapters
+    * to route to the correct platform implementation.
+diff --git a/apps/web/src/lib/api-client.ts b/apps/web/src/lib/api-client.ts
+index d2271fd..ecb9630 100644
+--- a/apps/web/src/lib/api-client.ts
++++ b/apps/web/src/lib/api-client.ts
+@@ -363,10 +363,15 @@ export function getCloudApiBaseUrl(): string {
+     return process.env.INTERNAL_API_URL || DEFAULT_INTERNAL_URL;
+   }
+ 
+-  // Desktop is local-first and must NEVER pick up the mobile build's
+-  // NEXT_PUBLIC_API_URL (the emulator host 10.0.2.2 is unreachable from
+-  // a desktop machine). The API runs on the same machine → localhost:3003.
++  // Desktop is local-first: the UI data endpoint stays :3080 (getApiBaseUrl),
++  // but the CLOUD this machine talks to for login/sync/realtime must be the
++  // SAME server the main process resolved — BLASTI_CLOUD_URL from the
++  // desktop .env / project root .env / OS environment (Task 65). The main
++  // process hands it over via additionalArguments → preload → electronAPI.
+   if (isElectronRuntime()) {
++    const shellUrl = (window as unknown as { electronAPI?: { cloudBaseUrl?: string } })
++      .electronAPI?.cloudBaseUrl?.trim();
++    if (shellUrl) return shellUrl.replace(/\/+$/, '');
+     return process.env.NEXT_PUBLIC_CLOUD_URL || DEFAULT_CLOUD_URL;
+   }
+ 
+diff --git a/apps/web/src/lib/native-bridge.ts b/apps/web/src/lib/native-bridge.ts
+index 68928ae..57c3934 100644
+--- a/apps/web/src/lib/native-bridge.ts
++++ b/apps/web/src/lib/native-bridge.ts
+@@ -20,6 +20,15 @@ import { getPlatformCapabilities, type PlatformCapabilities, type CapabilityKey
+ 
+ /** Shape of the Electron API exposed via preload contextBridge */
+ interface ElectronAPI {
++  /**
++   * CLOUD API base URL resolved by the Electron main process (Task 65).
++   * Injected via webPreferences.additionalArguments and parsed in preload.js.
++   * '' when the main process has no configured cloud URL — callers must
++   * fall back to their own defaults. This is the SAME value the main process
++   * uses for login proxying / sync / realtime, so the renderer can never
++   * disagree about which server is "the cloud" (e.g. a self-hosted VPS).
++   */
++  cloudBaseUrl?: string;
+   sendNotification: (title: string, body: string) => void;
+   setBadge: (count: number) => void;
+   minimize: () => void;
+diff --git a/ops/Caddyfile b/ops/Caddyfile
+new file mode 100644
+index 0000000..41eac9d
+--- /dev/null
++++ b/ops/Caddyfile
+@@ -0,0 +1,33 @@
++# ════════════════════════════════════════════════════════════════
++# BLASTI — public gateway (Caddy 2)
++# ════════════════════════════════════════════════════════════════
++# SITE_ADDRESS is injected from ops/.env via docker-compose.yml:
++#   • https://blasti.example.com  → automatic Let's Encrypt HTTPS
++#   • :80                         → plain HTTP (IP-only testing)
++#
++# This is the ONLY container exposed to the internet (ports 80/443).
++# Everything else (web:3000, api:3003, db:5432) stays internal.
++#
++# Caddy handles WebSocket upgrades automatically, so the realtime
++# socket and the REST API share the same public origin as the web
++# app — no CORS headaches, native shells always allowed by the API.
++# ════════════════════════════════════════════════════════════════
++
++{$SITE_ADDRESS} {
++	encode zstd gzip
++
++	# API (Bun, :3003) — REST endpoints
++	handle /api/* {
++		reverse_proxy api:3003
++	}
++
++	# API — realtime engine.io/socket.io handshake + transports
++	handle /socket.io/* {
++		reverse_proxy api:3003
++	}
++
++	# Everything else → Next.js web app (:3000)
++	handle {
++		reverse_proxy web:3000
++	}
++}

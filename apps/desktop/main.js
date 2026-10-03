@@ -78,6 +78,21 @@ initFileLogger();
   }
 })();
 
+// ─── .env loading (MUST run before anything reads BLASTI_* variables) ──────
+// Electron does not read .env files, and OS env vars from the BUILD machine
+// do not travel into the packaged installer. loadDesktopEnv() fills
+// process.env from (first match wins, OS environment always overrides):
+//   1. <resources>\.env   packaged only — editable AFTER install (no rebuild)
+//   2. apps/desktop/.env  dev directory; baked into app.asar when packaged
+// See load-env.js for the full contract. Without this, the ".env" workflow
+// documented in .env.example silently did nothing (cloud URL stayed at the
+// http://localhost:3003 default on every installed machine).
+const DESKTOP_ENV_LOAD = require('./load-env').loadDesktopEnv({ isPackaged: app.isPackaged });
+// Task 65: remember whether the OS environment already carried a cloud URL
+// BEFORE any .env file was applied — used below to label the source of the
+// effective Cloud API URL in the startup banner.
+const OS_HAD_CLOUD_URL = !!(process.env.BLASTI_CLOUD_URL || process.env.BLASTI_API_URL);
+
 // ─── Monorepo Module Resolution ────────────────────────────────────────────
 // In bun workspaces, packages are hoisted to the root node_modules.
 // Electron uses Node.js require() which may not follow bun's symlink structure.
@@ -212,14 +227,54 @@ try {
 // local development; production builds should always configure the env var.
 function resolveCloudBaseUrl() {
   const strip = (u) => String(u || '').replace(/\/+$/, '');
-  if (process.env.BLASTI_CLOUD_URL) return strip(process.env.BLASTI_CLOUD_URL);
-  if (process.env.BLASTI_API_URL) return strip(process.env.BLASTI_API_URL);
+  const key = process.env.BLASTI_CLOUD_URL ? 'BLASTI_CLOUD_URL'
+    : (process.env.BLASTI_API_URL ? 'BLASTI_API_URL' : '');
+  const raw = key ? process.env[key] : '';
+  const base = strip(raw);
+  // Task 65 — field report: BLASTI_CLOUD_URL="http://203.0.113.10/api" made
+  // diagnostics probe http://…/api/api/health → 404 → "cloud unreachable"
+  // → first-run initial sync FATAL. BLASTI always appends /api/* itself
+  // (login proxy, sync, realtime and diagnostics all do base + '/api/…'),
+  // and the Caddy site serves /api/* at the ORIGIN root, so the value must
+  // be the bare origin. Auto-correct this exact mistake and say so loudly.
+  if (/\/api$/i.test(base)) {
+    const fixed = strip(base.replace(/\/api$/i, ''));
+    if (/^https?:\/\//i.test(fixed) && fixed.length > 'http://x'.length) {
+      console.warn('[BLASTI Desktop] ' + key + '="' + raw + '" ends with "/api" — auto-corrected to "' + fixed + '"');
+      console.warn('[BLASTI Desktop] BLASTI_CLOUD_URL must be the server ORIGIN only (no path) — the app appends /api/* itself.');
+      return fixed;
+    }
+  }
+  if (base) return base;
   return 'http://localhost:3003';
 }
 const CLOUD_BASE_URL = resolveCloudBaseUrl();
 // Publish for every other module (local API initial-sync route, sync service,
 // loading-screen fallbacks) so they can never resolve a different origin.
 process.env.BLASTI_CLOUD_URL = CLOUD_BASE_URL;
+
+// Task 65: make the effective cloud URL IMPOSSIBLE to miss at startup.
+// The #1 misconfiguration report is "the desktop app is not using my VPS" —
+// this banner is the authoritative answer, printed once, in plain sight
+// (also mirrored into main.log by the console-mirror above).
+const cloudUrlSource = (() => {
+  if (OS_HAD_CLOUD_URL) return 'OS environment variable';
+  const provider = ((DESKTOP_ENV_LOAD && DESKTOP_ENV_LOAD.loaded) || []).find(
+    (l) => l && ((l.filled || []).includes('BLASTI_CLOUD_URL') || (l.filled || []).includes('BLASTI_API_URL'))
+  );
+  return provider ? provider.file : null;
+})();
+if (cloudUrlSource) {
+  console.log('[BLASTI Desktop] Cloud API → ' + CLOUD_BASE_URL + '  [source: ' + cloudUrlSource + ']');
+} else {
+  console.warn('[BLASTI Desktop] Cloud API → ' + CLOUD_BASE_URL + '  [source: built-in default — NO cloud URL configured]');
+  console.warn('[BLASTI Desktop] Login, sync and realtime will target ' + CLOUD_BASE_URL + '.');
+  console.warn('[BLASTI Desktop] To use your VPS instead, set one of (first that exists wins):');
+  console.warn('[BLASTI Desktop]   1. OS environment variable  BLASTI_CLOUD_URL="https://your-vps-domain"');
+  console.warn('[BLASTI Desktop]   2. apps/desktop/.env        BLASTI_CLOUD_URL="https://your-vps-domain"');
+  console.warn('[BLASTI Desktop]   3. project root .env        BLASTI_CLOUD_URL="https://your-vps-domain"  (BLASTI_* keys only)');
+  console.warn('[BLASTI Desktop] Then restart the app. See apps/desktop/.env.example and DEPLOY-GUIDE.md.');
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -783,6 +838,12 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false, // Needed for some IPC patterns
+      // Task 65: hand the resolved CLOUD base URL to the renderer WITHOUT a
+      // sync IPC roundtrip. The preload script parses this flag out of
+      // process.argv and exposes it as window.electronAPI.cloudBaseUrl, so
+      // the web bundle's few direct-cloud calls (session healing, browser
+      // sync fallback) target the SAME server the main process uses.
+      additionalArguments: ['--blasti-cloud-url=' + CLOUD_BASE_URL],
     },
   });
 

@@ -1,0 +1,33 @@
+# ════════════════════════════════════════════════════════════════
+# BLASTI — public gateway (Caddy 2)
+# ════════════════════════════════════════════════════════════════
+# SITE_ADDRESS is injected from ops/.env via docker-compose.yml:
+#   • https://blasti.example.com  → automatic Let's Encrypt HTTPS
+#   • :80                         → plain HTTP (IP-only testing)
+#
+# This is the ONLY container exposed to the internet (ports 80/443).
+# Everything else (web:3000, api:3003, db:5432) stays internal.
+#
+# Caddy handles WebSocket upgrades automatically, so the realtime
+# socket and the REST API share the same public origin as the web
+# app — no CORS headaches, native shells always allowed by the API.
+# ════════════════════════════════════════════════════════════════
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# API (Bun, :3003) — REST endpoints
+	handle /api/* {
+		reverse_proxy api:3003
+	}
+
+	# API — realtime engine.io/socket.io handshake + transports
+	handle /socket.io/* {
+		reverse_proxy api:3003
+	}
+
+	# Everything else → Next.js web app (:3000)
+	handle {
+		reverse_proxy web:3000
+	}
+}

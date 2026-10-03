@@ -17,10 +17,19 @@
  *   2. <app dir>\.env     development: apps/desktop/.env. Packaged: the copy
  *                         baked into app.asar at build time (same file the
  *                         developer had when running electron-builder).
+ *   3. <project root>\.env development only (apps/desktop/../../.env — TWO
+ *                         levels up). BLASTI_* KEYS ONLY. The monorepo root
+ *                         .env already exists for the web/api stack, so
+ *                         developers naturally put BLASTI_CLOUD_URL there —
+ *                         reading it makes that intuition work. Restricting
+ *                         it to the BLASTI_* namespace keeps cloud-only
+ *                         secrets (DATABASE_URL, POSTGRES_PASSWORD,
+ *                         NEXTAUTH_SECRET…) out of the desktop process.
  *
  * PRECEDENCE RULES
  *   - OS environment variables ALWAYS win: fill-only-unset, dotenv-style.
- *   - Therefore: OS env  >  resources\.env  >  bundled .env  >  built-in defaults.
+ *   - Therefore: OS env  >  resources\.env  >  apps/desktop .env  >
+ *     project root .env (BLASTI_* only, dev)  >  built-in defaults.
  *
  * PARSER NOTES (kept deliberately simple and predictable)
  *   - UTF-8 BOM stripped; both LF and CRLF line endings accepted (Windows).
@@ -86,6 +95,7 @@ function readEnvVars(filePath) {
  * Fill process.env from the .env candidates. Existing (non-empty) OS
  * environment variables are never overwritten.
  * @param {{ isPackaged?: boolean, verbose?: boolean }} [opts]
+ * @returns {{ loaded: Array<{file: string, why: string, total: number, filled: string[]}>, applied: number }}
  */
 function loadDesktopEnv(opts) {
   const isPackaged = !!(opts && opts.isPackaged);
@@ -96,17 +106,28 @@ function loadDesktopEnv(opts) {
     candidates.push({
       file: path.join(process.resourcesPath, '.env'),
       why: 'installed resources (editable after install)',
+      filter: null,
     });
   }
-  candidates.push({ file: path.join(__dirname, '.env'), why: 'app directory' });
+  candidates.push({ file: path.join(__dirname, '.env'), why: 'app directory', filter: null });
+  if (!isPackaged) {
+    // Dev convenience: the monorepo root .env (shared with web/api) is read
+    // too, but ONLY its BLASTI_* keys — see the header note for why.
+    // NOTE: __dirname is apps/desktop, so the project root is TWO levels up.
+    candidates.push({
+      file: path.join(__dirname, '..', '..', '.env'),
+      why: 'project root (BLASTI_* keys only, dev)',
+      filter: (key) => key.startsWith('BLASTI_'),
+    });
+  }
 
   const loaded = [];
   let applied = 0;
 
-  for (const { file, why } of candidates) {
+  for (const { file, why, filter } of candidates) {
     const vars = readEnvVars(file);
     if (!vars) continue;
-    const keys = Object.keys(vars);
+    const keys = Object.keys(vars).filter((k) => (filter ? filter(k) : true));
     const filled = [];
     for (const k of keys) {
       if (process.env[k] === undefined || process.env[k] === '') {
@@ -118,7 +139,7 @@ function loadDesktopEnv(opts) {
     loaded.push({ file, why, total: keys.length, filled });
     if (verbose) {
       console.log(
-        `[BLASTI Desktop] .env (${why}): ${file} — ${keys.length} var(s) in file, ${filled.length} applied [${filled.join(', ') || '-'}]`
+        `[BLASTI Desktop] .env (${why}): ${file} — ${keys.length} var(s) in scope, ${filled.length} applied [${filled.join(', ') || '-'}]`
       );
     }
   }

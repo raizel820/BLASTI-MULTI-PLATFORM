@@ -10,6 +10,78 @@ using **PostgreSQL** as the database. Every step is copy-paste.
 
 ---
 
+## Fast path — DigitalOcean (one command)
+
+> 📘 **New to this? Use the dedicated walkthrough instead:**
+> **`DEPLOY-GUIDE.md`** — a numbered, copy-paste, step-by-step DigitalOcean
+> droplet guide (account → SSH key → droplet → deploy → DNS/HTTPS →
+> verification checklist → connecting the desktop app → updates →
+> troubleshooting). Everything below is the condensed version.
+
+Prefer **DigitalOcean** over OVHcloud? The exact same stack (Docker + PostgreSQL 16 + Caddy HTTPS)
+deploys itself with one script — `scripts/deploy-digitalocean.sh`:
+
+```bash
+# 0) One-time: install the doctl CLI and authenticate
+#    https://docs.digitalocean.com/reference/doctl/how-to/install/
+doctl auth init
+
+# 1) Create a droplet and deploy BLASTI to it in one shot:
+./scripts/deploy-digitalocean.sh create --ssh-key <your-do-ssh-key> --domain blasti.example.com
+
+#    No domain yet? Deploy on the raw IP first (plain HTTP), add DNS later:
+./scripts/deploy-digitalocean.sh create --ssh-key <your-do-ssh-key>
+
+# 2) Later — ship updates with the same one-liner (server secrets are never touched):
+./scripts/deploy-digitalocean.sh deploy root@<DROPLET_IP> --domain blasti.example.com
+
+#    Helpers:
+./scripts/deploy-digitalocean.sh status root@<DROPLET_IP>
+./scripts/deploy-digitalocean.sh logs   root@<DROPLET_IP> api
+```
+
+Notes:
+- **Recommended droplet:** Basic / 2 vCPU / 4 GB (`s-2vcpu-4gb`), image **Ubuntu 24.04** — the script
+  adds swap automatically on smaller sizes so the first build never runs out of memory.
+- The script generates `ops/.env` on the server with **random secrets** and never overwrites one that
+  already exists — re-running `deploy` is always safe.
+- Windows: run it from **WSL or Git Bash** (needs only `ssh` + `tar`; `doctl` only for `create`).
+- Everything else in this guide (first login, DNS, backups, troubleshooting) applies unchanged —
+  just replace "OVH Manager" with the DigitalOcean control panel.
+
+---
+
+## Auto-deploy on new commits (git watcher)
+
+`scripts/watch-and-deploy.sh` polls the GitHub repo
+(`https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git`) and applies new commits to the VPS
+automatically — no manual deploy step.
+
+**On the VPS (recommended, cron-driven):** the VPS holds a git clone of the repo
+(`git clone https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git /opt/blasti`),
+then cron checks every 5 minutes and on a new commit runs `git fetch + reset --hard`
+plus the docker rebuild (your `ops/.env` secrets are never touched):
+
+```bash
+sudo crontab -e
+# add:
+*/5 * * * * /opt/blasti/scripts/watch-and-deploy.sh watch --on-server --once >> /var/log/blasti-watch.log 2>&1
+```
+
+**From your own machine (no git needed on the VPS):** uploads the changed code with the
+same tar-over-ssh path as a manual deploy, in a long-running loop:
+
+```bash
+./scripts/watch-and-deploy.sh watch root@<DROPLET_IP> --domain blasti.example.com
+```
+
+Useful flags: `--branch master` (default), `--interval 300`, `--once` (single check),
+`--dry-run` (show what would happen), `--deploy-now` (deploy on first run instead of just
+recording a baseline). Private repos need a PAT/deploy key on the machine running the
+watcher. The watcher never deploys on its very first check unless `--deploy-now` is given.
+
+---
+
 ## 0. What you are deploying (30 seconds)
 
 ```
@@ -227,8 +299,12 @@ The phone app is built with the server address **baked in**:
    bun run build:mobile
    ```
    then open Android Studio → ▶ Run / build the APK as usual.
-3. **Desktop (Electron):** set `BLASTI_CLOUD_URL=https://blasti.example.com` before
-   `bun run electron:build` — or configure it in the desktop app's cloud-sync settings.
+3. **Desktop (Electron):** put `BLASTI_CLOUD_URL="https://blasti.example.com"`
+   into **`apps/desktop/.env`** and rebuild (`bun run electron:build:win`). The
+   `.env` is baked into the installer, and can also be edited **after**
+   installation at `<install>\resources\.env` without rebuilding. (OS environment
+   variables do NOT travel into the installer — the `.env` file is the only
+   supported build-time configuration.)
 
 ---
 

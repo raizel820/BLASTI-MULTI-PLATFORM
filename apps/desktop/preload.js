@@ -15,6 +15,26 @@
 
 const { contextBridge, ipcRenderer } = require('electron');
 
+// ─── Cloud API base URL (injected by main.js via additionalArguments) ──────
+// The main process resolves the CLOUD API origin (BLASTI_CLOUD_URL >
+// BLASTI_API_URL > default, after .env files are applied — see load-env.js)
+// and passes it as a --blasti-cloud-url=… flag. Reading it here (instead of
+// an IPC call) gives the web bundle a synchronous, zero-roundtrip answer for
+// its few direct-cloud calls (session healing, browser-side sync fallback),
+// so the renderer and the main process can never disagree about which
+// server is "the cloud" — including a self-hosted VPS.
+function resolveInjectedCloudUrl() {
+  const flag = '--blasti-cloud-url=';
+  for (const arg of process.argv || []) {
+    if (typeof arg === 'string' && arg.startsWith(flag)) {
+      const value = arg.slice(flag.length).trim();
+      if (value) return value;
+    }
+  }
+  return '';
+}
+const CLOUD_BASE_URL = resolveInjectedCloudUrl();
+
 contextBridge.exposeInMainWorld('electronAPI', {
   // ─── Platform Detection ────────────────────────────────────────────────────
 
@@ -23,6 +43,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * The platform detection code checks: !!window.electronAPI || ua.includes('Electron')
    */
   isElectron: true,
+
+  /**
+   * CLOUD API base URL resolved by the main process ('' when absent — the
+   * web bundle then falls back to its own defaults). Mirrors the value used
+   * for login proxying, sync and realtime inside the main process.
+   */
+  cloudBaseUrl: CLOUD_BASE_URL,
 
   /**
    * Returns 'electron' — used by native-bridge.ts and adapters

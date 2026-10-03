@@ -83,7 +83,11 @@ packages/db/data/.db-generation.json
 /download/
 /upload/
 /examples/
-Caddyfile
+# root-level Caddyfile only — ops/Caddyfile (docker-compose mount) MUST be
+# tracked; a bare "Caddyfile" pattern here silently excluded it from every
+# commit, so the GitHub repo never had it and fresh server deploys crashed
+# on `docker compose up` (compose bind-mounts ./Caddyfile).
+/Caddyfile
 ops/.next/
 
 # dev tooling caches

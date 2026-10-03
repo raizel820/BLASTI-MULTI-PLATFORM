@@ -363,10 +363,15 @@ export function getCloudApiBaseUrl(): string {
     return process.env.INTERNAL_API_URL || DEFAULT_INTERNAL_URL;
   }
 
-  // Desktop is local-first and must NEVER pick up the mobile build's
-  // NEXT_PUBLIC_API_URL (the emulator host 10.0.2.2 is unreachable from
-  // a desktop machine). The API runs on the same machine → localhost:3003.
+  // Desktop is local-first: the UI data endpoint stays :3080 (getApiBaseUrl),
+  // but the CLOUD this machine talks to for login/sync/realtime must be the
+  // SAME server the main process resolved — BLASTI_CLOUD_URL from the
+  // desktop .env / project root .env / OS environment (Task 65). The main
+  // process hands it over via additionalArguments → preload → electronAPI.
   if (isElectronRuntime()) {
+    const shellUrl = (window as unknown as { electronAPI?: { cloudBaseUrl?: string } })
+      .electronAPI?.cloudBaseUrl?.trim();
+    if (shellUrl) return shellUrl.replace(/\/+$/, '');
     return process.env.NEXT_PUBLIC_CLOUD_URL || DEFAULT_CLOUD_URL;
   }
 
