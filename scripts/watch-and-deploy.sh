@@ -6,11 +6,12 @@
 # DigitalOcean (or any) VPS automatically.
 #
 # MODES
-#   A) Watch FROM YOUR MACHINE - deploy by upload (no git on the VPS):
+#   A) Watch FROM YOUR MACHINE - tell the VPS to pull from GitHub:
 #        ./scripts/watch-and-deploy.sh watch root@VPS_IP [--domain d.tld]
-#      Every new commit runs scripts/deploy-digitalocean.sh deploy
-#      (tar over ssh + docker compose rebuild) - identical to a manual
-#      deploy, so the VPS never needs GitHub credentials.
+#      Every new commit runs scripts/deploy-digitalocean.sh update
+#      (one ssh call -> server-update: git pull + rebuild + restart),
+#      identical to a manual update. No upload, no GitHub credentials
+#      needed on your machine (the repo is public).
 #
 #   B) Watch ON THE VPS (recommended for always-on auto-deploy):
 #      The VPS clone is updated with git, then rebuilt in place.
@@ -32,8 +33,9 @@
 #   --port N          (upload mode) ssh port (default 22)
 #   --domain D        (upload mode) passed through to deploy-digitalocean.sh
 #
-# PRIVATE REPOS: the machine running the watcher needs GitHub credentials
-# (a fine-grained PAT over HTTPS or a read-only deploy key).
+# PRIVATE REPOS: mode B (on the VPS) needs read credentials on the VPS
+# (export GITHUB_TOKEN before the first clone, or use a deploy key).
+# Mode A needs no credentials when the repo is public.
 #
 # SAFETY
 #   - First run records the current commit as baseline WITHOUT deploying
@@ -187,19 +189,19 @@ deploy_now() { # deploy_now <sha> -> 0 on success (respects dry-run)
   local sha="$1"
   if [ "$ON_SERVER" -eq 1 ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
-      log "dry-run: would run: git -C $DIR fetch+reset to $sha && deploy-digitalocean.sh bootstrap"
+      log "dry-run: would run: git -C $DIR fetch+reset to $sha && deploy-digitalocean.sh server-update"
       return 0
     fi
     git -C "$DIR" fetch origin "$BRANCH" || return 1
     git -C "$DIR" reset --hard "FETCH_HEAD" >/dev/null || return 1
-    log "code updated to $sha - rebuilding containers (secrets untouched)"
-    ( cd "$DIR" && bash scripts/deploy-digitalocean.sh bootstrap ${DOMAIN:+--domain "$DOMAIN"} ) || return 1
+    log "code updated to $sha - rebuilding + restarting services (secrets untouched)"
+    ( cd "$DIR" && bash scripts/deploy-digitalocean.sh server-update ${DOMAIN:+--domain "$DOMAIN"} ) || return 1
   else
     if [ "$DRY_RUN" -eq 1 ]; then
-      log "dry-run: would run: deploy-digitalocean.sh deploy $TARGET (upload $sha)"
+      log "dry-run: would run: deploy-digitalocean.sh update $TARGET (ssh -> server-update)"
       return 0
     fi
-    "$SCRIPT_DIR/deploy-digitalocean.sh" deploy "$TARGET" --port "$PORT" ${DOMAIN:+--domain "$DOMAIN"} || return 1
+    "$SCRIPT_DIR/deploy-digitalocean.sh" update "$TARGET" --port "$PORT" ${DOMAIN:+--domain "$DOMAIN"} || return 1
   fi
 }
 

@@ -92,6 +92,40 @@ function readEnvVars(filePath) {
 }
 
 /**
+ * Normalize BLASTI_* URL variables in process.env.
+ *
+ * The cloud URL must be the BARE ORIGIN ("http://203.0.113.10" or
+ * "https://blasti.example.com") — every consumer appends "/api/..." itself.
+ * A common misconfiguration is pasting the full API base ("…/api"), which
+ * produces "/api/api/health" probes → 404 → "cloud unreachable" → the
+ * startup gate blocks the workspace. We self-heal the two known offenders
+ * (BLASTI_CLOUD_URL + legacy BLASTI_API_URL) and say so loudly.
+ */
+function normalizeCloudUrls() {
+  let fixed = 0;
+  for (const key of ['BLASTI_CLOUD_URL', 'BLASTI_API_URL']) {
+    const value = process.env[key];
+    if (typeof value === 'string' && /\/api\/?$/.test(value)) {
+      const stripped = value.replace(/\/+$/, '').replace(/\/api$/i, '');
+      console.warn(
+        `[BLASTI Desktop] ${key} ends with "/api" — that would double the path ` +
+        `(probing /api/api/health → 404). Auto-corrected to the bare origin:`
+      );
+      console.warn(`[BLASTI Desktop]   was:  ${value}`);
+      console.warn(`[BLASTI Desktop]   now:  ${stripped}   (fix the .env file anyway)`);
+      process.env[key] = stripped;
+      fixed++;
+    }
+    // also trim a stray trailing slash (harmless but noisy)
+    const v2 = process.env[key];
+    if (typeof v2 === 'string' && v2.length > 1 && v2.endsWith('/')) {
+      process.env[key] = v2.replace(/\/+$/, '');
+    }
+  }
+  return fixed;
+}
+
+/**
  * Fill process.env from the .env candidates. Existing (non-empty) OS
  * environment variables are never overwritten.
  * @param {{ isPackaged?: boolean, verbose?: boolean }} [opts]
@@ -147,6 +181,8 @@ function loadDesktopEnv(opts) {
   if (verbose && loaded.length === 0) {
     console.log('[BLASTI Desktop] no .env found — using OS environment + built-in defaults');
   }
+
+  normalizeCloudUrls();
 
   return { loaded, applied };
 }

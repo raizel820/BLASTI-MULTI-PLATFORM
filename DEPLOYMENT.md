@@ -10,42 +10,57 @@ using **PostgreSQL** as the database. Every step is copy-paste.
 
 ---
 
-## Fast path — DigitalOcean (one command)
+## Fast path — DigitalOcean (Docker = PostgreSQL only, everything else native)
 
 > 📘 **New to this? Use the dedicated walkthrough instead:**
 > **`DEPLOY-GUIDE.md`** — a numbered, copy-paste, step-by-step DigitalOcean
-> droplet guide (account → SSH key → droplet → deploy → DNS/HTTPS →
-> verification checklist → connecting the desktop app → updates →
-> troubleshooting). Everything below is the condensed version.
+> guide written for non-developers (account → droplet → installer →
+> **all .env configurations** → DNS/HTTPS → verification → desktop app →
+> updates → backups → troubleshooting).
 
-Prefer **DigitalOcean** over OVHcloud? The exact same stack (Docker + PostgreSQL 16 + Caddy HTTPS)
-deploys itself with one script — `scripts/deploy-digitalocean.sh`:
+**Architecture note:** DigitalOcean deployments use the **"Docker = PostgreSQL
+only"** stack: ONE container (`blasti-db`, PostgreSQL 16 on 127.0.0.1:5432)
+plus **native systemd services** — `blasti-api` (Bun, :3003), `blasti-web`
+(Node/Next.js, :3000) and the **Caddy** apt package (80/443, automatic HTTPS).
+The code is **pulled from GitHub** by the VPS itself. The full-docker-compose
+stack documented below (OVHcloud style) also still works unchanged.
+
+On a **fresh droplet** (Ubuntu 24.04, no node/bun/docker) ssh in and run
+two commands — the installer pulls everything from GitHub:
 
 ```bash
-# 0) One-time: install the doctl CLI and authenticate
-#    https://docs.digitalocean.com/reference/doctl/how-to/install/
-doctl auth init
+# on YOUR machine:  ssh root@<DROPLET_IP>
+# on the SERVER:
+curl -fsSL https://raw.githubusercontent.com/raizel820/BLASTI-MULTI-PLATFORM/master/scripts/deploy-digitalocean.sh -o blasti-deploy.sh
+bash blasti-deploy.sh server-install
+```
 
-# 1) Create a droplet and deploy BLASTI to it in one shot:
-./scripts/deploy-digitalocean.sh create --ssh-key <your-do-ssh-key> --domain blasti.example.com
+Or trigger the identical install from your own machine
+(needs only `ssh`; Windows PowerShell works — no tar/upload anymore):
 
-#    No domain yet? Deploy on the raw IP first (plain HTTP), add DNS later:
-./scripts/deploy-digitalocean.sh create --ssh-key <your-do-ssh-key>
+```bash
+git clone https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git blasti && cd blasti
+./scripts/deploy-digitalocean.sh install root@<DROPLET_IP>
+```
 
-# 2) Later — ship updates with the same one-liner (server secrets are never touched):
-./scripts/deploy-digitalocean.sh deploy root@<DROPLET_IP> --domain blasti.example.com
+Everyday operations:
 
-#    Helpers:
-./scripts/deploy-digitalocean.sh status root@<DROPLET_IP>
-./scripts/deploy-digitalocean.sh logs   root@<DROPLET_IP> api
+```bash
+./scripts/deploy-digitalocean.sh update  root@<DROPLET_IP>   # git pull + rebuild + restart
+./scripts/deploy-digitalocean.sh status  root@<DROPLET_IP>   # services + db + health
+./scripts/deploy-digitalocean.sh logs    root@<DROPLET_IP> api  # api | web | db | caddy
+./scripts/deploy-digitalocean.sh backup  root@<DROPLET_IP>   # pg_dump to a local file
+./scripts/deploy-digitalocean.sh restore root@<DROPLET_IP> blasti-DATE.sql
 ```
 
 Notes:
-- **Recommended droplet:** Basic / 2 vCPU / 4 GB (`s-2vcpu-4gb`), image **Ubuntu 24.04** — the script
-  adds swap automatically on smaller sizes so the first build never runs out of memory.
-- The script generates `ops/.env` on the server with **random secrets** and never overwrites one that
-  already exists — re-running `deploy` is always safe.
-- Windows: run it from **WSL or Git Bash** (needs only `ssh` + `tar`; `doctl` only for `create`).
+- **Recommended droplet:** Basic / 2 vCPU / 4 GB (`s-2vcpu-4gb`), image **Ubuntu 24.04** — the
+  installer adds swap automatically on smaller sizes so the build never runs out of memory.
+- All server .env configuration lives in ONE file: **`/etc/blasti/blasti.env`**
+  (random secrets generated on first install, never overwritten, never committed —
+  full variable reference in `DEPLOY-GUIDE.md` Part 6).
+- Domain later? Re-run update with `--domain your.domain` — Caddy obtains and
+  renews the HTTPS certificate automatically.
 - Everything else in this guide (first login, DNS, backups, troubleshooting) applies unchanged —
   just replace "OVH Manager" with the DigitalOcean control panel.
 

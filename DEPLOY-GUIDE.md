@@ -1,426 +1,518 @@
-# BLASTI — Step-by-Step DigitalOcean Droplet Deployment Guide
+# BLASTI — Step-by-Step DigitalOcean VPS Deployment Guide
 
-A complete, copy-paste walkthrough: **from "I have a DigitalOcean account" to
-"BLASTI is live on my droplet with HTTPS, and my desktop app talks to it."**
+**For everyone — no developer experience required.** This guide takes you
+from *"I have a DigitalOcean account"* to *"BLASTI is live on my own VPS,
+pulled straight from GitHub, and my desktop app talks to it."*
 
-Everything here uses one script — `scripts/deploy-digitalocean.sh` — which
-automates Docker, firewall, secrets, build and startup. No manual server
-configuration is required.
+Just copy-paste the commands exactly as shown. Every step explains what it
+does and what you should see.
 
-> Reference for every internal detail (compose layout, Caddyfile, env vars,
-> backups, restore): see `DEPLOYMENT.md`.
+> **How the app is deployed (the short version):**
+> Docker on the VPS runs **only ONE container: PostgreSQL (the database)**.
+> Everything else — the API, the web app and the HTTPS gateway — runs
+> natively on the server as **system services** that start on boot and
+> restart on crash. The code is **pulled from your GitHub repository** —
+> nothing is uploaded by hand.
 
 ---
 
 ## Part 0 — What you will end up with (30 seconds)
 
-One droplet running the full production stack in Docker:
-
 ```
-                    Internet
-                        │
-              ┌─────────▼─────────┐
-              │   Droplet (VPS)   │
-              │  ports 80 + 443   │
-              │  ┌─────────────┐  │
-              │  │    Caddy    │  │  automatic HTTPS (Let's Encrypt)
-              │  └──┬───────┬──┘  │
-              │     │       │     │
-              │ ┌───▼──┐ ┌──▼───┐ │
-              │ │ web  │ │ api  │ │  Next.js UI  +  Hono API (:3003)
-              │ └──────┘ └──┬───┘ │                 │
-              │         ┌───▼───┐ │         ┌──────▼──────┐
-              │         │ postgres│ │        │ /socket.io  │
-              │         └───────┘ │         │ realtime    │
-              │                   │         └─────────────┘
-              └───────────────────┘
-   ▲                                    ▲
-   │ browser / phone browser            │ desktop app (login + sync + realtime)
-   └── http(s)://your-domain ───────────┴── BLASTI_CLOUD_URL="https://your-domain"
+                        Internet
+                            │
+              ┌─────────────▼──────────────────┐
+              │   DigitalOcean Droplet (VPS)   │
+              │                                │
+              │   Caddy  :80 / :443            │  ◀── the ONLY public door
+              │     ├─ /api/*        ─────┐    │      (automatic HTTPS)
+              │     ├─ /socket.io/* ──────┤    │
+              │     └─ everything else ──┐│    │
+              │                          ││    │
+              │   blasti-web  :3000 ◀────┘│    │  systemd service (Next.js)
+              │   blasti-api  :3003 ◀─────┘    │  systemd service (Bun)
+              │          │                     │
+              │   ┌──────▼───────────────┐      │
+              │   │ Docker: blasti-db    │      │  ← the ONLY container
+              │   │ PostgreSQL 127.0.0.1:5432   │
+              │   └──────────────────────┘      │
+              └────────────────────────────────┘
+        ▲                                      ▲
+        │ browser / phone browser              │ desktop app (login, sync, realtime)
+        └── http://YOUR-IP  or  https://your-domain
+                                  BLASTI_CLOUD_URL="http://YOUR-IP"   ← no /api!
 ```
 
-- **Browser users** open `https://your-domain` (or `http://<droplet-ip>` for testing).
-- **Desktop app** keeps running its local SQLite database offline, and uses
-  your droplet for login, cloud sync and realtime — configured with ONE
-  variable: `BLASTI_CLOUD_URL` (Part 6).
+| Piece | What it is | How it runs | Port |
+|---|---|---|---|
+| **Caddy** | HTTPS gateway (padlock 🔒) | native service (`systemd`) | 80, 443 — public |
+| **blasti-api** | BLASTI backend (Hono + Socket.IO) | native service, **Bun** | 3003 — localhost only |
+| **blasti-web** | BLASTI web app (Next.js) | native service, **Node** | 3000 — localhost only |
+| **blasti-db** | PostgreSQL 16 database | **Docker — the only container** | 5432 — localhost only |
+
+Everything is installed for you by **one script**: `scripts/deploy-digitalocean.sh`
+(it is part of the GitHub repo — the server downloads it itself).
 
 ---
 
 ## Part 1 — What you need
 
 | # | Requirement | Notes |
-|---|-------------|-------|
-| 1 | DigitalOcean account | [digitalocean.com](https://www.digitalocean.com) |
-| 2 | A machine with `bash` + `ssh` + `tar` | Windows 10/11: use **Git Bash** or **WSL** (both ship ssh/tar) |
-| 3 | An SSH key added to your DO account | Part 2, Step 2 |
-| 4 | `doctl` CLI (optional) | Only for Path A (one-command droplet creation). Path B uses the DO website instead |
-| 5 | A domain name (recommended) | Needed for automatic HTTPS. You can start without one |
-| 6 | ~10–15 minutes | Most of it is the Docker build, which runs unattended |
+|---|---|---|
+| 1 | A DigitalOcean account | [digitalocean.com](https://www.digitalocean.com) — sign up, add a payment method |
+| 2 | Your computer | Windows 10/11 (use **PowerShell**), macOS or Linux (use **Terminal**) |
+| 3 | The BLASTI GitHub repo | `https://github.com/raizel820/BLASTI-MULTI-PLATFORM` (public — no GitHub login needed on the server) |
+| 4 | A domain name *(optional but recommended)* | Needed for automatic HTTPS. You can start with just the IP |
+| 5 | 30–45 minutes | Most of it is unattended installing/building |
 
-**Recommended droplet:** Basic → Regular → **s-2vcpu-4gb** (2 vCPU / 4 GB /
-80 GB SSD, ~$18/mo). The script auto-adds 2 GB swap on smaller droplets so
-even s-1vcpu-2gb can build, but 4 GB is noticeably faster and safer for
-production. Region: pick the one closest to your users (default `ams3`).
+**Recommended droplet:** Basic plan → Regular CPU → **4 GB RAM / 2 vCPU**
+(~$18/month). Smaller 2 GB droplets work too (the installer adds swap
+memory automatically), but 4 GB builds noticeably faster.
 
 ---
 
-## Part 2 — One-time local setup
+## Part 2 — Create the droplet (on the DigitalOcean website)
 
-### Step 1 — Get the BLASTI code
+1. Log in at [cloud.digitalocean.com](https://cloud.digitalocean.com).
+2. Click the green **Create** button (top right) → **Droplets**.
+3. **Choose Region** — pick the region closest to your users
+   (e.g. *Frankfurt* for Europe, *New York* for the Americas).
+4. **Choose an Image** — under *OS* select **Ubuntu 24.04 (LTS) x64**.
+5. **Choose Size** — *Shared CPU → Basic → Regular* → **4 GB / 2 vCPU**.
+6. **Choose Authentication Method:**
+   - **Password** (easiest for beginners): choose a **strong root password**
+     and save it somewhere safe. DigitalOcean emails it to you as well.
+   - **SSH Key** (more convenient later): upload your key if you have one.
+7. **Hostname:** change to `blasti` (nice to recognise it later).
+8. Click **Create Droplet**.
+9. Wait ~60 seconds until the droplet shows **green "Active"**.
+10. **Write down the droplet's IP address** (shown next to the droplet name,
+    e.g. `203.0.113.10`). You will use it constantly.
+
+> 💡 If a firewall prompt appears on the creation screen, you can skip it —
+> the installer configures the server's own firewall for you.
+
+---
+
+## Part 3 — Connect to the droplet (first time)
+
+**Windows:** click Start, type **PowerShell**, press Enter, then type
+(replace `203.0.113.10` with YOUR droplet IP):
+
+```
+ssh root@203.0.113.10
+```
+
+**macOS / Linux:** open **Terminal** and type the same command.
+
+- First time only, you will see a fingerprint question — type `yes` and Enter.
+- With **password auth**: type the root password (nothing appears while
+  typing — that is normal) and press Enter.
+- ✅ Success looks like: the prompt changes to something like
+  `root@blasti:~#`. You are now "inside" the server. All commands in the
+  next Part are typed there.
+
+---
+
+## Part 4 — Install BLASTI (one shot, from GitHub)
+
+Stay inside the ssh session (`root@blasti:~#`). A fresh droplet has no
+curl/git/node/bun — **the installer adds everything itself**. Copy-paste
+these **two commands**, one at a time:
+
+**Command 1 — download the installer from GitHub:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/raizel820/BLASTI-MULTI-PLATFORM/master/scripts/deploy-digitalocean.sh -o blasti-deploy.sh
+```
+
+**Command 2 — run it:**
+
+```bash
+bash blasti-deploy.sh server-install
+```
+
+That's it. The installer now runs unattended for roughly **8–15 minutes**
+(installing Docker, Bun, Node, Caddy, cloning the code from GitHub, building
+the web app). You will see `[deploy]` progress lines the whole time.
+
+> ✅ **Success looks like** a box at the end that says **"BLASTI is UP on
+> this droplet"** with your web address. Open that address in your browser —
+> you should see the BLASTI login page.
+>
+> ❌ If a line ends with `[FAIL]`, note the message and jump to Part 12
+> (Troubleshooting).
+
+### Alternative: run the installer from your own computer
+
+If you have a copy of the repo on your own machine and prefer to trigger
+everything remotely (works from Windows PowerShell too):
 
 ```bash
 git clone https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git blasti
 cd blasti
+./scripts/deploy-digitalocean.sh install root@203.0.113.10
 ```
 
-(Already have it? `git pull` and make sure you are on the latest `master`.)
-
-### Step 2 — Add your SSH key to DigitalOcean
-
-If you already have a key, note its fingerprint/ID and skip to Step 3.
-
-1. DigitalOcean console → **Settings → Security → SSH keys → Add SSH key**.
-2. Paste your **public** key (`~/.ssh/id_ed25519.pub` or `~/.ssh/id_rsa.pub`).
-   - No key yet? Generate one: `ssh-keygen -t ed25519` (accept defaults).
-3. Give it a name you will recognise, e.g. `my-laptop`.
-
-### Step 3 (optional, Path A only) — Install & authenticate doctl
-
-```bash
-# macOS
-brew install doctl
-# Linux — see https://docs.digitalocean.com/reference/doctl/how-to/install/
-# Windows — choco install doctl  (or scoop install doctl)
-
-doctl auth init          # paste your API token
-                         # (DO console → API → Generate New Token, Read+Write)
-```
-
-Verify your key is visible (note the **ID** or **Name** — you will use it):
-
-```bash
-doctl compute ssh-key list
-```
+This connects to the droplet over ssh and performs **exactly the same
+install** (the code still comes from GitHub, not from your machine).
+If your droplet uses password auth, ssh asks for it once.
 
 ---
 
-## Part 3 — Deploy
+## Part 5 — What the installer did (plain English)
 
-Pick **ONE** path:
+1. Added **2 GB swap** if the droplet has under 4 GB RAM (build headroom).
+2. Installed **Docker** — used **only** to run the PostgreSQL container.
+3. Installed **Bun** (runs the API) and **Node.js 22** (runs the web app).
+4. Installed **Caddy** — the HTTPS gateway on ports 80/443.
+5. Turned on the **firewall**: only ssh (22), HTTP (80) and HTTPS (443) are
+   reachable. The database and both app services are **localhost-only**.
+6. Created the **environment file** `/etc/blasti/blasti.env` with **random
+   secrets** (see Part 6).
+7. **Cloned your GitHub repo** to `/opt/blasti`.
+8. Started **one Docker container**: `blasti-db` (PostgreSQL 16, data stored
+   in a Docker volume that survives restarts and updates).
+9. Created the database tables and seeded the default accounts (only when
+   the database is empty — your data is never wiped by updates).
+10. Built the web app (`next build`) and registered two **system services**:
+    `blasti-api` and `blasti-web` — they start on boot and restart on crash.
+11. Rendered `/etc/caddy/Caddyfile` and started Caddy with **automatic
+    HTTPS** (once a domain points here).
+12. Waited until `GET /api/health` answered OK.
 
-- **Path A (recommended)** — you installed `doctl`: one command creates the
-  droplet AND deploys BLASTI.
-- **Path B** — no `doctl`: create the droplet on the DO website, then one
-  command deploys BLASTI to it.
+---
 
-### ── Path A: one command from zero ──────────────────────────────
+## Part 6 — .env configurations (all of them, in one place)
+
+BLASTI uses **three small configuration files**. Only the first one lives on
+the VPS; the other two live where the app runs (your Windows PC / phone).
+
+### 6.1 Server: `/etc/blasti/blasti.env` (the VPS environment file)
+
+Created **automatically** with random secrets. It is the single place that
+configures the database container, the API and the web app on the VPS.
+
+**View it** (on the server):
 
 ```bash
-./scripts/deploy-digitalocean.sh create \
-    --ssh-key my-laptop \
-    --region ams3 \
-    --size s-2vcpu-4gb \
-    --name blasti \
-    --domain blasti.example.com
+cat /etc/blasti/blasti.env
 ```
 
-- `--ssh-key` accepts the key **name** or **ID** from `doctl compute ssh-key list`.
-- `--domain` is optional — include it only if the DNS A-record already points
-  this hostname at the IP the script prints (see Part 4). Without it the site
-  runs on plain HTTP at the raw IP.
-- Add `--yes` to skip the confirmation prompt.
-
-What happens (fully automated, ~10 min):
-
-1. Creates Ubuntu 24.04 droplet, waits until it is network-active.
-2. Uploads the code and runs the server bootstrap (see below).
-3. Prints your URLs + the droplet IP at the end. **Write the IP down.**
-
-### ── Path B: droplet via the DO website, then one command ───────
-
-1. DO console → **Create → Droplets**.
-2. **Region:** closest to your users. **Image:** Ubuntu 24.04 LTS.
-3. **Size:** Basic → Regular → **4 GB / 2 vCPU** (s-2vcpu-4gb).
-4. **Authentication:** SSH key → select `my-laptop`.
-5. **Hostname:** `blasti`. → **Create Droplet**.
-6. Copy the droplet's public IP (e.g. `203.0.113.10`), then from the repo:
-
-   ```bash
-   ./scripts/deploy-digitalocean.sh deploy root@203.0.113.10 \
-       --domain blasti.example.com
-   ```
-
-   (Omit `--domain` if you have none yet.) This uploads the code, installs
-   Docker, configures the firewall, generates secrets, builds and starts
-   everything. **Safe to re-run any time** to ship an update.
-
-### What the server bootstrap does (both paths, automatic)
-
-- Installs Docker + git (skipped when already present)
-- Firewall: `ufw` allows only **22 / 80 / 443**
-- Generates `ops/.env` with **random** Postgres password + secrets
-  (never overwrites an existing one — redeploys keep your data)
-- Adds 2 GB swap on small droplets (build headroom)
-- `docker compose up -d --build` → postgres → migrations → api → web → caddy
-- Waits until `GET /api/health` returns OK (up to 5 min), then prints URLs
-
----
-
-## Part 4 — Domain + HTTPS
-
-If you deployed **without** a domain, the app is live at
-`http://<droplet-ip>` (plain HTTP — fine for testing).
-
-To go to proper HTTPS:
-
-1. In your DNS provider create an **A record**:
-
-   | Type | Name | Value |
-   |------|------|-------|
-   | A | `blasti` (or `@` for the root domain) | `<droplet IP>` |
-
-2. Wait until it resolves (check: `ping blasti.example.com` → your IP), then
-   re-run the deploy with the domain so Caddy picks it up:
-
-   ```bash
-   ./scripts/deploy-digitalocean.sh deploy root@<droplet-ip> \
-       --domain blasti.example.com
-   ```
-
-3. Caddy automatically obtains and later **renews** the Let's Encrypt
-   certificate. Verify: open `https://blasti.example.com` — padlock, no
-   warnings.
-
-> ⚠️ Do the DNS step BEFORE the very first start when you can — Caddy gets
-> the certificate immediately on first boot. Adding it later still works via
-> the redeploy above.
-
----
-
-## Part 5 — Verify the deployment (2-minute checklist)
+**What it looks like after a fresh install** (your values differ):
 
 ```bash
-# 1. Everything running?
-./scripts/deploy-digitalocean.sh status root@<droplet-ip>
-#    → 5 containers: caddy, web, api, migrate (exited 0), postgres
+# ══════════════════════════════════════════════════════════════
+# BLASTI VPS environment - generated by deploy-digitalocean.sh
+# ══════════════════════════════════════════════════════════════
 
-# 2. API health from the outside  (NOTE: /api/health — never /api/api/health)
-curl https://blasti.example.com/api/health        # → {"status":"ok",...}
+# ── PostgreSQL (the ONLY Docker container) ─────────────────────
+POSTGRES_USER=blasti
+POSTGRES_PASSWORD=9f2c4ba71d0e8a63c5f7...      # random - keep private
+POSTGRES_DB=blasti
 
-# 3. Web UI loads
-open https://blasti.example.com                    # login page renders
+# ── Database URL used by the API + Prisma CLI ──────────────────
+DATABASE_URL=postgresql://blasti:9f2c4ba7...@127.0.0.1:5432/blasti?schema=public
 
-# 4. Realtime endpoint reachable
-curl -i https://blasti.example.com/socket.io/?EIO=4&transport=polling
-#    → HTTP 200 with an engine.io handshake payload
+# ── Security secrets ───────────────────────────────────────────
+NEXTAUTH_SECRET=4be21d0c9f7a8b6355e0c1...     # signs login sessions
+INTERNAL_SECRET=77c0ffa1b2e34d5589aa0f...     # API-to-API trust
+CRON_SECRET=52aa0be17c3d94f6bb12e0a1f...      # maintenance endpoint
 
-# 5. Live logs (Ctrl-C to stop)
-./scripts/deploy-digitalocean.sh logs root@<droplet-ip> api
+# ── Networking (all app ports bind to localhost only) ──────────
+API_PORT=3003
+HOST=127.0.0.1
+WEB_PORT=3000
+INTERNAL_API_URL=http://127.0.0.1:3003
+API_PROXY_URL=http://127.0.0.1:3003
+
+# ── Public address (set by the installer; --domain updates it) ─
+SITE_ADDRESS=:80                          # ← becomes https://your-domain
+CORS_ORIGIN=http://203.0.113.10           # ← becomes https://your-domain
+ALLOWED_ORIGINS=http://203.0.113.10       # ← becomes https://your-domain
 ```
 
-**First login — change the defaults NOW:**
-The database is seeded with two accounts. Log in at `https://blasti.example.com`
-and change both passwords immediately:
+**Variable reference:**
 
-| Role | Username | Default password |
-|------|----------|------------------|
-| Admin | `admin` | `admin123` |
-| Owner | `owner` | `owner123` |
+| Variable | Meaning | Change it when… |
+|---|---|---|
+| `POSTGRES_USER` / `POSTGRES_DB` | Database login + database name | Never (keep `blasti`) |
+| `POSTGRES_PASSWORD` | Database password (random) | Never — regenerate only on a full reset |
+| `DATABASE_URL` | Full database address — must match the three lines above | Never edit alone (keep it in sync with the password) |
+| `NEXTAUTH_SECRET` | Session-signing key (random) | Never |
+| `INTERNAL_SECRET` | Trust secret between BLASTI components | Never |
+| `CRON_SECRET` | Protects the maintenance endpoint | Never |
+| `API_PORT` / `HOST` | Where the API listens — `127.0.0.1` = not reachable from outside | Never |
+| `WEB_PORT` | Where the web app listens | Never |
+| `INTERNAL_API_URL` / `API_PROXY_URL` | How the web app reaches the API internally | Never |
+| `SITE_ADDRESS` | The public door Caddy opens: `:80` (IP, HTTP) or `https://your-domain` | When adding/changing the domain — or just re-run `update --domain` |
+| `CORS_ORIGIN` / `ALLOWED_ORIGINS` | Which origins may call the API | Automatically updated together with the domain |
 
----
+**Editing it safely** (on the server):
 
-## Part 6 — Point the desktop app at YOUR droplet
-
-The desktop app is **local-first**: its UI and working data always come from
-the embedded local API, while **login, cloud sync and realtime** go to the
-server you configure below. One variable controls everything:
-
+```bash
+nano /etc/blasti/blasti.env      # edit: arrows to move, Ctrl+O then Enter to save, Ctrl+X to exit
+systemctl restart blasti-api blasti-web   # apply the change
 ```
-BLASTI_CLOUD_URL
+
+> ⚠️ The file is `chmod 600` (root-only) and lives **outside the repo** —
+> git updates never touch it, and it is never committed anywhere.
+
+### 6.2 Desktop app: `apps/desktop/.env` (on your Windows PC)
+
+The desktop app is local-first: it works offline and uses your VPS **only
+for login, cloud sync and realtime**. One variable points it at the VPS.
+
+Create or edit the file `apps/desktop/.env` inside your local BLASTI folder:
+
+```bash
+BLASTI_CLOUD_URL="http://203.0.113.10"
 ```
 
-### ⚠️ The value must be the ORIGIN — never append `/api`
-
-The app appends `/api/*` paths **itself**. Writing the suffix yourself
-doubles the path and breaks everything:
-
-```
-✅ BLASTI_CLOUD_URL="http://68.183.137.227"          ← raw IP, HTTP (testing)
-✅ BLASTI_CLOUD_URL="https://blasti.example.com"     ← domain + HTTPS (production)
-❌ BLASTI_CLOUD_URL="http://68.183.137.227/api"      ← DO NOT — probes /api/api/health → 404
-```
+> ### ⚠️ The value must be the bare origin — NEVER add `/api`
+> The app adds `/api/...` paths **itself**. Adding the suffix yourself
+> doubles it and breaks the connection (`/api/api/health` → 404):
+>
+> ```
+> ✅ BLASTI_CLOUD_URL="http://203.0.113.10"        ← raw IP (testing)
+> ✅ BLASTI_CLOUD_URL="https://your-domain.com"    ← domain + HTTPS (production)
+> ❌ BLASTI_CLOUD_URL="http://203.0.113.10/api"    ← DO NOT — double /api
+> ```
 
 Recent builds **auto-correct** a trailing `/api` and print a warning, but
-fix the value anyway.
+write the correct value anyway.
 
-### Dev mode (`bun run electron:dev`)
+**Where the app looks for the variable** (first match wins):
 
-The app reads `.env` files automatically at startup (Electron does not do
-this by itself — BLASTI ships its own loader). The printed startup line is
-the ground truth of what will be used:
+1. `apps/desktop/.env` — the dedicated desktop file (recommended)
+2. Project root `.env` — only `BLASTI_*` keys are read from it
+3. OS environment variable — overrides both files
 
-```
-[BLASTI Desktop] Cloud API → https://blasti.example.com  [source: …\.env]
-```
-
-Pick **any one** of these three places (first match wins):
-
-1. **Project root `.env`** — the file you already have for web/api vars.
-   Add one line (only `BLASTI_*` keys are read from this file):
-
-   ```bash
-   # at the repository root, .env
-   BLASTI_CLOUD_URL="https://blasti.example.com"
-   ```
-
-2. **`apps/desktop/.env`** — the dedicated desktop file (create it if
-   missing; it is gitignored so it stays on your machine):
-
-   ```bash
-   cp apps/desktop/.env.example apps/desktop/.env
-   # then edit: BLASTI_CLOUD_URL="https://blasti.example.com"
-   ```
-
-3. **OS environment variable** (overrides both files):
-
-   ```bash
-   export BLASTI_CLOUD_URL="https://blasti.example.com"   # macOS/Linux
-   set BLASTI_CLOUD_URL=https://blasti.example.com        # Windows cmd
-   ```
-
-Then start the app and **check the console line**:
-
-```bash
-bun run electron:dev
-```
-
-- ✅ `[BLASTI Desktop] Cloud API → https://blasti.example.com  [source: …\.env]`
-  → the app will log in against, sync with, and receive realtime events from
-  your droplet.
-- ❌ `[source: built-in default — NO cloud URL configured]` → the variable
-  was not found; the banner lists every location it looked in. Fix the
-  location/name and restart.
-
-> `BLASTI_API_URL` still works as a legacy alias but has **lower** precedence
-> than `BLASTI_CLOUD_URL`.
-
-### Installed app (.exe) — no rebuild needed
-
-After installing, edit this file with Notepad (create it if missing):
+**For the installed .exe** (no rebuild needed): edit (or create) this file
+with Notepad, then restart the app:
 
 ```
 %LOCALAPPDATA%\Programs\BLASTI\resources\.env
 ```
 
+**Verify inside the app:** start it with `bun run electron:dev` and check
+the startup line — it is the ground truth of what will be used:
+
 ```
-BLASTI_CLOUD_URL="https://blasti.example.com"
+[BLASTI Desktop] Cloud API → http://203.0.113.10  [source: …apps\desktop\.env]
 ```
 
-Restart the app — it repoints without reinstalling or rebuilding.
+✅ That line + a successful login = the desktop is talking to YOUR droplet.
+❌ `[source: built-in default — NO cloud URL configured]` = the file/variable
+name is wrong (the banner lists every location it checked).
 
-### Verify the connection inside the app
+> The first login imports ("initial-sync") your workspace from the VPS, so
+> the VPS must be reachable **before** the first login succeeds. If a
+> previous wrong URL locked the workspace (REVOKED), fixing the URL and
+> logging in fresh clears it.
 
-1. Log in with an account that exists **on the VPS** (e.g. the ones from
-   Part 5). Success = the login was proxied to your droplet.
-2. Create something (a queue/ticket) → it should appear on the web UI at
-   `https://blasti.example.com` after the next sync tick.
-3. Offline test: disable Wi-Fi, keep working; re-enable → data syncs up.
+### 6.3 Web app build: `NEXT_PUBLIC_API_URL` (leave it EMPTY on the VPS)
 
-> First run shows `initial-sync: ERROR — الإعداد الأول يتطلب اتصالاً بالإنترنت`
-> until the cloud is reachable AND you log in once — that is expected: the
-> very first workspace import needs the VPS. With the URL fixed, the
-> cloud-api diagnostic must turn ✓ before login will work.
+This variable is **baked into the web bundle at build time**. On the VPS the
+installer explicitly builds with `NEXT_PUBLIC_API_URL=""` (empty) so the
+browser calls the API **same-origin** (`/api/*` on your own domain) and
+Caddy routes it to the internal API. You never need to touch this — it is
+listed here so you know why it must stay empty for VPS deployments.
+(It is only used non-empty for phone/emulator builds.)
+
+### 6.4 PostgreSQL container: `ops/postgres.compose.yml`
+
+The database container reads `POSTGRES_USER`, `POSTGRES_PASSWORD`,
+`POSTGRES_DB` **from `/etc/blasti/blasti.env`** (section 6.1) — there is no
+separate database .env file to manage. The compose file also publishes the
+port on **127.0.0.1 only**, so the database is invisible to the internet.
 
 ---
 
-## Part 7 — Ship updates (and optional auto-deploy)
+## Part 7 — Verify the deployment (2-minute checklist)
 
-### Manual update — one command, whenever you want
+On the **server** (ssh session):
 
 ```bash
-git pull                                        # get the latest code
-./scripts/deploy-digitalocean.sh deploy root@<droplet-ip> --domain blasti.example.com
+systemctl status blasti-api blasti-web caddy --no-pager   # all three: active (running)
+docker ps                                                  # ONE container: blasti-db (healthy)
+curl http://127.0.0.1:3003/api/health                      # {"status":"ok",...}
 ```
 
-Zero-downtime restart of changed containers; **secrets and database are
-never touched**. (`status` / `logs` subcommands help you watch it land.)
+From **your own computer** (replace the IP):
 
-### Auto-deploy on every new commit (git watcher)
+```
+curl http://203.0.113.10/api/health       → {"status":"ok",...}
+```
+
+then open **http://203.0.113.10** in a browser → the BLASTI login page.
+
+**First login — change the default passwords NOW:**
+
+| Role | Username | Default password |
+|---|---|---|
+| Platform super-admin | `admin` | `admin123` |
+| Demo agency owner | `owner1` | `owner123` |
+
+---
+
+## Part 8 — Add a domain + automatic HTTPS
+
+1. At your domain provider (or DigitalOcean → Networking → Domains), create
+   a DNS **A record** pointing your name at the droplet IP:
+
+   | Type | Name | Value |
+   |---|---|---|
+   | A | `blasti` (or `@` for the root domain) | `203.0.113.10` |
+
+2. Wait until the name resolves (`ping blasti.yourdomain.com` must show the
+   droplet IP), then run the **update with the domain** — ssh into the
+   server and run:
+
+   ```bash
+   bash /opt/blasti/scripts/deploy-digitalocean.sh server-update --domain blasti.yourdomain.com
+   ```
+
+   This rewrites `SITE_ADDRESS` / `CORS_ORIGIN` / `ALLOWED_ORIGINS` in
+   `/etc/blasti/blasti.env` (Part 6.1) and reconfigures Caddy.
+
+3. Caddy **automatically obtains and renews** the Let's Encrypt certificate.
+   Verify: open `https://blasti.yourdomain.com` — padlock 🔒, no warnings.
+
+4. Update the desktop (Part 6.2) and phone apps to the `https://` URL.
+
+> The domain also switches the web login/sessions to secure cookies — tell
+> all users the new `https://` address.
+
+---
+
+## Part 9 — Update the app (always from GitHub)
+
+New code is deployed by **pulling the latest commit from GitHub** and
+rebuilding — your database, uploaded files and secrets are never touched.
+
+**Update from your computer (one command):**
 
 ```bash
-# From your machine — every new commit triggers the same upload+rebuild:
-./scripts/watch-and-deploy.sh watch root@<droplet-ip> --domain blasti.example.com
+./scripts/deploy-digitalocean.sh update root@203.0.113.10
+```
 
-# Or ON the server via cron (recommended for always-on):
-ssh root@<droplet-ip>
+**Or update on the server (ssh in, then):**
+
+```bash
+bash /opt/blasti/scripts/deploy-digitalocean.sh server-update
+```
+
+Both do: `git pull` from GitHub → `bun install` → database schema update →
+`next build` → restart `blasti-api` + `blasti-web` + Caddy.
+
+### Auto-update on every new commit (optional)
+
+On the server, enable a 5-minute git watcher via cron:
+
+```bash
 crontab -e
-# add:
+```
+
+Add this line, save, exit:
+
+```
 */5 * * * * /opt/blasti/scripts/watch-and-deploy.sh watch --on-server --once >> /var/log/blasti-watch.log 2>&1
 ```
 
-Useful flags: `--once` (single check), `--dry-run`, `--force`, `--branch master`,
-`--deploy-now`. Private repos need a read-only PAT or deploy key on the
-machine running the watcher.
+From then on, every new commit on GitHub lands on the VPS within 5 minutes.
 
 ---
 
-## Part 8 — Everyday operations cheat sheet
+## Part 10 — Backups
+
+**Quick manual backup** (from your computer — writes a .sql file next to you):
 
 ```bash
-# Container status
-./scripts/deploy-digitalocean.sh status root@IP
+./scripts/deploy-digitalocean.sh backup root@203.0.113.10
+```
 
-# Follow logs: api | web | db | caddy
-./scripts/deploy-digitalocean.sh logs root@IP api
+**Restore a backup** (careful — overwrites the current database):
 
-# SSH in
-ssh root@IP
+```bash
+./scripts/deploy-digitalocean.sh restore root@203.0.113.10 blasti-2026-01-01.sql
+```
 
-# Inside the server
-cd /opt/blasti
-docker compose ps                 # what is running
-docker compose logs -f api        # any service's logs
-docker compose restart api        # restart one service
-docker compose up -d --build      # rebuild everything
+**Automated safety net:** DigitalOcean panel → your droplet → **Backups** →
+enable (weekly, +20% of droplet price). Keep both.
 
-# Database backup (weekly at least — see DEPLOYMENT.md §10.1 for automation)
-ssh root@IP "docker compose -f /opt/blasti/ops/docker-compose.yml exec -T db \
-  pg_dump -U blasti blasti" > blasti-$(date +%F).sql
+---
+
+## Part 11 — Everyday operations cheat sheet
+
+```bash
+# ── from your computer ────────────────────────────────────────
+./scripts/deploy-digitalocean.sh status root@IP          # everything at a glance
+./scripts/deploy-digitalocean.sh logs  root@IP api       # api | web | db | caddy
+./scripts/deploy-digitalocean.sh update root@IP          # ship the latest code
+./scripts/deploy-digitalocean.sh backup root@IP          # dump the database
+
+# ── on the server (ssh root@IP) ───────────────────────────────
+systemctl status blasti-api blasti-web caddy   # are the services running?
+systemctl restart blasti-api                   # restart one service
+journalctl -u blasti-api -n 100 --no-pager     # last 100 API log lines
+journalctl -u blasti-api -f                    # live-follow the API log (Ctrl-C stops)
+docker logs --tail 100 blasti-db               # database logs
+docker restart blasti-db                       # restart the database container
+cat /etc/blasti/blasti.env                     # view the .env configuration (Part 6.1)
+cd /opt/blasti                                 # the app's code (from GitHub)
 ```
 
 ---
 
-## Part 9 — Troubleshooting
+## Part 12 — Troubleshooting
 
 | Symptom | Likely cause → Fix |
 |---|---|
-| Diagnostics probe shows **`/api/api/health` → 404** | `BLASTI_CLOUD_URL` has a trailing `/api` → remove it (origin only). Recent builds auto-strip it with a warning |
-| Desktop console: `[source: built-in default — NO cloud URL configured]` | Variable missing → Part 6; the banner lists all checked locations |
-| `deploy` fails at upload | `ssh root@IP` asks for a password → your local key is not the DO-registered one. `ssh -i ~/.ssh/id_ed25519 root@IP` to test |
-| Build killed / "Killed" during `web` build | Droplet too small for the build → the script adds swap automatically on ≤4 GB; if you built manually, add swap or use s-2vcpu-4gb |
-| Site loads but login spins forever | API not healthy → `./scripts/deploy-digitalocean.sh logs root@IP api`; check `/api/health` |
-| No HTTPS / certificate pending | DNS A-record not pointing at the droplet yet, or deployed <1 min ago. `dig +short blasti.example.com` must return the droplet IP; Caddy retries automatically |
-| Desktop: login fails with "cloud unreachable" | `BLASTI_CLOUD_URL` typo'd, or the droplet firewall blocks you, or the domain's cert is pending → test `curl https://your-domain/api/health` from the same machine |
-| Desktop: logs in but never syncs | The VPS account's agency must exist on the cloud; check api logs for `/api/sync/*` calls; realtime uses `/socket.io/*` (Caddy proxies it automatically) |
-| Workspace stays locked / REVOKED after a wrong URL was used | Fix the URL, then log in **fresh** — a successful cloud login clears the revoked state (offline unlock stays disabled until then) |
-| `curl http://<ip>/api/health` works, HTTPS doesn't | You added the domain after the first boot → re-run `deploy --domain` (Part 4) |
+| Installer line `[FAIL] could not detect the public IP` | Rare network hiccup → re-run `bash blasti-deploy.sh server-install` (it resumes safely) |
+| `curl /api/health` says connection refused | API not running → `systemctl status blasti-api` and `journalctl -u blasti-api -n 50 --no-pager`; after fixing, `systemctl restart blasti-api` |
+| `docker ps` shows blasti-db restarting/unhealthy | Check `docker logs blasti-db`; usually a mismatched `POSTGRES_PASSWORD` vs `DATABASE_URL` in `/etc/blasti/blasti.env` (Part 6.1) — keep them in sync |
+| Web page loads but login spins | API unhealthy → check `curl http://127.0.0.1:3003/api/health` **on the server** and the API logs |
+| Desktop probe shows **`/api/api/health` → 404** | `BLASTI_CLOUD_URL` has a trailing `/api` → remove it (bare origin only, Part 6.2) |
+| Desktop: `[source: built-in default — NO cloud URL configured]` | Variable not found → create `apps/desktop/.env` exactly as in Part 6.2 and restart the app |
+| Desktop: workspace locked / REVOKED after a wrong URL | Fix the URL, then log in **fresh** — a successful cloud login clears the revoked state |
+| No HTTPS / certificate pending | DNS A-record not pointing at the droplet yet, or re-run `server-update --domain …` (Part 8). Caddy retries automatically |
+| `update` says "no git repo" | You installed long ago with the old method → re-run the Part 4 installer (it detects and refreshes the clone) |
+| Build killed / "Killed" during update | Droplet ran out of memory → the installer adds swap automatically on ≤4 GB; for manual runs: `sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile` |
+| Site reachable on the IP but not the domain | DNS not propagated (can take up to 24 h) → `ping your-domain` until it shows the droplet IP |
+| Everything is slow / server unresponsive | Check memory: `free -h` (on the server). 4 GB droplets are the comfortable minimum |
+
+**Reset a service to factory settings** (last resort — wipes the database):
+
+```bash
+# on the server
+docker stop blasti-db && docker rm blasti-db
+docker volume rm blasti_pgdata
+docker compose -f /opt/blasti/ops/postgres.compose.yml --env-file /etc/blasti/blasti.env up -d
+systemctl restart blasti-api blasti-web
+# the seed re-creates the default accounts on the next API start
+```
 
 ---
 
-## Part 10 — Cost & sizing notes
+## Part 13 — Cost & sizing notes
 
 | Droplet | RAM/vCPU | Verdict |
 |---|---|---|
 | s-1vcpu-1gb | 1 GB | ❌ Not enough for the Next.js build |
-| s-1vcpu-2gb | 2 GB | ⚠️ Works (script adds 2 GB swap) — slow builds, dev/testing only |
-| **s-2vcpu-4gb** | 4 GB | ✅ **Recommended** — comfortable builds + headroom for Postgres |
-| s-4vcpu-8gb | 8 GB | For many agencies / heavy ticket volume |
+| s-1vcpu-2gb | 2 GB | ⚠️ Works (installer adds 2 GB swap) — testing/small teams |
+| **s-2vcpu-4gb** | 4 GB | ✅ **Recommended** — comfortable builds + Postgres headroom |
+| s-4vcpu-8gb | 8 GB | Many agencies / heavy ticket volume |
 
-Backups: enable **Droplet → Backups** in the DO panel (weekly, +20% cost) on
-top of the `pg_dump` routine in Part 8.
+- Docker runs **only** the tiny Postgres container — the apps run natively,
+  so a 4 GB droplet has plenty of headroom.
+- Enable **Droplet → Backups** (+20%) on top of the Part 10 `pg_dump` routine.
+- Firewall keeps the database and app ports **invisible from the internet** —
+  only Caddy's 80/443 are public.
 
 ---
 
 *Automation behind this guide: `scripts/deploy-digitalocean.sh`
-(create/deploy/bootstrap/status/logs) + `scripts/watch-and-deploy.sh`
-(commit watcher). Full reference: `DEPLOYMENT.md`.*
+(install / update / status / logs / backup / restore — plus the on-VPS
+`server-install` / `server-update` helpers) and `scripts/watch-and-deploy.sh`
+(commit watcher). Full architecture reference: `DEPLOYMENT.md`.*

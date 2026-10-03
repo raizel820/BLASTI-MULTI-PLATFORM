@@ -5,8 +5,12 @@
 #   • https://blasti.example.com  → automatic Let's Encrypt HTTPS
 #   • :80                         → plain HTTP (IP-only testing)
 #
-# This is the ONLY container exposed to the internet (ports 80/443).
-# Everything else (web:3000, api:3003, db:5432) stays internal.
+# Works in BOTH deployment architectures (see DEPLOY-GUIDE.md):
+#   • Docker stack (ops/docker-compose.yml): the docker-compose
+#     `api`/`web` service names are used as-is.
+#   • Native VPS stack (deploy-digitalocean.sh server-install):
+#     the installer rewrites api:3003 / web:3000 → 127.0.0.1:3003 /
+#     127.0.0.1:3000 and bakes SITE_ADDRESS into /etc/caddy/Caddyfile.
 #
 # Caddy handles WebSocket upgrades automatically, so the realtime
 # socket and the REST API share the same public origin as the web
@@ -14,20 +18,20 @@
 # ════════════════════════════════════════════════════════════════
 
 {$SITE_ADDRESS} {
-	encode zstd gzip
+        encode zstd gzip
 
-	# API (Bun, :3003) — REST endpoints
-	handle /api/* {
-		reverse_proxy api:3003
-	}
+        # API (Bun, :3003) — REST endpoints
+        handle /api/* {
+                reverse_proxy api:3003
+        }
 
-	# API — realtime engine.io/socket.io handshake + transports
-	handle /socket.io/* {
-		reverse_proxy api:3003
-	}
+        # API — realtime engine.io/socket.io handshake + transports
+        handle /socket.io/* {
+                reverse_proxy api:3003
+        }
 
-	# Everything else → Next.js web app (:3000)
-	handle {
-		reverse_proxy web:3000
-	}
+        # Everything else → Next.js web app (:3000)
+        handle {
+                reverse_proxy web:3000
+        }
 }
