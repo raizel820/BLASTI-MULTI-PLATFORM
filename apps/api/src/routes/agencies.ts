@@ -69,12 +69,12 @@ app.get('/', async (c) => {
     const agencyIds = agencies.map(a => a.id)
     const ratingResults = agencyIds.length > 0
       ? await db.$queryRaw<Array<{ agencyId: string; avgRating: number | null; reviewCount: number }>>`
-          SELECT agencyId,
-                 ROUND(AVG(CAST(rating AS REAL)) * 10) / 10 as avgRating,
-                 COUNT(*) as reviewCount
-          FROM Review
-          WHERE agencyId IN (${Prisma.join(agencyIds)})
-          GROUP BY agencyId
+          SELECT "agencyId",
+                 (ROUND(AVG("rating") * 10) / 10.0)::float8 as "avgRating",
+                 CAST(COUNT(*) AS INTEGER) as "reviewCount"
+          FROM "Review"
+          WHERE "agencyId" IN (${Prisma.join(agencyIds)})
+          GROUP BY "agencyId"
         `
       : []
 

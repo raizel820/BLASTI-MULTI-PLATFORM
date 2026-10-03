@@ -14,6 +14,10 @@ const API_Q = 'XTransformPort=3003';
 const POLL_INTERVAL = 3000;
 const SLOW_POLL_INTERVAL = 30000;
 const AUTO_SCAN_INTERVAL = 30000;
+// Stop the 3s scan polling after this many consecutive failures — otherwise a
+// dead/misconfigured API gets polled FOREVER while the UI shows a fake scan.
+// (Regression guard: this stop existed in 95b4d90 and was wiped by the a2ce27b revert.)
+const MAX_SCAN_POLL_FAILURES = 3;
 
 interface DiscoveryServiceReturn {
   scanState: ScanState;
@@ -36,6 +40,20 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const autoScanTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const mountedRef = useRef(true);
+  const scanPollFailuresRef = useRef(0);
+
+  /** Shared failure-stop: after N consecutive poll failures, end the scan locally. */
+  const noteScanPollFailure = useCallback(() => {
+    scanPollFailuresRef.current += 1;
+    if (scanPollFailuresRef.current >= MAX_SCAN_POLL_FAILURES && mountedRef.current) {
+      if (pollTimerRef.current) {
+        clearInterval(pollTimerRef.current);
+        pollTimerRef.current = undefined;
+      }
+      setScanState((prev) => ({ ...prev, scanning: false, phase: 'idle' }));
+      scanPollFailuresRef.current = 0;
+    }
+  }, []);
 
   // Health check — proxy through API
   const checkHealth = useCallback(async () => {
@@ -110,7 +128,11 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   const pollScanStatus = useCallback(async () => {
     try {
       const res = await apiFetch(`/api/agency-devices/discovery/scan/status?${API_Q}`);
-      if (!res.ok) return;
+      if (!res.ok) {
+        noteScanPollFailure();
+        return;
+      }
+      scanPollFailuresRef.current = 0;
       const data = await res.json();
       if (mountedRef.current) {
         let wasScanning = false;
@@ -142,9 +164,9 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
         }
       }
     } catch {
-      // Silent
+      noteScanPollFailure();
     }
-  }, [pollDevices]);
+  }, [pollDevices, noteScanPollFailure]);
 
   // Poll protocols (less frequent — every 30s) — proxy through API
   const pollProtocols = useCallback(async () => {
@@ -153,7 +175,15 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
       if (!res.ok) return;
       const data = await res.json();
       if (data.protocols && Array.isArray(data.protocols) && mountedRef.current) {
-        setProtocols(data.protocols);
+        // Backend contract: { name, status: 'available'|'unavailable', description }
+        // Client model:    { name, enabled, available, description } — normalize so
+        // the badges actually light up (they were permanently gray before).
+        setProtocols(data.protocols.map((p: Record<string, unknown>) => ({
+          name: String(p.name ?? ''),
+          enabled: p.enabled === undefined ? true : Boolean(p.enabled),
+          available: p.available === undefined ? p.status === 'available' : Boolean(p.available),
+          description: String(p.description ?? ''),
+        })));
       }
     } catch {
       // Silent

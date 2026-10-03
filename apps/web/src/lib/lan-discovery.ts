@@ -6,12 +6,19 @@
  *
  * Discovery Strategy:
  * 1. Check if we're already on the same host (localhost)
- * 2. Scan common LAN IP ranges (192.168.x.x, 10.0.x.x) on the API port
- * 3. Try mDNS hostname: http://blasti.local:{port}/api/discover
+ * 2. Probe the gateway of our DERIVED subnet (WebRTC local IP when the page
+ *    hostname isn't a real IP — Capacitor/localhost shells; else the page IP)
+ * 3. Scan the derived /24, then the common LAN ranges on the API port
  * 4. Fall back to the cloud server if nothing found
+ *
+ * Only `service: 'blasti-local'` responses count as a desktop. The historic
+ * 'blasti-lan' service is IGNORED here — it polluted the LAN cache and made
+ * it flap between cloud and LAN entries (Task 2-b).
  *
  * The discovered server info is cached and used for API + Socket.IO connections.
  */
+
+import { getLocalIp } from './get-local-ip';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -43,10 +50,11 @@ type DiscoveryListener = (state: DiscoveryState) => void;
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const DISCOVERY_ENDPOINT = '/api/discover';
-const DISCOVERY_TIMEOUT = 1500; // 1.5s per IP scan
+const DISCOVERY_TIMEOUT = 1000; // 1s per IP — local HTTP beacons answer in ms
 const CACHE_KEY = 'blasti_lan_server';
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
 const SCAN_CONCURRENCY = 10; // Scan 10 IPs at once
+const SCAN_CAP = 128; // Max IPs scanned per subnet — bounds a full sweep
 const DEFAULT_API_PORT = parseInt(process.env.NEXT_PUBLIC_API_PORT || '3080', 10);
 
 // Common LAN subnets to scan
@@ -122,7 +130,10 @@ async function scanIP(ip: string, port: number): Promise<DiscoveredServer | null
     if (!response.ok) return null;
 
     const data = await response.json();
-    if (data.service === 'blasti-lan' || data.service === 'blasti-local') {
+    // Task 2-b: ONLY 'blasti-local' is a desktop. 'blasti-lan' (cloud LAN
+    // helper) responses used to be cached here and made the cache flap
+    // between the cloud origin and the real LAN server.
+    if (data.service === 'blasti-local') {
       return data as DiscoveredServer;
     }
     return null;
@@ -132,21 +143,19 @@ async function scanIP(ip: string, port: number): Promise<DiscoveredServer | null
   }
 }
 
-// ─── mDNS Hostname Check ────────────────────────────────────────────────────
+// ─── Gateway Probe (replaces the fake mDNS lookups) ─────────────────────────
 
-async function checkMDnsHostname(): Promise<DiscoveredServer | null> {
-  const hostnames = [
-    'blasti.local',
-    'blasti._tcp.local',
-  ];
-
-  for (const hostname of hostnames) {
-    try {
-      const server = await scanIP(hostname, DEFAULT_API_PORT);
-      if (server) return server;
-    } catch {
-      // mDNS not available, continue
-    }
+/**
+ * Probe the gateway (assumed .1) of each candidate subnet for the desktop
+ * beacon. The previous implementation "checked" blasti.local /
+ * blasti._tcp.local — names nothing in the system announces — so it burned
+ * a DNS timeout on every discovery pass. The gateway .1 is where the BLASTI
+ * desktop (often also the router/NAT) is most likely to live.
+ */
+async function checkGatewayServers(subnets: string[]): Promise<DiscoveredServer | null> {
+  for (const subnet of subnets) {
+    const server = await scanIP(`${subnet}.1`, DEFAULT_API_PORT);
+    if (server) return server;
   }
   return null;
 }
@@ -168,8 +177,10 @@ async function scanSubnet(
   port: number,
   onProgress?: (scanned: number, total: number) => void
 ): Promise<DiscoveredServer | null> {
-  // L13: Skip .255 broadcast address — scan .1 through .254
-  const ips = Array.from({ length: 254 }, (_, i) => `${subnet}.${i + 1}`);
+  // L13: Skip .255 broadcast address — scan .1 through .{SCAN_CAP}
+  // Task 2-b: a full 254-host sweep × 13 subnets is minutes of waiting on
+  // unresponsive hosts; SCAN_CAP bounds each subnet scan.
+  const ips = Array.from({ length: Math.min(254, SCAN_CAP) }, (_, i) => `${subnet}.${i + 1}`);
   const total = ips.length;
   let scanned = 0;
 
@@ -190,6 +201,35 @@ async function scanSubnet(
   }
 
   return null;
+}
+
+// ─── Local Subnet Derivation (Task 2-b) ─────────────────────────────────
+
+/**
+ * Derive the most likely LAN subnet(s) for THIS device.
+ * Order: (1) the /24 of the page hostname when it IS a real IP (served from
+ * a LAN host), (2) the /24 of the WebRTC local IP — the only reliable source
+ * inside Capacitor/localhost shells, where window.location.hostname is
+ * 'localhost' and the old hostname-derived subnet never existed.
+ */
+async function deriveCandidateSubnets(): Promise<string[]> {
+  const subnets: string[] = [];
+  const push = (ip: string) => {
+    const parts = ip.split('.');
+    if (parts.length === 4 && parts.every((p) => /^\d{1,3}$/.test(p))) {
+      const subnet = parts.slice(0, 3).join('.');
+      if (!subnets.includes(subnet)) subnets.push(subnet);
+    }
+  };
+  const currentHost = typeof window !== 'undefined' ? window.location.hostname : '';
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(currentHost || '')) {
+    push(currentHost);
+  }
+  try {
+    const rtcIp = await getLocalIp();
+    if (rtcIp) push(rtcIp);
+  } catch { /* WebRTC blocked — fall through to the hardcoded list */ }
+  return subnets;
 }
 
 // ─── Main Discovery Function ────────────────────────────────────────────────
@@ -245,7 +285,7 @@ export async function discoverLanServer(
   isScanning = true;
   let scannedCount = 0;
   const scannedSubnets = new Set<string>(); // M25
-  const totalToScan = LAN_SUBNETS.length * 254;
+  const totalToScan = LAN_SUBNETS.length * SCAN_CAP;
 
   const updateProgress = (status: 'scanning' | 'failed', server: DiscoveredServer | null) => {
     const state: DiscoveryState = { status, server, scannedCount, totalToScan };
@@ -265,39 +305,35 @@ export async function discoverLanServer(
       }
       scannedCount += 1;
 
-      // Strategy 2: Check mDNS hostname
-      const mdnsServer = await checkMDnsHostname();
-      if (mdnsServer) {
-        cacheServer(mdnsServer);
-        notifyListeners({ status: 'found', server: mdnsServer, scannedCount: 0, totalToScan: 0 });
-        return mdnsServer;
+      // Strategy 2+3: derive our LAN subnet(s) — WebRTC local IP first
+      // (Capacitor/localhost shells), then the page hostname — probe their
+      // gateway (.1) and scan them BEFORE any hardcoded fallback (Task 2-b).
+      const derived = await deriveCandidateSubnets();
+      const gatewayServer = await checkGatewayServers(derived);
+      if (gatewayServer) {
+        cacheServer(gatewayServer);
+        notifyListeners({ status: 'found', server: gatewayServer, scannedCount: 0, totalToScan: 0 });
+        return gatewayServer;
       }
-      scannedCount += 2;
+      scannedCount += derived.length;
 
-      // Strategy 3: If we know our own IP, scan our subnet first
-      const currentHost = window.location.hostname;
-      if (currentHost && currentHost !== 'localhost' && !currentHost.startsWith('127.')) {
-        const parts = currentHost.split('.');
-        if (parts.length === 4) {
-          const subnet = parts.slice(0, 3).join('.');
-          // M25: Track scanned subnets to avoid duplicates
-          if (!scannedSubnets.has(subnet)) {
-            scannedSubnets.add(subnet);
-            const subnetServer = await scanSubnet(subnet, DEFAULT_API_PORT, (s, _t) => {
-              // M28: Accumulate progress instead of overwriting
-              scannedCount += s;
-              updateProgress('scanning', null);
-            });
-            if (subnetServer) {
-              cacheServer(subnetServer);
-              notifyListeners({ status: 'found', server: subnetServer, scannedCount, totalToScan });
-              return subnetServer;
-            }
-          }
+      for (const subnet of derived) {
+        // M25: Track scanned subnets to avoid duplicates
+        if (scannedSubnets.has(subnet)) continue;
+        scannedSubnets.add(subnet);
+        const subnetServer = await scanSubnet(subnet, DEFAULT_API_PORT, (s, _t) => {
+          // M28: Accumulate progress instead of overwriting
+          scannedCount += s;
+          updateProgress('scanning', null);
+        });
+        if (subnetServer) {
+          cacheServer(subnetServer);
+          notifyListeners({ status: 'found', server: subnetServer, scannedCount, totalToScan });
+          return subnetServer;
         }
       }
 
-      // Strategy 4: Scan all common subnets
+      // Strategy 4: Scan all common subnets (fallback AFTER the derived one)
       const targetSubnet = options?.subnet;
       const subnets = targetSubnet ? [targetSubnet] : LAN_SUBNETS;
 
@@ -364,26 +400,21 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
     return localhost;
   }
 
-  // Check mDNS
-  const mdns = await checkMDnsHostname();
-  if (mdns) {
-    cacheServer(mdns); // M26: Cache mDNS result
-    return mdns;
+  // Probe the gateway (.1) of the derived subnet(s), then scan them.
+  const derived = await deriveCandidateSubnets();
+  const gateway = await checkGatewayServers(derived);
+  if (gateway) {
+    cacheServer(gateway); // M26: Cache gateway result
+    return gateway;
   }
 
-  // Scan current subnet only
-  const currentHost = typeof window !== 'undefined' ? window.location.hostname : '';
   const scannedSubnets = new Set<string>(); // M25
-  if (currentHost && currentHost !== 'localhost' && !currentHost.startsWith('127.')) {
-    const parts = currentHost.split('.');
-    if (parts.length === 4) {
-      const subnet = parts.slice(0, 3).join('.');
-      scannedSubnets.add(subnet); // M25: Track scanned subnet
-      const server = await scanSubnet(subnet, DEFAULT_API_PORT);
-      if (server) {
-        cacheServer(server);
-        return server;
-      }
+  for (const subnet of derived) {
+    scannedSubnets.add(subnet); // M25: Track scanned subnet
+    const server = await scanSubnet(subnet, DEFAULT_API_PORT);
+    if (server) {
+      cacheServer(server);
+      return server;
     }
   }
 

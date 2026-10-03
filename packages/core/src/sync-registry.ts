@@ -678,6 +678,38 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
   },
 
+  {
+    // Support tickets: customers AND agencies send complaints, suggestions,
+    // questions and notes to the super admin. AGENCY-scoped via the nullable
+    // agencyId — agency tickets flow to the owning agency's desktops (pull is
+    // {agencyId}-scoped so customer tickets, which have no agencyId, simply
+    // never reach any desktop; they stay cloud-side for the admin). Locally
+    // created tickets (offline agency) ride the outbox replay to
+    // POST /api/support-tickets with a client-generated id (cloud route is
+    // idempotent on id).
+    model: 'SupportTicket',
+    delegate: 'supportTicket',
+    label: 'Support Ticket',
+    isSynced: true,
+    isAgencyScoped: true,
+    agencyField: 'agencyId',
+    conflictStrategy: ConflictStrategy.LAST_WRITE_WINS,
+    mutableFields: ['status', 'priority', 'reply', 'repliedAt', 'repliedBy'],
+    immutableFields: ['id', 'userId', 'agencyId', 'subject', 'category', 'message', 'createdAt', 'updatedAt'],
+    localOnlyFields: ['syncVersion', 'syncedAt'],
+    cloudOnlyFields: [],
+    lwwFields: ['updatedAt'],
+    versionField: 'syncVersion',
+    syncedAtField: 'syncedAt',
+    dependencies: ['User', 'Agency'],
+    canCreateOffline: true,
+    canUpdateOffline: false,
+    canDeleteOffline: false,
+    isReadOnly: false,
+    syncOrder: 21,
+    dateFields: ['repliedAt', 'createdAt', 'updatedAt', 'syncedAt'],
+  },
+
   // ── Non-Synced (Cloud-Only) Models ───────────────────────────────────────
 
   {

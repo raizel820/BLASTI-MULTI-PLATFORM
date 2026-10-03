@@ -25,6 +25,7 @@ import {
   type VerificationDev,
   type VerificationSuccess,
 } from './verification-step';
+import { NativeServerStatus } from './native-server-status';
 
 export function LoginForm() {
   const { setUser, setView, goBack, setSessionToken } = useAppStore();
@@ -160,7 +161,17 @@ export function LoginForm() {
         }, 600);
       } else {
         triggerShake();
-        if (data.error === 'wrongRoleError') {
+        // Network-level failure (apiFetch maps network ApiClientErrors to a
+        // 5xx whose statusText is the raw fetch message). Give the user an
+        // ACTIONABLE message instead of a generic "Error" — on a physical
+        // phone this is almost always "the app can't find the PC's server".
+        const networkFailure = res.status >= 500 && /fetch|network|timed out|load failed/i.test(res.statusText || '');
+        if (networkFailure) {
+          toast.error(t('loginNetworkError'), {
+            description: t('loginNetworkErrorDesc'),
+            duration: 8000,
+          });
+        } else if (data.error === 'wrongRoleError') {
           toast.error(t('wrongRoleError'), { description: t('wrongRoleHint') || t('selectRole') || '' });
         } else {
           toast.error(data.error || t('invalidCredentials'));
@@ -409,6 +420,12 @@ export function LoginForm() {
                     transition={{ duration: 0.25 }}
                   >
                     <CardContent className="space-y-5 pt-4">
+                      {/* Native shell (Capacitor): show/fix the PC server
+                          connection before the user burns a login attempt —
+                          the build-time API URL may be unreachable on this
+                          device. Renders nothing in the browser. */}
+                      <NativeServerStatus />
+
                       {/* Role Tabs */}
                       <Tabs value={roleTab} onValueChange={setRoleTab} className="w-full">
                         <div className="text-center mb-2">

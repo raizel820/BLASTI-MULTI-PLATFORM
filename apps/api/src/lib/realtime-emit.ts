@@ -100,6 +100,8 @@ export type NotificationEventType =
   | 'notification:new'
   | 'notification:turn-approaching'
   | 'notification:your-turn'
+  | 'notification:ticket-reply'
+  | 'notification:ticket-status'
 
 export type KioskEventType = 'kiosk:update'
 
@@ -118,6 +120,8 @@ export type DeviceEventType =
 export type AdminEventType =
   | 'admin:stats-updated'
   | 'admin:user-created'
+  | 'admin:ticket-created'
+  | 'admin:ticket-updated'
 
 export interface QueueEventPayload {
   type: QueueEventType

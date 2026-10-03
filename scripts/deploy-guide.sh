@@ -17,10 +17,15 @@
 # BLASTI Deployment Guide & Build Scripts
 # ============================================================================
 #
+# ⭐ SERVER DEPLOYMENT HAS MOVED: see DEPLOYMENT.md at the repository root —
+#    the complete, non-developer, step-by-step OVHcloud guide (Docker +
+#    PostgreSQL + HTTPS). The ops/ folder holds docker-compose.yml,
+#    docker-compose.dev.yml, Caddyfile and .env.example.
+#
 # This script documents how to:
 #   1. Build the Windows .exe (Electron desktop app)
 #   2. Build the Android .apk (Capacitor mobile app)
-#   3. Self-host the full stack (API + Web + Database)
+#   3. Self-host the full stack (→ superseded by DEPLOYMENT.md)
 #
 # ============================================================================
 
@@ -40,7 +45,7 @@
 # 1. Build the Next.js static export first:
 #
 #    cd apps/web
-#    DATABASE_URL="file:../../packages/db/data/custom.db" bun run build
+#    bun run build
 #    cd ../..
 #
 # 2. Build the Electron app:
@@ -95,7 +100,7 @@
 # 1. Build the Next.js static export:
 #
 #    cd apps/web
-#    DATABASE_URL="file:../../packages/db/data/custom.db" bun run build
+#    bun run build
 #    cd ../..
 #
 # 2. Sync web files to Capacitor:
@@ -152,68 +157,18 @@
 # ============================================================================
 
 # ============================================================================
-# SECTION 4: SELF-HOST THE FULL STACK (Recommended)
+# SECTION 4: SELF-HOST THE FULL STACK
 # ============================================================================
 #
-# BLASTI is designed as a local-first, offline-capable system.
-# Self-hosting is the recommended deployment approach because:
-#   - Socket.IO needs persistent WebSocket connections
-#   - SQLite database requires persistent filesystem
-#   - Offline-first architecture works best with a dedicated server
+# ⭐ SUPERSEDED — see DEPLOYMENT.md at the repository root for the maintained
+#    OVHcloud deployment guide (Docker Compose + PostgreSQL 16 + Caddy HTTPS).
 #
-# --- Quick Start (VPS / Dedicated Server) ---
+# Quick version:
+#   cd ops && cp .env.example .env   # then edit .env
+#   docker compose up -d --build
 #
-# 1. Set up your server:
-#    apt update && apt install -y curl
-#    curl -fsSL https://bun.sh/install | bash
-#
-# 2. Clone and install:
-#    git clone <your-repo> /opt/blasti
-#    cd /opt/blasti
-#    bun install
-#
-# 3. Initialize database:
-#    bun run db:push
-#    bun run db:seed
-#
-# 4. Build the frontend:
-#    cd apps/web && DATABASE_URL="file:../../packages/db/data/custom.db" bun run build && cd ../..
-#
-# 5. Start with pm2:
-#    npm install -g pm2
-#    pm2 start "bun run dev:api" --name blasti-api
-#    pm2 start "bun run dev:web" --name blasti-web
-#    pm2 save && pm2 startup
-#
-# 6. Set up Caddy as reverse proxy (config in ops/Caddyfile):
-#    apt install -y caddy
-#    cp ops/Caddyfile /etc/caddy/Caddyfile
-#    # Edit the domain name in the Caddyfile
-#    systemctl restart caddy
-#
-# --- Docker Compose (Alternative) ---
-#
-# Create a Dockerfile:
-#
-#    FROM oven/bun:1
-#    WORKDIR /app
-#    COPY . .
-#    RUN bun install
-#    RUN bun run db:push
-#    RUN cd apps/web && DATABASE_URL="file:../../packages/db/data/custom.db" bun run build
-#    EXPOSE 3000 3003
-#    CMD ["sh", "-c", "bun run dev:api & bun run dev:web"]
-#
-# --- Cloud Platforms ---
-#
-# | Platform    | Socket.IO | SQLite | Cost     | Notes                    |
-# |-------------|-----------|--------|----------|--------------------------|
-# | Railway     | ✅        | ⚠️*    | Free+    | *Use attached volume     |
-# | Fly.io      | ✅        | ⚠️*    | Free+    | *Use persistent volume   |
-# | Render      | ✅        | ❌     | $7/mo+   | Need external DB         |
-# | DigitalOcean| ✅        | ✅     | $5/mo+   | Full VPS control         |
-# | Hetzner     | ✅        | ✅     | €4/mo+   | Best value VPS           |
-#
+# ============================================================================
+
 # ============================================================================
 
 echo "BLASTI Deployment Guide"

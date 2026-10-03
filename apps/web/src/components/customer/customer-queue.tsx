@@ -211,7 +211,9 @@ export function CustomerQueue() {
         // Detect status changes to CALLED
         list.forEach((r: Reservation) => {
           if (prevStatusRef.current[r.id] && prevStatusRef.current[r.id] !== r.status && r.status === 'CALLED') {
-            if (!soundStartedRef.current && !isReservationConfirmed(r.id)) {
+            // Task 24: also respect the persisted sleep state — a dismissed alert
+            // must not re-trigger (shouldShowAlert reads localStorage)
+            if (!soundStartedRef.current && !isReservationConfirmed(r.id) && shouldShowAlert(r.id)) {
               soundStartedRef.current = true;
               if (!soundMuted) {
                 startNotificationSound(r.id);
@@ -259,7 +261,11 @@ export function CustomerQueue() {
         } catch { /* ignore */ }
 
         // Check for unconfirmed CALLED
-        const unconfirmedCalled = list.find((r: Reservation) => r.status === 'CALLED' && !isReservationConfirmed(r.id));
+        // Task 24: shouldShowAlert (persisted sleep state) prevents a dismissed
+        // alert from RE-TRIGGERING after a page reload — the in-memory
+        // isReservationConfirmed set is empty again after a reload, which used
+        // to fire the alarm + confetti for a turn the customer already saw.
+        const unconfirmedCalled = list.find((r: Reservation) => r.status === 'CALLED' && !isReservationConfirmed(r.id) && shouldShowAlert(r.id));
         if (unconfirmedCalled && !soundStartedRef.current) {
           soundStartedRef.current = true;
           if (!soundMuted) {

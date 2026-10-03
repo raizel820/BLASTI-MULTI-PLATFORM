@@ -5,14 +5,25 @@
  * (inside Electron's userData directory). This is completely independent from
  * the cloud API's database.
  *
+ * ⠀SCHEMA (desktop vs cloud) — IMPORTANT since the PostgreSQL migration:
+ * The SHARED monorepo schema (packages/db/prisma/schema.prisma) is now
+ * provider "postgresql" — its generated client REJECTS the local `file:`
+ * URL. The desktop therefore builds its client from its OWN schema:
+ * apps/desktop/prisma/schema.prisma (provider "sqlite", identical models)
+ * into apps/desktop/prisma/generated/client. That dir is resolution
+ * candidate #1 below; the workspace PostgreSQL client is only a last
+ * resort. Never copy a desktop-generated client into
+ * node_modules/.prisma/client — it would break the cloud API.
+ *
  * On first startup, automatically pushes the Prisma schema to create tables.
  *
  * Module resolution: In bun workspaces, @prisma/client is hoisted via symlinks
  * that may not work with Electron's Node.js require() on Windows. This module:
- *   1. Tries multiple paths to find the Prisma client runtime
+ *   1. Tries multiple paths to find the Prisma client runtime (desktop client
+ *      FIRST, then the shared one as a legacy fallback)
  *   2. Uses fs.realpathSync() to resolve bun symlinks to real paths
- *   3. If not found, auto-generates the client using the locally-installed prisma CLI
- *   4. Copies the generated output to a stable directory (no symlinks)
+ *   3. If the desktop client is missing, auto-generates it from the desktop
+ *      schema using the locally-installed prisma CLI
  *
  * IMPORTANT: Inside Electron, process.execPath points to the Electron binary,
  * NOT Node.js. We must NEVER use process.execPath to run CLI tools like prisma,
@@ -31,14 +42,28 @@ const { execFileSync } = require('child_process')
 const MONOREPO_ROOT = path.resolve(__dirname, '../../../../')
 
 /**
- * The prisma schema shared by the whole monorepo.
+ * The prisma schema shared by the whole monorepo (PostgreSQL — cloud only).
+ * KEPT for diagnostics/export compatibility; the desktop uses DESKTOP_SCHEMA_PATH.
  */
 const SCHEMA_PATH = path.join(MONOREPO_ROOT, 'packages', 'db', 'prisma', 'schema.prisma')
 
 /**
- * Stable output directory for the generated Prisma client.
- * After `prisma generate`, we copy the generated files here so that
- * Electron's require() never needs to follow symlinks.
+ * The DESKTOP schema — SQLite provider, identical models. Lives inside the
+ * desktop app so packaging (electron-builder `files`) ships it too.
+ */
+const DESKTOP_SCHEMA_PATH = path.join(MONOREPO_ROOT, 'apps', 'desktop', 'prisma', 'schema.prisma')
+
+/**
+ * Stable output directory for the DESKTOP-generated Prisma client
+ * (explicit generator `output` in the desktop schema — no copying needed,
+ * no symlinks, never touches node_modules/.prisma/client).
+ */
+const DESKTOP_GENERATED_CLIENT_DIR = path.join(MONOREPO_ROOT, 'apps', 'desktop', 'prisma', 'generated', 'client')
+
+/**
+ * Legacy output dir (pre-PostgreSQL era): the shared client used to be
+ * copied here. Kept ONLY as a low-priority resolution candidate so databases
+ * prepared by older builds keep working.
  */
 const GENERATED_CLIENT_DIR = path.join(MONOREPO_ROOT, 'node_modules', '.prisma', 'client')
 
@@ -238,26 +263,29 @@ function runPrismaCommand(args, opts = {}) {
 // ─── Auto-Generate Prisma Client (if missing) ─────────────────────────────
 
 /**
- * Run `prisma generate` using the locally installed CLI (v6.x).
- * Then copies the generated output to GENERATED_CLIENT_DIR.
+ * Run `prisma generate` for the DESKTOP SQLite schema using the locally
+ * installed CLI (v6.x). The schema's generator block has an explicit
+ * `output`, so the client lands in DESKTOP_GENERATED_CLIENT_DIR directly —
+ * nothing is ever copied into node_modules/.prisma/client (that dir holds
+ * the workspace PostgreSQL client and must stay untouched).
  *
  * Returns true on success, false on failure.
  */
 function generatePrismaClient() {
-  if (!fs.existsSync(SCHEMA_PATH)) {
-    console.error('[local-api:db] Schema not found:', SCHEMA_PATH)
+  if (!fs.existsSync(DESKTOP_SCHEMA_PATH)) {
+    console.error('[local-api:db] Desktop schema not found:', DESKTOP_SCHEMA_PATH)
     return false
   }
 
-  console.log(`[local-api:db] Auto-generating Prisma client ...`)
-  console.log(`[local-api:db] Schema: ${SCHEMA_PATH}`)
+  console.log('[local-api:db] Auto-generating the DESKTOP SQLite Prisma client ...')
+  console.log(`[local-api:db] Schema: ${DESKTOP_SCHEMA_PATH}`)
 
   const result = runPrismaCommand([
     'generate',
-    `--schema=${SCHEMA_PATH}`,
+    `--schema=${DESKTOP_SCHEMA_PATH}`,
   ], {
-    cwd: path.join(MONOREPO_ROOT, 'packages', 'db'),
-    timeout: 60000,
+    cwd: path.join(MONOREPO_ROOT, 'apps', 'desktop'),
+    timeout: 120000,
   })
 
   if (!result.success) {
@@ -272,22 +300,13 @@ function generatePrismaClient() {
     }
   }
 
-  // Find where the generated files landed (prisma outputs the path in the result)
-  // Then copy them to our stable GENERATED_CLIENT_DIR
-  const sourceDir = findGeneratedClientDir()
-  if (sourceDir) {
-    copyDirRecursive(sourceDir, GENERATED_CLIENT_DIR)
-    console.log(`[local-api:db] Copied generated client to ${GENERATED_CLIENT_DIR}`)
-    return fs.existsSync(path.join(GENERATED_CLIENT_DIR, 'index.js'))
-  }
-
-  // Fallback: the output might already be at the default location
-  return true
+  return fs.existsSync(path.join(DESKTOP_GENERATED_CLIENT_DIR, 'index.js'))
 }
 
 /**
  * Find the directory where `prisma generate` just placed the output.
- * Scans bun's hoist cache for @prisma+client dirs that contain generated files.
+ * (Legacy helper — kept for diagnostics only; the desktop schema's explicit
+ * `output` makes the destination deterministic.)
  */
 function findGeneratedClientDir() {
   const bunDir = path.join(MONOREPO_ROOT, 'node_modules', '.bun')
@@ -314,36 +333,17 @@ function findGeneratedClientDir() {
   return null
 }
 
-/**
- * Recursively copy a directory. Overwrites existing files.
- */
-function copyDirRecursive(src, dest) {
-  if (!fs.existsSync(dest)) {
-    fs.mkdirSync(dest, { recursive: true })
-  }
-
-  const entries = scanDir(src)
-  for (const entry of entries) {
-    const srcPath = path.join(src, entry)
-    const destPath = path.join(dest, entry)
-    const stat = fs.statSync(srcPath)
-
-    if (stat.isDirectory()) {
-      copyDirRecursive(srcPath, destPath)
-    } else {
-      fs.copyFileSync(srcPath, destPath)
-    }
-  }
-}
-
 // ─── Robust PrismaClient Resolution ───────────────────────────────────────
 // Strategy:
-//   1. Stable generated dir (GENERATED_CLIENT_DIR) — no symlinks
-//   2. Standard @prisma/client resolution
-//   3. Monorepo root node_modules
-//   4. Bun's hoisted cache — with realpathSync to resolve symlinks
-//   5. Electron production resources
-//   6. If nothing works → auto-generate → retry
+//   1. DESKTOP-generated client (apps/desktop/prisma/generated/client) —
+//      SQLite schema, stable dir, no symlinks — THE one the local DB needs
+//   2. Legacy stable dir (node_modules/.prisma/client) — pre-PostgreSQL builds
+//   3. Standard @prisma/client resolution (workspace PostgreSQL client —
+//      LAST resort: rejects the local file: URL, only useful to fail legibly)
+//   4. Monorepo root node_modules
+//   5. Bun's hoisted cache — with realpathSync to resolve symlinks
+//   6. Electron production resources
+//   7. If the desktop client is missing → auto-generate → retry
 
 let PrismaClient = null
 let prismaRequireError = null
@@ -354,17 +354,19 @@ let prismaRequireError = null
  */
 function tryResolvePrismaClient() {
   const candidatePaths = [
-    // 1. Stable generated client dir (most reliable — no symlinks)
+    // 1. DESKTOP-generated SQLite client (the correct one for the local DB)
+    DESKTOP_GENERATED_CLIENT_DIR,
+    // 2. Legacy stable dir (older builds copied the shared client here)
     GENERATED_CLIENT_DIR,
-    // 2. Standard Node.js resolution
+    // 3. Standard Node.js resolution (workspace PostgreSQL client — last resort)
     '@prisma/client',
-    // 3. Monorepo root node_modules
+    // 4. Monorepo root node_modules
     path.join(MONOREPO_ROOT, 'node_modules', '@prisma', 'client'),
-    // 4. packages/db own node_modules (bun workspace may install here)
+    // 5. packages/db own node_modules (bun workspace may install here)
     path.join(MONOREPO_ROOT, 'packages', 'db', 'node_modules', '@prisma', 'client'),
-    // 5. Electron production resources
+    // 6. Electron production resources
     path.join(process.resourcesPath || '', 'node_modules', '@prisma', 'client'),
-    // 6. App directory (electron-builder asar unpacked)
+    // 7. App directory (electron-builder asar unpacked)
     path.join(path.dirname(process.execPath), '..', 'resources', 'app.asar.unpacked', 'node_modules', '@prisma', 'client'),
   ]
 
@@ -405,6 +407,15 @@ function tryResolvePrismaClient() {
 }
 
 // ── First attempt ──────────────────────────────────────────────────────────
+// If the DESKTOP SQLite client has never been generated, generate it now —
+// even when some other PrismaClient (e.g. the workspace PostgreSQL client)
+// resolves, because that client REJECTS the local `file:` URL at first query
+// with "the URL must start with the protocol postgresql://". Generation runs
+// once (~seconds) and is cached on disk for every later boot.
+if (!fs.existsSync(path.join(DESKTOP_GENERATED_CLIENT_DIR, 'index.js'))) {
+  console.warn('[local-api:db] Desktop SQLite client not generated yet — generating once ...')
+  generatePrismaClient()
+}
 PrismaClient = tryResolvePrismaClient()
 
 // ── Auto-generate if not found ─────────────────────────────────────────────
@@ -417,10 +428,10 @@ if (!PrismaClient) {
 
   if (!PrismaClient) {
     prismaRequireError = new Error(
-      'Cannot find or generate @prisma/client module.\n' +
+      'Cannot find or generate the desktop Prisma client.\n' +
       'Auto-generation was attempted but failed.\n' +
-      'Please run manually:\n' +
-      '  cd packages/db && npx prisma generate'
+      'Please run manually at the monorepo root:\n' +
+      '  bun run db:generate:desktop'
     )
     console.error('[local-api:db]', prismaRequireError.message)
   }
@@ -742,6 +753,8 @@ module.exports = {
   get DATABASE_URL() { return resolvedDatabaseUrl },
   get DB_PATH() { return resolvedDbPath },
   get DB_DIR() { return resolvedDbDir },
+  DESKTOP_SCHEMA_PATH,
+  DESKTOP_GENERATED_CLIENT_DIR,
   GENERATED_CLIENT_DIR,
   SCHEMA_PATH,
 }

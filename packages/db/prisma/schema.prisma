@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -69,6 +69,7 @@ model User {
   auditLogs               AuditLog[]
   favorites               Favorite[]
   notifications           Notification[]
+  supportTickets          SupportTicket[]
   reservations            Reservation[]
   smsPurchases            SmsPurchase[]
   managedTransactions     Transaction[]  @relation("ReviewedBy")
@@ -281,6 +282,7 @@ model Agency {
   branches              Branch[]
   staff                 AgencyStaff[]
   announcements         Announcement[]
+  supportTickets        SupportTicket[]
   favorites             Favorite[]
   queueSettings         QueueSettings[]
   reservations          Reservation[]
@@ -658,6 +660,36 @@ model Notification {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt @default(now())
   user      User     @relation(fields: [userId], references: [id])
+}
+
+/// Support tickets: customers AND agencies send complaints, suggestions,
+/// questions and notes to the super admin. agencyId is nullable — customer
+/// tickets have no agency (they stay cloud-side; agency tickets sync to the
+/// owning agency's desktops). v1 thread = single admin reply on the ticket.
+model SupportTicket {
+  id          String    @id @default(cuid())
+  userId      String
+  agencyId    String?
+  subject     String
+  /// QUESTION | COMPLAINT | SUGGESTION | NOTE
+  category    String    @default("QUESTION")
+  /// OPEN | IN_PROGRESS | RESOLVED | CLOSED
+  status      String    @default("OPEN")
+  /// LOW | NORMAL | HIGH
+  priority    String    @default("NORMAL")
+  message     String
+  reply       String?
+  repliedAt   DateTime?
+  /// Admin userId who replied (plain string — no relation, admin is cloud-side)
+  repliedBy   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt @default(now())
+  user        User      @relation(fields: [userId], references: [id])
+  agency      Agency?   @relation(fields: [agencyId], references: [id])
+
+  @@index([userId, createdAt])
+  @@index([agencyId, createdAt])
+  @@index([status, createdAt])
 }
 
 model Favorite {

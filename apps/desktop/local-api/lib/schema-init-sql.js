@@ -1,36 +1,29 @@
 // AUTO-GENERATED from packages/db/prisma/schema.prisma via
 // `prisma migrate diff --from-empty --to-schema-datamodel`.
 // DO NOT EDIT BY HAND — regenerate instead (see lib/schema-migrations.js).
-// This is the authoritative first-creation DDL for the desktop local SQLite,
-// including the protected sync infrastructure tables (_sync_meta,
-// _sync_conflicts, _pending_mutations, _sync_applied_mutations,
-// _deferred_changes), the v2 retry/deferred columns, and the local-only
-// LocalDeviceCredential table (desktop unlock verifier, never synced).
-// User.passwordHash is NULLABLE as of schema v2: the cloud sync feed never
-// sends auth secrets — synced profiles keep NULL and desktop unlock uses
-// LocalDeviceCredential.
-module.exports = `-- CreateTable
+// This is the authoritative first-creation DDL for the desktop local SQLite.
+// The sync-infrastructure tables (_sync_meta, _sync_conflicts,
+// _pending_mutations, _sync_applied_mutations, _deferred_changes) are
+// hand-maintained below the generated section (runtime equivalents live in
+// schema-migrations.js SYNC_INFRA_DDL).
+module.exports = `
+-- CreateTable
 CREATE TABLE "User" (
     "id" TEXT NOT NULL PRIMARY KEY,
     "username" TEXT NOT NULL,
     "fullName" TEXT NOT NULL,
     "email" TEXT,
     "phoneNumber" TEXT,
-    -- Task 5: Algeria address selectors (manual sync from the shared
-    -- schema.prisma User model — the ensureSchema column top-up auto-adds
-    -- these to pre-existing local DBs from this DDL).
-    "wilaya" TEXT,
-    "commune" TEXT,
     "shortAppId" TEXT,
     "passwordHash" TEXT,
     "role" TEXT NOT NULL DEFAULT 'CUSTOMER',
     "language" TEXT NOT NULL DEFAULT 'ar',
     "avatarUrl" TEXT,
+    "wilaya" TEXT,
+    "commune" TEXT,
     "avatarStorageProvider" TEXT,
     "avatarStorageKey" TEXT,
     "freeSmsCount" INTEGER NOT NULL DEFAULT 10,
-    -- Task 22: email/phone verification flags (kept in sync with the cloud
-    -- schema.prisma User model — the shared Prisma client expects them).
     "emailVerified" BOOLEAN NOT NULL DEFAULT false,
     "phoneVerified" BOOLEAN NOT NULL DEFAULT false,
     "notificationPreferences" TEXT NOT NULL DEFAULT '{"queue_called":true,"turn_approaching":true,"completed":true}',
@@ -41,6 +34,62 @@ CREATE TABLE "User" (
     "fcmToken" TEXT,
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "lastRoleChangeAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL
+);
+
+-- CreateTable
+CREATE TABLE "VerificationCode" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "userId" TEXT NOT NULL,
+    "purpose" TEXT NOT NULL,
+    "channel" TEXT NOT NULL,
+    "target" TEXT NOT NULL,
+    "codeHash" TEXT NOT NULL,
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "maxAttempts" INTEGER NOT NULL DEFAULT 5,
+    "expiresAt" DATETIME NOT NULL,
+    "consumedAt" DATETIME,
+    "requestIp" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL,
+    CONSTRAINT "VerificationCode_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- CreateTable
+CREATE TABLE "ProviderConfig" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "channel" TEXT NOT NULL,
+    "provider" TEXT NOT NULL,
+    "enabled" BOOLEAN NOT NULL DEFAULT false,
+    "apiKey" TEXT NOT NULL DEFAULT '',
+    "senderId" TEXT NOT NULL DEFAULT '',
+    "phoneNumberId" TEXT NOT NULL DEFAULT '',
+    "accountId" TEXT NOT NULL DEFAULT '',
+    "apiUrl" TEXT NOT NULL DEFAULT '',
+    "extraConfig" TEXT NOT NULL DEFAULT '{}',
+    "lastTestAt" DATETIME,
+    "lastTestOk" BOOLEAN,
+    "lastTestError" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL
+);
+
+-- CreateTable
+CREATE TABLE "NotificationTemplate" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "key" TEXT NOT NULL,
+    "channel" TEXT NOT NULL,
+    "language" TEXT NOT NULL DEFAULT 'en',
+    "name" TEXT NOT NULL,
+    "subject" TEXT,
+    "body" TEXT NOT NULL,
+    "htmlBody" TEXT,
+    "variables" TEXT NOT NULL DEFAULT '[]',
+    "useProviderTemplate" BOOLEAN NOT NULL DEFAULT false,
+    "providerTemplateId" TEXT,
+    "providerTemplateLang" TEXT,
+    "enabled" BOOLEAN NOT NULL DEFAULT true,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
 );
@@ -94,8 +143,6 @@ CREATE TABLE "Agency" (
     "subscriptionStatus" TEXT NOT NULL DEFAULT 'INACTIVE',
     "workingHoursStart" TEXT NOT NULL DEFAULT '08:00',
     "workingHoursEnd" TEXT NOT NULL DEFAULT '17:00',
-    -- Round 15: working days CSV (0=Sunday … 6=Saturday) — rides with the
-    -- working hours through the v2 sync engine.
     "workingDays" TEXT NOT NULL DEFAULT '1,2,3,4,5',
     "isQueueOpen" BOOLEAN NOT NULL DEFAULT true,
     "isActive" BOOLEAN NOT NULL DEFAULT true,
@@ -105,9 +152,6 @@ CREATE TABLE "Agency" (
     "gracePeriodEndsAt" DATETIME,
     "subscriptionStartsAt" DATETIME,
     "subscriptionExpiresAt" DATETIME,
-    -- Task 51: map/location columns (manual sync from the shared
-    -- schema.prisma Agency model — the ensureSchema column top-up auto-adds
-    -- these to pre-existing local DBs from this DDL).
     "latitude" REAL,
     "longitude" REAL,
     "postalCode" TEXT,
@@ -276,10 +320,6 @@ CREATE TABLE "AgencyStaff" (
     "canManageWorkingHours" BOOLEAN NOT NULL DEFAULT false,
     "canExportData" BOOLEAN NOT NULL DEFAULT false,
     "canManageProfile" BOOLEAN NOT NULL DEFAULT false,
-    -- Task 37-d: 2-tier staff authority — normalized boolean columns for the
-    -- new branch-create/delete + subscription-management permissions (kept in
-    -- sync with the cloud schema.prisma AgencyStaff model — the shared Prisma
-    -- client expects them; see the guarded migration in schema-migrations.js).
     "canCreateBranches" BOOLEAN NOT NULL DEFAULT false,
     "canDeleteBranches" BOOLEAN NOT NULL DEFAULT false,
     "canPurchaseSubscription" BOOLEAN NOT NULL DEFAULT false,
@@ -430,6 +470,25 @@ CREATE TABLE "Notification" (
 );
 
 -- CreateTable
+CREATE TABLE "SupportTicket" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "userId" TEXT NOT NULL,
+    "agencyId" TEXT,
+    "subject" TEXT NOT NULL,
+    "category" TEXT NOT NULL DEFAULT 'QUESTION',
+    "status" TEXT NOT NULL DEFAULT 'OPEN',
+    "priority" TEXT NOT NULL DEFAULT 'NORMAL',
+    "message" TEXT NOT NULL,
+    "reply" TEXT,
+    "repliedAt" DATETIME,
+    "repliedBy" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "SupportTicket_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT "SupportTicket_agencyId_fkey" FOREIGN KEY ("agencyId") REFERENCES "Agency" ("id") ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+-- CreateTable
 CREATE TABLE "Favorite" (
     "id" TEXT NOT NULL PRIMARY KEY,
     "userId" TEXT NOT NULL,
@@ -544,7 +603,7 @@ CREATE TABLE "FAQ" (
     "updatedAt" DATETIME NOT NULL
 );
 
--- CreateTable (Task 42-a: user-created agency fields/industries — shared dictionary)
+-- CreateTable
 CREATE TABLE "AgencyCategory" (
     "id" TEXT NOT NULL PRIMARY KEY,
     "name" TEXT NOT NULL,
@@ -556,9 +615,6 @@ CREATE TABLE "AgencyCategory" (
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
 );
-
--- CreateIndex
-CREATE UNIQUE INDEX "AgencyCategory_name_key" ON "AgencyCategory"("name");
 
 -- CreateTable
 CREATE TABLE "PaymentSettings" (
@@ -602,10 +658,6 @@ CREATE TABLE "Counter" (
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "branchId" TEXT NOT NULL,
     "staffId" TEXT,
-    -- Task 37-d: counter OCCUPATION timestamp — Counter.staffId is repurposed
-    -- as "occupied by" (the occupying AgencyStaff row, or NULL for an
-    -- owner-held counter) and occupiedAt records WHEN it was occupied.
-    -- Nullable; set by POST /api/agency/counters/:id/occupy, cleared by release.
     "occupiedAt" DATETIME,
     "currentReservationId" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -641,44 +693,6 @@ CREATE TABLE "UploadedFile" (
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
--- CreateTable
--- Round 15: desktop file store registry — one row per locally stored file
--- (blob lives under the local files dir; lib/file-sync.js mirrors it with the
--- cloud FileAsset table). syncState: LOCAL_ONLY | DIRTY | SYNCED | DELETED.
-CREATE TABLE "FileAsset" (
-    "id" TEXT NOT NULL PRIMARY KEY,
-    "deviceFileId" TEXT NOT NULL,
-    "bucket" TEXT NOT NULL,
-    "storagePath" TEXT NOT NULL,
-    "originalName" TEXT,
-    "mimeType" TEXT,
-    "size" INTEGER NOT NULL DEFAULT 0,
-    "checksum" TEXT,
-    "url" TEXT NOT NULL,
-    "ownerId" TEXT,
-    "agencyId" TEXT,
-    "syncState" TEXT NOT NULL DEFAULT 'LOCAL_ONLY',
-    "remoteFileId" TEXT,
-    "remoteUrl" TEXT,
-    "syncedAt" DATETIME,
-    "lastError" TEXT,
-    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" DATETIME NOT NULL,
-    "deletedAt" DATETIME
-);
-
--- CreateIndex
-CREATE UNIQUE INDEX "FileAsset_deviceFileId_key" ON "FileAsset"("deviceFileId");
-
--- CreateIndex
-CREATE INDEX "FileAsset_updatedAt_idx" ON "FileAsset"("updatedAt");
-
--- CreateIndex
-CREATE INDEX "FileAsset_ownerId_idx" ON "FileAsset"("ownerId");
-
--- CreateIndex
-CREATE INDEX "FileAsset_agencyId_idx" ON "FileAsset"("agencyId");
 
 -- CreateTable
 CREATE TABLE "DeletedRecord" (
@@ -879,6 +893,354 @@ CREATE TABLE "AgencyLocalState" (
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
 );
+
+-- CreateTable
+CREATE TABLE "_sync_meta" (
+    "key" TEXT NOT NULL PRIMARY KEY,
+    "value" TEXT NOT NULL
+);
+
+-- CreateTable
+CREATE TABLE "_sync_conflicts" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "modelName" TEXT NOT NULL,
+    "recordId" TEXT NOT NULL,
+    "agencyId" TEXT,
+    "localVersion" BIGINT,
+    "cloudVersion" BIGINT,
+    "localData" TEXT,
+    "cloudData" TEXT,
+    "resolution" TEXT DEFAULT 'pending',
+    "resolvedAt" BIGINT,
+    "createdAt" BIGINT NOT NULL
+);
+
+-- CreateTable
+CREATE TABLE "_pending_mutations" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "method" TEXT NOT NULL,
+    "path" TEXT NOT NULL,
+    "body" TEXT,
+    "headers" TEXT,
+    "status" TEXT NOT NULL DEFAULT 'pending',
+    "attempts" INTEGER NOT NULL DEFAULT 0,
+    "max_attempts" INTEGER NOT NULL DEFAULT 5,
+    "created_at" BIGINT NOT NULL,
+    "last_attempt_at" BIGINT,
+    "next_retry_at" BIGINT,
+    "last_http_status" INTEGER,
+    "last_error" TEXT,
+    "response_data" TEXT,
+    "idempotency_key" TEXT
+);
+
+-- CreateTable
+CREATE TABLE "_sync_applied_mutations" (
+    "key" TEXT NOT NULL PRIMARY KEY,
+    "appliedAt" BIGINT NOT NULL
+);
+
+-- CreateTable
+CREATE TABLE "_deferred_changes" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "agencyId" TEXT NOT NULL,
+    "source" TEXT NOT NULL DEFAULT 'pull',
+    "sequence" INTEGER,
+    "stage" TEXT,
+    "model" TEXT NOT NULL,
+    "recordId" TEXT NOT NULL,
+    "operation" TEXT NOT NULL,
+    "payload" TEXT,
+    "dependencyError" TEXT,
+    "retryCount" INTEGER NOT NULL DEFAULT 0,
+    "firstSeenAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "lastRetryAt" DATETIME,
+    "nextRetryAt" DATETIME,
+    "status" TEXT NOT NULL DEFAULT 'PENDING',
+    "lastError" TEXT
+);
+
+-- CreateTable
+CREATE TABLE "FileAsset" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "deviceFileId" TEXT NOT NULL,
+    "bucket" TEXT NOT NULL,
+    "storagePath" TEXT NOT NULL,
+    "originalName" TEXT,
+    "mimeType" TEXT,
+    "size" INTEGER NOT NULL DEFAULT 0,
+    "checksum" TEXT,
+    "url" TEXT NOT NULL,
+    "ownerId" TEXT,
+    "agencyId" TEXT,
+    "syncState" TEXT NOT NULL DEFAULT 'LOCAL_ONLY',
+    "remoteFileId" TEXT,
+    "remoteUrl" TEXT,
+    "syncedAt" DATETIME,
+    "lastError" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL,
+    "deletedAt" DATETIME
+);
+
+-- CreateTable
+CREATE TABLE "DataUsageEvent" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "uploadBytes" INTEGER NOT NULL DEFAULT 0,
+    "downloadBytes" INTEGER NOT NULL DEFAULT 0,
+    "networkType" TEXT NOT NULL DEFAULT 'UNKNOWN',
+    "trafficType" TEXT NOT NULL DEFAULT 'API',
+    "method" TEXT,
+    "path" TEXT,
+    "status" INTEGER,
+    "userId" TEXT,
+    "agencyId" TEXT,
+    "deviceId" TEXT,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "User_username_key" ON "User"("username");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "User_email_key" ON "User"("email");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "User_phoneNumber_key" ON "User"("phoneNumber");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "User_shortAppId_key" ON "User"("shortAppId");
+
+-- CreateIndex
+CREATE INDEX "VerificationCode_userId_purpose_idx" ON "VerificationCode"("userId", "purpose");
+
+-- CreateIndex
+CREATE INDEX "VerificationCode_target_idx" ON "VerificationCode"("target");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ProviderConfig_channel_key" ON "ProviderConfig"("channel");
+
+-- CreateIndex
+CREATE INDEX "NotificationTemplate_channel_idx" ON "NotificationTemplate"("channel");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "NotificationTemplate_key_channel_language_key" ON "NotificationTemplate"("key", "channel", "language");
+
+-- CreateIndex
+CREATE INDEX "LocalDeviceCredential_userId_idx" ON "LocalDeviceCredential"("userId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "LocalDeviceCredential_userId_deviceId_key" ON "LocalDeviceCredential"("userId", "deviceId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Agency_customCode_key" ON "Agency"("customCode");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SubscriptionPlan_name_key" ON "SubscriptionPlan"("name");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "PlanFeature_planId_featureKey_key" ON "PlanFeature"("planId", "featureKey");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "HardwareProduct_name_key" ON "HardwareProduct"("name");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "HardwareCommitmentTier_months_key" ON "HardwareCommitmentTier"("months");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "AgencyStaff_userId_agencyId_key" ON "AgencyStaff"("userId", "agencyId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Service_agencyId_name_key" ON "Service"("agencyId", "name");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Reservation_importToken_key" ON "Reservation"("importToken");
+
+-- CreateIndex
+CREATE INDEX "Reservation_agencyId_status_queueNumber_idx" ON "Reservation"("agencyId", "status", "queueNumber");
+
+-- CreateIndex
+CREATE INDEX "Reservation_agencyId_serviceId_status_idx" ON "Reservation"("agencyId", "serviceId", "status");
+
+-- CreateIndex
+CREATE INDEX "Reservation_userId_status_idx" ON "Reservation"("userId", "status");
+
+-- CreateIndex
+CREATE INDEX "SupportTicket_userId_createdAt_idx" ON "SupportTicket"("userId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "SupportTicket_agencyId_createdAt_idx" ON "SupportTicket"("agencyId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "SupportTicket_status_createdAt_idx" ON "SupportTicket"("status", "createdAt");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Favorite_userId_agencyId_key" ON "Favorite"("userId", "agencyId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Review_reservationId_key" ON "Review"("reservationId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Review_userId_agencyId_key" ON "Review"("userId", "agencyId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "AgencyCategory_name_key" ON "AgencyCategory"("name");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Counter_currentReservationId_key" ON "Counter"("currentReservationId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "DeviceRegistration_userId_deviceId_key" ON "DeviceRegistration"("userId", "deviceId");
+
+-- CreateIndex
+CREATE INDEX "UploadedFile_storageProvider_idx" ON "UploadedFile"("storageProvider");
+
+-- CreateIndex
+CREATE INDEX "UploadedFile_storageKey_idx" ON "UploadedFile"("storageKey");
+
+-- CreateIndex
+CREATE INDEX "DeletedRecord_modelName_deletedAt_idx" ON "DeletedRecord"("modelName", "deletedAt");
+
+-- CreateIndex
+CREATE INDEX "DeletedRecord_recordId_idx" ON "DeletedRecord"("recordId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "system_settings_key_key" ON "system_settings"("key");
+
+-- CreateIndex
+CREATE INDEX "system_settings_category_idx" ON "system_settings"("category");
+
+-- CreateIndex
+CREATE INDEX "system_settings_key_idx" ON "system_settings"("key");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "AgencyDevice_pairingCode_key" ON "AgencyDevice"("pairingCode");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "AgencyDevice_deviceToken_key" ON "AgencyDevice"("deviceToken");
+
+-- CreateIndex
+CREATE INDEX "AgencyDevice_agencyId_idx" ON "AgencyDevice"("agencyId");
+
+-- CreateIndex
+CREATE INDEX "AgencyDevice_status_idx" ON "AgencyDevice"("status");
+
+-- CreateIndex
+CREATE INDEX "AgencyDevice_agencyId_status_idx" ON "AgencyDevice"("agencyId", "status");
+
+-- CreateIndex
+CREATE INDEX "AgencyDevice_pairingCode_idx" ON "AgencyDevice"("pairingCode");
+
+-- CreateIndex
+CREATE INDEX "AgencyDevice_deviceToken_idx" ON "AgencyDevice"("deviceToken");
+
+-- CreateIndex
+CREATE INDEX "AgencyDevice_lastHeartbeatAt_idx" ON "AgencyDevice"("lastHeartbeatAt");
+
+-- CreateIndex
+CREATE INDEX "AgencyDevice_deviceFingerprint_idx" ON "AgencyDevice"("deviceFingerprint");
+
+-- CreateIndex
+CREATE INDEX "SavedTv_agencyId_idx" ON "SavedTv"("agencyId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SavedTv_agencyId_ip_key" ON "SavedTv"("agencyId", "ip");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "DefaultPrinter_agencyId_key" ON "DefaultPrinter"("agencyId");
+
+-- CreateIndex
+CREATE INDEX "DefaultPrinter_agencyId_idx" ON "DefaultPrinter"("agencyId");
+
+-- CreateIndex
+CREATE INDEX "DeviceCommand_deviceId_status_idx" ON "DeviceCommand"("deviceId", "status");
+
+-- CreateIndex
+CREATE INDEX "DeviceCommand_createdAt_idx" ON "DeviceCommand"("createdAt");
+
+-- CreateIndex
+CREATE INDEX "AppVersion_platform_idx" ON "AppVersion"("platform");
+
+-- CreateIndex
+CREATE INDEX "AppVersion_isPublished_idx" ON "AppVersion"("isPublished");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "AppVersion_platform_version_key" ON "AppVersion"("platform", "version");
+
+-- CreateIndex
+CREATE INDEX "DelayedJob_status_executeAt_idx" ON "DelayedJob"("status", "executeAt");
+
+-- CreateIndex
+CREATE INDEX "DelayedJob_userId_reservationId_idx" ON "DelayedJob"("userId", "reservationId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SyncChange_sequence_key" ON "SyncChange"("sequence");
+
+-- CreateIndex
+CREATE INDEX "SyncChange_agencyId_sequence_idx" ON "SyncChange"("agencyId", "sequence");
+
+-- CreateIndex
+CREATE INDEX "SyncChange_agencyId_model_recordId_idx" ON "SyncChange"("agencyId", "model", "recordId");
+
+-- CreateIndex
+CREATE INDEX "SyncChange_mutationId_idx" ON "SyncChange"("mutationId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "SyncMutation_idempotencyKey_key" ON "SyncMutation"("idempotencyKey");
+
+-- CreateIndex
+CREATE INDEX "SyncMutation_agencyId_createdAt_idx" ON "SyncMutation"("agencyId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "SyncMutation_status_idx" ON "SyncMutation"("status");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "AgencyLocalState_agencyId_key" ON "AgencyLocalState"("agencyId");
+
+-- CreateIndex
+CREATE INDEX "idx_sync_conflicts_model" ON "_sync_conflicts"("modelName");
+
+-- CreateIndex
+CREATE INDEX "idx_sync_conflicts_resolution" ON "_sync_conflicts"("resolution");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "idx_pending_mutations_idem" ON "_pending_mutations"("idempotency_key");
+
+-- CreateIndex
+CREATE INDEX "idx_pending_mutations_status" ON "_pending_mutations"("status");
+
+-- CreateIndex
+CREATE INDEX "idx_deferred_agency_status" ON "_deferred_changes"("agencyId", "status");
+
+-- CreateIndex
+CREATE INDEX "idx_deferred_status_next" ON "_deferred_changes"("status", "nextRetryAt");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "FileAsset_deviceFileId_key" ON "FileAsset"("deviceFileId");
+
+-- CreateIndex
+CREATE INDEX "FileAsset_updatedAt_idx" ON "FileAsset"("updatedAt");
+
+-- CreateIndex
+CREATE INDEX "FileAsset_ownerId_idx" ON "FileAsset"("ownerId");
+
+-- CreateIndex
+CREATE INDEX "FileAsset_agencyId_idx" ON "FileAsset"("agencyId");
+
+-- CreateIndex
+CREATE INDEX "DataUsageEvent_createdAt_idx" ON "DataUsageEvent"("createdAt");
+
+-- CreateIndex
+CREATE INDEX "DataUsageEvent_agencyId_createdAt_idx" ON "DataUsageEvent"("agencyId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "DataUsageEvent_userId_createdAt_idx" ON "DataUsageEvent"("userId", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "DataUsageEvent_trafficType_idx" ON "DataUsageEvent"("trafficType");
+
+-- CreateIndex
+CREATE INDEX "DataUsageEvent_networkType_idx" ON "DataUsageEvent"("networkType");
 
 -- CreateTable
 CREATE TABLE "_sync_meta" (

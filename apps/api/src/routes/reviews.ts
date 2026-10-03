@@ -49,9 +49,9 @@ app.post('/', async (c) => {
     if (reservationId) {
       await db.reservation.update({ where: { id: reservationId }, data: { rating } })
       try {
-        await db.$executeRaw`UPDATE Reservation SET ratedAt = datetime('now') WHERE id = ${reservationId}`
+        await db.$executeRaw`UPDATE "Reservation" SET "ratedAt" = NOW() WHERE "id" = ${reservationId}`
         if (comment?.trim()) {
-          await db.$executeRaw`UPDATE Reservation SET feedback = ${comment.trim()} WHERE id = ${reservationId}`
+          await db.$executeRaw`UPDATE "Reservation" SET "feedback" = ${comment.trim()} WHERE "id" = ${reservationId}`
         }
         // Spec Part O: $executeRaw writes are invisible to the auto-tracking
         // extension — compensate with an explicit capture so the rating/feed
@@ -137,7 +137,7 @@ app.patch('/:id', async (c) => {
       }
       if (comment !== undefined) {
         try {
-          await db.$executeRaw`UPDATE Reservation SET feedback = ${comment?.trim() || null} WHERE id = ${review.reservationId}`
+          await db.$executeRaw`UPDATE "Reservation" SET "feedback" = ${comment?.trim() || null} WHERE "id" = ${review.reservationId}`
           // Spec Part O: raw-SQL compensation capture.
           await recordSyncChangeNow({ agencyId: review.agencyId, model: 'Reservation', recordId: review.reservationId, operation: 'update' })
         } catch {

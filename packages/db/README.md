@@ -1,7 +1,7 @@
 # @blasti/db — Shared Prisma Database Package
 
 > Single source of truth for database access across the BLASTI monorepo.
-> Uses Prisma ORM with SQLite, plus a Ghost Delete Trap for offline sync.
+> Uses Prisma ORM with **PostgreSQL**, plus a Ghost Delete Trap for offline sync.
 
 ---
 
@@ -28,9 +28,11 @@ bun run db:studio
 
 ## Database
 
-- **Provider:** SQLite
-- **Location:** `packages/db/data/custom.db`
-- **Connection string:** `DATABASE_URL="file:/path/to/packages/db/data/custom.db"`
+- **Provider:** PostgreSQL 16
+- **Local dev:** `docker compose -f ops/docker-compose.dev.yml up -d` (user `blasti` / password `blasti` / database `blasti` on `localhost:5432`)
+- **Production:** OVH VPS via `ops/docker-compose.yml` — connection string set through `ops/.env` (see `DEPLOYMENT.md`)
+- **Connection string:** `DATABASE_URL="postgresql://blasti:blasti@127.0.0.1:5432/blasti?schema=public"`
+- A committed `packages/db/.env` provides that exact dev default to the Prisma CLI, so `bun run db:push` works with zero setup (a real `DATABASE_URL` env var always wins).
 
 ---
 
@@ -48,7 +50,7 @@ const user = await db.user.findUnique({ where: { id: '...' } });
 **Features:**
 - Global caching in development (prevents duplicate PrismaClient on hot-reload)
 - Ghost Delete Trap (Prisma Client Extension)
-- SQLite PRAGMA setup (`busy_timeout = 5000ms`)
+- Startup connectivity check (`setupConnectionPragmas`)
 
 ### Ghost Delete Trap
 
@@ -58,14 +60,19 @@ A Prisma Client Extension intercepts every `delete()` and `deleteMany()` call an
 - **Recursion guard:** `DeletedRecord` model is excluded from tombstone creation
 - **Non-blocking:** Tombstone creation failure never blocks the actual delete
 
-### SQLite PRAGMA Setup
+### Connection Setup (legacy SQLite PRAGMAs are gone)
+
+PostgreSQL handles concurrent writers natively — no PRAGMAs needed. The API
+server calls `setupConnectionPragmas()` at startup, which now just performs a
+one-shot `SELECT 1` so a bad `DATABASE_URL` fails loudly at boot:
 
 ```ts
-import { setupSQLitePragmas } from '@blasti/db';
+import { setupConnectionPragmas } from '@blasti/db';
 
 // Call once at server startup
-await setupSQLitePragmas(); // Sets busy_timeout = 5000ms
+await setupConnectionPragmas();
 ```
+`setupSQLitePragmas` remains exported as a deprecated alias.
 
 ---
 
@@ -387,9 +394,9 @@ Tombstone table for WatermelonDB offline sync. Created automatically by the Ghos
 
 ---
 
-## Enums (String Constants)
+## Enums
 
-Since SQLite doesn't support native ENUM types, all enum-like fields use string constants defined in `@blasti/db` (and mirrored in `apps/api/src/lib/enums.ts`):
+Prisma-native enums live in `schema.prisma` (e.g. `NotificationPref`, `JobStatus`); all other enum-like fields intentionally use string constants defined in `@blasti/db` (mirrored in `apps/api/src/lib/enums.ts`) so the WatermelonDB offline sync stays byte-exact across platforms:
 
 | Enum | Values |
 |---|---|
@@ -449,10 +456,12 @@ Run `bun run db:seed` to populate the database with test data:
 ```
 packages/db/
 ├── package.json           → NPM package config (@blasti/db)
+├── .env                   → COMMITTED dev-default DATABASE_URL for the Prisma CLI
 ├── index.ts               → Prisma client singleton + Ghost Delete Trap
 ├── prisma/
-│   ├── schema.prisma      → Database schema (all models)
-│   └── seed.ts            → Seed script with test data
+│   ├── schema.prisma      → Database schema (PostgreSQL, all models)
+│   ├── seed.ts            → Full-reset seed (admin + one fresh agency)
+│   └── seed-if-empty.ts   → Idempotent bootstrap seed (used by Docker deploy)
 └── data/
-    └── custom.db          → SQLite database file
+    └── .db-generation.json → Reset-generation marker (runtime, gitignored)
 ```

@@ -108,6 +108,7 @@ const STAGE_DEFINITIONS: StageMeta[] = [
   { id: 'favorites', label: 'Favorites', mandatory: false },
   { id: 'faqs', label: 'FAQs', mandatory: false },
   { id: 'agencyCategories', label: 'Agency Categories', mandatory: false },
+  { id: 'supportTickets', label: 'Support Tickets', mandatory: false },
 ]
 
 const VALID_STAGES = new Set(STAGE_DEFINITIONS.map((s) => s.id))
@@ -412,6 +413,16 @@ async function fetchStageData(
       return { records, hasMore: false, total: records.length }
     }
 
+    // ── Support Tickets (super-admin support desk — agency-scoped subset;
+    // tickets with agencyId = this agency. Customer tickets (agencyId null)
+    // stay cloud-side and are intentionally NOT part of any agency feed.)
+    case 'supportTickets': {
+      const records = await db.supportTicket.findMany({
+        where: { agencyId },
+      })
+      return { records, hasMore: false, total: records.length }
+    }
+
     // ── 11b. GlobalAnnouncements (global broadcast content — Task 4-b §5-5)
     case 'globalAnnouncements': {
       // SECURITY: platform-wide broadcast announcements — global by design
@@ -581,6 +592,7 @@ function serializeRecords(stage: string, records: any[]): any[] {
     smsSettings: 'SmsSettings',
     paymentSettings: 'PaymentSettings',
     agencyCategories: 'AgencyCategory',
+    supportTickets: 'SupportTicket',
   }
 
   const modelName = stageToModel[stage]
@@ -781,6 +793,8 @@ async function estimateStageCount(stage: string, agencyId: string): Promise<numb
       return db.fAQ.count()
     case 'agencyCategories':
       return db.agencyCategory.count()
+    case 'supportTickets':
+      return db.supportTicket.count({ where: { agencyId } })
     case 'smsSettings':
       return db.smsSettings.count()
     case 'paymentSettings':

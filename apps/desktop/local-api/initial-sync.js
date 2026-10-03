@@ -52,7 +52,7 @@ const SYNC_PROTOCOL_VERSION = 2
 // sorted by this canonical order regardless of the order the cloud returns
 // them in (spec §29: deterministic, race-free imports).
 const FK_SAFE_STAGE_ORDER = [
-  'users', 'subscriptionPlans', 'planFeatures', 'agency', 'branches', 'services', 'agencyStaff', 'counters', 'queueSettings', 'reservations', 'transactions', 'smsSettings', 'paymentSettings', 'notifications', 'announcements', 'globalAnnouncements', 'reviews', 'favorites', 'faqs', 'agencyCategories',
+  'users', 'subscriptionPlans', 'planFeatures', 'agency', 'branches', 'services', 'agencyStaff', 'counters', 'queueSettings', 'reservations', 'transactions', 'smsSettings', 'paymentSettings', 'notifications', 'announcements', 'globalAnnouncements', 'reviews', 'favorites', 'faqs', 'agencyCategories', 'supportTickets',
 ]
 
 function _sortStagesFkSafe(stages) {
@@ -91,6 +91,8 @@ const STAGE_MODEL_MAP = {
   planFeatures:     'PlanFeature',
   // Task 42-a: user-created agency fields (shared dictionary, global model)
   agencyCategories: 'AgencyCategory',
+  // Support tickets (super-admin support desk; agency-scoped subset)
+  supportTickets:   'SupportTicket',
 }
 
 // ─── Module State ───────────────────────────────────────────────────────────

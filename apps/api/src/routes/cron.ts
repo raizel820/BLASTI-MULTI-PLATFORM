@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { db } from '@blasti/db'
 import { normalizeDzPhone, getSmsTemplate, sendSms } from '../lib/sms-service'
 import { recordSyncChange } from '../lib/sync-helpers'
+import { emitNotificationEvent } from '../lib/realtime-emit'
 
 const app = new Hono()
 
@@ -145,6 +146,8 @@ app.get('/check-reminders', async (c) => {
             : reservation.user.language === 'fr' ? reservation.agency.nameFr || reservation.agency.name
             : reservation.agency.name
 
+        let turnApproachingEvent: { userId: string; ticketNumber: string; agencyName: string; peopleAhead: number } | null = null
+
         await db.$transaction(async (tx) => {
           await tx.reservation.update({
             where: { id: reservation.id },
@@ -163,8 +166,23 @@ app.get('/check-reminders', async (c) => {
               },
             })
             await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
+            // Task 24: also emit the realtime event the customer app listens for
+            // (customer-queue.tsx 'notification:turn-approaching' toast). The
+            // socket event was typed but NEVER emitted anywhere — dead alert.
+            turnApproachingEvent = { userId: reservation.userId, ticketNumber: reservation.displayNumber, agencyName, peopleAhead }
           }
         })
+
+        if (turnApproachingEvent) {
+          const ev = turnApproachingEvent as { userId: string; ticketNumber: string; agencyName: string; peopleAhead: number }
+          emitNotificationEvent('notification:turn-approaching', ev.userId, {
+            ticketNumber: ev.ticketNumber,
+            agencyName: ev.agencyName,
+            peopleAhead: ev.peopleAhead,
+            userId: ev.userId,
+            reservationId: reservation.id,
+          }).catch(() => {})
+        }
 
         remindersSent++
       }

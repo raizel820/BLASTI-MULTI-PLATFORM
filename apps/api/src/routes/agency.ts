@@ -1420,43 +1420,43 @@ app.get('/no-show-analytics', async (c) => {
 
     const dailyStats = await db.$queryRaw<Array<{ date: string; total: number; noShows: number }>>`
       SELECT 
-        DATE(joinedAt) as date,
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'NO_SHOW' THEN 1 ELSE 0 END) as noShows
-      FROM Reservation
-      WHERE agencyId = ${agencyId}
-        AND joinedAt >= ${periodAgo}
-      GROUP BY DATE(joinedAt)
-      ORDER BY date ASC
+        DATE("joinedAt")::text as "date",
+        CAST(COUNT(*) AS INTEGER) as "total",
+        CAST(SUM(CASE WHEN "status" = 'NO_SHOW' THEN 1 ELSE 0 END) AS INTEGER) as "noShows"
+      FROM "Reservation"
+      WHERE "agencyId" = ${agencyId}
+        AND "joinedAt" >= ${periodAgo}
+      GROUP BY DATE("joinedAt")
+      ORDER BY "date" ASC
     `
 
     const serviceStats = await db.$queryRaw<
       Array<{ serviceId: string; serviceName: string; total: number; noShows: number }>
     >`
       SELECT 
-        r.serviceId,
-        s.name as serviceName,
-        COUNT(*) as total,
-        SUM(CASE WHEN r.status = 'NO_SHOW' THEN 1 ELSE 0 END) as noShows
-      FROM Reservation r
-      JOIN Service s ON r.serviceId = s.id
-      WHERE r.agencyId = ${agencyId}
-        AND r.joinedAt >= ${periodAgo}
-      GROUP BY r.serviceId, s.name
-      ORDER BY noShows DESC
+        r."serviceId" as "serviceId",
+        s."name" as "serviceName",
+        CAST(COUNT(*) AS INTEGER) as "total",
+        CAST(SUM(CASE WHEN r."status" = 'NO_SHOW' THEN 1 ELSE 0 END) AS INTEGER) as "noShows"
+      FROM "Reservation" r
+      JOIN "Service" s ON r."serviceId" = s."id"
+      WHERE r."agencyId" = ${agencyId}
+        AND r."joinedAt" >= ${periodAgo}
+      GROUP BY r."serviceId", s."name"
+      ORDER BY "noShows" DESC
       LIMIT 10
     `
 
     const hourlyStats = await db.$queryRaw<Array<{ hour: number; total: number; noShows: number }>>`
       SELECT 
-        CAST(strftime('%H', joinedAt) AS INTEGER) as hour,
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'NO_SHOW' THEN 1 ELSE 0 END) as noShows
-      FROM Reservation
-      WHERE agencyId = ${agencyId}
-        AND joinedAt >= ${periodAgo}
-      GROUP BY hour
-      ORDER BY hour ASC
+        CAST(EXTRACT(HOUR FROM "joinedAt") AS INTEGER) as "hour",
+        CAST(COUNT(*) AS INTEGER) as "total",
+        CAST(SUM(CASE WHEN "status" = 'NO_SHOW' THEN 1 ELSE 0 END) AS INTEGER) as "noShows"
+      FROM "Reservation"
+      WHERE "agencyId" = ${agencyId}
+        AND "joinedAt" >= ${periodAgo}
+      GROUP BY 1
+      ORDER BY "hour" ASC
     `
 
     const reclaimedNoShows = await db.reservation.count({
@@ -1531,27 +1531,27 @@ app.get('/peak-hours', async (c) => {
     // Hourly demand distribution
     const hourlyDemand = await db.$queryRaw<Array<{ hour: number; count: number; avgWait: number }>>`
       SELECT 
-        CAST(strftime('%H', joinedAt) AS INTEGER) as hour,
-        COUNT(*) as count,
-        COALESCE(AVG(estimatedWait), 0) as avgWait
-      FROM Reservation
-      WHERE agencyId = ${agencyId}
-        AND joinedAt >= ${thirtyDaysAgo}
-      GROUP BY hour
-      ORDER BY hour ASC
+        CAST(EXTRACT(HOUR FROM "joinedAt") AS INTEGER) as "hour",
+        CAST(COUNT(*) AS INTEGER) as "count",
+        COALESCE(AVG("estimatedWait"), 0)::float8 as "avgWait"
+      FROM "Reservation"
+      WHERE "agencyId" = ${agencyId}
+        AND "joinedAt" >= ${thirtyDaysAgo}
+      GROUP BY 1
+      ORDER BY "hour" ASC
     `
 
     // Day of week demand
     const weekdayDemand = await db.$queryRaw<Array<{ weekday: number; count: number; avgWait: number }>>`
       SELECT 
-        CAST(strftime('%w', joinedAt) AS INTEGER) as weekday,
-        COUNT(*) as count,
-        COALESCE(AVG(estimatedWait), 0) as avgWait
-      FROM Reservation
-      WHERE agencyId = ${agencyId}
-        AND joinedAt >= ${thirtyDaysAgo}
-      GROUP BY weekday
-      ORDER BY weekday ASC
+        CAST(EXTRACT(DOW FROM "joinedAt") AS INTEGER) as "weekday",
+        CAST(COUNT(*) AS INTEGER) as "count",
+        COALESCE(AVG("estimatedWait"), 0)::float8 as "avgWait"
+      FROM "Reservation"
+      WHERE "agencyId" = ${agencyId}
+        AND "joinedAt" >= ${thirtyDaysAgo}
+      GROUP BY 1
+      ORDER BY "weekday" ASC
     `
 
     // Peak hours by service
@@ -1559,16 +1559,16 @@ app.get('/peak-hours', async (c) => {
       Array<{ serviceId: string; serviceName: string; peakHour: number; count: number }>
     >`
       SELECT 
-        r.serviceId,
-        s.name as serviceName,
-        CAST(strftime('%H', r.joinedAt) AS INTEGER) as peakHour,
-        COUNT(*) as count
-      FROM Reservation r
-      JOIN Service s ON r.serviceId = s.id
-      WHERE r.agencyId = ${agencyId}
-        AND r.joinedAt >= ${thirtyDaysAgo}
-      GROUP BY r.serviceId, s.name, peakHour
-      ORDER BY r.serviceId, count DESC
+        r."serviceId" as "serviceId",
+        s."name" as "serviceName",
+        CAST(EXTRACT(HOUR FROM r."joinedAt") AS INTEGER) as "peakHour",
+        CAST(COUNT(*) AS INTEGER) as "count"
+      FROM "Reservation" r
+      JOIN "Service" s ON r."serviceId" = s."id"
+      WHERE r."agencyId" = ${agencyId}
+        AND r."joinedAt" >= ${thirtyDaysAgo}
+      GROUP BY r."serviceId", s."name", 3
+      ORDER BY r."serviceId", "count" DESC
     `
 
     // Find top 3 peak hours
@@ -1592,14 +1592,14 @@ app.get('/peak-hours', async (c) => {
     // Daily average wait time trend (past 30 days)
     const dailyWaitTrend = await db.$queryRaw<Array<{ date: string; avgWait: number; count: number }>>`
       SELECT 
-        DATE(joinedAt) as date,
-        COALESCE(AVG(estimatedWait), 0) as avgWait,
-        COUNT(*) as count
-      FROM Reservation
-      WHERE agencyId = ${agencyId}
-        AND joinedAt >= ${thirtyDaysAgo}
-      GROUP BY DATE(joinedAt)
-      ORDER BY date ASC
+        DATE("joinedAt")::text as "date",
+        COALESCE(AVG("estimatedWait"), 0)::float8 as "avgWait",
+        CAST(COUNT(*) AS INTEGER) as "count"
+      FROM "Reservation"
+      WHERE "agencyId" = ${agencyId}
+        AND "joinedAt" >= ${thirtyDaysAgo}
+      GROUP BY DATE("joinedAt")
+      ORDER BY "date" ASC
     `
 
     const weekdayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
@@ -2844,6 +2844,7 @@ app.post('/queue/call-next', async (c) => {
           queueNumber: true,
           preferredTime: true,
           fixedTimeEnabled: true,
+          reservedDate: true,
         },
       })
 
@@ -2887,6 +2888,8 @@ app.post('/queue/call-next', async (c) => {
     emitQueueEvent('queue:called', agencyId, {
       reservationId: nextReservation.id,
       displayNumber: nextReservation.displayNumber,
+      // Task 24: userId inside data so the customer's full-screen turn alert fires
+      userId: nextReservation.userId || null,
       customerName: (nextReservation as any).walkInCustomerName || (nextReservation as any).user?.fullName || '',
       isWalkIn: !!(nextReservation as any).isWalkIn,
       serviceId: nextReservation.serviceId,
@@ -2895,6 +2898,8 @@ app.post('/queue/call-next', async (c) => {
       emitNotificationEvent('notification:your-turn', nextReservation.userId, {
         ticketNumber: nextReservation.displayNumber,
         agencyId,
+        userId: nextReservation.userId,
+        reservationId: nextReservation.id,
       })
     }
     emitKioskEvent(agencyId, {

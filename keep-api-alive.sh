@@ -17,7 +17,7 @@ MAX_CONSECUTIVE_RESTARTS=5
 BACKOFF_BASE=3
 BACKOFF_CAP=30
 
-export DATABASE_URL="${DATABASE_URL:-file:${REPO_ROOT}/packages/db/data/custom.db}"
+export DATABASE_URL="${DATABASE_URL:-postgresql://blasti:blasti@127.0.0.1:5432/blasti?schema=public}"
 export NEXTAUTH_SECRET="${NEXTAUTH_SECRET:-blast1-dev-s3cr3t-k3y-f0r-d3v3l0pm3nt-0nly}"
 export CORS_ORIGIN="${CORS_ORIGIN:-*}"
 export INTERNAL_SECRET="${INTERNAL_SECRET:-blast1-internal-secret-dev}"

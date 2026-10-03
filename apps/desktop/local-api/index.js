@@ -9,7 +9,9 @@
  *                                                         → Background Sync → Cloud API (when online)
  *
  * Security:
- *   - Binds ONLY to 127.0.0.1 (never 0.0.0.0)
+ *   - Binds 127.0.0.1 by default; LAN-reachable only when explicitly enabled
+ *     (BLASTI_LAN_BIND=lan/<ip> or BLASTI_ENABLE_LAN=1 — the packaged desktop
+ *     app enables LAN mode by default so kiosks/TV boards can discover it)
  *   - Per-launch session token (random hex, timing-safe comparison)
  *   - All requests (except health/login/discover/sync-status) require valid session token
  *   - NO admin endpoints — agent-level only
@@ -37,10 +39,24 @@ const { diagLog } = require('./lib/diag-log')
 // UI fully offline against the local SQLite mirror.
 const registerAgencyDeviceRoutes = require('./agency-devices')
 
+// Device-facing endpoints (/public/*, /device/*) — lets TV boards & kiosks
+// register, pair, heartbeat and pull live queue data from the LOCAL API
+// (LAN mode / offline), closing the parity gap with the cloud API.
+const { registerDeviceBoardRoutes } = require('./lib/device-board-routes')
+
 // ─── Configuration ────────────────────────────────────────────────────────
 
 const DEFAULT_PORT = 3080
-const BIND_ADDRESS = '127.0.0.1'
+// ─── LAN reachability (P0: kiosks could not discover the desktop) ──────────
+// Bind address is configurable via lib/lan-origin.js:
+//   BLASTI_LAN_BIND  = 'loopback' (default) | 'lan' (→ 0.0.0.0) | explicit IP
+//   BLASTI_ENABLE_LAN = 1/true — shorthand for BLASTI_LAN_BIND=lan
+// When bound to the LAN the CORS layer also accepts private http origins
+// (http://192.168.x.y:port) and the /api/discover beacon carries the LAN IP.
+const { resolveLanBind, isLanHttpOrigin, bestLanIp, primaryLanInterface } = require('./lib/lan-origin')
+const LAN_BIND = resolveLanBind()
+const LAN_ENABLED = LAN_BIND.lan
+const BIND_ADDRESS = LAN_BIND.bind
 const CORS_ORIGINS = [
   'http://localhost:3000',
   'http://localhost:3080',
@@ -2183,11 +2199,19 @@ function computeAgencyAnalyticsDashboard(rows, prevRows, lookups, period, range)
 function createApp() {
   const app = new Hono()
 
-  // CORS — localhost only
+  // CORS — loopback origins always; LAN/private http origins additionally
+  // when the API is bound beyond loopback (kiosk/TV webviews on the same
+  // network). Requests WITHOUT an Origin header (curl, Electron renderer,
+  // native shells) never enter CORS and are unaffected.
   app.use(
     '*',
     cors({
-      origin: CORS_ORIGINS,
+      origin: (origin) => {
+        if (!origin) return null // no Origin header → nothing to allow
+        if (CORS_ORIGINS.includes(origin)) return origin
+        if (LAN_ENABLED && isLanHttpOrigin(origin)) return origin
+        return null
+      },
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
       allowHeaders: ['Content-Type', 'Authorization', 'X-Local-Token'],
       credentials: true,
@@ -2296,13 +2320,33 @@ function createApp() {
   })
 
   app.get('/api/discover', (c) => {
+    // Identity fields (hostname/displayName/platform) let the webapp's LAN
+    // discovery show a real server label instead of "BLASTI Server (IP)".
+    let hostname = ''
+    let platform = ''
+    try {
+      const os = require('os')
+      hostname = os.hostname() || ''
+      platform = `${os.type()} ${os.arch()}`.trim()
+    } catch { /* non-fatal */ }
+    // LAN-reachability fields — clients treat extra fields safely. When bound
+    // to the LAN, lanIp tells the scanner WHICH address answered (the UDP
+    // beacon carries the same pair).
+    const lanIp = LAN_ENABLED ? bestLanIp() : null
     return c.json({
       service: 'blasti-local',
       version: '1.0.0',
       mode: 'local-first',
+      hostname,
+      displayName: hostname ? `BLASTI Desktop — ${hostname}` : 'BLASTI Desktop',
+      platform,
       port: DEFAULT_PORT,
       apiPort: DEFAULT_PORT,
       webPort: 3000,
+      lanIp: lanIp || null,
+      uptime: Math.floor(process.uptime()),
+      networkInterface: LAN_ENABLED ? primaryLanInterface(lanIp) : null,
+      syncReady: true,
       capabilities: [
         'auth',
         'agency',
@@ -2316,6 +2360,8 @@ function createApp() {
         'user',
         'settings',
         'sync',
+        'devices',
+        'discovery',
       ],
     })
   })
@@ -5738,6 +5784,27 @@ function createApp() {
     }
   })
 
+  // Task 24 — local mirror of the cloud call-next selection rules
+  // (api/src/lib/queue-scheduler.ts): future-date tickets are never callable
+  // today, and fixed-time tickets wait until their preferred HH:MM.
+  function pickNextLocalCustomer(candidates, now) {
+    const pad = (n) => String(n).padStart(2, '0')
+    const todayStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+    const nowMinutes = now.getHours() * 60 + now.getMinutes()
+    const timePassed = (hhmm) => {
+      try {
+        const parts = String(hhmm).split(':').map(Number)
+        if (Number.isNaN(parts[0]) || Number.isNaN(parts[1])) return true
+        return parts[0] * 60 + parts[1] <= nowMinutes
+      } catch { return true }
+    }
+    return (candidates || []).find((r) => {
+      if (r.reservedDate && String(r.reservedDate).slice(0, 10) > todayStr) return false
+      if (r.preferredTime && r.fixedTimeEnabled && !timePassed(r.preferredTime)) return false
+      return true
+    }) || null
+  }
+
   // POST /api/queue/call-next — call next customer
   app.post('/api/queue/call-next', authMiddleware, async (c) => {
     try {
@@ -5756,18 +5823,31 @@ function createApp() {
       const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
       if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
 
-      // Build where clause for next waiting
+      // Task 24: parity with the CLOUD call-next — order by queueNumber ASC
+      // (Postpone Paradox fix), skip FUTURE-DATE tickets, and skip fixed-time
+      // tickets whose preferred time has not arrived yet.
       const where = { agencyId, status: 'WAITING' }
       if (serviceId) where.serviceId = serviceId
       // branchId filter removed — Reservation has no branchId field
 
-      const next = await db.reservation.findFirst({
+      const candidates = await db.reservation.findMany({
         where,
-        orderBy: { joinedAt: 'asc' },
+        orderBy: { queueNumber: 'asc' },
+        take: 200,
       })
 
+      const next = pickNextLocalCustomer(candidates, new Date())
+
       if (!next) {
-        return c.json({ success: false, error: 'No customers in queue' }, 404)
+        const anyWaiting = await db.reservation.findFirst({ where, orderBy: { queueNumber: 'asc' } })
+        if (!anyWaiting) {
+          return c.json({ success: false, error: 'No customers in queue' }, 404)
+        }
+        return c.json({
+          success: false,
+          error: 'All waiting reservations have preferred times in the future. No one to call yet.',
+          hasPreferredTimeOnly: true,
+        })
       }
 
       const now = new Date()
@@ -6039,14 +6119,37 @@ function createApp() {
         )
       }
 
+      // Task 24: mirror the CLOUD postpone semantics (api/src/routes/reservations.ts).
+      // The old local behavior set status:'POSTPONED' — a status the cloud never
+      // produces and every queue query filters out — so a postponed ticket
+      // VANISHED from the local waiting list, and positions were never shifted.
+      // Cloud semantics: status stays WAITING; the ticket swaps places with the
+      // Nth WAITING ticket behind it (atomic temp-negative + raw shift).
+      if (existing.status !== 'WAITING') {
+        return c.json({ success: false, error: 'Can only postpone a waiting reservation' }, 400)
+      }
+
+      const postponeBody = await c.req.json().catch(() => ({}))
+      const positions = Math.max(1, Math.min(10, Number(postponeBody && postponeBody.positions) || 1))
+
+      const laterReservations = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING', queueNumber: { gt: existing.queueNumber } },
+        orderBy: { queueNumber: 'asc' },
+        take: positions,
+      })
+      if (laterReservations.length === 0) {
+        return c.json({ success: false, error: 'No one to postpone behind' }, 400)
+      }
+      const targetQueueNumber = laterReservations[laterReservations.length - 1].queueNumber
+
       const now = new Date()
       const reservation = await withOutboxTransaction(async (tx) => {
+        const tempQueueNumber = -existing.queueNumber
+        await tx.reservation.update({ where: { id }, data: { queueNumber: tempQueueNumber } })
+        await tx.$executeRaw`UPDATE "Reservation" SET "queueNumber" = "queueNumber" - 1 WHERE "agencyId" = ${agencyId} AND "status" = 'WAITING' AND "queueNumber" > ${existing.queueNumber} AND "queueNumber" <= ${targetQueueNumber}`
         const row = await tx.reservation.update({
           where: { id },
-          data: {
-            status: 'POSTPONED',
-            // postponedAt: removed — not a Reservation schema field
-          },
+          data: { queueNumber: targetQueueNumber, postponeCount: (existing.postponeCount || 0) + 1 },
         })
         await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
         return row
@@ -6055,10 +6158,14 @@ function createApp() {
       // Update positions
       const remainingWaiting = await db.reservation.findMany({
         where: { agencyId, status: 'WAITING' },
-        orderBy: { joinedAt: 'asc' },
+        orderBy: { queueNumber: 'asc' },
       })
       // position reassignment loop removed — position is not a schema field
 
+      // Task 24: emit the event name the dashboard actually subscribes to
+      // (queue:position-changed, mirroring the cloud emit); keep the legacy
+      // queue:postponed as an alias for any older listeners.
+      emitEvent('queue:position-changed', { agencyId, reservationId: reservation.id, displayNumber: reservation.displayNumber, queueNumber: reservation.queueNumber, reservation })
       emitEvent('queue:postponed', { agencyId, reservation })
 
       return c.json({ success: true, data: reservation })
@@ -6223,6 +6330,184 @@ function createApp() {
     } catch (error) {
       console.error('[LocalAPI] Delete notification error:', error)
       return c.json({ success: false, error: 'Failed to delete notification' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 10b. SUPPORT TICKETS (auth required) — offline-first mirror of the cloud
+  // route apps/api/src/routes/support-tickets.ts. SupportTicket is
+  // agency-scoped in the sync registry (syncOrder 21), so admin replies /
+  // status changes flow back in via the incremental pull while locally
+  // created tickets reach the cloud through the outbox replay (the cloud
+  // POST route is idempotent on the `id` field).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // Cuid-v1-SHAPED id generator. The cloud create route validates the replayed
+  // id with z.string().cuid() (apps/api zod v4) — a plain randomUUID would 400
+  // every outbox replay. Shape: 'c' + base36 timestamp + pid + counter + hex —
+  // starts with 'c', ≥9 chars, no separators/hyphens (matches zod's CUID_RE);
+  // pid + counter + 4 random bytes keep it collision-safe per workstation.
+  let _supportTicketIdCounter = 0
+  function newSupportTicketId() {
+    _supportTicketIdCounter = (_supportTicketIdCounter + 1) % 1296
+    return 'c' + Date.now().toString(36) + process.pid.toString(36) +
+      _supportTicketIdCounter.toString(36) + randomBytes(4).toString('hex')
+  }
+
+  /** Cloud ticketDto mirror: ISO datetimes, trimmed user/agency includes;
+   *  undefined user/agency keys drop from the JSON exactly like the cloud. */
+  function serializeSupportTicket(t) {
+    const iso = (v) => (v == null ? null : (v instanceof Date ? v.toISOString() : new Date(v).toISOString()))
+    return {
+      id: t.id,
+      userId: t.userId,
+      agencyId: t.agencyId == null ? null : String(t.agencyId),
+      subject: t.subject,
+      category: t.category,
+      status: t.status,
+      priority: t.priority,
+      message: t.message,
+      reply: t.reply == null ? null : String(t.reply),
+      repliedAt: iso(t.repliedAt),
+      repliedBy: t.repliedBy == null ? null : String(t.repliedBy),
+      createdAt: iso(t.createdAt),
+      updatedAt: iso(t.updatedAt),
+      user: t.user ? { id: t.user.id, username: t.user.username, fullName: t.user.fullName, role: t.user.role } : undefined,
+      agency: t.agency ? { id: t.agency.id, name: t.agency.name, customCode: t.agency.customCode } : undefined,
+    }
+  }
+
+  // POST /api/support-tickets — create a ticket OFFLINE-FIRST (agency
+  // workstation). Cloud contract: POST /api/support-tickets, idempotent on the
+  // optional id (outbox replays carry the locally-generated id so cloud and
+  // local rows share identity). agencyId resolves from the SESSION agency via
+  // resolveSessionAgencyId (same ownership fallbacks as branches/staff) —
+  // cross-agency tagging is not allowed, mirroring the cloud.
+  app.post('/api/support-tickets', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+
+      const body = await c.req.json().catch(() => ({}))
+      const subject = typeof body.subject === 'string' ? body.subject : ''
+      const message = typeof body.message === 'string' ? body.message : ''
+
+      // Minimal validation mirroring the cloud zod schema.
+      if (subject.trim().length < 3 || subject.length > 150) {
+        return c.json({ success: false, error: 'Subject is required (min 3 chars, max 150)' }, 400)
+      }
+      if (message.length < 1 || message.length > 5000) {
+        return c.json({ success: false, error: 'Message is required (max 5000 chars)' }, 400)
+      }
+      const category = body.category == null || body.category === '' ? 'QUESTION' : body.category
+      if (['COMPLAINT', 'SUGGESTION', 'QUESTION', 'NOTE'].indexOf(category) === -1) {
+        return c.json({ success: false, error: 'Invalid category' }, 400)
+      }
+      const priority = body.priority == null || body.priority === '' ? 'NORMAL' : body.priority
+      if (['LOW', 'NORMAL', 'HIGH'].indexOf(priority) === -1) {
+        return c.json({ success: false, error: 'Invalid priority' }, 400)
+      }
+
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId') || body.agencyId)
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const id = newSupportTicketId()
+      const created = await withOutboxTransaction(async (tx) => {
+        const row = await tx.supportTicket.create({
+          data: {
+            id,
+            userId: sessionUser.id,
+            agencyId,
+            subject,
+            category,
+            status: 'OPEN',
+            priority,
+            message,
+          },
+        })
+        // Part Q: the outbox row commits ATOMICALLY with the ticket. The body
+        // carries the local id — the cloud route returns the existing record
+        // (200, replayed:true) when it already knows it. AWAITED inside the tx
+        // (a floating logPendingMutation caused a real P2028 bug here before).
+        await logPendingMutation('POST', '/api/support-tickets', { id, subject, category, message, priority }, row, { tx })
+        return row
+      })
+
+      console.log('[LocalAPI] support ticket created: id=' + created.id + ' category=' + created.category)
+
+      // Re-read with the cloud's include shape so the response matches the
+      // cloud ticketDto exactly (the frontend works against either API).
+      const full = await db.supportTicket.findUnique({
+        where: { id: created.id },
+        include: {
+          user: { select: { id: true, username: true, fullName: true, role: true } },
+          agency: { select: { id: true, name: true, customCode: true } },
+        },
+      })
+      return c.json({ success: true, ticket: serializeSupportTicket(full || created) }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create support ticket error:', error)
+      return c.json({ success: false, error: 'Failed to create support ticket' }, 500)
+    }
+  })
+
+  // GET /api/support-tickets/agency — the caller's agency tickets
+  // (owner/staff). Cloud-parity: orderBy createdAt desc, take 100, user +
+  // agency includes, openCount counts OPEN + IN_PROGRESS.
+  app.get('/api/support-tickets/agency', authMiddleware, async (c) => {
+    try {
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const statusFilter = c.req.query('status')
+      const where = { agencyId }
+      if (statusFilter) where.status = statusFilter
+
+      const tickets = await db.supportTicket.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+        include: {
+          user: { select: { id: true, username: true, fullName: true, role: true } },
+          agency: { select: { id: true, name: true, customCode: true } },
+        },
+      })
+      const openCount = await db.supportTicket.count({
+        where: { agencyId, status: { in: ['OPEN', 'IN_PROGRESS'] } },
+      })
+
+      console.log('[SyncDiag] support tickets agency read: agencyId=' + agencyId + ' rows=' + tickets.length)
+      return c.json({ success: true, tickets: tickets.map(serializeSupportTicket), openCount })
+    } catch (error) {
+      console.error('[LocalAPI] List agency support tickets error:', error)
+      return c.json({ success: false, error: 'Failed to list support tickets' }, 500)
+    }
+  })
+
+  // GET /api/support-tickets/mine — the caller's own tickets (cloud parity:
+  // no user/agency include, optional ?status= filter, openCount by user).
+  app.get('/api/support-tickets/mine', authMiddleware, async (c) => {
+    try {
+      const statusFilter = c.req.query('status')
+      const where = { userId: sessionUser.id }
+      if (statusFilter) where.status = statusFilter
+
+      const tickets = await db.supportTicket.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+      })
+      const openCount = await db.supportTicket.count({
+        where: { userId: sessionUser.id, status: { in: ['OPEN', 'IN_PROGRESS'] } },
+      })
+
+      return c.json({ success: true, tickets: tickets.map(serializeSupportTicket), openCount })
+    } catch (error) {
+      console.error('[LocalAPI] List my support tickets error:', error)
+      return c.json({ success: false, error: 'Failed to list support tickets' }, 500)
     }
   })
 
@@ -9021,18 +9306,31 @@ function createApp() {
       const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
       if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
 
-      // Build where clause for next waiting
+      // Task 24: parity with the CLOUD call-next — order by queueNumber ASC
+      // (Postpone Paradox fix), skip FUTURE-DATE tickets, and skip fixed-time
+      // tickets whose preferred time has not arrived yet.
       const where = { agencyId, status: 'WAITING' }
       if (serviceId) where.serviceId = serviceId
       // branchId filter removed — Reservation has no branchId field
 
-      const next = await db.reservation.findFirst({
+      const candidates = await db.reservation.findMany({
         where,
-        orderBy: { joinedAt: 'asc' },
+        orderBy: { queueNumber: 'asc' },
+        take: 200,
       })
 
+      const next = pickNextLocalCustomer(candidates, new Date())
+
       if (!next) {
-        return c.json({ success: false, error: 'No customers in queue' }, 404)
+        const anyWaiting = await db.reservation.findFirst({ where, orderBy: { queueNumber: 'asc' } })
+        if (!anyWaiting) {
+          return c.json({ success: false, error: 'No customers in queue' }, 404)
+        }
+        return c.json({
+          success: false,
+          error: 'All waiting reservations have preferred times in the future. No one to call yet.',
+          hasPreferredTimeOnly: true,
+        })
       }
 
       const now = new Date()
@@ -9589,6 +9887,30 @@ function createApp() {
   let registeredRouteCount = -1
   try { registeredRouteCount = (app.routes || []).length } catch { /* older hono — unknown */ }
 
+  // ═══ Device-facing board endpoints (public/* + device/*) ════════════
+  // TV boards / kiosks authenticate with a deviceToken (NOT a session).
+  // Registered BEFORE the static-UI catch-all so /api/* keeps priority.
+  // Task 2-b ORDER MATTERS: these static /device/* routes MUST register
+  // BEFORE the agency-devices management module below — the manager route
+  // POST /:id/pair is dynamic and, when registered first, SHADOWS the kiosk
+  // POST /device/pair (Hono resolves matching by registration order; the
+  // cloud file has the same ordering — static /device/pair at 1206 before
+  // /:id/pair at 2118).
+  registerDeviceBoardRoutes(app, {
+    authMiddleware,
+    getDb: () => db,
+    broadcast: (type, payload) => {
+      try { emitEvent(type, payload) } catch { /* non-fatal */ }
+      try { localRealtime.broadcastLocalRealtime(type, payload) } catch { /* non-fatal */ }
+    },
+    diagLog,
+    // Kiosk join-queue → local walk-in Reservation must reach the cloud via
+    // the canonical outbox (same transactional pattern as /queue/walk-in).
+    withOutboxTransaction,
+    logDeterministicOutcome,
+    checkQueueIssuanceGates,
+  })
+
   // ═══ Agency devices + embedded discovery (Task A 2-c) ═══════════════════
   // Device management + multi-protocol LAN discovery + cast for the local
   // UI — registered BEFORE the static-UI catch-all below. Every route uses
@@ -9851,6 +10173,9 @@ async function startLocalApi(dbPath, port, options) {
   try {
     localRealtime.initLocalRealtime(httpServer, {
       getSession: () => (sessionToken && sessionUser ? { token: sessionToken, user: sessionUser } : null),
+      // Device room joins (join:device) validate tokens against the LOCAL
+      // AgencyDevice mirror — TV boards/kiosks get realtime while offline.
+      getDb: () => db,
       // Task 41 — rotation-grace awareness for socket auth: a renderer socket
       // presenting the PREVIOUS token of the same session is accepted during
       // the grace window instead of being rejected with

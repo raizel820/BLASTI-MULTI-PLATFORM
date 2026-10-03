@@ -270,17 +270,24 @@ export function formatETA(eta: ETAResult, language: string = 'en'): string {
  * entries that should NOT be counted toward the ETA, as they inflate the
  * peopleAhead count and skew estimates.
  *
- * Phase 3c: A reservation is considered a ghost ticket if its createdAt is
- * more than maxWaitHours ago (default: 2 hours).
+ * Phase 3c: A reservation is considered a ghost ticket if its creation time
+ * (joinedAt — the actual Reservation field; createdAt kept as a legacy alias)
+ * is more than maxWaitHours ago (default: 2 hours).
+ *
+ * Task 24 RUNTIME FIX: queue.ts selected the NON-EXISTENT `createdAt` field
+ * from Prisma (Reservation only has joinedAt) — findMany threw "Invalid
+ * db.reservation.findMany() invocation" and the whole /api/queue/status
+ * endpoint 500'd. The filter now reads joinedAt first.
  */
-export function filterGhostTickets<T extends { createdAt?: Date | string | null }>(
+export function filterGhostTickets<T extends { createdAt?: Date | string | null; joinedAt?: Date | string | null }>(
   reservations: T[],
   maxWaitHours: number = 2,
 ): T[] {
   const cutoff = new Date(Date.now() - maxWaitHours * 60 * 60 * 1000)
   return reservations.filter(r => {
-    if (!r.createdAt) return true // If no createdAt, keep it (conservative)
-    const created = typeof r.createdAt === 'string' ? new Date(r.createdAt) : r.createdAt
+    const raw = r.joinedAt ?? r.createdAt
+    if (!raw) return true // If no creation timestamp, keep it (conservative)
+    const created = typeof raw === 'string' ? new Date(raw) : raw
     // Keep only reservations created AFTER the cutoff (i.e., not ghost tickets)
     return created >= cutoff
   })
@@ -290,15 +297,19 @@ export function filterGhostTickets<T extends { createdAt?: Date | string | null 
  * Filter out future fixed-time appointments that are outside the immediate service window.
  * These "ghost tickets" inflate the peopleAhead count and skew ETA estimates.
  */
-export function filterImmediateServiceWindow<T extends { fixedTimeEnabled?: boolean; preferredTime?: string | null }>(
+export function filterImmediateServiceWindow<T extends { fixedTimeEnabled?: boolean; preferredTime?: string | null; reservedDate?: string | null }>(
   reservations: T[],
   windowMinutes: number = 30
 ): T[] {
   const now = new Date()
   const windowEnd = new Date(now.getTime() + windowMinutes * 60 * 1000)
   const windowEndStr = windowEnd.toTimeString().slice(0, 5) // "HH:MM"
+  // Task 24: a ticket booked for a FUTURE DATE is never in today's window
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const todayStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
   
   return reservations.filter(r => {
+    if (r.reservedDate && String(r.reservedDate).slice(0, 10) > todayStr) return false
     if (!r.fixedTimeEnabled) return true
     if (!r.preferredTime) return true
     // Include if the preferred time is within the immediate window

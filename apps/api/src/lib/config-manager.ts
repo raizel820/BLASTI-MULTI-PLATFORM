@@ -186,7 +186,7 @@ export async function deleteConfig(key: string): Promise<boolean> {
     if (!setting) return false
 
     // Use raw SQL to bypass the Ghost Delete Trap (SystemSetting doesn't need tombstones)
-    await db.$executeRaw`DELETE FROM system_settings WHERE id = ${setting.id}`
+    await db.$executeRaw`DELETE FROM "SystemSetting" WHERE "id" = ${setting.id}`
     cache.delete(key)
     return true
   } catch {

@@ -44,6 +44,7 @@ const { timingSafeEqual } = require('crypto')
 
 let _io = null
 let _getSession = null // () => ({ token, user } | null)
+let _getDb = null // () => local Prisma client | null (device room joins)
 let _getPreviousSessionToken = null // Task 41 — () => previous-token | null (rotation grace)
 let _relayAgencyId = null // agency room the cloud relay targets
 let _startedAt = null
@@ -86,13 +87,20 @@ function warn(...args) {
 }
 
 /**
- * Is this origin allowed to open a socket to the loopback local API?
- * The local server binds 127.0.0.1 only; the renderer origins we serve are
- * the dev server (localhost:3000), the packaged web origin, Electron
+ * Is this origin allowed to open a socket to the local API?
+ * The local server binds 127.0.0.1 by default; the renderer origins we serve
+ * are the dev server (localhost:3000), the packaged web origin, Electron
  * file:// pages (which send NO origin header), and Capacitor shells.
+ * When the local API is bound to the LAN (BLASTI_LAN_BIND / BLASTI_ENABLE_LAN
+ * — same resolution as index.js), private http origins (the kiosk/TV
+ * webviews on the same network) are accepted too, mirroring the HTTP CORS
+ * layer so Socket.IO never gets stricter than fetch.
  */
+const { isLanHttpOrigin, resolveLanBind } = require('./lib/lan-origin')
+
 function isLocalOriginAllowed(origin) {
   if (!origin) return true // Electron/websocket handshakes may omit Origin
+  if (resolveLanBind().lan && isLanHttpOrigin(origin)) return true
   try {
     const u = new URL(origin)
     const host = u.hostname
@@ -223,6 +231,68 @@ function _registerRoomHandlers(socket, authRef) {
     if (agencyId) socket.leave('kiosk:' + agencyId)
   })
 
+  // Device rooms (TV boards / kiosks authenticated by deviceToken — mirrors
+  // the cloud join:device): validates the token against the LOCAL AgencyDevice
+  // mirror, then joins device:* + agency:* + kiosk:* so display devices
+  // receive queue:* and kiosk:update while offline/LAN-mode.
+  socket.on('join:device', async (deviceToken) => {
+    if (!deviceToken || typeof deviceToken !== 'string') return
+    const db = _getDb && _getDb()
+    if (!db) {
+      warn('socket', socket.id, 'rejected join:device — local database not ready')
+      return
+    }
+    let device = null
+    try {
+      device = await db.agencyDevice.findUnique({
+        where: { deviceToken },
+        select: { id: true, agencyId: true, type: true, status: true },
+      })
+    } catch (err) {
+      warn('socket', socket.id, 'join:device lookup failed: ' + (err && err.message))
+      return
+    }
+    if (!device) {
+      warn('socket', socket.id, 'rejected join:device with invalid token')
+      return
+    }
+    socket.join('device:' + device.id)
+    if (device.agencyId) {
+      socket.join('agency:' + device.agencyId)
+      socket.join('kiosk:' + device.agencyId)
+    }
+    socket._blastiDeviceId = device.id
+    socket._blastiDeviceAgencyId = device.agencyId || null
+    socket._blastiIsDevice = true
+    // Flip the device ONLINE (respect DISABLED) — parity with the cloud
+    if (device.status !== 'DISABLED') {
+      try {
+        await db.agencyDevice.update({
+          where: { id: device.id },
+          data: { status: 'ONLINE', lastHeartbeatAt: new Date(), statusChangedAt: new Date() },
+        })
+      } catch { /* best-effort */ }
+    } else {
+      try {
+        await db.agencyDevice.update({ where: { id: device.id }, data: { lastHeartbeatAt: new Date() } })
+      } catch { /* best-effort */ }
+    }
+    log('Device joined:', socket.id, '(device:', device.id + ', type:', device.type + ', agency:', String(device.agencyId) + ')')
+  })
+
+  socket.on('leave:device', () => {
+    if (socket._blastiDeviceId) {
+      socket.leave('device:' + socket._blastiDeviceId)
+      if (socket._blastiDeviceAgencyId) {
+        socket.leave('kiosk:' + socket._blastiDeviceAgencyId)
+        socket.leave('agency:' + socket._blastiDeviceAgencyId)
+      }
+      socket._blastiDeviceId = null
+      socket._blastiDeviceAgencyId = null
+      socket._blastiIsDevice = false
+    }
+  })
+
   socket.on('join:admin', () => {
     if (!canJoinAdmin(ensureAuth())) {
       warn('socket', socket.id, 'rejected join:admin — not authorized')
@@ -265,11 +335,12 @@ function _registerRoomHandlers(socket, authRef) {
 /**
  * Attach the local Socket.IO server to the embedded API's HTTP server.
  * @param {import('http').Server} httpServer - the @hono/node-server instance
- * @param {{ getSession: () => { token: string, user: object } | null }} options
+ * @param {{ getSession: () => { token: string, user: object } | null, getDb?: () => object | null }} options
  */
 function initLocalRealtime(httpServer, options) {
   if (_io) return _io
   _getSession = (options && options.getSession) || null
+  _getDb = (options && options.getDb) || null
   _getPreviousSessionToken = (options && options.getPreviousSessionToken) || null
 
   let ServerCtor
@@ -338,6 +409,7 @@ function closeLocalRealtime() {
     log('Local realtime socket server closed')
   }
   _getSession = null
+  _getDb = null
   _relayAgencyId = null
 }
 

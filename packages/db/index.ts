@@ -1,5 +1,5 @@
 /**
- * @blasti/db — Shared Prisma Client Singleton
+ * @blasti/db — Shared Prisma Client Singleton (PostgreSQL)
  *
  * This is the single source of truth for database access across all
  * workspace packages. Import { db } from '@blasti/db' instead of
@@ -7,6 +7,14 @@
  *
  * Development-time global caching prevents duplicate PrismaClient
  * instances on hot-reload.
+ *
+ * ── Database engine ──────────────────────────────────────────────
+ * The cloud database is PostgreSQL (packages/db/prisma/schema.prisma
+ * provider = "postgresql"). Local development uses the PostgreSQL
+ * instance started by ops/docker-compose.dev.yml (user blasti /
+ * password blasti / database blasti on localhost:5432) — the same
+ * credentials are the zero-config default below. Production (OVH
+ * cloud, Docker) sets DATABASE_URL through ops/.env instead.
  *
  * ── Ghost Delete Trap ──────────────────────────────────────────────
  * A Prisma Client Extension intercepts every delete() and deleteMany()
@@ -22,58 +30,44 @@
 
 import { PrismaClient, Prisma } from '@prisma/client'
 import { resolve, dirname } from 'path'
-import { mkdirSync, existsSync, statSync, readFileSync } from 'fs'
+import { statSync, readFileSync } from 'fs'
 import { fileURLToPath } from 'url'
 import { AsyncLocalStorage } from 'async_hooks'
 
 // ── Robust DATABASE_URL resolution ─────────────────────────────────────────
-// On a freshly-copied/cloned project there may be no `.env` (it's gitignored),
-// or it may point at a stale path whose parent directory doesn't exist. In
-// either case Prisma throws "Error code 14: Unable to open the database file"
-// and every API write returns HTTP 500 with a generic message — very hard to
-// debug from the browser console.
+// BLASTI uses PostgreSQL (see packages/db/prisma/schema.prisma → provider
+// "postgresql").
 //
-// To make a fresh copy work with ZERO configuration, we:
-//   1. Compute the canonical DB path: <this-package>/data/custom.db
-//   2. Validate the incoming DATABASE_URL (if any) — does its parent dir exist?
-//   3. Fall back to the canonical path when invalid/missing.
-//   4. Ensure the parent directory exists (mkdirSync recursive).
-//   5. Set process.env.DATABASE_URL so Prisma's env() picks it up.
-function resolveDatabaseUrl(): string {
-  const pkgRoot = typeof __dirname !== 'undefined'
-    ? __dirname
-    : dirname(fileURLToPath(import.meta.url))
-  const canonicalPath = resolve(pkgRoot, 'data', 'custom.db')
-  const canonicalUrl = `file:${canonicalPath}`
+// Zero-config local development: the dev PostgreSQL instance started by
+// `docker compose -f ops/docker-compose.dev.yml up -d` serves
+// postgresql://blasti:blasti@127.0.0.1:5432/blasti — that exact URL is the
+// fallback here, so a fresh clone + `bun run dev` works with no .env at all
+// (as long as the dev database container is up).
+//
+// Production (OVH VPS via ops/docker-compose.yml) always sets a real
+// DATABASE_URL through ops/.env — the process environment wins over every
+// fallback.
+//
+// Legacy `file:` (SQLite) URLs are no longer supported by the schema; they
+// are ignored with a clear notice instead of a cryptic Prisma error.
+export const DEFAULT_POSTGRES_URL = 'postgresql://blasti:blasti@127.0.0.1:5432/blasti?schema=public'
 
-  const incoming = process.env.DATABASE_URL
+function resolveDatabaseUrl(): string {
+  const incoming = process.env.DATABASE_URL?.trim()
   if (incoming) {
-    // Prisma SQLite URLs look like `file:/abs/path` or `file:./rel/path`
-    const filePath = incoming.startsWith('file:')
-      ? resolve(incoming.slice('file:'.length).replace(/^\/(?=[A-Za-z]:)/, ''))
-      : resolve(incoming)
-    const dir = dirname(filePath)
-    if (existsSync(dir)) {
-      // Incoming URL is usable — keep it (allows overrides for tests/CI).
-      return incoming.startsWith('file:') ? incoming : `file:${filePath}`
+    if (/^(postgres|postgresql):\/\//i.test(incoming)) {
+      return incoming
     }
-    console.warn(`[db] DATABASE_URL points to a non-existent directory: ${dir}. Falling back to canonical path.`)
+    console.warn('[db] DATABASE_URL is not a PostgreSQL URL — BLASTI no longer uses SQLite.')
+    console.warn('[db] Ignoring it and falling back to the local development database:')
+    console.warn(`[db]   ${DEFAULT_POSTGRES_URL}`)
+    console.warn('[db] Set DATABASE_URL (postgresql://…) in your .env to connect elsewhere.')
   }
-  return canonicalUrl
+  return DEFAULT_POSTGRES_URL
 }
 
 const resolvedDbUrl = resolveDatabaseUrl()
 process.env.DATABASE_URL = resolvedDbUrl
-// Ensure the parent directory exists so SQLite can create/open the file.
-{
-  const filePath = resolvedDbUrl.startsWith('file:')
-    ? resolvedDbUrl.slice('file:'.length).replace(/^\/(?=[A-Za-z]:)/, '')
-    : resolvedDbUrl
-  const dir = dirname(filePath)
-  if (!existsSync(dir)) {
-    try { mkdirSync(dir, { recursive: true }) } catch { /* ignore */ }
-  }
-}
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined
@@ -283,6 +277,7 @@ export const SYNC_TRACKED_MODELS: Set<string> = new Set([
   'SubscriptionPlan',
   'PlanFeature',
   'AgencyCategory', // Task 42-a: user-created agency fields (shared dictionary)
+  'SupportTicket', // super-admin support desk (complaints/suggestions/questions/notes)
 ])
 
 
@@ -447,30 +442,31 @@ export { Prisma, PrismaClient }
 // Default export for convenience
 export default db
 
-// ── SQLite PRAGMA Setup ──────────────────────────────────────────────────────
-// Phase 3b: Set busy_timeout to 5000ms so SQLite waits (instead of immediately
-// failing with SQLITE_BUSY) when another writer holds the lock. This MUST be
-// called once at server startup before any concurrent writes occur.
+// ── Database connection tuning ──────────────────────────────────────────
+// The historic SQLite PRAGMA (busy_timeout) is a no-op on PostgreSQL — the
+// engine handles concurrent writers natively via MVCC. The function is kept
+// (renamed) because the API server calls it during startup; it now doubles
+// as a one-shot connectivity check so a wrong DATABASE_URL fails loudly at
+// boot instead of on the first user request.
 
 let pragmaInitialized = false
 
-export async function setupSQLitePragmas(): Promise<void> {
+export async function setupConnectionPragmas(): Promise<void> {
   if (pragmaInitialized) return
   try {
-    // Use $runCommandRaw or raw query with proper handling for SQLite PRAGMA
-    // $executeRawUnsafe returns results which SQLite doesn't allow, so we use $queryRaw instead
-    await currentBase.$queryRaw`PRAGMA busy_timeout = 5000`
+    await currentBase.$queryRaw`SELECT 1`
     pragmaInitialized = true
   } catch (err) {
-    // Non-fatal — the default busy_timeout is 0, but the retry logic in
-    // queue.ts will still handle SQLITE_BUSY errors gracefully.
-    console.warn('[db] Failed to set PRAGMA busy_timeout:', err)
+    console.warn('[db] Database connectivity check failed:', (err as Error)?.message)
   }
 }
 
+/** @deprecated Legacy SQLite-era name — use {@link setupConnectionPragmas}. */
+export const setupSQLitePragmas = setupConnectionPragmas
+
 // ── Reset-generation invalidation + DB hot-swap (Task 36) ───────────────────
-// scripts/reset-all.ts writes .db-generation.json NEXT to the database file:
-//   phase 1 (old DB file deleted):  { "epoch": <ms>, "ready": false }
+// scripts/reset-all.ts writes .db-generation.json into packages/db/data/:
+//   phase 1 (reset started):        { "epoch": <ms>, "ready": false }
 //   phase 2 (db push + seed done):  { "epoch": <ms>, "ready": true  }
 //
 // 1) apps/api/src/lib/auth.ts calls getInvalidationEpochMs() on EVERY session
@@ -482,10 +478,12 @@ export async function setupSQLitePragmas(): Promise<void> {
 //    data without a restart (the old client drains for 10s, disconnects).
 
 const DB_GENERATION_FILE = (() => {
-  const dbPath = resolvedDbUrl.startsWith('file:')
-    ? resolvedDbUrl.slice('file:'.length).replace(/^\/(?=[A-Za-z]:)/, '')
-    : resolvedDbUrl
-  return resolve(dirname(dbPath), '.db-generation.json')
+  const pkgRoot = typeof __dirname !== 'undefined'
+    ? __dirname
+    : dirname(fileURLToPath(import.meta.url))
+  // The marker lives at the historic SQLite location (packages/db/data/) —
+  // deliberately independent of the PostgreSQL connection string.
+  return resolve(pkgRoot, 'data', '.db-generation.json')
 })()
 
 export interface DbGeneration {
@@ -540,10 +538,10 @@ function swapDbClient(): void {
   currentBase = base
   currentExtended = extension ? (base.$extends(extension) as unknown as PrismaClient) : base
   if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = base
-  // Re-apply connection PRAGMAs on the new client and release the old file
-  // handle after in-flight operations drain (best-effort).
+  // Re-verify connectivity on the new client and release the old pool after
+  // in-flight operations drain (best-effort).
   pragmaInitialized = false
-  void setupSQLitePragmas().catch(() => {})
+  void setupConnectionPragmas().catch(() => {})
   const drain = setTimeout(() => {
     previousBase.$disconnect().catch(() => {})
   }, 10_000)

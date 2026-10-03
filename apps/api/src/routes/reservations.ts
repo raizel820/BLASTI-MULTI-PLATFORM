@@ -148,7 +148,12 @@ app.post('/', async (c) => {
         updatedAt: { gte: fortyFiveForCreate },
       },
     })
-    const isPausedForCreate = agency.queueSettings?.isPaused ?? false
+    // Task 24: queueSettings is a LIST relation — use the first row (the code
+    // above already guards with queueSettings[0].isPaused); the old
+    // `agency.queueSettings?.isPaused` read a property off an array → always
+    // undefined → the join ETA never accounted for a paused queue.
+    const qsForCreate = agency.queueSettings?.[0]
+    const isPausedForCreate = qsForCreate?.isPaused ?? false
     const etaForCreate = calculateETA({
       peopleAhead: waitingCount,
       avgServiceTimeMinutes: effectiveForCreate.avgMinutes,
@@ -315,7 +320,8 @@ app.get('/active', async (c) => {
     })
 
     const currentServings = await db.reservation.findMany({
-      where: { agencyId: { in: agencyIds }, status: { in: ['CALLED', 'SERVED'] }, calledAt: { not: null } },
+      // Task 24: 'SERVED' ghost status → 'SERVING' (the real in-progress status)
+      where: { agencyId: { in: agencyIds }, status: { in: ['CALLED', 'SERVING'] }, calledAt: { not: null } },
       orderBy: { calledAt: 'desc' },
       distinct: ['agencyId'],
       select: { agencyId: true, displayNumber: true },
@@ -843,12 +849,12 @@ app.post('/:id/postpone', async (c) => {
       await tx.reservation.update({ where: { id: reservation.id }, data: { queueNumber: tempQueueNumber } })
 
       await tx.$executeRaw`
-        UPDATE Reservation
-        SET queueNumber = queueNumber - 1
-        WHERE agencyId = ${reservation.agencyId}
-        AND status = 'WAITING'
-        AND queueNumber > ${reservation.queueNumber}
-        AND queueNumber <= ${targetQueueNumber}
+        UPDATE "Reservation"
+        SET "queueNumber" = "queueNumber" - 1
+        WHERE "agencyId" = ${reservation.agencyId}
+        AND "status" = 'WAITING'
+        AND "queueNumber" > ${reservation.queueNumber}
+        AND "queueNumber" <= ${targetQueueNumber}
       `
 
       // Spec Part O: the raw-SQL shift is INVISIBLE to the auto-tracking
@@ -1217,14 +1223,15 @@ app.put('/:id/status', async (c) => {
     }
     const queueEventType = queueEventTypeMap[status]
     if (queueEventType) {
-      emitQueueEvent(queueEventType, reservation.agencyId, { reservationId: id, displayNumber: reservation.displayNumber, previousStatus: reservation.status, newStatus: status, serviceId: reservation.serviceId })
+      // Task 24: userId inside data so the customer's turn-alert listeners can match it
+      emitQueueEvent(queueEventType, reservation.agencyId, { reservationId: id, displayNumber: reservation.displayNumber, previousStatus: reservation.status, newStatus: status, serviceId: reservation.serviceId, userId: reservation.userId || null })
     }
 
     const reservationEventType = status === 'CANCELLED' ? 'reservation:cancelled' : 'reservation:updated'
-    emitReservationEvent(reservationEventType, reservation.agencyId, reservation.userId ?? undefined, { reservationId: id, displayNumber: reservation.displayNumber, previousStatus: reservation.status, newStatus: status })
+    emitReservationEvent(reservationEventType, reservation.agencyId, reservation.userId ?? undefined, { reservationId: id, displayNumber: reservation.displayNumber, previousStatus: reservation.status, newStatus: status, userId: reservation.userId || null })
 
     if (reservation.userId && status === 'CALLED') {
-      emitNotificationEvent('notification:your-turn', reservation.userId, { ticketNumber: reservation.displayNumber, agencyName: reservation.agency.name })
+      emitNotificationEvent('notification:your-turn', reservation.userId, { ticketNumber: reservation.displayNumber, agencyName: reservation.agency.name, userId: reservation.userId, reservationId: id })
     } else if (reservation.userId && status === 'NO_SHOW') {
       emitNotificationEvent('notification:new', reservation.userId, { message: `You missed your turn for ticket ${reservation.displayNumber}` })
     }

@@ -88,12 +88,14 @@ app.post('/call-next', async (c) => {
     }
 
     // Phase 3: Enforce preferred time logic using getNextCustomerToCall
+    // Task 24: pass reservedDate so FUTURE-DATE tickets are never callable today
     const nextId = getNextCustomerToCall(
       waitingReservations.map(r => ({
         id: r.id,
         queueNumber: r.queueNumber,
         preferredTime: r.preferredTime,
         fixedTimeEnabled: r.fixedTimeEnabled,
+        reservedDate: r.reservedDate,
       }))
     )
 
@@ -174,6 +176,7 @@ app.post('/call-next', async (c) => {
             queueNumber: r.queueNumber,
             preferredTime: r.preferredTime,
             fixedTimeEnabled: r.fixedTimeEnabled,
+            reservedDate: r.reservedDate,
           }))
         )
         if (retryNextId) {
@@ -200,12 +203,16 @@ app.post('/call-next', async (c) => {
       reservationId: mergedCallData.id,
       displayNumber: mergedCallData.displayNumber,
       serviceId,
+      // Task 24: userId inside data so the customer's full-screen turn alert
+      // (useTurnAlert checks data.userId) can fire — the envelope alone is not read there
+      userId: mergedCallData.userId || null,
       customerName: mergedCallData.user?.fullName || '',
+      agencyName: mergedCallData.agency?.name,
       counterId,
       counterName: updatedReservation?.counter?.name,
     })
     if (mergedCallData.userId) {
-      emitNotificationEvent('notification:your-turn', mergedCallData.userId, { ticketNumber: mergedCallData.displayNumber, agencyName: mergedCallData.agency.name, serviceName: mergedCallData.service.name })
+      emitNotificationEvent('notification:your-turn', mergedCallData.userId, { ticketNumber: mergedCallData.displayNumber, agencyName: mergedCallData.agency.name, serviceName: mergedCallData.service.name, userId: mergedCallData.userId, reservationId: mergedCallData.id })
     }
     emitKioskEvent(agencyId, { action: 'call-next', displayNumber: mergedCallData.displayNumber, counterId })
 
@@ -402,10 +409,12 @@ app.get('/status', async (c) => {
       countersPerService.set(ar.serviceId, current + 1)
     }
 
-    // Phase 3c: Get waiting reservations with fixedTimeEnabled/preferredTime/createdAt for ghost ticket filtering
+    // Phase 3c: Get waiting reservations with fixedTimeEnabled/preferredTime/joinedAt for ghost ticket filtering
+    // Task 24 RUNTIME FIX: `createdAt` is not a Reservation field — Prisma threw
+    // "Invalid findMany invocation" and /api/queue/status 500'd on every call.
     const allWaitingReservations = await db.reservation.findMany({
       where: { agencyId, status: 'WAITING' },
-      select: { id: true, serviceId: true, fixedTimeEnabled: true, preferredTime: true, createdAt: true },
+      select: { id: true, serviceId: true, fixedTimeEnabled: true, preferredTime: true, reservedDate: true, joinedAt: true },
     })
 
     // Phase 3c: Filter out ghost tickets (WAITING > 2 hours — likely no-shows)
@@ -571,7 +580,8 @@ app.get('/track', async (c) => {
     const waitingReservations = await db.reservation.findMany({
       where: { agencyId, serviceId: reservation.serviceId, status: 'WAITING' },
       orderBy: { queueNumber: 'asc' },
-      select: { id: true, queueNumber: true, joinedAt: true, fixedTimeEnabled: true, preferredTime: true, createdAt: true },
+      // Task 24 RUNTIME FIX: createdAt → joinedAt (real field; see /status fix)
+      select: { id: true, queueNumber: true, joinedAt: true, fixedTimeEnabled: true, preferredTime: true, reservedDate: true },
     })
 
     const activeWaiting = filterGhostTickets(waitingReservations)
@@ -602,8 +612,11 @@ app.get('/track', async (c) => {
     })
 
     // Currently serving number
+    // Task 24: 'SERVED' is not a status in the enum — the real in-progress
+    // status is 'SERVING'. The ghost 'SERVED' entry made this query return
+    // only CALLED tickets (SERVING excluded from "now serving").
     const currentServing = await db.reservation.findFirst({
-      where: { agencyId, status: { in: ['CALLED', 'SERVED'] }, calledAt: { not: null } },
+      where: { agencyId, status: { in: ['CALLED', 'SERVING'] }, calledAt: { not: null } },
       orderBy: { calledAt: 'desc' },
       select: { displayNumber: true },
     })

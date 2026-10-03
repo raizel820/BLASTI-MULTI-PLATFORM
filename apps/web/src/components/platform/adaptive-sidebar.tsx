@@ -59,6 +59,7 @@ import {
   ChevronRight,
   ChevronLeft,
   History,
+  LifeBuoy,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { toast } from 'sonner';
@@ -180,6 +181,8 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
     { view: 'agency-branches', icon: GitBranch, label: t('branchesCounters') },
     { view: 'agency-devices', icon: Monitor, label: t('devicesConnection') },
     { view: 'agency-reviews', icon: Star, label: t('reviewsPage') },
+    // Support desk — file tickets to the super admin / track agency tickets.
+    { view: 'agency-support', icon: LifeBuoy, label: t('supportDesk' as TranslationKeys) },
     { view: 'agency-settings', icon: Settings, label: t('settings') },
     { view: 'agency-profile', icon: Building2, label: t('agencyProfile') },
     { view: 'agency-subscription', icon: CreditCard, label: t('subscription') },
@@ -528,6 +531,9 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
     { view: 'admin-agencies', icon: Building2, label: t('agencies') },
     { view: 'admin-audit', icon: ClipboardList, label: t('auditLogsPage') },
     { view: 'admin-users', icon: Users, label: t('userManagement') },
+    // Support desk — triage/reply incoming complaints, suggestions,
+    // questions and notes from customers and agencies.
+    { view: 'admin-tickets', icon: LifeBuoy, label: t('supportTickets' as TranslationKeys) },
     {
       view: '__sales_ops_group__',
       icon: Briefcase,

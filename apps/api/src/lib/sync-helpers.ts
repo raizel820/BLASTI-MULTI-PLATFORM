@@ -41,6 +41,25 @@ export type TxClient = any
 /** Global sentinel agencyId for platform-wide synced models. */
 export const GLOBAL_AGENCY = '__global__'
 
+// ── PostgreSQL sequence for SyncChange allocation ────────────────────────
+// Created lazily once per process. `IF NOT EXISTS` makes it idempotent
+// across restarts and across the seed wipe (sequences survive DELETEs).
+let syncSequenceReady: Promise<void> | null = null
+
+function ensureSyncSequence(): Promise<void> {
+  if (!syncSequenceReady) {
+    syncSequenceReady = dbRaw
+      .$executeRawUnsafe('CREATE SEQUENCE IF NOT EXISTS sync_change_seq')
+      .then(() => undefined)
+      .catch((err) => {
+        // Reset so a transient failure (db briefly unreachable) can retry.
+        syncSequenceReady = null
+        throw err
+      })
+  }
+  return syncSequenceReady
+}
+
 /** Map model name → Prisma delegate, from the single-source registry. */
 const MODEL_DELEGATES: Map<string, string> = new Map(
   SYNC_REGISTRY.filter((c) => c.isSynced).map((c) => [c.model, c.delegate]),
@@ -66,15 +85,16 @@ export interface RecordSyncChangeParams {
 /**
  * Record a SyncChange entry inside the current transaction.
  *
- * The `sequence` is a GLOBAL monotonic integer allocated ATOMICALLY in a
- * single INSERT..SELECT statement — SQLite evaluates the subquery and the
- * insert under one write lock, so no interleaving writer (auto-track worker,
- * another request) can observe or claim the same value. The sequence is the
- * pull cursor currency: it MUST be monotonic per database (GLOBAL — not
- * per-agency; the feed interleaves agencies by sequence and every consumer
- * filter is agency+global). The allocated sequence IS the record's sync
- * version (Part X Option B: version lives centrally in the SyncChange log,
- * because business tables have no syncVersion column).
+ * The `sequence` is a GLOBAL monotonic integer allocated from the dedicated
+ * PostgreSQL sequence `sync_change_seq` (see ensureSyncSequence) — unlike the
+ * historic SQLite MAX+1 trick, a database SEQUENCE is atomic by definition,
+ * never collides, and never rolls back (gaps are fine: the pull cursor only
+ * needs monotonicity). The sequence is the pull cursor currency: it MUST be
+ * monotonic per database (GLOBAL — not per-agency; the feed interleaves
+ * agencies by sequence and every consumer filter is agency+global). The
+ * allocated sequence IS the record's sync version (Part X Option B: version
+ * lives centrally in the SyncChange log, because business tables have no
+ * syncVersion column).
  *
  * @returns the allocated global sequence (also usable as the record version)
  */
@@ -85,12 +105,14 @@ export async function recordSyncChange(params: RecordSyncChangeParams): Promise<
   // feed of every agency without exploding rows per agency.
   const scopedAgencyId = agencyId || GLOBAL_AGENCY
 
-  // Both MAX+1 subquery evaluations run inside ONE statement under one write
-  // lock — they observe the same MAX, so sequence and syncVersion agree.
+  // One nextval for BOTH columns (sequence + syncVersion) via the CTE —
+  // currval/second nextval calls are avoided so the two columns always agree.
+  await ensureSyncSequence()
   const rows = (await tx.$queryRawUnsafe(
+    'WITH n AS (SELECT nextval(\'sync_change_seq\') AS seq) ' +
     'INSERT INTO "SyncChange" ' +
     '("id", "sequence", "agencyId", "model", "recordId", "operation", "syncVersion", "mutationId", "origin", "changedAt") ' +
-    'SELECT ?, COALESCE((SELECT MAX("sequence") FROM "SyncChange"), 0) + 1, ?, ?, ?, ?, COALESCE((SELECT MAX("sequence") FROM "SyncChange"), 0) + 1, ?, ?, ? ' +
+    'SELECT $1, n.seq, $2, $3, $4, $5, n.seq, $6, $7, $8 FROM n ' +
     'RETURNING "sequence"',
     randomUUID(),
     scopedAgencyId,
@@ -99,7 +121,7 @@ export async function recordSyncChange(params: RecordSyncChangeParams): Promise<
     operation,
     mutationId ?? null,
     origin ?? getSyncContext()?.origin ?? 'cloud',
-    new Date().toISOString(),
+    new Date(),
   )) as Array<{ sequence: number }>
   const seq = Number(Array.isArray(rows) ? rows[0]?.sequence : (rows as any)?.sequence) || 0
   return seq
@@ -316,15 +338,16 @@ async function recordChangeAuto(params: {
 
   noteSyncChange(scoped, model, 0) // sequence filled below; notify uses latest anyway
 
-  // Atomic single-statement allocation: the sequence subquery and the insert
-  // run under one SQLite write lock — no reader/writer can interleave, so a
-  // MAX+1 collision is impossible (unlike the previous read-then-write).
+  // Atomic single-statement allocation via the PostgreSQL sequence — no
+  // collision possible, no retry needed (the loop remains as a safety net).
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      await ensureSyncSequence()
       const inserted = await dbRaw.$queryRawUnsafe(
+        'WITH n AS (SELECT nextval(\'sync_change_seq\') AS seq) ' +
         'INSERT INTO "SyncChange" ' +
         '("id", "sequence", "agencyId", "model", "recordId", "operation", "syncVersion", "mutationId", "origin", "changedAt") ' +
-        'SELECT ?, COALESCE((SELECT MAX("sequence") FROM "SyncChange"), 0) + 1, ?, ?, ?, ?, COALESCE((SELECT MAX("sequence") FROM "SyncChange"), 0) + 1, ?, ?, ? ' +
+        'SELECT $1, n.seq, $2, $3, $4, $5, n.seq, $6, $7, $8 FROM n ' +
         'RETURNING "sequence"',
         randomUUID(),
         scoped,
@@ -333,7 +356,7 @@ async function recordChangeAuto(params: {
         operation,
         ctx?.idempotencyKey ?? null,
         ctx?.origin ?? 'cloud',
-        new Date().toISOString(),
+        new Date(),
       )
       const rawSeq = Array.isArray(inserted)
         ? inserted[0]?.sequence
@@ -1147,8 +1170,8 @@ export async function pruneSyncChanges(days: number = 14): Promise<number> {
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
   try {
     const res = await dbRaw.$executeRawUnsafe(
-      'DELETE FROM "SyncChange" WHERE "changedAt" < ?',
-      cutoff.toISOString(),
+      'DELETE FROM "SyncChange" WHERE "changedAt" < $1',
+      cutoff,
     )
     return typeof res === 'number' ? res : 0
   } catch (err) {

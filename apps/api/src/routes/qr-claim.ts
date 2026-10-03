@@ -11,6 +11,7 @@ import { db } from '@blasti/db'
 import { requireAuth, authErrorResponse } from '../lib/auth'
 import { generateImportToken, verifyQRToken } from '../lib/qr-token-service'
 import { emitQueueEvent, emitReservationEvent, emitKioskEvent } from '../lib/realtime-emit'
+import { recordSyncChangeNow } from '../lib/sync-helpers'
 import { enforceRateLimit, KIOSK_RATE_LIMIT, GENERAL_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
 
 const app = new Hono()
@@ -168,16 +169,26 @@ app.post('/claim', async (c) => {
       }, 400)
     }
 
-    // Mark the reservation as claimed and checked-in
+    // Mark the reservation as claimed and checked-in.
+    // Task 24: KEEP the status as-is (WAITING). The old code flipped it to
+    // 'CONFIRMED' — a status that exists in NO enum and NO queue query — so a
+    // customer scanning their QR pass at the kiosk VANISHED from the agency
+    // queue AND from their own active-tickets list. Claiming = recording
+    // qrClaimedAt/qdClaimDeviceId only; the ticket stays in line.
     const now = new Date()
     await db.reservation.update({
       where: { id: reservation.id },
       data: {
         qrClaimedAt: now,
         qrClaimDeviceId: deviceId,
-        status: 'CONFIRMED',
       },
     })
+    // Task 24: feed the change so DESKTOP agencies sync the claim state too
+    try {
+      await recordSyncChangeNow({ agencyId: reservation.agencyId, model: 'Reservation', recordId: reservation.id, operation: 'update' })
+    } catch (syncErr) {
+      console.warn('[QR-Claim] Failed to record sync change:', syncErr)
+    }
 
     // Emit real-time events to agency room
     try {
@@ -189,10 +200,12 @@ app.post('/claim', async (c) => {
       })
       await emitReservationEvent('reservation:updated', reservation.agencyId, reservation.userId || undefined, {
         reservationId: reservation.id,
-        status: 'CONFIRMED',
+        status: reservation.status,
         qrClaimedAt: now.toISOString(),
       })
-      await emitKioskEvent('kiosk:update', reservation.agencyId, {
+      // Task 24: fixed arity — the old call passed ('kiosk:update', agencyId, data)
+      // to emitKioskEvent(agencyId, data), landing the event in room 'kiosk:kiosk:update'
+      await emitKioskEvent(reservation.agencyId, {
         action: 'qr_claimed',
         reservationId: reservation.id,
         ticketNumber: reservation.displayNumber,
@@ -209,7 +222,7 @@ app.post('/claim', async (c) => {
       reservation: {
         id: reservation.id,
         displayNumber: reservation.displayNumber,
-        status: 'CONFIRMED',
+        status: reservation.status,
         queueNumber: reservation.queueNumber,
         agency: reservation.agency,
         service: reservation.service,

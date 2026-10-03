@@ -70,12 +70,13 @@ function _loadSyncRegistry() {
     }
   } catch { /* fall through */ }
   // 4. Frozen fallback (kept in lockstep with packages/core/src/sync-registry.ts).
-  console.warn('[SyncService] sync-registry.json not found — using FROZEN in-file model list (19 models). Regenerate packages/core/sync-registry.json if models changed.');
+  console.warn('[SyncService] sync-registry.json not found — using FROZEN in-file model list (21 models). Regenerate packages/core/sync-registry.json if models changed.');
   SYNC_TABLES = [
     'Agency', 'User', 'AgencyStaff', 'Service', 'Branch', 'Counter',
     'QueueSettings', 'Reservation', 'Transaction', 'SmsSettings',
     'PaymentSettings', 'Notification', 'Announcement', 'GlobalAnnouncement',
     'Review', 'Favorite', 'FAQ', 'SubscriptionPlan', 'PlanFeature',
+    'AgencyCategory', 'SupportTicket',
   ];
   SYNC_REGISTRY_VERSION = 2;
 }
@@ -93,7 +94,7 @@ const UNSCOPED_TABLES = new Set([
 // reconciliation push scoping. Counter is scoped via branchId → Branch.
 const AGENCY_SCOPED_TABLES = new Set([
   'AgencyStaff', 'Service', 'Branch', 'QueueSettings', 'Reservation',
-  'Transaction', 'Announcement', 'Review', 'Favorite',
+  'Transaction', 'Announcement', 'Review', 'Favorite', 'SupportTicket',
 ]);
 
 const DATE_FIELDS = new Set([
@@ -1304,6 +1305,9 @@ async function _pullFromCloud(options) {
       conflictCount += result.conflicts;
       deletedCount += result.deleted;
       await _markPullPageApplied(pageKey);
+      // Task 24: notify the local agency room AFTER the rows are committed
+      // (see _broadcastPullBusinessEvents). This closes the relay-vs-data race.
+      _broadcastPullBusinessEvents(result.reservationEvents, agencyId);
     }
 
     pages++;
@@ -1503,6 +1507,14 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
   var conflictCount = 0;
   var deletedCount = 0;
   var deferred = 0;
+  // Task 24: business events for applied Reservation rows. The pull is the ONLY
+  // guaranteed data path for customer actions (join/cancel/postpone/call); the
+  // relayed cloud event (fast path) reaches the UI 1-2s BEFORE the row exists
+  // locally, so dashboard refetches raced and lost. Returning the applied
+  // rows lets the caller broadcast AFTER the data is committed.
+  // _pullFromCloud broadcasts these into the local agency room; initial-sync
+  // (which applies thousands of rows at boot) deliberately ignores them.
+  var reservationEvents = [];
   await _ensureDeferredTable(db);
 
   await db.$transaction(async function(tx) {
@@ -1589,6 +1601,7 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
 
         var local = _cloudRecordToLocal(cloudRecord, modelName);
         var existing = await _fetchLocalRecord(tx, table, local.id);
+        var prevStatus = existing ? existing.status : null;
         var ok = await withSavepoint(async function() {
           if (!existing) {
             await _insertLocalRecord(tx, table, local);
@@ -1616,6 +1629,18 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
         });
         if (ok) {
           applied++;
+          if (modelName === 'Reservation') {
+            var action = 'updated';
+            if (!existing) {
+              action = 'create';
+            } else if (prevStatus !== local.status) {
+              if (local.status === 'CALLED') action = 'called';
+              else if (local.status === 'COMPLETED') action = 'completed';
+              else if (local.status === 'NO_SHOW') action = 'no-show';
+              else if (local.status === 'CANCELLED') action = 'cancelled';
+            }
+            reservationEvents.push({ action: action, record: local });
+          }
         } else {
           deferred++;
           await deferChange(table, cloudRecord.id, existing ? 'update' : 'create', local, lastApplyError);
@@ -1631,6 +1656,9 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
         });
         if (delOk) {
           deletedCount++;
+          if (modelName === 'Reservation') {
+            reservationEvents.push({ action: 'cancelled', record: { id: deleteId } });
+          }
         } else {
           deferred++;
           await deferChange(table, deleteId, 'delete', null, lastApplyError);
@@ -1642,7 +1670,71 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
   if (deferred > 0) {
     console.warn('[SyncService] ' + deferred + ' pulled record(s) DURABLY deferred to _deferred_changes (dependency failures) - will re-apply when their parents arrive');
   }
-  return { applied: applied, conflicts: conflictCount, deleted: deletedCount, deferred: deferred };
+  return { applied: applied, conflicts: conflictCount, deleted: deletedCount, deferred: deferred, reservationEvents: reservationEvents };
+}
+
+/**
+ * Task 24 — post-pull business event broadcast (the desktop 'join not shown' fix).
+ * The cloud event relay (fast path) arrives before the pulled row is committed,
+ * so a UI refetch triggered by the relay read STALE SQLite. Now, after each
+ * pull page commits, we re-emit the queue/reservation events for the rows that
+ * just landed — the dashboard (subscribed to all of these) refetches and this
+ * time SEES the new data. Duplicate events vs the relay are harmless (handlers
+ * just refetch); a missing event is what broke the flow.
+ * Best-effort: local realtime may not be running (unit tests) — never throws.
+ */
+function _broadcastPullBusinessEvents(events, agencyId) {
+  if (!events || events.length === 0 || !agencyId) return;
+  var broadcast = null;
+  try {
+    broadcast = require('./lib/local-realtime').broadcastLocalRealtime;
+  } catch (e) {
+    return; // local realtime not available (tests / early boot)
+  }
+  if (typeof broadcast !== 'function') return;
+  var emitted = 0;
+  for (var i = 0; i < events.length; i++) {
+    try {
+      var ev = events[i];
+      var rec = ev.record || {};
+      var payload = {
+        agencyId: agencyId,
+        reservationId: rec.id,
+        displayNumber: rec.displayNumber,
+        status: rec.status,
+        userId: rec.userId || null,
+        reservation: rec,
+      };
+      if (ev.action === 'create') {
+        broadcast('reservation:created', payload);
+        broadcast('queue:joined', payload);
+        emitted += 2;
+      } else if (ev.action === 'cancelled') {
+        broadcast('reservation:cancelled', payload);
+        broadcast('queue:cancelled', payload);
+        emitted += 2;
+      } else if (ev.action === 'called') {
+        broadcast('reservation:updated', payload);
+        broadcast('queue:called', payload);
+        emitted += 2;
+      } else if (ev.action === 'completed') {
+        broadcast('reservation:updated', payload);
+        broadcast('queue:completed', payload);
+        emitted += 2;
+      } else if (ev.action === 'no-show') {
+        broadcast('reservation:updated', payload);
+        broadcast('queue:no-show', payload);
+        emitted += 2;
+      } else {
+        broadcast('reservation:updated', payload);
+        broadcast('queue:updated', payload);
+        emitted += 2;
+      }
+    } catch (e) { /* per-event isolation */ }
+  }
+  if (emitted > 0) {
+    console.log('[SyncService] Post-pull business events broadcast: ' + emitted + ' (Reservation rows: ' + events.length + ')');
+  }
 }
 
 /**

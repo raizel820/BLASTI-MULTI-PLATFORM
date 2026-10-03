@@ -52,7 +52,7 @@ const path = require('path')
 // ─── Versioning ─────────────────────────────────────────────────────────────
 
 /** Current local schema version. Bump when adding MIGRATION_STEPS. */
-const LOCAL_SCHEMA_VERSION = 5
+const LOCAL_SCHEMA_VERSION = 6
 
 /**
  * Incremental upgrade steps BETWEEN versions. Each step:
@@ -130,6 +130,23 @@ const MIGRATION_STEPS = [
       'ALTER TABLE "Counter" ADD COLUMN "occupiedAt" DATETIME',
     ],
   },
+  {
+    // Support tickets (complaints/suggestions/questions/notes to the super
+    // admin). Agency tickets sync down to owning desktops (agency-scoped in
+    // the sync registry); customer tickets stay cloud-side. The regenerated
+    // shared Prisma client includes the model, so the local SQLite table
+    // MUST exist for the local support routes to read/write it. The
+    // convergence pass below additionally self-heals any database shape
+    // that skipped this step.
+    version: 6,
+    name: 'SupportTicket table (super-admin support desk)',
+    statements: [
+      'CREATE TABLE "SupportTicket" ("id" TEXT NOT NULL PRIMARY KEY, "userId" TEXT NOT NULL, "agencyId" TEXT, "subject" TEXT NOT NULL, "category" TEXT NOT NULL DEFAULT \'QUESTION\', "status" TEXT NOT NULL DEFAULT \'OPEN\', "priority" TEXT NOT NULL DEFAULT \'NORMAL\', "message" TEXT NOT NULL, "reply" TEXT, "repliedAt" DATETIME, "repliedBy" TEXT, "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT "SupportTicket_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE RESTRICT ON UPDATE CASCADE, CONSTRAINT "SupportTicket_agencyId_fkey" FOREIGN KEY ("agencyId") REFERENCES "Agency" ("id") ON DELETE SET NULL ON UPDATE CASCADE)',
+      'CREATE INDEX "SupportTicket_userId_createdAt_idx" ON "SupportTicket"("userId", "createdAt")',
+      'CREATE INDEX "SupportTicket_agencyId_createdAt_idx" ON "SupportTicket"("agencyId", "createdAt")',
+      'CREATE INDEX "SupportTicket_status_createdAt_idx" ON "SupportTicket"("status", "createdAt")',
+    ],
+  },
 ]
 
 // ─── Embedded first-creation DDL ────────────────────────────────────────────
@@ -202,7 +219,7 @@ function loadRegistryModels() {
   return ['Agency', 'User', 'AgencyStaff', 'Service', 'Branch', 'Counter', 'QueueSettings',
     'Reservation', 'Transaction', 'SmsSettings', 'PaymentSettings', 'Notification',
     'Announcement', 'GlobalAnnouncement', 'Review', 'Favorite', 'FAQ',
-    'SubscriptionPlan', 'PlanFeature']
+    'SubscriptionPlan', 'PlanFeature', 'AgencyCategory', 'SupportTicket']
 }
 
 // ─── SQL utilities ──────────────────────────────────────────────────────────

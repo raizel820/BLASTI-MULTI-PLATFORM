@@ -135,6 +135,24 @@ const isDev =
   // electron-is-dev is literally just `!app.isPackaged` — use the native.
   !app.isPackaged;
 
+// ─── LAN mode default (kiosk/desktop discovery on the local network) ────────
+// The embedded local API binds 127.0.0.1 by default, which made kiosks and
+// TV boards on the office Wi-Fi unable to discover or pair with the desktop
+// ("desktop app could not discover kiosk devices"). In PACKAGED builds LAN
+// mode is ON by default: the local API binds 0.0.0.0, CORS accepts private
+// http origins and the UDP discovery beacon runs (local-api/index.js +
+// local-api/lib/lan-origin.js). Dev runs stay loopback-only unless the
+// operator opts in with BLASTI_ENABLE_LAN=1 / BLASTI_LAN_BIND=lan.
+// Explicit env always wins over the default.
+if (!process.env.BLASTI_ENABLE_LAN && !process.env.BLASTI_LAN_BIND) {
+  if (!isDev) {
+    process.env.BLASTI_ENABLE_LAN = '1';
+    console.log('[BLASTI Desktop] LAN mode enabled by default (packaged build) — local API is discoverable on the LAN');
+  } else {
+    console.log('[BLASTI Desktop] LAN mode off in dev (set BLASTI_ENABLE_LAN=1 to enable kiosk discovery)');
+  }
+}
+
 // ─── Authoritative Local Database Path (single source of truth) ───────────
 // ═══════════════════════════════════════════════════════════════════════════
 // EXACTLY ONE local database location exists:
@@ -355,9 +373,93 @@ function getNetworkInterfaceName() {
   return null;
 }
 
-// Discovery beacon state (module-scope so cleanup can access them)
-let discoverySocket = null;
-let discoveryInterval = null;
+// ─── LAN Discovery Beacon (Task 2-b) ────────────────────────────────────────
+// Broadcasts a small JSON payload every 3s on UDP :3081 (255.255.255.255 and
+// each interface's subnet broadcast address):
+//     { service:'blasti-local', name, hostname, lanIp, httpPort }
+// The discovery scanner (apps/desktop/local-api/lib/discovery-scanner.js,
+// phase 'beacon') consumes these and surfaces the machine as a high-
+// confidence BLASTI device — this is what lets kiosk shells / other desktops
+// find this machine without a port scan. Runs ONLY in LAN mode; every step
+// is guarded so a UDP failure can never affect the app.
+const BEACON_PORT = 3081;
+const BEACON_INTERVAL_MS = 3000;
+let beaconSocket = null;
+let beaconInterval = null;
+
+/** Build the beacon payload (mirrors the /api/discover beacon identity). */
+function buildBeaconPayload() {
+  return JSON.stringify({
+    service: 'blasti-local',
+    name: getMachineDisplayName(),
+    hostname: getMachineDisplayName(),
+    lanIp: getLocalIP(),
+    httpPort: 3080,
+  });
+}
+
+/** All broadcast addresses worth announcing on (subnets + global broadcast). */
+function getBeaconBroadcastAddresses() {
+  const targets = new Set(['255.255.255.255']);
+  try {
+    const os = require('os');
+    const interfaces = os.networkInterfaces();
+    for (const addrs of Object.values(interfaces)) {
+      for (const iface of addrs || []) {
+        if (iface.family !== 'IPv4' || iface.internal) continue;
+        if (iface.broadcast) targets.add(iface.broadcast);
+      }
+    }
+  } catch { /* global broadcast alone is fine */ }
+  return Array.from(targets);
+}
+
+function startLanBeacon() {
+  if (beaconSocket || beaconInterval) return; // already running
+  let lanMode = false;
+  try { lanMode = require('./local-api/lib/lan-origin').resolveLanBind().lan; } catch { lanMode = false; }
+  if (!lanMode) {
+    console.log('[BLASTI Desktop] Discovery beacon not started (loopback bind — kiosks cannot reach this host)');
+    return;
+  }
+  try {
+    const dgram = require('dgram');
+    beaconSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    beaconSocket.on('error', () => { /* best-effort — keep broadcasting */ });
+    beaconSocket.bind(() => {
+      try { beaconSocket.setBroadcast(true); } catch { /* ignore */ }
+    });
+    beaconInterval = setInterval(() => {
+      try {
+        const payload = Buffer.from(buildBeaconPayload());
+        for (const target of getBeaconBroadcastAddresses()) {
+          try {
+            beaconSocket.send(payload, 0, payload.length, BEACON_PORT, target, () => {});
+          } catch { /* skip dead broadcast target */ }
+        }
+      } catch { /* non-fatal */ }
+    }, BEACON_INTERVAL_MS);
+    // Send one immediately so a fresh kiosk finds us within seconds.
+    setImmediate(() => {
+      try {
+        const payload = Buffer.from(buildBeaconPayload());
+        beaconSocket.send(payload, 0, payload.length, BEACON_PORT, '255.255.255.255', () => {});
+      } catch { /* non-fatal */ }
+    });
+    console.log(`[BLASTI Desktop] LAN discovery beacon broadcasting on UDP :${BEACON_PORT} every ${BEACON_INTERVAL_MS / 1000}s`);
+  } catch (err) {
+    console.warn('[BLASTI Desktop] Discovery beacon unavailable (non-fatal):', err && err.message);
+    stopLanBeacon();
+  }
+}
+
+function stopLanBeacon() {
+  if (beaconInterval) { clearInterval(beaconInterval); beaconInterval = null; }
+  if (beaconSocket) {
+    try { beaconSocket.close(); } catch { /* already closed */ }
+    beaconSocket = null;
+  }
+}
 
 // ─── Single Instance Lock ─────────────────────────────────────────────────────
 
@@ -2128,6 +2230,14 @@ app.whenReady().then(async () => {
     console.warn('[BLASTI Desktop] Failed to wire mutation listener:', wireErr.message);
   }
 
+  // ── LAN discovery beacon (Task 2-b) ────────────────────────────────────
+  // Only broadcasts when the local API is LAN-bound (BLASTI_ENABLE_LAN /
+  // BLASTI_LAN_BIND — see lib/lan-origin.js). Lets kiosks / other desktops
+  // discover this machine on the LAN via UDP :3081 without any port scan.
+  try { startLanBeacon(); } catch (beaconErr) {
+    console.warn('[BLASTI Desktop] Discovery beacon failed to start (non-fatal):', beaconErr && beaconErr.message);
+  }
+
   // Task 49: the WINDOW is created FIRST — it is the primary user surface and
   // must appear even if tray creation misbehaves. Historically the tray was
   // created first; any failure above window creation left the app running
@@ -2204,9 +2314,8 @@ app.on('before-quit', () => {
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
 
 app.on('will-quit', () => {
-  // Clean up LAN discovery beacon
-  if (discoveryInterval) clearInterval(discoveryInterval);
-  if (discoverySocket) discoverySocket.close();
+  // Clean up LAN discovery beacon (Task 2-b)
+  stopLanBeacon();
 
   // Clean up any resources
   if (tray) {

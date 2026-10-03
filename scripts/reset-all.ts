@@ -11,10 +11,11 @@
  *                                        # (kept by default — they are app files)
  *
  * ─── WHAT GETS WIPED ──────────────────────────────────────────────────────────
- * 1. Cloud database  packages/db/data/custom.db (+ -journal / -wal / -shm)
- *    → includes ALL tokens, sessions, verification codes, device registrations,
- *      sync state, transactions (everything lives in the DB).
- *    Then recreated with `prisma db push` + the fresh-start seed, which creates
+ * 1. Cloud database  PostgreSQL (ops/docker-compose.dev.yml locally, ops/
+ *    docker-compose.yml on the OVH server) — `prisma db push --force-reset`
+ *    drops ALL rows and recreates the schema: every token, session,
+ *    verification code, device registration, sync state, transaction.
+ *    Then re-seeded with the fresh-start seed, which creates
  *    the super admin (admin / admin123) and ONE fresh agency account
  *    (owner / owner123 — agency "My Agency", code MYA, no other data).
  * 2. Uploaded user files (images, PDFs, receipts, avatars, logos…):
@@ -44,7 +45,7 @@
  *
  * ⚠️  Safe to run while the services are UP (Linux/macOS): the running cloud
  *     API hot-swaps onto the fresh database automatically — old session tokens
- *     are rejected from the moment the reset starts, and the fresh file is
+ *     are rejected from the moment the reset starts, and the fresh database is
  *     adopted within ~2s (no restart needed). On Windows the DB file may be
  *     EBUSY-locked by a running app — close the apps in that case.
  *     The Electron desktop app must still be FULLY restarted (or just
@@ -71,7 +72,6 @@ const doCloudDb = !DESKTOP_ONLY && !FILES_ONLY;
 const doCloudFiles = !DESKTOP_ONLY;
 const doDesktop = !CLOUD_ONLY && !FILES_ONLY;
 
-const DB_FILE = path.join(ROOT, 'packages', 'db', 'data', 'custom.db');
 const DB_GENERATION_FILE = path.join(ROOT, 'packages', 'db', 'data', '.db-generation.json');
 const API_UPLOADS = path.join(ROOT, 'apps', 'api', 'uploads');
 const WEB_LEGACY_UPLOADS = path.join(ROOT, 'apps', 'web', 'public', 'uploads');
@@ -82,10 +82,10 @@ const failures: string[] = [];
 
 /**
  * Token/DB-generation marker consumed by packages/db (watcher + apps/api
- * auth guard). Phase 1 (ready:false) is written the moment the old DB file
- * is gone: every session JWT issued before `epoch` is rejected from then on.
+ * auth guard). Phase 1 (ready:false) is written the moment the reset starts:
+ * every session JWT issued before `epoch` is rejected from then on.
  * Phase 2 (ready:true) is written after the fresh seed: the running API's
- * watcher hot-swaps its Prisma client onto the recreated file within ~1s.
+ * watcher hot-swaps its Prisma client within ~1s.
  */
 function writeGenerationFile(epoch: number, ready: boolean): void {
   try {
@@ -164,18 +164,42 @@ function desktopDataDirs(): string[] {
 
 function runBunStep(stepArgs: string[], cwd: string, label: string): void {
   console.log(`\n▶ ${label} …`);
-  const dbUrl = `file:${DB_FILE.replace(/\\/g, '/')}`;
-  const result = Bun.spawnSync({
-    cmd: [process.execPath, ...stepArgs],
-    cwd,
-    env: { ...process.env, DATABASE_URL: dbUrl },
-    stdout: 'inherit',
-    stderr: 'inherit',
-  });
+  // Drop a stale non-PostgreSQL DATABASE_URL (sandbox daemons / old IDE
+  // terminals can still export the legacy SQLite file: URL) so the committed
+  // packages/db/.env dev default applies. Real postgres URLs pass through.
+  const env = { ...process.env };
+  if (env.DATABASE_URL && !/^postgres(ql)?:\/\//i.test(env.DATABASE_URL)) {
+    delete env.DATABASE_URL;
+  }
+  // Windows + non-ASCII username: Bun's process spawner (uv_spawn) cannot
+  // launch an executable whose path contains non-ASCII characters — bun.exe
+  // under C:\Users\<Arabic/Cyrillic/… username>\.bun\bin fails with a bogus
+  // ENOENT even though the file exists. Detour through cmd.exe (always at an
+  // ASCII path): cmd resolves `bun` with Windows' own Unicode-correct loader.
+  //
+  // ⚠ Do NOT pre-quote or wrap the /c payload: Bun escapes embedded double
+  // quotes as \" when building the raw Windows command line and cmd.exe
+  // cannot parse \" — it would try to run a command literally named
+  // '"bun run db:seed"'. Every token below is space-free, so each goes in as
+  // its own array entry with no quoting at all.
+  const result =
+    process.platform === 'win32'
+      ? Bun.spawnSync(
+          [env.ComSpec || 'cmd.exe', '/d', '/s', '/c', 'bun', ...stepArgs],
+          { cwd, env, stdout: 'inherit', stderr: 'inherit' },
+        )
+      : Bun.spawnSync({
+          cmd: [process.execPath, ...stepArgs],
+          cwd,
+          env,
+          stdout: 'inherit',
+          stderr: 'inherit',
+        });
   if (!result.success || result.exitCode !== 0) {
     console.error(`\n❌ "${label}" failed (exit ${result.exitCode}).`);
-    console.error('   The database files were deleted but the fresh schema/seed could not be applied.');
-    console.error('   Fix the error above, then run:  bun run db:push && bun run db:seed');
+    console.error('   Fix the error above (check that the PostgreSQL database is reachable:');
+    console.error('   locally: docker compose -f ops/docker-compose.dev.yml up -d), then re-run.');
+    console.error('   You can also finish manually with:  bun run db:push && bun run db:seed');
     process.exit(1);
   }
 }
@@ -184,7 +208,7 @@ console.log('══════════════════════�
 console.log('  BLASTI MULTI — FULL RESET');
 console.log('  Permanently deletes ALL databases, tokens, sessions and');
 console.log('  uploaded files. Only the super-admin and one fresh agency owner are recreated.');
-if (doCloudDb) console.log('  • cloud database (packages/db/data/custom.db) + ALL tokens/sessions');
+if (doCloudDb) console.log('  • cloud PostgreSQL database — ALL data + tokens/sessions');
 if (doCloudFiles) console.log('  • uploaded files (apps/api/uploads + apps/web/public/uploads)');
 if (doDesktop) console.log('  • desktop local data (local DB + files + stored session)');
 console.log('════════════════════════════════════════════════════════════');
@@ -207,10 +231,7 @@ if (apiWasRunning) {
 
 // ─── 1. Cloud database ─────────────────────────────────────────────────────────
 if (doCloudDb) {
-  console.log('🗄  [1/3] Cloud database (DB + tokens + sessions)');
-  for (const suffix of ['', '-journal', '-wal', '-shm']) {
-    rm(`${DB_FILE}${suffix}`, `packages/db/data/custom.db${suffix}`);
-  }
+  console.log('🗄  [1/3] Cloud database (PostgreSQL — ALL data + tokens + sessions)');
   // Defensive: force the API to re-run `prisma db push` on next start.
   rm(SCHEMA_STAMP, 'packages/db/.schema-stamp');
 
@@ -219,11 +240,12 @@ if (doCloudDb) {
   const resetEpoch = Date.now();
   writeGenerationFile(resetEpoch, false);
 
-  runBunStep(['run', 'db:push'], path.join(ROOT, 'packages', 'db'), 'prisma db push (recreate empty schema)');
+  // Drop ALL data + recreate the schema (PostgreSQL — nothing to delete on disk).
+  runBunStep(['run', 'db:force-reset'], path.join(ROOT, 'packages', 'db'), 'prisma db push --force-reset (drop all data, recreate schema)');
   runBunStep(['run', 'db:seed'], path.join(ROOT, 'packages', 'db'), 'fresh-start seed (admin + fresh agency)');
 
   // Phase 2: the running API's generation watcher hot-swaps its DB client
-  // onto the freshly recreated file — no restart required.
+  // onto the freshly re-seeded database — no restart required.
   writeGenerationFile(resetEpoch, true);
 }
 

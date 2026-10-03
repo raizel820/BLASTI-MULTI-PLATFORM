@@ -7,7 +7,7 @@
 # Duplicate full stacks were a direct cause of 100% CPU/RAM machine freezes.
 
 (
-  export DATABASE_URL="${DATABASE_URL:-file:/home/z/my-project/packages/db/data/custom.db}"
+  export DATABASE_URL="${DATABASE_URL:-postgresql://blasti:blasti@127.0.0.1:5432/blasti?schema=public}"
   export NEXTAUTH_SECRET="${NEXTAUTH_SECRET:-blast1-dev-s3cr3t-k3y-f0r-d3v3l0pm3nt-0nly}"
   export CORS_ORIGIN="${CORS_ORIGIN:-*}"
   export INTERNAL_SECRET="${INTERNAL_SECRET:-blast1-internal-secret-dev}"
@@ -51,9 +51,9 @@
     echo "[$(date)] Next.js already serving on :3000 — skipping (no duplicate instance)" >> /tmp/services.log
   else
     cd /home/z/my-project/apps/web
-    # Heap-capped Node dev server via the shared launcher (never `bun --bun` —
-    # see WEB_DEV_CRASH_AUDIT.md; cap prevents machine-wide RAM exhaustion).
-    node ../../scripts/dev-web.cjs -p 3000 -H 127.0.0.1 > /tmp/next-dev.log 2>&1 &
+    # Dev server via the shared launcher (scripts/dev-web.mjs is env-driven:
+    # PORT + HOST). Heap cap comes from NODE_OPTIONS below when set.
+    PORT=3000 HOST=0.0.0.0 NODE_OPTIONS="--max-old-space-size=2048" node ../../scripts/dev-web.mjs > /tmp/next-dev.log 2>&1 &
     NEXT_PID=$!
     echo "[$(date)] Next.js started (PID $NEXT_PID, heap-capped)" >> /tmp/services.log
   fi

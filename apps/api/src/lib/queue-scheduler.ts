@@ -7,12 +7,31 @@
  */
 
 /**
+ * Task 24: format a Date as its LOCAL calendar date 'YYYY-MM-DD'.
+ * (API-side mirror of the web app's toLocalDateString — do NOT use
+ * toISOString(), it shifts the day for any timezone east of UTC.)
+ */
+function localDateString(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+/**
  * Check if a reservation should be skipped because the preferred time hasn't arrived yet
+ *
+ * Task 24: reservedDate awareness — a ticket booked for a FUTURE DATE is not
+ * callable today. This used to ignore reservedDate entirely, so a ticket made
+ * for tomorrow 10:00 became callable at 10:00 TODAY (fixed) or immediately
+ * (flexible). Past-date tickets are treated like today (never stranded).
  */
 export function shouldSkipForPreferredTime(
-  reservation: { preferredTime: string | null; fixedTimeEnabled: boolean },
+  reservation: { preferredTime: string | null; fixedTimeEnabled: boolean; reservedDate?: string | null },
   currentTime: Date = new Date()
 ): boolean {
+  if (reservation.reservedDate) {
+    if (reservation.reservedDate > localDateString(currentTime)) return true;
+  }
+
   if (!reservation.preferredTime || !reservation.fixedTimeEnabled) return false;
 
   const [hours, minutes] = reservation.preferredTime.split(':').map(Number);
@@ -34,6 +53,7 @@ export function getNextCustomerToCall(
     queueNumber: number;
     preferredTime: string | null;
     fixedTimeEnabled: boolean;
+    reservedDate?: string | null;
   }>,
   currentTime: Date = new Date()
 ): string | null {
@@ -59,6 +79,7 @@ export function getEffectivePosition(
     queueNumber: number;
     preferredTime: string | null;
     fixedTimeEnabled: boolean;
+    reservedDate?: string | null;
   }>,
   currentTime: Date = new Date()
 ): number {

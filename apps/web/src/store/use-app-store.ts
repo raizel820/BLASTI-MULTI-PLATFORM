@@ -23,6 +23,7 @@ export type ViewName =
   | 'customer-settings'
   | 'customer-sms-wallet'
   | 'customer-analytics'
+  | 'customer-support'
   | 'agency-dashboard'
   | 'agency-settings'
   | 'agency-employees'
@@ -32,12 +33,14 @@ export type ViewName =
   | 'agency-branches'
   | 'agency-devices'
   | 'agency-analytics'
+  | 'agency-support'
   | 'admin-dashboard'
   | 'admin-transactions'
   | 'admin-agencies'
   | 'admin-audit'
   | 'admin-users'
   | 'admin-analytics'
+  | 'admin-tickets'
   | 'admin-settings'
   // Task 2-b: dedicated super-admin Maps & Location page (standalone wrapper
   // around AdminMapsSettings, which is also embedded in admin-settings).
@@ -132,6 +135,7 @@ const viewHashMap: Record<ViewName, string> = {
   'customer-favorites': '#/customer/favorites',
   'customer-settings': '#/customer/settings',
   'customer-analytics': '#/customer/analytics',
+  'customer-support': '#/customer/support',
   'customer-sms-wallet': '#/customer/sms-wallet',
   'agency-dashboard': '#/agency',
   'agency-settings': '#/agency/settings',
@@ -142,12 +146,14 @@ const viewHashMap: Record<ViewName, string> = {
   'agency-branches': '#/agency/branches',
   'agency-devices': '#/agency/devices',
   'agency-analytics': '#/agency/analytics',
+  'agency-support': '#/agency/support',
   'admin-dashboard': '#/admin',
   'admin-transactions': '#/admin/transactions',
   'admin-agencies': '#/admin/agencies',
   'admin-audit': '#/admin/audit',
   'admin-users': '#/admin/users',
   'admin-analytics': '#/admin/analytics',
+  'admin-tickets': '#/admin/tickets',
   'admin-settings': '#/admin/settings',
   'admin-maps': '#/admin/maps', // Task 2-b
   'admin-subscription-plans': '#/admin/subscription-plans',

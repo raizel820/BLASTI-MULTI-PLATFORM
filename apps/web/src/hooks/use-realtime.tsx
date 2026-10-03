@@ -23,10 +23,11 @@
 
 'use client'
 
-import { useEffect, useRef, useCallback, useState } from 'react'
+import { useEffect, useRef, useCallback, useState, useMemo } from 'react'
 import { io, Socket } from 'socket.io-client'
 import { useAppStore } from '@/store/use-app-store'
 import { shouldShowAlert, enterSleepMode, clearSleep, subscribe as subscribeSleep, isReactivationDue, markReactivationShown, getSleepRecord, closeTurnNotifications } from '@/lib/turn-alert-sleep'
+import { getNativeCloudUrl, ensureNativeCloudUrl, onNativeCloudStateChange } from '@/lib/native-cloud-resolver'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -108,11 +109,13 @@ function resolveSocketUrl(): string {
     return 'http://127.0.0.1:3080'
   }
   // Other native platforms (Capacitor): connect directly to the cloud API's
-  // realtime server. NEXT_PUBLIC_API_URL is baked in at build time
-  // (apps/web/.env.production); the 10.0.2.2 fallback is the emulator's
-  // alias for the host machine — localhost would be the device itself.
+  // realtime server. The runtime-resolved LAN address wins (physical devices —
+  // the build-time default 10.0.2.2 is the EMULATOR's alias for the host
+  // machine and no real phone can reach it), then NEXT_PUBLIC_API_URL baked in
+  // at build time (apps/web/.env.production), then the 10.0.2.2 fallback.
   if (isNativePlatform()) {
-    return process.env.NEXT_PUBLIC_API_URL
+    return getNativeCloudUrl()
+      || process.env.NEXT_PUBLIC_API_URL
       || (typeof process !== 'undefined' && (process as any).env?.BLASTI_CLOUD_URL)
       || `http://10.0.2.2:${REALTIME_PORT}`
   }
@@ -196,9 +199,34 @@ function isNativePlatform(): boolean {
 
 function getSocket(): Socket {
   if (!globalSocket) {
-    globalSocket = io(resolveSocketUrl(), resolveSocketOptions())
+    globalSocketCreatedAtUrl = resolveSocketUrl()
+    globalSocket = io(globalSocketCreatedAtUrl, resolveSocketOptions())
   }
   return globalSocket
+}
+
+/** URL the global socket singleton was created with (for repointing). */
+let globalSocketCreatedAtUrl: string | null = null
+
+/**
+ * Re-point the ALREADY-ALLOCATED socket singleton at a newly resolved cloud
+ * URL and reconnect it. Same object, same listeners — socket.io-client 4.x
+ * re-reads Manager.uri on every open(), so mutating it + disconnect/connect
+ * is sufficient. This covers the case where the native cloud resolver finds
+ * the PC's LAN address AFTER the socket already started connecting to the
+ * (emulator-default) build-time URL.
+ */
+function repointGlobalSocket(newUrl: string): void {
+  if (!globalSocket || !newUrl || globalSocketCreatedAtUrl === newUrl) return
+  console.log(`[Realtime] repointing socket ${globalSocketCreatedAtUrl} → ${newUrl}`)
+  globalSocketCreatedAtUrl = newUrl
+  try {
+    ;(globalSocket.io as unknown as { uri: string }).uri = newUrl
+  } catch { /* manager shape changed — next reconnect will handle it */ }
+  try {
+    globalSocket.disconnect()
+    globalSocket.connect()
+  } catch { /* ignore */ }
 }
 
 function releaseSocket(): void {
@@ -283,75 +311,116 @@ export function useRealtime(options?: UseRealtimeOptions) {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected')
   const joinedRoomsRef = useRef<Set<string>>(new Set(initialRooms))
   const listenersRef = useRef<Map<string, Set<SocketHandler>>>(new Map())
+  // Device credential for join:device (TV boards / kiosks) — re-emitted on
+  // every reconnect from the connection effect below.
+  const deviceTokenRef = useRef<string | null>(null)
 
   // ─── Connection Lifecycle ─────────────────────────────────────────────
 
   useEffect(() => {
     if (!autoConnect) return
 
-    const socket = getSocket()
-    socketRef.current = socket
-    connectionCount++
+    let cancelled = false
+    let teardown: (() => void) | null = null
 
-    const onConnect = () => {
-      setConnectionStatus('connected')
-      // Re-join all rooms that were previously joined
-      for (const room of joinedRoomsRef.current) {
-        socket.emit('join:room', room)
+    const boot = async () => {
+      // Native shells (Capacitor): give the runtime cloud resolver a short
+      // window BEFORE the first socket connect — the build-time URL may be
+      // the emulator alias, unreachable from a physical phone. Bounded by an
+      // 8s race so a hopeless LAN never blocks the app from starting.
+      if (isNativePlatform() && !isElectronPlatform() && !getNativeCloudUrl()) {
+        await Promise.race([
+          ensureNativeCloudUrl().catch(() => null),
+          new Promise((r) => setTimeout(r, 8000)),
+        ])
       }
-      // Disconnect LAN socket — cloud is back
-      if (lanSocket) {
-        lanSocket.disconnect()
-        lanSocket = null
-        lanSocketConnected = false
+      if (cancelled) return
+
+      const socket = getSocket()
+      socketRef.current = socket
+      connectionCount++
+
+      const onConnect = () => {
+        setConnectionStatus('connected')
+        // Re-join all rooms that were previously joined
+        for (const room of joinedRoomsRef.current) {
+          socket.emit('join:room', room)
+        }
+        // Devices must re-run the FULL join:device handshake after a reconnect
+        // (it re-joins agency/kiosk rooms server-side and flips status ONLINE)
+        if (deviceTokenRef.current) {
+          socket.emit('join:device', deviceTokenRef.current)
+        }
+        // Disconnect LAN socket — cloud is back
+        if (lanSocket) {
+          lanSocket.disconnect()
+          lanSocket = null
+          lanSocketConnected = false
+        }
+      }
+
+      const onDisconnect = (reason: string) => {
+        setConnectionStatus('disconnected')
+
+        // On native platforms, try connecting to LAN server after 5s delay
+        if (isNativePlatform() && !lanSocket) {
+          setTimeout(() => {
+            if (globalSocket?.connected) return // cloud reconnected
+            connectLanSocket()
+          }, 5000)
+        }
+      }
+
+      const onConnecting = () => {
+        setConnectionStatus('connecting')
+      }
+
+      // When all reconnection attempts are exhausted (native: 5 attempts),
+      // stop trying and accept offline mode. The HTTP LAN fallback handles data.
+      const onReconnectFailed = () => {
+        setConnectionStatus('disconnected')
+        console.log('[Realtime] Cloud reconnection failed — staying in offline mode')
+      }
+
+      socket.on('connect', onConnect)
+      socket.on('disconnect', onDisconnect)
+      socket.on('reconnect_attempt', onConnecting)
+      socket.on('connect_error', onConnecting)
+      socket.on('reconnect_failed', onReconnectFailed)
+
+      if (!socket.connected) {
+        socket.connect()
+        setConnectionStatus('connecting')
+      } else {
+        setConnectionStatus('connected')
+      }
+
+      // Late resolution: if the native cloud resolver finds the server AFTER
+      // the socket started dialing the wrong (build-time) URL, repoint the
+      // singleton and reconnect — same object, listeners stay attached.
+      const unsubResolve = onNativeCloudStateChange((s) => {
+        if (s.status === 'found' && s.url) repointGlobalSocket(s.url)
+      })
+
+      teardown = () => {
+        unsubResolve()
+        socket.off('connect', onConnect)
+        socket.off('disconnect', onDisconnect)
+        socket.off('reconnect_attempt', onConnecting)
+        socket.off('connect_error', onConnecting)
+        socket.off('reconnect_failed', onReconnectFailed)
+
+        releaseSocket()
+        socketRef.current = null
       }
     }
 
-    const onDisconnect = (reason: string) => {
-      setConnectionStatus('disconnected')
-
-      // On native platforms, try connecting to LAN server after 5s delay
-      if (isNativePlatform() && !lanSocket) {
-        setTimeout(() => {
-          if (globalSocket?.connected) return // cloud reconnected
-          connectLanSocket()
-        }, 5000)
-      }
-    }
-
-    const onConnecting = () => {
-      setConnectionStatus('connecting')
-    }
-
-    // When all reconnection attempts are exhausted (native: 5 attempts),
-    // stop trying and accept offline mode. The HTTP LAN fallback handles data.
-    const onReconnectFailed = () => {
-      setConnectionStatus('disconnected')
-      console.log('[Realtime] Cloud reconnection failed — staying in offline mode')
-    }
-
-    socket.on('connect', onConnect)
-    socket.on('disconnect', onDisconnect)
-    socket.on('reconnect_attempt', onConnecting)
-    socket.on('connect_error', onConnecting)
-    socket.on('reconnect_failed', onReconnectFailed)
-
-    if (!socket.connected) {
-      socket.connect()
-      setConnectionStatus('connecting')
-    } else {
-      setConnectionStatus('connected')
-    }
+    void boot()
 
     return () => {
-      socket.off('connect', onConnect)
-      socket.off('disconnect', onDisconnect)
-      socket.off('reconnect_attempt', onConnecting)
-      socket.off('connect_error', onConnecting)
-      socket.off('reconnect_failed', onReconnectFailed)
-
-      releaseSocket()
-      socketRef.current = null
+      cancelled = true
+      teardown?.()
+      teardown = null
     }
   }, [autoConnect])
 
@@ -414,6 +483,22 @@ export function useRealtime(options?: UseRealtimeOptions) {
   const leaveAdmin = useCallback(() => {
     joinedRoomsRef.current.delete('admin:global')
     socketRef.current?.emit('leave:admin')
+  }, [])
+
+  // ─── Device room (TV boards / kiosks authenticated by deviceToken) ────
+  // The server's `join:device` handler validates the deviceToken against the
+  // AgencyDevice table, then joins device:* + agency:* + kiosk:* rooms and
+  // marks the socket as _isDevice — the ONLY way an unauthenticated display
+  // device can receive queue:* events.
+  const joinDevice = useCallback((deviceToken: string) => {
+    if (!deviceToken) return
+    deviceTokenRef.current = deviceToken
+    socketRef.current?.emit('join:device', deviceToken)
+  }, [])
+
+  const leaveDevice = useCallback(() => {
+    deviceTokenRef.current = null
+    socketRef.current?.emit('leave:device')
   }, [])
 
   // ─── Generic Event Subscription ──────────────────────────────────────
@@ -497,11 +582,13 @@ export function useRealtime(options?: UseRealtimeOptions) {
     off(event, handler)
   }, [off])
 
-  return {
+  return useMemo(() => ({
     // Connection state
     isConnected: connectionStatus === 'connected',
     connectionStatus,
     connected: connectionStatus === 'connected',
+    // True when a user session token exists (in-app preview vs standalone device)
+    hasSession: !!sessionToken,
 
     // Low-level
     on,
@@ -521,6 +608,8 @@ export function useRealtime(options?: UseRealtimeOptions) {
     leaveKiosk,
     joinAdmin,
     leaveAdmin,
+    joinDevice,
+    leaveDevice,
 
     // Queue event subscriptions
     onQueueCreated,
@@ -559,7 +648,21 @@ export function useRealtime(options?: UseRealtimeOptions) {
     subscribe,
     unsubscribe,
     onAnyEvent,
-  }
+  }), [
+    connectionStatus, sessionToken,
+    on, off, emit,
+    joinRoom, leaveRoom,
+    joinAgency, leaveAgency, joinCustomer, leaveCustomer,
+    joinKiosk, leaveKiosk, joinAdmin, leaveAdmin,
+    joinDevice, leaveDevice,
+    onQueueCreated, onQueueUpdated, onQueueCalled, onQueueCompleted,
+    onQueueNoShow, onQueueCancelled, onQueueJoined, onQueueWalkIn,
+    onQueuePaused, onQueueResumed, onQueuePositionChanged, onQueueSettingsUpdated,
+    onReservationCreated, onReservationUpdated, onReservationCancelled,
+    onNotification, onTurnApproaching, onYourTurn,
+    onKioskUpdate, onAgencyUpdated, onStaffUpdated,
+    subscribe, unsubscribe, onAnyEvent,
+  ])
 }
 
 // ─── Role-Specific Hook: useAgencyRealtime ────────────────────────────────
@@ -825,7 +928,8 @@ export function useTurnAlert(userId: string | undefined) {
     // Listen for notification:your-turn events
     const unsubYourTurn = subscribe('notification:your-turn', (event: any) => {
       const data = event?.data || event
-      if (data?.userId === userId) {
+      // Task 24: userId may ride inside data (new) or on the relayed envelope top level — accept both
+      if (data?.userId === userId || event?.userId === userId) {
         const reservationId = data?.reservationId || data?.id
         // Sleep-state check: if the alert is suppressed (sleep mode), do not show
         if (reservationId && !shouldShowAlert(reservationId)) return
@@ -849,7 +953,8 @@ export function useTurnAlert(userId: string | undefined) {
     // Also listen for queue:called events as backup
     const unsubQueueCalled = subscribe('queue:called', (event: any) => {
       const data = event?.data || event
-      if (data?.userId === userId) {
+      // Task 24: userId may ride inside data (new) or on the relayed envelope top level — accept both
+      if (data?.userId === userId || event?.userId === userId) {
         const reservationId = data?.reservationId || data?.id
         // Sleep-state check: if the alert is suppressed (sleep mode), do not show
         if (reservationId && !shouldShowAlert(reservationId)) return

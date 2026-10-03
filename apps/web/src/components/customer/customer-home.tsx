@@ -1,5 +1,6 @@
 'use client';
 import { apiFetch } from '@/lib/api-fetch';
+import { toLocalDateString } from '@/lib/date-utils';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
@@ -362,7 +363,7 @@ export function CustomerHome() {
           && selectedDate.getMonth() === today.getMonth()
           && selectedDate.getDate() === today.getDate();
         if (!isToday) {
-          body.reservedDate = selectedDate.toISOString().split('T')[0];
+          body.reservedDate = toLocalDateString(selectedDate);
         }
       }
       // Add preferred time if set

@@ -25,6 +25,7 @@
  */
 
 import { useState, useCallback } from 'react'
+import { useRouter } from 'next/navigation'
 import { apiFetch } from '@/lib/api-fetch'
 import { apiClient, setNativeSessionToken } from '@/lib/api-client'
 import { useAppStore } from '@/store/use-app-store'
@@ -36,6 +37,7 @@ import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
 import { LanguageSwitcher } from '@/components/shared/language-switcher'
 import { ThemeToggle } from '@/components/shared/theme-toggle'
+import { NativeServerStatus } from './native-server-status'
 import {
   Eye, EyeOff, Loader2, Building2, Users, MonitorPlay, CloudOff,
   ShieldCheck, ArrowLeft,
@@ -104,6 +106,20 @@ const COPY = {
 
 export function DesktopAgencyLogin() {
   const { setUser, setView, setSessionToken } = useAppStore()
+  // Task 24: the store's setUser() already flips currentView to
+  // 'agency-dashboard' + '#/agency', but when this component is mounted on the
+  // STANDALONE /agency/login route (deep links / diagnostics / dev preview),
+  // the Home ViewRouter is not mounted — nothing re-renders and the user was
+  // stranded on the login form forever. Navigate back to the SPA root after a
+  // successful login so the dashboard actually renders.
+  const router = useRouter()
+  const navigateToConsole = useCallback(() => {
+    try {
+      if (typeof window !== 'undefined' && window.location.pathname !== '/') {
+        router.replace('/')
+      }
+    } catch { /* router unavailable — the periodic views still recover */ }
+  }, [router])
   const { t, lang } = useLanguage()
   const c = COPY[lang === 'en' ? 'en' : 'ar']
 
@@ -226,6 +242,7 @@ export function DesktopAgencyLogin() {
           }
           toast.success(t('loginSuccess'))
           setLoginSuccess(false)
+          navigateToConsole()
         }, 600)
       } else {
         triggerShake()
@@ -234,9 +251,22 @@ export function DesktopAgencyLogin() {
           setFormError(c.customerRefused)
           toast.error(c.customerRefused)
         } else {
-          const msg = data.error || t('invalidCredentials')
-          setFormError(msg)
-          toast.error(msg)
+          // Network-level failure (apiFetch maps network ApiClientErrors to a
+          // 5xx whose statusText is the raw fetch message) — on a physical
+          // phone this is almost always "the app can't find the PC's server".
+          // Give an actionable message instead of a generic error.
+          const networkFailure = res.status >= 500 && /fetch|network|timed out|load failed/i.test(res.statusText || '')
+          if (networkFailure) {
+            setFormError(t('loginNetworkError'))
+            toast.error(t('loginNetworkError'), {
+              description: t('loginNetworkErrorDesc'),
+              duration: 8000,
+            })
+          } else {
+            const msg = data.error || t('invalidCredentials')
+            setFormError(msg)
+            toast.error(msg)
+          }
         }
       }
     } catch {
@@ -299,6 +329,7 @@ export function DesktopAgencyLogin() {
       toast.success(t('loginSuccess'))
       setVerificationData(null)
       setLoginSuccess(false)
+      navigateToConsole()
     }, 600)
   }
 
@@ -460,6 +491,14 @@ export function DesktopAgencyLogin() {
                       <h2 className="text-xl font-bold text-foreground">{c.signInTitle}</h2>
                     </div>
                     <p className="text-sm text-muted-foreground">{c.signInSubtitle}</p>
+                  </div>
+
+                  {/* Native shell (Capacitor): show/fix the PC server
+                      connection before the user burns a login attempt —
+                      the build-time API URL may be unreachable on this
+                      device. Renders nothing in the browser/Electron. */}
+                  <div className="mb-4">
+                    <NativeServerStatus />
                   </div>
 
                   <div className="space-y-4" onKeyDown={handleKeyDown}>

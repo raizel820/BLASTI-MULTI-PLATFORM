@@ -471,8 +471,10 @@ export function AgencyDevices() {
   const handleTestDiscoveryPrinter = useCallback(async (device: RealDiscoveredDevice) => {
     setTestingPrinterId(device.id);
     try {
-      // Use discovery service probe endpoint for unregistered devices (direct IP test)
-      const res = await apiFetch(`/api/probe?XTransformPort=3010`, {
+      // Probe the printer via the API's /discovery/probe endpoint (TCP connect
+      // test). The historic call pointed at /api/probe on the retired :3010
+      // discovery mini-service — it could only ever fail.
+      const res = await apiFetch(`${API_BASE}/discovery/probe`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ip: device.ip, port: device.port, timeout: 3000 }),

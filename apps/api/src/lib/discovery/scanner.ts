@@ -25,7 +25,7 @@ import { Buffer } from 'node:buffer'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-export type DiscoverySource = 'arp' | 'ping' | 'mdns' | 'ssdp' | 'http_probe' | 'usb' | 'local'
+export type DiscoverySource = 'arp' | 'ping' | 'mdns' | 'ssdp' | 'http_probe' | 'usb' | 'local' | 'udp-beacon'
 export type DeviceCategory = 'BLASTI' | 'NETWORK' | 'UPNP' | 'LOCAL'
 export type DeviceType = 'TV' | 'KIOSK' | 'DISPLAY' | 'PRINTER' | 'APP' | 'PHONE' | 'ROUTER' | 'IOT' | 'UNKNOWN'
 
@@ -85,7 +85,7 @@ export interface DiscoveredDeviceRaw {
 }
 
 export type ScanPhase =
-  | 'idle' | 'arp' | 'ping' | 'mdns' | 'ssdp' | 'names'
+  | 'idle' | 'beacon' | 'arp' | 'ping' | 'mdns' | 'ssdp' | 'names'
   | 'http' | 'local' | 'fingerprinting' | 'complete' | 'error'
 
 export interface ScanProgress {
@@ -133,6 +133,13 @@ const MDNS_ADDR = '224.0.0.251'
 const MDNS_PORT = 5353
 const SSDP_ADDR = '239.255.255.250'
 const SSDP_PORT = 1900
+
+// Task 2-b — UDP discovery beacon. Desktop/kiosk shells broadcast a small
+// JSON payload ({service:'blasti-local', name, lanIp, httpPort}) on this
+// port every few seconds; the scanner listens for it and turns those
+// announcements into high-confidence BLASTI devices without any probing.
+const BEACON_UDP_PORT = 3081
+const BEACON_LISTEN_MS = 2500
 
 /** mDNS service types we actively query for.
  *
@@ -185,22 +192,72 @@ const MDNS_SERVICE_TYPES = [
 
 // ─── Network helpers ────────────────────────────────────────────────────────
 
-export function getLocalSubnets(): string[] {
-  const interfaces = os.networkInterfaces()
-  const subnets: string[] = []
-  for (const [, addrs] of Object.entries(interfaces)) {
-    if (!addrs) continue
-    for (const addr of addrs) {
-      if (addr.family === 'IPv4' && !addr.internal) {
-        const parts = addr.address.split('.')
-        if (parts.length === 4) {
-          const subnet = `${parts[0]}.${parts[1]}.${parts[2]}`
-          if (!subnets.includes(subnet)) subnets.push(subnet)
-        }
+// Interface-name patterns for VIRTUAL adapters that must never be scanned:
+// Docker/WSL/vEthernet/VPN taps produce unreachable or irrelevant subnets.
+const VIRTUAL_IFACE_RE = /docker|veth|br-|vmnet|vEthernet|WSL|VirtualBox|Host-Only|Loopback|TAP|TUN|utun|llw|awdl/i
+
+/** Parse an IPv4 netmask ('255.255.255.0') into a prefix length (24). */
+function netmaskToPrefixLen(netmask: string): number | null {
+  const parts = String(netmask || '').split('.').map((n) => parseInt(n, 10))
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return null
+  let prefix = 0
+  let sawZero = false
+  for (const octet of parts) {
+    for (let bit = 7; bit >= 0; bit--) {
+      if (octet & (1 << bit)) {
+        if (sawZero) return null // non-contiguous netmask
+        prefix++
+      } else {
+        sawZero = true
       }
     }
   }
-  return subnets.length > 0 ? subnets : ['192.168.1']
+  return prefix
+}
+
+/** Per-octet mask for a prefix length (octet index 0..3). */
+function octetMask(prefixLen: number, index: number): number {
+  const bits = Math.max(0, Math.min(8, prefixLen - index * 8))
+  return bits === 0 ? 0 : (0xff << (8 - bits)) & 0xff
+}
+
+/**
+ * Enumerate the /24 subnets worth scanning.
+ * FIX (Task 2-b): the old version blindly took the first three octets of
+ * every non-internal IPv4 — it ignored the netmask (mis-aligning the network
+ * base on non-/24 masks), included virtual adapters (Docker/WSL/vEthernet/
+ * VPN taps) and could return duplicates. The network base is now derived
+ * from ip & netmask; obvious virtual adapters are filtered out UNLESS nothing
+ * remains (then the unfiltered list is used). The scan stays /24-bounded by
+ * contract (callers assume 254 addresses per subnet).
+ */
+export function getLocalSubnets(): string[] {
+  const interfaces = os.networkInterfaces()
+  const physical: string[] = []
+  const all: string[] = []
+  for (const [name, addrs] of Object.entries(interfaces)) {
+    if (!addrs) continue
+    for (const addr of addrs) {
+      if (!addr || addr.family !== 'IPv4' || addr.internal) continue
+      const parts = addr.address.split('.').map((n) => parseInt(n, 10))
+      if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) continue
+      const prefixLen = netmaskToPrefixLen(addr.netmask)
+      let base: number[]
+      if (prefixLen !== null && prefixLen > 0 && prefixLen <= 32) {
+        base = [0, 1, 2].map((i) => parts[i] & octetMask(prefixLen, i))
+      } else {
+        base = parts.slice(0, 3) // unusable netmask — legacy behavior
+      }
+      const subnet = base.join('.')
+      all.push(subnet)
+      if (!VIRTUAL_IFACE_RE.test(name)) physical.push(subnet)
+    }
+  }
+  const dedupe = (list: string[]) => Array.from(new Set(list))
+  const physicalSubnets = dedupe(physical)
+  if (physicalSubnets.length > 0) return physicalSubnets
+  const allSubnets = dedupe(all)
+  return allSubnets.length > 0 ? allSubnets : ['192.168.1']
 }
 
 export interface NetworkInterfaceInfo {
@@ -301,9 +358,10 @@ const MAC_OUI_VENDORS: Record<string, { vendor: string; type?: DeviceType }> = {
   'fc:64:ba': { vendor: 'Xiaomi', type: 'PHONE' },
   // OPPO / Realme / OnePlus
   '6a:8f:35': { vendor: 'OPPO', type: 'PHONE' },
-  '08:00:27': { vendor: 'OPPO', type: 'PHONE' },
   '3c:36:e4': { vendor: 'OPPO', type: 'PHONE' },
   '80:32:53': { vendor: 'OPPO', type: 'PHONE' },
+  // Oracle VirtualBox — local VMs (was wrongly mapped to OPPO PHONE)
+  '08:00:27': { vendor: 'VirtualBox VM', type: 'UNKNOWN' },
   'a0:4f:78': { vendor: 'OPPO', type: 'PHONE' },
   'c0:f8:54': { vendor: 'OPPO', type: 'PHONE' },
   // Google — Pixel, Chromecast, Nest
@@ -677,6 +735,8 @@ export interface MdnsRecord {
   name: string
   serviceType: string
   txt?: Record<string, string>
+  /** Human-friendly instance/model name correlated from TXT/SRV records. */
+  instanceName?: string
 }
 
 /**
@@ -684,6 +744,27 @@ export interface MdnsRecord {
  * responses for `timeoutMs` milliseconds. Captures printers, Android, AirPlay,
  * Chromecast, and any other mDNS/Bonjour announcer.
  */
+/**
+ * Extract the best human-readable device name from mDNS TXT keys
+ * (Chromecast `md`/`fn`, AirPlay `deviceid`-adjacent names, printer `ty`,
+ * Android TV `am`, generic `model`/`product`). Returns undefined when the
+ * TXT payload carries no useful name.
+ */
+function extractTxtDeviceName(txt: Record<string, string> | undefined): string | undefined {
+  if (!txt) return undefined
+  const candidates = [txt.fn, txt.md, txt.ty, txt.am, txt.model, txt.product]
+  for (const raw of candidates) {
+    if (!raw) continue
+    const value = raw.trim()
+    // Skip hashes, MAC-like strings, and absurdly long blobs
+    if (!value || value.length < 2 || value.length > 64) continue
+    if (/^([0-9a-f]{2}[:-]){5}[0-9a-f]{2}$/i.test(value)) continue
+    if (/^[0-9a-f]{16,}$/i.test(value)) continue
+    return value
+  }
+  return undefined
+}
+
 export async function mdnsQuery(
   serviceTypes: string[] = MDNS_SERVICE_TYPES,
   opts: { timeoutMs?: number; isAborted?: () => boolean } = {},
@@ -692,6 +773,12 @@ export async function mdnsQuery(
   const isAborted = opts.isAborted ?? (() => false)
   const records: MdnsRecord[] = []
   const seen = new Set<string>()
+  // Correlation maps — mDNS answers for one instance (SRV + TXT + A) arrive
+  // as separate records, often in separate packets and in any order. TXT is
+  // keyed by the instance label; SRV maps instance → host label; A records
+  // are enriched from both in a post-pass before resolve.
+  const txtByInstance = new Map<string, Record<string, string>>()
+  const hostByInstance = new Map<string, string>()
 
   return new Promise((resolve) => {
     const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
@@ -700,6 +787,26 @@ export async function mdnsQuery(
       if (closed) return
       closed = true
       try { sock.close() } catch { /* ignore */ }
+      // Post-pass: enrich A records with the TXT/SRV-derived instance names.
+      // An A record for "Living-Room-TV.local" picks up the friendly/model
+      // name advertised by the matching TXT record (same first label, or via
+      // the SRV instance→host mapping).
+      for (const rec of records) {
+        if (rec.instanceName) continue
+        const hostLabel = rec.name.split('.')[0]
+        if (!hostLabel) continue
+        let txt = txtByInstance.get(hostLabel)
+        if (!txt) {
+          for (const [instance, host] of hostByInstance) {
+            if (host === hostLabel) { txt = txtByInstance.get(instance); break }
+          }
+        }
+        const pretty = extractTxtDeviceName(txt)
+        if (pretty) {
+          rec.instanceName = pretty
+          rec.txt = txt
+        }
+      }
       resolve(records)
     }
 
@@ -713,10 +820,36 @@ export async function mdnsQuery(
           seen.add(key)
           records.push(rec)
         }
+        // Build the correlation maps while records stream in
+        if (rec.serviceType === 'TXT' && rec.txt) {
+          const instance = rec.name.split('.')[0]
+          if (instance) txtByInstance.set(instance, rec.txt)
+        } else if (rec.serviceType !== 'A' && rec.serviceType !== 'TXT') {
+          // PTR: name is the service type, "serviceType" holds the instance
+          // target; SRV: name is the instance, "name"-target embedded — both
+          // carry instance labels worth mapping.
+          const instanceLabel = (rec.serviceType && rec.serviceType.includes('.') ? rec.serviceType : rec.name).split('.')[0]
+          const hostLabel = rec.name.split('.')[0]
+          if (instanceLabel && hostLabel && instanceLabel !== hostLabel) {
+            hostByInstance.set(instanceLabel, hostLabel)
+          }
+        }
       }
     })
 
     sock.bind(0, '0.0.0.0', () => {
+      // FIX (Task 2-b): without joining the 224.0.0.251 multicast group the
+      // OS silently drops the RESPONSES — only QU (unicast-response) devices
+      // were ever seen. Join on every relevant interface (best-effort — some
+      // interfaces reject IGMP joins), then fall back to the default route.
+      let joined = 0
+      for (const iface of getNetworkInterfacesDetailed()) {
+        if (iface.internal) continue
+        try { sock.addMembership(MDNS_ADDR, iface.ip); joined++ } catch { /* ignore */ }
+      }
+      if (joined === 0) {
+        try { sock.addMembership(MDNS_ADDR) } catch { /* ignore */ }
+      }
       // Build a DNS-SD PTR query for each requested service type
       for (const st of serviceTypes) {
         const query = buildMdnsQuery(st)
@@ -776,8 +909,23 @@ function parseMdnsResponse(msg: Buffer): MdnsRecord[] {
         records.push({ ip: '', port, name: target, serviceType: name })
       }
     } else if (rtype === 16) {
-      // TXT record: skip (we don't parse txt key=value pairs for now)
-      records.push({ ip: '', port: 0, name, serviceType: 'TXT' })
+      // TXT record (RFC 6763): sequence of len-byte-prefixed key=value strings.
+      // Chromecast/TV model names (md/fn/ty/am) and printer ty/rp live here —
+      // they were historically parsed as stubs and discarded.
+      const txt: Record<string, string> = {}
+      let p = rdataStart
+      const end = rdataStart + rdlength
+      while (p < end) {
+        const segLen = msg[p]
+        p += 1
+        if (segLen === 0 || p + segLen > end) break
+        const seg = msg.subarray(p, p + segLen).toString('utf8')
+        p += segLen
+        const eq = seg.indexOf('=')
+        if (eq > 0) txt[seg.slice(0, eq)] = seg.slice(eq + 1)
+        else if (eq === -1 && seg) txt[seg] = '' // boolean flag entry
+      }
+      records.push({ ip: '', port: 0, name, serviceType: 'TXT', txt })
     }
 
     offset = rdataStart + rdlength
@@ -2559,6 +2707,12 @@ export async function runDiscoveryScan(
   const devicesByIp = new Map<string, DiscoveredDeviceRaw>()
   const protocolsUsed: string[] = []
   const totalIPs = subnets.length * 254
+  // Task 2-b — the host's own IPs are never valid discovery results: the ARP
+  // cache / ping sweep / multicast loops all report them. Collected once and
+  // filtered at every insertion point (ARP, ping, UDP beacon listener).
+  const selfIps = new Set<string>(
+    getNetworkInterfacesDetailed().filter((i) => i.family === 'IPv4').map((i) => i.ip),
+  )
 
   const emitProgress = (phase: ScanPhase, scannedIPs: number, currentSubnet: string = '') => {
     cb.onProgress({
@@ -2669,6 +2823,31 @@ export async function runDiscoveryScan(
     }
   }
 
+  // ── Phase 0: UDP beacon listener ──
+  // BLASTI shells announce themselves on UDP 3081 (apps/desktop/main.js).
+  // A self-announcing beacon is the highest-signal BLASTI result — no
+  // guessing, no port probing.
+  if (!cb.isAborted()) {
+    emitProgress('beacon', 0)
+    if (!protocolsUsed.includes('UDP beacon')) protocolsUsed.push('UDP beacon')
+    try {
+      const beacons = await listenForUdpBeacons({ selfIps, isAborted: cb.isAborted })
+      for (const b of beacons) {
+        if (cb.isAborted()) break
+        if (!subnets.some((s) => b.ip.startsWith(s + '.'))) continue
+        upsertDevice(b.ip, {
+          source: 'udp-beacon',
+          port: b.port || 0,
+          httpServer: 'blasti-local',
+          friendlyName: b.name,
+          name: b.name,
+          capabilities: ['UDP_BEACON'],
+        })
+      }
+    } catch { /* beacon listener is best-effort */ }
+  }
+  emitProgress('beacon', 0)
+
   // ── Phase 1: ARP ──
   emitProgress('arp', 0)
   if (!protocolsUsed.includes('ARP')) protocolsUsed.push('ARP')
@@ -2678,6 +2857,8 @@ export async function runDiscoveryScan(
       if (cb.isAborted()) break
       // Only keep entries on our scanned subnets
       if (!subnets.some((s) => entry.ip.startsWith(s + '.'))) continue
+      // Task 2-b: never report the host's own IPs (stale self-ARP entries)
+      if (selfIps.has(entry.ip)) continue
       upsertDevice(entry.ip, {
         source: 'arp',
         mac: entry.mac,
@@ -2701,6 +2882,8 @@ export async function runDiscoveryScan(
       },
     })
     for (const ip of alive) {
+      // Task 2-b: skip the host's own IPs from the ping results
+      if (selfIps.has(ip)) continue
       upsertDevice(ip, { source: 'ping', capabilities: ['ICMP'] })
     }
     scanned = Math.max(scanned, totalIPs / subnets.length)
@@ -2750,14 +2933,19 @@ export async function runDiscoveryScan(
         // merges for re-fingerprinting). Only set it as the display `name` if
         // it's NOT a virtual-printer queue name ("Adobe PDF", etc.) — those are
         // host-side CUPS artifacts, not real device names.
-        const cleanName = cleanMdnsName(rec.name) || rec.name
+        // instanceName: friendly/model name correlated from TXT records —
+        // preferred over the raw hostname ("Living-Room-TV" beats
+        // "living-room-tv.local"; "Bedroom Chromecast" beats an mDNS id).
+        const cleanName = cleanMdnsName(rec.instanceName || rec.name) || rec.name
         const safeName = cleanName && !isVirtualPrinterName(cleanName) ? cleanName : undefined
+        const txtModel = rec.txt?.md || rec.txt?.model || rec.txt?.am
         upsertDevice(rec.ip, {
           source: 'mdns',
           port: rec.port || 0,
           mdnsService: rec.serviceType,
           friendlyName: cleanName,
           name: safeName,
+          model: txtModel && !isVirtualPrinterName(txtModel) ? txtModel : undefined,
           capabilities: [`mDNS:${rec.serviceType}`],
         })
       }
@@ -3048,8 +3236,67 @@ function sourcePriority(s: DiscoverySource): number {
     case 'arp': return 1
     case 'local': return 6  // CUPS queues are authoritative for local printers
     case 'usb': return 7    // USB probe is most authoritative
+    case 'udp-beacon': return 6 // self-announcing BLASTI shells — high confidence
     default: return 0
   }
+}
+
+/**
+ * Listen for BLASTI UDP discovery beacons (Task 2-b).
+ * Companion of the announcer in apps/desktop/main.js: shells broadcast
+ * {service:'blasti-local', name, hostname, lanIp, httpPort} every ~3s on
+ * UDP 3081. Resolves the deduped beacon list after `timeoutMs` or as soon
+ * as `isAborted()` fires. Self-broadcasts (own IPs) are ignored.
+ */
+function listenForUdpBeacons(
+  { timeoutMs = BEACON_LISTEN_MS, selfIps, isAborted }: {
+    timeoutMs?: number
+    selfIps?: Set<string>
+    isAborted?: () => boolean
+  } = {},
+): Promise<{ ip: string; port: number; name: string }[]> {
+  return new Promise((resolve) => {
+    const found = new Map<string, { ip: string; port: number; name: string }>()
+    let settled = false
+    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearInterval(abortPoll)
+      clearTimeout(timer)
+      try { sock.close() } catch { /* already closed */ }
+      resolve(Array.from(found.values()))
+    }
+    const abortPoll = setInterval(() => {
+      if (isAborted && isAborted()) finish()
+    }, 200)
+    const timer = setTimeout(finish, timeoutMs)
+    sock.on('error', () => finish())
+    sock.on('message', (msg: Buffer, rinfo: dgram.RemoteInfo) => {
+      try {
+        const payload = JSON.parse(msg.toString('utf8'))
+        if (!payload || payload.service !== 'blasti-local' || !rinfo || !rinfo.address) return
+        if (selfIps && selfIps.has(rinfo.address)) return // our own broadcast
+        const name = typeof payload.name === 'string' && payload.name.trim()
+          ? payload.name.trim().slice(0, 100)
+          : (typeof payload.hostname === 'string' && payload.hostname
+            ? payload.hostname.slice(0, 100)
+            : `BLASTI @ ${rinfo.address}`)
+        found.set(rinfo.address, {
+          ip: rinfo.address,
+          port: Number(payload.httpPort) || Number(payload.port) || 3080,
+          name,
+        })
+      } catch { /* non-JSON packet — ignore */ }
+    })
+    try {
+      sock.bind(BEACON_UDP_PORT, () => {
+        try { sock.setBroadcast(true) } catch { /* ignore */ }
+      })
+    } catch {
+      finish() // port already taken (another scanner) — degrade silently
+    }
+  })
 }
 
 // ─── Protocol availability (for /discovery/protocols) ───────────────────────

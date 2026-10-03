@@ -66,6 +66,7 @@ import {
   FileText,
   Settings,
   Sparkles,
+  LifeBuoy,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -120,6 +121,8 @@ interface AdminStats {
   totalRevenue: number;
   pendingTransactions: number;
   totalUsers?: number;
+  // Support desk: OPEN + IN_PROGRESS tickets (Task 2-c)
+  openSupportTickets?: number;
   // Subscription expiry stats (returned by /api/admin/dashboard)
   expiredSubscriptions?: number;
   expiringSoonSubscriptions?: number;
@@ -135,6 +138,13 @@ interface ActivityItem {
 
 // ─── AnimatedCounter ───────────────────────────────────────────────────────
 
+// Task 2-c: the old implementation latched `hasAnimated` on the FIRST effect
+// run — cards mount while `stats` is still null (every value 0), the 0-value
+// guard bailed, and when real stats arrived the latch rejected the update →
+// ALL stat cards (incl. Total Revenue) were frozen at 0 forever. Rewritten
+// with the prevValue→value tween used by agency/dashboard/helpers.tsx: it
+// animates on EVERY change (first paint AND the 60s auto-refresh) and no
+// longer needs a one-shot latch.
 function AnimatedCounter({ value, duration = 1200, prefix = '', suffix = '', decimals = 0 }: {
   value: number;
   duration?: number;
@@ -142,28 +152,27 @@ function AnimatedCounter({ value, duration = 1200, prefix = '', suffix = '', dec
   suffix?: string;
   decimals?: number;
 }) {
-  const [display, setDisplay] = useState(0);
+  const [display, setDisplay] = useState(value);
   const rafRef = useRef<number | null>(null);
-  const startTimeRef = useRef<number | null>(null);
-  const hasAnimated = useRef(false);
+  const prevValue = useRef(value);
 
   useEffect(() => {
-    if (hasAnimated.current) return;
-    hasAnimated.current = true;
-
+    const startValue = prevValue.current;
     const endValue = value;
-    if (endValue === 0) return;
+    if (startValue === endValue) return;
 
+    const startTime = performance.now();
     const animate = (timestamp: number) => {
-      if (startTimeRef.current === null) startTimeRef.current = timestamp;
-      const elapsed = timestamp - startTimeRef.current;
+      const elapsed = timestamp - startTime;
       const progress = Math.min(elapsed / duration, 1);
       const easedProgress = 1 - Math.pow(1 - progress, 3);
-      setDisplay(endValue * easedProgress);
+      const next = startValue + (endValue - startValue) * easedProgress;
+      setDisplay(next);
 
       if (progress < 1) {
         rafRef.current = requestAnimationFrame(animate);
       } else {
+        prevValue.current = endValue;
         setDisplay(endValue);
       }
     };
@@ -745,6 +754,9 @@ export function AdminDashboard() {
     unsubscribers.push(realtime.onQueueCompleted(handleAdminEvent));
     unsubscribers.push(realtime.onAgencyUpdated(handleAdminEvent));
     unsubscribers.push(realtime.onStaffUpdated(handleAdminEvent));
+    // Support desk: ticket create/reply/status events refresh the KPI cards
+    unsubscribers.push(realtime.on('admin:ticket-created', handleAdminEvent));
+    unsubscribers.push(realtime.on('admin:ticket-updated', handleAdminEvent));
     return () => { unsubscribers.forEach(unsub => unsub()); };
   }, [realtime]);
 
@@ -872,6 +884,21 @@ export function AdminDashboard() {
       sparkColor: '#10b981',
       trend: 'up' as const,
       trendVal: '+22%',
+    },
+    // Task 2-c: support desk — open tickets awaiting admin action
+    {
+      label: t('openTickets'),
+      value: stats?.openSupportTickets ?? 0,
+      numericValue: stats?.openSupportTickets ?? 0,
+      prefix: '',
+      suffix: '',
+      icon: LifeBuoy,
+      gradient: 'from-teal-500 to-cyan-600',
+      iconBg: 'from-teal-200 to-cyan-200 dark:from-teal-900/40 dark:to-cyan-900/40',
+      iconColor: 'text-teal-600 dark:text-teal-400',
+      sparkColor: '#14b8a6',
+      trend: 'up' as const,
+      trendVal: '',
     },
   ];
 
@@ -1083,6 +1110,7 @@ export function AdminDashboard() {
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           {[
             { icon: Users, label: 'إدارة المستخدمين', view: 'admin-users', gradient: 'from-emerald-500 to-teal-600', shadow: 'shadow-emerald-500/25', hoverShadow: 'hover:shadow-emerald-500/40' },
+            { icon: LifeBuoy, label: t('supportTickets' as import('@/i18n').TranslationKeys), view: 'admin-tickets', gradient: 'from-teal-500 to-emerald-600', shadow: 'shadow-teal-500/25', hoverShadow: 'hover:shadow-teal-500/40' },
             { icon: Building2, label: 'المؤسسات', view: 'admin-agencies', gradient: 'from-teal-500 to-cyan-600', shadow: 'shadow-teal-500/25', hoverShadow: 'hover:shadow-teal-500/40' },
             { icon: Settings, label: 'الإعدادات', view: 'admin-settings', gradient: 'from-cyan-500 to-emerald-600', shadow: 'shadow-cyan-500/25', hoverShadow: 'hover:shadow-cyan-500/40' },
             { icon: FileText, label: 'سجل المراجعة', view: 'admin-audit', gradient: 'from-emerald-600 to-teal-500', shadow: 'shadow-emerald-500/25', hoverShadow: 'hover:shadow-emerald-500/40' },

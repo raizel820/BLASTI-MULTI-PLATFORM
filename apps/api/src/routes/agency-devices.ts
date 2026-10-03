@@ -652,7 +652,7 @@ app.get('/public/queue-status', async (c) => {
 
     const recentCalls = await db.reservation.findMany({
       where: { agencyId, status: { in: ['CALLED', 'SERVING', 'COMPLETED'] }, calledAt: { not: null } },
-      select: { id: true, displayNumber: true, status: true, calledAt: true, service: { select: { prefix: true, name: true } } },
+      select: { id: true, displayNumber: true, status: true, calledAt: true, service: { select: { prefix: true, name: true } }, counter: { select: { name: true } } },
       orderBy: { calledAt: 'desc' },
       take: 5,
     })
@@ -668,16 +668,48 @@ app.get('/public/queue-status', async (c) => {
     })
     const totalEstimatedWait = overallEta.estimatedMaxMinutes
 
+    // TV footer "Served Today" — COMPLETED reservations within the local day.
+    // (Historically missing from this response → the TV footer showed 0 forever.)
+    const startOfToday = new Date()
+    startOfToday.setHours(0, 0, 0, 0)
+    const totalServedToday = await db.reservation.count({
+      where: { agencyId, status: 'COMPLETED', completedAt: { gte: startOfToday } },
+    })
+
+    // Active announcements for the TV ticker (agency-scoped first, then
+    // platform-wide). Expired agency announcements are excluded.
+    const nowForAnnouncements = new Date()
+    const [agencyAnnouncements, globalAnnouncements] = await Promise.all([
+      db.announcement.findMany({
+        where: {
+          agencyId,
+          isActive: true,
+          OR: [{ expiresAt: null }, { expiresAt: { gt: nowForAnnouncements } }],
+        },
+        select: { id: true, message: true, type: true, createdAt: true },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+      }),
+      db.globalAnnouncement.findMany({
+        select: { id: true, message: true, type: true, createdAt: true },
+        orderBy: { updatedAt: 'desc' },
+        take: 3,
+      }),
+    ])
+    const announcements = [...agencyAnnouncements, ...globalAnnouncements]
+
     if (clientIp) recordSuccessfulRequest(clientIp)
     return c.json({
       success: true,
-      agency: { id: agency.id, name: agency.name, nameAr: agency.nameAr, nameFr: agency.nameFr, isQueueOpen: agency.isQueueOpen, isPaused },
+      agency: { id: agency.id, name: agency.name, nameAr: agency.nameAr, nameFr: agency.nameFr, logoUrl: agency.logoUrl, isQueueOpen: agency.isQueueOpen, isPaused },
       currentlyServing: servingReservations.map((r) => ({ id: r.id, ticketNumber: r.displayNumber, serviceId: r.serviceId, serviceName: r.service.name, status: r.status, calledAt: r.calledAt, counterName: r.counter?.name ?? null })),
       serviceStats,
       totalWaiting,
+      totalServedToday,
       totalEstimatedWait,
       activeCounters: totalActiveCounters,
-      recentCalls: recentCalls.map((r) => ({ id: r.id, ticketNumber: r.displayNumber, status: r.status, calledAt: r.calledAt })),
+      recentCalls: recentCalls.map((r) => ({ id: r.id, ticketNumber: r.displayNumber, status: r.status, calledAt: r.calledAt, counterName: r.counter?.name ?? null })),
+      announcements,
       deviceId: deviceId ?? null,
     })
   } catch (error: unknown) {
@@ -2736,6 +2768,72 @@ function diagnosticsResponse() {
 // ─── Route Handlers ──────────────────────────────────────────────────────────
 
 // GET /discovery/health — Embedded scanner is always healthy when the API is up
+// ─── POST /discovery/probe — Reachability + name probe for one host ─────────
+// Restores the discovery-panel "Test" action: TCP-connect (+ optional HTTP
+// title probe) against ip:port for a printer/TV. Historic implementation
+// pointed at the retired :3010 mini-service and could never succeed.
+const probeSchema = z.object({
+  ip: z.string().min(1).max(64).optional(),
+  port: z.coerce.number().int().min(1).max(65535).optional(),
+  usbPath: z.string().max(200).optional(),
+  timeoutMs: z.coerce.number().int().min(250).max(10_000).optional(),
+})
+
+app.post('/discovery/probe', async (c) => {
+  try {
+    await requireAuth(c)
+    const rawBody = await c.req.json().catch(() => ({}))
+    const validation = validateBody(probeSchema, rawBody)
+    if (validation.error) {
+      return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
+    }
+    const body = validation.data
+    const net = await import('node:net')
+
+    // USB (CUPS) targets are local by definition — report them as online.
+    if (!body.ip && body.usbPath) {
+      return c.json({ success: true, reachable: true, target: body.usbPath, detail: 'USB device — locally attached' })
+    }
+    if (!body.ip) {
+      return c.json({ success: false, reachable: false, error: 'ip or usbPath is required' }, 400)
+    }
+
+    const port = body.port || 9100 // raw-printing default
+    const timeoutMs = body.timeoutMs || 3000
+    const startedAt = Date.now()
+
+    const reachable = await new Promise<boolean>((resolve) => {
+      const socket = new net.Socket()
+      let settled = false
+      const finish = (ok: boolean) => {
+        if (settled) return
+        settled = true
+        try { socket.destroy() } catch { /* already closed */ }
+        resolve(ok)
+      }
+      socket.setTimeout(timeoutMs)
+      socket.once('connect', () => finish(true))
+      socket.once('timeout', () => finish(false))
+      socket.once('error', () => finish(false))
+      socket.connect(port, body.ip!)
+    })
+
+    return c.json({
+      success: true,
+      reachable,
+      target: `${body.ip}:${port}`,
+      latencyMs: reachable ? Date.now() - startedAt : undefined,
+      detail: reachable ? 'TCP connection accepted' : `No response within ${timeoutMs}ms`,
+    })
+  } catch (error: unknown) {
+    if (isRateLimitError(error)) {
+      return c.json(rateLimitErrorResponse(error).data, 429)
+    }
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error ?? (error instanceof Error ? error.message : 'Internal server error') }, err.status as any)
+  }
+})
+
 app.get('/discovery/health', async (c) => {
   try {
     await requireAuth(c)

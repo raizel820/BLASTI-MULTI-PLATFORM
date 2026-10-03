@@ -27,6 +27,7 @@ import {
   Settings2,
   LogOut,
   BarChart3,
+  LifeBuoy,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 
@@ -63,7 +64,7 @@ function CustomerTopTabBar({ mainItems, currentView, setView, moreOpen, setMoreO
 }) {
   const { capabilities } = usePlatform();
 
-  const handleMoreNav = (view: 'customer-favorites' | 'customer-notifications' | 'customer-settings' | 'customer-analytics') => {
+  const handleMoreNav = (view: 'customer-favorites' | 'customer-notifications' | 'customer-settings' | 'customer-analytics' | 'customer-support') => {
     setMoreOpen(false);
     setView(view);
   };
@@ -163,6 +164,13 @@ function CustomerTopTabBar({ mainItems, currentView, setView, moreOpen, setMoreO
                 )}
               </button>
               <button
+                onClick={() => handleMoreNav('customer-support')}
+                className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-muted dark:hover:bg-gray-800 transition-colors"
+              >
+                <LifeBuoy className="h-5 w-5 text-teal-600 dark:text-teal-400" />
+                <span className="text-sm font-medium text-foreground">{t('supportDesk' as TranslationKeys)}</span>
+              </button>
+              <button
                 onClick={() => handleMoreNav('customer-settings')}
                 className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-muted dark:hover:bg-gray-800 transition-colors"
               >
@@ -200,7 +208,7 @@ function CustomerMobileBottomNav({ mainItems, currentView, setView, moreOpen, se
 }) {
   const { capabilities } = usePlatform();
 
-  const handleMoreNav = (view: 'customer-favorites' | 'customer-notifications' | 'customer-settings' | 'customer-analytics') => {
+  const handleMoreNav = (view: 'customer-favorites' | 'customer-notifications' | 'customer-settings' | 'customer-analytics' | 'customer-support') => {
     setMoreOpen(false);
     setView(view);
   };
@@ -313,6 +321,13 @@ function CustomerMobileBottomNav({ mainItems, currentView, setView, moreOpen, se
                       {unreadCount > 99 ? '99+' : unreadCount}
                     </span>
                   )}
+                </button>
+                <button
+                  onClick={() => handleMoreNav('customer-support')}
+                  className="w-full flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-muted dark:hover:bg-gray-800 transition-colors"
+                >
+                  <LifeBuoy className="h-5 w-5 text-teal-600 dark:text-teal-400" />
+                  <span className="text-sm font-medium text-foreground">{t('supportDesk' as TranslationKeys)}</span>
                 </button>
                 <button
                   onClick={() => handleMoreNav('customer-settings')}

@@ -122,6 +122,40 @@ function resolveRunner() {
   }
 }
 
+/**
+ * Start the runner hosting next dev.
+ *
+ * Windows + non-ASCII username caveat: Bun's process spawner (uv_spawn)
+ * cannot launch an executable whose path contains non-ASCII characters —
+ * e.g. bun.exe under `C:\Users\عماد الدين\.bun\bin\bun.exe` fails with a
+ * bogus ENOENT. When the chosen runner IS bun.exe, detour through cmd.exe
+ * (always at an ASCII path): cmd resolves bun with Windows' own
+ * Unicode-correct loader. node.exe installs to ASCII paths, so the common
+ * runner needs no detour.
+ *
+ * ⚠ Do NOT pre-quote or wrap the /c payload: Bun escapes embedded double
+ * quotes as \" when building the raw Windows command line and cmd.exe
+ * cannot parse \" (it tried to run a command literally named
+ * '"bun x next dev"'). Instead every token is passed as its own array
+ * entry — all tokens below are space-free. The space-containing paths
+ * (project dir) travel via the cwd option, and cmd resolves `bun` via
+ * PATH. `bun x next` picks the workspace-local Next.js from apps/web.
+ */
+function spawnRunner(runnerCmd, runnerArgs, nextBin, port, host, extraArgs) {
+  const baseOpts = {
+    cwd: WEB_DIR,
+    stdio: 'inherit',
+    env: { ...process.env, NODE_ENV: 'development' },
+    windowsHide: true,
+  };
+  if (IS_WIN && /bun/i.test(runnerCmd)) {
+    const comspec = process.env.ComSpec || 'cmd.exe';
+    const tokens = ['bun', 'x', 'next', 'dev', '-p', String(port), '-H', String(host), ...extraArgs];
+    return spawn(comspec, ['/d', '/s', '/c', ...tokens], baseOpts);
+  }
+  return spawn(runnerCmd, [...runnerArgs, nextBin, 'dev', '-p', port, '-H', host, ...extraArgs], baseOpts);
+}
+
 // ─── 1. Self-healing: free the port from any leftover previous run ──────────
 
 const stalePids = pidsListeningOnPort(PORT);
@@ -167,16 +201,7 @@ try {
 const { cmd: runnerCmd, args: runnerArgs } = resolveRunner();
 const extraArgs = process.argv.slice(2); // e.g. `bun run dev:web -- --turbopack`
 
-const child = spawn(
-  runnerCmd,
-  [...runnerArgs, nextBin, 'dev', '-p', PORT, '-H', HOST, ...extraArgs],
-  {
-    cwd: WEB_DIR,
-    stdio: 'inherit',
-    env: { ...process.env, NODE_ENV: 'development' },
-    windowsHide: true,
-  },
-);
+const child = spawnRunner(runnerCmd, runnerArgs, nextBin, PORT, HOST, extraArgs);
 
 console.log(`[dev-web] next dev starting on port ${PORT} (pid: ${child.pid}, runner: ${path.basename(runnerCmd)})`);
 

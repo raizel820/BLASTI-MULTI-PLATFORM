@@ -645,6 +645,14 @@ export function AgencyDashboard() {
     unsubscribers.push(realtime.onQueuePaused(handleQueueEvent));
     unsubscribers.push(realtime.onQueueResumed(handleQueueEvent));
     unsubscribers.push(realtime.onQueuePositionChanged(handleQueueEvent));
+    // Task 24: previously-unsubscribed events — customer cancel (queue:updated),
+    // reclaim / qr-claim / import-walk-in (reservation:*), settings changes.
+    // Without these the dashboard only found out on the next poll.
+    unsubscribers.push(realtime.onQueueUpdated(handleQueueEvent));
+    unsubscribers.push(realtime.onReservationCreated(handleQueueEvent));
+    unsubscribers.push(realtime.onReservationUpdated(handleQueueEvent));
+    unsubscribers.push(realtime.onReservationCancelled(handleQueueEvent));
+    unsubscribers.push(realtime.onQueueSettingsUpdated(handleQueueEvent));
 
     return () => {
       unsubscribers.forEach(unsub => unsub());
@@ -696,12 +704,13 @@ export function AgencyDashboard() {
         setWalkInOpen(false);
         setWalkInName('');
         setWalkInServiceId('');
-        // Show ticket confirmation animation
-        if (data.queueNumber || data.entry?.queueNumber) {
+        // Show ticket confirmation animation.
+        // Backend returns { success, reservation: {..., queueNumber|displayNumber}, importToken }.
+        if (data.reservation) {
           const selectedService = serviceStats.find(s => s.id === walkInServiceId);
           setTicketConfirmation({
             visible: true,
-            ticketNumber: data.queueNumber || data.entry?.queueNumber || '',
+            ticketNumber: data.reservation.queueNumber || data.reservation.displayNumber || '',
             customerName: walkInName.trim(),
             serviceName: selectedService ? getServiceDisplayName(selectedService) : '',
           });

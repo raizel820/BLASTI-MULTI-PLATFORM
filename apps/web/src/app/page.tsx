@@ -25,6 +25,9 @@ const CustomerSettings = lazy(() => import('@/components/customer/customer-setti
 // Task 54-d: personal "My Analytics" module (doc-2 §38-44) over the frozen
 // 54-a customer endpoints (GET /api/customer/analytics/*).
 const CustomerAnalytics = lazy(() => import('@/components/customer/customer-analytics').then(m => ({ default: m.CustomerAnalytics })));
+// Support desk — customer side: file complaints/suggestions/questions/notes
+// to the super admin and track replies.
+const CustomerSupport = lazy(() => import('@/components/customer/customer-support').then(m => ({ default: m.CustomerSupport })));
 
 // Agency Views
 const AgencyDashboard = lazy(() => import('@/components/agency/agency-dashboard').then(m => ({ default: m.AgencyDashboard })));
@@ -38,6 +41,9 @@ const AgencyDevices = lazy(() => import('@/components/agency/agency-devices').th
 // Task 42-e: dedicated Analytics & Statistics section (self-handles authority
 // empty/error states — no AuthorityGate wrapper, like admin-analytics).
 const AgencyAnalytics = lazy(() => import('@/components/agency/analytics/analytics-dashboard').then(m => ({ default: m.AgencyAnalytics })));
+// Support desk — agency side: file tickets on behalf of the agency and track
+// the super admin's replies.
+const AgencySupport = lazy(() => import('@/components/agency/agency-support').then(m => ({ default: m.AgencySupport })));
 const AgencyFullscreen = lazy(() => import('@/components/agency/agency-fullscreen').then(m => ({ default: m.AgencyFullscreen })));
 const AgencyFullscreenHistory = lazy(() => import('@/components/agency/agency-fullscreen-history').then(m => ({ default: m.AgencyFullscreenHistory })));
 // Device Views (standalone kiosk, TV board — accessed via ?mode=device&type=KIOSK|TV)
@@ -60,6 +66,8 @@ const AdminAppSettings = lazy(() => import('@/components/admin/admin-app-setting
 const AdminHardware = lazy(() => import('@/components/admin/admin-hardware').then(m => ({ default: m.AdminHardware })));
 const AdminHardwareRequests = lazy(() => import('@/components/admin/admin-hardware-requests').then(m => ({ default: m.AdminHardwareRequests })));
 const AdminEnterpriseRequests = lazy(() => import('@/components/admin/admin-enterprise-requests').then(m => ({ default: m.AdminEnterpriseRequests })));
+// Support desk — super-admin triage: reply to and resolve incoming tickets.
+const AdminTickets = lazy(() => import('@/components/admin/admin-tickets').then(m => ({ default: m.AdminTickets })));
 
 // Shared (eagerly imported — lightweight)
 import { AgencyAuthorityGate } from '@/components/agency/agency-authority-gate';
@@ -137,6 +145,8 @@ const ViewRouter = memo(function ViewRouter() {
               // Task 54-d: personal analytics — scope is server-locked to the
               // caller (userId); 403/404 handled inside the module.
               return <CustomerAnalytics />;
+            case 'customer-support':
+              return <CustomerSupport />;
             case 'agency-dashboard':
               return <AgencyDashboard />;
             // Task 37-e: restricted agency sections pass through the authority
@@ -160,6 +170,8 @@ const ViewRouter = memo(function ViewRouter() {
               // Task 42-e: the section self-handles empty/error/unauthorized
               // states — no AuthorityGate (mirrors admin-analytics wiring).
               return <AgencyAnalytics />;
+            case 'agency-support':
+              return <AgencySupport />;
             case 'agency-fullscreen':
               return <AgencyFullscreen />;
             case 'agency-fullscreen-history':
@@ -176,6 +188,8 @@ const ViewRouter = memo(function ViewRouter() {
               return <AdminUsers />;
             case 'admin-analytics':
               return <AdminAnalytics />;
+            case 'admin-tickets':
+              return <AdminTickets />;
             case 'admin-settings':
               return <AdminSettings />;
             case 'admin-maps':
@@ -458,6 +472,7 @@ export default function Home() {
       'customer-notifications': t('notifications') + ' - BLASTI',
       'customer-favorites': t('favorites') + ' - BLASTI',
       'customer-analytics': t('myAnalytics.nav.title') + ' - BLASTI',
+      'customer-support': t('supportDesk') + ' - BLASTI',
       'agency-dashboard': t('dashboard') + ' - BLASTI',
       'agency-settings': t('settings') + ' - BLASTI',
       'agency-profile': t('profile') + ' - BLASTI',
@@ -470,6 +485,8 @@ export default function Home() {
       'admin-audit': t('auditLogs') + ' - BLASTI',
       'admin-users': t('userManagement') + ' - BLASTI',
       'admin-analytics': t('analytics') + ' - BLASTI',
+      'admin-tickets': t('supportTickets') + ' - BLASTI',
+      'agency-support': t('supportDesk') + ' - BLASTI',
     'admin-settings': t('platformSettings') + ' - BLASTI',
     'admin-maps': t('adminMaps') + ' - BLASTI',
     'admin-subscription-plans': t('subscriptionPlans') + ' - BLASTI',

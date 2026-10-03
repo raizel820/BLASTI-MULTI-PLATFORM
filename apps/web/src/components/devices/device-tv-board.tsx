@@ -1,13 +1,15 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { useRealtime } from '@/hooks/use-realtime';
 import { isRTL, type Language } from '@/i18n';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Monitor, Clock, Users, ArrowLeft, RefreshCw, Wifi, Maximize, Minimize } from 'lucide-react';
+import { Monitor, Clock, Users, ArrowLeft, RefreshCw, Wifi, WifiOff, Maximize, Minimize, Megaphone, PauseCircle, Link2 } from 'lucide-react';
 import { quickDiscover, type DiscoveredServer } from '@/lib/lan-discovery';
 import { apiFetch } from '@/lib/api-fetch';
+import { translateStatus } from '@/lib/enum-i18n';
+import { getCachedLocalIp } from '@/lib/get-local-ip';
 
 interface CurrentlyServing {
   id: string;
@@ -15,7 +17,7 @@ interface CurrentlyServing {
   serviceName: string;
   status: string;
   calledAt: string | null;
-  counterName?: string;
+  counterName?: string | null;
 }
 
 interface ServiceStat {
@@ -28,19 +30,27 @@ interface ServiceStat {
   estimatedWait: number;
 }
 
+interface AnnouncementItem {
+  id: string;
+  message: string;
+  type: string;
+  createdAt?: string;
+}
+
 interface QueueStatus {
   agency: {
     id: string;
     name: string;
     nameAr?: string | null;
     nameFr?: string | null;
+    logoUrl?: string | null;
     isQueueOpen: boolean;
     isPaused: boolean;
   };
   currentlyServing: CurrentlyServing[];
   serviceStats: ServiceStat[];
   totalWaiting: number;
-  totalServedToday: number;
+  totalServedToday?: number;
   totalEstimatedWait: number;
   activeCounters?: number;
   recentCalls: {
@@ -48,8 +58,9 @@ interface QueueStatus {
     ticketNumber: string;
     status: string;
     calledAt: string | null;
-    counterName?: string;
+    counterName?: string | null;
   }[];
+  announcements?: AnnouncementItem[];
 }
 
 interface DisplayConfig {
@@ -70,6 +81,12 @@ interface DeviceTvBoardProps {
   onBack?: () => void;
   currentLang?: Language;
 }
+
+// ─── Polling cadence ─────────────────────────────────────────────────────────
+const POLL_INTERVAL_MS = 5_000;
+// A screen is "LIVE" while fresh data arrived within this window; beyond it the
+// badge flips to STALE — never show LIVE on frozen data (the old UI did).
+const FRESH_WINDOW_MS = 15_000;
 
 // Animated counter component
 function AnimatedCounter({ value, className }: { value: number; className?: string }) {
@@ -166,6 +183,60 @@ function generateFingerprint(): string {
   }
 }
 
+// ─── Display settings delivered via ?ds_* URL params (agency preview links) ──
+// agency-devices.tsx getTvBoardUrl() serializes device.displaySettings as
+// ds_<key>=<value> — the historic component never read them back.
+function parseDisplaySettingsFromUrl(): DisplayConfig {
+  if (typeof window === 'undefined') return {};
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const cfg: DisplayConfig = {};
+    const num = (k: string) => {
+      const raw = params.get(`ds_${k}`);
+      if (raw === null) return undefined;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const str = (k: string) => params.get(`ds_${k}`) ?? undefined;
+    const bool = (k: string) => {
+      const raw = params.get(`ds_${k}`);
+      if (raw === null) return undefined;
+      return raw === 'true' || raw === '1';
+    };
+    const fontSize = str('fontSize');
+    if (fontSize === 'sm' || fontSize === 'md' || fontSize === 'lg' || fontSize === 'xl') cfg.fontSize = fontSize;
+    const theme = str('theme');
+    if (theme === 'dark' || theme === 'light' || theme === 'auto') cfg.theme = theme;
+    const lang = str('language');
+    if (lang === 'ar' || lang === 'fr' || lang === 'en') cfg.language = lang;
+    const rotationSec = num('rotationSec');
+    if (rotationSec !== undefined) cfg.rotationSec = rotationSec;
+    const showClock = bool('showClock');
+    if (showClock !== undefined) cfg.showClock = showClock;
+    const showLogo = bool('showLogo');
+    if (showLogo !== undefined) cfg.showLogo = showLogo;
+    const showAds = bool('showAds');
+    if (showAds !== undefined) cfg.showAds = showAds;
+    const showEstimatedWait = bool('showEstimatedWait');
+    if (showEstimatedWait !== undefined) cfg.showEstimatedWait = showEstimatedWait;
+    const showServiceStats = bool('showServiceStats');
+    if (showServiceStats !== undefined) cfg.showServiceStats = showServiceStats;
+    const filterRaw = str('serviceFilter');
+    if (filterRaw) {
+      try {
+        const parsed = JSON.parse(filterRaw);
+        if (Array.isArray(parsed)) cfg.serviceFilter = parsed.filter((x) => typeof x === 'string');
+      } catch { /* plain comma list fallback */
+        const list = filterRaw.split(',').map(s => s.trim()).filter(Boolean);
+        if (list.length) cfg.serviceFilter = list;
+      }
+    }
+    return cfg;
+  } catch {
+    return {};
+  }
+}
+
 export function DeviceTvBoard({
   agencyId: agencyIdProp,
   onBack,
@@ -180,10 +251,12 @@ export function DeviceTvBoard({
   const [resolvedAgencyId, setResolvedAgencyId] = useState<string>('');
   const [status, setStatus] = useState<QueueStatus | null>(null);
   const [loading, setLoading] = useState(true);
-  const [lastRefresh, setLastRefresh] = useState(Date.now());
   const [prevServingIds, setPrevServingIds] = useState<Set<string>>(new Set());
   const [flashIds, setFlashIds] = useState<Set<string>>(new Set());
   const [currentTime, setCurrentTime] = useState(new Date());
+  // Data freshness — the LIVE badge is driven by this, not socket transport.
+  const [lastSuccessAt, setLastSuccessAt] = useState(0);
+  const [fetchFailed, setFetchFailed] = useState(false);
 
   // ─── Fullscreen Management ──────────────────────────────────────────────
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -257,14 +330,18 @@ export function DeviceTvBoard({
     return '';
   });
   const [isDeviceRegistered, setIsDeviceRegistered] = useState(false);
-  const [displaySettings, setDisplaySettings] = useState<DisplayConfig>({});
+  // Merge order: device config (server) < ?ds_* URL params (preview links)
+  const [serverDisplaySettings, setServerDisplaySettings] = useState<DisplayConfig>({});
+  const urlDisplaySettings = useMemo(() => parseDisplaySettingsFromUrl(), []);
+  const displaySettings = useMemo(
+    () => ({ ...serverDisplaySettings, ...urlDisplaySettings }),
+    [serverDisplaySettings, urlDisplaySettings],
+  );
   const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // LAN Discovery state
   const [lanServer, setLanServer] = useState<DiscoveredServer | null>(null);
   const [isDiscovering, setIsDiscovering] = useState(true);
-
-
 
   // Resolve agencyId from multiple sources
   const agencyId = resolvedAgencyId || agencyIdProp || '';
@@ -426,19 +503,42 @@ export function DeviceTvBoard({
     }
   }, [lanServer]);
 
-  // Update clock every second
+  // Update clock every second (also drives the freshness indicator)
   useEffect(() => {
     const interval = setInterval(() => setCurrentTime(new Date()), 1000);
     return () => clearInterval(interval);
   }, []);
 
-  // ─── Device Heartbeat ──────────────────────────
+  // ─── Device Heartbeat + remote commands (parity with device-kiosk) ─────
+  const fetchDeviceConfigRef = useRef<() => void>(() => {});
+
+  const clearDeviceCredentials = useCallback(() => {
+    try {
+      localStorage.removeItem('blasti_tv_device_token');
+      localStorage.removeItem('blasti_tv_device_id');
+      localStorage.removeItem('blasti_tv_registered_agency_id');
+    } catch { /* private mode */ }
+    setDeviceToken('');
+    setDeviceId('');
+    setIsDeviceRegistered(false);
+  }, []);
+
   const startDeviceHeartbeat = useCallback((token: string) => {
     if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
 
+    const ackCommand = async (cmdId: string) => {
+      try {
+        await apiFetch(`/api/agency-devices/device/command/${cmdId}/ack`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          body: JSON.stringify({ status: 'DELIVERED' }),
+        });
+      } catch { /* best-effort */ }
+    };
+
     const sendHeartbeat = async () => {
       try {
-        await apiFetch('/api/agency-devices/device/heartbeat', {
+        const res = await apiFetch('/api/agency-devices/device/heartbeat', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -446,8 +546,44 @@ export function DeviceTvBoard({
           },
           body: JSON.stringify({
             appVersion: '1.0.0',
+            ipAddress: getCachedLocalIp() || lanServer?.ip || undefined,
           }),
         });
+        if (res.status === 401) {
+          // Token revoked (device unpaired/disabled) — drop credentials; the
+          // registration flow will re-create the device on the next boot.
+          console.warn('[TV Board] Heartbeat 401 — token invalid, clearing credentials');
+          if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
+          clearDeviceCredentials();
+          return;
+        }
+        if (res.ok) {
+          const body = await res.json().catch(() => null);
+          const commands: Array<{ id: string; type: string }> = body?.pendingCommands ?? [];
+          if (commands.length) {
+            for (const cmd of commands) {
+              if (cmd.type === 'FORCE_DISCONNECT') {
+                await ackCommand(cmd.id);
+                if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
+                clearDeviceCredentials();
+                window.location.reload();
+                return;
+              }
+              if (cmd.type === 'REBOOT' || cmd.type === 'REFRESH') {
+                await ackCommand(cmd.id);
+                window.location.reload();
+                return;
+              }
+              if (cmd.type === 'CONFIG_UPDATE') {
+                await ackCommand(cmd.id);
+                fetchDeviceConfigRef.current();
+                continue;
+              }
+              // Unknown command types: ack so they don't age out silently
+              await ackCommand(cmd.id);
+            }
+          }
+        }
       } catch {
         // Silent — don't disrupt TV board operation
       }
@@ -456,7 +592,7 @@ export function DeviceTvBoard({
     // Send immediately, then every 30s
     sendHeartbeat();
     heartbeatTimerRef.current = setInterval(sendHeartbeat, 30_000);
-  }, []);
+  }, [lanServer, clearDeviceCredentials]);
 
   // Clean up heartbeat on unmount
   useEffect(() => {
@@ -468,7 +604,7 @@ export function DeviceTvBoard({
   }, []);
 
   // On mount — fetch device config if deviceToken exists & start heartbeat
-  useEffect(() => {
+  const fetchDeviceConfig = useCallback(() => {
     if (!deviceToken) return;
     setIsDeviceRegistered(true);
     apiFetch('/api/agency-devices/device/config', {
@@ -493,7 +629,7 @@ export function DeviceTvBoard({
         if (data.success && data.config) {
           try {
             const parsed = data.config.displaySettings || {};
-            setDisplaySettings(parsed);
+            setServerDisplaySettings(parsed);
           } catch {
             // Invalid JSON, use defaults
           }
@@ -505,10 +641,19 @@ export function DeviceTvBoard({
         }
       })
       .catch(() => {});
+  }, [deviceToken, resolvedAgencyId]);
 
+  // Keep a ref so heartbeat command handlers can trigger a config refresh
+  useEffect(() => {
+    fetchDeviceConfigRef.current = fetchDeviceConfig;
+  }, [fetchDeviceConfig]);
+
+  useEffect(() => {
+    if (!deviceToken) return;
+    fetchDeviceConfig();
     // Start heartbeat
     startDeviceHeartbeat(deviceToken);
-  }, [deviceToken, startDeviceHeartbeat]);
+  }, [deviceToken, startDeviceHeartbeat, fetchDeviceConfig]);
 
   // M43: Restart heartbeat when LAN server is discovered
   useEffect(() => {
@@ -518,6 +663,7 @@ export function DeviceTvBoard({
   }, [lanServer]);
 
   const fetchStatus = useCallback(async () => {
+    if (!agencyId) return;
     try {
       const fetchHeaders: Record<string, string> = {};
       if (deviceToken) fetchHeaders['Authorization'] = `Bearer ${deviceToken}`;
@@ -539,9 +685,13 @@ export function DeviceTvBoard({
         }
         prevServingIdsRef.current = currentIds;
         setStatus(data);
+        setLastSuccessAt(Date.now());
+        setFetchFailed(false);
+      } else {
+        setFetchFailed(true);
       }
     } catch {
-      // silent
+      setFetchFailed(true);
     } finally {
       setLoading(false);
     }
@@ -553,31 +703,54 @@ export function DeviceTvBoard({
   useEffect(() => {
     if (!agencyId) return;
     fetchStatus();
-    const interval = setInterval(() => {
-      fetchStatus();
-      setLastRefresh(Date.now());
-    }, 5000);
+    const interval = setInterval(fetchStatus, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
   }, [agencyId, fetchStatus]);
 
-  // Join agency room for realtime updates
-  // CRITICAL: Always join the agency room (agency:${id}) because queue:called events
-  // broadcast to that room. The deviceToken-only path was broken — 'join:device' doesn't
-  // exist on the server, so TV never received realtime updates.
+  // ─── Realtime room joins ─────────────────────────────────────────────
+  // A standalone TV has no user session — `join:agency` requires membership
+  // and is REJECTED for it (this is why the board never updated live). The
+  // correct path is `join:device` (deviceToken → server joins agency + kiosk
+  // rooms, marks socket _isDevice). Fallbacks: join the kiosk room (accepted
+  // in legacy mode → kiosk:update still arrives); when a USER session exists
+  // (in-app preview) join the agency room as well.
   useEffect(() => {
     if (!agencyId) return;
-    realtime.joinAgency(agencyId);
+    if (deviceToken) {
+      realtime.joinDevice(deviceToken);
+    } else {
+      realtime.joinKiosk(agencyId);
+    }
+    if (realtime.hasSession) {
+      realtime.joinAgency(agencyId);
+    }
     return () => {
-      realtime.leaveAgency(agencyId);
+      if (deviceToken) {
+        realtime.leaveDevice();
+      } else {
+        realtime.leaveKiosk(agencyId);
+      }
+      if (realtime.hasSession) {
+        realtime.leaveAgency(agencyId);
+      }
     };
-  }, [agencyId, realtime]);
+  }, [agencyId, deviceToken, realtime]);
 
-  // Subscribe to realtime events — instantly refresh on any queue change
+  // Subscribe to realtime events — instantly (debounced) refresh on any
+  // queue change. Includes completions/cancels, which change the footer
+  // stats and the "now serving" roster just as much as a call-next does.
   useEffect(() => {
     const unsubscribers: (() => void)[] = [];
+    let fetchTimer: ReturnType<typeof setTimeout> | null = null;
 
+    // Trampoline: bursts of events (call-next + kiosk:update + completed…)
+    // collapse into ONE fetch within 250ms instead of N immediate calls.
     const handleUpdate = () => {
-      fetchStatus();
+      if (fetchTimer) return;
+      fetchTimer = setTimeout(() => {
+        fetchTimer = null;
+        fetchStatus();
+      }, 250);
     };
 
     unsubscribers.push(realtime.onKioskUpdate(handleUpdate));
@@ -586,11 +759,20 @@ export function DeviceTvBoard({
     unsubscribers.push(realtime.onQueueWalkIn(handleUpdate));
     unsubscribers.push(realtime.onQueuePaused(handleUpdate));
     unsubscribers.push(realtime.onQueueResumed(handleUpdate));
+    unsubscribers.push(realtime.onQueueCompleted(handleUpdate));
+    unsubscribers.push(realtime.onQueueNoShow(handleUpdate));
+    unsubscribers.push(realtime.onQueueCancelled(handleUpdate));
+    unsubscribers.push(realtime.onQueueSettingsUpdated(handleUpdate));
 
     return () => {
+      if (fetchTimer) clearTimeout(fetchTimer);
       unsubscribers.forEach(unsub => unsub());
     };
   }, [realtime, fetchStatus]);
+
+  // ─── Freshness indicator (1s tick shares the clock interval) ──────────
+  const secondsSinceRefresh = lastSuccessAt ? Math.max(0, Math.floor((currentTime.getTime() - lastSuccessAt) / 1000)) : null;
+  const dataIsFresh = lastSuccessAt > 0 && (currentTime.getTime() - lastSuccessAt) < FRESH_WINDOW_MS;
 
   const getAgencyName = () => {
     if (!status) return '';
@@ -633,14 +815,15 @@ export function DeviceTvBoard({
   const showEstimatedWait = displaySettings.showEstimatedWait !== false; // default: true
   const showServiceStats = displaySettings.showServiceStats !== false; // default: true
 
-  // Font size mapping for ticket numbers
+  // Font size mapping for ticket numbers (kept small enough that even
+  // 5-char tickets like "R-001" never wrap mid-number on a 720p TV)
   const getFontSizeClass = () => {
     switch (displaySettings.fontSize) {
-      case 'sm': return 'clamp(3rem, 12vh, 6rem)';
-      case 'md': return 'clamp(4rem, 16vh, 9rem)';
-      case 'lg': return 'clamp(4rem, 20vh, 12rem)';
-      case 'xl': return 'clamp(5rem, 24vh, 14rem)';
-      default: return 'clamp(4rem, 20vh, 12rem)'; // current default
+      case 'sm': return 'clamp(2.5rem, 9vh, 5rem)';
+      case 'md': return 'clamp(3rem, 12vh, 7rem)';
+      case 'lg': return 'clamp(3rem, 15vh, 9.5rem)';
+      case 'xl': return 'clamp(4rem, 19vh, 12rem)';
+      default: return 'clamp(3rem, 15vh, 9.5rem)';
     }
   };
 
@@ -656,10 +839,56 @@ export function DeviceTvBoard({
     return () => clearInterval(interval);
   }, [displaySettings.rotationSec, status?.currentlyServing?.length]);
 
+  // Reset rotation index when the roster changes to avoid pointing at nothing
+  useEffect(() => {
+    setFocusedServiceIndex(0);
+  }, [status?.currentlyServing?.length]);
+
   // Filter service stats if serviceFilter is configured
   const filteredServiceStats = displaySettings.serviceFilter
     ? status?.serviceStats.filter(s => displaySettings.serviceFilter!.includes(s.serviceId)) || []
     : status?.serviceStats || [];
+
+  // Ticker content: announcements first (they change), then identity/date.
+  const tickerItems = useMemo(() => {
+    const items: { text: string; className: string }[] = [];
+    for (const ann of status?.announcements ?? []) {
+      if (ann?.message) items.push({ text: `📢 ${ann.message}`, className: 'text-amber-200 font-semibold' });
+    }
+    items.push({ text: `🏛️ ${t('tvBoardInstitution')}: ${getAgencyName()}`, className: 'text-emerald-300 font-semibold' });
+    items.push({ text: `📅 ${formatDate(currentTime)}`, className: 'text-teal-300' });
+    items.push({ text: `⏰ ${formatTime(currentTime)}`, className: 'text-cyan-300' });
+    return items;
+  }, [status?.announcements, currentTime, lang, status?.agency]);
+
+  // ─── States ──────────────────────────────────────────────────────────
+
+  // No agency resolvable: give operators an actionable screen instead of an
+  // infinite spinner (the historic behavior hid the missing ?agencyId/?code).
+  if (!isDiscovering && !agencyId && !loading && !status) {
+    return (
+      <div
+        ref={fullscreenRef}
+        className="min-h-screen bg-gray-900 flex flex-col items-center justify-center text-white p-6"
+        dir={rtl ? 'rtl' : 'ltr'}
+      >
+        <Link2 className="h-14 w-14 text-gray-600 mb-6" />
+        <h1 className="text-2xl font-bold mb-2">{t('kioskQueueBoard')}</h1>
+        <p className="text-gray-400 text-center max-w-md mb-1">
+          {t('tvBoardNotLinked')}
+        </p>
+        <p className="text-gray-500 text-sm text-center max-w-md font-mono">
+          ?agencyId=… {rtl ? 'أو' : 'or'} ?code=…
+        </p>
+        <button
+          onClick={onBack || (() => window.history.back())}
+          className="mt-8 min-h-[60px] px-8 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-semibold text-lg shadow-lg shadow-emerald-500/25"
+        >
+          {t('kioskBack')}
+        </button>
+      </div>
+    );
+  }
 
   if (loading || (!status && !agencyId)) {
     return (
@@ -675,7 +904,11 @@ export function DeviceTvBoard({
         className="min-h-screen bg-gray-900 flex flex-col items-center justify-center text-white p-6"
         dir={rtl ? 'rtl' : 'ltr'}
       >
-        <p className="text-xl mb-4">{t('error')}</p>
+        <WifiOff className="h-14 w-14 text-red-400/70 mb-4" />
+        <p className="text-xl mb-1">{t('error')}</p>
+        <p className="text-gray-500 text-sm mb-6">
+          {fetchFailed ? t('tvBoardCannotReachServer') : ''}
+        </p>
         <button
           onClick={onBack || (() => window.history.back())}
           className="min-h-[60px] px-8 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 text-white font-semibold text-lg shadow-lg shadow-emerald-500/25"
@@ -686,13 +919,39 @@ export function DeviceTvBoard({
     );
   }
 
+  // Status badge: driven by DATA freshness (never claim LIVE on frozen data)
+  const statusBadge = dataIsFresh ? (
+    <div
+      className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/20 text-emerald-300"
+      title={secondsSinceRefresh !== null ? `${t('tvBoardUpdated')} ${secondsSinceRefresh}s` : undefined}
+    >
+      <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+      <span className="text-xs font-bold tracking-wider">{t('tvBoardLive')}</span>
+    </div>
+  ) : fetchFailed ? (
+    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-red-500/20 text-red-300">
+      <WifiOff className="h-3 w-3" />
+      <span className="text-xs font-bold tracking-wider">{t('tvBoardOffline')}</span>
+    </div>
+  ) : (
+    <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/20 text-amber-300">
+      <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+      <span className="text-xs font-bold tracking-wider">{t('tvBoardStale')}</span>
+    </div>
+  );
+
+  const showPausedBanner = status.agency.isPaused || !status.agency.isQueueOpen;
+
   return (
     <div
       ref={fullscreenRef}
-      className="min-h-screen text-white flex flex-col select-none relative overflow-hidden"
+      className="min-h-screen bg-gray-950 text-white flex flex-col select-none relative overflow-hidden"
       dir={rtl ? 'rtl' : 'ltr'}
     >
-      {/* Animated gradient background */}
+      {/* Animated gradient background — decorative layer over a SOLID dark
+          base: the 400%-sized gradient spends most of its cycle on its
+          ~transparent mid-stops, which used to let the white page bleed
+          through and wash out the whole board. */}
       <div className="absolute inset-0">
         <motion.div
           animate={{ backgroundPosition: ['0% 0%', '100% 100%', '0% 0%'] }}
@@ -721,22 +980,36 @@ export function DeviceTvBoard({
 
       {/* Header */}
       <div className="relative bg-gray-800/60 backdrop-blur-md px-6 py-4 flex items-center justify-between border-b border-emerald-500/10">
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-4 min-w-0">
           <button
             onClick={onBack || (() => window.history.back())}
-            className="min-h-[48px] min-w-[48px] rounded-xl bg-gray-700/60 flex items-center justify-center hover:bg-gray-600/60 transition-colors"
+            className="min-h-[48px] min-w-[48px] shrink-0 rounded-xl bg-gray-700/60 flex items-center justify-center hover:bg-gray-600/60 transition-colors"
           >
             <ArrowLeft className={`h-5 w-5 ${rtl ? 'rotate-180' : ''}`} />
           </button>
-          <div>
+          {/* Agency logo — served by the API; fallback to the device icon */}
+          {showLogo && (
+            status.agency.logoUrl ? (
+              <img
+                src={status.agency.logoUrl}
+                alt={getAgencyName() || 'Agency logo'}
+                className="h-11 w-11 shrink-0 rounded-xl object-contain bg-gray-700/40 p-1"
+                onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}
+              />
+            ) : (
+              <div className="h-11 w-11 shrink-0 rounded-xl bg-gray-700/40 flex items-center justify-center">
+                <Monitor className="h-5 w-5 text-emerald-400" />
+              </div>
+            )
+          )}
+          <div className="min-w-0">
             <div className="flex items-center gap-2">
-              {showLogo && <Monitor className="h-5 w-5 text-emerald-400" />}
-              <h1 className="text-xl font-bold">{t('kioskQueueBoard')}</h1>
+              <h1 className="text-xl font-bold truncate">{t('kioskQueueBoard')}</h1>
             </div>
-            <p className="text-gray-400 text-sm">{getAgencyName()}</p>
+            <p className="text-gray-400 text-sm truncate">{getAgencyName()}</p>
           </div>
         </div>
-        <div className="flex items-center gap-4 text-gray-400 text-sm">
+        <div className="flex items-center gap-4 text-gray-400 text-sm shrink-0">
           {/* Clock display */}
           {showClock && (
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-gray-700/40 backdrop-blur-sm">
@@ -744,18 +1017,14 @@ export function DeviceTvBoard({
               <span className="font-mono text-sm text-emerald-300">{formatTime(currentTime)}</span>
             </div>
           )}
-          <span className="flex items-center gap-1">
+          <span
+            className="hidden md:flex items-center gap-1"
+            title={secondsSinceRefresh !== null ? `${t('tvBoardUpdated')} ${secondsSinceRefresh}s` : undefined}
+          >
             <RefreshCw className="h-3.5 w-3.5" />
-            {t('tvBoardRefreshInterval')}
+            {Math.round(POLL_INTERVAL_MS / 1000)}s
           </span>
-          {realtime.isConnected ? (
-            <div className="flex items-center gap-1.5 px-2 py-1 rounded-full bg-emerald-500/20 text-emerald-300">
-              <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-xs font-bold tracking-wider">{t('tvBoardLive')}</span>
-            </div>
-          ) : (
-            <span className="text-gray-500 font-semibold">● {t('tvBoardOffline')}</span>
-          )}
+          {statusBadge}
           {/* Fullscreen toggle — always visible on TV mode */}
           <button
             onClick={toggleFullscreen}
@@ -766,6 +1035,23 @@ export function DeviceTvBoard({
           </button>
         </div>
       </div>
+
+      {/* Paused / closed ribbon — instant via queue:paused/resumed events */}
+      <AnimatePresence>
+        {showPausedBanner && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            className="relative bg-amber-500/15 border-b border-amber-500/30 overflow-hidden"
+          >
+            <div className="px-6 py-2 flex items-center justify-center gap-2 text-amber-300 font-semibold">
+              <PauseCircle className="h-5 w-5" />
+              {status.agency.isPaused ? t('queuePaused') : t('queueClosed')}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <div className="flex-1 p-6 overflow-y-auto relative">
         {/* Now Serving Section - HUGE numbers */}
@@ -830,7 +1116,7 @@ export function DeviceTvBoard({
                               animate={isNew ? { scale: [1, 1.05, 1] } : {}}
                               transition={{ duration: 0.5, repeat: isNew ? 3 : 0 , ease: 'easeInOut' }}
                             >
-                              <p className="font-black text-transparent bg-clip-text bg-gradient-to-r from-emerald-300 via-teal-300 to-cyan-300 leading-none"
+                              <p className="font-black whitespace-nowrap text-transparent bg-clip-text bg-gradient-to-r from-emerald-300 via-teal-300 to-cyan-300 leading-none"
                                 style={{ fontSize: getFontSizeClass() }}
                               >
                                 {item.ticketNumber}
@@ -905,7 +1191,7 @@ export function DeviceTvBoard({
                         animate={isNew ? { scale: [1, 1.05, 1] } : {}}
                         transition={{ duration: 0.5, repeat: isNew ? 3 : 0 , ease: 'easeInOut' }}
                       >
-                        <p className="font-black text-transparent bg-clip-text bg-gradient-to-r from-emerald-300 via-teal-300 to-cyan-300 leading-none"
+                        <p className="font-black whitespace-nowrap text-transparent bg-clip-text bg-gradient-to-r from-emerald-300 via-teal-300 to-cyan-300 leading-none"
                           style={{ fontSize: getFontSizeClass() }}
                         >
                           {item.ticketNumber}
@@ -965,7 +1251,7 @@ export function DeviceTvBoard({
                 whileHover={{ scale: 1.02, y: -2 }}
                 className="bg-gray-800/60 backdrop-blur-sm rounded-xl p-4 flex items-center justify-between border border-gray-700/30 hover:border-emerald-500/20 transition-all duration-300"
               >
-                <div>
+                <div className="min-w-0">
                   <span className="text-xs font-bold px-2 py-1 rounded bg-gradient-to-r from-emerald-500/20 to-teal-500/20 text-emerald-300 me-2 border border-emerald-500/20">
                     {stat.prefix}
                   </span>
@@ -973,7 +1259,7 @@ export function DeviceTvBoard({
                     {getServiceName(stat)}
                   </span>
                 </div>
-                <div className="flex items-center gap-4">
+                <div className="flex items-center gap-4 shrink-0">
                   <div className="text-center">
                     <AnimatedCounter
                       value={stat.waiting}
@@ -1016,6 +1302,9 @@ export function DeviceTvBoard({
                   <span className="text-lg font-bold text-gray-200">
                     {call.ticketNumber}
                   </span>
+                  {call.counterName && (
+                    <span className="text-xs text-gray-400">{call.counterName}</span>
+                  )}
                   <span
                     className={`text-xs px-2 py-0.5 rounded-full ${
                       call.status === 'CALLED'
@@ -1025,7 +1314,7 @@ export function DeviceTvBoard({
                         : 'bg-gray-700/60 text-gray-400 border border-gray-600/20'
                     }`}
                   >
-                    {call.status}
+                    {translateStatus(call.status, t)}
                   </span>
                 </motion.div>
               ))}
@@ -1036,32 +1325,25 @@ export function DeviceTvBoard({
 
       {/* Scrolling Ticker + Footer Stats */}
       <div className="relative">
-        {/* Scrolling ticker */}
+        {/* Scrolling ticker — announcements (from the API) + identity/date */}
         <div className="bg-gradient-to-r from-emerald-900/60 via-teal-900/60 to-emerald-900/60 backdrop-blur-md border-t border-emerald-500/10 overflow-hidden">
           <div className="flex items-center py-2">
+            {(status.announcements?.length ?? 0) > 0 && (
+              <div className="shrink-0 px-3 flex items-center gap-1.5 text-amber-300 border-e border-emerald-500/20 me-3">
+                <Megaphone className="h-4 w-4" />
+                <span className="text-xs font-bold uppercase tracking-wider">{t('tvBoardAnnouncements')}</span>
+              </div>
+            )}
             <motion.div
               animate={{ x: rtl ? [-2000, 0] : [0, -2000] }}
               transition={{ duration: 30, repeat: Infinity, ease: 'linear' }}
               className="flex items-center gap-8 whitespace-nowrap px-4"
             >
-              <span className="text-emerald-300 font-semibold">
-                🏛️ {t('tvBoardInstitution')}: {getAgencyName()}
-              </span>
-              <span className="text-teal-300">
-                📅 {formatDate(currentTime)}
-              </span>
-              <span className="text-cyan-300">
-                ⏰ {formatTime(currentTime)}
-              </span>
-              <span className="text-emerald-300 font-semibold">
-                🏛️ {t('tvBoardInstitution')}: {getAgencyName()}
-              </span>
-              <span className="text-teal-300">
-                📅 {formatDate(currentTime)}
-              </span>
-              <span className="text-cyan-300">
-                ⏰ {formatTime(currentTime)}
-              </span>
+              {[...tickerItems, ...tickerItems].map((item, i) => (
+                <span key={i} className={item.className}>
+                  {item.text}
+                </span>
+              ))}
             </motion.div>
           </div>
         </div>

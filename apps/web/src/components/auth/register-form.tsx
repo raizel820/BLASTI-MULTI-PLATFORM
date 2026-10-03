@@ -822,7 +822,7 @@ export function RegisterForm() {
     : [MapPin, Clock, Bell];
 
   return (
-    <div className="min-h-screen flex flex-col relative overflow-hidden">
+    <div className="min-h-dvh flex flex-col relative overflow-hidden">
       {/* Animated background gradient + dot-grid pattern */}
       <div className="absolute inset-0 -z-10">
         <motion.div
@@ -1051,9 +1051,12 @@ export function RegisterForm() {
                     </div>
                   </div>
 
-                  {/* Task 23: keep the compact scroll constraint on phones,
-                      let the card grow naturally on desktop/PC (lg+) */}
-                  <CardContent className="space-y-4 pt-2 max-h-[55vh] overflow-y-auto custom-scrollbar relative overflow-hidden lg:max-h-none">
+                  {/* Task 24: no fixed-height inner scroll on phones — the card grows
+                      naturally and the DOCUMENT scrolls (parity with login-form).
+                      A nested 55vh scroll window swallowed fields below the fold
+                      (username reachable, everything else clipped) and fought the
+                      soft keyboard (vh never shrinks) + invisible overlay scrollbar. */}
+                  <CardContent className="space-y-4 pt-2">
                     <AnimatePresence mode="wait" custom={direction}>
                       <motion.div
                         key={step}

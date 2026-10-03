@@ -65,7 +65,10 @@ export function useLanMode() {
       clearTimeout(timeout);
       if (res.ok) {
         const data = await res.json();
-        if (data.service === 'blasti-lan') {
+        // The desktop beacon answers service:'blasti-local'; accept both it
+        // and the historic 'blasti-lan' so LAN-mode validation actually works
+        // (only the Electron-IPC path succeeded before this).
+        if (data.service === 'blasti-lan' || data.service === 'blasti-local') {
           return data as LanServerInfo & { name: string; version: string };
         }
       }

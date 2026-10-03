@@ -21,6 +21,11 @@ files:
   - loading-screen.js
   - out/**/*
   - data/**/*
+  - prisma/schema.prisma
+  - prisma/generated/**/*
+  # The desktop SQLite Prisma client (prisma/generated) is also copied into
+  # resources/node_modules/.prisma/client by scripts/after-pack.js (outside
+  # asar — the query engine .node binary cannot load from inside an archive).
   # Prisma query engine + generated client are picked up from
   # node_modules automatically; the schema itself ships below via
   # extraResources for diagnostics/reference (migrations are embedded
@@ -31,6 +36,7 @@ asar: true
 asarUnpack:
   - out/**/*
   - data/**/*
+  - prisma/generated/**/*
 
 npmRebuild: true
 

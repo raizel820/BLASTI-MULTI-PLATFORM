@@ -54,7 +54,7 @@ function hashPassword(password: string): string {
  * changes, the seed still pins the known-good fresh-account state that the
  * webapp and desktop are hardened against.
  */
-async function seed() {
+export async function seed() {
   console.log('🌱 Seeding database (fresh platform setup — admin + one fresh agency owner + one agency)...');
 
   // ─── Clean up ALL existing data (children first, parents last) ─────────────────
@@ -369,11 +369,18 @@ async function seed() {
   console.log('   📊 Data-consumption ledger wiped — analytics restart from zero');
 }
 
-seed()
-  .catch((e) => {
-    console.error('❌ Seed failed:', e);
-    process.exit(1);
-  })
-  .finally(async () => {
-    await db.$disconnect();
-  });
+// Self-execute ONLY when run directly (`bun run prisma/seed.ts` / db:seed).
+// When imported (seed-if-empty.ts), the caller awaits the exported `seed()`
+// itself — the historic fire-and-forget self-run raced the caller's
+// db.$disconnect() and killed the engine mid-seed ("Response from the Engine
+// was empty").
+if (import.meta.main) {
+  seed()
+    .catch((e) => {
+      console.error('❌ Seed failed:', e);
+      process.exit(1);
+    })
+    .finally(async () => {
+      await db.$disconnect();
+    });
+}

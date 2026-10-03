@@ -29,6 +29,14 @@ const path = require('path');
 
 const MONOREPO_ROOT = path.resolve(__dirname, '..', '..', '..');
 const ROOT_NODE_MODULES = path.join(MONOREPO_ROOT, 'node_modules');
+// The DESKTOP-generated SQLite client (apps/desktop/prisma/schema.prisma has
+// an explicit generator `output` pointing here). The workspace client in
+// node_modules/.prisma/client is the POSTGRESQL client since the cloud
+// migration — packaging THAT would break the local `file:` database with
+// "the URL must start with the protocol postgresql://".
+const DESKTOP_GENERATED_CLIENT_DIR = path.join(
+  MONOREPO_ROOT, 'apps', 'desktop', 'prisma', 'generated', 'client'
+);
 
 function log(msg) { console.log(`  • ${msg}`); }
 
@@ -95,25 +103,29 @@ module.exports = async function afterPack(context) {
   }
   log(`@prisma/client found at: ${clientPkg}`);
 
-  // The GENERATED client (schema + query engine) lives at <node_modules>/.prisma/client
-  // — i.e. the parent of the @prisma SCOPE dir, not the parent of the client dir:
-  //   <nm>/@prisma/client  →  <nm>/.prisma/client
-  const generatedDir = path.join(path.dirname(path.dirname(clientPkg)), '.prisma', 'client');
-  if (!fs.existsSync(generatedDir)) {
+  // The DESKTOP-generated client (SQLite schema + platform query engine)
+  // from apps/desktop/prisma/generated/client. We copy it into
+  // resources/node_modules/.prisma/client so the shipped @prisma/client
+  // re-exports THE DESKTOP client — exactly the layout a default
+  // `prisma generate` produces, so no resolution changes are needed.
+  const generatedDir = DESKTOP_GENERATED_CLIENT_DIR;
+  if (!fs.existsSync(path.join(generatedDir, 'index.js'))) {
     throw new Error(
-      '[afterPack] Generated client (.prisma/client) not found next to @prisma/client.\n' +
-      '  Run `bun run db:generate` at the monorepo root, then rebuild the desktop app.'
+      '[afterPack] Desktop SQLite client not found at apps/desktop/prisma/generated/client.\n' +
+      '  Run `bun run db:generate:desktop` at the monorepo root (prebuild.js does\n' +
+      '  this automatically) — do NOT package the workspace PostgreSQL client;\n' +
+      '  the local SQLite database cannot use it.'
     );
   }
-  log(`Generated client found at: ${generatedDir}`);
+  log(`Desktop generated client found at: ${generatedDir}`);
 
   // 1. Runtime package
   copyDereference(clientPkg, path.join(destNodeModules, '@prisma', 'client'));
   log('Copied @prisma/client → resources/node_modules/@prisma/client');
 
-  // 2. Generated client (schema + platform query engine binary)
+  // 2. Desktop generated client (SQLite schema + platform query engine binary)
   copyDereference(generatedDir, path.join(destNodeModules, '.prisma', 'client'));
-  log('Copied .prisma/client → resources/node_modules/.prisma/client');
+  log('Copied desktop SQLite client → resources/node_modules/.prisma/client');
 
   // 3. Runtime dependencies of @prisma/client (tiny JS helpers)
   for (const dep of collectDependencyDirs(clientPkg)) {

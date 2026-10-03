@@ -14,6 +14,9 @@ import {
 } from '../lib/analytics-engine'
 import { getMapsSettingsAdmin, validateMapsSettingsPayload, applyMapsSettingsWrites, validateGoogleMaps, validateOpenFreeMap, validateGeocoding, type MapsValidationResult } from '../lib/map-settings'
 import { getSettingRaw } from '../lib/config-manager'
+// Task 2-a FIX 3 — the admin-dashboard SMS tab reads/writes /admin/sms-settings.
+import { getSmsSettings, getSmsUsageStats, testSms, validateGatewayConnection } from '../lib/sms-service'
+import { PROVIDER_REGISTRY } from '../lib/messaging/provider-registry'
 import { z } from 'zod'
 import { scryptSync } from 'crypto'
 import path from 'path'
@@ -851,16 +854,30 @@ async function buildSectionReservationWhere(c: { req: { query: (k: string) => st
   return where
 }
 
+/**
+ * Bucket key for a timestamp at the range granularity — MUST stay identical to
+ * buildBucketKeys() in lib/analytics-dashboard.ts (Task 2-a FIX 1): hourly →
+ * 'YYYY-MM-DDTHH', monthly → 'YYYY-MM', else 'YYYY-MM-DD'. Shared by
+ * timeseriesFromDates() and the /analytics/payments revenue loop so rows are
+ * keyed the same way as pq.range.bucketKeys (previously the payments route
+ * skipped the hourly branch → flat-zero trend for today/yesterday).
+ */
+function bucketKeyOf(d: Date, granularity: string): string {
+  if (granularity === 'hourly') {
+    return `${utcDateKeyOf(d)}T${String(d.getUTCHours()).padStart(2, '0')}`
+  }
+  if (granularity === 'monthly') {
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
+  }
+  return utcDateKeyOf(d)
+}
+
 /** Zero-filled count timeseries from raw date rows at the range granularity. */
 function timeseriesFromDates(dates: Date[], range: { bucketKeys: string[]; granularity: string }): Array<{ bucket: string; count: number }> {
   const counts = new Map<string, number>()
   for (const key of range.bucketKeys) counts.set(key, 0)
   for (const d of dates) {
-    const key = range.granularity === 'hourly'
-      ? `${utcDateKeyOf(d)}T${String(d.getUTCHours()).padStart(2, '0')}`
-      : range.granularity === 'monthly'
-        ? `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`
-        : utcDateKeyOf(d)
+    const key = bucketKeyOf(d, range.granularity)
     if (counts.has(key)) counts.set(key, (counts.get(key) ?? 0) + 1)
   }
   return Array.from(counts.entries()).map(([bucket, count]) => ({ bucket, count }))
@@ -1377,32 +1394,39 @@ app.get('/analytics/subscriptions', async (c) => {
     const now = new Date()
     const in30Days = new Date(now.getTime() + 30 * 24 * 3600e3)
 
-    const [byPlan, byTier, byStatus, activeSubscriptions, newInPeriod, expiringSoon, plansCatalog] = await Promise.all([
-      db.agency.groupBy({ by: ['subscriptionPlanId'], _count: { id: true } }),
+    const [byTier, byStatus, agenciesWithoutPlan, activeSubscriptions, newInPeriod, expiringSoon, plansCatalog] = await Promise.all([
       db.agency.groupBy({ by: ['subscriptionTier'], _count: { id: true } }),
       db.agency.groupBy({ by: ['subscriptionStatus'], _count: { id: true } }),
+      // Task 2-a: keep the original "no plan entity assigned" semantics.
+      db.agency.count({ where: { subscriptionPlanId: null } }),
       db.agency.count({ where: { subscriptionStatus: 'ACTIVE' } }),
       db.agency.count({ where: { subscriptionStartsAt: { gte: start, lte: end } } }),
       db.agency.count({ where: { subscriptionExpiresAt: { gte: now, lte: in30Days } } }),
       db.subscriptionPlan.findMany({ where: { isActive: true }, select: { id: true, name: true, displayName: true, price: true, billingCycle: true } }),
     ])
 
-    const planNameById = new Map(plansCatalog.map((p) => [p.id, p]))
-    const planDistribution = byPlan
-      .filter((g) => g.subscriptionPlanId !== null)
+    // Task 2-a: planDistribution now derives from the SAME agency.subscriptionTier
+    // field as byTier (they previously read two different fields —
+    // subscriptionPlanId join vs subscriptionTier — and could disagree, e.g.
+    // transaction approval sets subscriptionTier without refreshing
+    // subscriptionPlanId). Catalog info is attached by matching plan.name to
+    // the tier string; `planName` is added for the section-types.ts frontend
+    // contract (additive — `name` kept for older consumers).
+    const planDistribution = [...byTier]
+      .sort((a, b) => b._count.id - a._count.id)
       .map((g) => {
-        const plan = planNameById.get(g.subscriptionPlanId as string)
+        const tier = g.subscriptionTier
+        const plan = plansCatalog.find((p) => p.name === tier)
         return {
-          planId: g.subscriptionPlanId,
-          name: plan?.name ?? 'Unknown plan',
+          planId: plan?.id ?? null,
+          planName: plan?.name ?? tier,
+          name: plan?.name ?? tier,
           displayName: plan?.displayName ?? null,
           price: plan?.price ?? null,
           billingCycle: plan?.billingCycle ?? null,
           agencies: g._count.id,
         }
       })
-      .sort((a, b) => b.agencies - a.agencies)
-    const unassigned = byPlan.find((g) => g.subscriptionPlanId === null)
 
     const tierDist: Record<string, number> = {}
     for (const g of byTier) tierDist[g.subscriptionTier] = g._count.id
@@ -1417,7 +1441,7 @@ app.get('/analytics/subscriptions', async (c) => {
           activeSubscriptions,
           newSubscriptionsInPeriod: newInPeriod,
           expiringWithin30Days: expiringSoon,
-          agenciesWithoutPlan: unassigned?._count.id ?? 0,
+          agenciesWithoutPlan: agenciesWithoutPlan,
           plansInCatalog: plansCatalog.length,
         },
         planDistribution,
@@ -1463,9 +1487,10 @@ app.get('/analytics/payments', async (c) => {
         s.value += value
         m.value += value
         totalRevenue += value
-        const bucketKey = pq.range.granularity === 'monthly'
-          ? `${r.createdAt.getUTCFullYear()}-${String(r.createdAt.getUTCMonth() + 1).padStart(2, '0')}`
-          : utcDateKeyOf(r.createdAt)
+        // Task 2-a FIX 1: shared bucketing helper — hourly ranges now key as
+        // 'YYYY-MM-DDTHH' to match pq.range.bucketKeys (was date-only → no
+        // match → all-zero revenueTimeseries for today/yesterday).
+        const bucketKey = bucketKeyOf(r.createdAt, pq.range.granularity)
         if (bucketValues.has(bucketKey)) bucketValues.set(bucketKey, (bucketValues.get(bucketKey) ?? 0) + value)
       }
     }
@@ -2157,8 +2182,9 @@ app.get('/dashboard', async (c) => {
       activeQueues,
       dailyReservations,
       pendingTransactions,
-      completedTransactions,
+      approvedTransactionRows,
       totalUsers,
+      openSupportTickets,
       expiredSubscriptions,
       expiringSoonSubscriptions,
     ] = await Promise.all([
@@ -2168,11 +2194,16 @@ app.get('/dashboard', async (c) => {
         where: { joinedAt: { gte: todayStart, lte: todayEnd } },
       }),
       db.transaction.count({ where: { status: 'PENDING' } }),
-      db.transaction.aggregate({
+      // Task 2-a FIX 2: revenue = what was REALLY paid. Prisma cannot coalesce
+      // inside _sum, so fetch the rows and reduce amountPaid ?? priceSnapshot
+      // ?? amount — the same definition /analytics/payments uses.
+      db.transaction.findMany({
         where: { status: 'APPROVED' },
-        _sum: { amount: true },
+        select: { amount: true, amountPaid: true, priceSnapshot: true },
       }),
       db.user.count({ where: { isActive: true } }),
+      // Support desk: OPEN + IN_PROGRESS tickets awaiting admin action
+      db.supportTicket.count({ where: { status: { in: ['OPEN', 'IN_PROGRESS'] } } }),
       // Agencies whose subscription has already expired (expiry date in the past)
       db.agency.count({
         where: {
@@ -2199,7 +2230,10 @@ app.get('/dashboard', async (c) => {
       },
     })
 
-    const totalRevenue = completedTransactions._sum.amount ?? 0
+    const totalRevenue = approvedTransactionRows.reduce(
+      (sum, t) => sum + (t.amountPaid ?? t.priceSnapshot ?? t.amount),
+      0,
+    )
 
     return c.json({
       stats: {
@@ -2209,6 +2243,7 @@ app.get('/dashboard', async (c) => {
         totalRevenue,
         pendingTransactions,
         totalUsers,
+        openSupportTickets,
         expiredSubscriptions,
         expiringSoonSubscriptions,
       },
@@ -2952,7 +2987,225 @@ app.get('/performance', async (c) => {
   }
 })
 
-// ─── SMS Settings ───────────────────────────────────────────────────────────
+// ─── SMS Settings (Task 2-a FIX 3 — admin-dashboard.tsx SMS tab contract) ───
+//
+// The SUPER_ADMIN dashboard calls GET /api/admin/sms-settings on mount, saves
+// via PUT (an echoed-back MASKED apiKey is treated as "no change"), and POSTs
+// { phoneNumber } (send test) / { action: 'validate' } (gateway check). The
+// routes previously did not exist → 404s + a dead SMS tab. Response shapes
+// mirror the frontend interfaces EXACTLY (top-level keys — the dashboard does
+// NOT unwrap a { success, data } envelope here, same convention as
+// /admin/payment-settings):
+//   settings: SmsSettingsData (id/provider/apiUrl/apiKey/senderName/enabled/
+//             smsPerReminder/maxSmsPerDay/testPhoneNumber/updatedAt/createdAt)
+//   stats:    SmsUsageStats (sentToday/sentThisWeek/sentThisMonth/totalSent/
+//             failedToday)
+//   recentLogs: SmsLogItem[] (id/phoneNumber/message/status/provider/
+//             errorMessage/createdAt — 20 newest)
+//   providers: SmsProviderInfo[] (id/name/description/defaultApiUrl/
+//             senderIdSupport/docsUrl)
+
+/** Mask everything but the last 4 chars; always ≥4 bullets so the frontend's `includes('••••')` round-trip check matches. */
+function maskSmsApiKeyForAdmin(key: string): string {
+  if (!key) return ''
+  if (key.length <= 4) return '••••'
+  return '•'.repeat(Math.max(4, key.length - 4)) + key.slice(-4)
+}
+
+/** Providers for the SMS tab, from the Task-22 registry (SMS channel only). */
+function smsProviderInfos(): Array<{ id: string; name: string; description: string; defaultApiUrl: string; senderIdSupport: boolean; docsUrl: string }> {
+  return [PROVIDER_REGISTRY.SMS].map((p) => ({
+    id: p.id,
+    name: p.name,
+    description: p.description,
+    defaultApiUrl: p.defaultApiUrl,
+    senderIdSupport: p.fields.some((f) => f.target === 'senderId'),
+    docsUrl: p.docsUrl,
+  }))
+}
+
+function serializeSmsSettings(settings: {
+  id: string
+  provider: string
+  apiUrl: string
+  apiKey: string
+  senderName: string
+  enabled: boolean
+  smsPerReminder: number
+  maxSmsPerDay: number
+  testPhoneNumber: string | null
+  updatedAt: Date
+  createdAt: Date
+}) {
+  return {
+    id: settings.id,
+    provider: settings.provider,
+    apiUrl: settings.apiUrl,
+    apiKey: maskSmsApiKeyForAdmin(settings.apiKey),
+    senderName: settings.senderName,
+    enabled: settings.enabled,
+    smsPerReminder: settings.smsPerReminder,
+    maxSmsPerDay: settings.maxSmsPerDay,
+    testPhoneNumber: settings.testPhoneNumber,
+    updatedAt: settings.updatedAt.toISOString(),
+    createdAt: settings.createdAt.toISOString(),
+  }
+}
+
+/** Full GET payload ({ settings, stats, recentLogs, providers }) — reused by PUT/POST so the dashboard can refresh its state in one round-trip. */
+async function buildSmsSettingsResponse(settings: Awaited<ReturnType<typeof getSmsSettings>>) {
+  const [stats, recentLogs] = await Promise.all([
+    getSmsUsageStats(),
+    db.smsLog.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+      select: { id: true, phoneNumber: true, message: true, status: true, provider: true, errorMessage: true, createdAt: true },
+    }),
+  ])
+  return {
+    settings: serializeSmsSettings(settings),
+    stats,
+    recentLogs: recentLogs.map((log) => ({
+      id: log.id,
+      phoneNumber: log.phoneNumber,
+      message: log.message,
+      status: log.status,
+      provider: log.provider,
+      errorMessage: log.errorMessage,
+      createdAt: log.createdAt.toISOString(),
+    })),
+    providers: smsProviderInfos(),
+  }
+}
+
+// Task 2-a: the stale smsSettingsSchema in lib/validations.ts still carries the
+// 8 removed legacy providers and lacks the limit/test-phone fields, so this
+// route validates inline (per task instructions) against what the dashboard
+// actually sends.
+const adminSmsSettingsUpdateSchema = z.object({
+  provider: z.string().min(1).max(50).optional(),
+  apiUrl: z.string().max(500).optional(),
+  apiKey: z.string().max(500).optional(),
+  senderName: z.string().max(50).optional(),
+  enabled: z.boolean().optional(),
+  smsPerReminder: z.number().int().min(1).max(10).optional(),
+  maxSmsPerDay: z.number().int().min(0).max(10000).optional(),
+  testPhoneNumber: z.string().max(30).nullable().optional(),
+})
+
+// GET /admin/sms-settings
+app.get('/sms-settings', async (c) => {
+  try {
+    await requireAdmin(c)
+    const settings = await getSmsSettings() // creates the default row if missing (same as lib/sms-service)
+    return c.json(await buildSmsSettingsResponse(settings))
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// PUT /admin/sms-settings
+app.put('/sms-settings', async (c) => {
+  try {
+    const admin = await requireAdmin(c)
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400)
+    }
+    const validation = validateBody(adminSmsSettingsUpdateSchema, body)
+    if (validation.error) {
+      return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
+    }
+    const data = validation.data
+
+    const settings = await getSmsSettings()
+
+    const apiKeyChanged = data.apiKey !== undefined && !data.apiKey.includes('••••')
+
+    const updated = await db.smsSettings.update({
+      where: { id: settings.id },
+      data: {
+        ...(data.provider !== undefined && { provider: data.provider }),
+        ...(data.apiUrl !== undefined && { apiUrl: data.apiUrl }),
+        ...(data.senderName !== undefined && { senderName: data.senderName }),
+        ...(data.enabled !== undefined && { enabled: data.enabled }),
+        ...(data.smsPerReminder !== undefined && { smsPerReminder: data.smsPerReminder }),
+        ...(data.maxSmsPerDay !== undefined && { maxSmsPerDay: data.maxSmsPerDay }),
+        ...(data.testPhoneNumber !== undefined && { testPhoneNumber: data.testPhoneNumber }),
+        // A masked key echoed back (contains '••••') means "unchanged" — keep the stored value.
+        ...(apiKeyChanged && { apiKey: data.apiKey }),
+      },
+    })
+
+    await db.auditLog.create({
+      data: {
+        userId: admin.id,
+        action: 'SMS_SETTINGS_UPDATED',
+        entityType: 'SMS_SETTINGS',
+        entityId: updated.id,
+        details: JSON.stringify({
+          provider: updated.provider,
+          enabled: updated.enabled,
+          apiKeyChanged,
+        }),
+      },
+    })
+
+    return c.json(await buildSmsSettingsResponse(updated))
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// POST /admin/sms-settings — the dashboard's two SMS-tab buttons:
+//   { phoneNumber }     → send a test SMS (lib/sms-service testSms)
+//   { action:'validate' } → gateway config check (lib/sms-service validateGatewayConnection)
+app.post('/sms-settings', async (c) => {
+  try {
+    const admin = await requireAdmin(c)
+
+    let body: { phoneNumber?: unknown; action?: unknown }
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400)
+    }
+
+    if (body.action === 'validate') {
+      const result = await validateGatewayConnection()
+      return c.json(result) // { valid, error?, provider } — dashboard checks data.valid
+    }
+
+    const phoneNumber = typeof body.phoneNumber === 'string' ? body.phoneNumber.trim() : ''
+    if (!phoneNumber) {
+      return c.json({ success: false, error: 'phoneNumber is required' }, 400)
+    }
+
+    const result = await testSms(phoneNumber)
+    await db.auditLog.create({
+      data: {
+        userId: admin.id,
+        action: 'SMS_SEND',
+        entityType: 'SMS_SETTINGS',
+        entityId: result.logId ?? 'test',
+        details: JSON.stringify({ phoneNumber, success: result.success, error: result.error ?? null }),
+      },
+    })
+
+    if (!result.success) {
+      return c.json({ success: false, error: result.error ?? 'SMS_SEND_FAILED' }, 400)
+    }
+    return c.json({ success: true, logId: result.logId })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
 
 // ─── Stats ──────────────────────────────────────────────────────────────────
 

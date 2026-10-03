@@ -35,6 +35,7 @@ function mapApiType(apiType: string): Notification['type'] {
   const t = (apiType || '').toUpperCase();
   if (t.startsWith('TURN')) return 'turn';
   if (t.startsWith('QUEUE')) return 'queue';
+  if (t.startsWith('TICKET')) return 'info';
   if (t.startsWith('SUCCESS')) return 'success';
   if (t.startsWith('WARNING')) return 'warning';
   if (t.startsWith('ERROR')) return 'error';

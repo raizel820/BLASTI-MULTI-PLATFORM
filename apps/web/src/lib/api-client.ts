@@ -45,6 +45,12 @@
 // lock). See lib/authz-state.ts.
 import { isRevoked, setRevoked, isRevocationStatus } from './authz-state';
 
+// Native (Capacitor) cloud-API runtime resolution — fixes "can't login on a
+// physical phone": the build-time NEXT_PUBLIC_API_URL defaults to the Android
+// EMULATOR alias 10.0.2.2:3003, which no physical device can reach. The
+// resolver finds the PC's LAN address at runtime (probe/scan on :3003).
+import { getNativeCloudUrl, startNativeCloudResolution } from './native-cloud-resolver';
+
 // Diagnostics ring buffer (persistent) — every failure below records a
 // machine-readable timeline event. See lib/diag-log.ts.
 import { diag } from './diag-log';
@@ -243,7 +249,8 @@ const ELECTRON_LOCAL_API_BASE = 'http://127.0.0.1:3080';
  * 1. **SSR**: `INTERNAL_API_URL` env var → `http://localhost:3000`
  * 2. **Electron**: the embedded LOCAL API `http://127.0.0.1:3080` ALWAYS
  *    (local-first: cloud is sync-only and must never serve UI data requests)
- * 3. **Capacitor**: `NEXT_PUBLIC_API_URL` env var → `http://localhost:3003`
+ * 3. **Capacitor**: runtime-resolved cloud URL (native-cloud-resolver) →
+ *    `NEXT_PUBLIC_API_URL` env var → `http://10.0.2.2:3003` (emulator alias)
  * 4. **Web (browser)**: `NEXT_PUBLIC_API_URL` → cloud API → fallback to localhost:3003
  *
  * NOTE: We removed the Next.js rewrite proxy (/api/* → localhost:3003) because
@@ -273,10 +280,15 @@ export function getApiBaseUrl(): string {
   }
 
   // Native shell (Capacitor): need absolute URL to the cloud API backend.
-  // Emulator default 10.0.2.2 (host loopback alias) — NEVER localhost,
-  // which inside the WebView is the device itself.
+  // Runtime-resolved LAN address first (physical devices — the build-time
+  // default 10.0.2.2 is the ANDROID EMULATOR alias and is unreachable from a
+  // real phone), then the build-time env (emulators / fixed servers), then
+  // the emulator alias. NEVER localhost, which inside the WebView is the
+  // device itself.
   if (isCapacitorRuntime()) {
-    return process.env.NEXT_PUBLIC_API_URL || DEFAULT_NATIVE_CLOUD_URL;
+    return getNativeCloudUrl()
+      || process.env.NEXT_PUBLIC_API_URL
+      || DEFAULT_NATIVE_CLOUD_URL;
   }
 
   // Web browser: use explicit API URL if set (e.g. for staging environments)
@@ -358,9 +370,13 @@ export function getCloudApiBaseUrl(): string {
     return process.env.NEXT_PUBLIC_CLOUD_URL || DEFAULT_CLOUD_URL;
   }
 
-  // Capacitor: build-time NEXT_PUBLIC_API_URL wins, emulator alias fallback.
+  // Capacitor: runtime-resolved LAN address wins (physical devices), then the
+  // build-time env, then the emulator alias fallback.
   if (isCapacitorRuntime()) {
-    return process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_CLOUD_URL || DEFAULT_NATIVE_CLOUD_URL;
+    return getNativeCloudUrl()
+      || process.env.NEXT_PUBLIC_API_URL
+      || process.env.NEXT_PUBLIC_CLOUD_URL
+      || DEFAULT_NATIVE_CLOUD_URL;
   }
 
   if (process.env.NEXT_PUBLIC_API_URL) {
@@ -632,6 +648,12 @@ function persistUnreachableFlags(): void {
 
 // Restore flags immediately on module load (handles HMR re-initialization)
 restoreUnreachableFlags();
+// Native shells: resolve the cloud API address at RUNTIME (probe/scan the LAN
+// for the :3003 /api/discover beacon). Fire-and-forget — early requests use
+// the build-time env default and later ones pick up the resolved URL.
+if (isCapacitorRuntime()) {
+  startNativeCloudResolution();
+}
 // Module init banner — shows platform, URLs, and flag state on every load (including HMR)
 {
   const platform = isElectronRuntime() ? 'Electron' : isCapacitorRuntime() ? 'Capacitor' : isServerSide() ? 'SSR' : 'Web';
@@ -847,7 +869,14 @@ export class ApiClient {
     // In Electron, use a shorter timeout (5s) so cloud failures are detected quickly
     // and LAN failover kicks in without a long wait.
     const timeoutMs = options?.timeout ?? (isElectronRuntime() ? 5_000 : this.config.timeout);
-    const url = buildUrl(this.config.baseUrl, path, options?.params);
+    // Re-resolve the base URL PER REQUEST (not per construction): the Capacitor
+    // runtime resolver finishes asynchronously after module load, and the
+    // singleton's frozen config.baseUrl would otherwise keep pointing at the
+    // unreachable build-time default (10.0.2.2) forever on physical phones.
+    const requestBaseUrl = isCapacitorRuntime() && getNativeCloudUrl()
+      ? getNativeCloudUrl() as string
+      : this.config.baseUrl;
+    const url = buildUrl(requestBaseUrl, path, options?.params);
 
     // ── Electron: pre-discover local API (inert under local-first) ──────────────────
     // Fire-and-forget: only populates use-lan-mode UI state; the request below

@@ -74,7 +74,10 @@ import { staffAnalyticsRoutes } from './routes/staff-analytics'
 import { customerAnalyticsRoutes } from './routes/customer-analytics'
 // Task 51 — public-ish runtime configuration (GET /api/config/maps)
 import { configRoutes } from './routes/config'
-import { db, setupSQLitePragmas } from '@blasti/db'
+// Support desk — customers AND agencies send complaints/suggestions/
+// questions/notes to the super admin.
+import { supportTicketRoutes } from './routes/support-tickets'
+import { db, setupConnectionPragmas } from '@blasti/db'
 import { initialSyncRoutes } from './routes/initial-sync'
 import { idempotencyGuard } from './lib/idempotency-middleware'
 import { setSyncNotifyIo, startSyncNotifyTimer } from './lib/sync-notify'
@@ -98,58 +101,34 @@ const INTERNAL_SECRET = process.env.INTERNAL_SECRET || ''
 // ─── Startup validation: DATABASE_URL ────────────────────────────────────────
 // A freshly-cloned/copied project may have NO DATABASE_URL set (the root .env
 // is gitignored). Instead of crashing with Prisma's cryptic "Environment
-// variable not found" on every query, fall back to the standard SQLite path
-// (packages/db/data/custom.db) and log a notice.
-//
-// Relative paths are resolved against the monorepo root (NOT the API's CWD,
-// which is apps/api/ in dev) and rewritten to an absolute path before Prisma
-// reads them — this works identically on Linux and Windows.
+// variable not found", fall back to the documented local development
+// PostgreSQL database (ops/docker-compose.dev.yml) and log a notice.
+// Production (OVH VPS via ops/docker-compose.yml) always sets a real URL
+// through ops/.env.
 const fs = require('fs')
-const path = require('path')
 
-function findMonorepoRoot(): string {
-  // Walk up from CWD looking for the packages/ directory (monorepo root marker).
-  let dir = process.cwd()
-  for (let i = 0; i < 10; i++) {
-    if (fs.existsSync(path.join(dir, 'packages', 'db'))) return dir
-    const parent = path.dirname(dir)
-    if (parent === dir) break
-    dir = parent
-  }
-  return process.cwd() // fallback
-}
+const POSTGRES_URL_RE = /^(postgres|postgresql):\/\//i
 
 let DATABASE_URL = process.env.DATABASE_URL
 if (!DATABASE_URL) {
-  // Cross-platform default (works on Linux AND Windows — no $PWD/shell
-  // syntax required). Resolved to an absolute path against the monorepo
-  // root by the block below. Set DATABASE_URL in .env to override.
-  DATABASE_URL = 'file:./packages/db/data/custom.db'
+  DATABASE_URL = 'postgresql://blasti:blasti@127.0.0.1:5432/blasti?schema=public'
   process.env.DATABASE_URL = DATABASE_URL
-  console.warn('[db] DATABASE_URL not set — using default SQLite database:')
-  console.warn('     packages/db/data/custom.db  (set DATABASE_URL in .env to override)')
+  console.warn('[db] DATABASE_URL not set — using the local development PostgreSQL database:')
+  console.warn('     postgresql://blasti:blasti@127.0.0.1:5432/blasti')
+  console.warn('     Start it with: docker compose -f ops/docker-compose.dev.yml up -d')
+  console.warn('     (Set DATABASE_URL in .env to override — see ops/.env.example for production)')
 }
 
-// Resolve relative SQLite paths to absolute (against monorepo root) so they
-// work regardless of the API's CWD (which is apps/api/ in dev).
-if (DATABASE_URL.startsWith('file:')) {
-  const dbPath = DATABASE_URL.replace(/^file:/, '').replace(/\?.*$/, '')
-  if (!path.isAbsolute(dbPath)) {
-    const root = findMonorepoRoot()
-    const absolute = path.resolve(root, dbPath)
-    DATABASE_URL = `file:${absolute}`
-    process.env.DATABASE_URL = DATABASE_URL // rewrite so Prisma picks it up
-    console.log(`[db] Resolved relative DATABASE_URL → ${DATABASE_URL}`)
-  }
-  // Verify the DB file actually exists (Prisma error 14 is opaque).
-  const checkPath = DATABASE_URL.replace(/^file:/, '').replace(/\?.*$/, '')
-  if (!fs.existsSync(checkPath)) {
-    console.error(`\n❌ FATAL: SQLite database file not found: ${checkPath}`)
-    console.error('   DATABASE_URL =', DATABASE_URL)
-    console.error('   Fix: run the database migration to create it:\n')
-    console.error('       bun run db:push\n')
-    process.exit(1)
-  }
+// The schema provider is PostgreSQL — a non-postgres URL can only be a stale
+// config. Fail loudly with actionable examples instead of a runtime surprise.
+if (!POSTGRES_URL_RE.test(DATABASE_URL)) {
+  console.error('\n❌ FATAL: DATABASE_URL must be a PostgreSQL connection URL.')
+  console.error('   BLASTI no longer supports SQLite file databases (schema provider = "postgresql").')
+  console.error('   DATABASE_URL =', DATABASE_URL.replace(/:[^:@/]+@/, ':****@'))
+  console.error('   Examples:')
+  console.error('     Local dev : postgresql://blasti:blasti@127.0.0.1:5432/blasti?schema=public')
+  console.error('     OVH prod  : postgresql://blasti:<password>@db:5432/blasti?schema=public  (docker compose)')
+  process.exit(1)
 }
 
 // Phase 1c: Allowed origins for CSWSH protection
@@ -612,6 +591,8 @@ app.route('/api/staff/analytics', staffAnalyticsRoutes)
 app.route('/api/customer/analytics', customerAnalyticsRoutes)
 // Task 51 — Agency Location & Maps: effective map config for any authed user
 app.route('/api/config', configRoutes)
+// Support desk — ticket create/list/reply (see routes/support-tickets.ts)
+app.route('/api/support-tickets', supportTicketRoutes)
 
 // ─── Sync-route introspection (P0-2: make the running build self-evident) ──
 // Field round 4 showed a cloud process answering /api/health with 200 while
@@ -969,10 +950,15 @@ function isPrivateLanHost(host: string): boolean {
 
 function isOriginAllowed(origin: string | undefined): boolean {
   if (!origin) {
-    // Electron desktop clients may drop the origin header.
-    // In production, require JWT auth via the handshake.
-    // In development, allow for convenience.
-    return isDevelopment
+    // Task 24: allow origin-less WebSocket handshakes in ALL environments.
+    // Packaged Electron's sync engine (socket.io-client from the MAIN process,
+    // not a Chromium renderer) sends no Origin header — with the old
+    // `return isDevelopment` the desktop lost the ENTIRE fast-path relay in
+    // production builds (handshake rejected before JWT auth even ran).
+    // CSWSH protection only applies to browsers (the only clients that attach
+    // Origin); non-browser clients need the session token for every room join
+    // and every authed request regardless, so this opens no new surface.
+    return true
   }
   // Strict exact match ONLY — no startsWith, no regex
   if (STRICT_ALLOWED_ORIGINS.has(origin)) return true
@@ -1390,8 +1376,8 @@ io.on('connection', async (socket) => {
 })
 
 httpServer.listen(PORT, HOST, async () => {
-  // Phase 3b: Set SQLite busy_timeout PRAGMA on startup
-  await setupSQLitePragmas()
+  // One-shot database connectivity check (legacy SQLite PRAGMA is a no-op now)
+  await setupConnectionPragmas()
   console.log(`🚀 @blasti/api server running on port ${PORT} (bootId: ${BOOT_ID.substring(0, 8)}…)`)
   console.log(`   API:    http://localhost:${PORT}/ (bound to ${HOST})`)
   console.log(`   Health: http://localhost:${PORT}/health`)
