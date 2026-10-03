@@ -226,6 +226,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
         setViewFromHash(hash);
       }
+    } else if (currentView === 'login' || currentView === 'register') {
+      // Web must always START on the landing page. A stale persisted
+      // 'login'/'register' view (left over from an earlier visit to this
+      // origin) used to make the site boot straight into the login screen —
+      // correct for the native shells (Electron / Capacitor skip the
+      // marketing landing) but wrong for browsers. This runs ONCE per page
+      // load, so in-app navigation to login is untouched.
+      const isNativeShell =
+        !!window.electronAPI ||
+        !!(window as unknown as { Capacitor?: unknown }).Capacitor;
+      if (!isNativeShell) {
+        useAppStore.getState().setView('landing');
+      } else {
+        updateHashForView(currentView);
+      }
     } else {
       updateHashForView(currentView);
     }

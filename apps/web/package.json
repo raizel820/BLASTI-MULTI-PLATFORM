@@ -52,13 +52,14 @@
     "zustand": "^5.0.6"
   },
   "devDependencies": {
-    "cross-env": "^7.0.3",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^22",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "cross-env": "^7.0.3",
     "eslint-config-next": "^16.1.1",
     "tailwindcss": "^4",
+    "tailwindcss-animate": "^1.0.7",
     "tw-animate-css": "^1.3.5",
     "typescript": "^5"
   }

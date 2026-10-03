@@ -387,6 +387,72 @@ EOF
 }
 
 # --------------------------------------------------------------------
+# ON-VPS: (re)write the blasti-api / blasti-web systemd units.
+# Called by server-install AND server-update, so unit changes ship to
+# existing droplets with a plain `git pull` + server-update.
+# --------------------------------------------------------------------
+write_systemd_units() {
+  local root="$1"
+  local NEXT_BIN WEB_START
+  NEXT_BIN="$(resolve_next_bin "$root")" || die "Next.js CLI not found after bun install"
+  case "$NEXT_BIN" in
+    */dist/bin/next) WEB_START="/usr/bin/node $NEXT_BIN start -H 127.0.0.1 -p 3000" ;;
+    *)               WEB_START="$NEXT_BIN start -H 127.0.0.1 -p 3000" ;;
+  esac
+
+  # The API unit declares ReadWritePaths on this directory: it MUST exist,
+  # otherwise systemd fails the unit with a mount-namespacing error.
+  mkdir -p "$root/apps/api/uploads"
+
+  cat > /etc/systemd/system/blasti-api.service <<EOF
+[Unit]
+Description=BLASTI API (Bun - Hono + Socket.IO on 127.0.0.1:3003)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=$ENV_FILE
+WorkingDirectory=$root/apps/api
+ExecStart=/usr/local/bin/bun src/index.ts
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=-$root/apps/api/uploads
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  cat > /etc/systemd/system/blasti-web.service <<EOF
+[Unit]
+Description=BLASTI Web (Next.js on 127.0.0.1:3000)
+After=network-online.target blasti-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=$ENV_FILE
+Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
+WorkingDirectory=$root/apps/web
+ExecStart=$WEB_START
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# --------------------------------------------------------------------
 # MODE: server-install (runs ON the VPS, as root)
 # --------------------------------------------------------------------
 cmd_server_install() {
@@ -582,60 +648,8 @@ EOF
   build_web "$DIR"
 
   # -- 14. systemd services (auto-start + auto-restart on boot/crash) ------------
-  local NEXT_BIN WEB_START
-  NEXT_BIN="$(resolve_next_bin "$DIR")" || die "Next.js CLI not found after bun install"
-  case "$NEXT_BIN" in
-    */dist/bin/next) WEB_START="/usr/bin/node $NEXT_BIN start -H 127.0.0.1 -p 3000" ;;
-    *)               WEB_START="$NEXT_BIN start -H 127.0.0.1 -p 3000" ;;
-  esac
-
   log "Installing systemd services (blasti-api, blasti-web)..."
-  cat > /etc/systemd/system/blasti-api.service <<EOF
-[Unit]
-Description=BLASTI API (Bun - Hono + Socket.IO on 127.0.0.1:3003)
-After=network-online.target docker.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=$ENV_FILE
-WorkingDirectory=$DIR/apps/api
-ExecStart=/usr/local/bin/bun src/index.ts
-Restart=always
-RestartSec=3
-TimeoutStopSec=15
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ReadWritePaths=$DIR/apps/api/uploads
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  cat > /etc/systemd/system/blasti-web.service <<EOF
-[Unit]
-Description=BLASTI Web (Next.js on 127.0.0.1:3000)
-After=network-online.target blasti-api.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=$ENV_FILE
-Environment=NODE_ENV=production
-Environment=NEXT_TELEMETRY_DISABLED=1
-WorkingDirectory=$DIR/apps/web
-ExecStart=$WEB_START
-Restart=always
-RestartSec=3
-TimeoutStopSec=15
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-
-[Install]
-WantedBy=multi-user.target
-EOF
+  write_systemd_units "$DIR"
 
   systemctl daemon-reload
   systemctl enable --now blasti-api.service blasti-web.service >/dev/null 2>&1 || true
@@ -705,7 +719,11 @@ cmd_server_update() {
     warn "domain set to $DOMAIN - make sure the DNS A-record points at this server"
   fi
 
-  # -- 4. restart services + re-render Caddy (ships ops/Caddyfile changes) ------
+  # -- 4. refresh systemd units (ships unit changes to existing droplets) --------
+  write_systemd_units "$root"
+  systemctl daemon-reload
+
+  # -- 5. restart services + re-render Caddy (ships ops/Caddyfile changes) ------
   local SITE
   SITE="$(grep '^SITE_ADDRESS=' "$ENV_FILE" | cut -d= -f2- || true)"
   [ -n "$SITE" ] || SITE=":80"

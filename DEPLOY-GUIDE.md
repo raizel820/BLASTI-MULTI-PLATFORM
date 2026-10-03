@@ -99,8 +99,9 @@ memory automatically), but 4 GB builds noticeably faster.
 **Windows:** click Start, type **PowerShell**, press Enter, then type
 (replace `203.0.113.10` with YOUR droplet IP):
 
+ssh-keygen -R 68.183.137.227
 ```
-ssh root@203.0.113.10
+ssh root@68.183.137.227
 ```
 
 **macOS / Linux:** open **Terminal** and type the same command.
