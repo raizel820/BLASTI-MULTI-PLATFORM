@@ -146,18 +146,6 @@ let _lastPushAt = null;             // Date of last successful outbox replay
 let _lastFullSyncAt = null;
 let _lastIncrementalSyncAt = null;
 
-// Task 75 — cached cloud-reachability verdict (MAIN-PROCESS truth).
-// The renderer's own cloud probe runs cross-origin from http://127.0.0.1:3080
-// (packaged) and is decided by the VPS CORS_ORIGIN policy — an explicit
-// allowlist without the packaged origin makes EVERY renderer probe throw,
-// so the banner showed "local mode" forever while the engine (no CORS)
-// was online. The engine probes /api/health from Node where CORS does not
-// apply; the last verdict is cached here and served through getStatus() →
-// electronAPI.getSyncStatus() so the renderer can key off engine truth.
-let _lastCloudOnline = null;        // true/false from the latest _isOnline()
-let _lastCloudProbeAt = 0;          // ms epoch of that probe
-let _cloudProbeIntervalId = null;   // lightweight keep-fresh probe timer
-
 // Realtime socket
 let _socket = null;
 let _socketId = null;
@@ -676,40 +664,31 @@ async function _logConflict(db, tableName, recordId, localVersion, cloudVersion,
 
 async function _isOnline() {
   const baseUrl = _config?.cloudBaseUrl;
-  if (!baseUrl) {
-    _lastCloudOnline = false;
-    _lastCloudProbeAt = Date.now();
-    return false;
-  }
+  if (!baseUrl) return false;
   // CRITICAL (VPS architecture): behind Caddy ONLY /api/* reaches the API —
   // bare /health is answered by the Next.js WEB app (404), which made the
   // engine permanently believe the cloud was offline ("Running in local
   // mode — cloud sync paused" while the cloud was actually healthy).
   // /api/health is the canonical alias in EVERY topology (direct, LAN,
   // Caddy) — /health is kept as a last-resort fallback for ancient builds.
-  const record = (verdict) => {
-    _lastCloudOnline = verdict;
-    _lastCloudProbeAt = Date.now();
-    return verdict;
-  };
   try {
     const response = await fetch(baseUrl + '/api/health', {
       method: 'GET',
       signal: AbortSignal.timeout(5000),
     });
-    if (response.ok) return record(true);
-    if (response.status !== 404) return record(false);
+    if (response.ok) return true;
+    if (response.status !== 404) return false;
   } catch {
-    return record(false);
+    return false;
   }
   try {
     const legacy = await fetch(baseUrl + '/health', {
       method: 'GET',
       signal: AbortSignal.timeout(5000),
     });
-    return record(legacy.ok);
+    return legacy.ok;
   } catch {
-    return record(false);
+    return false;
   }
 }
 
@@ -1322,8 +1301,6 @@ async function _pullFromCloud(options) {
   var conflictCount = 0;
   var deletedCount = 0;
   var pages = 0;
-  // Task 75: union of models with applied rows across all pages of this pull.
-  var dataAppliedModels = {};
 
   var sinceSequence = fullSync ? 0 : (await _getCursor());
   console.log('[SyncService] Pulling from cloud - agency: ' + agencyId + ', sinceSequence: ' + sinceSequence + (fullSync ? ' (FULL)' : ''));
@@ -1386,13 +1363,6 @@ async function _pullFromCloud(options) {
       // Task 24: notify the local agency room AFTER the rows are committed
       // (see _broadcastPullBusinessEvents). This closes the relay-vs-data race.
       _broadcastPullBusinessEvents(result.reservationEvents, agencyId);
-      // Task 75: aggregate the models this pull actually changed so ONE
-      // 'sync:data-applied' event can notify the UI after the loop.
-      if (result.appliedModels) {
-        for (var am = 0; am < result.appliedModels.length; am++) {
-          dataAppliedModels[result.appliedModels[am]] = true;
-        }
-      }
     }
 
     pages++;
@@ -1417,21 +1387,7 @@ async function _pullFromCloud(options) {
 
   var deferredTotal = await _countDeferredChanges(db, agencyId);
   console.log('[SyncService] Pull applied: ' + applied + ', conflicts: ' + conflictCount + ', deleted: ' + deletedCount + ', pages: ' + pages + ', deferredPending: ' + deferredTotal);
-  // Task 75: tell the UI which NON-Reservation data just landed locally
-  // (services, branches, counters, settings…). Reservation rows already
-  // carry their own business events (_broadcastPullBusinessEvents); this
-  // covers EVERY other model so dashboards can refetch without waiting for
-  // the next poll or a section swap.
-  var appliedModelNames = Object.keys(dataAppliedModels);
-  if (appliedModelNames.length > 0) {
-    try {
-      var lr = require('./local-realtime');
-      if (lr && typeof lr.broadcastLocalRealtime === 'function') {
-        lr.broadcastLocalRealtime('sync:data-applied', { agencyId: agencyId, models: appliedModelNames, applied: applied });
-      }
-    } catch { /* local realtime not available (tests / early boot) */ }
-  }
-  return { applied: applied, conflicts: conflictCount, deleted: deletedCount, pages: pages, deferred: deferredTotal, appliedModels: appliedModelNames };
+  return { applied: applied, conflicts: conflictCount, deleted: deletedCount, pages: pages, deferred: deferredTotal };
 }
 
 // ─── Durable Deferred-Change Queue (Part K) ──────────────────────────────────
@@ -1639,11 +1595,6 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
   var conflictCount = 0;
   var deletedCount = 0;
   var deferred = 0;
-  // Task 75: which models had rows APPLIED in this page — the caller
-  // aggregates them across pages and broadcasts a single 'sync:data-applied'
-  // event so the UI can refetch views driven by NON-Reservation models too
-  // (services, branches, counters, settings changed by another client).
-  var appliedModels = {};
   // Task 24: business events for applied Reservation rows. The pull is the ONLY
   // guaranteed data path for customer actions (join/cancel/postpone/call); the
   // relayed cloud event (fast path) reaches the UI 1-2s BEFORE the row exists
@@ -1787,7 +1738,6 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
         });
         if (ok) {
           applied++;
-          appliedModels[modelName] = true;
           if (modelName === 'Reservation') {
             var action = 'updated';
             if (!existing) {
@@ -1815,7 +1765,6 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
         });
         if (delOk) {
           deletedCount++;
-          appliedModels[modelName] = true;
           if (modelName === 'Reservation') {
             reservationEvents.push({ action: 'cancelled', record: { id: deleteId } });
           }
@@ -1830,7 +1779,7 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
   if (deferred > 0) {
     console.warn('[SyncService] ' + deferred + ' pulled record(s) DURABLY deferred to _deferred_changes (dependency failures) - will re-apply when their parents arrive');
   }
-  return { applied: applied, conflicts: conflictCount, deleted: deletedCount, deferred: deferred, reservationEvents: reservationEvents, appliedModels: Object.keys(appliedModels) };
+  return { applied: applied, conflicts: conflictCount, deleted: deletedCount, deferred: deferred, reservationEvents: reservationEvents };
 }
 
 /**
@@ -2870,23 +2819,6 @@ async function startSync(config) {
     _setupSocket();
     _startWatchdog();
   }
-
-  // ── Task 75: keep the cloud-reachability verdict FRESH even when pulls are
-  // gated (workspace not READY yet, engine paused, no auth). The renderer's
-  // connection banner keys off this verdict through getStatus() — without a
-  // periodic probe it would stay null right after launch (exactly when the
-  // packaged app shows its first banner) and the renderer would fall back to
-  // its own CORS-bound probe, which an explicit-allowlist VPS always rejects.
-  // One 5s-budget GET / 30s is negligible. The first probe runs immediately
-  // so the verdict exists BEFORE the renderer's first health check.
-  if (_config.cloudBaseUrl) {
-    _isOnline().catch(function () { /* never rejects — defensive */ });
-    if (_cloudProbeIntervalId) clearInterval(_cloudProbeIntervalId);
-    _cloudProbeIntervalId = setInterval(function () {
-      if (!_isStarted || _isSyncing) return; // a cycle's own probes keep it fresh
-      _isOnline().catch(function () { /* defensive */ });
-    }, 30 * 1000);
-  }
 }
 
 function stopSync() {
@@ -2895,7 +2827,6 @@ function stopSync() {
   if (_fullReconcileTimeoutId) { clearTimeout(_fullReconcileTimeoutId); _fullReconcileTimeoutId = null; }
   if (_socketPullDebounceId) { clearTimeout(_socketPullDebounceId); _socketPullDebounceId = null; }
   if (_localMutationDebounceId) { clearTimeout(_localMutationDebounceId); _localMutationDebounceId = null; }
-  if (_cloudProbeIntervalId) { clearInterval(_cloudProbeIntervalId); _cloudProbeIntervalId = null; }
   if (_onlineListener) {
     if (typeof process !== 'undefined' && process.off) { process.off('online', _onlineListener); }
     _onlineListener = null;
@@ -3029,12 +2960,6 @@ async function getStatus() {
     cloudBaseUrl: (_config && _config.cloudBaseUrl) || null,
     socketConnected: !!(_socket && _socket.connected),
     socketId: _socketId,
-    // Task 75 — main-process cloud verdict (CORS-free). Consumed by the
-    // renderer's connection banner (connection-status.tsx) as the authority
-    // on cloud reachability: the renderer's own probe is cross-origin from
-    // the packaged origin and can be blocked by the VPS CORS policy.
-    cloudProbeOk: _lastCloudOnline,
-    cloudProbeAt: _lastCloudProbeAt ? new Date(_lastCloudProbeAt).toISOString() : null,
     lastEventAt: _lastEventAt ? new Date(_lastEventAt).toISOString() : null,
     lastPingAt: _lastPingAt ? new Date(_lastPingAt).toISOString() : null,
     lastPullAt: _lastPullAt ? _lastPullAt.toISOString() : null,

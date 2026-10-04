@@ -176,9 +176,24 @@ function _registerRoomHandlers(socket, authRef) {
 
   socket.on('join:room', (room) => {
     if (!room || typeof room !== 'string') return
-    // admin:global is the only sensitive generic room (mirrors the cloud).
+    // Task 75 (parity with the cloud's join:room): agency:* and customer:*
+    // rooms are AUTHORIZED rooms — the generic path must not become an
+    // unauthenticated bypass around join:agency / join:customer. Only
+    // admin:* was checked before, so any loopback socket (kiosk webviews,
+    // a pre-session renderer) could join agency rooms via join:room and
+    // receive queue events without a session.
     if (room.startsWith('admin:')) {
       if (!canJoinAdmin(ensureAuth())) {
+        warn('socket', socket.id, 'rejected join:room(' + room + ') — not authorized')
+        return
+      }
+    } else if (room.startsWith('agency:')) {
+      if (!canJoinAgency(ensureAuth(), room.slice('agency:'.length))) {
+        warn('socket', socket.id, 'rejected join:room(' + room + ') — not authorized')
+        return
+      }
+    } else if (room.startsWith('customer:')) {
+      if (!canJoinCustomer(ensureAuth(), room.slice('customer:'.length))) {
         warn('socket', socket.id, 'rejected join:room(' + room + ') — not authorized')
         return
       }
@@ -538,12 +553,19 @@ function relayCloudRealtime(eventName, args) {
 function getLocalRealtimeStats() {
   let clients = 0
   let authenticated = 0
+  const rooms = {}
   if (_io) {
     try {
       clients = _io.engine.clientsCount
       for (const [id, s] of _io.sockets.sockets) {
         if (s._blastiAuthRef && s._blastiAuthRef.user) authenticated++
         void id
+      }
+      // Field diagnostics (realtime-parity reports): the #1 question when the
+      // desktop "doesn't update live" is whether ANY socket actually sits in
+      // the agency room. room name → member count, kiosk/admin included.
+      for (const [roomName, members] of _io.sockets.adapter.rooms) {
+        rooms[roomName] = members.size
       }
     } catch { /* engine not ready */ }
   }
@@ -552,6 +574,7 @@ function getLocalRealtimeStats() {
     startedAt: _startedAt,
     clients,
     authenticated,
+    rooms,
     relayAgencyId: _relayAgencyId,
     uptimeSec: _startedAt ? Math.floor((Date.now() - _startedAt) / 1000) : 0,
   })

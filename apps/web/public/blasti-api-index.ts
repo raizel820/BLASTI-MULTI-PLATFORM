@@ -157,16 +157,6 @@ app.use('*', cors({
     // Missing it meant every REST call from a real Android phone against the VPS
     // died at CORS preflight while the same app worked in a desktop browser.
     'https://localhost',
-    // Task 75: the PACKAGED desktop app serves its renderer from the embedded
-    // local API, so its page origin is http://127.0.0.1:3080 (or localhost:3080)
-    // — the machine's own loopback. The renderer's cloud health probe and any
-    // direct renderer→cloud fetch are CROSS-ORIGIN from that origin; without
-    // these entries an explicit CORS_ORIGIN allowlist silently rejected every
-    // probe and the desktop banner showed "local mode / offline" while login
-    // (same-origin to :3080, proxied server-side) worked fine. These origins
-    // are fixed and local to the user's machine — always safe to allow.
-    'http://127.0.0.1:3080',
-    'http://localhost:3080',
   ],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   // Task 55: x-blasti-network (web network-type attribution) + x-blasti-device

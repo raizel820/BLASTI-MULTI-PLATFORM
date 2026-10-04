@@ -123,8 +123,11 @@ const ViewRouter = memo(function ViewRouter() {
             case 'landing':
               return <LandingPage />;
             case 'login':
-              // Dedicated agency login page: the desktop app serves agencies only.
-              return platform.isNative ? <DesktopAgencyLogin /> : <LoginForm />;
+              // The DESKTOP app is agency-only and opens its dedicated console
+              // login. The MOBILE app is customer-first but also serves
+              // agencies — the shared form carries both role tabs (customer is
+              // the default tab).
+              return platform.isElectron ? <DesktopAgencyLogin /> : <LoginForm />;
             case 'register':
               return <RegisterForm />;
             case 'customer-home':
@@ -304,7 +307,9 @@ export default function Home() {
   }, []);
 
   // Native apps (Electron desktop / Capacitor mobile) skip the landing page —
-  // they default directly to the login page since they don't need marketing content.
+  // they default directly to the login page since they don't need marketing
+  // content. On mobile that is the customer-first shared sign-in (agency tab
+  // available); on desktop it is the dedicated agency console login.
   useEffect(() => {
     if (!mounted) return;
     if (platform.isNative && !isAuthenticated && currentView === 'landing') {
@@ -605,8 +610,10 @@ export default function Home() {
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.2 }}
           >
-            {/* Native platforms get the dedicated agency login; web falls back to landing */}
-            {fallbackView === 'login' ? (platform.isNative ? <DesktopAgencyLogin /> : <LoginForm />) : <LandingPage />}
+            {/* Desktop gets the dedicated agency login; mobile gets the shared
+                customer-first sign-in (agency tab included); web falls back
+                to the landing page */}
+            {fallbackView === 'login' ? (platform.isElectron ? <DesktopAgencyLogin /> : <LoginForm />) : <LandingPage />}
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />

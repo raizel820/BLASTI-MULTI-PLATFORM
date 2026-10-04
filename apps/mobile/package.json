@@ -15,7 +15,7 @@
     "cap:run:ios": "cap run ios",
     "build:web": "bun run --filter @blasti/web build:export",
     "build:android": "bun run --filter @blasti/web build:export && cap sync android && cap open android",
-    "build:android:release": "bun run --filter @blasti/web build:export && cap sync android && node ../../scripts/gradle.js assembleRelease",
+    "build:android:release": "cross-env BLASTI_MOBILE_BUILD=1 bun run --filter @blasti/web build:export && cap sync android && node ../../scripts/gradle.js assembleRelease",
     "build:android:debug": "bun run --filter @blasti/web build:export && cap sync android && node ../../scripts/gradle.js assembleDebug"
   },
   "dependencies": {

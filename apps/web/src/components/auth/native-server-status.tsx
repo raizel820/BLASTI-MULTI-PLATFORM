@@ -11,6 +11,9 @@
  * (enter the PC's IP) when auto-discovery can't run (e.g. AP-isolated Wi-Fi).
  *
  * Shown on the login screen only when running inside the Capacitor shell.
+ * Task 72: NOT rendered at all in production release builds — they ship
+ * NEXT_PUBLIC_SERVER_DISCOVERY=0 (apps/mobile/.env.production) and talk only
+ * to the baked VPS URL: no pill, no manual-address dialog, no rescanning.
  */
 
 import { useEffect, useState, useCallback } from 'react';
@@ -34,6 +37,7 @@ import {
   getNativeCloudState,
   getNormalizedManualCloudUrl,
   onNativeCloudStateChange,
+  SERVER_DISCOVERY_LOCKED,
   setManualCloudUrl,
   type NativeCloudState,
 } from '@/lib/native-cloud-resolver';
@@ -61,7 +65,7 @@ export function NativeServerStatus() {
   const isNativeShell = platform.isCapacitor;
 
   useEffect(() => {
-    if (!isNativeShell) return;
+    if (!isNativeShell || SERVER_DISCOVERY_LOCKED) return;
     // Kick a scan on mount too (in case api-client's boot run already finished
     // before this component mounted — the subscription below keeps us current).
     void ensureNativeCloudUrl().catch(() => null);
@@ -75,7 +79,8 @@ export function NativeServerStatus() {
     setDialogOpen(true);
   }, [state.url]);
 
-  if (!isNativeShell) return null;
+  // Release (locked) builds: the server is baked in — no setup UI, ever.
+  if (!isNativeShell || SERVER_DISCOVERY_LOCKED) return null;
 
   const handleSave = async () => {
     setSaving(true);

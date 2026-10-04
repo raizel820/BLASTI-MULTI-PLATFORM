@@ -49,33 +49,6 @@ const SCAN_CAP = 128; // per subnet — bounds a full sweep (~6s at 900ms timeou
 const OVERRIDE_KEY = 'blasti-cloud-url-override';
 const LAST_GOOD_KEY = 'blasti-cloud-url-last-good';
 
-// ─── Production lock (baked server, zero discovery) ────────────────────
-
-/** True for '0' / 'false' / 'off' / 'no' (case-insensitive). */
-function envFlagOff(value: string | undefined): boolean {
-  return ['0', 'false', 'off', 'no'].includes(String(value ?? '').trim().toLowerCase());
-}
-
-/**
- * Task 72 — PRODUCTION LOCK. Release phone builds ship
- * NEXT_PUBLIC_SERVER_DISCOVERY=0 (apps/mobile/.env.production, applied by the
- * web build when BLASTI_MOBILE_BUILD=1). In that mode the app talks ONLY to
- * the baked NEXT_PUBLIC_API_URL: no LAN sweep, no manual override, no setup
- * UI. Dev/emulator builds leave the flag unset → full discovery flow.
- */
-export const SERVER_DISCOVERY_LOCKED = envFlagOff(process.env.NEXT_PUBLIC_SERVER_DISCOVERY);
-
-/**
- * The baked URL a locked build always uses — never probed, never overridden,
- * trailing slashes stripped. Mirrors the env fallback chain of the scan path.
- */
-function lockedBakedUrl(): string {
-  const envUrl = process.env.NEXT_PUBLIC_API_URL
-    || (typeof process !== 'undefined' && (process as unknown as { env?: Record<string, string> }).env?.BLASTI_CLOUD_URL)
-    || null;
-  return (envUrl || `http://10.0.2.2:${CLOUD_PORT}`).trim().replace(/\/+$/, '');
-}
-
 /** Common LAN prefixes scanned when the derived subnet yields nothing. */
 const COMMON_SUBNETS = [
   '192.168.1', '192.168.0', '192.168.2', '192.168.4', '192.168.5',
@@ -119,10 +92,8 @@ export function getNativeCloudState(): NativeCloudState {
   return state;
 }
 
-/** Sync accessor — what every request pipeline should use.
- * Locked (release) builds resolve synchronously to the baked server URL. */
+/** Sync accessor — what every request pipeline should use (may be null pre-resolution). */
 export function getNativeCloudUrl(): string | null {
-  if (SERVER_DISCOVERY_LOCKED) return lockedBakedUrl();
   return state.url;
 }
 
@@ -412,15 +383,6 @@ export async function ensureNativeCloudUrl(
   opts?: { force?: boolean; manualOnly?: boolean },
 ): Promise<string | null> {
   if (typeof window === 'undefined') return null;
-  if (SERVER_DISCOVERY_LOCKED) {
-    // Baked-server production build: adopt the URL as-is, synchronously —
-    // no probes, no subnet sweeps; manual overrides / rescans are inert.
-    const baked = lockedBakedUrl();
-    if (state.status !== 'found' || state.url !== baked || state.source !== 'env') {
-      setState({ status: 'found', url: baked, source: 'env', scanned: 0 });
-    }
-    return baked;
-  }
   if (opts?.manualOnly) {
     // Manual-only runs always start fresh (they are user-initiated saves).
     return resolveManualOnly();
@@ -503,13 +465,8 @@ export function startNativeCloudResolution(): void {
   void ensureNativeCloudUrl().catch(() => { /* state already 'failed' */ });
 }
 
-/** Forget the cached last-good URL (e.g. after repeated network failures).
- * Locked builds re-adopt the baked URL immediately — there is nothing to forget. */
+/** Forget the cached last-good URL (e.g. after repeated network failures). */
 export function clearNativeCloudCache(): void {
   lsRemove(LAST_GOOD_KEY);
-  if (SERVER_DISCOVERY_LOCKED) {
-    setState({ status: 'found', url: lockedBakedUrl(), source: 'env', scanned: 0 });
-    return;
-  }
   setState({ url: null, source: 'none', status: 'idle', scanned: 0 });
 }

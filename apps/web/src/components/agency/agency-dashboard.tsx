@@ -653,6 +653,11 @@ export function AgencyDashboard() {
     unsubscribers.push(realtime.onReservationUpdated(handleQueueEvent));
     unsubscribers.push(realtime.onReservationCancelled(handleQueueEvent));
     unsubscribers.push(realtime.onQueueSettingsUpdated(handleQueueEvent));
+    // Task 75 (desktop local-first): the local API fires sync:data-applied
+    // after a pull commits rows for ANY model — refetch so non-queue data
+    // (services, branches, counters, agency settings) updates live too,
+    // matching the webapp's cloud-direct behavior. No-op on web/cloud.
+    unsubscribers.push(realtime.onSyncDataApplied(handleQueueEvent));
 
     return () => {
       unsubscribers.forEach(unsub => unsub());

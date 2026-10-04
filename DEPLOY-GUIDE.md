@@ -407,21 +407,35 @@ bash /opt/blasti/scripts/deploy-digitalocean.sh server-update
 Both do: `git pull` from GitHub → `bun install` → database schema update →
 `next build` → restart `blasti-api` + `blasti-web` + Caddy.
 
-### Auto-update on every new commit (optional)
+### Auto-update on every new commit (BUILT-IN, on by default)
 
-On the server, enable a 5-minute git watcher via cron:
+The droplet updates **itself**: a systemd timer (`blasti-watcher.timer`)
+checks GitHub every 2 minutes, and when a new commit is there it runs a full
+update automatically (pull → rebuild → restart — your data and secrets are
+never touched). It is armed by the installer and by every `server-update`.
+
+You just work normally: `git push` → ~2 minutes later the site is updated.
+
+**Useful commands (ssh into the droplet):**
 
 ```bash
-crontab -e
+systemctl status blasti-watcher.timer                 # is it on?
+journalctl -u blasti-watcher.service -n 50 --no-pager # what did it do?
+bash /opt/blasti/scripts/deploy-digitalocean.sh server-watch-disable  # turn OFF
+bash /opt/blasti/scripts/deploy-digitalocean.sh server-watch-install  # turn ON again
 ```
 
-Add this line, save, exit:
+**Good to know:**
 
-```
-*/5 * * * * /opt/blasti/scripts/watch-and-deploy.sh watch --on-server --once >> /var/log/blasti-watch.log 2>&1
-```
-
-From then on, every new commit on GitHub lands on the VPS within 5 minutes.
+- A failed rebuild (e.g. a broken push) does **not** get forgotten: the
+  watcher retries it after 30 minutes, and immediately when your **next**
+  commit lands. The site keeps running the previous working build until a
+  deploy succeeds at the restart stage.
+- The watcher and a manual `server-update` can never run at the same time
+  (they share one lock — no memory problems on the small droplet).
+- One caveat of true auto-deploy: whatever lands on `master` goes live. Push
+  small, tested commits — and if a push breaks the site, push the fix (or
+  disable the watcher first).
 
 ---
 
@@ -515,5 +529,6 @@ systemctl restart blasti-api blasti-web
 
 *Automation behind this guide: `scripts/deploy-digitalocean.sh`
 (install / update / status / logs / backup / restore — plus the on-VPS
-`server-install` / `server-update` helpers) and `scripts/watch-and-deploy.sh`
-(commit watcher). Full architecture reference: `DEPLOYMENT.md`.*
+`server-install` / `server-update` / `server-watch-install` helpers) and
+`scripts/watch-and-deploy.sh` (the engine behind the built-in auto-updater).
+Full architecture reference: `DEPLOYMENT.md`.*

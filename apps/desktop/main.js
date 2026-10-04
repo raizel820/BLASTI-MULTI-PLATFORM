@@ -4,9 +4,11 @@
  * @blasti/desktop Electron shell for the BLASTI (بلاصتي) queue management app.
  *
  * Strategy: Remote web app shell
- *   • Development: loads http://localhost:3000 (Next.js dev server)
- *   • Production:  loads the deployed web URL or bundled static files
- *                  Falls back to an offline page when unreachable.
+ *   • ALWAYS opens on the agency sign-in page (/agency/login) — the consumer
+ *     marketing landing page (SPA root '/') is for the web app only.
+ *   • Development: loads http://localhost:3000/agency/login (Next.js dev server)
+ *   • Production:  loads /agency/login on the deployed web URL or the bundled
+ *                  static files. Falls back to an offline page when unreachable.
  *
  * Features:
  *   - Deep link protocol registration (blasti://)
@@ -87,11 +89,12 @@ initFileLogger();
 // See load-env.js for the full contract. Without this, the ".env" workflow
 // documented in .env.example silently did nothing (cloud URL stayed at the
 // http://localhost:3003 default on every installed machine).
-const DESKTOP_ENV_LOAD = require('./load-env').loadDesktopEnv({ isPackaged: app.isPackaged });
-// Task 65: remember whether the OS environment already carried a cloud URL
-// BEFORE any .env file was applied — used below to label the source of the
-// effective Cloud API URL in the startup banner.
+// Task 65: remember whether the OS environment ALREADY carried a cloud URL
+// BEFORE any .env file is applied — used below to label the source of the
+// effective Cloud API URL in the startup banner. (Snapshot FIRST: after the
+// loader runs, a .env-filled value is indistinguishable from an OS one.)
 const OS_HAD_CLOUD_URL = !!(process.env.BLASTI_CLOUD_URL || process.env.BLASTI_API_URL);
+const DESKTOP_ENV_LOAD = require('./load-env').loadDesktopEnv({ isPackaged: app.isPackaged });
 
 // ─── Monorepo Module Resolution ────────────────────────────────────────────
 // In bun workspaces, packages are hoisted to the root node_modules.
@@ -217,14 +220,39 @@ try {
   console.warn('[BLASTI Desktop] Could not resolve userData for the file store yet — will set when app is ready:', err.message);
 }
 
-// ─── Cloud API Base URL (single source of truth) ────────────────────────
+// ─── Cloud API Base URL (single source of truth) ────────────────────────────
 // One resolution used by diagnostics, sync service, local API fallbacks and
 // the web shell. Precedence: BLASTI_CLOUD_URL > BLASTI_API_URL > default.
 // Self-hosted (VPS) deployments: set BLASTI_CLOUD_URL to the origin that
 // serves the Hono API (apps/api, port 3003) — e.g. https://api.your-domain.tld
 // — unless the API is served under the same hostname via reverse proxy
-// (spec §13). The neutral fallback below (localhost:3003) is only meant for
-// local development; production builds should always configure the env var.
+// (spec §13).
+//
+// Task 74 — field report: a packaged build produced on a fresh machine (no
+// apps/desktop/.env — it is gitignored — and no OS variable) kept the DEV
+// fallback http://localhost:3003 → the cloud probe failed → the launch gate
+// blocked with the misleading "first setup needs an internet connection"
+// error even though the PC was online. The full resolution order is now:
+//   1. OS environment  (BLASTI_CLOUD_URL / BLASTI_API_URL)
+//   2. .env files      (load-env.js: resources\.env > apps/desktop/.env)
+//   3. build-stamp.json cloudBaseUrl — baked at BUILD time by scripts/prebuild.js
+//   4. packaged production fallback (the VPS the release APK is locked to)
+//   5. dev fallback localhost:3003   (dev runs only — never packaged apps)
+const DEV_CLOUD_FALLBACK = 'http://localhost:3003';
+// Same server as apps/mobile/.env.production. Used ONLY when a PACKAGED build
+// finds no configuration anywhere. To repoint an installed app without
+// rebuilding, create <install>\resources\.env with BLASTI_CLOUD_URL="…".
+const PRODUCTION_CLOUD_FALLBACK = 'http://68.183.137.227';
+
+/** The cloudBaseUrl baked by scripts/prebuild.js into build-stamp.json, if any. */
+function readBuildStampCloudUrl() {
+  try {
+    const stamp = require('./build-stamp.json');
+    const url = stamp && typeof stamp.cloudBaseUrl === 'string' ? stamp.cloudBaseUrl : '';
+    return /^https?:\/\//i.test(url) ? url.replace(/\/+$/, '') : null;
+  } catch { return null; } // no stamp (dev) / unreadable / field absent
+}
+
 function resolveCloudBaseUrl() {
   const strip = (u) => String(u || '').replace(/\/+$/, '');
   const key = process.env.BLASTI_CLOUD_URL ? 'BLASTI_CLOUD_URL'
@@ -246,7 +274,14 @@ function resolveCloudBaseUrl() {
     }
   }
   if (base) return base;
-  return 'http://localhost:3003';
+  if (app.isPackaged) {
+    // A packaged app must NEVER fall back to the dev-only localhost:3003 —
+    // nothing listens there on an end-user machine (Task 74).
+    const stamped = readBuildStampCloudUrl();
+    if (stamped) return stamped;
+    return PRODUCTION_CLOUD_FALLBACK;
+  }
+  return DEV_CLOUD_FALLBACK;
 }
 const CLOUD_BASE_URL = resolveCloudBaseUrl();
 // Publish for every other module (local API initial-sync route, sync service,
@@ -262,10 +297,22 @@ const cloudUrlSource = (() => {
   const provider = ((DESKTOP_ENV_LOAD && DESKTOP_ENV_LOAD.loaded) || []).find(
     (l) => l && ((l.filled || []).includes('BLASTI_CLOUD_URL') || (l.filled || []).includes('BLASTI_API_URL'))
   );
-  return provider ? provider.file : null;
+  if (provider) return provider.file;
+  if (app.isPackaged) {
+    // Task 74: packaged builds are never "unconfigured" — the stamp or the
+    // production fallback below always applies.
+    if (readBuildStampCloudUrl()) return 'baked at build time (build-stamp.json)';
+    return 'packaged production default (VPS)';
+  }
+  return null; // dev run with no configuration — localhost:3003 default
 })();
 if (cloudUrlSource) {
   console.log('[BLASTI Desktop] Cloud API → ' + CLOUD_BASE_URL + '  [source: ' + cloudUrlSource + ']');
+  if (cloudUrlSource === 'packaged production default (VPS)') {
+    console.warn('[BLASTI Desktop] No cloud URL was configured on the build machine or at runtime —');
+    console.warn('[BLASTI Desktop] using the built-in production VPS. To override, set BLASTI_CLOUD_URL');
+    console.warn('[BLASTI Desktop] in <install>\\resources\\.env and restart (no rebuild needed).');
+  }
 } else {
   console.warn('[BLASTI Desktop] Cloud API → ' + CLOUD_BASE_URL + '  [source: built-in default — NO cloud URL configured]');
   console.warn('[BLASTI Desktop] Login, sync and realtime will target ' + CLOUD_BASE_URL + '.');
@@ -293,6 +340,35 @@ const PROTOCOL = 'blasti';
 
 // Path to bundled static web files (from Next.js export)
 const STATIC_WEB_DIR = path.join(__dirname, 'out');
+
+// ─── Start Page ───────────────────────────────────────────────────────────────
+// The desktop console is agency-only: it must ALWAYS open on the agency
+// sign-in screen (/agency/login — the dedicated addressable route). The
+// consumer marketing landing page is the SPA root '/' and belongs to the web
+// app only; the desktop app must never boot onto it.
+const START_PATH = '/agency/login';
+
+/** Join START_PATH onto a base origin (tolerates trailing slashes). */
+function withStartPath(baseUrl) {
+  return String(baseUrl || '').replace(/\/+$/, '') + START_PATH;
+}
+
+/**
+ * The bundled static export's copy of the agency login page, if packaged.
+ * Next.js writes page-style files (agency/login.html) when trailingSlash is
+ * off and directory-style (agency/login/index.html) when on — accept both.
+ * Returns null when the bundled export predates the route.
+ */
+function bundledLoginFile() {
+  const candidates = [
+    path.join(STATIC_WEB_DIR, 'agency', 'login.html'),
+    path.join(STATIC_WEB_DIR, 'agency', 'login', 'index.html'),
+  ];
+  for (const candidate of candidates) {
+    try { if (fs.existsSync(candidate)) return candidate; } catch { /* ignore */ }
+  }
+  return null;
+}
 
 // Task 49: asset resolution that works BOTH in dev and in the packaged app.
 // electron-builder ships `assets/` via extraResources (outside the asar), so
@@ -1023,8 +1099,8 @@ function loadApp() {
       if (settled) return;
       settled = true;
       try { probe.abort(); } catch { /* ignore */ }
-      console.log('[BLASTI Desktop] Loading ' + DEV_URL);
-      mainWindow.loadURL(DEV_URL);
+      console.log('[BLASTI Desktop] Loading ' + withStartPath(DEV_URL));
+      mainWindow.loadURL(withStartPath(DEV_URL));
     };
 
     const showErrorPage = () => {
@@ -1070,15 +1146,18 @@ function loadApp() {
   const remoteUrl = process.env.BLASTI_REMOTE_URL;
 
   if (remoteUrl) {
-    // Explicit remote URL mode — probe the server first
-    const request = net.request(remoteUrl);
+    // Explicit remote URL mode — probe the START PAGE (agency login), not the
+    // bare origin. If the deployed web build predates /agency/login (4xx/5xx),
+    // open the remote origin itself instead of a dead 404 screen.
+    const startUrl = withStartPath(remoteUrl);
+    const request = net.request(startUrl);
     let settled = false;
     const fallback = () => {
       if (settled) return;
       settled = true;
       try { request.abort(); } catch { /* ignore */ }
       if (hasBundledFiles) {
-        mainWindow.loadFile(indexPath);
+        mainWindow.loadFile(bundledLoginFile() || indexPath);
       } else {
         mainWindow.loadURL(
           `data:text/html;charset=utf-8,${encodeURIComponent(OFFLINE_HTML)}`
@@ -1087,11 +1166,17 @@ function loadApp() {
     };
     // Electron's net.request does NOT have setTimeout — use a manual timer
     const timeout = setTimeout(fallback, 5000);
-    request.on('response', () => {
+    request.on('response', (res) => {
       clearTimeout(timeout);
       if (settled) return;
       settled = true;
-      mainWindow.loadURL(remoteUrl);
+      const status = (res && res.statusCode) || 0;
+      if (status > 0 && status < 400) {
+        mainWindow.loadURL(startUrl);
+      } else {
+        console.warn('[BLASTI Desktop] ' + startUrl + ' answered ' + status + ' — loading the remote origin instead');
+        mainWindow.loadURL(remoteUrl);
+      }
     });
     request.on('error', () => {
       clearTimeout(timeout);
@@ -1105,10 +1190,14 @@ function loadApp() {
   // export over http (Task 58) — absolute /_next/* paths only work over an
   // http origin. loadFile() is now the last-ditch fallback only.
   if (hasBundledFiles) {
-    console.log('[BLASTI Desktop] Bundled UI found — loading ' + PROD_URL);
-    mainWindow.loadURL(PROD_URL).catch((loadErr) => {
-      console.warn('[BLASTI Desktop] loadURL(' + PROD_URL + ') failed:', loadErr && loadErr.message, '— falling back to file://');
-      mainWindow.loadFile(indexPath).catch(() => {
+    // Open the agency login page. When the bundled export predates the
+    // /agency/login route (loginFile === null), keep the legacy '/' behavior.
+    const loginFile = bundledLoginFile();
+    const startUrl = loginFile ? withStartPath(PROD_URL) : PROD_URL;
+    console.log('[BLASTI Desktop] Bundled UI found — loading ' + startUrl);
+    mainWindow.loadURL(startUrl).catch((loadErr) => {
+      console.warn('[BLASTI Desktop] loadURL(' + startUrl + ') failed:', loadErr && loadErr.message, '— falling back to file://');
+      mainWindow.loadFile(loginFile || indexPath).catch(() => {
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(OFFLINE_HTML));
         }

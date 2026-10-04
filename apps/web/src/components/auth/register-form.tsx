@@ -430,9 +430,11 @@ function useUsernameAvailability(username: string) {
 export function RegisterForm() {
   const { setUser, setView, goBack, setSessionToken } = useAppStore();
   const { t, lang } = useLanguage();
-  // The desktop app serves agencies only → register as an agency account there.
+  // The DESKTOP app serves agencies only → register as an agency account there.
+  // The MOBILE app is customer-first: it defaults to CUSTOMER but still shows
+  // the agency role card so agencies can sign up from the phone too.
   const { platform } = usePlatform();
-  const isDesktopNative = platform.isNative;
+  const isDesktopNative = platform.isElectron;
   // Local email-field error copy (fr falls back to EN — same as the desktop page).
   const emailCopy = EMAIL_FIELD_COPY[lang === 'ar' ? 'ar' : 'en'];
   // Task 23: local copy for the redesigned UI (brand panel, avatar picker).
@@ -1163,7 +1165,9 @@ export function RegisterForm() {
                               <Label className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">{t('selectRole')}</Label>
                               <div className={`grid gap-2 ${isDesktopNative ? 'grid-cols-1' : 'grid-cols-2'}`}>
                                 {([
-                                  // Desktop serves agencies only — hide the customer option there.
+                                  // Desktop serves agencies only — hide the
+                                  // customer option there. Mobile keeps BOTH
+                                  // cards (customer listed first).
                                   ...(isDesktopNative ? [] : [{ value: 'CUSTOMER' as UserRole, label: t('loginAsCustomer'), icon: '👤' }]),
                                   { value: 'AGENCY_OWNER' as UserRole, label: t('loginAsAgency'), sublabel: t('ownerRole'), icon: '🏢' },
                                 ]).map((roleOption) => (

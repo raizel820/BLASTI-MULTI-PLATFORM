@@ -39,15 +39,15 @@
     "mobile:studio": "bun run --filter @blasti/mobile studio",
     "mobile:android": "bun run build:mobile && bun run mobile:studio",
     "mobile:apk": "bun run build:mobile && node scripts/gradle.js assembleDebug",
-    "mobile:apk:release": "bun run build:mobile && node scripts/gradle.js assembleRelease",
+    "mobile:apk:release": "cross-env BLASTI_MOBILE_BUILD=1 bun run build:mobile && node scripts/gradle.js assembleRelease",
     "mobile:run": "bun run --filter @blasti/mobile cap:run:android",
     "electron:dev": "bun run db:generate:desktop && cd apps/desktop && bun x electron . --dev",
     "electron:dev:bun": "bun run --filter @blasti/desktop dev",
     "electron:dev:full": "concurrently -n api,web,desktop -c blue,green,yellow \"bun run dev:api\" \"bun run dev:web\" \"bun run db:generate:desktop && cd apps/desktop && bun x electron . --dev\"",
-    "electron:build": "bun run --filter @blasti/desktop build",
-    "electron:build:win": "bun run --filter @blasti/desktop build:win",
-    "electron:build:mac": "bun run --filter @blasti/desktop build:mac",
-    "electron:build:linux": "bun run --filter @blasti/desktop build:linux"
+    "electron:build": "bun run build:export && bun run --filter @blasti/desktop build",
+    "electron:build:win": "bun run build:export && bun run --filter @blasti/desktop build:win",
+    "electron:build:mac": "bun run build:export && bun run --filter @blasti/desktop build:mac",
+    "electron:build:linux": "bun run build:export && bun run --filter @blasti/desktop build:linux"
   },
   "devDependencies": {
     "@types/node": "^22",

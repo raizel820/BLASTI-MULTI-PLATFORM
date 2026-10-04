@@ -63,11 +63,39 @@ CAPACITOR_SERVER_URL=http://192.168.1.100:3000 bun run cap:sync:android
 bun run studio
 ```
 
-### After every web change for release builds
+### After every web change (dev builds)
 
 ```bash
 bun run build:mobile     # always re-sync — the native project embeds the web export
 ```
+
+> `build:mobile` is a **DEV** build: discovery + manual server address stay
+> available. See the production section below for the locked VPS APK.
+
+## 🌍 Production (VPS) release APK — fixed server, no setup UI
+
+The **release** build bakes ONE server address into the app and removes the
+login screen's "Server connection" pill, manual-address dialog and Wi-Fi
+scanning entirely — the app talks only to your VPS.
+
+1. Edit **`apps/mobile/.env.production`**:
+
+   ```env
+   NEXT_PUBLIC_API_URL=http://68.183.137.227   # your VPS bare origin (no /api)
+   NEXT_PUBLIC_SERVER_DISCOVERY=0              # lock: no manual input / no scan
+   ```
+
+2. Build + install — either of these (both read `.env.production`):
+
+   ```bash
+   cd apps/mobile && bun run build:android:release   # from the app folder
+   bun run mobile:apk:release                        # from the repo root
+   ```
+
+Dev builds (`build:mobile`, `build:android`, `build:android:debug`,
+`mobile:apk`) ignore `.env.production` and keep the discovery flow so the
+phone can find the API running on your PC. To change the server later:
+edit `.env.production` → rebuild → reinstall.
 
 ## 🔔 Enabling real FCM push
 

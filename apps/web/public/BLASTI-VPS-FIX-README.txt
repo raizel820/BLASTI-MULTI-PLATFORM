@@ -1,88 +1,70 @@
-BLASTI — VPS fixes: API not starting + web opens on the login page
-====================================================================
+BLASTI — droplet API fix ("Bad Gateway" on login) — one sequence
+=================================================================
 
-WHAT HAPPENED (two separate problems)
--------------------------------------
-1) The API service (blasti-api) never started on the droplet.
-   The systemd service requires the folder /opt/blasti/apps/api/uploads
-   to exist, but a fresh GitHub clone does not contain it. systemd then
-   refuses to start the service (mount-namespacing error). The web app
-   was fine — that is why the site opened at all.
+WHAT I VERIFIED FROM HERE
+-------------------------
+I probed your droplet directly:
+    http://68.183.137.227/             -> 200 OK   (web app is UP)
+    http://68.183.137.227/api/health   -> 502      (API is DOWN)
+Caddy and the web app are fine. Only the blasti-api service is not
+running, which is exactly why logging in gives "Bad Gateway".
 
-2) The web app opened on the LOGIN page instead of the home page.
-   Your browser still remembers data from the OLD deployment (same IP),
-   including "last screen = login". A brand-new visitor would see the
-   landing page; your browser restored that stale screen.
+WHY IT IS STILL DOWN
+--------------------
+Your GitHub push arrived (master now contains all the fixes) — good
+job! But the DROPLET still runs the OLD service setup: its systemd
+unit still requires the missing uploads folder, and re-running the
+old script copy cannot install the new unit (a running bash script
+keeps its old code even after the repo is updated).
 
-FIX 1 — BRING THE API UP (on the droplet, takes 10 seconds)
------------------------------------------------------------
-Run these four commands over SSH:
-
-    mkdir -p /opt/blasti/apps/api/uploads
-    systemctl restart blasti-api
-    sleep 5
-    curl -s http://127.0.0.1:3003/api/health ; echo
-
-Expected: a JSON line containing "status":"ok".
-Then open http://68.183.137.227/api/health in your browser to confirm.
-
-If it is NOT ok, send me this output:
-    journalctl -u blasti-api -n 50 --no-pager
-
-FIX 2 — SEE THE HOME PAGE IN YOUR BROWSER
------------------------------------------
-Quick proof first: open http://68.183.137.227 in an INCOGNITO / Private
-window — you will see the landing page. That confirms the cause is
-stored browser data, not the server.
-
-To fix your normal window (Chrome or Edge):
-  1. On the site, press F12 -> Application tab -> Storage ->
-     Local Storage -> right-click the site -> Clear.
-  2. Press Ctrl+Shift+Delete -> Time range "Last hour" ->
-     Cached images and files + Cookies -> Clear data.
-  3. Reload the page. You will land on the home page.
-
-OPTIONAL HARDENING — SHIP THE PERMANENT FIXES TO GITHUB (the patch)
--------------------------------------------------------------------
-blasti-vps-fixes.patch makes three changes:
-  - deploy script: creates the missing uploads folder, hardens the
-    systemd units, and `server-update` now also refreshes the units
-    (a fresh install can never hit problem 1 again);
-  - web app: browsers ALWAYS start on the landing page, even with
-    stale saved data (problem 2 can never happen again for anyone);
-  - adds tailwindcss-animate (removes the build warning and restores
-    the shadcn animation utilities).
-
-Download both files from the app preview panel into your repo folder
-(C:\Users\Origin Systems\Downloads\TheApp\BLASTI-MULTI\BLASTI-MULTI):
-
-    /blasti-vps-fixes.patch
-    /BLASTI-VPS-FIX-README.txt   (this file)
-
-Then in PowerShell, from the repo folder:
-
-    git pull
-    git apply blasti-vps-fixes.patch
-    git add -A
-    git commit -m "fix: VPS API startup + web always boots on landing page"
-    git push
-
-(The patch was tested to apply cleanly on the current GitHub master.
-bun.lock is intentionally not in the patch: run `bun install` once, or
-just let the droplet do it during server-update.)
-
-AFTER PUSHING — UPDATE THE DROPLET (pulls the fixes from GitHub)
-----------------------------------------------------------------
+THE FIX — paste this on the droplet (5-10 minutes, mostly the build)
+--------------------------------------------------------------------
     cd /opt/blasti
-    bash scripts/deploy-digitalocean.sh server-update
+    curl -fsSL https://raw.githubusercontent.com/raizel820/BLASTI-MULTI-PLATFORM/master/scripts/deploy-digitalocean.sh -o blasti-deploy.sh
+    bash blasti-deploy.sh server-update
 
-This pulls the latest code from GitHub, rebuilds the web app
-(2-4 minutes) and restarts api + web + caddy.
+This re-downloads the FIXED script fresh from GitHub, then:
+    - pulls the latest code (already up to date)
+    - creates the missing apps/api/uploads folder
+    - installs the corrected systemd units
+    - rebuilds the web app (2-4 minutes on your droplet)
+    - restarts api + web + caddy and waits for the health check
+
+Expected ending:
+    [  ok  ] API is healthy
+    ============================================================
+     BLASTI is UP on this droplet. ...
+
+THEN IN YOUR BROWSER
+--------------------
+1. http://68.183.137.227/api/health  -> should show JSON with "status".
+2. Open the site in an INCOGNITO window: the HOME page now appears
+   (the login-screen problem is fixed in this build).
+3. For your normal window: F12 -> Application -> Local Storage ->
+   right-click the site -> Clear, then reload.
+4. Log in (admin/admin123 or owner/owner123) — CHANGE these passwords.
+
+IF IT STILL SAYS "API did not become healthy"
+---------------------------------------------
+Run this on the droplet and paste me the COMPLETE output:
+
+    cd /opt/blasti
+    git fetch origin master && git reset --hard origin/master
+    mkdir -p apps/api/uploads
+    systemctl daemon-reload
+    systemctl restart blasti-api
+    sleep 6
+    echo "── health ──"; curl -s -m 5 http://127.0.0.1:3003/api/health; echo
+    echo "── version ──"; git log --oneline -1
+    echo "── status ──"; systemctl status blasti-api --no-pager | head -12
+    echo "── logs ──"; journalctl -u blasti-api -n 30 --no-pager | tail -30
+    echo "── memory ──"; free -m | head -2
+
+(NOTE: once this script reaches GitHub via your next push, the same
+report is one command:  bash blasti-deploy.sh server-doctor)
 
 REMINDERS
 ---------
-- Desktop app .env must stay the BARE origin (no /api at the end):
+- Desktop .env keeps the BARE origin (no /api at the end):
       BLASTI_CLOUD_URL="http://68.183.137.227"
-- Log in and CHANGE the default passwords:
-      admin / admin123   (platform super-admin)
-      owner / owner123   (agency owner)
+- The script now also has a `server-doctor` mode for future debugging.

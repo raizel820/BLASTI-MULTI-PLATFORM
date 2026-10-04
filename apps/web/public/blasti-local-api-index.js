@@ -6859,10 +6859,7 @@ function createApp() {
         return { ...reservation, ...updateData }
       })
 
-      // Task 75: the payload MUST carry agencyId — broadcastLocalRealtime
-      // routes queue:* events by data.agencyId, and without it the event was
-      // silently dropped (no live update anywhere).
-      emitEvent('queue:updated', { agencyId: updatedReservation.agencyId, reservationId, action, reservation: updatedReservation, ...updateData })
+      emitEvent('queue:updated', { reservationId, action, ...updateData })
       return c.json({ success: true, reservation: updatedReservation })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/:id PATCH error:', error)
@@ -7049,9 +7046,7 @@ function createApp() {
         await logDeterministicOutcome('QueueSettings', row && row.id, 'update', row, null, { tx })
         return row
       })
-      // Task 75: EMPTY payload meant the router dropped the event (no
-      // agencyId) — dashboards never saw pause state change live.
-      emitEvent('queue:paused', { agencyId, action: 'pause' })
+      emitEvent('queue:paused', {})
       return c.json({ success: true, isPaused: true })
     } catch (error) {
       console.error('[LocalAPI] /api/queue/pause error:', error)
@@ -7078,9 +7073,7 @@ function createApp() {
           return row
         })
       }
-      // Task 75: EMPTY payload meant the router dropped the event (no
-      // agencyId) — dashboards never saw resume state change live.
-      emitEvent('queue:resumed', { agencyId, action: 'resume' })
+      emitEvent('queue:resumed', {})
       return c.json({ success: true, isPaused: false })
     } catch (error) {
       console.error('[LocalAPI] /api/queue/resume error:', error)
@@ -7119,7 +7112,7 @@ function createApp() {
         await logDeterministicOutcome('QueueSettings', row && row.id, 'update', row, null, { tx })
         return row
       })
-      emitEvent('queue:pause-toggled', { agencyId, isPaused: !currentPaused })
+      emitEvent('queue:pause-toggled', { isPaused: !currentPaused })
       return c.json({ success: true, isPaused: !currentPaused })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/toggle-pause error:', error)
@@ -7189,10 +7182,7 @@ function createApp() {
         return created
       })
 
-      // Task 75: the payload MUST carry agencyId — the router routes queue:*
-      // by data.agencyId and silently dropped this event before, so a staff
-      // walk-in never appeared live on other views.
-      emitEvent('queue:walk-in', { agencyId, reservation })
+      emitEvent('queue:walk-in', { reservation })
       return c.json({ success: true, reservation })
     } catch (error) {
       console.error('[LocalAPI] /api/agency/queue/walk-in error:', error)

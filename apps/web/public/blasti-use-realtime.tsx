@@ -345,15 +345,6 @@ export function useRealtime(options?: UseRealtimeOptions) {
 
       const onConnect = () => {
         setConnectionStatus('connected')
-        // Task 75: (re)authenticate BEFORE re-joining rooms. The singleton
-        // socket may have been created before the session existed (handshake
-        // auth is captured once and reused on every reconnect) — without this
-        // every re-join was evaluated against the pre-login credential and
-        // rejected, so the dashboard never entered its agency room and the
-        // UI only updated on a manual refresh. socket.io delivers events in
-        // emit order, so auth lands before the joins below.
-        const currentToken = useAppStore.getState().sessionToken || REALTIME_TOKEN
-        if (currentToken) socket.emit('auth', { token: currentToken })
         // Re-join all rooms that were previously joined
         for (const room of joinedRoomsRef.current) {
           socket.emit('join:room', room)
@@ -436,35 +427,11 @@ export function useRealtime(options?: UseRealtimeOptions) {
     }
   }, [autoConnect])
 
-  // C3: Send auth with session token when it changes — Task 75 hardening:
-  // - no `connected` gate: socket.io-client BUFFERS emissions while the
-  //   socket is connecting/disconnected, so an early emit flushes (in order)
-  //   right after the handshake instead of being silently skipped forever
-  //   (the old `if connected` gate lost the upgrade whenever the token
-  //   arrived mid-handshake — a pre-session socket then stayed
-  //   unauthenticated for the WHOLE session).
-  // - after the upgrade, RE-JOIN the tracked rooms: joins attempted before
-  //   the session existed were rejected server-side and never retried, so
-  //   the agency room stayed empty until a full page refresh.
+  // C3: Send auth with session token when it changes
   useEffect(() => {
     const authToken = sessionToken || REALTIME_TOKEN
-    const socket = socketRef.current
-    if (!authToken || !socket) return
-    socket.emit('auth', { token: authToken })
-    if (socket.connected) {
-      for (const room of joinedRoomsRef.current) {
-        if (room.startsWith('agency:')) {
-          socket.emit('join:agency', room.replace('agency:', ''))
-        } else if (room.startsWith('customer:')) {
-          socket.emit('join:customer', room.replace('customer:', ''))
-        } else if (room.startsWith('kiosk:')) {
-          socket.emit('join:kiosk', room.replace('kiosk:', ''))
-        } else if (room === 'admin:global') {
-          socket.emit('join:admin')
-        } else {
-          socket.emit('join:room', room)
-        }
-      }
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('auth', { token: authToken })
     }
   }, [sessionToken])
 
@@ -574,12 +541,6 @@ export function useRealtime(options?: UseRealtimeOptions) {
   const onQueueResumed = useCallback((handler: EventHandler) => on('queue:resumed', handler as SocketHandler), [on])
   const onQueuePositionChanged = useCallback((handler: EventHandler) => on('queue:position-changed', handler as SocketHandler), [on])
   const onQueueSettingsUpdated = useCallback((handler: EventHandler) => on('queue:settings-updated', handler as SocketHandler), [on])
-  // Task 75 (desktop local-first): fired by the LOCAL API after a sync pull
-  // committed rows for ANY model (services, branches, counters, settings…).
-  // Cloud never emits it — web/mobile rely on their own realtime + cloud
-  // fetches; the desktop uses it to refetch views driven by non-Reservation
-  // data without waiting for a poll tick or a section swap.
-  const onSyncDataApplied = useCallback((handler: EventHandler) => on('sync:data-applied', handler as SocketHandler), [on])
 
   // ─── Typed Event Subscriptions (Reservation) ────────────────────────
 
@@ -666,7 +627,6 @@ export function useRealtime(options?: UseRealtimeOptions) {
     onQueueResumed,
     onQueuePositionChanged,
     onQueueSettingsUpdated,
-    onSyncDataApplied,
 
     // Reservation event subscriptions
     onReservationCreated,
@@ -701,7 +661,6 @@ export function useRealtime(options?: UseRealtimeOptions) {
     onQueueCreated, onQueueUpdated, onQueueCalled, onQueueCompleted,
     onQueueNoShow, onQueueCancelled, onQueueJoined, onQueueWalkIn,
     onQueuePaused, onQueueResumed, onQueuePositionChanged, onQueueSettingsUpdated,
-    onSyncDataApplied,
     onReservationCreated, onReservationUpdated, onReservationCancelled,
     onNotification, onTurnApproaching, onYourTurn,
     onKioskUpdate, onAgencyUpdated, onStaffUpdated,
@@ -753,12 +712,6 @@ export function useAgencyRealtime(agencyId: string | null) {
     const onConnect = () => {
       setConnectionStatus('connected')
       setConnected(true)
-      // Task 75: authenticate before (re-)joining — same ordering rationale
-      // as in useRealtime's onConnect (handshake auth is captured once;
-      // a socket created before login must upgrade FIRST or the join is
-      // rejected and no agency events ever arrive).
-      const currentToken = useAppStore.getState().sessionToken || REALTIME_TOKEN
-      if (currentToken) socket.emit('auth', { token: currentToken })
       // Re-join all tracked rooms
       for (const room of joinedRoomsRef.current) {
         if (room.startsWith('agency:')) {

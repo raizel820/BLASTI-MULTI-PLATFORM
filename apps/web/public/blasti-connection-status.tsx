@@ -101,33 +101,16 @@ async function checkApiHealth(): Promise<ApiHealthStatus> {
       const w = window as unknown as { electronAPI?: { getSyncStatus?: () => Promise<Record<string, unknown> | null> } };
       if (w.electronAPI?.getSyncStatus) {
         const status = await w.electronAPI.getSyncStatus();
-        // Task 75: `cloudProbeOk` is the engine's OWN /api/health verdict,
-        // probed from the MAIN process (Node fetch — CORS does not apply)
-        // and refreshed every 30s by the engine even when pulls are gated
-        // (fresh install, workspace not READY yet). This closes the last
-        // gap in the packaged app: its page origin is http://127.0.0.1:3080,
-        // so a renderer-side probe of the VPS is CROSS-ORIGIN and fails
-        // forever when the server's CORS_ORIGIN allowlist does not include
-        // that origin — the banner then showed "local mode" while login
-        // (same-origin → local API → cloud proxy) worked perfectly.
-        const probeFresh = (iso: unknown): boolean => {
-          try {
-            if (typeof iso !== 'string' || !iso) return false;
-            return Date.now() - new Date(iso).getTime() < 5 * 60_000;
-          } catch { return false; }
-        };
-        const engineCloudProbeOk = status?.cloudProbeOk === true && probeFresh(status?.cloudProbeAt);
         const engineOnline = !!status && (
           status.socketConnected === true ||
-          (!!status.lastPullAt && !status.lastError) ||
-          engineCloudProbeOk
+          (!!status.lastPullAt && !status.lastError)
         );
         if (engineOnline) {
           _healthStatus.cloudReachable = true;
           _healthStatus.lanReachable = null;
           _consecutiveCloudFailures = 0;
           _healthListeners.forEach((fn) => fn({ ..._healthStatus }));
-          console.log(`[HealthCheck] CLOUD OK (engine verdict: ${engineCloudProbeOk ? 'main-process probe' : 'socket/pull active'}) — skipping renderer probe`);
+          console.log('[HealthCheck] CLOUD OK (engine verdict: socket/pull active) — skipping renderer probe');
           return { ..._healthStatus };
         }
       }

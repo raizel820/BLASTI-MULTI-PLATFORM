@@ -19,8 +19,8 @@
     - HTTPS everywhere by default, system CAs only (unchanged).
     - ONE narrow, temporary exception: the known cloud VPS IP is allowed to
       serve cleartext HTTP until a domain + TLS are provisioned. Remove this
-      domain-config block as soon as https:// is live on the server
-      (see DEPLOY-GUIDE.md Part 8, the domain setup section).
+      <domain-config> block as soon as https:// is live on the server
+      (see DEPLOY-GUIDE.md Part 8, --domain mode).
     - The debug variant remains fully permissive (separate file).
 -->
 <network-security-config>
