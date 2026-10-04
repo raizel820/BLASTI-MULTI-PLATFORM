@@ -28,6 +28,10 @@ import {
   type SyncModelConfig,
 } from '@blasti/core/sync-registry'
 import { noteSyncChange, getSyncContext } from './sync-notify'
+import {
+  capturePreApplySnapshot,
+  emitPushSideEffects,
+} from './sync-side-effects'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1074,6 +1078,17 @@ export async function processPushMutation(
     }
   }
 
+  // ── Device-side-effect parity (Task 76) ────────────────────────────────
+  // Direct API routes emit queue/notification/kiosk Socket.IO events and
+  // create Notification rows inline. Device pushes (desktop/mobile
+  // offline-first) arrive through THIS function instead — historically they
+  // were applied SILENTLY, so a call-next from the desktop never rang the
+  // customer's phone and never refreshed the webapp/kiosks in realtime.
+  // Capture the PRE-apply state (one findUnique, only for the models that can
+  // ring a phone) so the post-apply emitter can detect real status
+  // transitions — see lib/sync-side-effects.ts.
+  const preApplySnapshot = await capturePreApplySnapshot(db, model, recordId, operation, data)
+
   let appliedSequence = 0
   const apply = async (tx: TxClient): Promise<any> => {
     const result = await applyMutationInTx(tx, config, model, recordId, operation, data, localUpdatedAt)
@@ -1099,7 +1114,12 @@ export async function processPushMutation(
         { idempotencyKey: mutationId, agencyId, model, recordId, operation },
         apply,
       )
-      if (!res.wasDuplicate) notifyApplied(agencyId, model, appliedSequence)
+      if (!res.wasDuplicate) {
+        notifyApplied(agencyId, model, appliedSequence)
+        // Realtime/notification parity for device-originated changes —
+        // best-effort, never fails the push (see sync-side-effects.ts).
+        await emitPushSideEffects({ agencyId, model, recordId, operation, data, prev: preApplySnapshot, db })
+      }
       return {
         status: res.wasDuplicate ? 'duplicate' : 'applied',
         result: res.result,
@@ -1108,6 +1128,7 @@ export async function processPushMutation(
 
     const result = await atomicMutation(agencyId, model, recordId, operation, apply)
     notifyApplied(agencyId, model, appliedSequence)
+    await emitPushSideEffects({ agencyId, model, recordId, operation, data, prev: preApplySnapshot, db })
     return { status: 'applied', result }
   } catch (error) {
     if (error instanceof IdempotencyConflictError) {
