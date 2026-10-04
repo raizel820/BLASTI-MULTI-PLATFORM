@@ -114,8 +114,17 @@ const FULL_RECONCILE_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 const PULL_PAGE_LIMIT = 500;
 const RECONCILE_BATCH_SIZE = 200;
 const MAX_RECONCILE_ROWS_PER_TABLE = 2000;
-const LOCAL_MUTATION_DEBOUNCE_MS = 400;
-const SOCKET_EVENT_DEBOUNCE_MS = 300;
+// Task 77 latency tuning: human-paced queue actions never benefit from the
+// old 400ms/300ms coalescing windows — bursts are ALREADY coalesced by the
+// replay in-flight guard (mutations landing mid-replay are queued, not lost)
+// and by the trailing-edge debounce below. Shorter windows + leading-edge
+// firing put a desktop call-next in the cloud in ~1 RTT.
+const LOCAL_MUTATION_DEBOUNCE_MS = 150;
+const SOCKET_EVENT_DEBOUNCE_MS = 150;
+const QUEUED_REPLAY_DELAY_MS = 100; // was 500 — replay again right after the in-flight one drains
+// A live cloud socket IS reachability (same origin serves HTTP + socket), and
+// a fresh /api/health verdict stays valid for this long in the hot paths.
+const FAST_ONLINE_TTL_MS = 15_000;
 const SOCKET_STALENESS_WATCHDOG_MS = 60_000;
 const SOCKET_STALENESS_THRESHOLD_MS = 90_000;
 
@@ -138,6 +147,7 @@ let _onlineListener = null;
 let _watchdogIntervalId = null;
 let _localMutationDebounceId = null;
 let _socketPullDebounceId = null;
+let _pendingRealtimePull = false;   // a realtime pull was suppressed by an in-flight cycle — re-fire after it
 
 // Cursor / timestamps (mirrored in _sync_meta)
 let _cursor = 0;                    // lastPulledSequence
@@ -711,6 +721,25 @@ async function _isOnline() {
   } catch {
     return record(false);
   }
+}
+
+/**
+ * Task 77 fast-path reachability check for the push/pull HOT paths.
+ *
+ * Returns true when the cloud is known-reachable WITHOUT a network round
+ * trip: a live cloud socket (same origin as the HTTP API) or a /api/health
+ * verdict younger than FAST_ONLINE_TTL_MS. Returns false only on an equally
+ * fresh OFFLINE verdict. null = unknown — the caller should do a real probe
+ * (_isOnline) or just attempt the request and let its error handling cope.
+ *
+ * This removes one full HTTP round trip from every realtime push and pull
+ * (the old flow paid /api/health before EVERY action, adding 100-500ms).
+ */
+function _cloudReachableFast() {
+  if (_socket && _socket.connected) return true;
+  var age = Date.now() - (_lastCloudProbeAt || 0);
+  if (age < FAST_ONLINE_TTL_MS && _lastCloudOnline !== null) return _lastCloudOnline;
+  return null;
 }
 
 /**
@@ -2156,11 +2185,13 @@ async function _replayPendingMutations() {
     _replayInFlight = false;
     if (_replayQueued) {
       _replayQueued = false;
+      // Task 77: 500ms → 100ms — mutations that landed mid-replay go out
+      // right after the in-flight request drains, not half a second later.
       setTimeout(function() {
         _replayPendingMutations().catch(function(err) {
           console.error('[SyncService] Queued replay error:', err.message);
         });
-      }, 500);
+      }, QUEUED_REPLAY_DELAY_MS);
     }
   }
 }
@@ -2344,12 +2375,16 @@ function _setupSocket() {
     }
 
     var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
+    // Task 77: reconnect fast after network blips / sleep-wake. The old
+    // 1s→30s backoff could leave the desktop realtime-blind for up to 30s
+    // after a flaky moment; 0.5s→5s recovers in ~1s typical, and the
+    // staleness watchdog below remains the stuck-state backstop.
     _socket = io(_config.cloudBaseUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 30000,
+      reconnectionDelay: 500,
+      reconnectionDelayMax: 5000,
       timeout: 10000,
       auth: { token: _authToken },
     });
@@ -2395,6 +2430,10 @@ function _setupSocket() {
         });
         // Trigger a pull on (re)connect — catches changes missed while offline.
         _scheduleSocketPull(SOCKET_EVENT_DEBOUNCE_MS);
+        // The connect itself is fresh reachability evidence — note it so the
+        // push/pull fast paths skip their /api/health probe right after.
+        _lastCloudOnline = true;
+        _lastCloudProbeAt = Date.now();
       } catch (e) {
         console.warn('[SyncService] socket connect handler error:', e.message);
       }
@@ -2405,7 +2444,11 @@ function _setupSocket() {
         _lastEventAt = Date.now();
         var p = payload || {};
         console.log('[SyncService] sync:changes received — models:', (p.models || []).join(',') || '?', 'count:', p.changeCount);
-        _scheduleSocketPull(SOCKET_EVENT_DEBOUNCE_MS);
+        // Task 77 LEADING-EDGE pull: the cloud emits AFTER committing, so
+        // the first event can pull immediately — data visibility drops from
+        // debounce+probe+pull (~1s) to ~1 pull RTT. Burst events that follow
+        // coalesce through the trailing debounce.
+        _scheduleSocketPull(0, { leading: true });
       } catch (e) {
         console.warn('[SyncService] sync:changes handler error:', e.message);
       }
@@ -2413,6 +2456,11 @@ function _setupSocket() {
 
     _socket.on('disconnect', function(reason) {
       _socketId = null;
+      // Record the offline verdict immediately — the push/pull fast paths
+      // must not attempt requests while the socket is down (they'd burn a
+      // 5s fetch timeout per mutation).
+      _lastCloudOnline = false;
+      _lastCloudProbeAt = Date.now();
       console.log('[SyncService] Realtime socket disconnected:', reason);
     });
 
@@ -2436,10 +2484,29 @@ function _setupSocket() {
   }
 }
 
-function _scheduleSocketPull(debounceMs) {
+/**
+ * Task 77: leading/trailing socket-pull scheduler.
+ *
+ * leading=true (first sync:changes of a burst) → pull IMMEDIATELY unless a
+ * cycle is already running, in which case the request is remembered and one
+ * catch-up pull runs the moment the cycle drains (no silent drops).
+ * Everything else arms the short trailing debounce for burst coalescing.
+ */
+function _scheduleSocketPull(debounceMs, opts) {
+  var leading = !!(opts && opts.leading);
+  if (leading) {
+    if (_isSyncing) { _pendingRealtimePull = true; }
+    else if (!_socketPullDebounceId) {
+      _incrementalPullCycle('realtime-leading').catch(function(err) {
+        console.error('[SyncService] Realtime pull error:', err.message);
+      });
+      return;
+    }
+  }
   if (_socketPullDebounceId) clearTimeout(_socketPullDebounceId);
   _socketPullDebounceId = setTimeout(function() {
     _socketPullDebounceId = null;
+    if (_isSyncing) { _pendingRealtimePull = true; return; }
     _incrementalPullCycle('realtime').catch(function(err) {
       console.error('[SyncService] Realtime pull error:', err.message);
     });
@@ -2593,7 +2660,11 @@ async function _handleOffline() {
  */
 async function _incrementalPullCycle(trigger) {
   if (!(await _preCheck())) return;
-  var online = await _isOnline();
+  // Task 77: skip the /api/health probe when the fast path already knows the
+  // cloud is reachable (live socket / fresh verdict) — saves a full RTT on
+  // every realtime pull.
+  var fastOnline = _cloudReachableFast();
+  var online = fastOnline === null ? await _isOnline() : fastOnline;
   if (!online) {
     await _handleOffline();
     return;
@@ -2672,6 +2743,13 @@ async function _incrementalPullCycle(trigger) {
     emit({ type: 'sync-error', error: err.message, backoffMs: _backoffMs, failures: _consecutiveFailures });
   } finally {
     _isSyncing = false;
+    // Task 77: a realtime pull suppressed by this cycle fires right after it
+    // drains — changes that arrived mid-cycle are visible ~150ms later, not
+    // on the next event or the 30s interval.
+    if (_pendingRealtimePull && _isStarted) {
+      _pendingRealtimePull = false;
+      _scheduleSocketPull(SOCKET_EVENT_DEBOUNCE_MS);
+    }
   }
 }
 
@@ -2729,6 +2807,10 @@ async function _fullReconcileCycle() {
     emit({ type: 'sync-error', error: err.message, backoffMs: _backoffMs, failures: _consecutiveFailures });
   } finally {
     _isSyncing = false;
+    if (_pendingRealtimePull && _isStarted) {
+      _pendingRealtimePull = false;
+      _scheduleSocketPull(SOCKET_EVENT_DEBOUNCE_MS);
+    }
   }
 }
 
@@ -2778,6 +2860,7 @@ async function startSync(config) {
     agencyId: '',
     deviceId: 'unknown',
     realtimeEnabled: true,
+    probeKeepFresh: true, // tests set false — the 30s background probe would pollute probe-count assertions
   };
   Object.keys(config).forEach(function(k) { _config[k] = config[k]; });
   _realtimeEnabled = _config.realtimeEnabled !== false;
@@ -2879,7 +2962,7 @@ async function startSync(config) {
   // its own CORS-bound probe, which an explicit-allowlist VPS always rejects.
   // One 5s-budget GET / 30s is negligible. The first probe runs immediately
   // so the verdict exists BEFORE the renderer's first health check.
-  if (_config.cloudBaseUrl) {
+  if (_config.cloudBaseUrl && _config.probeKeepFresh !== false) {
     _isOnline().catch(function () { /* never rejects — defensive */ });
     if (_cloudProbeIntervalId) clearInterval(_cloudProbeIntervalId);
     _cloudProbeIntervalId = setInterval(function () {
@@ -2918,11 +3001,26 @@ function triggerSyncNow() {
 
 /**
  * Local→cloud immediacy: called by the local API (via main.js mutation
- * listener) after every local business mutation. Debounced 400ms so a burst
- * of mutations coalesces into one outbox replay.
+ * listener) after every local business mutation. Leading-edge immediate
+ * replay for the first mutation; a 150ms trailing debounce coalesces bursts.
  */
 function onLocalMutation() {
   if (!_isStarted || !_authToken) return;
+  // Task 77 LEADING EDGE: the first mutation after an idle period replays
+  // IMMEDIATELY (the outbox row is committed before this listener fires) —
+  // a desktop call-next reaches the cloud in ~1 RTT instead of
+  // debounce + /api/health probe + push. Offline bursts skip this (fresh
+  // offline verdict) so we never burn a 5s fetch timeout per mutation; the
+  // trailing debounce below plus the connect/online/30s-cycle paths recover.
+  var fast = _cloudReachableFast();
+  if (fast !== false && !_localMutationDebounceId && !_replayInFlight) {
+    _replayPendingMutations().catch(function(e) {
+      console.warn('[SyncService] leading-edge replay error:', e.message);
+    });
+  }
+  // Trailing debounce: coalesces mutation bursts into ONE follow-up replay
+  // (a leading-edge replay may already have drained them — that replay is a
+  // cheap no-op when the outbox is empty).
   if (_localMutationDebounceId) clearTimeout(_localMutationDebounceId);
   _localMutationDebounceId = setTimeout(async function() {
     _localMutationDebounceId = null;
@@ -2930,7 +3028,9 @@ function onLocalMutation() {
       // Only replay when actually online — otherwise the 30s cycle,
       // socket 'connect' and 'online' event paths pick it up (no attempt
       // burn on fetch failures).
-      if (!(await _isOnline())) return;
+      var reach = _cloudReachableFast();
+      if (reach === false) return;
+      if (reach === null && !(await _isOnline())) return;
       await _replayPendingMutations();
     } catch (e) {
       console.warn('[SyncService] onLocalMutation replay error:', e.message);
@@ -3270,6 +3370,8 @@ module.exports = {
   // P0 deadlock breaker: wakes the initializer when NOT_INITIALIZED + cloud reachable
   ensureWorkspaceInitialized: ensureWorkspaceInitialized,
   probeCloudSyncRoutes: function() { return _probeCloudSyncRoutes(); },
+  // Task 77: fast-path reachability verdict (diagnostics + latency tests)
+  cloudReachableFast: function() { return _cloudReachableFast(); },
   // Task 33-C: authorization (workspace lock) surface
   classifyCloudError: classifyCloudError,
   markAuthorizationAuthorized: markAuthorizationAuthorized,
