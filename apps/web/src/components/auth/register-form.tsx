@@ -459,6 +459,8 @@ export function RegisterForm() {
   const [focusedField, setFocusedField] = useState<string | null>(null);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const avatarInputRef = useRef<HTMLInputElement>(null);
+  // Task 78 — captures the settled upload URL immediately (see avatarValue).
+  const uploadedAvatarUrlRef = useRef<string | null>(null);
   // Task 23: the chosen preset icon (a data URI) — mutually exclusive with an
   // uploaded file. avatarValue (below) is what actually gets sent.
   const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
@@ -483,6 +485,7 @@ export function RegisterForm() {
     maxSize: 2 * 1024 * 1024,
     accept: ['image/jpeg', 'image/png', 'image/gif', 'image/webp'],
     onSuccess: (result) => {
+      uploadedAvatarUrlRef.current = result.url;
       setSelectedPreset(null);
       setAvatarPreview(getProxiedUrl(result.url));
       toast.success(t('avatarUpdated' as any));
@@ -500,26 +503,32 @@ export function RegisterForm() {
   });
 
   // The avatar that gets sent to the API: an uploaded file URL wins over a
-  // picked preset icon; either may be present, neither is required.
-  const avatarValue = avatarUpload.url || selectedPreset;
+  // picked preset icon. Computed INSIDE handleRegister (Task 78 — react-hooks
+  // refs rule: ref.current must not be read during render): the ref captures
+  // the settled upload result immediately, so a fast “Create account” tap
+  // while the photo is still uploading never silently drops the avatar.
 
   const handleAvatarChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setSelectedPreset(null);
+    uploadedAvatarUrlRef.current = null;
     setAvatarPreview(URL.createObjectURL(file));
-    await avatarUpload.upload(file);
+    const result = await avatarUpload.upload(file);
+    if (result?.url) uploadedAvatarUrlRef.current = result.url;
   };
 
   // Task 23: pick a preset profile icon instead of uploading a photo.
   const handlePresetSelect = (uri: string) => {
     avatarUpload.reset();
+    uploadedAvatarUrlRef.current = null;
     setSelectedPreset(uri);
     setAvatarPreview(uri);
   };
 
   const handleAvatarRemove = () => {
     avatarUpload.reset();
+    uploadedAvatarUrlRef.current = null;
     setSelectedPreset(null);
     setAvatarPreview(null);
   };
@@ -585,6 +594,13 @@ export function RegisterForm() {
   }, []);
 
   const handleRegister = async () => {
+    // Task 78 — never submit while the avatar upload is still in flight:
+    // the account would be created without the photo (placeholder avatar).
+    if (avatarUpload.uploading) {
+      toast.error('Photo still uploading — one moment');
+      return;
+    }
+
     // Full validation
     const errors: Record<string, string> = {};
 
@@ -644,6 +660,7 @@ export function RegisterForm() {
       // code field here made users think they were reserving their code at
       // sign-up, then the wizard rejected the same code as "already used".
       // Task 23: uploaded photo URL OR the picked preset icon (data URI)
+      const avatarValue = avatarUpload.url || uploadedAvatarUrlRef.current || selectedPreset;
       if (avatarValue) { body.avatarUrl = avatarValue; }
 
       // Task 5 — Algeria address selectors. When BOTH wilaya and commune are
@@ -1687,7 +1704,7 @@ export function RegisterForm() {
                             <Button
                               className="relative w-full h-12 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-semibold text-base rounded-xl shadow-lg shadow-emerald-500/25 hover:shadow-xl hover:shadow-emerald-500/40 transition-all duration-300 hover:scale-[1.02] z-10"
                               onClick={handleRegister}
-                              disabled={loading}
+                              disabled={loading || avatarUpload.uploading}
                             >
                               {loading ? (
                                 <motion.div

@@ -281,11 +281,15 @@ export const nativeBridge = {
   // ── Camera / Take Photo ───────────────────────────────────────────────────
 
   /**
-   * Take a photo and return it as a base64 data URI.
-   * - Capacitor: Camera plugin
-   * - Web: MediaStream + canvas capture (simplified)
+   * Take (or pick) a photo and return it as a base64 data URI.
+   * - Capacitor: Camera plugin — `source: 'Camera'` opens the camera,
+   *   `'Photos'` opens the device gallery (Task 78: the mobile register
+   *   wizard's Gallery button; the source argument was previously ignored).
+   * - Web: MediaStream + canvas capture for the camera; a gallery pick has
+   *   no web equivalent here (the register wizard's <input type=file>
+   *   covers it) so it resolves null on non-native runtimes.
    */
-  async takePhoto(): Promise<string | null> {
+  async takePhoto(source: 'Camera' | 'Photos' = 'Camera'): Promise<string | null> {
     if (!hasCapability('canUseCamera')) {
       console.warn('[nativeBridge] takePhoto: capability not available on this platform');
       return null;
@@ -299,7 +303,8 @@ export const nativeBridge = {
             quality: 80,
             allowEditing: false,
             resultType: 'DataUrl',
-            source: 'Camera',
+            // 'Photos' → device gallery picker; 'Camera' → camera prompt.
+            source,
           });
           return photo.dataUrl ?? (photo.base64String ? `data:image/jpeg;base64,${photo.base64String}` : null);
         }

@@ -18,7 +18,7 @@ import {
 } from '@/components/ui/select';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
-import { getProxiedUrl } from '@/lib/utils';
+import { UserAvatar } from '@/components/shared/user-avatar';
 import {
   User,
   Phone,
@@ -346,15 +346,6 @@ export function CustomerProfile() {
     { count: 200, price: 1200 },
   ];
 
-  const getInitials = () => {
-    if (!user?.fullName) return 'U';
-    const parts = user.fullName.trim().split(/\s+/);
-    if (parts.length >= 2) {
-      return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase();
-    }
-    return parts[0].charAt(0).toUpperCase();
-  };
-
   const fetchPurchaseHistory = async () => {
     if (!user?.id) return;
     setPurchaseHistoryLoading(true);
@@ -482,11 +473,7 @@ export function CustomerProfile() {
               >
                 <div className="p-[3px] rounded-full bg-gradient-to-br from-emerald-400 via-teal-400 to-cyan-500 shadow-xl">
                   <div className="h-[72px] w-[72px] rounded-full bg-gradient-to-br from-emerald-400 via-teal-400 to-emerald-600 flex items-center justify-center text-white text-2xl font-bold ring-[3px] ring-white dark:ring-gray-900 flex-shrink-0 overflow-hidden">
-                    {user?.avatarUrl ? (
-                      <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName} width={80} height={80} className="h-full w-full object-cover" />
-                    ) : (
-                      getInitials()
-                    )}
+                    <UserAvatar avatarUrl={user?.avatarUrl} fullName={user?.fullName} />
                   </div>
                 </div>
                 {/* Online indicator dot */}

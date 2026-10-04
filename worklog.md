@@ -3210,3 +3210,25 @@ Stage Summary:
 - Desktop sync is now leading-edge end-to-end: local action → cloud in ~1 RTT; cloud event → desktop data in ~1 pull RTT; zero probe round trips on hot paths; ~1s reconnect after blips. On a real VPS link the win is the removed probe + debounce ≈ 0.5-1.2s per action/event; loopback E2E measured 54ms pull / 10ms push.
 - NO cloud changes in this task → the droplet does NOT need a server-update for Task 77 itself (but DO run server-update once to deploy the already-pushed 7bb0c0a Task 76 notification fix if not done yet).
 - Desktop rebuild is REQUIRED for Task 77 to take effect: apply apps/web/public/blasti-desktop-latency-fix.patch on Windows → rebuild. Phone/web need no rebuild for this task.
+
+---
+Task ID: 78
+Agent: main (Z.ai Code)
+Task: Recover sandbox from GitHub repo (raizel820/BLASTI-MULTI-PLATFORM) after environment reset; then wire in + finish the dedicated mobile login/create-account UI (Task 78) and fix the mobile customer avatar "placeholder only" bug
+
+Work Log:
+- SANDBOX RECOVERY: local repo was a stale Task-25 snapshot; fetched origin (same GitHub URL) and hard-reset master to e48ad02 ("Delete BLASTI-v1.0.0-debug.apk", superset containing 7bb0c0a fix realetime 2 + d90e94f improve latency). Stale state preserved in branch `backup-stale-task25`. Untracked survivors of the previous session's Task 78 work were kept: mobile-login.tsx, mobile-register.tsx, preset-avatars.ts (components existed but were NOT wired into the router).
+- ROUTER WIRING (apps/web/src/app/page.tsx): lazy imports for MobileLoginForm/MobileRegisterForm; case 'login' → Electron: DesktopAgencyLogin, Capacitor/phone-browser (isCapacitor||isMobile): MobileLoginForm, desktop web: LoginForm; case 'register' → mobile shell: MobileRegisterForm, else RegisterForm; boot fallback branch updated to the same 3-way split.
+- GALLERY FIX (apps/web/src/lib/native-bridge.ts): takePhoto() previously IGNORED its source argument — the wizard's Gallery button opened the camera. Signature now takePhoto(source: 'Camera' | 'Photos' = 'Camera') and the Capacitor Camera getPhoto options pass source through; web Camera fallback unchanged, web Photos resolves null (file input covers it).
+- AVATAR BUG ROOT CAUSES + FIXES:
+  (1) RACE: register forms sent body.avatarUrl from hook state; a user tapping "Create account" while the 2MB upload was still in flight submitted with NO avatarUrl → account created with placeholder forever. Fix in BOTH register forms: uploadedAvatarUrlRef captures upload()'s settled result immediately; avatarValue = avatarUpload.url || ref || selectedPreset computed inside handleRegister (react-hooks/refs rule: no ref reads during render — lint verified); submit disabled + toast while avatarUpload.uploading (mobile-register bilingual copy 'uploadInProgress').
+  (2) DISPLAY: profile-header.tsx + customer-profile.tsx rendered `avatarUrl ? <img/> : initials` so a stale/unreachable URL showed a broken image. New shared components/shared/user-avatar.tsx (UserAvatar + initialsOf): getProxiedUrl img with onError → initials fallback, resets on URL change; both customer views swapped to it.
+- MOBILE LOGIN FIX (mobile-login.tsx): remember-me was <button><Radix Checkbox/>…</button> — nested <button> invalid HTML, hydration warning caught by agent-browser smoke test; wrapper is now <label htmlFor="m-remember">.
+- VERIFICATION (agent-browser, viewport 390x844, localStorage blasti-platform-override=android): MobileLoginForm renders AR+EN (customer-first segmented control, show-password, remember/forgot, register link); forgot-password + reset-code sub-views render; MobileRegisterForm 3-step wizard walked end-to-end: preset avatar pick → preview, step-1 validation fields, step-2 full name/phone/wilaya-commune, step-3 review card shows all data + chosen avatar; nested-button error gone after fix; console clean (only pre-existing /api/stats fetch noise — no API running in sandbox). bun run lint exit 0; tsc: 0 errors in ALL touched files (427 pre-existing baseline untouched).
+- NOTE: user.phone app needs rebuild (`bun run build:mobile` → cap sync → Android Studio build) to receive this; web/desktop unaffected behaviorally except register-form avatar race guard + UserAvatar fallback.
+
+Stage Summary:
+- Sandbox recovered to GitHub master (e48ad02) — Tasks 74-77 history restored; stale local snapshot kept on branch backup-stale-task25
+- Dedicated mobile auth screens are LIVE in the view router: Capacitor/phone → MobileLoginForm + MobileRegisterForm (customer-first, touch-first, safe-area aware, ar/en)
+- Mobile avatar placeholder bug fixed at three levels: upload race closed (ref capture + submit guard), gallery pick actually opens the gallery (takePhoto source), display degrades to initials instead of broken/placeholder on dead URLs
+- Windows/droplet actions: none required for this task (pure apps/web change) except rebuilding the phone APK; commit = this commit

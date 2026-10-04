@@ -13,6 +13,10 @@ const LandingPage = lazy(() => import('@/components/auth/landing-page').then(m =
 const LoginForm = lazy(() => import('@/components/auth/login-form').then(m => ({ default: m.LoginForm })));
 const DesktopAgencyLogin = lazy(() => import('@/components/auth/desktop-agency-login').then(m => ({ default: m.DesktopAgencyLogin })));
 const RegisterForm = lazy(() => import('@/components/auth/register-form').then(m => ({ default: m.RegisterForm })));
+// Task 78 — dedicated MOBILE (Capacitor) auth screens: customer-first,
+// touch-first, safe-area aware replacements for the desktop-oriented forms.
+const MobileLoginForm = lazy(() => import('@/components/auth/mobile-login').then(m => ({ default: m.MobileLoginForm })));
+const MobileRegisterForm = lazy(() => import('@/components/auth/mobile-register').then(m => ({ default: m.MobileRegisterForm })));
 
 // Customer Views
 const CustomerHome = lazy(() => import('@/components/customer/customer-home').then(m => ({ default: m.CustomerHome })));
@@ -124,12 +128,20 @@ const ViewRouter = memo(function ViewRouter() {
               return <LandingPage />;
             case 'login':
               // The DESKTOP app is agency-only and opens its dedicated console
-              // login. The MOBILE app is customer-first but also serves
-              // agencies — the shared form carries both role tabs (customer is
-              // the default tab).
-              return platform.isElectron ? <DesktopAgencyLogin /> : <LoginForm />;
+              // login. The MOBILE shell (Capacitor, or a phone browser) gets
+              // its own dedicated customer-first sign-in screen (Task 78).
+              // Desktop/laptop web browsers keep the shared form.
+              return platform.isElectron ? (
+                <DesktopAgencyLogin />
+              ) : platform.isCapacitor || platform.isMobile ? (
+                <MobileLoginForm />
+              ) : (
+                <LoginForm />
+              );
             case 'register':
-              return <RegisterForm />;
+              // Task 78 — the phone registers through the dedicated 3-step
+              // mobile wizard (native camera/gallery avatar, customer-first).
+              return platform.isCapacitor || platform.isMobile ? <MobileRegisterForm /> : <RegisterForm />;
             case 'customer-home':
               return <CustomerHome />;
             case 'customer-queue':
@@ -610,10 +622,12 @@ export default function Home() {
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.2 }}
           >
-            {/* Desktop gets the dedicated agency login; mobile gets the shared
-                customer-first sign-in (agency tab included); web falls back
-                to the landing page */}
-            {fallbackView === 'login' ? (platform.isElectron ? <DesktopAgencyLogin /> : <LoginForm />) : <LandingPage />}
+            {/* Desktop gets the dedicated agency login; the mobile shell gets
+                the dedicated mobile sign-in (Task 78); web falls back to the
+                landing page */}
+            {fallbackView === 'login' ? (
+              platform.isElectron ? <DesktopAgencyLogin /> : <MobileLoginForm />
+            ) : <LandingPage />}
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />

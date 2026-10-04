@@ -1,11 +1,11 @@
 'use client';
 
 import { Card, CardContent } from '@/components/ui/card';
-import { getProxiedUrl } from '@/lib/utils';
 import { User, Shield, CalendarDays } from 'lucide-react';
 import { motion } from 'framer-motion';
 import type { TranslationKeys } from '@/i18n';
 import { useLanguage } from '@/hooks/use-language';
+import { UserAvatar } from '@/components/shared/user-avatar';
 
 interface ProfileHeaderProps {
   user: {
@@ -21,14 +21,6 @@ interface ProfileHeaderProps {
 
 export function ProfileHeader({ user, phoneNumber, memberSince, t }: ProfileHeaderProps) {
   const { t: tHook } = useLanguage();
-  const getInitials = () => {
-    if (!user?.fullName) return 'U';
-    const parts = user.fullName.trim().split(/\s+/);
-    if (parts.length >= 2) {
-      return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase();
-    }
-    return parts[0].charAt(0).toUpperCase();
-  };
 
   return (
     <motion.div
@@ -55,11 +47,7 @@ export function ProfileHeader({ user, phoneNumber, memberSince, t }: ProfileHead
               className="relative"
             >
               <div className="h-20 w-20 rounded-full bg-gradient-to-br from-emerald-400 via-teal-400 to-emerald-600 flex items-center justify-center text-white text-2xl font-bold ring-4 ring-white dark:ring-gray-900 shadow-xl flex-shrink-0 overflow-hidden">
-                {user?.avatarUrl ? (
-                  <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName || ''} width={80} height={80} className="h-full w-full object-cover" />
-                ) : (
-                  getInitials()
-                )}
+                <UserAvatar avatarUrl={user?.avatarUrl} fullName={user?.fullName} />
               </div>
               {/* Online indicator dot */}
               <div className="absolute bottom-0.5 end-0.5 h-5 w-5 rounded-full bg-emerald-500 border-[3px] border-white dark:border-gray-900" />
