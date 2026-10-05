@@ -709,27 +709,11 @@ export default function Home() {
           </header>
         )}
 
-        {/* Customer navigation — platform-adaptive: Electron gets top tab bar, others get header + bottom nav */}
+        {/* Customer navigation — platform-adaptive: Electron gets top tab bar, others get slim top strip + bottom nav.
+            Task 79-a: the old chrome strip (NotificationBadge + NotificationCenter + PlatformSwitcher + LanguageSwitcher +
+            ThemeToggle) that rendered here was REMOVED — the single bell + all controls now live inside CustomerNavigation. */}
         {isCustomer && (
           <CustomerNavigation />
-        )}
-
-        {/* Language & theme controls for customer — always shown */}
-        {isCustomer && (
-          <div className="flex items-center justify-end px-4 py-1.5 bg-white/60 dark:bg-gray-950/60">
-            <div className="flex items-center gap-2">
-              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <ConnectionDot />
-              </span>
-              <NotificationBadge variant="customer" />
-              <Suspense fallback={<BlastiSkeletonCompact />}>
-                <NotificationCenter />
-              </Suspense>
-              <PlatformSwitcher />
-              <LanguageSwitcher />
-              <ThemeToggle />
-            </div>
-          </div>
         )}
 
         {/* Global Announcements Banner */}
@@ -791,19 +775,15 @@ export default function Home() {
           </div>
         )}
 
-        {/* Page content */}
+        {/* Page content — keyed CSS enter animation instead of
+            AnimatePresence mode="wait": a lazy view suspending on FIRST
+            navigation could leave the framer-motion enter animation stuck at
+            opacity 0 (blank view until the next navigation). A plain CSS
+            animation cannot get stuck — it always plays to completion. */}
         <div className={isCustomer ? 'pt-2' : ''}>
-          <AnimatePresence mode="wait">
-            <motion.div
-              key={currentView}
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.2 }}
-            >
-              <ViewRouter />
-            </motion.div>
-          </AnimatePresence>
+          <div key={currentView} className="blasti-view-enter">
+            <ViewRouter />
+          </div>
         </div>
 
         {/* Customer bottom nav is handled by CustomerNavigation above */}

@@ -137,7 +137,8 @@ export function CustomerAnalytics() {
   };
 
   return (
-    <div className="p-4 sm:p-6 pb-24 max-w-6xl mx-auto space-y-4">
+    <div className="px-4 py-3 pb-24 lg:pb-8">
+      <div className="max-w-5xl mx-auto space-y-4">
       {/* ── Sub-navigation strip: horizontal scroll on mobile, wrap on lg ── */}
       <nav
         className="flex gap-1.5 overflow-x-auto pb-1.5 -mx-1 px-1 lg:flex-wrap lg:overflow-x-visible lg:mx-0 lg:px-0 custom-scrollbar"
@@ -239,6 +240,7 @@ export function CustomerAnalytics() {
       {/* ── Section body ── */}
       <div id="customer-analytics-section-panel" role="tabpanel" aria-labelledby={`customer-analytics-tab-${activeSection}`}>
         <SectionBody query={query} />
+      </div>
       </div>
     </div>
   );

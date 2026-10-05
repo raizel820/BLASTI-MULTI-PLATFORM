@@ -1800,3 +1800,28 @@ html {
 .cta-float-element-reverse {
   animation: cta-float-reverse 7s ease-in-out infinite;
 }
+
+/* ─── Task 79-a: view transition (replaces AnimatePresence mode="wait") ──
+   A keyed CSS animation can never get stuck: a lazily-loaded view suspending
+   on first navigation used to leave the framer-motion enter animation at
+   opacity 0 (blank content until the next navigation). */
+@keyframes blasti-view-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.blasti-view-enter {
+  animation: blasti-view-enter 0.2s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .blasti-view-enter {
+    animation: none;
+  }
+}

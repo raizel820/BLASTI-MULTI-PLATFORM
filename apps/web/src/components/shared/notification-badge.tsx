@@ -11,6 +11,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
+import type { TranslationKeys } from '@/i18n';
 import {
   Popover,
   PopoverContent,
@@ -27,8 +28,9 @@ interface NotificationItem {
 }
 
 interface NotificationBadgeProps {
-  /** 'customer' navigates to notifications view, 'agency' shows a dropdown */
-  variant?: 'customer' | 'agency';
+  /** Task 79-a (one-bell rule): the customer bell lives in CustomerNavigation
+   *  (platform/customer-navigation.tsx) — this component is agency-only now. */
+  variant?: 'agency';
 }
 
 // ─── Notification icon mapping ────────────────────
@@ -53,7 +55,7 @@ function getNotifIcon(type: string) {
   }
 }
 
-function formatTimeAgo(dateStr: string, t: (key: string) => string) {
+function formatTimeAgo(dateStr: string, t: (key: TranslationKeys) => string) {
   const diff = Math.floor((Date.now() - new Date(dateStr).getTime()) / 1000);
   if (diff < 60) return t('justNow');
   if (diff < 3600) return `${Math.floor(diff / 60)} ${t('min')}`;
@@ -61,10 +63,9 @@ function formatTimeAgo(dateStr: string, t: (key: string) => string) {
   return `${Math.floor(diff / 86400)} ${t('date')}`;
 }
 
-export function NotificationBadge({ variant = 'customer' }: NotificationBadgeProps) {
+export function NotificationBadge({ variant = 'agency' }: NotificationBadgeProps) {
   const user = useAppStore((s) => s.user);
-  const setView = useAppStore((s) => s.setView);
-  const { t, lang } = useLanguage();
+  const { t } = useLanguage();
   const [unreadCount, setUnreadCount] = useState(0);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -166,16 +167,10 @@ export function NotificationBadge({ variant = 'customer' }: NotificationBadgePro
 
   // Fetch full notification list when dropdown opens (agency variant)
   useEffect(() => {
-    if (dropdownOpen && variant === 'agency') {
+    if (dropdownOpen) {
       fetchNotifications();
     }
-  }, [dropdownOpen, variant, fetchNotifications]);
-
-  const handleClick = () => {
-    if (variant === 'customer') {
-      setView('customer-notifications');
-    }
-  };
+  }, [dropdownOpen, fetchNotifications]);
 
   const hasNewNotifications = unreadCount > prevCountRef.current;
   useEffect(() => {
@@ -184,7 +179,6 @@ export function NotificationBadge({ variant = 'customer' }: NotificationBadgePro
 
   return (
     <div className="relative">
-      {variant === 'agency' ? (
         <Popover open={dropdownOpen} onOpenChange={setDropdownOpen}>
           <PopoverTrigger asChild>
             <Button
@@ -314,41 +308,7 @@ export function NotificationBadge({ variant = 'customer' }: NotificationBadgePro
               </>
             )}
           </PopoverContent>
-        </Popover>
-      ) : (
-        /* Customer variant - simple button that navigates */
-        <Button
-          variant="ghost"
-          size="icon"
-          className="relative h-9 w-9 rounded-full hover:bg-emerald-50 dark:hover:bg-emerald-900/20 transition-colors"
-          onClick={handleClick}
-          aria-label={t('notifications')}
-        >
-          <div className="relative">
-            <Bell className="h-4 w-4 text-muted-foreground" />
-            <AnimatePresence>
-              {unreadCount > 0 && (
-                <motion.span
-                  initial={{ scale: 0 }}
-                  animate={{ scale: 1 }}
-                  exit={{ scale: 0 }}
-                  className="absolute -top-1.5 -end-1.5 h-4 min-w-4 px-1 flex items-center justify-center rounded-full bg-emerald-500 text-white text-[9px] font-bold shadow-sm"
-                >
-                  {unreadCount > 99 ? '99+' : unreadCount}
-                </motion.span>
-              )}
-            </AnimatePresence>
-            {/* Pulse animation for unread */}
-            {unreadCount > 0 && (
-              <motion.span
-                className="absolute -top-1.5 -end-1.5 h-4 min-w-4 rounded-full bg-emerald-400"
-                animate={{ scale: [1, 1.5, 1], opacity: [0.6, 0, 0.6] }}
-                transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
-              />
-            )}
-          </div>
-        </Button>
-      )}
+    </Popover>
     </div>
   );
 }

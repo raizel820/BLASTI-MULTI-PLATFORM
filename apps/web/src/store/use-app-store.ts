@@ -109,6 +109,14 @@ interface AppState {
   // Onboarding
   onboarded: boolean;
 
+  // Task 80 — biometric quick-unlock. Enabled per-account in Settings
+  // (Security group). The credential itself lives ONLY in the device
+  // keystore (native-bridge setBiometricCredentials) — the store keeps just
+  // the flag + which username the stored credential belongs to, so the
+  // login screen can offer "Sign in with biometrics".
+  biometricLoginEnabled: boolean;
+  biometricUsername: string | null;
+
   // Actions
   setUser: (user: UserState | null) => void;
   setSessionToken: (token: string) => void;
@@ -119,6 +127,8 @@ interface AppState {
   logout: () => void;
   setPendingAgencyCode: (code: string | null) => void;
   setOnboarded: (v: boolean) => void;
+  /** Task 80 — enable/disable biometric quick-unlock (username = credential owner). */
+  setBiometricLogin: (enabled: boolean, username?: string | null) => void;
 }
 
 // ─── Hash-based navigation helpers ─────────────────────────────────────────
@@ -348,6 +358,8 @@ function sanitizePersistedState(state: any): {
   pendingAgencyCode: string | null;
   onboarded: boolean;
   sessionToken: string;
+  biometricLoginEnabled: boolean;
+  biometricUsername: string | null;
 } {
   const user = sanitizeUser(state?.user);
   const isAuthenticated = sanitizeIsAuthenticated(state?.isAuthenticated);
@@ -360,6 +372,11 @@ function sanitizePersistedState(state: any): {
   // skipped every cycle — the offline DB never caught up until the next
   // fresh login. Validate as a plain string; default to '' when corrupted.
   const sessionToken = typeof state?.sessionToken === 'string' ? state.sessionToken : '';
+  // Task 80 — biometric quick-unlock prefs are device-local; sanitize both.
+  const biometricLoginEnabled = state?.biometricLoginEnabled === true;
+  const biometricUsername = typeof state?.biometricUsername === 'string' && state.biometricUsername
+    ? state.biometricUsername
+    : null;
 
   // If user is null but isAuthenticated is true, fix the inconsistency
   const safeIsAuthenticated = user ? isAuthenticated : false;
@@ -374,6 +391,8 @@ function sanitizePersistedState(state: any): {
     pendingAgencyCode,
     onboarded,
     sessionToken,
+    biometricLoginEnabled,
+    biometricUsername,
   };
 }
 
@@ -391,6 +410,8 @@ export const useAppStore = create<AppState>()(
       sidebarOpen: false,
       pendingAgencyCode: null,
       onboarded: false,
+      biometricLoginEnabled: false,
+      biometricUsername: null,
 
       setSessionToken: (token) => {
         // Task 33-E — fresh auth re-enables everything the revocation guards
@@ -467,6 +488,14 @@ export const useAppStore = create<AppState>()(
 
       setPendingAgencyCode: (code) => set({ pendingAgencyCode: code }),
 
+      setBiometricLogin: (enabled, username) =>
+        set((state) => ({
+          biometricLoginEnabled: enabled,
+          biometricUsername: enabled
+            ? (username ?? state.biometricUsername ?? null)
+            : null,
+        })),
+
       // Task 37-e: cache/refill/clear the agency authority. `null` clears.
       setAgencyAuthority: (authority) => set({ agencyAuthority: authority }),
 
@@ -530,6 +559,9 @@ export const useAppStore = create<AppState>()(
         currentView: state.currentView,
         pendingAgencyCode: state.pendingAgencyCode,
         onboarded: state.onboarded,
+        // Task 80 — device-local biometric quick-unlock prefs.
+        biometricLoginEnabled: state.biometricLoginEnabled,
+        biometricUsername: state.biometricUsername,
       }),
       // Deep merge with null safety — Phase 6b: sanitize persisted state to prevent
       // NaN/null/corrupted values from leaking into the live store.

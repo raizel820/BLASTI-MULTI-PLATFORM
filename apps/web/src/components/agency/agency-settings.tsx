@@ -51,9 +51,11 @@ import {
   MessageSquare,
   ArrowRight,
   Building2,
+  Fingerprint,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
+import { BiometricSettingsCard } from '@/components/shared/biometric-settings';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -119,6 +121,7 @@ const SECTIONS: SettingsSection[] = [
   { id: 'staff', icon: Users, titleKey: 'staffManagement' },
   { id: 'branches', icon: MapPin, titleKey: 'branchManagement' },
   { id: 'sms', icon: MessageSquare, titleKey: 'smsBalanceConfig' },
+  { id: 'security', icon: Fingerprint, titleKey: 'security' },
   { id: 'danger', icon: AlertTriangle, titleKey: 'deleteAccount', danger: true },
 ];
 
@@ -138,6 +141,7 @@ export function AgencySettings() {
     capacity: true,
     staff: false,
     sms: false,
+    security: false,
     danger: false,
   });
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
@@ -1413,6 +1417,14 @@ export function AgencySettings() {
                               </span>
                             </div>
                           </div>
+                        </div>
+                      )}
+
+                      {/* Security — biometric login (Task 80) */}
+                      {section.id === 'security' && (
+                        <div className="space-y-3">
+                          <p className="text-xs text-muted-foreground -mt-1 mb-2">{t('biometricLogin')}</p>
+                          <BiometricSettingsCard />
                         </div>
                       )}
 

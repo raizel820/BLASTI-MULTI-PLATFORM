@@ -3493,6 +3493,43 @@ const ar = {
   'ticketAllCategories': 'كل الأنواع',
   'ticketLoadMore': 'تحميل المزيد',
 
+  // ─── Customer account (Task 79-b) ────────
+  security: "الأمان",
+  appVersion: "إصدار التطبيق",
+  servicesCount: "خدمة",
+  completedAt: "اكتمل في",
+
+  // ─── Task 79-a: customer daily-flow rebuild ──
+  'activeTicket': "تذكرة نشطة",
+  'noActiveTicket': "لا توجد تذكرة نشطة",
+  'noActiveTicketCta': "ابحث عن وكالة بالأسفل وانضم إلى الطابور",
+  'tapToViewQueue': "اضغط لعرض الطابور",
+  'moreActiveTickets': "+{n} أخرى في الطابور",
+  'otherActiveTickets': "تذاكر نشطة أخرى",
+  'pastTickets': "التذاكر السابقة",
+
+
+    'showPassword': "إظهار كلمة المرور",
+  'hidePassword': "إخفاء كلمة المرور",
+// ─── Task 80: إعدادات تسجيل الدخول البيومتري ──
+  'biometricLogin': "تسجيل الدخول البيومتري",
+  'biometricOn': "مفعّل",
+  'biometricChecking': "جارٍ فحص هذا الجهاز…",
+  'biometricDesc': "افتح BLASTI ببصمتك أو بوجهك — دون حاجة لكلمة المرور على هذا الجهاز.",
+  'biometricUnavailableDesc': "غير متاح على هذا الجهاز. يعمل تسجيل الدخول البيومتري على الهواتف المزودة ببصمة الإصبع أو Face ID.",
+  'biometricEnrolledAs': "بيانات الاعتماد محفوظة لـ",
+  'biometricEnabled': "تم تفعيل تسجيل الدخول البيومتري",
+  'biometricDisabled': "تم إيقاف تسجيل الدخول البيومتري",
+  'biometricEnableTitle': "تفعيل تسجيل الدخول البيومتري",
+  'biometricEnableDesc': "أكّد كلمة مرور حسابك مرة واحدة. سيسألك جهازك بعد ذلك عن بصمتك أو Face ID بدلاً منها.",
+  'biometricEnableConfirm': "تحقّق وفعّل",
+  'biometricEnableReason': "أكّد لتفعيل تسجيل الدخول البيومتري",
+  'biometricVerifyFailed': "فشل التحقق. يرجى المحاولة مرة أخرى.",
+  'biometricStorageNote': "كلمة المرور الخاصة بك مخزّنة فقط في خزنة هذا الجهاز الآمنة — لا تتم مشاركتها أو مزامنتها مطلقًا.",
+
+  'biometricSignIn': "تسجيل الدخول بالبصمة",
+  'biometricLoginReason': "تسجيل الدخول إلى BLASTI",
+
 };
 
 export default ar;

@@ -11,11 +11,18 @@ interface QueueProgressRingProps {
   ringCircumference: number;
   ringRadius: number;
   ringDashOffset: number;
+  /** Task 79-a compact variant (hero card side-by-side layout) */
+  compact?: boolean;
 }
 
 // Dynamic font sizing for queue numbers based on string length
-const getQueueRingClass = (qNum: string) => {
+const getQueueRingClass = (qNum: string, compact: boolean) => {
   const len = qNum.length;
+  if (compact) {
+    if (len > 7) return 'text-[10px] font-black';
+    if (len > 4) return 'text-sm font-black';
+    return 'text-xl font-black';
+  }
   if (len > 7) return 'text-xs sm:text-sm font-black';
   if (len > 4) return 'text-base sm:text-lg font-black';
   return 'text-2xl sm:text-3xl font-black';
@@ -27,13 +34,14 @@ export function QueueProgressRing({
   ringCircumference,
   ringRadius,
   ringDashOffset,
+  compact = false,
 }: QueueProgressRingProps) {
   const { t } = useLanguage();
 
   return (
-    <div className="flex justify-center mb-4">
+    <div className={compact ? 'flex justify-center flex-shrink-0' : 'flex justify-center mb-4'}>
       <div className="relative">
-        <svg className="h-32 w-32 sm:h-36 sm:w-36" viewBox="0 0 120 120">
+        <svg className={compact ? 'h-28 w-28' : 'h-32 w-32 sm:h-36 sm:w-36'} viewBox="0 0 120 120">
           <defs>
             <linearGradient
               id={`ring-grad-${reservation.id}`}
@@ -62,7 +70,7 @@ export function QueueProgressRing({
             cy="60"
             r={ringRadius}
             fill="none"
-            strokeWidth="8"
+            strokeWidth={compact ? '9' : '8'}
             className="stroke-gray-200 dark:stroke-gray-700"
           />
           {/* Progress arc */}
@@ -72,7 +80,7 @@ export function QueueProgressRing({
             r={ringRadius}
             fill="none"
             stroke={`url(#ring-grad-${reservation.id})`}
-            strokeWidth="8"
+            strokeWidth={compact ? '9' : '8'}
             strokeLinecap="round"
             strokeDasharray={ringCircumference}
             transform="rotate(-90, 60, 60)"
@@ -96,16 +104,16 @@ export function QueueProgressRing({
               </div>
             </motion.div>
           )}
-          <span className={`${getQueueRingClass(reservation.queueNumber)} text-foreground tracking-tight leading-tight`}>
+          <span className={`${getQueueRingClass(reservation.queueNumber, compact)} text-foreground tracking-tight leading-tight`}>
             {reservation.queueNumber}
           </span>
-          <span className="text-[9px] sm:text-[10px] text-muted-foreground uppercase tracking-wider mt-0.5">
+          <span className={`text-muted-foreground uppercase tracking-wider ${compact ? 'text-[8px]' : 'text-[9px] sm:text-[10px]'} mt-0.5`}>
             {t('yourQueueNumber')}
           </span>
           {/* Live indicator */}
           <div className="flex items-center gap-1 mt-1">
-            <Radio className="h-2.5 w-2.5 text-emerald-600 dark:text-emerald-400" />
-            <span className="text-[9px] font-medium text-emerald-600 dark:text-emerald-400 uppercase">
+            <Radio className={`text-emerald-600 dark:text-emerald-400 ${compact ? 'h-2 w-2' : 'h-2.5 w-2.5'}`} />
+            <span className={`font-medium text-emerald-600 dark:text-emerald-400 uppercase ${compact ? 'text-[8px]' : 'text-[9px]'}`}>
               {t('live')}
             </span>
           </div>

@@ -1,15 +1,25 @@
 'use client';
+/**
+ * Customer Settings — Task 79-b rebuild (Design System v2).
+ * iOS-style grouped rows. ALL logic preserved 1:1:
+ *  - GET /api/user/profile (fullName, phoneNumber, notificationPreferences)
+ *  - PATCH /api/user/profile (save profile; language; avatarUrl after upload)
+ *  - POST /api/upload?type=avatar (FormData: file + userId + type)
+ *  - PATCH /api/user/change-password (validation + wrongCurrentPassword mapping)
+ *  - PATCH /api/user/preferences (notification prefs)
+ *  - DELETE /api/user/delete-account (typed confirmation → logout)
+ *  - NotificationPrefs channel component (APP_ONLY / SMS / WHATSAPP / BOTH)
+ *  - Logout: store logout() + success toast
+ */
 import { apiFetch } from '@/lib/api-fetch';
 import { useState, useEffect } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
+import { Skeleton } from '@/components/ui/skeleton';
 import {
   Select,
   SelectContent,
@@ -27,10 +37,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import { getProxiedUrl } from '@/lib/utils';
+import { UserAvatar } from '@/components/shared/user-avatar';
 import {
   User,
-  Phone,
   Bell,
   BellRing,
   Clock,
@@ -45,16 +54,23 @@ import {
   CalendarDays,
   Shield,
   AlertTriangle,
+  LogOut,
+  Sun,
+  Moon,
+  Monitor,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
+import { useTheme } from 'next-themes';
 import type { Language } from '@/i18n';
 import { updateDocumentDirection } from '@/store/use-app-store';
 import { NotificationPrefs } from '@/components/customer/notification-prefs';
+import { BiometricSettingsCard } from '@/components/shared/biometric-settings';
 
 export function CustomerSettings() {
   const { user, setUser, logout } = useAppStore();
   const { t, lang } = useLanguage();
+  const { theme, setTheme } = useTheme();
 
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -251,6 +267,8 @@ export function CustomerSettings() {
       toast.error(t('error'));
     } finally {
       setAvatarUploading(false);
+      // Allow re-picking the same file later
+      e.target.value = '';
     }
   };
 
@@ -279,13 +297,6 @@ export function CustomerSettings() {
     }
   };
 
-  const getInitials = () => {
-    if (!user?.fullName) return 'U';
-    const parts = user.fullName.trim().split(/\s+/);
-    if (parts.length >= 2) return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase();
-    return parts[0].charAt(0).toUpperCase();
-  };
-
   const getMemberSince = () => {
     if (!user?.createdAt) return '';
     return new Date(user.createdAt).toLocaleDateString(
@@ -295,238 +306,196 @@ export function CustomerSettings() {
   };
 
   const notifCards = [
-    { key: 'queue_called' as const, label: t('queueCalledNotif'), desc: t('queueCalledNotifDesc'), icon: BellRing, color: 'emerald' },
-    { key: 'turn_approaching' as const, label: t('turnApproachingNotif'), desc: t('turnApproachingNotifDesc'), icon: Clock, color: 'amber' },
-    { key: 'completed' as const, label: t('completedNotif'), desc: t('completedNotifDesc'), icon: CheckCircle2, color: 'teal' },
+    { key: 'queue_called' as const, label: t('queueCalledNotif'), desc: t('queueCalledNotifDesc'), icon: BellRing, color: 'emerald' as const },
+    { key: 'turn_approaching' as const, label: t('turnApproachingNotif'), desc: t('turnApproachingNotifDesc'), icon: Clock, color: 'amber' as const },
+    { key: 'completed' as const, label: t('completedNotif'), desc: t('completedNotifDesc'), icon: CheckCircle2, color: 'teal' as const },
+  ];
+
+  const themeOptions = [
+    { value: 'light', icon: Sun, label: t('lightMode') },
+    { value: 'dark', icon: Moon, label: t('darkMode') },
+    { value: 'system', icon: Monitor, label: t('systemTheme') },
   ];
 
   if (loading) {
     return (
-      <div className="px-4 py-4 pb-24 space-y-4">
-        <Skeleton className="h-8 w-32 rounded-lg" />
-        <Skeleton className="h-48 rounded-2xl" />
-        <Skeleton className="h-40 rounded-2xl" />
-        <Skeleton className="h-32 rounded-2xl" />
+      <div className="px-4 py-3 pb-24 lg:pb-8">
+        <div className="max-w-5xl mx-auto space-y-4">
+          <Skeleton className="h-8 w-32 rounded-xl" />
+          <Skeleton className="h-48 rounded-2xl" />
+          <Skeleton className="h-40 rounded-2xl" />
+          <Skeleton className="h-32 rounded-2xl" />
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="px-4 py-4 pb-24 space-y-4">
-      {/* Header */}
-      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
-        <h1 className="text-xl font-bold text-foreground flex items-center gap-2">
-          <Settings2 className="h-5 w-5 text-emerald-600" />
-          {t('settings')}
-        </h1>
-        <p className="text-sm text-muted-foreground mt-0.5">{t('customerSettingsDesc' as any)}</p>
-      </motion.div>
+    <div className="px-4 py-3 pb-24 lg:pb-8">
+      <div className="max-w-5xl mx-auto space-y-4">
+        {/* Header */}
+        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25 }}>
+          <h1 className="text-lg font-bold text-foreground">{t('settings')}</h1>
+          <p className="text-xs text-muted-foreground mt-0.5">{t('customerSettingsDesc')}</p>
+        </motion.div>
 
-      {/* Profile Section */}
-      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }}>
-        <Card className="border-0 shadow-sm overflow-hidden">
-          <div className="relative h-28 bg-gradient-to-br from-emerald-500 via-teal-500 to-emerald-600">
-            <div className="absolute inset-0 overflow-hidden">
-              <div className="absolute -top-8 -end-8 w-32 h-32 rounded-full bg-white/10" />
-              <div className="absolute -bottom-12 -start-12 w-40 h-40 rounded-full bg-white/5" />
-            </div>
-          </div>
-          <CardContent className="p-5 -mt-12 relative">
-            <div className="flex items-end gap-4 mb-4">
-              {/* Avatar */}
-              <div className="relative">
-                <div className="h-20 w-20 rounded-full bg-gradient-to-br from-emerald-400 via-teal-400 to-emerald-600 flex items-center justify-center text-white text-2xl font-bold ring-4 ring-white dark:ring-gray-900 shadow-xl flex-shrink-0 overflow-hidden">
-                  {user?.avatarUrl ? (
-                    <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName} width={36} height={36} className="h-full w-full object-cover" />
-                  ) : (
-                    getInitials()
-                  )}
+        {/* ─── Account group ─── */}
+        <motion.section
+          initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.05 }}
+          aria-label={t('account')}
+        >
+          <h2 className="text-sm font-semibold text-muted-foreground mb-2 px-1">{t('account')}</h2>
+          <div className="rounded-2xl border border-border bg-white dark:bg-gray-900/80 shadow-sm overflow-hidden divide-y divide-border/60">
+            {/* Identity row with avatar upload */}
+            <div className="p-4 flex items-center gap-3">
+              <div className="relative shrink-0">
+                <div className="h-14 w-14 rounded-full overflow-hidden bg-emerald-600 flex items-center justify-center text-white text-lg font-bold ring-2 ring-emerald-100 dark:ring-emerald-900">
+                  <UserAvatar avatarUrl={user?.avatarUrl} fullName={user?.fullName} />
                 </div>
-                <label className="absolute bottom-0 end-0 h-7 w-7 rounded-full bg-emerald-600 flex items-center justify-center cursor-pointer ring-2 ring-white dark:ring-gray-900 shadow-lg hover:bg-emerald-700 transition-colors">
+                <label
+                  className="absolute bottom-0 end-0 h-7 w-7 rounded-full bg-emerald-600 flex items-center justify-center cursor-pointer ring-2 ring-white dark:ring-gray-900 shadow hover:bg-emerald-700 transition-colors"
+                  aria-label={t('edit')}
+                >
                   {avatarUploading ? <Loader2 className="h-3.5 w-3.5 text-white animate-spin" /> : <Camera className="h-3.5 w-3.5 text-white" />}
                   <input type="file" accept="image/*" className="hidden" onChange={handleAvatarUpload} disabled={avatarUploading} />
                 </label>
               </div>
-              <div className="pb-1 min-w-0 flex-1">
-                <h2 className="text-lg font-bold text-foreground truncate">{user?.fullName || t('defaultUser')}</h2>
-                <p className="text-sm text-muted-foreground truncate">@{user?.username}</p>
+              <div className="min-w-0">
+                <p className="text-sm font-bold text-foreground truncate">{user?.fullName || t('defaultUser')}</p>
+                <p className="text-xs text-muted-foreground truncate">@{user?.username}</p>
+                <span className="mt-0.5 inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 dark:text-emerald-400">
+                  <CalendarDays className="h-3 w-3" />
+                  {t('memberSince')} {getMemberSince()}
+                </span>
               </div>
             </div>
-
-            {/* Edit Fields */}
-            <div className="space-y-3 mt-2">
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">{t('fullName')}</Label>
-                <Input
-                  value={fullName}
-                  onChange={(e) => setFullName(e.target.value)}
-                  placeholder={t('fullName')}
-                  className="h-11"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">{t('phoneNumber')}</Label>
-                <div className="flex gap-2">
-                  <Input
-                    type="tel"
-                    value={phoneNumber}
-                    onChange={(e) => setPhoneNumber(e.target.value)}
-                    placeholder={t('phonePlaceholder')}
-                    className="h-11"
-                    dir="ltr"
-                  />
-                </div>
-              </div>
+            {/* Editable name */}
+            <div className="p-4 space-y-1.5">
+              <Label htmlFor="settings-fullname" className="text-xs text-muted-foreground">{t('fullName')}</Label>
+              <Input
+                id="settings-fullname"
+                value={fullName}
+                onChange={(e) => setFullName(e.target.value)}
+                placeholder={t('fullName')}
+                className="h-11 rounded-xl"
+              />
+            </div>
+            {/* Editable phone */}
+            <div className="p-4 space-y-1.5">
+              <Label htmlFor="settings-phone" className="text-xs text-muted-foreground">{t('phoneNumber')}</Label>
+              <Input
+                id="settings-phone"
+                type="tel"
+                value={phoneNumber}
+                onChange={(e) => setPhoneNumber(e.target.value)}
+                placeholder={t('phonePlaceholder')}
+                className="h-11 rounded-xl"
+                dir="ltr"
+              />
+            </div>
+            {/* Save */}
+            <div className="p-4">
               <Button
-                className="w-full bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl h-10 gap-2"
+                className="w-full h-10 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl"
                 onClick={handleSaveProfile}
                 disabled={saving || !fullName.trim()}
               >
-                {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : profileSaved ? <Check className="h-4 w-4" /> : <CheckCircle2 className="h-4 w-4" />}
+                {saving ? <Loader2 className="h-4 w-4 animate-spin me-2" /> : profileSaved ? <Check className="h-4 w-4 me-2" /> : <CheckCircle2 className="h-4 w-4 me-2" />}
                 {t('save')}
               </Button>
             </div>
-          </CardContent>
-        </Card>
-      </motion.div>
+          </div>
+        </motion.section>
 
-      {/* About Section */}
-      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }}>
-        <Card className="border-0 shadow-sm">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <Info className="h-4 w-4 text-emerald-600" />
-              {t('about' as any)}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0">
-            <div className="grid grid-cols-1 gap-2">
-              <div className="flex items-center gap-3 p-3 rounded-xl bg-gray-50 dark:bg-gray-800/30">
-                <div className="h-9 w-9 rounded-lg bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center flex-shrink-0">
-                  <User className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                </div>
-                <div className="min-w-0">
-                  <p className="text-[10px] text-muted-foreground">{t('username')}</p>
-                  <p className="text-sm font-medium text-foreground">@{user?.username}</p>
-                </div>
-              </div>
-              <div className="flex items-center gap-3 p-3 rounded-xl bg-gray-50 dark:bg-gray-800/30">
-                <div className="h-9 w-9 rounded-lg bg-teal-100 dark:bg-teal-900/30 flex items-center justify-center flex-shrink-0">
-                  <Shield className="h-4 w-4 text-teal-600 dark:text-teal-400" />
-                </div>
-                <div className="min-w-0">
-                  <p className="text-[10px] text-muted-foreground">{t('status')}</p>
-                  <p className="text-sm font-medium text-foreground">{t('customerRole')}</p>
-                </div>
-              </div>
-              <div className="flex items-center gap-3 p-3 rounded-xl bg-gray-50 dark:bg-gray-800/30">
-                <div className="h-9 w-9 rounded-lg bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center flex-shrink-0">
-                  <CalendarDays className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-                </div>
-                <div className="min-w-0">
-                  <p className="text-[10px] text-muted-foreground">{t('memberSince')}</p>
-                  <p className="text-sm font-medium text-foreground">{getMemberSince()}</p>
-                </div>
+        {/* ─── Appearance group (theme + language quick setters) ─── */}
+        <motion.section
+          initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.1 }}
+          aria-label={t('appearance')}
+        >
+          <h2 className="text-sm font-semibold text-muted-foreground mb-2 px-1">{t('appearance')}</h2>
+          <div className="rounded-2xl border border-border bg-white dark:bg-gray-900/80 shadow-sm overflow-hidden divide-y divide-border/60">
+            {/* Theme quick setter — same keys as theme-selector logic */}
+            <div className="p-4">
+              <p className="text-xs font-medium text-foreground mb-2">{t('appearanceDesc')}</p>
+              <div className="grid grid-cols-3 gap-2">
+                {themeOptions.map((opt) => {
+                  const Icon = opt.icon;
+                  const active = opt.value === 'dark' ? theme === 'dark' : opt.value === 'light' ? theme !== 'dark' : theme === 'system';
+                  return (
+                    <button
+                      key={opt.value}
+                      onClick={() => setTheme(opt.value)}
+                      aria-pressed={active}
+                      className={`h-11 rounded-xl border-2 flex items-center justify-center gap-1.5 text-xs font-semibold transition-colors ${
+                        active
+                          ? 'border-emerald-500 bg-emerald-50 text-emerald-700 dark:bg-emerald-900/20 dark:text-emerald-400'
+                          : 'border-border text-muted-foreground hover:border-emerald-200 dark:hover:border-emerald-800'
+                      }`}
+                    >
+                      <Icon className="h-4 w-4" />
+                      {opt.label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
-          </CardContent>
-        </Card>
-      </motion.div>
-
-      {/* Change Password */}
-      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15 }}>
-        <Card className="border-0 shadow-sm">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <KeyRound className="h-4 w-4 text-emerald-600" />
-              {t('changePassword')}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0">
-            <div className="space-y-3">
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">{t('currentPassword')}</Label>
-                <Input
-                  type="password"
-                  value={currentPassword}
-                  onChange={(e) => setCurrentPassword(e.target.value)}
-                  placeholder="••••••"
-                  className="h-11"
-                  dir="ltr"
-                />
+            {/* Language quick setter (persists to server) */}
+            <div className="p-4 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="h-9 w-9 rounded-xl bg-teal-100 dark:bg-teal-900/40 flex items-center justify-center shrink-0">
+                  <Globe className="h-4 w-4 text-teal-600 dark:text-teal-400" />
+                </div>
+                <p className="text-sm font-medium text-foreground">{t('language')}</p>
               </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">{t('newPassword')}</Label>
-                <Input
-                  type="password"
-                  value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  placeholder="••••••"
-                  className="h-11"
-                  dir="ltr"
-                />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs text-muted-foreground">{t('confirmNewPassword')}</Label>
-                <Input
-                  type="password"
-                  value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  placeholder="••••••"
-                  className="h-11"
-                  dir="ltr"
-                  onKeyDown={(e) => { if (e.key === 'Enter') handleChangePassword(); }}
-                />
-              </div>
-              <Button
-                className="w-full bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl h-10 gap-2"
-                onClick={handleChangePassword}
-                disabled={passwordLoading || !currentPassword || !newPassword || !confirmPassword}
-              >
-                {passwordLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <KeyRound className="h-4 w-4" />}
-                {t('changePassword')}
-              </Button>
+              <Select value={selectedLang} onValueChange={handleLanguageChange}>
+                <SelectTrigger className="h-10 w-36 rounded-xl">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ar">العربية</SelectItem>
+                  <SelectItem value="en">{t('languageEnglish')}</SelectItem>
+                  <SelectItem value="fr">Français</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
-          </CardContent>
-        </Card>
-      </motion.div>
+          </div>
+        </motion.section>
 
-      {/* Notification Preferences */}
-      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
-        <Card className="border-0 shadow-sm">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <Bell className="h-4 w-4 text-emerald-600" />
-              {t('notifPrefs')}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0">
-            <p className="text-xs text-muted-foreground mb-3">{t('notifPrefsDesc')}</p>
-            <div className="space-y-3">
+        {/* ─── Notifications group ─── */}
+        <motion.section
+          initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.15 }}
+          aria-label={t('notifications')}
+        >
+          <h2 className="text-sm font-semibold text-muted-foreground mb-2 px-1">{t('notifications')}</h2>
+          <div className="rounded-2xl border border-border bg-white dark:bg-gray-900/80 shadow-sm overflow-hidden divide-y divide-border/60">
+            <div className="p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <Bell className="h-4 w-4 text-emerald-600" />
+                <p className="text-sm font-semibold text-foreground">{t('notifPrefs')}</p>
+              </div>
+              <p className="text-xs text-muted-foreground -mt-1.5">{t('notifPrefsDesc')}</p>
               {notifCards.map((item) => {
                 const isEnabled = notifPrefs[item.key];
                 const Icon = item.icon;
-                const colorMap: Record<string, string> = {
-                  emerald: isEnabled ? 'border-emerald-300 dark:border-emerald-700 bg-emerald-50/80 dark:bg-emerald-900/20' : '',
-                  amber: isEnabled ? 'border-amber-300 dark:border-amber-700 bg-amber-50/80 dark:bg-amber-900/20' : '',
-                  teal: isEnabled ? 'border-teal-300 dark:border-teal-700 bg-teal-50/80 dark:bg-teal-900/20' : '',
-                };
-                const iconColorMap: Record<string, string> = {
-                  emerald: 'bg-emerald-100 dark:bg-emerald-800/40 text-emerald-600 dark:text-emerald-400',
-                  amber: 'bg-amber-100 dark:bg-amber-800/40 text-amber-600 dark:text-amber-400',
-                  teal: 'bg-teal-100 dark:bg-teal-800/40 text-teal-600 dark:text-teal-400',
-                };
                 return (
                   <div
                     key={item.key}
-                    className={`flex items-center gap-3 p-3 rounded-xl border-2 transition-all ${isEnabled ? colorMap[item.color] : 'border-transparent bg-gray-50 dark:bg-gray-800/30 opacity-70'}`}
+                    className={`flex items-center gap-3 p-3 rounded-xl border transition-colors ${
+                      isEnabled
+                        ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50/60 dark:bg-emerald-900/20'
+                        : 'border-transparent bg-muted/50 dark:bg-gray-800/30'
+                    }`}
                   >
-                    <div className={`h-9 w-9 rounded-lg ${iconColorMap[item.color]} flex items-center justify-center flex-shrink-0`}>
+                    <div className={`h-9 w-9 rounded-lg flex items-center justify-center shrink-0 ${
+                      isEnabled
+                        ? 'bg-emerald-100 dark:bg-emerald-800/40 text-emerald-600 dark:text-emerald-400'
+                        : 'bg-gray-100 dark:bg-gray-800 text-muted-foreground'
+                    }`}>
                       <Icon className="h-4 w-4" />
                     </div>
                     <div className="flex-1 min-w-0">
                       <p className={`text-sm font-medium ${isEnabled ? 'text-foreground' : 'text-muted-foreground'}`}>{item.label}</p>
-                      <p className="text-[11px] text-muted-foreground mt-0.5">{item.desc}</p>
+                      <p className="text-[11px] text-muted-foreground">{item.desc}</p>
                     </div>
                     <Switch
                       checked={isEnabled}
@@ -535,110 +504,192 @@ export function CustomerSettings() {
                   </div>
                 );
               })}
+              <Button
+                className="w-full h-10 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl"
+                onClick={handleSaveNotifs}
+                disabled={notifSaving}
+              >
+                {notifSaving ? <Loader2 className="h-4 w-4 animate-spin me-2" /> : <Check className="h-4 w-4 me-2" />}
+                {t('save')}
+              </Button>
             </div>
-            <Button
-              className="w-full mt-3 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl h-10 gap-2"
-              onClick={handleSaveNotifs}
-              disabled={notifSaving}
-            >
-              {notifSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-              {t('save')}
-            </Button>
-          </CardContent>
-        </Card>
-      </motion.div>
-
-      {/* Notification Channel Preference (APP_ONLY / SMS / WHATSAPP / BOTH) */}
-      <NotificationPrefs />
-
-      {/* Language Preference */}
-      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.25 }}>
-        <Card className="border-0 shadow-sm">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <Globe className="h-4 w-4 text-emerald-600" />
-              {t('language')}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0">
-            <Select value={selectedLang} onValueChange={handleLanguageChange}>
-              <SelectTrigger className="h-11 rounded-xl">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="ar">العربية</SelectItem>
-                <SelectItem value="en">{t('languageEnglish')}</SelectItem>
-                <SelectItem value="fr">Français</SelectItem>
-              </SelectContent>
-            </Select>
-          </CardContent>
-        </Card>
-      </motion.div>
-
-      {/* Delete Account */}
-      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }}>
-        <Card className="border-0 shadow-sm border-t-2 border-t-red-200 dark:border-t-red-800">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2 text-red-600 dark:text-red-400">
-              <AlertTriangle className="h-4 w-4" />
-              {t('deleteAccount')}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0">
-            <p className="text-xs text-muted-foreground mb-3">{t('deleteAccountDesc')}</p>
-            <Button
-              variant="outline"
-              className="w-full text-red-600 border-red-200 dark:border-red-800 hover:bg-red-50 dark:hover:bg-red-900/10 rounded-xl h-10 gap-2"
-              onClick={() => setDeleteOpen(true)}
-            >
-              <Trash2 className="h-4 w-4" />
-              {t('deleteAccount')}
-            </Button>
-          </CardContent>
-        </Card>
-      </motion.div>
-
-      {/* Delete Account Dialog */}
-      <AlertDialog open={deleteOpen} onOpenChange={(open) => { setDeleteOpen(open); if (!open) setDeleteConfirmText(''); }}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle className="flex items-center gap-2 text-red-600">
-              <AlertTriangle className="h-5 w-5" />
-              {t('deleteAccount')}
-            </AlertDialogTitle>
-            <AlertDialogDescription>{t('deleteUserWarning')}</AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="space-y-3 py-2">
-            <div className="p-3 rounded-xl bg-red-50 dark:bg-red-900/10 border border-red-200/50 dark:border-red-800/30">
-              <p className="text-xs font-medium text-red-700 dark:text-red-400">{t('deleteAccountWarning')}</p>
-            </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs text-muted-foreground">{t('typeDeleteToConfirm')}</Label>
-              <Input
-                value={deleteConfirmText}
-                onChange={(e) => setDeleteConfirmText(e.target.value)}
-                placeholder="delete"
-                className="h-11"
-                dir="ltr"
-              />
+            {/* Channel preference (APP_ONLY / SMS / WHATSAPP / BOTH) — preserved component */}
+            <div className="p-4 border-t border-border/60">
+              <NotificationPrefs />
             </div>
           </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel>{t('cancel')}</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDeleteAccount}
-              disabled={deleteLoading || deleteConfirmText.toLowerCase() !== 'delete'}
-              className="bg-red-600 hover:bg-red-700 text-white"
-            >
-              {deleteLoading ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : null}
-              {t('deleteAccount')}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        </motion.section>
+
+        {/* ─── Security group (biometric login + password) ─── */}
+        <motion.section
+          initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.2 }}
+          aria-label={t('security')}
+        >
+          <h2 className="text-sm font-semibold text-muted-foreground mb-2 px-1">{t('security')}</h2>
+          <div className="space-y-3">
+            {/* Task 80 — biometric quick-unlock (device keystore-backed) */}
+            <BiometricSettingsCard />
+            {/* Change password (preserved) */}
+            <div className="rounded-2xl border border-border bg-white dark:bg-gray-900/80 shadow-sm p-4 space-y-3">
+              <div className="flex items-center gap-2">
+                <KeyRound className="h-4 w-4 text-emerald-600" />
+                <p className="text-sm font-semibold text-foreground">{t('changePassword')}</p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="settings-cur-pass" className="text-xs text-muted-foreground">{t('currentPassword')}</Label>
+                <Input
+                  id="settings-cur-pass"
+                  type="password"
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  placeholder="••••••"
+                  className="h-11 rounded-xl"
+                  dir="ltr"
+                  autoComplete="current-password"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="settings-new-pass" className="text-xs text-muted-foreground">{t('newPassword')}</Label>
+                <Input
+                  id="settings-new-pass"
+                  type="password"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="••••••"
+                  className="h-11 rounded-xl"
+                  dir="ltr"
+                  autoComplete="new-password"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="settings-conf-pass" className="text-xs text-muted-foreground">{t('confirmNewPassword')}</Label>
+                <Input
+                  id="settings-conf-pass"
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="••••••"
+                  className="h-11 rounded-xl"
+                  dir="ltr"
+                  autoComplete="new-password"
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleChangePassword(); }}
+                />
+              </div>
+              <Button
+                className="w-full h-10 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl"
+                onClick={handleChangePassword}
+                disabled={passwordLoading || !currentPassword || !newPassword || !confirmPassword}
+              >
+                {passwordLoading ? <Loader2 className="h-4 w-4 animate-spin me-2" /> : <KeyRound className="h-4 w-4 me-2" />}
+                {t('changePassword')}
+              </Button>
+            </div>
+          </div>
+        </motion.section>
+
+        {/* ─── About group ─── */}
+        <motion.section
+          initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.25 }}
+          aria-label={t('about')}
+        >
+          <h2 className="text-sm font-semibold text-muted-foreground mb-2 px-1">{t('about')}</h2>
+          <div className="rounded-2xl border border-border bg-white dark:bg-gray-900/80 shadow-sm overflow-hidden divide-y divide-border/60">
+            <div className="p-3.5 flex items-center gap-3">
+              <div className="h-9 w-9 rounded-xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center shrink-0">
+                <User className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+              </div>
+              <p className="text-xs text-muted-foreground">{t('username')}</p>
+              <p className="text-sm font-medium text-foreground ms-auto truncate">@{user?.username}</p>
+            </div>
+            <div className="p-3.5 flex items-center gap-3">
+              <div className="h-9 w-9 rounded-xl bg-teal-100 dark:bg-teal-900/30 flex items-center justify-center shrink-0">
+                <Shield className="h-4 w-4 text-teal-600 dark:text-teal-400" />
+              </div>
+              <p className="text-xs text-muted-foreground">{t('status')}</p>
+              <p className="text-sm font-medium text-foreground ms-auto">{t('customerRole')}</p>
+            </div>
+            <div className="p-3.5 flex items-center gap-3">
+              <div className="h-9 w-9 rounded-xl bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center shrink-0">
+                <CalendarDays className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+              </div>
+              <p className="text-xs text-muted-foreground">{t('memberSince')}</p>
+              <p className="text-sm font-medium text-foreground ms-auto truncate">{getMemberSince()}</p>
+            </div>
+            <div className="p-3.5 flex items-center gap-3">
+              <div className="h-9 w-9 rounded-xl bg-muted dark:bg-gray-800 flex items-center justify-center shrink-0">
+                <Info className="h-4 w-4 text-muted-foreground" />
+              </div>
+              <p className="text-xs text-muted-foreground">{t('appVersion')}</p>
+              <p className="text-sm font-medium text-foreground ms-auto" dir="ltr">1.0.0</p>
+            </div>
+          </div>
+        </motion.section>
+
+        {/* ─── Logout (exact logic preserved) ─── */}
+        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.3 }}>
+          <Button
+            variant="outline"
+            className="w-full h-11 rounded-xl border-red-200 text-red-600 hover:bg-red-50 dark:border-red-800 dark:text-red-400 dark:hover:bg-red-900/20 font-semibold"
+            onClick={() => {
+              logout();
+              toast.success(t('logout'));
+            }}
+          >
+            <LogOut className="h-4 w-4 me-2" />
+            {t('logout')}
+          </Button>
+        </motion.div>
+
+        {/* ─── Delete account ─── */}
+        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.35 }}>
+          <button
+            className="w-full h-11 rounded-xl border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors flex items-center justify-center gap-2 text-sm font-semibold"
+            onClick={() => setDeleteOpen(true)}
+          >
+            <Trash2 className="h-4 w-4" />
+            {t('deleteAccount')}
+          </button>
+        </motion.div>
+
+        {/* Delete Account Dialog (preserved confirmation flow) */}
+        <AlertDialog open={deleteOpen} onOpenChange={(open) => { setDeleteOpen(open); if (!open) setDeleteConfirmText(''); }}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle className="flex items-center gap-2 text-red-600">
+                <AlertTriangle className="h-5 w-5" />
+                {t('deleteAccount')}
+              </AlertDialogTitle>
+              <AlertDialogDescription>{t('deleteUserWarning')}</AlertDialogDescription>
+            </AlertDialogHeader>
+            <div className="space-y-3 py-2">
+              <div className="p-3 rounded-xl bg-red-50 dark:bg-red-900/10 border border-red-200/50 dark:border-red-800/30">
+                <p className="text-xs font-medium text-red-700 dark:text-red-400">{t('deleteAccountWarning')}</p>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs text-muted-foreground">{t('typeDeleteToConfirm')}</Label>
+                <Input
+                  value={deleteConfirmText}
+                  onChange={(e) => setDeleteConfirmText(e.target.value)}
+                  placeholder="delete"
+                  className="h-11 rounded-xl"
+                  dir="ltr"
+                />
+              </div>
+            </div>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t('cancel')}</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={handleDeleteAccount}
+                disabled={deleteLoading || deleteConfirmText.toLowerCase() !== 'delete'}
+                className="bg-red-600 hover:bg-red-700 text-white"
+              >
+                {deleteLoading ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : null}
+                {t('deleteAccount')}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      </div>
     </div>
   );
 }
-
-// Need to import Settings2
-import { Settings2 } from 'lucide-react';

@@ -1,7 +1,7 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { apiClient, setNativeSessionToken } from '@/lib/api-client';
 import { useAppStore } from '@/store/use-app-store';
 import { adoptImportedLocalSessionUser } from '@/lib/session-heal';
@@ -13,7 +13,8 @@ import { Label } from '@/components/ui/label';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
-import { ArrowLeft, Loader2, Eye, EyeOff, CheckCircle2, KeyRound, Mail, Ticket, Tablet } from 'lucide-react';
+import { nativeBridge } from '@/lib/native-bridge';
+import { ArrowLeft, Loader2, Eye, EyeOff, CheckCircle2, KeyRound, Mail, Ticket, Tablet, Fingerprint } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { UserRole } from '@/store/use-app-store';
@@ -64,8 +65,43 @@ export function LoginForm() {
     setTimeout(() => setShakeError(false), 600);
   }, []);
 
-  const handleLogin = async () => {
-    if (!username.trim() || !password.trim()) {
+  // ── Task 80: biometric quick-unlock ──
+  // Offered only when THIS device has an enrolled credential (Settings →
+  // Security) and a biometric authenticator is available. On phones
+  // (Capacitor) this is fingerprint/Face ID; desktop web/Electron simply
+  // never shows the button (isBiometricsAvailable → false).
+  const biometricLoginEnabled = useAppStore((s) => s.biometricLoginEnabled);
+  const biometricUsername = useAppStore((s) => s.biometricUsername);
+  const [biometricPassword, setBiometricPassword] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!biometricLoginEnabled || !biometricUsername) return;
+      try {
+        const available = await nativeBridge.isBiometricsAvailable();
+        if (!available || cancelled) return;
+        const stored = await nativeBridge.getBiometricCredentials(biometricUsername);
+        if (!cancelled && stored) setBiometricPassword(stored);
+      } catch { /* biometric unlock simply not offered */ }
+    })();
+    return () => { cancelled = true; };
+  }, [biometricLoginEnabled, biometricUsername]);
+
+  const handleBiometricLogin = async () => {
+    if (!biometricUsername || !biometricPassword) return;
+    const ok = await nativeBridge.authenticateWithBiometrics(t('biometricLoginReason'));
+    if (!ok) {
+      toast.error(t('biometricVerifyFailed'));
+      return;
+    }
+    await handleLogin(biometricUsername, biometricPassword);
+  };
+
+  const handleLogin = async (biometricUser?: string, biometricPass?: string) => {
+    const effUsername = biometricUser ?? username;
+    const effPassword = biometricPass ?? password;
+    if (!effUsername.trim() || !effPassword.trim()) {
       toast.error(t('requiredField'));
       return;
     }
@@ -76,7 +112,14 @@ export function LoginForm() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ username: username.trim(), password, expectedRole: getRoleFromTab(roleTab), ...(rememberMe ? { rememberMe: true } : {}) }),
+        body: JSON.stringify({
+          username: effUsername.trim(),
+          password: effPassword,
+          // Biometric quick-unlock skips the role tab — the credential IS the
+          // account identity (expectedRole omitted → server uses actual role).
+          ...(biometricUser ? {} : { expectedRole: getRoleFromTab(roleTab) }),
+          ...(rememberMe && !biometricUser ? { rememberMe: true } : {}),
+        }),
       });
 
       const data = await res.json();
@@ -541,7 +584,7 @@ export function LoginForm() {
                             <div className="absolute -inset-1 rounded-xl bg-gradient-to-r from-emerald-500/40 via-teal-500/30 to-cyan-500/40 blur-lg opacity-0 hover:opacity-100 transition-opacity duration-500 group" />
                             <Button
                               className="relative w-full h-12 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-semibold text-base rounded-xl shadow-lg shadow-emerald-500/25 hover:shadow-xl hover:shadow-emerald-500/40 transition-all duration-300 hover:scale-[1.02] z-10"
-                              onClick={handleLogin}
+                              onClick={() => handleLogin()}
                               disabled={loading}
                             >
                               {loading ? (
@@ -551,6 +594,18 @@ export function LoginForm() {
                                 </motion.div>
                               ) : t('login')}
                             </Button>
+                            {/* Task 80 — biometric quick-unlock (enrolled devices only) */}
+                            {biometricUsername && biometricPassword && (
+                              <Button
+                                variant="outline"
+                                onClick={handleBiometricLogin}
+                                disabled={loading}
+                                className="relative w-full h-11 mt-2 rounded-xl border-emerald-200 dark:border-emerald-800/50 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 font-semibold z-10"
+                              >
+                                <Fingerprint className="h-4 w-4 me-2" />
+                                {t('biometricSignIn')}
+                              </Button>
+                            )}
                           </motion.div>
                         )}
                       </AnimatePresence>

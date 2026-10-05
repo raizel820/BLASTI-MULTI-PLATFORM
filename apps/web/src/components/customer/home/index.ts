@@ -1,12 +1,8 @@
-export { HomeHeader } from './HomeHeader';
+export { ActiveTicketStrip } from './ActiveTicketStrip';
+export type { ActiveTicket } from './ActiveTicketStrip';
 export { CategoryFilters } from './CategoryFilters';
-export { NearbyAgencies } from './NearbyAgencies';
-export { FeaturedAgencies } from './FeaturedAgencies';
 export { AgencyCard } from './AgencyCard';
-export { AgencyGrid } from './AgencyGrid';
-export { AgencyDetailSheet } from './AgencyDetailSheet';
-export { JoinQueueDialog } from './JoinQueueDialog';
-export { QuickStatsBanner } from './QuickStatsBanner';
 export { RecentActivityFeed } from './RecentActivityFeed';
-export type { AgencyListItem, AgencyDetail, ActiveReservation, CategoryKey } from './types';
+export { RecentlyVisited } from './RecentlyVisited';
+export type { AgencyListItem, AgencyDetail, CategoryKey } from './types';
 export { categoryKeys, getAgencyName, getCategoryLabel, isOpenNow } from './types';

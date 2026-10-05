@@ -705,6 +705,30 @@ export const nativeBridge = {
     }
   },
 
+  /**
+   * Remove the stored credential for `service` from the device keystore
+   * (Task 80 — used when the user turns biometric login off, or when the
+   * stored account no longer matches the logged-in one). No-op when the
+   * plugin is unavailable; resolves false only on real failures so callers
+   * can warn, without throwing.
+   */
+  async deleteBiometricCredentials(service: string): Promise<boolean> {
+    if (!isCapacitorNative()) return false;
+
+    try {
+      const plugin = getCapacitorPlugin('NativeBiometric');
+      if (!plugin || typeof plugin.deleteCredentials !== 'function') return false;
+
+      await (plugin.deleteCredentials as (opts: unknown) => Promise<void>)({
+        username: service,
+      });
+      return true;
+    } catch (error) {
+      console.warn('[nativeBridge] deleteBiometricCredentials failed:', error);
+      return false;
+    }
+  },
+
   // ── Geolocation ───────────────────────────────────────────────────────────
 
   /**

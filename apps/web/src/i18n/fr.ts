@@ -3494,6 +3494,43 @@ const fr: Record<TranslationKeys, string> = {
   'ticketAllCategories': 'Tous les types',
   'ticketLoadMore': 'Charger plus',
 
+  // ─── Customer account (Task 79-b) ────────
+  security: "Sécurité",
+  appVersion: "Version de l'application",
+  servicesCount: "services",
+  completedAt: "Terminé le",
+
+  // ─── Task 79-a: customer daily-flow rebuild ──
+  'activeTicket': "Ticket actif",
+  'noActiveTicket': "Aucun ticket actif",
+  'noActiveTicketCta': "Trouvez une agence ci-dessous et rejoignez la file",
+  'tapToViewQueue': "Appuyez pour voir la file",
+  'moreActiveTickets': "+{n} autres dans la file",
+  'otherActiveTickets': "Autres tickets actifs",
+  'pastTickets': "Tickets passés",
+
+
+    'showPassword': "Afficher le mot de passe",
+  'hidePassword': "Masquer le mot de passe",
+// ─── Task 80 : paramètres de connexion biométrique ──
+  'biometricLogin': "Connexion biométrique",
+  'biometricOn': "Activé",
+  'biometricChecking': "Vérification de l'appareil…",
+  'biometricDesc': "Déverrouillez BLASTI avec votre empreinte ou votre visage — plus besoin de mot de passe sur cet appareil.",
+  'biometricUnavailableDesc': "Indisponible sur cet appareil. La connexion biométrique fonctionne sur les téléphones avec empreinte ou Face ID.",
+  'biometricEnrolledAs': "Identifiant enregistré pour",
+  'biometricEnabled': "Connexion biométrique activée",
+  'biometricDisabled': "Connexion biométrique désactivée",
+  'biometricEnableTitle': "Activer la connexion biométrique",
+  'biometricEnableDesc': "Confirmez une seule fois votre mot de passe. Votre appareil demandera ensuite votre empreinte ou votre Face ID.",
+  'biometricEnableConfirm': "Vérifier et activer",
+  'biometricEnableReason': "Confirmez pour activer la connexion biométrique",
+  'biometricVerifyFailed': "Échec de la vérification. Veuillez réessayer.",
+  'biometricStorageNote': "Votre mot de passe est stocké uniquement dans le coffre sécurisé de cet appareil — jamais partagé, jamais synchronisé.",
+
+  'biometricSignIn': "Se connecter avec la biométrie",
+  'biometricLoginReason': "Se connecter à BLASTI",
+
 };
 
 export default fr;

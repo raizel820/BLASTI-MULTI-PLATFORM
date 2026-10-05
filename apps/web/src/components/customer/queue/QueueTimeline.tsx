@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
+import { apiFetch } from '@/lib/api-fetch';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useLanguage } from '@/hooks/use-language';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';

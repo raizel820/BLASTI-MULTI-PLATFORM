@@ -25,6 +25,7 @@ import { SystemSettingsConfig } from '@/components/admin/admin-settings-config';
 import { AdminPaymentEngine } from '@/components/admin/admin-payment-engine';
 import { AdminProvidersSettings } from '@/components/admin/admin-providers-settings';
 import { AdminMapsSettings } from '@/components/admin/admin-maps-settings';
+import { BiometricSettingsCard } from '@/components/shared/biometric-settings';
 
 // ─── Animation variants ───────────────────────────────────────────
 const fadeUp = {
@@ -265,6 +266,21 @@ export function AdminSettings() {
               {savingPayment ? <Loader2 className="h-3.5 w-3.5 animate-spin me-2" /> : <Save className="h-3.5 w-3.5 me-2" />}
               {t('save')}
             </Button>
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* ─── Security — biometric login (Task 80, device-local) ─── */}
+      <motion.div {...fadeUp} transition={{ delay: 0.45 }}>
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Shield className="h-4 w-4 text-emerald-600" />
+              {t('security')}
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="pt-0">
+            <BiometricSettingsCard />
           </CardContent>
         </Card>
       </motion.div>

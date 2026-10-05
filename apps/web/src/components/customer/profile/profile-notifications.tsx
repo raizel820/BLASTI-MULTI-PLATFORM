@@ -11,6 +11,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
+import type { TranslationKeys } from '@/i18n';
 import type { NotifPrefs, ProfileNotificationsProps } from './profile-types';
 
 const notifCardDefs = [
@@ -52,7 +53,7 @@ const colorStyles = {
   },
 };
 
-const notifLabels: Record<keyof NotifPrefs, { label: string; description: string }> = {
+const notifLabels: Record<keyof NotifPrefs, { label: TranslationKeys; description: TranslationKeys }> = {
   queue_called: { label: 'queueCalledNotif', description: 'queueCalledNotifDesc' },
   turn_approaching: { label: 'turnApproachingNotif', description: 'turnApproachingNotifDesc' },
   completed: { label: 'completedNotif', description: 'completedNotifDesc' },
@@ -123,10 +124,10 @@ export function ProfileNotifications({ notifPrefs, notifSaving, notifLoading, on
                     <motion.span
                       layout
                       transition={{ type: 'spring', stiffness: 500, damping: 30 }}
-                      className="absolute top-0.5 h-5 w-5 bg-white rounded-full shadow-md"
-                      style={{
-                        left: isEnabled ? '22px' : '2px',
-                      }}
+                      className={`absolute top-0.5 h-5 w-5 bg-white rounded-full shadow-md ${
+                        // Task 79-b: logical inset (RTL-safe) — same pattern as Task 39.
+                        isEnabled ? 'start-[22px]' : 'start-[2px]'
+                      }`}
                     />
                   </motion.div>
                 </motion.button>

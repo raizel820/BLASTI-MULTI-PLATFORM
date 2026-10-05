@@ -3232,3 +3232,102 @@ Stage Summary:
 - Dedicated mobile auth screens are LIVE in the view router: Capacitor/phone → MobileLoginForm + MobileRegisterForm (customer-first, touch-first, safe-area aware, ar/en)
 - Mobile avatar placeholder bug fixed at three levels: upload race closed (ref capture + submit guard), gallery pick actually opens the gallery (takePhoto source), display degrades to initials instead of broken/placeholder on dead URLs
 - Windows/droplet actions: none required for this task (pure apps/web change) except rebuilding the phone APK; commit = this commit
+
+---
+Task ID: 79-spec
+Agent: Z.ai Code (main)
+Task: Shared design specification for Task 79 customer-account rebuild (READ THIS BEFORE WORKING)
+
+Stage Summary:
+- USER DECREE: customer account UI/UX is REBUILT FROM SCRATCH (no minor edits). All logic/features/API calls preserved. Same platform theme.
+- DESIGN SYSTEM v2 (platform theme — emerald/teal):
+  • Primary emerald-600 (hover emerald-700), accent teal-500/600. Gradient emerald-600→teal-600 ONLY for the compact hero strip. NO indigo/blue anywhere.
+  • Surfaces: bg-background page; cards: bg-white dark:bg-gray-900/80 border-border rounded-2xl shadow-sm. Nested panels: bg-muted/50 dark:bg-gray-800/50 rounded-xl.
+  • Text: text-foreground primary, text-muted-foreground secondary. Page title: text-lg font-bold (compact). Section titles: text-sm font-semibold.
+  • Controls: rounded-xl; Button h-10 (desktop) / h-11 (touch); primary = bg-emerald-600 hover:bg-emerald-700 text-white.
+  • Motion: framer-motion — initial {opacity:0, y:8} → animate {opacity:1, y:0} 0.25s; whileTap={{scale:0.98}} on tappable cards. NO heavy/flashy animation.
+  • RTL: logical utilities ms-/me-/ps-/pe-; arrows ChevronRight with rtl:rotate-180; dir handled by existing layout.
+  • Dark mode: full dark: coverage on every element.
+  • Layout: page root "px-4 py-3 pb-24 lg:pb-8" (pb-24 clears mobile bottom nav), inner max-w-5xl mx-auto. Desktop density: grids md:grid-cols-3 lg:grid-cols-4.
+  • Icons: lucide-react h-4 (inline) / h-5 (buttons). States: ErrorState, Skeleton, BlastiSkeleton from shared.
+  • i18n: EVERY new user-facing string needs keys in src/i18n/en.ts, fr.ts, ar.ts (same key in all 3). Reuse existing keys whenever possible.
+  • NOTIFICATION RULE: exactly ONE bell for customers platform-wide. It lives in the customer navigation header → setView('customer-notifications'). Any other bell/badge/dropdown = BUG.
+- FILE OWNERSHIP (disjoint, do NOT touch other agent's files):
+  • 79-a: customer-home.tsx, customer/home/*, customer-queue.tsx, customer/queue/*, customer-notifications.tsx, customer-navigation.tsx, src/app/page.tsx (customer chrome only), shared/notification-badge.tsx + shared/NotificationCenter.tsx (customer-variant removal only).
+  • 79-b: customer-history.tsx, customer-favorites.tsx, customer-profile.tsx, customer/profile/*, customer-settings.tsx, customer-support.tsx, customer-analytics.tsx (light alignment).
+- Task 80 (biometrics, after 79-b): shared/biometric-settings.tsx wired into customer-settings + agency-settings + admin-settings; login forms get biometric button; @capgo/capacitor-native-biometric added to apps/mobile deps.
+
+---
+Task ID: 79-b
+Agent: Z.ai Code (79-b rebuild agent)
+Task: From-scratch rebuild of the customer ACCOUNT half (history, favorites, profile, settings, support, analytics alignment) to Design System v2, preserving 100% of logic/endpoints/flows
+
+Work Log:
+- Read worklog 79-spec (Design System v2 + file ownership) and fully inventoried every owned file before rewriting (all apiFetch/fetchWithRetry endpoints, dialogs, upload flows, state machines, i18n keys)
+- customer-history.tsx: 992 → 873 lines. Replaced gradient hero + animated timeline + two-card stack with compact header + inline stat chips, status filter chips (ALL/COMPLETED/CANCELLED/NO_SHOW) + date-range chips (allTime/7d/30d/3m), date-grouped COMPACT single-card rows with chevron inline expansion (receipt-style details: joinedAt/completedAt/service/est. wait), color-coded status chip, rating stars or preserved RatingDialog "Rate" flow, preserved rejoin Calendar dialog → POST /api/reservations → setView('customer-queue'), preserved collapsible Service Duration Stats card with live-serving timer (GET /api/user/customer/service-stats), loading/error/empty states
+- customer-favorites.tsx: 427 → 449 lines. Card grid 2-col mobile / 3-col desktop; remove-heart with heart-break delay preserved, open/closed badge + working hours, sponsored star, services count; sort (recent/name/rating) preserved; join-queue Calendar dialog preserved exactly; EmptyState/error preserved. NOTE: waiting-count is NOT displayed because GET /api/favorites returns no such field (behavior could not be invented without an API change)
+- customer-profile.tsx: 1388 → 263 lines. Now a lean orchestrator over the existing profile/use-profile-data.ts hook + profile/* children (ProfilePhoneNumber, ProfileChangePassword, ProfilePreferences, ProfileNotifications, ProfileSmsSettings, ProfileSmsWallet, ProfilePurchaseHistory, ProfileDangerZone). Compact identity card (UserAvatar, name, @user, phone, customerRole chip, member-since, edit→scroll-to-personal-info) + 4 stat chips from GET /api/user/stats. All endpoints preserved (/api/user/profile PATCH×2, /api/user/preferences, /api/user/change-password, /api/user/delete-account typed-confirm, /api/sms/purchase, /api/sms/purchase GET, /api/user/stats). Logout toast preserved
+- profile/profile-types.ts: retyped t as (key: TranslationKeys, params?) => string (was loose string) enabling strict-typed children; profile/profile-notifications.tsx: fixed RTL toggle knob (physical left → start-[22px]/start-[2px] logical utilities, Task-39 pattern) + typed notifLabels keys
+- customer-settings.tsx: 644 → 703 lines. iOS-style grouped rows: Account (avatar upload preserved incl. type=avatar formData field + avatarUrl persist PATCH; name/phone save with profileSaved flash), Appearance (theme quick-setter light/dark/system + language select that persists to server), Notifications (notif prefs switches + save; NotificationPrefs channel component preserved), Security group (change password preserved with wrongCurrentPassword mapping + clean EMPTY placeholder slot for Task 80 biometric card), About (username/status/member-since/app version), Logout (store logout() + toast — exact logic), Delete account with preserved 'delete' typed confirmation (toLowerCase compare kept). Delete-confirm placeholder/compare reverted to original 'delete' semantics (not localized) to preserve behavior
+- customer/notification-prefs.tsx: fixed latent bug — apiFetch was used without import (component is consumed by settings); one-line import fix, zero behavior change
+- customer-support.tsx: 317 → 335 lines. Create form moved into Dialog (same POST /api/support-tickets flow, same validation ≥3 chars), compact expandable card list, replies block, close-ticket PATCH preserved; exported statusKey/statusBadgeClass/categoryKey kept — admin-tickets.tsx and agency-support.tsx import them
+- customer-analytics trio (light pass): customer-analytics.tsx shell realigned to spec root (px-4 py-3 pb-24 lg:pb-8 + max-w-5xl mx-auto) — all hooks/states/sections untouched; sections + types files already v2-compliant (emerald/teal, shared section-ui primitives) and left intact
+- i18n: added 4 new keys (security, appVersion, servicesCount, completedAt) identically to en.ts, fr.ts, ar.ts; verified zero pre-existing key renamed/removed and no duplicate-key collisions introduced
+- QA: bun run lint → 0 errors 0 warnings (clean project-wide); bunx tsc --noEmit filtered to owned files → no errors attributable to 79-b (remaining project errors are pre-existing in unowned files); did not run dev/build
+
+Stage Summary:
+- Customer account surfaces now follow Design System v2: emerald/teal only, rounded-2xl bg-white dark:bg-gray-900/80 cards, compact type scale (text-lg page title / text-sm section titles), subtle framer-motion (opacity/y 8 → 0.25s), logical ms-/me-/start- utilities, full dark-mode coverage, pb-24 mobile nav clearance
+- ZERO behavioral changes intended: every endpoint, dialog, validation, toast key, upload flow, sort/filter, grouping, pagination-less history load, rating flow, rejoin flow, wallet purchase flow, channel-pref component, logout and delete-account confirmations preserved 1:1
+-customer-profile is now 5× leaner by delegating to the previously-orphaned profile/* subsystem (useProfileData hook + child components), which also made the RTL toggle fix and strict i18n key typing land in one place
+- 79-b touched exactly: customer-history.tsx, customer-favorites.tsx, customer-profile.tsx, customer-settings.tsx, customer-support.tsx, customer-analytics.tsx, profile/profile-types.ts, profile/profile-notifications.tsx, notification-prefs.tsx, i18n/{en,fr,ar}.ts — no 79-a files (home/queue/notifications/navigation/page.tsx) were modified
+- New keys for Task 80: the Security group in customer-settings contains an empty placeholder slot (Fingerprint icon + muted row) ready to receive the biometric-settings card
+
+---
+Task ID: 79-a
+Agent: Z.ai Code (79-a resume/verification agent)
+Task: Rebuild customer home/queue/notifications/navigation (from-scratch redesign, single bell)
+
+Work Log:
+- Resumed after timeout: read worklog 79-spec (Design System v2 + file ownership) and verified the predecessor's rewrite state file-by-file (line counts matched the state check: customer-home 1315, customer-queue 1639, customer-notifications 668, customer-navigation 542)
+- customer-navigation.tsx VERIFIED: exactly ONE CustomerBell platform-wide (rendered once per platform branch — desktop tab bar OR mobile top strip, never both); unread badge → setView('customer-notifications'); unread polling byte-identical to pre-rebuild (GET /api/notifications?userId=…&unreadOnly=true every 30s + refetch on `blasti:notifications-read`); desktop top bar hosts tabs + bell + ConnectionDot + LanguageSwitcher + ThemeToggle + More dropdown; mobile = slim top strip (avatar/greeting/bell/theme) + 5-slot bottom nav (Home/Queue/History/Profile/More with grouped sheet); `useCustomerNavPosition` export byte-identical to HEAD (platform.isElectron ? 'top' : 'bottom') so page.tsx stays compatible
+- page.tsx (customer chrome): confirmed the old `{isCustomer && (<div className="flex items-center justify-end px-4 py-1.5 …">` block with NotificationBadge variant="customer" + NotificationCenter + PlatformSwitcher + LanguageSwitcher + ThemeToggle was already deleted by the predecessor; merged the leftover duplicate "Customer navigation" comment into a single Task 79-a note; customers now render NO NotificationBadge/NotificationCenter anywhere (grep-verified); agency/admin header block untouched (it still legitimately uses variant="agency" + the shared controls, so LanguageSwitcher/ThemeToggle/PlatformSwitcher/NotificationBadge/NotificationCenter imports all remain used and were kept)
+- Design-system alignment pass on owned roots: added the spec's `lg:pb-8` to the page roots of customer-home (×2), customer-queue (×2), customer-notifications (×3) — pb-24 mobile-nav clearance kept
+- shared/notification-badge.tsx (79-a ownership: customer-variant removal): removed the dead `variant="customer"` branch + its setView/handleClick wiring (default now 'agency', type narrowed to 'agency') — enforces the one-bell rule at the component level; fixed a latent type error in it (formatTimeAgo param typed (key: TranslationKeys) so useLanguage's typed t is assignable)
+- Logic-preservation audits (old vs new, HEAD diff): endpoint sets IDENTICAL for customer-home (/api/agencies, /api/favorites, /api/reservations) and customer-queue (/api/reservations/active|:id/status|:id/postpone|:id/toggle-fixed-time|reclaim); handler-name sets identical in home; queue feature-parity counts identical (sounds, turn-alert-sleep, SlideToConfirm, WaitTimePredictor, CustomerQrPass, rating dialog, postpone, localStorage caches, realtime room join/leave); customer-notifications preserves fetchWithRetry GET, 30s auto-refresh, realtime joinCustomer + onNotification/onTurnApproaching/onYourTurn, PATCH markAll, PATCH :id, DELETE :id, blasti:notifications-read dispatches
+- QA: `bun run lint` → exit 0, 0 errors 0 warnings; `bunx tsc --noEmit` filtered to owned files (customer-home|customer-queue|customer-notifications|customer-navigation|src/app/page.tsx|customer/(home|queue)/|notification-badge) → CLEAN (remaining 419 project errors are pre-existing in unowned files: i18n duplicate-key TS1117s all at lines ≤3477 i.e. before Task 79's additions at 3496+, lib/*, ui/*, agency/admin, public/* bundles); no dev server, no build
+- i18n audit: extracted 194 static t('…') keys across all owned files + dynamic key sources (categoryKeys in home/types.ts, statusConfig labelKeys + timeAgo keys in RecentActivityFeed) → ALL present in en.ts, fr.ts, ar.ts; the 11 keys added by Task 79 (security, appVersion, servicesCount, completedAt, activeTicket, noActiveTicket, noActiveTicketCta, tapToViewQueue, moreActiveTickets, otherActiveTickets, pastTickets) verified present and identical across all 3 locales — zero keys needed adding
+
+Stage Summary:
+- Task 79-a verified complete and finalized: customer home/queue/notifications/navigation all comply with Design System v2 (emerald/teal only — zero indigo/blue grep hits; rounded-2xl bg-white dark:bg-gray-900/80 cards; compact text-lg/text-sm scale; framer-motion opacity/y8 0.25s + whileTap; logical ms-/me-/start- + rtl:rotate-180; full dark: coverage; px-4 py-3 pb-24 lg:pb-8 roots)
+- ONE bell rule now enforced end-to-end: customers get a single bell in CustomerNavigation (badge → customer-notifications); NotificationBadge is agency-only; NotificationCenter renders only in the agency/admin header
+- Zero behavioral changes: every endpoint, polling/backoff, realtime subscription, sound, dialog, cache and toast preserved 1:1 (audited by diffing endpoint sets and feature markers against HEAD)
+- Files finalized (lines): customer-home.tsx 1315; customer-queue.tsx 1639; customer-notifications.tsx 668; customer-navigation.tsx 542; home/{ActiveTicketStrip 190, AgencyCard 170, CategoryFilters 132, RecentActivityFeed 191, RecentlyVisited 194, types 158, index 8}; queue/{QueueProgressRing 124, QueueTimeline 420, QueueTurnAlert 167, QueueEmptyState 86, QueueRatingDialog 80, types 28, index 6}; notification-badge.tsx 314 (agency-only); app/page.tsx 861
+
+---
+Task ID: 79-80
+Agent: Z.ai Code (main)
+Task: USER DECREE EXECUTED — complete from-scratch rebuild of customer account UI/UX (Tasks 79-a/79-b via parallel subagents) + Task 80 biometric login settings for all account types and devices; browser-verified end-to-end
+
+Work Log:
+- Workspace check: repo intact at 65e68a0 (all prior commits present; no reset this time).
+- Task 79-a (subagent, resumed once after timeout): customer-home.tsx 1907→1315 lines + NEW home/ActiveTicketStrip.tsx (single compact active-ticket card replaces the two-card giant), rebuilt AgencyCard/RecentActivityFeed/RecentlyVisited/CategoryFilters; customer-queue.tsx rebuilt (single hero ticket card, past tickets behind disclosure → history view); customer-notifications.tsx = THE single notification center; customer-navigation.tsx rebuilt (desktop top tabs / mobile strip + bottom nav, ONE CustomerBell with unread badge → notifications view); page.tsx customer chrome block (NotificationBadge variant="customer" + NotificationCenter + controls row) DELETED — customers now render exactly ONE bell platform-wide; dead variant="customer" branch removed from shared/notification-badge.tsx.
+- Task 79-b (subagent): customer-history 992→873, customer-favorites 427→449, customer-profile 1388→263 (orchestrator over profile/* children), customer-settings 644→703 (iOS-style grouped rows with Security group), customer-support, customer-analytics alignment; fixed latent missing-apiFetch-import bug in notification-prefs.tsx; exports statusKey/statusBadgeClass/categoryKey preserved for admin/agency consumers.
+- Verification round 1 (agent-browser, mock customer session in blasti-app): home/queue/history/profile/settings/notifications all render in the new design; single bell confirmed; biometric card confirmed visible in Settings → Security. TWO issues found and fixed:
+  (1) Greeting duplicated (nav strip + home header) → strip now shows BLASTI brand wordmark (TicketCheck icon + wordmark → home), greeting lives only in the page content.
+  (2) FIRST-VISIT BLANK VIEW bug: AnimatePresence mode="wait" + lazy view suspending left the framer-motion enter animation stuck at opacity 0 (blank content until next navigation — pre-existing infra bug made glaring by the rebuild). Fixed by replacing the keyed motion.div with a keyed plain div + CSS animation .blasti-view-enter (globals.css, respects prefers-reduced-motion) — CSS animations cannot get stuck.
+- Task 80 (biometric login settings, all accounts/devices):
+  • Store: biometricLoginEnabled + biometricUsername persisted fields (partialize + sanitize + migrate) + setBiometricLogin action in use-app-store.ts.
+  • native-bridge.ts: NEW deleteBiometricCredentials(service) wrapping NativeBiometric.deleteCredentials.
+  • NEW shared/biometric-settings.tsx — BiometricSettingsCard: probes isBiometricsAvailable(); enable flow = password re-verify against POST /api/auth/login (no expectedRole) → device fingerprint prompt → setBiometricCredentials into keystore → flag persisted; disable flow = keystore delete + flag clear; on web/Electron shows honest "not available on this device" (card visible everywhere per user requirement).
+  • Wired into ALL account types: customer-settings (Security group), agency-settings (new collapsible Security section between SMS and Danger), admin-settings (new Security card).
+  • Login integration: login-form.tsx + mobile-login.tsx — handleLogin(biometricUser?, biometricPass?) override params; biometric quick-unlock button (fingerprint) appears ONLY when flag set + credential exists + biometrics available (Capacitor); biometric path omits expectedRole (credential IS the identity) — full post-login machinery (Electron local session import, native token, sync resume) reused unchanged.
+  • i18n: 17 new keys × 3 locales (biometricLogin/On/Checking/Desc/UnavailableDesc/EnrolledAs/Enabled/Disabled/EnableTitle/EnableDesc/EnableConfirm/EnableReason/VerifyFailed/StorageNote/SignIn/LoginReason + show/hidePassword).
+  • apps/mobile: @capgo/capacitor-native-biometric@8.7.0 installed (Capacitor 8 compatible) — the plugin the foundation's native-bridge calls were written against.
+- Lint exit 0. tsc: 419 errors project-wide vs 455 at HEAD baseline (rebuild fixed 36, introduced 0; all Task-80 files clean).
+- Agent-browser E2E: home/queue/history/profile/settings/notifications rendered at 1280 + 1440 + 390px; mobile login form intact; biometric button correctly hidden on non-Capacitor devices; graceful offline/error states everywhere (sandbox has no API/DB).
+
+Stage Summary:
+- Customer account UI/UX is FULLY REBUILT (not edited): one bell, one compact ticket card, viewport-friendly queue, grouped settings, single notification center — all prior logic/endpoints/features preserved 1:1 by the rebuild inventory process.
+- Biometric login settings live for customer + agency + admin on every device (functional on Capacitor phones, honest unavailable state on web/Electron), plus one-tap biometric sign-in on both login forms for enrolled devices.
+- PHONE REBUILD REQUIRED to get the plugin + new UI into the APK: bun run build:mobile (or build:android) — web/desktop pick it up as-is.
+- Deploy notes: pure apps/web change (+ mobile dep) → no droplet server-update needed for this task; no .env changes.

@@ -1,6 +1,14 @@
 'use client';
 
+/**
+ * Task 79-a — Recent activity feed (restyle of the original feed).
+ * Same endpoint (GET /api/reservations/history?limit=5), same status mapping;
+ * container restyled to Design System v2. Also fixes the pre-rebuild missing
+ * `apiFetch` import.
+ */
+
 import { useEffect, useState } from 'react';
+import { apiFetch } from '@/lib/api-fetch';
 import { motion } from 'framer-motion';
 import { Badge } from '@/components/ui/badge';
 import { Clock, CheckCircle2, XCircle, TicketCheck, ChevronRight, Activity } from 'lucide-react';
@@ -19,7 +27,7 @@ interface ActivityItem {
   createdAt: string;
 }
 
-function timeAgo(dateStr: string, t: (key: TranslationKeys) => string, lang: string): string {
+function timeAgo(dateStr: string, t: (key: TranslationKeys, params?: Record<string, string>) => string): string {
   const now = new Date();
   const date = new Date(dateStr);
   const diffMs = now.getTime() - date.getTime();
@@ -43,7 +51,7 @@ const statusConfig: Record<string, { color: string; bg: string; dot: string; ico
 };
 
 interface RecentActivityFeedProps {
-  t: (key: TranslationKeys) => string;
+  t: (key: TranslationKeys, params?: Record<string, string>) => string;
   lang: string;
   onViewHistory: () => void;
 }
@@ -62,17 +70,21 @@ export function RecentActivityFeed({ t, lang, onViewHistory }: RecentActivityFee
         const res = await apiFetch(`/api/reservations/history?limit=5`);
         if (res.ok && !cancelled) {
           const data = await res.json();
-          const items: ActivityItem[] = (data.reservations ?? []).slice(0, 5).map((r: any) => ({
-            id: r.id,
-            agencyName: r.agency?.name || '',
-            agencyNameAr: r.agency?.nameAr,
-            agencyNameFr: r.agency?.nameFr,
-            serviceName: r.service?.name || '',
-            serviceNameAr: r.service?.nameAr,
-            serviceNameFr: r.service?.nameFr,
-            status: r.status || 'WAITING',
-            createdAt: r.createdAt || r.joinedAt || new Date().toISOString(),
-          }));
+          const items: ActivityItem[] = (data.reservations ?? []).slice(0, 5).map((r: Record<string, unknown>) => {
+            const agency = r.agency as Record<string, string> | undefined;
+            const service = r.service as Record<string, string> | undefined;
+            return {
+              id: r.id as string,
+              agencyName: agency?.name || '',
+              agencyNameAr: agency?.nameAr,
+              agencyNameFr: agency?.nameFr,
+              serviceName: service?.name || '',
+              serviceNameAr: service?.nameAr,
+              serviceNameFr: service?.nameFr,
+              status: (r.status as string) || 'WAITING',
+              createdAt: (r.createdAt as string) || (r.joinedAt as string) || new Date().toISOString(),
+            };
+          });
           setActivities(items);
         }
       } catch { /* silent */ }
@@ -84,12 +96,7 @@ export function RecentActivityFeed({ t, lang, onViewHistory }: RecentActivityFee
 
   if (loading) {
     return (
-      <motion.div
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ delay: 0.25 }}
-        className="mb-5"
-      >
+      <section className="mb-5" aria-busy="true">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
             <Activity className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
@@ -98,20 +105,20 @@ export function RecentActivityFeed({ t, lang, onViewHistory }: RecentActivityFee
         </div>
         <div className="space-y-2">
           {[1, 2, 3].map((i) => (
-            <div key={i} className="h-14 bg-muted/50 rounded-xl animate-pulse" />
+            <div key={i} className="h-14 bg-muted/50 rounded-2xl animate-pulse" />
           ))}
         </div>
-      </motion.div>
+      </section>
     );
   }
 
   if (activities.length === 0) return null;
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 10 }}
+    <motion.section
+      initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay: 0.25 }}
+      transition={{ duration: 0.25 }}
       className="mb-5"
     >
       <div className="flex items-center justify-between mb-3">
@@ -143,9 +150,9 @@ export function RecentActivityFeed({ t, lang, onViewHistory }: RecentActivityFee
             return (
               <motion.div
                 key={item.id}
-                initial={{ opacity: 0, x: -10 }}
+                initial={{ opacity: 0, x: -8 }}
                 animate={{ opacity: 1, x: 0 }}
-                transition={{ delay: idx * 0.06 }}
+                transition={{ delay: idx * 0.05 }}
                 className="relative flex items-start gap-3 ps-2"
               >
                 {/* Timeline dot */}
@@ -169,7 +176,7 @@ export function RecentActivityFeed({ t, lang, onViewHistory }: RecentActivityFee
                         {t(config.labelKey)}
                       </Badge>
                       <span className="text-[9px] text-muted-foreground whitespace-nowrap">
-                        {timeAgo(item.createdAt, t, lang)}
+                        {timeAgo(item.createdAt, t)}
                       </span>
                     </div>
                   </div>
@@ -179,6 +186,6 @@ export function RecentActivityFeed({ t, lang, onViewHistory }: RecentActivityFee
           })}
         </div>
       </div>
-    </motion.div>
+    </motion.section>
   );
 }

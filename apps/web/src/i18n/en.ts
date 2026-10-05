@@ -3493,6 +3493,43 @@ const en: Record<TranslationKeys, string> = {
   'ticketAllCategories': 'All types',
   'ticketLoadMore': 'Load More',
 
+  // ─── Customer account (Task 79-b) ────────
+  security: "Security",
+  appVersion: "App version",
+  servicesCount: "services",
+  completedAt: "Completed",
+
+  // ─── Task 79-a: customer daily-flow rebuild ──
+  'activeTicket': "Active ticket",
+  'noActiveTicket': "No active ticket",
+  'noActiveTicketCta': "Find an agency below and join the queue",
+  'tapToViewQueue': "Tap to view your queue",
+  'moreActiveTickets': "+{n} more in queue",
+  'otherActiveTickets': "Other active tickets",
+  'pastTickets': "Past tickets",
+
+
+    'showPassword': "Show password",
+  'hidePassword': "Hide password",
+// ─── Task 80: biometric login settings (all account types, shared card) ──
+  'biometricLogin': "Biometric login",
+  'biometricOn': "On",
+  'biometricChecking': "Checking this device…",
+  'biometricDesc': "Unlock BLASTI with your fingerprint or face — no password needed on this device.",
+  'biometricUnavailableDesc': "Not available on this device. Biometric login works on phones with fingerprint or Face ID.",
+  'biometricEnrolledAs': "Credential stored for",
+  'biometricEnabled': "Biometric login enabled",
+  'biometricDisabled': "Biometric login turned off",
+  'biometricEnableTitle': "Enable biometric login",
+  'biometricEnableDesc': "Confirm your account password once. Your device will then ask for your fingerprint or Face ID instead.",
+  'biometricEnableConfirm': "Verify & enable",
+  'biometricEnableReason': "Confirm to enable biometric login",
+  'biometricVerifyFailed': "Verification failed. Please try again.",
+  'biometricStorageNote': "Your password is stored only in this device's secure keystore — never shared, never synced.",
+
+  'biometricSignIn': "Sign in with biometrics",
+  'biometricLoginReason': "Sign in to BLASTI",
+
 };
 
 export default en;

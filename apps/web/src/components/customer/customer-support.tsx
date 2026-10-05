@@ -1,21 +1,35 @@
 'use client';
 /**
- * Customer Support Desk — file complaints / notes / suggestions / questions
- * to the super admin and track the replies. Backed by /api/support-tickets
- * (cloud). Personal tickets only (agencyId = null for customers).
+ * Customer Support Desk — Task 79-b rebuild (Design System v2).
+ * File complaints / notes / suggestions / questions to the super admin and
+ * track replies. Backed by /api/support-tickets (cloud). Personal tickets only
+ * (agencyId = null for customers).
+ *
+ * Flows preserved 1:1:
+ *  - GET  /api/support-tickets/mine        → { tickets, openCount }
+ *  - POST /api/support-tickets             → create (subject ≥ 3 chars, message required)
+ *  - PATCH /api/support-tickets/:id        → close ticket (status CLOSED)
+ *  - Exports statusKey / statusBadgeClass / categoryKey are consumed by
+ *    admin-tickets.tsx and agency-support.tsx — kept for compatibility.
  */
 import { apiFetch } from '@/lib/api-fetch';
 
 import { useState, useEffect, useCallback } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog';
 import { EmptyState } from '@/components/shared/empty-state';
 import {
   LifeBuoy,
@@ -26,7 +40,7 @@ import {
   MessageCircle,
   XCircle,
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { AnimatePresence, motion } from 'framer-motion';
 import { toast } from 'sonner';
 import type { TranslationKeys } from '@/i18n';
 
@@ -141,101 +155,37 @@ export function CustomerSupport() {
   };
 
   return (
-    <div className="min-h-dvh bg-gradient-to-b from-teal-50/60 to-transparent dark:from-teal-950/10">
-      <div className="max-w-3xl mx-auto px-4 py-6 space-y-5">
-        {/* Header */}
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex items-center gap-3 min-w-0">
-            <div className="h-12 w-12 rounded-2xl bg-gradient-to-br from-teal-500 to-emerald-600 flex items-center justify-center shadow-lg shadow-teal-500/20 flex-shrink-0">
-              <LifeBuoy className="h-6 w-6 text-white" />
+    <div className="px-4 py-3 pb-24 lg:pb-8">
+      <div className="max-w-5xl mx-auto space-y-4">
+        {/* Compact header */}
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.25 }}
+          className="flex items-center justify-between gap-2"
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="h-9 w-9 rounded-xl bg-teal-600 flex items-center justify-center shrink-0">
+              <LifeBuoy className="h-4 w-4 text-white" />
             </div>
             <div className="min-w-0">
-              <h1 className="text-xl font-bold text-foreground truncate">{t('supportDesk')}</h1>
-              <p className="text-sm text-muted-foreground line-clamp-2">{t('supportSubtitle')}</p>
+              <h1 className="text-lg font-bold text-foreground leading-tight">{t('supportDesk')}</h1>
+              <p className="text-xs text-muted-foreground truncate">{t('supportSubtitle')}</p>
             </div>
           </div>
           <Button
-            onClick={() => setShowForm(v => !v)}
-            className="bg-teal-600 hover:bg-teal-700 text-white flex-shrink-0"
+            onClick={() => setShowForm(true)}
+            className="bg-teal-600 hover:bg-teal-700 text-white h-10 rounded-xl shrink-0"
             size="sm"
           >
             <Plus className="h-4 w-4 me-1" />
             {t('newTicket')}
           </Button>
-        </div>
+        </motion.div>
 
-        {/* New ticket form */}
-        <AnimatePresence>
-          {showForm && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: 'auto' }}
-              exit={{ opacity: 0, height: 0 }}
-              transition={{ duration: 0.2 }}
-              className="overflow-hidden"
-            >
-              <Card className="border-teal-200/60 dark:border-teal-800/40">
-                <CardHeader className="pb-2">
-                  <CardTitle className="text-base">{t('newTicket')}</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="space-y-2">
-                    <Label htmlFor="ticket-subject">{t('ticketSubject')}</Label>
-                    <Input
-                      id="ticket-subject"
-                      value={subject}
-                      onChange={(e) => setSubject(e.target.value)}
-                      placeholder={t('ticketSubjectPlaceholder')}
-                      maxLength={150}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>{t('ticketCategory')}</Label>
-                    <Select value={category} onValueChange={setCategory}>
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {CATEGORIES.map((cat) => (
-                          <SelectItem key={cat} value={cat}>{t(CATEGORY_KEY[cat])}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="ticket-message">{t('ticketMessage')}</Label>
-                    <Textarea
-                      id="ticket-message"
-                      value={message}
-                      onChange={(e) => setMessage(e.target.value)}
-                      placeholder={t('ticketMessagePlaceholder')}
-                      rows={5}
-                      maxLength={5000}
-                    />
-                  </div>
-                  <div className="flex items-center gap-2 justify-end">
-                    <Button variant="outline" size="sm" onClick={() => { setShowForm(false); resetForm(); }}>
-                      {t('cancel') || 'Cancel'}
-                    </Button>
-                    <Button
-                      onClick={handleCreate}
-                      disabled={creating || subject.trim().length < 3 || message.trim().length === 0}
-                      className="bg-teal-600 hover:bg-teal-700 text-white"
-                      size="sm"
-                    >
-                      {creating ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : <Send className="h-4 w-4 me-1" />}
-                      {t('submit')}
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {/* My tickets */}
+        {/* Ticket list header */}
         <div className="flex items-center justify-between">
-          <h2 className="text-base font-semibold text-foreground">{t('mySupportTickets')}</h2>
+          <h2 className="text-sm font-semibold text-foreground">{t('mySupportTickets')}</h2>
           {openCount > 0 && (
             <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
               {openCount} {t('openTickets')}
@@ -244,8 +194,8 @@ export function CustomerSupport() {
         </div>
 
         {loading ? (
-          <div className="space-y-3">
-            {[1, 2, 3].map((i) => <Skeleton key={i} className="h-20 w-full rounded-2xl" />)}
+          <div className="space-y-2">
+            {[1, 2, 3].map((i) => <Skeleton key={i} className="h-16 w-full rounded-2xl" />)}
           </div>
         ) : !tickets || tickets.length === 0 ? (
           <EmptyState
@@ -254,13 +204,19 @@ export function CustomerSupport() {
             description={t('ticketNoTicketsDesc')}
           />
         ) : (
-          <div className="space-y-3">
+          <div className="space-y-2">
             {tickets.map((ticket) => {
               const expanded = expandedId === ticket.id;
               return (
-                <Card key={ticket.id} className="overflow-hidden">
+                <motion.div
+                  key={ticket.id}
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.25 }}
+                  className="rounded-2xl border border-border bg-white dark:bg-gray-900/80 shadow-sm overflow-hidden"
+                >
                   <button
-                    className="w-full text-start p-4 flex items-start gap-3 hover:bg-muted/50 transition-colors"
+                    className="w-full text-start p-3.5 flex items-start gap-3 hover:bg-muted/40 transition-colors"
                     onClick={() => setExpandedId(expanded ? null : ticket.id)}
                     aria-expanded={expanded}
                   >
@@ -269,8 +225,8 @@ export function CustomerSupport() {
                         <Badge variant="outline" className="text-[11px]">{t(CATEGORY_KEY[ticket.category] ?? 'ticketCatQuestion')}</Badge>
                         <Badge className={`text-[11px] ${statusBadgeClass(ticket.status)}`}>{t(statusKey(ticket.status))}</Badge>
                       </div>
-                      <p className="mt-1.5 font-medium text-foreground truncate">{ticket.subject}</p>
-                      <p className="text-xs text-muted-foreground mt-0.5">{t('ticketSentAt')} {fmtDate(ticket.createdAt)}</p>
+                      <p className="mt-1.5 text-sm font-medium text-foreground truncate">{ticket.subject}</p>
+                      <p className="text-[11px] text-muted-foreground mt-0.5">{t('ticketSentAt')} {fmtDate(ticket.createdAt)}</p>
                     </div>
                     <ChevronDown className={`h-4 w-4 text-muted-foreground transition-transform flex-shrink-0 mt-1 ${expanded ? 'rotate-180' : ''}`} />
                   </button>
@@ -283,7 +239,7 @@ export function CustomerSupport() {
                         transition={{ duration: 0.2 }}
                         className="overflow-hidden"
                       >
-                        <div className="px-4 pb-4 pt-0 space-y-3 border-t border-border/60">
+                        <div className="px-3.5 pb-3.5 pt-0 space-y-3 border-t border-border/60">
                           <p className="text-sm text-foreground whitespace-pre-wrap pt-3">{ticket.message}</p>
                           {ticket.reply && (
                             <div className="rounded-xl bg-teal-50 dark:bg-teal-950/30 p-3 border border-teal-200/60 dark:border-teal-800/40">
@@ -296,7 +252,7 @@ export function CustomerSupport() {
                           )}
                           <div className="flex items-center gap-2">
                             {!['CLOSED', 'RESOLVED'].includes(ticket.status) && (
-                              <Button variant="outline" size="sm" onClick={() => handleClose(ticket.id)}>
+                              <Button variant="outline" size="sm" className="h-8 rounded-xl" onClick={() => handleClose(ticket.id)}>
                                 <XCircle className="h-3.5 w-3.5 me-1 text-muted-foreground" />
                                 {t('ticketCloseTicket')}
                               </Button>
@@ -306,11 +262,73 @@ export function CustomerSupport() {
                       </motion.div>
                     )}
                   </AnimatePresence>
-                </Card>
+                </motion.div>
               );
             })}
           </div>
         )}
+
+        {/* New ticket dialog (same create flow) */}
+        <Dialog open={showForm} onOpenChange={(open) => { setShowForm(open); if (!open) resetForm(); }}>
+          <DialogContent className="sm:max-w-lg">
+            <DialogHeader>
+              <DialogTitle>{t('newTicket')}</DialogTitle>
+              <DialogDescription className="sr-only">{t('supportSubtitle')}</DialogDescription>
+            </DialogHeader>
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="ticket-subject">{t('ticketSubject')}</Label>
+                <Input
+                  id="ticket-subject"
+                  value={subject}
+                  onChange={(e) => setSubject(e.target.value)}
+                  placeholder={t('ticketSubjectPlaceholder')}
+                  maxLength={150}
+                  className="h-11 rounded-xl"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>{t('ticketCategory')}</Label>
+                <Select value={category} onValueChange={setCategory}>
+                  <SelectTrigger className="h-11 rounded-xl">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {CATEGORIES.map((cat) => (
+                      <SelectItem key={cat} value={cat}>{t(CATEGORY_KEY[cat])}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="ticket-message">{t('ticketMessage')}</Label>
+                <Textarea
+                  id="ticket-message"
+                  value={message}
+                  onChange={(e) => setMessage(e.target.value)}
+                  placeholder={t('ticketMessagePlaceholder')}
+                  rows={5}
+                  maxLength={5000}
+                  className="rounded-xl"
+                />
+              </div>
+              <div className="flex items-center gap-2 justify-end">
+                <Button variant="outline" size="sm" className="h-10 rounded-xl" onClick={() => { setShowForm(false); resetForm(); }}>
+                  {t('cancel')}
+                </Button>
+                <Button
+                  onClick={handleCreate}
+                  disabled={creating || subject.trim().length < 3 || message.trim().length === 0}
+                  className="bg-teal-600 hover:bg-teal-700 text-white h-10 rounded-xl"
+                  size="sm"
+                >
+                  {creating ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : <Send className="h-4 w-4 me-1" />}
+                  {t('submit')}
+                </Button>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   );

@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import { apiFetch } from '@/lib/api-fetch'
 import { useAppStore } from '@/store/use-app-store'
 import { useLanguage } from '@/hooks/use-language'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
