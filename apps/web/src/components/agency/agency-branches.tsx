@@ -56,6 +56,9 @@ import {
   Lock,
   RefreshCw,
   AlertTriangle,
+  QrCode,
+  Copy,
+  Download,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -63,6 +66,12 @@ import { apiFetch } from '@/lib/api-fetch';
 import { getApiBaseUrl, isElectronRuntime } from '@/lib/api-client';
 import { useSubscriptionActive } from '@/hooks/use-subscription';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import QRCode from 'qrcode';
+// Task 83-b — branch location picker + Algeria address selectors (same
+// shared components the create-agency wizard and agency profile use).
+import { MapLocationPicker, type GeocodeComponents } from '@/components/shared/map/map-location-picker';
+import { WilayaSelect, CommuneSelect } from '@/components/shared/algeria-location-selects';
+import { ALGERIA_WILAYAS, findWilayaByCode } from '@/lib/algeria-locations';
 
 // Types
 interface Branch {
@@ -70,14 +79,68 @@ interface Branch {
   name: string;
   nameAr?: string | null;
   nameFr?: string | null;
+  // Task 83-b — customer-facing display name + generated sub code
+  // ("<AGYCODE>-M1" / "<AGYCODE>-B<n>", backend Task 83-a).
+  specialName?: string | null;
+  subCode?: string | null;
   address?: string | null;
   phone?: string | null;
   isActive: boolean;
   isMain: boolean;
   agencyId: string;
   createdAt: string;
+  // Task 83-b — canonical location fields (backend Task 83-a). Optional so
+  // rows from older local-API builds keep rendering.
+  latitude?: number | null;
+  longitude?: number | null;
+  city?: string | null;
+  wilaya?: string | null;
+  postalCode?: string | null;
+  locationVerified?: string | null;
+  locationSource?: string | null;
   _count?: { counters: number; staff: number };
 }
+
+// ─── Task 83-b — tolerant wilaya helpers (client-side copies of the proven
+// create-agency-form.tsx logic; server code is NOT imported on purpose) ─────
+
+/** Official two-digit ANI wilaya codes 01-58. */
+const BRANCH_WILAYA_CODE_REGEX = /^(0[1-9]|[1-4][0-9]|5[0-8])$/;
+
+/** Fold a Latin name for comparison: strip diacritics (NFD + combining
+ * marks), lowercase, keep [a-z0-9] only — "Sétif" ≍ "Setif". */
+const foldLatinName = (v: string): string =>
+  v
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+
+/** Match a geocoded wilaya name (Latin OR Arabic — the geocoder answers in
+ * the UI language) to the official dataset. Digit input ("19", "١٩") maps to
+ * the canonical two-digit code. No match → null: never invent a wilaya. */
+const branchWilayaCodeFromGeocodeName = (name: string | null): string | null => {
+  if (!name) return null;
+  const raw = name.trim();
+  if (!raw) return null;
+  const mapped = raw
+    .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06F0));
+  const digits = mapped.replace(/\D/g, '');
+  if (digits.length >= 1 && digits.length <= 2) {
+    const code = digits.padStart(2, '0');
+    return BRANCH_WILAYA_CODE_REGEX.test(code) ? code : null;
+  }
+  const qLatin = foldLatinName(mapped.replace(/wilaya/gi, '').replace(/\bde\b\s*/i, ''));
+  const qArabic = mapped.replace(/ولاية/g, '').replace(/\s/g, '');
+  if (!qLatin && !qArabic) return null;
+  const hit = ALGERIA_WILAYAS.find((w) => {
+    const latin = foldLatinName(w.name);
+    const arabic = w.nameAr.replace(/ولاية/g, '').replace(/\s/g, '');
+    return (qLatin !== '' && latin === qLatin) || (qArabic !== '' && arabic === qArabic);
+  });
+  return hit ? hit.code : null;
+};
 
 // Task 40 (round 4): the recurring "branches created but the desktop shows
 // none" report traced every time to the renderer talking to a STALE embedded
@@ -157,6 +220,16 @@ export function AgencyBranches() {
   const [branchAddress, setBranchAddress] = useState('');
   const [branchPhone, setBranchPhone] = useState('');
   const [branchIsMain, setBranchIsMain] = useState(false);
+  // Task 83-b — special name + location form state. Location is REQUIRED at
+  // creation (backend 83-a 400s without lat+lng); in edit mode lat/lng are
+  // sent together only when either changed (server pair rule).
+  const [branchSpecialName, setBranchSpecialName] = useState('');
+  const [branchLatitude, setBranchLatitude] = useState<number | null>(null);
+  const [branchLongitude, setBranchLongitude] = useState<number | null>(null);
+  const [branchWilayaCode, setBranchWilayaCode] = useState('');
+  const [branchCity, setBranchCity] = useState('');
+  const [branchPostalCode, setBranchPostalCode] = useState('');
+  const [branchLocationSource, setBranchLocationSource] = useState<'GOOGLE' | 'OPENFREEMAP' | 'MANUAL' | 'DEVICE_GPS' | null>(null);
   const [branchSaving, setBranchSaving] = useState(false);
 
   // Counter dialog
@@ -179,6 +252,11 @@ export function AgencyBranches() {
   // Toggle loading states
   const [togglingBranchId, setTogglingBranchId] = useState<string | null>(null);
   const [togglingCounterId, setTogglingCounterId] = useState<string | null>(null);
+
+  // Task 83-b — per-branch QR dialog (client-side generated SVG).
+  const [qrBranch, setQrBranch] = useState<Branch | null>(null);
+  const [qrSvg, setQrSvg] = useState<string | null>(null);
+  const [qrLoading, setQrLoading] = useState(false);
 
   // Stale-local-API awareness (see MIN_LOCAL_API_VERSION note). null = probe
   // still running / not Electron / probe failed — never blocks the UI, and a
@@ -379,9 +457,16 @@ export function AgencyBranches() {
     setBranchName('');
     setBranchNameAr('');
     setBranchNameFr('');
+    setBranchSpecialName('');
     setBranchAddress('');
     setBranchPhone('');
     setBranchIsMain(false);
+    setBranchLatitude(null);
+    setBranchLongitude(null);
+    setBranchWilayaCode('');
+    setBranchCity('');
+    setBranchPostalCode('');
+    setBranchLocationSource(null);
     setBranchDialogOpen(true);
   };
 
@@ -390,10 +475,59 @@ export function AgencyBranches() {
     setBranchName(branch.name);
     setBranchNameAr(branch.nameAr || '');
     setBranchNameFr(branch.nameFr || '');
+    setBranchSpecialName(branch.specialName || '');
     setBranchAddress(branch.address || '');
     setBranchPhone(branch.phone || '');
     setBranchIsMain(branch.isMain);
+    setBranchLatitude(branch.latitude ?? null);
+    setBranchLongitude(branch.longitude ?? null);
+    setBranchWilayaCode(branch.wilaya || '');
+    setBranchCity(branch.city || '');
+    setBranchPostalCode(branch.postalCode || '');
+    // null = no FRESH pick this session — the save payload must not touch
+    // the stored provenance pair unless the owner re-picked the pin.
+    setBranchLocationSource(null);
     setBranchDialogOpen(true);
+  };
+
+  // Task 83-b — picker → branch form state; persistence happens through the
+  // Save button. onLocationSource marks a fresh pick this session so the
+  // payload can refresh the provenance pair (spec §35 semantics).
+  const handleBranchPickerChange = (lat: number | null, lng: number | null) => {
+    setBranchLatitude(lat);
+    setBranchLongitude(lng);
+  };
+  const handleBranchLocationSource = (source: 'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS') => {
+    setBranchLocationSource(source);
+  };
+
+  // Task 83-b — reverse-geocode auto-fill (map pick → fields). Simplified
+  // branch rule: fill ONLY EMPTY fields so a manually typed value is never
+  // overwritten (no manualTouched machinery — the compact branch dialog
+  // keeps it predictable; the create-agency wizard keeps the full guard).
+  const handleBranchDetectedAddress = (components: GeocodeComponents) => {
+    if (components.street && !branchAddress.trim()) setBranchAddress(components.street);
+    if (components.wilaya && !branchWilayaCode) {
+      const code = branchWilayaCodeFromGeocodeName(components.wilaya);
+      if (code) setBranchWilayaCode(code);
+    }
+    if (components.city && !branchCity) {
+      // The commune must belong to the just-detected (or current) wilaya;
+      // only a commune that exists in the dataset is applied.
+      const code = branchWilayaCode || branchWilayaCodeFromGeocodeName(components.wilaya);
+      const wilaya = code ? findWilayaByCode(code) : undefined;
+      if (wilaya) {
+        const qLatin = foldLatinName(components.city);
+        const qArabic = components.city.replace(/\s/g, '');
+        const match = wilaya.communes.find(
+          (c) =>
+            (qLatin !== '' && foldLatinName(c.name) === qLatin) ||
+            (qArabic !== '' && c.nameAr.replace(/\s/g, '') === qArabic),
+        );
+        if (match) setBranchCity(match.name);
+      }
+    }
+    if (components.postalCode && !branchPostalCode.trim()) setBranchPostalCode(components.postalCode);
   };
 
   const handleSaveBranch = async () => {
@@ -404,9 +538,22 @@ export function AgencyBranches() {
       toast.error(t('subscriptionRequiredBranches'));
       return;
     }
+    // Task 83-b — a branch MUST carry its location at creation (backend 83-a
+    // answers 400 without lat+lng). Block here; the inline hint in the
+    // location block explains what is missing.
+    if (!editingBranch && (branchLatitude === null || branchLongitude === null)) return;
     setBranchSaving(true);
     try {
       if (editingBranch) {
+        // Task 83-b — location pair rule: lat/lng go out TOGETHER only when
+        // either actually changed vs the branch as opened for edit (an
+        // unchanged pair must never re-stamp locationUpdatedAt); both null =
+        // explicit clear. Address fields are sent only when changed (null
+        // clears); the provenance pair rides along only on a fresh pick.
+        const origLat = editingBranch.latitude ?? null;
+        const origLng = editingBranch.longitude ?? null;
+        const latChanged = (branchLatitude ?? null) !== origLat;
+        const lngChanged = (branchLongitude ?? null) !== origLng;
         const res = await apiFetch(`/api/agency/branches/${editingBranch.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
@@ -414,9 +561,21 @@ export function AgencyBranches() {
             name: branchName.trim(),
             nameAr: branchNameAr.trim() || undefined,
             nameFr: branchNameFr.trim() || undefined,
+            specialName: branchSpecialName.trim() || null,
             address: branchAddress.trim() || undefined,
             phone: branchPhone.trim() || undefined,
             isMain: branchIsMain,
+            ...((latChanged || lngChanged) && {
+              latitude: branchLatitude,
+              longitude: branchLongitude,
+              ...(branchLocationSource && {
+                locationSource: branchLocationSource,
+                locationVerified: branchLocationSource === 'DEVICE_GPS' ? 'VERIFIED' : 'UNVERIFIED',
+              }),
+            }),
+            ...(branchWilayaCode !== (editingBranch.wilaya || '') && { wilaya: branchWilayaCode || null }),
+            ...(branchCity !== (editingBranch.city || '') && { city: branchCity || null }),
+            ...(branchPostalCode !== (editingBranch.postalCode || '') && { postalCode: branchPostalCode.trim() || null }),
           }),
         });
         if (res.ok) {
@@ -439,9 +598,19 @@ export function AgencyBranches() {
             name: branchName.trim(),
             nameAr: branchNameAr.trim() || undefined,
             nameFr: branchNameFr.trim() || undefined,
+            specialName: branchSpecialName.trim() || undefined,
             address: branchAddress.trim() || undefined,
             phone: branchPhone.trim() || undefined,
             isMain: branchIsMain,
+            // Task 83-b — REQUIRED location block (the server 400s without
+            // lat+lng); the guarded submit above guarantees both are set.
+            latitude: branchLatitude,
+            longitude: branchLongitude,
+            wilaya: branchWilayaCode || undefined,
+            city: branchCity.trim() || undefined,
+            postalCode: branchPostalCode.trim() || undefined,
+            locationSource: branchLocationSource ?? 'MANUAL',
+            locationVerified: branchLocationSource === 'DEVICE_GPS' ? 'VERIFIED' : 'UNVERIFIED',
           }),
         });
         if (res.ok) {
@@ -684,6 +853,67 @@ export function AgencyBranches() {
     } finally {
       setAssigningCounterId(null);
     }
+  };
+
+  // ─── Task 83-b — per-branch QR (client-side SVG, offline-safe) ───────────
+
+  // Regenerate whenever a branch is opened in the QR dialog. Encodes the
+  // SAME deep-link shape the agency QR uses — <origin>/?branch=<subCode>
+  // (the agency-wide QR encodes ?code=<customCode>; the branch param lets
+  // the customer side open that specific branch, Task 83-c).
+  useEffect(() => {
+    if (!qrBranch) {
+      setQrSvg(null);
+      return;
+    }
+    let cancelled = false;
+    setQrLoading(true);
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'https://blasti.dz';
+    const payload = qrBranch.subCode
+      ? `${origin}/?branch=${encodeURIComponent(qrBranch.subCode)}`
+      : 'https://blasti.dz';
+    QRCode.toString(payload, {
+      type: 'svg',
+      width: 256,
+      margin: 2,
+      color: { dark: '#047857', light: '#ffffff' },
+      errorCorrectionLevel: 'M',
+    })
+      .then((svg) => { if (!cancelled) setQrSvg(svg); })
+      .catch(() => { if (!cancelled) setQrSvg(null); })
+      .finally(() => { if (!cancelled) setQrLoading(false); });
+    return () => { cancelled = true; };
+  }, [qrBranch]);
+
+  const handleCopySubCode = async (subCode: string) => {
+    try {
+      await navigator.clipboard.writeText(subCode);
+      toast.success(t('branchSubCodeCopied'));
+    } catch {
+      // Fallback (non-secure contexts / older webviews) — agency-profile pattern
+      const textArea = document.createElement('textarea');
+      textArea.value = subCode;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+      toast.success(t('branchSubCodeCopied'));
+    }
+  };
+
+  const handleDownloadBranchQr = () => {
+    if (!qrSvg || !qrBranch) return;
+    // image/svg+xml Blob download — the vector stays crisp on printed signage.
+    const blob = new Blob([qrSvg], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `blasti-branch-${qrBranch.subCode || qrBranch.id}.svg`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast.success(t('downloaded'));
   };
 
   // Get localized name
@@ -953,7 +1183,18 @@ export function AgencyBranches() {
                       </div>
                       <div className="min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <p className="text-sm font-semibold text-foreground truncate">{getBranchDisplayName(branch)}</p>
+                          {/* Task 83-b — specialName is the display title when present */}
+                          <p className="text-sm font-semibold text-foreground truncate">
+                            {branch.specialName?.trim() || getBranchDisplayName(branch)}
+                          </p>
+                          {branch.subCode && (
+                            <span
+                              className="font-mono text-[10px] px-1.5 py-0.5 rounded-md bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-400 border border-teal-200/70 dark:border-teal-800/60 flex-shrink-0"
+                              dir="ltr"
+                            >
+                              {branch.subCode}
+                            </span>
+                          )}
                           {branch.isMain && (
                             <Badge className="bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 border-0 text-[10px] px-1.5 py-0.5 gap-0.5">
                               <Star className="h-3 w-3" />
@@ -1028,6 +1269,19 @@ export function AgencyBranches() {
                               <Trash2 className="h-3.5 w-3.5" />
                               {t('deleteBranch')}
                             </Button>
+                            {/* Task 83-b — per-branch QR (hidden until a subCode
+                                exists — nothing meaningful to encode before that) */}
+                            {branch.subCode && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-8 w-8 p-0 rounded-lg"
+                                onClick={(e) => { e.stopPropagation(); setQrBranch(branch); }}
+                                aria-label={t('branchQrTitle')}
+                              >
+                                <QrCode className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                              </Button>
+                            )}
                             {!branch.isMain && branch.isActive && (
                               <Button
                                 size="sm"
@@ -1235,7 +1489,9 @@ export function AgencyBranches() {
 
       {/* Create/Edit Branch Dialog */}
       <Dialog open={branchDialogOpen} onOpenChange={setBranchDialogOpen}>
-        <DialogContent className="sm:max-w-md">
+        {/* Task 83-b — the dialog now carries the location block; make it
+            scrollable and slightly wider (same pattern as history sheets). */}
+        <DialogContent className="sm:max-w-md max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Building2 className="h-5 w-5 text-emerald-500" />
@@ -1275,14 +1531,93 @@ export function AgencyBranches() {
                 dir="ltr"
               />
             </div>
+            {/* Task 83-b — optional customer-facing display name ("Downtown
+                Branch", "Mall Kiosk"…). Distinct from the internal name. */}
             <div className="space-y-2">
-              <Label>{t('branchAddress')}</Label>
+              <Label className="flex items-center gap-1.5">
+                {t('branchSpecialName')}
+                <span className="text-xs text-muted-foreground">({t('optional')})</span>
+              </Label>
               <Input
-                value={branchAddress}
-                onChange={(e) => setBranchAddress(e.target.value)}
-                placeholder={t('branchAddress')}
+                value={branchSpecialName}
+                onChange={(e) => setBranchSpecialName(e.target.value)}
                 className="h-11"
               />
+              <p className="text-xs text-muted-foreground">{t('branchSpecialNameDesc')}</p>
+            </div>
+            {/* Task 83-b — REQUIRED location block (backend 83-a): map picker
+                + address fields beneath it. Creation 400s without lat+lng;
+                edit sends the pair only when either changed. */}
+            <div className="space-y-3 rounded-xl border border-gray-100 dark:border-gray-800 bg-muted/50 p-3">
+              <Label className="text-sm font-medium flex items-center gap-1.5">
+                <MapPin className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                {t('branchLocation')}
+              </Label>
+              <p className="text-xs text-muted-foreground">{t('branchLocationDesc')}</p>
+              <MapLocationPicker
+                value={{ latitude: branchLatitude, longitude: branchLongitude }}
+                onChange={handleBranchPickerChange}
+                onLocationSource={handleBranchLocationSource}
+                addressFields={{ onDetected: handleBranchDetectedAddress }}
+                height={260}
+              />
+              {!editingBranch && (branchLatitude === null || branchLongitude === null) && (
+                <p className="text-xs flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
+                  <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+                  {t('branchLocationRequired')}
+                </p>
+              )}
+              <div className="space-y-2">
+                <Label>{t('location.streetAddress')}</Label>
+                <Input
+                  value={branchAddress}
+                  onChange={(e) => setBranchAddress(e.target.value)}
+                  placeholder={t('branchAddress')}
+                  className="h-11"
+                />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label>{t('location.wilaya')}</Label>
+                  <WilayaSelect
+                    value={branchWilayaCode}
+                    onValueChange={(code) => {
+                      if (code === branchWilayaCode) return;
+                      setBranchWilayaCode(code);
+                      // Dependent list — the commune must belong to the
+                      // newly selected wilaya, so reset it.
+                      setBranchCity('');
+                    }}
+                    lang={lang}
+                    placeholder={t('location.selectWilaya')}
+                    aria-label={t('location.wilaya')}
+                    triggerClassName="h-11 rounded-xl border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 data-[state=open]:border-emerald-400 focus-visible:border-emerald-400 focus-visible:ring-emerald-500/20"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>{t('location.commune')}</Label>
+                  <CommuneSelect
+                    wilayaCode={branchWilayaCode}
+                    value={branchCity}
+                    onValueChange={setBranchCity}
+                    lang={lang}
+                    placeholder={t('location.selectCommune')}
+                    aria-label={t('location.commune')}
+                    triggerClassName="h-11 rounded-xl border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 data-[state=open]:border-emerald-400 focus-visible:border-emerald-400 focus-visible:ring-emerald-500/20"
+                  />
+                </div>
+              </div>
+              <div className="space-y-2">
+                <Label>{t('maps.postalCode')}</Label>
+                <Input
+                  value={branchPostalCode}
+                  onChange={(e) => setBranchPostalCode(e.target.value)}
+                  className="h-11"
+                  dir="ltr"
+                  maxLength={10}
+                  placeholder="28019"
+                />
+              </div>
             </div>
             <div className="space-y-2">
               <Label>{t('branchPhone')}</Label>
@@ -1313,10 +1648,83 @@ export function AgencyBranches() {
             <Button
               className="bg-emerald-600 hover:bg-emerald-700 text-white"
               onClick={handleSaveBranch}
-              disabled={branchSaving || !branchName.trim() || (!editingBranch && !subscriptionActive)}
+              disabled={
+                branchSaving ||
+                !branchName.trim() ||
+                // Task 83-b — location is REQUIRED at creation; block until
+                // the pin is placed (inline hint explains it).
+                (!editingBranch && (branchLatitude === null || branchLongitude === null)) ||
+                (!editingBranch && !subscriptionActive)
+              }
             >
               {branchSaving ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : null}
               {t('save')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Task 83-b — Branch QR dialog: client-side SVG QR encoding the branch
+          deep-link (?branch=<subCode>), subCode display + copy + SVG
+          download. Rendered only for branches that already carry a subCode
+          (the QR button is hidden otherwise). */}
+      <Dialog open={!!qrBranch} onOpenChange={(open) => { if (!open) setQrBranch(null); }}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <QrCode className="h-5 w-5 text-emerald-500" />
+              {t('branchQrTitle')}
+              {qrBranch?.specialName?.trim() ? (
+                <span className="text-sm font-normal text-muted-foreground truncate">
+                  — {qrBranch.specialName}
+                </span>
+              ) : null}
+            </DialogTitle>
+            <DialogDescription className="sr-only">{t('branchQrDesc')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <p className="text-xs text-muted-foreground">{t('branchQrDesc')}</p>
+            {qrLoading ? (
+              <div className="flex items-center justify-center py-8">
+                <Loader2 className="h-8 w-8 animate-spin text-emerald-600" />
+              </div>
+            ) : qrSvg ? (
+              <div className="flex justify-center">
+                {/* QRCode.toString('svg') output is trusted, locally generated
+                    markup — rendered into a white rounded box for scannability. */}
+                <div
+                  className="w-fit rounded-2xl bg-white p-3 border border-gray-100 dark:border-gray-800 shadow-sm"
+                  dangerouslySetInnerHTML={{ __html: qrSvg }}
+                />
+              </div>
+            ) : null}
+            {qrBranch?.subCode && (
+              <div className="flex items-center justify-between gap-3 p-3 rounded-xl bg-muted/50 dark:bg-gray-800/50">
+                <div className="min-w-0">
+                  <p className="text-[10px] text-muted-foreground">{t('branchSubCode')}</p>
+                  <p className="text-sm font-mono font-bold text-emerald-700 dark:text-emerald-400 truncate" dir="ltr">
+                    {qrBranch.subCode}
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-9 rounded-lg text-xs gap-1.5 flex-shrink-0"
+                  onClick={() => handleCopySubCode(qrBranch.subCode!)}
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                  {t('copy')}
+                </Button>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={handleDownloadBranchQr} disabled={!qrSvg}>
+              <Download className="h-4 w-4 me-1.5" />
+              {t('downloadQr')}
+            </Button>
+            <Button variant="outline" onClick={() => setQrBranch(null)}>
+              {t('cancel')}
             </Button>
           </DialogFooter>
         </DialogContent>

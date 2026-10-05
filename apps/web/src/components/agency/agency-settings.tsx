@@ -56,6 +56,10 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { BiometricSettingsCard } from '@/components/shared/biometric-settings';
+// Task 83-b — agency location editor (map picker + Algeria address selectors).
+import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
+import { WilayaSelect, CommuneSelect } from '@/components/shared/algeria-location-selects';
+import { findWilayaByCode } from '@/lib/algeria-locations';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -115,6 +119,8 @@ interface SettingsSection {
 
 const SECTIONS: SettingsSection[] = [
   { id: 'general', icon: Info, titleKey: 'settings' },
+  // Task 83-b — agency-level canonical location (map picker + address).
+  { id: 'location', icon: MapPin, titleKey: 'locationSettings' },
   { id: 'hours', icon: Clock, titleKey: 'workingHours' },
   { id: 'services', icon: Settings, titleKey: 'manageServices' },
   { id: 'capacity', icon: Gauge, titleKey: 'queueCapacity' },
@@ -136,6 +142,7 @@ export function AgencySettings() {
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     general: true,
+    location: true,
     hours: true,
     services: true,
     capacity: true,
@@ -191,11 +198,30 @@ export function AgencySettings() {
   const [svcNameFr, setSvcNameFr] = useState('');
   const [svcPrefix, setSvcPrefix] = useState('');
 
+  // ─── Task 83-b — Location section state (agency-level canonical location).
+  // GET /api/agency/settings carries NO location fields, so the section loads
+  // the Agency row values from GET /api/agency/profile (address/city/wilaya/
+  // postalCode/latitude/longitude per Task 51) and PATCHes them back there.
+  const [locAddress, setLocAddress] = useState('');
+  const [locWilaya, setLocWilaya] = useState('');
+  const [locCommune, setLocCommune] = useState('');
+  const [locPostalCode, setLocPostalCode] = useState('');
+  const [locLatitude, setLocLatitude] = useState<number | null>(null);
+  const [locLongitude, setLocLongitude] = useState<number | null>(null);
+  // Fresh-pick marker this session (drives the provenance pair on save).
+  const [locSource, setLocSource] = useState<'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS' | null>(null);
+  // Snapshot of the server's lat/lng at load time — the pair goes out only
+  // when either changed (never re-stamp locationUpdatedAt for a no-op save;
+  // null snapshot = profile never loaded → save must not clear anything).
+  const [locOriginal, setLocOriginal] = useState<{ latitude: number | null; longitude: number | null } | null>(null);
+  const [locSaving, setLocSaving] = useState(false);
+
   useEffect(() => {
     fetchSettings();
     fetchStaff();
     fetchBranches();
     fetchPlanCap();
+    fetchProfileLocation();
   }, []);
 
   // Task 37: no early return when the session user lacks agencyId — the APIs
@@ -260,6 +286,97 @@ export function AgencySettings() {
       }
     } catch {
       // silent — no cap info, the input stays unclamped (server still gates)
+    }
+  };
+
+  // Task 83-b — load the agency's canonical location for the Location
+  // section. Same ?agencyId param convention as the other fetches; the
+  // payload is the Agency row (address/city/wilaya/postalCode/lat/lng).
+  const fetchProfileLocation = async () => {
+    try {
+      const params = user?.agencyId ? `?agencyId=${encodeURIComponent(user.agencyId)}` : '';
+      const res = await apiFetch(`/api/agency/profile${params}`);
+      if (res.ok) {
+        const data = await res.json();
+        const p = (data && typeof data === 'object' ? data : {}) as {
+          address?: string | null;
+          city?: string | null;
+          wilaya?: string | null;
+          postalCode?: string | null;
+          latitude?: number | null;
+          longitude?: number | null;
+        };
+        setLocAddress(p.address ?? '');
+        setLocWilaya(p.wilaya ?? '');
+        setLocPostalCode(p.postalCode ?? '');
+        // The stored city counts as selected only when it belongs to the
+        // stored wilaya's commune list (agency-profile convention) — a
+        // legacy/mismatched city leaves the commune unselected.
+        const wilaya = p.wilaya ? findWilayaByCode(p.wilaya) : undefined;
+        const city =
+          typeof p.city === 'string' &&
+          !!wilaya?.communes.some((c) => c.name.toLowerCase() === p.city!.toLowerCase())
+            ? p.city
+            : '';
+        setLocCommune(city);
+        const lat = typeof p.latitude === 'number' ? p.latitude : null;
+        const lng = typeof p.longitude === 'number' ? p.longitude : null;
+        setLocLatitude(lat);
+        setLocLongitude(lng);
+        setLocOriginal({ latitude: lat, longitude: lng });
+        setLocSource(null);
+      }
+    } catch {
+      // silent — the section renders empty; locOriginal stays null so a
+      // save can never clear values it never saw.
+    }
+  };
+
+  // Task 83-b — save the agency location. lat/lng go out TOGETHER only when
+  // either changed (server pair rule + locationUpdatedAt stamping); the
+  // provenance pair rides along only on a fresh pick. wilaya/city are sent
+  // as a coherent PAIR only (a lone/empty value is omitted — the server
+  // keeps the stored one, matching the agency-profile save contract).
+  const handleSaveLocation = async () => {
+    setLocSaving(true);
+    try {
+      const payload: Record<string, unknown> = {};
+      if (locOriginal) {
+        // Only touch textual fields when the profile actually loaded —
+        // a save against a failed load must never null-out stored values.
+        payload.address = locAddress.trim() || null;
+        payload.postalCode = locPostalCode.trim() || null;
+        if (locWilaya && locCommune) {
+          payload.wilaya = locWilaya;
+          payload.city = locCommune;
+        }
+      }
+      if (user?.agencyId) payload.agencyId = user.agencyId;
+      const latChanged = (locLatitude ?? null) !== (locOriginal?.latitude ?? null);
+      const lngChanged = (locLongitude ?? null) !== (locOriginal?.longitude ?? null);
+      if (locOriginal && (latChanged || lngChanged)) {
+        payload.latitude = locLatitude ?? null;
+        payload.longitude = locLongitude ?? null;
+        payload.locationSource = locSource ?? 'MANUAL';
+        payload.locationVerified = locSource === 'DEVICE_GPS' ? 'VERIFIED' : 'UNVERIFIED';
+      }
+      const res = await apiFetch('/api/agency/profile', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        toast.success(t('locationSaved'));
+        // Re-sync with the server truth (also refreshes the lat/lng snapshot).
+        fetchProfileLocation();
+      } else {
+        const data = await res.json().catch(() => null);
+        toast.error((data && data.error) || t('locationSaveFailed'));
+      }
+    } catch {
+      toast.error(t('locationSaveFailed'));
+    } finally {
+      setLocSaving(false);
     }
   };
 
@@ -687,6 +804,86 @@ export function AgencySettings() {
                             label={t('kioskModeEnabled')}
                             description={t('kioskModeDesc')}
                           />
+                        </div>
+                      )}
+
+                      {/* Task 83-b — Location Section: the agency-level
+                          canonical location (map picker + Algeria address
+                          fields), loaded from GET /api/agency/profile and
+                          saved via PATCH /api/agency/profile. */}
+                      {section.id === 'location' && (
+                        <div className="space-y-4">
+                          <p className="text-xs text-muted-foreground -mt-1 mb-2">{t('locationSettingsDesc')}</p>
+                          <MapLocationPicker
+                            value={{ latitude: locLatitude, longitude: locLongitude }}
+                            onChange={(lat, lng) => {
+                              setLocLatitude(lat);
+                              setLocLongitude(lng);
+                            }}
+                            onLocationSource={(source) => setLocSource(source)}
+                            height={260}
+                          />
+                          <div className="space-y-2">
+                            <Label className="text-sm flex items-center gap-2">
+                              <MapPin className="h-4 w-4 text-muted-foreground" />
+                              {t('location.streetAddress')}
+                            </Label>
+                            <Input
+                              value={locAddress}
+                              onChange={(e) => setLocAddress(e.target.value)}
+                              className="h-11"
+                            />
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div className="space-y-2">
+                              <Label className="text-sm">{t('location.wilaya')}</Label>
+                              <WilayaSelect
+                                value={locWilaya}
+                                onValueChange={(code) => {
+                                  if (code === locWilaya) return;
+                                  setLocWilaya(code);
+                                  // Dependent list — the commune must belong
+                                  // to the newly selected wilaya.
+                                  setLocCommune('');
+                                }}
+                                lang={lang}
+                                placeholder={t('location.selectWilaya')}
+                                aria-label={t('location.wilaya')}
+                                triggerClassName="h-11 rounded-xl border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 data-[state=open]:border-emerald-400 focus-visible:border-emerald-400 focus-visible:ring-emerald-500/20"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label className="text-sm">{t('location.commune')}</Label>
+                              <CommuneSelect
+                                wilayaCode={locWilaya}
+                                value={locCommune}
+                                onValueChange={setLocCommune}
+                                lang={lang}
+                                placeholder={t('location.selectCommune')}
+                                aria-label={t('location.commune')}
+                                triggerClassName="h-11 rounded-xl border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 data-[state=open]:border-emerald-400 focus-visible:border-emerald-400 focus-visible:ring-emerald-500/20"
+                              />
+                            </div>
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-sm">{t('maps.postalCode')}</Label>
+                            <Input
+                              value={locPostalCode}
+                              onChange={(e) => setLocPostalCode(e.target.value)}
+                              className="h-11 w-40"
+                              dir="ltr"
+                              maxLength={10}
+                              placeholder="28019"
+                            />
+                          </div>
+                          <Button
+                            className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl h-10 gap-2"
+                            onClick={handleSaveLocation}
+                            disabled={locSaving}
+                          >
+                            {locSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                            {t('saveLocation')}
+                          </Button>
                         </div>
                       )}
 

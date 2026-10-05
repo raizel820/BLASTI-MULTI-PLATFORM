@@ -10,6 +10,9 @@
  *   label = config.directions.buttonLabel (Super-Admin override, spec §24)
  *   falling back to `maps.getDirections`; hidden when the agency has no
  *   coordinates or config.directionsEnabled is false (spec §26).
+ *   `alwaysAllowDirections` (Task 82) bypasses ONLY the config gate — the
+ *   centralized Google Maps URL builder is still the single source — so
+ *   customer-facing surfaces always offer directions to the agency location.
  * - Clicking the button opens the ONE centralized directions URL
  *   (`openDirections` in lib/map/directions.ts — spec §25).
  * - Offline / failed provider → friendly box, coordinates untouched
@@ -27,6 +30,7 @@ import {
   buildDirectionsUrl,
   MARKER_ZOOM,
   openDirections,
+  type DirectionsSettings,
   type MapProviderInstance,
 } from '@/lib/map';
 import { useMapConfig } from '@/lib/map/use-map-config';
@@ -44,6 +48,9 @@ export interface AgencyLocationMapProps {
   agency: AgencyLocationMapAgency;
   /** Render the Get Directions button (still gated by config.directionsEnabled). */
   showDirections?: boolean;
+  /** Task 82 — show directions even when config.directionsEnabled is false
+   *  (customer-facing agency profile). URL building stays centralized. */
+  alwaysAllowDirections?: boolean;
   /** Map height in px (default 220). */
   height?: number;
 }
@@ -51,11 +58,21 @@ export interface AgencyLocationMapProps {
 export function AgencyLocationMap({
   agency,
   showDirections = false,
+  alwaysAllowDirections = false,
   height = 220,
 }: AgencyLocationMapProps) {
   const { t } = useLanguage();
   const online = useOnlineStatus();
   const { config, loading: configLoading } = useMapConfig();
+
+  // Task 82 — settings fallback used when the maps config never loaded:
+  // plain coordinates destination, current-location origin.
+  const fallbackDirectionsSettings: DirectionsSettings = {
+    destinationMode: 'COORDINATES',
+    origin: 'CURRENT_LOCATION',
+    openBehavior: 'AUTO',
+    buttonLabel: null,
+  };
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const providerRef = useRef<MapProviderInstance | null>(null);
@@ -128,13 +145,18 @@ export function AgencyLocationMap({
 
   // Directions visibility: coords + feature flag + provider config present
   // (spec §26 — hidden when no coordinates or directionsEnabled is false).
+  // Task 82: customer-facing surfaces can pass alwaysAllowDirections to keep
+  // the button regardless of the super-admin config.
   const directionsVisible =
-    showDirections && hasCoords && config != null && config.directionsEnabled;
+    showDirections && hasCoords &&
+    (alwaysAllowDirections || (config != null && config.directionsEnabled));
   const directionsLabel = config?.directions?.buttonLabel || t('maps.getDirections');
 
   const handleDirections = () => {
-    if (!config) return;
-    const ok = openDirections(lat, lng, addressText, config.directions);
+    // The URL builder needs the configured destination mode; when the config
+    // never loaded we still build a plain coordinates URL (never block the
+    // customer from reaching the agency).
+    const ok = openDirections(lat, lng, addressText, config?.directions ?? fallbackDirectionsSettings);
     if (!ok) navigateFallback();
   };
 
@@ -142,21 +164,24 @@ export function AgencyLocationMap({
   // The URL comes from the SAME centralized builder (spec §25 — never build
   // Google Maps URLs independently in UI components).
   const navigateFallback = () => {
-    if (typeof window === 'undefined' || !config) return;
-    const url = buildDirectionsUrl(lat, lng, addressText, config.directions);
+    if (typeof window === 'undefined') return;
+    const url = buildDirectionsUrl(lat, lng, addressText, config?.directions ?? fallbackDirectionsSettings);
     if (url) window.location.href = url;
   };
 
   if (!hasCoords) return null; // nothing to show — address block carries the info
-  // Maps deliberately disabled by the Super Admin → no map surface at all.
-  if (config && !config.mapsEnabled) return null;
+  // Maps deliberately disabled by the Super Admin → no map surface at all,
+  // EXCEPT when the caller keeps directions open (Task 82 customer profile):
+  // then the friendly-unavailable box renders with the directions button.
+  if (config && !config.mapsEnabled && !alwaysAllowDirections) return null;
 
-  // Offline/loading-failed → friendly box (spec §40). Coordinates stay in
+  // Offline/loading-failed/provider-dead → friendly box (spec §40). Coordinates stay in
   // the payload; the directions URL keeps working through the browser.
   const unavailable =
     mapState === 'failed' ||
     (!online && mapState === 'loading') ||
-    (!config && !configLoading);
+    (!config && !configLoading) ||
+    (config != null && !config.mapsEnabled);
   if (unavailable) {
     return (
       <div className="space-y-2" data-testid="agency-location-map">

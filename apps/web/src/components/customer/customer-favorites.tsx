@@ -38,6 +38,7 @@ import {
   MapPin,
   TicketCheck,
   ChevronRight,
+  Info,
   Loader2,
   Star,
   CalendarDays,
@@ -422,11 +423,18 @@ export function CustomerFavorites() {
                         </p>
                       )}
 
-                      {/* Join action pinned to bottom */}
-                      <div className="mt-auto pt-1">
+                      {/* Join action pinned to bottom + Task 81-b profile entry */}
+                      <div className="mt-auto pt-1 flex items-center gap-1.5">
+                        <button
+                          onClick={() => { useAppStore.getState().setAgencyProfileId(fav.agencyId); setView('customer-agency-profile'); }}
+                          aria-label={t('viewProfile')}
+                          className="h-9 w-9 rounded-xl border border-border flex items-center justify-center hover:bg-emerald-50 dark:hover:bg-emerald-900/20 transition-colors shrink-0"
+                        >
+                          <Info className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                        </button>
                         <Button
                           size="sm"
-                          className="w-full h-9 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs"
+                          className="flex-1 h-9 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs"
                           onClick={() => handleJoinQueue(fav.agencyId)}
                           disabled={!fav.isQueueOpen}
                         >

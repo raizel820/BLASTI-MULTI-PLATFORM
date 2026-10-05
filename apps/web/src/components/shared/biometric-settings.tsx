@@ -5,12 +5,17 @@
  * One card, dropped into every settings surface (customer / agency / admin),
  * that manages biometric quick-unlock FOR THIS DEVICE:
  *
- *  • Visibility: rendered on every device. The availability probe
+ *  • Visibility: rendered ONLY on devices with active biometric support
+ *    (phones/tablets with fingerprint/face sensors via the Capacitor
+ *    keystore bridge). The availability probe
  *    (nativeBridge.isBiometricsAvailable → @capgo/capacitor-native-biometric
- *    on Capacitor) decides whether the toggle is functional:
+ *    on Capacitor) decides:
  *      - Capacitor phone/tablet with enrolled biometrics → fully functional.
- *      - Web browser / Electron desktop → honest "not available on this
- *        device" state (no secure-enclave bridge), toggle disabled.
+ *      - Web browser / Electron desktop / phones without enrolled sensors →
+ *        the whole card is HIDDEN (user requirement: biometric settings must
+ *        only appear on devices that can actually use them). The card stays
+ *        visible in the rare case biometrics vanished while a credential is
+ *        still enrolled, so the user can switch it off.
  *  • Enable flow: fingerprint prompt → password confirm dialog → credentials
  *    verified against POST /api/auth/login (no expectedRole — this is the
  *    ALREADY-logged-in user re-proving identity) → secret stored in the
@@ -47,6 +52,7 @@ import {
   Info,
   Eye,
   EyeOff,
+  Smartphone,
 } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -55,7 +61,9 @@ export function BiometricSettingsCard() {
   const user = useAppStore((s) => s.user);
   const biometricLoginEnabled = useAppStore((s) => s.biometricLoginEnabled);
   const biometricUsername = useAppStore((s) => s.biometricUsername);
+  const biometricOnAppOpen = useAppStore((s) => s.biometricOnAppOpen);
   const setBiometricLogin = useAppStore((s) => s.setBiometricLogin);
+  const setBiometricOnAppOpen = useAppStore((s) => s.setBiometricOnAppOpen);
 
   const [probing, setProbing] = useState(true);
   const [available, setAvailable] = useState(false);
@@ -180,6 +188,11 @@ export function BiometricSettingsCard() {
 
   const functional = available && !probing;
 
+  // Hide entirely on devices without active biometric support — unless a
+  // credential is still enrolled (probe regressed), in which case the user
+  // needs the card to be able to turn it off.
+  if (!probing && !available && !biometricLoginEnabled) return null;
+
   return (
     <div
       className="rounded-2xl border border-border bg-white dark:bg-gray-900/80 p-4"
@@ -236,6 +249,46 @@ export function BiometricSettingsCard() {
           disabled={!functional || verifying || disabling}
           onCheckedChange={handleEnabledToggle}
           aria-label={t('biometricLogin')}
+        />
+      </div>
+
+      {/* Task 81 — ask for biometrics on EVERY app open while the account is
+          active (lock screen on launch / return from background). Depends on
+          the enrolled credential above, hence disabled until it is on. */}
+      <div
+        className="mt-3 pt-3 border-t border-border flex items-start gap-3"
+        data-testid="biometric-app-open-row"
+      >
+        <div
+          className={`h-10 w-10 rounded-xl flex items-center justify-center flex-shrink-0 ${
+            functional && biometricLoginEnabled
+              ? 'bg-emerald-50 dark:bg-emerald-900/20'
+              : 'bg-muted'
+          }`}
+        >
+          <Smartphone
+            className={`h-5 w-5 ${
+              functional && biometricLoginEnabled
+                ? 'text-emerald-600 dark:text-emerald-400'
+                : 'text-muted-foreground'
+            }`}
+          />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-foreground">{t('biometricEveryOpen')}</p>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            {!functional
+              ? t('biometricUnavailableDesc')
+              : !biometricLoginEnabled
+                ? t('biometricEveryOpenNeedsEnable')
+                : t('biometricEveryOpenDesc')}
+          </p>
+        </div>
+        <Switch
+          checked={functional && biometricLoginEnabled && biometricOnAppOpen}
+          disabled={!functional || !biometricLoginEnabled || verifying || disabling}
+          onCheckedChange={(checked) => setBiometricOnAppOpen(checked)}
+          aria-label={t('biometricEveryOpen')}
         />
       </div>
 

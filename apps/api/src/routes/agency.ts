@@ -730,6 +730,49 @@ app.post('/branches', async (c) => {
       return c.json({ success: false, error: error.error, details: error.details }, 400)
     }
 
+    // Task 83 — a branch MUST carry its location at creation (lat/lng pair
+    // already type-checked by the schema; both fields are required numbers
+    // there, so their presence here is guaranteed — this guard is for the
+    // range/pair semantics the schema cannot express across two fields).
+    if (
+      typeof data.latitude !== 'number' || typeof data.longitude !== 'number' ||
+      Number.isNaN(data.latitude) || Number.isNaN(data.longitude)
+    ) {
+      return c.json({ success: false, error: 'Branch location (latitude & longitude) is required — pin it on the map' }, 400)
+    }
+
+    // Task 83 — sub-code generation: agency "ABC" → main branch "ABC-M1",
+    // ordinary branches "ABC-B1", "ABC-B2", … Globally unique column; the
+    // agency customCode is itself globally unique so collisions can only
+    // come from a suffix race — probed with the same loop pattern the
+    // agency-code derivation uses.
+    const parentAgency = await db.agency.findUnique({
+      where: { id: agencyId },
+      select: { customCode: true },
+    })
+    if (!parentAgency) {
+      return c.json({ success: false, error: 'Agency not found' }, 404)
+    }
+    const baseSubCode = data.isMain
+      ? `${parentAgency.customCode}-M1`
+      : `${parentAgency.customCode}-B`
+    let subCode: string = data.isMain ? baseSubCode : `${baseSubCode}1`
+    if (!data.isMain) {
+      for (let attempt = 2; attempt <= 60; attempt++) {
+        const taken = await db.branch.findUnique({ where: { subCode }, select: { id: true } })
+        if (!taken) break
+        subCode = `${baseSubCode}${attempt}`
+      }
+    } else {
+      // Defensive: two agencies cannot collide (customCode is unique), but a
+      // re-run/replay of the same create could — suffix instead of failing.
+      for (let attempt = 2; attempt <= 60; attempt++) {
+        const taken = await db.branch.findUnique({ where: { subCode }, select: { id: true } })
+        if (!taken) break
+        subCode = `${parentAgency.customCode}-M${attempt}`
+      }
+    }
+
     // If this branch is set as main, unset other main branches
     if (data.isMain) {
       await db.branch.updateMany({
@@ -743,9 +786,19 @@ app.post('/branches', async (c) => {
         name: data.name,
         nameAr: data.nameAr || null,
         nameFr: data.nameFr || null,
+        specialName: data.specialName?.trim() || null,
+        subCode,
         address: data.address || null,
         phone: data.phone || null,
         isMain: data.isMain,
+        latitude: data.latitude,
+        longitude: data.longitude,
+        city: data.city?.trim() || null,
+        wilaya: data.wilaya?.trim() || null,
+        postalCode: data.postalCode?.trim() || null,
+        locationVerified: data.locationVerified || 'UNVERIFIED',
+        locationSource: data.locationSource || null,
+        locationUpdatedAt: new Date(),
         agencyId,
       },
     })
@@ -829,7 +882,18 @@ async function handleBranchUpdate(c: Context) {
       return c.json({ success: false, error: error.error, details: error.details }, 400)
     }
 
-    // If setting as main, unset other main branches
+    // Task 83 — location pair rule on update: lat/lng arrive together or
+    // both null (explicit clear). A one-sided update is a client bug → 400.
+    const latProvided = data.latitude !== undefined
+    const lngProvided = data.longitude !== undefined
+    if (latProvided !== lngProvided) {
+      return c.json({
+        success: false,
+        error: 'latitude and longitude must be provided together (or both null to clear the location)',
+      }, 400)
+    }
+
+    // If this branch is set as main, unset other main branches
     if (data.isMain) {
       await db.branch.updateMany({
         where: { agencyId: branch.agencyId, isMain: true },
@@ -837,9 +901,15 @@ async function handleBranchUpdate(c: Context) {
       })
     }
 
+    // Task 83 — any location change stamps locationUpdatedAt.
+    const branchUpdateData: Record<string, unknown> = { ...data }
+    if (latProvided) {
+      branchUpdateData.locationUpdatedAt = new Date()
+    }
+
     const updated = await db.branch.update({
       where: { id },
-      data,
+      data: branchUpdateData,
     })
 
     // Task 44: explicit SyncChange capture (see POST /branches note).
@@ -2653,9 +2723,30 @@ app.get('/qr-code', async (c) => {
       )
     }
 
-    // Encode as a URL so phone scanners can open it as a clickable link
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz'
-    const qrData = `${baseUrl}/?code=${code}`
+    // Task 83 — optional per-branch QR: ?code=<agencyCode>&branchId=<id>
+    // encodes the branch deep link (?branch=<subCode>) so every branch has
+    // its own scannable code. Ownership is enforced: the branch must belong
+    // to the agency whose code is being encoded.
+    let qrData: string
+    const branchId = c.req.query('branchId')
+    if (branchId) {
+      const branch = await db.branch.findUnique({
+        where: { id: branchId },
+        select: { subCode: true, agency: { select: { customCode: true } } },
+      })
+      if (!branch || !branch.subCode || branch.agency.customCode !== code) {
+        return c.json(
+          { success: false, error: 'Branch not found for this agency code' },
+          404
+        )
+      }
+      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz'
+      qrData = `${baseUrl}/?branch=${branch.subCode}`
+    } else {
+      // Encode as a URL so phone scanners can open it as a clickable link
+      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz'
+      qrData = `${baseUrl}/?code=${code}`
+    }
 
     const svgString = await QRCode.toString(qrData, {
       type: 'svg',
@@ -3558,9 +3649,12 @@ app.post('/reviews', async (c) => {
     // Verify agency access for this review
     await requireAgencyAccess(c, agencyId)
 
-    // Check if user already reviewed this agency
-    const existing = await db.review.findUnique({
-      where: { userId_agencyId: { userId, agencyId } },
+    // Check if user already reviewed this agency (Task 83: the compound
+    // unique is now [userId, agencyId, branchId] — this legacy flow writes
+    // the AGENCY-WIDE review, i.e. branchId = null; findFirst because
+    // Prisma findUnique cannot filter a null component of a compound key).
+    const existing = await db.review.findFirst({
+      where: { userId, agencyId, branchId: null },
     })
 
     let review

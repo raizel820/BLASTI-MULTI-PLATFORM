@@ -1170,8 +1170,16 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                         // code, so a valid 01-58 prefix (once the user has typed at
                         // least two characters) selects that wilaya and resets the
                         // dependent commune list, keeping the pair coherent.
+                        // Task 83-b — reverse cascade hardening: extract ALL digits
+                        // from the input FIRST (not just the first two characters),
+                        // so a pasted "A28 019" or any non-digit-prefixed value still
+                        // derives 28. Fires only when the derived code is a real
+                        // 01-58 code AND different from the current selection — a
+                        // wilaya the user picked after the zip was set is never
+                        // wiped (a matching prefix is a no-op).
                         if (v.trim().length >= 2) {
-                          const prefix = normalizeWilayaInput(v.slice(0, 2));
+                          const digits = v.replace(/\D/g, '');
+                          const prefix = normalizeWilayaInput(digits.slice(0, 2));
                           if (WILAYA_CODE_REGEX.test(prefix) && prefix !== wilayaCode) {
                             setWilayaCode(prefix);
                             setCommuneName('');

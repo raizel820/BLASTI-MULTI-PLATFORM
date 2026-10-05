@@ -1,10 +1,24 @@
 // Notification sound utilities
 
+import {
+  getNotificationSoundEngineState,
+  initNotificationSoundEngine,
+} from '@/lib/notification-sound-settings';
+
+// Task 82 — load persisted volume + custom notification song into the engine
+// (fire-and-forget; alerts fall back to the built-in chime until it lands).
+if (typeof window !== 'undefined') {
+  void initNotificationSoundEngine();
+}
+
 let audioContext: AudioContext | null = null;
 let isPlaying = false;
 let loopInterval: ReturnType<typeof setInterval> | null = null;
 let currentReservationId: string | null = null;
 let autoStopTimeout: ReturnType<typeof setTimeout> | null = null;
+
+/** Task 82 — transient volume override used only by previewDefaultChime(). */
+let overrideVolume: number | null = null;
 
 // Track which reservations have already triggered the sound
 // so we don't re-trigger when the component remounts
@@ -18,6 +32,28 @@ function getAudioContext(): AudioContext {
 }
 
 /**
+ * Play the customer-selected custom notification audio (Task 82), if one is
+ * active. Returns true when playback was started.
+ */
+function playCustomNotificationSound(): boolean {
+  const state = getNotificationSoundEngineState();
+  if (state.source !== 'custom' || !state.customSoundUrl) return false;
+  try {
+    const audio = new Audio(state.customSoundUrl);
+    audio.volume = state.volume;
+    const p = audio.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch(() => {
+        /* autoplay guard / decode error — silent fallback */
+      });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Play an urgent notification chime - ascending two-tone alert
  */
 function playChime() {
@@ -28,6 +64,8 @@ function playChime() {
     }
 
     const now = ctx.currentTime;
+    // Task 82 — customer volume setting scales every tone.
+    const vol = overrideVolume ?? getNotificationSoundEngineState().volume;
 
     // First tone (lower)
     const osc1 = ctx.createOscillator();
@@ -35,7 +73,7 @@ function playChime() {
     osc1.type = 'sine';
     osc1.frequency.setValueAtTime(523.25, now); // C5
     osc1.frequency.setValueAtTime(659.25, now + 0.12); // E5
-    gain1.gain.setValueAtTime(0.3, now);
+    gain1.gain.setValueAtTime(0.3 * vol, now);
     gain1.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
     osc1.connect(gain1);
     gain1.connect(ctx.destination);
@@ -48,7 +86,7 @@ function playChime() {
     osc2.type = 'sine';
     osc2.frequency.setValueAtTime(659.25, now + 0.15); // E5
     osc2.frequency.setValueAtTime(783.99, now + 0.27); // G5
-    gain2.gain.setValueAtTime(0.3, now + 0.15);
+    gain2.gain.setValueAtTime(0.3 * vol, now + 0.15);
     gain2.gain.exponentialRampToValueAtTime(0.01, now + 0.5);
     osc2.connect(gain2);
     gain2.connect(ctx.destination);
@@ -61,7 +99,7 @@ function playChime() {
     osc3.type = 'sine';
     osc3.frequency.setValueAtTime(783.99, now + 0.3); // G5
     osc3.frequency.setValueAtTime(1046.5, now + 0.42); // C6
-    gain3.gain.setValueAtTime(0.35, now + 0.3);
+    gain3.gain.setValueAtTime(0.35 * vol, now + 0.3);
     gain3.gain.exponentialRampToValueAtTime(0.01, now + 0.65);
     osc3.connect(gain3);
     gain3.connect(ctx.destination);
@@ -70,6 +108,21 @@ function playChime() {
   } catch (e) {
     // AudioContext may not be available or may fail silently
     console.warn('[sounds] playChime error:', e);
+  }
+}
+
+/**
+ * Task 82 — preview the built-in chime at a given volume (settings UI).
+ * Bypasses the alert loop entirely (no reservation bookkeeping).
+ */
+export function previewDefaultChime(volume: number) {
+  try {
+    overrideVolume = volume;
+    playChime();
+  } catch {
+    /* ignore */
+  } finally {
+    overrideVolume = null;
   }
 }
 
@@ -89,9 +142,11 @@ export function startNotificationSound(reservationId?: string) {
   isPlaying = true;
   currentReservationId = reservationId || null;
 
-  // Play immediately
+  // Play immediately — the custom song (if set) wins over the built-in chime
   try {
-    playChime();
+    if (!playCustomNotificationSound()) {
+      playChime();
+    }
   } catch (e) {
     console.warn('[sounds] Initial chime failed:', e);
     // Continue even if first chime fails
@@ -103,7 +158,9 @@ export function startNotificationSound(reservationId?: string) {
     elapsed += 4000;
     if (isPlaying && elapsed < 30000) {
       try {
-        playChime();
+        if (!playCustomNotificationSound()) {
+          playChime();
+        }
       } catch (e) {
         console.warn('[sounds] Loop chime failed, stopping:', e);
         stopNotificationSound();
@@ -166,6 +223,7 @@ export function playConfirmSound() {
     }
 
     const now = ctx.currentTime;
+    const vol = overrideVolume ?? getNotificationSoundEngineState().volume;
 
     // Quick ascending confirmation beep
     const osc = ctx.createOscillator();
@@ -173,7 +231,7 @@ export function playConfirmSound() {
     osc.type = 'sine';
     osc.frequency.setValueAtTime(600, now);
     osc.frequency.linearRampToValueAtTime(900, now + 0.1);
-    gain.gain.setValueAtTime(0.2, now);
+    gain.gain.setValueAtTime(0.2 * vol, now);
     gain.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
     osc.connect(gain);
     gain.connect(ctx.destination);

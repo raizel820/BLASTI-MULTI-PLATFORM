@@ -10,9 +10,10 @@
  */
 
 import { motion } from 'framer-motion';
-import { Building2, Clock, Heart, Loader2, MapPin, Star, Users, Zap } from 'lucide-react';
+import { Building2, Clock, Heart, Info, Loader2, MapPin, Navigation, Star, Users, Zap } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { AgencyRatingDisplay } from '@/components/shared/agency-rating-display';
+import { formatDistance } from '@/lib/geo';
 import type { TranslationKeys } from '@/i18n';
 import { categoryKeys, getAgencyName, type AgencyListItem } from './types';
 
@@ -26,6 +27,11 @@ interface AgencyCardProps {
   onSelect: (agency: AgencyListItem) => void;
   onToggleFavorite: (e: React.MouseEvent, agencyId: string) => void;
   onQuickJoin: (agencyId: string) => void;
+  /** Task 81-b — optional “view agency profile” entry (Info icon, does not select the card). */
+  onViewProfile?: (agency: AgencyListItem) => void;
+  /** Task 82 — estimated straight-line distance in km (null when location
+   *  access is unavailable → the chip is simply not rendered). */
+  distanceKm?: number | null;
 }
 
 export function AgencyCard({
@@ -38,6 +44,8 @@ export function AgencyCard({
   onSelect,
   onToggleFavorite,
   onQuickJoin,
+  onViewProfile,
+  distanceKm,
 }: AgencyCardProps) {
   const queueStatus = agency.isQueueOpen && !agency.isPaused ? 'open' : agency.isPaused ? 'paused' : 'closed';
   const CatIcon = categoryKeys.find((c) => c.value === agency.category.toUpperCase())?.icon ?? Building2;
@@ -109,6 +117,20 @@ export function AgencyCard({
 
         {/* Row 2: stats */}
         <div className="mt-2.5 flex items-center gap-2 flex-wrap">
+          {typeof distanceKm === 'number' && Number.isFinite(distanceKm) && (
+            <span
+              className="flex items-center gap-1 text-[10px] font-medium text-gray-600 dark:text-gray-300 bg-gray-100 dark:bg-gray-800 rounded-full px-1.5 py-0.5"
+              title={t('estimatedDistance')}
+            >
+              <Navigation className="h-2.5 w-2.5 flex-shrink-0 rtl:rotate-180" />
+              <span dir="ltr">
+                ~{(() => {
+                  const d = formatDistance(distanceKm);
+                  return d.unit === 'km' ? `${d.value} km` : `${d.value} m`;
+                })()}
+              </span>
+            </span>
+          )}
           {queueStatus === 'open' && (
             <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-900/20 rounded-full px-1.5 py-0.5">
               <Users className="h-2.5 w-2.5" />
@@ -134,6 +156,15 @@ export function AgencyCard({
             {agency.isSponsored ? t('sponsored') : ''}
           </span>
           <span className="flex items-center gap-1.5">
+            {onViewProfile && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onViewProfile(agency); }}
+                className="h-7 w-7 rounded-full flex items-center justify-center hover:bg-emerald-50 dark:hover:bg-emerald-900/20 transition-colors"
+                aria-label={t('viewProfile')}
+              >
+                <Info className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+              </button>
+            )}
             <button
               onClick={(e) => onToggleFavorite(e, agency.id)}
               disabled={toggling}

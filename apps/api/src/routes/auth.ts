@@ -14,7 +14,7 @@
 import { Hono } from 'hono'
 import { setCookie, deleteCookie } from 'hono/cookie'
 import { db } from '@blasti/db'
-import { createSessionToken, getSessionUser, type SessionUser } from '../lib/auth'
+import { createSessionToken, getSessionUser, requireAuth, AuthError, REMEMBER_ME_MAX_AGE, SESSION_MAX_AGE, type SessionUser } from '../lib/auth'
 import { verifyPassword, hashPassword } from '../lib/password'
 import crypto from 'crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
@@ -227,7 +227,7 @@ app.post('/login', async (c) => {
       )
     }
 
-    const { username, password, expectedRole } = validation.data
+    const { username, password, expectedRole, rememberMe } = validation.data
 
     // Find user by username
     const user = await db.user.findUnique({
@@ -386,23 +386,86 @@ app.post('/login', async (c) => {
       ...userData,
       agencyId: agencyId || null,
     }
-    const token = await createSessionToken(sessionUser)
+    // Task 81 — remember-me policy: a checked "Remember me" box issues a
+    // 3-DAY token/cookie instead of the 30-day default. The client may then
+    // keep the session alive while the app is actively used via
+    // POST /auth/refresh (which re-issues 3-day tokens), but the total
+    // lifetime never exceeds 3 days from login.
+    const sessionMaxAge = rememberMe ? REMEMBER_ME_MAX_AGE : SESSION_MAX_AGE
+    const token = await createSessionToken(sessionUser, sessionMaxAge)
     await setCookie(c, getCookieName(), token, {
       httpOnly: true,
       secure: isSecureCookie(),
       sameSite: 'Lax',
       path: '/',
-      maxAge: SESSION_MAX_AGE,
+      maxAge: sessionMaxAge,
     })
 
     // Return token in response body for native clients (Electron/Capacitor)
     // that can't rely on httpOnly cookies due to cross-origin restrictions.
     // Web clients should use the cookie; native clients should store the token
     // and send it via Authorization: Bearer header.
-    return c.json({ success: true, user: { ...userData, agencyId }, token })
+    return c.json({ success: true, user: { ...userData, agencyId }, token, sessionMaxAge })
   } catch (error: unknown) {
     if (error instanceof Error && error.message === 'INVALID_IP') {
       return c.json({ success: false, error: 'Unable to identify client' }, 400)
+    }
+    if (error instanceof RateLimitError || error instanceof IpBlockedError) {
+      return rateLimitResponse(error)(c)
+    }
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return c.json({ success: false, error: message }, 500)
+  }
+})
+
+/**
+ * POST /auth/refresh — Task 81 sliding-window session refresh.
+ *
+ * Remember-me sessions live AT MOST 3 days from login (client-enforced hard
+ * wall), but a token issued at login must not die mid-use while the customer
+ * is actively using the app. The client calls this endpoint periodically
+ * (session-keeper): it verifies the caller's CURRENT session (Bearer header
+ * or cookie) and issues a fresh token + cookie.
+ *
+ * Body { rememberMe: true } → the new token keeps the 3-day remember-me
+ * policy. Without it a default-policy token is issued.
+ *
+ * Auth failures bubble up as 401 — the client treats that as "session gone,
+ * re-login required (password or biometric)".
+ */
+app.post('/refresh', async (c) => {
+  try {
+    const ip = requireValidIp(c)
+    checkIpBlocked(ip)
+    checkRateLimit(ip, AUTH_RATE_LIMIT)
+
+    const user = await requireAuth(c)
+
+    let body: { rememberMe?: boolean } = {}
+    try {
+      body = await c.req.json()
+    } catch {
+      // Empty/absent body is fine — defaults apply.
+    }
+
+    const maxAge = body.rememberMe ? REMEMBER_ME_MAX_AGE : SESSION_MAX_AGE
+    const token = await createSessionToken(user, maxAge)
+
+    await setCookie(c, getCookieName(), token, {
+      httpOnly: true,
+      secure: isSecureCookie(),
+      sameSite: 'Lax',
+      path: '/',
+      maxAge,
+    })
+
+    return c.json({ success: true, token, user, sessionMaxAge: maxAge })
+  } catch (error: unknown) {
+    if (error instanceof Error && error.message === 'INVALID_IP') {
+      return c.json({ success: false, error: 'Unable to identify client' }, 400)
+    }
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode)
     }
     if (error instanceof RateLimitError || error instanceof IpBlockedError) {
       return rateLimitResponse(error)(c)

@@ -1,7 +1,7 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { apiClient, setNativeSessionToken } from '@/lib/api-client';
 import { useAppStore } from '@/store/use-app-store';
 import { adoptImportedLocalSessionUser } from '@/lib/session-heal';
@@ -98,6 +98,39 @@ export function LoginForm() {
     await handleLogin(biometricUsername, biometricPassword);
   };
 
+  // ── Task 81: biometrics ARE the relogin ──
+  // "After activating biometric login it should be asked whenever re-login
+  // happens on the same device instead of username/password." When this
+  // device has an enrolled credential and biometrics are available, the
+  // fingerprint/FaceID prompt fires automatically once the login view
+  // appears — no typing required. The manual fingerprint button stays as
+  // the fallback for canceled prompts.
+  const autoPromptedRef = useRef(false);
+  useEffect(() => {
+    if (autoPromptedRef.current || !biometricPassword) return;
+    if (authView !== 'login' || loading || loginSuccess) return;
+    autoPromptedRef.current = true;
+    const timer = setTimeout(() => { void handleBiometricLogin(); }, 600);
+    return () => clearTimeout(timer);
+     
+  }, [biometricPassword, authView, loading, loginSuccess]);
+
+  // ── Task 81: device enrollment belongs to ONE account ──
+  // If the customer signs in manually as a DIFFERENT account than the one
+  // whose credential is stored, the enrollment is cleared — otherwise the
+  // login screen would keep offering the previous account's identity.
+  const guardBiometricOwnership = (loggedInUsername: string) => {
+    const st = useAppStore.getState();
+    if (
+      st.biometricLoginEnabled &&
+      st.biometricUsername &&
+      st.biometricUsername.toLowerCase() !== loggedInUsername.toLowerCase()
+    ) {
+      void nativeBridge.deleteBiometricCredentials(st.biometricUsername);
+      st.setBiometricLogin(false, null);
+    }
+  };
+
   const handleLogin = async (biometricUser?: string, biometricPass?: string) => {
     const effUsername = biometricUser ?? username;
     const effPassword = biometricPass ?? password;
@@ -142,6 +175,15 @@ export function LoginForm() {
         setLoginSuccess(true);
         setTimeout(() => {
           setUser(data.user);
+          // Task 81 — remember-me session policy: a checked box starts the
+          // 3-day window (token refreshed in use by the session-keeper);
+          // without it the session ends when this platform's default does.
+          guardBiometricOwnership(data.user?.username ?? effUsername.trim());
+          if (rememberMe && !biometricUser) {
+            useAppStore.getState().beginRememberSession();
+          } else {
+            useAppStore.getState().clearRememberSession();
+          }
           if (data.token) {
             setSessionToken(data.token);
             // ── Electron: Establish local API session for LAN failover ──
@@ -238,6 +280,14 @@ export function LoginForm() {
     setLoginSuccess(true);
     setTimeout(() => {
       setUser(result.user as any);
+      // Task 81 — same remember-me + enrollment-ownership policy as the
+      // direct login path (the OTP flow inherits the form's rememberMe).
+      guardBiometricOwnership(result.user?.username ?? username.trim());
+      if (rememberMe) {
+        useAppStore.getState().beginRememberSession();
+      } else {
+        useAppStore.getState().clearRememberSession();
+      }
       setSessionToken(result.token);
       // ── Electron: Establish local API session for LAN failover ──
       try {

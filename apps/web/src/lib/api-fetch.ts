@@ -31,6 +31,12 @@ export interface ApiFetchResponse {
   text: () => Promise<string>;
   blob: () => Promise<Blob>;
   headers: Headers;
+  /**
+   * Final response URL, when the underlying client exposes one. apiClient
+   * responses generally carry none (failover layers abstract the origin),
+   * so callers must treat this as optional — `!res.url` is the norm.
+   */
+  url?: string;
 }
 
 /**

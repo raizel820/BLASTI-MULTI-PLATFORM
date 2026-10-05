@@ -25,7 +25,7 @@
  *     same pattern as VerificationStep / DesktopAgencyLogin.
  */
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { apiFetch } from '@/lib/api-fetch';
 import { apiClient, setNativeSessionToken } from '@/lib/api-client';
 import { useAppStore } from '@/store/use-app-store';
@@ -164,6 +164,38 @@ export function MobileLoginForm() {
     await handleLogin(biometricUsername, biometricPassword);
   };
 
+  // ── Task 81: biometrics ARE the relogin on the phone ──
+  // Once biometric login is activated (Settings → Security), EVERY return
+  // to the login screen auto-fires the fingerprint/FaceID prompt — the
+  // customer is asked for biometrics instead of typing username/password.
+  // The manual fingerprint button below stays as the fallback for a
+  // canceled/failed prompt.
+  const autoPromptedRef = useRef(false);
+  useEffect(() => {
+    if (autoPromptedRef.current || !biometricPassword) return;
+    if (authView !== 'login' || loading || loginSuccess) return;
+    autoPromptedRef.current = true;
+    const timer = setTimeout(() => { void handleBiometricLogin(); }, 600);
+    return () => clearTimeout(timer);
+     
+  }, [biometricPassword, authView, loading, loginSuccess]);
+
+  // ── Task 81: device enrollment belongs to ONE account ──
+  // Signing in manually as a DIFFERENT account clears the stored
+  // credential + flags so the phone never offers the previous account's
+  // identity to its successor.
+  const guardBiometricOwnership = (loggedInUsername: string) => {
+    const st = useAppStore.getState();
+    if (
+      st.biometricLoginEnabled &&
+      st.biometricUsername &&
+      st.biometricUsername.toLowerCase() !== loggedInUsername.toLowerCase()
+    ) {
+      void nativeBridge.deleteBiometricCredentials(st.biometricUsername);
+      st.setBiometricLogin(false, null);
+    }
+  };
+
   const getRoleFromTab = (tab: 'customer' | 'agency'): UserRole =>
     tab === 'agency' ? 'AGENCY_OWNER' : 'CUSTOMER';
 
@@ -174,10 +206,20 @@ export function MobileLoginForm() {
   // blasti-session-token — on Capacitor EVERY apiClient request sends it as
   // Bearer, so it is called unconditionally (no-op on plain web).
   const bootstrapSession = useCallback(
-    (user: unknown, token: string | undefined, successMsg: string) => {
+    (user: unknown, token: string | undefined, successMsg: string, opts?: { remember?: boolean; loggedInUsername?: string }) => {
       setLoginSuccess(true);
       setTimeout(() => {
         setUser(user as never);
+        // Task 81 — remember-me session policy: the 3-day window starts at
+        // login and is kept alive by the session-keeper while the app is
+        // used; after 3 days a re-login (password or biometric) is required.
+        const st = useAppStore.getState();
+        if (opts?.loggedInUsername) guardBiometricOwnership(opts.loggedInUsername);
+        if (opts?.remember) {
+          st.beginRememberSession();
+        } else {
+          st.clearRememberSession();
+        }
         if (token) {
           setSessionToken(token);
           try { setNativeSessionToken(token); } catch { /* non-native runtime */ }
@@ -228,7 +270,10 @@ export function MobileLoginForm() {
       }
 
       if (res.ok && data.user) {
-        bootstrapSession(data.user, data.token, t('loginSuccess'));
+        bootstrapSession(data.user, data.token, t('loginSuccess'), {
+          remember: rememberMe && !biometricUser,
+          loggedInUsername: effUsername.trim(),
+        });
       } else {
         if (data.error === 'wrongRoleError') {
           toast.error(t('wrongRoleError'), { description: t('wrongRoleHint') || t('selectRole') || '' });
@@ -247,7 +292,10 @@ export function MobileLoginForm() {
   const handleVerificationSuccess = (result: VerificationSuccess) => {
     setVerificationData(null);
     setAuthView('login');
-    bootstrapSession(result.user, result.token, t('loginSuccess'));
+    bootstrapSession(result.user, result.token, t('loginSuccess'), {
+      remember: rememberMe,
+      loggedInUsername: username.trim(),
+    });
   };
 
   const handleVerificationTokenInvalid = () => {

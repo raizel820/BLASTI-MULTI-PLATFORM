@@ -66,6 +66,7 @@ import type { Language } from '@/i18n';
 import { updateDocumentDirection } from '@/store/use-app-store';
 import { NotificationPrefs } from '@/components/customer/notification-prefs';
 import { BiometricSettingsCard } from '@/components/shared/biometric-settings';
+import { ProfileSoundSettings } from './profile/profile-sound-settings';
 
 export function CustomerSettings() {
   const { user, setUser, logout } = useAppStore();
@@ -519,6 +520,9 @@ export function CustomerSettings() {
             </div>
           </div>
         </motion.section>
+
+        {/* ─── Notification sound (volume + custom song — Task 82) ─── */}
+        <ProfileSoundSettings t={t} />
 
         {/* ─── Security group (biometric login + password) ─── */}
         <motion.section

@@ -34,6 +34,7 @@ import {
   Zap,
   Volume2,
   CalendarDays,
+  Monitor,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
@@ -41,6 +42,7 @@ import QRCode from 'qrcode';
 import type { TranslationKeys } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { apiFetch } from '@/lib/api-fetch';
+import { unwrapListPayload } from '@/lib/list-payload';
 import { formatWorkingDaysList } from '@/lib/enum-i18n';
 import { AgencyCategorySelect } from '@/components/agency/agency-category-select';
 import { BUILT_IN_CATEGORY_OPTIONS } from '@/hooks/use-agency-categories';
@@ -106,6 +108,27 @@ interface AgencyInfo {
   locationSource?: string | null;
 }
 
+// ─── Task 83-b — branch row for the profile switcher (subset of the fields
+// GET /api/agency/branches returns; optional so older payloads render) ─────
+interface BranchProfileRow {
+  id: string;
+  name: string;
+  nameAr?: string | null;
+  nameFr?: string | null;
+  specialName?: string | null;
+  subCode?: string | null;
+  address?: string | null;
+  phone?: string | null;
+  isActive: boolean;
+  isMain: boolean;
+  latitude?: number | null;
+  longitude?: number | null;
+  city?: string | null;
+  wilaya?: string | null;
+  postalCode?: string | null;
+  _count?: { counters?: number; staff?: number };
+}
+
 /** Round 15 — localized weekday list for the workingDays CSV (0=Sunday).
  *  Task 31-A: delegated to the shared formatWorkingDaysList and driven by the
  *  app language (was navigator.language, which ignored the in-app ar/fr
@@ -133,8 +156,18 @@ export function AgencyProfile() {
   const [locationChanged, setLocationChanged] = useState(false);
   const [locationSourceOverride, setLocationSourceOverride] = useState<'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS' | null>(null);
 
+  // ─── Task 83-b — branch profile switcher ──────────────────────────────────
+  // activeBranchId === null → agency-wide view (EXACTLY the pre-83 render);
+  // a branch id additionally shows the Branch profile card below. The chips
+  // row renders only when the agency actually HAS branches.
+  const [branches, setBranches] = useState<BranchProfileRow[]>([]);
+  const [activeBranchId, setActiveBranchId] = useState<string | null>(null);
+  const [branchQrDataUrl, setBranchQrDataUrl] = useState<string | null>(null);
+  const [activeBranchCounters, setActiveBranchCounters] = useState<number | null>(null);
+
   useEffect(() => {
     fetchProfile();
+    fetchBranches();
   }, []);
 
   const fetchProfile = async () => {
@@ -150,6 +183,94 @@ export function AgencyProfile() {
       toast.error(t('error'));
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Task 83-b — the switcher's branch list. GET /api/agency/branches returns
+  // the SESSION agency's branches; the ?agencyId param mirrors the profile
+  // fetch above. Same unwrap as agency-branches (Task 45: the local dual
+  // envelope arrives auto-unwrapped as a raw array).
+  const fetchBranches = async () => {
+    try {
+      const params = user?.agencyId ? `?agencyId=${user.agencyId}` : '';
+      const res = await apiFetch(`/api/agency/branches${params}`);
+      if (res.ok) {
+        const data = await res.json();
+        setBranches(unwrapListPayload<BranchProfileRow>(data, ['branches']));
+      }
+    } catch {
+      // silent — the switcher simply does not render
+    }
+  };
+
+  const activeBranch = useMemo(
+    () => branches.find((b) => b.id === activeBranchId) ?? null,
+    [branches, activeBranchId],
+  );
+
+  const getBranchDisplayName = (b: BranchProfileRow) => {
+    if (lang === 'ar' && b.nameAr) return b.nameAr;
+    if (lang === 'fr' && b.nameFr) return b.nameFr;
+    return b.name;
+  };
+
+  // Task 83-b — per-branch QR, generated client-side with the same bundled
+  // `qrcode` package as the agency QR (offline-safe on the desktop shell).
+  // Encodes <origin>/?branch=<subCode> — the branch deep-link (Task 83-c
+  // opens that branch's profile on the customer side).
+  useEffect(() => {
+    if (!activeBranch?.subCode) {
+      setBranchQrDataUrl(null);
+      return;
+    }
+    let cancelled = false;
+    const base = typeof window !== 'undefined' ? window.location.origin : '';
+    QRCode.toDataURL(`${base}/?branch=${encodeURIComponent(activeBranch.subCode)}`, {
+      margin: 2,
+      width: 256,
+      color: { dark: '#047857', light: '#ffffff' },
+    })
+      .then((url) => { if (!cancelled) setBranchQrDataUrl(url); })
+      .catch(() => { if (!cancelled) setBranchQrDataUrl(null); });
+    return () => { cancelled = true; };
+  }, [activeBranch?.subCode]);
+
+  // Task 83-b — ACTIVE counters count for the selected branch (the list
+  // _count is the TOTAL counters; the branch card needs the active ones).
+  // Falls back to the total when the counters endpoint is unavailable.
+  useEffect(() => {
+    if (!activeBranch) {
+      setActiveBranchCounters(null);
+      return;
+    }
+    let cancelled = false;
+    apiFetch(`/api/agency/branches/${activeBranch.id}/counters`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error('counters unavailable');
+        const data = await res.json();
+        const rows = unwrapListPayload<{ isActive: boolean }>(data, ['counters']);
+        if (!cancelled) setActiveBranchCounters(rows.filter((c) => c.isActive).length);
+      })
+      .catch(() => {
+        if (!cancelled) setActiveBranchCounters(activeBranch._count?.counters ?? null);
+      });
+    return () => { cancelled = true; };
+  }, [activeBranch]);
+
+  // Task 83-b — copy the branch sub code (same clipboard + fallback pattern
+  // as handleCopyLink below).
+  const handleCopySubCode = async (subCode: string) => {
+    try {
+      await navigator.clipboard.writeText(subCode);
+      toast.success(t('branchSubCodeCopied'));
+    } catch {
+      const textArea = document.createElement('textarea');
+      textArea.value = subCode;
+      document.body.appendChild(textArea);
+      textArea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textArea);
+      toast.success(t('branchSubCodeCopied'));
     }
   };
 
@@ -385,6 +506,190 @@ export function AgencyProfile() {
           </Button>
         )}
       </div>
+
+      {/* Task 83-b — Branch switcher: agency-wide (default, current behavior)
+          + one chip per branch. Horizontal scroll on mobile. Renders ONLY
+          when the agency has branches; absent → the page renders exactly as
+          before. */}
+      {branches.length > 0 && (
+        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+          <div className="flex items-center gap-2 mb-2">
+            <Building2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+            <p className="text-sm font-semibold text-foreground">{t('branchSwitcher')}</p>
+          </div>
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            <motion.button
+              whileTap={{ scale: 0.98 }}
+              onClick={() => setActiveBranchId(null)}
+              className={`flex-shrink-0 px-3.5 py-2 rounded-full text-xs font-medium border transition-colors ${
+                activeBranchId === null
+                  ? 'bg-emerald-600 border-emerald-600 text-white shadow-sm shadow-emerald-500/20'
+                  : 'bg-white dark:bg-gray-900/80 border-gray-200 dark:border-gray-700 text-muted-foreground hover:border-emerald-300 dark:hover:border-emerald-700'
+              }`}
+            >
+              {t('agencyWide')}
+            </motion.button>
+            {branches.map((b) => (
+              <motion.button
+                key={b.id}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => setActiveBranchId(b.id)}
+                className={`flex-shrink-0 px-3.5 py-2 rounded-full text-xs font-medium border transition-colors flex items-center gap-1.5 ${
+                  activeBranchId === b.id
+                    ? 'bg-emerald-600 border-emerald-600 text-white shadow-sm shadow-emerald-500/20'
+                    : 'bg-white dark:bg-gray-900/80 border-gray-200 dark:border-gray-700 text-muted-foreground hover:border-emerald-300 dark:hover:border-emerald-700'
+                }`}
+              >
+                <span className="max-w-40 truncate">{b.specialName?.trim() || getBranchDisplayName(b)}</span>
+                {b.isMain ? (
+                  <span
+                    className={`text-[9px] px-1 py-0.5 rounded flex-shrink-0 ${
+                      activeBranchId === b.id
+                        ? 'bg-white/20 text-white'
+                        : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400'
+                    }`}
+                  >
+                    {t('mainBranch')}
+                  </span>
+                ) : b.subCode ? (
+                  <span
+                    className={`font-mono text-[10px] px-1 py-0.5 rounded flex-shrink-0 ${
+                      activeBranchId === b.id
+                        ? 'bg-white/20 text-white'
+                        : 'bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-400'
+                    }`}
+                    dir="ltr"
+                  >
+                    {b.subCode}
+                  </span>
+                ) : null}
+              </motion.button>
+            ))}
+          </div>
+        </motion.div>
+      )}
+
+      {/* Task 83-b — Branch profile card (only when a branch chip is active).
+          When NO branch chip is selected the page renders exactly as today. */}
+      {activeBranch && (
+        <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}>
+          <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50">
+            <CardHeader className="pb-3">
+              <div className="flex items-center justify-between gap-2">
+                <CardTitle className="text-base flex items-center gap-2">
+                  <Building2 className="h-4 w-4 text-emerald-600" />
+                  {t('branchProfile')}
+                </CardTitle>
+                {activeBranch.isMain && (
+                  <Badge className="bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 border-0 text-[10px] px-1.5 py-0.5">
+                    {t('mainBranch')}
+                  </Badge>
+                )}
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              {/* Display name (specialName || name) + subCode + copy */}
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-foreground truncate">
+                    {activeBranch.specialName?.trim() || getBranchDisplayName(activeBranch)}
+                  </p>
+                  {activeBranch.subCode && (
+                    <p className="text-xs font-mono text-emerald-700 dark:text-emerald-400 mt-0.5" dir="ltr">
+                      {activeBranch.subCode}
+                    </p>
+                  )}
+                </div>
+                {activeBranch.subCode && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-9 rounded-lg text-xs gap-1.5"
+                    onClick={() => handleCopySubCode(activeBranch.subCode!)}
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    {t('copy')}
+                  </Button>
+                )}
+              </div>
+
+              {/* Branch QR — client-side, encodes ?branch=<subCode> */}
+              {activeBranch.subCode && (
+                <div className="flex items-center gap-4 p-3 rounded-xl bg-muted/50 dark:bg-gray-800/50">
+                  <div className="h-28 w-28 rounded-xl bg-white flex items-center justify-center border-2 border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden flex-shrink-0">
+                    {branchQrDataUrl ? (
+                      <img
+                        src={branchQrDataUrl}
+                        alt={`QR code — branch ${activeBranch.subCode}`}
+                        className="h-full w-full object-contain p-1.5"
+                      />
+                    ) : (
+                      <QrCode className="h-8 w-8 text-muted-foreground" />
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground min-w-0">{t('branchQrDesc')}</p>
+                </div>
+              )}
+
+              {/* Location: branch coordinates when present (same shared map
+                  the agency profile uses), else address text + note. */}
+              {activeBranch.latitude != null && activeBranch.longitude != null ? (
+                <AgencyLocationMap
+                  agency={{
+                    latitude: activeBranch.latitude,
+                    longitude: activeBranch.longitude,
+                    name: activeBranch.specialName?.trim() || getBranchDisplayName(activeBranch),
+                    address: activeBranch.address ?? null,
+                    city: composeLocationLabel(activeBranch.wilaya ?? '', activeBranch.city ?? '', lang) || null,
+                  }}
+                  height={220}
+                />
+              ) : (
+                <div className="rounded-xl border border-amber-200 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-900/20 p-3 text-xs text-amber-800 dark:text-amber-200">
+                  {activeBranch.address ||
+                    composeLocationLabel(activeBranch.wilaya ?? '', activeBranch.city ?? '', lang) ||
+                    t('agencyAddress')}
+                  <span className="block mt-0.5 text-amber-700/80 dark:text-amber-300/80">
+                    {t('branchLocationDesc')}
+                  </span>
+                </div>
+              )}
+
+              {/* Address / wilaya / postalCode line */}
+              {(activeBranch.address || activeBranch.city || activeBranch.wilaya || activeBranch.postalCode) && (
+                <div className="flex items-start gap-2 text-sm text-muted-foreground">
+                  <MapPin className="h-4 w-4 flex-shrink-0 mt-0.5" />
+                  <span className="min-w-0">
+                    {[
+                      activeBranch.address,
+                      composeLocationLabel(activeBranch.wilaya ?? '', activeBranch.city ?? '', lang),
+                      activeBranch.postalCode,
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </span>
+                </div>
+              )}
+
+              {/* Branch phone */}
+              {activeBranch.phone && (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Phone className="h-4 w-4 flex-shrink-0" />
+                  <span dir="ltr">{activeBranch.phone}</span>
+                </div>
+              )}
+
+              {/* Active counters count */}
+              {activeBranchCounters !== null && (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Monitor className="h-4 w-4 flex-shrink-0" />
+                  <span>{t('branchCounters', { n: String(activeBranchCounters) })}</span>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </motion.div>
+      )}
 
       {/* Agency Info Card with Hero Banner */}
       <motion.div

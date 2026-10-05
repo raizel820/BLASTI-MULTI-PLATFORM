@@ -52,10 +52,26 @@ app.patch('/profile', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    const { phoneNumber, language, avatarUrl, fullName, notificationPreferences, reminderMinutes, smsNotificationsEnabled, notificationPref } = validation.data
+    const { phoneNumber, email, language, avatarUrl, fullName, notificationPreferences, reminderMinutes, smsNotificationsEnabled, notificationPref } = validation.data
 
     const updateData: Record<string, unknown> = {}
     if (phoneNumber !== undefined) updateData.phoneNumber = phoneNumber
+    if (email !== undefined) {
+      // '' clears the email; a value must be globally unique (User.email @unique).
+      const normalizedEmail = email.trim().toLowerCase()
+      if (normalizedEmail === '') {
+        updateData.email = null
+      } else {
+        const taken = await db.user.findFirst({
+          where: { email: normalizedEmail, id: { not: user.id } },
+          select: { id: true },
+        })
+        if (taken) {
+          return c.json({ success: false, error: 'This email is already used by another account' }, 409)
+        }
+        updateData.email = normalizedEmail
+      }
+    }
     if (notificationPreferences !== undefined) {
       updateData.notificationPreferences = typeof notificationPreferences === 'string' ? notificationPreferences : JSON.stringify(notificationPreferences)
     }
@@ -84,6 +100,11 @@ app.patch('/profile', async (c) => {
 
     return c.json({ success: true, ...updated })
   } catch (error: unknown) {
+    // phoneNumber is @unique — a duplicate must surface as a friendly 409,
+    // not a raw 500 (customers editing their profile phone hit this).
+    if ((error as { code?: string })?.code === 'P2002') {
+      return c.json({ success: false, error: 'This phone number is already used by another account' }, 409)
+    }
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
   }

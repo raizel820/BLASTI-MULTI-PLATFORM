@@ -783,10 +783,14 @@ model Review {
   user          User         @relation(fields: [userId], references: [id])
   agencyId      String
   agency        Agency       @relation(fields: [agencyId], references: [id])
+  /// Task 83 — branch-scoped reviews. Null = agency-wide review (legacy rows).
+  /// A user may hold ONE agency-level review AND one review per branch.
+  branchId      String?
+  branch        Branch?      @relation(fields: [branchId], references: [id], onDelete: Cascade)
   reservationId String?     @unique
   reservation   Reservation? @relation(fields: [reservationId], references: [id])
 
-  @@unique([userId, agencyId])
+  @@unique([userId, agencyId, branchId])
 }
 
 model FAQ {
@@ -841,15 +845,37 @@ model Branch {
   name      String
   nameAr    String?
   nameFr    String?
+  /// Task 83 — optional customer-facing display name ("Downtown Branch",
+  /// "Mall Kiosk"…). Search treats each branch as an independent entity and
+  /// matches this name alongside name/nameAr/nameFr and the agency code.
+  specialName String?
+  /// Task 83 — per-branch short code derived from the agency customCode
+  /// (e.g. agency "ABC" → main branch "ABC-M1", next branch "ABC-B2").
+  /// Unique globally; the QR deep link carries it (?branch=<subCode>).
+  subCode   String?  @unique
   address   String?
   phone     String?
   isActive  Boolean  @default(true)
   isMain    Boolean  @default(false)
+  /// Task 83 — canonical per-branch location (same contract as Agency's
+  /// Task 51 fields: DB is the source of truth, provider-independent, pair
+  /// rule lat/lng together or absent; locationUpdatedAt stamps changes).
+  latitude            Float?
+  longitude           Float?
+  city                String?
+  wilaya              String?
+  postalCode          String?
+  /// VERIFIED | UNVERIFIED | MANUAL (default UNVERIFIED)
+  locationVerified    String?   @default("UNVERIFIED")
+  /// GOOGLE | OPENFREEMAP | MANUAL | DEVICE_GPS — how the location was picked
+  locationSource      String?
+  locationUpdatedAt   DateTime?
   agencyId  String
   agency    Agency   @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   counters  Counter[]
   staff     AgencyStaff[]
   devices   AgencyDevice[]
+  reviews   Review[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }

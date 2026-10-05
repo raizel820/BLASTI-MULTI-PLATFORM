@@ -4934,7 +4934,11 @@ function createApp() {
       // (agency-branches.tsx) — dropping them silently lost translations and
       // the "set as main" flag on desktop. Cloud createBranchSchema accepts
       // all of these, so the canonical replay body stays valid cloud-side.
-      const { name, nameAr, nameFr, address, phone, isActive, isMain } = body
+      // Task 83 — the UI now ALSO sends specialName + the location block
+      // (latitude/longitude/city/wilaya/postalCode/locationSource/Verified);
+      // dropping those would lose the mandatory branch location on desktop.
+      const { name, nameAr, nameFr, specialName, address, phone, isActive, isMain,
+              latitude, longitude, city, wilaya, postalCode, locationVerified, locationSource } = body
 
       if (!name) {
         return c.json({ success: false, error: 'Branch name is required' }, 400)
@@ -4971,6 +4975,32 @@ function createApp() {
         console.warn('[LocalAPI] Branch plan-limit check skipped:', limitErr && limitErr.message)
       }
 
+      // Task 83 — local sub-code derivation (same contract as the cloud
+      // POST /branches): "<customCode>-M1" for the main branch,
+      // "<customCode>-B<n>" otherwise. The agency row is synced locally so
+      // its customCode is available offline; if it somehow is not, subCode
+      // stays null (nullable column) and the cloud backfills on the next
+      // edit — never fail the business write over a display code.
+      let subCode = null
+      try {
+        const parentAgency = await db.agency.findUnique({
+          where: { id: agencyId },
+          select: { customCode: true },
+        })
+        if (parentAgency && parentAgency.customCode) {
+          const base = isMain ? `${parentAgency.customCode}-M1` : `${parentAgency.customCode}-B`
+          subCode = isMain ? base : `${base}1`
+          for (let attempt = 2; attempt <= 60; attempt++) {
+            const taken = await db.branch.findUnique({ where: { subCode }, select: { id: true } })
+            if (!taken) break
+            subCode = isMain ? `${parentAgency.customCode}-M${attempt}` : `${base}${attempt}`
+          }
+        }
+      } catch (subErr) {
+        console.warn('[LocalAPI] sub-code derivation skipped:', subErr && subErr.message)
+        subCode = null
+      }
+
       // Part Q: business write + outbox row commit atomically.
       const branch = await withOutboxTransaction(async (tx) => {
         // Cloud parity (agency.ts POST /branches): when the new branch is set
@@ -4988,10 +5018,26 @@ function createApp() {
             name,
             nameAr: nameAr || null,
             nameFr: nameFr || null,
+            specialName: (specialName && String(specialName).trim()) || null,
+            subCode,
             address: address || null,
             phone: phone || null,
             isMain: Boolean(isMain),
             isActive: isActive !== undefined ? Boolean(isActive) : true,
+            // Task 83 — branch location (pair rule mirrors the cloud route:
+            // both numbers, or neither).
+            ...(typeof latitude === 'number' && typeof longitude === 'number'
+              ? {
+                  latitude,
+                  longitude,
+                  city: (city && String(city).trim()) || null,
+                  wilaya: (wilaya && String(wilaya).trim()) || null,
+                  postalCode: (postalCode && String(postalCode).trim()) || null,
+                  locationVerified: locationVerified || 'UNVERIFIED',
+                  locationSource: locationSource || null,
+                  locationUpdatedAt: new Date(),
+                }
+              : {}),
           },
         })
         // Canonical replay (round-7): see the reservation create note —
@@ -5044,12 +5090,21 @@ function createApp() {
           return c.json({ success: false, error: 'Branch not found' }, 404)
         }
 
-        const allowedFields = ['name', 'nameAr', 'nameFr', 'address', 'phone', 'isActive', 'isMain']
+        const allowedFields = ['name', 'nameAr', 'nameFr', 'specialName', 'address', 'phone', 'isActive', 'isMain',
+                               'latitude', 'longitude', 'city', 'wilaya', 'postalCode', 'locationVerified', 'locationSource']
         const updateData = {}
         for (const field of allowedFields) {
           if (body[field] !== undefined) {
             updateData[field] = body[field]
           }
+        }
+        // Task 83 — location pair rule (cloud parity): lat/lng arrive
+        // together or both null; any location change stamps locationUpdatedAt.
+        if ('latitude' in updateData !== 'longitude' in updateData) {
+          return c.json({ success: false, error: 'latitude and longitude must be provided together' }, 400)
+        }
+        if ('latitude' in updateData) {
+          updateData.locationUpdatedAt = new Date()
         }
 
         // Part Q: every write below (including the isMain sweep) + the outbox
@@ -8752,8 +8807,11 @@ function createApp() {
       const { rating, comment } = body
       if (!rating || rating < 1 || rating > 5) return c.json({ success: false, error: 'Rating must be 1-5' }, 400)
       // Check if user already reviewed this agency (upsert)
-      const existing = await db.review.findUnique({
-        where: { userId_agencyId: { userId: sessionUser.id, agencyId } },
+      // Task 83: the Review compound unique is now [userId, agencyId,
+      // branchId] — this local flow writes the AGENCY-WIDE review (branchId
+      // = null); findFirst because findUnique cannot filter a null component.
+      const existing = await db.review.findFirst({
+        where: { userId: sessionUser.id, agencyId, branchId: null },
       })
       // Part Q: business write + outbox row commit atomically. The upsert
       // branch decision uses the pre-read `existing` — both branches join tx.

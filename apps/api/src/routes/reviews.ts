@@ -11,6 +11,10 @@ const app = new Hono()
 const createReviewBodySchema = createReviewSchema.extend({
   agencyId: z.string().min(1, 'Agency ID is required'),
   reservationId: z.string().optional(),
+  // Task 83 — optional branch scoping: when present the review counts for
+  // THIS branch only (branch rating/comment section). Null/omitted = the
+  // legacy agency-wide review.
+  branchId: z.string().optional(),
 })
 
 // POST /reviews — Create a new review
@@ -23,13 +27,21 @@ app.post('/', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    const { agencyId, rating, comment, reservationId } = validation.data
+    const { agencyId, rating, comment, reservationId, branchId } = validation.data
     const userId = user.id
 
     if (user.role !== 'CUSTOMER') return c.json({ error: 'Only customers can submit reviews' }, 403)
 
     const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ error: 'Agency not found' }, 404)
+
+    // Task 83 — branch-scoped review validation: the branch must exist AND
+    // belong to the reviewed agency.
+    if (branchId) {
+      const branch = await db.branch.findUnique({ where: { id: branchId } })
+      if (!branch) return c.json({ error: 'Branch not found' }, 404)
+      if (branch.agencyId !== agencyId) return c.json({ error: 'Branch does not belong to this agency' }, 400)
+    }
 
     if (reservationId) {
       const reservation = await db.reservation.findUnique({ where: { id: reservationId } })
@@ -42,7 +54,7 @@ app.post('/', async (c) => {
     }
 
     const review = await db.review.create({
-      data: { rating, comment: comment?.trim() || null, userId, agencyId, reservationId: reservationId || null },
+      data: { rating, comment: comment?.trim() || null, userId, agencyId, branchId: branchId || null, reservationId: reservationId || null },
       include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
     })
 
@@ -74,6 +86,9 @@ app.get('/', async (c) => {
   try {
     const agencyId = c.req.query('agencyId')
     if (!agencyId) return c.json({ error: 'agencyId query parameter is required' }, 400)
+    // Task 83 — optional branch scoping: ?branchId=<id> narrows everything
+    // (list + count + average) to that branch's own rating/comment section.
+    const branchId = c.req.query('branchId') || null
 
     const page = Math.max(1, parseInt(c.req.query('page') || '1', 10))
     const limit = Math.min(50, Math.max(1, parseInt(c.req.query('limit') || '20', 10)))
@@ -82,18 +97,20 @@ app.get('/', async (c) => {
     const agency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!agency) return c.json({ error: 'Agency not found' }, 404)
 
+    const reviewWhere: Record<string, unknown> = branchId ? { agencyId, branchId } : { agencyId }
+
     const [reviews, total] = await Promise.all([
       db.review.findMany({
-        where: { agencyId },
+        where: reviewWhere,
         include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
         orderBy: { createdAt: 'desc' },
         skip,
         take: limit,
       }),
-      db.review.count({ where: { agencyId } }),
+      db.review.count({ where: reviewWhere }),
     ])
 
-    const ratingStats = await db.review.aggregate({ where: { agencyId }, _avg: { rating: true }, _count: { rating: true } })
+    const ratingStats = await db.review.aggregate({ where: reviewWhere, _avg: { rating: true }, _count: { rating: true } })
     const averageRating = ratingStats._avg.rating ? Math.round(ratingStats._avg.rating * 10) / 10 : 0
 
     return c.json({ success: true, reviews, averageRating, totalCount: total, page, limit, totalPages: Math.ceil(total / limit) })

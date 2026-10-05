@@ -32,6 +32,10 @@ const CustomerAnalytics = lazy(() => import('@/components/customer/customer-anal
 // Support desk — customer side: file complaints/suggestions/questions/notes
 // to the super admin and track replies.
 const CustomerSupport = lazy(() => import('@/components/customer/customer-support').then(m => ({ default: m.CustomerSupport })));
+// Task 81-b: public customer-facing agency profile (info/location/rating/comments).
+const CustomerAgencyProfile = lazy(() => import('@/components/customer/customer-agency-profile').then(m => ({ default: m.CustomerAgencyProfile })));
+// Task 83-c: customer-facing BRANCH profile (independent per-branch entity).
+const CustomerBranchProfile = lazy(() => import('@/components/customer/customer-branch-profile').then(m => ({ default: m.CustomerBranchProfile })));
 
 // Agency Views
 const AgencyDashboard = lazy(() => import('@/components/agency/agency-dashboard').then(m => ({ default: m.AgencyDashboard })));
@@ -86,6 +90,9 @@ import { NotificationBadge } from '@/components/shared/notification-badge';
 import { BlastiSkeleton, BlastiSkeletonCompact } from '@/components/shared/blasti-skeleton';
 import { BootGate } from '@/components/shared/boot-gate';
 import { PostLoginSyncGate } from '@/components/shared/post-login-sync-gate';
+// Task 81 — biometric app-open lock + remember-me session keeper.
+import { BiometricAppLock } from '@/components/shared/biometric-app-lock';
+import { startSessionKeeper, SESSION_EXPIRED_EVENT } from '@/lib/session-keeper';
 import { usePlatform } from '@/hooks/use-platform';
 import { Button } from '@/components/ui/button';
 
@@ -162,6 +169,15 @@ const ViewRouter = memo(function ViewRouter() {
               return <CustomerAnalytics />;
             case 'customer-support':
               return <CustomerSupport />;
+            // Task 81-b: reads agencyProfileId from the store (set by the
+            // entry point); self-handles null id / 404 as a friendly state.
+            case 'customer-agency-profile':
+              return <CustomerAgencyProfile />;
+            // Task 83-c: reads branchProfileId from the store (set by the
+            // entry points: branch cards, QR deep link ?branch=<subCode>);
+            // self-handles null id / 404 as a friendly state.
+            case 'customer-branch-profile':
+              return <CustomerBranchProfile />;
             case 'agency-dashboard':
               return <AgencyDashboard />;
             // Task 37-e: restricted agency sections pass through the authority
@@ -276,6 +292,25 @@ export default function Home() {
   }, []);
  const { t, lang } = useLanguage();
   const { platform } = usePlatform();
+
+  // Task 81 — remember-me session policy: while a remember-me session is
+  // active the keeper refreshes the token during use and enforces the 3-day
+  // hard wall. On expiry it dispatches blasti:session-expired; the listener
+  // below tells the customer and returns them to the login screen (where
+  // biometric quick-unlock auto-fires when enrolled).
+  useEffect(() => {
+    startSessionKeeper();
+    const onExpired = () => {
+      toast.error(t('sessionExpiredTitle'), {
+        description: t('sessionExpiredBody'),
+        duration: 8000,
+      });
+      setTimeout(() => { useAppStore.getState().logout(); }, 1500);
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
+     
+  }, []);
   // Aggressive turn alert — full-screen overlay when customer's turn is called
   // Hook is always called (rules of hooks) but only activates for customers via userId filtering
   const { showTurnAlert, turnAlertData, dismissTurnAlert } = useTurnAlert(user?.role === 'CUSTOMER' ? user?.id : undefined);
@@ -544,7 +579,39 @@ export default function Home() {
       setPendingAgencyCode(code);
       window.history.replaceState({}, '', window.location.pathname);
     }
+    // Task 83-c — branch QR deep link: ?branch=<subCode> (encoded in every
+    // branch QR code). Parked in sessionStorage until the user is
+    // authenticated (QR scans land on logged-out browsers too); the effect
+    // below resolves it into the branch profile view.
+    const branchSubCode = params.get('branch');
+    if (branchSubCode) {
+      sessionStorage.setItem('blasti:pending-branch', branchSubCode);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
   }, [setPendingAgencyCode]);
+
+  // Task 83-c — resolve a parked ?branch=<subCode> deep link once the
+  // customer is authenticated: sub-code → branch id → branch profile view.
+  // Resolution failure (unknown/retired code) clears the park silently —
+  // the user just lands on home.
+  useEffect(() => {
+    if (user?.role !== 'CUSTOMER') return;
+    const pendingBranch = sessionStorage.getItem('blasti:pending-branch');
+    if (!pendingBranch) return;
+    sessionStorage.removeItem('blasti:pending-branch');
+    let cancelled = false;
+    apiFetch(`/api/agencies/branches/by-code/${encodeURIComponent(pendingBranch)}`)
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = await res.json().catch(() => null);
+        const branchId: string | undefined = data?.branch?.id;
+        if (!branchId || cancelled) return;
+        useAppStore.getState().setBranchProfileId(branchId);
+        useAppStore.getState().setView('customer-branch-profile');
+      })
+      .catch(() => { /* deep-link best effort */ });
+    return () => { cancelled = true; };
+  }, [user?.role]);
 
   // When user is authenticated as customer and has pending agency code, navigate to customer-home
   // The customer-home component will pick up the code and auto-fetch agency detail
@@ -795,6 +862,11 @@ export default function Home() {
           branded progress screen until the desktop workspace import is done
           (Electron only, only when the workspace is not READY yet). */}
       <PostLoginSyncGate />
+
+      {/* Task 81 — biometric app lock: when "ask for biometrics every time
+          the app opens" is enabled and the account is active, this full-
+          screen gate challenges biometrics on launch/background-return. */}
+      <BiometricAppLock />
 
       {/* Aggressive Turn Alert — full-screen overlay for customers */}
       <AggressiveTurnAlert

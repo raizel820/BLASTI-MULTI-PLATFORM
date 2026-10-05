@@ -35,7 +35,11 @@ export interface SessionToken {
 // ─── Configuration ─────────────────────────────────────────────────────────
 
 const FALLBACK_SECRET = 'blast1-d3v-s3cr3t-k3y-f0r-d3v3l0pm3nt-0nly'
-const SESSION_MAX_AGE = 30 * 24 * 60 * 60 // 30 days
+export const SESSION_MAX_AGE = 30 * 24 * 60 * 60 // 30 days
+// Task 81 — remember-me policy: the session may live AT MOST 3 days from
+// login. While the customer actively uses the app the client refreshes the
+// token (POST /auth/refresh), but the total window never exceeds 3 days.
+export const REMEMBER_ME_MAX_AGE = 3 * 24 * 60 * 60 // 3 days
 
 function getAuthSecret(): string {
   return process.env.NEXTAUTH_SECRET || FALLBACK_SECRET
@@ -50,8 +54,10 @@ function getSecretKey(): Uint8Array {
 /**
  * Create a signed JWT session token for a user.
  * This replaces the NextAuth `encode()` function.
+ * Task 81: `maxAgeSeconds` parametrizes the lifetime — remember-me logins
+ * issue 3-day tokens, everything else keeps the 30-day default.
  */
-export async function createSessionToken(user: SessionUser): Promise<string> {
+export async function createSessionToken(user: SessionUser, maxAgeSeconds: number = SESSION_MAX_AGE): Promise<string> {
   const secret = getSecretKey()
   const token = await new SignJWT({
     id: user.id,
@@ -64,7 +70,7 @@ export async function createSessionToken(user: SessionUser): Promise<string> {
   })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
-    .setExpirationTime(`${SESSION_MAX_AGE}s`)
+    .setExpirationTime(`${maxAgeSeconds}s`)
     .sign(secret)
   return token
 }

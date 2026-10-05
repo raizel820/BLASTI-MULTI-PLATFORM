@@ -21,6 +21,8 @@ export type ViewName =
   | 'customer-profile'
   | 'customer-favorites'
   | 'customer-settings'
+  | 'customer-agency-profile'
+  | 'customer-branch-profile'
   | 'customer-sms-wallet'
   | 'customer-analytics'
   | 'customer-support'
@@ -66,6 +68,7 @@ interface UserState {
   agencyNameAr?: string;
   agencyNameFr?: string;
   phoneNumber?: string;
+  email?: string;
   freeSmsCount?: number;
   createdAt?: string;
 }
@@ -117,6 +120,27 @@ interface AppState {
   biometricLoginEnabled: boolean;
   biometricUsername: string | null;
 
+  // Task 81 — "ask for biometrics every time the app opens". When true AND
+  // the account is active (a session exists), the BiometricAppLock gate
+  // challenges biometrics on every app launch and every return from the
+  // background, before the UI can be used.
+  biometricOnAppOpen: boolean;
+
+  // Task 81 — remember-me session policy. When the customer signs in with
+  // "Remember me" checked, the session is refreshed while the app is being
+  // used (session-keeper → POST /api/auth/refresh) but HARD-EXPIRES 3 days
+  // after login: after that the customer must re-authenticate with
+  // username/password — or biometrics when enrolled.
+  rememberSession: boolean;
+  sessionStartedAt: number | null;
+  lastSessionRefreshAt: number;
+
+  // Task 81 — customer-facing agency profile (session-scoped, NOT persisted).
+  agencyProfileId: string | null;
+
+  // Task 83 — customer-facing BRANCH profile (session-scoped, NOT persisted).
+  branchProfileId: string | null;
+
   // Actions
   setUser: (user: UserState | null) => void;
   setSessionToken: (token: string) => void;
@@ -129,6 +153,17 @@ interface AppState {
   setOnboarded: (v: boolean) => void;
   /** Task 80 — enable/disable biometric quick-unlock (username = credential owner). */
   setBiometricLogin: (enabled: boolean, username?: string | null) => void;
+  /** Task 81 — require a biometric challenge on every app open (account active). */
+  setBiometricOnAppOpen: (enabled: boolean) => void;
+  /** Task 81 — mark this login as a remember-me session (starts the 3-day window). */
+  beginRememberSession: () => void;
+  /** Task 81 — forget the remember-me session marker (logout / non-remember login). */
+  clearRememberSession: () => void;
+  /** Task 81 — record a successful session-token refresh. */
+  markSessionRefreshed: () => void;
+  /** Task 81 — open the customer-facing agency profile view for this agency. */
+  setAgencyProfileId: (id: string | null) => void;
+  setBranchProfileId: (id: string | null) => void;
 }
 
 // ─── Hash-based navigation helpers ─────────────────────────────────────────
@@ -142,6 +177,8 @@ const viewHashMap: Record<ViewName, string> = {
   'customer-history': '#/customer/history',
   'customer-notifications': '#/customer/notifications',
   'customer-profile': '#/customer/profile',
+  'customer-agency-profile': '#/customer/agency-profile',
+  'customer-branch-profile': '#/customer/branch-profile',
   'customer-favorites': '#/customer/favorites',
   'customer-settings': '#/customer/settings',
   'customer-analytics': '#/customer/analytics',
@@ -273,6 +310,8 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'landing', 'login', 'register',
   'customer-home', 'customer-queue', 'customer-history', 'customer-notifications',
   'customer-profile', 'customer-favorites', 'customer-settings', 'customer-sms-wallet',
+  'customer-agency-profile',
+  'customer-branch-profile',
   'customer-analytics',
   'agency-dashboard', 'agency-settings', 'agency-employees', 'agency-profile',
   'agency-reviews', 'agency-subscription', 'agency-branches', 'agency-devices',
@@ -335,6 +374,7 @@ function sanitizeUser(user: unknown): UserState | null {
     agencyNameAr: typeof u.agencyNameAr === 'string' ? u.agencyNameAr : undefined,
     agencyNameFr: typeof u.agencyNameFr === 'string' ? u.agencyNameFr : undefined,
     phoneNumber: typeof u.phoneNumber === 'string' ? u.phoneNumber : undefined,
+    email: typeof u.email === 'string' && u.email ? u.email : undefined,
     freeSmsCount,
     createdAt: typeof u.createdAt === 'string' ? u.createdAt : undefined,
   };
@@ -360,6 +400,10 @@ function sanitizePersistedState(state: any): {
   sessionToken: string;
   biometricLoginEnabled: boolean;
   biometricUsername: string | null;
+  biometricOnAppOpen: boolean;
+  rememberSession: boolean;
+  sessionStartedAt: number | null;
+  lastSessionRefreshAt: number;
 } {
   const user = sanitizeUser(state?.user);
   const isAuthenticated = sanitizeIsAuthenticated(state?.isAuthenticated);
@@ -377,9 +421,23 @@ function sanitizePersistedState(state: any): {
   const biometricUsername = typeof state?.biometricUsername === 'string' && state.biometricUsername
     ? state.biometricUsername
     : null;
+  // Task 81 — app-open biometric gate + remember-me session policy fields.
+  const biometricOnAppOpen = state?.biometricOnAppOpen === true;
+  const rememberSession = state?.rememberSession === true;
+  const sessionStartedAt = typeof state?.sessionStartedAt === 'number' && Number.isFinite(state.sessionStartedAt)
+    ? state.sessionStartedAt
+    : null;
+  const lastSessionRefreshAt = typeof state?.lastSessionRefreshAt === 'number' && Number.isFinite(state.lastSessionRefreshAt)
+    ? state.lastSessionRefreshAt
+    : 0;
 
   // If user is null but isAuthenticated is true, fix the inconsistency
   const safeIsAuthenticated = user ? isAuthenticated : false;
+
+  // A remember-session marker without an authenticated user is meaningless —
+  // drop it so the session-keeper never fights a dead marker.
+  const safeRememberSession = rememberSession && !!user && safeIsAuthenticated;
+  const safeSessionStartedAt = safeRememberSession ? sessionStartedAt : null;
 
   // If user is not authenticated but currentView is a protected view, reset to landing
   const safeView = (!user && !isAuthView(currentView)) ? 'landing' : currentView;
@@ -393,6 +451,10 @@ function sanitizePersistedState(state: any): {
     sessionToken,
     biometricLoginEnabled,
     biometricUsername,
+    biometricOnAppOpen,
+    rememberSession: safeRememberSession,
+    sessionStartedAt: safeSessionStartedAt,
+    lastSessionRefreshAt,
   };
 }
 
@@ -412,6 +474,12 @@ export const useAppStore = create<AppState>()(
       onboarded: false,
       biometricLoginEnabled: false,
       biometricUsername: null,
+      biometricOnAppOpen: false,
+      rememberSession: false,
+      sessionStartedAt: null,
+      lastSessionRefreshAt: 0,
+      agencyProfileId: null,
+      branchProfileId: null,
 
       setSessionToken: (token) => {
         // Task 33-E — fresh auth re-enables everything the revocation guards
@@ -494,7 +562,28 @@ export const useAppStore = create<AppState>()(
           biometricUsername: enabled
             ? (username ?? state.biometricUsername ?? null)
             : null,
+          // Task 81 — the app-open gate depends on an enrolled credential;
+          // killing the master switch kills the gate too.
+          biometricOnAppOpen: enabled ? state.biometricOnAppOpen : false,
         })),
+
+      setBiometricOnAppOpen: (enabled) => set({ biometricOnAppOpen: enabled }),
+
+      beginRememberSession: () =>
+        set({
+          rememberSession: true,
+          sessionStartedAt: Date.now(),
+          lastSessionRefreshAt: Date.now(),
+        }),
+
+      clearRememberSession: () =>
+        set({ rememberSession: false, sessionStartedAt: null, lastSessionRefreshAt: 0 }),
+
+      markSessionRefreshed: () => set({ lastSessionRefreshAt: Date.now() }),
+
+      setAgencyProfileId: (id) => set({ agencyProfileId: id }),
+
+      setBranchProfileId: (id) => set({ branchProfileId: id }),
 
       // Task 37-e: cache/refill/clear the agency authority. `null` clears.
       setAgencyAuthority: (authority) => set({ agencyAuthority: authority }),
@@ -514,6 +603,14 @@ export const useAppStore = create<AppState>()(
           sidebarOpen: false,
           pendingAgencyCode: null,
           onboarded: false,
+          // Task 81 — a logged-out account has no session to remember; the
+          // 3-day window dies with it. Biometric flags are DEVICE-level and
+          // deliberately survive (the keystore credential is untouched).
+          rememberSession: false,
+          sessionStartedAt: null,
+          lastSessionRefreshAt: 0,
+          agencyProfileId: null,
+          branchProfileId: null,
         });
         // Clear Electron cloud sync auth on logout
         const w = window as any;
@@ -562,6 +659,12 @@ export const useAppStore = create<AppState>()(
         // Task 80 — device-local biometric quick-unlock prefs.
         biometricLoginEnabled: state.biometricLoginEnabled,
         biometricUsername: state.biometricUsername,
+        // Task 81 — app-open biometric gate + remember-me session policy
+        // (the 3-day wall must survive app restarts to be a real wall).
+        biometricOnAppOpen: state.biometricOnAppOpen,
+        rememberSession: state.rememberSession,
+        sessionStartedAt: state.sessionStartedAt,
+        lastSessionRefreshAt: state.lastSessionRefreshAt,
       }),
       // Deep merge with null safety — Phase 6b: sanitize persisted state to prevent
       // NaN/null/corrupted values from leaking into the live store.

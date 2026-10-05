@@ -25,8 +25,9 @@ import { useTheme } from 'next-themes';
 import { toast } from 'sonner';
 
 import { useProfileData } from './profile/use-profile-data';
-import { ProfilePhoneNumber } from './profile/profile-phone-number';
+import { ProfilePersonalInfo } from './profile/profile-personal-info';
 import { ProfileChangePassword } from './profile/profile-change-password';
+import { ProfileSoundSettings } from './profile/profile-sound-settings';
 import { ProfilePreferences } from './profile/profile-preferences';
 import { ProfileNotifications } from './profile/profile-notifications';
 import { ProfileSmsSettings } from './profile/profile-sms-settings';
@@ -165,16 +166,20 @@ export function CustomerProfile() {
           )}
         </motion.section>
 
-        {/* ─── Personal info: phone number ─── */}
-        <div id="profile-personal-info" className="scroll-mt-4">
-          <ProfilePhoneNumber
-            phoneNumber={profile.phoneNumber}
-            savingPhone={profile.savingPhone}
-            onPhoneNumberChange={profile.setPhoneNumber}
-            onSave={profile.handleSavePhone}
-            t={t}
-          />
-        </div>
+        {/* ─── Personal info: avatar + name + email + phone (Task 82) ─── */}
+        <ProfilePersonalInfo
+          fullName={profile.fullName}
+          email={profile.email}
+          phoneNumber={profile.phoneNumber}
+          avatarUrl={profile.avatarUrl}
+          saving={profile.savingPersonalInfo}
+          onFullNameChange={profile.setFullName}
+          onEmailChange={profile.setEmail}
+          onPhoneNumberChange={profile.setPhoneNumber}
+          onAvatarUrlChange={profile.setAvatarUrl}
+          onSave={profile.handleSavePersonalInfo}
+          t={t}
+        />
 
         {/* ─── Change password ─── */}
         <ProfileChangePassword
@@ -207,6 +212,9 @@ export function CustomerProfile() {
           onSave={profile.saveNotifPrefs}
           t={t}
         />
+
+        {/* ─── Notification sound (volume + custom song — Task 82) ─── */}
+        <ProfileSoundSettings t={t} />
 
         {/* ─── SMS settings ─── */}
         <ProfileSmsSettings

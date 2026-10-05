@@ -53,6 +53,10 @@ export const loginSchema = z.object({
   username: z.string().min(1, 'Username is required'),
   password: z.string().min(1, 'Password is required'),
   expectedRole: z.enum(['CUSTOMER', 'AGENCY_OWNER', 'AGENCY_STAFF', 'SUPER_ADMIN']).optional(),
+  // Task 81 — remember-me sessions: a checked box shortens the token/cookie
+  // lifetime to 3 days AND lets the client keep it alive with
+  // POST /auth/refresh while the customer actively uses the app.
+  rememberMe: z.boolean().optional(),
 })
 
 export const registerSchema = z.object({
@@ -98,6 +102,8 @@ export const resetPasswordSchema = z.object({
 
 export const updateProfileSchema = z.object({
   fullName: z.string().min(1).max(100).optional(),
+  // Email is editable by the account owner; '' clears it (nullable column).
+  email: z.string().email().max(255).optional().or(z.literal('')),
   phoneNumber: z.string().optional(),
   language: z.enum(['en', 'ar', 'fr']).optional(),
   avatarUrl: z.string().url().optional().or(z.literal('')),
@@ -364,23 +370,53 @@ export const faqSchema = z.object({
 
 // ─── Branch ──────────────────────────────────────────────────────────────────
 
+// Task 83 — shared branch location fields (mirrors the Agency Task 51
+// contract: lat/lng pair validated by the route, city/wilaya/postalCode
+// free-form, value enums for the provenance badges).
+const branchLocationCreateSchema = {
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  city: z.string().max(100).optional(),
+  wilaya: z.string().max(10).optional(),
+  postalCode: z.string().max(20).optional(),
+  locationVerified: z.enum(['VERIFIED', 'UNVERIFIED', 'MANUAL']).optional(),
+  locationSource: z.enum(['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']).optional(),
+}
+
+const branchLocationUpdateSchema = {
+  latitude: z.number().min(-90).max(90).nullable().optional(),
+  longitude: z.number().min(-180).max(180).nullable().optional(),
+  city: z.string().max(100).nullable().optional(),
+  wilaya: z.string().max(10).nullable().optional(),
+  postalCode: z.string().max(20).nullable().optional(),
+  locationVerified: z.enum(['VERIFIED', 'UNVERIFIED', 'MANUAL']).nullable().optional(),
+  locationSource: z.enum(['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']).nullable().optional(),
+}
+
 export const createBranchSchema = z.object({
   name: z.string().min(1, 'Branch name is required').max(100),
   nameAr: z.string().optional(),
   nameFr: z.string().optional(),
+  /// Task 83 — customer-facing display name ("Downtown Branch", "Mall Kiosk"…)
+  specialName: z.string().max(100).optional(),
   address: z.string().max(200).optional(),
   phone: z.string().max(20).optional(),
   isMain: z.boolean().optional().default(false),
+  // Task 83 — a branch MUST carry its location at creation (user requirement:
+  // "each branch has to input its locations when creating").
+  ...branchLocationCreateSchema,
 })
 
 export const updateBranchSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   nameAr: z.string().optional(),
   nameFr: z.string().optional(),
+  specialName: z.string().max(100).nullable().optional(),
   address: z.string().max(200).optional(),
   phone: z.string().max(20).optional(),
   isActive: z.boolean().optional(),
   isMain: z.boolean().optional(),
+  ...branchLocationUpdateSchema,
 })
 
 // ─── Counter ─────────────────────────────────────────────────────────────────

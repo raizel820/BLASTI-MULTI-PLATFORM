@@ -20,6 +20,12 @@ export function useProfileData() {
   const [phoneNumber, setPhoneNumber] = useState(user?.phoneNumber || '');
   const [savingPhone, setSavingPhone] = useState(false);
 
+  // Personal info (Task 82) — name, email and avatar are now editable.
+  const [fullName, setFullName] = useState(user?.fullName || '');
+  const [email, setEmail] = useState(user?.email || '');
+  const [avatarUrl, setAvatarUrl] = useState(user?.avatarUrl || '');
+  const [savingPersonalInfo, setSavingPersonalInfo] = useState(false);
+
   const [notifPrefs, setNotifPrefs] = useState<NotifPrefs>({
     queue_called: true,
     turn_approaching: true,
@@ -67,6 +73,9 @@ export function useProfileData() {
             : data.notificationPreferences);
         }
         if (data.phoneNumber) setPhoneNumber(data.phoneNumber);
+        if (data.fullName) setFullName(data.fullName);
+        if (data.email !== undefined && data.email !== null) setEmail(data.email);
+        if (data.avatarUrl !== undefined && data.avatarUrl !== null) setAvatarUrl(data.avatarUrl);
         if (data.freeSmsCount !== undefined) setSmsCount(data.freeSmsCount);
         if (data.reminderMinutes !== undefined) setReminderMinutesVal(data.reminderMinutes);
         if (data.smsNotificationsEnabled !== undefined) setSmsNotifEnabled(data.smsNotificationsEnabled);
@@ -135,8 +144,85 @@ export function useProfileData() {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id, phoneNumber: phoneNumber.trim() }),
       });
-      if (res.ok) { toast.success(t('success')); setUser({ ...user, phoneNumber: phoneNumber.trim() }); }
+      if (res.ok) {
+        toast.success(t('success'));
+        setUser({ ...user, phoneNumber: phoneNumber.trim() });
+      } else {
+        const data = await res.json().catch(() => null);
+        if (res.status === 409) toast.error(t('phoneNumberTaken'));
+        else toast.error(data?.error || t('error'));
+      }
     } catch { toast.error(t('error')); } finally { setSavingPhone(false); }
+  };
+
+  /**
+   * Task 82 — save the editable personal info (name, email, phone, avatar).
+   * Only changed fields are sent so untouched sections never fail validation.
+   * The store user is refreshed from the authoritative API response.
+   */
+  const handleSavePersonalInfo = async (next: {
+    fullName: string;
+    email: string;
+    phoneNumber: string;
+    avatarUrl?: string;
+  }): Promise<boolean> => {
+    if (!user) return false;
+    const trimmedName = next.fullName.trim();
+    if (!trimmedName) { toast.error(t('requiredField')); return false; }
+    const trimmedEmail = next.email.trim();
+    if (trimmedEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
+      toast.error(t('invalidEmail'));
+      return false;
+    }
+    setSavingPersonalInfo(true);
+    try {
+      const body: Record<string, unknown> = {
+        userId: user.id,
+        fullName: trimmedName,
+        // '' clears the email server-side (nullable column)
+        email: trimmedEmail,
+        phoneNumber: next.phoneNumber.trim(),
+      };
+      // Only send the avatar when it actually changed — sending '' would
+      // wipe an existing avatar the customer never touched.
+      if (next.avatarUrl !== undefined && next.avatarUrl !== (user.avatarUrl ?? '')) {
+        body.avatarUrl = next.avatarUrl;
+      }
+
+      const res = await apiFetch('/api/user/profile', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data) {
+        setFullName(data.fullName ?? trimmedName);
+        setEmail(data.email ?? '');
+        if (data.phoneNumber) setPhoneNumber(data.phoneNumber);
+        if (data.avatarUrl !== undefined && data.avatarUrl !== null) setAvatarUrl(data.avatarUrl);
+        // Refresh the session user so the header/avatar reflect the change.
+        setUser({
+          ...user,
+          fullName: data.fullName ?? user.fullName,
+          email: data.email ?? undefined,
+          phoneNumber: data.phoneNumber ?? user.phoneNumber,
+          avatarUrl: data.avatarUrl ?? user.avatarUrl,
+        });
+        toast.success(t('success'));
+        return true;
+      }
+      if (res.status === 409) {
+        const msg = String(data?.error || '');
+        toast.error(msg.includes('email') ? t('emailTaken') : t('phoneNumberTaken'));
+      } else {
+        toast.error(data?.error || t('error'));
+      }
+      return false;
+    } catch {
+      toast.error(t('error'));
+      return false;
+    } finally {
+      setSavingPersonalInfo(false);
+    }
   };
 
   const handleSaveSmsSettings = async () => {
@@ -215,6 +301,9 @@ export function useProfileData() {
     user, setUser, logout, t, lang,
     // Phone
     phoneNumber, savingPhone, setPhoneNumber, handleSavePhone,
+    // Personal info (name/email/avatar — Task 82)
+    fullName, setFullName, email, setEmail, avatarUrl, setAvatarUrl,
+    savingPersonalInfo, handleSavePersonalInfo,
     // Notif prefs
     notifPrefs, notifLoading, notifSaving, handleToggleNotifPref, saveNotifPrefs,
     // Delete account

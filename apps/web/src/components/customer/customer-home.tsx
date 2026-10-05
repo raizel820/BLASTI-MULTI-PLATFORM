@@ -53,6 +53,7 @@ import {
   ScanLine,
   History,
   Bell,
+  Building2,
   Zap,
   RefreshCw,
   Navigation,
@@ -74,6 +75,10 @@ import { CustomerQrScanner } from '@/components/customer/customer-qr-scanner';
 import { getAgencyName, getCategoryLabel, type AgencyListItem, type AgencyDetail } from './home/types';
 import { CategoryFilters } from './home/CategoryFilters';
 import { AgencyCard } from './home/AgencyCard';
+import { BranchCard, type BranchListItem } from './home/BranchCard';
+import { useCustomerLocation } from '@/hooks/use-customer-location';
+import { useDebounce } from '@/hooks/use-debounce';
+import { haversineDistanceKm } from '@/lib/geo';
 import { ActiveTicketStrip, type ActiveTicket } from './home/ActiveTicketStrip';
 
 export function CustomerHome() {
@@ -97,6 +102,29 @@ export function CustomerHome() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchSectionRef = useRef<HTMLDivElement>(null);
   const [showSuggestions, setShowSuggestions] = useState(false);
+
+  // Task 83-c-1 — branch-level search results (GET /api/agencies/branches,
+  // Task 83-a). Fetched ONLY while a search query is active; a failed branch
+  // fetch is caught silently and surfaces as a tiny inline retry — it must
+  // NEVER break the agency results.
+  const [branchResults, setBranchResults] = useState<BranchListItem[]>([]);
+  const [branchTotal, setBranchTotal] = useState(0);
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  const [branchesFailed, setBranchesFailed] = useState(false);
+  const [branchRetryTick, setBranchRetryTick] = useState(0);
+
+  // Task 82 — estimated distance per agency card. Only computed when the
+  // device's location permission is ALREADY granted (never prompts); the
+  // position is cached module-level (5 min TTL) inside the hook.
+  const { position: customerPosition } = useCustomerLocation(true);
+
+  // Task 83-c-1 — debounced search query driving the branch search endpoint.
+  // The agency list is preloaded and filtered client-side (unchanged default
+  // browse experience); only the branch fetch is network-driven, sharing the
+  // same debounce window as the search input.
+  const debouncedSearchQuery = useDebounce(searchQuery, 350);
+  const activeSearch = debouncedSearchQuery.trim();
+  const searchActive = activeSearch.length > 0;
 
   // Date picker state (join flow)
   const [dateDialogOpen, setDateDialogOpen] = useState(false);
@@ -162,6 +190,51 @@ export function CustomerHome() {
       setLoading(false);
     }
   };
+
+  // Task 83-c-1 — branch-level search. Runs in parallel with the (unchanged,
+  // client-side filtered) agency flow: independent effect, independent state,
+  // silent catch. Rate-limited endpoint → debounced query + fetch on change.
+  useEffect(() => {
+    const query = activeSearch;
+    if (!query) {
+      setBranchResults([]);
+      setBranchTotal(0);
+      setBranchesLoading(false);
+      setBranchesFailed(false);
+      return;
+    }
+    let cancelled = false;
+    const fetchBranches = async () => {
+      setBranchesLoading(true);
+      setBranchesFailed(false);
+      try {
+        const params = new URLSearchParams({ search: query, limit: '20', offset: '0' });
+        if (selectedCategory !== 'ALL') params.set('category', selectedCategory);
+        const res = await apiFetch(`/api/agencies/branches?${params.toString()}`);
+        if (cancelled) return;
+        if (res.ok) {
+          const data = await res.json();
+          const list: BranchListItem[] = Array.isArray(data.branches) ? data.branches : [];
+          setBranchResults(list);
+          setBranchTotal(typeof data.total === 'number' ? data.total : list.length);
+        } else {
+          setBranchResults([]);
+          setBranchTotal(0);
+          setBranchesFailed(true);
+        }
+      } catch {
+        if (!cancelled) {
+          setBranchResults([]);
+          setBranchTotal(0);
+          setBranchesFailed(true);
+        }
+      } finally {
+        if (!cancelled) setBranchesLoading(false);
+      }
+    };
+    fetchBranches();
+    return () => { cancelled = true; };
+  }, [activeSearch, selectedCategory, branchRetryTick]);
 
   const filteredAgencies = useMemo(() => {
     return agencies.filter((a) => {
@@ -270,6 +343,13 @@ export function CustomerHome() {
 
   const handleSelectAgency = async (agency: AgencyListItem) => {
     await fetchAgencyDetail(agency.customCode);
+  };
+
+  // Task 83-c-1 — branch profile navigation (store plumbing from Task 83-a,
+  // consumed — not modified). Mirrors the AgencyCard.onViewProfile pattern.
+  const handleSelectBranch = (branch: BranchListItem) => {
+    useAppStore.getState().setBranchProfileId(branch.id);
+    setView('customer-branch-profile');
   };
 
   // Quick join: go straight to date picker without showing agency detail
@@ -473,6 +553,30 @@ export function CustomerHome() {
 
   // Compute quick stats
   const openAgencyCount = useMemo(() => agencies.filter(a => a.isQueueOpen && !a.isPaused).length, [agencies]);
+
+  // Task 82 — agencyId → straight-line km from the customer's position.
+  const distanceByAgencyId = useMemo(() => {
+    if (!customerPosition) return null as Record<string, number> | null;
+    const map: Record<string, number> = {};
+    agencies.forEach((a) => {
+      if (typeof a.latitude === 'number' && typeof a.longitude === 'number') {
+        map[a.id] = haversineDistanceKm(customerPosition, { lat: a.latitude, lng: a.longitude });
+      }
+    });
+    return map;
+  }, [customerPosition, agencies]);
+
+  // Task 83-c-1 — branchId → straight-line km (same pattern as agencies).
+  const distanceByBranchId = useMemo(() => {
+    if (!customerPosition) return null as Record<string, number> | null;
+    const map: Record<string, number> = {};
+    branchResults.forEach((b) => {
+      if (typeof b.latitude === 'number' && typeof b.longitude === 'number') {
+        map[b.id] = haversineDistanceKm(customerPosition, { lat: b.latitude, lng: b.longitude });
+      }
+    });
+    return map;
+  }, [customerPosition, branchResults]);
 
   // Compute category counts for filter badges
   const categoryCounts = useMemo(() => {
@@ -989,6 +1093,67 @@ export function CustomerHome() {
         })}
       </div>
 
+      {/* ── 5.5 Branch search results (Task 83-c-1) — rendered ONLY while a
+          search query is active. Empty results render nothing; a failed
+          fetch renders a tiny inline retry and never affects the agency grid. ── */}
+      {searchActive && (branchesLoading || branchesFailed || branchResults.length > 0) && (
+        <div className="mb-4">
+          <div className="flex items-center justify-between mb-2.5">
+            <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
+              <Building2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+              {t('branchResults')}
+            </h2>
+            {!branchesLoading && branchTotal > 0 && (
+              <span className="text-[10px] text-muted-foreground font-medium">
+                {branchTotal} {t('searchResultsCount')}
+              </span>
+            )}
+          </div>
+          {branchesLoading ? (
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+              {[...Array(4)].map((_, i) => (
+                <div key={i} className="rounded-2xl border border-border/40 bg-white dark:bg-gray-900/80 p-3.5 space-y-2.5">
+                  <div className="flex items-start justify-between">
+                    <div className="h-9 w-9 rounded-xl bg-emerald-100/80 dark:bg-emerald-900/30 animate-pulse" />
+                    <div className="h-3 w-10 rounded-full bg-emerald-50 dark:bg-emerald-900/20 animate-pulse" />
+                  </div>
+                  <div className="space-y-1.5">
+                    <div className="h-3.5 w-3/4 rounded-full bg-gray-100 dark:bg-gray-800 animate-pulse" />
+                    <div className="h-2.5 w-1/2 rounded-full bg-gray-50 dark:bg-gray-800/50 animate-pulse" />
+                  </div>
+                  <div className="h-4 w-20 rounded-full bg-teal-50 dark:bg-teal-900/20 animate-pulse" />
+                </div>
+              ))}
+            </div>
+          ) : branchesFailed ? (
+            <div className="flex items-center justify-center gap-2 py-3 rounded-2xl border border-border/50 bg-muted/50">
+              <span className="text-xs text-muted-foreground">{t('error')}</span>
+              <button
+                onClick={() => setBranchRetryTick((n) => n + 1)}
+                className="h-8 px-3 rounded-full flex items-center gap-1 text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 transition-colors"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                {t('tryAgain')}
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+              {branchResults.map((branch, idx) => (
+                <BranchCard
+                  key={branch.id}
+                  branch={branch}
+                  index={idx}
+                  lang={lang}
+                  t={t}
+                  onSelectBranch={handleSelectBranch}
+                  distanceKm={distanceByBranchId?.[branch.id] ?? null}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* ── 6. Agency grid ── */}
       <div className="flex items-center justify-between mb-2.5">
         <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
@@ -1045,6 +1210,11 @@ export function CustomerHome() {
               onSelect={handleSelectAgency}
               onToggleFavorite={toggleFavorite}
               onQuickJoin={(agencyId) => handleQuickJoin(agencyId)}
+              distanceKm={distanceByAgencyId?.[agency.id] ?? null}
+              onViewProfile={(agency) => {
+                useAppStore.getState().setAgencyProfileId(agency.id);
+                setView('customer-agency-profile');
+              }}
             />
           ))}
         </div>

@@ -47,6 +47,11 @@ export interface AgencyListItem {
   averageRating?: number;
   reviewCount?: number;
   subscriptionStatus?: string;
+  // Task 82 — canonical coordinates (already returned by GET /api/agencies);
+  // used to compute the estimated distance when the customer's location
+  // access is granted. Optional: older payloads omit them.
+  latitude?: number | null;
+  longitude?: number | null;
 }
 
 export interface AgencyDetail {

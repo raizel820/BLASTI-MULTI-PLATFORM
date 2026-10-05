@@ -581,9 +581,11 @@ CREATE TABLE "Review" (
     "updatedAt" DATETIME NOT NULL,
     "userId" TEXT NOT NULL,
     "agencyId" TEXT NOT NULL,
+    "branchId" TEXT,
     "reservationId" TEXT,
     CONSTRAINT "Review_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE RESTRICT ON UPDATE CASCADE,
     CONSTRAINT "Review_agencyId_fkey" FOREIGN KEY ("agencyId") REFERENCES "Agency" ("id") ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT "Review_branchId_fkey" FOREIGN KEY ("branchId") REFERENCES "Branch" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT "Review_reservationId_fkey" FOREIGN KEY ("reservationId") REFERENCES "Reservation" ("id") ON DELETE SET NULL ON UPDATE CASCADE
 );
 
@@ -638,10 +640,20 @@ CREATE TABLE "Branch" (
     "name" TEXT NOT NULL,
     "nameAr" TEXT,
     "nameFr" TEXT,
+    "specialName" TEXT,
+    "subCode" TEXT,
     "address" TEXT,
     "phone" TEXT,
     "isActive" BOOLEAN NOT NULL DEFAULT true,
     "isMain" BOOLEAN NOT NULL DEFAULT false,
+    "latitude" DOUBLE PRECISION,
+    "longitude" DOUBLE PRECISION,
+    "city" TEXT,
+    "wilaya" TEXT,
+    "postalCode" TEXT,
+    "locationVerified" TEXT DEFAULT 'UNVERIFIED',
+    "locationSource" TEXT,
+    "locationUpdatedAt" DATETIME,
     "agencyId" TEXT NOT NULL,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
@@ -1081,7 +1093,10 @@ CREATE UNIQUE INDEX "Favorite_userId_agencyId_key" ON "Favorite"("userId", "agen
 CREATE UNIQUE INDEX "Review_reservationId_key" ON "Review"("reservationId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "Review_userId_agencyId_key" ON "Review"("userId", "agencyId");
+CREATE UNIQUE INDEX "Review_userId_agencyId_branchId_key" ON "Review"("userId", "agencyId", "branchId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Branch_subCode_key" ON "Branch"("subCode");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "AgencyCategory_name_key" ON "AgencyCategory"("name");
@@ -1366,7 +1381,10 @@ CREATE UNIQUE INDEX "Favorite_userId_agencyId_key" ON "Favorite"("userId", "agen
 CREATE UNIQUE INDEX "Review_reservationId_key" ON "Review"("reservationId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "Review_userId_agencyId_key" ON "Review"("userId", "agencyId");
+CREATE UNIQUE INDEX "Review_userId_agencyId_branchId_key" ON "Review"("userId", "agencyId", "branchId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "Branch_subCode_key" ON "Branch"("subCode");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Counter_currentReservationId_key" ON "Counter"("currentReservationId");
