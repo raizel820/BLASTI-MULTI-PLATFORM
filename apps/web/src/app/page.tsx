@@ -90,7 +90,6 @@ import { PlatformSwitcher } from '@/components/shared/platform-switcher';
 import { PlatformBadge } from '@/components/shared/platform-badge';
 import { ConnectionStatus, ConnectionDot, onCloudStatusChange } from '@/components/shared/connection-status';
 import { OfflineDiagnosisPanel } from '@/components/shared/offline-diagnosis-panel';
-import { NotificationBadge } from '@/components/shared/notification-badge';
 import { BlastiSkeleton, BlastiSkeletonCompact } from '@/components/shared/blasti-skeleton';
 import { BootGate } from '@/components/shared/boot-gate';
 import { PostLoginSyncGate } from '@/components/shared/post-login-sync-gate';
@@ -836,7 +835,9 @@ export default function Home() {
               <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <ConnectionDot />
               </span>
-              <NotificationBadge variant="agency" />
+              {/* One-bell rule (field report): agency/admin get exactly ONE bell —
+                  the rich NotificationCenter panel. The small NotificationBadge
+                  popover was a duplicate bell next to it. */}
               <Suspense fallback={<BlastiSkeletonCompact />}>
                 <NotificationCenter />
               </Suspense>
