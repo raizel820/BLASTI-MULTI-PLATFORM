@@ -69,6 +69,7 @@ import { agencyDeviceRoutes } from './routes/agency-devices'
 import { agencyCategoriesRoutes } from './routes/agency-categories'
 import { adminProviderRoutes } from './routes/admin-providers'
 import { appVersionRoutes } from './routes/app-versions'
+import { systemStatusRoutes } from './routes/system-status'
 // Task 54-a — doc-2 role-scoped analytics (staff + customer modules)
 import { staffAnalyticsRoutes } from './routes/staff-analytics'
 import { customerAnalyticsRoutes } from './routes/customer-analytics'
@@ -602,6 +603,7 @@ app.route('/api/agency-devices', agencyDeviceRoutes)
 // Task 42-b — user-created agency fields/industries (global dictionary).
 app.route('/api/agency-categories', agencyCategoriesRoutes)
 app.route('/api/app-versions', appVersionRoutes)
+app.route('/api/system', systemStatusRoutes)
 // Task 54-a — role-scoped analytics modules (doc-2 spec §29-44)
 app.route('/api/staff/analytics', staffAnalyticsRoutes)
 app.route('/api/customer/analytics', customerAnalyticsRoutes)

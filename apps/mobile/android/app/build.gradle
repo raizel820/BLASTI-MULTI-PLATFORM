@@ -1,5 +1,14 @@
 apply plugin: 'com.android.application'
 
+// Optional release signing via environment variables (used by CI).
+// Locally nothing changes: without the env vars the release build stays
+// unsigned exactly as before.
+//   BLASTI_KEYSTORE_PATH / BLASTI_KEYSTORE_PASSWORD / BLASTI_KEY_ALIAS / BLASTI_KEY_PASSWORD
+def blastiKeystorePath = System.getenv("BLASTI_KEYSTORE_PATH")
+def blastiKeystoreConfigured = blastiKeystorePath != null && !blastiKeystorePath.trim().isEmpty() \
+        && System.getenv("BLASTI_KEYSTORE_PASSWORD") != null \
+        && file(blastiKeystorePath).exists()
+
 android {
     namespace = "com.blasti.mobile"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -16,10 +25,23 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        if (blastiKeystoreConfigured) {
+            ciRelease {
+                storeFile file(blastiKeystorePath)
+                storePassword System.getenv("BLASTI_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("BLASTI_KEY_ALIAS") ?: "blasti"
+                keyPassword System.getenv("BLASTI_KEY_PASSWORD") ?: System.getenv("BLASTI_KEYSTORE_PASSWORD")
+            }
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (blastiKeystoreConfigured) {
+                signingConfig signingConfigs.ciRelease
+            }
         }
     }
 }

@@ -17,6 +17,7 @@ import type {
   Marker as MlMarker,
   Popup as MlPopup,
   ErrorEvent as MlErrorEvent,
+  StyleSpecification,
 } from 'maplibre-gl';
 
 /**
@@ -51,6 +52,105 @@ function webGLSupported(mod: MapLibreModule): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * How long a style gets to produce its first `load` event before it is
+ * declared dead and the next fallback style is tried. The previous behavior
+ * RESOLVED after this timeout (the map went "ready" and showed a pin over a
+ * dead grey/white canvas forever — exactly the field report). Resolving into
+ * a blank canvas is never correct: reject so the caller can fall back.
+ */
+const STYLE_LOAD_TIMEOUT_MS = 7000;
+
+/**
+ * Bulletproof final style fallback: an inline RASTER style with zero external
+ * style-JSON/sprite/glyph dependencies. Even when the configured vector style
+ * (or its tiles.openfreemap.org CDN) is unreachable — ISP filtering, DNS
+ * issues, captive portals — tile.openstreetmap.org renders a real map.
+ * Markers/popups are DOM overlays and work identically on raster styles.
+ */
+const OSM_RASTER_STYLE: StyleSpecification = {
+  version: 8,
+  sources: {
+    osm: {
+      type: 'raster',
+      tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+      tileSize: 256,
+      maxzoom: 19,
+      attribution: '© OpenStreetMap contributors',
+    },
+  },
+  layers: [
+    {
+      id: 'osm-raster',
+      type: 'raster',
+      source: 'osm',
+    },
+  ],
+};
+
+/**
+ * Construct a MapLibre map for ONE style and resolve only on a genuine `load`
+ * (style + first render). Fatal pre-load errors and the hard timeout reject,
+ * so the style fallback chain (and finally the provider fallback chain) can
+ * take over instead of leaving a dead canvas on screen.
+ */
+function loadMapWithStyle(
+  mod: MapLibreModule,
+  container: HTMLElement,
+  style: string | StyleSpecification,
+  initOpts?: MapInitOptions,
+): Promise<MlMap> {
+  return new Promise<MlMap>((resolve, reject) => {
+    let settled = false;
+    let map: MlMap | null = null;
+
+    const onError = (event: MlErrorEvent) => {
+      if (settled) return;
+      const err = event?.error;
+      const message = err?.message ?? '';
+      const name = (err as { name?: string } | null)?.name ?? '';
+      const status = (err as { status?: number } | null)?.status;
+      const looksFatal =
+        status === 0 ||
+        /webgl|context (lost|created)|failed to fetch|style/i.test(message) ||
+        /WebGL|SecurityError/.test(name);
+      if (!looksFatal) return; // tile hiccup — the `load` event still may fire
+      settled = true;
+      reject(new Error(`OPENFREEMAP_STYLE_FAILED: ${name || 'Error'}: ${message || 'style failed before load'}`));
+    };
+
+    try {
+      map = new mod.Map({
+        container,
+        style,
+        center: [
+          initOpts?.center?.lng ?? 1.6596,
+          initOpts?.center?.lat ?? 28.0339,
+        ],
+        zoom: initOpts?.zoom ?? 5,
+        // BLASTI renders its own controls; keep attribution (license).
+        attributionControl: { compact: true },
+      });
+    } catch (err) {
+      settled = true;
+      reject(err instanceof Error ? err : new Error('OPENFREEMAP_MAP_CONSTRUCTOR_FAILED'));
+      return;
+    }
+
+    map.on('error', onError);
+    map.once('load', () => {
+      if (settled) return;
+      settled = true;
+      resolve(map!);
+    });
+    setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`OPENFREEMAP_STYLE_TIMEOUT: no load within ${STYLE_LOAD_TIMEOUT_MS}ms`));
+    }, STYLE_LOAD_TIMEOUT_MS);
+  });
 }
 
 let maplibrePromise: Promise<MapLibreModule> | null = null;
@@ -111,45 +211,47 @@ export function createOpenFreeMapProvider(opts: { styleUrl: string }): MapProvid
         throw new Error('WebGL not supported');
       }
 
-      map = new mod.Map({
-        container,
-        style: opts.styleUrl || 'https://tiles.openfreemap.org/styles/liberty',
-        center: [
-          initOpts?.center?.lng ?? 1.6596,
-          initOpts?.center?.lat ?? 28.0339,
-        ],
-        zoom: initOpts?.zoom ?? 5,
-        // BLASTI renders its own controls; keep attribution (license).
-        attributionControl: { compact: true },
-      });
+      // Style fallback chain: the configured style first, then the inline
+      // OSM raster style. Each style gets one genuine `load`-or-fail cycle;
+      // a style that cannot produce tiles within the timeout is destroyed
+      // and the next one takes over. Only a total failure of every style
+      // rejects — which the provider fallback chain (lib/map index.ts) then
+      // escalates to the other provider / graceful UI state.
+      const styles: Array<string | StyleSpecification> = [
+        opts.styleUrl || 'https://tiles.openfreemap.org/styles/liberty',
+        OSM_RASTER_STYLE,
+      ];
 
-      // Task 2-a (b): style-load errors used to be completely silent (the
-      // 6s timeout resolved regardless → 'ready' → grey canvas). Listen for
-      // maplibre `error` events: fatal-looking ones BEFORE `load` reject
-      // init; everything after `load` is non-fatal (warn once, never reject).
-      let loadFired = false;
-      let fatal: Error | null = null;
+      let lastError: Error | null = null;
+      for (const style of styles) {
+        if (destroyed) return;
+        try {
+          map = await loadMapWithStyle(mod, container, style, initOpts);
+          lastError = null;
+          break;
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          // Tear down the half-constructed map and scrub whatever DOM it
+          // left behind so the next style starts from a clean container.
+          try { map?.remove(); } catch { /* already gone */ }
+          map = null;
+          try { container.innerHTML = ''; } catch { /* non-critical */ }
+        }
+      }
+      if (!map || lastError) {
+        throw lastError ?? new Error('OPENFREEMAP_INIT_FAILED: every style failed');
+      }
+
+      // Task 2-a (b) post-load: everything after `load` is non-fatal
+      // (tile hiccups etc. — warn once, never reject).
+      let loadFired = true;
       let warnedError = false;
-      let onFatal: ((err: Error) => void) | null = null;
 
       errorHandler = (event: MlErrorEvent) => {
         const err = event?.error;
         const message = err?.message ?? '';
         const name = (err as { name?: string } | null)?.name ?? '';
-        const status = (err as { status?: number } | null)?.status;
-        const looksFatal =
-          status === 0 ||
-          /webgl|context (lost|created)|failed to fetch|style/i.test(message) ||
-          /WebGL|SecurityError/.test(name);
-        if (!loadFired) {
-          if (looksFatal) {
-            fatal ??= new Error(
-              `OPENFREEMAP_INIT_FAILED: ${name || 'Error'}: ${message || 'map failed before load'}`,
-            );
-            onFatal?.(fatal);
-          }
-          return;
-        }
+        if (!loadFired) return; // unreachable today — kept for safety
         // After `load`: tile hiccups etc. must NOT reject — warn once.
         if (!warnedError) {
           warnedError = true;
@@ -174,45 +276,8 @@ export function createOpenFreeMapProvider(opts: { styleUrl: string }): MapProvid
         if (clickCb) clickCb({ lat: e.lngLat.lat, lng: e.lngLat.lng });
       });
 
-      // Resolve when tiles/styles are ready so `placeMarker` right after
-      // init never races the style (MapLibre markers need the map to exist,
-      // but a loaded map avoids first-render flicker).
-      // Task 2-a (c): genuine settle — a fatal pre-load error rejects
-      // immediately; the legacy 6s hard fallback stays ONLY for browsers
-      // that never fire `load` and never reported a fatal error.
-      await new Promise<void>((resolve, reject) => {
-        if (!map) return resolve();
-        if (map.loaded()) {
-          loadFired = true;
-          return resolve();
-        }
-        let timer: ReturnType<typeof setTimeout> | null = null;
-        onFatal = (err) => {
-          if (timer) {
-            clearTimeout(timer);
-            timer = null;
-          }
-          reject(err);
-        };
-        map.once('load', () => {
-          loadFired = true;
-          if (timer) {
-            clearTimeout(timer);
-            timer = null;
-          }
-          resolve();
-          scheduleResize();
-        });
-        timer = setTimeout(() => {
-          timer = null;
-          if (fatal) {
-            reject(fatal); // fatal error seen before `load` — never fake-ready
-            return;
-          }
-          resolve();
-          scheduleResize();
-        }, 6000);
-      });
+      // First paint finished — recover any layout that raced the canvas.
+      scheduleResize();
     },
 
     setCenter(ll: LatLng): void {

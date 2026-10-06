@@ -511,7 +511,10 @@ app.get('/status', async (c) => {
     })
   } catch (error: unknown) {
     if (isRateLimitError(error)) {
-      if (clientIp) recordFailedRequest(clientIp)
+      // Rate limiting IS the punishment — a 429 must NOT also feed the
+      // abuse blocker (10 failures/5min → 30-min IP lockout), otherwise a
+      // single burst locks a legitimate user out of every public route.
+      // Genuine business 4xxs (400/404) below still record failures.
       const res = rateLimitErrorResponse(error)
       return c.json(res.data, res.status as any)
     }

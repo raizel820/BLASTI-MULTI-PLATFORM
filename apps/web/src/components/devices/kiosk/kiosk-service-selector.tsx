@@ -4,6 +4,7 @@ import { motion } from 'framer-motion';
 import { Users, Ticket, Clock, XCircle, Pause, WifiOff } from 'lucide-react';
 import type { AgencyInfo, ServiceInfo, QueueStats } from './kiosk-types';
 import { getLocalizedName } from './kiosk-types';
+import { getProxiedUrl } from '@/lib/utils';
 
 interface KioskServiceSelectorProps {
   agency: AgencyInfo;
@@ -61,7 +62,7 @@ export function KioskServiceSelector({
           </button>
           {agency.logoUrl && (
             <div className="h-10 w-10 rounded-lg overflow-hidden bg-gray-100 flex-shrink-0 p-0.5">
-              <img src={agency.logoUrl} alt={getLocalizedName(agency, lang)} className="h-full w-full object-contain" />
+              <img src={getProxiedUrl(agency.logoUrl)} alt={getLocalizedName(agency, lang)} className="h-full w-full object-contain" />
             </div>
           )}
           <div className="min-w-0">

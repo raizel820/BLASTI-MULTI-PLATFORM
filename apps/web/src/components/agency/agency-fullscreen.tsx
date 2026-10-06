@@ -5,6 +5,7 @@ import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useRealtime } from '@/hooks/use-realtime';
 import { isRTL } from '@/i18n';
+import { getProxiedUrl } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -265,7 +266,7 @@ function CustomerAvatar({ entry, size = 'md' }: { entry: QueueEntry; size?: 'sm'
   if (entry.customerAvatar) {
     return (
       <img
-        src={entry.customerAvatar}
+        src={getProxiedUrl(entry.customerAvatar)}
         alt={getDisplayName(entry)}
         className={`${sizeClasses[size]} rounded-full object-cover border-2 border-white/20 flex-shrink-0`}
       />

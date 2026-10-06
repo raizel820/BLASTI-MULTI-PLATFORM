@@ -77,8 +77,9 @@ import { Calendar } from '@/components/ui/calendar';
 import { CustomerQrScanner } from '@/components/customer/customer-qr-scanner';
 import { getAgencyName, getCategoryLabel, type AgencyListItem, type AgencyDetail } from './home/types';
 import { CategoryFilters } from './home/CategoryFilters';
-import { AgencyCard } from './home/AgencyCard';
+import { AgencyCardWide } from './home/AgencyCardWide';
 import { BranchCard, type BranchListItem } from './home/BranchCard';
+import { CardSwiper } from './home/CardSwiper';
 import { useCustomerLocation } from '@/hooks/use-customer-location';
 import { useDebounce } from '@/hooks/use-debounce';
 import { haversineDistanceKm } from '@/lib/geo';
@@ -136,13 +137,11 @@ export function CustomerHome() {
 
   // Task 83-c-1 — branch-level search results (GET /api/agencies/branches,
   // Task 83-a). Fetched ONLY while a search query is active; a failed branch
-  // fetch is caught silently and surfaces as a tiny inline retry — it must
-  // NEVER break the agency results.
+  // fetch degrades SILENTLY (never breaks the agency results — see the
+  // failure policy on the effect below).
   const [branchResults, setBranchResults] = useState<BranchListItem[]>([]);
   const [branchTotal, setBranchTotal] = useState(0);
   const [branchesLoading, setBranchesLoading] = useState(false);
-  const [branchesFailed, setBranchesFailed] = useState(false);
-  const [branchRetryTick, setBranchRetryTick] = useState(0);
 
   // Task 82 — estimated distance per agency card. Only computed when the
   // device's location permission is ALREADY granted (never prompts); the
@@ -246,22 +245,37 @@ export function CustomerHome() {
     }
   };
 
-  // Task 83-c-1 — branch-level search. Runs in parallel with the (unchanged,
-  // client-side filtered) agency flow: independent effect, independent state,
-  // silent catch. Rate-limited endpoint → debounced query + fetch on change.
+  // Task 83-c-1 / field-fix — branch-level search. Runs in parallel with the
+  // (unchanged, client-side filtered) agency flow: independent effect,
+  // independent state. Rate-limited endpoint → debounced query + fetch on
+  // change.
+  //
+  // FAILURE POLICY (the "search shows an error" field report): branch search
+  // is a SECONDARY enhancement — the primary agency results are client-side
+  // and never fail. A branch fetch that fails for ANY reason (429 from a
+  // shared-IP rate bucket, 404 on a not-yet-upgraded backend, network error)
+  // degrades SILENTLY to "no branch section" — no error chip, no toast. A
+  // 429 additionally schedules ONE quiet retry after Retry-After so a momentary
+  // throttle never eats the results the user is actively waiting for.
   useEffect(() => {
     const query = activeSearch;
     if (!query) {
       setBranchResults([]);
       setBranchTotal(0);
       setBranchesLoading(false);
-      setBranchesFailed(false);
       return;
     }
     let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const applyResults = (data: { branches?: unknown; total?: unknown }) => {
+      const list: BranchListItem[] = Array.isArray(data.branches) ? (data.branches as BranchListItem[]) : [];
+      setBranchResults(list);
+      setBranchTotal(typeof data.total === 'number' ? data.total : list.length);
+    };
+
     const fetchBranches = async () => {
       setBranchesLoading(true);
-      setBranchesFailed(false);
       try {
         const params = new URLSearchParams({ search: query, limit: '20', offset: '0' });
         if (selectedCategory !== 'ALL') params.set('category', selectedCategory);
@@ -269,27 +283,40 @@ export function CustomerHome() {
         if (cancelled) return;
         if (res.ok) {
           const data = await res.json();
-          const list: BranchListItem[] = Array.isArray(data.branches) ? data.branches : [];
-          setBranchResults(list);
-          setBranchTotal(typeof data.total === 'number' ? data.total : list.length);
-        } else {
-          setBranchResults([]);
-          setBranchTotal(0);
-          setBranchesFailed(true);
+          applyResults(data);
+          return;
         }
+        // Not ok → silent degrade (detail stays in the console for diagnosis).
+        console.warn('[CustomerHome] branch search unavailable:', res.status);
+        if (res.status === 429) {
+          // One quiet retry after Retry-After (bounded to 10s) — only if the
+          // user is still on the same query (cancelled/changed queries skip).
+          const retryAfterHeader = typeof res.headers?.get === 'function' ? res.headers.get('Retry-After') : null;
+          const delayMs = Math.min(Math.max((parseInt(retryAfterHeader ?? '', 10) || 2) * 1000, 2000), 10_000);
+          retryTimer = setTimeout(() => {
+            if (cancelled) return;
+            void fetchBranches();
+          }, delayMs);
+          return; // keep the previous results visible during the backoff
+        }
+        setBranchResults([]);
+        setBranchTotal(0);
       } catch {
         if (!cancelled) {
           setBranchResults([]);
           setBranchTotal(0);
-          setBranchesFailed(true);
         }
       } finally {
         if (!cancelled) setBranchesLoading(false);
       }
     };
-    fetchBranches();
-    return () => { cancelled = true; };
-  }, [activeSearch, selectedCategory, branchRetryTick]);
+
+    void fetchBranches();
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+  }, [activeSearch, selectedCategory]);
 
   const filteredAgencies = useMemo(() => {
     return agencies.filter((a) => {
@@ -1136,9 +1163,9 @@ export function CustomerHome() {
       </div>
 
       {/* ── 5.5 Branch search results (Task 83-c-1) — rendered ONLY while a
-          search query is active. Empty results render nothing; a failed
-          fetch renders a tiny inline retry and never affects the agency grid. ── */}
-      {searchActive && (branchesLoading || branchesFailed || branchResults.length > 0) && (
+          search query is active. Empty results AND failed fetches render
+          nothing (silent degrade — the agency results below are primary). ── */}
+      {searchActive && (branchesLoading || branchResults.length > 0) && (
         <div className="mb-4">
           <div className="flex items-center justify-between mb-2.5">
             <h2 className="text-sm font-semibold text-foreground flex items-center gap-2">
@@ -1167,19 +1194,11 @@ export function CustomerHome() {
                 </div>
               ))}
             </div>
-          ) : branchesFailed ? (
-            <div className="flex items-center justify-center gap-2 py-3 rounded-2xl border border-border/50 bg-muted/50">
-              <span className="text-xs text-muted-foreground">{t('error')}</span>
-              <button
-                onClick={() => setBranchRetryTick((n) => n + 1)}
-                className="h-8 px-3 rounded-full flex items-center gap-1 text-xs font-medium text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 transition-colors"
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-                {t('tryAgain')}
-              </button>
-            </div>
           ) : (
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+            <CardSwiper
+              ariaLabel={t('branchResults')}
+              itemClassName="w-[calc(50%-6px)] md:w-[calc(33.333%-8px)] lg:w-[calc(25%-9px)]"
+            >
               {branchResults.map((branch, idx) => (
                 <BranchCard
                   key={branch.id}
@@ -1191,7 +1210,7 @@ export function CustomerHome() {
                   distanceKm={distanceByBranchId?.[branch.id] ?? null}
                 />
               ))}
-            </div>
+            </CardSwiper>
           )}
         </div>
       )}
@@ -1239,26 +1258,33 @@ export function CustomerHome() {
           onRetry={fetchAgencies}
         />
       ) : (
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
-          {filteredAgencies.map((agency, idx) => (
-            <AgencyCard
-              key={agency.id}
-              agency={agency}
-              index={idx}
-              lang={lang}
-              isFavorite={favoriteIds.has(agency.id)}
-              toggling={togglingFav === agency.id}
-              t={t}
-              onSelect={handleSelectAgency}
-              onToggleFavorite={toggleFavorite}
-              onQuickJoin={(agencyId) => handleQuickJoin(agencyId)}
-              distanceKm={distanceByAgencyId?.[agency.id] ?? null}
-              onViewProfile={(agency) => {
-                useAppStore.getState().setAgencyProfileId(agency.id);
-                setView('customer-agency-profile');
-              }}
-            />
-          ))}
+        /* Full-width detail cards in a swipeable rail (nearby + search results
+           share this section — the rail covers both, per the field request). */
+        <div className="-mx-4 px-4">
+          <CardSwiper
+            ariaLabel={t('nearbyAgencies')}
+            itemClassName="w-full md:w-[calc(50%-6px)] lg:w-[calc(33.333%-8px)]"
+          >
+            {filteredAgencies.map((agency, idx) => (
+              <AgencyCardWide
+                key={agency.id}
+                agency={agency}
+                index={idx}
+                lang={lang}
+                isFavorite={favoriteIds.has(agency.id)}
+                toggling={togglingFav === agency.id}
+                t={t}
+                onSelect={handleSelectAgency}
+                onToggleFavorite={toggleFavorite}
+                onQuickJoin={(agencyId) => handleQuickJoin(agencyId)}
+                distanceKm={distanceByAgencyId?.[agency.id] ?? null}
+                onViewProfile={(agency) => {
+                  useAppStore.getState().setAgencyProfileId(agency.id);
+                  setView('customer-agency-profile');
+                }}
+              />
+            ))}
+          </CardSwiper>
         </div>
       )}
 
@@ -1268,6 +1294,17 @@ export function CustomerHome() {
           t={t}
           lang={lang}
           onSelectAgency={handleSelectAgency}
+          agencies={agencies}
+          favoriteIds={favoriteIds}
+          togglingFav={togglingFav}
+          onToggleFavorite={toggleFavorite}
+          onQuickJoin={(agencyId) => handleQuickJoin(agencyId)}
+          distanceByAgencyId={distanceByAgencyId}
+          onViewProfile={(agency) => {
+            useAppStore.getState().setAgencyProfileId(agency.id);
+            setView('customer-agency-profile');
+          }}
+          onNavigateHistory={() => setView('customer-history')}
         />
 
         <RecentActivityFeed

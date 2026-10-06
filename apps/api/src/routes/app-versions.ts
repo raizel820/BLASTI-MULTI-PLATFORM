@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import type { Context } from 'hono'
 import { db } from '@blasti/db'
 import { requireAdmin, authErrorResponse } from '../lib/auth'
 import { STORAGE_ROOT } from '../lib/storage'
@@ -9,6 +10,23 @@ import path from 'path'
 import os from 'os'
 
 const app = new Hono()
+
+// ─── Deploy-token auth (CI / automation) ────────────────────────────────────
+//
+// Installers can be uploaded not only by an admin in Public Apps Settings,
+// but also by CI (GitHub Actions) using the shared DEPLOY_TOKEN from
+// /etc/blasti/blasti.env. Requests with a valid `x-deploy-token` header
+// bypass the admin session check; everyone else still needs an admin
+// session. If no token is configured the header is simply ignored.
+
+const DEPLOY_TOKEN = () => process.env.BLASTI_DEPLOY_TOKEN || process.env.DEPLOY_TOKEN || ''
+
+async function requireAdminOrDeployToken(c: Context): Promise<void> {
+  const expected = DEPLOY_TOKEN()
+  const provided = c.req.header('x-deploy-token')
+  if (expected && provided && provided === expected) return
+  await requireAdmin(c)
+}
 
 // ─── Validation Schemas ─────────────────────────────────────────────────────
 
@@ -164,7 +182,7 @@ app.get('/check', async (c) => {
 
 app.post('/', async (c) => {
   try {
-    await requireAdmin(c)
+    await requireAdminOrDeployToken(c)
 
     const body = await c.req.json()
     const validation = createAppVersionSchema.safeParse(body)
@@ -210,7 +228,7 @@ app.post('/', async (c) => {
 
 app.post('/upload', async (c) => {
   try {
-    await requireAdmin(c)
+    await requireAdminOrDeployToken(c)
 
     ensureUploadDir()
 
@@ -218,6 +236,11 @@ app.post('/upload', async (c) => {
     const file = formData.get('file') as File | null
     const platform = formData.get('platform') as string | null
     const version = formData.get('version') as string | null
+    // create=1 (form field or query): CI convenience — auto-create the
+    // version record when it does not exist yet, so one multipart call
+    // both registers the version and attaches the binary.
+    const autoCreate =
+      formData.get('create') === '1' || formData.get('create') === 'true' || c.req.query('create') === '1'
 
     if (!file) {
       return c.json({ success: false, error: 'No file provided' }, 400)
@@ -225,6 +248,13 @@ app.post('/upload', async (c) => {
 
     if (!platform || !version) {
       return c.json({ success: false, error: 'Platform and version are required' }, 400)
+    }
+
+    if (!['android', 'ios', 'electron', 'windows', 'mac', 'linux'].includes(platform)) {
+      return c.json({ success: false, error: 'Invalid platform' }, 400)
+    }
+    if (!/^\d+\.\d+\.\d+/.test(version)) {
+      return c.json({ success: false, error: 'Version must be semver (e.g. 1.2.3)' }, 400)
     }
 
     // Save file to temp directory
@@ -237,10 +267,26 @@ app.post('/upload', async (c) => {
     // Calculate file hash for integrity
     const hash = crypto.createHash('sha256').update(buffer).digest('hex')
 
-    // Update the app version record with file info
-    const appVersion = await db.appVersion.findUnique({
+    // Update the app version record with file info (create it first when
+    // requested — used by CI uploads of brand-new versions)
+    let appVersion = await db.appVersion.findUnique({
       where: { platform_version: { platform, version } },
     })
+
+    if (!appVersion && autoCreate) {
+      const versionCodeRaw = formData.get('versionCode')
+      const versionCode = versionCodeRaw ? parseInt(String(versionCodeRaw), 10) || 0 : 0
+      const notes = String(formData.get('releaseNotes') ?? '')
+      appVersion = await db.appVersion.create({
+        data: {
+          platform,
+          version,
+          versionCode,
+          releaseNotes: notes.slice(0, 2000),
+          isPublished: false, // CI uploads land as drafts — an admin activates them
+        },
+      })
+    }
 
     if (!appVersion) {
       return c.json({ success: false, error: 'App version record not found. Create the version first, then upload the file.' }, 404)
@@ -268,6 +314,84 @@ app.post('/upload', async (c) => {
         hash,
       },
     })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── GET /app-versions/public/active — PUBLIC active downloads ────────────
+//
+// Used by the public landing page download section: returns the ACTIVE
+// (published) version per platform so visitors can download the installer
+// the admin selected in Public Apps Settings. Metadata only, no secrets.
+// NOTE: registered before GET /:id (Hono matches in registration order).
+
+app.get('/public/active', async (c) => {
+  try {
+    const platforms = ['android', 'ios', 'electron', 'windows', 'mac', 'linux'] as const
+    const versions: Array<Record<string, unknown>> = []
+
+    for (const platform of platforms) {
+      const v = await db.appVersion.findFirst({
+        where: { platform, isPublished: true },
+        orderBy: [{ versionCode: 'desc' }, { createdAt: 'desc' }],
+      })
+      if (!v) continue
+      versions.push({
+        platform: v.platform,
+        version: v.version,
+        versionCode: v.versionCode,
+        releaseNotes: v.releaseNotes,
+        releaseNotesAr: v.releaseNotesAr,
+        releaseNotesFr: v.releaseNotesFr,
+        isMandatory: v.isMandatory,
+        fileName: v.fileName,
+        fileSize: v.fileSize,
+        downloadCount: v.downloadCount,
+        publishedAt: v.publishedAt,
+        downloadUrl: v.downloadUrl || `/api/app-versions/${v.id}/download`,
+      })
+    }
+
+    return c.json({ success: true, versions })
+  } catch (error: unknown) {
+    return c.json({ success: false, error: 'Failed to load public downloads' }, 500)
+  }
+})
+
+// ─── POST /app-versions/:id/activate — Make this THE active version ──────
+//
+// "Select the active version" from Public Apps Settings: publishes this
+// version and unpublishes every other version of the same platform in a
+// single transaction, so exactly one installer per platform is public.
+
+app.post('/:id/activate', async (c) => {
+  try {
+    await requireAdmin(c)
+
+    const existing = await db.appVersion.findUnique({
+      where: { id: c.req.param('id') },
+    })
+    if (!existing) {
+      return c.json({ success: false, error: 'Version not found' }, 404)
+    }
+
+    const activated = await db.$transaction(async (tx) => {
+      await tx.appVersion.updateMany({
+        where: { platform: existing.platform, id: { not: existing.id } },
+        data: { isPublished: false },
+      })
+      return tx.appVersion.update({
+        where: { id: existing.id },
+        data: {
+          isPublished: true,
+          publishedAt: existing.publishedAt ?? new Date(),
+        },
+      })
+    })
+
+    return c.json({ success: true, version: activated })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

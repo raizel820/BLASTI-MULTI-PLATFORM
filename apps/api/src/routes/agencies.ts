@@ -2,10 +2,25 @@ import { Hono } from 'hono'
 import { db, Prisma } from '@blasti/db'
 import { requireRole, requireAgencyAccess, authErrorResponse, createSessionToken } from '../lib/auth'
 import { adminCreateAgencySchema, updateAgencyProfileSchema, validateBody, wilayaCodeRegex } from '../lib/validations'
-import { enforceRateLimit, getClientIp, AGENCY_LISTING_RATE_LIMIT, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordFailedRequest, recordSuccessfulRequest } from '../lib/rate-limit'
+import { enforceRateLimit, getClientIp, AGENCY_LISTING_RATE_LIMIT, AGENCY_SEARCH_RATE_LIMIT, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordFailedRequest, recordSuccessfulRequest } from '../lib/rate-limit'
 import { recordSyncChangeNow } from '../lib/sync-helpers'
 // Task 51 — Agency Location & Maps: location pair rule + timestamp stamping
 import { buildAgencyLocationPatch } from '../lib/map-settings'
+
+// ─── Case-insensitive search (field-fix: agency & branch search) ───────────
+// Prisma `contains` is CASE-SENSITIVE on PostgreSQL but case-insensitive on
+// SQLite (LIKE semantics). The cloud DB is Postgres, so searching "main"
+// failed to match "Main Branch" and "my agency" failed to match "My Agency"
+// — the customer search looked broken. `mode: 'insensitive'` fixes Postgres
+// and is only valid there, so gate it on the connector in use.
+const IS_POSTGRES = /^(postgres|postgresql):/i.test(process.env.DATABASE_URL ?? '')
+
+/** Contains filter that is case-insensitive wherever the DB supports it. */
+function containsQuery(value: string): Record<string, unknown> {
+  return IS_POSTGRES
+    ? { contains: value, mode: 'insensitive' }
+    : { contains: value }
+}
 
 const app = new Hono()
 
@@ -28,10 +43,10 @@ app.get('/', async (c) => {
 
     if (search) {
       where.OR = [
-        { name: { contains: search } },
-        { nameFr: { contains: search } },
-        { nameAr: { contains: search } },
-        { customCode: { contains: search } },
+        { name: containsQuery(search) },
+        { nameFr: containsQuery(search) },
+        { nameAr: containsQuery(search) },
+        { customCode: containsQuery(search) },
       ]
     }
 
@@ -126,7 +141,10 @@ app.get('/', async (c) => {
     })
   } catch (error: unknown) {
     if (isRateLimitError(error)) {
-      if (clientIp) recordFailedRequest(getClientIp(c))
+      // Rate limiting IS the punishment — a 429 must NOT also feed the
+      // abuse blocker (10 failures/5min → 30-min IP lockout), otherwise a
+      // single burst locks a legitimate user out of every public route.
+      // Genuine business 4xxs (400/404) below still record failures.
       const res = rateLimitErrorResponse(error)
       return c.json(res.data, res.status as any)
     }
@@ -192,7 +210,10 @@ app.get('/check-code', async (c) => {
     return c.json({ available: !exact })
   } catch (error: unknown) {
     if (isRateLimitError(error)) {
-      if (clientIp) recordFailedRequest(getClientIp(c))
+      // Rate limiting IS the punishment — a 429 must NOT also feed the
+      // abuse blocker (10 failures/5min → 30-min IP lockout), otherwise a
+      // single burst locks a legitimate user out of every public route.
+      // Genuine business 4xxs (400/404) below still record failures.
       const res = rateLimitErrorResponse(error)
       return c.json(res.data, res.status as any)
     }
@@ -290,7 +311,10 @@ app.get('/code/:code', async (c) => {
     })
   } catch (error: unknown) {
     if (isRateLimitError(error)) {
-      if (clientIp) recordFailedRequest(clientIp)
+      // Rate limiting IS the punishment — a 429 must NOT also feed the
+      // abuse blocker (10 failures/5min → 30-min IP lockout), otherwise a
+      // single burst locks a legitimate user out of every public route.
+      // Genuine business 4xxs (400/404) below still record failures.
       const res = rateLimitErrorResponse(error)
       return c.json(res.data, res.status as any)
     }
@@ -309,7 +333,7 @@ app.get('/code/:code', async (c) => {
 app.get('/branches', async (c) => {
   let clientIp: string | undefined
   try {
-    clientIp = enforceRateLimit(c, AGENCY_LISTING_RATE_LIMIT)
+    clientIp = enforceRateLimit(c, AGENCY_SEARCH_RATE_LIMIT)
 
     const search = c.req.query('search') || ''
     const category = c.req.query('category') || ''
@@ -328,15 +352,15 @@ app.get('/branches', async (c) => {
 
     if (search) {
       branchWhere.OR = [
-        { name: { contains: search } },
-        { nameFr: { contains: search } },
-        { nameAr: { contains: search } },
-        { specialName: { contains: search } },
-        { subCode: { contains: search } },
-        { agency: { is: { name: { contains: search } } } },
-        { agency: { is: { nameFr: { contains: search } } } },
-        { agency: { is: { nameAr: { contains: search } } } },
-        { agency: { is: { customCode: { contains: search } } } },
+        { name: containsQuery(search) },
+        { nameFr: containsQuery(search) },
+        { nameAr: containsQuery(search) },
+        { specialName: containsQuery(search) },
+        { subCode: containsQuery(search) },
+        { agency: { is: { name: containsQuery(search) } } },
+        { agency: { is: { nameFr: containsQuery(search) } } },
+        { agency: { is: { nameAr: containsQuery(search) } } },
+        { agency: { is: { customCode: containsQuery(search) } } },
       ]
     }
 
@@ -427,7 +451,10 @@ app.get('/branches', async (c) => {
     })
   } catch (error: unknown) {
     if (isRateLimitError(error)) {
-      if (clientIp) recordFailedRequest(getClientIp(c))
+      // Rate limiting IS the punishment — a 429 must NOT also feed the
+      // abuse blocker (10 failures/5min → 30-min IP lockout), otherwise a
+      // single burst locks a legitimate user out of every public route.
+      // Genuine business 4xxs (400/404) below still record failures.
       const res = rateLimitErrorResponse(error)
       return c.json(res.data, res.status as any)
     }
@@ -481,7 +508,10 @@ app.get('/branches/by-code/:subCode', async (c) => {
     return c.json({ success: true, branch: { id: branch.id, subCode: branch.subCode } })
   } catch (error: unknown) {
     if (isRateLimitError(error)) {
-      if (clientIp) recordFailedRequest(getClientIp(c))
+      // Rate limiting IS the punishment — a 429 must NOT also feed the
+      // abuse blocker (10 failures/5min → 30-min IP lockout), otherwise a
+      // single burst locks a legitimate user out of every public route.
+      // Genuine business 4xxs (400/404) below still record failures.
       const res = rateLimitErrorResponse(error)
       return c.json(res.data, res.status as any)
     }
@@ -595,7 +625,10 @@ app.get('/branches/:branchId', async (c) => {
     })
   } catch (error: unknown) {
     if (isRateLimitError(error)) {
-      if (clientIp) recordFailedRequest(getClientIp(c))
+      // Rate limiting IS the punishment — a 429 must NOT also feed the
+      // abuse blocker (10 failures/5min → 30-min IP lockout), otherwise a
+      // single burst locks a legitimate user out of every public route.
+      // Genuine business 4xxs (400/404) below still record failures.
       const res = rateLimitErrorResponse(error)
       return c.json(res.data, res.status as any)
     }

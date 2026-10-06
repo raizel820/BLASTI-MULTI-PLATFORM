@@ -364,11 +364,23 @@ export const WALK_IN_RATE_LIMIT: RateLimitOptions = {
   prefix: 'walkin',
 }
 
-/** Public agency listing: 60 requests per minute per IP */
+/** Public agency listing: 120 requests per minute per IP (read-only; shared
+ *  with branch QR deep-links + branch profile reads. Was 60/min — behind a
+ *  proxy that collapses client IPs the whole app shares ONE bucket, and a
+ *  burst (home load + typing a search) then 429s legitimate customers.) */
 export const AGENCY_LISTING_RATE_LIMIT: RateLimitOptions = {
   windowMs: 60 * 1000,
-  maxRequests: 60,
+  maxRequests: 120,
   prefix: 'agencies',
+}
+
+/** Branch SEARCH (GET /agencies/branches?search=…): own bucket so interactive
+ *  typing bursts can never starve the listing bucket (or vice versa). 120/min
+ *  per IP covers debounced typing on any real device. */
+export const AGENCY_SEARCH_RATE_LIMIT: RateLimitOptions = {
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  prefix: 'agency-search',
 }
 
 /** General public routes: 60 requests per minute per IP */

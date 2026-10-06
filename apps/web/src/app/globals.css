@@ -1660,6 +1660,34 @@ html {
   animation: hero-gradient-shift 15s ease-in-out infinite;
 }
 
+/* ─── Landing page mobile animation budget ───────────────────────────────
+ * Phone browsers (and users preferring reduced motion) get the decorative
+ * infinite CSS animations switched OFF. These are the flicker culprits from
+ * the "landing page keeps flickering on a phone" field report:
+ *   • full-surface background-position gradient shifts (hero-animated-gradient,
+ *     hero-gradient-title) repaint the whole screen every frame,
+ *   • box-shadow pulses (cta-pulse-glow*) force full-element repaints,
+ *   • floating bubbles keep the compositor permanently busy.
+ * The STATIC styles (gradients, shadows, layout) remain — only the motion
+ * stops. Paired with the MotionConfig reducedMotion switch in
+ * landing-page.tsx, which handles the framer-motion side. */
+@media (max-width: 767px), (prefers-reduced-motion: reduce) {
+  .hero-animated-gradient,
+  .landing-bubble,
+  .landing-bubble-slow,
+  .cta-pulse-glow,
+  .cta-pulse-glow-enhanced,
+  .cta-pulse-glow-secondary,
+  .cta-shine-sweep,
+  .hero-heading-pulse,
+  .hero-gradient-title {
+    animation: none !important;
+  }
+  .hero-gradient-title {
+    filter: none;
+  }
+}
+
 /* Kiosk mode button enhanced styling */
 .kiosk-mode-btn {
   position: relative;

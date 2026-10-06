@@ -9,7 +9,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
 import { DownloadSection } from '@/components/platform/download-section';
-import { motion, useInView, AnimatePresence } from 'framer-motion';
+import { motion, useInView, AnimatePresence, MotionConfig } from 'framer-motion';
 import {
   Clock,
   Wifi,
@@ -211,10 +211,38 @@ function seededRandom(seed: number): number {
   return x - Math.floor(x);
 }
 
-function HeroParticles() {
+/* ─── Mobile animation budget ────────────
+ * The landing page used to run ~50 simultaneous infinite framer-motion
+ * loops plus full-surface gradient/box-shadow CSS animations. On a phone
+ * browser that saturates the main thread and the compositor and paints as
+ * constant flicker — content and components visibly appearing/disappearing.
+ * On compact (phone-width) viewports we:
+ *   1. cut the particle/orb DOM budget (HeroParticles compact prop),
+ *   2. stop the full-surface background keyframe animations (they repaint
+ *      the whole screen every frame — the single worst offender),
+ *   3. switch framer-motion to reducedMotion="always" via MotionConfig,
+ *      which disables transform/layout loops (entrance opacity fades stay),
+ *   4. and a globals.css media query switches off the expensive infinite
+ *      CSS animations (box-shadow pulses, gradient shifts, bubbles).
+ */
+function useCompactScreen(): boolean {
+  const [compact, setCompact] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 767px)');
+    const update = () => setCompact(mq.matches);
+    update();
+    mq.addEventListener?.('change', update);
+    return () => mq.removeEventListener?.('change', update);
+  }, []);
+  return compact;
+}
+
+function HeroParticles({ compact = false }: { compact?: boolean }) {
   // Use deterministic values derived from index to prevent SSR/client hydration mismatch
   // Enhanced with larger decorative bubbles, more varied sizes, and extra depth layers
-  const particles = Array.from({ length: 50 }, (_, i) => ({
+  // Mobile budget: 14 particles instead of 50 — opacity keyframe loops still
+  // run even under reducedMotion, so the COUNT is the lever on phones.
+  const particles = Array.from({ length: compact ? 14 : 50 }, (_, i) => ({
     id: i,
     x: seededRandom(i * 2) * 100,
     y: seededRandom(i * 2 + 1) * 100,
@@ -267,28 +295,32 @@ function HeroParticles() {
         animate={{ x: [0, 25, -12, 18, 0], y: [0, -18, 12, -22, 0] }}
         transition={{ duration: 15, repeat: Infinity, ease: 'easeInOut' }}
       />
-      <motion.div
-        className="absolute bottom-1/4 end-10 w-44 h-44 rounded-full bg-teal-400/12 dark:bg-teal-500/6 blur-3xl"
-        animate={{ x: [0, -18, 12, -22, 0], y: [0, 22, -12, 18, 0] }}
-        transition={{ duration: 18, repeat: Infinity, ease: 'easeInOut', delay: 3 }}
-      />
-      <motion.div
-        className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 rounded-full bg-cyan-300/8 dark:bg-emerald-600/4 blur-3xl"
-        animate={{ scale: [1, 1.25, 0.9, 1.15, 1], opacity: [0.06, 0.12, 0.06, 0.1, 0.06] }}
-        transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
-      />
-      {/* Extra cyan orb for depth */}
-      <motion.div
-        className="absolute top-[15%] end-[20%] w-28 h-28 rounded-full bg-cyan-400/10 dark:bg-cyan-500/5 blur-3xl"
-        animate={{ x: [0, -14, 8, -10, 0], y: [0, -20, 15, -12, 0] }}
-        transition={{ duration: 14, repeat: Infinity, ease: 'easeInOut', delay: 5 }}
-      />
-      {/* Extra large slow-moving emerald orb for subtle depth */}
-      <motion.div
-        className="absolute bottom-[10%] start-[30%] w-56 h-56 rounded-full bg-emerald-300/6 dark:bg-emerald-600/3 blur-3xl"
-        animate={{ x: [0, 20, -15, 10, 0], y: [0, -15, 20, -10, 0], scale: [1, 1.1, 0.95, 1.05, 1] }}
-        transition={{ duration: 22, repeat: Infinity, ease: 'easeInOut', delay: 4 }}
-      />
+      {!compact && (
+        <>
+          <motion.div
+            className="absolute bottom-1/4 end-10 w-44 h-44 rounded-full bg-teal-400/12 dark:bg-teal-500/6 blur-3xl"
+            animate={{ x: [0, -18, 12, -22, 0], y: [0, 22, -12, 18, 0] }}
+            transition={{ duration: 18, repeat: Infinity, ease: 'easeInOut', delay: 3 }}
+          />
+          <motion.div
+            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 rounded-full bg-cyan-300/8 dark:bg-emerald-600/4 blur-3xl"
+            animate={{ scale: [1, 1.25, 0.9, 1.15, 1], opacity: [0.06, 0.12, 0.06, 0.1, 0.06] }}
+            transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
+          />
+          {/* Extra cyan orb for depth */}
+          <motion.div
+            className="absolute top-[15%] end-[20%] w-28 h-28 rounded-full bg-cyan-400/10 dark:bg-cyan-500/5 blur-3xl"
+            animate={{ x: [0, -14, 8, -10, 0], y: [0, -20, 15, -12, 0] }}
+            transition={{ duration: 14, repeat: Infinity, ease: 'easeInOut', delay: 5 }}
+          />
+          {/* Extra large slow-moving emerald orb for subtle depth */}
+          <motion.div
+            className="absolute bottom-[10%] start-[30%] w-56 h-56 rounded-full bg-emerald-300/6 dark:bg-emerald-600/3 blur-3xl"
+            animate={{ x: [0, 20, -15, 10, 0], y: [0, -15, 20, -10, 0], scale: [1, 1.1, 0.95, 1.05, 1] }}
+            transition={{ duration: 22, repeat: Infinity, ease: 'easeInOut', delay: 4 }}
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -304,6 +336,8 @@ export function LandingPage() {
   const [activeTestimonial, setActiveTestimonial] = useState(0);
   const [scrolled, setScrolled] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  // Mobile animation budget — see the useCompactScreen doc block above.
+  const compact = useCompactScreen();
 
   const scrollToSection = useCallback((id: string) => {
     document.getElementById(id)?.scrollIntoView({ behavior: 'smooth' });
@@ -389,10 +423,13 @@ export function LandingPage() {
 
   return (
     <div ref={containerRef} className="min-h-screen flex flex-col relative overflow-hidden">
+      <MotionConfig reducedMotion={compact ? 'always' : 'never'}>
       {/* Animated gradient mesh background */}
       <div className="absolute inset-0 -z-10">
+        {/* Full-surface background-position keyframes repaint the ENTIRE screen
+            every frame — the worst flicker offender on phones. Static on mobile. */}
         <motion.div
-          animate={{ backgroundPosition: ['0% 0%', '100% 100%', '50% 50%', '0% 0%'] }}
+          animate={compact ? undefined : { backgroundPosition: ['0% 0%', '100% 100%', '50% 50%', '0% 0%'] }}
           transition={{ duration: 25, repeat: Infinity, ease: 'linear' }}
           className="absolute inset-0 bg-[length:400%_400%] bg-gradient-to-br from-emerald-50 via-teal-50 to-emerald-100 dark:from-gray-950 dark:via-gray-900 dark:to-emerald-950/30"
         />
@@ -575,10 +612,11 @@ export function LandingPage() {
       <section id="hero" className="flex-1 flex flex-col items-center justify-center px-4 py-20 md:py-24 relative z-10 overflow-hidden">
         {/* Animated gradient background with emerald/teal/cyan palette */}
         <div className="absolute inset-0 -z-20 hero-animated-gradient" />
-        {/* Additional animated gradient layer */}
+        {/* Additional animated gradient layer (animates the background IMAGE —
+            full-screen repaint per frame; static on mobile) */}
         <motion.div
           className="absolute inset-0 -z-10"
-          animate={{
+          animate={compact ? undefined : {
             background: [
               'radial-gradient(ellipse at 20% 50%, rgba(6,182,212,0.08) 0%, transparent 50%)',
               'radial-gradient(ellipse at 80% 50%, rgba(16,185,129,0.08) 0%, transparent 50%)',
@@ -597,7 +635,7 @@ export function LandingPage() {
           <div className="landing-bubble-slow absolute top-[75%] start-[25%] w-2.5 h-2.5 bg-teal-300/15 dark:bg-teal-600/6" style={{ animationDelay: '4s' }} />
           <div className="landing-bubble absolute top-[15%] end-[30%] w-2 h-2 bg-cyan-300/20 dark:bg-cyan-600/8" style={{ animationDelay: '0.5s' }} />
         </div>
-        <HeroParticles />
+        <HeroParticles compact={compact} />
 
         <div className="text-center max-w-2xl mx-auto lg:flex lg:items-center lg:gap-12 lg:max-w-5xl lg:text-start">
           <motion.div
@@ -1562,6 +1600,7 @@ export function LandingPage() {
           </motion.button>
         )}
       </AnimatePresence>
+      </MotionConfig>
 
     </div>
   );

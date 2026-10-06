@@ -1,5 +1,7 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';
+import { getProxiedUrl } from '@/lib/utils';
+import { AdminDeployStatus } from '@/components/admin/admin-deploy-status';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -69,6 +71,7 @@ import {
   Package,
   Rocket,
   Shield,
+  Zap,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
@@ -523,7 +526,10 @@ export function AdminAppSettings() {
   // ── Download binary ──
   const handleDownload = useCallback((v: AppVersion) => {
     if (v.downloadUrl) {
-      window.open(v.downloadUrl, '_blank');
+      // getProxiedUrl rebases the stored installer path onto the API server
+      // per platform (gateway hint / :3003 / Electron cloud base) so the
+      // download never 404s against the Next.js page origin.
+      window.open(getProxiedUrl(v.downloadUrl), '_blank');
     } else {
       toast.error(isRTL ? 'لا يوجد رابط تحميل' : 'No download URL available');
     }
@@ -556,6 +562,34 @@ export function AdminAppSettings() {
       return p ? (isRTL ? p.labelAr : p.labelEn) : platform;
     },
     [isRTL]
+  );
+
+  // ── Activate (make THE active version for its platform) ──
+  // NOTE: declared after getPlatformName — the callback references it.
+  const [activatingId, setActivatingId] = useState<string | null>(null);
+  const handleActivate = useCallback(
+    async (v: AppVersion) => {
+      setActivatingId(v.id);
+      try {
+        const res = await apiFetch(`/api/app-versions/${v.id}/activate`, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          toast.success(
+            isRTL
+              ? `أصبح الإصدار ${v.version} هو النسخة النشطة لـ ${getPlatformName(v.platform)}`
+              : `v${v.version} is now the active ${getPlatformName(v.platform)} version`
+          );
+          fetchVersions();
+        } else {
+          toast.error(data.error || (isRTL ? 'فشلت العملية' : 'Operation failed'));
+        }
+      } catch {
+        toast.error(isRTL ? 'خطأ في الاتصال' : 'Connection error');
+      } finally {
+        setActivatingId(null);
+      }
+    },
+    [isRTL, fetchVersions, getPlatformName]
   );
 
   // ─── Loading skeleton ──────────────────────────────────────────────
@@ -628,6 +662,9 @@ export function AdminAppSettings() {
           </div>
         </div>
       </motion.div>
+
+      {/* ─── 1b. Auto-Deploy & Watcher Status ─── */}
+      <AdminDeployStatus />
 
       {/* ─── 2. Platform Overview Cards ─── */}
       <motion.div
@@ -878,6 +915,32 @@ export function AdminAppSettings() {
                                   <XCircle className="h-3.5 w-3.5" />
                                 ) : (
                                   <Rocket className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className={`h-7 w-7 ${
+                                  v.isPublished
+                                    ? 'text-green-600 hover:text-green-700'
+                                    : 'text-muted-foreground hover:text-green-600'
+                                }`}
+                                onClick={() => handleActivate(v)}
+                                disabled={activatingId === v.id}
+                                title={
+                                  v.isPublished
+                                    ? isRTL
+                                      ? 'الإصدار النشط للعامة — اضغط لتفعيل إصدار آخر'
+                                      : 'Active public version — click to activate another version'
+                                    : isRTL
+                                      ? 'تعيين كإصدار نشط (يُلغي نشر بقية إصدارات المنصة)'
+                                      : 'Set as the active version (unpublishes other versions of this platform)'
+                                }
+                              >
+                                {activatingId === v.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Zap className="h-3.5 w-3.5" />
                                 )}
                               </Button>
                               {v.downloadUrl && (

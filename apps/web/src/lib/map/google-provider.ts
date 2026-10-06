@@ -58,6 +58,18 @@ let googleLoaderPromise: Promise<NonNullable<GoogleMapsWindow['google']>> | null
 let googleLoaderKey: string | null = null;
 
 /**
+ * Google calls `window.gm_authFailure()` when the key is rejected (invalid,
+ * billing disabled, referrer/http-restriction mismatch). Without capturing
+ * this the map renders a grey/white canvas forever while the script itself
+ * "loads fine" — the exact field report. Module-level because the callback
+ * is global and provider instances come and go.
+ */
+let googleAuthFailed = false;
+
+/** How long the first `tilesloaded` gets to arrive before init declares the map dead. */
+const GOOGLE_TILES_TIMEOUT_MS = 10_000;
+
+/**
  * Inject (or reuse) the Google Maps JS API script.
  * Rejects when the script fails to load (offline, blocked, invalid referrer).
  */
@@ -69,8 +81,15 @@ export function loadGoogleMaps(apiKey: string): Promise<NonNullable<GoogleMapsWi
   // An API key change must re-inject (different quota/referrer restrictions).
   if (googleLoaderPromise && googleLoaderKey === apiKey) return googleLoaderPromise;
   googleLoaderKey = apiKey;
+  googleAuthFailed = false; // fresh attempt with this key
   googleLoaderPromise = new Promise((resolve, reject) => {
     const w = window as unknown as GoogleMapsWindow;
+
+    // Capture Google's global auth-failure signal (called asynchronously when
+    // a Map is constructed with an unusable key).
+    (w as unknown as { gm_authFailure?: () => void }).gm_authFailure = () => {
+      googleAuthFailed = true;
+    };
 
     // Already loaded (e.g. another BLASTI surface loaded it first).
     if (w.google?.maps) {
@@ -161,6 +180,39 @@ export function createGoogleMapsProvider(opts: { apiKey: string | null }): MapPr
         streetViewControl: false,
         fullscreenControl: false,
         clickableIcons: false,
+      });
+
+      // Verify the map actually RENDERS tiles before reporting success.
+      // A rejected key (invalid / billing disabled / referrer restriction)
+      // constructs the Map fine and then paints a dead grey canvas — the
+      // script itself loads OK, so without this watchdog the UI showed a
+      // pin over an empty map forever. Rejecting routes init into the
+      // provider fallback chain (lib/map index.ts) → OpenFreeMap renders.
+      await new Promise<void>((resolve, reject) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          clearInterval(poll);
+          resolve();
+        };
+        const fail = (reason: string) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          clearInterval(poll);
+          reject(new Error(reason));
+        };
+        const timer = setTimeout(
+          () => fail(googleAuthFailed ? 'GOOGLE_MAPS_AUTH_FAILED' : 'GOOGLE_MAPS_TILES_TIMEOUT'),
+          GOOGLE_TILES_TIMEOUT_MS,
+        );
+        // gm_authFailure may fire well before tiles — poll for a fast fail.
+        const poll = setInterval(() => {
+          if (googleAuthFailed) fail('GOOGLE_MAPS_AUTH_FAILED');
+        }, 250);
+        maps.event.addListenerOnce(map, 'tilesloaded', () => finish());
       });
 
       listeners.push(

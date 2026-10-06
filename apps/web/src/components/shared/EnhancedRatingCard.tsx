@@ -5,6 +5,7 @@ import { motion } from 'framer-motion';
 import { Star, Clock, Users, ArrowRight, ArrowLeft } from 'lucide-react';
 import { useLanguage } from '@/hooks/use-language';
 import { isRTL } from '@/i18n';
+import { getProxiedUrl } from '@/lib/utils';
 
 interface EnhancedRatingCardProps {
   agency: {
@@ -75,7 +76,7 @@ export function EnhancedRatingCard({ agency, onJoinQueue, compact = false }: Enh
             {/* Logo/Initial */}
             <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-500 flex items-center justify-center text-white font-bold text-sm flex-shrink-0 overflow-hidden shadow-sm">
               {agency.logoUrl ? (
-                <img src={agency.logoUrl} alt={agency.name} width={48} height={48} className="h-full w-full object-contain" />
+                <img src={getProxiedUrl(agency.logoUrl)} alt={agency.name} width={48} height={48} className="h-full w-full object-contain" />
               ) : (
                 getInitial()
               )}
@@ -146,7 +147,7 @@ export function EnhancedRatingCard({ agency, onJoinQueue, compact = false }: Enh
               className="h-14 w-14 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-500 flex items-center justify-center text-white font-bold text-xl flex-shrink-0 overflow-hidden shadow-lg shadow-emerald-500/20"
             >
               {agency.logoUrl ? (
-                <img src={agency.logoUrl} alt={agency.name} width={48} height={48} className="h-full w-full object-contain" />
+                <img src={getProxiedUrl(agency.logoUrl)} alt={agency.name} width={48} height={48} className="h-full w-full object-contain" />
               ) : (
                 getInitial()
               )}

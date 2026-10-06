@@ -107,6 +107,15 @@ export function MapLocationPicker({
   const onLocationSourceRef = useRef(onLocationSource);
   const configRef = useRef<MapsProviderSettings | null>(config);
   const langRef = useRef(lang);
+  // Latest picker value, read by the init effect WITHOUT being a dependency:
+  // re-initializing the map when `hasCoords` flips (async profile load, or the
+  // user's own first click) destroys a working map just to change the initial
+  // center — the value-sync effect below already moves the marker + viewport
+  // when coordinates arrive externally.
+  const valueRef = useRef(value);
+  useEffect(() => {
+    valueRef.current = value;
+  }, [value]);
   useEffect(() => {
     onChangeRef.current = onChange;
     onDetectedRef.current = addressFields?.onDetected;
@@ -169,11 +178,15 @@ export function MapLocationPicker({
     providerRef.current = provider;
     setMapState('loading');
 
-    const initialCenter: LatLng =
-      value.latitude != null && value.longitude != null
-        ? { lat: value.latitude, lng: value.longitude }
-        : DEFAULT_MAP_CENTER;
-    const initialZoom = hasCoords ? MARKER_ZOOM : COUNTRY_ZOOM;
+    // Read via ref (not dep): coordinates that arrive async are handled by
+    // the value-sync effect below — they must NOT tear down a live map.
+    const currentValue = valueRef.current;
+    const initialHasCoords =
+      typeof currentValue.latitude === 'number' && typeof currentValue.longitude === 'number';
+    const initialCenter: LatLng = initialHasCoords
+      ? { lat: currentValue.latitude as number, lng: currentValue.longitude as number }
+      : DEFAULT_MAP_CENTER;
+    const initialZoom = initialHasCoords ? MARKER_ZOOM : COUNTRY_ZOOM;
 
     provider.onMapClick((ll) => {
       provider.placeMarker(ll);
@@ -211,7 +224,7 @@ export function MapLocationPicker({
       provider.destroy();
       if (providerRef.current === provider) providerRef.current = null;
     };
-  }, [config, emitLocation, hasCoords]);
+  }, [config, emitLocation]);
 
   // Keep the marker + viewport in sync when the value changes EXTERNALLY
   // (parent restoring a saved agency location). Emits nothing; interaction

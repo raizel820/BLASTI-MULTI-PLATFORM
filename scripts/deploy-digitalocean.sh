@@ -50,6 +50,11 @@
 #                    bash blasti-deploy.sh server-watch-install
 #   server-watch-disable (ON-VPS) turn the auto-updater off again:
 #                    bash blasti-deploy.sh server-watch-disable
+#   server-watch-status (ON-VPS) is the auto-updater alive, and did the
+#                  droplet already pull + rebuild the latest commit? One
+#                  command answers both (timer state + journal + git +
+#                  last watcher/deploy heartbeats):
+#                    bash blasti-deploy.sh server-watch-status
 #
 # WHAT server-install DOES ON THE VPS
 #   1. apt installs: curl git unzip openssl ufw ca-certificates
@@ -91,7 +96,7 @@ ok()   { printf '\033[1;32m[  ok  ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[ warn ]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[FAIL  ]\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,74p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,80p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 ssh_run() { # ssh_run <port> <target> <command...>
   local port="$1" target="$2"; shift 2
@@ -370,6 +375,39 @@ wait_healthy() {
   return 1
 }
 
+# --------------------------------------------------------------------
+# ON-VPS: make sure a DEPLOY_TOKEN exists in the env file (shared
+# secret used by the GitHub watcher + CI to authenticate heartbeats
+# and installer uploads against the API). Older droplets get it
+# automatically on the next server-update - never overwrites.
+# --------------------------------------------------------------------
+ensure_deploy_token() {
+  [ -f "$ENV_FILE" ] || return 0
+  if ! grep -q '^DEPLOY_TOKEN=' "$ENV_FILE" 2>/dev/null; then
+    printf '\n# Shared token: GitHub auto-updater heartbeats + CI installer uploads\nDEPLOY_TOKEN=%s\n' "$(openssl rand -hex 24)" >> "$ENV_FILE"
+    ok "DEPLOY_TOKEN added to $ENV_FILE (watcher/CI auth)"
+  fi
+}
+
+# --------------------------------------------------------------------
+# ON-VPS: report a deploy result to the API (deploy-status card in the
+# admin panel). Best-effort: if the API is down (failed deploy) the
+# POST is silently skipped.
+# --------------------------------------------------------------------
+post_deploy_heartbeat() { # <status:success|failure> <commit> <duration_sec> <message>
+  local status="$1" commit="$2" duration="$3" message="$4"
+  local api_url token
+  case "$duration" in '' | *[!0-9]*) duration=0 ;; esac
+  api_url="$(grep '^INTERNAL_API_URL=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  api_url="${api_url:-http://127.0.0.1:3003}"
+  token="$(grep '^DEPLOY_TOKEN=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  [ -n "$token" ] || return 0
+  curl -fsS -m 5 -X POST "$api_url/api/system/deploy-heartbeat" \
+    -H 'Content-Type: application/json' -H "x-deploy-token: $token" \
+    -d "{\"kind\":\"deploy-result\",\"status\":\"$status\",\"commit\":\"$commit\",\"durationSec\":$duration,\"message\":\"$message\"}" \
+    >/dev/null 2>&1 || true
+}
+
 print_summary() { # print_summary <site-url> <ip> <domain>
   local url="$1" ip="$2" domain="$3"
   cat <<EOF
@@ -492,6 +530,7 @@ Wants=network-online.target
 Type=oneshot
 Environment=HOME=/root
 Environment=BLASTI_WATCH_STATE_DIR=/root/.blasti-watch
+EnvironmentFile=$ENV_FILE
 WorkingDirectory=$root
 ExecStart=$root/scripts/watch-and-deploy.sh watch --on-server --once --dir $root
 # a full rebuild can take a while on small droplets - never kill it mid-build
@@ -515,6 +554,7 @@ EOF
   systemctl enable --now blasti-watcher.timer >/dev/null 2>&1 || true
   ok "auto-updater armed (blasti-watcher.timer) - push to GitHub and the droplet updates itself"
   ok "turn it off anytime with:  bash $SELF server-watch-disable"
+  ok "check it anytime with:     bash $SELF server-watch-status"
 }
 
 # --------------------------------------------------------------------
@@ -638,6 +678,7 @@ DATABASE_URL=postgresql://blasti:$PG_PW@127.0.0.1:5432/blasti?schema=public
 NEXTAUTH_SECRET=$(openssl rand -hex 32)
 INTERNAL_SECRET=$(openssl rand -hex 32)
 CRON_SECRET=$(openssl rand -hex 16)
+DEPLOY_TOKEN=$(openssl rand -hex 24)
 
 # ── Networking (all app ports bind to localhost only) ─────────
 API_PORT=3003
@@ -755,7 +796,8 @@ EOF
 # MODE: server-update (runs ON the VPS, as root)
 # --------------------------------------------------------------------
 cmd_server_update() {
-  local DOMAIN=""
+  local DOMAIN="" deploy_started deployed_commit
+  deploy_started="$(date +%s)"
   while [ $# -gt 0 ]; do
     case "$1" in
       --domain) DOMAIN="$2"; shift 2 ;;
@@ -783,6 +825,7 @@ cmd_server_update() {
   git -C "$root" fetch origin "$branch"
   git -C "$root" reset --hard FETCH_HEAD
   ok "code updated to $(git -C "$root" rev-parse --short HEAD)"
+  deployed_commit="$(git -C "$root" rev-parse HEAD 2>/dev/null || echo "")"
 
   # -- 2. dependencies + schema + build ----------------------------------------
   ( cd "$root" && bun install )
@@ -804,6 +847,10 @@ cmd_server_update() {
   # -- 4b. keep the GitHub auto-updater armed + its unit fresh (idempotent) -------
   install_auto_update_watcher "$root"
 
+  # -- 4c. watcher/CI shared token (idempotent; must exist BEFORE restart so
+  #        the API can authenticate heartbeats and CI installer uploads) ------
+  ensure_deploy_token
+
   # -- 5. restart services + re-render Caddy (ships ops/Caddyfile changes) ------
   local SITE
   SITE="$(grep '^SITE_ADDRESS=' "$ENV_FILE" | cut -d= -f2- || true)"
@@ -820,9 +867,13 @@ cmd_server_update() {
       *)         ORIGIN_URL="http://${PUB_IP:-<server-ip>}" ;;
     esac
     print_summary "$ORIGIN_URL" "${PUB_IP:-?}" "$DOMAIN"
+    post_deploy_heartbeat success "$deployed_commit" "$(( $(date +%s) - deploy_started ))" \
+      "server-update ok (git pull + rebuild + restart)"
   else
     warn "API not healthy after update. Diagnose with:"
     warn "  journalctl -u blasti-api -n 50 --no-pager && systemctl status blasti-api"
+    post_deploy_heartbeat failure "$deployed_commit" "$(( $(date +%s) - deploy_started ))" \
+      "server-update finished but API health check failed"
     exit 1
   fi
 }
@@ -973,6 +1024,74 @@ cmd_server_watch_disable() {
 }
 
 # --------------------------------------------------------------------
+# MODE: server-watch-status (runs ON the VPS) - answer in one command:
+#   1. is the GitHub auto-updater timer alive + when did it last fire?
+#   2. is the local checkout behind GitHub (new commit pending)?
+#   3. what did the last deploy do (from the watcher/deploy heartbeats
+#      stored by the API in its SystemSetting table)?
+# --------------------------------------------------------------------
+cmd_server_watch_status() {
+  local DIR="${DIR_DEFAULT:-/opt/blasti}"
+  echo "════════════════════════════════════════════════════════════"
+  echo " BLASTI auto-update status - $(date '+%F %T %Z')"
+  echo "════════════════════════════════════════════════════════════"
+
+  echo; echo "── 1. systemd timer (blasti-watcher) ──────────────"
+  printf 'timer state    : %s / %s\n' \
+    "$(systemctl is-active blasti-watcher.timer 2>/dev/null || echo '?')" \
+    "$(systemctl is-enabled blasti-watcher.timer 2>/dev/null || echo '?')"
+  systemctl show blasti-watcher.timer -p LastTriggerUSec -p NextElapseUSecRealtime 2>/dev/null
+  printf 'last check     : exit=%s at %s\n' \
+    "$(systemctl show blasti-watcher.service -p ExecMainStatus --value 2>/dev/null || echo '?')" \
+    "$(systemctl show blasti-watcher.service -p ExecMainExitTimestamp --value 2>/dev/null || echo '?')"
+
+  echo; echo "── 2. watcher journal (last 12 lines) ───────────────"
+  journalctl -u blasti-watcher.service -n 12 --no-pager 2>/dev/null | tail -12 || echo "no journal yet"
+
+  echo; echo "── 3. code version ($DIR) vs GitHub ──────────"
+  if [ -d "$DIR/.git" ]; then
+    git -C "$DIR" fetch origin master >/dev/null 2>&1 || true
+    local local_sha remote_sha
+    local_sha="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    remote_sha="$(git -C "$DIR" rev-parse --short origin/master 2>/dev/null || echo '?')"
+    echo "deployed : $local_sha $(git -C "$DIR" log -1 --format=%s 2>/dev/null)"
+    echo "github   : $remote_sha"
+    if [ "$local_sha" = "$remote_sha" ]; then
+      ok "up to date - the droplet already has the latest master"
+    else
+      warn "BEHIND - a new commit exists; the watcher will deploy it on its next check (or run: bash $SELF server-update)"
+    fi
+  else
+    warn "no git repo at $DIR"
+  fi
+
+  echo; echo "── 4. last heartbeats stored by the API ─────────────"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q blasti-db; then
+    local pg_user pg_db
+    pg_user="$(grep '^POSTGRES_USER=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+    pg_db="$(grep '^POSTGRES_DB=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+    pg_user="${pg_user:-blasti}"; pg_db="${pg_db:-blasti}"
+    for key in deploy.watcher.lastCheck deploy.last; do
+      printf '%s:\n  ' "$key"
+      docker exec blasti-db psql -U "$pg_user" -d "$pg_db" -Atc \
+        "select value from \"SystemSetting\" where key='$key'" 2>/dev/null \
+        || echo '(unavailable)'
+      echo
+    done
+    echo 'recent events:'
+    docker exec blasti-db psql -U "$pg_user" -d "$pg_db" -Atc \
+      "select value from \"SystemSetting\" where key='deploy.events'" 2>/dev/null \
+      | head -c 2000 || true
+    echo
+  else
+    warn "blasti-db container not running - cannot read heartbeats (API still starting?)"
+  fi
+  echo
+  echo "hint: the same status is visible in the web admin panel:"
+  echo "      Public Apps Settings -> Auto-Deploy & Watcher Status"
+}
+
+# --------------------------------------------------------------------
 # dispatch
 # --------------------------------------------------------------------
 MODE="${1:-help}"
@@ -986,6 +1105,7 @@ case "$MODE" in
   server-doctor)       cmd_server_doctor "$@" ;;
   server-watch-install) cmd_server_watch_install "$@" ;;
   server-watch-disable) cmd_server_watch_disable "$@" ;;
+  server-watch-status)  cmd_server_watch_status "$@" ;;
   status)              cmd_status "$@" ;;
   logs)                cmd_logs "$@" ;;
   backup)              cmd_backup "$@" ;;

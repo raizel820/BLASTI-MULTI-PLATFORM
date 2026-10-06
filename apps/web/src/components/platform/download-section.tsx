@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import { Monitor, Smartphone, Globe, Download, Apple, ChevronRight, QrCode, Laptop } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -9,7 +9,27 @@ import { Badge } from '@/components/ui/badge';
 import { usePlatform } from '@/hooks/use-platform';
 import { getPlatformIcon, getPlatformLabel, type Platform } from '@/lib/platform';
 import { useLanguage } from '@/hooks/use-language';
+import { apiFetch } from '@/lib/api-fetch';
+import { getProxiedUrl } from '@/lib/utils';
 import { type TranslationKeys } from '@/i18n';
+
+// ─── Active public versions (from Public Apps Settings) ─────────────────────
+
+interface PublicAppVersion {
+  platform: string;
+  version: string;
+  versionCode: number;
+  releaseNotes: string;
+  fileName: string | null;
+  fileSize: number | null;
+  downloadUrl: string;
+}
+
+function formatSize(bytes: number | null | undefined): string {
+  if (!bytes) return '';
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 // ─── OS Detection ─────────────────────────────────────────────────────────────
 
@@ -131,6 +151,31 @@ export function DownloadSection() {
   const isArabic = lang === 'ar';
   const userOS = useMemo(() => detectUserOS(), []);
 
+  // ── Active installers published by the admin (Public Apps Settings) ──
+  const [activeVersions, setActiveVersions] = useState<Record<string, PublicAppVersion>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiFetch('/api/app-versions/public/active');
+        if (!cancelled && res.ok) {
+          const data = await res.json();
+          if (data?.success && Array.isArray(data.versions)) {
+            const map: Record<string, PublicAppVersion> = {};
+            for (const v of data.versions) map[v.platform] = v;
+            setActiveVersions(map);
+          }
+        }
+      } catch {
+        // the section still renders ("coming soon") without the API
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Determine which card to highlight based on current platform
   const highlightedId = useMemo(() => {
     if (platform.isElectron) return 'desktop';
@@ -154,21 +199,53 @@ export function DownloadSection() {
   };
 
   const handleDesktopDownload = () => {
-    // Placeholder: would link to actual Electron installer
-    const urls: Record<string, string> = {
-      macos: '#download-mac',
-      windows: '#download-windows',
-      linux: '#download-linux',
-    };
-    const url = urls[userOS] || '#download-desktop';
-    // For now, just show an alert (app not published yet)
+    const platformKey =
+      userOS === 'macos' ? 'mac' : userOS === 'windows' ? 'windows' : userOS === 'linux' ? 'linux' : '';
+    // prefer the OS-specific installer, fall back to a generic electron build
+    const v = (platformKey ? activeVersions[platformKey] : undefined) ?? activeVersions['electron'];
+    if (v?.downloadUrl) {
+      // getProxiedUrl rebases the stored (relative) installer path onto the
+      // API server per platform — gateway pages get the XTransformPort hint,
+      // loopback pages target :3003, Electron targets its cloud base.
+      window.open(getProxiedUrl(v.downloadUrl), '_blank');
+      return;
+    }
     alert(isArabic ? 'سيكون التحميل متاحاً قريباً!' : 'Download coming soon!');
   };
 
   const handleMobileDownload = (os: 'ios' | 'android') => {
-    // Placeholder: would link to App Store / Play Store
-    alert(isArabic ? 'سيكون التحميل متاحاً قريباً!' : 'Coming soon to app stores!');
+    const v = activeVersions[os];
+    if (v?.downloadUrl) {
+      window.open(getProxiedUrl(v.downloadUrl), '_blank');
+      return;
+    }
+    alert(
+      isArabic
+        ? os === 'ios'
+          ? 'قريباً على App Store!'
+          : 'سيكون التحميل متاحاً قريباً!'
+        : os === 'ios'
+          ? 'Coming soon to the App Store!'
+          : 'Download coming soon!'
+    );
   };
+
+  // version labels shown on the cards when an installer is active
+  const desktopVersionLabel = useMemo(() => {
+    const platformKey =
+      userOS === 'macos' ? 'mac' : userOS === 'windows' ? 'windows' : userOS === 'linux' ? 'linux' : '';
+    const v = (platformKey ? activeVersions[platformKey] : undefined) ?? activeVersions['electron'];
+    if (!v) return '';
+    const size = formatSize(v.fileSize);
+    return size ? `v${v.version} · ${size}` : `v${v.version}`;
+  }, [activeVersions, userOS]);
+
+  const mobileVersionLabel = useMemo(() => {
+    const v = activeVersions[userOS === 'ios' ? 'ios' : 'android'];
+    if (!v) return '';
+    const size = formatSize(v.fileSize);
+    return size ? `v${v.version} · ${size}` : `v${v.version}`;
+  }, [activeVersions, userOS]);
 
   return (
     <section className="py-20 px-4 bg-gradient-to-b from-gray-50 to-white dark:from-gray-900 dark:to-gray-950">
@@ -291,6 +368,11 @@ export function DownloadSection() {
                           <Download className="h-4 w-4 me-2" />
                           {desktopDownloadLabel}
                         </Button>
+                        {desktopVersionLabel && (
+                          <p className="text-center text-[11px] text-muted-foreground font-mono">
+                            {desktopVersionLabel}
+                          </p>
+                        )}
                         <div className="flex gap-2">
                           <Button
                             variant="outline"
@@ -334,6 +416,11 @@ export function DownloadSection() {
                           <Download className="h-4 w-4 me-2" />
                           {isArabic ? card.actionAr : card.actionEn}
                         </Button>
+                        {mobileVersionLabel && (
+                          <p className="text-center text-[11px] text-muted-foreground font-mono">
+                            {mobileVersionLabel}
+                          </p>
+                        )}
                         <div className="flex gap-2">
                           <Button
                             variant="outline"

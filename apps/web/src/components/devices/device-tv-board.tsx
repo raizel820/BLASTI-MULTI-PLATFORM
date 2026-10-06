@@ -10,6 +10,7 @@ import { quickDiscover, type DiscoveredServer } from '@/lib/lan-discovery';
 import { apiFetch } from '@/lib/api-fetch';
 import { translateStatus } from '@/lib/enum-i18n';
 import { getCachedLocalIp } from '@/lib/get-local-ip';
+import { getProxiedUrl } from '@/lib/utils';
 
 interface CurrentlyServing {
   id: string;
@@ -991,7 +992,7 @@ export function DeviceTvBoard({
           {showLogo && (
             status.agency.logoUrl ? (
               <img
-                src={status.agency.logoUrl}
+                src={getProxiedUrl(status.agency.logoUrl)}
                 alt={getAgencyName() || 'Agency logo'}
                 className="h-11 w-11 shrink-0 rounded-xl object-contain bg-gray-700/40 p-1"
                 onError={(e) => { (e.currentTarget as HTMLImageElement).style.display = 'none'; }}

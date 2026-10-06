@@ -59,6 +59,40 @@ REPO_DEFAULT="https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git"
 RETRY_AFTER_SEC="${BLASTI_WATCH_RETRY_SEC:-1800}" # wait 30 min after a failed deploy
 UPDATE_LOCK="${BLASTI_WATCH_UPDATE_LOCK:-/run/lock/blasti-update.lock}" # shared with deploy-digitalocean.sh
 
+# ----------------------------------------------------------------
+# Heartbeat: report every check / deploy to the cloud API so the
+# admin panel (Public Apps Settings -> deploy status) can show that
+# the watcher is alive and what the last deploy did.
+#   - ON THE VPS: nothing to configure — systemd exports
+#     INTERNAL_API_URL + DEPLOY_TOKEN from /etc/blasti/blasti.env.
+#   - FROM YOUR MACHINE (mode A): export BLASTI_HEARTBEAT_URL and
+#     BLASTI_DEPLOY_TOKEN to enable it, otherwise it is skipped.
+# A failed heartbeat NEVER breaks the watcher (curl failure ignored).
+# ----------------------------------------------------------------
+HB_URL="${BLASTI_HEARTBEAT_URL:-}"
+HB_TOKEN="${BLASTI_DEPLOY_TOKEN:-${DEPLOY_TOKEN:-}}"
+if [ -z "$HB_URL" ] && [ -r /etc/blasti/blasti.env ]; then
+  HB_URL="$(grep '^INTERNAL_API_URL=' /etc/blasti/blasti.env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  HB_URL="${HB_URL:-http://127.0.0.1:3003}"
+fi
+if [ -z "$HB_TOKEN" ] && [ -r /etc/blasti/blasti.env ]; then
+  HB_TOKEN="$(grep '^DEPLOY_TOKEN=' /etc/blasti/blasti.env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+fi
+HB_REPO="${BLASTI_WATCH_REPO:-$REPO_DEFAULT}"
+HB_BRANCH_DEFAULT="master"
+
+hb_enabled() { [ -n "$HB_URL" ] && [ -n "$HB_TOKEN" ]; }
+
+heartbeat() { # heartbeat <kind> <status> <commit> <message> [extra_json]
+  hb_enabled || return 0
+  local kind="$1" status="$2" commit="$3" message="$4" extra="${5:-}"
+  local payload
+  payload="{\"kind\":\"$kind\",\"status\":\"$status\",\"commit\":\"$commit\",\"branch\":\"$BRANCH_NAME\",\"repo\":\"$HB_REPO\",\"intervalSec\":$INTERVAL_NAME,\"message\":\"$message\"$extra}"
+  curl -fsS -m 5 -X POST "$HB_URL/api/system/deploy-heartbeat" \
+    -H 'Content-Type: application/json' -H "x-deploy-token: $HB_TOKEN" \
+    -d "$payload" >/dev/null 2>&1 || true
+}
+
 log() { printf '%s [watch] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 die() { printf '%s [watch] FAIL: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
 usage() { sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -98,12 +132,14 @@ remote_sha() { # remote_sha <repo> <branch> -> latest commit on the branch
 cmd_watch() {
   local TARGET="" ON_SERVER=0 REPO="$REPO_DEFAULT" BRANCH="master" INTERVAL=300
   local ONCE=0 DRY_RUN=0 DEPLOY_NOW=0 FORCE=0 DIR="/opt/blasti" PORT=22 DOMAIN=""
+  BRANCH_NAME="$BRANCH"
+  INTERVAL_NAME="$INTERVAL"
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)       REPO="$2";      shift 2 ;;
-      --branch)     BRANCH="$2";    shift 2 ;;
-      --interval)   INTERVAL="$2";  shift 2 ;;
+      --repo)       REPO="$2"; BRANCH_NAME="$2";      shift 2 ;;
+      --branch)     BRANCH="$2";    BRANCH_NAME="$2";    shift 2 ;;
+      --interval)   INTERVAL="$2";  INTERVAL_NAME="$2";  shift 2 ;;
       --on-server)  ON_SERVER=1;    shift ;;
       --once)       ONCE=1;         shift ;;
       --dry-run)    DRY_RUN=1;      shift ;;
@@ -154,6 +190,7 @@ cmd_watch() {
     if [ -z "$sha" ]; then
       log "could not read remote refs (offline? missing credentials?) - will retry"
       failures=$((failures + 1))
+      heartbeat "watcher-check" "error" "" "could not read remote refs"
     else
       last=""
       if [ "$ON_SERVER" -eq 1 ]; then
@@ -199,18 +236,24 @@ cmd_watch() {
         fi
         if [ "$skip_deploy" -eq 0 ]; then
           log "new commit detected: $last -> $sha - deploying"
-          local rc=0
+          heartbeat "deploy-start" "ok" "$sha" "new commit detected - deploying"
+          local rc=0 deploy_started
+          deploy_started="$(date +%s)"
           deploy_now "$sha" || rc=$?
           if [ "$rc" -eq 0 ]; then
             failures=0
             if [ "$ON_SERVER" -ne 1 ]; then printf '%s' "$sha" > "$base.sha"; fi
             log "deploy finished - now at $sha"
+            heartbeat "deploy-result" "success" "$sha" "deploy finished" \
+              ",\"durationSec\":$(( $(date +%s) - deploy_started ))"
           elif [ "$rc" -eq 2 ]; then
             log "deploy skipped - another install/update is running; will check again next cycle"
+            heartbeat "watcher-check" "ok" "$sha" "deploy skipped - update lock busy"
           else
             failures=$((failures + 1))
             last_rc=1 # --once mode reports the failed deploy to systemd/cron
             log "deploy FAILED (attempt $failures) - will retry (state not updated)"
+            heartbeat "deploy-result" "failure" "$sha" "deploy failed (attempt $failures)"
           fi
         fi
       fi
@@ -218,6 +261,7 @@ cmd_watch() {
 
     if [ -n "$sha" ] && [ "$sha" = "$last" ] && [ "$FORCE" -eq 0 ]; then
       log "up to date ($sha)"
+      heartbeat "watcher-check" "ok" "$sha" "up to date"
       # first peaceful run: record the baseline so restarts never re-deploy
       if [ "$ON_SERVER" -eq 1 ] && [ "$DRY_RUN" -eq 0 ] && [ ! -f "$base.sha" ]; then
         printf '%s' "$sha" > "$base.sha" 2>/dev/null || true
