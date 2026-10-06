@@ -12,6 +12,7 @@
  *  - Logout: store logout() + success toast
  */
 import { apiFetch } from '@/lib/api-fetch';
+import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 import { useState, useEffect } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
@@ -110,27 +111,47 @@ export function CustomerSettings() {
     fetchProfile();
   }, []);
 
+  /** Apply a profile payload (fresh or cached) to the local state. */
+  const applyProfile = (
+    data: { fullName?: string; phoneNumber?: string; notificationPreferences?: unknown } | null,
+  ) => {
+    if (!data) return;
+    if (data.notificationPreferences) {
+      setNotifPrefs(
+        typeof data.notificationPreferences === 'string'
+          ? JSON.parse(data.notificationPreferences)
+          : data.notificationPreferences
+      );
+    }
+    if (data.phoneNumber) setPhoneNumber(data.phoneNumber);
+    if (data.fullName) setFullName(data.fullName);
+  };
+
+  /**
+   * Task 84 — INSTANT settings paint + stale-while-revalidate.
+   * The store already carries the profile basics, so the view renders
+   * immediately; the cached profile applies on mount and the network
+   * refreshes silently. The old flow gated the whole screen on
+   * /api/user/profile (30s+ on a dead/slow API — the black-screen bug).
+   */
   const fetchProfile = async () => {
     if (!user?.id) return;
-    setLoading(true);
+    setLoading(false);
+    const key = cacheKeyFor('/api/user/profile', { userId: user.id });
+    const cached = await cacheGet<Record<string, unknown>>(key);
+    if (cached) applyProfile(cached.data as { fullName?: string; phoneNumber?: string });
     try {
       const res = await apiFetch(`/api/user/profile?userId=${user.id}`);
       if (res.ok) {
         const data = await res.json();
-        if (data.notificationPreferences) {
-          setNotifPrefs(
-            typeof data.notificationPreferences === 'string'
-              ? JSON.parse(data.notificationPreferences)
-              : data.notificationPreferences
-          );
-        }
-        if (data.phoneNumber) setPhoneNumber(data.phoneNumber);
-        if (data.fullName) setFullName(data.fullName);
+        applyProfile(data);
+        await cacheSet(key, data);
+      } else if (!cached) {
+        toast.error(t('error'));
       }
     } catch {
-      toast.error(t('error'));
-    } finally {
-      setLoading(false);
+      // Store/cached data already on screen — refresh failed silently.
+      if (!cached) toast.error(t('error'));
     }
   };
 

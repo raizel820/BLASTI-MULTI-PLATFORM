@@ -873,10 +873,16 @@ export class ApiClient {
     // In Electron, don't retry cloud — fail fast and let LAN failover kick in immediately.
     // The desktop app's LAN server (localhost:3080) has the same data, so there's no need
     // to wait through 7 seconds of cloud retries when the API server is down.
-    const maxRetries = options?.retries ?? (isElectronRuntime() ? 0 : this.config.retries);
+    // Task 84 perf: GET reads fail FAST (10s timeout, 1 retry) — the previous
+    // default (30s × 3 retries) meant a dead/slow API black-screened every
+    // navigation for 90+s ("loads after 30s or never"). Mutations keep the
+    // long timeout so uploads on slow links are never cut short.
+    const maxRetries = options?.retries
+      ?? (isElectronRuntime() ? 0 : (method === 'GET' ? 1 : this.config.retries));
     // In Electron, use a shorter timeout (5s) so cloud failures are detected quickly
     // and LAN failover kicks in without a long wait.
-    const timeoutMs = options?.timeout ?? (isElectronRuntime() ? 5_000 : this.config.timeout);
+    const timeoutMs = options?.timeout
+      ?? (isElectronRuntime() ? 5_000 : (method === 'GET' ? 10_000 : this.config.timeout));
     // Re-resolve the base URL PER REQUEST (not per construction): the Capacitor
     // runtime resolver finishes asynchronously after module load, and the
     // singleton's frozen config.baseUrl would otherwise keep pointing at the

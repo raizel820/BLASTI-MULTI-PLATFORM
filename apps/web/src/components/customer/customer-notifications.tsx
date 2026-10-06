@@ -17,6 +17,9 @@
  */
 
 import { apiFetch } from "@/lib/api-fetch";
+// Task 84 — IndexedDB stale-while-revalidate: notifications render instantly
+// from the last-known list on initial load and refresh silently.
+import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
@@ -251,21 +254,32 @@ export function CustomerNotifications() {
     if (!user?.id) return;
     if (showRefresh) setRefreshing(true);
     setFetchError(false);
+    // Task 84 — instant paint from the last-known list on initial load only
+    // (the 30s auto-refresh + realtime events own the list afterwards).
+    const notifKey = cacheKeyFor('/api/notifications', { userId: user.id });
+    const cachedNotifs = notifications.length === 0 && !showRefresh
+      ? await cacheGet<{ notifications?: typeof notifications }>(notifKey)
+      : null;
+    if (cachedNotifs?.data?.notifications?.length) {
+      setNotifications(cachedNotifs.data.notifications);
+      setLoading(false);
+    }
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
       const res = await fetchWithRetry(`/api/notifications?userId=${user.id}`);
       if (res.ok) {
         const data = await res.json();
+        void cacheSet(notifKey, data);
         setNotifications(data.notifications ?? []);
       } else {
         // Only set error on initial load (not background refresh)
-        if (!showRefresh && notifications.length === 0) {
+        if (!showRefresh && notifications.length === 0 && !cachedNotifs?.data?.notifications?.length) {
           setFetchError(true);
         }
       }
     } catch {
       // Only set error on initial load (not background refresh)
-      if (!showRefresh && notifications.length === 0) {
+      if (!showRefresh && notifications.length === 0 && !cachedNotifs?.data?.notifications?.length) {
         setFetchError(true);
       }
     } finally {
@@ -274,7 +288,7 @@ export function CustomerNotifications() {
       }
       setLoading(false);
     }
-  }, [user?.id, notifications.length]);
+  }, [user?.id, notifications.length, notifications]);
 
   useEffect(() => {
     fetchNotifications();

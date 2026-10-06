@@ -1099,6 +1099,22 @@ CREATE UNIQUE INDEX "Review_userId_agencyId_branchId_key" ON "Review"("userId", 
 CREATE UNIQUE INDEX "Branch_subCode_key" ON "Branch"("subCode");
 
 -- CreateIndex
+-- Task 84 — search/listing performance indexes (mirrors packages/db schema)
+CREATE INDEX "Agency_isActive_isSponsored_createdAt_idx" ON "Agency"("isActive", "isSponsored", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "Agency_category_idx" ON "Agency"("category");
+
+-- CreateIndex
+CREATE INDEX "Branch_agencyId_idx" ON "Branch"("agencyId");
+
+-- CreateIndex
+CREATE INDEX "Branch_isActive_isMain_createdAt_idx" ON "Branch"("isActive", "isMain", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "Review_agencyId_branchId_idx" ON "Review"("agencyId", "branchId");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "AgencyCategory_name_key" ON "AgencyCategory"("name");
 
 -- CreateIndex
@@ -1385,6 +1401,22 @@ CREATE UNIQUE INDEX "Review_userId_agencyId_branchId_key" ON "Review"("userId", 
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Branch_subCode_key" ON "Branch"("subCode");
+
+-- CreateIndex
+-- Task 84 — search/listing performance indexes (mirrors packages/db schema)
+CREATE INDEX "Agency_isActive_isSponsored_createdAt_idx" ON "Agency"("isActive", "isSponsored", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "Agency_category_idx" ON "Agency"("category");
+
+-- CreateIndex
+CREATE INDEX "Branch_agencyId_idx" ON "Branch"("agencyId");
+
+-- CreateIndex
+CREATE INDEX "Branch_isActive_isMain_createdAt_idx" ON "Branch"("isActive", "isMain", "createdAt");
+
+-- CreateIndex
+CREATE INDEX "Review_agencyId_branchId_idx" ON "Review"("agencyId", "branchId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Counter_currentReservationId_key" ON "Counter"("currentReservationId");

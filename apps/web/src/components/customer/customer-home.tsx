@@ -24,6 +24,9 @@
 import { apiFetch } from '@/lib/api-fetch';
 import { toLocalDateString } from '@/lib/date-utils';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
+// Task 84 — IndexedDB stale-while-revalidate: the home screen paints instantly
+// from the last-known payload (even fully offline) and refreshes silently.
+import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -81,6 +84,34 @@ import { useDebounce } from '@/hooks/use-debounce';
 import { haversineDistanceKm } from '@/lib/geo';
 import { ActiveTicketStrip, type ActiveTicket } from './home/ActiveTicketStrip';
 
+/**
+ * Task 84 — shape a raw /api/reservations/active row into an ActiveTicket.
+ * Shared by the network refresh AND the cached instant paint (same mapping,
+ * so the cached strip looks identical to the live one).
+ */
+function mapActiveReservations(rows: Array<Record<string, unknown>>): ActiveTicket[] {
+  return rows.map((r) => {
+    const agency = r.agency as { name?: string; id?: string; nameAr?: string; nameFr?: string } | undefined;
+    const service = r.service as { name?: string; nameAr?: string; nameFr?: string } | undefined;
+    const eta = r.eta as { estimatedMaxMinutes?: number } | undefined;
+    return {
+      agencyId: agency?.id || (r.agencyId as string) || '',
+      agencyName: agency?.name || '',
+      agencyNameAr: agency?.nameAr,
+      agencyNameFr: agency?.nameFr,
+      serviceName: service?.name,
+      serviceNameAr: service?.nameAr,
+      serviceNameFr: service?.nameFr,
+      queueNumber:
+        (r.displayNumber as string) || (r.queueNumber != null ? `${r.queueNumber}` : undefined),
+      currentServingNumber: r.currentServingNumber != null ? String(r.currentServingNumber) : undefined,
+      estimatedWait: (r.estimatedWait as number | undefined) ?? eta?.estimatedMaxMinutes ?? undefined,
+      position: (r.position as number) || (r.queueNumber as number) || 0,
+      status: r.status as string | undefined,
+    };
+  });
+}
+
 export function CustomerHome() {
   const setView = useAppStore((s) => s.setView);
   const user = useAppStore((s) => s.user);
@@ -135,6 +166,9 @@ export function CustomerHome() {
   const [fixedTimeEnabled, setFixedTimeEnabled] = useState(false);
   const [qrScannerOpen, setQrScannerOpen] = useState(false);
   const [activeReservations, setActiveReservations] = useState<ActiveTicket[]>([]);
+  // Task 84 — the cached instant paint of the active-ticket strip runs once
+  // per mount (the polling loop owns the screen afterwards).
+  const activeCachePainted = useRef(false);
 
   useEffect(() => {
     fetchAgencies();
@@ -155,14 +189,23 @@ export function CustomerHome() {
 
   const fetchFavorites = useCallback(async () => {
     if (!user?.id) return;
+    const favKey = cacheKeyFor('/api/favorites', { userId: user.id });
+    // Instant paint from cache — favorite hearts are correct before the network answers.
+    const cachedFav = await cacheGet<{ favorites?: Array<{ agencyId: string }> }>(favKey);
+    if (cachedFav?.data?.favorites) {
+      setFavoriteIds(new Set(cachedFav.data.favorites.map((f) => f.agencyId)));
+    }
     try {
       const res = await apiFetch(`/api/favorites?userId=${user.id}`);
       if (res.ok) {
         const data = await res.json();
+        void cacheSet(favKey, data);
         setFavoriteIds(new Set((data.favorites ?? []).map((f: { agencyId: string }) => f.agencyId)));
+      } else if (!cachedFav) {
+        toast.error(t('error'));
       }
     } catch {
-      toast.error(t('error'));
+      if (!cachedFav) toast.error(t('error'));
     }
   }, [user?.id, t]);
 
@@ -173,19 +216,31 @@ export function CustomerHome() {
   const fetchAgencies = async () => {
     setLoading(true);
     setFetchError(false);
+    // Task 84 — instant cache paint: render the last-known agency list right
+    // away, then revalidate. A dead/slow API no longer blank the home screen
+    // (the old "30s skeleton, sometimes never" bug).
+    const agencyKey = cacheKeyFor('/api/agencies');
+    const cachedAgencies = await cacheGet<{ agencies?: typeof agencies }>(agencyKey);
+    if (cachedAgencies?.data?.agencies?.length) {
+      setAgencies(cachedAgencies.data.agencies);
+      setLoading(false);
+    }
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
       const res = await fetchWithRetry('/api/agencies');
       if (res.ok) {
         const data = await res.json();
+        void cacheSet(agencyKey, data);
         setAgencies(data.agencies ?? []);
-      } else {
+      } else if (!cachedAgencies?.data?.agencies?.length) {
         setFetchError(true);
         toast.error(t('error'));
       }
     } catch {
-      setFetchError(true);
-      toast.error(t('error'));
+      if (!cachedAgencies?.data?.agencies?.length) {
+        setFetchError(true);
+        toast.error(t('error'));
+      }
     } finally {
       setLoading(false);
     }
@@ -494,35 +549,22 @@ export function CustomerHome() {
 
     const fetchActiveReservations = async () => {
       try {
+        const activeKey = cacheKeyFor('/api/reservations/active', { userId: user.id });
+        // First tick only: paint the last-known active ticket instantly so the
+        // strip is visible offline / on a dead API (the polling loop keeps it fresh).
+        if (!activeCachePainted.current) {
+          activeCachePainted.current = true;
+          const cachedActive = await cacheGet<{ reservations?: Array<Record<string, unknown>> }>(activeKey);
+          if (cachedActive?.data?.reservations?.length && !stopped) {
+            setActiveReservations(mapActiveReservations(cachedActive.data.reservations));
+          }
+        }
         const res = await apiFetch(`/api/reservations/active?userId=${user.id}`);
         if (res.ok) {
           const data = await res.json();
+          void cacheSet(activeKey, data);
           const reservations = data.reservations ?? [];
-          setActiveReservations(reservations.map((r: {
-            agency?: { name: string; id: string; nameAr?: string; nameFr?: string };
-            service?: { name: string; nameAr?: string; nameFr?: string };
-            position?: number;
-            agencyId?: string;
-            queueNumber?: number;
-            displayNumber?: string;
-            currentServingNumber?: number | string;
-            estimatedWait?: number;
-            eta?: { estimatedMaxMinutes?: number };
-            status?: string;
-          }) => ({
-            agencyId: r.agency?.id || r.agencyId || '',
-            agencyName: r.agency?.name || '',
-            agencyNameAr: r.agency?.nameAr,
-            agencyNameFr: r.agency?.nameFr,
-            serviceName: r.service?.name,
-            serviceNameAr: r.service?.nameAr,
-            serviceNameFr: r.service?.nameFr,
-            queueNumber: r.displayNumber || (r.queueNumber != null ? `${r.queueNumber}` : undefined),
-            currentServingNumber: r.currentServingNumber != null ? String(r.currentServingNumber) : undefined,
-            estimatedWait: r.estimatedWait ?? r.eta?.estimatedMaxMinutes ?? undefined,
-            position: r.position || r.queueNumber || 0,
-            status: r.status,
-          })));
+          setActiveReservations(mapActiveReservations(reservations));
           failures = 0;
         }
       } catch { /* silent */ }

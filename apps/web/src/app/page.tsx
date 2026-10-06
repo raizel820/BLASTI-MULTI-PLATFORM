@@ -1,6 +1,10 @@
 'use client';
 
-import { useEffect, useState, lazy, Suspense, memo, useCallback } from 'react';
+import { useEffect, useState, Suspense, memo, useCallback, useRef } from 'react';
+// Task 84 — resilient lazy views: every chunk import gets a timeout + retry
+// (a failed/hanging chunk can no longer black-screen a view), plus idle-time
+// warming of the chunks the current role is most likely to open next.
+import { lazyNamed, warmViews } from '@/lib/lazy-view';
 import { useAppStore, updateDocumentDirection } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { isRTL, type Language } from '@/i18n';
@@ -9,73 +13,73 @@ import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable } from '@/lib/api-client';
 
 // Auth Views — lazy loaded to reduce initial compilation footprint
-const LandingPage = lazy(() => import('@/components/auth/landing-page').then(m => ({ default: m.LandingPage })));
-const LoginForm = lazy(() => import('@/components/auth/login-form').then(m => ({ default: m.LoginForm })));
-const DesktopAgencyLogin = lazy(() => import('@/components/auth/desktop-agency-login').then(m => ({ default: m.DesktopAgencyLogin })));
-const RegisterForm = lazy(() => import('@/components/auth/register-form').then(m => ({ default: m.RegisterForm })));
+const LandingPage = lazyNamed(() => import('@/components/auth/landing-page'), 'LandingPage');
+const LoginForm = lazyNamed(() => import('@/components/auth/login-form'), 'LoginForm');
+const DesktopAgencyLogin = lazyNamed(() => import('@/components/auth/desktop-agency-login'), 'DesktopAgencyLogin');
+const RegisterForm = lazyNamed(() => import('@/components/auth/register-form'), 'RegisterForm');
 // Task 78 — dedicated MOBILE (Capacitor) auth screens: customer-first,
 // touch-first, safe-area aware replacements for the desktop-oriented forms.
-const MobileLoginForm = lazy(() => import('@/components/auth/mobile-login').then(m => ({ default: m.MobileLoginForm })));
-const MobileRegisterForm = lazy(() => import('@/components/auth/mobile-register').then(m => ({ default: m.MobileRegisterForm })));
+const MobileLoginForm = lazyNamed(() => import('@/components/auth/mobile-login'), 'MobileLoginForm');
+const MobileRegisterForm = lazyNamed(() => import('@/components/auth/mobile-register'), 'MobileRegisterForm');
 
 // Customer Views
-const CustomerHome = lazy(() => import('@/components/customer/customer-home').then(m => ({ default: m.CustomerHome })));
-const CustomerQueue = lazy(() => import('@/components/customer/customer-queue').then(m => ({ default: m.CustomerQueue })));
-const CustomerHistory = lazy(() => import('@/components/customer/customer-history').then(m => ({ default: m.CustomerHistory })));
-const CustomerProfile = lazy(() => import('@/components/customer/customer-profile').then(m => ({ default: m.CustomerProfile })));
-const CustomerNotifications = lazy(() => import('@/components/customer/customer-notifications').then(m => ({ default: m.CustomerNotifications })));
-const CustomerFavorites = lazy(() => import('@/components/customer/customer-favorites').then(m => ({ default: m.CustomerFavorites })));
-const CustomerSettings = lazy(() => import('@/components/customer/customer-settings').then(m => ({ default: m.CustomerSettings })));
+const CustomerHome = lazyNamed(() => import('@/components/customer/customer-home'), 'CustomerHome');
+const CustomerQueue = lazyNamed(() => import('@/components/customer/customer-queue'), 'CustomerQueue');
+const CustomerHistory = lazyNamed(() => import('@/components/customer/customer-history'), 'CustomerHistory');
+const CustomerProfile = lazyNamed(() => import('@/components/customer/customer-profile'), 'CustomerProfile');
+const CustomerNotifications = lazyNamed(() => import('@/components/customer/customer-notifications'), 'CustomerNotifications');
+const CustomerFavorites = lazyNamed(() => import('@/components/customer/customer-favorites'), 'CustomerFavorites');
+const CustomerSettings = lazyNamed(() => import('@/components/customer/customer-settings'), 'CustomerSettings');
 // Task 54-d: personal "My Analytics" module (doc-2 §38-44) over the frozen
 // 54-a customer endpoints (GET /api/customer/analytics/*).
-const CustomerAnalytics = lazy(() => import('@/components/customer/customer-analytics').then(m => ({ default: m.CustomerAnalytics })));
+const CustomerAnalytics = lazyNamed(() => import('@/components/customer/customer-analytics'), 'CustomerAnalytics');
 // Support desk — customer side: file complaints/suggestions/questions/notes
 // to the super admin and track replies.
-const CustomerSupport = lazy(() => import('@/components/customer/customer-support').then(m => ({ default: m.CustomerSupport })));
+const CustomerSupport = lazyNamed(() => import('@/components/customer/customer-support'), 'CustomerSupport');
 // Task 81-b: public customer-facing agency profile (info/location/rating/comments).
-const CustomerAgencyProfile = lazy(() => import('@/components/customer/customer-agency-profile').then(m => ({ default: m.CustomerAgencyProfile })));
+const CustomerAgencyProfile = lazyNamed(() => import('@/components/customer/customer-agency-profile'), 'CustomerAgencyProfile');
 // Task 83-c: customer-facing BRANCH profile (independent per-branch entity).
-const CustomerBranchProfile = lazy(() => import('@/components/customer/customer-branch-profile').then(m => ({ default: m.CustomerBranchProfile })));
+const CustomerBranchProfile = lazyNamed(() => import('@/components/customer/customer-branch-profile'), 'CustomerBranchProfile');
 
 // Agency Views
-const AgencyDashboard = lazy(() => import('@/components/agency/agency-dashboard').then(m => ({ default: m.AgencyDashboard })));
-const AgencySettings = lazy(() => import('@/components/agency/agency-settings').then(m => ({ default: m.AgencySettings })));
-const AgencyProfile = lazy(() => import('@/components/agency/agency-profile').then(m => ({ default: m.AgencyProfile })));
-const AgencySubscription = lazy(() => import('@/components/agency/agency-subscription').then(m => ({ default: m.AgencySubscription })));
-const AgencyReviews = lazy(() => import('@/components/agency/agency-reviews').then(m => ({ default: m.AgencyReviews })));
-const AgencyEmployees = lazy(() => import('@/components/agency/agency-employees').then(m => ({ default: m.AgencyEmployees })));
-const AgencyBranches = lazy(() => import('@/components/agency/agency-branches').then(m => ({ default: m.AgencyBranches })));
-const AgencyDevices = lazy(() => import('@/components/agency/agency-devices').then(m => ({ default: m.AgencyDevices })));
+const AgencyDashboard = lazyNamed(() => import('@/components/agency/agency-dashboard'), 'AgencyDashboard');
+const AgencySettings = lazyNamed(() => import('@/components/agency/agency-settings'), 'AgencySettings');
+const AgencyProfile = lazyNamed(() => import('@/components/agency/agency-profile'), 'AgencyProfile');
+const AgencySubscription = lazyNamed(() => import('@/components/agency/agency-subscription'), 'AgencySubscription');
+const AgencyReviews = lazyNamed(() => import('@/components/agency/agency-reviews'), 'AgencyReviews');
+const AgencyEmployees = lazyNamed(() => import('@/components/agency/agency-employees'), 'AgencyEmployees');
+const AgencyBranches = lazyNamed(() => import('@/components/agency/agency-branches'), 'AgencyBranches');
+const AgencyDevices = lazyNamed(() => import('@/components/agency/agency-devices'), 'AgencyDevices');
 // Task 42-e: dedicated Analytics & Statistics section (self-handles authority
 // empty/error states — no AuthorityGate wrapper, like admin-analytics).
-const AgencyAnalytics = lazy(() => import('@/components/agency/analytics/analytics-dashboard').then(m => ({ default: m.AgencyAnalytics })));
+const AgencyAnalytics = lazyNamed(() => import('@/components/agency/analytics/analytics-dashboard'), 'AgencyAnalytics');
 // Support desk — agency side: file tickets on behalf of the agency and track
 // the super admin's replies.
-const AgencySupport = lazy(() => import('@/components/agency/agency-support').then(m => ({ default: m.AgencySupport })));
-const AgencyFullscreen = lazy(() => import('@/components/agency/agency-fullscreen').then(m => ({ default: m.AgencyFullscreen })));
-const AgencyFullscreenHistory = lazy(() => import('@/components/agency/agency-fullscreen-history').then(m => ({ default: m.AgencyFullscreenHistory })));
+const AgencySupport = lazyNamed(() => import('@/components/agency/agency-support'), 'AgencySupport');
+const AgencyFullscreen = lazyNamed(() => import('@/components/agency/agency-fullscreen'), 'AgencyFullscreen');
+const AgencyFullscreenHistory = lazyNamed(() => import('@/components/agency/agency-fullscreen-history'), 'AgencyFullscreenHistory');
 // Device Views (standalone kiosk, TV board — accessed via ?mode=device&type=KIOSK|TV)
-const DeviceKiosk = lazy(() => import('@/components/devices/device-kiosk').then(m => ({ default: m.DeviceKiosk })));
-const DeviceTvBoard = lazy(() => import('@/components/devices/device-tv-board').then(m => ({ default: m.DeviceTvBoard })));
+const DeviceKiosk = lazyNamed(() => import('@/components/devices/device-kiosk'), 'DeviceKiosk');
+const DeviceTvBoard = lazyNamed(() => import('@/components/devices/device-tv-board'), 'DeviceTvBoard');
 
 // Admin Views
-const AdminDashboard = lazy(() => import('@/components/admin/admin-dashboard').then(m => ({ default: m.AdminDashboard })));
-const AdminTransactions = lazy(() => import('@/components/admin/admin-transactions').then(m => ({ default: m.AdminTransactions })));
-const AdminAgencies = lazy(() => import('@/components/admin/admin-agencies').then(m => ({ default: m.AdminAgencies })));
-const AdminAuditLogs = lazy(() => import('@/components/admin/admin-audit-logs').then(m => ({ default: m.AdminAuditLogs })));
-const AdminUsers = lazy(() => import('@/components/admin/admin-users').then(m => ({ default: m.AdminUsers })));
-const AdminAnalytics = lazy(() => import('@/components/admin/admin-analytics').then(m => ({ default: m.AdminAnalytics })));
-const AdminSettings = lazy(() => import('@/components/admin/admin-settings').then(m => ({ default: m.AdminSettings })));
+const AdminDashboard = lazyNamed(() => import('@/components/admin/admin-dashboard'), 'AdminDashboard');
+const AdminTransactions = lazyNamed(() => import('@/components/admin/admin-transactions'), 'AdminTransactions');
+const AdminAgencies = lazyNamed(() => import('@/components/admin/admin-agencies'), 'AdminAgencies');
+const AdminAuditLogs = lazyNamed(() => import('@/components/admin/admin-audit-logs'), 'AdminAuditLogs');
+const AdminUsers = lazyNamed(() => import('@/components/admin/admin-users'), 'AdminUsers');
+const AdminAnalytics = lazyNamed(() => import('@/components/admin/admin-analytics'), 'AdminAnalytics');
+const AdminSettings = lazyNamed(() => import('@/components/admin/admin-settings'), 'AdminSettings');
 // Task 2-b: standalone super-admin Maps & Location page (same component that
 // is embedded mid-page inside admin-settings — promoted to its own view).
-const AdminMaps = lazy(() => import('@/components/admin/admin-maps-settings').then(m => ({ default: m.AdminMapsSettings })));
-const AdminSubscriptionPlans = lazy(() => import('@/components/admin/admin-subscription-plans').then(m => ({ default: m.AdminSubscriptionPlans })));
-const AdminAppSettings = lazy(() => import('@/components/admin/admin-app-settings').then(m => ({ default: m.AdminAppSettings })));
-const AdminHardware = lazy(() => import('@/components/admin/admin-hardware').then(m => ({ default: m.AdminHardware })));
-const AdminHardwareRequests = lazy(() => import('@/components/admin/admin-hardware-requests').then(m => ({ default: m.AdminHardwareRequests })));
-const AdminEnterpriseRequests = lazy(() => import('@/components/admin/admin-enterprise-requests').then(m => ({ default: m.AdminEnterpriseRequests })));
+const AdminMaps = lazyNamed(() => import('@/components/admin/admin-maps-settings'), 'AdminMapsSettings');
+const AdminSubscriptionPlans = lazyNamed(() => import('@/components/admin/admin-subscription-plans'), 'AdminSubscriptionPlans');
+const AdminAppSettings = lazyNamed(() => import('@/components/admin/admin-app-settings'), 'AdminAppSettings');
+const AdminHardware = lazyNamed(() => import('@/components/admin/admin-hardware'), 'AdminHardware');
+const AdminHardwareRequests = lazyNamed(() => import('@/components/admin/admin-hardware-requests'), 'AdminHardwareRequests');
+const AdminEnterpriseRequests = lazyNamed(() => import('@/components/admin/admin-enterprise-requests'), 'AdminEnterpriseRequests');
 // Support desk — super-admin triage: reply to and resolve incoming tickets.
-const AdminTickets = lazy(() => import('@/components/admin/admin-tickets').then(m => ({ default: m.AdminTickets })));
+const AdminTickets = lazyNamed(() => import('@/components/admin/admin-tickets'), 'AdminTickets');
 
 // Shared (eagerly imported — lightweight)
 import { AgencyAuthorityGate } from '@/components/agency/agency-authority-gate';
@@ -97,9 +101,66 @@ import { usePlatform } from '@/hooks/use-platform';
 import { Button } from '@/components/ui/button';
 
 // Shared (lazy loaded — heavy components that are conditionally rendered)
-const OnboardingWizard = lazy(() => import('@/components/shared/onboarding-wizard').then(m => ({ default: m.OnboardingWizard })));
-const NotificationCenter = lazy(() => import('@/components/shared/NotificationCenter').then(m => ({ default: m.NotificationCenter })));
+const OnboardingWizard = lazyNamed(() => import('@/components/shared/onboarding-wizard'), 'OnboardingWizard');
+const NotificationCenter = lazyNamed(() => import('@/components/shared/NotificationCenter'), 'NotificationCenter');
 // QueueE2ETestPanel removed — test button no longer needed
+
+// ─── Task 84: idle-time view warming ─────────────────────────────────────────
+// After the authenticated shell has painted, preload the view chunks the
+// current role is most likely to open next (sequential, idle-scheduled —
+// never competes with first paint). Dynamic imports of the same module share
+// one chunk, so warming here makes the later lazyNamed(...) navigation
+// resolve instantly — no chunk download on first tap, no black skeleton.
+const WARMED_ROLES = new Set<string>();
+function warmRoleViews(role: string): void {
+  if (WARMED_ROLES.has(role)) return;
+  WARMED_ROLES.add(role);
+  const shared: Array<() => Promise<unknown>> = [
+    () => import('@/components/shared/NotificationCenter'),
+    () => import('@/components/shared/onboarding-wizard'),
+  ];
+  let roleViews: Array<() => Promise<unknown>> = [];
+  if (role === 'CUSTOMER') {
+    roleViews = [
+      () => import('@/components/customer/customer-queue'),
+      () => import('@/components/customer/customer-settings'),
+      () => import('@/components/customer/customer-profile'),
+      () => import('@/components/customer/customer-history'),
+      () => import('@/components/customer/customer-favorites'),
+      () => import('@/components/customer/customer-notifications'),
+      () => import('@/components/customer/customer-agency-profile'),
+      () => import('@/components/customer/customer-branch-profile'),
+      () => import('@/components/customer/customer-support'),
+      () => import('@/components/customer/customer-analytics'),
+    ];
+  } else if (role === 'AGENCY_OWNER' || role === 'AGENCY_STAFF') {
+    roleViews = [
+      () => import('@/components/agency/agency-settings'),
+      () => import('@/components/agency/agency-profile'),
+      () => import('@/components/agency/agency-branches'),
+      () => import('@/components/agency/agency-employees'),
+      () => import('@/components/agency/agency-reviews'),
+      () => import('@/components/agency/analytics/analytics-dashboard'),
+      () => import('@/components/agency/agency-subscription'),
+      () => import('@/components/agency/agency-devices'),
+      () => import('@/components/agency/agency-support'),
+    ];
+  } else if (role === 'SUPER_ADMIN') {
+    roleViews = [
+      () => import('@/components/admin/admin-agencies'),
+      () => import('@/components/admin/admin-users'),
+      () => import('@/components/admin/admin-transactions'),
+      () => import('@/components/admin/admin-audit-logs'),
+      () => import('@/components/admin/admin-analytics'),
+      () => import('@/components/admin/admin-tickets'),
+      () => import('@/components/admin/admin-settings'),
+      () => import('@/components/admin/admin-maps-settings'),
+      () => import('@/components/admin/admin-subscription-plans'),
+      () => import('@/components/admin/admin-app-settings'),
+    ];
+  }
+  warmViews([...roleViews, ...shared]);
+}
 
 // Platform-specific navigation components
 import { PlatformFrame } from '@/components/platform/platform-frame';
@@ -372,6 +433,17 @@ export default function Home() {
     if (isAuthenticated) return;
     queueMicrotask(() => setBootReady(false));
   }, [isAuthenticated]);
+
+  // Task 84 — once the shell is up and we know the role, warm the likely-next
+  // view chunks during idle time (once per role per session). Warming is
+  // deferred until bootReady so it never competes with the boot sync.
+  const warmedBootRef = useRef(false);
+  useEffect(() => {
+    if (!bootReady || !user?.role) return;
+    if (warmedBootRef.current) return;
+    warmedBootRef.current = true;
+    warmRoleViews(user.role);
+  }, [bootReady, user?.role]);
 
   // Listen for onboarding trigger from register form
   useEffect(() => {

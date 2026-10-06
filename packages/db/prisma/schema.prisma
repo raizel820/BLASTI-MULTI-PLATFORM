@@ -296,6 +296,12 @@ model Agency {
   hardwareOrders        HardwareOrder[]
   enterpriseRequests    EnterpriseContractRequest[]
   ownedEnterprisePlans  SubscriptionPlan[] @relation("EnterprisePlanOwner")
+
+  // Task 84 — public listing performance: the customer home endpoint filters
+  // WHERE isActive = true and sorts isSponsored DESC → createdAt DESC.
+  @@index([isActive, isSponsored, createdAt])
+  // Category filter (public listing + branch search agency filter).
+  @@index([category])
 }
 
 // Phase 2: Dynamic SubscriptionPlan model — replaces hardcoded subscriptionTier enum
@@ -791,6 +797,8 @@ model Review {
   reservation   Reservation? @relation(fields: [reservationId], references: [id])
 
   @@unique([userId, agencyId, branchId])
+  // Task 84 — per-branch/per-agency rating aggregates + review lists.
+  @@index([agencyId, branchId])
 }
 
 model FAQ {
@@ -878,6 +886,11 @@ model Branch {
   reviews   Review[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // Task 84 — branch search performance: FK joins to Agency + the public
+  // branch listing filter (isActive) / sort (isMain DESC, createdAt ASC).
+  @@index([agencyId])
+  @@index([isActive, isMain, createdAt])
 }
 
 model Counter {

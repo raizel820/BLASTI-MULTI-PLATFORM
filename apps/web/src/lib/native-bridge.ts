@@ -164,6 +164,72 @@ function isWebShareAvailable(): boolean {
   return typeof navigator !== 'undefined' && typeof navigator.share === 'function';
 }
 
+// ─── WebAuthn (biometrics on web / Electron) ──────────────────────────────────
+
+/**
+ * Web / Electron biometric vault storage (Task 84).
+ *
+ * Browsers do not expose a keystore for arbitrary secrets, so the biometric
+ * unlock on PC works as a biometric-GATED local vault: the login secret is
+ * persisted locally but only ever RELEASED after a fresh WebAuthn assertion
+ * against a user-verifying platform authenticator (Windows Hello, Touch ID,
+ * fingerprint reader). This mirrors the Capacitor keystore threat model
+ * (local convenience secret, unlocked by the sensor).
+ */
+const WEBAUTHN_VAULT_KEY = 'blasti.biometric.vault';
+const WEBAUTHN_CREDID_KEY = 'blasti.biometric.credId';
+/** Timestamp (ms) of the last successful WebAuthn assertion — freshness reuse. */
+let webAuthnLastAssertionAt = 0;
+
+interface WebAuthnVaultEntry {
+  credId: string;
+  password: string;
+}
+
+function webAuthnReadVault(): Record<string, WebAuthnVaultEntry> {
+  try {
+    const raw = localStorage.getItem(WEBAUTHN_VAULT_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, WebAuthnVaultEntry>;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function webAuthnReadStoredCredId(): string | null {
+  try {
+    return localStorage.getItem(WEBAUTHN_CREDID_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function webAuthnWriteStoredCredId(credId: string): void {
+  try {
+    localStorage.setItem(WEBAUTHN_CREDID_KEY, credId);
+  } catch (error) {
+    console.error('[nativeBridge] webauthn credId persist failed:', error);
+  }
+}
+
+/** base64url (WebAuthn-safe) → Uint8Array */
+function webAuthnB64ToBytes(b64: string): Uint8Array {
+  const norm = b64.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = norm.length % 4 === 0 ? '' : '='.repeat(4 - (norm.length % 4));
+  const bin = atob(norm + pad);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+/** Uint8Array → base64url (WebAuthn-safe) */
+function webAuthnBytesToB64(bytes: Uint8Array): string {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 // ─── Native Bridge API ────────────────────────────────────────────────────────
 
 export const nativeBridge = {
@@ -616,48 +682,138 @@ export const nativeBridge = {
   // ── Biometrics ────────────────────────────────────────────────────────────
 
   /**
-   * Check whether biometric authentication (fingerprint / Face ID) is
-   * available on this device.
+   * Check whether biometric authentication (fingerprint / Face ID / Windows
+   * Hello / Touch ID) is available on this device.
    * - Capacitor: NativeBiometric plugin (@capgo/capacitor-native-biometric)
-   * - Web / Electron: false (no secure-enclave bridge)
+   * - Web / Electron: WebAuthn platform-authenticator probe — true ONLY on
+   *   devices with an actual user-verifying authenticator (fingerprint
+   *   reader, Windows Hello, Touch ID). Requires a secure context
+   *   (HTTPS or localhost), which WebAuthn itself mandates.
    */
   async isBiometricsAvailable(): Promise<boolean> {
-    if (!isCapacitorNative()) return false;
+    // Capacitor native: probe the NativeBiometric plugin
+    if (isCapacitorNative()) {
+      try {
+        const plugin = getCapacitorPlugin('NativeBiometric');
+        if (!plugin || typeof plugin.isAvailable !== 'function') return false;
 
-    try {
-      const plugin = getCapacitorPlugin('NativeBiometric');
-      if (!plugin || typeof plugin.isAvailable !== 'function') return false;
-
-      const result = await (plugin.isAvailable as (opts?: unknown) => Promise<{ isAvailable: boolean }>)(
-        {},
-      );
-      return !!result?.isAvailable;
-    } catch (error) {
-      console.error('[nativeBridge] isBiometricsAvailable failed:', error);
-      return false;
+        const result = await (plugin.isAvailable as (opts?: unknown) => Promise<{ isAvailable: boolean }>)(
+          {},
+        );
+        return !!result?.isAvailable;
+      } catch (error) {
+        console.error('[nativeBridge] isBiometricsAvailable failed:', error);
+        return false;
+      }
     }
+
+    // Web / Electron: WebAuthn platform-authenticator probe.
+    if (typeof window === 'undefined' || !window.isSecureContext) return false;
+    try {
+      if (
+        typeof PublicKeyCredential !== 'undefined' &&
+        typeof (PublicKeyCredential as unknown as {
+          isUserVerifyingPlatformAuthenticatorAvailable?: () => Promise<boolean>;
+        }).isUserVerifyingPlatformAuthenticatorAvailable === 'function'
+      ) {
+        const ok = await (
+          PublicKeyCredential as unknown as {
+            isUserVerifyingPlatformAuthenticatorAvailable: () => Promise<boolean>;
+          }
+        ).isUserVerifyingPlatformAuthenticatorAvailable();
+        return !!ok;
+      }
+    } catch (error) {
+      console.error('[nativeBridge] isBiometricsAvailable (webauthn) failed:', error);
+    }
+    return false;
   },
 
   /**
    * Prompt the user to authenticate with biometrics.
    * Resolves true ONLY when the device confirms a successful verification;
-   * any error, cancellation, or missing plugin resolves false.
+   * any error, cancellation, or missing bridge resolves false.
+   * - Capacitor: NativeBiometric.verifyIdentity
+   * - Web / Electron: WebAuthn — first call ENROLS a platform credential
+   *   (user-verifying, e.g. Windows Hello / Touch ID); later calls assert
+   *   against the stored credential. A fresh assertion within the last 30s
+   *   is reused so enable/login flows never double-prompt.
    */
   async authenticateWithBiometrics(reason?: string): Promise<boolean> {
-    if (!isCapacitorNative()) return false;
+    if (isCapacitorNative()) {
+      try {
+        const plugin = getCapacitorPlugin('NativeBiometric');
+        if (!plugin || typeof plugin.verifyIdentity !== 'function') return false;
 
+        await (plugin.verifyIdentity as (opts: unknown) => Promise<void>)({
+          reason: reason ?? 'Log in to BLASTI',
+          title: 'BLASTI',
+          subtitle: reason ?? '',
+        });
+        return true;
+      } catch (error) {
+        console.error('[nativeBridge] authenticateWithBiometrics failed:', error);
+        return false;
+      }
+    }
+
+    // Web / Electron: WebAuthn enrol-or-assert against the platform authenticator.
+    if (typeof window === 'undefined' || !window.isSecureContext) return false;
+    if (typeof navigator?.credentials?.create !== 'function') return false;
     try {
-      const plugin = getCapacitorPlugin('NativeBiometric');
-      if (!plugin || typeof plugin.verifyIdentity !== 'function') return false;
+      const challenge = crypto.getRandomValues(new Uint8Array(32));
 
-      await (plugin.verifyIdentity as (opts: unknown) => Promise<void>)({
-        reason: reason ?? 'Log in to BLASTI',
-        title: 'BLASTI',
-        subtitle: reason ?? '',
-      });
+      // Reuse a recent assertion — callers chain authenticate + read and the
+      // user already just verified (prevents double fingerprint prompts).
+      if (webAuthnLastAssertionAt && Date.now() - webAuthnLastAssertionAt < 30_000) {
+        return true;
+      }
+
+      const storedCredId = webAuthnReadStoredCredId();
+      if (storedCredId) {
+        // ASSERT: existing platform credential (user verifying).
+        const cred = (await navigator.credentials.get({
+          publicKey: {
+            challenge,
+            allowCredentials: [{ id: webAuthnB64ToBytes(storedCredId), type: 'public-key' }],
+            userVerification: 'required',
+            timeout: 60_000,
+          },
+        })) as PublicKeyCredential | null;
+        if (!cred) return false;
+        webAuthnLastAssertionAt = Date.now();
+        return true;
+      }
+
+      // ENROL: create a platform credential on this device.
+      const cred = (await navigator.credentials.create({
+        publicKey: {
+          challenge,
+          rp: { name: 'BLASTI' },
+          user: {
+            id: crypto.getRandomValues(new Uint8Array(16)),
+            name: 'blasti-biometric',
+            displayName: 'BLASTI Biometric Unlock',
+          },
+          pubKeyCredParams: [
+            { type: 'public-key', alg: -7 },
+            { type: 'public-key', alg: -257 },
+          ],
+          authenticatorSelection: {
+            authenticatorAttachment: 'platform',
+            userVerification: 'required',
+            residentKey: 'preferred',
+          },
+          timeout: 60_000,
+          attestation: 'none',
+        },
+      })) as PublicKeyCredential | null;
+      if (!cred) return false;
+      webAuthnWriteStoredCredId(webAuthnBytesToB64(new Uint8Array(cred.rawId)));
+      webAuthnLastAssertionAt = Date.now();
       return true;
     } catch (error) {
-      console.error('[nativeBridge] authenticateWithBiometrics failed:', error);
+      console.error('[nativeBridge] authenticateWithBiometrics (webauthn) failed:', error);
       return false;
     }
   },
@@ -665,42 +821,90 @@ export const nativeBridge = {
   /**
    * Securely store a credential for `service` in the device's keystore
    * (Keychain on iOS, Keystore + EncryptedSharedPreferences on Android).
-   * No-op when the plugin is unavailable.
+   * Web / Electron: gated local vault — the secret is only persisted AFTER a
+   * successful biometric enrolment assertion and is only ever released by
+   * getBiometricCredentials after a fresh biometric assertion.
    */
   async setBiometricCredentials(service: string, password: string): Promise<void> {
-    if (!isCapacitorNative()) return;
+    if (isCapacitorNative()) {
+      try {
+        const plugin = getCapacitorPlugin('NativeBiometric');
+        if (!plugin || typeof plugin.setCredentials !== 'function') return;
 
+        await (plugin.setCredentials as (opts: unknown) => Promise<void>)({
+          username: service,
+          password,
+        });
+        return;
+      } catch (error) {
+        console.error('[nativeBridge] setBiometricCredentials failed:', error);
+        return;
+      }
+    }
+
+    // Web / Electron vault write (enrolment just succeeded via WebAuthn).
     try {
-      const plugin = getCapacitorPlugin('NativeBiometric');
-      if (!plugin || typeof plugin.setCredentials !== 'function') return;
-
-      await (plugin.setCredentials as (opts: unknown) => Promise<void>)({
-        username: service,
-        password,
-      });
+      const credId = webAuthnReadStoredCredId();
+      if (!credId) return;
+      const vault = webAuthnReadVault();
+      vault[service] = { credId, password };
+      localStorage.setItem(WEBAUTHN_VAULT_KEY, JSON.stringify(vault));
     } catch (error) {
-      console.error('[nativeBridge] setBiometricCredentials failed:', error);
+      console.error('[nativeBridge] setBiometricCredentials (web vault) failed:', error);
     }
   },
 
   /**
    * Read the stored password for `service` from the device keystore.
-   * Returns null when nothing is stored, the plugin is unavailable,
+   * Returns null when nothing is stored, the bridge is unavailable,
    * or the read fails (a normal, non-fatal state).
+   * Web / Electron: requires a fresh biometric assertion (WebAuthn get with
+   * userVerification=required) before the secret is released — the fingerprint
+   * IS the unlock. Assertion freshness is reused within 30s so the login flow
+   * does not double-prompt.
    */
   async getBiometricCredentials(service: string): Promise<string | null> {
-    if (!isCapacitorNative()) return null;
+    if (isCapacitorNative()) {
+      try {
+        const plugin = getCapacitorPlugin('NativeBiometric');
+        if (!plugin || typeof plugin.getCredentials !== 'function') return null;
 
+        const result = await (plugin.getCredentials as (opts: unknown) => Promise<{ password?: string }>)(
+          { username: service },
+        );
+        return result?.password ?? null;
+      } catch (error) {
+        console.warn('[nativeBridge] getBiometricCredentials failed:', error);
+        return null;
+      }
+    }
+
+    // Web / Electron: biometric-gated local vault read.
     try {
-      const plugin = getCapacitorPlugin('NativeBiometric');
-      if (!plugin || typeof plugin.getCredentials !== 'function') return null;
+      const vault = webAuthnReadVault();
+      const entry = vault[service];
+      if (!entry) return null;
+      if (typeof window === 'undefined' || !window.isSecureContext) return null;
 
-      const result = await (plugin.getCredentials as (opts: unknown) => Promise<{ password?: string }>)(
-        { username: service },
-      );
-      return result?.password ?? null;
+      // Require a fresh assertion unless one happened moments ago.
+      const fresh = webAuthnLastAssertionAt && Date.now() - webAuthnLastAssertionAt < 30_000;
+      if (!fresh) {
+        if (typeof navigator?.credentials?.get !== 'function') return null;
+        const challenge = crypto.getRandomValues(new Uint8Array(32));
+        const cred = (await navigator.credentials.get({
+          publicKey: {
+            challenge,
+            allowCredentials: [{ id: webAuthnB64ToBytes(entry.credId), type: 'public-key' }],
+            userVerification: 'required',
+            timeout: 60_000,
+          },
+        })) as PublicKeyCredential | null;
+        if (!cred) return null;
+      }
+      webAuthnLastAssertionAt = Date.now();
+      return entry.password;
     } catch (error) {
-      console.warn('[nativeBridge] getBiometricCredentials failed:', error);
+      console.warn('[nativeBridge] getBiometricCredentials (web vault) failed:', error);
       return null;
     }
   },
@@ -713,18 +917,30 @@ export const nativeBridge = {
    * can warn, without throwing.
    */
   async deleteBiometricCredentials(service: string): Promise<boolean> {
-    if (!isCapacitorNative()) return false;
+    if (isCapacitorNative()) {
+      try {
+        const plugin = getCapacitorPlugin('NativeBiometric');
+        if (!plugin || typeof plugin.deleteCredentials !== 'function') return false;
 
+        await (plugin.deleteCredentials as (opts: unknown) => Promise<void>)({
+          username: service,
+        });
+        return true;
+      } catch (error) {
+        console.warn('[nativeBridge] deleteBiometricCredentials failed:', error);
+        return false;
+      }
+    }
+
+    // Web / Electron: drop the vault entry for this service.
     try {
-      const plugin = getCapacitorPlugin('NativeBiometric');
-      if (!plugin || typeof plugin.deleteCredentials !== 'function') return false;
-
-      await (plugin.deleteCredentials as (opts: unknown) => Promise<void>)({
-        username: service,
-      });
+      const vault = webAuthnReadVault();
+      if (!(service in vault)) return false;
+      delete vault[service];
+      localStorage.setItem(WEBAUTHN_VAULT_KEY, JSON.stringify(vault));
       return true;
     } catch (error) {
-      console.warn('[nativeBridge] deleteBiometricCredentials failed:', error);
+      console.warn('[nativeBridge] deleteBiometricCredentials (web vault) failed:', error);
       return false;
     }
   },

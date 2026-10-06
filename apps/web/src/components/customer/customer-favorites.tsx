@@ -14,6 +14,9 @@
  */
 import { apiFetch } from '@/lib/api-fetch';
 import { toLocalDateString } from '@/lib/date-utils';
+// Task 84 — IndexedDB stale-while-revalidate: favorites render instantly from
+// the last-known list (shared key with customer-home) and refresh silently.
+import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 
 import { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -85,19 +88,29 @@ export function CustomerFavorites() {
     if (!user?.id) return;
     setLoading(true);
     setFetchError(false);
+    // Task 84 — instant cache paint (same key as customer-home's favorites fetch).
+    const favKey = cacheKeyFor('/api/favorites', { userId: user.id });
+    const cachedFav = await cacheGet<{ favorites?: FavoriteAgency[] }>(favKey);
+    if (cachedFav?.data?.favorites?.length) {
+      setFavorites(cachedFav.data.favorites);
+      setLoading(false);
+    }
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
       const res = await fetchWithRetry(`/api/favorites?userId=${user.id}`);
       if (res.ok) {
         const data = await res.json();
+        void cacheSet(favKey, data);
         setFavorites(data.favorites ?? []);
-      } else {
+      } else if (!cachedFav?.data?.favorites?.length) {
         setFetchError(true);
         toast.error(t('error'));
       }
     } catch {
-      setFetchError(true);
-      toast.error(t('error'));
+      if (!cachedFav?.data?.favorites?.length) {
+        setFetchError(true);
+        toast.error(t('error'));
+      }
     } finally {
       setLoading(false);
     }

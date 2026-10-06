@@ -297,6 +297,10 @@ model Agency {
   hardwareOrders        HardwareOrder[]
   enterpriseRequests    EnterpriseContractRequest[]
   ownedEnterprisePlans  SubscriptionPlan[] @relation("EnterprisePlanOwner")
+
+  // Task 84 — public listing performance (mirrors packages/db schema).
+  @@index([isActive, isSponsored, createdAt])
+  @@index([category])
 }
 
 // Phase 2: Dynamic SubscriptionPlan model — replaces hardcoded subscriptionTier enum
@@ -792,6 +796,8 @@ model Review {
   reservation   Reservation? @relation(fields: [reservationId], references: [id])
 
   @@unique([userId, agencyId, branchId])
+  // Task 84 — rating aggregate performance (mirrors packages/db schema).
+  @@index([agencyId, branchId])
 }
 
 model FAQ {
@@ -879,6 +885,10 @@ model Branch {
   reviews   Review[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // Task 84 — branch search performance (mirrors packages/db schema).
+  @@index([agencyId])
+  @@index([isActive, isMain, createdAt])
 }
 
 model Counter {

@@ -14,6 +14,9 @@
  * inline expansion for details (no two-card stack, no heavy animations).
  */
 import { apiFetch } from "@/lib/api-fetch";
+// Task 84 — IndexedDB stale-while-revalidate: history renders instantly from
+// the last-known list and refreshes silently.
+import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 import { toLocalDateString } from '@/lib/date-utils';
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -128,43 +131,56 @@ export function CustomerHistory() {
     if (!user?.id) return;
     setLoading(true);
     setFetchError(false);
+    // Task 84 — shared row mapper for the network payload AND the cached paint.
+    // Rows are loosely typed (any-fielded) exactly like the original network
+    // path (res.json() → any) — the shape contract lives in HistoryItem.
+    const mapHistoryRows = (data: { reservations?: any[] }): HistoryItem[] =>
+      (data.reservations ?? []).map((r: Record<string, any>) => {
+        const agency = r.agency as Record<string, string> | undefined;
+        const service = r.service as Record<string, string> | undefined;
+        return {
+          id: r.id,
+          queueNumber: r.displayNumber || `${r.queueNumber}`,
+          status: r.status,
+          agencyId: r.agencyId || agency?.id || '',
+          serviceId: r.serviceId || service?.id || '',
+          agencyName: agency?.name || t('defaultAgency'),
+          agencyNameAr: agency?.nameAr,
+          agencyNameFr: agency?.nameFr,
+          serviceName: service?.name || t('defaultService'),
+          serviceNameAr: service?.nameAr,
+          serviceNameFr: service?.nameFr,
+          joinedAt: r.joinedAt,
+          completedAt: r.completedAt,
+          calledAt: r.calledAt,
+          estimatedWait: (r.estimatedWait as number | null | undefined) ?? null,
+          rating: (r.rating as number | null | undefined) ?? null,
+          feedback: (r.feedback as string | null | undefined) ?? null,
+          ratedAt: (r.ratedAt as string | null | undefined) ?? null,
+        };
+      });
+    const historyKey = cacheKeyFor('/api/reservations/history', { userId: user.id });
+    const cachedHistory = await cacheGet<{ reservations?: Array<Record<string, unknown>> }>(historyKey);
+    if (cachedHistory?.data?.reservations?.length) {
+      setHistory(mapHistoryRows(cachedHistory.data));
+      setLoading(false);
+    }
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
       const res = await fetchWithRetry(`/api/reservations/history?userId=${user.id}`);
       if (res.ok) {
         const data = await res.json();
-        const list = (data.reservations ?? []).map((r: Record<string, unknown>) => {
-          const agency = r.agency as Record<string, string> | undefined;
-          const service = r.service as Record<string, string> | undefined;
-          return {
-            id: r.id,
-            queueNumber: r.displayNumber || `${r.queueNumber}`,
-            status: r.status,
-            agencyId: (r as Record<string, unknown>).agencyId || agency?.id || '',
-            serviceId: (r as Record<string, unknown>).serviceId || service?.id || '',
-            agencyName: agency?.name || t('defaultAgency'),
-            agencyNameAr: agency?.nameAr,
-            agencyNameFr: agency?.nameFr,
-            serviceName: service?.name || t('defaultService'),
-            serviceNameAr: service?.nameAr,
-            serviceNameFr: service?.nameFr,
-            joinedAt: r.joinedAt,
-            completedAt: r.completedAt,
-            calledAt: r.calledAt,
-            estimatedWait: (r.estimatedWait as number | null | undefined) ?? null,
-            rating: (r.rating as number | null | undefined) ?? null,
-            feedback: (r.feedback as string | null | undefined) ?? null,
-            ratedAt: (r.ratedAt as string | null | undefined) ?? null,
-          };
-        });
-        setHistory(list);
-      } else {
+        void cacheSet(historyKey, data);
+        setHistory(mapHistoryRows(data));
+      } else if (!cachedHistory?.data?.reservations?.length) {
         setFetchError(true);
         toast.error(t('error'));
       }
     } catch {
-      setFetchError(true);
-      toast.error(t('error'));
+      if (!cachedHistory?.data?.reservations?.length) {
+        setFetchError(true);
+        toast.error(t('error'));
+      }
     } finally {
       setLoading(false);
     }
