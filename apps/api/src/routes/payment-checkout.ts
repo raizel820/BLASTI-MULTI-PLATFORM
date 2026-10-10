@@ -29,6 +29,7 @@ import {
   getBalance,
   isChargilyConfigured,
   isChargilyLiveMode,
+  expireCheckout,
 } from '../lib/chargily-service'
 import { fulfillCheckoutPaid, fulfillCheckoutFailed, normalizeChargilyStatus } from '../lib/chargily-fulfill'
 import { validateBody } from '../lib/validations'
@@ -476,8 +477,24 @@ app.post('/create-checkout', async (c) => {
     }
     if (error instanceof Error && error.message.startsWith('Chargily API error')) {
       console.error('[payment-checkout] Chargily API rejected the checkout:', error.message)
+      const statusMatch = error.message.match(/Chargily API error: (\d+)/)
+      const gatewayStatus = statusMatch?.[1] ?? ''
+      // Status-aware message: 401/403 = key problem, 422 = payload problem,
+      // 5xx = gateway outage. `details` carries the RAW gateway answer so
+      // the exact reason is always visible (admin UI + client toasts).
+      let hint =
+        'The payment gateway rejected the request. Check the Chargily API keys in Platform Settings.'
+      if (gatewayStatus === '401' || gatewayStatus === '403') {
+        hint =
+          'The payment gateway rejected the API keys. Verify the SECRET key and the mode (sandbox vs live) in Platform Settings.'
+      } else if (gatewayStatus === '422') {
+        hint =
+          'The payment gateway rejected the payment details (validation error). See the technical details, or run “Test checkout” in Platform Settings → Payment Engine.'
+      } else if (gatewayStatus.startsWith('5')) {
+        hint = 'The payment gateway is temporarily unavailable. Please try again shortly.'
+      }
       return c.json(
-        { success: false, error: 'The payment gateway rejected the request. Check the Chargily API keys in Platform Settings.', details: error.message },
+        { success: false, error: hint, gatewayStatus: gatewayStatus || undefined, details: error.message },
         502,
       )
     }
@@ -762,6 +779,101 @@ app.get('/test', async (c) => {
     }
     console.error('[payment-test] Error testing Chargily connection:', error)
     return c.json({ success: false, error: 'Connection test failed' }, 500)
+  }
+})
+
+// ─── GET /test-checkout — Full checkout-creation probe (super admin) ──────
+//
+// The balance probe (/test) only validates the KEYS. This probe exercises
+// the REAL checkout-creation path — the exact POST /checkouts call an agency
+// payment performs — against the configured gateway, then expires the
+// checkout immediately so nothing is payable and no money can move.
+// It catches payload-level rejections (API contract changes, amount rules…)
+// that the balance check cannot see.
+
+app.get('/test-checkout', async (c) => {
+  try {
+    await requireAdmin(c)
+
+    const configured = await isChargilyConfigured()
+    if (!configured) {
+      return c.json(
+        {
+          success: false,
+          error:
+            'No usable Chargily SECRET key found. Enter the SECRET key (test_sk_… in sandbox / sk_… in live) — the PUBLIC key (test_pk_…) is never valid server-side.',
+          code: 'not_configured',
+        },
+        400,
+      )
+    }
+
+    const live = await isChargilyLiveMode()
+    const probeAmount = 100 // DZD — the practical EDAHABIA minimum
+    const baseUrl = resolveBaseUrl(c)
+    const successUrl = `${baseUrl}/#/payment/result?status=success`
+    const failureUrl = `${baseUrl}/#/payment/result?status=failed`
+
+    const checkout = await createCheckout({
+      amount: probeAmount,
+      description: 'BLASTI payment-engine self-test (auto-expired)',
+      metadata: { transactionType: 'selftest' },
+      successUrl,
+      failureUrl,
+      customerName: 'BLASTI Self-Test',
+      paymentMethod: 'edahabia',
+      locale: 'en',
+    })
+
+    // Expire immediately — the checkout becomes unpayable, nothing moves.
+    let expired = false
+    try {
+      await expireCheckout(checkout.id)
+      expired = true
+    } catch (err) {
+      console.warn('[payment-test-checkout] Failed to expire the probe checkout:', err)
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        mode: live ? 'live' : 'sandbox',
+        checkoutId: checkout.id,
+        amountSent: Math.round(probeAmount * 100),
+        amountEchoed: checkout.amount,
+        currency: checkout.currency,
+        expired,
+      },
+    })
+  } catch (error: unknown) {
+    const err = error as { status?: number; message?: string }
+    if (err?.status === 401 || err?.status === 403) {
+      const authErr = authErrorResponse(error)
+      return c.json({ success: false, error: authErr.error }, authErr.status as 400)
+    }
+    if (err?.message === 'chargily_not_configured') {
+      return c.json({ success: false, error: 'Chargily is not configured', code: 'not_configured' }, 503)
+    }
+    if (error instanceof Error && error.message.startsWith('Chargily API error')) {
+      console.error('[payment-test-checkout] Chargily rejected the probe checkout:', error.message)
+      const statusMatch = error.message.match(/Chargily API error: (\d+)/)
+      const gatewayStatus = statusMatch?.[1] ?? ''
+      let hint =
+        'Chargily rejected a test checkout — the keys may work for balance but the payment request itself is being refused. Check the technical details.'
+      if (gatewayStatus === '401' || gatewayStatus === '403') {
+        hint =
+          'Chargily rejected the keys (HTTP ' + gatewayStatus + '). Verify the SECRET key and the mode (sandbox vs live).'
+      }
+      return c.json(
+        { success: false, error: hint, gatewayStatus: gatewayStatus || undefined, details: error.message },
+        400,
+      )
+    }
+    if (error instanceof Error && error.message.includes('not configured')) {
+      return c.json({ success: false, error: error.message, code: 'not_configured' }, 400)
+    }
+    console.error('[payment-test-checkout] Error:', error)
+    return c.json({ success: false, error: 'Checkout test failed' }, 500)
   }
 })
 

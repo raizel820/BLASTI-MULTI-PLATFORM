@@ -15,7 +15,14 @@
  *   chargily_mode        — "sandbox" or "live" (payment category)
  *
  * Chargily uses DZD (Algerian Dinar) as the default currency.
- * Amounts are sent in centimes (1 DZD = 100 centimes).
+ * Amounts are sent in centimes (1 DZD = 100 centimes) — matching the
+ * balance endpoint which also reports centimes (e.g. 150000 = 1,500.00 DZD).
+ *
+ * IMPORTANT (2025 API contract): POST /checkouts no longer accepts a nested
+ * `customer` object — only `customer_id`, referencing a customer created
+ * beforehand via POST /customers. Sending the old nested object makes the
+ * gateway answer 422 and reject the WHOLE checkout (the balance probe keeps
+ * working, which is why the keys test fine but agency payments failed).
  *
  * Optional env overrides (mainly for testing):
  *   CHARGILY_API_URL   — overrides the live-mode base URL
@@ -52,6 +59,73 @@ async function getBaseUrl(): Promise<string> {
 function isPublicKey(key: string | null | undefined): boolean {
   // Base62 key bodies never contain '_', so 'pk_' can only be the key-type marker.
   return !!key && key.includes('pk_')
+}
+
+/**
+ * In-memory cache of created Chargily customer ids (per base URL + name),
+ * so a returning payer reuses the same remote customer instead of creating
+ * a duplicate on every checkout.
+ */
+const customerCache = new Map<string, { id: string; expiresAt: number }>()
+const CUSTOMER_CACHE_TTL = 24 * 60 * 60 * 1000
+const CUSTOMER_CACHE_MAX = 200
+
+/**
+ * Create (or reuse a cached) Chargily customer for the payer — best-effort.
+ *
+ * The Pay v2 API only accepts `customer_id` on checkout creation (a reference
+ * to a customer created via POST /customers); a nested customer object is
+ * rejected with 422. This helper never blocks the checkout: on ANY failure
+ * it returns null and the checkout is created without a customer_id (the
+ * field is optional).
+ */
+export async function ensureCustomerId(
+  baseUrl: string,
+  apiKey: string,
+  name?: string,
+  email?: string,
+): Promise<string | null> {
+  const cleanName = (name || '').trim()
+  const cleanEmail = (email || '').trim()
+  if (!cleanName && !cleanEmail) return null
+
+  const cacheKey = `${baseUrl}|${cleanName}|${cleanEmail}`
+  const cached = customerCache.get(cacheKey)
+  if (cached) {
+    if (cached.expiresAt > Date.now()) return cached.id
+    customerCache.delete(cacheKey)
+  }
+
+  try {
+    const res = await fetch(`${baseUrl}/customers`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        ...(cleanName && { name: cleanName }),
+        ...(cleanEmail && { email: cleanEmail }),
+      }),
+    })
+    if (!res.ok) {
+      console.warn(
+        `[chargily] customer creation failed (${res.status}) — continuing without customer_id`,
+      )
+      return null
+    }
+    const customer = (await res.json()) as { id?: string }
+    if (!customer?.id) return null
+    if (customerCache.size >= CUSTOMER_CACHE_MAX) {
+      const oldest = customerCache.keys().next().value
+      if (oldest) customerCache.delete(oldest)
+    }
+    customerCache.set(cacheKey, { id: customer.id, expiresAt: Date.now() + CUSTOMER_CACHE_TTL })
+    return customer.id
+  } catch (err) {
+    console.warn('[chargily] customer creation error — continuing without customer_id:', err)
+    return null
+  }
 }
 
 /** The usable SECRET key from either settings field (null when none). */
@@ -102,6 +176,7 @@ export interface CheckoutParams {
   failureUrl: string
   customerName?: string
   customerEmail?: string
+  customerId?: string   // Pre-created Chargily customer id (optional)
   paymentMethod?: string  // 'edahabia' | 'cib' — defaults to 'edahabia'
   locale?: string         // 'ar' | 'en' | 'fr' — language of the hosted checkout page
   webhookEndpoint?: string // optional per-checkout webhook override
@@ -188,11 +263,11 @@ export async function createCheckout(params: CheckoutParams): Promise<ChargilyCh
     body.webhook_endpoint = params.webhookEndpoint
   }
 
-  if (params.customerName || params.customerEmail) {
-    body.customer = {
-      ...(params.customerName && { name: params.customerName }),
-      ...(params.customerEmail && { email: params.customerEmail }),
-    }
+  // The API accepts ONLY a pre-created customer reference here — never a
+  // nested customer object (that shape is retired and triggers a 422).
+  const customerId = params.customerId || (await ensureCustomerId(baseUrl, apiKey, params.customerName, params.customerEmail))
+  if (customerId) {
+    body.customer_id = customerId
   }
 
   const response = await fetch(`${baseUrl}/checkouts`, {

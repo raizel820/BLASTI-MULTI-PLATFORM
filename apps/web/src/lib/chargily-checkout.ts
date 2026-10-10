@@ -104,9 +104,12 @@ export async function startChargilyCheckout(
   ) as CreateCheckoutResponse | undefined;
 
   if (!res.ok || !checkout?.checkoutUrl) {
-    throw new Error(
-      (body as { error?: string })?.error || 'Failed to create the payment session',
-    );
+    const errBody = body as { error?: string; details?: string };
+    const base = errBody?.error || 'Failed to create the payment session';
+    // Surface the gateway's raw answer (details) so the REAL rejection
+    // reason is visible in the toast, not just the generic headline.
+    const details = errBody?.details ? ` — ${errBody.details.slice(0, 240)}` : '';
+    throw new Error(`${base}${details}`);
   }
 
   // Persist BEFORE navigating away — the result page depends on it.

@@ -163,6 +163,10 @@ export function AdminPaymentEngine() {
   const [testingConnection, setTestingConnection] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
+  // Test-checkout state (GET /api/payment/test-checkout — full creation probe)
+  const [testingCheckout, setTestingCheckout] = useState(false);
+  const [checkoutTestResult, setCheckoutTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+
   // Reconciliation state
   const [reconDate, setReconDate] = useState(new Date().toISOString().split('T')[0]);
   const [reconReport, setReconReport] = useState<ReconciliationReportData | null>(null);
@@ -327,6 +331,43 @@ export function AdminPaymentEngine() {
       toast.error(t('connectionFailed'));
     } finally {
       setTestingConnection(false);
+    }
+  };
+
+  // ── Test checkout creation (exercises the REAL payment path) ──
+  // The connection test above only validates the keys against the balance
+  // endpoint; this probe performs an actual checkout creation (then expires
+  // it) — the exact call that fails when the gateway rejects payments.
+  const testCheckout = async () => {
+    setTestingCheckout(true);
+    setCheckoutTestResult(null);
+    try {
+      const res = await apiFetch('/api/payment/test-checkout');
+      const body = await res.json().catch(() => null);
+      const info = (
+        body && typeof body === 'object' && 'mode' in body
+          ? body
+          : (body as { data?: { mode?: string; amountEchoed?: number; expired?: boolean } })?.data
+      ) || {};
+      if (res.ok && info.mode) {
+        // Chargily amounts are in centimes (echo included).
+        const echoed = typeof info.amountEchoed === 'number' ? (info.amountEchoed / 100).toLocaleString() : null;
+        let message = `${t('testCheckoutOk')} — ${info.mode === 'live' ? 'live' : 'sandbox'}`;
+        if (echoed !== null) message += ` · ${echoed} DZD`;
+        setCheckoutTestResult({ ok: true, message });
+        toast.success(t('testCheckout'));
+      } else {
+        const bodyErr = body as { error?: string; details?: string };
+        const error = bodyErr?.error || t('testCheckoutFailed');
+        const details = bodyErr?.details ? `\n${bodyErr.details.slice(0, 300)}` : '';
+        setCheckoutTestResult({ ok: false, message: `${error}${details}` });
+        toast.error(`${t('testCheckoutFailed')} — ${error}`);
+      }
+    } catch {
+      setCheckoutTestResult({ ok: false, message: t('testCheckoutFailed') });
+      toast.error(t('testCheckoutFailed'));
+    } finally {
+      setTestingCheckout(false);
     }
   };
 
@@ -615,8 +656,8 @@ export function AdminPaymentEngine() {
 
                     <Separator />
 
-                    {/* Save + Test connection buttons */}
-                    <div className="grid grid-cols-2 gap-2">
+                    {/* Save + Test connection + Test checkout buttons */}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                       <Button
                         onClick={saveConfig}
                         disabled={savingConfig}
@@ -642,6 +683,19 @@ export function AdminPaymentEngine() {
                         )}
                         {t('testConnection')}
                       </Button>
+                      <Button
+                        onClick={testCheckout}
+                        disabled={testingCheckout}
+                        variant="outline"
+                        className="border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+                      >
+                        {testingCheckout ? (
+                          <Loader2 className="h-4 w-4 animate-spin me-2" />
+                        ) : (
+                          <CreditCard className="h-4 w-4 me-2" />
+                        )}
+                        {t('testCheckout')}
+                      </Button>
                     </div>
 
                     {/* Test result (green/red inline box) */}
@@ -662,6 +716,27 @@ export function AdminPaymentEngine() {
                           <XCircle className="h-4 w-4 mt-0.5 shrink-0 text-red-600" />
                         )}
                         <span className="whitespace-pre-line">{testResult.message}</span>
+                      </motion.div>
+                    )}
+
+                    {/* Checkout-creation probe result */}
+                    {checkoutTestResult && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 6 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className={`flex items-start gap-2 p-2.5 rounded-lg border text-[11px] leading-relaxed ${
+                          checkoutTestResult.ok
+                            ? 'bg-emerald-50 dark:bg-emerald-900/10 border-emerald-200 dark:border-emerald-800/30 text-emerald-800 dark:text-emerald-200'
+                            : 'bg-red-50 dark:bg-red-900/10 border-red-200 dark:border-red-800/30 text-red-800 dark:text-red-200'
+                        }`}
+                        dir="auto"
+                      >
+                        {checkoutTestResult.ok ? (
+                          <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0 text-emerald-600" />
+                        ) : (
+                          <XCircle className="h-4 w-4 mt-0.5 shrink-0 text-red-600" />
+                        )}
+                        <span className="whitespace-pre-line">{checkoutTestResult.message}</span>
                       </motion.div>
                     )}
                   </>
