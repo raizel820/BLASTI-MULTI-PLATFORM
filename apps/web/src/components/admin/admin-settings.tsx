@@ -25,6 +25,7 @@ import { SystemSettingsConfig } from '@/components/admin/admin-settings-config';
 import { AdminPaymentEngine } from '@/components/admin/admin-payment-engine';
 import { AdminProvidersSettings } from '@/components/admin/admin-providers-settings';
 import { AdminMapsSettings } from '@/components/admin/admin-maps-settings';
+import { AdminVpsStatus } from '@/components/admin/admin-vps-status';
 import { BiometricSettingsCard } from '@/components/shared/biometric-settings';
 
 // ─── Animation variants ───────────────────────────────────────────
@@ -130,6 +131,12 @@ export function AdminSettings() {
             </div>
           </div>
         </div>
+      </motion.div>
+
+      {/* ─── VPS Server (Task 88 — CPU/RAM/storage, served git commit,
+           manual GitHub check + rebuild-from-new-commit) ─── */}
+      <motion.div {...fadeUp} transition={{ delay: 0.05 }}>
+        <AdminVpsStatus />
       </motion.div>
 
       {/* ─── Notifications & Providers hub (SMS · Email · WhatsApp · Templates · Logs) ─── */}

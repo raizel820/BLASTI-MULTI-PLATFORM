@@ -9,7 +9,7 @@ import { recordSyncChange, resolveAgencyIdForUser } from '../lib/sync-helpers'
 const app = new Hono()
 
 const smsPurchaseSchema = z.object({
-  packId: z.enum(['20', '50', '100'], { message: 'Invalid pack ID. Allowed: 20, 50, 100' }),
+  packId: z.enum(['20', '50', '100', '200'], { message: 'Invalid pack ID. Allowed: 20, 50, 100, 200' }),
 })
 
 /**
@@ -21,6 +21,7 @@ const ALLOWED_PACKS: Record<string, { quantity: number; price: number }> = {
   '20': { quantity: 20, price: 200 },
   '50': { quantity: 50, price: 400 },
   '100': { quantity: 100, price: 700 },
+  '200': { quantity: 200, price: 1200 },
 }
 
 // POST /sms/purchase — Purchase an SMS pack (creates PENDING record, no credits yet)

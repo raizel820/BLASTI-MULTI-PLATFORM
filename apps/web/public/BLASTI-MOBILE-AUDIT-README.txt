@@ -8,7 +8,7 @@ found 6 phone-only problems. All are fixed below; 3 of them would
 have made real phones fail against your VPS in exactly the same way
 the desktop did.
 
-WHAT WAS WRONG (phone against the VPS http://68.183.137.227)
+WHAT WAS WRONG (phone against the VPS http://129.151.242.219)
 ------------------------------------------------------------
 1. THE VPS REJECTED THE PHONE'S ORIGIN (would block EVERYTHING).
    Your VPS allows one web origin (its own IP). An Android phone app
@@ -22,8 +22,8 @@ WHAT WAS WRONG (phone against the VPS http://68.183.137.227)
 
 2. TYPING YOUR VPS ADDRESS INTO THE PHONE'S SERVER DIALOG WAS
    BOOBY-TRAPPED. The app silently appended ":3003" to any address
-   typed without a port — "http://68.183.137.227" became
-   "http://68.183.137.227:3003", a port your VPS does NOT expose
+   typed without a port — "http://129.151.242.219" became
+   "http://129.151.242.219:3003", a port your VPS does NOT expose
    (only port 80 is public). The phone then said "server not found"
    forever. FIXED (native-cloud-resolver.ts): the app now probes the
    address AS TYPED (port 80, through Caddy) AND the :3003 variant,
@@ -106,8 +106,8 @@ STEP BY STEP (on your PC, where the project folder is)
    as BLASTI-v<version>-<variant>.apk.)
 
 6. ON THE PHONE: open the app; on the login screen tap the server
-   pill and type  http://68.183.137.227  — exactly that, no port.
-   It should confirm "Connected to 68.183.137.227". Log in.
+   pill and type  http://129.151.242.219  — exactly that, no port.
+   It should confirm "Connected to 129.151.242.219". Log in.
 
 WHAT YOU SHOULD SEE
 -------------------

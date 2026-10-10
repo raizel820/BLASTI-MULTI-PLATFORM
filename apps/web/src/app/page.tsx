@@ -11,6 +11,7 @@ import { isRTL, type Language } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable } from '@/lib/api-client';
+import { getPendingCheckout } from '@/lib/chargily-checkout';
 
 // Auth Views — lazy loaded to reduce initial compilation footprint
 const LandingPage = lazyNamed(() => import('@/components/auth/landing-page'), 'LandingPage');
@@ -29,6 +30,8 @@ const CustomerHistory = lazyNamed(() => import('@/components/customer/customer-h
 const CustomerProfile = lazyNamed(() => import('@/components/customer/customer-profile'), 'CustomerProfile');
 const CustomerNotifications = lazyNamed(() => import('@/components/customer/customer-notifications'), 'CustomerNotifications');
 const CustomerFavorites = lazyNamed(() => import('@/components/customer/customer-favorites'), 'CustomerFavorites');
+// Task 86: dedicated full-screen customer search (agencies + branches).
+const CustomerSearch = lazyNamed(() => import('@/components/customer/customer-search'), 'CustomerSearch');
 const CustomerSettings = lazyNamed(() => import('@/components/customer/customer-settings'), 'CustomerSettings');
 // Task 54-d: personal "My Analytics" module (doc-2 §38-44) over the frozen
 // 54-a customer endpoints (GET /api/customer/analytics/*).
@@ -80,6 +83,9 @@ const AdminHardwareRequests = lazyNamed(() => import('@/components/admin/admin-h
 const AdminEnterpriseRequests = lazyNamed(() => import('@/components/admin/admin-enterprise-requests'), 'AdminEnterpriseRequests');
 // Support desk — super-admin triage: reply to and resolve incoming tickets.
 const AdminTickets = lazyNamed(() => import('@/components/admin/admin-tickets'), 'AdminTickets');
+// Database Manager — SUPER_ADMIN PostgreSQL console (browse every table,
+// row-level actions, VACUUM/tombstone maintenance).
+const AdminDbManager = lazyNamed(() => import('@/components/admin/admin-db-manager'), 'AdminDbManager');
 
 // Shared (eagerly imported — lightweight)
 import { AgencyAuthorityGate } from '@/components/agency/agency-authority-gate';
@@ -102,6 +108,9 @@ import { Button } from '@/components/ui/button';
 // Shared (lazy loaded — heavy components that are conditionally rendered)
 const OnboardingWizard = lazyNamed(() => import('@/components/shared/onboarding-wizard'), 'OnboardingWizard');
 const NotificationCenter = lazyNamed(() => import('@/components/shared/NotificationCenter'), 'NotificationCenter');
+// Chargily (EDAHABIA / CIB) payment result — full-screen, role-agnostic,
+// self-handles the logged-out case (no role gate below).
+const PaymentResult = lazyNamed(() => import('@/components/shared/payment-result'), 'PaymentResult');
 // QueueE2ETestPanel removed — test button no longer needed
 
 // ─── Task 84: idle-time view warming ─────────────────────────────────────────
@@ -117,6 +126,9 @@ function warmRoleViews(role: string): void {
   const shared: Array<() => Promise<unknown>> = [
     () => import('@/components/shared/NotificationCenter'),
     () => import('@/components/shared/onboarding-wizard'),
+    // Chargily payment result — role-agnostic, tiny chunk, and the one view
+    // the app may need the instant the customer returns from the gateway.
+    () => import('@/components/shared/payment-result'),
   ];
   let roleViews: Array<() => Promise<unknown>> = [];
   if (role === 'CUSTOMER') {
@@ -126,6 +138,7 @@ function warmRoleViews(role: string): void {
       () => import('@/components/customer/customer-profile'),
       () => import('@/components/customer/customer-history'),
       () => import('@/components/customer/customer-favorites'),
+      () => import('@/components/customer/customer-search'),
       () => import('@/components/customer/customer-notifications'),
       () => import('@/components/customer/customer-agency-profile'),
       () => import('@/components/customer/customer-branch-profile'),
@@ -156,6 +169,7 @@ function warmRoleViews(role: string): void {
       () => import('@/components/admin/admin-maps-settings'),
       () => import('@/components/admin/admin-subscription-plans'),
       () => import('@/components/admin/admin-app-settings'),
+      () => import('@/components/admin/admin-db-manager'),
     ];
   }
   warmViews([...roleViews, ...shared]);
@@ -176,6 +190,23 @@ import { Toaster } from 'sonner';
 import { toast } from 'sonner';
 import { useTurnAlert } from '@/hooks/use-realtime';
 import { AggressiveTurnAlert } from '@/components/customer/AggressiveTurnAlert';
+
+// Chargily return-URL query preservation: the hosted payment page redirects
+// the browser to /#/payment/result?status=success|failed, but the hash
+// normalization inside setView (updateHashForView) drops the query before the
+// payment-result view mounts. Capture the raw params ONCE here at module
+// evaluation (runs before any effect) — PaymentResult consumes them as a
+// read-once fallback when the live hash no longer carries them.
+if (typeof window !== 'undefined' && (window.location.hash || '').startsWith('#/payment/result')) {
+  try {
+    const qIndex = window.location.hash.indexOf('?');
+    if (qIndex >= 0) {
+      sessionStorage.setItem('blasti:payment-return-query', window.location.hash.slice(qIndex + 1));
+    }
+  } catch {
+    /* private mode — PaymentResult falls back to its other id sources */
+  }
+}
 
 // Suspense fallback for lazy-loaded views — branded BLASTI skeleton
 function ViewSpinner() {
@@ -221,6 +252,10 @@ const ViewRouter = memo(function ViewRouter() {
               return <CustomerNotifications />;
             case 'customer-favorites':
               return <CustomerFavorites />;
+            // Task 86: full-screen search — join flows hand off to home via
+            // pendingAgencyCode; profiles open via the store profile ids.
+            case 'customer-search':
+              return <CustomerSearch />;
             case 'customer-settings':
               return <CustomerSettings />;
             case 'customer-analytics':
@@ -298,6 +333,15 @@ const ViewRouter = memo(function ViewRouter() {
               return <AdminHardwareRequests />;
             case 'admin-enterprise-requests':
               return <AdminEnterpriseRequests />;
+            // Database Manager — SUPER_ADMIN PostgreSQL console. The component
+            // owns its own page padding (p-4 lg:p-6), same as admin-settings.
+            case 'admin-db':
+              return <AdminDbManager />;
+            // Chargily payment result — NO role gate: renders for every role
+            // and self-handles the logged-out case (generic result + login
+            // CTA, no polling when unauthenticated).
+            case 'payment-result':
+              return <PaymentResult />;
             default:
               return <LandingPage />;
           }
@@ -541,6 +585,37 @@ export default function Home() {
     }).catch(() => {});
   }, [isAuthenticated, user?.role]);
 
+  // Chargily (EDAHABIA / CIB) payment return — when the customer comes back
+  // from the hosted checkout (focus/visible again, or a fresh app load onto
+  // the gateway's /#/payment/result?status=… redirect), route the app to the
+  // payment-result view so the settlement poll can run. Only while a pending
+  // checkout exists and the caller is logged in; the view itself clears the
+  // localStorage marker once the payment settles.
+  useEffect(() => {
+    const checkPendingCheckout = () => {
+      try {
+        const pc = getPendingCheckout();
+        if (!pc) return;
+        const state = useAppStore.getState();
+        if (state.currentView !== 'payment-result' && state.user) {
+          state.setView('payment-result');
+        }
+      } catch {
+        /* corrupted localStorage — nothing to resume */
+      }
+    };
+    checkPendingCheckout();
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') checkPendingCheckout();
+    };
+    window.addEventListener('focus', checkPendingCheckout);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.removeEventListener('focus', checkPendingCheckout);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, []);
+
   // Fetch global announcements (cloud-only endpoint — skip when cloud is known-down)
   useEffect(() => {
     if (!user?.id) return;
@@ -594,6 +669,7 @@ export default function Home() {
       'customer-profile': t('profile') + ' - BLASTI',
       'customer-notifications': t('notifications') + ' - BLASTI',
       'customer-favorites': t('favorites') + ' - BLASTI',
+      'customer-search': t('search') + ' - BLASTI',
       'customer-analytics': t('myAnalytics.nav.title') + ' - BLASTI',
       'customer-support': t('supportDesk') + ' - BLASTI',
       'agency-dashboard': t('dashboard') + ' - BLASTI',
@@ -614,6 +690,8 @@ export default function Home() {
     'admin-maps': t('adminMaps') + ' - BLASTI',
     'admin-subscription-plans': t('subscriptionPlans') + ' - BLASTI',
     'admin-app-settings': t('publicAppsSettings') + ' - BLASTI',
+    'admin-db': t('dbManagerTitle') + ' - BLASTI',
+    'payment-result': t('paymentResultTitle') + ' - BLASTI',
     };
     document.title = titles[currentView] || 'BLASTI';
   }, [currentView, t]);
@@ -721,8 +799,12 @@ export default function Home() {
     );
   }
 
-  // Auth pages render full-screen with their own layouts
-  const isAuthPage = currentView === 'landing' || currentView === 'login' || currentView === 'register';
+  // Auth pages render full-screen with their own layouts. The Chargily
+  // payment-result joins this branch: full-screen for every role, and it
+  // self-handles the logged-out case (generic result + login CTA) — so it
+  // must never be bounced to landing/login by the guard below.
+  const isAuthPage = currentView === 'landing' || currentView === 'login' || currentView === 'register'
+    || currentView === 'payment-result';
 
   // Agency fullscreen mode bypasses sidebar + header
   if (currentView === 'agency-fullscreen' || currentView === 'agency-fullscreen-history') {

@@ -1,8 +1,13 @@
-# BLASTI — Step-by-Step DigitalOcean VPS Deployment Guide
+# BLASTI — Step-by-Step VPS Deployment Guide
+### Oracle Cloud — also works on DigitalOcean or any Ubuntu VPS
 
 **For everyone — no developer experience required.** This guide takes you
-from *"I have a DigitalOcean account"* to *"BLASTI is live on my own VPS,
+from *"I have a cloud account"* to *"BLASTI is live on my own VPS,
 pulled straight from GitHub, and my desktop app talks to it."*
+
+> **Current production server:** Oracle Cloud instance **http://129.151.242.219**
+> (migrated from the old DigitalOcean droplet `68.183.137.227`, now retired).
+> Moving servers again? Follow the migration box in Part 10.
 
 Just copy-paste the commands exactly as shown. Every step explains what it
 does and what you should see.
@@ -22,7 +27,7 @@ does and what you should see.
                         Internet
                             │
               ┌─────────────▼──────────────────┐
-              │   DigitalOcean Droplet (VPS)   │
+              │  Oracle Cloud Instance (VPS)   │
               │                                │
               │   Caddy  :80 / :443            │  ◀── the ONLY public door
               │     ├─ /api/*        ─────┐    │      (automatic HTTPS)
@@ -52,6 +57,8 @@ does and what you should see.
 
 Everything is installed for you by **one script**: `scripts/deploy-digitalocean.sh`
 (it is part of the GitHub repo — the server downloads it itself).
+The filename mentions DigitalOcean for historical reasons only — the script
+itself provisions **any Ubuntu 22.04+/Debian 12+ VPS, including Oracle Cloud**.
 
 ---
 
@@ -59,56 +66,70 @@ Everything is installed for you by **one script**: `scripts/deploy-digitalocean.
 
 | # | Requirement | Notes |
 |---|---|---|
-| 1 | A DigitalOcean account | [digitalocean.com](https://www.digitalocean.com) — sign up, add a payment method |
+| 1 | A cloud account — **Oracle Cloud** (or DigitalOcean, Hetzner, any provider) | [cloud.oracle.com](https://cloud.oracle.com) — sign up |
 | 2 | Your computer | Windows 10/11 (use **PowerShell**), macOS or Linux (use **Terminal**) |
 | 3 | The BLASTI GitHub repo | `https://github.com/raizel820/BLASTI-MULTI-PLATFORM` (public — no GitHub login needed on the server) |
 | 4 | A domain name *(optional but recommended)* | Needed for automatic HTTPS. You can start with just the IP |
 | 5 | 30–45 minutes | Most of it is unattended installing/building |
 
-**Recommended droplet:** Basic plan → Regular CPU → **4 GB RAM / 2 vCPU**
-(~$18/month). Smaller 2 GB droplets work too (the installer adds swap
-memory automatically), but 4 GB builds noticeably faster.
+**Recommended Oracle shape:** `VM.Standard.E2.2` — x86, **2 OCPU / 4 GB RAM**.
+The **Always Free A1.Flex** (ARM, up to 4 OCPU / 24 GB total) is plenty too —
+Bun, Node.js and PostgreSQL all ship arm64 builds. Smaller 2 GB instances
+work as well (the installer adds swap memory automatically), but 4 GB builds
+noticeably faster.
 
 ---
 
-## Part 2 — Create the droplet (on the DigitalOcean website)
+## Part 2 — Create the VPS (Oracle Cloud console)
 
-1. Log in at [cloud.digitalocean.com](https://cloud.digitalocean.com).
-2. Click the green **Create** button (top right) → **Droplets**.
-3. **Choose Region** — pick the region closest to your users
-   (e.g. *Frankfurt* for Europe, *New York* for the Americas).
-4. **Choose an Image** — under *OS* select **Ubuntu 24.04 (LTS) x64**.
-5. **Choose Size** — *Shared CPU → Basic → Regular* → **4 GB / 2 vCPU**.
-6. **Choose Authentication Method:**
-   - **Password** (easiest for beginners): choose a **strong root password**
-     and save it somewhere safe. DigitalOcean emails it to you as well.
-   - **SSH Key** (more convenient later): upload your key if you have one.
-7. **Hostname:** change to `blasti` (nice to recognise it later).
-8. Click **Create Droplet**.
-9. Wait ~60 seconds until the droplet shows **green "Active"**.
-10. **Write down the droplet's IP address** (shown next to the droplet name,
-    e.g. `203.0.113.10`). You will use it constantly.
+1. Log in at [cloud.oracle.com](https://cloud.oracle.com).
+2. Menu ☰ → **Compute → Instances → Create instance**.
+3. **Name:** `blasti`.
+4. **Image:** *Canonical Ubuntu 24.04* (x86 or ARM — both work).
+5. **Shape:** `VM.Standard.E2.2` (4 GB), or the free **A1.Flex** (2–4 OCPU).
+6. **SSH keys:** paste your public key — or let Oracle generate a pair and
+   download the private key (you need it for every login).
+7. **Networking (CRITICAL on Oracle):** open **TCP 22**, **TCP 80** and
+   **TCP 443** to source `0.0.0.0/0` in the subnet's **Security List**
+   (Ingress Rules). Oracle blocks every port at the CLOUD level by default —
+   a fresh BLASTI install is unreachable if this is skipped. (On
+   DigitalOcean you can skip this — the installer configures the firewall.)
+8. Click **Create** and wait until the instance shows **RUNNING**.
+9. **Write down the Public IP address** (shown on the instance page,
+   e.g. `203.0.113.10`). You will use it constantly.
 
-> 💡 If a firewall prompt appears on the creation screen, you can skip it —
-> the installer configures the server's own firewall for you.
+> 💡 Oracle's Ubuntu image also ships a locked-down OS firewall
+> (`/etc/iptables/rules.v4`). If ports stay closed even after the Security
+> List is right, apply the iptables fix in Part 12 once.
 
 ---
 
-## Part 3 — Connect to the droplet (first time)
+## Part 3 — Connect to the VPS (first time)
 
 **Windows:** click Start, type **PowerShell**, press Enter, then type
-(replace `203.0.113.10` with YOUR droplet IP):
+(replace the IP with YOUR server's IP):
 
-ssh-keygen -R 68.183.137.227
-```
-ssh root@68.183.137.227
+```bash
+ssh-keygen -R 129.151.242.219
+ssh ubuntu@129.151.242.219
 ```
 
 **macOS / Linux:** open **Terminal** and type the same command.
 
 - First time only, you will see a fingerprint question — type `yes` and Enter.
-- With **password auth**: type the root password (nothing appears while
-  typing — that is normal) and press Enter.
+- On **Oracle Cloud** you log in as `ubuntu` by SSH key (no password prompt).
+  The installer expects `root`, so do this ONE-TIME box, then `exit` and
+  reconnect as `ssh root@129.151.242.219`:
+
+```bash
+sudo mkdir -p /root/.ssh
+sudo cp ~/.ssh/authorized_keys /root/.ssh/authorized_keys
+sudo chown -R root:root /root/.ssh
+sudo chmod 700 /root/.ssh && sudo chmod 600 /root/.ssh/authorized_keys
+```
+
+- With **password auth** (DigitalOcean): type the root password (nothing
+  appears while typing — that is normal) and press Enter.
 - ✅ Success looks like: the prompt changes to something like
   `root@blasti:~#`. You are now "inside" the server. All commands in the
   next Part are typed there.
@@ -117,7 +138,7 @@ ssh root@68.183.137.227
 
 ## Part 4 — Install BLASTI (one shot, from GitHub)
 
-Stay inside the ssh session (`root@blasti:~#`). A fresh droplet has no
+Stay inside the ssh session (`root@blasti:~#`). A fresh VPS has no
 curl/git/node/bun — **the installer adds everything itself**. Copy-paste
 these **two commands**, one at a time:
 
@@ -155,15 +176,15 @@ cd blasti
 ./scripts/deploy-digitalocean.sh install root@203.0.113.10
 ```
 
-This connects to the droplet over ssh and performs **exactly the same
+This connects to the VPS over ssh and performs **exactly the same
 install** (the code still comes from GitHub, not from your machine).
-If your droplet uses password auth, ssh asks for it once.
+If your VPS uses password auth, ssh asks for it once.
 
 ---
 
 ## Part 5 — What the installer did (plain English)
 
-1. Added **2 GB swap** if the droplet has under 4 GB RAM (build headroom).
+1. Added **2 GB swap** if the VPS has under 4 GB RAM (build headroom).
 2. Installed **Docker** — used **only** to run the PostgreSQL container.
 3. Installed **Bun** (runs the API) and **Node.js 22** (runs the web app).
 4. Installed **Caddy** — the HTTPS gateway on ports 80/443.
@@ -303,7 +324,7 @@ the startup line — it is the ground truth of what will be used:
 [BLASTI Desktop] Cloud API → http://203.0.113.10  [source: …apps\desktop\.env]
 ```
 
-✅ That line + a successful login = the desktop is talking to YOUR droplet.
+✅ That line + a successful login = the desktop is talking to YOUR VPS.
 ❌ `[source: built-in default — NO cloud URL configured]` = the file/variable
 name is wrong (the banner lists every location it checked).
 
@@ -359,15 +380,15 @@ then open **http://203.0.113.10** in a browser → the BLASTI login page.
 
 ## Part 8 — Add a domain + automatic HTTPS
 
-1. At your domain provider (or DigitalOcean → Networking → Domains), create
-   a DNS **A record** pointing your name at the droplet IP:
+1. At your DNS provider (your registrar, or Oracle's DNS / Cloudflare), create
+   a DNS **A record** pointing your name at the VPS IP:
 
    | Type | Name | Value |
    |---|---|---|
    | A | `blasti` (or `@` for the root domain) | `203.0.113.10` |
 
 2. Wait until the name resolves (`ping blasti.yourdomain.com` must show the
-   droplet IP), then run the **update with the domain** — ssh into the
+   VPS IP), then run the **update with the domain** — ssh into the
    server and run:
 
    ```bash
@@ -409,14 +430,14 @@ Both do: `git pull` from GitHub → `bun install` → database schema update →
 
 ### Auto-update on every new commit (BUILT-IN, on by default)
 
-The droplet updates **itself**: a systemd timer (`blasti-watcher.timer`)
+The VPS updates **itself**: a systemd timer (`blasti-watcher.timer`)
 checks GitHub every 2 minutes, and when a new commit is there it runs a full
 update automatically (pull → rebuild → restart — your data and secrets are
 never touched). It is armed by the installer and by every `server-update`.
 
 You just work normally: `git push` → ~2 minutes later the site is updated.
 
-**Useful commands (ssh into the droplet):**
+**Useful commands (ssh into the VPS):**
 
 ```bash
 systemctl status blasti-watcher.timer                 # is it on?
@@ -432,7 +453,7 @@ bash /opt/blasti/scripts/deploy-digitalocean.sh server-watch-install  # turn ON 
   commit lands. The site keeps running the previous working build until a
   deploy succeeds at the restart stage.
 - The watcher and a manual `server-update` can never run at the same time
-  (they share one lock — no memory problems on the small droplet).
+  (they share one lock — no memory problems on the small VPS).
 - One caveat of true auto-deploy: whatever lands on `master` goes live. Push
   small, tested commits — and if a push breaks the site, push the fix (or
   disable the watcher first).
@@ -453,8 +474,34 @@ bash /opt/blasti/scripts/deploy-digitalocean.sh server-watch-install  # turn ON 
 ./scripts/deploy-digitalocean.sh restore root@203.0.113.10 blasti-2026-01-01.sql
 ```
 
-**Automated safety net:** DigitalOcean panel → your droplet → **Backups** →
-enable (weekly, +20% of droplet price). Keep both.
+**Automated safety net (Oracle Cloud):** Console → your instance →
+**Boot volume backup policy** (assign *Bronze* = weekly, small extra cost) —
+or simply rely on the `pg_dump` routine above. Keep both.
+
+### Migrating to a NEW VPS (e.g. DigitalOcean → Oracle Cloud)
+
+Done it once? Do it again in four steps:
+
+```bash
+# 1 — dump the OLD server (from your computer):
+./scripts/deploy-digitalocean.sh backup root@OLD_IP
+
+# 2 — install BLASTI on the NEW server (Parts 2–4):
+./scripts/deploy-digitalocean.sh install root@NEW_IP
+
+# 3 — restore the data onto the NEW server:
+./scripts/deploy-digitalocean.sh restore root@NEW_IP blasti-YYYY-MM-DD.sql
+
+# 4 — repoint every client at the NEW_IP (see Part 6.2):
+#     desktop dev:      apps/desktop/.env       BLASTI_CLOUD_URL="http://NEW_IP"
+#     installed .exe:   %LOCALAPPDATA%\Programs\BLASTI\resources\.env
+#     phone:            apps/web/.env.production  NEXT_PUBLIC_API_URL=http://NEW_IP
+#                       then rebuild: bun run build:mobile && bun run mobile:apk
+```
+
+The database (agencies, users, tickets) travels inside the `.sql` dump.
+If you use file attachments, also copy the uploaded-files directory from
+the old server's disk to the new one.
 
 ---
 
@@ -491,11 +538,12 @@ cd /opt/blasti                                 # the app's code (from GitHub)
 | Desktop probe shows **`/api/api/health` → 404** | `BLASTI_CLOUD_URL` has a trailing `/api` → remove it (bare origin only, Part 6.2) |
 | Desktop: `[source: built-in default — NO cloud URL configured]` | Variable not found → create `apps/desktop/.env` exactly as in Part 6.2 and restart the app |
 | Desktop: workspace locked / REVOKED after a wrong URL | Fix the URL, then log in **fresh** — a successful cloud login clears the revoked state |
-| No HTTPS / certificate pending | DNS A-record not pointing at the droplet yet, or re-run `server-update --domain …` (Part 8). Caddy retries automatically |
+| No HTTPS / certificate pending | DNS A-record not pointing at the VPS yet, or re-run `server-update --domain …` (Part 8). Caddy retries automatically |
+| Ports unreachable from the internet (Oracle Cloud) | Two firewalls: ① the CLOUD Security List → add Ingress Rules TCP 22/80/443 (Part 2.7); ② the OS image ships a locked iptables → run once: `sudo iptables -F INPUT && sudo netfilter-persistent save` — then `curl http://IP/api/health` from your PC |
 | `update` says "no git repo" | You installed long ago with the old method → re-run the Part 4 installer (it detects and refreshes the clone) |
-| Build killed / "Killed" during update | Droplet ran out of memory → the installer adds swap automatically on ≤4 GB; for manual runs: `sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile` |
-| Site reachable on the IP but not the domain | DNS not propagated (can take up to 24 h) → `ping your-domain` until it shows the droplet IP |
-| Everything is slow / server unresponsive | Check memory: `free -h` (on the server). 4 GB droplets are the comfortable minimum |
+| Build killed / "Killed" during update | VPS ran out of memory → the installer adds swap automatically on ≤4 GB; for manual runs: `sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile` |
+| Site reachable on the IP but not the domain | DNS not propagated (can take up to 24 h) → `ping your-domain` until it shows the VPS IP |
+| Everything is slow / server unresponsive | Check memory: `free -h` (on the server). 4 GB instances are the comfortable minimum |
 
 **Reset a service to factory settings** (last resort — wipes the database):
 
@@ -512,16 +560,18 @@ systemctl restart blasti-api blasti-web
 
 ## Part 13 — Cost & sizing notes
 
-| Droplet | RAM/vCPU | Verdict |
+| Plan / shape | RAM/vCPU | Verdict |
 |---|---|---|
-| s-1vcpu-1gb | 1 GB | ❌ Not enough for the Next.js build |
-| s-1vcpu-2gb | 2 GB | ⚠️ Works (installer adds 2 GB swap) — testing/small teams |
-| **s-2vcpu-4gb** | 4 GB | ✅ **Recommended** — comfortable builds + Postgres headroom |
-| s-4vcpu-8gb | 8 GB | Many agencies / heavy ticket volume |
+| **Oracle Always Free A1.Flex (ARM)** | up to 4 OCPU / 24 GB | ✅ **Free-forever tier — recommended** |
+| Any 1 GB plan | 1 GB | ❌ Not enough for the Next.js build |
+| Any 2 GB plan | 2 GB | ⚠️ Works (installer adds 2 GB swap) — testing/small teams |
+| **Any 4 GB / 2 vCPU plan** | 4 GB | ✅ **Recommended (paid)** — comfortable builds + Postgres headroom |
+| Any 8 GB plan | 8 GB | Many agencies / heavy ticket volume |
 
 - Docker runs **only** the tiny Postgres container — the apps run natively,
-  so a 4 GB droplet has plenty of headroom.
-- Enable **Droplet → Backups** (+20%) on top of the Part 10 `pg_dump` routine.
+  so a 4 GB VPS has plenty of headroom.
+- Enable boot-volume backups (Oracle) or provider snapshots on top of the
+  Part 10 `pg_dump` routine.
 - Firewall keeps the database and app ports **invisible from the internet** —
   only Caddy's 80/443 are public.
 

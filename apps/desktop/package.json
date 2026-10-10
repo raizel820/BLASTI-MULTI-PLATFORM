@@ -2,7 +2,7 @@
   "name": "@blasti/desktop",
   "version": "0.3.4",
   "private": true,
-  "description": "BLASTI Desktop — Multi-agency queue management system",
+  "description": "BLASTI Desktop \u2014 Multi-agency queue management system",
   "main": "main.js",
   "scripts": {
     "dev": "electron . --dev",
@@ -30,5 +30,10 @@
     "electron": "^42.3.3",
     "electron-builder": "^26.15.2",
     "prisma": "^6.11.1"
+  },
+  "homepage": "https://github.com/raizel820/BLASTI-MULTI-PLATFORM",
+  "author": {
+    "name": "BLASTI Team",
+    "email": "admin@blasti.dz"
   }
 }

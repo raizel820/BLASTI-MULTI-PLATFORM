@@ -1,33 +1,47 @@
 /**
  * @blasti/api — Chargily Webhook Route
  *
- * Receives and processes webhook events from Chargily payment gateway.
- * Verifies the HMAC-SHA256 signature, then updates the corresponding
- * Transaction record and emits real-time notifications.
+ * Receives and processes webhook events from Chargily Pay (EDAHABIA / CIB).
+ * Verifies the HMAC-SHA256 signature, then settles ALL payment surfaces via
+ * the shared fulfillment library (chargily-fulfill.ts):
+ *
+ *   Subscriptions  — Transaction COMPLETED + agency activated with expiry
+ *   SMS packs      — SmsPurchase APPROVED + credits granted atomically
+ *   Hardware orders — HardwareOrder APPROVED (payment confirmed)
+ *
+ * The webhook is the PRIMARY confirmation channel; the status-polling route
+ * (GET /api/payment/checkout/:id) runs the exact same fulfillment logic as a
+ * fallback, so payments complete even when the webhook URL is not configured
+ * in the Chargily dashboard (super admin only needs to enter the API keys).
  *
  * Supported events:
- *   checkout.paid   — Transaction marked as COMPLETED, agency subscription activated
- *   checkout.failed — Transaction marked as FAILED
+ *   checkout.paid   — payment confirmed
+ *   checkout.failed — payment failed / canceled
  *
  * Route:
  *   POST /api/payment/webhook
+ *
+ * Docs: https://dev.chargily.com/pay-v2/webhooks
  */
 
 import { Hono } from 'hono'
-import { db } from '@blasti/db'
 import { verifyWebhookSignature, type ChargilyWebhookEvent } from '../lib/chargily-service'
+import { fulfillCheckoutPaid, fulfillCheckoutFailed } from '../lib/chargily-fulfill'
 
 const app = new Hono()
 
 // POST / — Process Chargily webhook
 app.post('/', async (c) => {
   try {
-    // Read the raw body for signature verification
+    // Read the raw body for signature verification (HMAC is computed over
+    // the exact bytes — never over a re-serialized JSON object).
     const rawBody = await c.req.text()
-    const signature = c.req.header('Signature')
+    // Chargily sends the header as `signature` (HTTP headers are
+    // case-insensitive; Hono's header() lookup handles that).
+    const signature = c.req.header('signature') || c.req.header('Signature')
 
     if (!signature) {
-      console.warn('[payment-webhook] Missing Signature header')
+      console.warn('[payment-webhook] Missing signature header')
       return c.json({ success: false, error: 'Missing signature' }, 400)
     }
 
@@ -56,139 +70,48 @@ app.post('/', async (c) => {
 
     const { type, data } = event
 
-    console.log(`[payment-webhook] Received event: ${type}, checkout: ${data.id}`)
+    console.log(`[payment-webhook] Received event: ${type}, checkout: ${data?.id}`)
 
-    // Find the transaction by provider reference (Chargily checkout ID)
-    const transaction = await db.transaction.findFirst({
-      where: { providerRef: data.id },
-    })
-
-    if (!transaction) {
-      console.warn(`[payment-webhook] No transaction found for checkout ID: ${data.id}`)
-      // Return 200 so Chargily doesn't retry indefinitely
-      return c.json({ success: true, message: 'No matching transaction (ignored)' })
+    if (!data?.id) {
+      return c.json({ success: true, message: 'No checkout id (ignored)' })
     }
 
-    // Process based on event type
+    // Process based on event type — shared idempotent fulfillment.
     if (type === 'checkout.paid') {
-      // Mark transaction as completed
-      await db.transaction.update({
-        where: { id: transaction.id },
-        data: {
-          status: 'COMPLETED',
-          webhookVerified: true,
-          reviewedAt: new Date(),
+      const result = await fulfillCheckoutPaid(
+        {
+          id: data.id,
+          status: data.status,
+          amount: data.amount,
+          payment_method: data.payment_method,
+          metadata: data.metadata,
         },
-      })
-
-      // Activate the agency subscription
-      await db.agency.update({
-        where: { id: transaction.agencyId },
-        data: {
-          subscriptionStatus: 'ACTIVE',
-          subscriptionTier: transaction.plan,
-        },
-      })
-
-      // Create audit log
-      await db.auditLog.create({
-        data: {
-          action: 'PAYMENT_WEBHOOK_PAID',
-          entityType: 'TRANSACTION',
-          entityId: transaction.id,
-          details: JSON.stringify({
-            checkoutId: data.id,
-            amount: data.amount,
-            paymentMethod: data.payment_method,
-            agencyId: transaction.agencyId,
-          }),
-        },
-      })
-
-      console.log(`[payment-webhook] Transaction ${transaction.id} marked as COMPLETED`)
-
-      // Emit real-time notification to the agency room
-      try {
-        await fetch(`http://127.0.0.1:3003/emit`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-internal-secret': process.env.INTERNAL_SECRET || '',
-          },
-          body: JSON.stringify({
-            room: `agency:${transaction.agencyId}`,
-            event: 'payment:completed',
-            data: {
-              transactionId: transaction.id,
-              amount: transaction.amount,
-              plan: transaction.plan,
-            },
-          }),
-        })
-      } catch (emitErr) {
-        console.warn('[payment-webhook] Failed to emit real-time event:', emitErr)
+        'webhook',
+      )
+      if (!result.handled) {
+        console.warn(`[payment-webhook] No local records for checkout ${data.id} (ignored)`)
       }
-
     } else if (type === 'checkout.failed') {
-      // Mark transaction as failed
-      await db.transaction.update({
-        where: { id: transaction.id },
-        data: {
-          status: 'FAILED',
-          webhookVerified: true,
-          rejectionReason: 'Chargily checkout failed',
+      const result = await fulfillCheckoutFailed(
+        {
+          id: data.id,
+          status: data.status,
+          amount: data.amount,
+          payment_method: data.payment_method,
+          metadata: data.metadata,
         },
-      })
-
-      // Update agency subscription status
-      await db.agency.update({
-        where: { id: transaction.agencyId },
-        data: { subscriptionStatus: 'INACTIVE' },
-      })
-
-      // Create audit log
-      await db.auditLog.create({
-        data: {
-          action: 'PAYMENT_WEBHOOK_FAILED',
-          entityType: 'TRANSACTION',
-          entityId: transaction.id,
-          details: JSON.stringify({
-            checkoutId: data.id,
-            agencyId: transaction.agencyId,
-          }),
-        },
-      })
-
-      console.log(`[payment-webhook] Transaction ${transaction.id} marked as FAILED`)
-
-      // Emit real-time notification
-      try {
-        await fetch(`http://127.0.0.1:3003/emit`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-internal-secret': process.env.INTERNAL_SECRET || '',
-          },
-          body: JSON.stringify({
-            room: `agency:${transaction.agencyId}`,
-            event: 'payment:failed',
-            data: {
-              transactionId: transaction.id,
-              amount: transaction.amount,
-              plan: transaction.plan,
-            },
-          }),
-        })
-      } catch (emitErr) {
-        console.warn('[payment-webhook] Failed to emit real-time event:', emitErr)
+        'webhook',
+      )
+      if (!result.handled) {
+        console.warn(`[payment-webhook] No local records for checkout ${data.id} (ignored)`)
       }
-
     } else {
       console.log(`[payment-webhook] Unhandled event type: ${type}`)
     }
 
+    // Always 200 once the signature is valid — stops Chargily retries for
+    // events we have nothing to settle (e.g. webhooks for other apps).
     return c.json({ success: true })
-
   } catch (error) {
     console.error('[payment-webhook] Error processing webhook:', error)
     return c.json({ success: false, error: 'Webhook processing failed' }, 500)

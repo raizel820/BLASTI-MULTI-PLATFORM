@@ -4,8 +4,8 @@ BLASTI — droplet API fix ("Bad Gateway" on login) — one sequence
 WHAT I VERIFIED FROM HERE
 -------------------------
 I probed your droplet directly:
-    http://68.183.137.227/             -> 200 OK   (web app is UP)
-    http://68.183.137.227/api/health   -> 502      (API is DOWN)
+    http://129.151.242.219/             -> 200 OK   (web app is UP)
+    http://129.151.242.219/api/health   -> 502      (API is DOWN)
 Caddy and the web app are fine. Only the blasti-api service is not
 running, which is exactly why logging in gives "Bad Gateway".
 
@@ -37,7 +37,7 @@ Expected ending:
 
 THEN IN YOUR BROWSER
 --------------------
-1. http://68.183.137.227/api/health  -> should show JSON with "status".
+1. http://129.151.242.219/api/health  -> should show JSON with "status".
 2. Open the site in an INCOGNITO window: the HOME page now appears
    (the login-screen problem is fixed in this build).
 3. For your normal window: F12 -> Application -> Local Storage ->
@@ -66,5 +66,5 @@ report is one command:  bash blasti-deploy.sh server-doctor)
 REMINDERS
 ---------
 - Desktop .env keeps the BARE origin (no /api at the end):
-      BLASTI_CLOUD_URL="http://68.183.137.227"
+      BLASTI_CLOUD_URL="http://129.151.242.219"
 - The script now also has a `server-doctor` mode for future debugging.

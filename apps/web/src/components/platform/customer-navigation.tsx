@@ -64,13 +64,14 @@ import {
   LogOut,
   BarChart3,
   LifeBuoy,
+  Search,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 
 // ─── Shared Types ─────────────────────────────────────────────────────────────
 
 interface NavItem {
-  view: 'customer-home' | 'customer-queue' | 'customer-history' | 'customer-profile';
+  view: 'customer-home' | 'customer-queue' | 'customer-history' | 'customer-profile' | 'customer-search';
   icon: typeof HomeIcon;
   label: string;
 }
@@ -154,6 +155,9 @@ function useNavItems(t: (key: TranslationKeys, params?: Record<string, string>) 
     { view: 'customer-history', icon: CalendarDays, label: t('history') },
     { view: 'customer-profile', icon: User, label: t('profile') },
   ];
+  // Search is NOT a More-list entry — on mobile it is the raised rounded
+  // button in the CENTER of the bottom nav, and on desktop a regular tab.
+  const searchItem: NavItem = { view: 'customer-search', icon: Search, label: t('search') };
   const moreItems: MoreView[] = [
     { view: 'customer-favorites', icon: Heart, label: t('favorites') },
     { view: 'customer-notifications', icon: Bell, label: t('notifications') },
@@ -161,7 +165,7 @@ function useNavItems(t: (key: TranslationKeys, params?: Record<string, string>) 
     { view: 'customer-support', icon: LifeBuoy, label: t('supportDesk' as TranslationKeys) },
     { view: 'customer-settings', icon: Settings2, label: t('settings') },
   ];
-  return { mainItems, moreItems };
+  return { mainItems, searchItem, moreItems };
 }
 
 // ─── Electron / desktop-web top tab bar ──────────────────────────────────────
@@ -174,7 +178,7 @@ function CustomerTopTabBar({ currentView, setView, unreadCount, user, logout, t 
   logout: () => void;
   t: (key: TranslationKeys, params?: Record<string, string>) => string;
 }) {
-  const { mainItems, moreItems } = useNavItems(t);
+  const { mainItems, searchItem, moreItems } = useNavItems(t);
 
   return (
     <nav
@@ -184,7 +188,7 @@ function CustomerTopTabBar({ currentView, setView, unreadCount, user, logout, t 
       <BrandMark />
 
       <div className="flex items-center gap-0.5 ms-2 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-        {mainItems.map((item) => {
+        {[...mainItems, searchItem].map((item) => {
           const active = currentView === item.view;
           const Icon = item.icon;
           return (
@@ -330,12 +334,43 @@ function CustomerMobileBottomNav({ currentView, setView, unreadCount, user, logo
   logout: () => void;
   t: (key: TranslationKeys, params?: Record<string, string>) => string;
 }) {
-  const { mainItems, moreItems } = useNavItems(t);
+  const { mainItems, searchItem, moreItems } = useNavItems(t);
   const [moreOpen, setMoreOpen] = useState(false);
+  const searchActive = currentView === searchItem.view;
 
   const handleMoreNav = (view: MoreView['view']) => {
     setMoreOpen(false);
     setView(view);
+  };
+
+  const renderNavItem = (item: NavItem) => {
+    const active = currentView === item.view;
+    const Icon = item.icon;
+    return (
+      <motion.button
+        key={item.view}
+        whileTap={{ scale: 0.9 }}
+        transition={{ type: 'spring', stiffness: 400, damping: 17 }}
+        onClick={() => {
+          setView(item.view);
+          triggerHaptic();
+        }}
+        aria-current={active ? 'page' : undefined}
+        className="relative flex flex-col items-center justify-center gap-0.5 flex-1 h-full"
+      >
+        {active && (
+          <motion.span
+            layoutId="customer-nav-dot"
+            className="absolute top-0 h-0.5 w-8 rounded-full bg-emerald-600 dark:bg-emerald-400"
+            transition={{ type: 'spring', stiffness: 350, damping: 30 }}
+          />
+        )}
+        <Icon className={`h-5 w-5 transition-colors ${active ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}`} />
+        <span className={`text-[10px] transition-colors ${active ? 'text-emerald-600 dark:text-emerald-400 font-semibold' : 'text-muted-foreground'}`}>
+          {item.label}
+        </span>
+      </motion.button>
+    );
   };
 
   return (
@@ -343,39 +378,41 @@ function CustomerMobileBottomNav({ currentView, setView, unreadCount, user, logo
       <CustomerMobileTopStrip unreadCount={unreadCount} setView={setView} t={t} />
 
       <nav className="fixed bottom-0 inset-x-0 z-50 bg-white/95 dark:bg-gray-950/95 backdrop-blur-xl safe-area-bottom border-t border-border">
-        <div className="flex items-center justify-around h-16 max-w-lg mx-auto px-2">
-          {mainItems.map((item) => {
-            const active = currentView === item.view;
-            const Icon = item.icon;
-            return (
+        <div className="flex items-stretch h-16 max-w-lg mx-auto px-2">
+          {/* Left cluster: home · queue · history */}
+          <div className="flex-1 flex items-stretch">
+            {mainItems.slice(0, 3).map((item) => renderNavItem(item))}
+          </div>
+
+          {/* Center: raised rounded SEARCH button — dead center of the bar */}
+          <div className="w-16 shrink-0 relative">
+            <div className="absolute left-1/2 -translate-x-1/2 -top-5">
               <motion.button
-                key={item.view}
-                whileTap={{ scale: 0.9 }}
+                whileTap={{ scale: 0.92 }}
                 transition={{ type: 'spring', stiffness: 400, damping: 17 }}
                 onClick={() => {
-                  setView(item.view);
+                  setView(searchItem.view);
                   triggerHaptic();
                 }}
-                aria-current={active ? 'page' : undefined}
-                className="relative flex flex-col items-center justify-center gap-0.5 flex-1 h-full"
+                aria-label={searchItem.label}
+                aria-current={searchActive ? 'page' : undefined}
+                className={`flex h-14 w-14 items-center justify-center rounded-full text-white shadow-lg transition-shadow ${
+                  searchActive
+                    ? 'bg-gradient-to-br from-emerald-500 to-teal-500 shadow-emerald-600/40 ring-4 ring-emerald-400/40'
+                    : 'bg-gradient-to-br from-emerald-600 to-teal-600 shadow-emerald-900/20 ring-4 ring-white dark:ring-gray-950'
+                }`}
               >
-                {active && (
-                  <motion.span
-                    layoutId="customer-nav-dot"
-                    className="absolute top-0 h-0.5 w-8 rounded-full bg-emerald-600 dark:bg-emerald-400"
-                    transition={{ type: 'spring', stiffness: 350, damping: 30 }}
-                  />
-                )}
-                <Icon className={`h-5 w-5 transition-colors ${active ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}`} />
-                <span className={`text-[10px] transition-colors ${active ? 'text-emerald-600 dark:text-emerald-400 font-semibold' : 'text-muted-foreground'}`}>
-                  {item.label}
-                </span>
+                <Search className="h-6 w-6" />
               </motion.button>
-            );
-          })}
+            </div>
+          </div>
 
-          {/* More */}
-          <Sheet open={moreOpen} onOpenChange={setMoreOpen}>
+          {/* Right cluster: profile · more */}
+          <div className="flex-1 flex items-stretch">
+            {renderNavItem(mainItems[3])}
+
+            {/* More */}
+            <Sheet open={moreOpen} onOpenChange={setMoreOpen}>
             <SheetTrigger asChild>
               <motion.button
                 whileTap={{ scale: 0.9 }}
@@ -459,6 +496,7 @@ function CustomerMobileBottomNav({ currentView, setView, unreadCount, user, logo
               </div>
             </SheetContent>
           </Sheet>
+          </div>
         </div>
       </nav>
     </>

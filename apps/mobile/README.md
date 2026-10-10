@@ -81,7 +81,7 @@ scanning entirely — the app talks only to your VPS.
 1. Edit **`apps/mobile/.env.production`**:
 
    ```env
-   NEXT_PUBLIC_API_URL=http://68.183.137.227   # your VPS bare origin (no /api)
+   NEXT_PUBLIC_API_URL=http://129.151.242.219   # your VPS bare origin (no /api)
    NEXT_PUBLIC_SERVER_DISCOVERY=0              # lock: no manual input / no scan
    ```
 

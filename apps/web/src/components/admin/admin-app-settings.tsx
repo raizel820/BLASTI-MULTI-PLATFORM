@@ -72,6 +72,8 @@ import {
   Rocket,
   Shield,
   Zap,
+  Hammer,
+  History,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
@@ -105,12 +107,15 @@ interface LatestVersions {
   [platform: string]: AppVersion | null;
 }
 
-type Platform = 'android' | 'ios' | 'electron' | 'windows' | 'mac' | 'linux';
+type Platform = 'android' | 'android-debug' | 'ios' | 'electron' | 'windows' | 'mac' | 'linux';
 
 // ─── Constants ─────────────────────────────────────────────────────
 
 const PLATFORMS: { key: Platform; labelAr: string; labelEn: string; icon: typeof Smartphone }[] = [
   { key: 'android', labelAr: 'أندرويد', labelEn: 'Android', icon: Smartphone },
+  // Debug-APK channel: debug-keystore build, installable on any device without
+  // signing secrets. Kept OUT of public update checks — tester distribution only.
+  { key: 'android-debug', labelAr: 'أندرويد (نسخة تجريبية)', labelEn: 'Android Debug', icon: Smartphone },
   { key: 'ios', labelAr: 'آيفون', labelEn: 'iOS', icon: Apple },
   { key: 'electron', labelAr: 'إلكترون', labelEn: 'Electron', icon: Monitor },
   { key: 'windows', labelAr: 'ويندوز', labelEn: 'Windows', icon: Monitor },
@@ -204,6 +209,14 @@ export function AdminAppSettings() {
   const [deleteAlertOpen, setDeleteAlertOpen] = useState(false);
   const [deletingVersion, setDeletingVersion] = useState<AppVersion | null>(null);
   const [deleting, setDeleting] = useState(false);
+
+  // ── Manual installer generation + per-platform version manager (Task 88) ──
+  const [genPlatform, setGenPlatform] = useState<Platform | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [managerPlatform, setManagerPlatform] = useState<Platform | null>(null);
+  // Which APK build to generate when the target device is Android:
+  // release (store/signed build) · debug (installable on any device) · both.
+  const [genAndroidBuild, setGenAndroidBuild] = useState<'release' | 'debug' | 'both'>('release');
 
   // ── Fetch data ──
   const fetchVersions = useCallback(async (isRefresh = false) => {
@@ -541,6 +554,8 @@ export function AdminAppSettings() {
     switch (platform) {
       case 'android':
         return <Smartphone className={cn} />;
+      case 'android-debug':
+        return <Smartphone className={`${cn} opacity-70`} />;
       case 'ios':
         return <Apple className={cn} />;
       case 'electron':
@@ -590,6 +605,46 @@ export function AdminAppSettings() {
       }
     },
     [isRTL, fetchVersions, getPlatformName]
+  );
+
+  // ── Manual installer generation (GitHub Actions, per device) ──
+  const handleGenerate = useCallback(
+    async (platform: Platform, androidBuild: 'release' | 'debug' | 'both' = 'release') => {
+      setGenerating(true);
+      try {
+        const res = await apiFetch('/api/system/installers/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ platform, androidBuild }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.success) {
+          const built =
+            platform === 'android'
+              ? androidBuild === 'both'
+                ? isRTL
+                  ? 'نسختي Release و Debug'
+                  : 'Release + Debug APKs'
+                : isRTL
+                  ? `APK ${androidBuild === 'debug' ? 'Debug (تجريبية)' : 'Release'}`
+                  : `${androidBuild === 'debug' ? 'Debug' : 'Release'} APK`
+              : getPlatformName(platform);
+          toast.success(
+            isRTL
+              ? `بدأ بناء ${built} على GitHub Actions — سيظهر المثبّت هنا كمسودة عند انتهاء البناء`
+              : `${built} build started on GitHub Actions — the installer arrives here as a draft when CI finishes`
+          );
+          setGenPlatform(null);
+        } else {
+          toast.error(data.error || (isRTL ? 'فشل طلب البناء' : 'Build request failed'));
+        }
+      } catch {
+        toast.error(isRTL ? 'خطأ في الاتصال' : 'Connection error');
+      } finally {
+        setGenerating(false);
+      }
+    },
+    [isRTL, getPlatformName]
   );
 
   // ─── Loading skeleton ──────────────────────────────────────────────
@@ -720,6 +775,41 @@ export function AdminAppSettings() {
                         hasPublished ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'
                       }`}
                     />
+                  </div>
+                  {/* Per-device actions: manual installer generation + version manager (Task 88) */}
+                  <div
+                    className="flex items-center justify-center gap-1 pt-1 border-t border-border/40"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground hover:text-amber-600"
+                      onClick={() => {
+                        setGenAndroidBuild('release');
+                        setGenPlatform(p.key);
+                      }}
+                      title={
+                        isRTL
+                          ? `توليد مثبّت ${isRTL ? p.labelAr : p.labelEn} يدوياً (GitHub Actions)`
+                          : `Generate ${p.labelEn} installer manually (GitHub Actions)`
+                      }
+                    >
+                      <Hammer className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground hover:text-amber-600"
+                      onClick={() => setManagerPlatform(p.key)}
+                      title={
+                        isRTL
+                          ? `إدارة إصدارات ${isRTL ? p.labelAr : p.labelEn}`
+                          : `Manage ${p.labelEn} installer versions`
+                      }
+                    >
+                      <History className="h-3.5 w-3.5" />
+                    </Button>
                   </div>
                 </CardContent>
               </Card>
@@ -1705,6 +1795,275 @@ export function AdminAppSettings() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* ─── 9. Manual installer generation confirm (Task 88, per device) ─── */}
+      <AlertDialog open={genPlatform !== null} onOpenChange={(o) => !o && setGenPlatform(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              <Hammer className="h-4 w-4 text-amber-600" />
+              {genPlatform
+                ? isRTL
+                  ? `توليد مثبّت ${getPlatformName(genPlatform)} يدوياً؟`
+                  : `Generate the ${getPlatformName(genPlatform)} installer?`
+                : ''}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {isRTL
+                ? 'يطلق هذا الإجراء مسار GitHub Actions لبناء مثبّت هذه المنصة فقط من أحدث إصدار، ثم يرفعه إلى هذه اللوحة كمسودة عند انتهاء البناء. يتطلب GITHUB_TOKEN على الخادم.'
+                : 'This triggers the GitHub Actions pipeline to build ONLY this platform installer from the latest commit and upload it here as a draft when finished. Requires GITHUB_TOKEN configured on the server.'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+
+          {/* Android: choose which APK build(s) to generate */}
+          {genPlatform === 'android' && (
+            <div className="space-y-2">
+              <p className="text-xs font-medium">
+                {isRTL ? 'نوع النسخة (APK)' : 'APK build type'}
+              </p>
+              <div className="grid grid-cols-3 gap-1.5">
+                {([
+                  { key: 'release', label: isRTL ? 'Release' : 'Release', sub: isRTL ? 'نسخة رسمية' : 'store build' },
+                  { key: 'debug', label: isRTL ? 'Debug' : 'Debug', sub: isRTL ? 'نسخة تجريبية' : 'test build' },
+                  { key: 'both', label: isRTL ? 'الكل' : 'Both', sub: isRTL ? 'النسختان معاً' : 'release + debug' },
+                ] as const).map((opt) => (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() => setGenAndroidBuild(opt.key)}
+                    className={`rounded-lg border px-2 py-2 text-center transition-colors ${
+                      genAndroidBuild === opt.key
+                        ? 'border-amber-400 bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400'
+                        : 'border-border/60 hover:bg-muted/50 text-muted-foreground'
+                    }`}
+                  >
+                    <span className="block text-xs font-semibold">{opt.label}</span>
+                    <span className="block text-[10px] opacity-70">{opt.sub}</span>
+                  </button>
+                ))}
+              </div>
+              <p className="text-[10px] text-muted-foreground">
+                {isRTL
+                  ? 'Release: نسخة الإصدار الرسمية (تحتاج مفتاح توقيع للتثبيت عبر المتجر) · Debug: نسخة تجريبية موقّعة بمفتاح Debug، تُثبَّت مباشرة على أي جهاز للاختبار.'
+                  : 'Release: the official store build (needs your keystore to install) · Debug: auto-signed with the debug key — installs directly on any device for testing.'}
+              </p>
+            </div>
+          )}
+
+          <AlertDialogFooter>
+            <AlertDialogCancel>{isRTL ? 'إلغاء' : 'Cancel'}</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white"
+              onClick={() => genPlatform && handleGenerate(genPlatform, genAndroidBuild)}
+              disabled={generating}
+            >
+              {generating ? (
+                <Loader2 className="h-4 w-4 animate-spin me-1" />
+              ) : (
+                <Hammer className="h-4 w-4 me-1" />
+              )}
+              {isRTL ? 'توليد' : 'Generate'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ─── 10. Installer Version Manager (Task 88, per device) ─── */}
+      <Dialog open={managerPlatform !== null} onOpenChange={(o) => !o && setManagerPlatform(null)}>
+        <DialogContent className="max-w-3xl max-h-[85vh] flex flex-col">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              {managerPlatform && getPlatformIcon(managerPlatform, 'h-4 w-4 text-amber-600')}
+              {managerPlatform
+                ? isRTL
+                  ? `إدارة إصدارات ${getPlatformName(managerPlatform)}`
+                  : `${getPlatformName(managerPlatform)} installer versions`
+                : ''}
+              {managerPlatform && (
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 text-muted-foreground">
+                  {versions.filter((v) => v.platform === managerPlatform).length}{' '}
+                  {isRTL ? 'إصدار' : 'versions'}
+                </Badge>
+              )}
+            </DialogTitle>
+            <DialogDescription>
+              {isRTL
+                ? 'مسودات CI والإصدارات المنشورة سابقاً — فعّل الإصدار الذي يجب أن يكون متاحاً للعامة لهذه المنصة.'
+                : 'CI drafts and previously published versions — activate the one that should be public for this platform.'}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <p className="text-[11px] text-muted-foreground">
+              {isRTL
+                ? 'الإصدار النشط هو ما تحمّله التطبيقات العامة عند التحقق من التحديثات.'
+                : 'The ACTIVE version is what public apps download on update checks.'}
+            </p>
+            {managerPlatform && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20"
+                onClick={() => {
+                  setGenAndroidBuild('release');
+                  setGenPlatform(managerPlatform);
+                  setManagerPlatform(null);
+                }}
+              >
+                <Hammer className="h-3 w-3 me-1" />
+                {isRTL ? 'توليد مثبّت جديد' : 'Generate new installer'}
+              </Button>
+            )}
+          </div>
+
+          <div className="max-h-[55vh] overflow-y-auto custom-scrollbar -mx-1 px-1 space-y-1.5">
+            {managerPlatform &&
+              versions
+                .filter((v) => v.platform === managerPlatform)
+                .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+                .map((v) => {
+                  const isActive = latestVersions[managerPlatform]?.id === v.id;
+                  return (
+                    <div
+                      key={v.id}
+                      className={`rounded-xl border p-3 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 ${
+                        isActive
+                          ? 'border-green-300/70 bg-green-50/50 dark:border-green-800/40 dark:bg-green-900/10'
+                          : 'border-border/50 bg-muted/20'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0 flex-1">
+                        {getPlatformIcon(v.platform, 'h-4 w-4 text-amber-600 dark:text-amber-400 shrink-0')}
+                        <div className="min-w-0">
+                          <p className="text-sm font-semibold font-mono flex items-center gap-1.5">
+                            v{v.version}
+                            <span className="text-[10px] font-normal text-muted-foreground">
+                              (code {v.versionCode})
+                            </span>
+                          </p>
+                          <p className="text-[10px] text-muted-foreground truncate">
+                            {formatFileSize(v.fileSize)} · {v.downloadCount}{' '}
+                            {isRTL ? 'تنزيل' : 'downloads'} · {formatDate(v.createdAt)}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1 flex-wrap shrink-0">
+                        {isActive ? (
+                          <Badge className="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 text-[10px] px-1.5 py-0">
+                            <CheckCircle2 className="h-3 w-3 me-0.5" />
+                            {isRTL ? 'النسخة النشطة' : 'Active'}
+                          </Badge>
+                        ) : v.isPublished ? (
+                          <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 text-[10px] px-1.5 py-0">
+                            {isRTL ? 'منشور' : 'Published'}
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline" className="text-[10px] px-1.5 py-0 text-muted-foreground">
+                            {isRTL ? 'مسودة' : 'Draft'}
+                          </Badge>
+                        )}
+                        {v.isMandatory && (
+                          <Badge className="bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 text-[10px] px-1.5 py-0">
+                            {isRTL ? 'إلزامي' : 'Mandatory'}
+                          </Badge>
+                        )}
+                        {!isActive && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7 text-muted-foreground hover:text-green-600"
+                            onClick={() => handleActivate(v)}
+                            disabled={activatingId === v.id}
+                            title={
+                              isRTL
+                                ? 'تعيين كإصدار نشط (يُلغي نشر بقية إصدارات المنصة)'
+                                : 'Set as the active version (unpublishes other versions of this platform)'
+                            }
+                          >
+                            {activatingId === v.id ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Zap className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className={`h-7 w-7 ${
+                            v.isPublished
+                              ? 'text-orange-500 hover:text-orange-600'
+                              : 'text-muted-foreground hover:text-green-600'
+                          }`}
+                          onClick={() => {
+                            setPublishingVersion(v);
+                            setPublishAlertOpen(true);
+                          }}
+                          title={
+                            v.isPublished
+                              ? isRTL
+                                ? 'إلغاء النشر'
+                                : 'Unpublish'
+                              : isRTL
+                                ? 'نشر'
+                                : 'Publish'
+                          }
+                        >
+                          {v.isPublished ? <XCircle className="h-3.5 w-3.5" /> : <Rocket className="h-3.5 w-3.5" />}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                          onClick={() => {
+                            setManagerPlatform(null);
+                            openEditDialog(v);
+                          }}
+                          title={isRTL ? 'تعديل' : 'Edit'}
+                        >
+                          <Edit3 className="h-3.5 w-3.5" />
+                        </Button>
+                        {v.downloadUrl && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                            onClick={() => handleDownload(v)}
+                            title={isRTL ? 'تحميل الملف' : 'Download binary'}
+                          >
+                            <Download className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 text-red-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/20"
+                          onClick={() => {
+                            setManagerPlatform(null);
+                            setDeletingVersion(v);
+                            setDeleteAlertOpen(true);
+                          }}
+                          title={isRTL ? 'حذف' : 'Delete'}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  );
+                })}
+            {managerPlatform && versions.filter((v) => v.platform === managerPlatform).length === 0 && (
+              <div className="text-center py-10 text-muted-foreground">
+                <Package className="h-10 w-10 mx-auto mb-2 opacity-30" />
+                <p className="text-xs">
+                  {isRTL
+                    ? 'لا توجد إصدارات لهذه المنصة بعد — استخدم "توليد مثبّت جديد" بالأعلى.'
+                    : 'No versions for this platform yet — use "Generate new installer" above.'}
+                </p>
+              </div>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

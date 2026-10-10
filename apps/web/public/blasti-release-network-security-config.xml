@@ -32,6 +32,6 @@
 
     <!-- TEMPORARY until the VPS serves HTTPS: allow the cloud server IP. -->
     <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">68.183.137.227</domain>
+        <domain includeSubdomains="false">129.151.242.219</domain>
     </domain-config>
 </network-security-config>

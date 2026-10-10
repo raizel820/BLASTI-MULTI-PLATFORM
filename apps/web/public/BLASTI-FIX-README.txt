@@ -11,7 +11,7 @@ so your value made it probe /api/api/health -> 404 -> "cloud unreachable".
 
 Edit  apps\desktop\.env  and change it to the BARE ORIGIN:
 
-    BLASTI_CLOUD_URL="http://68.183.137.227"
+    BLASTI_CLOUD_URL="http://129.151.242.219"
 
 (only if a domain is set up later: BLASTI_CLOUD_URL="https://your-domain")
 

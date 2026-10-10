@@ -1,14 +1,25 @@
 import { Hono } from 'hono'
 import { db } from '@blasti/db'
 import { enforceRateLimit, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
+import { isChargilyConfigured, isChargilyLiveMode } from '../lib/chargily-service'
 
 const app = new Hono()
 
 // GET /payment-settings — Public payment settings
+//
+// Returns the manual-payment account details (CCP / bank / e-wallet) plus the
+// Chargily availability flags so clients only offer the EDAHABIA / CIB online
+// payment methods when the super admin has entered the Chargily API keys.
 app.get('/', async (c) => {
   let clientIp: string | undefined
   try {
     clientIp = enforceRateLimit(c, PUBLIC_RATE_LIMIT)
+
+    // Chargily availability — non-sensitive flags only (never the keys).
+    const [chargilyEnabled, chargilyLive] = await Promise.all([
+      isChargilyConfigured(),
+      isChargilyLiveMode(),
+    ])
 
     let settings = await db.paymentSettings.findFirst()
     if (!settings) {
@@ -23,6 +34,9 @@ app.get('/', async (c) => {
         bankRib: '00 000 00000 000 0000 000',
         bankName: 'BNA',
         ewalletNumber: '0XXX XXX XXX',
+        chargilyEnabled,
+        chargilyMode: chargilyLive ? 'live' : 'sandbox',
+        chargilyMethods: chargilyEnabled ? ['edahabia', 'cib'] : [],
       })
     }
     if (clientIp) recordSuccessfulRequest(clientIp)
@@ -36,6 +50,9 @@ app.get('/', async (c) => {
       bankRib: settings.bankRib,
       bankName: settings.bankName,
       ewalletNumber: settings.ewalletNumber,
+      chargilyEnabled,
+      chargilyMode: chargilyLive ? 'live' : 'sandbox',
+      chargilyMethods: chargilyEnabled ? ['edahabia', 'cib'] : [],
     })
   } catch (error: unknown) {
     if (isRateLimitError(error)) {

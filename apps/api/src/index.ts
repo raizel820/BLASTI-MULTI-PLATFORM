@@ -68,6 +68,8 @@ import { qrClaimRoutes } from './routes/qr-claim'
 import { agencyDeviceRoutes } from './routes/agency-devices'
 import { agencyCategoriesRoutes } from './routes/agency-categories'
 import { adminProviderRoutes } from './routes/admin-providers'
+// Database Manager — SUPER_ADMIN PostgreSQL console (sidebar "Database Manager")
+import { adminDbRoutes } from './routes/admin-db'
 import { appVersionRoutes } from './routes/app-versions'
 import { systemStatusRoutes } from './routes/system-status'
 // Task 54-a — doc-2 role-scoped analytics (staff + customer modules)
@@ -569,6 +571,7 @@ app.route('/api/auth', authRoutes)
 app.route('/api/agency', agencyRoutes)
 app.route('/api/admin', adminRoutes)
 app.route('/api/admin/providers', adminProviderRoutes)
+app.route('/api/admin/db', adminDbRoutes)
 app.route('/api/agencies', agenciesRoutes)
 app.route('/api/reservations', reservationsRoutes)
 app.route('/api/queue', queueRoutes)
@@ -750,6 +753,28 @@ function broadcastEvent(event: Record<string, unknown>): number {
   }
 
   if (type.startsWith('reservation:')) {
+    const agencyId = event.agencyId as string
+    const userId = event.userId as string
+    let recipients = 0
+    if (agencyId) {
+      const room = `agency:${agencyId}`
+      io.to(room).emit(type, { ...event, timestamp })
+      const sockets = io.sockets.adapter.rooms.get(room)
+      recipients += sockets ? sockets.size : 0
+    }
+    if (userId) {
+      const room = `customer:${userId}`
+      io.to(room).emit(type, { ...event, timestamp })
+      const sockets = io.sockets.adapter.rooms.get(room)
+      recipients += sockets ? sockets.size : 0
+    }
+    console.log(`[${type}] → agency:${agencyId || 'none'}, customer:${userId || 'none'} (${recipients} recipients)`)
+    return recipients
+  }
+
+  // Chargily payment events — routed to the agency room (subscription /
+  // hardware payments) and/or the customer room (SMS pack purchases).
+  if (type.startsWith('payment:')) {
     const agencyId = event.agencyId as string
     const userId = event.userId as string
     let recipients = 0

@@ -3353,6 +3353,26 @@ app.post('/transactions/:id', async (c) => {
     })
 
     if (action === 'approve') {
+      // ─── Chargily HARDWARE transactions ──────────────────────────────
+      // Device payments (type=HARDWARE) are not subscriptions: approving
+      // one must NOT touch the agency's subscription tier/status. The
+      // Chargily webhook settles them automatically; this manual path only
+      // exists as an override — it approves the linked hardware order too.
+      if (transaction.type === 'HARDWARE') {
+        if (transaction.hardwareOrderId) {
+          const hwOrder = await db.hardwareOrder.findUnique({
+            where: { id: transaction.hardwareOrderId },
+          })
+          if (hwOrder && hwOrder.status === 'PENDING') {
+            await db.hardwareOrder.update({
+              where: { id: hwOrder.id },
+              data: { status: 'APPROVED' },
+            })
+          }
+        }
+        return c.json({ success: true, transaction: updated })
+      }
+
       // ─── Phase: Subscription expiry ───────────────────────────────────
       // Look up the plan to get the billing cycle, then compute the expiry
       // date. ONE_TIME plans never expire (null), MONTHLY = +30 days,

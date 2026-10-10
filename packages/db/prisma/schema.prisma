@@ -404,6 +404,12 @@ model HardwareOrder {
   status           String   @default("PENDING") // PENDING, APPROVED, REJECTED, FULFILLED
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
+  /// Chargily integration: payment provider — manual (default) or chargily
+  paymentProvider  String   @default("manual")
+  /// Chargily integration: checkout ID when paid via Chargily (EDAHABIA/CIB)
+  providerRef      String?
+  /// Chargily integration: whether gateway confirmation was signature-verified
+  webhookVerified  Boolean  @default(false)
 
   agency           Agency   @relation(fields: [agencyId], references: [id])
   items            HardwareOrderItem[]
@@ -633,6 +639,10 @@ model Transaction {
   reconciledAt    DateTime?
   /// Module 2: Admin who reconciled
   reconciledBy    String?
+  /// Chargily integration: payment category — SUBSCRIPTION (default) or HARDWARE
+  type            String    @default("SUBSCRIPTION")
+  /// Chargily integration: linked hardware order (type=HARDWARE payments)
+  hardwareOrderId String?
   agency          Agency    @relation(fields: [agencyId], references: [id])
   reviewer        User?     @relation("ReviewedBy", fields: [reviewedBy], references: [id])
 }
@@ -643,13 +653,19 @@ model SmsPurchase {
   quantity      Int
   price         Int
   /// Phase 1e: Status now requires APPROVED before credits are granted
-  status        String   @default("PENDING") // PENDING → APPROVED | REJECTED
+  status        String   @default("PENDING") // PENDING → APPROVED | REJECTED | FAILED (Chargily)
   paymentMethod String?
   receiptUrl    String?
   /// Storage provider for SMS receipt
   receiptStorageProvider String?
   /// Storage key for SMS receipt
   receiptStorageKey      String?
+  /// Chargily integration: payment provider — manual (default) or chargily
+  paymentProvider String  @default("manual")
+  /// Chargily integration: checkout ID for gateway confirmation
+  providerRef    String?
+  /// Chargily integration: whether the gateway confirmation was signature-verified
+  webhookVerified Boolean @default(false)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt @default(now())
   user          User     @relation(fields: [userId], references: [id])

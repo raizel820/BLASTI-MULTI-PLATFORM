@@ -15,6 +15,7 @@
  *  - POST /api/sms/purchase   (SMS packs)
  * Section UI reuses the existing profile/* child components (restyle only).
  */
+import { useState } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -32,6 +33,7 @@ import { ProfilePreferences } from './profile/profile-preferences';
 import { ProfileNotifications } from './profile/profile-notifications';
 import { ProfileSmsSettings } from './profile/profile-sms-settings';
 import { ProfileSmsWallet } from './profile/profile-sms-wallet';
+import { SmsPurchaseDialog, type SmsPackId } from './profile/sms-purchase-dialog';
 import { ProfilePurchaseHistory } from './profile/profile-purchase-history';
 import { ProfileDangerZone } from './profile/profile-danger-zone';
 
@@ -41,6 +43,10 @@ export function CustomerProfile() {
   const { theme, setTheme } = useTheme();
 
   const profile = useProfileData();
+
+  // SMS pack purchase: the pack card opens the payment-method dialog
+  // (instant Chargily checkout vs manual admin-approved request).
+  const [smsBuyPackId, setSmsBuyPackId] = useState<string | null>(null);
 
   const getMemberSince = () => {
     if (!user?.createdAt) return '';
@@ -237,7 +243,20 @@ export function CustomerProfile() {
           totalPercent={profile.totalPercent}
           smsPurchasing={profile.smsPurchasing}
           smsPurchasingPackId={profile.smsPurchasingPackId}
-          onPurchaseSms={profile.handlePurchaseSms}
+          onPurchaseSms={(packId) => setSmsBuyPackId(packId)}
+          t={t}
+        />
+
+        {/* ─── SMS purchase: payment-method chooser (Chargily / manual) ─── */}
+        <SmsPurchaseDialog
+          open={!!smsBuyPackId}
+          onOpenChange={(o) => !o && setSmsBuyPackId(null)}
+          packId={smsBuyPackId as SmsPackId | null}
+          onManualPurchase={(packId) => {
+            setSmsBuyPackId(null);
+            profile.handlePurchaseSms(packId);
+          }}
+          lang={lang}
           t={t}
         />
 

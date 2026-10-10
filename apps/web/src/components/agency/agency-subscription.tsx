@@ -1,5 +1,6 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
+import { startChargilyCheckout, fetchPaymentSettings } from '@/lib/chargily-checkout';
 
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -94,6 +95,7 @@ import {
   ArrowUpCircle,
   ArrowDownCircle,
   Lock,
+  Zap,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -372,6 +374,99 @@ function getTotalForPeriod(plan: SubscriptionPlan, period: number): number {
   return Math.round(plan.price * period * (1 - discount / 100));
 }
 
+// ─── Chargily availability (module-level TTL cache) ─────────────────────────
+// GET /api/payment-settings is public and cheap, but there is no reason to
+// hit it on every dialog open / list render — the result is memoized for
+// 5 minutes (in-flight requests share the same promise). Silent-fails to
+// false so the EDAHABIA / CIB online methods simply stay hidden when the
+// request errors; the manual transfer methods always remain available.
+
+const CHARGILY_SETTINGS_TTL_MS = 5 * 60 * 1000;
+let chargilySettingsCache: { at: number; value: Promise<boolean> } | null = null;
+
+function fetchChargilyEnabled(): Promise<boolean> {
+  if (chargilySettingsCache && Date.now() - chargilySettingsCache.at < CHARGILY_SETTINGS_TTL_MS) {
+    return chargilySettingsCache.value;
+  }
+  const value = fetchPaymentSettings()
+    .then((settings) => !!settings?.chargilyEnabled)
+    .catch(() => false);
+  chargilySettingsCache = { at: Date.now(), value };
+  return value;
+}
+
+// ─── Chargily method card ───────────────────────────────────────────────────
+// Shared visual treatment for the two instant online payment methods
+// (EDAHABIA / CIB): emerald gradient border (same best-value styling used
+// for premium plan cards), gradient icon tile and an "instant payment"
+// badge. Used by the PaymentDialog method step and by the hardware
+// "Pay now" dialog.
+
+interface ChargilyMethodOption {
+  id: 'EDAHABIA' | 'CIB';
+  label: string;
+  description: string;
+}
+
+function ChargilyMethodCard({
+  method,
+  selected,
+  onSelect,
+}: {
+  method: ChargilyMethodOption;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const { t } = useLanguage();
+  return (
+    <motion.button
+      type="button"
+      aria-pressed={selected}
+      whileHover={{ scale: 1.01 }}
+      whileTap={{ scale: 0.99 }}
+      onClick={onSelect}
+      className={`relative w-full cursor-pointer text-start rounded-2xl p-[2px] transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/40 ${
+        selected
+          ? 'bg-gradient-to-r from-emerald-500 via-teal-500 to-emerald-500 shadow-md shadow-emerald-500/25'
+          : 'bg-gradient-to-r from-emerald-400/40 via-teal-400/30 to-emerald-400/40 hover:from-emerald-400/70 hover:via-teal-500/60 hover:to-emerald-400/70'
+      }`}
+    >
+      <div
+        className={`relative rounded-[14px] p-4 ${
+          selected
+            ? 'bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-900/25 dark:to-teal-900/15'
+            : 'bg-white dark:bg-gray-900'
+        }`}
+      >
+        {selected && (
+          <motion.div
+            initial={{ scale: 0 }}
+            animate={{ scale: 1 }}
+            className="absolute top-3 end-3 h-5 w-5 rounded-full bg-emerald-500 flex items-center justify-center"
+          >
+            <Check className="h-3 w-3 text-white" strokeWidth={3} />
+          </motion.div>
+        )}
+        <div className="flex items-center gap-3 pe-7">
+          <div className="h-11 w-11 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 text-white flex items-center justify-center flex-shrink-0 shadow-sm">
+            <CreditCard className="h-5 w-5" />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <p className="text-sm font-bold text-foreground">{method.label}</p>
+              <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-gradient-to-r from-emerald-500 to-teal-500 text-white">
+                <Zap className="h-2.5 w-2.5" />
+                {t('smsChargilyOption')}
+              </span>
+            </div>
+            <p className="text-xs text-muted-foreground mt-0.5">{method.description}</p>
+          </div>
+        </div>
+      </div>
+    </motion.button>
+  );
+}
+
 // ─── Payment Dialog Component ───
 //
 // 3-step payment flow: 1) method, 2) receipt upload, 3) review & submit.
@@ -386,6 +481,7 @@ function PaymentDialog({
   selectedPlan,
   onSuccess,
   hardware,
+  chargilyEnabled,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -396,6 +492,9 @@ function PaymentDialog({
     commitmentTiers: CommitmentTier[];
     settings: HardwareSettings;
   } | null;
+  /** True when the super admin has configured the Chargily keys (fetched
+   *  once by the parent through the shared 5-minute module cache). */
+  chargilyEnabled?: boolean;
 }) {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
@@ -425,6 +524,27 @@ function PaymentDialog({
     hardware?.commitmentTiers?.[0]?.months ?? 12,
   );
   const [hwExpanded, setHwExpanded] = useState(false);
+
+  // Chargily (EDAHABIA / CIB) availability — seeded from the parent's
+  // mount-time fetch, then re-checked through the shared 5-minute module
+  // cache each time the dialog opens (picks up a mid-session gateway
+  // enable/disable without a page reload). Silent-fails to false.
+  const [chargilyOnline, setChargilyOnline] = useState(!!chargilyEnabled);
+  useEffect(() => {
+    setChargilyOnline(!!chargilyEnabled);
+  }, [chargilyEnabled]);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    fetchChargilyEnabled()
+      .then((enabled) => {
+        if (!cancelled) setChargilyOnline(enabled);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
 
   const hasHardware = !!(
     hardware &&
@@ -474,6 +594,8 @@ function PaymentDialog({
   };
 
   const getPaymentMethodLabel = (method: string) => {
+    if (method === 'EDAHABIA') return t('payEdahabiaFull');
+    if (method === 'CIB') return t('payCibFull');
     if (method === 'CCP') return t('ccpTransfer');
     if (method === 'BANK_TRANSFER' || method === 'BANK') return t('bankTransfer');
     return t('electronicPayment');
@@ -503,11 +625,21 @@ function PaymentDialog({
     },
   ];
 
+  // Instant online payment methods (Chargily gateway) — rendered above the
+  // manual ones when the gateway is configured. They skip the receipt step.
+  const isChargilyMethod = paymentMethod === 'EDAHABIA' || paymentMethod === 'CIB';
+  const chargilyMethods: ChargilyMethodOption[] = [
+    { id: 'EDAHABIA', label: t('payEdahabiaFull'), description: t('payOnlineSectionDesc') },
+    { id: 'CIB', label: t('payCibFull'), description: t('payOnlineSectionDesc') },
+  ];
+
   const dialogSteps = [
     { step: 1, label: t('stepPaymentMethod'), icon: CreditCard },
     { step: 2, label: t('stepReceipt'), icon: Upload },
     { step: 3, label: t('stepReview'), icon: CheckCircle2 },
-  ];
+    // Chargily methods skip the receipt step entirely — hide it from the
+    // progress indicator too so the flow reads 1 → 3.
+  ].filter((s) => !(isChargilyMethod && s.step === 2));
 
   const getFileSize = () => {
     if (!receiptFile) return '';
@@ -579,6 +711,75 @@ function PaymentDialog({
 
   const handleSubmitPayment = async () => {
     if (!selectedPlan) return;
+
+    // ── Chargily online payment (EDAHABIA / CIB) ─────────────────────────
+    // No receipt to upload: create a checkout session and hand the user to
+    // the hosted Chargily page. Hardware items picked in the optional picker
+    // are ordered FIRST so their ids can be bundled into the SAME checkout
+    // (one payment for everything). Best-effort — a hardware failure never
+    // blocks the subscription checkout.
+    if (isChargilyMethod) {
+      setSubmitting(true);
+      try {
+        const orderIds: string[] = [];
+        if (hasHardware) {
+          const items = (hardware?.products ?? [])
+            .map((p) => ({ productId: p.id, quantity: hwQuantities[p.id] ?? 0 }))
+            .filter((i) => i.quantity > 0);
+          if (items.length > 0) {
+            try {
+              const res = await apiFetch('/api/agency/hardware/orders', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  items,
+                  paymentModel: hwPaymentModel,
+                  ...(hwPaymentModel === 'MONTHLY'
+                    ? { commitmentMonths: hwCommitmentMonths }
+                    : {}),
+                }),
+              });
+              if (res.ok) {
+                // Response shape: { success, order } — see POST /hardware/orders.
+                const d = await res.json().catch(() => null);
+                if (d?.order?.id) orderIds.push(d.order.id);
+              }
+            } catch {
+              // Swallow — proceed with the subscription checkout alone; the
+              // hardware order can be retried from the catalog.
+            }
+          }
+        }
+
+        await startChargilyCheckout(
+          {
+            type: 'subscription',
+            paymentMethod: paymentMethod === 'CIB' ? 'cib' : 'edahabia',
+            locale: lang,
+            agencyId: user?.agencyId,
+            plan: selectedPlan.name,
+            period,
+            ...(orderIds.length > 0 ? { hardwareOrderIds: orderIds } : {}),
+          },
+          { returnView: 'agency-subscription' },
+        );
+        toast.info(t('redirectingToPayment'));
+        // Deliberately do NOT close the dialog — the browser is navigating
+        // to the hosted Chargily page; on return the payment-result view
+        // takes over (the pending checkout was persisted before redirect).
+      } catch (err) {
+        toast.error(
+          err instanceof Error && err.message
+            ? err.message
+            : t('chargilyUnavailable'),
+        );
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
+
+    // ── Manual payment (receipt upload + admin review) ───────────────────
     if (!receiptFile) {
       toast.error(t('uploadReceipt'));
       return;
@@ -663,7 +864,11 @@ function PaymentDialog({
   };
 
   const handleNext = () => {
-    if (paymentStep < 3 && canGoNext()) {
+    if (paymentStep === 1 && canGoNext()) {
+      // Chargily methods skip the receipt step — nothing to upload, the
+      // hosted gateway page collects the payment instead.
+      setPaymentStep(isChargilyMethod ? 3 : 2);
+    } else if (paymentStep < 3 && canGoNext()) {
       setPaymentStep(paymentStep + 1);
     } else if (paymentStep === 3) {
       handleSubmitPayment();
@@ -671,7 +876,11 @@ function PaymentDialog({
   };
 
   const handleBack = () => {
-    if (paymentStep > 1) setPaymentStep(paymentStep - 1);
+    if (paymentStep > 1) {
+      // Step 2 is unreachable for Chargily methods — jump straight back
+      // to the method step from the review.
+      setPaymentStep(isChargilyMethod && paymentStep === 3 ? 1 : paymentStep - 1);
+    }
   };
 
   // Plan info for header
@@ -967,7 +1176,41 @@ function PaymentDialog({
                       {lang === 'ar' ? 'اختر طريقة الدفع' : lang === 'fr' ? 'Choisir la méthode de paiement' : 'Choose Payment Method'}
                     </Label>
                     <div className="space-y-2.5">
-                      {paymentMethods.map((method) => {
+                      {/* Section 1 — instant online payment via the Chargily
+                          gateway (only when the super admin configured the
+                          keys). Rendered ABOVE the manual methods. */}
+                      {chargilyOnline && (
+                        <div className="space-y-2.5">
+                          <div className="px-1">
+                            <p className="text-xs font-bold text-emerald-700 dark:text-emerald-400">
+                              {t('payOnlineSection')}
+                            </p>
+                            <p className="text-[11px] text-muted-foreground mt-0.5">
+                              {t('payOnlineSectionDesc')}
+                            </p>
+                          </div>
+                          {chargilyMethods.map((method) => (
+                            <ChargilyMethodCard
+                              key={method.id}
+                              method={method}
+                              selected={paymentMethod === method.id}
+                              onSelect={() => setPaymentMethod(method.id)}
+                            />
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Section 2 — manual transfer (receipt upload + admin
+                          review). Section header only when the online
+                          methods above exist to contrast against. */}
+                      <div className="space-y-2.5">
+                        {chargilyOnline && (
+                          <div className="px-1">
+                            <p className="text-xs font-bold text-foreground/70">{t('payManualSection')}</p>
+                            <p className="text-[11px] text-muted-foreground mt-0.5">{t('payManualSectionDesc')}</p>
+                          </div>
+                        )}
+                        {paymentMethods.map((method) => {
                         const MethodIcon = method.icon;
                         const isSelected = paymentMethod === method.id;
                         const isExpanded = expandedInstructions === method.id;
@@ -1054,6 +1297,7 @@ function PaymentDialog({
                           </div>
                         );
                       })}
+                      </div>
                     </div>
                   </div>
                 </motion.div>
@@ -1259,13 +1503,18 @@ function PaymentDialog({
                           </span>
                           <span className="text-sm font-medium text-foreground">{getPaymentMethodLabel(paymentMethod)}</span>
                         </div>
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs text-muted-foreground">{t('uploadReceipt')}</span>
-                          <span className="text-sm font-medium text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
-                            <CheckCircle2 className="h-3.5 w-3.5" />
-                            {t('receiptUploadedSuccess')}
-                          </span>
-                        </div>
+                        {/* Receipt summary — manual methods only (Chargily
+                            payments have no receipt; the secure-note info box
+                            below replaces it). */}
+                        {!isChargilyMethod && (
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs text-muted-foreground">{t('uploadReceipt')}</span>
+                            <span className="text-sm font-medium text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
+                              <CheckCircle2 className="h-3.5 w-3.5" />
+                              {t('receiptUploadedSuccess')}
+                            </span>
+                          </div>
+                        )}
                         {/* Savings breakdown — show base price × period crossed out
                             and the discounted total when an extended period applies. */}
                         {period > 1 && selectedPlan && savingsAmount > 0 && (
@@ -1480,13 +1729,23 @@ function PaymentDialog({
                       </div>
                     )}
 
-                    {/* Payment review info */}
-                    <div className="flex items-start gap-3 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/10 border border-amber-200/60 dark:border-amber-800/30">
-                      <Info className="h-4 w-4 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
-                      <p className="text-xs text-amber-800 dark:text-amber-300 leading-relaxed">
-                        {t('paymentReviewInfo')}
-                      </p>
-                    </div>
+                    {/* Payment review info — Chargily methods get the secure
+                        gateway note instead of the manual-review notice. */}
+                    {isChargilyMethod ? (
+                      <div className="flex items-start gap-3 p-3 rounded-xl bg-emerald-50 dark:bg-emerald-900/10 border border-emerald-200/60 dark:border-emerald-800/30">
+                        <Shield className="h-4 w-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0 mt-0.5" />
+                        <p className="text-xs text-emerald-800 dark:text-emerald-300 leading-relaxed">
+                          {t('chargilySecureNote')}
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="flex items-start gap-3 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/10 border border-amber-200/60 dark:border-amber-800/30">
+                        <Info className="h-4 w-4 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
+                        <p className="text-xs text-amber-800 dark:text-amber-300 leading-relaxed">
+                          {t('paymentReviewInfo')}
+                        </p>
+                      </div>
+                    )}
                   </div>
                 </motion.div>
               )}
@@ -1537,10 +1796,16 @@ function PaymentDialog({
                       <span className="font-semibold text-foreground truncate">{getPaymentMethodLabel(paymentMethod)}</span>
                     </div>
 
-                    {/* Receipt status + thumbnail */}
+                    {/* Receipt status + thumbnail — Chargily methods show the
+                        instant-payment chip instead of the receipt status. */}
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-muted-foreground flex-shrink-0">{t('stepReceipt')}</span>
-                      {receiptFile ? (
+                      {isChargilyMethod ? (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400">
+                          <Zap className="h-3 w-3" />
+                          {t('smsChargilyOption')}
+                        </span>
+                      ) : receiptFile ? (
                         <span className="flex items-center gap-1.5 min-w-0 justify-end">
                           {receiptPreview ? (
                             <img
@@ -1656,7 +1921,7 @@ function PaymentDialog({
                 ) : (
                   <ChevronRight className={`h-4 w-4 ${lang === 'ar' ? 'rotate-180' : ''} me-1`} />
                 )}
-                {paymentStep === 3 ? t('confirm') : t('next')}
+                {paymentStep === 3 ? (isChargilyMethod ? t('redirectToPayment') : t('confirm')) : t('next')}
                 {paymentStep === 3 && selectedPlan && (
                   <span className="hidden lg:inline ms-1 opacity-90">
                     · {priceLabel}
@@ -2299,6 +2564,18 @@ export function AgencySubscription() {
   });
   const [hardwareOrders, setHardwareOrders] = useState<HardwareOrder[]>([]);
 
+  // Chargily (EDAHABIA / CIB) online-payment availability — fetched once on
+  // mount through the shared module-level 5-minute TTL cache. Passed down to
+  // the PaymentDialog and used to show "Pay now" on pending UPFRONT hardware
+  // orders. Silent-fails to false (online methods simply stay hidden).
+  const [chargilyEnabled, setChargilyEnabled] = useState(false);
+
+  // "Pay now" flow for a single pending UPFRONT hardware order (Chargily):
+  // the order-row button opens a small method-picker dialog.
+  const [payOrderTarget, setPayOrderTarget] = useState<HardwareOrder | null>(null);
+  const [payOrderMethod, setPayOrderMethod] = useState<'EDAHABIA' | 'CIB'>('EDAHABIA');
+  const [payOrderSubmitting, setPayOrderSubmitting] = useState(false);
+
   // Enterprise plan requests
   const [enterpriseDialogOpen, setEnterpriseDialogOpen] = useState(false);
   const [enterpriseRequests, setEnterpriseRequests] = useState<EnterpriseRequest[]>([]);
@@ -2322,6 +2599,8 @@ export function AgencySubscription() {
     fetchHardware();
     fetchHardwareOrders();
     fetchEnterpriseRequests();
+    // Chargily availability — module-level 5-min cache, never rejects.
+    fetchChargilyEnabled().then((enabled) => setChargilyEnabled(enabled));
   }, []);
 
   const fetchFaqs = async () => {
@@ -2399,6 +2678,37 @@ export function AgencySubscription() {
       }
     } catch {
       // silently fail
+    }
+  };
+
+  // "Pay now" (Chargily EDAHABIA / CIB) for a pending UPFRONT hardware order —
+  // creates a checkout for that single order and sends the user to the hosted
+  // Chargily page. Toast + error handling mirror the PaymentDialog Chargily
+  // branch; the dialog only closes on error (on success the page navigates to
+  // the gateway and the payment-result view takes over on return).
+  const handlePayOrder = async () => {
+    if (!payOrderTarget) return;
+    setPayOrderSubmitting(true);
+    try {
+      await startChargilyCheckout(
+        {
+          type: 'hardware',
+          orderId: payOrderTarget.id,
+          paymentMethod: payOrderMethod === 'CIB' ? 'cib' : 'edahabia',
+          locale: lang,
+        },
+        { returnView: 'agency-subscription' },
+      );
+      toast.info(t('redirectingToPayment'));
+    } catch (err) {
+      toast.error(
+        err instanceof Error && err.message
+          ? err.message
+          : t('chargilyUnavailable'),
+      );
+      setPayOrderTarget(null);
+    } finally {
+      setPayOrderSubmitting(false);
     }
   };
 
@@ -2489,6 +2799,8 @@ export function AgencySubscription() {
   };
 
   const getPaymentMethodLabel = (method: string) => {
+    if (method === 'EDAHABIA') return t('payEdahabiaFull');
+    if (method === 'CIB') return t('payCibFull');
     if (method === 'CCP') return t('ccpTransfer');
     if (method === 'BANK_TRANSFER' || method === 'BANK') return t('bankTransfer');
     return t('electronicPayment');
@@ -3705,6 +4017,23 @@ export function AgencySubscription() {
                         {order.paymentModel === 'MONTHLY' && (
                           <p className="text-[10px] text-muted-foreground">{t('perMonth')}</p>
                         )}
+                        {/* Instant online payment for a pending UPFRONT order —
+                            only when the Chargily gateway is configured. */}
+                        {isPending && order.paymentModel === 'UPFRONT' && chargilyEnabled && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="mt-1.5 h-7 px-2.5 text-[11px] font-semibold border-emerald-500/60 text-emerald-700 hover:bg-emerald-50 hover:text-emerald-800 dark:border-emerald-700/60 dark:text-emerald-400 dark:hover:bg-emerald-900/20"
+                            onClick={() => {
+                              setPayOrderMethod('EDAHABIA');
+                              setPayOrderTarget(order);
+                            }}
+                          >
+                            <CreditCard className="h-3 w-3 me-1" />
+                            {t('payNow')}
+                          </Button>
+                        )}
                       </div>
                     </div>
                   );
@@ -3963,7 +4292,60 @@ export function AgencySubscription() {
         selectedPlan={selectedPlan}
         onSuccess={fetchSubscription}
         hardware={hardwareProp}
+        chargilyEnabled={chargilyEnabled}
       />
+
+      {/* ─── Pay Now Dialog (Chargily checkout for a pending UPFRONT hardware order) ─── */}
+      <Dialog
+        open={!!payOrderTarget}
+        onOpenChange={(o) => {
+          // Only close on explicit dismiss while idle — never mid-submit.
+          if (!o && !payOrderSubmitting) setPayOrderTarget(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <CreditCard className="h-4.5 w-4.5 text-emerald-600" />
+              {t('choosePaymentMethod')}
+            </DialogTitle>
+            <DialogDescription>
+              {payOrderTarget
+                ? `${payOrderTarget.items
+                    .map((it) => `${it.quantity}× ${getHardwareProductName(it.product)}`)
+                    .join(' · ')} — ${payOrderTarget.upfrontTotal.toLocaleString()} ${t('currency')}`
+                : ''}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2.5">
+            {([
+              { id: 'EDAHABIA', label: t('payEdahabiaFull'), description: t('payOnlineSectionDesc') },
+              { id: 'CIB', label: t('payCibFull'), description: t('payOnlineSectionDesc') },
+            ] as ChargilyMethodOption[]).map((method) => (
+              <ChargilyMethodCard
+                key={method.id}
+                method={method}
+                selected={payOrderMethod === method.id}
+                onSelect={() => setPayOrderMethod(method.id)}
+              />
+            ))}
+          </div>
+          <DialogFooter>
+            <Button
+              onClick={handlePayOrder}
+              disabled={payOrderSubmitting}
+              className="w-full font-semibold bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white shadow-md shadow-emerald-500/20"
+            >
+              {payOrderSubmitting ? (
+                <Loader2 className="h-4 w-4 animate-spin me-2" />
+              ) : (
+                <CreditCard className="h-4 w-4 me-2" />
+              )}
+              {t('payWithGateway')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* ─── Cancel Subscription AlertDialog ─── */}
       <AlertDialog open={cancelDialogOpen} onOpenChange={setCancelDialogOpen}>

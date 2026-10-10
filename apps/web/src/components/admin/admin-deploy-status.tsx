@@ -42,6 +42,9 @@ interface DeployStatusData {
     repo: string | null;
     lastResult: string | null;
     lastMessage: string | null;
+    /** false = the server has no DEPLOY_TOKEN configured, so every
+     *  watcher/CI heartbeat is rejected (401) and the panel stays empty. */
+    heartbeatAuth?: boolean;
   };
   lastDeploy: {
     at: string | null;
@@ -185,6 +188,25 @@ export function AdminDeployStatus() {
           </div>
         </CardHeader>
         <CardContent className="pt-0 space-y-4">
+          {/* ── Heartbeat auth diagnosis: explains a permanent "no data" ── */}
+          {w.heartbeatAuth === false && (
+            <div className="rounded-lg border border-red-200/70 dark:border-red-800/40 bg-red-50/60 dark:bg-red-900/10 p-3 flex items-start gap-2">
+              <AlertTriangle className="h-4 w-4 text-red-500 shrink-0 mt-0.5" />
+              <div className="text-[11px] space-y-1">
+                <p className="font-medium text-red-700 dark:text-red-400">
+                  {isRTL
+                    ? 'لا يمكن قبول نبضات المراقب: لم يتم ضبط DEPLOY_TOKEN على الخادم'
+                    : 'Watcher heartbeats cannot be accepted: DEPLOY_TOKEN is not configured on the server' }
+                </p>
+                <p className="text-muted-foreground">
+                  {isRTL
+                    ? 'كل نبضة تُرفض بخطأ 401 لذا تبقى الحالة "لا بيانات". أضف DEPLOY_TOKEN إلى /etc/blasti/blasti.env ثم أعد تشغيل blasti-api.'
+                    : 'Every heartbeat is rejected with 401, so the panel stays "no data". Add DEPLOY_TOKEN to /etc/blasti/blasti.env (same secret in GitHub Actions BLASTI_DEPLOY_TOKEN) and restart blasti-api.'}
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* ── Status blocks ── */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             {/* Watcher liveness */}

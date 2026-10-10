@@ -1,5 +1,11 @@
 appId: com.blasti.desktop
 productName: BLASTI
+# Path-safe executable name — electron-builder 26.x derives executableName
+# from the (scoped) package name "@blasti/desktop" → "@blastidesktop" and then
+# REFUSES to build: "executableName contains characters that cannot be safely
+# used in file paths". Installer FILE names still use ${productName}, so the
+# artifacts stay BLASTI-Setup-x.y.z.exe / BLASTI-x.y.z.AppImage / .dmg.
+executableName: blasti
 copyright: Copyright © 2025 BLASTI
 
 directories:
@@ -110,8 +116,17 @@ linux:
         - x64
   category: Office
   icon: assets/icon.png
-  maintainer: BLASTI Team
+  # fpm requires a "Name <email>" maintainer (author-email check).
+  maintainer: BLASTI Team <admin@blasti.dz>
   vendor: BLASTI
+
+deb:
+  # fpm package name + flat artifact name — the scoped "@blasti/desktop"
+  # package name would otherwise produce a broken nested artifact path
+  # (dist/@blasti/desktop_...deb — fpm aborts on the missing parent dir and
+  # the CI artifact glob dist/*.deb would never match it either).
+  packageName: blasti
+  artifactName: "blasti_${version}_${arch}.${ext}"
 
 publish:
   provider: generic

@@ -14,6 +14,8 @@ export const viewToUrl: Record<ViewName, string> = {
   'customer-notifications': '/customer/notifications',
   'customer-profile': '/customer/profile',
   'customer-favorites': '/customer/favorites',
+  // Task 86: dedicated full-screen customer search.
+  'customer-search': '/customer/search',
   'customer-settings': '/customer/settings',
   'customer-agency-profile': '/customer/agency-profile',
   'customer-branch-profile': '/customer/branch-profile',
@@ -21,6 +23,9 @@ export const viewToUrl: Record<ViewName, string> = {
   // Task 54-d: personal "My Analytics" module (doc-2 §38-44).
   'customer-analytics': '/customer/analytics',
   'customer-support': '/customer/support',
+  // Chargily (EDAHABIA / CIB) hosted-checkout return view — role-agnostic and
+  // self-guarding, so it deliberately takes no role prefix.
+  'payment-result': '/payment/result',
   'agency-dashboard': '/agency',
   'agency-settings': '/agency/settings',
   'agency-employees': '/agency/employees',
@@ -54,6 +59,10 @@ export const viewToUrl: Record<ViewName, string> = {
   'admin-hardware': '/admin/hardware',
   'admin-hardware-requests': '/admin/hardware-requests',
   'admin-enterprise-requests': '/admin/enterprise-requests',
+  // Database Manager — SUPER_ADMIN PostgreSQL console. The role guard is
+  // inherited from the `admin-` prefix branch in getAllowedRolesForView
+  // (SUPER_ADMIN only), same as every other admin view.
+  'admin-db': '/admin/db',
   'kiosk': '/kiosk',
 };
 

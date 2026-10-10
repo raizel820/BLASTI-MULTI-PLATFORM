@@ -322,12 +322,16 @@ export function CustomerHome() {
     return agencies.filter((a) => {
       const matchCategory = selectedCategory === 'ALL' || a.category.toUpperCase() === selectedCategory;
       const query = searchQuery.toLowerCase().trim();
+      // Null-safe (Task 86 field-fix): address is a nullable column — a
+      // null-address agency crashed the whole home with "cannot read
+      // properties of null (reading 'toLowerCase')" the moment a query
+      // was typed (mirrored fix in customer-search.tsx).
       const matchSearch =
         !query ||
         a.name.toLowerCase().includes(query) ||
         a.nameAr?.includes(query) ||
         a.nameFr?.toLowerCase().includes(query) ||
-        a.address.toLowerCase().includes(query) ||
+        a.address?.toLowerCase().includes(query) ||
         a.customCode.toLowerCase().includes(query);
       return matchCategory && matchSearch;
     });

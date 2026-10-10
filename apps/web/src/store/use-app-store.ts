@@ -23,9 +23,13 @@ export type ViewName =
   | 'customer-settings'
   | 'customer-agency-profile'
   | 'customer-branch-profile'
+  | 'customer-search'
   | 'customer-sms-wallet'
   | 'customer-analytics'
   | 'customer-support'
+  // Chargily (EDAHABIA / CIB) payment result — full-screen, role-agnostic,
+  // self-handles the logged-out case (generic result + login CTA).
+  | 'payment-result'
   | 'agency-dashboard'
   | 'agency-settings'
   | 'agency-employees'
@@ -52,6 +56,9 @@ export type ViewName =
   | 'admin-hardware'
   | 'admin-hardware-requests'
   | 'admin-enterprise-requests'
+  // Database Manager — SUPER_ADMIN PostgreSQL console (sidebar section:
+  // browse every table, row-level actions, maintenance).
+  | 'admin-db'
   | 'kiosk'
   | 'agency-fullscreen'
   | 'agency-fullscreen-history';
@@ -179,11 +186,16 @@ const viewHashMap: Record<ViewName, string> = {
   'customer-profile': '#/customer/profile',
   'customer-agency-profile': '#/customer/agency-profile',
   'customer-branch-profile': '#/customer/branch-profile',
+  'customer-search': '#/customer/search',
   'customer-favorites': '#/customer/favorites',
   'customer-settings': '#/customer/settings',
   'customer-analytics': '#/customer/analytics',
   'customer-support': '#/customer/support',
   'customer-sms-wallet': '#/customer/sms-wallet',
+  // Chargily hosted-checkout return URL: /#/payment/result?status=success —
+  // the generic prefix match in parseHashToView keeps the query params intact
+  // while still resolving the view.
+  'payment-result': '#/payment/result',
   'agency-dashboard': '#/agency',
   'agency-settings': '#/agency/settings',
   'agency-employees': '#/agency/employees',
@@ -312,12 +324,16 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'customer-profile', 'customer-favorites', 'customer-settings', 'customer-sms-wallet',
   'customer-agency-profile',
   'customer-branch-profile',
+  'customer-search',
   'customer-analytics',
+  // Chargily payment result — must survive persisted-state sanitization
+  // (VALID_VIEW_NAMES is the runtime mirror of the ViewName union).
+  'payment-result',
   'agency-dashboard', 'agency-settings', 'agency-employees', 'agency-profile',
   'agency-reviews', 'agency-subscription', 'agency-branches', 'agency-devices',
   'agency-analytics',
   'admin-dashboard', 'admin-transactions', 'admin-agencies', 'admin-audit',
-  'admin-users', 'admin-analytics', 'admin-settings', 'admin-maps', 'admin-subscription-plans', 'admin-app-settings',
+  'admin-users', 'admin-analytics', 'admin-settings', 'admin-maps', 'admin-subscription-plans', 'admin-app-settings', 'admin-db',
   'admin-hardware', 'admin-enterprise-requests',
   'admin-hardware-requests',
   'kiosk', 'agency-fullscreen', 'agency-fullscreen-history',

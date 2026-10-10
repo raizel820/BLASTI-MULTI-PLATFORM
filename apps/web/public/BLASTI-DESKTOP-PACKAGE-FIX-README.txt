@@ -80,7 +80,7 @@ when you BUILD the APK on your PC. Create this file in your project:
 
 containing exactly one line:
 
-   NEXT_PUBLIC_API_URL=http://68.183.137.227
+   NEXT_PUBLIC_API_URL=http://129.151.242.219
 
 (bare address — no port, no /api). Then rebuild the phone app:
 
@@ -92,5 +92,5 @@ the login-screen "Server connection" pill stays as a manual backup.
 
 PowerShell one-liner for step 1 (run in the project folder):
 
-   Set-Content -Path apps\web\.env.production.local -Value "NEXT_PUBLIC_API_URL=http://68.183.137.227"
+   Set-Content -Path apps\web\.env.production.local -Value "NEXT_PUBLIC_API_URL=http://129.151.242.219"
 ====================================================================

@@ -31,7 +31,9 @@ async function requireAdminOrDeployToken(c: Context): Promise<void> {
 // ─── Validation Schemas ─────────────────────────────────────────────────────
 
 const createAppVersionSchema = z.object({
-  platform: z.enum(['android', 'ios', 'electron', 'windows', 'mac', 'linux']),
+  // 'android-debug' = debug-keystore APK channel (installable on any device
+  // without signing secrets) — admin-internal, never served to update checks.
+  platform: z.enum(['android', 'android-debug', 'ios', 'electron', 'windows', 'mac', 'linux']),
   version: z.string().min(1).max(50).regex(/^\d+\.\d+\.\d+/, 'Version must be semver (e.g. 1.2.3)'),
   versionCode: z.number().int().min(0).default(0),
   releaseNotes: z.string().default(''),
@@ -116,7 +118,7 @@ app.get('/latest', async (c) => {
   try {
     await requireAdmin(c)
 
-    const platforms = ['android', 'ios', 'electron', 'windows', 'mac', 'linux'] as const
+    const platforms = ['android', 'android-debug', 'ios', 'electron', 'windows', 'mac', 'linux'] as const
     const latest: Record<string, any> = {}
 
     for (const platform of platforms) {
@@ -187,7 +189,7 @@ app.post('/', async (c) => {
     const body = await c.req.json()
     const validation = createAppVersionSchema.safeParse(body)
     if (!validation.success) {
-      return c.json({ success: false, error: 'Invalid input', details: validation.error.errors }, 400)
+      return c.json({ success: false, error: 'Invalid input', details: validation.error.issues }, 400)
     }
 
     const data = validation.data
@@ -250,7 +252,7 @@ app.post('/upload', async (c) => {
       return c.json({ success: false, error: 'Platform and version are required' }, 400)
     }
 
-    if (!['android', 'ios', 'electron', 'windows', 'mac', 'linux'].includes(platform)) {
+    if (!['android', 'android-debug', 'ios', 'electron', 'windows', 'mac', 'linux'].includes(platform)) {
       return c.json({ success: false, error: 'Invalid platform' }, 400)
     }
     if (!/^\d+\.\d+\.\d+/.test(version)) {
@@ -470,7 +472,7 @@ app.patch('/:id', async (c) => {
     const body = await c.req.json()
     const validation = updateAppVersionSchema.safeParse(body)
     if (!validation.success) {
-      return c.json({ success: false, error: 'Invalid input', details: validation.error.errors }, 400)
+      return c.json({ success: false, error: 'Invalid input', details: validation.error.issues }, 400)
     }
 
     const data = validation.data

@@ -55,6 +55,7 @@ import {
   MailCheck,
   Briefcase,
   Package,
+  Database,
   ChevronDown,
   ChevronRight,
   ChevronLeft,
@@ -531,6 +532,9 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
     { view: 'admin-agencies', icon: Building2, label: t('agencies') },
     { view: 'admin-audit', icon: ClipboardList, label: t('auditLogsPage') },
     { view: 'admin-users', icon: Users, label: t('userManagement') },
+    // Database Manager — dedicated section: every PostgreSQL table with row
+    // counts/sizes, row-level actions and maintenance (VACUUM, tombstones).
+    { view: 'admin-db', icon: Database, label: t('dbManagerTitle') },
     // Support desk — triage/reply incoming complaints, suggestions,
     // questions and notes from customers and agencies.
     { view: 'admin-tickets', icon: LifeBuoy, label: t('supportTickets' as TranslationKeys) },

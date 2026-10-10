@@ -184,12 +184,11 @@ function findApks(dir, out) {
   return out;
 }
 
-function reportApk() {
-  const variant = args.includes('assembleRelease') ? 'release' : 'debug';
+function reportVariant(variant, version) {
   const outDir = path.join(androidDir, 'app', 'build', 'outputs', 'apk', variant);
   const apks = findApks(outDir, []);
   if (apks.length === 0) {
-    warn(`Build succeeded but no APK was found under ${outDir}`);
+    warn(`Build succeeded but no ${variant} APK was found under ${outDir}`);
     return;
   }
   // Newest (largest mtime) wins — Gradle may keep multiple outputs.
@@ -197,7 +196,6 @@ function reportApk() {
 
   let finalPath = apk;
   try {
-    const version = readVersionName();
     const friendly = path.join(ROOT, `BLASTI-v${version}-${variant}.apk`);
     fs.copyFileSync(apk, friendly);
     finalPath = friendly;
@@ -214,8 +212,8 @@ function reportApk() {
   if (variant === 'release') {
     console.log('  ⚠️  This RELEASE APK is UNSIGNED (no keystore configured) —');
     console.log('     Android will refuse to install it. Use the debug APK');
-    console.log('     (`bun run mobile:apk`) for on-device testing, or add a');
-    console.log('     signingConfig to apps/mobile/android/app/build.gradle.');
+    console.log('     (`bun run mobile:apk:debug`) for on-device testing, or add');
+    console.log('     a signingConfig to apps/mobile/android/app/build.gradle.');
   } else {
     console.log('  Install it on your phone — pick one:');
     console.log('    1. Copy the APK file to your phone (USB / cloud / chat)');
@@ -227,6 +225,18 @@ function reportApk() {
   console.log('  crashes on launch (signature mismatch between builds).');
   console.log('══════════════════════════════════════════════════════════');
   console.log('');
+}
+
+function reportApk() {
+  // One invocation may request both tasks (assembleDebug assembleRelease) —
+  // report every variant that was actually built.
+  const variants = [];
+  if (args.includes('assembleDebug')) variants.push('debug');
+  if (args.includes('assembleRelease')) variants.push('release');
+  if (variants.length === 0) variants.push('debug'); // assembleDefault safety net
+
+  const version = readVersionName();
+  for (const variant of variants) reportVariant(variant, version);
 }
 
 // ─── Run Gradle ──────────────────────────────────────────────────────────────

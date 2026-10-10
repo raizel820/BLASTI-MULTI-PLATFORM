@@ -86,11 +86,22 @@ hb_enabled() { [ -n "$HB_URL" ] && [ -n "$HB_TOKEN" ]; }
 heartbeat() { # heartbeat <kind> <status> <commit> <message> [extra_json]
   hb_enabled || return 0
   local kind="$1" status="$2" commit="$3" message="$4" extra="${5:-}"
-  local payload
+  local payload code
   payload="{\"kind\":\"$kind\",\"status\":\"$status\",\"commit\":\"$commit\",\"branch\":\"$BRANCH_NAME\",\"repo\":\"$HB_REPO\",\"intervalSec\":$INTERVAL_NAME,\"message\":\"$message\"$extra}"
-  curl -fsS -m 5 -X POST "$HB_URL/api/system/deploy-heartbeat" \
+  # A failed heartbeat NEVER breaks the watcher, but a SILENT failure is
+  # invisible: the admin panel (Public Apps Settings) shows "no data" with no
+  # clue why. Log the rejection reason so `journalctl -u blasti-watcher`
+  # answers it (401 = token mismatch, 404 = server API outdated, else network).
+  code="$(curl -fsS -m 5 -o /dev/null -w '%{http_code}' -X POST "$HB_URL/api/system/deploy-heartbeat" \
     -H 'Content-Type: application/json' -H "x-deploy-token: $HB_TOKEN" \
-    -d "$payload" >/dev/null 2>&1 || true
+    -d "$payload" 2>/dev/null)" || code="unreachable"
+  case "$code" in
+    200 | 201 | 204) : ;;
+    401) log "heartbeat REJECTED (HTTP 401) — the server did not accept this DEPLOY_TOKEN; Public Apps Settings stays 'no data'. Check that DEPLOY_TOKEN in /etc/blasti/blasti.env is the same secret the watcher (and GitHub Actions BLASTI_DEPLOY_TOKEN) use." ;;
+    404) log "heartbeat endpoint missing (HTTP 404) — the server API predates deploy heartbeats; run: bash scripts/deploy-digitalocean.sh server-update" ;;
+    unreachable) log "heartbeat unreachable at $HB_URL (connection failed) — is blasti-api running?" ;;
+    *) log "heartbeat failed (HTTP $code)" ;;
+  esac
 }
 
 log() { printf '%s [watch] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
@@ -137,7 +148,7 @@ cmd_watch() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)       REPO="$2"; BRANCH_NAME="$2";      shift 2 ;;
+      --repo)       REPO="$2";                           shift 2 ;;
       --branch)     BRANCH="$2";    BRANCH_NAME="$2";    shift 2 ;;
       --interval)   INTERVAL="$2";  INTERVAL_NAME="$2";  shift 2 ;;
       --on-server)  ON_SERVER=1;    shift ;;

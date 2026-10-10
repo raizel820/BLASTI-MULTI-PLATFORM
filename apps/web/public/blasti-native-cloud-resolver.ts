@@ -129,8 +129,8 @@ export function getManualCloudUrl(): string | null {
  * and "https://api.example.com". Returns null when nothing parseable remains.
  *
  * Task 70: the port is NO LONGER injected here. Injecting the default :3003
- * made a user who typed the VPS origin "http://68.183.137.227" unknowingly
- * target "http://68.183.137.227:3003" — a port the VPS API does not expose
+ * made a user who typed the VPS origin "http://129.151.242.219" unknowingly
+ * target "http://129.151.242.219:3003" — a port the VPS API does not expose
  * (it binds 127.0.0.1:3003; only Caddy :80/:443 are public), so the manual
  * entry was silently booby-trapped. Both the as-typed origin AND the :3003
  * variant are now probed by candidateVariants() instead, and the variant

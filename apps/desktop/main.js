@@ -242,7 +242,7 @@ const DEV_CLOUD_FALLBACK = 'http://localhost:3003';
 // Same server as apps/mobile/.env.production. Used ONLY when a PACKAGED build
 // finds no configuration anywhere. To repoint an installed app without
 // rebuilding, create <install>\resources\.env with BLASTI_CLOUD_URL="…".
-const PRODUCTION_CLOUD_FALLBACK = 'http://68.183.137.227';
+const PRODUCTION_CLOUD_FALLBACK = 'http://129.151.242.219';
 
 /** The cloudBaseUrl baked by scripts/prebuild.js into build-stamp.json, if any. */
 function readBuildStampCloudUrl() {

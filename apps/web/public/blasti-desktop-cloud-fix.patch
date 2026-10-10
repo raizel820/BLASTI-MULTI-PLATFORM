@@ -268,9 +268,9 @@ index 0000000..4660354
 +doubles the path and breaks everything:
 +
 +```
-+✅ BLASTI_CLOUD_URL="http://68.183.137.227"          ← raw IP, HTTP (testing)
++✅ BLASTI_CLOUD_URL="http://129.151.242.219"          ← raw IP, HTTP (testing)
 +✅ BLASTI_CLOUD_URL="https://blasti.example.com"     ← domain + HTTPS (production)
-+❌ BLASTI_CLOUD_URL="http://68.183.137.227/api"      ← DO NOT — probes /api/api/health → 404
++❌ BLASTI_CLOUD_URL="http://129.151.242.219/api"      ← DO NOT — probes /api/api/health → 404
 +```
 +
 +Recent builds **auto-correct** a trailing `/api` and print a warning, but

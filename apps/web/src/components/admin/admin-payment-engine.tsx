@@ -42,6 +42,7 @@ import {
   DollarSign,
   Activity,
   Key,
+  Info,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
@@ -75,6 +76,14 @@ interface ChargilyConfig {
   chargily_api_key: string;
   chargily_secret_key: string;
   chargily_mode: string;
+}
+
+// Which encrypted keys already have a value stored on the server.
+// (The API masks encrypted values, so the client can never read them back —
+// it can only know THAT they exist, not WHAT they are.)
+interface SavedKeyFlags {
+  chargily_api_key: boolean;
+  chargily_secret_key: boolean;
 }
 
 interface ReconciliationReportItem {
@@ -139,10 +148,20 @@ export function AdminPaymentEngine() {
     chargily_secret_key: '',
     chargily_mode: 'sandbox',
   });
+  // TRUE when the server already holds a (masked) value for that key.
+  // Drives the "✓ saved" indicator + the keep-empty-on-save behavior.
+  const [savedKeys, setSavedKeys] = useState<SavedKeyFlags>({
+    chargily_api_key: false,
+    chargily_secret_key: false,
+  });
   const [showApiKey, setShowApiKey] = useState(false);
   const [showSecretKey, setShowSecretKey] = useState(false);
   const [savingConfig, setSavingConfig] = useState(false);
   const [loadingConfig, setLoadingConfig] = useState(true);
+
+  // Test-connection state (GET /api/payment/test — super admin only)
+  const [testingConnection, setTestingConnection] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
 
   // Reconciliation state
   const [reconDate, setReconDate] = useState(new Date().toISOString().split('T')[0]);
@@ -161,18 +180,31 @@ export function AdminPaymentEngine() {
     try {
       const res = await apiFetch('/api/settings/category/payment');
       if (res.ok) {
-        const data = await res.json();
+        const body = await res.json();
+        // apiFetch/apiClient UNWRAPS the {success, data} envelope — the
+        // settings array is either `body` directly or `body.data`.
+        const list: Array<{ key: string; value?: string; encrypted?: boolean }> = Array.isArray(body)
+          ? body
+          : Array.isArray((body as { data?: unknown[] })?.data)
+            ? (body as { data: Array<{ key: string; value?: string; encrypted?: boolean }> }).data
+            : [];
         const settings: Record<string, string> = {};
-        if (Array.isArray(data.data)) {
-          for (const s of data.data) {
-            // Don't show encrypted values as-is (they are masked)
-            settings[s.key] = s.encrypted ? '' : (s.value || '');
-          }
+        const hasValue: Record<string, boolean> = {};
+        for (const s of list) {
+          // Encrypted values are masked server-side ("••••••••") — we can't
+          // show them, but we REMEMBER that they exist so the UI can display
+          // a "saved" state and Save never wipes them with an empty string.
+          hasValue[s.key] = Boolean(s.encrypted || (s.value && s.value.trim() !== ''));
+          settings[s.key] = s.encrypted ? '' : (s.value || '');
         }
         setConfig({
-          chargily_api_key: settings.chargily_api_key || '',
-          chargily_secret_key: settings.chargily_secret_key || '',
+          chargily_api_key: '', // never pre-fill encrypted keys
+          chargily_secret_key: '',
           chargily_mode: settings.chargily_mode || 'sandbox',
+        });
+        setSavedKeys({
+          chargily_api_key: Boolean(hasValue.chargily_api_key),
+          chargily_secret_key: Boolean(hasValue.chargily_secret_key),
         });
       }
     } catch {
@@ -183,35 +215,52 @@ export function AdminPaymentEngine() {
   }, []);
 
   // ── Save Chargily config ──
+  // CRITICAL: empty encrypted fields are NOT sent — otherwise reloading the
+  // page (fields blank because values are masked) and pressing Save would
+  // silently WIPE the stored keys. Only fields the admin actually typed are
+  // written; the mode flag is always sent (it is not sensitive).
   const saveConfig = async () => {
     setSavingConfig(true);
     try {
-      const settings = [
-        {
+      const settings: Array<{
+        key: string;
+        value: string;
+        encrypted?: boolean;
+        category?: string;
+        description?: string;
+        valueType?: string;
+      }> = [];
+
+      if (config.chargily_api_key.trim() !== '') {
+        settings.push({
           key: 'chargily_api_key',
-          value: config.chargily_api_key,
+          value: config.chargily_api_key.trim(),
           encrypted: true,
           category: 'payment',
           description: 'Chargily API key for payment processing',
           valueType: 'string',
-        },
-        {
+        });
+      }
+
+      if (config.chargily_secret_key.trim() !== '') {
+        settings.push({
           key: 'chargily_secret_key',
-          value: config.chargily_secret_key,
+          value: config.chargily_secret_key.trim(),
           encrypted: true,
           category: 'payment',
           description: 'Chargily secret key for webhook verification',
           valueType: 'string',
-        },
-        {
-          key: 'chargily_mode',
-          value: config.chargily_mode,
-          encrypted: false,
-          category: 'payment',
-          description: 'Chargily mode: sandbox or live',
-          valueType: 'string',
-        },
-      ];
+        });
+      }
+
+      settings.push({
+        key: 'chargily_mode',
+        value: config.chargily_mode,
+        encrypted: false,
+        category: 'payment',
+        description: 'Chargily mode: sandbox or live',
+        valueType: 'string',
+      });
 
       const res = await apiFetch('/api/settings/bulk', {
         method: 'POST',
@@ -220,7 +269,18 @@ export function AdminPaymentEngine() {
       });
 
       if (res.ok) {
-        toast.success('Chargily configuration saved');
+        toast.success(t('chargilySavedKeep'));
+        // Reflect the new "saved" state + clear the typed values (they are
+        // now stored masked — leaving them visible would be misleading).
+        setSavedKeys({
+          chargily_api_key: savedKeys.chargily_api_key || config.chargily_api_key.trim() !== '',
+          chargily_secret_key: savedKeys.chargily_secret_key || config.chargily_secret_key.trim() !== '',
+        });
+        setConfig((prev) => ({
+          chargily_api_key: '',
+          chargily_secret_key: '',
+          chargily_mode: prev.chargily_mode,
+        }));
       } else {
         const data = await res.json();
         toast.error(data.error || 'Failed to save configuration');
@@ -229,6 +289,44 @@ export function AdminPaymentEngine() {
       toast.error('Failed to save configuration');
     } finally {
       setSavingConfig(false);
+    }
+  };
+
+  // ── Test the Chargily connection (validates the saved keys) ──
+  const testConnection = async () => {
+    setTestingConnection(true);
+    setTestResult(null);
+    try {
+      const res = await apiFetch('/api/payment/test');
+      const body = await res.json().catch(() => null);
+      // apiFetch/apiClient UNWRAPS the {success, data} envelope — accept both
+      // the unwrapped data object (has `mode`) and the full envelope.
+      const info = (
+        body && typeof body === 'object' && 'mode' in body
+          ? body
+          : (body as { data?: { mode?: string; dzdBalance?: number | null } })?.data
+      ) || {};
+      if (res.ok && info.mode) {
+        let message = `${t('chargilyTestOk')} ${info.mode === 'live' ? 'live' : 'sandbox'}`;
+        if (info.dzdBalance !== null && info.dzdBalance !== undefined) {
+          // Chargily reports the balance in centimes.
+          message += ` · ${t('chargilyBalanceLabel')}: ${(info.dzdBalance / 100).toLocaleString()} DZD`;
+        }
+        setTestResult({ ok: true, message });
+        toast.success(t('connectionOk'));
+      } else {
+        const bodyErr = body as { error?: string; details?: string };
+        const error = bodyErr?.error || 'Connection test failed';
+        // Surface Chargily's own answer (status + body) so the admin sees WHY.
+        const details = bodyErr?.details ? `\n${bodyErr.details.slice(0, 300)}` : '';
+        setTestResult({ ok: false, message: `${error}${details}` });
+        toast.error(`${t('connectionFailed')} — ${error}`);
+      }
+    } catch {
+      setTestResult({ ok: false, message: t('connectionFailed') });
+      toast.error(t('connectionFailed'));
+    } finally {
+      setTestingConnection(false);
     }
   };
 
@@ -353,6 +451,17 @@ export function AdminPaymentEngine() {
                 </p>
               </div>
             </div>
+            {/* Supported gateway badges */}
+            <div className="flex flex-wrap items-center gap-2 mt-1">
+              <Badge variant="outline" className="text-[10px] border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 bg-emerald-50/50 dark:bg-emerald-900/10">
+                <CreditCard className="h-3 w-3 me-1" />
+                {t('payEdahabiaFull')}
+              </Badge>
+              <Badge variant="outline" className="text-[10px] border-teal-300 dark:border-teal-800 text-teal-700 dark:text-teal-400 bg-teal-50/50 dark:bg-teal-900/10">
+                <CreditCard className="h-3 w-3 me-1" />
+                {t('payCibFull')}
+              </Badge>
+            </div>
           </CardContent>
         </Card>
       </motion.div>
@@ -401,13 +510,22 @@ export function AdminPaymentEngine() {
                       <Label className="text-sm font-medium flex items-center gap-2">
                         <Key className="h-3.5 w-3.5 text-amber-600" />
                         {t('chargilyApiKey')}
+                        {savedKeys.chargily_api_key && (
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 bg-emerald-50/50 dark:bg-emerald-900/10"
+                          >
+                            <CheckCircle2 className="h-3 w-3 me-1" />
+                            {t('keySavedBadge')}
+                          </Badge>
+                        )}
                       </Label>
                       <div className="relative">
                         <Input
                           type={showApiKey ? 'text' : 'password'}
                           value={config.chargily_api_key}
                           onChange={(e) => setConfig({ ...config, chargily_api_key: e.target.value })}
-                          placeholder="test_sk_xxxxxxxxxxxxx"
+                          placeholder={savedKeys.chargily_api_key ? t('savedKeyPlaceholder') : 'test_sk_xxxxxxxxxxxxx'}
                           className="pr-10"
                         />
                         <Button
@@ -422,6 +540,11 @@ export function AdminPaymentEngine() {
                       <p className="text-[11px] text-muted-foreground">
                         {t('apiKeyHint')}
                       </p>
+                      {config.chargily_api_key.includes('pk_') && (
+                        <p className="text-[11px] font-medium text-red-600 dark:text-red-400">
+                          {t('chargilyPublicKeyWarning')}
+                        </p>
+                      )}
                     </div>
 
                     {/* Secret Key */}
@@ -429,13 +552,22 @@ export function AdminPaymentEngine() {
                       <Label className="text-sm font-medium flex items-center gap-2">
                         <Shield className="h-3.5 w-3.5 text-rose-600" />
                         {t('chargilySecretKey')}
+                        {savedKeys.chargily_secret_key && (
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] border-emerald-300 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 bg-emerald-50/50 dark:bg-emerald-900/10"
+                          >
+                            <CheckCircle2 className="h-3 w-3 me-1" />
+                            {t('keySavedBadge')}
+                          </Badge>
+                        )}
                       </Label>
                       <div className="relative">
                         <Input
                           type={showSecretKey ? 'text' : 'password'}
                           value={config.chargily_secret_key}
                           onChange={(e) => setConfig({ ...config, chargily_secret_key: e.target.value })}
-                          placeholder="whsec_xxxxxxxxxxxxx"
+                          placeholder={savedKeys.chargily_secret_key ? t('savedKeyPlaceholder') : 'test_sk_xxxxxxxxxxxxx'}
                           className="pr-10"
                         />
                         <Button
@@ -450,6 +582,11 @@ export function AdminPaymentEngine() {
                       <p className="text-[11px] text-muted-foreground">
                         {t('secretKeyHint')}
                       </p>
+                      {config.chargily_secret_key.includes('pk_') && (
+                        <p className="text-[11px] font-medium text-red-600 dark:text-red-400">
+                          {t('chargilyPublicKeyWarning')}
+                        </p>
+                      )}
                     </div>
 
                     {/* Mode Toggle */}
@@ -478,19 +615,55 @@ export function AdminPaymentEngine() {
 
                     <Separator />
 
-                    {/* Save Button */}
-                    <Button
-                      onClick={saveConfig}
-                      disabled={savingConfig}
-                      className="w-full bg-emerald-600 hover:bg-emerald-700"
-                    >
-                      {savingConfig ? (
-                        <Loader2 className="h-4 w-4 animate-spin me-2" />
-                      ) : (
-                        <Save className="h-4 w-4 me-2" />
-                      )}
-                      {t('saveConfiguration')}
-                    </Button>
+                    {/* Save + Test connection buttons */}
+                    <div className="grid grid-cols-2 gap-2">
+                      <Button
+                        onClick={saveConfig}
+                        disabled={savingConfig}
+                        className="bg-emerald-600 hover:bg-emerald-700"
+                      >
+                        {savingConfig ? (
+                          <Loader2 className="h-4 w-4 animate-spin me-2" />
+                        ) : (
+                          <Save className="h-4 w-4 me-2" />
+                        )}
+                        {t('saveConfiguration')}
+                      </Button>
+                      <Button
+                        onClick={testConnection}
+                        disabled={testingConnection}
+                        variant="outline"
+                        className="border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+                      >
+                        {testingConnection ? (
+                          <Loader2 className="h-4 w-4 animate-spin me-2" />
+                        ) : (
+                          <Zap className="h-4 w-4 me-2" />
+                        )}
+                        {t('testConnection')}
+                      </Button>
+                    </div>
+
+                    {/* Test result (green/red inline box) */}
+                    {testResult && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 6 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className={`flex items-start gap-2 p-2.5 rounded-lg border text-[11px] leading-relaxed ${
+                          testResult.ok
+                            ? 'bg-emerald-50 dark:bg-emerald-900/10 border-emerald-200 dark:border-emerald-800/30 text-emerald-800 dark:text-emerald-200'
+                            : 'bg-red-50 dark:bg-red-900/10 border-red-200 dark:border-red-800/30 text-red-800 dark:text-red-200'
+                        }`}
+                        dir="auto"
+                      >
+                        {testResult.ok ? (
+                          <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0 text-emerald-600" />
+                        ) : (
+                          <XCircle className="h-4 w-4 mt-0.5 shrink-0 text-red-600" />
+                        )}
+                        <span className="whitespace-pre-line">{testResult.message}</span>
+                      </motion.div>
+                    )}
                   </>
                 )}
               </CardContent>
@@ -522,6 +695,15 @@ export function AdminPaymentEngine() {
                     <AlertTriangle className="h-4 w-4 text-amber-600 mt-0.5 shrink-0" />
                     <p className="text-[11px] text-amber-800 dark:text-amber-200">
                       {t('webhookWarning')}
+                    </p>
+                  </div>
+                </div>
+                {/* Optional webhook note — payments settle without it too */}
+                <div className="mt-2 p-2.5 rounded-lg bg-muted/30 border border-dashed">
+                  <div className="flex items-start gap-2">
+                    <Info className="h-4 w-4 text-muted-foreground mt-0.5 shrink-0" />
+                    <p className="text-[11px] text-muted-foreground">
+                      {t('webhookOptionalNote')}
                     </p>
                   </div>
                 </div>
