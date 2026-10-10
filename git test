@@ -2,3 +2,6 @@ bash /opt/blasti/scripts/deploy-digitalocean.sh server-update
 bash /opt/blasti/scripts/deploy-digitalocean.sh server-doctor
 
 NEXT_PUBLIC_API_URL=http://129.151.242.219 
+
+
+esms_test_e696e94773d30376412f5afd108bd14a
