@@ -56,6 +56,7 @@ import {
   ArrowLeft,
   ChevronRight,
   Folder,
+  FolderOpen,
   UserCircle,
   Image,
   ReceiptText,
@@ -132,6 +133,13 @@ interface MonthRow {
   bytes: number;
 }
 
+/** Group folder inside a system bucket (e.g. app-versions/desktop + /mobile). */
+interface GroupRow {
+  group: string;
+  files: number;
+  bytes: number;
+}
+
 interface StorageFileRow {
   name: string;
   storagePath: string;
@@ -142,7 +150,7 @@ interface StorageFileRow {
 }
 
 type BrowseData =
-  | { level: 1; bucket: string; years: YearRow[]; flatFiles: StorageFileRow[] }
+  | { level: 1; bucket: string; years: YearRow[]; groups: GroupRow[]; flatFiles: StorageFileRow[] }
   | { level: 2; bucket: string; yyyy: string; months: MonthRow[] }
   | { level: 3; bucket: string; yyyy: string; mm: string; files: StorageFileRow[] };
 
@@ -262,6 +270,12 @@ function normYear(v: unknown): YearRow | null {
   const r = asRecord(v);
   if (!r || typeof r.yyyy !== 'string') return null;
   return { yyyy: r.yyyy, folders: num(r.folders), files: num(r.files), bytes: num(r.bytes) };
+}
+
+function normGroup(v: unknown): GroupRow | null {
+  const r = asRecord(v);
+  if (!r || typeof r.group !== 'string') return null;
+  return { group: r.group, files: num(r.files), bytes: num(r.bytes) };
 }
 
 function normMonth(v: unknown): MonthRow | null {
@@ -774,11 +788,19 @@ export function AdminStorageManager() {
         if (Array.isArray(data.files)) next = { level: 3, bucket, yyyy, mm, files };
       } else if (yyyy) {
         const months = asArray(data.months).map(normMonth).filter((m): m is MonthRow => m !== null);
-        if (Array.isArray(data.months)) next = { level: 2, bucket, yyyy, months };
+        if (Array.isArray(data.months)) {
+          next = { level: 2, bucket, yyyy, months };
+        } else if (Array.isArray(data.files)) {
+          // Group folder (system bucket, e.g. app-versions/desktop): the API
+          // answers with a files listing directly (mm stays '').
+          const files = asArray(data.files).map(normFile).filter((f): f is StorageFileRow => f !== null);
+          next = { level: 3, bucket, yyyy, mm: '', files };
+        }
       } else {
         const years = asArray(data.years).map(normYear).filter((y): y is YearRow => y !== null);
+        const groups = asArray(data.groups).map(normGroup).filter((g): g is GroupRow => g !== null);
         const flatFiles = asArray(data.flatFiles).map(normFile).filter((f): f is StorageFileRow => f !== null);
-        if (Array.isArray(data.years)) next = { level: 1, bucket, years, flatFiles };
+        if (Array.isArray(data.years)) next = { level: 1, bucket, years, groups, flatFiles };
       }
       if (!next) {
         toast.error(t('storageLoadFailed'));
@@ -1070,11 +1092,11 @@ export function AdminStorageManager() {
       ) : null;
     }
 
-    // Level 1 — bucket: year rows + legacy flat files.
+    // Level 1 — bucket: group folders (installers) + year rows + legacy flat files.
     if (browse.level === 1) {
       return (
         <div className="space-y-4">
-          {browse.years.length === 0 && browse.flatFiles.length === 0 ? (
+          {browse.years.length === 0 && browse.groups.length === 0 && browse.flatFiles.length === 0 ? (
             <div className="text-center py-12 text-muted-foreground">
               <Folder className="h-10 w-10 mx-auto mb-3 opacity-40" />
               <p className="text-sm">{t('noData')}</p>
@@ -1102,6 +1124,36 @@ export function AdminStorageManager() {
                       <ChevronRight className={chevronCls} aria-hidden="true" />
                     </button>
                   ))}
+                </div>
+              )}
+              {browse.groups.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-[13px] font-medium flex items-center gap-2">
+                    <FolderOpen className="h-3.5 w-3.5 text-emerald-600" />
+                    {t('storageFolders')}
+                    <Badge variant="secondary" className="text-[10px]">{browse.groups.length}</Badge>
+                  </p>
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5">
+                    {browse.groups.map((g) => (
+                      <button
+                        key={g.group}
+                        type="button"
+                        onClick={() => openYear(g.group)}
+                        className="group flex items-center gap-3 p-3 rounded-xl border border-border text-start hover:border-emerald-300 dark:hover:border-emerald-700 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-all"
+                      >
+                        <div className="h-9 w-9 rounded-lg bg-emerald-100/60 dark:bg-emerald-900/20 group-hover:bg-emerald-100 dark:group-hover:bg-emerald-900/30 flex items-center justify-center shrink-0 transition-colors">
+                          <Folder className="h-4 w-4 text-emerald-600 dark:text-emerald-400 transition-colors" />
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="font-mono text-[13px] font-semibold">{g.group}</p>
+                          <p className="text-[11px] text-muted-foreground truncate">
+                            {t('storageFilesCount', { count: compactNumber(g.files) })} · {humanSize(g.bytes)}
+                          </p>
+                        </div>
+                        <ChevronRight className={chevronCls} aria-hidden="true" />
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
               {browse.flatFiles.length > 0 && (
@@ -1365,7 +1417,9 @@ export function AdminStorageManager() {
                       : browse?.level === 2
                         ? nav.yyyy
                         : browse?.level === 3
-                          ? `${nav.yyyy}/${nav.mm}`
+                          ? nav.mm
+                            ? `${nav.yyyy}/${nav.mm}`
+                            : nav.yyyy
                           : t(bucketLabelKey(nav.bucket))}
                   </span>
                   {loadingBrowse && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />}

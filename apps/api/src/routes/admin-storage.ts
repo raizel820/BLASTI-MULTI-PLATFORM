@@ -75,6 +75,12 @@ const SYSTEM_DIRS = new Set(['app-versions'])
 
 const YEAR_RE = /^\d{4}$/
 const MONTH_RE = /^(0[1-9]|1[0-2])$/
+/**
+ * Group folder inside a SYSTEM bucket (e.g. app-versions/desktop,
+ * app-versions/mobile — the installer split). Lowercase-first so it can never
+ * collide with the numeric YEAR_RE / MONTH_RE segments.
+ */
+const GROUP_NAME_RE = /^[a-z][a-z0-9-]{0,23}$/
 
 interface WalkedFile {
   rel: string // relative path from STORAGE_ROOT, POSIX separators
@@ -105,6 +111,30 @@ async function walkStorage(): Promise<{ files: WalkedFile[]; errors: number }> {
     }
     const months = level1.filter((e) => e.isDirectory() && YEAR_RE.test(e.name))
     const flatFiles = level1.filter((e) => e.isFile())
+    // Group folders (SYSTEM buckets only): bucket/<group>/<name>
+    // e.g. app-versions/desktop/BLASTI-Setup-0.3.4.exe (CI-uploaded installers).
+    const groups = SYSTEM_DIRS.has(bucket)
+      ? level1.filter((e) => e.isDirectory() && !YEAR_RE.test(e.name) && GROUP_NAME_RE.test(e.name))
+      : []
+    for (const groupDir of groups) {
+      const group = groupDir.name
+      const dir = path.join(bucketDir, group)
+      let names: fs.Dirent[]
+      try {
+        names = await fs.promises.readdir(dir, { withFileTypes: true })
+      } catch {
+        errors++
+        continue
+      }
+      for (const f of names.filter((e) => e.isFile())) {
+        try {
+          const st = await fs.promises.stat(path.join(dir, f.name))
+          files.push({ rel: `${bucket}/${group}/${f.name}`, bucket, yyyy: group, mm: '', name: f.name, size: st.size, mtimeMs: st.mtimeMs })
+        } catch {
+          errors++
+        }
+      }
+    }
     // Month-split files: bucket/<yyyy>/<mm>/<name>
     for (const yearDir of months) {
       const yyyy = yearDir.name
@@ -316,6 +346,7 @@ app.get('/browse', async (c) => {
     if (!yyyy) {
       const entries = await fs.promises.readdir(bucketDir, { withFileTypes: true })
       const years = [] as { yyyy: string; folders: number; files: number; bytes: number }[]
+      const groups = [] as { group: string; files: number; bytes: number }[]
       const flats = [] as { name: string; size: number; mtimeMs: number; storagePath: string; url: string | null; tracked: boolean }[]
       for (const e of entries.filter((x) => x.isDirectory() && YEAR_RE.test(x.name))) {
         const yyyyDir = path.join(bucketDir, e.name)
@@ -339,6 +370,24 @@ app.get('/browse', async (c) => {
         }
         years.push({ yyyy: e.name, folders: months.filter((x) => x.isDirectory() && MONTH_RE.test(x.name)).length, files, bytes })
       }
+      // Group folders (system buckets, e.g. app-versions/desktop + /mobile)
+      if (SYSTEM_DIRS.has(bucket)) {
+        for (const e of entries.filter((x) => x.isDirectory() && !YEAR_RE.test(x.name) && GROUP_NAME_RE.test(x.name))) {
+          let files = 0
+          let bytes = 0
+          try {
+            const fstats = await fs.promises.readdir(path.join(bucketDir, e.name), { withFileTypes: true })
+            for (const f of fstats.filter((x) => x.isFile())) {
+              try {
+                const st = await fs.promises.stat(path.join(bucketDir, e.name, f.name))
+                files++
+                bytes += st.size
+              } catch { /* raced */ }
+            }
+          } catch { /* raced */ }
+          groups.push({ group: e.name, files, bytes })
+        }
+      }
       const tracked = await loadTrackedMap()
       for (const e of entries.filter((x) => x.isFile())) {
         try {
@@ -347,10 +396,47 @@ app.get('/browse', async (c) => {
           flats.push({ name: e.name, size: st.size, mtimeMs: st.mtimeMs, storagePath: rel, url: publicFilePathForStoragePath(rel), tracked: tracked.has(rel) })
         } catch { /* raced */ }
       }
-      return c.json({ bucket, yyyy: null, years, flatFiles: flats })
+      return c.json({ bucket, yyyy: null, years, groups, flatFiles: flats })
     }
 
-    if (!YEAR_RE.test(yyyy)) return c.json({ success: false, error: 'Invalid year' }, 400)
+    // Group folders (system buckets): bucket/<group> — list its files
+    // directly (same response shape as a level-3 month listing, with mm='').
+    if (!YEAR_RE.test(yyyy)) {
+      if (!SYSTEM_DIRS.has(bucket) || !GROUP_NAME_RE.test(yyyy)) {
+        return c.json({ success: false, error: 'Invalid year' }, 400)
+      }
+      if (mm) return c.json({ success: false, error: 'Invalid month' }, 400)
+      const groupDir = path.join(bucketDir, yyyy)
+      if (!insideRoot(groupDir)) return c.json({ success: false, error: 'Invalid path' }, 400)
+      let entries: fs.Dirent[]
+      try {
+        entries = await fs.promises.readdir(groupDir, { withFileTypes: true })
+      } catch {
+        return c.json({ success: false, error: 'Folder not found' }, 404)
+      }
+      const tracked = await loadTrackedMap()
+      const files = []
+      for (const e of entries.filter((x) => x.isFile())) {
+        try {
+          const st = await fs.promises.stat(path.join(groupDir, e.name))
+          const rel = `${bucket}/${yyyy}/${e.name}`
+          files.push({
+            name: e.name,
+            size: st.size,
+            mtimeMs: st.mtimeMs,
+            storagePath: rel,
+            url: publicFilePathForStoragePath(rel),
+            tracked: tracked.has(rel),
+            dbId: null,
+            ownerId: null,
+            agencyId: null,
+            uploadedAt: null,
+          })
+        } catch { /* raced */ }
+      }
+      files.sort((a, b) => b.mtimeMs - a.mtimeMs)
+      return c.json({ bucket, yyyy, mm: '', files })
+    }
 
     // Level 2: list months of the year
     if (!mm) {
@@ -444,7 +530,8 @@ function resolveManagerPath(storagePath: string): string | null {
   const file = rest[rest.length - 1]
   if (!MANAGER_FILENAME_RE.test(file) || file.includes('..')) return null
   for (const seg of rest.slice(0, -1)) {
-    if (!YEAR_RE.test(seg) && !MONTH_RE.test(seg)) return null
+    // Year, month, or group segment (system buckets, e.g. app-versions/desktop)
+    if (!YEAR_RE.test(seg) && !MONTH_RE.test(seg) && !GROUP_NAME_RE.test(seg)) return null
   }
   const resolved = path.resolve(path.join(STORAGE_ROOT, ...parts))
   return insideRoot(resolved) ? resolved : null

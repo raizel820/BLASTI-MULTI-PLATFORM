@@ -3734,6 +3734,7 @@ const ar = {
   storageAllCategories: "جميع الفئات",
   storageYears: "السنوات",
   storageMonths: "الأشهر",
+  storageFolders: "مجلدات المثبّتات",
   storageFlatFiles: "ملفات قديمة بلا تصنيف",
   storageFileName: "اسم الملف",
   storageSize: "الحجم",

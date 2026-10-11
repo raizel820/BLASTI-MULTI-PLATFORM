@@ -198,8 +198,8 @@ export function AdminVpsStatus() {
       if (res.ok && json?.success) {
         toast.success(
           isRTL
-            ? 'بدأت إعادة البناء — سيتم سحب آخر إصدار وإعادة تشغيل الخدمات. تابع التقدم في نشاط النشر التلقائي.'
-            : 'Rebuild started — the pipeline pulls the latest commit and restarts the services. Track progress in the Auto-Deploy activity.'
+            ? 'بدأت إعادة البناء — server-update يسحب آخر إصدار ويعيد بناء الخدمات، ثم يُرفق تقرير server-doctor. تابع التقدم في نشاط النشر التلقائي.'
+            : 'Rebuild started — server-update pulls the latest commit and rebuilds the services, then a server-doctor report is appended. Track progress in the Auto-Deploy activity.'
         );
         // the served commit changes once the deploy finishes
         setTimeout(() => fetchStatus(true), 60_000);
@@ -477,8 +477,8 @@ export function AdminVpsStatus() {
             <Terminal className="h-3.5 w-3.5 text-muted-foreground shrink-0 mt-0.5" />
             <p className="text-[11px] text-muted-foreground">
               {isRTL
-                ? '"إعادة البناء" تشغّل نفس مسار المراقب التلقائي (سحب الإصدار الجديد + إعادة البناء + إعادة تشغيل الخدمات) مع قفل تحديث مشترك حتى لا يتعارض مع أي تحديث جارٍ.'
-                : '"Rebuild" runs the same pipeline as the auto-watcher (pull new commit + rebuild + restart services) and holds the shared update lock, so it never races a running update.'}
+                ? '«إعادة البناء» تشغّل server-update + server-doctor في وحدة systemd مستقلة (blasti-rebuild) — نفس ما يُشغّل عبر SSH يدوياً — مع قفل تحديث مشترك حتى لا يتعارض مع المراقب التلقائي. وعند نشر مثبّتات جديدة من CI يُشعَل نفس المسار تلقائياً (deploy-trigger).'
+                : '"Rebuild" runs server-update + server-doctor in a dedicated blasti-rebuild systemd unit — the same commands an admin runs over ssh — and holds the shared update lock, so it never races the auto-updater. When CI publishes new installers, the same pipeline is triggered automatically (deploy-trigger).'}
             </p>
           </div>
         </CardContent>
@@ -493,8 +493,8 @@ export function AdminVpsStatus() {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {isRTL
-                ? 'سيتم سحب أحدث إصدار من GitHub وإعادة بناء وإعادة تشغيل blasti-api و blasti-web (انقطاع ثوانٍ قليلة). إذا لم تُضف إصدارات جديدة سيتم فرض إعادة البناء الحالي.'
-                : 'The pipeline will pull the latest commit from GitHub, rebuild and restart blasti-api + blasti-web (a few seconds of downtime). If there are no new commits the current build is rebuilt anyway (forced).'}
+                ? 'يشغّل نفس ما يشغّله المشرف عبر SSH: ‏deploy-digitalocean.sh server-update (سحب الإصدار الجديد ← bun install ← db push ← بناء الويب ← إعادة تشغيل blasti-api و blasti-web و caddy) ثم تقرير server-doctor. يعمل في وحدة systemd مستقلة (blasti-rebuild) فلا تُوقفه إعادة تشغيل الـ API أثناء النشر.'
+                : 'Runs exactly what an admin runs over ssh: deploy-digitalocean.sh server-update (git pull → bun install → db push → web build → restart blasti-api + blasti-web + caddy) followed by a server-doctor health report. It runs in its own systemd unit (blasti-rebuild), so the mid-deploy API restart cannot kill it.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

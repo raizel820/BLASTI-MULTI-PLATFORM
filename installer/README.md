@@ -1,28 +1,62 @@
 # installer/
 
-Auto-generated installer artifacts. **Do not commit edits by hand** — the
-`Build Installers` GitHub Action refreshes this folder automatically.
+Installer staging folders for CI. **Binaries are NOT stored in git or on
+GitHub Releases** — git rejects files over 100 MB and the Windows installer
+is ~155 MB. Instead, the `Build Installers` GitHub Action uploads them
+**directly to the BLASTI VPS**, where they are served by the platform itself.
 
-| Folder | File | What it is |
+CI stages the freshly built binaries here inside the runner workspace
+(never committed), then the `publish-to-vps` job delivers them.
+
+## Where the installers end up on the VPS
+
+| Built file | VPS path (under `BLASTI_STORAGE_DIR`) | Platform channel |
 |---|---|---|
-| `desktop/` | `BLASTI-Setup-<version>.exe` | Windows NSIS installer (Electron desktop app, x64) |
-| `mobile/` | `BLASTI-v<version>-debug.apk` | Android **debug** APK (Capacitor, for testing — not Play-Store release) |
+| `desktop/BLASTI-Setup-<version>.exe` — Windows NSIS (Electron, x64) | `app-versions/desktop/<…>.exe` | `windows` |
+| `mobile/BLASTI-v<version>-debug.apk` — Android debug APK (Capacitor) | `app-versions/mobile/<…>.apk` | `android-debug` |
 
-## How files get here
+The split mirrors this folder layout 1:1 inside the API's storage root, so
+**Admin → Database and Storage Management → Storage Manager** shows them
+under the `app-versions` category → *Installer folders* (`desktop/`, `mobile/`).
 
-1. Every push to `master` (and every manual run from the **Actions** tab)
-   triggers the `Build Installers` workflow.
-2. `desktop-exe` job builds the Windows installer; `mobile-apk` job builds
-   the Android debug APK.
-3. A final `publish-installers` job replaces the previous files here and
-   commits them with `[skip ci]` (so it never re-triggers itself).
-4. Each file is also attached to the workflow run as a downloadable artifact
-   (`desktop-exe`, `mobile-apk`) — kept 30 days.
+## What the upload does
 
-## Download options
+1. CI runs `node scripts/publish-installer.mjs` per file — a multipart
+   `POST /api/app-versions/upload?create=1` authenticated with the shared
+   deploy token (`x-deploy-token` header).
+2. The API stores the binary, records its SHA-256, and creates/updates an
+   **AppVersion draft** (never auto-published).
+3. An admin opens **Admin → Public Apps Settings**, reviews the draft and
+   clicks **Activate** — that version becomes THE published installer for
+   its platform (public download section + app update checks follow).
 
-- **Latest:** grab the files directly from this folder on GitHub.
-- **Per run:** Actions → *Build Installers* → pick the run → **Artifacts**.
+## Required GitHub secrets
+
+Settings → Secrets and variables → Actions → Repository secrets:
+
+| Secret | Value |
+|---|---|
+| `BLASTI_API_URL` | Public site URL the VPS Caddy serves, e.g. `https://blasti.example.com` (no trailing slash needed) |
+| `BLASTI_DEPLOY_TOKEN` | The `DEPLOY_TOKEN` value from `/etc/blasti/blasti.env` on the VPS |
+
+If either secret is missing, the publish job **skips with a notice** and the
+built files remain available as run artifacts
+(Actions → *Build Installers* → run → **Artifacts**, 30 days).
+
+## Manual upload (local machine or VPS)
+
+```bash
+node scripts/publish-installer.mjs \
+  --file BLASTI-Setup-0.3.4.exe \
+  --platform windows \
+  --version 0.3.4 \
+  --api-url https://blasti.example.com \
+  --token "$DEPLOY_TOKEN" \
+  --notes "manual upload"
+```
+
+Platforms: `windows` / `electron` / `mac` / `linux` → `desktop/`,
+`android` / `android-debug` / `ios` → `mobile/`.
 
 ## Manual build (local machine or VPS)
 
@@ -34,11 +68,11 @@ bun run build:export
 cd apps/desktop
 node scripts/prebuild.js
 npx electron-builder --win
-cp dist/BLASTI-Setup-*.exe ../../installer/desktop/
+# → dist/BLASTI-Setup-<version>.exe
 
 # ── Mobile debug APK ──────────────────────────────────────────
 bun run --filter @blasti/mobile build:android:debug
-cp BLASTI-v*-debug.apk ../../installer/mobile/
+# → BLASTI-v<version>-debug.apk copied to the repo root
 ```
 
 > **Note:** builds are unsigned (no code-signing certificate configured), so

@@ -3735,6 +3735,7 @@ const fr: Record<TranslationKeys, string> = {
   storageAllCategories: "Toutes les catégories",
   storageYears: "Années",
   storageMonths: "Mois",
+  storageFolders: "Dossiers d'installation",
   storageFlatFiles: "Fichiers à plat (anciens)",
   storageFileName: "Nom du fichier",
   storageSize: "Taille",

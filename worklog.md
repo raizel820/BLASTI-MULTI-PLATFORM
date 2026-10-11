@@ -3812,3 +3812,46 @@ Stage Summary:
 - Next CI run will pass the mobile job: chmod step runs BEFORE gradle regardless of the repo's exec bit; gradle.js self-heal is second net; committed git mode is the permanent fix.
 - User sync path: port this commit (or minimally the updated build-installers.yml + gradle.js) to GitHub and re-run the workflow. Fastest independent one-liner on their machine: git update-index --chmod=+x apps/mobile/android/gradlew && git commit -m "fix: gradlew exec bit" && git push.
 - Desktop job log not provided; if it also failed, upload job-1 log. On both passing, publish-installers auto-commits BLASTI-Setup-0.3.4.exe + BLASTI-v1.0.0-debug.apk into installer/.
+
+---
+Task ID: ci-releases-not-git — main agent
+Agent: Z.ai Code (main)
+Task: User pasted publish-job failure — push rejected: installer/desktop/BLASTI-Setup-0.3.4.exe is 155.10 MB, exceeds GitHub's 100 MB git file limit (GH001, pre-receive hook declined).
+
+Work Log:
+- GOOD NEWS IN THE LOG: partial-publish worked exactly as designed — desktop job green, publish job committed c5d22b9 with the exe. Only the push was rejected; remote master is CLEAN (pre-receive rejected atomically, nothing stuck anywhere).
+- SECOND (SILENT) BUG FOUND: .gitignore line 107 is *.apk — the APK was never committable; git add installer/ silently skips it. So "mobile missing from installer/" may not even have been a build failure (job-2 log still needed if red).
+- ARCHITECTURE FIX: binaries out of git entirely → GitHub Releases.
+  publish-installers now: conditional artifact downloads → rolling release `installers` (gh release delete --cleanup-tag || true, then gh release create with the built files as assets; 2 GiB/asset limit; stable URLs https://github.com/<repo>/releases/download/installers/<file>) → writes installer/{desktop,mobile}/LATEST.txt (file/size/sha256/download URL/built-from run) → rm binaries from workspace → commits ONLY metadata with [skip ci].
+- DEFENSE IN DEPTH: .gitignore += installer/**/*.exe (*.apk already covered by line 107) so no future edit can accidentally stage a binary; workflow rm step is the second net.
+- installer/README.md REWRITTEN: points at the releases page + direct download URLs, explains LATEST.txt + sha256 verification, per-run artifacts, manual build commands. .gitkeep files remain.
+- VALIDATED: YAML safe_load ✓, publish job step list ✓, bash -n on embedded script blocks ✓. Committed.
+
+Stage Summary:
+- Desktop .exe 155MB can NEVER live in git — Releases is the only sane home; LFS rejected mentally (1GB free quota < single installer, dies after ~6 runs).
+- From next CI run: binaries always land on the installers release (partial-publish preserved); installer/ shows fresh LATEST.txt with checksums.
+- User must sync this workflow + .gitignore + README to GitHub and re-run. If mobile job is red again, upload job-2 log (unknown whether it failed on gradle or actually built and was gitignore-dropped).
+
+---
+Task ID: ci-deploy-trigger
+Agent: Z.ai Code (main)
+Task: (1) Make the CI installers push trigger an immediate VPS rebuild instead of relying on the periodic blasti-watcher.timer; (2) fix the manual Rebuild button in Platform Settings (user fallback: bash /opt/blasti/scripts/deploy-digitalocean.sh server-update + server-doctor over ssh).
+
+Work Log:
+- Root-caused the broken manual rebuild button: POST /api/system/rebuild spawned scripts/watch-and-deploy.sh (watch --on-server --once) from the blasti-api service — two failure modes: (a) the systemd unit has NO HOME env, and watch-and-deploy.sh reads $HOME under `set -u` (state_dir) → instant "HOME: unbound variable" death; (b) even when it ran, a detached child stays in blasti-api.service's cgroup, so `systemctl restart blasti-api` mid-deploy kills the pipeline.
+- Rewrote the rebuild pipeline in apps/api/src/routes/system-status.ts: shared startServerUpdate() runs EXACTLY what the operator runs over ssh — `deploy-digitalocean.sh server-update` followed by `server-doctor` — chained in a bash -c inner script that tees everything to <STORAGE_ROOT>/logs/deploy-<ts>.log and preserves server-update's exit code.
+- Launch via `systemd-run --collect --unit=blasti-rebuild --setenv=HOME=/root --setenv=PATH=...` (transient unit = own cgroup → survives the mid-deploy blasti-api restart); automatic fallback to a detached spawn (with a note in the log) when systemd-run is unavailable; spawn 'error' handler added.
+- Guards: flock probe on /run/lock/blasti-update.lock (updateLockHeld) for accurate 409 "already_running" on /rebuild; 30s debounce for CI triggers; fixed unit name blasti-rebuild makes concurrent systemd-run attempts fail cleanly.
+- Added POST /api/system/deploy-trigger (x-deploy-token auth, same DEPLOY_TOKEN as uploads/heartbeats): CI calls it right after publishing installers; soft-skip responses (deploy_in_progress / recent_trigger) always HTTP 200 so CI never fails on a busy VPS; every attempt recorded as a 'deploy-trigger' event for the Auto-Deploy activity feed.
+- POST /api/system/rebuild now uses the same pipeline (admin-panel button = server-update + server-doctor in the blasti-rebuild unit); force kept for UI compat (server-update always rebuilds), dryRun writes the would-be command list to the log.
+- .github/workflows/build-installers.yml: upload step now emits `uploaded` output (id: upload, if-statements instead of `&&` lists); new "Trigger the VPS rebuild (server-update)" step (if: always() && uploaded=='true') POSTs {source:"github-actions", commit, reason} to /api/system/deploy-trigger with structured step-summary handling for started/already-running/401/unreachable; header comments updated (watcher = fallback only).
+- Fixed watch-and-deploy.sh state_dir(): ${BLASTI_WATCH_STATE_DIR:-${HOME:-/root}/.blasti-watch} — no more set -u crash when spawned without HOME (periodic-watcher robustness).
+- Updated admin-vps-status.tsx texts (EN/AR): confirm dialog + hint now describe server-update + server-doctor in the blasti-rebuild unit and the automatic CI deploy-trigger.
+- Verified live in the sandbox (API restarted on :3003 with DEPLOY_TOKEN): 401 no/wrong token; 400 invalid source; 200 started:true → systemd-run ENOENT → fallback spawn → log file shows server-update FAIL (require_root, expected off-VPS) + full server-doctor report + "exit code: 1"; immediate re-trigger → 200 started:false recent_trigger; deploy-trigger event persisted to SystemSetting deploy.events (verified via Prisma).
+- Validations: tsc --noEmit clean for system-status.ts and admin-vps-status.tsx; bun run lint OK; workflow YAML parses; generated inner bash script passes bash -n; flock probe exit codes verified (0 free / 1 held); deploy-digitalocean.sh + watch-and-deploy.sh bash -n OK; CI JSON payload shape validated.
+
+Stage Summary:
+- Installers push now triggers an immediate VPS rebuild: GitHub Actions → POST /api/system/deploy-trigger (DEPLOY_TOKEN) → blasti-rebuild transient systemd unit runs deploy-digitalocean.sh server-update + server-doctor; periodic watcher stays armed as fallback only.
+- Manual Rebuild button fixed: same ssh-equivalent pipeline, immune to the missing-HOME crash and the cgroup-kill on mid-deploy API restart; correct "already_running" feedback via the shared update lock; logs under <STORAGE_ROOT>/logs/deploy-*.log and journalctl -u blasti-rebuild.
+- Sandbox note: the dev API on :3003 is now started with DEPLOY_TOKEN=blasti-test-token-123 (dev-only) so deploy-trigger/heartbeat paths are exercisable in previews.
+- Deployment note for the user: after the next server-update picks this commit up, the new endpoints + CI trigger go live; no new repo secrets needed (reuses BLASTI_API_URL + BLASTI_DEPLOY_TOKEN).

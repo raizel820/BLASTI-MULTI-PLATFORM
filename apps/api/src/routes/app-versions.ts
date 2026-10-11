@@ -71,18 +71,37 @@ const updateAppVersionSchema = z.object({
 const UPLOAD_DIR = path.join(STORAGE_ROOT, 'app-versions')
 const LEGACY_UPLOAD_DIR = path.join(os.tmpdir(), 'blasti-app-uploads')
 
+// Group folders inside the app-versions bucket — mirrors the repo's
+// installer/<desktop|mobile> layout, so the admin Storage Manager shows the
+// same desktop/ + mobile/ split under the app-versions category.
+const PLATFORM_GROUP: Record<string, 'desktop' | 'mobile'> = {
+  windows: 'desktop',
+  electron: 'desktop',
+  mac: 'desktop',
+  linux: 'desktop',
+  android: 'mobile',
+  'android-debug': 'mobile',
+  ios: 'mobile',
+}
+
 function ensureUploadDir() {
   if (!fs.existsSync(UPLOAD_DIR)) {
     fs.mkdirSync(UPLOAD_DIR, { recursive: true })
   }
 }
 
-/** Resolve a stored binary: organized dir first, legacy tmpdir second. */
+/**
+ * Resolve a stored binary. `storageKey` may be grouped ("desktop/<name>",
+ * current layout) or flat ("<name>", binaries uploaded before grouping).
+ * Legacy tmpdir is checked last so pre-Round-15 binaries keep downloading.
+ */
 function resolveBinaryPath(storageKey: string): string | null {
-  const organized = path.resolve(UPLOAD_DIR, storageKey)
-  if (organized.startsWith(path.resolve(UPLOAD_DIR) + path.sep) && fs.existsSync(organized)) return organized
-  const legacy = path.resolve(LEGACY_UPLOAD_DIR, storageKey)
-  if (legacy.startsWith(path.resolve(LEGACY_UPLOAD_DIR) + path.sep) && fs.existsSync(legacy)) return legacy
+  const root = path.resolve(UPLOAD_DIR)
+  const organized = path.resolve(root, storageKey)
+  if (organized.startsWith(root + path.sep) && fs.existsSync(organized)) return organized
+  const legacyRoot = path.resolve(LEGACY_UPLOAD_DIR)
+  const legacy = path.resolve(legacyRoot, storageKey)
+  if (legacy.startsWith(legacyRoot + path.sep) && fs.existsSync(legacy)) return legacy
   return null
 }
 
@@ -259,11 +278,14 @@ app.post('/upload', async (c) => {
       return c.json({ success: false, error: 'Version must be semver (e.g. 1.2.3)' }, 400)
     }
 
-    // Save file to temp directory
-    const safeName = `${platform}-${version}-${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`
+    // Save into the bucket's group folder (app-versions/desktop|mobile/<file>)
+    // — the Storage Manager renders these groups like the repo installer/ split.
+    const group = PLATFORM_GROUP[platform] ?? 'desktop'
+    const safeName = `${group}/${platform}-${version}-${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`
     const filePath = path.join(UPLOAD_DIR, safeName)
 
     const buffer = Buffer.from(await file.arrayBuffer())
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
     fs.writeFileSync(filePath, buffer)
 
     // Calculate file hash for integrity

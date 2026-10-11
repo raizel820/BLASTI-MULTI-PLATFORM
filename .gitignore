@@ -109,3 +109,7 @@ apps/desktop/prisma/generated/
 
 # Runtime file storage (dev default: apps/api/uploads — VPS sets BLASTI_STORAGE_DIR)
 apps/api/uploads/
+
+# CI installers: binaries ship via GitHub Releases (git rejects > 100 MB).
+# installer/ carries only LATEST.txt metadata.
+installer/**/*.exe
