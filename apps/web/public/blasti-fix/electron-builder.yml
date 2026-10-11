@@ -1,0 +1,108 @@
+appId: com.blasti.desktop
+productName: BLASTI
+copyright: Copyright © 2025 BLASTI
+
+directories:
+  output: dist
+  buildResources: assets
+
+# ─── Files to Package ───────────────────────────────────────────────────────
+# Main process files, web app output, and local database.
+# node_modules production deps are auto-included by electron-builder.
+# NOTE: the runtime (schema migrations, sync registry) must be fully
+# self-contained — production desktop must not depend on the monorepo
+# packages/ tree, Prisma CLI, Bun or system Node (spec §27).
+files:
+  - main.js
+  - preload.js
+  - package.json
+  - build-stamp.json
+  - local-api/**/*
+  - loading-screen.js
+  - out/**/*
+  - data/**/*
+  # Prisma query engine + generated client are picked up from
+  # node_modules automatically; the schema itself ships below via
+  # extraResources for diagnostics/reference (migrations are embedded
+  # in local-api/lib/schema-init-sql.js and need no CLI at runtime).
+
+# ─── ASAR Configuration ─────────────────────────────────────────────────────
+asar: true
+asarUnpack:
+  - out/**/*
+  - data/**/*
+
+npmRebuild: true
+
+# Task 55: copy @prisma/client + the generated .prisma/client (schema +
+# platform query engine) from bun's isolated store into resources/node_modules
+# after packing — electron-builder cannot follow bun's store layout itself.
+afterPack: scripts/after-pack.js
+
+# ─── Extra Resources (outside asar) ────────────────────────────────────────
+extraResources:
+  - from: assets
+    to: assets
+    filter:
+      - "**/*"
+  - from: data
+    to: data
+    filter:
+      - "*.db"
+
+# ─── Icon Configuration ───
+# electron-builder auto-converts icon.png (1024x1024) to platform-specific formats.
+# If icon.icns (mac) or icon.ico (win) exist, they take priority.
+mac:
+  category: public.app-category.business
+  target:
+    - target: dmg
+      arch:
+        - universal
+  icon: assets/icon.png
+  hardenedRuntime: true
+  gatekeeperAssess: false
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: assets/icon.png
+  artifactName: "${productName}-Setup-${version}.${ext}"
+  # Required for native modules like better-sqlite3
+  # npmRebuild in root config handles native module rebuild
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+  # NOTE: installerIcon/uninstallerIcon/installerHeaderIcon overrides REMOVED.
+  # electron-builder now derives them from win.icon (assets/icon.png) and its
+  # built-in header BMP. Forcing a 512x512 PNG into installerHeaderIcon made
+  # NSIS abort with: Error in macro MUI_UNPAGE_INIT / MUI_UNPAGE_WELCOME /
+  # !include: error in script: assistedInstaller.nsh (MUI2 header expects a
+  # small BMP, not a large PNG).
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: BLASTI
+  # Allow the installed app to be run immediately after installation
+  allowElevation: true
+
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+  category: Office
+  icon: assets/icon.png
+  maintainer: BLASTI Team
+  vendor: BLASTI
+
+publish:
+  provider: generic
+  url: https://releases.blasti.app/desktop

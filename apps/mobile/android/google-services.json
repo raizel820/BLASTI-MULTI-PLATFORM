@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "525851302866",
+    "project_id": "blasti-1190a",
+    "storage_bucket": "blasti-1190a.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:525851302866:android:7fa0bd216571afaa1e460b",
+        "android_client_info": {
+          "package_name": "com.blasti.mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBKQZSW2IF_uR3j_ypWRH-C_cotvSUnq6c"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

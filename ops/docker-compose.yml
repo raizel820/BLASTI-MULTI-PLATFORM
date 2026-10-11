@@ -1,0 +1,112 @@
+# ════════════════════════════════════════════════════════════════
+# BLASTI — PRODUCTION STACK (OVHcloud VPS)
+# ════════════════════════════════════════════════════════════════
+# Run from the ops/ folder:
+#     cp .env.example .env      # once — then EDIT .env!
+#     docker compose up -d --build
+#
+# Services
+#   db      → PostgreSQL 16 (all data lives in the `pgdata` volume)
+#   migrate → one-shot: creates/updates tables + seeds ONLY if empty
+#   api     → BLASTI API (Bun, port 3003, internal)
+#   web     → BLASTI web app (Next.js, port 3000, internal)
+#   caddy   → the only public port (80/443): HTTPS + routing
+#
+# Nothing except Caddy is reachable from the internet.
+# ════════════════════════════════════════════════════════════════
+name: blasti
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-blasti}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in ops/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-blasti}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-blasti} -d ${POSTGRES_DB:-blasti}']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # One-shot job: schema push + idempotent bootstrap seed.
+  # SAFE on every start — it never wipes data (seed-if-empty skips when
+  # users already exist). Run a full wipe deliberately instead:
+  #   docker compose run --rm migrate sh -c "cd packages/db && bun run db:seed"
+  migrate:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    restart: 'no'
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-blasti}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-blasti}?schema=public
+    command: ['sh', '-c', 'cd packages/db && bun run db:push && bun run db:seed-if-empty']
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-blasti}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-blasti}?schema=public
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?Set NEXTAUTH_SECRET in ops/.env}
+      INTERNAL_SECRET: ${INTERNAL_SECRET:-}
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}
+      API_PORT: '3003'
+      HOST: 0.0.0.0
+      CRON_SECRET: ${CRON_SECRET:-}
+    volumes:
+      - uploads:/app/apps/api/uploads
+    expose:
+      - '3003'
+
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+      args:
+        # Empty → same-origin relative API calls (single domain behind Caddy).
+        NEXT_PUBLIC_API_URL: ''
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      NODE_ENV: production
+      INTERNAL_API_URL: http://api:3003
+    expose:
+      - '3000'
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?Set SITE_ADDRESS in ops/.env (domain or :80)}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+
+volumes:
+  pgdata:
+  uploads:
+  caddy_data:
+  caddy_config:

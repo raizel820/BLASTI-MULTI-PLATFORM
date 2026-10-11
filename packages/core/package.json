@@ -1,0 +1,21 @@
+{
+  "name": "@blasti/core",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/sync-serializer.ts",
+  "types": "src/sync-serializer.ts",
+  "exports": {
+    "./sync-registry": {
+      "default": "./src/sync-registry.ts"
+    },
+    "./sync-serializer": {
+      "default": "./src/sync-serializer.ts"
+    },
+    "./sync-registry.json": {
+      "default": "./sync-registry.json"
+    }
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,702 @@
+/**
+ * Zod validation schemas for API write endpoints.
+ *
+ * Every POST/PUT/PATCH/DELETE endpoint should validate its input
+ * against these schemas before processing.
+ */
+import { z } from 'zod'
+
+/**
+ * Task 5 — Algeria address selectors. Official two-digit ANI wilaya codes
+ * '01'-'58'. Only the canonical padded form passes; route handlers normalize
+ * client values with padStart(2,'0') before persisting.
+ *
+ * Task 2-c — CORRECTED the class: the old pattern (0[1-9]|[1-5][0-8]) had a
+ * latent typo ([0-8] excludes 9) that silently rejected the REAL wilaya
+ * codes 19 (Sétif), 29 (El M'Ghair), 39 (El Meniaa), 49 (Timimoun) — the
+ * exact "wilaya must be a two-digit wilaya code (01-58)" failure users hit
+ * when geocoding auto-filled Sétif. The corrected form covers exactly
+ * 01-09, 10-49 and 50-58 and still rejects 00, 59+ and non-canonical
+ * values.
+ */
+export const wilayaCodeRegex = /^(0[1-9]|[1-4][0-9]|5[0-8])$/
+
+/**
+ * Task 2-c — tolerant wilaya-code canonicalization (fixes "wilaya must be a
+ * two-digit wilaya code" 400s on geocode-filled values). Maps Arabic-Indic
+ * digits ٠١٢٣٤٥٦٧٨٩ (U+0660-0669) AND Eastern Arabic-Indic ۰۱۲۳۴۵۶۷۸۹
+ * (U+06F0-06F9) to ASCII, strips non-digits, and pads a 1-2 digit value to
+ * the canonical two-digit form. Anything else (3+ digits, letters, "019")
+ * is returned unchanged so the schema regex still rejects it — e.g. a
+ * 5-digit postal code must NOT be mistaken for a wilaya code.
+ */
+export function canonicalWilayaCode(input: unknown): string {
+  const raw = String(input ?? '')
+    .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06F0));
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length >= 1 && digits.length <= 2) return digits.padStart(2, '0');
+  return raw;
+}
+
+/** Task 2-c — tolerant wilaya field: string OR number in, canonical
+ * two-digit code out (regex still rejects non-canonical garbage). The
+ * transformed value is what handlers receive via validateBody. */
+const wilayaField = z
+  .union([z.string(), z.number()])
+  .transform(canonicalWilayaCode)
+  .refine((v) => wilayaCodeRegex.test(v), 'wilaya must be a two-digit wilaya code (01-58)');
+
+// ─── Auth ────────────────────────────────────────────────────────────────────
+
+export const loginSchema = z.object({
+  username: z.string().min(1, 'Username is required'),
+  password: z.string().min(1, 'Password is required'),
+  expectedRole: z.enum(['CUSTOMER', 'AGENCY_OWNER', 'AGENCY_STAFF', 'SUPER_ADMIN']).optional(),
+  // Task 81 — remember-me sessions: a checked box shortens the token/cookie
+  // lifetime to 3 days AND lets the client keep it alive with
+  // POST /auth/refresh while the customer actively uses the app.
+  rememberMe: z.boolean().optional(),
+})
+
+export const registerSchema = z.object({
+  username: z.string().min(3, 'Username must be at least 3 characters').max(30),
+  fullName: z.string().min(1, 'Full name is required').max(100),
+  password: z.string().min(6, 'Password must be at least 6 characters').max(128),
+  // Task 22: email + phone are REQUIRED and both verified via OTP at signup
+  email: z.string().email('A valid email address is required'),
+  phoneNumber: z
+    .string()
+    .min(1, 'Phone number is required')
+    .refine(
+      (v) => /^(\+213|00213)?0?[5-7]\d{8}$/.test(v.replace(/[\s\-\.]/g, '')),
+      'Enter a valid Algerian phone number (e.g. 0555123456)',
+    ),
+  // Task 31: SUPER_ADMIN accepted so programmatic/admin-console registrations can
+  // create platform admins; they skip email/phone verification entirely (auth.ts).
+  role: z.enum(['CUSTOMER', 'AGENCY_OWNER', 'SUPER_ADMIN']).optional().default('CUSTOMER'),
+  agencyCode: z.string().optional(),
+  avatarUrl: z.string().url().optional().or(z.literal('')),
+  // Task 5 — optional Algeria address (register form location selectors).
+  // wilaya = two-digit official code, commune = baladiya Latin name.
+  // Task 2-c — tolerant pipeline (string|number → canonical two-digit code).
+  wilaya: wilayaField.optional(),
+  commune: z.string().min(1).max(120).optional(),
+})
+
+export const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Current password is required'),
+  newPassword: z.string().min(6, 'New password must be at least 6 characters').max(128),
+})
+
+export const forgotPasswordSchema = z.object({
+  username: z.string().min(1, 'Username is required'),
+})
+
+export const resetPasswordSchema = z.object({
+  token: z.string().min(1, 'Reset token is required'),
+  newPassword: z.string().min(6, 'New password must be at least 6 characters').max(128),
+})
+
+// ─── User Profile ────────────────────────────────────────────────────────────
+
+export const updateProfileSchema = z.object({
+  fullName: z.string().min(1).max(100).optional(),
+  // Email is editable by the account owner; '' clears it (nullable column).
+  email: z.string().email().max(255).optional().or(z.literal('')),
+  phoneNumber: z.string().optional(),
+  language: z.enum(['en', 'ar', 'fr']).optional(),
+  avatarUrl: z.string().url().optional().or(z.literal('')),
+  notificationPreferences: z.record(z.string(), z.boolean()).optional(),
+  reminderMinutes: z.number().int().min(1).max(1440).optional(),
+  smsNotificationsEnabled: z.boolean().optional(),
+  notificationPref: z.enum(['APP_ONLY', 'SMS', 'WHATSAPP', 'BOTH']).optional(),
+})
+
+export const updatePreferencesSchema = z.object({
+  language: z.enum(['en', 'ar', 'fr']).optional(),
+  notificationsEnabled: z.boolean().optional(),
+  smsNotificationsEnabled: z.boolean().optional(),
+  emailNotificationsEnabled: z.boolean().optional(),
+})
+
+// ─── Reservations ────────────────────────────────────────────────────────────
+
+export const createReservationSchema = z.object({
+  agencyId: z.string().min(1, 'Agency ID is required'),
+  serviceId: z.string().optional(),
+  preferredTime: z.string().optional(),
+  reservedDate: z.string().optional(),
+  fixedTimeEnabled: z.boolean().optional(),
+  userId: z.string().optional(),
+})
+
+export const updateReservationStatusSchema = z.object({
+  status: z.enum(['WAITING', 'CALLED', 'SERVING', 'COMPLETED', 'CANCELLED', 'NO_SHOW']),
+})
+
+export const postponeReservationSchema = z.object({
+  reason: z.string().optional(),
+})
+
+export const rateReservationSchema = z.object({
+  rating: z.number().int().min(1).max(5),
+  comment: z.string().max(500).optional(),
+})
+
+// ─── Agency ──────────────────────────────────────────────────────────────────
+
+/** Round 15 — shared working-days CSV validation (0=Sunday … 6=Saturday). */
+export const workingDaysRegex = /^([0-6])(,[0-6])*$/
+
+export const updateAgencyProfileSchema = z.object({
+  // Task 42: null-tolerant profile saves. The webapp spreads the GET response
+  // straight back into the PATCH body — nullable columns (String? in Prisma)
+  // legitimately carry `null` ("not set by the user yet" / "clear this field"),
+  // and `z.string().optional()` REJECTS null with a 400. Every nullable column
+  // now accepts null; the three NOT-NULL-with-default schedule fields accept
+  // null in the schema but the handler strips it (they must never write null).
+  name: z.string().min(1).max(100).optional(),
+  nameAr: z.string().nullable().optional(),
+  nameFr: z.string().nullable().optional(),
+  description: z.string().max(500).nullable().optional(),
+  descriptionAr: z.string().max(500).nullable().optional(),
+  descriptionFr: z.string().max(500).nullable().optional(),
+  address: z.string().max(200).nullable().optional(),
+  phone: z.string().max(20).nullable().optional(),
+  category: z.string().optional(),
+  website: z.string().url().optional().or(z.literal('')).nullable().optional(),
+  // Task 31 (bug 13): nullable so desktop-synced profile saves that carry
+  // explicit nulls ("clear this field") no longer fail validation with a 400 —
+  // the outbox replay classifies 400s as permanent_failed and never retries.
+  logoUrl: z.string().max(2048).nullable().optional(),
+  coverUrl: z.string().max(2048).nullable().optional(),
+  workingHoursStart: z.string().nullable().optional(),
+  workingHoursEnd: z.string().nullable().optional(),
+  /// CSV of weekday numbers 0=Sunday…6=Saturday, e.g. "0,1,2,3,4"
+  workingDays: z.string().regex(workingDaysRegex, 'workingDays must be a comma-separated list of weekday numbers 0-6').nullable().optional(),
+  // Task 5 — Algeria address selectors (agency profile). Nullable to follow
+  // the established null-tolerant spread-the-GET-response pattern; wilaya is
+  // the two-digit official code, city is the commune (baladiya) Latin name.
+  // Task 2-c — tolerant pipeline (string|number → canonical two-digit code);
+  // null/undefined short-circuit BEFORE the transform, so optionality and
+  // "explicit null clears the field" semantics are unchanged.
+  wilaya: wilayaField.nullable().optional(),
+  city: z.string().min(1).max(120).nullable().optional(),
+  // Task 51 — Agency Location & Maps (spec §2): canonical provider-independent
+  // location fields. Nullable so "spread the GET response back" saves can
+  // clear them; lat/lng range violations 400 at validation time, and the
+  // handlers enforce pair semantics + locationUpdatedAt stamping via
+  // buildAgencyLocationPatch (lib/map-settings.ts).
+  latitude: z.number().min(-90, 'latitude must be between -90 and 90').max(90, 'latitude must be between -90 and 90').nullable().optional(),
+  longitude: z.number().min(-180, 'longitude must be between -180 and 180').max(180, 'longitude must be between -180 and 180').nullable().optional(),
+  postalCode: z.string().max(20).nullable().optional(),
+  locationVerified: z.enum(['VERIFIED', 'UNVERIFIED', 'MANUAL']).nullable().optional(),
+  locationSource: z.enum(['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']).nullable().optional(),
+})
+
+export const updateAgencySettingsSchema = z.object({
+  // Task 37: maxReservations is the PRIMARY capacity key (what GET /settings
+  // returns and what the UI PATCHes back). maxQueueSize is kept as a legacy
+  // alias for older clients. The route resolves:
+  //   maxQueueSize = data.maxQueueSize ?? data.maxReservations
+  maxQueueSize: z.number().int().min(1).max(1000).optional(),
+  maxReservations: z.number().int().min(1).max(1000).optional(),
+  avgServiceTime: z.number().int().min(1).max(480).optional(),
+  sponsorSms: z.boolean().optional(),
+  smsBalance: z.number().int().min(0).optional(),
+})
+
+export const createServiceSchema = z.object({
+  name: z.string().min(1, 'Service name is required').max(100),
+  nameAr: z.string().optional(),
+  nameFr: z.string().optional(),
+  description: z.string().max(300).optional(),
+  isActive: z.boolean().optional().default(true),
+})
+
+export const updateServiceSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  nameAr: z.string().optional(),
+  nameFr: z.string().optional(),
+  description: z.string().max(300).optional(),
+  isActive: z.boolean().optional(),
+})
+
+// ─── Staff ───────────────────────────────────────────────────────────────────
+
+export const createStaffSchema = z.object({
+  username: z.string().min(3).max(30),
+  fullName: z.string().min(1).max(100),
+  password: z.string().min(6).max(128),
+  phoneNumber: z.string().optional(),
+  role: z.enum(['STAFF', 'MANAGER']).optional().default('STAFF'),
+  // Task 31 (bug 8): staff must be associated with a branch of the same agency.
+  branchId: z.string().min(1).optional(),
+})
+
+export const updateStaffSchema = z.object({
+  fullName: z.string().min(1).max(100).optional(),
+  phoneNumber: z.string().optional(),
+  role: z.enum(['STAFF', 'MANAGER']).optional(),
+  isActive: z.boolean().optional(),
+  // Task 31 (bug 8): allow reassigning a staff member to another branch.
+  branchId: z.string().min(1).nullable().optional(),
+})
+
+// ─── Admin ───────────────────────────────────────────────────────────────────
+
+export const adminUserActionSchema = z.object({
+  userId: z.string().min(1, 'User ID is required'),
+  action: z.enum(['suspend', 'activate', 'delete']),
+})
+
+export const adminResetPasswordSchema = z.object({
+  newPassword: z.string().min(6, 'Password must be at least 6 characters').max(128),
+})
+
+export const adminCreateAgencySchema = z.object({
+  name: z.string().min(1).max(100),
+  nameAr: z.string().optional(),
+  nameFr: z.string().optional(),
+  description: z.string().max(500).optional(),
+  address: z.string().max(200).optional(),
+  phone: z.string().max(20).optional(),
+  email: z.string().optional(),
+  category: z.string().default('OTHER'),
+  ownerId: z.string().optional(), // Optional: derived from session for non-SUPER_ADMIN
+  customCode: z.string().min(2).max(10).optional(),
+  workingHoursStart: z.string().optional(),
+  workingHoursEnd: z.string().optional(),
+  /// Round 15 — CSV of weekday numbers 0=Sunday…6=Saturday (default Mon–Fri).
+  workingDays: z.string().regex(workingDaysRegex, 'workingDays must be a comma-separated list of weekday numbers 0-6').optional(),
+  /// Round 15 — services created together with the agency (atomic onboarding).
+  services: z.array(z.object({
+    name: z.string().min(1).max(100),
+    nameAr: z.string().max(100).optional(),
+    nameFr: z.string().max(100).optional(),
+    description: z.string().max(500).optional(),
+    /// Single uppercase letter A–Z (auto-assigned when omitted).
+    prefix: z.string().regex(/^[A-Z]$/, 'prefix must be a single uppercase letter A-Z').optional(),
+  })).max(20).optional(),
+  // Task 5 — Algeria address selectors (create-agency wizard address step).
+  // wilaya = two-digit official code, city = commune (baladiya) Latin name.
+  // Both optional — when omitted the Agency row keeps its DB defaults.
+  // Task 2-c — tolerant pipeline (string|number → canonical two-digit code).
+  wilaya: wilayaField.optional(),
+  city: z.string().min(1).max(120).optional(),
+  // Task 51 — Agency Location & Maps (spec §27/§28): optional location picked
+  // on the create-agency map. Range violations 400 at validation time; the
+  // routes enforce pair semantics (lat/lng together) and stamp
+  // locationUpdatedAt when a valid pair lands.
+  latitude: z.number().min(-90, 'latitude must be between -90 and 90').max(90, 'latitude must be between -90 and 90').nullable().optional(),
+  longitude: z.number().min(-180, 'longitude must be between -180 and 180').max(180, 'longitude must be between -180 and 180').nullable().optional(),
+  postalCode: z.string().max(20).nullable().optional(),
+  locationVerified: z.enum(['VERIFIED', 'UNVERIFIED', 'MANUAL']).nullable().optional(),
+  locationSource: z.enum(['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']).nullable().optional(),
+})
+
+export const adminUpdateAgencySchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  nameAr: z.string().optional(),
+  nameFr: z.string().optional(),
+  description: z.string().max(500).optional(),
+  address: z.string().max(200).optional(),
+  phone: z.string().max(20).optional(),
+  category: z.string().optional(),
+  isActive: z.boolean().optional(),
+  ownerId: z.string().optional(),
+  customCode: z.string().min(2).max(10).optional(),
+})
+
+// ─── SMS Settings ────────────────────────────────────────────────────────────
+
+export const smsSettingsSchema = z.object({
+  provider: z.enum(['winsms', 'notifsend', 'algeria_sms', 'green_send', 'mtarget', 'twilio', 'vonage', 'generic']).optional(),
+  apiUrl: z.string().url().optional().or(z.literal('')),
+  apiKey: z.string().optional(),
+  senderName: z.string().max(11).optional(),
+  enabled: z.boolean().optional(),
+  templateTurnApproaching: z.string().max(500).optional(),
+  templateYourTurn: z.string().max(500).optional(),
+  templateNoShow: z.string().max(500).optional(),
+  templateCustom: z.string().max(500).optional(),
+})
+
+// ─── Payment Settings ────────────────────────────────────────────────────────
+
+export const paymentSettingsSchema = z.object({
+  ccpEnabled: z.boolean().optional(),
+  bankEnabled: z.boolean().optional(),
+  electronicEnabled: z.boolean().optional(),
+  ccpAccount: z.string().max(30).optional(),
+  ccpKey: z.string().max(10).optional(),
+  bankName: z.string().max(100).optional(),
+  bankAccount: z.string().max(30).optional(),
+  bankRib: z.string().max(30).optional(),
+  ewalletNumber: z.string().max(30).optional(),
+})
+
+// ─── Notifications ───────────────────────────────────────────────────────────
+
+export const markReadSchema = z.object({
+  notificationIds: z.array(z.string()).min(1).optional(),
+})
+
+// ─── Reviews ─────────────────────────────────────────────────────────────────
+
+export const createReviewSchema = z.object({
+  rating: z.number().int().min(1).max(5),
+  comment: z.string().max(500).optional(),
+})
+
+export const replyToReviewSchema = z.object({
+  reply: z.string().min(1, 'Reply is required').max(500),
+})
+
+// ─── FAQ ─────────────────────────────────────────────────────────────────────
+
+export const faqSchema = z.object({
+  question: z.string().min(1, 'Question is required').max(300),
+  answer: z.string().min(1, 'Answer is required').max(1000),
+  questionAr: z.string().optional(),
+  answerAr: z.string().optional(),
+  questionFr: z.string().optional(),
+  answerFr: z.string().optional(),
+  category: z.string().optional(),
+  isActive: z.boolean().optional().default(true),
+  order: z.number().int().min(0).optional(),
+})
+
+// ─── Branch ──────────────────────────────────────────────────────────────────
+
+// Task 83 — shared branch location fields (mirrors the Agency Task 51
+// contract: lat/lng pair validated by the route, city/wilaya/postalCode
+// free-form, value enums for the provenance badges).
+const branchLocationCreateSchema = {
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  city: z.string().max(100).optional(),
+  wilaya: z.string().max(10).optional(),
+  postalCode: z.string().max(20).optional(),
+  locationVerified: z.enum(['VERIFIED', 'UNVERIFIED', 'MANUAL']).optional(),
+  locationSource: z.enum(['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']).optional(),
+}
+
+const branchLocationUpdateSchema = {
+  latitude: z.number().min(-90).max(90).nullable().optional(),
+  longitude: z.number().min(-180).max(180).nullable().optional(),
+  city: z.string().max(100).nullable().optional(),
+  wilaya: z.string().max(10).nullable().optional(),
+  postalCode: z.string().max(20).nullable().optional(),
+  locationVerified: z.enum(['VERIFIED', 'UNVERIFIED', 'MANUAL']).nullable().optional(),
+  locationSource: z.enum(['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']).nullable().optional(),
+}
+
+export const createBranchSchema = z.object({
+  name: z.string().min(1, 'Branch name is required').max(100),
+  nameAr: z.string().optional(),
+  nameFr: z.string().optional(),
+  /// Task 83 — customer-facing display name ("Downtown Branch", "Mall Kiosk"…)
+  specialName: z.string().max(100).optional(),
+  address: z.string().max(200).optional(),
+  phone: z.string().max(20).optional(),
+  isMain: z.boolean().optional().default(false),
+  // Task 83 — a branch MUST carry its location at creation (user requirement:
+  // "each branch has to input its locations when creating").
+  ...branchLocationCreateSchema,
+})
+
+export const updateBranchSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  nameAr: z.string().optional(),
+  nameFr: z.string().optional(),
+  specialName: z.string().max(100).nullable().optional(),
+  address: z.string().max(200).optional(),
+  phone: z.string().max(20).optional(),
+  isActive: z.boolean().optional(),
+  isMain: z.boolean().optional(),
+  ...branchLocationUpdateSchema,
+})
+
+// ─── Counter ─────────────────────────────────────────────────────────────────
+
+export const createCounterSchema = z.object({
+  number: z.number().int().min(1),
+  name: z.string().min(1, 'Counter name is required').max(50),
+  nameAr: z.string().optional(),
+  nameFr: z.string().optional(),
+})
+
+export const updateCounterSchema = z.object({
+  name: z.string().min(1).max(50).optional(),
+  nameAr: z.string().optional(),
+  nameFr: z.string().optional(),
+  isActive: z.boolean().optional(),
+  staffId: z.string().nullable().optional(),
+})
+
+// ─── Kiosk ──────────────────────────────────────────────────────────────────
+
+export const kioskJoinSchema = z.object({
+  agencyId: z.string().min(1, 'Agency ID is required'),
+  serviceId: z.string().min(1, 'Service ID is required'),
+  customerName: z.string().max(100).optional(),
+})
+
+// ─── Announcements ───────────────────────────────────────────────────────────
+
+export const createAnnouncementSchema = z.object({
+  agencyId: z.string().min(1, 'Agency ID is required'),
+  message: z.string().min(1, 'Message is required').max(500),
+  type: z.enum(['INFO', 'WARNING', 'URGENT']).optional().default('INFO'),
+  expiresAt: z.string().optional(), // ISO date string
+})
+
+// ─── Subscription ────────────────────────────────────────────────────────────
+
+export const subscriptionPaySchema = z.object({
+  // Phase 2: Plan name is validated against the DB (SubscriptionPlan.name) —
+  // any non-empty string is accepted here so admin-managed dynamic plan names
+  // (FREE / BASIC / PREMIUM / PRO / custom) all work without schema churn.
+  plan: z.string().min(1, 'Plan is required'),
+  method: z.enum(['CCP', 'BANK', 'BANK_TRANSFER', 'ELECTRONIC'], {
+    message: 'Payment method must be CCP, BANK, BANK_TRANSFER, or ELECTRONIC',
+  }),
+  receiptUrl: z.string().max(500).optional(),
+  // Billing period (in months). 1 = monthly (default), 3 = quarterly,
+  // 6 = semi-annual, 12 = annual, 24 = biennial. The plan's discount fields
+  // are looked up by period to compute the discounted total.
+  period: z.number().int().refine(
+    (v) => [1, 3, 6, 12, 24].includes(v),
+    { message: 'period must be one of 1, 3, 6, 12, 24' },
+  ).optional(),
+})
+
+export const subscriptionUnsubscribeSchema = z.object({
+  agencyId: z.string().optional(),
+})
+
+// ─── Working Hours ───────────────────────────────────────────────────────────
+
+const timeFormatRegex = /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/
+
+export const updateWorkingHoursSchema = z.object({
+  agencyId: z.string().min(1, 'Agency ID is required'),
+  workingHoursStart: z.string().regex(timeFormatRegex, 'Invalid time format. Use HH:MM').optional(),
+  workingHoursEnd: z.string().regex(timeFormatRegex, 'Invalid time format. Use HH:MM').optional(),
+  /// Round 15 — CSV of weekday numbers 0=Sunday…6=Saturday.
+  workingDays: z.string().regex(workingDaysRegex, 'workingDays must be a comma-separated list of weekday numbers 0-6').optional(),
+})
+
+// ─── Device Registration ────────────────────────────────────────────────────
+
+export const deviceRegistrationSchema = z.object({
+  platform: z.enum(['web', 'electron', 'android', 'ios'], {
+    message: 'Invalid platform. Must be one of: web, electron, android, ios',
+  }),
+  deviceId: z.string().min(1, 'Device ID is required').max(200),
+  deviceToken: z.string().max(500).optional(),
+  appVersion: z.string().max(50).optional(),
+  deviceFingerprint: z.string().max(200).optional(),
+})
+
+// ─── Subscription Plan (Admin) ──────────────────────────────────────────────
+
+export const createSubscriptionPlanSchema = z.object({
+  name: z.string().min(1, 'Plan name is required').max(50),
+  displayName: z.string().min(1, 'Display name is required').max(100),
+  displayNameAr: z.string().max(100).optional(),
+  displayNameFr: z.string().max(100).optional(),
+  description: z.string().max(500).optional(),
+  descriptionAr: z.string().max(500).optional(),
+  descriptionFr: z.string().max(500).optional(),
+  price: z.number().int().min(0).default(0),
+  currency: z.string().max(10).optional().default('DZD'),
+  billingCycle: z.enum(['MONTHLY', 'YEARLY', 'ONE_TIME']).optional().default('MONTHLY'),
+  maxServices: z.number().int().min(1).default(5),
+  maxBranches: z.number().int().min(1).default(1),
+  maxStaff: z.number().int().min(1).default(3),
+  maxActiveReservations: z.number().int().min(1).default(50),
+  maxSmsPerMonth: z.number().int().min(0).default(50),
+  kioskModeEnabled: z.boolean().optional().default(false),
+  analyticsEnabled: z.boolean().optional().default(false),
+  priorityListing: z.boolean().optional().default(false),
+  customBranding: z.boolean().optional().default(false),
+  apiAccess: z.boolean().optional().default(false),
+  isActive: z.boolean().optional().default(true),
+  sortOrder: z.number().int().min(0).optional().default(0),
+  quarterlyDiscount: z.number().int().min(0).max(100).optional(),
+  semiAnnualDiscount: z.number().int().min(0).max(100).optional(),
+  annualDiscount: z.number().int().min(0).max(100).optional(),
+  biennialDiscount: z.number().int().min(0).max(100).optional(),
+})
+
+export const updateSubscriptionPlanSchema = z.object({
+  name: z.string().min(1).max(50).optional(),
+  displayName: z.string().min(1).max(100).optional(),
+  displayNameAr: z.string().max(100).optional(),
+  displayNameFr: z.string().max(100).optional(),
+  description: z.string().max(500).optional(),
+  descriptionAr: z.string().max(500).optional(),
+  descriptionFr: z.string().max(500).optional(),
+  price: z.number().int().min(0).optional(),
+  currency: z.string().max(10).optional(),
+  billingCycle: z.enum(['MONTHLY', 'YEARLY', 'ONE_TIME']).optional(),
+  maxServices: z.number().int().min(1).optional(),
+  maxBranches: z.number().int().min(1).optional(),
+  maxStaff: z.number().int().min(1).optional(),
+  maxActiveReservations: z.number().int().min(1).optional(),
+  maxSmsPerMonth: z.number().int().min(0).optional(),
+  kioskModeEnabled: z.boolean().optional(),
+  analyticsEnabled: z.boolean().optional(),
+  priorityListing: z.boolean().optional(),
+  customBranding: z.boolean().optional(),
+  apiAccess: z.boolean().optional(),
+  isActive: z.boolean().optional(),
+  sortOrder: z.number().int().min(0).optional(),
+  quarterlyDiscount: z.number().int().min(0).max(100).optional(),
+  semiAnnualDiscount: z.number().int().min(0).max(100).optional(),
+  annualDiscount: z.number().int().min(0).max(100).optional(),
+  biennialDiscount: z.number().int().min(0).max(100).optional(),
+})
+
+// ─── Hardware Ordering (Agency) ─────────────────────────────────────────────
+
+export const createHardwareOrderSchema = z.object({
+  items: z.array(
+    z.object({
+      productId: z.string().min(1, 'Product ID is required'),
+      quantity: z.number().int().min(1, 'Quantity must be at least 1'),
+    }),
+  ).min(1, 'At least one item is required'),
+  paymentModel: z.enum(['UPFRONT', 'MONTHLY'], {
+    message: 'Payment model must be UPFRONT or MONTHLY',
+  }),
+  commitmentMonths: z.number().int().refine(
+    (v) => [12, 24, 36, 48, 60].includes(v),
+    { message: 'commitmentMonths must be one of 12, 24, 36, 48, 60' },
+  ).optional(),
+}).superRefine((data, ctx) => {
+  if (data.paymentModel === 'MONTHLY' && !data.commitmentMonths) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['commitmentMonths'],
+      message: 'commitmentMonths is required when paymentModel is MONTHLY',
+    })
+  }
+})
+
+// ─── Enterprise Contract Requests (Agency) ──────────────────────────────────
+
+export const createEnterpriseRequestSchema = z.object({
+  message: z.string().min(1, 'Message is required').max(2000),
+  contactEmail: z.string().email('Valid contact email is required'),
+  contactPhone: z.string().max(30).optional(),
+  branchesNeeded: z.number().int().min(1).max(1000).optional().default(1),
+  countersNeeded: z.number().int().min(1).max(1000).optional().default(1),
+  hardwareNeeded: z.boolean().optional().default(true),
+  requestedFeatures: z.array(z.string().max(100)).max(50).optional().default([]),
+})
+
+// ─── Admin Hardware ─────────────────────────────────────────────────────────
+
+export const createHardwareProductSchema = z.object({
+  name: z.string().min(1, 'Product name is required').max(100),
+  nameAr: z.string().max(100).optional(),
+  nameFr: z.string().max(100).optional(),
+  description: z.string().max(500).optional(),
+  descriptionAr: z.string().max(500).optional(),
+  descriptionFr: z.string().max(500).optional(),
+  category: z.string().min(1, 'Category is required').max(50),
+  basePrice: z.number().int().min(0, 'Base price must be >= 0'),
+  isActive: z.boolean().optional().default(true),
+  sortOrder: z.number().int().min(0).optional().default(0),
+})
+
+export const updateHardwareProductSchema = z.object({
+  name: z.string().min(1).max(100).optional(),
+  nameAr: z.string().max(100).optional(),
+  nameFr: z.string().max(100).optional(),
+  description: z.string().max(500).optional(),
+  descriptionAr: z.string().max(500).optional(),
+  descriptionFr: z.string().max(500).optional(),
+  category: z.string().min(1).max(50).optional(),
+  basePrice: z.number().int().min(0).optional(),
+  isActive: z.boolean().optional(),
+  sortOrder: z.number().int().min(0).optional(),
+})
+
+export const updateHardwareSettingsSchema = z.object({
+  hardwareEnabled: z.boolean().optional(),
+  upfrontDiscount: z.number().int().min(0).max(100).optional(),
+})
+
+export const updateHardwareCommitmentTierSchema = z.object({
+  extraPercentage: z.number().int().min(0).max(500).optional(),
+  isActive: z.boolean().optional(),
+})
+
+// ─── Admin Enterprise Requests ──────────────────────────────────────────────
+
+export const updateEnterpriseRequestStatusSchema = z.object({
+  status: z.enum(['APPROVED', 'REJECTED', 'REVIEWING'], {
+    message: 'Status must be APPROVED, REJECTED, or REVIEWING',
+  }),
+  adminNotes: z.string().max(2000).optional(),
+})
+
+export const createEnterprisePlanFromRequestSchema = z.object({
+  name: z.string().min(1, 'Plan name is required').max(50),
+  displayName: z.string().min(1, 'Display name is required').max(100),
+  displayNameAr: z.string().max(100).optional(),
+  displayNameFr: z.string().max(100).optional(),
+  description: z.string().max(500).optional(),
+  descriptionAr: z.string().max(500).optional(),
+  descriptionFr: z.string().max(500).optional(),
+  price: z.number().int().min(0).default(0),
+  currency: z.string().max(10).optional().default('DZD'),
+  billingCycle: z.enum(['MONTHLY', 'YEARLY', 'ONE_TIME']).optional().default('MONTHLY'),
+  maxServices: z.number().int().min(1).default(5),
+  maxBranches: z.number().int().min(1).default(1),
+  maxStaff: z.number().int().min(1).default(3),
+  maxActiveReservations: z.number().int().min(1).default(50),
+  maxSmsPerMonth: z.number().int().min(0).default(50),
+  kioskModeEnabled: z.boolean().optional().default(false),
+  analyticsEnabled: z.boolean().optional().default(false),
+  priorityListing: z.boolean().optional().default(false),
+  customBranding: z.boolean().optional().default(false),
+  apiAccess: z.boolean().optional().default(false),
+  isActive: z.boolean().optional().default(true),
+  sortOrder: z.number().int().min(0).optional().default(0),
+})
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Validates request body against a Zod schema.
+ * Returns parsed data or a 400 error object (Hono-compatible).
+ */
+export function validateBody<T extends z.ZodType>(
+  schema: T,
+  body: unknown
+): { data: z.infer<T>; error: null } | { data: null; error: { success: false; error: string; details: Array<{ field: string; message: string }>; status: 400 } } {
+  const result = schema.safeParse(body)
+  if (result.success) {
+    return { data: result.data as z.infer<T>, error: null }
+  }
+  const zodErr = result.error
+  const firstError = zodErr.issues[0]
+  return {
+    data: null,
+    error: {
+      success: false,
+      error: firstError?.message || 'Validation error',
+      details: zodErr.issues.map((e: z.ZodIssue) => ({
+        field: e.path.join('.'),
+        message: e.message,
+      })),
+      status: 400,
+    },
+  }
+}

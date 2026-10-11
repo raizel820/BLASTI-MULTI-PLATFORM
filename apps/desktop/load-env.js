@@ -1,0 +1,190 @@
+/**
+ * BLASTI Desktop — .env loader (zero dependencies)
+ *
+ * WHY THIS EXISTS
+ * Electron does NOT read .env files, and OS environment variables set on the
+ * BUILD machine do not travel into the packaged installer. Until now the only
+ * way to configure the cloud URL was to export BLASTI_CLOUD_URL in the shell
+ * at RUNTIME — yet .env.example documented a ".env" workflow that silently
+ * did nothing ("copy to .env and build" → the app still pointed at
+ * localhost:3003). This loader makes that documented workflow real.
+ *
+ * WHAT IT LOADS (in order — first file that sets a var wins)
+ *   1. <resources>\.env   packaged app only. Lives OUTSIDE app.asar, so it can
+ *                         be edited AFTER installation (e.g.
+ *                         %LOCALAPPDATA%\Programs\BLASTI\resources\.env on
+ *                         Windows) to repoint the app without rebuilding.
+ *   2. <app dir>\.env     development: apps/desktop/.env. Packaged: the copy
+ *                         baked into app.asar at build time (same file the
+ *                         developer had when running electron-builder).
+ *   3. <project root>\.env development only (apps/desktop/../../.env — TWO
+ *                         levels up). BLASTI_* KEYS ONLY. The monorepo root
+ *                         .env already exists for the web/api stack, so
+ *                         developers naturally put BLASTI_CLOUD_URL there —
+ *                         reading it makes that intuition work. Restricting
+ *                         it to the BLASTI_* namespace keeps cloud-only
+ *                         secrets (DATABASE_URL, POSTGRES_PASSWORD,
+ *                         NEXTAUTH_SECRET…) out of the desktop process.
+ *
+ * PRECEDENCE RULES
+ *   - OS environment variables ALWAYS win: fill-only-unset, dotenv-style.
+ *   - Therefore: OS env  >  resources\.env  >  apps/desktop .env  >
+ *     project root .env (BLASTI_* only, dev)  >  built-in defaults.
+ *
+ * PARSER NOTES (kept deliberately simple and predictable)
+ *   - UTF-8 BOM stripped; both LF and CRLF line endings accepted (Windows).
+ *   - Full-line  #  comments and blank lines ignored.
+ *   - Optional  export  prefix accepted.
+ *   - One pair of surrounding quotes stripped ("…" or '…'); backslashes are
+ *     NEVER processed so Windows paths like "C:\Users\me" stay literal.
+ *   - Inline comments are NOT stripped (a # inside a value stays part of it).
+ *   - Values are never logged — this file may hold secrets (NEXTAUTH_SECRET).
+ *
+ * Usage (main.js, before ANY code reads BLASTI_* variables):
+ *   const { loadDesktopEnv } = require('./load-env');
+ *   loadDesktopEnv({ isPackaged: app.isPackaged });
+ */
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+/** Parse .env text into a plain object. Pure function — exported for tests. */
+function parseEnvFile(text) {
+  const vars = {};
+  if (!text) return vars;
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); // strip UTF-8 BOM
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    let body = line;
+    if (body.startsWith('export ') || body.startsWith('export\t')) {
+      body = body.slice(6).trim();
+    }
+    const eq = body.indexOf('=');
+    if (eq <= 0) continue; // no '=' or empty key → skip silently
+    const key = body.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    let value = body.slice(eq + 1).trim();
+    if (value.length >= 2) {
+      const first = value[0];
+      const last = value[value.length - 1];
+      if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+        value = value.slice(1, -1);
+      }
+    }
+    vars[key] = value;
+  }
+  return vars;
+}
+
+/** Read + parse an env file; null when missing/unreadable/not a regular file. */
+function readEnvVars(filePath) {
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const st = fs.statSync(filePath);
+    if (!st.isFile() || st.size > 1024 * 1024) return null; // sanity cap: 1 MB
+    return parseEnvFile(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null; // unreadable .env must never crash startup
+  }
+}
+
+/**
+ * Normalize BLASTI_* URL variables in process.env.
+ *
+ * The cloud URL must be the BARE ORIGIN ("http://203.0.113.10" or
+ * "https://blasti.example.com") — every consumer appends "/api/..." itself.
+ * A common misconfiguration is pasting the full API base ("…/api"), which
+ * produces "/api/api/health" probes → 404 → "cloud unreachable" → the
+ * startup gate blocks the workspace. We self-heal the two known offenders
+ * (BLASTI_CLOUD_URL + legacy BLASTI_API_URL) and say so loudly.
+ */
+function normalizeCloudUrls() {
+  let fixed = 0;
+  for (const key of ['BLASTI_CLOUD_URL', 'BLASTI_API_URL']) {
+    const value = process.env[key];
+    if (typeof value === 'string' && /\/api\/?$/.test(value)) {
+      const stripped = value.replace(/\/+$/, '').replace(/\/api$/i, '');
+      console.warn(
+        `[BLASTI Desktop] ${key} ends with "/api" — that would double the path ` +
+        `(probing /api/api/health → 404). Auto-corrected to the bare origin:`
+      );
+      console.warn(`[BLASTI Desktop]   was:  ${value}`);
+      console.warn(`[BLASTI Desktop]   now:  ${stripped}   (fix the .env file anyway)`);
+      process.env[key] = stripped;
+      fixed++;
+    }
+    // also trim a stray trailing slash (harmless but noisy)
+    const v2 = process.env[key];
+    if (typeof v2 === 'string' && v2.length > 1 && v2.endsWith('/')) {
+      process.env[key] = v2.replace(/\/+$/, '');
+    }
+  }
+  return fixed;
+}
+
+/**
+ * Fill process.env from the .env candidates. Existing (non-empty) OS
+ * environment variables are never overwritten.
+ * @param {{ isPackaged?: boolean, verbose?: boolean }} [opts]
+ * @returns {{ loaded: Array<{file: string, why: string, total: number, filled: string[]}>, applied: number }}
+ */
+function loadDesktopEnv(opts) {
+  const isPackaged = !!(opts && opts.isPackaged);
+  const verbose = opts ? opts.verbose !== false : true;
+
+  const candidates = [];
+  if (isPackaged && process.resourcesPath) {
+    candidates.push({
+      file: path.join(process.resourcesPath, '.env'),
+      why: 'installed resources (editable after install)',
+      filter: null,
+    });
+  }
+  candidates.push({ file: path.join(__dirname, '.env'), why: 'app directory', filter: null });
+  if (!isPackaged) {
+    // Dev convenience: the monorepo root .env (shared with web/api) is read
+    // too, but ONLY its BLASTI_* keys — see the header note for why.
+    // NOTE: __dirname is apps/desktop, so the project root is TWO levels up.
+    candidates.push({
+      file: path.join(__dirname, '..', '..', '.env'),
+      why: 'project root (BLASTI_* keys only, dev)',
+      filter: (key) => key.startsWith('BLASTI_'),
+    });
+  }
+
+  const loaded = [];
+  let applied = 0;
+
+  for (const { file, why, filter } of candidates) {
+    const vars = readEnvVars(file);
+    if (!vars) continue;
+    const keys = Object.keys(vars).filter((k) => (filter ? filter(k) : true));
+    const filled = [];
+    for (const k of keys) {
+      if (process.env[k] === undefined || process.env[k] === '') {
+        process.env[k] = vars[k];
+        filled.push(k);
+        applied++;
+      }
+    }
+    loaded.push({ file, why, total: keys.length, filled });
+    if (verbose) {
+      console.log(
+        `[BLASTI Desktop] .env (${why}): ${file} — ${keys.length} var(s) in scope, ${filled.length} applied [${filled.join(', ') || '-'}]`
+      );
+    }
+  }
+
+  if (verbose && loaded.length === 0) {
+    console.log('[BLASTI Desktop] no .env found — using OS environment + built-in defaults');
+  }
+
+  normalizeCloudUrls();
+
+  return { loaded, applied };
+}
+
+module.exports = { parseEnvFile, readEnvVars, loadDesktopEnv };

@@ -1,0 +1,30 @@
+{
+  "//": "TEMPLATE ONLY — DO NOT BUILD WITH THIS FILE. Rename to google-services.json AFTER filling in the real values from the Firebase console. See apps/mobile/docs/firebase-push-setup.md",
+  "project_info": {
+    "project_number": "000000000000",
+    "project_id": "REPLACE_WITH_YOUR_PROJECT_ID",
+    "storage_bucket": "REPLACE_WITH_YOUR_PROJECT_ID.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:000000000000:android:REPLACE_WITH_REAL_APP_ID",
+        "android_client_info": {
+          "package_name": "com.blasti.mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "REPLACE_WITH_REAL_API_KEY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

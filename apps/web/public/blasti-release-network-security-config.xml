@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  BLASTI Mobile — Network Security Config (RELEASE)
+
+  This file lives at src/release/res/xml/network_security_config.xml and is
+  automatically picked up only by release builds (Gradle overlays src/release/
+  on top of src/main/ when building the release variant). It overrides the
+  permissive debug config at src/main/res/xml/network_security_config.xml.
+
+  Task 70 (phone audit): release builds previously forbade ALL cleartext
+  traffic — correct once the server serves HTTPS, but today the production
+  VPS is plain HTTP behind Caddy on port 80 (no domain/TLS yet), so every
+  release APK failed with net::ERR_CLEARTEXT_NOT_PERMITTED while the debug
+  APK (permissive main config) worked. allowMixedContent in
+  capacitor.config.ts CANNOT grant this — cleartext is enforced by the
+  network stack, not the WebView.
+
+  Current policy:
+    - HTTPS everywhere by default, system CAs only (unchanged).
+    - ONE narrow, temporary exception: the known cloud VPS IP is allowed to
+      serve cleartext HTTP until a domain + TLS are provisioned. Remove this
+      <domain-config> block as soon as https:// is live on the server
+      (see DEPLOY-GUIDE.md Part 8, --domain mode).
+    - The debug variant remains fully permissive (separate file).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- TEMPORARY until the VPS serves HTTPS: allow the cloud server IP. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">129.151.242.219</domain>
+    </domain-config>
+</network-security-config>

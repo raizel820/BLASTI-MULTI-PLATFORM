@@ -1,0 +1,50 @@
+# ──────────────────────────────────────────────────────
+# Docker build context — what NEVER goes into an image
+# ──────────────────────────────────────────────────────
+
+# Dependencies (installed inside the image)
+**/node_modules
+
+# Version control & sandbox artifacts
+.git
+.gitignore
+tool-results
+agent-ctx
+upload
+download
+skills
+examples
+mini-services
+
+# Build outputs (recreated inside the image)
+**/.next
+**/out
+**/dist
+apps/desktop/build-stamp.json
+
+# Runtime data — the PostgreSQL database is a container volume now
+packages/db/data
+apps/api/uploads
+apps/web/public/uploads
+
+# Local env files with real secrets (ops/.env is used by compose, not builds).
+# NOTE: apps/web/.env.production is excluded ON PURPOSE — it carries the
+# Android-emulator API URL for LOCAL mobile builds and must never leak into
+# the server image (the web container builds with NEXT_PUBLIC_API_URL="").
+.env
+.env.local
+.env.*.local
+apps/api/.env
+apps/web/.env.production
+apps/web/.env.production.local
+ops/.env
+
+# Logs & caches
+*.log
+.schema-stamp
+packages/db/.schema-stamp
+.DS_Store
+
+# Native app projects (not needed for server images)
+apps/mobile/android
+apps/desktop/assets

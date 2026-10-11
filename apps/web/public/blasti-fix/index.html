@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BLASTI Desktop Fixes — Downloads</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    background: #0f172a; color: #e2e8f0; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 14px; max-width: 720px; width: 100%; padding: 28px; }
+  h1 { font-size: 20px; margin-bottom: 4px; color: #f8fafc; }
+  .sub { color: #94a3b8; font-size: 14px; margin-bottom: 20px; }
+  .badge { display: inline-block; background: #16a34a; color: #fff; font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; margin-bottom: 14px; }
+  .main-dl {
+    display: block; background: #16a34a; color: #fff; text-decoration: none; text-align: center;
+    font-size: 16px; font-weight: 700; padding: 14px 18px; border-radius: 10px; margin-bottom: 8px;
+  }
+  .main-dl:hover { background: #15803d; }
+  .hint { font-size: 13px; color: #94a3b8; margin-bottom: 22px; line-height: 1.6; }
+  code { background: #0f172a; border: 1px solid #334155; border-radius: 5px; padding: 2px 6px; font-size: 12.5px; color: #fbbf24; }
+  h2 { font-size: 14px; color: #cbd5e1; text-transform: uppercase; letter-spacing: 0.06em; margin: 18px 0 10px; }
+  ul.files { list-style: none; }
+  ul.files li { border-top: 1px solid #334155; }
+  ul.files a { display: flex; justify-content: space-between; gap: 12px; padding: 10px 2px; color: #e2e8f0; text-decoration: none; font-size: 14px; }
+  ul.files a:hover { color: #4ade80; }
+  .size { color: #64748b; font-size: 12.5px; white-space: nowrap; }
+  ol.steps { margin: 10px 0 0 18px; color: #cbd5e1; font-size: 14px; line-height: 2; }
+</style>
+</head>
+<body>
+  <main class="card">
+    <h1>BLASTI Desktop Fixes</h1>
+    <div class="sub">One-click patcher for the Windows desktop app (stuck loading screen fix)</div>
+    <span class="badge">Latest: v0.3.4</span>
+
+    <a class="main-dl" href="BLASTI-fix-0.3.4.ps1" download>⬇ Download BLASTI-fix-0.3.4.ps1 (947 KB)</a>
+    <p class="hint">
+      This is the only file you need. It is a <strong>PowerShell script</strong> — the extension is
+      <code>.ps1</code> (P, S, then the number <strong>one</strong> — not &ldquo;psi&rdquo;).
+      It applies every fix automatically: main.js, loading-screen.js, local API, Prisma pack hook, builder config,
+      and bumps the version to 0.3.4.
+    </p>
+
+    <h2>How to use</h2>
+    <ol class="steps">
+      <li>Download the file above into your <strong>BLASTI-MULTI root folder</strong> (the one containing <code>apps</code>, <code>packages</code>, <code>package.json</code>).</li>
+      <li>Open PowerShell in that folder.</li>
+      <li>Run: <code>powershell -ExecutionPolicy Bypass -File .\BLASTI-fix-0.3.4.ps1</code></li>
+      <li>Rebuild: <code>bun run build:desktop</code></li>
+      <li>Start <code>apps\desktop\dist\win-unpacked\BLASTI.exe</code></li>
+    </ol>
+
+    <h2>Individual files (fallback, manual copy)</h2>
+    <ul class="files">
+      <li><a href="main.js" download>main.js <span class="size">92 KB → apps\desktop\main.js</span></a></li>
+      <li><a href="loading-screen.js" download>loading-screen.js <span class="size">168 KB → apps\desktop\loading-screen.js</span></a></li>
+      <li><a href="local-api-index.js" download>local-api-index.js <span class="size">448 KB → apps\desktop\local-api\index.js</span></a></li>
+      <li><a href="after-pack.js" download>after-pack.js <span class="size">6 KB → apps\desktop\scripts\after-pack.js</span></a></li>
+      <li><a href="electron-builder.yml" download>electron-builder.yml <span class="size">4 KB → apps\desktop\electron-builder.yml</span></a></li>
+      <li><a href="gradle.js" download>gradle.js <span class="size">11 KB → scripts\gradle.js (Android APK build)</span></a></li>
+    </ul>
+
+    <h2>Older patchers</h2>
+    <ul class="files">
+      <li><a href="BLASTI-fix-0.3.3.ps1" download>BLASTI-fix-0.3.3.ps1 <span class="size">943 KB (superseded)</span></a></li>
+      <li><a href="BLASTI-fix-0.3.2.ps1" download>BLASTI-fix-0.3.2.ps1 <span class="size">130 KB (superseded)</span></a></li>
+    </ul>
+  </main>
+</body>
+</html>

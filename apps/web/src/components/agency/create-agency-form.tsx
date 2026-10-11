@@ -1,0 +1,1651 @@
+'use client'
+import { apiFetch } from '@/lib/api-fetch';
+import { healSessionFromCookie, applyHealedSession, isElectronSessionContext } from '@/lib/session-heal';
+
+import { useState, useRef, useEffect, useMemo } from 'react';
+import { useAppStore } from '@/store/use-app-store';
+import { useLanguage } from '@/hooks/use-language';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Textarea } from '@/components/ui/textarea';
+import {
+  Building2,
+  ArrowRight,
+  ArrowLeft,
+  Loader2,
+  CheckCircle2,
+  Check,
+  MapPin,
+  Phone,
+  Globe,
+  Hash,
+  Sparkles,
+  Store,
+  Briefcase,
+  FileText,
+  Clock,
+  Eye,
+  Pencil,
+  QrCode,
+  CircleDot,
+  Plus,
+  Trash2,
+  CalendarDays,
+  Layers,
+  X,
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { toast } from 'sonner';
+import { AgencyCategorySelect } from '@/components/agency/agency-category-select';
+import { BUILT_IN_CATEGORY_OPTIONS } from '@/hooks/use-agency-categories';
+// Task 5 — Algeria address selectors (58 wilayas + their communes).
+import {
+  WilayaSelect,
+  CommuneSelect,
+  composeLocationLabel,
+} from '@/components/shared/algeria-location-selects';
+import { ALGERIA_WILAYAS, findWilayaByCode } from '@/lib/algeria-locations';
+// Task 51-b — agency location map picker (provider abstraction, spec §27-30).
+import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
+import { useMapConfig } from '@/lib/map/use-map-config';
+import type { GeocodeComponents } from '@/lib/map';
+
+// ─── Task 2-c — tolerant wilaya helpers (client-side copies; server code is
+// NOT imported on purpose — apps/api/src/lib/validations.ts owns the same
+// logic: canonicalWilayaCode + the corrected 01-58 regex) ─────────────────
+
+/** Official two-digit ANI wilaya codes 01-58 (corrected: the old
+ * [1-5][0-8] class silently rejected the real codes 19/29/39/49). */
+const WILAYA_CODE_REGEX = /^(0[1-9]|[1-4][0-9]|5[0-8])$/;
+
+/** "19", 19, " 19 ", "١٩", "۱۹" → "19"; "9" → "09". Anything that is not a
+ * 1-2 digit value after mapping Arabic-Indic (U+0660-0669) and Eastern
+ * Arabic-Indic (U+06F0-06F9) digits to ASCII is returned unchanged so
+ * downstream validation still rejects it (e.g. a 5-digit postal code must
+ * never become a wilaya). */
+const normalizeWilayaInput = (v: string): string => {
+  const mapped = v
+    .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06F0));
+  const digits = mapped.replace(/\D/g, '');
+  if (digits.length >= 1 && digits.length <= 2) return digits.padStart(2, '0');
+  return mapped.trim();
+};
+
+/** Fold a Latin name for comparison: strip diacritics (NFD + combining
+ * marks), lowercase, drop everything but [a-z0-9] so "Sétif" ≍ "Setif",
+ * "Ain-Legradj" ≍ "Ain Legradj", "M'Sila" ≍ "Msila". */
+const foldLatinName = (v: string): string =>
+  v
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '');
+
+/** Strip the common wilaya prefixes/suffixes geocoders prepend/append
+ * ("Wilaya de Sétif", "Province of Sétif", "Sétif Province") and the Arabic
+ * "ولاية" prefix so either side matches the bare dataset name. */
+const stripWilayaAffixes = (v: string): string =>
+  v
+    .replace(/^\s*(?:wilaya|province|governorate)\s*(?:de\s+|d'|du\s+|of\s+|el\s+)?\s*/i, '')
+    .replace(/\s+(?:province|wilaya|governorate)\s*$/i, '')
+    .replace(/ولاية/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+// ─── Floating Label Input ─────────────────────────────
+function FloatingInput({
+  id,
+  value,
+  onChange,
+  label,
+  placeholder,
+  error,
+  dir,
+  maxLength,
+  type = 'text',
+  icon: Icon,
+  required,
+  uppercase,
+}: {
+  id: string;
+  value: string;
+  onChange: (v: string) => void;
+  label: string;
+  placeholder: string;
+  error?: string;
+  dir?: string;
+  maxLength?: number;
+  type?: string;
+  icon?: React.ElementType;
+  required?: boolean;
+  uppercase?: boolean;
+}) {
+  const [focused, setFocused] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  return (
+    <div className="space-y-1.5">
+      <Label htmlFor={id} className="text-sm font-medium flex items-center gap-1.5">
+        {Icon && <Icon className="h-3.5 w-3.5 text-muted-foreground" />}
+        {label}
+        {required && <span className="text-red-500">*</span>}
+      </Label>
+      <div className="relative group">
+        {/* Gradient left border on focus */}
+        <div
+          className={`absolute start-0 top-0 bottom-0 w-1 rounded-s-xl transition-all duration-300 ${
+            focused
+              ? 'bg-gradient-to-b from-emerald-500 via-teal-500 to-cyan-500'
+              : 'bg-transparent'
+          }`}
+        />
+        <Input
+          ref={inputRef}
+          id={id}
+          value={value}
+          onChange={(e) => {
+            const v = uppercase ? e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '') : e.target.value;
+            onChange(v);
+          }}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          placeholder={placeholder}
+          dir={dir}
+          maxLength={maxLength}
+          type={type}
+          className={`h-12 rounded-xl ps-3 transition-all duration-300 ${
+            error
+              ? 'border-red-400 focus-visible:ring-red-400'
+              : focused
+                ? 'border-emerald-300 dark:border-emerald-700 shadow-sm shadow-emerald-500/10'
+                : ''
+          } ${uppercase ? 'uppercase' : ''}`}
+        />
+      </div>
+      {error && (
+        <motion.p
+          initial={{ opacity: 0, y: -4 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="text-xs text-red-500"
+        >
+          {error}
+        </motion.p>
+      )}
+    </div>
+  );
+}
+
+// ─── Step Circle Indicator ────────────────────────────
+function StepIndicator({
+  currentStep,
+  totalSteps,
+  stepLabels,
+}: {
+  currentStep: number;
+  totalSteps: number;
+  stepLabels: string[];
+}) {
+  return (
+    <div className="flex items-center justify-center gap-0 mb-8 px-4">
+      {Array.from({ length: totalSteps }, (_, i) => {
+        const isCompleted = i < currentStep;
+        const isActive = i === currentStep;
+        const isFuture = i > currentStep;
+
+        return (
+          <div key={i} className="flex items-center">
+            {/* Step circle + label */}
+            <div className="flex flex-col items-center">
+              <motion.div
+                initial={false}
+                animate={{
+                  scale: isActive ? 1.1 : 1,
+                }}
+                transition={{ type: 'spring', stiffness: 300, damping: 20 }}
+                className={`relative flex items-center justify-center w-10 h-10 rounded-full transition-all duration-500 ${
+                  isActive
+                    ? 'bg-gradient-to-br from-emerald-500 to-teal-500 shadow-lg shadow-emerald-500/30 ring-4 ring-emerald-100 dark:ring-emerald-900/30'
+                    : isCompleted
+                      ? 'bg-gradient-to-br from-emerald-500 to-teal-500 shadow-md shadow-emerald-500/20'
+                      : 'bg-gray-100 dark:bg-gray-800 border-2 border-gray-200 dark:border-gray-700'
+                }`}
+              >
+                {isCompleted ? (
+                  <motion.div
+                    initial={{ scale: 0, rotate: -90 }}
+                    animate={{ scale: 1, rotate: 0 }}
+                    transition={{ type: 'spring', stiffness: 200, damping: 15 }}
+                  >
+                    <Check className="h-5 w-5 text-white" strokeWidth={3} />
+                  </motion.div>
+                ) : isActive ? (
+                  <span className="text-sm font-bold text-white">{i + 1}</span>
+                ) : (
+                  <span className="text-sm font-semibold text-gray-400 dark:text-gray-500">{i + 1}</span>
+                )}
+              </motion.div>
+              {/* Step label */}
+              <span
+                className={`mt-2 text-[10px] sm:text-xs font-medium text-center max-w-[60px] leading-tight transition-colors duration-300 ${
+                  isActive
+                    ? 'text-emerald-600 dark:text-emerald-400'
+                    : isCompleted
+                      ? 'text-emerald-600/70 dark:text-emerald-400/70'
+                      : 'text-gray-400 dark:text-gray-500'
+                }`}
+              >
+                {stepLabels[i]}
+              </span>
+            </div>
+
+            {/* Connector line */}
+            {i < totalSteps - 1 && (
+              <div className="relative w-6 sm:w-12 h-0.5 mx-1 mb-5">
+                <div className="absolute inset-0 bg-gray-200 dark:bg-gray-700 rounded-full" />
+                <motion.div
+                  className="absolute inset-y-0 start-0 bg-gradient-to-r from-emerald-500 to-teal-400 rounded-full"
+                  initial={{ width: '0%' }}
+                  animate={{ width: isCompleted ? '100%' : '0%' }}
+                  transition={{ duration: 0.5, ease: 'easeInOut' }}
+                />
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Confetti Circle ──────────────────────────────────
+function ConfettiCircle({ delay, x, size, color, duration }: { delay: number; x: string; size: number; color: string; duration: number }) {
+  return (
+    <motion.div
+      className="absolute rounded-full pointer-events-none"
+      style={{ width: size, height: size, backgroundColor: color }}
+      initial={{ opacity: 0, y: 0, x: 0, scale: 0 }}
+      animate={{
+        opacity: [0, 1, 1, 0],
+        y: [-20, -60, -120],
+        x: [0, parseFloat(x) * 20, parseFloat(x) * 40],
+        scale: [0, 1.2, 0.8],
+        rotate: [0, 180, 360],
+      }}
+      transition={{
+        duration,
+        delay,
+        ease: 'easeOut',
+      }}
+    />
+  );
+}
+
+// ─── Preview Summary Section ──────────────────────────
+function PreviewSection({
+  title,
+  icon: Icon,
+  onEdit,
+  children,
+}: {
+  title: string;
+  icon: React.ElementType;
+  onEdit: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="rounded-xl border border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900/50 p-4 space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Icon className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+          <span className="text-sm font-semibold text-foreground">{title}</span>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onEdit}
+          className="h-7 px-2 text-xs gap-1 text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 dark:hover:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+        >
+          <Pencil className="h-3 w-3" />
+          {title === 'Preview' ? '' : ''}
+        </Button>
+      </div>
+      <div className="space-y-1.5">{children}</div>
+    </div>
+  );
+}
+
+function PreviewRow({ label, value, dir }: { label: string; value: string; dir?: string }) {
+  if (!value) return null;
+  return (
+    <div className="flex items-start justify-between gap-2 text-sm">
+      <span className="text-muted-foreground text-xs shrink-0">{label}</span>
+      <span className="text-foreground font-medium text-end" dir={dir}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+// ─── Main Component ───────────────────────────────────
+interface CreateAgencyFormProps {
+  onAgencyCreated?: (agencyId: string, agencyName: string) => void;
+}
+
+export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
+  const { t } = useLanguage();
+  const { user, setUser, setSessionToken, logout } = useAppStore();
+  const [step, setStep] = useState(0);
+  const [direction, setDirection] = useState(1);
+  const [creating, setCreating] = useState(false);
+  const [created, setCreated] = useState(false);
+  const [createdAgencyName, setCreatedAgencyName] = useState('');
+  const [createdAgencyCode, setCreatedAgencyCode] = useState('');
+
+  // Step 0: Basic info
+  const [name, setName] = useState('');
+  const [nameAr, setNameAr] = useState('');
+  const [nameFr, setNameFr] = useState('');
+  const [category, setCategory] = useState('CLINIC');
+
+  // Step 1: Contact Details
+  const [address, setAddress] = useState('');
+  // Task 5 — REQUIRED Algeria address: wilaya = two-digit official code,
+  // city/commune = baladiya LATIN name. Pre-filled one-shot from the register
+  // form handoff (localStorage 'blasti:reg-location') when present.
+  const [wilayaCode, setWilayaCode] = useState('');
+  const [communeName, setCommuneName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [email, setEmail] = useState('');
+  const [description, setDescription] = useState('');
+  const [customCode, setCustomCode] = useState('');
+
+  // Task 51-b — agency location (map picker, spec §27-30). Coordinates live
+  // in TEMPORARY form state until the final submit (spec §28 — "Do not
+  // immediately persist every drag event").
+  const [latitude, setLatitude] = useState<number | null>(null);
+  const [longitude, setLongitude] = useState<number | null>(null);
+  const [postalCode, setPostalCode] = useState('');
+  const [locationSource, setLocationSource] = useState<'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS' | null>(null);
+  // Manual-override guard (spec §30): raised whenever the user edits an
+  // address field, RESET on an explicit location change (picker onChange),
+  // so a new detection only overwrites text the user has not typed since.
+  const manualTouchedRef = useRef(false);
+  const { config: mapsConfig } = useMapConfig();
+
+  // Step 2: Working Hours + Working Days (Round 15 — days beside the hours)
+  const [workingHoursStart, setWorkingHoursStart] = useState('08:00');
+  const [workingHoursEnd, setWorkingHoursEnd] = useState('17:00');
+  // CSV of weekday numbers 0=Sunday … 6=Saturday. Algeria's work week is
+  // Sunday–Thursday, so the form prefills "0,1,2,3,4" (the schema default
+  // stays Mon–Fri for safety).
+  const [workingDays, setWorkingDays] = useState<number[]>([0, 1, 2, 3, 4]);
+
+  // Step 3: Services (Round 15 — created atomically with the agency)
+  const [services, setServices] = useState<Array<{ name: string; prefix: string }>>([
+    { name: '', prefix: 'A' },
+  ]);
+
+  // Localized weekday initials — index 0 = Sunday (matches the CSV encoding).
+  const { lang } = useLanguage();
+  const dayLabels = useMemo(() => {
+    const locale = lang === 'ar' ? 'ar' : lang === 'fr' ? 'fr' : 'en';
+    // Oct 6 2024 is a Sunday — offset i gives weekday i.
+    return Array.from({ length: 7 }, (_, i) =>
+      new Intl.DateTimeFormat(locale, { weekday: 'short' }).format(new Date(2024, 9, 6 + i))
+    );
+  }, [lang]);
+
+  const toggleWorkingDay = (day: number) => {
+    setWorkingDays((prev) => {
+      if (prev.includes(day)) {
+        // Keep at least one working day selected.
+        return prev.length > 1 ? prev.filter((d) => d !== day) : prev;
+      }
+      return [...prev, day].sort((a, b) => a - b);
+    });
+  };
+
+  const addServiceRow = () => {
+    setServices((prev) => {
+      if (prev.length >= 20) return prev;
+      // Next free letter A–Z.
+      const used = new Set(prev.map((s) => s.prefix.toUpperCase()));
+      let letter = 'A';
+      for (let i = 0; i < 26; i++) {
+        const candidate = String.fromCharCode(65 + i);
+        if (!used.has(candidate)) { letter = candidate; break; }
+      }
+      return [...prev, { name: '', prefix: letter }];
+    });
+  };
+
+  const removeServiceRow = (index: number) => {
+    setServices((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== index) : prev));
+  };
+
+  const updateServiceRow = (index: number, patch: Partial<{ name: string; prefix: string }>) => {
+    setServices((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  };
+
+  const filledServices = services.filter((s) => s.name.trim().length > 0);
+
+  // Task 51-b — explicit location change (map click / drag settle / GPS).
+  // Resets the manual-override guard FIRST so the follow-up detection (spec
+  // §29) may overwrite fields the user has not typed since this new pick
+  // (spec §30 — "unless the owner explicitly selects another location").
+  const handlePickerChange = (lat: number | null, lng: number | null) => {
+    setLatitude(lat);
+    setLongitude(lng);
+    manualTouchedRef.current = false;
+  };
+
+  // Task 51-b — match a geocoded wilaya name (Latin OR Arabic — Nominatim
+  // answers in the UI language) to the official dataset. No match → null:
+  // NEVER invent a wilaya (spec §29).
+  // Task 2-c — normalized matching, in order:
+  //  1. Digit input ("19", " 19 ", "١٩", "Wilaya 19") → canonical two-digit
+  //     code, accepted only when it is a real 01-58 code (never invented);
+  //  2. Latin match after stripping geocoder prefixes/suffixes and folding
+  //     diacritics/case/punctuation ("Wilaya de Sétif" ≍ "Sétif" ≍ "Setif");
+  //  3. Arabic match, whitespace-insensitive with "ولاية" stripped from BOTH
+  //     the geocoded name and the dataset's nameAr.
+  const findWilayaCodeByGeocodeName = (name: string | null): string | null => {
+    if (!name) return null;
+    const raw = name.trim();
+    if (!raw) return null;
+
+    // 1) digit-bearing geocode name → canonical code or nothing
+    const mapped = raw
+      .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+      .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06F0));
+    const digits = mapped.replace(/\D/g, '');
+    if (digits.length >= 1 && digits.length <= 2) {
+      const code = digits.padStart(2, '0');
+      return WILAYA_CODE_REGEX.test(code) ? code : null;
+    }
+
+    // 2) folded Latin match (prefix/suffix-stripped, diacritic-insensitive)
+    const qLatin = foldLatinName(stripWilayaAffixes(mapped));
+    // 3) Arabic match ("ولاية سطيف" ≍ "سطيف" ≍ dataset "سطيف")
+    const qArabic = mapped.replace(/ولاية/g, '').replace(/\s/g, '');
+    const hit = ALGERIA_WILAYAS.find((w) => {
+      const latin = foldLatinName(w.name);
+      const arabic = w.nameAr.replace(/ولاية/g, '').replace(/\s/g, '');
+      return (qLatin !== '' && latin === qLatin) || (qArabic !== '' && arabic === qArabic);
+    });
+    return hit ? hit.code : null;
+  };
+
+  // Task 51-b — automatic address extraction (spec §29): fill available
+  // address fields from the geocoder, then show the human-readable address.
+  // Missing components are null and simply leave their field untouched.
+  const handleDetectedAddress = (components: GeocodeComponents) => {
+    if (manualTouchedRef.current) return; // manual override wins (spec §30)
+
+    if (components.street && !address.trim()) setAddress(components.street);
+
+    // Task 2-c — the matcher already returns a canonical two-digit code;
+    // normalizeWilayaInput again as belt-and-braces before comparing/storing.
+    const code = normalizeWilayaInput(findWilayaCodeByGeocodeName(components.wilaya) || '');
+    const validCode = WILAYA_CODE_REGEX.test(code) ? code : null;
+    if (validCode && validCode !== wilayaCode) {
+      setWilayaCode(validCode);
+      setCommuneName(''); // dependent list — reset the commune
+    }
+    const effectiveCode = validCode || normalizeWilayaInput(wilayaCode);
+    if (components.city && WILAYA_CODE_REGEX.test(effectiveCode)) {
+      const wilaya = findWilayaByCode(effectiveCode);
+      // Task 2-c — folded Latin + raw Arabic commune matching, same
+      // normalization as the wilaya matcher (diacritics/punctuation/
+      // whitespace-insensitive).
+      const qLatin = foldLatinName(components.city);
+      const qArabic = components.city.replace(/\s/g, '');
+      const match = wilaya?.communes.find(
+        (c) =>
+          (qLatin !== '' && foldLatinName(c.name) === qLatin) ||
+          (qArabic !== '' && c.nameAr.replace(/\s/g, '') === qArabic),
+      );
+      // Only a commune that exists in the selected wilaya is applied; the
+      // commune field only auto-fills while the user has not chosen one.
+      if (match && !communeName) setCommuneName(match.name);
+    }
+    if (components.postalCode && !postalCode.trim()) setPostalCode(components.postalCode);
+  };
+
+  // Task 5 — one-shot location handoff from the register form. Read + REMOVE
+  // 'blasti:reg-location' on mount so the selection pre-fills this wizard
+  // exactly once (re-opening the wizard later must not resurrect a stale
+  // choice). A corrupted/invalid payload is ignored silently.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('blasti:reg-location');
+      if (!raw) return;
+      localStorage.removeItem('blasti:reg-location');
+      const parsed = JSON.parse(raw) as { wilaya?: unknown; commune?: unknown };
+      const w = typeof parsed.wilaya === 'string' ? parsed.wilaya.trim().padStart(2, '0') : '';
+      const c = typeof parsed.commune === 'string' ? parsed.commune.trim() : '';
+      if (w) {
+        setWilayaCode(w);
+        if (c) setCommuneName(c);
+      }
+    } catch { /* corrupted payload — ignore, leave the selectors empty */ }
+  }, []);
+
+  // Errors
+  const [errors, setErrors] = useState<Record<string, string>>({});
+
+  // ── Live agency-code availability (same UX as the username check) ──
+  // Debounced 500ms GET /api/agencies/check-code?code=XXX while the user
+  // types on the Contact step, so a colliding code is surfaced BEFORE the
+  // final submit instead of a late 409 that bounces back to this step.
+  const [codeCheck, setCodeCheck] = useState<'idle' | 'checking' | 'available' | 'taken' | 'error'>('idle');
+  const codeCheckAbortRef = useRef<AbortController | null>(null);
+  const codeCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const code = customCode.trim().toUpperCase();
+    if (!code || code.length < 2 || code.length > 10 || !/^[A-Z0-9_-]+$/.test(code)) {
+      setCodeCheck('idle');
+      return;
+    }
+    setCodeCheck('checking');
+    if (codeCheckTimerRef.current) clearTimeout(codeCheckTimerRef.current);
+    codeCheckTimerRef.current = setTimeout(async () => {
+      codeCheckAbortRef.current?.abort();
+      const controller = new AbortController();
+      codeCheckAbortRef.current = controller;
+      try {
+        const res = await apiFetch(`/api/agencies/check-code?code=${encodeURIComponent(code)}`, {
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        // apiFetch NEVER throws — only a real 200 with a boolean decides
+        // availability; anything else shows a neutral state instead of a
+        // false "taken" that would block the wizard.
+        let data: { available?: boolean } | null = null;
+        try { data = await res.json(); } catch { data = null; }
+        if (res.ok && data && typeof data.available === 'boolean') {
+          setCodeCheck(data.available ? 'available' : 'taken');
+        } else {
+          setCodeCheck('error');
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') return;
+        setCodeCheck('error');
+      }
+    }, 500);
+    return () => {
+      if (codeCheckTimerRef.current) clearTimeout(codeCheckTimerRef.current);
+    };
+  }, [customCode]);
+
+  // Abort any in-flight check when the form unmounts.
+  useEffect(() => () => { codeCheckAbortRef.current?.abort(); }, []);
+
+  const totalSteps = 5; // Basic Info, Contact, Working Hours+Days, Services, Preview
+
+  const stepLabels = [
+    t('basicInfo' as any),
+    t('contactDetails' as any),
+    t('workingHours' as any),
+    t('services' as any),
+    t('preview' as any),
+  ];
+
+  const goToStep = (targetStep: number) => {
+    setDirection(targetStep > step ? 1 : -1);
+    setStep(targetStep);
+  };
+
+  const validateStep0 = () => {
+    const errs: Record<string, string> = {};
+    if (!name.trim()) errs.name = t('agencyNameRequired' as any);
+    if (!category) errs.category = t('agencyCategoryRequired' as any);
+    setErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
+
+  const validateStep1 = () => {
+    const errs: Record<string, string> = {};
+    if (customCode && customCode.length < 2) errs.customCode = t('agencyCodeMinLength' as any);
+    if (customCode && customCode.length > 10) errs.customCode = t('agencyCodeMaxLength' as any);
+    // Live check says the code is already used — block here instead of a
+    // late 409 from the server after the user finished the whole wizard.
+    if (customCode && !errs.customCode && codeCheck === 'taken') errs.customCode = t('agencyCodeTaken' as any);
+    setErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
+
+  const validateStep2 = () => {
+    // Working hours/days are optional with defaults, no validation needed
+    setErrors({});
+    return true;
+  };
+
+  const validateStep3 = () => {
+    // Every STARTED service row needs a name (untouched rows are dropped).
+    const errs: Record<string, string> = {};
+    if (services.some((s) => !s.name.trim() && s.name.length > 0)) {
+      errs.serviceName = t('serviceNameRequired' as any);
+    }
+    setErrors(errs);
+    return Object.keys(errs).length === 0;
+  };
+
+  // ── Early session validation (web only) ─────────────────────────────
+  // The ghost-account logout used to strike only at FINAL submit — after
+  // the user had filled the whole wizard. Validate the restored session as
+  // soon as the wizard mounts (and self-heal it from the cookie when
+  // possible) so a dead session is caught BEFORE any form input is
+  // collected. Network failures never trigger a logout here (offline
+  // tolerance).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (isElectronSessionContext()) return; // desktop: local-API session machinery
+      const check = await apiFetch('/api/auth/session');
+      if (cancelled || !check.ok) return;     // unreachable/offline — do nothing
+      const payload = await check.json().catch(() => ({}) as any);
+      if (cancelled || payload?.user) return; // session valid
+      const healed = await healSessionFromCookie();
+      if (cancelled) return;
+      if (healed) {
+        console.warn('[CreateAgencyForm] Stale session on mount — healed from cookie, continuing');
+        await applyHealedSession(healed);
+        return;
+      }
+      console.warn('[CreateAgencyForm] Session invalid (ghost account) on mount — clearing session, routing to login before the form is filled');
+      toast.error(t('sessionInvalidRelogin' as any));
+      logout();
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleNext = () => {
+    if (step === 0 && validateStep0()) {
+      goToStep(1);
+    } else if (step === 1 && validateStep1()) {
+      goToStep(2);
+    } else if (step === 2 && validateStep2()) {
+      goToStep(3);
+    } else if (step === 3 && validateStep3()) {
+      goToStep(4);
+    }
+  };
+
+  const handleBack = () => {
+    if (step > 0) goToStep(step - 1);
+  };
+
+  const handleCreate = async () => {
+    if (!validateStep0() || !validateStep1()) return;
+
+    setCreating(true);
+    try {
+      const body: Record<string, unknown> = {
+        name: name.trim(),
+        category,
+      };
+      if (nameAr.trim()) body.nameAr = nameAr.trim();
+      if (nameFr.trim()) body.nameFr = nameFr.trim();
+      if (address.trim()) body.address = address.trim();
+      // Task 2-c — wilaya is sent whenever a canonical 01-58 code is known;
+      // the commune rides along only when one is selected (city is optional
+      // server-side). Requiring BOTH (the old pair rule) silently dropped a
+      // geocode-matched wilaya whose commune did not match, letting the
+      // server default (wilaya '28' / M'Sila) land instead — and the strict
+      // raw-value 400 on "19" blocked the whole wizard.
+      const canonicalWilaya = normalizeWilayaInput(wilayaCode);
+      if (WILAYA_CODE_REGEX.test(canonicalWilaya)) {
+        body.wilaya = canonicalWilaya;
+        if (communeName.trim()) body.city = communeName.trim();
+      }
+      if (phone.trim()) body.phone = phone.trim();
+      if (email.trim()) body.email = email.trim();
+      if (description.trim()) body.description = description.trim();
+      if (customCode.trim()) body.customCode = customCode.trim().toUpperCase();
+      // Task 51-b — canonical agency location (spec §2). Sent only when the
+      // owner actually set coordinates; locationSource/locationVerified ride
+      // along per the 51-a contract (source per spec §2/§35).
+      if (postalCode.trim()) body.postalCode = postalCode.trim();
+      if (latitude != null && longitude != null) {
+        body.latitude = latitude;
+        body.longitude = longitude;
+        if (locationSource) {
+          body.locationSource = locationSource;
+          body.locationVerified = locationSource === 'DEVICE_GPS' ? 'VERIFIED' : 'UNVERIFIED';
+        }
+      }
+      if (workingHoursStart) body.workingHoursStart = workingHoursStart;
+      if (workingHoursEnd) body.workingHoursEnd = workingHoursEnd;
+      // Round 15 — working days + services ride along in ONE atomic create.
+      if (workingDays.length) body.workingDays = [...workingDays].sort((a, b) => a - b).join(',');
+      if (filledServices.length) {
+        body.services = filledServices.map((s) => {
+          const row: Record<string, unknown> = { name: s.name.trim() };
+          if (s.prefix.trim()) row.prefix = s.prefix.trim().toUpperCase();
+          return row;
+        });
+      }
+
+      const sendCreate = () => apiFetch('/api/agencies?XTransformPort=3003', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      let res = await sendCreate();
+      let data = await res.json().catch(() => ({}) as any);
+
+      // Ghost-session guard: the stored token belongs to an account the
+      // cloud no longer knows (DB reset / account deleted while the session
+      // survived). The API answers 401 SESSION_USER_MISSING.
+      //
+      // Session-heal (ghost-account logout fix): a stale Bearer token
+      // POISONS every apiClient request — the cloud reads the Authorization
+      // header BEFORE the cookie — even when the httpOnly session cookie is
+      // still perfectly valid. Before destroying the session (which used to
+      // throw away the ENTIRE filled wizard), re-mint the session from the
+      // cookie alone and retry the create once. Only a cookie that is dead
+      // too leads to the clean logout.
+      const isGhostReject =
+        res.status === 401 ||
+        data.code === 'SESSION_USER_MISSING' ||
+        (typeof data.error === 'string' && data.error.includes('no longer exists'));
+
+      if (!res.ok && isGhostReject) {
+        const healed = await healSessionFromCookie();
+        if (healed) {
+          console.warn('[CreateAgencyForm] 401 on create — session healed from cookie, retrying create');
+          await applyHealedSession(healed);
+          res = await sendCreate();
+          data = await res.json().catch(() => ({}) as any);
+        } else {
+          console.warn('[CreateAgencyForm] Session invalid (ghost account) — heal unavailable, clearing session, routing to login');
+          toast.error(t('sessionInvalidRelogin' as any));
+          logout();
+          return;
+        }
+      }
+
+      if (!res.ok) {
+        if (data.error === 'Agency code already taken') {
+          setErrors({ customCode: t('agencyCodeTaken' as any) });
+          toast.error(t('agencyCodeTaken' as any));
+          goToStep(1);
+        } else {
+          toast.error(data.error || t('createAgencyFailed' as any));
+        }
+        return;
+      }
+
+      // Success! Update the Zustand store with the new agency info
+      if (data.agency && user) {
+        setUser({
+          ...user,
+          agencyId: data.agency.id,
+          agencyName: data.agency.name,
+          agencyNameAr: data.agency.nameAr || data.agency.name,
+          agencyNameFr: data.agency.nameFr || data.agency.name,
+        });
+        // Round 16 — adopt the REFRESHED session token. The token used during
+        // creation was issued before this agency existed (agencyId: '') — a
+        // permanent snapshot. The cloud 201 returns an upgraded JWT with the
+        // agency embedded; setSessionToken (user updated FIRST, above) pushes
+        // it to the Electron main process (sync engine setAuth) and the local
+        // API session, so the workspace initializes immediately and the
+        // next launch restores the agency-aware session.
+        if (data.token) {
+          try {
+            setSessionToken(data.token);
+          } catch (sessionErr) {
+            console.warn('[CreateAgencyForm] Session token adoption failed (non-fatal):', sessionErr);
+          }
+        }
+      }
+
+      setCreatedAgencyName(data.agency?.name || name);
+      setCreatedAgencyCode(data.agency?.customCode || customCode || name.slice(0, 3).toUpperCase());
+      setCreated(true);
+      toast.success(t('agencyCreatedSuccess' as any));
+
+      // Notify parent component
+      if (onAgencyCreated && data.agency) {
+        onAgencyCreated(data.agency.id, data.agency.name);
+      }
+    } catch (err) {
+      console.error('[CreateAgencyForm] Error:', err);
+      toast.error(t('createAgencyFailed' as any));
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const slideVariants = {
+    enter: (dir: number) => ({ x: dir > 0 ? 60 : -60, opacity: 0 }),
+    center: { x: 0, opacity: 1 },
+    exit: (dir: number) => ({ x: dir < 0 ? 60 : -60, opacity: 0 }),
+  };
+
+  // ─── Get selected category label ─────────────────
+  // Built-ins resolve through the shared 25-option list; custom categories
+  // (user-entered names) display as-is.
+  const getSelectedCategoryLabel = () => {
+    const found = BUILT_IN_CATEGORY_OPTIONS.find((o) => o.value === category);
+    return found ? `${found.icon} ${t(found.labelKey as any)}` : category;
+  };
+
+  // ─── Confetti colors ────────────────────────────
+  const confettiColors = [
+    'rgba(16, 185, 129, 0.6)',
+    'rgba(20, 184, 166, 0.5)',
+    'rgba(6, 182, 212, 0.5)',
+    'rgba(52, 211, 153, 0.5)',
+    'rgba(94, 234, 212, 0.4)',
+    'rgba(110, 231, 183, 0.5)',
+  ];
+
+  // ─── Success State ──────────────────────────────
+  if (created) {
+    return (
+      <div className="relative flex flex-col items-center justify-center py-10 text-center overflow-hidden">
+        {/* Confetti decorative circles */}
+        {confettiColors.map((color, i) => (
+          <ConfettiCircle
+            key={i}
+            delay={i * 0.15}
+            x={((i % 3) - 1).toString()}
+            size={8 + i * 3}
+            color={color}
+            duration={2 + i * 0.3}
+          />
+        ))}
+
+        {/* Floating background decorations */}
+        <motion.div
+          className="absolute top-8 start-6 w-16 h-16 rounded-full bg-emerald-100 dark:bg-emerald-900/20 opacity-40"
+          animate={{ y: [0, -15, 0], rotate: [0, 10, 0] }}
+          transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
+        />
+        <motion.div
+          className="absolute top-20 end-8 w-12 h-12 rounded-full bg-teal-100 dark:bg-teal-900/20 opacity-40"
+          animate={{ y: [0, -10, 0], rotate: [0, -15, 0] }}
+          transition={{ duration: 3.5, repeat: Infinity, ease: 'easeInOut', delay: 0.5 }}
+        />
+        <motion.div
+          className="absolute bottom-24 start-10 w-10 h-10 rounded-full bg-cyan-100 dark:bg-cyan-900/20 opacity-40"
+          animate={{ y: [0, -12, 0], rotate: [0, 8, 0] }}
+          transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut', delay: 1 }}
+        />
+        <motion.div
+          className="absolute bottom-32 end-6 w-14 h-14 rounded-full bg-emerald-100 dark:bg-emerald-900/20 opacity-30"
+          animate={{ y: [0, -8, 0], rotate: [0, -12, 0] }}
+          transition={{ duration: 3.8, repeat: Infinity, ease: 'easeInOut', delay: 0.8 }}
+        />
+
+        {/* Main success icon */}
+        <motion.div
+          initial={{ scale: 0, rotate: -180 }}
+          animate={{ scale: 1, rotate: 0 }}
+          transition={{ type: 'spring', stiffness: 200, damping: 12 }}
+          className="h-28 w-28 rounded-full bg-gradient-to-br from-emerald-100 to-teal-100 dark:from-emerald-900/30 dark:to-teal-900/30 flex items-center justify-center mb-6 shadow-xl shadow-emerald-500/20 relative z-10"
+        >
+          <CheckCircle2 className="h-14 w-14 text-emerald-600 dark:text-emerald-400" />
+        </motion.div>
+
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.3 }}
+          className="relative z-10"
+        >
+          <h3 className="text-xl font-bold text-foreground mb-2">
+            {t('agencyCreatedTitle' as any)}
+          </h3>
+          <p className="text-sm text-muted-foreground max-w-sm mb-1">
+            {t('agencyCreatedDesc' as any)}
+          </p>
+          <p className="text-base font-semibold text-emerald-600 dark:text-emerald-400 mb-4">
+            {createdAgencyName}
+          </p>
+
+          {/* Agency Code Display */}
+          <motion.div
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ delay: 0.6 }}
+            className="inline-flex flex-col items-center gap-3 bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-800 dark:to-gray-900 rounded-2xl p-5 mb-6 border border-gray-200/50 dark:border-gray-700/50 shadow-lg"
+          >
+            <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+              {t('agencyCodePreview' as any)}
+            </span>
+            <div className="flex items-center gap-3">
+              <span className="text-3xl font-mono font-bold tracking-widest text-emerald-600 dark:text-emerald-400 bg-white dark:bg-gray-950 px-5 py-2 rounded-xl border border-emerald-200 dark:border-emerald-800 shadow-inner">
+                {createdAgencyCode}
+              </span>
+            </div>
+
+            {/* QR Code Placeholder */}
+            <div className="mt-2 flex flex-col items-center gap-1.5">
+              <div className="w-24 h-24 rounded-xl bg-white dark:bg-gray-950 border border-gray-200 dark:border-gray-700 flex items-center justify-center shadow-sm">
+                <div className="grid grid-cols-5 grid-rows-5 gap-0.5 w-16 h-16">
+                  {Array.from({ length: 25 }, (_, i) => (
+                    <div
+                      key={i}
+                      className={`rounded-sm ${
+                        Math.random() > 0.4
+                          ? 'bg-gray-800 dark:bg-gray-200'
+                          : 'bg-transparent'
+                      }`}
+                    />
+                  ))}
+                </div>
+              </div>
+              <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                <QrCode className="h-3 w-3" />
+                {t('qrCodeAgency' as any)}
+              </span>
+            </div>
+          </motion.div>
+
+          <p className="text-xs text-muted-foreground max-w-xs mb-6">
+            {t('agencyCreatedNextSteps' as any)}
+          </p>
+          <Button
+            onClick={() => window.location.reload()}
+            className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white gap-2 shadow-lg shadow-emerald-500/20 rounded-xl h-11 px-6"
+          >
+            <Sparkles className="h-4 w-4" />
+            {t('goToDashboard' as any)}
+          </Button>
+        </motion.div>
+      </div>
+    );
+  }
+
+  // ─── Form Steps ─────────────────────────────────
+  return (
+    <div className="max-w-lg lg:max-w-2xl mx-auto">
+      {/* Header */}
+      <div className="text-center mb-6">
+        <motion.div
+          initial={{ scale: 0.8, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          className="h-16 w-16 rounded-2xl bg-gradient-to-br from-emerald-100 to-teal-100 dark:from-emerald-900/30 dark:to-teal-900/30 flex items-center justify-center mx-auto mb-4 shadow-lg shadow-emerald-500/10"
+        >
+          <Building2 className="h-8 w-8 text-emerald-600 dark:text-emerald-400" />
+        </motion.div>
+        <h3 className="text-lg font-bold text-foreground">
+          {t('createYourAgency' as any)}
+        </h3>
+        <p className="text-sm text-muted-foreground mt-1">
+          {t('createYourAgencyDesc' as any)}
+        </p>
+      </div>
+
+      {/* Step indicator */}
+      <StepIndicator
+        currentStep={step}
+        totalSteps={totalSteps}
+        stepLabels={stepLabels}
+      />
+
+      {/* Step Content */}
+      <AnimatePresence mode="wait" custom={direction}>
+        <motion.div
+          key={step}
+          custom={direction}
+          variants={slideVariants}
+          initial="enter"
+          animate="center"
+          exit="exit"
+          transition={{ duration: 0.25, ease: 'easeInOut' }}
+        >
+          {/* Step 0: Basic Info */}
+          {step === 0 && (
+            <Card className="border-0 shadow-lg shadow-black/5 dark:shadow-black/20">
+              <CardContent className="p-5 space-y-5">
+                <div className="flex items-center gap-2 mb-2">
+                  <Store className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                  <span className="text-sm font-semibold text-foreground">{t('basicInfo' as any)}</span>
+                </div>
+
+                {/* Agency Name (required) */}
+                <FloatingInput
+                  id="agency-name"
+                  value={name}
+                  onChange={(v) => { setName(v); setErrors((p) => ({ ...p, name: '' })); }}
+                  label={t('agencyName' as any)}
+                  placeholder={t('agencyNamePlaceholder' as any)}
+                  error={errors.name}
+                  icon={Building2}
+                  required
+                />
+
+                {/* Arabic Name */}
+                <FloatingInput
+                  id="agency-name-ar"
+                  value={nameAr}
+                  onChange={setNameAr}
+                  label={`${t('agencyNameAr' as any)} (${t('optional' as any)})`}
+                  placeholder={t('agencyNameArPlaceholder' as any)}
+                  dir="rtl"
+                />
+
+                {/* French Name */}
+                <FloatingInput
+                  id="agency-name-fr"
+                  value={nameFr}
+                  onChange={setNameFr}
+                  label={`${t('agencyNameFr' as any)} (${t('optional' as any)})`}
+                  placeholder={t('agencyNameFrPlaceholder' as any)}
+                  dir="ltr"
+                />
+
+                {/* Category Selection — shared searchable picker (25 built-ins + custom fields) */}
+                <div className="space-y-2.5">
+                  <Label className="text-sm font-medium">
+                    {t('agencyCategory' as any)} <span className="text-red-500">*</span>
+                  </Label>
+                  <AgencyCategorySelect
+                    value={category}
+                    onChange={(v) => { setCategory(v); setErrors((p) => ({ ...p, category: '' })); }}
+                  />
+                  {errors.category && (
+                    <motion.p
+                      initial={{ opacity: 0, y: -4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="text-xs text-red-500"
+                    >
+                      {errors.category}
+                    </motion.p>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Step 1: Contact Details */}
+          {step === 1 && (
+            <Card className="border-0 shadow-lg shadow-black/5 dark:shadow-black/20">
+              <CardContent className="p-5 space-y-5">
+                <div className="flex items-center gap-2 mb-2">
+                  <Briefcase className="h-4 w-4 text-teal-600 dark:text-teal-400" />
+                  <span className="text-sm font-semibold text-foreground">{t('contactDetails' as any)}</span>
+                </div>
+
+                {/* Task 5 — REQUIRED Algeria location: wilaya + commune
+                    (baladiya). Marked required; the request simply omits
+                    them if skipped so the server defaults apply. */}
+                <div className="space-y-2.5">
+                  <Label className="text-sm font-medium flex items-center gap-1.5">
+                    <MapPin className="h-3.5 w-3.5 text-muted-foreground" />
+                    {t('location.wilaya' as any)} <span className="text-red-500">*</span>
+                  </Label>
+                  <WilayaSelect
+                    value={wilayaCode}
+                    onValueChange={(code) => {
+                      setWilayaCode(code);
+                      // Dependent list — reset the commune on wilaya change.
+                      setCommuneName('');
+                      // Task 51-b — manual edit guard (spec §30).
+                      manualTouchedRef.current = true;
+                    }}
+                    lang={lang}
+                    placeholder={t('location.selectWilaya' as any)}
+                    id="agency-wilaya"
+                    aria-label={t('location.wilaya' as any)}
+                    triggerClassName="h-12 rounded-xl text-sm font-medium data-[state=open]:border-emerald-300 dark:data-[state=open]:border-emerald-700 focus-visible:border-emerald-300 dark:focus-visible:border-emerald-700 focus-visible:ring-emerald-500/10"
+                  />
+                  <Label className="text-sm font-medium">
+                    {t('location.commune' as any)} <span className="text-red-500">*</span>
+                  </Label>
+                  <CommuneSelect
+                    wilayaCode={wilayaCode}
+                    value={communeName}
+                    onValueChange={(name) => {
+                      setCommuneName(name);
+                      // Task 51-b — manual edit guard (spec §30).
+                      manualTouchedRef.current = true;
+                    }}
+                    lang={lang}
+                    placeholder={t('location.selectCommune' as any)}
+                    id="agency-commune"
+                    aria-label={t('location.commune' as any)}
+                    triggerClassName="h-12 rounded-xl text-sm font-medium data-[state=open]:border-emerald-300 dark:data-[state=open]:border-emerald-700 focus-visible:border-emerald-300 dark:focus-visible:border-emerald-700 focus-visible:ring-emerald-500/10"
+                  />
+                  {/* Composed location hint, e.g. "16 - Alger · Bab El Oued" */}
+                  {composeLocationLabel(wilayaCode, communeName, lang) && (
+                    <p className="text-[10px] text-muted-foreground flex items-center gap-1">
+                      <MapPin className="h-3 w-3 shrink-0 text-emerald-500" />
+                      {composeLocationLabel(wilayaCode, communeName, lang)}
+                    </p>
+                  )}
+                </div>
+
+                {/* Address — optional street detail under the selected
+                    wilaya/commune (Task 5 relabel). */}
+                <FloatingInput
+                  id="agency-address"
+                  value={address}
+                  onChange={(v) => {
+                    setAddress(v);
+                    // Task 51-b — manual edit guard (spec §30).
+                    manualTouchedRef.current = true;
+                  }}
+                  label={t('location.streetAddress' as any)}
+                  placeholder={t('agencyAddressPlaceholder' as any)}
+                  icon={MapPin}
+                />
+
+                {/* Task 51-b — Location block (spec §27): map picker + postal
+                    code. Rendered whenever maps are not explicitly disabled;
+                    when the config endpoint is unreachable the picker itself
+                    degrades to the offline box while GPS stays functional. */}
+                {mapsConfig?.mapsEnabled !== false && (
+                  <div className="space-y-3 rounded-xl border border-gray-100 dark:border-gray-800 bg-gray-50/40 dark:bg-gray-900/40 p-3">
+                    <Label className="text-sm font-medium flex items-center gap-1.5">
+                      <MapPin className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                      {t('maps.location' as any)}
+                      <span className="text-xs text-muted-foreground">({t('optional' as any)})</span>
+                    </Label>
+                    <MapLocationPicker
+                      value={{ latitude, longitude }}
+                      onChange={handlePickerChange}
+                      onLocationSource={setLocationSource}
+                      addressFields={{ onDetected: handleDetectedAddress }}
+                      height={260}
+                    />
+                    {/* Postal code (spec §27 — Postal Code field) */}
+                    <FloatingInput
+                      id="agency-postal-code"
+                      value={postalCode}
+                      onChange={(v) => {
+                        setPostalCode(v);
+                        // Task 2-c — manual zip edit → related fields auto-update:
+                        // an Algerian postal code's first TWO digits ARE the wilaya
+                        // code, so a valid 01-58 prefix (once the user has typed at
+                        // least two characters) selects that wilaya and resets the
+                        // dependent commune list, keeping the pair coherent.
+                        // Task 83-b — reverse cascade hardening: extract ALL digits
+                        // from the input FIRST (not just the first two characters),
+                        // so a pasted "A28 019" or any non-digit-prefixed value still
+                        // derives 28. Fires only when the derived code is a real
+                        // 01-58 code AND different from the current selection — a
+                        // wilaya the user picked after the zip was set is never
+                        // wiped (a matching prefix is a no-op).
+                        if (v.trim().length >= 2) {
+                          const digits = v.replace(/\D/g, '');
+                          const prefix = normalizeWilayaInput(digits.slice(0, 2));
+                          if (WILAYA_CODE_REGEX.test(prefix) && prefix !== wilayaCode) {
+                            setWilayaCode(prefix);
+                            setCommuneName('');
+                          }
+                        }
+                        // Task 51-b — manual edit guard (spec §30).
+                        manualTouchedRef.current = true;
+                      }}
+                      label={t('maps.postalCode' as any)}
+                      placeholder="28019"
+                      dir="ltr"
+                      icon={Hash}
+                      maxLength={10}
+                    />
+                  </div>
+                )}
+
+                {/* Phone */}
+                <FloatingInput
+                  id="agency-phone"
+                  value={phone}
+                  onChange={setPhone}
+                  label={`${t('phoneNumber' as any)} (${t('optional' as any)})`}
+                  placeholder={t('agencyPhonePlaceholder' as any)}
+                  dir="ltr"
+                  icon={Phone}
+                />
+
+                {/* Email */}
+                <FloatingInput
+                  id="agency-email"
+                  value={email}
+                  onChange={setEmail}
+                  label={`${t('email' as any)} (${t('optional' as any)})`}
+                  placeholder={t('agencyEmailPlaceholder' as any)}
+                  type="email"
+                  dir="ltr"
+                  icon={Globe}
+                />
+
+                {/* Description */}
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-medium flex items-center gap-1.5">
+                    <FileText className="h-3.5 w-3.5 text-muted-foreground" />
+                    {t('description' as any)} <span className="text-xs text-muted-foreground">({t('optional' as any)})</span>
+                  </Label>
+                  <Textarea
+                    value={description}
+                    onChange={(e) => setDescription(e.target.value)}
+                    placeholder={t('agencyDescriptionPlaceholder' as any)}
+                    className="rounded-xl min-h-[80px] resize-none"
+                    maxLength={500}
+                  />
+                  <p className="text-[10px] text-muted-foreground text-end">{description.length}/500</p>
+                </div>
+
+                {/* Custom Code */}
+                <FloatingInput
+                  id="agency-code"
+                  value={customCode}
+                  onChange={(v) => { setCustomCode(v); setErrors((p) => ({ ...p, customCode: '' })); }}
+                  label={`${t('agencyCodeField' as any)} (${t('optional' as any)})`}
+                  placeholder={t('agencyCodePlaceholder' as any)}
+                  dir="ltr"
+                  maxLength={10}
+                  icon={Hash}
+                  error={errors.customCode}
+                  uppercase
+                />
+                {/* Live availability verdict (like the username check) */}
+                {!errors.customCode && customCode.trim().length >= 2 && codeCheck === 'checking' && (
+                  <p className="text-[10px] text-muted-foreground -mt-3 flex items-center gap-1.5">
+                    <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                    {t('checking' as any)}
+                  </p>
+                )}
+                {!errors.customCode && customCode.trim().length >= 2 && codeCheck === 'available' && (
+                  <p className="text-[10px] text-emerald-600 dark:text-emerald-400 -mt-3 flex items-center gap-1.5">
+                    <Check className="h-3 w-3 shrink-0" />
+                    {t('agencyCodeAvailable' as any)}
+                  </p>
+                )}
+                {!errors.customCode && customCode.trim().length >= 2 && codeCheck === 'taken' && (
+                  <p className="text-[10px] text-red-500 dark:text-red-400 -mt-3 flex items-center gap-1.5">
+                    <X className="h-3 w-3 shrink-0" />
+                    {t('agencyCodeTaken' as any)}
+                  </p>
+                )}
+                {(customCode.trim().length < 2 || codeCheck === 'idle' || codeCheck === 'error') && (
+                  <p className="text-[10px] text-muted-foreground -mt-3">{t('agencyCodeAutoGenerated' as any)}</p>
+                )}
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Step 2: Working Hours */}
+          {step === 2 && (
+            <Card className="border-0 shadow-lg shadow-black/5 dark:shadow-black/20">
+              <CardContent className="p-5 space-y-5">
+                <div className="flex items-center gap-2 mb-2">
+                  <Clock className="h-4 w-4 text-cyan-600 dark:text-cyan-400" />
+                  <span className="text-sm font-semibold text-foreground">{t('workingHours' as any)}</span>
+                </div>
+
+                <p className="text-xs text-muted-foreground -mt-2">
+                  {t('workingHoursDesc' as any)}
+                </p>
+
+                {/* Visual time range indicator */}
+                <div className="flex items-center gap-3 justify-center py-4">
+                  <motion.div
+                    initial={{ opacity: 0, x: -20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: 0.1 }}
+                    className="flex flex-col items-center gap-1.5"
+                  >
+                    <div className="h-12 w-12 rounded-full bg-gradient-to-br from-emerald-100 to-teal-100 dark:from-emerald-900/30 dark:to-teal-900/30 flex items-center justify-center shadow-sm">
+                      <span className="text-lg">🌅</span>
+                    </div>
+                    <span className="text-[10px] text-muted-foreground">{t('workingHoursStart' as any)}</span>
+                  </motion.div>
+
+                  <motion.div
+                    initial={{ scaleX: 0 }}
+                    animate={{ scaleX: 1 }}
+                    transition={{ delay: 0.3, duration: 0.5 }}
+                    className="flex-1 h-1 bg-gradient-to-r from-emerald-400 via-teal-400 to-cyan-400 rounded-full max-w-[100px]"
+                  />
+
+                  <motion.div
+                    initial={{ opacity: 0, x: 20 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: 0.2 }}
+                    className="flex flex-col items-center gap-1.5"
+                  >
+                    <div className="h-12 w-12 rounded-full bg-gradient-to-br from-cyan-100 to-teal-100 dark:from-cyan-900/30 dark:to-teal-900/30 flex items-center justify-center shadow-sm">
+                      <span className="text-lg">🌆</span>
+                    </div>
+                    <span className="text-[10px] text-muted-foreground">{t('workingHoursEnd' as any)}</span>
+                  </motion.div>
+                </div>
+
+                {/* Time inputs — stack on phones, share a row from sm+ (Task 31-A) */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="wh-start" className="text-sm font-medium flex items-center gap-1.5">
+                      <Clock className="h-3.5 w-3.5 text-emerald-500" />
+                      {t('workingHoursStart' as any)}
+                    </Label>
+                    <div className="relative group">
+                      <div className="absolute start-0 top-0 bottom-0 w-1 rounded-s-xl bg-gradient-to-b from-emerald-400 to-teal-400 opacity-0 group-focus-within:opacity-100 transition-opacity duration-300" />
+                      <Input
+                        id="wh-start"
+                        type="time"
+                        value={workingHoursStart}
+                        onChange={(e) => setWorkingHoursStart(e.target.value)}
+                        className="h-12 rounded-xl ps-3"
+                        dir="ltr"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <Label htmlFor="wh-end" className="text-sm font-medium flex items-center gap-1.5">
+                      <Clock className="h-3.5 w-3.5 text-cyan-500" />
+                      {t('workingHoursEnd' as any)}
+                    </Label>
+                    <div className="relative group">
+                      <div className="absolute start-0 top-0 bottom-0 w-1 rounded-s-xl bg-gradient-to-b from-teal-400 to-cyan-400 opacity-0 group-focus-within:opacity-100 transition-opacity duration-300" />
+                      <Input
+                        id="wh-end"
+                        type="time"
+                        value={workingHoursEnd}
+                        onChange={(e) => setWorkingHoursEnd(e.target.value)}
+                        className="h-12 rounded-xl ps-3"
+                        dir="ltr"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Round 15 — Working DAYS beside the working hours */}
+                <div className="space-y-2 pt-1">
+                  <Label className="text-sm font-medium flex items-center gap-1.5">
+                    <CalendarDays className="h-3.5 w-3.5 text-emerald-500" />
+                    {t('workingDays' as any)}
+                  </Label>
+                  <p className="text-[10px] text-muted-foreground">{t('workingDaysDesc' as any)}</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {dayLabels.map((label, day) => {
+                      const active = workingDays.includes(day);
+                      return (
+                        <button
+                          key={day}
+                          type="button"
+                          onClick={() => toggleWorkingDay(day)}
+                          aria-pressed={active}
+                          aria-label={label}
+                          className={`h-9 min-w-[44px] px-2 rounded-xl text-xs font-semibold border transition-all duration-150 ${
+                            active
+                              ? 'bg-gradient-to-b from-emerald-500 to-teal-500 text-white border-emerald-500 shadow-sm shadow-emerald-500/30 scale-[1.03]'
+                              : 'bg-background text-muted-foreground border-border hover:border-emerald-300 hover:text-emerald-600'
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Quick presets */}
+                <div className="space-y-2">
+                  <span className="text-xs font-medium text-muted-foreground">{t('quickPresets' as any)}</span>
+                  <div className="flex flex-wrap gap-2">
+                    {[
+                      { start: '08:00', end: '17:00', label: '8AM - 5PM' },
+                      { start: '08:00', end: '16:00', label: '8AM - 4PM' },
+                      { start: '09:00', end: '18:00', label: '9AM - 6PM' },
+                      { start: '07:00', end: '15:00', label: '7AM - 3PM' },
+                    ].map((preset) => (
+                      <Button
+                        key={preset.label}
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setWorkingHoursStart(preset.start);
+                          setWorkingHoursEnd(preset.end);
+                        }}
+                        className={`h-7 text-[10px] rounded-lg gap-1 ${
+                          workingHoursStart === preset.start && workingHoursEnd === preset.end
+                            ? 'border-emerald-400 bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-400'
+                            : 'text-muted-foreground'
+                        }`}
+                      >
+                        <Clock className="h-2.5 w-2.5" />
+                        {preset.label}
+                      </Button>
+                    ))}
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Step 3: Services (Round 15) */}
+          {step === 3 && (
+            <Card className="border-0 shadow-lg shadow-black/5 dark:shadow-black/20">
+              <CardContent className="p-5 space-y-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <Layers className="h-4 w-4 text-teal-600 dark:text-teal-400" />
+                  <span className="text-sm font-semibold text-foreground">{t('services' as any)}</span>
+                </div>
+
+                <p className="text-xs text-muted-foreground -mt-2">
+                  {t('servicesStepDesc' as any)}
+                </p>
+
+                <div className="space-y-2.5">
+                  {services.map((row, index) => (
+                    <div key={index} className="flex items-center gap-2">
+                      {/* Prefix badge/input */}
+                      <div className="shrink-0">
+                        <Input
+                          value={row.prefix}
+                          onChange={(e) => {
+                            const v = e.target.value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 1);
+                            updateServiceRow(index, { prefix: v });
+                          }}
+                          className="h-12 w-11 text-center font-mono font-bold rounded-xl"
+                          maxLength={1}
+                          aria-label={t('servicePrefix' as any)}
+                          dir="ltr"
+                        />
+                      </div>
+                      {/* Service name */}
+                      <div className="flex-1">
+                        <Input
+                          value={row.name}
+                          onChange={(e) => updateServiceRow(index, { name: e.target.value })}
+                          placeholder={t('serviceNamePlaceholder' as any)}
+                          className="h-12 rounded-xl"
+                          maxLength={100}
+                          aria-label={t('serviceName' as any)}
+                        />
+                      </div>
+                      {/* Remove row */}
+                      <button
+                        type="button"
+                        onClick={() => removeServiceRow(index)}
+                        disabled={services.length <= 1}
+                        aria-label={t('delete' as any)}
+                        className="h-11 w-11 shrink-0 rounded-xl flex items-center justify-center text-muted-foreground hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors disabled:opacity-30 disabled:pointer-events-none"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                {errors.serviceName && (
+                  <motion.p
+                    initial={{ opacity: 0, y: -4 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="text-xs text-red-500"
+                  >
+                    {errors.serviceName}
+                  </motion.p>
+                )}
+
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={addServiceRow}
+                  disabled={services.length >= 20}
+                  className="w-full h-10 rounded-xl gap-1.5 border-dashed text-emerald-600 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+                >
+                  <Plus className="h-4 w-4" />
+                  {t('addService' as any)}
+                </Button>
+              </CardContent>
+            </Card>
+          )}
+
+          {/* Step 4: Preview */}
+          {step === 4 && (
+            <Card className="border-0 shadow-lg shadow-black/5 dark:shadow-black/20">
+              <CardContent className="p-5 space-y-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <Eye className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                  <span className="text-sm font-semibold text-foreground">{t('preview' as any)}</span>
+                </div>
+
+                <p className="text-xs text-muted-foreground -mt-1">
+                  {t('previewDescription' as any)}
+                </p>
+
+                {/* Basic Info Preview */}
+                <PreviewSection
+                  title={t('basicInfo' as any)}
+                  icon={Store}
+                  onEdit={() => goToStep(0)}
+                >
+                  <PreviewRow label={t('agencyName' as any)} value={name} />
+                  {nameAr && <PreviewRow label={t('agencyNameAr' as any)} value={nameAr} dir="rtl" />}
+                  {nameFr && <PreviewRow label={t('agencyNameFr' as any)} value={nameFr} dir="ltr" />}
+                  <PreviewRow label={t('agencyCategory' as any)} value={getSelectedCategoryLabel()} />
+                </PreviewSection>
+
+                {/* Contact Details Preview */}
+                <PreviewSection
+                  title={t('contactDetails' as any)}
+                  icon={Briefcase}
+                  onEdit={() => goToStep(1)}
+                >
+                  {composeLocationLabel(wilayaCode, communeName, lang) && (
+                    <PreviewRow label={t('location.wilaya' as any)} value={composeLocationLabel(wilayaCode, communeName, lang) || ''} />
+                  )}
+                  {address && <PreviewRow label={t('agencyAddress' as any)} value={address} />}
+                  {postalCode && <PreviewRow label={t('maps.postalCode' as any)} value={postalCode} dir="ltr" />}
+                  {latitude != null && longitude != null && (
+                    <PreviewRow
+                      label={t('maps.location' as any)}
+                      value={`${latitude.toFixed(6)}, ${longitude.toFixed(6)}`}
+                      dir="ltr"
+                    />
+                  )}
+                  {phone && <PreviewRow label={t('phoneNumber' as any)} value={phone} dir="ltr" />}
+                  {email && <PreviewRow label={t('email' as any)} value={email} dir="ltr" />}
+                  {description && <PreviewRow label={t('description' as any)} value={description.length > 80 ? `${description.slice(0, 80)}...` : description} />}
+                  {customCode && <PreviewRow label={t('agencyCodeField' as any)} value={customCode} dir="ltr" />}
+                  {!address && !phone && !email && !description && !customCode && !composeLocationLabel(wilayaCode, communeName, lang) && (
+                    <span className="text-xs text-muted-foreground italic">{t('noData' as any)}</span>
+                  )}
+                </PreviewSection>
+
+                {/* Working Hours Preview */}
+                <PreviewSection
+                  title={t('workingHours' as any)}
+                  icon={Clock}
+                  onEdit={() => goToStep(2)}
+                >
+                  <PreviewRow label={t('workingHoursStart' as any)} value={workingHoursStart} dir="ltr" />
+                  <PreviewRow label={t('workingHoursEnd' as any)} value={workingHoursEnd} dir="ltr" />
+                  <PreviewRow
+                    label={t('workingDays' as any)}
+                    value={workingDays.slice().sort((a, b) => a - b).map((d) => dayLabels[d]).join(' · ')}
+                  />
+                </PreviewSection>
+
+                {/* Services Preview (Round 15) */}
+                <PreviewSection
+                  title={t('services' as any)}
+                  icon={Layers}
+                  onEdit={() => goToStep(3)}
+                >
+                  {filledServices.length ? (
+                    filledServices.map((s, i) => (
+                      <PreviewRow key={i} label={s.prefix || String.fromCharCode(65 + i)} value={s.name} />
+                    ))
+                  ) : (
+                    <span className="text-xs text-muted-foreground italic">{t('noData' as any)}</span>
+                  )}
+                </PreviewSection>
+
+                {/* Confirmation notice */}
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: 0.3 }}
+                  className="flex items-start gap-2 p-3 rounded-xl bg-emerald-50 dark:bg-emerald-900/10 border border-emerald-200/50 dark:border-emerald-800/30"
+                >
+                  <CircleDot className="h-4 w-4 text-emerald-500 mt-0.5 shrink-0" />
+                  <p className="text-xs text-emerald-700 dark:text-emerald-300 leading-relaxed">
+                    {t('previewConfirmation' as any)}
+                  </p>
+                </motion.div>
+              </CardContent>
+            </Card>
+          )}
+        </motion.div>
+      </AnimatePresence>
+
+      {/* Navigation Buttons */}
+      <div className="flex items-center justify-between mt-5 gap-3">
+        {step > 0 ? (
+          <Button
+            variant="outline"
+            onClick={handleBack}
+            className="gap-1.5 rounded-xl h-10"
+          >
+            <ArrowLeft className="h-3.5 w-3.5 rtl:rotate-180" />
+            {t('back' as any)}
+          </Button>
+        ) : (
+          <div />
+        )}
+
+        {step < totalSteps - 1 ? (
+          <Button
+            onClick={handleNext}
+            className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white gap-1.5 shadow-sm rounded-xl h-10 px-5"
+          >
+            {t('next' as any)}
+            <ArrowRight className="h-3.5 w-3.5 rtl:rotate-180" />
+          </Button>
+        ) : (
+          <Button
+            onClick={handleCreate}
+            disabled={creating}
+            className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white gap-1.5 shadow-lg shadow-emerald-500/20 rounded-xl h-10 px-5"
+          >
+            {creating ? (
+              <>
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t('creating' as any)}
+              </>
+            ) : (
+              <>
+                <Building2 className="h-4 w-4" />
+                {t('createAgency' as any)}
+              </>
+            )}
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,10478 @@
+/**
+ * BLASTI Embedded Local API Server
+ *
+ * A Hono-based HTTP server that runs inside Electron on localhost.
+ * Agent-scoped: every query is filtered by the logged-in agent's agencyId.
+ *
+ * Architecture:
+ *   Electron BrowserWindow → http://127.0.0.1:3080/api/* → Hono → SQLite
+ *                                                         → Background Sync → Cloud API (when online)
+ *
+ * Security:
+ *   - Binds 127.0.0.1 by default; LAN-reachable only when explicitly enabled
+ *     (BLASTI_LAN_BIND=lan/<ip> or BLASTI_ENABLE_LAN=1 — the packaged desktop
+ *     app enables LAN mode by default so kiosks/TV boards can discover it)
+ *   - Per-launch session token (random hex, timing-safe comparison)
+ *   - All requests (except health/login/discover/sync-status) require valid session token
+ *   - NO admin endpoints — agent-level only
+ *
+ * This file is meant to be run inside Electron's main process,
+ * NOT as a standalone Node.js script.
+ */
+
+const { Hono } = require('hono')
+const { cors } = require('hono/cors')
+const { createServer } = require('http')
+const { randomBytes, timingSafeEqual, createHash, scryptSync } = require('crypto')
+const { localDb, setupPragmas, ensureDatabaseReady } = require('./lib/db')
+const localRealtime = require('./local-realtime')
+const fileStore = require('./lib/file-store')
+const { createFileSync } = require('./lib/file-sync')
+
+// ─── Diagnostic file logger ("data loading failed" investigation) ───────────
+// Shared with the main process (initial sync) so both sides land in ONE
+// rolling timeline: <userData>/logs/local-api-diag.log. See lib/diag-log.js.
+const { diagLog } = require('./lib/diag-log')
+
+// Agency device management + embedded LAN discovery + cast (Task A 2-c).
+// Port of apps/api/src/routes/agency-devices.ts — serves the device-management
+// UI fully offline against the local SQLite mirror.
+const registerAgencyDeviceRoutes = require('./agency-devices')
+
+// Device-facing endpoints (/public/*, /device/*) — lets TV boards & kiosks
+// register, pair, heartbeat and pull live queue data from the LOCAL API
+// (LAN mode / offline), closing the parity gap with the cloud API.
+const { registerDeviceBoardRoutes } = require('./lib/device-board-routes')
+
+// ─── Configuration ────────────────────────────────────────────────────────
+
+const DEFAULT_PORT = 3080
+// ─── LAN reachability (P0: kiosks could not discover the desktop) ──────────
+// Bind address is configurable via lib/lan-origin.js:
+//   BLASTI_LAN_BIND  = 'loopback' (default) | 'lan' (→ 0.0.0.0) | explicit IP
+//   BLASTI_ENABLE_LAN = 1/true — shorthand for BLASTI_LAN_BIND=lan
+// When bound to the LAN the CORS layer also accepts private http origins
+// (http://192.168.x.y:port) and the /api/discover beacon carries the LAN IP.
+const { resolveLanBind, isLanHttpOrigin, bestLanIp, primaryLanInterface } = require('./lib/lan-origin')
+const LAN_BIND = resolveLanBind()
+const LAN_ENABLED = LAN_BIND.lan
+const BIND_ADDRESS = LAN_BIND.bind
+const CORS_ORIGINS = [
+  'http://localhost:3000',
+  'http://localhost:3080',
+  'http://localhost:3111',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3080',
+  'http://127.0.0.1:3111',
+]
+
+// ─── Module-level State ───────────────────────────────────────────────────
+
+let db = null
+let httpServer = null
+let sessionToken = null
+let sessionUser = null
+
+// Task 41 — token-rotation grace.
+// WHY: the cloud re-issues the session token on every import-session /
+// refresh-session validation. The MAIN process imports the session at startup
+// and adopts the refreshed token, while the RENDERER keeps presenting the
+// previous token from localStorage until it re-imports. With a strict
+// current-token-only compare, every renderer request in that window 401s —
+// the direct cause of the intermittent "data loading failed" dashboard popup
+// (all 4 dashboard fetches fail at once) and of the local-realtime
+// "auth event rejected" spam. We therefore keep the IMMEDIATE predecessor
+// token (same session, rotated by our own code) valid for a grace window.
+let previousSessionToken = null
+let previousSessionTokenAt = 0
+const SESSION_TOKEN_GRACE_MS = 30 * 60 * 1000 // 30 minutes
+
+let eventListeners = []
+let mutationListeners = []
+let idemColumnEnsured = false
+let outboxV3Ensured = false
+
+// Round 15 — local file store origin + file-sync worker handle. The local
+// origin is what every locally stored file URL is built against; it is
+// refreshed at startLocalApi() with the actual bound port.
+let localOrigin = `http://${BIND_ADDRESS}:${DEFAULT_PORT}`
+let fileSync = null
+
+// ─── Task 51: Map configuration cache (GET /api/config/maps) ────────────────
+// Desktop parity of the cloud's public map config (spec §39 Electron: "use the
+// same provider abstraction"; §40: offline behavior). The route tries the
+// cloud FIRST (freshest Super-Admin configuration), and falls back to the last
+// cached config while offline.
+//
+// SECRETS (spec §45/§46) — the Google Maps JS key (jsApiKey) is
+// referrer-restricted by design and the cloud serves it to browsers, but the
+// desktop must NEVER persist API keys in the local SQLite database:
+//   - `mapsConfigMemoryCache` (module variable) holds the FULL cloud response,
+//     jsApiKey included, for the lifetime of this process only (memory).
+//   - the `_sync_meta` persisted copy (`maps_config_cache`) carries
+//     jsApiKey: null — see stripMapsSecretsForPersist() below.
+// Server-side Google keys (maps.google.apiKey / maps.geocoding.apiKey) never
+// appear in this config at any layer — the cloud itself withholds them.
+let mapsConfigMemoryCache = null // { config, fetchedAt (epoch ms) }
+const MAPS_CONFIG_MEMORY_TTL_MS = 30 * 1000 // serve from memory without re-probing the cloud
+const MAPS_CONFIG_META_KEY = 'maps_config_cache'
+const MAPS_CLOUD_PROBE_TIMEOUT_MS = 5000
+
+/**
+ * Task 51 — the built-in default map configuration (offline fallback tier 3).
+ * Mirrors the cloud's MAPS_DEFAULTS + buildMapsConfig() output (apps/api/src/
+ * lib/map-settings.ts) and the verified 51-a contract envelope byte-for-byte:
+ * OpenFreeMap-first so the map works with zero configuration.
+ */
+const DEFAULT_MAPS_CONFIG = {
+  provider: 'OPENFREEMAP',
+  fallbackProvider: 'NONE',
+  mapsEnabled: true,
+  directionsEnabled: true,
+  openfreemap: { styleUrl: 'https://tiles.openfreemap.org/styles/liberty' },
+  google: { configured: false, geocodingEnabled: true, jsApiKey: null },
+  geocoding: { provider: 'OSM' },
+  directions: {
+    destinationMode: 'COORDINATES',
+    origin: 'CURRENT_LOCATION',
+    openBehavior: 'AUTO',
+    buttonLabel: null,
+  },
+}
+
+/**
+ * Task 51 (spec §45/§46) — copy of a maps config that is SAFE TO PERSIST.
+ * Strips the Google Maps JS key (jsApiKey → null) so no API key is ever
+ * written to the local database; the live value passes through memory only.
+ */
+function stripMapsSecretsForPersist(config) {
+  if (!config || typeof config !== 'object') return config
+  let copy
+  try { copy = JSON.parse(JSON.stringify(config)) } catch { return null }
+  if (copy.google && typeof copy.google === 'object') copy.google.jsApiKey = null
+  return copy
+}
+
+// ─── Local Device Identity & Unlock Credentials (Task 14) ───────────────
+// Desktop authentication model:
+//
+//   CLOUD LOGIN (password enters ONLY here, over 127.0.0.1 or the cloud)
+//        → create/update the LOCAL OPERATIONAL User (profile-only)
+//        → create LocalDeviceCredential for THIS user on THIS device
+//        → logout / restart
+//        → LOCAL UNLOCK (scrypt verifier check — no cloud, no User.passwordHash)
+//
+// User.passwordHash stays NULL for synced profiles: the cloud sync feed
+// never ships authentication secrets. Only the user who actually logged in
+// on THIS device receives a credential — every other synced user has none.
+// The optional "keep signed in" flag is persisted in _sync_meta and controls
+// whether the app auto-restores the session on restart or requires unlock.
+
+const UNLOCK_SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64 }
+
+async function getLocalMeta(key) {
+  try {
+    const rows = await db.$queryRawUnsafe('SELECT value FROM "_sync_meta" WHERE key = ?', key)
+    return rows && rows[0] ? String(rows[0].value) : null
+  } catch { return null }
+}
+
+async function setLocalMeta(key, value) {
+  await db.$executeRawUnsafe(
+    'INSERT INTO "_sync_meta" ("key", "value") VALUES (?, ?) ' +
+    'ON CONFLICT("key") DO UPDATE SET "value" = excluded."value"',
+    key, String(value)
+  )
+}
+
+// ─── Authorization (workspace lock) state — Task 33-C ─────────────────────
+// The workspace lock lives in _sync_meta ('authorization_status') and is
+// cached in memory so requireAuth() never adds a SQL query per request.
+//   'AUTHORIZED' → fresh proof of authorization (cloud refresh 200 / fresh
+//                  cloud login / validated import).
+//   'REVOKED'    → the cloud EXPLICITLY rejected the session (401/403 from a
+//                  REACHABLE cloud) — every protected route 423s, offline
+//                  unlock is rejected, sync + file-sync are stopped.
+//   null         → unknown — behaves exactly like the pre-33-C local API.
+// The cache uses a short TTL (covers cross-module writes from sync-service)
+// plus explicit invalidation on every write performed here.
+let authzStatusCache = null
+let authzStatusReadAt = 0
+const AUTHZ_CACHE_TTL_MS = 5000
+
+function invalidateAuthzCache() {
+  authzStatusCache = null
+  authzStatusReadAt = 0
+}
+
+async function getAuthorizationStatus() {
+  const now = Date.now()
+  if (authzStatusCache && now - authzStatusReadAt < AUTHZ_CACHE_TTL_MS) {
+    return authzStatusCache
+  }
+  try {
+    const v = await getLocalMeta('authorization_status')
+    authzStatusCache = (v === 'REVOKED' || v === 'AUTHORIZED') ? v : null
+    authzStatusReadAt = now
+  } catch {
+    authzStatusCache = null
+  }
+  return authzStatusCache
+}
+
+/**
+ * Task 33-C — record FRESH PROOF of authorization. Called after a REAL cloud
+ * login (local login path 3 / main.js cloud-sync:set-auth) or a validated
+ * import-session. Clears the workspace lock (meta + cache + sync engine).
+ * Returns true when a REVOKED lock was actually lifted (restore logging).
+ */
+async function markAuthorizationAuthorized() {
+  let prev = null
+  try { prev = await getAuthorizationStatus() } catch { /* best effort */ }
+  authzStatusCache = 'AUTHORIZED'
+  authzStatusReadAt = Date.now()
+  try {
+    if (db) await setLocalMeta('authorization_status', 'AUTHORIZED')
+  } catch { /* best effort */ }
+  try {
+    const syncService = require('./sync-service')
+    if (typeof syncService.markAuthorizationAuthorized === 'function') {
+      syncService.markAuthorizationAuthorized()
+    }
+  } catch { /* engine not loaded — degrade gracefully */ }
+  if (prev === 'REVOKED') {
+    console.log('[LocalAPI] Authorization restored via fresh login')
+  }
+  return true
+}
+
+/**
+ * Task 33-C — the LOCAL revocation routine (workspace LOCK). Invoked by the
+ * sync engine (confirmed cloud rejection) and by the import-session
+ * validator. Hard user requirements honored:
+ *   - offline unlock credentials are REVOKED (revokedAt set), NEVER deleted;
+ *   - data tables (Agency, branches, reservations, transactions, …) are
+ *     NEVER touched — access is locked, data is kept for recovery/audit;
+ *   - the local session is cleared and the file-sync worker stopped;
+ *   - the sync engine is stopped + its auth cleared (guarded — safe if the
+ *     caller already did it; stopSync/clearAuth are idempotent).
+ */
+async function revokeLocalAuthorization(reason) {
+  const revokedReason = String(reason || 'token-rejected')
+  console.log(`[LocalAPI] Workspace LOCKED — authorization revoked (${revokedReason})`)
+  try {
+    if (db) {
+      await setLocalMeta('authorization_status', 'REVOKED')
+      await setLocalMeta('authorization_revoked_at', new Date().toISOString())
+      await setLocalMeta('authorization_reason', revokedReason)
+    }
+  } catch (metaErr) {
+    console.warn('[LocalAPI] Could not persist revocation meta:', metaErr?.message || metaErr)
+  }
+  try {
+    if (db && db.localDeviceCredential && sessionUser && sessionUser.id) {
+      const res = await db.localDeviceCredential.updateMany({
+        where: { userId: sessionUser.id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      })
+      if (res && res.count) {
+        console.log(`[LocalAPI] Revoked ${res.count} local device credential(s) — offline unlock disabled while locked (rows kept)`)
+      }
+    }
+  } catch (credErr) {
+    console.warn('[LocalAPI] Could not revoke device credentials:', credErr?.message || credErr)
+  }
+  // Clear the local session — every protected route now fails (401/423).
+  try { clearSession() } catch { /* already cleared */ }
+  // Stop the file-sync worker (no more blob pushes/pulls while locked).
+  try { if (fileSync && typeof fileSync.stop === 'function') fileSync.stop() } catch { /* not started */ }
+  // Stop + clear the sync engine (guarded — the engine may have stopped
+  // itself already; both calls are idempotent).
+  try {
+    const syncService = require('./sync-service')
+    if (typeof syncService.markAuthorizationRevoked === 'function') syncService.markAuthorizationRevoked(revokedReason)
+    if (typeof syncService.clearAuth === 'function') syncService.clearAuth()
+    if (typeof syncService.stopSync === 'function') syncService.stopSync()
+  } catch { /* engine not loaded — degrade gracefully */ }
+  // Immediate cache hit for requireAuth (no TTL wait).
+  authzStatusCache = 'REVOKED'
+  authzStatusReadAt = Date.now()
+  // Notify in-process listeners + LAN realtime clients.
+  try { emitEvent('auth:revoked', { reason: revokedReason }) } catch { /* never fatal */ }
+  return true
+}
+
+/**
+ * Round 15 — LOCALIZE a file URL: when the URL points at a file that ALSO
+ * exists in this device's local file store, rewrite it to the local API
+ * origin so <img> tags render instantly and OFFLINE. Anything else (cloud
+ * URLs for files we never downloaded, data: URIs, …) passes through
+ * untouched — the cloud remains the cross-device source of truth.
+ */
+async function localizeFileUrl(url) {
+  try {
+    if (!url || typeof url !== 'string' || url.indexOf('/api/upload/file/') === -1) return url
+    const storagePath = fileStore.storagePathFromUrl(url)
+    if (!storagePath) return url
+    const abs = fileStore.resolveRelativeStoragePath(storagePath)
+    if (abs && require('fs').existsSync(abs)) {
+      return localOrigin + fileStore.publicFilePath(storagePath)
+    }
+    return url
+  } catch {
+    return url
+  }
+}
+
+/**
+ * Resolve the agency id the current session may read/write, mirroring the
+ * cloud's ensureAgencyIdOwnership/requireAgencyAccess pair.
+ *
+ * The web UI always sends ?agencyId=<user.agencyId> on /api/agency/* reads,
+ * but the local endpoints used to ignore it and read sessionUser.agencyId —
+ * when the local session carried no agencyId (e.g. an owner re-login before
+ * the owner fallback existed) every read 403'd and the profile/settings
+ * pages rendered empty. This helper accepts the explicit param ONLY when the
+ * session user genuinely has access to that agency.
+ */
+// ─── Task 40: shared local agency resolution (owner fallback) ───────────────
+//
+// Wizard-created agency owners are bound via Agency.ownerId ONLY — the real
+// create flow never creates an AgencyStaff row and the cloud User row keeps
+// agencyId NULL. The local-unlock login path already resolved the agency via
+// buildStaffAgencyId(), but the CLOUD-login path and import-session copied
+// `agencyId` from the payload verbatim — a null there produced a session (and
+// a renderer user object) with agencyId:null, and every route that trusts the
+// session agency (branch list, staff, profile …) then 403'd or silently
+// returned an empty list on desktop while the SAME account worked on the
+// webapp (cloud routes self-resolve per request via resolveUserAgencyId).
+//
+// This module-level helper mirrors the cloud contract (auth.ts
+// resolveUserAgencyId) against the LOCAL database: staff row first, then
+// owned agency. Safe to call with any partial user object.
+
+async function lookupLocalAgencyIdForUser(userData) {
+  if (!userData || !userData.id || !db) return null
+  try {
+    if (userData.role === 'AGENCY_OWNER' || userData.role === 'AGENCY_STAFF') {
+      const staff = await db.agencyStaff.findFirst({
+        where: { userId: userData.id, isActive: true },
+      })
+      if (staff) return staff.agencyId
+      if (userData.role === 'AGENCY_OWNER') {
+        const owned = await db.agency.findFirst({
+          where: { ownerId: userData.id },
+          // Task 43: deterministic pick — mirrors the cloud contract
+          // (oldest owned agency wins) so the local session can never bind
+          // a different agency than the cloud login did.
+          orderBy: { createdAt: 'asc' },
+        })
+        if (owned) return owned.id
+      }
+    }
+  } catch (e) {
+    console.warn('[LocalAPI] Agency lookup for user failed (non-fatal):', e && e.message)
+  }
+  return null
+}
+
+/**
+ * Task 40: fill in a null/blank agencyId on a session-shaped user object.
+ * Mutates and returns the same object; returns the input untouched when an
+ * agencyId is already present. Used by the cloud-login and import-session
+ * paths so the renderer ALWAYS receives a usable agencyId for owners/staff.
+ */
+async function hydrateSessionAgencyId(sessionData) {
+  if (!sessionData || sessionData.agencyId) return sessionData
+  try {
+    const resolved = await lookupLocalAgencyIdForUser(sessionData)
+    if (resolved) {
+      sessionData.agencyId = resolved
+      console.log('[LocalAPI] Session agencyId hydrated from local ownership:', sessionData.username, '→', resolved)
+    }
+  } catch { /* keep null — routes will report the actionable 403 */ }
+  return sessionData
+}
+
+async function resolveSessionAgencyId(explicitAgencyId) {
+  const sessionAgencyId = sessionUser ? sessionUser.agencyId : null
+  if (!explicitAgencyId) return sessionAgencyId
+  if (sessionAgencyId && explicitAgencyId === sessionAgencyId) return explicitAgencyId
+  if (!sessionUser) return null
+  try {
+    if (sessionUser.role === 'AGENCY_OWNER') {
+      const owned = await db.agency.findFirst({ where: { id: explicitAgencyId, ownerId: sessionUser.id } })
+      if (owned) return explicitAgencyId
+    }
+    const staff = await db.agencyStaff.findFirst({
+      where: { agencyId: explicitAgencyId, userId: sessionUser.id, isActive: true },
+    })
+    if (staff) return explicitAgencyId
+  } catch { /* fall through */ }
+  // Task 37-a: an explicit agencyId that fails ownership used to hard-null
+  // here — every route resolving through this helper then 403'd (and the UI
+  // silently rendered empty lists) whenever the renderer carried a stale
+  // user.agencyId. Fall back to the SESSION agency instead; still null only
+  // when the session itself has none.
+  if (sessionAgencyId) {
+    console.warn('[branches] requested agencyId %s failed ownership — falling back to session agency %s', explicitAgencyId, sessionAgencyId)
+    return sessionAgencyId
+  }
+  // Task 40: the session has no agencyId (cloud login for an account row
+  // without one, or an import-session payload snapshot) — try the LOCAL
+  // ownership lookup once before giving up, mirroring the cloud's
+  // resolveUserAgencyId contract.
+  const hydrated = await lookupLocalAgencyIdForUser(sessionUser)
+  if (hydrated) {
+    try {
+      sessionUser.agencyId = hydrated
+    } catch { /* session object read-only — ignore */ }
+    console.warn('[branches] session agencyId was null — hydrated from local ownership:', hydrated)
+    return explicitAgencyId === hydrated ? explicitAgencyId : hydrated
+  }
+  return null
+}
+
+// ─── Task 37-d: 2-tier staff authority (mirror of the cloud contract) ──────
+//
+// Authority model (apps/api/src/routes/agency.ts — the parallel cloud task
+// implements the SAME contract):
+//   - OWNER  : sessionUser.role === 'AGENCY_OWNER', or SUPER_ADMIN, or the
+//              Agency row's ownerId matches the session user id. Bypasses ALL
+//              permission checks.
+//   - MANAGER/STAFF : an ACTIVE AgencyStaff row for (session user, agency).
+//              Permissions come from the normalized boolean columns (the 12
+//              keys below); the legacy JSON `permissions` column is kept in
+//              sync and used as fallback when the local Prisma client
+//              predates one of the new columns (transition window).
+
+const STAFF_PERMISSION_KEYS = [
+  'canManageQueue',
+  'canManageServices',
+  'canManageStaff',
+  'canViewAnalytics',
+  'canManageBranches',
+  'canManageWorkingHours',
+  'canExportData',
+  'canManageProfile',
+  'canCreateBranches',
+  'canDeleteBranches',
+  'canPurchaseSubscription',
+  'canManageSubscription',
+]
+
+// Columns added in Task 37-d — used to detect (and gracefully degrade when)
+// a stale generated Prisma client does not know them yet.
+const NEW_STAFF_PERMISSION_COLUMNS = [
+  'canCreateBranches',
+  'canDeleteBranches',
+  'canPurchaseSubscription',
+  'canManageSubscription',
+]
+const NEW_COUNTER_COLUMNS = ['occupiedAt']
+
+// Tier defaults applied on a role change (mirror the cloud exactly):
+//   STAFF   → queue + analytics only.
+//   MANAGER → queue, analytics, branch create/delete, subscription
+//             purchase/manage, profile — NOT staff/services/branches/
+//             working-hours/export.
+const STAFF_TIER_DEFAULTS = {
+  canManageQueue: true,
+  canManageServices: false,
+  canManageStaff: false,
+  canViewAnalytics: true,
+  canManageBranches: false,
+  canManageWorkingHours: false,
+  canExportData: false,
+  canManageProfile: false,
+  canCreateBranches: false,
+  canDeleteBranches: false,
+  canPurchaseSubscription: false,
+  canManageSubscription: false,
+}
+const MANAGER_TIER_DEFAULTS = {
+  canManageQueue: true,
+  canManageServices: false,
+  canManageStaff: false,
+  canViewAnalytics: true,
+  canManageBranches: false,
+  canManageWorkingHours: false,
+  canExportData: false,
+  canManageProfile: true,
+  canCreateBranches: true,
+  canDeleteBranches: true,
+  canPurchaseSubscription: true,
+  canManageSubscription: true,
+}
+
+function allPermissionsTrue() {
+  const out = {}
+  for (const key of STAFF_PERMISSION_KEYS) out[key] = true
+  return out
+}
+
+function parseLegacyPermissionsJson(json) {
+  if (!json) return {}
+  if (typeof json === 'object') return json
+  try { return JSON.parse(json) || {} } catch { return {} }
+}
+
+/**
+ * Effective permission map for a staff row. The normalized boolean columns
+ * are authoritative; when a column is missing from the row (stale local
+ * Prisma client in the transition window) the parsed legacy JSON decides.
+ */
+function permissionsFromStaffRow(row) {
+  const legacy = parseLegacyPermissionsJson(row ? row.permissions : null)
+  const out = {}
+  for (const key of STAFF_PERMISSION_KEYS) {
+    const value = row ? row[key] : undefined
+    out[key] = typeof value === 'boolean' ? value : legacy[key] === true
+  }
+  return out
+}
+
+/** Owner test per the contract: role flag OR agency.ownerId match. SUPER_ADMIN bypasses too. */
+function isAgencyOwnerUser(user, agency) {
+  if (!user) return false
+  if (user.role === 'AGENCY_OWNER' || user.role === 'SUPER_ADMIN') return true
+  return Boolean(agency && agency.ownerId && user && user.id && agency.ownerId === user.id)
+}
+
+/**
+ * Resolve the caller's agency + authority context in one place.
+ * Returns null when no agency can be attributed to the session (the caller
+ * then gets the route's regular "no agency" 403).
+ */
+async function resolveAuthorityContext(explicitAgencyId) {
+  if (!db || !sessionUser) return null
+  const isSuperAdmin = sessionUser.role === 'SUPER_ADMIN'
+  let agencyId = await resolveSessionAgencyId(explicitAgencyId)
+  if (!agencyId && isSuperAdmin && explicitAgencyId) {
+    // SUPER_ADMIN has neither a session agency nor a staff row — platform
+    // admins address an agency explicitly (cloud admin parity).
+    agencyId = explicitAgencyId
+  }
+  if (!agencyId) return null
+  const agency = await db.agency.findUnique({ where: { id: agencyId } }).catch(() => null)
+  if (!agency) return null
+  const isOwner = isAgencyOwnerUser(sessionUser, agency)
+  let staffRow = null
+  if (!isOwner) {
+    staffRow = await db.agencyStaff.findFirst({
+      where: { userId: sessionUser.id, agencyId, isActive: true },
+    }).catch(() => null)
+  }
+  return {
+    agencyId,
+    agency,
+    isOwner,
+    staffRow,
+    staffId: staffRow ? staffRow.id : null,
+    role: isOwner ? 'OWNER' : (staffRow ? staffRow.role : null),
+    permissions: isOwner ? allPermissionsTrue() : permissionsFromStaffRow(staffRow),
+  }
+}
+
+function permissionDeniedBody(permission) {
+  return { success: false, error: `PERMISSION_DENIED:${permission}` }
+}
+
+/**
+ * Enforcement-matrix gate (Task 37-d). Owner/SUPER_ADMIN bypass; everyone
+ * else needs AT LEAST ONE of the given permissions on their ACTIVE
+ * AgencyStaff row of the resolved agency (most routes pass exactly one; the
+ * branch PATCH/PUT route passes the create/delete pair per the matrix).
+ * Denials report the FIRST permission in the list. Returns
+ * { ok:true, ctx } or { ok:false, status, body }.
+ */
+async function checkAgencyPermission(explicitAgencyId, ...permissions) {
+  const primary = permissions[0]
+  const ctx = await resolveAuthorityContext(explicitAgencyId)
+  if (!ctx) {
+    return { ok: false, status: 403, body: { success: false, error: 'No agency associated with this account' } }
+  }
+  if (!ctx.isOwner && !permissions.some((permission) => ctx.permissions[permission])) {
+    return { ok: false, status: 403, body: permissionDeniedBody(primary) }
+  }
+  return { ok: true, ctx }
+}
+
+/**
+ * Strict OWNER-ONLY gate (staff management routes). Unlike
+ * checkAgencyPermission there is deliberately NO session-agency fallback:
+ * when the request names an explicit agency, the caller must own THAT
+ * agency — a stale/foreign agencyId can never pass by silently resolving
+ * to the session's own agency. Staff-management failures are reported as
+ * PERMISSION_DENIED:canManageStaff (the permission that semantically covers
+ * the action; per the contract only owners can ever pass).
+ */
+async function checkAgencyOwnerOnly(explicitAgencyId) {
+  if (!db || !sessionUser) {
+    return { ok: false, status: 403, body: { success: false, error: 'No agency associated with this account' } }
+  }
+  const targetId = explicitAgencyId || sessionUser.agencyId
+  if (!targetId) {
+    return { ok: false, status: 403, body: { success: false, error: 'No agency associated with this account' } }
+  }
+  const agency = await db.agency.findUnique({ where: { id: targetId } }).catch(() => null)
+  if (!agency || !isAgencyOwnerUser(sessionUser, agency)) {
+    return { ok: false, status: 403, body: permissionDeniedBody('canManageStaff') }
+  }
+  return {
+    ok: true,
+    ctx: {
+      agencyId: targetId,
+      agency,
+      isOwner: true,
+      staffRow: null,
+      staffId: null,
+      role: 'OWNER',
+      permissions: allPermissionsTrue(),
+    },
+  }
+}
+
+/**
+ * Task 37-d OCCUPANCY RULE for the queue action routes: a non-owner caller
+ * must operate from a counter they personally occupy.
+ *   - staff without counterId                → denied OCCUPY_COUNTER_FIRST
+ *   - counter missing / outside the agency   → denied OCCUPY_COUNTER_FIRST
+ *   - counter occupied by another ACTIVE row → denied OCCUPY_COUNTER_FIRST
+ * Owner is unaffected (counterId optional, no occupancy requirement).
+ */
+async function checkCounterOccupancy(ctx, counterId) {
+  if (ctx.isOwner) return { ok: true, counter: null }
+  if (!counterId) {
+    return { ok: false, body: { success: false, error: 'OCCUPY_COUNTER_FIRST' } }
+  }
+  const counter = await db.counter.findUnique({
+    where: { id: counterId },
+    include: { branch: true },
+  }).catch(() => null)
+  if (!counter || !counter.branch || counter.branch.agencyId !== ctx.agencyId) {
+    return { ok: false, body: { success: false, error: 'OCCUPY_COUNTER_FIRST' } }
+  }
+  if (counter.staffId !== ctx.staffId) {
+    return { ok: false, body: { success: false, error: 'OCCUPY_COUNTER_FIRST' } }
+  }
+  return { ok: true, counter }
+}
+
+/**
+ * Task 37-d ticket-issuance gates (mirror of the cloud walk-in route,
+ * apps/api/src/routes/agency.ts — same order, same messages, same
+ * comparison style):
+ *   1. agency.isQueueOpen === false        → 400 'Queue is currently closed'
+ *   2. QueueSettings.isPaused              → 400 'Queue is currently paused'
+ *   3. active (WAITING|CALLED) >= maxActiveReservations → 400 'Queue is full'
+ * Returns null when issuance may proceed, else { status, body }.
+ */
+async function checkQueueIssuanceGates(agencyId) {
+  const agency = await db.agency.findUnique({
+    where: { id: agencyId },
+    include: { queueSettings: { take: 1, orderBy: { updatedAt: 'desc' } } },
+  }).catch(() => null)
+  if (!agency) return null // unknown agency — the route's own 404/403 paths apply
+  if (!agency.isQueueOpen) {
+    return { status: 400, body: { success: false, error: 'Queue is currently closed' } }
+  }
+  if (agency.queueSettings.length > 0 && agency.queueSettings[0].isPaused) {
+    return { status: 400, body: { success: false, error: 'Queue is currently paused' } }
+  }
+  const activeCount = await db.reservation.count({
+    where: { agencyId, status: { in: ['WAITING', 'CALLED'] } },
+  }).catch(() => 0)
+  if (activeCount >= agency.maxActiveReservations) {
+    return { status: 400, body: { success: false, error: 'Queue is full' } }
+  }
+  return null
+}
+
+/**
+ * Defensive write helper for the transition window: when the generated local
+ * Prisma client predates a Task 37-d column, a write naming it throws
+ * PrismaClientValidationError ("Unknown argument `x`"). `run(withoutColumns)`
+ * is invoked once with the offending column names so the caller can retry
+ * the write without them (the columns themselves are added to the local
+ * SQLite file by the schema convergence pass regardless).
+ */
+function isUnknownColumnError(err, columns) {
+  const msg = String((err && (err.message || err)) || '')
+  if (!/Unknown argument|Unknown arg|does not exist in the type/i.test(msg)) return false
+  return columns.some((col) => msg.includes(col))
+}
+
+/**
+ * Stable per-installation device id, persisted in _sync_meta on first use.
+ * LocalDeviceCredential is scoped to (user, device) — never global.
+ */
+async function getDeviceId() {
+  const existing = await getLocalMeta('device_id')
+  if (existing) return existing
+  const id = 'dev-' + randomBytes(12).toString('hex')
+  try { await setLocalMeta('device_id', id) } catch { /* next call retries */ }
+  return id
+}
+
+/** Derive the scrypt verifier hex for a password + salt hex. */
+function deriveUnlockVerifier(password, saltHex, params) {
+  const p = params || UNLOCK_SCRYPT
+  return scryptSync(
+    String(password),
+    Buffer.from(saltHex, 'hex'),
+    p.keylen,
+    { N: p.N, r: p.r, p: p.p, maxmem: 128 * 1024 * 1024 }
+  ).toString('hex')
+}
+
+/** Timing-safe verification of a password against a stored credential. */
+function verifierMatches(cred, password) {
+  try {
+    if (!cred || !cred.verifierHash || !cred.salt) return false
+    const candidate = scryptSync(
+      String(password),
+      Buffer.from(cred.salt, 'hex'),
+      UNLOCK_SCRYPT.keylen,
+      { N: cred.scryptN || UNLOCK_SCRYPT.N, r: cred.scryptR || UNLOCK_SCRYPT.r, p: cred.scryptP || UNLOCK_SCRYPT.p, maxmem: 128 * 1024 * 1024 }
+    )
+    const stored = Buffer.from(cred.verifierHash, 'hex')
+    if (stored.length !== candidate.length) return false
+    return timingSafeEqual(stored, candidate)
+  } catch { return false }
+}
+
+function cloudBaseUrl() {
+  return process.env.BLASTI_CLOUD_URL || 'http://localhost:3003'
+}
+
+/**
+ * Attempt a cloud login (username + password) from the local API. Used when
+ * the local profile has no unlock credential yet (first login through the
+ * LAN-failover path) or no local profile at all. NEVER throws.
+ */
+async function cloudLoginProxy(username, password, extra) {
+  const base = cloudBaseUrl()
+  try {
+    const res = await fetch(base + '/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ username, password }, extra || {})),
+      signal: AbortSignal.timeout(8000),
+    })
+    let data = null
+    try { data = await res.json() } catch { /* non-JSON error body */ }
+    return { ok: res.ok, status: res.status, data }
+  } catch (err) {
+    return { ok: false, status: 0, error: err?.message || 'cloud unreachable' }
+  }
+}
+
+/**
+ * Fast cloud reachability probe (Task 67). MUST hit /api/health — behind the
+ * VPS Caddy gateway only /api/* reaches the API; bare /health is answered by
+ * the Next.js web app (404), which made online users look offline.
+ */
+async function isCloudReachable(timeoutMs) {
+  try {
+    const res = await fetch(cloudBaseUrl() + '/api/health', {
+      method: 'GET',
+      signal: AbortSignal.timeout(timeoutMs || 2500),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Create/update the LOCAL OPERATIONAL User row from a cloud login user
+ * object — PROFILE-ONLY. Authentication secrets are never written here
+ * (passwordHash stays NULL for synced profiles).
+ *
+ * Task 5: `overrides` carries Algeria address fields captured from a
+ * register request body (wilaya two-digit code + commune Latin name) — the
+ * cloud register projection may not include them on older clouds, so the
+ * request body is the source of truth at registration time. Only non-empty
+ * string values are written; login/verify flows pass no overrides and never
+ * clear existing values.
+ */
+async function upsertLocalUserFromCloud(cloudUser, overrides) {
+  if (!cloudUser || !cloudUser.id || !db.user) return null
+  const profile = {
+    username: cloudUser.username || cloudUser.email || ('user-' + String(cloudUser.id).slice(-8)),
+    fullName: cloudUser.fullName || cloudUser.name || '',
+    email: cloudUser.email ?? null,
+    phoneNumber: cloudUser.phoneNumber ?? null,
+    shortAppId: cloudUser.shortAppId ?? null,
+    role: cloudUser.role || 'CUSTOMER',
+    language: cloudUser.language || 'ar',
+    avatarUrl: cloudUser.avatarUrl ?? null,
+    isActive: cloudUser.isActive !== false,
+  }
+  // Task 5 — Algeria address (cloud value first, request-body override as
+  // fallback; only non-empty strings, never cleared).
+  const wilaya = (typeof overrides?.wilaya === 'string' && overrides.wilaya.trim())
+    ? overrides.wilaya.trim().padStart(2, '0')
+    : (typeof cloudUser.wilaya === 'string' && cloudUser.wilaya.trim() ? cloudUser.wilaya.trim().padStart(2, '0') : null)
+  const commune = (typeof overrides?.commune === 'string' && overrides.commune.trim())
+    ? overrides.commune.trim()
+    : (typeof cloudUser.commune === 'string' && cloudUser.commune.trim() ? cloudUser.commune.trim() : null)
+  if (wilaya) profile.wilaya = wilaya
+  if (commune) profile.commune = commune
+  // Task 48 (layer 3): login-path stale-generation rescue. The cloud may
+  // have re-seeded — same email/username, NEW user id — while the local User
+  // table still holds the previous generation's row. Upsert-by-id then dies
+  // with P2002 on the unique columns. Probe the identity columns, delete the
+  // stale row (different id), and retry the upsert exactly once.
+  try {
+    await db.user.upsert({
+      where: { id: cloudUser.id },
+      update: profile,
+      create: Object.assign({ id: cloudUser.id }, profile),
+    })
+  } catch (e) {
+    const isUnique = (e && e.code === 'P2002') || /UNIQUE constraint failed/i.test(String((e && e.message) || ''))
+    if (!isUnique) throw e
+    let rescued = false
+    for (const field of ['email', 'username']) {
+      const value = profile[field]
+      if (!value) continue
+      const stale = await db.user.findFirst({ where: { [field]: value } }).catch(() => null)
+      if (stale && stale.id !== cloudUser.id) {
+        await db.user.delete({ where: { id: stale.id } }).catch(() => null)
+        rescued = true
+      }
+    }
+    if (!rescued) throw e
+    await db.user.upsert({
+      where: { id: cloudUser.id },
+      update: profile,
+      create: Object.assign({ id: cloudUser.id }, profile),
+    })
+    console.warn('[LocalAPI] Unique-conflict resolved for user ' + cloudUser.id + ' — stale-generation row replaced')
+  }
+  return Object.assign({ id: cloudUser.id }, profile)
+}
+
+// ─── Task 51: Agency location payload builder (spec §2/§3) ──────────────────
+// Mirrors the CLOUD contract exactly — apps/api/src/lib/validations.ts range/
+// enum checks + buildAgencyLocationPatch (apps/api/src/lib/map-settings.ts)
+// pair semantics — so an offline save written locally replays to the cloud
+// with the SAME acceptance rules (a locally-accepted payload the cloud would
+// 400 would otherwise loop as permanent_failed in the outbox).
+//
+//   - latitude  −90..90 or null   → else 400 "latitude must be between -90 and 90"
+//   - longitude −180..180 or null → else 400 "longitude must be between -180 and 180"
+//   - both numbers → pair write + locationUpdatedAt = now (SERVER-stamped,
+//     never client-set — the UI strips it from the body)
+//   - both null   → explicit clear ("not set by the user yet" round-trip);
+//     locationUpdatedAt is left untouched, same as the cloud
+//   - half pair   → 400 "latitude and longitude must be provided together ..."
+//   - postalCode: string ≤ 20 chars or null
+//   - locationVerified ∈ VERIFIED | UNVERIFIED | MANUAL
+//   - locationSource  ∈ GOOGLE | OPENFREEMAP | MANUAL | DEVICE_GPS
+//
+// Returns { ok: true, data } where data contains ONLY the location fields
+// present in the body (undefined = unchanged), or { ok: false, error } for the
+// caller to answer 400.
+const AGENCY_LOCATION_VERIFIED_VALUES = ['VERIFIED', 'UNVERIFIED', 'MANUAL']
+const AGENCY_LOCATION_SOURCE_VALUES = ['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']
+
+function buildAgencyLocationUpdate(body) {
+  const data = {}
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { ok: true, data }
+
+  // Coordinate range/type checks (before pair semantics — same order as the
+  // cloud: zod rejects a bad coordinate 400 before buildAgencyLocationPatch).
+  // null is NOT a type error here — it is nullable in the cloud schema and
+  // drives the explicit-clear case in the pair semantics below.
+  for (const field of ['latitude', 'longitude']) {
+    const v = body[field]
+    if (v === undefined || v === null) continue
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      return { ok: false, error: `${field} must be a number` }
+    }
+    const min = field === 'latitude' ? -90 : -180
+    const max = field === 'latitude' ? 90 : 180
+    if (v < min || v > max) {
+      return { ok: false, error: `${field} must be between ${min} and ${max}` }
+    }
+  }
+
+  // Pair semantics (mirrors buildAgencyLocationPatch).
+  const latPresent = body.latitude !== undefined
+  const lngPresent = body.longitude !== undefined
+  if (latPresent || lngPresent) {
+    const lat = latPresent ? body.latitude : undefined
+    const lng = lngPresent ? body.longitude : undefined
+    if (lat === null && lng === null) {
+      data.latitude = null
+      data.longitude = null
+    } else if (typeof lat === 'number' && typeof lng === 'number') {
+      data.latitude = lat
+      data.longitude = lng
+      data.locationUpdatedAt = new Date()
+    } else {
+      return {
+        ok: false,
+        error: 'latitude and longitude must be provided together (both numbers, or both null to clear the location)',
+      }
+    }
+  }
+
+  if (body.postalCode !== undefined) {
+    if (body.postalCode !== null && (typeof body.postalCode !== 'string' || body.postalCode.length > 20)) {
+      return { ok: false, error: 'postalCode must be a string of at most 20 characters' }
+    }
+    data.postalCode = body.postalCode
+  }
+
+  if (body.locationVerified !== undefined) {
+    if (!AGENCY_LOCATION_VERIFIED_VALUES.includes(body.locationVerified)) {
+      return { ok: false, error: 'locationVerified must be one of VERIFIED, UNVERIFIED, MANUAL' }
+    }
+    data.locationVerified = body.locationVerified
+  }
+
+  if (body.locationSource !== undefined) {
+    if (!AGENCY_LOCATION_SOURCE_VALUES.includes(body.locationSource)) {
+      return { ok: false, error: 'locationSource must be one of GOOGLE, OPENFREEMAP, MANUAL, DEVICE_GPS' }
+    }
+    data.locationSource = body.locationSource
+  }
+
+  return { ok: true, data }
+}
+
+/**
+ * Store/refresh THIS user's LocalDeviceCredential for THIS device from a
+ * plaintext password (the only moment the password exists locally), and
+ * optionally persist the keep-signed-in preference.
+ */
+async function storeDeviceCredential(userId, password, keepSignedIn) {
+  if (!db.localDeviceCredential) {
+    console.warn('[LocalAPI] localDeviceCredential model unavailable — regenerate the Prisma client (cd packages/db && npx prisma generate)')
+    return null
+  }
+  const deviceId = await getDeviceId()
+  const salt = randomBytes(16).toString('hex')
+  const verifierHash = deriveUnlockVerifier(password, salt)
+  const existing = await db.localDeviceCredential.findUnique({
+    where: { userId_deviceId: { userId, deviceId } },
+  }).catch(() => null)
+  if (existing) {
+    await db.localDeviceCredential.update({
+      where: { id: existing.id },
+      data: { verifierHash, salt, revokedAt: null },
+    })
+  } else {
+    await db.localDeviceCredential.create({ data: { userId, deviceId, verifierHash, salt } })
+  }
+  if (typeof keepSignedIn === 'boolean') {
+    await setLocalMeta('keep_signed_in', keepSignedIn ? 'true' : 'false')
+  }
+  return deviceId
+}
+
+// ─── Event Emitter (UI reactivity) ────────────────────────────────────────
+
+/**
+ * Emit a local event to all registered UI listeners.
+ * @param {string} event
+ * @param {object} payload
+ */
+function emitEvent(event, payload) {
+  for (const cb of eventListeners) {
+    try {
+      cb(event, payload)
+    } catch (err) {
+      console.error('[LocalAPI] Event listener error:', err)
+    }
+  }
+}
+
+/**
+ * Register a callback for local events.
+ * @param {(event: string, payload: any) => void} callback
+ * @returns {() => void} unsubscribe function
+ */
+function onEvent(callback) {
+  eventListeners.push(callback)
+  return () => {
+    eventListeners = eventListeners.filter((cb) => cb !== callback)
+  }
+}
+
+// ─── Mutation Listeners (local→cloud sync immediacy) ──────────────────
+
+/**
+ * Register a callback fired (fire-and-forget) after every pending mutation
+ * is logged. main.js wires this to syncService.onLocalMutation() so the
+ * outbox replays to the cloud immediately when online.
+ * NOTE: do NOT require sync-service from inside this module at top level —
+ * sync-service lazily requires ./index (circular dependency).
+ * @param {() => void} callback
+ * @returns {() => void} unsubscribe function
+ */
+function setMutationListener(callback) {
+  mutationListeners.push(callback)
+  return () => {
+    mutationListeners = mutationListeners.filter((cb) => cb !== callback)
+  }
+}
+
+function notifyMutationLogged() {
+  for (const cb of mutationListeners) {
+    try {
+      cb()
+    } catch (err) {
+      console.error('[LocalAPI] Mutation listener error:', err)
+    }
+  }
+}
+
+// ─── Auth Middleware ──────────────────────────────────────────────────────
+
+/** Short fingerprint of a token for SAFE console logging (never the full token). */
+function tokenFingerprint(token) {
+  if (!token) return '(null)'
+  const s = String(token)
+  return s.slice(0, 10) + '…(len ' + s.length + ')'
+}
+
+/**
+ * Is the given token the previous session token, still inside the grace
+ * window? (Task 41 — see the rotation-grace note at the top of this file.)
+ * Timing-safe, same as the current-token compare.
+ */
+function matchesPreviousSessionToken(token) {
+  if (!token || !previousSessionToken) return false
+  if (Date.now() - previousSessionTokenAt > SESSION_TOKEN_GRACE_MS) return false
+  try {
+    const a = Buffer.from(previousSessionToken, 'utf-8')
+    const b = Buffer.from(token, 'utf-8')
+    return a.length === b.length && timingSafeEqual(a, b)
+  } catch {
+    return false
+  }
+}
+
+function previousSessionTokenValid() {
+  return !!previousSessionToken && Date.now() - previousSessionTokenAt <= SESSION_TOKEN_GRACE_MS
+}
+
+/**
+ * Assign a new session (token + user). Whenever the token CHANGES, the
+ * outgoing token is kept as the rotation-grace predecessor so in-flight
+ * renderer sessions (stale localStorage token) keep working instead of
+ * 401-ing mid-rotation. `source` labels the rotation in the console log.
+ */
+function assignSession(token, user, source) {
+  if (!token || !user || typeof user !== 'object') {
+    console.warn('[LocalAPI] assignSession called with invalid args — skipping (source=' + (source || 'unknown') + ')')
+    diagLog('SESSION assign REJECTED — invalid args (source=' + (source || 'unknown') + ')')
+    return
+  }
+  const rotated = !!sessionToken && sessionToken !== token
+  if (rotated) {
+    previousSessionToken = sessionToken
+    previousSessionTokenAt = Date.now()
+    // Token rotation is the #1 suspect for transient 401s → always record it.
+    diagLog('SESSION token ROTATED (source=' + (source || 'unknown') + ') ' +
+      tokenFingerprint(sessionToken) + ' → ' + tokenFingerprint(token) +
+      ' — predecessor valid for ' + Math.round(SESSION_TOKEN_GRACE_MS / 60000) + 'm grace')
+  } else if (!sessionToken) {
+    diagLog('SESSION established (source=' + (source || 'unknown') + ') token=' + tokenFingerprint(token) + ' user=' + (user.username || user.id))
+  }
+  sessionToken = token
+  sessionUser = user
+}
+
+/**
+ * Middleware that validates the session token and attaches user + db to context.
+ */
+function requireAuth() {
+  return async (c, next) => {
+    const token =
+      c.req.header('Authorization')?.replace('Bearer ', '') ||
+      c.req.header('X-Local-Token') ||
+      c.req.query('token')
+
+    if (!token) {
+      diagLog('AUTH 401 AUTH_NO_TOKEN — request presented no token')
+      return c.json({ success: false, error: 'Authentication required', code: 'AUTH_NO_TOKEN' }, 401)
+    }
+
+    if (!sessionToken) {
+      diagLog('AUTH 401 AUTH_NO_SESSION — local API has no active session (IPC import not yet fired?)')
+      return c.json({ success: false, error: 'No active session', code: 'AUTH_NO_SESSION' }, 401)
+    }
+
+    // Critical: also check sessionUser is non-null.
+    // After a Fast Refresh or app reload, the renderer rehydrates from
+    // localStorage (token + user) but the IPC setLocalApiSession may not
+    // have fired yet, leaving sessionToken set (from a previous import-session
+    // HTTP call or IPC) but sessionUser null.
+    if (!sessionUser) {
+      diagLog('AUTH 401 AUTH_USER_NOT_LOADED — token present but sessionUser null (sessionUser/token desync)')
+      return c.json({ success: false, error: 'No active session (user not loaded)', code: 'AUTH_USER_NOT_LOADED' }, 401)
+    }
+
+    // Timing-safe comparison — current token first, then the rotation-grace
+    // predecessor (Task 41). A stale renderer token must NOT 401 mid-rotation.
+    let tokenValid = false
+    let viaGrace = false
+    try {
+      const expectedBuf = Buffer.from(sessionToken, 'utf-8')
+      const providedBuf = Buffer.from(token, 'utf-8')
+      tokenValid =
+        expectedBuf.length === providedBuf.length &&
+        timingSafeEqual(expectedBuf, providedBuf)
+      if (!tokenValid && matchesPreviousSessionToken(token)) {
+        tokenValid = true
+        viaGrace = true
+      }
+    } catch {
+      tokenValid = false
+    }
+    if (!tokenValid) {
+      // Task 41 — actionable rejection log: fingerprints of what was presented
+      // vs what the session holds, so token-mismatch reports are diagnosable
+      // from the console alone. Also written to the rolling diag file.
+      diagLog('AUTH 401 AUTH_TOKEN_MISMATCH — presented=' + tokenFingerprint(token) +
+        ' current=' + tokenFingerprint(sessionToken) +
+        ' previous=' + (previousSessionTokenValid() ? tokenFingerprint(previousSessionToken) : '(none/expired)'))
+      return c.json({ success: false, error: 'Invalid session token', code: 'AUTH_TOKEN_MISMATCH' }, 401)
+    }
+    if (viaGrace) {
+      // Task 67: tell the renderer (cross-origin-readably) that a fresher
+      // token exists — api-client/fetch-with-retry then run one adopt-session
+      // catch-up instead of presenting the predecessor for the whole grace
+      // window (the old endless "grace-window accept" log spam).
+      try { c.header('X-Blasti-Session-Rotated', '1') } catch { /* header is best-effort */ }
+      diagLog('AUTH grace-window accept — predecessor (rotated) token accepted (user=' + (sessionUser.username || sessionUser.id) + ') — renderer should adopt the fresh token via POST /api/auth/adopt-session')
+    }
+
+    // Task 33-C: honor the workspace LOCK. A REVOKED authorization blocks
+    // every protected route (423 Locked) even when the token itself still
+    // matches — e.g. a renderer that re-imports a stale session from
+    // localStorage after the cloud confirmed the revocation. Cache-backed
+    // (short TTL) so this adds no per-request SQL query.
+    try {
+      const authz = await getAuthorizationStatus()
+      if (authz === 'REVOKED') {
+        return c.json({
+          success: false,
+          error: 'Authorization revoked — please sign in again',
+          code: 'AUTHORIZATION_REVOKED',
+        }, 423)
+      }
+    } catch { /* meta read failure must never wedge auth */ }
+
+    // Guard: if db (PrismaClient) is not initialized, no data queries can run.
+    // Return 503 so the client knows to retry later rather than getting a
+    // cryptic 500 from a null-pointer crash inside the route handler.
+    if (!db) {
+      diagLog('AUTH ok but 503 DB_NOT_READY — PrismaClient not initialized yet (dashboard must retry)')
+      return c.json({ success: false, error: 'Local database not ready (PrismaClient not initialized)', code: 'DB_NOT_READY' }, 503)
+    }
+
+    // Attach user and db to context
+    c.set('user', sessionUser)
+    c.set('db', db)
+    await next()
+  }
+}
+
+/**
+ * Helper: get agencyId from session user, return 403 if missing.
+ */
+function requireAgencyId(c) {
+  const user = c.get('user')
+  const agencyId = user?.agencyId
+  if (!agencyId) {
+    c.json({ success: false, error: 'No agency associated with this account' }, 403)
+    return null
+  }
+  return agencyId
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+function parsePagination(c) {
+  return {
+    take: Math.min(parseInt(c.req.query('take') || '50', 10), 200),
+    skip: parseInt(c.req.query('skip') || '0', 10),
+  }
+}
+
+function todayStartMs() {
+  const d = new Date()
+  d.setHours(0, 0, 0, 0)
+  return d
+}
+
+function todayEndMs() {
+  const d = new Date()
+  d.setHours(23, 59, 59, 999)
+  return d
+}
+
+// ─── Offline Mutation Queue (write-ahead log) ───────────────────────────
+
+let _pendingMutationsBigintDone = false
+
+/**
+ * One-time in-place migration: legacy `_pending_mutations` tables declared
+ * `created_at`/`last_attempt_at` as INTEGER. quaint binds INTEGER columns as
+ * Int32 and epoch-millis values (Date.now()) overflow — every outbox insert
+ * would fail with "does not fit in an INT column". SQLite cannot ALTER a
+ * column type, so the table is rebuilt (rows preserved) with BIGINT columns.
+ */
+async function _migratePendingMutationsBigint() {
+  if (_pendingMutationsBigintDone || !db) return
+  try {
+    const cols = await db.$queryRawUnsafe('PRAGMA table_info("_pending_mutations")')
+    if (!cols || cols.length === 0) return
+    const createdCol = cols.find((c) => c.name === 'created_at')
+    if (!createdCol || String(createdCol.type || '').toUpperCase() === 'BIGINT') {
+      _pendingMutationsBigintDone = true
+      return
+    }
+    console.log('[LocalAPI] Migrating _pending_mutations timestamps INTEGER → BIGINT')
+    await db.$executeRawUnsafe('ALTER TABLE "_pending_mutations" RENAME TO "_pending_mutations_old"')
+    await db.$executeRawUnsafe(
+      'CREATE TABLE "_pending_mutations" (' +
+      '"id" TEXT PRIMARY KEY,' +
+      '"method" TEXT NOT NULL,' +
+      '"path" TEXT NOT NULL,' +
+      '"body" TEXT,' +
+      '"headers" TEXT,' +
+      '"status" TEXT NOT NULL DEFAULT \'pending\',' +
+      '"attempts" INTEGER NOT NULL DEFAULT 0,' +
+      '"max_attempts" INTEGER NOT NULL DEFAULT 5,' +
+      '"created_at" BIGINT NOT NULL,' +
+      '"last_attempt_at" BIGINT,' +
+      '"last_error" TEXT,' +
+      '"response_data" TEXT,' +
+      '"idempotency_key" TEXT' +
+      ')'
+    )
+    // The old table's shape varies by install age — introspect before copying.
+    const oldCols = await db.$queryRawUnsafe('PRAGMA table_info("_pending_mutations_old")')
+    const oldNames = new Set((oldCols || []).map((c) => c.name))
+    const headersExpr = oldNames.has('headers') ? '"headers"' : 'NULL'
+    const idemExpr = oldNames.has('idempotency_key') ? '"idempotency_key"' : 'NULL'
+    const attemptsExpr = oldNames.has('attempts') ? '"attempts"' : '0'
+    const maxAttemptsExpr = oldNames.has('max_attempts') ? '"max_attempts"' : '5'
+    const lastAttemptExpr = oldNames.has('last_attempt_at') ? '"last_attempt_at"' : 'NULL'
+    const lastErrorExpr = oldNames.has('last_error') ? '"last_error"' : 'NULL'
+    const statusExpr = oldNames.has('status') ? '"status"' : "'pending'"
+    await db.$executeRawUnsafe(
+      'INSERT OR IGNORE INTO "_pending_mutations" ' +
+      '("id","method","path","body","headers","status","attempts","max_attempts","created_at","last_attempt_at","last_error","response_data","idempotency_key") ' +
+      'SELECT "id","method","path","body",' + headersExpr + ',' + statusExpr + ',' + attemptsExpr + ',' + maxAttemptsExpr + ',"created_at",' + lastAttemptExpr + ',' + lastErrorExpr + ',"response_data",' + idemExpr + ' ' +
+      'FROM "_pending_mutations_old"'
+    )
+    await db.$executeRawUnsafe('DROP TABLE "_pending_mutations_old"')
+    await db.$executeRawUnsafe(
+      'CREATE INDEX IF NOT EXISTS "idx_pending_mutations_status" ON "_pending_mutations"("status")'
+    )
+    await db.$executeRawUnsafe(
+      'CREATE UNIQUE INDEX IF NOT EXISTS "idx_pending_mutations_idem" ON "_pending_mutations"("idempotency_key")'
+    ).catch(() => {})
+    _pendingMutationsBigintDone = true
+    console.log('[LocalAPI] _pending_mutations timestamps migrated to BIGINT')
+  } catch (e) {
+    console.warn('[LocalAPI] _pending_mutations BIGINT migration skipped:', e.message)
+  }
+}
+
+/**
+ * Create the _pending_mutations table if it doesn't exist.
+ * Also (guarded) adds the v2 `idempotency_key` column + unique index and
+ * backfills legacy rows. Existing table name/columns are never changed
+ * (backward compat).
+ */
+async function ensurePendingMutationsTable() {
+  if (!db) return
+  try {
+    await db.$executeRawUnsafe(
+      'CREATE TABLE IF NOT EXISTS "_pending_mutations" (' +
+      '"id" TEXT PRIMARY KEY,' +
+      '"method" TEXT NOT NULL,' +
+      '"path" TEXT NOT NULL,' +
+      '"body" TEXT,' +
+      '"headers" TEXT,' +
+      '"status" TEXT NOT NULL DEFAULT \'pending\',' +
+      '"attempts" INTEGER NOT NULL DEFAULT 0,' +
+      '"max_attempts" INTEGER NOT NULL DEFAULT 5,' +
+      '"created_at" BIGINT NOT NULL,' +
+      '"last_attempt_at" BIGINT,' +
+      '"next_retry_at" BIGINT,' +
+      '"last_http_status" INTEGER,' +
+      '"last_error" TEXT,' +
+      '"response_data" TEXT' +
+      ')'
+    )
+    await db.$executeRawUnsafe(
+      'CREATE INDEX IF NOT EXISTS "idx_pending_mutations_status" ON "_pending_mutations"("status")'
+    )
+
+    await _migratePendingMutationsBigint()
+
+    // ── v3 (Parts R/S): retry-scheduling columns + legacy status sweep ──
+    if (!outboxV3Ensured) {
+      try {
+        const cols = await db.$queryRawUnsafe('PRAGMA table_info("_pending_mutations")')
+        const colNames = new Set((cols || []).map((c) => c && c.name))
+        for (const [col, ddl] of [
+          ['next_retry_at', 'ALTER TABLE "_pending_mutations" ADD COLUMN "next_retry_at" BIGINT'],
+          ['last_http_status', 'ALTER TABLE "_pending_mutations" ADD COLUMN "last_http_status" INTEGER'],
+        ]) {
+          if (!colNames.has(col)) {
+            await db.$executeRawUnsafe(ddl)
+            console.log('[LocalAPI] Added _pending_mutations.' + col + ' column')
+          }
+        }
+      } catch (e) {
+        console.warn('[LocalAPI] retry-column ensure skipped:', e.message)
+      }
+      try {
+        // Legacy rows: 'failed' was a permanent-quarantine bug — they become
+        // retryable again; 'abandoned' becomes visible permanent_failed.
+        const r1 = await db.$executeRawUnsafe('UPDATE "_pending_mutations" SET status = \'retry\', "next_retry_at" = NULL WHERE status = \'failed\'')
+        const r2 = await db.$executeRawUnsafe('UPDATE "_pending_mutations" SET status = \'permanent_failed\' WHERE status = \'abandoned\'')
+        // Crash sweep: 'sending' rows older than 10 min were in-flight when
+        // the process died — back to pending.
+        const r3 = await db.$executeRawUnsafe('UPDATE "_pending_mutations" SET status = \'pending\' WHERE status = \'sending\' AND "last_attempt_at" IS NOT NULL AND "last_attempt_at" < ?', Date.now() - 10 * 60 * 1000)
+        const swept = Number(r1) + Number(r2) + Number(r3)
+        if (swept > 0) console.log('[LocalAPI] Outbox legacy/crash sweep:', swept, 'row(s) rescheduled')
+      } catch (e) {
+        console.warn('[LocalAPI] outbox status sweep skipped:', e.message)
+      }
+      outboxV3Ensured = true
+    }
+
+    // ── v2: stable idempotency key column ──
+    if (!idemColumnEnsured) {
+      try {
+        // Introspection-guarded: the schema-migrations top-up (lib/db.js) or
+        // the BIGINT rebuild DDL above may already have added this column.
+        // An unguarded ALTER fails with "duplicate column name" and Prisma
+        // logs noisy prisma:error output even when the failure is swallowed.
+        const colsNow = await db.$queryRawUnsafe('PRAGMA table_info("_pending_mutations")')
+        const hasIdemCol = (colsNow || []).some((c) => c && c.name === 'idempotency_key')
+        if (!hasIdemCol) {
+          await db.$executeRawUnsafe('ALTER TABLE "_pending_mutations" ADD COLUMN "idempotency_key" TEXT')
+          console.log('[LocalAPI] Added _pending_mutations.idempotency_key column')
+        }
+      } catch (e) {
+        // ALTER unsupported or introspection failed — non-fatal (the derived
+        // -key replay fallback still works without the physical column).
+        console.warn('[LocalAPI] idempotency_key column ensure skipped:', e.message)
+      }
+      try {
+        await db.$executeRawUnsafe(
+          'CREATE UNIQUE INDEX IF NOT EXISTS "idx_pending_mutations_idem" ON "_pending_mutations"("idempotency_key")'
+        )
+      } catch (e) {
+        // Pre-existing duplicate non-NULL keys would block the index — log
+        // loudly; replay still works via the derived-key fallback.
+        console.warn('[LocalAPI] Could not create idempotency unique index:', e.message)
+      }
+      try {
+        // Backfill legacy rows (NULL keys) with the same derivation.
+        const backfillRows = await db.$queryRawUnsafe(
+          'SELECT id, method, path, body FROM "_pending_mutations" WHERE "idempotency_key" IS NULL'
+        )
+        for (const row of backfillRows || []) {
+          const key = deriveStableIdempotencyKey(row.method, row.path, row.body)
+          await db.$executeRawUnsafe(
+            'UPDATE "_pending_mutations" SET "idempotency_key" = ? WHERE id = ?',
+            key, row.id
+          ).catch(() => {}) // duplicate key on backfill → leave NULL (unique index allows NULLs)
+        }
+        if ((backfillRows || []).length > 0) {
+          console.log('[LocalAPI] Backfilled idempotency keys for', (backfillRows || []).length, 'pending mutation rows')
+        }
+      } catch (e) {
+        console.warn('[LocalAPI] idempotency key backfill failed:', e.message)
+      }
+      idemColumnEnsured = true
+    }
+  } catch (e) {
+    console.error('[LocalAPI] Failed to create _pending_mutations table:', e.message)
+  }
+}
+
+// Volatile fields stripped before hashing (they never repeat across retries
+// of the same logical operation and would defeat content-derived keys).
+const VOLATILE_IDEM_FIELDS = ['clientTimestamp', 'clientTime', 'timestamp', 'issuedAt', 'nonce', 'requestId', 'localId']
+
+/**
+ * Recursively sort object keys and strip volatile fields, returning a
+ * deterministic JSON string (for content-derived idempotency keys).
+ */
+function stableStringify(value) {
+  if (Array.isArray(value)) return value.map(stableStringify)
+  if (value && typeof value === 'object') {
+    const sorted = {}
+    Object.keys(value).sort().forEach((k) => {
+      if (VOLATILE_IDEM_FIELDS.includes(k)) return
+      sorted[k] = stableStringify(value[k])
+    })
+    return sorted
+  }
+  return value
+}
+
+/**
+ * Derive the stable idempotency key for an outbox mutation:
+ *   `${method}:${path}:${sha256(sorted-JSON of body)}`
+ * Volatile fields (clientTimestamp, timestamp, nonce, ...) are stripped
+ * recursively before hashing so retries hash identically.
+ * @param {string} method
+ * @param {string} path
+ * @param {string|object|null} body - raw JSON string (as stored) or object
+ * @returns {string}
+ */
+function deriveStableIdempotencyKey(method, path, body) {
+  let parsed = {}
+  if (body) {
+    try {
+      parsed = typeof body === 'string' ? JSON.parse(body) : body
+    } catch {
+      parsed = { _unparseable: String(body).substring(0, 128) }
+    }
+  }
+  const hash = createHash('sha256').update(JSON.stringify(stableStringify(parsed))).digest('hex')
+  return `${method}:${path}:${hash}`
+}
+
+/**
+ * Log a mutation to the pending outbox.
+ * Called by write handlers (POST/PUT/PATCH/DELETE) after EVERY local
+ * business mutation. The sync service replays the queue to the cloud with a
+ * stable X-Idempotency-Key header (route rows) or as canonical /api/sync/push
+ * mutations (SYNC_PUSH rows), so the cloud applies each logical operation
+ * exactly once.
+ *
+ * Part T (identity): the idempotency key is a UUID generated when the
+ * business operation runs — ONE logical operation = ONE mutationId, reused
+ * across every retry. Two separate legitimate operations with identical
+ * payloads get DIFFERENT keys (the old content-hash collapsed them).
+ *
+ * Part Q (durability): pass opts.tx (the interactive-transaction client of
+ * the business write) to commit the business mutation and the outbox row
+ * ATOMICALLY. Without tx the row is still persisted immediately (SQLite,
+ * awaited) — a smaller but real durability window.
+ *
+ * Canonical rows (Part V): method='SYNC_PUSH', path='/api/sync/push', body =
+ * JSON { model, recordId, operation, data, localUpdatedAt } — replayed via
+ * the cloud push protocol as a deterministic outcome instead of re-running
+ * a business action.
+ */
+async function logPendingMutation(method, path, body, responseData, opts) {
+  opts = opts || {}
+  const executor = opts.tx || db
+  if (!executor) return
+  try {
+    if (!opts.tx) await ensurePendingMutationsTable()
+    const id = require('crypto').randomUUID()
+    const bodyStr = body ? JSON.stringify(body) : null
+    const mutationId = 'mut-' + id
+    const stmt = 'INSERT OR IGNORE INTO "_pending_mutations" (id, method, path, body, status, created_at, response_data, idempotency_key) VALUES (?, ?, ?, ?, \'pending\', ?, ?, ?)'
+    const params = [id, method, path, bodyStr, Date.now(), responseData ? JSON.stringify(responseData) : null, mutationId]
+    if (opts.tx) {
+      await opts.tx.$executeRawUnsafe(stmt, ...params)
+    } else {
+      await executor.$executeRawUnsafe(stmt, ...params)
+    }
+    console.log('[LocalAPI] Logged outbox mutation:', method, path, 'id:', mutationId)
+    if (!opts.tx) {
+      // Immediate replay trigger (skip when transactional — the caller emits
+      // after commit).
+      notifyMutationLogged()
+    }
+  } catch (e) {
+    console.error('[LocalAPI] Failed to log pending mutation:', e.message)
+    if (opts.tx) throw e // transactional callers MUST know the outbox row failed
+  }
+}
+
+/**
+ * Canonical push payload (Parts V/W): a deterministic record-level mutation
+ * for the cloud /api/sync/push protocol - "Reservation R was set to state S",
+ * never "please run action X again".
+ */
+function canonicalPushPayload(model, recordId, operation, data, localUpdatedAt) {
+  const clean = data && typeof data === 'object'
+    ? JSON.parse(JSON.stringify(data, (k, v) => (typeof v === 'bigint' ? Number(v) : v === undefined ? null : v)))
+    : {}
+  return {
+    model,
+    recordId,
+    operation,
+    data: clean,
+    localUpdatedAt: localUpdatedAt || new Date().toISOString(),
+  }
+}
+
+/**
+ * Log a canonical outcome mutation (replayed via POST /api/sync/push).
+ * Use for every state-changing action whose cloud replay must be
+ * DETERMINISTIC (queue actions, :id routes, deletes).
+ */
+async function logDeterministicOutcome(model, recordId, operation, data, localUpdatedAt, opts) {
+  // Defensive arg-shim: callers sometimes write (..., data, { tx }) placing the
+  // opts object in the localUpdatedAt slot — shift it so the outbox row really
+  // joins the caller's transaction instead of corrupting the payload.
+  // (Dates and arrays are legitimate localUpdatedAt values and are NOT opts.)
+  if (
+    localUpdatedAt &&
+    typeof localUpdatedAt === 'object' &&
+    !Array.isArray(localUpdatedAt) &&
+    !(localUpdatedAt instanceof Date)
+  ) {
+    if (!opts) opts = localUpdatedAt
+    localUpdatedAt = undefined
+  }
+  return logPendingMutation('SYNC_PUSH', '/api/sync/push',
+    canonicalPushPayload(model, recordId, operation, data, localUpdatedAt), null, opts)
+}
+
+/**
+ * P1-5 (spec Part Q): run a business mutation and its outbox row in ONE
+ * SQLite transaction — the historic pattern (business write commits, then
+ * `logPendingMutation()` afterwards) had a crash window that could produce
+ * an APPLIED local mutation with NO outbox entry: the cloud would never
+ * learn the mutation happened.
+ *
+ * The callback receives the interactive-transaction client `tx` — perform
+ * ALL business writes through it and log the outbox row inside the same
+ * callback via logDeterministicOutcome(..., { tx }) / logPendingMutation(..., { tx }).
+ * An outbox INSERT failure rolls the business write back (the client sees
+ * the 500 and retries) — the two sides can never diverge.
+ * notifyMutationLogged() fires only AFTER commit so the replay never races
+ * an uncommitted row.
+ */
+async function withOutboxTransaction(work) {
+  if (!db) throw new Error('Local database not initialized')
+  const result = await db.$transaction(async (tx) => work(tx), { maxWait: 5000, timeout: 20000 })
+  notifyMutationLogged()
+  return result
+}
+
+/**
+ * Get due outbox mutations (for sync service replay).
+ * Part R: 'retry' rows re-join the queue once their backoff expires — a
+ * transient failure NEVER removes a mutation from the retry pool.
+ * Legacy 'failed' rows (pre-v3 quarantine bug) are also retryable again.
+ */
+async function getPendingMutations() {
+  if (!db) return []
+  try {
+    await ensurePendingMutationsTable()
+    const rows = await db.$queryRawUnsafe(
+      'SELECT * FROM "_pending_mutations" ' +
+      'WHERE status IN (\'pending\', \'retry\', \'failed\') ' +
+      'AND ("next_retry_at" IS NULL OR "next_retry_at" <= ?) ' +
+      'ORDER BY created_at ASC LIMIT 100',
+      Date.now()
+    )
+    return (rows || []).map(row => ({
+      ...row,
+      // BIGINT columns arrive as JS BigInt — JSON.stringify throws on BigInt,
+      // so convert timestamp fields to Numbers for the response payload.
+      created_at: typeof row.created_at === 'bigint' ? Number(row.created_at) : row.created_at,
+      last_attempt_at: typeof row.last_attempt_at === 'bigint' ? Number(row.last_attempt_at) : row.last_attempt_at,
+      next_retry_at: typeof row.next_retry_at === 'bigint' ? Number(row.next_retry_at) : row.next_retry_at,
+      body: row.body ? JSON.parse(row.body) : null,
+      responseData: row.response_data ? JSON.parse(row.response_data) : null,
+    }))
+  } catch (e) {
+    console.error('[LocalAPI] Failed to get pending mutations:', e.message)
+    return []
+  }
+}
+
+/**
+ * Get outbox counters for /api/db-status (Part AT).
+ */
+async function getOutboxStats() {
+  if (!db) return { pending: 0, retry: 0, permanentFailed: 0, conflict: 0, completedToday: 0 }
+  try {
+    await ensurePendingMutationsTable()
+    const rows = await db.$queryRawUnsafe(
+      'SELECT status, COUNT(*) as n FROM "_pending_mutations" GROUP BY status'
+    )
+    const byStatus = {}
+    for (const r of rows || []) byStatus[r.status] = Number(r.n)
+    return {
+      pending: (byStatus.pending || 0),
+      retry: (byStatus.retry || 0) + (byStatus.failed || 0),
+      permanentFailed: (byStatus.permanent_failed || 0) + (byStatus.abandoned || 0),
+      conflict: (byStatus.conflict || 0),
+      sending: (byStatus.sending || 0),
+    }
+  } catch {
+    return { pending: 0, retry: 0, permanentFailed: 0, conflict: 0, sending: 0 }
+  }
+}
+
+/**
+ * Mark a mutation as completed (successfully synced to cloud).
+ */
+async function markMutationCompleted(id, responseData) {
+  if (!db) return
+  try {
+    if (responseData !== undefined) {
+      await db.$executeRawUnsafe(
+        'UPDATE "_pending_mutations" SET status = \'completed\', "response_data" = COALESCE(?, "response_data") WHERE id = ?',
+        responseData ? JSON.stringify(responseData) : null, id
+      )
+    } else {
+      await db.$executeRawUnsafe(
+        'UPDATE "_pending_mutations" SET status = \'completed\' WHERE id = ?', id
+      )
+    }
+  } catch (e) {
+    console.error('[LocalAPI] Failed to mark mutation completed:', e.message)
+  }
+}
+
+// --- Part R/S: failure classification + bounded exponential backoff ------
+
+/** HTTP statuses that can NEVER succeed by retrying. */
+const PERMANENT_HTTP_STATUSES = new Set([400, 401, 403, 404, 405, 410, 422])
+/** Transient statuses that MUST be retried (spec Part R). */
+const RETRYABLE_HTTP_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504])
+
+/**
+ * Classify a replay failure: 'permanent' | 'transient'.
+ * Network-level errors (no HTTP status) are transient by definition — a
+ * dropped connection must never permanently silence a business operation.
+ */
+function classifyMutationFailure(httpStatus, errorMessage) {
+  const msg = String(errorMessage || '')
+  if (httpStatus === undefined || httpStatus === null || httpStatus === 0) {
+    return /validation|malformed|schema/i.test(msg) ? 'permanent' : 'transient'
+  }
+  if (RETRYABLE_HTTP_STATUSES.has(httpStatus)) return 'transient'
+  if (PERMANENT_HTTP_STATUSES.has(httpStatus)) return 'permanent'
+  if (httpStatus >= 500) return 'transient'
+  return 'transient' // unknown 4xx — retryable rather than data loss
+}
+
+/** Bounded exponential backoff with jitter: 15s * 2^n, capped at 15 min. */
+function computeRetryBackoffMs(attempts) {
+  const base = 15000 * Math.pow(2, Math.max(0, attempts - 1))
+  const capped = Math.min(base, 15 * 60 * 1000)
+  const jitter = capped * (0.15 * Math.random())
+  return Math.round(capped + jitter)
+}
+
+/**
+ * Mark a mutation as 'sending' before the replay fetch (crash-safe in-flight
+ * marker). The boot sweep returns stale 'sending' rows (>10 min) to 'pending'.
+ */
+async function markMutationSending(id) {
+  if (!db) return
+  try {
+    await db.$executeRawUnsafe(
+      'UPDATE "_pending_mutations" SET status = \'sending\', "last_attempt_at" = ? WHERE id = ?',
+      Date.now(), id
+    )
+  } catch (e) {
+    console.error('[LocalAPI] Failed to mark mutation sending:', e.message)
+  }
+}
+
+// Legacy create-row repair map (round-7): path → Prisma model for locally
+// created records whose HTTP-replay rows could never succeed.
+const LEGACY_CREATE_PATH_MODELS = [
+  { path: '/api/reservations', model: 'Reservation' },
+  { path: '/api/agency/queue/walk-in', model: 'Reservation' },
+  { path: '/api/services', model: 'Service' },
+  { path: '/api/agency/services', model: 'Service' },
+  { path: '/api/agency/branches', model: 'Branch' },
+  { path: '/api/agency/counters', model: 'Counter' },
+]
+
+/**
+ * One-time startup repair (round-7): rows logged BEFORE the canonical
+ * SYNC_PUSH conversion as HTTP create replays are permanently failed by
+ * definition (the cloud route is customer-only / schema-incompatible), so
+ * their outbox rows sit in permanent_failed forever and any dependent
+ * SYNC_PUSH update rows retry against a cloud record that never existed.
+ *
+ * Repair: for each permanent_failed legacy create row, re-log its stored
+ * response record as a CANONICAL id-preserving SYNC_PUSH create (idempotent
+ * cloud upsert — safe even if the record already reached the cloud by
+ * another path). The original row is kept untouched as truthful history;
+ * the new canonical row tracks the real delivery exactly-once.
+ */
+async function repairLegacyReservationCreates() {
+  if (!db) return
+  try {
+    await ensurePendingMutationsTable()
+    for (const { path, model } of LEGACY_CREATE_PATH_MODELS) {
+      let rows = []
+      try {
+        rows = await db.$queryRawUnsafe(
+          'SELECT id, response_data FROM "_pending_mutations" ' +
+          "WHERE status = 'permanent_failed' AND method = 'POST' AND path = ? ORDER BY created_at ASC",
+          path
+        )
+      } catch (e) {
+        console.warn('[LocalAPI] Legacy create repair scan failed for', path, ':', e.message)
+        continue
+      }
+      for (const row of rows || []) {
+        let record = null
+        try {
+          const parsed = row.response_data ? JSON.parse(row.response_data) : null
+          // response_data stored by logPendingMutation is the created record
+          // itself (reservations/walk-in) — unwrap common wrappers too.
+          record = parsed && typeof parsed === 'object'
+            ? (parsed.data || parsed.reservation || parsed.record || parsed)
+            : null
+        } catch { record = null }
+        if (!record || typeof record !== 'object' || !record.id || typeof record.id !== 'string') {
+          continue
+        }
+        // Idempotence: skip only if a canonical CREATE row for this record
+        // already exists (a previous repair already scheduled the delivery).
+        // A SYNC_PUSH update row for the same record must NOT suppress the
+        // create repair — the update is useless until the create lands.
+        let already = []
+        try {
+          already = await db.$queryRawUnsafe(
+            'SELECT id FROM "_pending_mutations" WHERE method = \'SYNC_PUSH\' AND body LIKE ? AND body LIKE ? LIMIT 1',
+            '%"recordId":"' + record.id + '"%',
+            '%"operation":"create"%'
+          )
+        } catch { already = [] }
+        if (already && already.length > 0) continue
+        await logDeterministicOutcome(model, record.id, 'create', record, record.updatedAt || null, {})
+        console.log('[LocalAPI] Legacy create repair: re-queued', model, record.id, 'as canonical SYNC_PUSH create (was permanently-failed HTTP replay', row.id + ')')
+      }
+    }
+  } catch (e) {
+    console.warn('[LocalAPI] Legacy create repair error (non-fatal):', e.message)
+  }
+}
+
+/**
+ * Mark a mutation failed with Part R/S semantics:
+ *   transient (network/timeout/5xx/429) -> status='retry' + exponential
+ *     backoff with jitter - retried INDEFINITELY (never abandoned;
+ *     bounded backoff keeps it visible and eligible forever).
+ *   permanent (400/401/403/404/422/malformed) -> status='permanent_failed'
+ *     - surfaced loudly; requires remediation/reconciliation.
+ */
+async function markMutationFailed(id, error, httpStatus) {
+  if (!db) return
+  try {
+    const verdict = classifyMutationFailure(httpStatus, error)
+    const now = Date.now()
+    if (verdict === 'permanent') {
+      await db.$executeRawUnsafe(
+        'UPDATE "_pending_mutations" SET status = \'permanent_failed\', attempts = attempts + 1, "last_attempt_at" = ?, "last_http_status" = ?, "last_error" = ?, "next_retry_at" = NULL WHERE id = ?',
+        now, httpStatus ?? null, String(error || '').substring(0, 500), id
+      )
+      console.error('[LocalAPI] Outbox mutation PERMANENTLY FAILED (needs attention - not retried):', id, httpStatus || '', String(error || '').substring(0, 160))
+      emitEvent('mutation:permanent-failure', { id, httpStatus: httpStatus ?? null, error: String(error || '').substring(0, 200) })
+    } else {
+      const row = await db.$queryRawUnsafe('SELECT attempts FROM "_pending_mutations" WHERE id = ?', id)
+      const attempts = Number(row?.[0]?.attempts || 0) + 1
+      const nextRetryAt = now + computeRetryBackoffMs(attempts)
+      await db.$executeRawUnsafe(
+        'UPDATE "_pending_mutations" SET status = \'retry\', attempts = ?, "last_attempt_at" = ?, "last_http_status" = ?, "last_error" = ?, "next_retry_at" = ? WHERE id = ?',
+        attempts, now, httpStatus ?? null, String(error || '').substring(0, 500), nextRetryAt, id
+      )
+      console.warn('[LocalAPI] Outbox mutation failed (transient) - retry', attempts, 'scheduled in', Math.round((nextRetryAt - now) / 1000) + 's:', String(error || '').substring(0, 120))
+    }
+  } catch (e) {
+    console.error('[LocalAPI] Failed to mark mutation failed:', e.message)
+  }
+}
+
+/**
+ * Mark a mutation as conflicted (cloud rejected with a conflict verdict) -
+ * kept OUT of the retry pool; surfaced via _sync_conflicts reconciliation.
+ */
+async function markMutationConflict(id, error) {
+  if (!db) return
+  try {
+    await db.$executeRawUnsafe(
+      'UPDATE "_pending_mutations" SET status = \'conflict\', attempts = attempts + 1, "last_attempt_at" = ?, "last_error" = ? WHERE id = ?',
+      Date.now(), String(error || '').substring(0, 500), id
+    )
+    console.warn('[LocalAPI] Outbox mutation CONFLICT - needs reconciliation:', id)
+  } catch (e) {
+    console.error('[LocalAPI] Failed to mark mutation conflict:', e.message)
+  }
+}
+
+// ─── Agency analytics dashboard (Task 42-c) ──────────────────────────────
+// Standalone, pure computation — NO db access — so the harness can drive it
+// directly with synthetic rows (module.exports). The route below only fetches
+// (current range, previous range, Service/Branch/Counter lookups) and delegates.
+
+const ANALYTICS_PERIODS = ['7d', '30d', '90d', '12m']
+const ANALYTICS_STATUSES = ['WAITING', 'CALLED', 'SERVING', 'COMPLETED', 'CANCELLED', 'NO_SHOW']
+
+function asAnalyticsDate(value) {
+  if (value == null) return null
+  const d = value instanceof Date ? value : new Date(value)
+  return isNaN(d.getTime()) ? null : d
+}
+
+function round1(n) {
+  return Math.round(n * 10) / 10
+}
+
+/** Percent change (1 decimal); null when the previous value is 0/absent. */
+function analyticsPctChange(current, previous) {
+  if (previous == null || previous === 0) return null
+  return round1((((current || 0) - previous) / previous) * 100)
+}
+
+function computeAnalyticsRange(period, now) {
+  const end = asAnalyticsDate(now) || new Date()
+  let start
+  if (period === '12m') {
+    // 00:00 UTC of the month 11 months before the CURRENT month (12 buckets).
+    start = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - 11, 1, 0, 0, 0, 0))
+  } else {
+    const days = period === '7d' ? 7 : period === '90d' ? 90 : 30
+    start = new Date(end.getTime() - days * 86400000)
+  }
+  const spanMs = end.getTime() - start.getTime()
+  const previousEnd = new Date(start.getTime())
+  const previousStart = new Date(start.getTime() - spanMs)
+  return { start, end, previousStart, previousEnd }
+}
+
+/**
+ * Normalize one reservation record into the plain shape the aggregation uses.
+ * Accepts Prisma rows (Date objects, boolean isWalkIn) and raw test records
+ * (ISO strings, 0/1 booleans) alike.
+ */
+function normalizeAnalyticsReservation(raw) {
+  return {
+    status: raw.status,
+    joinedAt: asAnalyticsDate(raw.joinedAt),
+    calledAt: asAnalyticsDate(raw.calledAt),
+    completedAt: asAnalyticsDate(raw.completedAt),
+    rating: raw.rating == null ? null : Number(raw.rating),
+    isWalkIn: raw.isWalkIn === 1 || raw.isWalkIn === true,
+    userId: raw.userId || null,
+    serviceId: raw.serviceId || null,
+    counterId: raw.counterId || null,
+  }
+}
+
+/** Zero-filled timeseries buckets (UTC). 7d/30d/90d → daily 'YYYY-MM-DD' from
+ * range.start's day through range.end's day inclusive; 12m → monthly 'YYYY-MM'. */
+function buildAnalyticsBuckets(period, range) {
+  const buckets = []
+  const indexByKey = new Map()
+  if (period === '12m') {
+    const endKey = range.end.toISOString().slice(0, 7)
+    let y = range.start.getUTCFullYear()
+    let m = range.start.getUTCMonth()
+    for (let i = 0; i < 24; i++) { // 12 real buckets; 24 = hard safety bound
+      const key = `${y}-${String(m + 1).padStart(2, '0')}`
+      indexByKey.set(key, buckets.length)
+      buckets.push({ date: key, total: 0, completed: 0, cancelled: 0, noShow: 0, walkIn: 0, online: 0, _waitSum: 0, _waitN: 0 })
+      if (key === endKey) break
+      m += 1
+      if (m > 11) { m = 0; y += 1 }
+    }
+  } else {
+    const startDay = Date.UTC(range.start.getUTCFullYear(), range.start.getUTCMonth(), range.start.getUTCDate())
+    const endDay = Date.UTC(range.end.getUTCFullYear(), range.end.getUTCMonth(), range.end.getUTCDate())
+    for (let t = startDay; t <= endDay; t += 86400000) {
+      const key = new Date(t).toISOString().slice(0, 10)
+      indexByKey.set(key, buckets.length)
+      buckets.push({ date: key, total: 0, completed: 0, cancelled: 0, noShow: 0, walkIn: 0, online: 0, _waitSum: 0, _waitN: 0 })
+    }
+  }
+  return { buckets, indexByKey }
+}
+
+function analyticsMeanWaitMinutes(rows) {
+  let sum = 0
+  let n = 0
+  for (const r of rows) {
+    if (r.calledAt && r.joinedAt) {
+      sum += (r.calledAt.getTime() - r.joinedAt.getTime()) / 60000
+      n += 1
+    }
+  }
+  return n > 0 ? round1(sum / n) : null
+}
+
+function analyticsMeanServiceMinutes(rows) {
+  let sum = 0
+  let n = 0
+  for (const r of rows) {
+    if (r.completedAt && r.calledAt) {
+      sum += (r.completedAt.getTime() - r.calledAt.getTime()) / 60000
+      n += 1
+    }
+  }
+  return n > 0 ? round1(sum / n) : null
+}
+
+function analyticsRatingStats(rows) {
+  let sum = 0
+  let n = 0
+  const distribution = [1, 2, 3, 4, 5].map((stars) => ({ stars, count: 0 }))
+  for (const r of rows) {
+    if (r.rating != null && r.rating >= 1 && r.rating <= 5) {
+      const stars = Math.round(r.rating)
+      sum += stars
+      n += 1
+      distribution[stars - 1].count += 1
+    }
+  }
+  return { average: n > 0 ? round1(sum / n) : null, count: n, distribution }
+}
+
+/**
+ * Compute the agency analytics dashboard payload (Task 42-c contract — the
+ * SAME shape the cloud route implements).
+ *
+ * @param {Array} rows     reservations with joinedAt in the CURRENT range
+ * @param {Array} prevRows reservations with joinedAt in the PREVIOUS range
+ * @param {Object} lookups { services: {id:name}, branches: {id:name},
+ *                           counters: {id:{name,branchId}} }
+ * @param {string} period  '7d' | '30d' | '90d' | '12m'
+ * @param {Object} range   { start, end, previousStart, previousEnd } Dates
+ */
+function computeAgencyAnalyticsDashboard(rows, prevRows, lookups, period, range) {
+  const cur = (rows || []).map(normalizeAnalyticsReservation)
+  const prev = (prevRows || []).map(normalizeAnalyticsReservation)
+  lookups = lookups || {}
+  const serviceName = (id) => (id && lookups.services && lookups.services[id]) || 'Unknown'
+  const branchName = (id) => (id && lookups.branches && lookups.branches[id]) || 'Unknown'
+  const counterInfo = (id) => (id && lookups.counters && lookups.counters[id]) || null
+
+  // ── Current-range KPIs ──────────────────────────────────────────────────
+  const total = cur.length
+  let completed = 0
+  let cancelled = 0
+  let noShow = 0
+  for (const r of cur) {
+    if (r.status === 'COMPLETED') completed += 1
+    else if (r.status === 'CANCELLED') cancelled += 1
+    else if (r.status === 'NO_SHOW') noShow += 1
+  }
+  const completionRate = total > 0 ? round1((completed / total) * 100) : 0
+  const cancellationRate = total > 0 ? round1((cancelled / total) * 100) : 0
+  const noShowRate = total > 0 ? round1((noShow / total) * 100) : 0
+  const avgWaitMinutes = analyticsMeanWaitMinutes(cur)
+  const avgServiceMinutes = analyticsMeanServiceMinutes(cur)
+  // SAME walk-in / online convention as GET /api/agency/stats:
+  //   walkIn = isWalkIn true · online = isWalkIn false with a userId.
+  const walkInCount = cur.filter((r) => r.isWalkIn).length
+  const onlineCount = cur.filter((r) => !r.isWalkIn && r.userId).length
+  // Task 46 — online vs walk-in rates (0-100, one decimal; 0 when empty)
+  const walkInRate = total > 0 ? round1((walkInCount / total) * 100) : 0
+  const onlineRate = total > 0 ? round1((onlineCount / total) * 100) : 0
+  const uniqueCustomers = new Set(cur.map((r) => r.userId).filter(Boolean)).size
+  const ratings = analyticsRatingStats(cur)
+
+  // ── Previous-range aggregates (for deltas) ─────────────────────────────
+  const prevTotal = prev.length
+  const prevCompleted = prev.filter((r) => r.status === 'COMPLETED').length
+  const prevNoShow = prev.filter((r) => r.status === 'NO_SHOW').length
+  const prevNoShowRate = prevTotal > 0 ? round1((prevNoShow / prevTotal) * 100) : 0
+  const prevAvgWaitMinutes = analyticsMeanWaitMinutes(prev)
+  const prevRatings = analyticsRatingStats(prev)
+  const prevUniqueCustomers = new Set(prev.map((r) => r.userId).filter(Boolean)).size
+
+  // ── Timeseries (zero-filled over joinedAt, UTC) ────────────────────────
+  const { buckets, indexByKey } = buildAnalyticsBuckets(period, range)
+  const hourly = new Array(24).fill(0)
+  const weekdayCounts = new Array(7).fill(0)
+  const matrix = new Map()
+  const dailyCounts = new Map() // always daily — busiestDay, any period
+  for (const r of cur) {
+    const j = r.joinedAt
+    if (j) {
+      const key = period === '12m' ? j.toISOString().slice(0, 7) : j.toISOString().slice(0, 10)
+      const bi = indexByKey.get(key)
+      if (bi != null) {
+        const b = buckets[bi]
+        b.total += 1
+        if (r.status === 'COMPLETED') b.completed += 1
+        else if (r.status === 'CANCELLED') b.cancelled += 1
+        else if (r.status === 'NO_SHOW') b.noShow += 1
+        // Task 46 — channel split per bucket (same convention as KPIs)
+        if (r.isWalkIn) b.walkIn += 1
+        else if (r.userId) b.online += 1
+        if (r.calledAt && r.joinedAt) {
+          b._waitSum += (r.calledAt.getTime() - r.joinedAt.getTime()) / 60000
+          b._waitN += 1
+        }
+      }
+      hourly[j.getUTCHours()] += 1
+      weekdayCounts[j.getUTCDay()] += 1
+      const mk = j.getUTCDay() + ':' + j.getUTCHours()
+      matrix.set(mk, (matrix.get(mk) || 0) + 1)
+      const dayKey = j.toISOString().slice(0, 10)
+      dailyCounts.set(dayKey, (dailyCounts.get(dayKey) || 0) + 1)
+    }
+  }
+
+  // ── Per-service / per-branch / per-counter rollups ──────────────────────
+  const serviceAgg = new Map()
+  const branchAgg = new Map()
+  const counterAgg = new Map()
+  for (const r of cur) {
+    // services
+    const sKey = r.serviceId
+    if (!serviceAgg.has(sKey)) serviceAgg.set(sKey, { count: 0, completed: 0, cancelled: 0, noShow: 0, _waitSum: 0, _waitN: 0 })
+    const s = serviceAgg.get(sKey)
+    s.count += 1
+    if (r.status === 'COMPLETED') s.completed += 1
+    else if (r.status === 'CANCELLED') s.cancelled += 1
+    else if (r.status === 'NO_SHOW') s.noShow += 1
+    if (r.calledAt && r.joinedAt) {
+      s._waitSum += (r.calledAt.getTime() - r.joinedAt.getTime()) / 60000
+      s._waitN += 1
+    }
+    // branches — via counterId → Counter.branchId → Branch
+    let branchId = null
+    if (r.counterId) {
+      const info = counterInfo(r.counterId)
+      branchId = info ? info.branchId : r.counterId + ':missing-counter'
+    }
+    if (!branchAgg.has(branchId)) branchAgg.set(branchId, { count: 0, completed: 0, noShow: 0, _waitSum: 0, _waitN: 0 })
+    const br = branchAgg.get(branchId)
+    br.count += 1
+    if (r.status === 'COMPLETED') br.completed += 1
+    else if (r.status === 'NO_SHOW') br.noShow += 1
+    if (r.calledAt && r.joinedAt) {
+      br._waitSum += (r.calledAt.getTime() - r.joinedAt.getTime()) / 60000
+      br._waitN += 1
+    }
+    // counters — rows actually served by a counter
+    if (r.counterId) {
+      if (!counterAgg.has(r.counterId)) counterAgg.set(r.counterId, { served: 0, _svcSum: 0, _svcN: 0 })
+      const ct = counterAgg.get(r.counterId)
+      if (r.status === 'COMPLETED') {
+        ct.served += 1
+        if (r.completedAt && r.calledAt) {
+          ct._svcSum += (r.completedAt.getTime() - r.calledAt.getTime()) / 60000
+          ct._svcN += 1
+        }
+      }
+    }
+  }
+
+  const timeseries = buckets.map((b) => ({
+    date: b.date,
+    total: b.total,
+    completed: b.completed,
+    cancelled: b.cancelled,
+    noShow: b.noShow,
+    walkIn: b.walkIn,
+    online: b.online,
+    avgWaitMinutes: b._waitN > 0 ? round1(b._waitSum / b._waitN) : null,
+  }))
+
+  // Task 46 — online vs walk-in channel block (mirrors the cloud payload)
+  const channel = {
+    onlineCount,
+    walkInCount,
+    total,
+    onlineRate,
+    walkInRate,
+    daily: buckets.map((b) => ({ date: b.date, online: b.online, walkIn: b.walkIn })),
+  }
+
+  const statusDistribution = ANALYTICS_STATUSES.map((status) => ({
+    status,
+    count: cur.filter((r) => r.status === status).length,
+  }))
+
+  const hourlyTraffic = hourly.map((count, hour) => ({ hour, count }))
+
+  const weekdayHourMatrix = []
+  for (const [mk, count] of matrix) {
+    const [weekday, hour] = mk.split(':').map((v) => parseInt(v, 10))
+    weekdayHourMatrix.push({ weekday, hour, count })
+  }
+  weekdayHourMatrix.sort((a, b) => (a.weekday - b.weekday) || (a.hour - b.hour))
+
+  const services = [...serviceAgg.entries()]
+    .map(([serviceId, s]) => ({
+      serviceId,
+      name: serviceName(serviceId),
+      count: s.count,
+      completed: s.completed,
+      cancelled: s.cancelled,
+      noShow: s.noShow,
+      completionRate: s.count > 0 ? round1((s.completed / s.count) * 100) : 0,
+      avgWaitMinutes: s._waitN > 0 ? round1(s._waitSum / s._waitN) : null,
+    }))
+    .sort((a, b) => (b.count - a.count) || String(a.serviceId).localeCompare(String(b.serviceId)))
+
+  const branches = [...branchAgg.entries()]
+    .map(([branchId, b]) => ({
+      branchId: branchId && !String(branchId).includes(':missing-counter') ? branchId : null,
+      name: branchId === null ? '—' : branchName(branchId),
+      count: b.count,
+      completed: b.completed,
+      noShowRate: b.count > 0 ? round1((b.noShow / b.count) * 100) : 0,
+      avgWaitMinutes: b._waitN > 0 ? round1(b._waitSum / b._waitN) : null,
+    }))
+    .sort((a, b) => (b.count - a.count) || String(a.name).localeCompare(String(b.name)))
+
+  const counters = [...counterAgg.entries()]
+    .map(([counterId, ct]) => {
+      const info = counterInfo(counterId)
+      return {
+        counterId,
+        name: info ? info.name : 'Unknown',
+        branchName: info && info.branchId ? branchName(info.branchId) : 'Unknown',
+        served: ct.served,
+        avgServiceMinutes: ct._svcN > 0 ? round1(ct._svcSum / ct._svcN) : null,
+      }
+    })
+    .sort((a, b) => (b.served - a.served) || String(a.counterId).localeCompare(String(b.counterId)))
+    .slice(0, 12)
+
+  // ── Peaks ───────────────────────────────────────────────────────────────
+  const argmax = (arr) => {
+    let best = -1
+    let bestIndex = -1
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] > best) { best = arr[i]; bestIndex = i }
+    }
+    return bestIndex
+  }
+  let busiestDay = null
+  let busiestDayCount = 0
+  for (const [dayKey, count] of dailyCounts) {
+    if (count > busiestDayCount) { busiestDayCount = count; busiestDay = dayKey }
+  }
+  const peak = total > 0
+    ? { busiestHour: argmax(hourly), busiestWeekday: argmax(weekdayCounts), busiestDay }
+    : { busiestHour: null, busiestWeekday: null, busiestDay: null }
+
+  return {
+    period,
+    generatedAt: new Date().toISOString(),
+    range: {
+      start: range.start.toISOString(),
+      end: range.end.toISOString(),
+      previousStart: range.previousStart.toISOString(),
+      previousEnd: range.previousEnd.toISOString(),
+    },
+    kpis: {
+      total,
+      completed,
+      cancelled,
+      noShow,
+      completionRate,
+      cancellationRate,
+      noShowRate,
+      avgWaitMinutes,
+      avgServiceMinutes,
+      avgRating: ratings.average,
+      ratingCount: ratings.count,
+      walkInCount,
+      onlineCount,
+      walkInRate,
+      onlineRate,
+      uniqueCustomers,
+      deltas: {
+        total: analyticsPctChange(total, prevTotal),
+        completed: analyticsPctChange(completed, prevCompleted),
+        noShowRate: round1(noShowRate - prevNoShowRate), // percentage POINTS
+        avgWaitMinutes: analyticsPctChange(avgWaitMinutes, prevAvgWaitMinutes),
+        avgRating: analyticsPctChange(ratings.average, prevRatings.average),
+        uniqueCustomers: analyticsPctChange(uniqueCustomers, prevUniqueCustomers),
+      },
+    },
+    timeseries,
+    statusDistribution,
+    hourlyTraffic,
+    weekdayHourMatrix,
+    services,
+    branches,
+    counters,
+    ratings: { distribution: ratings.distribution, average: ratings.average, count: ratings.count },
+    peak,
+    channel,
+  }
+}
+
+// ─── Create Hono App ─────────────────────────────────────────────────────
+
+function createApp() {
+  const app = new Hono()
+
+  // CORS — loopback origins always; LAN/private http origins additionally
+  // when the API is bound beyond loopback (kiosk/TV webviews on the same
+  // network). Requests WITHOUT an Origin header (curl, Electron renderer,
+  // native shells) never enter CORS and are unaffected.
+  app.use(
+    '*',
+    cors({
+      origin: (origin) => {
+        if (!origin) return null // no Origin header → nothing to allow
+        if (CORS_ORIGINS.includes(origin)) return origin
+        if (LAN_ENABLED && isLanHttpOrigin(origin)) return origin
+        return null
+      },
+      allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+      allowHeaders: ['Content-Type', 'Authorization', 'X-Local-Token'],
+      // Task 41/67: the grace-window accept signals the stale renderer to
+      // catch up — the custom header must be readable cross-origin.
+      exposeHeaders: ['X-Blasti-Session-Rotated'],
+      credentials: true,
+      maxAge: 86400,
+    }),
+  )
+
+  // ─── Request diagnostics — "data loading failed" investigation ───────────
+  // Every /api/* request is timed. Failures (status ≥ 400) are ALWAYS logged
+  // with a response-body snippet; slow responses (>1500 ms) and
+  // auth/session/sync-relevant paths are logged too. Output goes to the
+  // console AND the rolling diag file, giving the exact server-side answer
+  // (401 AUTH_*, 503 db-warming, 404 route-missing, …) that pairs with the
+  // renderer's persistent diagnostic timeline.
+  app.use('/api/*', async (c, next) => {
+    const startedAt = Date.now()
+    const method = c.req.method
+    let path = '/api'
+    try { path = new URL(c.req.url).pathname } catch { /* keep fallback */ }
+    const alwaysLog = /\/api\/(auth\/|sync|initial-sync|agency\/(stats|queue|services))/.test(path)
+    try {
+      await next()
+    } catch (err) {
+      const ms = Date.now() - startedAt
+      const stack = err && err.stack ? String(err.stack).split('\n').slice(0, 4).join(' | ') : String(err)
+      diagLog(`API ${method} ${path} → THREW after ${ms}ms :: ${stack}`)
+      throw err
+    }
+    const ms = Date.now() - startedAt
+    const status = c.res && typeof c.res.status === 'number' ? c.res.status : 0
+    if (status >= 400) {
+      let snippet = ''
+      try {
+        const text = await c.res.clone().text()
+        snippet = ' :: ' + text.slice(0, 240)
+      } catch { /* body unreadable */ }
+      diagLog(`API ${method} ${path} → ${status} ${ms}ms${snippet}`)
+    } else if (alwaysLog || ms > 1500) {
+      diagLog(`API ${method} ${path} → ${status} ${ms}ms`)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 1. HEALTH / DISCOVERY (no auth)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  app.get('/health', (c) => {
+    return c.json({
+      status: 'ok',
+      mode: 'local',
+      uptime: Math.floor(process.uptime()),
+      dbReady: !!db,
+    })
+  })
+
+  // Alias: /api/health (used by loading-screen diagnostics probe)
+  app.get('/api/health', async (c) => {
+    // Task 42: build identity — lets diagnostics (and the second-launch guard
+    // in main.js) tell a CURRENT local API from a STALE one left running by an
+    // older install (the recurring "old server on :3080" divergence).
+    //   version = desktop package version; build = prebuild stamp (absent in
+    //   dev/source runs — see scripts/prebuild.js). Older builds return none
+    //   of these fields, which is itself the staleness fingerprint.
+    let build = null
+    try { build = require('../build-stamp.json').builtAt || null } catch { /* dev run — no stamp */ }
+    let version = null
+    try { version = require('../package.json').version || null } catch { /* never in a packaged app */ }
+
+    // Task 45: workspace identity — WHAT the synced workspace actually holds.
+    // This is the decisive diagnostic for the recurring "created a branch but
+    // the list stays empty" reports: the UI (and any human reading /api/health)
+    // can now see whether the SERVER's workspace is READY, which agency it is
+    // bound to, and how many branches/services it holds — i.e. WHICH side of
+    // the divergence is empty, with zero guessing.
+    let workspace = null
+    try {
+      if (db) {
+        const state = await db.agencyLocalState.findFirst({
+          select: { agencyId: true, initializationStatus: true, recordsImported: true, lastError: true },
+        }).catch(() => null)
+        if (state && state.agencyId) {
+          const branchCount = await db.branch.count({ where: { agencyId: state.agencyId } }).catch(() => null)
+          const serviceCount = await db.service.count({ where: { agencyId: state.agencyId } }).catch(() => null)
+          workspace = {
+            agencyId: state.agencyId,
+            status: state.initializationStatus || null,
+            recordsImported: state.recordsImported ?? null,
+            branchCount,
+            serviceCount,
+            lastError: state.lastError || null,
+          }
+        }
+      }
+    } catch { /* health must never fail because of diagnostics */ }
+
+    return c.json({
+      status: 'ok',
+      mode: 'local',
+      service: 'blasti-local-api',
+      version,
+      build,
+      uptime: Math.floor(process.uptime()),
+      dbReady: !!db,
+      workspace,
+    })
+  })
+
+  app.get('/api/discover', (c) => {
+    // Identity fields (hostname/displayName/platform) let the webapp's LAN
+    // discovery show a real server label instead of "BLASTI Server (IP)".
+    let hostname = ''
+    let platform = ''
+    try {
+      const os = require('os')
+      hostname = os.hostname() || ''
+      platform = `${os.type()} ${os.arch()}`.trim()
+    } catch { /* non-fatal */ }
+    // LAN-reachability fields — clients treat extra fields safely. When bound
+    // to the LAN, lanIp tells the scanner WHICH address answered (the UDP
+    // beacon carries the same pair).
+    const lanIp = LAN_ENABLED ? bestLanIp() : null
+    return c.json({
+      service: 'blasti-local',
+      version: '1.0.0',
+      mode: 'local-first',
+      hostname,
+      displayName: hostname ? `BLASTI Desktop — ${hostname}` : 'BLASTI Desktop',
+      platform,
+      port: DEFAULT_PORT,
+      apiPort: DEFAULT_PORT,
+      webPort: 3000,
+      lanIp: lanIp || null,
+      uptime: Math.floor(process.uptime()),
+      networkInterface: LAN_ENABLED ? primaryLanInterface(lanIp) : null,
+      syncReady: true,
+      capabilities: [
+        'auth',
+        'agency',
+        'services',
+        'branches',
+        'counters',
+        'staff',
+        'reservations',
+        'queue',
+        'notifications',
+        'user',
+        'settings',
+        'sync',
+        'devices',
+        'discovery',
+      ],
+    })
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 2. AUTH (no auth)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Desktop login = CLOUD LOGIN → LOCAL UNLOCK (Task 14).
+   *
+   * Resolution order (generic for every role — no per-user special cases):
+   *   1. LOCAL UNLOCK — LocalDeviceCredential (user+device) scrypt verifier.
+   *      Works with the cloud completely offline. Only the user who logged
+   *      in on THIS device has one.
+   *   2. LEGACY LOCAL HASH — pre-contract local rows that still carry a
+   *      passwordHash (dev fixtures / accounts created before the sync
+   *      contract change). A mismatch FALLS THROUGH to the cloud so a
+   *      password changed on the cloud still logs in.
+   *   3. CLOUD LOGIN PROXY — forwards the credentials to the cloud API; on
+   *      success upserts the local profile (profile-only), imports the
+   *      cloud session, and creates THIS user's device credential so the
+   *      next restart can unlock offline.
+   *   4. NO LOCAL CREDENTIAL — an explicit, machine-readable verdict so the
+   *      UI can say "log in with the cloud once to enable offline unlock".
+   */
+  app.post('/api/auth/login', async (c) => {
+    try {
+      const body = await c.req.json()
+      const { username, password } = body
+
+      if (!username || !password) {
+        return c.json({ success: false, error: 'Username and password required' }, 400)
+      }
+      if (!db) {
+        return c.json({ success: false, error: 'Local database not ready' }, 503)
+      }
+
+      const invalid = () => c.json({ success: false, error: 'Invalid username or password' }, 401)
+      const deactivated = () => c.json({ success: false, error: 'Account is deactivated' }, 403)
+
+      const buildStaffAgencyId = async (user) => {
+        if (user.role === 'AGENCY_OWNER' || user.role === 'AGENCY_STAFF') {
+          const staff = await db.agencyStaff.findFirst({
+            where: { userId: user.id, isActive: true },
+          })
+          if (staff) return staff.agencyId
+          // Owner fallback: the cloud's agency-create flow binds an owner via
+          // Agency.ownerId ONLY (no AgencyStaff row is ever created), so a
+          // wizard-created owner syncing locally has no staff row. Without
+          // this fallback the local session gets agencyId: null after
+          // re-login and every /api/agency/* read returns 403 → the profile,
+          // settings and QR pages all render empty (mirrors cloud auth.ts).
+          if (user.role === 'AGENCY_OWNER') {
+            const owned = await db.agency.findFirst({ where: { ownerId: user.id } })
+            if (owned) return owned.id
+          }
+          return null
+        }
+        return null
+      }
+
+      // Find user in local SQLite (may be absent on a fresh machine)
+      const user = await db.user.findUnique({ where: { username } }).catch(() => null)
+
+      // ── 1. Local unlock via device credential (fully offline) ──
+      // Task 33-C: when the workspace is LOCKED (authorization REVOKED), the
+      // device credential must NOT establish a session. We deliberately fall
+      // through to the cloud path below so a FRESH online login can restore
+      // authorization (Case-B recovery); only when the cloud cannot validate
+      // fresh credentials does the tail answer the explicit 423.
+      let unlockBlockedByRevocation = false
+      // Task 67: an ONLINE login must produce a CLOUD session. A device-
+      // credential unlock creates a local-only token the cloud cannot
+      // recognize — importing it afterwards used to LOCK the whole workspace
+      // ("session rejected by cloud"). So when the cloud IS reachable, defer
+      // the offline unlock and let the cloud-login path below authenticate
+      // for real; the device unlock only fires when the cloud is unreachable
+      // (fast offline path) or flaps mid-login (fallback further down).
+      const cloudUp = await isCloudReachable().catch(() => false)
+      let deferredUnlock = null
+      if (user && db.localDeviceCredential) {
+        const deviceId = await getDeviceId()
+        const cred = await db.localDeviceCredential.findUnique({
+          where: { userId_deviceId: { userId: user.id, deviceId } },
+        }).catch(() => null)
+        if (cred && !cred.revokedAt && verifierMatches(cred, password)) {
+          const authzNow = await getAuthorizationStatus()
+          if (authzNow === 'REVOKED') {
+            unlockBlockedByRevocation = true
+            console.warn('[LocalAPI] Offline unlock BLOCKED — authorization REVOKED (fresh cloud login required)')
+          } else if (cloudUp) {
+            if (!user.isActive) return deactivated()
+            deferredUnlock = {
+              source: 'login:device-unlock',
+              sessionData: {
+                id: user.id,
+                username: user.username,
+                fullName: user.fullName,
+                role: user.role,
+                language: user.language || 'ar',
+                avatarUrl: user.avatarUrl || null,
+                agencyId: await buildStaffAgencyId(user),
+              },
+            }
+            console.log('[LocalAPI] Device credential matches — cloud is reachable, using a fresh cloud login instead of the offline unlock')
+          } else {
+            if (!user.isActive) return deactivated()
+            const sessionData = {
+              id: user.id,
+              username: user.username,
+              fullName: user.fullName,
+              role: user.role,
+              language: user.language || 'ar',
+              avatarUrl: user.avatarUrl || null,
+              agencyId: await buildStaffAgencyId(user),
+            }
+            // Task 41 — route through assignSession so the outgoing token
+            // becomes the rotation-grace predecessor (never 401 a stale renderer).
+            assignSession(randomBytes(32).toString('hex'), sessionData, 'login:device-unlock')
+            emitEvent('auth:login', { user: sessionData })
+            console.log('[LocalAPI] Local unlock via device credential:', sessionData.username)
+            return c.json({ success: true, user: sessionData, token: sessionToken, unlockedLocally: true })
+          }
+        }
+      }
+
+      // ── 2. Legacy local passwordHash (pre-contract rows only) ──
+      // NOTE: a mismatch falls through to the cloud (the local hash may be
+      // stale after a cloud-side password change) — it does NOT return 401.
+      if (user && user.passwordHash) {
+        const inputHash = createHash('sha256').update(password).digest('hex')
+        try {
+          const storedBuf = Buffer.from(user.passwordHash, 'utf-8')
+          const inputBuf = Buffer.from(inputHash, 'utf-8')
+          let ok = storedBuf.length === inputBuf.length && timingSafeEqual(storedBuf, inputBuf)
+          if (!ok && user.passwordHash.startsWith('$2')) {
+            try {
+              const bcrypt = require('bcryptjs')
+              ok = await bcrypt.compare(password, user.passwordHash)
+            } catch { ok = false }
+          }
+          if (ok) {
+            if (!user.isActive) return deactivated()
+            // Task 33-C: legacy unlock is also subject to the workspace lock.
+            const authzNowLegacy = await getAuthorizationStatus()
+            if (authzNowLegacy === 'REVOKED') {
+              unlockBlockedByRevocation = true
+              console.warn('[LocalAPI] Legacy local unlock BLOCKED — authorization REVOKED (fresh cloud login required)')
+              // fall through to the cloud path
+            } else if (cloudUp) {
+              // Task 67: online → prefer the cloud session (same reasoning as
+              // the device-credential branch above).
+              deferredUnlock = {
+                source: 'login:legacy-unlock',
+                sessionData: {
+                  id: user.id,
+                  username: user.username,
+                  fullName: user.fullName,
+                  role: user.role,
+                  language: user.language || 'ar',
+                  avatarUrl: await localizeFileUrl(user.avatarUrl || null),
+                  agencyId: await buildStaffAgencyId(user),
+                },
+              }
+              console.log('[LocalAPI] Legacy credential matches — cloud is reachable, using a fresh cloud login instead of the offline unlock')
+            } else {
+              const sessionData = {
+                id: user.id,
+                username: user.username,
+                fullName: user.fullName,
+                role: user.role,
+                language: user.language || 'ar',
+                avatarUrl: await localizeFileUrl(user.avatarUrl || null),
+                agencyId: await buildStaffAgencyId(user),
+              }
+              // Task 41 — rotation-grace-aware assignment (see assignSession).
+              assignSession(randomBytes(32).toString('hex'), sessionData, 'login:legacy-unlock')
+              emitEvent('auth:login', { user: sessionData })
+              return c.json({ success: true, user: sessionData, token: sessionToken })
+            }
+          }
+        } catch { /* fall through to the cloud */ }
+      }
+
+      // ── 3. Cloud login through the local API (+ device credential) ──
+      const cloud = await cloudLoginProxy(username, password, body && body.rememberMe ? { rememberMe: true } : undefined)
+
+      // ── Task 22: cloud requires email/phone OTP verification ──
+      // The account exists but is NOT verified: pass the verification payload
+      // through and DO NOT establish any session (local or cloud) until the
+      // codes are confirmed via POST /api/auth/verify.
+      if (cloud.ok && cloud.data && cloud.data.requiresVerification) {
+        console.log(`[LocalAPI] Cloud login requires verification for: ${username}`)
+        return c.json(cloud.data, 200)
+      }
+
+      if (cloud.ok && cloud.data && cloud.data.user && cloud.data.token) {
+        const cloudUser = cloud.data.user
+        try {
+          await upsertLocalUserFromCloud(cloudUser)
+        } catch (e) {
+          console.warn('[LocalAPI] Local profile upsert after cloud login failed:', e?.message || e)
+        }
+        try {
+          await storeDeviceCredential(cloudUser.id, password, body ? body.keepSignedIn : undefined)
+        } catch (e) {
+          console.warn('[LocalAPI] Device credential store failed:', e?.message || e)
+        }
+        // Task 41 — assignSession keeps the pre-login token (if any) valid for
+        // the grace window, so a renderer that still presents it never 401s.
+        assignSession(cloud.data.token, {
+          id: cloudUser.id,
+          username: cloudUser.username || cloudUser.email || 'imported',
+          fullName: cloudUser.fullName || cloudUser.name || '',
+          role: cloudUser.role || 'CUSTOMER',
+          language: cloudUser.language || 'ar',
+          avatarUrl: await localizeFileUrl(cloudUser.avatarUrl || null),
+          agencyId: cloudUser.agencyId || null,
+        }, 'login:cloud')
+        // Task 40: wizard-created owners have a NULL cloud User.agencyId (the
+        // agency binds via Agency.ownerId) — hydrate from LOCAL ownership so
+        // the renderer receives a usable agencyId and the branch/staff lists
+        // stop rendering silently empty on desktop.
+        await hydrateSessionAgencyId(sessionUser)
+        // Task 33-C: a fresh CLOUD login is fresh proof of authorization —
+        // clears a previous workspace lock and (via storeDeviceCredential's
+        // upsert semantics: revokedAt: null on update) makes offline unlock
+        // work again for the re-login recovery case.
+        try {
+          await markAuthorizationAuthorized()
+        } catch (authzErr) {
+          console.warn('[LocalAPI] Could not record fresh authorization:', authzErr?.message || authzErr)
+        }
+        emitEvent('auth:login', { user: sessionUser })
+        // Round 15 — push any local-only files (e.g. an avatar uploaded
+        // offline) now that a session exists.
+        if (fileSync) fileSync.schedule('login')
+        console.log('[LocalAPI] Cloud login via local API — device credential stored:', sessionUser.username)
+        return c.json({ success: true, user: sessionUser, token: sessionToken })
+      }
+
+      // The cloud REJECTED the credentials — a definitive wrong-password (not offline).
+      if (cloud.status === 401 || cloud.status === 403) return invalid()
+
+      // Task 67: the cloud login could not complete (unreachable mid-flight or
+      // a 5xx) although an offline credential was verified earlier — fall back
+      // to the deferred local unlock so a network flap never locks the user
+      // out of their own machine. A definitive cloud rejection (401/403) above
+      // still wins: the cloud is the authority on wrong passwords.
+      if (deferredUnlock && cloud.status !== 401 && cloud.status !== 403 && !unlockBlockedByRevocation) {
+        assignSession(randomBytes(32).toString('hex'), deferredUnlock.sessionData, deferredUnlock.source)
+        emitEvent('auth:login', { user: deferredUnlock.sessionData })
+        console.log('[LocalAPI] Cloud login unavailable — falling back to the verified local unlock:', deferredUnlock.sessionData.username)
+        return c.json({
+          success: true,
+          user: deferredUnlock.sessionData,
+          token: sessionToken,
+          unlockedLocally: true,
+        })
+      }
+
+      // Task 33-C: the device credential matched but the workspace is locked
+      // and the cloud could not validate fresh credentials (unreachable or
+      // wrong password answered by an unreachable cloud). Never unlock.
+      if (unlockBlockedByRevocation && cloud.status !== 401 && cloud.status !== 403) {
+        return c.json({
+          success: false,
+          error: 'Authorization revoked — please sign in again with an internet connection',
+          code: 'AUTHORIZATION_REVOKED',
+        }, 423)
+      }
+
+      // Cloud unreachable and no local unlock is possible for this profile.
+      if (user) {
+        return c.json({
+          success: false,
+          error: 'Invalid username or password',
+          code: 'NO_LOCAL_CREDENTIAL',
+          cloudLoginRequired: true,
+        }, 401)
+      }
+      return invalid()
+    } catch (error) {
+      console.error('[LocalAPI] Login error:', error)
+      return c.json({ success: false, error: 'Login failed' }, 500)
+    }
+  })
+
+  /**
+   * Plaintext passwords stashed between REGISTER and VERIFY (Task 22).
+   * Keyed by verificationToken; only used to derive the offline unlock
+   * credential the moment verification completes. Memory-only — a restart
+   * simply means the credential is stored at the next successful login.
+   */
+  const pendingVerificationPasswords = new Map()
+
+  /**
+   * Register a new account — CLOUD-NATIVE operation proxied through the
+   * local API. The desktop UI always targets 127.0.0.1:3080 (local-first
+   * contract), so without this route account creation was impossible in the
+   * desktop app even though the web register form existed.
+   *
+   * Flow (registration REQUIRES the cloud — an offline-created account would
+   * never exist on the cloud and could never sync or log in elsewhere):
+   *   1. Forward the payload to the cloud POST /api/auth/register.
+   *   2. Cloud rejection (409 username/phone taken, validation, …) is passed
+   *      through verbatim so the form can map field errors.
+   *   3. Task 22: the cloud now returns requiresVerification=true + a
+   *      verificationToken — OTP codes are sent for email + phone and NO
+   *      session exists until the codes are confirmed (POST /api/auth/verify).
+   *      The plaintext password is stashed in memory so the offline unlock
+   *      credential can be derived the moment verification completes.
+   *   4. Legacy path (cloud WITHOUT verification enforcement): sign in
+   *      immediately as before.
+   */
+  app.post('/api/auth/register', async (c) => {
+    try {
+      if (!db) {
+        return c.json({ success: false, error: 'Local database not ready' }, 503)
+      }
+
+      let body
+      try { body = await c.req.json() } catch { body = null }
+      if (!body || typeof body !== 'object' || !String(body.username || '').trim() || !String(body.password || '') || !String(body.fullName || '').trim()) {
+        return c.json({ success: false, error: 'username, fullName and password are required' }, 400)
+      }
+      if (String(body.password).length < 6) {
+        return c.json({ success: false, error: 'Password must be at least 6 characters' }, 400)
+      }
+
+      const base = cloudBaseUrl()
+      let reg
+      try {
+        const res = await fetch(base + '/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(15000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON error body */ }
+        reg = { ok: res.ok, status: res.status, data }
+      } catch (err) {
+        console.warn('[LocalAPI] Register proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Account creation requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+
+      if (!reg.ok || !reg.data || !reg.data.user) {
+        const status = reg.status || 500
+        const errBody = reg.data && typeof reg.data === 'object'
+          ? reg.data
+          : { success: false, error: 'Registration failed' }
+        console.warn(`[LocalAPI] Register rejected by cloud: HTTP ${status} — ${errBody.error || '(no error body)'}`)
+        return c.json(errBody, status)
+      }
+
+      const cloudUser = reg.data.user
+      const password = String(body.password)
+      const username = String(body.username).trim()
+
+      // ── Task 22: account created but UNVERIFIED — no session yet ──
+      if (reg.data.requiresVerification && reg.data.verificationToken) {
+        try {
+          // Task 5 — mirror the Algeria address onto the local User row from
+          // the register request body (cloud value preferred inside the
+          // helper; the body is the fallback for older clouds).
+          await upsertLocalUserFromCloud(cloudUser, { wilaya: body.wilaya, commune: body.commune })
+        } catch (e) {
+          console.warn('[LocalAPI] Register: local profile upsert failed:', e?.message || e)
+        }
+        pendingVerificationPasswords.set(reg.data.verificationToken, {
+          userId: cloudUser.id,
+          password,
+          storedAt: Date.now(),
+        })
+        // Prune stashes older than 30 minutes (verificationToken TTL is 15)
+        for (const [k, v] of pendingVerificationPasswords) {
+          if (Date.now() - v.storedAt > 30 * 60 * 1000) pendingVerificationPasswords.delete(k)
+        }
+        console.log(`[LocalAPI] Account registered — awaiting email/phone verification: ${cloudUser.username || username}`)
+        return c.json(reg.data, 201)
+      }
+
+      // Legacy path — cloud without verification enforcement: sign in now
+
+      // Sign in immediately — acquire the cloud session token (best effort).
+      let token = null
+      try {
+        const cloud = await cloudLoginProxy(username, password)
+        if (cloud.ok && cloud.data && cloud.data.user && cloud.data.token) {
+          token = cloud.data.token
+        }
+      } catch { /* tolerated — local token minted below */ }
+      if (!token) {
+        token = randomBytes(32).toString('hex')
+        console.warn('[LocalAPI] Register: cloud token unavailable — minted a LOCAL session token (a cloud token will be acquired at the next login)')
+      }
+
+      try {
+        // Task 5 — mirror the Algeria address onto the local User row (see
+        // the requiresVerification path above for the override rationale).
+        await upsertLocalUserFromCloud(cloudUser, { wilaya: body.wilaya, commune: body.commune })
+      } catch (e) {
+        console.warn('[LocalAPI] Register: local profile upsert failed:', e?.message || e)
+      }
+      try {
+        await storeDeviceCredential(cloudUser.id, password)
+      } catch (e) {
+        console.warn('[LocalAPI] Register: device credential store failed:', e?.message || e)
+      }
+
+      sessionToken = token
+      sessionUser = {
+        id: cloudUser.id,
+        username: cloudUser.username || username,
+        fullName: cloudUser.fullName || '',
+        role: cloudUser.role || 'CUSTOMER',
+        language: cloudUser.language || 'ar',
+        avatarUrl: cloudUser.avatarUrl || null,
+        agencyId: cloudUser.agencyId || null,
+      }
+      emitEvent('auth:login', { user: sessionUser })
+      console.log(`[LocalAPI] Account registered + session established: ${sessionUser.username} (${sessionUser.role})`)
+      return c.json({
+        success: true,
+        user: { ...sessionUser, phoneNumber: cloudUser.phoneNumber ?? null },
+        token,
+        isNewUser: true,
+      }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Register error:', error)
+      return c.json({ success: false, error: 'Registration failed' }, 500)
+    }
+  })
+
+  // ── Task 22: OTP verification proxies (cloud-native operations) ─────────
+
+  /**
+   * POST /api/auth/verify — proxy to the cloud. On FULL verification the
+   * cloud returns { verified: true, user, token }: the local profile is
+   * upserted, the offline unlock credential is derived from the stashed
+   * register password (when available), and the local session is established
+   * with the CLOUD token — exactly the pre-Task-22 register success shape.
+   */
+  app.post('/api/auth/verify', async (c) => {
+    try {
+      let body
+      try { body = await c.req.json() } catch { body = null }
+      if (!body || !body.verificationToken) {
+        return c.json({ success: false, error: 'verificationToken is required' }, 400)
+      }
+      const base = cloudBaseUrl()
+      let cloud
+      try {
+        const res = await fetch(base + '/api/auth/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(15000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON */ }
+        cloud = { ok: res.ok, status: res.status, data }
+      } catch (err) {
+        return c.json({
+          success: false,
+          error: 'Verification requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+
+      if (!cloud.ok || !cloud.data) {
+        return c.json(cloud.data || { success: false, error: 'Verification failed' }, cloud.status || 500)
+      }
+
+      // Partial verification (one channel done, the other pending) → pass through
+      if (!cloud.data.verified) {
+        return c.json(cloud.data, cloud.status || 200)
+      }
+
+      // FULL verification → establish the local session (parity with register)
+      const verifiedUser = cloud.data.user
+      const token = cloud.data.token
+      try {
+        await upsertLocalUserFromCloud(verifiedUser)
+      } catch (e) {
+        console.warn('[LocalAPI] Verify: local profile upsert failed:', e?.message || e)
+      }
+
+      const stashed = pendingVerificationPasswords.get(body.verificationToken)
+      if (stashed && stashed.userId === verifiedUser.id) {
+        try {
+          await storeDeviceCredential(verifiedUser.id, stashed.password)
+        } catch (e) {
+          console.warn('[LocalAPI] Verify: device credential store failed:', e?.message || e)
+        }
+        pendingVerificationPasswords.delete(body.verificationToken)
+      }
+
+      sessionToken = token
+      sessionUser = {
+        id: verifiedUser.id,
+        username: verifiedUser.username || 'verified',
+        fullName: verifiedUser.fullName || '',
+        role: verifiedUser.role || 'CUSTOMER',
+        language: verifiedUser.language || 'ar',
+        avatarUrl: await localizeFileUrl(verifiedUser.avatarUrl || null),
+        agencyId: verifiedUser.agencyId || null,
+      }
+      emitEvent('auth:login', { user: sessionUser })
+      console.log(`[LocalAPI] Account VERIFIED + session established: ${sessionUser.username} (${sessionUser.role})`)
+      // Round 15 — with a session in hand the file-sync worker can finally
+      // push the register-time avatar (and any other local-only files) to
+      // the cloud. Fire it now so the avatar appears on the user's OTHER
+      // devices within seconds.
+      if (fileSync) fileSync.schedule('verified')
+      return c.json({
+        success: true,
+        verified: true,
+        user: { ...sessionUser, email: verifiedUser.email ?? null, phoneNumber: verifiedUser.phoneNumber ?? null },
+        token,
+        isNewUser: true,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] Verify error:', error)
+      return c.json({ success: false, error: 'Verification failed' }, 500)
+    }
+  })
+
+  /** POST /api/auth/resend-verification — thin proxy (rate limits live on the cloud). */
+  app.post('/api/auth/resend-verification', async (c) => {
+    try {
+      let body
+      try { body = await c.req.json() } catch { body = null }
+      if (!body || !body.verificationToken || !body.channel) {
+        return c.json({ success: false, error: 'verificationToken and channel are required' }, 400)
+      }
+      const base = cloudBaseUrl()
+      const res = await fetch(base + '/api/auth/resend-verification', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15000),
+      })
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON */ }
+      return c.json(data || { success: false, error: 'Resend failed' }, res.ok ? 200 : (res.status || 500))
+    } catch (err) {
+      return c.json({
+        success: false,
+        error: 'Resending the code requires an internet connection — the cloud API is unreachable',
+        code: 'CLOUD_UNREACHABLE',
+      }, 503)
+    }
+  })
+
+  /** POST /api/auth/verification-status — thin proxy (resume an interrupted flow). */
+  app.post('/api/auth/verification-status', async (c) => {
+    try {
+      let body
+      try { body = await c.req.json() } catch { body = null }
+      if (!body || !body.verificationToken) {
+        return c.json({ success: false, error: 'verificationToken is required' }, 400)
+      }
+      const base = cloudBaseUrl()
+      const res = await fetch(base + '/api/auth/verification-status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(10000),
+      })
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON */ }
+      return c.json(data || { success: false, error: 'Status check failed' }, res.ok ? 200 : (res.status || 500))
+    } catch (err) {
+      return c.json({
+        success: false,
+        error: 'The cloud API is unreachable',
+        code: 'CLOUD_UNREACHABLE',
+      }, 503)
+    }
+  })
+
+  /**
+   * Task 23: file-upload proxies — the desktop UI (apiClient) always targets
+   * 127.0.0.1:3080 (local-first contract), but file STORAGE is a cloud
+   * property (the returned URL must be reachable from every device), so the
+   * local API forwards the multipart/JSON body to the cloud verbatim. Offline
+   * → explicit 503 CLOUD_UNREACHABLE, same contract as the register/verify
+   * proxies.
+   *
+   * POST is deliberately NOT session-gated here: account creation uploads an
+   * avatar BEFORE the account exists (no session until OTP verification), so
+   * the cloud's own per-type policy applies (public avatar path under strict
+   * limits, every other type requires the forwarded cloud token).
+   */
+
+  /**
+   * Round 15 — POST /api/upload is now LOCAL-FIRST. The previous
+   * implementation forwarded the multipart body verbatim to the cloud, so a
+   * registration-time avatar upload failed the instant the cloud was
+   * unreachable (the reported "the image never shows in the preview") and
+   * the desktop stored no files at all. Now:
+   *   1. The file is written to THIS device's organized file store
+   *      (lib/file-store.js → <files>/<bucket>/<yyyy>/<mm>/…).
+   *   2. A local FileAsset row is created (syncState LOCAL_ONLY).
+   *   3. The response URL points at THIS local API, so the preview renders
+   *      immediately and offline.
+   *   4. lib/file-sync.js mirrors the file to the cloud in the background
+   *      (POST /api/files/sync/push) and flips the row to SYNCED.
+   * Cloud-side URL normalization (apps/api/src/lib/file-url.ts) rewrites the
+   * local URL carried in records (avatarUrl, receiptUrl, …) to the cloud's
+   * public URL at sync intake, so other devices keep working.
+   *
+   * Validation mirrors the cloud's per-type policy: the avatar path stays
+   * PUBLIC (register-time upload, no session yet) with the strict image-only
+   * whitelist + 2MB cap; every other bucket requires a session.
+   */
+  const UPLOAD_LIMITS = {
+    avatar: 2 * 1024 * 1024,
+    logo: 2 * 1024 * 1024,
+    receipt: 5 * 1024 * 1024,
+    document: 10 * 1024 * 1024,
+    general: 5 * 1024 * 1024,
+  }
+  const PUBLIC_AVATAR_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp'])
+  const ALL_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'pdf'])
+
+  app.post('/api/upload', async (c) => {
+    try {
+      let formData
+      try {
+        formData = await c.req.formData()
+      } catch (parseErr) {
+        return c.json({ success: false, error: 'multipart/form-data body required' }, 400)
+      }
+      const file = formData.get('file')
+      const rawType = String(formData.get('type') || c.req.query('type') || 'general').trim().toLowerCase()
+      const bucket = ['general', 'avatar', 'logo', 'receipt', 'document'].includes(rawType) && /^[a-z][a-z0-9-]{0,23}$/.test(rawType)
+        ? rawType
+        : 'general'
+
+      if (!file || typeof file === 'string') {
+        return c.json({ success: false, error: 'No file provided' }, 400)
+      }
+
+      const ext = (String(file.name || '').split('.').pop() || '').toLowerCase()
+
+      // ── Auth + extension policy (mirrors the cloud route) ──
+      if (bucket === 'avatar') {
+        // PUBLIC path — registration uploads an avatar before any session exists.
+        if (!PUBLIC_AVATAR_EXTENSIONS.has(ext)) {
+          return c.json({ success: false, error: `Invalid image type ".${ext}" — allowed: ${[...PUBLIC_AVATAR_EXTENSIONS].join(', ')}` }, 400)
+        }
+      } else {
+        if (!sessionToken) {
+          return c.json({ success: false, error: 'Authentication required' }, 401)
+        }
+        if (!ALL_EXTENSIONS.has(ext)) {
+          return c.json({ success: false, error: `Invalid file type ".${ext}" — allowed: ${[...ALL_EXTENSIONS].join(', ')}` }, 400)
+        }
+      }
+
+      const maxBytes = UPLOAD_LIMITS[bucket] || UPLOAD_LIMITS.general
+      if (file.size > maxBytes) {
+        return c.json({ success: false, error: `File too large — max ${Math.round(maxBytes / 1024 / 1024)}MB` }, 400)
+      }
+
+      const buffer = Buffer.from(await file.arrayBuffer())
+      const filename = fileStore.makeFilename(ext)
+      const saved = await fileStore.saveUpload(bucket, buffer, filename)
+
+      const checksum = createHash('sha256').update(buffer).digest('hex')
+      const deviceFileId = 'dev-' + randomBytes(12).toString('hex')
+      const url = fileStore.absoluteFileUrl(localOrigin, saved.storagePath)
+
+      try {
+        await db.fileAsset.create({
+          data: {
+            deviceFileId,
+            bucket,
+            storagePath: saved.storagePath,
+            originalName: String(file.name || filename).slice(0, 200),
+            mimeType: file.type || 'application/octet-stream',
+            size: buffer.length,
+            checksum,
+            url,
+            ownerId: sessionUser ? sessionUser.id : null,
+            agencyId: sessionUser && sessionUser.agencyId ? sessionUser.agencyId : null,
+            syncState: 'LOCAL_ONLY',
+          },
+        })
+      } catch (regErr) {
+        // The blob is durably stored; a registry hiccup must not fail the upload.
+        console.warn('[LocalAPI] FileAsset registration failed:', regErr?.message || regErr)
+      }
+
+      // Kick the file-sync worker — the blob reaches the cloud in the background.
+      if (fileSync) fileSync.schedule('upload')
+
+      return c.json({
+        success: true,
+        url,
+        path: fileStore.publicFilePath(saved.storagePath),
+        filename,
+        storagePath: saved.storagePath,
+        deviceFileId,
+        provider: 'local-device',
+        size: buffer.length,
+        type: bucket,
+        syncState: 'LOCAL_ONLY',
+      }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Upload error:', error)
+      return c.json({ success: false, error: 'Upload failed' }, 500)
+    }
+  })
+
+  /**
+   * Round 15 — GET /api/upload/file/* serves the LOCAL file store (both the
+   * organized <bucket>/<yyyy>/<mm>/<name> shape and the legacy flat
+   * <bucket>/<name> shape). Public like the cloud (capability URLs — the
+   * filenames are unguessable); this is what makes uploaded avatars/logos/
+   * receipts render instantly in the desktop UI, OFFLINE included.
+   */
+  const MIME_BY_EXT = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+    webp: 'image/webp', svg: 'image/svg+xml', pdf: 'application/pdf',
+  }
+  const serveLocalFile = async (c) => {
+    const type = c.req.param('type')
+    const yyyy = c.req.param('yyyy')
+    const mm = c.req.param('mm')
+    const name = c.req.param('name') || c.req.param('rest')
+    if (!type || !name || !/^[a-z][a-z0-9-]{0,23}$/.test(type)) {
+      return c.json({ success: false, error: 'Invalid file path' }, 400)
+    }
+    // Organized route has yyyy/mm params; legacy flat route passes only the name.
+    const storagePath = yyyy && mm ? `${type}/${yyyy}/${mm}/${name}` : `${type}/${name}`
+    const data = await fileStore.readByStoragePath(storagePath)
+    if (!data) {
+      return c.json({ success: false, error: 'File not found' }, 404)
+    }
+    const ext = (name.split('.').pop() || '').toLowerCase()
+    const mime = MIME_BY_EXT[ext] || 'application/octet-stream'
+    return new Response(new Uint8Array(data), {
+      status: 200,
+      headers: {
+        'Content-Type': mime,
+        'Content-Length': String(data.length),
+        'Cache-Control': 'public, max-age=31536000, immutable',
+        'Content-Disposition': 'inline',
+      },
+    })
+  }
+  app.get('/api/upload/file/:type/:yyyy/:mm/:name', serveLocalFile)
+  app.get('/api/upload/file/:type/:name', serveLocalFile)
+
+  /**
+   * Round 15 — GET /api/files/status: local file store + sync diagnostics.
+   */
+  app.get('/api/files/status', requireAuth(), async (c) => {
+    try {
+      const status = fileStore.getStatus()
+      const counts = { LOCAL_ONLY: 0, DIRTY: 0, SYNCED: 0, DELETED: 0 }
+      try {
+        const rows = await db.$queryRawUnsafe('SELECT "syncState", COUNT(*) as n FROM "FileAsset" GROUP BY "syncState"')
+        for (const row of rows || []) counts[String(row.syncState)] = Number(row.n)
+      } catch { /* table may be absent on ancient DBs */ }
+      const cursor = await getLocalMeta('file_sync_cursor')
+      return c.json({ success: true, store: status, counts, pullCursor: cursor })
+    } catch (error) {
+      return c.json({ success: false, error: 'File status failed' }, 500)
+    }
+  })
+
+  /**
+   * Round 15 — POST /api/files/sync-now: run one file-sync round on demand
+   * (diagnostics / Settings → Sync recovery).
+   */
+  app.post('/api/files/sync-now', requireAuth(), async (c) => {
+    try {
+      if (!fileSync) return c.json({ success: false, error: 'File sync not initialized' }, 503)
+      const result = await fileSync.syncNow('manual')
+      return c.json({ success: true, result })
+    } catch (error) {
+      return c.json({ success: false, error: 'File sync failed' }, 500)
+    }
+  })
+
+  /**
+   * Round 15 — DELETE /api/upload removes the LOCAL copy first (offline-safe)
+   * and mirrors the deletion to the cloud: a SYNCED file is tombstoned right
+   * away (best-effort) or, when offline, the row flips to DELETED so the
+   * file-sync worker replays the tombstone once the cloud is reachable.
+   */
+  app.delete('/api/upload', requireAuth(), async (c) => {
+    try {
+      let body
+      try { body = await c.req.json() } catch { body = {} }
+      const url = body && body.url
+      if (!url) {
+        return c.json({ success: false, error: 'No URL provided' }, 400)
+      }
+      const storagePath = fileStore.storagePathFromUrl(url)
+      if (!storagePath) {
+        return c.json({ success: false, error: 'Invalid file URL — only /api/upload/file/* paths are allowed' }, 400)
+      }
+
+      // Local removal + registry update.
+      await fileStore.deleteByStoragePath(storagePath)
+      const row = await db.fileAsset.findFirst({ where: { storagePath } })
+      if (row) {
+        if (row.syncState === 'SYNCED') {
+          // Already on the cloud — tombstone there immediately (best-effort).
+          let cloudDeleted = false
+          try {
+            const res = await fetch(cloudBaseUrl() + `/api/files/sync/${encodeURIComponent(row.deviceFileId)}`, {
+              method: 'DELETE',
+              headers: { ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}) },
+              signal: AbortSignal.timeout(10000),
+            })
+            cloudDeleted = res.ok || res.status === 404
+          } catch { /* offline — replay via the worker */ }
+          if (cloudDeleted) {
+            await db.fileAsset.delete({ where: { id: row.id } }).catch(() => {})
+          } else {
+            await db.fileAsset.update({ where: { id: row.id }, data: { syncState: 'DELETED' } }).catch(() => {})
+            if (fileSync) fileSync.schedule('delete')
+          }
+        } else if (row.syncState === 'LOCAL_ONLY' || row.syncState === 'DIRTY') {
+          // Never reached the cloud — the local row is enough.
+          await db.fileAsset.delete({ where: { id: row.id } }).catch(() => {})
+        } else {
+          await db.fileAsset.update({ where: { id: row.id }, data: { syncState: 'DELETED' } }).catch(() => {})
+        }
+      }
+      return c.json({ success: true, message: 'File deleted' })
+    } catch (error) {
+      console.error('[LocalAPI] Upload delete error:', error)
+      return c.json({ success: false, error: 'Delete failed' }, 500)
+    }
+  })
+
+  /**
+   * Task 24: /api/app-versions cloud passthrough — app binaries and version
+   * records exist ONLY on the cloud, but the admin panel (rendered inside the
+   * desktop shell too) posts uploads to the local-first base URL and used to
+   * get a bare local 404. Every method is forwarded verbatim — multipart
+   * bodies included — with the cloud session token attached when one exists.
+   * Authorization is enforced by the cloud (requireAdmin); without a session
+   * the forwarded request simply carries no token and the cloud answers 401.
+   */
+  const forwardAppVersions = async (c) => {
+    try {
+      const reqUrl = new URL(c.req.url)
+      const base = cloudBaseUrl()
+      const target = base + reqUrl.pathname + (reqUrl.search || '')
+      const method = c.req.method
+      const isBodyful = method !== 'GET' && method !== 'HEAD'
+      const contentType = c.req.header('Content-Type')
+      let bodyBuffer = null
+      if (isBodyful) {
+        try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
+      }
+      let res
+      try {
+        res = await fetch(target, {
+          method,
+          headers: {
+            ...(contentType ? { 'Content-Type': contentType } : {}),
+            ...(bodyBuffer ? { 'Content-Length': String(bodyBuffer.length) } : {}),
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: bodyBuffer,
+          signal: AbortSignal.timeout(120000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] App-versions proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'App version management requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      const resContentType = res.headers.get('Content-Type') || ''
+      if (resContentType.includes('application/json')) {
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON body */ }
+        return c.json(data || { success: res.ok }, res.status)
+      }
+      // Binary passthrough (e.g. /download) — stream the bytes back untouched.
+      const buf = Buffer.from(await res.arrayBuffer())
+      return new Response(buf, {
+        status: res.status,
+        headers: {
+          'Content-Type': resContentType || 'application/octet-stream',
+          'Content-Length': String(buf.length),
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] App-versions proxy error:', error)
+      return c.json({ success: false, error: 'App version request failed' }, 500)
+    }
+  }
+  app.all('/api/app-versions', forwardAppVersions)
+  app.all('/api/app-versions/*', forwardAppVersions)
+
+  /**
+   * Round 15 — /api/agencies cloud proxy. Agency CREATION is a cloud-native
+   * operation (customCode uniqueness, the owner relation, the web/mobile
+   * catalogue), but the create-agency form posts to the local-first base
+   * URL and the local API had NO /api/agencies route — every attempt 404'd
+   * with the self-identifying "Not found" body. POST forwards to the cloud
+   * with the session token, then kicks a sync round so the new agency (and
+   * its services) land in the local DB immediately; GET forwards admin
+   * listings. Authorization stays cloud-enforced.
+   *
+   * Task 51: the create/UPDATE payloads carry the map/location fields
+   * (latitude, longitude, postalCode, locationVerified, locationSource —
+   * see spec docs/chatgpt-doc1-map-location-spec.md §2/§27). They ride
+   * through this proxy VERBATIM: the cloud validates the ranges/pair
+   * (400 on violation) and stamps locationUpdatedAt, then the ordinary v2
+   * sync brings the row (all 8 location columns) down to the local DB —
+   * no second mechanism (spec §41).
+   */
+  const forwardAgencies = async (c) => {
+    try {
+      const reqUrl = new URL(c.req.url)
+      // Strip the web-gateway routing hint — meaningless to the cloud.
+      reqUrl.searchParams.delete('XTransformPort')
+      const target = cloudBaseUrl() + reqUrl.pathname + (reqUrl.search || '')
+      const method = c.req.method
+      let bodyBuffer = null
+      if (method !== 'GET' && method !== 'HEAD') {
+        try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
+      }
+      let res
+      try {
+        res = await fetch(target, {
+          method,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(bodyBuffer ? { 'Content-Length': String(bodyBuffer.length) } : {}),
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: bodyBuffer,
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] Agencies proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Creating an agency requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON */ }
+      if (res.ok && (method === 'POST' || method === 'PUT' || method === 'PATCH') && data && data.success) {
+        // Round 16 — agency CREATED: adopt it into the local session at once.
+        // The cloud 201 now carries an upgraded token whose JWT embeds the new
+        // agencyId; the renderer adopts it (setSessionToken → IPC setAuth),
+        // but the local session must not stay agency-less until then — every
+        // /api/agency/* read would 403 and the db-status readiness gate would
+        // keep reporting NOT_INITIALIZED.
+        if (method === 'POST' && data.agency && data.agency.id && sessionUser) {
+          sessionUser.agencyId = data.agency.id
+          console.log('[LocalAPI] Session agencyId updated after agency create:', data.agency.id)
+          emitEvent('auth:login', { user: sessionUser })
+        }
+        // Kick a sync round so the created/updated agency appears locally at once.
+        try { if (fileSync) fileSync.schedule('agency-created') } catch { /* non-fatal */ }
+        try {
+          // Lazy require — sync-service lazily requires ./index (circular dep).
+          const syncService = require('./sync-service')
+          if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+        } catch { /* non-fatal */ }
+      }
+      return c.json(data || { success: res.ok }, res.ok ? (res.status === 201 ? 201 : 200) : (res.status || 500))
+    } catch (error) {
+      console.error('[LocalAPI] Agencies proxy error:', error)
+      return c.json({ success: false, error: 'Agency request failed' }, 500)
+    }
+  }
+  app.post('/api/agencies', forwardAgencies)
+  app.get('/api/agencies', forwardAgencies)
+  // Round 17 — sub-path GETs forward too: the create-agency wizard live-checks
+  // the chosen code via GET /api/agencies/check-code?code=XXX before submit.
+  app.get('/api/agencies/*', forwardAgencies)
+  app.put('/api/agencies/*', forwardAgencies)
+  app.patch('/api/agencies/*', forwardAgencies)
+
+  /**
+   * Task 31-C (BUG 12) — password routes are cloud-native. Reset tokens live
+   * in the cloud's in-memory store and mail/SMS sending happens cloud-side,
+   * while User.passwordHash is never synced to the device — so the desktop
+   * has nothing local to implement these with, and every password call used
+   * to hit app.notFound with a bare "Not found". Three thin proxies now
+   * forward the body verbatim and pass the cloud status+body through.
+   */
+  const forwardPasswordRoute = (cloudPath, opts = {}) => async (c) => {
+    try {
+      let bodyBuffer = null
+      try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + cloudPath, {
+          method: c.req.method,
+          headers: {
+            'Content-Type': 'application/json',
+            ...(bodyBuffer ? { 'Content-Length': String(bodyBuffer.length) } : {}),
+            // forgot/reset are public (the user may have lost the session);
+            // change-password carries the session the local middleware validated.
+            ...(opts.withAuth && sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: bodyBuffer,
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn(`[LocalAPI] ${cloudPath} proxy: cloud unreachable:`, err?.message || err)
+        return c.json({
+          success: false,
+          error: opts.unreachableMessage ||
+            'Password reset requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON body */ }
+      // GOTCHA: after a cloud-side password CHANGE, the local
+      // LocalDeviceCredential verifier still matches the OLD password —
+      // revoke it so offline unlock cannot keep authenticating the stale
+      // secret. The next login re-derives and stores a fresh credential.
+      if (res.ok && opts.revokeDeviceCredential && sessionUser && sessionUser.id && db && db.localDeviceCredential) {
+        try {
+          const removed = await db.localDeviceCredential.deleteMany({ where: { userId: sessionUser.id } })
+          if (removed && removed.count) {
+            console.log(`[LocalAPI] Revoked ${removed.count} local device credential(s) after password change — re-login required for offline unlock`)
+          }
+        } catch (credErr) {
+          console.warn('[LocalAPI] Could not revoke local device credential after password change:', credErr?.message || credErr)
+        }
+      }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error(`[LocalAPI] ${cloudPath} proxy error:`, error)
+      return c.json({ success: false, error: 'Password request failed' }, 500)
+    }
+  }
+  // POST /api/auth/forgot-password — public: request a reset token (cloud
+  // auth.ts, always answers the same message to prevent enumeration).
+  app.post('/api/auth/forgot-password', forwardPasswordRoute('/api/auth/forgot-password'))
+  // POST /api/auth/reset-password — public: redeem token + set new password.
+  app.post('/api/auth/reset-password', forwardPasswordRoute('/api/auth/reset-password'))
+  // PATCH /api/user/change-password — authenticated: swap current→new password.
+  app.patch('/api/user/change-password', forwardPasswordRoute('/api/user/change-password', {
+    withAuth: true,
+    revokeDeviceCredential: true,
+  }))
+
+  /**
+   * Round 16 — /api/auth/refresh-session proxy. Asks the cloud to re-issue
+   * the session token from the DATABASE's current state (role + agency
+   * ownership). This upgrades a stale snapshot token — the exact situation
+   * of an AGENCY_OWNER whose token predates their agency (agencyId: '') —
+   * and imports the fresh token + user into THIS local session so the sync
+   * engine and every local agency endpoint see the agency immediately.
+   * No local body needed; the CURRENT stored cloud token is forwarded.
+   */
+  app.post('/api/auth/refresh-session', async (c) => {
+    try {
+      if (!sessionToken) {
+        return c.json({ success: false, error: 'No active session' }, 401)
+      }
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/auth/refresh-session', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': 2,
+            Authorization: 'Bearer ' + sessionToken,
+          },
+          body: '{}',
+          signal: AbortSignal.timeout(15000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] Refresh-session proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Refreshing the session requires an internet connection', code: 'CLOUD_UNREACHABLE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON */ }
+      if (res.ok && data && data.success && data.token && data.user) {
+        // Adopt the refreshed session locally (same contract as import-session).
+        // Task 41 — assignSession (NOT a raw overwrite): the outgoing token
+        // stays valid for the grace window so a renderer presenting it does
+        // not get 401s between the refresh and its own token catch-up.
+        assignSession(data.token, {
+          id: data.user.id,
+          username: data.user.username || data.user.email || 'imported',
+          fullName: data.user.fullName || data.user.name || '',
+          role: data.user.role || 'CUSTOMER',
+          language: data.user.language || 'ar',
+          avatarUrl: await localizeFileUrl(data.user.avatarUrl || null),
+          agencyId: data.user.agencyId || null,
+        }, 'refresh-session')
+        // Task 33-C: a successful refresh is FRESH PROOF of authorization —
+        // the reachable cloud just re-issued this session from its CURRENT
+        // DB state. Record it (and lift a lock if one existed).
+        try {
+          await markAuthorizationAuthorized()
+        } catch (authzErr) {
+          console.warn('[LocalAPI] Could not record fresh authorization after refresh:', authzErr?.message || authzErr)
+        }
+        console.log('[LocalAPI] Session refreshed from cloud:', sessionUser.username, 'agency:', sessionUser.agencyId || 'none')
+        emitEvent('auth:login', { user: sessionUser })
+        if (fileSync) fileSync.schedule('refresh-session')
+      }
+      return c.json(data || { success: res.ok }, res.ok ? 200 : (res.status || 500))
+    } catch (error) {
+      console.error('[LocalAPI] Refresh-session proxy error:', error)
+      return c.json({ success: false, error: 'Session refresh failed' }, 500)
+    }
+  })
+
+  /**
+   * Username availability check for the register form — cloud-first (global
+   * uniqueness is a cloud property), with a LOCAL fallback so the form still
+   * behaves sensibly when the cloud is briefly unreachable. Same response
+   * contract as the cloud route: { available: boolean }.
+   */
+  app.get('/api/auth/check-username', async (c) => {
+    const username = (c.req.query('username') || '').trim()
+    const validShape = username.length >= 3 && username.length <= 30 && /^[a-zA-Z0-9_]+$/.test(username)
+    if (!validShape) {
+      // Short names never block typing (same as the cloud route); invalid
+      // shapes are reported unavailable.
+      return c.json({ available: username.length >= 3 })
+    }
+    try {
+      const res = await fetch(cloudBaseUrl() + '/api/auth/check-username?username=' + encodeURIComponent(username), {
+        signal: AbortSignal.timeout(5000),
+      })
+      const data = await res.json().catch(() => null)
+      if (data && typeof data.available === 'boolean') {
+        return c.json({ available: data.available })
+      }
+    } catch { /* fall through to the local check */ }
+    try {
+      if (db) {
+        const existing = await db.user.findUnique({ where: { username }, select: { id: true } }).catch(() => null)
+        return c.json({ available: !existing })
+      }
+    } catch { /* ignore */ }
+    // Never block registration on an unavailable check.
+    return c.json({ available: true })
+  })
+
+  app.get('/api/auth/session', async (c) => {
+    if (!sessionUser) {
+      return c.json({ success: false, error: 'No active session' }, 401)
+    }
+    // "Keep signed in on this device" preference (Task 14). Default TRUE —
+    // matches the historic auto-restore behavior — and only an explicit
+    // 'false' in _sync_meta disables it.
+    let keepSignedIn = true
+    try { keepSignedIn = (await getLocalMeta('keep_signed_in')) !== 'false' } catch { keepSignedIn = true }
+    // Return in NextAuth-compatible format (same as cloud API)
+    return c.json({
+      user: {
+        id: sessionUser.id,
+        username: sessionUser.username,
+        fullName: sessionUser.fullName,
+        role: sessionUser.role,
+        language: sessionUser.language,
+        avatarUrl: sessionUser.avatarUrl,
+        agencyId: sessionUser.agencyId,
+      },
+      expires: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+      keepSignedIn,
+    })
+  })
+
+  app.post('/api/auth/logout', (c) => {
+    const previousUser = sessionUser
+    sessionToken = null
+    sessionUser = null
+    // Task 41 — a logout invalidates the WHOLE session chain (no grace).
+    previousSessionToken = null
+    previousSessionTokenAt = 0
+    emitEvent('auth:logout', { previousUser })
+    return c.json({ success: true, data: { message: 'Logged out' } })
+  })
+
+  /**
+   * POST /api/auth/adopt-session — Task 41 token catch-up (rotation grace).
+   * ────────────────────────────────────────────────────────────────────────
+   * WHY: the cloud re-issues the token whenever import-session /
+   * refresh-session validate it, so the MAIN process can hold a NEWER token
+   * than the renderer's localStorage. Instead of the renderer blindly
+   * re-importing its STALE token over the fresh one (the tug-of-war that
+   * produced the intermittent "data loading failed" dashboard error), the
+   * renderer presents ITS token here and, when it matches the current OR the
+   * rotation-grace predecessor of the SAME session, receives the CURRENT
+   * token + user back — converging both sides on the newest credential.
+   *
+   * SECURITY: loopback-only server; the presented credential must be the
+   * current token or its immediate predecessor (timing-safe compared) —
+   * i.e. proof of possession of the same session chain. A foreign token is
+   * answered 401 exactly like any other authenticated route.
+   */
+  app.post('/api/auth/adopt-session', async (c) => {
+    try {
+      const presented =
+        c.req.header('Authorization')?.replace('Bearer ', '') ||
+        c.req.header('X-Local-Token') ||
+        null
+      if (!presented || !sessionToken || !sessionUser) {
+        return c.json({ success: false, error: 'No active session to adopt' }, 401)
+      }
+
+      let isCurrent = false
+      try {
+        const a = Buffer.from(sessionToken, 'utf-8')
+        const b = Buffer.from(presented, 'utf-8')
+        isCurrent = a.length === b.length && timingSafeEqual(a, b)
+      } catch { isCurrent = false }
+
+      const isPrev = matchesPreviousSessionToken(presented)
+      if (!isCurrent && !isPrev) {
+        console.warn('[LocalAPI] adopt-session rejected — presented=' + tokenFingerprint(presented) +
+          ' current=' + tokenFingerprint(sessionToken) +
+          ' previous=' + (previousSessionTokenValid() ? tokenFingerprint(previousSessionToken) : '(none/expired)'))
+        return c.json({ success: false, error: 'Invalid session token' }, 401)
+      }
+
+      if (!isCurrent) {
+        console.log('[LocalAPI] adopt-session: stale renderer token ' + tokenFingerprint(presented) +
+          ' matched the rotation-grace predecessor — returning the CURRENT token ' + tokenFingerprint(sessionToken))
+      }
+
+      return c.json({
+        success: true,
+        token: sessionToken,
+        user: sessionUser,
+        adopted: !isCurrent,
+        graceRemainingMs: isCurrent ? 0 : Math.max(0, SESSION_TOKEN_GRACE_MS - (Date.now() - previousSessionTokenAt)),
+      })
+    } catch (error) {
+      console.error('[LocalAPI] adopt-session error:', error)
+      return c.json({ success: false, error: 'Adopt failed' }, 500)
+    }
+  })
+
+  /**
+   * Import a cloud session into the local API.
+   * Called by the renderer after cloud login to create a local session
+   * that uses the same token, so LAN failover works seamlessly.
+   *
+   * This is critical for offline mode:
+   * 1. User logs in via cloud API (gets cloud JWT + user data)
+   * 2. Renderer calls this endpoint with the cloud token + user
+   * 3. Local API creates a session with the SAME token
+   * 4. When cloud goes down, LAN failover sends the same Bearer token
+   * 5. Local API validates it → request succeeds
+   *
+   * Body: { token: string, user: { id, username, fullName, role, agencyId, language, avatarUrl } }
+   */
+  app.post('/api/auth/import-session', async (c) => {
+    try {
+      const body = c.req.json ? c.req.json.bind(c.req) : async () => ({})
+
+      // Hono may have already parsed the body; handle both cases
+      let data
+      try {
+        data = typeof body === 'function' ? await body() : body
+      } catch {
+        data = {}
+      }
+
+      const { token, user } = data
+
+      if (!token || !user || !user.id) {
+        return c.json({ success: false, error: 'Token and user required' }, 400)
+      }
+
+      // ── Task 33-C: workspace-LOCK gate (closes the re-import hole) ──────
+      // A locked workspace must never be resurrected by re-importing the
+      // stale token (the loading-screen fallback and a renderer rehydration
+      // both land here). Only a fresh cloud login can clear the lock.
+      try {
+        const currentAuthz = await getAuthorizationStatus()
+        if (currentAuthz === 'REVOKED') {
+          console.warn('[LocalAPI] import-session rejected — workspace authorization is REVOKED')
+          return c.json({
+            success: false,
+            error: 'Authorization revoked — please sign in again',
+            code: 'AUTHORIZATION_REVOKED',
+          }, 403)
+        }
+      } catch { /* meta read failure must never wedge the import */ }
+
+      // ── Task 33-C: cloud VALIDATION of the presented token (offline-first) ──
+      // When the cloud is REACHABLE, the presented token must be accepted by
+      // /api/auth/refresh-session — a ghost token (cloud DB reset / deleted
+      // account / revoked device) is rejected and the workspace LOCKS. When
+      // the cloud is unreachable the import is accepted as before (offline
+      // first — never block on unavailability). Validation is capped at ~5s
+      // per hop so reloads stay snappy.
+      let adopted = null
+      try {
+        // Task 67: a LOCAL-ONLY token (offline device unlock / legacy unlock)
+        // is raw hex — the cloud can NEVER recognize it. Validating it used to
+        // produce a meaningless 401 that LOCKED the whole workspace ("session
+        // rejected by cloud") even though the account was perfectly fine.
+        // Import offline instead; cloud sync resumes after the next real
+        // online password login (the login route now prefers the cloud when
+        // reachable, so this path is rare and deliberate).
+        const looksLikeCloudJwt = typeof token === 'string' &&
+          token.split('.').length === 3 && token.indexOf('eyJ') === 0
+        let cloudReachable = false
+        if (looksLikeCloudJwt) {
+          try {
+            const healthRes = await fetch(cloudBaseUrl() + '/api/health', { signal: AbortSignal.timeout(5000) })
+            cloudReachable = healthRes.ok
+          } catch { cloudReachable = false }
+        } else {
+          console.log('[LocalAPI] Local-only token (offline unlock) — importing without cloud validation (cloud sync resumes after the next online password login)')
+        }
+
+        if (!cloudReachable) {
+          console.log('[LocalAPI] Cloud unreachable — importing session offline (offline-first)')
+        } else {
+          let vStatus = 0
+          let vData = null
+          let vNetwork = false
+          try {
+            const vRes = await fetch(cloudBaseUrl() + '/api/auth/refresh-session', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: 'Bearer ' + token,
+              },
+              body: '{}',
+              signal: AbortSignal.timeout(5000),
+            })
+            vStatus = vRes.status
+            try { vData = await vRes.json() } catch { /* non-JSON */ }
+          } catch { vNetwork = true }
+
+          if (vNetwork) {
+            // Cloud flapped between the health check and the validation —
+            // treat as unavailable (offline-first accept, status unchanged).
+            console.log('[LocalAPI] Cloud unreachable — importing session offline (offline-first)')
+          } else if (vStatus === 200 && vData && vData.success && vData.token && vData.user) {
+            // Prefer the REFRESHED token+user: the response carries the
+            // session re-issued from the cloud DB's CURRENT state (current
+            // agencyId, current role) — not the possibly stale snapshot.
+            adopted = { token: vData.token, user: vData.user }
+          } else if (vStatus === 401 || vStatus === 403) {
+            const bodyMsg = (vData && (vData.error || vData.message)) || ''
+            const reason = String(bodyMsg).indexOf('Account not found') !== -1 ? 'account-not-found' : 'token-rejected'
+            console.warn(`[LocalAPI] Session rejected by cloud (HTTP ${vStatus}) — this account is no longer authorized (${reason})`)
+            await revokeLocalAuthorization(reason)
+            return c.json({
+              success: false,
+              error: 'Session rejected by cloud — this account is no longer authorized',
+              code: 'AUTHORIZATION_REVOKED',
+            }, 401)
+          } else {
+            // Any other answer (5xx, malformed) — not an explicit auth
+            // verdict; keep today's offline-first behavior.
+            console.log(`[LocalAPI] Cloud session validation inconclusive (HTTP ${vStatus}) — importing session offline (offline-first)`)
+          }
+        }
+      } catch (validationErr) {
+        // Validation is a hardening layer, never a availability requirement.
+        console.warn('[LocalAPI] import-session cloud validation skipped:', validationErr?.message || validationErr)
+      }
+
+      const finalToken = adopted ? adopted.token : token
+      const finalUser = adopted ? adopted.user : user
+
+      // Set session with the CLOUD token (so LAN failover works with the same token)
+      // Task 41 — assignSession records the rotation (stale renderer token
+      // stays valid via grace + POST /api/auth/adopt-session catch-up).
+      assignSession(finalToken, {
+        id: finalUser.id,
+        username: finalUser.username || finalUser.email || 'imported',
+        fullName: finalUser.fullName || finalUser.name || '',
+        role: finalUser.role || 'CUSTOMER',
+        language: finalUser.language || 'ar',
+        avatarUrl: await localizeFileUrl(finalUser.avatarUrl || null),
+        agencyId: finalUser.agencyId || null,
+      }, adopted ? 'import-session:adopted' : 'import-session:offline')
+      // Task 40: offline import of a payload snapshot whose agencyId is null
+      // (stale renderer user, wizard-created owner) — hydrate from LOCAL
+      // ownership so boot-restore lands with a usable agencyId every time.
+      await hydrateSessionAgencyId(sessionUser)
+
+      if (adopted) {
+        // The cloud just proved this session valid against its CURRENT DB —
+        // record AUTHORIZED (and lift a stale lock if one existed).
+        try {
+          await markAuthorizationAuthorized()
+        } catch { /* non-fatal */ }
+      }
+
+      console.log('[LocalAPI] Session imported from cloud:', sessionUser.username, 'role:', sessionUser.role, adopted ? '(cloud-validated, refreshed token adopted)' : '')
+      emitEvent('auth:login', { user: sessionUser })
+      if (fileSync) fileSync.schedule('import-session')
+
+      return c.json({
+        success: true,
+        user: sessionUser,
+        token: sessionToken,
+        cloudValidated: !!adopted || undefined,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] Import session error:', error)
+      return c.json({ success: false, error: 'Import failed' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // PUBLIC FAQ (Task 2-d) — cloud parity with apps/api/src/routes/faqs.ts
+  // L8-69 (mounted at /api/faq + /api/faqs). Public — no auth, same as the
+  // cloud. The local FAQ table is populated by the sync engine (isSynced:
+  // true in lib/sync-registry.json, syncOrder 19); an empty table simply
+  // renders as an empty list.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/faq — non-localized variant (cloud faqs.ts GET '/' L8-30):
+  // full active rows ordered by (order asc, createdAt desc).
+  app.get('/api/faq', async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      // The generated client exposes the FAQ model as `fAQ`; `faq` is a
+      // defensive fallback for alternate client generations.
+      const faqModel = db.fAQ || db.faq
+      if (!faqModel) return c.json({ success: true, faqs: [] })
+      const faqs = await faqModel.findMany({
+        where: { isActive: true },
+        orderBy: [{ order: 'asc' }, { createdAt: 'desc' }],
+      })
+      return c.json({ success: true, faqs })
+    } catch (error) {
+      console.error('[LocalAPI] /api/faq error:', error)
+      return c.json({ success: false, error: 'Failed to load FAQs' }, 500)
+    }
+  })
+
+  // GET /api/faqs — localized variant (cloud faqs.ts GET '/faqs' L33-69):
+  // ?category filters; ?lang (ar|fr|en, default 'en') picks the localized
+  // question/answer with fallback to the base field — trimmed row shape
+  // { id, question, answer, category, order } mapped exactly as the cloud.
+  app.get('/api/faqs', async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      const faqModel = db.fAQ || db.faq
+      if (!faqModel) return c.json({ success: true, faqs: [] })
+      const category = c.req.query('category')
+      const lang = c.req.query('lang') || 'en'
+
+      const where = { isActive: true }
+      if (category) where.category = category
+
+      const rows = await faqModel.findMany({
+        where,
+        orderBy: { order: 'asc' },
+      })
+
+      const faqs = rows.map((faq) => ({
+        id: faq.id,
+        question: lang === 'ar' && faq.questionAr ? faq.questionAr : lang === 'fr' && faq.questionFr ? faq.questionFr : faq.question,
+        answer: lang === 'ar' && faq.answerAr ? faq.answerAr : lang === 'fr' && faq.answerFr ? faq.answerFr : faq.answer,
+        category: faq.category,
+        order: faq.order,
+      }))
+
+      return c.json({ success: true, faqs })
+    } catch (error) {
+      console.error('[LocalAPI] /api/faqs error:', error)
+      return c.json({ success: false, error: 'Failed to load FAQs' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // ALL ROUTES BELOW REQUIRE AUTH
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const authMiddleware = requireAuth()
+
+  // ═════════════════════════════════════════════════════════════════
+  // LOCAL DEVICE CREDENTIAL (desktop unlock — Task 14)
+  // ═════════════════════════════════════════════════════════════════
+
+  /**
+   * Store/refresh the CURRENT session user's local unlock credential for
+   * THIS device. Callable any time while the session is valid — after a
+   * cloud login (the local login proxy already does this automatically) or
+   * explicitly from the Electron main process/renderer.
+   *
+   * Body: { password?: string, verifier?: string, salt?: string, keepSignedIn?: boolean }
+   *  - password  → server derives the scrypt verifier (request never leaves 127.0.0.1)
+   *  - verifier+salt → pre-derived by the caller (Electron main process)
+   * The credential is bound to (sessionUser.id, deviceId) — never global.
+   */
+  app.post('/api/auth/device-credential', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+      if (!db.localDeviceCredential) {
+        return c.json({ success: false, error: 'localDeviceCredential model unavailable — regenerate the Prisma client' }, 503)
+      }
+      const userId = sessionUser && sessionUser.id
+      if (!userId) return c.json({ success: false, error: 'No active session user' }, 401)
+
+      const body = await c.req.json().catch(() => ({}))
+      let verifierHash = null
+      let salt = null
+      if (body && typeof body.password === 'string' && body.password.length > 0) {
+        salt = randomBytes(16).toString('hex')
+        verifierHash = deriveUnlockVerifier(body.password, salt)
+      } else if (
+        body && typeof body.verifier === 'string' && typeof body.salt === 'string' &&
+        /^[0-9a-f]{32,}$/i.test(body.salt) && /^[0-9a-f]{64,}$/i.test(body.verifier)
+      ) {
+        verifierHash = body.verifier.toLowerCase()
+        salt = body.salt.toLowerCase()
+      } else {
+        return c.json({ success: false, error: 'password or (verifier + salt) required' }, 400)
+      }
+
+      const deviceId = await getDeviceId()
+      const existing = await db.localDeviceCredential.findUnique({
+        where: { userId_deviceId: { userId, deviceId } },
+      }).catch(() => null)
+      if (existing) {
+        await db.localDeviceCredential.update({
+          where: { id: existing.id },
+          data: { verifierHash, salt, revokedAt: null },
+        })
+      } else {
+        await db.localDeviceCredential.create({ data: { userId, deviceId, verifierHash, salt } })
+      }
+      let keepSignedIn = null
+      if (body && typeof body.keepSignedIn === 'boolean') {
+        await setLocalMeta('keep_signed_in', body.keepSignedIn ? 'true' : 'false')
+        keepSignedIn = body.keepSignedIn
+      }
+      console.log('[LocalAPI] Device credential stored for user', String(userId).substring(0, 8) + '…', 'device', deviceId.substring(0, 12) + '…')
+      return c.json({ success: true, deviceId, keepSignedIn })
+    } catch (error) {
+      console.error('[LocalAPI] Device credential error:', error)
+      return c.json({ success: false, error: 'Failed to store device credential' }, 500)
+    }
+  })
+
+  /**
+   * Revoke the CURRENT session user's local unlock credential for THIS
+   * device (e.g. "sign out of this device"). Logout alone does NOT revoke —
+   * the credential is what enables offline unlock after a restart.
+   */
+  app.delete('/api/auth/device-credential', authMiddleware, async (c) => {
+    try {
+      const userId = sessionUser && sessionUser.id
+      if (!userId || !db || !db.localDeviceCredential) {
+        return c.json({ success: false, error: 'No active session or model unavailable' }, 401)
+      }
+      const deviceId = await getDeviceId()
+      const result = await db.localDeviceCredential.updateMany({
+        where: { userId, deviceId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      })
+      return c.json({ success: true, revoked: result?.count || 0 })
+    } catch (error) {
+      console.error('[LocalAPI] Device credential revoke error:', error)
+      return c.json({ success: false, error: 'Failed to revoke device credential' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // APP CONFIG (Task 51 — Maps & Location, spec §39/§40/§47)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * GET /api/config/maps — desktop parity of the cloud's public map config.
+   *
+   * CONTRACT (identical envelope to the cloud GET /api/config/maps — Task 51,
+   * do not deviate): { success: true, data: { provider, fallbackProvider,
+   * mapsEnabled, directionsEnabled, openfreemap: { styleUrl },
+   * google: { configured, geocodingEnabled, jsApiKey }, geocoding: { provider },
+   * directions: { destinationMode, origin, openBehavior, buttonLabel } } }
+   *
+   * Behavior:
+   *   1. FRESH — probe the cloud ({BLASTI_CLOUD_URL}/api/config/maps with the
+   *      session token) unless the in-memory cache is younger than
+   *      MAPS_CONFIG_MEMORY_TTL_MS (a config read happens on every map-view
+   *      mount; the short TTL keeps the offline-path latency at zero without
+   *      serving stale settings for long).
+   *   2. Cache the successful cloud response: FULL config (jsApiKey included)
+   *      in the module memory cache, and a STRIPPED copy (jsApiKey → null) in
+   *      _sync_meta — see the Task 51 secrets note at the top of this file:
+   *      NO API key is ever persisted to the local SQLite database (spec §45/
+   *      §46); the live jsApiKey passes through memory only.
+   *   3. OFFLINE FALLBACK (spec §40) — cloud unreachable/error: serve the last
+   *      cached config (memory first, then the persisted stripped copy — it
+   *      survives an app restart), else the built-in default (OpenFreeMap
+   *      zero-config). The envelope shape is ALWAYS the same, so the UI map
+   *      widgets degrade gracefully instead of crashing offline.
+   */
+  app.get('/api/config/maps', authMiddleware, async (c) => {
+    try {
+      // 1) Fresh probe — skipped while the memory cache is hot.
+      const cacheHot = mapsConfigMemoryCache &&
+        (Date.now() - mapsConfigMemoryCache.fetchedAt) < MAPS_CONFIG_MEMORY_TTL_MS &&
+        mapsConfigMemoryCache.config
+      if (!cacheHot && sessionToken) {
+        try {
+          const res = await fetch(cloudBaseUrl() + '/api/config/maps', {
+            method: 'GET',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${sessionToken}`,
+            },
+            signal: AbortSignal.timeout(MAPS_CLOUD_PROBE_TIMEOUT_MS),
+          })
+          if (res.ok) {
+            const body = await res.json().catch(() => null)
+            const cfg = body && body.success && body.data && typeof body.data === 'object' ? body.data : null
+            if (cfg) {
+              // Memory cache — full config (jsApiKey included, memory only).
+              mapsConfigMemoryCache = { config: cfg, fetchedAt: Date.now() }
+              // Persisted cache — STRIPPED copy (never store keys in the DB).
+              try {
+                await setLocalMeta(
+                  MAPS_CONFIG_META_KEY,
+                  JSON.stringify({ config: stripMapsSecretsForPersist(cfg), fetchedAt: Date.now() })
+                )
+              } catch (metaErr) {
+                console.warn('[LocalAPI] Maps config cache persist failed (non-fatal):', metaErr?.message || metaErr)
+              }
+            }
+          } else {
+            // Reachable cloud refused (e.g. session revoked server-side) —
+            // fall through to the cached/default config; the workspace-lock
+            // machinery (Task 33-C) owns revocation handling elsewhere.
+            console.warn('[LocalAPI] Maps config proxy: cloud answered HTTP', res.status, '— using cached/default config')
+          }
+        } catch (probeErr) {
+          // Offline or cloud unreachable (spec §40) — fall through.
+          console.warn('[LocalAPI] Maps config proxy: cloud unreachable:', probeErr?.message || probeErr)
+        }
+      }
+
+      // 2) Success path — the probe just refreshed the memory cache.
+      if (mapsConfigMemoryCache && mapsConfigMemoryCache.config) {
+        return c.json({ success: true, data: mapsConfigMemoryCache.config })
+      }
+
+      // 3) Offline fallback (spec §40) — persisted stripped cache first
+      //    (survives an app restart), then the built-in default.
+      try {
+        const raw = await getLocalMeta(MAPS_CONFIG_META_KEY)
+        if (raw) {
+          const parsed = JSON.parse(raw)
+          if (parsed && parsed.config && typeof parsed.config === 'object') {
+            console.log('[LocalAPI] Maps config served from persisted offline cache (fetchedAt', new Date(parsed.fetchedAt || 0).toISOString() + ')')
+            return c.json({ success: true, data: parsed.config })
+          }
+        }
+      } catch { /* corrupted cache row → default */ }
+
+      return c.json({ success: true, data: DEFAULT_MAPS_CONFIG })
+    } catch (error) {
+      console.error('[LocalAPI] Maps config error:', error)
+      return c.json({ success: false, error: 'Failed to load map configuration' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // CLOUD-ONLY STUBS — return 200 with available:false so the dashboard
+  // knows the feature exists but requires a cloud connection, instead of
+  // letting the request fall through to a 404 (which would incorrectly
+  // mark the app as fully offline).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  app.get('/api/agency/no-show-analytics', authMiddleware, async (c) => {
+    const agencyId = requireAgencyId(c)
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+    const periodDays = parseInt(c.req.query('period') || '30', 10)
+    const periodAgo = new Date(Date.now() - periodDays * 86400000).toISOString()
+
+    try {
+      const [summaryRows, dailyRows, serviceRows, hourlyRows] = await Promise.all([
+        db.$queryRawUnsafe(`
+          SELECT
+            COUNT(*) as totalReservations,
+            SUM(CASE WHEN status = 'NO_SHOW' THEN 1 ELSE 0 END) as noShows,
+            SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) as cancelled,
+            SUM(CASE WHEN status = 'NO_SHOW' AND skippedForNoShow = 1 AND reclaimRequestedAt IS NOT NULL THEN 1 ELSE 0 END) as reclaimedNoShows
+          FROM Reservation
+          WHERE agencyId = ? AND joinedAt >= ?
+        `, agencyId, periodAgo),
+        db.$queryRawUnsafe(`
+          SELECT
+            DATE(joinedAt) as date,
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'NO_SHOW' THEN 1 ELSE 0 END) as noShows
+          FROM Reservation
+          WHERE agencyId = ? AND joinedAt >= ?
+          GROUP BY DATE(joinedAt)
+          ORDER BY date ASC
+        `, agencyId, periodAgo),
+        db.$queryRawUnsafe(`
+          SELECT
+            r.serviceId,
+            s.name as serviceName,
+            COUNT(*) as total,
+            SUM(CASE WHEN r.status = 'NO_SHOW' THEN 1 ELSE 0 END) as noShows
+          FROM Reservation r
+          LEFT JOIN Service s ON r.serviceId = s.id
+          WHERE r.agencyId = ? AND r.joinedAt >= ?
+          GROUP BY r.serviceId, s.name
+          ORDER BY noShows DESC
+          LIMIT 10
+        `, agencyId, periodAgo),
+        db.$queryRawUnsafe(`
+          SELECT
+            CAST(strftime('%H', joinedAt) AS INTEGER) as hour,
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'NO_SHOW' THEN 1 ELSE 0 END) as noShows
+          FROM Reservation
+          WHERE agencyId = ? AND joinedAt >= ?
+          GROUP BY hour
+          ORDER BY hour ASC
+        `, agencyId, periodAgo),
+      ])
+
+      const s = summaryRows[0]
+      const totalReservations = Number(s.totalReservations)
+      const noShows = Number(s.noShows)
+      const cancelled = Number(s.cancelled)
+      const reclaimedNoShows = Number(s.reclaimedNoShows)
+
+      return c.json({
+        success: true,
+        analytics: {
+          summary: {
+            totalReservations,
+            noShows,
+            cancelled,
+            noShowRate: totalReservations > 0 ? Math.round((noShows / totalReservations) * 100) : 0,
+            cancelRate: totalReservations > 0 ? Math.round((cancelled / totalReservations) * 100) : 0,
+            reclaimedNoShows,
+            reclaimRate: noShows > 0 ? Math.round((reclaimedNoShows / noShows) * 100) : 0,
+          },
+          dailyTrend: dailyRows.map((d) => ({
+            date: d.date,
+            total: Number(d.total),
+            noShows: Number(d.noShows),
+            rate: Number(d.total) > 0 ? Math.round((Number(d.noShows) / Number(d.total)) * 100) : 0,
+          })),
+          byService: serviceRows.map((sv) => ({
+            serviceId: sv.serviceId,
+            serviceName: sv.serviceName || 'Unknown',
+            total: Number(sv.total),
+            noShows: Number(sv.noShows),
+            rate: Number(sv.total) > 0 ? Math.round((Number(sv.noShows) / Number(sv.total)) * 100) : 0,
+          })),
+          byHour: hourlyRows.map((h) => ({
+            hour: Number(h.hour),
+            total: Number(h.total),
+            noShows: Number(h.noShows),
+            rate: Number(h.total) > 0 ? Math.round((Number(h.noShows) / Number(h.total)) * 100) : 0,
+          })),
+        },
+      })
+    } catch (err) {
+      console.error('[LocalAPI] no-show-analytics error:', err)
+      return c.json({ success: true, analytics: { summary: { totalReservations: 0, noShows: 0, cancelled: 0, noShowRate: 0, cancelRate: 0, reclaimedNoShows: 0, reclaimRate: 0 }, dailyTrend: [], byService: [], byHour: [] } })
+    }
+  })
+
+  app.get('/api/agency/peak-hours', authMiddleware, async (c) => {
+    const agencyId = requireAgencyId(c)
+    if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString()
+    const weekdayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+
+    try {
+      const [hourlyRows, weekdayRows, serviceRows, dailyRows] = await Promise.all([
+        db.$queryRawUnsafe(`
+          SELECT
+            CAST(strftime('%H', joinedAt) AS INTEGER) as hour,
+            COUNT(*) as count,
+            COALESCE(AVG(estimatedWait), 0) as avgWait
+          FROM Reservation
+          WHERE agencyId = ? AND joinedAt >= ?
+          GROUP BY hour
+          ORDER BY hour ASC
+        `, agencyId, thirtyDaysAgo),
+        db.$queryRawUnsafe(`
+          SELECT
+            CAST(strftime('%w', joinedAt) AS INTEGER) as weekday,
+            COUNT(*) as count,
+            COALESCE(AVG(estimatedWait), 0) as avgWait
+          FROM Reservation
+          WHERE agencyId = ? AND joinedAt >= ?
+          GROUP BY weekday
+          ORDER BY weekday ASC
+        `, agencyId, thirtyDaysAgo),
+        db.$queryRawUnsafe(`
+          SELECT
+            r.serviceId,
+            s.name as serviceName,
+            CAST(strftime('%H', r.joinedAt) AS INTEGER) as peakHour,
+            COUNT(*) as count
+          FROM Reservation r
+          LEFT JOIN Service s ON r.serviceId = s.id
+          WHERE r.agencyId = ? AND r.joinedAt >= ?
+          GROUP BY r.serviceId, s.name, peakHour
+          ORDER BY r.serviceId, count DESC
+        `, agencyId, thirtyDaysAgo),
+        db.$queryRawUnsafe(`
+          SELECT
+            DATE(joinedAt) as date,
+            COALESCE(AVG(estimatedWait), 0) as avgWait,
+            COUNT(*) as count
+          FROM Reservation
+          WHERE agencyId = ? AND joinedAt >= ?
+          GROUP BY DATE(joinedAt)
+          ORDER BY date ASC
+        `, agencyId, thirtyDaysAgo),
+      ])
+
+      const hourlyDemand = hourlyRows
+        .map((h) => ({ hour: Number(h.hour), count: Number(h.count), avgWait: Math.round(Number(h.avgWait)) }))
+        .sort((a, b) => b.count - a.count)
+
+      const peakHours = hourlyDemand.slice(0, 3)
+
+      const weekdayDemand = weekdayRows.map((d) => ({
+        weekday: Number(d.weekday),
+        name: weekdayNames[Number(d.weekday)],
+        count: Number(d.count),
+        avgWait: Math.round(Number(d.avgWait)),
+      }))
+
+      const busiestDay = weekdayDemand.length > 0
+        ? [...weekdayDemand].sort((a, b) => b.count - a.count)[0]
+        : null
+
+      return c.json({
+        success: true,
+        analytics: {
+          peakHours,
+          busiestDay,
+          hourlyDemand: hourlyRows.map((h) => ({
+            hour: Number(h.hour),
+            count: Number(h.count),
+            avgWait: Math.round(Number(h.avgWait)),
+          })),
+          weekdayDemand,
+          servicePeakHours: serviceRows.map((sv) => ({
+            serviceId: sv.serviceId,
+            serviceName: sv.serviceName || 'Unknown',
+            peakHour: Number(sv.peakHour),
+            count: Number(sv.count),
+          })),
+          dailyWaitTrend: dailyRows.map((d) => ({
+            date: d.date,
+            avgWait: Math.round(Number(d.avgWait)),
+            count: Number(d.count),
+          })),
+        },
+      })
+    } catch (err) {
+      console.error('[LocalAPI] peak-hours error:', err)
+      return c.json({ success: true, analytics: { peakHours: [], busiestDay: null, hourlyDemand: [], weekdayDemand: [], servicePeakHours: [], dailyWaitTrend: [] } })
+    }
+  })
+
+  // GET /api/agency/analytics/dashboard?period=7d|30d|90d|12m — Task 42-c
+  // Cloud-parity analytics dashboard contract: the SAME JSON shape the cloud
+  // route implements (KPIs + timeseries + distributions + rollups + peaks).
+  // All aggregation lives in the pure computeAgencyAnalyticsDashboard() above;
+  // this route only resolves the agency, computes the ranges, and fetches.
+  app.get('/api/agency/analytics/dashboard', authMiddleware, async (c) => {
+    try {
+      const agencyId = requireAgencyId(c)
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+      const periodParam = c.req.query('period') || '30d'
+      const period = ANALYTICS_PERIODS.includes(periodParam) ? periodParam : '30d'
+      const range = computeAnalyticsRange(period, new Date())
+
+      const reservationSelect = {
+        status: true,
+        joinedAt: true,
+        calledAt: true,
+        completedAt: true,
+        rating: true,
+        isWalkIn: true,
+        userId: true,
+        serviceId: true,
+        counterId: true,
+      }
+
+      // In-range reservations (current + previous) and dictionary lookups.
+      // Lookups loaded with separate findMany calls (no joins) per contract.
+      const [rows, prevRows, serviceRows, branchRows] = await Promise.all([
+        db.reservation.findMany({
+          where: { agencyId, joinedAt: { gte: range.start, lte: range.end } },
+          select: reservationSelect,
+        }),
+        db.reservation.findMany({
+          where: { agencyId, joinedAt: { gte: range.previousStart, lte: range.previousEnd } },
+          select: reservationSelect,
+        }),
+        db.service.findMany({ where: { agencyId }, select: { id: true, name: true } }),
+        db.branch.findMany({ where: { agencyId }, select: { id: true, name: true } }),
+      ])
+      const branchIds = branchRows.map((b) => b.id)
+      const counterRows = branchIds.length > 0
+        ? await db.counter.findMany({
+            where: { branchId: { in: branchIds } },
+            select: { id: true, name: true, branchId: true },
+          })
+        : []
+
+      const lookups = {
+        services: Object.fromEntries(serviceRows.map((s) => [s.id, s.name])),
+        branches: Object.fromEntries(branchRows.map((b) => [b.id, b.name])),
+        counters: Object.fromEntries(counterRows.map((ct) => [ct.id, { name: ct.name, branchId: ct.branchId }])),
+      }
+
+      const data = computeAgencyAnalyticsDashboard(rows, prevRows, lookups, period, range)
+      console.log('[LocalAPI] /api/agency/analytics/dashboard period=' + period +
+        ' rows=' + rows.length + ' prevRows=' + prevRows.length)
+      return c.json({ success: true, data })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/analytics/dashboard error:', error)
+      return c.json({ success: false, error: 'Failed to compute analytics dashboard', detail: error?.message || String(error) }, 500)
+    }
+  })
+
+  app.get('/api/admin/announcements', authMiddleware, async (c) => {
+    return c.json({
+      success: true,
+      data: { available: false, reason: 'offline', message: 'Announcements require cloud connection' },
+    })
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 3. AGENCY (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/profile — current agency with stats
+  app.get('/api/agency/profile', authMiddleware, async (c) => {
+    try {
+      // The UI sends ?agencyId=<user.agencyId> — accept it when the session
+      // genuinely has access (previously the param was ignored entirely and
+      // a session without a bound agencyId 403'd, leaving the profile page
+      // with no data at all).
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const agency = await db.agency.findUnique({ where: { id: agencyId } })
+      if (!agency) {
+        // Problem 6 (review): a session-based fallback must NEVER masquerade
+        // as a valid workspace. Session exists ≠ agency workspace initialized.
+        //   - pre-READY: fallback is legitimate bootstrap (data not imported
+        //     yet) — but flagged so the frontend knows.
+        //   - READY + missing Agency row: LOCAL DATA CORRUPTION / INCOMPLETE
+        //     WORKSPACE — reported as an error, never as a working profile.
+        let workspaceStatus = null
+        try {
+          const state = await db.agencyLocalState.findFirst({ where: { agencyId }, select: { initializationStatus: true } })
+          workspaceStatus = state?.initializationStatus || null
+        } catch { /* state table may not exist on ancient DBs */ }
+
+        if (workspaceStatus === 'READY') {
+          console.error(`[LocalAPI] CORRUPTION/INCOMPLETE WORKSPACE: status is READY but Agency ${agencyId} is missing locally — refusing the session-based fallback`)
+          return c.json({
+            success: false,
+            error: 'Local workspace incomplete: READY but agency record missing — re-run initial sync (Settings → Sync recovery) or re-login while online',
+            code: 'LOCAL_WORKSPACE_INCOMPLETE',
+            agencyId,
+            initializationStatus: workspaceStatus,
+          }, 412)
+        }
+        console.log(`[LocalAPI] Agency ${agencyId} not in local DB, returning session-based fallback (workspace status: ${workspaceStatus || 'unknown'} — pre-READY bootstrap)`)
+        return c.json({
+          id: agencyId,
+          name: sessionUser.agencyName || sessionUser.name || 'Unknown Agency',
+          _partial: true,
+          _reason: 'Agency not yet synced to local database',
+          _workspaceInitialized: false,
+          _workspaceStatus: workspaceStatus,
+        })
+      }
+
+      const [serviceCount, staffCount, branchCount, branchIds] = await Promise.all([
+        db.service.count({ where: { agencyId, isActive: true } }),
+        db.agencyStaff.count({ where: { agencyId, isActive: true } }),
+        db.branch.count({ where: { agencyId, isActive: true } }),
+        db.branch.findMany({ where: { agencyId }, select: { id: true } }),
+      ])
+      const counterCount = branchIds.length > 0
+        ? await db.counter.count({ where: { branchId: { in: branchIds.map(b => b.id) }, isActive: true } })
+        : 0
+
+      // Remove sensitive fields
+      const { passwordHash, ...safeAgency } = agency
+
+      return c.json({
+        id: agency.id,
+        name: agency.name,
+        nameAr: agency.nameAr,
+        nameFr: agency.nameFr,
+        address: agency.address,
+        category: agency.category,
+        phone: agency.phone,
+        email: agency.email,
+        code: agency.customCode,
+        // Task 5 — Algeria address (mirrors the cloud profile projection so
+        // the profile page location selectors initialize from stored values).
+        wilaya: agency.wilaya ?? null,
+        city: agency.city ?? null,
+        logoUrl: await localizeFileUrl(agency.logoUrl),
+        coverUrl: agency.coverUrl ? await localizeFileUrl(agency.coverUrl) : null,
+        workingHoursStart: agency.workingHoursStart,
+        workingHoursEnd: agency.workingHoursEnd,
+        workingDays: agency.workingDays || '1,2,3,4,5',
+        // Task 51: canonical location fields (provider-independent; mirrors the
+        // cloud GET /profile payload). locationVerified falls back to the
+        // schema default for rows created before the additive column top-up.
+        latitude: agency.latitude ?? null,
+        longitude: agency.longitude ?? null,
+        postalCode: agency.postalCode ?? null,
+        locationVerified: agency.locationVerified ?? 'UNVERIFIED',
+        locationSource: agency.locationSource ?? null,
+        locationUpdatedAt: agency.locationUpdatedAt ?? null,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] Agency profile error:', error)
+      return c.json({ success: false, error: 'Failed to load agency profile' }, 500)
+    }
+  })
+
+  // GET /api/agency/dashboard — today's stats
+  app.get('/api/agency/dashboard', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const startMs = todayStartMs()
+      const endMs = todayEndMs()
+
+      const [
+        totalToday,
+        waiting,
+        serving,
+        completed,
+        noShow,
+        cancelled,
+      ] = await Promise.all([
+        db.reservation.count({
+          where: { agencyId, joinedAt: { gte: startMs, lte: endMs } },
+        }),
+        db.reservation.count({ where: { agencyId, status: 'WAITING' } }),
+        db.reservation.count({
+          where: { agencyId, status: { in: ['CALLED', 'SERVING'] } },
+        }),
+        db.reservation.count({
+          where: { agencyId, status: 'COMPLETED', completedAt: { gte: startMs } },
+        }),
+        db.reservation.count({
+          where: { agencyId, status: 'NO_SHOW', skippedAt: { gte: startMs } },
+        }),
+        db.reservation.count({
+          where: { agencyId, status: 'CANCELLED', cancelledAt: { gte: startMs } },
+        }),
+      ])
+
+      return c.json({
+        success: true,
+        data: {
+          totalToday,
+          waiting,
+          serving,
+          completed,
+          noShow,
+          cancelled,
+          averageWaitMinutes: 0, // placeholder — would need actual wait calculations
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] Dashboard error:', error)
+      return c.json({ success: false, error: 'Failed to load dashboard' }, 500)
+    }
+  })
+
+  // PUT /api/agency/profile — update agency basic fields
+  app.put('/api/agency/profile', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: agency profile/settings edits need canManageProfile
+      // (owner-limited manager authority; owners bypass).
+      const permGate = await checkAgencyPermission(undefined, 'canManageProfile')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+
+      const body = await c.req.json()
+
+      // Only allow basic fields (Round 15: + workingDays/coverUrl)
+      const allowedFields = ['name', 'phone', 'workingHoursStart', 'workingHoursEnd', 'description', 'address', 'logoUrl', 'coverUrl', 'workingDays']
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) {
+          updateData[field] = body[field]
+        }
+      }
+
+      // Task 51: map/location fields (latitude, longitude, postalCode,
+      // locationVerified, locationSource) — cloud-identical validation
+      // (range/pair/enum → 400) + locationUpdatedAt stamping. Applied through
+      // the same outbox transaction so the replay carries the exact fields.
+      const locationUpdate = buildAgencyLocationUpdate(body)
+      if (!locationUpdate.ok) {
+        return c.json({ success: false, error: locationUpdate.error }, 400)
+      }
+      Object.assign(updateData, locationUpdate.data)
+
+      if (Object.keys(updateData).length === 0) {
+        return c.json({ success: false, error: 'No valid fields to update' }, 400)
+      }
+
+      // Part Q: business write + outbox row commit atomically — a crash can
+      // no longer produce an agency update the cloud never learns about.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.agency.update({
+          where: { id: agencyId },
+          data: updateData,
+        })
+        await logPendingMutation('PUT', '/api/agency/profile', body, row, { tx })
+        return row
+      })
+
+      emitEvent('agency:updated', { agencyId, ...updateData })
+
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Update agency profile error:', error)
+      return c.json({ success: false, error: 'Failed to update agency profile' }, 500)
+    }
+  })
+
+  // PATCH /api/agency/queue-status — toggle queue open/paused
+  app.patch('/api/agency/queue-status', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const body = await c.req.json()
+      const newStatus = body.queueOpen // boolean or 0/1
+
+      if (newStatus === undefined) {
+        return c.json({ success: false, error: 'queueOpen field is required' }, 400)
+      }
+
+      // Update queue settings
+      const qs = await db.queueSettings.findFirst({ where: { agencyId } })
+      const isPaused = !newStatus
+
+      // Part Q: settings write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        if (qs) {
+          await tx.queueSettings.update({
+            where: { id: qs.id },
+            data: { isPaused },
+          })
+        } else {
+          await tx.queueSettings.create({
+            data: {
+              agencyId,
+              isPaused,
+              lastIssuedNumber: 0,
+              currentServingNumber: 0,
+            },
+          })
+        }
+        await logPendingMutation('PATCH', '/api/agency/queue-status', body, { queueOpen: !isPaused }, { tx })
+      })
+
+      emitEvent('agency:queue-status', { agencyId, queueOpen: !isPaused })
+
+      return c.json({
+        success: true,
+        data: { queueOpen: !isPaused },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] Queue status error:', error)
+      return c.json({ success: false, error: 'Failed to update queue status' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 4. SERVICES (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/services — list active services for agency
+  app.get('/api/services', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const services = await db.service.findMany({
+        where: { agencyId, isActive: true },
+        orderBy: { createdAt: 'asc' },
+      })
+
+      return c.json({ success: true, data: services })
+    } catch (error) {
+      console.error('[LocalAPI] List services error:', error)
+      return c.json({ success: false, error: 'Failed to list services' }, 500)
+    }
+  })
+
+  // POST /api/services — create service
+  app.post('/api/services', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: service management needs canManageServices (owners bypass).
+      const permGate = await checkAgencyPermission(undefined, 'canManageServices')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+
+      const body = await c.req.json()
+      const { name, prefix, estimatedDuration, description } = body
+
+      if (!name) {
+        return c.json({ success: false, error: 'Service name is required' }, 400)
+      }
+
+      // Part Q: business write + outbox row commit atomically.
+      const service = await withOutboxTransaction(async (tx) => {
+        const created = await tx.service.create({
+          data: {
+            agencyId,
+            name,
+            prefix: prefix || name.charAt(0).toUpperCase(),
+            // estimatedDuration: removed — not a Service schema field
+            description: description || null,
+            isActive: true,
+          },
+        })
+        // Canonical replay (round-7): record-level create preserves the LOCAL
+        // id on the cloud — HTTP replays of create routes recreate the record
+        // under a NEW cloud id, permanently breaking later updates by id.
+        await logDeterministicOutcome('Service', created.id, 'create', created, null, { tx })
+        return created
+      })
+
+      emitEvent('service:created', { agencyId, service })
+
+      return c.json({ success: true, data: service }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create service error:', error)
+      return c.json({ success: false, error: 'Failed to create service' }, 500)
+    }
+  })
+
+  // PUT /api/services/:id — update service
+  app.put('/api/services/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: service management needs canManageServices (owners bypass).
+      const permGate = await checkAgencyPermission(undefined, 'canManageServices')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+
+      const id = c.req.param('id')
+      const body = await c.req.json()
+
+      // Verify service belongs to this agency
+      const existing = await db.service.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Service not found' }, 404)
+      }
+
+      const allowedFields = ['name', 'prefix', 'description', 'isActive'] // estimatedDuration removed — not a Service schema field
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) {
+          updateData[field] = body[field]
+        }
+      }
+
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.service.update({ where: { id }, data: updateData })
+        await logDeterministicOutcome('Service', id, 'update', row, null, { tx })
+        return row
+      })
+
+      emitEvent('service:updated', { agencyId, serviceId: id, ...updateData })
+
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Update service error:', error)
+      return c.json({ success: false, error: 'Failed to update service' }, 500)
+    }
+  })
+
+  // DELETE /api/services/:id — soft delete service
+  app.delete('/api/services/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: service management needs canManageServices (owners bypass).
+      const permGate = await checkAgencyPermission(undefined, 'canManageServices')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+
+      const id = c.req.param('id')
+
+      // Verify ownership
+      const existing = await db.service.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Service not found' }, 404)
+      }
+
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.service.update({
+          where: { id },
+          data: { isActive: false },
+        })
+        await logDeterministicOutcome('Service', id, 'delete', {}, null, { tx })
+      })
+
+      emitEvent('service:deleted', { agencyId, serviceId: id })
+
+      return c.json({ success: true, data: { id, deleted: true } })
+    } catch (error) {
+      console.error('[LocalAPI] Delete service error:', error)
+      return c.json({ success: false, error: 'Failed to delete service' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 4b. AGENCY CATEGORIES (Task 42-c — global dictionary, mirror of the
+  // cloud /api/agency-categories routes). NOT agency-scoped: the rows are
+  // platform-wide (Task 42-a sync registry — isAgencyScoped false). Offline
+  // creates replay to the cloud via the outbox (logDeterministicOutcome →
+  // /api/sync/push → registry-driven applyMutationInTx).
+
+  // The 25 built-in category keys (cloud parity) — case-insensitive collision
+  // targets for custom names.
+  const AGENCY_CATEGORY_BUILTIN_KEYS = [
+    'CLINIC', 'HOSPITAL', 'DENTAL_CLINIC', 'LABORATORY', 'PHARMACY',
+    'VETERINARY', 'BANK', 'POST_OFFICE', 'TELECOM', 'INSURANCE',
+    'LAW_FIRM', 'NOTARY', 'GOVERNMENT', 'EDUCATION', 'AGENCY',
+    'TRAVEL', 'REAL_ESTATE', 'CAR_SERVICE', 'BARBER', 'BEAUTY_SALON',
+    'RESTAURANT', 'CAFE', 'RETAIL', 'HOTEL', 'OTHER',
+  ]
+
+  /** Plain JSON record with booleans + ISO datetimes (also the outbox payload). */
+  function serializeAgencyCategory(row) {
+    return {
+      id: row.id,
+      name: row.name,
+      nameFr: row.nameFr == null ? null : String(row.nameFr),
+      nameAr: row.nameAr == null ? null : String(row.nameAr),
+      icon: row.icon == null ? null : String(row.icon),
+      isCustom: row.isCustom === 1 || row.isCustom === true,
+      createdBy: row.createdBy == null ? null : String(row.createdBy),
+      createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : (row.createdAt ? new Date(row.createdAt).toISOString() : null),
+      updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : (row.updatedAt ? new Date(row.updatedAt).toISOString() : null),
+    }
+  }
+
+  // GET /api/agency-categories — ANY authenticated session (any role incl. customer)
+  app.get('/api/agency-categories', authMiddleware, async (c) => {
+    try {
+      const rows = await db.agencyCategory.findMany({ orderBy: [{ createdAt: 'asc' }] })
+      const data = rows.map(serializeAgencyCategory)
+      console.log('[LocalAPI] agency-categories list read: rows=' + data.length)
+      return c.json({ success: true, data })
+    } catch (error) {
+      console.error('[LocalAPI] List agency-categories error:', error)
+      return c.json({ success: false, error: 'Failed to list agency categories' }, 500)
+    }
+  })
+
+  // POST /api/agency-categories — owners/staff/super-admin create a custom
+  // category; commit + outbox row in ONE transaction (Part Q).
+  app.post('/api/agency-categories', authMiddleware, async (c) => {
+    try {
+      const role = sessionUser ? sessionUser.role : null
+      if (!['AGENCY_OWNER', 'AGENCY_STAFF', 'SUPER_ADMIN'].includes(role)) {
+        return c.json({ success: false, error: 'Only agency owners, staff, or super admins can create agency categories' }, 403)
+      }
+
+      const body = await c.req.json().catch(() => ({}))
+      // Normalize: trim + collapse internal whitespace; 2–40 chars required.
+      const name = typeof body?.name === 'string' ? body.name.replace(/\s+/g, ' ').trim() : ''
+      if (name.length < 2 || name.length > 40) {
+        return c.json({ success: false, error: 'INVALID_NAME' }, 400)
+      }
+      const nameFr = typeof body?.nameFr === 'string' && body.nameFr.trim() !== '' ? body.nameFr.trim() : null
+      const nameAr = typeof body?.nameAr === 'string' && body.nameAr.trim() !== '' ? body.nameAr.trim() : null
+      const icon = typeof body?.icon === 'string' && body.icon.trim() !== '' ? body.icon.trim() : null
+
+      // Case-insensitive collision check — built-in keys first, then local rows.
+      const lower = name.toLowerCase()
+      if (AGENCY_CATEGORY_BUILTIN_KEYS.some((k) => k.toLowerCase() === lower)) {
+        return c.json({ success: false, error: 'CATEGORY_EXISTS' }, 409)
+      }
+      const existing = await db.agencyCategory.findMany({ select: { name: true } })
+      if (existing.some((r) => String(r.name || '').trim().toLowerCase() === lower)) {
+        return c.json({ success: false, error: 'CATEGORY_EXISTS' }, 409)
+      }
+
+      const categoryId = require('crypto').randomUUID()
+      const created = await withOutboxTransaction(async (tx) => {
+        const row = await tx.agencyCategory.create({
+          data: {
+            id: categoryId,
+            name,
+            nameFr,
+            nameAr,
+            icon,
+            isCustom: true,
+            createdBy: sessionUser.id || null,
+          },
+        })
+        // Canonical replay (round-7): id-preserving record-level create with a
+        // plain payload (ISO dates + booleans) so the cloud push is schema-clean.
+        await logDeterministicOutcome('AgencyCategory', row.id, 'create', serializeAgencyCategory(row), new Date().toISOString(), { tx })
+        return row
+      })
+
+      console.log('[LocalAPI] agency-category created: id=' + created.id + ' name="' + created.name + '"')
+      return c.json({ success: true, data: serializeAgencyCategory(created) }, 201)
+    } catch (error) {
+      // Race with a concurrent create (or a synced row that landed between the
+      // pre-check and the INSERT) → unique constraint on name → CATEGORY_EXISTS.
+      if (error && (error.code === 'P2002' || /UNIQUE constraint failed/i.test(String(error?.message || '')))) {
+        return c.json({ success: false, error: 'CATEGORY_EXISTS' }, 409)
+      }
+      console.error('[LocalAPI] Create agency-category error:', error)
+      return c.json({ success: false, error: 'Failed to create agency category' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 5. BRANCHES (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/branches
+  app.get('/api/agency/branches', authMiddleware, async (c) => {
+    try {
+      // Task 35 (bug A): resolve the agency like the staff/subscription routes
+      // do — accept the UI's ?agencyId= param (with owner/staff DB fallbacks)
+      // instead of ONLY sessionUser.agencyId. A session whose agencyId is
+      // null/blank (cloud login for an account row without agencyId) 403'd
+      // here, which left the desktop branch list AND the staff-creation
+      // dialog's branch selector empty even when branches existed.
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      // Cloud contract (apps/api/src/routes/agency.ts GET /branches): rows
+      // carry counter/staff counts (_count) and main branches sort first.
+      // The response is DUAL-KEYED — { branches } for cloud-shape readers and
+      // { data } for the legacy local envelope — because the UI reads
+      // data.branches (Task 31-C, BUG 6: the single-key { data } shape left
+      // the desktop branch list structurally empty).
+      const branches = await db.branch.findMany({
+        where: { agencyId },
+        include: {
+          _count: { select: { counters: true, staff: true } },
+        },
+        orderBy: [{ isMain: 'desc' }, { name: 'asc' }],
+      })
+
+      // Task 46 [SyncDiag]: every list read is traceable — if the UI shows
+      // "no branches yet" while this line says N rows, the defect is in the
+      // client render layer, not the data.
+      console.log(`[SyncDiag] branches list read: agencyId=${agencyId} rows=${branches.length}`)
+
+      return c.json({ success: true, branches, data: branches })
+    } catch (error) {
+      console.error('[LocalAPI] List branches error:', error)
+      return c.json({ success: false, error: 'Failed to list branches' }, 500)
+    }
+  })
+
+  // POST /api/agency/branches — create branch
+  app.post('/api/agency/branches', authMiddleware, async (c) => {
+    try {
+      // Task 37-a: parse the body FIRST and resolve via query || body. The
+      // cloud contract (agency.ts POST /branches) REQUIRES body.agencyId and
+      // the UI (agency-branches.tsx) sends agencyId in the BODY — resolving
+      // from the query alone made the resolver see undefined → session agency,
+      // so desktop-created branches always landed under the session's agency.
+      const body = await c.req.json()
+      // Task 37-d enforcement matrix: create → owner | canCreateBranches.
+      const permGate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canCreateBranches')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      // Task 35 (bug A): same agency resolution fix as the GET route above.
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId') || body.agencyId)
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      // Task 31-C (BUG 6): the UI also sends nameAr/nameFr/isMain
+      // (agency-branches.tsx) — dropping them silently lost translations and
+      // the "set as main" flag on desktop. Cloud createBranchSchema accepts
+      // all of these, so the canonical replay body stays valid cloud-side.
+      // Task 83 — the UI now ALSO sends specialName + the location block
+      // (latitude/longitude/city/wilaya/postalCode/locationSource/Verified);
+      // dropping those would lose the mandatory branch location on desktop.
+      const { name, nameAr, nameFr, specialName, address, phone, isActive, isMain,
+              latitude, longitude, city, wilaya, postalCode, locationVerified, locationSource } = body
+
+      if (!name) {
+        return c.json({ success: false, error: 'Branch name is required' }, 400)
+      }
+
+      // Task 35: enforce the subscription plan's branch limit locally too
+      // (cloud mirror — maxBranches, -1 = unlimited). Uses the locally synced
+      // plan row so the same limit applies offline.
+      try {
+        const agencyRow = await db.agency.findUnique({
+          where: { id: agencyId },
+          select: { subscriptionPlanId: true },
+        })
+        let limitPlan = agencyRow && agencyRow.subscriptionPlanId
+          ? await db.subscriptionPlan.findUnique({ where: { id: agencyRow.subscriptionPlanId } })
+          : null
+        if (!limitPlan) {
+          limitPlan = await db.subscriptionPlan.findFirst({ where: { name: 'FREE' } })
+        }
+        if (limitPlan && limitPlan.maxBranches !== -1 && limitPlan.maxBranches !== null && limitPlan.maxBranches !== undefined) {
+          const branchCount = await db.branch.count({ where: { agencyId } })
+          if (branchCount >= limitPlan.maxBranches) {
+            return c.json({
+              success: false,
+              code: 'PLAN_LIMIT_REACHED',
+              error: `Your ${limitPlan.displayName} plan allows up to ${limitPlan.maxBranches} branches. Upgrade your subscription to add more.`,
+              limit: limitPlan.maxBranches,
+              current: branchCount,
+            }, 403)
+          }
+        }
+      } catch (limitErr) {
+        // Fail OPEN — a missing/corrupt plan catalog must never block business.
+        console.warn('[LocalAPI] Branch plan-limit check skipped:', limitErr && limitErr.message)
+      }
+
+      // Task 83 — local sub-code derivation (same contract as the cloud
+      // POST /branches): "<customCode>-M1" for the main branch,
+      // "<customCode>-B<n>" otherwise. The agency row is synced locally so
+      // its customCode is available offline; if it somehow is not, subCode
+      // stays null (nullable column) and the cloud backfills on the next
+      // edit — never fail the business write over a display code.
+      let subCode = null
+      try {
+        const parentAgency = await db.agency.findUnique({
+          where: { id: agencyId },
+          select: { customCode: true },
+        })
+        if (parentAgency && parentAgency.customCode) {
+          const base = isMain ? `${parentAgency.customCode}-M1` : `${parentAgency.customCode}-B`
+          subCode = isMain ? base : `${base}1`
+          for (let attempt = 2; attempt <= 60; attempt++) {
+            const taken = await db.branch.findUnique({ where: { subCode }, select: { id: true } })
+            if (!taken) break
+            subCode = isMain ? `${parentAgency.customCode}-M${attempt}` : `${base}${attempt}`
+          }
+        }
+      } catch (subErr) {
+        console.warn('[LocalAPI] sub-code derivation skipped:', subErr && subErr.message)
+        subCode = null
+      }
+
+      // Part Q: business write + outbox row commit atomically.
+      const branch = await withOutboxTransaction(async (tx) => {
+        // Cloud parity (agency.ts POST /branches): when the new branch is set
+        // as main, unset the other main branches INSIDE the same transaction
+        // — same sweep the PATCH route runs — so a crash cannot leave two mains.
+        if (isMain) {
+          await tx.branch.updateMany({
+            where: { agencyId, isMain: true },
+            data: { isMain: false },
+          })
+        }
+        const created = await tx.branch.create({
+          data: {
+            agencyId,
+            name,
+            nameAr: nameAr || null,
+            nameFr: nameFr || null,
+            specialName: (specialName && String(specialName).trim()) || null,
+            subCode,
+            address: address || null,
+            phone: phone || null,
+            isMain: Boolean(isMain),
+            isActive: isActive !== undefined ? Boolean(isActive) : true,
+            // Task 83 — branch location (pair rule mirrors the cloud route:
+            // both numbers, or neither).
+            ...(typeof latitude === 'number' && typeof longitude === 'number'
+              ? {
+                  latitude,
+                  longitude,
+                  city: (city && String(city).trim()) || null,
+                  wilaya: (wilaya && String(wilaya).trim()) || null,
+                  postalCode: (postalCode && String(postalCode).trim()) || null,
+                  locationVerified: locationVerified || 'UNVERIFIED',
+                  locationSource: locationSource || null,
+                  locationUpdatedAt: new Date(),
+                }
+              : {}),
+          },
+        })
+        // Canonical replay (round-7): see the reservation create note —
+        // id-preserving record-level create, never an HTTP route replay.
+        await logDeterministicOutcome('Branch', created.id, 'create', created, null, { tx })
+        return created
+      })
+
+      emitEvent('branch:created', { agencyId, branch })
+
+      // Task 46 [SyncDiag]: the branch-visibility incident needs the CREATE
+      // side to be as traceable as the import side — log the created row and
+      // the resulting local table count so "created but list empty" is
+      // attributable to the read/render layer, never ambiguous again.
+      try {
+        const localBranchCount = await db.branch.count({ where: { agencyId } })
+        console.log(`[SyncDiag] branch created locally: id=${branch.id} name="${branch.name}" agencyId=${agencyId} — local Branch table now holds ${localBranchCount} row(s) for this agency`)
+      } catch { /* diagnostics must never fail the request */ }
+
+      // Dual-key response — the cloud route returns { success, branch } 201.
+      return c.json({ success: true, branch, data: branch }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create branch error:', error)
+      return c.json({ success: false, error: 'Failed to create branch' }, 500)
+    }
+  })
+
+  // PUT /api/agency/branches/:id — update branch
+  // Also accepts PATCH for compatibility
+  for (const method of ['put', 'patch']) {
+    app[method]('/api/agency/branches/:id', authMiddleware, async (c) => {
+      try {
+        // Task 37-a: resolve like the GET/POST routes (query || body with the
+        // session-agency fallback) instead of raw sessionUser.agencyId.
+        const body = await c.req.json()
+        // Task 37-d enforcement matrix: update → owner | canCreateBranches
+        // | canDeleteBranches (managers hold both by tier default).
+        const permGate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canCreateBranches', 'canDeleteBranches')
+        if (!permGate.ok) return c.json(permGate.body, permGate.status)
+        const agencyId = await resolveSessionAgencyId(c.req.query('agencyId') || body.agencyId)
+        if (!agencyId) {
+          return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+        }
+
+        const id = c.req.param('id')
+
+        // Verify ownership
+        const existing = await db.branch.findUnique({ where: { id } })
+        if (!existing || existing.agencyId !== agencyId) {
+          return c.json({ success: false, error: 'Branch not found' }, 404)
+        }
+
+        const allowedFields = ['name', 'nameAr', 'nameFr', 'specialName', 'address', 'phone', 'isActive', 'isMain',
+                               'latitude', 'longitude', 'city', 'wilaya', 'postalCode', 'locationVerified', 'locationSource']
+        const updateData = {}
+        for (const field of allowedFields) {
+          if (body[field] !== undefined) {
+            updateData[field] = body[field]
+          }
+        }
+        // Task 83 — location pair rule (cloud parity): lat/lng arrive
+        // together or both null; any location change stamps locationUpdatedAt.
+        if ('latitude' in updateData !== 'longitude' in updateData) {
+          return c.json({ success: false, error: 'latitude and longitude must be provided together' }, 400)
+        }
+        if ('latitude' in updateData) {
+          updateData.locationUpdatedAt = new Date()
+        }
+
+        // Part Q: every write below (including the isMain sweep) + the outbox
+        // row commit atomically — a crash cannot half-apply a main-branch flip.
+        const updated = await withOutboxTransaction(async (tx) => {
+          // If setting as main, unset other main branches
+          if (updateData.isMain) {
+            await tx.branch.updateMany({
+              where: { agencyId, isMain: true },
+              data: { isMain: false },
+            })
+          }
+          const row = await tx.branch.update({ where: { id }, data: updateData })
+          await logDeterministicOutcome('Branch', id, 'update', row, null, { tx })
+          return row
+        })
+
+        emitEvent('branch:updated', { agencyId, branchId: id, ...updateData })
+
+        return c.json({ success: true, data: updated })
+      } catch (error) {
+        console.error('[LocalAPI] Update branch error:', error)
+        return c.json({ success: false, error: 'Failed to update branch' }, 500)
+      }
+    })
+  }
+
+  // DELETE /api/agency/branches/:id — delete branch
+  app.delete('/api/agency/branches/:id', authMiddleware, async (c) => {
+    try {
+      // Task 37-a: resolve like the sibling branch routes (no body — query only).
+      // Task 37-d enforcement matrix: delete → owner | canDeleteBranches.
+      const permGate = await checkAgencyPermission(c.req.query('agencyId'), 'canDeleteBranches')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      const id = c.req.param('id')
+      const existing = await db.branch.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Branch not found' }, 404)
+      }
+      // Soft delete: set isActive = false — Part Q: atomic with the outbox row.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.branch.update({ where: { id }, data: { isActive: false } })
+        await logDeterministicOutcome('Branch', id, 'delete', {}, null, { tx })
+        return row
+      })
+      emitEvent('branch:deleted', { agencyId, branchId: id })
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Delete branch error:', error)
+      return c.json({ success: false, error: 'Failed to delete branch' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 6. COUNTERS (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/counters
+  app.get('/api/agency/counters', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const branchId = c.req.query('branchId')
+
+      // Counter has no agencyId — route through Branch
+      let where = {}
+      if (branchId) {
+        where.branchId = branchId
+      } else {
+        // Get all branch IDs for this agency
+        const branches = await db.branch.findMany({ where: { agencyId }, select: { id: true } })
+        where = { branchId: { in: branches.map(b => b.id) } }
+      }
+
+      const counters = await db.counter.findMany({
+        where,
+        orderBy: { number: 'asc' },
+      })
+
+      return c.json({ success: true, data: counters })
+    } catch (error) {
+      console.error('[LocalAPI] List counters error:', error)
+      return c.json({ success: false, error: 'Failed to list counters' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters — create counter
+  app.post('/api/agency/counters', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: counter management is branch management (canManageBranches).
+      const permGate = await checkAgencyPermission(undefined, 'canManageBranches')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+
+      const body = await c.req.json()
+      const { name, number, branchId, isActive } = body
+
+      if (number === undefined) {
+        return c.json({ success: false, error: 'Counter number is required' }, 400)
+      }
+
+      // Part Q: business write + outbox row commit atomically.
+      const counter = await withOutboxTransaction(async (tx) => {
+        const created = await tx.counter.create({
+          data: {
+            // agencyId removed — Counter has no direct agencyId, only branchId
+            name: name || `Counter ${number}`,
+            number,
+            branchId: branchId || null,
+            isActive: isActive !== undefined ? Boolean(isActive) : true,
+          },
+        })
+        // Canonical replay (round-7): id-preserving record-level create.
+        await logDeterministicOutcome('Counter', created.id, 'create', created, null, { tx })
+        return created
+      })
+
+      emitEvent('counter:created', { agencyId, counter })
+
+      return c.json({ success: true, data: counter }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create counter error:', error)
+      return c.json({ success: false, error: 'Failed to create counter' }, 500)
+    }
+  })
+
+  // PUT /api/agency/counters/:id — update counter
+  app.put('/api/agency/counters/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: counter management is branch management (canManageBranches).
+      const permGate = await checkAgencyPermission(undefined, 'canManageBranches')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+
+      const id = c.req.param('id')
+      const body = await c.req.json()
+
+      const existing = await db.counter.findUnique({ where: { id } })
+      if (!existing) {
+        return c.json({ success: false, error: 'Counter not found' }, 404)
+      }
+      // Counter has no agencyId — verify ownership through Branch
+      if (existing.branchId) {
+        const branch = await db.branch.findUnique({ where: { id: existing.branchId } }).catch(() => null)
+        if (!branch || branch.agencyId !== agencyId) {
+          return c.json({ success: false, error: 'Counter not found' }, 404)
+        }
+      }
+
+      const allowedFields = ['name', 'number', 'branchId', 'isActive']
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) {
+          updateData[field] = body[field]
+        }
+      }
+
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.counter.update({ where: { id }, data: updateData })
+        await logDeterministicOutcome('Counter', id, 'update', row, null, { tx })
+        return row
+      })
+
+      emitEvent('counter:updated', { agencyId, counterId: id, ...updateData })
+
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Update counter error:', error)
+      return c.json({ success: false, error: 'Failed to update counter' }, 500)
+    }
+  })
+
+  // ── Branch-nested counter routes (used by agency-branches.tsx) ──────
+  // These proxy to the same counter logic but use the branch path pattern.
+
+  // GET /api/agency/branches/:branchId/counters — list counters for a branch
+  app.get('/api/agency/branches/:branchId/counters', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const branchId = c.req.param('branchId')
+      // Ownership first, then filter by branchId only — Counter has NO
+      // agencyId column (branchId → Branch → agencyId), so the old
+      // `where: { agencyId, branchId }` threw "Unknown argument" and the
+      // route 500'd on every call. Same shape as the cloud route
+      // (agency.ts GET /branches/:id/counters).
+      const branch = await db.branch.findFirst({ where: { id: branchId, agencyId } })
+      if (!branch) return c.json({ success: false, error: 'Branch not found' }, 404)
+      const counters = await db.counter.findMany({
+        where: { branchId },
+        orderBy: { name: 'asc' },
+      })
+      // Dual-key — the UI reads data.counters, the cloud contract is { counters }.
+      return c.json({ success: true, counters, data: counters })
+    } catch (error) {
+      console.error('[LocalAPI] List branch counters error:', error)
+      return c.json({ success: false, error: 'Failed to list counters' }, 500)
+    }
+  })
+
+  // GET /api/agency/branches/:branchId/counters/:counterId — get single counter
+  app.get('/api/agency/branches/:branchId/counters/:counterId', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const { counterId } = c.req.param()
+      const counter = await db.counter.findUnique({ where: { id: counterId } })
+      if (!counter || counter.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Counter not found' }, 404)
+      }
+      return c.json({ success: true, data: counter })
+    } catch (error) {
+      console.error('[LocalAPI] Get counter error:', error)
+      return c.json({ success: false, error: 'Failed to get counter' }, 500)
+    }
+  })
+
+  // PUT/PATCH /api/agency/branches/:branchId/counters/:counterId — update counter
+  for (const method of ['put', 'patch']) {
+    app[method]('/api/agency/branches/:branchId/counters/:counterId', authMiddleware, async (c) => {
+      try {
+        const agencyId = sessionUser.agencyId
+        if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+        const { counterId } = c.req.param()
+        const body = await c.req.json()
+        const existing = await db.counter.findUnique({ where: { id: counterId } })
+        if (!existing || existing.agencyId !== agencyId) {
+          return c.json({ success: false, error: 'Counter not found' }, 404)
+        }
+        const allowedFields = ['name', 'branchId', 'isActive', 'prefix']
+        const updateData = {}
+        for (const field of allowedFields) {
+          if (body[field] !== undefined) updateData[field] = body[field]
+        }
+        // Part Q: business write + outbox row commit atomically.
+        const updated = await withOutboxTransaction(async (tx) => {
+          const row = await tx.counter.update({ where: { id: counterId }, data: updateData })
+          await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+          return row
+        })
+        emitEvent('counter:updated', { agencyId, counterId, ...updateData })
+        return c.json({ success: true, data: updated })
+      } catch (error) {
+        console.error('[LocalAPI] Update branch counter error:', error)
+        return c.json({ success: false, error: 'Failed to update counter' }, 500)
+      }
+    })
+  }
+
+  // DELETE /api/agency/branches/:branchId/counters/:counterId — delete counter
+  app.delete('/api/agency/branches/:branchId/counters/:counterId', authMiddleware, async (c) => {
+    try {
+      // Task 37-a: resolve like the sibling branch routes (query only — no body).
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const { counterId } = c.req.param()
+      const existing = await db.counter.findUnique({ where: { id: counterId } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Counter not found' }, 404)
+      }
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.counter.delete({ where: { id: counterId } })
+        await logDeterministicOutcome('Counter', counterId, 'delete', {}, null, { tx })
+      })
+      emitEvent('counter:deleted', { agencyId, counterId })
+      return c.json({ success: true, data: { id: counterId, deleted: true } })
+    } catch (error) {
+      console.error('[LocalAPI] Delete branch counter error:', error)
+      return c.json({ success: false, error: 'Failed to delete counter' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 6b. STAFF AUTHORITY + COUNTER OCCUPATION (Task 37-d — mirrors the cloud
+  //     2-tier authority contract; the parallel cloud task implements the
+  //     same endpoints against the same shapes).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/my-authority — the caller's effective authority for the
+  // agency. Owner (role AGENCY_OWNER / SUPER_ADMIN / agency.ownerId match)
+  // → isOwner true, role 'OWNER', staffId null, ALL permissions true.
+  // Staff → the ACTIVE AgencyStaff row resolved by (userId, agencyId) with
+  // the normalized boolean permission columns. No agency / no staff row →
+  // role null + all-false permissions (the honest "no authority" answer).
+  app.get('/api/agency/my-authority', authMiddleware, async (c) => {
+    try {
+      const noPermissions = {}
+      for (const key of STAFF_PERMISSION_KEYS) noPermissions[key] = false
+      const ctx = await resolveAuthorityContext(c.req.query('agencyId'))
+      if (!ctx) {
+        return c.json({
+          success: true,
+          agencyId: null,
+          isOwner: false,
+          role: null,
+          staffId: null,
+          permissions: noPermissions,
+        })
+      }
+      return c.json({
+        success: true,
+        agencyId: ctx.agencyId,
+        isOwner: ctx.isOwner,
+        role: ctx.role,
+        staffId: ctx.staffId,
+        permissions: ctx.permissions,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/my-authority error:', error)
+      return c.json({ success: false, error: 'Failed to resolve authority' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/:counterId/occupy — claim a service counter.
+  // Contract: the counter must belong to the caller's agency (validated via
+  // counter.branch.agencyId — Counter has NO agencyId column, join through
+  // Branch). If Counter.staffId points at ANOTHER ACTIVE staff row → 409
+  // COUNTER_OCCUPIED. Staff callers claim with their own AgencyStaff.id;
+  // owners set occupiedAt only (staffId untouched). Persisted through the
+  // SAME outbox pattern as the counter PATCH routes so the occupation
+  // replays deterministically to the cloud.
+  app.post('/api/agency/counters/:counterId/occupy', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
+      if (!gate.ok) return c.json(gate.body, gate.status)
+      const { ctx } = gate
+
+      const counterId = c.req.param('counterId')
+      const counter = await db.counter.findUnique({
+        where: { id: counterId },
+        include: { branch: true },
+      })
+      if (!counter || !counter.branch || counter.branch.agencyId !== ctx.agencyId) {
+        return c.json({ success: false, error: 'Counter not found' }, 404)
+      }
+
+      // Occupied by ANOTHER ACTIVE staff row → 409. A stale holder row
+      // (deleted or deactivated) does not block a fresh occupation.
+      if (counter.staffId && counter.staffId !== ctx.staffId) {
+        const holder = await db.agencyStaff.findUnique({ where: { id: counter.staffId } }).catch(() => null)
+        if (holder && holder.isActive) {
+          return c.json({ success: false, error: 'COUNTER_OCCUPIED' }, 409)
+        }
+      }
+
+      const now = new Date()
+      const counterUpdated = await withOutboxTransaction(async (tx) => {
+        const data = ctx.isOwner ? { occupiedAt: now } : { staffId: ctx.staffId, occupiedAt: now }
+        let row
+        try {
+          row = await tx.counter.update({ where: { id: counterId }, data })
+        } catch (err) {
+          // Transition window: a stale generated client without occupiedAt.
+          if (!isUnknownColumnError(err, NEW_COUNTER_COLUMNS)) throw err
+          console.warn('[LocalAPI] occupy: local Prisma client lacks occupiedAt — writing staffId only (non-fatal)')
+          row = await tx.counter.update({
+            where: { id: counterId },
+            data: ctx.isOwner ? {} : { staffId: ctx.staffId },
+          })
+        }
+        await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+        return row
+      })
+
+      emitEvent('counter:occupied', {
+        agencyId: ctx.agencyId,
+        counterId,
+        staffId: counterUpdated.staffId,
+        occupiedAt: counterUpdated.occupiedAt || now,
+        byOwner: ctx.isOwner,
+      })
+      return c.json({ success: true, counter: counterUpdated })
+    } catch (error) {
+      console.error('[LocalAPI] Occupy counter error:', error)
+      return c.json({ success: false, error: 'Failed to occupy counter' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/:counterId/release — free a service counter.
+  // Staff may release only their own occupation (a counter held by ANOTHER
+  // ACTIVE staff row → 409 COUNTER_OCCUPIED); an owner may release ANY
+  // counter of the agency (clearing its staffId too — otherwise a staff-held
+  // counter could never be freed). staffId is cleared only when it was the
+  // caller's own row (or the caller is an owner); occupiedAt = null always.
+  // Same outbox pattern as occupy.
+  app.post('/api/agency/counters/:counterId/release', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
+      if (!gate.ok) return c.json(gate.body, gate.status)
+      const { ctx } = gate
+
+      const counterId = c.req.param('counterId')
+      const counter = await db.counter.findUnique({
+        where: { id: counterId },
+        include: { branch: true },
+      })
+      if (!counter || !counter.branch || counter.branch.agencyId !== ctx.agencyId) {
+        return c.json({ success: false, error: 'Counter not found' }, 404)
+      }
+
+      if (!ctx.isOwner && counter.staffId && counter.staffId !== ctx.staffId) {
+        const holder = await db.agencyStaff.findUnique({ where: { id: counter.staffId } }).catch(() => null)
+        if (holder && holder.isActive) {
+          return c.json({ success: false, error: 'COUNTER_OCCUPIED' }, 409)
+        }
+      }
+
+      const counterUpdated = await withOutboxTransaction(async (tx) => {
+        const data = { occupiedAt: null }
+        if (ctx.isOwner || counter.staffId === ctx.staffId) data.staffId = null
+        let row
+        try {
+          row = await tx.counter.update({ where: { id: counterId }, data })
+        } catch (err) {
+          // Transition window: a stale generated client without occupiedAt.
+          if (!isUnknownColumnError(err, NEW_COUNTER_COLUMNS)) throw err
+          console.warn('[LocalAPI] release: local Prisma client lacks occupiedAt — clearing staffId only (non-fatal)')
+          row = await tx.counter.update({
+            where: { id: counterId },
+            data: data.staffId !== undefined ? { staffId: data.staffId } : {},
+          })
+        }
+        await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+        return row
+      })
+
+      emitEvent('counter:released', { agencyId: ctx.agencyId, counterId, staffId: counterUpdated.staffId })
+      return c.json({ success: true, counter: counterUpdated })
+    } catch (error) {
+      console.error('[LocalAPI] Release counter error:', error)
+      return c.json({ success: false, error: 'Failed to release counter' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 7. STAFF (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/staff
+  app.get('/api/agency/staff', authMiddleware, async (c) => {
+    try {
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      // Cloud contract (apps/api/src/routes/agency.ts GET /staff): rows
+      // include the joined user and permissions parsed from JSON, returned
+      // as { staff: [...] } — the settings UI reads data.staff.
+      const staffList = await db.agencyStaff.findMany({
+        where: { agencyId },
+        include: {
+          user: {
+            select: { id: true, username: true, fullName: true, role: true, isActive: true },
+          },
+        },
+        orderBy: { joinedAt: 'desc' },
+      })
+
+      const staffWithPermissions = staffList.map((s) => {
+        let permissions = {}
+        try { permissions = s.permissions ? JSON.parse(s.permissions) : {} } catch { permissions = {} }
+        return { ...s, permissions }
+      })
+
+      return c.json({ success: true, staff: staffWithPermissions, data: staffWithPermissions })
+    } catch (error) {
+      console.error('[LocalAPI] List staff error:', error)
+      return c.json({ success: false, error: 'Failed to list staff' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 8. RESERVATIONS (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/reservations — list with filters
+  app.get('/api/reservations', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const { take, skip } = parsePagination(c)
+      const status = c.req.query('status')
+      const serviceId = c.req.query('serviceId')
+      const branchId = c.req.query('branchId')
+      const dateFrom = c.req.query('dateFrom')
+      const dateTo = c.req.query('dateTo')
+
+      const where = { agencyId }
+      if (status) where.status = status
+      if (serviceId) where.serviceId = serviceId
+      // branchId filter removed — Reservation has no branchId field
+
+      // Date range filters
+      if (dateFrom || dateTo) {
+        where.joinedAt = {}
+        if (dateFrom) where.joinedAt.gte = new Date(dateFrom).getTime()
+        if (dateTo) where.joinedAt.lte = new Date(dateTo).getTime()
+      }
+
+      const [reservations, total] = await Promise.all([
+        db.reservation.findMany({
+          where,
+          orderBy: { joinedAt: 'desc' },
+          take,
+          skip,
+        }),
+        db.reservation.count({ where }),
+      ])
+
+      return c.json({ success: true, data: reservations, total })
+    } catch (error) {
+      console.error('[LocalAPI] List reservations error:', error)
+      return c.json({ success: false, error: 'Failed to list reservations' }, 500)
+    }
+  })
+
+  // GET /api/reservations/history — the customer's completed-reservation
+  // history (Task 31-C, BUG 4: the route did not exist locally and every
+  // desktop History tap 404'd). Mirrors the cloud contract
+  // (apps/api/src/routes/reservations.ts GET /history): scoped by the SESSION
+  // user — the ?userId= query param is ignored — with terminal statuses only,
+  // agency + service joins, localized logo, and { reservations, total,
+  // limit, offset } pagination. An empty history renders as an empty list
+  // (200), never an error.
+  app.get('/api/reservations/history', authMiddleware, async (c) => {
+    try {
+      const userId = sessionUser.id
+      const parsedLimit = parseInt(c.req.query('limit') || '20', 10)
+      const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 100) : 20
+      const parsedOffset = parseInt(c.req.query('offset') || '0', 10)
+      const offset = Number.isFinite(parsedOffset) ? Math.max(parsedOffset, 0) : 0
+
+      const completedStatuses = ['COMPLETED', 'CANCELLED', 'NO_SHOW', 'SERVED']
+      const where = { userId, status: { in: completedStatuses } }
+
+      const [reservations, total] = await Promise.all([
+        db.reservation.findMany({
+          where,
+          include: {
+            agency: { select: { id: true, name: true, nameFr: true, nameAr: true, customCode: true, category: true, logoUrl: true } },
+            service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
+          },
+          orderBy: { joinedAt: 'desc' },
+          take: limit,
+          skip: offset,
+        }),
+        db.reservation.count({ where }),
+      ])
+
+      // Same field projection as the cloud route; the agency logo is
+      // localized to the local file store when the blob is on this device
+      // so history rows render offline.
+      const mappedReservations = await Promise.all(reservations.map(async (r) => ({
+        id: r.id,
+        userId: r.userId,
+        agencyId: r.agencyId,
+        serviceId: r.serviceId,
+        queueNumber: r.queueNumber,
+        displayNumber: r.displayNumber,
+        status: r.status,
+        estimatedWait: r.estimatedWait,
+        reservedDate: r.reservedDate,
+        joinedAt: r.joinedAt,
+        calledAt: r.calledAt,
+        completedAt: r.completedAt,
+        cancelledAt: r.cancelledAt,
+        rating: r.rating,
+        feedback: r.feedback ?? null,
+        ratedAt: r.ratedAt ?? null,
+        agency: r.agency ? { ...r.agency, logoUrl: await localizeFileUrl(r.agency.logoUrl) } : null,
+        service: r.service,
+      })))
+
+      return c.json({ success: true, reservations: mappedReservations, total, limit, offset })
+    } catch (error) {
+      console.error('[LocalAPI] Reservation history error:', error)
+      return c.json({ success: false, error: 'Failed to load reservation history' }, 500)
+    }
+  })
+
+  // POST /api/reservations — create reservation with auto queue number
+  app.post('/api/reservations', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      // Task 37-d: open/paused/full gates — mirror of the cloud join path.
+      // A closed or paused queue (or a full one) must never issue tickets.
+      const issuanceGate = await checkQueueIssuanceGates(agencyId)
+      if (issuanceGate) return c.json(issuanceGate.body, issuanceGate.status)
+
+      const body = await c.req.json()
+      const {
+        serviceId,
+        // branchId removed — Reservation has no branchId,
+        userId,
+        walkInCustomerName,
+        preferredTime,
+        fixedTimeEnabled,
+        estimatedWait,
+        isWalkIn,
+      } = body
+
+      if (!serviceId) {
+        return c.json({ success: false, error: 'serviceId is required' }, 400)
+      }
+
+      // Get service prefix
+      const service = await db.service.findUnique({ where: { id: serviceId } })
+      if (!service || service.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Service not found' }, 404)
+      }
+
+      // Get or create queue settings to determine next number
+      let qs = await db.queueSettings.findFirst({ where: { agencyId } })
+      const lastNumber = qs?.lastIssuedNumber || 0
+      const newNumber = lastNumber + 1
+      const servicePrefix = service.prefix || 'A'
+      const displayNumber = `${servicePrefix}${String(newNumber).padStart(3, '0')}`
+
+      // Calculate position in queue (number of WAITING reservations before this one)
+      const waitingCount = await db.reservation.count({
+        where: { agencyId, status: 'WAITING' },
+      })
+
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const created = await tx.reservation.create({
+          data: {
+            agencyId,
+            serviceId,
+            // branchId: removed — Reservation has no branchId field
+            userId: userId || sessionUser.id,
+            queueNumber: newNumber,
+            displayNumber,
+            status: 'WAITING',
+          // position: removed — not a Reservation schema field
+            estimatedWait: estimatedWait || 0,
+            isWalkIn: !!isWalkIn,
+            walkInCustomerName: walkInCustomerName || null,
+            preferredTime: preferredTime || null,
+            // Prisma 6 rejects Int 0/1 for Boolean fields (field-discovered by
+            // Task-15 live repro — the old `? 1 : 0` 500'd every create).
+            fixedTimeEnabled: !!fixedTimeEnabled,
+          },
+        })
+
+        // Update queue settings (same transaction — the counter and the
+        // ticket must commit or roll back together)
+        if (qs) {
+          await tx.queueSettings.update({
+            where: { id: qs.id },
+            data: { lastIssuedNumber: newNumber },
+          })
+        } else {
+          await tx.queueSettings.create({
+            data: {
+              agencyId,
+              lastIssuedNumber: newNumber,
+              currentServingNumber: 0,
+              isPaused: false,
+            },
+          })
+        }
+
+        // Part Q: the outbox row commits ATOMICALLY with the ticket — a crash
+        // can no longer produce an issued ticket the cloud never learns about.
+        //
+        // Round-7 fix: replay as a CANONICAL SYNC_PUSH record-level CREATE,
+        // NOT as an HTTP POST replay. The cloud's POST /api/reservations is
+        // the CUSTOMER join-queue route — it 403s for AGENCY_OWNER
+        // ("Only customers can join queues") and its Zod schema requires
+        // agencyId (the local route derives it from the session), so every
+        // replayed HTTP row failed permanently (400/403) and locally-issued
+        // tickets NEVER reached the cloud. The canonical push applies the
+        // exact local record (same id, full data) role-agnostically via
+        // POST /api/sync/push — deterministic, idempotent, id-preserving.
+        await logDeterministicOutcome('Reservation', created.id, 'create', created, null, { tx })
+        return created
+      })
+
+      emitEvent('reservation:created', { agencyId, reservation })
+
+      return c.json({ success: true, data: reservation }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create reservation error:', error)
+      return c.json({ success: false, error: 'Failed to create reservation' }, 500)
+    }
+  })
+
+  // PUT /api/reservations/:id — update reservation details
+  app.put('/api/reservations/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const id = c.req.param('id')
+      const body = await c.req.json()
+
+      // Verify ownership
+      const existing = await db.reservation.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      // Only allow certain fields to be updated
+      const allowedFields = [
+        'serviceId', 'walkInCustomerName', // branchId removed — Reservation has no branchId field
+        'preferredTime', 'fixedTimeEnabled', 'estimatedWait',
+        'notes',
+      ]
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) {
+          updateData[field] = body[field]
+        }
+      }
+
+      if (Object.keys(updateData).length === 0) {
+        return c.json({ success: false, error: 'No valid fields to update' }, 400)
+      }
+
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: updateData,
+        })
+        // Part Q: outbox row is atomic with the business write.
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
+      })
+
+      emitEvent('reservation:updated', { agencyId, reservationId: id, ...updateData })
+
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Update reservation error:', error)
+      return c.json({ success: false, error: 'Failed to update reservation' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 9. QUEUE OPERATIONS (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/queue/active — waiting + called/serving
+  app.get('/api/queue/active', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const branchId = c.req.query('branchId')
+      const baseWhere = { agencyId }
+      // branchId filter removed — Reservation has no branchId field
+
+      const [waiting, called] = await Promise.all([
+        db.reservation.findMany({
+          where: { ...baseWhere, status: 'WAITING' },
+          orderBy: { joinedAt: 'asc' },
+        }),
+        db.reservation.findMany({
+          where: { ...baseWhere, status: { in: ['CALLED', 'SERVING'] } },
+          orderBy: { calledAt: 'asc' },
+        }),
+      ])
+
+      return c.json({
+        success: true,
+        data: {
+          waiting,
+          serving: called.filter((r) => r.status === 'SERVING'),
+          called: called.filter((r) => r.status === 'CALLED'),
+        },
+      })
+    } catch (error) {
+      console.error('[LocalAPI] Active queue error:', error)
+      return c.json({ success: false, error: 'Failed to load active queue' }, 500)
+    }
+  })
+
+  // GET /api/queue/today — all today's reservations
+  app.get('/api/queue/today', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const startMs = todayStartMs()
+      const endMs = todayEndMs()
+
+      const reservations = await db.reservation.findMany({
+        where: { agencyId, joinedAt: { gte: startMs, lte: endMs } },
+        orderBy: { joinedAt: 'desc' },
+      })
+
+      return c.json({ success: true, data: reservations, total: reservations.length })
+    } catch (error) {
+      console.error('[LocalAPI] Today queue error:', error)
+      return c.json({ success: false, error: 'Failed to load today queue' }, 500)
+    }
+  })
+
+  // Task 24 — local mirror of the cloud call-next selection rules
+  // (api/src/lib/queue-scheduler.ts): future-date tickets are never callable
+  // today, and fixed-time tickets wait until their preferred HH:MM.
+  function pickNextLocalCustomer(candidates, now) {
+    const pad = (n) => String(n).padStart(2, '0')
+    const todayStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+    const nowMinutes = now.getHours() * 60 + now.getMinutes()
+    const timePassed = (hhmm) => {
+      try {
+        const parts = String(hhmm).split(':').map(Number)
+        if (Number.isNaN(parts[0]) || Number.isNaN(parts[1])) return true
+        return parts[0] * 60 + parts[1] <= nowMinutes
+      } catch { return true }
+    }
+    return (candidates || []).find((r) => {
+      if (r.reservedDate && String(r.reservedDate).slice(0, 10) > todayStr) return false
+      if (r.preferredTime && r.fixedTimeEnabled && !timePassed(r.preferredTime)) return false
+      return true
+    }) || null
+  }
+
+  // POST /api/queue/call-next — call next customer
+  app.post('/api/queue/call-next', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const body = await c.req.json().catch(() => ({}))
+      const { serviceId, counterId, branchId } = body
+
+      // Task 37-d: queue actions need canManageQueue; a non-owner caller must
+      // operate from a counter they personally occupy (OCCUPY_COUNTER_FIRST).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+      const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
+      if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
+
+      // Task 24: parity with the CLOUD call-next — order by queueNumber ASC
+      // (Postpone Paradox fix), skip FUTURE-DATE tickets, and skip fixed-time
+      // tickets whose preferred time has not arrived yet.
+      const where = { agencyId, status: 'WAITING' }
+      if (serviceId) where.serviceId = serviceId
+      // branchId filter removed — Reservation has no branchId field
+
+      const candidates = await db.reservation.findMany({
+        where,
+        orderBy: { queueNumber: 'asc' },
+        take: 200,
+      })
+
+      const next = pickNextLocalCustomer(candidates, new Date())
+
+      if (!next) {
+        const anyWaiting = await db.reservation.findFirst({ where, orderBy: { queueNumber: 'asc' } })
+        if (!anyWaiting) {
+          return c.json({ success: false, error: 'No customers in queue' }, 404)
+        }
+        return c.json({
+          success: false,
+          error: 'All waiting reservations have preferred times in the future. No one to call yet.',
+          hasPreferredTimeOnly: true,
+        })
+      }
+
+      const now = new Date()
+
+      // P1-5 (Part Q): the CALLED flip, the serving-number advance and the
+      // outbox row commit as ONE transaction — a crash mid-call can never
+      // leave the ticket called locally while the cloud believes it WAITING.
+      const updated = await withOutboxTransaction(async (tx) => {
+        await tx.reservation.update({
+          where: { id: next.id },
+          data: {
+            status: 'CALLED',
+            calledAt: now,
+            // calledBy: removed — not a Reservation schema field
+            counterId: counterId || null,
+          },
+        })
+
+        // Update current serving number in queue settings
+        const qsTx = await tx.queueSettings.findFirst({ where: { agencyId } })
+        if (qsTx) {
+          await tx.queueSettings.update({
+            where: { id: qsTx.id },
+            data: { currentServingNumber: next.queueNumber },
+          })
+        }
+
+        const row = await tx.reservation.findUnique({ where: { id: next.id } })
+        await logDeterministicOutcome('Reservation', row && row.id, 'update', row, null, { tx })
+        return row
+      })
+
+      // Update positions of remaining waiting reservations
+      const remainingWaiting = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING' },
+        orderBy: { joinedAt: 'asc' },
+      })
+      // position reassignment loop removed — position is not a schema field
+
+      emitEvent('queue:called', { agencyId, reservation: updated })
+
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Call-next error:', error)
+      return c.json({ success: false, error: 'Failed to call next customer' }, 500)
+    }
+  })
+
+  // POST /api/queue/call/:id — call specific reservation
+  app.post('/api/queue/call/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const id = c.req.param('id')
+      const body = await c.req.json().catch(() => ({}))
+      const { counterId } = body
+
+      // Task 37-d: queue actions need canManageQueue + counter occupancy.
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+      const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
+      if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
+
+      const existing = await db.reservation.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      if (!['WAITING', 'CALLED'].includes(existing.status)) {
+        return c.json(
+          { success: false, error: `Cannot call a reservation with status: ${existing.status}` },
+          400,
+        )
+      }
+
+      const now = new Date()
+      const updated = await withOutboxTransaction(async (tx) => {
+        await tx.reservation.update({
+          where: { id },
+          data: {
+            status: 'CALLED',
+            calledAt: now,
+            // calledBy: removed — not a Reservation schema field
+            counterId: counterId || null,
+          },
+        })
+        const row = await tx.reservation.findUnique({ where: { id } })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
+      })
+
+      emitEvent('queue:called', { agencyId, reservation: updated })
+
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Call specific error:', error)
+      return c.json({ success: false, error: 'Failed to call reservation' }, 500)
+    }
+  })
+
+  // POST /api/queue/complete/:id
+  app.post('/api/queue/complete/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: queue actions need canManageQueue (owners bypass).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+
+      const id = c.req.param('id')
+
+      const existing = await db.reservation.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      const now = new Date()
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: {
+            status: 'COMPLETED',
+            completedAt: now,
+            // completedBy: removed — not a Reservation schema field
+          },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
+      })
+
+      // Update positions of remaining waiting
+      const remainingWaiting = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING' },
+        orderBy: { joinedAt: 'asc' },
+      })
+      // position reassignment loop removed — position is not a schema field
+
+      emitEvent('queue:completed', { agencyId, reservation })
+
+      return c.json({ success: true, data: reservation })
+    } catch (error) {
+      console.error('[LocalAPI] Complete error:', error)
+      return c.json({ success: false, error: 'Failed to complete reservation' }, 500)
+    }
+  })
+
+  // POST /api/queue/no-show/:id
+  app.post('/api/queue/no-show/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: queue actions need canManageQueue (owners bypass).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+
+      const id = c.req.param('id')
+
+      const existing = await db.reservation.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      const now = new Date()
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: {
+            status: 'NO_SHOW',
+            skippedAt: now,
+          },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
+      })
+
+      // Update positions
+      const remainingWaiting = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING' },
+        orderBy: { joinedAt: 'asc' },
+      })
+      // position reassignment loop removed — position is not a schema field
+
+      emitEvent('queue:no-show', { agencyId, reservation })
+
+      return c.json({ success: true, data: reservation })
+    } catch (error) {
+      console.error('[LocalAPI] No-show error:', error)
+      return c.json({ success: false, error: 'Failed to mark no-show' }, 500)
+    }
+  })
+
+  // POST /api/queue/cancel/:id
+  app.post('/api/queue/cancel/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: queue actions need canManageQueue (owners bypass).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+
+      const id = c.req.param('id')
+
+      const existing = await db.reservation.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      const now = new Date()
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: {
+            status: 'CANCELLED',
+            cancelledAt: now,
+            // cancelledBy: removed — not a Reservation schema field
+          },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
+      })
+
+      // Update positions
+      const remainingWaiting = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING' },
+        orderBy: { joinedAt: 'asc' },
+      })
+      // position reassignment loop removed — position is not a schema field
+
+      emitEvent('queue:cancelled', { agencyId, reservation })
+
+      return c.json({ success: true, data: reservation })
+    } catch (error) {
+      console.error('[LocalAPI] Cancel error:', error)
+      return c.json({ success: false, error: 'Failed to cancel reservation' }, 500)
+    }
+  })
+
+  // POST /api/queue/postpone/:id
+  app.post('/api/queue/postpone/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: queue actions need canManageQueue (owners bypass).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+
+      const id = c.req.param('id')
+
+      const existing = await db.reservation.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      if (!['WAITING', 'CALLED'].includes(existing.status)) {
+        return c.json(
+          { success: false, error: `Cannot postpone reservation with status: ${existing.status}` },
+          400,
+        )
+      }
+
+      // Task 24: mirror the CLOUD postpone semantics (api/src/routes/reservations.ts).
+      // The old local behavior set status:'POSTPONED' — a status the cloud never
+      // produces and every queue query filters out — so a postponed ticket
+      // VANISHED from the local waiting list, and positions were never shifted.
+      // Cloud semantics: status stays WAITING; the ticket swaps places with the
+      // Nth WAITING ticket behind it (atomic temp-negative + raw shift).
+      if (existing.status !== 'WAITING') {
+        return c.json({ success: false, error: 'Can only postpone a waiting reservation' }, 400)
+      }
+
+      const postponeBody = await c.req.json().catch(() => ({}))
+      const positions = Math.max(1, Math.min(10, Number(postponeBody && postponeBody.positions) || 1))
+
+      const laterReservations = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING', queueNumber: { gt: existing.queueNumber } },
+        orderBy: { queueNumber: 'asc' },
+        take: positions,
+      })
+      if (laterReservations.length === 0) {
+        return c.json({ success: false, error: 'No one to postpone behind' }, 400)
+      }
+      const targetQueueNumber = laterReservations[laterReservations.length - 1].queueNumber
+
+      const now = new Date()
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const tempQueueNumber = -existing.queueNumber
+        await tx.reservation.update({ where: { id }, data: { queueNumber: tempQueueNumber } })
+        await tx.$executeRaw`UPDATE "Reservation" SET "queueNumber" = "queueNumber" - 1 WHERE "agencyId" = ${agencyId} AND "status" = 'WAITING' AND "queueNumber" > ${existing.queueNumber} AND "queueNumber" <= ${targetQueueNumber}`
+        const row = await tx.reservation.update({
+          where: { id },
+          data: { queueNumber: targetQueueNumber, postponeCount: (existing.postponeCount || 0) + 1 },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
+      })
+
+      // Update positions
+      const remainingWaiting = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING' },
+        orderBy: { queueNumber: 'asc' },
+      })
+      // position reassignment loop removed — position is not a schema field
+
+      // Task 24: emit the event name the dashboard actually subscribes to
+      // (queue:position-changed, mirroring the cloud emit); keep the legacy
+      // queue:postponed as an alias for any older listeners.
+      emitEvent('queue:position-changed', { agencyId, reservationId: reservation.id, displayNumber: reservation.displayNumber, queueNumber: reservation.queueNumber, reservation })
+      emitEvent('queue:postponed', { agencyId, reservation })
+
+      return c.json({ success: true, data: reservation })
+    } catch (error) {
+      console.error('[LocalAPI] Postpone error:', error)
+      return c.json({ success: false, error: 'Failed to postpone reservation' }, 500)
+    }
+  })
+
+  // POST /api/queue/recall/:id — re-call a CALLED reservation
+  app.post('/api/queue/recall/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      // Task 37-d: queue actions need canManageQueue (owners bypass).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+
+      const id = c.req.param('id')
+
+      const existing = await db.reservation.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      if (existing.status !== 'CALLED') {
+        return c.json(
+          { success: false, error: 'Can only recall a CALLED reservation' },
+          400,
+        )
+      }
+
+      const now = new Date()
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const row = await tx.reservation.update({
+          where: { id },
+          data: {
+            calledAt: now,
+          },
+        })
+        await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+        return row
+      })
+
+      emitEvent('queue:recalled', { agencyId, reservation })
+
+      return c.json({ success: true, data: reservation })
+    } catch (error) {
+      console.error('[LocalAPI] Recall error:', error)
+      return c.json({ success: false, error: 'Failed to recall reservation' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 10. NOTIFICATIONS (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/notifications — list with pagination
+  app.get('/api/notifications', authMiddleware, async (c) => {
+    try {
+      const user = sessionUser
+      const { take, skip } = parsePagination(c)
+
+      const [notifications, total, unreadCount] = await Promise.all([
+        db.notification.findMany({
+          where: { userId: user.id },
+          orderBy: { createdAt: 'desc' },
+          take,
+          skip,
+        }),
+        db.notification.count({ where: { userId: user.id } }),
+        db.notification.count({ where: { userId: user.id, isRead: false } }),
+      ])
+
+      return c.json({ success: true, notifications, unreadCount })
+    } catch (error) {
+      console.error('[LocalAPI] List notifications error:', error)
+      return c.json({ success: false, error: 'Failed to list notifications' }, 500)
+    }
+  })
+
+  // POST /api/notifications/read-all — mark all as read
+  app.post('/api/notifications/read-all', authMiddleware, async (c) => {
+    try {
+      const user = sessionUser
+
+      // Part Q: read-state sweep + outbox row commit atomically.
+      // Logged with method PUT + the CLOUD path (cloud route is
+      // PUT /api/notifications/read-all) so the replay hits the live route.
+      await withOutboxTransaction(async (tx) => {
+        await tx.notification.updateMany({
+          where: { userId: user.id, isRead: false },
+          data: { isRead: true },
+        })
+        await logPendingMutation('PUT', '/api/notifications/read-all', {}, { success: true }, { tx })
+      })
+
+      emitEvent('notifications:read-all', { userId: user.id })
+
+      return c.json({ success: true, data: { message: 'All notifications marked as read' } })
+    } catch (error) {
+      console.error('[LocalAPI] Read-all notifications error:', error)
+      return c.json({ success: false, error: 'Failed to mark notifications as read' }, 500)
+    }
+  })
+
+  // PUT /api/notifications/:id — mark as read
+  // Also accepts PATCH for compatibility (some web clients use PATCH)
+  for (const method of ['put', 'patch']) {
+    app[method]('/api/notifications/:id', authMiddleware, async (c) => {
+      try {
+        const id = c.req.param('id')
+        const body = await c.req.json().catch(() => ({}))
+
+        const existing = await db.notification.findUnique({ where: { id } })
+        if (!existing || existing.userId !== sessionUser.id) {
+          return c.json({ success: false, error: 'Notification not found' }, 404)
+        }
+
+        const updateData = {}
+        if (body.isRead !== undefined) {
+          updateData.isRead = body.isRead ? true : false
+        }
+
+        // Part Q: read-state is a business mutation — write + deterministic
+        // outbox outcome atomically (this route previously had NO outbox at
+        // all: an offline mark-read never reached the cloud or other devices).
+        const updated = await withOutboxTransaction(async (tx) => {
+          const row = await tx.notification.update({
+            where: { id },
+            data: updateData,
+          })
+          await logDeterministicOutcome('Notification', id, 'update', row, null, { tx })
+          return row
+        })
+
+        return c.json({ success: true, data: updated })
+      } catch (error) {
+        console.error('[LocalAPI] Update notification error:', error)
+        return c.json({ success: false, error: 'Failed to update notification' }, 500)
+      }
+    })
+  }
+
+  // DELETE /api/notifications/:id — delete a notification
+  app.delete('/api/notifications/:id', authMiddleware, async (c) => {
+    try {
+      const id = c.req.param('id')
+      const existing = await db.notification.findUnique({ where: { id } })
+      if (!existing || existing.userId !== sessionUser.id) {
+        return c.json({ success: false, error: 'Notification not found' }, 404)
+      }
+      // Part Q: delete + deterministic outbox outcome atomically (previously
+      // NO outbox — an offline notification delete never reached the cloud).
+      await withOutboxTransaction(async (tx) => {
+        await tx.notification.delete({ where: { id } })
+        await logDeterministicOutcome('Notification', id, 'delete', {}, null, { tx })
+      })
+      return c.json({ success: true, data: { deleted: true } })
+    } catch (error) {
+      console.error('[LocalAPI] Delete notification error:', error)
+      return c.json({ success: false, error: 'Failed to delete notification' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 10b. SUPPORT TICKETS (auth required) — offline-first mirror of the cloud
+  // route apps/api/src/routes/support-tickets.ts. SupportTicket is
+  // agency-scoped in the sync registry (syncOrder 21), so admin replies /
+  // status changes flow back in via the incremental pull while locally
+  // created tickets reach the cloud through the outbox replay (the cloud
+  // POST route is idempotent on the `id` field).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // Cuid-v1-SHAPED id generator. The cloud create route validates the replayed
+  // id with z.string().cuid() (apps/api zod v4) — a plain randomUUID would 400
+  // every outbox replay. Shape: 'c' + base36 timestamp + pid + counter + hex —
+  // starts with 'c', ≥9 chars, no separators/hyphens (matches zod's CUID_RE);
+  // pid + counter + 4 random bytes keep it collision-safe per workstation.
+  let _supportTicketIdCounter = 0
+  function newSupportTicketId() {
+    _supportTicketIdCounter = (_supportTicketIdCounter + 1) % 1296
+    return 'c' + Date.now().toString(36) + process.pid.toString(36) +
+      _supportTicketIdCounter.toString(36) + randomBytes(4).toString('hex')
+  }
+
+  /** Cloud ticketDto mirror: ISO datetimes, trimmed user/agency includes;
+   *  undefined user/agency keys drop from the JSON exactly like the cloud. */
+  function serializeSupportTicket(t) {
+    const iso = (v) => (v == null ? null : (v instanceof Date ? v.toISOString() : new Date(v).toISOString()))
+    return {
+      id: t.id,
+      userId: t.userId,
+      agencyId: t.agencyId == null ? null : String(t.agencyId),
+      subject: t.subject,
+      category: t.category,
+      status: t.status,
+      priority: t.priority,
+      message: t.message,
+      reply: t.reply == null ? null : String(t.reply),
+      repliedAt: iso(t.repliedAt),
+      repliedBy: t.repliedBy == null ? null : String(t.repliedBy),
+      createdAt: iso(t.createdAt),
+      updatedAt: iso(t.updatedAt),
+      user: t.user ? { id: t.user.id, username: t.user.username, fullName: t.user.fullName, role: t.user.role } : undefined,
+      agency: t.agency ? { id: t.agency.id, name: t.agency.name, customCode: t.agency.customCode } : undefined,
+    }
+  }
+
+  // POST /api/support-tickets — create a ticket OFFLINE-FIRST (agency
+  // workstation). Cloud contract: POST /api/support-tickets, idempotent on the
+  // optional id (outbox replays carry the locally-generated id so cloud and
+  // local rows share identity). agencyId resolves from the SESSION agency via
+  // resolveSessionAgencyId (same ownership fallbacks as branches/staff) —
+  // cross-agency tagging is not allowed, mirroring the cloud.
+  app.post('/api/support-tickets', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Local database not ready' }, 503)
+
+      const body = await c.req.json().catch(() => ({}))
+      const subject = typeof body.subject === 'string' ? body.subject : ''
+      const message = typeof body.message === 'string' ? body.message : ''
+
+      // Minimal validation mirroring the cloud zod schema.
+      if (subject.trim().length < 3 || subject.length > 150) {
+        return c.json({ success: false, error: 'Subject is required (min 3 chars, max 150)' }, 400)
+      }
+      if (message.length < 1 || message.length > 5000) {
+        return c.json({ success: false, error: 'Message is required (max 5000 chars)' }, 400)
+      }
+      const category = body.category == null || body.category === '' ? 'QUESTION' : body.category
+      if (['COMPLAINT', 'SUGGESTION', 'QUESTION', 'NOTE'].indexOf(category) === -1) {
+        return c.json({ success: false, error: 'Invalid category' }, 400)
+      }
+      const priority = body.priority == null || body.priority === '' ? 'NORMAL' : body.priority
+      if (['LOW', 'NORMAL', 'HIGH'].indexOf(priority) === -1) {
+        return c.json({ success: false, error: 'Invalid priority' }, 400)
+      }
+
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId') || body.agencyId)
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const id = newSupportTicketId()
+      const created = await withOutboxTransaction(async (tx) => {
+        const row = await tx.supportTicket.create({
+          data: {
+            id,
+            userId: sessionUser.id,
+            agencyId,
+            subject,
+            category,
+            status: 'OPEN',
+            priority,
+            message,
+          },
+        })
+        // Part Q: the outbox row commits ATOMICALLY with the ticket. The body
+        // carries the local id — the cloud route returns the existing record
+        // (200, replayed:true) when it already knows it. AWAITED inside the tx
+        // (a floating logPendingMutation caused a real P2028 bug here before).
+        await logPendingMutation('POST', '/api/support-tickets', { id, subject, category, message, priority }, row, { tx })
+        return row
+      })
+
+      console.log('[LocalAPI] support ticket created: id=' + created.id + ' category=' + created.category)
+
+      // Re-read with the cloud's include shape so the response matches the
+      // cloud ticketDto exactly (the frontend works against either API).
+      const full = await db.supportTicket.findUnique({
+        where: { id: created.id },
+        include: {
+          user: { select: { id: true, username: true, fullName: true, role: true } },
+          agency: { select: { id: true, name: true, customCode: true } },
+        },
+      })
+      return c.json({ success: true, ticket: serializeSupportTicket(full || created) }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create support ticket error:', error)
+      return c.json({ success: false, error: 'Failed to create support ticket' }, 500)
+    }
+  })
+
+  // GET /api/support-tickets/agency — the caller's agency tickets
+  // (owner/staff). Cloud-parity: orderBy createdAt desc, take 100, user +
+  // agency includes, openCount counts OPEN + IN_PROGRESS.
+  app.get('/api/support-tickets/agency', authMiddleware, async (c) => {
+    try {
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const statusFilter = c.req.query('status')
+      const where = { agencyId }
+      if (statusFilter) where.status = statusFilter
+
+      const tickets = await db.supportTicket.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+        include: {
+          user: { select: { id: true, username: true, fullName: true, role: true } },
+          agency: { select: { id: true, name: true, customCode: true } },
+        },
+      })
+      const openCount = await db.supportTicket.count({
+        where: { agencyId, status: { in: ['OPEN', 'IN_PROGRESS'] } },
+      })
+
+      console.log('[SyncDiag] support tickets agency read: agencyId=' + agencyId + ' rows=' + tickets.length)
+      return c.json({ success: true, tickets: tickets.map(serializeSupportTicket), openCount })
+    } catch (error) {
+      console.error('[LocalAPI] List agency support tickets error:', error)
+      return c.json({ success: false, error: 'Failed to list support tickets' }, 500)
+    }
+  })
+
+  // GET /api/support-tickets/mine — the caller's own tickets (cloud parity:
+  // no user/agency include, optional ?status= filter, openCount by user).
+  app.get('/api/support-tickets/mine', authMiddleware, async (c) => {
+    try {
+      const statusFilter = c.req.query('status')
+      const where = { userId: sessionUser.id }
+      if (statusFilter) where.status = statusFilter
+
+      const tickets = await db.supportTicket.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+      })
+      const openCount = await db.supportTicket.count({
+        where: { userId: sessionUser.id, status: { in: ['OPEN', 'IN_PROGRESS'] } },
+      })
+
+      return c.json({ success: true, tickets: tickets.map(serializeSupportTicket), openCount })
+    } catch (error) {
+      console.error('[LocalAPI] List my support tickets error:', error)
+      return c.json({ success: false, error: 'Failed to list support tickets' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 11. USER PROFILE (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/user/profile
+  app.get('/api/user/profile', authMiddleware, async (c) => {
+    try {
+      const user = sessionUser
+      const fullUser = await db.user.findUnique({ where: { id: user.id } })
+      if (!fullUser) {
+        return c.json({ success: false, error: 'User not found' }, 404)
+      }
+
+      // Remove passwordHash from response
+      const { passwordHash, ...safeUser } = fullUser
+      // Round 15 — serve the local copy of the avatar when we have one.
+      safeUser.avatarUrl = await localizeFileUrl(safeUser.avatarUrl)
+
+      return c.json({ success: true, data: safeUser })
+    } catch (error) {
+      console.error('[LocalAPI] User profile error:', error)
+      return c.json({ success: false, error: 'Failed to load user profile' }, 500)
+    }
+  })
+
+  // PUT /api/user/profile — update name, language, avatar
+  app.put('/api/user/profile', authMiddleware, async (c) => {
+    try {
+      const user = sessionUser
+      const body = await c.req.json()
+
+      const allowedFields = ['fullName', 'language', 'avatarUrl']
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) {
+          updateData[field] = body[field]
+        }
+      }
+
+      if (Object.keys(updateData).length === 0) {
+        return c.json({ success: false, error: 'No valid fields to update' }, 400)
+      }
+
+      // Part Q: business write + outbox row commit atomically. Session-user
+      // mirroring stays outside the tx — it touches no database rows.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.user.update({
+          where: { id: user.id },
+          data: updateData,
+        })
+        const { passwordHash: _omit, ...safeRow } = row
+        await logPendingMutation('PUT', '/api/user/profile', body, safeRow, { tx })
+        return row
+      })
+
+      // Update session user if name/language/avatar changed
+      if (updateData.fullName) sessionUser.fullName = updateData.fullName
+      if (updateData.language) sessionUser.language = updateData.language
+      if (updateData.avatarUrl !== undefined) sessionUser.avatarUrl = updateData.avatarUrl
+
+      const { passwordHash, ...safeUser } = updated
+
+      emitEvent('user:updated', { userId: user.id, ...updateData })
+
+      return c.json({ success: true, data: safeUser })
+    } catch (error) {
+      console.error('[LocalAPI] Update user profile error:', error)
+      return c.json({ success: false, error: 'Failed to update user profile' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 12. SETTINGS (auth required)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/settings — MUST match the cloud contract exactly
+  // (apps/api/src/routes/agency.ts GET /settings): a FLAT object with
+  // services + working hours + queue knobs. The old local shape wrapped a
+  // bare QueueSettings row in { success, data } with NO services and NO
+  // working hours, so the desktop settings page rendered empty even when
+  // the data existed locally.
+  app.get('/api/agency/settings', authMiddleware, async (c) => {
+    try {
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId },
+        include: {
+          services: {
+            where: { isActive: true },
+            select: { id: true, name: true, nameAr: true, nameFr: true, prefix: true },
+          },
+          queueSettings: true,
+        },
+      })
+
+      if (!agency) {
+        // Agency not pulled yet — same defaults the cloud returns for an
+        // unknown agency (never 500, never an empty wrapped row).
+        return c.json({
+          success: true,
+          _partial: true,
+          _reason: 'Agency not yet synced to local database',
+          avgServiceTime: 10,
+          maxReservations: 50,
+          isQueueOpen: true,
+          services: [],
+          workingHoursStart: '08:00',
+          workingHoursEnd: '17:00',
+          autoPauseWhenFull: false,
+          kioskModeEnabled: false,
+          sponsorSms: false,
+          smsBalance: 0,
+        })
+      }
+
+      const qs = agency.queueSettings
+      const settings = {
+        avgServiceTime: agency.averageServiceTime ?? qs?.avgServiceTime ?? 10,
+        maxReservations: agency.maxActiveReservations ?? 50,
+        isQueueOpen: agency.isQueueOpen ?? true,
+        services: agency.services,
+        workingHoursStart: agency.workingHoursStart ?? '08:00',
+        workingHoursEnd: agency.workingHoursEnd ?? '17:00',
+        autoPauseWhenFull: agency.autoPauseWhenFull ?? false,
+        kioskModeEnabled: agency.kioskModeEnabled ?? false,
+        sponsorSms: agency.sponsorSms ?? false,
+        smsBalance: agency.smsBalance ?? 0,
+        // Local queue runtime state (superset — other local consumers +
+        // the queue UI read these from the same endpoint)
+        workingDays: agency.workingDays || '1,2,3,4,5',
+        lastIssuedNumber: qs?.lastIssuedNumber ?? 0,
+        currentServingNumber: qs?.currentServingNumber ?? 0,
+        isPaused: qs?.isPaused ?? false,
+        maxDailyTickets: qs?.maxDailyTickets ?? 500,
+      }
+      // Flat (cloud contract) + legacy { success, data } envelope so older
+      // local consumers keep working.
+      return c.json({ success: true, data: settings, ...settings })
+    } catch (error) {
+      console.error('[LocalAPI] Queue settings error:', error)
+      return c.json({ success: false, error: 'Failed to load queue settings', detail: error?.message || String(error) }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 13. FRONTEND ROUTE ALIASES (/api/agency/* paths)
+  //    The frontend (page.tsx, dashboard, fullscreen) calls /api/agency/queue,
+  //    /api/agency/stats, /api/agency/services etc. These are aliases that
+  //    delegate to the existing routes above, keeping the response format
+  //    compatible with the cloud API so the frontend works offline.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/queue?status=WAITING,CALLED — active queue entries
+  app.get('/api/agency/queue', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated' }, 403)
+      }
+
+      const statusParam = c.req.query('status') || 'WAITING,CALLED'
+      const statuses = statusParam.split(',').map(s => s.trim())
+      const where = { agencyId }
+      if (statuses.length === 1) {
+        where.status = statuses[0]
+      } else {
+        where.status = { in: statuses }
+      }
+
+      const reservations = await db.reservation.findMany({
+        where,
+        orderBy: { joinedAt: statuses.includes('CALLED') ? 'desc' : 'asc' },
+      })
+
+      // Enrich with service/branch/counter data
+      const entries = []
+      for (const r of reservations) {
+        const service = r.serviceId ? await db.service.findUnique({ where: { id: r.serviceId } }).catch(() => null) : null
+        const user = r.userId ? await db.user.findUnique({ where: { id: r.userId } }).catch(() => null) : null
+        entries.push({
+          id: r.id,
+          queueNumber: r.displayNumber,
+          customerName: r.walkInCustomerName || null,
+          customerPhone: user?.phoneNumber || null,
+          customerAvatar: null,
+          serviceName: service ? service.name : null,
+          serviceNameAr: service?.nameAr || null,
+          serviceNameFr: service?.nameFr || null,
+          joinedAt: r.joinedAt instanceof Date ? r.joinedAt.toISOString() : String(r.joinedAt),
+          status: r.status,
+          position: r.status === 'WAITING' ? (entries.length - entries.filter((e) => e.status === 'WAITING').length + 1) : 0,
+          isWalkIn: r.isWalkIn || false,
+          walkInCustomerName: r.walkInCustomerName || null,
+          importToken: null,
+          preferredTime: r.preferredTime || null,
+          fixedTimeEnabled: r.fixedTimeEnabled || false,
+          postponeCount: r.postponeCount || 0,
+        })
+      }
+
+      return c.json({ entries })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/queue error:', error)
+      return c.json({ success: false, error: 'Failed to load queue', detail: error?.message || String(error) }, 500)
+    }
+  })
+
+  // PATCH /api/agency/queue/:id — complete / no_show / cancel
+  app.patch('/api/agency/queue/:id', authMiddleware, async (c) => {
+    try {
+      const reservationId = c.req.param('id')
+      const body = await c.req.json().catch(() => ({}))
+      const { action } = body
+
+      if (!['complete', 'no_show', 'cancel', 'serve', 'recall'].includes(action)) {
+        return c.json({ success: false, error: 'Invalid action' }, 400)
+      }
+
+      const reservation = await db.reservation.findUnique({ where: { id: reservationId } })
+      if (!reservation) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      const updateData = {}
+      const now = new Date()
+      if (action === 'complete') {
+        updateData.status = 'COMPLETED'
+        updateData.completedAt = now
+      } else if (action === 'no_show') {
+        updateData.status = 'NO_SHOW'
+        updateData.skippedAt = now
+      } else if (action === 'cancel') {
+        updateData.status = 'CANCELLED'
+        updateData.cancelledAt = now
+      } else if (action === 'serve') {
+        updateData.status = 'SERVING'
+      } else if (action === 'recall') {
+        updateData.status = 'CALLED'
+      }
+
+      const updatedReservation = await withOutboxTransaction(async (tx) => {
+        await tx.reservation.update({ where: { id: reservationId }, data: updateData })
+        // Part Q: outcome row is atomic with the state flip. The logged
+        // outcome merges the pre-read with the intended delta (deterministic
+        // desired-state replay per Part V).
+        await logDeterministicOutcome('Reservation', reservationId, 'update', { ...reservation, ...updateData }, null, { tx })
+        return { ...reservation, ...updateData }
+      })
+
+      // Task 75: the payload MUST carry agencyId — broadcastLocalRealtime
+      // routes queue:* events by data.agencyId, and without it the event was
+      // silently dropped (no live update anywhere).
+      emitEvent('queue:updated', { agencyId: updatedReservation.agencyId, reservationId, action, reservation: updatedReservation, ...updateData })
+      return c.json({ success: true, reservation: updatedReservation })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/queue/:id PATCH error:', error)
+      return c.json({ success: false, error: 'Failed to update reservation' }, 500)
+    }
+  })
+
+  // GET /api/agency/stats — queue statistics
+  app.get('/api/agency/stats', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated' }, 403)
+      }
+
+      const startMs = todayStartMs()
+      const endMs = todayEndMs()
+
+      const agency = await db.agency.findUnique({ where: { id: agencyId } }).catch(() => null)
+      const branchRows = await db.branch.findMany({ where: { agencyId }, select: { id: true } }).catch(() => [])
+      const branchIds = branchRows.map((b) => b.id)
+
+      const [waiting, called, serving, completed, cancelled, noShow, total, activeCounters, walkInCount, onlineReservationCount] = await Promise.all([
+        db.reservation.count({ where: { agencyId, status: 'WAITING' } }),
+        db.reservation.count({ where: { agencyId, status: 'CALLED' } }),
+        db.reservation.count({ where: { agencyId, status: 'SERVING' } }),
+        db.reservation.count({ where: { agencyId, status: 'COMPLETED', completedAt: { gte: startMs, lte: endMs } } }),
+        db.reservation.count({ where: { agencyId, status: 'CANCELLED', cancelledAt: { gte: startMs, lte: endMs } } }),
+        db.reservation.count({ where: { agencyId, status: 'NO_SHOW', skippedAt: { gte: startMs, lte: endMs } } }),
+        db.reservation.count({ where: { agencyId, joinedAt: { gte: startMs, lte: endMs } } }),
+        branchIds.length > 0
+          ? db.counter.count({ where: { branchId: { in: branchIds }, isActive: true } })
+          : Promise.resolve(0),
+        db.reservation.count({ where: { agencyId, isWalkIn: true, joinedAt: { gte: startMs, lte: endMs } } }),
+        db.reservation.count({ where: { agencyId, isWalkIn: false, userId: { not: null }, joinedAt: { gte: startMs, lte: endMs } } }),
+      ])
+
+      // Queue settings (paused state)
+      const queueSettings = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      const isPaused = queueSettings ? queueSettings.isPaused === 1 || queueSettings.isPaused === true : false
+
+      const result = {
+        todayReservations: total,
+        currentlyWaiting: waiting,
+        servedToday: completed,
+        noShowCount: noShow,
+        cancelledCount: cancelled,
+        avgWaitTime: agency?.averageServiceTime || 10,
+        currentQueueNumber: queueSettings?.currentServingNumber ? String(queueSettings.currentServingNumber) : '—',
+        isPaused,
+        peakHour: '—',
+        avgRating: 0,
+        totalRatings: 0,
+        completionRate: 0,
+        noShowRate: 0,
+        hourlyWaitTime: new Array(24).fill(0),
+        ratingDistribution: new Array(5).fill(0),
+        subscriptionStatus: agency?.subscriptionStatus
+          || 'ACTIVE',  // Default to ACTIVE in offline mode if not set
+        estimatedWaitRange: { minMinutes: 0, maxMinutes: 0, confidence: 'LOW' },
+        activeCounters,
+        walkInCount,
+        onlineReservationCount,
+      }
+      return c.json(result)
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/stats error:', error)
+      return c.json({ success: false, error: 'Failed to load stats', detail: error?.message || String(error) }, 500)
+    }
+  })
+
+  // GET /api/agency/services — list services (alias for /api/services)
+  app.get('/api/agency/services', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated' }, 403)
+      }
+      const services = await db.service.findMany({
+        where: { agencyId, isActive: true },
+        orderBy: { name: 'asc' },
+      })
+      return c.json({ services })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/services error:', error)
+      return c.json({ success: false, error: 'Failed to load services', detail: error?.message || String(error) }, 500)
+    }
+  })
+
+  // POST /api/agency/services — create service (alias for /api/services)
+  app.post('/api/agency/services', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      // Task 37-d: service management needs canManageServices (owners bypass).
+      const permGate = await checkAgencyPermission(undefined, 'canManageServices')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      const body = await c.req.json()
+      const { name, nameAr, nameFr, prefix } = body
+      if (!name) return c.json({ success: false, error: 'Service name is required' }, 400)
+      // Part Q: business write + outbox row commit atomically.
+      const service = await withOutboxTransaction(async (tx) => {
+        const created = await tx.service.create({
+          data: {
+            agencyId,
+            name,
+            nameAr: nameAr || null,
+            nameFr: nameFr || null,
+            // Task 37-a: Service has NO averageServiceTime column (it lives on
+            // Agency — schema.prisma) — including it here threw a
+            // PrismaClientValidationError and 500'd EVERY service add.
+            // prefix is NOT NULL (String @default("A")) — an explicit null
+            // would throw the same way, so fall back to '' instead.
+            prefix: prefix || '',
+            isActive: true,
+          },
+        })
+        // Canonical replay (round-7): id-preserving record-level create.
+        await logDeterministicOutcome('Service', created.id, 'create', created, null, { tx })
+        return created
+      })
+      emitEvent('service:created', { agencyId, service })
+      return c.json({ success: true, data: service }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create service error:', error)
+      return c.json({ success: false, error: 'Failed to create service' }, 500)
+    }
+  })
+
+  // GET /api/agency/activity — recent activity events (for dashboard feed)
+  app.get('/api/agency/activity', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated' }, 403)
+      }
+      // Fetch recent reservations with status changes as activity events
+      const recent = await db.reservation.findMany({
+        where: { agencyId },
+        orderBy: { joinedAt: 'desc' },
+        take: 10,
+      })
+      // Build service lookup map
+      const servicesIds = new Set()
+      for (const r of recent) {
+        if (r.serviceId) servicesIds.add(r.serviceId)
+      }
+      const serviceList = servicesIds.size > 0 ? await db.service.findMany({ where: { id: { in: [...servicesIds] } } }).catch(() => []) : []
+      const serviceMap = new Map(serviceList.map((s) => [s.id, s]))
+      const events = recent.map((r) => ({
+        id: r.id,
+        eventType: r.status === 'COMPLETED' ? 'completed' : r.status === 'CANCELLED' ? 'cancelled' : r.status === 'NO_SHOW' ? 'no_show' : r.status === 'CALLED' ? 'called' : 'joined',
+        eventKey: r.status === 'COMPLETED' ? 'customerCompletedService' : r.status === 'CANCELLED' ? 'customerCancelledRes' : r.status === 'NO_SHOW' ? 'customerNoShow' : r.status === 'CALLED' ? 'customerWasCalled' : 'customerJoinedQueue',
+        customerName: r.walkInCustomerName || 'Walk-in',
+        queueNumber: r.displayNumber || String(r.queueNumber),
+        timestamp: r.joinedAt instanceof Date ? r.joinedAt.toISOString() : String(r.joinedAt),
+        serviceName: serviceMap.get(r.serviceId)?.name || null,
+      }))
+      return c.json({ success: true, events })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/activity error:', error)
+      return c.json({ success: false, error: 'Failed to load activity', detail: error?.message || String(error) }, 500)
+    }
+  })
+
+  // POST /api/queue/pause — explicit pause (used by SimpleMobileDashboard)
+  app.post('/api/queue/pause', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      // Task 37-d: queue actions need canManageQueue (owners bypass).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+      const existing = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      // Part V: replayed as the DESIRED STATE (isPaused=true), not an action.
+      // Part Q: state change + outbox row commit atomically.
+      const qsOutcome = await withOutboxTransaction(async (tx) => {
+        let row = null
+        if (existing) {
+          row = await tx.queueSettings.update({ where: { id: existing.id }, data: { isPaused: true, pausedAt: new Date() } })
+        } else {
+          row = await tx.queueSettings.create({ data: { agencyId, isPaused: true, pausedAt: new Date() } })
+        }
+        await logDeterministicOutcome('QueueSettings', row && row.id, 'update', row, null, { tx })
+        return row
+      })
+      // Task 75: EMPTY payload meant the router dropped the event (no
+      // agencyId) — dashboards never saw pause state change live.
+      emitEvent('queue:paused', { agencyId, action: 'pause' })
+      return c.json({ success: true, isPaused: true })
+    } catch (error) {
+      console.error('[LocalAPI] /api/queue/pause error:', error)
+      return c.json({ success: false, error: 'Failed to pause' }, 500)
+    }
+  })
+
+  // POST /api/queue/resume — explicit resume (used by SimpleMobileDashboard)
+  app.post('/api/queue/resume', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      // Task 37-d: queue actions need canManageQueue (owners bypass).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+      const existing = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      // Part V: replayed as the DESIRED STATE (isPaused=false), not an action.
+      // Part Q: state change + outbox row commit atomically.
+      let qsOutcome = null
+      if (existing) {
+        qsOutcome = await withOutboxTransaction(async (tx) => {
+          const row = await tx.queueSettings.update({ where: { id: existing.id }, data: { isPaused: false, pausedAt: null } })
+          await logDeterministicOutcome('QueueSettings', row && row.id, 'update', row, null, { tx })
+          return row
+        })
+      }
+      // Task 75: EMPTY payload meant the router dropped the event (no
+      // agencyId) — dashboards never saw resume state change live.
+      emitEvent('queue:resumed', { agencyId, action: 'resume' })
+      return c.json({ success: true, isPaused: false })
+    } catch (error) {
+      console.error('[LocalAPI] /api/queue/resume error:', error)
+      return c.json({ success: false, error: 'Failed to resume' }, 500)
+    }
+  })
+
+  // POST /api/agency/queue/toggle-pause
+  app.post('/api/agency/queue/toggle-pause', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated' }, 403)
+      }
+      // Task 37-d: queue actions need canManageQueue (owners bypass).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+      const existing = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      const currentPaused = existing ? (existing.isPaused === 1 || existing.isPaused === true) : false
+      const now = new Date()
+      // Part V: the replayed mutation expresses the DESIRED STATE (paused=true/false),
+      // never a toggle instruction whose effect depends on remote state.
+      // Part Q: state change + outbox row commit atomically.
+      const qsOutcome = await withOutboxTransaction(async (tx) => {
+        let row = null
+        if (existing) {
+          row = await tx.queueSettings.update({
+            where: { id: existing.id },
+            data: { isPaused: !currentPaused, pausedAt: !currentPaused ? now : null },
+          })
+        } else {
+          row = await tx.queueSettings.create({
+            data: { agencyId, isPaused: true, pausedAt: now },
+          })
+        }
+        await logDeterministicOutcome('QueueSettings', row && row.id, 'update', row, null, { tx })
+        return row
+      })
+      emitEvent('queue:pause-toggled', { agencyId, isPaused: !currentPaused })
+      return c.json({ success: true, isPaused: !currentPaused })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/queue/toggle-pause error:', error)
+      return c.json({ success: false, error: 'Failed to toggle pause' }, 500)
+    }
+  })
+
+  // POST /api/agency/queue/walk-in — create walk-in reservation
+  app.post('/api/agency/queue/walk-in', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated' }, 403)
+      }
+      const body = await c.req.json().catch(() => ({}))
+      const { customerName, serviceId, phone } = body
+      if (!serviceId || !customerName) {
+        return c.json({ success: false, error: 'Service and name are required' }, 400)
+      }
+
+      // Task 37-d: open/paused/full gates (mirror of the cloud walk-in path).
+      const issuanceGate = await checkQueueIssuanceGates(agencyId)
+      if (issuanceGate) return c.json(issuanceGate.body, issuanceGate.status)
+
+      // Get next queue number. Task 37-d fix: Reservation.queueNumber is an
+      // INT column and `customerName` does not exist on the model — the old
+      // prefixed-string + unknown-field create was a guaranteed
+      // PrismaClientValidationError 500 on every walk-in. Numbering now uses
+      // the same source as POST /api/reservations (queueSettings.lastIssuedNumber).
+      const service = await db.service.findUnique({ where: { id: serviceId } })
+      if (!service || service.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Service not found' }, 404)
+      }
+      const now = new Date()
+      const qsWalkIn = await db.queueSettings.findFirst({ where: { agencyId } })
+      const newWalkInNumber = (qsWalkIn?.lastIssuedNumber || 0) + 1
+      const displayNumber = `${service.prefix || 'A'}${String(newWalkInNumber).padStart(3, '0')}`
+
+      const reservation = await withOutboxTransaction(async (tx) => {
+        const created = await tx.reservation.create({
+          data: {
+            id: require('crypto').randomUUID(),
+            agencyId,
+            serviceId,
+            userId: sessionUser.id,
+            queueNumber: newWalkInNumber,
+            displayNumber,
+            status: 'WAITING',
+            walkInCustomerName: customerName,
+            isWalkIn: true,
+            joinedAt: now,
+            estimatedWait: 0,
+          },
+        })
+        // Keep the global issued-number cursor in lockstep (same transaction).
+        if (qsWalkIn) {
+          await tx.queueSettings.update({ where: { id: qsWalkIn.id }, data: { lastIssuedNumber: newWalkInNumber } })
+        } else {
+          await tx.queueSettings.create({
+            data: { agencyId, lastIssuedNumber: newWalkInNumber, currentServingNumber: 0, isPaused: false },
+          })
+        }
+        // Part Q: the outbox row commits ATOMICALLY with the walk-in ticket.
+        // Canonical replay (round-7): the cloud POST route is customer-only
+        // (403 for owners) — replay as a record-level create like /api/reservations.
+        await logDeterministicOutcome('Reservation', created.id, 'create', created, null, { tx })
+        return created
+      })
+
+      // Task 75: the payload MUST carry agencyId — the router routes queue:*
+      // by data.agencyId and silently dropped this event before, so a staff
+      // walk-in never appeared live on other views.
+      emitEvent('queue:walk-in', { agencyId, reservation })
+      return c.json({ success: true, reservation })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/queue/walk-in error:', error)
+      return c.json({ success: false, error: 'Failed to create walk-in' }, 500)
+    }
+  })
+
+  // GET /api/agency/announcements — list announcements
+  app.get('/api/agency/announcements', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      // Round 16: a session without an agency used to feed Prisma
+      // agencyId: null → validation error → 500. An empty list is the
+      // honest pre-wizard answer.
+      if (!agencyId) {
+        return c.json({ announcements: [] })
+      }
+      const announcements = await db.announcement.findMany({
+        where: { agencyId, isActive: true },
+        orderBy: { createdAt: 'desc' },
+        take: 10,
+      })
+      return c.json({ announcements })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/announcements error:', error)
+      return c.json({ success: false, error: 'Failed to load announcements' }, 500)
+    }
+  })
+
+  // POST /api/agency/announcements — create announcement
+  app.post('/api/agency/announcements', authMiddleware, async (c) => {
+    return c.json({ success: true, message: 'Announcement created (offline)' })
+  })
+
+  // DELETE /api/agency/announcements?id= — delete announcement
+  app.delete('/api/agency/announcements', authMiddleware, async (c) => {
+    return c.json({ success: true })
+  })
+
+  // GET /api/agency/analytics — service analytics
+  app.get('/api/agency/analytics', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated' }, 403)
+      }
+      const startMs = todayStartMs()
+      const endMs = todayEndMs()
+      const services = await db.service.findMany({ where: { agencyId, isActive: true } })
+      const result = services.map(async (s) => {
+        const completed = await db.reservation.count({
+          where: { agencyId, serviceId: s.id, status: 'COMPLETED', completedAt: { gte: startMs, lte: endMs } },
+        })
+        return { serviceId: s.id, name: s.name, prefix: s.prefix, served: completed }
+      })
+      return c.json({ success: true, services: await Promise.all(result) })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/analytics error:', error)
+      return c.json({ success: false, error: 'Failed to load analytics' }, 500)
+    }
+  })
+
+  // GET /api/agency/history — reservation history
+  // Matches the cloud API response format expected by AgencyHistorySheet:
+  //   { reservations: [...], total: N, page: N, limit: N, totalPages: N }
+  app.get('/api/agency/history', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated' }, 403)
+      }
+      const status = c.req.query('status')
+      const search = c.req.query('search')
+      const page = parseInt(c.req.query('page') || '1', 10)
+      const limit = parseInt(c.req.query('limit') || '20', 10)
+      const skip = (page - 1) * limit
+      const where = { agencyId }
+      if (status && status !== 'ALL') where.status = status
+      if (search) {
+        where.OR = [
+          { customerName: { contains: search } },
+          { walkInCustomerName: { contains: search } },
+          { displayNumber: { contains: search } },
+          { customerPhone: { contains: search } },
+        ]
+      }
+
+      const [reservations, total] = await Promise.all([
+        db.reservation.findMany({
+          where,
+          orderBy: { joinedAt: 'desc' },
+          take: limit,
+          skip,
+        }),
+        db.reservation.count({ where }),
+      ])
+      const totalPages = Math.max(1, Math.ceil(total / limit))
+      return c.json({
+        success: true,
+        reservations,
+        total,
+        page,
+        limit,
+        totalPages,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/history error:', error)
+      return c.json({ success: false, error: 'Failed to load history' }, 500)
+    }
+  })
+
+  // GET /api/agency/history/:id — single reservation detail (for history sheet detail view)
+  app.get('/api/agency/history/:id', authMiddleware, async (c) => {
+    try {
+      const reservationId = c.req.param('id')
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+
+      const reservation = await db.reservation.findUnique({
+        where: { id: reservationId },
+      })
+      if (!reservation || reservation.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+
+      // Enrich with service data
+      const service = reservation.serviceId
+        ? await db.service.findUnique({ where: { id: reservation.serviceId } }).catch(() => null)
+        : null
+      const user = reservation.userId
+        ? await db.user.findUnique({ where: { id: reservation.userId } }).catch(() => null)
+        : null
+
+      return c.json({
+        ...reservation,
+        serviceName: service?.name || null,
+        serviceNameAr: service?.nameAr || null,
+        serviceNameFr: service?.nameFr || null,
+        customerPhone: user?.phoneNumber || null,
+        customerName: user?.fullName || reservation.walkInCustomerName || null,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/history/:id error:', error)
+      return c.json({ success: false, error: 'Failed to load reservation' }, 500)
+    }
+  })
+
+  // GET /api/agency/subscription — subscription status from local Agency record
+  // Subscription data (tier, status, dates) is embedded in the Agency table and
+  // synced to local SQLite at login. Task 31-C (BUG 11): SubscriptionPlan +
+  // PlanFeature ARE synced locally (sync-registry syncOrder 2/3 — the old
+  // "NOT synced" comment was stale) and Transaction is synced APPEND_ONLY, so
+  // the plan catalog and recent payments are mirrored with the exact cloud
+  // queries (agency.ts GET /subscription) instead of hardcoded empty arrays.
+  // Payment/cancellation/unsubscribe actions still require cloud.
+  app.get('/api/agency/subscription', authMiddleware, async (c) => {
+    try {
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+
+      // Cloud parity (agency.ts:3393-3403): the active plan catalog is
+      // embedded in EVERY response — even when the session has no agency.
+      // Enterprise custom plans appear only for their owner agency.
+      let availablePlans = []
+      try {
+        availablePlans = await db.subscriptionPlan.findMany({
+          where: {
+            isActive: true,
+            OR: [
+              { isEnterprise: false },
+              ...(agencyId ? [{ isEnterprise: true, ownerAgencyId: agencyId }] : []),
+            ],
+          },
+          include: { features: true },
+          orderBy: { sortOrder: 'asc' },
+        })
+      } catch (planErr) {
+        console.warn('[LocalAPI] subscription plan catalog query failed:', planErr?.message || planErr)
+      }
+
+      // Cloud parity (agency.ts:3455-3469): last 10 payment transactions with
+      // the snapshot fields the subscription page renders.
+      let recentTransactions = []
+      if (agencyId) {
+        try {
+          const transactions = await db.transaction.findMany({
+            where: { agencyId },
+            orderBy: { createdAt: 'desc' },
+            take: 10,
+          })
+          recentTransactions = transactions.map((tx) => ({
+            id: tx.id,
+            amount: tx.amount,
+            amountPaid: tx.amountPaid ?? null,
+            planName: tx.planName ?? null,
+            plan: tx.plan,
+            method: tx.paymentMethod,
+            status: tx.status,
+            rejectionReason: tx.rejectionReason ?? null,
+            reviewedAt: tx.reviewedAt ? new Date(tx.reviewedAt).toISOString() : null,
+            createdAt: new Date(tx.createdAt).toISOString(),
+          }))
+        } catch (txErr) {
+          console.warn('[LocalAPI] recent transactions query failed:', txErr?.message || txErr)
+        }
+      }
+
+      if (!agencyId) {
+        return c.json({
+          // Task 32 (bug A companion): the built-in default tier is FREE, not
+          // BASIC — mirrors the cloud's currentPlan fallback (agency.ts:3479).
+          currentPlan: 'FREE',
+          status: 'INACTIVE',
+          subscriptionStartsAt: null,
+          subscriptionExpiresAt: null,
+          daysRemaining: null,
+          isExpired: false,
+          isExpiringSoon: false,
+          availablePlans,
+          recentTransactions,
+        })
+      }
+
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId },
+        select: {
+          subscriptionTier: true,
+          subscriptionStatus: true,
+          subscriptionStartsAt: true,
+          subscriptionExpiresAt: true,
+          subscriptionPlanId: true,
+        },
+      })
+
+      if (!agency) {
+        return c.json({
+          // Task 32 (bug A companion): FREE, not BASIC — cloud parity.
+          currentPlan: 'FREE',
+          status: 'INACTIVE',
+          subscriptionStartsAt: null,
+          subscriptionExpiresAt: null,
+          daysRemaining: null,
+          isExpired: false,
+          isExpiringSoon: false,
+          availablePlans,
+          recentTransactions,
+        })
+      }
+
+      // Task 32 (bug A companion) — local mirror of the cloud's one-time
+      // self-heal (agency.ts:3511-3522): a never-paid agency (no transactions,
+      // no linked SubscriptionPlan, INACTIVE) still carrying the legacy
+      // "BASIC" default tier is corrected to FREE locally too, so the desktop
+      // stops posing Basic as the built-in free tier. The update also syncs
+      // back up through the regular sync engine.
+      if (agency.subscriptionTier === 'BASIC' && agency.subscriptionStatus === 'INACTIVE' && !agency.subscriptionPlanId) {
+        try {
+          const paidTransactions = await db.transaction.count({ where: { agencyId } })
+          if (paidTransactions === 0) {
+            await db.agency.update({ where: { id: agencyId }, data: { subscriptionTier: 'FREE' } })
+            agency.subscriptionTier = 'FREE'
+          }
+        } catch (healErr) {
+          console.warn('[LocalAPI] subscription tier self-heal failed (non-fatal):', healErr?.message || healErr)
+        }
+      }
+
+      // Calculate expiry flags (mirrors cloud's checkSubscriptionExpiry logic)
+      const now = new Date()
+      const expiresAt = agency.subscriptionExpiresAt
+      let isExpired = false
+      let isExpiringSoon = false
+      let daysRemaining = null
+      let status = agency.subscriptionStatus
+
+      if (expiresAt) {
+        const diffMs = expiresAt.getTime() - now.getTime()
+        daysRemaining = Math.max(0, Math.ceil(diffMs / 86400000))
+        isExpired = diffMs <= 0
+        isExpiringSoon = !isExpired && daysRemaining <= 7
+        if (isExpired && status === 'ACTIVE') {
+          status = 'EXPIRED'
+        }
+      }
+
+      return c.json({
+        // Task 32 (bug A companion): the built-in default tier is FREE, not
+        // BASIC — mirrors the cloud (agency.ts:3531 uses the healed tier).
+        currentPlan: agency.subscriptionTier || 'FREE',
+        status,
+        subscriptionStartsAt: agency.subscriptionStartsAt?.toISOString() ?? null,
+        subscriptionExpiresAt: agency.subscriptionExpiresAt?.toISOString() ?? null,
+        daysRemaining,
+        isExpired,
+        isExpiringSoon,
+        availablePlans,
+        recentTransactions,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/subscription error:', error)
+      return c.json({ success: false, error: 'Failed to load subscription' }, 500)
+    }
+  })
+
+  // POST /api/agency/subscription/pay — cloud-forwarding proxy (Task 32, bug B).
+  //
+  // The desktop PaymentDialog (agency-subscription.tsx handleSubmitPayment)
+  // uploads the receipt to the LOCAL /api/upload (which returns a
+  // http://127.0.0.1:3080/api/upload/file/... URL), then POSTs multipart
+  // FormData here — but this route did not exist, so every desktop payment
+  // submission 404'd with the app's bare "not found". Payment submission is
+  // CLOUD-native: the cloud validates the plan, applies the period discount,
+  // creates the PENDING Transaction and flips the agency to
+  // subscriptionStatus PENDING (apps/api agency.ts POST /subscription/pay).
+  // Same proxy contract as the Task 31-C staff-create proxy: session Bearer
+  // forwarding, cloud status+body passthrough, 503 CLOUD_UNREACHABLE offline.
+  //
+  // Deliberately NO local Transaction write and NO logPendingMutation/outbox
+  // row — the cloud is authoritative and a replayed outbox row would
+  // duplicate-create the transaction. The cloud-created Transaction + the
+  // agency's PENDING state sync back down via the regular sync engine
+  // (kicked below on success).
+  app.post('/api/agency/subscription/pay', authMiddleware, async (c) => {
+    try {
+      // Task 37-d: paying needs canPurchaseSubscription (owner-limited
+      // manager authority; owners bypass). Checked before any body parsing.
+      const payGate = await checkAgencyPermission(undefined, 'canPurchaseSubscription')
+      if (!payGate.ok) return c.json(payGate.body, payGate.status)
+      // Parse the multipart form the UI sends. All fields are plain strings —
+      // NO file blob in this form (the receipt was already uploaded to
+      // /api/upload and is referenced by URL).
+      let form
+      try {
+        form = await c.req.formData()
+      } catch {
+        return c.json({ success: false, error: 'multipart/form-data body required' }, 400)
+      }
+      const fields = {}
+      for (const key of ['plan', 'method', 'receiptUrl', 'agencyId', 'period']) {
+        const value = form.get(key)
+        if (typeof value === 'string' && value.length > 0) fields[key] = value
+      }
+
+      // Task 32: BEFORE forwarding, force a file-sync pass so the receipt
+      // blob reaches the cloud first — the cloud rewrites the local receipt
+      // URL to a cloud URL preserving the /api/upload/file/<suffix> path
+      // byte-exact, so the normalized URL becomes valid as soon as the blob
+      // lands. syncNow() is the awaitable handle (schedule() merely defers
+      // to it after 300ms); hard-capped at ~8s via Promise.race so a slow
+      // sync can never stall the payment. Sync failure is NON-FATAL — never
+      // block the payment because sync failed.
+      try {
+        if (fileSync && typeof fileSync.syncNow === 'function') {
+          await Promise.race([
+            fileSync.syncNow('subscription-payment'),
+            new Promise((resolve) => setTimeout(resolve, 8000)),
+          ])
+        } else if (fileSync && typeof fileSync.schedule === 'function') {
+          // Fallback: background pass (the /api/upload route already
+          // scheduled one anyway — belt and braces).
+          fileSync.schedule('subscription-payment')
+        }
+      } catch (syncErr) {
+        console.warn('[LocalAPI] subscription/pay: pre-forward receipt file-sync failed (non-fatal):', syncErr?.message || syncErr)
+      }
+
+      // Rebuild the FormData from the parsed string fields — the original
+      // body stream is never forwarded raw.
+      const forwardForm = new FormData()
+      for (const [key, value] of Object.entries(fields)) forwardForm.append(key, value)
+
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/agency/subscription/pay', {
+          method: 'POST',
+          // NOTE: no manual Content-Type — fetch sets multipart/form-data
+          // with the correct boundary for the FormData body.
+          headers: {
+            // Same session token requireAuth() validated — the cloud
+            // enforces auth + resolves the agency from the session.
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: forwardForm,
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] Subscription-pay proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Submitting a subscription payment requires an internet connection. Please connect and try again.',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) {
+        // Kick a sync round so the cloud-created PENDING Transaction and the
+        // agency's PENDING subscription state pull down at once (regular
+        // sync engine — no local subscription writes here).
+        try { if (fileSync) fileSync.schedule('subscription-paid') } catch { /* non-fatal */ }
+        try {
+          // Lazy require — sync-service lazily requires ./index (circular dep).
+          const syncService = require('./sync-service')
+          if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+        } catch { /* non-fatal */ }
+      }
+      // Cloud status + body pass through verbatim ({ success, transaction } 200
+      // or a 4xx { error }).
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] Subscription-pay proxy error:', error)
+      return c.json({ success: false, error: 'Failed to submit subscription payment' }, 500)
+    }
+  })
+
+  // POST /api/agency/subscription/cancel — cloud-forwarding proxy (Task 33).
+  //
+  // The Active-Plan card's "Manage Subscription" → Cancel flow (agency-
+  // subscription.tsx handleCancelSubscription) POSTs this route; it did not
+  // exist locally, so EVERY desktop cancel 404'd with the bare "Not found"
+  // toast (the webapp's ApiClient in Electron is pinned to 127.0.0.1:3080).
+  // Cancellation is CLOUD-native (apps/api agency.ts POST /subscription/cancel):
+  // it flips subscriptionStatus to INACTIVE, nulls the start/expiry dates and
+  // keeps the tier for history. Same proxy contract as the /pay route above.
+  //
+  // After a 2xx we ALSO mirror the status change onto the LOCAL Agency row —
+  // the UI refetches GET /api/agency/subscription from the LOCAL API right
+  // after canceling, and without the local mirror it would keep showing
+  // ACTIVE until the next sync pull lands. No outbox row: the cloud is
+  // authoritative and its own sequence bump pulls the truth back down
+  // (triggerSyncNow below).
+  app.post('/api/agency/subscription/cancel', authMiddleware, async (c) => {
+    try {
+      // Task 37-d: subscription management needs canManageSubscription
+      // (owner-limited manager authority; owners bypass).
+      const cancelGate = await checkAgencyPermission(undefined, 'canManageSubscription')
+      if (!cancelGate.ok) return c.json(cancelGate.body, cancelGate.status)
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/agency/subscription/cancel', {
+          method: 'POST',
+          headers: {
+            // Same session token requireAuth() validated — the cloud enforces
+            // auth + resolves the agency from the session.
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] Subscription-cancel proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Canceling your subscription requires an internet connection. Please connect and try again.',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) {
+        // Local mirror so the immediate local refetch reflects the cancel.
+        try {
+          const agencyId = sessionUser?.agencyId
+          if (agencyId) {
+            await db.agency.update({
+              where: { id: agencyId },
+              data: {
+                subscriptionStatus: 'INACTIVE',
+                subscriptionStartsAt: null,
+                subscriptionExpiresAt: null,
+                // subscriptionTier intentionally kept — mirrors the cloud.
+              },
+            })
+          } else {
+            console.warn('[LocalAPI] subscription/cancel: no agencyId in session — local mirror skipped')
+          }
+        } catch (mirrorErr) {
+          console.warn('[LocalAPI] subscription/cancel: local mirror failed (non-fatal):', mirrorErr?.message || mirrorErr)
+        }
+        // Pull the cloud's authoritative state down immediately.
+        try { if (fileSync) fileSync.schedule('subscription-cancelled') } catch { /* non-fatal */ }
+        try {
+          const syncService = require('./sync-service')
+          if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+        } catch { /* non-fatal */ }
+      }
+      // Cloud status + body pass through verbatim ({ success: true } 200 or a
+      // 4xx { error }). Idempotent on the cloud: canceling an INACTIVE agency
+      // still returns success.
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] Subscription-cancel proxy error:', error)
+      return c.json({ success: false, error: 'Failed to cancel subscription' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 13c. TRANSACTIONS / HARDWARE / ENTERPRISE REQUEST (Task 2-d)
+  //
+  // Cloud-parity gap routes ported LOCAL-FIRST from apps/api/src/routes:
+  // transactions.ts L18-111 and agency.ts L5580-5867. Every handler scopes
+  // to the session agency (resolveSessionAgencyId / lookupLocalAgencyIdForUser
+  // — the local mirror of the cloud's resolveUserAgencyId). The desktop local
+  // API is agent-level by design: there is NO SUPER_ADMIN branch and the
+  // transaction-review endpoint (cloud transactions.ts PUT /:id/review,
+  // super-admin-only) is deliberately NOT ported.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/transactions — list (cloud transactions.ts GET '/' L62-111).
+  // ?status filters; ?limit (default 50, clamped 1..200 — the local
+  // parsePagination clamp) + ?offset page the result. Rows carry the same
+  // agency/reviewer select projections the cloud includes. Sessions without
+  // an agency get the cloud's empty envelope, never an error.
+  app.get('/api/transactions', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      const status = c.req.query('status')
+
+      const parsedLimit = parseInt(c.req.query('limit') || '50', 10)
+      const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 200) : 50
+      const parsedOffset = parseInt(c.req.query('offset') || '0', 10)
+      const offset = Number.isFinite(parsedOffset) ? Math.max(parsedOffset, 0) : 0
+
+      if (!agencyId) {
+        return c.json({ success: true, transactions: [], total: 0, limit, offset })
+      }
+
+      const where = { agencyId }
+      if (status) where.status = status
+
+      const [transactions, total] = await Promise.all([
+        db.transaction.findMany({
+          where,
+          include: {
+            agency: { select: { id: true, name: true, customCode: true, category: true, subscriptionTier: true, subscriptionStatus: true } },
+            reviewer: { select: { id: true, fullName: true, username: true } },
+          },
+          orderBy: { createdAt: 'desc' },
+          take: limit,
+          skip: offset,
+        }),
+        db.transaction.count({ where }),
+      ])
+
+      return c.json({ success: true, transactions, total, limit, offset })
+    } catch (error) {
+      console.error('[LocalAPI] /api/transactions error:', error)
+      return c.json({ success: false, error: 'Failed to list transactions' }, 500)
+    }
+  })
+
+  // POST /api/transactions — create a PENDING payment transaction
+  // (cloud transactions.ts POST '/' L18-59). Body validation mirrors the
+  // cloud's createTransactionSchema; the agency resolves LOCALLY — the
+  // session agency wins and a differing body.agencyId is a 403 (the local
+  // API has no SUPER_ADMIN bypass). planName/amountPaid are snapshotted from
+  // the local SubscriptionPlan catalog when the plan row exists (cloud
+  // parity), else they fall back to the request's plan/amount; the agency
+  // flips to subscriptionStatus PENDING like the cloud does.
+  //
+  // Local-first write with the file's Part-Q convention: the business writes
+  // and a canonical SYNC_PUSH outbox row commit ATOMICALLY, exactly like
+  // POST /api/reservations. The push is id-preserving (Transaction is
+  // APPEND_ONLY — create-only pushes are accepted by the cloud push engine),
+  // so the cloud learns the SAME transaction record. Deliberately NO HTTP
+  // POST replay / cloud /transactions forward — that WOULD double-create.
+  app.post('/api/transactions', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      const body = (await c.req.json().catch(() => ({}))) || {}
+      const bodyAgencyId = typeof body.agencyId === 'string' && body.agencyId.length > 0 ? body.agencyId : null
+      const { amount, plan, paymentMethod } = body
+      const receiptUrl = typeof body.receiptUrl === 'string' && body.receiptUrl.length > 0 ? body.receiptUrl : null
+
+      // Cloud createTransactionSchema messages (transactions.ts L9-15).
+      if (!bodyAgencyId) {
+        return c.json({ success: false, error: 'Agency ID is required' }, 400)
+      }
+      if (!Number.isInteger(amount) || amount <= 0) {
+        return c.json({ success: false, error: 'Amount must be a positive number' }, 400)
+      }
+      if (plan !== 'BASIC' && plan !== 'PREMIUM') {
+        return c.json({ success: false, error: 'Invalid plan. Must be BASIC or PREMIUM' }, 400)
+      }
+      if (!['CCP', 'BANK_TRANSFER', 'E_WALLET', 'CASH'].includes(paymentMethod)) {
+        return c.json({ success: false, error: 'Invalid payment method' }, 400)
+      }
+
+      // Local requireAgencyAccess equivalent: the SESSION agency wins; a
+      // differing body.agencyId is rejected — no SUPER_ADMIN bypass locally.
+      const sessionAgencyId = sessionUser ? sessionUser.agencyId : null
+      if (sessionAgencyId && bodyAgencyId !== sessionAgencyId) {
+        return c.json({ success: false, error: 'You do not have access to this agency' }, 403)
+      }
+      let agencyId = sessionAgencyId
+      if (!agencyId) {
+        // Session without an agencyId: accept the body agencyId only when the
+        // session user genuinely has access (ownership/staff checks inside).
+        agencyId = await lookupLocalAgencyIdForUser(sessionUser)
+        if (!agencyId || agencyId !== bodyAgencyId) {
+          return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+        }
+      }
+
+      const agency = await db.agency.findUnique({ where: { id: agencyId } })
+      if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
+
+      // Snapshot: freeze the current SubscriptionPlan price & name (cloud L33-46).
+      let planName
+      let amountPaid
+      let subscriptionPlan = null
+      try {
+        subscriptionPlan = await db.subscriptionPlan.findFirst({ where: { name: plan, isActive: true } })
+      } catch (planErr) {
+        console.warn('[LocalAPI] transaction plan snapshot lookup failed (non-fatal):', planErr?.message || planErr)
+      }
+      if (subscriptionPlan) {
+        planName = subscriptionPlan.displayName || subscriptionPlan.name
+        amountPaid = subscriptionPlan.price
+      } else {
+        planName = plan
+        amountPaid = amount
+      }
+
+      // Part Q: business writes + the canonical outbox row commit atomically.
+      const transaction = await withOutboxTransaction(async (tx) => {
+        const created = await tx.transaction.create({
+          data: {
+            agencyId,
+            amount,
+            plan,
+            paymentMethod,
+            receiptUrl,
+            status: 'PENDING',
+            amountPaid,
+            planName,
+          },
+        })
+        await tx.agency.update({ where: { id: agencyId }, data: { subscriptionStatus: 'PENDING' } })
+        // Canonical id-preserving SYNC_PUSH create — never an HTTP POST replay
+        // (see the POST /api/reservations comment for why replays double-create).
+        await logDeterministicOutcome('Transaction', created.id, 'create', created, null, { tx })
+        return created
+      })
+
+      // Kick a file-sync round (receipt blob ride-along) + a record-sync pass —
+      // the same non-fatal pairing the other local mutations use.
+      try { if (fileSync) fileSync.schedule('transaction-created') } catch { /* non-fatal */ }
+      try {
+        const syncService = require('./sync-service')
+        if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+      } catch { /* non-fatal */ }
+
+      return c.json({ success: true, transaction }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/transactions error:', error)
+      return c.json({ success: false, error: 'Failed to create transaction' }, 500)
+    }
+  })
+
+  // GET /api/agency/hardware — catalog for the hardware ordering UI
+  // (cloud agency.ts GET /hardware L5580-5612). Reads the LOCAL
+  // HardwareSettings singleton. The Hardware* models are cloud-only
+  // (isSynced: false in lib/sync-registry.json), so an unpopulated local
+  // table degrades to the exact disabled shape the cloud returns and the UI
+  // hides the ordering section. Success-branch shapes are cloud-identical.
+  app.get('/api/agency/hardware', authMiddleware, async (c) => {
+    try {
+      if (!db || !db.hardwareSettings) {
+        return c.json({ products: [], commitmentTiers: [], settings: { hardwareEnabled: false } })
+      }
+      const settings = await db.hardwareSettings.findUnique({ where: { id: 'singleton' } })
+      if (!settings || !settings.hardwareEnabled) {
+        return c.json({ products: [], commitmentTiers: [], settings: { hardwareEnabled: false } })
+      }
+      const [products, commitmentTiers] = await Promise.all([
+        db.hardwareProduct.findMany({
+          where: { isActive: true },
+          orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+        }),
+        db.hardwareCommitmentTier.findMany({
+          where: { isActive: true },
+          orderBy: { sortOrder: 'asc' },
+        }),
+      ])
+      return c.json({ products, commitmentTiers, settings })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/hardware error:', error)
+      return c.json({ success: false, error: 'Failed to load hardware catalog' }, 500)
+    }
+  })
+
+  // GET /api/agency/hardware/orders — agency-scoped order history
+  // (cloud agency.ts GET /hardware/orders L5616-5637): items include their
+  // product, newest first.
+  app.get('/api/agency/hardware/orders', authMiddleware, async (c) => {
+    try {
+      if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId || !db.hardwareOrder) {
+        return c.json({ success: true, orders: [] })
+      }
+      const orders = await db.hardwareOrder.findMany({
+        where: { agencyId },
+        include: { items: { include: { product: true } } },
+        orderBy: { createdAt: 'desc' },
+      })
+      return c.json({ success: true, orders })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/hardware/orders error:', error)
+      return c.json({ success: false, error: 'Failed to load hardware orders' }, 500)
+    }
+  })
+
+  // POST /api/agency/hardware/orders — create a hardware order
+  // (cloud agency.ts POST /hardware/orders L5651-5768). Body validation
+  // mirrors the cloud's createHardwareOrderSchema (validations.ts L491-513):
+  // items[{productId, quantity>=1}], paymentModel 'UPFRONT'|'MONTHLY',
+  // commitmentMonths one of 12/24/36/48/60 (required for MONTHLY). Price
+  // math is byte-identical to the cloud:
+  //   UPFRONT: upfrontTotal = round(total * (1 - upfrontDiscount/100))
+  //   MONTHLY: monthlyExtra = round(total * (1 + extraPercentage/100) / months)
+  // Line items snapshot each product's current basePrice; order + items are
+  // created in ONE local $transaction with status PENDING. No auditLog row —
+  // the local file has no audit-log convention. Hardware* models are
+  // cloud-only locally, so an unpopulated catalog fails the same gates the
+  // cloud enforces (403 disabled / 400 unavailable / 400 invalid tier).
+  app.post('/api/agency/hardware/orders', authMiddleware, async (c) => {
+    try {
+      if (!db || !db.hardwareOrder) {
+        return c.json({ success: false, error: 'Hardware order model unavailable — regenerate the Prisma client' }, 503)
+      }
+      // Cloud L5654: user.agencyId || resolveUserAgencyId(user) — the local
+      // mirror is lookupLocalAgencyIdForUser.
+      const agencyId = (sessionUser && sessionUser.agencyId) || await lookupLocalAgencyIdForUser(sessionUser)
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency found for this user' }, 404)
+      }
+
+      const body = (await c.req.json().catch(() => ({}))) || {}
+      const items = Array.isArray(body.items) ? body.items : null
+      if (!items || items.length === 0) {
+        return c.json({ success: false, error: 'At least one item is required' }, 400)
+      }
+      for (const item of items) {
+        if (!item || typeof item.productId !== 'string' || item.productId.length === 0) {
+          return c.json({ success: false, error: 'Product ID is required' }, 400)
+        }
+        if (!Number.isInteger(item.quantity) || item.quantity < 1) {
+          return c.json({ success: false, error: 'Quantity must be at least 1' }, 400)
+        }
+      }
+      const paymentModel = body.paymentModel
+      if (paymentModel !== 'UPFRONT' && paymentModel !== 'MONTHLY') {
+        return c.json({ success: false, error: 'Payment model must be UPFRONT or MONTHLY' }, 400)
+      }
+      const commitmentMonths = body.commitmentMonths
+      if (paymentModel === 'MONTHLY' && !commitmentMonths) {
+        return c.json({ success: false, error: 'commitmentMonths is required when paymentModel is MONTHLY' }, 400)
+      }
+      if (commitmentMonths !== undefined && commitmentMonths !== null &&
+          (!Number.isInteger(commitmentMonths) || ![12, 24, 36, 48, 60].includes(commitmentMonths))) {
+        return c.json({ success: false, error: 'commitmentMonths must be one of 12, 24, 36, 48, 60' }, 400)
+      }
+
+      // 1. Hardware must be enabled globally (cloud L5668-5671 — 403).
+      const settings = db.hardwareSettings
+        ? await db.hardwareSettings.findUnique({ where: { id: 'singleton' } })
+        : null
+      if (!settings || !settings.hardwareEnabled) {
+        return c.json({ success: false, error: 'Hardware ordering is currently disabled' }, 403)
+      }
+
+      // 2. Snapshot current product prices (only active products orderable).
+      const productIds = items.map((i) => i.productId)
+      const products = await db.hardwareProduct.findMany({
+        where: { id: { in: productIds }, isActive: true },
+      })
+      const productMap = new Map(products.map((p) => [p.id, p]))
+      for (const item of items) {
+        if (!productMap.has(item.productId)) {
+          return c.json({ success: false, error: `Product ${item.productId} is not available` }, 400)
+        }
+      }
+
+      // 3. Compute totals — identical math to the cloud (L5687-5719).
+      const orderItems = items.map((i) => {
+        const product = productMap.get(i.productId)
+        return { productId: i.productId, quantity: i.quantity, unitPrice: product.basePrice }
+      })
+      const totalBasePrice = orderItems.reduce((sum, i) => sum + i.unitPrice * i.quantity, 0)
+
+      let upfrontTotal = 0
+      let monthlyExtra = 0
+      let extraPercentage = 0
+      let commitmentMonthsDb = null
+
+      if (paymentModel === 'UPFRONT') {
+        const discount = settings.upfrontDiscount || 0
+        upfrontTotal = Math.round(totalBasePrice * (1 - discount / 100))
+        monthlyExtra = 0
+      } else {
+        // MONTHLY — look up the commitment tier.
+        const tier = await db.hardwareCommitmentTier.findFirst({
+          where: { months: commitmentMonths, isActive: true },
+        })
+        if (!tier) {
+          return c.json({ success: false, error: `Invalid commitment tier: ${commitmentMonths} months` }, 400)
+        }
+        extraPercentage = tier.extraPercentage
+        commitmentMonthsDb = tier.months
+        monthlyExtra = Math.round((totalBasePrice * (1 + extraPercentage / 100)) / tier.months)
+        upfrontTotal = 0
+      }
+
+      // 4. Create the order + items in a single local transaction (cloud L5722).
+      const order = await db.$transaction(async (tx) => {
+        return tx.hardwareOrder.create({
+          data: {
+            agencyId,
+            paymentModel,
+            commitmentMonths: commitmentMonthsDb,
+            totalBasePrice,
+            extraPercentage,
+            monthlyExtra,
+            upfrontTotal,
+            status: 'PENDING',
+            items: { create: orderItems },
+          },
+          include: { items: { include: { product: true } } },
+        })
+      }, { maxWait: 5000, timeout: 20000 })
+
+      return c.json({ success: true, order }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/agency/hardware/orders error:', error)
+      return c.json({ success: false, error: 'Failed to create hardware order' }, 500)
+    }
+  })
+
+  // POST /api/agency/enterprise-request — submit an enterprise contract
+  // request (cloud agency.ts POST /enterprise-request L5776-5845).
+  // CLOUD-MIRROR-FIRST (Task 2-d): enterprise requests need SUPER_ADMIN
+  // attention in the cloud, so when online the validated payload is
+  // forwarded to the cloud FIRST (session Bearer, 10s timeout) and the cloud
+  // response passes through verbatim — NO local write (the cloud row is the
+  // source of truth for admin-visible data and the local table is not
+  // synced, so a local copy would be a dead-end duplicate). Only when the
+  // forward is skipped (offline) or fails does the handler write locally
+  // (status PENDING, agencyName snapshotted, requestedFeatures
+  // JSON-stringified) so the submission is never lost.
+  app.post('/api/agency/enterprise-request', authMiddleware, async (c) => {
+    try {
+      if (!db || !db.enterpriseContractRequest) {
+        return c.json({ success: false, error: 'Enterprise request model unavailable — regenerate the Prisma client' }, 503)
+      }
+      const agencyId = (sessionUser && sessionUser.agencyId) || await lookupLocalAgencyIdForUser(sessionUser)
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency found for this user' }, 404)
+      }
+
+      const body = (await c.req.json().catch(() => ({}))) || {}
+      const message = body.message
+      const contactEmail = body.contactEmail
+      const contactPhone = body.contactPhone
+      const branchesNeeded = body.branchesNeeded
+      const countersNeeded = body.countersNeeded
+      const hardwareNeeded = body.hardwareNeeded
+      const requestedFeatures = body.requestedFeatures
+
+      // Manual mirror of the cloud's createEnterpriseRequestSchema
+      // (apps/api/src/lib/validations.ts L517-525) — same fields, same bounds.
+      if (typeof message !== 'string' || message.length === 0) {
+        return c.json({ success: false, error: 'Message is required' }, 400)
+      }
+      if (message.length > 2000) {
+        return c.json({ success: false, error: 'Message must be at most 2000 characters' }, 400)
+      }
+      if (typeof contactEmail !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactEmail)) {
+        return c.json({ success: false, error: 'Valid contact email is required' }, 400)
+      }
+      if (contactPhone !== undefined && contactPhone !== null &&
+          (typeof contactPhone !== 'string' || contactPhone.length > 30)) {
+        return c.json({ success: false, error: 'Contact phone must be at most 30 characters' }, 400)
+      }
+      for (const pair of [['branchesNeeded', branchesNeeded], ['countersNeeded', countersNeeded]]) {
+        const value = pair[1]
+        if (value !== undefined && value !== null &&
+            (!Number.isInteger(value) || value < 1 || value > 1000)) {
+          return c.json({ success: false, error: `${pair[0]} must be an integer between 1 and 1000` }, 400)
+        }
+      }
+      if (hardwareNeeded !== undefined && hardwareNeeded !== null && typeof hardwareNeeded !== 'boolean') {
+        return c.json({ success: false, error: 'hardwareNeeded must be a boolean' }, 400)
+      }
+      if (requestedFeatures !== undefined && requestedFeatures !== null && !Array.isArray(requestedFeatures)) {
+        return c.json({ success: false, error: 'requestedFeatures must be an array of strings' }, 400)
+      }
+      if (Array.isArray(requestedFeatures)) {
+        if (requestedFeatures.length > 50) {
+          return c.json({ success: false, error: 'requestedFeatures must contain at most 50 items' }, 400)
+        }
+        for (const feature of requestedFeatures) {
+          if (typeof feature !== 'string' || feature.length === 0 || feature.length > 100) {
+            return c.json({ success: false, error: 'Each requested feature must be a string of at most 100 characters' }, 400)
+          }
+        }
+      }
+
+      const agency = await db.agency.findUnique({
+        where: { id: agencyId },
+        select: { id: true, name: true },
+      })
+      if (!agency) {
+        return c.json({ success: false, error: 'Agency not found' }, 404)
+      }
+
+      const payload = {
+        message,
+        contactEmail,
+        contactPhone: contactPhone ?? null,
+        branchesNeeded: branchesNeeded ?? 1,
+        countersNeeded: countersNeeded ?? 1,
+        hardwareNeeded: hardwareNeeded ?? true,
+        requestedFeatures: requestedFeatures ?? [],
+      }
+
+      // Best-effort CLOUD MIRROR FIRST — failures are IGNORED (the local
+      // fallback write below still succeeds); a cloud success short-circuits
+      // the local write so the request is never double-created.
+      try {
+        const res = await fetch(cloudBaseUrl() + '/api/agency/enterprise-request', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(10000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON error body */ }
+        if (res.ok && data && data.success && data.request) {
+          console.log('[LocalAPI] enterprise-request created in the cloud — skipping local write (cloud is source of truth)')
+          return c.json(data, res.status)
+        }
+        console.warn('[LocalAPI] enterprise-request cloud mirror failed (status ' + res.status + ') — falling back to the local write')
+      } catch (mirrorErr) {
+        console.warn('[LocalAPI] enterprise-request cloud mirror failed (cloud unreachable):', mirrorErr?.message || mirrorErr)
+      }
+
+      // Local fallback write — cloud L5808-5821 field-for-field.
+      const request = await db.enterpriseContractRequest.create({
+        data: {
+          agencyId,
+          agencyName: agency.name,
+          contactEmail: payload.contactEmail,
+          contactPhone: payload.contactPhone,
+          message: payload.message,
+          requestedFeatures: JSON.stringify(payload.requestedFeatures ?? []),
+          branchesNeeded: payload.branchesNeeded ?? 1,
+          countersNeeded: payload.countersNeeded ?? 1,
+          hardwareNeeded: payload.hardwareNeeded ?? true,
+          status: 'PENDING',
+        },
+      })
+
+      return c.json({ success: true, request }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/agency/enterprise-request error:', error)
+      return c.json({ success: false, error: 'Failed to submit enterprise request' }, 500)
+    }
+  })
+
+  // GET /api/agency/enterprise-request — agency-scoped request history
+  // (cloud agency.ts GET /enterprise-request L5849-5867). Local rows win;
+  // when the local table is empty AND the cloud is reachable, the cloud's
+  // rows are mirrored best-effort (source: 'cloud') so submissions created
+  // through the cloud-mirror path still render offline. Simple precedence:
+  // local rows if any, else cloud rows if reachable, else empty.
+  app.get('/api/agency/enterprise-request', authMiddleware, async (c) => {
+    try {
+      if (!db || !db.enterpriseContractRequest) {
+        return c.json({ success: true, requests: [] })
+      }
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) {
+        return c.json({ success: true, requests: [] })
+      }
+
+      const requests = await db.enterpriseContractRequest.findMany({
+        where: { agencyId },
+        orderBy: { createdAt: 'desc' },
+      })
+      if (requests.length > 0) {
+        return c.json({ success: true, requests })
+      }
+
+      // Local table empty — best-effort cloud mirror (failures ignored).
+      try {
+        const res = await fetch(cloudBaseUrl() + '/api/agency/enterprise-request', {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          signal: AbortSignal.timeout(10000),
+        })
+        let data = null
+        try { data = await res.json() } catch { /* non-JSON error body */ }
+        if (res.ok && data && Array.isArray(data.requests)) {
+          return c.json({ success: true, requests: data.requests, source: 'cloud' })
+        }
+      } catch (mirrorErr) {
+        console.warn('[LocalAPI] enterprise-request cloud mirror (GET) failed:', mirrorErr?.message || mirrorErr)
+      }
+
+      return c.json({ success: true, requests })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/enterprise-request error:', error)
+      return c.json({ success: false, error: 'Failed to load enterprise requests' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 13b. ADDITIONAL MISSING AGENCY ROUTES (offline parity with cloud API)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/agency/branches/:id — single branch with counters
+  app.get('/api/agency/branches/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      const id = c.req.param('id')
+      const branch = await db.branch.findUnique({
+        where: { id },
+        include: {
+          counters: {
+            where: { isActive: true },
+            include: {
+              staff: { include: { user: { select: { fullName: true, username: true } } } },
+            },
+            orderBy: { number: 'asc' },
+          },
+          _count: { select: { staff: true } },
+        },
+      })
+      if (!branch || branch.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Branch not found' }, 404)
+      }
+      return c.json({ success: true, branch })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/branches/:id error:', error)
+      return c.json({ success: false, error: 'Failed to load branch' }, 500)
+    }
+  })
+
+  // POST /api/agency/branches/:id/counters — create counter under branch
+  app.post('/api/agency/branches/:id/counters', authMiddleware, async (c) => {
+    try {
+      // Task 37-a: resolve like the branch routes (query || body, session fallback).
+      const body = await c.req.json()
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId') || body.agencyId)
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      // Task 37-d: counter management is branch management (canManageBranches).
+      const permGate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageBranches')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      const branchId = c.req.param('id')
+      const { number, name, nameAr, nameFr } = body
+      if (!number || !name) return c.json({ success: false, error: 'number and name required' }, 400)
+      // Verify branch ownership
+      const branch = await db.branch.findUnique({ where: { id: branchId } })
+      if (!branch || branch.agencyId !== agencyId) return c.json({ success: false, error: 'Branch not found' }, 404)
+      // Check duplicate
+      const existing = await db.counter.findFirst({ where: { branchId, number } })
+      if (existing) return c.json({ success: false, error: 'Counter number already exists in this branch' }, 409)
+      // Part Q: business write + outbox row commit atomically.
+      const counter = await withOutboxTransaction(async (tx) => {
+        const created = await tx.counter.create({
+          data: { number, name, nameAr: nameAr || null, nameFr: nameFr || null, branchId },
+        })
+        await logDeterministicOutcome('Counter', created && created.id, 'create', created, null, { tx })
+        return created
+      })
+      emitEvent('counter:created', { agencyId, counterId: counter.id, branchId })
+      return c.json({ success: true, counter }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/branches/:id/counters POST error:', error)
+      return c.json({ success: false, error: 'Failed to create counter' }, 500)
+    }
+  })
+
+  // PATCH /api/agency/branches/:id/counters/:counterId — update counter
+  app.patch('/api/agency/branches/:id/counters/:counterId', authMiddleware, async (c) => {
+    try {
+      // Task 37-a: resolve like the branch routes (query || body, session fallback).
+      const body = await c.req.json()
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId') || body.agencyId)
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      // Task 37-d: counter management is branch management (canManageBranches).
+      const permGate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageBranches')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      const branchId = c.req.param('id')
+      const counterId = c.req.param('counterId')
+      const counter = await db.counter.findUnique({ where: { id: counterId }, include: { branch: true } })
+      if (!counter || counter.branchId !== branchId || counter.branch.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Counter not found' }, 404)
+      }
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'isActive', 'staffId']
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) updateData[field] = body[field]
+      }
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.counter.update({ where: { id: counterId }, data: updateData })
+        await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+        return row
+      })
+      emitEvent('counter:updated', { agencyId, counterId, branchId })
+      return c.json({ success: true, counter: updated })
+    } catch (error) {
+      console.error('[LocalAPI] PATCH counter error:', error)
+      return c.json({ success: false, error: 'Failed to update counter' }, 500)
+    }
+  })
+
+  // PATCH /api/agency/profile — alias for PUT (cloud uses PATCH)
+  app.patch('/api/agency/profile', authMiddleware, async (c) => {
+    try {
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      // Task 37-d: profile edits need canManageProfile (owners bypass).
+      const permGate = await checkAgencyPermission(c.req.query('agencyId'), 'canManageProfile')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      const body = await c.req.json()
+      // Field whitelist extended to match PUT + the cloud PATCH route —
+      // the profile form updates email/working hours/days and the cover.
+      // Task 5: 'wilaya' joins 'city' (both Algeria address columns on the
+      // Agency row) so desktop profile saves persist the full location.
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'phone', 'email', 'description', 'descriptionAr', 'descriptionFr', 'address', 'city', 'wilaya', 'category', 'website', 'logoUrl', 'coverUrl', 'workingHoursStart', 'workingHoursEnd', 'workingDays']
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) updateData[field] = body[field]
+      }
+      // The UI may send workingDays as an array — normalize to the CSV string
+      // stored on the Agency row (same normalization the create wizard uses).
+      if (Array.isArray(updateData.workingDays)) updateData.workingDays = updateData.workingDays.join(',')
+      if (updateData.workingDays !== undefined && !/^([0-6])(,[0-6])*$/.test(String(updateData.workingDays))) {
+        return c.json({ success: false, error: 'Invalid workingDays format' }, 400)
+      }
+      // Task 51: map/location fields (latitude, longitude, postalCode,
+      // locationVerified, locationSource) — validated with the SAME rules the
+      // cloud applies (range/pair/enum → 400) BEFORE both the local write and
+      // the cloud-forward path below, so an offline save can never produce an
+      // outbox payload the cloud replay would permanently reject. A valid
+      // lat/lng pair gets locationUpdatedAt = now (server-stamped, never
+      // client-set — the UI strips it from the body).
+      const locationUpdate = buildAgencyLocationUpdate(body)
+      if (!locationUpdate.ok) {
+        return c.json({ success: false, error: locationUpdate.error }, 400)
+      }
+      Object.assign(updateData, locationUpdate.data)
+      if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields to update' }, 400)
+
+      // The agency row may not exist locally yet (created on the cloud via
+      // the wizard and the initial sync has not completed). The old code
+      // ran tx.agency.update anyway → Prisma P2025 → 500 "Failed to update
+      // profile". Now: apply on the cloud (source of truth) and let the
+      // sync bring the row down; fail with an honest 412 when offline.
+      const agencyExists = await db.agency.findUnique({ where: { id: agencyId }, select: { id: true } })
+      if (!agencyExists) {
+        if (sessionToken) {
+          try {
+            const target = `${cloudBaseUrl()}/api/agency/profile?agencyId=${encodeURIComponent(agencyId)}`
+            const cloudRes = await fetch(target, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
+              body: JSON.stringify(body),
+              signal: AbortSignal.timeout(8000),
+            })
+            const cloudData = await cloudRes.json().catch(() => ({}))
+            if (cloudRes.ok) {
+              try { if (fileSync) fileSync.schedule('agency-profile-cloud-patch') } catch {}
+              try { const syncService = require('./sync-service'); if (syncService.triggerSyncNow) syncService.triggerSyncNow() } catch {}
+              return c.json({ success: true, appliedOn: 'cloud' })
+            }
+            if (cloudRes.status === 401 || cloudRes.status === 403) {
+              return c.json({ success: false, error: cloudData.error || 'Session not valid for this agency — please log in again', code: 'SESSION_INVALID' }, cloudRes.status)
+            }
+            return c.json({ success: false, error: cloudData.error || 'Cloud update failed', code: 'CLOUD_UPDATE_FAILED' }, 502)
+          } catch (cloudErr) {
+            return c.json({ success: false, error: 'Agency not synced to this device yet and the cloud is unreachable — reconnect to the internet and try again', code: 'AGENCY_NOT_SYNCED' }, 412)
+          }
+        }
+        return c.json({ success: false, error: 'Agency not synced to this device yet — connect to the internet and try again', code: 'AGENCY_NOT_SYNCED' }, 412)
+      }
+
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.agency.update({ where: { id: agencyId }, data: updateData })
+        await logPendingMutation('PATCH', '/api/agency/profile', body, updateData, { tx })
+      })
+      emitEvent('agency:updated', { agencyId, ...updateData })
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] PATCH /api/agency/profile error:', error)
+      const msg = String((error && (error.message || error)) || '')
+      if (msg.includes('P2025') || msg.toLowerCase().includes('not found')) {
+        return c.json({ success: false, error: 'Agency not synced to this device yet — reconnect to the internet and try again', code: 'AGENCY_NOT_SYNCED' }, 412)
+      }
+      return c.json({ success: false, error: 'Failed to update profile' }, 500)
+    }
+  })
+
+  // GET /api/agency/daily-chart — hourly chart data for today
+  app.get('/api/agency/daily-chart', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: true, data: [] })
+      const today = new Date()
+      today.setHours(0, 0, 0, 0)
+      const reservations = await db.reservation.findMany({
+        where: { agencyId, joinedAt: { gte: today } },
+        select: { joinedAt: true, status: true },
+      })
+      const hourlyData = []
+      for (let h = 7; h <= 22; h++) {
+        const hourReservations = reservations.filter((r) => new Date(r.joinedAt).getHours() === h)
+        const completed = hourReservations.filter((r) => r.status === 'COMPLETED').length
+        hourlyData.push({ hour: h, count: hourReservations.length, completed })
+      }
+      return c.json({ success: true, data: hourlyData })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/daily-chart error:', error)
+      return c.json({ success: true, data: [] })
+    }
+  })
+
+  // PATCH /api/agency/settings — update agency settings
+  app.patch('/api/agency/settings', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ error: 'No agency found' }, 404)
+      // Task 37-d: settings edits need canManageProfile (owners bypass).
+      const permGate = await checkAgencyPermission(undefined, 'canManageProfile')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      const body = await c.req.json()
+      const updateData = {}
+      if (body.avgServiceTime !== undefined) updateData.averageServiceTime = body.avgServiceTime
+      // Task 37-a: the cloud GET /settings returns the key as `maxReservations`
+      // (Agency.maxActiveReservations) while PATCH accepts `maxQueueSize` —
+      // clients echoing the GET shape back sent maxReservations, which was
+      // silently dropped. Accept BOTH keys (schema: Agency.maxActiveReservations).
+      if (body.maxQueueSize !== undefined) updateData.maxActiveReservations = body.maxQueueSize
+      else if (body.maxReservations !== undefined) updateData.maxActiveReservations = body.maxReservations
+      if (body.isQueueOpen !== undefined) updateData.isQueueOpen = Boolean(body.isQueueOpen)
+      if (body.workingHoursStart !== undefined) updateData.workingHoursStart = body.workingHoursStart
+      if (body.workingHoursEnd !== undefined) updateData.workingHoursEnd = body.workingHoursEnd
+      if (body.autoPauseWhenFull !== undefined) updateData.autoPauseWhenFull = Boolean(body.autoPauseWhenFull)
+      if (body.kioskModeEnabled !== undefined) updateData.kioskModeEnabled = Boolean(body.kioskModeEnabled)
+      if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields to update' }, 400)
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        const row = await tx.agency.update({ where: { id: agencyId }, data: updateData })
+        await logPendingMutation('PATCH', '/api/agency/settings', body, row, { tx })
+      })
+      emitEvent('agency:updated', { agencyId, action: 'settings-updated', ...updateData })
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] PATCH /api/agency/settings error:', error)
+      return c.json({ success: false, error: 'Failed to update settings' }, 500)
+    }
+  })
+
+  // POST /api/agency/staff — add existing user as staff by username
+  app.post('/api/agency/staff', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ error: 'agencyId required' }, 400)
+      const { agencyId: bodyAgencyId, username } = await c.req.json()
+      const targetAgencyId = bodyAgencyId || agencyId
+      // Task 37-d: staff management is OWNER-only — the owner-limited manager
+      // authority list deliberately excludes staff management.
+      const ownerGate = await checkAgencyOwnerOnly(targetAgencyId)
+      if (!ownerGate.ok) return c.json(ownerGate.body, ownerGate.status)
+      if (!username) return c.json({ error: 'username required' }, 400)
+      // Find user by username
+      const user = await db.user.findUnique({ where: { username: username.trim() } })
+      if (!user) return c.json({ error: 'User not found' }, 404)
+      // Check if already staff
+      const existing = await db.agencyStaff.findUnique({
+        where: { userId_agencyId: { userId: user.id, agencyId: targetAgencyId } },
+      })
+      if (existing) return c.json({ error: 'Staff already exists in this agency' }, 409)
+      // Part Q: business write + outbox row commit atomically. The pre-reads
+      // (user lookup, duplicate check) stay outside — only writes join the tx.
+      const staff = await withOutboxTransaction(async (tx) => {
+        const created = await tx.agencyStaff.create({
+          data: { userId: user.id, agencyId: targetAgencyId, role: user.role === 'AGENCY_OWNER' ? 'OWNER' : 'STAFF' },
+          include: { user: { select: { id: true, username: true, fullName: true, role: true } } },
+        })
+        await logPendingMutation('POST', '/api/agency/staff', { username }, created, { tx })
+        return created
+      })
+      emitEvent('staff:updated', { agencyId: targetAgencyId, action: 'staff-added', staffId: staff.id })
+      return c.json({ staff }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/agency/staff error:', error)
+      return c.json({ error: 'Failed to add staff' }, 500)
+    }
+  })
+
+  // DELETE /api/agency/staff?staffId=xxx&agencyId=xxx — remove staff by query param
+  app.delete('/api/agency/staff', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ error: 'agencyId required' }, 400)
+      // Task 37-d: staff management is OWNER-only.
+      const ownerGate = await checkAgencyOwnerOnly(c.req.query('agencyId') || agencyId)
+      if (!ownerGate.ok) return c.json(ownerGate.body, ownerGate.status)
+      const staffId = c.req.query('staffId')
+      const queryAgencyId = c.req.query('agencyId') || agencyId
+      if (!staffId) return c.json({ error: 'staffId required' }, 400)
+      const staffMember = await db.agencyStaff.findUnique({ where: { id: staffId } })
+      if (!staffMember) return c.json({ error: 'Staff member not found' }, 404)
+      if (staffMember.agencyId !== queryAgencyId) return c.json({ error: 'Staff not in this agency' }, 403)
+      if (staffMember.role === 'OWNER') return c.json({ error: 'Cannot remove agency owner' }, 403)
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.agencyStaff.delete({ where: { id: staffId } })
+        await logPendingMutation('DELETE', '/api/agency/staff', { staffId }, null, { tx })
+      })
+      emitEvent('staff:updated', { agencyId: queryAgencyId, action: 'staff-removed', staffId })
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] DELETE /api/agency/staff error:', error)
+      return c.json({ error: 'Failed to remove staff' }, 500)
+    }
+  })
+
+  // PATCH /api/agency/staff/:id — update staff member
+  app.patch('/api/agency/staff/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ error: 'No agency found' }, 403)
+      const id = c.req.param('id')
+      const body = await c.req.json()
+      const staffMember = await db.agencyStaff.findUnique({
+        where: { id },
+        include: { user: { select: { id: true, username: true, fullName: true, role: true, isActive: true } } },
+      })
+      if (!staffMember) return c.json({ error: 'Staff member not found' }, 404)
+      if (staffMember.agencyId !== agencyId) return c.json({ error: 'Not your agency' }, 403)
+      if (staffMember.role === 'OWNER') return c.json({ error: 'Cannot modify owner' }, 403)
+      // Task 37-d: staff management is OWNER-only.
+      const ownerGate = await checkAgencyOwnerOnly(c.req.query('agencyId') || agencyId)
+      if (!ownerGate.ok) return c.json(ownerGate.body, ownerGate.status)
+      const { fullName, role, isActive, permissions, branchId } = body
+      // Task 31-C (BUG 8 support): optional branch assignment — attach the
+      // staff member to one of the agency's branches (string) or clear the
+      // assignment (null). AgencyStaff.branchId exists in BOTH schemas but no
+      // route accepted it before. A string must reference a branch of THIS
+      // agency (same ownership rule the other branch routes enforce).
+      if (branchId !== undefined && branchId !== null) {
+        if (typeof branchId !== 'string' || !branchId) {
+          return c.json({ success: false, error: 'branchId must be a non-empty string or null' }, 400)
+        }
+        const branch = await db.branch.findFirst({ where: { id: branchId, agencyId } })
+        if (!branch) {
+          return c.json({ success: false, error: 'Branch not found in this agency' }, 400)
+        }
+      }
+      // Part Q: ALL staff/user writes below + the outbox row commit atomically
+      // — a crash can no longer half-apply a staff edit (e.g. role changed but
+      // name not, or activation written with no outbox entry).
+      const updated = await withOutboxTransaction(async (tx) => {
+        // Update user fullName
+        if (fullName !== undefined && fullName.trim()) {
+          await tx.user.update({ where: { id: staffMember.userId }, data: { fullName: fullName.trim() } })
+        }
+        // Update staff role. Task 37-d: a tier change re-applies the tier's
+        // permission defaults (manager = owner-like minus staff management;
+        // staff = queue + analytics only) before any explicitly submitted
+        // permissions are overlaid below.
+        if (role !== undefined && ['STAFF', 'MANAGER'].includes(role)) {
+          const tierDefaults = role === 'MANAGER' ? MANAGER_TIER_DEFAULTS : STAFF_TIER_DEFAULTS
+          const roleData = { role }
+          for (const key of STAFF_PERMISSION_KEYS) {
+            if (tierDefaults[key] !== undefined) roleData[key] = tierDefaults[key]
+          }
+          await tx.agencyStaff.update({ where: { id }, data: roleData })
+        }
+        // Update isActive
+        if (isActive !== undefined) {
+          await tx.user.update({ where: { id: staffMember.userId }, data: { isActive } })
+          await tx.agencyStaff.update({ where: { id }, data: { isActive } })
+        }
+        // Update branch assignment (string to attach, null to clear)
+        if (branchId !== undefined) {
+          await tx.agencyStaff.update({ where: { id }, data: { branchId: branchId === null ? null : branchId } })
+        }
+        // Update permissions — Task 37-d: write BOTH the legacy JSON string
+        // (old readers) AND the normalized boolean columns (the permission
+        // enforcer reads those). Unknown-column validation errors degrade to
+        // the JSON-only write (pre-regenerated-client transition window).
+        if (permissions !== undefined) {
+          const currentPerms = staffMember.permissions ? JSON.parse(staffMember.permissions) : {}
+          const mergedPerms = { ...currentPerms, ...permissions }
+          const boolData = {}
+          for (const key of STAFF_PERMISSION_KEYS) {
+            if (permissions[key] !== undefined) boolData[key] = Boolean(permissions[key])
+          }
+          try {
+            await tx.agencyStaff.update({ where: { id }, data: { permissions: JSON.stringify(mergedPerms), ...boolData } })
+          } catch (permErr) {
+            if (!isUnknownColumnError(permErr, Object.keys(boolData))) throw permErr
+            console.warn('[LocalAPI] staff PATCH: normalized permission columns unavailable — JSON-only write')
+            await tx.agencyStaff.update({ where: { id }, data: { permissions: JSON.stringify(mergedPerms) } })
+          }
+        }
+        // Fetch updated
+        const row = await tx.agencyStaff.findUnique({
+          where: { id },
+          include: { user: { select: { id: true, username: true, fullName: true, role: true, isActive: true } } },
+        })
+        await logDeterministicOutcome('AgencyStaff', id, 'update', row, null, { tx })
+        return row
+      })
+      emitEvent('staff:updated', { agencyId, action: 'staff-updated', staffId: id })
+      return c.json({ staff: updated, success: true })
+    } catch (error) {
+      console.error('[LocalAPI] PATCH /api/agency/staff/:id error:', error)
+      return c.json({ success: false, error: 'Failed to update staff' }, 500)
+    }
+  })
+
+  // GET /api/agency/subscription-plans — list available plans
+  // Task 31-C (BUG 11): SubscriptionPlan + PlanFeature ARE synced locally
+  // (lib/sync-registry.json syncOrder 2/3 — the old "NOT synced locally"
+  // comment was stale and the route always returned an empty catalog).
+  // Mirrors the cloud query verbatim (agency.ts GET /subscription-plans,
+  // which returns { plans }) — enterprise custom plans are included only
+  // for the agency they were built for.
+  app.get('/api/agency/subscription-plans', authMiddleware, async (c) => {
+    try {
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      const plans = await db.subscriptionPlan.findMany({
+        where: {
+          isActive: true,
+          OR: [
+            { isEnterprise: false },
+            ...(agencyId ? [{ isEnterprise: true, ownerAgencyId: agencyId }] : []),
+          ],
+        },
+        include: { features: true },
+        orderBy: { sortOrder: 'asc' },
+      })
+      return c.json({ plans })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/subscription-plans error:', error)
+      return c.json({ plans: [] })
+    }
+  })
+
+  // PATCH /api/agency/working-hours — update working hours
+  app.patch('/api/agency/working-hours', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency found' }, 404)
+      // Task 37-d: working-hours edits need canManageProfile (owners bypass).
+      const permGate = await checkAgencyPermission(undefined, 'canManageProfile')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      const body = await c.req.json()
+      const { workingHoursStart, workingHoursEnd, workingDays } = body
+      if (workingHoursStart === undefined && workingHoursEnd === undefined && workingDays === undefined) {
+        return c.json({ success: false, error: 'workingHoursStart, workingHoursEnd or workingDays required' }, 400)
+      }
+      if (workingDays !== undefined && !/^([0-6])(,[0-6])*$/.test(String(workingDays))) {
+        return c.json({ success: false, error: 'workingDays must be a comma-separated list of weekday numbers 0-6' }, 400)
+      }
+      const updateData = {}
+      if (workingHoursStart !== undefined) updateData.workingHoursStart = workingHoursStart
+      if (workingHoursEnd !== undefined) updateData.workingHoursEnd = workingHoursEnd
+      if (workingDays !== undefined) updateData.workingDays = String(workingDays)
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.agency.update({
+          where: { id: agencyId },
+          data: updateData,
+          select: { id: true, workingHoursStart: true, workingHoursEnd: true, workingDays: true },
+        })
+        await logPendingMutation('PATCH', '/api/agency/working-hours', body, row, { tx })
+        return row
+      })
+      emitEvent('agency:updated', { agencyId, action: 'working-hours-updated', ...updateData })
+      return c.json(updated)
+    } catch (error) {
+      console.error('[LocalAPI] PATCH /api/agency/working-hours error:', error)
+      return c.json({ success: false, error: 'Failed to update working hours' }, 500)
+    }
+  })
+
+  // DELETE /api/reviews — delete a review (by body.reviewId)
+  app.delete('/api/reviews', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const { reviewId } = body
+      if (!reviewId) return c.json({ error: 'reviewId is required' }, 400)
+      const review = await db.review.findUnique({ where: { id: reviewId } })
+      if (!review) return c.json({ error: 'Review not found' }, 404)
+      if (review.agencyId !== sessionUser.agencyId && review.userId !== sessionUser.id) {
+        return c.json({ error: 'Not authorized to delete this review' }, 403)
+      }
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.review.delete({ where: { id: reviewId } })
+        await logPendingMutation('DELETE', '/api/reviews', { reviewId }, null, { tx })
+      })
+      emitEvent('review:deleted', { agencyId: review.agencyId, reviewId })
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] DELETE /api/reviews error:', error)
+      return c.json({ error: 'Failed to delete review' }, 500)
+    }
+  })
+
+  // DELETE /api/agency/reviews — delete a review (agency-scoped alias)
+  app.delete('/api/agency/reviews', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const { reviewId } = body
+      if (!reviewId) return c.json({ error: 'reviewId is required' }, 400)
+      const review = await db.review.findUnique({ where: { id: reviewId } })
+      if (!review) return c.json({ error: 'Review not found' }, 404)
+      if (review.agencyId !== sessionUser.agencyId) {
+        return c.json({ error: 'Not authorized' }, 403)
+      }
+      // Part Q: business write + outbox row commit atomically.
+      await withOutboxTransaction(async (tx) => {
+        await tx.review.delete({ where: { id: reviewId } })
+        await logPendingMutation('DELETE', '/api/agency/reviews', { reviewId }, null, { tx })
+      })
+      emitEvent('review:deleted', { agencyId: review.agencyId, reviewId })
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] DELETE /api/agency/reviews error:', error)
+      return c.json({ error: 'Failed to delete review' }, 500)
+    }
+  })
+
+  // POST /api/agency/reviews — create or update review (agency-scoped alias)
+  app.post('/api/agency/reviews', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      const body = await c.req.json()
+      const { rating, comment } = body
+      if (!rating || rating < 1 || rating > 5) return c.json({ success: false, error: 'Rating must be 1-5' }, 400)
+      // Check if user already reviewed this agency (upsert)
+      // Task 83: the Review compound unique is now [userId, agencyId,
+      // branchId] — this local flow writes the AGENCY-WIDE review (branchId
+      // = null); findFirst because findUnique cannot filter a null component.
+      const existing = await db.review.findFirst({
+        where: { userId: sessionUser.id, agencyId, branchId: null },
+      })
+      // Part Q: business write + outbox row commit atomically. The upsert
+      // branch decision uses the pre-read `existing` — both branches join tx.
+      const review = await withOutboxTransaction(async (tx) => {
+        const row = existing
+          ? await tx.review.update({
+              where: { id: existing.id },
+              data: { rating, comment: comment || null },
+              include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
+            })
+          : await tx.review.create({
+              data: { agencyId, userId: sessionUser.id, rating, comment: comment || null },
+              include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
+            })
+        await logPendingMutation('POST', '/api/agency/reviews', body, row, { tx })
+        return row
+      })
+      emitEvent('review:created', { agencyId, review })
+      return c.json({
+        review: {
+          id: review.id, rating: review.rating, comment: review.comment,
+          createdAt: review.createdAt, user: review.user,
+        },
+        updated: !!existing,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] POST /api/agency/reviews error:', error)
+      return c.json({ success: false, error: 'Failed to create review' }, 500)
+    }
+  })
+
+  // GET /api/agency/reviews — list reviews (agency-scoped, matches cloud format)
+  app.get('/api/agency/reviews', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ error: 'agencyId is required' }, 400)
+      const page = parseInt(c.req.query('page') || '1', 10)
+      const limit = parseInt(c.req.query('limit') || '10', 10)
+      const skip = (page - 1) * limit
+      const [reviews, totalReviews] = await Promise.all([
+        db.review.findMany({
+          where: { agencyId }, orderBy: { createdAt: 'desc' }, skip, take: limit,
+          include: { user: { select: { id: true, fullName: true, avatarUrl: true } } },
+        }),
+        db.review.count({ where: { agencyId } }),
+      ])
+      // Rating distribution
+      const ratingDistribution = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }
+      const allRatings = await db.review.findMany({ where: { agencyId }, select: { rating: true } })
+      for (const r of allRatings) {
+        if (r.rating >= 1 && r.rating <= 5) ratingDistribution[r.rating]++
+      }
+      const agg = await db.review.aggregate({ where: { agencyId }, _avg: { rating: true } })
+      const avgRating = agg._avg.rating ? Math.round(agg._avg.rating * 10) / 10 : 0
+      return c.json({
+        reviews: reviews.map((r) => ({
+          id: r.id, rating: r.rating, comment: r.comment,
+          replyText: r.replyText, repliedAt: r.repliedAt?.toISOString() ?? null,
+          createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : String(r.createdAt),
+          user: r.user ? { id: r.user.id, fullName: r.user.fullName, avatarUrl: r.user.avatarUrl } : { id: '', fullName: 'Unknown' },
+        })),
+        avgRating, totalReviews, ratingDistribution,
+        hasMore: skip + limit < totalReviews,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/reviews error:', error)
+      return c.json({ reviews: [], avgRating: 0, totalReviews: 0, ratingDistribution: {}, hasMore: false })
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 14. SYNC STATUS (no auth)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/sync/status — LAN discovery endpoint probed by the sync engine.
+  // The sync engine (db/sync.ts _probeSyncEndpoint) fetches /api/sync/status and
+  // checks for { service: 'blasti-lan-sync' } or { local: { ready: true } }.
+  // Without this route, the sync engine never discovers the local API,
+  // so WatermelonDB never syncs → offline mode has no data.
+  //
+  // v2: now also returns the LIVE background sync engine status (lazy
+  // require of sync-service to avoid a circular module dependency; falls
+  // back gracefully when the sync service isn't loadable).
+  app.get('/api/sync/status', (c) => {
+    const base = {
+      service: 'blasti-lan-sync',
+      local: { ready: !!db, mode: 'sqlite' },
+      sessionActive: !!sessionToken,
+    }
+    try {
+      const syncService = require('./sync-service')
+      const status = syncService.getStatus()
+      // getStatus is async — answer synchronously with the discovery
+      // contract + a promise-resolved snapshot is not possible here, so
+      // expose the non-async subset and let clients use /api/sync-status
+      // for the full live snapshot.
+      return c.json({
+        ...base,
+        syncServiceAvailable: true,
+        isStarted: status.isStarted,
+        hasAuth: status.hasAuth,
+        socketConnected: status.socketConnected,
+        cursor: status.cursor,
+        syncProtocolVersion: status.syncProtocolVersion,
+        syncModelCount: status.syncModelCount,
+      })
+    } catch {
+      return c.json({ ...base, syncServiceAvailable: false })
+    }
+  })
+
+  // POST /api/sync/pull — Task 41: protocol-v2 pull answer for the RENDERER's
+  // web sync engine (apps/web/src/db/sync.ts). The embedded local API is the
+  // renderer's primary base in Electron, so its periodic sync cycle POSTs
+  // HERE first. This route previously did not exist → 404 noise in the
+  // console ("no route matched: POST /api/sync/pull") AND, worse, the
+  // renderer fell back to pulling the CLOUD directly behind the main
+  // process's SyncService (duplicate puller, racing cursors, duplicate
+  // 401-revocation risk). The authoritative cloud pulls belong to the
+  // SyncService; this endpoint answers a well-formed EMPTY page so the
+  // renderer's cycle completes cleanly against the local-first source.
+  app.post('/api/sync/pull', authMiddleware, async (c) => {
+    try {
+      let body = {}
+      try { body = await c.req.json() } catch { /* empty body is fine */ }
+      const since = Number.isFinite(Number(body && body.sinceSequence))
+        ? Math.max(0, Math.floor(Number(body.sinceSequence)))
+        : 0
+      const agencyId = sessionUser?.agencyId || body?.agencyId || null
+      if (Math.random() < 0.15) { // log occasionally — a per-5-min cycle, but never spam
+        console.log('[LocalAPI] /api/sync/pull (renderer cycle) → empty page answer (sinceSequence=' + since +
+          ', agency=' + (agencyId ? agencyId.slice(0, 8) + '…' : 'none') + ') — cloud pulls are owned by the desktop SyncService')
+      }
+      return c.json({
+        success: true,
+        protocolVersion: 2,
+        agencyId,
+        sinceSequence: since,
+        pageLastSequence: since,
+        latestSequence: since,
+        rows: [],
+        hasMore: false,
+        source: 'local-embedded-api',
+      })
+    } catch (error) {
+      console.error('[LocalAPI] /api/sync/pull error:', error)
+      return c.json({ success: false, error: 'Pull failed' }, 500)
+    }
+  })
+
+  // GET /api/sync-status — local sync status for diagnosis panel
+  // v2: returns the live background sync engine status (awaited).
+  app.get('/api/sync-status', async (c) => {
+    const base = {
+      success: true,
+      localReady: !!db,
+      sessionActive: !!sessionToken,
+    }
+    try {
+      const syncService = require('./sync-service')
+      const status = await syncService.getStatus()
+      return c.json({
+        ...base,
+        syncServiceAvailable: true,
+        cloudConnected: !!(status.socketConnected || (status.lastPullAt && status.lastError === null)),
+        ...status,
+      })
+    } catch {
+      return c.json({
+        ...base,
+        syncServiceAvailable: false,
+        cloudConnected: false,
+        lastSyncAt: null,
+      })
+    }
+  })
+
+  // GET /api/sync/initial-sync/status — Task 46: live workspace-import status
+  // for the post-login loading gate. Read-only and loopback-only (the local
+  // API binds 127.0.0.1), mirroring the /api/db-status exposure precedent.
+  // Combines: the AgencyLocalState state machine (READY/INITIALIZING/…),
+  // the live engine run (stage/counts via getInitialSyncSnapshot), core
+  // table counts, deferred/quarantine stats and the [SyncDiag] ring buffer.
+  app.get('/api/sync/initial-sync/status', async (c) => {
+    try {
+      const { checkInitialSyncStatus, getInitialSyncSnapshot } = require('./initial-sync')
+      const agencyId = sessionUser?.agencyId || c.req.query('agencyId') || null
+
+      let state = null
+      if (db && agencyId) {
+        state = await checkInitialSyncStatus(db, agencyId).catch((e) => {
+          console.warn('[LocalAPI] initial-sync/status state check failed:', e.message)
+          return null
+        })
+      }
+
+      const snapshot = getInitialSyncSnapshot()
+
+      // Core table counts (−1 on error) — the gate renders these as a
+      // checklist so "what arrived" is visible without opening devtools.
+      const counts = {}
+      const countQueries = {
+        Agency: () => db.agency.count(),
+        Branch: () => db.branch.count({ where: agencyId ? { agencyId } : undefined }),
+        Service: () => db.service.count({ where: agencyId ? { agencyId } : undefined }),
+        Counter: () => db.counter.count({ where: agencyId ? { branch: { agencyId } } : undefined }),
+        AgencyStaff: () => db.agencyStaff.count({ where: agencyId ? { agencyId } : undefined }),
+        Reservation: () => db.reservation.count({ where: agencyId ? { agencyId } : undefined }),
+        User: () => db.user.count(),
+      }
+      if (db) {
+        for (const [model, fn] of Object.entries(countQueries)) {
+          try { counts[model] = await fn() } catch { counts[model] = -1 }
+        }
+      }
+
+      // Deferred/quarantined changes (FK-blocked rows awaiting parents)
+      const deferred = { pending: 0, quarantined: 0 }
+      if (db) {
+        try {
+          const rows = await db.$queryRawUnsafe(
+            'SELECT status, COUNT(*) as cnt FROM "_deferred_changes" GROUP BY status'
+          )
+          for (const row of rows || []) {
+            if (row.status === 'PENDING') deferred.pending = Number(row.cnt)
+            if (row.status === 'QUARANTINED') deferred.quarantined = Number(row.cnt)
+          }
+        } catch { /* table may not exist yet */ }
+      }
+
+      return c.json({
+        success: true,
+        serverTime: new Date().toISOString(),
+        sessionActive: !!sessionToken,
+        agencyId,
+        state: state?.status || (snapshot.active ? 'INITIALIZING' : 'UNKNOWN'),
+        needsInitialSync: state ? !!state.needsInitialSync : null,
+        lastError: state?.lastError || null,
+        active: snapshot.active,
+        activeSync: snapshot.activeSync,
+        lastProgress: snapshot.lastProgress,
+        counts,
+        deferred,
+        diag: snapshot.diag,
+      })
+    } catch (err) {
+      console.error('[LocalAPI] /api/sync/initial-sync/status error:', err)
+      return c.json({ success: false, error: err?.message || 'status failed' }, 500)
+    }
+  })
+
+  // GET /api/sync/diagnostics — Task 46: one-shot branch-focused support
+  // report (auth required). Everything needed to answer "why doesn't the
+  // desktop show my branches" without reproducing the incident: workspace
+  // identity, initialization state, core counts, the actual branch rows,
+  // deferred/quarantine stats, engine cursor, and the [SyncDiag] ring.
+  app.get('/api/sync/diagnostics', requireAuth(), async (c) => {
+    try {
+      const { checkInitialSyncStatus, getInitialSyncSnapshot } = require('./initial-sync')
+      const user = c.get('user')
+      const agencyId = user?.agencyId || sessionUser?.agencyId || null
+
+      const state = agencyId && db
+        ? await checkInitialSyncStatus(db, agencyId).catch(() => null)
+        : null
+      const snapshot = getInitialSyncSnapshot()
+
+      const counts = {}
+      for (const [model, fn] of Object.entries({
+        Agency: () => db.agency.count(),
+        Branch: () => db.branch.count({ where: agencyId ? { agencyId } : undefined }),
+        Service: () => db.service.count({ where: agencyId ? { agencyId } : undefined }),
+        Counter: () => db.counter.count({ where: agencyId ? { branch: { agencyId } } : undefined }),
+        AgencyStaff: () => db.agencyStaff.count({ where: agencyId ? { agencyId } : undefined }),
+        Reservation: () => db.reservation.count({ where: agencyId ? { agencyId } : undefined }),
+      })) {
+        try { counts[model] = await fn() } catch { counts[model] = -1 }
+      }
+
+      // The actual branch rows (first 50) — names/ids/timestamps for support
+      let branches = []
+      try {
+        branches = await db.branch.findMany({
+          where: agencyId ? { agencyId } : undefined,
+          select: { id: true, name: true, phone: true, address: true, isActive: true, createdAt: true, updatedAt: true },
+          take: 50,
+          orderBy: { createdAt: 'asc' },
+        })
+      } catch { /* non-fatal */ }
+
+      // Deferred summary by model
+      const deferredByModel = {}
+      try {
+        const rows = await db.$queryRawUnsafe(
+          "SELECT model, status, COUNT(*) as cnt FROM \"_deferred_changes\" WHERE agencyId = ? GROUP BY model, status",
+          agencyId || ''
+        )
+        for (const row of rows || []) {
+          deferredByModel[`${row.model}:${row.status}`] = Number(row.cnt)
+        }
+      } catch { /* non-fatal */ }
+
+      // Engine cursor + ready-check receipt
+      const meta = {}
+      try {
+        const rows = await db.$queryRawUnsafe(
+          "SELECT key, value FROM \"_sync_meta\" WHERE key IN ('lastPulledSequence', 'initialSyncSnapshotSequence', 'readyChecks') OR key LIKE 'readyChecks:%'"
+        )
+        for (const row of rows || []) meta[row.key] = row.value
+      } catch { /* non-fatal */ }
+
+      return c.json({
+        success: true,
+        generatedAt: new Date().toISOString(),
+        workspace: {
+          agencyId,
+          user: user ? { id: user.id, username: user.username, role: user.role } : null,
+          initialization: state ? {
+            status: state.status,
+            needsInitialSync: state.needsInitialSync,
+            currentStage: state.currentStage || null,
+            recordsImported: state.recordsImported ?? null,
+            lastError: state.lastError || null,
+          } : null,
+        },
+        counts,
+        branches,
+        deferredByModel,
+        engineCursor: meta,
+        initialSync: snapshot,
+        apiVersion: '0.3.0',
+      })
+    } catch (err) {
+      console.error('[LocalAPI] /api/sync/diagnostics error:', err)
+      return c.json({ success: false, error: err?.message || 'diagnostics failed' }, 500)
+    }
+  })
+
+  // GET /api/db-status — database diagnostics for the diagnosis panel
+  // v2: extended with initialization status (AgencyLocalState), required
+  // dataset counts, sync timestamps, pending outbox size and a readiness
+  // verdict (ready = initialization READY + Agency data present).
+  app.get('/api/db-status', async (c) => {
+    if (!db) {
+      return c.json({ success: false, error: 'Database not initialized', tables: 0 })
+    }
+    try {
+      // Count tables and records in the local SQLite database
+      const tablesResult = await db.$queryRawUnsafe("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+      const tables = tablesResult ? tablesResult.map(r => r.name) : []
+
+      // Get record counts for key tables
+      const counts = {}
+      for (const table of tables) {
+        try {
+          const r = await db.$queryRawUnsafe(`SELECT COUNT(*) as cnt FROM \"${table}\"`)
+          // Prisma may return BigInt for COUNT(*) — convert to Number for JSON serialization
+          const raw = Array.isArray(r) ? r[0]?.cnt : r?.cnt
+          counts[table] = typeof raw === 'bigint' ? Number(raw) : (raw || 0)
+        } catch {
+          counts[table] = -1 // error
+        }
+      }
+
+      // ── v2 additions: initialization + readiness ──
+      const agencyId = sessionUser?.agencyId || null
+
+      // Initialization status from AgencyLocalState (model exists in the
+      // shared schema; older local DBs may predate it → NOT_INITIALIZED).
+      let localState = null
+      try {
+        localState = await db.agencyLocalState.findUnique({ where: { agencyId: agencyId || '__none__' } })
+      } catch {
+        localState = null
+      }
+      const initializationStatus = localState?.initializationStatus || 'NOT_INITIALIZED'
+      const effectiveAgencyId = agencyId || localState?.agencyId || null
+
+      // Required dataset counts (-1 on error): the minimum tables the app
+      // needs before it is usable offline.
+      const requiredModels = ['Agency', 'AgencyStaff', 'Service', 'Branch', 'Counter', 'QueueSettings', 'Reservation']
+      const requiredDataset = {}
+      for (const model of requiredModels) {
+        requiredDataset[model] = typeof counts[model] === 'number' ? counts[model] : -1
+      }
+
+      // Sync timestamps: prefer _sync_meta (live engine), fall back to
+      // AgencyLocalState, then null.
+      let lastFullSyncAt = null
+      let lastIncrementalSyncAt = null
+      let lastError = localState?.lastError || null
+      try {
+        const metaRows = await db.$queryRawUnsafe(
+          "SELECT key, value FROM \"_sync_meta\" WHERE key IN ('lastFullSyncAt', 'lastIncrementalSyncAt', 'lastPulledSequence')"
+        )
+        for (const row of metaRows || []) {
+          if (row.key === 'lastFullSyncAt' && row.value) lastFullSyncAt = row.value
+          if (row.key === 'lastIncrementalSyncAt' && row.value) lastIncrementalSyncAt = row.value
+        }
+      } catch { /* _sync_meta may not exist yet */ }
+      if (!lastFullSyncAt && localState?.lastFullSyncAt) {
+        lastFullSyncAt = localState.lastFullSyncAt instanceof Date ? localState.lastFullSyncAt.toISOString() : String(localState.lastFullSyncAt)
+      }
+      if (!lastIncrementalSyncAt && localState?.lastIncrementalSyncAt) {
+        lastIncrementalSyncAt = localState.lastIncrementalSyncAt instanceof Date ? localState.lastIncrementalSyncAt.toISOString() : String(localState.lastIncrementalSyncAt)
+      }
+
+      // Pending outgoing mutations (Part AT: full outbox breakdown)
+      let pendingOutgoingMutations = 0
+      let outbox = { pending: 0, retry: 0, permanentFailed: 0, conflict: 0, sending: 0 }
+      try {
+        const statusRows = await db.$queryRawUnsafe('SELECT status, COUNT(*) as cnt FROM "_pending_mutations" GROUP BY status')
+        const byStatus = {}
+        for (const row of statusRows || []) byStatus[row.status] = Number(row.cnt)
+        outbox = {
+          pending: byStatus.pending || 0,
+          retry: (byStatus.retry || 0) + (byStatus.failed || 0),
+          permanentFailed: (byStatus.permanent_failed || 0) + (byStatus.abandoned || 0),
+          conflict: byStatus.conflict || 0,
+          sending: byStatus.sending || 0,
+        }
+        pendingOutgoingMutations = outbox.pending + outbox.retry
+      } catch { /* outbox table may not exist yet */ }
+
+      // Part K/AT: durable deferred changes + conflicts + cursor
+      let deferredChanges = 0
+      let deferredQuarantined = 0
+      try {
+        const defRows = await db.$queryRawUnsafe(
+          'SELECT status, COUNT(*) as cnt FROM "_deferred_changes" GROUP BY status'
+        )
+        for (const row of defRows || []) {
+          if (row.status === 'PENDING') deferredChanges = Number(row.cnt)
+          if (row.status === 'QUARANTINED') deferredQuarantined = Number(row.cnt)
+        }
+      } catch { /* deferred table may not exist yet */ }
+      let conflictCount = 0
+      try {
+        const confRows = await db.$queryRawUnsafe(
+          'SELECT COUNT(*) as cnt FROM "_sync_conflicts" WHERE resolution = \'pending\''
+        )
+        conflictCount = Number(confRows?.[0]?.cnt || 0)
+      } catch { /* conflicts table may not exist yet */ }
+      let cursor = null
+      try {
+        const curRows = await db.$queryRawUnsafe(
+          "SELECT value FROM \"_sync_meta\" WHERE key = 'lastPulledSequence'"
+        )
+        cursor = curRows && curRows[0] ? parseInt(curRows[0].value, 10) || null : null
+      } catch { /* meta table may not exist yet */ }
+
+      // Task 33-C: authorization (workspace lock) state from _sync_meta.
+      let authorizationStatus = null
+      let authorizationRevokedAt = null
+      let authorizationReason = null
+      try {
+        const authzRows = await db.$queryRawUnsafe(
+          "SELECT key, value FROM \"_sync_meta\" WHERE key IN ('authorization_status', 'authorization_revoked_at', 'authorization_reason')"
+        )
+        for (const row of authzRows || []) {
+          if (row.key === 'authorization_status') authorizationStatus = row.value || null
+          if (row.key === 'authorization_revoked_at') authorizationRevokedAt = row.value || null
+          if (row.key === 'authorization_reason') authorizationReason = row.value || null
+        }
+      } catch { /* meta table may not exist yet */ }
+
+      // Readiness verdict: initialized AND agency data actually imported.
+      const agencyCount = typeof counts.Agency === 'number' ? counts.Agency : -1
+      const ready = initializationStatus === 'READY' && agencyCount > 0
+      let reason = 'ready'
+      if (initializationStatus !== 'READY') {
+        reason = 'initialization ' + initializationStatus
+      } else if (agencyCount <= 0) {
+        reason = 'initialization READY but no Agency records imported'
+      }
+
+      // Spec §24 contract fields
+      const { getDbStatus: _getDbStatus } = require('./lib/db')
+      const dbFileStatus = _getDbStatus()
+      let schemaVersion = null
+      try {
+        const vRows = await db.$queryRawUnsafe("SELECT value FROM \"_sync_meta\" WHERE key = 'schema_version'")
+        schemaVersion = vRows && vRows[0] ? parseInt(vRows[0].value, 10) || null : null
+      } catch { /* meta table may not exist yet */ }
+      const syncInfraTables = ['_sync_meta', '_sync_conflicts', '_pending_mutations', '_sync_applied_mutations', '_deferred_changes']
+      const syncTablesStatus = {}
+      for (const t of syncInfraTables) syncTablesStatus[t] = tables.includes(t)
+      let realtimeConnected = false
+      try {
+        realtimeConnected = !!require('./sync-service').getStatus()?.socketConnected
+      } catch { /* engine not started */ }
+
+      return c.json({
+        success: true,
+        tables: tables.length,
+        tableNames: tables,
+        counts,
+        mode: 'sqlite',
+        sessionActive: !!sessionToken,
+        user: sessionUser ? { id: sessionUser.id, username: sessionUser.username, role: sessionUser.role } : null,
+        // v2 fields
+        agencyId: effectiveAgencyId,
+        initializationStatus,
+        initialization: {
+          status: initializationStatus,
+          currentStage: localState?.currentStage || null,
+          recordsImported: localState?.recordsImported ?? null,
+          snapshotSequence: localState?.snapshotSequence ?? null,
+        },
+        requiredDataset,
+        lastFullSyncAt,
+        lastIncrementalSyncAt,
+        lastError,
+        pendingOutgoingMutations,
+        // Part AT observability contract
+        cursor,
+        outbox,
+        deferredChanges,
+        deferredQuarantined,
+        conflicts: conflictCount,
+        // Task 33-C: authorization (workspace lock) diagnostics
+        authorizationStatus,
+        authorizationRevokedAt: authorizationStatus === 'REVOKED' ? authorizationRevokedAt : undefined,
+        authorizationReason: authorizationStatus === 'REVOKED' ? authorizationReason : undefined,
+        ready,
+        readiness: { ready, reason },
+        // Spec §24 canonical names (aliases kept above for existing consumers)
+        databasePath: dbFileStatus.path,
+        databaseExists: dbFileStatus.path ? require('fs').existsSync(dbFileStatus.path) : false,
+        schemaStatus: {
+          ok: Object.values(syncTablesStatus).every(Boolean) && !!schemaVersion,
+          version: schemaVersion,
+          syncTables: syncTablesStatus,
+        },
+        initializationState: initializationStatus,
+        pendingMutations: pendingOutgoingMutations,
+        realtimeConnected,
+        lastSyncError: lastError,
+      })
+    } catch (err) {
+      return c.json({ success: false, error: String(err), tables: 0 })
+    }
+  })
+
+  // POST /api/sync/initial-sync/run — run the stage-based initial sync
+  // (local-api/initial-sync.js runInitialSync) with the current session.
+  // This is the loading-screen fallback path (primary is the IPC bridge →
+  // cloud-sync:initial-sync). Progress events are emitted on the local
+  // event bus as 'initial-sync:progress'. On success the sync engine's
+  // pull cursor is initialized from the snapshot sequence and the
+  // background engine is started.
+  app.post('/api/sync/initial-sync/run', authMiddleware, async (c) => {
+    try {
+      const { runInitialSync } = require('./initial-sync')
+      const user = c.get('user')
+      const agencyId = user?.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      const token = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-Local-Token')
+      const cloudUrl = process.env.BLASTI_CLOUD_URL || 'http://localhost:3003'
+
+      const result = await runInitialSync({
+        agencyId,
+        cloudAuthToken: token,
+        cloudUrl,
+        db,
+        // Task 48: session identity → stale-generation pre-flight (Step 0b).
+        sessionUserId: user?.id || null,
+        sessionUserEmail: user?.email || null,
+        sessionUserUsername: user?.username || null,
+        emitFn: (evt) => {
+          emitEvent('initial-sync:progress', evt)
+          console.log('[LocalAPI][InitialSync evt]', evt.type, evt.stage || '')
+        },
+      })
+
+      // Initialize the engine cursor + start the background engine.
+      try {
+        const syncService = require('./sync-service')
+        if (result && result.success && typeof result.snapshotSequence === 'number') {
+          // CURSOR INVARIANT (field round 6): prefer the BRIDGE's final
+          // sequence (ledger-proven coverage) over the raw snapshotSequence.
+          const adoptedSeq = (typeof result.bridgeFinalSequence === 'number' && result.bridgeFinalSequence >= result.snapshotSequence)
+            ? result.bridgeFinalSequence
+            : result.snapshotSequence
+          await syncService.setInitialCursor(adoptedSeq, { source: 'http-post-init', snapshotSequence: result.snapshotSequence, bridgeFinalSequence: result.bridgeFinalSequence ?? null })
+        }
+        if (!syncService.getStatus()?.isStarted) {
+          syncService.startSync({ localDb: db, cloudBaseUrl: cloudUrl, agencyId })
+        }
+      } catch (syncErr) {
+        console.warn('[LocalAPI] post-initial-sync engine wiring failed:', syncErr.message)
+      }
+
+      return c.json({
+        success: !!result?.success,
+        totalRecords: result?.totalRecords ?? 0,
+        duration: result?.duration ?? 0,
+        alreadyInitialized: !!result?.alreadyInitialized,
+        snapshotSequence: result?.snapshotSequence,
+        error: result?.error || undefined,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] /api/sync/initial-sync/run error:', error)
+      return c.json({ success: false, error: error?.message || 'Initial sync failed' }, 500)
+    }
+  })
+
+  // GET /api/cloud-health — check if local API can reach the cloud API
+  // This endpoint is used by the diagnosis panel to verify local→cloud connectivity
+  app.get('/api/cloud-health', async (c) => {
+    const cloudUrl = process.env.BLASTI_CLOUD_URL || 'http://localhost:3003'
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 2000)
+      const res = await fetch(`${cloudUrl}/health`, { signal: controller.signal })
+      clearTimeout(timer)
+      return c.json({
+        success: res.ok,
+        cloudReachable: true,
+        cloudUrl,
+        statusCode: res.status,
+        latency: null, // measured externally
+      })
+    } catch (err) {
+      return c.json({
+        success: false,
+        cloudReachable: false,
+        cloudUrl,
+        error: err.message || 'Connection failed',
+      })
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 15. ADDITIONAL OFFLINE ROUTES
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // POST /api/agency/queue/call-next — alias (frontend calls this path)
+  app.post('/api/agency/queue/call-next', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+
+      const body = await c.req.json().catch(() => ({}))
+      const { serviceId, counterId, branchId } = body
+
+      // Task 37-d: queue actions need canManageQueue; a non-owner caller must
+      // operate from a counter they personally occupy (OCCUPY_COUNTER_FIRST).
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+      const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
+      if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
+
+      // Task 24: parity with the CLOUD call-next — order by queueNumber ASC
+      // (Postpone Paradox fix), skip FUTURE-DATE tickets, and skip fixed-time
+      // tickets whose preferred time has not arrived yet.
+      const where = { agencyId, status: 'WAITING' }
+      if (serviceId) where.serviceId = serviceId
+      // branchId filter removed — Reservation has no branchId field
+
+      const candidates = await db.reservation.findMany({
+        where,
+        orderBy: { queueNumber: 'asc' },
+        take: 200,
+      })
+
+      const next = pickNextLocalCustomer(candidates, new Date())
+
+      if (!next) {
+        const anyWaiting = await db.reservation.findFirst({ where, orderBy: { queueNumber: 'asc' } })
+        if (!anyWaiting) {
+          return c.json({ success: false, error: 'No customers in queue' }, 404)
+        }
+        return c.json({
+          success: false,
+          error: 'All waiting reservations have preferred times in the future. No one to call yet.',
+          hasPreferredTimeOnly: true,
+        })
+      }
+
+      const now = new Date()
+
+      // Call the customer
+      await db.reservation.update({
+        where: { id: next.id },
+        data: {
+          status: 'CALLED',
+          calledAt: now,
+          // calledBy: removed — not a Reservation schema field
+          counterId: counterId || null,
+        },
+      })
+
+      // Update current serving number in queue settings
+      const qs = await db.queueSettings.findFirst({ where: { agencyId } })
+      if (qs) {
+        await db.queueSettings.update({
+          where: { id: qs.id },
+          data: { currentServingNumber: next.queueNumber },
+        })
+      }
+
+      // Update positions of remaining waiting reservations
+      const remainingWaiting = await db.reservation.findMany({
+        where: { agencyId, status: 'WAITING' },
+        orderBy: { joinedAt: 'asc' },
+      })
+      // position reassignment loop removed — position is not a schema field
+
+      const updated = await db.reservation.findUnique({ where: { id: next.id } })
+
+      emitEvent('queue:called', { agencyId, reservation: updated })
+
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/queue/call-next error:', error)
+      return c.json({ success: false, error: 'Failed to call next customer' }, 500)
+    }
+  })
+
+  // POST /api/agency/queue/walk-in-token — QR-based walk-in
+  app.post('/api/agency/queue/walk-in-token', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      const body = await c.req.json().catch(() => ({}))
+      const { serviceId, customerName, phone } = body
+      if (!serviceId) return c.json({ success: false, error: 'serviceId required' }, 400)
+      const service = await db.service.findUnique({ where: { id: serviceId } })
+      if (!service || service.agencyId !== agencyId) return c.json({ success: false, error: 'Service not found' }, 404)
+      // Task 37-d: open/paused/full gates (mirror of the cloud walk-in path).
+      const tokenIssuanceGate = await checkQueueIssuanceGates(agencyId)
+      if (tokenIssuanceGate) return c.json(tokenIssuanceGate.body, tokenIssuanceGate.status)
+      // Task 37-d fix: queueNumber is an INT column — keep the 6-digit token
+      // as the DISPLAY number only and take the Int from the issued-number
+      // cursor (the old string-into-Int write 500'd every token walk-in).
+      const qsToken = await db.queueSettings.findFirst({ where: { agencyId } })
+      const newTokenNumber = (qsToken?.lastIssuedNumber || 0) + 1
+      // Generate a 6-digit token code
+      const tokenCode = String(Math.floor(100000 + Math.random() * 900000))
+      const now = new Date()
+      const reservation = await db.reservation.create({
+        data: {
+          agencyId,
+          serviceId,
+          userId: sessionUser.id,
+          queueNumber: newTokenNumber,
+          displayNumber: tokenCode,
+          status: 'WAITING',
+          walkInCustomerName: customerName || 'Token',
+          isWalkIn: true,
+          joinedAt: now,
+          estimatedWait: 0,
+        },
+      })
+      try {
+        if (qsToken) {
+          await db.queueSettings.update({ where: { id: qsToken.id }, data: { lastIssuedNumber: newTokenNumber } })
+        } else {
+          await db.queueSettings.create({
+            data: { agencyId, lastIssuedNumber: newTokenNumber, currentServingNumber: 0, isPaused: false },
+          })
+        }
+      } catch { /* cursor is best-effort for the token flow */ }
+      emitEvent('reservation:created', { agencyId, reservation })
+      return c.json({ success: true, data: { ...reservation, tokenCode } }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] walk-in-token error:', error)
+      return c.json({ success: false, error: 'Failed to create token walk-in' }, 500)
+    }
+  })
+
+  // PATCH /api/agency/services/:id — update service
+  app.patch('/api/agency/services/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      // Task 37-d: service management needs canManageServices (owners bypass).
+      const permGate = await checkAgencyPermission(undefined, 'canManageServices')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      const id = c.req.param('id')
+      const body = await c.req.json()
+      const existing = await db.service.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Service not found' }, 404)
+      // Task 37-a: nameAr/nameFr are real Service columns (schema.prisma) the
+      // UI sends — the old whitelist silently dropped translations on edits.
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'prefix', 'description', 'isActive'] // estimatedDuration removed — not a Service schema field
+      const updateData = {}
+      for (const field of allowedFields) {
+        if (body[field] !== undefined) updateData[field] = body[field]
+      }
+      if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields' }, 400)
+      // Task 37-a: wrap in the same outbox transaction as branch create/update
+      // so offline service edits replay to the cloud (deterministic record update).
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.service.update({ where: { id }, data: updateData })
+        await logDeterministicOutcome('Service', id, 'update', row, null, { tx })
+        return row
+      })
+      emitEvent('service:updated', { agencyId, serviceId: id, ...updateData })
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] PATCH service error:', error)
+      return c.json({ success: false, error: 'Failed to update service' }, 500)
+    }
+  })
+
+  // DELETE /api/agency/services/:id — soft-delete service
+  app.delete('/api/agency/services/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      // Task 37-d: service management needs canManageServices (owners bypass).
+      const permGate = await checkAgencyPermission(undefined, 'canManageServices')
+      if (!permGate.ok) return c.json(permGate.body, permGate.status)
+      const id = c.req.param('id')
+      const existing = await db.service.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Service not found' }, 404)
+      // Task 37-a: outbox-wrapped like the sibling branch delete so offline
+      // service deletions replay to the cloud (deterministic record delete).
+      await withOutboxTransaction(async (tx) => {
+        await tx.service.update({ where: { id }, data: { isActive: false } })
+        await logDeterministicOutcome('Service', id, 'delete', {}, null, { tx })
+      })
+      emitEvent('service:deleted', { agencyId, serviceId: id })
+      return c.json({ success: true, data: { id, deleted: true } })
+    } catch (error) {
+      console.error('[LocalAPI] DELETE service error:', error)
+      return c.json({ success: false, error: 'Failed to delete service' }, 500)
+    }
+  })
+
+  // POST /api/agency/staff/create — cloud-forwarding proxy (Task 31-C, BUG 7).
+  //
+  // The previous local handler implemented an obsolete "link an existing user
+  // by userId" contract and rejected the UI's body with "userId is required".
+  // The UI (agency-employees.tsx) and the cloud route (agency.ts POST
+  // /staff/create) both speak the "CREATE A NEW user account" contract —
+  // user creation is cloud-native: the cloud verifies agency ownership,
+  // hashes the password (scrypt), creates the User + AgencyStaff rows and
+  // returns { staff, initialPassword } 201. Deliberately NO
+  // logPendingMutation here — replaying this body would create a SECOND,
+  // divergent cloud user. The new rows reach this device through the normal
+  // sync pull instead (kicked below on success).
+  app.post('/api/agency/staff/create', authMiddleware, async (c) => {
+    try {
+      let bodyBuffer = null
+      try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
+      // Task 37-d: staff management is OWNER-only — local gate before the
+      // cloud forward (the cloud enforces too; this gives a clean 403).
+      let parsedCreateBody = null
+      try { parsedCreateBody = bodyBuffer ? JSON.parse(bodyBuffer.toString('utf8')) : null } catch { parsedCreateBody = null }
+      const createOwnerGate = await checkAgencyOwnerOnly(
+        (parsedCreateBody && parsedCreateBody.agencyId) || c.req.query('agencyId') || sessionUser.agencyId,
+      )
+      if (!createOwnerGate.ok) return c.json(createOwnerGate.body, createOwnerGate.status)
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/agency/staff/create', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(bodyBuffer ? { 'Content-Length': String(bodyBuffer.length) } : {}),
+            // Same session token requireAuth() validated — the cloud enforces
+            // agency ownership on the body's agencyId.
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: bodyBuffer,
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] Staff-create proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Creating a staff account requires an internet connection — the cloud API is unreachable',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) {
+        // Kick a sync round so the new User + AgencyStaff pull down at once.
+        try { if (fileSync) fileSync.schedule('staff-created') } catch { /* non-fatal */ }
+        try {
+          // Lazy require — sync-service lazily requires ./index (circular dep).
+          const syncService = require('./sync-service')
+          if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+        } catch { /* non-fatal */ }
+      }
+      // Cloud status + body pass through verbatim ({ staff, initialPassword } 201).
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] Staff-create proxy error:', error)
+      return c.json({ success: false, error: 'Failed to create staff' }, 500)
+    }
+  })
+
+  // PUT/PATCH /api/agency/staff/:id — update staff
+  for (const method of ['put', 'patch']) {
+    app[method]('/api/agency/staff/:id', authMiddleware, async (c) => {
+      try {
+        const agencyId = sessionUser.agencyId
+        if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+        const id = c.req.param('id')
+        const body = await c.req.json()
+        const existing = await db.agencyStaff.findUnique({ where: { id } })
+        if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Staff not found' }, 404)
+        const allowedFields = ['role', 'permissions', 'isActive']
+        const updateData = {}
+        for (const field of allowedFields) {
+          if (body[field] !== undefined) updateData[field] = body[field]
+        }
+        const updated = await db.agencyStaff.update({ where: { id }, data: updateData })
+        emitEvent('staff:updated', { agencyId, staffId: id, ...updateData })
+        return c.json({ success: true, data: updated })
+      } catch (error) {
+        console.error('[LocalAPI] Update staff error:', error)
+        return c.json({ success: false, error: 'Failed to update staff' }, 500)
+      }
+    })
+  }
+
+  // DELETE /api/agency/staff/:id — remove staff
+  app.delete('/api/agency/staff/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      // Task 37-d: staff management is OWNER-only.
+      const ownerGate = await checkAgencyOwnerOnly(c.req.query('agencyId') || agencyId)
+      if (!ownerGate.ok) return c.json(ownerGate.body, ownerGate.status)
+      const id = c.req.param('id')
+      const existing = await db.agencyStaff.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Staff not found' }, 404)
+      await db.agencyStaff.delete({ where: { id } })
+      emitEvent('staff:deleted', { agencyId, staffId: id })
+      return c.json({ success: true, data: { id, deleted: true } })
+    } catch (error) {
+      console.error('[LocalAPI] DELETE staff error:', error)
+      return c.json({ success: false, error: 'Failed to delete staff' }, 500)
+    }
+  })
+
+  // GET /api/agency/qr-code — QR code info (cloud-contract compatible)
+  // Mirrors apps/api/src/routes/agency.ts GET /qr-code: with ?code= (or the
+  // session agency's customCode) it returns a real SVG QR encoding the
+  // public queue URL — fully offline. ?format=json returns the structured
+  // info the local UI previously expected.
+  app.get('/api/agency/qr-code', authMiddleware, async (c) => {
+    try {
+      const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      const agency = await db.agency.findUnique({ where: { id: agencyId } })
+      if (!agency) return c.json({ success: false, error: 'Agency not found' }, 404)
+
+      const code = c.req.query('code') || agency.customCode
+      if (!code) return c.json({ success: false, error: 'Agency has no custom code' }, 400)
+
+      // Same payload the cloud encodes: <app-url>/?code=<customCode>
+      const appUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.BLASTI_PUBLIC_BASE_URL || 'http://localhost:3000'
+      const qrData = `${appUrl}/?code=${encodeURIComponent(code)}`
+
+      if (c.req.query('format') === 'json') {
+        return c.json({
+          success: true,
+          data: {
+            qrCodeUrl: null,
+            qrData,
+            displayUrl: qrData,
+            agencyName: agency.name,
+            agencyCode: code,
+            message: 'Use qrData with a client-side QR generator (works offline)',
+          },
+        })
+      }
+
+      // Default: SVG — identical content-type contract to the cloud route.
+      let QRCode = null
+      try { QRCode = require('qrcode') } catch { /* not bundled — optional */ }
+      if (QRCode && typeof QRCode.toString === 'function') {
+        const svg = await QRCode.toString(qrData, { type: 'svg', margin: 1, width: 240 })
+        return c.body(svg, 200, { 'Content-Type': 'image/svg+xml' })
+      }
+
+      // qrcode module unavailable in this build → JSON describing the data
+      // so the renderer can generate the QR client-side (qrcode npm package
+      // is bundled with the web UI).
+      return c.json({
+        success: true,
+        qrData,
+        agencyName: agency.name,
+        agencyCode: code,
+        message: 'QR generation module unavailable — render client-side from qrData',
+      })
+    } catch (error) {
+      console.error('[LocalAPI] QR code error:', error)
+      return c.json({ success: false, error: 'Failed to generate QR' }, 500)
+    }
+  })
+
+  // GET /api/reviews — list reviews (matches cloud API response format)
+  app.get('/api/reviews', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      const limit = parseInt(c.req.query('limit') || '100', 10)
+
+      const reviews = await db.review.findMany({
+        where: { agencyId },
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+        include: {
+          user: { select: { id: true, fullName: true, avatarUrl: true } },
+        },
+      })
+
+      const totalReviews = await db.review.count({ where: { agencyId } })
+      const agg = await db.review.aggregate({
+        where: { agencyId },
+        _avg: { rating: true },
+      })
+      const averageRating = agg._avg.rating ? Math.round(agg._avg.rating * 10) / 10 : 0
+
+      return c.json({
+        reviews: reviews.map((r) => ({
+          id: r.id,
+          rating: r.rating,
+          comment: r.comment,
+          replyText: r.replyText,
+          repliedAt: r.repliedAt?.toISOString() ?? null,
+          createdAt: r.createdAt instanceof Date ? r.createdAt.toISOString() : String(r.createdAt),
+          userId: r.userId,
+          agencyId: r.agencyId,
+          user: r.user ? { id: r.user.id, fullName: r.user.fullName, avatarUrl: r.user.avatarUrl } : { id: '', fullName: 'Unknown' },
+        })),
+        averageRating,
+        totalCount: totalReviews,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] List reviews error:', error)
+      return c.json({ reviews: [], averageRating: 0, totalCount: 0 })
+    }
+  })
+
+  // POST /api/reviews/:id/reply — reply to a review
+  app.post('/api/reviews/:id/reply', authMiddleware, async (c) => {
+    try {
+      const reviewId = c.req.param('id')
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
+      const body = await c.req.json()
+      const { text } = body
+      if (!text?.trim()) return c.json({ success: false, error: 'Reply text is required' }, 400)
+
+      const review = await db.review.findUnique({ where: { id: reviewId } })
+      if (!review || review.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Review not found' }, 404)
+      }
+
+      // Part Q: business write + outbox row commit atomically.
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.review.update({
+          where: { id: reviewId },
+          data: { replyText: text.trim(), repliedAt: new Date() },
+        })
+        await logDeterministicOutcome('Review', reviewId, 'update', { replyText: text.trim() }, null, { tx })
+        return row
+      })
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] Reply to review error:', error)
+      return c.json({ success: false, error: 'Failed to reply' }, 500)
+    }
+  })
+
+  // POST /api/reviews — create review
+  app.post('/api/reviews', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      const body = await c.req.json()
+      const { rating, comment } = body
+      if (!rating || rating < 1 || rating > 5) return c.json({ success: false, error: 'Rating must be 1-5' }, 400)
+      const review = await db.review.create({
+        data: {
+          agencyId,
+          userId: sessionUser.id,
+          rating,
+          comment: comment || null,
+        },
+      })
+      emitEvent('review:created', { agencyId, review })
+      return c.json({ success: true, data: review }, 201)
+    } catch (error) {
+      console.error('[LocalAPI] Create review error:', error)
+      return c.json({ success: false, error: 'Failed to create review' }, 500)
+    }
+  })
+
+  // GET /api/agency/export-csv — export reservations as CSV
+  app.get('/api/agency/export-csv', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      const dateFrom = c.req.query('dateFrom')
+      const dateTo = c.req.query('dateTo')
+      const where = { agencyId }
+      if (dateFrom || dateTo) {
+        where.joinedAt = {}
+        if (dateFrom) where.joinedAt.gte = new Date(dateFrom).getTime()
+        if (dateTo) where.joinedAt.lte = new Date(dateTo).getTime()
+      }
+      const reservations = await db.reservation.findMany({
+        where,
+        orderBy: { joinedAt: 'desc' },
+        take: 5000,
+      })
+      // Build CSV
+      const header = 'ID,Ticket,Display Number,Status,Service,Customer,Created At,Completed At\n'
+      const rows = reservations.map(r => {
+        const svc = r.serviceId || ''
+        const name = r.walkInCustomerName || ''
+        const created = r.joinedAt ? new Date(r.joinedAt).toISOString() : ''
+        const completed = r.completedAt ? new Date(r.completedAt).toISOString() : ''
+        return `${r.id},${r.displayNumber},${r.status},${svc},${name},${created},${completed}`
+      })
+      const csv = header + rows.join('\n')
+      return c.text(csv, 200, {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': 'attachment; filename=export.csv',
+      })
+    } catch (error) {
+      console.error('[LocalAPI] Export CSV error:', error)
+      return c.json({ success: false, error: 'Failed to export CSV' }, 500)
+    }
+  })
+
+  // POST /api/agency/queue/call/:id — call specific reservation
+  app.post('/api/agency/queue/call/:id', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: false, error: 'No agency associated' }, 403)
+      const id = c.req.param('id')
+      const body = await c.req.json().catch(() => ({}))
+      const { counterId } = body
+      // Task 37-d: queue actions need canManageQueue + counter occupancy.
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+      const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
+      if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
+      const existing = await db.reservation.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Reservation not found' }, 404)
+      if (!['WAITING', 'CALLED'].includes(existing.status)) {
+        return c.json({ success: false, error: 'Cannot call reservation with status: ' + existing.status }, 400)
+      }
+      const now = new Date()
+      await db.reservation.update({
+        where: { id },
+        data: {
+          status: 'CALLED',
+          calledAt: now,
+          // calledBy: removed — not a Reservation schema field
+          counterId: counterId || null,
+        },
+      })
+      const updated = await db.reservation.findUnique({ where: { id } })
+      emitEvent('queue:called', { agencyId, reservation: updated })
+      return c.json({ success: true, data: updated })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/queue/call/:id error:', error)
+      return c.json({ success: false, error: 'Failed to call reservation' }, 500)
+    }
+  })
+
+  // GET /api/probe — health check used by frontend
+  app.get('/api/probe', (c) => {
+    return c.json({ success: true, mode: 'local', timestamp: Date.now() })
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 16. OFFLINE MUTATION QUEUE (write-ahead log)
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/pending-mutations — get pending mutations (for sync service)
+  app.get('/api/pending-mutations', authMiddleware, async (c) => {
+    const mutations = await getPendingMutations()
+    return c.json({ success: true, data: mutations, total: mutations.length })
+  })
+
+  // GET /api/pending-mutations/count — quick count
+  // BUGFIX: the handler MUST return the awaited response to Hono. The old
+  // fire-and-forget `.then(r => c.json(...))` returned undefined from the
+  // handler → Hono threw "Context is not finalized" → 500 on every call.
+  app.get('/api/pending-mutations/count', async (c) => {
+    if (!db) return c.json({ success: true, count: 0 })
+    try {
+      const r = await db.$queryRawUnsafe(
+        'SELECT COUNT(*) as cnt FROM "_pending_mutations" WHERE status = \'pending\''
+      )
+      const raw = r && r[0] ? r[0].cnt : 0
+      return c.json({ success: true, count: typeof raw === 'bigint' ? Number(raw) : (raw || 0) })
+    } catch {
+      return c.json({ success: true, count: 0 })
+    }
+  })
+
+  // Initialize the pending mutations table on startup
+  ensurePendingMutationsTable().catch(() => {})
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // GLOBAL ERROR HANDLER
+  // ═══════════════════════════════════════════════════════════════════════
+
+  app.onError((err, c) => {
+    console.error(`[LocalAPI Error] ${c.req.method} ${c.req.path}:`, err)
+    const detail = err?.message || String(err)
+    // Include error detail so the renderer can log it for debugging
+    return c.json({ success: false, error: 'Internal server error', detail }, 500)
+  })
+
+  // ── Middleware: require DB ───────────────────────────────────────────
+  // Prevents 500 crashes when db is null (e.g. during startup race).
+  // Must be applied AFTER authMiddleware so it runs after auth.
+  const requireDb = async (c, next) => {
+    if (!db) {
+      return c.json({ success: false, error: 'Database not initialized' }, 503)
+    }
+    await next()
+  }
+
+  // Route count at registration-complete time (used by the 404 handler and
+  // the startup registry summary to prove which build is actually running).
+  let registeredRouteCount = -1
+  try { registeredRouteCount = (app.routes || []).length } catch { /* older hono — unknown */ }
+
+  // ═══ Device-facing board endpoints (public/* + device/*) ════════════
+  // TV boards / kiosks authenticate with a deviceToken (NOT a session).
+  // Registered BEFORE the static-UI catch-all so /api/* keeps priority.
+  // Task 2-b ORDER MATTERS: these static /device/* routes MUST register
+  // BEFORE the agency-devices management module below — the manager route
+  // POST /:id/pair is dynamic and, when registered first, SHADOWS the kiosk
+  // POST /device/pair (Hono resolves matching by registration order; the
+  // cloud file has the same ordering — static /device/pair at 1206 before
+  // /:id/pair at 2118).
+  registerDeviceBoardRoutes(app, {
+    authMiddleware,
+    getDb: () => db,
+    broadcast: (type, payload) => {
+      try { emitEvent(type, payload) } catch { /* non-fatal */ }
+      try { localRealtime.broadcastLocalRealtime(type, payload) } catch { /* non-fatal */ }
+    },
+    diagLog,
+    // Kiosk join-queue → local walk-in Reservation must reach the cloud via
+    // the canonical outbox (same transactional pattern as /queue/walk-in).
+    withOutboxTransaction,
+    logDeterministicOutcome,
+    checkQueueIssuanceGates,
+  })
+
+  // ═══ Agency devices + embedded discovery (Task A 2-c) ═══════════════════
+  // Device management + multi-protocol LAN discovery + cast for the local
+  // UI — registered BEFORE the static-UI catch-all below. Every route uses
+  // the session-scoped authMiddleware; agencyId always comes from the
+  // session (never from client query params).
+  registerAgencyDeviceRoutes(app, {
+    authMiddleware,
+    requireAgencyId,
+    getDb: () => db,
+    broadcast: (type, payload) => {
+      try { emitEvent(type, payload) } catch { /* non-fatal */ }
+      try { localRealtime.broadcastLocalRealtime(type, payload) } catch { /* non-fatal */ }
+    },
+    diagLog,
+  })
+
+  // ═══ Static UI server (Task 58) ═════════════════════════════════════════
+  // Serves the bundled Next.js static export (../out) so the packaged desktop
+  // window can load http://127.0.0.1:3080/ with WORKING absolute /_next/*
+  // asset paths (file:// loading resolves those against the filesystem root
+  // and yields a blank shell; a localhost:3000 dev server doesn't exist on
+  // user machines). Registered LAST — every /api/* route above keeps
+  // priority, unknown /api/* GETs fall through to a proper 404, and this
+  // route is unauthenticated by design (it only exposes public static files,
+  // mirroring any ordinary web server; the API itself stays token-gated).
+  {
+    const pathMod = require('path')
+    const fsMod = require('fs')
+    const STATIC_UI_ROOT = pathMod.resolve(__dirname, '..', 'out')
+    const STATIC_MIME = {
+      html: 'text/html; charset=utf-8',
+      js: 'text/javascript; charset=utf-8',
+      mjs: 'text/javascript; charset=utf-8',
+      css: 'text/css; charset=utf-8',
+      json: 'application/json; charset=utf-8',
+      txt: 'text/plain; charset=utf-8',
+      svg: 'image/svg+xml',
+      png: 'image/png',
+      jpg: 'image/jpeg',
+      jpeg: 'image/jpeg',
+      gif: 'image/gif',
+      webp: 'image/webp',
+      avif: 'image/avif',
+      ico: 'image/x-icon',
+      woff: 'font/woff',
+      woff2: 'font/woff2',
+      ttf: 'font/ttf',
+      otf: 'font/otf',
+      eot: 'application/vnd.ms-fontobject',
+      map: 'application/json',
+      wasm: 'application/wasm',
+      mp3: 'audio/mpeg',
+      wav: 'audio/wav',
+      mp4: 'video/mp4',
+      webm: 'video/webm',
+      xml: 'application/xml',
+      csv: 'text/csv',
+      webmanifest: 'application/manifest+json',
+    }
+    // Resolve a URL pathname to a file under STATIC_UI_ROOT. Tries, in order:
+    // the exact path, <path>/index.html (directory-style export) and
+    // <path>.html (page-style export). Path traversal is rejected.
+    const resolveStaticUiFile = (rawPathname) => {
+      let pathname
+      try { pathname = decodeURIComponent(new URL(rawPathname, 'http://x').pathname) } catch { return null }
+      pathname = pathname.split('?')[0].split('#')[0]
+      if (pathname.includes('\0')) return null
+      const rel = pathname.replace(/^\/+/, '')
+      const candidates = rel === ''
+        ? ['index.html']
+        : [rel, rel.replace(/\/$/, '') + '/index.html', rel.replace(/\/$/, '') + '.html']
+      for (const candidate of candidates) {
+        if (!candidate || candidate.endsWith('/') || candidate.endsWith('\\')) continue
+        const abs = pathMod.resolve(STATIC_UI_ROOT, candidate)
+        if (abs !== STATIC_UI_ROOT && !abs.startsWith(STATIC_UI_ROOT + pathMod.sep)) continue
+        try {
+          if (fsMod.statSync(abs).isFile()) return abs
+        } catch { /* try the next candidate */ }
+      }
+      return null
+    }
+    app.get('*', (c) => {
+      const file = resolveStaticUiFile(c.req.url)
+      if (!file) {
+        return c.json({ success: false, error: 'Not found', path: c.req.path }, 404)
+      }
+      const ext = pathMod.extname(file).slice(1).toLowerCase()
+      const mime = STATIC_MIME[ext] || 'application/octet-stream'
+      const isHtml = mime.startsWith('text/html')
+      const cacheControl = isHtml
+        ? 'no-cache'
+        : file.includes(pathMod.join('_next', 'static'))
+          ? 'public, max-age=31536000, immutable'
+          : 'no-cache'
+      try {
+        return c.body(fsMod.readFileSync(file), 200, {
+          'Content-Type': mime,
+          'Cache-Control': cacheControl,
+        })
+      } catch (err) {
+        return c.json({ success: false, error: 'Static read failed', detail: err.message }, 500)
+      }
+    })
+    console.log(`[LocalAPI] Static UI server active — root: ${STATIC_UI_ROOT}`)
+  }
+
+  // 404 handler — self-identifying (isolation aid): logs the unmatched
+  // method+path so a stale running build is immediately visible in the
+  // console (e.g. a 404 on /api/auth/import-session, which IS registered in
+  // the current checkout). The response also echoes the path so callers can
+  // distinguish this local 404 from any other server's.
+  app.notFound((c) => {
+    console.warn(`[LocalAPI] 404 — no route matched: ${c.req.method} ${c.req.path} (registered routes: ${registeredRouteCount}) — if this path should exist, the RUNNING local-api build is older than the checkout; fully restart the app`)
+    return c.json({ success: false, error: 'Not found', path: c.req.path }, 404)
+  })
+
+  return app
+}
+
+// ─── Start / Stop ─────────────────────────────────────────────────────────
+
+/**
+ * Start the embedded local API server.
+ * @param {string} dbPath - Path to the SQLite database file
+ * @param {number} [port] - Port to listen on (default: 3080)
+ * @param {object} [options] - Additional options
+ * @returns {Promise<{ port: number, db: SqliteDatabase }>}
+ */
+async function startLocalApi(dbPath, port, options) {
+  port = port || DEFAULT_PORT
+  options = options || {}
+
+  // ── Authoritative local DB startup (spec §3/§28) ────────────────────────
+  // Resolves the single authoritative path, migrates a legacy database if
+  // present (copy + verify), applies the controlled NON-DESTRUCTIVE schema
+  // lifecycle (create / adopt / upgrade / verify — never `prisma db push`
+  // with --accept-data-loss), sets pragmas, and logs the durable
+  // initialization state. Safe on every startup; idempotent.
+  db = localDb
+  const dbReady = await ensureDatabaseReady()
+  if (!dbReady.ok) {
+    console.error('[LocalAPI] Local database failed startup initialization:', dbReady.error)
+    // Keep serving so /api/db-status can surface the diagnostic state; the
+    // readiness gate will block the dashboard (no READY DB → no dashboard).
+  }
+  await setupPragmas()
+  console.log(`[LocalAPI] Prisma database initialized (local SQLite)`)
+
+  // ── Task 47: startup self-heal for the stale 'BASIC' tier default ─────
+  // The pre-Task-32 local DDL defaulted Agency.subscriptionTier to 'BASIC',
+  // so any agency row created LOCALLY (before its first sync pull) still
+  // carries that legacy default on existing Windows databases — SQLite can't
+  // ALTER a column DEFAULT, so the DDL fix alone can't reach them. Mirror of
+  // the cloud's one-time heal (agency.ts) and the subscription-endpoint heal
+  // below, hoisted to startup so the desktop never poses Basic as the built-in
+  // free tier anywhere (profile cards, kiosk, sync pushes). Idempotent,
+  // non-fatal; runs before the sync engine so pushes carry the healed tier.
+  try {
+    const healed = await db.$executeRawUnsafe(`
+      UPDATE Agency SET subscriptionTier = 'FREE', updatedAt = '${new Date().toISOString()}'
+      WHERE subscriptionTier = 'BASIC'
+        AND subscriptionStatus = 'INACTIVE'
+        AND subscriptionPlanId IS NULL
+        AND id NOT IN (SELECT DISTINCT agencyId FROM "Transaction" WHERE agencyId IS NOT NULL)
+    `)
+    if (healed > 0) {
+      console.log(`[LocalAPI] Startup tier heal: ${healed} never-paid agency row(s) 'BASIC' → 'FREE' (legacy local default)`)
+    }
+  } catch (tierHealErr) {
+    console.warn('[LocalAPI] Startup tier heal skipped (non-fatal):', tierHealErr?.message || tierHealErr)
+  }
+
+
+  // ── Round 15: local FILE STORE + FILE SYNC worker ─────────────────────
+  // Uploads land locally first (lib/file-store.js, under
+  // BLASTI_LOCAL_FILES_DIR); this worker mirrors them with the cloud
+  // (push local-only blobs / pull remote blobs / replay tombstones) as part
+  // of the sync engine. The v2 record engine above is untouched.
+  localOrigin = `http://${BIND_ADDRESS}:${port}`
+  fileSync = createFileSync({
+    db,
+    getCloudBaseUrl: cloudBaseUrl,
+    getSessionToken: () => sessionToken,
+    getSyncMeta: getLocalMeta,
+    setSyncMeta: setLocalMeta,
+  })
+  fileSync.start()
+  console.log(`[LocalAPI] File store: ${fileStore.resolveFilesRoot()} — file-sync worker started`)
+
+  // Round-7: repair legacy permanently-failed HTTP create rows before the
+  // sync engine starts replaying (idempotent — safe on every startup).
+  try {
+    await repairLegacyReservationCreates()
+  } catch (repairErr) {
+    console.warn('[LocalAPI] Legacy create repair skipped (non-fatal):', repairErr.message)
+  }
+
+  // Create Hono app
+  const app = createApp()
+
+  // Route registry summary (isolation aid): proves which routes the RUNNING
+  // build actually registered, so "404 on a known route" is instantly
+  // diagnosable as a stale build/checkout.
+  try {
+    const registeredRoutes = (app.routes || []).map(function (r) { return r.method + ' ' + r.path })
+    const hasImportSession = registeredRoutes.indexOf('POST /api/auth/import-session') !== -1
+    console.log(`[LocalAPI] Router: ${registeredRoutes.length} routes registered — POST /api/auth/import-session: ${hasImportSession ? 'registered' : 'MISSING (stale build!)'}`)
+  } catch (routeErr) {
+    console.warn('[LocalAPI] Route registry summary unavailable:', routeErr.message)
+  }
+
+  // ── IMPORTANT: DO NOT pre-create httpServer and pass it via createServer ──
+  // The @hono/node-server createAdaptorServer() attaches the Hono request
+  // listener to the server internally. If you pre-create the server with
+  // createServer() and pass it via createServer: () => httpServer, the
+  // request listener is NOT attached because the pre-created server ignores
+  // the requestListener argument. The server accepts connections but never
+  // responds, causing health probes to timeout.
+  //
+  // Instead, use serve() directly and capture the returned server reference.
+  // serve() creates the server with the listener attached, calls listen(),
+  // and returns the server. We wrap it in a Promise to await the listen callback.
+
+  const { serve } = require('@hono/node-server')
+
+  await new Promise((resolve, reject) => {
+    let settled = false
+
+    const server = serve({
+      fetch: app.fetch,
+      port,
+      hostname: BIND_ADDRESS,
+    }, (serverInfo) => {
+      // This callback fires when server.listen() succeeds
+      if (!settled) {
+        settled = true
+        console.log(`[LocalAPI] BLASTI Embedded API running on http://${BIND_ADDRESS}:${port}`)
+        resolve(serverInfo)
+      }
+    })
+
+    // Store the server reference for stopLocalApi() and getStatus()
+    httpServer = server
+
+    // Handle listen errors (e.g. EADDRINUSE — port already in use)
+    server.on('error', (err) => {
+      if (!settled) {
+        settled = true
+        console.error(`[LocalAPI] Failed to listen on port ${port}:`, err.message)
+        reject(err)
+      }
+    })
+  })
+
+  // ── Local realtime socket server (local-first, spec §7/§8) ────────────────
+  // The desktop UI connects its Socket.IO client to THIS server (use-realtime
+  // resolveSocketUrl → http://127.0.0.1:3080). Without it every UI realtime
+  // connection 404'd and the dashboard showed "offline mode" even while the
+  // cloud was healthy. Attach Socket.IO to the SAME HTTP server here.
+  try {
+    localRealtime.initLocalRealtime(httpServer, {
+      getSession: () => (sessionToken && sessionUser ? { token: sessionToken, user: sessionUser } : null),
+      // Device room joins (join:device) validate tokens against the LOCAL
+      // AgencyDevice mirror — TV boards/kiosks get realtime while offline.
+      getDb: () => db,
+      // Task 41 — rotation-grace awareness for socket auth: a renderer socket
+      // presenting the PREVIOUS token of the same session is accepted during
+      // the grace window instead of being rejected with
+      // "auth event rejected — token does not match the current local session".
+      getPreviousSessionToken: () =>
+        previousSessionTokenValid() ? previousSessionToken : null,
+    })
+    // Bridge the in-process event stream (emitEvent) onto the socket server —
+    // every local business mutation becomes a live UI event, OFFLINE included.
+    onEvent((event, payload) => {
+      try { localRealtime.broadcastLocalRealtime(event, payload) } catch { /* non-fatal */ }
+    })
+  } catch (rtErr) {
+    console.warn('[LocalAPI] Local realtime init failed (non-fatal — interval sync unaffected):', rtErr.message)
+  }
+
+  return { port, db }
+}
+
+/**
+ * Stop the embedded local API server.
+ */
+function stopLocalApi() {
+  // Close the realtime socket server BEFORE the HTTP server (it wraps it).
+  try { localRealtime.closeLocalRealtime() } catch { /* not started */ }
+  try { if (fileSync) fileSync.stop() } catch { /* not started */ }
+  if (httpServer) {
+    httpServer.close()
+    httpServer = null
+  }
+  if (db) {
+    try {
+      db.$disconnect()
+    } catch (e) {
+      console.warn('[LocalAPI] Error disconnecting database:', e.message)
+    }
+    db = null
+  }
+  sessionToken = null
+  sessionUser = null
+  previousSessionToken = null
+  previousSessionTokenAt = 0
+  eventListeners = []
+  console.log('[LocalAPI] Stopped')
+}
+
+/**
+ * Get the current session info.
+ * @returns {{ token: string, user: object } | null}
+ */
+function getSession() {
+  if (!sessionToken || !sessionUser) return null
+  return { token: sessionToken, user: sessionUser }
+}
+
+/**
+ * Set an active session (called from Electron main process).
+ * Task 41 — routed through assignSession: an IPC re-import of a STALE renderer
+ * token after a cloud-validated rotation no longer hard-invalidates the fresh
+ * token — it becomes the grace predecessor, ending the token tug-of-war that
+ * produced the intermittent "data loading failed" dashboard error.
+ * @param {string} token
+ * @param {object} user
+ */
+function setSession(token, user) {
+  // Defensive: never set a token without a valid user object.
+  // If user is null/undefined, both should stay null to keep them in sync.
+  if (!token || !user || typeof user !== 'object') {
+    console.warn('[LocalAPI] setSession called with invalid args — skipping')
+    return
+  }
+  assignSession(token, user, 'ipc:set-session')
+}
+
+/**
+ * Clear the active session.
+ */
+function clearSession() {
+  sessionToken = null
+  sessionUser = null
+  previousSessionToken = null
+  previousSessionTokenAt = 0
+}
+
+/**
+ * Get the current status of the local API.
+ * @returns {{ port: number|null, dbReady: boolean, sessionActive: boolean, uptime: number }}
+ */
+function getStatus() {
+  return {
+    port: httpServer ? httpServer.address()?.port : null,
+    dbReady: !!db,
+    sessionActive: !!sessionToken,
+    uptime: Math.floor(process.uptime()),
+    address: BIND_ADDRESS,
+  }
+}
+
+// ─── Module Exports ──────────────────────────────────────────────────────
+
+module.exports = {
+  startLocalApi,
+  stopLocalApi,
+  getSession,
+  setSession,
+  clearSession,
+  onEvent,
+  setMutationListener,
+  getStatus,
+  logPendingMutation,
+  logDeterministicOutcome,
+  withOutboxTransaction,
+  notifyMutationLogged,
+  getPendingMutations,
+  getOutboxStats,
+  markMutationCompleted,
+  markMutationFailed,
+  markMutationConflict,
+  markMutationSending,
+  classifyMutationFailure,
+  computeRetryBackoffMs,
+  deriveStableIdempotencyKey,
+  broadcastLocalRealtime: (...args) => localRealtime.broadcastLocalRealtime(...args),
+  setLocalRealtimeRelayContext: (...args) => localRealtime.setLocalRealtimeRelayContext(...args),
+  relayCloudRealtime: (...args) => localRealtime.relayCloudRealtime(...args),
+  getLocalRealtimeStats: () => localRealtime.getLocalRealtimeStats(),
+  repairLegacyReservationCreates,
+  // Task 42-c: pure analytics computation (harness-testable, no db access)
+  computeAgencyAnalyticsDashboard,
+  computeAnalyticsRange,
+  // Task 33-C: workspace lock / authorization surface
+  revokeLocalAuthorization,
+  markAuthorizationAuthorized,
+  getAuthorizationStatus,
+  invalidateAuthzCache,
+  DEFAULT_PORT,
+}

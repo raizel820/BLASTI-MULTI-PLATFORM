@@ -1,0 +1,133 @@
+appId: com.blasti.desktop
+productName: BLASTI
+# Path-safe executable name — electron-builder 26.x derives executableName
+# from the (scoped) package name "@blasti/desktop" → "@blastidesktop" and then
+# REFUSES to build: "executableName contains characters that cannot be safely
+# used in file paths". Installer FILE names still use ${productName}, so the
+# artifacts stay BLASTI-Setup-x.y.z.exe / BLASTI-x.y.z.AppImage / .dmg.
+executableName: blasti
+copyright: Copyright © 2025 BLASTI
+
+directories:
+  output: dist
+  buildResources: assets
+
+# ─── Files to Package ───────────────────────────────────────────────────────
+# Main process files, web app output, and local database.
+# node_modules production deps are auto-included by electron-builder.
+# NOTE: the runtime (schema migrations, sync registry) must be fully
+# self-contained — production desktop must not depend on the monorepo
+# packages/ tree, Prisma CLI, Bun or system Node (spec §27).
+files:
+  - main.js
+  - preload.js
+  # Task 71: load-env.js (the .env loader main.js requires at boot) was missing
+  # from this allowlist — dev ran fine (real file on disk) but the packaged app
+  # crashed with "Cannot find module './load-env'" on first launch.
+  - load-env.js
+  - package.json
+  - build-stamp.json
+  - local-api/**/*
+  - loading-screen.js
+  - out/**/*
+  - data/**/*
+  - prisma/schema.prisma
+  - prisma/generated/**/*
+  # The desktop SQLite Prisma client (prisma/generated) is also copied into
+  # resources/node_modules/.prisma/client by scripts/after-pack.js (outside
+  # asar — the query engine .node binary cannot load from inside an archive).
+  # Prisma query engine + generated client are picked up from
+  # node_modules automatically; the schema itself ships below via
+  # extraResources for diagnostics/reference (migrations are embedded
+  # in local-api/lib/schema-init-sql.js and need no CLI at runtime).
+
+# ─── ASAR Configuration ─────────────────────────────────────────────────────
+asar: true
+asarUnpack:
+  - out/**/*
+  - data/**/*
+  - prisma/generated/**/*
+
+npmRebuild: true
+
+# Task 55: copy @prisma/client + the generated .prisma/client (schema +
+# platform query engine) from bun's isolated store into resources/node_modules
+# after packing — electron-builder cannot follow bun's store layout itself.
+afterPack: scripts/after-pack.js
+
+# ─── Extra Resources (outside asar) ────────────────────────────────────────
+extraResources:
+  - from: assets
+    to: assets
+    filter:
+      - "**/*"
+  - from: data
+    to: data
+    filter:
+      - "*.db"
+
+# ─── Icon Configuration ───
+# electron-builder auto-converts icon.png (1024x1024) to platform-specific formats.
+# If icon.icns (mac) or icon.ico (win) exist, they take priority.
+mac:
+  category: public.app-category.business
+  target:
+    - target: dmg
+      arch:
+        - universal
+  icon: assets/icon.png
+  hardenedRuntime: true
+  gatekeeperAssess: false
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: assets/icon.png
+  artifactName: "${productName}-Setup-${version}.${ext}"
+  # Required for native modules like better-sqlite3
+  # npmRebuild in root config handles native module rebuild
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+  # NOTE: installerIcon/uninstallerIcon/installerHeaderIcon overrides REMOVED.
+  # electron-builder now derives them from win.icon (assets/icon.png) and its
+  # built-in header BMP. Forcing a 512x512 PNG into installerHeaderIcon made
+  # NSIS abort with: Error in macro MUI_UNPAGE_INIT / MUI_UNPAGE_WELCOME /
+  # !include: error in script: assistedInstaller.nsh (MUI2 header expects a
+  # small BMP, not a large PNG).
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: BLASTI
+  # Allow the installed app to be run immediately after installation
+  allowElevation: true
+
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+  category: Office
+  icon: assets/icon.png
+  # fpm requires a "Name <email>" maintainer (author-email check).
+  maintainer: BLASTI Team <admin@blasti.dz>
+  vendor: BLASTI
+
+deb:
+  # fpm package name + flat artifact name — the scoped "@blasti/desktop"
+  # package name would otherwise produce a broken nested artifact path
+  # (dist/@blasti/desktop_...deb — fpm aborts on the missing parent dir and
+  # the CI artifact glob dist/*.deb would never match it either).
+  packageName: blasti
+  artifactName: "blasti_${version}_${arch}.${ext}"
+
+publish:
+  provider: generic
+  url: https://releases.blasti.app/desktop

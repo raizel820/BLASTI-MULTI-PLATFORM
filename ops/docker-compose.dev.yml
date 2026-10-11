@@ -1,0 +1,35 @@
+# ════════════════════════════════════════════════════════════════
+# BLASTI — LOCAL DEVELOPMENT DATABASE ONLY
+# ════════════════════════════════════════════════════════════════
+# Gives your machine the PostgreSQL instance the app expects, with the
+# exact default credentials baked into packages/db/.env and packages/db/
+# index.ts (blasti / blasti / blasti on localhost:5432).
+#
+# Start (from the repository root):
+#     docker compose -f ops/docker-compose.dev.yml up -d
+#
+# Then just run the app as usual:
+#     bun run dev
+# ════════════════════════════════════════════════════════════════
+name: blasti-dev
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: blasti
+      POSTGRES_PASSWORD: blasti
+      POSTGRES_DB: blasti
+    volumes:
+      - pgdata_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U blasti -d blasti']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  pgdata_dev:

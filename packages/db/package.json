@@ -1,0 +1,31 @@
+{
+  "name": "@blasti/db",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.ts",
+  "types": "index.ts",
+  "exports": {
+    ".": {
+      "default": "./index.ts"
+    }
+  },
+  "scripts": {
+    "db:push": "bun scripts/db-cli.mjs prisma db push",
+    "db:force-reset": "bun scripts/db-cli.mjs prisma db push --force-reset",
+    "db:generate": "prisma generate",
+    "db:migrate": "bun scripts/db-cli.mjs prisma migrate dev",
+    "db:reset": "bun scripts/db-cli.mjs prisma migrate reset",
+    "db:seed": "bun run prisma/seed.ts",
+    "db:seed-if-empty": "bun run prisma/seed-if-empty.ts",
+    "db:studio": "bun scripts/db-cli.mjs prisma studio"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.11.1"
+  },
+  "devDependencies": {
+    "prisma": "^6.11.1"
+  },
+  "prisma": {
+    "seed": "bun run prisma/seed.ts"
+  }
+}

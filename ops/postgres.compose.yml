@@ -1,0 +1,49 @@
+# ════════════════════════════════════════════════════════════════
+# BLASTI — VPS DATABASE CONTAINER (PostgreSQL ONLY)
+# ════════════════════════════════════════════════════════════════
+# This is the ONLY thing Docker runs on the BLASTI VPS.
+# Everything else runs NATIVELY on the host as systemd services:
+#
+#     blasti-api  → Bun  (Hono + Socket.IO)  127.0.0.1:3003
+#     blasti-web  → Node (Next.js server)    127.0.0.1:3000
+#     caddy       → apt package              0.0.0.0:80/443
+#
+# Installed + managed automatically by scripts/deploy-digitalocean.sh
+# (modes: server-install / server-update). Reference: DEPLOY-GUIDE.md.
+#
+# Run manually from the ops/ folder:
+#     docker compose -f postgres.compose.yml \
+#         --env-file /etc/blasti/blasti.env up -d
+#
+# SECURITY
+#   • 5432 is published on 127.0.0.1 ONLY — the database is never
+#     reachable from the internet (ufw does not open it either).
+#   • All data lives in the named volume `blasti_pgdata`, which
+#     survives reboots, redeploys and even container removal.
+#   • Credentials come from /etc/blasti/blasti.env (never committed).
+# ════════════════════════════════════════════════════════════════
+
+name: blasti-db
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: blasti-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-blasti}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in /etc/blasti/blasti.env}
+      POSTGRES_DB: ${POSTGRES_DB:-blasti}
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-blasti} -d ${POSTGRES_DB:-blasti}']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  pgdata:
+    name: blasti_pgdata
