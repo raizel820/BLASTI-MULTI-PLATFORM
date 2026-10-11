@@ -1667,10 +1667,14 @@ html {
  *   • full-surface background-position gradient shifts (hero-animated-gradient,
  *     hero-gradient-title) repaint the whole screen every frame,
  *   • box-shadow pulses (cta-pulse-glow*) force full-element repaints,
- *   • floating bubbles keep the compositor permanently busy.
+ *   • floating bubbles keep the compositor permanently busy,
+ *   • shimmer-text / gradient-flow-bar repaint TEXT every frame,
+ *   • the 12-card testimonial marquee scrolls forever over backdrop-filter
+ *     glass — the single heaviest continuous GPU job on the page.
  * The STATIC styles (gradients, shadows, layout) remain — only the motion
- * stops. Paired with the MotionConfig reducedMotion switch in
- * landing-page.tsx, which handles the framer-motion side. */
+ * stops. Paired with the per-element compact gates in landing-page.tsx,
+ * which handle the framer-motion side (MotionConfig alone cannot cancel
+ * loops that started before the compact flag flipped). */
 @media (max-width: 767px), (prefers-reduced-motion: reduce) {
   .hero-animated-gradient,
   .landing-bubble,
@@ -1680,11 +1684,50 @@ html {
   .cta-pulse-glow-secondary,
   .cta-shine-sweep,
   .hero-heading-pulse,
-  .hero-gradient-title {
+  .hero-gradient-title,
+  .shimmer-text,
+  .gradient-flow-bar,
+  .cta-float-element,
+  .cta-float-element-reverse,
+  .landing-carousel-track,
+  .landing-carousel-dot {
     animation: none !important;
   }
   .hero-gradient-title {
     filter: none;
+  }
+
+  /* backdrop-filter is the most expensive effect a phone GPU can be given —
+     ~20 frosted-glass surfaces (cards + orbs) force a full re-blur of the
+     content behind them on every scroll frame and were a main flicker
+     source. Plain translucent fills keep the design, minus the blur. */
+  .glass-feature-card,
+  .glass-orb {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    background: rgba(255, 255, 255, 0.86) !important;
+  }
+  .dark .glass-feature-card,
+  .dark .glass-orb {
+    background: rgba(15, 23, 42, 0.86) !important;
+  }
+
+  /* The infinite testimonial marquee becomes a normal swipeable row on
+     phones — users scroll it themselves, the compositor stays idle. */
+  .landing-carousel-viewport {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x mandatory;
+    scrollbar-width: none;
+  }
+  .landing-carousel-viewport::-webkit-scrollbar {
+    display: none;
+  }
+  .landing-carousel-track {
+    scroll-snap-stop: always;
+  }
+  .landing-carousel-track > * {
+    scroll-snap-align: center;
   }
 }
 

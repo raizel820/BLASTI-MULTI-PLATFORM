@@ -242,8 +242,8 @@ function useCompactScreen(): boolean {
 function HeroParticles({ compact = false }: { compact?: boolean }) {
   // Use deterministic values derived from index to prevent SSR/client hydration mismatch
   // Enhanced with larger decorative bubbles, more varied sizes, and extra depth layers
-  // Mobile budget: 14 particles instead of 50 — opacity keyframe loops still
-  // run even under reducedMotion, so the COUNT is the lever on phones.
+  // Mobile budget: 14 STATIC particles (no rAF loops at all — 50 animated
+  // particles saturated the phone compositor and produced flicker).
   const particles = Array.from({ length: compact ? 14 : 50 }, (_, i) => ({
     id: i,
     x: seededRandom(i * 2) * 100,
@@ -261,42 +261,64 @@ function HeroParticles({ compact = false }: { compact?: boolean }) {
 
   return (
     <div className="absolute inset-0 overflow-hidden pointer-events-none">
-      {particles.map((p) => (
-        <motion.div
-          key={p.id}
-          className="absolute rounded-full"
-          style={{
-            left: `${p.x}%`,
-            top: `${p.y}%`,
-            width: p.size,
-            height: p.size,
-            background: p.id < 7
-              ? 'radial-gradient(circle, rgba(16,185,129,0.5) 0%, rgba(20,184,166,0.15) 70%, transparent 100%)'
-              : p.id < 20
-                ? 'radial-gradient(circle, rgba(6,182,212,0.35) 0%, rgba(20,184,166,0.1) 70%, transparent 100%)'
-                : 'radial-gradient(circle, rgba(6,182,212,0.25) 0%, rgba(20,184,166,0.06) 70%, transparent 100%)',
-          }}
-          animate={{
-            y: [0, -40, -10, -35, 0],
-            x: [0, 15, -10, 12, 0],
-            opacity: [p.opacity, p.opacity * 2.5, p.opacity * 1.5, p.opacity * 3, p.opacity],
-            scale: [1, 1.25, 1.1, 1.35, 1],
-          }}
-          transition={{
-            duration: p.duration,
-            repeat: Infinity,
-            ease: 'easeInOut',
-            delay: p.delay,
-          }}
-        />
-      ))}
+      {particles.map((p) =>
+        compact ? (
+          // Phones: static painted dots — zero rAF, zero compositor churn.
+          <div
+            key={p.id}
+            className="absolute rounded-full"
+            style={{
+              left: `${p.x}%`,
+              top: `${p.y}%`,
+              width: p.size,
+              height: p.size,
+              opacity: p.opacity,
+              background: p.id < 7
+                ? 'radial-gradient(circle, rgba(16,185,129,0.5) 0%, rgba(20,184,166,0.15) 70%, transparent 100%)'
+                : p.id < 20
+                  ? 'radial-gradient(circle, rgba(6,182,212,0.35) 0%, rgba(20,184,166,0.1) 70%, transparent 100%)'
+                  : 'radial-gradient(circle, rgba(6,182,212,0.25) 0%, rgba(20,184,166,0.06) 70%, transparent 100%)',
+            }}
+          />
+        ) : (
+          <motion.div
+            key={p.id}
+            className="absolute rounded-full"
+            style={{
+              left: `${p.x}%`,
+              top: `${p.y}%`,
+              width: p.size,
+              height: p.size,
+              background: p.id < 7
+                ? 'radial-gradient(circle, rgba(16,185,129,0.5) 0%, rgba(20,184,166,0.15) 70%, transparent 100%)'
+                : p.id < 20
+                  ? 'radial-gradient(circle, rgba(6,182,212,0.35) 0%, rgba(20,184,166,0.1) 70%, transparent 100%)'
+                  : 'radial-gradient(circle, rgba(6,182,212,0.25) 0%, rgba(20,184,166,0.06) 70%, transparent 100%)',
+            }}
+            animate={{
+              y: [0, -40, -10, -35, 0],
+              x: [0, 15, -10, 12, 0],
+              opacity: [p.opacity, p.opacity * 2.5, p.opacity * 1.5, p.opacity * 3, p.opacity],
+              scale: [1, 1.25, 1.1, 1.35, 1],
+            }}
+            transition={{
+              duration: p.duration,
+              repeat: Infinity,
+              ease: 'easeInOut',
+              delay: p.delay,
+            }}
+          />
+        ),
+      )}
 
-      {/* Large decorative blurred orbs */}
-      <motion.div
-        className="absolute top-1/4 start-10 w-36 h-36 rounded-full bg-emerald-400/15 dark:bg-emerald-500/8 blur-3xl"
-        animate={{ x: [0, 25, -12, 18, 0], y: [0, -18, 12, -22, 0] }}
-        transition={{ duration: 15, repeat: Infinity, ease: 'easeInOut' }}
-      />
+      {/* Large decorative blurred orbs — desktop only */}
+      {!compact && (
+        <motion.div
+          className="absolute top-1/4 start-10 w-36 h-36 rounded-full bg-emerald-400/15 dark:bg-emerald-500/8 blur-3xl"
+          animate={{ x: [0, 25, -12, 18, 0], y: [0, -18, 12, -22, 0] }}
+          transition={{ duration: 15, repeat: Infinity, ease: 'easeInOut' }}
+        />
+      )}
       {!compact && (
         <>
           <motion.div
@@ -405,23 +427,36 @@ export function LandingPage() {
     { icon: Landmark, labelKey: 'trustedGov' as const },
   ];
 
-  // Back to top button visibility + sticky header scroll tracking
+  // Back to top button visibility + sticky header scroll tracking.
+  // HYSTERESIS: the mobile URL bar collapses/expands while scrolling and the
+  // reported flicker included the header/back-to-top flashing when scrollY sat
+  // on the old single threshold. Separate on/off thresholds stop the toggle.
   useEffect(() => {
     const handleScroll = () => {
-      setShowBackToTop(window.scrollY > 400);
-      setScrolled(window.scrollY > 50);
+      const y = window.scrollY;
+      setShowBackToTop((prev) => (y > 440 ? true : y < 360 ? false : prev));
+      setScrolled((prev) => (y > 64 ? true : y < 40 ? false : prev));
     };
     window.addEventListener('scroll', handleScroll, { passive: true });
     return () => window.removeEventListener('scroll', handleScroll);
   }, []);
 
-  // Testimonial auto-rotate
+  // Testimonial auto-rotate — mobile-flicker hardening:
+  //  • setInterval piled up callbacks while the phone had the tab backgrounded
+  //    and fired them in a burst on return → the card rapidly flip-flopped
+  //    ("text appearing and disappearing"). A self-rearming setTimeout can
+  //    never queue more than one tick.
+  //  • the timer only runs while the testimonials section is actually on
+  //    screen, so no off-screen churn and no work while the user is at the top
+  //    of the page.
+  const testimonialsInView = useInView(testimonialsRef, { margin: '-80px 0px' });
   useEffect(() => {
-    const interval = setInterval(() => {
+    if (!testimonialsInView || document.hidden) return;
+    const id = setTimeout(() => {
       setActiveTestimonial((prev) => (prev + 1) % testimonials.length);
     }, 5000);
-    return () => clearInterval(interval);
-  }, [testimonials.length]);
+    return () => clearTimeout(id);
+  }, [testimonialsInView, activeTestimonial, testimonials.length]);
 
   const scrollToTop = useCallback(() => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -446,81 +481,91 @@ export function LandingPage() {
             backgroundSize: '32px 32px',
           }}
         />
-        {/* Mesh gradient blobs - enhanced with more layers */}
-        <motion.div
-          animate={{ x: [0, 30, 0], y: [0, -20, 0], scale: [1, 1.1, 1] }}
-          transition={{ duration: 15, repeat: Infinity, ease: 'easeInOut' }}
-          className="absolute top-0 start-1/4 w-96 h-96 bg-emerald-200/40 dark:bg-emerald-800/15 rounded-full blur-3xl"
-        />
-        <motion.div
-          animate={{ x: [0, -20, 0], y: [0, 30, 0] }}
-          transition={{ duration: 18, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
-          className="absolute bottom-1/4 end-1/4 w-80 h-80 bg-teal-200/40 dark:bg-teal-800/15 rounded-full blur-3xl"
-        />
-        <motion.div
-          animate={{ scale: [1, 1.2, 1] }}
-          transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut' }}
-          className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-emerald-300/10 dark:bg-emerald-700/5 rounded-full blur-3xl"
-        />
-        {/* Additional mesh layer: cyan blob */}
-        <motion.div
-          animate={{ x: [0, 25, -10, 15, 0], y: [0, -15, 25, -10, 0], scale: [1, 1.15, 0.95, 1.1, 1] }}
-          transition={{ duration: 20, repeat: Infinity, ease: 'easeInOut', delay: 4 }}
-          className="absolute top-[10%] end-[15%] w-72 h-72 bg-cyan-200/25 dark:bg-cyan-800/10 rounded-full blur-3xl"
-        />
-        {/* Additional mesh layer: teal mid-section blob */}
-        <motion.div
-          animate={{ x: [0, -15, 20, -8, 0], y: [0, 20, -10, 15, 0] }}
-          transition={{ duration: 16, repeat: Infinity, ease: 'easeInOut', delay: 6 }}
-          className="absolute top-[60%] start-[10%] w-64 h-64 bg-teal-200/20 dark:bg-teal-800/8 rounded-full blur-3xl"
-        />
+        {/* Mesh gradient blobs - decorative only. UNMOUNTED on phones:
+            five blur-3xl layers being transformed forever is exactly what
+            evicts GPU layers on mobile (elements visibly vanish/pop back). */}
+        {!compact && (
+          <>
+            <motion.div
+              animate={{ x: [0, 30, 0], y: [0, -20, 0], scale: [1, 1.1, 1] }}
+              transition={{ duration: 15, repeat: Infinity, ease: 'easeInOut' }}
+              className="absolute top-0 start-1/4 w-96 h-96 bg-emerald-200/40 dark:bg-emerald-800/15 rounded-full blur-3xl"
+            />
+            <motion.div
+              animate={{ x: [0, -20, 0], y: [0, 30, 0] }}
+              transition={{ duration: 18, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
+              className="absolute bottom-1/4 end-1/4 w-80 h-80 bg-teal-200/40 dark:bg-teal-800/15 rounded-full blur-3xl"
+            />
+            <motion.div
+              animate={{ scale: [1, 1.2, 1] }}
+              transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut' }}
+              className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-emerald-300/10 dark:bg-emerald-700/5 rounded-full blur-3xl"
+            />
+            {/* Additional mesh layer: cyan blob */}
+            <motion.div
+              animate={{ x: [0, 25, -10, 15, 0], y: [0, -15, 25, -10, 0], scale: [1, 1.15, 0.95, 1.1, 1] }}
+              transition={{ duration: 20, repeat: Infinity, ease: 'easeInOut', delay: 4 }}
+              className="absolute top-[10%] end-[15%] w-72 h-72 bg-cyan-200/25 dark:bg-cyan-800/10 rounded-full blur-3xl"
+            />
+            {/* Additional mesh layer: teal mid-section blob */}
+            <motion.div
+              animate={{ x: [0, -15, 20, -8, 0], y: [0, 20, -10, 15, 0] }}
+              transition={{ duration: 16, repeat: Infinity, ease: 'easeInOut', delay: 6 }}
+              className="absolute top-[60%] start-[10%] w-64 h-64 bg-teal-200/20 dark:bg-teal-800/8 rounded-full blur-3xl"
+            />
+          </>
+        )}
       </div>
 
-      {/* Floating glass orbs with glass-morphism */}
-      <div className="absolute inset-0 pointer-events-none overflow-hidden">
-        <motion.div
-          animate={{ y: [0, -25, 0], x: [0, 15, 0] }}
-          transition={{ duration: 8, repeat: Infinity, ease: 'easeInOut' }}
-          className="absolute top-[12%] start-[5%] w-20 h-20 rounded-full glass-orb shadow-lg"
-        />
-        <motion.div
-          animate={{ y: [0, 20, 0], x: [0, -12, 0] }}
-          transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut', delay: 1 }}
-          className="absolute top-[22%] end-[10%] w-16 h-16 rounded-full glass-orb shadow-lg"
-        />
-        <motion.div
-          animate={{ y: [0, -15, 0], x: [0, 8, 0] }}
-          transition={{ duration: 7, repeat: Infinity, ease: 'easeInOut', delay: 3 }}
-          className="absolute top-[55%] end-[6%] w-14 h-14 rounded-full glass-orb shadow-lg"
-        />
-        <motion.div
-          animate={{ y: [0, 18, 0], x: [0, -10, 0] }}
-          transition={{ duration: 9, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
-          className="absolute top-[70%] start-[12%] w-12 h-12 rounded-full glass-orb shadow-lg"
-        />
-        {/* Small decorative dots */}
-        <motion.div
-          animate={{ y: [0, -12, 0] }}
-          transition={{ duration: 5, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
-          className="absolute top-[40%] start-[15%] w-2 h-2 rounded-full bg-emerald-400/30 dark:bg-emerald-500/20"
-        />
-        <motion.div
-          animate={{ y: [0, 10, 0], x: [0, -6, 0] }}
-          transition={{ duration: 9, repeat: Infinity, ease: 'easeInOut', delay: 4 }}
-          className="absolute top-[35%] start-[30%] w-1.5 h-1.5 rounded-full bg-teal-400/25 dark:bg-teal-500/10"
-        />
-        {/* Floating diamonds */}
-        <motion.div
-          animate={{ y: [0, -10, 0], rotate: [0, 180, 360] }}
-          transition={{ duration: 12, repeat: Infinity, ease: 'linear', delay: 3 }}
-          className="absolute top-[20%] end-[25%] w-6 h-6 rounded-md border border-emerald-300/30 dark:border-emerald-700/20 rotate-45"
-        />
-        <motion.div
-          animate={{ y: [0, 14, 0], rotate: [0, -180, -360] }}
-          transition={{ duration: 10, repeat: Infinity, ease: 'linear', delay: 1.5 }}
-          className="absolute top-[50%] start-[5%] w-4 h-4 rounded-md border border-teal-300/25 dark:border-teal-700/15 rotate-12"
-        />
-      </div>
+      {/* Floating glass orbs with glass-morphism — DESKTOP ONLY. 8 backdrop-
+          blurred layers animated forever thrash the phone GPU (backdrop-filter
+          must re-blur everything behind them every frame). */}
+      {!compact && (
+        <div className="absolute inset-0 pointer-events-none overflow-hidden">
+          <motion.div
+            animate={{ y: [0, -25, 0], x: [0, 15, 0] }}
+            transition={{ duration: 8, repeat: Infinity, ease: 'easeInOut' }}
+            className="absolute top-[12%] start-[5%] w-20 h-20 rounded-full glass-orb shadow-lg"
+          />
+          <motion.div
+            animate={{ y: [0, 20, 0], x: [0, -12, 0] }}
+            transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut', delay: 1 }}
+            className="absolute top-[22%] end-[10%] w-16 h-16 rounded-full glass-orb shadow-lg"
+          />
+          <motion.div
+            animate={{ y: [0, -15, 0], x: [0, 8, 0] }}
+            transition={{ duration: 7, repeat: Infinity, ease: 'easeInOut', delay: 3 }}
+            className="absolute top-[55%] end-[6%] w-14 h-14 rounded-full glass-orb shadow-lg"
+          />
+          <motion.div
+            animate={{ y: [0, 18, 0], x: [0, -10, 0] }}
+            transition={{ duration: 9, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
+            className="absolute top-[70%] start-[12%] w-12 h-12 rounded-full glass-orb shadow-lg"
+          />
+          {/* Small decorative dots */}
+          <motion.div
+            animate={{ y: [0, -12, 0] }}
+            transition={{ duration: 5, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
+            className="absolute top-[40%] start-[15%] w-2 h-2 rounded-full bg-emerald-400/30 dark:bg-emerald-500/20"
+          />
+          <motion.div
+            animate={{ y: [0, 10, 0], x: [0, -6, 0] }}
+            transition={{ duration: 9, repeat: Infinity, ease: 'easeInOut', delay: 4 }}
+            className="absolute top-[35%] start-[30%] w-1.5 h-1.5 rounded-full bg-teal-400/25 dark:bg-teal-500/10"
+          />
+          {/* Floating diamonds */}
+          <motion.div
+            animate={{ y: [0, -10, 0], rotate: [0, 180, 360] }}
+            transition={{ duration: 12, repeat: Infinity, ease: 'linear', delay: 3 }}
+            className="absolute top-[20%] end-[25%] w-6 h-6 rounded-md border border-emerald-300/30 dark:border-emerald-700/20 rotate-45"
+          />
+          <motion.div
+            animate={{ y: [0, 14, 0], rotate: [0, -180, -360] }}
+            transition={{ duration: 10, repeat: Infinity, ease: 'linear', delay: 1.5 }}
+            className="absolute top-[50%] start-[5%] w-4 h-4 rounded-md border border-teal-300/25 dark:border-teal-700/15 rotate-12"
+          />
+        </div>
+      )}
 
       {/* ─── Top Bar (Sticky with scroll-based background) ─────── */}
       <header
@@ -668,19 +713,32 @@ export function LandingPage() {
             transition={{ duration: 0.6 }}
             className="flex-1"
           >
-            {/* Floating Hero Icon */}
+            {/* Floating Hero Icon — loop re-targeted to a STATIC pose on
+                phones: changing the animate target interrupts+cancels the
+                running keyframe loop (MotionConfig alone cannot stop loops
+                that started before the compact flag flipped). */}
+            {compact ? (
+              <div className="inline-flex mb-4 lg:mb-6">
+                <div className="relative">
+                  <div className="relative h-18 w-18 md:h-24 md:w-24 rounded-3xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-2xl shadow-emerald-500/40">
+                    <Zap className="h-9 w-9 md:h-12 md:w-12 text-white" />
+                  </div>
+                </div>
+              </div>
+            ) : (
             <motion.div
               animate={{ y: [0, -14, 0], rotate: [0, 3, -3, 0] }}
               transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
               className="inline-flex mb-4 lg:mb-6"
             >
               <div className="relative">
+                {/* Blur halo pulse — decorative, desktop only */}
                 <motion.div
                   animate={{ scale: [1, 1.15, 1], opacity: [0.3, 0.6, 0.3] }}
                   transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
                   className="absolute inset-0 rounded-3xl bg-gradient-to-br from-emerald-400 to-teal-500 blur-xl"
                 />
-                {/* Rotating ring around icon */}
+                {/* Rotating ring around icon — decorative, desktop only */}
                 <motion.div
                   animate={{ rotate: 360 }}
                   transition={{ duration: 20, repeat: Infinity, ease: 'linear' }}
@@ -691,6 +749,7 @@ export function LandingPage() {
                 </div>
               </div>
             </motion.div>
+            )}
 
             <motion.div
               initial={{ opacity: 0, y: 10 }}
@@ -699,8 +758,8 @@ export function LandingPage() {
               className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 text-sm font-medium mb-6 border border-emerald-200/50 dark:border-emerald-800/50"
             >
               <motion.div
-                animate={{ rotate: [0, 15, -15, 0] }}
-                transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut', repeatDelay: 3 }}
+                animate={compact ? { rotate: 0 } : { rotate: [0, 15, -15, 0] }}
+                transition={compact ? undefined : { duration: 2, repeat: Infinity, ease: 'easeInOut', repeatDelay: 3 }}
               >
                 <TicketCheck className="h-4 w-4" />
               </motion.div>
@@ -748,8 +807,8 @@ export function LandingPage() {
                     <span className="relative flex items-center">
                       {t('getStarted')}
                       <motion.span
-                        animate={{ x: [0, 4, 0] }}
-                        transition={{ duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
+                        animate={compact ? { x: 0 } : { x: [0, 4, 0] }}
+                        transition={compact ? undefined : { duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
                         className="inline-flex ms-2"
                       >
                         <ArrowRight className="h-5 w-5 rtl:rotate-180" />
@@ -780,11 +839,14 @@ export function LandingPage() {
 
           </motion.div>
 
-          {/* Phone Mockup - visible on desktop */}
-          <PhoneMockup />
+          {/* Phone Mockup - desktop only. Unmounting on phones keeps the
+              floating-loop JS from ticking inside a display:none subtree. */}
+          {!compact && <PhoneMockup />}
         </div>
 
-        {/* Scroll indicator */}
+        {/* Scroll indicator — desktop-only mouse hint (also unmounted on
+            phones so its two bobbing loops never run) */}
+        {!compact && (
         <motion.div
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
@@ -806,6 +868,7 @@ export function LandingPage() {
             </div>
           </motion.div>
         </motion.div>
+        )}
       </section>
 
       {/* ─── Features Grid ─────────────────────────── */}
@@ -858,27 +921,19 @@ export function LandingPage() {
                         viewport={{ once: true }}
                         transition={{ duration: 0.4, delay: 0.2 + idx * 0.1 }}
                       >
-                        {/* Continuous floating animation */}
+                        {/* Continuous floating animation — frozen on phones */}
                         <motion.div
-                          animate={{ y: [0, -3, 0] }}
-                          transition={{ duration: 2.5 + idx * 0.3, repeat: Infinity, ease: 'easeInOut', delay: idx * 0.5 }}
+                          animate={compact ? { y: 0 } : { y: [0, -3, 0] }}
+                          transition={compact ? undefined : { duration: 2.5 + idx * 0.3, repeat: Infinity, ease: 'easeInOut', delay: idx * 0.5 }}
                           className="flex items-center justify-center"
                         >
                           <Icon className="h-6 w-6 text-emerald-600 dark:text-emerald-400" />
                         </motion.div>
-                        {/* Pulse ring around icon */}
+                        {/* Pulse ring around icon — invisible/static on phones */}
                         <motion.div
                           className="absolute inset-0 rounded-full border-2 border-emerald-400/0 group-hover:border-emerald-400/40"
-                          animate={{
-                            scale: [1, 1.3, 1],
-                            opacity: [0, 0.5, 0],
-                          }}
-                          transition={{
-                            duration: 2,
-                            repeat: Infinity,
-                            ease: 'easeInOut',
-                            delay: idx * 0.4,
-                          }}
+                          animate={compact ? { scale: 1, opacity: 0 } : { scale: [1, 1.3, 1], opacity: [0, 0.5, 0] }}
+                          transition={compact ? undefined : { duration: 2, repeat: Infinity, ease: 'easeInOut', delay: idx * 0.4 }}
                         />
                       </motion.div>
                       <div>
@@ -910,13 +965,16 @@ export function LandingPage() {
       >
         <div className="max-w-3xl mx-auto">
           <div className="relative rounded-3xl overflow-hidden landing-stats-bg p-1">
-            {/* Animated shine overlay */}
+            {/* Animated shine overlay — STATIC on phones (background-position
+                animation repaints the full element every frame) */}
             <motion.div
-              animate={{ backgroundPosition: ['0% 0%', '200% 0%'] }}
-              transition={{ duration: 4, repeat: Infinity, ease: 'linear' }}
+              animate={compact ? { backgroundPosition: '0% 0%' } : { backgroundPosition: ['0% 0%', '200% 0%'] }}
+              transition={compact ? undefined : { duration: 4, repeat: Infinity, ease: 'linear' }}
               className="absolute inset-0 bg-[length:200%_100%] bg-gradient-to-r from-emerald-300 via-teal-300 to-amber-300 opacity-20 rounded-3xl"
             />
-            {/* Decorative mesh blobs inside stats card */}
+            {/* Decorative mesh blobs inside stats card — desktop only */}
+            {!compact && (
+            <>
             <motion.div
               animate={{ x: [0, 20, 0], y: [0, -10, 0] }}
               transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut' }}
@@ -927,6 +985,8 @@ export function LandingPage() {
               transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
               className="absolute bottom-0 end-0 w-52 h-52 bg-teal-400/10 rounded-full blur-2xl"
             />
+            </>
+            )}
             <div className="relative rounded-[22px] bg-gradient-to-r from-emerald-600/90 to-teal-600/90 backdrop-blur-sm p-8 md:p-10 overflow-hidden">
               {/* Grid pattern overlay */}
               <div
@@ -954,11 +1014,11 @@ export function LandingPage() {
                         whileHover={{ scale: 1.1, rotate: [0, -5, 5, 0] }}
                         transition={{ duration: 0.3 }}
                       >
-                        {/* Pulse ring behind icon */}
+                        {/* Pulse ring behind icon — static on phones */}
                         <motion.div
                           className="absolute inset-0 rounded-2xl bg-white/10"
-                          animate={{ scale: [1, 1.4, 1], opacity: [0.3, 0, 0.3] }}
-                          transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut', delay: idx * 0.7 }}
+                          animate={compact ? { scale: 1, opacity: 0.3 } : { scale: [1, 1.4, 1], opacity: [0.3, 0, 0.3] }}
+                          transition={compact ? undefined : { duration: 3, repeat: Infinity, ease: 'easeInOut', delay: idx * 0.7 }}
                         />
                         <Icon className="h-6 w-6 text-white relative z-10" />
                       </motion.div>
@@ -1023,7 +1083,10 @@ export function LandingPage() {
                           </linearGradient>
                         </defs>
                       </svg>
-                      {/* Animated flowing dot along the line */}
+                      {/* Animated flowing dot along the line — desktop only
+                          (its `left` loop animates a layout property; never
+                          run it on phones) */}
+                      {!compact && (
                       <motion.div
                         className="absolute top-1/2 -translate-y-1/2"
                         initial={{ left: '0%' }}
@@ -1032,6 +1095,7 @@ export function LandingPage() {
                       >
                         <div className="h-2 w-2 rounded-full bg-emerald-400 shadow-sm shadow-emerald-400/60" />
                       </motion.div>
+                      )}
                       {/* Arrow dot at end */}
                       <motion.div
                         className="absolute end-0 top-1/2 -translate-y-1/2"
@@ -1059,7 +1123,9 @@ export function LandingPage() {
                           transition={{ duration: 0.8, delay: 0.5 + idx * 0.2 }}
                         />
                       </svg>
-                      {/* Flowing dot */}
+                      {/* Flowing dot (mobile connector) — animating `top` is a
+                          layout property; on phones it is removed entirely */}
+                      {!compact && (
                       <motion.div
                         className="absolute"
                         animate={{ top: ['0%', '100%'] }}
@@ -1067,6 +1133,7 @@ export function LandingPage() {
                       >
                         <div className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
                       </motion.div>
+                      )}
                       <motion.div
                         className="h-2 w-2 rounded-full bg-teal-400 dark:bg-teal-500 -mt-1 shadow-sm shadow-teal-400/50"
                         initial={{ scale: 0 }}
@@ -1084,17 +1151,17 @@ export function LandingPage() {
                     viewport={{ once: true }}
                     transition={{ duration: 0.6, delay: 0.3 + idx * 0.25 }}
                   >
-                    {/* Outer pulse ring */}
+                    {/* Outer pulse ring — static on phones */}
                     <motion.div
                       className="absolute inset-0 rounded-2xl bg-emerald-400/20 dark:bg-emerald-500/10"
-                      animate={{ scale: [1, 1.3, 1], opacity: [0.3, 0, 0.3] }}
-                      transition={{ duration: 2.5, repeat: Infinity, ease: 'easeInOut', delay: idx * 0.5 }}
+                      animate={compact ? { scale: 1, opacity: 0.3 } : { scale: [1, 1.3, 1], opacity: [0.3, 0, 0.3] }}
+                      transition={compact ? undefined : { duration: 2.5, repeat: Infinity, ease: 'easeInOut', delay: idx * 0.5 }}
                     />
-                    {/* Second pulse ring (staggered) */}
+                    {/* Second pulse ring (staggered) — static on phones */}
                     <motion.div
                       className="absolute inset-0 rounded-2xl bg-teal-400/15 dark:bg-teal-500/8"
-                      animate={{ scale: [1, 1.4, 1], opacity: [0.2, 0, 0.2] }}
-                      transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut', delay: idx * 0.5 + 1.25 }}
+                      animate={compact ? { scale: 1, opacity: 0.2 } : { scale: [1, 1.4, 1], opacity: [0.2, 0, 0.2] }}
+                      transition={compact ? undefined : { duration: 3, repeat: Infinity, ease: 'easeInOut', delay: idx * 0.5 + 1.25 }}
                     />
                     <div className="relative h-16 w-16 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-lg shadow-emerald-500/25 group-hover:shadow-xl group-hover:shadow-emerald-500/35 transition-shadow duration-300">
                       <Icon className="h-7 w-7 text-white" />
@@ -1134,7 +1201,7 @@ export function LandingPage() {
       </section>
 
       {/* ─── Testimonials Section ──────────────────── */}
-      <section id="testimonials" className="w-full px-4 py-20 md:py-24 relative z-10">
+      <section id="testimonials" ref={testimonialsRef} className="w-full px-4 py-20 md:py-24 relative z-10">
         {/* Subtle gradient overlay */}
         <div className="absolute inset-0 -z-10 bg-gradient-to-b from-transparent via-emerald-50/30 to-emerald-50/50 dark:from-transparent dark:via-emerald-950/10 dark:to-emerald-950/20" />
         <div className="max-w-4xl mx-auto">
@@ -1145,10 +1212,10 @@ export function LandingPage() {
             transition={{ duration: 0.5 }}
             className="text-center"
           >
-            {/* Decorative floating quote */}
+            {/* Decorative floating quote — frozen on phones */}
             <motion.div
-              animate={{ y: [0, -8, 0], rotate: [-6, -3, -6] }}
-              transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
+              animate={compact ? { y: 0, rotate: -6 } : { y: [0, -8, 0], rotate: [-6, -3, -6] }}
+              transition={compact ? undefined : { duration: 4, repeat: Infinity, ease: 'easeInOut' }}
               className="inline-block mb-4"
             >
               <Quote className="h-12 w-12 text-emerald-300 dark:text-emerald-700 rotate-180" />
@@ -1284,10 +1351,11 @@ export function LandingPage() {
             {/* Gradient fade overlays */}
             <div className="absolute start-0 top-0 bottom-8 w-16 bg-gradient-to-e from-[var(--color-bg)] to-transparent z-10 pointer-events-none rtl:bg-gradient-to-l" />
             <div className="absolute end-0 top-0 bottom-8 w-16 bg-gradient-to-s from-[var(--color-bg)] to-transparent z-10 pointer-events-none rtl:bg-gradient-to-r" />
-            {/* Carousel track */}
-            <div className="overflow-hidden">
+            {/* Carousel track — on phones the CSS turns this marquee into a
+                swipeable snap row (see globals.css landing-carousel-viewport) */}
+            <div className="landing-carousel-viewport overflow-hidden">
               <div
-                className="flex gap-4 w-max"
+                className="landing-carousel-track flex gap-4 w-max"
                 style={{
                   animationName: 'carousel-scroll',
                   animationDuration: '25s',
@@ -1331,7 +1399,7 @@ export function LandingPage() {
               {testimonials.map((_, i) => (
                 <div
                   key={`dot-${i}`}
-                  className="h-2 w-2 rounded-full bg-emerald-400 dark:bg-emerald-600"
+                  className="landing-carousel-dot h-2 w-2 rounded-full bg-emerald-400 dark:bg-emerald-600"
                   style={{
                     animation: `carousel-dot-pulse 3s ease-in-out ${i * 0.8}s infinite`,
                   }}
@@ -1427,7 +1495,9 @@ export function LandingPage() {
               <div className="cta-float-element absolute top-[60%] start-[20%] w-10 h-10 rounded-full border border-white/8 bg-white/3" />
               <div className="cta-float-element-reverse absolute top-[10%] end-[25%] w-8 h-8 rounded-md border border-white/10 bg-white/5 rotate-45" />
               <div className="cta-float-element absolute bottom-[10%] start-[40%] w-6 h-6 rounded-full border border-teal-300/20 bg-teal-400/10" />
-              {/* Large blurred orbs */}
+              {/* Large blurred orbs — desktop only */}
+              {!compact && (
+              <>
               <motion.div
                 animate={{ x: [0, 15, 0], y: [0, -10, 0], scale: [1, 1.1, 1] }}
                 transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut' }}
@@ -1438,6 +1508,8 @@ export function LandingPage() {
                 transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
                 className="absolute bottom-0 end-0 w-52 h-52 bg-cyan-300/8 rounded-full blur-3xl"
               />
+              </>
+              )}
             </div>
 
             <div className="relative z-10 text-center">
@@ -1488,8 +1560,8 @@ export function LandingPage() {
                     <span className="flex items-center">
                       {t('getStarted')}
                       <motion.span
-                        animate={{ x: [0, 4, 0] }}
-                        transition={{ duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
+                        animate={compact ? { x: 0 } : { x: [0, 4, 0] }}
+                        transition={compact ? undefined : { duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
                         className="inline-flex ms-2"
                       >
                         <ArrowRight className="h-5 w-5 rtl:rotate-180" />
