@@ -3793,3 +3793,22 @@ Work Log:
 Stage Summary:
 - New: .github/workflows/build-installers.yml + installer/{desktop,mobile}/ + README. After the user pushes this commit to GitHub (sandbox has no GH creds), the workflow runs automatically on master; installers land in installer/desktop + installer/mobile and as run artifacts.
 - Windows runner chosen for .exe (NSIS native; avoids the ARM64 qemu emulation issue discussed for the Ampere VPS — CI is the zero-impact path). ubuntu runner for APK (SDK preinstalled; JDK 21 matches Capacitor 8).
+
+---
+Task ID: ci-eacces-fix — main agent
+Agent: Z.ai Code (main)
+Task: Diagnose uploaded GitHub Actions log "2_Mobile debug APK (Android).txt" (user's first CI run of build-installers workflow) and fix the failure.
+
+Work Log:
+- LOG ANALYSIS: run on commit 553ed67 (user pushed the workflow to GitHub from their side; local master is on a diverged line — ahead 66/behind 46 — user syncs manually). Everything passed: checkout ✓, setup-java 21 ✓, SDK licenses ✓, bun install 966 pkgs 7.4s ✓, web export 12.4s 27 pages ✓, cap sync 11 plugins ✓. Single failure: "[gradle] Failed to start Gradle: spawn …/apps/mobile/android/gradlew EACCES" (exit 1) → publish-installers consequently skipped.
+- ROOT CAUSE: gradlew stored in git as mode 100644 (executable bit stripped — classic Windows-commit effect; user commits from Windows). Node spawn on Linux → EACCES.
+- FIX LAYER 1 (repo): git update-index --chmod=+x apps/mobile/android/gradlew → index mode now 100755 (survives Windows checkouts/commits).
+- FIX LAYER 2 (self-healing script): scripts/gradle.js now chmodSyncs gradlew 0o755 on non-Windows before spawn (with log + warn fallback) — Windows-touched clones can never EACCES again.
+- FIX LAYER 3 (CI defense): workflow mobile-apk job gains "Ensure gradlew is executable: chmod +x apps/mobile/android/gradlew" step before the build. Even a stale workflow-only sync makes the next run pass.
+- HOUSEKEEPING from log warnings: actions/checkout v4→v5 ×3, actions/setup-java v4→v5 (both were Node-20-deprecation warnings). upload/download-artifact stay v4 (current). Bun 1.4.3 resolved automatically.
+- VALIDATED: YAML safe_load OK; node --check scripts/gradle.js OK; git ls-files -s confirms 100755.
+
+Stage Summary:
+- Next CI run will pass the mobile job: chmod step runs BEFORE gradle regardless of the repo's exec bit; gradle.js self-heal is second net; committed git mode is the permanent fix.
+- User sync path: port this commit (or minimally the updated build-installers.yml + gradle.js) to GitHub and re-run the workflow. Fastest independent one-liner on their machine: git update-index --chmod=+x apps/mobile/android/gradlew && git commit -m "fix: gradlew exec bit" && git push.
+- Desktop job log not provided; if it also failed, upload job-1 log. On both passing, publish-installers auto-commits BLASTI-Setup-0.3.4.exe + BLASTI-v1.0.0-debug.apk into installer/.

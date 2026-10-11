@@ -48,6 +48,20 @@ if (!fs.existsSync(isWindows ? path.join(androidDir, 'gradlew.bat') : launcher))
   die(`Gradle wrapper not found: ${launcher}`);
 }
 
+// ─── Self-healing exec bit (CI safety) ───────────────────────────────────────
+// Repos committed from Windows often lose the executable bit on `gradlew`
+// (stored as git mode 100644) — on Linux/macOS the spawn then dies with
+// EACCES: "Failed to start Gradle: spawn …/gradlew EACCES". Restore +x here
+// so the wrapper always starts, even from a fresh Windows-touched clone.
+if (!isWindows) {
+  try {
+    fs.chmodSync(launcher, 0o755);
+    log('Ensured gradlew is executable (+x).');
+  } catch (err) {
+    warn(`Could not set gradlew executable bit (${err.message})`);
+  }
+}
+
 // ─── Java (JAVA_HOME) detection ──────────────────────────────────────────────
 // Gradle needs a JDK. Android Studio ships a private one (jbr) — prefer it so
 // users who installed Android Studio never have to configure anything.
