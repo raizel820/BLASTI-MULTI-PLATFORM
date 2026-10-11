@@ -9,6 +9,8 @@ import { Card, CardContent } from '@/components/ui/card';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
 import { DownloadSection } from '@/components/platform/download-section';
+// Download CTA with the REAL published installers (OS picker dropdown)
+import { DownloadAppButton } from '@/components/platform/download-app-button';
 import { motion, useInView, AnimatePresence, MotionConfig } from 'framer-motion';
 import {
   Clock,
@@ -380,10 +382,14 @@ export function LandingPage() {
   }, []);
 
   const stats = [
-    { icon: Users, value: 10000, suffix: '+', labelKey: 'landingStatActiveCustomers' as const },
-    { icon: Building2, value: 500, suffix: '+', labelKey: 'landingStatInstitutions' as const },
-    { icon: TicketCheck, value: 1, suffix: 'M+', labelKey: 'landingStatTickets' as const },
-    { icon: Activity, value: 99.9, suffix: '%', labelKey: 'landingStatUptime' as const, decimals: 1 },
+    // REAL platform statistics from GET /api/stats (stats.ts — live DB counts).
+    // While the request is in flight (or the API is unreachable) the honest
+    // value 0 is shown — the old hardcoded 10,000 / 500 / 1M+ / 99.9% fake
+    // numbers are gone.
+    { icon: Users, value: landingStats?.totalCustomers ?? 0, suffix: '+', labelKey: 'landingStatActiveCustomers' as const },
+    { icon: Building2, value: landingStats?.totalAgencies ?? 0, suffix: '+', labelKey: 'landingStatInstitutions' as const },
+    { icon: TicketCheck, value: landingStats?.totalReservations ?? 0, suffix: '+', labelKey: 'landingStatTickets' as const },
+    { icon: Activity, value: landingStats?.activeQueues ?? 0, suffix: '', labelKey: 'landingStatActiveQueues' as const },
   ];
 
   const testimonials = [
@@ -563,6 +569,24 @@ export function LandingPage() {
         <div className="flex items-center gap-1">
           <LanguageSwitcher />
           <ThemeToggle />
+          {/* Login + Download pair on md+ — the download button opens the
+              real-installer OS picker (windows/mac/linux + android release/
+              debug + ios). Icon-only variant on phones. */}
+          <div className="hidden md:flex items-center gap-1.5 ms-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-9 px-3 text-sm font-semibold text-emerald-700 dark:text-emerald-300 hover:bg-emerald-50 dark:hover:bg-emerald-950/40"
+              onClick={() => setView('login')}
+            >
+              {t('login')}
+            </Button>
+            <DownloadAppButton tone="solid" size="sm" />
+          </div>
+          {/* Phones: icon-only download in the header (login stays in the hero) */}
+          <div className="md:hidden ms-1">
+            <DownloadAppButton tone="solid" size="sm" iconOnly />
+          </div>
           {/* Mobile hamburger menu button */}
           <button
             onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
@@ -746,6 +770,11 @@ export function LandingPage() {
                   <span className="absolute inset-0 -translate-x-full group-hover:translate-x-full transition-transform duration-700 bg-gradient-to-r from-transparent via-emerald-500/5 to-transparent" />
                   <span className="relative">{t('login')}</span>
                 </Button>
+              </motion.div>
+              {/* Download CTA — real published installers with an OS picker
+                  (desktop: windows/mac/linux · mobile: android release+debug, ios) */}
+              <motion.div whileHover={{ scale: 1.08, y: -4 }} whileTap={{ scale: 0.97 }}>
+                <DownloadAppButton tone="outline" size="lg" />
               </motion.div>
             </motion.div>
 
@@ -1477,6 +1506,10 @@ export function LandingPage() {
                   >
                     {t('login')}
                   </Button>
+                </motion.div>
+                {/* Download CTA — same real-installer OS picker, adapted to the dark panel */}
+                <motion.div whileHover={{ scale: 1.06, y: -3 }} whileTap={{ scale: 0.97 }}>
+                  <DownloadAppButton tone="onDark" size="lg" />
                 </motion.div>
               </motion.div>
             </div>

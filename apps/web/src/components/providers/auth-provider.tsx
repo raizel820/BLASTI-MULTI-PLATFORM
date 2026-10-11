@@ -233,7 +233,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    // User is NOT authenticated — set view from hash for auth pages
+    // User is NOT authenticated — set view from hash for auth pages.
+    // NATIVE SHELLS (mobile APK / desktop exe): an empty/'#/' hash (exactly
+    // what the packaged WebView boots with) used to resolve to 'landing'
+    // here — AFTER the store/page-level native redirect had already selected
+    // the dedicated login — putting the mobile app back on the marketing
+    // landing page. Native shells now boot to 'login' no matter what the
+    // hash says (deep links like #/join/CODE still win below).
     if (hash) {
       const view = parseHashToView(hash);
       if (view) {
@@ -241,7 +247,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (joinCode) {
           setPendingAgencyCode(joinCode);
         }
-        setViewFromHash(hash);
+        const isNativeShell =
+          !!window.electronAPI ||
+          !!(window as unknown as { Capacitor?: unknown }).Capacitor;
+        if (isNativeShell && view === 'landing') {
+          useAppStore.getState().setView('login');
+          updateHashForView('login');
+        } else {
+          setViewFromHash(hash);
+        }
       }
     } else if (currentView === 'login' || currentView === 'register') {
       // Web must always START on the landing page. A stale persisted
@@ -255,6 +269,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         !!(window as unknown as { Capacitor?: unknown }).Capacitor;
       if (!isNativeShell) {
         useAppStore.getState().setView('landing');
+      } else {
+        updateHashForView(currentView);
+      }
+    } else if (currentView === 'landing') {
+      const isNativeShell =
+        !!window.electronAPI ||
+        !!(window as unknown as { Capacitor?: unknown }).Capacitor;
+      if (isNativeShell) {
+        // Native shell booting with an empty hash — land on the dedicated
+        // login screen, never the marketing landing page.
+        useAppStore.getState().setView('login');
+        updateHashForView('login');
       } else {
         updateHashForView(currentView);
       }

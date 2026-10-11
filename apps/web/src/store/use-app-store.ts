@@ -3,6 +3,37 @@ import { persist } from 'zustand/middleware';
 import type { Language } from '@/i18n';
 import { isRTL } from '@/i18n';
 import { apiFetch } from '@/lib/api-fetch';
+// Native shells (Capacitor mobile / Electron desktop) must boot straight into
+// their dedicated login screen — never the marketing landing page. detectPlatform
+// is SSR-safe (returns isNative:false on the server) and dependency-free.
+import { detectPlatform } from '@/lib/platform';
+
+/**
+ * The FIRST view the app should show. Native shells (the Android/iOS APK and
+ * the Windows desktop exe) skip the marketing landing page entirely — their
+ * first screen is the dedicated sign-in (MobileLoginForm / DesktopAgencyLogin
+ * per the ViewRouter). This is computed synchronously at store creation, i.e.
+ * BEFORE any effect runs, so no interleaving of rehydration/hash handling can
+ * ever flash the landing page inside the mobile app.
+ */
+function initialViewForShell(): ViewName {
+  if (typeof window === 'undefined') return 'landing';
+  try {
+    return detectPlatform().isNative ? 'login' : 'landing';
+  } catch {
+    return 'landing';
+  }
+}
+
+/** True when running inside the Capacitor mobile shell or the Electron desktop app. */
+function isNativeShell(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return detectPlatform().isNative;
+  } catch {
+    return false;
+  }
+}
 // Task 33-E — fresh auth must re-enable everything the revocation guards
 // locked (authz flag + sync engine). authz-state is dependency-free (no
 // cycles); sync.ts does not statically import this store (dynamic import only).
@@ -496,7 +527,11 @@ function sanitizePersistedState(state: any): {
   const safeSessionStartedAt = safeRememberSession ? sessionStartedAt : null;
 
   // If user is not authenticated but currentView is a protected view, reset to landing
-  const safeView = (!user && !isAuthView(currentView)) ? 'landing' : currentView;
+  // — EXCEPT in native shells (mobile APK / desktop app), which boot straight
+  // into their dedicated login screen instead of the marketing landing page.
+  const safeView = (!user && !isAuthView(currentView))
+    ? 'landing'
+    : (!user && currentView === 'landing' && isNativeShell() ? 'login' : currentView);
 
   return {
     user,
@@ -523,7 +558,9 @@ export const useAppStore = create<AppState>()(
       isAuthenticated: false,
       sessionToken: '',
       agencyAuthority: null,
-      currentView: 'landing',
+      // Native shells start on their dedicated login screen (never the
+      // marketing landing page); web browsers keep the landing page.
+      currentView: initialViewForShell(),
       previousView: null,
       sidebarOpen: false,
       pendingAgencyCode: null,

@@ -349,11 +349,14 @@ app.post('/upload', async (c) => {
 // Used by the public landing page download section: returns the ACTIVE
 // (published) version per platform so visitors can download the installer
 // the admin selected in Public Apps Settings. Metadata only, no secrets.
+// 'android-debug' is included so the landing page can offer the debug APK
+// as a separate mobile download choice (release = 'android'). Admins choose
+// which of the two channels is public via the normal Activate flow.
 // NOTE: registered before GET /:id (Hono matches in registration order).
 
 app.get('/public/active', async (c) => {
   try {
-    const platforms = ['android', 'ios', 'electron', 'windows', 'mac', 'linux'] as const
+    const platforms = ['android', 'android-debug', 'ios', 'electron', 'windows', 'mac', 'linux'] as const
     const versions: Array<Record<string, unknown>> = []
 
     for (const platform of platforms) {
