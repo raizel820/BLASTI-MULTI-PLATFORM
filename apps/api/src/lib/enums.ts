@@ -36,6 +36,16 @@ export const TransactionStatus = {
 } as const
 export type TransactionStatus = (typeof TransactionStatus)[keyof typeof TransactionStatus]
 
+/**
+ * Statuses that count as SETTLED (revenue-earning) transactions.
+ *
+ * Manual receipt approvals write APPROVED; automatic Chargily settlement
+ * (webhook + return-trip polling) writes COMPLETED with webhookVerified=true.
+ * Every revenue sum must accept BOTH — gating on APPROVED alone made
+ * Chargily-paid transactions appear in counts but contribute 0 to revenue.
+ */
+export const SETTLED_TRANSACTION_STATUSES = ['APPROVED', 'COMPLETED'] as const
+
 // ─── Transaction Plan ────────────────────────────────────────────────────────
 export const TransactionPlan = {
   BASIC: 'BASIC',

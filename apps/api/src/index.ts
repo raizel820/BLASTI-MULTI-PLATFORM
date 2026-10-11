@@ -61,6 +61,7 @@ import { filesSyncRoutes } from './routes/files-sync'
 import { syncRoutes } from './routes/sync'
 import { settingsRoutes } from './routes/settings'
 import { paymentWebhookRoutes } from './routes/payment-webhook'
+import { messagingWebhookRoutes } from './routes/messaging-webhooks'
 import { paymentCheckoutRoutes } from './routes/payment-checkout'
 import { reconciliationRoutes } from './routes/reconciliation'
 import { offlineSyncRoutes } from './routes/offline-sync'
@@ -70,6 +71,8 @@ import { agencyCategoriesRoutes } from './routes/agency-categories'
 import { adminProviderRoutes } from './routes/admin-providers'
 // Database Manager — SUPER_ADMIN PostgreSQL console (sidebar "Database Manager")
 import { adminDbRoutes } from './routes/admin-db'
+// Storage Manager — SUPER_ADMIN file-store console (sidebar "Storage Manager")
+import { adminStorageRoutes } from './routes/admin-storage'
 import { appVersionRoutes } from './routes/app-versions'
 import { systemStatusRoutes } from './routes/system-status'
 // Task 54-a — doc-2 role-scoped analytics (staff + customer modules)
@@ -572,6 +575,7 @@ app.route('/api/agency', agencyRoutes)
 app.route('/api/admin', adminRoutes)
 app.route('/api/admin/providers', adminProviderRoutes)
 app.route('/api/admin/db', adminDbRoutes)
+app.route('/api/admin/storage', adminStorageRoutes)
 app.route('/api/agencies', agenciesRoutes)
 app.route('/api/reservations', reservationsRoutes)
 app.route('/api/queue', queueRoutes)
@@ -598,6 +602,9 @@ app.route('/api/sync', syncRoutes)
 app.route('/api/sync', initialSyncRoutes)
 app.route('/api/settings', settingsRoutes)
 app.route('/api/payment/webhook', paymentWebhookRoutes)
+// Task 3 — provider delivery-report webhooks (public, self-verified):
+//   POST /api/webhooks/esms (eSMS DLR) · GET+POST /api/webhooks/whatsapp (Meta)
+app.route('/api/webhooks', messagingWebhookRoutes)
 app.route('/api/payment', paymentCheckoutRoutes)
 app.route('/api/reconciliation', reconciliationRoutes)
 app.route('/api/offline-sync', offlineSyncRoutes)

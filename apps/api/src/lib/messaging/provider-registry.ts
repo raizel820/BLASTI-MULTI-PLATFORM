@@ -6,8 +6,14 @@
  * adding an entry here + an adapter in the matching service module.
  *
  *   EMAIL     → Resend            (https://resend.com)           api.resend.com
- *   SMS       → eSMS Africa       (https://esmsafrica.io)        api.esmsafrica.io
+ *   SMS       → eSMS Africa       (https://esmsafrica.io)        sms.esmsafrica.io/api
  *   WHATSAPP  → Meta WhatsApp     (Cloud API, graph.facebook.com)
+ *
+ * eSMS Africa endpoints/semantics follow the official docs
+ * (https://esmsafrica.io/docs — API Reference):
+ *   POST /messages/send { to (E.164), text, sender_id? }  Bearer auth
+ *   GET  /balance                                          wallet check
+ * Meta Cloud API follows https://developers.facebook.com/docs/whatsapp/cloud-api
  */
 
 export type Channel = 'EMAIL' | 'SMS' | 'WHATSAPP'
@@ -50,22 +56,26 @@ export const PROVIDER_REGISTRY: Record<Channel, ProviderInfo> = {
     name: 'eSMS Africa',
     channel: 'SMS',
     description: 'African SMS gateway with direct routes to Algerian operators (Mobilis, Djezzy, Ooredoo). SMS OTP + notifications.',
-    docsUrl: 'https://docs.esmsafrica.io',
-    defaultApiUrl: 'https://api.esmsafrica.io/v1',
+    docsUrl: 'https://esmsafrica.io/docs',
+    defaultApiUrl: 'https://sms.esmsafrica.io/api',
     supportsTemplates: true,
     supportsProviderTemplateList: false,
     supportsOtp: true,
     fields: [
-      { key: 'apiKey', label: 'API Key', target: 'apiKey', secret: true, required: true, placeholder: 'esms_live_...', help: 'Bearer key from the eSMS Africa dashboard (Settings → API Keys).' },
-      { key: 'senderId', label: 'Sender ID', target: 'senderId', required: true, placeholder: 'BLASTI', help: 'Alphanumeric sender ID shown on recipients\' phones (max 11 chars).' },
-      { key: 'apiUrl', label: 'API Base URL', target: 'apiUrl', placeholder: 'https://api.esmsafrica.io/v1', help: 'Override only if instructed by eSMS support. Leave empty for the default.' },
+      { key: 'apiKey', label: 'API Key', target: 'apiKey', secret: true, required: true, placeholder: 'esms_live_...', help: 'From sms.esmsafrica.io → API Keys → Create key (choose live or test, scope: send + query). Test keys (esms_test_) simulate delivery free of charge.' },
+      { key: 'senderId', label: 'Sender ID (optional)', target: 'senderId', placeholder: 'BLASTI', help: 'Approved alphanumeric sender ID shown on recipients\' phones (max 11 chars). Leave empty to use the route\'s default sender. Register sender IDs in the eSMS dashboard → Sender IDs.' },
+      { key: 'apiUrl', label: 'API Base URL', target: 'apiUrl', placeholder: 'https://sms.esmsafrica.io/api', help: 'Leave empty for the default. Only override if instructed by eSMS support (https://sms.esmsafrica.io/api).' },
     ],
     extraFields: [
-      { key: 'testPhoneNumber', label: 'Test phone number', target: 'extra', placeholder: '+213555123456' },
+      { key: 'testPhoneNumber', label: 'Test phone number', target: 'extra', placeholder: '+213555123456', help: 'Used by the Test buttons (E.164 format, e.g. +213…). Leave empty to only verify the key + wallet balance.' },
+      { key: 'webhookSigningSecret', label: 'Webhook signing secret', target: 'extra', secret: true, placeholder: 'whsec_...', help: 'From GET /webhooks (or the portal → Settings → Webhooks). Used to verify X-Webhook-Signature on delivery reports sent to the BLASTI webhook URL below.' },
     ],
     notes: [
-      'OTP codes are delivered as regular SMS with the app-side template body.',
-      'A 6-digit numeric code is generated server-side; dev mode bypasses with 1234.',
+      'OTP codes are delivered as regular SMS with the app-side template body (numbers must be E.164, e.g. +213555123456).',
+      'Delivery reports arrive at the BLASTI webhook URL — copy it into the eSMS portal (Settings → Webhooks → DLR URL).',
+      'Rate limits: single send 20/second; identical message to the same number within 5 minutes is rejected as duplicate.',
+      'A 6-digit numeric OTP is generated server-side; dev mode bypasses with 123456.',
+      'Test modes in the admin tab: connection (free /balance probe, no message), message (raw text), OTP (verify_phone template).',
     ],
   },
   EMAIL: {
@@ -90,6 +100,7 @@ export const PROVIDER_REGISTRY: Record<Channel, ProviderInfo> = {
     notes: [
       'Templates are app-side (Templates tab) — Resend has no server-side template gallery; emails are delivered through the /emails endpoint.',
       'Free tier: 100 emails/day, 3,000/month. Verify your sending domain for production.',
+      'Test modes in the admin tab: connection (free /domains probe, no email), message (raw text), OTP (verify_email template).',
     ],
   },
   WHATSAPP: {
@@ -98,24 +109,27 @@ export const PROVIDER_REGISTRY: Record<Channel, ProviderInfo> = {
     channel: 'WHATSAPP',
     description: 'Official WhatsApp Business Cloud API. WhatsApp OTP (authentication templates) + notifications.',
     docsUrl: 'https://developers.facebook.com/docs/whatsapp/cloud-api',
-    defaultApiUrl: 'https://graph.facebook.com/v21.0',
+    defaultApiUrl: 'https://graph.facebook.com/v23.0',
     supportsTemplates: true,
     supportsProviderTemplateList: true,
     supportsOtp: true,
     fields: [
-      { key: 'apiKey', label: 'Permanent Access Token', target: 'apiKey', secret: true, required: true, placeholder: 'EAAG...', help: 'System-user token with whatsapp_business_messaging + whatsapp_business_management scopes.' },
+      { key: 'apiKey', label: 'Permanent Access Token', target: 'apiKey', secret: true, required: true, placeholder: 'EAAG...', help: 'System-user token with whatsapp_business_messaging + whatsapp_business_management scopes (Meta Business Settings → System users → generate).' },
       { key: 'phoneNumberId', label: 'Phone Number ID', target: 'phoneNumberId', required: true, placeholder: '123456789012345', help: 'WhatsApp → API Setup → Phone number ID.' },
       { key: 'accountId', label: 'WABA ID', target: 'accountId', required: true, placeholder: '987654321098765', help: 'WhatsApp Business Account ID — used to list approved templates.' },
-      { key: 'apiUrl', label: 'Graph API Base URL', target: 'apiUrl', placeholder: 'https://graph.facebook.com/v21.0', help: 'Leave empty for the default.' },
+      { key: 'apiUrl', label: 'Graph API Base URL', target: 'apiUrl', placeholder: 'https://graph.facebook.com/v23.0', help: 'Leave empty for the default (v23.0).' },
     ],
     extraFields: [
-      { key: 'webhookVerifyToken', label: 'Webhook verify token', target: 'extra', secret: true, placeholder: 'any-random-string', help: 'Used for the Meta webhook subscription handshake (GET verification).' },
-      { key: 'testPhoneNumber', label: 'Test phone number', target: 'extra', placeholder: '+213555123456' },
+      { key: 'webhookVerifyToken', label: 'Webhook verify token', target: 'extra', secret: true, placeholder: 'any-random-string', help: 'Any random string you choose — Meta echoes it back during the webhook subscription handshake (GET verification) against the BLASTI webhook URL below.' },
+      { key: 'metaAppSecret', label: 'Meta App Secret', target: 'extra', secret: true, placeholder: 'App secret from Meta App Dashboard → App settings', help: 'Optional — used to verify X-Hub-Signature-256 on incoming webhook payloads.' },
+      { key: 'testPhoneNumber', label: 'Test phone number', target: 'extra', placeholder: '+213555123456', help: 'Used by the Test buttons. Leave empty to only verify token + phone number.' },
     ],
     notes: [
       'OTP delivery uses a Meta-APPROVED authentication template (pick one below or in the Templates tab). Without an approved template, WhatsApp OTP falls back to SMS automatically.',
       'Free-form (non-template) texts are only delivered within the 24-hour customer service window; notifications outside that window must use an approved template.',
+      'Status webhooks (sent/delivered/read/failed) arrive at the BLASTI webhook URL — subscribe at Meta App Dashboard → WhatsApp → Configuration (use the verify token above).',
       'Pricing is per delivered message; authentication templates have a fixed rate.',
+      'Test modes in the admin tab: connection (free phone-number probe, no message), message (24h-window text), OTP (verify_phone template path).',
     ],
   },
 }

@@ -767,15 +767,16 @@ model SmsSettings {
 }
 
 model SmsLog {
-  id            String      @id @default(cuid())
-  userId        String?
-  phoneNumber   String
-  message       String
-  status        String      @default("PENDING")
-  provider      String      @default("")
-  errorMessage  String?
-  createdAt     DateTime    @default(now())
-  updatedAt     DateTime    @updatedAt @default(now())
+  id                String      @id @default(cuid())
+  userId            String?
+  phoneNumber       String
+  message           String
+  status            String      @default("PENDING")
+  provider          String      @default("")
+  errorMessage      String?
+  providerMessageId String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt @default(now())
   smsSettings   SmsSettings? @relation(fields: [smsSettingsId], references: [id])
   smsSettingsId String?
 }

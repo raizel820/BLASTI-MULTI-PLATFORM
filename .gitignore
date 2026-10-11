@@ -106,3 +106,6 @@ apps/desktop/prisma/generated/
 # Build artifacts — APKs come from GitHub Actions CI, never from git
 *.apk
 *.aab
+
+# Runtime file storage (dev default: apps/api/uploads — VPS sets BLASTI_STORAGE_DIR)
+apps/api/uploads/

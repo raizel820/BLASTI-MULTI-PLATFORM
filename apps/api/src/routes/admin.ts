@@ -14,6 +14,7 @@ import {
 } from '../lib/analytics-engine'
 import { getMapsSettingsAdmin, validateMapsSettingsPayload, applyMapsSettingsWrites, validateGoogleMaps, validateOpenFreeMap, validateGeocoding, type MapsValidationResult } from '../lib/map-settings'
 import { getSettingRaw } from '../lib/config-manager'
+import { SETTLED_TRANSACTION_STATUSES } from '../lib/enums'
 // Task 2-a FIX 3 — the admin-dashboard SMS tab reads/writes /admin/sms-settings.
 import { getSmsSettings, getSmsUsageStats, testSms, validateGatewayConnection } from '../lib/sms-service'
 import { PROVIDER_REGISTRY } from '../lib/messaging/provider-registry'
@@ -1483,7 +1484,10 @@ app.get('/analytics/payments', async (c) => {
       s.count++
       const m = (byMethod[r.paymentMethod] ??= { count: 0, value: 0 })
       m.count++
-      if (r.status === 'APPROVED') {
+      // Revenue counts BOTH settled statuses: manual approvals write APPROVED,
+      // Chargily settlement writes COMPLETED. Gating on APPROVED alone made
+      // Chargily-paid transactions show in the count but add 0 to revenue.
+      if ((SETTLED_TRANSACTION_STATUSES as readonly string[]).includes(r.status)) {
         s.value += value
         m.value += value
         totalRevenue += value
@@ -1495,7 +1499,7 @@ app.get('/analytics/payments', async (c) => {
       }
     }
 
-    const approvedCount = byStatus.APPROVED?.count ?? 0
+    const approvedCount = SETTLED_TRANSACTION_STATUSES.reduce((n, s) => n + (byStatus[s]?.count ?? 0), 0)
     return c.json({
       success: true,
       data: {
@@ -2198,7 +2202,7 @@ app.get('/dashboard', async (c) => {
       // inside _sum, so fetch the rows and reduce amountPaid ?? priceSnapshot
       // ?? amount — the same definition /analytics/payments uses.
       db.transaction.findMany({
-        where: { status: 'APPROVED' },
+        where: { status: { in: [...SETTLED_TRANSACTION_STATUSES] } },
         select: { amount: true, amountPaid: true, priceSnapshot: true },
       }),
       db.user.count({ where: { isActive: true } }),
@@ -3244,9 +3248,9 @@ app.get('/stats', async (c) => {
         },
       }),
 
-      // Total revenue (approved transactions)
+      // Total revenue (settled transactions — manual APPROVED + Chargily COMPLETED)
       db.transaction.aggregate({
-        where: { status: 'APPROVED' },
+        where: { status: { in: [...SETTLED_TRANSACTION_STATUSES] } },
         _sum: { amount: true },
       }),
 
@@ -3419,13 +3423,31 @@ app.post('/transactions/:id', async (c) => {
         }
       }
 
+      // ── Upgrade / early-renewal stacking (proration counterpart) ──
+      // The receipt/checkout flow does NOT touch subscriptionExpiresAt, so
+      // it still holds the current window at approval time. When that window
+      // is still active, the approved term STACKS on top of the remaining
+      // days instead of discarding them (mirrors chargily-fulfill.ts).
+      const currentAgency = await db.agency.findUnique({
+        where: { id: transaction.agencyId },
+        select: { subscriptionStartsAt: true, subscriptionExpiresAt: true },
+      })
+      const baseExpiry = currentAgency?.subscriptionExpiresAt ?? null
+      const stillActive = !!baseExpiry && baseExpiry.getTime() > now.getTime()
+
+      if (subscriptionExpiresAt && stillActive && baseExpiry) {
+        const stacked = new Date(baseExpiry)
+        stacked.setTime(stacked.getTime() + (subscriptionExpiresAt.getTime() - now.getTime()))
+        subscriptionExpiresAt = stacked
+      }
+
       await db.agency.update({
         where: { id: transaction.agencyId },
         data: {
           subscriptionStatus: 'ACTIVE',
           subscriptionTier: transaction.plan,
           subscriptionPlanId: planRecord?.id || undefined,
-          subscriptionStartsAt: now,
+          subscriptionStartsAt: stillActive ? (currentAgency?.subscriptionStartsAt ?? now) : now,
           subscriptionExpiresAt,
         },
       })

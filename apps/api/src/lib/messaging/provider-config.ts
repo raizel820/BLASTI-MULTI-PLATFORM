@@ -24,7 +24,7 @@ export interface ResolvedProviderConfig {
 }
 
 /** extraConfig keys that must be encrypted at rest */
-const EXTRA_SECRET_KEYS = new Set(['webhookVerifyToken'])
+const EXTRA_SECRET_KEYS = new Set(['webhookVerifyToken', 'webhookSigningSecret', 'metaAppSecret'])
 
 function maskSecret(value: string): string {
   if (!value) return ''

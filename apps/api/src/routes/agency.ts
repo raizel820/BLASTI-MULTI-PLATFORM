@@ -6,6 +6,8 @@ import { emitQueueEvent, emitNotificationEvent, emitKioskEvent, emitReservationE
 import { getNextCustomerToCall } from '../lib/queue-scheduler'
 import { checkRateLimit, RateLimitError, QUEUE_RATE_LIMIT } from '../lib/rate-limit'
 import { getTodayStart, getTodayEnd } from '../lib/date-utils'
+import { SETTLED_TRANSACTION_STATUSES } from '../lib/enums'
+import { computePeriodDiscount, computeUpgradeCredit } from '../lib/subscription-proration'
 import { hashPassword } from '../lib/password'
 import { calculateETA, getEffectiveServiceTime } from '../lib/eta-calculator'
 import { z } from 'zod'
@@ -2413,7 +2415,9 @@ app.get('/analytics/payments', async (c) => {
       const s = (byStatus[r.status] ??= { count: 0, value: 0 })
       s.count++
       byMethod[r.paymentMethod] = (byMethod[r.paymentMethod] ?? 0) + 1
-      if (r.status === 'APPROVED') {
+      // Revenue counts BOTH settled statuses: manual approvals write APPROVED,
+      // Chargily settlement writes COMPLETED (same rule as the admin analytics).
+      if ((SETTLED_TRANSACTION_STATUSES as readonly string[]).includes(r.status)) {
         s.value += value
         totalPaid += value
         const bucketKey = pq.range.granularity === 'monthly'
@@ -2442,7 +2446,7 @@ app.get('/analytics/payments', async (c) => {
           : null,
         totals: {
           transactionsInPeriod: rows.length,
-          paid: byStatus.APPROVED?.count ?? 0,
+          paid: SETTLED_TRANSACTION_STATUSES.reduce((n, s) => n + (byStatus[s]?.count ?? 0), 0),
           pending: byStatus.PENDING?.count ?? 0,
           rejected: byStatus.REJECTED?.count ?? 0,
           totalPaid,
@@ -5342,15 +5346,19 @@ app.post('/subscription/pay', async (c) => {
     // Map the chosen billing period (months) to the plan's discount field.
     // Defaults to period = 1 (monthly, no discount) when not provided.
     const effectivePeriod = validation.data.period ?? 1
-    let discountPercent = 0
-    if (effectivePeriod === 3) discountPercent = planRecord.quarterlyDiscount
-    else if (effectivePeriod === 6) discountPercent = planRecord.semiAnnualDiscount
-    else if (effectivePeriod === 12) discountPercent = planRecord.annualDiscount
-    else if (effectivePeriod === 24) discountPercent = planRecord.biennialDiscount
+    const discountPercent = computePeriodDiscount(planRecord, effectivePeriod)
 
     // Total amount for the full period: base price × period × (1 − discount%).
     // Rounded to the nearest DZD.
-    const amount = Math.round(planRecord.price * effectivePeriod * (1 - discountPercent / 100))
+    const listTotal = Math.round(planRecord.price * effectivePeriod * (1 - discountPercent / 100))
+
+    // ─── Upgrade / early-renewal credit (same proration as Chargily) ─────
+    // The unused per-day value of the current ACTIVE window is deducted from
+    // the transfer amount. No gateway minimum here — a fully-covered upgrade
+    // becomes a 0 DZD receipt the admin simply approves.
+    const creditInfo = await computeUpgradeCredit(agencyId)
+    const creditApplied = Math.max(0, Math.min(creditInfo.remainingValue, listTotal))
+    const amount = listTotal - creditApplied
 
     // Encode the period in the planName snapshot so the admin approval handler
     // can recover it later and set subscriptionExpiresAt = now + period months.
@@ -5388,7 +5396,20 @@ app.post('/subscription/pay', async (c) => {
       },
     })
 
-    return c.json({ success: true, transaction })
+    return c.json({
+      success: true,
+      transaction,
+      proration: {
+        eligible: creditInfo.eligible,
+        upgradeFrom: creditInfo.currentTier,
+        daysRemaining: creditInfo.daysRemaining,
+        paidAmount: creditInfo.paidAmount,
+        listTotal,
+        discountPercent,
+        creditApplied,
+        chargeAmount: amount,
+      },
+    })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

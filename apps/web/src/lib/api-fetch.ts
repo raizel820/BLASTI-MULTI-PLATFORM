@@ -105,7 +105,11 @@ export async function apiFetch(
         res = await apiClient.patch<any>(path, body, { ...requestOptions, headers });
         break;
       case 'DELETE':
-        res = await apiClient.delete<any>(path, { ...requestOptions, headers });
+        // apiClient.delete() hardcodes the body to `undefined`, which silently
+        // drops DELETE payloads (admin storage delete, upload remove, …).
+        // Route through request() so a JSON body actually reaches the API;
+        // with no body this is byte-for-byte what delete() did before.
+        res = await apiClient.request<any>('DELETE', path, body, { ...requestOptions, headers });
         break;
       default:
         res = await apiClient.get<any>(path, requestOptions);

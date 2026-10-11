@@ -35,6 +35,11 @@ import { db } from '@blasti/db'
 import { sendSms, normalizeDzPhone } from './sms-service'
 import { sendWhatsAppText } from './messaging/whatsapp-service'
 
+// SmsLog statuses that consume a credit (SENT + any DLR advancement) — kept
+// in sync with sms-service.SMS_CONSUMED_STATUSES (a plain string[] so the
+// Prisma `status: { in: ... }` filter accepts it directly).
+const SMS_CONSUMED_STATUSES: string[] = ['SENT', 'DELIVERED', 'READ']
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export type NotificationType =
@@ -456,7 +461,8 @@ export async function sendViaSms(
           return false
         }
 
-        // 3. Manually create an SmsLog with userId for tracking
+        // 3. Manually create an SmsLog with userId for tracking.
+        // providerMessageId → the DLR webhook advances this row's status too.
         await db.smsLog.create({
           data: {
             userId,
@@ -464,6 +470,7 @@ export async function sendViaSms(
             message,
             status: 'SENT',
             provider: 'agency-sponsored',
+            ...(result.providerMessageId ? { providerMessageId: result.providerMessageId } : {}),
           },
         })
 
@@ -565,7 +572,7 @@ export async function sendViaWhatsApp(
         })
         const totalPurchased = purchasedTotal._sum.quantity ?? 0
         const usedCount = await db.smsLog.count({
-          where: { userId, status: 'SENT' },
+          where: { userId, status: { in: SMS_CONSUMED_STATUSES } },
         })
 
         if (totalPurchased - usedCount <= 0) {
@@ -605,7 +612,9 @@ export async function sendViaWhatsApp(
         `(user: ${userId}, sponsored: ${agencyDeducted}, msg: "${message.substring(0, 40)}…")`
     )
 
-    // Create an SMS log entry for tracking (even though it's WhatsApp)
+    // Create an SMS log entry for tracking (even though it's WhatsApp).
+    // providerMessageId → the Meta status webhook correlates on it to advance
+    // the status (SENT → DELIVERED → READ) without breaking credit accounting.
     await db.smsLog.create({
       data: {
         userId,
@@ -613,6 +622,7 @@ export async function sendViaWhatsApp(
         message,
         status: 'SENT',
         provider: 'whatsapp',
+        ...(waResult.providerMessageId ? { providerMessageId: waResult.providerMessageId } : {}),
       },
     })
 
@@ -740,7 +750,7 @@ export async function deductSmsBalance(
     })
     const totalPurchased = purchasedTotal._sum.quantity ?? 0
     const usedCount = await db.smsLog.count({
-      where: { userId, status: 'SENT' },
+      where: { userId, status: { in: SMS_CONSUMED_STATUSES } },
     })
 
     if (totalPurchased - usedCount > 0) {
@@ -848,7 +858,7 @@ async function checkCarrierBalance(
   })
   const totalPurchased = purchasedTotal._sum.quantity ?? 0
   const usedCount = await db.smsLog.count({
-    where: { userId, status: 'SENT' },
+    where: { userId, status: { in: SMS_CONSUMED_STATUSES } },
   })
 
   return totalPurchased - usedCount > 0

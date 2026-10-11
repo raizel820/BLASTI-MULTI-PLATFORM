@@ -48,6 +48,17 @@ export type ViewName =
   | 'admin-analytics'
   | 'admin-tickets'
   | 'admin-settings'
+  // Platform Settings split (Task 5): the old monolithic admin-settings page
+  // became a General/Overview hub; each former section is now its own view,
+  // grouped in the sidebar under '__platform_settings_group__'.
+  | 'admin-settings-vps'
+  | 'admin-settings-providers'
+  | 'admin-settings-maps'
+  | 'admin-settings-payments'
+  | 'admin-settings-security'
+  | 'admin-settings-faq'
+  | 'admin-settings-config'
+  | 'admin-settings-financial'
   // Task 2-b: dedicated super-admin Maps & Location page (standalone wrapper
   // around AdminMapsSettings, which is also embedded in admin-settings).
   | 'admin-maps'
@@ -59,6 +70,10 @@ export type ViewName =
   // Database Manager — SUPER_ADMIN PostgreSQL console (sidebar section:
   // browse every table, row-level actions, maintenance).
   | 'admin-db'
+  // Storage Manager — SUPER_ADMIN on-disk file store console (Task 2):
+  // disk usage, per-category breakdown, drill-down browser, orphan cleanup.
+  // Lives in the '__data_storage_group__' sidebar group next to admin-db.
+  | 'admin-storage'
   | 'kiosk'
   | 'agency-fullscreen'
   | 'agency-fullscreen-history';
@@ -214,12 +229,29 @@ const viewHashMap: Record<ViewName, string> = {
   'admin-analytics': '#/admin/analytics',
   'admin-tickets': '#/admin/tickets',
   'admin-settings': '#/admin/settings',
+  // Platform Settings split (Task 5) — one hash per former section of the
+  // long-scroll admin-settings page. #/admin/settings itself stays untouched
+  // (now the General/Overview hub) for backward compatibility.
+  'admin-settings-vps': '#/admin/settings/vps',
+  'admin-settings-providers': '#/admin/settings/providers',
+  'admin-settings-maps': '#/admin/settings/maps',
+  'admin-settings-payments': '#/admin/settings/payments',
+  'admin-settings-security': '#/admin/settings/security',
+  'admin-settings-faq': '#/admin/settings/faq',
+  'admin-settings-config': '#/admin/settings/config',
+  'admin-settings-financial': '#/admin/settings/financial',
   'admin-maps': '#/admin/maps', // Task 2-b
   'admin-subscription-plans': '#/admin/subscription-plans',
   'admin-app-settings': '#/admin/app-settings',
   'admin-hardware': '#/admin/hardware',
   'admin-hardware-requests': '#/admin/hardware-requests',
   'admin-enterprise-requests': '#/admin/enterprise-requests',
+  // Task 2: Database + Storage Manager group. 'admin-db' was previously
+  // MISSING here — clicking it in the sidebar fell through updateHashForView
+  // to '#/' (wrong hash reset). Both hashes are exact-matched in
+  // parseHashToView via hashViewMap (no prefix-map work needed).
+  'admin-db': '#/admin/db',
+  'admin-storage': '#/admin/storage',
   'kiosk': '#/kiosk',
   'agency-fullscreen': '#/agency/fullscreen',
   'agency-fullscreen-history': '#/agency/fullscreen/history',
@@ -334,6 +366,14 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'agency-analytics',
   'admin-dashboard', 'admin-transactions', 'admin-agencies', 'admin-audit',
   'admin-users', 'admin-analytics', 'admin-settings', 'admin-maps', 'admin-subscription-plans', 'admin-app-settings', 'admin-db',
+  // Task 2: Storage Manager — must survive persisted-state sanitization
+  // (VALID_VIEW_NAMES mirrors the ViewName union).
+  'admin-storage',
+  // Platform Settings split (Task 5) — must survive persisted-state
+  // sanitization (VALID_VIEW_NAMES mirrors the ViewName union).
+  'admin-settings-vps', 'admin-settings-providers', 'admin-settings-maps',
+  'admin-settings-payments', 'admin-settings-security', 'admin-settings-faq',
+  'admin-settings-config', 'admin-settings-financial',
   'admin-hardware', 'admin-enterprise-requests',
   'admin-hardware-requests',
   'kiosk', 'agency-fullscreen', 'agency-fullscreen-history',
