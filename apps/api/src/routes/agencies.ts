@@ -4,6 +4,8 @@ import { requireRole, requireAgencyAccess, authErrorResponse, createSessionToken
 import { adminCreateAgencySchema, updateAgencyProfileSchema, validateBody, wilayaCodeRegex } from '../lib/validations'
 import { enforceRateLimit, getClientIp, AGENCY_LISTING_RATE_LIMIT, AGENCY_SEARCH_RATE_LIMIT, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordFailedRequest, recordSuccessfulRequest } from '../lib/rate-limit'
 import { recordSyncChangeNow } from '../lib/sync-helpers'
+// Performance Round — eager invalidation of the public GET response cache.
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 // Task 51 — Agency Location & Maps: location pair rule + timestamp stamping
 import { buildAgencyLocationPatch } from '../lib/map-settings'
 
@@ -59,16 +61,21 @@ app.get('/', async (c) => {
         where,
         include: {
           _count: {
-            select: { services: { where: { isActive: true } } },
+            select: {
+              services: { where: { isActive: true } },
+              // Performance Round — the old shape loaded EVERY matching
+              // reservation id per agency (`reservations: { select: { id } }`)
+              // just to read `.length`. A filtered `_count` runs server-side
+              // COUNT(*) with the (agencyId, status) index instead — on a
+              // busy agency this drops thousands of rows per request to a
+              // single aggregate on the hottest public endpoint.
+              reservations: { where: { status: { in: ['WAITING', 'CALLED'] } } },
+            },
           },
           queueSettings: {
             select: { isPaused: true },
             take: 1,
             orderBy: { updatedAt: 'desc' },
-          },
-          reservations: {
-            select: { id: true },
-            where: { status: { in: ['WAITING', 'CALLED'] } },
           },
         },
         orderBy: [
@@ -112,7 +119,7 @@ app.get('/', async (c) => {
         isSponsored: agency.isSponsored,
         isQueueOpen: agency.isQueueOpen,
         serviceCount: agency._count.services,
-        waitingCount: agency.reservations.length,
+        waitingCount: agency._count.reservations,
         workingHoursStart: agency.workingHoursStart,
         workingHoursEnd: agency.workingHoursEnd,
         // Task 51 — canonical location fields (customer map/list rendering,
@@ -921,6 +928,10 @@ app.post('/', async (c) => {
       },
     })
 
+    // Performance Round — the public directory cache must not advertise the
+    // new agency one TTL-window late.
+    invalidateResponseCacheTag('agencies', 'stats')
+
     // Round 16 — the freshly-created agency must be usable IMMEDIATELY. The
     // caller's session token is a snapshot issued BEFORE this agency existed
     // (agencyId: '') — without a re-issue the desktop sync engine keeps
@@ -993,6 +1004,10 @@ app.put('/:id', async (c) => {
       where: { id },
       data: updateData,
     })
+
+    // Performance Round — profile/queue/location edits reflect on the public
+    // directory immediately instead of after the 30s TTL.
+    invalidateResponseCacheTag('agencies')
 
     return c.json({ success: true, agency })
   } catch (error: unknown) {

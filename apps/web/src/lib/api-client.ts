@@ -808,6 +808,15 @@ async function preDiscoverElectronLan(): Promise<void> {
  * - Query params support
  * - SSR-safe
  */
+// Performance Round — per-request console logging is compiled out in
+// production builds (string formatting + console I/O per call on phones is
+// measurable at 30s polling cadence). Dev builds and any runtime with
+// localStorage['blasti-debug-http']='1' keep the full logs.
+const DEBUG_HTTP_LOGS: boolean =
+  process.env.NODE_ENV !== 'production' ||
+  (typeof localStorage !== 'undefined' &&
+    (() => { try { return localStorage.getItem('blasti-debug-http') === '1'; } catch { return false; } })());
+
 export class ApiClient {
   private config: ApiClientConfig;
 
@@ -861,10 +870,73 @@ export class ApiClient {
 
   // ── Core Request Logic ─────────────────────────────────────────────────────
 
+  // ── Performance Round: in-flight GET dedup ───────────────────────────────
+  // Boot sequences and render effects commonly fire 2-5 IDENTICAL GETs before
+  // the first one resolves (component mounts + providers + retry effects).
+  // Coalescing them halves the request burst on slow mobile links: the first
+  // caller runs the real request, the rest await the same promise.
+  // Scope is deliberately narrow — dedup ONLY when:
+  //   • method is GET,  • no caller signal,  • no custom headers
+  //     (custom headers = caller-specific semantics),
+  //   • same URL AND same auth token (different token → different data).
+  private static inflightGets = new Map<string, Promise<ApiResponse<unknown>>>();
+
   /**
    * Execute an HTTP request with retry, timeout, and error handling.
+   *
+   * Performance Round — identical in-flight GETs are coalesced into ONE real
+   * request (boot effects + provider mounts fire the same endpoint 2-5×
+   * before the first response lands). The first caller performs the request;
+   * later identical callers await the same promise. Opt-out guarantees:
+   * callers with a custom signal, custom headers, or non-GET methods always
+   * execute for themselves. The auth token is part of the dedupe key so two
+   * different sessions never share a response.
    */
   private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+    options?: RequestOptions,
+  ): Promise<ApiResponse<T>> {
+    const m = (method || 'GET').toUpperCase();
+    // apiFetch() always passes a headers object (often `{}` after
+    // normalization) — treat an EMPTY headers bag as "no custom headers".
+    let hasCustomHeaders = false;
+    if (options?.headers) {
+      hasCustomHeaders = options.headers instanceof Headers
+        ? [...options.headers.keys()].length > 0
+        : Object.keys(options.headers).length > 0;
+    }
+    const dedupable = m === 'GET' && !options?.signal && !hasCustomHeaders;
+    if (!dedupable) {
+      return this.requestUncached<T>(method, path, body, options);
+    }
+    let authKey = '';
+    try {
+      const authHeaders = buildAuthHeaders();
+      authKey = authHeaders['Authorization'] ?? authHeaders['authorization'] ?? '';
+    } catch {
+      authKey = '';
+    }
+    const paramsKey = options?.params ? JSON.stringify(options.params) : '';
+    const key = `${m} ${path}?${paramsKey}#${authKey.slice(-24)}`;
+    const existing = ApiClient.inflightGets.get(key);
+    if (existing) {
+      return existing as Promise<ApiResponse<T>>;
+    }
+    const p = this.requestUncached<T>(method, path, body, options).finally(() => {
+      ApiClient.inflightGets.delete(key);
+    });
+    ApiClient.inflightGets.set(key, p as Promise<ApiResponse<unknown>>);
+    return p;
+  }
+
+  /**
+   * Execute an HTTP request with retry, timeout, and error handling.
+   * (Performance Round: wrapped by `request()` above which coalesces
+   * identical in-flight GETs before delegating to this implementation.)
+   */
+  private async requestUncached<T>(
     method: string,
     path: string,
     body?: unknown,
@@ -948,7 +1020,12 @@ export class ApiClient {
 
     let lastError: ApiClientError | null = null;
 
-    console.log(`[ApiClient:CLOUD] ${method} ${path} → ${url} (retries=${maxRetries}, timeout=${timeoutMs}ms, isApiUnreachable=${isApiUnreachable()})`);
+    // Performance Round — per-request logs are dev-only. In production
+    // WebViews they cost string formatting + console I/O on EVERY call for
+    // zero benefit (flip on via localStorage 'blasti-debug-http'='1').
+    if (DEBUG_HTTP_LOGS) {
+      console.log(`[ApiClient:CLOUD] ${method} ${path} → ${url} (retries=${maxRetries}, timeout=${timeoutMs}ms, isApiUnreachable=${isApiUnreachable()})`);
+    }
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
       // Create a new AbortController for each attempt
       const controller = new AbortController();
@@ -992,7 +1069,9 @@ export class ApiClient {
         if (response.ok) {
           markApiReachable(); // Cloud is back — clear the unreachable flag
           const elapsed = (performance.now() - attemptStart).toFixed(0);
-          console.log(`[ApiClient:CLOUD] ${method} ${path} → OK ${response.status} (${elapsed}ms, attempt ${attempt}/${maxRetries})`);
+          if (DEBUG_HTTP_LOGS) {
+            console.log(`[ApiClient:CLOUD] ${method} ${path} → OK ${response.status} (${elapsed}ms, attempt ${attempt}/${maxRetries})`);
+          }
           return await this.parseResponse<T>(response);
         }
 

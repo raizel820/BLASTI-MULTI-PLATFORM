@@ -20,18 +20,51 @@
 {$SITE_ADDRESS} {
         encode zstd gzip
 
-        # API (Bun, :3003) — REST endpoints
+        # API (Bun, :3003) — REST endpoints.
+        # NOTE: response caching/compression policy is set by the API itself
+        # (ETag + Cache-Control middleware). Caddy only compresses on the way
+        # out; it never re-compresses an already-encoded response.
         handle /api/* {
                 reverse_proxy api:3003
         }
 
-        # API — realtime engine.io/socket.io handshake + transports
+        # API — realtime engine.io/socket.io handshake + transports.
+        # flush_interval -1 → every frame is forwarded the moment it arrives
+        # (no proxy buffering on long-poll fallback transports).
         handle /socket.io/* {
-                reverse_proxy api:3003
+                reverse_proxy api:3003 {
+                        flush_interval -1
+                }
         }
 
         # Everything else → Next.js web app (:3000)
         handle {
+                # ── Performance Round — static asset caching ─────────────
+                # Fingerprinted build chunks already carry immutable caching
+                # from Next itself. Everything below overrides the upstream's
+                # `max-age=0` for public/ assets; `defer` makes our value win
+                # over the header the Next server just set.
+                #
+                # Icons/images/fonts/manifest/audio: 7 days (content changes
+                # are rare and redeploy-busting is acceptable for them).
+                @staticAssets {
+                        path *.png *.jpg *.jpeg *.gif *.svg *.ico *.webp *.avif
+                        path *.woff *.woff2 *.ttf *.otf *.eot
+                        path *.webmanifest *.wav *.mp3
+                }
+                header @staticAssets {
+                        Cache-Control "public, max-age=604800"
+                        defer
+                }
+
+                # The service worker MUST revalidate on every load or stale
+                # shells can pin users to old app versions.
+                @swFile path /sw.js
+                header @swFile {
+                        Cache-Control "no-cache"
+                        defer
+                }
+
                 reverse_proxy web:3000
         }
 }

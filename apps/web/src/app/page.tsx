@@ -684,7 +684,11 @@ export default function Home() {
       } catch { /* silent */ }
     };
     fetchAnnouncements();
-    const interval = setInterval(fetchAnnouncements, 60000);
+    // Performance Round — paused while the tab is hidden.
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      fetchAnnouncements();
+    }, 60000);
     return () => clearInterval(interval);
   }, [user?.id]);
 

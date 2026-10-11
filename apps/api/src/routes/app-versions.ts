@@ -8,6 +8,9 @@ import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
+import { Readable } from 'stream'
+// Performance Round — public-download cache invalidation + streaming response.
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 
 const app = new Hono()
 
@@ -328,6 +331,10 @@ app.post('/upload', async (c) => {
       },
     })
 
+    // Performance Round — a CI/admin upload may flip availability once
+    // activated; clear the landing-page download cache either way (cheap).
+    invalidateResponseCacheTag('app-versions')
+
     return c.json({
       success: true,
       version: updated,
@@ -418,6 +425,10 @@ app.post('/:id/activate', async (c) => {
       })
     })
 
+    // Performance Round — the landing download buttons must switch to the
+    // newly activated installer on the very next visit.
+    invalidateResponseCacheTag('app-versions')
+
     return c.json({ success: true, version: activated })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -425,8 +436,17 @@ app.post('/:id/activate', async (c) => {
   }
 })
 
-// ─── GET /app-versions/:id/download — Download an app binary ────────────────
-
+// ─── GET /app-versions/:id/download — Download an app binary ────────────
+//
+// Performance Round — STREAMING rewrite. The old handler read the WHOLE
+// installer into memory (fs.readFileSync) before the first byte hit the
+// wire: a 155 MB Windows setup spiked RSS by 155 MB per concurrent download
+// on the 2-core/12GB ARM VPS (three simultaneous downloads ≈ 0.5 GB). Now:
+//   • fs.createReadStream → Web ReadableStream (constant ~64KB chunks),
+//   • Content-Length from stat (no buffer), Accept-Ranges: bytes,
+//   • single-range 206 support → paused/resumed mobile downloads work,
+//   • ETag (size+mtime) + Cache-Control → re-downloads short-circuit 304,
+//   • downloadCount increments fire-and-forget (no DB await before byte 1).
 app.get('/:id/download', async (c) => {
   try {
     // Public endpoint — no auth required (for app update checks)
@@ -442,26 +462,89 @@ app.get('/:id/download', async (c) => {
     if (!filePath) {
       return c.json({ success: false, error: 'File not found' }, 404)
     }
-    if (!fs.existsSync(filePath)) {
+
+    let fileStat: fs.Stats
+    try {
+      fileStat = fs.statSync(filePath)
+      if (!fileStat.isFile()) throw new Error('not a file')
+    } catch {
       return c.json({ success: false, error: 'File not found on disk' }, 404)
     }
 
-    // Increment download count
-    await db.appVersion.update({
-      where: { id: c.req.param('id') },
-      data: { downloadCount: { increment: 1 } },
-    })
-
-    const fileBuffer = fs.readFileSync(filePath)
     const fileName = appVersion.fileName || appVersion.fileStorageKey
+    const fileSize = fileStat.size
+    // Weak ETag from (size, mtimeMs) — re-installs of the same binary reuse
+    // the browser/HTTP-cache copy instead of re-pulling 155 MB.
+    const etag = `W/"${fileSize.toString(16)}-${Math.floor(fileStat.mtimeMs).toString(16)}"`
+    const baseHeaders: Record<string, string> = {
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${fileName}"`,
+      'Accept-Ranges': 'bytes',
+      ETag: etag,
+      'Cache-Control': 'public, max-age=300',
+    }
 
-    return new Response(fileBuffer, {
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'Content-Disposition': `attachment; filename="${fileName}"`,
-        'Content-Length': String(fileBuffer.length),
-      },
+    // Conditional request on the full file → 304 (no body, no disk read).
+    const ifNoneMatch = c.req.header('if-none-match')
+    if (ifNoneMatch && !c.req.header('range')) {
+      const matches = ifNoneMatch.split(',').map((t) => t.trim())
+      if (matches.includes(etag) || matches.includes(etag.replace(/^W\//, '')) || ifNoneMatch.trim() === '*') {
+        return new Response(null, {
+          status: 304,
+          headers: { ETag: etag, 'Cache-Control': baseHeaders['Cache-Control']!, 'Accept-Ranges': 'bytes' },
+        })
+      }
+    }
+
+    // Range support (single range only — sufficient for resume/players).
+    const rangeHeader = c.req.header('range')
+    let start = 0
+    let end = fileSize - 1
+    let status = 200
+    if (rangeHeader) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim())
+      if (m && (m[1] !== '' || m[2] !== '')) {
+        if (m[1] === '') {
+          // suffix range: last N bytes
+          const suffix = Math.min(parseInt(m[2], 10), fileSize)
+          start = Math.max(0, fileSize - suffix)
+          end = fileSize - 1
+        } else {
+          start = parseInt(m[1], 10)
+          end = m[2] === '' ? fileSize - 1 : Math.min(parseInt(m[2], 10), fileSize - 1)
+        }
+        if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= fileSize) {
+          return new Response(null, {
+            status: 416,
+            headers: { 'Content-Range': `bytes */${fileSize}` },
+          })
+        }
+        status = 206
+      }
+    }
+
+    const contentLength = end - start + 1
+    const headers: Record<string, string> = { ...baseHeaders, 'Content-Length': String(contentLength) }
+    if (status === 206) {
+      headers['Content-Range'] = `bytes ${start}-${end}/${fileSize}`
+    }
+
+    // Fire-and-forget analytics — the download MUST NOT wait on a DB write
+    // before its first byte (the old handler awaited this increment).
+    void db.appVersion
+      .update({ where: { id: appVersion.id }, data: { downloadCount: { increment: 1 } } })
+      .catch(() => {
+        // counter loss is acceptable; the download is not
+      })
+
+    const nodeStream = fs.createReadStream(filePath, { start, end })
+    nodeStream.on('error', (err) => {
+      console.error('[app-versions] download stream error:', err.message)
+      nodeStream.destroy()
     })
+    const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>
+
+    return new Response(webStream, { status, headers })
   } catch (error: unknown) {
     return c.json({ success: false, error: 'Download failed' }, 500)
   }
@@ -520,6 +603,9 @@ app.patch('/:id', async (c) => {
       data: { ...data, ...publishData },
     })
 
+    // Performance Round — publish/unpublish edits hit the public downloads.
+    invalidateResponseCacheTag('app-versions')
+
     return c.json({ success: true, version: appVersion })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -549,6 +635,10 @@ app.delete('/:id', async (c) => {
     }
 
     await db.appVersion.delete({ where: { id: c.req.param('id') } })
+
+    // Performance Round — a deleted version must vanish from the public
+    // download list immediately.
+    invalidateResponseCacheTag('app-versions')
 
     return c.json({ success: true })
   } catch (error: unknown) {

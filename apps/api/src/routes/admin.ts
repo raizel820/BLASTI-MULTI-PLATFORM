@@ -23,6 +23,9 @@ import { scryptSync } from 'crypto'
 import path from 'path'
 import fs from 'fs'
 import os from 'os'
+// Performance Round — eager invalidation of cached public GETs (FAQ list,
+// payment settings) after admin mutations.
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 
 const app = new Hono()
 
@@ -2439,6 +2442,7 @@ app.post('/faq', async (c) => {
         isActive: isActive ?? true,
       },
     })
+    invalidateResponseCacheTag('faqs')
 
     return c.json({ faq }, 201)
   } catch (error) {
@@ -2474,6 +2478,7 @@ app.put('/faq', async (c) => {
         ...(isActive !== undefined && { isActive }),
       },
     })
+    invalidateResponseCacheTag('faqs')
 
     return c.json({ faq })
   } catch (error) {
@@ -2494,6 +2499,7 @@ app.delete('/faq', async (c) => {
     }
 
     await db.fAQ.delete({ where: { id } })
+    invalidateResponseCacheTag('faqs')
     return c.json({ success: true })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -2548,6 +2554,7 @@ app.post('/faqs', async (c) => {
         isActive: isActive !== undefined ? isActive : true,
       },
     })
+    invalidateResponseCacheTag('faqs')
 
     return c.json({ faq }, 201)
   } catch (error) {
@@ -2588,6 +2595,7 @@ app.put('/faqs', async (c) => {
         ...(isActive !== undefined && { isActive }),
       },
     })
+    invalidateResponseCacheTag('faqs')
 
     return c.json({ faq })
   } catch (error) {
@@ -2614,6 +2622,7 @@ app.delete('/faqs', async (c) => {
     }
 
     await db.fAQ.delete({ where: { id } })
+    invalidateResponseCacheTag('faqs')
     return c.json({ success: true })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -2808,6 +2817,10 @@ app.put('/payment-settings', async (c) => {
         ...(validatedData.ewalletNumber !== undefined && { ewalletNumber: validatedData.ewalletNumber }),
       },
     })
+
+    // Performance Round — checkout clients read /api/payment-settings (60s
+    // TTL): new account details must be visible right away.
+    invalidateResponseCacheTag('payment-settings')
 
     return c.json({ settings: updated })
   } catch (error) {

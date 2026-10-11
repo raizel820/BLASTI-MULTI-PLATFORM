@@ -67,7 +67,31 @@ function resolveDatabaseUrl(): string {
 }
 
 const resolvedDbUrl = resolveDatabaseUrl()
-process.env.DATABASE_URL = resolvedDbUrl
+
+// ── Performance Round: deterministic connection-pool bounds ────────────────
+// The production VPS is a 2-vCPU ARM box with PostgreSQL on the SAME host:
+// the Prisma default pool (num_cpus*2+1 = 5) undersells Promise.all-heavy
+// routes, while an unbounded pool would thrash Postgres during cron/worker
+// bursts. Explicit params (only when the URL does not already carry them):
+//   connection_limit=10  → ceiling per process (API + scripts),
+//   pool_timeout=15s     → fail fast instead of queuing forever,
+//   connect_timeout=5s   → a hung DB never stalls boot for minutes.
+function withPoolParams(url: string): string {
+  try {
+    const u = new URL(url)
+    if (!u.searchParams.has('connection_limit')) u.searchParams.set('connection_limit', '10')
+    if (!u.searchParams.has('pool_timeout')) u.searchParams.set('pool_timeout', '15')
+    if (!u.searchParams.has('connect_timeout')) u.searchParams.set('connect_timeout', '5')
+    return u.toString()
+  } catch {
+    // Not a parseable URL (shouldn't happen — postgres URLs are validated
+    // upstream) — return as-is rather than break startup.
+    return url
+  }
+}
+
+const pooledDbUrl = withPoolParams(resolvedDbUrl)
+process.env.DATABASE_URL = pooledDbUrl
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined

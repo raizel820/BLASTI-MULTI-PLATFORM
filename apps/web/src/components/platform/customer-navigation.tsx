@@ -529,7 +529,13 @@ export function CustomerNavigation() {
       }
     };
     fetchUnread();
-    const interval = setInterval(fetchUnread, 30000);
+    // Performance Round — skip the poll while the tab/app is hidden (the
+    // realtime socket still pushes notification events, so the badge only
+    // self-heals a beat later on return).
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      fetchUnread();
+    }, 30000);
     const handleNotificationsRead = () => { fetchUnread(); };
     window.addEventListener('blasti:notifications-read', handleNotificationsRead);
     return () => {
