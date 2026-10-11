@@ -12,7 +12,11 @@
  *   Browse L1    → per bucket: year cards + legacy flat files
  *   Browse L2    → per bucket/yyyy: month rows
  *   Browse L3    → per bucket/yyyy/mm: searchable files table with
- *                  copy-path / open-URL / delete actions
+ *                  inline image thumbnails / preview dialog / copy-path /
+ *                  open-URL / delete actions
+ *   Preview      → in-app file preview: images, PDF (browser viewer),
+ *                  video/audio players and text files (first 256 KB);
+ *                  binaries fall back to download/open actions
  *   Delete       → DELETE /file { storagePath } (disk unlink + FileAsset
  *                  tombstone server-side)
  *
@@ -24,6 +28,7 @@
  */
 
 import { apiFetch } from '@/lib/api-fetch';
+import { buildCloudUrl } from '@/lib/api-client';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
@@ -59,11 +64,17 @@ import {
   PackageCheck,
   MonitorDown,
   AlertTriangle,
+  Eye,
+  Download,
+  Music,
+  Video,
+  FileQuestion,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
 import { ConfirmDialog } from '@/components/shared/confirm-dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog';
 import { isRTL, type TranslationKeys, type Language } from '@/i18n';
 
 const fadeUp = {
@@ -162,6 +173,41 @@ function compactNumber(n: number): string {
   if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}K`;
   if (n < 1_000_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   return `${(n / 1_000_000_000).toFixed(1)}B`;
+}
+
+// ─── File-kind detection (drives previews; extension-based — filenames are
+// canonical <timestamp>-<rand>.<ext> produced by the storage service) ────────
+
+type FileKind = 'image' | 'pdf' | 'video' | 'audio' | 'text' | 'binary';
+
+const KIND_BY_EXT: Record<string, FileKind> = {
+  png: 'image', jpg: 'image', jpeg: 'image', webp: 'image', gif: 'image',
+  svg: 'image', bmp: 'image', avif: 'image', ico: 'image',
+  pdf: 'pdf',
+  mp4: 'video', webm: 'video', mov: 'video', mkv: 'video', m4v: 'video',
+  mp3: 'audio', wav: 'audio', ogg: 'audio', oga: 'audio', m4a: 'audio', aac: 'audio', flac: 'audio',
+  txt: 'text', json: 'text', csv: 'text', tsv: 'text', md: 'text', xml: 'text',
+  log: 'text', yml: 'text', yaml: 'text', ini: 'text', conf: 'text', sql: 'text', html: 'text',
+};
+
+function fileKind(name: string): FileKind {
+  const ext = name.slice(name.lastIndexOf('.') + 1).toLowerCase();
+  return KIND_BY_EXT[ext] ?? 'binary';
+}
+
+/** True when the file can be rendered in-app (everything but raw binaries). */
+function isPreviewable(name: string): boolean {
+  return fileKind(name) !== 'binary';
+}
+
+/**
+ * Browser-reachable URL for a stored file. The API returns RELATIVE
+ * /api/upload/file/... paths — behind the single-port sandbox gateway those
+ * only resolve when XTransformPort=3003 is appended, while on loopback/LAN
+ * dev the API lives on :3003 directly. buildCloudUrl handles every topology.
+ */
+function fileBrowserUrl(url: string): string {
+  return url.startsWith('/') ? buildCloudUrl(url) : url;
 }
 
 /** Locale-aware medium date + short time. */
@@ -302,6 +348,202 @@ function pathKey(bucket: string, yyyy: string | null, mm: string | null): string
   return mm && yyyy ? `${bucket}/${yyyy}/${mm}` : yyyy ? `${bucket}/${yyyy}` : bucket;
 }
 
+// ─── Preview dialog (images / PDF / video / audio / text) ───────────────
+
+interface StoragePreviewDialogProps {
+  file: StorageFileRow | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  t: (key: TranslationKeys, params?: Record<string, string>) => string;
+  lang: Language;
+  onCopy: (text: string) => void;
+}
+
+/** Text previews are capped — a multi-MB log must never freeze the tab. */
+const TEXT_PREVIEW_LIMIT = 256 * 1024;
+
+function PreviewFallback({ icon: Icon, text }: { icon: LucideIcon; text: string }) {
+  return (
+    <div className="rounded-xl border bg-muted/30 py-12 flex flex-col items-center justify-center gap-3 text-center px-6">
+      <Icon className="h-10 w-10 text-muted-foreground/50" />
+      <p className="text-sm text-muted-foreground max-w-sm">{text}</p>
+    </div>
+  );
+}
+
+function StoragePreviewDialog({ file, open, onOpenChange, t, lang, onCopy }: StoragePreviewDialogProps) {
+  const src = file?.url ? fileBrowserUrl(file.url) : null;
+  const kind = file ? fileKind(file.name) : 'binary';
+
+  // Image load failure (404 after disk drift, decode error) → honest fallback.
+  const [imgFailed, setImgFailed] = useState(false);
+  // Text-kind fetch state.
+  const [textBody, setTextBody] = useState<string | null>(null);
+  const [textTruncated, setTextTruncated] = useState(false);
+  const [textLoading, setTextLoading] = useState(false);
+  const [textFailed, setTextFailed] = useState(false);
+
+  // Reset per-file state whenever the dialog opens for a (new) file.
+  useEffect(() => {
+    setImgFailed(false);
+    setTextBody(null);
+    setTextTruncated(false);
+    setTextFailed(false);
+    if (!open || !src || !file || fileKind(file.name) !== 'text') return;
+    let cancelled = false;
+    setTextLoading(true);
+    (async () => {
+      try {
+        const res = await fetch(src);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const raw = await res.text();
+        if (cancelled) return;
+        const truncated = raw.length > TEXT_PREVIEW_LIMIT;
+        setTextBody(truncated ? raw.slice(0, TEXT_PREVIEW_LIMIT) : raw);
+        setTextTruncated(truncated);
+      } catch {
+        if (!cancelled) setTextFailed(true);
+      } finally {
+        if (!cancelled) setTextLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [open, src, file]);
+
+  if (!file) return null;
+
+  const ext = file.name.slice(file.name.lastIndexOf('.') + 1).toUpperCase();
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 min-w-0 pe-6 flex-wrap">
+            <span className="truncate font-mono text-sm max-w-full" title={file.name}>{file.name}</span>
+            <Badge variant="secondary" className="text-[10px] font-mono">{ext}</Badge>
+            {file.tracked ? (
+              <Badge className="text-[10px] bg-emerald-100 text-emerald-800 hover:bg-emerald-100 dark:bg-emerald-900/40 dark:text-emerald-300">
+                {t('storageTracked')}
+              </Badge>
+            ) : (
+              <Badge className="text-[10px] bg-amber-100 text-amber-800 hover:bg-amber-100 dark:bg-amber-900/40 dark:text-amber-300">
+                {t('storageUntracked')}
+              </Badge>
+            )}
+          </DialogTitle>
+          <DialogDescription className="text-[11px] break-all">
+            {humanSize(file.size)} · {formatModified(file.mtimeMs, lang)} ·
+            <code className="font-mono ms-1" title={file.storagePath}>{file.storagePath}</code>
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-3">
+          {/* ── Body by kind ── */}
+          {kind === 'image' && src && !imgFailed && (
+            <div className="rounded-xl border bg-muted/30 p-2 flex items-center justify-center min-h-[200px]">
+              <img
+                src={src}
+                alt={file.name}
+                loading="lazy"
+                onError={() => setImgFailed(true)}
+                className="max-h-[60vh] w-auto max-w-full object-contain rounded-lg"
+              />
+            </div>
+          )}
+          {kind === 'image' && imgFailed && (
+            <PreviewFallback icon={FileQuestion} text={t('storagePreviewLoadFailed')} />
+          )}
+
+          {kind === 'pdf' && src && (
+            <iframe
+              src={src}
+              title={file.name}
+              className="w-full h-[65vh] rounded-xl border bg-muted/30"
+            />
+          )}
+
+          {kind === 'video' && src && (
+            <video
+              controls
+              src={src}
+              className="max-h-[60vh] w-full rounded-xl border bg-black"
+            />
+          )}
+
+          {kind === 'audio' && src && (
+            <div className="rounded-xl border bg-muted/30 p-6 flex items-center justify-center">
+              <audio controls src={src} className="w-full max-w-md" />
+            </div>
+          )}
+
+          {kind === 'text' && (
+            <div className="rounded-xl border bg-muted/30 p-3">
+              {textLoading && (
+                <div className="flex items-center justify-center py-10 text-muted-foreground text-sm gap-2">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {t('storagePreviewLoading')}
+                </div>
+              )}
+              {!textLoading && textFailed && (
+                <PreviewFallback icon={FileQuestion} text={t('storagePreviewLoadFailed')} />
+              )}
+              {!textLoading && !textFailed && textBody !== null && (
+                <>
+                  <pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap break-all text-[12px] leading-relaxed font-mono">
+                    {textBody}
+                  </pre>
+                  {textTruncated && (
+                    <p className="mt-2 text-[10px] text-muted-foreground">
+                      {t('storagePreviewTruncated', { size: humanSize(TEXT_PREVIEW_LIMIT) })}
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
+          )}
+
+          {kind === 'binary' && (
+            <PreviewFallback icon={FileQuestion} text={t('storagePreviewUnavailable')} />
+          )}
+
+          {/* ── Footer actions ── */}
+          <div className="flex items-center gap-2 flex-wrap justify-end pt-1 border-t">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => onCopy(file.storagePath)}
+            >
+              <Copy className="h-3.5 w-3.5 me-1" />
+              {t('storageCopyPath')}
+            </Button>
+            {src && (
+              <a
+                href={src}
+                download={file.name}
+                className="inline-flex items-center justify-center gap-1.5 h-8 px-3 rounded-md border border-input bg-background text-sm font-medium hover:bg-muted transition-colors"
+              >
+                <Download className="h-3.5 w-3.5" />
+                {t('storageDownload')}
+              </a>
+            )}
+            {src && (
+              <a
+                href={src}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center justify-center gap-1.5 h-8 px-3 rounded-md border border-input bg-background text-sm font-medium hover:bg-muted transition-colors"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                {t('storageOpenFile')}
+              </a>
+            )}
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 // ─── Files table (shared by legacy flat files + month listing) ──────────────
 
 interface FilesTableProps {
@@ -310,9 +552,10 @@ interface FilesTableProps {
   lang: Language;
   onCopy: (path: string) => void;
   onAskDelete: (file: StorageFileRow) => void;
+  onPreview: (file: StorageFileRow) => void;
 }
 
-function StorageFilesTable({ files, t, lang, onCopy, onAskDelete }: FilesTableProps) {
+function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: FilesTableProps) {
   return (
     <div className="rounded-xl border overflow-hidden">
       {/* Long lists scroll inside a bounded viewport (custom-scrollbar free —
@@ -336,12 +579,37 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete }: FilesTablePr
                 </TableCell>
               </TableRow>
             ) : (
-              files.map((f, idx) => (
+              files.map((f, idx) => {
+                const previewable = isPreviewable(f.name) && !!f.url;
+                const thumb = f.name.toLowerCase().match(/\.(png|jpe?g|webp|gif|svg|bmp|avif|ico)$/)
+                  ? (f.url ? fileBrowserUrl(f.url) : null)
+                  : null;
+                return (
                 <TableRow key={f.storagePath || idx}>
                   <TableCell className="max-w-[280px]">
-                    <span className="font-mono text-[12px] block truncate" title={f.name}>
-                      {f.name}
-                    </span>
+                    <button
+                      type="button"
+                      onClick={() => { if (previewable) onPreview(f); }}
+                      disabled={!previewable}
+                      className={`flex items-center gap-2.5 min-w-0 max-w-full text-start ${previewable ? 'group cursor-pointer' : 'cursor-default'}`}
+                      title={previewable ? t('storagePreview') : undefined}
+                    >
+                      {thumb ? (
+                        <img
+                          src={thumb}
+                          alt=""
+                          loading="lazy"
+                          className="h-9 w-9 rounded-md border object-cover shrink-0 bg-muted/40 group-hover:border-emerald-400 dark:group-hover:border-emerald-600 transition-colors"
+                        />
+                      ) : (
+                        <span className="h-9 w-9 rounded-md border bg-muted/40 flex items-center justify-center shrink-0">
+                          <FileText className="h-4 w-4 text-muted-foreground/70" />
+                        </span>
+                      )}
+                      <span className={`font-mono text-[12px] truncate ${previewable ? 'group-hover:underline decoration-dotted underline-offset-2' : ''}`} title={f.name}>
+                        {f.name}
+                      </span>
+                    </button>
                   </TableCell>
                   <TableCell className="whitespace-nowrap text-[12px]">{humanSize(f.size)}</TableCell>
                   <TableCell className="whitespace-nowrap text-[12px] text-muted-foreground">
@@ -360,6 +628,18 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete }: FilesTablePr
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1 justify-end">
+                      {previewable && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 w-7 p-0"
+                          title={t('storagePreview')}
+                          aria-label={t('storagePreview')}
+                          onClick={() => onPreview(f)}
+                        >
+                          <Eye className="h-3.5 w-3.5" />
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         size="sm"
@@ -372,7 +652,7 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete }: FilesTablePr
                       </Button>
                       {f.url && (
                         <a
-                          href={f.url}
+                          href={fileBrowserUrl(f.url)}
                           target="_blank"
                           rel="noopener noreferrer"
                           title={t('storageOpenFile')}
@@ -395,7 +675,8 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete }: FilesTablePr
                     </div>
                   </TableCell>
                 </TableRow>
-              ))
+                );
+              })
             )}
           </TableBody>
         </Table>
@@ -430,6 +711,9 @@ export function AdminStorageManager() {
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<StorageFileRow | null>(null);
   const [deleting, setDeleting] = useState(false);
+
+  // Preview dialog (image / PDF / video / audio / text)
+  const [previewTarget, setPreviewTarget] = useState<StorageFileRow | null>(null);
 
   // ── Overview fetch ──
   const fetchOverview = useCallback(async (isRefresh = false) => {
@@ -833,6 +1117,7 @@ export function AdminStorageManager() {
                     lang={lang}
                     onCopy={copyText}
                     onAskDelete={setDeleteTarget}
+                    onPreview={setPreviewTarget}
                   />
                 </div>
               )}
@@ -895,6 +1180,7 @@ export function AdminStorageManager() {
           lang={lang}
           onCopy={copyText}
           onAskDelete={setDeleteTarget}
+          onPreview={setPreviewTarget}
         />
       </div>
     );
@@ -1109,6 +1395,16 @@ export function AdminStorageManager() {
         variant="danger"
         loading={deleting}
         onConfirm={confirmDeleteFile}
+      />
+
+      {/* File preview (image / PDF / video / audio / text) */}
+      <StoragePreviewDialog
+        file={previewTarget}
+        open={!!previewTarget}
+        onOpenChange={(o) => { if (!o) setPreviewTarget(null); }}
+        t={t}
+        lang={lang}
+        onCopy={copyText}
       />
     </div>
   );
