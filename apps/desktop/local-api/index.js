@@ -8962,6 +8962,162 @@ function createApp() {
     }
   })
 
+  // POST /api/sync/push — Task 2-b (sub-task 6): the RENDERER's sync engine
+  // (apps/web/src/db/sync.ts) targets the local API in Electron and pushes
+  // its WatermelonDB-shaped changes HERE every cycle. This route previously
+  // did NOT exist → every push answered 404 → the cycle failed with
+  // "Push failed with status 404", the LAN-404 cooldown kicked in, and the
+  // desktop looked like "the sync engine is not working" while local business
+  // writes created through the Hono routes kept flowing via the outbox.
+  //
+  // Contract (superset — accepts every legacy shape):
+  //   { changes: { [table|model]: { created: rows, updated: rows, deleted: ids } },
+  //     lastPulledAt?, agencyId?, mutations? }
+  // Rows arrive in WDB storage shape (snake_case keys, epoch-ms dates, 0/1
+  // booleans); they are converted to the cloud record shape and applied via
+  // the SAME pipeline the cloud pull uses (schema-aware sanitizer + LWW +
+  // FK-failure deferral) so a pushed row can never corrupt the local mirror.
+  // Applied rows are counted; per-row failures are reported per model —
+  // never silently swallowed.
+  const WDB_TABLE_TO_MODEL = {
+    agencies: 'Agency',
+    services: 'Service',
+    branches: 'Branch',
+    counters: 'Counter',
+    reservations: 'Reservation',
+    notifications: 'Notification',
+    queue_settings: 'QueueSettings',
+    users: 'User',
+    transactions: 'Transaction',
+    reviews: 'Review',
+    favorites: 'Favorite',
+    announcements: 'Announcement',
+    global_announcements: 'GlobalAnnouncement',
+    globalannouncements: 'GlobalAnnouncement',
+    faqs: 'FAQ',
+    sms_settings: 'SmsSettings',
+    payment_settings: 'PaymentSettings',
+    subscription_plans: 'SubscriptionPlan',
+    plan_features: 'PlanFeature',
+    agency_categories: 'AgencyCategory',
+    support_tickets: 'SupportTicket',
+  }
+
+  /** snake_case → camelCase (WDB rows → Prisma field names). */
+  function wdbKeyToCamel(key) {
+    return String(key).replace(/_([a-z0-9])/g, (_m, ch) => ch.toUpperCase())
+  }
+
+  const WDB_DATE_FIELDS = new Set([
+    'joinedAt', 'calledAt', 'completedAt', 'cancelledAt', 'createdAt',
+    'updatedAt', 'ratedAt', 'reminderSentAt', 'smsReminderSentAt',
+    'skippedAt', 'reclaimRequestedAt', 'qrClaimedAt', 'offlineCreatedAt',
+    'syncedAt', 'deletedAt', 'openedAt', 'resolvedAt', 'repliedAt',
+    'lastActiveAt', 'reviewedAt', 'subscriptionStartsAt', 'subscriptionExpiresAt',
+  ])
+  const WDB_BOOLEAN_FIELDS = new Set([
+    'reminderSent', 'smsReminderSent', 'syncConflict', 'skippedForNoShow',
+    'fixedTimeEnabled', 'isWalkIn', 'isRead', 'isPaused', 'isOpen',
+    'isActive', 'isRequired', 'allowWalkIn', 'autoComplete', 'verified',
+  ])
+
+  /**
+   * One WDB row → cloud record shape (camelCase, ISO datetimes, true/false
+   * booleans). Returns null for rows without an id (cannot be upserted).
+   */
+  function wdbRowToCloudRecord(row) {
+    if (!row || typeof row !== 'object') return null
+    const out = {}
+    let hasId = false
+    for (const [rawKey, value] of Object.entries(row)) {
+      const key = rawKey === 'id' ? 'id' : wdbKeyToCamel(rawKey)
+      if (key === 'id') {
+        if (value === undefined || value === null || value === '') return null
+        out.id = value
+        hasId = true
+        continue
+      }
+      if (value === undefined) continue
+      if (WDB_DATE_FIELDS.has(key) && typeof value === 'number') {
+        out[key] = new Date(value).toISOString()
+      } else if (WDB_BOOLEAN_FIELDS.has(key) && (value === 0 || value === 1)) {
+        out[key] = value === 1
+      } else {
+        out[key] = value
+      }
+    }
+    return hasId ? out : null
+  }
+
+  app.post('/api/sync/push', authMiddleware, async (c) => {
+    try {
+      let body = {}
+      try { body = await c.req.json() } catch { /* empty body — nothing to push */ }
+
+      const changes = body && typeof body.changes === 'object' && body.changes ? body.changes : {}
+      const agencyId = sessionUser?.agencyId || body?.agencyId || null
+
+      // Normalize every WDB table bucket into the v2 model shape.
+      const cloudChanges = {}
+      let received = 0
+      for (const [tableName, bucket] of Object.entries(changes)) {
+        if (!bucket || typeof bucket !== 'object') continue
+        const modelName = WDB_TABLE_TO_MODEL[tableName] ||
+          (/^[A-Z]/.test(tableName) ? tableName : null)
+        if (!modelName) {
+          console.warn('[LocalAPI] /api/sync/push: unknown table "' + tableName + '" — skipped (not silently lost: reported here)')
+          continue
+        }
+        const changed = []
+        for (const row of [...(Array.isArray(bucket.created) ? bucket.created : []), ...(Array.isArray(bucket.updated) ? bucket.updated : [])]) {
+          const rec = wdbRowToCloudRecord(row)
+          if (rec) { changed.push(rec); received++ }
+        }
+        const deleted = Array.isArray(bucket.deleted) ? bucket.deleted.filter((id) => typeof id === 'string' && id) : []
+        received += deleted.length
+        if (changed.length === 0 && deleted.length === 0) continue
+        const target = cloudChanges[modelName] || (cloudChanges[modelName] = { changed: [], deleted: [] })
+        target.changed.push(...changed)
+        target.deleted.push(...deleted)
+      }
+
+      if (received === 0) {
+        // Empty pushes are NORMAL (WatermelonDB pushes only local deltas —
+        // on the desktop the renderer's WDB cache is usually empty because
+        // the UI reads the local API directly). Answer 200 so the cycle
+        // completes cleanly instead of tripping the 404 cooldown.
+        return c.json({ success: true, applied: 0, deferred: 0, received: 0, models: [] })
+      }
+
+      if (!db) {
+        return c.json({ success: false, error: 'Local database is not ready' }, 503)
+      }
+
+      const syncService = require('./sync-service')
+      const applyResult = await syncService.applyPullChanges(db, cloudChanges, {
+        agencyId: agencyId || '',
+        pageLastSequence: null,
+      })
+      console.log('[LocalAPI] /api/sync/push applied=' + applyResult.applied +
+        ' deleted=' + applyResult.deleted + ' deferred=' + applyResult.deferred +
+        ' received=' + received + ' models=[' + Object.keys(cloudChanges).join(',') + ']')
+      return c.json({
+        success: true,
+        applied: applyResult.applied,
+        deleted: applyResult.deleted,
+        deferred: applyResult.deferred,
+        conflicts: applyResult.conflicts,
+        received,
+        models: Object.keys(cloudChanges),
+      })
+    } catch (error) {
+      // Task 2-b (sub-task 6): push failures are NEVER silent — the renderer
+      // cycle and the diagnosis panel both key off this log line.
+      console.error('[LocalAPI] /api/sync/push error:', error && (error.stack || error.message))
+      return c.json({ success: false, error: 'Push failed: ' + (error && error.message || 'unknown') }, 500)
+    }
+  })
+
   // GET /api/sync-status — local sync status for diagnosis panel
   // v2: returns the live background sync engine status (awaited).
   app.get('/api/sync-status', async (c) => {
@@ -10355,6 +10511,38 @@ async function startLocalApi(dbPath, port, options) {
     console.warn('[LocalAPI] Local realtime init failed (non-fatal — interval sync unaffected):', rtErr.message)
   }
 
+  // ── Parent-liveness watchdog (Task 2-b, sub-task 5) ─────────────────────
+  // The embedded API runs INSIDE the Electron main process, so it can only
+  // outlive the app if a future build moves it into a spawned CHILD process.
+  // When BLASTI_LOCAL_API_CHILD=1 (child layout), the module polls its parent
+  // PID (BLASTI_PARENT_PID, set by main.js) every 15s and SELF-TERMINATES the
+  // moment the parent disappears — the "local api keeps running after the app
+  // died" bug can then never recur, even if the child outlived a crash. In
+  // the current in-process layout the env is absent and the watchdog is a
+  // no-op (zero timers).
+  try {
+    const childMode = process.env.BLASTI_LOCAL_API_CHILD === '1'
+    const parentPid = parseInt(process.env.BLASTI_PARENT_PID || '', 10)
+    if (childMode && parentPid > 0) {
+      const parentWatchdog = setInterval(() => {
+        try {
+          // Signal 0 = liveness probe only (no signal delivered).
+          process.kill(parentPid, 0)
+        } catch {
+          console.error('[LocalAPI] Parent process ' + parentPid + ' is gone — stopping the local API and exiting (orphan guard)')
+          clearInterval(parentWatchdog)
+          try { stopLocalApi() } catch { /* best-effort */ }
+          process.exit(94)
+        }
+      }, 15000)
+      // Never hold the event loop open for the watchdog itself.
+      if (typeof parentWatchdog.unref === 'function') parentWatchdog.unref()
+      console.log('[LocalAPI] Parent-liveness watchdog armed (parent pid ' + parentPid + ', 15s poll)')
+    }
+  } catch (wdErr) {
+    console.warn('[LocalAPI] Parent watchdog could not be armed (non-fatal):', wdErr && wdErr.message)
+  }
+
   return { port, db }
 }
 
@@ -10367,6 +10555,14 @@ function stopLocalApi() {
   try { if (fileSync) fileSync.stop() } catch { /* not started */ }
   if (httpServer) {
     httpServer.close()
+    // Task 2-b-1: close() only STOPS ACCEPTING new connections — established
+    // keep-alive sockets (a LAN kiosk board that polled :3080 seconds ago)
+    // would otherwise linger up to the socket timeout, holding the port open
+    // during the app's quit window. closeAllConnections() (Node ≥ 18.2;
+    // Electron 42 embeds Node 22) destroys them NOW so teardown is immediate.
+    try {
+      if (typeof httpServer.closeAllConnections === 'function') httpServer.closeAllConnections()
+    } catch { /* best-effort — quit backstop covers the rest */ }
     httpServer = null
   }
   if (db) {

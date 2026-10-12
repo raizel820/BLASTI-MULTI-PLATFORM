@@ -3,7 +3,15 @@ import { db } from '@blasti/db'
 import { requireAuth, requireAgencyAccess, requireResourceOwnership, resolveUserAgencyId, authErrorResponse, verifyAgencyOwnership, requireAgencyAuthority, getAgencyAuthority, STAFF_PERMISSION_KEYS, AuthError, type StaffPermission, type SessionUser } from '../lib/auth'
 import { validateBody, createAnnouncementSchema, createBranchSchema, updateBranchSchema, createCounterSchema, updateCounterSchema, updateAgencyProfileSchema, updateAgencySettingsSchema, createServiceSchema, updateServiceSchema, updateStaffSchema, createStaffSchema, createReviewSchema, subscriptionPaySchema, subscriptionUnsubscribeSchema, updateWorkingHoursSchema, createHardwareOrderSchema, createEnterpriseRequestSchema } from '../lib/validations'
 import { emitQueueEvent, emitNotificationEvent, emitKioskEvent, emitReservationEvent, emitAgencyEvent, emitStaffEvent } from '../lib/realtime-emit'
-import { getNextCustomerToCall } from '../lib/queue-scheduler'
+// Task 2-a — shared waiting/callable criteria: the queue list, the stats count
+// and call-next MUST evaluate the SAME predicate or the staff UI reports
+// "customer waiting" while call-next reports "No customers waiting". These
+// helpers wrap lib/queue-scheduler.ts shouldSkipForPreferredTime — the
+// scheduler itself is no longer imported per-route.
+import { partitionWaiting, pickNextCallable, scheduledReason, todayLocalDateString, WAITING_CRITERIA_SELECT } from '../lib/queue-waiting'
+// Task 2-a — every queue mutation invalidates the public cache tags that
+// expose reservation-derived numbers (/api/stats, /api/agencies waitingCount).
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 import { checkRateLimit, RateLimitError, QUEUE_RATE_LIMIT } from '../lib/rate-limit'
 import { getTodayStart, getTodayEnd } from '../lib/date-utils'
 import { SETTLED_TRANSACTION_STATUSES } from '../lib/enums'
@@ -2801,8 +2809,14 @@ app.get('/queue', async (c) => {
       orderBy: { queueNumber: 'asc' },
     })
 
-    // Calculate position for each reservation
+    // Task 2-a — one shared partition for the whole response: which WAITING
+    // tickets are callable NOW vs scheduled for a later date/time. The list
+    // still shows BOTH (they are real bookings), but each entry now carries
+    // callableNow so staff surfaces can stop counting scheduled tickets as
+    // "waiting now" — the exact divergence that produced the VPS phantom.
     const waitingReservations = reservations.filter(r => r.status === 'WAITING')
+    const { callable: callableWaiting, scheduled: scheduledWaiting } = partitionWaiting(waitingReservations)
+    const callableById = new Set(callableWaiting.map(r => r.id))
     const entries = reservations.map((res) => ({
       id: res.id,
       queueNumber: res.displayNumber,
@@ -2821,9 +2835,32 @@ app.get('/queue', async (c) => {
       preferredTime: res.preferredTime,
       fixedTimeEnabled: res.fixedTimeEnabled,
       postponeCount: res.postponeCount,
+      // Task 2-a — NEW field (backward compatible): true ⇔ call-next would
+      // take this ticket right now. Scheduled tickets (future reservedDate or
+      // future fixed preferredTime) report callableNow:false + why.
+      callableNow: res.status === 'WAITING' ? callableById.has(res.id) : undefined,
+      scheduledReason: res.status === 'WAITING' && !callableById.has(res.id)
+        ? scheduledReason(res)
+        : undefined,
     }))
 
-    return c.json({ entries })
+    return c.json({
+      entries,
+      // Task 2-a — staff-facing counts derived from the SAME criteria as
+      // call-next, with CANONICAL names (see lib/queue-waiting.ts contract):
+      //   waitingCount   — all WAITING tickets in the queue (callable + scheduled)
+      //   callableCount  — call-next would take these RIGHT NOW
+      //   scheduledCount — WAITING but booked for a later date/time
+      // The list still shows scheduled entries (they are real bookings) and
+      // each entry carries callableNow/scheduledReason so any surface can
+      // stop counting them as "waiting now" — the exact VPS phantom class.
+      waitingCount: callableWaiting.length + scheduledWaiting.length,
+      callableCount: callableWaiting.length,
+      scheduledCount: scheduledWaiting.length,
+      calledCount: reservations.filter(r => r.status === 'CALLED').length,
+      nextCallableId: pickNextCallable(waitingReservations)?.id ?? null,
+      today: todayLocalDateString(),
+    })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -2891,7 +2928,9 @@ app.post('/queue/call-next', async (c) => {
 
     // Use transaction to prevent double-calling
     // Returns both the next reservation and any auto-completed entries
-    const { nextReservation: next, autoCompleted } = await db.$transaction(async (tx) => {
+    // Task 2-a — also returns the WAITING-partition counts so the "nothing to
+    // call" response can TELL the staff why (scheduled vs empty queue).
+    const { nextReservation: next, autoCompleted, queueWaitingCount, queueCallableCount, queueScheduledCount } = await db.$transaction(async (tx) => {
       // ─── Auto-complete the PREVIOUS customer for THIS counter only ───
       // Scoping to counterId ensures multiple receptions can serve simultaneously
       const completedEntries: { id: string; displayNumber: string }[] = []
@@ -2936,6 +2975,7 @@ app.post('/queue/call-next', async (c) => {
         orderBy: { queueNumber: 'asc' },
         select: {
           id: true,
+          status: true,
           queueNumber: true,
           preferredTime: true,
           fixedTimeEnabled: true,
@@ -2943,9 +2983,21 @@ app.post('/queue/call-next', async (c) => {
         },
       })
 
-      // Use queue scheduler to find next customer (respects preferred times)
-      const nextId = getNextCustomerToCall(waitingReservations)
-      if (!nextId) return { nextReservation: null, autoCompleted: completedEntries }
+      // Task 2-a — SHARED criteria (lib/queue-waiting.ts): the SAME predicate
+      // the waiting list and the stats count use. Scheduled tickets (future
+      // reservedDate / future fixed preferredTime) are excluded here and
+      // reported via scheduledCount instead of silently becoming phantoms.
+      const { callable: callableNow, scheduled: scheduledNow } = partitionWaiting(waitingReservations)
+      const nextId = pickNextCallable(waitingReservations)?.id ?? null
+      if (!nextId) {
+        return {
+          nextReservation: null,
+          autoCompleted: completedEntries,
+          queueWaitingCount: waitingReservations.length,
+          queueCallableCount: callableNow.length,
+          queueScheduledCount: scheduledNow.length,
+        }
+      }
 
       const candidate = await tx.reservation.findUnique({
         where: { id: nextId },
@@ -2954,19 +3006,64 @@ app.post('/queue/call-next', async (c) => {
           user: { select: { id: true, fullName: true } },
         },
       })
-      if (!candidate) return { nextReservation: null, autoCompleted: completedEntries }
+      if (!candidate) {
+        return {
+          nextReservation: null,
+          autoCompleted: completedEntries,
+          queueWaitingCount: waitingReservations.length,
+          queueCallableCount: callableNow.length,
+          queueScheduledCount: scheduledNow.length,
+        }
+      }
 
       // Re-check status inside transaction
       const recheck = await tx.reservation.findUnique({ where: { id: candidate.id } })
-      if (!recheck || recheck.status !== 'WAITING') return { nextReservation: null, autoCompleted: completedEntries }
+      if (!recheck || recheck.status !== 'WAITING') {
+        return {
+          nextReservation: null,
+          autoCompleted: completedEntries,
+          queueWaitingCount: waitingReservations.length,
+          queueCallableCount: callableNow.length,
+          queueScheduledCount: scheduledNow.length,
+        }
+      }
 
       await processCandidate(tx, candidate, queueSettings, agencyId, counterId ?? undefined)
-      return { nextReservation: candidate, autoCompleted: completedEntries }
+      return {
+        nextReservation: candidate,
+        autoCompleted: completedEntries,
+        queueWaitingCount: waitingReservations.length,
+        queueCallableCount: callableNow.length,
+        queueScheduledCount: scheduledNow.length,
+      }
     })
 
     const nextReservation = next
 
+    // Task 2-a — this call changed reservation-state-derived numbers exposed
+    // by the CACHED public GETs (/api/stats tag 'stats', /api/agencies tag
+    // 'agencies' waitingCount). Invalidate them eagerly — a cached waiting
+    // count served after a call is exactly the class of staleness that
+    // brought down the VPS phantom report. No-op when nothing is cached.
+    invalidateResponseCacheTag('stats', 'agencies')
+
     if (!nextReservation) {
+      // Task 2-a — truthful "nothing to call" responses. The old blanket
+      // 'No customers waiting' was WRONG whenever scheduled tickets existed:
+      // staff saw them as waiting (list/stats) and call-next refused them.
+      if (queueWaitingCount > 0) {
+        return c.json({
+          success: false,
+          error: `${queueScheduledCount} customer(s) waiting but none callable yet — ticket(s) are booked for a later time or date`,
+          errorKey: 'ONLY_SCHEDULED_WAITING',
+          // Task 2-a — CANONICAL count names, identical meaning to the list
+          // (lib/queue-waiting.ts contract): waitingCount = all WAITING,
+          // callableCount = callable now (0 here), scheduledCount = booked later.
+          waitingCount: queueWaitingCount,
+          callableCount: queueCallableCount,
+          scheduledCount: queueScheduledCount,
+        }, 404)
+      }
       return c.json({ error: 'No customers waiting' }, 404)
     }
 
@@ -3325,6 +3422,9 @@ app.post('/queue/walk-in', async (c) => {
       displayNumber: reservation.displayNumber,
     })
 
+    // Task 2-a — walk-in creation changes the reservation-derived counts.
+    invalidateResponseCacheTag('stats', 'agencies')
+
     return c.json({ success: true, reservation: { ...reservation, importToken }, importToken }, 201)
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -3507,6 +3607,10 @@ app.patch('/queue/:id', async (c) => {
         details: JSON.stringify({ displayNumber: reservation.displayNumber, status }),
       },
     })
+
+    // Task 2-a — complete/no-show/cancel all change the reservation-derived
+    // counts exposed by the cached public GETs.
+    invalidateResponseCacheTag('stats', 'agencies')
 
     // Emit realtime events (non-blocking — fire and forget)
     const eventType = action === 'complete' ? 'queue:completed'
@@ -4761,7 +4865,8 @@ app.get('/stats', async (c) => {
 
     const [
       todayReservations,
-      waitingCount,
+      waitingRows,
+      calledCount,
       servedToday,
       noShowCount,
       cancelledCount,
@@ -4777,8 +4882,17 @@ app.get('/stats', async (c) => {
       db.reservation.count({
         where: { agencyId, joinedAt: { gte: todayStart, lte: todayEnd } },
       }),
+      // Task 2-a — currentlyWaiting now uses the SAME callable criteria as
+      // call-next (lib/queue-waiting.ts): WAITING rows are partitioned here so
+      // future-dated / future-fixed-time tickets stop counting as "waiting
+      // now" while call-next refuses them. CALLED rows (at a desk) stay in
+      // the number, matching the previous in-house semantics.
+      db.reservation.findMany({
+        where: { agencyId, status: 'WAITING' },
+        select: WAITING_CRITERIA_SELECT,
+      }),
       db.reservation.count({
-        where: { agencyId, status: { in: ['WAITING', 'CALLED'] } },
+        where: { agencyId, status: 'CALLED' },
       }),
       db.reservation.count({
         where: { agencyId, status: { in: ['COMPLETED'] }, completedAt: { gte: todayStart, lte: todayEnd } },
@@ -4892,8 +5006,15 @@ app.get('/stats', async (c) => {
       take: 200,
     })
     const effectiveService = getEffectiveServiceTime(recentCompletedForEta, agency.averageServiceTime)
+    // Task 2-a — shared partition of the WAITING rows (lib/queue-waiting.ts):
+    // callable = could be called this instant; scheduled = booked for a later
+    // date/time. currentlyWaiting keeps its in-house meaning (callable + at a
+    // desk) but EXCLUDES scheduled tickets — the count the dashboard shows can
+    // no longer disagree with what call-next is able to serve.
+    const { callable: callableWaitingRows, scheduled: scheduledWaitingRows } = partitionWaiting(waitingRows)
+    const waitingCount = callableWaitingRows.length + calledCount
     const overallEta = calculateETA({
-      peopleAhead: waitingCount,
+      peopleAhead: callableWaitingRows.length, // ETA counts only callable tickets
       avgServiceTimeMinutes: effectiveService.avgMinutes,
       activeCounters: Math.max(1, activeCounters),
       historicalVarianceFactor: effectiveService.varianceFactor,
@@ -4904,6 +5025,13 @@ app.get('/stats', async (c) => {
     return c.json({
       todayReservations,
       currentlyWaiting: waitingCount,
+      // Task 2-a — breakdown so staff UIs can show the truth:
+      //   callableWaitingCount — call-next would take these right now
+      //   calledCount          — already at a desk (CALLED)
+      //   scheduledCount       — WAITING but booked for a later time/date
+      callableWaitingCount: callableWaitingRows.length,
+      calledCount,
+      scheduledCount: scheduledWaitingRows.length,
       servedToday,
       noShowCount,
       cancelledCount,

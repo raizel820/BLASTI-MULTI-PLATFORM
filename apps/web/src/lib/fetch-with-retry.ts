@@ -106,6 +106,29 @@ function handleAuthExpired(): void {
       const w = window as any;
       let sessionRestored = false;
 
+      // ── Task 2-b (sub-task 1): SINGLE-FLIGHT cloud refresh first ──────────
+      // Every 401 in the same second (dashboard, notifications, banner, sync)
+      // lands HERE and awaits the SAME in-flight refresh promise — no parallel
+      // refresh storms against /api/auth/refresh-session. When the cloud
+      // re-issues the token, it is adopted on every renderer surface and the
+      // local API is re-imported with the FRESH token (no destructive reset).
+      try {
+        const { refreshCloudSessionSingleFlight } = await import('@/lib/token-refresh');
+        const refreshed = await refreshCloudSessionSingleFlight();
+        if (refreshed.ok && refreshed.token) {
+          if (currentUser && w.electronAPI?.setLocalApiSession) {
+            w.electronAPI.setLocalApiSession({ token: refreshed.token, user: currentUser });
+          }
+          sessionRestored = true;
+          console.log('[Auth] Electron 401 → single-flight cloud refresh succeeded — fresh token adopted, session re-imported');
+          diag('auth-expired', { outcome: 'cloud-refreshed' });
+          return; // done — the next request carries the fresh token
+        }
+        // refreshed.rejected === true → the cloud CONFIRMED the session is
+        // dead; fall through so the restore attempt runs and (failing) the
+        // state is cleared — the user lands on the login screen.
+      } catch { /* refresh module unavailable — fall through to restore */ }
+
       // ── Task 41: token CATCH-UP before any destructive restore ──────────
       // The local API may hold a NEWER token than the renderer (the main
       // process's import-session adopted a cloud-refreshed token). First ask

@@ -3799,6 +3799,75 @@ const ar = {
   settingsSystemConfigDesc: "إعدادات النظام الديناميكية المخزنة في قاعدة البيانات (بما فيها المفاتيح المشفرة)",
   settingsBackToOverview: "العودة إلى النظرة العامة",
 
+  // ─── Task 2-c: admin transactions — online (Chargily) payments ──────────
+  txTypeAll: "جميع الأنواع",
+  txTypeManual: "يدوي",
+  txTypeOnline: "أونلاين (شارجيلي)",
+  txBadgeManual: "يدوي",
+  txBadgeOnline: "أونلاين",
+  txGatewayRef: "مرجع البوابة",
+  txPayer: "الدافع",
+  txSubscriptionPayment: "اشتراك",
+  txHardwarePayment: "أجهزة",
+  txVerifyWithGateway: "تحقق من البوابة",
+  txVerifying: "جارٍ التحقق من البوابة...",
+  txMarkSettled: "تأكيد التسوية",
+  txMarkFailed: "تعليم كفاشل",
+  txGatewayOwned: "يديرها الدفع الإلكتروني — الموافقة والرفض معطّلة هنا",
+  txVerifyPending: "البوابة: قيد الانتظار",
+  txVerifyPaid: "أكدت البوابة الدفع — تمت التسوية",
+  txVerifyFailed: "البوابة: فاشل — تم تحديث الحالة",
+  txGatewayUnreachable: "تعذّر الوصول إلى بوابة الدفع",
+  txOverrideApplied: "تم تطبيق تسوية يدوية (تعذّر الوصول إلى البوابة)",
+  txRefusedPending: "البوابة لا تزال تُبلغ: قيد الانتظار — تم رفض الإجراء",
+  txReconciled: "تمت التسوية",
+
+  // ─── Task 2-c: manual full sync (agency + customer settings) ────────────
+  fullSyncTitle: "مزامنة كاملة للبيانات",
+  fullSyncDesc: "يحذف جميع البيانات المخزنة محليًا (ما عدا جلسة تسجيل الدخول)، ثم يعيد تنزيل كل شيء من الخادم.",
+  fullSyncButton: "طلب مزامنة كاملة",
+  fullSyncConfirmTitle: "مزامنة كاملة من جديد؟",
+  fullSyncConfirmBody: "سيؤدي هذا إلى محو قاعدة البيانات المحلية وذاكرة التخزين المؤقت (سجل التذاكر غير المتصلة، الصور، الملفات المؤقتة) ثم إعادة تنزيل جميع البيانات من الخادم. سيعاد تشغيل التطبيق تلقائيًا.",
+  fullSyncKeepSession: "تبقى جلسة تسجيل دخولك محفوظة.",
+  fullSyncConfirm: "محو وإعادة المزامنة",
+  fullSyncSyncing: "جارٍ تنزيل كل البيانات من جديد...",
+
+  // ─── Task 2-b-2: desktop post-login full-sync consent dialog ────────────
+  desktopSyncConsentTitle: "مزامنة كاملة للبيانات",
+  desktopSyncConsentBody: "يُنصح بمزامنة كاملة لبيانات الوكالة الآن (الطوابير والحجوزات والإعدادات). المزامنة التزايدية تستمر في الخلفية أيضاً.",
+  desktopSyncConsentNow: "مزامنة الآن",
+  desktopSyncConsentNotNow: "ليس الآن",
+  desktopSyncConsentStarted: "تم بدء المزامنة الكاملة — ستنتهي في الخلفية",
+
+  // ─── Task 2-c: storage manager navigation ───────────────────────────────
+  storageFlatView: "كل الملفات",
+  storageTreeView: "المجلدات",
+  storageFolderCol: "المجلد",
+  storageSortBy: "ترتيب",
+  storageSortName: "الاسم",
+  storageSortDate: "التاريخ",
+  storageSortSize: "الحجم",
+  storageSortType: "النوع",
+  storageSortAsc: "تصاعدي",
+  storageSortDesc: "تنازلي",
+  storageDownloadStarted: "بدأ التنزيل",
+  storageDownloadFailed: "فشل التنزيل",
+
+  // ─── Task 2-c: installer version tracker (live multi-version listing) ───
+  installerFilesTitle: "ملفات المثبّتات على الخادم",
+  installerFilesDesc: "كل نسخة مرفوعة تُقرأ مباشرة من التخزين — إعادة البناء بنفس الاسم تظهر كإدخال منفصل مع وقت رفعه الخاص.",
+  installerPushedAt: "وقت الرفع",
+  installerActiveFile: "النشط",
+  installerDraftFile: "مسودة",
+  installerUnmatched: "غير مفعّل",
+  installerActivateFile: "تفعيل هذا الملف",
+  installerActivateConfirmTitle: "تفعيل هذا الملف بالضبط؟",
+  installerActivateConfirmBody: "سيصبح رابط التنزيل العام لمنصة {platform} يشير إلى هذا الملف بالضبط (مرفوع في {time}). أياً من الإصدارات الأخرى لنفس المنصة سيُلغى نشره.",
+  installerNoFiles: "لا توجد ملفات مثبّتات على الخادم بعد",
+  installerGroupFlat: "قديم (الجذر)",
+  installerActivating: "جارٍ التفعيل...",
+  installerUnknownPlatform: "منصة غير معروفة",
+
 };
 
 export default ar;

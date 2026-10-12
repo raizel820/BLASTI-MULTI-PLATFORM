@@ -15,6 +15,11 @@ import {
 import { getMapsSettingsAdmin, validateMapsSettingsPayload, applyMapsSettingsWrites, validateGoogleMaps, validateOpenFreeMap, validateGeocoding, type MapsValidationResult } from '../lib/map-settings'
 import { getSettingRaw } from '../lib/config-manager'
 import { SETTLED_TRANSACTION_STATUSES } from '../lib/enums'
+// Online (Chargily) payment reconciliation — the admin transactions console can
+// verify a gateway checkout against the LIVE Chargily API and settle it through
+// the same idempotent fulfillment path used by the webhook + poll fallback.
+import { getCheckoutStatus } from '../lib/chargily-service'
+import { fulfillCheckoutPaid, fulfillCheckoutFailed, normalizeChargilyStatus, type FulfillmentCheckout } from '../lib/chargily-fulfill'
 // Task 2-a FIX 3 — the admin-dashboard SMS tab reads/writes /admin/sms-settings.
 import { getSmsSettings, getSmsUsageStats, testSms, validateGatewayConnection } from '../lib/sms-service'
 import { PROVIDER_REGISTRY } from '../lib/messaging/provider-registry'
@@ -3346,6 +3351,18 @@ app.post('/transactions/:id', async (c) => {
       )
     }
 
+    // Gateway-owned payments (Chargily online checkout — providerRef set) can
+    // NEVER be approved/rejected here: an admin must not confirm a charge the
+    // gateway has not settled. Manual approve/reject stays for manual receipt
+    // payments only; online rows are reconciled through the gateway via
+    // POST /admin/transactions/:id/reconcile (verify / mark-settled / mark-failed).
+    if (transaction.providerRef) {
+      return c.json(
+        { error: 'This is an online (Chargily) payment — use the gateway reconciliation actions instead' },
+        400
+      )
+    }
+
     const newStatus = action === 'approve' ? 'APPROVED' : 'REJECTED'
 
     const updated = await db.transaction.update({
@@ -3484,10 +3501,269 @@ app.post('/transactions/:id', async (c) => {
       },
     })
 
+    // Approve/reject flips the agency subscription state that the public
+    // revenue tiles (/api/stats) and the agency directory display — drop
+    // their cached responses immediately (mirrors the reconcile endpoint).
+    invalidateResponseCacheTag('stats', 'agencies')
+
     return c.json({ success: true, transaction: updated })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status)
+  }
+})
+
+// ─── Online (Chargily) payment reconciliation ───────────────────────────────
+//
+// POST /admin/transactions/:id/reconcile — admin actions on gateway-owned
+// payments. The gateway owns the payment lifecycle: admins can NEVER
+// "approve" an unpaid charge. Only real gateway states may be reconciled:
+//
+//   verify        → query the LIVE Chargily checkout and apply its true
+//                   state through the idempotent fulfillment path (the same
+//                   code the webhook and the poll fallback run). Pure read +
+//                   settle — the honest default button.
+//   mark-settled  → confirm settlement. Refused (409) while the gateway still
+//                   reports 'pending' or reports 'failed'. When the gateway
+//                   answers 'paid' the normal fulfillment runs; when the
+//                   gateway is UNREACHABLE a documented manual override is
+//                   allowed (reconciledBy/At stamped, webhookVerified=false,
+//                   audit-logged with override:true) so a lost webhook + dead
+//                   gateway API can still be closed out after the admin
+//                   verified the payment in the Chargily dashboard.
+//   mark-failed   → mirror image for closing abandoned payments. Same rules.
+
+const reconcileTransactionSchema = z.object({
+  action: z.enum(['verify', 'mark-settled', 'mark-failed'], {
+    message: 'Action must be "verify", "mark-settled" or "mark-failed"',
+  }),
+  reason: z.string().max(500).optional(),
+})
+
+app.post('/transactions/:id/reconcile', async (c) => {
+  try {
+    const admin = await requireAdmin(c)
+
+    const id = c.req.param('id')
+    const body = await c.req.json().catch(() => ({}))
+    const validation = validateBody(reconcileTransactionSchema, body)
+    if (validation.error) {
+      return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
+    }
+    const { action, reason } = validation.data
+
+    const transaction = await db.transaction.findUnique({
+      where: { id },
+      include: {
+        agency: { select: { id: true, name: true, subscriptionStatus: true, subscriptionStartsAt: true, subscriptionExpiresAt: true } },
+      },
+    })
+    if (!transaction) return c.json({ success: false, error: 'Transaction not found' }, 404)
+
+    // Online payments only — manual receipt rows have no gateway reference.
+    if (!transaction.providerRef) {
+      return c.json({ success: false, error: 'This transaction is a manual payment — use approve/reject instead' }, 400)
+    }
+
+    // ── Live gateway check (shared by all three actions) ──
+    type LiveCheck =
+      | { ok: true; live: FulfillmentCheckout; normalized: 'pending' | 'paid' | 'failed' }
+      | { ok: false; error: string }
+
+    const liveCheck = async (): Promise<LiveCheck> => {
+      try {
+        const checkout = await getCheckoutStatus(transaction.providerRef as string)
+        return { ok: true, live: checkout as unknown as FulfillmentCheckout, normalized: normalizeChargilyStatus(checkout.status) }
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      }
+    }
+
+    const refetchTransaction = () =>
+      db.transaction.findUnique({
+        where: { id },
+        include: {
+          agency: { select: { id: true, name: true, customCode: true, subscriptionTier: true, subscriptionStatus: true } },
+        },
+      })
+
+    // Manual override settlement (gateway unreachable) — mirrors the
+    // webhook fulfillment's DB writes without touching lib code:
+    // subscription term stacking included, so an override never discards
+    // paid days of an active window.
+    const applyManualSettled = async () => {
+      await db.transaction.update({
+        where: { id: transaction.id },
+        data: {
+          status: 'COMPLETED',
+          amountPaid: transaction.amount,
+          webhookVerified: false,
+          reviewedAt: new Date(),
+          reconciledAt: new Date(),
+          reconciledBy: admin.id,
+          version: { increment: 1 },
+        },
+      })
+
+      if (transaction.type !== 'HARDWARE') {
+        const planRecord = await db.subscriptionPlan.findFirst({
+          where: { name: transaction.plan, isActive: true },
+        })
+        const periodMatch = transaction.planName?.match(/\((\d+)m\)$/)
+        const period = periodMatch ? parseInt(periodMatch[1], 10) : 1
+        const now = new Date()
+        let termExpiry: Date | null = null
+        if (period > 1) {
+          termExpiry = new Date(now)
+          termExpiry.setMonth(termExpiry.getMonth() + period)
+        } else {
+          switch (planRecord?.billingCycle) {
+            case 'YEARLY':
+              termExpiry = new Date(now); termExpiry.setDate(termExpiry.getDate() + 365); break
+            case 'ONE_TIME':
+              termExpiry = null; break
+            case 'MONTHLY':
+            default:
+              termExpiry = new Date(now); termExpiry.setDate(termExpiry.getDate() + 30); break
+          }
+        }
+        const stillActive = !!transaction.agency.subscriptionExpiresAt && transaction.agency.subscriptionExpiresAt.getTime() > now.getTime()
+        const base = stillActive ? (transaction.agency.subscriptionExpiresAt as Date) : now
+        let subscriptionExpiresAt = termExpiry
+        if (termExpiry && stillActive) {
+          const stacked = new Date(base)
+          stacked.setTime(stacked.getTime() + (termExpiry.getTime() - now.getTime()))
+          subscriptionExpiresAt = stacked
+        }
+        await db.agency.update({
+          where: { id: transaction.agencyId },
+          data: {
+            subscriptionStatus: 'ACTIVE',
+            subscriptionTier: transaction.plan,
+            subscriptionPlanId: planRecord?.id || undefined,
+            subscriptionStartsAt: stillActive ? (transaction.agency.subscriptionStartsAt ?? now) : now,
+            subscriptionExpiresAt,
+          },
+        })
+      } else if (transaction.hardwareOrderId) {
+        const hwOrder = await db.hardwareOrder.findUnique({ where: { id: transaction.hardwareOrderId } })
+        if (hwOrder && hwOrder.status === 'PENDING') {
+          await db.hardwareOrder.update({ where: { id: hwOrder.id }, data: { status: 'APPROVED', webhookVerified: false } })
+        }
+      }
+    }
+
+    const applyManualFailed = async () => {
+      await db.transaction.update({
+        where: { id: transaction.id },
+        data: {
+          status: 'FAILED',
+          webhookVerified: false,
+          rejectionReason: reason || 'Manually reconciled as failed by admin (gateway unreachable)',
+          reconciledAt: new Date(),
+          reconciledBy: admin.id,
+          version: { increment: 1 },
+        },
+      })
+      // Mirror fulfillCheckoutFailed: only demote agencies that the checkout
+      // creation flipped to PENDING — never downgrade an ACTIVE subscription.
+      if (transaction.agency.subscriptionStatus === 'PENDING') {
+        await db.agency.update({
+          where: { id: transaction.agencyId },
+          data: { subscriptionStatus: 'INACTIVE' },
+        })
+      }
+    }
+
+    const auditAndInvalidate = async (details: Record<string, unknown>) => {
+      await db.auditLog.create({
+        data: {
+          userId: admin.id,
+          action: 'PAYMENT_RECONCILE',
+          entityType: 'TRANSACTION',
+          entityId: id,
+          details: JSON.stringify({ action, providerRef: transaction.providerRef, ...details }),
+        },
+      })
+      // Public revenue tiles (/api/stats) and the agency directory carry
+      // settlement state — drop their cached responses immediately.
+      invalidateResponseCacheTag('stats', 'agencies')
+    }
+
+    if (action === 'verify') {
+      const check = await liveCheck()
+      if (!check.ok) {
+        return c.json({ success: false, error: 'Gateway unreachable', detail: check.error }, 502)
+      }
+      let applied: Awaited<ReturnType<typeof fulfillCheckoutPaid>> = { handled: false }
+      if (check.normalized === 'paid') {
+        applied = await fulfillCheckoutPaid(check.live, 'poll')
+      } else if (check.normalized === 'failed') {
+        applied = await fulfillCheckoutFailed(check.live, 'poll')
+      }
+      await auditAndInvalidate({ outcome: check.normalized, applied, source: 'verify' })
+      return c.json({
+        success: true,
+        live: {
+          checkoutId: check.live.id,
+          status: check.live.status,
+          normalized: check.normalized,
+          paymentMethod: (check.live as { payment_method?: string | null }).payment_method ?? null,
+        },
+        applied,
+        transaction: await refetchTransaction(),
+      })
+    }
+
+    if (action === 'mark-settled') {
+      const check = await liveCheck()
+      if (check.ok) {
+        // Gateway answered — only REAL states may be reconciled.
+        if (check.normalized === 'pending') {
+          return c.json({ success: false, error: 'Gateway still reports this checkout as pending — an unpaid charge cannot be settled', live: { status: check.live.status, normalized: check.normalized } }, 409)
+        }
+        if (check.normalized === 'failed') {
+          return c.json({ success: false, error: 'Gateway reports this checkout as failed — use mark-failed instead', live: { status: check.live.status, normalized: check.normalized } }, 409)
+        }
+        // paid → settle through the standard idempotent fulfillment.
+        const applied = await fulfillCheckoutPaid(check.live, 'poll')
+        await auditAndInvalidate({ outcome: 'paid', applied, source: 'mark-settled', gatewayConfirmed: true })
+        return c.json({ success: true, gatewayConfirmed: true, live: { status: check.live.status, normalized: check.normalized }, applied, transaction: await refetchTransaction() })
+      }
+      // Gateway unreachable — documented manual override (never for unpaid).
+      if (transaction.status !== 'PENDING') {
+        return c.json({ success: false, error: `Transaction already ${transaction.status.toLowerCase()}` }, 409)
+      }
+      await applyManualSettled()
+      await auditAndInvalidate({ outcome: 'completed', source: 'mark-settled', override: true, gatewayError: check.error, reason })
+      return c.json({ success: true, override: true, gatewayError: check.error, transaction: await refetchTransaction() })
+    }
+
+    // action === 'mark-failed'
+    const check = await liveCheck()
+    if (check.ok) {
+      if (check.normalized === 'pending') {
+        return c.json({ success: false, error: 'Gateway still reports this checkout as pending — a charge that may still complete cannot be failed. Verify again later.', live: { status: check.live.status, normalized: check.normalized } }, 409)
+      }
+      if (check.normalized === 'failed') {
+        const applied = await fulfillCheckoutFailed(check.live, 'poll')
+        await auditAndInvalidate({ outcome: 'failed', applied, source: 'mark-failed', gatewayConfirmed: true })
+        return c.json({ success: true, gatewayConfirmed: true, live: { status: check.live.status, normalized: check.normalized }, applied, transaction: await refetchTransaction() })
+      }
+      // Gateway says paid — refusing to fail a real payment.
+      return c.json({ success: false, error: 'Gateway reports this checkout as PAID — it cannot be marked failed', live: { status: check.live.status, normalized: check.normalized } }, 409)
+    }
+    if (transaction.status !== 'PENDING') {
+      return c.json({ success: false, error: `Transaction already ${transaction.status.toLowerCase()}` }, 409)
+    }
+    await applyManualFailed()
+    await auditAndInvalidate({ outcome: 'failed', source: 'mark-failed', override: true, gatewayError: check.error, reason })
+    return c.json({ success: true, override: true, gatewayError: check.error, transaction: await refetchTransaction() })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    // `as any` matches the file-wide authErrorResponse status typing (keeps the
+    // tsc baseline unchanged — bare err.status is a known TS2769 everywhere).
+    return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 

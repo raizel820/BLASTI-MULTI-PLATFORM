@@ -199,6 +199,14 @@ try {
   console.warn('[BLASTI Desktop] Could not resolve userData yet — will set when app is ready:', err.message);
 }
 
+// ─── Parent-Process Identity (Task 2-b, sub-task 5) ──────────────────────
+// Exported for the embedded local API: the module can verify its host is
+// alive and self-terminate if it is ever moved OUT of the Electron process
+// (a future child-process spawn layout). In the current in-process layout
+// the check is a no-op (the parent IS this process) — see the
+// BLASTI_LOCAL_API_CHILD watchdog in local-api/index.js.
+try { process.env.BLASTI_PARENT_PID = String(process.pid); } catch { /* ignore */ }
+
 // ─── Local FILE store dir (Round 15) ─────────────────────────────────────
 // Uploads (avatars, logos, receipts, documents, …) are stored LOCALLY FIRST
 // in an organized layout (<bucket>/<yyyy>/<mm>/…) under the Electron
@@ -426,6 +434,148 @@ process.on('unhandledRejection', (reason) => {
         ((reason && (reason.message || String(reason))) || 'unknown')
     );
   }
+});
+
+// Task 2-b (sub-task 5): SIGINT/SIGTERM must run the SAME embedded-service
+// teardown as a UI quit — a terminal Ctrl+C (dev) or a process-manager stop
+// used to leave the :3080 server + timers to the OS's mercy.
+for (const _sig of ['SIGINT', 'SIGTERM']) {
+  process.on(_sig, () => {
+    console.log('[BLASTI Desktop] Received ' + _sig + ' — shutting down embedded services');
+    shutdownEmbeddedServices('signal:' + _sig);
+    killBlastiChildProcessTree();
+    try { app.quit(); } catch { process.exit(0); }
+    // Hard backstop if Electron refuses to exit promptly.
+    setTimeout(() => process.exit(0), 3000).unref();
+  });
+}
+
+// ─── Session Purge (Task 2-b, sub-task 3) ─────────────────────────────────────
+// The durable session file (userData/blasti-auth.json) exists ONLY for
+// remember-me logins. The renderer reports the decision with
+// cloud-sync:set-auth { rememberMe }:
+//   rememberMe=true  → file persisted (historic behavior).
+//   rememberMe=false → file DELETED + _ephemeralSessionActive=true so the
+//                      before-quit purge deletes it again even if an older
+//                      remember-me login wrote it meanwhile. Closing and
+//                      re-opening the app then always requires a fresh login.
+let _ephemeralSessionActive = false;
+
+function authFilePath() {
+  try { return path.join(app.getPath('userData'), 'blasti-auth.json'); }
+  catch { return null; }
+}
+
+/** Delete the durable session file (best-effort — never throws). */
+function purgeDurableAuthFile(reason) {
+  try {
+    const p = authFilePath();
+    if (p && fs.existsSync(p)) {
+      fs.unlinkSync(p);
+      console.log('[BLASTI Desktop] Durable session file removed (' + reason + '):', p);
+    }
+  } catch (err) {
+    console.warn('[BLASTI Desktop] Could not remove the session file (' + reason + '):', err && err.message);
+  }
+}
+
+// ─── Embedded Services Shutdown (Task 2-b, sub-task 5) ────────────────────────
+// The local API (Hono on :3080), the realtime socket, the file-sync worker,
+// the LAN beacon and the sync engine all run INSIDE this Electron main
+// process — they die with the process ONLY if the process actually exits.
+// Historically the app stayed alive after the window closed (hide-to-tray +
+// the tray/LAN keep-alive in window-all-closed), so the local API kept
+// serving after the user "closed the app". shutdownEmbeddedServices() is the
+// ONE idempotent teardown called from EVERY exit path (before-quit, quit,
+// window-all-closed, SIGINT/SIGTERM, uncaught fatal) — double quits are
+// guarded by _embeddedShutdownDone.
+let _embeddedShutdownDone = false;
+
+function shutdownEmbeddedServices(reason) {
+  if (_embeddedShutdownDone) return;
+  _embeddedShutdownDone = true;
+  console.log('[BLASTI Desktop] Shutting down embedded services (' + (reason || 'quit') + ')');
+
+  // 1. Tell the renderer to purge non-persisted (non remember-me) session
+  //    state while it can still run JS. Best-effort: the window may already
+  //    be gone; the boot purge (auth-storage.enforcePersistencePolicyAtBoot)
+  //    and the file purge below are the backstops.
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('app:quitting', { reason: reason || 'quit' });
+    }
+  } catch { /* window gone */ }
+
+  // 2. Stop the cloud sync engine (timers, socket, watchdog).
+  try {
+    const syncService = require('./local-api/sync-service');
+    if (typeof syncService.stopSync === 'function') syncService.stopSync();
+  } catch (err) {
+    console.warn('[BLASTI Desktop] Sync engine stop failed (non-fatal):', err && err.message);
+  }
+
+  // 3. Stop the embedded local API: closes the realtime socket server, the
+  //    HTTP server (:3080), the file-sync worker and disconnects the DB.
+  try {
+    const localApi = require('./local-api/index');
+    if (typeof localApi.stopLocalApi === 'function') localApi.stopLocalApi();
+  } catch (err) {
+    console.warn('[BLASTI Desktop] Local API stop failed (non-fatal):', err && err.message);
+  }
+
+  // 4. LAN discovery beacon.
+  try { stopLanBeacon(); } catch { /* not started */ }
+
+  // 5. Purge non-persisted session material:
+  //    - an ephemeral (non remember-me) login must never leave the durable
+  //      auth file behind;
+  //    - a remember-me login keeps its file BY DESIGN (that is the feature).
+  if (_ephemeralSessionActive) {
+    purgeDurableAuthFile('ephemeral session purge on shutdown');
+  }
+
+  console.log('[BLASTI Desktop] Embedded services stopped');
+}
+
+// Windows: belt-and-braces tree-kill for the (in-process) local API. Today
+// the API shares this process, so the OS reaping this process kills it; if a
+// future build spawns the API as a CHILD process, _blastiChildPids lets the
+// same shutdown path taskkill the whole tree (/T) so nothing can outlive the
+// app holding :3080.
+const _blastiChildPids = [];
+function registerBlastiChildPid(pid) {
+  if (typeof pid === 'number' && pid > 0 && _blastiChildPids.indexOf(pid) === -1) {
+    _blastiChildPids.push(pid);
+  }
+}
+function killBlastiChildProcessTree() {
+  if (process.platform !== 'win32') {
+    for (const pid of _blastiChildPids) {
+      try { process.kill(-pid); } catch { /* not a group leader / already gone */ }
+    }
+    return;
+  }
+  for (const pid of _blastiChildPids) {
+    try {
+      // /T = tree (children too), /F = force. taskkill is always on PATH.
+      require('child_process').execSync('taskkill /PID ' + pid + ' /T /F', { stdio: 'ignore' });
+      console.log('[BLASTI Desktop] taskkill tree for child pid', pid);
+    } catch { /* already exited */ }
+    // Task 2-b-1: taskkill needs the process name/enumeration to work; a child
+    // spawned with { detached: true } became a PROCESS GROUP LEADER, and
+    // process.kill(-pid) signals the whole group directly. Best-effort: if the
+    // group is already gone (taskkill above succeeded) this throws and is
+    // ignored — both paths together cover normal AND detached children.
+    try { process.kill(-pid); } catch { /* not a group leader / already gone */ }
+  }
+}
+
+// Task 2-b-1: absolute last-resort teardown hook. 'exit' fires on EVERY way
+// the process can die (normal quit, process.exit, signal-after-teardown) —
+// including the hard-quit backstop below — so the child-tree kill runs even
+// on exit paths that bypass the Electron lifecycle events.
+process.on('exit', () => {
+  try { killBlastiChildProcessTree(); } catch { /* exit must never throw */ }
 });
 
 // ─── Process Keep-Alive ─────────────────────────────────────────────────────────
@@ -1006,19 +1156,18 @@ function createWindow() {
     shell.openExternal(url);
   });
 
-  // ── Window Close → Minimize to Tray ──────────────────────────────────────
-
+  // ── Window Close → QUIT the app (Task 2-b, sub-task 5) ──────────────────
+  // USER BUG FIXED: "desktop app keeps local api running even when the desktop
+  // app is closed." The previous behavior hid the window to the tray and kept
+  // the whole process — including the embedded local API on :3080, the sync
+  // engine and the LAN beacon — running invisibly. Closing the window now
+  // means closing the app: the full embedded-service shutdown runs and the
+  // process exits. The tray icon remains available WHILE the app is running
+  // (open / exit actions); closing the window is the documented exit gesture.
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
-      event.preventDefault();
-
-      // If tray exists, hide to tray; otherwise just hide the window
-      if (tray) {
-        mainWindow.hide();
-      } else {
-        // No tray — just minimize
-        mainWindow.minimize();
-      }
+      isQuitting = true;
+      app.quit();
     }
   });
 
@@ -1538,11 +1687,11 @@ ipcMain.on('window:maximize', () => {
   }
 });
 ipcMain.on('window:close', () => {
-  if (tray) {
-    mainWindow?.hide();
-  } else {
-    mainWindow?.close();
-  }
+  // Task 2-b (sub-task 5): the renderer's close affordance now performs a
+  // REAL quit — the embedded local API must die with the app (same policy as
+  // the titlebar X button in createWindow).
+  isQuitting = true;
+  app.quit();
 });
 ipcMain.handle('window:is-maximized', () => mainWindow?.isMaximized() ?? false);
 
@@ -2033,7 +2182,7 @@ async function _runInitialSyncFromSessionInner() {
   return result;
 }
 
-ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
+ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user, rememberMe }) => {
   try {
     const syncService = require('./local-api/sync-service');
     syncService.setAuth(token, user);
@@ -2078,13 +2227,27 @@ ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user }) => {
       console.warn('[IPC] Failed to launch initial sync:', initErr.message);
     }
 
-    // Persist auth to file so the loading screen can import agency data on next launch
+    // Persist auth to file so the loading screen can import agency data on next launch.
+    // Task 2-b (sub-task 3) — REMEMBER-ME ENFORCEMENT (main-process side):
+    //   rememberMe=true  → the durable file is written (session survives restarts).
+    //   rememberMe=false → NO durable copy; any PREVIOUS durable copy is deleted
+    //                      (a fresh non-remember login must not revive an older
+    //                      remembered session) and the before-quit purge deletes
+    //                      it again in case anything re-wrote it meanwhile.
+    // Callers that do not send rememberMe keep the historic durable behavior.
     try {
-      const authPath = path.join(app.getPath('userData'), 'blasti-auth.json');
-      fs.writeFileSync(authPath, JSON.stringify({ token, user }, null, 2));
-      console.log('[IPC] Cloud sync auth saved to', authPath);
+      const authPath = authFilePath();
+      const isRememberLogin = rememberMe === true;
+      _ephemeralSessionActive = !isRememberLogin;
+      if (isRememberLogin) {
+        fs.writeFileSync(authPath, JSON.stringify({ token, user }, null, 2));
+        console.log('[IPC] Cloud sync auth saved to', authPath, '(remember-me session)');
+      } else {
+        purgeDurableAuthFile('non remember-me login');
+        console.log('[IPC] Non remember-me login — session kept in memory only (no auth file will survive this run)');
+      }
     } catch (saveErr) {
-      console.warn('[IPC] Failed to save auth file:', saveErr.message);
+      console.warn('[IPC] Failed to apply auth file policy:', saveErr.message);
     }
 
     return { success: true };
@@ -2101,11 +2264,7 @@ ipcMain.handle('cloud-sync:clear-auth', async () => {
 
     // Remove persisted auth file
     try {
-      const authPath = path.join(app.getPath('userData'), 'blasti-auth.json');
-      if (fs.existsSync(authPath)) {
-        fs.unlinkSync(authPath);
-        console.log('[IPC] Auth file removed');
-      }
+      purgeDurableAuthFile('logout / clear-auth');
     } catch { /* ignore */ }
 
     // Clear local API session
@@ -2135,6 +2294,46 @@ ipcMain.handle('cloud-sync:trigger', async () => {
     await syncService.triggerSyncNow();
     return { success: true };
   } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// ─── Task 2-b (sub-task 4): FULL data sync on demand ──────────────────────────
+// Backs the post-login consent dialog ("Full data sync recommended — sync
+// now?"). Runs the engine's FULL reconciliation path:
+//   1. _runInitialSyncFromSession() — the staged workspace import; a no-op
+//      (fast return) when the workspace is already READY, otherwise it owns
+//      first-import recovery,
+//   2. syncService.fullSyncNow() — outbox replay (push) + pull from sequence 0
+//      (LWW) + record-level reconcile push.
+// "Not now" never calls this — the incremental 30s cycle keeps running.
+ipcMain.handle('sync:full-now', async () => {
+  try {
+    const startedAt = Date.now();
+    let initResult = null;
+    try {
+      initResult = await _runInitialSyncFromSession();
+    } catch (initErr) {
+      console.warn('[IPC] sync:full-now initial-sync stage failed (continuing):', initErr.message);
+    }
+    let fullResult = null;
+    try {
+      const syncService = require('./local-api/sync-service');
+      if (typeof syncService.fullSyncNow === 'function') {
+        fullResult = await syncService.fullSyncNow();
+      } else {
+        // Older sync-service without fullSyncNow — the incremental trigger is
+        // the best available approximation.
+        await syncService.triggerSyncNow();
+      }
+    } catch (fullErr) {
+      console.warn('[IPC] sync:full-now full pull failed:', fullErr.message);
+      return { success: false, error: fullErr.message, init: initResult || null };
+    }
+    console.log('[IPC] sync:full-now completed in ' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's');
+    return { success: true, init: initResult || null, full: fullResult || null };
+  } catch (err) {
+    console.error('[IPC] sync:full-now failed:', err.message);
     return { success: false, error: err.message };
   }
 });
@@ -2445,31 +2644,67 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  // On macOS, apps typically stay active until explicitly quit.
-  // On Windows/Linux, also keep alive if we have a tray icon or LAN server
-  // so the LAN server and discovery beacon continue running.
+  // Task 2-b (sub-task 5): the embedded local API must die WITH the app.
+  // On Windows/Linux a closed last window now always quits the process —
+  // the tray/LAN keep-alive that used to leave :3080 serving with no window
+  // is gone (the user-facing "local api still running after close" bug).
+  // On macOS the standard keep-active convention is preserved; the embedded
+  // services keep serving because the app is still genuinely open there.
+  shutdownEmbeddedServices('window-all-closed');
+  killBlastiChildProcessTree();
   if (process.platform !== 'darwin') {
-    if (tray || localServer) {
-      console.log('[BLASTI Desktop] Window closed — keeping app alive (tray/LAN server active)');
-      return;
-    }
     app.quit();
   }
 });
 
+// Task 2-b-1: HARD-QUIT BACKSTOP — the quit sequence must never stall with
+// the embedded local API (:3080) still serving. Electron CAN stall a quit:
+// a renderer's beforeunload handler blocking the window close, a wedged
+// keep-alive socket, or a lifecycle hook that never returns all leave the
+// process (and :3080) alive after the user closed the app — the exact
+// "local api still running after close" report. Arm a 5s timer on the FIRST
+// before-quit; if the process is somehow still alive when it fires,
+// app.exit(0) bypasses every remaining lifecycle event and tears the process
+// down immediately. Cleared on the 'quit' event (normal completion).
+let _hardQuitBackstop = null;
+
 app.on('before-quit', () => {
   isQuitting = true;
+  // Task 2-b (sub-task 5): idempotent teardown before Electron tears down
+  // windows — stops the sync engine, the local API (:3080), the realtime
+  // socket, the file-sync worker and the beacon, and purges non-persisted
+  // (non remember-me) session state. Safe on double-quit paths.
+  shutdownEmbeddedServices('before-quit');
+  killBlastiChildProcessTree();
+  if (!_hardQuitBackstop) {
+    _hardQuitBackstop = setTimeout(() => {
+      console.error('[BLASTI Desktop] Quit stalled for 5s — forcing exit so the local API cannot outlive the app');
+      try { app.exit(0); } catch { process.exit(0); }
+    }, 5000);
+  }
 });
 
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
 
 app.on('will-quit', () => {
-  // Clean up LAN discovery beacon (Task 2-b)
-  stopLanBeacon();
+  // Task 2-b (sub-task 5): last-chance teardown (covers quit paths that
+  // bypass before-quit, e.g. some auto-updater flows).
+  shutdownEmbeddedServices('will-quit');
+  killBlastiChildProcessTree();
 
   // Clean up any resources
   if (tray) {
     tray.destroy();
     tray = null;
   }
+});
+
+// Task 2-b (sub-task 5): the process is going away NOW — the embedded HTTP
+// server must not hold the event loop open a millisecond longer than needed.
+app.on('quit', (_event, exitCode) => {
+  console.log('[BLASTI Desktop] Quitting (exit code ' + exitCode + ') — embedded services already stopped');
+  shutdownEmbeddedServices('quit');
+  killBlastiChildProcessTree();
+  // Task 2-b-1: quit completed normally — disarm the hard-quit backstop.
+  if (_hardQuitBackstop) { clearTimeout(_hardQuitBackstop); _hardQuitBackstop = null; }
 });

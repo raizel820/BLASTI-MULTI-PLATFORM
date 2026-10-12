@@ -20,6 +20,16 @@
  *   Delete       → DELETE /file { storagePath } (disk unlink + FileAsset
  *                  tombstone server-side)
  *
+ * Task 2-c-2 — navigation + download upgrades:
+ *   - Per-file DOWNLOAD via the admin streaming endpoint
+ *     GET /api/admin/storage/download?path=... (Content-Disposition:
+ *     attachment) — works for every file, with or without a public URL.
+ *   - Sort dropdown (name/date/size/type, asc/desc) applied to the file
+ *     tables (month listing + legacy flat files).
+ *   - Name search on BOTH the flat-files listing and the month listing.
+ *   - Per-kind Lucide file icons, custom scrollbar on the list viewport,
+ *     ≥44px touch targets for row actions (mobile-first).
+ *
  * Conventions mirror admin-db-manager.tsx: same page padding (p-4 lg:p-6),
  * apiFetch + res.ok discipline, both unwrapped and {success, data} envelope
  * shapes accepted, sonner toasts, ConfirmDialog for deletes. Every fetched
@@ -29,6 +39,7 @@
 
 import { apiFetch } from '@/lib/api-fetch';
 import { buildCloudUrl } from '@/lib/api-client';
+import { downloadAdminStorageFile } from '@/lib/admin-download';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
@@ -38,13 +49,12 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import {
   HardDrive,
   RefreshCw,
@@ -54,6 +64,9 @@ import {
   Copy,
   ExternalLink,
   ArrowLeft,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   ChevronRight,
   Folder,
   FolderOpen,
@@ -61,6 +74,7 @@ import {
   Image,
   ReceiptText,
   FileText,
+  FileArchive,
   Package,
   PackageCheck,
   MonitorDown,
@@ -72,6 +86,14 @@ import {
   FileQuestion,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
 import { ConfirmDialog } from '@/components/shared/confirm-dialog';
@@ -209,6 +231,45 @@ function isPreviewable(name: string): boolean {
 }
 
 /**
+ * Task 2-c-2 — per-kind list icon (Lucide). Drives the file-type column in
+ * the storage tables: every row shows the kind of document it holds.
+ */
+const ICON_BY_KIND: Record<FileKind, LucideIcon> = {
+  image: Image,
+  pdf: FileText,
+  video: Video,
+  audio: Music,
+  text: FileText,
+  binary: FileArchive,
+};
+
+function fileKindIcon(name: string): LucideIcon {
+  return ICON_BY_KIND[fileKind(name)] ?? FileQuestion;
+}
+
+/** Sort fields for the file tables (Task 2-c-2 sort dropdown). */
+type SortField = 'date' | 'name' | 'size' | 'type';
+type SortDir = 'asc' | 'desc';
+
+/** Non-mutating client-side sort of normalized file rows. */
+function sortFileRows(files: StorageFileRow[], field: SortField, dir: SortDir): StorageFileRow[] {
+  const mul = dir === 'asc' ? 1 : -1;
+  return [...files].sort((a, b) => {
+    switch (field) {
+      case 'name':
+        return a.name.localeCompare(b.name) * mul;
+      case 'size':
+        return (a.size - b.size) * mul;
+      case 'type':
+        return (fileKind(a.name).localeCompare(fileKind(b.name)) || a.name.localeCompare(b.name)) * mul;
+      case 'date':
+      default:
+        return (a.mtimeMs - b.mtimeMs) * mul;
+    }
+  });
+}
+
+/**
  * Browser-reachable URL for a stored file. The API returns RELATIVE
  * /api/upload/file/... paths — behind the single-port sandbox gateway those
  * only resolve when XTransformPort=3003 is appended, while on loopback/LAN
@@ -217,6 +278,16 @@ function isPreviewable(name: string): boolean {
 function fileBrowserUrl(url: string): string {
   return url.startsWith('/') ? buildCloudUrl(url) : url;
 }
+
+/**
+ * Task 2-c-2 — ADMIN download endpoint (apps/api/src/routes/admin-storage.ts
+ * GET /download). Streams the file with Content-Disposition: attachment —
+ * unlike the public capability URL (inline preview) it forces a real
+ * download and works for EVERY managed file, with or without a public URL.
+ * The actual fetch runs BINARY-SAFE through lib/admin-download.ts (native
+ * fetch + real Blob + per-shell auth) — apiFetch() would text-decode the
+ * stream and corrupt binary files.
+ */
 
 /** Locale-aware medium date + short time. */
 function formatModified(ms: number, lang: Language): string {
@@ -371,6 +442,8 @@ interface StoragePreviewDialogProps {
   t: (key: TranslationKeys, params?: Record<string, string>) => string;
   lang: Language;
   onCopy: (text: string) => void;
+  onDownload: (file: StorageFileRow) => void;
+  downloading: boolean;
 }
 
 /** Text previews are capped — a multi-MB log must never freeze the tab. */
@@ -385,7 +458,7 @@ function PreviewFallback({ icon: Icon, text }: { icon: LucideIcon; text: string 
   );
 }
 
-function StoragePreviewDialog({ file, open, onOpenChange, t, lang, onCopy }: StoragePreviewDialogProps) {
+function StoragePreviewDialog({ file, open, onOpenChange, t, lang, onCopy, onDownload, downloading }: StoragePreviewDialogProps) {
   const src = file?.url ? fileBrowserUrl(file.url) : null;
   const kind = file ? fileKind(file.name) : 'binary';
 
@@ -530,16 +603,21 @@ function StoragePreviewDialog({ file, open, onOpenChange, t, lang, onCopy }: Sto
               <Copy className="h-3.5 w-3.5 me-1" />
               {t('storageCopyPath')}
             </Button>
-            {src && (
-              <a
-                href={src}
-                download={file.name}
-                className="inline-flex items-center justify-center gap-1.5 h-8 px-3 rounded-md border border-input bg-background text-sm font-medium hover:bg-muted transition-colors"
-              >
-                <Download className="h-3.5 w-3.5" />
-                {t('storageDownload')}
-              </a>
-            )}
+            {/* Task 2-c-2 — download via the ADMIN streaming endpoint
+                (attachment; works for every file, no public URL needed). */}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={downloading}
+              onClick={() => onDownload(file)}
+            >
+              {downloading ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin me-1" />
+              ) : (
+                <Download className="h-3.5 w-3.5 me-1" />
+              )}
+              {t('storageDownload')}
+            </Button>
             {src && (
               <a
                 href={src}
@@ -567,14 +645,16 @@ interface FilesTableProps {
   onCopy: (path: string) => void;
   onAskDelete: (file: StorageFileRow) => void;
   onPreview: (file: StorageFileRow) => void;
+  onDownload: (file: StorageFileRow) => void;
+  downloadingPath: string | null;
 }
 
-function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: FilesTableProps) {
+function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview, onDownload, downloadingPath }: FilesTableProps) {
   return (
     <div className="rounded-xl border overflow-hidden">
-      {/* Long lists scroll inside a bounded viewport (custom-scrollbar free —
-          mirrors admin-db-manager's plain overflow-auto container). */}
-      <div className="max-h-[480px] overflow-y-auto">
+      {/* Long lists scroll inside a bounded viewport — custom scrollbar
+          styling per the 2-c-2 navigation upgrades. */}
+      <div className="max-h-[480px] overflow-y-auto custom-scrollbar">
         <Table>
           <TableHeader className="sticky top-0 z-10 bg-background">
             <TableRow>
@@ -598,6 +678,8 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                 const thumb = f.name.toLowerCase().match(/\.(png|jpe?g|webp|gif|svg|bmp|avif|ico)$/)
                   ? (f.url ? fileBrowserUrl(f.url) : null)
                   : null;
+                const KindIcon = fileKindIcon(f.name);
+                const downloading = downloadingPath === f.storagePath;
                 return (
                 <TableRow key={f.storagePath || idx}>
                   <TableCell className="max-w-[280px]">
@@ -605,7 +687,7 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                       type="button"
                       onClick={() => { if (previewable) onPreview(f); }}
                       disabled={!previewable}
-                      className={`flex items-center gap-2.5 min-w-0 max-w-full text-start ${previewable ? 'group cursor-pointer' : 'cursor-default'}`}
+                      className={`flex items-center gap-2.5 min-w-[44px] min-h-[44px] sm:min-h-0 py-1 max-w-full text-start ${previewable ? 'group cursor-pointer' : 'cursor-default'}`}
                       title={previewable ? t('storagePreview') : undefined}
                     >
                       {thumb ? (
@@ -616,8 +698,8 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                           className="h-9 w-9 rounded-md border object-cover shrink-0 bg-muted/40 group-hover:border-emerald-400 dark:group-hover:border-emerald-600 transition-colors"
                         />
                       ) : (
-                        <span className="h-9 w-9 rounded-md border bg-muted/40 flex items-center justify-center shrink-0">
-                          <FileText className="h-4 w-4 text-muted-foreground/70" />
+                        <span className="h-9 w-9 rounded-md border bg-muted/40 flex items-center justify-center shrink-0" aria-hidden="true">
+                          <KindIcon className="h-4 w-4 text-muted-foreground/70" />
                         </span>
                       )}
                       <span className={`font-mono text-[12px] truncate ${previewable ? 'group-hover:underline decoration-dotted underline-offset-2' : ''}`} title={f.name}>
@@ -646,7 +728,7 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                         <Button
                           variant="ghost"
                           size="sm"
-                          className="h-7 w-7 p-0"
+                          className="h-11 w-11 sm:h-7 sm:w-7 p-0"
                           title={t('storagePreview')}
                           aria-label={t('storagePreview')}
                           onClick={() => onPreview(f)}
@@ -657,12 +739,30 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                       <Button
                         variant="ghost"
                         size="sm"
-                        className="h-7 w-7 p-0"
+                        className="h-11 w-11 sm:h-7 sm:w-7 p-0"
                         title={t('storageCopyPath')}
                         aria-label={t('storageCopyPath')}
                         onClick={() => onCopy(f.storagePath)}
                       >
                         <Copy className="h-3.5 w-3.5" />
+                      </Button>
+                      {/* Task 2-c-2 — per-file download through the ADMIN
+                          streaming endpoint (attachment). No public URL
+                          needed — works for every managed file. */}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-11 w-11 sm:h-7 sm:w-7 p-0"
+                        title={t('storageDownload')}
+                        aria-label={t('storageDownload')}
+                        disabled={downloadingPath !== null}
+                        onClick={() => onDownload(f)}
+                      >
+                        {downloading ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Download className="h-3.5 w-3.5" />
+                        )}
                       </Button>
                       {f.url && (
                         <a
@@ -671,7 +771,7 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                           rel="noopener noreferrer"
                           title={t('storageOpenFile')}
                           aria-label={t('storageOpenFile')}
-                          className="inline-flex items-center justify-center h-7 w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                          className="inline-flex items-center justify-center h-11 w-11 sm:h-7 sm:w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
                         >
                           <ExternalLink className="h-3.5 w-3.5" />
                         </a>
@@ -679,7 +779,7 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                       <Button
                         variant="ghost"
                         size="sm"
-                        className="h-7 w-7 p-0 text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20"
+                        className="h-11 w-11 sm:h-7 sm:w-7 p-0 text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20"
                         title={t('storageDelete')}
                         aria-label={t('storageDelete')}
                         onClick={() => onAskDelete(f)}
@@ -719,8 +819,14 @@ export function AdminStorageManager() {
   // fetched levels stay in component state. Invalidated per-bucket on delete.
   const [cache, setCache] = useState<Record<string, BrowseData>>({});
 
-  // Level-3 client-side name filter
+  // Level-3 client-side name filter (Task 2-c-2: also applied to the
+  // legacy flat-files listing at level 1).
   const [fileSearch, setFileSearch] = useState('');
+
+  // Task 2-c-2 — sort controls (name/date/size/type × asc/desc) + download
+  const [sortField, setSortField] = useState<SortField>('date');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const [downloadingPath, setDownloadingPath] = useState<string | null>(null);
 
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<StorageFileRow | null>(null);
@@ -930,6 +1036,28 @@ export function AdminStorageManager() {
     }
   };
 
+  // ── Download (Task 2-c-2) — admin streaming endpoint, BINARY-SAFE ──
+  // Routes through lib/admin-download.ts: native fetch + real Blob. The
+  // previous apiFetch() path text-decoded the stream and rebuilt a
+  // 'text/plain' blob from JSON.stringify — every binary file saved corrupt.
+
+  const downloadFile = useCallback(async (file: StorageFileRow) => {
+    if (downloadingPath) return; // one download at a time — clear spinner
+    setDownloadingPath(file.storagePath);
+    try {
+      const result = await downloadAdminStorageFile(file.storagePath, file.name);
+      if (!result.ok) {
+        toast.error(result.error || t('storageDownloadFailed'));
+        return;
+      }
+      toast.success(t('storageDownloadStarted'));
+    } catch {
+      toast.error(t('storageDownloadFailed'));
+    } finally {
+      setDownloadingPath(null);
+    }
+  }, [downloadingPath, t]);
+
   // ── Derived ──
 
   const disk = overview?.disk ?? null;
@@ -939,9 +1067,17 @@ export function AdminStorageManager() {
   const filteredFiles = useMemo(() => {
     if (!browse || browse.level !== 3) return [];
     const q = fileSearch.trim().toLowerCase();
-    if (!q) return browse.files;
-    return browse.files.filter((f) => f.name.toLowerCase().includes(q));
-  }, [browse, fileSearch]);
+    const base = q ? browse.files.filter((f) => f.name.toLowerCase().includes(q)) : browse.files;
+    return sortFileRows(base, sortField, sortDir);
+  }, [browse, fileSearch, sortField, sortDir]);
+
+  // Level-1 legacy flat files — same search + sort treatment.
+  const levelOneFlatFiles = browse && browse.level === 1 ? browse.flatFiles : [];
+  const filteredFlatFiles = useMemo(() => {
+    const q = fileSearch.trim().toLowerCase();
+    const base = q ? levelOneFlatFiles.filter((f) => f.name.toLowerCase().includes(q)) : levelOneFlatFiles;
+    return sortFileRows(base, sortField, sortDir);
+  }, [levelOneFlatFiles, fileSearch, sortField, sortDir]);
 
   // Full-literal Tailwind classes (JIT-safe) for the usage bar severity.
   const usageBarClass =
@@ -953,6 +1089,55 @@ export function AdminStorageManager() {
 
   const chevronCls = `h-3.5 w-3.5 text-muted-foreground shrink-0 ${rtl ? 'rotate-180' : ''}`;
 
+  // Task 2-c-2 — sort dropdown (field) + direction toggle, shared by the
+  // flat-files listing and the month listing.
+  const renderSortControls = () => (
+    <div className="flex items-center gap-2">
+      <Select value={sortField} onValueChange={(v) => setSortField(v as SortField)}>
+        <SelectTrigger
+          className="h-11 sm:h-9 w-[140px] rounded-xl text-[13px]"
+          aria-label={t('storageSortBy')}
+        >
+          <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" aria-hidden="true" />
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="date" className="min-h-[44px]">{t('storageSortDate')}</SelectItem>
+          <SelectItem value="name" className="min-h-[44px]">{t('storageSortName')}</SelectItem>
+          <SelectItem value="size" className="min-h-[44px]">{t('storageSortSize')}</SelectItem>
+          <SelectItem value="type" className="min-h-[44px]">{t('storageSortType')}</SelectItem>
+        </SelectContent>
+      </Select>
+      <Button
+        type="button"
+        variant="outline"
+        className="h-11 sm:h-9 w-11 sm:w-9 p-0 rounded-xl shrink-0"
+        title={sortDir === 'asc' ? t('storageSortAsc') : t('storageSortDesc')}
+        aria-label={sortDir === 'asc' ? t('storageSortAsc') : t('storageSortDesc')}
+        onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
+      >
+        {sortDir === 'asc' ? <ArrowUp className="h-4 w-4" /> : <ArrowDown className="h-4 w-4" />}
+      </Button>
+    </div>
+  );
+
+  // Task 2-c-2 — search + sort row shared by both file listings.
+  const renderSearchSortRow = () => (
+    <div className="flex items-center gap-2 flex-wrap">
+      <div className="relative flex-1 min-w-[180px] max-w-md">
+        <Search className="absolute start-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+        <Input
+          value={fileSearch}
+          onChange={(e) => setFileSearch(e.target.value)}
+          placeholder={t('search')}
+          className="ps-8 h-11 sm:h-9"
+          aria-label={t('search')}
+        />
+      </div>
+      {renderSortControls()}
+    </div>
+  );
+
   // ─── Render ───
 
   const renderBreadcrumb = () => (
@@ -960,7 +1145,7 @@ export function AdminStorageManager() {
       <button
         type="button"
         onClick={() => backTo({ bucket: null, yyyy: null, mm: null })}
-        className="text-muted-foreground hover:text-foreground transition-colors truncate"
+        className="inline-flex items-center min-h-[44px] px-1 text-muted-foreground hover:text-foreground transition-colors truncate"
       >
         {t('storageAllCategories')}
       </button>
@@ -971,7 +1156,7 @@ export function AdminStorageManager() {
             <button
               type="button"
               onClick={() => backTo({ bucket: nav.bucket, yyyy: null, mm: null })}
-              className="text-muted-foreground hover:text-foreground transition-colors truncate"
+              className="inline-flex items-center min-h-[44px] px-1 text-muted-foreground hover:text-foreground transition-colors truncate"
             >
               {t(bucketLabelKey(nav.bucket))}
             </button>
@@ -989,7 +1174,7 @@ export function AdminStorageManager() {
             <button
               type="button"
               onClick={() => backTo({ bucket: nav.bucket, yyyy: nav.yyyy, mm: null })}
-              className="font-mono text-muted-foreground hover:text-foreground transition-colors"
+              className="inline-flex items-center min-h-[44px] px-1 font-mono text-muted-foreground hover:text-foreground transition-colors"
             >
               {nav.yyyy}
             </button>
@@ -1163,13 +1348,17 @@ export function AdminStorageManager() {
                     {t('storageFlatFiles')}
                     <Badge variant="secondary" className="text-[10px]">{browse.flatFiles.length}</Badge>
                   </p>
+                  {/* Task 2-c-2 — search + sort for the legacy flat files too */}
+                  {renderSearchSortRow()}
                   <StorageFilesTable
-                    files={browse.flatFiles}
+                    files={filteredFlatFiles}
                     t={t}
                     lang={lang}
                     onCopy={copyText}
                     onAskDelete={setDeleteTarget}
                     onPreview={setPreviewTarget}
+                    onDownload={downloadFile}
+                    downloadingPath={downloadingPath}
                   />
                 </div>
               )}
@@ -1217,15 +1406,8 @@ export function AdminStorageManager() {
     // Level 3 — bucket/yyyy/mm: searchable files table.
     return (
       <div className="space-y-3">
-        <div className="relative max-w-md">
-          <Search className="absolute start-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-          <Input
-            value={fileSearch}
-            onChange={(e) => setFileSearch(e.target.value)}
-            placeholder={t('search')}
-            className="ps-8"
-          />
-        </div>
+        {/* Task 2-c-2 — search + sort (field × direction) controls */}
+        {renderSearchSortRow()}
         <StorageFilesTable
           files={filteredFiles}
           t={t}
@@ -1233,6 +1415,8 @@ export function AdminStorageManager() {
           onCopy={copyText}
           onAskDelete={setDeleteTarget}
           onPreview={setPreviewTarget}
+          onDownload={downloadFile}
+          downloadingPath={downloadingPath}
         />
       </div>
     );
@@ -1459,6 +1643,8 @@ export function AdminStorageManager() {
         t={t}
         lang={lang}
         onCopy={copyText}
+        onDownload={downloadFile}
+        downloading={!!previewTarget && downloadingPath === previewTarget.storagePath}
       />
     </div>
   );

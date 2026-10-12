@@ -3799,6 +3799,75 @@ const en: Record<TranslationKeys, string> = {
   settingsSystemConfigDesc: "Dynamic database-backed system settings (including encrypted keys)",
   settingsBackToOverview: "Back to overview",
 
+  // ─── Task 2-c: admin transactions — online (Chargily) payments ──────────
+  txTypeAll: "All types",
+  txTypeManual: "Manual",
+  txTypeOnline: "Online (Chargily)",
+  txBadgeManual: "Manual",
+  txBadgeOnline: "Online",
+  txGatewayRef: "Gateway ref",
+  txPayer: "Payer",
+  txSubscriptionPayment: "Subscription",
+  txHardwarePayment: "Hardware",
+  txVerifyWithGateway: "Verify with gateway",
+  txVerifying: "Verifying with gateway...",
+  txMarkSettled: "Confirm settled",
+  txMarkFailed: "Mark failed",
+  txGatewayOwned: "Managed by the online gateway — approve/reject is disabled here",
+  txVerifyPending: "Gateway: pending",
+  txVerifyPaid: "Gateway confirmed payment — settlement applied",
+  txVerifyFailed: "Gateway: failed — state updated",
+  txGatewayUnreachable: "Payment gateway unreachable",
+  txOverrideApplied: "Manual override applied (gateway unreachable)",
+  txRefusedPending: "Gateway still reports pending — action refused",
+  txReconciled: "Reconciled",
+
+  // ─── Task 2-c: manual full sync (agency + customer settings) ────────────
+  fullSyncTitle: "Full data sync",
+  fullSyncDesc: "Removes all locally cached data (except your login session), then re-downloads everything from the server.",
+  fullSyncButton: "Request full sync",
+  fullSyncConfirmTitle: "Full resync?",
+  fullSyncConfirmBody: "This wipes the local database and caches (offline ticket history, images, temporary files), then re-downloads all data from the server. The app restarts automatically.",
+  fullSyncKeepSession: "Your login session is preserved.",
+  fullSyncConfirm: "Wipe & resync",
+  fullSyncSyncing: "Downloading everything again...",
+
+  // ─── Task 2-b-2: desktop post-login full-sync consent dialog ────────────
+  desktopSyncConsentTitle: "Full data sync",
+  desktopSyncConsentBody: "A full sync of your agency data (queues, reservations, settings) is recommended right now. Incremental sync also keeps running in the background.",
+  desktopSyncConsentNow: "Sync now",
+  desktopSyncConsentNotNow: "Not now",
+  desktopSyncConsentStarted: "Full sync started — it continues in the background",
+
+  // ─── Task 2-c: storage manager navigation ───────────────────────────────
+  storageFlatView: "All files",
+  storageTreeView: "Folders",
+  storageFolderCol: "Folder",
+  storageSortBy: "Sort",
+  storageSortName: "Name",
+  storageSortDate: "Date",
+  storageSortSize: "Size",
+  storageSortType: "Type",
+  storageSortAsc: "Ascending",
+  storageSortDesc: "Descending",
+  storageDownloadStarted: "Download started",
+  storageDownloadFailed: "Download failed",
+
+  // ─── Task 2-c: installer version tracker (live multi-version listing) ───
+  installerFilesTitle: "Installer files on disk",
+  installerFilesDesc: "Every pushed build is read LIVE from storage — same-name rebuilds each appear as their own entry with their push time.",
+  installerPushedAt: "Pushed",
+  installerActiveFile: "Active",
+  installerDraftFile: "Draft",
+  installerUnmatched: "Not activated",
+  installerActivateFile: "Activate this file",
+  installerActivateConfirmTitle: "Activate this exact file?",
+  installerActivateConfirmBody: "The public download for {platform} will point to this exact build (pushed {time}). Any other build of the same platform is unpublished.",
+  installerNoFiles: "No installer files on the server yet",
+  installerGroupFlat: "Legacy (root)",
+  installerActivating: "Activating...",
+  installerUnknownPlatform: "Unknown platform",
+
 };
 
 export default en;

@@ -23,8 +23,16 @@
  *                                   no mm given, files when yyyy+mm given)
  *   GET    /file?path=...         → single file detail (disk stat + FileAsset
  *                                   DB record + public URL)
+ *   GET    /download?path=...     → per-file ADMIN download (Task 2-c-2):
+ *                                   streamed attachment (createReadStream,
+ *                                   Content-Length from stat, Accept-Ranges +
+ *                                   single-range 206, 416 on bad range, weak
+ *                                   ETag + 304, Content-Disposition:
+ *                                   attachment with RFC 5987 filename*)
+ *   GET    /flat?bucket=...       → recursive flat listing of one bucket
  *   DELETE /file                  → delete a file by storagePath (disk unlink +
- *                                   FileAsset tombstone, mirrors upload.ts)
+ *                                   FileAsset tombstone, mirrors upload.ts;
+ *                                   invalidates the 'app-versions' cache tag)
  *
  * SAFETY MODEL
  *   - Every route requires SUPER_ADMIN (requireAdmin) + authErrorResponse.
@@ -41,8 +49,10 @@
 import { Hono } from 'hono'
 import fs from 'fs'
 import path from 'path'
+import { Readable } from 'stream'
 import { db } from '@blasti/db'
 import { requireAdmin, authErrorResponse } from '../lib/auth'
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 import {
   STORAGE_ROOT,
   SAFE_TYPE_RE,
@@ -562,6 +572,175 @@ app.get('/file', async (c) => {
   }
 })
 
+// ─── GET /download?path=... — stream a file as an attachment (SUPER_ADMIN) ──
+//
+// Manager counterpart of the public /api/upload/file/* capability URLs: the
+// public route serves Content-Disposition: INLINE (previews must open in the
+// browser), while admins explicitly asked for a forced DOWNLOAD per file.
+// Streaming pattern mirrors app-versions.ts /:id/download:
+//   • fs.createReadStream → Web ReadableStream (constant ~64KB chunks — a
+//     155 MB installer never buffers in RAM),
+//   • Content-Length from stat, Accept-Ranges + single-range 206 (resumable),
+//   • weak ETag (size+mtime) + 304 support,
+//   • Content-Disposition: attachment; RFC 5987 filename* for unicode names.
+// Auth: requireAdmin (same as every other /api/admin/storage route). Browsers
+// follow plain <a href> links with the session cookie; native shells download
+// via fetch + Bearer (both are accepted by requireAdmin).
+
+const DL_MIME_BY_EXT: Record<string, string> = {
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+  webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif',
+  pdf: 'application/pdf',
+  mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', mkv: 'video/x-matroska',
+  mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', m4a: 'audio/mp4', flac: 'audio/flac',
+  txt: 'text/plain', json: 'application/json', csv: 'text/csv', xml: 'application/xml',
+  html: 'text/html', md: 'text/markdown', log: 'text/plain',
+  zip: 'application/zip', apk: 'application/vnd.android.package-archive',
+  exe: 'application/vnd.microsoft.portable-executable',
+  dmg: 'application/x-apple-diskimage', appimage: 'application/x-executable',
+  deb: 'application/vnd.debian.binary-package', rpm: 'application/x-rpm',
+}
+
+function downloadMime(name: string): string {
+  const ext = (name.split('.').pop() || '').toLowerCase()
+  return DL_MIME_BY_EXT[ext] || 'application/octet-stream'
+}
+
+/** RFC 6266/5987 header pair — ASCII fallback + UTF-8 encoded form. */
+function contentDispositionFor(name: string): string {
+  const ascii = name.replace(/[^\x20-\x7E]/g, '_').replace(/["\\]/g, '_')
+  const utf8 = encodeURIComponent(name)
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`
+}
+
+app.get('/download', async (c) => {
+  try {
+    await requireAdmin(c)
+    const storagePath = c.req.query('path') || ''
+    const abs = resolveManagerPath(storagePath)
+    if (!abs) return c.json({ success: false, error: 'Invalid storage path' }, 400)
+
+    let fileStat: fs.Stats
+    try {
+      fileStat = fs.statSync(abs)
+      if (!fileStat.isFile()) throw new Error('not a file')
+    } catch {
+      return c.json({ success: false, error: 'File not found on disk' }, 404)
+    }
+
+    const fileName = abs.split(path.sep).pop() || 'file'
+    const fileSize = fileStat.size
+    const etag = `W/"${fileSize.toString(16)}-${Math.floor(fileStat.mtimeMs).toString(16)}"`
+    const baseHeaders: Record<string, string> = {
+      'Content-Type': downloadMime(fileName),
+      'Content-Disposition': contentDispositionFor(fileName),
+      'Accept-Ranges': 'bytes',
+      ETag: etag,
+      // Short client cache — the manager may re-download after changes.
+      'Cache-Control': 'private, max-age=60',
+      'X-Content-Type-Options': 'nosniff',
+    }
+
+    // Conditional request on the full file → 304 (no body, no disk read).
+    const ifNoneMatch = c.req.header('if-none-match')
+    if (ifNoneMatch && !c.req.header('range')) {
+      const matches = ifNoneMatch.split(',').map((t) => t.trim())
+      if (matches.includes(etag) || matches.includes(etag.replace(/^W\//, '')) || ifNoneMatch.trim() === '*') {
+        return new Response(null, {
+          status: 304,
+          headers: { ETag: etag, 'Cache-Control': baseHeaders['Cache-Control']!, 'Accept-Ranges': 'bytes' },
+        })
+      }
+    }
+
+    // Single-range support (resumable downloads / preview players).
+    const rangeHeader = c.req.header('range')
+    let start = 0
+    let end = fileSize - 1
+    let status = 200
+    if (rangeHeader) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim())
+      if (m && (m[1] !== '' || m[2] !== '')) {
+        if (m[1] === '') {
+          const suffix = Math.min(parseInt(m[2], 10), fileSize)
+          start = Math.max(0, fileSize - suffix)
+          end = fileSize - 1
+        } else {
+          start = parseInt(m[1], 10)
+          end = m[2] === '' ? fileSize - 1 : Math.min(parseInt(m[2], 10), fileSize - 1)
+        }
+        if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= fileSize) {
+          return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${fileSize}` } })
+        }
+        status = 206
+      }
+    }
+
+    const contentLength = end - start + 1
+    const headers: Record<string, string> = { ...baseHeaders, 'Content-Length': String(contentLength) }
+    if (status === 206) {
+      headers['Content-Range'] = `bytes ${start}-${end}/${fileSize}`
+    }
+
+    const nodeStream = fs.createReadStream(abs, { start, end })
+    nodeStream.on('error', (err) => {
+      console.error('[admin-storage] download stream error:', err.message)
+      nodeStream.destroy()
+    })
+    const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>
+    return new Response(webStream, { status, headers })
+  } catch (e) {
+    const err = authErrorResponse(e)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
+// ─── GET /flat?bucket=... — recursive flat listing of one bucket ────────────
+//
+// Navigation upgrade for the manager UI: alongside the 3-level drill-down
+// (bucket → year → month) there is now a FLAT view — every file of the bucket
+// in ONE scrollable, sortable, searchable table (a folder column shows where
+// each file lives). Reuses walkStorage()'s single recursive pass + the
+// FileAsset tracked map. Sorted by mtime desc server-side; the client
+// re-sorts/searches freely.
+
+app.get('/flat', async (c) => {
+  try {
+    await requireAdmin(c)
+    const bucket = c.req.query('bucket') || ''
+    if (!SAFE_TYPE_RE.test(bucket) && !SYSTEM_DIRS.has(bucket)) {
+      return c.json({ success: false, error: 'Invalid bucket' }, 400)
+    }
+    const bucketDir = path.join(STORAGE_ROOT, bucket)
+    if (!insideRoot(bucketDir)) return c.json({ success: false, error: 'Invalid bucket' }, 400)
+    try {
+      const st = await fs.promises.stat(bucketDir)
+      if (!st.isDirectory()) return c.json({ success: false, error: 'Bucket not found' }, 404)
+    } catch {
+      return c.json({ success: false, error: 'Bucket not found' }, 404)
+    }
+
+    const [walk, tracked] = await Promise.all([walkStorage(), loadTrackedMap()])
+    const files = walk.files
+      .filter((f) => f.bucket === bucket)
+      .map((f) => ({
+        name: f.name,
+        storagePath: f.rel,
+        folder: f.mm && f.yyyy ? `${f.yyyy}/${f.mm}` : f.yyyy ? f.yyyy : '',
+        size: f.size,
+        mtimeMs: f.mtimeMs,
+        url: publicFilePathForStoragePath(f.rel),
+        tracked: tracked.has(f.rel),
+      }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+
+    return c.json({ bucket, files, walkErrors: walk.errors })
+  } catch (e) {
+    const err = authErrorResponse(e)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
 // ─── DELETE /file { storagePath } ───────────────────────────────────────────
 
 app.delete('/file', async (c) => {
@@ -595,6 +774,14 @@ app.delete('/file', async (c) => {
       const res = await db.fileAsset.updateMany({ where: { storagePath, deletedAt: null }, data: { deletedAt: new Date() } })
       dbUpdated = res.count
     } catch { /* row may not exist */ }
+    // Task 2-c-2 — cache-tag invalidation after the mutation: deleting an
+    // app-versions installer changes what the CACHED public listing
+    // /api/app-versions/public/active (60s TTL, tag 'app-versions') reports
+    // (file size/availability), so drop those entries immediately.
+    const deletedBucket = storagePath.split('/')[0] || ''
+    if ((unlinked || dbUpdated > 0) && deletedBucket === 'app-versions') {
+      invalidateResponseCacheTag('app-versions')
+    }
     return c.json({ success: true, existed, unlinked, dbTombstoned: dbUpdated })
   } catch (e) {
     const err = authErrorResponse(e)

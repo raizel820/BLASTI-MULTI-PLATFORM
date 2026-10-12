@@ -1,0 +1,479 @@
+name: Push Installers (no rebuild)
+
+# Re-publishes ALREADY-BUILT installers to the BLASTI VPS without rebuilding
+# anything. Complements "Build Installers" (build-installers.yml):
+#
+#   Build Installers      → builds + uploads artifacts + pushes to the VPS
+#   Push Installers       → picks a previous successful Build Installers run,
+#                           downloads its artifacts AS-IS, re-uploads them to
+#                           the VPS, and re-triggers the VPS refresh.
+#
+# Typical use: the VPS was rebuilt/restored, an admin deleted a version in
+# Public Apps Settings, or an upload silently failed — re-push the same
+# binaries in ~2 minutes instead of a ~35-minute full rebuild.
+#
+# HOW IT WORKS
+#   1. Resolve the source run: the latest SUCCESSFUL run of build-installers.yml,
+#      or the exact run given in the optional `build_run_id` input.
+#   2. Download that run's artifacts with actions/download-artifact@v4
+#      (`run-id` + `github-token` = cross-run download within the same repo).
+#      Only the artifacts matching the selected platforms are downloaded.
+#   3. Push each file to the VPS EXACTLY like build-installers.yml does:
+#      node scripts/publish-installer.mjs → multipart POST /api/app-versions/upload?create=1
+#      (x-deploy-token header). The API stores the binary under
+#      $BLASTI_STORAGE_DIR/app-versions/<desktop|mobile>/ and creates/updates
+#      an UNPUBLISHED AppVersion draft (admin activates it in Public Apps
+#      Settings — uploads never auto-publish, by design).
+#   4. POST /api/system/deploy-trigger (same DEPLOY_TOKEN) so the VPS runs
+#      server-update + server-doctor in the transient blasti-rebuild unit —
+#      the same refresh path as the build workflow (soft-skips when a deploy
+#      is already running; never fails the job on a busy VPS).
+#   5. Write a run summary: what was pushed (file / size / platform / version),
+#      from which source run, and what was skipped.
+#
+# ARTIFACT → INSTALLER → VPS PLATFORM MAPPING
+#   Selection      | Artifact name        | Files                       | API platform
+#   ---------------+----------------------+-----------------------------+-------------
+#   windows        | desktop-exe          | BLASTI-Setup-<v>.exe        | windows
+#   macos          | desktop-mac          | BLASTI-<v>.dmg              | mac
+#   linux          | desktop-linux        | BLASTI-<v>.AppImage,        | linux
+#                  |                      | blasti_<v>_<arch>.deb       |
+#   android-release| mobile-apk-release   | BLASTI-v<v>-release.apk     | android
+#   android-debug  | mobile-apk           | BLASTI-v<v>-debug.apk       | android-debug
+#   all            | every artifact above that exists on the source run
+#
+#   NOTE: the current build-installers.yml produces `desktop-exe` (Windows)
+#   and `mobile-apk` (Android debug) only. The macos / linux /
+#   android-release selections are wired and forward-compatible — they work
+#   as soon as the build workflow gains those targets (or against older runs,
+#   via the `build_run_id` input, that still carry such artifacts). If the
+#   selected artifact does not exist on the source run, the job fails with a
+#   clear message instead of pushing nothing.
+#
+# REQUIRED REPO SECRETS (same as Build Installers — no new secrets):
+#   BLASTI_API_URL      e.g. https://blasti.example.com (public site the VPS
+#                       Caddy serves; /api/* is proxied to the cloud API)
+#   BLASTI_DEPLOY_TOKEN the DEPLOY_TOKEN value from /etc/blasti/blasti.env
+#                       on the VPS (shared CI/updater secret)
+# When either secret is missing the job skips the upload with a clear notice
+# instead of failing — the source artifacts are untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      installers:
+        description: 'Which installer(s) to push to the VPS'
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - windows
+          - linux
+          - macos
+          - android-release
+          - android-debug
+      build_run_id:
+        description: 'Optional: source Build Installers run ID (blank = latest successful run)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: push-installers
+  cancel-in-progress: false
+
+jobs:
+  push-to-vps:
+    name: Re-push installers → BLASTI VPS (no rebuild)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      # ─────────────────────────────────────────────────────────────────────
+      # STEP 1 — Resolve the source run + plan the download
+      # Resolves the latest SUCCESSFUL Build Installers run (or the run given
+      # in build_run_id), lists its artifacts via the API, and intersects them
+      # with the selected platforms. NOTHING is rebuilt or downloaded here.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Resolve source run + selection plan
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELECTION: ${{ inputs.installers }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+
+          # ── 1a. Find the source run (specific id wins, else latest success)
+          if [ -n "$BUILD_RUN_ID" ]; then
+            RUN_ID="$BUILD_RUN_ID"
+            echo "Using the requested source run id: $RUN_ID"
+            if ! gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json status,conclusion > /tmp/run.json 2> /tmp/run-err.txt; then
+              echo "::error::Run $RUN_ID not found in $GITHUB_REPOSITORY ($(cat /tmp/run-err.txt)). The id is the number in the run's URL: .../actions/runs/<id>."
+              exit 1
+            fi
+            conclusion="$(node -e "const j=require('/tmp/run.json');console.log(j.conclusion||'unknown')")"
+            if [ "$conclusion" != "success" ]; then
+              echo "::error::Run $RUN_ID concluded '${conclusion}', not 'success' — refusing to push installers from an unsuccessful run. Pick a green Build Installers run."
+              exit 1
+            fi
+          else
+            RUN_ID="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build-installers.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2> /dev/null || true)"
+            if [ -z "$RUN_ID" ]; then
+              echo "::error::No successful 'Build Installers' (build-installers.yml) run found. Dispatch 'Build Installers' once (it builds the installers and uploads the artifacts), then run 'Push Installers (no rebuild)' again."
+              exit 1
+            fi
+            echo "Latest successful Build Installers run: $RUN_ID"
+          fi
+
+          gh run view "$RUN_ID" --repo "$GITHUB_REPOSITORY" --json url,headSha,displayTitle,createdAt > /tmp/run-meta.json
+          RUN_URL="$(node -e "console.log(require('/tmp/run-meta.json').url||'')")"
+          HEAD_SHA="$(node -e "console.log(require('/tmp/run-meta.json').headSha||'')")"
+          RUN_TITLE="$(node -e "console.log(require('/tmp/run-meta.json').displayTitle||'')" | tr '\n' ' ')"
+          RUN_AT="$(node -e "console.log(require('/tmp/run-meta.json').createdAt||'')")"
+
+          # ── 1b. List the run's live (non-expired) artifact names
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" --paginate \
+            --jq '.artifacts[] | select((.expired // false) == false) | .name' | sort -u > /tmp/artifacts.txt || true
+          echo "Artifacts available on run $RUN_ID:"; sed 's/^/  - /' /tmp/artifacts.txt || true
+
+          # ── 1c. Map the selection → candidate artifact names
+          case "$SELECTION" in
+            all)             wanted="desktop-exe mobile-apk desktop-mac desktop-linux mobile-apk-release" ;;
+            windows)         wanted="desktop-exe" ;;
+            macos)           wanted="desktop-mac" ;;
+            linux)           wanted="desktop-linux" ;;
+            android-release) wanted="mobile-apk-release" ;;
+            android-debug)   wanted="mobile-apk" ;;
+            *) echo "::error::Unknown selection '${SELECTION}'"; exit 1 ;;
+          esac
+
+          # ── 1d. Intersect with what the run actually has
+          found=""
+          missing=""
+          for name in $wanted; do
+            if grep -qx "$name" /tmp/artifacts.txt; then
+              found="$found $name"
+            else
+              missing="$missing $name"
+            fi
+          done
+          found="$(echo "$found" | xargs)"
+          missing="$(echo "$missing" | xargs)"
+
+          echo "Wanted:      ${wanted}"
+          echo "Found:       ${found:-<none>}"
+          echo "Missing:     ${missing:-<none>}"
+
+          if [ -z "$found" ]; then
+            {
+              echo "## ❌ Nothing to push"
+              echo ""
+              echo "Selection \`${SELECTION}\` matched no artifact on run [$RUN_ID]($RUN_URL)."
+              echo ""
+              echo "Available artifacts: $(wc -l < /tmp/artifacts.txt | tr -d ' ')"
+              echo '```'
+              cat /tmp/artifacts.txt || true
+              echo '```'
+              echo ""
+              echo "The current **Build Installers** workflow builds \`desktop-exe\` (Windows) and"
+              echo "\`mobile-apk\` (Android debug) — run it first, then re-dispatch this workflow."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::None of the artifacts for selection '${SELECTION}' (${wanted}) exist on run $RUN_ID. Run 'Build Installers' first, or pick a selection/artifact the run actually has."
+            exit 1
+          fi
+
+          # ── 1e. Expose outputs + write the source-run summary section
+          {
+            echo "run_id=$RUN_ID"
+            echo "run_url=$RUN_URL"
+            echo "run_title=$RUN_TITLE"
+            echo "run_at=$RUN_AT"
+            echo "head_sha=$HEAD_SHA"
+            echo "artifacts=$found"
+            echo "missing=$missing"
+            for name in desktop-exe mobile-apk desktop-mac desktop-linux mobile-apk-release; do
+              flag="false"
+              case " $found " in *" $name "*) flag="true" ;; esac
+              # want_desktop-exe is not a valid output name → underscore form
+              case "$name" in
+                desktop-exe)         echo "want_desktop_exe=$flag" ;;
+                mobile-apk)          echo "want_mobile_apk=$flag" ;;
+                desktop-mac)         echo "want_desktop_mac=$flag" ;;
+                desktop-linux)       echo "want_desktop_linux=$flag" ;;
+                mobile-apk-release)  echo "want_mobile_apk_release=$flag" ;;
+              esac
+            done
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## 🔁 Push Installers (no rebuild)"
+            echo ""
+            echo "**Source run:** [$RUN_TITLE — $RUN_ID]($RUN_URL), built at $RUN_AT from commit \`$(echo "$HEAD_SHA" | cut -c1-7)\`"
+            echo ""
+            echo "**Selection:** \`${SELECTION}\` → artifacts: \`${found}\`"
+            if [ -n "$missing" ]; then
+              echo ""
+              echo "> ⚠️ Not on the source run (skipped): \`${missing}\` — the Build Installers workflow currently produces \`desktop-exe\` (Windows) and \`mobile-apk\` (Android debug)."
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ─────────────────────────────────────────────────────────────────────
+      # STEP 2 — Download the source run's artifacts (cross-run, v4)
+      # Each step is skipped unless the resolve step found that artifact on
+      # the source run. Paths mirror the Build Installers staging layout.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Download desktop-exe artifact (Windows NSIS)
+        if: steps.resolve.outputs.want_desktop_exe == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+          name: desktop-exe
+          path: installer/desktop
+
+      - name: Download mobile-apk artifact (Android debug)
+        if: steps.resolve.outputs.want_mobile_apk == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+          name: mobile-apk
+          path: installer/mobile
+
+      - name: Download desktop-mac artifact (macOS dmg)
+        if: steps.resolve.outputs.want_desktop_mac == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+          name: desktop-mac
+          path: installer/desktop
+
+      - name: Download desktop-linux artifact (AppImage + deb)
+        if: steps.resolve.outputs.want_desktop_linux == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+          name: desktop-linux
+          path: installer/desktop
+
+      - name: Download mobile-apk-release artifact (Android release)
+        if: steps.resolve.outputs.want_mobile_apk_release == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+          name: mobile-apk-release
+          path: installer/mobile
+
+      # ─────────────────────────────────────────────────────────────────────
+      # STEP 3 — Push the selected installers to the VPS
+      # Identical mechanics to build-installers.yml: scripts/publish-installer.mjs
+      # → POST /api/app-versions/upload?create=1 (x-deploy-token) → the API
+      # stores the file under app-versions/<desktop|mobile>/ and creates/updates
+      # a DRAFT AppVersion (admin activates in Public Apps Settings).
+      # Re-uploading the same platform+version is idempotent (binary replaced).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Push installers to the VPS
+        id: upload
+        env:
+          BLASTI_API_URL: ${{ secrets.BLASTI_API_URL }}
+          BLASTI_DEPLOY_TOKEN: ${{ secrets.BLASTI_DEPLOY_TOKEN }}
+          SOURCE_RUN_ID: ${{ steps.resolve.outputs.run_id }}
+          SOURCE_HEAD_SHA: ${{ steps.resolve.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          rm -f /tmp/pushed-rows.md
+          : > /tmp/pushed-rows.md
+
+          if [ -z "$BLASTI_API_URL" ] || [ -z "$BLASTI_DEPLOY_TOKEN" ]; then
+            echo "::warning::BLASTI_API_URL / BLASTI_DEPLOY_TOKEN secrets not configured — skipping VPS upload (the source run's artifacts are untouched)."
+            {
+              echo "### ⚠️ VPS upload skipped"
+              echo ""
+              echo "Set the repo secrets \`BLASTI_API_URL\` and \`BLASTI_DEPLOY_TOKEN\`"
+              echo "(Settings → Secrets and variables → Actions) to deliver installers"
+              echo "to the VPS Storage Manager + Public Apps Settings."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          parse_version() { # <file> → version from the installer filename
+            local f v=""
+            f="$(basename "$1")"
+            case "$f" in
+              BLASTI-Setup-*.exe)    v="$(printf '%s' "$f" | sed -n 's/^BLASTI-Setup-\(.*\)\.exe$/\1/p')" ;;
+              BLASTI-v*-debug.apk)   v="$(printf '%s' "$f" | sed -n 's/^BLASTI-v\(.*\)-debug\.apk$/\1/p')" ;;
+              BLASTI-v*-release.apk) v="$(printf '%s' "$f" | sed -n 's/^BLASTI-v\(.*\)-release\.apk$/\1/p')" ;;
+              BLASTI-*.dmg)          v="$(printf '%s' "$f" | sed -n 's/^BLASTI-\(.*\)\.dmg$/\1/p')" ;;
+              BLASTI-*.AppImage)     v="$(printf '%s' "$f" | sed -n 's/^BLASTI-\(.*\)\.AppImage$/\1/p')" ;;
+              blasti_*.deb)          v="$(printf '%s' "$f" | sed -n 's/^blasti_\(.*\)_[^_]*\.deb$/\1/p')" ;;
+            esac
+            printf '%s' "$v"
+          }
+
+          upload() { # <file> <api-platform> <fallback-version> <source-artifact>
+            local f="$1" platform="$2" fallback="$3" artifact="$4" ver size_mb
+            ver="$(parse_version "$f")"
+            if [ -z "$ver" ]; then
+              echo "::warning::could not parse a semver out of $(basename "$f") — falling back to $fallback"
+              ver="$fallback"
+            fi
+            size_mb="$(awk -v b="$(stat -c%s "$f")" 'BEGIN{printf "%.1f", b/1048576}')"
+            node scripts/publish-installer.mjs \
+              --file "$f" \
+              --platform "$platform" \
+              --version "$ver" \
+              --api-url "$BLASTI_API_URL" \
+              --token "$BLASTI_DEPLOY_TOKEN" \
+              --notes "Re-pushed from run ${SOURCE_RUN_ID} (no rebuild, commit ${SOURCE_HEAD_SHA:0:7})"
+            printf '| `%s` | %s | %s | %s MB | %s |\n' "$(basename "$f")" "$artifact" "$platform" "$size_mb" "$ver" >> /tmp/pushed-rows.md
+          }
+
+          desktop_ver="$(node -p "require('./apps/desktop/package.json').version")"
+          mobile_ver="$(sed -n 's/.*versionName[^"]*"\([^"]*\)".*/\1/p' apps/mobile/android/app/build.gradle | head -1)"
+          count=0
+
+          # Windows NSIS (artifact: desktop-exe)
+          for f in installer/desktop/*.exe; do
+            [ -f "$f" ] || continue
+            upload "$f" windows "$desktop_ver" desktop-exe
+            count=$((count + 1))
+          done
+
+          # macOS dmg (artifact: desktop-mac — forward-compat target)
+          for f in installer/desktop/*.dmg; do
+            [ -f "$f" ] || continue
+            upload "$f" mac "$desktop_ver" desktop-mac
+            count=$((count + 1))
+          done
+
+          # Linux AppImage + deb (artifact: desktop-linux — forward-compat target)
+          for f in installer/desktop/*.AppImage installer/desktop/*.deb; do
+            [ -f "$f" ] || continue
+            upload "$f" linux "$desktop_ver" desktop-linux
+            count=$((count + 1))
+          done
+
+          # Android APKs (artifact: mobile-apk → android-debug, mobile-apk-release → android)
+          for f in installer/mobile/*.apk; do
+            [ -f "$f" ] || continue
+            case "$(basename "$f")" in
+              *-release.apk) upload "$f" android "$mobile_ver" mobile-apk-release ;;
+              *)             upload "$f" android-debug "$mobile_ver" mobile-apk ;;
+            esac
+            count=$((count + 1))
+          done
+
+          uploaded="false"
+          [ "$count" -gt 0 ] && uploaded="true"
+          {
+            echo "uploaded=$uploaded"
+            echo "count=$count"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$uploaded" = "false" ]; then
+            echo "::error::Nothing was pushed — the downloaded artifacts contained no installer files. Check the artifact contents of run ${SOURCE_RUN_ID}."
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────────────────────────────────
+      # STEP 4 — Trigger the VPS refresh (server-update)
+      # Same endpoint as build-installers.yml: POST /api/system/deploy-trigger
+      # (x-deploy-token). The API runs deploy-digitalocean.sh server-update +
+      # server-doctor in the transient blasti-rebuild systemd unit, which
+      # re-syncs storage + restarts the services. Best-effort: a skipped or
+      # failed trigger is a warning, never a job failure (the periodic
+      # blasti-watcher.timer stays the fallback).
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Trigger the VPS refresh (server-update)
+        if: always() && steps.upload.outputs.uploaded == 'true'
+        env:
+          BLASTI_API_URL: ${{ secrets.BLASTI_API_URL }}
+          BLASTI_DEPLOY_TOKEN: ${{ secrets.BLASTI_DEPLOY_TOKEN }}
+          COMMIT_SHA: ${{ steps.resolve.outputs.head_sha }}
+          SOURCE_RUN_ID: ${{ steps.resolve.outputs.run_id }}
+        run: |
+          # Build the JSON payload defensively: `commit` is optional on the API
+          # (git-sha validated) — omit it entirely when unknown instead of
+          # sending an empty string (which the schema would reject).
+          payload='{"source":"github-actions","reason":"installers re-pushed without rebuild from run '"$SOURCE_RUN_ID"'"}'
+          if [ -n "$COMMIT_SHA" ]; then
+            payload='{"source":"github-actions","commit":"'"$COMMIT_SHA"'","reason":"installers re-pushed without rebuild from run '"$SOURCE_RUN_ID"'"}'
+          fi
+
+          code="$(curl -fsS -m 60 -o /tmp/deploy-trigger.json -w '%{http_code}' \
+            -X POST "${BLASTI_API_URL%/}/api/system/deploy-trigger" \
+            -H 'Content-Type: application/json' \
+            -H "x-deploy-token: $BLASTI_DEPLOY_TOKEN" \
+            -d "$payload")" || code="000"
+
+          started=$(node -e "try{const j=require('/tmp/deploy-trigger.json');console.log(j.started===true?'true':(j.started===false?'false':'unknown'))}catch{console.log('unknown')}" 2>/dev/null || echo unknown)
+          reason=$(node -e "try{const j=require('/tmp/deploy-trigger.json');console.log(String(j.reason||''))}catch{console.log('')}" 2>/dev/null || echo '')
+
+          case "$code" in
+            200)
+              if [ "$started" = "true" ]; then
+                echo "Refresh triggered on the VPS (server-update + server-doctor, blasti-rebuild unit). Log: \\<STORAGE_ROOT\\>/logs/deploy-*.log or \\(journalctl -u blasti-rebuild -f\\)." >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "Trigger accepted but NOT started (reason: ${reason:-unknown}) — a deploy is already in progress and will rescan storage on its own." >> "$GITHUB_STEP_SUMMARY"
+                echo "::notice::Deploy trigger accepted but not started (reason: ${reason:-unknown}) — a deploy is already in progress."
+              fi
+              ;;
+            401)
+              echo "::warning::VPS rejected the refresh trigger (HTTP 401) — BLASTI_DEPLOY_TOKEN does not match DEPLOY_TOKEN in /etc/blasti/blasti.env. The periodic watcher will rescan on its next tick."
+              echo "⚠️ Refresh trigger rejected (401): token mismatch — the periodic watcher remains the fallback." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            000)
+              echo "::warning::Could not reach the VPS to trigger a refresh (network error). The periodic watcher remains the fallback."
+              echo "⚠️ Refresh trigger unreachable — the periodic watcher remains the fallback." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::warning::VPS refresh trigger failed (HTTP $code). The periodic watcher remains the fallback."
+              echo "⚠️ Refresh trigger failed (HTTP $code) — the periodic watcher remains the fallback." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+      # ─────────────────────────────────────────────────────────────────────
+      # STEP 5 — Final summary: what was pushed, sizes, source run
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Write run summary
+        if: always()
+        env:
+          API_URL: ${{ secrets.BLASTI_API_URL }}
+          SOURCE_RUN_ID: ${{ steps.resolve.outputs.run_id }}
+          SOURCE_RUN_URL: ${{ steps.resolve.outputs.run_url }}
+          UPLOADED: ${{ steps.upload.outputs.uploaded }}
+          COUNT: ${{ steps.upload.outputs.count }}
+        run: |
+          {
+            if [ "$UPLOADED" = "true" ]; then
+              echo "### 📦 Pushed to the VPS ($COUNT file(s)) — no rebuild"
+              echo ""
+              echo "| File | Artifact | Platform | Size | Version |"
+              echo "|---|---|---|---|---|"
+              cat /tmp/pushed-rows.md
+              echo ""
+              if [ -n "$API_URL" ]; then
+                echo "**Delivered to:** ${API_URL%/} → Admin → Public Apps Settings (activate as published installer)"
+                echo ""
+                echo "**Storage Manager:** app-versions category → \`desktop/\` + \`mobile/\` installer folders"
+              fi
+            elif [ -z "$SOURCE_RUN_ID" ]; then
+              echo "### ❌ Aborted before download — no source run resolved"
+            else
+              echo "### ⚠️ Nothing pushed (upload skipped or failed) — source run [${SOURCE_RUN_ID}](${SOURCE_RUN_URL}) was not modified."
+            fi
+            echo ""
+            echo "**Source run:** [${SOURCE_RUN_ID}](${SOURCE_RUN_URL}) — artifacts were re-pushed AS-IS, nothing was rebuilt."
+          } >> "$GITHUB_STEP_SUMMARY"

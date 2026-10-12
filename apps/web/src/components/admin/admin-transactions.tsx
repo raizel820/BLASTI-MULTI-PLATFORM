@@ -28,20 +28,52 @@ import {
   Download,
   ExternalLink,
   FileText,
+  BadgeCheck,
+  ShieldCheck,
+  Landmark,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 
-interface PendingPayment {
+/**
+ * Admin transactions console — manual receipt payments AND online Chargily
+ * payments in one view.
+ *
+ *  • Manual payments  → approve / reject (receipt upload flow).
+ *  • Online payments  → gateway-owned: never "approved" by an admin. The
+ *    settlement lifecycle is driven by Chargily (webhook / checkout poll);
+ *    admins reconcile through the gateway: verify with the LIVE checkout,
+ *    confirm settled / mark failed (only real gateway states are accepted —
+ *    an unpaid charge can never be settled, and a gateway-reported "pending"
+ *    checkout cannot be failed either — the API refuses both with 409).
+ */
+interface AdminPayment {
   id: string;
   agencyName: string;
   amount: number;
   plan: string;
+  planName?: string | null;
   method: string;
   status: string;
   receiptUrl?: string;
   createdAt: string;
+  reviewedAt?: string | null;
+  reconciledAt?: string | null;
+  rejectionReason?: string | null;
+  /** SUBSCRIPTION (default) | HARDWARE */
+  type: string;
+  providerRef: string;
+  webhookVerified: boolean;
+  isOnline: boolean;
+  payerName?: string;
+  payerContact?: string;
+  agencySubscriptionStatus?: string;
 }
+
+type TypeFilter = 'ALL' | 'manual' | 'online';
+type ReconcileAction = 'verify' | 'mark-settled' | 'mark-failed';
+
+const STATUS_FILTERS = ['ALL', 'PENDING', 'COMPLETED', 'FAILED', 'APPROVED', 'REJECTED'] as const;
 
 /**
  * Get a safe URL for accessing uploaded files.
@@ -55,10 +87,11 @@ function getProxiedUrl(url: string): string {
 export function AdminTransactions() {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
-  const [payments, setPayments] = useState<PendingPayment[]>([]);
+  const [payments, setPayments] = useState<AdminPayment[]>([]);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const [statusFilter, setStatusFilter] = useState<string>('PENDING');
+  const [statusFilter, setStatusFilter] = useState<string>('ALL');
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>('ALL');
 
   // Reject dialog
   const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
@@ -73,27 +106,49 @@ export function AdminTransactions() {
 
   useEffect(() => {
     fetchPayments();
-  }, [statusFilter]);
+  }, [statusFilter, typeFilter]);
 
   const fetchPayments = async () => {
     setLoading(true);
     try {
-      const statusParam = statusFilter !== 'ALL' ? `?status=${statusFilter}` : '';
-      const res = await apiFetch(`/api/transactions${statusParam}`);
+      const params = new URLSearchParams();
+      if (statusFilter !== 'ALL') params.set('status', statusFilter);
+      if (typeFilter !== 'ALL') params.set('type', typeFilter);
+      params.set('limit', '50');
+      const res = await apiFetch(`/api/transactions?${params.toString()}`);
       if (res.ok) {
         const data = await res.json();
         const mapped = (data.transactions ?? []).map((tx: Record<string, unknown>) => {
-          const agency = tx.agency as Record<string, string> | undefined;
+          const agency = tx.agency as
+            | { name?: string; subscriptionStatus?: string; owner?: { username?: string; fullName?: string; email?: string } }
+            | undefined;
+          const owner = agency?.owner;
+          const providerRef = ((tx.providerRef as string) || '').trim();
+          const payerName = owner?.fullName?.trim() || owner?.username?.trim() || '';
+          const payerContact = owner?.email?.trim() || '';
           return {
             id: tx.id,
             agencyName: agency?.name || t('unknownAgency'),
             amount: tx.amount as number,
             plan: tx.plan as string,
+            planName: (tx.planName as string) || null,
             method: tx.paymentMethod as string,
             status: tx.status as string,
             receiptUrl: (tx.receiptUrl as string) || undefined,
             createdAt: tx.createdAt as string,
-          };
+            reviewedAt: (tx.reviewedAt as string) || null,
+            reconciledAt: (tx.reconciledAt as string) || null,
+            rejectionReason: (tx.rejectionReason as string) || null,
+            type: (tx.type as string) || 'SUBSCRIPTION',
+            providerRef,
+            webhookVerified: !!tx.webhookVerified,
+            // Online payments are ALWAYS created with a Chargily checkout id in
+            // providerRef (payment-checkout.ts); manual receipts leave it empty.
+            isOnline: !!providerRef,
+            payerName: payerName || undefined,
+            payerContact: payerContact || undefined,
+            agencySubscriptionStatus: agency?.subscriptionStatus || undefined,
+          } as AdminPayment;
         });
         setPayments(mapped);
       }
@@ -104,8 +159,9 @@ export function AdminTransactions() {
     }
   };
 
+  // ── Manual payments: approve / reject (receipt flow only) ──
   const handleApprove = async (id: string) => {
-    setActionLoading(id);
+    setActionLoading(`${id}:approve`);
     try {
       const res = await apiFetch(`/api/admin/transactions/${id}`, {
         method: 'POST',
@@ -134,7 +190,7 @@ export function AdminTransactions() {
       toast.error(t('requiredField'));
       return;
     }
-    setActionLoading(rejectId);
+    setActionLoading(`${rejectId}:reject`);
     try {
       const res = await apiFetch(`/api/admin/transactions/${rejectId}`, {
         method: 'POST',
@@ -153,6 +209,51 @@ export function AdminTransactions() {
         fetchPayments();
       } else {
         const data = await res.json();
+        toast.error(data.error || t('error'));
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  // ── Online payments: gateway reconciliation ──
+  // verify        → query the LIVE Chargily checkout and apply its true state
+  //                 through the idempotent fulfillment path (same code as the
+  //                 webhook). The honest default: it settles real payments and
+  //                 real failures, and reports "pending" without touching state.
+  // mark-settled  → confirm settlement. Refused (409) while the gateway still
+  //                 reports the charge as pending; allowed as a documented
+  //                 override ONLY when the gateway API is unreachable.
+  // mark-failed   → mirror image for abandoned checkouts (same rules).
+  const handleReconcile = async (id: string, action: ReconcileAction) => {
+    setActionLoading(`${id}:${action}`);
+    try {
+      const res = await apiFetch(`/api/admin/transactions/${id}/reconcile`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        if (action === 'verify') {
+          const normalized = data.live?.normalized;
+          if (normalized === 'paid') toast.success(t('txVerifyPaid'));
+          else if (normalized === 'failed') toast.info(t('txVerifyFailed'));
+          else toast.info(t('txVerifyPending'));
+        } else if (data.override) {
+          // Gateway unreachable — the admin closed the payment out manually.
+          toast.warning(t('txOverrideApplied'));
+        } else {
+          toast.success(action === 'mark-settled' ? t('txVerifyPaid') : t('txVerifyFailed'));
+        }
+        fetchPayments();
+      } else if (res.status === 502) {
+        toast.error(data.detail ? `${t('txGatewayUnreachable')} — ${data.detail}` : t('txGatewayUnreachable'));
+      } else if (res.status === 409) {
+        toast.error(data.error || t('txRefusedPending'));
+      } else {
         toast.error(data.error || t('error'));
       }
     } catch {
@@ -193,24 +294,64 @@ export function AdminTransactions() {
     return url.toLowerCase().includes('.pdf') || url.toLowerCase().includes('pdf');
   };
 
+  const statusBadgeClass = (status: string) =>
+    status === 'PENDING'
+      ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
+      : status === 'APPROVED' || status === 'COMPLETED'
+        ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
+        : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400';
+
+  const busy = (id: string, action: string) => actionLoading === `${id}:${action}`;
+
   if (loading) {
     return (
       <div className="p-4 lg:p-6 space-y-4">
         <Skeleton className="h-8 w-48" />
+        <Skeleton className="h-10 w-full max-w-xl rounded-lg" />
         <Skeleton className="h-64 rounded-2xl" />
       </div>
     );
   }
 
+  const pendingCount = payments.filter((p) => p.status === 'PENDING').length;
+
   return (
     <div className="p-4 lg:p-6 space-y-5">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-foreground">{t('pendingPayments')}</h1>
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <h1 className="text-2xl font-bold text-foreground">{t('transactions')}</h1>
+        {pendingCount > 0 && (
+          <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 text-xs px-2 py-1 self-start">
+            {pendingCount} {t('statusPending').toLowerCase()}
+          </Badge>
+        )}
+      </div>
+
+      {/* Type Filter — Manual receipts vs Online (Chargily) payments */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Landmark className="h-4 w-4 text-muted-foreground" />
+        {([
+          { key: 'ALL' as TypeFilter, label: t('txTypeAll') },
+          { key: 'manual' as TypeFilter, label: t('txTypeManual') },
+          { key: 'online' as TypeFilter, label: t('txTypeOnline') },
+        ]).map((item) => (
+          <button
+            key={item.key}
+            onClick={() => { setTypeFilter(item.key); }}
+            className={`px-4 py-2 rounded-lg text-xs font-medium transition-all duration-200 ${
+              typeFilter === item.key
+              ? 'filter-chip-active'
+              : 'bg-gray-100 dark:bg-gray-800 text-muted-foreground hover:bg-gray-200 dark:hover:bg-gray-700'
+            }`
+          }
+          >
+            {item.label}
+          </button>
+        ))}
       </div>
 
       {/* Status Filter */}
-      <div className="flex gap-2">
-        {['ALL', 'PENDING', 'APPROVED', 'REJECTED'].map((status) => (
+      <div className="flex flex-wrap gap-2">
+        {STATUS_FILTERS.map((status) => (
           <button
             key={status}
             onClick={() => { setStatusFilter(status); }}
@@ -234,38 +375,60 @@ export function AdminTransactions() {
           </CardContent>
         </Card>
       ) : (
-        <div className="space-y-3">
+        <div className="space-y-3 max-h-[75vh] overflow-y-auto custom-scrollbar pe-1">
           {payments.map((payment, idx) => (
             <motion.div
               key={payment.id}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: idx * 0.03 }}
+              transition={{ delay: Math.min(idx * 0.03, 0.3) }}
             >
               <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50 hover:shadow-md hover:-translate-y-0.5 transition-all duration-200">
                 <CardContent className="p-4">
                   <div className="flex flex-col sm:flex-row sm:items-center gap-4">
                     {/* Agency Info */}
-                    <div className="flex items-center gap-3 flex-1">
-                      <div className="h-10 w-10 rounded-xl bg-gradient-to-br from-emerald-200 to-emerald-300 dark:from-emerald-900/40 dark:to-emerald-800/40 flex items-center justify-center flex-shrink-0 shadow-sm">
-                        <Building2 className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                    <div className="flex items-center gap-3 flex-1 min-w-0">
+                      <div
+                        className={`h-10 w-10 rounded-xl flex items-center justify-center flex-shrink-0 shadow-sm ${
+                          payment.isOnline
+                            ? 'bg-gradient-to-br from-emerald-200 to-emerald-300 dark:from-emerald-900/40 dark:to-emerald-800/40'
+                            : 'bg-gradient-to-br from-amber-200 to-orange-200 dark:from-amber-900/40 dark:to-orange-800/40'
+                        }`}
+                      >
+                        {payment.isOnline ? (
+                          <CreditCard className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                        ) : (
+                          <Building2 className="h-5 w-5 text-amber-700 dark:text-amber-400" />
+                        )}
                       </div>
                       <div className="min-w-0">
                         <p className="text-sm font-semibold text-foreground truncate">
                           {payment.agencyName}
                         </p>
                         <div className="flex items-center gap-2 flex-wrap mt-0.5">
+                          {/* Manual vs Online badge */}
+                          {payment.isOnline ? (
+                            <Badge className="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 text-[10px] px-1.5 py-0">
+                              <CreditCard className="h-3 w-3 me-0.5" />
+                              {t('txBadgeOnline')}
+                            </Badge>
+                          ) : (
+                            <Badge variant="outline" className="text-[10px] px-1.5 py-0 text-muted-foreground">
+                              {t('txBadgeManual')}
+                            </Badge>
+                          )}
+                          {/* Plan badge */}
                           <Badge variant="secondary" className="text-[10px]">
                             {payment.plan === 'PREMIUM' ? t('premiumPlan') : payment.plan === 'ENTERPRISE' ? t('enterprisePlan') : t('basicPlan')}
                           </Badge>
+                          {/* Subscription vs Hardware payment (online rows) */}
+                          {payment.isOnline && payment.type === 'HARDWARE' && (
+                            <Badge variant="secondary" className="text-[10px]">
+                              {t('txHardwarePayment')}
+                            </Badge>
+                          )}
                           <Badge
-                            className={`text-[10px] ${
-                              payment.status === 'PENDING'
-                                ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
-                                : payment.status === 'APPROVED'
-                                  ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
-                                  : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
-                            }`}
+                            className={`text-[10px] ${statusBadgeClass(payment.status)}`}
                           >
                             {translateStatus(payment.status, t)}
                           </Badge>
@@ -274,11 +437,46 @@ export function AdminTransactions() {
                             {new Date(payment.createdAt).toLocaleDateString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US')}
                           </span>
                         </div>
+                        {/* Online payment details — gateway reference + payer account */}
+                        {payment.isOnline && (
+                          <div className="flex items-center gap-3 flex-wrap mt-1 text-[11px] text-muted-foreground">
+                            <span className="inline-flex items-center gap-1 min-w-0">
+                              <span className="font-medium">{t('txGatewayRef')}:</span>
+                              <span className="font-mono truncate max-w-[16rem]" dir="ltr" title={payment.providerRef}>
+                                {payment.providerRef}
+                              </span>
+                            </span>
+                            {(payment.payerName || payment.payerContact) && (
+                              <span className="inline-flex items-center gap-1 min-w-0">
+                                <span className="font-medium">{t('txPayer')}:</span>
+                                <span className="truncate max-w-[14rem]">
+                                  {payment.payerName}{payment.payerContact ? ` · ${payment.payerContact}` : ''}
+                                </span>
+                              </span>
+                            )}
+                            {payment.webhookVerified && (
+                              <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                                <BadgeCheck className="h-3.5 w-3.5" />
+                                {t('verified')}
+                              </span>
+                            )}
+                            {payment.reconciledAt && (
+                              <span>
+                                {t('txReconciled')}: {new Date(payment.reconciledAt).toLocaleDateString(lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US')}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        {payment.rejectionReason && (
+                          <p className="text-[11px] text-red-600 dark:text-red-400 mt-1 truncate" title={payment.rejectionReason}>
+                            {payment.rejectionReason}
+                          </p>
+                        )}
                       </div>
                     </div>
 
                     {/* Amount + Actions */}
-                    <div className="flex items-center gap-3 sm:ms-auto">
+                    <div className="flex items-center gap-2 sm:gap-3 sm:ms-auto flex-wrap justify-end">
                       <div className="text-end me-2">
                         <p className="text-lg font-bold text-foreground">
                           {payment.amount.toLocaleString()} {t('currency')}
@@ -297,7 +495,8 @@ export function AdminTransactions() {
                         </Button>
                       )}
 
-                      {payment.status === 'PENDING' && (
+                      {/* ── MANUAL payments: approve / reject (unchanged flow) ── */}
+                      {!payment.isOnline && payment.status === 'PENDING' && (
                         <>
                           <Button
                             size="sm"
@@ -305,7 +504,7 @@ export function AdminTransactions() {
                             onClick={() => handleApprove(payment.id)}
                             disabled={!!actionLoading}
                           >
-                            {actionLoading === payment.id ? (
+                            {busy(payment.id, 'approve') ? (
                               <Loader2 className="h-4 w-4 animate-spin" />
                             ) : (
                               <Check className="h-4 w-4 me-1.5" />
@@ -324,8 +523,71 @@ export function AdminTransactions() {
                           </Button>
                         </>
                       )}
+
+                      {/* ── ONLINE payments: gateway reconciliation only ──
+                              The gateway owns the lifecycle; admins never
+                              "approve" an unpaid charge. */}
+                      {payment.isOnline && (
+                        <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap justify-end">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-9 px-3 border-emerald-200 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-400 dark:hover:bg-emerald-900/20"
+                            onClick={() => handleReconcile(payment.id, 'verify')}
+                            disabled={!!actionLoading}
+                            title={t('txVerifyWithGateway')}
+                          >
+                            {busy(payment.id, 'verify') ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <ShieldCheck className="h-4 w-4 me-1.5" />
+                            )}
+                            <span className="hidden md:inline">{t('txVerifyWithGateway')}</span>
+                          </Button>
+                          {payment.status === 'PENDING' && (
+                            <>
+                              <Button
+                                size="sm"
+                                className="h-9 px-3 bg-emerald-600 hover:bg-emerald-700 text-white"
+                                onClick={() => handleReconcile(payment.id, 'mark-settled')}
+                                disabled={!!actionLoading}
+                                title={t('txMarkSettled')}
+                              >
+                                {busy(payment.id, 'mark-settled') ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <Check className="h-4 w-4 me-1.5" />
+                                )}
+                                <span className="hidden md:inline">{t('txMarkSettled')}</span>
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-9 px-3 border-red-200 text-red-600 hover:bg-red-50 dark:border-red-800 dark:hover:bg-red-900/20"
+                                onClick={() => handleReconcile(payment.id, 'mark-failed')}
+                                disabled={!!actionLoading}
+                                title={t('txMarkFailed')}
+                              >
+                                {busy(payment.id, 'mark-failed') ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <X className="h-4 w-4 me-1.5" />
+                                )}
+                                <span className="hidden md:inline">{t('txMarkFailed')}</span>
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
+                  {/* Explain why approve/reject is unavailable on online rows */}
+                  {payment.isOnline && payment.status === 'PENDING' && (
+                    <p className="text-[10px] text-muted-foreground mt-2 flex items-center gap-1">
+                      <BadgeCheck className="h-3 w-3" />
+                      {t('txGatewayOwned')}
+                    </p>
+                  )}
                 </CardContent>
               </Card>
             </motion.div>
@@ -333,7 +595,7 @@ export function AdminTransactions() {
         </div>
       )}
 
-      {/* Reject Dialog */}
+      {/* Reject Dialog (manual payments only) */}
       <Dialog open={rejectDialogOpen} onOpenChange={setRejectDialogOpen}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
@@ -358,9 +620,9 @@ export function AdminTransactions() {
             <Button
               className="bg-red-600 hover:bg-red-700 text-white"
               onClick={handleReject}
-              disabled={actionLoading === rejectId}
+              disabled={actionLoading === `${rejectId}:reject`}
             >
-              {actionLoading === rejectId ? (
+              {actionLoading === `${rejectId}:reject` ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
               ) : (
                 <X className="h-4 w-4 me-1.5" />
@@ -371,7 +633,7 @@ export function AdminTransactions() {
         </DialogContent>
       </Dialog>
 
-      {/* Receipt Preview Dialog */}
+      {/* Receipt Preview Dialog (manual payments only) */}
       <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
         <DialogContent className="sm:max-w-2xl">
           <DialogHeader>

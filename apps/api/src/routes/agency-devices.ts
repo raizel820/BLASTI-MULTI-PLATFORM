@@ -7,6 +7,9 @@ import { recordSyncChange } from '../lib/sync-helpers'
 import crypto from 'crypto'
 import { validateBody, kioskJoinSchema } from '../lib/validations'
 import { emitQueueEvent, emitKioskEvent, emitAgencyDeviceEvent } from '../lib/realtime-emit'
+// Task 2-a — device walk-in joins create reservations → invalidate cached
+// public GETs that expose reservation-derived numbers.
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 import {
   enforceRateLimit,
   KIOSK_RATE_LIMIT,
@@ -502,6 +505,9 @@ app.post('/public/join-queue', async (c) => {
 
     emitQueueEvent('queue:walk-in', agencyId, queueEventData)
     emitKioskEvent(agencyId, kioskEventData)
+
+    // Task 2-a — device join is a reservation create.
+    invalidateResponseCacheTag('stats', 'agencies')
 
     // Fetch branch info if device is authenticated and has a branch
     let branchName: string | null = null

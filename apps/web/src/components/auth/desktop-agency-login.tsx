@@ -24,7 +24,7 @@
  *    agency-only on desktop.
  */
 
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { apiFetch } from '@/lib/api-fetch'
 import { apiClient, setNativeSessionToken } from '@/lib/api-client'
@@ -35,12 +35,27 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { LanguageSwitcher } from '@/components/shared/language-switcher'
 import { ThemeToggle } from '@/components/shared/theme-toggle'
+// Task 2-b (sub-tasks 1+3) — remember-me persistence policy: the mode is
+// recorded BEFORE the token is stored so every surface (zustand persist,
+// token mirrors, main-process auth file) honors the same decision.
+// Task 2-b-2 (sub-task 1) — the checkbox also PRE-SHOWS the last choice.
+import { setSessionPersistenceMode, getLastRememberChoice } from '@/lib/auth-storage'
 import { NativeServerStatus } from './native-server-status'
 import {
   Eye, EyeOff, Loader2, Building2, Users, MonitorPlay, CloudOff,
-  ShieldCheck, ArrowLeft,
+  ShieldCheck, ArrowLeft, RefreshCw,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { motion } from 'framer-motion'
@@ -101,6 +116,9 @@ const COPY = {
     sendReset: 'Send reset token',
     resetSent: 'Reset token sent successfully',
     desktopBadge: 'Desktop app',
+    // Task 2-b-2 (sub-task 3) — the full-sync consent strings moved to the
+    // shared i18n dictionaries (desktopSyncConsent*) so FR + RTL come free
+    // via t() instead of the previous hardcoded AR/EN-only COPY entries.
   },
 } as const
 
@@ -126,11 +144,24 @@ export function DesktopAgencyLogin() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [rememberMe, setRememberMe] = useState(false)
+  // Task 2-b-2 (sub-task 1) — pre-show the last "Remember me" choice. The
+  // hint lives in localStorage ('blasti-remember-me-last', written by
+  // setSessionPersistenceMode at every login) and is read AFTER mount so the
+  // SSR/hydration pass is never mismatched. Web browsers that never went
+  // through setSessionPersistenceMode simply keep the unchecked default.
+  useEffect(() => {
+    try { setRememberMe(getLastRememberChoice()) } catch { /* storage unavailable */ }
+  }, [])
   const [loading, setLoading] = useState(false)
   const [showPassword, setShowPassword] = useState(false)
   const [shakeError, setShakeError] = useState(false)
   const [formError, setFormError] = useState<string | null>(null)
   const [loginSuccess, setLoginSuccess] = useState(false)
+
+  // Task 2-b (sub-task 4) — full-sync consent dialog, shown right after a
+  // successful username/password login (Electron only, before navigating to
+  // the console so the component hosting the dialog stays mounted).
+  const [showSyncConsent, setShowSyncConsent] = useState(false)
 
   // Forgot-password subview state (same endpoints as the shared form)
   const [authView, setAuthView] = useState<'login' | 'forgot-password' | 'verify'>('login')
@@ -203,16 +234,23 @@ export function DesktopAgencyLogin() {
         setTimeout(() => {
           setUser(data.user)
           if (data.token) {
-            setSessionToken(data.token)
+            // Task 2-b (sub-task 3) — REMEMBER-ME ENFORCEMENT (desktop):
+            // record the persistence mode FIRST so the store's partialize
+            // gate + token mirrors + main-process auth file all honor the
+            // SAME decision. Unchecked → nothing durable survives a restart
+            // (fresh login required); checked → the durable session copies
+            // are written.
+            try { setSessionPersistenceMode(rememberMe ? 'remember' : 'ephemeral') } catch { /* ignore */ }
+            setSessionToken(data.token, { rememberMe })
             // ── Electron: establish the local API session for LAN failover ──
             try {
               const w = window as any
               const isElectron = navigator.userAgent.includes('Electron') || !!w.electronAPI
               if (isElectron) {
                 // Native session key so EVERY token consumer reads it deterministically
+                // (Task 2-b: routed through auth-storage — durable vs ephemeral
+                // storage is decided by the remember-me mode set above).
                 setNativeSessionToken(data.token)
-                // buildAuthHeaders() fallback for local API requests
-                try { localStorage.setItem('blasti-local-api-token', data.token) } catch { /* ignore */ }
                 // HTTP import-session backup (IPC bridge may not be enough).
                 // Task 37-a: adopt the refreshed user the local API returns
                 // after its cloud validation so the persisted user (and its
@@ -242,6 +280,18 @@ export function DesktopAgencyLogin() {
           }
           toast.success(t('loginSuccess'))
           setLoginSuccess(false)
+          // Task 2-b (sub-task 4) — after a REAL username/password login the
+          // desktop offers the full data sync (consent dialog) BEFORE entering
+          // the console. The dialog navigates on answer; non-Electron callers
+          // navigate straight away (unchanged behavior).
+          try {
+            const w = window as any
+            const isElectron = navigator.userAgent.includes('Electron') || !!w.electronAPI
+            if (isElectron && data.token) {
+              setShowSyncConsent(true)
+              return
+            }
+          } catch { /* ignore */ }
           navigateToConsole()
         }, 600)
       } else {
@@ -293,17 +343,20 @@ export function DesktopAgencyLogin() {
     }
     setLoginSuccess(true)
     setTimeout(() => {
+      // Task 2-b (sub-task 3) — same remember-me enforcement as the direct
+      // login path (the checkbox on the sign-in form owns the decision).
+      try { setSessionPersistenceMode(rememberMe ? 'remember' : 'ephemeral') } catch { /* ignore */ }
       setUser(result.user as any)
-      setSessionToken(result.token)
+      setSessionToken(result.token, { rememberMe })
       // ── Electron: establish the local API session for LAN failover ──
       try {
         const w = window as any
         const isElectron = navigator.userAgent.includes('Electron') || !!w.electronAPI
         if (isElectron) {
           // Native session key so EVERY token consumer reads it deterministically
+          // (Task 2-b: durable vs ephemeral storage follows the mode set above;
+          // the local-api token mirror is written by the store via auth-storage).
           setNativeSessionToken(result.token)
-          // buildAuthHeaders() fallback for local API requests
-          try { localStorage.setItem('blasti-local-api-token', result.token) } catch { /* ignore */ }
           // HTTP import-session backup (IPC bridge may not be enough).
           // apiFetch responses carry no url — same behavior as the login path.
           // Task 37-a: adopt the refreshed user the local API returns.
@@ -329,8 +382,48 @@ export function DesktopAgencyLogin() {
       toast.success(t('loginSuccess'))
       setVerificationData(null)
       setLoginSuccess(false)
+      // Task 2-b (sub-task 4) — the verification-completed session is ALSO a
+      // fresh username/password login → offer the full-sync consent dialog.
+      try {
+        const w = window as any
+        const isElectron = navigator.userAgent.includes('Electron') || !!w.electronAPI
+        if (isElectron) {
+          setShowSyncConsent(true)
+          return
+        }
+      } catch { /* ignore */ }
       navigateToConsole()
     }, 600)
+  }
+
+  /**
+   * Task 2-b (sub-task 4) — the user answered the full-sync consent dialog.
+   * "Sync now" runs the FULL reconciliation path (outbox replay + pull from
+   * sequence 0 + record-level reconcile) through the new sync:full-now IPC;
+   * "Not now" skips — the incremental engine keeps its 30s cycle untouched.
+   * Either way the login flow finishes by navigating to the console.
+   */
+  const handleSyncConsent = (syncNow: boolean) => {
+    setShowSyncConsent(false)
+    if (syncNow) {
+      try {
+        const w = window as any
+        if (w.electronAPI?.fullSyncNow) {
+          w.electronAPI.fullSyncNow()
+            .then((res: any) => {
+              console.log('[DesktopLogin] Full sync result:', res && res.success ? 'started/ok' : (res && res.error) || 'unavailable')
+            })
+            .catch(() => { /* non-critical — incremental sync continues */ })
+          toast.success(t('desktopSyncConsentStarted'))
+        } else if (w.electronAPI?.initialCloudSync) {
+          // Older main.js without sync:full-now — fall back to the initial
+          // import trigger (idempotent; READY workspaces just start the engine).
+          w.electronAPI.initialCloudSync().catch(() => { /* non-critical */ })
+          toast.success(t('desktopSyncConsentStarted'))
+        }
+      } catch { /* never block navigation on the sync bridge */ }
+    }
+    navigateToConsole()
   }
 
   // Verification token expired/invalid → back to the sign-in view (a fresh
@@ -639,6 +732,39 @@ export function DesktopAgencyLogin() {
           BLASTI · {c.consoleTitle} · {new Date().getFullYear()}
         </footer>
       </main>
+
+      {/* ── Task 2-b (sub-task 4): full-sync consent dialog (post-login) ── */}
+      <AlertDialog
+        open={showSyncConsent}
+        onOpenChange={(open) => {
+          // Closing the dialog by any means other than the two buttons
+          // (Esc, overlay click) counts as "Not now" — the login flow must
+          // always finish by entering the console.
+          if (!open) handleSyncConsent(false)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              <RefreshCw className="h-5 w-5 text-emerald-600" aria-hidden="true" />
+              {t('desktopSyncConsentTitle')}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('desktopSyncConsentBody')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => handleSyncConsent(false)}>{t('desktopSyncConsentNotNow')}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => handleSyncConsent(true)}
+              className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white"
+            >
+              <RefreshCw className="h-4 w-4" aria-hidden="true" />
+              {t('desktopSyncConsentNow')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

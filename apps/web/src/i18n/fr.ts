@@ -3800,6 +3800,75 @@ const fr: Record<TranslationKeys, string> = {
   settingsSystemConfigDesc: "Paramètres système dynamiques en base de données (clés chiffrées comprises)",
   settingsBackToOverview: "Retour à la vue d\u2019ensemble",
 
+  // ─── Task 2-c: admin transactions — online (Chargily) payments ──────────
+  txTypeAll: "Tous les types",
+  txTypeManual: "Manuel",
+  txTypeOnline: "En ligne (Chargily)",
+  txBadgeManual: "Manuel",
+  txBadgeOnline: "En ligne",
+  txGatewayRef: "Réf. passerelle",
+  txPayer: "Payeur",
+  txSubscriptionPayment: "Abonnement",
+  txHardwarePayment: "Matériel",
+  txVerifyWithGateway: "Vérifier auprès de la passerelle",
+  txVerifying: "Vérification auprès de la passerelle...",
+  txMarkSettled: "Confirmer le règlement",
+  txMarkFailed: "Marquer échoué",
+  txGatewayOwned: "Géré par la passerelle de paiement — approbation/refus désactivés ici",
+  txVerifyPending: "Passerelle : en attente",
+  txVerifyPaid: "Paiement confirmé par la passerelle — règlement appliqué",
+  txVerifyFailed: "Passerelle : échoué — état mis à jour",
+  txGatewayUnreachable: "Passerelle de paiement injoignable",
+  txOverrideApplied: "Correction manuelle appliquée (passerelle injoignable)",
+  txRefusedPending: "La passerelle signale toujours « en attente » — action refusée",
+  txReconciled: "Réconcilié",
+
+  // ─── Task 2-c: manual full sync (agency + customer settings) ────────────
+  fullSyncTitle: "Synchronisation complète des données",
+  fullSyncDesc: "Supprime toutes les données locales en cache (sauf votre session de connexion), puis retélécharge tout depuis le serveur.",
+  fullSyncButton: "Demander une synchronisation complète",
+  fullSyncConfirmTitle: "Resynchroniser complètement ?",
+  fullSyncConfirmBody: "Cela efface la base locale et les caches (historique des tickets hors ligne, images, fichiers temporaires), puis retélécharge toutes les données depuis le serveur. L'application redémarre automatiquement.",
+  fullSyncKeepSession: "Votre session de connexion est conservée.",
+  fullSyncConfirm: "Effacer et resynchroniser",
+  fullSyncSyncing: "Retéléchargement de toutes les données...",
+
+  // ─── Task 2-b-2: desktop post-login full-sync consent dialog ────────────
+  desktopSyncConsentTitle: "Synchronisation complète des données",
+  desktopSyncConsentBody: "Une synchronisation complète des données de votre agence (files d'attente, réservations, paramètres) est recommandée maintenant. La synchronisation incrémentale continue également en arrière-plan.",
+  desktopSyncConsentNow: "Synchroniser maintenant",
+  desktopSyncConsentNotNow: "Pas maintenant",
+  desktopSyncConsentStarted: "Synchronisation complète lancée — elle se poursuit en arrière-plan",
+
+  // ─── Task 2-c: storage manager navigation ───────────────────────────────
+  storageFlatView: "Tous les fichiers",
+  storageTreeView: "Dossiers",
+  storageFolderCol: "Dossier",
+  storageSortBy: "Trier",
+  storageSortName: "Nom",
+  storageSortDate: "Date",
+  storageSortSize: "Taille",
+  storageSortType: "Type",
+  storageSortAsc: "Croissant",
+  storageSortDesc: "Décroissant",
+  storageDownloadStarted: "Téléchargement lancé",
+  storageDownloadFailed: "Échec du téléchargement",
+
+  // ─── Task 2-c: installer version tracker (live multi-version listing) ───
+  installerFilesTitle: "Fichiers d'installation sur le serveur",
+  installerFilesDesc: "Chaque build poussé est lu en direct depuis le stockage — les rebuilds du même nom apparaissent chacun avec leur heure d'envoi.",
+  installerPushedAt: "Poussé le",
+  installerActiveFile: "Actif",
+  installerDraftFile: "Brouillon",
+  installerUnmatched: "Non activé",
+  installerActivateFile: "Activer ce fichier",
+  installerActivateConfirmTitle: "Activer ce fichier exact ?",
+  installerActivateConfirmBody: "Le téléchargement public de {platform} pointera vers ce build exact (poussé le {time}). Tout autre build de la même plateforme sera dépublié.",
+  installerNoFiles: "Aucun fichier d'installation sur le serveur",
+  installerGroupFlat: "Ancien (racine)",
+  installerActivating: "Activation...",
+  installerUnknownPlatform: "Plateforme inconnue",
+
 };
 
 export default fr;

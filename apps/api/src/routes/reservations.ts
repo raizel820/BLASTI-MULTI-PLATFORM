@@ -8,6 +8,10 @@ import { calculateETA, getEffectiveServiceTime, filterImmediateServiceWindow } f
 import type { ETAResult } from '../lib/eta-calculator'
 import { z } from 'zod'
 import { recordSyncChange, recordSyncChangeNow } from '../lib/sync-helpers'
+// Task 2-a — reservation-state mutations invalidate the cached public GETs
+// that expose reservation-derived numbers (/api/stats, /api/agencies
+// waitingCount). Mutations themselves are never cached (GET-only layers).
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 
 const app = new Hono()
 
@@ -233,6 +237,9 @@ app.post('/', async (c) => {
 
       return res
     })
+
+    // Task 2-a — a new ticket changes the numbers the cached public GETs show.
+    invalidateResponseCacheTag('stats', 'agencies')
 
     emitQueueEvent('queue:joined', agencyId, { reservationId: reservation.id, displayNumber: reservation.displayNumber, userId, serviceId: resolvedServiceId, estimatedWait })
     emitKioskEvent(agencyId, { action: 'app-join', displayNumber: reservation.displayNumber, serviceId: resolvedServiceId })
@@ -554,6 +561,9 @@ app.post('/reclaim', async (c) => {
     emitReservationEvent('reservation:updated', reservation.agencyId, reservation.userId ?? undefined, { reservationId: reservation.id, displayNumber: reservation.displayNumber, action: 'reclaimed' })
     emitQueueEvent('queue:updated', reservation.agencyId, { reservationId: reservation.id, displayNumber: reservation.displayNumber, action: 'reclaimed' })
 
+    // Task 2-a — reclaim moves a ticket back into the callable set.
+    invalidateResponseCacheTag('stats', 'agencies')
+
     return c.json({ success: true })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -593,6 +603,9 @@ app.delete('/cancel-active', async (c) => {
     emitReservationEvent('reservation:cancelled', updated.agencyId, userId, { reservationId: updated.id, displayNumber: updated.displayNumber, agencyId: updated.agencyId })
     emitQueueEvent('queue:updated', updated.agencyId, { reservationId: updated.id, displayNumber: updated.displayNumber, action: 'cancelled' })
     emitKioskEvent(updated.agencyId, { action: 'reservation-cancelled', displayNumber: updated.displayNumber })
+
+    // Task 2-a — cancel removes a ticket from the waiting set.
+    invalidateResponseCacheTag('stats', 'agencies')
 
     return c.json({ success: true, reservation: updated })
   } catch (error: unknown) {
@@ -665,6 +678,9 @@ app.post('/batch-complete', async (c) => {
     for (const merged of mergedReservations) {
       emitKioskEvent(resolvedAgencyId, { action: 'reservation-completed', displayNumber: merged.displayNumber })
     }
+
+    // Task 2-a — batch completion drains the waiting set.
+    invalidateResponseCacheTag('stats', 'agencies')
 
     return c.json({ success: true, updatedCount: results.count })
   } catch (error: unknown) {
@@ -901,6 +917,9 @@ app.post('/:id/postpone', async (c) => {
     emitReservationEvent('reservation:updated', reservation.agencyId, reservation.userId ?? undefined, { reservationId: id, displayNumber: reservation.displayNumber, action: 'postponed', positions, newQueueNumber: updated.queueNumber })
     emitQueueEvent('queue:position-changed', reservation.agencyId, { reservationId: id, displayNumber: reservation.displayNumber, action: 'postponed', positions })
 
+    // Task 2-a — postpone re-orders the waiting set.
+    invalidateResponseCacheTag('stats', 'agencies')
+
     return c.json({ success: true, reservation: updated })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -1132,6 +1151,9 @@ app.post('/:id/cancel', async (c) => {
     emitQueueEvent('queue:updated', reservation.agencyId, { reservationId: id, displayNumber: reservation.displayNumber, action: 'cancelled' })
     emitKioskEvent(reservation.agencyId, { action: 'reservation-cancelled', displayNumber: reservation.displayNumber })
 
+    // Task 2-a — customer-side cancel removes a ticket from the waiting set.
+    invalidateResponseCacheTag('stats', 'agencies')
+
     return c.json({ success: true })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -1239,6 +1261,9 @@ app.put('/:id/status', async (c) => {
     if (['CALLED', 'COMPLETED', 'NO_SHOW', 'CANCELLED'].includes(status)) {
       emitKioskEvent(reservation.agencyId, { action: `reservation-${status.toLowerCase()}`, displayNumber: reservation.displayNumber })
     }
+
+    // Task 2-a — status transitions change every reservation-derived count.
+    invalidateResponseCacheTag('stats', 'agencies')
 
     return c.json({ success: true, reservation: updatedReservation })
   } catch (error: unknown) {

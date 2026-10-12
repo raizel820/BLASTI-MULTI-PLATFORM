@@ -39,6 +39,34 @@ function isNativeShell(): boolean {
 // cycles); sync.ts does not statically import this store (dynamic import only).
 import { clearRevoked } from '@/lib/authz-state';
 import { syncEngine } from '@/db/sync';
+// Task 2-b (sub-task 1/3) — remember-me persistence policy + the single home
+// for every renderer token surface. auth-storage never imports this store
+// (it reads/writes raw localStorage JSON), so the dependency stays one-way.
+import {
+  isSessionEphemeral,
+  storeSessionToken,
+  purgeAuthState,
+} from '@/lib/auth-storage';
+
+/**
+ * Task 2-b — DESKTOP remember-me gate for the persisted store.
+ *
+ * In Electron, a login WITHOUT "Remember me" must leave NOTHING durable
+ * behind: the persisted zustand JSON is written on every state change, so
+ * partialize drops the auth fields while the session is ephemeral (the
+ * in-memory state is untouched — only what survives a restart is gated).
+ * Web browsers keep the historic always-persist behavior.
+ */
+function shouldOmitPersistedAuth(): boolean {
+  if (typeof window === 'undefined') return false;
+  const isElectron = !!(window as any).electronAPI || navigator.userAgent.includes('Electron');
+  if (!isElectron) return false;
+  try {
+    return isSessionEphemeral();
+  } catch {
+    return false;
+  }
+}
 
 export type UserRole = 'CUSTOMER' | 'AGENCY_STAFF' | 'AGENCY_OWNER' | 'SUPER_ADMIN';
 export type ViewName =
@@ -196,7 +224,13 @@ interface AppState {
 
   // Actions
   setUser: (user: UserState | null) => void;
-  setSessionToken: (token: string) => void;
+  /**
+   * Task 2-b (sub-tasks 3+4) — `opts.rememberMe` (desktop only) is forwarded
+   * to the Electron main process with cloud-sync:set-auth so blasti-auth.json
+   * is persisted ONLY for remember-me logins. Omitting it keeps the historic
+   * behavior (durable auth file) for non-desktop callers.
+   */
+  setSessionToken: (token: string, opts?: { rememberMe?: boolean }) => void;
   setAgencyAuthority: (authority: AgencyAuthorityState | null) => void;
   setView: (view: ViewName) => void;
   goBack: () => void;
@@ -574,7 +608,7 @@ export const useAppStore = create<AppState>()(
       agencyProfileId: null,
       branchProfileId: null,
 
-      setSessionToken: (token) => {
+      setSessionToken: (token, opts) => {
         // Task 33-E — fresh auth re-enables everything the revocation guards
         // locked: clear the persisted revoked flag, resume the sync engine's
         // periodic loop (after a 401/403 pause), and drop the pull cursor so
@@ -582,12 +616,25 @@ export const useAppStore = create<AppState>()(
         clearRevoked();
         syncEngine.clearSyncCursor();
         syncEngine.resumeAfterAuth();
+        // Task 2-b (sub-task 1) — ONE place writes the token mirrors
+        // (blasti-local-api-token + blasti-session-token), honoring the
+        // remember-me mode chosen at login (durable localStorage vs
+        // sessionStorage + quit/boot purge). Replaces the duplicated
+        // localStorage.setItem calls the login forms used to make.
+        try { storeSessionToken(token); } catch { /* storage unavailable */ }
         set({ sessionToken: token, agencyAuthority: null });
-        // Pass auth token to Electron main process for cloud sync
+        // Pass auth token to Electron main process for cloud sync.
+        // Task 2-b (sub-task 3): forward the remember-me decision so the main
+        // process can honor it (persist blasti-auth.json ONLY when checked,
+        // delete any previous durable copy when not).
         const w = window as any;
         const currentUser = useAppStore.getState().user;
         if (w.electronAPI?.setCloudSyncAuth) {
-          w.electronAPI.setCloudSyncAuth({ token, user: currentUser });
+          w.electronAPI.setCloudSyncAuth({
+            token,
+            user: currentUser,
+            ...(opts && typeof opts.rememberMe === 'boolean' ? { rememberMe: opts.rememberMe } : {}),
+          });
         }
         // CRITICAL: Also import session into the local API (port 3080)
         // so that when cloud goes down and LAN failover kicks in,
@@ -714,7 +761,9 @@ export const useAppStore = create<AppState>()(
         if (w.electronAPI?.clearLocalApiSession) {
           w.electronAPI.clearLocalApiSession();
         }
-        try { localStorage.removeItem('blasti-local-api-token'); } catch { /* ignore */ }
+        // Task 2-b (sub-task 1) — purge every token mirror through the single
+        // auth-storage surface (local-api token + native key, both storages).
+        try { purgeAuthState(); } catch { /* ignore */ }
         // Task 33-E — drop the sync pull cursor: the next login may be a
         // different account/agency, which must re-pull from sequence 0.
         // NOTE: the revoked flag is deliberately NOT cleared here — only a
@@ -739,9 +788,14 @@ export const useAppStore = create<AppState>()(
       // Bumped version to 3 to trigger clean rehydrate with fixed partialize
       version: 3,
       partialize: (state) => ({
-        user: state.user,
-        isAuthenticated: state.isAuthenticated,
-        sessionToken: state.sessionToken,
+        // Task 2-b (sub-task 3) — DESKTOP remember-me enforcement: while the
+        // session is ephemeral ("Remember me" unchecked) the persisted JSON
+        // carries logged-out auth values so a restart can never silently
+        // continue the old session. The in-memory store keeps the real state;
+        // only the durable copy is gated. Web browsers are unaffected.
+        ...(shouldOmitPersistedAuth()
+          ? { user: null, isAuthenticated: false, sessionToken: '' }
+          : { user: state.user, isAuthenticated: state.isAuthenticated, sessionToken: state.sessionToken }),
         // BUG FIX: Always persist the actual currentView, not 'landing' for unauthenticated users.
         // The previous code was `state.user ? state.currentView : 'landing'` which caused
         // the persist middleware to override view changes (e.g., navigating to login/register)
@@ -755,9 +809,15 @@ export const useAppStore = create<AppState>()(
         // Task 81 — app-open biometric gate + remember-me session policy
         // (the 3-day wall must survive app restarts to be a real wall).
         biometricOnAppOpen: state.biometricOnAppOpen,
-        rememberSession: state.rememberSession,
-        sessionStartedAt: state.sessionStartedAt,
-        lastSessionRefreshAt: state.lastSessionRefreshAt,
+        // Task 2-b (sub-task 3) — the remember-me window fields are AUTH state:
+        // an ephemeral session must not leave a remember marker behind either.
+        ...(shouldOmitPersistedAuth()
+          ? { rememberSession: false, sessionStartedAt: null, lastSessionRefreshAt: 0 }
+          : {
+              rememberSession: state.rememberSession,
+              sessionStartedAt: state.sessionStartedAt,
+              lastSessionRefreshAt: state.lastSessionRefreshAt,
+            }),
       }),
       // Deep merge with null safety — Phase 6b: sanitize persisted state to prevent
       // NaN/null/corrupted values from leaking into the live store.

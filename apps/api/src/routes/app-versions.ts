@@ -550,6 +550,263 @@ app.get('/:id/download', async (c) => {
   }
 })
 
+// ─── GET /app-versions/storage-files — LIVE installer file inventory (admin) ──
+//
+// Task: version tracker for rebuilt installers. GitHub Actions re-pushes an
+// installer with the SAME original filename after every rebuild — each push
+// lands as a NEW file on disk (the upload endpoint embeds Date.now() in the
+// storage key), while the AppVersion table keeps only the LATEST file per
+// platform+version. Reading the DB alone therefore HIDES every earlier build.
+//
+// This endpoint reads the ACTUAL files from the app-versions bucket LIVE on
+// every call (a readdir+stat of one folder is ms-cheap; intentionally NO
+// server cache — the user asked for live disk truth) and enriches each entry
+// with the AppVersion record that currently references it (if any):
+//
+//   • name / storageKey / group (desktop|mobile|flat) / size / mtimeMs —
+//     mtime is the PUSH TIME (CI writes the file at push time),
+//   • parsed platform + version from the upload naming convention
+//     `<platform>-<semver>-<ts>-<original-name>` ('android-debug' checked
+//     before 'android'; unknown naming → parsed=null),
+//   • version: { id, platform, version, isPublished, fileName } of the
+//     AppVersion row whose fileStorageKey points at this exact file.
+//
+// The UI groups by platform and lists EVERY occurrence sorted by push time
+// desc, so two rebuilds of the same filename appear as two distinct entries.
+
+app.get('/storage-files', async (c) => {
+  try {
+    await requireAdmin(c)
+    ensureUploadDir()
+
+    interface DiskFile {
+      storageKey: string
+      name: string
+      group: string
+      size: number
+      mtimeMs: number
+    }
+    const diskFiles: DiskFile[] = []
+
+    const root = path.resolve(UPLOAD_DIR)
+    const pushFile = async (abs: string, group: string) => {
+      try {
+        const st = await fs.promises.stat(abs)
+        if (!st.isFile()) return
+        diskFiles.push({
+          storageKey: group ? `${group}/${path.basename(abs)}` : path.basename(abs),
+          name: path.basename(abs),
+          group,
+          size: st.size,
+          mtimeMs: st.mtimeMs,
+        })
+      } catch { /* raced delete — skip */ }
+    }
+
+    let dirEntries: fs.Dirent[] = []
+    try {
+      dirEntries = await fs.promises.readdir(root, { withFileTypes: true })
+    } catch { /* bucket missing — empty list */ }
+
+    for (const e of dirEntries) {
+      if (e.isFile()) {
+        await pushFile(path.join(root, e.name), '') // legacy flat binaries
+      } else if (e.isDirectory()) {
+        let inner: fs.Dirent[] = []
+        try {
+          inner = await fs.promises.readdir(path.join(root, e.name), { withFileTypes: true })
+        } catch { continue }
+        for (const f of inner) {
+          if (f.isFile()) await pushFile(path.join(root, e.name, f.name), e.name)
+        }
+      }
+    }
+
+    // Enrich in ONE query: which AppVersion rows reference these exact keys?
+    const keys = diskFiles.map((f) => f.storageKey)
+    const rows = keys.length
+      ? await db.appVersion.findMany({
+          where: { fileStorageKey: { in: keys } },
+          select: { id: true, platform: true, version: true, isPublished: true, fileName: true, fileStorageKey: true },
+        })
+      : []
+    const byKey = new Map(rows.map((r) => [r.fileStorageKey as string, r]))
+
+    // Parse the CI/upload naming convention → platform + version.
+    const PLATFORMS_DESC = ['android-debug', 'android', 'ios', 'electron', 'windows', 'mac', 'linux']
+    // Extension/pattern fallback — classifies binaries that do not follow the
+    // `<platform>-<semver>-<ts>-<original>` storage-key convention (e.g. files
+    // copied onto disk manually). 'android-debug' must be checked before
+    // 'android' so a debug APK name containing "debug" wins.
+    const classifyByExtension = (name: string): string | null => {
+      const lower = name.toLowerCase()
+      if (lower.endsWith('.apk')) {
+        return lower.includes('debug') ? 'android-debug' : 'android'
+      }
+      if (lower.endsWith('.ipa')) return 'ios'
+      if (lower.endsWith('.exe') || lower.endsWith('.msi')) return 'windows'
+      if (lower.endsWith('.dmg') || lower.endsWith('.pkg')) return 'mac'
+      if (lower.endsWith('.appimage') || lower.endsWith('.deb') || lower.endsWith('.rpm') || lower.endsWith('.snap')) return 'linux'
+      if (lower.endsWith('.app.zip')) return 'mac'
+      return null
+    }
+    const parseKey = (key: string): { platform: string; version: string } | null => {
+      const base = key.includes('/') ? key.slice(key.indexOf('/') + 1) : key
+      for (const platform of PLATFORMS_DESC) {
+        if (!base.startsWith(`${platform}-`)) continue
+        const m = new RegExp(`^${platform}-(\\d+\\.\\d+\\.\\d+)-\\d+-.+$`).exec(base)
+        if (m) return { platform, version: m[1] }
+      }
+      return null
+    }
+
+    const files = diskFiles
+      .map((f) => {
+        const row = byKey.get(f.storageKey) ?? null
+        // Platform classification precedence: upload-name convention →
+        // linked AppVersion row → file-extension/pattern fallback.
+        const parsed = parseKey(f.storageKey)
+        const platform =
+          parsed?.platform ?? row?.platform ?? classifyByExtension(f.name) ?? null
+        return {
+          ...f,
+          parsed: parsed ?? (platform ? { platform, version: row?.version ?? '' } : null),
+          platform,
+          version: row
+            ? { id: row.id, platform: row.platform, version: row.version, isPublished: row.isPublished, fileName: row.fileName }
+            : null,
+        }
+      })
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+
+    return c.json({ success: true, files, uploadDir: UPLOAD_DIR })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── POST /app-versions/activate-file — activate the EXACT file on disk ─────
+//
+// Body: { storagePath: "<group>/<file>" | "<flat file>" }
+//
+// The version tracker lists every rebuild occurrence; this endpoint makes ONE
+// specific disk file (referenced by its FULL storage path — name + push
+// timestamp, never just the original filename) THE active version of its
+// platform: it repoints the platform+version's AppVersion record at that
+// exact file and runs the same publish/unpublish-siblings transaction as
+// POST /:id/activate. Unknown platform+version combos are created on the
+// fly (draft), mirroring the CI auto-create path.
+
+app.post('/activate-file', async (c) => {
+  try {
+    await requireAdmin(c)
+
+    const body = await c.req.json().catch(() => ({}))
+    const storagePath = typeof body?.storagePath === 'string' ? body.storagePath.trim() : ''
+    if (!storagePath) return c.json({ success: false, error: 'storagePath is required' }, 400)
+
+    // Traversal-safe resolution INSIDE the app-versions bucket only.
+    const root = path.resolve(UPLOAD_DIR)
+    const resolved = path.resolve(root, storagePath.replace(/\\/g, '/'))
+    if (!resolved.startsWith(root + path.sep)) {
+      return c.json({ success: false, error: 'Invalid storage path' }, 400)
+    }
+    const rel = path.relative(root, resolved).split(path.sep).join('/')
+    if (rel.split('/').length > 2 || rel.split('/').some((s) => s === '.' || s === '..')) {
+      return c.json({ success: false, error: 'Invalid storage path' }, 400)
+    }
+
+    let fileStat: fs.Stats
+    try {
+      fileStat = await fs.promises.stat(resolved)
+      if (!fileStat.isFile()) throw new Error('not a file')
+    } catch {
+      return c.json({ success: false, error: 'File not found on disk' }, 404)
+    }
+
+    // Identify platform + version: parse the upload naming convention first,
+    // then fall back to whichever AppVersion row already points at this file.
+    const PLATFORMS_DESC = ['android-debug', 'android', 'ios', 'electron', 'windows', 'mac', 'linux']
+    const base = rel.includes('/') ? rel.slice(rel.indexOf('/') + 1) : rel
+    let platform: string | null = null
+    let version: string | null = null
+    for (const p of PLATFORMS_DESC) {
+      if (!base.startsWith(`${p}-`)) continue
+      const m = new RegExp(`^${p}-(\\d+\\.\\d+\\.\\d+)-\\d+-.+$`).exec(base)
+      if (m) { platform = p; version = m[1] }
+      break
+    }
+    if (!platform || !version) {
+      const linked = await db.appVersion.findFirst({ where: { fileStorageKey: rel } })
+      if (linked) { platform = linked.platform; version = linked.version }
+    }
+    if (!platform || !version) {
+      return c.json({ success: false, error: 'Cannot determine platform/version from this file name — create the version record first' }, 400)
+    }
+
+    // Find-or-create the version record for this platform+version.
+    let record = await db.appVersion.findUnique({
+      where: { platform_version: { platform, version } },
+    })
+    if (!record) {
+      record = await db.appVersion.create({
+        data: { platform, version, versionCode: 0, releaseNotes: '', isPublished: false },
+      })
+    }
+
+    // Integrity hash — streamed so a 155 MB installer never buffers in RAM.
+    const hash = await new Promise<string>((resolve) => {
+      const h = crypto.createHash('sha256')
+      const stream = fs.createReadStream(resolved)
+      stream.on('data', (chunk) => h.update(chunk))
+      stream.on('error', () => resolve(''))
+      stream.on('end', () => resolve(h.digest('hex')))
+    })
+
+    // Recover the ORIGINAL installer filename from the storage key convention
+    // `<platform>-<version>-<ts>-<original>` — the tail after the timestamp.
+    const prefix = `${platform}-${version}-`
+    const originalName = base.startsWith(prefix)
+      ? base.slice(prefix.length).replace(/^\d+-/, '')
+      : base
+    await db.appVersion.update({
+      where: { id: record.id },
+      data: {
+        fileStorageKey: rel,
+        fileStorageProvider: 'local',
+        fileName: originalName,
+        fileSize: fileStat.size,
+        ...(hash ? { fileHash: hash } : {}),
+        downloadUrl: `/api/app-versions/${record.id}/download`,
+      },
+    })
+
+    // Same publish semantics as POST /:id/activate — exactly one public
+    // installer per platform.
+    const activated = await db.$transaction(async (tx) => {
+      await tx.appVersion.updateMany({
+        where: { platform, id: { not: record!.id } },
+        data: { isPublished: false },
+      })
+      return tx.appVersion.update({
+        where: { id: record.id },
+        data: {
+          isPublished: true,
+          publishedAt: record.publishedAt ?? new Date(),
+        },
+      })
+    })
+
+    invalidateResponseCacheTag('app-versions')
+
+    return c.json({ success: true, activatedFile: rel, version: activated })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 // ─── GET /app-versions/:id — Get a single app version ───────────────────────
 
 app.get('/:id', async (c) => {

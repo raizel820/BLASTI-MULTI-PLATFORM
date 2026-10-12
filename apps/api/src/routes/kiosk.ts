@@ -6,6 +6,9 @@ import { emitQueueEvent, emitKioskEvent } from '../lib/realtime-emit'
 import { enforceRateLimit, KIOSK_RATE_LIMIT, KIOSK_READ_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
 import { calculateETA, getEffectiveServiceTime, filterGhostTickets } from '../lib/eta-calculator'
 import { recordSyncChange } from '../lib/sync-helpers'
+// Task 2-a — kiosk joins create reservations → invalidate cached public GETs
+// that expose reservation-derived numbers (/api/stats, /api/agencies).
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 
 const app = new Hono()
 
@@ -114,6 +117,9 @@ app.post('/join', async (c) => {
 
     emitQueueEvent('queue:walk-in', agencyId, { reservationId: reservation.id, displayNumber: reservation.displayNumber, customerName: customerName || 'Anonymous', serviceId, estimatedWait })
     emitKioskEvent(agencyId, { action: 'kiosk-join', displayNumber: reservation.displayNumber })
+
+    // Task 2-a — kiosk join is a reservation create.
+    invalidateResponseCacheTag('stats', 'agencies')
 
     if (clientIp) recordSuccessfulRequest(clientIp)
     return c.json({ success: true, reservation: { id: reservation.id, ticketNumber: reservation.displayNumber, position, estimatedWaitMinutes: estimatedWait, importToken: reservation.importToken } }, 201)
