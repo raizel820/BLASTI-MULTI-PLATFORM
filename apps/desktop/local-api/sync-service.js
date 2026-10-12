@@ -2377,14 +2377,19 @@ function _setupSocket() {
     var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
     // Task 77: reconnect fast after network blips / sleep-wake. The old
     // 1s→30s backoff could leave the desktop realtime-blind for up to 30s
-    // after a flaky moment; 0.5s→5s recovers in ~1s typical, and the
-    // staleness watchdog below remains the stuck-state backstop.
+    // after a flaky moment. Connection-stability round: 1s→15s ceiling (was
+    // 0.5s→5s) — 0.5s reconnect attempts during a server restart or network
+    // flap produced reconnect storms (hundreds of attempts hammering the
+    // cloud while it was down, then a burst of handshakes the moment it
+    // recovered). A 1s start still feels instant on a normal blip; the 15s
+    // ceiling keeps the storm bounded. The staleness watchdog below remains
+    // the stuck-state backstop.
     _socket = io(_config.cloudBaseUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionAttempts: Infinity,
-      reconnectionDelay: 500,
-      reconnectionDelayMax: 5000,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 15000,
       timeout: 10000,
       auth: { token: _authToken },
     });

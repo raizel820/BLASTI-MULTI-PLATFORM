@@ -365,6 +365,17 @@ app.use('/api/*', async (c, next) => {
   const path = c.req.path
   const method = c.req.method
 
+  // Connection-stability round: liveness probes are NEVER rate limited —
+  // every client (web banner, desktop engine probe, mobile shell, uptime
+  // monitors) hammers /api/health, and venues share one egress IP. Even with
+  // the general tier sized for many-devices-per-IP, a handful of pollers
+  // could otherwise 429 the entire venue. (Rate-limit exemption only — the
+  // data-usage recorder above has its own, wider skip list.)
+  if (path === '/api/health') {
+    await next()
+    return
+  }
+
   // Get client IP using the existing rate-limit utility.
   // Priority: x-connecting-ip (injected by server) → x-forwarded-for → x-real-ip
   const ip = getClientIp(c)
@@ -384,12 +395,15 @@ app.use('/api/*', async (c, next) => {
     throw error
   }
 
-  // Apply global rate limit: 100 req/min per IP for all API routes
+  // Apply global rate limit: 300 req/min per IP for all API routes.
+  // (Connection-stability round: 100→300 — venues run MANY devices behind
+  // one egress IP (kiosks + staff tablets + customer phones on venue Wi-Fi),
+  // so the per-IP bucket must be sized for the venue, not the device.)
   try {
     checkRateLimit(ip, GENERAL_RATE_LIMIT)
   } catch (error) {
     if (error instanceof RateLimitError) {
-      console.warn(`[RATE-LIMIT] Rate limited: ${ip} on ${method} ${path} (global: 100/min)`)
+      console.warn(`[RATE-LIMIT] Rate limited: ${ip} on ${method} ${path} (global: 300/min)`)
       return c.json(
         { success: false, error: error.message, retryAfter: error.retryAfter },
         429,
@@ -1119,8 +1133,13 @@ io = new SocketIOServer(httpServer, {
     methods: ['GET', 'POST'],
     credentials: true,
   },
-  pingInterval: 10000,
-  pingTimeout: 5000,
+  // Connection-stability round: the old 10s/5s heartbeat raced slow links and
+  // mobile networks — one missed 10s ping + 5s grace killed the socket and
+  // forced a full reconnect (often mid-transaction). 25s/20s matches the
+  // engine.io defaults and survives transient blips; genuinely dead peers
+  // are still reaped within ~45s.
+  pingInterval: 25000,
+  pingTimeout: 20000,
   allowUpgrades: true,
   maxHttpBufferSize: 1e6,
   // Phase 1b: Allow unauthenticated connections but track auth state

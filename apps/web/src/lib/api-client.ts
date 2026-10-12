@@ -951,10 +951,14 @@ export class ApiClient {
     // long timeout so uploads on slow links are never cut short.
     const maxRetries = options?.retries
       ?? (isElectronRuntime() ? 0 : (method === 'GET' ? 1 : this.config.retries));
-    // In Electron, use a shorter timeout (5s) so cloud failures are detected quickly
-    // and LAN failover kicks in without a long wait.
+    // In Electron, use a shorter-than-default timeout so cloud failures are
+    // detected quickly and LAN failover kicks in. Connection-stability round:
+    // 12s (was 5s) — the renderer request is proxied through the local API
+    // whose own upstream budget is ~10s; a 5s renderer timeout aborted
+    // requests that were still being served, producing spurious "cloud
+    // unreachable" flaps right when the API was merely slow.
     const timeoutMs = options?.timeout
-      ?? (isElectronRuntime() ? 5_000 : (method === 'GET' ? 10_000 : this.config.timeout));
+      ?? (isElectronRuntime() ? 12_000 : (method === 'GET' ? 10_000 : this.config.timeout));
     // Re-resolve the base URL PER REQUEST (not per construction): the Capacitor
     // runtime resolver finishes asynchronously after module load, and the
     // singleton's frozen config.baseUrl would otherwise keep pointing at the
