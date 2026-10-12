@@ -126,8 +126,10 @@ interface InstallerDiskFile {
   /** Platform classification (name convention → linked row → extension). */
   platform?: string | null;
   parsed?: { platform: string; version: string } | null;
-  /** AppVersion row currently pointing at this exact file (if any). */
-  version?: { id: string; platform: string; version: string; isPublished: boolean; fileName: string | null } | null;
+  /** AppVersion row currently pointing at this exact file (if any).
+   *  fileSize travels with it so the UI can enforce the EXACT identity
+   *  (name + push time + byte size) for the Active badge. */
+  version?: { id: string; platform: string; version: string; isPublished: boolean; fileName: string | null; fileSize: number | null } | null;
 }
 
 // ─── Constants ─────────────────────────────────────────────────────
@@ -1257,7 +1259,14 @@ export function AdminAppSettings() {
                       </Badge>
                     </div>
                     {group.files.map((file) => {
-                      const isActive = !!file.version?.isPublished;
+                      const isActive =
+                        // Active identity is EXACT (user requirement): the
+                        // linked AppVersion row must be published AND match
+                        // this file occurrence by full storage key with an
+                        // EXACT byte-size check — same-name/same-size
+                        // rebuilds with a different push date/time never
+                        // display as active.
+                        !!file.version?.isPublished && file.version.fileSize === file.size;
                       const activating = activatingFileKey === file.storageKey;
                       return (
                         <div
@@ -1279,6 +1288,11 @@ export function AdminAppSettings() {
                               </span>
                               <span dir="ltr">{formatPushedAt(file.mtimeMs, lang)}</span>
                               <span>· {formatFileSize(file.size)}</span>
+                              {isActive && (
+                                <span dir="ltr" className="font-mono" title={t('installerExactBytes')}>
+                                  · {file.size.toLocaleString(lang === 'ar' ? 'ar-EG' : lang === 'fr' ? 'fr-FR' : 'en-US')} B
+                                </span>
+                              )}
                               {file.parsed?.version && <span>· v{file.parsed.version}</span>}
                               {file.group === '' && <span>· {t('installerGroupFlat')}</span>}
                             </div>

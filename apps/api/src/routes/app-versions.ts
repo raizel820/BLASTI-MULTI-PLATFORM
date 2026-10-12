@@ -623,11 +623,14 @@ app.get('/storage-files', async (c) => {
     }
 
     // Enrich in ONE query: which AppVersion rows reference these exact keys?
+    // fileSize is included so the UI can verify the ACTIVE identity by EXACT
+    // byte size (same-name/same-size rebuilds with a different push time must
+    // never display as active — user requirement).
     const keys = diskFiles.map((f) => f.storageKey)
     const rows = keys.length
       ? await db.appVersion.findMany({
           where: { fileStorageKey: { in: keys } },
-          select: { id: true, platform: true, version: true, isPublished: true, fileName: true, fileStorageKey: true },
+          select: { id: true, platform: true, version: true, isPublished: true, fileName: true, fileStorageKey: true, fileSize: true },
         })
       : []
     const byKey = new Map(rows.map((r) => [r.fileStorageKey as string, r]))
@@ -673,7 +676,7 @@ app.get('/storage-files', async (c) => {
           parsed: parsed ?? (platform ? { platform, version: row?.version ?? '' } : null),
           platform,
           version: row
-            ? { id: row.id, platform: row.platform, version: row.version, isPublished: row.isPublished, fileName: row.fileName }
+            ? { id: row.id, platform: row.platform, version: row.version, isPublished: row.isPublished, fileName: row.fileName, fileSize: row.fileSize }
             : null,
         }
       })

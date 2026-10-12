@@ -774,15 +774,126 @@ app.delete('/file', async (c) => {
       const res = await db.fileAsset.updateMany({ where: { storagePath, deletedAt: null }, data: { deletedAt: new Date() } })
       dbUpdated = res.count
     } catch { /* row may not exist */ }
+    // Cascade (this round): an AppVersion record that PUBLISHES this exact
+    // file must not outlive it — deactivate it so the platform falls back to
+    // "available"/draft in Public Apps Settings, while the live installer
+    // tracker keeps listing sibling same-name builds (they are distinct
+    // files with different push date/time and/or byte size). Identity is the
+    // full storage key (name + embedded push timestamp), so ONLY the deleted
+    // occurrence is deactivated — never its same-name siblings.
+    let appVersionsDeactivated = 0
+    const deletedBucket = storagePath.split('/')[0] || ''
+    if (unlinked && deletedBucket === 'app-versions') {
+      try {
+        // PATH-CONVENTION NORMALIZATION: the storage manager addresses files
+        // relative to STORAGE_ROOT ("app-versions/<key>") while
+        // AppVersion.fileStorageKey is relative to the app-versions bucket
+        // itself ("<key>" — e.g. "desktop/<file>" or flat legacy names).
+        // Strip the bucket prefix or the cascade would never match.
+        const avKey = storagePath.slice('app-versions/'.length)
+        const res = await db.appVersion.updateMany({
+          where: { fileStorageKey: avKey, isPublished: true },
+          data: { isPublished: false, publishedAt: null },
+        })
+        appVersionsDeactivated = res.count
+      } catch { /* no rows / table unavailable — tracker self-corrects via key match */ }
+    }
     // Task 2-c-2 — cache-tag invalidation after the mutation: deleting an
     // app-versions installer changes what the CACHED public listing
     // /api/app-versions/public/active (60s TTL, tag 'app-versions') reports
     // (file size/availability), so drop those entries immediately.
-    const deletedBucket = storagePath.split('/')[0] || ''
     if ((unlinked || dbUpdated > 0) && deletedBucket === 'app-versions') {
       invalidateResponseCacheTag('app-versions')
     }
-    return c.json({ success: true, existed, unlinked, dbTombstoned: dbUpdated })
+    return c.json({ success: true, existed, unlinked, dbTombstoned: dbUpdated, appVersionsDeactivated })
+  } catch (e) {
+    const err = authErrorResponse(e)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
+// ─── POST /rename { storagePath, newName } ──────────────────────────────────
+//
+// Renames ONE managed file IN PLACE (same directory — bare filename only, no
+// cross-directory moves, so bucket semantics stay intact). Downstream
+// bookkeeping follows the rename:
+//   • FileAsset rows referencing the old storage path are repointed (never
+//     tombstoned — the file still exists, desktop sync must converge).
+//   • AppVersion rows in the app-versions bucket are repointed too — renaming
+//     the CURRENTLY ACTIVE installer keeps it active under its new name
+//     (identity travels with the file), and the 'app-versions' cache tag is
+//     dropped so the live tracker + public active listing re-read at once.
+app.post('/rename', async (c) => {
+  try {
+    await requireAdmin(c)
+    let body: { storagePath?: string; newName?: string } = {}
+    try {
+      body = await c.req.json()
+    } catch { /* empty body */ }
+    const storagePath = (body.storagePath || '').trim()
+    const newName = (body.newName || '').trim()
+    if (!storagePath) return c.json({ success: false, error: 'storagePath is required' }, 400)
+    // Bare filename only: no separators, no dot-names, sane length.
+    if (!newName || /[\\/]/.test(newName) || newName === '.' || newName === '..') {
+      return c.json({ success: false, error: 'Invalid new name' }, 400)
+    }
+    if (newName.length > 255) return c.json({ success: false, error: 'Name too long' }, 400)
+
+    const abs = resolveManagerPath(storagePath)
+    if (!abs) return c.json({ success: false, error: 'Invalid storage path' }, 400)
+    if (!insideRoot(path.resolve(abs))) return c.json({ success: false, error: 'Invalid storage path' }, 400)
+
+    const existed = await fileExists(abs)
+    if (!existed) return c.json({ success: false, error: 'File not found' }, 404)
+
+    const targetAbs = path.join(path.dirname(abs), newName)
+    if (!insideRoot(path.resolve(targetAbs))) return c.json({ success: false, error: 'Invalid target path' }, 400)
+    if (path.resolve(targetAbs) === path.resolve(abs)) {
+      return c.json({ success: false, error: 'Name unchanged' }, 400)
+    }
+    if (await fileExists(targetAbs)) {
+      return c.json({ success: false, error: 'A file with this name already exists in this folder' }, 409)
+    }
+
+    await fs.promises.rename(abs, targetAbs)
+
+    // Same-directory rename → the relative path changes only in its tail.
+    const normalized = storagePath.replace(/\\/g, '/')
+    const slashIdx = normalized.lastIndexOf('/')
+    const newStoragePath = slashIdx === -1 ? newName : `${normalized.slice(0, slashIdx + 1)}${newName}`
+
+    // Repoint FileAsset rows (file still exists — NOT a tombstone).
+    let fileAssetRows = 0
+    try {
+      const res = await db.fileAsset.updateMany({
+        where: { storagePath, deletedAt: null },
+        data: { storagePath: newStoragePath, originalName: newName },
+      })
+      fileAssetRows = res.count
+    } catch { /* no rows for stray/legacy files */ }
+
+    // Repoint AppVersion rows (renaming the ACTIVE installer keeps it
+    // published under the new name — identity = exact storage key).
+    // Same path-convention normalization as the delete cascade above:
+    // AppVersion.fileStorageKey is relative to the app-versions bucket.
+    let appVersionsRepointed = 0
+    const bucket = storagePath.split('/')[0] || ''
+    if (bucket === 'app-versions') {
+      const avKey = storagePath.slice('app-versions/'.length)
+      const avKeyNew = newStoragePath.slice('app-versions/'.length)
+      try {
+        const res = await db.appVersion.updateMany({
+          where: { fileStorageKey: avKey },
+          data: { fileStorageKey: avKeyNew, fileName: newName },
+        })
+        appVersionsRepointed = res.count
+      } catch { /* no linked rows */ }
+      // The live tracker + public active listing derive from this bucket —
+      // refresh their cache entries.
+      invalidateResponseCacheTag('app-versions')
+    }
+
+    return c.json({ success: true, storagePath: newStoragePath, fileAssetRows, appVersionsRepointed })
   } catch (e) {
     const err = authErrorResponse(e)
     return c.json({ success: false, error: err.error }, err.status as 400)

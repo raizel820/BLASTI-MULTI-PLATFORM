@@ -18,7 +18,10 @@
  *                  video/audio players and text files (first 256 KB);
  *                  binaries fall back to download/open actions
  *   Delete       → DELETE /file { storagePath } (disk unlink + FileAsset
- *                  tombstone server-side)
+ *                  tombstone + AppVersion publish-cascade server-side)
+ *   Rename       → POST /rename { storagePath, newName } (in-place rename;
+ *                  FileAsset + AppVersion rows repoint, active installer
+ *                  stays active under its new name)
  *
  * Task 2-c-2 — navigation + download upgrades:
  *   - Per-file DOWNLOAD via the admin streaming endpoint
@@ -62,6 +65,7 @@ import {
   Search,
   Trash2,
   Copy,
+  Pencil,
   ExternalLink,
   ArrowLeft,
   ArrowDown,
@@ -644,12 +648,13 @@ interface FilesTableProps {
   lang: Language;
   onCopy: (path: string) => void;
   onAskDelete: (file: StorageFileRow) => void;
+  onAskRename: (file: StorageFileRow) => void;
   onPreview: (file: StorageFileRow) => void;
   onDownload: (file: StorageFileRow) => void;
   downloadingPath: string | null;
 }
 
-function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview, onDownload, downloadingPath }: FilesTableProps) {
+function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onAskRename, onPreview, onDownload, downloadingPath }: FilesTableProps) {
   return (
     <div className="rounded-xl border overflow-hidden">
       {/* Long lists scroll inside a bounded viewport — custom scrollbar
@@ -776,6 +781,18 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview, onD
                           <ExternalLink className="h-3.5 w-3.5" />
                         </a>
                       )}
+                      {/* Rename in place (same folder) — downstream rows
+                          (FileAsset/AppVersion) repoint server-side. */}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-11 w-11 sm:h-7 sm:w-7 p-0"
+                        title={t('storageRename')}
+                        aria-label={t('storageRename')}
+                        onClick={() => onAskRename(f)}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </Button>
                       <Button
                         variant="ghost"
                         size="sm"
@@ -831,6 +848,10 @@ export function AdminStorageManager() {
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<StorageFileRow | null>(null);
   const [deleting, setDeleting] = useState(false);
+  // Rename-in-place dialog state (mirror of the delete flow).
+  const [renameTarget, setRenameTarget] = useState<StorageFileRow | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [renaming, setRenaming] = useState(false);
 
   // Preview dialog (image / PDF / video / audio / text)
   const [previewTarget, setPreviewTarget] = useState<StorageFileRow | null>(null);
@@ -1010,6 +1031,57 @@ export function AdminStorageManager() {
       toast.error(t('storageDeleteFailed'));
     } finally {
       setDeleting(false);
+    }
+  };
+
+  // ── Rename in place (same folder) ──
+  // Client-side guard mirrors the server: bare filename, no separators, no
+  // dot-names, must differ from the current name. Server enforces the rest
+  // (existence, conflict 409, AppVersion/FileAsset repointing).
+  const renameInvalid = useMemo(() => {
+    const v = renameValue.trim();
+    if (!v) return 'empty';
+    if (/[\\/]/.test(v) || v === '.' || v === '..') return 'invalid';
+    if (renameTarget && v === renameTarget.name) return 'unchanged';
+    return null;
+  }, [renameValue, renameTarget]);
+
+  const confirmRenameFile = async () => {
+    if (!renameTarget || renameInvalid) return;
+    setRenaming(true);
+    try {
+      const res = await apiFetch('/api/admin/storage/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ storagePath: renameTarget.storagePath, newName: renameValue.trim() }),
+      });
+      const body = await res.json().catch(() => null);
+      const bodyRec = asRecord(body);
+      if (res.ok && bodyRec && bodyRec.success !== false) {
+        toast.success(t('storageRenameDone'));
+        const renamedPath = renameTarget.storagePath;
+        setRenameTarget(null);
+        // Drop every cached summary of the affected bucket subtree — the
+        // listing shows the OLD name until re-fetched.
+        const bucket = renamedPath.split('/')[0] || nav.bucket || '';
+        setCache((prev) => {
+          const next: Record<string, BrowseData> = {};
+          for (const [k, v] of Object.entries(prev)) {
+            if (k !== bucket && !k.startsWith(`${bucket}/`)) next[k] = v;
+          }
+          return next;
+        });
+        if (nav.bucket) fetchLevel(nav.bucket, nav.yyyy, nav.mm, { force: true });
+        fetchOverview(true);
+      } else {
+        const serverError = typeof bodyRec?.error === 'string' ? bodyRec.error : '';
+        if (serverError.includes('already exists')) toast.error(t('storageRenameConflict'));
+        else toast.error(serverError || t('storageRenameFailed'));
+      }
+    } catch {
+      toast.error(t('storageRenameFailed'));
+    } finally {
+      setRenaming(false);
     }
   };
 
@@ -1356,6 +1428,7 @@ export function AdminStorageManager() {
                     lang={lang}
                     onCopy={copyText}
                     onAskDelete={setDeleteTarget}
+                    onAskRename={(f) => { setRenameTarget(f); setRenameValue(f.name); }}
                     onPreview={setPreviewTarget}
                     onDownload={downloadFile}
                     downloadingPath={downloadingPath}
@@ -1414,6 +1487,7 @@ export function AdminStorageManager() {
           lang={lang}
           onCopy={copyText}
           onAskDelete={setDeleteTarget}
+          onAskRename={(f) => { setRenameTarget(f); setRenameValue(f.name); }}
           onPreview={setPreviewTarget}
           onDownload={downloadFile}
           downloadingPath={downloadingPath}
@@ -1634,6 +1708,50 @@ export function AdminStorageManager() {
         loading={deleting}
         onConfirm={confirmDeleteFile}
       />
+
+      {/* Rename in place — dialog with an input (ConfirmDialog is text-only). */}
+      <Dialog
+        open={!!renameTarget}
+        onOpenChange={(o) => { if (!o) setRenameTarget(null); }}
+      >
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t('storageRename')}</DialogTitle>
+            <DialogDescription className="break-all">
+              {t('storageRenameDesc', { name: renameTarget?.name ?? '' })}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Input
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              placeholder={t('storageRenameNewName')}
+              dir="ltr"
+              autoFocus
+              disabled={renaming}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !renameInvalid && !renaming) confirmRenameFile(); }}
+              aria-invalid={!!renameInvalid}
+            />
+            {renameInvalid && (
+              <p className="text-xs text-muted-foreground">
+                {renameInvalid === 'empty'
+                  ? t('storageRenameNewName')
+                  : renameInvalid === 'invalid'
+                    ? t('storageRenameInvalid')
+                    : t('storageRenameUnchanged')}
+              </p>
+            )}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => setRenameTarget(null)} disabled={renaming}>
+              {t('cancel')}
+            </Button>
+            <Button size="sm" onClick={confirmRenameFile} disabled={!!renameInvalid || renaming}>
+              {renaming ? <Loader2 className="h-4 w-4 animate-spin" /> : t('storageRename')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* File preview (image / PDF / video / audio / text) */}
       <StoragePreviewDialog
