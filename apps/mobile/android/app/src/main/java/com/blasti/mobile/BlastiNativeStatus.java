@@ -151,7 +151,9 @@ public class BlastiNativeStatus extends Plugin {
             // Widevine UUID: edef8ba9-79d6-4ace-a3c8-27dcd51d21ed
             java.util.UUID WIDEVINE_UUID = new java.util.UUID(0xEDEF8BA979D64ACEL, 0xA3C827DCD51D21EDL);
             android.media.MediaDrm mediaDrm = new android.media.MediaDrm(WIDEVINE_UUID);
-            byte[] drmId = mediaDrm.getPropertyByteArray(android.media.MediaDrm.PROPERTY_DEVICE_ID);
+            // PROPERTY_DEVICE_UNIQUE_ID is the real MediaDrm constant (API 18+);
+            // PROPERTY_DEVICE_ID does not exist and broke compileDebugJavaWithJavac.
+            byte[] drmId = mediaDrm.getPropertyByteArray(android.media.MediaDrm.PROPERTY_DEVICE_UNIQUE_ID);
             mediaDrm.release();
             StringBuilder hex = new StringBuilder(drmId.length * 2);
             for (byte b : drmId) {
