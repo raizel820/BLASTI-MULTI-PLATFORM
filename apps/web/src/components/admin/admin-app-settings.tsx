@@ -74,6 +74,8 @@ import {
   Zap,
   Hammer,
   History,
+  HardDrive,
+  Clock3,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
@@ -108,6 +110,27 @@ interface LatestVersions {
 }
 
 type Platform = 'android' | 'android-debug' | 'ios' | 'electron' | 'windows' | 'mac' | 'linux';
+
+// ─── Live installer tracker (Task 2-c) ────────────────────────────────
+// One entry PER FILE on disk. GitHub Actions rebuilds land as NEW files
+// even when the original installer name (and platform+version) is the
+// same — each occurrence keeps its own push time (file mtime) so two
+// rebuilds of "BLASTI-Setup-0.3.4.exe" show up as two distinct rows.
+interface InstallerDiskFile {
+  /** Bucket-relative path "<group>/<name>" — the EXACT disk reference. */
+  storageKey: string;
+  name: string;
+  group: string; // 'desktop' | 'mobile' | '' (legacy root)
+  size: number;
+  mtimeMs: number;
+  /** Platform classification (name convention → linked row → extension). */
+  platform?: string | null;
+  parsed?: { platform: string; version: string } | null;
+  /** AppVersion row currently pointing at this exact file (if any).
+   *  fileSize travels with it so the UI can enforce the EXACT identity
+   *  (name + push time + byte size) for the Active badge. */
+  version?: { id: string; platform: string; version: string; isPublished: boolean; fileName: string | null; fileSize: number | null } | null;
+}
 
 // ─── Constants ─────────────────────────────────────────────────────
 
@@ -161,6 +184,23 @@ function formatDate(dateStr: string | null | undefined): string {
   }
 }
 
+// Push time of a disk build = file mtime (CI writes the binary at push
+// time). Shows DATE + TIME so same-name rebuilds minutes apart stay distinct.
+function formatPushedAt(mtimeMs: number, lang: string): string {
+  try {
+    const locale = lang === 'ar' ? 'ar-DZ' : lang === 'fr' ? 'fr-DZ' : 'en-US';
+    return new Date(mtimeMs).toLocaleString(locale, {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return new Date(mtimeMs).toISOString();
+  }
+}
+
 // ─── Component ─────────────────────────────────────────────────────
 export function AdminAppSettings() {
   const { setView } = useAppStore();
@@ -173,6 +213,11 @@ export function AdminAppSettings() {
   const [versions, setVersions] = useState<AppVersion[]>([]);
   const [latestVersions, setLatestVersions] = useState<LatestVersions>({});
   const [selectedPlatform, setSelectedPlatform] = useState<string>('all');
+
+  // ── Live installer tracker state (Task 2-c) ──
+  const [installerFiles, setInstallerFiles] = useState<InstallerDiskFile[]>([]);
+  const [activatingFileKey, setActivatingFileKey] = useState<string | null>(null);
+  const [confirmActivateFile, setConfirmActivateFile] = useState<InstallerDiskFile | null>(null);
 
   // ── Dialog state ──
   const [addDialogOpen, setAddDialogOpen] = useState(false);
@@ -219,13 +264,18 @@ export function AdminAppSettings() {
   const [genAndroidBuild, setGenAndroidBuild] = useState<'release' | 'debug' | 'both'>('release');
 
   // ── Fetch data ──
+  // The third call is the LIVE disk inventory: every installer file in the
+  // app-versions storage bucket with its size + push time (mtime). The API
+  // re-reads the disk on each call, so a CI rebuild that just landed shows up
+  // on the next refresh even when no AppVersion row references it yet.
   const fetchVersions = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
     try {
-      const [versionsRes, latestRes] = await Promise.all([
+      const [versionsRes, latestRes, filesRes] = await Promise.all([
         apiFetch('/api/app-versions'),
         apiFetch('/api/app-versions/latest'),
+        apiFetch('/api/app-versions/storage-files'),
       ]);
 
       if (versionsRes.ok) {
@@ -239,6 +289,13 @@ export function AdminAppSettings() {
         const data = await latestRes.json();
         if (data.success) {
           setLatestVersions(data.latest || {});
+        }
+      }
+
+      if (filesRes.ok) {
+        const data = await filesRes.json();
+        if (data.success) {
+          setInstallerFiles(data.files || []);
         }
       }
     } catch {
@@ -578,6 +635,80 @@ export function AdminAppSettings() {
     },
     [isRTL]
   );
+
+  // ── Live installer tracker (Task 2-c) ──
+  // Group every disk file by platform classification (name convention →
+  // linked AppVersion row → file-extension fallback), preserving the
+  // push-time-desc order the API returns within each group. Legacy flat
+  // binaries (bucket root, pre-grouping layout) get their own group.
+  const installerGroups = (() => {
+    const buckets = new Map<string, InstallerDiskFile[]>();
+    for (const f of installerFiles) {
+      const key =
+        f.platform ||
+        f.parsed?.platform ||
+        f.version?.platform ||
+        (f.group === '' ? '__flat' : '__unknown');
+      const list = buckets.get(key) || [];
+      list.push(f);
+      buckets.set(key, list);
+    }
+    const orderedKeys = [
+      ...PLATFORMS.map((p) => p.key).filter((k) => buckets.has(k)),
+      ...[...buckets.keys()].filter((k) => !PLATFORMS.some((p) => p.key === k)),
+    ];
+    return orderedKeys.map((key) => ({
+      key,
+      label:
+        key === '__flat'
+          ? t('installerGroupFlat')
+          : key === '__unknown'
+            ? t('installerUnknownPlatform')
+            : getPlatformName(key),
+      files: buckets.get(key) || [],
+    }));
+  })();
+
+  // Activate ONE exact disk file (name + push time — never just a name).
+  const handleActivateFile = useCallback(
+    async (file: InstallerDiskFile) => {
+      setActivatingFileKey(file.storageKey);
+      try {
+        const res = await apiFetch('/api/app-versions/activate-file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ storagePath: file.storageKey }),
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          const platformLabel = getPlatformName(
+            file.platform || file.parsed?.platform || file.version?.platform || ''
+          );
+          toast.success(
+            isRTL
+              ? `أصبح هذا الملف هو النسخة النشطة لـ ${platformLabel}`
+              : `This file is now the active ${platformLabel} build`
+          );
+          setConfirmActivateFile(null);
+          fetchVersions();
+        } else {
+          toast.error(data.error || (isRTL ? 'فشلت العملية' : 'Operation failed'));
+        }
+      } catch {
+        toast.error(isRTL ? 'خطأ في الاتصال' : 'Connection error');
+      } finally {
+        setActivatingFileKey(null);
+      }
+    },
+    [isRTL, fetchVersions, getPlatformName]
+  );
+
+  // Download a disk build (only possible when an AppVersion row serves it).
+  const handleDownloadFile = useCallback((file: InstallerDiskFile) => {
+    if (file.version?.id) {
+      window.open(getProxiedUrl(`/api/app-versions/${file.version.id}/download`), '_blank');
+    }
+  }, []);
 
   // ── Activate (make THE active version for its platform) ──
   // NOTE: declared after getPlatformName — the callback references it.
@@ -1063,6 +1194,158 @@ export function AdminAppSettings() {
                     })}
                   </TableBody>
                 </Table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* ─── 3b. Live Installer Builds — version tracker over the ACTUAL files ─── */}
+      {/* Every pushed build is listed from live disk storage, grouped by
+          platform and sorted by push time (newest first). Rebuilds pushed by
+          GitHub Actions keep the SAME original filename — they appear here as
+          DISTINCT rows because each push lands as a new file with its own
+          timestamp. Activate one exact row to make that precise build public. */}
+      <motion.div {...fadeUp} transition={{ delay: 0.18 }}>
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 rounded-xl">
+          <CardHeader className="pb-3">
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+              <div>
+                <CardTitle className="text-base flex items-center gap-2">
+                  <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-emerald-200 to-emerald-300 dark:from-emerald-900/40 dark:to-emerald-800/40 flex items-center justify-center shadow-sm">
+                    <HardDrive className="h-4 w-4 text-emerald-700 dark:text-emerald-400" />
+                  </div>
+                  {t('installerFilesTitle')}
+                  <Badge variant="outline" className="text-[10px] px-1.5 py-0 text-muted-foreground">
+                    {installerFiles.length}
+                  </Badge>
+                </CardTitle>
+                <p className="text-[11px] text-muted-foreground mt-1 ms-10">
+                  {t('installerFilesDesc')}
+                </p>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 px-3 shrink-0 border-emerald-300 dark:border-emerald-700 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+                onClick={() => fetchVersions(true)}
+                disabled={refreshing}
+              >
+                <RefreshCw className={`h-3.5 w-3.5 me-1 ${refreshing ? 'animate-spin' : ''}`} />
+                {t('refresh')}
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent className="pt-0">
+            {installerFiles.length === 0 ? (
+              <div className="text-center py-10 text-muted-foreground">
+                <HardDrive className="h-10 w-10 mx-auto mb-2 opacity-30" />
+                <p className="text-sm">{t('installerNoFiles')}</p>
+              </div>
+            ) : (
+              <div className="max-h-[460px] overflow-y-auto custom-scrollbar pe-1 space-y-3">
+                {installerGroups.map((group) => (
+                  <div key={group.key} className="space-y-1.5">
+                    {/* Group header — platform / channel */}
+                    <div className="flex items-center gap-2 sticky top-0 z-10 bg-white/95 dark:bg-gray-900/95 backdrop-blur-sm py-1 rounded-md">
+                      {group.key === '__flat' || group.key === '__unknown' ? (
+                        <Package className="h-4 w-4 text-muted-foreground" />
+                      ) : (
+                        getPlatformIcon(group.key, 'h-4 w-4 text-emerald-700 dark:text-emerald-400')
+                      )}
+                      <span className="text-xs font-semibold">{group.label}</span>
+                      <Badge variant="outline" className="text-[10px] px-1.5 py-0 text-muted-foreground">
+                        {t('storageFilesCount', { count: String(group.files.length) })}
+                      </Badge>
+                    </div>
+                    {group.files.map((file) => {
+                      const isActive =
+                        // Active identity is EXACT (user requirement): the
+                        // linked AppVersion row must be published AND match
+                        // this file occurrence by full storage key with an
+                        // EXACT byte-size check — same-name/same-size
+                        // rebuilds with a different push date/time never
+                        // display as active.
+                        !!file.version?.isPublished && file.version.fileSize === file.size;
+                      const activating = activatingFileKey === file.storageKey;
+                      return (
+                        <div
+                          key={file.storageKey}
+                          className={`rounded-xl border p-2.5 flex flex-col lg:flex-row lg:items-center gap-2 lg:gap-3 ${
+                            isActive
+                              ? 'border-green-300/70 bg-green-50/50 dark:border-green-800/40 dark:bg-green-900/10'
+                              : 'border-border/50 bg-muted/20'
+                          }`}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <p className="text-xs font-medium font-mono truncate" dir="ltr" title={file.name}>
+                              {file.name}
+                            </p>
+                            <div className="flex items-center gap-2 flex-wrap text-[10px] text-muted-foreground mt-0.5">
+                              <span className="inline-flex items-center gap-1">
+                                <Clock3 className="h-3 w-3" />
+                                {t('installerPushedAt')}:
+                              </span>
+                              <span dir="ltr">{formatPushedAt(file.mtimeMs, lang)}</span>
+                              <span>· {formatFileSize(file.size)}</span>
+                              {isActive && (
+                                <span dir="ltr" className="font-mono" title={t('installerExactBytes')}>
+                                  · {file.size.toLocaleString(lang === 'ar' ? 'ar-EG' : lang === 'fr' ? 'fr-FR' : 'en-US')} B
+                                </span>
+                              )}
+                              {file.parsed?.version && <span>· v{file.parsed.version}</span>}
+                              {file.group === '' && <span>· {t('installerGroupFlat')}</span>}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+                            {/* Status of THIS occurrence */}
+                            {isActive ? (
+                              <Badge className="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 text-[10px] px-1.5 py-0">
+                                <CheckCircle2 className="h-3 w-3 me-0.5" />
+                                {t('installerActiveFile')}
+                              </Badge>
+                            ) : file.version ? (
+                              <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 text-[10px] px-1.5 py-0">
+                                {t('installerDraftFile')}
+                              </Badge>
+                            ) : (
+                              <Badge variant="outline" className="text-[10px] px-1.5 py-0 text-muted-foreground">
+                                {t('installerUnmatched')}
+                              </Badge>
+                            )}
+                            {!isActive && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7 text-muted-foreground hover:text-emerald-600"
+                                onClick={() => setConfirmActivateFile(file)}
+                                disabled={!!activatingFileKey}
+                                title={t('installerActivateFile')}
+                              >
+                                {activating ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <Zap className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                            )}
+                            {file.version?.id && (
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                                onClick={() => handleDownloadFile(file)}
+                                title={isRTL ? 'تحميل الملف' : 'Download binary'}
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                              </Button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
               </div>
             )}
           </CardContent>
@@ -1791,6 +2074,59 @@ export function AdminAppSettings() {
                 <Trash2 className="h-4 w-4 me-1" />
               )}
               {isRTL ? 'حذف' : 'Delete'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ─── 3b-confirm. Activate ONE exact disk build (live tracker) ─── */}
+      {/* References the file by its FULL storage path (name + push timestamp):
+          when the same installer name was pushed twice, only the picked
+          occurrence becomes the public download. */}
+      <AlertDialog
+        open={confirmActivateFile !== null}
+        onOpenChange={(o) => !o && setConfirmActivateFile(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              <Zap className="h-5 w-5 text-emerald-600" />
+              {t('installerActivateConfirmTitle')}
+            </AlertDialogTitle>
+            <AlertDialogDescription className="space-y-2">
+              {confirmActivateFile && (
+                <span className="block font-mono text-xs break-all" dir="ltr">
+                  {confirmActivateFile.name}
+                </span>
+              )}
+              {confirmActivateFile && (
+                <span className="block text-sm">
+                  {t('installerActivateConfirmBody', {
+                    platform: getPlatformName(
+                      confirmActivateFile.platform ||
+                        confirmActivateFile.parsed?.platform ||
+                        confirmActivateFile.version?.platform ||
+                        ''
+                    ),
+                    time: formatPushedAt(confirmActivateFile.mtimeMs, lang),
+                  })}
+                </span>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{isRTL ? 'إلغاء' : 'Cancel'}</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-emerald-600 hover:bg-emerald-700 text-white"
+              onClick={() => confirmActivateFile && handleActivateFile(confirmActivateFile)}
+              disabled={!!activatingFileKey}
+            >
+              {activatingFileKey ? (
+                <Loader2 className="h-4 w-4 animate-spin me-1" />
+              ) : (
+                <Zap className="h-4 w-4 me-1" />
+              )}
+              {activatingFileKey ? t('installerActivating') : t('installerActivateFile')}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

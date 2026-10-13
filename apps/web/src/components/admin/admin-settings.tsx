@@ -1,32 +1,38 @@
-'use client'
-import { apiFetch } from '@/lib/api-fetch';;
+'use client';
 
-import { useState, useEffect } from 'react';
-import { useLanguage } from '@/hooks/use-language';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Switch } from '@/components/ui/switch';
+/**
+ * Platform Settings — General/Overview hub (Task 5).
+ *
+ * This view used to be a ~300-line long-scroll page mounting all 8 admin
+ * sections back-to-back. It is now the entry card of the sidebar
+ * "__platform_settings_group__": a navigation grid where every card routes to
+ * its own dedicated view (admin-settings-vps, admin-settings-providers, …),
+ * mirroring the "Managing Sales & Operations" group pattern.
+ *
+ * Backward compatible: the view name (`admin-settings`) and its hash
+ * (#/admin/settings) are unchanged.
+ */
+
+import { motion } from 'framer-motion';
 import {
   Settings,
   Shield,
-  Loader2,
-  Save,
+  ArrowRight,
+  Server,
+  BellRing,
+  MapPin,
   CreditCard,
-  Building2,
-  Wallet,
+  Banknote,
+  ShieldCheck,
+  HelpCircle,
+  SlidersHorizontal,
+  type LucideIcon,
 } from 'lucide-react';
-import { toast } from 'sonner';
-import { motion } from 'framer-motion';
-import { AdminFaqManager } from '@/components/admin/admin-faq-manager';
-import { SystemSettingsConfig } from '@/components/admin/admin-settings-config';
-import { AdminPaymentEngine } from '@/components/admin/admin-payment-engine';
-import { AdminProvidersSettings } from '@/components/admin/admin-providers-settings';
-import { AdminMapsSettings } from '@/components/admin/admin-maps-settings';
-import { AdminVpsStatus } from '@/components/admin/admin-vps-status';
-import { BiometricSettingsCard } from '@/components/shared/biometric-settings';
+import { useLanguage } from '@/hooks/use-language';
+import { useAppStore } from '@/store/use-app-store';
+import type { ViewName } from '@/store/use-app-store';
+import { Badge } from '@/components/ui/badge';
+import type { TranslationKeys } from '@/i18n';
 
 // ─── Animation variants ───────────────────────────────────────────
 const fadeUp = {
@@ -34,69 +40,30 @@ const fadeUp = {
   animate: { opacity: 1, y: 0 },
 };
 
+// ─── Subsection registry (order = sidebar group order) ────────────
+interface SettingsSection {
+  view: ViewName;
+  icon: LucideIcon;
+  titleKey: TranslationKeys;
+  descKey: TranslationKeys;
+}
+
+const SETTINGS_SECTIONS: SettingsSection[] = [
+  { view: 'admin-settings-vps', icon: Server, titleKey: 'settingsVps', descKey: 'settingsVpsDesc' },
+  { view: 'admin-settings-providers', icon: BellRing, titleKey: 'settingsProviders', descKey: 'settingsProvidersDesc' },
+  { view: 'admin-settings-maps', icon: MapPin, titleKey: 'settingsMapsSub', descKey: 'settingsMapsSubDesc' },
+  { view: 'admin-settings-payments', icon: CreditCard, titleKey: 'settingsPaymentsGateway', descKey: 'settingsPaymentsGatewayDesc' },
+  { view: 'admin-settings-financial', icon: Banknote, titleKey: 'settingsFinancialEngine', descKey: 'settingsFinancialEngineDesc' },
+  { view: 'admin-settings-security', icon: ShieldCheck, titleKey: 'settingsSecuritySub', descKey: 'settingsSecuritySubDesc' },
+  { view: 'admin-settings-faq', icon: HelpCircle, titleKey: 'settingsFaqSub', descKey: 'settingsFaqSubDesc' },
+  { view: 'admin-settings-config', icon: SlidersHorizontal, titleKey: 'settingsSystemConfig', descKey: 'settingsSystemConfigDesc' },
+];
+
 // ─── Component ─────────────────────────────────────────────────────
 export function AdminSettings() {
   const { t } = useLanguage();
+  const setView = useAppStore((s) => s.setView);
 
-  // ── State ──
-  const [paymentSettings, setPaymentSettings] = useState<{
-    ccpEnabled: boolean; bankEnabled: boolean; electronicEnabled: boolean;
-    ccpAccount: string; ccpKey: string; bankName: string;
-    bankAccount: string; bankRib: string; ewalletNumber: string;
-  }>({ ccpEnabled: false, bankEnabled: false, electronicEnabled: false, ccpAccount: '', ccpKey: '', bankName: '', bankAccount: '', bankRib: '', ewalletNumber: '' });
-  const [savingPayment, setSavingPayment] = useState(false);
-
-  // ── Fetch on mount ──
-  useEffect(() => {
-    fetchPaymentSettings();
-  }, []);
-
-  // ── Payment settings ──
-  const fetchPaymentSettings = async () => {
-    try {
-      const res = await apiFetch('/api/admin/payment-settings');
-      if (res.ok) {
-        const data = await res.json();
-        if (data.settings) {
-          setPaymentSettings({
-            ccpEnabled: data.settings.ccpEnabled || false,
-            bankEnabled: data.settings.bankEnabled || false,
-            electronicEnabled: data.settings.electronicEnabled || false,
-            ccpAccount: data.settings.ccpAccount || '',
-            ccpKey: data.settings.ccpKey || '',
-            bankName: data.settings.bankName || '',
-            bankAccount: data.settings.bankAccount || '',
-            bankRib: data.settings.bankRib || '',
-            ewalletNumber: data.settings.ewalletNumber || '',
-          });
-        }
-      }
-    } catch {
-      // silent fail
-    }
-  };
-
-  const savePaymentSettings = async () => {
-    setSavingPayment(true);
-    try {
-      const res = await apiFetch('/api/admin/payment-settings', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(paymentSettings),
-      });
-      if (res.ok) {
-        toast.success(t('paymentSaved'));
-      } else {
-        toast.error(t('error'));
-      }
-    } catch {
-      toast.error(t('error'));
-    } finally {
-      setSavingPayment(false);
-    }
-  };
-
-  // ── Render ──
   return (
     <div className="p-4 lg:p-6 space-y-5">
       {/* ─── Header Banner ─── */}
@@ -114,13 +81,13 @@ export function AdminSettings() {
           <div className="relative flex items-center justify-between">
             <div>
               <h1 className="text-2xl font-bold text-white flex items-center gap-3">
-                <div className="h-10 w-10 rounded-xl bg-white/20 backdrop-blur-sm flex items-center justify-center">
+                <span className="h-10 w-10 rounded-xl bg-white/20 backdrop-blur-sm flex items-center justify-center">
                   <Settings className="h-5 w-5 text-white" />
-                </div>
+                </span>
                 {t('settings')}
               </h1>
               <p className="text-sm text-emerald-100 mt-1 ms-[52px]">
-                {'Platform Settings'}
+                {t('platformSettings')}
               </p>
             </div>
             <div className="hidden sm:flex items-center gap-2">
@@ -133,179 +100,40 @@ export function AdminSettings() {
         </div>
       </motion.div>
 
-      {/* ─── VPS Server (Task 88 — CPU/RAM/storage, served git commit,
-           manual GitHub check + rebuild-from-new-commit) ─── */}
-      <motion.div {...fadeUp} transition={{ delay: 0.05 }}>
-        <AdminVpsStatus />
-      </motion.div>
-
-      {/* ─── Notifications & Providers hub (SMS · Email · WhatsApp · Templates · Logs) ─── */}
-      <motion.div {...fadeUp} transition={{ delay: 0.1 }}>
-        <AdminProvidersSettings />
-      </motion.div>
-
-      {/* ─── Maps & Location (Task 51-c — provider / geocoding / directions / status).
-           Task 2-b: this panel is ALSO available standalone at #/admin/maps
-           (sidebar entry "Locations & Maps"), with the Location Editor on top. ─── */}
-      <motion.div {...fadeUp} transition={{ delay: 0.2 }}>
-        <AdminMapsSettings />
-      </motion.div>
-
-      {/* ─── Gateway/Payment Settings ─── */}
-      <motion.div {...fadeUp} transition={{ delay: 0.4 }}>
-        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50 dark:backdrop-blur-sm dark:shadow-gray-900/50">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <CreditCard className="h-4 w-4 text-emerald-600" />
-              {t('gatewaySettings')}
-            </CardTitle>
-            <p className="text-[11px] text-muted-foreground">{t('gatewaySettingsDesc')}</p>
-          </CardHeader>
-          <CardContent className="pt-0 space-y-5">
-            {/* CCP Section */}
-            <div className="space-y-3 p-3 rounded-xl bg-blue-50/50 dark:bg-blue-900/10 border border-blue-100 dark:border-blue-800/30">
-              <div className="flex items-center justify-between">
-                <Label className="text-xs font-medium flex items-center gap-2">
-                  <Building2 className="h-3.5 w-3.5 text-blue-600" />
-                  {t('ccpEnabled')}
-                </Label>
-                <Switch
-                  checked={paymentSettings.ccpEnabled}
-                  onCheckedChange={(v) => setPaymentSettings({ ...paymentSettings, ccpEnabled: v })}
-                />
+      {/* ─── Subsection navigation grid ───
+           One card per dedicated view — tap to navigate; the sidebar
+           "__platform_settings_group__" mirrors the same entries. ─── */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 lg:gap-6">
+        {SETTINGS_SECTIONS.map((section, index) => {
+          const Icon = section.icon;
+          return (
+            <motion.button
+              key={section.view}
+              type="button"
+              {...fadeUp}
+              transition={{ delay: 0.05 + index * 0.04 }}
+              onClick={() => setView(section.view)}
+              aria-label={t(section.titleKey)}
+              whileHover={{ y: -3 }}
+              whileTap={{ scale: 0.98 }}
+              className="group text-start rounded-2xl border border-border/60 bg-white dark:bg-gray-900/80 dark:border-gray-800/50 shadow-sm hover:shadow-md hover:border-emerald-300/60 dark:hover:border-emerald-700/50 transition-colors p-5 flex flex-col gap-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/60"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <span className="h-10 w-10 shrink-0 rounded-xl bg-emerald-50 dark:bg-emerald-900/30 flex items-center justify-center transition-colors group-hover:bg-emerald-100 dark:group-hover:bg-emerald-900/50">
+                  <Icon className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                </span>
+                <ArrowRight className="h-4 w-4 text-muted-foreground/60 transition-all group-hover:text-emerald-600 dark:group-hover:text-emerald-400 rtl:rotate-180 group-hover:-translate-y-0.5" />
               </div>
-              {paymentSettings.ccpEnabled && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="space-y-1">
-                    <Label className="text-[10px] text-muted-foreground">{t('ccpAccount')}</Label>
-                    <Input
-                      value={paymentSettings.ccpAccount}
-                      onChange={(e) => setPaymentSettings({ ...paymentSettings, ccpAccount: e.target.value })}
-                      placeholder="0000000000"
-                      className="h-8 text-xs"
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label className="text-[10px] text-muted-foreground">{t('ccpKey')}</Label>
-                    <Input
-                      value={paymentSettings.ccpKey}
-                      onChange={(e) => setPaymentSettings({ ...paymentSettings, ccpKey: e.target.value })}
-                      placeholder="00"
-                      className="h-8 text-xs"
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Bank Section */}
-            <div className="space-y-3 p-3 rounded-xl bg-green-50/50 dark:bg-green-900/10 border border-green-100 dark:border-green-800/30">
-              <div className="flex items-center justify-between">
-                <Label className="text-xs font-medium flex items-center gap-2">
-                  <Building2 className="h-3.5 w-3.5 text-green-600" />
-                  {t('bankEnabled')}
-                </Label>
-                <Switch
-                  checked={paymentSettings.bankEnabled}
-                  onCheckedChange={(v) => setPaymentSettings({ ...paymentSettings, bankEnabled: v })}
-                />
+              <div className="space-y-1">
+                <h3 className="text-sm font-semibold text-foreground">{t(section.titleKey)}</h3>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  {t(section.descKey)}
+                </p>
               </div>
-              {paymentSettings.bankEnabled && (
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <div className="space-y-1">
-                    <Label className="text-[10px] text-muted-foreground">{t('bankName')}</Label>
-                    <Input
-                      value={paymentSettings.bankName}
-                      onChange={(e) => setPaymentSettings({ ...paymentSettings, bankName: e.target.value })}
-                      placeholder="BNA"
-                      className="h-8 text-xs"
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label className="text-[10px] text-muted-foreground">{t('bankAccount')}</Label>
-                    <Input
-                      value={paymentSettings.bankAccount}
-                      onChange={(e) => setPaymentSettings({ ...paymentSettings, bankAccount: e.target.value })}
-                      placeholder="0000000000"
-                      className="h-8 text-xs"
-                    />
-                  </div>
-                  <div className="space-y-1">
-                    <Label className="text-[10px] text-muted-foreground">{t('bankRib')}</Label>
-                    <Input
-                      value={paymentSettings.bankRib}
-                      onChange={(e) => setPaymentSettings({ ...paymentSettings, bankRib: e.target.value })}
-                      placeholder="00000000000000000000"
-                      className="h-8 text-xs"
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* E-Wallet Section */}
-            <div className="space-y-3 p-3 rounded-xl bg-purple-50/50 dark:bg-purple-900/10 border border-purple-100 dark:border-purple-800/30">
-              <div className="flex items-center justify-between">
-                <Label className="text-xs font-medium flex items-center gap-2">
-                  <Wallet className="h-3.5 w-3.5 text-purple-600" />
-                  {t('electronicEnabled')}
-                </Label>
-                <Switch
-                  checked={paymentSettings.electronicEnabled}
-                  onCheckedChange={(v) => setPaymentSettings({ ...paymentSettings, electronicEnabled: v })}
-                />
-              </div>
-              {paymentSettings.electronicEnabled && (
-                <div className="space-y-1">
-                  <Label className="text-[10px] text-muted-foreground">{t('ewalletNumber')}</Label>
-                  <Input
-                    value={paymentSettings.ewalletNumber}
-                    onChange={(e) => setPaymentSettings({ ...paymentSettings, ewalletNumber: e.target.value })}
-                    placeholder={t('phonePlaceholder')}
-                    className="h-8 text-xs"
-                  />
-                </div>
-              )}
-            </div>
-
-            {/* Save button */}
-            <Button onClick={savePaymentSettings} disabled={savingPayment} className="w-full h-9 text-xs bg-emerald-600 hover:bg-emerald-700">
-              {savingPayment ? <Loader2 className="h-3.5 w-3.5 animate-spin me-2" /> : <Save className="h-3.5 w-3.5 me-2" />}
-              {t('save')}
-            </Button>
-          </CardContent>
-        </Card>
-      </motion.div>
-
-      {/* ─── Security — biometric login (Task 80, device-local) ─── */}
-      <motion.div {...fadeUp} transition={{ delay: 0.45 }}>
-        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50">
-          <CardHeader className="pb-3">
-            <CardTitle className="text-base flex items-center gap-2">
-              <Shield className="h-4 w-4 text-emerald-600" />
-              {t('security')}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="pt-0">
-            <BiometricSettingsCard />
-          </CardContent>
-        </Card>
-      </motion.div>
-
-      {/* ─── FAQ Management ─── */}
-      <motion.div {...fadeUp} transition={{ delay: 0.5 }}>
-        <AdminFaqManager />
-      </motion.div>
-
-      {/* ─── Dynamic System Configuration ─── */}
-      <motion.div {...fadeUp} transition={{ delay: 0.6 }}>
-        <SystemSettingsConfig />
-      </motion.div>
-
-      {/* ─── Dual Financial Engine (Chargily + ECCP) ─── */}
-      <motion.div {...fadeUp} transition={{ delay: 0.7 }}>
-        <AdminPaymentEngine />
-      </motion.div>
+            </motion.button>
+          );
+        })}
+      </div>
     </div>
   );
 }

@@ -5,7 +5,14 @@ import { validateBody } from '../lib/validations'
 import { emitQueueEvent, emitNotificationEvent, emitKioskEvent } from '../lib/realtime-emit'
 import { enforceRateLimit, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
 import { calculateETA, getEffectiveServiceTime, filterImmediateServiceWindow, filterGhostTickets } from '../lib/eta-calculator'
-import { shouldSkipForPreferredTime, getNextCustomerToCall } from '../lib/queue-scheduler'
+// Task 2-a — the scheduler's predicate is now reached through the shared
+// criteria in lib/queue-waiting.ts (isCallableNow/partitionWaiting/
+// pickNextCallable), which wrap shouldSkipForPreferredTime — one definition
+// of "callable" everywhere.
+import { partitionWaiting, pickNextCallable } from '../lib/queue-waiting'
+// Task 2-a — reservation-state mutations must invalidate the cached public
+// GETs that expose reservation-derived numbers (/api/stats, /api/agencies).
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 import { cancelPendingCustomerAlerts } from '../lib/cancel-pending-alerts'
 import { z } from 'zod'
 import { recordSyncChange } from '../lib/sync-helpers'
@@ -73,6 +80,9 @@ app.post('/call-next', async (c) => {
     // When a reservation is postponed, its queueNumber stays the same but joinedAt changes
     // Sorting by joinedAt would put postponed tickets at the back of the queue,
     // but sorting by queueNumber preserves their original position
+    // Task 2-a — shared criteria: partitionWaiting uses the SAME predicate as
+    // GET /api/agency/queue and GET /api/agency/stats, so "the list says N
+    // waiting" and "call-next says none" can no longer disagree.
     const waitingReservations = await db.reservation.findMany({
       where: { agencyId, serviceId, status: 'WAITING' },
       orderBy: { queueNumber: 'asc' },
@@ -87,27 +97,30 @@ app.post('/call-next', async (c) => {
       return c.json({ success: false, error: 'No waiting reservations for this service' }, 404)
     }
 
-    // Phase 3: Enforce preferred time logic using getNextCustomerToCall
-    // Task 24: pass reservedDate so FUTURE-DATE tickets are never callable today
-    const nextId = getNextCustomerToCall(
-      waitingReservations.map(r => ({
-        id: r.id,
-        queueNumber: r.queueNumber,
-        preferredTime: r.preferredTime,
-        fixedTimeEnabled: r.fixedTimeEnabled,
-        reservedDate: r.reservedDate,
-      }))
-    )
+    const { callable: callableNow, scheduled: scheduledOnly } = partitionWaiting(waitingReservations)
 
-    if (!nextId) {
+    // Phase 3: Enforce preferred time logic — now via the SHARED picker
+    // (lib/queue-waiting.ts evaluates the same predicate the list/stats
+    // endpoints use; ordering (queueNumber asc) is preserved by the query).
+    // Task 24: reservedDate keeps FUTURE-DATE tickets uncallable today.
+    const nextId = pickNextCallable(waitingReservations)?.id ?? null
+    const nextReservation = nextId ? waitingReservations.find(r => r.id === nextId) ?? null : null
+
+    if (!nextReservation) {
+      // Task 2-a — truthful counts: every WAITING ticket on this service is
+      // scheduled for a later time/date. The same scheduledCount/callableCount
+      // breakdown is returned by the list/stats endpoints, so all surfaces
+      // agree on WHY nothing is callable.
       return c.json({
         success: false,
         error: 'All waiting reservations have preferred times in the future. No one to call yet.',
+        errorKey: 'ONLY_SCHEDULED_WAITING',
         hasPreferredTimeOnly: true,
+        waitingCount: waitingReservations.length,
+        scheduledCount: scheduledOnly.length,
+        callableCount: callableNow.length,
       }, 200)
     }
-
-    const nextReservation = waitingReservations.find(r => r.id === nextId)!
 
     // Phase 3b: Wrap all writes in a transaction with retry logic to prevent
     // SQLite BUSY/DEADLOCK errors under concurrent load (two desks calling next simultaneously)
@@ -170,15 +183,8 @@ app.post('/call-next', async (c) => {
     if (updateResult.count === 0) {
       const remainingReservations = waitingReservations.filter(r => r.id !== nextId && r.status === 'WAITING')
       if (remainingReservations.length > 0) {
-        const retryNextId = getNextCustomerToCall(
-          remainingReservations.map(r => ({
-            id: r.id,
-            queueNumber: r.queueNumber,
-            preferredTime: r.preferredTime,
-            fixedTimeEnabled: r.fixedTimeEnabled,
-            reservedDate: r.reservedDate,
-          }))
-        )
+        // Same shared predicate for the concurrent-retry probe (Task 2-a).
+        const retryNextId = pickNextCallable(remainingReservations)?.id ?? null
         if (retryNextId) {
           return c.json({
             success: false,
@@ -189,6 +195,12 @@ app.post('/call-next', async (c) => {
       }
       return c.json({ success: false, error: 'No available waiting reservations' }, 404)
     }
+
+    // Task 2-a — invalidate the cached public GETs that expose reservation-
+    // derived numbers (/api/stats, /api/agencies waitingCount). POSTs are
+    // never served from cache, but the READS that follow this mutation must
+    // not come from a stale TTL entry.
+    invalidateResponseCacheTag('stats', 'agencies')
 
     // Phase 3a: Merge original data with the mutation state for complete realtime event data
     const calledNow = new Date()

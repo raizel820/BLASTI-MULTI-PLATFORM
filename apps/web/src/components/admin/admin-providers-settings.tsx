@@ -53,6 +53,7 @@ import {
   Settings2, MessageSquare, Mail, MessageCircle, LayoutGrid, FileText, ScrollText,
   Eye, EyeOff, Send, Save, Loader2, RefreshCw, CheckCircle2, XCircle, Clock,
   AlertTriangle, Info, ExternalLink, KeyRound, FlaskConical, ChevronDown, Trash2,
+  ShieldCheck, Hash, Webhook, Copy, Check,
   type LucideIcon,
 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -163,11 +164,18 @@ interface ChannelFormState {
   extras: Record<string, string>;
 }
 
+/** Test request mode — connection = free key probe · otp = real verification template · message = raw text */
+type TestMode = 'connection' | 'otp' | 'message';
+
 interface TestResult {
   success: boolean;
   error?: string;
   responseRaw?: string;
   providerMessageId?: string;
+  /** Which test mode produced this result — drives the mode-specific details rendering */
+  mode?: TestMode;
+  /** Mode-specific payload: balance / verified number / template key / delivered-via */
+  details?: Record<string, unknown>;
 }
 
 /** Editor state for one (key, channel, language) template */
@@ -185,6 +193,15 @@ interface TemplateDraft {
 }
 
 // ─── Local bilingual copy (AR/EN — global i18n dictionaries untouched) ──
+
+/** GET /api/admin/providers/webhook-urls response shape */
+interface WebhookUrlsInfo {
+  baseUrl: string;
+  urls: {
+    SMS?: { url: string; signatureEnforced: boolean };
+    WHATSAPP?: { url: string; verifyTokenConfigured: boolean; signatureEnforced: boolean };
+  };
+}
 
 const COPY = {
   ar: {
@@ -237,13 +254,34 @@ const COPY = {
     save: 'حفظ',
     saving: 'جارٍ الحفظ...',
     saved: 'تم حفظ إعدادات القناة',
-    sendTest: 'إرسال اختبار',
+    sendTest: 'إرسال رسالة اختبار',
+    testConnection: 'اختبار الاتصال (مجاني)',
+    testOtp: 'اختبار إرسال OTP',
     testing: 'جارٍ الإرسال...',
+    testingConnection: 'جارٍ الاختبار...',
     testTargetRequired: 'أدخل رقم هاتف / بريد الاختبار أولاً',
     testOkMsg: 'تم إرسال رسالة الاختبار بنجاح',
+    testConnectionOk: 'المفاتيح تعمل — الطلب وصل إلى المزود',
+    testOtpOk: 'تم إرسال رمز التحقق التجريبي بنجاح',
     testFailMsg: 'فشل إرسال رسالة الاختبار',
     testMessageId: 'معرّف الرسالة لدى المزود',
     testRawResponse: 'رد المزود الخام',
+    testBalance: 'الرصيد',
+    testVerifiedNumber: 'الرقم المعتمد لدى ميتا',
+    testDisplayName: 'الاسم المعتمد',
+    testQualityRating: 'تقييم الجودة',
+    testDomainCount: 'عدد النطاقات الموثقة',
+    testTemplateSent: 'القالب المُرسل',
+    testDeliveredVia: 'تم التسليم عبر',
+    testButtonsHint: '«اختبار الاتصال» مجاني ويتحقق من صلاحية المفاتيح لدى المزود دون إرسال أي رسالة. «اختبار إرسال OTP» يرسل قالب التحقق الفعلي المُستخدم عند التسجيل مع رمز تجريبي (قد تُطبّق رسوم المزود).',
+    webhookUrlTitle: 'رابط Webhook تقارير التسليم',
+    webhookUrlHintSms: 'انسخ هذا الرابط إلى بوابة eSMS Africa (الإعدادات ← Webhooks ← DLR URL) لاستقبال تقارير التسليم.',
+    webhookUrlHintWa: 'سجّل هذا الرابط في Meta App Dashboard ← WhatsApp ← Configuration، واستخدم رمز التحقق أدناه عند الاشتراك.',
+    webhookCopy: 'نسخ',
+    webhookCopied: 'تم النسخ',
+    webhookSigEnforced: 'التوقيع مُفعّل',
+    webhookSigOpen: 'بدون تحقق توقيع (أضف السر أدناه لتأمينه)',
+    webhookVerifyTokenLabel: 'رمز تحقق Webhook',
     notesTitle: 'ملاحظات',
     loadFailed: 'تعذر تحميل بيانات المزودين',
     authRequired: 'هذه الصفحة تتطلب صلاحية مدير عام (SUPER_ADMIN).',
@@ -357,13 +395,34 @@ const COPY = {
     save: 'Save',
     saving: 'Saving...',
     saved: 'Channel settings saved',
-    sendTest: 'Send test',
+    sendTest: 'Send test message',
+    testConnection: 'Test connection (free)',
+    testOtp: 'Test OTP delivery',
     testing: 'Sending...',
+    testingConnection: 'Testing...',
     testTargetRequired: 'Enter a test phone number / email first',
     testOkMsg: 'Test message sent successfully',
+    testConnectionOk: 'Keys are working — the request reached the provider',
+    testOtpOk: 'Test verification code delivered successfully',
     testFailMsg: 'Test message failed',
     testMessageId: 'Provider message ID',
     testRawResponse: 'Raw provider response',
+    testBalance: 'Balance',
+    testVerifiedNumber: 'Verified number',
+    testDisplayName: 'Verified name',
+    testQualityRating: 'Quality rating',
+    testDomainCount: 'Verified domains',
+    testTemplateSent: 'Template sent',
+    testDeliveredVia: 'Delivered via',
+    testButtonsHint: '"Test connection" is free and validates the API key against the provider without sending any message. "Test OTP delivery" sends the real verification template used at signup with a sample code (provider fees may apply).',
+    webhookUrlTitle: 'Delivery-report webhook URL',
+    webhookUrlHintSms: 'Paste this URL into the eSMS Africa portal (Settings → Webhooks → DLR URL) to receive delivery reports.',
+    webhookUrlHintWa: 'Subscribe at Meta App Dashboard → WhatsApp → Configuration, and use the verify token below during the handshake.',
+    webhookCopy: 'Copy',
+    webhookCopied: 'Copied',
+    webhookSigEnforced: 'Signature enforced',
+    webhookSigOpen: 'No signature check (add the secret below to secure it)',
+    webhookVerifyTokenLabel: 'Webhook verify token',
     notesTitle: 'Notes',
     loadFailed: 'Failed to load provider data',
     authRequired: 'This page requires SUPER_ADMIN permissions.',
@@ -708,7 +767,39 @@ export function AdminProvidersSettings() {
     WHATSAPP: { enabled: false, values: {}, extras: {} },
   });
   const [savingChannel, setSavingChannel] = useState<Channel | null>(null);
+
+  // ── Delivery-report webhook URLs (SMS + WHATSAPP tabs) ──
+  // Lazily fetched once per page mount; the API resolves the public base
+  // (PUBLIC_BASE_URL env → CORS_ORIGIN → ?origin= hint → request origin).
+  const [webhookInfo, setWebhookInfo] = useState<WebhookUrlsInfo | null>(null);
+  const [webhookCopied, setWebhookCopied] = useState<Channel | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
+    apiFetch(`/api/admin/providers/webhook-urls${origin ? `?origin=${encodeURIComponent(origin)}` : ''}`)
+      .then(async (res) => {
+        const json = await res.json().catch(() => null);
+        if (!cancelled && res.ok && json?.success) setWebhookInfo(json as WebhookUrlsInfo);
+      })
+      .catch(() => {
+        // Silent — the panel simply stays hidden
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const copyWebhookUrl = async (channel: Channel, url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setWebhookCopied(channel);
+      setTimeout(() => setWebhookCopied(null), 2000);
+    } catch {
+      // Clipboard unavailable — the URL is selectable text anyway
+    }
+  };
   const [testingChannel, setTestingChannel] = useState<Channel | null>(null);
+  const [testingMode, setTestingMode] = useState<TestMode>('message');
   const [testResults, setTestResults] = useState<Partial<Record<Channel, TestResult>>>({});
 
   // ── Templates state ──
@@ -929,11 +1020,13 @@ export function AdminProvidersSettings() {
     }
   };
 
-  const sendTest = async (channel: Channel) => {
+  /** Fire a channel test — mode: connection (free key probe) / otp (real verification template) / message (raw text) */
+  const sendTest = async (channel: Channel, mode: TestMode) => {
     const registry = getRegistry(channel);
     const testField = registry?.extraFields?.find((f) => f.key.toLowerCase().startsWith('test'));
     const target = testField ? (forms[channel].extras[testField.key] ?? '').trim() : '';
-    if (!target) {
+    // Connection mode validates the keys only — it works even with an empty target
+    if (mode !== 'connection' && !target) {
       toast.error(c.testTargetRequired);
       return;
     }
@@ -941,11 +1034,12 @@ export function AdminProvidersSettings() {
     const saved = await saveChannel(channel);
     if (!saved) return;
     setTestingChannel(channel);
+    setTestingMode(mode);
     try {
       const res = await apiFetch(`/api/admin/providers/${channel}/test`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to: target }),
+        body: JSON.stringify(mode === 'connection' ? { mode } : { to: target, mode }),
       });
       const json = await res.json().catch(() => ({}));
       const result: TestResult = {
@@ -953,14 +1047,19 @@ export function AdminProvidersSettings() {
         error: json.error,
         responseRaw: json.responseRaw,
         providerMessageId: json.providerMessageId,
+        mode,
+        details: (json.details ?? undefined) as Record<string, unknown> | undefined,
       };
       setTestResults((prev) => ({ ...prev, [channel]: result }));
-      if (result.success) toast.success(c.testOkMsg);
-      else toast.error(json.error || c.testFailMsg);
+      if (result.success) {
+        toast.success(mode === 'connection' ? c.testConnectionOk : mode === 'otp' ? c.testOtpOk : c.testOkMsg);
+      } else {
+        toast.error(json.error || c.testFailMsg);
+      }
       // Refresh last-test metadata in the background
       fetchData(true);
     } catch {
-      setTestResults((prev) => ({ ...prev, [channel]: { success: false, error: c.testFailMsg } }));
+      setTestResults((prev) => ({ ...prev, [channel]: { success: false, error: c.testFailMsg, mode } }));
       toast.error(c.testFailMsg);
     } finally {
       setTestingChannel(null);
@@ -1606,26 +1705,94 @@ export function AdminProvidersSettings() {
                       </div>
                     )}
 
+                    {/* ── Delivery-report webhook URL (SMS / WHATSAPP) ── */}
+                    {(channel === 'SMS' || channel === 'WHATSAPP') && webhookInfo?.urls?.[channel] && (
+                      <div className="rounded-xl border border-emerald-200/70 dark:border-emerald-800/40 bg-white dark:bg-gray-900/40 p-3 space-y-2">
+                        <p className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                          <Webhook className="h-3.5 w-3.5 text-emerald-600" />
+                          {c.webhookUrlTitle}
+                        </p>
+                        <p className="text-[11px] text-muted-foreground leading-relaxed">
+                          {channel === 'SMS' ? c.webhookUrlHintSms : c.webhookUrlHintWa}
+                        </p>
+                        <div className="flex items-center gap-2">
+                          <code
+                            dir="ltr"
+                            className="flex-1 min-w-0 truncate rounded-lg bg-emerald-50 dark:bg-emerald-950/30 px-2.5 py-1.5 text-[11px] font-mono text-emerald-800 dark:text-emerald-300"
+                          >
+                            {webhookInfo.urls[channel]!.url}
+                          </code>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            className="h-8 rounded-lg gap-1.5 px-3 text-xs shrink-0"
+                            onClick={() => copyWebhookUrl(channel, webhookInfo.urls[channel]!.url)}
+                          >
+                            {webhookCopied === channel ? <Check className="h-3.5 w-3.5 text-emerald-600" /> : <Copy className="h-3.5 w-3.5" />}
+                            {webhookCopied === channel ? c.webhookCopied : c.webhookCopy}
+                          </Button>
+                        </div>
+                        {channel === 'SMS' && (
+                          <p className={`text-[10px] font-medium ${webhookInfo.urls.SMS?.signatureEnforced ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                            {webhookInfo.urls.SMS?.signatureEnforced ? `✓ ${c.webhookSigEnforced}` : `⚠ ${c.webhookSigOpen}`}
+                          </p>
+                        )}
+                        {channel === 'WHATSAPP' && (
+                          <p className={`text-[10px] font-medium ${webhookInfo.urls.WHATSAPP?.verifyTokenConfigured ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                            {c.webhookVerifyTokenLabel}: {webhookInfo.urls.WHATSAPP?.verifyTokenConfigured
+                              ? `✓ ${c.webhookSigEnforced}`
+                              : `⚠ ${c.webhookSigOpen}`}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
                     {/* ── Actions ── */}
-                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                    <div className="space-y-2">
                       <Button
                         onClick={() => saveChannel(channel)}
                         disabled={saving || testing}
-                        className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl h-10 gap-2"
+                        className="w-full sm:w-auto bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl h-10 gap-2"
                       >
                         {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                         {saving ? c.saving : c.save}
                       </Button>
                       {testField && (
-                        <Button
-                          onClick={() => sendTest(channel)}
-                          disabled={saving || testing}
-                          variant="outline"
-                          className="rounded-xl h-10 gap-2 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
-                        >
-                          {testing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                          {testing ? c.testing : c.sendTest}
-                        </Button>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                          <Button
+                            onClick={() => sendTest(channel, 'connection')}
+                            disabled={saving || testing}
+                            variant="outline"
+                            className="rounded-xl h-10 gap-2 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+                          >
+                            {testing && testingMode === 'connection' ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
+                            {testing && testingMode === 'connection' ? c.testingConnection : c.testConnection}
+                          </Button>
+                          <Button
+                            onClick={() => sendTest(channel, 'message')}
+                            disabled={saving || testing}
+                            variant="outline"
+                            className="rounded-xl h-10 gap-2 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+                          >
+                            {testing && testingMode === 'message' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                            {testing && testingMode === 'message' ? c.testing : c.sendTest}
+                          </Button>
+                          <Button
+                            onClick={() => sendTest(channel, 'otp')}
+                            disabled={saving || testing}
+                            variant="outline"
+                            className="rounded-xl h-10 gap-2 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20"
+                          >
+                            {testing && testingMode === 'otp' ? <Loader2 className="h-4 w-4 animate-spin" /> : <Hash className="h-4 w-4" />}
+                            {testing && testingMode === 'otp' ? c.testing : c.testOtp}
+                          </Button>
+                        </div>
+                      )}
+                      {testField && (
+                        <p className="text-[10px] text-muted-foreground flex items-start gap-1">
+                          <Info className="h-3 w-3 mt-0.5 shrink-0" />
+                          {c.testButtonsHint}
+                        </p>
                       )}
                     </div>
 
@@ -1641,8 +1808,57 @@ export function AdminProvidersSettings() {
                       >
                         <p className={`font-semibold flex items-center gap-1.5 ${testResult.success ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'}`}>
                           {testResult.success ? <CheckCircle2 className="h-3.5 w-3.5" /> : <XCircle className="h-3.5 w-3.5" />}
-                          {testResult.success ? c.testOkMsg : (testResult.error || c.testFailMsg)}
+                          {testResult.success
+                            ? (testResult.mode === 'connection' ? c.testConnectionOk : testResult.mode === 'otp' ? c.testOtpOk : c.testOkMsg)
+                            : (testResult.error || c.testFailMsg)}
                         </p>
+                        {/* Connection probe details (balance / verified number / domains) */}
+                        {testResult.success && testResult.mode === 'connection' && testResult.details && (
+                          <div className="space-y-0.5">
+                            {testResult.details.balance !== undefined && (
+                              <p className="text-[11px] text-muted-foreground">
+                                {c.testBalance}: <span className="font-semibold text-foreground" dir="ltr">
+                                  {String(testResult.details.balance)}{testResult.details.currency !== undefined ? ` ${String(testResult.details.currency)}` : ''}
+                                </span>
+                              </p>
+                            )}
+                            {testResult.details.displayPhoneNumber !== undefined && (
+                              <p className="text-[11px] text-muted-foreground">
+                                {c.testVerifiedNumber}: <span className="font-semibold text-foreground" dir="ltr">{String(testResult.details.displayPhoneNumber)}</span>
+                              </p>
+                            )}
+                            {testResult.details.verifiedName !== undefined && (
+                              <p className="text-[11px] text-muted-foreground">
+                                {c.testDisplayName}: <span className="font-semibold text-foreground">{String(testResult.details.verifiedName)}</span>
+                              </p>
+                            )}
+                            {testResult.details.qualityRating !== undefined && (
+                              <p className="text-[11px] text-muted-foreground">
+                                {c.testQualityRating}: <span className="font-semibold text-foreground">{String(testResult.details.qualityRating)}</span>
+                              </p>
+                            )}
+                            {testResult.details.domainCount !== undefined && (
+                              <p className="text-[11px] text-muted-foreground">
+                                {c.testDomainCount}: <span className="font-semibold text-foreground">{String(testResult.details.domainCount)}</span>
+                              </p>
+                            )}
+                          </div>
+                        )}
+                        {/* OTP-path details (which template was sent, actual delivery channel) */}
+                        {testResult.success && testResult.mode === 'otp' && (
+                          <div className="space-y-0.5">
+                            {testResult.details?.templateKey !== undefined && (
+                              <p className="text-[11px] text-muted-foreground">
+                                {c.testTemplateSent}: <code className="font-mono" dir="ltr">{String(testResult.details.templateKey)}</code>
+                              </p>
+                            )}
+                            {testResult.details?.deliveredVia !== undefined && (
+                              <p className="text-[11px] text-muted-foreground">
+                                {c.testDeliveredVia}: <span className="font-semibold text-foreground">{String(testResult.details.deliveredVia)}</span>
+                              </p>
+                            )}
+                          </div>
+                        )}
                         {testResult.providerMessageId && (
                           <p className="text-[11px] text-muted-foreground">
                             {c.testMessageId}: <code className="font-mono" dir="ltr">{testResult.providerMessageId}</code>

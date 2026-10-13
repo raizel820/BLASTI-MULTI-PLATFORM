@@ -9,7 +9,9 @@
  * Routes:
  *   GET   /                            → all channel configs (masked) + registry metadata
  *   PUT   /:channel                    → save channel config (secrets encrypted)
- *   POST  /:channel/test               → send a test message via the channel
+ *   POST  /:channel/test               → channel test — body { to?, mode?: 'connection' | 'otp' | 'message' }:
+ *                                          connection (free key probe, no message) · otp (real verification
+ *                                          template path) · message (raw free-form test, default)
  *   GET   /:channel/provider-templates → list provider-side templates (WhatsApp Graph)
  *   GET   /templates                   → list app templates (optionally ?channel=&key=)
  *   POST  /templates                   → create a template
@@ -31,17 +33,23 @@ import {
   type Channel,
 } from '../lib/messaging/provider-registry'
 import {
+  getProviderConfig,
   getProviderConfigMasked,
   saveProviderConfig,
   recordTestResult,
 } from '../lib/messaging/provider-config'
 import { DEV_BYPASS_CODES } from '../lib/verification-service'
-import { sendTestEmail } from '../lib/messaging/email-service'
-import { sendTestSms } from '../lib/messaging/sms-sender'
-import { sendTestWhatsApp, listWhatsAppTemplates } from '../lib/messaging/whatsapp-service'
+import { sendTestEmail, checkEmailConnection } from '../lib/messaging/email-service'
+import { sendTestSms, getEsmsBalance } from '../lib/messaging/sms-sender'
+import {
+  sendTestWhatsApp,
+  listWhatsAppTemplates,
+  verifyWhatsAppConnection,
+} from '../lib/messaging/whatsapp-service'
 import {
   ensureDefaultTemplates,
   renderTemplate,
+  deliverTemplate,
   TEMPLATE_CATALOG,
 } from '../lib/messaging/template-service'
 
@@ -130,7 +138,9 @@ app.put('/:channel', async (c) => {
   }
 })
 
-// ─── POST /:channel/test — send test message ────────────────────────────────
+// ─── POST /:channel/test — connection / OTP / message test ──────────────────
+
+type TestMode = 'connection' | 'otp' | 'message'
 
 app.post('/:channel/test', async (c) => {
   try {
@@ -141,17 +151,104 @@ app.post('/:channel/test', async (c) => {
     }
 
     const body = await c.req.json().catch(() => ({}))
-    const { to } = body as { to?: string }
+    const { to, mode } = body as { to?: string; mode?: string }
+    if (mode !== undefined && mode !== 'connection' && mode !== 'otp' && mode !== 'message') {
+      return c.json({ success: false, error: "Invalid mode. Allowed: 'connection' (free probe) | 'otp' | 'message'" }, 400)
+    }
+    const testMode: TestMode = mode ?? 'message'
+
+    // ── mode='connection' — FREE probe: validates the stored credentials reach
+    //    the provider without sending any message. Works with an empty target. ──
+    if (testMode === 'connection') {
+      let probe: { ok: boolean; error?: string; responseRaw?: string; details?: Record<string, unknown> }
+      if (channel === 'SMS') probe = await getEsmsBalance()
+      else if (channel === 'EMAIL') probe = await checkEmailConnection()
+      else probe = await verifyWhatsAppConnection()
+
+      await recordTestResult(channel, probe.ok, probe.error)
+      return c.json({
+        success: probe.ok,
+        error: probe.error,
+        responseRaw: probe.responseRaw,
+        details: probe.details,
+      })
+    }
+
     if (!to) {
       return c.json({ success: false, error: 'Test recipient (to) is required' }, 400)
     }
 
+    // ── mode='otp' — real end-to-end test of the verification path: sends the
+    //    ACTUAL template used at signup (verify_phone / verify_email) with a
+    //    sample code to the test target. ──
+    if (testMode === 'otp') {
+      const templateKey = channel === 'EMAIL' ? 'verify_email' : 'verify_phone'
+      const vars = channel === 'EMAIL'
+        ? { fullName: 'BLASTI Test', code: '87654321', expiryMinutes: 10 }
+        : { fullName: 'BLASTI Test', code: '654321', expiryMinutes: 10 }
+      const delivered = await deliverTemplate({ key: templateKey, channel, target: to, language: 'ar', vars })
+
+      await recordTestResult(channel, delivered.success, delivered.error)
+      return c.json({
+        success: delivered.success,
+        error: delivered.error,
+        responseRaw: delivered.responseRaw,
+        providerMessageId: delivered.providerMessageId,
+        details: { mode: 'otp', templateKey, deliveredVia: delivered.deliveredVia },
+      })
+    }
+
+    // ── mode='message' (default) — raw free-form test message (unchanged) ──
     let result: { success: boolean; error?: string; responseRaw?: string; providerMessageId?: string }
     if (channel === 'EMAIL') result = await sendTestEmail(to)
     else if (channel === 'SMS') result = await sendTestSms(to)
     else result = await sendTestWhatsApp(to)
 
     return c.json({ success: result.success, error: result.error, responseRaw: result.responseRaw, providerMessageId: result.providerMessageId })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
+// ─── GET /webhook-urls — URLs to paste into the provider dashboards ────────
+//
+// Resolves the PUBLIC base of this API so the admin can copy the exact
+// webhook URL for each provider:
+//   1. PUBLIC_BASE_URL env (production — set once on the VPS)
+//   2. CORS_ORIGIN env
+//   3. ?origin= hint from the browser (works behind preview gateways)
+//   4. the request's own origin (dev fallback)
+// Also reports which enforcement secrets are configured, so the UI can badge
+// each channel's webhook with "signature enforced" / "open (no secret)".
+
+app.get('/webhook-urls', async (c) => {
+  try {
+    await requireAdmin(c)
+
+    const explicit = (process.env.PUBLIC_BASE_URL || process.env.CORS_ORIGIN || '').replace(/\/+$/, '')
+    const originHint = c.req.query('origin') || ''
+    const requestOrigin = new URL(c.req.url).origin
+    const base =
+      (explicit && /^https?:\/\//i.test(explicit) && explicit) ||
+      (/^https?:\/\//i.test(originHint) ? originHint.replace(/\/+$/, '') : '') ||
+      requestOrigin
+
+    const [smsCfg, waCfg] = await Promise.all([getProviderConfig('SMS'), getProviderConfig('WHATSAPP')])
+
+    return c.json({
+      success: true,
+      baseUrl: base,
+      resolvedFrom: explicit ? 'env' : originHint ? 'origin-hint' : 'request',
+      urls: {
+        SMS: { url: `${base}/api/webhooks/esms`, signatureEnforced: !!smsCfg?.extra?.webhookSigningSecret },
+        WHATSAPP: {
+          url: `${base}/api/webhooks/whatsapp`,
+          verifyTokenConfigured: !!waCfg?.extra?.webhookVerifyToken,
+          signatureEnforced: !!waCfg?.extra?.metaAppSecret,
+        },
+      },
+    })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: false, error: err.error }, err.status as 400)

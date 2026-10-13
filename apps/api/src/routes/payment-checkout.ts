@@ -33,6 +33,7 @@ import {
 } from '../lib/chargily-service'
 import { fulfillCheckoutPaid, fulfillCheckoutFailed, normalizeChargilyStatus } from '../lib/chargily-fulfill'
 import { validateBody } from '../lib/validations'
+import { computeUpgradeCredit, applyProration, computePeriodDiscount } from '../lib/subscription-proration'
 import { z } from 'zod'
 
 const app = new Hono()
@@ -159,16 +160,21 @@ app.post('/create-checkout', async (c) => {
         return c.json({ success: false, error: 'This enterprise plan is not available for your agency' }, 403)
       }
 
-      // Period discount — identical computation to /agency/subscription/pay.
+      // Period discount — shared computation (same as /agency/subscription/pay).
       const effectivePeriod = period ?? 1
-      let discountPercent = 0
-      if (effectivePeriod === 3) discountPercent = planRecord.quarterlyDiscount
-      else if (effectivePeriod === 6) discountPercent = planRecord.semiAnnualDiscount
-      else if (effectivePeriod === 12) discountPercent = planRecord.annualDiscount
-      else if (effectivePeriod === 24) discountPercent = planRecord.biennialDiscount
+      const discountPercent = computePeriodDiscount(planRecord, effectivePeriod)
 
-      const subscriptionAmount = Math.round(planRecord.price * effectivePeriod * (1 - discountPercent / 100))
+      const listTotal = Math.round(planRecord.price * effectivePeriod * (1 - discountPercent / 100))
       const planNameSnapshot = effectivePeriod > 1 ? `${plan} (${effectivePeriod}m)` : plan
+
+      // ── Upgrade / early-renewal proration ──
+      // An agency with an ACTIVE subscription gets the unused per-day value
+      // of its current window credited against the new purchase (paid amount,
+      // remaining days, and the period discounts of the target plan all
+      // accounted for). Zero credit when there is no active window.
+      const creditInfo = await computeUpgradeCredit(agencyId)
+      const proration = applyProration(listTotal, creditInfo.remainingValue)
+      const subscriptionAmount = proration.chargeAmount
 
       // Optional hardware add-on: bundle pending UPFRONT orders from the
       // same agency into the SAME checkout (one payment for everything).
@@ -191,30 +197,10 @@ app.post('/create-checkout', async (c) => {
 
       const totalAmount = subscriptionAmount + hardwareAmount
 
-      const checkout = await createCheckout({
-        amount: totalAmount,
-        description: `BLASTI ${planRecord.displayName || plan} Subscription - ${agency.name}${
-          bundledOrders.length > 0 ? ` (+${bundledOrders.length} hardware order${bundledOrders.length > 1 ? 's' : ''})` : ''
-        }`,
-        metadata: {
-          agencyId,
-          plan,
-          period: String(effectivePeriod),
-          userId: user.id,
-          transactionType: 'subscription',
-          ...(bundledOrders.length > 0
-            ? { hardwareOrderIds: bundledOrders.map((o) => o.id).join(',') }
-            : {}),
-        },
-        successUrl,
-        failureUrl,
-        customerName: user.fullName,
-        paymentMethod,
-        locale: locale || 'ar',
-      })
-
-      // Create a pending transaction linked to this checkout
-      const transaction = await db.transaction.create({
+      // ── Pending Transaction FIRST — its id is shown on the hosted
+      // checkout page (description + metadata) so every payment is
+      // traceable, then linked to the Chargily checkout id after creation.
+      let transaction = await db.transaction.create({
         data: {
           agencyId,
           amount: totalAmount,
@@ -222,13 +208,67 @@ app.post('/create-checkout', async (c) => {
           paymentMethod: paymentMethod === 'edahabia' ? 'EDAHABIA' : 'CIB',
           status: 'PENDING',
           paymentProvider: 'chargily',
-          providerRef: checkout.id,
           amountPaid: totalAmount,
           planName: planNameSnapshot,
           priceSnapshot: planRecord.price,
           currencySnapshot: planRecord.currency,
           type: 'SUBSCRIPTION',
         },
+      })
+
+      const agencyAddress = [agency.address, agency.city, agency.wilaya, agency.postalCode]
+        .filter(Boolean)
+        .join(', ')
+
+      let checkout
+      try {
+        checkout = await createCheckout({
+          amount: totalAmount,
+          description: `BLASTI ${planRecord.displayName || plan} Subscription - ${agency.name}${
+            bundledOrders.length > 0 ? ` (+${bundledOrders.length} hardware order${bundledOrders.length > 1 ? 's' : ''})` : ''
+          } | Ref: ${transaction.id}`,
+          metadata: {
+            agencyId,
+            plan,
+            period: String(effectivePeriod),
+            userId: user.id,
+            transactionType: 'subscription',
+            transactionId: transaction.id,
+            // Proration transparency — visible in the Chargily dashboard:
+            listTotal: String(listTotal),
+            discountPercent: String(discountPercent),
+            creditApplied: String(proration.creditApplied),
+            ...(creditInfo.eligible ? { upgradeFrom: creditInfo.currentTier || '' } : {}),
+            ...(proration.minimumApplied ? { minimumChargeApplied: 'true' } : {}),
+            ...(bundledOrders.length > 0
+              ? { hardwareOrderIds: bundledOrders.map((o) => o.id).join(',') }
+              : {}),
+          },
+          successUrl,
+          failureUrl,
+          // Full agency identity — the hosted checkout page shows the
+          // agency's name, email, phone and address (not just the payer).
+          customerName: agency.name || user.fullName,
+          customerEmail: agency.email || undefined,
+          customerPhone: agency.phone || undefined,
+          customerAddress: agencyAddress || undefined,
+          paymentMethod,
+          locale: locale || 'ar',
+        })
+      } catch (err) {
+        // No orphan PENDING ledger row when the gateway refuses the checkout.
+        await db.transaction
+          .update({
+            where: { id: transaction.id },
+            data: { status: 'FAILED', rejectionReason: 'Chargily checkout creation failed', reviewedAt: new Date() },
+          })
+          .catch(() => undefined)
+        throw err
+      }
+
+      transaction = await db.transaction.update({
+        where: { id: transaction.id },
+        data: { providerRef: checkout.id },
       })
 
       // Link the bundled hardware orders to the same checkout id so the
@@ -262,6 +302,10 @@ app.post('/create-checkout', async (c) => {
             plan,
             period: effectivePeriod,
             amount: totalAmount,
+            listTotal,
+            discountPercent,
+            creditApplied: proration.creditApplied,
+            minimumApplied: proration.minimumApplied,
             subscriptionAmount,
             hardwareAmount,
             paymentMethod,
@@ -279,6 +323,17 @@ app.post('/create-checkout', async (c) => {
           currency: planRecord.currency || 'DZD',
           type: 'subscription',
           hardwareOrderIds: bundledOrders.map((o) => o.id),
+          proration: {
+            eligible: creditInfo.eligible,
+            upgradeFrom: creditInfo.currentTier,
+            daysRemaining: creditInfo.daysRemaining,
+            paidAmount: creditInfo.paidAmount,
+            listTotal,
+            discountPercent,
+            creditApplied: proration.creditApplied,
+            chargeAmount: proration.chargeAmount,
+            minimumApplied: proration.minimumApplied,
+          },
         },
       })
     }
@@ -293,25 +348,9 @@ app.post('/create-checkout', async (c) => {
       }
       const pack = SMS_PACKS[packId]
 
-      const checkout = await createCheckout({
-        amount: pack.price,
-        description: `BLASTI SMS Pack - ${pack.quantity} credits`,
-        metadata: {
-          userId: user.id,
-          packId,
-          quantity: String(pack.quantity),
-          transactionType: 'sms',
-        },
-        successUrl,
-        failureUrl,
-        customerName: user.fullName,
-        paymentMethod,
-        locale: locale || 'ar',
-      })
-
-      // Create the pending purchase — credits are granted automatically when
-      // Chargily confirms the payment (webhook or return-trip polling).
-      const purchase = await db.smsPurchase.create({
+      // Pending purchase FIRST — its id rides in the checkout metadata and
+      // the hosted page description for traceability.
+      let purchase = await db.smsPurchase.create({
         data: {
           userId: user.id,
           quantity: pack.quantity,
@@ -319,8 +358,45 @@ app.post('/create-checkout', async (c) => {
           status: 'PENDING',
           paymentMethod: paymentMethod === 'edahabia' ? 'EDAHABIA' : 'CIB',
           paymentProvider: 'chargily',
-          providerRef: checkout.id,
         },
+      })
+
+      // Payer contact (customers buy SMS with their own identity).
+      const payer = await db.user.findUnique({
+        where: { id: user.id },
+        select: { fullName: true, email: true, phoneNumber: true },
+      })
+
+      let checkout
+      try {
+        checkout = await createCheckout({
+          amount: pack.price,
+          description: `BLASTI SMS Pack - ${pack.quantity} credits | Ref: ${purchase.id}`,
+          metadata: {
+            userId: user.id,
+            packId,
+            quantity: String(pack.quantity),
+            transactionType: 'sms',
+            smsPurchaseId: purchase.id,
+          },
+          successUrl,
+          failureUrl,
+          customerName: payer?.fullName || user.fullName,
+          customerEmail: payer?.email || undefined,
+          customerPhone: payer?.phoneNumber || undefined,
+          paymentMethod,
+          locale: locale || 'ar',
+        })
+      } catch (err) {
+        await db.smsPurchase
+          .update({ where: { id: purchase.id }, data: { status: 'FAILED', webhookVerified: true } })
+          .catch(() => undefined)
+        throw err
+      }
+
+      purchase = await db.smsPurchase.update({
+        where: { id: purchase.id },
+        data: { providerRef: checkout.id },
       })
 
       await db.auditLog.create({
@@ -390,24 +466,8 @@ app.post('/create-checkout', async (c) => {
       .map((i) => `${i.quantity}× ${i.product.name}`)
       .join(', ')
 
-    const checkout = await createCheckout({
-      amount: order.upfrontTotal,
-      description: `BLASTI Hardware - ${itemsSummary || 'Devices'}${agency ? ` - ${agency.name}` : ''}`,
-      metadata: {
-        agencyId: order.agencyId,
-        orderId: order.id,
-        userId: user.id,
-        transactionType: 'hardware',
-      },
-      successUrl,
-      failureUrl,
-      customerName: user.fullName,
-      paymentMethod,
-      locale: locale || 'ar',
-    })
-
-    // Payment ledger entry (shows up in admin transactions + analytics).
-    const transaction = await db.transaction.create({
+    // Ledger entry FIRST so the transaction id appears on the hosted page.
+    let transaction = await db.transaction.create({
       data: {
         agencyId: order.agencyId,
         amount: order.upfrontTotal,
@@ -415,13 +475,52 @@ app.post('/create-checkout', async (c) => {
         paymentMethod: paymentMethod === 'edahabia' ? 'EDAHABIA' : 'CIB',
         status: 'PENDING',
         paymentProvider: 'chargily',
-        providerRef: checkout.id,
         amountPaid: order.upfrontTotal,
         planName: itemsSummary || 'Hardware order',
         currencySnapshot: 'DZD',
         type: 'HARDWARE',
         hardwareOrderId: order.id,
       },
+    })
+
+    const hwAddress = agency
+      ? [agency.address, agency.city, agency.wilaya, agency.postalCode].filter(Boolean).join(', ')
+      : ''
+
+    let checkout
+    try {
+      checkout = await createCheckout({
+        amount: order.upfrontTotal,
+        description: `BLASTI Hardware - ${itemsSummary || 'Devices'}${agency ? ` - ${agency.name}` : ''} | Ref: ${transaction.id}`,
+        metadata: {
+          agencyId: order.agencyId,
+          orderId: order.id,
+          userId: user.id,
+          transactionType: 'hardware',
+          transactionId: transaction.id,
+        },
+        successUrl,
+        failureUrl,
+        customerName: agency?.name || user.fullName,
+        customerEmail: agency?.email || undefined,
+        customerPhone: agency?.phone || undefined,
+        customerAddress: hwAddress || undefined,
+        paymentMethod,
+        locale: locale || 'ar',
+      })
+    } catch (err) {
+      await db.transaction
+        .update({
+          where: { id: transaction.id },
+          data: { status: 'FAILED', rejectionReason: 'Chargily checkout creation failed', reviewedAt: new Date() },
+        })
+        .catch(() => undefined)
+      throw err
+    }
+
+    transaction = await db.transaction.update({
+      where: { id: transaction.id },
+      data: { providerRef: checkout.id },
     })
 
     // Link the order to the checkout — the fulfillment pass approves it.
@@ -500,6 +599,82 @@ app.post('/create-checkout', async (c) => {
     }
     console.error('[payment-checkout] Error creating checkout:', error)
     return c.json({ success: false, error: 'Failed to create checkout session' }, 500)
+  }
+})
+
+// ─── GET /subscription-quote — Proration preview (read-only) ─────────────
+//
+// Returns what an agency would be charged for a plan + period RIGHT NOW,
+// including the upgrade / early-renewal credit for the current ACTIVE
+// subscription window (paid amount × remaining days, target-plan discounts
+// applied). The agency payment dialog shows this breakdown BEFORE checkout.
+
+app.get('/subscription-quote', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const agencyId = c.req.query('agencyId') || ''
+    const plan = c.req.query('plan') || ''
+    const period = Number(c.req.query('period') || '1')
+
+    if (!agencyId || !plan) {
+      return c.json({ success: false, error: 'agencyId and plan are required' }, 400)
+    }
+    if (![1, 3, 6, 12, 24].includes(period)) {
+      return c.json({ success: false, error: 'period must be one of 1, 3, 6, 12, 24' }, 400)
+    }
+
+    await requireAgencyAccess(c, agencyId)
+    await requireAgencyAuthority(c, agencyId, 'canPurchaseSubscription')
+
+    const planRecord = await db.subscriptionPlan.findFirst({
+      where: { name: plan, isActive: true },
+    })
+    if (!planRecord) {
+      return c.json({ success: false, error: 'Invalid or inactive plan' }, 400)
+    }
+    if (planRecord.isEnterprise && planRecord.ownerAgencyId && planRecord.ownerAgencyId !== agencyId) {
+      return c.json({ success: false, error: 'This enterprise plan is not available for your agency' }, 403)
+    }
+
+    const discountPercent = computePeriodDiscount(planRecord, period)
+    const listTotal = Math.round(planRecord.price * period * (1 - discountPercent / 100))
+    const creditInfo = await computeUpgradeCredit(agencyId)
+    const proration = applyProration(listTotal, creditInfo.remainingValue)
+
+    return c.json({
+      success: true,
+      data: {
+        plan: {
+          name: planRecord.name,
+          displayName: planRecord.displayName,
+          price: planRecord.price,
+          currency: planRecord.currency,
+        },
+        period,
+        discountPercent,
+        listTotal,
+        credit: {
+          eligible: creditInfo.eligible,
+          upgradeFrom: creditInfo.currentTier,
+          currentPlanName: creditInfo.currentPlanName,
+          currentExpiresAt: creditInfo.currentExpiresAt?.toISOString() ?? null,
+          daysRemaining: creditInfo.daysRemaining,
+          totalDays: creditInfo.totalDays,
+          paidAmount: creditInfo.paidAmount,
+          remainingValue: creditInfo.remainingValue,
+          creditApplied: proration.creditApplied,
+        },
+        chargeAmount: proration.chargeAmount,
+        minimumApplied: proration.minimumApplied,
+      },
+    })
+  } catch (error) {
+    const authErr = authErrorResponse(error)
+    if (authErr.status === 401 || authErr.status === 403) {
+      return c.json({ success: false, error: authErr.error }, authErr.status as 400)
+    }
+    console.error('[payment-checkout] subscription quote error:', error)
+    return c.json({ success: false, error: 'Failed to compute subscription quote' }, 500)
   }
 })
 

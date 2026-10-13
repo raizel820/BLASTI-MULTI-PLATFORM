@@ -288,6 +288,27 @@ contextBridge.exposeInMainWorld('electronAPI', {
   initialCloudSync: () => ipcRenderer.invoke('cloud-sync:initial-sync'),
 
   /**
+   * Task 2-b (sub-task 4) — run the FULL data sync now (post-login consent
+   * dialog "Sync now"). Outbox replay + pull from sequence 0 + record-level
+   * reconcile. "Not now" never calls this; incremental sync is unaffected.
+   * @returns {Promise<{ success: boolean, error?: string, full?: object }>}
+   */
+  fullSyncNow: () => ipcRenderer.invoke('sync:full-now'),
+
+  /**
+   * Task 2-b (sub-tasks 3+5) — fired by the main process on before-quit so
+   * the renderer can purge non-persisted (non remember-me) session state
+   * while it can still run JS. Returns an unsubscribe function.
+   * @param {(payload: { reason: string }) => void} callback
+   * @returns {() => void} unsubscribe function
+   */
+  onAppQuitting: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on('app:quitting', listener);
+    return () => ipcRenderer.removeListener('app:quitting', listener);
+  },
+
+  /**
    * Listen for initial-sync progress events (v2 staged initial sync).
    * main.js (agent 7-b) forwards runInitialSync emitFn events from the local
    * API process to this channel via webContents.send('initial-sync:progress').

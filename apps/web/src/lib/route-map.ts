@@ -49,6 +49,17 @@ export const viewToUrl: Record<ViewName, string> = {
   'admin-users': '/admin/users',
   'admin-analytics': '/admin/analytics',
   'admin-settings': '/admin/settings',
+  // Platform Settings split (Task 5): one URL per former section of the
+  // admin-settings long-scroll page. Role guard is inherited from the
+  // `admin-` prefix branch in getAllowedRolesForView (SUPER_ADMIN only).
+  'admin-settings-vps': '/admin/settings/vps',
+  'admin-settings-providers': '/admin/settings/providers',
+  'admin-settings-maps': '/admin/settings/maps',
+  'admin-settings-payments': '/admin/settings/payments',
+  'admin-settings-security': '/admin/settings/security',
+  'admin-settings-faq': '/admin/settings/faq',
+  'admin-settings-config': '/admin/settings/config',
+  'admin-settings-financial': '/admin/settings/financial',
   'admin-tickets': '/admin/tickets',
   // Task 2-b: dedicated super-admin Maps & Location view. The role guard is
   // inherited from the `admin-` prefix branch in getAllowedRolesForView below
@@ -63,6 +74,10 @@ export const viewToUrl: Record<ViewName, string> = {
   // inherited from the `admin-` prefix branch in getAllowedRolesForView
   // (SUPER_ADMIN only), same as every other admin view.
   'admin-db': '/admin/db',
+  // Task 2: Storage Manager — SUPER_ADMIN on-disk file store console.
+  // Role guard is inherited from the `admin-` prefix branch in
+  // getAllowedRolesForView (SUPER_ADMIN only), same as admin-db.
+  'admin-storage': '/admin/storage',
   'kiosk': '/kiosk',
 };
 

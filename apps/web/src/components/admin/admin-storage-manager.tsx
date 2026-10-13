@@ -18,7 +18,20 @@
  *                  video/audio players and text files (first 256 KB);
  *                  binaries fall back to download/open actions
  *   Delete       → DELETE /file { storagePath } (disk unlink + FileAsset
- *                  tombstone server-side)
+ *                  tombstone + AppVersion publish-cascade server-side)
+ *   Rename       → POST /rename { storagePath, newName } (in-place rename;
+ *                  FileAsset + AppVersion rows repoint, active installer
+ *                  stays active under its new name)
+ *
+ * Task 2-c-2 — navigation + download upgrades:
+ *   - Per-file DOWNLOAD via the admin streaming endpoint
+ *     GET /api/admin/storage/download?path=... (Content-Disposition:
+ *     attachment) — works for every file, with or without a public URL.
+ *   - Sort dropdown (name/date/size/type, asc/desc) applied to the file
+ *     tables (month listing + legacy flat files).
+ *   - Name search on BOTH the flat-files listing and the month listing.
+ *   - Per-kind Lucide file icons, custom scrollbar on the list viewport,
+ *     ≥44px touch targets for row actions (mobile-first).
  *
  * Conventions mirror admin-db-manager.tsx: same page padding (p-4 lg:p-6),
  * apiFetch + res.ok discipline, both unwrapped and {success, data} envelope
@@ -29,7 +42,8 @@
 
 import { apiFetch } from '@/lib/api-fetch';
 import { buildCloudUrl } from '@/lib/api-client';
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { downloadAdminStorageFile } from '@/lib/admin-download';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
@@ -38,13 +52,12 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import {
   HardDrive,
   RefreshCw,
@@ -52,14 +65,23 @@ import {
   Search,
   Trash2,
   Copy,
+  Pencil,
   ExternalLink,
   ArrowLeft,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
   ChevronRight,
   Folder,
+  FolderOpen,
+  FolderInput,
+  FolderPlus,
+  Upload,
   UserCircle,
   Image,
   ReceiptText,
   FileText,
+  FileArchive,
   Package,
   PackageCheck,
   MonitorDown,
@@ -69,8 +91,17 @@ import {
   Music,
   Video,
   FileQuestion,
+  Check,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
 import { ConfirmDialog } from '@/components/shared/confirm-dialog';
@@ -119,17 +150,13 @@ interface Overview {
   categories: CategoryInfo[];
 }
 
-interface YearRow {
-  yyyy: string;
+/** Generic folder row — ANY level of the tree (bucket or admin subfolder). */
+interface BrowseFolderRow {
+  name: string;
+  path: string;
+  files: number;
+  bytes: number;
   folders: number;
-  files: number;
-  bytes: number;
-}
-
-interface MonthRow {
-  mm: string;
-  files: number;
-  bytes: number;
 }
 
 interface StorageFileRow {
@@ -141,15 +168,15 @@ interface StorageFileRow {
   tracked: boolean;
 }
 
-type BrowseData =
-  | { level: 1; bucket: string; years: YearRow[]; flatFiles: StorageFileRow[] }
-  | { level: 2; bucket: string; yyyy: string; months: MonthRow[] }
-  | { level: 3; bucket: string; yyyy: string; mm: string; files: StorageFileRow[] };
-
-interface NavState {
-  bucket: string | null;
-  yyyy: string | null;
-  mm: string | null;
+/**
+ * GET /api/admin/storage/browse payload — ONE shape for EVERY level:
+ * { path, folders, files, totals }. `path` '' = storage root (buckets).
+ */
+interface BrowseData {
+  path: string;
+  folders: BrowseFolderRow[];
+  files: StorageFileRow[];
+  totals: { files: number; bytes: number };
 }
 
 // ─── Formatting helpers ─────────────────────────────────────────────────────
@@ -201,6 +228,45 @@ function isPreviewable(name: string): boolean {
 }
 
 /**
+ * Task 2-c-2 — per-kind list icon (Lucide). Drives the file-type column in
+ * the storage tables: every row shows the kind of document it holds.
+ */
+const ICON_BY_KIND: Record<FileKind, LucideIcon> = {
+  image: Image,
+  pdf: FileText,
+  video: Video,
+  audio: Music,
+  text: FileText,
+  binary: FileArchive,
+};
+
+function fileKindIcon(name: string): LucideIcon {
+  return ICON_BY_KIND[fileKind(name)] ?? FileQuestion;
+}
+
+/** Sort fields for the file tables (Task 2-c-2 sort dropdown). */
+type SortField = 'date' | 'name' | 'size' | 'type';
+type SortDir = 'asc' | 'desc';
+
+/** Non-mutating client-side sort of normalized file rows. */
+function sortFileRows(files: StorageFileRow[], field: SortField, dir: SortDir): StorageFileRow[] {
+  const mul = dir === 'asc' ? 1 : -1;
+  return [...files].sort((a, b) => {
+    switch (field) {
+      case 'name':
+        return a.name.localeCompare(b.name) * mul;
+      case 'size':
+        return (a.size - b.size) * mul;
+      case 'type':
+        return (fileKind(a.name).localeCompare(fileKind(b.name)) || a.name.localeCompare(b.name)) * mul;
+      case 'date':
+      default:
+        return (a.mtimeMs - b.mtimeMs) * mul;
+    }
+  });
+}
+
+/**
  * Browser-reachable URL for a stored file. The API returns RELATIVE
  * /api/upload/file/... paths — behind the single-port sandbox gateway those
  * only resolve when XTransformPort=3003 is appended, while on loopback/LAN
@@ -209,6 +275,16 @@ function isPreviewable(name: string): boolean {
 function fileBrowserUrl(url: string): string {
   return url.startsWith('/') ? buildCloudUrl(url) : url;
 }
+
+/**
+ * Task 2-c-2 — ADMIN download endpoint (apps/api/src/routes/admin-storage.ts
+ * GET /download). Streams the file with Content-Disposition: attachment —
+ * unlike the public capability URL (inline preview) it forces a real
+ * download and works for EVERY managed file, with or without a public URL.
+ * The actual fetch runs BINARY-SAFE through lib/admin-download.ts (native
+ * fetch + real Blob + per-shell auth) — apiFetch() would text-decode the
+ * stream and corrupt binary files.
+ */
 
 /** Locale-aware medium date + short time. */
 function formatModified(ms: number, lang: Language): string {
@@ -258,16 +334,10 @@ function normFile(v: unknown): StorageFileRow | null {
   };
 }
 
-function normYear(v: unknown): YearRow | null {
+function normFolder(v: unknown): BrowseFolderRow | null {
   const r = asRecord(v);
-  if (!r || typeof r.yyyy !== 'string') return null;
-  return { yyyy: r.yyyy, folders: num(r.folders), files: num(r.files), bytes: num(r.bytes) };
-}
-
-function normMonth(v: unknown): MonthRow | null {
-  const r = asRecord(v);
-  if (!r || typeof r.mm !== 'string') return null;
-  return { mm: r.mm, files: num(r.files), bytes: num(r.bytes) };
+  if (!r || typeof r.name !== 'string' || typeof r.path !== 'string') return null;
+  return { name: r.name, path: r.path, files: num(r.files), bytes: num(r.bytes), folders: num(r.folders) };
 }
 
 function normCategory(v: unknown): CategoryInfo | null {
@@ -344,10 +414,6 @@ function bucketIcon(bucket: string): LucideIcon {
   return BUCKET_ICON[bucket] ?? Folder;
 }
 
-function pathKey(bucket: string, yyyy: string | null, mm: string | null): string {
-  return mm && yyyy ? `${bucket}/${yyyy}/${mm}` : yyyy ? `${bucket}/${yyyy}` : bucket;
-}
-
 // ─── Preview dialog (images / PDF / video / audio / text) ───────────────
 
 interface StoragePreviewDialogProps {
@@ -357,6 +423,8 @@ interface StoragePreviewDialogProps {
   t: (key: TranslationKeys, params?: Record<string, string>) => string;
   lang: Language;
   onCopy: (text: string) => void;
+  onDownload: (file: StorageFileRow) => void;
+  downloading: boolean;
 }
 
 /** Text previews are capped — a multi-MB log must never freeze the tab. */
@@ -371,7 +439,7 @@ function PreviewFallback({ icon: Icon, text }: { icon: LucideIcon; text: string 
   );
 }
 
-function StoragePreviewDialog({ file, open, onOpenChange, t, lang, onCopy }: StoragePreviewDialogProps) {
+function StoragePreviewDialog({ file, open, onOpenChange, t, lang, onCopy, onDownload, downloading }: StoragePreviewDialogProps) {
   const src = file?.url ? fileBrowserUrl(file.url) : null;
   const kind = file ? fileKind(file.name) : 'binary';
 
@@ -516,16 +584,21 @@ function StoragePreviewDialog({ file, open, onOpenChange, t, lang, onCopy }: Sto
               <Copy className="h-3.5 w-3.5 me-1" />
               {t('storageCopyPath')}
             </Button>
-            {src && (
-              <a
-                href={src}
-                download={file.name}
-                className="inline-flex items-center justify-center gap-1.5 h-8 px-3 rounded-md border border-input bg-background text-sm font-medium hover:bg-muted transition-colors"
-              >
-                <Download className="h-3.5 w-3.5" />
-                {t('storageDownload')}
-              </a>
-            )}
+            {/* Task 2-c-2 — download via the ADMIN streaming endpoint
+                (attachment; works for every file, no public URL needed). */}
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={downloading}
+              onClick={() => onDownload(file)}
+            >
+              {downloading ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin me-1" />
+              ) : (
+                <Download className="h-3.5 w-3.5 me-1" />
+              )}
+              {t('storageDownload')}
+            </Button>
             {src && (
               <a
                 href={src}
@@ -552,15 +625,19 @@ interface FilesTableProps {
   lang: Language;
   onCopy: (path: string) => void;
   onAskDelete: (file: StorageFileRow) => void;
+  onAskRename: (file: StorageFileRow) => void;
+  onAskMove: (file: StorageFileRow) => void;
   onPreview: (file: StorageFileRow) => void;
+  onDownload: (file: StorageFileRow) => void;
+  downloadingPath: string | null;
 }
 
-function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: FilesTableProps) {
+function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onAskRename, onAskMove, onPreview, onDownload, downloadingPath }: FilesTableProps) {
   return (
     <div className="rounded-xl border overflow-hidden">
-      {/* Long lists scroll inside a bounded viewport (custom-scrollbar free —
-          mirrors admin-db-manager's plain overflow-auto container). */}
-      <div className="max-h-[480px] overflow-y-auto">
+      {/* Scrolling is owned by the explorer viewport around the table —
+          nested scrollbars made navigating feel cramped (user report). */}
+      <div>
         <Table>
           <TableHeader className="sticky top-0 z-10 bg-background">
             <TableRow>
@@ -584,6 +661,8 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                 const thumb = f.name.toLowerCase().match(/\.(png|jpe?g|webp|gif|svg|bmp|avif|ico)$/)
                   ? (f.url ? fileBrowserUrl(f.url) : null)
                   : null;
+                const KindIcon = fileKindIcon(f.name);
+                const downloading = downloadingPath === f.storagePath;
                 return (
                 <TableRow key={f.storagePath || idx}>
                   <TableCell className="max-w-[280px]">
@@ -591,7 +670,7 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                       type="button"
                       onClick={() => { if (previewable) onPreview(f); }}
                       disabled={!previewable}
-                      className={`flex items-center gap-2.5 min-w-0 max-w-full text-start ${previewable ? 'group cursor-pointer' : 'cursor-default'}`}
+                      className={`flex items-center gap-2.5 min-w-[44px] min-h-[44px] sm:min-h-0 py-1 max-w-full text-start ${previewable ? 'group cursor-pointer' : 'cursor-default'}`}
                       title={previewable ? t('storagePreview') : undefined}
                     >
                       {thumb ? (
@@ -602,8 +681,8 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                           className="h-9 w-9 rounded-md border object-cover shrink-0 bg-muted/40 group-hover:border-emerald-400 dark:group-hover:border-emerald-600 transition-colors"
                         />
                       ) : (
-                        <span className="h-9 w-9 rounded-md border bg-muted/40 flex items-center justify-center shrink-0">
-                          <FileText className="h-4 w-4 text-muted-foreground/70" />
+                        <span className="h-9 w-9 rounded-md border bg-muted/40 flex items-center justify-center shrink-0" aria-hidden="true">
+                          <KindIcon className="h-4 w-4 text-muted-foreground/70" />
                         </span>
                       )}
                       <span className={`font-mono text-[12px] truncate ${previewable ? 'group-hover:underline decoration-dotted underline-offset-2' : ''}`} title={f.name}>
@@ -632,7 +711,7 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                         <Button
                           variant="ghost"
                           size="sm"
-                          className="h-7 w-7 p-0"
+                          className="h-11 w-11 sm:h-7 sm:w-7 p-0"
                           title={t('storagePreview')}
                           aria-label={t('storagePreview')}
                           onClick={() => onPreview(f)}
@@ -643,12 +722,30 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                       <Button
                         variant="ghost"
                         size="sm"
-                        className="h-7 w-7 p-0"
+                        className="h-11 w-11 sm:h-7 sm:w-7 p-0"
                         title={t('storageCopyPath')}
                         aria-label={t('storageCopyPath')}
                         onClick={() => onCopy(f.storagePath)}
                       >
                         <Copy className="h-3.5 w-3.5" />
+                      </Button>
+                      {/* Task 2-c-2 — per-file download through the ADMIN
+                          streaming endpoint (attachment). No public URL
+                          needed — works for every managed file. */}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-11 w-11 sm:h-7 sm:w-7 p-0"
+                        title={t('storageDownload')}
+                        aria-label={t('storageDownload')}
+                        disabled={downloadingPath !== null}
+                        onClick={() => onDownload(f)}
+                      >
+                        {downloading ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Download className="h-3.5 w-3.5" />
+                        )}
                       </Button>
                       {f.url && (
                         <a
@@ -657,15 +754,40 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onPreview }: F
                           rel="noopener noreferrer"
                           title={t('storageOpenFile')}
                           aria-label={t('storageOpenFile')}
-                          className="inline-flex items-center justify-center h-7 w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                          className="inline-flex items-center justify-center h-11 w-11 sm:h-7 sm:w-7 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
                         >
                           <ExternalLink className="h-3.5 w-3.5" />
                         </a>
                       )}
+                      {/* Rename in place (same folder) — downstream rows
+                          (FileAsset/AppVersion) repoint server-side. */}
                       <Button
                         variant="ghost"
                         size="sm"
-                        className="h-7 w-7 p-0 text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20"
+                        className="h-11 w-11 sm:h-7 sm:w-7 p-0"
+                        title={t('storageRename')}
+                        aria-label={t('storageRename')}
+                        onClick={() => onAskRename(f)}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </Button>
+                      {/* Move to another folder — cross-folder (and
+                          cross-bucket) with FileAsset/AppVersion repointing
+                          handled server-side. */}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-11 w-11 sm:h-7 sm:w-7 p-0"
+                        title={t('storageMove')}
+                        aria-label={t('storageMove')}
+                        onClick={() => onAskMove(f)}
+                      >
+                        <FolderInput className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-11 w-11 sm:h-7 sm:w-7 p-0 text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20"
                         title={t('storageDelete')}
                         aria-label={t('storageDelete')}
                         onClick={() => onAskDelete(f)}
@@ -696,24 +818,49 @@ export function AdminStorageManager() {
   const [loadingOverview, setLoadingOverview] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
-  // Drill-down navigation (level is derived: null bucket = categories grid)
-  const [nav, setNav] = useState<NavState>({ bucket: null, yyyy: null, mm: null });
+  // Generic folder navigation — `navPath` is a POSIX path relative to the
+  // storage root ('' = root → the bucket grid). One shape at EVERY level.
+  const [navPath, setNavPath] = useState('');
   const [browse, setBrowse] = useState<BrowseData | null>(null);
   const [loadingBrowse, setLoadingBrowse] = useState(false);
 
   // Per-path cache so Back/breadcrumb navigation never blanks out — ALL
-  // fetched levels stay in component state. Invalidated per-bucket on delete.
+  // fetched levels stay in component state. Invalidated per-folder subtree
+  // on delete/rename/move/upload.
   const [cache, setCache] = useState<Record<string, BrowseData>>({});
 
-  // Level-3 client-side name filter
+  // Client-side name filter (applied to files AND folders).
   const [fileSearch, setFileSearch] = useState('');
+
+  // Task 2-c-2 — sort controls (name/date/size/type × asc/desc) + download
+  const [sortField, setSortField] = useState<SortField>('date');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
+  const [downloadingPath, setDownloadingPath] = useState<string | null>(null);
 
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<StorageFileRow | null>(null);
   const [deleting, setDeleting] = useState(false);
+  // Rename-in-place dialog state (mirror of the delete flow).
+  const [renameTarget, setRenameTarget] = useState<StorageFileRow | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [renaming, setRenaming] = useState(false);
 
   // Preview dialog (image / PDF / video / audio / text)
   const [previewTarget, setPreviewTarget] = useState<StorageFileRow | null>(null);
+
+  // New-folder dialog
+  const [newFolderOpen, setNewFolderOpen] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [creatingFolder, setCreatingFolder] = useState(false);
+
+  // Manual upload (into the CURRENT folder)
+  const [uploading, setUploading] = useState(false);
+
+  // Move dialog (file → destination folder picker)
+  const [moveTarget, setMoveTarget] = useState<StorageFileRow | null>(null);
+  const [folderOptions, setFolderOptions] = useState<string[] | null>(null);
+  const [moveDestination, setMoveDestination] = useState('');
+  const [moving, setMoving] = useState(false);
 
   // ── Overview fetch ──
   const fetchOverview = useCallback(async (isRefresh = false) => {
@@ -741,16 +888,20 @@ export function AdminStorageManager() {
     fetchOverview();
   }, [fetchOverview]);
 
-  // ── Browse fetch (level 1/2/3) ──
+  // Root folder listing — the explorer's first paint (the old level-0 grid
+  // came from the overview payload; the generic explorer needs its own fetch).
+  useEffect(() => {
+    fetchLevel('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Browse fetch (generic folder level — ONE shape at EVERY depth) ──
   const fetchLevel = useCallback(async (
-    bucket: string,
-    yyyy: string | null,
-    mm: string | null,
+    path: string,
     opts?: { force?: boolean }
   ) => {
-    const key = pathKey(bucket, yyyy, mm);
     if (!opts?.force) {
-      const cached = cache[key];
+      const cached = cache[path];
       if (cached) {
         setBrowse(cached);
         return;
@@ -758,33 +909,23 @@ export function AdminStorageManager() {
     }
     setLoadingBrowse(true);
     try {
-      const params = new URLSearchParams({ bucket });
-      if (yyyy) params.set('yyyy', yyyy);
-      if (mm) params.set('mm', mm);
+      const params = new URLSearchParams();
+      if (path) params.set('path', path);
       const res = await apiFetch(`/api/admin/storage/browse?${params.toString()}`);
       const body = await res.json().catch(() => null);
       const data = unwrapPayload(body);
-      if (!res.ok || !data) {
+      if (!res.ok || !data || !Array.isArray(data.folders) || !Array.isArray(data.files)) {
         toast.error(t('storageLoadFailed'));
         return;
       }
-      let next: BrowseData | null = null;
-      if (mm && yyyy) {
-        const files = asArray(data.files).map(normFile).filter((f): f is StorageFileRow => f !== null);
-        if (Array.isArray(data.files)) next = { level: 3, bucket, yyyy, mm, files };
-      } else if (yyyy) {
-        const months = asArray(data.months).map(normMonth).filter((m): m is MonthRow => m !== null);
-        if (Array.isArray(data.months)) next = { level: 2, bucket, yyyy, months };
-      } else {
-        const years = asArray(data.years).map(normYear).filter((y): y is YearRow => y !== null);
-        const flatFiles = asArray(data.flatFiles).map(normFile).filter((f): f is StorageFileRow => f !== null);
-        if (Array.isArray(data.years)) next = { level: 1, bucket, years, flatFiles };
-      }
-      if (!next) {
-        toast.error(t('storageLoadFailed'));
-        return;
-      }
-      setCache((prev) => ({ ...prev, [key]: next as BrowseData }));
+      const totalsRec = asRecord(data.totals);
+      const next: BrowseData = {
+        path,
+        folders: asArray(data.folders).map(normFolder).filter((f): f is BrowseFolderRow => f !== null),
+        files: asArray(data.files).map(normFile).filter((f): f is StorageFileRow => f !== null),
+        totals: { files: num(totalsRec?.files), bytes: num(totalsRec?.bytes) },
+      };
+      setCache((prev) => ({ ...prev, [path]: next }));
       setBrowse(next);
     } catch {
       toast.error(t('storageLoadFailed'));
@@ -793,57 +934,185 @@ export function AdminStorageManager() {
     }
   }, [cache, t]);
 
-  // ── Navigation handlers ──
+  // ── Navigation ──
 
-  const openBucket = (bucket: string) => {
+  /** POSIX parent of a folder/file path ('a/b' → 'a', 'a' → ''). */
+  const parentOf = useCallback((p: string): string => {
+    const idx = p.lastIndexOf('/');
+    return idx === -1 ? '' : p.slice(0, idx);
+  }, []);
+
+  const openFolder = (path: string) => {
     setFileSearch('');
-    setNav({ bucket, yyyy: null, mm: null });
+    setNavPath(path);
     setBrowse(null); // skeleton while fetching (cache hit resolves instantly)
-    fetchLevel(bucket, null, null);
+    fetchLevel(path);
   };
 
-  const openYear = (yyyy: string) => {
-    if (!nav.bucket) return;
-    setFileSearch('');
-    setNav({ bucket: nav.bucket, yyyy, mm: null });
-    setBrowse(null);
-    fetchLevel(nav.bucket, yyyy, null);
-  };
+  const backOneLevel = () => openFolder(parentOf(navPath));
 
-  const openMonth = (mm: string) => {
-    if (!nav.bucket || !nav.yyyy) return;
-    setFileSearch('');
-    setNav({ bucket: nav.bucket, yyyy: nav.yyyy, mm });
-    setBrowse(null);
-    fetchLevel(nav.bucket, nav.yyyy, mm);
-  };
-
-  /** Breadcrumb/back navigation — restores cached data instantly when hit. */
-  const backTo = (target: NavState) => {
-    setFileSearch('');
-    if (!target.bucket) {
-      setNav({ bucket: null, yyyy: null, mm: null });
-      setBrowse(null);
-      return;
-    }
-    setNav(target);
-    setBrowse(null);
-    fetchLevel(target.bucket, target.yyyy, target.mm);
-  };
-
-  const backOneLevel = () => {
-    if (nav.mm) backTo({ bucket: nav.bucket, yyyy: nav.yyyy, mm: null });
-    else if (nav.yyyy) backTo({ bucket: nav.bucket, yyyy: null, mm: null });
-    else backTo({ bucket: null, yyyy: null, mm: null });
-  };
-
-  /** Header refresh — reloads the CURRENT level (overview at level 0). */
+  /** Header refresh — reloads the CURRENT level (overview at root). */
   const refreshCurrent = () => {
-    if (!nav.bucket) {
+    if (!navPath) {
       fetchOverview(true);
       return;
     }
-    fetchLevel(nav.bucket, nav.yyyy, nav.mm, { force: true });
+    fetchLevel(navPath, { force: true });
+  };
+
+  /**
+   * Drop every cached level inside the affected folder SUBTREES — the folder
+   * content changed AND every ancestor aggregate above it went stale. The
+   * currently open level (when affected) is force re-fetched by the callers.
+   */
+  const invalidateFolderCache = useCallback((folders: string[]) => {
+    setCache((prev) => {
+      const next: Record<string, BrowseData> = {};
+      for (const [k, v] of Object.entries(prev)) {
+        const affected = folders.some((f) => k === f || k.startsWith(`${f}/`));
+        if (!affected) next[k] = v;
+      }
+      return next;
+    });
+  }, []);
+
+  // ── Create folder (inside the CURRENT folder) ──
+  // Client-side guard mirrors the server FOLDER_NAME_RE: starts with a
+  // letter/digit, no slashes, no dot-names, ≤64 chars.
+  const newFolderNameInvalid = useMemo(() => {
+    const v = newFolderName.trim();
+    if (!v) return 'empty';
+    if (v === '.' || v === '..' || v.includes('..') || /[\\/]/.test(v)) return 'invalid';
+    if (!/^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/.test(v)) return 'invalid';
+    return null;
+  }, [newFolderName]);
+
+  const confirmCreateFolder = async () => {
+    const name = newFolderName.trim();
+    if (!name || newFolderNameInvalid || creatingFolder) return;
+    setCreatingFolder(true);
+    try {
+      const res = await apiFetch('/api/admin/storage/folder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: navPath, name }),
+      });
+      const body = await res.json().catch(() => null);
+      const bodyRec = asRecord(body);
+      if (res.ok && bodyRec && bodyRec.success !== false) {
+        toast.success(t('storageNewFolderDone'));
+        setNewFolderOpen(false);
+        setNewFolderName('');
+        invalidateFolderCache([navPath]);
+        fetchLevel(navPath, { force: true });
+        fetchOverview(true);
+      } else {
+        const serverError = typeof bodyRec?.error === 'string' ? bodyRec.error : '';
+        if (res.status === 409 || serverError.includes('already exists')) toast.error(t('storageNewFolderConflict'));
+        else if (res.status === 400) toast.error(t('storageNewFolderInvalid'));
+        else toast.error(serverError || t('storageNewFolderFailed'));
+      }
+    } catch {
+      toast.error(t('storageNewFolderFailed'));
+    } finally {
+      setCreatingFolder(false);
+    }
+  };
+
+  // ── Manual upload (multi-file, into the CURRENT folder) ──
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleUploadSelected = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    if (!navPath) {
+      // Belt-and-braces — the toolbar button is disabled at the root anyway.
+      toast.error(t('storageUploadNoFolder'));
+      return;
+    }
+    setUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('path', navPath);
+      for (const f of Array.from(fileList)) formData.append('files', f);
+      const res = await apiFetch('/api/admin/storage/upload', { method: 'POST', body: formData });
+      const body = await res.json().catch(() => null);
+      const data = unwrapPayload(body);
+      if (res.ok && data && data.success !== false) {
+        const count = asArray(data.uploaded).length;
+        const skipped = asArray(data.skipped).length;
+        if (skipped > 0) {
+          toast.warning(`${t('storageUploadDone', { count: String(count) })} — ${skipped} skipped`);
+        } else {
+          toast.success(t('storageUploadDone', { count: String(count) }));
+        }
+        invalidateFolderCache([navPath]);
+        fetchLevel(navPath, { force: true });
+        fetchOverview(true);
+      } else {
+        const serverError = typeof data?.error === 'string' ? data.error : '';
+        toast.error(serverError || t('storageUploadFailed'));
+      }
+    } catch {
+      toast.error(t('storageUploadFailed'));
+    } finally {
+      setUploading(false);
+      if (uploadInputRef.current) uploadInputRef.current.value = '';
+    }
+  };
+
+  // ── Move (file → destination folder) ──
+  // Opens the destination picker: the full folder tree is fetched once per
+  // open (GET /folders). The file's CURRENT folder is shown but not
+  // selectable; the storage root is never listed (files live in a bucket).
+  const openMoveDialog = (file: StorageFileRow) => {
+    setMoveTarget(file);
+    setMoveDestination('');
+    setFolderOptions(null);
+    (async () => {
+      try {
+        const res = await apiFetch('/api/admin/storage/folders');
+        const body = await res.json().catch(() => null);
+        const data = unwrapPayload(body);
+        const list = data && Array.isArray(data.folders)
+          ? (data.folders as unknown[]).filter((x): x is string => typeof x === 'string' && x !== '')
+          : null;
+        setFolderOptions(res.ok && list ? list : []);
+      } catch {
+        setFolderOptions([]);
+      }
+    })();
+  };
+
+  const confirmMoveFile = async () => {
+    if (!moveTarget || !moveDestination || moving) return;
+    setMoving(true);
+    try {
+      const res = await apiFetch('/api/admin/storage/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ storagePath: moveTarget.storagePath, targetFolder: moveDestination }),
+      });
+      const body = await res.json().catch(() => null);
+      const bodyRec = asRecord(body);
+      if (res.ok && bodyRec && bodyRec.success !== false) {
+        toast.success(t('storageMoveDone'));
+        const sourceFolder = parentOf(moveTarget.storagePath);
+        setMoveTarget(null);
+        // Both the source and the destination folder aggregates changed.
+        invalidateFolderCache([sourceFolder, moveDestination]);
+        if (navPath) fetchLevel(navPath, { force: true });
+        fetchOverview(true);
+      } else {
+        const serverError = typeof bodyRec?.error === 'string' ? bodyRec.error : '';
+        if (res.status === 409 || serverError.includes('already exists')) toast.error(t('storageMoveConflict'));
+        else if (serverError.includes('already in this folder')) toast.error(t('storageMoveSameFolder'));
+        else toast.error(serverError || t('storageMoveFailed'));
+      }
+    } catch {
+      toast.error(t('storageMoveFailed'));
+    } finally {
+      setMoving(false);
+    }
   };
 
   // ── Delete ──
@@ -863,17 +1132,11 @@ export function AdminStorageManager() {
         toast.success(t('storageDeleteDone'));
         const deletedPath = deleteTarget.storagePath;
         setDeleteTarget(null);
-        // Drop every cached summary of the affected bucket subtree (the
-        // forced re-fetch below re-caches the current level).
-        const bucket = deletedPath.split('/')[0] || nav.bucket || '';
-        setCache((prev) => {
-          const next: Record<string, BrowseData> = {};
-          for (const [k, v] of Object.entries(prev)) {
-            if (k !== bucket && !k.startsWith(`${bucket}/`)) next[k] = v;
-          }
-          return next;
-        });
-        if (nav.bucket) fetchLevel(nav.bucket, nav.yyyy, nav.mm, { force: true });
+        // Drop every cached summary of the affected folder subtree (the
+        // forced re-fetch below re-caches the current level) — the parent
+        // folder's aggregate counts changed too.
+        invalidateFolderCache([parentOf(deletedPath)]);
+        if (navPath) fetchLevel(navPath, { force: true });
         fetchOverview(true);
       } else {
         toast.error(bodyRec?.error as string || t('storageDeleteFailed'));
@@ -882,6 +1145,50 @@ export function AdminStorageManager() {
       toast.error(t('storageDeleteFailed'));
     } finally {
       setDeleting(false);
+    }
+  };
+
+  // ── Rename in place (same folder) ──
+  // Client-side guard mirrors the server: bare filename, no separators, no
+  // dot-names, must differ from the current name. Server enforces the rest
+  // (existence, conflict 409, AppVersion/FileAsset repointing).
+  const renameInvalid = useMemo(() => {
+    const v = renameValue.trim();
+    if (!v) return 'empty';
+    if (/[\\/]/.test(v) || v === '.' || v === '..') return 'invalid';
+    if (renameTarget && v === renameTarget.name) return 'unchanged';
+    return null;
+  }, [renameValue, renameTarget]);
+
+  const confirmRenameFile = async () => {
+    if (!renameTarget || renameInvalid) return;
+    setRenaming(true);
+    try {
+      const res = await apiFetch('/api/admin/storage/rename', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ storagePath: renameTarget.storagePath, newName: renameValue.trim() }),
+      });
+      const body = await res.json().catch(() => null);
+      const bodyRec = asRecord(body);
+      if (res.ok && bodyRec && bodyRec.success !== false) {
+        toast.success(t('storageRenameDone'));
+        const renamedPath = renameTarget.storagePath;
+        setRenameTarget(null);
+        // Drop every cached summary of the affected folder subtree — the
+        // listing shows the OLD name until re-fetched.
+        invalidateFolderCache([parentOf(renamedPath)]);
+        if (navPath) fetchLevel(navPath, { force: true });
+        fetchOverview(true);
+      } else {
+        const serverError = typeof bodyRec?.error === 'string' ? bodyRec.error : '';
+        if (serverError.includes('already exists')) toast.error(t('storageRenameConflict'));
+        else toast.error(serverError || t('storageRenameFailed'));
+      }
+    } catch {
+      toast.error(t('storageRenameFailed'));
+    } finally {
+      setRenaming(false);
     }
   };
 
@@ -908,6 +1215,28 @@ export function AdminStorageManager() {
     }
   };
 
+  // ── Download (Task 2-c-2) — admin streaming endpoint, BINARY-SAFE ──
+  // Routes through lib/admin-download.ts: native fetch + real Blob. The
+  // previous apiFetch() path text-decoded the stream and rebuilt a
+  // 'text/plain' blob from JSON.stringify — every binary file saved corrupt.
+
+  const downloadFile = useCallback(async (file: StorageFileRow) => {
+    if (downloadingPath) return; // one download at a time — clear spinner
+    setDownloadingPath(file.storagePath);
+    try {
+      const result = await downloadAdminStorageFile(file.storagePath, file.name);
+      if (!result.ok) {
+        toast.error(result.error || t('storageDownloadFailed'));
+        return;
+      }
+      toast.success(t('storageDownloadStarted'));
+    } catch {
+      toast.error(t('storageDownloadFailed'));
+    } finally {
+      setDownloadingPath(null);
+    }
+  }, [downloadingPath, t]);
+
   // ── Derived ──
 
   const disk = overview?.disk ?? null;
@@ -915,10 +1244,17 @@ export function AdminStorageManager() {
   const categories = overview?.categories ?? [];
 
   const filteredFiles = useMemo(() => {
-    if (!browse || browse.level !== 3) return [];
+    if (!browse) return [];
     const q = fileSearch.trim().toLowerCase();
-    if (!q) return browse.files;
-    return browse.files.filter((f) => f.name.toLowerCase().includes(q));
+    const base = q ? browse.files.filter((f) => f.name.toLowerCase().includes(q)) : browse.files;
+    return sortFileRows(base, sortField, sortDir);
+  }, [browse, fileSearch, sortField, sortDir]);
+
+  // Folders follow the same name filter (files and folders searched together).
+  const filteredFolders = useMemo(() => {
+    if (!browse) return [];
+    const q = fileSearch.trim().toLowerCase();
+    return q ? browse.folders.filter((f) => f.name.toLowerCase().includes(q)) : browse.folders;
   }, [browse, fileSearch]);
 
   // Full-literal Tailwind classes (JIT-safe) for the usage bar severity.
@@ -931,257 +1267,209 @@ export function AdminStorageManager() {
 
   const chevronCls = `h-3.5 w-3.5 text-muted-foreground shrink-0 ${rtl ? 'rotate-180' : ''}`;
 
+  // Task 2-c-2 — sort dropdown (field) + direction toggle, shared by the
+  // flat-files listing and the month listing.
+  const renderSortControls = () => (
+    <div className="flex items-center gap-2">
+      <Select value={sortField} onValueChange={(v) => setSortField(v as SortField)}>
+        <SelectTrigger
+          className="h-11 sm:h-9 w-[140px] rounded-xl text-[13px]"
+          aria-label={t('storageSortBy')}
+        >
+          <ArrowUpDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" aria-hidden="true" />
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="date" className="min-h-[44px]">{t('storageSortDate')}</SelectItem>
+          <SelectItem value="name" className="min-h-[44px]">{t('storageSortName')}</SelectItem>
+          <SelectItem value="size" className="min-h-[44px]">{t('storageSortSize')}</SelectItem>
+          <SelectItem value="type" className="min-h-[44px]">{t('storageSortType')}</SelectItem>
+        </SelectContent>
+      </Select>
+      <Button
+        type="button"
+        variant="outline"
+        className="h-11 sm:h-9 w-11 sm:w-9 p-0 rounded-xl shrink-0"
+        title={sortDir === 'asc' ? t('storageSortAsc') : t('storageSortDesc')}
+        aria-label={sortDir === 'asc' ? t('storageSortAsc') : t('storageSortDesc')}
+        onClick={() => setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))}
+      >
+        {sortDir === 'asc' ? <ArrowUp className="h-4 w-4" /> : <ArrowDown className="h-4 w-4" />}
+      </Button>
+    </div>
+  );
+
+  // Task 2-c-2 — search + sort row shared by both file listings.
+  const renderSearchSortRow = () => (
+    <div className="flex items-center gap-2 flex-wrap">
+      <div className="relative flex-1 min-w-[180px] max-w-md">
+        <Search className="absolute start-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+        <Input
+          value={fileSearch}
+          onChange={(e) => setFileSearch(e.target.value)}
+          placeholder={t('search')}
+          className="ps-8 h-11 sm:h-9"
+          aria-label={t('search')}
+        />
+      </div>
+      {renderSortControls()}
+    </div>
+  );
+
   // ─── Render ───
 
   const renderBreadcrumb = () => (
     <nav aria-label="Breadcrumb" className="flex items-center gap-1 flex-wrap min-w-0 text-[13px]">
       <button
         type="button"
-        onClick={() => backTo({ bucket: null, yyyy: null, mm: null })}
-        className="text-muted-foreground hover:text-foreground transition-colors truncate"
+        onClick={() => openFolder('')}
+        className="inline-flex items-center min-h-[44px] px-1 text-muted-foreground hover:text-foreground transition-colors truncate"
       >
         {t('storageAllCategories')}
       </button>
-      {nav.bucket && (
-        <>
-          <ChevronRight className={chevronCls} aria-hidden="true" />
-          {nav.yyyy || nav.mm ? (
-            <button
-              type="button"
-              onClick={() => backTo({ bucket: nav.bucket, yyyy: null, mm: null })}
-              className="text-muted-foreground hover:text-foreground transition-colors truncate"
-            >
-              {t(bucketLabelKey(nav.bucket))}
-            </button>
-          ) : (
-            <span aria-current="page" className="font-medium text-foreground truncate">
-              {t(bucketLabelKey(nav.bucket))}
-            </span>
-          )}
-        </>
-      )}
-      {nav.bucket && nav.yyyy && (
-        <>
-          <ChevronRight className={chevronCls} aria-hidden="true" />
-          {nav.mm ? (
-            <button
-              type="button"
-              onClick={() => backTo({ bucket: nav.bucket, yyyy: nav.yyyy, mm: null })}
-              className="font-mono text-muted-foreground hover:text-foreground transition-colors"
-            >
-              {nav.yyyy}
-            </button>
-          ) : (
-            <span aria-current="page" className="font-mono font-medium text-foreground">
-              {nav.yyyy}
-            </span>
-          )}
-        </>
-      )}
-      {nav.bucket && nav.yyyy && nav.mm && (
-        <>
-          <ChevronRight className={chevronCls} aria-hidden="true" />
-          <span aria-current="page" className="font-mono font-medium text-foreground">
-            {nav.mm}
+      {navPath.split('/').filter(Boolean).map((seg, i, arr) => {
+        const segPath = arr.slice(0, i + 1).join('/');
+        const isLast = i === arr.length - 1;
+        return (
+          <span key={segPath} className="inline-flex items-center gap-1 min-w-0">
+            <ChevronRight className={chevronCls} aria-hidden="true" />
+            {isLast ? (
+              <span aria-current="page" className="font-medium text-foreground truncate">
+                {seg}
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => openFolder(segPath)}
+                className="inline-flex items-center min-h-[44px] px-1 text-muted-foreground hover:text-foreground transition-colors truncate"
+              >
+                {seg}
+              </button>
+            )}
           </span>
-        </>
-      )}
+        );
+      })}
     </nav>
   );
 
-  const renderBrowserContent = () => {
-    // Level 0 — categories grid (no fetch: straight from the overview).
-    if (!nav.bucket) {
-      if (loadingOverview && !overview) {
-        return (
-          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2.5">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <Skeleton key={i} className="h-24 w-full" />
-            ))}
-          </div>
-        );
-      }
-      if (categories.length === 0) {
-        return (
-          <div className="text-center py-12 text-muted-foreground">
-            <Folder className="h-10 w-10 mx-auto mb-3 opacity-40" />
-            <p className="text-sm">{t('noData')}</p>
-          </div>
-        );
-      }
-      return (
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2.5">
-          {categories.map((cat) => {
-            const Icon = bucketIcon(cat.bucket);
-            return (
-              <button
-                key={cat.bucket}
-                type="button"
-                onClick={() => openBucket(cat.bucket)}
-                className="group flex flex-col gap-2.5 p-4 rounded-xl border border-border text-start hover:border-emerald-300 dark:hover:border-emerald-700 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-all"
-              >
-                <div className="flex items-center gap-3 w-full">
-                  <div className="h-10 w-10 rounded-lg bg-muted/60 group-hover:bg-emerald-100 dark:group-hover:bg-emerald-900/30 flex items-center justify-center shrink-0 transition-colors">
-                    <Icon className="h-5 w-5 text-muted-foreground group-hover:text-emerald-600 dark:group-hover:text-emerald-400 transition-colors" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-semibold truncate">{t(bucketLabelKey(cat.bucket))}</p>
-                    <p className="text-[11px] text-muted-foreground">
-                      {humanSize(cat.bytes)} · {t('storageFilesCount', { count: compactNumber(cat.files) })}
-                    </p>
-                  </div>
-                  <ChevronRight className={chevronCls} aria-hidden="true" />
-                </div>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  <Badge variant="secondary" className="text-[10px]">
-                    {t('storageDbTracked')}: {compactNumber(cat.dbCount)}
-                  </Badge>
-                  {cat.system && (
-                    <Badge className="text-[10px] bg-muted text-muted-foreground hover:bg-muted">
-                      {t('storageSystem')}
-                    </Badge>
-                  )}
-                  {cat.orphans > 0 && (
-                    <Badge className="text-[10px] bg-amber-100 text-amber-800 hover:bg-amber-100 dark:bg-amber-900/40 dark:text-amber-300">
-                      {t('storageOrphans')}: {compactNumber(cat.orphans)}
-                    </Badge>
-                  )}
-                  {cat.missing > 0 && (
-                    <Badge className="text-[10px] bg-red-100 text-red-800 hover:bg-red-100 dark:bg-red-900/40 dark:text-red-300">
-                      {t('storageMissing')}: {compactNumber(cat.missing)}
-                    </Badge>
-                  )}
-                </div>
-              </button>
-            );
-          })}
-        </div>
-      );
-    }
+  /** Explorer toolbar — New Folder / Upload (into the CURRENT folder). */
+  const renderToolbar = () => (
+    <div className="flex items-center gap-2 flex-wrap shrink-0">
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-11 sm:h-9 rounded-xl"
+        onClick={() => { setNewFolderName(''); setNewFolderOpen(true); }}
+        disabled={loadingBrowse || creatingFolder}
+      >
+        <FolderPlus className="h-4 w-4 me-1" />
+        {t('storageNewFolder')}
+      </Button>
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-11 sm:h-9 rounded-xl"
+        disabled={!navPath || uploading || loadingBrowse}
+        title={!navPath ? t('storageUploadNoFolder') : t('storageUpload')}
+        onClick={() => uploadInputRef.current?.click()}
+      >
+        {uploading ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : <Upload className="h-4 w-4 me-1" />}
+        {uploading ? t('storageUploading') : t('storageUpload')}
+      </Button>
+      <input
+        ref={uploadInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        aria-hidden="true"
+        tabIndex={-1}
+        onChange={(e) => { void handleUploadSelected(e.target.files); }}
+      />
+    </div>
+  );
 
-    // Loading a deeper level with nothing to show yet → skeletons.
-    if (!browse) {
-      return loadingBrowse ? (
+  const renderExplorerBody = () => {
+    if (loadingBrowse && !browse) {
+      return (
         <div className="space-y-2">
           {Array.from({ length: 6 }).map((_, i) => (
             <Skeleton key={i} className="h-12 w-full" />
           ))}
         </div>
-      ) : null;
+      );
     }
+    if (!browse) return null;
 
-    // Level 1 — bucket: year rows + legacy flat files.
-    if (browse.level === 1) {
+    const atRoot = !navPath;
+    if (browse.folders.length === 0 && browse.files.length === 0) {
       return (
-        <div className="space-y-4">
-          {browse.years.length === 0 && browse.flatFiles.length === 0 ? (
-            <div className="text-center py-12 text-muted-foreground">
-              <Folder className="h-10 w-10 mx-auto mb-3 opacity-40" />
-              <p className="text-sm">{t('noData')}</p>
-            </div>
-          ) : (
-            <>
-              {browse.years.length > 0 && (
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5">
-                  {browse.years.map((y) => (
-                    <button
-                      key={y.yyyy}
-                      type="button"
-                      onClick={() => openYear(y.yyyy)}
-                      className="group flex items-center gap-3 p-3 rounded-xl border border-border text-start hover:border-emerald-300 dark:hover:border-emerald-700 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-all"
-                    >
-                      <div className="h-9 w-9 rounded-lg bg-muted/60 group-hover:bg-emerald-100 dark:group-hover:bg-emerald-900/30 flex items-center justify-center shrink-0 transition-colors">
-                        <Folder className="h-4 w-4 text-muted-foreground group-hover:text-emerald-600 dark:group-hover:text-emerald-400 transition-colors" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="font-mono text-[13px] font-semibold">{y.yyyy}</p>
-                        <p className="text-[11px] text-muted-foreground truncate">
-                          {t('storageMonths')}: {y.folders} · {t('storageFilesCount', { count: compactNumber(y.files) })} · {humanSize(y.bytes)}
-                        </p>
-                      </div>
-                      <ChevronRight className={chevronCls} aria-hidden="true" />
-                    </button>
-                  ))}
-                </div>
-              )}
-              {browse.flatFiles.length > 0 && (
-                <div className="space-y-2">
-                  <p className="text-[13px] font-medium flex items-center gap-2">
-                    <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />
-                    {t('storageFlatFiles')}
-                    <Badge variant="secondary" className="text-[10px]">{browse.flatFiles.length}</Badge>
-                  </p>
-                  <StorageFilesTable
-                    files={browse.flatFiles}
-                    t={t}
-                    lang={lang}
-                    onCopy={copyText}
-                    onAskDelete={setDeleteTarget}
-                    onPreview={setPreviewTarget}
-                  />
-                </div>
-              )}
-            </>
-          )}
+        <div className="text-center py-12 text-muted-foreground">
+          <FolderOpen className="h-10 w-10 mx-auto mb-3 opacity-40" />
+          <p className="text-sm">{atRoot ? t('noData') : t('storageEmptyFolder')}</p>
         </div>
       );
     }
 
-    // Level 2 — bucket/yyyy: month rows.
-    if (browse.level === 2) {
-      if (browse.months.length === 0) {
-        return (
-          <div className="text-center py-12 text-muted-foreground">
-            <Folder className="h-10 w-10 mx-auto mb-3 opacity-40" />
-            <p className="text-sm">{t('noData')}</p>
-          </div>
-        );
-      }
-      return (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5">
-          {browse.months.map((m) => (
-            <button
-              key={m.mm}
-              type="button"
-              onClick={() => openMonth(m.mm)}
-              className="group flex items-center gap-3 p-3 rounded-xl border border-border text-start hover:border-emerald-300 dark:hover:border-emerald-700 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-all"
-            >
-              <div className="h-9 w-9 rounded-lg bg-muted/60 group-hover:bg-emerald-100 dark:group-hover:bg-emerald-900/30 flex items-center justify-center shrink-0 transition-colors">
-                <Folder className="h-4 w-4 text-muted-foreground group-hover:text-emerald-600 dark:group-hover:text-emerald-400 transition-colors" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="font-mono text-[13px] font-semibold">{m.mm}</p>
-                <p className="text-[11px] text-muted-foreground truncate">
-                  {t('storageFilesCount', { count: compactNumber(m.files) })} · {humanSize(m.bytes)}
-                </p>
-              </div>
-              <ChevronRight className={chevronCls} aria-hidden="true" />
-            </button>
-          ))}
-        </div>
-      );
-    }
-
-    // Level 3 — bucket/yyyy/mm: searchable files table.
     return (
-      <div className="space-y-3">
-        <div className="relative max-w-md">
-          <Search className="absolute start-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-          <Input
-            value={fileSearch}
-            onChange={(e) => setFileSearch(e.target.value)}
-            placeholder={t('search')}
-            className="ps-8"
-          />
-        </div>
-        <StorageFilesTable
-          files={filteredFiles}
-          t={t}
-          lang={lang}
-          onCopy={copyText}
-          onAskDelete={setDeleteTarget}
-          onPreview={setPreviewTarget}
-        />
+      <div className="space-y-4">
+        {/* Folders first — buckets at the root, admin subfolders deeper. */}
+        {browse.folders.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-[13px] font-medium flex items-center gap-2">
+              <FolderOpen className="h-3.5 w-3.5 text-emerald-600" />
+              {t('storageFolders')}
+              <Badge variant="secondary" className="text-[10px]">{browse.folders.length}</Badge>
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5">
+              {filteredFolders.map((folder) => {
+                const Icon = atRoot ? bucketIcon(folder.name) : Folder;
+                const label = atRoot && BUCKET_LABEL[folder.name] ? t(bucketLabelKey(folder.name)) : folder.name;
+                return (
+                  <button
+                    key={folder.path}
+                    type="button"
+                    onClick={() => openFolder(folder.path)}
+                    className="group flex items-center gap-3 p-3 rounded-xl border border-border text-start hover:border-emerald-300 dark:hover:border-emerald-700 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-all"
+                  >
+                    <div className="h-9 w-9 rounded-lg bg-muted/60 group-hover:bg-emerald-100 dark:group-hover:bg-emerald-900/30 flex items-center justify-center shrink-0 transition-colors">
+                      <Icon className="h-4 w-4 text-muted-foreground group-hover:text-emerald-600 dark:group-hover:text-emerald-400 transition-colors" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-[13px] font-semibold truncate" title={folder.name}>{label}</p>
+                      <p className="text-[11px] text-muted-foreground truncate">
+                        {t('storageFilesCount', { count: compactNumber(folder.files) })}
+                        {folder.folders > 0 ? ` · ${folder.folders} ↳` : ''} · {humanSize(folder.bytes)}
+                      </p>
+                    </div>
+                    <ChevronRight className={chevronCls} aria-hidden="true" />
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        {browse.files.length > 0 && (
+          <div className="space-y-2">
+            <p className="text-[13px] font-medium flex items-center gap-2">
+              <FileText className="h-3.5 w-3.5 text-emerald-600" />
+              {t('storageFileName')}
+              <Badge variant="secondary" className="text-[10px]">{browse.files.length}</Badge>
+            </p>
+            {renderSearchSortRow()}
+            <StorageFilesTable
+              files={filteredFiles}
+              t={t}
+              lang={lang}
+              onCopy={copyText}
+              onAskDelete={setDeleteTarget}
+              onAskRename={(f) => { setRenameTarget(f); setRenameValue(f.name); }}
+              onAskMove={openMoveDialog}
+              onPreview={setPreviewTarget}
+              onDownload={downloadFile}
+              downloadingPath={downloadingPath}
+            />
+          </div>
+        )}
       </div>
     );
   };
@@ -1218,9 +1506,68 @@ export function AdminStorageManager() {
         </Card>
       </motion.div>
 
+      {/* EXPLORER — the primary content, FIRST after the header (user report:
+          the old browser sat below the stats and its 480px viewport was too
+          small). Breadcrumb + New Folder / Upload toolbar + a tall
+          file-manager viewport (folders first, files below). */}
+      <motion.div {...fadeUp} transition={{ delay: 0.05 }}>
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <CardTitle className="text-base flex items-center gap-2 min-w-0 flex-1">
+                  {navPath ? (
+                    <button
+                      type="button"
+                      onClick={backOneLevel}
+                      disabled={loadingBrowse}
+                      className="shrink-0"
+                      title={t('storageBack')}
+                      aria-label={t('storageBack')}
+                    >
+                      <ArrowLeft className={`h-4 w-4 text-muted-foreground hover:text-foreground transition-colors ${rtl ? 'rotate-180' : ''}`} />
+                    </button>
+                  ) : (
+                    <Folder className="h-4 w-4 text-emerald-600 shrink-0" />
+                  )}
+                  <span className="truncate">
+                    {!navPath
+                      ? t('storageCategories')
+                      : navPath.split('/').filter(Boolean).pop()}
+                  </span>
+                  {loadingBrowse && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />}
+                  {browse && (browse.folders.length > 0 || browse.files.length > 0) && (
+                    <Badge variant="secondary" className="text-[10px] shrink-0">
+                      {t('storageFilesCount', { count: compactNumber(browse.totals.files) })} · {humanSize(browse.totals.bytes)}
+                    </Badge>
+                  )}
+                </CardTitle>
+                {navPath && (
+                  <Button variant="outline" size="sm" onClick={backOneLevel} disabled={loadingBrowse} className="shrink-0">
+                    <ArrowLeft className={`h-4 w-4 me-1 ${rtl ? 'rotate-180' : ''}`} />
+                    {t('storageBack')}
+                  </Button>
+                )}
+              </div>
+              <div className="flex items-end sm:items-center justify-between gap-2 flex-wrap">
+                <CardDescription className="min-w-0 flex-1">{renderBreadcrumb()}</CardDescription>
+                {renderToolbar()}
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent>
+            {/* Tall file-manager viewport (user report: the old 480px window
+                felt cramped) — folders grid + files table scroll together. */}
+            <div className="h-[calc(100vh-330px)] min-h-[420px] overflow-y-auto custom-scrollbar pe-1">
+              {renderExplorerBody()}
+            </div>
+          </CardContent>
+        </Card>
+      </motion.div>
+
       {/* Disk usage — hidden entirely when the platform exposes no statfs */}
       {disk && (
-        <motion.div {...fadeUp} transition={{ delay: 0.05 }}>
+        <motion.div {...fadeUp} transition={{ delay: 0.1 }}>
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-base flex items-center gap-2">
@@ -1268,7 +1615,7 @@ export function AdminStorageManager() {
 
       {/* Totals row */}
       {totals && (
-        <motion.div {...fadeUp} transition={{ delay: 0.1 }} className="space-y-2">
+        <motion.div {...fadeUp} transition={{ delay: 0.15 }} className="space-y-2">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <Card>
               <CardContent className="p-4">
@@ -1338,52 +1685,6 @@ export function AdminStorageManager() {
         </motion.div>
       )}
 
-      {/* Browser */}
-      <motion.div {...fadeUp} transition={{ delay: 0.15 }}>
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex flex-col sm:flex-row sm:items-center gap-2">
-              <div className="flex items-center gap-2 min-w-0 flex-1">
-                <CardTitle className="text-base flex items-center gap-2 min-w-0">
-                  {nav.bucket ? (
-                    <button
-                      type="button"
-                      onClick={backOneLevel}
-                      disabled={loadingBrowse}
-                      className="shrink-0"
-                      title={t('storageBack')}
-                      aria-label={t('storageBack')}
-                    >
-                      <ArrowLeft className={`h-4 w-4 text-muted-foreground hover:text-foreground transition-colors ${rtl ? 'rotate-180' : ''}`} />
-                    </button>
-                  ) : (
-                    <Folder className="h-4 w-4 text-emerald-600 shrink-0" />
-                  )}
-                  <span className="truncate">
-                    {!nav.bucket
-                      ? t('storageCategories')
-                      : browse?.level === 2
-                        ? nav.yyyy
-                        : browse?.level === 3
-                          ? `${nav.yyyy}/${nav.mm}`
-                          : t(bucketLabelKey(nav.bucket))}
-                  </span>
-                  {loadingBrowse && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />}
-                </CardTitle>
-              </div>
-              {nav.bucket && (
-                <Button variant="outline" size="sm" onClick={backOneLevel} disabled={loadingBrowse} className="shrink-0 self-start sm:self-auto">
-                  <ArrowLeft className={`h-4 w-4 me-1 ${rtl ? 'rotate-180' : ''}`} />
-                  {t('storageBack')}
-                </Button>
-              )}
-            </div>
-            <CardDescription className="mt-1">{renderBreadcrumb()}</CardDescription>
-          </CardHeader>
-          <CardContent>{renderBrowserContent()}</CardContent>
-        </Card>
-      </motion.div>
-
       {/* Delete confirmation */}
       <ConfirmDialog
         open={!!deleteTarget}
@@ -1397,6 +1698,174 @@ export function AdminStorageManager() {
         onConfirm={confirmDeleteFile}
       />
 
+      {/* Rename in place — dialog with an input (ConfirmDialog is text-only). */}
+      <Dialog
+        open={!!renameTarget}
+        onOpenChange={(o) => { if (!o) setRenameTarget(null); }}
+      >
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t('storageRename')}</DialogTitle>
+            <DialogDescription className="break-all">
+              {t('storageRenameDesc', { name: renameTarget?.name ?? '' })}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Input
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              placeholder={t('storageRenameNewName')}
+              dir="ltr"
+              autoFocus
+              disabled={renaming}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !renameInvalid && !renaming) confirmRenameFile(); }}
+              aria-invalid={!!renameInvalid}
+            />
+            {renameInvalid && (
+              <p className="text-xs text-muted-foreground">
+                {renameInvalid === 'empty'
+                  ? t('storageRenameNewName')
+                  : renameInvalid === 'invalid'
+                    ? t('storageRenameInvalid')
+                    : t('storageRenameUnchanged')}
+              </p>
+            )}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => setRenameTarget(null)} disabled={renaming}>
+              {t('cancel')}
+            </Button>
+            <Button size="sm" onClick={confirmRenameFile} disabled={!!renameInvalid || renaming}>
+              {renaming ? <Loader2 className="h-4 w-4 animate-spin" /> : t('storageRename')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* New folder — created INSIDE the currently open folder. */}
+      <Dialog
+        open={newFolderOpen}
+        onOpenChange={(o) => { if (!o) setNewFolderOpen(false); }}
+      >
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>{t('storageNewFolder')}</DialogTitle>
+            <DialogDescription className="break-all">
+              {t('storageNewFolderName')}
+              {navPath ? (
+                <code className="font-mono ms-1" title={navPath}>{navPath}</code>
+              ) : (
+                <span className="ms-1">({t('storageAllCategories')})</span>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Input
+              value={newFolderName}
+              onChange={(e) => setNewFolderName(e.target.value)}
+              placeholder={t('storageNewFolderNamePh')}
+              autoFocus
+              disabled={creatingFolder}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !newFolderNameInvalid && !creatingFolder) confirmCreateFolder(); }}
+              aria-invalid={!!newFolderNameInvalid}
+              aria-label={t('storageNewFolderName')}
+            />
+            {newFolderNameInvalid && (
+              <p className="text-xs text-muted-foreground">
+                {newFolderNameInvalid === 'empty'
+                  ? t('storageNewFolderName')
+                  : t('storageNewFolderInvalid')}
+              </p>
+            )}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => setNewFolderOpen(false)} disabled={creatingFolder}>
+              {t('cancel')}
+            </Button>
+            <Button size="sm" onClick={confirmCreateFolder} disabled={!!newFolderNameInvalid || creatingFolder}>
+              {creatingFolder ? <Loader2 className="h-4 w-4 animate-spin" /> : <FolderPlus className="h-4 w-4 me-1" />}
+              {t('storageNewFolder')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Move — destination picker over the WHOLE folder tree (the file's
+          current folder is shown but not selectable; root is never listed). */}
+      <Dialog
+        open={!!moveTarget}
+        onOpenChange={(o) => { if (!o) setMoveTarget(null); }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t('storageMoveTitle')}</DialogTitle>
+            <DialogDescription className="break-all">
+              {t('storageMoveDesc', { name: moveTarget?.name ?? '' })}
+            </DialogDescription>
+          </DialogHeader>
+          <p className="text-[11px] text-muted-foreground flex items-center gap-1.5 min-w-0">
+            <span className="shrink-0">{t('storageMoveCurrentLocation')}:</span>
+            <code className="font-mono truncate" title={moveTarget ? parentOf(moveTarget.storagePath) : ''}>
+              {moveTarget ? parentOf(moveTarget.storagePath) || '/' : ''}
+            </code>
+          </p>
+          <div className="rounded-xl border max-h-[45vh] overflow-y-auto custom-scrollbar" role="radiogroup" aria-label={t('storageMoveTarget')}>
+            {folderOptions === null ? (
+              <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
+                <Loader2 className="h-4 w-4 animate-spin" />
+                {t('storageLoadingFolders')}
+              </div>
+            ) : folderOptions.length === 0 ? (
+              <div className="py-10 text-center text-sm text-muted-foreground">{t('noData')}</div>
+            ) : (
+              <div className="p-1.5 space-y-0.5">
+                {folderOptions.map((folderPath) => {
+                  const isCurrent = moveTarget ? parentOf(moveTarget.storagePath) === folderPath : false;
+                  const depth = folderPath ? folderPath.split('/').length - 1 : 0;
+                  const selected = moveDestination === folderPath;
+                  return (
+                    <button
+                      key={folderPath}
+                      type="button"
+                      role="radio"
+                      aria-checked={selected}
+                      disabled={isCurrent}
+                      onClick={() => setMoveDestination(folderPath)}
+                      className={`w-full flex items-center gap-2 min-h-[44px] px-2.5 rounded-lg text-start transition-colors ${
+                        isCurrent
+                          ? 'opacity-50 cursor-not-allowed'
+                          : selected
+                            ? 'bg-emerald-50 dark:bg-emerald-900/20 text-emerald-800 dark:text-emerald-300'
+                            : 'hover:bg-muted/60'
+                      }`}
+                      style={{ paddingInlineStart: `${10 + depth * 14}px` }}
+                    >
+                      <Folder className={`h-4 w-4 shrink-0 ${selected ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}`} />
+                      <span className="font-mono text-[12px] truncate flex-1" title={folderPath}>
+                        {folderPath}
+                      </span>
+                      {isCurrent && (
+                        <Badge variant="secondary" className="text-[10px] shrink-0">{t('storageMoveCurrentLocation')}</Badge>
+                      )}
+                      {selected && <Check className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400" />}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" size="sm" onClick={() => setMoveTarget(null)} disabled={moving}>
+              {t('cancel')}
+            </Button>
+            <Button size="sm" onClick={confirmMoveFile} disabled={!moveDestination || moving}>
+              {moving ? <Loader2 className="h-4 w-4 animate-spin" /> : <FolderInput className="h-4 w-4 me-1" />}
+              {t('storageMoveHere')}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* File preview (image / PDF / video / audio / text) */}
       <StoragePreviewDialog
         file={previewTarget}
@@ -1405,6 +1874,8 @@ export function AdminStorageManager() {
         t={t}
         lang={lang}
         onCopy={copyText}
+        onDownload={downloadFile}
+        downloading={!!previewTarget && downloadingPath === previewTarget.storagePath}
       />
     </div>
   );

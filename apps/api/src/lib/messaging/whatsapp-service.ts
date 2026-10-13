@@ -51,12 +51,30 @@ async function postMessage(body: Record<string, unknown>): Promise<WhatsAppSendR
 
     const raw = await res.text()
     if (!res.ok) {
-      // 131047 = re-engagement message (outside 24h window without template)
+      // Documented Meta error codes worth translating for the admin UI:
+      //   190    → access token expired/invalid
+      //   403    → missing scopes/permissions on the token
+      //   131047 → re-engagement message (outside 24h window without template)
+      let friendly: string | undefined
+      try {
+        const errJson = JSON.parse(raw) as { error?: { code?: number; error_subcode?: number; message?: string } }
+        const code = errJson.error?.code
+        const subcode = errJson.error?.error_subcode
+        if (code === 190) {
+          friendly = 'Meta: access token expired or invalid (code 190) — generate a new permanent system-user token in Meta Business Settings.'
+        } else if (res.status === 403 || code === 403) {
+          friendly = 'Meta: the token lacks the required permissions (403) — it needs whatsapp_business_messaging + whatsapp_business_management scopes.'
+        } else if (subcode === 131047) {
+          friendly = 'Meta: outside the 24-hour customer service window (code 131047) — use an approved template instead of free-form text.'
+        }
+      } catch {
+        // Non-JSON body — keep the raw error below
+      }
       const fb = /"error_subcode"\s*:\s*(\d+)/.exec(raw)
       const subcode = fb?.[1]
       return {
         success: false,
-        error: `WHATSAPP_HTTP_${res.status}${subcode ? `_SUB_${subcode}` : ''}`,
+        error: friendly || `WHATSAPP_HTTP_${res.status}${subcode ? `_SUB_${subcode}` : ''}`,
         responseRaw: raw.slice(0, 400),
         fallbackToSms: subcode === '131047',
       }
@@ -180,6 +198,60 @@ export async function listWhatsAppTemplates(): Promise<{ success: boolean; error
     return { success: true, templates }
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : 'GRAPH_REQUEST_FAILED', templates: [] }
+  }
+}
+
+/** Free connection-check result (no message sent — token reachability probe) */
+export interface WhatsAppConnectionCheckResult {
+  ok: boolean
+  error?: string
+  responseRaw?: string
+  details?: Record<string, unknown>
+}
+
+/**
+ * FREE connection probe — GET {apiUrl}/{phoneNumberId} with the access token.
+ * No message is sent; it validates that the token + phone number ID can reach
+ * the Graph API and surfaces the verified name / display number / quality.
+ */
+export async function verifyWhatsAppConnection(): Promise<WhatsAppConnectionCheckResult> {
+  const config = await getResolvedConfig('WHATSAPP')
+  if (!config.apiKey || !config.phoneNumberId) {
+    return { ok: false, error: 'WHATSAPP_NOT_CONFIGURED — access token and Phone Number ID are required' }
+  }
+  try {
+    const res = await fetch(
+      `${config.apiUrl}/${config.phoneNumberId}?fields=verified_name,display_phone_number,quality_rating`,
+      {
+        headers: { Authorization: `Bearer ${config.apiKey}` },
+        signal: AbortSignal.timeout(15000),
+      },
+    )
+    const raw = await res.text()
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: 'Invalid token — Meta rejected the access token', responseRaw: raw.slice(0, 400) }
+    }
+    if (!res.ok) {
+      return { ok: false, error: `GRAPH_HTTP_${res.status}`, responseRaw: raw.slice(0, 400) }
+    }
+    let details: Record<string, unknown> | undefined
+    try {
+      const json = JSON.parse(raw) as {
+        verified_name?: string
+        display_phone_number?: string
+        quality_rating?: string
+      }
+      details = {}
+      if (json.display_phone_number) details.displayPhoneNumber = json.display_phone_number
+      if (json.verified_name) details.verifiedName = json.verified_name
+      if (json.quality_rating) details.qualityRating = json.quality_rating
+      if (!Object.keys(details).length) details = undefined
+    } catch {
+      // Non-JSON answer — still a reachable Graph API
+    }
+    return { ok: true, details }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'GRAPH_CONNECTION_CHECK_FAILED' }
   }
 }
 

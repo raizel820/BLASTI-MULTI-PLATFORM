@@ -74,6 +74,8 @@ import {
 import { useAppStore } from '@/store/use-app-store';
 import { StaffPermissionsEditor, parsePermissions } from '@/components/shared/staff-permissions-editor';
 import { apiFetch } from '@/lib/api-fetch';
+// Task 2-c-2 — manual full data resync (shared: web + Capacitor mobile + Electron desktop).
+import { FullResyncButton } from '@/components/shared/full-resync-button';
 
 interface AgencyService {
   id: string;
@@ -1617,11 +1619,14 @@ export function AgencySettings() {
                         </div>
                       )}
 
-                      {/* Security — biometric login (Task 80) */}
+                      {/* Security — biometric login (Task 80) + full data resync (Task 2-c-2) */}
                       {section.id === 'security' && (
                         <div className="space-y-3">
                           <p className="text-xs text-muted-foreground -mt-1 mb-2">{t('biometricLogin')}</p>
                           <BiometricSettingsCard />
+                          <Separator />
+                          {/* Account-level action — shared component, same for every role/shell */}
+                          <FullResyncButton />
                         </div>
                       )}
 

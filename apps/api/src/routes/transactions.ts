@@ -59,15 +59,34 @@ app.post('/', async (c) => {
 })
 
 // GET /transactions — List transactions
+//
+// Query params:
+//   status  — PENDING | APPROVED | REJECTED | COMPLETED | FAILED (optional)
+//   type    — 'online' (Chargily checkout payments: providerRef set) |
+//             'manual' (receipt-upload payments: no gateway reference) |
+//             omitted → both (optional)
+//   limit / offset — pagination (defaults 20 / 0)
+//
+// Online vs manual discrimination: online payments are created by
+// payment-checkout.ts which ALWAYS stamps providerRef with the Chargily
+// checkout id; manual receipts leave providerRef at its schema default ('').
+// The schema default of paymentProvider is 'chargily' for legacy rows, so
+// providerRef — not paymentProvider — is the reliable discriminator.
 app.get('/', async (c) => {
   try {
     const user = await requireAuth(c)
     const status = c.req.query('status')
+    const type = c.req.query('type')
     const limit = parseInt(c.req.query('limit') || '20', 10)
     const offset = parseInt(c.req.query('offset') || '0', 10)
 
     const where: Record<string, unknown> = {}
     if (status) where.status = status
+    if (type === 'online') {
+      where.providerRef = { not: '' }
+    } else if (type === 'manual') {
+      where.OR = [{ providerRef: '' }, { providerRef: null }]
+    }
 
     if (user.role !== 'SUPER_ADMIN') {
       const ownedAgency = await db.agency.findFirst({
@@ -93,7 +112,14 @@ app.get('/', async (c) => {
       db.transaction.findMany({
         where,
         include: {
-          agency: { select: { id: true, name: true, customCode: true, category: true, subscriptionTier: true, subscriptionStatus: true } },
+          agency: {
+            select: {
+              id: true, name: true, customCode: true, category: true,
+              subscriptionTier: true, subscriptionStatus: true,
+              // Payer account contact (admin online-payment reconciliation view)
+              owner: { select: { username: true, fullName: true, email: true } },
+            },
+          },
           reviewer: { select: { id: true, fullName: true, username: true } },
         },
         orderBy: { createdAt: 'desc' },

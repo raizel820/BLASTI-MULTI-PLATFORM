@@ -78,35 +78,41 @@ const CUSTOMER_CACHE_MAX = 200
  * rejected with 422. This helper never blocks the checkout: on ANY failure
  * it returns null and the checkout is created without a customer_id (the
  * field is optional).
+ *
+ * Full contact details (phone/address) are sent so the hosted checkout page
+ * shows the payer's complete information. If the gateway rejects the richer
+ * payload (422/400), it retries ONCE with the minimal name+email body so a
+ * conservative API version can never block the checkout.
  */
 export async function ensureCustomerId(
   baseUrl: string,
   apiKey: string,
   name?: string,
   email?: string,
+  phone?: string,
+  address?: string,
 ): Promise<string | null> {
   const cleanName = (name || '').trim()
   const cleanEmail = (email || '').trim()
+  const cleanPhone = (phone || '').trim()
+  const cleanAddress = (address || '').trim()
   if (!cleanName && !cleanEmail) return null
 
-  const cacheKey = `${baseUrl}|${cleanName}|${cleanEmail}`
+  const cacheKey = `${baseUrl}|${cleanName}|${cleanEmail}|${cleanPhone}|${cleanAddress}`
   const cached = customerCache.get(cacheKey)
   if (cached) {
     if (cached.expiresAt > Date.now()) return cached.id
     customerCache.delete(cacheKey)
   }
 
-  try {
+  const createCustomer = async (body: Record<string, unknown>): Promise<{ id?: string } | null> => {
     const res = await fetch(`${baseUrl}/customers`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        ...(cleanName && { name: cleanName }),
-        ...(cleanEmail && { email: cleanEmail }),
-      }),
+      body: JSON.stringify(body),
     })
     if (!res.ok) {
       console.warn(
@@ -114,7 +120,24 @@ export async function ensureCustomerId(
       )
       return null
     }
-    const customer = (await res.json()) as { id?: string }
+    return (await res.json()) as { id?: string }
+  }
+
+  try {
+    // Rich payload first (full contact info on the hosted checkout page);
+    // fall back to the minimal body if the gateway rejects extra fields.
+    let customer = await createCustomer({
+      ...(cleanName && { name: cleanName }),
+      ...(cleanEmail && { email: cleanEmail }),
+      ...(cleanPhone && { phone: cleanPhone }),
+      ...(cleanAddress && { address: cleanAddress }),
+    })
+    if (!customer?.id && (cleanPhone || cleanAddress)) {
+      customer = await createCustomer({
+        ...(cleanName && { name: cleanName }),
+        ...(cleanEmail && { email: cleanEmail }),
+      })
+    }
     if (!customer?.id) return null
     if (customerCache.size >= CUSTOMER_CACHE_MAX) {
       const oldest = customerCache.keys().next().value
@@ -176,6 +199,8 @@ export interface CheckoutParams {
   failureUrl: string
   customerName?: string
   customerEmail?: string
+  customerPhone?: string  // shown on the hosted checkout page (customer record)
+  customerAddress?: string
   customerId?: string   // Pre-created Chargily customer id (optional)
   paymentMethod?: string  // 'edahabia' | 'cib' — defaults to 'edahabia'
   locale?: string         // 'ar' | 'en' | 'fr' — language of the hosted checkout page
@@ -265,7 +290,16 @@ export async function createCheckout(params: CheckoutParams): Promise<ChargilyCh
 
   // The API accepts ONLY a pre-created customer reference here — never a
   // nested customer object (that shape is retired and triggers a 422).
-  const customerId = params.customerId || (await ensureCustomerId(baseUrl, apiKey, params.customerName, params.customerEmail))
+  const customerId =
+    params.customerId ||
+    (await ensureCustomerId(
+      baseUrl,
+      apiKey,
+      params.customerName,
+      params.customerEmail,
+      params.customerPhone,
+      params.customerAddress,
+    ))
   if (customerId) {
     body.customer_id = customerId
   }

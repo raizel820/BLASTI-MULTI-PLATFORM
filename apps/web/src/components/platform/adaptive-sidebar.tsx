@@ -33,6 +33,13 @@ import {
 import {
   LayoutDashboard,
   Settings,
+  Settings2,
+  Server,
+  BellRing,
+  Banknote,
+  ShieldCheck,
+  HelpCircle,
+  SlidersHorizontal,
   CreditCard,
   Building2,
   LogOut,
@@ -47,7 +54,6 @@ import {
   Users,
   MapPin,
   BarChart3,
-  ShieldCheck,
   Crown,
   Monitor,
   Smartphone,
@@ -56,6 +62,7 @@ import {
   Briefcase,
   Package,
   Database,
+  HardDrive,
   ChevronDown,
   ChevronRight,
   ChevronLeft,
@@ -523,18 +530,45 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
 
   const navItems: SidebarNavItem[] = [
     { view: 'admin-dashboard', icon: LayoutDashboard, label: t('dashboard') },
-    // Task 2-b: Maps & Location promoted to its own findable entry, directly
-    // above the general platform settings where the same panel is also embedded.
+    // Task 2-b: Maps & Location promoted to its own findable entry.
     { view: 'admin-maps', icon: MapPin, label: t('adminMaps') },
-    { view: 'admin-settings', icon: Settings, label: t('platformSettings') },
+    // Task 2: "Database and Storage Management" group — splits the flat
+    // Database Manager entry into two subsections: the PostgreSQL console
+    // and the on-disk file store browser (Storage Manager).
+    {
+      view: '__data_storage_group__',
+      icon: Database,
+      label: t('dataStorageGroup'),
+      children: [
+        { view: 'admin-db', icon: Database, label: t('dbManagerTitle') },
+        { view: 'admin-storage', icon: HardDrive, label: t('storageManagerTitle') },
+      ],
+    },
+    // Task 5: the old monolithic "Platform Settings" long-scroll page became
+    // a collapsible sidebar group — one page per section, mirroring the
+    // "Managing Sales & Operations" group pattern below. 'admin-settings'
+    // stays the first child (General/Overview hub).
+    {
+      view: '__platform_settings_group__',
+      icon: Settings,
+      label: t('platformSettings'),
+      children: [
+        { view: 'admin-settings', icon: Settings2, label: t('settingsGeneral') },
+        { view: 'admin-settings-vps', icon: Server, label: t('settingsVps') },
+        { view: 'admin-settings-providers', icon: BellRing, label: t('settingsProviders') },
+        { view: 'admin-settings-maps', icon: MapPin, label: t('settingsMapsSub') },
+        { view: 'admin-settings-payments', icon: CreditCard, label: t('settingsPaymentsGateway') },
+        { view: 'admin-settings-financial', icon: Banknote, label: t('settingsFinancialEngine') },
+        { view: 'admin-settings-security', icon: ShieldCheck, label: t('settingsSecuritySub') },
+        { view: 'admin-settings-faq', icon: HelpCircle, label: t('settingsFaqSub') },
+        { view: 'admin-settings-config', icon: SlidersHorizontal, label: t('settingsSystemConfig') },
+      ],
+    },
     { view: 'admin-app-settings', icon: Smartphone, label: t('publicAppsSettings') },
     { view: 'admin-analytics', icon: BarChart3, label: t('analytics') },
     { view: 'admin-agencies', icon: Building2, label: t('agencies') },
     { view: 'admin-audit', icon: ClipboardList, label: t('auditLogsPage') },
     { view: 'admin-users', icon: Users, label: t('userManagement') },
-    // Database Manager — dedicated section: every PostgreSQL table with row
-    // counts/sizes, row-level actions and maintenance (VACUUM, tombstones).
-    { view: 'admin-db', icon: Database, label: t('dbManagerTitle') },
     // Support desk — triage/reply incoming complaints, suggestions,
     // questions and notes from customers and agencies.
     { view: 'admin-tickets', icon: LifeBuoy, label: t('supportTickets' as TranslationKeys) },
@@ -575,7 +609,11 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
       </div>
       <nav className="flex-1 px-3 py-3 space-y-1 overflow-y-auto">
         {navItems.map((item) => {
-          const isGroup = item.view === '__sales_ops_group__';
+          // Task 5 + Task 2: all sentinel-named groups (data & storage,
+          // sales ops + platform settings) get the section divider above
+          // them — the flat platform-settings entry this check used to test
+          // against no longer exists.
+          const isGroup = item.view === '__sales_ops_group__' || item.view === '__platform_settings_group__' || item.view === '__data_storage_group__';
           if (item.children) {
             return (
               <div key={item.view}>

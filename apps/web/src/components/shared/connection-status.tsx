@@ -82,7 +82,31 @@ async function resolveCloudBaseUrl(): Promise<string> {
   return 'http://localhost:3003';
 }
 
+// Connection-stability round: single-flight + minimum-interval throttle for
+// the health probe. Several mounted hooks/components each call
+// checkApiHealth (banner, dot, reachability) and during reconnect storms
+// they all fire together — piling renderer fetches onto the same probe
+// endpoint and starving real requests (the fetch-pool contention Task 69
+// documented). Rules: at most ONE probe in flight process-wide, and a probe
+// that completed <10s ago serves its verdict to everyone else. Probes still
+// mutate the module health state + notify listeners exactly as before.
+let _inFlightHealthCheck: Promise<ApiHealthStatus> | null = null;
+let _lastHealthCheckAt = 0;
+const MIN_HEALTH_CHECK_INTERVAL_MS = 10_000;
+
 async function checkApiHealth(): Promise<ApiHealthStatus> {
+  if (_inFlightHealthCheck) return _inFlightHealthCheck;
+  if (Date.now() - _lastHealthCheckAt < MIN_HEALTH_CHECK_INTERVAL_MS) {
+    return { ..._healthStatus };
+  }
+  _inFlightHealthCheck = runHealthCheck().finally(() => {
+    _lastHealthCheckAt = Date.now();
+    _inFlightHealthCheck = null;
+  });
+  return _inFlightHealthCheck;
+}
+
+async function runHealthCheck(): Promise<ApiHealthStatus> {
   const platform = detectPlatform();
   const { isElectron } = platform;
 

@@ -160,17 +160,39 @@ export async function fulfillCheckoutPaid(
       const planRecord = await db.subscriptionPlan.findFirst({
         where: { name: transaction.plan, isActive: true },
       })
-      const { subscriptionExpiresAt } = computeSubscriptionExpiry(
+      const { subscriptionExpiresAt: termExpiry } = computeSubscriptionExpiry(
         transaction.planName,
         planRecord?.billingCycle,
       )
+
+      // ── Upgrade / early-renewal stacking (proration counterpart) ──
+      // Checkout creation does NOT touch subscriptionExpiresAt, so at
+      // settlement time it still holds the CURRENT window's expiry. When
+      // that window is still active, the purchased term STACKS on top of it
+      // (remaining days preserved — the agency paid for them). An expired
+      // window behaves exactly as before (term starts now).
+      const current = await db.agency.findUnique({
+        where: { id: transaction.agencyId },
+        select: { subscriptionStartsAt: true, subscriptionExpiresAt: true },
+      })
+      const now = new Date()
+      const stillActive = !!current?.subscriptionExpiresAt && current.subscriptionExpiresAt.getTime() > now.getTime()
+      const base = stillActive ? (current.subscriptionExpiresAt as Date) : now
+
+      let subscriptionExpiresAt: Date | null = termExpiry
+      if (termExpiry && stillActive) {
+        const stacked = new Date(base)
+        stacked.setTime(stacked.getTime() + (termExpiry.getTime() - now.getTime()))
+        subscriptionExpiresAt = stacked
+      }
+
       await db.agency.update({
         where: { id: transaction.agencyId },
         data: {
           subscriptionStatus: 'ACTIVE',
           subscriptionTier: transaction.plan,
           subscriptionPlanId: planRecord?.id || undefined,
-          subscriptionStartsAt: new Date(),
+          subscriptionStartsAt: stillActive ? (current?.subscriptionStartsAt ?? now) : now,
           subscriptionExpiresAt,
         },
       })

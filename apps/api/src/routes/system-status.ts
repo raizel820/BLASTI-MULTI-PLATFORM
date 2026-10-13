@@ -551,20 +551,183 @@ app.get('/github-check', async (c) => {
   }
 })
 
-// ─── POST /api/system/rebuild — manual "pull + rebuild + restart" ───────────
+// ─── Rebuild pipeline (shared by the manual button + the CI trigger) ────────
 //
-// Spawns the SAME pipeline the watcher uses (scripts/watch-and-deploy.sh
-// watch --on-server --once), detached, so it survives the API restart that
-// happens mid-deploy. The script posts its own deploy heartbeats, holds the
-// shared update lock (never races a running install/update) and logs here:
-// <STORAGE_ROOT>/logs/rebuild-<timestamp>.log
+// Both endpoints run EXACTLY what an operator runs over ssh:
+//   bash scripts/deploy-digitalocean.sh server-update   (git pull → bun install →
+//     prisma db push → next build → restart blasti-api/blasti-web/caddy →
+//     health check → posts its own deploy heartbeat)
+//   bash scripts/deploy-digitalocean.sh server-doctor   (health report appended)
+//
+// The pipeline is launched through `systemd-run` as the transient unit
+// blasti-rebuild.service so it lives in its OWN cgroup — the blasti-api
+// restart in the middle of server-update cannot kill it (a plain detached
+// spawn would die with the API's cgroup on `systemctl restart blasti-api`).
+// Fallback: detached spawn when systemd-run is unavailable.
+// Output: <STORAGE_ROOT>/logs/deploy-<timestamp>.log + journalctl -u blasti-rebuild.
+// Serialization: server-update holds /run/lock/blasti-update.lock, so a
+// rebuild never races the watcher or another manual run.
+
+const UPDATE_LOCK = '/run/lock/blasti-update.lock'
+const REBUILD_UNIT = 'blasti-rebuild'
+// systemd-run does NOT inherit the caller's environment — give the unit a
+// usable PATH/HOME (bun, git, node live in the standard system paths).
+const REBUILD_UNIT_ENV: Array<[string, string]> = [
+  ['HOME', '/root'],
+  ['PATH', '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'],
+  ['GIT_TERMINAL_PROMPT', '0'],
+]
 
 const rebuildSchema = z.object({
-  force: z.boolean().default(false),
+  force: z.boolean().default(false), // kept for UI compat; server-update always rebuilds
   dryRun: z.boolean().default(false),
 })
 
-let rebuildInFlightUntil = 0
+const deployTriggerSchema = z.object({
+  source: z
+    .string()
+    .max(64)
+    .regex(/^[A-Za-z0-9._-]*$/, 'source must be [A-Za-z0-9._-]')
+    .default('external'),
+  commit: z
+    .string()
+    .max(64)
+    .regex(/^[0-9a-f]{7,64}$/i, 'commit must be a git sha')
+    .optional(),
+  reason: z
+    .string()
+    .max(200)
+    .regex(/^[^"'\\$`<>;|&]*$/, 'reason must not contain shell/quote characters')
+    .optional(),
+})
+
+/** True when something (watcher / manual / CI rebuild) holds the update lock. */
+async function updateLockHeld(): Promise<boolean> {
+  try {
+    await execFileAsync('flock', ['-n', UPDATE_LOCK, 'true'], { timeout: 5000 })
+    return false
+  } catch (error: unknown) {
+    const err = error as { code?: unknown; message?: unknown }
+    if (err.code === 1) return true // flock exit code 1 = lock held by someone
+    if (typeof err.code === 'string' && err.code === 'ENOENT') return false // no flock binary
+    return false // other spawn errors: assume free (server-update re-checks anyway)
+  }
+}
+
+function buildRebuildInnerScript(
+  scriptPath: string,
+  logFile: string,
+  source: string,
+  commit: string | null
+): string {
+  return [
+    `exec >>"${logFile}" 2>&1`,
+    `echo "============================================================"`,
+    `echo " BLASTI server-update (source: ${source}) - $(date '+%F %T %Z')"`,
+    `echo " target commit: ${commit ?? 'latest on the checked-out branch'}"`,
+    `echo "============================================================"`,
+    `echo "$ bash scripts/deploy-digitalocean.sh server-update"`,
+    `echo`,
+    `bash "${scriptPath}" server-update`,
+    `rc=$?`,
+    `echo`,
+    `echo "============================================================"`,
+    `echo " server-doctor health report"`,
+    `echo "============================================================"`,
+    `bash "${scriptPath}" server-doctor || true`,
+    `echo`,
+    `echo "=== server-update exit code: $rc ==="`,
+    `exit $rc`,
+  ].join('\n')
+}
+
+interface RebuildStart {
+  started: boolean
+  reason?: string
+  logFile: string
+  pid?: number | null
+}
+
+/** Spawn server-update + server-doctor detached from the API's cgroup. */
+async function startServerUpdate(opts: {
+  source: string
+  commit: string | null
+  dryRun?: boolean
+}): Promise<RebuildStart> {
+  const { source, commit, dryRun } = opts
+  const repoRoot = findRepoRoot()
+  if (!repoRoot) throw new Error('no_repo: this server does not serve from a git checkout')
+  const scriptPath = path.join(repoRoot, 'scripts', 'deploy-digitalocean.sh')
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error('missing_script: scripts/deploy-digitalocean.sh not found in the checkout')
+  }
+
+  const logDir = path.join(STORAGE_ROOT, 'logs')
+  fs.mkdirSync(logDir, { recursive: true })
+  const logFile = path.join(logDir, `deploy-${new Date().toISOString().replace(/[:.]/g, '-')}.log`)
+
+  if (dryRun) {
+    fs.writeFileSync(logFile, buildRebuildInnerScript(scriptPath, logFile, source, commit) + '\n(dry run: nothing was executed)\n')
+    return { started: false, reason: 'dry_run', logFile }
+  }
+
+  const inner = buildRebuildInnerScript(scriptPath, logFile, source, commit)
+
+  // Preferred launch path: a transient systemd unit in its own cgroup.
+  try {
+    const args = [
+      '--collect',
+      `--unit=${REBUILD_UNIT}`,
+      `--description=BLASTI server-update (${source})`,
+      ...REBUILD_UNIT_ENV.map(([k, v]) => `--setenv=${k}=${v}`),
+      'bash',
+      '-c',
+      inner,
+    ]
+    await execFileAsync('systemd-run', args, { timeout: 15_000 })
+    return { started: true, logFile, pid: null }
+  } catch (error: unknown) {
+    const err = error as { code?: unknown; message?: string; stderr?: string }
+    const text = `${err.message ?? ''} ${err.stderr ?? ''}`
+    if (/already loaded|already exists|unit .* already/i.test(text)) {
+      return { started: false, reason: 'already_running', logFile }
+    }
+    // systemd-run missing (non-systemd host) or refused for another reason —
+    // fall through to the detached spawn so the rebuild still happens.
+    try {
+      fs.appendFileSync(
+        logFile,
+        `[api] systemd-run unavailable (${text.trim().slice(0, 200) || 'not found'}) — falling back to a detached spawn\n`
+      )
+    } catch {
+      // logging is best-effort
+    }
+  }
+
+  // Fallback (no systemd): plain detached process. NOTE: it still dies if
+  // something restarts the API's service cgroup mid-deploy.
+  const out = fs.openSync(logFile, 'a')
+  try {
+    const env: NodeJS.ProcessEnv = { ...process.env }
+    for (const [k, v] of REBUILD_UNIT_ENV) env[k] = v
+    const child = spawn('bash', ['-c', inner], {
+      cwd: repoRoot,
+      detached: true,
+      stdio: ['ignore', out, out],
+      env,
+    })
+    child.on('error', () => {
+      /* spawn errors (missing bash?) land in the API log via the empty handler;
+         nothing else to do — systemd-run path or the watcher is the fallback */
+    })
+    child.unref()
+    return { started: true, logFile, pid: child.pid ?? null }
+  } finally {
+    fs.closeSync(out)
+  }
+}
+
+// ─── POST /api/system/rebuild — admin-panel "Rebuild" button ────────────────
 
 app.post('/rebuild', async (c) => {
   try {
@@ -575,43 +738,23 @@ app.post('/rebuild', async (c) => {
     if (!parsed.success) {
       return c.json({ success: false, error: 'Invalid payload' }, 400)
     }
-    const { force, dryRun } = parsed.data
+    const { dryRun } = parsed.data
 
-    if (Date.now() < rebuildInFlightUntil) {
+    if (await updateLockHeld()) {
       return c.json(
-        { success: false, error: 'already_running: a rebuild was triggered less than 10 minutes ago' },
+        {
+          success: false,
+          error:
+            'already_running: a deploy holds /run/lock/blasti-update.lock (auto-updater or another rebuild) — try again in a few minutes',
+        },
         409
       )
     }
+
     const repoRoot = findRepoRoot()
-    if (!repoRoot) {
-      return c.json({ success: false, error: 'no_repo: this server does not serve from a git checkout' }, 500)
-    }
-    const scriptPath = path.join(repoRoot, 'scripts', 'watch-and-deploy.sh')
-    if (!fs.existsSync(scriptPath)) {
-      return c.json({ success: false, error: 'missing_script: scripts/watch-and-deploy.sh not found' }, 500)
-    }
+    const localSha = repoRoot ? await git(['rev-parse', 'HEAD'], repoRoot).catch(() => '') : ''
 
-    const localSha = await git(['rev-parse', 'HEAD'], repoRoot).catch(() => '')
-    const logDir = path.join(STORAGE_ROOT, 'logs')
-    fs.mkdirSync(logDir, { recursive: true })
-    const logFile = path.join(logDir, `rebuild-${new Date().toISOString().replace(/[:.]/g, '-')}.log`)
-
-    const args = ['watch', '--on-server', '--once', '--dir', repoRoot]
-    if (force) args.push('--force')
-    if (dryRun) args.push('--dry-run')
-
-    const out = fs.openSync(logFile, 'a')
-    const child = spawn('bash', [scriptPath, ...args], {
-      cwd: repoRoot,
-      detached: true,
-      stdio: ['ignore', out, out],
-      env: { ...process.env },
-    })
-    child.unref()
-    fs.closeSync(out)
-
-    rebuildInFlightUntil = Date.now() + 10 * 60_000
+    const result = await startServerUpdate({ source: 'admin-panel', commit: localSha || null, dryRun })
 
     await recordEvent({
       at: new Date().toISOString(),
@@ -619,24 +762,104 @@ app.post('/rebuild', async (c) => {
       status: 'ok',
       commit: localSha || null,
       message: dryRun
-        ? 'manual rebuild (dry run) started from the admin panel'
-        : `manual rebuild started from the admin panel${force ? ' (forced)' : ''}`,
+        ? 'manual rebuild (dry run) requested from the admin panel'
+        : result.started
+          ? 'manual rebuild started from the admin panel (server-update + server-doctor)'
+          : `manual rebuild NOT started (${result.reason ?? 'unknown'})`,
     })
 
     return c.json({
       success: true,
-      started: true,
-      pid: child.pid ?? null,
-      logFile,
-      force,
-      dryRun,
-      hint: dryRun
-        ? 'Dry run: the pipeline only reports what it would do (see the log file on the server).'
-        : 'The pipeline pulls the new commit, rebuilds and restarts the services. Live progress: Auto-Deploy activity in Public Apps Settings, or tail -f the log file on the server.',
+      started: result.started,
+      reason: result.reason ?? null,
+      pid: result.pid ?? null,
+      logFile: result.logFile,
+      hint: result.started
+        ? 'server-update is running in the blasti-rebuild systemd unit (git pull → bun install → db push → next build → service restarts) followed by a server-doctor report. Progress: Auto-Deploy activity, the log file on the server, or journalctl -u blasti-rebuild -f.'
+        : result.reason === 'already_running'
+          ? 'A deploy is already in progress — nothing was started.'
+          : result.reason === 'dry_run'
+            ? 'Dry run: the command sequence was written to the log file; nothing was executed.'
+            : 'Nothing was started.',
     })
   } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : 'rebuild failed'
+    if (msg.startsWith('no_repo:') || msg.startsWith('missing_script:')) {
+      return c.json({ success: false, error: msg }, 500)
+    }
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── POST /api/system/deploy-trigger — CI hook ("installers pushed → rebuild")
+//
+// GitHub Actions (publish-to-vps job) calls this right after uploading the
+// freshly built installers, so the VPS pulls the new commit and rebuilds
+// immediately instead of waiting for the next blasti-watcher.timer tick.
+// Auth: the shared DEPLOY_TOKEN (x-deploy-token header) — same secret the
+// watcher and the installer upload use. Always returns 200 for soft-skip
+// cases (deploy already running / recently triggered) so CI never fails
+// just because the VPS was busy; the watcher remains the safety net.
+
+let lastTriggerAt = 0
+
+app.post('/deploy-trigger', async (c) => {
+  try {
+    requireDeployToken(c)
+
+    const body = await c.req.json().catch(() => ({}))
+    const parsed = deployTriggerSchema.safeParse(body)
+    if (!parsed.success) {
+      return c.json({ success: false, error: 'Invalid payload', details: parsed.error.issues }, 400)
+    }
+    const { source, commit, reason } = parsed.data
+
+    if (await updateLockHeld()) {
+      await recordEvent({
+        at: new Date().toISOString(),
+        kind: 'deploy-trigger',
+        status: 'skipped',
+        commit: commit ?? null,
+        message: `${source} requested a rebuild — skipped, a deploy is already running`,
+      })
+      return c.json({ success: true, started: false, reason: 'deploy_in_progress' })
+    }
+    if (Date.now() - lastTriggerAt < 30_000) {
+      return c.json({ success: true, started: false, reason: 'recent_trigger' })
+    }
+
+    const result = await startServerUpdate({ source, commit: commit ?? null })
+    lastTriggerAt = Date.now()
+
+    await recordEvent({
+      at: new Date().toISOString(),
+      kind: 'deploy-trigger',
+      status: result.started ? 'ok' : 'skipped',
+      commit: commit ?? null,
+      message: result.started
+        ? `rebuild triggered by ${source}${reason ? ` — ${reason}` : ''} (server-update + server-doctor)`
+        : `rebuild trigger from ${source} not started (${result.reason ?? 'unknown'})`,
+    })
+
+    return c.json({
+      success: true,
+      started: result.started,
+      reason: result.reason ?? null,
+      logFile: result.logFile,
+      hint: result.started
+        ? 'server-update is running in the blasti-rebuild systemd unit; watch journalctl -u blasti-rebuild -f on the VPS.'
+        : 'Nothing was started.',
+    })
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : 'deploy trigger failed'
+    if (msg.includes('deploy_token') || msg.includes('heartbeat_disabled')) {
+      return c.json({ success: false, error: msg }, 401)
+    }
+    if (msg.startsWith('no_repo:') || msg.startsWith('missing_script:')) {
+      return c.json({ success: false, error: msg }, 500)
+    }
+    return c.json({ success: false, error: 'Deploy trigger failed' }, 500)
   }
 })
 

@@ -294,9 +294,13 @@ export function CustomerNotifications() {
     fetchNotifications();
   }, [fetchNotifications]);
 
-  // Auto-refresh every 30s
+  // Auto-refresh every 30s — paused while the tab/app is hidden (Performance
+  // Round: the realtime socket pushes notification:* events anyway).
   useEffect(() => {
-    const interval = setInterval(() => fetchNotifications(), 30000);
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      fetchNotifications();
+    }, 30000);
     return () => clearInterval(interval);
   }, [fetchNotifications]);
 

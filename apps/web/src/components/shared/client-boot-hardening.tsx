@@ -3,7 +3,7 @@
 /**
  * BLASTI Client Boot Hardening (Task 41, extended by Task 47-b)
  *
- * Three independent boot tasks that run once per page load:
+ * Four independent boot tasks that run once per page load:
  *
  * 1. LEGACY SERVICE-WORKER CLEANUP
  *    Older builds of the app shipped public/sw.js (cache-first static caching
@@ -33,10 +33,18 @@
  *    (listeners + permission + register) and uploads the FCM token to the
  *    API, so push works even when the native shell's auto-setup did not
  *    run. No-op on plain browsers / Electron (Capacitor absent).
+ *
+ * 4. MOBILE HARDWARE BACK BUTTON (Android touch/gesture navigation)
+ *    Inside the Capacitor WebView, owns the hardware back button:
+ *    step back through the app's navigation, close open overlays, and at the
+ *    root view show a non-blocking "press back again to exit" confirm that
+ *    calls App.exitApp(). No-op on plain browsers / Electron (Capacitor
+ *    absent) — see lib/native-back-handler.ts for the full policy.
  */
 
 import { useEffect } from 'react';
 import { initMobilePushRegistration } from '@/lib/push-registration';
+import { initNativeBackHandler } from '@/lib/native-back-handler';
 
 const CHUNK_RELOAD_KEY = 'blasti-chunk-reload-at';
 const CHUNK_RELOAD_COOLDOWN_MS = 15000;
@@ -51,6 +59,14 @@ export function ClientBootHardening() {
     // Fire-and-forget: a hardened boot task must never block or throw.
     initMobilePushRegistration().catch((error) => {
       console.warn('[BootHardening] Mobile push registration failed:', error);
+    });
+
+    // ── 0b. Mobile hardware back button (Capacitor only; no-op elsewhere) ─
+    // Same fire-and-forget contract. The listener registers once per session
+    // and is intentionally never removed — the WebView process owns it for
+    // its lifetime (same convention as the push registration above).
+    initNativeBackHandler().catch((error) => {
+      console.warn('[BootHardening] Native back-button handler failed:', error);
     });
 
     // ── 1. Legacy service worker cleanup ──────────────────────────────────

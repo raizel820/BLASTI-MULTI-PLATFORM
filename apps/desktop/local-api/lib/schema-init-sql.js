@@ -550,6 +550,7 @@ CREATE TABLE "SmsLog" (
     "status" TEXT NOT NULL DEFAULT 'PENDING',
     "provider" TEXT NOT NULL DEFAULT '',
     "errorMessage" TEXT,
+    "providerMessageId" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "smsSettingsId" TEXT,

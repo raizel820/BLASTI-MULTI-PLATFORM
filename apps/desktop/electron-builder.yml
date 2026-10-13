@@ -93,7 +93,16 @@ nsis:
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true
-  deleteAppDataOnUninstall: false
+  # Task 2-b-1 (USER BUG: "when uninstall the app, delete all local stored data
+  # so a new install will not reopen old offline sessions"): the uninstaller
+  # must wipe the userData dir (%APPDATA%\BLASTI — local SQLite DB, file store,
+  # logs, durable session file). build/installer.nsh additionally removes the
+  # dirs deleteAppDataOnUninstall does NOT cover (dev-run userData, legacy
+  # ~/.blasti data, updater caches) — see the path inventory documented there.
+  deleteAppDataOnUninstall: true
+  # NSIS hook script: customUnInstall macro removes every remaining BLASTI
+  # data dir (build/installer.nsh, relative to apps/desktop).
+  include: build/installer.nsh
   # NOTE: installerIcon/uninstallerIcon/installerHeaderIcon overrides REMOVED.
   # electron-builder now derives them from win.icon (assets/icon.png) and its
   # built-in header BMP. Forcing a 512x512 PNG into installerHeaderIcon made

@@ -34,6 +34,16 @@ import {
   GENERAL_RATE_LIMIT,
   REGISTRATION_RATE_LIMIT,
 } from './lib/rate-limit'
+// Performance Round — response caching + conditional GET (ETag/304) layer for
+// the 2-core ARM VPS: cuts DB load on hot public endpoints and turns most
+// authed polling into ~200-byte 304 revalidations (browser/WebView/Electron
+// honor this natively). See lib/response-cache.ts for the design contract.
+import {
+  conditionalGetMiddleware,
+  publicCacheMiddleware,
+  invalidateResponseCacheTag,
+  responseCacheStats,
+} from './lib/response-cache'
 
 // ─── Route Modules ──────────────────────────────────────────────────────────
 
@@ -61,6 +71,7 @@ import { filesSyncRoutes } from './routes/files-sync'
 import { syncRoutes } from './routes/sync'
 import { settingsRoutes } from './routes/settings'
 import { paymentWebhookRoutes } from './routes/payment-webhook'
+import { messagingWebhookRoutes } from './routes/messaging-webhooks'
 import { paymentCheckoutRoutes } from './routes/payment-checkout'
 import { reconciliationRoutes } from './routes/reconciliation'
 import { offlineSyncRoutes } from './routes/offline-sync'
@@ -70,6 +81,8 @@ import { agencyCategoriesRoutes } from './routes/agency-categories'
 import { adminProviderRoutes } from './routes/admin-providers'
 // Database Manager — SUPER_ADMIN PostgreSQL console (sidebar "Database Manager")
 import { adminDbRoutes } from './routes/admin-db'
+// Storage Manager — SUPER_ADMIN file-store console (sidebar "Storage Manager")
+import { adminStorageRoutes } from './routes/admin-storage'
 import { appVersionRoutes } from './routes/app-versions'
 import { systemStatusRoutes } from './routes/system-status'
 // Task 54-a — doc-2 role-scoped analytics (staff + customer modules)
@@ -181,7 +194,11 @@ app.use('*', cors({
   credentials: true,
   maxAge: 86400,
 }))
-app.use('*', logger())
+// Request logging is pure I/O overhead on the production VPS (every request
+// wrote a line to journald on a 2-core box). Enabled by default ONLY in
+// development; set BLASTI_HTTP_LOG=1 to force it back on in production.
+const HTTP_LOG = process.env.NODE_ENV !== 'production' || process.env.BLASTI_HTTP_LOG === '1'
+if (HTTP_LOG) app.use('*', logger())
 
 // ─── Outbox Idempotency Guard (sync v2) ────────────────────────────────────
 // Route-agnostic: for mutation requests carrying X-Idempotency-Key, dedupes
@@ -348,6 +365,17 @@ app.use('/api/*', async (c, next) => {
   const path = c.req.path
   const method = c.req.method
 
+  // Connection-stability round: liveness probes are NEVER rate limited —
+  // every client (web banner, desktop engine probe, mobile shell, uptime
+  // monitors) hammers /api/health, and venues share one egress IP. Even with
+  // the general tier sized for many-devices-per-IP, a handful of pollers
+  // could otherwise 429 the entire venue. (Rate-limit exemption only — the
+  // data-usage recorder above has its own, wider skip list.)
+  if (path === '/api/health') {
+    await next()
+    return
+  }
+
   // Get client IP using the existing rate-limit utility.
   // Priority: x-connecting-ip (injected by server) → x-forwarded-for → x-real-ip
   const ip = getClientIp(c)
@@ -367,12 +395,15 @@ app.use('/api/*', async (c, next) => {
     throw error
   }
 
-  // Apply global rate limit: 100 req/min per IP for all API routes
+  // Apply global rate limit: 300 req/min per IP for all API routes.
+  // (Connection-stability round: 100→300 — venues run MANY devices behind
+  // one egress IP (kiosks + staff tablets + customer phones on venue Wi-Fi),
+  // so the per-IP bucket must be sized for the venue, not the device.)
   try {
     checkRateLimit(ip, GENERAL_RATE_LIMIT)
   } catch (error) {
     if (error instanceof RateLimitError) {
-      console.warn(`[RATE-LIMIT] Rate limited: ${ip} on ${method} ${path} (global: 100/min)`)
+      console.warn(`[RATE-LIMIT] Rate limited: ${ip} on ${method} ${path} (global: 300/min)`)
       return c.json(
         { success: false, error: error.message, retryAfter: error.retryAfter },
         429,
@@ -401,6 +432,38 @@ app.use('/api/*', async (c, next) => {
 
   await next()
 })
+
+// ─── Performance Round: response cache + conditional GET ───────────────────
+//
+// Layer 2 — generic ETag/304 for EVERY /api/* GET: after this, unchanged
+// responses cost ~200 bytes instead of full payloads for ALL clients
+// (browser, Capacitor WebView, Electron main-process fetch, kiosks).
+// NOTE (Hono internals): the conditional-GET layer is registered BEFORE the
+// public cache on purpose. Hono's Context.res setter copies the previous
+// response's headers onto any newly assigned one — so the LAST middleware to
+// write headers must be the innermost one. Registered in this order, the
+// public cache stamps ETag/Cache-Control/X-Cache LAST (its TTL wins on cached
+// routes) while conditionalGet still stamps everything else and always skips
+// responses that already carry an ETag.
+app.use('/api/*', conditionalGetMiddleware)
+
+// Layer 1 — TTL cache for hot PUBLIC GET endpoints (zero-DB hits on repeat).
+// Exact-path matches only; authed callers always bypass (fresh data), and
+// every entry self-expires so a missed invalidation is bounded by its TTL.
+// Mutation routes invalidate eagerly via invalidateResponseCacheTag().
+const PUBLIC_CACHE_ROUTES: Array<{ path: string; ttlMs: number; tags: string[] }> = [
+  { path: '/api/stats', ttlMs: 15_000, tags: ['stats'] },                      // landing counters
+  { path: '/api/agencies', ttlMs: 30_000, tags: ['agencies'] },                // public directory (per query combo)
+  { path: '/api/faqs', ttlMs: 300_000, tags: ['faqs'] },                       // rarely changes
+  { path: '/api/faq', ttlMs: 300_000, tags: ['faqs'] },
+  // NOTE: /api/agency-categories is AUTH-REQUIRED (any role) — served by the
+  // conditional-GET layer (304s) instead of the anonymous public cache.
+  { path: '/api/app-versions/public/active', ttlMs: 60_000, tags: ['app-versions'] }, // landing download buttons
+  { path: '/api/payment-settings', ttlMs: 60_000, tags: ['payment-settings'] },// checkout config
+]
+for (const route of PUBLIC_CACHE_ROUTES) {
+  app.use(route.path, publicCacheMiddleware({ ttlMs: route.ttlMs, tags: route.tags }))
+}
 
 // Global error handler
 app.onError((err, c) => {
@@ -446,6 +509,9 @@ app.get('/health', (c) => {
     totalEventsEmitted,
     uptime: Math.floor(process.uptime()),
     rooms: io?.sockets?.adapter?.rooms?.size ?? 0,
+    // Performance Round — response-cache introspection (entries, single-flight
+    // in-flight count, invalidation tags currently indexed).
+    cache: responseCacheStats(),
   })
 })
 
@@ -572,6 +638,7 @@ app.route('/api/agency', agencyRoutes)
 app.route('/api/admin', adminRoutes)
 app.route('/api/admin/providers', adminProviderRoutes)
 app.route('/api/admin/db', adminDbRoutes)
+app.route('/api/admin/storage', adminStorageRoutes)
 app.route('/api/agencies', agenciesRoutes)
 app.route('/api/reservations', reservationsRoutes)
 app.route('/api/queue', queueRoutes)
@@ -598,6 +665,9 @@ app.route('/api/sync', syncRoutes)
 app.route('/api/sync', initialSyncRoutes)
 app.route('/api/settings', settingsRoutes)
 app.route('/api/payment/webhook', paymentWebhookRoutes)
+// Task 3 — provider delivery-report webhooks (public, self-verified):
+//   POST /api/webhooks/esms (eSMS DLR) · GET+POST /api/webhooks/whatsapp (Meta)
+app.route('/api/webhooks', messagingWebhookRoutes)
 app.route('/api/payment', paymentCheckoutRoutes)
 app.route('/api/reconciliation', reconciliationRoutes)
 app.route('/api/offline-sync', offlineSyncRoutes)
@@ -1063,8 +1133,13 @@ io = new SocketIOServer(httpServer, {
     methods: ['GET', 'POST'],
     credentials: true,
   },
-  pingInterval: 10000,
-  pingTimeout: 5000,
+  // Connection-stability round: the old 10s/5s heartbeat raced slow links and
+  // mobile networks — one missed 10s ping + 5s grace killed the socket and
+  // forced a full reconnect (often mid-transaction). 25s/20s matches the
+  // engine.io defaults and survives transient blips; genuinely dead peers
+  // are still reaped within ~45s.
+  pingInterval: 25000,
+  pingTimeout: 20000,
   allowUpgrades: true,
   maxHttpBufferSize: 1e6,
   // Phase 1b: Allow unauthenticated connections but track auth state
@@ -1422,6 +1497,19 @@ io.on('connection', async (socket) => {
     }
   })
 })
+
+// ─── Performance Round: HTTP keep-alive tuning ─────────────────────────────
+// Node defaults keepAliveTimeout to 5s while Caddy (and every browser pool)
+// idle reusable upstream connections for far longer — the classic "connection
+// closed just as the proxy reuses it" race that turns a cached request into a
+// retried one (ERR_EMPTY_RESPONSE spikes under load). Aligning the timeouts
+// above the proxy's idle window keeps reverse-proxy connections warm and
+// removes those retry round-trips entirely. requestTimeout stays generous so
+// slow installer uploads/downloads are never cut short.
+const PROXY_IDLE_MS = 120_000
+httpServer.keepAliveTimeout = PROXY_IDLE_MS
+httpServer.headersTimeout = PROXY_IDLE_MS + 6_000 // must exceed keepAliveTimeout
+httpServer.requestTimeout = 300_000
 
 httpServer.listen(PORT, HOST, async () => {
   // One-shot database connectivity check (legacy SQLite PRAGMA is a no-op now)

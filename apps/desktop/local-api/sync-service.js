@@ -1245,7 +1245,18 @@ async function _insertLocalRecord(db, table, record) {
   var columns = entries.map(function(kv) { return '"' + kv[0] + '"'; });
   var placeholders = entries.map(function() { return '?'; });
   var values = entries.map(function(kv) { return kv[1]; });
-  var sql = 'INSERT OR IGNORE INTO "' + table + '" (' + columns.join(', ') + ') VALUES (' + placeholders.join(', ') + ')';
+  // Task 2-b-1 (USER BUG: "desktop did not import and sync queue data"):
+  // this was `INSERT OR IGNORE` — which SILENTLY SKIPS the row on a NOT NULL
+  // violation. A drifted pull payload missing a required Reservation column
+  // (agencyId/serviceId/queueNumber/displayNumber) therefore vanished with
+  // zero errors while the record was counted as "applied" — exactly the
+  // reported "queue rows never imported" symptom. A plain INSERT surfaces the
+  // failure: the caller's savepoint catches it, the APPLY-ERROR line logs the
+  // model/record/error, and the change is durably deferred (then retried /
+  // quarantined) instead of silently lost. Both callers SELECT the row first,
+  // so the id-collision case OR IGNORE used to paper over cannot occur except
+  // as a visible, retryable error.
+  var sql = 'INSERT INTO "' + table + '" (' + columns.join(', ') + ') VALUES (' + placeholders.join(', ') + ')';
   await db.$executeRawUnsafe(sql, ...values);
 }
 
@@ -1831,6 +1842,15 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
           }
         } else {
           deferred++;
+          // Task 2-b (sub-task 6): VISIBILITY — one loud, greppable line per
+          // apply failure with the exact model/record/operation and error.
+          // Queue rows (Reservation) that failed to import were previously
+          // only visible as an anonymous savepoint warning; support tickets
+          // like "desktop did not import queue data" now answer from the log.
+          console.error('[SyncService] APPLY-ERROR model=' + modelName +
+            ' record=' + cloudRecord.id +
+            ' op=' + (existing ? 'update' : 'create') +
+            ' error=' + String(lastApplyError && lastApplyError.message || 'unknown').substring(0, 300));
           await deferChange(table, cloudRecord.id, existing ? 'update' : 'create', local, lastApplyError);
         }
       }
@@ -1850,6 +1870,12 @@ async function _applyPullChanges(db, cloudChanges, pageCtx) {
           }
         } else {
           deferred++;
+          // Task 2-b (sub-task 6): same visibility contract as the create/
+          // update branch above — a failed delete is never silent.
+          console.error('[SyncService] APPLY-ERROR model=' + modelName +
+            ' record=' + deleteId +
+            ' op=delete' +
+            ' error=' + String(lastApplyError && lastApplyError.message || 'unknown').substring(0, 300));
           await deferChange(table, deleteId, 'delete', null, lastApplyError);
         }
       }
@@ -2377,14 +2403,19 @@ function _setupSocket() {
     var agencyId = _config.agencyId || (_userContext && _userContext.agencyId);
     // Task 77: reconnect fast after network blips / sleep-wake. The old
     // 1s→30s backoff could leave the desktop realtime-blind for up to 30s
-    // after a flaky moment; 0.5s→5s recovers in ~1s typical, and the
-    // staleness watchdog below remains the stuck-state backstop.
+    // after a flaky moment. Connection-stability round: 1s→15s ceiling (was
+    // 0.5s→5s) — 0.5s reconnect attempts during a server restart or network
+    // flap produced reconnect storms (hundreds of attempts hammering the
+    // cloud while it was down, then a burst of handshakes the moment it
+    // recovered). A 1s start still feels instant on a normal blip; the 15s
+    // ceiling keeps the storm bounded. The staleness watchdog below remains
+    // the stuck-state backstop.
     _socket = io(_config.cloudBaseUrl, {
       transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionAttempts: Infinity,
-      reconnectionDelay: 500,
-      reconnectionDelayMax: 5000,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 15000,
       timeout: 10000,
       auth: { token: _authToken },
     });
@@ -3000,6 +3031,64 @@ function triggerSyncNow() {
 }
 
 /**
+ * Task 2-b (sub-task 4): FULL data sync on demand — backs the post-login
+ * consent dialog ("Full data sync recommended — sync now?").
+ *
+ * Runs the complete reconciliation stack IN ORDER:
+ *   1. Outbox replay  — every local (offline) mutation reaches the cloud.
+ *   2. Full pull      — /api/sync/pull from sequence 0 (LWW protects
+ *                       locally-newer rows); re-imports EVERYTHING the feed
+ *                       still carries, including any queue rows an older
+ *                       cursor had skipped.
+ *   3. Record reconcile — record-diff push of local rows (safety net for
+ *                       anything that missed the outbox).
+ *
+ * Safe to call concurrently with the incremental cycle (the same in-flight
+ * guards apply). Never throws — errors land in the result object so the
+ * caller (sync:full-now IPC) can report them without breaking the UI flow.
+ */
+async function fullSyncNow() {
+  var result = { replayed: 0, pulled: 0, deleted: 0, conflicts: 0, reconciled: 0, errors: [] };
+  try {
+    if (!_isStarted || !_authToken) {
+      // Engine not running yet (fresh login race) — start a plain incremental
+      // cycle so the engine comes up; the consent "Sync now" already ran the
+      // staged initial import through cloud-sync:set-auth / initial-sync IPC.
+      await triggerSyncNow();
+      result.errors.push('engine-not-started: incremental cycle triggered instead');
+      return result;
+    }
+    try {
+      var replay = await _replayPendingMutations();
+      result.replayed = (replay && replay.succeeded) || 0;
+    } catch (replayErr) {
+      result.errors.push('replay: ' + replayErr.message);
+    }
+    try {
+      var pull = await _pullFromCloud({ fullSync: true });
+      result.pulled = pull.applied;
+      result.deleted = pull.deleted;
+      result.conflicts = pull.conflicts;
+    } catch (pullErr) {
+      result.errors.push('pull: ' + pullErr.message);
+    }
+    try {
+      var reconcile = await reconcileRecords();
+      result.reconciled = reconcile.pushed;
+    } catch (recErr) {
+      result.errors.push('reconcile: ' + recErr.message);
+    }
+    console.log('[SyncService] FULL SYNC NOW: replayed=' + result.replayed + ', pulled=' + result.pulled +
+      ', deleted=' + result.deleted + ', conflicts=' + result.conflicts + ', reconciled=' + result.reconciled +
+      (result.errors.length ? ', errors=[' + result.errors.join('; ') + ']' : ''));
+    return result;
+  } catch (err) {
+    result.errors.push('fatal: ' + err.message);
+    return result;
+  }
+}
+
+/**
  * Local→cloud immediacy: called by the local API (via main.js mutation
  * listener) after every local business mutation. Leading-edge immediate
  * replay for the first mutation; a 150ms trailing debounce coalesces bursts.
@@ -3351,6 +3440,7 @@ module.exports = {
   startSync: startSync,
   stopSync: stopSync,
   triggerSyncNow: triggerSyncNow,
+  fullSyncNow: fullSyncNow,
   cleanupTombstones: cleanupTombstones,
   getStatus: getStatus,
   setAuth: setAuth,

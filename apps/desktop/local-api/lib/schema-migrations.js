@@ -52,7 +52,7 @@ const path = require('path')
 // ─── Versioning ─────────────────────────────────────────────────────────────
 
 /** Current local schema version. Bump when adding MIGRATION_STEPS. */
-const LOCAL_SCHEMA_VERSION = 6
+const LOCAL_SCHEMA_VERSION = 7
 
 /**
  * Incremental upgrade steps BETWEEN versions. Each step:
@@ -145,6 +145,18 @@ const MIGRATION_STEPS = [
       'CREATE INDEX "SupportTicket_userId_createdAt_idx" ON "SupportTicket"("userId", "createdAt")',
       'CREATE INDEX "SupportTicket_agencyId_createdAt_idx" ON "SupportTicket"("agencyId", "createdAt")',
       'CREATE INDEX "SupportTicket_status_createdAt_idx" ON "SupportTicket"("status", "createdAt")',
+    ],
+  },
+  {
+    // Task 3 (messaging providers) — delivery-report correlation: eSMS Africa
+    // and Meta WhatsApp webhooks land with the PROVIDER's message id; the
+    // idempotent DLR handler matches SmsLog rows through this column to
+    // advance PENDING → SENT → DELIVERED → READ. The regenerated shared
+    // Prisma client includes the field, so every local write path needs it.
+    version: 7,
+    name: 'smslog-provider-message-id (DLR webhook correlation — Task 3)',
+    statements: [
+      'ALTER TABLE "SmsLog" ADD COLUMN "providerMessageId" TEXT',
     ],
   },
 ]

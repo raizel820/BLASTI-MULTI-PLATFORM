@@ -23,6 +23,8 @@ export interface SendSmsResult {
   error?: string;
   logId?: string;
   responseRaw?: string;
+  /** Provider message id — the DLR webhook correlates delivery reports on it */
+  providerMessageId?: string;
 }
 
 export interface SmsUsageStats {
@@ -70,7 +72,7 @@ export async function getSmsSettings() {
     settings = await db.smsSettings.create({
       data: {
         provider: 'esmsafrica',
-        apiUrl: 'https://api.esmsafrica.io/v1',
+        apiUrl: 'https://sms.esmsafrica.io/api',
         apiKey: '',
         senderName: 'BLASTI',
         enabled: false,
@@ -179,9 +181,10 @@ export async function checkUserSmsCredit(userId: string): Promise<{ hasCredit: b
 
   const totalPurchased = purchasedTotal._sum.quantity ?? 0;
 
-  // Count used SMS (SENT status logs)
+  // Count used SMS — every consumed status counts (SENT and any later DLR
+  // advancement such as DELIVERED/READ must never refund a spent credit)
   const usedCount = await db.smsLog.count({
-    where: { userId, status: 'SENT' },
+    where: { userId, status: { in: [...SMS_CONSUMED_STATUSES] } },
   });
 
   const hasPurchasedCredit = (totalPurchased - usedCount) > 0;
@@ -204,7 +207,7 @@ export async function checkDailyLimit(userId: string, maxPerDay: number): Promis
   const sentToday = await db.smsLog.count({
     where: {
       userId,
-      status: 'SENT',
+      status: { in: [...SMS_CONSUMED_STATUSES] },
       createdAt: { gte: todayStart },
     },
   });
@@ -222,10 +225,10 @@ export async function getSmsUsageStats(): Promise<SmsUsageStats> {
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
   const [sentToday, sentThisWeek, sentThisMonth, totalSent, failedToday] = await Promise.all([
-    db.smsLog.count({ where: { status: 'SENT', createdAt: { gte: todayStart } } }),
-    db.smsLog.count({ where: { status: 'SENT', createdAt: { gte: weekStart } } }),
-    db.smsLog.count({ where: { status: 'SENT', createdAt: { gte: monthStart } } }),
-    db.smsLog.count({ where: { status: 'SENT' } }),
+    db.smsLog.count({ where: { status: { in: [...SMS_CONSUMED_STATUSES] }, createdAt: { gte: todayStart } } }),
+    db.smsLog.count({ where: { status: { in: [...SMS_CONSUMED_STATUSES] }, createdAt: { gte: weekStart } } }),
+    db.smsLog.count({ where: { status: { in: [...SMS_CONSUMED_STATUSES] }, createdAt: { gte: monthStart } } }),
+    db.smsLog.count({ where: { status: { in: [...SMS_CONSUMED_STATUSES] } } }),
     db.smsLog.count({ where: { status: 'FAILED', createdAt: { gte: todayStart } } }),
   ]);
 
@@ -243,6 +246,14 @@ export async function getRecentSmsLogs(limit = 10) {
 }
 
 // ─── Main Send Function (eSMS Africa via ProviderConfig) ────────────────────
+
+/**
+ * SmsLog statuses that CONSUME a credit. Delivery reports (DLR webhooks)
+ * advance SENT → DELIVERED → READ; every consumed status must keep counting
+ * against the user's balance, or a later DLR update would silently refund
+ * credits that were genuinely spent.
+ */
+export const SMS_CONSUMED_STATUSES = ['SENT', 'DELIVERED', 'READ'] as const;
 
 /**
  * Send SMS through the admin-configured provider. Retains the original
@@ -273,7 +284,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
       });
       const totalPurchased = purchasedTotal._sum.quantity ?? 0;
       const usedCount = await db.smsLog.count({
-        where: { userId, status: 'SENT' },
+        where: { userId, status: { in: [...SMS_CONSUMED_STATUSES] } },
       });
       const hasPurchasedCredit = (totalPurchased - usedCount) > 0;
 
@@ -323,6 +334,9 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
         status,
         provider: 'esmsafrica',
         errorMessage,
+        // The provider's own message id — the DLR webhook correlates on it
+        // to advance the status (SENT → DELIVERED → READ).
+        ...(result.providerMessageId ? { providerMessageId: result.providerMessageId } : {}),
         smsSettingsId: settings.id,
       },
     });
@@ -341,6 +355,7 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
       error: result.success ? undefined : 'SEND_FAILED',
       logId: log.id,
       responseRaw: result.responseRaw?.slice(0, 200) ?? result.error,
+      providerMessageId: result.providerMessageId,
     };
   } catch (err) {
     // Refund the credit if SMS threw an exception

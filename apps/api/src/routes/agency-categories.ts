@@ -22,6 +22,8 @@ import { requireAuth, requireRole, authErrorResponse } from '../lib/auth'
 import { validateBody } from '../lib/validations'
 import { BUILT_IN_AGENCY_CATEGORY_KEYS } from '../lib/enums'
 import { enforceRateLimit, GENERAL_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
+// Performance Round — eager invalidation of cached public GETs.
+import { invalidateResponseCacheTag } from '../lib/response-cache'
 
 const app = new Hono()
 
@@ -128,6 +130,9 @@ app.post('/', async (c) => {
     }
 
     if (clientIp) recordSuccessfulRequest(clientIp)
+
+    // Performance Round — the dictionary feeds the customer filter bar.
+    invalidateResponseCacheTag('categories')
 
     return c.json({ success: true, data: category }, 201)
   } catch (error: unknown) {

@@ -105,8 +105,10 @@ export function StatsSection() {
   }, []);
 
   const stats: StatItem[] = [
-    { icon: Building2, value: landingStats?.totalAgencies ?? 500, suffix: '+', labelKey: 'landingStatAgencies' },
-    { icon: Users, value: landingStats?.totalCustomers ?? 10000, suffix: '+', labelKey: 'landingStatUsers' },
+    // REAL values from GET /api/stats — 0 while loading / offline. The old
+    // hardcoded 500/10,000 fallbacks were fake marketing numbers.
+    { icon: Building2, value: landingStats?.totalAgencies ?? 0, suffix: '+', labelKey: 'landingStatAgencies' },
+    { icon: Users, value: landingStats?.totalCustomers ?? 0, suffix: '+', labelKey: 'landingStatUsers' },
     { icon: TicketCheck, value: landingStats?.totalReservations ?? 0, suffix: '+', labelKey: 'landingStatReservations' },
   ];
 

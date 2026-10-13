@@ -39,6 +39,8 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { UserAvatar } from '@/components/shared/user-avatar';
+// Task 2-c-2 — manual full data resync (shared: web + Capacitor mobile + Electron desktop).
+import { FullResyncButton } from '@/components/shared/full-resync-button';
 import {
   User,
   Bell,
@@ -609,6 +611,9 @@ export function CustomerSettings() {
                 {t('changePassword')}
               </Button>
             </div>
+            {/* Task 2-c-2 — account-level full data resync (shared component,
+                same block the agency settings render) */}
+            <FullResyncButton />
           </div>
         </motion.section>
 

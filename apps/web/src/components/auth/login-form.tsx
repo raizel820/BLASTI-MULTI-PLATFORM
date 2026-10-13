@@ -3,6 +3,12 @@ import { apiFetch } from '@/lib/api-fetch';;
 
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { apiClient, setNativeSessionToken } from '@/lib/api-client';
+// Task 2-b (sub-task 3) — desktop remember-me persistence mode. In the
+// Electron shell the checkbox decides whether ANY durable session material
+// survives a restart; on plain web browsers the marker is ignored by the
+// store's Electron-gated partialize, so behavior there is unchanged.
+// Task 2-b-2 (sub-task 1) — the checkbox also PRE-SHOWS the last choice.
+import { setSessionPersistenceMode, getLastRememberChoice } from '@/lib/auth-storage';
 import { useAppStore } from '@/store/use-app-store';
 import { adoptImportedLocalSessionUser } from '@/lib/session-heal';
 import { useLanguage } from '@/hooks/use-language';
@@ -41,6 +47,15 @@ export function LoginForm() {
   const [loginSuccess, setLoginSuccess] = useState(false);
   const [shakeError, setShakeError] = useState(false);
   const [rememberMe, setRememberMe] = useState(false);
+  // Task 2-b-2 (sub-task 1) — pre-show the last "Remember me" choice. The
+  // hint lives in localStorage ('blasti-remember-me-last', written by
+  // setSessionPersistenceMode at every login — desktop shells today) and is
+  // read AFTER mount so the SSR/hydration pass is never mismatched. Browsers
+  // that never recorded a choice keep the unchecked default (unchanged web
+  // behavior).
+  useEffect(() => {
+    try { setRememberMe(getLastRememberChoice()); } catch { /* storage unavailable */ }
+  }, []);
   const [authView, setAuthView] = useState<'login' | 'forgot-password' | 'reset-password' | 'verify'>('login');
 
   // Task 22-b: pending OTP verification — when the login API answers
@@ -185,7 +200,16 @@ export function LoginForm() {
             useAppStore.getState().clearRememberSession();
           }
           if (data.token) {
-            setSessionToken(data.token);
+            // Task 2-b (sub-task 3) — record the persistence mode BEFORE the
+            // token touches any surface, so the desktop honors "remember me"
+            // exactly: checked → durable copies; unchecked → nothing survives
+            // a restart (web browsers are unaffected by this marker).
+            const isDesktopShell = typeof navigator !== 'undefined' &&
+              (navigator.userAgent.includes('Electron') || !!(window as any).electronAPI);
+            if (isDesktopShell) {
+              try { setSessionPersistenceMode(rememberMe && !biometricUser ? 'remember' : 'ephemeral'); } catch { /* ignore */ }
+            }
+            setSessionToken(data.token, isDesktopShell ? { rememberMe: rememberMe && !biometricUser } : undefined);
             // ── Electron: Establish local API session for LAN failover ──
             // When cloud goes down, requests fall back to localhost:3080 (local API).
             // The local API needs its own session token to authorize requests.
@@ -279,6 +303,13 @@ export function LoginForm() {
   const finalizeVerificationLogin = (result: VerificationSuccess) => {
     setLoginSuccess(true);
     setTimeout(() => {
+      // Task 2-b (sub-task 3) — the OTP-verified session inherits the form's
+      // remember-me decision, same as the direct login path.
+      const isDesktopShell = typeof navigator !== 'undefined' &&
+        (navigator.userAgent.includes('Electron') || !!(window as any).electronAPI);
+      if (isDesktopShell) {
+        try { setSessionPersistenceMode(rememberMe ? 'remember' : 'ephemeral'); } catch { /* ignore */ }
+      }
       setUser(result.user as any);
       // Task 81 — same remember-me + enrollment-ownership policy as the
       // direct login path (the OTP flow inherits the form's rememberMe).
@@ -288,7 +319,7 @@ export function LoginForm() {
       } else {
         useAppStore.getState().clearRememberSession();
       }
-      setSessionToken(result.token);
+      setSessionToken(result.token, isDesktopShell ? { rememberMe } : undefined);
       // ── Electron: Establish local API session for LAN failover ──
       try {
         const w = window as any;

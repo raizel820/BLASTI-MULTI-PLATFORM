@@ -1,37 +1,30 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo } from 'react';
 import { motion } from 'framer-motion';
-import { Monitor, Smartphone, Globe, Download, Apple, ChevronRight, QrCode, Laptop } from 'lucide-react';
+import { Monitor, Smartphone, Globe, Download, ChevronRight, QrCode, FlaskConical } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { usePlatform } from '@/hooks/use-platform';
-import { getPlatformIcon, getPlatformLabel, type Platform } from '@/lib/platform';
+import { getPlatformIcon, getPlatformLabel } from '@/lib/platform';
 import { useLanguage } from '@/hooks/use-language';
-import { apiFetch } from '@/lib/api-fetch';
-import { getProxiedUrl } from '@/lib/utils';
-import { type TranslationKeys } from '@/i18n';
+import { toast } from 'sonner';
+import {
+  AndroidLogo,
+  AppleLogo,
+  GooglePlayLogo,
+  LinuxLogo,
+  WindowsLogo,
+} from '@/components/platform/brand-logos';
+import {
+  DESKTOP_PLATFORMS,
+  MOBILE_PLATFORMS,
+  formatVersionLabel,
+  usePublicAppVersions,
+} from '@/components/platform/use-public-app-versions';
 
-// ─── Active public versions (from Public Apps Settings) ─────────────────────
-
-interface PublicAppVersion {
-  platform: string;
-  version: string;
-  versionCode: number;
-  releaseNotes: string;
-  fileName: string | null;
-  fileSize: number | null;
-  downloadUrl: string;
-}
-
-function formatSize(bytes: number | null | undefined): string {
-  if (!bytes) return '';
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-// ─── OS Detection ─────────────────────────────────────────────────────────────
+// ─── OS Detection (mobile) ────────────────────────────────────────────────────
 
 function detectUserOS(): 'macos' | 'windows' | 'linux' | 'android' | 'ios' | 'unknown' {
   if (typeof navigator === 'undefined') return 'unknown';
@@ -44,14 +37,14 @@ function detectUserOS(): 'macos' | 'windows' | 'linux' | 'android' | 'ios' | 'un
   return 'unknown';
 }
 
-function getOSLabel(os: string, t: (key: TranslationKeys, params?: Record<string, string>) => string): string {
+function getOSLabel(os: string, fallback: string): string {
   switch (os) {
     case 'macos': return 'macOS';
     case 'windows': return 'Windows';
     case 'linux': return 'Linux';
     case 'android': return 'Android';
     case 'ios': return 'iOS';
-    default: return t('platformDesktop');
+    default: return fallback;
   }
 }
 
@@ -68,7 +61,7 @@ function QRCodePlaceholder() {
   );
 }
 
-// ─── Platform Card ────────────────────────────────────────────────────────────
+// ─── Platform Card config ─────────────────────────────────────────────────────
 
 interface PlatformCardConfig {
   id: string;
@@ -83,7 +76,6 @@ interface PlatformCardConfig {
   badgeColor: string;
   actionEn: string;
   actionAr: string;
-  available: boolean;
   featuresEn: string[];
   featuresAr: string[];
   highlight?: boolean;
@@ -103,7 +95,6 @@ const platformCards: PlatformCardConfig[] = [
     badgeColor: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
     actionEn: 'Open Web App',
     actionAr: 'افتح تطبيق الويب',
-    available: true,
     featuresEn: ['No installation', 'Works everywhere', 'Always up-to-date'],
     featuresAr: ['بدون تثبيت', 'يعمل في كل مكان', 'دائماً محدث'],
   },
@@ -120,7 +111,6 @@ const platformCards: PlatformCardConfig[] = [
     badgeColor: 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400',
     actionEn: 'Download for Desktop',
     actionAr: 'حمّل للحاسوب',
-    available: true,
     featuresEn: ['System notifications', 'Keyboard shortcuts', 'Offline mode'],
     featuresAr: ['إشعارات النظام', 'اختصارات لوحة المفاتيح', 'وضع عدم الاتصال'],
   },
@@ -137,7 +127,6 @@ const platformCards: PlatformCardConfig[] = [
     badgeColor: 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400',
     actionEn: 'Download for Mobile',
     actionAr: 'حمّل للهاتف',
-    available: true,
     featuresEn: ['Push notifications', 'QR scanner', 'Background updates'],
     featuresAr: ['إشعارات فورية', 'ماسح QR', 'تحديثات في الخلفية'],
   },
@@ -151,30 +140,66 @@ export function DownloadSection() {
   const isArabic = lang === 'ar';
   const userOS = useMemo(() => detectUserOS(), []);
 
-  // ── Active installers published by the admin (Public Apps Settings) ──
-  const [activeVersions, setActiveVersions] = useState<Record<string, PublicAppVersion>>({});
+  // ── REAL installers published by the admin (Public Apps Settings) ──
+  const { versions, getVersion, hasAny, download } = usePublicAppVersions();
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await apiFetch('/api/app-versions/public/active');
-        if (!cancelled && res.ok) {
-          const data = await res.json();
-          if (data?.success && Array.isArray(data.versions)) {
-            const map: Record<string, PublicAppVersion> = {};
-            for (const v of data.versions) map[v.platform] = v;
-            setActiveVersions(map);
-          }
-        }
-      } catch {
-        // the section still renders ("coming soon") without the API
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // Desktop: prefer the visitor's OS, fall back to whatever IS published.
+  const desktopVersions = useMemo(
+    () => DESKTOP_PLATFORMS.map((p) => ({ key: p, v: getVersion(p) })),
+    [getVersion],
+  );
+  const primaryDesktop = useMemo(() => {
+    const userKey = userOS === 'macos' ? 'mac' : userOS === 'windows' ? 'windows' : userOS === 'linux' ? 'linux' : '';
+    const direct = userKey ? getVersion(userKey) : null;
+    if (direct) return { key: userKey as string, v: direct };
+    // No installer for the visitor's OS — promote the first that exists
+    // (windows first, then mac, linux, then the generic electron build).
+    for (const p of ['windows', 'mac', 'linux', 'electron'] as const) {
+      const v = getVersion(p);
+      if (v) return { key: p as string, v };
+    }
+    return null;
+  }, [userOS, getVersion]);
+
+  const mobileRelease = getVersion('android');
+  const mobileDebug = getVersion('android-debug');
+  const mobileIos = getVersion('ios');
+
+  // Availability is DATA-DRIVEN — a card is only "available" when at least
+  // one real installer is published for its group.
+  const desktopAvailable = hasAny([...DESKTOP_PLATFORMS, 'electron']);
+  const mobileAvailable = hasAny(MOBILE_PLATFORMS);
+  const availabilityById: Record<string, boolean> = {
+    web: true,
+    desktop: desktopAvailable,
+    mobile: mobileAvailable,
+  };
+
+  const handleWebApp = () => {
+    // Already on the web app — just scroll to top
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleDesktopDownload = (platformKey?: string) => {
+    const target =
+      (platformKey ? getVersion(platformKey) : null) ??
+      (primaryDesktop?.key ? getVersion(primaryDesktop.key) : null);
+    if (target && download(target.platform)) return;
+    toast.info(isArabic ? 'سيكون التحميل متاحاً قريباً!' : 'Download coming soon!');
+  };
+
+  const handleMobileDownload = (channel: 'android' | 'android-debug' | 'ios') => {
+    if (download(channel)) return;
+    toast.info(
+      isArabic
+        ? channel === 'ios'
+          ? 'قريباً على App Store!'
+          : 'سيكون التحميل متاحاً قريباً!'
+        : channel === 'ios'
+          ? 'Coming soon to the App Store!'
+          : 'Download coming soon!'
+    );
+  };
 
   // Determine which card to highlight based on current platform
   const highlightedId = useMemo(() => {
@@ -183,69 +208,14 @@ export function DownloadSection() {
     return 'web';
   }, [platform]);
 
-  // Determine the recommended desktop download
+  // Current-OS label on the desktop primary button
   const desktopDownloadLabel = useMemo(() => {
-    switch (userOS) {
-      case 'macos': return isArabic ? 'حمّل لنظام Mac' : 'Download for Mac';
-      case 'windows': return isArabic ? 'حمّل لنظام Windows' : 'Download for Windows';
-      case 'linux': return isArabic ? 'حمّل لنظام Linux' : 'Download for Linux';
-      default: return isArabic ? 'حمّل للحاسوب' : 'Download for Desktop';
-    }
-  }, [userOS, isArabic]);
-
-  const handleWebApp = () => {
-    // Already on the web app — just scroll to top or show a toast
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  };
-
-  const handleDesktopDownload = () => {
-    const platformKey =
-      userOS === 'macos' ? 'mac' : userOS === 'windows' ? 'windows' : userOS === 'linux' ? 'linux' : '';
-    // prefer the OS-specific installer, fall back to a generic electron build
-    const v = (platformKey ? activeVersions[platformKey] : undefined) ?? activeVersions['electron'];
-    if (v?.downloadUrl) {
-      // getProxiedUrl rebases the stored (relative) installer path onto the
-      // API server per platform — gateway pages get the XTransformPort hint,
-      // loopback pages target :3003, Electron targets its cloud base.
-      window.open(getProxiedUrl(v.downloadUrl), '_blank');
-      return;
-    }
-    alert(isArabic ? 'سيكون التحميل متاحاً قريباً!' : 'Download coming soon!');
-  };
-
-  const handleMobileDownload = (os: 'ios' | 'android') => {
-    const v = activeVersions[os];
-    if (v?.downloadUrl) {
-      window.open(getProxiedUrl(v.downloadUrl), '_blank');
-      return;
-    }
-    alert(
-      isArabic
-        ? os === 'ios'
-          ? 'قريباً على App Store!'
-          : 'سيكون التحميل متاحاً قريباً!'
-        : os === 'ios'
-          ? 'Coming soon to the App Store!'
-          : 'Download coming soon!'
-    );
-  };
-
-  // version labels shown on the cards when an installer is active
-  const desktopVersionLabel = useMemo(() => {
-    const platformKey =
-      userOS === 'macos' ? 'mac' : userOS === 'windows' ? 'windows' : userOS === 'linux' ? 'linux' : '';
-    const v = (platformKey ? activeVersions[platformKey] : undefined) ?? activeVersions['electron'];
-    if (!v) return '';
-    const size = formatSize(v.fileSize);
-    return size ? `v${v.version} · ${size}` : `v${v.version}`;
-  }, [activeVersions, userOS]);
-
-  const mobileVersionLabel = useMemo(() => {
-    const v = activeVersions[userOS === 'ios' ? 'ios' : 'android'];
-    if (!v) return '';
-    const size = formatSize(v.fileSize);
-    return size ? `v${v.version} · ${size}` : `v${v.version}`;
-  }, [activeVersions, userOS]);
+    const key = primaryDesktop?.key ?? '';
+    const osName =
+      key === 'mac' ? 'Mac' : key === 'windows' ? 'Windows' : key === 'linux' ? 'Linux' : '';
+    if (osName) return isArabic ? `حمّل لنظام ${osName}` : `Download for ${osName}`;
+    return isArabic ? 'حمّل للحاسوب' : 'Download for Desktop';
+  }, [primaryDesktop, isArabic]);
 
   return (
     <section className="py-20 px-4 bg-gradient-to-b from-gray-50 to-white dark:from-gray-900 dark:to-gray-950">
@@ -283,7 +253,7 @@ export function DownloadSection() {
             </span>
             {platform.isElectron && (
               <Badge variant="secondary" className="text-[9px] bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400">
-                {getOSLabel(platform.os, t)}
+                {getOSLabel(platform.os, t('platformDesktop'))}
               </Badge>
             )}
           </motion.div>
@@ -294,6 +264,7 @@ export function DownloadSection() {
           {platformCards.map((card, index) => {
             const Icon = card.icon;
             const isHighlighted = card.id === highlightedId;
+            const isAvailable = availabilityById[card.id] ?? false;
             return (
               <motion.div
                 key={card.id}
@@ -326,8 +297,8 @@ export function DownloadSection() {
                       <h3 className="text-xl font-bold text-foreground">
                         {isArabic ? card.nameAr : card.nameEn}
                       </h3>
-                      <Badge variant="secondary" className={`text-[10px] ${card.badgeColor}`}>
-                        {card.available ? (isArabic ? 'متاح' : 'Available') : (isArabic ? 'قريباً' : 'Coming Soon')}
+                      <Badge variant="secondary" className={`text-[10px] ${isAvailable ? card.badgeColor : 'bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400'}`}>
+                        {isAvailable ? (isArabic ? 'متاح' : 'Available') : (isArabic ? 'قريباً' : 'Coming Soon')}
                       </Badge>
                     </div>
 
@@ -357,90 +328,89 @@ export function DownloadSection() {
                       </Button>
                     )}
 
-                    {/* Desktop CTA with OS detection */}
+                    {/* Desktop CTA — real installers per OS (data-driven) */}
                     {card.id === 'desktop' && (
                       <div className="space-y-2">
                         <Button
                           className={`w-full bg-gradient-to-r ${card.color} hover:opacity-90 text-white shadow-md`}
                           size="lg"
-                          onClick={handleDesktopDownload}
+                          disabled={!primaryDesktop}
+                          onClick={() => handleDesktopDownload()}
                         >
                           <Download className="h-4 w-4 me-2" />
                           {desktopDownloadLabel}
                         </Button>
-                        {desktopVersionLabel && (
+                        {primaryDesktop && (
                           <p className="text-center text-[11px] text-muted-foreground font-mono">
-                            {desktopVersionLabel}
+                            {formatVersionLabel(primaryDesktop.v)}
                           </p>
                         )}
                         <div className="flex gap-2">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="flex-1 text-xs gap-1.5"
-                            onClick={() => { if (userOS === 'macos') handleDesktopDownload(); }}
-                          >
-                            <Apple className="h-3.5 w-3.5" />
-                            Mac
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="flex-1 text-xs gap-1.5"
-                            onClick={() => { if (userOS === 'windows') handleDesktopDownload(); }}
-                          >
-                            <Laptop className="h-3.5 w-3.5" />
-                            Windows
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="flex-1 text-xs gap-1.5"
-                            onClick={() => { if (userOS === 'linux') handleDesktopDownload(); }}
-                          >
-                            <Monitor className="h-3.5 w-3.5" />
-                            Linux
-                          </Button>
+                          {desktopVersions.map(({ key, v }) => (
+                            <Button
+                              key={key}
+                              variant="outline"
+                              size="sm"
+                              className="flex-1 text-xs gap-1.5"
+                              disabled={!v}
+                              title={v ? formatVersionLabel(v) : t('comingSoon')}
+                              onClick={() => handleDesktopDownload(key)}
+                            >
+                              {key === 'mac' && <AppleLogo className="h-3.5 w-3.5" />}
+                              {key === 'windows' && <WindowsLogo className="h-3.5 w-3.5" />}
+                              {key === 'linux' && <LinuxLogo className="h-3.5 w-3.5" />}
+                              {key === 'mac' ? 'Mac' : key === 'windows' ? 'Windows' : 'Linux'}
+                            </Button>
+                          ))}
                         </div>
                       </div>
                     )}
 
-                    {/* Mobile CTA with store badges */}
+                    {/* Mobile CTA — release / debug APK + App Store (real logos) */}
                     {card.id === 'mobile' && (
                       <div className="space-y-3">
+                        {/* Google Play — RELEASE APK */}
                         <Button
                           className={`w-full bg-gradient-to-r ${card.color} hover:opacity-90 text-white shadow-md`}
                           size="lg"
-                          onClick={() => handleMobileDownload(userOS === 'ios' ? 'ios' : 'android')}
+                          disabled={!mobileRelease}
+                          onClick={() => handleMobileDownload('android')}
                         >
-                          <Download className="h-4 w-4 me-2" />
-                          {isArabic ? card.actionAr : card.actionEn}
+                          <GooglePlayLogo className="h-5 w-5 me-2" />
+                          {isArabic ? 'حمّل نسخة Android (رسمي)' : 'Get it on Android (Release)'}
                         </Button>
-                        {mobileVersionLabel && (
+                        {/* Debug APK channel — the CI-built debug package */}
+                        <Button
+                          variant="outline"
+                          className="w-full border-2 border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/30"
+                          size="sm"
+                          disabled={!mobileDebug}
+                          onClick={() => handleMobileDownload('android-debug')}
+                        >
+                          <AndroidLogo className="h-4 w-4 me-2" />
+                          <FlaskConical className="h-3.5 w-3.5 me-1" />
+                          {isArabic ? 'تحميل نسخة Debug' : 'Download Debug APK'}
+                        </Button>
+                        {/* App Store — iOS */}
+                        <Button
+                          variant="outline"
+                          className="w-full"
+                          size="sm"
+                          disabled={!mobileIos}
+                          onClick={() => handleMobileDownload('ios')}
+                        >
+                          <AppleLogo className="h-4 w-4 me-2" />
+                          {isArabic ? 'حمّل من App Store' : 'Download on the App Store'}
+                          {!mobileIos && <span className="text-[10px] text-muted-foreground ms-1">· {t('comingSoon')}</span>}
+                        </Button>
+                        {(mobileRelease || mobileDebug || mobileIos) && (
                           <p className="text-center text-[11px] text-muted-foreground font-mono">
-                            {mobileVersionLabel}
+                            {[
+                              mobileRelease && `release ${formatVersionLabel(mobileRelease)}`,
+                              mobileDebug && `debug ${formatVersionLabel(mobileDebug)}`,
+                            ].filter(Boolean).join('  ·  ')}
                           </p>
                         )}
-                        <div className="flex gap-2">
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="flex-1 text-xs gap-1.5"
-                            onClick={() => handleMobileDownload('ios')}
-                          >
-                            <Apple className="h-3.5 w-3.5" />
-                            App Store
-                          </Button>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="flex-1 text-xs gap-1.5"
-                            onClick={() => handleMobileDownload('android')}
-                          >
-                            <Smartphone className="h-3.5 w-3.5" />
-                            Play Store
-                          </Button>
-                        </div>
                         {/* QR code for mobile download */}
                         <div className="flex justify-center pt-2">
                           <QRCodePlaceholder />

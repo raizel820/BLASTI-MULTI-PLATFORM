@@ -475,6 +475,33 @@ function ChargilyMethodCard({
 // selected items are submitted as a separate POST /api/agency/hardware/orders
 // after the subscription payment succeeds (best-effort, never blocks the
 // subscription success path).
+// ─── Proration quote (server-computed upgrade credit) ───────────────────────
+// GET /api/payment/subscription-quote — what the agency would be charged for
+// a plan + period RIGHT NOW, including the credit for the unused value of
+// the current ACTIVE subscription window (paid amount × remaining days).
+// The review step shows this breakdown; the checkout endpoints apply the
+// exact same math server-side.
+
+interface ProrationQuote {
+  plan: { name: string; displayName: string; price: number; currency: string };
+  period: number;
+  discountPercent: number;
+  listTotal: number;
+  credit: {
+    eligible: boolean;
+    upgradeFrom: string | null;
+    currentPlanName: string | null;
+    currentExpiresAt: string | null;
+    daysRemaining: number;
+    totalDays: number;
+    paidAmount: number;
+    remainingValue: number;
+    creditApplied: number;
+  };
+  chargeAmount: number;
+  minimumApplied: boolean;
+}
+
 function PaymentDialog({
   open,
   onOpenChange,
@@ -545,6 +572,35 @@ function PaymentDialog({
       cancelled = true;
     };
   }, [open]);
+
+  // ── Proration quote — fetched per (dialog open, plan, period) ──────
+  // Silent-fails to null (the plain list price is shown and the server
+  // still applies the credit at checkout time).
+  const [quote, setQuote] = useState<ProrationQuote | null>(null);
+  useEffect(() => {
+    if (!open || !selectedPlan || !user?.agencyId) {
+      setQuote(null);
+      return;
+    }
+    let cancelled = false;
+    apiFetch(
+      `/api/payment/subscription-quote?agencyId=${encodeURIComponent(user.agencyId)}&plan=${encodeURIComponent(selectedPlan.name)}&period=${period}`,
+    )
+      .then(async (res) => {
+        const d = await res.json().catch(() => null);
+        // apiFetch's parseResponse UNWRAPS {success,data} envelopes — accept
+        // both the raw shape (d.success/d.data) and the unwrapped data.
+        const payload = (d?.data ?? d) as ProrationQuote | null;
+        if (!cancelled && res.ok && payload?.credit) setQuote(payload);
+        else if (!cancelled) setQuote(null);
+      })
+      .catch(() => {
+        if (!cancelled) setQuote(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, selectedPlan, period, user?.agencyId]);
 
   const hasHardware = !!(
     hardware &&
@@ -898,8 +954,12 @@ function PaymentDialog({
     : 0;
   const currentDiscount = selectedPlan ? getDiscountForPeriod(selectedPlan, period) : 0;
 
+  // Amount the agency ACTUALLY pays: when a server proration quote exists and
+  // the current subscription has creditable remaining value, the charge is
+  // listTotal − credit (the gateway minimum is applied server-side).
+  const effectiveCharge = quote?.credit?.eligible ? quote.chargeAmount : totalPrice;
   const priceLabel = selectedPlan
-    ? `${totalPrice.toLocaleString()} ${selectedPlan.currency}`
+    ? `${effectiveCharge.toLocaleString()} ${selectedPlan.currency}`
     : '';
   // Cycle label reflects the chosen billing period (e.g. "3 Months" instead of
   // the plan's static billingCycle when an extended period is selected).
@@ -1523,6 +1583,46 @@ function PaymentDialog({
                             <span className="text-xs text-muted-foreground line-through">
                               {(selectedPlan.price * period).toLocaleString()} {selectedPlan.currency}
                             </span>
+                          </div>
+                        )}
+                        {/* Upgrade / early-renewal credit — server-computed proration
+                            of the current ACTIVE subscription window (paid amount ×
+                            remaining days). The Total below already reflects it. */}
+                        {selectedPlan && quote?.credit?.eligible && (
+                          <div className="rounded-lg border border-emerald-200/70 dark:border-emerald-800/40 bg-white/60 dark:bg-gray-900/40 p-3 space-y-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs text-muted-foreground flex items-center gap-1.5 min-w-0">
+                                <ArrowRight className="h-3 w-3 text-emerald-600 shrink-0 rtl:rotate-180" />
+                                <span className="truncate">
+                                  {lang === 'ar'
+                                    ? `رصيد خطتك الحالية${quote.credit.upgradeFrom ? ` (${quote.credit.upgradeFrom})` : ''}`
+                                    : lang === 'fr'
+                                      ? `Crédit de votre offre actuelle${quote.credit.upgradeFrom ? ` (${quote.credit.upgradeFrom})` : ''}`
+                                      : `Credit from your current plan${quote.credit.upgradeFrom ? ` (${quote.credit.upgradeFrom})` : ''}`}
+                                </span>
+                              </span>
+                              <span className="text-[11px] font-medium text-foreground whitespace-nowrap">
+                                {quote.credit.daysRemaining}{' '}
+                                {lang === 'ar' ? 'يوم متبقٍ' : lang === 'fr' ? 'jours restants' : 'days remaining'}
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-xs text-muted-foreground">
+                                {lang === 'ar' ? 'القيمة غير المستخدمة المخصومة' : lang === 'fr' ? 'Valeur non utilisée déduite' : 'Unused value credited'}
+                              </span>
+                              <span className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 whitespace-nowrap">
+                                −{quote.credit.creditApplied.toLocaleString()} {selectedPlan.currency}
+                              </span>
+                            </div>
+                            {quote.minimumApplied && (
+                              <p className="text-[10px] text-muted-foreground leading-relaxed">
+                                {lang === 'ar'
+                                  ? 'الحد الأدنى لعملية الدفع الإلكتروني (100 دج) مطبّق.'
+                                  : lang === 'fr'
+                                    ? 'Le minimum de paiement en ligne (100 DZD) est appliqué.'
+                                    : 'The online payment minimum (100 DZD) applies.'}
+                              </p>
+                            )}
                           </div>
                         )}
                         <Separator className="bg-emerald-200/50 dark:bg-emerald-800/30" />

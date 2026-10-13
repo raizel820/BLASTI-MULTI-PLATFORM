@@ -605,8 +605,15 @@ async function _upsertRecordRaw(tx, modelName, rawRecord) {
     } else {
       const colList = ['id', ...fields.map(f => `"${f}"`)].join(', ')
       const placeholders = ['?', ...fields.map(() => '?')].join(', ')
+      // Task 2-b-1 (visibility): was INSERT OR IGNORE — a NOT NULL violation
+      // silently skipped the row while this function still returned true
+      // ("upserted"), so a drifted stage payload could drop queue rows with
+      // zero errors. Plain INSERT lets the failure reach the caller, which
+      // defers the record durably (source='initial-sync') for the retry pass
+      // instead of losing it. The SELECT above already ruled out id
+      // collisions, so OR IGNORE never had a legitimate job here.
       await tx.$executeRawUnsafe(
-        `INSERT OR IGNORE INTO "${modelName}" (${colList}) VALUES (${placeholders})`,
+        `INSERT INTO "${modelName}" (${colList}) VALUES (${placeholders})`,
         id, ...values
       )
     }

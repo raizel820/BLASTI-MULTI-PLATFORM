@@ -1,0 +1,308 @@
+name: Build Installers
+
+# Builds the two user-facing installers on every push to master (and on
+# demand via the Actions tab), then uploads them STRAIGHT to the BLASTI VPS:
+#
+#   Binaries → POST /api/app-versions/upload?create=1 (multipart, auth via the
+#     shared deploy token) → stored on the VPS under
+#     $BLASTI_STORAGE_DIR/app-versions/<desktop|mobile>/<file> — the same
+#     desktop/ + mobile/ split as the repo's installer/ folder.
+#   → Visible in Admin → Database and Storage Management → Storage Manager
+#     (app-versions category → Installer folders).
+#   → Each upload registers an AppVersion DRAFT in Admin → Public Apps
+#     Settings, where an admin picks "Activate" to make it the published
+#     installer (public download section + app update checks follow).
+#   → Immediately afterwards the job POSTs /api/system/deploy-trigger
+#     (same DEPLOY_TOKEN) so the VPS rebuilds right away: the API launches
+#     deploy-digitalocean.sh server-update + server-doctor in the transient
+#     blasti-rebuild systemd unit (git pull → bun install → db push →
+#     next build → service restarts). No waiting for the periodic
+#     blasti-watcher.timer — that timer stays armed as a fallback only.
+#
+# Nothing is committed back to git — GitHub rejects files > 100 MB and the
+# NSIS installer is ~155 MB. Per-run artifacts remain as a fallback copy.
+#
+# REQUIRED REPO SECRETS (Settings → Secrets and variables → Actions):
+#   BLASTI_API_URL      e.g. https://blasti.example.com (public site the VPS
+#                       Caddy serves; /api/* is proxied to the cloud API)
+#   BLASTI_DEPLOY_TOKEN the DEPLOY_TOKEN value from /etc/blasti/blasti.env
+#                       on the VPS (shared CI/updater secret)
+# When either secret is missing the job skips the upload with a clear notice
+# instead of failing — artifacts are still attached to the run.
+#
+# Layout rationale:
+#   • desktop job runs on windows-latest — NSIS + electron-builder are native
+#     there, no emulation, no wine needed.
+#   • mobile job runs on ubuntu-latest — Android SDK is preinstalled and the
+#     repo's scripts/gradle.js auto-detects JAVA_HOME (set by setup-java) and
+#     the SDK path, and even copies the finished APK to the repo root itself.
+#   • A separate `publish-to-vps` job publishes PARTIAL results: if only one
+#     build succeeded, that file is still uploaded and the other platform's
+#     VPS version is untouched.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths-ignore:
+      - '**.md'
+      - 'worklog.md'
+      - 'download/**'
+
+concurrency:
+  group: build-installers
+  cancel-in-progress: false
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  desktop-exe:
+    name: Desktop .exe (Windows NSIS)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build web static export (apps/web → out/)
+        run: bun run build:export
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+
+      - name: Package Windows installer (prebuild + electron-builder NSIS)
+        run: bun run --filter @blasti/desktop build:win
+
+      - name: Collect installer into installer/desktop/
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installer/desktop | Out-Null
+          Copy-Item apps/desktop/dist/BLASTI-Setup-*.exe -Destination installer/desktop/ -Force
+          Get-ChildItem installer/desktop | Format-Table Name, Length
+
+      - name: Upload desktop installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-exe
+          path: installer/desktop/*.exe
+          retention-days: 30
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
+  mobile-apk:
+    name: Mobile debug APK (Android)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      # Capacitor 8 / AGP 8.x require JDK 21
+      - name: Setup JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # Android SDK is preinstalled on ubuntu runners; accepting the licenses
+      # lets AGP auto-download any missing platform/build-tool (e.g. android-36).
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      # Defends against the Windows-commit gotcha where git stores gradlew as
+      # mode 100644 — spawn would die with EACCES on the Linux runner.
+      # (scripts/gradle.js also self-heals; this makes the failure impossible.)
+      - name: Ensure gradlew is executable
+        run: chmod +x apps/mobile/android/gradlew
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Web export → cap sync android → gradlew assembleDebug
+      # (scripts/gradle.js then copies the APK to the repo root as
+      #  BLASTI-v<versionName>-debug.apk)
+      - name: Build debug APK
+        run: bun run --filter @blasti/mobile build:android:debug
+        env:
+          NEXT_TELEMETRY_DISABLED: '1'
+
+      - name: Collect APK into installer/mobile/
+        run: |
+          mkdir -p installer/mobile
+          if compgen -G "BLASTI-v*-debug.apk" > /dev/null; then
+            cp -f BLASTI-v*-debug.apk installer/mobile/
+          else
+            # Fallback: newest APK straight from the gradle output dir
+            cp -f apps/mobile/android/app/build/outputs/apk/debug/*.apk installer/mobile/
+          fi
+          ls -lh installer/mobile
+
+      - name: Upload mobile APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-apk
+          path: installer/mobile/*.apk
+          retention-days: 30
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────────
+  publish-to-vps:
+    name: Publish installers → BLASTI VPS
+    runs-on: ubuntu-latest
+    needs: [desktop-exe, mobile-apk]
+    # Partial-publish mode: run even when one build failed, upload whichever
+    # artifact exists, and never touch the other platform's stored version.
+    if: always() && (needs.desktop-exe.result == 'success' || needs.mobile-apk.result == 'success')
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download desktop installer
+        if: needs.desktop-exe.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-exe
+          path: installer/desktop
+
+      - name: Download mobile APK
+        if: needs.mobile-apk.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: mobile-apk
+          path: installer/mobile
+
+      # scripts/publish-installer.mjs POSTs multipart to /api/app-versions/upload?create=1
+      # with the x-deploy-token header. The API stores the binary under
+      # app-versions/<desktop|mobile>/ and creates/updates an UNPUBLISHED
+      # AppVersion row (admin activates it in Public Apps Settings).
+      - name: Upload installers to the VPS
+        id: upload
+        env:
+          BLASTI_API_URL: ${{ secrets.BLASTI_API_URL }}
+          BLASTI_DEPLOY_TOKEN: ${{ secrets.BLASTI_DEPLOY_TOKEN }}
+        run: |
+          set -e
+          if [ -z "$BLASTI_API_URL" ] || [ -z "$BLASTI_DEPLOY_TOKEN" ]; then
+            echo "::warning::BLASTI_API_URL / BLASTI_DEPLOY_TOKEN secrets not configured — skipping VPS upload (artifacts are still on this run)."
+            {
+              echo "### ⚠️ VPS upload skipped"
+              echo ""
+              echo "Set the repo secrets \`BLASTI_API_URL\` and \`BLASTI_DEPLOY_TOKEN\`"
+              echo "(Settings → Secrets and variables → Actions) to deliver installers"
+              echo "to the VPS Storage Manager + Public Apps Settings."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          upload() { # <file> <platform> <fallback-version>
+            local f="$1" platform="$2" ver=""
+            case "$(basename "$f")" in
+              BLASTI-Setup-*.exe)  ver="$(basename "$f" | sed -n 's/^BLASTI-Setup-\(.*\)\.exe$/\1/p')" ;;
+              BLASTI-v*-debug.apk) ver="$(basename "$f" | sed -n 's/^BLASTI-v\(.*\)-debug\.apk$/\1/p')" ;;
+            esac
+            if [ -z "$ver" ]; then
+              echo "::warning::could not parse a semver out of $(basename "$f") — falling back to $3"
+              ver="$3"
+            fi
+            node scripts/publish-installer.mjs \
+              --file "$f" \
+              --platform "$platform" \
+              --version "$ver" \
+              --api-url "$BLASTI_API_URL" \
+              --token "$BLASTI_DEPLOY_TOKEN" \
+              --notes "Automated build from commit ${GITHUB_SHA::7} (run #${GITHUB_RUN_NUMBER})"
+          }
+
+          uploaded=false
+          for f in installer/desktop/*.exe; do
+            if [ -f "$f" ]; then
+              upload "$f" windows "$(node -p "require('./apps/desktop/package.json').version")"
+              uploaded=true
+            fi
+          done
+          for f in installer/mobile/*.apk; do
+            if [ -f "$f" ]; then
+              upload "$f" android-debug \
+                "$(sed -n 's/.*versionName[^"]*"\([^"]*\)".*/\1/p' apps/mobile/android/app/build.gradle | head -1)"
+              uploaded=true
+            fi
+          done
+          echo "uploaded=$uploaded" >> "$GITHUB_OUTPUT"
+
+      # The installers were built from THIS commit — tell the VPS to pull and
+      # rebuild right now (server-update + server-doctor in the transient
+      # blasti-rebuild systemd unit) instead of waiting for the next
+      # blasti-watcher.timer tick. Best-effort: a skipped/failed trigger is a
+      # warning, never a job failure — the periodic watcher stays the fallback.
+      - name: Trigger the VPS rebuild (server-update)
+        if: always() && steps.upload.outputs.uploaded == 'true'
+        env:
+          BLASTI_API_URL: ${{ secrets.BLASTI_API_URL }}
+          BLASTI_DEPLOY_TOKEN: ${{ secrets.BLASTI_DEPLOY_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          code="$(curl -fsS -m 60 -o /tmp/deploy-trigger.json -w '%{http_code}' \
+            -X POST "${BLASTI_API_URL%/}/api/system/deploy-trigger" \
+            -H 'Content-Type: application/json' \
+            -H "x-deploy-token: $BLASTI_DEPLOY_TOKEN" \
+            -d '{"source":"github-actions","commit":"'"$COMMIT_SHA"'","reason":"installers published (run #'"$RUN_NUMBER"')"}')" || code="000"
+
+          started=$(node -e "try{const j=require('/tmp/deploy-trigger.json');console.log(j.started===true?'true':(j.started===false?'false':'unknown'))}catch{console.log('unknown')}" 2>/dev/null || echo unknown)
+          reason=$(node -e "try{const j=require('/tmp/deploy-trigger.json');console.log(String(j.reason||''))}catch{console.log('')}" 2>/dev/null || echo '')
+
+          {
+            echo "### 🚀 VPS rebuild trigger"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          case "$code" in
+            200)
+              if [ "$started" = "true" ]; then
+                echo "server-update is running on the VPS (blasti-rebuild unit): git pull → bun install → db push → next build → service restarts, then a server-doctor report. Log: \\<STORAGE_ROOT\\>/logs/deploy-*.log or \\(journalctl -u blasti-rebuild -f\\)." >> "$GITHUB_STEP_SUMMARY"
+                echo "Rebuild triggered on the VPS (server-update + server-doctor, blasti-rebuild unit)."
+              else
+                echo "Trigger accepted but NOT started (reason: ${reason:-unknown}) — a deploy is already in progress; the running deploy will pick this commit up." >> "$GITHUB_STEP_SUMMARY"
+                echo "::notice::Deploy trigger accepted but not started (reason: ${reason:-unknown}) — a deploy is already in progress."
+              fi
+              ;;
+            401)
+              echo "::warning::VPS rejected the deploy trigger (HTTP 401) — BLASTI_DEPLOY_TOKEN does not match DEPLOY_TOKEN in /etc/blasti/blasti.env. The periodic watcher will pick the commit up."
+              echo "⚠️ Trigger rejected (401): token mismatch — the periodic watcher remains the fallback." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            000)
+              echo "::warning::Could not reach the VPS to trigger a rebuild (network error). The periodic watcher remains the fallback."
+              echo "⚠️ Trigger unreachable — the periodic watcher remains the fallback." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            *)
+              echo "::warning::VPS deploy trigger failed (HTTP $code). The periodic watcher remains the fallback."
+              echo "⚠️ Trigger failed (HTTP $code) — the periodic watcher remains the fallback." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
+
+      - name: Write run summary
+        if: always()
+        env:
+          API_URL: ${{ secrets.BLASTI_API_URL }}
+        run: |
+          {
+            echo "## 📦 Installer publish result"
+            echo ""
+            echo "| Build | Result |"
+            echo "|---|---|"
+            echo "| desktop .exe | ${{ needs.desktop-exe.result }} |"
+            echo "| mobile debug APK | ${{ needs.mobile-apk.result }} |"
+            echo ""
+            if [ -n "$API_URL" ]; then
+              echo "**Delivered to:** ${API_URL%/} → Admin → Public Apps Settings (activate as published installer)"
+              echo ""
+              echo "**Storage Manager:** app-versions category → \`desktop/\` + \`mobile/\` installer folders"
+            else
+              echo "**VPS upload:** skipped (secrets not configured) — download from this run's artifacts"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

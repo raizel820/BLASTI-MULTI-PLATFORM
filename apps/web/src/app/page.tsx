@@ -73,8 +73,20 @@ const AdminAuditLogs = lazyNamed(() => import('@/components/admin/admin-audit-lo
 const AdminUsers = lazyNamed(() => import('@/components/admin/admin-users'), 'AdminUsers');
 const AdminAnalytics = lazyNamed(() => import('@/components/admin/admin-analytics'), 'AdminAnalytics');
 const AdminSettings = lazyNamed(() => import('@/components/admin/admin-settings'), 'AdminSettings');
+// Task 5: Platform Settings split — one page per former section of the
+// admin-settings long-scroll page, grouped in the sidebar under
+// "__platform_settings_group__". Each page component owns its padding +
+// section header (AdminSettingsSectionPage shell).
+const AdminSettingsVpsPage = lazyNamed(() => import('@/components/admin/admin-settings-vps-page'), 'AdminSettingsVpsPage');
+const AdminSettingsProvidersPage = lazyNamed(() => import('@/components/admin/admin-settings-providers-page'), 'AdminSettingsProvidersPage');
+const AdminSettingsMapsPage = lazyNamed(() => import('@/components/admin/admin-settings-maps-page'), 'AdminSettingsMapsPage');
+const AdminSettingsPaymentsPage = lazyNamed(() => import('@/components/admin/admin-payment-gateway-settings'), 'AdminPaymentGatewaySettings');
+const AdminSettingsFinancialPage = lazyNamed(() => import('@/components/admin/admin-settings-financial-page'), 'AdminSettingsFinancialPage');
+const AdminSettingsSecurityPage = lazyNamed(() => import('@/components/admin/admin-settings-security-page'), 'AdminSettingsSecurityPage');
+const AdminSettingsFaqPage = lazyNamed(() => import('@/components/admin/admin-settings-faq-page'), 'AdminSettingsFaqPage');
+const AdminSettingsConfigPage = lazyNamed(() => import('@/components/admin/admin-settings-config-page'), 'AdminSettingsConfigPage');
 // Task 2-b: standalone super-admin Maps & Location page (same component that
-// is embedded mid-page inside admin-settings — promoted to its own view).
+// is also mounted on the admin-settings-maps subsection — promoted to its own view).
 const AdminMaps = lazyNamed(() => import('@/components/admin/admin-maps-settings'), 'AdminMapsSettings');
 const AdminSubscriptionPlans = lazyNamed(() => import('@/components/admin/admin-subscription-plans'), 'AdminSubscriptionPlans');
 const AdminAppSettings = lazyNamed(() => import('@/components/admin/admin-app-settings'), 'AdminAppSettings');
@@ -86,6 +98,9 @@ const AdminTickets = lazyNamed(() => import('@/components/admin/admin-tickets'),
 // Database Manager — SUPER_ADMIN PostgreSQL console (browse every table,
 // row-level actions, VACUUM/tombstone maintenance).
 const AdminDbManager = lazyNamed(() => import('@/components/admin/admin-db-manager'), 'AdminDbManager');
+// Storage Manager — SUPER_ADMIN on-disk file store console (Task 2): disk
+// usage, per-category breakdown, drill-down browser, orphan/missing cleanup.
+const AdminStorageManager = lazyNamed(() => import('@/components/admin/admin-storage-manager'), 'AdminStorageManager');
 
 // Shared (eagerly imported — lightweight)
 import { AgencyAuthorityGate } from '@/components/agency/agency-authority-gate';
@@ -166,10 +181,21 @@ function warmRoleViews(role: string): void {
       () => import('@/components/admin/admin-analytics'),
       () => import('@/components/admin/admin-tickets'),
       () => import('@/components/admin/admin-settings'),
+      // Task 5: Platform Settings subsection pages (one chunk each).
+      () => import('@/components/admin/admin-settings-vps-page'),
+      () => import('@/components/admin/admin-settings-providers-page'),
+      () => import('@/components/admin/admin-settings-maps-page'),
+      () => import('@/components/admin/admin-payment-gateway-settings'),
+      () => import('@/components/admin/admin-settings-financial-page'),
+      () => import('@/components/admin/admin-settings-security-page'),
+      () => import('@/components/admin/admin-settings-faq-page'),
+      () => import('@/components/admin/admin-settings-config-page'),
       () => import('@/components/admin/admin-maps-settings'),
       () => import('@/components/admin/admin-subscription-plans'),
       () => import('@/components/admin/admin-app-settings'),
       () => import('@/components/admin/admin-db-manager'),
+      // Task 2: Storage Manager — same admin group, warmed alongside db.
+      () => import('@/components/admin/admin-storage-manager'),
     ];
   }
   warmViews([...roleViews, ...shared]);
@@ -317,11 +343,33 @@ const ViewRouter = memo(function ViewRouter() {
             case 'admin-tickets':
               return <AdminTickets />;
             case 'admin-settings':
+              // Task 5: General/Overview hub (navigation grid to the
+              // subsection pages below). Name + hash kept for backward compat.
               return <AdminSettings />;
+            // Task 5: Platform Settings subsections — every page component
+            // owns its own p-4 lg:p-6 padding + section header, so no extra
+            // wrapper is needed here (same pattern as admin-db).
+            case 'admin-settings-vps':
+              return <AdminSettingsVpsPage />;
+            case 'admin-settings-providers':
+              return <AdminSettingsProvidersPage />;
+            case 'admin-settings-maps':
+              return <AdminSettingsMapsPage />;
+            case 'admin-settings-payments':
+              return <AdminSettingsPaymentsPage />;
+            case 'admin-settings-financial':
+              return <AdminSettingsFinancialPage />;
+            case 'admin-settings-security':
+              return <AdminSettingsSecurityPage />;
+            case 'admin-settings-faq':
+              return <AdminSettingsFaqPage />;
+            case 'admin-settings-config':
+              return <AdminSettingsConfigPage />;
             case 'admin-maps':
               // Task 2-b: standalone Maps & Location — AdminMapsSettings owns
-              // no page padding (it is embedded in admin-settings), so the
-              // view root provides the standard admin padding here.
+              // no page padding, so the view root provides the standard admin
+              // padding here (the admin-settings-maps subsection wraps the
+              // same component in its own shell instead).
               return <div className="p-4 lg:p-6"><AdminMaps /></div>;
             case 'admin-subscription-plans':
               return <AdminSubscriptionPlans />;
@@ -337,6 +385,10 @@ const ViewRouter = memo(function ViewRouter() {
             // owns its own page padding (p-4 lg:p-6), same as admin-settings.
             case 'admin-db':
               return <AdminDbManager />;
+            // Storage Manager — SUPER_ADMIN on-disk file store console
+            // (Task 2), same padding/fetch conventions as admin-db.
+            case 'admin-storage':
+              return <AdminStorageManager />;
             // Chargily payment result — NO role gate: renders for every role
             // and self-handles the logged-out case (generic result + login
             // CTA, no polling when unauthenticated).
@@ -632,7 +684,11 @@ export default function Home() {
       } catch { /* silent */ }
     };
     fetchAnnouncements();
-    const interval = setInterval(fetchAnnouncements, 60000);
+    // Performance Round — paused while the tab is hidden.
+    const interval = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      fetchAnnouncements();
+    }, 60000);
     return () => clearInterval(interval);
   }, [user?.id]);
 
@@ -687,10 +743,21 @@ export default function Home() {
       'admin-tickets': t('supportTickets') + ' - BLASTI',
       'agency-support': t('supportDesk') + ' - BLASTI',
     'admin-settings': t('platformSettings') + ' - BLASTI',
+    // Task 5: Platform Settings subsection pages.
+    'admin-settings-vps': t('settingsVps') + ' - BLASTI',
+    'admin-settings-providers': t('settingsProviders') + ' - BLASTI',
+    'admin-settings-maps': t('settingsMapsSub') + ' - BLASTI',
+    'admin-settings-payments': t('settingsPaymentsGateway') + ' - BLASTI',
+    'admin-settings-financial': t('settingsFinancialEngine') + ' - BLASTI',
+    'admin-settings-security': t('settingsSecuritySub') + ' - BLASTI',
+    'admin-settings-faq': t('settingsFaqSub') + ' - BLASTI',
+    'admin-settings-config': t('settingsSystemConfig') + ' - BLASTI',
     'admin-maps': t('adminMaps') + ' - BLASTI',
     'admin-subscription-plans': t('subscriptionPlans') + ' - BLASTI',
     'admin-app-settings': t('publicAppsSettings') + ' - BLASTI',
     'admin-db': t('dbManagerTitle') + ' - BLASTI',
+    // Task 2: Storage Manager page title.
+    'admin-storage': t('storageManagerTitle') + ' - BLASTI',
     'payment-result': t('paymentResultTitle') + ' - BLASTI',
     };
     document.title = titles[currentView] || 'BLASTI';

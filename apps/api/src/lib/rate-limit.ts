@@ -308,10 +308,15 @@ export const QUEUE_RATE_LIMIT: RateLimitOptions = {
   prefix: 'queue',
 }
 
-/** General API: 100 requests per minute per IP */
+/**
+ * General API: 300 requests per minute per IP.
+ * (Connection-stability round: was 100 — venues share one egress IP across
+ * kiosks + staff + customer devices, so the per-IP bucket is sized for the
+ * venue. A single busy kiosk screen can legitimately issue 3-4 req/s.)
+ */
 export const GENERAL_RATE_LIMIT: RateLimitOptions = {
   windowMs: 60 * 1000,
-  maxRequests: 100,
+  maxRequests: 300,
   prefix: 'api',
 }
 
@@ -343,10 +348,15 @@ export const KIOSK_RATE_LIMIT: RateLimitOptions = {
   prefix: 'kiosk-join',
 }
 
-/** Kiosk read (agency/status): 60 requests per minute per IP (public, unauthenticated) */
+/**
+ * Kiosk read (agency/status): 240 requests per minute per IP (public,
+ * unauthenticated). (Connection-stability round: was 60 — one wall-mounted
+ * kiosk polls several endpoints every few seconds; a venue with multiple
+ * kiosks behind one IP blew through 60/min within the first minute.)
+ */
 export const KIOSK_READ_RATE_LIMIT: RateLimitOptions = {
   windowMs: 60 * 1000,
-  maxRequests: 60,
+  maxRequests: 240,
   prefix: 'kiosk-read',
 }
 
@@ -383,10 +393,14 @@ export const AGENCY_SEARCH_RATE_LIMIT: RateLimitOptions = {
   prefix: 'agency-search',
 }
 
-/** General public routes: 60 requests per minute per IP */
+/**
+ * General public routes: 120 requests per minute per IP.
+ * (Connection-stability round: was 60 — the landing page boot burst plus
+ * shared-IP venue traffic could exhaust 60/min on first visit.)
+ */
 export const PUBLIC_RATE_LIMIT: RateLimitOptions = {
   windowMs: 60 * 1000,
-  maxRequests: 60,
+  maxRequests: 120,
   prefix: 'public',
 }
 

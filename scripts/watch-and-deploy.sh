@@ -108,7 +108,11 @@ log() { printf '%s [watch] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 die() { printf '%s [watch] FAIL: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
 usage() { sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
-state_dir() { printf '%s' "${BLASTI_WATCH_STATE_DIR:-$HOME/.blasti-watch}"; }
+# HOME can be UNSET when this script is spawned by a systemd service
+# (blasti-api has no HOME in its environment). Under `set -u` a bare
+# $HOME reference would kill the script instantly with
+# "HOME: unbound variable" — fall back like the watcher unit does.
+state_dir() { printf '%s' "${BLASTI_WATCH_STATE_DIR:-${HOME:-/root}/.blasti-watch}"; }
 
 state_key() { # stable id for repo+branch
   local raw="$1|$2"

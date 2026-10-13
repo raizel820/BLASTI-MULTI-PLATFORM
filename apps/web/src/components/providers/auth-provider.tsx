@@ -4,6 +4,12 @@ import { useEffect, useState } from 'react';
 import { useAppStore, updateDocumentDirection, hydrateFromSession, setViewFromHash, parseHashToView, parseJoinCodeFromHash, updateHashForView, isHashChangeSuppressed } from '@/store/use-app-store';
 import { isRevoked, setRevoked, clearRevoked } from '@/lib/authz-state';
 import { adoptImportedLocalSessionUser } from '@/lib/session-heal';
+// Task 2-b (sub-tasks 1+3) — boot-time enforcement of the remember-me
+// persistence policy + the renderer-side purge when the desktop app quits.
+import { enforcePersistencePolicyAtBoot, purgeAuthState, isSessionEphemeral } from '@/lib/auth-storage';
+// Task 2-b-2 (sub-task 2) — ONE boot-time session sanity check (desktop):
+// expiry check → single-flight refresh → purge on failure. See session-boot.ts.
+import { validateSessionOnBoot } from '@/lib/session-boot';
 import { Loader2 } from 'lucide-react';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -71,6 +77,53 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  // ── Task 2-b (sub-task 3): quit purge (desktop) ────────────────────────────
+  // When the current login did NOT check "Remember me", every renderer token
+  // surface is purged when the app goes away so nothing durable outlives the
+  // window (the main process independently deletes userData/blasti-auth.json
+  // for non-remember sessions — defense in depth). Remember-me sessions are
+  // left intact.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const w = window as any;
+    const isElectron = !!w.electronAPI || navigator.userAgent.includes('Electron');
+    if (!isElectron) return;
+
+    // Task 2-b-2 — shared purge body: token mirrors + persisted auth fields
+    // (purgeAuthState) ONLY for ephemeral sessions; pure synchronous
+    // localStorage work, so it is safe inside unload handlers.
+    const purgeIfEphemeral = () => {
+      try {
+        if (isSessionEphemeral()) {
+          purgeAuthState();
+          console.log('[AuthProvider] App quitting — ephemeral (non remember-me) session purged');
+        }
+      } catch { /* best-effort — main-process purge is the backstop */ }
+    };
+
+    // Primary channel: the main process broadcasts 'app:quitting' on
+    // before-quit (its own comment marks this as best-effort — the window may
+    // already be gone when the broadcast is sent).
+    const offQuitting = w.electronAPI?.onAppQuitting
+      ? (w.electronAPI.onAppQuitting(purgeIfEphemeral) as unknown)
+      : null;
+
+    // Task 2-b-2 — beforeunload/pagehide FALLBACK: these fire synchronously
+    // in the renderer even when the 'app:quitting' broadcast is missed
+    // (window destroyed before IPC delivery, hard quit, webContents reload).
+    // Idempotent with the broadcast path; pagehide never fires on a plain
+    // tray-hide/minimize, so a running ephemeral session is never disturbed.
+    const onPageHide = () => purgeIfEphemeral();
+    try { window.addEventListener('pagehide', onPageHide); } catch { /* ignore */ }
+    try { window.addEventListener('beforeunload', onPageHide); } catch { /* ignore */ }
+
+    return () => {
+      if (typeof offQuitting === 'function') offQuitting();
+      try { window.removeEventListener('pagehide', onPageHide); } catch { /* ignore */ }
+      try { window.removeEventListener('beforeunload', onPageHide); } catch { /* ignore */ }
+    };
+  }, []);
+
   // ── Boot session settle (BLOCKING on web) / local session restore (Electron) ──
   // Runs once after persist rehydration, BEFORE any authed UI is rendered.
   //
@@ -83,6 +136,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // working credentials.
   useEffect(() => {
     if (!persistRehydrated) return;
+
+    // ── Task 2-b (sub-task 3): boot persistence-policy enforcement ──────────
+    // A previous run that ended WITHOUT a clean quit (crash, force-kill,
+    // power loss) can leave token mirrors behind even though the login did
+    // not opt into being remembered. Purge any such leftover BEFORE the
+    // restore logic below can revive the stale session — a non remember-me
+    // login MUST always require a fresh sign-in after the app reopens.
+    try { enforcePersistencePolicyAtBoot(); } catch { /* never block boot */ }
 
     const store = useAppStore.getState();
 
@@ -97,104 +158,149 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       console.log('[AuthProvider] Session is revoked — forcing logged-out state (no import-session restore)');
       useAppStore.setState({ user: null, isAuthenticated: false, sessionToken: '' });
       setSessionChecked(true);
+      // Task 2-b-2 — the clear above leaves the token mirrors behind; sweep
+      // them (Electron-only inside the validator) so no dead Bearer reaches
+      // PUBLIC requests. Fire-and-forget: pure storage work, the login
+      // screen must not wait for it.
+      void validateSessionOnBoot().catch(() => { /* never block boot */ });
       return;
     }
 
     // Not authenticated — nothing to settle, render immediately.
     if (!store.isAuthenticated || !store.user) {
       setSessionChecked(true);
+      // Task 2-b-2 — even WITHOUT a live session, leftover token mirrors
+      // (revoked-clear, crashed logout, a remembered login later revoked
+      // remotely) must be swept: buildAuthHeaders() would still attach the
+      // dead Bearer and the cloud reads the Authorization header FIRST.
+      // validateSessionOnBoot() case 1 performs exactly this sweep
+      // (Electron-only; browsers → 'skipped', unchanged web behavior).
+      void validateSessionOnBoot().catch(() => { /* never block boot */ });
       return;
     }
 
-    // ── Electron: Restore local API session on app reload, then render ──
-    // When the Electron app restarts/reloads, the local API's sessionToken
-    // is null (it's module-level state), but Zustand persist still has the
-    // user + token. We need to re-import the session so LAN failover works.
-    // (No cloud session check here — the desktop is local-first and has its
-    // own auth machinery; see fetch-with-retry handleAuthExpired.)
-    try {
-      const w = window as any;
-      if (w.electronAPI || navigator.userAgent.includes('Electron')) {
-        const token = store.sessionToken || localStorage.getItem('blasti-local-api-token');
-        if (token && store.user) {
-          // 1. Restore via IPC bridge (direct)
-          if (w.electronAPI?.setLocalApiSession) {
-            w.electronAPI.setLocalApiSession({ token, user: store.user });
-          }
-          // 2. Also call HTTP import-session as backup. Task 37-a: ADOPT the
-          //    refreshed user the local API returns after its cloud validation
-          //    — the response used to be discarded, leaving the persisted
-          //    user (and its agencyId) stale while the local session moved on
-          //    (the root cause of the desktop branch list showing nothing).
-          //    Only success:false responses (e.g. AUTHORIZATION_REVOKED)
-          //    carry no user — the adoption helper no-ops on them, so the
-          //    Task 33-E revoked handling above is unaffected.
-          (async () => {
-            try {
-              const res = await fetch('http://127.0.0.1:3080/api/auth/import-session', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                credentials: 'omit',
-                body: JSON.stringify({ token, user: store.user }),
-              });
-              if (!res.ok) return; // non-critical — offline / rejected
-              const data = await res.json().catch(() => null);
-              await adoptImportedLocalSessionUser(data);
-            } catch { /* non-critical */ }
-          })();
-        }
-        setSessionChecked(true);
-        return;
-      }
-    } catch { /* ignore */ }
-
-    // ── Web: settle the restored session before rendering authed UI ──
     let cancelled = false;
     (async () => {
+      // ── Task 2-b-2 (sub-task 2): boot session sanity check (desktop) ──────
+      // Runs BEFORE any restore path can revive a stale session: checks the
+      // token's expiry, attempts exactly ONE refresh through the existing
+      // single-flight logic (token-refresh.ts), and — when the session cannot
+      // be proven valid (expired + refresh rejected/unavailable, tokens
+      // absent, or the 3-day remember-me wall reached) — purges ALL auth
+      // surfaces so the restart lands on a clean login instead of continuing
+      // a half-valid offline session. Electron-only: browsers return
+      // 'skipped' and their settle below stays the sole boot authority.
       try {
-        const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
-        // Bounded wait: an unreachable/hanging API must never stall boot —
-        // a network failure simply skips the check (offline tolerance).
-        const signal = typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
-          ? AbortSignal.timeout(6000)
-          : undefined;
-        const res = await fetchWithRetry('/api/auth/session', { skipAuthCheck: true, maxRetries: 0, signal });
-
-        if (!cancelled && res.ok) {
-          const data = await res.json().catch(() => ({}));
-          if (!data?.user) {
-            // Session invalid per the server. A stale Bearer token poisons
-            // every apiClient request (Authorization header wins over the
-            // cookie), so the cookie may STILL be valid — try to re-mint
-            // the session from the cookie alone before destroying it.
-            const { healSessionFromCookie, applyHealedSession } = await import('@/lib/session-heal');
-            const healed = await healSessionFromCookie();
-            if (!cancelled && healed) {
-              console.log('[AuthProvider] Session reported invalid but cookie healed it — fresh token adopted');
-              await applyHealedSession(healed);
-              // Task 33-E — a healed session is a VALID session: clear any
-              // stale revocation so sync/restore paths re-enable.
-              clearRevoked();
-            } else if (!cancelled && useAppStore.getState().isAuthenticated) {
-              const current = useAppStore.getState().user;
-              import('sonner').then(({ toast }) => {
-                toast.error(current?.language === 'ar' ? 'انتهت الجلسة، يرجى تسجيل الدخول مجدداً' : current?.language === 'fr' ? 'Session expirée, veuillez vous reconnecter' : 'Session expired, please log in again');
-              });
-              useAppStore.getState().logout();
-            }
-          } else if (!cancelled) {
-            // Task 33-E — the session validated successfully at boot: any
-            // previously persisted revocation (e.g. a stale token that has
-            // since been re-minted by the server) is fully recovered.
-            clearRevoked();
-          }
+        const verdict = await validateSessionOnBoot();
+        if (verdict === 'purged') {
+          console.log('[AuthProvider] Boot validation purged the stale session — login screen');
         }
-        // !res.ok → server unreachable/offline → proceed WITHOUT logout
-      } catch {
-        // never block the app on the settle check
-      } finally {
-        if (!cancelled) setSessionChecked(true);
+        if (verdict === 'purged' || cancelled) {
+          setSessionChecked(true);
+          return;
+        }
+      } catch (bootErr) {
+        // Never block boot on the validator — the restore/settle below keeps
+        // today's behavior when the check cannot run.
+        console.warn('[AuthProvider] Boot session validation skipped:', bootErr);
       }
+      if (cancelled) return;
+
+      // Re-read AFTER validation: a successful refresh rotated the token.
+      const current = useAppStore.getState();
+
+      // ── Electron: Restore local API session on app reload, then render ──
+      // When the Electron app restarts/reloads, the local API's sessionToken
+      // is null (it's module-level state), but Zustand persist still has the
+      // user + token. We need to re-import the session so LAN failover works.
+      // (No cloud session check here — the desktop is local-first and has its
+      // own auth machinery; see fetch-with-retry handleAuthExpired.)
+      try {
+        const w = window as any;
+        if (w.electronAPI || navigator.userAgent.includes('Electron')) {
+          const token = current.sessionToken || localStorage.getItem('blasti-local-api-token');
+          if (token && current.user) {
+            // 1. Restore via IPC bridge (direct)
+            if (w.electronAPI?.setLocalApiSession) {
+              w.electronAPI.setLocalApiSession({ token, user: current.user });
+            }
+            // 2. Also call HTTP import-session as backup. Task 37-a: ADOPT the
+            //    refreshed user the local API returns after its cloud validation
+            //    — the response used to be discarded, leaving the persisted
+            //    user (and its agencyId) stale while the local session moved on
+            //    (the root cause of the desktop branch list showing nothing).
+            //    Only success:false responses (e.g. AUTHORIZATION_REVOKED)
+            //    carry no user — the adoption helper no-ops on them, so the
+            //    Task 33-E revoked handling above is unaffected.
+            (async () => {
+              try {
+                const res = await fetch('http://127.0.0.1:3080/api/auth/import-session', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  credentials: 'omit',
+                  body: JSON.stringify({ token, user: current.user }),
+                });
+                if (!res.ok) return; // non-critical — offline / rejected
+                const data = await res.json().catch(() => null);
+                await adoptImportedLocalSessionUser(data);
+              } catch { /* non-critical */ }
+            })();
+          }
+          setSessionChecked(true);
+          return;
+        }
+      } catch { /* ignore */ }
+
+    // ── Web: settle the restored session before rendering authed UI ──
+    // (Runs inside the boot IIFE above so the desktop sanity check always
+    // precedes it; `webCancelled` aliases the shared effect cancellation.)
+      let webCancelled = cancelled;
+      (async () => {
+        try {
+          const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
+          // Bounded wait: an unreachable/hanging API must never stall boot —
+          // a network failure simply skips the check (offline tolerance).
+          const signal = typeof AbortSignal !== 'undefined' && 'timeout' in AbortSignal
+            ? AbortSignal.timeout(6000)
+            : undefined;
+          const res = await fetchWithRetry('/api/auth/session', { skipAuthCheck: true, maxRetries: 0, signal });
+
+          if (!webCancelled && res.ok) {
+            const data = await res.json().catch(() => ({}));
+            if (!data?.user) {
+              // Session invalid per the server. A stale Bearer token poisons
+              // every apiClient request (Authorization header wins over the
+              // cookie), so the cookie may STILL be valid — try to re-mint
+              // the session from the cookie alone before destroying it.
+              const { healSessionFromCookie, applyHealedSession } = await import('@/lib/session-heal');
+              const healed = await healSessionFromCookie();
+              if (!webCancelled && healed) {
+                console.log('[AuthProvider] Session reported invalid but cookie healed it — fresh token adopted');
+                await applyHealedSession(healed);
+                // Task 33-E — a healed session is a VALID session: clear any
+                // stale revocation so sync/restore paths re-enable.
+                clearRevoked();
+              } else if (!webCancelled && useAppStore.getState().isAuthenticated) {
+                const staleUser = useAppStore.getState().user;
+                import('sonner').then(({ toast }) => {
+                  toast.error(staleUser?.language === 'ar' ? 'انتهت الجلسة، يرجى تسجيل الدخول مجدداً' : staleUser?.language === 'fr' ? 'Session expirée, veuillez vous reconnecter' : 'Session expired, please log in again');
+                });
+                useAppStore.getState().logout();
+              }
+            } else if (!webCancelled) {
+              // Task 33-E — the session validated successfully at boot: any
+              // previously persisted revocation (e.g. a stale token that has
+              // since been re-minted by the server) is fully recovered.
+              clearRevoked();
+            }
+          }
+          // !res.ok → server unreachable/offline → proceed WITHOUT logout
+        } catch {
+          // never block the app on the settle check
+        } finally {
+          if (!webCancelled) setSessionChecked(true);
+        }
+      })();
     })();
 
     return () => { cancelled = true; };
@@ -233,7 +339,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    // User is NOT authenticated — set view from hash for auth pages
+    // User is NOT authenticated — set view from hash for auth pages.
+    // NATIVE SHELLS (mobile APK / desktop exe): an empty/'#/' hash (exactly
+    // what the packaged WebView boots with) used to resolve to 'landing'
+    // here — AFTER the store/page-level native redirect had already selected
+    // the dedicated login — putting the mobile app back on the marketing
+    // landing page. Native shells now boot to 'login' no matter what the
+    // hash says (deep links like #/join/CODE still win below).
     if (hash) {
       const view = parseHashToView(hash);
       if (view) {
@@ -241,7 +353,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (joinCode) {
           setPendingAgencyCode(joinCode);
         }
-        setViewFromHash(hash);
+        const isNativeShell =
+          !!window.electronAPI ||
+          !!(window as unknown as { Capacitor?: unknown }).Capacitor;
+        if (isNativeShell && view === 'landing') {
+          useAppStore.getState().setView('login');
+          updateHashForView('login');
+        } else {
+          setViewFromHash(hash);
+        }
       }
     } else if (currentView === 'login' || currentView === 'register') {
       // Web must always START on the landing page. A stale persisted
@@ -255,6 +375,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         !!(window as unknown as { Capacitor?: unknown }).Capacitor;
       if (!isNativeShell) {
         useAppStore.getState().setView('landing');
+      } else {
+        updateHashForView(currentView);
+      }
+    } else if (currentView === 'landing') {
+      const isNativeShell =
+        !!window.electronAPI ||
+        !!(window as unknown as { Capacitor?: unknown }).Capacitor;
+      if (isNativeShell) {
+        // Native shell booting with an empty hash — land on the dedicated
+        // login screen, never the marketing landing page.
+        useAppStore.getState().setView('login');
+        updateHashForView('login');
       } else {
         updateHashForView(currentView);
       }
