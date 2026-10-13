@@ -533,6 +533,8 @@ const ar = {
   turnNotifBody: 'يرجى التوجه إلى مكتب الخدمة.',
   dismissAlert: "فهمت",
   fileTooLarge: "حجم الملف يتجاوز 5 ميغابايت",
+  imagePreviewTitle: "معاينة الصورة الجديدة",
+  imagePreviewDesc: "هذه هي الصورة التي ستظهر. هل تريد تعيينها؟",
   seconds: "ثانية",
 
   // ─── Admin Analytics ──────────────────
@@ -1108,6 +1110,17 @@ const ar = {
   newBalance: 'الرصيد الجديد',
   purchaseHistory: 'سجل المشتريات',
   noPurchases: 'لا مشتريات بعد',
+  // Task 2-b: purchase status chips, filters & pending stat
+  purchaseStatusApproved: 'ناجحة',
+  purchaseStatusPending: 'قيد الانتظار',
+  purchaseStatusFailed: 'فاشلة',
+  purchaseStatusRejected: 'مرفوضة',
+  purchaseFilterAll: 'الكل',
+  purchaseFilterSuccess: 'ناجحة',
+  purchaseFilterPending: 'قيد الانتظار',
+  purchaseFilterFailed: 'فاشلة',
+  purchasePendingCount: '{count} عملية شراء قيد الانتظار',
+  purchaseNoResults: 'لا مشتريات ضمن هذا التصنيف',
   paymentSubmitted: 'تم تقديم الدفع للمراجعة',
   waitingApproval: 'في انتظار موافقة المسؤول',
   stepSelectPlan: 'اختيار الخطة',
@@ -2561,6 +2574,11 @@ const ar = {
   paymentForLabel: "الدفع مقابل",
   pendingCheckoutResume: "استكمال الدفع المعلق",
   continuePayment: "متابعة الدفع",
+  paymentUnverifiedTitle: "لم يتم التأكد من الدفع بعد",
+  paymentUnverifiedDesc: "لم نتمكن من التأكد من حالة الدفع تلقائياً. لا تفترض أن الدفع قد تم — راجع سجل مشترياتك أو اشتراكك للتأكد قبل إعادة المحاولة.",
+  paymentUnverifiedCta: "مراجعة سجل الدفعات",
+  paymentToastCompleted: "تم تأكيد الدفع بنجاح",
+  paymentToastFailed: "تعذّر إتمام عملية الدفع",
 
   // ─── agency-fullscreen.tsx ────────────────────────────────────
   walkInAdded: "تمت إضافة الزائر",

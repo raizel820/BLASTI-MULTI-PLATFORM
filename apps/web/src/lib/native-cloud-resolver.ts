@@ -126,6 +126,20 @@ export function getNativeCloudUrl(): string | null {
   return state.url;
 }
 
+/**
+ * Task 2-c — status probe for consumers that must NOT trust the resolver's
+ * url blindly. On a FAILED scan the resolver keeps `state.url` pointing at
+ * the baked fallback (the Android EMULATOR alias http://10.0.2.2:3003), which
+ * is dead on every physical phone — image rebasing therefore needs to know
+ * whether a returned url is a PROVEN server or just the fallback.
+ * Returns { status } ('idle' | 'scanning' | 'found' | 'failed'), or null
+ * outside the browser (SSR).
+ */
+export function getNativeCloudUrlStatus(): { status: string } | null {
+  if (typeof window === 'undefined') return null;
+  return { status: state.status };
+}
+
 export function onNativeCloudStateChange(cb: (s: NativeCloudState) => void): () => void {
   listeners.add(cb);
   return () => { listeners.delete(cb); };

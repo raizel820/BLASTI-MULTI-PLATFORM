@@ -46,6 +46,7 @@ import { useEffect } from 'react';
 import { initMobilePushRegistration } from '@/lib/push-registration';
 import { initNativeBackHandler } from '@/lib/native-back-handler';
 import { startDeviceReporting } from '@/lib/device-report';
+import { PaymentRealtimeToasts } from '@/lib/payment-realtime';
 
 const CHUNK_RELOAD_KEY = 'blasti-chunk-reload-at';
 const CHUNK_RELOAD_COOLDOWN_MS = 15000;
@@ -151,5 +152,11 @@ export function ClientBootHardening() {
     };
   }, []);
 
-  return null;
+  // Task 2-e: global Chargily settlement toasts — rides the app-wide socket
+  // singleton for the whole page lifetime (renders null).
+  return (
+    <>
+      <PaymentRealtimeToasts />
+    </>
+  );
 }

@@ -538,6 +538,8 @@ const en: Record<TranslationKeys, string> = {
   turnNotifBody: 'Please proceed to the service counter.',
   dismissAlert: "Got it",
   fileTooLarge: "File size exceeds 5 MB limit",
+  imagePreviewTitle: "Preview the new image",
+  imagePreviewDesc: "This is how the image will appear. Set it as active?",
   seconds: "Seconds",
 
   // ─── Admin Analytics ──────────────────
@@ -1108,6 +1110,17 @@ const en: Record<TranslationKeys, string> = {
   newBalance: "New balance",
   purchaseHistory: "Purchase history",
   noPurchases: "No purchases yet",
+  // Task 2-b: purchase status chips, filters & pending stat
+  purchaseStatusApproved: "Success",
+  purchaseStatusPending: "Pending",
+  purchaseStatusFailed: "Failed",
+  purchaseStatusRejected: "Rejected",
+  purchaseFilterAll: "All",
+  purchaseFilterSuccess: "Success",
+  purchaseFilterPending: "Pending",
+  purchaseFilterFailed: "Failed",
+  purchasePendingCount: "{count} purchase(s) pending",
+  purchaseNoResults: "No purchases in this category",
   paymentSubmitted: "Payment submitted for review",
   waitingApproval: "Waiting for admin approval",
   stepSelectPlan: "Select Plan",
@@ -2561,6 +2574,11 @@ const en: Record<TranslationKeys, string> = {
   paymentForLabel: "Payment for",
   pendingCheckoutResume: "Resume pending payment",
   continuePayment: "Continue payment",
+  paymentUnverifiedTitle: "Payment not verified yet",
+  paymentUnverifiedDesc: "We couldn't verify the payment status automatically. Don't assume the payment went through — check your purchase or subscription history to confirm before retrying.",
+  paymentUnverifiedCta: "View payment history",
+  paymentToastCompleted: "Payment confirmed successfully",
+  paymentToastFailed: "The payment could not be completed",
 
   // ─── agency-fullscreen.tsx ────────────────────────────────────
   walkInAdded: "Walk-in added",

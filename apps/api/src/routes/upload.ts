@@ -11,9 +11,10 @@ import {
   resolveStoredPath,
   saveUpload,
   makeFilename,
-  absoluteFileUrl,
+  uploadUrlPath,
   publicFilePath,
   storagePathFromUrl,
+  normalizeUploadUrlPath,
 } from '../lib/storage'
 import { db } from '@blasti/db'
 
@@ -27,8 +28,15 @@ import { db } from '@blasti/db'
  * layout, legacy flat fallback) and registers every upload in the FileAsset
  * table so the desktop file-sync and the storage audit have one registry.
  *
- * The response now carries BOTH the absolute `url` and the relative `path`
- * (`/api/upload/file/<bucket>/<yyyy>/<mm>/<name>`), plus the storagePath.
+ * Task 2-c — the response `url` (and the FileAsset.url row) is now the
+ * RELATIVE canonical path (`/api/upload/file/<bucket>/<yyyy>/<mm>/<name>`),
+ * not an absolute URL: baking the request-time origin used to store
+ * http://localhost:3003/... rows that were dead on every other device
+ * (proxies, phones) — the root cause of the "all images show a placeholder"
+ * bug. Clients rebase the relative path per environment.
+ *
+ * The response also still carries `path` (same relative value),
+ * `storagePath` (bucket/yyyy/mm/name) and `deviceFileId`.
  */
 const app = new Hono()
 
@@ -141,8 +149,10 @@ app.post('/', async (c) => {
     const saved = await saveUpload(type, buffer, filename)
 
     const checksum = createHash('sha256').update(buffer).digest('hex')
-    const origin = new URL(c.req.url).origin
-    const url = absoluteFileUrl(origin, type, saved.yyyy, saved.mm, filename)
+    // Task 2-c — store/answer the RELATIVE path. No request-time origin is
+    // baked into the row or the response, so the URL stays valid behind
+    // proxies, on LAN browsers, on phones and inside the desktop shell.
+    const url = uploadUrlPath(type, saved.yyyy, saved.mm, filename)
     const filePath = publicFilePath(type, saved.yyyy, saved.mm, filename)
 
     // Register the file in the central FileAsset registry (best-effort —
@@ -248,6 +258,67 @@ app.get('/file/:type/:name', async (c) => {
     return fileResponse(data, name)
   } catch {
     return c.json({ success: false, error: 'File not found' }, 404)
+  }
+})
+
+// ─── DELETE /api/upload/asset — delete a registered FileAsset (Task 2-c) ────
+//
+// Row-oriented counterpart of DELETE /api/upload (which deletes by storage
+// path). Accepts ANY url shape the system has produced (relative or absolute
+// with a dead host), normalizes it to the canonical relative path, finds the
+// FileAsset registry row, enforces ownership, then removes the blob (best
+// effort) and the row. Contract for Task 2-d's client asset cleanup.
+app.delete('/asset', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const body = await c.req.json().catch(() => ({}))
+    const url = body?.url as string | undefined
+
+    if (!url || typeof url !== 'string') {
+      return c.json({ success: false, error: 'No URL provided' }, 400)
+    }
+
+    const path = normalizeUploadUrlPath(url)
+    if (!path) {
+      return c.json({ success: false, error: 'not an upload URL' }, 400)
+    }
+
+    // Match the row by the canonical url OR the storagePath the path implies.
+    const storagePath = storagePathFromUrl(path)
+    const asset = await db.fileAsset.findFirst({
+      where: {
+        OR: [
+          { url: path },
+          // Legacy rows may carry an ABSOLUTE url — match them by storagePath.
+          ...(storagePath ? [{ storagePath }] : []),
+        ],
+      },
+    })
+    if (!asset) {
+      return c.json({ success: false, error: 'File asset not found' }, 404)
+    }
+
+    if (asset.ownerId !== user.id && user.role !== 'SUPER_ADMIN') {
+      return c.json({ success: false, error: 'Access denied — you do not own this file' }, 403)
+    }
+
+    // Best-effort disk delete — the registry row is the source of truth here;
+    // a missing/unreadable blob must not fail the deletion.
+    if (storagePath) {
+      try {
+        const { deleteByStoragePath } = await import('../lib/storage')
+        await deleteByStoragePath(storagePath)
+      } catch { /* best-effort */ }
+    }
+
+    try {
+      await db.fileAsset.delete({ where: { id: asset.id } })
+    } catch { /* row may already be gone — deletion still succeeded */ }
+
+    return c.json({ success: true })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 

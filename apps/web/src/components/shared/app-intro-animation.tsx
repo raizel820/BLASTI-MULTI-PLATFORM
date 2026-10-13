@@ -15,6 +15,9 @@
 
 import { useEffect, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
+// Task 2-a — the version probe moved into lib/app-version.ts so the customer
+// settings About row shares the same memoized Device.getInfo() round-trip.
+import { getAppVersion } from '@/lib/app-version';
 
 const INTRO_KEY = 'blasti-intro-played';
 /** The original artwork, tile-fill framing (matches the launcher icon file). */
@@ -59,27 +62,22 @@ export function AppIntroAnimation() {
   }, [reduceMotion]);
 
   // Version badge (user request: show the app version on the launch
-  // animation). The native shell injects the @capacitor/device plugin;
-  // getInfo() returns appVersion = the Android versionName — the SAME value
-  // the APK file name and the update system use. Zero @capacitor imports
-  // (apps/web does not depend on them) — probed defensively like
-  // device-report.ts does. Plain-browser previews (?intro=1) simply never
+  // animation). Task 2-a: the shell-injected Capacitor Device probe lives in
+  // lib/app-version.ts (shared with the settings About row) — it reads
+  // getInfo().appVersion, i.e. the Android versionName, the SAME value the
+  // APK file name and the update system use. Zero @capacitor imports
+  // (apps/web does not depend on them); the promise never rejects and
+  // resolves null in plain browsers, so ?intro=1 previews simply never
   // resolve a version and the badge stays hidden.
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    const cap = (window as unknown as {
-      Capacitor?: { getPlugins?: (name: string) => Record<string, { getInfo?: () => Promise<{ appVersion?: string }> }> };
-    }).Capacitor;
-    try {
-      const info = cap?.getPlugins?.('Device');
-      info?.getInfo?.()
-        .then((res) => {
-          if (res && typeof res.appVersion === 'string' && res.appVersion.trim()) {
-            setAppVersion(res.appVersion.trim());
-          }
-        })
-        .catch(() => { /* older shell — badge stays hidden */ });
-    } catch { /* no bridge — badge stays hidden */ }
+    let mounted = true;
+    getAppVersion()
+      .then((version) => {
+        if (mounted && version) setAppVersion(version);
+      })
+      .catch(() => { /* never rejects per contract — kept defensive */ });
+    return () => { mounted = false; };
   }, []);
 
   return (

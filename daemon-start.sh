@@ -13,6 +13,23 @@
   export INTERNAL_SECRET="${INTERNAL_SECRET:-blast1-internal-secret-dev}"
   export NEXTAUTH_URL="${NEXTAUTH_URL:-http://localhost:3000/}"
 
+  # ── PostgreSQL on 5432 (embedded binaries, no root/docker in sandbox) ──────
+  if ss -ltn 2>/dev/null | grep -q ':5432 '; then
+    echo "[$(date)] PostgreSQL already accepting connections on :5432 — skipping" >> /tmp/services.log
+  else
+    cd /home/z/pg-embedded
+    bun boot-pg.mjs > /tmp/pg-embedded.log 2>&1 &
+    PG_PID=$!
+    echo "[$(date)] Embedded PostgreSQL starting (PID $PG_PID)" >> /tmp/services.log
+    for i in $(seq 1 30); do
+      if ss -ltn 2>/dev/null | grep -q ':5432 '; then
+        echo "[$(date)] PostgreSQL ready" >> /tmp/services.log
+        break
+      fi
+      sleep 1
+    done
+  fi
+
   # ── API on port 3003 (skip if already healthy) ────────────────────────────
   if curl -sf -m 2 http://127.0.0.1:3003/health >/dev/null 2>&1; then
     echo "[$(date)] API already healthy on :3003 — skipping (no duplicate instance)" >> /tmp/services.log

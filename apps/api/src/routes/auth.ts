@@ -516,11 +516,11 @@ app.post('/register', async (c) => {
       ? (validation.data.wilaya.padStart(2, '0').match(/^(0[1-9]|[1-5][0-8])$/) ? validation.data.wilaya.padStart(2, '0') : undefined)
       : undefined
     const registerCommune = validation.data.commune?.trim() || undefined
-    // Round 15 — the desktop local API returns LOCAL file URLs (offline-first
-    // upload); rewrite them to this API's public URLs so the stored avatar is
+    // Task 2-c — normalize on write: the avatar is stored as the canonical
+    // RELATIVE /api/upload/file/... path (desktop-local absolute URLs and
+    // request-origin absolute URLs are stripped to their path), so it stays
     // reachable from every device once the file-sync push delivers the blob.
-    const fileBase = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '') || new URL(c.req.url).origin
-    const avatarUrl = normalizeRecordFileUrls({ avatarUrl: validation.data.avatarUrl }, fileBase).avatarUrl
+    const avatarUrl = normalizeRecordFileUrls({ avatarUrl: validation.data.avatarUrl }).avatarUrl
 
     // Check for duplicate username
     const existingUser = await db.user.findUnique({

@@ -3,7 +3,11 @@ import { twMerge } from "tailwind-merge"
 // Native (Capacitor) cloud-API runtime resolution — used to rebase stored
 // localhost file URLs onto the LAN/cloud base the phone actually reached.
 // This module only imports get-local-ip (no cycle with utils).
-import { getNativeCloudUrl } from './native-cloud-resolver';
+import { getNativeCloudUrl, getNativeCloudUrlStatus } from './native-cloud-resolver';
+// Task 2-c — environment-aware CLOUD API base for the Capacitor fallback
+// when the native resolver FAILED (its url is then the dead emulator alias).
+// api-client does NOT import utils, so this import cannot form a cycle.
+import { getCloudApiBaseUrl } from './api-client';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
@@ -124,20 +128,37 @@ export function getProxiedUrl(url: string | null | undefined): string {
     }
 
     // ── Capacitor (mobile app) — same placeholder bug class ─────────────
-    // The WebView origin is the device itself. Only localhost-stored URLs
-    // used to be rebased; cloud-ABSOLUTE urls (http://<vps>:3003/...) passed
-    // through raw and were blocked by Android cleartext policy / iOS ATS or
-    // simply unreachable (firewalled :3003) — placeholder everywhere in the
-    // mobile app. Rebase EVERY upload-file URL onto the cloud base the
-    // native resolver actually reached — the same base the app's successful
-    // fetch()/upload calls already use, so images ride a proven-reachable
-    // origin. Unconfigured resolver → fall through to the legacy branches.
+    // The WebView origin is the device itself. EVERY upload-file URL
+    // (relative legacy row, absolute localhost row, absolute dead-host row)
+    // is rebased — path-driven — onto the cloud base the native resolver
+    // actually reached: the same base the app's successful fetch()/upload
+    // calls already use, so images ride a proven-reachable origin.
+    //
+    // Task 2-c hardening: the resolver is trusted ONLY when it actually
+    // FOUND the server (or a locked build answers with the baked server).
+    // On a FAILED scan getNativeCloudUrl() still returns its fallback — the
+    // ANDROID EMULATOR alias http://10.0.2.2:3003 — which is dead on every
+    // physical phone; in that case fall back to the environment-configured
+    // cloud base (getCloudApiBaseUrl() / NEXT_PUBLIC_API_URL) instead.
     if (isCapacitorShell() && isUploadFilePath) {
+      const suffix = raw.startsWith('/') ? raw : `${parsed.pathname}${parsed.search}`;
+      const resolverStatus = getNativeCloudUrlStatus();
       const nativeBase = getNativeCloudUrl();
-      if (nativeBase) {
-        const suffix = raw.startsWith('/') ? raw : `${parsed.pathname}${parsed.search}`;
+      if (nativeBase && (!resolverStatus || resolverStatus.status !== 'failed')) {
         return `${nativeBase.replace(/\/+$/, '')}${suffix}`;
       }
+      // Resolver failed (or no URL yet): prefer a cloud base that is NOT the
+      // resolver's own dead fallback, then the baked env URL.
+      const cloudBase = getCloudApiBaseUrl();
+      const fallbackBase =
+        (cloudBase && cloudBase !== nativeBase ? cloudBase : '') ||
+        process.env.NEXT_PUBLIC_API_URL ||
+        process.env.NEXT_PUBLIC_CLOUD_URL ||
+        '';
+      if (fallbackBase) {
+        return `${fallbackBase.replace(/\/+$/, '')}${suffix}`;
+      }
+      // No usable base at all — fall through to the legacy branches.
     }
 
     if (isDirectReachablePageHost(pageHost)) {
@@ -170,6 +191,17 @@ export function getProxiedUrl(url: string | null | undefined): string {
       ) {
         parsed.hostname = pageHost === '0.0.0.0' ? 'localhost' : pageHost;
         return parsed.toString();
+      }
+      // Task 2-c — universal repair: an ABSOLUTE upload-file URL carrying a
+      // dead host (stale LAN IP, request-time origin baked by older API
+      // builds, expired tunnel) gets the same treatment as relative paths
+      // above — rebased onto the page host's own cloud API port.
+      if (isUploadFilePath) {
+        const electronBase = electronCloudBaseUrl();
+        if (electronBase) {
+          return `${electronBase.replace(/\/+$/, '')}${parsed.pathname}${parsed.search}`;
+        }
+        return `http://${pageHost === '0.0.0.0' ? 'localhost' : pageHost}:3003${parsed.pathname}${parsed.search}`;
       }
       return raw;
     }

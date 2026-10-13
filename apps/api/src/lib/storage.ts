@@ -183,10 +183,27 @@ export function publicFilePathForStoragePath(storagePath: string): string | null
  * Build the ABSOLUTE public URL clients should render. Prefers the
  * BLASTI_PUBLIC_BASE_URL env (stable behind reverse proxies / docker port
  * mappings), and falls back to the API's own request origin.
+ *
+ * Task 2-c — DEPRECATED for intake/storage: baking the request-time origin
+ * (http://localhost:3003 behind proxies/phones) into stored rows is exactly
+ * what made every uploaded image dead on any OTHER device. New uploads and
+ * entity intake must store the RELATIVE uploadUrlPath() instead; clients
+ * rebase the relative path per environment (web getProxiedUrl).
  */
 export function absoluteFileUrl(requestOrigin: string, bucket: string, yyyy: string, mm: string, filename: string): string {
   const base = PUBLIC_BASE_URL || requestOrigin.replace(/\/+$/, '')
   return `${base}${publicFilePath(bucket, yyyy, mm, filename)}`
+}
+
+/**
+ * Task 2-c — the CANONICAL stored URL for an upload: a RELATIVE path
+ *   /api/upload/file/<bucket>/<yyyy>/<mm>/<filename>
+ * Relative paths are origin-agnostic — every client (web gateway, LAN
+ * browser, Capacitor phone, Electron local API) already knows how to rebase
+ * them onto the API origin it can actually reach.
+ */
+export function uploadUrlPath(bucket: string, yyyy: string, mm: string, filename: string): string {
+  return publicFilePath(bucket, yyyy, mm, filename)
 }
 
 // ─── Parsing stored URLs back into storage paths ────────────────────────────
@@ -209,4 +226,45 @@ export function isLocalOrRelativeFileUrl(value: unknown): value is string {
   if (typeof value !== 'string' || !value.includes('/api/upload/file/')) return false
   if (value.startsWith('/api/upload/file/')) return true
   return /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(value)
+}
+
+/**
+ * Task 2-c — normalize ANY upload-file URL (absolute with a dead/stale host,
+ * localhost, or already-relative) into its CANONICAL RELATIVE path:
+ *
+ *   http://anything:port/api/upload/file/avatar/2026/01/x.png?qs
+ *     → /api/upload/file/avatar/2026/01/x.png
+ *   /api/upload/file/logo/x.png                     (legacy flat)
+ *     → /api/upload/file/logo/x.png
+ *
+ * Accepts absolute http(s) URLs and root-relative paths. Returns null when
+ * the value is not an upload-file URL shape (external CDNs, data:, /uploads/
+ * legacy shapes, …) so callers keep the original value untouched.
+ */
+export function normalizeUploadUrlPath(url: string): string | null {
+  if (!url || typeof url !== 'string') return null
+  const trimmed = url.trim()
+  if (!trimmed) return null
+
+  let pathname: string
+  if (trimmed.startsWith('/')) {
+    // Root-relative path — strip query/hash if a client appended one.
+    pathname = trimmed
+  } else if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      pathname = new URL(trimmed).pathname
+    } catch {
+      return null
+    }
+  } else {
+    return null
+  }
+
+  const cut = pathname.search(/[?#]/)
+  if (cut >= 0) pathname = pathname.slice(0, cut)
+
+  const match = pathname.match(
+    /^\/api\/upload\/file\/([a-z][a-z0-9-]{0,23}(?:\/\d{4}\/(?:0[1-9]|1[0-2]))?\/[a-zA-Z0-9._-]+)$/,
+  )
+  return match ? `/api/upload/file/${match[1]}` : null
 }

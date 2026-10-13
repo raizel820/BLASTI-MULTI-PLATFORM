@@ -16,7 +16,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
-import { CheckCircle2, XCircle, Clock, Loader2, CreditCard, LogIn } from 'lucide-react';
+import { CheckCircle2, XCircle, Clock, Loader2, CreditCard, LogIn, HelpCircle, History } from 'lucide-react';
 import { useAppStore } from '@/store/use-app-store';
 import type { ViewName, UserRole } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
@@ -320,6 +320,11 @@ export function PaymentResult() {
   const showSecondaryHome =
     role === 'CUSTOMER' && primaryCta.view !== 'customer-home';
 
+  // Task 2-e: history view for the unverified fallback — agencies check their
+  // subscription page, customers their profile (purchase history).
+  const unverifiedHistoryView: ViewName =
+    role === 'AGENCY_OWNER' || role === 'AGENCY_STAFF' ? 'agency-subscription' : 'customer-profile';
+
   const knownAmount = data?.amount ?? pending?.amount ?? null;
 
   // ── Effective visual state ────────────────────────────────────────────────
@@ -328,7 +333,17 @@ export function PaymentResult() {
   const genericStatus =
     statusParam === 'success' ? 'success' : statusParam === 'failed' ? 'failed' : 'neutral';
 
-  type Visual = 'confirming' | 'success' | 'failed' | 'pending' | 'neutral';
+  // Task 2-e — unverified-success guard: `?status=success` comes from the
+  // STATIC Chargily return URL and proves nothing on its own (the charge may
+  // not even exist). When we have no checkout id to verify against (logged
+  // out, or authenticated but nothing recoverable), a green "paid" screen
+  // would invite the user to mistake an unconfirmed/failed payment as done.
+  // Those cases render an AMBER "unverified" state instead. The authenticated
+  // polling path (real checkout id → confirming → paid/failed) is untouched.
+  const unverifiedGeneric =
+    (phase === 'unauthenticated' || phase === 'no-checkout') && genericStatus === 'success';
+
+  type Visual = 'confirming' | 'success' | 'failed' | 'pending' | 'unverified' | 'neutral';
   const visual: Visual =
     phase === 'confirming'
       ? 'confirming'
@@ -338,11 +353,13 @@ export function PaymentResult() {
           ? 'failed'
           : phase === 'still-pending'
             ? 'pending'
-            : genericStatus === 'success'
-              ? 'success'
-              : genericStatus === 'failed'
-                ? 'failed'
-                : 'neutral';
+            : unverifiedGeneric
+              ? 'unverified'
+              : genericStatus === 'success'
+                ? 'success'
+                : genericStatus === 'failed'
+                  ? 'failed'
+                  : 'neutral';
 
   const renderIcon = () => {
     if (visual === 'confirming') {
@@ -403,6 +420,23 @@ export function PaymentResult() {
         </motion.div>
       );
     }
+    if (visual === 'unverified') {
+      return (
+        <motion.div
+          initial={{ scale: 0.6, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          transition={{ type: 'spring', stiffness: 220, damping: 14 }}
+          className="relative"
+        >
+          <motion.div
+            animate={{ scale: [1, 1.15, 1], opacity: [0.16, 0.05, 0.16] }}
+            transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
+            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-amber-300 dark:bg-amber-700"
+          />
+          <HelpCircle className="relative h-20 w-20 text-amber-500 dark:text-amber-400" />
+        </motion.div>
+      );
+    }
     // Neutral — no status hint available
     return (
       <motion.div
@@ -422,6 +456,8 @@ export function PaymentResult() {
     if (phase === 'paid') return t('paymentSuccessTitle');
     if (phase === 'failed') return t('paymentFailedTitle');
     if (phase === 'still-pending') return t('paymentStillPendingTitle');
+    // Task 2-e: unverifiable `?status=success` — never claim success.
+    if (visual === 'unverified') return t('paymentUnverifiedTitle');
     if (genericStatus === 'success') return t('paymentSuccessTitle');
     if (genericStatus === 'failed') return t('paymentFailedTitle');
     // Neutral: authenticated without a checkout says so; logged-out (or
@@ -434,6 +470,8 @@ export function PaymentResult() {
     if (phase === 'paid') return t('paymentSuccessDesc');
     if (phase === 'failed') return t('paymentFailedDesc');
     if (phase === 'still-pending') return t('paymentStillPendingDesc');
+    // Task 2-e: unverifiable `?status=success` — never claim success.
+    if (visual === 'unverified') return t('paymentUnverifiedDesc');
     if (genericStatus === 'success') return t('paymentSuccessDesc');
     if (genericStatus === 'failed') return t('paymentFailedDesc');
     return null;
@@ -496,6 +534,18 @@ export function PaymentResult() {
                 >
                   <LogIn className="h-4 w-4" />
                   {t('login')}
+                </Button>
+              ) : visual === 'unverified' ? (
+                // Task 2-e: unverifiable success — steer to the history view
+                // instead of celebrating. (Logged-out users keep the login CTA
+                // above: signing in IS their path to their history.)
+                <Button
+                  onClick={() => setView(unverifiedHistoryView)}
+                  variant="outline"
+                  className="w-full sm:w-auto min-h-[44px] px-6 rounded-2xl border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/20 gap-2"
+                >
+                  <History className="h-4 w-4" />
+                  {t('paymentUnverifiedCta')}
                 </Button>
               ) : phase === 'still-pending' ? (
                 <>

@@ -95,6 +95,10 @@ app.post('/purchase', async (c) => {
 })
 
 // GET /sms/purchase — Get user's SMS purchase history
+// Task 2-b: purchases carry status/paymentProvider/createdAt (full model rows) and the
+// response adds aggregates computed over ALL the user's purchases (not just the 10 returned):
+//   totalPurchased / totalSpent — SUM(quantity)/SUM(price) of APPROVED purchases only
+//   pendingCount                — COUNT of purchases still awaiting approval
 app.get('/purchase', async (c) => {
   try {
     const user = await requireAuth(c)
@@ -106,7 +110,27 @@ app.get('/purchase', async (c) => {
       take: 10,
     })
 
-    return c.json({ purchases })
+    // Aggregates over the user's ENTIRE purchase history — one groupBy on status
+    const statusAgg = await db.smsPurchase.groupBy({
+      by: ['status'],
+      where: { userId },
+      _sum: { quantity: true, price: true },
+      _count: { status: true },
+    })
+
+    let totalPurchased = 0
+    let totalSpent = 0
+    let pendingCount = 0
+    for (const row of statusAgg) {
+      if (row.status === 'APPROVED') {
+        totalPurchased = row._sum.quantity ?? 0
+        totalSpent = row._sum.price ?? 0
+      } else if (row.status === 'PENDING') {
+        pendingCount = row._count.status
+      }
+    }
+
+    return c.json({ success: true, purchases, totalPurchased, totalSpent, pendingCount })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

@@ -46,6 +46,8 @@ import { unwrapListPayload } from '@/lib/list-payload';
 import { formatWorkingDaysList } from '@/lib/enum-i18n';
 import { AgencyCategorySelect } from '@/components/agency/agency-category-select';
 import { BUILT_IN_CATEGORY_OPTIONS } from '@/hooks/use-agency-categories';
+// Task 2-d — preview the picked logo before it is uploaded/set active.
+import { ImageUploadPreviewDialog } from '@/components/shared/image-upload-preview-dialog';
 // Task 5 — Algeria address selectors (58 wilayas + their communes).
 import {
   WilayaSelect,
@@ -151,6 +153,11 @@ export function AgencyProfile() {
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [qrLoading, setQrLoading] = useState(false);
   const logoInputRef = useRef<HTMLInputElement>(null);
+  // Task 2-d — logo preview dialog: pick → preview → confirm uploads + swaps.
+  const [logoPreviewOpen, setLogoPreviewOpen] = useState(false);
+  const [pendingLogoFile, setPendingLogoFile] = useState<File | null>(null);
+  const [pendingLogoUrl, setPendingLogoUrl] = useState<string | null>(null);
+  const [logoUploading, setLogoUploading] = useState(false);
   // Task 51-b — set when the owner re-picks the pin this session; drives the
   // locationSource/locationVerified overrides in the save payload (spec §35).
   const [locationChanged, setLocationChanged] = useState(false);
@@ -354,6 +361,73 @@ export function AgencyProfile() {
 
   const updateField = (field: keyof AgencyInfo, value: string) => {
     setProfile((prev) => (prev ? { ...prev, [field]: value } : prev));
+  };
+
+  // Task 2-d — file pick only VALIDATES + OPENS the preview dialog now;
+  // the upload runs in handleLogoPreviewConfirm on user confirm.
+  const handleLogoPick = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // Allow re-picking the same file later
+    e.target.value = '';
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error(t('fileTooLarge'));
+      return;
+    }
+    setPendingLogoFile(file);
+    setPendingLogoUrl(URL.createObjectURL(file));
+    setLogoPreviewOpen(true);
+  };
+
+  // Task 2-d — close + cleanup (also used by the dialog's own onOpenChange).
+  const closeLogoPreview = () => {
+    setLogoPreviewOpen(false);
+    setPendingLogoFile(null);
+    if (pendingLogoUrl) URL.revokeObjectURL(pendingLogoUrl);
+    setPendingLogoUrl(null);
+  };
+
+  // Task 2-d — confirm runs the ORIGINAL upload flow (temporary profile state;
+  // persistence still happens through the Save button) and then best-effort
+  // deletes the replaced logo upload (fire-and-forget, never blocks the UX).
+  const handleLogoPreviewConfirm = async () => {
+    if (!pendingLogoFile) return;
+    setLogoUploading(true);
+    try {
+      // Capture the CURRENT logo BEFORE overwriting so the replaced upload
+      // can be removed from the server.
+      const previousLogoUrl = profile?.logoUrl || null;
+      const form = new FormData();
+      form.append('file', pendingLogoFile);
+      // Task 24 FIX: declare the upload type as a form field too —
+      // the cloud route reads formData 'type' first and previously
+      // only saw 'general'.
+      form.append('type', 'logo');
+      const uploadRes = await apiFetch('/api/upload?type=logo', { method: 'POST', body: form });
+      if (uploadRes.ok) {
+        const uploadData = await uploadRes.json();
+        updateField('logoUrl', uploadData.url);
+        toast.success(t('success'));
+        closeLogoPreview();
+        if (
+          previousLogoUrl &&
+          previousLogoUrl !== uploadData.url &&
+          previousLogoUrl.includes('/api/upload/file/')
+        ) {
+          apiFetch('/api/upload/asset', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: previousLogoUrl }),
+          }).catch(() => { /* best-effort cleanup */ });
+        }
+      } else {
+        toast.error(t('error'));
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setLogoUploading(false);
+    }
   };
 
   // Task 51-b — picker → TEMPORARY profile state (spec §28); persistence
@@ -783,32 +857,7 @@ export function AgencyProfile() {
                   ref={logoInputRef}
                   type="file"
                   accept=".jpg,.jpeg,.png,.svg,.webp"
-                  onChange={async (e) => {
-                    const file = e.target.files?.[0];
-                    if (!file) return;
-                    if (file.size > 5 * 1024 * 1024) {
-                      toast.error(t('fileTooLarge'));
-                      return;
-                    }
-                    const form = new FormData();
-                    form.append('file', file);
-                    // Task 24 FIX: declare the upload type as a form field too —
-                    // the cloud route reads formData 'type' first and previously
-                    // only saw 'general'.
-                    form.append('type', 'logo');
-                    try {
-                      const uploadRes = await apiFetch('/api/upload?type=logo', { method: 'POST', body: form });
-                      if (uploadRes.ok) {
-                        const uploadData = await uploadRes.json();
-                        updateField('logoUrl', uploadData.url);
-                        toast.success(t('success'));
-                      } else {
-                        toast.error(t('error'));
-                      }
-                    } catch {
-                      toast.error(t('error'));
-                    }
-                  }}
+                  onChange={handleLogoPick}
                   className="hidden"
                 />
                 <Button
@@ -1176,6 +1225,20 @@ export function AgencyProfile() {
           </CardContent>
         </Card>
       </motion.div>
+
+      {/* Task 2-d — logo preview: confirm here actually uploads + swaps the old file */}
+      <ImageUploadPreviewDialog
+        open={logoPreviewOpen}
+        onOpenChange={(open) => { if (!open) closeLogoPreview(); }}
+        previewUrl={pendingLogoUrl ?? ''}
+        shape="rounded"
+        title={t('imagePreviewTitle')}
+        description={t('imagePreviewDesc')}
+        confirmLabel={t('confirm')}
+        cancelLabel={t('cancel')}
+        loading={logoUploading}
+        onConfirm={handleLogoPreviewConfirm}
+      />
     </div>
   );
 }

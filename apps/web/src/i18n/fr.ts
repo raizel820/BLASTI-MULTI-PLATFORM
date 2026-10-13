@@ -538,6 +538,8 @@ const fr: Record<TranslationKeys, string> = {
   turnNotifBody: "Veuillez vous rendre au guichet de service.",
   dismissAlert: "Compris",
   fileTooLarge: "La taille du fichier dépasse 5 Mo",
+  imagePreviewTitle: "Aperçu de la nouvelle image",
+  imagePreviewDesc: "Voici comment l'image apparaîtra. La définir comme active ?",
   seconds: "Seconde",
 
   // ─── Admin Analytics ──────────────────
@@ -1109,6 +1111,17 @@ const fr: Record<TranslationKeys, string> = {
   newBalance: "Nouveau solde",
   purchaseHistory: "Historique des achats",
   noPurchases: "Pas encore d'achats",
+  // Task 2-b: purchase status chips, filters & pending stat
+  purchaseStatusApproved: "Réussie",
+  purchaseStatusPending: "En attente",
+  purchaseStatusFailed: "Échouée",
+  purchaseStatusRejected: "Rejetée",
+  purchaseFilterAll: "Tout",
+  purchaseFilterSuccess: "Réussies",
+  purchaseFilterPending: "En attente",
+  purchaseFilterFailed: "Échouées",
+  purchasePendingCount: "{count} achat(s) en attente",
+  purchaseNoResults: "Aucun achat dans cette catégorie",
   paymentSubmitted: "Paiement soumis pour vérification",
   waitingApproval: "En attente d'approbation",
   stepSelectPlan: "Choisir le plan",
@@ -2560,6 +2573,11 @@ const fr: Record<TranslationKeys, string> = {
   paymentForLabel: "Paiement pour",
   pendingCheckoutResume: "Reprendre le paiement en attente",
   continuePayment: "Continuer le paiement",
+  paymentUnverifiedTitle: "Paiement non confirmé pour l'instant",
+  paymentUnverifiedDesc: "Nous n'avons pas pu vérifier automatiquement l'état du paiement. Ne le considérez pas comme effectué — consultez votre historique d'achats ou d'abonnement pour confirmer avant de réessayer.",
+  paymentUnverifiedCta: "Voir l'historique des paiements",
+  paymentToastCompleted: "Paiement confirmé avec succès",
+  paymentToastFailed: "Le paiement n'a pas abouti",
 
   // ─── agency-fullscreen.tsx ────────────────────────────────────
   walkInAdded: "Visiteur ajouté",
