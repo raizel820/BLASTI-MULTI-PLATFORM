@@ -41,6 +41,7 @@ import {
 import { UserAvatar } from '@/components/shared/user-avatar';
 // Task 2-c-2 — manual full data resync (shared: web + Capacitor mobile + Electron desktop).
 import { FullResyncButton } from '@/components/shared/full-resync-button';
+import { AppUpdateSettingsCard } from '@/components/shared/app-update-settings-card';
 import {
   User,
   Bell,
@@ -546,6 +547,15 @@ export function CustomerSettings() {
 
         {/* ─── Notification sound (volume + custom song — Task 82) ─── */}
         <ProfileSoundSettings t={t} />
+
+        {/* ─── Updates (auto-download + Wi-Fi-only + manual check) ─── */}
+        <motion.section
+          initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.18 }}
+          aria-label={t('updateSettingsSection')}
+        >
+          <h2 className="text-sm font-semibold text-muted-foreground mb-2 px-1">{t('updateSettingsSection')}</h2>
+          <AppUpdateSettingsCard />
+        </motion.section>
 
         {/* ─── Security group (biometric login + password) ─── */}
         <motion.section

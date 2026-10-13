@@ -966,8 +966,11 @@ function getConsumerGateHTML(opts = {}) {
     .version {
       position: fixed; bottom: 14px; inset-inline-start: 0; inset-inline-end: 0;
       text-align: center;
-      font-size: 0.62rem; color: rgba(122, 133, 153, 0.6);
+      /* Version + build date are a user-facing feature (shown on every
+         launch animation) — keep them legible, not a watermark. */
+      font-size: 0.72rem; color: rgba(122, 133, 153, 0.85);
       letter-spacing: 0.4px;
+      font-variant-numeric: tabular-nums;
     }
   </style>
 </head>
@@ -991,7 +994,7 @@ function getConsumerGateHTML(opts = {}) {
     </div>
   </div>
 
-  <div class="version">BLASTI Desktop v${appVersion}</div>
+  <div class="version">BLASTI Desktop v${appVersion}${buildLabel}</div>
 
   <script>
     var MODE = ${JSON.stringify(mode)};

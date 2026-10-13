@@ -145,31 +145,58 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('window:maximized-changed', (_event, isMaximized) => callback(isMaximized));
   },
 
-  // ─── Auto-Update ───────────────────────────────────────────────────────────
+  // ─── Auto-Update (Public App Settings delivery) ────────────────────────────
 
   /**
-   * Listen for auto-update available events.
-   * In production, this would be triggered by electron-updater.
+   * Listen for pushed update events (device telemetry check-ins deliver them).
    */
   onUpdateAvailable: (callback) => {
     ipcRenderer.on('update:available', (_event, info) => callback(info));
   },
 
   /**
-   * Listen for update downloaded events.
-   * In production, triggered after electron-updater downloads an update.
+   * Listen for update downloaded events — fired by main after a successful
+   * updates:download completes.
    */
   onUpdateDownloaded: (callback) => {
-    ipcRenderer.on('update:downloaded', () => callback());
+    ipcRenderer.on('update:downloaded', (_event, payload) => callback(payload));
   },
 
   /**
-   * Trigger the installation of a downloaded update.
-   * In production, this calls autoUpdater.quitAndInstall().
+   * Listen for live download progress: { status: 'downloading'|'downloaded'|'error',
+   * percent, receivedBytes, totalBytes, error?, version }. Returns an unsubscribe.
    */
-  installUpdate: () => {
-    ipcRenderer.send('update:install');
+  onUpdateProgress: (callback) => {
+    const handler = (_event, payload) => callback(payload);
+    ipcRenderer.on('update:progress', handler);
+    return () => ipcRenderer.removeListener('update:progress', handler);
   },
+
+  /**
+   * Stateless update check against the cloud (GET /api/app-versions/check).
+   * Returns { success, updateAvailable, isMandatory, latestVersion, downloadUrl,
+   * releaseNotes*, fileSize, fileHash, ... } or { success:false, error }.
+   */
+  checkForUpdates: () => ipcRenderer.invoke('updates:check'),
+
+  /**
+   * Start downloading an installer in the main process. Payload { url, version } —
+   * url may be the relative downloadUrl (main resolves it against the cloud base).
+   * Returns { status: 'started'|'busy'|'error', ... }.
+   */
+  downloadUpdate: (payload) => ipcRenderer.invoke('updates:download', payload),
+
+  /**
+   * Install the downloaded installer: the app quits, then the NSIS installer
+   * runs silently. Returns { ok } or { ok:false, error:'no-download' }.
+   */
+  installUpdate: () => ipcRenderer.invoke('updates:install'),
+
+  /**
+   * Best-effort network classification for "auto-download on Wi-Fi only":
+   * { isWifi, connectionType: 'wifi'|'ethernet'|'unknown', isUnmetered }.
+   */
+  getNetworkInfo: () => ipcRenderer.invoke('updates:network-info'),
 
   // ─── Silent Print ───────────────────────────────────────────────────────────
 

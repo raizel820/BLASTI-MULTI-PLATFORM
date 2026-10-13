@@ -43,6 +43,31 @@ If either secret is missing, the publish job **skips with a notice** and the
 built files remain available as run artifacts
 (Actions → *Build Installers* → run → **Artifacts**, 30 days).
 
+## Changing the version (the "old version in the file name" fix)
+
+Each artifact name reads its version from a DIFFERENT file — that is why
+bumping one `package.json` used to leave installers named with the old
+version:
+
+| Artifact | Version source |
+|---|---|
+| `BLASTI-Setup-<x.y.z>.exe` (Windows) | `apps/desktop/package.json` → `version` |
+| `BLASTI-v<x.y.z>-debug.apk` (Android) | `apps/mobile/package.json` → `version` (synced into `android/app/build.gradle` `versionName`/`versionCode` by `scripts/gradle.js` before every build) |
+| API self-report (`GET /api/health`) | `apps/api/package.json` → `version` (read live by `apps/api/src/index.ts`) |
+| Mobile launch-animation version badge | Same `versionName` (via the Capacitor Device plugin) |
+| Desktop launch-animation version label | `apps/desktop/package.json` (plus the `build-stamp.json` build date) |
+
+**One command bumps everything and keeps the names in sync:**
+
+```bash
+bun run version:set 1.2.3     # writes every package.json + build.gradle
+bun run version:check         # audit the current version map
+```
+
+Commit + push to master → CI builds `BLASTI-Setup-1.2.3.exe` and
+`BLASTI-v1.2.3-debug.apk` → the publish job registers AppVersion `1.2.3` as
+a DRAFT in **Admin → Public Apps Settings** → click **Activate**.
+
 ## Manual upload (local machine or VPS)
 
 ```bash

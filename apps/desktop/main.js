@@ -1761,20 +1761,176 @@ ipcMain.on('offline:retry', () => {
   if (mainWindow) loadApp();
 });
 
-// Auto-update handler — Public App Settings rebuild: when the cloud pushed
-// an update (device telemetry delivered an update payload), 'update:install'
-// opens the exact installer download in the user's browser. A full in-app
-// electron-updater flow can layer on later; the pushed downloadUrl IS the
-// real install path today.
+// ─── App Update Delivery (Public App Settings → desktop client) ─────────────
+// Full in-app update flow requested by the Public App Settings rebuild:
+//   • updates:check         → PUBLIC GET /api/app-versions/check (platform+version)
+//   • updates:download      → streams the installer to <userData>/updates/ with
+//                             live progress events on 'update:progress' and a
+//                             final 'update:downloaded' event (preload exposes both)
+//   • updates:install       → runs the downloaded NSIS installer AFTER this app
+//                             has fully quit (cmd waits 4s → silent /S install)
+//   • updates:network-info  → best-effort Wi-Fi detection for "auto-download
+//                             only on Wi-Fi" (unknown → treated as Wi-Fi)
+// The legacy 'update:install' channel stays wired: it now prefers a locally
+// downloaded installer and only falls back to opening the pushed URL.
+const os = require('os');
+
+const UPDATE_PLATFORM = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'mac' : 'linux';
+const UPDATES_DIR = () => path.join(app.getPath('userData'), 'updates');
+let activeUpdateDownload = null; // { version, url, dest } while running
+let lastDownloadedInstaller = null; // absolute path of the last completed download
+
+function sendUpdateProgress(payload) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    try { if (!win.isDestroyed()) win.webContents.send('update:progress', payload); } catch { /* window gone */ }
+  }
+}
+
+function resolveUpdateUrl(url) {
+  let u = String(url || '').trim();
+  if (!u) return '';
+  if (!/^https?:\/\//i.test(u)) {
+    const base = (process.env.BLASTI_CLOUD_URL || CLOUD_BASE_URL || '').replace(/\/+$/, '');
+    if (base) u = base + (u.startsWith('/') ? u : '/' + u);
+  }
+  return u;
+}
+
+ipcMain.handle('updates:check', async () => {
+  try {
+    const base = (process.env.BLASTI_CLOUD_URL || CLOUD_BASE_URL || '').replace(/\/+$/, '');
+    if (!base) return { success: false, error: 'no-cloud-url' };
+    const url = `${base}/api/app-versions/check?platform=${UPDATE_PLATFORM}&version=${encodeURIComponent(app.getVersion())}`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    const res = await fetch(url, { signal: ctrl.signal, headers: { accept: 'application/json' } });
+    clearTimeout(timer);
+    if (!res.ok) return { success: false, error: `http-${res.status}` };
+    const data = await res.json();
+    console.log('[BLASTI Desktop] updates:check →', data && data.updateAvailable
+      ? `v${data.currentVersion} → v${data.latestVersion} (mandatory: ${data.isMandatory})` : 'up to date');
+    return data;
+  } catch (err) {
+    console.warn('[BLASTI Desktop] updates:check failed:', err && err.message);
+    return { success: false, error: (err && err.message) || 'check-failed' };
+  }
+});
+
+ipcMain.handle('updates:download', async (_e, payload) => {
+  const { url, version } = payload || {};
+  const resolved = resolveUpdateUrl(url);
+  if (!resolved) return { status: 'error', error: 'missing-url' };
+  if (activeUpdateDownload) return { status: 'busy', version: activeUpdateDownload.version };
+
+  const fileName = path.basename(resolved.split('?')[0]) || `BLASTI-Setup-${version || 'update'}.exe`;
+  const dest = path.join(UPDATES_DIR(), /^BLASTI-Setup-.*\.exe$/i.test(fileName) ? fileName : `BLASTI-Setup-${version || 'update'}.exe`);
+  try { fs.mkdirSync(path.dirname(dest), { recursive: true }); } catch { /* exists */ }
+
+  activeUpdateDownload = { version: version || '', url: resolved, dest };
+  console.log('[BLASTI Desktop] updates:download →', resolved, '→', dest);
+  (async () => {
+    let lastSentPercent = -1;
+    let lastSentAt = 0;
+    try {
+      const res = await fetch(resolved, { redirect: 'follow' });
+      if (!res.ok) throw new Error(`http-${res.status}`);
+      const total = Number(res.headers.get('content-length') || 0);
+      let received = 0;
+      const fileStream = fs.createWriteStream(dest);
+      const nodeStream = require('stream').Readable.fromWeb(res.body);
+      await new Promise((resolveP, rejectP) => {
+        nodeStream.on('data', (chunk) => {
+          received += chunk.length;
+          fileStream.write(chunk);
+          const percent = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0;
+          const now = Date.now();
+          if (percent !== lastSentPercent && (now - lastSentAt > 250 || percent === 100)) {
+            lastSentPercent = percent;
+            lastSentAt = now;
+            sendUpdateProgress({ status: 'downloading', percent, receivedBytes: received, totalBytes: total, version: activeUpdateDownload.version });
+          }
+        });
+        nodeStream.on('error', rejectP);
+        fileStream.on('error', rejectP);
+        nodeStream.on('end', () => fileStream.end(resolveP));
+      });
+      lastDownloadedInstaller = dest;
+      sendUpdateProgress({ status: 'downloaded', percent: 100, receivedBytes: received, totalBytes: total, filePath: dest, version: activeUpdateDownload.version });
+      for (const win of BrowserWindow.getAllWindows()) {
+        try { if (!win.isDestroyed()) win.webContents.send('update:downloaded', { filePath: dest, version: activeUpdateDownload.version }); } catch { /* window gone */ }
+      }
+      console.log('[BLASTI Desktop] update downloaded:', dest, `(${received} bytes)`);
+    } catch (err) {
+      console.warn('[BLASTI Desktop] update download failed:', err && err.message);
+      sendUpdateProgress({ status: 'error', error: (err && err.message) || 'download-failed', version: activeUpdateDownload ? activeUpdateDownload.version : '' });
+      try { fs.unlinkSync(dest); } catch { /* nothing to clean */ }
+    } finally {
+      activeUpdateDownload = null;
+    }
+  })();
+  return { status: 'started', dest };
+});
+
+function runInstallerAndQuit() {
+  const installer = lastDownloadedInstaller || (() => {
+    try {
+      const files = fs.readdirSync(UPDATES_DIR()).filter((f) => /\.(exe|dmg|appimage|deb)$/i.test(f))
+        .map((f) => ({ f, t: fs.statSync(path.join(UPDATES_DIR(), f)).mtimeMs }))
+        .sort((a, b) => b.t - a.t);
+      return files.length ? path.join(UPDATES_DIR(), files[0].f) : null;
+    } catch { return null; }
+  })();
+  if (!installer || !fs.existsSync(installer)) return { ok: false, error: 'no-download' };
+  console.log('[BLASTI Desktop] updates:install → quitting and running:', installer);
+  if (process.platform === 'win32') {
+    // NSIS: give this app up to 4s to fully exit, then run the installer
+    // silently (/S — same per-user settings, data preserved on update).
+    const child = require('child_process').spawn('cmd.exe',
+      ['/c', `timeout /t 4 /nobreak >nul && "${installer}" /S`],
+      { detached: true, stdio: 'ignore', windowsHide: true, cwd: os.tmpdir() });
+    child.on('error', (err) => console.warn('[BLASTI Desktop] installer spawn failed:', err.message));
+    child.unref();
+  } else {
+    try { require('child_process').spawn('xdg-open', [installer], { detached: true, stdio: 'ignore' }).unref(); } catch { shell.openPath(installer); }
+  }
+  setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 300);
+  return { ok: true };
+}
+
+ipcMain.handle('updates:install', async () => runInstallerAndQuit());
+
+ipcMain.handle('updates:network-info', () => {
+  // Best-effort Wi-Fi/metered classification for "auto-download on Wi-Fi only".
+  // Uncertainty NEVER blocks a download (isWifi defaults true when unknown).
+  try {
+    const ifaces = os.networkInterfaces() || {};
+    let wifi = false;
+    let ethernet = false;
+    for (const [name, addrs] of Object.entries(ifaces)) {
+      const active = (addrs || []).some((a) => !a.internal && (a.family === 'IPv4' || a.family === 4));
+      if (!active) continue;
+      const n = String(name).toLowerCase();
+      if (/wi-?fi|wlan|wl[pxs]?[0-9]*/.test(n)) wifi = true;
+      else if (/eth|en[0-9]|eno|ens/.test(n)) ethernet = true;
+    }
+    return { isWifi: wifi || (!wifi && !ethernet), connectionType: wifi ? 'wifi' : ethernet ? 'ethernet' : 'unknown', isUnmetered: true };
+  } catch {
+    return { isWifi: true, connectionType: 'unknown', isUnmetered: true };
+  }
+});
+
+// Legacy channel (older renderer builds): prefer the local installer; fall
+// back to opening the pushed downloadUrl in the browser as before.
 ipcMain.on('update:install', () => {
   try {
+    const haveLocal = lastDownloadedInstaller && fs.existsSync(lastDownloadedInstaller);
+    if (haveLocal) {
+      runInstallerAndQuit();
+      return;
+    }
     const telemetry = require('./device-telemetry');
     const payload = telemetry.getLastUpdatePayload();
-    const base = process.env.BLASTI_CLOUD_URL || '';
-    let url = payload && payload.downloadUrl ? String(payload.downloadUrl) : '';
-    if (url && !/^https?:\/\//i.test(url) && base) {
-      url = base.replace(/\/+$/, '') + (url.startsWith('/') ? url : '/' + url);
-    }
+    const url = resolveUpdateUrl(payload && payload.downloadUrl);
     if (url) {
       console.log('[BLASTI Desktop] update:install → opening installer download:', url);
       shell.openExternal(url);

@@ -30,6 +30,7 @@ const REDUCED_MS = 900;
 
 export function AppIntroAnimation() {
   const [visible, setVisible] = useState(false);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const reduceMotion = useReducedMotion();
 
   useEffect(() => {
@@ -56,6 +57,30 @@ export function AppIntroAnimation() {
     const timer = window.setTimeout(() => setVisible(false), total);
     return () => window.clearTimeout(timer);
   }, [reduceMotion]);
+
+  // Version badge (user request: show the app version on the launch
+  // animation). The native shell injects the @capacitor/device plugin;
+  // getInfo() returns appVersion = the Android versionName — the SAME value
+  // the APK file name and the update system use. Zero @capacitor imports
+  // (apps/web does not depend on them) — probed defensively like
+  // device-report.ts does. Plain-browser previews (?intro=1) simply never
+  // resolve a version and the badge stays hidden.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const cap = (window as unknown as {
+      Capacitor?: { getPlugins?: (name: string) => Record<string, { getInfo?: () => Promise<{ appVersion?: string }> }> };
+    }).Capacitor;
+    try {
+      const info = cap?.getPlugins?.('Device');
+      info?.getInfo?.()
+        .then((res) => {
+          if (res && typeof res.appVersion === 'string' && res.appVersion.trim()) {
+            setAppVersion(res.appVersion.trim());
+          }
+        })
+        .catch(() => { /* older shell — badge stays hidden */ });
+    } catch { /* no bridge — badge stays hidden */ }
+  }, []);
 
   return (
     <AnimatePresence>
@@ -108,6 +133,17 @@ export function AppIntroAnimation() {
             >
               بلاصتي
             </motion.p>
+            {appVersion && (
+              <motion.p
+                className="mt-3 text-xs font-semibold uppercase tracking-[0.22em] text-emerald-600/80"
+                dir="ltr"
+                initial={reduceMotion ? undefined : { opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={reduceMotion ? undefined : { delay: 2.25, duration: 0.45 }}
+              >
+                v{appVersion}
+              </motion.p>
+            )}
           </motion.div>
         </motion.div>
       )}

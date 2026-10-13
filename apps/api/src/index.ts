@@ -16,6 +16,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
+import { readFileSync } from 'fs'
 import os from 'os'
 import { Server as SocketIOServer } from 'socket.io'
 import type { Socket } from 'socket.io'
@@ -44,6 +45,16 @@ import {
   invalidateResponseCacheTag,
   responseCacheStats,
 } from './lib/response-cache'
+
+// ─── API version — single source of truth ──────────────────────────────────
+// Read live from apps/api/package.json. This was previously hardcoded as
+// '0.2.1' in FOUR places below, which is exactly how "I bumped the version
+// but /api/health still reports the old one" happened. Bump the version with
+//   bun run version:set x.y.z
+// (scripts/version-set.js updates every package.json in the monorepo).
+const API_VERSION = (
+  JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')) as { version: string }
+).version
 
 // ─── Route Modules ──────────────────────────────────────────────────────────
 
@@ -486,7 +497,7 @@ app.onError((err, c) => {
 app.get('/', (c) => {
   return c.json({
     name: '@blasti/api',
-    version: '0.2.1',
+    version: API_VERSION,
     description: 'BLASTI Headless Backend Server',
     endpoints: {
       health: 'GET /health',
@@ -503,7 +514,7 @@ app.get('/health', (c) => {
   return c.json({
     status: 'ok',
     service: '@blasti/api',
-    version: '0.2.1',
+    version: API_VERSION,
     bootId: BOOT_ID,
     sync: SYNC_HEALTH,
     connections: io?.engine?.clientsCount ?? 0,
@@ -523,7 +534,7 @@ app.get('/health', (c) => {
 app.get('/api/health', (c) => c.json({
   status: 'ok',
   service: '@blasti/api',
-  version: '0.2.1',
+  version: API_VERSION,
   bootId: BOOT_ID,
   sync: SYNC_HEALTH,
   uptime: Math.floor(process.uptime()),
@@ -605,7 +616,7 @@ app.get('/api/discover', (c) => {
   }
   return c.json({
     service: 'blasti-lan',
-    version: '0.2.1',
+    version: API_VERSION,
     name: 'BLASTI Server',
     hostname,
     ip,

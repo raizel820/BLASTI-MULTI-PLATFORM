@@ -28,6 +28,7 @@ import { syncEngine } from '@/db/sync';
 import { useDatabase, useDatabaseReady } from '@/db/provider';
 import { useLanguage } from '@/hooks/use-language';
 import { diag, diagReset } from '@/lib/diag-log';
+import { useAppUpdateStore } from '@/store/use-app-update-store';
 
 const MIN_DISPLAY_MS = 900;
 const DB_WAIT_CAP_MS = 6000;
@@ -66,6 +67,10 @@ export function BootGate({ onDone }: { onDone: () => void }) {
       // Record WHY the gate released — the "waiting for syncing" splash
       // releasing before the sync finished is diagnosed from this event.
       diag('boot-gate-release', { reason, elapsedMs: Date.now() - startedAt });
+      // App-update delivery: one update check per sync cycle (throttled in
+      // the store; no-ops on plain web). The check is PUBLIC — works even
+      // when this boot has no session yet.
+      try { void useAppUpdateStore.getState().check('sync'); } catch { /* never block boot */ }
       // Respect the minimum display time so fast boots don't flash.
       const remaining = Math.max(0, MIN_DISPLAY_MS - (Date.now() - startedAt));
       timers.push(setTimeout(() => {

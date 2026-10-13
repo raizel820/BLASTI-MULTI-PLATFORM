@@ -196,6 +196,13 @@ app.get('/check', async (c) => {
       releaseNotes: latestVersion?.releaseNotes ?? '',
       releaseNotesAr: latestVersion?.releaseNotesAr ?? '',
       releaseNotesFr: latestVersion?.releaseNotesFr ?? '',
+      // App-update delivery (desktop in-app downloader + Android APK install):
+      // file metadata so clients can render progress + verify before install.
+      fileSize: updateAvailable ? (latestVersion?.fileSize ?? 0) : 0,
+      fileHash: updateAvailable ? (latestVersion?.fileHash ?? '') : '',
+      fileName: updateAvailable ? (latestVersion?.fileName ?? '') : '',
+      isPatch: updateAvailable ? (latestVersion?.isPatch ?? false) : false,
+      minAppVersion: updateAvailable ? (latestVersion?.minAppVersion ?? '') : '',
     })
   } catch (error: unknown) {
     return c.json({ success: false, error: 'Update check failed' }, 500)

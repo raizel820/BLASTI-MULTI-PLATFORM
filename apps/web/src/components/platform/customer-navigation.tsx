@@ -31,6 +31,8 @@ import { type TranslationKeys } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { usePlatform } from '@/hooks/use-platform';
 import { nativeBridge } from '@/lib/native-bridge';
+import { useAppUpdateStore } from '@/store/use-app-update-store';
+import { runManualUpdateCheck } from '@/components/shared/app-update-manager';
 import { ConnectionDot } from '@/components/shared/connection-status';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
@@ -65,6 +67,7 @@ import {
   BarChart3,
   LifeBuoy,
   Search,
+  RefreshCw,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 
@@ -335,8 +338,15 @@ function CustomerMobileBottomNav({ currentView, setView, unreadCount, user, logo
   t: (key: TranslationKeys, params?: Record<string, string>) => string;
 }) {
   const { mainItems, searchItem, moreItems } = useNavItems(t);
+  const { lang } = useLanguage();
   const [moreOpen, setMoreOpen] = useState(false);
   const searchActive = currentView === searchItem.view;
+  // App-update delivery — More-sheet row (mirrors the agency sidebar footer):
+  // "Check for updates", turning into "Update now" after a postponed update.
+  const updateChecking = useAppUpdateStore((s) => s.checking);
+  const updatePostponedPending = useAppUpdateStore(
+    (s) => s.status === 'available' && !!s.postponedVersion && s.info?.version === s.postponedVersion,
+  );
 
   const handleMoreNav = (view: MoreView['view']) => {
     setMoreOpen(false);
@@ -481,6 +491,17 @@ function CustomerMobileBottomNav({ currentView, setView, unreadCount, user, logo
                     <PlatformSwitcher />
                   </div>
                 )}
+
+                {/* App-update manual check / update now */}
+                <button
+                  onClick={() => { void runManualUpdateCheck(lang); }}
+                  className="w-full flex items-center gap-3 px-3 h-11 rounded-xl hover:bg-muted dark:hover:bg-gray-800 transition-colors"
+                >
+                  <RefreshCw className={`h-[18px] w-[18px] text-emerald-600 dark:text-emerald-400 ${updateChecking ? 'animate-spin' : ''}`} />
+                  <span className="text-sm font-medium text-foreground">
+                    {updateChecking ? t('updateChecking') : updatePostponedPending ? t('updateNow') : t('updateCheckForUpdates')}
+                  </span>
+                </button>
               </div>
 
               <div className="h-px bg-border mx-5" />

@@ -56,6 +56,7 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { BiometricSettingsCard } from '@/components/shared/biometric-settings';
+import { AppUpdateSettingsCard } from '@/components/shared/app-update-settings-card';
 // Task 83-b — agency location editor (map picker + Algeria address selectors).
 import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
 import { WilayaSelect, CommuneSelect } from '@/components/shared/algeria-location-selects';
@@ -1627,6 +1628,10 @@ export function AgencySettings() {
                           <Separator />
                           {/* Account-level action — shared component, same for every role/shell */}
                           <FullResyncButton />
+                          <Separator />
+                          {/* App-update delivery — auto-download + Wi-Fi-only + manual check */}
+                          <p className="text-xs text-muted-foreground">{t('updateSettingsSection')}</p>
+                          <AppUpdateSettingsCard />
                         </div>
                       )}
 
