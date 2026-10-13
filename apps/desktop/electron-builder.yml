@@ -25,6 +25,11 @@ files:
   # from this allowlist — dev ran fine (real file on disk) but the packaged app
   # crashed with "Cannot find module './load-env'" on first launch.
   - load-env.js
+  # Public App Settings rebuild: device install telemetry. main.js requires it
+  # lazily (launch registration + 6h heartbeat + update polling). Same failure
+  # class as load-env.js — dev works, packaged app would crash with
+  # "Cannot find module './device-telemetry'" on first launch.
+  - device-telemetry.js
   - package.json
   - build-stamp.json
   - local-api/**/*
