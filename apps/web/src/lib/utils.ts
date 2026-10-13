@@ -97,6 +97,48 @@ export function getProxiedUrl(url: string | null | undefined): string {
     const parsed = new URL(raw, window.location.origin);
     const isHttp = parsed.protocol === 'http:' || parsed.protocol === 'https:';
     const isFileApiPath = isRelativeFileApiPath || isBinaryApiPath(parsed.pathname);
+    // Uploaded blobs ONLY (avatars/logos/receipts/documents) — installers
+    // (/api/app-versions/*) have their own working per-shell flow and must
+    // not be re-routed here.
+    const isUploadFilePath =
+      raw.startsWith('/api/upload/file/') || parsed.pathname.includes('/api/upload/file/');
+
+    // ── Packaged Electron shell — uploaded-file placeholder fix ──────────
+    // The packaged UI is served by the EMBEDDED LOCAL API from
+    // http://127.0.0.1:3080 (apps/desktop/main.js PROD_URL). The shell CSP
+    // (img-src) only allows 'self' + localhost origins, and the cloud API
+    // port (:3003) is typically firewalled — so a stored ABSOLUTE cloud URL
+    // (http://<vps>:3003/api/upload/file/...) was BOTH CSP-blocked and
+    // usually unreachable. Every uploaded avatar/logo rendered its initials
+    // placeholder across the whole desktop app.
+    //
+    // Fix: in the packaged shell, aim EVERY upload-file URL (relative legacy
+    // rows included) at the LOCAL API origin — it serves already-synced
+    // blobs instantly (offline included) and falls back to a CLOUD PROXY
+    // for anything not downloaded yet (local-api serveLocalFile).
+    const pageOrigin = window.location.origin;
+    const isPackagedShellOrigin =
+      pageOrigin === 'http://127.0.0.1:3080' || pageOrigin === 'http://localhost:3080';
+    if (isElectronShell() && isPackagedShellOrigin && isUploadFilePath) {
+      return `${pageOrigin}${raw.startsWith('/') ? raw : `${parsed.pathname}${parsed.search}`}`;
+    }
+
+    // ── Capacitor (mobile app) — same placeholder bug class ─────────────
+    // The WebView origin is the device itself. Only localhost-stored URLs
+    // used to be rebased; cloud-ABSOLUTE urls (http://<vps>:3003/...) passed
+    // through raw and were blocked by Android cleartext policy / iOS ATS or
+    // simply unreachable (firewalled :3003) — placeholder everywhere in the
+    // mobile app. Rebase EVERY upload-file URL onto the cloud base the
+    // native resolver actually reached — the same base the app's successful
+    // fetch()/upload calls already use, so images ride a proven-reachable
+    // origin. Unconfigured resolver → fall through to the legacy branches.
+    if (isCapacitorShell() && isUploadFilePath) {
+      const nativeBase = getNativeCloudUrl();
+      if (nativeBase) {
+        const suffix = raw.startsWith('/') ? raw : `${parsed.pathname}${parsed.search}`;
+        return `${nativeBase.replace(/\/+$/, '')}${suffix}`;
+      }
+    }
 
     if (isDirectReachablePageHost(pageHost)) {
       // Capacitor: the WebView origin is the device itself — a stored

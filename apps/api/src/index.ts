@@ -84,6 +84,8 @@ import { adminDbRoutes } from './routes/admin-db'
 // Storage Manager — SUPER_ADMIN file-store console (sidebar "Storage Manager")
 import { adminStorageRoutes } from './routes/admin-storage'
 import { appVersionRoutes } from './routes/app-versions'
+// Public App Settings rebuild — real device install tracking + update pusher
+import { appInstallRoutes } from './routes/app-installs'
 import { systemStatusRoutes } from './routes/system-status'
 // Task 54-a — doc-2 role-scoped analytics (staff + customer modules)
 import { staffAnalyticsRoutes } from './routes/staff-analytics'
@@ -676,6 +678,8 @@ app.route('/api/agency-devices', agencyDeviceRoutes)
 // Task 42-b — user-created agency fields/industries (global dictionary).
 app.route('/api/agency-categories', agencyCategoriesRoutes)
 app.route('/api/app-versions', appVersionRoutes)
+// Public App Settings rebuild — device telemetry + update pusher
+app.route('/api/app-installs', appInstallRoutes)
 app.route('/api/system', systemStatusRoutes)
 // Task 54-a — role-scoped analytics modules (doc-2 spec §29-44)
 app.route('/api/staff/analytics', staffAnalyticsRoutes)

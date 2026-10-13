@@ -1761,10 +1761,29 @@ ipcMain.on('offline:retry', () => {
   if (mainWindow) loadApp();
 });
 
-// Auto-update handlers (placeholder — requires electron-updater in production)
+// Auto-update handler — Public App Settings rebuild: when the cloud pushed
+// an update (device telemetry delivered an update payload), 'update:install'
+// opens the exact installer download in the user's browser. A full in-app
+// electron-updater flow can layer on later; the pushed downloadUrl IS the
+// real install path today.
 ipcMain.on('update:install', () => {
-  // In production, this would call autoUpdater.quitAndInstall()
-  console.log('[BLASTI Desktop] Update install requested — electron-updater not configured');
+  try {
+    const telemetry = require('./device-telemetry');
+    const payload = telemetry.getLastUpdatePayload();
+    const base = process.env.BLASTI_CLOUD_URL || '';
+    let url = payload && payload.downloadUrl ? String(payload.downloadUrl) : '';
+    if (url && !/^https?:\/\//i.test(url) && base) {
+      url = base.replace(/\/+$/, '') + (url.startsWith('/') ? url : '/' + url);
+    }
+    if (url) {
+      console.log('[BLASTI Desktop] update:install → opening installer download:', url);
+      shell.openExternal(url);
+    } else {
+      console.log('[BLASTI Desktop] update:install — no pushed download URL available');
+    }
+  } catch (err) {
+    console.warn('[BLASTI Desktop] update:install failed:', err && err.message);
+  }
 });
 
 // LAN server info IPC — returns connection details for the local LAN server
@@ -2585,6 +2604,17 @@ app.whenReady().then(async () => {
   // discover this machine on the LAN via UDP :3081 without any port scan.
   try { startLanBeacon(); } catch (beaconErr) {
     console.warn('[BLASTI Desktop] Discovery beacon failed to start (non-fatal):', beaconErr && beaconErr.message);
+  }
+
+  // Device install telemetry (Public App Settings rebuild): registers this
+  // MACHINE with the cloud (stable fingerprint survives updates/reinstalls →
+  // accurate device counts) and heartbeats every 6h. Pushed updates are
+  // forwarded to the renderer as 'update:available'.
+  try {
+    const telemetry = require('./device-telemetry');
+    telemetry.startDeviceTelemetry();
+  } catch (telErr) {
+    console.warn('[BLASTI Desktop] Device telemetry failed to start (non-fatal):', telErr && telErr.message);
   }
 
   // Task 49: the WINDOW is created FIRST — it is the primary user surface and

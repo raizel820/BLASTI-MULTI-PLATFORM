@@ -45,6 +45,7 @@
 import { useEffect } from 'react';
 import { initMobilePushRegistration } from '@/lib/push-registration';
 import { initNativeBackHandler } from '@/lib/native-back-handler';
+import { startDeviceReporting } from '@/lib/device-report';
 
 const CHUNK_RELOAD_KEY = 'blasti-chunk-reload-at';
 const CHUNK_RELOAD_COOLDOWN_MS = 15000;
@@ -68,6 +69,13 @@ export function ClientBootHardening() {
     initNativeBackHandler().catch((error) => {
       console.warn('[BootHardening] Native back-button handler failed:', error);
     });
+
+    // ── 0c. Device install reporting (Capacitor only; no-op elsewhere) ───
+    // Public App Settings rebuild — the phone install registers itself with
+    // the cloud (stable fingerprint survives reinstalls → one device counts
+    // exactly once) and heartbeats on every resume so the admin Devices tab
+    // shows REAL active-device numbers. Fire-and-forget, silent failures.
+    const stopDeviceReporting = startDeviceReporting();
 
     // ── 1. Legacy service worker cleanup ──────────────────────────────────
     (async () => {
@@ -139,6 +147,7 @@ export function ClientBootHardening() {
     return () => {
       window.removeEventListener('unhandledrejection', onUnhandledRejection);
       window.removeEventListener('error', onErrorEvent);
+      if (stopDeviceReporting) stopDeviceReporting();
     };
   }, []);
 

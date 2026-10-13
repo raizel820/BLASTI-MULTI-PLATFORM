@@ -138,6 +138,18 @@ export function DesktopAgencyLogin() {
       }
     } catch { /* router unavailable — the periodic views still recover */ }
   }, [router])
+  // The Electron window ALWAYS boots on the standalone /agency/login route
+  // (main.js START_PATH), where the Home ViewRouter is not mounted. A bare
+  // setView('register') from the "Create account" link only mutated store
+  // state + hash — nothing re-rendered and the sign-in card just sat there
+  // (the account-creation dialog never opened). Mirror the post-login
+  // navigateToConsole() flow: flip the view, then hand control to the SPA
+  // root (same contract as the /auth/register redirect helper) so the
+  // agency-only register form actually renders.
+  const openRegisterView = useCallback(() => {
+    setView('register')
+    navigateToConsole()
+  }, [setView, navigateToConsole])
   const { t, lang } = useLanguage()
   const c = COPY[lang === 'en' ? 'en' : 'ar']
 
@@ -675,7 +687,7 @@ export function DesktopAgencyLogin() {
                     <span className="text-muted-foreground">{c.noAccount} </span>
                     <button
                       type="button"
-                      onClick={() => setView('register')}
+                      onClick={openRegisterView}
                       className="font-semibold text-emerald-700 dark:text-emerald-400 hover:underline"
                     >
                       {c.createAccount}

@@ -16,11 +16,30 @@ export interface ResolvedProviderConfig {
   provider: string
   enabled: boolean
   apiKey: string
+  /** false when the STORED secret is an encrypted envelope that no longer
+   *  decrypts with the current ENCRYPTION_KEY (secret rotated / DB restored
+   *  elsewhere). The unreadable ciphertext must NEVER be sent to the provider
+   *  as a credential — services surface a precise "re-enter and save" error
+   *  instead of the provider's generic 401 "invalid key". */
+  apiKeyReadable: boolean
   senderId: string
   phoneNumberId: string
   accountId: string
   apiUrl: string
   extra: Record<string, string>
+}
+
+/** Shape of OUR own encrypted envelopes (lib/encryption.ts) — used to tell
+ *  "ciphertext that no longer decrypts" apart from a legacy plaintext key. */
+function looksLikeEncryptedEnvelope(value: string): boolean {
+  const v = value.trim()
+  if (!v.startsWith('{')) return false
+  try {
+    const o = JSON.parse(v) as Record<string, unknown>
+    return typeof o.iv === 'string' && typeof o.data === 'string' && typeof o.authTag === 'string'
+  } catch {
+    return false
+  }
 }
 
 /** extraConfig keys that must be encrypted at rest */
@@ -61,11 +80,18 @@ export async function getProviderConfig(channel: Channel): Promise<ResolvedProvi
   }
 
   let apiKey = row.apiKey
+  let apiKeyReadable = true
   if (apiKey) {
     try {
       apiKey = decrypt(apiKey)
     } catch {
-      // Legacy plaintext key — keep as-is
+      if (looksLikeEncryptedEnvelope(apiKey)) {
+        // Encrypted with a DIFFERENT/rotated ENCRYPTION_KEY — unreadable.
+        // Blank it out so no service ever sends ciphertext as a credential.
+        apiKey = ''
+        apiKeyReadable = false
+      }
+      // else: legacy plaintext key — keep as-is
     }
   }
 
@@ -75,6 +101,7 @@ export async function getProviderConfig(channel: Channel): Promise<ResolvedProvi
     provider: row.provider,
     enabled: row.enabled,
     apiKey,
+    apiKeyReadable,
     senderId: row.senderId,
     phoneNumberId: row.phoneNumberId,
     accountId: row.accountId,
@@ -103,6 +130,7 @@ export async function getResolvedConfig(channel: Channel): Promise<ResolvedProvi
     provider: stored?.provider ?? registry.id,
     enabled: stored?.enabled ?? false,
     apiKey: stored?.apiKey || envKey[channel] || '',
+    apiKeyReadable: stored ? stored.apiKeyReadable || !stored.apiKey : true,
     senderId: stored?.senderId || '',
     phoneNumberId: stored?.phoneNumberId || '',
     accountId: stored?.accountId || '',
@@ -184,6 +212,7 @@ export async function getProviderConfigMasked(channel: Channel) {
     enabled: resolved?.enabled ?? false,
     apiKey: resolved?.apiKey ? maskApiKey(resolved.apiKey) : '',
     hasApiKey: Boolean(resolved?.apiKey),
+    apiKeyUnreadable: resolved?.apiKeyReadable === false,
     senderId: resolved?.senderId ?? '',
     phoneNumberId: resolved?.phoneNumberId ?? '',
     accountId: resolved?.accountId ?? '',

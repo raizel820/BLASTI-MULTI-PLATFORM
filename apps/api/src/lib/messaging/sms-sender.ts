@@ -76,6 +76,16 @@ function mapEsmsError(httpStatus: number, raw: string): string {
 export async function sendSmsViaProvider(phoneNumber: string, message: string): Promise<SendSmsProviderResult> {
   const config = await getResolvedConfig('SMS')
 
+  // A stored credential that no longer decrypts (rotated ENCRYPTION_KEY) is
+  // NEVER sent to the gateway — the operator gets an actionable error that
+  // names the actual fix instead of a misleading provider-side 401.
+  if (config.apiKeyReadable === false) {
+    return {
+      success: false,
+      error: 'Stored SMS API key is unreadable — the server encryption secret changed since it was saved. Re-enter the API key in Admin → Providers and save, then test again.',
+    }
+  }
+
   if (!config.enabled || !config.apiKey) {
     if (isDevMode()) {
       console.log(`[sms:dev-simulate] to=${phoneNumber}\n${message}`)
@@ -153,6 +163,12 @@ function extractBalance(json: Record<string, unknown>): { balance?: unknown; cur
  */
 export async function getEsmsBalance(): Promise<ConnectionCheckResult> {
   const config = await getResolvedConfig('SMS')
+  if (config.apiKeyReadable === false) {
+    return {
+      ok: false,
+      error: 'Stored API key is unreadable — the server encryption secret changed since it was saved. Re-enter the API key and save, then test again.',
+    }
+  }
   if (!config.apiKey) {
     return { ok: false, error: 'SMS_NOT_CONFIGURED — no API key stored' }
   }
@@ -163,7 +179,14 @@ export async function getEsmsBalance(): Promise<ConnectionCheckResult> {
     })
     const raw = await res.text()
     if (res.status === 401 || res.status === 403) {
-      return { ok: false, error: 'Invalid API key — eSMS Africa rejected the credential', responseRaw: raw.slice(0, 400) }
+      // Include the gateway's own answer — it distinguishes "key revoked",
+      // "wrong environment" (live vs test) and "key disabled" at a glance.
+      const hint = raw.trim().slice(0, 160)
+      return {
+        ok: false,
+        error: `Invalid API key — eSMS Africa rejected the stored credential (HTTP ${res.status}). Re-enter the API key in the provider form, save, then test again.${hint ? ` Gateway said: ${hint}` : ''}`,
+        responseRaw: raw.slice(0, 400),
+      }
     }
     if (!res.ok) {
       return { ok: false, error: mapEsmsError(res.status, raw), responseRaw: raw.slice(0, 400) }

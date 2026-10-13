@@ -129,6 +129,66 @@ public class BlastiNativeStatus extends Plugin {
         call.resolve(result);
     }
 
+    /**
+     * Stable device identity for install tracking (Public App Settings).
+     *
+     * Returns the Widevine MediaDrm device ID — an OS-level identity that
+     * SURVIVES uninstall → reinstall cycles and needs NO runtime permission.
+     * ANDROID_ID alone is regenerated on every reinstall (Android 8+), so it
+     * is only a last-resort fallback: the cloud dedupes devices by the hash
+     * of this value, so a stable source here is what keeps one physical
+     * phone counted exactly once.
+     *
+     * Also returns the app's own versionName so the phone reports the exact
+     * installed version for per-version active-device tracking.
+     */
+    @PluginMethod
+    public void getStableDeviceId(PluginCall call) {
+        JSObject result = new JSObject();
+        String stableId = "";
+        String source = "unavailable";
+        try {
+            // Widevine UUID: edef8ba9-79d6-4ace-a3c8-27dcd51d21ed
+            java.util.UUID WIDEVINE_UUID = new java.util.UUID(0xEDEF8BA979D64ACEL, 0xA3C827DCD51D21EDL);
+            android.media.MediaDrm mediaDrm = new android.media.MediaDrm(WIDEVINE_UUID);
+            byte[] drmId = mediaDrm.getPropertyByteArray(android.media.MediaDrm.PROPERTY_DEVICE_ID);
+            mediaDrm.release();
+            StringBuilder hex = new StringBuilder(drmId.length * 2);
+            for (byte b : drmId) {
+                hex.append(Character.forDigit((b >> 4) & 0xF, 16));
+                hex.append(Character.forDigit(b & 0xF, 16));
+            }
+            stableId = hex.toString();
+            source = "mediadrm-widevine";
+        } catch (Throwable t) {
+            Log.w(TAG, "Widevine device id unavailable — falling back to ANDROID_ID", t);
+        }
+        if (stableId.isEmpty()) {
+            try {
+                String androidId = android.provider.Settings.Secure.getString(
+                    getContext().getContentResolver(),
+                    android.provider.Settings.Secure.ANDROID_ID
+                );
+                if (androidId != null && !androidId.isEmpty()) {
+                    stableId = androidId;
+                    source = "android-id";
+                }
+            } catch (Throwable t2) {
+                Log.w(TAG, "ANDROID_ID unavailable too", t2);
+            }
+        }
+        result.put("deviceId", stableId);
+        result.put("source", source);
+        try {
+            android.content.pm.PackageInfo pi = getContext().getPackageManager()
+                .getPackageInfo(getContext().getPackageName(), 0);
+            result.put("appVersion", pi.versionName);
+        } catch (Throwable t) {
+            // version reporting is best-effort
+        }
+        call.resolve(result);
+    }
+
     // ─── Internals ──────────────────────────────────────────────────────────────
 
     private static boolean tryInitializeFirebase(Context context) {

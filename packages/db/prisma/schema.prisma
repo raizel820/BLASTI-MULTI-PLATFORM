@@ -1214,9 +1214,114 @@ model AppVersion {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
+  pushes          UpdatePush[]
+
   @@unique([platform, version])
   @@index([platform])
   @@index([isPublished])
+}
+
+// ─── Device Install Tracking (Public App Settings rebuild) ────────────────────
+
+/// ONE row per PHYSICAL device that installed the BLASTI app.
+///
+/// Deduping contract (user requirement): a device is identified by
+/// (platform, fingerprint) where `fingerprint` is a STABLE hash of hardware/
+/// OS attributes that survives app updates AND uninstall→reinstall cycles.
+/// The same machine therefore never inflates install counts:
+///   • first ever check-in        → INSTALL event, installCount = 1
+///   • same fingerprint, new UUID → REINSTALL event, installCount += 1
+///     (the client regenerates its UUID on a fresh install)
+///   • same fingerprint, new version → UPDATE event
+/// "Active device" = lastActiveAt within a rolling window (7/30 days).
+model AppDevice {
+  id           String   @id @default(cuid())
+  /// electron | windows | mac | linux | android | ios
+  platform     String
+  /// Stable machine fingerprint (sha256 of OS/machine attributes) — the
+  /// dedupe key that survives updates and reinstalls.
+  fingerprint  String
+  /// Client-generated UUID — regenerated on reinstall (used to DETECT
+  /// reinstall but never as the dedupe key).
+  deviceId     String
+  /// Human label: hostname (desktop) / device model (mobile)
+  label        String?
+  osName       String?
+  osVersion    String?
+  /// Version currently running on the device (latest reported)
+  appVersion   String?
+  /// How many installs/uninstall-reinstall cycles were reported
+  installCount Int      @default(1)
+  firstSeenAt  DateTime @default(now())
+  lastActiveAt DateTime @default(now())
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  events       AppInstallEvent[]
+  pushAcks     UpdatePushAck[]
+
+  @@unique([platform, fingerprint])
+  @@index([platform])
+  @@index([lastActiveAt])
+}
+
+/// Append-only telemetry: INSTALL / UPDATE / REINSTALL / UNINSTALL per device.
+/// Feeds the "installers & versions tracker" analytics with REAL events.
+model AppInstallEvent {
+  id        String   @id @default(cuid())
+  deviceId  String
+  device    AppDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  platform  String
+  version   String
+  /// INSTALL | UPDATE | REINSTALL | UNINSTALL | HEARTBEAT
+  eventType String
+  createdAt DateTime @default(now())
+
+  @@index([deviceId])
+  @@index([createdAt])
+  @@index([platform, eventType])
+}
+
+/// An admin update-push campaign. Devices learn about pushes through the
+/// public register/heartbeat responses (poll-based push). Delivery is
+/// measured as DISTINCT devices that checked in after the push was created
+/// — real numbers, never hardcoded.
+model UpdatePush {
+  id           String   @id @default(cuid())
+  platform     String
+  /// Target AppVersion row (must exist; typically published)
+  appVersionId String
+  appVersion   AppVersion @relation(fields: [appVersionId], references: [id], onDelete: Cascade)
+  isMandatory  Boolean  @default(false)
+  message      String   @default("")
+  messageAr    String?
+  messageFr    String?
+  /// ACTIVE | CANCELLED
+  status       String   @default("ACTIVE")
+  createdBy    String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  acknowledgements UpdatePushAck[]
+
+  @@index([platform, status])
+  @@index([createdAt])
+}
+
+/// Per-device acknowledgement: the device reported running (or later
+/// heartbeated with) the pushed target version.
+model UpdatePushAck {
+  id          String     @id @default(cuid())
+  pushId      String
+  push        UpdatePush @relation(fields: [pushId], references: [id], onDelete: Cascade)
+  deviceId    String
+  device      AppDevice  @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  fromVersion String?
+  toVersion   String
+  createdAt   DateTime   @default(now())
+
+  @@unique([pushId, deviceId])
+  @@index([deviceId])
 }
 
 model DelayedJob {
