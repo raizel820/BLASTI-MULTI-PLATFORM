@@ -5,7 +5,4 @@ NEXT_PUBLIC_API_URL=http://129.151.242.219
 
 esms_test_e696e94773d30376412f5afd108bd14a
 
-
-
-re_6bVdagf1 _8Ug2YgbRd8 VXXe1X YedayU4W
-re_2hUC icrF_77G3kt SdDNcCna cptf5F6t9i
+grep -E '^(DEPLOY_TOKEN|CORS_ORIGIN|ALLOWED_ORIGINS)=' /etc/blasti/blasti.env"

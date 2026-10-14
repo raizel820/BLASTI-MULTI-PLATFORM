@@ -76,7 +76,15 @@ export function ClientBootHardening() {
     // the cloud (stable fingerprint survives reinstalls → one device counts
     // exactly once) and heartbeats on every resume so the admin Devices tab
     // shows REAL active-device numbers. Fire-and-forget, silent failures.
-    const stopDeviceReporting = startDeviceReporting();
+    // Defense in depth: startDeviceReporting() runs SYNCHRONOUSLY in this
+    // effect — a throw here (unexpected native-bridge shape) takes the whole
+    // boot tree down to the RootRecoveryBoundary, so it must never escape.
+    let stopDeviceReporting: (() => void) | undefined;
+    try {
+      stopDeviceReporting = startDeviceReporting();
+    } catch (error) {
+      console.warn('[BootHardening] Device reporting failed:', error);
+    }
 
     // ── 1. Legacy service worker cleanup ──────────────────────────────────
     (async () => {

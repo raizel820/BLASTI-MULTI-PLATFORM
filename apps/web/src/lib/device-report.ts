@@ -184,17 +184,37 @@ export function startDeviceReporting(): () => void {
 
   const App = getNativePlugin('App');
   let removeResume: (() => void) | null = null;
+  // ⚠️ Bridge-shape trap (Oct 2026 field crash "i(...).then is not a function"):
+  // the RAW Android bridge surface (window.Capacitor.Plugins.App.addListener →
+  // window.Capacitor.addListener, native-bridge.js) returns the PluginListener
+  // handle { remove } SYNCHRONOUSLY — NOT a Promise. Only the @capacitor/core
+  // registerPlugin proxy wraps it in a Promise, and apps/web must not import
+  // @capacitor/*. Chaining .then() on the sync handle threw a TypeError inside
+  // ClientBootHardening's effect, which RootRecoveryBoundary caught — killing
+  // the boot tree to the recovery card on every launch. Promise.resolve()
+  // normalizes BOTH shapes (sync handle and Promise) and the try/catch below
+  // guarantees this boot task can never throw synchronously again.
   const addListener = App?.addListener as
-    | ((evt: string, cb: (state: { isActive?: boolean }) => void) => Promise<{ remove?: () => void }>)
+    | ((
+        evt: string,
+        cb: (state: { isActive?: boolean }) => void,
+      ) => Promise<{ remove?: () => void }> | { remove?: () => void })
     | undefined;
   if (addListener) {
-    addListener('appStateChange', (state: { isActive?: boolean }) => {
-      if (state?.isActive) void reportDeviceInstall('heartbeat');
-    })
-      .then((handle) => {
-        removeResume = () => handle.remove?.();
-      })
-      .catch(() => undefined);
+    try {
+      Promise.resolve(
+        addListener('appStateChange', (state: { isActive?: boolean }) => {
+          if (state?.isActive) void reportDeviceInstall('heartbeat');
+        }),
+      )
+        .then((handle) => {
+          const h = handle as { remove?: () => void } | undefined;
+          removeResume = () => h?.remove?.();
+        })
+        .catch(() => undefined);
+    } catch {
+      // Listener registration must never crash the boot effect.
+    }
   }
 
   return () => {
