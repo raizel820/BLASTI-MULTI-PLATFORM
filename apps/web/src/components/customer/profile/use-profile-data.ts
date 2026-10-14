@@ -6,6 +6,7 @@ import { useLanguage } from '@/hooks/use-language';
 import { toast } from 'sonner';
 import type { Language } from '@/i18n';
 import { updateDocumentDirection } from '@/store/use-app-store';
+import { mergeSessionUser } from '@/lib/user-store-refresh';
 import type {
   NotifPrefs,
   QueueStats,
@@ -79,6 +80,19 @@ export function useProfileData() {
         if (data.freeSmsCount !== undefined) setSmsCount(data.freeSmsCount);
         if (data.reminderMinutes !== undefined) setReminderMinutesVal(data.reminderMinutes);
         if (data.smsNotificationsEnabled !== undefined) setSmsNotifEnabled(data.smsNotificationsEnabled);
+        // Cross-device heal: the persisted store user may be older than the
+        // DB (avatar uploaded on another device). Merge the authoritative
+        // identity fields so the header/sidebar/identity-card avatars update
+        // on THIS device too — without navigation side effects.
+        mergeSessionUser({
+          fullName: typeof data.fullName === 'string' && data.fullName ? data.fullName : undefined,
+          email: typeof data.email === 'string' && data.email ? data.email : undefined,
+          phoneNumber: typeof data.phoneNumber === 'string' && data.phoneNumber ? data.phoneNumber : undefined,
+          avatarUrl: typeof data.avatarUrl === 'string' && data.avatarUrl ? data.avatarUrl : undefined,
+          freeSmsCount: typeof data.freeSmsCount === 'number' && Number.isFinite(data.freeSmsCount)
+            ? data.freeSmsCount
+            : undefined,
+        });
       }
     } catch {
       toast.error(t('error'));

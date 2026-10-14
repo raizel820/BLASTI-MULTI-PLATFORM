@@ -10,6 +10,7 @@ import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Textarea } from '@/components/ui/textarea';
 import { EmptyState } from '@/components/shared/empty-state';
+import { UserAvatar } from '@/components/shared/user-avatar';
 import {
   Star,
   MessageSquareReply,
@@ -227,6 +228,7 @@ function ReviewCard({
   const isReplying = replyingId === review.id;
   const reviewerName = review.user?.fullName || 'User';
   const avatarColor = getAvatarColor(reviewerName);
+  const reviewerAvatar = review.user?.avatarUrl;
 
   return (
     <motion.div
@@ -239,11 +241,20 @@ function ReviewCard({
       <Card className="border border-border/50 bg-white dark:bg-gray-900/80 hover:shadow-md transition-shadow">
         <CardContent className="p-4">
           <div className="flex items-start gap-3">
-            {/* Avatar */}
-            <div className={`h-10 w-10 rounded-full ${avatarColor} flex items-center justify-center flex-shrink-0`}>
-              <span className="text-sm font-bold text-white">
-                {getInitials(reviewerName) || '?'}
-              </span>
+            {/* Avatar — real profile image when the reviewer has one
+                (cross-account visibility), initials fallback otherwise */}
+            <div className={`h-10 w-10 rounded-full ${reviewerAvatar ? '' : avatarColor} flex items-center justify-center flex-shrink-0 overflow-hidden`}>
+              {reviewerAvatar ? (
+                <UserAvatar
+                  avatarUrl={reviewerAvatar}
+                  fullName={reviewerName}
+                  size={40}
+                />
+              ) : (
+                <span className="text-sm font-bold text-white">
+                  {getInitials(reviewerName) || '?'}
+                </span>
+              )}
             </div>
 
             <div className="flex-1 min-w-0">

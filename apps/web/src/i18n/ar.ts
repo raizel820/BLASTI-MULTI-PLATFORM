@@ -123,6 +123,7 @@ const ar = {
   orContinueWith: "أو تابع باستخدام",
   uploadAvatar: "رفع صورة الملف الشخصي",
   avatarMaxSize: "حجم الصورة يجب أن لا يتجاوز 2 ميغابايت",
+  profileImage: "صورة الملف الشخصي",
   avatarUpdated: "تم تحديث صورة الملف الشخصي",
 
   // ─── Navigation ──────────────────────────

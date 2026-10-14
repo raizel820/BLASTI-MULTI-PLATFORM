@@ -125,6 +125,7 @@ const en: Record<TranslationKeys, string> = {
   orContinueWith: "Or continue with",
   uploadAvatar: "Upload Profile Avatar",
   avatarMaxSize: "Avatar must be under 2MB",
+  profileImage: "Profile image",
   avatarUpdated: "Avatar updated successfully",
 
   // ─── Navigation ──────────────────────────

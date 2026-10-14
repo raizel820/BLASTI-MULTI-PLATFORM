@@ -125,6 +125,7 @@ const fr: Record<TranslationKeys, string> = {
   orContinueWith: "Ou continuer avec",
   uploadAvatar: "Téléverser un avatar",
   avatarMaxSize: "L'avatar ne doit pas dépasser 2 Mo",
+  profileImage: "Photo de profil",
   avatarUpdated: "Avatar mis à jour avec succès",
 
   // ─── Navigation ──────────────────────────

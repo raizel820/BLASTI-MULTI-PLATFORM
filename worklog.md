@@ -4575,3 +4575,42 @@ Stage Summary:
 - DELIVERY GAP IS THE META-ISSUE: 53 commits unpushed; the user's production line (129.151.242.219) has only their manual ports. USER ACTION: apply download/0001-fix-profile-payments-version-avatar-400-Invalid-URL-.patch (git am --3way) onto their master + push + redeploy the server so the web layer ships; earlier patch sets in download/ (notifications e5141f7, update-engine 4605a94, keystore+storage) still pending their line.
 - The phone's settings version will show 0.5.7 once the patched web layer is deployed AND the shell answers BlastiNativeStatus.getDiagnostics (no APK rebuild needed).
 - Leftover sandbox state: probe1800 (test customer, pw E2ePass123!) has a real avatar; 2-3 orphan avatar FileAssets kept as storage-manager demo data; test files cleaned from /home/z.
+
+---
+Task ID: reset-audit / sandbox-reset-verification
+Agent: Z.ai Code (main)
+Task: User asked to check whether the app got reset and some updates got lost.
+
+Work Log:
+- Git audit: working tree CLEAN; all 55 session commits present incl. 2fe08f9 (boot crash), 801fc17 (avatar persist + preview/delete parity + Chargily ×100 + version probe), fdc791e (worklog). Nothing uncommitted to lose.
+- Divergence check vs origin/master (35/55): origin-only commits are the user's own pushes ("mobuile app fix" ×3 = applied agent patches, "versions 1–7" bumps); tree-level comparison shows origin adds NO unique content — local master is strictly newer (only delta = the 6-file 801fc17 fix batch not yet applied to the user's line).
+- Runtime audit: web :3000 → 200 (serves Blasti), API :3003 → 200, embedded PG processes alive, db intact (58 public tables, 3 users), uploads intact (3 avatar PNGs + 1 logo under apps/api/uploads/), all 8 patch/diff files intact in download/.
+- mini-services/ CONFIRMED WIPED by sandbox reset (never committed to git — `git log --all -- mini-services` empty): discovery-service (:3010) + chargily-mock (:3021) absent and not running. daemon-start.sh tolerates it: "Discovery service directory missing — skipped"; API+Web still boot healthy. Already tracked as backlog item.
+
+Stage Summary:
+- VERDICT: no source, data, or patch loss. Only casualty = untracked sandbox-only mini-services (discovery/chargily-mock), non-blocking, backlog already covers recreation.
+- Still awaiting user: apply + push download/0001-fix-profile-payments-version-avatar-400-Invalid-URL-.patch (plus earlier pending sets: notifications e5141f7, update-engine 4605a94, keystore+storage) then redeploy server.
+
+---
+Task ID: avatar-everywhere / cross-device profile-image visibility + sync
+Agent: Z.ai Code (main)
+Task: "Profile image works ONLY in customer webapp — not desktop, not mobile, and super admin/agency still see the placeholder in customer profiles. Fix across all devices and accounts so all accounts can see each other's profile images, and make it sync: avatar updated in webapp must reach mobile + desktop."
+
+Work Log:
+- Delivery archaeology: DB was fine (probe1800.avatarUrl = relative /api/upload/file/... path); getProxiedUrl already rebases for every shell; sync contract USER_SYNC_FIELDS already carries avatarUrl; desktop local API has GET /api/user/profile with localizeFileUrl. The gaps were (a) the persisted store, (b) two render sites.
+- ROOT CAUSE 1 (stale persisted store): zustand user was refreshed ONLY at login or after an in-place edit on the same device. Other devices kept the login-era user (avatarUrl=null) forever — header/sidebar/identity-card placeholders on phone/desktop. session-heal fires on auth failure only, never on stale profile data.
+- ROOT CAUSE 2 (admin view): admin-users.tsx never rendered user.avatarUrl — generic UserCircle icon in both the list row and the expanded profile panel, though GET /api/admin/users already returns avatarUrl.
+- ROOT CAUSE 3 (agency view): agency-reviews.tsx had avatarUrl in its ReviewUser interface but rendered a colored initials circle unconditionally.
+- FIX 1: NEW lib/user-store-refresh.ts — gentle boot + focus-time (30s-throttled) refresher; merges authoritative profile fields into the persisted store via raw setState (never setUser → no view reset), concurrent calls coalesced, account-switch guarded, no-avatar-clears semantics preserved. Mounted as boot task 5 in client-boot-hardening (same never-throw contract).
+- FIX 2: use-profile-data.fetchProfile now mergeSessionUser()s the fetched identity fields — opening the profile page heals the header/sidebar on that device too.
+- FIX 3: admin-users renders UserAvatar in the row circle + expanded panel (icon/initials fallback preserved); new i18n key profileImage (en/ar/fr).
+- FIX 4: agency-reviews renders the reviewer's real avatar via UserAvatar when present.
+- Cross-device sync path: webapp avatar change → DB → (web/mobile) boot/focus refreshSessionUser hits /api/user/profile → store healed; (desktop) cloud→local User pull updates the local row (USER_SYNC_FIELDS) → boot/focus refresh hits the LOCAL profile endpoint → localized URL merged. No realtime dependency (sandbox realtime mini-service is gone); propagation = next boot or app focus, which matches "open the app → see the new avatar".
+- E2E (agent-browser, sandbox): admin users list + expanded profile show the customer avatar (naturalWidth 1024, URL rebased to :3003); poisoned-null store + reload heals to the real path WITHOUT visiting the profile page; customer home header + profile page render the avatar (2 imgs); agency reviews page renders the reviewer avatar after inserting a temp review (removed afterwards). eslint clean; tsc: no new errors in changed files (55 pre-existing TS1117 dupes in ar.ts on clean master).
+- Test accounts touched (sandbox DB only): admin + owner passwords reset to known E2E values; temp review e2e-review-* deleted.
+- Commit 5882fa5 (9 files, +265/−11).
+
+Stage Summary:
+- All four reported surfaces explained and fixed: (1) phone/desktop self-avatar = stale persisted store → boot/focus refresher; (2) admin customer-profile placeholder = render gap → admin-users avatars; (3) agency side = render gap → agency-reviews avatars; (4) sync requirement = boot/focus refresh + existing cloud→local User pull.
+- DELIVERY: patch exported to download/ (0001-fix-avatar-...patch + avatar-cross-device.diff), validated onto origin/master with git apply --check --3way. USER ACTION: apply + push + redeploy server; no APK rebuild needed (phones load the server's web bundle).
+- Note: on-device verification (real APK/desktop binary) still recommended; sandbox verified the web layer all three roles share.
