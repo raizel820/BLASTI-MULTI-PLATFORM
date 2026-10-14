@@ -21,6 +21,8 @@
     "build:export": "bun run --filter @blasti/web build:export",
     "build:desktop": "bun run build:export && bun run --filter @blasti/desktop build",
     "build:mobile": "bun run build:export && bun run --filter @blasti/mobile cap:sync:android",
+    "version:set": "node scripts/version-set.js",
+    "version:check": "node scripts/version-set.js --check",
     "lint": "bun run --filter @blasti/web lint",
     "db:push": "bun run --filter @blasti/db db:push",
     "db:force-reset": "bun run --filter @blasti/db db:force-reset",

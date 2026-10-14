@@ -16,6 +16,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { logger } from 'hono/logger'
+import { readFileSync } from 'fs'
 import os from 'os'
 import { Server as SocketIOServer } from 'socket.io'
 import type { Socket } from 'socket.io'
@@ -45,6 +46,16 @@ import {
   responseCacheStats,
 } from './lib/response-cache'
 
+// ─── API version — single source of truth ──────────────────────────────────
+// Read live from apps/api/package.json. This was previously hardcoded as
+// '0.2.1' in FOUR places below, which is exactly how "I bumped the version
+// but /api/health still reports the old one" happened. Bump the version with
+//   bun run version:set x.y.z
+// (scripts/version-set.js updates every package.json in the monorepo).
+const API_VERSION = (
+  JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8')) as { version: string }
+).version
+
 // ─── Route Modules ──────────────────────────────────────────────────────────
 
 import { authRoutes } from './routes/auth'
@@ -67,6 +78,7 @@ import { paymentSettingsRoutes } from './routes/payment-settings'
 import { qrRoutes } from './routes/qr'
 import { transactionRoutes } from './routes/transactions'
 import { uploadRoutes } from './routes/upload'
+import { brandingRoutes } from './routes/branding'
 import { filesSyncRoutes } from './routes/files-sync'
 import { syncRoutes } from './routes/sync'
 import { settingsRoutes } from './routes/settings'
@@ -84,6 +96,8 @@ import { adminDbRoutes } from './routes/admin-db'
 // Storage Manager — SUPER_ADMIN file-store console (sidebar "Storage Manager")
 import { adminStorageRoutes } from './routes/admin-storage'
 import { appVersionRoutes } from './routes/app-versions'
+// Public App Settings rebuild — real device install tracking + update pusher
+import { appInstallRoutes } from './routes/app-installs'
 import { systemStatusRoutes } from './routes/system-status'
 // Task 54-a — doc-2 role-scoped analytics (staff + customer modules)
 import { staffAnalyticsRoutes } from './routes/staff-analytics'
@@ -484,7 +498,7 @@ app.onError((err, c) => {
 app.get('/', (c) => {
   return c.json({
     name: '@blasti/api',
-    version: '0.2.1',
+    version: API_VERSION,
     description: 'BLASTI Headless Backend Server',
     endpoints: {
       health: 'GET /health',
@@ -501,7 +515,7 @@ app.get('/health', (c) => {
   return c.json({
     status: 'ok',
     service: '@blasti/api',
-    version: '0.2.1',
+    version: API_VERSION,
     bootId: BOOT_ID,
     sync: SYNC_HEALTH,
     connections: io?.engine?.clientsCount ?? 0,
@@ -521,7 +535,7 @@ app.get('/health', (c) => {
 app.get('/api/health', (c) => c.json({
   status: 'ok',
   service: '@blasti/api',
-  version: '0.2.1',
+  version: API_VERSION,
   bootId: BOOT_ID,
   sync: SYNC_HEALTH,
   uptime: Math.floor(process.uptime()),
@@ -603,7 +617,7 @@ app.get('/api/discover', (c) => {
   }
   return c.json({
     service: 'blasti-lan',
-    version: '0.2.1',
+    version: API_VERSION,
     name: 'BLASTI Server',
     hostname,
     ip,
@@ -657,6 +671,8 @@ app.route('/api/payment-settings', paymentSettingsRoutes)
 app.route('/api/qr', qrRoutes)
 app.route('/api/transactions', transactionRoutes)
 app.route('/api/upload', uploadRoutes)
+// Public branding assets (app logo for emails / integrations)
+app.route('/api/branding', brandingRoutes)
 // Round 15 — desktop file-sync family (push/pull/blob/tombstone).
 app.route('/api/files/sync', filesSyncRoutes)
 app.route('/api/sync', syncRoutes)
@@ -676,6 +692,8 @@ app.route('/api/agency-devices', agencyDeviceRoutes)
 // Task 42-b — user-created agency fields/industries (global dictionary).
 app.route('/api/agency-categories', agencyCategoriesRoutes)
 app.route('/api/app-versions', appVersionRoutes)
+// Public App Settings rebuild — device telemetry + update pusher
+app.route('/api/app-installs', appInstallRoutes)
 app.route('/api/system', systemStatusRoutes)
 // Task 54-a — role-scoped analytics modules (doc-2 spec §29-44)
 app.route('/api/staff/analytics', staffAnalyticsRoutes)

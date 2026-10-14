@@ -9,6 +9,8 @@ import { isRTL, type TranslationKeys } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { usePlatform } from '@/hooks/use-platform';
 import { nativeBridge } from '@/lib/native-bridge';
+import { useAppUpdateStore } from '@/store/use-app-update-store';
+import { runManualUpdateCheck } from '@/components/shared/app-update-manager';
 import { Button } from '@/components/ui/button';
 import {
   Sheet,
@@ -68,6 +70,7 @@ import {
   ChevronLeft,
   History,
   LifeBuoy,
+  RefreshCw,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { toast } from 'sonner';
@@ -130,8 +133,15 @@ function MobileBottomActionBar({ onMenuOpen, onLogout, t }: { onMenuOpen: () => 
 
 export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { currentView, setView, logout, user } = useAppStore();
-  const { t } = useLanguage();
+  const { t, lang } = useLanguage();
   const { platform, capabilities } = usePlatform();
+  // App-update delivery — manual check sits at the bottom of the sidebar
+  // (same footer is reused as the mobile More sheet) and flips to
+  // "Update now" once the user postponed an available update.
+  const updateChecking = useAppUpdateStore((s) => s.checking);
+  const updatePostponedPending = useAppUpdateStore(
+    (s) => s.status === 'available' && !!s.postponedVersion && s.info?.version === s.postponedVersion,
+  );
   // Task 37-e: authority-aware navigation — sections a staff/manager has no
   // authority for are hidden (matrix shared with the page guards).
   const { authority } = useAgencyAuthority();
@@ -318,6 +328,13 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
         >
           <KeyRound className="h-5 w-5" />
           {t('changePassword')}
+        </button>
+        <button
+          onClick={() => { void runManualUpdateCheck(lang); }}
+          className="flex items-center gap-3 w-full px-3 py-2 rounded-xl text-sm text-muted-foreground hover:bg-muted hover:text-foreground transition-colors"
+        >
+          <RefreshCw className={`h-5 w-5 ${updateChecking ? 'animate-spin text-emerald-600 dark:text-emerald-400' : ''}`} />
+          {updateChecking ? t('updateChecking') : updatePostponedPending ? t('updateNow') : t('updateCheckForUpdates')}
         </button>
         <button
           onClick={() => { logout(); onClose(); }}

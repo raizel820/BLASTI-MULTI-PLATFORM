@@ -78,9 +78,10 @@ app.patch('/profile', async (c) => {
     if (reminderMinutes !== undefined) updateData.reminderMinutes = Number(reminderMinutes)
     if (smsNotificationsEnabled !== undefined) updateData.smsNotificationsEnabled = Boolean(smsNotificationsEnabled)
     if (avatarUrl !== undefined) {
-      // Round 15 — rewrite desktop-local/relative file URLs to cloud URLs.
-      const fileBase = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '') || new URL(c.req.url).origin
-      updateData.avatarUrl = normalizeRecordFileUrls({ avatarUrl }, fileBase).avatarUrl
+      // Task 2-c — normalize on write: any upload-file URL shape (desktop
+      // local, request-origin absolute, or already relative) is stored as the
+      // canonical RELATIVE /api/upload/file/... path, valid from every device.
+      updateData.avatarUrl = normalizeRecordFileUrls({ avatarUrl }).avatarUrl
     }
     if (fullName !== undefined) updateData.fullName = fullName
     if (notificationPref !== undefined) updateData.notificationPref = notificationPref

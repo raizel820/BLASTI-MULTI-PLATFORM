@@ -3,6 +3,12 @@ import { db } from '@blasti/db'
 import { normalizeDzPhone, getSmsTemplate, sendSms } from '../lib/sms-service'
 import { recordSyncChange } from '../lib/sync-helpers'
 import { emitNotificationEvent } from '../lib/realtime-emit'
+import { getCheckoutStatus, expireCheckout } from '../lib/chargily-service'
+import {
+  fulfillCheckoutPaid,
+  fulfillCheckoutFailed,
+  normalizeChargilyStatus,
+} from '../lib/chargily-fulfill'
 
 const app = new Hono()
 
@@ -459,4 +465,182 @@ app.post('/sweep-offline', async (c) => {
   }
 })
 
+// ─── Task 2-e: Stale-PENDING payment sweeper ────────────────────────────────
+// A PENDING Transaction / SmsPurchase whose Chargily webhook never arrives AND
+// whose customer never returns to the app (so the poll fallback never runs)
+// would stay PENDING forever — the agency's subscriptionStatus stuck on
+// 'PENDING', SMS credits never granted, hardware orders never approved.
+//
+// This sweeper asks Chargily for the live checkout status and settles through
+// the SAME idempotent fulfillment used by the webhook and poll paths.
+//
+//   Interval ....... every 5 minutes (in-process, unref'd)
+//   Candidate ...... status PENDING · paymentProvider 'chargily' ·
+//                    providerRef set · createdAt older than 30 minutes
+//   unreachable .... skip silently (retried on the next sweep)
+//   status paid .... fulfillCheckoutPaid(..., 'sweep')
+//   status failed .. fulfillCheckoutFailed(..., 'sweep')
+//   pending >24h ... expireCheckout() then fulfillCheckoutFailed(...,
+//                    'sweep-expired')
+//
+// Also exposed as POST /api/cron/sweep-payments (verifyCronSecret) so an
+// external scheduler can trigger a run on demand.
+
+const PAYMENT_SWEEP_INTERVAL_MS = 5 * 60 * 1000     // every 5 minutes
+const PAYMENT_STALE_AFTER_MS = 30 * 60 * 1000       // 30 min without settlement → ask Chargily
+const PAYMENT_EXPIRE_AFTER_MS = 24 * 60 * 60 * 1000 // 24h still pending → force-expire at gateway
+const PAYMENT_SWEEP_BATCH = 25                      // max Chargily round-trips per run
+
+interface PaymentSweepStats {
+  checked: number
+  settledPaid: number
+  settledFailed: number
+  expired: number
+  skipped: number
+}
+
+export async function sweepPendingPayments(): Promise<PaymentSweepStats> {
+  const stats: PaymentSweepStats = { checked: 0, settledPaid: 0, settledFailed: 0, expired: 0, skipped: 0 }
+  const staleBefore = new Date(Date.now() - PAYMENT_STALE_AFTER_MS)
+  const expireBefore = new Date(Date.now() - PAYMENT_EXPIRE_AFTER_MS)
+
+  // `not: ''` also excludes NULL rows (SQL `<>` semantics) — manual transactions
+  // (empty providerRef, awaiting admin review) are never swept.
+  const pendingChargily = {
+    status: 'PENDING',
+    paymentProvider: 'chargily',
+    providerRef: { not: '' },
+    createdAt: { lt: staleBefore },
+  }
+
+  // Cheap guard first — one COUNT per table; skip the whole sweep when no
+  // record is eligible (the overwhelmingly common case).
+  const [txCount, smsCount] = await Promise.all([
+    db.transaction.count({ where: pendingChargily }),
+    db.smsPurchase.count({ where: pendingChargily }),
+  ])
+  if (txCount + smsCount === 0) return stats
+
+  const [staleTx, staleSms] = await Promise.all([
+    db.transaction.findMany({
+      where: pendingChargily,
+      select: { id: true, providerRef: true, createdAt: true },
+      orderBy: { createdAt: 'asc' },
+      take: PAYMENT_SWEEP_BATCH,
+    }),
+    db.smsPurchase.findMany({
+      where: pendingChargily,
+      select: { id: true, providerRef: true, createdAt: true },
+      orderBy: { createdAt: 'asc' },
+      take: PAYMENT_SWEEP_BATCH,
+    }),
+  ])
+
+  const candidates = [
+    ...staleTx.map((t) => ({ kind: 'transaction' as const, ...t })),
+    ...staleSms.map((s) => ({ kind: 'sms_purchase' as const, ...s })),
+  ]
+    .filter((c) => !!c.providerRef)
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+    .slice(0, PAYMENT_SWEEP_BATCH)
+
+  stats.checked = candidates.length
+  if (candidates.length === 0) return stats
+  console.log(
+    `[cron:payments] Sweeping ${candidates.length} stale PENDING payment record(s) (eligible: tx=${txCount}, sms=${smsCount})`,
+  )
+
+  for (const candidate of candidates) {
+    const providerRef = candidate.providerRef as string
+    try {
+      const checkout = await getCheckoutStatus(providerRef)
+      const normalized = normalizeChargilyStatus(checkout.status)
+      const payload = {
+        id: checkout.id || providerRef,
+        status: checkout.status,
+        amount: typeof checkout.amount === 'number' ? checkout.amount : 0,
+        payment_method: checkout.payment_method ?? null,
+        metadata: checkout.metadata ?? null,
+      }
+
+      if (normalized === 'paid') {
+        await fulfillCheckoutPaid(payload, 'sweep')
+        stats.settledPaid++
+        console.log(`[cron:payments] Settled ${candidate.kind} ${candidate.id} as PAID (checkout ${providerRef})`)
+      } else if (normalized === 'failed') {
+        await fulfillCheckoutFailed(payload, 'sweep')
+        stats.settledFailed++
+        console.log(`[cron:payments] Settled ${candidate.kind} ${candidate.id} as FAILED (checkout ${providerRef})`)
+      } else if (candidate.createdAt < expireBefore) {
+        // Genuinely still pending at the gateway after 24h — force-expire the
+        // checkout remotely, then settle the local record as failed so nothing
+        // stays PENDING forever. If the expire call fails, retry next sweep.
+        try {
+          await expireCheckout(providerRef)
+        } catch (err) {
+          console.warn(`[cron:payments] Could not expire checkout ${providerRef}:`, err instanceof Error ? err.message : err)
+          stats.skipped++
+          continue
+        }
+        await fulfillCheckoutFailed(payload, 'sweep-expired')
+        stats.expired++
+        console.log(`[cron:payments] Expired + settled ${candidate.kind} ${candidate.id} as FAILED (checkout ${providerRef}, pending >24h)`)
+      } else {
+        // Still pending inside the window — retry on the next sweep.
+        stats.skipped++
+      }
+    } catch (err) {
+      // Chargily unreachable / keys misconfigured / bad row — one bad record
+      // must never kill the sweep; it is simply retried on the next run.
+      stats.skipped++
+      console.warn(
+        `[cron:payments] Skipped ${candidate.kind} ${candidate.id} (checkout ${providerRef}):`,
+        err instanceof Error ? err.message : err,
+      )
+    }
+  }
+
+  return stats
+}
+
+// POST /cron/sweep-payments — settle stale PENDING Chargily payments now
+app.post('/sweep-payments', async (c) => {
+  if (!verifyCronSecret(c)) {
+    return c.json({ success: false, error: 'Unauthorized' }, 401)
+  }
+
+  try {
+    const stats = await sweepPendingPayments()
+    return c.json({ success: true, ...stats })
+  } catch (error) {
+    console.error('[cron/sweep-payments] Error:', error)
+    return c.json({ error: 'Internal server error' }, 500)
+  }
+})
+
 export const cronRoutes = app
+
+// In-process registration — index.ts imports this module for the /api/cron
+// routes, so starting the interval here keeps the sweeper next to the cron
+// endpoints without touching index.ts (same start-from-worker-module pattern
+// as workers/notification-worker.ts).
+let paymentSweeperStarted = false
+export function startPaymentSweeper(): void {
+  if (paymentSweeperStarted) return
+  paymentSweeperStarted = true
+  console.log(
+    '[cron:payments] Payment sweeper registered (interval=5min, stale>30min, expire>24h, batch=25)',
+  )
+  setInterval(() => {
+    sweepPendingPayments()
+      .then((stats) => {
+        if (stats.checked > 0) {
+          console.log(
+            `[cron:payments] Sweep done: checked=${stats.checked} paid=${stats.settledPaid} failed=${stats.settledFailed} expired=${stats.expired} skipped=${stats.skipped}`,
+          )
+        }
+      })
+      .catch((err) => console.error('[cron:payments] Sweep failed:', err))
+  }, PAYMENT_SWEEP_INTERVAL_MS).unref()
+}
+startPaymentSweeper()

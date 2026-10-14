@@ -15,6 +15,9 @@
 
 import { useEffect, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
+// Task 2-a — the version probe moved into lib/app-version.ts so the customer
+// settings About row shares the same memoized Device.getInfo() round-trip.
+import { getAppVersion } from '@/lib/app-version';
 
 const INTRO_KEY = 'blasti-intro-played';
 /** The original artwork, tile-fill framing (matches the launcher icon file). */
@@ -30,6 +33,7 @@ const REDUCED_MS = 900;
 
 export function AppIntroAnimation() {
   const [visible, setVisible] = useState(false);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
   const reduceMotion = useReducedMotion();
 
   useEffect(() => {
@@ -56,6 +60,25 @@ export function AppIntroAnimation() {
     const timer = window.setTimeout(() => setVisible(false), total);
     return () => window.clearTimeout(timer);
   }, [reduceMotion]);
+
+  // Version badge (user request: show the app version on the launch
+  // animation). Task 2-a: the shell-injected Capacitor Device probe lives in
+  // lib/app-version.ts (shared with the settings About row) — it reads
+  // getInfo().appVersion, i.e. the Android versionName, the SAME value the
+  // APK file name and the update system use. Zero @capacitor imports
+  // (apps/web does not depend on them); the promise never rejects and
+  // resolves null in plain browsers, so ?intro=1 previews simply never
+  // resolve a version and the badge stays hidden.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    let mounted = true;
+    getAppVersion()
+      .then((version) => {
+        if (mounted && version) setAppVersion(version);
+      })
+      .catch(() => { /* never rejects per contract — kept defensive */ });
+    return () => { mounted = false; };
+  }, []);
 
   return (
     <AnimatePresence>
@@ -108,6 +131,17 @@ export function AppIntroAnimation() {
             >
               بلاصتي
             </motion.p>
+            {appVersion && (
+              <motion.p
+                className="mt-3 text-xs font-semibold uppercase tracking-[0.22em] text-emerald-600/80"
+                dir="ltr"
+                initial={reduceMotion ? undefined : { opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={reduceMotion ? undefined : { delay: 2.25, duration: 0.45 }}
+              >
+                v{appVersion}
+              </motion.p>
+            )}
           </motion.div>
         </motion.div>
       )}

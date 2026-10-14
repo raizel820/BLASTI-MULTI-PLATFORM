@@ -187,6 +187,50 @@ function readVersionName() {
   return '1.0.0';
 }
 
+// ─── Version sync safety net ─────────────────────────────────────────────────
+// "I bumped package.json but the APK is still named with the old version" —
+// the APK name comes from build.gradle versionName, NOT from package.json.
+// Before every Gradle run, sync versionName (+ derived versionCode) from
+// apps/mobile/package.json — THE mobile source of truth — into build.gradle,
+// so a manual package.json-only bump can never produce a stale-named APK.
+// The canonical way to bump everything at once is:  bun run version:set x.y.z
+function readPackageVersion() {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'apps', 'mobile', 'package.json'), 'utf8'));
+    if (typeof pkg.version === 'string' && /^\d+\.\d+\.\d+/.test(pkg.version)) return pkg.version;
+  } catch { /* unreadable — keep build.gradle as-is */ }
+  return null;
+}
+
+/** Deterministic, always-monotonic Android versionCode: major*1e6 + minor*1e3 + patch. */
+function versionCodeFrom(version) {
+  const [maj = '0', min = '0', pat = '0'] = String(version).split('-')[0].split('.');
+  return Number(maj) * 1_000_000 + Number(min) * 1_000 + Number(pat);
+}
+
+function syncGradleVersionFromPackage() {
+  const pkgVersion = readPackageVersion();
+  if (!pkgVersion) return; // no readable package.json — never guess
+  const gradlePath = path.join(androidDir, 'app', 'build.gradle');
+  let src = '';
+  try { src = fs.readFileSync(gradlePath, 'utf8'); } catch { return; }
+  const m = src.match(/versionName\s+"([^"]+)"/);
+  if (!m || m[1] === pkgVersion) return; // in sync (or unparseable) — untouched
+
+  const code = versionCodeFrom(pkgVersion);
+  const prevCode = (src.match(/versionCode\s+(\d+)/) || [])[1];
+  const updated = src
+    .replace(/versionName\s+"[^"]*"/, `versionName "${pkgVersion}"`)
+    .replace(/versionCode\s+\d+/, `versionCode ${code}`);
+  try {
+    fs.writeFileSync(gradlePath, updated);
+    log(`Synced Android version from apps/mobile/package.json: versionName "${m[1]}" → "${pkgVersion}", versionCode ${prevCode || '?'} → ${code}.`);
+    log('(package.json is the mobile source of truth — or use `bun run version:set` to bump everywhere at once.)');
+  } catch (err) {
+    warn(`Could not sync versionName into build.gradle: ${err.message}`);
+  }
+}
+
 function findApks(dir, out) {
   try {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -254,6 +298,12 @@ function reportApk() {
 }
 
 // ─── Run Gradle ──────────────────────────────────────────────────────────────
+
+// Version sync FIRST — build.gradle always matches apps/mobile/package.json
+// before any Gradle invocation (fixes "old version still in the APK file
+// name"). Runs before the JDK/SDK checks so the version fixup is applied
+// even when the build environment itself is incomplete.
+syncGradleVersionFromPackage();
 
 const javaHome = detectJavaHome();
 if (!javaHome) {

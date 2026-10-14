@@ -4167,3 +4167,327 @@ Stage Summary:
 - RTL: one logical-property fix repairs table alignment app-wide (verified in Arabic).
 - Installers: current build lists every same-name occurrence with exact push time; VPS needs redeploy.
 - Known follow-ups: desktop local-API lifecycle, sync engine, eSMS live (non-test) key purchase, empty-folder delete endpoint (folders removed manually in sandbox), public-settings same-name dedupe is confirmed FIXED on this build.
+
+---
+Task ID: avatar-placeholder-fix
+Agent: main (Z.ai Code)
+Task: User report — "across all devices app and web app, when uploading a profile image or logo it reaches the VPS and storage manager but keeps showing as just a placeholder in the app; apps never show the real image in preview, profile or any place." Also re-check that the app did not reset after the session gap.
+
+Work Log:
+- State check: NO reset — services up (web :3000, api :3003, postgres :5432), HEAD 993d872 clean. (The earlier "download not working" was the user's own internet loss — confirmed working by them.)
+- Serving chain verified by curl: direct API GET /api/upload/file/avatar/... → 200 PNG; gateway :81 + XTransformPort=3003 → 200 PNG; raw :3000 → 404 HTML (expected, no /api routes on Next). Upload POST → FileAsset row + disk write OK; PATCH /api/user/profile persists avatarUrl to DB (verified in Postgres).
+- Render path: ALL avatar/logo sites route through getProxiedUrl (UserAvatar + direct img tags) — no missed call sites.
+- ROOT CAUSE: stored file URLs are ABSOLUTE (the cloud API origin the upload POST used, e.g. http://<vps>:3003/api/upload/file/...). getProxiedUrl covered gateway-hosted pages and localhost-stored URLs only, so:
+  • Electron packaged shell (page origin http://127.0.0.1:3080, apps/desktop/main.js PROD_URL): raw cloud URL → blocked by the shell CSP img-src (plain-http remote hosts NOT allowed) and usually by the firewalled :3003 → initials placeholder everywhere in the desktop app.
+  • Capacitor mobile: cloud-absolute URLs passed through raw → Android cleartext policy / iOS ATS / unreachable port → placeholder everywhere in the mobile app.
+- FIX 1 (apps/web/src/lib/utils.ts getProxiedUrl): in the packaged Electron shell, rebase EVERY /api/upload/file/* URL (absolute any-host + relative legacy rows) onto the local API origin 127.0.0.1:3080 (CSP-safe, offline-capable); in Capacitor, rebase EVERY upload-file URL onto getNativeCloudUrl() — the same base the app's own successful fetches use. Installers (/api/app-versions/*) deliberately untouched. Web gateway/localhost branches unchanged.
+- FIX 2 (apps/desktop/local-api/index.js serveLocalFile): on a local-store miss, proxy the blob from the cloud's public capability URL once, best-effort cache it into the local store, then serve — makes not-yet-synced avatars (e.g. uploaded from the phone) render in the desktop app, and repeat renders instant/offline.
+- Verification: 13/13 branch-matrix harness (electron packaged/dev × capacitor × web-gateway × web-localhost × absolute/relative/local/installer/query/unresolved-resolver); live UI E2E on the sandbox (admin-seeded CUSTOMER "imgtest2"): upload through the real profile card → POST 200, preview <img> renders the NEW blob (ok:true), PATCH /api/user/profile → 200; DB ground truth checked via admin API; local-API proxy logic tested against the live cloud (200 → cached byte-exact, traversal-safe path).
+- Environment notes: bun+prisma ad-hoc DB queries blocked by client resolution — used the running API + admin endpoints instead; a fake non-localhost page host (nip.io) can't fully boot the SPA because next dev blocks cross-origin dev resources (allowedDevOrigins) — a sandbox dev-server artifact only, production builds unaffected; headless-browser→localhost:3003 latency (7–22s spikes) is pre-existing platform behavior.
+- Committed as 24e569a on master (sandbox has no GitHub push credentials — unchanged; user pushes from Windows/VPS).
+
+Stage Summary:
+- Uploaded profile images/logos now render on EVERY shell: desktop (CSP-safe local origin + cloud-fallback proxy), mobile (proven-reachable native cloud base), web (unchanged gateway rebase).
+- Upload → preview → save → DB → render chain verified end-to-end; no reset occurred.
+- VPS deploy note: the desktop fix needs a repackaged installer (local-api + bundled web both changed); web/mobile fixes ship with the next web build.
+
+---
+Task ID: 4-a
+Agent: full-stack-developer
+Task: Complete from-scratch rebuild of the admin "Public App Settings" screen — thin wrapper + 4 tab files (installers / versions / pusher / devices), all data live from the API.
+
+Work Log:
+- Read worklog + contract; found a prior interrupted 4-a run had already scaffolded public-app/ — audited every file line-by-line against the task contract (all 7 file groups complete and contract-true; page.tsx lazy-import + NAMED export + NO-props verified at lines 92/195/376).
+- Verified lib/admin-upload.ts: filename detection (.apk→android, debug→android-debug, .ipa/.exe/.msi/.dmg/.pkg/.appimage/.deb/.rpm map, electron-name override), first-semver token extraction, 409-tolerant POST /api/app-versions ensure-step, XHR multipart upload with real onprogress + per-shell auth mirror (electron/capacitor/web) + buildCloudUrl XTransformPort routing.
+- Verified i18n: publicApp* block (148 keys) added to ar.ts AFTER installer* keys, then en.ts + fr.ts (Record<TranslationKeys,string>); used/defined key diff = zero missing; count interpolation reuses t(key,{count}) like storageFilesCount; relative-time keys typed into shared.ts.
+- Live endpoint audit with admin bearer token vs TS interfaces: storage-files (storageKey/name/group/size/mtimeMs/parsed/platform/version{isPublished,fileName,fileSize}), app-versions (+?platform&published), app-installs stats (totals/byPlatform/byVersion/30-day timeline oldest-first/recentEvents), devices, events, pushes (deliveredCount/updatedCount real) — ALL field names match; zero shape mismatches (events add a compatible nested device:{label}).
+- bun run lint → exit 0 (0 errors; only a pre-existing warning in admin-storage-manager.tsx, untouched here). tsc → 422 = exact documented baseline, ZERO errors in the new files, zero new i18n errors.
+- Browser E2E (agent-browser, admin/admin123, RTL Arabic, viewport 1280×900): login → skip onboarding → إعدادات التطبيقات العامة.
+  TAB1: 3 same-name windows builds render as 3 DISTINCT rows sorted push-time desc, ACTIVE badge on exactly the published+byte-exact row, "—" on unlinked, Activate buttons elsewhere, chips (الكل 3/ويندوز 3), Refresh + 30s auto-refresh wired.
+  Upload E2E: picked dummy BLASTI-Setup-0.3.6.exe → platform+version auto-detected (editable), EN/AR/FR notes tabs, mandatory switch, XHR progress → version record created + binary on disk (28 B exact) → table auto-refetched, new row on top; then deleted it via TAB2 (confirm dialog warns the DISK FILE is deleted too) — record + file gone, state restored.
+  TAB2: real published dates, downloadCount, devices-per-version joined from stats.byVersion (1 / 4), Edit/Activate/Delete per row.
+  TAB3: platform select → published-version select populated, optional/mandatory radio cards, EN/AR/FR message; pushes list with MANDATORY/OPTIONAL + ACTIVE badges and REAL "وصل: 1 جهاز / حدّث: 1 جهاز" chips + progress bar; cancel/reactivate/delete present.
+  TAB4: stat cards 9/9/9/10/1 exact, byVersion table (5 rows), pure-div 30-bar timeline with tooltips + edge date labels, event feed with emerald/amber/orange/stone icons, filters + debounced search ("OFFICE" → 5 OFFICE-PC-* rows), relative "منذ 40 دقيقة" times.
+  Zero page errors; only pre-existing console noise (notifications-timeout first-connection stall absorbed by apiClient retry). Browser closed to keep the 4 GB sandbox memory-safe; web :3000 + api :3003 healthy after.
+- Wrote agent-ctx/4-a-full-stack-developer.md with the full record.
+
+Stage Summary:
+- Public App Settings is fully rebuilt: 2,830 lines across shared.ts + 4 tabs + notes-input + a 111-line wrapper (replacing the 2,400-line monolith), zero hardcoded data — every number on screen comes from the live API.
+- Core same-name-installers requirement confirmed in the real UI: identical filenames stay separate rows, distinguished by push time (mtime) + exact storage key, with byte-exact ACTIVE identity and per-row Activate.
+- Full installer lifecycle E2E-proven through the UI: upload (auto-detect → ensure-record → XHR progress → auto-refetch) and delete (record + disk file cascade).
+- Lint clean, tsc at exact baseline, i18n complete in ar/en/fr with real translations, RTL-safe (logical properties only), no indigo/blue, responsive + 44px targets + thin custom scrollbars throughout.
+- Not committed (sandbox has no push credentials — unchanged); git also carries the parallel telemetry-backend task's files (apps/api/app-installs.ts, index.ts wiring, prisma schema) which this task did not touch.
+
+---
+Task ID: public-app-rebuild
+Agent: main (Z.ai Code) + full-stack-developer (4-a)
+Task: User report — "the whole public app setting is not working well: rebuild public app from scratch" — requirements: show ALL installers even with identical names, read live storage changes (renames), a real update pusher with accurate device counts (updates/uninstall-reinstall of the same device never count twice), mandatory+optional pushes with per-version active tracking, better manual upload, better version tracker, real data (nothing hardcoded).
+
+Work Log:
+- State check first: NO reset — HEAD 082a2c5 (avatar fix) intact, services up.
+- Prisma: added AppDevice (unique platform+fingerprint), AppInstallEvent, UpdatePush, UpdatePushAck; db:push OK.
+- API: new routes/app-installs.ts — PUBLIC /api/app-installs/register + /heartbeat (upsert with INSTALL/REINSTALL/UPDATE/HEARTBEAT event logic; response carries the full update payload + newest applicable ACTIVE push so devices poll-deliver pushes; ack auto-recorded when a device reports the pushed version) and ADMIN /devices /stats /events /pushes(+cancel/reactivate/delete). Registered in index.ts.
+- Verified by curl: reinstall dedupe (same fingerprint + new UUID → REINSTALL, installCount=2, SAME device row — one machine never counts twice); seeded 9-device fleet; stats show real totals/byPlatform/byVersion/30-day timeline; created push for windows→0.3.5 → device on 0.3.4 received it (delivered 1) → device heartbeat at 0.3.5 acked it (updated 1); per-version active counts update live.
+- Desktop: apps/desktop/device-telemetry.js (stable OS fingerprint via MachineGuid/IOPlatformUUID/machine-id; per-install UUID in userData regenerated on fresh install; register at T+20s, 6h heartbeat, offline retry; forwards update:available to renderer) wired into main.js whenReady; update:install IPC now opens the pushed downloadUrl; local-api gained /api/app-installs passthrough.
+- Mobile: BlastiNativeStatus.getStableDeviceId (Widevine MediaDrm ID — survives reinstall, no permission; ANDROID_ID fallback; returns versionName); web lib/device-report.ts (Capacitor-only register/heartbeat on start+resume, throttled) wired into client-boot-hardening.
+- Admin UI rebuilt by subagent (Task 4-a, full-stack-developer): admin-app-settings.tsx → thin wrapper over public-app/{installers,versions,pusher,devices}-tabs + shared.ts + admin-upload.ts; 148 publicApp* i18n keys × ar/en/fr. Subagent browser-E2E: 3 same-name installers as 3 distinct rows w/ one exact ACTIVE badge; full upload E2E; pusher create/cancel; devices search; lint 0 errors.
+- I browser-verified all 4 tabs myself with the live seeded data (screenshots): installers table (3 same-name rows, push times, activate buttons), versions table (real downloadCount + devices-per-version 4/1), push history (وصل:1 / حدّث:1 + progress bar), devices tab (9/9/9/10/1 stat cards, by-version table, 30-day timeline, event feed, device table with filters).
+- Added update-notice.tsx (renders pushed updates inside the desktop shell; mandatory = non-dismissable; install → pushed downloadUrl) mounted in layout.tsx; updateNotice* i18n keys ×3 languages.
+- Committed as 08f30ee-era commit on master (sandbox has no GitHub push credentials — user pushes from Windows/VPS).
+
+Stage Summary:
+- Public App Settings is a full rebuild backed by REAL device telemetry: every number (devices, active 7/30d, installs, updates, per-version actives, delivered/updated per push) is computed from live DB rows written by actual device check-ins — nothing hardcoded.
+- Same-name installers all appear (one row per disk file, push time from mtime); the live rescan picks up renames/deletes within 30s.
+- Update pusher: optional/mandatory pushes reach desktop (renderer dialog + OS notification + install button) and mobile (check-in payloads); per-push delivery stats are real.
+- Device identity: desktop uses OS machine id (survives updates+reinstalls); Android uses Widevine DRM id (survives reinstalls); dedupe is (platform, fingerprint) — the user's "uninstall/reinstall must not count as a new device" requirement is enforced server-side.
+- Environment note: the sandbox host OOM-watched the Next dev server to death AFTER my layout edit forced full recompiles (oom_kill counter stuck at 5, silent process kills) — all UI verification was completed BEFORE that (subagent full E2E + my 4-tab screenshot walkthrough); the final code state was verified by warm-compile 200 + SSR HTML sanity + lint. A dev-server restart on the VPS will serve it normally.
+- Deploy notes: desktop changes need a repackaged installer; Android needs a new APK build (new plugin method); web/API ship with the next deploy. DEPLOY_TOKEN warning card on the page is the pre-existing CI-watcher hint, unrelated.
+
+---
+Task ID: public-app-rebuild-cleanup
+Agent: main (Z.ai Code)
+Task: Post-verification cleanup — remove seeded test telemetry so the rebuilt Public App Settings starts from honest empty states.
+
+Work Log:
+- Browser-verified the FINAL committed code on the daemon-start.sh-stabilized server: installers tab (3 same-name rows → now cleaned), versions, pusher, devices tabs all live. Screenshots retained in /tmp/final-*.png.
+- Deleted test devices (9) via admin-db row API → cascades cleared events/acks; deleted test push; deleted test versions 0.3.4/0.3.5 (disk-cascade removed 2 fake 15-byte installers).
+- Final state: versions 0, devices 0, pushes 0, storage-files 0 — every future row comes from real device check-ins and real uploads.
+- Environment note: manually-spawned (`setsid nohup …`) Next dev servers kept dying ~30-60s after boot (silent external kill; NOT the kernel OOM killer — oom_kill stayed 5, cgroup peak 1.7GB/4GB). Booting through the sanctioned ./daemon-start.sh is stable (200 at t+175s) — use it for the web dev server in this sandbox.
+
+Stage Summary:
+- Feature complete and committed (49b53cc + follow-ups); telemetry tables clean for real data.
+- Deploy notes unchanged: desktop needs a repackaged installer; Android needs a rebuilt APK (new getStableDeviceId plugin method); web/API ship as-is.
+
+---
+Task ID: version-flow-and-launch-version
+Agent: main (Z.ai Code)
+Task: Answer "how to change any app or api version" (bumping package.json often left OLD version in installer names) + add the app version number to the desktop and mobile launching animations.
+
+Work Log:
+- Mapped the full version flow: Windows installer name ← apps/desktop/package.json; APK name ← apps/mobile/android/app/build.gradle versionName (apps/mobile/package.json was IGNORED); API self-report ← hardcoded '0.2.1' in FOUR places in apps/api/src/index.ts; root/web package.json versions decorative. Six divergent numbers total (0.2.0 / 0.3.4 / 0.2.1 / 0.1.0 / 1.0.0 / 1.0.0) — the root cause of the user's "old version in the build name" bug.
+- Created scripts/version-set.js: `bun run version:set x.y.z` writes ALL six sources in one shot (5 package.json files + build.gradle with derived always-monotonic versionCode major*1e6+minor*1e3+patch); `bun run version:check` audits the map with per-file annotations. Added both scripts to root package.json.
+- Fixed apps/api/src/index.ts: single API_VERSION constant read live from apps/api/package.json (new URL('../package.json', import.meta.url)) — replaces the 4 hardcoded '0.2.1' strings (/ , /health, /api/health, /api/discover).
+- Added a safety net to scripts/gradle.js: syncGradleVersionFromPackage() runs BEFORE the JDK/SDK checks on every Gradle invocation and rewrites build.gradle versionName/versionCode from apps/mobile/package.json — a manual package.json-only bump can never produce a stale-named APK. Verified end-to-end in the sandbox: bumped package.json to 1.1.0 → `node scripts/gradle.js assembleDebug` logged the sync (versionName "1.0.0"→"1.1.0", versionCode 2→1001000) → restored originals.
+- Desktop launch animation: consumer gate version line now reads "BLASTI Desktop v<version> · Build <date>" (buildLabel wired in; CSS bumped 0.62→0.72rem, opacity 0.6→0.85, tabular-nums). Dev gate already showed version+build.
+- Mobile launch animation (apps/web/src/components/shared/app-intro-animation.tsx): added a 'v<versionName>' badge that fades in under the بلاصتي wordmark; version comes from the Capacitor Device plugin getInfo().appVersion probed defensively via the injected global (zero @capacitor imports, same pattern as device-report.ts); stays hidden in plain browsers.
+- Browser-verified the edited intro at /?intro=1 (logo, ripples, wordmark intact, no console errors, badge correctly absent without the native bridge). Web dev server had to be spawned inside the same tool-command window (sandbox reaps background children; /api/dev-tools/web supervisor is disabled because .zscripts is absent).
+- Lint clean (only the pre-existing admin-storage-manager unused-directive warning). node --check on all touched scripts.
+- Committed 45d085e on sandbox master; cherry-picked CLEAN onto origin/master tip (032331a) and re-ran version-set --check there to prove CI applicability. Exported download/0001-feat-versions-one-command-version-bump-version-on-bo.patch + download/version-flow-and-launch-version.diff (8 files, +296/-6). Documented the whole flow in installer/README.md ("Changing the version" section).
+
+Stage Summary:
+- One answer for version changes: bun run version:set <x.y.z> → commit → push → CI names installers correctly and registers the right AppVersion draft in Public Apps Settings.
+- Underlying traps removed: API version no longer duplicated; mobile package.json is now enforced as the APK-name source; versions visible on BOTH launch animations (desktop gate label + mobile intro badge).
+- Versions were NOT unified automatically (desktop 0.3.4 vs mobile 1.0.0 — forcing one value would downgrade one platform); the tool lets the user pick any target.
+- Patches in download/ await the user's apply+push to GitHub (sandbox has no push credentials).
+
+---
+Task ID: R
+Agent: recovery-agent
+Task: Restore embedded PostgreSQL + API after sandbox session break
+
+Work Log:
+- STEP 1: Edited daemon-start.sh — replaced the legacy /dev/tcp PostgreSQL gate with the ss -ltn-based check (block inserted after the NEXTAUTH_URL export, before the API-on-3003 gate); no /dev/tcp constructs remain in the script.
+- STEP 2: bash -n /home/z/my-project/daemon-start.sh → SYNTAX-OK.
+- STEP 3: ./daemon-start.sh ran clean; /tmp/services.log tail: "Embedded PostgreSQL starting (PID 4331)" → "PostgreSQL ready" (~1s) → "API starting (PID 4361)" → "API ready"; Discovery dir missing (skipped, pre-existing); "Next.js already serving on :3000 — skipping (no duplicate instance)".
+- STEP 4: ss -ltn → LISTEN on 127.0.0.1:5432 + [::1]:5432 (PostgreSQL), 0.0.0.0:3000 (web), 0.0.0.0:3003 (API).
+- STEP 5: DATABASE_URL='postgresql://blasti:blasti@127.0.0.1:5432/blasti?schema=public' bun run db:push → Exited with code 0, Prisma Client v6.19.3 generated (schema pushed); bun run db:seed-if-empty → Exited with code 0 (seed applied, no demo customers).
+- STEP 6: pkill -f "bun src/index.ts"; re-ran ./daemon-start.sh → API restarted as PID 4535 → "API ready"; PostgreSQL and Next.js skipped (already up/healthy).
+- STEP 7: GET :3003/health → {"status":"ok","service":"@blasti/api","version":"0.2.1","bootId":"a72e6a2b-155e-411a-9c0d-d202e4cc7493",...} with sync routes registered; GET :3000 → HTTP 200; ss -ltn → 5432/3000/3003 all LISTEN.
+
+Stage Summary:
+- PostgreSQL: embedded cluster (/home/z/pg-embedded, user blasti/pass blasti/db blasti) LISTENING on 127.0.0.1:5432 (+[::1]); schema pushed and seeded.
+- API: @blasti/api v0.2.1 healthy on :3003, connected to the populated blasti DB.
+- Web: dev server healthy on :3000 (HTTP 200) — pre-existing instance reused, no duplicate started.
+- Discovery: mini-services/discovery-service directory still missing (pre-existing gap, out of scope for Task R).
+- daemon-start.sh remains idempotent and health-gated, now free of /dev/tcp probes; per-step notes in agent-ctx/R-recovery-notes.md.
+
+---
+Task ID: 2-b
+Agent: purchase-history-chips-agent
+Task: Customer purchase history — distinguish failed vs successful transactions (status chips + real aggregates)
+
+Work Log:
+- API (apps/api/src/routes/sms.ts GET /purchase): kept requireAuth + take-10 findMany (full model rows already carry status/paymentProvider/createdAt); added ONE groupBy({by:['status'], where:{userId}}) over ALL the user's purchases to compute totalPurchased=SUM(quantity WHERE APPROVED), totalSpent=SUM(price WHERE APPROVED), pendingCount=COUNT(WHERE PENDING). Response is now { success: true, purchases, totalPurchased, totalSpent, pendingCount } — flat success-prefixed shape matching the file's neighboring handlers; no 'data' key so api-client parseResponse returns it untouched and the hook's data.purchases/data.totalPurchased reads keep working. Verified compile via `bun build --target=bun` (rc=0).
+- Discovered path fix: the task named apps/web/src/hooks/use-profile-data.ts but the hook actually lives at apps/web/src/components/customer/profile/use-profile-data.ts — edited/committed the real file.
+- profile-types.ts: added PurchaseStatus union ('PENDING'|'APPROVED'|'REJECTED'|'FAILED'); PurchaseHistoryItem += status: PurchaseStatus | string, paymentProvider?: string; SmsStatsData += pendingCount: number. Checked the only other SmsStatsData-shaped consumer (notification-prefs.tsx) uses an inline structural type — unaffected.
+- use-profile-data.ts: state initializer and fetchPurchaseHistory now read/set pendingCount from the API response (data.pendingCount || 0) alongside totalPurchased/totalSpent.
+- profile-purchase-history.tsx: copied customer-history.tsx:88-96 statusChipConfig pattern into purchaseStatusChipConfig — APPROVED emerald + CheckCircle2, PENDING amber + Clock, REJECTED rose + XCircle, FAILED rose + AlertOctagon (verified all four exist in installed lucide-react 0.525.0, incl. AlertOctagon alias); chip rendered under the price on every row. Added All/Success/Pending/Failed pill filter row (Success=APPROVED, Failed=FAILED+REJECTED, default All) applied BEFORE the existing slice(0,5); empty state (noPurchases) unchanged, plus a filtered-empty message (purchaseNoResults). Footer keeps totalPurchased/totalSpent cards (now fed by real API aggregates instead of silently-0) and adds an amber pendingCount banner (clock icon + {count} label) shown only when > 0.
+- i18n (ar.ts SSOT / fr.ts / en.ts): added 10 keys in the Task-3 purchase block right after noPurchases — purchaseStatusApproved, purchaseStatusPending, purchaseStatusFailed, purchaseStatusRejected, purchaseFilterAll, purchaseFilterSuccess, purchaseFilterPending, purchaseFilterFailed, purchasePendingCount ('{count} عملية شراء قيد الانتظار' / '{count} achat(s) en attente' / '{count} purchase(s) pending'), purchaseNoResults (extra key for the filtered-empty state). Verified each key appears exactly once per file; fr/en Record<TranslationKeys,string> satisfied (no new tsc errors).
+- Verification: bun run lint → 0 errors, only the pre-existing admin-storage-manager unused-directive warning; targeted tsc --noEmit → zero errors in all touched web files (the ~427 repo-wide TS errors incl. ar.ts TS1117 duplicate-property lines 61/496/802/1206/… are pre-existing, none on my added lines); curl :3003/api/health → {"status":"ok",...} (no authenticated endpoint calls, per instructions).
+- Committed efd0a3d on sandbox master with exactly the 7 owned files (other dirty working-tree files left unstaged).
+
+Stage Summary:
+- Customers can now see per-transaction outcome: green Success / amber Pending / rose Failed|Rejected chips, filter the history by outcome, and the footer stats (totalPurchased/totalSpent) are finally REAL — computed APPROVED-only over the entire purchase history server-side, with a pending-approval counter when applicable.
+- One deliberate addition beyond the listed keys: purchaseNoResults for the active-filter-empty state.
+- Next actions if desired: render paymentProvider (manual vs chargily) as a subtle secondary tag per row — the field is now in the API payload and type but intentionally not displayed.
+
+---
+Task ID: 2-a
+Agent: back-button-version-agent
+Task: Android back button returns to the role's home view (when no overlay is open) + replace the hardcoded 1.0.0 in customer settings About with the real app version; delete the two dead mobile-back-button drafts.
+
+Work Log:
+- Verified the role → home-view mapping against the codebase before implementing (the task brief's provisional names were NOT literal): the store's own getDefaultViewForRole() (apps/web/src/store/use-app-store.ts:405-413) maps CUSTOMER → 'customer-home' (:410-411), AGENCY_STAFF/AGENCY_OWNER → 'agency-dashboard' (:408-409), SUPER_ADMIN → 'admin-dashboard' (:407); those are exact members of the ViewName union (use-app-store.ts:76, :92, :102) with hashes '#/customer' / '#/agency' / '#/admin' (use-app-store.ts:262, :279, :289; same names in lib/route-map.ts:11, :29, :45). There is no view named 'home' or 'dashboard'.
+- apps/web/src/lib/native-back-handler.ts: inserted the new step ② between overlay-close (①, unchanged) and the legacy history.back step — homeFirstPolicy() dynamically imports the store (same rule as currentLanguage(), no top-level store import), reads useAppStore.getState().user?.role + currentView (the SPA's source of truth, kept in lockstep with location.hash by setView → updateHashForView at use-app-store.ts:678 and by auth-provider.tsx:460 hashchange → setViewFromHash), and either setView(<role home>) ('navigated' → back press consumed) or reports 'at-home' → falls straight to ③ the existing double-press-to-exit toast (per spec: at home the press does NOT history.back()). Unknown role / store chunk failure → 'unknown' → legacy history.back() step preserved verbatim (depth checks, watchdog, navStack untouched). Header policy comment rewritten to the 4-step home-first policy. setView called via useAppStore.getState().setView(...) (signature `(view: ViewName) => void`, use-app-store.ts:235) — it updates currentView AND syncs the hash.
+- Deleted the two untracked drafts (rm, zero importers verified by project-wide grep): apps/web/src/components/shared/mobile-back-button.tsx + mobile-back-exit-hint.tsx.
+- NEW apps/web/src/lib/app-version.ts: getAppVersion(): Promise<string | null> with a module-level memoized promise; zero @capacitor imports; probes the shell-injected global (Capacitor.getPlugins('Device') → getInfo().appVersion, trimmed); typeof window === 'undefined' → null; never rejects (missing/throwing bridge → null). IMPORTANT typing fix: the brief's inline `Record<string, {getInfo?…}>` shape + `info?.getInfo?.()` does NOT type-check (TS2349 — `device?.getInfo` on a Record resolves to the VALUE type, calling it is "not callable"; the pre-existing inline probe in app-intro-animation.tsx had this same latent error, tolerated only because next.config sets typescript.ignoreBuildErrors: true). Typed getPlugins as returning the plugin object itself (`DevicePluginShape | undefined`) — runtime call chain byte-identical (`cap?.getPlugins?.('Device')` → `device?.getInfo?.()`), tsc-clean.
+- Bun smoke-tested all four paths of app-version.ts: no window (SSR) → null; window without Capacitor → null; mock Device plugin ' 1.1.0 ' → '1.1.0' (trimmed); throwing getInfo → null (never rejects); second call reuses the same settled promise (memoized).
+- app-intro-animation.tsx (61-83): inline probe replaced with getAppVersion() (mounted guard, badge still hidden when null — behavior identical); customer-settings.tsx: new appVersion state + mounted-guard useEffect, About row now renders {appVersion ?? '1.0.0'} (dir="ltr" and classes kept).
+- VERIFIED: bun run lint → exit 0, 0 errors, only the pre-existing admin-storage-manager.tsx:895 unused-directive warning (accepted). Full tsc --noEmit on apps/web shows ZERO errors in the four owned files (remaining errors are pre-existing, all in public/ standalone artifacts + next.config ignores build errors anyway).
+- Committed af15d42 (exactly the 4 owned files, +179/−29). Other agents' uncommitted working-tree files were left untouched.
+
+Stage Summary:
+- Back button (Android shell): overlay open → closes it; otherwise NOT at the role home → straight home via setView; already at home → "press back again to exit" flow; unknown role → legacy history.back(). Exact home views: customer 'customer-home', agency 'agency-dashboard', admin 'admin-dashboard' (evidence: use-app-store.ts:405-413getDefaultViewForRole, :76/:92/:102 ViewName union; route-map.ts:11/:29/:45).
+- Settings About row + launch-intro badge now share one memoized, never-rejecting version probe (lib/app-version.ts) reading the REAL Android versionName from the shell's Device plugin; plain browsers/Electron keep the '1.0.0' fallback (settings) / hidden badge (intro).
+- Dead drafts mobile-back-button.tsx / mobile-back-exit-hint.tsx removed; lint clean; commit af15d42 on sandbox master awaiting push.
+
+---
+Task ID: 2-c
+Agent: image-fix-agent (sub agent)
+Task: Fix "profile images, logos and all user-uploaded images are not shown across all apps/devices" — store RELATIVE upload URLs instead of request-origin absolute URLs, harden getProxiedUrl path-driven rebase, add DELETE /api/upload/asset.
+
+Work Log:
+- Root cause re-verified in code: (1) apps/api/src/routes/upload.ts baked `absoluteFileUrl(new URL(c.req.url).origin, …)` into FileAsset.url and the response — behind proxies/phones that stores http://localhost:3003/... (dead on any other device → <img> onError → initials placeholder); (2) getProxiedUrl's Capacitor branch rebased onto getNativeCloudUrl() which, after a FAILED LAN scan, returns the emulator-alias fallback http://10.0.2.2:3003 (native-cloud-resolver sets state.url=fallback on failure) — dead on physical phones; (3) gateway branch only repaired isFileApiPath URLs, LAN branch passed dead-host absolute URLs through raw.
+- storage.ts: added uploadUrlPath(bucket,yyyy,mm,filename) → canonical relative `/api/upload/file/<bucket>/<yyyy>/<mm>/<filename>` (reuses publicFilePath); added normalizeUploadUrlPath(url) — accepts absolute http(s) or root-relative, strips query/hash, validates `^/api/upload/file/<type>(/<yyyy>/<mm>)?/<name>$` (SAFE_TYPE_RE bucket + yyyy/mm regexes + safe name chars) and returns the canonical relative path, else null. Marked absoluteFileUrl as DEPRECATED for intake/storage (kept — files-sync.ts still uses it for its own response contract).
+- upload.ts: POST /api/upload no longer computes the request origin — `url` in the response AND FileAsset.url are now the relative uploadUrlPath(); `path`/storagePath unchanged (response shape preserved: url, path, filename, storagePath, deviceFileId, provider, size, type). Desktop local-api (apps/desktop/local-api) mirrors this route with its own absolute local URLs + relative `path` — contract compatible, NOT touched.
+- file-url.ts (helper extended): normalizeRecordFileUrls now strips ANY upload-file URL shape (desktop-local absolute, request-origin absolute, already relative) to the canonical RELATIVE path via normalizeUploadUrlPath; non-upload values pass through untouched; `base` param kept optional for compatibility. DB stores relative /api/upload/file/... from now on.
+- Normalize-on-write call sites updated (comments + dropped obsolete fileBase/PUBLIC_FILE_URL_BASE locals): user.ts PATCH /profile (avatarUrl), auth.ts registration avatar, agency.ts profile logo/cover + subscription receiptUrl. sync.ts caller unchanged (optional param keeps it compiling).
+- NEW endpoint in upload.ts: DELETE /api/upload/asset (requireAuth; JSON body {url}) — normalizeUploadUrlPath → 400 {error:'not an upload URL'} when null; FileAsset lookup by url = canonical path OR storagePath = implied storage location (catches legacy absolute-url rows); 404 when no row; ownership ownerId===user.id OR role==='SUPER_ADMIN' else 403; best-effort deleteByStoragePath + FileAsset row delete → {success:true}. Same auth/error/envelope conventions as the rest of the file.
+- native-cloud-resolver.ts: exported getNativeCloudUrlStatus(): {status} | null ('idle'|'scanning'|'found'|'failed'; null on SSR) so consumers can tell a PROVEN server from the failed-scan fallback.
+- utils.ts getProxiedUrl(): (a) Capacitor branch is fully path-driven for EVERY upload-file URL and trusts the resolver only when status ≠ 'failed' — on failure falls back to getCloudApiBaseUrl() (when it isn't just echoing the dead fallback) / NEXT_PUBLIC_API_URL / NEXT_PUBLIC_CLOUD_URL; (b) universal repair on loopback/LAN pages: absolute upload-file URLs with dead hosts are rebased onto page-host:3003 (Electron cloud base first) — same treatment relative paths already had; (c) Electron packaged-shell branch (127.0.0.1:3080 local API) untouched; gateway XTransformPort branch untouched. Legacy DB rows are covered by the path-driven rebase — NO client-side row migration (sandbox DB freshly seeded anyway).
+- Verification: tsc on edited API files shows only pre-existing errors (baseline compared via git stash); web tsc clean for utils.ts/native-cloud-resolver.ts (api-client.ts errors pre-existing, file untouched); bun run lint → 0 errors, 1 pre-existing warning (admin-storage-manager unused directive).
+- Functional curl tests (API restarted via pkill + bash daemon-start.sh; ./ form hit "Permission denied" this session): POST /api/upload (avatar) → {"success":true,"url":"/api/upload/file/avatar/2026/10/1791897812338-7e01cc63.png",...} — RELATIVE ✓; fetch-back → 200 ✓; DELETE /api/upload/asset unauthenticated → 401 {"success":false,"error":"Authentication required"} ✓. Authenticated e2e (admin/admin123): upload → relative url; DELETE /asset with a LEGACY ABSOLUTE url (http://localhost:3003/api/upload/file/...) → {"success":true}; blob gone (fetch-back 404); repeat DELETE → 404 "File asset not found"; non-upload URL → 400 "not an upload URL". DB check via @blasti/db: FileAsset.url = "/api/upload/file/avatar/2026/10/...png" (relative). PATCH /user/profile with absolute dead-host avatar URL stored the relative path (normalize-on-write proven). Test rows/files cleaned up afterwards.
+- Committed 73397ab on sandbox master (only the 8 owned files; other agents' dirty files left unstaged).
+
+Stage Summary:
+- Uploads now produce and store origin-agnostic RELATIVE /api/upload/file/... URLs; intake (register avatar, profile, agency logo/cover, receipt, sync push) normalizes any absolute upload URL to relative on write — new rows can never bake a dead host again.
+- getProxiedUrl repairs every upload-file URL per environment (gateway XTransformPort, LAN/loopback page-host:3003 — including legacy absolute dead-host rows, Capacitor proven resolver base with env fallback when the scan failed), so placeholders from unreachable stored URLs are gone on web, desktop and mobile.
+- DELETE /api/upload/asset landed exactly per the Task 2-d contract (400/401/403/404 semantics verified) — ready for client asset cleanup work.
+- AbsoluteFileUrl kept only for the desktop file-sync push response contract; no DB migration needed (path-driven rebase covers legacy rows).
+
+---
+Task ID: 2-e
+Agent: payment-resilience-agent
+Task: Enhance payment system to deal with timeout and failed transactions — stale-PENDING sweeper, settlement notifications, unverified-result guard on the client, realtime settlement toasts. ("enhance payment system so it can deal with timeout and failed transactions and have proper notification and message to not mistake the payment as done")
+
+Work Log:
+- Located the cron/sweeper: there is NO apps/api/src/cron.ts — the cron module lives at apps/api/src/routes/cron.ts (HTTP cron endpoints with verifyCronSecret); implemented the payment sweep there and committed it under that path.
+- SERVER SWEEPER (routes/cron.ts): export sweepPendingPayments() + in-process startPaymentSweeper() invoked at module scope (index.ts already imports the module for /api/cron — no index.ts edit needed; same start-from-worker-module pattern as workers/notification-worker.ts). Interval 5 min (unref'd); cheap COUNT guard first (skips entirely when no eligible rows); candidates = PENDING Transaction + PENDING SmsPurchase WHERE paymentProvider='chargily' AND providerRef NOT ''/NULL AND createdAt < now-30min, oldest-first, batch 25/run; per record: getCheckoutStatus(providerRef) → normalizeChargilyStatus → 'paid' → fulfillCheckoutPaid(...,'sweep'); 'failed' → fulfillCheckoutFailed(...,'sweep'); still 'pending' AND createdAt < now-24h → expireCheckout() then fulfillCheckoutFailed(...,'sweep-expired'); unreachable/bad row → warn + skip (retry next sweep), one bad row can't kill the run. Also exposed POST /api/cron/sweep-payments (verifyCronSecret) for external schedulers. Logs use [cron:payments]; registration log confirmed in /tmp/api-server.log.
+- SETTLEMENT NOTIFICATIONS (lib/chargily-fulfill.ts): new createTransactionSettlementNotification() — bilingual FR+EN title/body with amount + plan name, type 'PAYMENT_COMPLETED'/'PAYMENT_FAILED' (plain strings like existing SMS_PURCHASED etc.), userId = agency.ownerId (agency include extended with ownerId in both fulfill paths), entityId = transaction.id, created inside db.$transaction with recordSyncChange (mirrors the SMS path), wrapped try/catch so it never fails settlement. Wired into BOTH fulfillCheckoutPaid and fulfillCheckoutFailed PENDING branches. Source union widened to FulfillmentSource = 'webhook'|'poll'|'sweep'|'sweep-expired' with a settlementAuditAction() mapper keeping old webhook/poll audit names byte-identical and adding *_SWEEP_CONFIRMED/_SWEEP_FAILED.
+- CLIENT RESULT HARDENING (payment-result.tsx): new 'unverified' visual — when phase is 'unauthenticated' or 'no-checkout' AND ?status=success (the static return URL that proves nothing), the view now renders an AMBER state (pulsing amber ring + HelpCircle icon, t('paymentUnverifiedTitle'), t('paymentUnverifiedDesc') telling the user NOT to assume the payment went through and to check purchase/subscription history) instead of the guaranteed green check; amber-outline CTA (History icon, t('paymentUnverifiedCta')) → setView('agency-subscription') for AGENCY_OWNER/AGENCY_STAFF, 'customer-profile' otherwise; logged-out users keep the login CTA (their path to history). Authenticated polling path (checkout id → confirming → paid/failed) untouched.
+- REALTIME TOASTS (NEW apps/web/src/lib/payment-realtime.tsx — .tsx not .ts because it's a component that reuses the existing socket): PaymentRealtimeToasts mounts the useRealtime() hook (the app's ONLY socket singleton from hooks/use-realtime.tsx — no second connection) and shows sonner toast.success(t('paymentToastCompleted')) / toast.error(t('paymentToastFailed')) on 'payment:completed' / 'payment:failed' (emitted by chargily-fulfill.ts → POST /emit → broadcastEvent → agency:{agencyId}/customer:{userId} rooms). Joins customer:{userId} for any signed-in user + agency:{agencyId} for agency roles; handlers attach only when connected (avoids the native 8s URL-probe race), survive reconnects (singleton socket persists). Mounted with ONE import + one JSX element in client-boot-hardening.tsx (already imported in layout.tsx:58) — renders null, page-lifetime.
+- i18n: added 5 keys to ar.ts (SSOT for TranslationKeys) + fr.ts + en.ts, right after continuePayment: paymentUnverifiedTitle / paymentUnverifiedDesc / paymentUnverifiedCta / paymentToastCompleted / paymentToastFailed.
+- Verified live: API restarted (pkill + bash ./daemon-start.sh; ./daemon-start.sh lacks +x) → /health ok (bootId d29cabd2…); "[cron:payments] Payment sweeper registered (interval=5min, stale>30min, expire>24h, batch=25)" in /tmp/api-server.log; POST /api/cron/sweep-payments → {"success":true,"checked":0,...}; headless browser on /#/payment/result?status=success (logged out) shows the AMBER unverified title/description + login CTA (no green success), zero console errors, and a Socket.IO client connection logged by the API (realtime mount works).
+- bun run lint: 0 errors, 1 pre-existing warning (admin-storage-manager). tsc filters: no errors in touched API files; web tsc TS1117 duplicates in ar/fr/en.ts are pre-existing (verified at HEAD) and unrelated to the new keys (each added exactly once).
+
+Stage Summary:
+- No payment can stay PENDING forever anymore: the 5-min sweeper settles stale Chargily records from the gateway of truth (30 min stale threshold, 24 h force-expire, batch 25, skip-and-retry on gateway unavailability), unblocking agencies stuck on subscriptionStatus 'PENDING' and SMS packs stuck ungranted.
+- Every Transaction settlement (subscription/hardware) now notifies the agency owner in-app (bilingual, amount + plan) — previously only SMS buyers were notified — and every settlement pops a realtime toast for signed-in web users.
+- The client can no longer present an unverified ?status=success as a completed payment: unverifiable success renders an amber "not verified yet — check your history" state with a CTA to the right history view.
+- Files: routes/cron.ts + lib/chargily-fulfill.ts (API), payment-result.tsx + client-boot-hardening.tsx (1 import + 1 mount) + NEW lib/payment-realtime.tsx + ar/fr/en.ts (web). Commit 77ffc36 on sandbox master.
+- Note: GET /api/payment/checkout/:id poll fallback and webhook behavior unchanged; sweep settlements flow through the same idempotent fulfillment, so no double-grant risk (status-guarded transitions).
+
+---
+Task ID: 2-d
+Agent: image-preview-cleanup-agent (sub agent)
+Task: "when updating logo or profile image show a preview dialog first" + "when user update a new image and confirm to set active, delete the old one" — NEW shared ImageUploadPreviewDialog, preview-first flows in customer avatar + agency logo, best-effort DELETE /api/upload/asset of the replaced upload, i18n keys.
+
+Work Log:
+- Flow recon: customer avatar = customer-settings.tsx handleAvatarUpload (was upload+PATCH straight from the file input); agency logo = agency-profile.tsx inline input onChange (5 MB cap + type='logo' → POST /api/upload → updateField('logoUrl', …) — TEMPORARY state, persisted by the existing Save button, unchanged). coverUrl has NO upload UI anywhere (display-only in customer-side components) — logo is the only agency image upload; verified via rg across components.
+- NEW apps/web/src/components/shared/image-upload-preview-dialog.tsx ('use client'): shadcn Dialog; props {open, onOpenChange, previewUrl, shape:'circle'|'rounded', title, description, confirmLabel?, cancelLabel?, loading?, onConfirm}. circle → h-40 w-40 rounded-full ring-4 ring-emerald-100/dark:ring-emerald-900; rounded → max-h-72 w-full object-cover rounded-2xl ring-1 ring-border. Footer = outline Cancel + emerald-gradient Confirm (same gradient as ConfirmDialog) with Loader2 + disabled while loading; onOpenChange guarded so X/overlay/Esc cannot dismiss mid-upload. previewUrl wrapped in getProxiedUrl per project rule (blob:/data: pass through untouched — utils.ts:226 — so object URLs render as-is).
+- customer-settings.tsx: file input onChange now only validates (image/* type check, 5 MB cap via existing t('fileTooLarge') — same cap as the agency picker) → URL.createObjectURL → opens the dialog (e.target.value reset immediately so re-picking the same file works). Confirm (handleAvatarPreviewConfirm) runs the ORIGINAL upload+PATCH logic verbatim (FormData file+userId+type='avatar' → POST /api/upload?type=avatar → toast.success → setUser → PATCH /api/user/profile), captures previousAvatarUrl = user.avatarUrl BEFORE overwriting, closes dialog (closeAvatarPreview revokes the object URL) and then fire-and-forget deletes the old upload. Cancel routes through onOpenChange → closeAvatarPreview (revoke + clear). Upload failure keeps the dialog open (retryable), only toasts t('error').
+- Old-image delete call sites (exact contract of 2-c's DELETE /api/upload/asset): guarded by `oldUrl && oldUrl !== newUrl && oldUrl.includes('/api/upload/file/')` → apiFetch('/api/upload/asset', {method:'DELETE', headers Content-Type json, body JSON.stringify({url: oldUrl})}).catch(() => {}) — never awaited, never blocks/errs the UX. (1) customer-settings.tsx handleAvatarPreviewConfirm (previousAvatarUrl); (2) agency-profile.tsx handleLogoPreviewConfirm (previousLogoUrl, captured before updateField overwrite; persistence still via Save button).
+- i18n: added imagePreviewTitle + imagePreviewDesc to ar.ts (SSOT) / fr.ts / en.ts right after fileTooLarge ("معاينة الصورة الجديدة"/"هذه هي الصورة التي ستظهر. هل تريد تعيينها؟", "Aperçu de la nouvelle image"/"Voici comment l'image apparaîtra. La définir comme active ?", "Preview the new image"/"This is how the image will appear. Set it as active?"). confirm/cancel REUSED from existing keys (no imagePreviewConfirm/Cancel added). Each key verified exactly once per file (rg -c = 1).
+- chmod +x daemon-start.sh re-applied (sandbox reset had stripped it; file itself left unstaged — content belongs to another agent).
+- VERIFIED: bun run lint → 0 errors, 1 pre-existing warning (admin-storage-manager:895). Targeted tsc: zero errors in image-upload-preview-dialog.tsx / customer-settings.tsx / agency-profile.tsx; the TS1117 lines in ar/fr/en.ts are all pre-existing duplicates (verified none fall in the new 536-537/541-542 ranges).
+- BROWSER E2E (web dev server started on :3000 — it was NOT running despite the brief; API :3003 already up; owner/owner123 from seed): logged in → #/agency/profile → skip onboarding → تعديل (edit mode) → "رفع الشعار" → upload 8×8 PNG via agent-browser → PREVIEW DIALOG OPENED ("معاينة الصورة الجديدة" + إلغاء/تأكيد, img src=blob: complete=true naturalWidth=8) → تأكيد → POST /api/upload?type=logo 200 → dialog closed, card <img> renders the new /api/upload/file/logo/2026/10/…png (GET 200). SECOND replace → same preview → confirm → network log shows `DELETE http://localhost:3003/api/upload/asset (Fetch) 200` and fetch-back of the OLD logo returns 404 (file really gone). Customer avatar flow NOT browser-tested (seed has no CUSTOMER account) — it shares the same dialog component + identical handler pattern verified on the logo path; DELETE-with-avatar-URL semantics were e2e-proven in 2-c. Test logo rows/files left in the sandbox (throwaway seeded owner account).
+
+Stage Summary:
+- Picking a new avatar or agency logo now ALWAYS shows a centered preview dialog (circle for avatars, rounded for logos, emerald theme) before anything is uploaded; Confirm uploads/activates, Cancel discards with object-URL revocation.
+- Confirming a new avatar/logo best-effort deletes the REPLACED upload via DELETE /api/upload/asset (old URL captured pre-overwrite, guarded to upload-file URLs that differ, fire-and-forget with .catch) — no more orphaned avatar/logo blobs; UX never blocked or errored by cleanup.
+- Shared component: components/shared/image-upload-preview-dialog.tsx; i18n keys imagePreviewTitle/imagePreviewDesc (ar/fr/en), confirm/cancel reused.
+- Commit 0699d01 on sandbox master (exactly the 6 owned files).
+
+---
+Task ID: P
+Agent: P-export (patch export sub-agent)
+Task: Export the 5 feature commits from sandbox master as git patch files to download/ for GitHub delivery (sandbox cannot push); validate cherry-pick against origin/master tip 032331a in a throwaway worktree; produce one combined plain diff; clean up.
+
+Work Log:
+- Verified master history via `git log --oneline -8` + parent chain: HEAD = 0699d01; ACTUAL oldest→newest order of the 5 feature commits is efd0a3d (2-b) → af15d42 (2-a) → 73397ab (2-c) → 77ffc36 (2-e) → 0699d01 (2-d) — this DIFFERS from the order stated in the task brief (which had af15d42 first and 77ffc36 last). origin/master tip confirmed = 032331a ("versions"). Ranges were corrected accordingly (literal `af15d42~1..77ffc36` would have emitted only 3 patches and a diff missing 2-b + 2-d).
+- Step 1: `git worktree add /tmp/verify-origin2 origin/master` → detached HEAD 032331a, clean checkout. OK.
+- Step 2: cherry-picked the 5 commits onto the worktree in true chronological order (efd0a3d af15d42 73397ab 77ffc36 0699d01): efd0a3d (2-b) applied CLEAN (auto-merges in apps/web/src/i18n/{ar,en,fr}.ts, became 6e56c4a, 7 files +171/−31); af15d42 (2-a) CONFLICTED (content) in apps/web/src/components/customer/customer-settings.tsx and apps/web/src/components/shared/app-intro-animation.tsx. Per instructions NO resolution was attempted: `git cherry-pick --abort` executed, worktree back to pristine 032331a. Remaining commits (73397ab, 77ffc36, 0699d01) not attempted — blocked behind the 2-a conflict. Conflict is against origin/master's long-diverged content (tip 032331a vs local base 45d085e), consistent with previous sessions.
+- Step 3: exported per-commit patches `git format-patch efd0a3d~1..0699d01 -o download/` → 5 files 0001..0005 ([PATCH 1/5]…[PATCH 5/5], subjects verified: 1=2-b purchases, 2=2-a back button, 3=2-c images, 4=2-e payments, 5=2-d preview dialog). Sizes: 17461 / 14873 / 24664 / 32717 / 19732 bytes. `ls download/*.patch` confirms exactly 5.
+- Step 4: exported combined plain diff `git diff efd0a3d~1 0699d01 > download/updates-batch-back-button-images-payments.diff` (all 5 commits vs 45d085e): 103800 bytes, 2233 lines, 26 files touched; head shows valid `diff --git a/apps/api/src/lib/chargily-fulfill.ts …` header.
+- Step 5: `git worktree remove --force /tmp/verify-origin2` → worktree list back to /home/z/my-project only.
+- Progress notes appended after each step to agent-ctx/P-export-notes.md. No /dev/tcp constructs used anywhere.
+
+Stage Summary:
+- download/ now contains the deliverables: 0001-feat-purchases-status-chips-real-aggregates-in-custo.patch, 0002-feat-mobile-back-button-returns-to-role-home-dynamic.patch, 0003-fix-images-store-relative-upload-URLs-path-driven-re.patch, 0004-feat-payments-stale-PENDING-sweeper-settlement-notif.patch, 0005-feat-images-preview-dialog-before-set-active-best-ef.patch, updates-batch-back-button-images-payments.diff.
+- Cherry-pick validation vs origin/master (032331a): NOT fully clean — 2-b applies clean, 2-a conflicts (customer-settings.tsx, app-intro-animation.tsx). Whoever applies these on GitHub must apply 0001→0005 in order and resolve the 2-a conflict in those two files (expected: origin-side customer-settings/intro-animation diverged from local 45d085e base).
+- Sandbox master untouched (still at 0699d01); no push performed; worktree cleaned up.
+
+---
+Task ID: V
+Agent: browser-verification sub-agent (general-purpose)
+Task: Browser-verify BLASTI features (dynamic app version, purchase-history chips/filters, payment-result amber unverified guard, console cleanliness)
+
+Work log:
+- curl :3000 -> 200; API :3003/api/health -> 200. No servers started.
+- agent-browser: home renders (AR RTL). Screenshots /tmp/v-home.png.
+- Registered customer via API (POST /api/auth/register + /api/auth/verify with dev OTP bypass): vtask1791899487 / vtask123.
+- Owner login via UI (agency tab) -> #/agency dashboard renders (onboarding wizard closed). /tmp/v-owner-dashboard.png. Step 4 skipped per instructions.
+- Customer login via UI -> #/customer. Purchase history was empty-state, so seeded 2 SMS purchases via API (packs 20+50 -> PENDING) and flipped the 20-pack to APPROVED through the workspace db package (bun, packages/db) to exercise both chip states.
+- Purchase history UI: filter pills الكل/ناجحة/قيد الانتظار/فاشلة render; Success filter -> only APPROVED item; Failed -> "لا مشتريات ضمن هذا التصنيف"; APPROVED chip emerald (emerald-50/700/200), stats row (20 / 200 DA / 1 pending). /tmp/v-purchases.png.
+- Customer settings #/customer/settings: About group renders, إصدار التطبيق = 1.0.0 (dynamic version, browser fallback correct). /tmp/v-settings.png.
+- Mobile 390x844: settings + profile purchase history render, scrollWidth=390 == viewport (no horizontal overflow). /tmp/v-mobile.png, /tmp/v-mobile2.png.
+- Payment result logged out (fresh load with ?status=success): AMBER unverified card (title "لم يتم التأكد من الدفع بعد", amber icon, login CTA, NO green success). /tmp/v-payment.png.
+- agent-browser errors: none. Console: benign warnings (IndexedDB delete blocked once during storage clear, BootGate max-wait, vibrate capability) + recurring SyncEngine "agencyId is required for SUPER_ADMIN pull" -> API 400 (apps/api/src/routes/sync.ts:131) from non-agency sessions; 1x notifications poll timeout.
+
+Stage summary:
+- All 5 targeted features verified PASS (feature 3 skipped per instructions; already e2e-verified).
+- Observations (non-blocking, pre-existing): SyncEngine pull/push 400s for non-agency sessions (apps/api/src/routes/sync.ts:131/204/206); PaymentResult query effect doesn't re-run on same-document hash navigation (only affects in-app hash edits, not gateway returns).
+- No code changed; nothing committed. Test data: 1 customer account + 2 SmsPurchase rows created.
+
+---
+Task ID: R
+Agent: reset-recovery (main session)
+Task: "check if the app got reset" — verify sandbox state after suspected reset; restore runtime; re-export lost deliverables.
+
+Work Log:
+- State audit: git intact (HEAD e5141f7, clean tree, all commits from versions/updates/2-a..2-e/daemon-fix/notifications present). BUT: download/ folder WIPED, /home/z/pg-embedded (PostgreSQL binaries + data) WIPED, mini-services/ (chargily-mock :3021, discovery :3010) WIPED, all services DOWN (3000/3003/5432 dead).
+- origin/master fetch: user has been applying and pushing deliveries — tip is now 0dbe60a "versions 7". Content match: 032331a=versions, ac4a458=45d085e+fcdd64b (version flow + update delivery), 0dbe60a=2-a..2-e batch + e7304bd daemon fix + worklog. => ALL earlier deliveries are already on GitHub. Only e5141f7 (feat(notifications)) is NOT on origin.
+- Runtime rebuild: recreated /home/z/pg-embedded (bun + embedded-postgres@17.10.0-beta.17, PG 17.10 binaries; bun pm trust --all for hydrate-symlinks) + wrote boot-pg.mjs (idempotent: port-probe :5432, initdb if no data dir, start, createDatabase blasti, stay-alive timer; user/pass/db = blasti on 5432, persistent data at pg-embedded/data).
+- Booted full stack via daemon-start.sh (idempotent, health-gated): PG up, Web :3000 up; API crashed on @prisma/client not generated (node_modules generated client was wiped) => bun run db:generate + db:push (fresh schema) + db:seed-if-empty (agency MYA FREE/INACTIVE, plans FREE/BASIC/PREMIUM, owner account) => daemon-start.sh again => API :3003 healthy (version 0.2.1 self-reported live).
+- Browser verification (agent-browser): landing page renders fully (AR RTL, branding, nav, download CTA), zero console/page errors; POST /api/auth/login owner/owner123 => success:true (DB round-trip works). Discovery(3010) + chargily-mock(3021) absent (folders wiped, never git-tracked) — non-blocking, recreatable on demand.
+- Re-exported deliverables to download/: 0001-feat-notifications-professional-branded-email-layout.patch (format-patch --binary, 142 KB, includes GIT binary patch for apps/api/assets/branding/logo.png) + notification-system-branded-emails-preview-tests.diff (git diff --binary, 140 KB).
+- Cherry-pick validation in throwaway worktree at origin/master tip 0dbe60a: e5141f7 applies CLEAN (exit 0, no conflicts — unlike the previous 5-batch where 2-a conflicted). Worktree removed.
+
+Stage Summary:
+- Answer: code NOT reset (git intact) but runtime WAS reset — download/, pg-embedded, mini-services wiped; services down.
+- Restored: PG 17.10 embedded (fresh cluster + schema + seed), API :3003 + Web :3000 healthy and browser-verified.
+- download/ re-delivers the ONLY missing commit: e5141f7 notifications (branded email layout, template wiring, WYSIWYG previews, per-channel test inputs) — applies clean on origin/master 0dbe60a.
+- Fresh-seeded DB means old sandbox test data (e2e payment evidence, provider test keys, extra accounts) is gone by design.
+
+---
+Task ID: N
+Agent: native-fixes (main session)
+Task: (1) images show placeholders on mobile+desktop while web works, (2) mobile settings page shows hardcoded 1.0.0, (3) update pusher: select the installer (last 10 uploads, any version incl. active/older) not just the version.
+
+Work Log:
+- ROOT-CAUSED the version bug by reading the actual Capacitor 8 Android bridge: JSExport.getPluginJS injects `window.Capacitor.Plugins['Device']` with Promise-returning methods (nativePromise) — `Capacitor.getPlugins(name)` (what app-version.ts/device-report.ts probed) DOES NOT EXIST anywhere in the injected surface. So on every real phone: Device.getInfo never ran → settings row + intro badge stuck on '1.0.0'; BlastiNativeStatus/Device/App probes failed → device telemetry + resume heartbeats silently dead.
+- NEW apps/web/src/lib/native-plugin.ts — single defensive probe (Plugins[name] → getPlugin(name) → getPlugins(name) legacy). app-version.ts uses it + BOUNDED RETRY (5×500ms) so a bridge that lands after the first consumer mount resolves instead of memoizing null for the session (real fix for slow WebView init; also what made the browser test possible).
+- device-report.ts rewritten onto the helper (BlastiNativeStatus stable id → Device.getId/Info fallback → App appStateChange resume listener); capacitorGlobal() minimal local helper for isNativePlatform/getPlatform.
+- Images: audited getProxiedUrl rebase paths (web gateway ✓, desktop :3080 + local-api cloud-fallback proxy ✓, Capacitor native-base rebase ✓), checked capacitor.config (android.allowMixedContent=true already set, debug NSC cleartext permitted, Bridge.java wires MIXED_CONTENT_ALWAYS_ALLOW), manifest usesCleartextTraffic=true. Pipeline is correct for FRESH builds — the failure modes left are first-paint-before-resolver + dead baked bases + old absolute rows, where a failed <img> NEVER retries. NEW apps/web/src/components/shared/upload-image-recovery.tsx mounted in root layout: capture-phase error listener for /api/upload/file/* imgs, retries the same path against proven bases (electronAPI.cloudBaseUrl → adopted native base (never the failed fallback) → getCloudApiBaseUrl → env → page-host :3003 → gateway relative+XTransformPort), ≤4 attempts/path, and onNativeCloudStateChange('found') retro-fixes every failed img. Verified end-to-end in the browser: broke the agency logo src to a dead port → ~3s later the src auto-healed onto http://localhost:3003 and the PNG rendered (naturalWidth=8).
+- IMPORTANT context for the user: installed APK/installers built BEFORE their 'versions 7' push predate the 2-c image fix entirely — a rebuild via CI is REQUIRED for phones/desktops to show images; this session's recovery layer additionally heals wrong-base cases at runtime.
+- Pusher (public-app/pusher-tab.tsx): fetches ALL AppVersion rows (was published-only) + /public/active for Active badges; installer dropdown = LAST TEN UPLOADED for the platform with file name + size + upload date + النشط/مسودة badges, default-picks the newest upload, auto-re-picks on platform change. POST /app-installs/pushes now AUTO-PUBLISHES a DRAFT target (push must deliver a downloadable installer; public/active still picks the HIGHEST versionCode so an older pushed draft never becomes the active download). Devices already at/above the pushed version auto-satisfy (compareVersions <= 0 in buildUpdatePayload) — pushing older versions is safe by design.
+- i18n: +5 keys (publicAppPushTargetInstaller/PickInstaller/InstallerHint/ActiveBadge/DraftBadge) ar/fr/en, added right after publicAppPushTargetVersion.
+- Verified (agent-browser): pusher dropdown lists all seeded installers (v1.0.1–1.0.4 windows / v1.0.1–1.0.3 android-debug) with badges; default pick = newest; selected DRAFT v1.0.1 → push created (DB row android-debug→1.0.1 ACTIVE); curl draft push v1.0.2 after API restart → isPublished=true + publishedAt set. Version probe: injected Capacitor-8-shaped bridge → customer settings About row renders 9.9.9 (old code rendered 1.0.0). bun lint 0 errors (1 pre-existing warning).
+- Sandbox note: pusher fetchAll verification was slowed by the SyncEngine's pre-existing periodic 254-IP LAN sweep (:3080 discovery) saturating the sandbox network stack (apiClient 10s budgets expiring mid-scan) — environmental, pre-existing, unchanged.
+- Commit 7be3eb5 (10 files, +408/−65). format-patch + plain diff exported to download/. Cherry-pick onto origin/master tip 0dbe60a verified CLEAN (exit 0).
+
+Stage Summary:
+- Version display + device telemetry on Capacitor 8 phones: FIXED (real bridge probe path; retry-hardened).
+- Upload images on native shells: self-healing recovery layer added on top of the (already correct) 2-c rebase — placeholders now recover at runtime; devices still need a CI rebuild of the shells to get the code.
+- Update pusher: installer-level targeting (last 10 uploads incl. Active/Draft, any version incl. older than active) + draft auto-publish on push.
+- download/0001-fix-native-real-Capacitor-8-plugin-probe-self-healin.patch + native-images-pusher-fixes.diff (+ the still-unpushed notifications patch from session R).

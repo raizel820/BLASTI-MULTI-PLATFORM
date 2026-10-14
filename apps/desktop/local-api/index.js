@@ -3133,6 +3133,43 @@ function createApp() {
     const storagePath = yyyy && mm ? `${type}/${yyyy}/${mm}/${name}` : `${type}/${name}`
     const data = await fileStore.readByStoragePath(storagePath)
     if (!data) {
+      // ── Cloud-fallback proxy (avatar/logo placeholder fix) ──────────────
+      // The desktop UI rebases every upload-file URL onto THIS origin (the
+      // packaged shell CSP blocks plain-http remote hosts, and :3003 is
+      // usually firewalled — see web utils.getProxiedUrl). A blob that has
+      // not been file-synced to this device yet (e.g. an avatar uploaded
+      // from the phone) used to 404 here → initials placeholder again.
+      // Proxy the miss from the cloud's public capability URL once, cache
+      // it into the local store, and serve — the next render is instant and
+      // offline-safe. Every failure path degrades to the previous 404.
+      try {
+        const target = cloudBaseUrl() + '/api/upload/file/' + storagePath
+        const upstream = await fetch(target, { signal: AbortSignal.timeout(15000) })
+        if (upstream.ok) {
+          const buf = Buffer.from(await upstream.arrayBuffer())
+          if (buf.length > 0) {
+            // Best-effort cache — a failed write must never fail the response.
+            try {
+              const abs = fileStore.resolveRelativeStoragePath(storagePath)
+              if (abs) {
+                await require('fs').promises.mkdir(require('path').dirname(abs), { recursive: true })
+                await require('fs').promises.writeFile(abs, buf)
+              }
+            } catch { /* cache write is opportunistic */ }
+            const ext = (name.split('.').pop() || '').toLowerCase()
+            const mime = MIME_BY_EXT[ext] || 'application/octet-stream'
+            return new Response(new Uint8Array(buf), {
+              status: 200,
+              headers: {
+                'Content-Type': mime,
+                'Content-Length': String(buf.length),
+                'Cache-Control': 'public, max-age=31536000, immutable',
+                'Content-Disposition': 'inline',
+              },
+            })
+          }
+        }
+      } catch { /* offline / cloud unreachable → keep the original 404 */ }
       return c.json({ success: false, error: 'File not found' }, 404)
     }
     const ext = (name.split('.').pop() || '').toLowerCase()
@@ -3299,6 +3336,16 @@ function createApp() {
   }
   app.all('/api/app-versions', forwardAppVersions)
   app.all('/api/app-versions/*', forwardAppVersions)
+
+  /**
+   * Public App Settings rebuild — /api/app-installs cloud passthrough.
+   * Device install registration/heartbeats and the admin update-pusher live
+   * on the cloud only; the desktop reports its own installs through this
+   * proxy and the admin panel (rendered inside the shell) manages pushes
+   * through it. Same verbatim forwarding as /api/app-versions above.
+   */
+  app.all('/api/app-installs', forwardAppVersions)
+  app.all('/api/app-installs/*', forwardAppVersions)
 
   /**
    * Round 15 — /api/agencies cloud proxy. Agency CREATION is a cloud-native

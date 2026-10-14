@@ -29,6 +29,7 @@ import {
   maskTarget,
   type VerificationPurpose,
 } from '../lib/verification-service'
+import { deliverTemplate } from '../lib/messaging/template-service'
 import {
   checkRateLimit,
   checkIpBlocked,
@@ -516,11 +517,11 @@ app.post('/register', async (c) => {
       ? (validation.data.wilaya.padStart(2, '0').match(/^(0[1-9]|[1-5][0-8])$/) ? validation.data.wilaya.padStart(2, '0') : undefined)
       : undefined
     const registerCommune = validation.data.commune?.trim() || undefined
-    // Round 15 — the desktop local API returns LOCAL file URLs (offline-first
-    // upload); rewrite them to this API's public URLs so the stored avatar is
+    // Task 2-c — normalize on write: the avatar is stored as the canonical
+    // RELATIVE /api/upload/file/... path (desktop-local absolute URLs and
+    // request-origin absolute URLs are stripped to their path), so it stays
     // reachable from every device once the file-sync push delivers the blob.
-    const fileBase = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '') || new URL(c.req.url).origin
-    const avatarUrl = normalizeRecordFileUrls({ avatarUrl: validation.data.avatarUrl }, fileBase).avatarUrl
+    const avatarUrl = normalizeRecordFileUrls({ avatarUrl: validation.data.avatarUrl }).avatarUrl
 
     // Check for duplicate username
     const existingUser = await db.user.findUnique({
@@ -813,6 +814,16 @@ app.post('/verify', async (c) => {
       : user.role === 'AGENCY_STAFF'
         ? (await db.agencyStaff.findFirst({ where: { userId: user.id, isActive: true }, select: { agencyId: true } }))?.agencyId ?? null
         : null
+
+    // ── Welcome email (fire-and-forget, never blocks the session) ──
+    // Sent once when the account becomes FULLY verified — this endpoint is
+    // only reachable while verification is pending, so it naturally runs once.
+    if (refreshed?.email && emailVerified) {
+      deliverTemplate({
+        key: 'welcome', channel: 'EMAIL', target: refreshed.email,
+        language: user.language || 'en', vars: { fullName: user.fullName },
+      }).catch(() => undefined)
+    }
 
     const sessionUser: SessionUser = {
       id: user.id,
@@ -1149,7 +1160,7 @@ app.post('/forgot-password', async (c) => {
     // Find user by username (but don't reveal existence)
     const user = await db.user.findUnique({
       where: { username },
-      select: { id: true, username: true },
+      select: { id: true, username: true, fullName: true, email: true, phoneNumber: true, language: true },
     })
 
     if (user) {
@@ -1164,8 +1175,37 @@ app.post('/forgot-password', async (c) => {
         expiresAt,
       })
 
-      // Log to console (dev mode — no email server)
-      console.log(`[Forgot Password] Reset token for user "${user.username}": ${resetToken} (expires in 15 min)`)
+      // ── Deliver the reset code through the notification templates ──
+      // EMAIL when the user has an address, otherwise SMS (both use the
+      // admin-editable password_reset template). Fallback: console log so
+      // dev environments never lose the token.
+      const vars = { fullName: user.fullName ?? user.username, code: resetToken, expiryMinutes: 15 }
+      let delivered = false
+      if (user.email) {
+        const r = await deliverTemplate({
+          key: 'password_reset', channel: 'EMAIL', target: user.email,
+          language: user.language || 'en', vars,
+        }).catch(() => null)
+        delivered = Boolean(r?.success)
+      } else if (user.phoneNumber) {
+        // SMS legibility: a compact 8-char code instead of the 64-hex token
+        const smsCode = crypto.randomBytes(4).toString('hex').toUpperCase()
+        resetTokenStore.set(smsCode, {
+          userId: user.id,
+          username: user.username,
+          expiresAt,
+        })
+        const r = await deliverTemplate({
+          key: 'password_reset', channel: 'SMS', target: user.phoneNumber,
+          language: user.language || 'en',
+          vars: { ...vars, code: smsCode },
+        }).catch(() => null)
+        delivered = Boolean(r?.success)
+      }
+      if (!delivered) {
+        // Log to console (dev mode — no provider configured)
+        console.log(`[Forgot Password] Reset token for user "${user.username}": ${resetToken} (expires in 15 min)`)
+      }
     }
 
     // Always return the same message to prevent username enumeration

@@ -29,16 +29,23 @@ export interface NotifPrefs {
   completed: boolean;
 }
 
+/** Task 2-b: purchase lifecycle status (SmsPurchase.status — PENDING → APPROVED | REJECTED | FAILED) */
+export type PurchaseStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'FAILED';
+
 export interface PurchaseHistoryItem {
   id: string;
   quantity: number;
   price: number;
   createdAt: string;
+  status: PurchaseStatus | string;
+  paymentProvider?: string;
 }
 
 export interface SmsStatsData {
   totalPurchased: number;
   totalSpent: number;
+  /** Count of purchases still awaiting approval (status = PENDING) */
+  pendingCount: number;
 }
 
 export type ProfileTranslate = (key: TranslationKeys, params?: Record<string, string>) => string;

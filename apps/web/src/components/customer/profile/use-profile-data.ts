@@ -53,7 +53,7 @@ export function useProfileData() {
 
   const [purchaseHistory, setPurchaseHistory] = useState<PurchaseHistoryItem[]>([]);
   const [purchaseHistoryLoading, setPurchaseHistoryLoading] = useState(false);
-  const [smsStatsData, setSmsStatsData] = useState<SmsStatsData>({ totalPurchased: 0, totalSpent: 0 });
+  const [smsStatsData, setSmsStatsData] = useState<SmsStatsData>({ totalPurchased: 0, totalSpent: 0, pendingCount: 0 });
 
   const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
   const [statsLoading, setStatsLoading] = useState(true);
@@ -108,7 +108,12 @@ export function useProfileData() {
       if (res.ok) {
         const data = await res.json();
         setPurchaseHistory(data.purchases || []);
-        setSmsStatsData({ totalPurchased: data.totalPurchased || 0, totalSpent: data.totalSpent || 0 });
+        // Task 2-b: API now returns real aggregates (APPROVED-only sums + pending count)
+        setSmsStatsData({
+          totalPurchased: data.totalPurchased || 0,
+          totalSpent: data.totalSpent || 0,
+          pendingCount: data.pendingCount || 0,
+        });
         setPurchasedSms(data.totalPurchased || 0);
       }
     } catch { /* silent */ } finally {

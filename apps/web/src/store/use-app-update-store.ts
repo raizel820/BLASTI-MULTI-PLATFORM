@@ -1,0 +1,513 @@
+'use client';
+
+/**
+ * App-update delivery store (Public App Settings rebuild).
+ *
+ * One state machine for BOTH native shells:
+ *   • Electron (desktop) → main-process IPC: checkForUpdates / downloadUpdate
+ *     (progress events) / installUpdate (quit + silent NSIS install)
+ *   • Capacitor (Android) → BlastiNativeStatus plugin: getAppInfo (real
+ *     versionName) / getNetworkInfo (Wi-Fi) / downloadUpdate (system
+ *     DownloadManager, polled) / installUpdate (package-installer intent)
+ *   • Plain web → no self-update (the VPS serves the latest web bundle);
+ *     every check() call no-ops.
+ *
+ * Update-check triggers (per product spec):
+ *   - every app opening (AppUpdateManager mounts → 'startup')
+ *   - after a sync cycle (BootGate release → 'sync')
+ *   - manual "Check for updates" (sidebar / More sheet / settings → 'manual')
+ *
+ * Mandatory updates block the ENTIRE app (full-screen gate) until installed;
+ * optional updates show a dialog with "Update later" — afterwards every
+ * manual-check button turns into "Update now".
+ *
+ * Check API: PUBLIC GET /api/app-versions/check?platform=&version= (also fed
+ * by pushed update:available IPC events from device telemetry check-ins).
+ */
+
+import { create } from 'zustand';
+import { buildCloudUrl } from '@/lib/api-client';
+import {
+  loadAppUpdateSettings,
+  loadPostponedVersion,
+  savePostponedVersion,
+} from '@/lib/app-update-settings';
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+export type AppUpdateStatus =
+  | 'idle'
+  | 'checking'
+  | 'available'
+  | 'downloading'
+  | 'downloaded'
+  | 'installing'
+  | 'error';
+
+export interface AppUpdateInfo {
+  version: string;
+  currentVersion: string;
+  isMandatory: boolean;
+  /** Relative downloadUrl exactly as the API returns it (main resolves it). */
+  downloadUrl: string;
+  /** Absolute URL for the Capacitor DownloadManager (resolved against cloud). */
+  absoluteDownloadUrl: string;
+  releaseNotes?: string;
+  releaseNotesAr?: string;
+  releaseNotesFr?: string;
+  fileSize: number;
+  pushMessage?: string;
+  pushMessageAr?: string;
+  pushMessageFr?: string;
+}
+
+export interface AppUpdateProgress {
+  percent: number;
+  receivedBytes: number;
+  totalBytes: number;
+}
+
+type Shell = 'electron' | 'capacitor' | 'web';
+
+interface ElectronUpdatesAPI {
+  getAppVersion?: () => Promise<string>;
+  checkForUpdates?: () => Promise<CheckResponse>;
+  downloadUpdate?: (payload: { url: string; version: string }) => Promise<unknown>;
+  installUpdate?: () => Promise<{ ok?: boolean; error?: string }>;
+  getNetworkInfo?: () => Promise<{ isWifi?: boolean }>;
+  onUpdateProgress?: (cb: (payload: UpdateProgressEvent) => void) => () => void;
+  onUpdateAvailable?: (cb: (payload: PushPayload) => void) => void;
+}
+
+interface UpdateProgressEvent {
+  status: 'downloading' | 'downloaded' | 'error';
+  percent?: number;
+  receivedBytes?: number;
+  totalBytes?: number;
+  error?: string;
+  version?: string;
+}
+
+interface PushPayload {
+  version?: string;
+  currentVersion?: string;
+  isMandatory?: boolean;
+  releaseNotes?: string;
+  releaseNotesAr?: string;
+  releaseNotesFr?: string;
+  downloadUrl?: string;
+  fileSize?: number;
+  push?: { message?: string; messageAr?: string; messageFr?: string; isMandatory?: boolean } | null;
+}
+
+interface CheckResponse {
+  success?: boolean;
+  updateAvailable?: boolean;
+  isMandatory?: boolean;
+  latestVersion?: string;
+  currentVersion?: string;
+  downloadUrl?: string;
+  releaseNotes?: string;
+  releaseNotesAr?: string;
+  releaseNotesFr?: string;
+  fileSize?: number;
+}
+
+interface CapacitorGlobal {
+  isNativePlatform?: () => boolean;
+  getPlatform?: () => string;
+  Plugins?: Record<string, {
+    getAppInfo?: () => Promise<{ versionName?: string; versionCode?: number }>;
+    getNetworkInfo?: () => Promise<{ isWifi?: boolean; isUnmetered?: boolean; connectionType?: string }>;
+    downloadUpdate?: (opts: { url: string; version?: string }) => Promise<{ downloadId?: number }>;
+    getDownloadProgress?: (opts: { downloadId: number }) => Promise<{
+      status?: string; percent?: number; bytesSoFar?: number; totalBytes?: number; localUri?: string;
+    }>;
+    installUpdate?: (opts: { downloadId?: number; filePath?: string }) => Promise<{ ok?: boolean }>;
+  }>;
+}
+
+export interface AppUpdateState {
+  status: AppUpdateStatus;
+  info: AppUpdateInfo | null;
+  progress: AppUpdateProgress | null;
+  error: string | null;
+  needsInstallPermission: boolean;
+  /** Version the user postponed with "Update later" (drives "Update now"). */
+  postponedVersion: string | null;
+  lastCheckAt: number;
+  checking: boolean;
+  /** True when the LAST check could not reach the cloud (manual toast picks). */
+  lastCheckFailed: boolean;
+  /** User opened the optional-update dialog via a manual button (Update now). */
+  dialogRequested: boolean;
+
+  check: (trigger: 'startup' | 'sync' | 'manual' | 'resume' | 'push') => Promise<boolean>;
+  startDownload: () => Promise<void>;
+  install: () => Promise<void>;
+  postpone: () => void;
+  requestDialog: () => void;
+  closeDialog: () => void;
+  applyProgress: (payload: UpdateProgressEvent) => void;
+  ingestPushPayload: (payload: PushPayload) => Promise<void>;
+  clearError: () => void;
+  resetNeedsPermission: () => void;
+}
+
+// ─── Shell helpers ───────────────────────────────────────────────────────────
+
+function electronAPI(): ElectronUpdatesAPI | null {
+  if (typeof window === 'undefined') return null;
+  return ((window as unknown as Record<string, unknown>).electronAPI as ElectronUpdatesAPI) ?? null;
+}
+
+function capacitor(): CapacitorGlobal | null {
+  if (typeof window === 'undefined') return null;
+  const cap = (window as unknown as Record<string, unknown>).Capacitor as CapacitorGlobal | undefined;
+  return cap?.isNativePlatform?.() ? cap : null;
+}
+
+function plugin(): NonNullable<CapacitorGlobal['Plugins']>[string] | null {
+  return capacitor()?.Plugins?.BlastiNativeStatus ?? null;
+}
+
+function currentShell(): Shell {
+  if (electronAPI()) return 'electron';
+  if (capacitor()) {
+    // Only Android has a sideload update path — iOS has none (App Store).
+    return capacitor()?.getPlatform?.() === 'android' ? 'capacitor' : 'web';
+  }
+  // Dev/preview override (same key the PlatformSwitcher uses): lets the
+  // update UI be exercised in a plain browser against the real /check API.
+  try {
+    if (process.env.NODE_ENV !== 'production' && typeof localStorage !== 'undefined'
+      && window.localStorage.getItem('blasti-platform-override') === 'electron') return 'electron';
+  } catch { /* no storage */ }
+  return 'web';
+}
+
+/** Map the detected desktop OS to the API platform channel. */
+function desktopPlatform(): string {
+  if (typeof navigator === 'undefined') return 'windows';
+  const ua = navigator.userAgent;
+  if (ua.includes('Windows')) return 'windows';
+  if (ua.includes('Mac')) return 'mac';
+  return 'linux';
+}
+
+async function isWifiConnection(): Promise<boolean> {
+  try {
+    if (currentShell() === 'electron') {
+      const info = await electronAPI()?.getNetworkInfo?.();
+      return info?.isWifi !== false; // unknown → never block
+    }
+    if (currentShell() === 'capacitor') {
+      const info = await plugin()?.getNetworkInfo?.();
+      return info?.isWifi !== false; // unknown → never block
+    }
+    const conn = (typeof navigator !== 'undefined' ? (navigator as unknown as { connection?: { type?: string; effectiveType?: string } }).connection : undefined);
+    if (conn?.type) return conn.type === 'wifi' || conn.type === 'ethernet';
+    return true; // unknown → never block
+  } catch {
+    return true;
+  }
+}
+
+/** Minimum spacing between AUTOMATIC checks (manual always goes through). */
+const AUTO_CHECK_THROTTLE_MS = 60_000;
+
+async function fetchCheck(platform: string, version: string): Promise<CheckResponse | null> {
+  try {
+    const res = await fetch(buildCloudUrl('/api/app-versions/check', { platform, version }), {
+      headers: { accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as CheckResponse;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Android download polling ────────────────────────────────────────────────
+
+let androidPollTimer: ReturnType<typeof setInterval> | null = null;
+
+function stopAndroidPolling() {
+  if (androidPollTimer) {
+    clearInterval(androidPollTimer);
+    androidPollTimer = null;
+  }
+}
+
+function startAndroidPolling(downloadId: number) {
+  stopAndroidPolling();
+  androidPollTimer = setInterval(async () => {
+    try {
+      const res = await plugin()?.getDownloadProgress?.({ downloadId });
+      if (!res) return;
+      if (res.status === 'successful') {
+        stopAndroidPolling();
+        getStore().setState({ status: 'downloaded', progress: { percent: 100, receivedBytes: res.bytesSoFar ?? 0, totalBytes: res.totalBytes ?? 0 } });
+      } else if (res.status === 'failed') {
+        stopAndroidPolling();
+        getStore().setState({ status: 'error', error: 'download-failed' });
+      } else if (res.status === 'running' || res.status === 'pending' || res.status === 'paused') {
+        getStore().setState({
+          status: 'downloading',
+          progress: {
+            percent: res.percent ?? 0,
+            receivedBytes: res.bytesSoFar ?? 0,
+            totalBytes: res.totalBytes ?? 0,
+          },
+        });
+      }
+    } catch {
+      /* transient query failure — keep polling */
+    }
+  }, 1200);
+}
+
+// Module-level access for the polling closure (created before the store).
+let storeInstance: ReturnType<typeof createAppUpdateStore> | null = null;
+function getStore() {
+  return storeInstance as unknown as { setState: (partial: Partial<AppUpdateState>) => void };
+}
+
+// ─── Store ───────────────────────────────────────────────────────────────────
+
+function createAppUpdateStore() {
+  return create<AppUpdateState>((set, get) => ({
+    status: 'idle',
+    info: null,
+    progress: null,
+    error: null,
+    needsInstallPermission: false,
+    postponedVersion: loadPostponedVersion(),
+    lastCheckAt: 0,
+    checking: false,
+    lastCheckFailed: false,
+    dialogRequested: false,
+
+    check: async (trigger) => {
+      const shell = currentShell();
+      if (shell === 'web') return false; // plain web never self-updates
+
+      const { lastCheckAt, checking } = get();
+      if (checking) return false;
+      if (trigger !== 'manual' && Date.now() - lastCheckAt < AUTO_CHECK_THROTTLE_MS) return false;
+      set({ checking: true, status: 'checking' });
+      try {
+        let info: AppUpdateInfo | null = null;
+        let checkFailed = false;
+
+        if (shell === 'electron') {
+          const api = electronAPI();
+          const version = (await api?.getAppVersion?.().catch(() => '')) || '';
+          if (api && !version) return finishIdle();
+          let res: CheckResponse | null = null;
+          if (api) {
+            res = (await api.checkForUpdates?.()) ?? null;
+          } else {
+            // Dev/preview (no preload bridge): query the same public endpoint
+            // from the renderer with a placeholder current version.
+            res = await fetchCheck(desktopPlatform(), '0.0.1');
+          }
+          if (!res?.success) checkFailed = true;
+          if (res?.success && res.updateAvailable && res.latestVersion && res.downloadUrl) {
+            info = {
+              version: res.latestVersion,
+              currentVersion: res.currentVersion || version,
+              isMandatory: res.isMandatory === true,
+              downloadUrl: res.downloadUrl,
+              absoluteDownloadUrl: '',
+              releaseNotes: res.releaseNotes,
+              releaseNotesAr: res.releaseNotesAr,
+              releaseNotesFr: res.releaseNotesFr,
+              fileSize: res.fileSize ?? 0,
+            };
+          }
+        } else {
+          // Android: try the release channel first, then the debug channel
+          // (CI currently publishes debug APKs to android-debug).
+          const capPlugin = plugin();
+          const appInfo = await capPlugin?.getAppInfo?.().catch(() => null);
+          const version = String(appInfo?.versionName || '');
+          if (!version) return finishIdle();
+          for (const platform of ['android', 'android-debug']) {
+            const res = await fetchCheck(platform, version);
+            if (!res?.success || !res.updateAvailable || !res.latestVersion || !res.downloadUrl) continue;
+            info = {
+              version: res.latestVersion,
+              currentVersion: res.currentVersion || version,
+              isMandatory: res.isMandatory === true,
+              downloadUrl: res.downloadUrl,
+              absoluteDownloadUrl: buildCloudUrl(res.downloadUrl),
+              releaseNotes: res.releaseNotes,
+              releaseNotesAr: res.releaseNotesAr,
+              releaseNotesFr: res.releaseNotesFr,
+              fileSize: res.fileSize ?? 0,
+            };
+            break;
+          }
+        }
+
+        set({ checking: false, lastCheckAt: Date.now(), lastCheckFailed: checkFailed });
+
+        if (!info) {
+          // Up to date (or the cloud was unreachable — lastCheckFailed marks it)
+          set({ status: 'idle', error: null });
+          return false;
+        }
+
+        // A NEWER version than the postponed one clears the postpone.
+        if (get().postponedVersion && get().postponedVersion !== info.version) {
+          savePostponedVersion(null);
+          set({ postponedVersion: null });
+        }
+
+        set({ info, status: 'available', error: null, progress: null });
+        await maybeAutoDownload(info);
+        return true;
+      } catch {
+        set({ checking: false, status: 'idle', lastCheckFailed: true });
+        return false;
+      }
+
+      function finishIdle(): boolean {
+        set({ checking: false, lastCheckAt: Date.now(), status: 'idle', lastCheckFailed: true });
+        return false;
+      }
+    },
+
+    startDownload: async () => {
+      const { info, status } = get();
+      if (!info || status === 'downloading' || status === 'downloaded') return;
+      set({ status: 'downloading', error: null, needsInstallPermission: false, progress: { percent: 0, receivedBytes: 0, totalBytes: info.fileSize } });
+      try {
+        if (currentShell() === 'electron') {
+          await electronAPI()?.downloadUpdate?.({ url: info.downloadUrl, version: info.version });
+          // Progress arrives via onUpdateProgress → applyProgress.
+        } else {
+          const res = await plugin()?.downloadUpdate?.({ url: info.absoluteDownloadUrl || info.downloadUrl, version: info.version });
+          if (res?.downloadId) startAndroidPolling(res.downloadId);
+          else set({ status: 'error', error: 'download-failed' });
+        }
+      } catch {
+        set({ status: 'error', error: 'download-failed' });
+      }
+    },
+
+    install: async () => {
+      const { status } = get();
+      if (status !== 'downloaded') return;
+      set({ status: 'installing' });
+      try {
+        if (currentShell() === 'electron') {
+          await electronAPI()?.installUpdate?.();
+          // The main process quits and runs the NSIS installer.
+        } else {
+          await plugin()?.installUpdate?.({});
+          // Android: the package installer opens over our activity.
+        }
+      } catch {
+        set({ status: 'downloaded', needsInstallPermission: true });
+      }
+    },
+
+    postpone: () => {
+      const { info } = get();
+      if (!info) return;
+      savePostponedVersion(info.version);
+      set({ postponedVersion: info.version, dialogRequested: false });
+    },
+
+    requestDialog: () => set({ dialogRequested: true }),
+    closeDialog: () => set({ dialogRequested: false }),
+
+    applyProgress: (payload) => {
+      if (payload.status === 'downloading') {
+        set({
+          status: 'downloading',
+          progress: {
+            percent: payload.percent ?? 0,
+            receivedBytes: payload.receivedBytes ?? 0,
+            totalBytes: payload.totalBytes ?? 0,
+          },
+        });
+      } else if (payload.status === 'downloaded') {
+        stopAndroidPolling();
+        set({
+          status: 'downloaded',
+          progress: { percent: 100, receivedBytes: payload.receivedBytes ?? 0, totalBytes: payload.totalBytes ?? 0 },
+        });
+      } else if (payload.status === 'error') {
+        stopAndroidPolling();
+        set({ status: 'error', error: payload.error || 'download-failed' });
+      }
+    },
+
+    ingestPushPayload: async (payload) => {
+      const shell = currentShell();
+      if (shell === 'web') return;
+      if (!payload?.version || !payload?.downloadUrl) return;
+      const { info, status } = get();
+      // A download already targeting THIS version keeps running untouched.
+      if (status === 'downloading' && info?.version === payload.version) return;
+      const mandatory = payload.isMandatory === true || payload.push?.isMandatory === true;
+      const next: AppUpdateInfo = {
+        version: payload.version,
+        currentVersion: payload.currentVersion || info?.currentVersion || '',
+        isMandatory: mandatory,
+        downloadUrl: payload.downloadUrl,
+        absoluteDownloadUrl: shell === 'capacitor' ? buildCloudUrl(payload.downloadUrl) : '',
+        releaseNotes: payload.releaseNotes,
+        releaseNotesAr: payload.releaseNotesAr,
+        releaseNotesFr: payload.releaseNotesFr,
+        fileSize: payload.fileSize ?? 0,
+        pushMessage: payload.push?.message,
+        pushMessageAr: payload.push?.messageAr,
+        pushMessageFr: payload.push?.messageFr,
+      };
+      if (get().postponedVersion && get().postponedVersion !== next.version) {
+        savePostponedVersion(null);
+        set({ postponedVersion: null });
+      }
+      set({ info: next, status: 'available', error: null, lastCheckAt: Date.now() });
+      await maybeAutoDownload(next);
+    },
+
+    clearError: () => set({ error: null, status: get().info ? 'available' : 'idle' }),
+    resetNeedsPermission: () => set({ needsInstallPermission: false }),
+  }));
+}
+
+/** Auto-download honouring the user settings + Wi-Fi-only sub-setting. */
+async function maybeAutoDownload(info: AppUpdateInfo) {
+  const settings = loadAppUpdateSettings();
+  if (!settings.autoDownload) return;
+  if (settings.autoDownloadWifiOnly && !(await isWifiConnection())) return;
+  // Mandatory or optional — download in the background either way.
+  storeInstance?.getState().startDownload();
+}
+
+export const useAppUpdateStore = (() => {
+  storeInstance = createAppUpdateStore();
+  return storeInstance;
+})();
+
+/**
+ * Manual-check entry shared by the sidebar button, the mobile More sheet and
+ * the settings cards. Returns what happened so callers can toast:
+ * 'up-to-date' | 'available' | 'failed' | 'throttled'
+ */
+export type ManualCheckResult = 'up-to-date' | 'available' | 'failed' | 'throttled';
+
+export async function manualUpdateCheck(): Promise<ManualCheckResult> {
+  if (currentShell() === 'web') return 'up-to-date';
+  const state = useAppUpdateStore.getState();
+  const alreadyAvailable = state.status === 'available' || state.status === 'downloading' || state.status === 'downloaded';
+  const found = await state.check('manual');
+  if (found || alreadyAvailable) return 'available';
+  // Distinguish a failed network check from a genuine "up to date".
+  return useAppUpdateStore.getState().lastCheckFailed ? 'failed' : 'up-to-date';
+}

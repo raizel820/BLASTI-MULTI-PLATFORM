@@ -36,6 +36,23 @@ export interface FulfillmentCheckout {
   metadata?: Record<string, string> | null
 }
 
+/** Which caller triggered the settlement — used for audit-log action naming. */
+export type FulfillmentSource = 'webhook' | 'poll' | 'sweep' | 'sweep-expired'
+
+/**
+ * Audit-log action for a settlement — keeps the pre-existing webhook/poll
+ * action names byte-identical and adds SWEEP variants for Task 2-e's sweeper.
+ */
+function settlementAuditAction(
+  base: 'PAYMENT' | 'SMS_PURCHASE' | 'HARDWARE_ORDER',
+  outcome: 'PAID' | 'FAILED',
+  source: FulfillmentSource,
+): string {
+  if (source === 'webhook') return `${base}_WEBHOOK_${outcome}`
+  if (source === 'poll') return `${base}_POLL_${outcome === 'PAID' ? 'CONFIRMED' : 'FAILED'}`
+  return `${base}_SWEEP_${outcome === 'PAID' ? 'CONFIRMED' : 'FAILED'}`
+}
+
 export interface FulfillmentResult {
   handled: boolean
   /** Which records were settled by this call. */
@@ -116,18 +133,78 @@ async function emitPaymentEvent(
   }
 }
 
-// ─── Paid ───────────────────────────────────────────────────────────────────
+// ─── Paid ─────────────────────────────────────────────────────────────────
+
+/**
+ * Task 2-e: best-effort in-app Notification for Transaction settlements.
+ *
+ * SMS purchases have always notified their buyer on settle/fail — but plain
+ * Transaction rows (agency subscriptions, hardware payments) were silent, so
+ * the agency only discovered the activation by accident. Creates a bilingual
+ * (FR + EN) Notification for the agency OWNER with amount + plan name and
+ * mirrors it to the agency's desktops via recordSyncChange (same shape as the
+ * SMS purchase notification block).
+ */
+async function createTransactionSettlementNotification(params: {
+  agencyId: string
+  ownerId: string
+  transactionId: string
+  amount: number
+  plan: string | null | undefined
+  type: string
+  paid: boolean
+}): Promise<void> {
+  const { agencyId, ownerId, transactionId, amount, plan, type, paid } = params
+  const isHardware = type === 'HARDWARE'
+  const planLabel = plan || (isHardware ? 'Hardware' : 'Subscription')
+  const amountLabel = `${amount} DA`
+
+  const title = paid
+    ? 'Paiement confirmé — Payment confirmed'
+    : 'Paiement échoué — Payment failed'
+  const message = paid
+    ? isHardware
+      ? `Paiement de ${amountLabel} confirmé pour votre commande d'équipement (${planLabel}). / ` +
+        `Your payment of ${amountLabel} for your hardware order (${planLabel}) was confirmed.`
+      : `Paiement de ${amountLabel} confirmé (plan ${planLabel}) — votre abonnement est désormais actif. / ` +
+        `Your payment of ${amountLabel} for the ${planLabel} plan was confirmed and your subscription is now active.`
+    : isHardware
+      ? `Votre paiement de ${amountLabel} (commande d'équipement) n'a pas abouti — aucun montant n'a été débité. / ` +
+        `Your hardware payment of ${amountLabel} did not complete — no amount was charged.`
+      : `Votre paiement de ${amountLabel} (plan ${planLabel}) n'a pas abouti — aucun montant n'a été débité. / ` +
+        `Your payment of ${amountLabel} for the ${planLabel} plan did not complete — no amount was charged.`
+
+  await db.$transaction(async (tx) => {
+    const notif = await tx.notification.create({
+      data: {
+        userId: ownerId,
+        type: paid ? 'PAYMENT_COMPLETED' : 'PAYMENT_FAILED',
+        title,
+        message,
+        entityId: transactionId,
+      },
+    })
+    await recordSyncChange({
+      tx,
+      agencyId,
+      model: 'Notification',
+      recordId: notif.id,
+      operation: 'create',
+    })
+  })
+}
 
 /**
  * Settle a PAID Chargily checkout: complete the transaction (and activate the
  * subscription when applicable), grant SMS credits, approve hardware orders.
  *
- * @param checkout - The Chargily checkout data (webhook payload or GET result)
- * @param source   - 'webhook' | 'poll' — used for audit logging
+ * @param checkout - The Chargily checkout data (webhook payload, GET result,
+ *                   or sweeper probe)
+ * @param source   - 'webhook' | 'poll' | 'sweep' | 'sweep-expired' — used for audit logging
  */
 export async function fulfillCheckoutPaid(
   checkout: FulfillmentCheckout,
-  source: 'webhook' | 'poll' = 'webhook',
+  source: FulfillmentSource = 'webhook',
 ): Promise<FulfillmentResult> {
   const result: FulfillmentResult = { handled: false }
   const methodSnapshot = mapPaymentMethod(checkout.payment_method)
@@ -135,7 +212,7 @@ export async function fulfillCheckoutPaid(
   // ── 1. Transaction (subscriptions + hardware payments) ──
   const transaction = await db.transaction.findFirst({
     where: { providerRef: checkout.id },
-    include: { agency: { select: { id: true, name: true, subscriptionStatus: true } } },
+    include: { agency: { select: { id: true, name: true, subscriptionStatus: true, ownerId: true } } },
   })
 
   if (transaction && transaction.status === 'PENDING') {
@@ -200,7 +277,7 @@ export async function fulfillCheckoutPaid(
 
     await db.auditLog.create({
       data: {
-        action: source === 'webhook' ? 'PAYMENT_WEBHOOK_PAID' : 'PAYMENT_POLL_CONFIRMED',
+        action: settlementAuditAction('PAYMENT', 'PAID', source),
         entityType: 'TRANSACTION',
         entityId: transaction.id,
         details: JSON.stringify({
@@ -213,6 +290,21 @@ export async function fulfillCheckoutPaid(
         }),
       },
     })
+
+    // Task 2-e: notify the agency owner (best-effort — never fail settlement).
+    try {
+      await createTransactionSettlementNotification({
+        agencyId: transaction.agencyId,
+        ownerId: transaction.agency.ownerId,
+        transactionId: transaction.id,
+        amount: transaction.amount,
+        plan: transaction.planName || transaction.plan,
+        type: transaction.type,
+        paid: true,
+      })
+    } catch (err) {
+      console.warn('[chargily-fulfill] Failed to create payment-completed notification:', err)
+    }
 
     await emitPaymentEvent('payment:completed', {
       agencyId: transaction.agencyId,
@@ -299,7 +391,7 @@ export async function fulfillCheckoutPaid(
 
       await db.auditLog.create({
         data: {
-          action: source === 'webhook' ? 'SMS_PURCHASE_WEBHOOK_PAID' : 'SMS_PURCHASE_POLL_CONFIRMED',
+          action: settlementAuditAction('SMS_PURCHASE', 'PAID', source),
           entityType: 'SMS_PURCHASE',
           entityId: smsPurchase.id,
           details: JSON.stringify({
@@ -336,7 +428,7 @@ export async function fulfillCheckoutPaid(
 
       await db.auditLog.create({
         data: {
-          action: source === 'webhook' ? 'HARDWARE_ORDER_WEBHOOK_PAID' : 'HARDWARE_ORDER_POLL_CONFIRMED',
+          action: settlementAuditAction('HARDWARE_ORDER', 'PAID', source),
           entityType: 'HARDWARE_ORDER',
           entityId: order.id,
           details: JSON.stringify({
@@ -375,13 +467,13 @@ export async function fulfillCheckoutPaid(
  */
 export async function fulfillCheckoutFailed(
   checkout: FulfillmentCheckout,
-  source: 'webhook' | 'poll' = 'webhook',
+  source: FulfillmentSource = 'webhook',
 ): Promise<FulfillmentResult> {
   const result: FulfillmentResult = { handled: false }
 
   const transaction = await db.transaction.findFirst({
     where: { providerRef: checkout.id },
-    include: { agency: { select: { id: true, subscriptionStatus: true } } },
+    include: { agency: { select: { id: true, subscriptionStatus: true, ownerId: true } } },
   })
 
   if (transaction) {
@@ -411,12 +503,27 @@ export async function fulfillCheckoutFailed(
 
       await db.auditLog.create({
         data: {
-          action: source === 'webhook' ? 'PAYMENT_WEBHOOK_FAILED' : 'PAYMENT_POLL_FAILED',
+          action: settlementAuditAction('PAYMENT', 'FAILED', source),
           entityType: 'TRANSACTION',
           entityId: transaction.id,
           details: JSON.stringify({ checkoutId: checkout.id, agencyId: transaction.agencyId, source }),
         },
       })
+
+      // Task 2-e: notify the agency owner (best-effort — never fail settlement).
+      try {
+        await createTransactionSettlementNotification({
+          agencyId: transaction.agencyId,
+          ownerId: transaction.agency.ownerId,
+          transactionId: transaction.id,
+          amount: transaction.amount,
+          plan: transaction.planName || transaction.plan,
+          type: transaction.type,
+          paid: false,
+        })
+      } catch (err) {
+        console.warn('[chargily-fulfill] Failed to create payment-failed notification:', err)
+      }
 
       await emitPaymentEvent('payment:failed', {
         agencyId: transaction.agencyId,
@@ -457,7 +564,7 @@ export async function fulfillCheckoutFailed(
 
       await db.auditLog.create({
         data: {
-          action: 'SMS_PURCHASE_WEBHOOK_FAILED',
+          action: settlementAuditAction('SMS_PURCHASE', 'FAILED', source),
           entityType: 'SMS_PURCHASE',
           entityId: smsPurchase.id,
           details: JSON.stringify({ checkoutId: checkout.id, userId: smsPurchase.userId, source }),

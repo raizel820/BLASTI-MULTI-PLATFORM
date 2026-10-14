@@ -5,6 +5,8 @@ import { ThemeProvider } from "next-themes";
 import { AuthProvider } from "@/components/providers/auth-provider";
 import { ErrorBoundary } from "@/components/shared/error-boundary";
 import { ClientBootHardening } from "@/components/shared/client-boot-hardening";
+import { UploadImageRecovery } from "@/components/shared/upload-image-recovery";
+import { AppUpdateManager } from "@/components/shared/app-update-manager";
 import { AppIntroAnimation } from "@/components/shared/app-intro-animation";
 import { PlatformProvider } from "@/hooks/use-platform";
 import { DatabaseProvider } from "@/db/provider";
@@ -55,6 +57,13 @@ export default function RootLayout({
           <AppIntroAnimation />
           {/* Task 41 — legacy SW unregister + chunk-error auto-recovery (phone flicker fix) */}
           <ClientBootHardening />
+          {/* Native-shell image recovery — retries failed /api/upload/file
+              <img> loads against proven bases (desktop cloud base, adopted
+              native resolver base, gateway relative). Placeholder fix. */}
+          <UploadImageRecovery />
+          {/* Public App Settings rebuild — delivers checked/pushed updates inside
+              the desktop shell AND the Android app (dialog / mandatory gate) */}
+          <AppUpdateManager />
           <PlatformProvider>
             <DatabaseProvider>
               <AuthProvider>

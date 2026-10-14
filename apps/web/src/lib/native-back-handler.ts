@@ -9,11 +9,22 @@
  * lives in the shared web bundle — registered once at boot from
  * ClientBootHardening, next to the push-registration boot task.
  *
- * Policy (standard Android UX):
+ * Policy (standard Android UX, home-first per Task 2-a):
  *   1. A Radix overlay is open (dialog / alertdialog / menu / listbox /
  *      popover…) → close it with a synthetic Escape, do NOT navigate.
- *   2. The app can step back in its navigation history → window.history.back().
- *      Depth detection, best-first:
+ *   2. Home-first: NOT on the signed-in role's home view → navigate straight
+ *      HOME via useAppStore.getState().setView(<home>) instead of stepping
+ *      back. The role → home mapping mirrors the store's own
+ *      getDefaultViewForRole() (use-app-store.ts):
+ *        CUSTOMER → 'customer-home'; AGENCY_STAFF/AGENCY_OWNER →
+ *        'agency-dashboard'; SUPER_ADMIN → 'admin-dashboard'.
+ *   3. Already AT the role's home view → NON-BLOCKING exit confirm: a sonner
+ *      toast ("Press back again to exit" + an explicit Exit action). Pressing
+ *      back again within 2.5 s — or tapping the toast action — calls
+ *      App.exitApp(). Any navigation re-arms (disarms) the prompt.
+ *   4. Legacy step-back (unknown role / store unavailable only):
+ *      window.history.back() when the app can step back in its navigation
+ *      history. Depth detection, best-first:
  *        a) history.state.idx > 0   (any router that maintains React-Router
  *                                   style idx — forward-compatible)
  *        b) our own hash-depth stack: this app is a hash-SPA (setView ↔
@@ -21,10 +32,7 @@
  *           We push the hash we leave and pop it when a back completes —
  *           unlike window.history.length (monotonic, never shrinks) this
  *           knows when the user is at the app's ROOT view.
- *   3. At the root view → NON-BLOCKING exit confirm: a sonner toast
- *      ("Press back again to exit" + an explicit Exit action). Pressing back
- *      again within 2.5 s — or tapping the toast action — calls
- *      App.exitApp(). Any navigation re-arms (disarms) the prompt.
+ *      Unknown-role users at the root view fall through to step 3.
  *
  * Design constraints (same rules as push-registration.ts):
  * - SSR-safe: every guard checks `typeof window` first.
@@ -156,6 +164,60 @@ async function currentLanguage(): Promise<'ar' | 'fr' | 'en'> {
   return 'ar';
 }
 
+/**
+ * Task 2-a home-first policy.
+ *
+ * Resolves the signed-in role's home view and either navigates to it or
+ * reports that the user is already there:
+ *   - 'navigated' → setView(home) was called; the back press is consumed.
+ *   - 'at-home'   → already on the home view; the caller arms the exit flow.
+ *   - 'unknown'   → no usable role (logged out / unrecognized) or the store
+ *                   chunk failed to load — the caller falls back to the
+ *                   legacy history.back() step.
+ *
+ * The store is dynamically imported (same rule as currentLanguage()) so this
+ * module never pulls the zustand graph into its own chunk and cannot create
+ * an import cycle. The store's `currentView` is the SPA's own source of
+ * truth — kept in lockstep with location.hash by setView →
+ * updateHashForView() (use-app-store.ts) and by the auth-provider's
+ * hashchange listener → setViewFromHash().
+ */
+type HomeFirstOutcome = 'navigated' | 'at-home' | 'unknown';
+
+async function homeFirstPolicy(): Promise<HomeFirstOutcome> {
+  try {
+    const { useAppStore } = await import('@/store/use-app-store');
+    const store = useAppStore.getState();
+
+    // Role → home view. Mirrors getDefaultViewForRole() in use-app-store.ts
+    // (the exact ViewNames the store navigates to after each role's login).
+    let home: 'customer-home' | 'agency-dashboard' | 'admin-dashboard';
+    switch (store.user?.role) {
+      case 'AGENCY_STAFF':
+      case 'AGENCY_OWNER':
+        home = 'agency-dashboard';
+        break;
+      case 'SUPER_ADMIN':
+        home = 'admin-dashboard';
+        break;
+      case 'CUSTOMER':
+        home = 'customer-home';
+        break;
+      default:
+        return 'unknown';
+    }
+
+    if (store.currentView === home) return 'at-home';
+
+    // Zustand action, safe outside React: updates currentView AND syncs
+    // location.hash via updateHashForView() — the whole SPA follows.
+    store.setView(home);
+    return 'navigated';
+  } catch {
+    return 'unknown'; // store chunk unavailable — legacy behavior
+  }
+}
+
 /** Fire-and-forget native exit — the only sanctioned way to close the shell. */
 function exitApp(plugin: AppPluginShape): void {
   if (typeof plugin.exitApp === 'function') {
@@ -257,13 +319,25 @@ export function initNativeBackHandler(): Promise<void> {
     });
 
     // ── Own the hardware back button (Android; the event never fires on iOS)
-    await plugin.addListener('backButton', (event: BackButtonEventShape) => {
+    await plugin.addListener('backButton', async (event: BackButtonEventShape) => {
       try {
         // 1. An overlay (dialog / menu / select…) is open → close it instead
         //    of navigating behind it.
         if (closeTopOverlay()) return;
 
-        // 2. Step back when the app has somewhere to go back to.
+        // 2. Home-first (Task 2-a): a back press with nothing to dismiss
+        //    takes the user to their role's home view. At the home view
+        //    itself the press goes straight to the exit confirmation (3).
+        //    'unknown' (logged out / store unavailable) → legacy step-back.
+        const homeStep = await homeFirstPolicy();
+        if (homeStep === 'navigated') return;
+        if (homeStep === 'at-home') {
+          void requestExitConfirmation(plugin);
+          return;
+        }
+
+        // 4. Legacy step-back (unknown role only): step back when the app
+        //    has somewhere to go back to.
         const state = window.history.state as { idx?: number } | null;
         const idx = typeof state?.idx === 'number' ? state.idx : undefined;
         const nativeSaysRoot = event?.canGoBack === false;
@@ -280,7 +354,7 @@ export function initNativeBackHandler(): Promise<void> {
           return;
         }
 
-        // 3. At the root view → non-blocking confirm, then exit.
+        // At the root view → non-blocking confirm, then exit.
         void requestExitConfirmation(plugin);
       } catch (error) {
         // The back handler must never throw into the native bridge.

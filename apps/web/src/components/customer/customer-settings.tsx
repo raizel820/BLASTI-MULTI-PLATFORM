@@ -4,7 +4,9 @@
  * iOS-style grouped rows. ALL logic preserved 1:1:
  *  - GET /api/user/profile (fullName, phoneNumber, notificationPreferences)
  *  - PATCH /api/user/profile (save profile; language; avatarUrl after upload)
- *  - POST /api/upload?type=avatar (FormData: file + userId + type)
+ *  - POST /api/upload?type=avatar (FormData: file + userId + type) — picked file
+ *    first shows in the ImageUploadPreviewDialog (Task 2-d); upload runs on
+ *    confirm, then the replaced avatar upload is best-effort deleted.
  *  - PATCH /api/user/change-password (validation + wrongCurrentPassword mapping)
  *  - PATCH /api/user/preferences (notification prefs)
  *  - DELETE /api/user/delete-account (typed confirmation → logout)
@@ -39,8 +41,14 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { UserAvatar } from '@/components/shared/user-avatar';
+// Task 2-d — preview the picked image before it is uploaded/set active.
+import { ImageUploadPreviewDialog } from '@/components/shared/image-upload-preview-dialog';
 // Task 2-c-2 — manual full data resync (shared: web + Capacitor mobile + Electron desktop).
 import { FullResyncButton } from '@/components/shared/full-resync-button';
+import { AppUpdateSettingsCard } from '@/components/shared/app-update-settings-card';
+// Task 2-a — real app version for the About row (null in plain browsers →
+// the static fallback label stays).
+import { getAppVersion } from '@/lib/app-version';
 import {
   User,
   Bell,
@@ -108,9 +116,27 @@ export function CustomerSettings() {
 
   // Avatar
   const [avatarUploading, setAvatarUploading] = useState(false);
+  // Task 2-d — avatar preview dialog: pick → preview → confirm uploads.
+  const [avatarPreviewOpen, setAvatarPreviewOpen] = useState(false);
+  const [pendingAvatarFile, setPendingAvatarFile] = useState<File | null>(null);
+  const [pendingAvatarUrl, setPendingAvatarUrl] = useState<string | null>(null);
+
+  // Task 2-a — real app version (shell-injected Capacitor Device plugin;
+  // null in plain browsers → keeps the '1.0.0' fallback in the About row).
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   useEffect(() => {
     fetchProfile();
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+    getAppVersion()
+      .then((version) => {
+        if (mounted && version) setAppVersion(version);
+      })
+      .catch(() => { /* never rejects per contract — kept defensive */ });
+    return () => { mounted = false; };
   }, []);
 
   /** Apply a profile payload (fresh or cached) to the local state. */
@@ -257,13 +283,44 @@ export function CustomerSettings() {
     }).catch(() => { /* silent */ });
   };
 
-  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Task 2-d — file pick only VALIDATES + OPENS the preview dialog now;
+  // the upload + PATCH runs in handleAvatarPreviewConfirm on user confirm.
+  const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    // Allow re-picking the same file later
+    e.target.value = '';
     if (!file || !user?.id) return;
+    if (!file.type.startsWith('image/')) {
+      toast.error(t('error'));
+      return;
+    }
+    // Same 5 MB cap the agency logo picker enforces (shared key).
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error(t('fileTooLarge'));
+      return;
+    }
+    setPendingAvatarFile(file);
+    setPendingAvatarUrl(URL.createObjectURL(file));
+    setAvatarPreviewOpen(true);
+  };
+
+  // Task 2-d — close + cleanup (also used by the dialog's own onOpenChange).
+  const closeAvatarPreview = () => {
+    setAvatarPreviewOpen(false);
+    setPendingAvatarFile(null);
+    if (pendingAvatarUrl) URL.revokeObjectURL(pendingAvatarUrl);
+    setPendingAvatarUrl(null);
+  };
+
+  const handleAvatarPreviewConfirm = async () => {
+    if (!pendingAvatarFile || !user?.id) return;
     setAvatarUploading(true);
     try {
+      // Task 2-d — capture the CURRENT avatar BEFORE overwriting so the
+      // replaced upload can be deleted from the server (best-effort).
+      const previousAvatarUrl = user.avatarUrl || null;
       const formData = new FormData();
-      formData.append('file', file);
+      formData.append('file', pendingAvatarFile);
       formData.append('userId', user.id);
       // Task 24 FIX: declare the upload type as a form field too — the cloud
       // route reads formData 'type' first and previously only saw 'general'.
@@ -284,6 +341,20 @@ export function CustomerSettings() {
             body: JSON.stringify({ userId: user?.id, avatarUrl: data.url }),
           });
         } catch { /* silent */ }
+        closeAvatarPreview();
+        // Task 2-d — best-effort delete of the REPLACED avatar upload
+        // (fire-and-forget: never blocks or errors the UX on failure).
+        if (
+          previousAvatarUrl &&
+          previousAvatarUrl !== data.url &&
+          previousAvatarUrl.includes('/api/upload/file/')
+        ) {
+          apiFetch('/api/upload/asset', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: previousAvatarUrl }),
+          }).catch(() => { /* best-effort cleanup */ });
+        }
       } else {
         toast.error(t('error'));
       }
@@ -291,8 +362,6 @@ export function CustomerSettings() {
       toast.error(t('error'));
     } finally {
       setAvatarUploading(false);
-      // Allow re-picking the same file later
-      e.target.value = '';
     }
   };
 
@@ -547,6 +616,15 @@ export function CustomerSettings() {
         {/* ─── Notification sound (volume + custom song — Task 82) ─── */}
         <ProfileSoundSettings t={t} />
 
+        {/* ─── Updates (auto-download + Wi-Fi-only + manual check) ─── */}
+        <motion.section
+          initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.18 }}
+          aria-label={t('updateSettingsSection')}
+        >
+          <h2 className="text-sm font-semibold text-muted-foreground mb-2 px-1">{t('updateSettingsSection')}</h2>
+          <AppUpdateSettingsCard />
+        </motion.section>
+
         {/* ─── Security group (biometric login + password) ─── */}
         <motion.section
           initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.2 }}
@@ -650,7 +728,7 @@ export function CustomerSettings() {
                 <Info className="h-4 w-4 text-muted-foreground" />
               </div>
               <p className="text-xs text-muted-foreground">{t('appVersion')}</p>
-              <p className="text-sm font-medium text-foreground ms-auto" dir="ltr">1.0.0</p>
+              <p className="text-sm font-medium text-foreground ms-auto" dir="ltr">{appVersion ?? '1.0.0'}</p>
             </div>
           </div>
         </motion.section>
@@ -680,6 +758,20 @@ export function CustomerSettings() {
             {t('deleteAccount')}
           </button>
         </motion.div>
+
+        {/* Task 2-d — avatar preview: confirm here actually uploads + activates */}
+        <ImageUploadPreviewDialog
+          open={avatarPreviewOpen}
+          onOpenChange={(open) => { if (!open) closeAvatarPreview(); }}
+          previewUrl={pendingAvatarUrl ?? ''}
+          shape="circle"
+          title={t('imagePreviewTitle')}
+          description={t('imagePreviewDesc')}
+          confirmLabel={t('confirm')}
+          cancelLabel={t('cancel')}
+          loading={avatarUploading}
+          onConfirm={handleAvatarPreviewConfirm}
+        />
 
         {/* Delete Account Dialog (preserved confirmation flow) */}
         <AlertDialog open={deleteOpen} onOpenChange={(open) => { setDeleteOpen(open); if (!open) setDeleteConfirmText(''); }}>

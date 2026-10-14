@@ -35,9 +35,6 @@ import {
 // Task 51 — Agency Location & Maps: location pair rule + timestamp stamping
 import { buildAgencyLocationPatch } from '../lib/map-settings'
 
-/** Round 15 — stable base for built file URLs when BLASTI_PUBLIC_BASE_URL is set. */
-const PUBLIC_FILE_URL_BASE = (process.env.BLASTI_PUBLIC_BASE_URL || '').replace(/\/+$/, '')
-
 const app = new Hono()
 
 // ─── Subscription expiry helper ──────────────────────────────────────────────
@@ -2638,11 +2635,12 @@ async function handleAgencyProfileUpdate(c: Context) {
     const targetAgency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!targetAgency) return c.json({ error: 'No agency found' }, 404)
 
-    // Round 15 — rewrite desktop-local/relative file URLs (logo/cover) to the
-    // cloud's own public URLs. Legacy outbox replays land here as PUT /profile
-    // (see app.put below) — both entry points share this handler.
-    const fileBase = PUBLIC_FILE_URL_BASE || new URL(c.req.url).origin
-    const normalizedData = normalizeRecordFileUrls(validatedData as Record<string, unknown>, fileBase) as typeof validatedData
+    // Task 2-c — normalize on write: logo/cover (and any other URL-shaped
+    // field) are stored as the canonical RELATIVE /api/upload/file/... path
+    // (desktop-local absolute URLs and request-origin absolute URLs are
+    // stripped to their path). Legacy outbox replays land here as PUT
+    // /profile (see app.put below) — both entry points share this handler.
+    const normalizedData = normalizeRecordFileUrls(validatedData as Record<string, unknown>) as typeof validatedData
 
     // Task 42: the three schedule columns are NOT NULL with DB defaults — a
     // null from a "spread the GET response back" client must be DROPPED here
@@ -5439,14 +5437,14 @@ app.post('/subscription/pay', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    // Task 32 (bug B): desktop submissions carry receipt URLs pointing at the
-    // device-local API (http://127.0.0.1:3080/api/upload/file/...). Rewrite
-    // them to the cloud's own public URL (same suffix-preserving rule as the
-    // sync intake) so admins can open the receipt from any device once the
+    // Task 32 (bug B) + Task 2-c: desktop submissions carry receipt URLs
+    // pointing at the device-local API (http://127.0.0.1:3080/api/upload/file/...).
+    // They are normalized on write to the canonical RELATIVE
+    // /api/upload/file/... path (same suffix-preserving rule as the sync
+    // intake) so admins can open the receipt from any device once the
     // desktop file-sync push lands the blob.
     const receiptUrlNormalized = normalizeRecordFileUrls(
       { receiptUrl: validation.data.receiptUrl },
-      PUBLIC_FILE_URL_BASE || new URL(c.req.url).origin,
     ).receiptUrl
 
     const agency = await db.agency.findUnique({ where: { id: agencyId } })
