@@ -3828,6 +3828,19 @@ const fr: Record<TranslationKeys, string> = {
   storageMoveSameFolder: "Le fichier est déjà dans ce dossier",
   storageEmptyFolder: "Ce dossier est vide",
   storageLoadingFolders: "Chargement des dossiers…",
+  // Multi-select (batch delete / move) — Storage Manager
+  storageSelectAll: "Tout sélectionner",
+  storageSelectedCount: "{count} sélectionné(s)",
+  storageClearSelection: "Effacer la sélection",
+  storageBatchMove: "Déplacer la sélection",
+  storageBatchDelete: "Supprimer la sélection",
+  storageBatchDeleteConfirm: "{count} élément(s) sélectionné(s) seront définitivement supprimés du disque — les dossiers sont supprimés avec TOUT leur contenu. Êtes-vous sûr ?",
+  storageBatchDeleteDone: "{count} élément(s) supprimé(s)",
+  storageBatchDeleteFailed: "Échec de la suppression des éléments sélectionnés",
+  storageBatchMoveTitle: "Déplacer les éléments",
+  storageBatchMoveDesc: "Choisissez le dossier de destination pour {count} élément(s) sélectionné(s).",
+  storageBatchMoveDone: "{count} élément(s) déplacé(s)",
+  storageBatchPartial: "{ok} élément(s) traités sur {total} — le reste a échoué",
 
   // ─── Task 5: Platform Settings split (sidebar group subsections) ──────────
   settingsGeneral: "Général",

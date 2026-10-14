@@ -59,6 +59,21 @@
  *   POST   /rename {storagePath,newName}
  *                                 → in-place rename (FileAsset + AppVersion
  *                                   rows repointed)
+ *   POST   /delete-batch {paths}  → MULTI-SELECT batch delete — mixed input:
+ *                                   files AND folders (folders recursively,
+ *                                   whole subtree + FileAsset tombstones by
+ *                                   prefix + published-installers cascade).
+ *                                   Per-item results — one bad path never
+ *                                   fails the whole batch; paths inside a
+ *                                   selected folder are covered by it.
+ *   POST   /move-batch {paths,targetFolder}
+ *                                 → MULTI-SELECT batch move — mixed input:
+ *                                   files AND folders (folder subtrees travel
+ *                                   together; descendant FileAsset +
+ *                                   AppVersion rows repointed by prefix).
+ *                                   Per-item results (409 name conflicts and
+ *                                   no-op same-folder moves are reported per
+ *                                   item instead of failing the batch).
  *
  * FOLDER MODEL (generalized — arbitrary depth within limits)
  *   - FOLDER_NAME_RE /^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$/ validates every
@@ -834,6 +849,374 @@ app.get('/file', async (c) => {
 // follow plain <a href> links with the session cookie; native shells download
 // via fetch + Bearer (both are accepted by requireAdmin).
 
+// ─── MUTATION CORES ─────────────────────────────────────────────────────────
+// One implementation shared by the single-item endpoints (DELETE /file,
+// POST /move) AND the multi-select batch endpoints (POST /delete-batch,
+// POST /move-batch) so selecting one vs many behaves IDENTICALLY. Cores
+// return plain result objects — the endpoints wrap them into HTTP responses.
+
+interface CoreResult {
+  ok: boolean
+  status: number // HTTP status the caller should use when !ok
+  error?: string
+  payload?: Record<string, unknown>
+}
+
+/** Delete ONE managed file — exact logic of the original DELETE /file. */
+async function deleteManagedFileCore(storagePath: string): Promise<CoreResult> {
+  const abs = resolveManagerPath(storagePath)
+  if (!abs) return { ok: false, status: 400, error: 'Invalid storage path' }
+  if (!insideRoot(path.resolve(abs))) return { ok: false, status: 400, error: 'Invalid storage path' }
+
+  const existed = await fileExists(abs)
+  // abs already came from resolveManagerPath (validated + inside STORAGE_ROOT),
+  // so unlink directly — lib/storage.deleteByStoragePath would re-apply its
+  // stricter canonical-name guard and reject stray/legacy files.
+  let unlinked = false
+  if (existed) {
+    try {
+      await fs.promises.unlink(abs)
+      unlinked = true
+    } catch {
+      unlinked = false
+    }
+  }
+  // Tombstone any FileAsset row (never hard delete — desktop sync relies on tombstones).
+  let dbUpdated = 0
+  try {
+    const res = await db.fileAsset.updateMany({ where: { storagePath, deletedAt: null }, data: { deletedAt: new Date() } })
+    dbUpdated = res.count
+  } catch { /* row may not exist */ }
+  // Cascade (this round): an AppVersion record that PUBLISHES this exact file
+  // must not outlive it — deactivate it so the platform falls back to
+  // "available"/draft in Public Apps Settings. Identity is the full storage
+  // key (name + embedded push timestamp), so ONLY the deleted occurrence is
+  // deactivated — never its same-name siblings.
+  let appVersionsDeactivated = 0
+  const deletedBucket = storagePath.split('/')[0] || ''
+  if (unlinked && deletedBucket === 'app-versions') {
+    try {
+      // PATH-CONVENTION NORMALIZATION: the storage manager addresses files
+      // relative to STORAGE_ROOT ("app-versions/<key>") while
+      // AppVersion.fileStorageKey is relative to the app-versions bucket
+      // itself ("<key>" — e.g. "desktop/<file>" or flat legacy names).
+      const avKey = storagePath.slice('app-versions/'.length)
+      const res = await db.appVersion.updateMany({
+        where: { fileStorageKey: avKey, isPublished: true },
+        data: { isPublished: false, publishedAt: null },
+      })
+      appVersionsDeactivated = res.count
+    } catch { /* no rows / table unavailable — tracker self-corrects via key match */ }
+  }
+  // Task 2-c-2 — cache-tag invalidation after the mutation.
+  if ((unlinked || dbUpdated > 0) && deletedBucket === 'app-versions') {
+    invalidateResponseCacheTag('app-versions')
+  }
+  return {
+    ok: true,
+    status: 200,
+    payload: { success: true, existed, unlinked, dbTombstoned: dbUpdated, appVersionsDeactivated },
+  }
+}
+
+/** Move ONE managed file — exact logic of the original POST /move. */
+async function moveManagedFileCore(storagePath: string, targetFolder: string): Promise<CoreResult> {
+  if (!storagePath) return { ok: false, status: 400, error: 'storagePath is required' }
+  // Files always live inside a bucket — moving INTO the storage root is invalid.
+  if (!targetFolder) return { ok: false, status: 400, error: 'targetFolder is required' }
+
+  const sourceAbs = resolveManagerPath(storagePath)
+  if (!sourceAbs) return { ok: false, status: 400, error: 'Invalid storage path' }
+  if (!insideRoot(path.resolve(sourceAbs))) return { ok: false, status: 400, error: 'Invalid storage path' }
+
+  const targetFolderAbs = resolveManagerFolderPath(targetFolder)
+  if (!targetFolderAbs) return { ok: false, status: 400, error: 'Invalid target folder' }
+  try {
+    const st = await fs.promises.stat(targetFolderAbs)
+    if (!st.isDirectory()) return { ok: false, status: 404, error: 'Target folder not found' }
+  } catch {
+    return { ok: false, status: 404, error: 'Target folder not found' }
+  }
+
+  let sourceStat: fs.Stats
+  try {
+    sourceStat = await fs.promises.stat(sourceAbs)
+    if (!sourceStat.isFile()) throw new Error('not a file')
+  } catch {
+    return { ok: false, status: 404, error: 'File not found' }
+  }
+
+  const fileName = sourceAbs.split(path.sep).pop() || ''
+  const targetAbs = path.join(targetFolderAbs, fileName)
+  if (!insideRoot(path.resolve(targetAbs))) return { ok: false, status: 400, error: 'Invalid target path' }
+  if (path.resolve(targetAbs) === path.resolve(sourceAbs)) {
+    return { ok: false, status: 400, error: 'File is already in this folder' }
+  }
+  if (await fileExists(targetAbs)) {
+    return { ok: false, status: 409, error: 'A file with this name already exists in the target folder' }
+  }
+
+  await fs.promises.rename(sourceAbs, targetAbs)
+
+  const normalizedSource = storagePath.replace(/\\/g, '/')
+  const sourceParts = normalizedSource.split('/').filter(Boolean)
+  const sourceBucket = sourceParts[0] || ''
+  const targetParts = targetFolder.replace(/\\/g, '/').split('/').filter(Boolean)
+  const targetBucket = targetParts[0] || ''
+  const newRel = [...targetParts, fileName].join('/')
+
+  // Repoint FileAsset rows (file still exists — NOT a tombstone): the
+  // relative path, the public URL and the bucket all follow the move.
+  let fileAssetRows = 0
+  try {
+    const res = await db.fileAsset.updateMany({
+      where: { storagePath: normalizedSource, deletedAt: null },
+      data: {
+        storagePath: newRel,
+        url: publicFilePathForStoragePath(newRel) || undefined,
+        bucket: targetBucket,
+      },
+    })
+    fileAssetRows = res.count
+  } catch { /* no rows for stray/legacy/system files */ }
+
+  // AppVersion bookkeeping — three cases (within / out of / into the bucket);
+  // an ACTIVE installer stays active on a within-bucket move.
+  let appVersionsRepointed = 0
+  let appVersionsDeactivated = 0
+  if (sourceBucket === 'app-versions' || targetBucket === 'app-versions') {
+    const avOld = sourceBucket === 'app-versions' ? normalizedSource.slice('app-versions/'.length) : null
+    const avNew = targetBucket === 'app-versions' ? newRel.slice('app-versions/'.length) : null
+    try {
+      if (avOld && avNew) {
+        const res = await db.appVersion.updateMany({
+          where: { fileStorageKey: avOld },
+          data: { fileStorageKey: avNew },
+        })
+        appVersionsRepointed = res.count
+      } else if (avOld && !avNew) {
+        const res = await db.appVersion.updateMany({
+          where: { fileStorageKey: avOld },
+          data: { fileStorageKey: avNew ?? undefined, isPublished: false, publishedAt: null },
+        })
+        appVersionsRepointed = res.count
+        appVersionsDeactivated = res.count
+      } else {
+        const res = await db.appVersion.updateMany({
+          where: { fileStorageKey: normalizedSource },
+          data: { fileStorageKey: avNew as string },
+        })
+        appVersionsRepointed = res.count
+      }
+    } catch { /* no rows / table unavailable — tracker self-corrects */ }
+    invalidateResponseCacheTag('app-versions')
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    payload: { success: true, storagePath: newRel, fileAssetRows, appVersionsRepointed, appVersionsDeactivated },
+  }
+}
+
+/**
+ * Recursively delete ONE folder (and its WHOLE subtree) — the multi-select
+ * counterpart of deleteManagedFileCore. Disk rm -rf, then the same
+ * bookkeeping as a file delete applied to every descendant:
+ *   • FileAsset rows tombstoned by storage-path PREFIX (never hard delete).
+ *   • Published AppVersion installers under the folder deactivated when the
+ *     folder lives in the app-versions bucket (+ cache tag dropped).
+ */
+async function deleteFolderCore(folderPath: string): Promise<CoreResult> {
+  if (!folderPath) return { ok: false, status: 400, error: 'Folder path is required' }
+  const abs = resolveManagerFolderPath(folderPath)
+  if (!abs) return { ok: false, status: 400, error: 'Invalid folder path' }
+  if (!insideRoot(path.resolve(abs))) return { ok: false, status: 400, error: 'Invalid folder path' }
+  // '' resolves to the STORAGE_ROOT itself — the bucket grid can never go away.
+  if (path.resolve(abs) === path.resolve(STORAGE_ROOT)) {
+    return { ok: false, status: 400, error: 'The storage root cannot be deleted' }
+  }
+
+  try {
+    const st = await fs.promises.stat(abs)
+    if (!st.isDirectory()) return { ok: false, status: 404, error: 'Folder not found' }
+  } catch {
+    return { ok: false, status: 404, error: 'Folder not found' }
+  }
+
+  // The whole subtree goes with the folder.
+  try {
+    await fs.promises.rm(abs, { recursive: true })
+  } catch (e) {
+    return { ok: false, status: 500, error: `Could not delete folder: ${(e as Error).message}` }
+  }
+
+  // Tombstone FileAsset rows of EVERY descendant (prefix match on the folder
+  // path + '/'; folders themselves are never tracked as FileAssets).
+  let dbTombstoned = 0
+  try {
+    const res = await db.fileAsset.updateMany({
+      where: { storagePath: { startsWith: `${folderPath}/` }, deletedAt: null },
+      data: { deletedAt: new Date() },
+    })
+    dbTombstoned = res.count
+  } catch { /* no rows / table unavailable */ }
+
+  let appVersionsDeactivated = 0
+  const bucket = folderPath.split('/')[0] || ''
+  if (bucket === 'app-versions') {
+    try {
+      const avPrefix = `${folderPath.slice('app-versions/'.length)}/`
+      const res = await db.appVersion.updateMany({
+        where: { fileStorageKey: { startsWith: avPrefix }, isPublished: true },
+        data: { isPublished: false, publishedAt: null },
+      })
+      appVersionsDeactivated = res.count
+    } catch { /* tracker self-corrects */ }
+    invalidateResponseCacheTag('app-versions')
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    payload: { success: true, removed: true, dbTombstoned, appVersionsDeactivated },
+  }
+}
+
+/**
+ * Move ONE folder (subtree travels with it) to another EXISTING folder —
+ * the multi-select counterpart of moveManagedFileCore. A rename covers the
+ * disk side; every descendant FileAsset/AppVersion row is repointed by path
+ * prefix with the same three bucket cases as the single-file move.
+ */
+async function moveFolderCore(folderPath: string, targetFolder: string): Promise<CoreResult> {
+  if (!folderPath) return { ok: false, status: 400, error: 'folderPath is required' }
+  if (!targetFolder) return { ok: false, status: 400, error: 'targetFolder is required' }
+
+  const sourceAbs = resolveManagerFolderPath(folderPath)
+  if (!sourceAbs) return { ok: false, status: 400, error: 'Invalid folder path' }
+  if (!insideRoot(path.resolve(sourceAbs))) return { ok: false, status: 400, error: 'Invalid folder path' }
+  if (path.resolve(sourceAbs) === path.resolve(STORAGE_ROOT)) {
+    return { ok: false, status: 400, error: 'The storage root cannot be moved' }
+  }
+
+  const targetFolderAbs = resolveManagerFolderPath(targetFolder)
+  if (!targetFolderAbs) return { ok: false, status: 400, error: 'Invalid target folder' }
+  try {
+    const st = await fs.promises.stat(targetFolderAbs)
+    if (!st.isDirectory()) return { ok: false, status: 404, error: 'Target folder not found' }
+  } catch {
+    return { ok: false, status: 404, error: 'Target folder not found' }
+  }
+
+  const folderName = folderPath.split('/').filter(Boolean).pop() || ''
+  const targetAbs = path.join(targetFolderAbs, folderName)
+
+  // Never move a folder into itself or one of its descendants.
+  if (targetFolder === folderPath || targetFolder.startsWith(`${folderPath}/`)) {
+    return { ok: false, status: 400, error: 'A folder cannot be moved into itself or its descendants' }
+  }
+  if (path.resolve(targetAbs) === path.resolve(sourceAbs)) {
+    return { ok: false, status: 400, error: 'Folder is already in this folder' }
+  }
+  if (await fileExists(targetAbs)) {
+    return { ok: false, status: 409, error: 'A folder with this name already exists in the target folder' }
+  }
+
+  await fs.promises.rename(sourceAbs, targetAbs)
+
+  const sourceParts = folderPath.replace(/\\/g, '/').split('/').filter(Boolean)
+  const targetParts = targetFolder.replace(/\\/g, '/').split('/').filter(Boolean)
+  const sourceBucket = sourceParts[0] || ''
+  const targetBucket = targetParts[0] || ''
+  const newFolderPath = [...targetParts, folderName].join('/')
+
+  // Repoint FileAsset rows of every descendant: prefix swap on the storage
+  // path, recomputed public URL and the new bucket. originalName unchanged.
+  let fileAssetRows = 0
+  const oldPrefix = `${folderPath}/`
+  const newPrefix = `${newFolderPath}/`
+  try {
+    const rows = await db.fileAsset.findMany({
+      where: { storagePath: { startsWith: oldPrefix }, deletedAt: null },
+      select: { id: true, storagePath: true },
+    })
+    for (const row of rows) {
+      const childRel = `${newPrefix}${row.storagePath.slice(oldPrefix.length)}`
+      try {
+        await db.fileAsset.update({
+          where: { id: row.id },
+          data: {
+            storagePath: childRel,
+            url: publicFilePathForStoragePath(childRel) || undefined,
+            bucket: targetBucket,
+          },
+        })
+        fileAssetRows += 1
+      } catch { /* skip this row — tracker self-corrects */ }
+    }
+  } catch { /* no rows */ }
+
+  // AppVersion bookkeeping — same three cases as the single-file move.
+  let appVersionsRepointed = 0
+  let appVersionsDeactivated = 0
+  if (sourceBucket === 'app-versions' || targetBucket === 'app-versions') {
+    const avOldPrefix = sourceBucket === 'app-versions' ? `${folderPath.slice('app-versions/'.length)}/` : null
+    const avNewPrefix = targetBucket === 'app-versions' ? `${newFolderPath.slice('app-versions/'.length)}/` : null
+    try {
+      if (avOldPrefix && avNewPrefix) {
+        // WITHIN the bucket — repoint every descendant key; isPublished preserved.
+        const rows = await db.appVersion.findMany({
+          where: { fileStorageKey: { startsWith: avOldPrefix } },
+          select: { id: true, fileStorageKey: true },
+        })
+        for (const row of rows) {
+          if (!row.fileStorageKey) continue
+          try {
+            await db.appVersion.update({
+              where: { id: row.id },
+              data: { fileStorageKey: `${avNewPrefix}${row.fileStorageKey.slice(avOldPrefix.length)}` },
+            })
+            appVersionsRepointed += 1
+          } catch { /* skip */ }
+        }
+      } else if (avOldPrefix && !avNewPrefix) {
+        // OUT of the bucket — installers under the folder can no longer be
+        // served; deactivate them (same shape as the single-file cascade).
+        const res = await db.appVersion.updateMany({
+          where: { fileStorageKey: { startsWith: avOldPrefix } },
+          data: { isPublished: false, publishedAt: null },
+        })
+        appVersionsRepointed = res.count
+        appVersionsDeactivated = res.count
+      } else {
+        // INTO the bucket — repoint rows that referenced the outside paths.
+        const rows = await db.appVersion.findMany({
+          where: { fileStorageKey: { startsWith: `${folderPath}/` } },
+          select: { id: true, fileStorageKey: true },
+        })
+        for (const row of rows) {
+          if (!row.fileStorageKey) continue
+          try {
+            await db.appVersion.update({
+              where: { id: row.id },
+              data: { fileStorageKey: `${avNewPrefix as string}${row.fileStorageKey.slice(folderPath.length + 1)}` },
+            })
+            appVersionsRepointed += 1
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* tracker self-corrects */ }
+    invalidateResponseCacheTag('app-versions')
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    payload: { success: true, folderPath: newFolderPath, fileAssetRows, appVersionsRepointed, appVersionsDeactivated },
+  }
+}
+
 const DL_MIME_BY_EXT: Record<string, string> = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
   webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon', avif: 'image/avif',
@@ -999,62 +1382,11 @@ app.delete('/file', async (c) => {
     try {
       body = await c.req.json()
     } catch { /* empty body */ }
-    const storagePath = (body.storagePath || '').trim()
-    const abs = resolveManagerPath(storagePath)
-    if (!abs) return c.json({ success: false, error: 'Invalid storage path' }, 400)
-    if (!insideRoot(path.resolve(abs))) return c.json({ success: false, error: 'Invalid storage path' }, 400)
-
-    const existed = await fileExists(abs)
-    // abs already came from resolveManagerPath (validated + inside STORAGE_ROOT),
-    // so unlink directly — lib/storage.deleteByStoragePath would re-apply its
-    // stricter canonical-name guard and reject stray/legacy files.
-    let unlinked = false
-    if (existed) {
-      try {
-        await fs.promises.unlink(abs)
-        unlinked = true
-      } catch {
-        unlinked = false
-      }
-    }
-    // Tombstone any FileAsset row (never hard delete — desktop sync relies on tombstones).
-    let dbUpdated = 0
-    try {
-      const res = await db.fileAsset.updateMany({ where: { storagePath, deletedAt: null }, data: { deletedAt: new Date() } })
-      dbUpdated = res.count
-    } catch { /* row may not exist */ }
-    // Cascade (this round): an AppVersion record that PUBLISHES this exact
-    // file must not outlive it — deactivate it so the platform falls back to
-    // "available"/draft in Public Apps Settings, while the live installer
-    // tracker keeps listing sibling same-name builds (they are distinct
-    // files with different push date/time and/or byte size). Identity is the
-    // full storage key (name + embedded push timestamp), so ONLY the deleted
-    // occurrence is deactivated — never its same-name siblings.
-    let appVersionsDeactivated = 0
-    const deletedBucket = storagePath.split('/')[0] || ''
-    if (unlinked && deletedBucket === 'app-versions') {
-      try {
-        // PATH-CONVENTION NORMALIZATION: the storage manager addresses files
-        // relative to STORAGE_ROOT ("app-versions/<key>") while
-        // AppVersion.fileStorageKey is relative to the app-versions bucket
-        // itself ("<key>" — e.g. "desktop/<file>" or flat legacy names).
-        // Strip the bucket prefix or the cascade would never match.
-        const avKey = storagePath.slice('app-versions/'.length)
-        const res = await db.appVersion.updateMany({
-          where: { fileStorageKey: avKey, isPublished: true },
-          data: { isPublished: false, publishedAt: null },
-        })
-        appVersionsDeactivated = res.count
-      } catch { /* no rows / table unavailable — tracker self-corrects via key match */ }
-    }
-    // Task 2-c-2 — cache-tag invalidation after the mutation: deleting an
-    // app-versions installer changes what the CACHED public listing
-    // /api/app-versions/public/active (60s TTL, tag 'app-versions') reports
-    // (file size/availability), so drop those entries immediately.
-    if ((unlinked || dbUpdated > 0) && deletedBucket === 'app-versions') {
-      invalidateResponseCacheTag('app-versions')
-    }
-    return c.json({ success: true, existed, unlinked, dbTombstoned: dbUpdated, appVersionsDeactivated })
+    // Thin HTTP wrapper around deleteManagedFileCore (shared with the batch
+    // endpoints — see MUTATION CORES above).
+    const result = await deleteManagedFileCore((body.storagePath || '').trim())
+    if (!result.ok) return c.json({ success: false, error: result.error }, result.status as 400)
+    return c.json(result.payload)
   } catch (e) {
     const err = authErrorResponse(e)
     return c.json({ success: false, error: err.error }, err.status as 400)
@@ -1175,108 +1507,161 @@ app.post('/move', async (c) => {
     try {
       body = await c.req.json()
     } catch { /* empty body */ }
-    const storagePath = (body.storagePath || '').trim()
+    // Thin HTTP wrapper around moveManagedFileCore (shared with the batch
+    // endpoints — see MUTATION CORES above).
+    const result = await moveManagedFileCore(
+      (body.storagePath || '').trim(),
+      (body.targetFolder || '').trim(),
+    )
+    if (!result.ok) return c.json({ success: false, error: result.error }, result.status as 400)
+    return c.json(result.payload)
+  } catch (e) {
+    const err = authErrorResponse(e)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
+// ─── MULTI-SELECT BATCH ENDPOINTS (Storage Manager multi-select) ────────────
+//
+// Both accept a MIXED list of storage paths (files AND folders) and process
+// every item independently:
+//   • Classification is disk-truth (stat), not name-shape — a path that
+//     exists as a folder is handled by the folder core, one that exists as
+//     a file by the file core; anything else reports a per-item 404.
+//   • Paths INSIDE another selected folder are dropped up-front ("subsumed")
+//     — the parent's recursive delete/move already covers them, and the
+//     response counts them as processed.
+//   • One failing item NEVER fails the request — the response carries
+//     per-item results so the UI can show "N of M processed".
+
+const MAX_BATCH_PATHS = 500
+
+/** Per-item batch result entry (mirrors the core payloads, plus errors). */
+interface BatchItemResult {
+  storagePath: string
+  ok: boolean
+  error?: string
+  [key: string]: unknown
+}
+
+/** Validate + dedupe the batch `paths` array. */
+function parseBatchPaths(raw: unknown): { paths: string[] } | { error: string } {
+  if (!Array.isArray(raw)) return { error: 'paths must be an array of storage paths' }
+  const seen = new Set<string>()
+  for (const p of raw) {
+    if (typeof p !== 'string') continue
+    const v = p.trim().replace(/\\/g, '/')
+    if (v) seen.add(v)
+  }
+  const paths = [...seen]
+  if (paths.length === 0) return { error: 'paths must contain at least one storage path' }
+  if (paths.length > MAX_BATCH_PATHS) return { error: `Too many paths — ${MAX_BATCH_PATHS} per request maximum` }
+  return { paths }
+}
+
+/**
+ * Drop every path that sits INSIDE another selected folder — the parent's
+ * recursive delete/move already carries those files/subfolders. Shallowest
+ * first; returns the kept paths + how many were subsumed.
+ */
+function subsumeSelectedPaths(paths: string[]): { kept: string[]; subsumed: number } {
+  const sorted = [...paths].sort((a, b) => a.split('/').length - b.split('/').length)
+  const kept: string[] = []
+  let subsumed = 0
+  for (const p of sorted) {
+    const covered = kept.some((k) => p.startsWith(`${k}/`))
+    if (covered) {
+      subsumed += 1
+      continue
+    }
+    kept.push(p)
+  }
+  return { kept, subsumed }
+}
+
+/** Disk-truth classification — stat based, so it also works offline. */
+async function classifyBatchEntry(p: string): Promise<'file' | 'folder' | 'missing'> {
+  const folderAbs = resolveManagerFolderPath(p)
+  if (folderAbs) {
+    try {
+      if ((await fs.promises.stat(folderAbs)).isDirectory()) return 'folder'
+    } catch { /* fall through */ }
+  }
+  const fileAbs = resolveManagerPath(p)
+  if (fileAbs) {
+    try {
+      if ((await fs.promises.stat(fileAbs)).isFile()) return 'file'
+    } catch { /* fall through */ }
+  }
+  return 'missing'
+}
+
+// POST /delete-batch { paths: string[] } — mixed files + folders, recursive.
+app.post('/delete-batch', async (c) => {
+  try {
+    await requireAdmin(c)
+    let body: { paths?: unknown } = {}
+    try {
+      body = await c.req.json()
+    } catch { /* empty body */ }
+    const parsed = parseBatchPaths(body.paths)
+    if ('error' in parsed) return c.json({ success: false, error: parsed.error }, 400)
+
+    const { kept, subsumed } = subsumeSelectedPaths(parsed.paths)
+    const results: BatchItemResult[] = []
+    for (const p of kept) {
+      const kind = await classifyBatchEntry(p)
+      if (kind === 'missing') {
+        results.push({ storagePath: p, ok: false, error: 'Not found on disk' })
+        continue
+      }
+      const r = kind === 'folder' ? await deleteFolderCore(p) : await deleteManagedFileCore(p)
+      results.push(r.ok ? { storagePath: p, ok: true, ...r.payload } : { storagePath: p, ok: false, error: r.error })
+    }
+
+    const processed = results.filter((r) => r.ok).length + subsumed
+    const failed = results.length - results.filter((r) => r.ok).length
+    return c.json({ success: true, total: parsed.paths.length, processed, failed, subsumed, results })
+  } catch (e) {
+    const err = authErrorResponse(e)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
+// POST /move-batch { paths: string[], targetFolder: string } — mixed files +
+// folders; folder subtrees travel together and their rows follow.
+app.post('/move-batch', async (c) => {
+  try {
+    await requireAdmin(c)
+    let body: { paths?: unknown; targetFolder?: string } = {}
+    try {
+      body = await c.req.json()
+    } catch { /* empty body */ }
+    const parsed = parseBatchPaths(body.paths)
+    if ('error' in parsed) return c.json({ success: false, error: parsed.error }, 400)
     const targetFolder = (body.targetFolder || '').trim()
-    if (!storagePath) return c.json({ success: false, error: 'storagePath is required' }, 400)
-    // Files always live inside a bucket — moving INTO the storage root is invalid.
     if (!targetFolder) return c.json({ success: false, error: 'targetFolder is required' }, 400)
-
-    const sourceAbs = resolveManagerPath(storagePath)
-    if (!sourceAbs) return c.json({ success: false, error: 'Invalid storage path' }, 400)
-    if (!insideRoot(path.resolve(sourceAbs))) return c.json({ success: false, error: 'Invalid storage path' }, 400)
-
-    const targetFolderAbs = resolveManagerFolderPath(targetFolder)
-    if (!targetFolderAbs) return c.json({ success: false, error: 'Invalid target folder' }, 400)
-    try {
-      const st = await fs.promises.stat(targetFolderAbs)
-      if (!st.isDirectory()) return c.json({ success: false, error: 'Target folder not found' }, 404)
-    } catch {
-      return c.json({ success: false, error: 'Target folder not found' }, 404)
+    if (!resolveManagerFolderPath(targetFolder)) {
+      return c.json({ success: false, error: 'Invalid target folder' }, 400)
     }
 
-    let sourceStat: fs.Stats
-    try {
-      sourceStat = await fs.promises.stat(sourceAbs)
-      if (!sourceStat.isFile()) throw new Error('not a file')
-    } catch {
-      return c.json({ success: false, error: 'File not found' }, 404)
+    const { kept, subsumed } = subsumeSelectedPaths(parsed.paths)
+    const results: BatchItemResult[] = []
+    for (const p of kept) {
+      const kind = await classifyBatchEntry(p)
+      if (kind === 'missing') {
+        results.push({ storagePath: p, ok: false, error: 'Not found on disk' })
+        continue
+      }
+      const r = kind === 'folder'
+        ? await moveFolderCore(p, targetFolder)
+        : await moveManagedFileCore(p, targetFolder)
+      results.push(r.ok ? { storagePath: p, ok: true, ...r.payload } : { storagePath: p, ok: false, error: r.error })
     }
 
-    const fileName = sourceAbs.split(path.sep).pop() || ''
-    const targetAbs = path.join(targetFolderAbs, fileName)
-    if (!insideRoot(path.resolve(targetAbs))) return c.json({ success: false, error: 'Invalid target path' }, 400)
-    if (path.resolve(targetAbs) === path.resolve(sourceAbs)) {
-      return c.json({ success: false, error: 'File is already in this folder' }, 400)
-    }
-    if (await fileExists(targetAbs)) {
-      return c.json({ success: false, error: 'A file with this name already exists in the target folder' }, 409)
-    }
-
-    await fs.promises.rename(sourceAbs, targetAbs)
-
-    const normalizedSource = storagePath.replace(/\\/g, '/')
-    const sourceParts = normalizedSource.split('/').filter(Boolean)
-    const sourceBucket = sourceParts[0] || ''
-    const targetParts = targetFolder.replace(/\\/g, '/').split('/').filter(Boolean)
-    const targetBucket = targetParts[0] || ''
-    const newRel = [...targetParts, fileName].join('/')
-
-    // Repoint FileAsset rows (file still exists — NOT a tombstone): the
-    // relative path, the public URL and the bucket all follow the move.
-    // originalName stays untouched (the client-facing name did not change).
-    let fileAssetRows = 0
-    try {
-      const res = await db.fileAsset.updateMany({
-        where: { storagePath: normalizedSource, deletedAt: null },
-        data: {
-          storagePath: newRel,
-          url: publicFilePathForStoragePath(newRel) || undefined,
-          bucket: targetBucket,
-        },
-      })
-      fileAssetRows = res.count
-    } catch { /* no rows for stray/legacy/system files */ }
-
-    // AppVersion bookkeeping — see the section comment for the three cases.
-    let appVersionsRepointed = 0
-    let appVersionsDeactivated = 0
-    if (sourceBucket === 'app-versions' || targetBucket === 'app-versions') {
-      const avOld = sourceBucket === 'app-versions' ? normalizedSource.slice('app-versions/'.length) : null
-      const avNew = targetBucket === 'app-versions' ? newRel.slice('app-versions/'.length) : null
-      try {
-        if (avOld && avNew) {
-          // WITHIN the bucket — repoint; isPublished preserved.
-          const res = await db.appVersion.updateMany({
-            where: { fileStorageKey: avOld },
-            data: { fileStorageKey: avNew },
-          })
-          appVersionsRepointed = res.count
-        } else if (avOld && !avNew) {
-          // OUT of the bucket — the installer can no longer be served;
-          // deactivate (avNew is undefined → fileStorageKey untouched, the
-          // same shape as the DELETE /file cascade).
-          const res = await db.appVersion.updateMany({
-            where: { fileStorageKey: avOld },
-            data: { fileStorageKey: avNew ?? undefined, isPublished: false, publishedAt: null },
-          })
-          appVersionsRepointed = res.count
-          appVersionsDeactivated = res.count
-        } else {
-          // INTO the bucket — repoint rows that referenced the outside path
-          // (rare; isPublished is NOT preserved per the section comment).
-          const res = await db.appVersion.updateMany({
-            where: { fileStorageKey: normalizedSource },
-            data: { fileStorageKey: avNew as string },
-          })
-          appVersionsRepointed = res.count
-        }
-      } catch { /* no rows / table unavailable — tracker self-corrects */ }
-      // The live tracker + public active listing derive from this bucket —
-      // refresh their cache entries.
-      invalidateResponseCacheTag('app-versions')
-    }
-
-    return c.json({ success: true, storagePath: newRel, fileAssetRows, appVersionsRepointed, appVersionsDeactivated })
+    const processed = results.filter((r) => r.ok).length + subsumed
+    const failed = results.length - results.filter((r) => r.ok).length
+    return c.json({ success: true, total: parsed.paths.length, processed, failed, subsumed, results })
   } catch (e) {
     const err = authErrorResponse(e)
     return c.json({ success: false, error: err.error }, err.status as 400)

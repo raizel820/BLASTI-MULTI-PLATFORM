@@ -21,6 +21,14 @@ def blastiKeystoreConfigured = blastiKeystorePath != null && !blastiKeystorePath
 //   keystore : app/blasti-signing.p12 (PKCS12)
 //   alias    : blasti
 //   password : blasti-mobile
+//   generated: JDK keytool (NOT openssl!) — openssl 3.5-produced PKCS12 files
+//   fail JDK MAC verification even with the correct password ("keystore
+//   password was incorrect" at :app:packageDebug). If this keystore ever
+//   needs regenerating, always use keytool:
+//     keytool -genkeypair -alias blasti -storetype PKCS12 \
+//       -keystore app/blasti-signing.p12 -storepass blasti-mobile \
+//       -keypass blasti-mobile -keyalg RSA -keysize 2048 -validity 10950 \
+//       -dname "CN=BLASTI Mobile, O=BLASTI, C=NG"
 // A per-run key still wins when BLASTI_KEYSTORE_PATH is provided (see above).
 def stableKeystoreFile = file('blasti-signing.p12')
 def stableKeystoreExists = stableKeystoreFile.exists()

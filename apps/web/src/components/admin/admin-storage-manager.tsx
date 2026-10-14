@@ -50,6 +50,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Input } from '@/components/ui/input';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Progress } from '@/components/ui/progress';
 import {
   Select,
@@ -92,6 +93,7 @@ import {
   Video,
   FileQuestion,
   Check,
+  X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import {
@@ -630,9 +632,15 @@ interface FilesTableProps {
   onPreview: (file: StorageFileRow) => void;
   onDownload: (file: StorageFileRow) => void;
   downloadingPath: string | null;
+  // Multi-select (batch delete / move) — leading checkbox column.
+  isSelected: (path: string) => boolean;
+  onToggleSelect: (storagePath: string) => void;
+  allSelected: boolean;
+  someSelected: boolean;
+  onToggleSelectAll: () => void;
 }
 
-function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onAskRename, onAskMove, onPreview, onDownload, downloadingPath }: FilesTableProps) {
+function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onAskRename, onAskMove, onPreview, onDownload, downloadingPath, isSelected, onToggleSelect, allSelected, someSelected, onToggleSelectAll }: FilesTableProps) {
   return (
     <div className="rounded-xl border overflow-hidden">
       {/* Scrolling is owned by the explorer viewport around the table —
@@ -641,6 +649,15 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onAskRename, o
         <Table>
           <TableHeader className="sticky top-0 z-10 bg-background">
             <TableRow>
+              <TableHead className="w-10 whitespace-nowrap">
+                <Checkbox
+                  checked={allSelected ? true : someSelected ? 'indeterminate' : false}
+                  onCheckedChange={onToggleSelectAll}
+                  onClick={(e) => e.stopPropagation()}
+                  aria-label={t('storageSelectAll')}
+                  className="align-middle"
+                />
+              </TableHead>
               <TableHead className="whitespace-nowrap">{t('storageFileName')}</TableHead>
               <TableHead className="whitespace-nowrap">{t('storageSize')}</TableHead>
               <TableHead className="whitespace-nowrap">{t('storageModified')}</TableHead>
@@ -651,7 +668,7 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onAskRename, o
           <TableBody>
             {files.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={5} className="text-center py-10 text-muted-foreground text-sm">
+                <TableCell colSpan={6} className="text-center py-10 text-muted-foreground text-sm">
                   {t('noData')}
                 </TableCell>
               </TableRow>
@@ -664,7 +681,20 @@ function StorageFilesTable({ files, t, lang, onCopy, onAskDelete, onAskRename, o
                 const KindIcon = fileKindIcon(f.name);
                 const downloading = downloadingPath === f.storagePath;
                 return (
-                <TableRow key={f.storagePath || idx}>
+                <TableRow key={f.storagePath || idx} className={isSelected(f.storagePath) ? 'bg-emerald-50/60 dark:bg-emerald-900/10' : undefined}>
+                  <TableCell
+                    className="w-10 cursor-pointer"
+                    onClick={() => onToggleSelect(f.storagePath)}
+                  >
+                    <div className="flex items-center min-h-[44px] sm:min-h-0">
+                      <Checkbox
+                        checked={isSelected(f.storagePath)}
+                        onCheckedChange={() => onToggleSelect(f.storagePath)}
+                        onClick={(e) => e.stopPropagation()}
+                        aria-label={t('storageSelectAll')}
+                      />
+                    </div>
+                  </TableCell>
                   <TableCell className="max-w-[280px]">
                     <button
                       type="button"
@@ -856,11 +886,19 @@ export function AdminStorageManager() {
   // Manual upload (into the CURRENT folder)
   const [uploading, setUploading] = useState(false);
 
-  // Move dialog (file → destination folder picker)
-  const [moveTarget, setMoveTarget] = useState<StorageFileRow | null>(null);
+  // Move dialog (→ destination folder picker). `moveTargets` carries ONE
+  // file (row button), the current multi-selection (selection bar) or a mix.
+  const [moveTargets, setMoveTargets] = useState<{ files: StorageFileRow[]; folders: BrowseFolderRow[]; count: number; label: string } | null>(null);
   const [folderOptions, setFolderOptions] = useState<string[] | null>(null);
   const [moveDestination, setMoveDestination] = useState('');
   const [moving, setMoving] = useState(false);
+
+  // ── Multi-select (batch delete / move) ──
+  // ONE Set for files (storage paths) AND folders (folder paths) — cleared
+  // whenever the open folder changes and after every batch mutation.
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const [batchDeleteOpen, setBatchDeleteOpen] = useState(false);
+  const [batchDeleting, setBatchDeleting] = useState(false);
 
   // ── Overview fetch ──
   const fetchOverview = useCallback(async (isRefresh = false) => {
@@ -892,8 +930,7 @@ export function AdminStorageManager() {
   // came from the overview payload; the generic explorer needs its own fetch).
   useEffect(() => {
     fetchLevel('');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [/* first paint only */]);
 
   // ── Browse fetch (generic folder level — ONE shape at EVERY depth) ──
   const fetchLevel = useCallback(async (
@@ -944,6 +981,7 @@ export function AdminStorageManager() {
 
   const openFolder = (path: string) => {
     setFileSearch('');
+    setSelectedPaths(new Set()); // selection never crosses folders
     setNavPath(path);
     setBrowse(null); // skeleton while fetching (cache hit resolves instantly)
     fetchLevel(path);
@@ -1060,12 +1098,39 @@ export function AdminStorageManager() {
     }
   };
 
-  // ── Move (file → destination folder) ──
+  // ── Move (single file via row button, or the whole selection) ──
   // Opens the destination picker: the full folder tree is fetched once per
-  // open (GET /folders). The file's CURRENT folder is shown but not
-  // selectable; the storage root is never listed (files live in a bucket).
+  // open (GET /folders). Destinations that are no-ops (the items' current
+  // folder) or dangerous (inside a selected folder) are disabled; the
+  // server still reports per-item skips/conflicts as the final guard.
   const openMoveDialog = (file: StorageFileRow) => {
-    setMoveTarget(file);
+    setMoveTargets({ files: [file], folders: [], count: 1, label: file.name });
+    setMoveDestination('');
+    setFolderOptions(null);
+    (async () => {
+      try {
+        const res = await apiFetch('/api/admin/storage/folders');
+        const body = await res.json().catch(() => null);
+        const data = unwrapPayload(body);
+        const list = data && Array.isArray(data.folders)
+          ? (data.folders as unknown[]).filter((x): x is string => typeof x === 'string' && x !== '')
+          : null;
+        setFolderOptions(res.ok && list ? list : []);
+      } catch {
+        setFolderOptions([]);
+      }
+    })();
+  };
+
+  // Batch move — the selection bar entry point.
+  const openBatchMove = () => {
+    if (selectedFileRows.length + selectedFolderRows.length === 0) return;
+    setMoveTargets({
+      files: selectedFileRows,
+      folders: selectedFolderRows,
+      count: selectedFileRows.length + selectedFolderRows.length,
+      label: '',
+    });
     setMoveDestination('');
     setFolderOptions(null);
     (async () => {
@@ -1084,28 +1149,35 @@ export function AdminStorageManager() {
   };
 
   const confirmMoveFile = async () => {
-    if (!moveTarget || !moveDestination || moving) return;
+    if (!moveTargets || !moveDestination || moving) return;
     setMoving(true);
     try {
-      const res = await apiFetch('/api/admin/storage/move', {
+      const paths = [
+        ...moveTargets.files.map((f) => f.storagePath),
+        ...moveTargets.folders.map((f) => f.path),
+      ];
+      const res = await apiFetch('/api/admin/storage/move-batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ storagePath: moveTarget.storagePath, targetFolder: moveDestination }),
+        body: JSON.stringify({ paths, targetFolder: moveDestination }),
       });
       const body = await res.json().catch(() => null);
-      const bodyRec = asRecord(body);
-      if (res.ok && bodyRec && bodyRec.success !== false) {
-        toast.success(t('storageMoveDone'));
-        const sourceFolder = parentOf(moveTarget.storagePath);
-        setMoveTarget(null);
-        // Both the source and the destination folder aggregates changed.
-        invalidateFolderCache([sourceFolder, moveDestination]);
-        if (navPath) fetchLevel(navPath, { force: true });
+      const data = unwrapPayload(body);
+      if (res.ok && data && data.success !== false) {
+        const processed = num(data.processed);
+        const failed = num(data.failed);
+        if (processed > 0 && failed === 0) toast.success(t('storageBatchMoveDone', { count: String(processed) }));
+        else if (processed > 0) toast.warning(t('storageBatchPartial', { ok: String(processed), total: String(processed + failed) }));
+        else toast.error(t('storageMoveFailed'));
+        setMoveTargets(null);
+        setSelectedPaths(new Set());
+        // Both the source (current) folder and the destination aggregates changed.
+        invalidateFolderCache([navPath, moveDestination].filter(Boolean));
+        fetchLevel(navPath, { force: true });
         fetchOverview(true);
       } else {
-        const serverError = typeof bodyRec?.error === 'string' ? bodyRec.error : '';
+        const serverError = typeof data?.error === 'string' ? data.error : '';
         if (res.status === 409 || serverError.includes('already exists')) toast.error(t('storageMoveConflict'));
-        else if (serverError.includes('already in this folder')) toast.error(t('storageMoveSameFolder'));
         else toast.error(serverError || t('storageMoveFailed'));
       }
     } catch {
@@ -1114,6 +1186,18 @@ export function AdminStorageManager() {
       setMoving(false);
     }
   };
+
+  // ── Multi-select: toggles + select-all ──
+  const toggleSelectPath = useCallback((p: string) => {
+    setSelectedPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(p)) next.delete(p);
+      else next.add(p);
+      return next;
+    });
+  }, []);
+
+  const clearSelection = useCallback(() => setSelectedPaths(new Set()), []);
 
   // ── Delete ──
 
@@ -1145,6 +1229,43 @@ export function AdminStorageManager() {
       toast.error(t('storageDeleteFailed'));
     } finally {
       setDeleting(false);
+    }
+  };
+
+  // ── Batch delete (multi-select) — POST /delete-batch, mixed files+folders ──
+  const confirmBatchDelete = async () => {
+    const paths = [...selectedPaths];
+    if (paths.length === 0 || batchDeleting) return;
+    setBatchDeleting(true);
+    try {
+      const res = await apiFetch('/api/admin/storage/delete-batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths }),
+      });
+      const body = await res.json().catch(() => null);
+      const data = unwrapPayload(body);
+      if (res.ok && data && data.success !== false) {
+        const processed = num(data.processed);
+        const failed = num(data.failed);
+        if (processed > 0 && failed === 0) toast.success(t('storageBatchDeleteDone', { count: String(processed) }));
+        else if (processed > 0) toast.warning(t('storageBatchPartial', { ok: String(processed), total: String(processed + failed) }));
+        else toast.error(t('storageBatchDeleteFailed'));
+        setBatchDeleteOpen(false);
+        setSelectedPaths(new Set());
+        // Every selected item lives under the current level (selection is
+        // cleared on navigation) — its subtree aggregates all changed.
+        invalidateFolderCache([navPath]);
+        fetchLevel(navPath, { force: true });
+        fetchOverview(true);
+      } else {
+        const serverError = typeof data?.error === 'string' ? data.error : '';
+        toast.error(serverError || t('storageBatchDeleteFailed'));
+      }
+    } catch {
+      toast.error(t('storageBatchDeleteFailed'));
+    } finally {
+      setBatchDeleting(false);
     }
   };
 
@@ -1256,6 +1377,30 @@ export function AdminStorageManager() {
     const q = fileSearch.trim().toLowerCase();
     return q ? browse.folders.filter((f) => f.name.toLowerCase().includes(q)) : browse.folders;
   }, [browse, fileSearch]);
+
+  // ── Multi-select derived state ──
+  // Selected rows known to the CURRENT level (searched-away selections stay
+  // in the Set and are still processed — the server resolves by path).
+  const selectedFileRows = useMemo(
+    () => (browse?.files ?? []).filter((f) => selectedPaths.has(f.storagePath)),
+    [browse, selectedPaths],
+  );
+  const selectedFolderRows = useMemo(
+    () => (browse?.folders ?? []).filter((f) => selectedPaths.has(f.path)),
+    [browse, selectedPaths],
+  );
+  const selectionCount = selectedFileRows.length + selectedFolderRows.length;
+  const allVisibleFilesSelected = filteredFiles.length > 0 && filteredFiles.every((f) => selectedPaths.has(f.storagePath));
+  const someVisibleFilesSelected = !allVisibleFilesSelected && filteredFiles.some((f) => selectedPaths.has(f.storagePath));
+
+  const toggleSelectAllFiles = () => {
+    setSelectedPaths((prev) => {
+      const next = new Set(prev);
+      if (allVisibleFilesSelected) filteredFiles.forEach((f) => next.delete(f.storagePath));
+      else filteredFiles.forEach((f) => next.add(f.storagePath));
+      return next;
+    });
+  };
 
   // Full-literal Tailwind classes (JIT-safe) for the usage bar severity.
   const usageBarClass =
@@ -1424,25 +1569,40 @@ export function AdminStorageManager() {
               {filteredFolders.map((folder) => {
                 const Icon = atRoot ? bucketIcon(folder.name) : Folder;
                 const label = atRoot && BUCKET_LABEL[folder.name] ? t(bucketLabelKey(folder.name)) : folder.name;
+                const folderSelected = selectedPaths.has(folder.path);
                 return (
-                  <button
+                  <div
                     key={folder.path}
-                    type="button"
-                    onClick={() => openFolder(folder.path)}
-                    className="group flex items-center gap-3 p-3 rounded-xl border border-border text-start hover:border-emerald-300 dark:hover:border-emerald-700 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10 transition-all"
+                    className={`flex items-center gap-2 p-2.5 rounded-xl border transition-all ${
+                      folderSelected
+                        ? 'border-emerald-400 dark:border-emerald-700 bg-emerald-50/60 dark:bg-emerald-900/10'
+                        : 'border-border hover:border-emerald-300 dark:hover:border-emerald-700 hover:bg-emerald-50/50 dark:hover:bg-emerald-900/10'
+                    }`}
                   >
-                    <div className="h-9 w-9 rounded-lg bg-muted/60 group-hover:bg-emerald-100 dark:group-hover:bg-emerald-900/30 flex items-center justify-center shrink-0 transition-colors">
-                      <Icon className="h-4 w-4 text-muted-foreground group-hover:text-emerald-600 dark:group-hover:text-emerald-400 transition-colors" />
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-[13px] font-semibold truncate" title={folder.name}>{label}</p>
-                      <p className="text-[11px] text-muted-foreground truncate">
-                        {t('storageFilesCount', { count: compactNumber(folder.files) })}
-                        {folder.folders > 0 ? ` · ${folder.folders} ↳` : ''} · {humanSize(folder.bytes)}
-                      </p>
-                    </div>
-                    <ChevronRight className={chevronCls} aria-hidden="true" />
-                  </button>
+                    <Checkbox
+                      checked={folderSelected}
+                      onCheckedChange={() => toggleSelectPath(folder.path)}
+                      aria-label={`${t('storageSelectAll')}: ${folder.name}`}
+                      className="shrink-0"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => openFolder(folder.path)}
+                      className="group flex items-center gap-3 flex-1 min-w-0 text-start"
+                    >
+                      <div className="h-9 w-9 rounded-lg bg-muted/60 group-hover:bg-emerald-100 dark:group-hover:bg-emerald-900/30 flex items-center justify-center shrink-0 transition-colors">
+                        <Icon className="h-4 w-4 text-muted-foreground group-hover:text-emerald-600 dark:group-hover:text-emerald-400 transition-colors" />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-[13px] font-semibold truncate" title={folder.name}>{label}</p>
+                        <p className="text-[11px] text-muted-foreground truncate">
+                          {t('storageFilesCount', { count: compactNumber(folder.files) })}
+                          {folder.folders > 0 ? ` · ${folder.folders} ↳` : ''} · {humanSize(folder.bytes)}
+                        </p>
+                      </div>
+                      <ChevronRight className={chevronCls} aria-hidden="true" />
+                    </button>
+                  </div>
                 );
               })}
             </div>
@@ -1467,6 +1627,11 @@ export function AdminStorageManager() {
               onPreview={setPreviewTarget}
               onDownload={downloadFile}
               downloadingPath={downloadingPath}
+              isSelected={(p) => selectedPaths.has(p)}
+              onToggleSelect={toggleSelectPath}
+              allSelected={allVisibleFilesSelected}
+              someSelected={someVisibleFilesSelected}
+              onToggleSelectAll={toggleSelectAllFiles}
             />
           </div>
         )}
@@ -1556,6 +1721,48 @@ export function AdminStorageManager() {
             </div>
           </CardHeader>
           <CardContent>
+            {/* Multi-select action bar — appears when at least one file or
+                folder is checked (batch delete / move). */}
+            {selectionCount > 0 && (
+              <div
+                className="mb-3 flex items-center gap-2 flex-wrap rounded-xl border border-emerald-200 dark:border-emerald-800 bg-emerald-50/70 dark:bg-emerald-900/20 p-2"
+                role="toolbar"
+                aria-label={t('storageSelectedCount', { count: String(selectionCount) })}
+              >
+                <Badge className="bg-emerald-600 text-white hover:bg-emerald-600 text-[11px] shrink-0">
+                  {t('storageSelectedCount', { count: String(selectionCount) })}
+                </Badge>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-11 sm:h-8 rounded-lg"
+                  disabled={moving || loadingBrowse}
+                  onClick={openBatchMove}
+                >
+                  <FolderInput className="h-3.5 w-3.5 me-1" />
+                  {t('storageBatchMove')}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-11 sm:h-8 rounded-lg text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20 border-red-200 dark:border-red-900"
+                  disabled={batchDeleting || loadingBrowse}
+                  onClick={() => setBatchDeleteOpen(true)}
+                >
+                  <Trash2 className="h-3.5 w-3.5 me-1" />
+                  {t('storageBatchDelete')}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-11 sm:h-8 rounded-lg ms-auto"
+                  onClick={clearSelection}
+                >
+                  <X className="h-3.5 w-3.5 me-1" />
+                  {t('storageClearSelection')}
+                </Button>
+              </div>
+            )}
             {/* Tall file-manager viewport (user report: the old 480px window
                 felt cramped) — folders grid + files table scroll together. */}
             <div className="h-[calc(100vh-330px)] min-h-[420px] overflow-y-auto custom-scrollbar pe-1">
@@ -1698,6 +1905,19 @@ export function AdminStorageManager() {
         onConfirm={confirmDeleteFile}
       />
 
+      {/* MULTI-SELECT batch delete confirmation — folders are recursive. */}
+      <ConfirmDialog
+        open={batchDeleteOpen}
+        onOpenChange={(o) => { if (!o) setBatchDeleteOpen(false); }}
+        title={t('storageBatchDelete')}
+        description={t('storageBatchDeleteConfirm', { count: String(selectionCount) })}
+        confirmLabel={t('storageDelete')}
+        cancelLabel={t('cancel')}
+        variant="danger"
+        loading={batchDeleting}
+        onConfirm={confirmBatchDelete}
+      />
+
       {/* Rename in place — dialog with an input (ConfirmDialog is text-only). */}
       <Dialog
         open={!!renameTarget}
@@ -1790,23 +2010,30 @@ export function AdminStorageManager() {
         </DialogContent>
       </Dialog>
 
-      {/* Move — destination picker over the WHOLE folder tree (the file's
-          current folder is shown but not selectable; root is never listed). */}
+      {/* Move — destination picker over the WHOLE folder tree (works for a
+          single file via the row button AND for the multi-selection). The
+          items' current folder is disabled (no-op); destinations INSIDE a
+          selected folder are disabled (a folder cannot move into itself);
+          the server reports per-item skips/conflicts as the final guard. */}
       <Dialog
-        open={!!moveTarget}
-        onOpenChange={(o) => { if (!o) setMoveTarget(null); }}
+        open={!!moveTargets}
+        onOpenChange={(o) => { if (!o) setMoveTargets(null); }}
       >
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>{t('storageMoveTitle')}</DialogTitle>
+            <DialogTitle>
+              {moveTargets && moveTargets.count > 1 ? t('storageBatchMoveTitle') : t('storageMoveTitle')}
+            </DialogTitle>
             <DialogDescription className="break-all">
-              {t('storageMoveDesc', { name: moveTarget?.name ?? '' })}
+              {moveTargets && moveTargets.count > 1
+                ? t('storageBatchMoveDesc', { count: String(moveTargets.count) })
+                : t('storageMoveDesc', { name: moveTargets?.label ?? '' })}
             </DialogDescription>
           </DialogHeader>
           <p className="text-[11px] text-muted-foreground flex items-center gap-1.5 min-w-0">
             <span className="shrink-0">{t('storageMoveCurrentLocation')}:</span>
-            <code className="font-mono truncate" title={moveTarget ? parentOf(moveTarget.storagePath) : ''}>
-              {moveTarget ? parentOf(moveTarget.storagePath) || '/' : ''}
+            <code className="font-mono truncate" title={navPath}>
+              {navPath || '/' }
             </code>
           </p>
           <div className="rounded-xl border max-h-[45vh] overflow-y-auto custom-scrollbar" role="radiogroup" aria-label={t('storageMoveTarget')}>
@@ -1820,7 +2047,14 @@ export function AdminStorageManager() {
             ) : (
               <div className="p-1.5 space-y-0.5">
                 {folderOptions.map((folderPath) => {
-                  const isCurrent = moveTarget ? parentOf(moveTarget.storagePath) === folderPath : false;
+                  // No-op destination: the items' current folder.
+                  const isCurrent = folderPath === navPath;
+                  // Dangerous: inside any selected folder (would move a
+                  // folder into itself / a descendant).
+                  const insideSelected = !!moveTargets && moveTargets.folders.some(
+                    (sel) => folderPath === sel.path || folderPath.startsWith(`${sel.path}/`),
+                  );
+                  const disabled = isCurrent || insideSelected;
                   const depth = folderPath ? folderPath.split('/').length - 1 : 0;
                   const selected = moveDestination === folderPath;
                   return (
@@ -1829,10 +2063,10 @@ export function AdminStorageManager() {
                       type="button"
                       role="radio"
                       aria-checked={selected}
-                      disabled={isCurrent}
+                      disabled={disabled}
                       onClick={() => setMoveDestination(folderPath)}
                       className={`w-full flex items-center gap-2 min-h-[44px] px-2.5 rounded-lg text-start transition-colors ${
-                        isCurrent
+                        disabled
                           ? 'opacity-50 cursor-not-allowed'
                           : selected
                             ? 'bg-emerald-50 dark:bg-emerald-900/20 text-emerald-800 dark:text-emerald-300'
@@ -1855,7 +2089,7 @@ export function AdminStorageManager() {
             )}
           </div>
           <div className="flex justify-end gap-2">
-            <Button variant="outline" size="sm" onClick={() => setMoveTarget(null)} disabled={moving}>
+            <Button variant="outline" size="sm" onClick={() => setMoveTargets(null)} disabled={moving}>
               {t('cancel')}
             </Button>
             <Button size="sm" onClick={confirmMoveFile} disabled={!moveDestination || moving}>

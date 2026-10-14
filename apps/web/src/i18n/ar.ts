@@ -3827,6 +3827,19 @@ const ar = {
   storageMoveSameFolder: "الملف موجود بالفعل في هذا المجلد",
   storageEmptyFolder: "هذا المجلد فارغ",
   storageLoadingFolders: "جارٍ تحميل المجلدات…",
+  // Multi-select (batch delete / move) — Storage Manager
+  storageSelectAll: "تحديد الكل",
+  storageSelectedCount: "تم تحديد {count}",
+  storageClearSelection: "إلغاء التحديد",
+  storageBatchMove: "نقل المحدد",
+  storageBatchDelete: "حذف المحدد",
+  storageBatchDeleteConfirm: "سيتم حذف {count} عنصر محدد نهائيًا من القرص — المجلدات تُحذف مع كل محتوياتها. هل أنت متأكد؟",
+  storageBatchDeleteDone: "تم حذف {count} عنصر",
+  storageBatchDeleteFailed: "فشل حذف العناصر المحددة",
+  storageBatchMoveTitle: "نقل العناصر",
+  storageBatchMoveDesc: "اختر مجلد الوجهة لـ {count} عنصر محدد.",
+  storageBatchMoveDone: "تم نقل {count} عنصر",
+  storageBatchPartial: "تمت معالجة {ok} من {total} عنصر — فشل الباقي",
 
   // ─── Task 5: Platform Settings split (sidebar group subsections) ──────────
   settingsGeneral: "عام",

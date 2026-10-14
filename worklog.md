@@ -4516,3 +4516,24 @@ Stage Summary:
 - origin was force-updated by the user (974da1a "update versions", squashed "some fixes 10-13"); CONTENT of all previously pending deliveries (notifications branding, native probe/images, pusher picker) verified present on origin → stale patch files removed from download/, only the NEW batch remains.
 - Deploy notes: desktop + mobile need repackaged/rebuilt installers (CI builds them on push); Android devices must install the FIRST stable-signed build once (uninstall + reinstall) — after that every pushed update installs in place; web/API ship via the normal VPS rebuild.
 - Sandbox runtime: web :3000 + api :3003 healthy via daemon-start.sh; fresh-seeded DB accounts are admin/admin123 + owner/owner123 (owner1 no longer exists).
+
+---
+Task ID: R+1 / ci-keystore-fix + storage-multiselect
+Agent: Z.ai Code (main)
+Task: (1) read the pasted CI log and fix the Android build failure; (2) add multi-selection (batch delete/move) to the admin Storage Manager.
+
+Work Log:
+- Parsed upload/Pasted Content_1791957231546.txt — GitHub Actions mobile job failed at :app:packageDebug: KeytoolException "Failed to read key blasti from store .../blasti-signing.p12: keystore password was incorrect".
+- Root-caused: the committed keystore was generated with openssl 3.5 (sandbox); openssl opens it fine with the correct password (blasti-mobile) but JDK 21 PKCS12 MAC verification rejects ANY openssl-3.5-produced PKCS12 (tested legacy 3DES/SHA1 MAC, bigger salt, different passwords — all rejected by JDK; keytool roundtrip of its own keystore OK). CI (temurin 21) hit the same wall.
+- Fix: regenerated the stable keystore with JDK keytool (alias blasti, password blasti-mobile, CN=BLASTI Mobile, RSA 2048, 30y) — same alias/password so build.gradle unchanged. Safe signature change: every CI run since the keystore landed failed, so no device ever received the old signature; the one-time uninstall/reinstall documented earlier still applies, then all future CI builds update in place.
+- Documented the openssl pitfall + regeneration recipe in apps/mobile/android/app/build.gradle; added a "Verify stable keystore is JDK-readable" fail-fast CI step before the gradle build in .github/workflows/build-installers.yml. Commit fbeab01.
+- Storage Manager multi-select: added shared mutation cores to apps/api/src/routes/admin-storage.ts (deleteManagedFileCore / moveManagedFileCore / deleteFolderCore / moveFolderCore); single DELETE /file + POST /move refactored onto them; new POST /delete-batch and POST /move-batch (mixed files+folders, disk-truth stat classification, descendant subsumption, per-item results, 500-path cap). Folder delete is recursive (rm -rf + FileAsset tombstone by prefix + AppVersion publish cascade + cache-tag drop); folder move renames the subtree and repoints every descendant row by prefix.
+- Frontend admin-storage-manager.tsx: checkbox column on files table (select-all header w/ indeterminate), checkbox on folder cards, selection toolbar (count + Move/Delete/Clear), batch delete ConfirmDialog with count, move dialog reworked to batch (destinations inside selected folders disabled), selection resets on navigation/mutation.
+- i18n: 12 new keys added to ar/en/fr (key source ar.ts).
+- Restored sandbox runtime (boot-pg confirmed PG alive; restarted API :3003 to pick up new routes; web :3000 up).
+- Browser-verified (agent-browser, admin/admin123): folder+file checkboxes, "2 selected" bar, clear, select-all, batch move folder→folder (server verified path multi-select-test-a/multi-select-test-b), recursive batch delete removed parent+nested child+stray folder from disk and DB listing; Arabic labels correct; no page errors. Lint clean; tsc clean for all touched files.
+
+Stage Summary:
+- download/0001-fix-mobile-JDK-native-stable-keystore-CI-fail-fast-k.patch + download/0002-feat-storage-multi-select-batch-delete-move-for-file.patch + download/keystore-and-storage-multiselect.diff — validated clean (git am) onto origin/master e0ae24d.
+- PENDING from earlier sessions (still not pushed by user): notifications set (e5141f7) + update-engine set (4605a94) patch files remain in download/.
+- USER ACTION: apply + push the new patch set; the next CI mobile build will sign with the new stable keystore (devices need the one-time uninstall/reinstall).

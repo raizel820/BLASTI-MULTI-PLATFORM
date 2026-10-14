@@ -134,6 +134,16 @@ jobs:
       # The APK is ALSO signed with the committed stable keystore
       # (app/blasti-signing.p12) so pushed updates install OVER the previously
       # installed build instead of failing signature verification.
+      # Fail fast with an obvious message if the committed keystore is not
+      # JDK-readable (an openssl-regenerated PKCS12 once passed openssl but
+      # broke :app:packageDebug 40 minutes later with a cryptic
+      # "keystore password was incorrect" KeytoolException).
+      - name: Verify stable keystore is JDK-readable
+        run: |
+          keytool -list -keystore apps/mobile/android/app/blasti-signing.p12 \
+            -storepass blasti-mobile -storetype PKCS12 > /dev/null
+          echo "Stable keystore OK — alias 'blasti' readable by this JDK."
+
       - name: Build debug APK
         run: bun run --filter @blasti/mobile build:android:debug
         env:

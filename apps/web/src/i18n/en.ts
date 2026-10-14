@@ -3827,6 +3827,19 @@ const en: Record<TranslationKeys, string> = {
   storageMoveSameFolder: "The file is already in this folder",
   storageEmptyFolder: "This folder is empty",
   storageLoadingFolders: "Loading folders…",
+  // Multi-select (batch delete / move) — Storage Manager
+  storageSelectAll: "Select all",
+  storageSelectedCount: "{count} selected",
+  storageClearSelection: "Clear selection",
+  storageBatchMove: "Move selected",
+  storageBatchDelete: "Delete selected",
+  storageBatchDeleteConfirm: "{count} selected item(s) will be permanently deleted from disk — folders are deleted together with ALL their contents. Are you sure?",
+  storageBatchDeleteDone: "Deleted {count} item(s)",
+  storageBatchDeleteFailed: "Failed to delete selected items",
+  storageBatchMoveTitle: "Move items",
+  storageBatchMoveDesc: "Choose a destination folder for {count} selected item(s).",
+  storageBatchMoveDone: "Moved {count} item(s)",
+  storageBatchPartial: "{ok} of {total} item(s) processed — the rest failed",
 
   // ─── Task 5: Platform Settings split (sidebar group subsections) ──────────
   settingsGeneral: "General",
