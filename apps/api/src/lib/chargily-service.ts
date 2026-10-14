@@ -15,8 +15,11 @@
  *   chargily_mode        — "sandbox" or "live" (payment category)
  *
  * Chargily uses DZD (Algerian Dinar) as the default currency.
- * Amounts are sent in centimes (1 DZD = 100 centimes) — matching the
- * balance endpoint which also reports centimes (e.g. 150000 = 1,500.00 DZD).
+ * AMOUNTS ARE MAJOR UNITS (DZD, NOT centimes): Pay v2 checkout creation takes
+ * the amount exactly as displayed (amount: 1200 → a "1 200,00 DZD" checkout
+ * page). The old ×100 "centimes" conversion made every hosted checkout show
+ * 100× the intended price (field report Oct 2026: a 1,200 DZD SMS pack opened
+ * as "120 000 DZD"). The balance-endpoint unit is unrelated and untouched.
  *
  * IMPORTANT (2025 API contract): POST /checkouts no longer accepts a nested
  * `customer` object — only `customer_id`, referencing a customer created
@@ -192,7 +195,7 @@ export async function isChargilyLiveMode(): Promise<boolean> {
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 export interface CheckoutParams {
-  amount: number        // Amount in DZD (will be converted to centimes)
+  amount: number        // Amount in DZD major units — sent to Chargily as-is (v2 contract)
   description: string
   metadata: Record<string, string>
   successUrl: string
@@ -270,11 +273,11 @@ export async function createCheckout(params: CheckoutParams): Promise<ChargilyCh
   const baseUrl = await getBaseUrl()
   const apiKey = await getApiKey()
 
-  // Convert amount to centimes (Chargily uses DZD centimes)
-  const amountInCents = Math.round(params.amount * 100)
-
+  // Pay v2 takes MAJOR units (DZD) — do NOT multiply by 100. The old centimes
+  // conversion made the hosted checkout page show 100× the intended amount
+  // (e.g. a 1,200 DZD SMS pack rendered as "120 000 DZD" on the gateway).
   const body: Record<string, unknown> = {
-    amount: amountInCents,
+    amount: params.amount,
     currency: 'dzd',
     description: params.description,
     metadata: params.metadata,

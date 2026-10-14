@@ -230,6 +230,34 @@ export function useProfileData() {
     }
   };
 
+  /**
+   * Task 2-d parity — persist a freshly-uploaded avatar IMMEDIATELY (same
+   * contract as the Settings page card): the preview confirm uploads, this
+   * PATCH points the DB at the new blob, and ONLY THEN may the replaced
+   * upload be deleted. Deferring to the card's Save button would leave the
+   * stored avatarUrl pointing at a deleted file whenever the customer skips
+   * Save. Returns true when the API accepted the new URL.
+   */
+  const activateAvatar = async (url: string): Promise<boolean> => {
+    if (!user) return false;
+    try {
+      const res = await apiFetch('/api/user/profile', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: user.id, avatarUrl: url }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data) {
+        setAvatarUrl(data.avatarUrl ?? url);
+        // Refresh the session user so the header/avatar reflect the change.
+        setUser({ ...user, avatarUrl: data.avatarUrl ?? url });
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   const handleSaveSmsSettings = async () => {
     if (!user?.id) return;
     setSmsSettingsSaving(true);
@@ -309,6 +337,7 @@ export function useProfileData() {
     // Personal info (name/email/avatar — Task 82)
     fullName, setFullName, email, setEmail, avatarUrl, setAvatarUrl,
     savingPersonalInfo, handleSavePersonalInfo,
+    activateAvatar,
     // Notif prefs
     notifPrefs, notifLoading, notifSaving, handleToggleNotifPref, saveNotifPrefs,
     // Delete account

@@ -49,6 +49,25 @@ const wilayaField = z
 
 // ─── Auth ────────────────────────────────────────────────────────────────────
 
+/**
+ * Upload-file URL validator (Task 2-c companion).
+ *
+ * Uploads return the canonical RELATIVE `/api/upload/file/...` path since
+ * Task 2-c, but these fields still validated with `z.string().url()` — which
+ * REJECTS every relative path — so the profile PATCH answered
+ * 400 "Invalid URL" and the avatar never reached the database (the picture
+ * stayed a placeholder everywhere). Accept BOTH shapes plus '' (clear):
+ *   • relative upload path  /api/upload/file/<bucket>/...   (canonical)
+ *   • absolute http(s) URL                                   (legacy rows,
+ *                                                            external CDNs)
+ */
+export const uploadFileUrlSchema = z
+  .string()
+  .refine(
+    (v) => v === '' || v.startsWith('/api/upload/file/') || /^https?:\/\//i.test(v),
+    'Invalid file URL',
+  );
+
 export const loginSchema = z.object({
   username: z.string().min(1, 'Username is required'),
   password: z.string().min(1, 'Password is required'),
@@ -76,7 +95,7 @@ export const registerSchema = z.object({
   // create platform admins; they skip email/phone verification entirely (auth.ts).
   role: z.enum(['CUSTOMER', 'AGENCY_OWNER', 'SUPER_ADMIN']).optional().default('CUSTOMER'),
   agencyCode: z.string().optional(),
-  avatarUrl: z.string().url().optional().or(z.literal('')),
+  avatarUrl: uploadFileUrlSchema.optional(),
   // Task 5 — optional Algeria address (register form location selectors).
   // wilaya = two-digit official code, commune = baladiya Latin name.
   // Task 2-c — tolerant pipeline (string|number → canonical two-digit code).
@@ -106,7 +125,7 @@ export const updateProfileSchema = z.object({
   email: z.string().email().max(255).optional().or(z.literal('')),
   phoneNumber: z.string().optional(),
   language: z.enum(['en', 'ar', 'fr']).optional(),
-  avatarUrl: z.string().url().optional().or(z.literal('')),
+  avatarUrl: uploadFileUrlSchema.optional(),
   notificationPreferences: z.record(z.string(), z.boolean()).optional(),
   reminderMinutes: z.number().int().min(1).max(1440).optional(),
   smsNotificationsEnabled: z.boolean().optional(),

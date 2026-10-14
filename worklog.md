@@ -4537,3 +4537,41 @@ Stage Summary:
 - download/0001-fix-mobile-JDK-native-stable-keystore-CI-fail-fast-k.patch + download/0002-feat-storage-multi-select-batch-delete-move-for-file.patch + download/keystore-and-storage-multiselect.diff — validated clean (git am) onto origin/master e0ae24d.
 - PENDING from earlier sessions (still not pushed by user): notifications set (e5141f7) + update-engine set (4605a94) patch files remain in download/.
 - USER ACTION: apply + push the new patch set; the next CI mobile build will sign with the new stable keystore (devices need the one-time uninstall/reinstall).
+
+---
+Task ID: mobile-fix-2 / boot-crash-i-then-not-a-function
+Agent: Z.ai Code (main)
+Task: Field error report from the Android app — "i(...).then is not a function" (RootRecoveryBoundary dump, reason: root-recovery, sole event: 401 POST /api/user/push-token at +2545ms).
+
+Work Log:
+- Located the reporter: RecoveryCard in root-recovery-boundary.tsx generates exactly the pasted report → a real error was thrown inside a boot provider OUTSIDE the page ErrorBoundary.
+- Audited every literal .then( call in the layout-mounted boot path; sole offender: apps/web/lib/device-report.ts chained .then() on Plugins.App.addListener('appStateChange').
+- Verified against @capacitor/android 8.5.2 native-bridge.js in node_modules: cap.addListener returns the PluginListenerHandle { remove } SYNCHRONOUSLY — NOT a Promise (only the @capacitor/core registerPlugin proxy wraps it; apps/web must not import @capacitor/*). await-based call sites (push-registration, native-back-handler) were immune — exactly why only device-report crashed.
+- Fixes: (1) device-report.ts Promise.resolve(addListener(...)) + try/catch; (2) client-boot-hardening.tsx try/catch around the synchronous startDeviceReporting() call; (3) push-registration.ts skips FCM token upload while signed out (kills the 401 "Authentication required" diag noise; retried on next registration event after login).
+- Verified: eslint clean; behavioral test of the real module under the exact sync-handle shape (no throw, listener registered, cleanup returned); agent-browser boot + interaction + mobile viewport clean; web :3000 restarted via daemon-start.sh after it was found down.
+- Commit 2fe08f9 (3 files, +50/−9). NOTE: origin/master already carries a Promise.resolve-style port of the device-report fix (user's "mobuile app fix" commits) — this patch may not be needed on their line.
+
+Stage Summary:
+- Root cause: Capacitor 8 RAW Android bridge returns a synchronous listener handle; .then() on it inside the boot effect killed the boot tree to the recovery card on every launch. Fixed at three levels. No APK rebuild required for server-served web code.
+
+---
+Task ID: mobile-fix-3 / avatar-persist + preview-parity + chargily-x100 + version-probe
+Agent: Z.ai Code (main)
+Task: 4 field reports — (1) profile image shows placeholder in both apps + webapp though the upload lands in Storage Manager; (2) missing vs 3 days ago: image preview before update + delete of the replaced image; (3) SMS purchase 1,200 DZD opens a Chargily checkout showing 120,000 DZD; (4) settings About version hardcoded 1.0.0 while the APK is 0.5.7.
+
+Work Log:
+- Delivery archaeology: origin/master was FORCE-UPDATED (78ceb01→f4947ee, user's own "mobuile app fix" commits); 53 local commits unpushed; the user's devices talk to the server baked in apps/web/.env.production (NEXT_PUBLIC_API_URL=http://129.151.242.219 — NOT the 68.183.137.227 host in the standing notes) and the APK bundles its web export. The "missing" features (preview dialog 0699d01, relative URLs 73397b, dynamic version af15d42) were never lost — they were never delivered to the user's line.
+- LIVE E2E (agent-browser, probe1800 customer, password reset via the API's own scrypt format) caught the REAL avatar root cause: PATCH /api/user/profile → 400 "Invalid URL". updateProfileSchema AND registerSchema validated avatarUrl with z.string().url(), which REJECTS the canonical RELATIVE /api/upload/file/... paths Task 2-c uploads return → the URL NEVER reached the DB (avatarUrl stayed null after "save success"). Older deployments stored absolute localhost URLs phones can't load — both eras show a placeholder forever.
+- FIX: shared uploadFileUrlSchema (relative /api/upload/file/... OR absolute http(s) OR '') wired into both schemas; website/apiUrl fields untouched.
+- Profile-card parity port: profile-personal-info.tsx now pick→validate→ImageUploadPreviewDialog (was: instant upload, no preview, no cleanup). New use-profile-data.activateAvatar() PATCHes + refreshes the store IMMEDIATELY on confirm; the replaced upload is DELETEd only AFTER activation (first port deleted before persisting — caught in E2E and corrected; the DB must never point at a deleted blob).
+- Chargily ×100: chargily-service.createCheckout multiplied amount ×100 ("centimes" — a v1-era assumption); Pay v2 takes MAJOR units → a 1,200 DZD pack rendered as "120 000 DZD". Amount now sent as-is (fulfillment/webhook only DISPLAY checkout.amount; getBalance untouched).
+- Version probe: app-version.ts falls back to BlastiNativeStatus.getDiagnostics().versionName (real PackageManager versionName) when Device.getInfo returns empty, and failed probe cycles are no longer memoized forever (retryable after 20s, throttled) — fixes settings "1.0.0" and recovery cards showing "غير معروف".
+- E2E verified after fixes (probe1800): preview dialog opens BEFORE any upload; confirm → POST upload 200 → PATCH 200 → DELETE /api/upload/asset 200; previous file fetch-back 404; DB avatarUrl = relative path; avatar <img> renders naturalWidth>0 on card AND header. eslint + tsc clean; API restarted to pick up the schema fix (bun --hot missed it).
+- Ops notes: web :3000 died mid-session (restarted via daemon-start.sh); sandbox-only GET /api/agencies 500 ("operator does not exist: text = jsonb" raw query — pre-existing, flag for later); [SyncEngine] "agencyId is required for SUPER_ADMIN pull" spam (pre-existing, flag for later); NOTE: rg -rn was misused as "recursive" (-r REPLACES matches — the "minified files" scare was a self-inflicted display artifact).
+- Commit 801fc17 (6 files, +185/−34); patch exported + validated (git apply --check --3way onto origin/master): download/0001-fix-profile-payments-version-avatar-400-Invalid-URL-.patch + download/avatar-chargily-version-fix.diff.
+
+Stage Summary:
+- ALL FOUR reports explained: (1)+(2) = undelivered fixes + a NEWLY-found schema bug that broke avatar persistence even with the fixes applied — both fixed in 801fc17; (3) = real Chargily v2 unit bug — fixed; (4) = probe hardened (on-device verification still needed).
+- DELIVERY GAP IS THE META-ISSUE: 53 commits unpushed; the user's production line (129.151.242.219) has only their manual ports. USER ACTION: apply download/0001-fix-profile-payments-version-avatar-400-Invalid-URL-.patch (git am --3way) onto their master + push + redeploy the server so the web layer ships; earlier patch sets in download/ (notifications e5141f7, update-engine 4605a94, keystore+storage) still pending their line.
+- The phone's settings version will show 0.5.7 once the patched web layer is deployed AND the shell answers BlastiNativeStatus.getDiagnostics (no APK rebuild needed).
+- Leftover sandbox state: probe1800 (test customer, pw E2ePass123!) has a real avatar; 2-3 orphan avatar FileAssets kept as storage-manager demo data; test files cleaned from /home/z.

@@ -23,25 +23,42 @@
  */
 
 import { getNativePlugin } from './native-plugin';
+import { getNativeDiagnostics } from './native-diagnostics';
 
 /** Memoized probe — shared by all consumers for the whole session. */
 let versionPromise: Promise<string | null> | null = null;
+/** Timestamp of the last FAILED probe cycle — null results are retryable. */
+let lastNullAt = 0;
 
 const PROBE_RETRIES = 5;
 const PROBE_RETRY_DELAY_MS = 500;
+/** After a failed cycle, wait this long before burning another full cycle
+ * (a consumer rendering on every state change must not re-probe in a loop). */
+const NULL_RETRY_MS = 20_000;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 async function probeOnce(): Promise<string | null> {
+  // 1. The @capacitor/device plugin — Device.getInfo().appVersion is the
+  //    Android versionName on a healthy bridge.
   try {
-    // Real Capacitor 3–8 surface: window.Capacitor.Plugins.Device.getInfo()
-    // (native Promise via nativePromise — verified JSExport.getPluginJS).
     const device = getNativePlugin('Device');
     const getInfo = device?.getInfo as (() => Promise<{ appVersion?: string }>) | undefined;
     const res = await getInfo?.();
-    return res?.appVersion?.trim() || null;
+    const v = res?.appVersion?.trim();
+    if (v) return v;
   } catch {
-    // Older shell / bridge threw — treat as not-ready, callers fall back.
+    // Older shell / bridge threw — fall through to the native status plugin.
+  }
+  // 2. Fallback: the BlastiNativeStatus shell plugin reports versionName
+  //    straight from PackageManager. Field devices were seen where the Device
+  //    probe returned an empty appVersion ("1.0.0" fallback shown forever,
+  //    recovery cards said "الإصدار: غير معروف") while this plugin answers —
+  //    it is registered directly in MainActivity of every build.
+  try {
+    const diag = await getNativeDiagnostics();
+    return diag.versionName?.trim() || null;
+  } catch {
     return null;
   }
 }
@@ -50,9 +67,7 @@ async function probeOnce(): Promise<string | null> {
  * Probe with a bounded retry: on a REAL phone the native bridge is injected
  * before any web code runs, so the first attempt hits. The retries cover
  * shells/timings where the bridge global lands slightly AFTER the first
- * consumer mounts (slow WebView init, SPA hot paths) — without them the
- * null result was memoized for the whole session and the settings row kept
- * its static fallback forever.
+ * consumer mounts (slow WebView init, SPA hot paths).
  */
 async function probeAppVersion(): Promise<string | null> {
   if (typeof window === 'undefined') return null;
@@ -61,16 +76,32 @@ async function probeAppVersion(): Promise<string | null> {
     if (version) return version;
     if (attempt + 1 < PROBE_RETRIES) await sleep(PROBE_RETRY_DELAY_MS);
   }
-  return null; // plain browser / bridgeless shell — memoized fallback
+  return null;
 }
 
 /**
  * Resolve the native app version (Android versionName inside the shell,
  * null in plain browsers / Electron). Never rejects.
+ *
+ * A null result is NOT memoized for the whole session any more — the first
+ * consumer (launch intro) can easily probe before the bridge is ready, and
+ * a permanently-cached null kept the settings row on its static fallback
+ * forever. Failed cycles may re-run after NULL_RETRY_MS (throttled so a
+ * re-rendering consumer cannot loop probes).
  */
 export function getAppVersion(): Promise<string | null> {
+  if (typeof window === 'undefined') return Promise.resolve(null);
   if (!versionPromise) {
-    versionPromise = probeAppVersion();
+    if (Date.now() - lastNullAt < NULL_RETRY_MS) return Promise.resolve(null);
+    versionPromise = probeAppVersion().then((v) => {
+      if (v) {
+        lastNullAt = 0;
+        return v;
+      }
+      lastNullAt = Date.now();
+      versionPromise = null; // allow a later re-probe
+      return null;
+    });
   }
   return versionPromise;
 }
