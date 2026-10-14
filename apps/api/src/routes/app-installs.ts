@@ -523,6 +523,19 @@ app.post('/pushes', async (c) => {
       return c.json({ success: false, error: 'Version does not belong to the selected platform' }, 400)
     }
 
+    // Pusher can target ANY of the last uploaded installers — drafts included
+    // (devices still on old builds must be reachable, and a rebuild of the
+    // same version may not have been published yet). A push must DELIVER a
+    // downloadable installer, so a DRAFT target is published here. This does
+    // NOT shift the platform's active download (public/active picks the
+    // HIGHEST published versionCode — an older pushed draft stays passive).
+    if (!appVersion.isPublished) {
+      await db.appVersion.update({
+        where: { id: appVersion.id },
+        data: { isPublished: true, publishedAt: appVersion.publishedAt ?? new Date() },
+      })
+    }
+
     const push = await db.updatePush.create({
       data: {
         platform: data.platform,

@@ -110,12 +110,19 @@ export const AUTH_PRESERVED_LOCAL_KEYS: readonly string[] = [
 
 /**
  * Pragmatic exceptions (NOT user data — wiped would only cause side
- * effects): language preference, device identity, this action flag.
+ * effects): language preference, device identity, this action flag,
+ * and the NATIVE CLOUD RESOLVER keys — on phones a full sync used to wipe
+ * `blasti-cloud-url-last-good` / `blasti-cloud-url-override`, so the app
+ * could no longer find its server after the reload (LAN rescan on a network
+ * that has no BLASTI server → dead 10.0.2.2 fallback → "can not load this
+ * page"). Connectivity config, not user data — preserved.
  */
 export const UI_PRESERVED_LOCAL_KEYS: readonly string[] = [
   'blasti-lang',
   'blasti-device-id',
   FULL_RESYNC_FLAG_KEY,
+  'blasti-cloud-url-last-good',
+  'blasti-cloud-url-override',
 ];
 
 const PRESERVED_SESSION_KEYS: readonly string[] = [
@@ -126,6 +133,11 @@ const PRESERVED_SESSION_KEYS: readonly string[] = [
   // here defensively (same list as localStorage), plus the action flag.
   ...AUTH_PRESERVED_LOCAL_KEYS,
   FULL_RESYNC_FLAG_KEY,
+  // Mobile INTRO animation marker (app-intro-animation.tsx INTRO_KEY).
+  // Wiping it made EVERY full resync replay the animated landing/intro on
+  // reload instead of returning straight to the login/dashboard — the
+  // "after full manual sync the app starts with the landing page" report.
+  'blasti-intro-played',
 ];
 
 /**

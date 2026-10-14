@@ -4448,3 +4448,92 @@ Stage summary:
 - All 5 targeted features verified PASS (feature 3 skipped per instructions; already e2e-verified).
 - Observations (non-blocking, pre-existing): SyncEngine pull/push 400s for non-agency sessions (apps/api/src/routes/sync.ts:131/204/206); PaymentResult query effect doesn't re-run on same-document hash navigation (only affects in-app hash edits, not gateway returns).
 - No code changed; nothing committed. Test data: 1 customer account + 2 SmsPurchase rows created.
+
+---
+Task ID: R
+Agent: reset-recovery (main session)
+Task: "check if the app got reset" — verify sandbox state after suspected reset; restore runtime; re-export lost deliverables.
+
+Work Log:
+- State audit: git intact (HEAD e5141f7, clean tree, all commits from versions/updates/2-a..2-e/daemon-fix/notifications present). BUT: download/ folder WIPED, /home/z/pg-embedded (PostgreSQL binaries + data) WIPED, mini-services/ (chargily-mock :3021, discovery :3010) WIPED, all services DOWN (3000/3003/5432 dead).
+- origin/master fetch: user has been applying and pushing deliveries — tip is now 0dbe60a "versions 7". Content match: 032331a=versions, ac4a458=45d085e+fcdd64b (version flow + update delivery), 0dbe60a=2-a..2-e batch + e7304bd daemon fix + worklog. => ALL earlier deliveries are already on GitHub. Only e5141f7 (feat(notifications)) is NOT on origin.
+- Runtime rebuild: recreated /home/z/pg-embedded (bun + embedded-postgres@17.10.0-beta.17, PG 17.10 binaries; bun pm trust --all for hydrate-symlinks) + wrote boot-pg.mjs (idempotent: port-probe :5432, initdb if no data dir, start, createDatabase blasti, stay-alive timer; user/pass/db = blasti on 5432, persistent data at pg-embedded/data).
+- Booted full stack via daemon-start.sh (idempotent, health-gated): PG up, Web :3000 up; API crashed on @prisma/client not generated (node_modules generated client was wiped) => bun run db:generate + db:push (fresh schema) + db:seed-if-empty (agency MYA FREE/INACTIVE, plans FREE/BASIC/PREMIUM, owner account) => daemon-start.sh again => API :3003 healthy (version 0.2.1 self-reported live).
+- Browser verification (agent-browser): landing page renders fully (AR RTL, branding, nav, download CTA), zero console/page errors; POST /api/auth/login owner/owner123 => success:true (DB round-trip works). Discovery(3010) + chargily-mock(3021) absent (folders wiped, never git-tracked) — non-blocking, recreatable on demand.
+- Re-exported deliverables to download/: 0001-feat-notifications-professional-branded-email-layout.patch (format-patch --binary, 142 KB, includes GIT binary patch for apps/api/assets/branding/logo.png) + notification-system-branded-emails-preview-tests.diff (git diff --binary, 140 KB).
+- Cherry-pick validation in throwaway worktree at origin/master tip 0dbe60a: e5141f7 applies CLEAN (exit 0, no conflicts — unlike the previous 5-batch where 2-a conflicted). Worktree removed.
+
+Stage Summary:
+- Answer: code NOT reset (git intact) but runtime WAS reset — download/, pg-embedded, mini-services wiped; services down.
+- Restored: PG 17.10 embedded (fresh cluster + schema + seed), API :3003 + Web :3000 healthy and browser-verified.
+- download/ re-delivers the ONLY missing commit: e5141f7 notifications (branded email layout, template wiring, WYSIWYG previews, per-channel test inputs) — applies clean on origin/master 0dbe60a.
+- Fresh-seeded DB means old sandbox test data (e2e payment evidence, provider test keys, extra accounts) is gone by design.
+
+---
+Task ID: N
+Agent: native-fixes (main session)
+Task: (1) images show placeholders on mobile+desktop while web works, (2) mobile settings page shows hardcoded 1.0.0, (3) update pusher: select the installer (last 10 uploads, any version incl. active/older) not just the version.
+
+Work Log:
+- ROOT-CAUSED the version bug by reading the actual Capacitor 8 Android bridge: JSExport.getPluginJS injects `window.Capacitor.Plugins['Device']` with Promise-returning methods (nativePromise) — `Capacitor.getPlugins(name)` (what app-version.ts/device-report.ts probed) DOES NOT EXIST anywhere in the injected surface. So on every real phone: Device.getInfo never ran → settings row + intro badge stuck on '1.0.0'; BlastiNativeStatus/Device/App probes failed → device telemetry + resume heartbeats silently dead.
+- NEW apps/web/src/lib/native-plugin.ts — single defensive probe (Plugins[name] → getPlugin(name) → getPlugins(name) legacy). app-version.ts uses it + BOUNDED RETRY (5×500ms) so a bridge that lands after the first consumer mount resolves instead of memoizing null for the session (real fix for slow WebView init; also what made the browser test possible).
+- device-report.ts rewritten onto the helper (BlastiNativeStatus stable id → Device.getId/Info fallback → App appStateChange resume listener); capacitorGlobal() minimal local helper for isNativePlatform/getPlatform.
+- Images: audited getProxiedUrl rebase paths (web gateway ✓, desktop :3080 + local-api cloud-fallback proxy ✓, Capacitor native-base rebase ✓), checked capacitor.config (android.allowMixedContent=true already set, debug NSC cleartext permitted, Bridge.java wires MIXED_CONTENT_ALWAYS_ALLOW), manifest usesCleartextTraffic=true. Pipeline is correct for FRESH builds — the failure modes left are first-paint-before-resolver + dead baked bases + old absolute rows, where a failed <img> NEVER retries. NEW apps/web/src/components/shared/upload-image-recovery.tsx mounted in root layout: capture-phase error listener for /api/upload/file/* imgs, retries the same path against proven bases (electronAPI.cloudBaseUrl → adopted native base (never the failed fallback) → getCloudApiBaseUrl → env → page-host :3003 → gateway relative+XTransformPort), ≤4 attempts/path, and onNativeCloudStateChange('found') retro-fixes every failed img. Verified end-to-end in the browser: broke the agency logo src to a dead port → ~3s later the src auto-healed onto http://localhost:3003 and the PNG rendered (naturalWidth=8).
+- IMPORTANT context for the user: installed APK/installers built BEFORE their 'versions 7' push predate the 2-c image fix entirely — a rebuild via CI is REQUIRED for phones/desktops to show images; this session's recovery layer additionally heals wrong-base cases at runtime.
+- Pusher (public-app/pusher-tab.tsx): fetches ALL AppVersion rows (was published-only) + /public/active for Active badges; installer dropdown = LAST TEN UPLOADED for the platform with file name + size + upload date + النشط/مسودة badges, default-picks the newest upload, auto-re-picks on platform change. POST /app-installs/pushes now AUTO-PUBLISHES a DRAFT target (push must deliver a downloadable installer; public/active still picks the HIGHEST versionCode so an older pushed draft never becomes the active download). Devices already at/above the pushed version auto-satisfy (compareVersions <= 0 in buildUpdatePayload) — pushing older versions is safe by design.
+- i18n: +5 keys (publicAppPushTargetInstaller/PickInstaller/InstallerHint/ActiveBadge/DraftBadge) ar/fr/en, added right after publicAppPushTargetVersion.
+- Verified (agent-browser): pusher dropdown lists all seeded installers (v1.0.1–1.0.4 windows / v1.0.1–1.0.3 android-debug) with badges; default pick = newest; selected DRAFT v1.0.1 → push created (DB row android-debug→1.0.1 ACTIVE); curl draft push v1.0.2 after API restart → isPublished=true + publishedAt set. Version probe: injected Capacitor-8-shaped bridge → customer settings About row renders 9.9.9 (old code rendered 1.0.0). bun lint 0 errors (1 pre-existing warning).
+- Sandbox note: pusher fetchAll verification was slowed by the SyncEngine's pre-existing periodic 254-IP LAN sweep (:3080 discovery) saturating the sandbox network stack (apiClient 10s budgets expiring mid-scan) — environmental, pre-existing, unchanged.
+- Commit 7be3eb5 (10 files, +408/−65). format-patch + plain diff exported to download/. Cherry-pick onto origin/master tip 0dbe60a verified CLEAN (exit 0).
+
+Stage Summary:
+- Version display + device telemetry on Capacitor 8 phones: FIXED (real bridge probe path; retry-hardened).
+- Upload images on native shells: self-healing recovery layer added on top of the (already correct) 2-c rebase — placeholders now recover at runtime; devices still need a CI rebuild of the shells to get the code.
+- Update pusher: installer-level targeting (last 10 uploads incl. Active/Draft, any version incl. older than active) + draft auto-publish on push.
+- download/0001-fix-native-real-Capacitor-8-plugin-probe-self-healin.patch + native-images-pusher-fixes.diff (+ the still-unpushed notifications patch from session R).
+
+---
+Task ID: update-engine-batch
+Agent: main (Z.ai Code)
+Task: 8-issue field batch — slow/failed in-app updates (desktop+mobile), no auto-update, desktop users-stage P2002 crash, mobile "can not load this page", landing-after-full-sync, missing lock-screen notifications.
+
+Work Log:
+- Diagnosed "update shows success but old version stays installed" SEPARATELY per platform:
+  • DESKTOP: `cmd.exe /c timeout /t 4 && "installer" /S` flow (a) races the app shutdown — silent NSIS with a still-running blasti.exe fails with NO dialog; (b) breaks on non-ASCII Windows profiles (user's path is C:\Users\عماد الدين\...); (c) nothing relaunched the app, so failure looked like "nothing happened".
+  • MOBILE (root cause): CI debug APKs are signed with the GitHub runner's EPHEMERAL debug keystore → every pushed APK had a DIFFERENT signature → Android refuses update-over-install ("App not installed"); fresh installs worked, every in-place update failed. Explains BOTH the pushed-update failure and the manual "old over new without uninstall" test.
+- Desktop main.js: new spawnSilentWindowsInstall() — ONE PowerShell -EncodedCommand (UTF-16LE base64, codepage-immune) script that polls until OUR pid exits (≤30s), runs installer /S AND WAITS, relaunches the app, logs each step to <userData>/updates/install-log.txt. New selfHealPendingInstaller() at whenReady: any downloaded installer newer than the running version finishes installing on next launch (self-heals every past failed update).
+- Desktop downloader rewritten: Range probe → 3 parallel chunks for >8 MB (net.fetch, system-proxy aware) → single-stream Range-RESUME fallback; positional fs writes (memory flat); progress aggregated.
+- Auto-update (download → install → restart): app-update-settings.autoInstall (default ON) + settings-card toggle + ar/en/fr keys; store's maybeAutoInstall() fires install 1.5s after any 'downloaded' (desktop = fully unattended quit+silent+relaunch; Android auto-opens the package installer — OS confirm screen is a hard platform limit); mandatory always auto-installs.
+- Mobile signing: generated stable PKCS12 keystore (openssl, CN=BLASTI Mobile) committed at apps/mobile/android/app/blasti-signing.p12; build.gradle blastiStable signingConfig now used by BOTH debug and release (BLASTI_KEYSTORE_* env still wins); .gitignore exception added. One more uninstall/reinstall is needed ONCE to move devices onto the stable signature; every later update then installs in place.
+- Mobile "can not load this page": CI debug builds shipped NO baked server URL + unlocked discovery → LAN scan → dead http://10.0.2.2:3003 fallback. Committed apps/mobile/.env.production (NEXT_PUBLIC_API_URL=http://129.151.242.219 + NEXT_PUBLIC_SERVER_DISCOVERY=0 → synchronous locked resolution); CI workflow now sets BLASTI_MOBILE_BUILD=1 for the debug APK build.
+- Mobile landing-after-full-sync: performFullResync wiped sessionStorage 'blasti-intro-played' (intro replayed = "starts with landing page") and localStorage 'blasti-cloud-url-last-good'/'-override' (server URL lost). Both are now preserved; browser-verified: resync keeps auth + settings view, no intro replay, cloud URLs survive, other keys still wiped.
+- Desktop initial-sync P2002 (Mandatory stage "users" failed: Unique constraint failed on email): new local-api/lib/stale-unique.js adoptChildrenThenDelete() — stale-generation rows that are FK-REFERENCED get their children repointed to the cloud id (ADOPT) before deletion; wired into _resolveStaleUniqueRow (initial-sync.js) and the login-path rescue in index.js (upsertLocalUserFromCloud).
+- Lock-screen notifications (mobile had none): BlastiNativeStatus.ensureNotificationChannels (blasti-lockscreen = IMPORTANCE_HIGH + VISIBILITY_PUBLIC + vibration/lights) + notifyLockscreen (BigTextStyle, tap→app, FULL-SCREEN INTENT while keyguard locked); manifest: MainActivity showWhenLocked/turnScreenOn; web: scheduleTurnNotification now routes through the native lock-screen path first; new lib/lockscreen-events.ts + components/shared/lockscreen-notification.tsx (Android-12-style LockscreenNotificationCard + LockscreenNotificationGate: heads-up while app open, full overlay on resume) mounted in layout.tsx; i18n ×3.
+- Verification: bun run lint 0 errors (1 pre-existing warning untouched); tsc 422 = exact documented baseline, 0 errors in changed files; agent-browser E2E — landing renders, owner login OK (note: fresh-seeded DB now has owner/owner123, NOT owner1), agency settings shows all 3 toggles (auto-install ON by default), manual update check hits /api/app-versions/public/active 200, full-resync E2E preserved the 4 sentinel keys and stayed on the dashboard; node --check on all JS; cherry-pick of 4605a94 onto origin/master 974da1a validated CLEAN in a throwaway worktree.
+
+Stage Summary:
+- Committed 4605a94 (22 files, +976/−36) and delivered as download/0001-fix-update-engine-updates-install-for-real-auto-upda.patch (+ .diff twin) — cherry-pick clean onto origin 974da1a.
+- origin was force-updated by the user (974da1a "update versions", squashed "some fixes 10-13"); CONTENT of all previously pending deliveries (notifications branding, native probe/images, pusher picker) verified present on origin → stale patch files removed from download/, only the NEW batch remains.
+- Deploy notes: desktop + mobile need repackaged/rebuilt installers (CI builds them on push); Android devices must install the FIRST stable-signed build once (uninstall + reinstall) — after that every pushed update installs in place; web/API ship via the normal VPS rebuild.
+- Sandbox runtime: web :3000 + api :3003 healthy via daemon-start.sh; fresh-seeded DB accounts are admin/admin123 + owner/owner123 (owner1 no longer exists).
+
+---
+Task ID: R+1 / ci-keystore-fix + storage-multiselect
+Agent: Z.ai Code (main)
+Task: (1) read the pasted CI log and fix the Android build failure; (2) add multi-selection (batch delete/move) to the admin Storage Manager.
+
+Work Log:
+- Parsed upload/Pasted Content_1791957231546.txt — GitHub Actions mobile job failed at :app:packageDebug: KeytoolException "Failed to read key blasti from store .../blasti-signing.p12: keystore password was incorrect".
+- Root-caused: the committed keystore was generated with openssl 3.5 (sandbox); openssl opens it fine with the correct password (blasti-mobile) but JDK 21 PKCS12 MAC verification rejects ANY openssl-3.5-produced PKCS12 (tested legacy 3DES/SHA1 MAC, bigger salt, different passwords — all rejected by JDK; keytool roundtrip of its own keystore OK). CI (temurin 21) hit the same wall.
+- Fix: regenerated the stable keystore with JDK keytool (alias blasti, password blasti-mobile, CN=BLASTI Mobile, RSA 2048, 30y) — same alias/password so build.gradle unchanged. Safe signature change: every CI run since the keystore landed failed, so no device ever received the old signature; the one-time uninstall/reinstall documented earlier still applies, then all future CI builds update in place.
+- Documented the openssl pitfall + regeneration recipe in apps/mobile/android/app/build.gradle; added a "Verify stable keystore is JDK-readable" fail-fast CI step before the gradle build in .github/workflows/build-installers.yml. Commit fbeab01.
+- Storage Manager multi-select: added shared mutation cores to apps/api/src/routes/admin-storage.ts (deleteManagedFileCore / moveManagedFileCore / deleteFolderCore / moveFolderCore); single DELETE /file + POST /move refactored onto them; new POST /delete-batch and POST /move-batch (mixed files+folders, disk-truth stat classification, descendant subsumption, per-item results, 500-path cap). Folder delete is recursive (rm -rf + FileAsset tombstone by prefix + AppVersion publish cascade + cache-tag drop); folder move renames the subtree and repoints every descendant row by prefix.
+- Frontend admin-storage-manager.tsx: checkbox column on files table (select-all header w/ indeterminate), checkbox on folder cards, selection toolbar (count + Move/Delete/Clear), batch delete ConfirmDialog with count, move dialog reworked to batch (destinations inside selected folders disabled), selection resets on navigation/mutation.
+- i18n: 12 new keys added to ar/en/fr (key source ar.ts).
+- Restored sandbox runtime (boot-pg confirmed PG alive; restarted API :3003 to pick up new routes; web :3000 up).
+- Browser-verified (agent-browser, admin/admin123): folder+file checkboxes, "2 selected" bar, clear, select-all, batch move folder→folder (server verified path multi-select-test-a/multi-select-test-b), recursive batch delete removed parent+nested child+stray folder from disk and DB listing; Arabic labels correct; no page errors. Lint clean; tsc clean for all touched files.
+
+Stage Summary:
+- download/0001-fix-mobile-JDK-native-stable-keystore-CI-fail-fast-k.patch + download/0002-feat-storage-multi-select-batch-delete-move-for-file.patch + download/keystore-and-storage-multiselect.diff — validated clean (git am) onto origin/master e0ae24d.
+- PENDING from earlier sessions (still not pushed by user): notifications set (e5141f7) + update-engine set (4605a94) patch files remain in download/.
+- USER ACTION: apply + push the new patch set; the next CI mobile build will sign with the new stable keystore (devices need the one-time uninstall/reinstall).

@@ -36,7 +36,8 @@ import { Input } from '@/components/ui/input';
 import { Checkbox } from '@/components/ui/checkbox';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
-import { ArrowLeft, ArrowRight, Loader2, Eye, EyeOff, CheckCircle2, UserRound, Building2, Fingerprint } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Loader2, Eye, EyeOff, CheckCircle2, UserRound, Building2, Fingerprint, LifeBuoy } from 'lucide-react';
+import { MobileDiagnosticsSheet } from '@/components/shared/mobile-diagnostics-sheet';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { UserRole } from '@/store/use-app-store';
@@ -126,6 +127,9 @@ export function MobileLoginForm() {
   // Forgot / reset password state
   const [forgotUsername, setForgotUsername] = useState('');
   const [forgotLoading, setForgotLoading] = useState(false);
+  // On-shell recovery: the diagnostics sheet is one tap away from the login
+  // screen so a broken boot never becomes a dead end.
+  const [diagOpen, setDiagOpen] = useState(false);
   const [forgotSent, setForgotSent] = useState(false);
   const [resetToken, setResetToken] = useState('');
   const [newPassword, setNewPassword] = useState('');
@@ -730,10 +734,25 @@ export function MobileLoginForm() {
                   {copy.createAccount}
                 </button>
               </p>
+
+              {/* Shell diagnostics entry — native shells only (the sheet self-guards).
+                  One tap answers "which build / which server / what happened" and
+                  offers reload / report / reset when the app cannot load a page. */}
+              <button
+                type="button"
+                onClick={() => setDiagOpen(true)}
+                className="mt-2 mx-auto flex items-center gap-1.5 rounded-full border border-border/60 bg-muted/40 px-3.5 py-1.5 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground transition-colors min-h-[36px]"
+              >
+                <LifeBuoy className="h-3.5 w-3.5" aria-hidden />
+                {t('diagOpenButton')}
+              </button>
             </motion.div>
           )}
         </AnimatePresence>
       </main>
+
+      {/* Shell diagnostics sheet (native only; renders null elsewhere) */}
+      <MobileDiagnosticsSheet open={diagOpen} onOpenChange={setDiagOpen} />
 
       {/* Success overlay */}
       <AnimatePresence>

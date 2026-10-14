@@ -145,6 +145,15 @@ export interface AppUpdateState {
   check: (trigger: 'startup' | 'sync' | 'manual' | 'resume' | 'push') => Promise<boolean>;
   startDownload: () => Promise<void>;
   install: () => Promise<void>;
+  /**
+   * Android honesty gate: after the package installer closes, compare the
+   * native versionName against the one recorded when install() handed the
+   * APK to the OS. 'updated' → the install really happened; 'not-installed'
+   * → Android silently refused it (signature mismatch is the classic case)
+   * and the user must be TOLD (uninstall + reinstall once) instead of the
+   * app claiming success. Null when no install is pending / not Android.
+   */
+  resolvePendingInstall: () => Promise<'updated' | 'not-installed' | null>;
   postpone: () => void;
   requestDialog: () => void;
   closeDialog: () => void;
@@ -248,6 +257,7 @@ function startAndroidPolling(downloadId: number) {
       if (res.status === 'successful') {
         stopAndroidPolling();
         getStore().setState({ status: 'downloaded', progress: { percent: 100, receivedBytes: res.bytesSoFar ?? 0, totalBytes: res.totalBytes ?? 0 } });
+        void maybeAutoInstall();
       } else if (res.status === 'failed') {
         stopAndroidPolling();
         getStore().setState({ status: 'error', error: 'download-failed' });
@@ -271,6 +281,29 @@ function startAndroidPolling(downloadId: number) {
 let storeInstance: ReturnType<typeof createAppUpdateStore> | null = null;
 function getStore() {
   return storeInstance as unknown as { setState: (partial: Partial<AppUpdateState>) => void };
+}
+
+// ─── Android install honesty gate ─────────────────────────────────────────
+
+/**
+ * The native versionName captured when install() handed the APK to the
+ * package installer. The installer UI is asynchronous and FIRE-AND-FORGET
+ * from the app's perspective — installUpdate() resolving ok:true only means
+ * "the installer opened", NOT "the update installed". When Android refuses
+ * the APK (signature mismatch is the classic case — an APK built by a
+ * different keystore than the installed build), it silently shows "App not
+ * installed" and the old version stays. Comparing the version on the next
+ * resume is the only truthful signal the web layer can get.
+ */
+let pendingInstallFromVersion: string | null = null;
+
+async function readNativeVersion(): Promise<string | null> {
+  try {
+    const res = await plugin()?.getAppInfo?.();
+    return res?.versionName?.trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Store ───────────────────────────────────────────────────────────────────
@@ -406,12 +439,41 @@ function createAppUpdateStore() {
           await electronAPI()?.installUpdate?.();
           // The main process quits and runs the NSIS installer.
         } else {
+          // Record the CURRENT native version BEFORE the installer opens —
+          // the resume comparison in resolvePendingInstall() needs it to tell
+          // "installed for real" from "Android silently refused".
+          if (!pendingInstallFromVersion) {
+            pendingInstallFromVersion = await readNativeVersion();
+          }
           await plugin()?.installUpdate?.({});
-          // Android: the package installer opens over our activity.
+          // Android: the package installer opens over our activity. It is
+          // asynchronous — ok:true only means the installer UI opened, so
+          // drop back to 'downloaded' (NOT a success claim). The resume
+          // listener decides the real outcome via resolvePendingInstall().
+          set({ status: 'downloaded' });
         }
       } catch {
+        pendingInstallFromVersion = null;
         set({ status: 'downloaded', needsInstallPermission: true });
       }
+    },
+
+    resolvePendingInstall: async () => {
+      if (currentShell() !== 'capacitor') return null;
+      const from = pendingInstallFromVersion;
+      pendingInstallFromVersion = null;
+      if (!from) return null;
+      const nowVersion = await readNativeVersion();
+      if (nowVersion && nowVersion !== from) {
+        // The install really happened — clear the update state so the dialog
+        // never re-opens for the already-installed version.
+        set({ status: 'idle', info: null, progress: null, error: null });
+        return 'updated';
+      }
+      // Android refused the APK (signature mismatch / cancelled / corrupt
+      // download). Keep the update available and let the UI tell the user
+      // the ONE-TIME fix: uninstall + reinstall.
+      return 'not-installed';
     },
 
     postpone: () => {
@@ -440,6 +502,7 @@ function createAppUpdateStore() {
           status: 'downloaded',
           progress: { percent: 100, receivedBytes: payload.receivedBytes ?? 0, totalBytes: payload.totalBytes ?? 0 },
         });
+        void maybeAutoInstall();
       } else if (payload.status === 'error') {
         stopAndroidPolling();
         set({ status: 'error', error: payload.error || 'download-failed' });
@@ -488,6 +551,27 @@ async function maybeAutoDownload(info: AppUpdateInfo) {
   if (settings.autoDownloadWifiOnly && !(await isWifiConnection())) return;
   // Mandatory or optional — download in the background either way.
   storeInstance?.getState().startDownload();
+}
+
+/**
+ * AUTO-UPDATE (download → install → restart): fire the install the moment a
+ * download completes. Desktop = quit + silent NSIS + relaunch (fully
+ * automatic). Android = the system package installer opens over the app (the
+ * OS always shows its own confirm screen — hard platform limit). Mandatory
+ * updates bypass the user's autoInstall preference entirely.
+ */
+async function maybeAutoInstall() {
+  const state = storeInstance?.getState();
+  if (!state || state.status !== 'downloaded') return;
+  const settings = loadAppUpdateSettings();
+  const mandatory = state.info?.isMandatory === true;
+  if (!settings.autoInstall && !mandatory) return;
+  // Small grace so the UI can paint the "downloaded" state before the
+  // desktop app quits / Android's installer screen takes over.
+  setTimeout(() => {
+    const s = storeInstance?.getState();
+    if (s && s.status === 'downloaded') void s.install();
+  }, 1500);
 }
 
 export const useAppUpdateStore = (() => {

@@ -9,6 +9,30 @@ def blastiKeystoreConfigured = blastiKeystorePath != null && !blastiKeystorePath
         && System.getenv("BLASTI_KEYSTORE_PASSWORD") != null \
         && file(blastiKeystorePath).exists()
 
+// ─── STABLE DISTRIBUTION KEY (update-in-place fix) ───────────────────────────
+// FIELD ROOT CAUSE: CI debug APKs were signed with the runner's EPHEMERAL
+// debug keystore — a DIFFERENT signature on every CI run. Android therefore
+// REFUSED to install any pushed update over an existing app
+// ("App not installed" / install silently aborted → the old version stayed).
+// Fresh installs worked; every update-in-place failed. The fix is one stable
+// keystore committed to the repo (it is a distribution key for a self-hosted
+// sideloaded app, not a store credential) used by BOTH debug and release so
+// every build — local or CI — upgrades every installed device cleanly.
+//   keystore : app/blasti-signing.p12 (PKCS12)
+//   alias    : blasti
+//   password : blasti-mobile
+//   generated: JDK keytool (NOT openssl!) — openssl 3.5-produced PKCS12 files
+//   fail JDK MAC verification even with the correct password ("keystore
+//   password was incorrect" at :app:packageDebug). If this keystore ever
+//   needs regenerating, always use keytool:
+//     keytool -genkeypair -alias blasti -storetype PKCS12 \
+//       -keystore app/blasti-signing.p12 -storepass blasti-mobile \
+//       -keypass blasti-mobile -keyalg RSA -keysize 2048 -validity 10950 \
+//       -dname "CN=BLASTI Mobile, O=BLASTI, C=NG"
+// A per-run key still wins when BLASTI_KEYSTORE_PATH is provided (see above).
+def stableKeystoreFile = file('blasti-signing.p12')
+def stableKeystoreExists = stableKeystoreFile.exists()
+
 android {
     namespace = "com.blasti.mobile"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -26,6 +50,15 @@ android {
         }
     }
     signingConfigs {
+        if (stableKeystoreExists) {
+            blastiStable {
+                storeFile stableKeystoreFile
+                storeType 'PKCS12'
+                storePassword 'blasti-mobile'
+                keyAlias 'blasti'
+                keyPassword 'blasti-mobile'
+            }
+        }
         if (blastiKeystoreConfigured) {
             ciRelease {
                 storeFile file(blastiKeystorePath)
@@ -36,11 +69,22 @@ android {
         }
     }
     buildTypes {
+        debug {
+            // THE critical line for pushed updates: every debug APK (CI or
+            // local) shares ONE signature, so Android installs it over the
+            // previously installed debug build instead of failing with
+            // "App not installed".
+            if (stableKeystoreExists) {
+                signingConfig signingConfigs.blastiStable
+            }
+        }
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
             if (blastiKeystoreConfigured) {
                 signingConfig signingConfigs.ciRelease
+            } else if (stableKeystoreExists) {
+                signingConfig signingConfigs.blastiStable
             }
         }
     }

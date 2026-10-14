@@ -31,24 +31,13 @@
  */
 
 import { getNativeCloudUrl } from './native-cloud-resolver';
+import { getNativePlugin } from './native-plugin';
 
 // Zero @capacitor imports (they are not installed in apps/web) — the
-// Capacitor global injected by the native shell is probed defensively.
-interface CapacitorGlobal {
-  isNativePlatform?: () => boolean;
-  getPlatform?: () => string;
-  getPlugins?: (name: string) => Record<string, {
-    getStableDeviceId?: (opts?: unknown) => Promise<StableIdResult>;
-    getId?: () => Promise<{ identifier?: string }>;
-    getInfo?: () => Promise<{ name?: string; model?: string }>;
-    addListener?: (evt: string, cb: (state: { isActive?: boolean }) => void) => Promise<{ remove?: () => void }>;
-  }>;
-}
-
-function capacitor(): CapacitorGlobal | null {
-  if (typeof window === 'undefined') return null;
-  return (window as unknown as { Capacitor?: CapacitorGlobal }).Capacitor ?? null;
-}
+// Capacitor global injected by the native shell is probed via
+// lib/native-plugin.ts (the REAL `Capacitor.Plugins[name]` surface —
+// Capacitor 8 injects NO getPlugins() function, which silently broke
+// telemetry registration on every physical phone).
 
 const THROTTLE_KEY = 'blasti-device-report-last';
 const DEVICE_UUID_KEY = 'blasti-device-install-uuid';
@@ -79,11 +68,13 @@ async function sha256Hex(input: string): Promise<string> {
 
 /** Stable OS-level id via the native plugin (Widevine), else Device plugin. */
 async function getStableDeviceId(): Promise<{ id: string; appVersion?: string }> {
-  const cap = capacitor();
-  const plugins = cap?.getPlugins?.('BlastiNativeStatus');
+  const native = getNativePlugin('BlastiNativeStatus');
   try {
-    if (plugins?.getStableDeviceId) {
-      const res = await plugins.getStableDeviceId();
+    const getStableDeviceId = native?.getStableDeviceId as
+      | ((opts?: unknown) => Promise<StableIdResult>)
+      | undefined;
+    if (getStableDeviceId) {
+      const res = await getStableDeviceId();
       if (res && typeof res.deviceId === 'string' && res.deviceId.length >= 8) {
         return { id: res.deviceId, appVersion: res.appVersion };
       }
@@ -91,12 +82,16 @@ async function getStableDeviceId(): Promise<{ id: string; appVersion?: string }>
   } catch { /* older shell without the method */ }
 
   // Fallback: @capacitor/device runtime plugin (injected by the shell)
-  const device = cap?.getPlugins?.('Device');
+  const device = getNativePlugin('Device');
   try {
-    if (device?.getId) {
+    const getId = device?.getId as (() => Promise<{ identifier?: string }>) | undefined;
+    const getInfo = device?.getInfo as
+      | (() => Promise<{ name?: string; model?: string }>)
+      | undefined;
+    if (getId) {
       const [{ identifier }, info] = await Promise.all([
-        device.getId(),
-        device.getInfo ? device.getInfo() : Promise.resolve({} as { name?: string }),
+        getId(),
+        getInfo ? getInfo() : Promise.resolve({} as { name?: string; model?: string }),
       ]);
       const id = identifier || info?.model || '';
       if (id) return { id };
@@ -137,10 +132,21 @@ async function postJson(base: string, path: string, body: unknown): Promise<bool
   }
 }
 
+/** Minimal shape of the injected Capacitor global this module needs. */
+function capacitorGlobal(): {
+  isNativePlatform?: () => boolean;
+  getPlatform?: () => string;
+} | null {
+  if (typeof window === 'undefined') return null;
+  return (window as unknown as {
+    Capacitor?: { isNativePlatform?: () => boolean; getPlatform?: () => string };
+  }).Capacitor ?? null;
+}
+
 /** One check-in. Silent on every failure. */
 export async function reportDeviceInstall(kind: 'register' | 'heartbeat' = 'register'): Promise<void> {
   try {
-    if (!capacitor()?.isNativePlatform?.()) return;
+    if (!capacitorGlobal()?.isNativePlatform?.()) return;
 
     // Throttle: at most one report per 30 min (covers start + resume spam).
     try {
@@ -149,7 +155,7 @@ export async function reportDeviceInstall(kind: 'register' | 'heartbeat' = 'regi
       localStorage.setItem(THROTTLE_KEY, String(Date.now()));
     } catch { /* no storage → report anyway */ }
 
-    const platform = capacitor()?.getPlatform?.() ?? '';
+    const platform = capacitorGlobal()?.getPlatform?.() ?? '';
     if (platform !== 'android' && platform !== 'ios') return;
 
     const base = await getNativeCloudUrl();
@@ -176,10 +182,13 @@ export async function reportDeviceInstall(kind: 'register' | 'heartbeat' = 'regi
 export function startDeviceReporting(): () => void {
   void reportDeviceInstall('register');
 
-  const App = capacitor()?.getPlugins?.('App');
+  const App = getNativePlugin('App');
   let removeResume: (() => void) | null = null;
-  if (App?.addListener) {
-    App.addListener('appStateChange', (state: { isActive?: boolean }) => {
+  const addListener = App?.addListener as
+    | ((evt: string, cb: (state: { isActive?: boolean }) => void) => Promise<{ remove?: () => void }>)
+    | undefined;
+  if (addListener) {
+    addListener('appStateChange', (state: { isActive?: boolean }) => {
       if (state?.isActive) void reportDeviceInstall('heartbeat');
     })
       .then((handle) => {

@@ -12,6 +12,8 @@
  * are only installed in apps/mobile).
  */
 
+import { emitLockscreenEvent } from '@/lib/lockscreen-events';
+
 interface NotificationChannelConfig {
   id: string;
   name: string;
@@ -67,6 +69,18 @@ export async function setupTurnAlertChannel(): Promise<void> {
 
   if (isCapacitorNative()) {
     try {
+      // Lock-screen channels FIRST (native plugin — IMPORTANCE_HIGH +
+      // VISIBILITY_PUBLIC so the full content shows on the lock screen and a
+      // full-screen intent can wake the app over the keyguard).
+      const status = getBlastiNativeStatusPlugin();
+      if (status?.ensureNotificationChannels) {
+        await status.ensureNotificationChannels();
+        console.log('[NotificationChannel] Native lock-screen channels ensured');
+      }
+    } catch {
+      console.log('[NotificationChannel] Native channel creation failed, falling back');
+    }
+    try {
       const LocalNotifications = getLocalNotificationsPlugin();
       if (LocalNotifications?.createChannel) {
         await LocalNotifications.createChannel(BLASTI_TURN_CHANNEL);
@@ -82,8 +96,63 @@ export async function setupTurnAlertChannel(): Promise<void> {
   channelCreated = true;
 }
 
+/**
+ * BLASTI native status plugin via the runtime global (zero @capacitor imports
+ * in the web bundle — the probe pattern used across the web codebase).
+ */
+function getBlastiNativeStatusPlugin(): {
+  ensureNotificationChannels?: () => Promise<unknown>;
+  notifyLockscreen?: (opts: {
+    title: string;
+    body: string;
+    notificationId?: number;
+  }) => Promise<{ ok?: boolean; id?: number }>;
+} | null {
+  if (typeof window === 'undefined') return null;
+  const cap = (window as any)?.Capacitor;
+  if (!cap?.Plugins) return null;
+  return cap.Plugins.BlastiNativeStatus ?? null;
+}
+
+/**
+ * Post a LOCK-SCREEN notification through the native plugin (full-screen
+ * intent when the device is locked, VISIBILITY_PUBLIC channel, tap → app).
+ * Returns true when the native path handled it.
+ */
+export async function showLockscreenNotification(
+  title: string,
+  body: string,
+  ticketNumber?: string,
+): Promise<boolean> {
+  if (!isCapacitorNative()) return false;
+  try {
+    const status = getBlastiNativeStatusPlugin();
+    if (!status?.notifyLockscreen) return false;
+    const res = await status.notifyLockscreen({
+      title,
+      body,
+      notificationId: Date.now() % 100000,
+    });
+    // Feed the in-app lock-screen UI (visible when the user returns to the
+    // app / as a heads-up card while the app is open).
+    void emitLockscreenEvent({ title, body, ticketNumber, at: Date.now() });
+    return res?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function scheduleTurnNotification(title: string, body: string, ticketNumber: string): Promise<void> {
-  // Try Capacitor LocalNotifications on native platforms
+  // 1. Native lock-screen path (full-screen intent + public lock-screen
+  //    visibility) — exactly what the mobile app was missing.
+  if (await showLockscreenNotification(title, body, ticketNumber)) {
+    // Still play the in-app alarm sound through the LocalNotifications path?
+    // No — the lock-screen channel carries its own sound + vibration.
+    return;
+  }
+
+  // 2. Capacitor LocalNotifications (pre-plugin builds / when the native
+  //    method is unavailable).
   if (isCapacitorNative()) {
     try {
       const LocalNotifications = getLocalNotificationsPlugin();
@@ -100,6 +169,7 @@ export async function scheduleTurnNotification(title: string, body: string, tick
             extra: { ticketNumber, type: 'TURN_CALLED' },
           }],
         });
+        void emitLockscreenEvent({ title, body, ticketNumber, at: Date.now() });
         return;
       }
     } catch {

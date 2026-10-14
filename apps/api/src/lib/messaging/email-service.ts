@@ -7,6 +7,7 @@
  */
 
 import { getResolvedConfig, recordTestResult } from './provider-config'
+import { wrapEmailHtml } from './email-layout'
 
 export interface SendEmailResult {
   success: boolean
@@ -127,10 +128,22 @@ export async function sendTestEmail(to?: string): Promise<SendEmailResult & { re
   if (!target) {
     return { success: false, error: 'TEST_EMAIL_ADDRESS_REQUIRED', recorded: false }
   }
+  const now = new Date().toISOString()
   const result = await sendEmail({
     to: target,
     subject: '[BLASTI] Test email — email provider is working',
-    text: `BLASTI test email (${new Date().toISOString()}).\n\nIf you received this message, the Resend integration is configured correctly.`,
+    text: `BLASTI test email (${now}).\n\nIf you received this message, the email provider integration is configured correctly.`,
+    // Professional branded test email — showcases the exact layout real
+    // notifications use (app logo header + footer + code-card styling).
+    html: wrapEmailHtml({
+      language: 'en',
+      preheader: 'BLASTI test email — your email provider is working',
+      bodyHtml: `<div style="text-align:center;padding:6px 0 2px 0;">
+  <p style="margin:0 0 14px 0;font-size:18px;font-weight:800;color:#059669;">✓ Your email provider is working</p>
+  <p style="margin:0 0 10px 0;font-size:14px;color:#374151;line-height:1.7;">This is a <strong>test email</strong> sent from the BLASTI admin panel at ${now}.</p>
+  <p style="margin:0;font-size:12px;color:#6b7280;line-height:1.7;">If you received this message, the Resend integration is configured correctly and real notifications (verification, welcome, password reset) will arrive in this exact branded layout.</p>
+</div>`,
+    }),
   })
   await recordTestResult('EMAIL', result.success, result.error ?? result.responseRaw)
   return { ...result, recorded: true }

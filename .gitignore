@@ -45,6 +45,13 @@ yarn-error.log*
 # Mobile build target config (no secrets — emulator/phone API URL so the
 # Android build works out of the box; committed on purpose)
 !apps/web/.env.production
+# Mobile PRODUCTION build config (baked VPS URL + locked discovery — see the
+# file header; no secrets, the same origin the desktop fallback already has)
+!apps/mobile/.env.production
+# Stable Android distribution keystore (sideload distribution key, no store
+# credential — required so every CI/local build signs with ONE key and pushed
+# APK updates install over installed devices)
+!apps/mobile/android/app/blasti-signing.p12
 
 # typescript
 *.tsbuildinfo

@@ -28,6 +28,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { apiFetch } from '@/lib/api-fetch';
+import { getApiBaseUrl } from '@/lib/api-client';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -53,7 +54,7 @@ import {
   Settings2, MessageSquare, Mail, MessageCircle, LayoutGrid, FileText, ScrollText,
   Eye, EyeOff, Send, Save, Loader2, RefreshCw, CheckCircle2, XCircle, Clock,
   AlertTriangle, Info, ExternalLink, KeyRound, FlaskConical, ChevronDown, Trash2,
-  ShieldCheck, Hash, Webhook, Copy, Check,
+  ShieldCheck, Hash, Webhook, Copy, Check, Phone,
   type LucideIcon,
 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -274,6 +275,12 @@ const COPY = {
     testTemplateSent: 'القالب المُرسل',
     testDeliveredVia: 'تم التسليم عبر',
     testButtonsHint: '«اختبار الاتصال» مجاني ويتحقق من صلاحية المفاتيح لدى المزود دون إرسال أي رسالة. «اختبار إرسال OTP» يرسل قالب التحقق الفعلي المُستخدم عند التسجيل مع رمز تجريبي (قد تُطبّق رسوم المزود).',
+    testRecipientHintPhone: 'اختبارات هذه القناة (رسالة اختبار + OTP) تُرسل إلى رقم هاتف — أدخل رقماً بالصيغة الدولية مثل ‎+213555123456. القنوات التي تحتاج بريداً إلكترونياً لها حقل بريد خاص بها.',
+    testRecipientHintEmail: 'اختبارات هذه القناة (رسالة اختبار + OTP) تُرسل إلى بريد إلكتروني — أدخل عنوان بريد صالحاً. القنوات التي تحتاج رقم هاتف لها حقل رقم خاص بها.',
+    previewEmailView: 'عرض البريد (نهائي)',
+    previewTextView: 'النسخة النصية',
+    previewFromLine: 'BLASTI <no-reply@blasti.app>',
+    previewDeliveredBadge: 'ما سيظهر على هاتف العميل',
     webhookUrlTitle: 'رابط Webhook تقارير التسليم',
     webhookUrlHintSms: 'انسخ هذا الرابط إلى بوابة eSMS Africa (الإعدادات ← Webhooks ← DLR URL) لاستقبال تقارير التسليم.',
     webhookUrlHintWa: 'سجّل هذا الرابط في Meta App Dashboard ← WhatsApp ← Configuration، واستخدم رمز التحقق أدناه عند الاشتراك.',
@@ -415,6 +422,12 @@ const COPY = {
     testTemplateSent: 'Template sent',
     testDeliveredVia: 'Delivered via',
     testButtonsHint: '"Test connection" is free and validates the API key against the provider without sending any message. "Test OTP delivery" sends the real verification template used at signup with a sample code (provider fees may apply).',
+    testRecipientHintPhone: 'Tests on this channel (test message + OTP) are sent to a PHONE NUMBER — enter an international number (e.g. +213555123456). Channels that need an email have their own email field.',
+    testRecipientHintEmail: 'Tests on this channel (test message + OTP) are sent to an EMAIL ADDRESS — enter a valid address. Channels that need a phone number have their own phone field.',
+    previewEmailView: 'Final email view',
+    previewTextView: 'Text version',
+    previewFromLine: 'BLASTI <no-reply@blasti.app>',
+    previewDeliveredBadge: 'What the customer\'s phone shows',
     webhookUrlTitle: 'Delivery-report webhook URL',
     webhookUrlHintSms: 'Paste this URL into the eSMS Africa portal (Settings → Webhooks → DLR URL) to receive delivery reports.',
     webhookUrlHintWa: 'Subscribe at Meta App Dashboard → WhatsApp → Configuration, and use the verify token below during the handshake.',
@@ -551,6 +564,18 @@ const extractVars = (text: string): string[] => {
     m = re.exec(text);
   }
   return [...found];
+};
+
+/**
+ * Make relative /api/... asset URLs absolute (resolved API base) so the
+ * preview iframe shows the real logos even when the API has no
+ * PUBLIC_BASE_URL set (dev/sandbox). Behind the gateway the base is '' and
+ * the relative URL routes correctly; in local dev it becomes :3003.
+ */
+const withAbsoluteAssetUrls = (html: string): string => {
+  const base = getApiBaseUrl().replace(/\/+$/, '');
+  if (!base) return html;
+  return html.replace(/(src|href)="\/(api\/[^"]*)"/g, `$1="${base}/$2"`);
 };
 
 /** Build the editable form state for a channel from its masked config */
@@ -1249,7 +1274,18 @@ export function AdminProvidersSettings() {
       const res = await apiFetch('/api/admin/providers/templates/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key: selKey, channel: selChannel, language: draft.language, vars }),
+        body: JSON.stringify({
+          key: selKey,
+          channel: selChannel,
+          language: draft.language,
+          vars,
+          // WYSIWYG: preview the UNSAVED editor draft (falls back to the saved row)
+          draft: {
+            subject: draft.subject,
+            body: draft.body,
+            ...(selChannel === 'EMAIL' ? { htmlBody: draft.htmlBody } : {}),
+          },
+        }),
       });
       const json = await res.json().catch(() => ({}));
       if (res.ok && json.success) {
@@ -1748,15 +1784,44 @@ export function AdminProvidersSettings() {
                     )}
 
                     {/* ── Actions ── */}
-                    <div className="space-y-2">
-                      <Button
-                        onClick={() => saveChannel(channel)}
-                        disabled={saving || testing}
-                        className="w-full sm:w-auto bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl h-10 gap-2"
-                      >
-                        {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                        {saving ? c.saving : c.save}
-                      </Button>
+                    <div className="space-y-3">
+                      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                        <Button
+                          onClick={() => saveChannel(channel)}
+                          disabled={saving || testing}
+                          className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl h-10 gap-2"
+                        >
+                          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                          {saving ? c.saving : c.save}
+                        </Button>
+                      </div>
+                      {/* ── Test recipient input — SMS/WhatsApp need a PHONE, Email needs an EMAIL ── */}
+                      {testField && (
+                        <div className="space-y-1.5">
+                          <Label className="text-xs font-medium text-muted-foreground flex items-center gap-1.5">
+                            {channel === 'EMAIL' ? <Mail className="h-3 w-3" /> : <Phone className="h-3 w-3" />}
+                            {testField.label}
+                            <Badge variant="outline" className="text-[9px] px-1 py-0 text-muted-foreground">
+                              {channel === 'EMAIL' ? 'email' : 'phone'}
+                            </Badge>
+                          </Label>
+                          <Input
+                            type={channel === 'EMAIL' ? 'email' : 'tel'}
+                            inputMode={channel === 'EMAIL' ? 'email' : 'tel'}
+                            autoComplete={channel === 'EMAIL' ? 'email' : 'tel'}
+                            value={form.extras[testField.key] ?? ''}
+                            onChange={(e) => setExtraValue(channel, testField.key, e.target.value)}
+                            placeholder={testField.placeholder}
+                            className="h-9 text-sm font-mono max-w-xs"
+                            dir="ltr"
+                            aria-label={testField.label}
+                          />
+                          <p className="text-[10px] text-muted-foreground flex items-start gap-1">
+                            <Info className="h-3 w-3 mt-0.5 shrink-0" />
+                            {channel === 'EMAIL' ? c.testRecipientHintEmail : c.testRecipientHintPhone}
+                          </p>
+                        </div>
+                      )}
                       {testField && (
                         <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                           <Button
@@ -2319,7 +2384,7 @@ export function AdminProvidersSettings() {
 
       {/* ─── Preview dialog ─── */}
       <Dialog open={previewOpen} onOpenChange={setPreviewOpen}>
-        <DialogContent className="max-w-lg max-h-[85vh] overflow-y-auto custom-scrollbar" dir={dir}>
+        <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto custom-scrollbar" dir={dir}>
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2 text-base">
               <Eye className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
@@ -2340,39 +2405,100 @@ export function AdminProvidersSettings() {
               {previewError || c.previewFailed}
             </div>
           ) : previewData ? (
-            <div className="space-y-3">
-              {previewData.useProviderTemplate && previewData.providerTemplateId && (
-                <div className="rounded-lg border border-violet-200 dark:border-violet-900/40 bg-violet-50 dark:bg-violet-950/20 p-2.5 text-[11px] text-violet-700 dark:text-violet-300 flex items-start gap-2">
-                  <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
-                  <span>
-                    {c.previewProviderNote}{' '}
-                    <code className="font-mono font-bold" dir="ltr">{previewData.providerTemplateId}</code>
-                  </span>
+            selChannel === 'EMAIL' ? (
+              /* ═══ EMAIL preview — email-client frame + sandboxed final HTML ═══ */
+              <div className="space-y-3">
+                {previewData.useProviderTemplate && previewData.providerTemplateId && (
+                  <div className="rounded-lg border border-violet-200 dark:border-violet-900/40 bg-violet-50 dark:bg-violet-950/20 p-2.5 text-[11px] text-violet-700 dark:text-violet-300 flex items-start gap-2">
+                    <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                    <span>
+                      {c.previewProviderNote}{' '}
+                      <code className="font-mono font-bold" dir="ltr">{previewData.providerTemplateId}</code>
+                    </span>
+                  </div>
+                )}
+                {/* Client chrome: from + subject */}
+                <div className="rounded-t-xl border border-b-0 border-border bg-muted/40 px-3 py-2.5 flex items-center gap-2.5">
+                  <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-emerald-200 to-teal-300 dark:from-emerald-900/40 dark:to-teal-800/40 flex items-center justify-center shrink-0">
+                    <Mail className="h-4 w-4 text-emerald-700 dark:text-emerald-400" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-[11px] font-semibold text-foreground truncate" dir="ltr">{c.previewFromLine}</p>
+                    {previewData.subject && (
+                      <p className="text-xs text-muted-foreground truncate" dir="auto">{previewData.subject}</p>
+                    )}
+                  </div>
                 </div>
-              )}
-              {previewData.subject && (
-                <div className="space-y-1">
-                  <p className="text-[10px] font-semibold text-muted-foreground uppercase">{c.previewSubject}</p>
-                  <p className="text-sm font-medium text-foreground rounded-lg bg-muted/50 px-3 py-2">{previewData.subject}</p>
-                </div>
-              )}
-              <div className="space-y-1">
-                <p className="text-[10px] font-semibold text-muted-foreground uppercase">{c.previewBody}</p>
-                <p className="text-sm text-foreground whitespace-pre-wrap rounded-lg bg-muted/50 px-3 py-2 leading-relaxed" dir="auto">
-                  {previewData.text}
-                </p>
-              </div>
-              {previewData.html && (
-                <div className="space-y-1">
-                  <p className="text-[10px] font-semibold text-muted-foreground uppercase">{c.previewHtml}</p>
-                  <div
-                    className="rounded-lg border border-border p-3 bg-white text-sm overflow-x-auto"
-                    // Admin-side preview of the admin's own stored email HTML
-                    dangerouslySetInnerHTML={{ __html: previewData.html }}
+                {/* Final rendered email (branded layout incl. logos) in a script-safe iframe */}
+                <div className="rounded-b-xl border border-border overflow-hidden bg-white">
+                  <iframe
+                    title="email-template-preview"
+                    sandbox=""
+                    srcDoc={previewData.html
+                      ? withAbsoluteAssetUrls(previewData.html)
+                      : `<pre style="white-space:pre-wrap;font-family:inherit;padding:16px;margin:0;">${previewData.text.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre>`}
+                    className="w-full h-[400px] border-0 bg-white"
                   />
                 </div>
-              )}
-            </div>
+                <Collapsible>
+                  <CollapsibleTrigger asChild>
+                    <Button variant="ghost" size="sm" className="h-7 px-2 text-xs text-muted-foreground gap-1">
+                      <ChevronDown className="h-3.5 w-3.5" />
+                      {c.previewTextView}
+                    </Button>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="pt-2">
+                    <p className="text-xs text-foreground whitespace-pre-wrap rounded-lg bg-muted/50 px-3 py-2 leading-relaxed" dir="auto">
+                      {previewData.text}
+                    </p>
+                  </CollapsibleContent>
+                </Collapsible>
+              </div>
+            ) : (
+              /* ═══ SMS / WHATSAPP preview — what the customer's phone shows ═══ */
+              <div className="space-y-3">
+                {previewData.useProviderTemplate && previewData.providerTemplateId && (
+                  <div className="rounded-lg border border-violet-200 dark:border-violet-900/40 bg-violet-50 dark:bg-violet-950/20 p-2.5 text-[11px] text-violet-700 dark:text-violet-300 flex items-start gap-2">
+                    <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                    <span>
+                      {c.previewProviderNote}{' '}
+                      <code className="font-mono font-bold" dir="ltr">{previewData.providerTemplateId}</code>
+                    </span>
+                  </div>
+                )}
+                <p className="text-[10px] font-medium text-muted-foreground flex items-center gap-1.5">
+                  <Phone className="h-3 w-3" />
+                  {c.previewDeliveredBadge}
+                </p>
+                <div className="rounded-2xl border border-border bg-muted/30 p-3.5">
+                  <div className="rounded-xl bg-white dark:bg-gray-900 border border-border/60 shadow-sm overflow-hidden">
+                    {/* Chat header */}
+                    <div className="flex items-center gap-2 px-3 py-2.5 border-b border-border/60 bg-muted/30">
+                      <div className="h-7 w-7 rounded-full bg-emerald-600 flex items-center justify-center shrink-0">
+                        <MessageSquare className="h-3.5 w-3.5 text-white" />
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-xs font-bold text-foreground leading-none">BLASTI</p>
+                        <p className="text-[9px] text-muted-foreground mt-0.5">{selChannel === 'WHATSAPP' ? 'WhatsApp Business' : 'SMS'}</p>
+                      </div>
+                    </div>
+                    {/* Chat body */}
+                    <div className="p-3">
+                      <div className="flex justify-start">
+                        <div className="max-w-[88%] rounded-2xl rounded-ss-md bg-muted dark:bg-gray-800 px-3.5 py-2.5">
+                          <p className="text-[13px] text-foreground whitespace-pre-wrap leading-relaxed break-words" dir="auto">
+                            {previewData.text}
+                          </p>
+                          <p className="text-[9px] text-muted-foreground mt-1 text-end" dir="ltr">
+                            {new Date().toLocaleTimeString(lang === 'ar' ? 'ar-DZ' : 'en-US', { hour: '2-digit', minute: '2-digit' })}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )
           ) : null}
 
           <DialogFooter>

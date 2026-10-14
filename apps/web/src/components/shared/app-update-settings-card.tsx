@@ -16,7 +16,7 @@
 import { useEffect, useState } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { Switch } from '@/components/ui/switch';
-import { Loader2, RefreshCw, Wifi, DownloadCloud } from 'lucide-react';
+import { Loader2, RefreshCw, Wifi, DownloadCloud, RotateCcw } from 'lucide-react';
 import {
   loadAppUpdateSettings,
   saveAppUpdateSettings,
@@ -31,6 +31,7 @@ export function AppUpdateSettingsCard() {
   const [settings, setSettings] = useState<AppUpdateSettings>({
     autoDownload: false,
     autoDownloadWifiOnly: true,
+    autoInstall: true,
   });
   const checking = useAppUpdateStore((s) => s.checking);
 
@@ -90,6 +91,22 @@ export function AppUpdateSettingsCard() {
           onCheckedChange={(checked) => update({ autoDownloadWifiOnly: checked })}
           disabled={!settings.autoDownload}
           aria-label={t('updateWifiOnly')}
+        />
+      </div>
+
+      {/* Auto-install (download → install → restart) */}
+      <div className="p-3.5 flex items-center gap-3 border-t border-border/40">
+        <div className="h-8 w-8 rounded-lg bg-emerald-50 dark:bg-emerald-900/20 flex items-center justify-center shrink-0">
+          <RotateCcw className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-foreground">{t('updateAutoInstall')}</p>
+          <p className="text-[11px] text-muted-foreground">{t('updateAutoInstallDesc')}</p>
+        </div>
+        <Switch
+          checked={settings.autoInstall}
+          onCheckedChange={(checked) => update({ autoInstall: checked })}
+          aria-label={t('updateAutoInstall')}
         />
       </div>
 

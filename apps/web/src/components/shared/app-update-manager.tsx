@@ -93,12 +93,40 @@ export function AppUpdateManager() {
 
     // Android: re-check when the app comes back to the foreground — this is
     // how a COMPLETED package install is detected (new version → no update).
+    // The honesty gate runs FIRST: if the user just came back from the
+    // package installer, compare the native version against the one recorded
+    // at install() time and TELL the truth — "updated to X" on success, or
+    // "the update did not install (signature mismatch) — uninstall and
+    // reinstall once" when Android silently refused it (the old app must
+    // never claim an update happened when the OS kept the old version).
     let unsubResume: (() => void) | undefined;
     const appPlugin = w.Capacitor?.Plugins?.App as CapacitorAppPlugin | undefined;
     if (appPlugin?.addListener) {
       try {
         const handle = appPlugin.addListener('appStateChange', (state) => {
-          if (state.isActive) void check('resume');
+          if (!state.isActive) return;
+          void (async () => {
+            const outcome = await useAppUpdateStore.getState().resolvePendingInstall();
+            if (outcome === 'updated') {
+              toast.success(
+                lang === 'ar'
+                  ? 'تم تحديث التطبيق بنجاح ✅'
+                  : lang === 'fr'
+                    ? 'Application mise à jour avec succès ✅'
+                    : 'App updated successfully ✅',
+              );
+            } else if (outcome === 'not-installed') {
+              toast.error(
+                lang === 'ar'
+                  ? 'لم يتم تثبيت التحديث — غالبًا بسبب توقيع مختلف. أزل التطبيق ثم ثبّته مرة واحدة من صفحة التحميل، وستعمل التحديثات المقبلة تلقائيًا.'
+                  : lang === 'fr'
+                    ? "La mise à jour n'a pas été installée — signature différente. Désinstallez puis réinstallez une fois ; les mises à jour suivantes seront automatiques."
+                    : 'The update was not installed — signature mismatch. Uninstall the app and reinstall once from the download page; future updates will then install automatically.',
+                { duration: 12000 },
+              );
+            }
+            void check('resume');
+          })();
         });
         if (handle && typeof (handle as { remove?: () => void }).remove === 'function') {
           unsubResume = () => (handle as { remove: () => void }).remove();

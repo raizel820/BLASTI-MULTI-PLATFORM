@@ -51,6 +51,7 @@ import {
 } from '@/components/ui/select';
 import {
   formatDateTime,
+  formatFileSize,
   platformIcon,
   platformLabel,
   type AppVersion,
@@ -65,7 +66,10 @@ export function PusherTab() {
   const { t, lang } = useLanguage();
 
   const [pushes, setPushes] = useState<PushRow[]>([]);
-  const [publishedVersions, setPublishedVersions] = useState<AppVersion[]>([]);
+  /** ALL installer rows (published AND drafts) — last 10 uploads are offered. */
+  const [allVersions, setAllVersions] = useState<AppVersion[]>([]);
+  /** platform → version string of the CURRENTLY ACTIVE published installer. */
+  const [activeByPlatform, setActiveByPlatform] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -82,12 +86,17 @@ export function PusherTab() {
   const fetchAll = useCallback(async (isRefresh = false) => {
     if (!isRefresh) setLoading(true);
     try {
-      const [pushesRes, versionsRes] = await Promise.all([
+      const [pushesRes, versionsRes, activeRes] = await Promise.all([
         apiFetch('/api/app-installs/pushes'),
-        apiFetch('/api/app-versions?published=true'),
+        // NO published filter — the admin picks among the LAST TEN UPLOADED
+        // INSTALLERS, including drafts and versions older than the active one
+        // (devices still running old builds must be reachable).
+        apiFetch('/api/app-versions'),
+        apiFetch('/api/app-versions/public/active'),
       ]);
       const pushesData = await pushesRes.json().catch(() => null);
       const versionsData = await versionsRes.json().catch(() => null);
+      const activeData = await activeRes.json().catch(() => null);
 
       if (pushesRes.ok && pushesData?.success) {
         setPushes(pushesData.pushes || []);
@@ -96,7 +105,14 @@ export function PusherTab() {
         setError(pushesData?.error || `HTTP ${pushesRes.status}`);
       }
       if (versionsRes.ok && versionsData?.success) {
-        setPublishedVersions(versionsData.versions || []);
+        setAllVersions(versionsData.versions || []);
+      }
+      if (activeRes.ok && activeData?.success) {
+        const map: Record<string, string> = {};
+        for (const v of activeData.versions || []) {
+          if (v?.platform && v?.version) map[v.platform as string] = v.version as string;
+        }
+        setActiveByPlatform(map);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Network error');
@@ -109,16 +125,23 @@ export function PusherTab() {
     fetchAll();
   }, [fetchAll]);
 
-  /** Published versions of the selected platform (server validates ownership). */
+  /** Installer rows of the selected platform — the LAST TEN UPLOADED first
+   * (API orders createdAt desc). Includes the active one and older versions:
+   * devices still on old builds must be pushable. */
   const targetVersions = useMemo(
-    () => publishedVersions.filter((v) => v.platform === platform),
-    [publishedVersions, platform],
+    () => allVersions.filter((v) => v.platform === platform).slice(0, 10),
+    [allVersions, platform],
   );
 
-  // Reset the version pick when the platform changes and the pick no longer belongs.
+  // Reset the pick when the platform changes and the pick no longer belongs,
+  // then DEFAULT-PICK the most recently uploaded installer (selecting the
+  // FILE, not just a version number — same version can be rebuilt often).
   useEffect(() => {
     if (appVersionId && !targetVersions.some((v) => v.id === appVersionId)) {
-      setAppVersionId('');
+      setAppVersionId(targetVersions[0]?.id ?? '');
+    }
+    if (!appVersionId && targetVersions.length > 0) {
+      setAppVersionId(targetVersions[0].id);
     }
   }, [targetVersions, appVersionId]);
 
@@ -280,27 +303,55 @@ export function PusherTab() {
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">{t('publicAppPushTargetVersion')}</Label>
+              <Label className="text-xs">{t('publicAppPushTargetInstaller')}</Label>
               <Select value={appVersionId} onValueChange={setAppVersionId} disabled={sending || targetVersions.length === 0}>
-                <SelectTrigger className="h-10 text-sm" aria-label={t('publicAppPushTargetVersion')}>
+                <SelectTrigger className="h-10 text-sm" aria-label={t('publicAppPushTargetInstaller')}>
                   <SelectValue
                     placeholder={
                       targetVersions.length === 0 && !loading
                         ? t('publicAppPushNoVersions')
-                        : t('publicAppPushPickVersion')
+                        : t('publicAppPushPickInstaller')
                     }
                   />
                 </SelectTrigger>
                 <SelectContent>
-                  {targetVersions.map((v) => (
-                    <SelectItem key={v.id} value={v.id}>
-                      {`v${v.version} · #${v.versionCode ?? 0}`}
-                    </SelectItem>
-                  ))}
+                  {targetVersions.map((v) => {
+                    const isActive = activeByPlatform[v.platform] === v.version;
+                    return (
+                      <SelectItem key={v.id} value={v.id} className="py-2">
+                        <span className="flex flex-col items-start gap-0.5 max-w-full" dir="ltr">
+                          <span className="flex items-center gap-1.5 font-medium">
+                            {`v${v.version}`}
+                            <span className="text-[10px] text-muted-foreground font-normal truncate max-w-[220px]">
+                              {v.fileName || 'installer'}
+                            </span>
+                          </span>
+                          <span className="flex items-center gap-1.5 text-[10px] text-muted-foreground font-normal">
+                            <span>{formatFileSize(v.fileSize)}</span>
+                            <span>·</span>
+                            <span>{formatDateTime(v.createdAt, lang)}</span>
+                            {isActive && (
+                              <Badge className="h-4 px-1.5 text-[9px] bg-emerald-100 text-emerald-700 border-emerald-200">
+                                {t('publicAppPushActiveBadge')}
+                              </Badge>
+                            )}
+                            {!v.isPublished && (
+                              <Badge className="h-4 px-1.5 text-[9px] bg-amber-100 text-amber-700 border-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:border-amber-800">
+                                {t('publicAppPushDraftBadge')}
+                              </Badge>
+                            )}
+                          </span>
+                        </span>
+                      </SelectItem>
+                    );
+                  })}
                 </SelectContent>
               </Select>
               {targetVersions.length === 0 && !loading && (
                 <p className="text-[11px] text-muted-foreground">{t('publicAppPushNoVersionsHint')}</p>
+              )}
+              {targetVersions.length > 0 && (
+                <p className="text-[11px] text-muted-foreground">{t('publicAppPushInstallerHint')}</p>
               )}
             </div>
           </div>

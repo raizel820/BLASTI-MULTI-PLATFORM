@@ -78,6 +78,7 @@ import { paymentSettingsRoutes } from './routes/payment-settings'
 import { qrRoutes } from './routes/qr'
 import { transactionRoutes } from './routes/transactions'
 import { uploadRoutes } from './routes/upload'
+import { brandingRoutes } from './routes/branding'
 import { filesSyncRoutes } from './routes/files-sync'
 import { syncRoutes } from './routes/sync'
 import { settingsRoutes } from './routes/settings'
@@ -670,6 +671,8 @@ app.route('/api/payment-settings', paymentSettingsRoutes)
 app.route('/api/qr', qrRoutes)
 app.route('/api/transactions', transactionRoutes)
 app.route('/api/upload', uploadRoutes)
+// Public branding assets (app logo for emails / integrations)
+app.route('/api/branding', brandingRoutes)
 // Round 15 — desktop file-sync family (push/pull/blob/tombstone).
 app.route('/api/files/sync', filesSyncRoutes)
 app.route('/api/sync', syncRoutes)

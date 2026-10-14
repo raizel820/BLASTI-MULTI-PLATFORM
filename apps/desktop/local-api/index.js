@@ -25,6 +25,7 @@ const { cors } = require('hono/cors')
 const { createServer } = require('http')
 const { randomBytes, timingSafeEqual, createHash, scryptSync } = require('crypto')
 const { localDb, setupPragmas, ensureDatabaseReady } = require('./lib/db')
+const { adoptChildrenThenDelete } = require('./lib/stale-unique')
 const localRealtime = require('./local-realtime')
 const fileStore = require('./lib/file-store')
 const { createFileSync } = require('./lib/file-sync')
@@ -840,7 +841,13 @@ async function upsertLocalUserFromCloud(cloudUser, overrides) {
       if (!value) continue
       const stale = await db.user.findFirst({ where: { [field]: value } }).catch(() => null)
       if (stale && stale.id !== cloudUser.id) {
-        await db.user.delete({ where: { id: stale.id } }).catch(() => null)
+        try {
+          await db.user.delete({ where: { id: stale.id } })
+        } catch (delErr) {
+          // FIELD FIX — the stale row is FK-referenced (locally synced staff,
+          // reservations…). ADOPT the children into the cloud id, then delete.
+          await adoptChildrenThenDelete(db, 'User', stale.id, cloudUser.id)
+        }
         rescued = true
       }
     }

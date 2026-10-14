@@ -50,8 +50,10 @@ import {
   ensureDefaultTemplates,
   renderTemplate,
   deliverTemplate,
+  applyTemplateVars,
   TEMPLATE_CATALOG,
 } from '../lib/messaging/template-service'
+import { isFullHtmlDocument, wrapEmailHtml } from '../lib/messaging/email-layout'
 
 const app = new Hono()
 
@@ -435,6 +437,16 @@ const previewSchema = z.object({
   channel: z.enum(['EMAIL', 'SMS', 'WHATSAPP']),
   language: z.enum(['ar', 'fr', 'en']).default('en'),
   vars: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
+  /**
+   * Unsaved editor draft — when present the preview renders THESE values
+   * (WYSIWYG: the admin sees exactly what will be sent before saving).
+   * Missing fields fall back to the saved template row.
+   */
+  draft: z.object({
+    subject: z.string().max(200).optional(),
+    body: z.string().max(4000).optional(),
+    htmlBody: z.string().max(20000).optional(),
+  }).optional(),
 })
 
 app.post('/templates/preview', async (c) => {
@@ -445,12 +457,38 @@ app.post('/templates/preview', async (c) => {
     if (validation.error) {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
-    const { key, channel, language, vars } = validation.data
+    const { key, channel, language, vars, draft } = validation.data
     const rendered = await renderTemplate(key, channel, language, vars ?? {})
-    if (!rendered) {
+    if (!rendered && !draft) {
       return c.json({ success: false, error: 'Template missing or disabled' }, 404)
     }
-    return c.json({ success: true, rendered })
+
+    // Draft overrides (unsaved editor content win — WYSIWYG preview).
+    // Variables are substituted into draft values too, so the admin sees the
+    // final rendered message exactly as the customer will receive it.
+    const varsMap = vars ?? {}
+    const subject = draft?.subject !== undefined ? applyTemplateVars(draft.subject, varsMap) : rendered?.subject ?? null
+    const text = draft?.body !== undefined ? applyTemplateVars(draft.body, varsMap) : rendered?.text ?? ''
+    let html = draft?.htmlBody !== undefined
+      ? (draft.htmlBody ? applyTemplateVars(draft.htmlBody, varsMap) : null)
+      : rendered?.html ?? null
+
+    // Apply the SAME professional branded layout used at delivery time so the
+    // preview shows the final look (app logo header + agency-style footer).
+    if (channel === 'EMAIL' && html && !isFullHtmlDocument(html)) {
+      html = wrapEmailHtml({ bodyHtml: html, language })
+    }
+
+    return c.json({
+      success: true,
+      rendered: {
+        subject,
+        text,
+        html,
+        useProviderTemplate: rendered?.useProviderTemplate ?? false,
+        providerTemplateId: rendered?.providerTemplateId ?? null,
+      },
+    })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: false, error: err.error }, err.status as 400)

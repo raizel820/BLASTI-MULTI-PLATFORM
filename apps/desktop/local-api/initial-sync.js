@@ -33,6 +33,7 @@ const { randomUUID } = require('crypto')
 // desktop) by dropping unknown columns / null-on-not-null values instead of
 // failing the whole stage.
 const { sanitizeSyncRecord, formatDropped, copyFallbackTags, getFallbackKeys } = require('./lib/sync-record-sanitize')
+const { adoptChildrenThenDelete: _adoptChildrenThenDelete } = require('./lib/stale-unique')
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -566,7 +567,15 @@ async function _resolveStaleUniqueRow(tx, modelName, error, incoming) {
       if (!model || typeof model.findFirst !== 'function') continue
       const stale = await model.findFirst({ where: { [field]: value } })
       if (!stale || stale.id === record.id) continue
-      await model.delete({ where: { id: stale.id } })
+      try {
+        await model.delete({ where: { id: stale.id } })
+      } catch (delErr) {
+        // FIELD FIX — the stale row is FK-REFERENCED (locally synced staff,
+        // reservations, notifications…), so a plain delete throws and the
+        // users stage died with the original P2002. ADOPT the children into
+        // the incoming (cloud) id first, then delete the stale parent.
+        await _adoptChildrenThenDelete(tx, modelName, stale.id, record.id)
+      }
       return true
     } catch { /* probe/delete failures fall through to the next field */ }
   }

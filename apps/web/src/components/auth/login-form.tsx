@@ -20,7 +20,7 @@ import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { LanguageSwitcher } from '@/components/shared/language-switcher';
 import { ThemeToggle } from '@/components/shared/theme-toggle';
 import { nativeBridge } from '@/lib/native-bridge';
-import { ArrowLeft, Loader2, Eye, EyeOff, CheckCircle2, KeyRound, Mail, Ticket, Tablet, Fingerprint } from 'lucide-react';
+import { ArrowLeft, Loader2, Eye, EyeOff, CheckCircle2, KeyRound, Mail, Ticket, Tablet, Fingerprint, LifeBuoy } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { UserRole } from '@/store/use-app-store';
@@ -33,6 +33,8 @@ import {
   type VerificationSuccess,
 } from './verification-step';
 import { NativeServerStatus } from './native-server-status';
+import { MobileDiagnosticsSheet } from '@/components/shared/mobile-diagnostics-sheet';
+import { isNativeShell } from '@/lib/native-diagnostics';
 
 export function LoginForm() {
   const { setUser, setView, goBack, setSessionToken } = useAppStore();
@@ -57,6 +59,8 @@ export function LoginForm() {
     try { setRememberMe(getLastRememberChoice()); } catch { /* storage unavailable */ }
   }, []);
   const [authView, setAuthView] = useState<'login' | 'forgot-password' | 'reset-password' | 'verify'>('login');
+  // Shell diagnostics (native shells only) — one tap from the login card.
+  const [diagOpen, setDiagOpen] = useState(false);
 
   // Task 22-b: pending OTP verification — when the login API answers
   // requiresVerification, the card shows the shared VerificationStep and the
@@ -615,6 +619,18 @@ export function LoginForm() {
                         </div>
                       </div>
                     </CardContent>
+                    {isNativeShell() && (
+                      <div className="px-6 pb-1 flex justify-center">
+                        <button
+                          type="button"
+                          onClick={() => setDiagOpen(true)}
+                          className="flex items-center gap-1.5 rounded-full border border-border/60 bg-muted/40 px-3.5 py-1.5 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground transition-colors min-h-[36px]"
+                        >
+                          <LifeBuoy className="h-3.5 w-3.5" aria-hidden />
+                          {t('diagOpenButton')}
+                        </button>
+                      </div>
+                    )}
                     <CardFooter className="flex-col gap-4 pt-2 pb-6">
                       <div className="flex items-center gap-2 w-full">
                         <button
@@ -1026,6 +1042,9 @@ export function LoginForm() {
           </motion.div>
         </motion.div>
       </div>
+
+      {/* Shell diagnostics (native shells only; renders null elsewhere) */}
+      <MobileDiagnosticsSheet open={diagOpen} onOpenChange={setDiagOpen} />
     </div>
   );
 }

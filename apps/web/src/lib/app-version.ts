@@ -10,9 +10,9 @@
  *
  * ZERO @capacitor imports: @capacitor/* is NOT installed in apps/web. The
  * global Capacitor object injected by the native shell is probed defensively
- * (established pattern: app-intro-animation.tsx / device-report.ts). In a
- * plain browser there is no bridge, so the promise simply resolves null and
- * callers fall back to their static label.
+ * (lib/native-plugin.ts — shared with device-report.ts). In a plain browser
+ * there is no bridge, so the promise simply resolves null and callers fall
+ * back to their static label.
  *
  * Contract:
  * - SSR-safe (`typeof window === 'undefined'` → null).
@@ -22,31 +22,46 @@
  *   one Device.getInfo() round-trip.
  */
 
-interface DevicePluginShape {
-  getInfo?: () => Promise<{ appVersion?: string }>;
-}
-
-interface CapacitorGlobalShape {
-  /** Runtime returns the plugin object for `name` (Device → .getInfo()). */
-  getPlugins?: (name: string) => DevicePluginShape | undefined;
-}
+import { getNativePlugin } from './native-plugin';
 
 /** Memoized probe — shared by all consumers for the whole session. */
 let versionPromise: Promise<string | null> | null = null;
 
-async function probeAppVersion(): Promise<string | null> {
-  if (typeof window === 'undefined') return null;
+const PROBE_RETRIES = 5;
+const PROBE_RETRY_DELAY_MS = 500;
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function probeOnce(): Promise<string | null> {
   try {
-    const cap = (
-      window as unknown as { Capacitor?: CapacitorGlobalShape }
-    ).Capacitor;
-    const device = cap?.getPlugins?.('Device');
-    const res = await device?.getInfo?.();
+    // Real Capacitor 3–8 surface: window.Capacitor.Plugins.Device.getInfo()
+    // (native Promise via nativePromise — verified JSExport.getPluginJS).
+    const device = getNativePlugin('Device');
+    const getInfo = device?.getInfo as (() => Promise<{ appVersion?: string }>) | undefined;
+    const res = await getInfo?.();
     return res?.appVersion?.trim() || null;
   } catch {
-    // Older shell / no bridge — callers keep their fallback label.
+    // Older shell / bridge threw — treat as not-ready, callers fall back.
     return null;
   }
+}
+
+/**
+ * Probe with a bounded retry: on a REAL phone the native bridge is injected
+ * before any web code runs, so the first attempt hits. The retries cover
+ * shells/timings where the bridge global lands slightly AFTER the first
+ * consumer mounts (slow WebView init, SPA hot paths) — without them the
+ * null result was memoized for the whole session and the settings row kept
+ * its static fallback forever.
+ */
+async function probeAppVersion(): Promise<string | null> {
+  if (typeof window === 'undefined') return null;
+  for (let attempt = 0; attempt < PROBE_RETRIES; attempt++) {
+    const version = await probeOnce();
+    if (version) return version;
+    if (attempt + 1 < PROBE_RETRIES) await sleep(PROBE_RETRY_DELAY_MS);
+  }
+  return null; // plain browser / bridgeless shell — memoized fallback
 }
 
 /**
