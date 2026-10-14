@@ -3950,6 +3950,10 @@ const en: Record<TranslationKeys, string> = {
   updateAutoDownloadDesc: "Download updates when they become available so you can install them later with one tap",
   updateWifiOnly: "Wi-Fi only",
   updateWifiOnlyDesc: "Auto-download updates only when connected to a Wi-Fi network",
+  updateAutoInstall: "Install updates automatically",
+  lockscreenOpenApp: "Open app",
+  lockscreenDismiss: "Dismiss",
+  updateAutoInstallDesc: "When a download finishes the update installs and the app restarts on its own",
   publicAppTabDevices: "Devices",
 
   // Tab 1 — Installers (live storage tracker)

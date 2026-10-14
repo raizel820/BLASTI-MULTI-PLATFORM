@@ -1831,31 +1831,19 @@ ipcMain.handle('updates:download', async (_e, payload) => {
   (async () => {
     let lastSentPercent = -1;
     let lastSentAt = 0;
+    const emit = (received, total) => {
+      const percent = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0;
+      const now = Date.now();
+      if (percent !== lastSentPercent && (now - lastSentAt > 250 || percent === 100)) {
+        lastSentPercent = percent;
+        lastSentAt = now;
+        sendUpdateProgress({ status: 'downloading', percent, receivedBytes: received, totalBytes: total, version: activeUpdateDownload.version });
+      }
+    };
     try {
-      const res = await fetch(resolved, { redirect: 'follow' });
-      if (!res.ok) throw new Error(`http-${res.status}`);
-      const total = Number(res.headers.get('content-length') || 0);
-      let received = 0;
-      const fileStream = fs.createWriteStream(dest);
-      const nodeStream = require('stream').Readable.fromWeb(res.body);
-      await new Promise((resolveP, rejectP) => {
-        nodeStream.on('data', (chunk) => {
-          received += chunk.length;
-          fileStream.write(chunk);
-          const percent = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : 0;
-          const now = Date.now();
-          if (percent !== lastSentPercent && (now - lastSentAt > 250 || percent === 100)) {
-            lastSentPercent = percent;
-            lastSentAt = now;
-            sendUpdateProgress({ status: 'downloading', percent, receivedBytes: received, totalBytes: total, version: activeUpdateDownload.version });
-          }
-        });
-        nodeStream.on('error', rejectP);
-        fileStream.on('error', rejectP);
-        nodeStream.on('end', () => fileStream.end(resolveP));
-      });
+      const received = await downloadUpdateFile(resolved, dest, emit);
       lastDownloadedInstaller = dest;
-      sendUpdateProgress({ status: 'downloaded', percent: 100, receivedBytes: received, totalBytes: total, filePath: dest, version: activeUpdateDownload.version });
+      sendUpdateProgress({ status: 'downloaded', percent: 100, receivedBytes: received, totalBytes: received, filePath: dest, version: activeUpdateDownload.version });
       for (const win of BrowserWindow.getAllWindows()) {
         try { if (!win.isDestroyed()) win.webContents.send('update:downloaded', { filePath: dest, version: activeUpdateDownload.version }); } catch { /* window gone */ }
       }
@@ -1871,6 +1859,145 @@ ipcMain.handle('updates:download', async (_e, payload) => {
   return { status: 'started', dest };
 });
 
+// ─── Fast parallel update downloader ─────────────────────────────────────────
+// The old single-connection fetch felt dramatically slower than the browser
+// download from the landing page on long-fat links (single TCP stream on a
+// high-latency route). This downloader:
+//   • uses Electron's net.fetch (system proxy + HTTP/2 aware) when available,
+//   • probes Range support and downloads in 3 PARALLEL chunks for files
+//     larger than 8 MB (multiplies the effective throughput exactly like a
+//     browser's parallel-connection behaviour),
+//   • falls back to a single resumed stream (Range: bytes=<have>-) when the
+//     server ignores ranges or a chunk fails,
+//   • never buffers the file in memory (positional fs writes / streaming).
+const UPDATE_PARALLEL_MIN_BYTES = 8 * 1024 * 1024;
+const UPDATE_PARTS = 3;
+
+function updateFetch(url, init) {
+  // Electron net.fetch honors the OS proxy and TLS stack — prefer it; the
+  // global (undici) fetch is the universal fallback (dev + tests).
+  try {
+    const { net } = require('electron');
+    if (net && typeof net.fetch === 'function') return net.fetch(url, init);
+  } catch { /* not available — fall through */ }
+  return fetch(url, init);
+}
+
+function semverGreaterThan(a, b) {
+  const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] || 0) > (pb[i] || 0)) return true;
+    if ((pa[i] || 0) < (pb[i] || 0)) return false;
+  }
+  return false;
+}
+
+async function downloadUpdateFile(url, dest, emit) {
+  // ── Probe: size + Range support in one cheap ranged request. ──────────────
+  let total = 0;
+  let ranges = false;
+  try {
+    const probe = await updateFetch(url, { headers: { Range: 'bytes=0-0' }, redirect: 'follow' });
+    if (probe.status === 206) {
+      ranges = true;
+      const cr = probe.headers.get('content-range') || '';
+      const m = /\/(\d+)\s*$/.exec(cr);
+      if (m) total = parseInt(m[1], 10);
+    } else if (probe.ok) {
+      total = Number(probe.headers.get('content-length') || 0);
+    }
+    try { await probe.body?.cancel(); } catch { /* already closed */ }
+  } catch { /* probe failure is non-fatal — the real request rechecks */ }
+
+  // Large file + server-side ranges → parallel chunked download.
+  if (ranges && total >= UPDATE_PARALLEL_MIN_BYTES) {
+    try {
+      const got = await downloadParallelRanges(url, dest, total, emit);
+      return got;
+    } catch (err) {
+      console.warn('[BLASTI Desktop] parallel download failed — falling back to single stream:', err && err.message);
+    }
+  }
+  return downloadSingleStream(url, dest, emit);
+}
+
+async function downloadParallelRanges(url, dest, total, emit) {
+  const parts = [];
+  const boundaries = [];
+  for (let i = 0; i <= UPDATE_PARTS; i++) boundaries.push(Math.round((total * i) / UPDATE_PARTS));
+  for (let i = 0; i < UPDATE_PARTS; i++) {
+    parts.push({ start: boundaries[i], end: boundaries[i + 1] - 1, received: 0 });
+  }
+  // Preallocate the file to the exact final size so positional writes never
+  // race ahead of the file length.
+  try {
+    const fd0 = fs.openSync(dest, 'w');
+    fs.truncateSync(fd0, total);
+    fs.closeSync(fd0);
+  } catch { /* keep going — writes still create it */ }
+
+  const receivedRef = { value: 0 };
+  const throttle = { last: 0 };
+  await Promise.all(parts.map(async (part) => {
+    const res = await updateFetch(url, {
+      headers: { Range: `bytes=${part.start}-${part.end}` },
+      redirect: 'follow',
+    });
+    if (res.status !== 206) throw new Error(`range-http-${res.status}`);
+    const nodeStream = require('stream').Readable.fromWeb(res.body);
+    await new Promise((resolveP, rejectP) => {
+      const fd = fs.openSync(dest, 'r+');
+      let pos = part.start;
+      nodeStream.on('data', (chunk) => {
+        fs.writeSync(fd, chunk, 0, chunk.length, pos);
+        pos += chunk.length;
+        part.received = pos - part.start;
+        receivedRef.value += chunk.length;
+        const now = Date.now();
+        if (now - throttle.last > 250) {
+          throttle.last = now;
+          emit(Math.min(receivedRef.value, total), total);
+        }
+      });
+      nodeStream.on('error', (e) => { try { fs.closeSync(fd); } catch { /* closed */ } rejectP(e); });
+      nodeStream.on('end', () => { try { fs.closeSync(fd); } catch { /* closed */ } resolveP(); });
+    });
+    if (part.start + part.received !== part.end + 1) throw new Error('range-short-read');
+  }));
+  return total;
+}
+
+async function downloadSingleStream(url, dest, emit) {
+  // Resume: keep an existing partial file and continue from its length.
+  let have = 0;
+  try { have = fs.statSync(dest).size; } catch { /* fresh download */ }
+  const res = await updateFetch(url, have > 0
+    ? { headers: { Range: `bytes=${have}-` }, redirect: 'follow' }
+    : { redirect: 'follow' });
+  if (!res.ok) throw new Error(`http-${res.status}`);
+  const resumed = res.status === 206;
+  if (!resumed && have > 0) { try { fs.unlinkSync(dest); } catch { /* gone */ } have = 0; }
+  const total = resumed
+    ? (parseInt((/\/(\d+)\s*$/.exec(res.headers.get('content-range') || '') || [])[1] || '0', 10))
+    : Number(res.headers.get('content-length') || 0) + have;
+  let received = have;
+  emit(received, total);
+  const fileStream = fs.createWriteStream(dest, resumed ? { flags: 'r+', start: have } : { flags: 'w' });
+  const nodeStream = require('stream').Readable.fromWeb(res.body);
+  await new Promise((resolveP, rejectP) => {
+    nodeStream.on('data', (chunk) => {
+      received += chunk.length;
+      fileStream.write(chunk);
+      emit(received, total);
+    });
+    nodeStream.on('error', rejectP);
+    fileStream.on('error', rejectP);
+    nodeStream.on('end', () => fileStream.end(resolveP));
+  });
+  return received;
+}
+
 function runInstallerAndQuit() {
   const installer = lastDownloadedInstaller || (() => {
     try {
@@ -1883,18 +2010,89 @@ function runInstallerAndQuit() {
   if (!installer || !fs.existsSync(installer)) return { ok: false, error: 'no-download' };
   console.log('[BLASTI Desktop] updates:install → quitting and running:', installer);
   if (process.platform === 'win32') {
-    // NSIS: give this app up to 4s to fully exit, then run the installer
-    // silently (/S — same per-user settings, data preserved on update).
-    const child = require('child_process').spawn('cmd.exe',
-      ['/c', `timeout /t 4 /nobreak >nul && "${installer}" /S`],
-      { detached: true, stdio: 'ignore', windowsHide: true, cwd: os.tmpdir() });
-    child.on('error', (err) => console.warn('[BLASTI Desktop] installer spawn failed:', err.message));
-    child.unref();
+    spawnSilentWindowsInstall(installer);
   } else {
     try { require('child_process').spawn('xdg-open', [installer], { detached: true, stdio: 'ignore' }).unref(); } catch { shell.openPath(installer); }
   }
   setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 300);
   return { ok: true };
+}
+
+// ─── Windows silent install + relaunch (Unicode-safe) ────────────────────────
+// FIELD ROOT CAUSE (updates "succeed" but the old version stays installed):
+//   1. The old flow launched the installer through `cmd.exe /c timeout … && "…"`,
+//      which is fragile on Windows accounts with non-ASCII names (e.g. Arabic
+//      "C:\Users\عماد الدين\…") depending on the system code page, and the
+//      fixed 4s head start races the app shutdown — if blasti.exe still holds
+//      a file lock, a SILENT (/S) NSIS install fails with NO error dialog and
+//      the old files simply remain.
+//   2. Nothing relaunched the app after a silent install, so a failed install
+//      looked exactly like "nothing happened".
+// The new flow runs ONE PowerShell script passed as -EncodedCommand
+// (UTF-16LE base64 — immune to every code-page issue):
+//   • polls until OUR process has fully exited (up to 30s),
+//   • runs the NSIS installer silently (/S) and WAITS for it,
+//   • relaunches the freshly installed app,
+//   • appends every step to <userData>\updates\install-log.txt so failures
+//     are diagnosable from the field.
+function spawnSilentWindowsInstall(installerPath) {
+  const cp = require('child_process');
+  const pid = process.pid;
+  const appExe = process.execPath;
+  const logFile = path.join(UPDATES_DIR(), 'install-log.txt');
+  const q = (s) => String(s).replace(/'/g, "''"); // PS single-quote escape
+  const ps = [
+    `$log='${q(logFile)}'`,
+    `try{Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] install started: " + '${
+      q(installerPath)
+    }')}catch{}`,
+    `for($i=0;$i -lt 60;$i++){ if(-not (Get-Process -Id ${pid} -ErrorAction SilentlyContinue)){break}; Start-Sleep -Milliseconds 500 }`,
+    `try{Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] app exited — running installer /S")}catch{}`,
+    `try{ Start-Process -FilePath '${q(installerPath)}' -ArgumentList '/S' -Wait -WindowStyle Hidden | Out-Null; Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] installer finished (exit " + $LASTEXITCODE + ")") }catch{ Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] installer FAILED: " + $_.Exception.Message) }`,
+    `try{ if(Test-Path '${q(appExe)}'){ Start-Process -FilePath '${q(appExe)}'; Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] app relaunched") } }catch{}`,
+  ].join('; ');
+  try {
+    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+    const child = cp.spawn('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+      { detached: true, stdio: 'ignore', windowsHide: true, cwd: os.tmpdir() });
+    child.on('error', (err) => console.warn('[BLASTI Desktop] installer spawn failed:', err.message));
+    child.unref();
+  } catch (err) {
+    console.warn('[BLASTI Desktop] installer spawn threw:', err && err.message);
+  }
+}
+
+// ─── Boot-time update self-heal (auto-update: download → install → restart) ──
+// If a downloaded installer is sitting in <userData>\updates whose version is
+// NEWER than the running app, a previous silent install did not complete
+// (locked files, power loss, killed installer…). Finish the job right at boot:
+// run that installer silently and exit — the relaunch comes back as the new
+// version. This closes the "success message but still the old version" loop
+// permanently, even when the NSIS run itself failed once.
+function selfHealPendingInstaller() {
+  if (process.platform !== 'win32' || !app.isPackaged) return;
+  try {
+    const dir = UPDATES_DIR();
+    const files = fs.readdirSync(dir).filter((f) => /^BLASTI-Setup-(\d+\.\d+\.\d+[^\s]*)\.exe$/i.test(f));
+    if (!files.length) return;
+    const current = app.getVersion();
+    const pending = files
+      .map((f) => ({ f, ver: /^BLASTI-Setup-(\d+\.\d+\.\d+[^\s]*)\.exe$/i.exec(f)[1], t: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .filter((e) => semverGreaterThan(e.ver, current))
+      .sort((a, b) => b.t - a.t);
+    if (!pending.length) return;
+    const target = path.join(dir, pending[0].f);
+    // Never self-heal on top of a download that is still being written.
+    try { fs.accessSync(target); } catch { return; }
+    const stat = fs.statSync(target);
+    if (Date.now() - stat.mtimeMs < 60_000) return; // still downloading
+    console.log(`[BLASTI Desktop] self-heal: finishing pending update ${pending[0].ver} (running ${current}) →`, target);
+    spawnSilentWindowsInstall(target);
+    setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 1500);
+  } catch (err) {
+    console.warn('[BLASTI Desktop] self-heal check failed:', err && err.message);
+  }
 }
 
 ipcMain.handle('updates:install', async () => runInstallerAndQuit());
@@ -2717,6 +2915,15 @@ app.whenReady().then(async () => {
   console.log(`[BLASTI Desktop] App ready — isDev: ${isDev}, platform: ${process.platform}`);
   console.log(`[BLASTI Desktop] Dev URL: ${DEV_URL}, Prod URL: ${PROD_URL}`);
   console.log(`[BLASTI Desktop] Electron version: ${process.versions.electron}, Node: ${process.versions.node}`);
+
+  // ── Update self-heal (auto-update: download → install → restart) ──────
+  // Must run BEFORE anything else: if a newer downloaded installer is still
+  // pending, the previous silent install failed — finish it now and let the
+  // PowerShell wrapper relaunch the freshly installed build.
+  try { selfHealPendingInstaller(); } catch (healErr) {
+    console.warn('[BLASTI Desktop] update self-heal failed (non-fatal):', healErr && healErr.message);
+  }
+
   // Task 40: stale-bundle guard — the build stamp is written by prebuild.js on
   // every package. An installed app whose stamp predates the latest fixes is
   // STALE: rebuild (bun run build:desktop) instead of debugging old code.

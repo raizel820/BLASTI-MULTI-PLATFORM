@@ -3951,6 +3951,10 @@ const fr: Record<TranslationKeys, string> = {
   updateAutoDownloadDesc: "Télécharge les mises à jour dès qu'elles sont disponibles pour les installer plus tard en un geste",
   updateWifiOnly: "Wi-Fi uniquement",
   updateWifiOnlyDesc: "Télécharge automatiquement les mises à jour uniquement en Wi-Fi",
+  updateAutoInstall: "Installer les mises à jour automatiquement",
+  lockscreenOpenApp: "Ouvrir l’application",
+  lockscreenDismiss: "Ignorer",
+  updateAutoInstallDesc: "Quand le téléchargement se termine, la mise à jour s’installe et l’application redémarre toute seule",
   publicAppTabDevices: "Appareils",
 
   // Tab 1 — Installers (live storage tracker)

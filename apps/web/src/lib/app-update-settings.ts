@@ -16,6 +16,15 @@ export interface AppUpdateSettings {
   autoDownload: boolean;
   /** Only auto-download over Wi-Fi / unmetered connections. */
   autoDownloadWifiOnly: boolean;
+  /**
+   * AUTO-UPDATE (download → install → restart): when the download finishes,
+   * install WITHOUT waiting for a tap — desktop quits, runs the silent NSIS
+   * installer and relaunches; Android opens the package installer
+   * automatically (the OS still shows its own confirm screen — a hard
+   * platform limit for non-device-owner apps). Mandatory updates ALWAYS
+   * auto-install regardless of this flag.
+   */
+  autoInstall: boolean;
 }
 
 const SETTINGS_KEY = 'blasti-app-update-settings-v1';
@@ -23,6 +32,7 @@ const SETTINGS_KEY = 'blasti-app-update-settings-v1';
 const DEFAULT_SETTINGS: AppUpdateSettings = {
   autoDownload: false,
   autoDownloadWifiOnly: true,
+  autoInstall: true,
 };
 
 export function defaultAppUpdateSettings(): AppUpdateSettings {
@@ -38,6 +48,7 @@ export function loadAppUpdateSettings(): AppUpdateSettings {
     return {
       autoDownload: parsed.autoDownload === true,
       autoDownloadWifiOnly: parsed.autoDownloadWifiOnly !== false,
+      autoInstall: parsed.autoInstall !== false,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };

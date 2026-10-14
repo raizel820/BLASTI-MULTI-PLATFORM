@@ -3950,6 +3950,10 @@ const ar = {
   updateAutoDownloadDesc: "تنزيل التحديثات عند توفرها ليتم تثبيتها لاحقًا بضغطة واحدة",
   updateWifiOnly: "عبر Wi-Fi فقط",
   updateWifiOnlyDesc: "تنزيل التحديثات تلقائيًا فقط عند الاتصال بشبكة Wi-Fi",
+  updateAutoInstall: "التثبيت التلقائي للتحديثات",
+  lockscreenOpenApp: "فتح التطبيق",
+  lockscreenDismiss: "تجاهل",
+  updateAutoInstallDesc: "بعد اكتمال التنزيل يتم التثبيت وإعادة التشغيل تلقائيًا دون تدخل",
   publicAppTabDevices: "الأجهزة",
 
   // Tab 1 — Installers (live storage tracker)

@@ -126,10 +126,19 @@ jobs:
       # Web export → cap sync android → gradlew assembleDebug
       # (scripts/gradle.js then copies the APK to the repo root as
       #  BLASTI-v<versionName>-debug.apk)
+      #
+      # BLASTI_MOBILE_BUILD=1 applies the COMMITTED apps/mobile/.env.production
+      # to the web export (baked VPS URL + locked discovery — see that file):
+      # CI debug APKs behave exactly like release builds — deterministic boot,
+      # no 10.0.2.2 fallback, no "can not load this page" after full syncs.
+      # The APK is ALSO signed with the committed stable keystore
+      # (app/blasti-signing.p12) so pushed updates install OVER the previously
+      # installed build instead of failing signature verification.
       - name: Build debug APK
         run: bun run --filter @blasti/mobile build:android:debug
         env:
           NEXT_TELEMETRY_DISABLED: '1'
+          BLASTI_MOBILE_BUILD: '1'
 
       - name: Collect APK into installer/mobile/
         run: |

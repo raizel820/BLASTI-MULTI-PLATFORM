@@ -458,6 +458,174 @@ public class BlastiNativeStatus extends Plugin {
         }
     }
 
+    // ─── Lock-screen notifications (channels + full-screen alerts) ──────────
+
+    /** Channel that surfaces ticket calls / critical alerts ON the lock screen. */
+    static final String LOCKSCREEN_CHANNEL_ID = "blasti-lockscreen";
+
+    /** Default-importance channel for non-critical notifications. */
+    static final String GENERAL_CHANNEL_ID = "blasti-general";
+
+    /**
+     * Create the BLASTI notification channels exactly the way the lock-screen
+     * UI needs them:
+     *   • blasti-lockscreen — IMPORTANCE_HIGH (heads-up + lock screen),
+     *     VISIBILITY_PUBLIC (full content readable on the lock screen),
+     *     vibration + lights; used for turn-called alerts.
+     *   • blasti-general — IMPORTANCE_DEFAULT, PRIVATE visibility.
+     * Idempotent — safe to call on every app start.
+     */
+    @PluginMethod
+    public void ensureNotificationChannels(PluginCall call) {
+        JSObject result = new JSObject();
+        try {
+            boolean ok = ensureNotificationChannelsInternal();
+            if (!ok) {
+                if (call != null) call.reject("notification-manager-unavailable");
+                return;
+            }
+            result.put("ok", true);
+            result.put("channels", new String[]{ LOCKSCREEN_CHANNEL_ID, GENERAL_CHANNEL_ID });
+            if (call != null) call.resolve(result);
+        } catch (Throwable t) {
+            Log.w(TAG, "ensureNotificationChannels failed", t);
+            if (call != null) call.reject("channels-failed", t.getMessage());
+        }
+    }
+
+    /**
+     * Real channel setup. Returns false only when the NotificationManager is
+     * unavailable. Safe to call with no PluginCall (internal use).
+     */
+    private boolean ensureNotificationChannelsInternal() {
+        if (android.os.Build.VERSION.SDK_INT < 26) {
+            // Pre-O: importance/visibility are per-notification, not per-channel.
+            return true;
+        }
+        android.app.NotificationManager nm = (android.app.NotificationManager)
+            getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+        if (nm == null) return false;
+
+        android.app.NotificationChannel lock = new android.app.NotificationChannel(
+            LOCKSCREEN_CHANNEL_ID,
+            "BLASTI Alerts",
+            android.app.NotificationManager.IMPORTANCE_HIGH);
+        lock.setDescription("Ticket calls and important BLASTI alerts");
+        // PUBLIC = the notification's full content is readable on the lock screen.
+        lock.setLockscreenVisibility(android.app.Notification.VISIBILITY_PUBLIC);
+        lock.enableVibration(true);
+        lock.enableLights(true);
+        lock.setLightColor(android.graphics.Color.parseColor("#10b981"));
+        try {
+            lock.setSound(
+                android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION),
+                new android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build());
+        } catch (Throwable ignored) { }
+
+        android.app.NotificationChannel general = new android.app.NotificationChannel(
+            GENERAL_CHANNEL_ID,
+            "BLASTI",
+            android.app.NotificationManager.IMPORTANCE_DEFAULT);
+        general.setDescription("General BLASTI notifications");
+        general.setLockscreenVisibility(android.app.Notification.VISIBILITY_PRIVATE);
+
+        nm.createNotificationChannel(lock);
+        nm.createNotificationChannel(general);
+        return true;
+    }
+
+    /**
+     * Post a lock-screen-ready notification directly through the native
+     * NotificationManager (the Capacitor LocalNotifications plugin cannot set
+     * full-screen intents or lock-screen visibility from JS):
+     *   • VISIBILITY_PUBLIC on the blasti-lockscreen channel → full content on
+     *     the lock screen;
+     *   • when the device is LOCKED, a full-screen intent launches the app
+     *     over the keyguard (screen wakes — manifest declares
+     *     USE_FULL_SCREEN_INTENT; MainActivity declares showWhenLocked);
+     *   • tapping the notification opens the app.
+     * Returns { ok, id, fullScreen }.
+     */
+    @PluginMethod
+    public void notifyLockscreen(PluginCall call) {
+        String title = call.getString("title");
+        String body = call.getString("body");
+        if (title == null || title.trim().isEmpty()) {
+            call.reject("missing-title");
+            return;
+        }
+        try {
+            // Channels must exist before the notification posts (no-op pre-O).
+            try { ensureNotificationChannels(null); } catch (Throwable ignored) { }
+
+            Object rawId = call.getData() == null ? null : call.getData().opt("notificationId");
+            int id = rawId instanceof Number
+                ? ((Number) rawId).intValue()
+                : (int) (System.currentTimeMillis() % 100000L);
+
+            android.app.NotificationManager nm = (android.app.NotificationManager)
+                getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) {
+                call.reject("notification-manager-unavailable");
+                return;
+            }
+
+            androidx.core.app.NotificationCompat.Builder builder =
+                new androidx.core.app.NotificationCompat.Builder(getContext(), LOCKSCREEN_CHANNEL_ID)
+                    .setSmallIcon(getContext().getApplicationInfo().icon)
+                    .setContentTitle(title)
+                    .setContentText(body == null ? "" : body)
+                    .setStyle(new androidx.core.app.NotificationCompat.BigTextStyle()
+                        .bigText(body == null ? "" : body))
+                    // Full content readable on the lock screen (pre-O too).
+                    .setVisibility(androidx.core.app.NotificationCompat.VISIBILITY_PUBLIC)
+                    .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+                    .setCategory(androidx.core.app.NotificationCompat.CATEGORY_EVENT)
+                    .setAutoCancel(true)
+                    .setWhen(System.currentTimeMillis())
+                    .setShowWhen(true)
+                    .setColor(android.graphics.Color.parseColor("#10b981"));
+
+            android.content.Intent launch = getContext().getPackageManager()
+                .getLaunchIntentForPackage(getContext().getPackageName());
+            if (launch != null) {
+                launch.addFlags(android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                android.app.PendingIntent contentPi = android.app.PendingIntent.getActivity(
+                    getContext(), id, launch,
+                    android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
+                builder.setContentIntent(contentPi);
+
+                // Device locked → wake the screen and show OVER the keyguard.
+                boolean locked = false;
+                try {
+                    Object kg = getContext().getSystemService(Context.KEYGUARD_SERVICE);
+                    if (kg instanceof android.app.KeyguardManager) {
+                        locked = ((android.app.KeyguardManager) kg).isKeyguardLocked();
+                    }
+                } catch (Throwable ignored) { }
+                if (locked) {
+                    android.app.PendingIntent fullPi = android.app.PendingIntent.getActivity(
+                        getContext(), id + 1, launch,
+                        android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
+                    builder.setFullScreenIntent(fullPi, true);
+                }
+            }
+
+            nm.notify(id, builder.build());
+            JSObject result = new JSObject();
+            result.put("ok", true);
+            result.put("id", id);
+            call.resolve(result);
+        } catch (Throwable t) {
+            Log.w(TAG, "notifyLockscreen failed", t);
+            call.reject("notify-failed", t.getMessage());
+        }
+    }
+
     // ─── Internals ──────────────────────────────────────────────────────────────
 
     private static boolean tryInitializeFirebase(Context context) {

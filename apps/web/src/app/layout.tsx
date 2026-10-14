@@ -7,6 +7,7 @@ import { ErrorBoundary } from "@/components/shared/error-boundary";
 import { ClientBootHardening } from "@/components/shared/client-boot-hardening";
 import { UploadImageRecovery } from "@/components/shared/upload-image-recovery";
 import { AppUpdateManager } from "@/components/shared/app-update-manager";
+import { LockscreenNotificationGate } from "@/components/shared/lockscreen-notification";
 import { AppIntroAnimation } from "@/components/shared/app-intro-animation";
 import { PlatformProvider } from "@/hooks/use-platform";
 import { DatabaseProvider } from "@/db/provider";
@@ -64,6 +65,9 @@ export default function RootLayout({
           {/* Public App Settings rebuild — delivers checked/pushed updates inside
               the desktop shell AND the Android app (dialog / mandatory gate) */}
           <AppUpdateManager />
+          {/* Lock-screen notifications UI — Android-12-style card mirroring the
+              native lock-screen alerts (heads-up while open, overlay on resume) */}
+          <LockscreenNotificationGate />
           <PlatformProvider>
             <DatabaseProvider>
               <AuthProvider>

@@ -248,6 +248,7 @@ function startAndroidPolling(downloadId: number) {
       if (res.status === 'successful') {
         stopAndroidPolling();
         getStore().setState({ status: 'downloaded', progress: { percent: 100, receivedBytes: res.bytesSoFar ?? 0, totalBytes: res.totalBytes ?? 0 } });
+        void maybeAutoInstall();
       } else if (res.status === 'failed') {
         stopAndroidPolling();
         getStore().setState({ status: 'error', error: 'download-failed' });
@@ -440,6 +441,7 @@ function createAppUpdateStore() {
           status: 'downloaded',
           progress: { percent: 100, receivedBytes: payload.receivedBytes ?? 0, totalBytes: payload.totalBytes ?? 0 },
         });
+        void maybeAutoInstall();
       } else if (payload.status === 'error') {
         stopAndroidPolling();
         set({ status: 'error', error: payload.error || 'download-failed' });
@@ -488,6 +490,27 @@ async function maybeAutoDownload(info: AppUpdateInfo) {
   if (settings.autoDownloadWifiOnly && !(await isWifiConnection())) return;
   // Mandatory or optional — download in the background either way.
   storeInstance?.getState().startDownload();
+}
+
+/**
+ * AUTO-UPDATE (download → install → restart): fire the install the moment a
+ * download completes. Desktop = quit + silent NSIS + relaunch (fully
+ * automatic). Android = the system package installer opens over the app (the
+ * OS always shows its own confirm screen — hard platform limit). Mandatory
+ * updates bypass the user's autoInstall preference entirely.
+ */
+async function maybeAutoInstall() {
+  const state = storeInstance?.getState();
+  if (!state || state.status !== 'downloaded') return;
+  const settings = loadAppUpdateSettings();
+  const mandatory = state.info?.isMandatory === true;
+  if (!settings.autoInstall && !mandatory) return;
+  // Small grace so the UI can paint the "downloaded" state before the
+  // desktop app quits / Android's installer screen takes over.
+  setTimeout(() => {
+    const s = storeInstance?.getState();
+    if (s && s.status === 'downloaded') void s.install();
+  }, 1500);
 }
 
 export const useAppUpdateStore = (() => {
