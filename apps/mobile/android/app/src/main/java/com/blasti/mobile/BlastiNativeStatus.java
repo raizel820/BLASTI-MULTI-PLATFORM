@@ -574,6 +574,31 @@ public class BlastiNativeStatus extends Plugin {
             }
             android.net.Uri apkUri = androidx.core.content.FileProvider.getUriForFile(
                 getContext(), getContext().getPackageName() + ".fileprovider", apk);
+
+            // ── PROACTIVE install-permission gate (field report: "the app does
+            // not open the dialog so I can grant it the authority to install
+            // apps"). The old flow only opened the settings screen when
+            // startActivity THREW — on modern Android (and especially MIUI /
+            // Android 14+ on Xiaomi, SDK 36 in the field) the ACTION_VIEW
+            // package-archive launch does NOT throw when
+            // REQUEST_INSTALL_PACKAGES is not granted: the system just shows
+            // nothing (or a dead installer screen) and the user is stuck on
+            // "update downloaded, awaiting install" forever. Check the
+            // permission FIRST and drive the user to the grant screen.
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                boolean canInstall = false;
+                try {
+                    android.content.pm.PackageManager pm = getContext().getPackageManager();
+                    canInstall = pm.canRequestPackageInstalls();
+                } catch (Throwable ignored) { }
+                if (!canInstall) {
+                    openInstallPermissionSettingsInternal();
+                    call.reject("needs-install-permission",
+                        "Install-from-this-source permission not granted — settings screen opened");
+                    return;
+                }
+            }
+
             android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
             intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
             intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
@@ -582,13 +607,7 @@ public class BlastiNativeStatus extends Plugin {
                 getContext().startActivity(intent);
             } catch (Throwable act) {
                 if (android.os.Build.VERSION.SDK_INT >= 26) {
-                    try {
-                        android.content.Intent settings = new android.content.Intent(
-                            android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                            android.net.Uri.parse("package:" + getContext().getPackageName()));
-                        settings.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-                        getContext().startActivity(settings);
-                    } catch (Throwable ignored) { }
+                    openInstallPermissionSettingsInternal();
                 }
                 call.reject("needs-install-permission", act.getMessage());
                 return;
@@ -603,6 +622,50 @@ public class BlastiNativeStatus extends Plugin {
     }
 
     // ─── Lock-screen notifications (channels + full-screen alerts) ──────────
+
+    /**
+     * Internal: open the system "Install unknown apps" grant screen for THIS
+     * app. Used by installUpdate when canRequestPackageInstalls() is false
+     * and exposed directly as a plugin method so the web layer can drive the
+     * user back here after an interrupted grant.
+     */
+    private void openInstallPermissionSettingsInternal() {
+        try {
+            android.content.Intent settings = new android.content.Intent(
+                android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                android.net.Uri.parse("package:" + getContext().getPackageName()));
+            settings.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(settings);
+        } catch (Throwable t) {
+            // Some OEM builds lack the action — fall back to the app details
+            // screen where the same toggle lives.
+            try {
+                android.content.Intent fallback = new android.content.Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.parse("package:" + getContext().getPackageName()));
+                fallback.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(fallback);
+            } catch (Throwable ignored) { }
+        }
+    }
+
+    /**
+     * Plugin method: open the system "Install unknown apps" screen for this
+     * app so the user can grant the install authority, then report the
+     * CURRENT grant state. Returns { ok, canInstall }.
+     */
+    @PluginMethod
+    public void openInstallPermissionSettings(PluginCall call) {
+        openInstallPermissionSettingsInternal();
+        JSObject result = new JSObject();
+        boolean canInstall = false;
+        try {
+            canInstall = getContext().getPackageManager().canRequestPackageInstalls();
+        } catch (Throwable ignored) { }
+        result.put("ok", true);
+        result.put("canInstall", canInstall);
+        call.resolve(result);
+    }
 
     /** Channel that surfaces ticket calls / critical alerts ON the lock screen. */
     static final String LOCKSCREEN_CHANNEL_ID = "blasti-lockscreen";
@@ -687,9 +750,13 @@ public class BlastiNativeStatus extends Plugin {
      * full-screen intents or lock-screen visibility from JS):
      *   • VISIBILITY_PUBLIC on the blasti-lockscreen channel → full content on
      *     the lock screen;
-     *   • when the device is LOCKED, a full-screen intent launches the app
-     *     over the keyguard (screen wakes — manifest declares
-     *     USE_FULL_SCREEN_INTENT; MainActivity declares showWhenLocked);
+     *   • OPTIONAL full-screen intent — ONLY when the caller passes
+     *     fullScreen:true AND the device is LOCKED. Default is FALSE: the app
+     *     must never launch itself over the keyguard (field report: "the
+     *     mobile app as a whole shows on the lock screen, not just a
+     *     notification" — the old unconditional full-screen intent made the
+     *     whole activity appear ON the lock screen). The notification itself
+     *     (heads-up banner + lock-screen content + tap-to-open) still fires.
      *   • tapping the notification opens the app.
      * Returns { ok, id, fullScreen }.
      */
@@ -701,6 +768,7 @@ public class BlastiNativeStatus extends Plugin {
             call.reject("missing-title");
             return;
         }
+        boolean wantFullScreen = call.getBoolean("fullScreen", false);
         try {
             // Channels must exist before the notification posts (no-op pre-O).
             try { ensureNotificationChannels(null); } catch (Throwable ignored) { }
@@ -735,6 +803,14 @@ public class BlastiNativeStatus extends Plugin {
 
             android.content.Intent launch = getContext().getPackageManager()
                 .getLaunchIntentForPackage(getContext().getPackageName());
+            // Hoisted so the result payload can report it below.
+            boolean locked = false;
+            try {
+                Object kg = getContext().getSystemService(Context.KEYGUARD_SERVICE);
+                if (kg instanceof android.app.KeyguardManager) {
+                    locked = ((android.app.KeyguardManager) kg).isKeyguardLocked();
+                }
+            } catch (Throwable ignored) { }
             if (launch != null) {
                 launch.addFlags(android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
                     | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -743,15 +819,11 @@ public class BlastiNativeStatus extends Plugin {
                     android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
                 builder.setContentIntent(contentPi);
 
-                // Device locked → wake the screen and show OVER the keyguard.
-                boolean locked = false;
-                try {
-                    Object kg = getContext().getSystemService(Context.KEYGUARD_SERVICE);
-                    if (kg instanceof android.app.KeyguardManager) {
-                        locked = ((android.app.KeyguardManager) kg).isKeyguardLocked();
-                    }
-                } catch (Throwable ignored) { }
-                if (locked) {
+                // Device locked → wake the screen and show OVER the keyguard —
+                // ONLY when the caller explicitly opted in (web preference
+                // lockscreenTakeover). Default is a normal notification: the
+                // app no longer takes over the lock screen by itself.
+                if (wantFullScreen && locked) {
                     android.app.PendingIntent fullPi = android.app.PendingIntent.getActivity(
                         getContext(), id + 1, launch,
                         android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
@@ -763,6 +835,7 @@ public class BlastiNativeStatus extends Plugin {
             JSObject result = new JSObject();
             result.put("ok", true);
             result.put("id", id);
+            result.put("fullScreen", wantFullScreen && locked);
             call.resolve(result);
         } catch (Throwable t) {
             Log.w(TAG, "notifyLockscreen failed", t);

@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   Clock,
   Loader2,
+  MonitorSmartphone,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import type { TranslationKeys } from '@/i18n';
@@ -29,6 +30,11 @@ const notifCardDefs = [
     key: 'completed' as const,
     icon: CheckCircle2,
     color: 'teal' as const,
+  },
+  {
+    key: 'lockscreenTakeover' as const,
+    icon: MonitorSmartphone,
+    color: 'slate' as const,
   },
 ];
 
@@ -51,12 +57,19 @@ const colorStyles = {
     iconColor: 'text-teal-600 dark:text-teal-400',
     badge: 'bg-teal-500',
   },
+  slate: {
+    active: 'border-slate-300 dark:border-slate-700 bg-slate-50/80 dark:bg-slate-900/20',
+    iconBg: 'bg-slate-100 dark:bg-slate-800/40',
+    iconColor: 'text-slate-600 dark:text-slate-400',
+    badge: 'bg-slate-500',
+  },
 };
 
 const notifLabels: Record<keyof NotifPrefs, { label: TranslationKeys; description: TranslationKeys }> = {
   queue_called: { label: 'queueCalledNotif', description: 'queueCalledNotifDesc' },
   turn_approaching: { label: 'turnApproachingNotif', description: 'turnApproachingNotifDesc' },
   completed: { label: 'completedNotif', description: 'completedNotifDesc' },
+  lockscreenTakeover: { label: 'lockscreenTakeoverLabel', description: 'lockscreenTakeoverDesc' },
 };
 
 export function ProfileNotifications({ notifPrefs, notifSaving, notifLoading, onTogglePref, onSave, t }: ProfileNotificationsProps) {
@@ -87,6 +100,7 @@ export function ProfileNotifications({ notifPrefs, notifSaving, notifLoading, on
                   whileHover={{ scale: 1.01 }}
                   whileTap={{ scale: 0.99 }}
                   onClick={() => onTogglePref(item.key)}
+                  aria-pressed={isEnabled}
                   className={`w-full flex items-center gap-3 p-3.5 rounded-xl border-2 transition-all duration-300 text-start toggle-item-hover ${
                     isEnabled
                       ? styles.active
@@ -112,7 +126,7 @@ export function ProfileNotifications({ notifPrefs, notifSaving, notifLoading, on
                       )}
                     </div>
                     <p className="text-[11px] text-muted-foreground mt-0.5">
-                      {t(labels.description) || (item.key === 'queue_called' ? 'Get notified when your turn is called' : item.key === 'turn_approaching' ? 'Alert when your turn is approaching' : 'Notify when service is completed')}
+                      {t(labels.description) || (item.key === 'queue_called' ? 'Get notified when your turn is called' : item.key === 'turn_approaching' ? 'Alert when your turn is approaching' : item.key === 'completed' ? 'Notify when service is completed' : 'Show the app on the lock screen when called (off = notification only)')}
                     </p>
                   </div>
                   {/* Toggle indicator */}

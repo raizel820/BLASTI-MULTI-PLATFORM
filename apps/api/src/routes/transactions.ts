@@ -88,6 +88,20 @@ app.get('/', async (c) => {
       where.OR = [{ providerRef: '' }, { providerRef: null }]
     }
 
+    // SMS purchase feed filters — same semantics, different columns:
+    //   status: SmsPurchase has no COMPLETED (Chargily settles at APPROVED) —
+    //           map a COMPLETED filter to APPROVED so the admin's "settled"
+    //           query returns the SMS equivalent too.
+    //   type:   online = chargily checkout (providerRef stamped), manual =
+    //           receipt upload (paymentProvider stays 'manual').
+    const smsWhere: Record<string, unknown> = {}
+    if (status) smsWhere.status = status === 'COMPLETED' ? 'APPROVED' : status
+    if (type === 'online') {
+      smsWhere.paymentProvider = 'chargily'
+    } else if (type === 'manual') {
+      smsWhere.paymentProvider = 'manual'
+    }
+
     if (user.role !== 'SUPER_ADMIN') {
       const ownedAgency = await db.agency.findFirst({
         where: { ownerId: user.id },
@@ -108,7 +122,7 @@ app.get('/', async (c) => {
       }
     }
 
-    const [transactions, total] = await Promise.all([
+    const [transactions, total, smsPurchases, smsTotal] = await Promise.all([
       db.transaction.findMany({
         where,
         include: {
@@ -127,9 +141,61 @@ app.get('/', async (c) => {
         skip: offset,
       }),
       db.transaction.count({ where }),
+      // ── ALL-transactions mandate (field report: "admin transactions must
+      // include ALL transactions with no exception") — the admin console must
+      // show SMS pack purchases NEXT TO subscription payments. For
+      // SUPER_ADMIN the SmsPurchase feed is merged into the same
+      // desc-by-createdAt page; agency-scoped callers keep the
+      // subscription-only view (SmsPurchase has no agency dimension).
+      user.role === 'SUPER_ADMIN'
+        ? db.smsPurchase.findMany({
+            where: smsWhere,
+            include: { user: { select: { id: true, username: true, fullName: true, email: true } } },
+            orderBy: { createdAt: 'desc' },
+            take: limit + offset,
+          })
+        : Promise.resolve([] as never[]),
+      user.role === 'SUPER_ADMIN' ? db.smsPurchase.count({ where: smsWhere }) : Promise.resolve(0),
     ])
 
-    return c.json({ success: true, transactions, total, limit, offset })
+    // Normalize SMS purchases into the transaction row shape the admin
+    // console renders, tagged with kind so the UI can badge + hide
+    // subscription-only actions (review/reconcile).
+    const smsRows = (smsPurchases as Array<Record<string, unknown>>).map((p) => ({
+      id: p.id,
+      kind: 'sms_purchase' as const,
+      amount: p.price,
+      amountPaid: p.price,
+      currencySnapshot: 'DZD',
+      plan: 'SMS_PACK',
+      planName: `SMS Pack ×${p.quantity}`,
+      quantity: p.quantity,
+      status: p.status,
+      paymentMethod: p.paymentMethod ?? null,
+      paymentProvider: p.paymentProvider,
+      providerRef: p.providerRef ?? null,
+      receiptUrl: p.receiptUrl ?? null,
+      webhookVerified: p.webhookVerified,
+      reviewedBy: null,
+      reviewedAt: null,
+      rejectionReason: null,
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt,
+      agency: null,
+      reviewer: null,
+      user: p.user,
+    }))
+
+    // Merge + single desc-by-createdAt page. Both sides were already limited
+    // to limit+offset rows, so slicing in memory is bounded.
+    const merged = ([
+      ...(transactions as Array<Record<string, unknown>>).map((t) => ({ ...t, kind: 'subscription' as const })),
+      ...smsRows,
+    ] as Array<Record<string, unknown>>)
+      .sort((a, b) => new Date(b.createdAt as string).getTime() - new Date(a.createdAt as string).getTime())
+      .slice(offset, offset + limit)
+
+    return c.json({ success: true, transactions: merged, total: total + smsTotal, limit, offset })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

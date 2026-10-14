@@ -583,6 +583,8 @@ const fr: Record<TranslationKeys, string> = {
   turnApproachingNotifDesc: "Alerte avant votre tour (3 positions)",
   completedNotif: "Service terminé",
   completedNotifDesc: "Notification quand le service est terminé",
+  lockscreenTakeoverLabel: "Afficher l'application à l'appel",
+  lockscreenTakeoverDesc: "À l'appel de votre tour, écran verrouillé, affiche l'application entière par-dessus l'écran de verrouillage. DÉSACTIVÉ = notification seulement (recommandé)",
 
   // ─── Enhanced Register ──────────────
   algeriaPrefix: "+213",

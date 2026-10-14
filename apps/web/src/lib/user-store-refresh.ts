@@ -42,6 +42,7 @@
  */
 
 import { apiFetch } from './api-fetch';
+import { mirrorNotifPrefs } from './notification-channel';
 
 /** Minimum interval between two refreshes triggered by focus/visibility. */
 const FOCUS_REFRESH_MIN_INTERVAL_MS = 30_000;
@@ -95,6 +96,19 @@ export async function refreshSessionUser(): Promise<void> {
         } else if (typeof value === 'string' && value) {
           merged[field] = value;
         }
+      }
+
+      // Notification-preferences mirror: the realtime turn-alert paths run
+      // outside React and read localStorage (notification-channel.ts). Refresh
+      // it here so a preference changed on another device (or in Settings)
+      // takes effect on this shell too — cross-device parity with the avatar.
+      const rawPrefs = (data as Record<string, unknown>).notificationPreferences;
+      if (rawPrefs) {
+        try {
+          mirrorNotifPrefs(
+            typeof rawPrefs === 'string' ? JSON.parse(rawPrefs) : (rawPrefs as Record<string, unknown>),
+          );
+        } catch { /* malformed prefs — keep the previous mirror */ }
       }
 
       // Skip the write when nothing actually changed (avoids re-render churn

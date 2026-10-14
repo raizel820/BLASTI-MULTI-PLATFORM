@@ -27,6 +27,10 @@ export interface NotifPrefs {
   queue_called: boolean;
   turn_approaching: boolean;
   completed: boolean;
+  /** Opt-in: a call may launch the whole app over the keyguard.
+   *  Default false — the lock screen shows the NOTIFICATION only.
+   *  Optional so stored prefs from older builds stay type-safe. */
+  lockscreenTakeover?: boolean;
 }
 
 /** Task 2-b: purchase lifecycle status (SmsPurchase.status — PENDING → APPROVED | REJECTED | FAILED) */

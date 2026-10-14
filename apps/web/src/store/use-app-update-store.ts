@@ -124,6 +124,8 @@ interface CapacitorGlobal {
       status?: string; percent?: number; bytesSoFar?: number; totalBytes?: number; localUri?: string;
     }>;
     installUpdate?: (opts: { downloadId?: number; filePath?: string }) => Promise<{ ok?: boolean }>;
+    /** Open the system "Install unknown apps" grant screen (newer builds). */
+    openInstallPermissionSettings?: () => Promise<{ ok?: boolean; canInstall?: boolean }>;
   }>;
 }
 
@@ -452,9 +454,19 @@ function createAppUpdateStore() {
           // listener decides the real outcome via resolvePendingInstall().
           set({ status: 'downloaded' });
         }
-      } catch {
+      } catch (err) {
         pendingInstallFromVersion = null;
         set({ status: 'downloaded', needsInstallPermission: true });
+        // Report #3: "the app does not open the dialog so I can grant it the
+        // authority to install apps". New native builds open the grant screen
+        // THEMSELVES before rejecting (their message carries the marker
+        // below) — for older builds, drive the user there from here.
+        const msg = err instanceof Error ? err.message : String(err ?? '');
+        if (!msg.includes('settings screen opened')) {
+          try {
+            await plugin()?.openInstallPermissionSettings?.();
+          } catch { /* older build without the method — the store flag still guides the UI */ }
+        }
       }
     },
 

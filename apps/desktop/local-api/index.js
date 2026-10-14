@@ -6898,12 +6898,30 @@ function createApp() {
       for (const r of reservations) {
         const service = r.serviceId ? await db.service.findUnique({ where: { id: r.serviceId } }).catch(() => null) : null
         const user = r.userId ? await db.user.findUnique({ where: { id: r.userId } }).catch(() => null) : null
+        // ── Walk-in-looking online customers (field report: "only his ticket
+        // number shows as a walk-in customer, not online, and no data of the
+        // customer like name"). The old endpoint returned
+        // customerName = walkInCustomerName ONLY and customerAvatar = null
+        // ALWAYS — an ONLINE customer's name/avatar/phone were never read
+        // from the locally-synced User row, so the desktop queue rendered
+        // every online customer with no identity (UI falls back to the
+        // walk-in look). Use the user row first, walk-in fields as fallback;
+        // localize the avatar URL for the local file store (cloud proxy
+        // fallback inside localizeFileUrl for not-yet-downloaded blobs).
+        let customerAvatar = null
+        if (user && user.avatarUrl) {
+          try {
+            customerAvatar = await localizeFileUrl(user.avatarUrl)
+          } catch { customerAvatar = user.avatarUrl }
+        }
         entries.push({
           id: r.id,
           queueNumber: r.displayNumber,
-          customerName: r.walkInCustomerName || null,
-          customerPhone: user?.phoneNumber || null,
-          customerAvatar: null,
+          customerName: (user && user.fullName) || r.walkInCustomerName || null,
+          customerPhone: (user && user.phoneNumber) || null,
+          customerAvatar,
+          customerId: r.userId || null,
+          isOnlineCustomer: !!(r.userId && user),
           serviceName: service ? service.name : null,
           serviceNameAr: service?.nameAr || null,
           serviceNameFr: service?.nameFr || null,
@@ -9708,25 +9726,35 @@ function createApp() {
 
       const now = new Date()
 
-      // Call the customer
-      await db.reservation.update({
-        where: { id: next.id },
-        data: {
-          status: 'CALLED',
-          calledAt: now,
-          // calledBy: removed — not a Reservation schema field
-          counterId: counterId || null,
-        },
-      })
-
-      // Update current serving number in queue settings
-      const qs = await db.queueSettings.findFirst({ where: { agencyId } })
-      if (qs) {
-        await db.queueSettings.update({
-          where: { id: qs.id },
-          data: { currentServingNumber: next.queueNumber },
-        })
+      // ── Call the customer + OUTBOX (field report: "the turn notification
+      // never reaches the customer when the agency uses the desktop app").
+      // This alias route updated the LOCAL row only — no outbox entry — so
+      // the CALLED status never reached the cloud: sync-side-effects never
+      // fired, the customer's phone never rang and the webapp queue never
+      // moved. Route the flip through withOutboxTransaction + deterministic
+      // outcomes exactly like PATCH /api/agency/queue/:id does.
+      const calledData = {
+        status: 'CALLED',
+        calledAt: now,
+        // calledBy: removed — not a Reservation schema field
+        counterId: counterId || null,
       }
+      const updated = await withOutboxTransaction(async (tx) => {
+        await tx.reservation.update({ where: { id: next.id }, data: calledData })
+        // Part Q: outcome row atomic with the state flip.
+        await logDeterministicOutcome('Reservation', next.id, 'update', { ...next, ...calledData }, null, { tx })
+
+        // Update current serving number in queue settings (synced table —
+        // keeps kiosks / other devices on the same "now serving" number).
+        const qs = await tx.queueSettings.findFirst({ where: { agencyId } })
+        if (qs) {
+          const qsData = { currentServingNumber: next.queueNumber }
+          await tx.queueSettings.update({ where: { id: qs.id }, data: qsData })
+          await logDeterministicOutcome('QueueSettings', qs.id, 'update', { ...qs, ...qsData }, null, { tx })
+        }
+
+        return { ...next, ...calledData }
+      })
 
       // Update positions of remaining waiting reservations
       const remainingWaiting = await db.reservation.findMany({
@@ -9734,8 +9762,6 @@ function createApp() {
         orderBy: { joinedAt: 'asc' },
       })
       // position reassignment loop removed — position is not a schema field
-
-      const updated = await db.reservation.findUnique({ where: { id: next.id } })
 
       emitEvent('queue:called', { agencyId, reservation: updated })
 

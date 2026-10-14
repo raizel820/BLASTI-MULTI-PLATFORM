@@ -108,8 +108,13 @@ const DATE_FIELDS = new Set([
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
 const MAX_BACKOFF_MS = 60_000;
-const DEFAULT_SYNC_INTERVAL_MS = 30_000;          // incremental pull cycle
-const SYNC_INTERVAL_JITTER_MS = 5_000;            // ±5s jitter
+const DEFAULT_SYNC_INTERVAL_MS = 15_000;          // incremental pull cycle
+// Field report: "it takes almost a minute before the customer shows in the
+// desktop app". The 30s default (plus jitter and probe overhead) pushed the
+// worst case to ~35-60s whenever the cloud→local realtime trigger was
+// unavailable. 15s keeps the incremental pull cheap (cursor-paged delta,
+// tiny payloads) while halving the worst-case visibility latency.
+const SYNC_INTERVAL_JITTER_MS = 2_000;            // ±2s jitter
 const FULL_RECONCILE_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
 const PULL_PAGE_LIMIT = 500;
 const RECONCILE_BATCH_SIZE = 200;

@@ -68,6 +68,12 @@ interface AdminPayment {
   payerName?: string;
   payerContact?: string;
   agencySubscriptionStatus?: string;
+  /** 'subscription' (Agency subscription payment) | 'sms_purchase' (customer SMS pack)
+   *  — ALL-transactions mandate: the console lists both, subscription-only
+   *  actions (review/reconcile) are hidden for sms_purchase rows. */
+  kind: 'subscription' | 'sms_purchase';
+  /** SMS pack size (sms_purchase rows only). */
+  smsQuantity?: number;
 }
 
 type TypeFilter = 'ALL' | 'manual' | 'online';
@@ -119,20 +125,27 @@ export function AdminTransactions() {
       if (res.ok) {
         const data = await res.json();
         const mapped = (data.transactions ?? []).map((tx: Record<string, unknown>) => {
+          const kind = (tx.kind as string) === 'sms_purchase' ? 'sms_purchase' : 'subscription';
           const agency = tx.agency as
             | { name?: string; subscriptionStatus?: string; owner?: { username?: string; fullName?: string; email?: string } }
             | undefined;
           const owner = agency?.owner;
+          const smsBuyer = tx.user as { username?: string; fullName?: string; email?: string } | undefined;
           const providerRef = ((tx.providerRef as string) || '').trim();
-          const payerName = owner?.fullName?.trim() || owner?.username?.trim() || '';
-          const payerContact = owner?.email?.trim() || '';
+          // SMS purchases have no agency — the payer is the customer account.
+          const payer = kind === 'sms_purchase'
+            ? (smsBuyer?.fullName?.trim() || smsBuyer?.username?.trim() || '')
+            : (owner?.fullName?.trim() || owner?.username?.trim() || '');
+          const payerEmail = kind === 'sms_purchase'
+            ? (smsBuyer?.email?.trim() || '')
+            : (owner?.email?.trim() || '');
           return {
             id: tx.id,
-            agencyName: agency?.name || t('unknownAgency'),
-            amount: tx.amount as number,
-            plan: tx.plan as string,
-            planName: (tx.planName as string) || null,
-            method: tx.paymentMethod as string,
+            agencyName: kind === 'sms_purchase' ? (t('customerRole') || 'Customer') : (agency?.name || t('unknownAgency')),
+            amount: (tx.amountPaid as number) ?? (tx.amount as number),
+            plan: (tx.plan as string) || 'SMS_PACK',
+            planName: (tx.planName as string) || (kind === 'sms_purchase' ? `SMS Pack ×${tx.quantity}` : null),
+            method: (tx.paymentMethod as string) || (tx.paymentProvider as string) || '',
             status: tx.status as string,
             receiptUrl: (tx.receiptUrl as string) || undefined,
             createdAt: tx.createdAt as string,
@@ -144,10 +157,14 @@ export function AdminTransactions() {
             webhookVerified: !!tx.webhookVerified,
             // Online payments are ALWAYS created with a Chargily checkout id in
             // providerRef (payment-checkout.ts); manual receipts leave it empty.
-            isOnline: !!providerRef,
-            payerName: payerName || undefined,
-            payerContact: payerContact || undefined,
+            isOnline: kind === 'sms_purchase'
+              ? ((tx.paymentProvider as string) === 'chargily')
+              : !!providerRef,
+            payerName: payer || undefined,
+            payerContact: payerEmail || undefined,
             agencySubscriptionStatus: agency?.subscriptionStatus || undefined,
+            kind,
+            smsQuantity: (tx.quantity as number) || undefined,
           } as AdminPayment;
         });
         setPayments(mapped);
@@ -403,7 +420,9 @@ export function AdminTransactions() {
                       </div>
                       <div className="min-w-0">
                         <p className="text-sm font-semibold text-foreground truncate">
-                          {payment.agencyName}
+                          {payment.kind === 'sms_purchase'
+                            ? (payment.payerName || payment.agencyName)
+                            : payment.agencyName}
                         </p>
                         <div className="flex items-center gap-2 flex-wrap mt-0.5">
                           {/* Manual vs Online badge */}
@@ -417,10 +436,18 @@ export function AdminTransactions() {
                               {t('txBadgeManual')}
                             </Badge>
                           )}
-                          {/* Plan badge */}
-                          <Badge variant="secondary" className="text-[10px]">
-                            {payment.plan === 'PREMIUM' ? t('premiumPlan') : payment.plan === 'ENTERPRISE' ? t('enterprisePlan') : t('basicPlan')}
-                          </Badge>
+                          {/* ALL-transactions mandate — SMS pack purchases render as
+                              their own kind (badge + payer handled above) and never
+                              masquerade as subscription plans */}
+                          {payment.kind === 'sms_purchase' ? (
+                            <Badge variant="secondary" className="text-[10px]">
+                              SMS ×{payment.smsQuantity ?? '—'}
+                            </Badge>
+                          ) : (
+                            <Badge variant="secondary" className="text-[10px]">
+                              {payment.plan === 'PREMIUM' ? t('premiumPlan') : payment.plan === 'ENTERPRISE' ? t('enterprisePlan') : t('basicPlan')}
+                            </Badge>
+                          )}
                           {/* Subscription vs Hardware payment (online rows) */}
                           {payment.isOnline && payment.type === 'HARDWARE' && (
                             <Badge variant="secondary" className="text-[10px]">
@@ -495,8 +522,11 @@ export function AdminTransactions() {
                         </Button>
                       )}
 
-                      {/* ── MANUAL payments: approve / reject (unchanged flow) ── */}
-                      {!payment.isOnline && payment.status === 'PENDING' && (
+                      {/* ── MANUAL payments: approve / reject (unchanged flow).
+                          SMS purchases are NOT reviewable here — their manual
+                          approval lives in the SMS purchase admin flow; online
+                          SMS packs settle via the gateway webhook. */}
+                      {!payment.isOnline && payment.status === 'PENDING' && payment.kind === 'subscription' && (
                         <>
                           <Button
                             size="sm"
@@ -526,8 +556,9 @@ export function AdminTransactions() {
 
                       {/* ── ONLINE payments: gateway reconciliation only ──
                               The gateway owns the lifecycle; admins never
-                              "approve" an unpaid charge. */}
-                      {payment.isOnline && (
+                              "approve" an unpaid charge. SMS purchases are
+                              reconciled through the SMS flow, not here. */}
+                      {payment.isOnline && payment.kind === 'subscription' && (
                         <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap justify-end">
                           <Button
                             size="sm"

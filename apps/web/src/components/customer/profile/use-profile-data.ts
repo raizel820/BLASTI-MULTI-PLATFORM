@@ -7,6 +7,7 @@ import { toast } from 'sonner';
 import type { Language } from '@/i18n';
 import { updateDocumentDirection } from '@/store/use-app-store';
 import { mergeSessionUser } from '@/lib/user-store-refresh';
+import { mirrorNotifPrefs } from '@/lib/notification-channel';
 import type {
   NotifPrefs,
   QueueStats,
@@ -70,6 +71,11 @@ export function useProfileData() {
         const data = await res.json();
         if (data.notificationPreferences) {
           setNotifPrefs(typeof data.notificationPreferences === 'string'
+            ? JSON.parse(data.notificationPreferences)
+            : data.notificationPreferences);
+          // Mirror for the realtime alert paths (outside React) — keeps the
+          // lock-screen alert mute/takeover prefs in effect app-wide.
+          mirrorNotifPrefs(typeof data.notificationPreferences === 'string'
             ? JSON.parse(data.notificationPreferences)
             : data.notificationPreferences);
         }

@@ -583,6 +583,8 @@ const en: Record<TranslationKeys, string> = {
   turnApproachingNotifDesc: "Alert before your turn (3 positions away)",
   completedNotif: "Completed",
   completedNotifDesc: "Notification when service is completed",
+  lockscreenTakeoverLabel: "Full-screen call takeover",
+  lockscreenTakeoverDesc: "When your turn is called and the screen is locked, show the whole app over the lock screen. OFF = notification only (recommended)",
 
   // ─── Enhanced Register ──────────────
   algeriaPrefix: "+213",

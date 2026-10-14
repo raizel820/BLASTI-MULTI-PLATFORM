@@ -10,9 +10,64 @@
  * IMPORTANT: Capacitor plugins are accessed via window.Capacitor.Plugins
  * to avoid bundling errors in the web project (the @capacitor/* packages
  * are only installed in apps/mobile).
+ *
+ * ── User-controlled alert behavior (field reports #lockscreen + #mute) ──
+ * • queue_called=false (existing per-user notification preference) now ALSO
+ *   silences the native lock-screen notification — previously only the
+ *   in-app banner honored it, so customers had NO way to stop the lock
+ *   screen alert when the agency called.
+ * • lockscreenTakeover (new preference, default OFF) opts back into the
+ *   full-screen app launch over the keyguard. Default behavior is a normal
+ *   high-importance notification — the app never takes over the lock
+ *   screen by itself anymore.
  */
 
 import { emitLockscreenEvent } from '@/lib/lockscreen-events';
+
+/** localStorage mirror of the per-user notificationPreferences JSON. */
+const NOTIF_PREFS_KEY = 'blasti-notif-prefs';
+
+export interface BlastiNotifPrefs {
+  queue_called?: boolean;
+  turn_approaching?: boolean;
+  completed?: boolean;
+  /** Opt-in to the app launching itself over the keyguard on a call.
+   *  Default FALSE — notification only. */
+  lockscreenTakeover?: boolean;
+}
+
+/**
+ * Persist the notification-preferences mirror used by the realtime alert
+ * paths (which run outside React and cannot read the zustand store).
+ * Called by user-store-refresh + the profile settings UI.
+ */
+export function mirrorNotifPrefs(prefs: BlastiNotifPrefs | null | undefined): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    if (!prefs || typeof prefs !== 'object') return;
+    localStorage.setItem(NOTIF_PREFS_KEY, JSON.stringify(prefs));
+  } catch { /* storage may be unavailable */ }
+}
+
+function readNotifPrefs(): BlastiNotifPrefs {
+  if (typeof localStorage === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(NOTIF_PREFS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * True when the user ALLOWED turn-call alerts (notification preference
+ * queue_called !== false). Default true — existing accounts keep alerts.
+ */
+export function turnCallAlertsEnabled(): boolean {
+  return readNotifPrefs().queue_called !== false;
+}
 
 interface NotificationChannelConfig {
   id: string;
@@ -102,11 +157,14 @@ export async function setupTurnAlertChannel(): Promise<void> {
  */
 function getBlastiNativeStatusPlugin(): {
   ensureNotificationChannels?: () => Promise<unknown>;
+  openInstallPermissionSettings?: () => Promise<{ ok?: boolean; canInstall?: boolean }>;
   notifyLockscreen?: (opts: {
     title: string;
     body: string;
     notificationId?: number;
-  }) => Promise<{ ok?: boolean; id?: number }>;
+    /** Opt-in full-screen app launch over the keyguard (default false). */
+    fullScreen?: boolean;
+  }) => Promise<{ ok?: boolean; id?: number; fullScreen?: boolean }>;
 } | null {
   if (typeof window === 'undefined') return null;
   const cap = (window as any)?.Capacitor;
@@ -115,8 +173,18 @@ function getBlastiNativeStatusPlugin(): {
 }
 
 /**
- * Post a LOCK-SCREEN notification through the native plugin (full-screen
- * intent when the device is locked, VISIBILITY_PUBLIC channel, tap → app).
+ * Lock-screen takeover preference: when true, a call may launch the whole
+ * app over the keyguard. Default FALSE (notification only) — the old
+ * always-takeover behavior is opt-in from Settings → Notifications.
+ */
+function lockscreenTakeoverEnabled(): boolean {
+  return readNotifPrefs().lockscreenTakeover === true;
+}
+
+/**
+ * Post a LOCK-SCREEN notification through the native plugin (high-importance
+ * PUBLIC content on the lock screen, tap → app; the full-screen APP takeover
+ * only when the user opted in via lockscreenTakeover).
  * Returns true when the native path handled it.
  */
 export async function showLockscreenNotification(
@@ -132,6 +200,9 @@ export async function showLockscreenNotification(
       title,
       body,
       notificationId: Date.now() % 100000,
+      // Default OFF — the app must not show itself on the lock screen
+      // (field report: the whole app appeared over the keyguard).
+      fullScreen: lockscreenTakeoverEnabled(),
     });
     // Feed the in-app lock-screen UI (visible when the user returns to the
     // app / as a heads-up card while the app is open).
@@ -143,8 +214,13 @@ export async function showLockscreenNotification(
 }
 
 export async function scheduleTurnNotification(title: string, body: string, ticketNumber: string): Promise<void> {
-  // 1. Native lock-screen path (full-screen intent + public lock-screen
-  //    visibility) — exactly what the mobile app was missing.
+  // ── Preference gate (report: "no way to stop the lock screen notification
+  // when agency calls") — queue_called=false silences EVERYTHING here:
+  // native lock-screen alert, Capacitor local notification, web Notification.
+  if (!turnCallAlertsEnabled()) return;
+
+  // 1. Native lock-screen path (public lock-screen visibility + optional
+  //    opt-in full-screen takeover) — exactly what the mobile app was missing.
   if (await showLockscreenNotification(title, body, ticketNumber)) {
     // Still play the in-app alarm sound through the LocalNotifications path?
     // No — the lock-screen channel carries its own sound + vibration.

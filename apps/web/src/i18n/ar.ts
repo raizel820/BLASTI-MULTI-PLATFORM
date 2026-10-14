@@ -578,6 +578,8 @@ const ar = {
   turnApproachingNotifDesc: "تنبيه قبل دورك (3 مراكز)",
   completedNotif: "إتمام الخدمة",
   completedNotifDesc: "إشعار عند اكتمال الخدمة",
+  lockscreenTakeoverLabel: "عرض التطبيق عند الاتصال",
+  lockscreenTakeoverDesc: "عند انتهاء دورك والشاشة مقفلة، يظهر التطبيق كاملاً فوق شاشة القفل. إيقاف = إشعار فقط (مستحسن)",
 
   // ─── Enhanced Register ──────────────
   algeriaPrefix: "+213",
