@@ -31,6 +31,19 @@ public class MainActivity extends BridgeActivity {
         //        of throwing; reports firebaseReady=false so the web layer
         //        skips the FCM flow entirely.
         BlastiNativeStatus.initializeFirebase(this);
+
+        // 4) Boot-time native prep, web-independent:
+        //      - Create the notification channels (blasti-lockscreen,
+        //        blasti-turn-alert, blasti-general) so FCM background pushes
+        //        and the web layer's notifications land on high-importance
+        //        PUBLIC channels even when the app was cold-started by a push.
+        //      - Apply the persisted lockscreenTakeover preference
+        //        (DEFAULT false → setShowWhenLocked(false)/setTurnScreenOn(false):
+        //        the app NEVER renders over the keyguard — full separation,
+        //        only the notification shows on the lock screen; the static
+        //        showWhenLocked/turnScreenOn manifest attributes were removed
+        //        for exactly this reason).
+        BlastiNativeStatus.applyLaunchPreferences(this);
     }
 
     /**

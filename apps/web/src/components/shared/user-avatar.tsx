@@ -9,13 +9,17 @@
  * pipeline was hardened, a localhost-stored URL viewed from a phone, a file
  * that never synced, …) rendered a broken-image glyph inside the avatar
  * circle instead of falling back — users reported it as "just a
- * placeholder". This component flips to initials the moment the image fails
- * to load, resets when the URL changes, and keeps the exact previous
- * rendering (getProxiedUrl + object-cover) when the URL is healthy.
+ * placeholder".
+ *
+ * Rendering now goes through useAvatarSrc (lib/avatar-src.ts): the URL is
+ * environment-rebased (getProxiedUrl), a failure gets a delayed cache-busted
+ * retry plus — on the Capacitor phone — a native HTTP fetch fallback that
+ * bypasses the WebView's image network policy entirely, and only THEN flips
+ * to initials. A different URL (profile update, re-login) always restarts
+ * the whole pipeline.
  */
 
-import { useEffect, useState } from 'react';
-import { getProxiedUrl } from '@/lib/utils';
+import { useAvatarSrc } from '@/lib/avatar-src';
 
 /** First-name + last-name initials, matching the previous inline helpers. */
 export function initialsOf(fullName?: string | null): string {
@@ -38,25 +42,23 @@ export function UserAvatar({
   className?: string;
   size?: number;
 }) {
-  const [failed, setFailed] = useState(false);
+  const { src, handleError } = useAvatarSrc(avatarUrl);
 
-  // A different URL (profile update, re-login) gets a fresh chance to load.
-  useEffect(() => {
-    setFailed(false);
-  }, [avatarUrl]);
-
-  if (!avatarUrl || failed) {
+  if (!src) {
     return <>{initialsOf(fullName)}</>;
   }
 
   return (
+    // key={src} — a retry/override produces a fresh <img> element so the
+    // browser genuinely re-requests instead of replaying a cached failure.
     <img
-      src={getProxiedUrl(avatarUrl)}
+      key={src}
+      src={src}
       alt={fullName || 'Avatar'}
       width={size}
       height={size}
       className={className}
-      onError={() => setFailed(true)}
+      onError={handleError}
     />
   );
 }

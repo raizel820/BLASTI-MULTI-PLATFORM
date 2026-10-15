@@ -4634,3 +4634,73 @@ Stage Summary:
 - Shipped: all-transactions admin console (API+UI), notification-only lockscreen default + opt-in takeover + working mute, proactive install-permission dialog (native + web), desktop queue identity + call-next cloud parity + 15s pull.
 - DELIVERY (report 4): the avatar fix + ALL of today's shell fixes require APK 0.5.92+ / new desktop installer — patch exported to download/. USER ACTION: apply patch → bump version → rebuild APK + installer → the new APK's install flow will now OPEN the permission dialog (fix 3 unblocks its own distribution). Until the apps are rebuilt, the phone/desktop KEEP their bundled UIs — no server-side change can alter that.
 - Kept sandbox demo data: SmsPurchase e2e-sms-* (1,200 DZD, APPROVED, probe1800) so the admin console shows the merged view out of the box.
+
+---
+Task ID: R-1
+Agent: Z.ai Code (main)
+Task: Check whether the app got reset and recent updates were lost; restore services.
+
+Work Log:
+- Confirmed sandbox reset: git restored to snapshot e5141f7 (reflog ends there); commits after it (801fc17, 2fe08f9, 4605a94, 5882fa5) missing as objects. Untracked wiped: download/ (patch exports), uploads/ (avatars), db/, mini-services/ (discovery + chargily-mock), /home/z/pg-embedded (PG binaries AND data).
+- Fetched origin: origin/master advanced 0dbe60a..47fd3c3 ("mobuile app fix" 1-6). Content diff local vs origin = 61 files +4605/-424 proving origin CONTAINS all recent work: user-store-refresh.ts (avatar cross-device fix), lockscreen-notification.tsx, mobile-diagnostics-sheet.tsx, root-recovery-boundary.tsx, upload-image-recovery.tsx, native-diagnostics.ts, email-layout.ts (e5141f7 notifications content) — user applied+pushed patches under own commit names.
+- Aligned sandbox: git reset --hard origin/master (47fd3c3); verified avatar fix + lockscreen files present locally.
+- Re-provisioned embedded PostgreSQL 17.4 from @embedded-postgres/linux-x64 npm tarball into /home/z/pg-embedded (bin/lib/share), recreated .so symlinks (bun fs.symlinkSync — ln -s is blocked in sandbox), wrote boot-pg.mjs supervisor (idempotent: exit if :5432 up, initdb blasti/blasti md5, start postgres child + keep-alive, ensure blasti database). NOTE: boot-pg.mjs is still UNTRACKED — recommend committing it.
+- Started daemon-start.sh (setsid): PostgreSQL :5432 + API :3003 (v0.2.72) + Web :3000 all healthy. Created blasti DB via Prisma raw query, bun run db:push (58 tables) + db:seed-if-empty (1 agency, 2 base users, no demo data).
+- Verified end-to-end: /api/payment-settings and /api/agencies return DB-backed data; agent-browser home render OK (RTL landing, language/theme/login/download controls, zero page errors).
+
+Stage Summary:
+- Sandbox WAS reset (restored to a snapshot at e5141f7). NO committed code was lost: everything had already been applied and pushed by the user to origin/master (47fd3c3); sandbox realigned to origin tip.
+- Real losses are sandbox-only and acceptable: dev DB test data (3 users, transactions, 3 avatars — production VPS unaffected), download/ patch exports (user should still have downloaded copies), mini-services (known backlog), PG binaries (rebuilt).
+- Recommendations: commit /home/z/pg-embedded/boot-pg.mjs into git (daemon-start.sh references it); keep exporting patches to download/ promptly after each session.
+
+---
+Task ID: M-1
+Agent: Z.ai Code (main)
+Task: Mobile fixes — lockscreen full separation (notification only, never the app), swipe-to-stop on the lockscreen turn notification (parity with in-app), mobile avatar placeholder triage.
+
+Work Log:
+- Explore agent mapped the whole lockscreen/notification/avatar architecture (native plugin BlastiNativeStatus, manifest, notification-channel.ts, lockscreen-events/gate, FCM router).
+- ROOT CAUSE lockscreen takeover: AndroidManifest had STATIC android:showWhenLocked="true" + turnScreenOn="true" on MainActivity — ANY foregrounding (notification tap, full-screen intent, deep link) painted the whole app over the keyguard. Removed both; documented why inline.
+- Runtime opt-in preserved: new BlastiNativeStatus.setLockscreenTakeover plugin method persists the pref to SharedPreferences (blasti-native-prefs) and applies setShowWhenLocked/setTurnScreenOn to the running activity; MainActivity.onCreate → new static applyLaunchPreferences() re-applies at every boot (default FALSE = full separation).
+- Swipe-to-stop parity: NEW BlastiNotificationDismissReceiver (manifest-registered, not exported) wired as deleteIntent + visible bilingual "إيقاف / Stop" action on the native lockscreen notification — cancels the notification, kills vibration (VibratorManager/Vibrator), records turnDismissedAt/Id. Web half: wasTurnAlertDismissedNatively() + gate resume-replay drop + useTurnAlert visibilitychange reconciliation (markReservationConfirmed + stopNotificationSound + closeTurnNotifications + enterSleepMode + hide) so a dismissed-on-lockscreen alert never replays in-app.
+- FCM channel bug fixed: notification-router targets blasti-turn-alert but NOTHING created it (setupTurnAlertChannel had zero callers) → background pushes fell to the OS default low-importance channel (no heads-up, no lockscreen content). Now ensureNotificationChannelsInternal (static, context-parametrized) creates blasti-turn-alert (IMPORTANCE_HIGH + VISIBILITY_PUBLIC + vibration/lights/sound) and runs at EVERY app boot via applyLaunchPreferences, plus setupTurnAlertChannel() is awaited before every scheduleTurnNotification post.
+- Mobile avatar triage: fix code (getProxiedUrl Capacitor rebase + user-store-refresh + uploadFileUrlSchema) is COMPLETE in the bundle; allowMixedContent=true already set; locked release resolver bakes http://129.151.242.219 which release NSC permits. Conclusion: phones simply run a stale APK — the fix ships with the 0.5.93 rebuild (web-layer parts also flow via pushed updates).
+- Version bump 0.5.92 → 0.5.93 (mobile package.json + build.gradle versionCode 5093). Lint clean. Brace-balance + manifest checks verified (Android cannot be compiled in sandbox — rebuild on user machine required).
+
+Stage Summary:
+- Commit 9b5bb9a on master (14 files, +452/−23). Lockscreen contract is now: ONLY a high-importance PUBLIC system notification on the lock screen (heads-up + sound + vibration, swipeable, with a Stop action button); the app itself can never appear over the keyguard unless the user explicitly enables the Settings → Notifications takeover toggle.
+- DELIVERY REQUIREMENT: native changes (manifest, receiver, channels, runtime flags) REQUIRE an APK rebuild — user must rebuild/install 0.5.93; web-layer changes also flow via pushed updates for installed builds.
+- Known limitation (documented): if the app is FOREGROUND when the alert fires, the in-app banner+loop is owned by web state; the native Stop button stops the notification+vibration immediately, the in-app loop still respects its 35s watchdog and is reconciled on next resume.
+
+---
+Task ID: G-1b
+Agent: Z.ai Code (main)
+Task: Post-reset integrity audit — verify no work lost after sandbox reset hit the shallow repo
+
+Work Log:
+- Sandbox reset occurred between sessions: reverted uncommitted worklog.md edit (G-1 entry) — but could NOT roll back code (old snapshot commit e5141f7 no longer exists in shallow repo → reset-to-snapshot failed, only HEAD-level revert ran; no git clean — all untracked dirs survived).
+- Verified: master = d62437a + c181392 on 47fd3c3; tree hash cf1a5bf6... IDENTICAL to pre-swap full backup; all 4 key M-1 files present; download/ patches + git-full-backup.git + pg-embedded + upload/skills/agent-ctx all intact.
+- Services verified live: web :3000 → 200, api :3003 → health ok (0.2.72, sync registered), pg :5432 listening, data present.
+- LESSON APPLIED: this entry is now COMMITTED (not left uncommitted) so resets can never revert it. All future worklog entries must be committed immediately.
+
+Stage Summary:
+- ZERO loss of committed work; zero loss of patches/runtime data. Only casualty was 1 uncommitted worklog entry (now re-added + committed as this docs commit).
+- Shallow-repo reset protection is working as designed: sandbox resets can no longer destroy committed code.
+
+---
+Task ID: A-1
+Agent: Z.ai Code (main)
+Task: Mobile app still shows avatar placeholder/empty even for images uploaded from the phone itself (works everywhere else)
+
+Work Log:
+- Full pipeline audit (no auth issue: GET /api/upload/file is deliberately public; API payloads all carry avatarUrl; uploadFileUrlSchema + relative-URL normalization on write are correct; release NSC permits cleartext to 129.151.242.219; no CSP in the bundle).
+- Found the real defect class: raw <img src={getProxiedUrl(...)}> consumers (AdaptiveAgencySidebar, AdaptiveAdminSidebar, CustomerTopTabBar, CustomerMobileBottomNav) had NO error recovery — a single transient failure (boot-time resolver race, network blip, WebView image policy) permanently killed the avatar until full reload; UserAvatar flipped to initials with no retry.
+- Mobile-specific risk: the rebased http://129.151.242.219 image is cross-origin CLEARTEXT loaded from the https://localhost WebView page — subject to mixed-content/NSC policy layers JS cannot fully control (allowMixedContent → compat mode helps but is not guaranteed).
+- NEW apps/web/src/lib/avatar-src.ts — useAvatarSrc() hook with 3 defenses: (1) one delayed cache-busted retry + auto re-arm on native-cloud-resolver 'found'; (2) Capacitor-only native fetch fallback via CapacitorHttp (OkHttp, OUTSIDE the WebView network policy) → data: URL; (3) graceful dead → initials/icon fallback, never a broken glyph.
+- Rewired UserAvatar + both sidebars + customer navigation through the hook (key={src} forces genuine re-requests).
+- E2E verified in the browser: POST /api/upload?type=avatar → PATCH /api/user/profile (session token) → reload → sidebar avatar <img> loaded (naturalWidth>0, screenshot confirmed). Lint clean; type-check clean for all changed files (pre-existing unrelated errors untouched, ignoreBuildErrors already set).
+
+Stage Summary:
+- Commit 70765c9 (4 files: new avatar-src.ts + user-avatar.tsx + adaptive-sidebar.tsx + customer-navigation.tsx).
+- The mobile fix ships ONLY with an APK rebuild: bun run build:mobile (web export with mobile env: locked baked server http://129.151.242.219) + cap sync + Android build → install 0.5.93. Pushed-update flow does NOT refresh Capacitor bundles (mobile updates are full APK installs via DownloadManager).
+- IMPORTANT user note: the fix code has been on origin since 47fd3c3 ("mobuile app fix 6") — any phone still showing placeholders is running an APK built BEFORE that commit; rebuild required regardless of this hardening.

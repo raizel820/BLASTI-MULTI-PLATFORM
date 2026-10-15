@@ -1,6 +1,9 @@
 package com.blasti.mobile;
 
+import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
 import android.util.Log;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -674,11 +677,30 @@ public class BlastiNativeStatus extends Plugin {
     static final String GENERAL_CHANNEL_ID = "blasti-general";
 
     /**
+     * Turn-alert channel — MUST exist natively because the FCM payload
+     * (apps/api/src/lib/notification-router.ts) targets exactly this id for
+     * background pushes (app closed → the web layer cannot create channels).
+     * Before this channel existed, FCM notifications fell back to the OS
+     * default "Miscellaneous" channel: low importance, no heads-up, no
+     * lock-screen content. The Capacitor LocalNotifications fallback path
+     * (notification-channel.ts BLASTI_TURN_CHANNEL) uses the same id.
+     */
+    static final String TURN_ALERT_CHANNEL_ID = "blasti-turn-alert";
+
+    /** Prefs file shared with BlastiNotificationDismissReceiver. */
+    static final String NATIVE_PREFS_FILE = "blasti-native-prefs";
+    static final String KEY_LOCKSCREEN_TAKEOVER = "lockscreenTakeover";
+
+    /**
      * Create the BLASTI notification channels exactly the way the lock-screen
      * UI needs them:
      *   • blasti-lockscreen — IMPORTANCE_HIGH (heads-up + lock screen),
      *     VISIBILITY_PUBLIC (full content readable on the lock screen),
      *     vibration + lights; used for turn-called alerts.
+     *   • blasti-turn-alert — IMPORTANCE_HIGH + PUBLIC: the channel the FCM
+     *     payload and the Capacitor LocalNotifications fallback both target
+     *     (creating it here fixes background pushes landing on the OS default
+     *     low-importance channel).
      *   • blasti-general — IMPORTANCE_DEFAULT, PRIVATE visibility.
      * Idempotent — safe to call on every app start.
      */
@@ -686,13 +708,13 @@ public class BlastiNativeStatus extends Plugin {
     public void ensureNotificationChannels(PluginCall call) {
         JSObject result = new JSObject();
         try {
-            boolean ok = ensureNotificationChannelsInternal();
+            boolean ok = ensureNotificationChannelsInternal(getContext());
             if (!ok) {
                 if (call != null) call.reject("notification-manager-unavailable");
                 return;
             }
             result.put("ok", true);
-            result.put("channels", new String[]{ LOCKSCREEN_CHANNEL_ID, GENERAL_CHANNEL_ID });
+            result.put("channels", new String[]{ LOCKSCREEN_CHANNEL_ID, TURN_ALERT_CHANNEL_ID, GENERAL_CHANNEL_ID });
             if (call != null) call.resolve(result);
         } catch (Throwable t) {
             Log.w(TAG, "ensureNotificationChannels failed", t);
@@ -702,15 +724,17 @@ public class BlastiNativeStatus extends Plugin {
 
     /**
      * Real channel setup. Returns false only when the NotificationManager is
-     * unavailable. Safe to call with no PluginCall (internal use).
+     * unavailable. Static + context-parametrized so MainActivity boot code can
+     * call it without a plugin instance.
      */
-    private boolean ensureNotificationChannelsInternal() {
+    private static boolean ensureNotificationChannelsInternal(Context context) {
+        if (context == null) return false;
         if (android.os.Build.VERSION.SDK_INT < 26) {
             // Pre-O: importance/visibility are per-notification, not per-channel.
             return true;
         }
         android.app.NotificationManager nm = (android.app.NotificationManager)
-            getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+            context.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) return false;
 
         android.app.NotificationChannel lock = new android.app.NotificationChannel(
@@ -732,6 +756,25 @@ public class BlastiNativeStatus extends Plugin {
                     .build());
         } catch (Throwable ignored) { }
 
+        android.app.NotificationChannel turn = new android.app.NotificationChannel(
+            TURN_ALERT_CHANNEL_ID,
+            "BLASTI Turn Alert",
+            android.app.NotificationManager.IMPORTANCE_HIGH);
+        turn.setDescription("Your-turn alerts (in-app fallback + push while the app is closed)");
+        // PUBLIC so FCM background pushes show full content on the lock screen.
+        turn.setLockscreenVisibility(android.app.Notification.VISIBILITY_PUBLIC);
+        turn.enableVibration(true);
+        turn.enableLights(true);
+        turn.setLightColor(android.graphics.Color.parseColor("#10b981"));
+        try {
+            turn.setSound(
+                android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION),
+                new android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build());
+        } catch (Throwable ignored) { }
+
         android.app.NotificationChannel general = new android.app.NotificationChannel(
             GENERAL_CHANNEL_ID,
             "BLASTI",
@@ -740,8 +783,101 @@ public class BlastiNativeStatus extends Plugin {
         general.setLockscreenVisibility(android.app.Notification.VISIBILITY_PRIVATE);
 
         nm.createNotificationChannel(lock);
+        nm.createNotificationChannel(turn);
         nm.createNotificationChannel(general);
         return true;
+    }
+
+    /**
+     * Boot-time hook for MainActivity: create the notification channels and
+     * apply the persisted lock-screen flags WITHOUT any web-layer involvement
+     * (channels must exist before FCM can post into them; the flags must be
+     * applied before any full-screen intent can fire).
+     */
+    public static void applyLaunchPreferences(Activity activity) {
+        try {
+            ensureNotificationChannelsInternal(activity.getApplicationContext());
+        } catch (Throwable ignored) { }
+        applyLockscreenFlags(activity);
+    }
+
+    /**
+     * Apply the persisted lockscreenTakeover preference to the activity:
+     *   • false (DEFAULT) → setShowWhenLocked(false) + setTurnScreenOn(false):
+     *     the app can NEVER render over the keyguard — only the notification
+     *     shows on the lock screen (full separation).
+     *   • true (explicit opt-in from Settings → Notifications) → the legacy
+     *     full-screen takeover behavior.
+     *
+     * Called from MainActivity.onCreate (boot) and from
+     * setLockscreenTakeover() (preference change while running).
+     */
+    private static void applyLockscreenFlags(Activity activity) {
+        if (activity == null) return;
+        if (android.os.Build.VERSION.SDK_INT < 27) {
+            // setShowWhenLocked/setTurnScreenOn exist from API 27; below that
+            // the removed manifest flags keep the safe default (never show).
+            return;
+        }
+        try {
+            SharedPreferences prefs = activity.getSharedPreferences(NATIVE_PREFS_FILE, Context.MODE_PRIVATE);
+            boolean takeover = prefs.getBoolean(KEY_LOCKSCREEN_TAKEOVER, false);
+            activity.setShowWhenLocked(takeover);
+            activity.setTurnScreenOn(takeover);
+        } catch (Throwable t) {
+            Log.w(TAG, "applyLockscreenFlags failed", t);
+        }
+    }
+
+    /**
+     * Persist + apply the lockscreenTakeover preference. The web layer calls
+     * this whenever the Settings → Notifications toggle changes (and on boot
+     * to keep native in sync with the server-side preference).
+     * Returns { ok, enabled }.
+     */
+    @PluginMethod
+    public void setLockscreenTakeover(PluginCall call) {
+        Boolean enabled = call.getBoolean("enabled", false);
+        boolean value = enabled != null && enabled;
+        try {
+            getContext().getSharedPreferences(NATIVE_PREFS_FILE, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_LOCKSCREEN_TAKEOVER, value)
+                .apply();
+            Activity activity = bridge != null ? bridge.getActivity() : null;
+            if (activity != null) {
+                applyLockscreenFlags(activity);
+            }
+            JSObject result = new JSObject();
+            result.put("ok", true);
+            result.put("enabled", value);
+            call.resolve(result);
+        } catch (Throwable t) {
+            Log.w(TAG, "setLockscreenTakeover failed", t);
+            call.reject("takeover-failed", t.getMessage());
+        }
+    }
+
+    /**
+     * Last turn-notification dismissal recorded by
+     * BlastiNotificationDismissReceiver (swipe or Stop action). The web layer
+     * compares this against a pending in-app replay on resume and DROPS the
+     * replay when the user already stopped the alert from the lock screen.
+     * Returns { dismissedAt, dismissedId } (epoch ms, notification id; 0/-1
+     * when nothing was ever dismissed).
+     */
+    @PluginMethod
+    public void getTurnDismissState(PluginCall call) {
+        try {
+            SharedPreferences prefs = getContext().getSharedPreferences(NATIVE_PREFS_FILE, Context.MODE_PRIVATE);
+            JSObject result = new JSObject();
+            result.put("dismissedAt", prefs.getLong(BlastiNotificationDismissReceiver.KEY_TURN_DISMISSED_AT, 0L));
+            result.put("dismissedId", prefs.getInt(BlastiNotificationDismissReceiver.KEY_TURN_DISMISSED_ID, -1));
+            call.resolve(result);
+        } catch (Throwable t) {
+            Log.w(TAG, "getTurnDismissState failed", t);
+            call.reject("dismiss-state-failed", t.getMessage());
+        }
     }
 
     /**
@@ -771,7 +907,7 @@ public class BlastiNativeStatus extends Plugin {
         boolean wantFullScreen = call.getBoolean("fullScreen", false);
         try {
             // Channels must exist before the notification posts (no-op pre-O).
-            try { ensureNotificationChannels(null); } catch (Throwable ignored) { }
+            try { ensureNotificationChannelsInternal(getContext()); } catch (Throwable ignored) { }
 
             Object rawId = call.getData() == null ? null : call.getData().opt("notificationId");
             int id = rawId instanceof Number
@@ -821,14 +957,42 @@ public class BlastiNativeStatus extends Plugin {
 
                 // Device locked → wake the screen and show OVER the keyguard —
                 // ONLY when the caller explicitly opted in (web preference
-                // lockscreenTakeover). Default is a normal notification: the
-                // app no longer takes over the lock screen by itself.
+                // lockscreenTakeover, synced to native SharedPreferences and
+                // applied by MainActivity/applyLaunchPreferences + the
+                // setLockscreenTakeover plugin method). With the manifest
+                // flags removed, the DEFAULT is full separation: tapping the
+                // notification while locked shows the keyguard first; the app
+                // paints only after unlock.
                 if (wantFullScreen && locked) {
                     android.app.PendingIntent fullPi = android.app.PendingIntent.getActivity(
                         getContext(), id + 1, launch,
                         android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
                     builder.setFullScreenIntent(fullPi, true);
                 }
+            }
+
+            // ── Swipe-to-stop + explicit Stop action (parity with the in-app
+            //    banner's slide-to-stop). Both paths hit
+            //    BlastiNotificationDismissReceiver, which cancels the
+            //    notification, kills vibration and records the dismissal so
+            //    the web layer drops the pending in-app replay on resume.
+            try {
+                Intent stopIntent = new Intent(getContext(), BlastiNotificationDismissReceiver.class);
+                stopIntent.setAction(BlastiNotificationDismissReceiver.ACTION_STOP_TURN_ALERT);
+                stopIntent.putExtra(BlastiNotificationDismissReceiver.EXTRA_NOTIFICATION_ID, id);
+                android.app.PendingIntent stopPi = android.app.PendingIntent.getBroadcast(
+                    getContext(), id + 2, stopIntent,
+                    android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
+                // Swipe the notification away → same receiver records the stop.
+                builder.setDeleteIntent(stopPi);
+                // Visible "Stop" button on the heads-up/lock-screen shade.
+                String stopLabel = call.getString("stopLabel");
+                if (stopLabel == null || stopLabel.trim().isEmpty()) stopLabel = "إيقاف / Stop";
+                builder.addAction(
+                    new androidx.core.app.NotificationCompat.Action.Builder(
+                        0, stopLabel, stopPi).build());
+            } catch (Throwable t) {
+                Log.w(TAG, "stop-action wiring failed", t);
             }
 
             nm.notify(id, builder.build());

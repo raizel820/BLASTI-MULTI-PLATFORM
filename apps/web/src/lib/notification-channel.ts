@@ -46,6 +46,10 @@ export function mirrorNotifPrefs(prefs: BlastiNotifPrefs | null | undefined): vo
   try {
     if (!prefs || typeof prefs !== 'object') return;
     localStorage.setItem(NOTIF_PREFS_KEY, JSON.stringify(prefs));
+    // Keep the native lock-screen flag in sync with the server-side
+    // preference (single choke point — called from the settings UI save path
+    // AND user-store-refresh on boot/focus).
+    syncLockscreenTakeoverToNative();
   } catch { /* storage may be unavailable */ }
 }
 
@@ -158,12 +162,16 @@ export async function setupTurnAlertChannel(): Promise<void> {
 function getBlastiNativeStatusPlugin(): {
   ensureNotificationChannels?: () => Promise<unknown>;
   openInstallPermissionSettings?: () => Promise<{ ok?: boolean; canInstall?: boolean }>;
+  setLockscreenTakeover?: (opts: { enabled: boolean }) => Promise<{ ok?: boolean; enabled?: boolean }>;
+  getTurnDismissState?: () => Promise<{ dismissedAt?: number; dismissedId?: number }>;
   notifyLockscreen?: (opts: {
     title: string;
     body: string;
     notificationId?: number;
     /** Opt-in full-screen app launch over the keyguard (default false). */
     fullScreen?: boolean;
+    /** Label for the native "Stop" action button (default "إيقاف / Stop"). */
+    stopLabel?: string;
   }) => Promise<{ ok?: boolean; id?: number; fullScreen?: boolean }>;
 } | null {
   if (typeof window === 'undefined') return null;
@@ -182,6 +190,53 @@ function lockscreenTakeoverEnabled(): boolean {
 }
 
 /**
+ * Last value synced to the native side — avoids re-issuing the plugin call on
+ * every mirrorNotifPrefs() write (user-store-refresh runs on boot AND focus).
+ */
+let lastSyncedTakeover: boolean | null = null;
+
+/**
+ * Push the current lockscreenTakeover preference into the NATIVE layer
+ * (SharedPreferences + apply setShowWhenLocked/setTurnScreenOn on the
+ * running activity). This is what makes the runtime gating actually work:
+ * the manifest flags are gone, so the ONLY way a full-screen takeover can
+ * happen is when the native pref says so — and this is the one bridge that
+ * keeps the native pref in sync with the server-side user preference.
+ * Best-effort: web/desktop shells and older APKs silently no-op.
+ */
+export function syncLockscreenTakeoverToNative(): void {
+  if (!isCapacitorNative()) return;
+  const enabled = lockscreenTakeoverEnabled();
+  if (lastSyncedTakeover === enabled) return;
+  try {
+    const status = getBlastiNativeStatusPlugin();
+    if (!status?.setLockscreenTakeover) return;
+    void status.setLockscreenTakeover({ enabled })
+      .then(() => { lastSyncedTakeover = enabled; })
+      .catch(() => { /* older APK without the method — stay silent */ });
+  } catch { /* never let a sync attempt break the caller */ }
+}
+
+/**
+ * Did the user already STOP the turn alert from the lock screen (swipe or
+ * the native "Stop" action) at or before `at`? The resume-replay gate uses
+ * this to avoid re-showing an alert the user explicitly dismissed — full
+ * parity with the in-app slide-to-stop.
+ */
+export async function wasTurnAlertDismissedNatively(at: number): Promise<boolean> {
+  if (!isCapacitorNative()) return false;
+  try {
+    const status = getBlastiNativeStatusPlugin();
+    if (!status?.getTurnDismissState) return false;
+    const state = await status.getTurnDismissState();
+    const dismissedAt = typeof state?.dismissedAt === 'number' ? state.dismissedAt : 0;
+    return dismissedAt > 0 && at <= dismissedAt;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Post a LOCK-SCREEN notification through the native plugin (high-importance
  * PUBLIC content on the lock screen, tap → app; the full-screen APP takeover
  * only when the user opted in via lockscreenTakeover).
@@ -191,11 +246,16 @@ export async function showLockscreenNotification(
   title: string,
   body: string,
   ticketNumber?: string,
+  stopLabel?: string,
 ): Promise<boolean> {
   if (!isCapacitorNative()) return false;
   try {
     const status = getBlastiNativeStatusPlugin();
     if (!status?.notifyLockscreen) return false;
+    // Apply the CURRENT takeover preference to the running activity BEFORE
+    // the notification posts — the runtime flags are what the full-screen
+    // intent launch obeys (singleTask reuses this very instance).
+    syncLockscreenTakeoverToNative();
     const res = await status.notifyLockscreen({
       title,
       body,
@@ -203,6 +263,9 @@ export async function showLockscreenNotification(
       // Default OFF — the app must not show itself on the lock screen
       // (field report: the whole app appeared over the keyguard).
       fullScreen: lockscreenTakeoverEnabled(),
+      // Lock-screen "Stop" action button — swipe/stop parity with the
+      // in-app banner. Bilingual default matches the alert title style.
+      stopLabel,
     });
     // Feed the in-app lock-screen UI (visible when the user returns to the
     // app / as a heads-up card while the app is open).
@@ -213,15 +276,21 @@ export async function showLockscreenNotification(
   }
 }
 
-export async function scheduleTurnNotification(title: string, body: string, ticketNumber: string): Promise<void> {
+export async function scheduleTurnNotification(title: string, body: string, ticketNumber: string, stopLabel?: string): Promise<void> {
   // ── Preference gate (report: "no way to stop the lock screen notification
   // when agency calls") — queue_called=false silences EVERYTHING here:
   // native lock-screen alert, Capacitor local notification, web Notification.
   if (!turnCallAlertsEnabled()) return;
 
+  // Channels MUST exist before anything posts. Idempotent — also covers
+  // builds where the native boot hook could not run (the FCM background path
+  // targets blasti-turn-alert; without it, pushes land on the OS default
+  // low-importance channel: no heads-up, no lock-screen content).
+  await setupTurnAlertChannel();
+
   // 1. Native lock-screen path (public lock-screen visibility + optional
   //    opt-in full-screen takeover) — exactly what the mobile app was missing.
-  if (await showLockscreenNotification(title, body, ticketNumber)) {
+  if (await showLockscreenNotification(title, body, ticketNumber, stopLabel)) {
     // Still play the in-app alarm sound through the LocalNotifications path?
     // No — the lock-screen channel carries its own sound + vibration.
     return;

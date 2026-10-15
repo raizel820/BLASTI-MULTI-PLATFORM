@@ -27,6 +27,8 @@ import { useEffect, useRef, useCallback, useState, useMemo } from 'react'
 import { io, Socket } from 'socket.io-client'
 import { useAppStore } from '@/store/use-app-store'
 import { shouldShowAlert, enterSleepMode, clearSleep, subscribe as subscribeSleep, isReactivationDue, markReactivationShown, getSleepRecord, closeTurnNotifications } from '@/lib/turn-alert-sleep'
+import { markReservationConfirmed, stopNotificationSound } from '@/lib/sounds'
+import { wasTurnAlertDismissedNatively } from '@/lib/notification-channel'
 import { getNativeCloudUrl, ensureNativeCloudUrl, onNativeCloudStateChange } from '@/lib/native-cloud-resolver'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
@@ -960,6 +962,10 @@ export function useTurnAlert(userId: string | undefined) {
     ticketNumber: string;
     agencyName: string;
   } | null>(null)
+  // When the CURRENT alert fired — compared against the native lock-screen
+  // dismissal timestamp so a swipe/Stop on the OS notification also silences
+  // the in-app banner (full swipe-to-stop parity, app-side half).
+  const turnAlertFiredAtRef = useRef<number>(0)
   const { subscribe, joinRoom, leaveRoom } = useRealtime()
 
   // H17: Join customer room for turn alerts
@@ -986,6 +992,7 @@ export function useTurnAlert(userId: string | undefined) {
         const ticketNumber = data?.ticketNumber || data?.displayNumber || '---'
         const agencyName = data?.agencyName || ''
 
+        turnAlertFiredAtRef.current = Date.now()
         setTurnAlertData({ reservationId, ticketNumber, agencyName })
         setShowTurnAlert(true)
 
@@ -1011,6 +1018,7 @@ export function useTurnAlert(userId: string | undefined) {
         const ticketNumber = data?.displayNumber || data?.ticketNumber || '---'
         const agencyName = data?.agencyName || ''
 
+        turnAlertFiredAtRef.current = Date.now()
         setTurnAlertData({ reservationId, ticketNumber, agencyName })
         setShowTurnAlert(true)
 
@@ -1064,6 +1072,33 @@ export function useTurnAlert(userId: string | undefined) {
     closeTurnNotifications()
     setShowTurnAlert(false)
   }, [turnAlertData])
+
+  // ── Lock-screen swipe-to-stop reconciliation (app-side half) ──────────
+  // The user can stop the turn alert from the LOCK SCREEN itself — swipe the
+  // OS notification away or tap its "Stop" action
+  // (BlastiNotificationDismissReceiver records the dismissal natively).
+  // When the app becomes visible again, an alert whose fire-time predates
+  // that dismissal must NOT replay its full-screen banner + sound loop:
+  // mirror the in-app slide-to-stop semantics (mark confirmed client-side so
+  // the sound cannot restart, stop the loop, close OS notifications, sleep).
+  useEffect(() => {
+    const reconcile = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      if (!showTurnAlert || !turnAlertData?.reservationId) return;
+      const firedAt = turnAlertFiredAtRef.current;
+      if (!firedAt) return;
+      void wasTurnAlertDismissedNatively(firedAt).then((dismissed) => {
+        if (!dismissed) return;
+        markReservationConfirmed(turnAlertData.reservationId as string);
+        stopNotificationSound();
+        closeTurnNotifications();
+        enterSleepMode(turnAlertData.reservationId as string);
+        setShowTurnAlert(false);
+      });
+    };
+    document.addEventListener('visibilitychange', reconcile);
+    return () => document.removeEventListener('visibilitychange', reconcile);
+  }, [showTurnAlert, turnAlertData]);
 
   return { showTurnAlert, turnAlertData, dismissTurnAlert }
 }

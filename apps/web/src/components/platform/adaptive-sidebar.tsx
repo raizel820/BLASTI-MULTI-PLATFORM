@@ -6,7 +6,7 @@ import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useAgencyAuthority, canAccessAgencySection, type AgencySectionView } from '@/hooks/use-agency-authority';
 import { isRTL, type TranslationKeys } from '@/i18n';
-import { getProxiedUrl } from '@/lib/utils';
+import { useAvatarSrc } from '@/lib/avatar-src';
 import { usePlatform } from '@/hooks/use-platform';
 import { nativeBridge } from '@/lib/native-bridge';
 import { useAppUpdateStore } from '@/store/use-app-update-store';
@@ -133,6 +133,8 @@ function MobileBottomActionBar({ onMenuOpen, onLogout, t }: { onMenuOpen: () => 
 
 export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { currentView, setView, logout, user } = useAppStore();
+  // Avatar with retry + native-fetch fallback (mobile placeholder fix).
+  const { src: avatarSrc, handleError: onAvatarError } = useAvatarSrc(user?.avatarUrl);
   const { t, lang } = useLanguage();
   const { platform, capabilities } = usePlatform();
   // App-update delivery — manual check sits at the bottom of the sidebar
@@ -308,8 +310,8 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
       <div className="px-3 py-3 space-y-1">
         <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-muted/30">
           <div className="relative h-9 w-9 rounded-full bg-gradient-to-br from-emerald-100 to-teal-100 dark:from-emerald-900/40 dark:to-teal-900/30 flex items-center justify-center overflow-hidden ring-2 ring-emerald-200/50 dark:ring-emerald-800/30">
-            {user?.avatarUrl ? (
-              <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName} width={36} height={36} className="h-full w-full object-cover" />
+            {avatarSrc ? (
+              <img key={avatarSrc} src={avatarSrc} alt={user?.fullName} width={36} height={36} className="h-full w-full object-cover" onError={onAvatarError} />
             ) : (
               <span className="text-xs font-bold text-emerald-700 dark:text-emerald-400">
                 {user?.fullName?.charAt(0)?.toUpperCase() || 'A'}
@@ -542,6 +544,8 @@ function AdminNavGroupItem({
 
 export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { currentView, setView, logout, user } = useAppStore();
+  // Avatar with retry + native-fetch fallback (mobile placeholder fix).
+  const { src: avatarSrc, handleError: onAvatarError } = useAvatarSrc(user?.avatarUrl);
   const { t } = useLanguage();
   const { platform, capabilities } = usePlatform();
 
@@ -691,8 +695,8 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
       <div className="px-3 py-3 space-y-1">
         <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-muted/30">
           <div className="relative h-9 w-9 rounded-full bg-gradient-to-br from-amber-100 to-orange-100 dark:from-amber-900/40 dark:to-orange-900/30 flex items-center justify-center overflow-hidden ring-2 ring-amber-200/50 dark:ring-amber-800/30">
-            {user?.avatarUrl ? (
-              <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName} width={36} height={36} className="h-full w-full object-cover" />
+            {avatarSrc ? (
+              <img key={avatarSrc} src={avatarSrc} alt={user?.fullName} width={36} height={36} className="h-full w-full object-cover" onError={onAvatarError} />
             ) : (
               <ShieldCheck className="h-4 w-4 text-amber-700 dark:text-amber-400" />
             )}
