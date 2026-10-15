@@ -14,6 +14,7 @@ import { partitionWaiting, pickNextCallable } from '../lib/queue-waiting'
 // GETs that expose reservation-derived numbers (/api/stats, /api/agencies).
 import { invalidateResponseCacheTag } from '../lib/response-cache'
 import { cancelPendingCustomerAlerts } from '../lib/cancel-pending-alerts'
+import { sendViaPushNotification } from '../lib/notification-router'
 import { z } from 'zod'
 import { recordSyncChange } from '../lib/sync-helpers'
 
@@ -89,7 +90,7 @@ app.post('/call-next', async (c) => {
       include: {
         agency: { select: { id: true, name: true, nameFr: true, nameAr: true } },
         service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
-        user: { select: { id: true, username: true, fullName: true, language: true, phoneNumber: true } },
+        user: { select: { id: true, username: true, fullName: true, language: true, phoneNumber: true, fcmToken: true } },
       },
     })
 
@@ -154,7 +155,7 @@ app.post('/call-next', async (c) => {
         include: {
           agency: { select: { id: true, name: true, nameFr: true, nameAr: true } },
           service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
-          user: { select: { id: true, username: true, fullName: true, language: true, phoneNumber: true } },
+          user: { select: { id: true, username: true, fullName: true, language: true, phoneNumber: true, fcmToken: true } },
           counter: { select: { id: true, name: true, number: true } },
         },
       })
@@ -225,6 +226,27 @@ app.post('/call-next', async (c) => {
     })
     if (mergedCallData.userId) {
       emitNotificationEvent('notification:your-turn', mergedCallData.userId, { ticketNumber: mergedCallData.displayNumber, agencyName: mergedCallData.agency.name, serviceName: mergedCallData.service.name, userId: mergedCallData.userId, reservationId: mergedCallData.id })
+
+      // ── Lock-screen delivery when the app is CLOSED/backgrounded ──
+      // The socket event only reaches a LIVE webview; with the app dead the
+      // "It's your turn" alert previously NEVER reached the lock screen
+      // (no FCM push existed — routeNotification is dead code). FCM
+      // notification message → OS tray on the blasti-turn-alert channel
+      // (high-importance, PUBLIC → lock-screen content, native swipe
+      // dismiss). Requires Firebase credentials + the app's FCM token.
+      const fcmToken = mergedCallData.user?.fcmToken
+      if (fcmToken) {
+        void sendViaPushNotification(fcmToken, {
+          userId: mergedCallData.userId,
+          reservationId: mergedCallData.id,
+          agencyId,
+          type: 'TURN_CALL',
+          message: `Your turn now! Ticket ${mergedCallData.displayNumber} at ${mergedCallData.agency.name} — ${mergedCallData.service.name}.`,
+          messageAr: mergedCallData.user?.language === 'ar'
+            ? `دورك الآن! التذكرة ${mergedCallData.displayNumber} في ${mergedCallData.agency.nameAr || mergedCallData.agency.name}.`
+            : `دورك الآن! التذكرة ${mergedCallData.displayNumber} في ${mergedCallData.agency.nameAr || mergedCallData.agency.name}.`,
+        }).catch(() => { /* push is best-effort — the in-app row already exists */ })
+      }
     }
     emitKioskEvent(agencyId, { action: 'call-next', displayNumber: mergedCallData.displayNumber, counterId })
 

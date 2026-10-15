@@ -19,6 +19,7 @@ import { toast } from 'sonner';
 import { useUpload } from '@/hooks/use-upload';
 import { UserAvatar } from '@/components/shared/user-avatar';
 import { ImageUploadPreviewDialog } from '@/components/shared/image-upload-preview-dialog';
+import { registerAvatarOverrideFromFile } from '@/lib/avatar-override';
 import { apiFetch } from '@/lib/api-fetch';
 import type { TranslationKeys } from '@/i18n';
 
@@ -94,6 +95,11 @@ export function ProfilePersonalInfo({
     const previousAvatarUrl = avatarUrl || null;
     const result = await upload.upload(pendingFile);
     if (result.url) {
+      // Session display guarantee: hold the LOCAL bytes of the file we just
+      // uploaded so every avatar consumer renders the new picture instantly
+      // under the new URL — the brand-new URL's first network fetch can
+      // never turn this session's avatar into a placeholder again.
+      void registerAvatarOverrideFromFile(result.url, pendingFile);
       // Persist FIRST (Settings-card contract): the database must point at
       // the NEW blob before the replaced upload is deleted — deleting before
       // activation would leave the stored avatarUrl targeting a deleted file

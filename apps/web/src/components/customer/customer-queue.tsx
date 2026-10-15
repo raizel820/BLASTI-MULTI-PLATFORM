@@ -417,13 +417,37 @@ export function CustomerQueue() {
     unsubscribers.push(realtime.onQueueResumed(handleQueueEvent));
     unsubscribers.push(realtime.onQueuePositionChanged(handleQueueEvent));
 
-    unsubscribers.push(realtime.onTurnApproaching(() => {
+    unsubscribers.push(realtime.onTurnApproaching((event: unknown) => {
       fetchReservations();
       toast.info(t('turnApproachingNotif'), {
         description: t('turnApproachingNotifDesc'),
         duration: 6000,
         icon: <Clock className="h-4 w-4 text-amber-500" />,
       });
+      // Field report: "cooling turn notification is no longer showing in lock
+      // screen" — the approaching alert was an in-app toast ONLY. Fire the
+      // SAME dedicated native lock-screen notification the turn-call uses
+      // (high-importance PUBLIC channel, Stop action button + swipe-to-stop
+      // via the dismiss receiver), gated by the turn_approaching preference.
+      const data = (event as { data?: Record<string, unknown> })?.data
+        ?? (event as Record<string, unknown> | null);
+      const ticket = (data?.ticketNumber as string) || (data?.displayNumber as string) || '';
+      const agency = (data?.agencyName as string) || '';
+      const ahead = typeof data?.peopleAhead === 'number' ? data.peopleAhead : null;
+      const body =
+        `Ticket ${ticket || '---'}${agency ? ` at ${agency}` : ''}` +
+        (ahead === null ? '' : ahead === 0 ? ' — You are next!' : ` — ~${ahead} ahead of you`);
+      import('@/lib/notification-channel')
+        .then(({ scheduleTurnNotification }) =>
+          scheduleTurnNotification(
+            'دورك يقترب! / Your Turn is Approaching!',
+            body,
+            ticket,
+            undefined,
+            'approaching',
+          ),
+        )
+        .catch(() => { /* notification must never break the queue view */ });
     }));
 
     unsubscribers.push(realtime.onYourTurn(() => {

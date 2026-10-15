@@ -6,7 +6,7 @@ import { useLanguage } from '@/hooks/use-language';
 import { toast } from 'sonner';
 import type { Language } from '@/i18n';
 import { updateDocumentDirection } from '@/store/use-app-store';
-import { mergeSessionUser } from '@/lib/user-store-refresh';
+import { mergeSessionUser, markLocalAvatarMutation } from '@/lib/user-store-refresh';
 import { mirrorNotifPrefs } from '@/lib/notification-channel';
 import type {
   NotifPrefs,
@@ -267,6 +267,7 @@ export function useProfileData() {
       });
       const data = await res.json().catch(() => null);
       if (res.ok && data) {
+        markLocalAvatarMutation(); // shield the fresh avatar from the refresher
         setAvatarUrl(data.avatarUrl ?? url);
         // Refresh the session user so the header/avatar reflect the change.
         setUser({ ...user, avatarUrl: data.avatarUrl ?? url });

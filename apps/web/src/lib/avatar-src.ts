@@ -95,8 +95,12 @@ function mimeFromUrl(url: string): string {
  * CapacitorHttp with responseType 'arraybuffer' answers with a base64
  * payload on Android — decode-free (we embed it straight into the data URL).
  * Returns null on ANY failure so callers keep their fallback path.
+ *
+ * Exported for the upload-confirm flows: they use it to (a) natively VERIFY
+ * that a freshly-uploaded file is actually reachable before trusting it and
+ * (b) reuse the fetched bytes as the session avatar override.
  */
-async function nativeImageDataUrl(url: string): Promise<string | null> {
+export async function nativeImageDataUrl(url: string): Promise<string | null> {
   const http = nativeHttpPlugin();
   if (!http?.get) return null;
   try {

@@ -31,7 +31,7 @@ import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
-import { getProxiedUrl } from '@/lib/utils';
+import { UserAvatar } from '@/components/shared/user-avatar';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -964,7 +964,13 @@ export function CustomerHome() {
           aria-label={t('profile')}
         >
           {user?.avatarUrl ? (
-            <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName ?? ''} width={40} height={40} className="h-full w-full object-cover" />
+            // UserAvatar (NOT a raw <img>): the home header is the FIRST thing
+            // a mobile customer sees — a raw src here had NO error recovery,
+            // so the freshly-uploaded avatar went placeholder for good the
+            // moment its one network request failed. UserAvatar brings the
+            // retry + native-fallback pipeline AND the session upload
+            // override, so the new picture shows instantly and can't regress.
+            <UserAvatar avatarUrl={user.avatarUrl} fullName={user.fullName} />
           ) : (
             <span className="text-sm font-bold text-white">{firstName.charAt(0).toUpperCase() || 'U'}</span>
           )}

@@ -1,6 +1,6 @@
 {
   "name": "@blasti/api",
-  "version": "0.5.95",
+  "version": "0.5.97",
   "private": true,
   "main": "src/index.ts",
   "scripts": {

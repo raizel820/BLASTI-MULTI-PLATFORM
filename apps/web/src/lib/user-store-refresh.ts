@@ -63,6 +63,33 @@ let lastRefreshAt = 0;
 let inFlight: Promise<void> | null = null;
 
 /**
+ * Timestamp of the last LOCAL avatar activation (upload confirm / profile
+ * save). Guards the refresher from CLOBBERING a brand-new avatar with the
+ * server's slightly-stale answer: a refresh request that STARTED before the
+ * local mutation (or lands right after it on a slow network) read the OLD
+ * row, and blindly merging it used to overwrite the fresh avatarUrl — the
+ * freshly-uploaded picture vanished back to the previous/placeholder state
+ * seconds after a successful upload.
+ */
+let lastLocalAvatarMutationAt = 0;
+
+/** Suppress window: server answers older than this NEVER clobber. */
+const AVATAR_MUTATION_SUPPRESS_MS = 15_000;
+
+/** Call from every flow that just applied a new avatarUrl locally. */
+export function markLocalAvatarMutation(): void {
+  lastLocalAvatarMutationAt = Date.now();
+}
+
+function avatarMutationGuardsRefresh(requestStartedAt: number): boolean {
+  if (lastLocalAvatarMutationAt === 0) return false;
+  // The request started before the local mutation → its answer is stale.
+  if (requestStartedAt < lastLocalAvatarMutationAt) return true;
+  // Landed within the suppress window → server may not have settled yet.
+  return Date.now() - lastLocalAvatarMutationAt < AVATAR_MUTATION_SUPPRESS_MS;
+}
+
+/**
  * Fetch the logged-in user's profile from the authoritative API and gently
  * merge the fresh values into the persisted store. Safe to call from
  * anywhere; concurrent calls coalesce into one network request.
@@ -74,6 +101,7 @@ export async function refreshSessionUser(): Promise<void> {
 
   if (inFlight) return inFlight;
   inFlight = (async () => {
+    const requestStartedAt = Date.now();
     try {
       const res = await apiFetch(`/api/user/profile?userId=${encodeURIComponent(user.id)}`);
       if (!res.ok) return; // 401 → session-heal owns auth repair; silent here
@@ -92,7 +120,16 @@ export async function refreshSessionUser(): Promise<void> {
         if (field === 'freeSmsCount') {
           if (typeof value === 'number' && Number.isFinite(value)) merged[field] = value;
         } else if (field === 'avatarUrl') {
-          merged[field] = typeof value === 'string' && value ? value : undefined;
+          // Guard: a local activation (upload/save) always beats this
+          // request's snapshot of the row — see markLocalAvatarMutation.
+          if (avatarMutationGuardsRefresh(requestStartedAt)) {
+            // Keep the local value untouched for this merge.
+          } else {
+            // Adopt only well-typed values; DB truth wins (a null avatarUrl
+            // means the avatar was removed server-side and MUST clear
+            // locally).
+            merged[field] = typeof value === 'string' && value ? value : undefined;
+          }
         } else if (typeof value === 'string' && value) {
           merged[field] = value;
         }

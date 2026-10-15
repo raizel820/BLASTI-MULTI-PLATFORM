@@ -73,6 +73,17 @@ export function turnCallAlertsEnabled(): boolean {
   return readNotifPrefs().queue_called !== false;
 }
 
+/**
+ * True when the user ALLOWED turn-approaching ("cooling turn") alerts
+ * (notification preference turn_approaching !== false). Default true.
+ * Field report: the approaching alert had NO lock-screen presence at all —
+ * it was an in-app toast only. Gated by the SAME per-channel preference
+ * card the settings page already exposes for it.
+ */
+export function turnApproachingAlertsEnabled(): boolean {
+  return readNotifPrefs().turn_approaching !== false;
+}
+
 interface NotificationChannelConfig {
   id: string;
   name: string;
@@ -276,11 +287,22 @@ export async function showLockscreenNotification(
   }
 }
 
-export async function scheduleTurnNotification(title: string, body: string, ticketNumber: string, stopLabel?: string): Promise<void> {
+/** Which alert family is firing — each gated by its own user preference. */
+export type TurnAlertKind = 'called' | 'approaching';
+
+export async function scheduleTurnNotification(
+  title: string,
+  body: string,
+  ticketNumber: string,
+  stopLabel?: string,
+  kind: TurnAlertKind = 'called',
+): Promise<void> {
   // ── Preference gate (report: "no way to stop the lock screen notification
   // when agency calls") — queue_called=false silences EVERYTHING here:
   // native lock-screen alert, Capacitor local notification, web Notification.
-  if (!turnCallAlertsEnabled()) return;
+  // The approaching ("cooling turn") alert is gated by its own card
+  // (turn_approaching) so users can mute it without muting the call alert.
+  if (kind === 'approaching' ? !turnApproachingAlertsEnabled() : !turnCallAlertsEnabled()) return;
 
   // Channels MUST exist before anything posts. Idempotent — also covers
   // builds where the native boot hook could not run (the FCM background path

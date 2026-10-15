@@ -14,6 +14,8 @@
  *  - Logout: store logout() + success toast
  */
 import { apiFetch } from '@/lib/api-fetch';
+import { registerAvatarOverrideFromFile } from '@/lib/avatar-override';
+import { markLocalAvatarMutation } from '@/lib/user-store-refresh';
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 import { useState, useEffect } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -337,6 +339,12 @@ export function CustomerSettings() {
       if (res.ok) {
         const data = await res.json();
         toast.success(t('success'));
+        // Session display guarantee: register the LOCAL bytes of the picked
+        // file under the new URL so the new avatar renders instantly and a
+        // failed first fetch of the brand-new URL can never regress this
+        // session's avatar to a placeholder (mobile field report).
+        void registerAvatarOverrideFromFile(data.url, pendingAvatarFile);
+        markLocalAvatarMutation(); // shield the fresh avatar from the refresher
         if (user) setUser({ ...user, avatarUrl: data.url });
         // Persist avatarUrl to the database
         try {

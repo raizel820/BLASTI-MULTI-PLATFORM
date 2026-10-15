@@ -20,6 +20,7 @@
  */
 
 import { useAvatarSrc } from '@/lib/avatar-src';
+import { useSessionAvatarOverride } from '@/lib/avatar-override';
 
 /** First-name + last-name initials, matching the previous inline helpers. */
 export function initialsOf(fullName?: string | null): string {
@@ -43,8 +44,13 @@ export function UserAvatar({
   size?: number;
 }) {
   const { src, handleError } = useAvatarSrc(avatarUrl);
+  // Session override: right after an upload, the LOCAL bytes of the picked
+  // file render instantly under the new avatarUrl — no network request that
+  // could fail (mobile "placeholder after upload" report).
+  const override = useSessionAvatarOverride(avatarUrl);
+  const effectiveSrc = override ?? src;
 
-  if (!src) {
+  if (!effectiveSrc) {
     return <>{initialsOf(fullName)}</>;
   }
 
@@ -52,13 +58,13 @@ export function UserAvatar({
     // key={src} — a retry/override produces a fresh <img> element so the
     // browser genuinely re-requests instead of replaying a cached failure.
     <img
-      key={src}
-      src={src}
+      key={effectiveSrc}
+      src={effectiveSrc}
       alt={fullName || 'Avatar'}
       width={size}
       height={size}
       className={className}
-      onError={handleError}
+      onError={override ? undefined : handleError}
     />
   );
 }
