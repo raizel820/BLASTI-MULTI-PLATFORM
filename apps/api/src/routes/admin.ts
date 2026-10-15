@@ -1477,6 +1477,15 @@ app.get('/analytics/payments', async (c) => {
       select: { amount: true, amountPaid: true, priceSnapshot: true, currencySnapshot: true, status: true, paymentMethod: true, paymentProvider: true, createdAt: true },
     })
 
+    // ── ALL-transactions revenue mandate (field report: revenue analytics
+    // showed subscription payments only) — SMS pack purchases are REAL
+    // revenue and must ride the same KPIs, method breakdown and trend
+    // buckets. SmsPurchase settles at APPROVED (no COMPLETED status).
+    const smsRows = await db.smsPurchase.findMany({
+      where: { createdAt: { gte: start, lte: end } },
+      select: { price: true, quantity: true, status: true, paymentMethod: true, paymentProvider: true, createdAt: true },
+    })
+
     const paidOf = (r: { amount: number; amountPaid: number | null; priceSnapshot: number | null }) => r.amountPaid ?? r.priceSnapshot ?? r.amount
     const byStatus: Record<string, { count: number; value: number }> = {}
     const byMethod: Record<string, { count: number; value: number }> = {}
@@ -1485,17 +1494,37 @@ app.get('/analytics/payments', async (c) => {
     let totalRevenue = 0
     let currency: string | null = null
 
-    for (const r of rows) {
-      const value = paidOf(r)
-      if (!currency && r.currencySnapshot) currency = r.currencySnapshot
+    // Unified iteration shape — subscription rows + SMS purchase rows feed
+    // the exact same accumulators.
+    type RevRow = { value: number; status: string; method: string; currency?: string | null; createdAt: Date }
+    const unified: RevRow[] = [
+      ...rows.map((r) => ({
+        value: paidOf(r),
+        status: r.status,
+        method: r.paymentMethod,
+        currency: r.currencySnapshot,
+        createdAt: r.createdAt,
+      })),
+      ...smsRows.map((r) => ({
+        value: r.price,
+        status: r.status,
+        method: r.paymentMethod ?? r.paymentProvider,
+        createdAt: r.createdAt,
+      })),
+    ]
+
+    for (const r of unified) {
+      const value = r.value
+      if (!currency && r.currency) currency = r.currency
       const s = (byStatus[r.status] ??= { count: 0, value: 0 })
       s.count++
-      const m = (byMethod[r.paymentMethod] ??= { count: 0, value: 0 })
+      const m = (byMethod[r.method] ??= { count: 0, value: 0 })
       m.count++
       // Revenue counts BOTH settled statuses: manual approvals write APPROVED,
-      // Chargily settlement writes COMPLETED. Gating on APPROVED alone made
-      // Chargily-paid transactions show in the count but add 0 to revenue.
-      if ((SETTLED_TRANSACTION_STATUSES as readonly string[]).includes(r.status)) {
+      // Chargily settlement writes COMPLETED (transactions) / APPROVED (SMS
+      // packs). Gating on APPROVED alone made Chargily-paid rows show in the
+      // count but add 0 to revenue.
+      if ((SETTLED_TRANSACTION_STATUSES as readonly string[]).includes(r.status) || r.status === 'APPROVED') {
         s.value += value
         m.value += value
         totalRevenue += value
@@ -1507,13 +1536,13 @@ app.get('/analytics/payments', async (c) => {
       }
     }
 
-    const approvedCount = SETTLED_TRANSACTION_STATUSES.reduce((n, s) => n + (byStatus[s]?.count ?? 0), 0)
+    const approvedCount = unified.filter((r) => (SETTLED_TRANSACTION_STATUSES as readonly string[]).includes(r.status) || r.status === 'APPROVED').length
     return c.json({
       success: true,
       data: {
         resolved: resolvedWindowPayload(pq.range),
         totals: {
-          transactionsInPeriod: rows.length,
+          transactionsInPeriod: unified.length,
           successfulPayments: approvedCount,
           pendingPayments: byStatus.PENDING?.count ?? 0,
           rejectedPayments: byStatus.REJECTED?.count ?? 0,
@@ -3248,6 +3277,7 @@ app.get('/stats', async (c) => {
       pendingTransactions,
       totalUsers,
       totalReservations,
+      smsPurchaseRevenue,
     ] = await Promise.all([
       // Total agencies
       db.agency.count({
@@ -3282,6 +3312,13 @@ app.get('/stats', async (c) => {
 
       // Total reservations
       db.reservation.count(),
+
+      // ALL-transactions mandate — SMS pack purchases are revenue too.
+      // APPROVED is the settled status for SmsPurchase (Chargily + manual).
+      db.smsPurchase.aggregate({
+        where: { status: 'APPROVED' },
+        _sum: { price: true },
+      }),
     ])
 
     // Get recent reservations for today
@@ -3307,7 +3344,10 @@ app.get('/stats', async (c) => {
         totalAgencies,
         activeQueues,
         todayReservations,
-        totalRevenue: totalRevenue._sum.amount || 0,
+        // ALL-transactions mandate — settled subscription revenue + settled
+        // SMS pack revenue (APPROVED purchases), so the admin tile matches
+        // the revenue analytics (which include both).
+        totalRevenue: (totalRevenue._sum.amount || 0) + (smsPurchaseRevenue._sum.price || 0),
         pendingTransactions,
         totalUsers,
         totalReservations,

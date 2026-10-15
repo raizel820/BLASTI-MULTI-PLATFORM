@@ -78,6 +78,19 @@ let initPromise: Promise<void> | null = null;
  */
 async function uploadPushToken(token: string, platform: string): Promise<void> {
   try {
+    // Signed-out devices skip the upload: the API answers 401 and the diag
+    // log filled with "Authentication required" noise on every cold start of
+    // a logged-out install (Oct 2026 field dump). The token is intentionally
+    // NOT remembered here, so the next registration event (resume →
+    // registerIfPermitted → register()) retries the upload once signed in.
+    try {
+      const { useAppStore } = await import('@/store/use-app-store');
+      if (!useAppStore.getState().isAuthenticated) {
+        console.log('[PushRegistration] Signed out — deferring FCM token upload');
+        return;
+      }
+    } catch { /* store chunk unavailable — keep the legacy attempt-upload path */ }
+
     const last = localStorage.getItem(PUSH_TOKEN_LAST_KEY);
     if (last === token) {
       console.log('[PushRegistration] Token unchanged — skipping upload');

@@ -40,12 +40,20 @@
  *    root view show a non-blocking "press back again to exit" confirm that
  *    calls App.exitApp(). No-op on plain browsers / Electron (Capacitor
  *    absent) — see lib/native-back-handler.ts for the full policy.
+ *
+ * 5. SESSION-USER STORE REFRESH (profile-image cross-device sync)
+ *    The persisted zustand user was only refreshed at login — an avatar
+ *    uploaded on another device never reached this shell's header/sidebar
+ *    ("profile image works only in the customer webapp"). A gentle
+ *    boot + focus-time refresher (lib/user-store-refresh.ts) now merges the
+ *    authoritative profile into the store WITHOUT touching navigation.
  */
 
 import { useEffect } from 'react';
 import { initMobilePushRegistration } from '@/lib/push-registration';
 import { initNativeBackHandler } from '@/lib/native-back-handler';
 import { startDeviceReporting } from '@/lib/device-report';
+import { startUserStoreRefresh } from '@/lib/user-store-refresh';
 import { PaymentRealtimeToasts } from '@/lib/payment-realtime';
 
 const CHUNK_RELOAD_KEY = 'blasti-chunk-reload-at';
@@ -76,7 +84,27 @@ export function ClientBootHardening() {
     // the cloud (stable fingerprint survives reinstalls → one device counts
     // exactly once) and heartbeats on every resume so the admin Devices tab
     // shows REAL active-device numbers. Fire-and-forget, silent failures.
-    const stopDeviceReporting = startDeviceReporting();
+    // Defense in depth: startDeviceReporting() runs SYNCHRONOUSLY in this
+    // effect — a throw here (unexpected native-bridge shape) takes the whole
+    // boot tree down to the RootRecoveryBoundary, so it must never escape.
+    let stopDeviceReporting: (() => void) | undefined;
+    try {
+      stopDeviceReporting = startDeviceReporting();
+    } catch (error) {
+      console.warn('[BootHardening] Device reporting failed:', error);
+    }
+
+    // ── 0d. Session-user store refresh (all shells; no-op when signed out) ─
+    // Boot + focus-time merge of the authoritative profile into the persisted
+    // store — this is what makes an avatar uploaded on device A visible on
+    // device B (phone/desktop share the account). Fire-and-forget; the helper
+    // is internally guarded, but the boot contract says nothing here may throw.
+    let stopUserRefresh: (() => void) | undefined;
+    try {
+      stopUserRefresh = startUserStoreRefresh();
+    } catch (error) {
+      console.warn('[BootHardening] User store refresh failed:', error);
+    }
 
     // ── 1. Legacy service worker cleanup ──────────────────────────────────
     (async () => {
@@ -149,6 +177,7 @@ export function ClientBootHardening() {
       window.removeEventListener('unhandledrejection', onUnhandledRejection);
       window.removeEventListener('error', onErrorEvent);
       if (stopDeviceReporting) stopDeviceReporting();
+      if (stopUserRefresh) stopUserRefresh();
     };
   }, []);
 

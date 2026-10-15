@@ -1,12 +1,15 @@
 'use client'
 
 import React from 'react'
-import { AlertTriangle, RefreshCw, Home } from 'lucide-react'
+import { AlertTriangle, RefreshCw, Home, ClipboardCopy } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { useLanguage } from '@/hooks/use-language'
+import { toast } from 'sonner'
 // Side-effect import: installs the global uncaught-error reporter in the
 // browser (window error + unhandledrejection → console + Electron terminal).
 import { reportCaughtError } from '@/lib/error-reporter'
+import { diagDump } from '@/lib/diag-log'
+import { getAppVersion } from '@/lib/app-version'
 
 interface ErrorBoundaryProps {
   children: React.ReactNode
@@ -21,6 +24,34 @@ interface ErrorBoundaryState {
 // Separate display component to use hooks inside class boundary
 function ErrorBoundaryFallback({ onReset, onGoHome, errorMessage }: { onReset: () => void; onGoHome: () => void; errorMessage?: string }) {
   const { t } = useLanguage()
+  const [version, setVersion] = React.useState<string | null>(null)
+
+  // The REAL installed version (native versionName inside the shell, null on
+  // web) — a user reporting "this page could not load" must be able to say
+  // WHICH build showed it.
+  React.useEffect(() => {
+    let alive = true
+    getAppVersion().then((v) => { if (alive) setVersion(v) }).catch(() => {})
+    return () => { alive = false }
+  }, [])
+
+  const copyReport = React.useCallback(async () => {
+    const lines = [
+      '— BLASTI تقرير خطأ —',
+      `الخطأ: ${errorMessage || 'غير معروف'}`,
+      `الإصدار: ${version || 'غير معروف'}`,
+      `الصفحة: ${typeof window !== 'undefined' ? (window.location.hash || '/') : '/'}`,
+      '— آخر الأحداث —',
+      diagDump('error-boundary'),
+    ]
+    const report = lines.join('\n')
+    try {
+      await navigator.clipboard.writeText(report)
+      toast.success(t('diagCopied'))
+    } catch {
+      toast.error(t('diagCopyFailed'))
+    }
+  }, [errorMessage, version, t])
 
   return (
     <div className="flex items-center justify-center min-h-[60vh] p-6">
@@ -40,12 +71,8 @@ function ErrorBoundaryFallback({ onReset, onGoHome, errorMessage }: { onReset: (
           <p className="text-sm text-muted-foreground leading-relaxed">
             {t('errorLoadingData')}
           </p>
-          {errorMessage && process.env.NODE_ENV === 'development' && (
-            <div className="mt-3 p-3 rounded-lg bg-red-50 dark:bg-red-900/10 border border-red-200 dark:border-red-800/30 text-start">
-              <p className="text-xs font-mono text-red-600 dark:text-red-400 break-all">
-                {errorMessage}
-              </p>
-            </div>
+          {version && (
+            <p className="text-xs font-mono text-muted-foreground" dir="ltr">v{version}</p>
           )}
         </div>
 
@@ -65,6 +92,14 @@ function ErrorBoundaryFallback({ onReset, onGoHome, errorMessage }: { onReset: (
           >
             <Home className="h-4 w-4" />
             {t('home')}
+          </Button>
+          <Button
+            variant="ghost"
+            onClick={() => void copyReport()}
+            className="min-h-[44px] gap-2 text-muted-foreground"
+          >
+            <ClipboardCopy className="h-4 w-4" />
+            {t('diagCopyReport')}
           </Button>
         </div>
       </div>

@@ -17,9 +17,21 @@
             android:label="@string/title_activity_main"
             android:theme="@style/AppTheme.NoActionBarLaunch"
             android:launchMode="singleTask"
-            android:exported="true"
-            android:showWhenLocked="true"
-            android:turnScreenOn="true">
+            android:exported="true">
+            <!-- NOTE: android:showWhenLocked / android:turnScreenOn were
+                 REMOVED on purpose (field report: "the whole mobile app still
+                 shows on the lock screen"). With the static attrs present,
+                 ANY foregrounding of the activity — tapping the turn-alert
+                 notification on the lock screen, a full-screen intent, a deep
+                 link — painted the ENTIRE app over the keyguard. Now the app
+                 can never appear above the lock screen; only the system
+                 NOTIFICATION does (IMPORTANCE_HIGH + VISIBILITY_PUBLIC on the
+                 blasti-lockscreen / blasti-turn-alert channels). The opt-in
+                 "full-screen call takeover" preference is applied at runtime
+                 by MainActivity → BlastiNativeStatus.applyLaunchPreferences()
+                 (setShowWhenLocked/setTurnScreenOn, default false) so the
+                 legacy behavior remains available ONLY when explicitly enabled
+                 in Settings → Notifications. -->
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -45,6 +57,14 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths"></meta-data>
         </provider>
+
+        <!-- Swipe-to-stop / "Stop" action receiver for the lock-screen turn
+             notification. Not exported — only the app's own PendingIntents can
+             reach it. Records the dismissal + cancels vibration so the web
+             layer can drop the pending in-app replay on resume. -->
+        <receiver
+            android:name=".BlastiNotificationDismissReceiver"
+            android:exported="false" />
     </application>
 
     <!-- Permissions -->

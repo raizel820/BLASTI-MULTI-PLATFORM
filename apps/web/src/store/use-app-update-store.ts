@@ -124,6 +124,8 @@ interface CapacitorGlobal {
       status?: string; percent?: number; bytesSoFar?: number; totalBytes?: number; localUri?: string;
     }>;
     installUpdate?: (opts: { downloadId?: number; filePath?: string }) => Promise<{ ok?: boolean }>;
+    /** Open the system "Install unknown apps" grant screen (newer builds). */
+    openInstallPermissionSettings?: () => Promise<{ ok?: boolean; canInstall?: boolean }>;
   }>;
 }
 
@@ -145,6 +147,15 @@ export interface AppUpdateState {
   check: (trigger: 'startup' | 'sync' | 'manual' | 'resume' | 'push') => Promise<boolean>;
   startDownload: () => Promise<void>;
   install: () => Promise<void>;
+  /**
+   * Android honesty gate: after the package installer closes, compare the
+   * native versionName against the one recorded when install() handed the
+   * APK to the OS. 'updated' → the install really happened; 'not-installed'
+   * → Android silently refused it (signature mismatch is the classic case)
+   * and the user must be TOLD (uninstall + reinstall once) instead of the
+   * app claiming success. Null when no install is pending / not Android.
+   */
+  resolvePendingInstall: () => Promise<'updated' | 'not-installed' | null>;
   postpone: () => void;
   requestDialog: () => void;
   closeDialog: () => void;
@@ -272,6 +283,29 @@ function startAndroidPolling(downloadId: number) {
 let storeInstance: ReturnType<typeof createAppUpdateStore> | null = null;
 function getStore() {
   return storeInstance as unknown as { setState: (partial: Partial<AppUpdateState>) => void };
+}
+
+// ─── Android install honesty gate ─────────────────────────────────────────
+
+/**
+ * The native versionName captured when install() handed the APK to the
+ * package installer. The installer UI is asynchronous and FIRE-AND-FORGET
+ * from the app's perspective — installUpdate() resolving ok:true only means
+ * "the installer opened", NOT "the update installed". When Android refuses
+ * the APK (signature mismatch is the classic case — an APK built by a
+ * different keystore than the installed build), it silently shows "App not
+ * installed" and the old version stays. Comparing the version on the next
+ * resume is the only truthful signal the web layer can get.
+ */
+let pendingInstallFromVersion: string | null = null;
+
+async function readNativeVersion(): Promise<string | null> {
+  try {
+    const res = await plugin()?.getAppInfo?.();
+    return res?.versionName?.trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Store ───────────────────────────────────────────────────────────────────
@@ -407,12 +441,51 @@ function createAppUpdateStore() {
           await electronAPI()?.installUpdate?.();
           // The main process quits and runs the NSIS installer.
         } else {
+          // Record the CURRENT native version BEFORE the installer opens —
+          // the resume comparison in resolvePendingInstall() needs it to tell
+          // "installed for real" from "Android silently refused".
+          if (!pendingInstallFromVersion) {
+            pendingInstallFromVersion = await readNativeVersion();
+          }
           await plugin()?.installUpdate?.({});
-          // Android: the package installer opens over our activity.
+          // Android: the package installer opens over our activity. It is
+          // asynchronous — ok:true only means the installer UI opened, so
+          // drop back to 'downloaded' (NOT a success claim). The resume
+          // listener decides the real outcome via resolvePendingInstall().
+          set({ status: 'downloaded' });
         }
-      } catch {
+      } catch (err) {
+        pendingInstallFromVersion = null;
         set({ status: 'downloaded', needsInstallPermission: true });
+        // Report #3: "the app does not open the dialog so I can grant it the
+        // authority to install apps". New native builds open the grant screen
+        // THEMSELVES before rejecting (their message carries the marker
+        // below) — for older builds, drive the user there from here.
+        const msg = err instanceof Error ? err.message : String(err ?? '');
+        if (!msg.includes('settings screen opened')) {
+          try {
+            await plugin()?.openInstallPermissionSettings?.();
+          } catch { /* older build without the method — the store flag still guides the UI */ }
+        }
       }
+    },
+
+    resolvePendingInstall: async () => {
+      if (currentShell() !== 'capacitor') return null;
+      const from = pendingInstallFromVersion;
+      pendingInstallFromVersion = null;
+      if (!from) return null;
+      const nowVersion = await readNativeVersion();
+      if (nowVersion && nowVersion !== from) {
+        // The install really happened — clear the update state so the dialog
+        // never re-opens for the already-installed version.
+        set({ status: 'idle', info: null, progress: null, error: null });
+        return 'updated';
+      }
+      // Android refused the APK (signature mismatch / cancelled / corrupt
+      // download). Keep the update available and let the UI tell the user
+      // the ONE-TIME fix: uninstall + reinstall.
+      return 'not-installed';
     },
 
     postpone: () => {

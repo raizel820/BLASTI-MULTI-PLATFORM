@@ -38,6 +38,7 @@ import { motion } from 'framer-motion';
 import { humanizeEnum } from '@/lib/enum-i18n';
 import { toast } from 'sonner';
 import { useDebounce } from '@/hooks/use-debounce';
+import { UserAvatar } from '@/components/shared/user-avatar';
 
 interface UserItem {
   id: string;
@@ -49,6 +50,7 @@ interface UserItem {
   createdAt: string;
   phoneNumber?: string;
   agencyName?: string;
+  avatarUrl?: string | null;
 }
 
 const roleFilters = [
@@ -364,16 +366,24 @@ export function AdminUsers() {
                 <CardContent className="p-4">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                      <div className={`h-11 w-11 rounded-full flex items-center justify-center shadow-sm ${
+                      <div className={`h-11 w-11 rounded-full flex items-center justify-center shadow-sm overflow-hidden ${
                         user.isActive
                           ? 'bg-gradient-to-br from-emerald-200 to-emerald-300 dark:from-emerald-900/40 dark:to-emerald-800/40'
                           : 'bg-gradient-to-br from-red-200 to-red-300 dark:from-red-900/40 dark:to-red-800/40'
                       }`}>
-                        <UserCircle className={`h-6 w-6 ${
-                          user.isActive
-                            ? 'text-emerald-600 dark:text-emerald-400'
-                            : 'text-red-600 dark:text-red-400'
-                        }`} />
+                        {user.avatarUrl ? (
+                          <UserAvatar
+                            avatarUrl={user.avatarUrl}
+                            fullName={user.fullName}
+                            size={44}
+                          />
+                        ) : (
+                          <UserCircle className={`h-6 w-6 ${
+                            user.isActive
+                              ? 'text-emerald-600 dark:text-emerald-400'
+                              : 'text-red-600 dark:text-red-400'
+                          }`} />
+                        )}
                       </div>
                       <div className="min-w-0">
                         <p className="text-sm font-semibold text-foreground truncate">
@@ -487,6 +497,20 @@ export function AdminUsers() {
                       className="mt-3 pt-3 border-t border-border"
                     >
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        {/* Profile image (cross-account visibility — Task: avatar everywhere) */}
+                        <div className="flex items-center gap-2 sm:col-span-2">
+                          <div className="h-12 w-12 rounded-full overflow-hidden bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center text-emerald-700 dark:text-emerald-400 text-sm font-bold ring-2 ring-emerald-200/60 dark:ring-emerald-800/60 shrink-0">
+                            <UserAvatar
+                              avatarUrl={user.avatarUrl}
+                              fullName={user.fullName}
+                              size={48}
+                            />
+                          </div>
+                          <div>
+                            <p className="text-[10px] text-muted-foreground uppercase tracking-wider">{t('profileImage')}</p>
+                            <p className="text-sm font-medium text-foreground">{user.fullName}</p>
+                          </div>
+                        </div>
                         <div className="flex items-center gap-2">
                           <UserCircle className="h-4 w-4 text-muted-foreground" />
                           <div>

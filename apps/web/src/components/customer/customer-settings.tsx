@@ -69,7 +69,10 @@ import {
   Sun,
   Moon,
   Monitor,
+  LifeBuoy,
 } from 'lucide-react';
+import { MobileDiagnosticsSheet } from '@/components/shared/mobile-diagnostics-sheet';
+import { isNativeShell } from '@/lib/native-diagnostics';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
 import { useTheme } from 'next-themes';
@@ -124,6 +127,8 @@ export function CustomerSettings() {
   // Task 2-a — real app version (shell-injected Capacitor Device plugin;
   // null in plain browsers → keeps the '1.0.0' fallback in the About row).
   const [appVersion, setAppVersion] = useState<string | null>(null);
+  // Shell diagnostics (native shells only) — one tap from the About card.
+  const [diagOpen, setDiagOpen] = useState(false);
 
   useEffect(() => {
     fetchProfile();
@@ -730,6 +735,19 @@ export function CustomerSettings() {
               <p className="text-xs text-muted-foreground">{t('appVersion')}</p>
               <p className="text-sm font-medium text-foreground ms-auto" dir="ltr">{appVersion ?? '1.0.0'}</p>
             </div>
+            {isNativeShell() && (
+              <button
+                type="button"
+                onClick={() => setDiagOpen(true)}
+                className="w-full p-3.5 flex items-center gap-3 hover:bg-muted/50 transition-colors text-start min-h-[52px]"
+              >
+                <div className="h-9 w-9 rounded-xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center shrink-0">
+                  <LifeBuoy className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                </div>
+                <p className="text-xs text-muted-foreground">{t('diagOpenButton')}</p>
+                <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400 ms-auto">›</p>
+              </button>
+            )}
           </div>
         </motion.section>
 
@@ -772,6 +790,9 @@ export function CustomerSettings() {
           loading={avatarUploading}
           onConfirm={handleAvatarPreviewConfirm}
         />
+
+        {/* Shell diagnostics (native shells only; renders null elsewhere) */}
+        <MobileDiagnosticsSheet open={diagOpen} onOpenChange={setDiagOpen} />
 
         {/* Delete Account Dialog (preserved confirmation flow) */}
         <AlertDialog open={deleteOpen} onOpenChange={(open) => { setDeleteOpen(open); if (!open) setDeleteConfirmText(''); }}>

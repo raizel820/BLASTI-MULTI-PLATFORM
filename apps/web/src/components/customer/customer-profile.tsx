@@ -183,6 +183,7 @@ export function CustomerProfile() {
           onEmailChange={profile.setEmail}
           onPhoneNumberChange={profile.setPhoneNumber}
           onAvatarUrlChange={profile.setAvatarUrl}
+          onAvatarActivate={profile.activateAvatar}
           onSave={profile.handleSavePersonalInfo}
           t={t}
         />

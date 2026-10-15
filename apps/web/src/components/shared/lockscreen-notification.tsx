@@ -27,6 +27,7 @@ import { BellRing, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLanguage } from '@/hooks/use-language';
 import { onLockscreenEvent, takePendingLockscreenEvent, type LockscreenNotificationEvent } from '@/lib/lockscreen-events';
+import { wasTurnAlertDismissedNatively } from '@/lib/notification-channel';
 
 // ─── The card ─────────────────────────────────────────────────────────────────
 
@@ -127,15 +128,26 @@ export function LockscreenNotificationGate() {
   }, [show]);
 
   // App resume: surface whatever fired while the user was away (the OS
-  // already showed it on the actual lock screen — this mirrors it in-app).
+  // already showed it on the actual lock screen — this mirrors it in-app)
+  // — UNLESS the user already STOPPED it from the lock screen (native
+  // notification swipe or the "Stop" action button): replaying an alert the
+  // user explicitly dismissed would break the swipe-to-stop parity, so the
+  // pending event is dropped instead.
   useEffect(() => {
+    let cancelled = false;
     const reveal = () => {
       if (document.visibilityState !== 'visible') return;
       const pending = takePendingLockscreenEvent();
-      if (pending) show(pending, 'resume');
+      if (!pending) return;
+      void wasTurnAlertDismissedNatively(pending.at).then((dismissed) => {
+        if (cancelled) return;
+        if (dismissed) return; // user already stopped it on the lock screen
+        show(pending, 'resume');
+      });
     };
     document.addEventListener('visibilitychange', reveal);
     return () => {
+      cancelled = true;
       document.removeEventListener('visibilitychange', reveal);
       if (headsUpTimer.current) clearTimeout(headsUpTimer.current);
     };

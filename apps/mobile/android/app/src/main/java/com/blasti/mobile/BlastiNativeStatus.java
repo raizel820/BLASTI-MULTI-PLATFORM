@@ -1,6 +1,9 @@
 package com.blasti.mobile;
 
+import android.app.Activity;
 import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
 import android.util.Log;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -222,6 +225,150 @@ public class BlastiNativeStatus extends Plugin {
     }
 
     /**
+     * Mobile "this page could not load" diagnostics — Task: on-device recovery.
+     *
+     * Returns everything the in-app diagnostics sheet needs to explain the
+     * state of the shell in ONE call: the REAL installed version (versionName
+     * + versionCode straight from PackageManager — the same values the update
+     * system uses), the platform build, the WebView engine version (from the
+     * live User-Agent — a stale/old WebView explains modern-JS render
+     * failures), and whether a downloaded update APK is still pending.
+     *
+     * Every field is best-effort: a failure to read one never rejects the
+     * whole call — the sheet degrades to fewer rows instead of dying.
+     */
+    @PluginMethod
+    public void getDiagnostics(PluginCall call) {
+        JSObject result = new JSObject();
+        try {
+            android.content.pm.PackageInfo pi = getContext().getPackageManager()
+                .getPackageInfo(getContext().getPackageName(), 0);
+            result.put("versionName", pi.versionName == null ? "" : pi.versionName);
+            long code = android.os.Build.VERSION.SDK_INT >= 28
+                ? pi.getLongVersionCode()
+                : pi.versionCode;
+            result.put("versionCode", code);
+        } catch (Throwable t) {
+            Log.w(TAG, "getDiagnostics: getAppInfo failed", t);
+            result.put("versionName", "");
+            result.put("versionCode", -1);
+        }
+        try {
+            result.put("packageName", getContext().getPackageName());
+        } catch (Throwable ignored) { }
+        result.put("androidSdk", android.os.Build.VERSION.SDK_INT);
+        result.put("deviceModel", android.os.Build.MODEL == null ? "" : android.os.Build.MODEL);
+        result.put("manufacturer", android.os.Build.MANUFACTURER == null ? "" : android.os.Build.MANUFACTURER);
+        // WebView engine version straight from the live UA string — e.g.
+        // "…; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/130.0…"
+        try {
+            if (getBridge() != null && getBridge().getWebView() != null) {
+                String ua = getBridge().getWebView().getSettings().getUserAgentString();
+                result.put("userAgent", ua == null ? "" : ua);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "getDiagnostics: userAgent failed", t);
+        }
+        // Is a downloaded update APK sitting on disk right now? (the phone
+        // downloaded but did not finish installing an update)
+        try {
+            java.io.File apk = new java.io.File(
+                getContext().getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS),
+                UPDATE_APK_NAME);
+            result.put("pendingUpdateApk", apk.exists() && apk.length() > 0);
+            result.put("pendingUpdateApkBytes", apk.exists() ? apk.length() : 0);
+        } catch (Throwable ignored) {
+            result.put("pendingUpdateApk", false);
+        }
+        call.resolve(result);
+    }
+
+    /**
+     * Recovery "reset shell data" — clears EVERYTHING the WebView persisted:
+     *   • HTTP cache (WebView.clearCache) — stale asset responses,
+     *   • localStorage / IndexedDB / Web SQL (WebStorage.deleteAllData) — the
+     *     poisoned-state killer (a broken session, an old offline schema,
+     *     a dead last-good server URL from a previous build),
+     *   • cookies (CookieManager.removeAllCookies),
+     *   • Service Worker registrations + Cache Storage (the app_webview
+     *     "Service Worker" directory — no SW is registered today, but a
+     *     future build or a plugin could register one; clearing keeps the
+     *     reset honest),
+     *   • the pending update APK (blasti-update.apk) so a corrupted download
+     *     is never retried.
+     *
+     * Called from the in-app diagnostics sheet's "reset app data" action
+     * (with a confirm dialog) when the shell cannot heal itself. The web
+     * layer reloads after this resolves.
+     */
+    @PluginMethod
+    public void clearWebviewData(PluginCall call) {
+        int cleared = 0;
+        // 1. HTTP cache
+        try {
+            if (getBridge() != null && getBridge().getWebView() != null) {
+                getBridge().getWebView().clearCache(true);
+                cleared++;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "clearWebviewData: clearCache failed", t);
+        }
+        // 2. localStorage / IndexedDB / Web SQL
+        try {
+            android.webkit.WebStorage.getInstance().deleteAllData();
+            cleared++;
+        } catch (Throwable t) {
+            Log.w(TAG, "clearWebviewData: WebStorage failed", t);
+        }
+        // 3. Cookies
+        try {
+            android.webkit.CookieManager.getInstance().removeAllCookies(null);
+            android.webkit.CookieManager.getInstance().flush();
+            cleared++;
+        } catch (Throwable t) {
+            Log.w(TAG, "clearWebviewData: cookies failed", t);
+        }
+        // 4. Service Worker registrations + Cache Storage (best-effort dir wipe)
+        try {
+            java.io.File swDir = new java.io.File(
+                getContext().getCacheDir().getParentFile(), "app_webview/Service Worker");
+            if (!swDir.exists()) {
+                // Some WebView versions use a different profile root layout.
+                swDir = new java.io.File(getContext().getDataDir(), "app_webview/Service Worker");
+            }
+            deleteRecursively(swDir);
+            cleared++;
+        } catch (Throwable t) {
+            Log.w(TAG, "clearWebviewData: SW dir failed", t);
+        }
+        // 5. The downloaded update APK (a corrupted/partial download must not
+        //    be re-offered by the next update check)
+        try {
+            java.io.File apk = new java.io.File(
+                getContext().getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS),
+                UPDATE_APK_NAME);
+            if (apk.exists()) apk.delete();
+        } catch (Throwable ignored) { }
+        JSObject result = new JSObject();
+        result.put("ok", true);
+        result.put("clearedSteps", cleared);
+        call.resolve(result);
+    }
+
+    /** Depth-bounded recursive delete used by clearWebviewData (SW directory). */
+    private static void deleteRecursively(java.io.File file) {
+        if (file == null || !file.exists()) return;
+        java.io.File[] children = file.listFiles();
+        if (children != null) {
+            for (java.io.File child : children) {
+                deleteRecursively(child);
+            }
+        }
+        //noinspection ResultOfMethodCallIgnored
+        file.delete();
+    }
+
+    /**
      * Connection classification for "auto-download only on Wi-Fi":
      * { connectionType: wifi|cellular|ethernet|vpn|none|unknown,
      *   isWifi, isUnmetered } — ACCESS_NETWORK_STATE is already granted.
@@ -430,6 +577,31 @@ public class BlastiNativeStatus extends Plugin {
             }
             android.net.Uri apkUri = androidx.core.content.FileProvider.getUriForFile(
                 getContext(), getContext().getPackageName() + ".fileprovider", apk);
+
+            // ── PROACTIVE install-permission gate (field report: "the app does
+            // not open the dialog so I can grant it the authority to install
+            // apps"). The old flow only opened the settings screen when
+            // startActivity THREW — on modern Android (and especially MIUI /
+            // Android 14+ on Xiaomi, SDK 36 in the field) the ACTION_VIEW
+            // package-archive launch does NOT throw when
+            // REQUEST_INSTALL_PACKAGES is not granted: the system just shows
+            // nothing (or a dead installer screen) and the user is stuck on
+            // "update downloaded, awaiting install" forever. Check the
+            // permission FIRST and drive the user to the grant screen.
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                boolean canInstall = false;
+                try {
+                    android.content.pm.PackageManager pm = getContext().getPackageManager();
+                    canInstall = pm.canRequestPackageInstalls();
+                } catch (Throwable ignored) { }
+                if (!canInstall) {
+                    openInstallPermissionSettingsInternal();
+                    call.reject("needs-install-permission",
+                        "Install-from-this-source permission not granted — settings screen opened");
+                    return;
+                }
+            }
+
             android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
             intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
             intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
@@ -438,13 +610,7 @@ public class BlastiNativeStatus extends Plugin {
                 getContext().startActivity(intent);
             } catch (Throwable act) {
                 if (android.os.Build.VERSION.SDK_INT >= 26) {
-                    try {
-                        android.content.Intent settings = new android.content.Intent(
-                            android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                            android.net.Uri.parse("package:" + getContext().getPackageName()));
-                        settings.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
-                        getContext().startActivity(settings);
-                    } catch (Throwable ignored) { }
+                    openInstallPermissionSettingsInternal();
                 }
                 call.reject("needs-install-permission", act.getMessage());
                 return;
@@ -460,6 +626,50 @@ public class BlastiNativeStatus extends Plugin {
 
     // ─── Lock-screen notifications (channels + full-screen alerts) ──────────
 
+    /**
+     * Internal: open the system "Install unknown apps" grant screen for THIS
+     * app. Used by installUpdate when canRequestPackageInstalls() is false
+     * and exposed directly as a plugin method so the web layer can drive the
+     * user back here after an interrupted grant.
+     */
+    private void openInstallPermissionSettingsInternal() {
+        try {
+            android.content.Intent settings = new android.content.Intent(
+                android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                android.net.Uri.parse("package:" + getContext().getPackageName()));
+            settings.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(settings);
+        } catch (Throwable t) {
+            // Some OEM builds lack the action — fall back to the app details
+            // screen where the same toggle lives.
+            try {
+                android.content.Intent fallback = new android.content.Intent(
+                    android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    android.net.Uri.parse("package:" + getContext().getPackageName()));
+                fallback.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(fallback);
+            } catch (Throwable ignored) { }
+        }
+    }
+
+    /**
+     * Plugin method: open the system "Install unknown apps" screen for this
+     * app so the user can grant the install authority, then report the
+     * CURRENT grant state. Returns { ok, canInstall }.
+     */
+    @PluginMethod
+    public void openInstallPermissionSettings(PluginCall call) {
+        openInstallPermissionSettingsInternal();
+        JSObject result = new JSObject();
+        boolean canInstall = false;
+        try {
+            canInstall = getContext().getPackageManager().canRequestPackageInstalls();
+        } catch (Throwable ignored) { }
+        result.put("ok", true);
+        result.put("canInstall", canInstall);
+        call.resolve(result);
+    }
+
     /** Channel that surfaces ticket calls / critical alerts ON the lock screen. */
     static final String LOCKSCREEN_CHANNEL_ID = "blasti-lockscreen";
 
@@ -467,11 +677,30 @@ public class BlastiNativeStatus extends Plugin {
     static final String GENERAL_CHANNEL_ID = "blasti-general";
 
     /**
+     * Turn-alert channel — MUST exist natively because the FCM payload
+     * (apps/api/src/lib/notification-router.ts) targets exactly this id for
+     * background pushes (app closed → the web layer cannot create channels).
+     * Before this channel existed, FCM notifications fell back to the OS
+     * default "Miscellaneous" channel: low importance, no heads-up, no
+     * lock-screen content. The Capacitor LocalNotifications fallback path
+     * (notification-channel.ts BLASTI_TURN_CHANNEL) uses the same id.
+     */
+    static final String TURN_ALERT_CHANNEL_ID = "blasti-turn-alert";
+
+    /** Prefs file shared with BlastiNotificationDismissReceiver. */
+    static final String NATIVE_PREFS_FILE = "blasti-native-prefs";
+    static final String KEY_LOCKSCREEN_TAKEOVER = "lockscreenTakeover";
+
+    /**
      * Create the BLASTI notification channels exactly the way the lock-screen
      * UI needs them:
      *   • blasti-lockscreen — IMPORTANCE_HIGH (heads-up + lock screen),
      *     VISIBILITY_PUBLIC (full content readable on the lock screen),
      *     vibration + lights; used for turn-called alerts.
+     *   • blasti-turn-alert — IMPORTANCE_HIGH + PUBLIC: the channel the FCM
+     *     payload and the Capacitor LocalNotifications fallback both target
+     *     (creating it here fixes background pushes landing on the OS default
+     *     low-importance channel).
      *   • blasti-general — IMPORTANCE_DEFAULT, PRIVATE visibility.
      * Idempotent — safe to call on every app start.
      */
@@ -479,13 +708,13 @@ public class BlastiNativeStatus extends Plugin {
     public void ensureNotificationChannels(PluginCall call) {
         JSObject result = new JSObject();
         try {
-            boolean ok = ensureNotificationChannelsInternal();
+            boolean ok = ensureNotificationChannelsInternal(getContext());
             if (!ok) {
                 if (call != null) call.reject("notification-manager-unavailable");
                 return;
             }
             result.put("ok", true);
-            result.put("channels", new String[]{ LOCKSCREEN_CHANNEL_ID, GENERAL_CHANNEL_ID });
+            result.put("channels", new String[]{ LOCKSCREEN_CHANNEL_ID, TURN_ALERT_CHANNEL_ID, GENERAL_CHANNEL_ID });
             if (call != null) call.resolve(result);
         } catch (Throwable t) {
             Log.w(TAG, "ensureNotificationChannels failed", t);
@@ -495,15 +724,17 @@ public class BlastiNativeStatus extends Plugin {
 
     /**
      * Real channel setup. Returns false only when the NotificationManager is
-     * unavailable. Safe to call with no PluginCall (internal use).
+     * unavailable. Static + context-parametrized so MainActivity boot code can
+     * call it without a plugin instance.
      */
-    private boolean ensureNotificationChannelsInternal() {
+    private static boolean ensureNotificationChannelsInternal(Context context) {
+        if (context == null) return false;
         if (android.os.Build.VERSION.SDK_INT < 26) {
             // Pre-O: importance/visibility are per-notification, not per-channel.
             return true;
         }
         android.app.NotificationManager nm = (android.app.NotificationManager)
-            getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+            context.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) return false;
 
         android.app.NotificationChannel lock = new android.app.NotificationChannel(
@@ -525,6 +756,25 @@ public class BlastiNativeStatus extends Plugin {
                     .build());
         } catch (Throwable ignored) { }
 
+        android.app.NotificationChannel turn = new android.app.NotificationChannel(
+            TURN_ALERT_CHANNEL_ID,
+            "BLASTI Turn Alert",
+            android.app.NotificationManager.IMPORTANCE_HIGH);
+        turn.setDescription("Your-turn alerts (in-app fallback + push while the app is closed)");
+        // PUBLIC so FCM background pushes show full content on the lock screen.
+        turn.setLockscreenVisibility(android.app.Notification.VISIBILITY_PUBLIC);
+        turn.enableVibration(true);
+        turn.enableLights(true);
+        turn.setLightColor(android.graphics.Color.parseColor("#10b981"));
+        try {
+            turn.setSound(
+                android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION),
+                new android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build());
+        } catch (Throwable ignored) { }
+
         android.app.NotificationChannel general = new android.app.NotificationChannel(
             GENERAL_CHANNEL_ID,
             "BLASTI",
@@ -533,8 +783,101 @@ public class BlastiNativeStatus extends Plugin {
         general.setLockscreenVisibility(android.app.Notification.VISIBILITY_PRIVATE);
 
         nm.createNotificationChannel(lock);
+        nm.createNotificationChannel(turn);
         nm.createNotificationChannel(general);
         return true;
+    }
+
+    /**
+     * Boot-time hook for MainActivity: create the notification channels and
+     * apply the persisted lock-screen flags WITHOUT any web-layer involvement
+     * (channels must exist before FCM can post into them; the flags must be
+     * applied before any full-screen intent can fire).
+     */
+    public static void applyLaunchPreferences(Activity activity) {
+        try {
+            ensureNotificationChannelsInternal(activity.getApplicationContext());
+        } catch (Throwable ignored) { }
+        applyLockscreenFlags(activity);
+    }
+
+    /**
+     * Apply the persisted lockscreenTakeover preference to the activity:
+     *   • false (DEFAULT) → setShowWhenLocked(false) + setTurnScreenOn(false):
+     *     the app can NEVER render over the keyguard — only the notification
+     *     shows on the lock screen (full separation).
+     *   • true (explicit opt-in from Settings → Notifications) → the legacy
+     *     full-screen takeover behavior.
+     *
+     * Called from MainActivity.onCreate (boot) and from
+     * setLockscreenTakeover() (preference change while running).
+     */
+    private static void applyLockscreenFlags(Activity activity) {
+        if (activity == null) return;
+        if (android.os.Build.VERSION.SDK_INT < 27) {
+            // setShowWhenLocked/setTurnScreenOn exist from API 27; below that
+            // the removed manifest flags keep the safe default (never show).
+            return;
+        }
+        try {
+            SharedPreferences prefs = activity.getSharedPreferences(NATIVE_PREFS_FILE, Context.MODE_PRIVATE);
+            boolean takeover = prefs.getBoolean(KEY_LOCKSCREEN_TAKEOVER, false);
+            activity.setShowWhenLocked(takeover);
+            activity.setTurnScreenOn(takeover);
+        } catch (Throwable t) {
+            Log.w(TAG, "applyLockscreenFlags failed", t);
+        }
+    }
+
+    /**
+     * Persist + apply the lockscreenTakeover preference. The web layer calls
+     * this whenever the Settings → Notifications toggle changes (and on boot
+     * to keep native in sync with the server-side preference).
+     * Returns { ok, enabled }.
+     */
+    @PluginMethod
+    public void setLockscreenTakeover(PluginCall call) {
+        Boolean enabled = call.getBoolean("enabled", false);
+        boolean value = enabled != null && enabled;
+        try {
+            getContext().getSharedPreferences(NATIVE_PREFS_FILE, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_LOCKSCREEN_TAKEOVER, value)
+                .apply();
+            Activity activity = bridge != null ? bridge.getActivity() : null;
+            if (activity != null) {
+                applyLockscreenFlags(activity);
+            }
+            JSObject result = new JSObject();
+            result.put("ok", true);
+            result.put("enabled", value);
+            call.resolve(result);
+        } catch (Throwable t) {
+            Log.w(TAG, "setLockscreenTakeover failed", t);
+            call.reject("takeover-failed", t.getMessage());
+        }
+    }
+
+    /**
+     * Last turn-notification dismissal recorded by
+     * BlastiNotificationDismissReceiver (swipe or Stop action). The web layer
+     * compares this against a pending in-app replay on resume and DROPS the
+     * replay when the user already stopped the alert from the lock screen.
+     * Returns { dismissedAt, dismissedId } (epoch ms, notification id; 0/-1
+     * when nothing was ever dismissed).
+     */
+    @PluginMethod
+    public void getTurnDismissState(PluginCall call) {
+        try {
+            SharedPreferences prefs = getContext().getSharedPreferences(NATIVE_PREFS_FILE, Context.MODE_PRIVATE);
+            JSObject result = new JSObject();
+            result.put("dismissedAt", prefs.getLong(BlastiNotificationDismissReceiver.KEY_TURN_DISMISSED_AT, 0L));
+            result.put("dismissedId", prefs.getInt(BlastiNotificationDismissReceiver.KEY_TURN_DISMISSED_ID, -1));
+            call.resolve(result);
+        } catch (Throwable t) {
+            Log.w(TAG, "getTurnDismissState failed", t);
+            call.reject("dismiss-state-failed", t.getMessage());
+        }
     }
 
     /**
@@ -543,9 +886,13 @@ public class BlastiNativeStatus extends Plugin {
      * full-screen intents or lock-screen visibility from JS):
      *   • VISIBILITY_PUBLIC on the blasti-lockscreen channel → full content on
      *     the lock screen;
-     *   • when the device is LOCKED, a full-screen intent launches the app
-     *     over the keyguard (screen wakes — manifest declares
-     *     USE_FULL_SCREEN_INTENT; MainActivity declares showWhenLocked);
+     *   • OPTIONAL full-screen intent — ONLY when the caller passes
+     *     fullScreen:true AND the device is LOCKED. Default is FALSE: the app
+     *     must never launch itself over the keyguard (field report: "the
+     *     mobile app as a whole shows on the lock screen, not just a
+     *     notification" — the old unconditional full-screen intent made the
+     *     whole activity appear ON the lock screen). The notification itself
+     *     (heads-up banner + lock-screen content + tap-to-open) still fires.
      *   • tapping the notification opens the app.
      * Returns { ok, id, fullScreen }.
      */
@@ -557,9 +904,10 @@ public class BlastiNativeStatus extends Plugin {
             call.reject("missing-title");
             return;
         }
+        boolean wantFullScreen = call.getBoolean("fullScreen", false);
         try {
             // Channels must exist before the notification posts (no-op pre-O).
-            try { ensureNotificationChannels(null); } catch (Throwable ignored) { }
+            try { ensureNotificationChannelsInternal(getContext()); } catch (Throwable ignored) { }
 
             Object rawId = call.getData() == null ? null : call.getData().opt("notificationId");
             int id = rawId instanceof Number
@@ -591,6 +939,14 @@ public class BlastiNativeStatus extends Plugin {
 
             android.content.Intent launch = getContext().getPackageManager()
                 .getLaunchIntentForPackage(getContext().getPackageName());
+            // Hoisted so the result payload can report it below.
+            boolean locked = false;
+            try {
+                Object kg = getContext().getSystemService(Context.KEYGUARD_SERVICE);
+                if (kg instanceof android.app.KeyguardManager) {
+                    locked = ((android.app.KeyguardManager) kg).isKeyguardLocked();
+                }
+            } catch (Throwable ignored) { }
             if (launch != null) {
                 launch.addFlags(android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
                     | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -599,15 +955,15 @@ public class BlastiNativeStatus extends Plugin {
                     android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
                 builder.setContentIntent(contentPi);
 
-                // Device locked → wake the screen and show OVER the keyguard.
-                boolean locked = false;
-                try {
-                    Object kg = getContext().getSystemService(Context.KEYGUARD_SERVICE);
-                    if (kg instanceof android.app.KeyguardManager) {
-                        locked = ((android.app.KeyguardManager) kg).isKeyguardLocked();
-                    }
-                } catch (Throwable ignored) { }
-                if (locked) {
+                // Device locked → wake the screen and show OVER the keyguard —
+                // ONLY when the caller explicitly opted in (web preference
+                // lockscreenTakeover, synced to native SharedPreferences and
+                // applied by MainActivity/applyLaunchPreferences + the
+                // setLockscreenTakeover plugin method). With the manifest
+                // flags removed, the DEFAULT is full separation: tapping the
+                // notification while locked shows the keyguard first; the app
+                // paints only after unlock.
+                if (wantFullScreen && locked) {
                     android.app.PendingIntent fullPi = android.app.PendingIntent.getActivity(
                         getContext(), id + 1, launch,
                         android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
@@ -615,10 +971,35 @@ public class BlastiNativeStatus extends Plugin {
                 }
             }
 
+            // ── Swipe-to-stop + explicit Stop action (parity with the in-app
+            //    banner's slide-to-stop). Both paths hit
+            //    BlastiNotificationDismissReceiver, which cancels the
+            //    notification, kills vibration and records the dismissal so
+            //    the web layer drops the pending in-app replay on resume.
+            try {
+                Intent stopIntent = new Intent(getContext(), BlastiNotificationDismissReceiver.class);
+                stopIntent.setAction(BlastiNotificationDismissReceiver.ACTION_STOP_TURN_ALERT);
+                stopIntent.putExtra(BlastiNotificationDismissReceiver.EXTRA_NOTIFICATION_ID, id);
+                android.app.PendingIntent stopPi = android.app.PendingIntent.getBroadcast(
+                    getContext(), id + 2, stopIntent,
+                    android.app.PendingIntent.FLAG_IMMUTABLE | android.app.PendingIntent.FLAG_UPDATE_CURRENT);
+                // Swipe the notification away → same receiver records the stop.
+                builder.setDeleteIntent(stopPi);
+                // Visible "Stop" button on the heads-up/lock-screen shade.
+                String stopLabel = call.getString("stopLabel");
+                if (stopLabel == null || stopLabel.trim().isEmpty()) stopLabel = "إيقاف / Stop";
+                builder.addAction(
+                    new androidx.core.app.NotificationCompat.Action.Builder(
+                        0, stopLabel, stopPi).build());
+            } catch (Throwable t) {
+                Log.w(TAG, "stop-action wiring failed", t);
+            }
+
             nm.notify(id, builder.build());
             JSObject result = new JSObject();
             result.put("ok", true);
             result.put("id", id);
+            result.put("fullScreen", wantFullScreen && locked);
             call.resolve(result);
         } catch (Throwable t) {
             Log.w(TAG, "notifyLockscreen failed", t);

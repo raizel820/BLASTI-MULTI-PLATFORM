@@ -6,6 +6,8 @@ import { useLanguage } from '@/hooks/use-language';
 import { toast } from 'sonner';
 import type { Language } from '@/i18n';
 import { updateDocumentDirection } from '@/store/use-app-store';
+import { mergeSessionUser } from '@/lib/user-store-refresh';
+import { mirrorNotifPrefs } from '@/lib/notification-channel';
 import type {
   NotifPrefs,
   QueueStats,
@@ -71,6 +73,11 @@ export function useProfileData() {
           setNotifPrefs(typeof data.notificationPreferences === 'string'
             ? JSON.parse(data.notificationPreferences)
             : data.notificationPreferences);
+          // Mirror for the realtime alert paths (outside React) — keeps the
+          // lock-screen alert mute/takeover prefs in effect app-wide.
+          mirrorNotifPrefs(typeof data.notificationPreferences === 'string'
+            ? JSON.parse(data.notificationPreferences)
+            : data.notificationPreferences);
         }
         if (data.phoneNumber) setPhoneNumber(data.phoneNumber);
         if (data.fullName) setFullName(data.fullName);
@@ -79,6 +86,19 @@ export function useProfileData() {
         if (data.freeSmsCount !== undefined) setSmsCount(data.freeSmsCount);
         if (data.reminderMinutes !== undefined) setReminderMinutesVal(data.reminderMinutes);
         if (data.smsNotificationsEnabled !== undefined) setSmsNotifEnabled(data.smsNotificationsEnabled);
+        // Cross-device heal: the persisted store user may be older than the
+        // DB (avatar uploaded on another device). Merge the authoritative
+        // identity fields so the header/sidebar/identity-card avatars update
+        // on THIS device too — without navigation side effects.
+        mergeSessionUser({
+          fullName: typeof data.fullName === 'string' && data.fullName ? data.fullName : undefined,
+          email: typeof data.email === 'string' && data.email ? data.email : undefined,
+          phoneNumber: typeof data.phoneNumber === 'string' && data.phoneNumber ? data.phoneNumber : undefined,
+          avatarUrl: typeof data.avatarUrl === 'string' && data.avatarUrl ? data.avatarUrl : undefined,
+          freeSmsCount: typeof data.freeSmsCount === 'number' && Number.isFinite(data.freeSmsCount)
+            ? data.freeSmsCount
+            : undefined,
+        });
       }
     } catch {
       toast.error(t('error'));
@@ -230,6 +250,34 @@ export function useProfileData() {
     }
   };
 
+  /**
+   * Task 2-d parity — persist a freshly-uploaded avatar IMMEDIATELY (same
+   * contract as the Settings page card): the preview confirm uploads, this
+   * PATCH points the DB at the new blob, and ONLY THEN may the replaced
+   * upload be deleted. Deferring to the card's Save button would leave the
+   * stored avatarUrl pointing at a deleted file whenever the customer skips
+   * Save. Returns true when the API accepted the new URL.
+   */
+  const activateAvatar = async (url: string): Promise<boolean> => {
+    if (!user) return false;
+    try {
+      const res = await apiFetch('/api/user/profile', {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: user.id, avatarUrl: url }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data) {
+        setAvatarUrl(data.avatarUrl ?? url);
+        // Refresh the session user so the header/avatar reflect the change.
+        setUser({ ...user, avatarUrl: data.avatarUrl ?? url });
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  };
+
   const handleSaveSmsSettings = async () => {
     if (!user?.id) return;
     setSmsSettingsSaving(true);
@@ -309,6 +357,7 @@ export function useProfileData() {
     // Personal info (name/email/avatar — Task 82)
     fullName, setFullName, email, setEmail, avatarUrl, setAvatarUrl,
     savingPersonalInfo, handleSavePersonalInfo,
+    activateAvatar,
     // Notif prefs
     notifPrefs, notifLoading, notifSaving, handleToggleNotifPref, saveNotifPrefs,
     // Delete account

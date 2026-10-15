@@ -4,6 +4,7 @@ import { Geist, Geist_Mono } from "next/font/google";
 import { ThemeProvider } from "next-themes";
 import { AuthProvider } from "@/components/providers/auth-provider";
 import { ErrorBoundary } from "@/components/shared/error-boundary";
+import { RootRecoveryBoundary } from "@/components/shared/root-recovery-boundary";
 import { ClientBootHardening } from "@/components/shared/client-boot-hardening";
 import { UploadImageRecovery } from "@/components/shared/upload-image-recovery";
 import { AppUpdateManager } from "@/components/shared/app-update-manager";
@@ -53,7 +54,8 @@ export default function RootLayout({
             chart-heavy screens like #/admin/analytics) and swallows that one
             benign error message as a backstop. */}
         <Script src="/resize-observer-fix.js" strategy="beforeInteractive" />
-        <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
+        <RootRecoveryBoundary>
+          <ThemeProvider attribute="class" defaultTheme="light" enableSystem={false} disableTransitionOnChange>
           {/* Launch intro — Capacitor shells only (web/desktop skip; ?intro=1 previews) */}
           <AppIntroAnimation />
           {/* Task 41 — legacy SW unregister + chunk-error auto-recovery (phone flicker fix) */}
@@ -78,6 +80,7 @@ export default function RootLayout({
             </DatabaseProvider>
           </PlatformProvider>
         </ThemeProvider>
+        </RootRecoveryBoundary>
       </body>
     </html>
   );

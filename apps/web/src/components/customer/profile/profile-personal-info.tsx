@@ -18,6 +18,8 @@ import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import { useUpload } from '@/hooks/use-upload';
 import { UserAvatar } from '@/components/shared/user-avatar';
+import { ImageUploadPreviewDialog } from '@/components/shared/image-upload-preview-dialog';
+import { apiFetch } from '@/lib/api-fetch';
 import type { TranslationKeys } from '@/i18n';
 
 interface ProfilePersonalInfoProps {
@@ -31,6 +33,11 @@ interface ProfilePersonalInfoProps {
   onPhoneNumberChange: (v: string) => void;
   onAvatarUrlChange: (v: string) => void;
   onSave: (next: { fullName: string; email: string; phoneNumber: string; avatarUrl?: string }) => Promise<boolean>;
+  /** Persist a freshly-uploaded avatar IMMEDIATELY (PATCH + store refresh).
+   * Task 2-d parity with the Settings card: the DB must point at the new blob
+   * before the replaced upload is deleted. When absent, the avatar is only
+   * applied locally and persists via the card's Save button. */
+  onAvatarActivate?: (url: string) => Promise<boolean>;
   t: (key: TranslationKeys) => string;
 }
 
@@ -45,26 +52,73 @@ export function ProfilePersonalInfo({
   onPhoneNumberChange,
   onAvatarUrlChange,
   onSave,
+  onAvatarActivate,
   t,
 }: ProfilePersonalInfoProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [uploadingAvatar, setUploadingAvatar] = useState(false);
   const upload = useUpload({ type: 'avatar', maxSize: 2 * 1024 * 1024 });
 
-  const handleAvatarPicked = async (file: File | null | undefined) => {
+  // Task 2-d parity — picking a file now only VALIDATES + OPENS the preview
+  // dialog (same UX as the Settings page card and the agency logo); the
+  // upload runs on user confirm. Confirming also best-effort deletes the
+  // upload this avatar REPLACES, so swapped-out images don't orphan on the
+  // server (the "image is stuck in storage manager forever" complaint).
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [pendingPreviewUrl, setPendingPreviewUrl] = useState<string | null>(null);
+
+  const closePreview = () => {
+    setPreviewOpen(false);
+    setPendingFile(null);
+    if (pendingPreviewUrl) URL.revokeObjectURL(pendingPreviewUrl);
+    setPendingPreviewUrl(null);
+  };
+
+  const handleAvatarPicked = (file: File | null | undefined) => {
+    // Allow re-picking the same file later
+    if (fileInputRef.current) fileInputRef.current.value = '';
     if (!file) return;
-    setUploadingAvatar(true);
-    try {
-      const result = await upload.upload(file);
-      if (result.url) {
-        onAvatarUrlChange(result.url);
-      } else if (result.error) {
-        toast.error(result.error);
+    if (!file.type.startsWith('image/')) {
+      toast.error(t('error'));
+      return;
+    }
+    setPendingFile(file);
+    setPendingPreviewUrl(URL.createObjectURL(file));
+    setPreviewOpen(true);
+  };
+
+  const handlePreviewConfirm = async () => {
+    if (!pendingFile) return;
+    // Capture the CURRENT avatar BEFORE overwriting — the replaced upload is
+    // deleted from the server once the new one is ACTIVE (best-effort).
+    const previousAvatarUrl = avatarUrl || null;
+    const result = await upload.upload(pendingFile);
+    if (result.url) {
+      // Persist FIRST (Settings-card contract): the database must point at
+      // the NEW blob before the replaced upload is deleted — deleting before
+      // activation would leave the stored avatarUrl targeting a deleted file
+      // whenever the customer never presses Save.
+      let activated = true;
+      if (onAvatarActivate) {
+        activated = await onAvatarActivate(result.url);
       }
-    } finally {
-      setUploadingAvatar(false);
-      // Reset so picking the same file twice still fires onChange.
-      if (fileInputRef.current) fileInputRef.current.value = '';
+      onAvatarUrlChange(result.url);
+      closePreview();
+      if (
+        activated &&
+        previousAvatarUrl &&
+        previousAvatarUrl !== result.url &&
+        previousAvatarUrl.includes('/api/upload/file/')
+      ) {
+        apiFetch('/api/upload/asset', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: previousAvatarUrl }),
+        }).catch(() => { /* best-effort cleanup — never blocks the UX */ });
+      }
+    } else if (result.error) {
+      // Keep the dialog open so the user can retry or cancel.
+      toast.error(result.error);
     }
   };
 
@@ -102,11 +156,11 @@ export function ProfilePersonalInfo({
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={uploadingAvatar}
+              disabled={upload.uploading}
               aria-label={t('changeAvatar')}
               className="absolute -bottom-1 -end-1 h-7 w-7 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white flex items-center justify-center shadow-md border-2 border-white dark:border-gray-900 transition-colors disabled:opacity-60"
             >
-              {uploadingAvatar ? (
+              {upload.uploading ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
               ) : (
                 <Camera className="h-3.5 w-3.5" />
@@ -179,13 +233,27 @@ export function ProfilePersonalInfo({
           <Button
             className="w-full h-10 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl"
             onClick={handleSaveClick}
-            disabled={saving || uploadingAvatar}
+            disabled={saving || upload.uploading || previewOpen}
           >
             {saving ? <Loader2 className="h-4 w-4 animate-spin me-2" /> : <Check className="h-4 w-4 me-2" />}
             {t('save')}
           </Button>
         </div>
       </div>
+
+      {/* Task 2-d parity — preview BEFORE anything uploads (circle avatar) */}
+      <ImageUploadPreviewDialog
+        open={previewOpen}
+        onOpenChange={(open) => { if (!open) closePreview(); }}
+        previewUrl={pendingPreviewUrl ?? ''}
+        shape="circle"
+        title={t('imagePreviewTitle')}
+        description={t('imagePreviewDesc')}
+        confirmLabel={t('confirm')}
+        cancelLabel={t('cancel')}
+        loading={upload.uploading}
+        onConfirm={handlePreviewConfirm}
+      />
     </motion.div>
   );
 }

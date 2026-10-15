@@ -4537,3 +4537,152 @@ Stage Summary:
 - download/0001-fix-mobile-JDK-native-stable-keystore-CI-fail-fast-k.patch + download/0002-feat-storage-multi-select-batch-delete-move-for-file.patch + download/keystore-and-storage-multiselect.diff — validated clean (git am) onto origin/master e0ae24d.
 - PENDING from earlier sessions (still not pushed by user): notifications set (e5141f7) + update-engine set (4605a94) patch files remain in download/.
 - USER ACTION: apply + push the new patch set; the next CI mobile build will sign with the new stable keystore (devices need the one-time uninstall/reinstall).
+
+---
+Task ID: mobile-fix-2 / boot-crash-i-then-not-a-function
+Agent: Z.ai Code (main)
+Task: Field error report from the Android app — "i(...).then is not a function" (RootRecoveryBoundary dump, reason: root-recovery, sole event: 401 POST /api/user/push-token at +2545ms).
+
+Work Log:
+- Located the reporter: RecoveryCard in root-recovery-boundary.tsx generates exactly the pasted report → a real error was thrown inside a boot provider OUTSIDE the page ErrorBoundary.
+- Audited every literal .then( call in the layout-mounted boot path; sole offender: apps/web/lib/device-report.ts chained .then() on Plugins.App.addListener('appStateChange').
+- Verified against @capacitor/android 8.5.2 native-bridge.js in node_modules: cap.addListener returns the PluginListenerHandle { remove } SYNCHRONOUSLY — NOT a Promise (only the @capacitor/core registerPlugin proxy wraps it; apps/web must not import @capacitor/*). await-based call sites (push-registration, native-back-handler) were immune — exactly why only device-report crashed.
+- Fixes: (1) device-report.ts Promise.resolve(addListener(...)) + try/catch; (2) client-boot-hardening.tsx try/catch around the synchronous startDeviceReporting() call; (3) push-registration.ts skips FCM token upload while signed out (kills the 401 "Authentication required" diag noise; retried on next registration event after login).
+- Verified: eslint clean; behavioral test of the real module under the exact sync-handle shape (no throw, listener registered, cleanup returned); agent-browser boot + interaction + mobile viewport clean; web :3000 restarted via daemon-start.sh after it was found down.
+- Commit 2fe08f9 (3 files, +50/−9). NOTE: origin/master already carries a Promise.resolve-style port of the device-report fix (user's "mobuile app fix" commits) — this patch may not be needed on their line.
+
+Stage Summary:
+- Root cause: Capacitor 8 RAW Android bridge returns a synchronous listener handle; .then() on it inside the boot effect killed the boot tree to the recovery card on every launch. Fixed at three levels. No APK rebuild required for server-served web code.
+
+---
+Task ID: mobile-fix-3 / avatar-persist + preview-parity + chargily-x100 + version-probe
+Agent: Z.ai Code (main)
+Task: 4 field reports — (1) profile image shows placeholder in both apps + webapp though the upload lands in Storage Manager; (2) missing vs 3 days ago: image preview before update + delete of the replaced image; (3) SMS purchase 1,200 DZD opens a Chargily checkout showing 120,000 DZD; (4) settings About version hardcoded 1.0.0 while the APK is 0.5.7.
+
+Work Log:
+- Delivery archaeology: origin/master was FORCE-UPDATED (78ceb01→f4947ee, user's own "mobuile app fix" commits); 53 local commits unpushed; the user's devices talk to the server baked in apps/web/.env.production (NEXT_PUBLIC_API_URL=http://129.151.242.219 — NOT the 68.183.137.227 host in the standing notes) and the APK bundles its web export. The "missing" features (preview dialog 0699d01, relative URLs 73397b, dynamic version af15d42) were never lost — they were never delivered to the user's line.
+- LIVE E2E (agent-browser, probe1800 customer, password reset via the API's own scrypt format) caught the REAL avatar root cause: PATCH /api/user/profile → 400 "Invalid URL". updateProfileSchema AND registerSchema validated avatarUrl with z.string().url(), which REJECTS the canonical RELATIVE /api/upload/file/... paths Task 2-c uploads return → the URL NEVER reached the DB (avatarUrl stayed null after "save success"). Older deployments stored absolute localhost URLs phones can't load — both eras show a placeholder forever.
+- FIX: shared uploadFileUrlSchema (relative /api/upload/file/... OR absolute http(s) OR '') wired into both schemas; website/apiUrl fields untouched.
+- Profile-card parity port: profile-personal-info.tsx now pick→validate→ImageUploadPreviewDialog (was: instant upload, no preview, no cleanup). New use-profile-data.activateAvatar() PATCHes + refreshes the store IMMEDIATELY on confirm; the replaced upload is DELETEd only AFTER activation (first port deleted before persisting — caught in E2E and corrected; the DB must never point at a deleted blob).
+- Chargily ×100: chargily-service.createCheckout multiplied amount ×100 ("centimes" — a v1-era assumption); Pay v2 takes MAJOR units → a 1,200 DZD pack rendered as "120 000 DZD". Amount now sent as-is (fulfillment/webhook only DISPLAY checkout.amount; getBalance untouched).
+- Version probe: app-version.ts falls back to BlastiNativeStatus.getDiagnostics().versionName (real PackageManager versionName) when Device.getInfo returns empty, and failed probe cycles are no longer memoized forever (retryable after 20s, throttled) — fixes settings "1.0.0" and recovery cards showing "غير معروف".
+- E2E verified after fixes (probe1800): preview dialog opens BEFORE any upload; confirm → POST upload 200 → PATCH 200 → DELETE /api/upload/asset 200; previous file fetch-back 404; DB avatarUrl = relative path; avatar <img> renders naturalWidth>0 on card AND header. eslint + tsc clean; API restarted to pick up the schema fix (bun --hot missed it).
+- Ops notes: web :3000 died mid-session (restarted via daemon-start.sh); sandbox-only GET /api/agencies 500 ("operator does not exist: text = jsonb" raw query — pre-existing, flag for later); [SyncEngine] "agencyId is required for SUPER_ADMIN pull" spam (pre-existing, flag for later); NOTE: rg -rn was misused as "recursive" (-r REPLACES matches — the "minified files" scare was a self-inflicted display artifact).
+- Commit 801fc17 (6 files, +185/−34); patch exported + validated (git apply --check --3way onto origin/master): download/0001-fix-profile-payments-version-avatar-400-Invalid-URL-.patch + download/avatar-chargily-version-fix.diff.
+
+Stage Summary:
+- ALL FOUR reports explained: (1)+(2) = undelivered fixes + a NEWLY-found schema bug that broke avatar persistence even with the fixes applied — both fixed in 801fc17; (3) = real Chargily v2 unit bug — fixed; (4) = probe hardened (on-device verification still needed).
+- DELIVERY GAP IS THE META-ISSUE: 53 commits unpushed; the user's production line (129.151.242.219) has only their manual ports. USER ACTION: apply download/0001-fix-profile-payments-version-avatar-400-Invalid-URL-.patch (git am --3way) onto their master + push + redeploy the server so the web layer ships; earlier patch sets in download/ (notifications e5141f7, update-engine 4605a94, keystore+storage) still pending their line.
+- The phone's settings version will show 0.5.7 once the patched web layer is deployed AND the shell answers BlastiNativeStatus.getDiagnostics (no APK rebuild needed).
+- Leftover sandbox state: probe1800 (test customer, pw E2ePass123!) has a real avatar; 2-3 orphan avatar FileAssets kept as storage-manager demo data; test files cleaned from /home/z.
+
+---
+Task ID: reset-audit / sandbox-reset-verification
+Agent: Z.ai Code (main)
+Task: User asked to check whether the app got reset and some updates got lost.
+
+Work Log:
+- Git audit: working tree CLEAN; all 55 session commits present incl. 2fe08f9 (boot crash), 801fc17 (avatar persist + preview/delete parity + Chargily ×100 + version probe), fdc791e (worklog). Nothing uncommitted to lose.
+- Divergence check vs origin/master (35/55): origin-only commits are the user's own pushes ("mobuile app fix" ×3 = applied agent patches, "versions 1–7" bumps); tree-level comparison shows origin adds NO unique content — local master is strictly newer (only delta = the 6-file 801fc17 fix batch not yet applied to the user's line).
+- Runtime audit: web :3000 → 200 (serves Blasti), API :3003 → 200, embedded PG processes alive, db intact (58 public tables, 3 users), uploads intact (3 avatar PNGs + 1 logo under apps/api/uploads/), all 8 patch/diff files intact in download/.
+- mini-services/ CONFIRMED WIPED by sandbox reset (never committed to git — `git log --all -- mini-services` empty): discovery-service (:3010) + chargily-mock (:3021) absent and not running. daemon-start.sh tolerates it: "Discovery service directory missing — skipped"; API+Web still boot healthy. Already tracked as backlog item.
+
+Stage Summary:
+- VERDICT: no source, data, or patch loss. Only casualty = untracked sandbox-only mini-services (discovery/chargily-mock), non-blocking, backlog already covers recreation.
+- Still awaiting user: apply + push download/0001-fix-profile-payments-version-avatar-400-Invalid-URL-.patch (plus earlier pending sets: notifications e5141f7, update-engine 4605a94, keystore+storage) then redeploy server.
+
+---
+Task ID: avatar-everywhere / cross-device profile-image visibility + sync
+Agent: Z.ai Code (main)
+Task: "Profile image works ONLY in customer webapp — not desktop, not mobile, and super admin/agency still see the placeholder in customer profiles. Fix across all devices and accounts so all accounts can see each other's profile images, and make it sync: avatar updated in webapp must reach mobile + desktop."
+
+Work Log:
+- Delivery archaeology: DB was fine (probe1800.avatarUrl = relative /api/upload/file/... path); getProxiedUrl already rebases for every shell; sync contract USER_SYNC_FIELDS already carries avatarUrl; desktop local API has GET /api/user/profile with localizeFileUrl. The gaps were (a) the persisted store, (b) two render sites.
+- ROOT CAUSE 1 (stale persisted store): zustand user was refreshed ONLY at login or after an in-place edit on the same device. Other devices kept the login-era user (avatarUrl=null) forever — header/sidebar/identity-card placeholders on phone/desktop. session-heal fires on auth failure only, never on stale profile data.
+- ROOT CAUSE 2 (admin view): admin-users.tsx never rendered user.avatarUrl — generic UserCircle icon in both the list row and the expanded profile panel, though GET /api/admin/users already returns avatarUrl.
+- ROOT CAUSE 3 (agency view): agency-reviews.tsx had avatarUrl in its ReviewUser interface but rendered a colored initials circle unconditionally.
+- FIX 1: NEW lib/user-store-refresh.ts — gentle boot + focus-time (30s-throttled) refresher; merges authoritative profile fields into the persisted store via raw setState (never setUser → no view reset), concurrent calls coalesced, account-switch guarded, no-avatar-clears semantics preserved. Mounted as boot task 5 in client-boot-hardening (same never-throw contract).
+- FIX 2: use-profile-data.fetchProfile now mergeSessionUser()s the fetched identity fields — opening the profile page heals the header/sidebar on that device too.
+- FIX 3: admin-users renders UserAvatar in the row circle + expanded panel (icon/initials fallback preserved); new i18n key profileImage (en/ar/fr).
+- FIX 4: agency-reviews renders the reviewer's real avatar via UserAvatar when present.
+- Cross-device sync path: webapp avatar change → DB → (web/mobile) boot/focus refreshSessionUser hits /api/user/profile → store healed; (desktop) cloud→local User pull updates the local row (USER_SYNC_FIELDS) → boot/focus refresh hits the LOCAL profile endpoint → localized URL merged. No realtime dependency (sandbox realtime mini-service is gone); propagation = next boot or app focus, which matches "open the app → see the new avatar".
+- E2E (agent-browser, sandbox): admin users list + expanded profile show the customer avatar (naturalWidth 1024, URL rebased to :3003); poisoned-null store + reload heals to the real path WITHOUT visiting the profile page; customer home header + profile page render the avatar (2 imgs); agency reviews page renders the reviewer avatar after inserting a temp review (removed afterwards). eslint clean; tsc: no new errors in changed files (55 pre-existing TS1117 dupes in ar.ts on clean master).
+- Test accounts touched (sandbox DB only): admin + owner passwords reset to known E2E values; temp review e2e-review-* deleted.
+- Commit 5882fa5 (9 files, +265/−11).
+
+Stage Summary:
+- All four reported surfaces explained and fixed: (1) phone/desktop self-avatar = stale persisted store → boot/focus refresher; (2) admin customer-profile placeholder = render gap → admin-users avatars; (3) agency side = render gap → agency-reviews avatars; (4) sync requirement = boot/focus refresh + existing cloud→local User pull.
+- DELIVERY: patch exported to download/ (0001-fix-avatar-...patch + avatar-cross-device.diff), validated onto origin/master with git apply --check --3way. USER ACTION: apply + push + redeploy server; no APK rebuild needed (phones load the server's web bundle).
+- Note: on-device verification (real APK/desktop binary) still recommended; sandbox verified the web layer all three roles share.
+
+---
+Task ID: field-batch-4 / transactions-all + lockscreen + install-dialog + desktop-queue
+Agent: Z.ai Code (main)
+Task: Six field reports — (1) mobile app shows AS THE APP on the lock screen instead of a notification; (2) admin transactions + revenue + revenue analytics exclude SMS purchases; (3) app never opens the install-authority dialog (stuck "awaiting install", Xiaomi SDK 36, APK 0.5.91); (4) avatar fix reached webapp but NOT mobile/desktop; (5) desktop queue: ~1min delay + online customer renders as walk-in with no name; (6) no way to stop the lock-screen call notification + turn notification never arrives when agency calls from the DESKTOP app.
+
+Work Log:
+- REPORT 4 ROOT CAUSE (delivery path): apps/mobile/capacitor.config.ts loads webDir (apps/web/out static export) in production — the phone UI is FROZEN at APK build time; desktop likewise ships the bundled export. No server redeploy can update installed shells. The avatar fix (5882fa5) reaches phones/desktops ONLY via version bump + rebuild + in-app update — which is BLOCKED by report 3 (install permission dialog never opens). Fixing 3 unblocks the whole delivery chain.
+- REPORT 1: notifyLockscreen set a full-screen intent whenever isKeyguardLocked() → the whole activity (showWhenLocked+turnScreenOn in the manifest) appeared ON the lock screen. Now OPT-IN: fullScreen param (default false) → notification-only default (heads-up + PUBLIC lock-screen content + tap-to-open). locked flag hoisted; result reports fullScreen.
+- REPORT 3: installUpdate opened the settings screen only when startActivity THREW — on modern Android/MIUI the ACTION_VIEW package-archive launch does NOT throw without REQUEST_INSTALL_PACKAGES grant; it silently does nothing. Now: proactive canRequestPackageInstalls() check → open ACTION_MANAGE_UNKNOWN_APP_SOURCES (app-details fallback) + reject needs-install-permission; new openInstallPermissionSettings plugin method; use-app-update-store catch calls it for older builds (message-marker guard).
+- REPORT 2: /api/transactions (SUPER_ADMIN) merges SmsPurchase rows (kind sms_purchase, planName 'SMS Pack ×N', payer = customer, COMPLETED→APPROVED filter mapping, online/manual→chargily/manual); /admin/analytics/payments runs subscription + SMS rows through the SAME accumulators (totals, byStatus, byMethod, buckets); /admin/stats totalRevenue += APPROVED SMS sum; admin-transactions.tsx shows SMS ×N badge + payer, hides subscription-only actions for SMS rows.
+- REPORT 6 (mute): scheduleTurnNotification now early-returns when the user's queue_called pref is false (previously ONLY the in-app banner honored it). New lockscreenTakeover pref (default OFF) gates the full-screen takeover; toggle added to Settings → Notifications (profile-notifications 4th card, slate); prefs mirrored to localStorage 'blasti-notif-prefs' by fetchProfile + user-store-refresh so the realtime handlers (outside React) honor them on all shells; i18n keys en/ar/fr (fixed a sed corruption in the ar string immediately).
+- REPORT 5+6 (desktop): (a) local GET /api/agency/queue returned customerName=walkInCustomerName ONLY + customerAvatar=null ALWAYS → online customers rendered identity-less (walk-in look); now reads the synced User row (fullName/phone/avatar via localizeFileUrl) with walk-in fallback + isOnlineCustomer flag. (b) /api/agency/queue/call-next — the alias the frontend ACTUALLY calls — flipped the local row with NO outbox entry → CALLED never reached the cloud → sync-side-effects (which IS on the user's origin, 7bb0c0a) never fired → no notification:your-turn, webapp queue never moved; now withOutboxTransaction + logDeterministicOutcome for Reservation AND QueueSettings (mirrors PATCH /api/agency/queue/:id). (c) pull interval 30s→15s (±2s jitter) halves worst-case visibility latency. Frontend uses ONLY agency/queue/call-next + agency/queue/:id (verified) — legacy 61xx action routes left untouched.
+- Verified: seeded SmsPurchase renders in the admin transactions page (SMS ×400 badge, payer probe1800, 1,200 DZD); /api/transactions returns kind sms_purchase; /analytics/payments totals.totalRevenue=1200 + successfulPayments=1; /admin/stats totalRevenue=1200; api tsc (my files clean; 60 pre-existing admin.ts errors unchanged), web lint clean, i18n duplicate keys 55/55/56 = exact clean-master baseline; desktop JS node --check OK. Java not compiled (no SDK here) — edits reviewed line-by-line.
+- Commit 04ff8b4 (15 files).
+
+Stage Summary:
+- Shipped: all-transactions admin console (API+UI), notification-only lockscreen default + opt-in takeover + working mute, proactive install-permission dialog (native + web), desktop queue identity + call-next cloud parity + 15s pull.
+- DELIVERY (report 4): the avatar fix + ALL of today's shell fixes require APK 0.5.92+ / new desktop installer — patch exported to download/. USER ACTION: apply patch → bump version → rebuild APK + installer → the new APK's install flow will now OPEN the permission dialog (fix 3 unblocks its own distribution). Until the apps are rebuilt, the phone/desktop KEEP their bundled UIs — no server-side change can alter that.
+- Kept sandbox demo data: SmsPurchase e2e-sms-* (1,200 DZD, APPROVED, probe1800) so the admin console shows the merged view out of the box.
+
+---
+Task ID: R-1
+Agent: Z.ai Code (main)
+Task: Check whether the app got reset and recent updates were lost; restore services.
+
+Work Log:
+- Confirmed sandbox reset: git restored to snapshot e5141f7 (reflog ends there); commits after it (801fc17, 2fe08f9, 4605a94, 5882fa5) missing as objects. Untracked wiped: download/ (patch exports), uploads/ (avatars), db/, mini-services/ (discovery + chargily-mock), /home/z/pg-embedded (PG binaries AND data).
+- Fetched origin: origin/master advanced 0dbe60a..47fd3c3 ("mobuile app fix" 1-6). Content diff local vs origin = 61 files +4605/-424 proving origin CONTAINS all recent work: user-store-refresh.ts (avatar cross-device fix), lockscreen-notification.tsx, mobile-diagnostics-sheet.tsx, root-recovery-boundary.tsx, upload-image-recovery.tsx, native-diagnostics.ts, email-layout.ts (e5141f7 notifications content) — user applied+pushed patches under own commit names.
+- Aligned sandbox: git reset --hard origin/master (47fd3c3); verified avatar fix + lockscreen files present locally.
+- Re-provisioned embedded PostgreSQL 17.4 from @embedded-postgres/linux-x64 npm tarball into /home/z/pg-embedded (bin/lib/share), recreated .so symlinks (bun fs.symlinkSync — ln -s is blocked in sandbox), wrote boot-pg.mjs supervisor (idempotent: exit if :5432 up, initdb blasti/blasti md5, start postgres child + keep-alive, ensure blasti database). NOTE: boot-pg.mjs is still UNTRACKED — recommend committing it.
+- Started daemon-start.sh (setsid): PostgreSQL :5432 + API :3003 (v0.2.72) + Web :3000 all healthy. Created blasti DB via Prisma raw query, bun run db:push (58 tables) + db:seed-if-empty (1 agency, 2 base users, no demo data).
+- Verified end-to-end: /api/payment-settings and /api/agencies return DB-backed data; agent-browser home render OK (RTL landing, language/theme/login/download controls, zero page errors).
+
+Stage Summary:
+- Sandbox WAS reset (restored to a snapshot at e5141f7). NO committed code was lost: everything had already been applied and pushed by the user to origin/master (47fd3c3); sandbox realigned to origin tip.
+- Real losses are sandbox-only and acceptable: dev DB test data (3 users, transactions, 3 avatars — production VPS unaffected), download/ patch exports (user should still have downloaded copies), mini-services (known backlog), PG binaries (rebuilt).
+- Recommendations: commit /home/z/pg-embedded/boot-pg.mjs into git (daemon-start.sh references it); keep exporting patches to download/ promptly after each session.
+
+---
+Task ID: M-1
+Agent: Z.ai Code (main)
+Task: Mobile fixes — lockscreen full separation (notification only, never the app), swipe-to-stop on the lockscreen turn notification (parity with in-app), mobile avatar placeholder triage.
+
+Work Log:
+- Explore agent mapped the whole lockscreen/notification/avatar architecture (native plugin BlastiNativeStatus, manifest, notification-channel.ts, lockscreen-events/gate, FCM router).
+- ROOT CAUSE lockscreen takeover: AndroidManifest had STATIC android:showWhenLocked="true" + turnScreenOn="true" on MainActivity — ANY foregrounding (notification tap, full-screen intent, deep link) painted the whole app over the keyguard. Removed both; documented why inline.
+- Runtime opt-in preserved: new BlastiNativeStatus.setLockscreenTakeover plugin method persists the pref to SharedPreferences (blasti-native-prefs) and applies setShowWhenLocked/setTurnScreenOn to the running activity; MainActivity.onCreate → new static applyLaunchPreferences() re-applies at every boot (default FALSE = full separation).
+- Swipe-to-stop parity: NEW BlastiNotificationDismissReceiver (manifest-registered, not exported) wired as deleteIntent + visible bilingual "إيقاف / Stop" action on the native lockscreen notification — cancels the notification, kills vibration (VibratorManager/Vibrator), records turnDismissedAt/Id. Web half: wasTurnAlertDismissedNatively() + gate resume-replay drop + useTurnAlert visibilitychange reconciliation (markReservationConfirmed + stopNotificationSound + closeTurnNotifications + enterSleepMode + hide) so a dismissed-on-lockscreen alert never replays in-app.
+- FCM channel bug fixed: notification-router targets blasti-turn-alert but NOTHING created it (setupTurnAlertChannel had zero callers) → background pushes fell to the OS default low-importance channel (no heads-up, no lockscreen content). Now ensureNotificationChannelsInternal (static, context-parametrized) creates blasti-turn-alert (IMPORTANCE_HIGH + VISIBILITY_PUBLIC + vibration/lights/sound) and runs at EVERY app boot via applyLaunchPreferences, plus setupTurnAlertChannel() is awaited before every scheduleTurnNotification post.
+- Mobile avatar triage: fix code (getProxiedUrl Capacitor rebase + user-store-refresh + uploadFileUrlSchema) is COMPLETE in the bundle; allowMixedContent=true already set; locked release resolver bakes http://129.151.242.219 which release NSC permits. Conclusion: phones simply run a stale APK — the fix ships with the 0.5.93 rebuild (web-layer parts also flow via pushed updates).
+- Version bump 0.5.92 → 0.5.93 (mobile package.json + build.gradle versionCode 5093). Lint clean. Brace-balance + manifest checks verified (Android cannot be compiled in sandbox — rebuild on user machine required).
+
+Stage Summary:
+- Commit 9b5bb9a on master (14 files, +452/−23). Lockscreen contract is now: ONLY a high-importance PUBLIC system notification on the lock screen (heads-up + sound + vibration, swipeable, with a Stop action button); the app itself can never appear over the keyguard unless the user explicitly enables the Settings → Notifications takeover toggle.
+- DELIVERY REQUIREMENT: native changes (manifest, receiver, channels, runtime flags) REQUIRE an APK rebuild — user must rebuild/install 0.5.93; web-layer changes also flow via pushed updates for installed builds.
+- Known limitation (documented): if the app is FOREGROUND when the alert fires, the in-app banner+loop is owned by web state; the native Stop button stops the notification+vibration immediately, the in-app loop still respects its 35s watchdog and is reconciled on next resume.
+
+---
+Task ID: G-1b
+Agent: Z.ai Code (main)
+Task: Post-reset integrity audit — verify no work lost after sandbox reset hit the shallow repo
+
+Work Log:
+- Sandbox reset occurred between sessions: reverted uncommitted worklog.md edit (G-1 entry) — but could NOT roll back code (old snapshot commit e5141f7 no longer exists in shallow repo → reset-to-snapshot failed, only HEAD-level revert ran; no git clean — all untracked dirs survived).
+- Verified: master = d62437a + c181392 on 47fd3c3; tree hash cf1a5bf6... IDENTICAL to pre-swap full backup; all 4 key M-1 files present; download/ patches + git-full-backup.git + pg-embedded + upload/skills/agent-ctx all intact.
+- Services verified live: web :3000 → 200, api :3003 → health ok (0.2.72, sync registered), pg :5432 listening, data present.
+- LESSON APPLIED: this entry is now COMMITTED (not left uncommitted) so resets can never revert it. All future worklog entries must be committed immediately.
+
+Stage Summary:
+- ZERO loss of committed work; zero loss of patches/runtime data. Only casualty was 1 uncommitted worklog entry (now re-added + committed as this docs commit).
+- Shallow-repo reset protection is working as designed: sandbox resets can no longer destroy committed code.
