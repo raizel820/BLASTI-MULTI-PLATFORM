@@ -154,6 +154,7 @@ export async function seed() {
       maxServices: 3,
       maxBranches: 1,
       maxStaff: 2,
+      maxCounters: 2,
       maxActiveReservations: 30,
       maxSmsPerMonth: 20,
       kioskModeEnabled: false,
@@ -181,6 +182,7 @@ export async function seed() {
       maxServices: 10,
       maxBranches: 2,
       maxStaff: 5,
+      maxCounters: 5,
       maxActiveReservations: 100,
       maxSmsPerMonth: 100,
       kioskModeEnabled: true,
@@ -214,6 +216,7 @@ export async function seed() {
       maxServices: -1, // unlimited
       maxBranches: -1,
       maxStaff: -1,
+      maxCounters: -1,
       maxActiveReservations: -1,
       maxSmsPerMonth: 500,
       kioskModeEnabled: true,

@@ -49,6 +49,8 @@ import {
   History,
   Lock,
   DoorOpen,
+  Bell,
+  ShieldAlert,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -81,6 +83,15 @@ interface QueueEntry {
   service?: { name?: string; nameAr?: string; nameFr?: string };
   counterId?: string | null;
   counterName?: string | null;
+}
+
+// Feature C — incoming counter control request (GET /counters/control-requests).
+interface IncomingControlRequest {
+  id: string;
+  counterId: string;
+  counter?: { id: string; number: number; name: string; nameAr?: string | null };
+  requester?: { id: string; fullName?: string; username?: string };
+  createdAt: string;
 }
 
 interface DashboardStats {
@@ -337,6 +348,8 @@ export function AgencyFullscreen() {
   // Task 37-e: the STAFF MEMBER now OCCUPIES the counter they pick (real
   // server-side occupation, mirrored by Counter.staffId / occupiedAt) —
   // call-next requires the target counter to be occupied by the caller.
+  // Feature C: "occupied" became "CONTROLLED" (controlledByUserId + 60s
+  // heartbeat); staffId is only the roster assignment now.
   interface CounterOption {
     id: string;
     number: number;
@@ -347,16 +360,48 @@ export function AgencyFullscreen() {
     staffId?: string | null;
     occupiedBy?: string | null;
     occupiedAt?: string | null;
+    controlledByUserId?: string | null;
+    controlledByStaffId?: string | null;
+    serviceIdList?: string[];
   }
   const [counters, setCounters] = useState<CounterOption[]>([]);
   const [selectedCounterId, setSelectedCounterId] = useState<string>('');
   const [occupationLoading, setOccupationLoading] = useState<string | null>(null);
+  // Feature C — 409 control conflict → "Request control" dialog state.
+  const [controlConflict, setControlConflict] = useState<{
+    counterId: string;
+    counterName: string;
+    controllerName: string | null;
+  } | null>(null);
+  const [requestControlLoading, setRequestControlLoading] = useState(false);
+  // Feature C — pending INCOMING control requests on counters I control.
+  const [incomingRequests, setIncomingRequests] = useState<IncomingControlRequest[]>([]);
+  const [requestsOpen, setRequestsOpen] = useState(false);
+  const [requestActionLoading, setRequestActionLoading] = useState<string | null>(null);
 
   // Agency authority — gives the fullscreen the caller's staffId (for "is
   // this counter mine?") and the owner bypass.
   const { authority } = useAgencyAuthority();
   const myStaffId = authority?.staffId ?? null;
   const isOwnerCaller = authority?.isOwner === true;
+
+  // Feature C — the CURRENT USER id is the control identity now (was staffId).
+  const myUserId = user?.id ?? '';
+
+  // Feature C — "is this counter controlled by ME?" Primary check is the user
+  // id (controlledByUserId === user.id); the staffId → controlledByStaffId
+  // comparison stays as a fallback for older local-API builds.
+  const isCounterMine = useCallback((c: Pick<CounterOption, 'controlledByUserId' | 'controlledByStaffId'>) => {
+    if (c.controlledByUserId && myUserId && c.controlledByUserId === myUserId) return true;
+    if (c.controlledByStaffId && myStaffId && c.controlledByStaffId === myStaffId) return true;
+    return false;
+  }, [myUserId, myStaffId]);
+
+  const localCounterName = useCallback((c: Pick<CounterOption, 'number' | 'name' | 'nameAr' | 'nameFr'>) => {
+    if (lang === 'ar') return c.nameAr || c.name;
+    if (lang === 'fr') return c.nameFr || c.name;
+    return c.name;
+  }, [lang]);
 
   // Fetch counters for this agency (all branches)
   const fetchCounters = useCallback(async () => {
@@ -379,6 +424,18 @@ export function AgencyFullscreen() {
         for (const c of list) {
           if (c.isActive === false) continue;
           const staff = c.staff as { user?: { fullName?: string; username?: string } } | null | undefined;
+          const controlledByUser = c.controlledByUser as { id?: string; fullName?: string; username?: string } | null | undefined;
+          // Feature C — serviceIdList is pre-parsed; tolerate the raw JSON
+          // string from older local-API builds too.
+          let serviceIdList: string[] = [];
+          if (Array.isArray(c.serviceIdList)) {
+            serviceIdList = (c.serviceIdList as unknown[]).filter((x): x is string => typeof x === 'string');
+          } else if (typeof c.serviceIds === 'string' && (c.serviceIds as string).trim()) {
+            try {
+              const parsed = JSON.parse(c.serviceIds as string);
+              if (Array.isArray(parsed)) serviceIdList = parsed.filter((x): x is string => typeof x === 'string');
+            } catch { /* tolerate garbage */ }
+          }
           allCounters.push({
             id: String(c.id),
             number: Number(c.number ?? 0),
@@ -387,30 +444,31 @@ export function AgencyFullscreen() {
             nameFr: (c.nameFr as string | null) ?? null,
             branchName: branch.name,
             staffId: (c.staffId as string | null) ?? null,
-            occupiedBy: staff?.user?.fullName ?? null,
-            occupiedAt: (c.occupiedAt as string | null) ?? null,
+            occupiedBy: controlledByUser?.fullName ?? staff?.user?.fullName ?? null,
+            occupiedAt: (c.controlClaimedAt as string | null) ?? (c.occupiedAt as string | null) ?? null,
+            // Feature C — live control identity (user id is authoritative).
+            controlledByUserId: (c.controlledByUserId as string | null) ?? null,
+            controlledByStaffId: (c.controlledByStaffId as string | null) ?? null,
+            serviceIdList,
           });
         }
       }
       setCounters(allCounters);
-      // Task 37-e: the previous localStorage-only restore is now backed by the
-      // server's occupation state. A saved counter is only restored when it is
-      // REALLY occupied by this caller (staff) or the caller is an owner
-      // (owners don't hold counters via staffId — keep the old convenience).
+      // Feature C: the localStorage marker is only restored when the SERVER
+      // says this counter is controlled by ME (controlledByUserId === my user
+      // id — the staffId fallback covers older local-API builds). Otherwise
+      // re-attach to whichever agency counter I DO control.
       const saved = localStorage.getItem(`blasti_counter_${agencyId}`);
       const savedCounter = saved ? allCounters.find(c => c.id === saved) : undefined;
-      if (saved && savedCounter && (isOwnerCaller || (!!myStaffId && savedCounter.staffId === myStaffId))) {
+      if (saved && savedCounter && isCounterMine(savedCounter)) {
         setSelectedCounterId(saved);
-      } else if (myStaffId) {
-        // Already occupying one of the agency's counters? Re-attach to it.
-        const mine = allCounters.find(c => !!c.staffId && c.staffId === myStaffId);
+      } else {
+        const mine = allCounters.find((c) => isCounterMine(c));
         if (mine) setSelectedCounterId(mine.id);
         else setSelectedCounterId('');
-      } else if (allCounters.length === 1) {
-        setSelectedCounterId(allCounters[0].id);
       }
     } catch { /* ignore */ }
-  }, [agencyId, myStaffId, isOwnerCaller]);
+  }, [agencyId, isCounterMine]);
 
   // Calculate live duration from currentServing's calledAt
   useEffect(() => {
@@ -436,6 +494,69 @@ export function AgencyFullscreen() {
     const secs = serviceDurationSeconds % 60;
     return `${mins}m ${secs.toString().padStart(2, '0')}s`;
   }, [serviceDurationSeconds]);
+
+  // ─── Feature C — heartbeat + control-requests polling ────────────────────
+
+  // Am I holding CONTROL of the selected counter? / of any counter?
+  const selectedCounter = counters.find((c) => c.id === selectedCounterId) ?? null;
+  const iControlSelected = !!selectedCounter && isCounterMine(selectedCounter);
+  const iControlAny = counters.some((c) => isCounterMine(c));
+
+  // HEARTBEAT: while the selected counter is controlled by me, ping
+  // /counters/:id/heartbeat every 60s (server TTL expires silent claims).
+  // Cleared automatically on release / selection change / unmount / logout.
+  useEffect(() => {
+    if (!iControlSelected || !selectedCounterId) return;
+    let stopped = false;
+    const beat = async () => {
+      try {
+        const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(selectedCounterId)}/heartbeat`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+        });
+        if (stopped) return;
+        if (res.status === 403) {
+          const data = await res.json().catch(() => ({}));
+          if (data.error === 'COUNTER_CONTROL_LOST' || data.controlError === 'COUNTER_CONTROL_LOST') {
+            // Control was taken away (heartbeat lapsed / force-released) —
+            // drop the selection so call-next stops claiming it.
+            if (agencyId) localStorage.removeItem(`blasti_counter_${agencyId}`);
+            setSelectedCounterId('');
+            toast.error(t('counterControlLost'));
+            fetchCounters();
+          }
+        }
+      } catch { /* transient — the next beat retries */ }
+    };
+    beat(); // immediate beat on acquire/restore
+    const interval = setInterval(beat, 60_000);
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+    };
+  }, [iControlSelected, selectedCounterId, agencyId, fetchCounters, t]);
+
+  // INCOMING control requests: poll every ~20s while I control ANY counter —
+  // someone may be asking to take over one of my counters.
+  const fetchControlRequests = useCallback(async () => {
+    if (!iControlAny) {
+      setIncomingRequests((prev) => (prev.length ? [] : prev));
+      return;
+    }
+    try {
+      const res = await apiFetch('/api/agency/counters/control-requests?status=PENDING');
+      if (res.ok) {
+        const data = await res.json().catch(() => null);
+        setIncomingRequests(Array.isArray(data?.incoming) ? data.incoming : []);
+      }
+    } catch { /* silent */ }
+  }, [iControlAny]);
+
+  useEffect(() => {
+    if (!iControlAny) return;
+    fetchControlRequests();
+    const interval = setInterval(fetchControlRequests, 20_000);
+    return () => clearInterval(interval);
+  }, [iControlAny, fetchControlRequests]);
 
   // Fullscreen permission state
   const fullscreenReady = true;
@@ -694,6 +815,9 @@ export function AgencyFullscreen() {
         const data = await res.json();
         let errorMsg: string = data.details || data.error || t('noQueue');
         if (data.error === 'OCCUPY_COUNTER_FIRST') errorMsg = t('occupyFirst');
+        else if (data.error === 'COUNTER_SETUP_REQUIRED') errorMsg = t('counterSetupRequired');
+        else if (data.error === 'COUNTER_CONTROL_REQUIRED') errorMsg = t('counterControlRequired');
+        else if (data.error === 'SERVICE_NOT_ASSIGNED_TO_COUNTER') errorMsg = t('serviceNotAssigned');
         else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) errorMsg = t('counterPermissionDenied');
         toast.error(errorMsg);
       }
@@ -701,14 +825,23 @@ export function AgencyFullscreen() {
     finally { setActionLoading(null); }
   };
 
-  // ─── Task 37-e: counter OCCUPATION (staff self-service) ─────────────────
-  // Picking a counter in the selector now OCCUPIES it server-side
-  // (POST /api/agency/counters/:id/occupy). 409 COUNTER_OCCUPIED (another
-  // active staff holds it) toasts + refreshes the list; PERMISSION_DENIED
-  // surfaces a friendly message. The Release action frees it again.
+  // ─── Feature C: counter CONTROL (was Task 37-e occupation) ───────────
+  // Picking a counter claims CONTROL server-side (POST /counters/:id/occupy).
+  // 409 COUNTER_OCCUPIED (another live member holds control) opens the
+  // request-control flow instead of a dead-end toast. While I hold control a
+  // 60s heartbeat keeps it alive; losing it (403 COUNTER_CONTROL_LOST) clears
+  // the selection. The Release action frees it again (owner/manager may
+  // force-release someone else's).
 
   const handleCounterSelect = async (counterId: string) => {
     if (!agencyId || counterId === selectedCounterId) return;
+    const target = counters.find((c) => c.id === counterId);
+    // Already controlled by me → just re-select locally (no occupy round-trip).
+    if (target && isCounterMine(target)) {
+      setSelectedCounterId(counterId);
+      localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
+      return;
+    }
     setOccupationLoading(counterId);
     try {
       const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(counterId)}/occupy`, {
@@ -722,8 +855,16 @@ export function AgencyFullscreen() {
       } else {
         const data = await res.json().catch(() => ({}));
         if (data.error === 'COUNTER_OCCUPIED') {
-          toast.error(t('counterOccupied'));
-          fetchCounters(); // refresh the occupied-by states
+          // Feature C — 409: someone else CONTROLS it → offer the
+          // request-control flow (approval) instead of a dead-end toast.
+          const controllerName: string | null =
+            data.controlledBy?.name || target?.occupiedBy || null;
+          setControlConflict({
+            counterId,
+            counterName: target ? localCounterName(target) : `#${counterId}`,
+            controllerName,
+          });
+          fetchCounters(); // refresh the control states
         } else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) {
           toast.error(t('counterPermissionDenied'));
         } else {
@@ -734,6 +875,36 @@ export function AgencyFullscreen() {
       toast.error(t('error'));
     } finally {
       setOccupationLoading(null);
+    }
+  };
+
+  // Feature C — POST /counters/:id/request-control: GRANTED (free / mine /
+  // owner-manager) → proceed; REQUEST_PENDING → info toast.
+  const handleRequestControl = async () => {
+    if (!controlConflict) return;
+    const counterId = controlConflict.counterId;
+    setRequestControlLoading(true);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(counterId)}/request-control`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.status === 'GRANTED') {
+        setSelectedCounterId(counterId);
+        if (agencyId) localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
+        toast.success(t('counterControlRequested'));
+        setControlConflict(null);
+        fetchCounters();
+      } else if (res.ok && data.status === 'REQUEST_PENDING') {
+        toast.info(t('counterControlRequestPending'));
+        setControlConflict(null);
+      } else {
+        toast.error(data.error || t('error'));
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setRequestControlLoading(false);
     }
   };
 
@@ -754,7 +925,13 @@ export function AgencyFullscreen() {
         if (data.error === 'COUNTER_OCCUPIED') {
           toast.error(t('counterOccupied'));
           fetchCounters();
-        } else if (typeof data.error === 'string' && (data.error.startsWith('PERMISSION_DENIED') || data.error === 'NOT_COUNTER_OCCUPIER')) {
+        } else if (
+          typeof data.error === 'string' &&
+          (data.error.startsWith('PERMISSION_DENIED') ||
+            data.error === 'NOT_COUNTER_OCCUPIER' ||
+            // Feature C — the new control-scoped 403.
+            data.error === 'NOT_COUNTER_CONTROLLER')
+        ) {
           toast.error(t('counterPermissionDenied'));
         } else {
           toast.error(data.error || t('error'));
@@ -764,6 +941,28 @@ export function AgencyFullscreen() {
       toast.error(t('error'));
     } finally {
       setOccupationLoading(null);
+    }
+  };
+
+  // Feature C — approve / reject an incoming control request.
+  const handleRespondControlRequest = async (requestId: string, action: 'approve' | 'reject') => {
+    setRequestActionLoading(requestId);
+    try {
+      const res = await apiFetch(`/api/agency/counters/control-requests/${encodeURIComponent(requestId)}/${action}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        toast.success(action === 'approve' ? t('counterControlRequested') : t('success'));
+        setIncomingRequests((prev) => prev.filter((r) => r.id !== requestId));
+        fetchCounters();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.error || t('error'));
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setRequestActionLoading(null);
     }
   };
 
@@ -955,8 +1154,8 @@ export function AgencyFullscreen() {
         </div>
         <div className="flex items-center gap-2">
           {/* Counter / Reception Selector — Task 37-e: picking a counter
-              OCCUPIES it (staff self-service); occupied state is shown per
-              item, and a Release action frees the counter again. */}
+              OCCUPIES it (staff self-service); Feature C: 409 opens the
+              request-control flow, and a 60s heartbeat keeps the claim. */}
           {counters.length > 0 && (
             <div className="flex items-center gap-1">
               <Select
@@ -969,17 +1168,17 @@ export function AgencyFullscreen() {
                 </SelectTrigger>
                 <SelectContent className="bg-gray-900 border-gray-700">
                   {counters.map((c) => {
-                    const mine = !!myStaffId && c.staffId === myStaffId;
+                    const mine = isCounterMine(c);
                     return (
                       <SelectItem key={c.id} value={c.id} className="text-xs text-gray-300">
                         <div
                           className="flex items-center gap-2"
-                          title={c.staffId ? `${t('counterOccupiedBy', { name: c.occupiedBy || '' })}${c.occupiedAt ? ` · ${formatTime(c.occupiedAt, lang)}` : ''}` : t('counterFree')}
+                          title={c.controlledByUserId ? `${c.occupiedBy ? t('counterOccupiedBy', { name: c.occupiedBy }) : t('counterOccupied')}${c.occupiedAt ? ` · ${formatTime(c.occupiedAt, lang)}` : ''}` : t('counterFree')}
                         >
                           <span className="font-bold text-emerald-400">#{c.number}</span>
                           <span>{lang === 'ar' ? (c.nameAr || c.name) : lang === 'fr' ? (c.nameFr || c.name) : c.name}</span>
-                          <span className={`text-[10px] ${mine ? 'text-emerald-400' : c.staffId ? 'text-amber-400' : 'text-gray-500'}`}>
-                            {c.staffId
+                          <span className={`text-[10px] ${mine ? 'text-emerald-400' : c.controlledByUserId ? 'text-amber-400' : 'text-gray-500'}`}>
+                            {c.controlledByUserId
                               ? (mine
                                 ? t('counterMine')
                                 : c.occupiedBy
@@ -993,7 +1192,7 @@ export function AgencyFullscreen() {
                   })}
                 </SelectContent>
               </Select>
-              {selectedCounterId && (isOwnerCaller || counters.some((c) => c.id === selectedCounterId && (!!myStaffId && c.staffId === myStaffId))) && (
+              {selectedCounterId && (iControlSelected || isOwnerCaller) && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -1010,6 +1209,26 @@ export function AgencyFullscreen() {
                 </Button>
               )}
             </div>
+          )}
+          {/* Feature C — pending control requests on MY counters: pulsing bell
+              opens the approve/reject dialog. */}
+          {incomingRequests.length > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setRequestsOpen(true)}
+              className="relative h-7 px-2 gap-1 text-amber-300 hover:text-amber-200 hover:bg-amber-500/10 rounded-lg text-[11px]"
+              aria-label={t('controlRequests')}
+            >
+              <motion.span
+                animate={{ opacity: [0.5, 1, 0.5] }}
+                transition={{ duration: 1.6, repeat: Infinity }}
+                className="flex items-center gap-1"
+              >
+                <Bell className="h-3 w-3" />
+                <span>{incomingRequests.length}</span>
+              </motion.span>
+            </Button>
           )}
           <div className="flex items-center gap-1.5">
             <motion.div
@@ -1581,6 +1800,104 @@ export function AgencyFullscreen() {
               {agencyCode && <p className="text-gray-400 text-sm mt-1">{t('agencyCode') || 'Code'}: <span className="font-mono text-emerald-400">{agencyCode}</span></p>}
             </div>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* ─── Feature C: Control Conflict Dialog (409 → Request control) ─── */}
+      <Dialog open={!!controlConflict} onOpenChange={(open) => { if (!open) setControlConflict(null); }}>
+        <DialogContent className="bg-gray-900 border-gray-800 text-white sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ShieldAlert className="h-5 w-5 text-amber-400" />
+              {t('counterOccupied') || 'Occupied'}
+            </DialogTitle>
+            <DialogDescription className="text-gray-400">
+              {controlConflict?.controllerName
+                ? t('counterOccupiedBy', { name: controlConflict.controllerName })
+                : t('counterOccupied')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-2 space-y-3">
+            {controlConflict && (
+              <div className="flex items-center gap-2 p-3 rounded-xl bg-gray-800/60 border border-gray-700">
+                <span className="font-bold text-emerald-400 text-sm">#{counters.find((c) => c.id === controlConflict.counterId)?.number ?? ''}</span>
+                <span className="text-sm text-gray-200 truncate">{controlConflict.counterName}</span>
+              </div>
+            )}
+            <p className="text-xs text-gray-400">{t('counterControlRequestPending')}</p>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setControlConflict(null)} className="text-gray-400 hover:text-white">
+              {t('cancel') || 'Cancel'}
+            </Button>
+            <Button onClick={handleRequestControl} disabled={requestControlLoading}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold gap-2">
+              {requestControlLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldAlert className="h-4 w-4" />}
+              {t('requestControl') || 'Request control'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ─── Feature C: Incoming Control Requests (approve / reject) ─────── */}
+      <Dialog open={requestsOpen} onOpenChange={setRequestsOpen}>
+        <DialogContent className="bg-gray-900 border-gray-800 text-white sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Bell className="h-5 w-5 text-amber-400" />
+              {t('controlRequests') || 'Control requests'}
+            </DialogTitle>
+            <DialogDescription className="text-gray-400">
+              {t('counterControlRequestPending')}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="py-2 space-y-2 max-h-72 overflow-y-auto">
+            {incomingRequests.length === 0 ? (
+              <p className="text-xs text-gray-500 text-center py-6">{t('noData') || 'No pending requests'}</p>
+            ) : (
+              incomingRequests.map((req) => (
+                <div
+                  key={req.id}
+                  className="flex items-center justify-between gap-3 p-3 rounded-xl bg-gray-800/60 border border-gray-700"
+                >
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-white truncate">
+                      {req.requester?.fullName || req.requester?.username || '—'}
+                    </p>
+                    <p className="text-[11px] text-gray-400 truncate">
+                      #{req.counter?.number ?? ''} {lang === 'ar' && req.counter?.nameAr ? req.counter.nameAr : req.counter?.name}
+                      {req.createdAt ? ` · ${formatTime(req.createdAt, lang)}` : ''}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    <Button
+                      size="sm"
+                      onClick={() => handleRespondControlRequest(req.id, 'approve')}
+                      disabled={requestActionLoading === req.id}
+                      className="h-8 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold"
+                    >
+                      {requestActionLoading === req.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCircle2 className="h-3 w-3" />}
+                      {t('approveRequest') || 'Approve'}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handleRespondControlRequest(req.id, 'reject')}
+                      disabled={requestActionLoading === req.id}
+                      className="h-8 px-3 rounded-lg border-gray-600 text-gray-300 hover:bg-gray-800 text-xs font-semibold"
+                    >
+                      {t('rejectRequest') || 'Reject'}
+                    </Button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setRequestsOpen(false)} className="text-gray-400 hover:text-white">
+              {t('close') || 'Close'}
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </div>

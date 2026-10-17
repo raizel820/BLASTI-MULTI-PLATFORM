@@ -440,9 +440,17 @@ process.on('unhandledRejection', (reason) => {
 // teardown as a UI quit — a terminal Ctrl+C (dev) or a process-manager stop
 // used to leave the :3080 server + timers to the OS's mercy.
 for (const _sig of ['SIGINT', 'SIGTERM']) {
-  process.on(_sig, () => {
+  process.on(_sig, async () => {
     console.log('[BLASTI Desktop] Received ' + _sig + ' — shutting down embedded services');
-    shutdownEmbeddedServices('signal:' + _sig);
+    // Feature C: AWAIT the teardown so the (bounded) counter auto-release AND
+    // the local-API stop below it actually complete before the process exits —
+    // shutdownEmbeddedServices is async now (the release awaits the DB), and
+    // a fire-and-forget call let Electron quit mid-teardown, skipping
+    // stopLocalApi entirely. The release is internally bounded (2.5s), so
+    // this never outlives the 3s hard-exit backstop below.
+    try { await shutdownEmbeddedServices('signal:' + _sig); } catch (err) {
+      console.warn('[BLASTI Desktop] Embedded teardown error (non-fatal):', err && err.message);
+    }
     killBlastiChildProcessTree();
     try { app.quit(); } catch { process.exit(0); }
     // Hard backstop if Electron refuses to exit promptly.
@@ -491,7 +499,7 @@ function purgeDurableAuthFile(reason) {
 // guarded by _embeddedShutdownDone.
 let _embeddedShutdownDone = false;
 
-function shutdownEmbeddedServices(reason) {
+async function shutdownEmbeddedServices(reason) {
   if (_embeddedShutdownDone) return;
   _embeddedShutdownDone = true;
   console.log('[BLASTI Desktop] Shutting down embedded services (' + (reason || 'quit') + ')');
@@ -512,6 +520,29 @@ function shutdownEmbeddedServices(reason) {
     if (typeof syncService.stopSync === 'function') syncService.stopSync();
   } catch (err) {
     console.warn('[BLASTI Desktop] Sync engine stop failed (non-fatal):', err && err.message);
+  }
+
+  // 2b. Feature C — app-close counter auto-release: every counter the session
+  //     user CONTROLS is freed BEFORE the local API (and its DB) stops, so a
+  //     desk can never stay "controlled" by a closed app (control otherwise
+  //     would only expire via the 3-min heartbeat sweeper after restart).
+  //     Strictly best-effort: try/catch + a hard 5s bound — shutdown is NEVER
+  //     blocked by the release.
+  try {
+    const localApi = require('./local-api/index');
+    if (typeof localApi.releaseAllCountersForSession === 'function') {
+      const boundedRelease = await Promise.race([
+        localApi.releaseAllCountersForSession(),
+        new Promise((resolve) => setTimeout(() => resolve(-1), 2500)),
+      ]);
+      if (boundedRelease > 0) {
+        console.log('[BLASTI Desktop] Shutdown auto-release: freed ' + boundedRelease + ' counter(s) controlled by the session user');
+      } else if (boundedRelease === -1) {
+        console.warn('[BLASTI Desktop] Shutdown counter auto-release timed out (non-fatal) — the heartbeat sweeper will free stale control');
+      }
+    }
+  } catch (err) {
+    console.warn('[BLASTI Desktop] Shutdown counter auto-release failed (non-fatal):', err && err.message);
   }
 
   // 3. Stop the embedded local API: closes the realtime socket server, the

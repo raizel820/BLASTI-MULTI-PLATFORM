@@ -183,6 +183,11 @@ CREATE TABLE "SubscriptionPlan" (
     "maxServices" INTEGER NOT NULL DEFAULT 5,
     "maxBranches" INTEGER NOT NULL DEFAULT 1,
     "maxStaff" INTEGER NOT NULL DEFAULT 3,
+    -- Feature C: maximum ACTIVE counters per BRANCH (-1 = unlimited). Kept in
+    -- lockstep with the shared Prisma schema — without this column every
+    -- generated-client SubscriptionPlan read throws P2022 and the plan sync
+    -- silently drops the limit (plan caps never enforced locally).
+    "maxCounters" INTEGER NOT NULL DEFAULT 2,
     "maxActiveReservations" INTEGER NOT NULL DEFAULT 50,
     "maxSmsPerMonth" INTEGER NOT NULL DEFAULT 50,
     "kioskModeEnabled" BOOLEAN NOT NULL DEFAULT false,
@@ -672,12 +677,34 @@ CREATE TABLE "Counter" (
     "branchId" TEXT NOT NULL,
     "staffId" TEXT,
     "occupiedAt" DATETIME,
+    "serviceIds" TEXT,
+    "controlledByUserId" TEXT,
+    "controlledByStaffId" TEXT,
+    "controlClaimedAt" DATETIME,
+    "controlHeartbeatAt" DATETIME,
     "currentReservationId" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
     CONSTRAINT "Counter_branchId_fkey" FOREIGN KEY ("branchId") REFERENCES "Branch" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
     CONSTRAINT "Counter_staffId_fkey" FOREIGN KEY ("staffId") REFERENCES "AgencyStaff" ("id") ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT "Counter_currentReservationId_fkey" FOREIGN KEY ("currentReservationId") REFERENCES "Reservation" ("id") ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+-- CreateTable
+-- Feature C — pending "give me control of this counter" requests (the
+-- controller approves/rejects; owner / branch MANAGER bypass via transfer).
+-- Mirrors the CounterControlRequest model in prisma/schema.prisma (no FK
+-- constraints here: sync can deliver a request before its counter/user rows).
+CREATE TABLE IF NOT EXISTS "CounterControlRequest" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "counterId" TEXT NOT NULL,
+    "agencyId" TEXT NOT NULL,
+    "branchId" TEXT NOT NULL,
+    "requestedByUserId" TEXT NOT NULL,
+    "status" TEXT DEFAULT 'PENDING',
+    "createdAt" DATETIME DEFAULT CURRENT_TIMESTAMP,
+    "resolvedAt" DATETIME,
+    "resolvedByUserId" TEXT
 );
 
 -- CreateTable
@@ -1122,6 +1149,16 @@ CREATE UNIQUE INDEX "AgencyCategory_name_key" ON "AgencyCategory"("name");
 CREATE UNIQUE INDEX "Counter_currentReservationId_key" ON "Counter"("currentReservationId");
 
 -- CreateIndex
+-- Feature C — CounterControlRequest lookup indexes (mirror prisma @@index).
+CREATE INDEX IF NOT EXISTS "CounterControlRequest_counterId_status_idx" ON "CounterControlRequest"("counterId", "status");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "CounterControlRequest_agencyId_status_idx" ON "CounterControlRequest"("agencyId", "status");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "CounterControlRequest_requestedByUserId_status_idx" ON "CounterControlRequest"("requestedByUserId", "status");
+
+-- CreateIndex
 CREATE UNIQUE INDEX "DeviceRegistration_userId_deviceId_key" ON "DeviceRegistration"("userId", "deviceId");
 
 -- CreateIndex
@@ -1421,6 +1458,16 @@ CREATE INDEX "Review_agencyId_branchId_idx" ON "Review"("agencyId", "branchId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Counter_currentReservationId_key" ON "Counter"("currentReservationId");
+
+-- CreateIndex
+-- Feature C — CounterControlRequest lookup indexes (mirror prisma @@index).
+CREATE INDEX IF NOT EXISTS "CounterControlRequest_counterId_status_idx" ON "CounterControlRequest"("counterId", "status");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "CounterControlRequest_agencyId_status_idx" ON "CounterControlRequest"("agencyId", "status");
+
+-- CreateIndex
+CREATE INDEX IF NOT EXISTS "CounterControlRequest_requestedByUserId_status_idx" ON "CounterControlRequest"("requestedByUserId", "status");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "DeviceRegistration_userId_deviceId_key" ON "DeviceRegistration"("userId", "deviceId");

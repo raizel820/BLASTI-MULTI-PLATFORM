@@ -47,6 +47,9 @@ import {
   storeSessionToken,
   purgeAuthState,
 } from '@/lib/auth-storage';
+// Feature C — fire-and-forget release of controlled counters on logout
+// (keepalive POST /counters/release-mine; deduped with the pagehide trigger).
+import { fireReleaseMine } from '@/lib/counter-release';
 
 /**
  * Task 2-b — DESKTOP remember-me gate for the persisted store.
@@ -587,7 +590,7 @@ function sanitizePersistedState(state: any): {
 
 export const useAppStore = create<AppState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       user: null,
       isAuthenticated: false,
       sessionToken: '',
@@ -731,6 +734,23 @@ export const useAppStore = create<AppState>()(
       setOnboarded: (v: boolean) => set({ onboarded: v }),
 
       logout: () => {
+        // ─── Feature C: release every counter this user still controls ────
+        // BEFORE any state is cleared: read the sessionToken from the CURRENT
+        // state (it is gone after the set() below) and fire the keepalive
+        // release-mine request — UNCONDITIONALLY (the dashboard "claim" path
+        // and other tabs never write a localStorage marker, so a marker-gated
+        // release would miss live claims). Fire-and-forget with keepalive so
+        // it survives the '/' navigation below; the shared module-level
+        // timestamp (counter-release.ts) dedupes against the pagehide trigger
+        // in auth-provider. A user with zero controlled counters is a cheap
+        // server-side no-op.
+        try {
+          const preLogout = get();
+          if (preLogout.sessionToken) {
+            fireReleaseMine(preLogout.sessionToken);
+          }
+        } catch { /* never block logout */ }
+
         set({
           user: null,
           isAuthenticated: false,

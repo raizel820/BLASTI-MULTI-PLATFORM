@@ -103,7 +103,18 @@ export function useDashboardData() {
     try {
       const res = await apiFetch('/api/agency/queue/call-next', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) });
       if (res.ok) { toast.success(t('statusCalled')); fetchData(); }
-      else { const data = await res.json(); toast.error(data.details || data.error || t('noQueue')); }
+      else {
+        const data = await res.json();
+        // Feature C — counter control & queue gating codes (friendly toasts
+        // instead of raw error codes; legacy OCCUPY_COUNTER_FIRST kept).
+        let errorMsg: string = data.details || data.error || t('noQueue');
+        if (data.error === 'OCCUPY_COUNTER_FIRST') errorMsg = t('occupyFirst');
+        else if (data.error === 'COUNTER_SETUP_REQUIRED') errorMsg = t('counterSetupRequired');
+        else if (data.error === 'COUNTER_CONTROL_REQUIRED') errorMsg = t('counterControlRequired');
+        else if (data.error === 'SERVICE_NOT_ASSIGNED_TO_COUNTER') errorMsg = t('serviceNotAssigned');
+        else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) errorMsg = t('counterPermissionDenied');
+        toast.error(errorMsg);
+      }
     } catch { toast.error(t('error')); }
     finally { setActionLoading(null); }
   };

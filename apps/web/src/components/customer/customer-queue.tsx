@@ -104,6 +104,7 @@ interface Reservation {
   etaMax?: number;
   etaConfidence?: 'high' | 'medium' | 'low';
   currentServingNumber: string;
+  counterInfo?: { number: number; name: string; nameAr?: string | null; nameFr?: string | null } | null;
   agencyName: string;
   agencyNameAr?: string;
   agencyNameFr?: string;
@@ -188,6 +189,7 @@ export function CustomerQueue() {
             etaMax: (etaData?.estimatedMaxMinutes as number) || (r.estimatedWait as number) || 0,
             etaConfidence: (etaData?.confidence as 'high' | 'medium' | 'low') || 'medium',
             currentServingNumber: (r.currentServingNumber as string) || '0',
+            counterInfo: (r.counterInfo as Reservation['counterInfo']) ?? null,
             agencyId: (r.agencyId as string) || agency?.id || '',
             agencyName: agency?.name || t('defaultAgency'),
             agencyNameAr: agency?.nameAr,
@@ -984,7 +986,11 @@ export function CustomerQueue() {
             <p className="text-base font-bold text-emerald-700 dark:text-emerald-400">
               {res.currentServingNumber}
             </p>
-            <p className="text-[9px] text-muted-foreground">{t('currentServing')}</p>
+            <p className="text-[9px] text-muted-foreground">
+              {t('currentServing')}
+              {/* Feature C: show which counter is serving when known */}
+              {res.counterInfo?.number ? ` · #${res.counterInfo.number}` : ''}
+            </p>
           </div>
         </div>
 

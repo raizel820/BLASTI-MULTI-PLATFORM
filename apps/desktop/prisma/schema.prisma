@@ -78,6 +78,8 @@ model User {
   devices                 DeviceRegistration[]
   deviceCredentials       LocalDeviceCredential[]
   verificationCodes       VerificationCode[]
+  controlledCounters      Counter[]            @relation("CounterControlledBy")
+  counterControlRequests  CounterControlRequest[] @relation("CounterControlRequests")
 }
 
 /// One-time verification codes (OTP) for email/phone verification and
@@ -319,6 +321,8 @@ model SubscriptionPlan {
   maxServices       Int      @default(5)
   maxBranches       Int      @default(1)
   maxStaff          Int      @default(3)
+  /// Maximum ACTIVE counters per BRANCH (-1 = unlimited).
+  maxCounters       Int      @default(2)
   maxActiveReservations Int  @default(50)
   maxSmsPerMonth    Int      @default(50)
   kioskModeEnabled  Boolean  @default(false)
@@ -901,19 +905,49 @@ model Counter {
   isActive             Boolean      @default(true)
   branchId             String
   branch               Branch       @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  /// Default/assigned staff member (roster assignment). NOT the live operator.
   staffId              String?
   staff                AgencyStaff? @relation(fields: [staffId], references: [id])
-  /// Task 37-c: counter OCCUPATION timestamp. `staffId` is repurposed as
-  /// "occupied by" (no new staff relation column): staff occupation sets BOTH
-  /// staffId + occupiedAt; an owner occupation sets occupiedAt ONLY. Release
-  /// clears staffId (when it was the releaser's) + occupiedAt=null.
+  /// Legacy occupation timestamp (Task 37-c). Live control lives in the
+  /// controlledBy* / controlClaimedAt / controlHeartbeatAt fields below.
   occupiedAt           DateTime?
+  /// Counter→service assignment (JSON array of Service ids). null/empty =
+  /// serves ALL agency services. Counters sharing a service share the queue.
+  serviceIds           String?
+  /// Counter CONTROL (live operator claim): one account at a time; released
+  /// on logout / app close / stale heartbeat.
+  controlledByUserId   String?
+  controlledByUser     User?        @relation("CounterControlledBy", fields: [controlledByUserId], references: [id])
+  controlledByStaffId  String?
+  controlClaimedAt     DateTime?
+  controlHeartbeatAt   DateTime?
   currentReservationId String?       @unique
   currentReservation   Reservation?  @relation("CurrentReservation", fields: [currentReservationId], references: [id])
   createdAt            DateTime     @default(now())
   updatedAt            DateTime     @updatedAt
 
   servedReservations Reservation[] @relation("ServedByCounter")
+  controlRequests    CounterControlRequest[]
+}
+
+/// Pending "give me control of this counter" requests (controller approves;
+/// owner/branch-manager can bypass via transfer).
+model CounterControlRequest {
+  id                String    @id @default(cuid())
+  counterId         String
+  counter           Counter   @relation(fields: [counterId], references: [id], onDelete: Cascade)
+  agencyId          String
+  branchId          String
+  requestedByUserId String
+  requester         User?     @relation("CounterControlRequests", fields: [requestedByUserId], references: [id])
+  status            String    @default("PENDING") // PENDING | APPROVED | REJECTED | CANCELLED | SUPERSEDED
+  createdAt         DateTime  @default(now())
+  resolvedAt        DateTime?
+  resolvedByUserId  String?
+
+  @@index([counterId, status])
+  @@index([agencyId, status])
+  @@index([requestedByUserId, status])
 }
 
 model DeviceRegistration {

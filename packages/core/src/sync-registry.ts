@@ -278,7 +278,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     isAgencyScoped: true,
     agencyField: null, // scoped via Branch relation
     conflictStrategy: ConflictStrategy.VERSION_AWARE,
-    mutableFields: ['number', 'name', 'nameAr', 'nameFr', 'isActive', 'branchId', 'staffId', 'occupiedAt', 'currentReservationId'],
+    mutableFields: ['number', 'name', 'nameAr', 'nameFr', 'isActive', 'branchId', 'staffId', 'occupiedAt', 'serviceIds', 'controlledByUserId', 'controlledByStaffId', 'controlClaimedAt', 'controlHeartbeatAt', 'currentReservationId'],
     immutableFields: ['id', 'createdAt', 'updatedAt'],
     localOnlyFields: ['syncVersion', 'syncedAt'],
     cloudOnlyFields: [],
@@ -291,7 +291,35 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     canDeleteOffline: false,
     isReadOnly: false,
     syncOrder: 8,
-    dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
+    dateFields: ['createdAt', 'updatedAt', 'syncedAt', 'controlClaimedAt', 'controlHeartbeatAt'],
+  },
+
+  {
+    // Counter control claim requests: a staff account asks for control of a
+    // counter held by another account; the holder approves/rejects (owner /
+    // branch MANAGER can bypass approval with transfer-control). Created
+    // locally (offline) and resolved wherever the counter is controlled.
+    model: 'CounterControlRequest',
+    delegate: 'counterControlRequest',
+    label: 'Counter Control Request',
+    isSynced: true,
+    isAgencyScoped: true,
+    agencyField: 'agencyId',
+    conflictStrategy: ConflictStrategy.VERSION_AWARE,
+    mutableFields: ['status', 'resolvedAt', 'resolvedByUserId'],
+    immutableFields: ['id', 'counterId', 'branchId', 'requestedByUserId', 'createdAt'],
+    localOnlyFields: ['syncVersion', 'syncedAt'],
+    cloudOnlyFields: [],
+    lwwFields: ['updatedAt'],
+    versionField: 'syncVersion',
+    syncedAtField: 'syncedAt',
+    dependencies: ['Counter'],
+    canCreateOffline: true,
+    canUpdateOffline: true,
+    canDeleteOffline: false,
+    isReadOnly: false,
+    syncOrder: 22,
+    dateFields: ['createdAt', 'updatedAt', 'syncedAt', 'resolvedAt'],
   },
 
   {
@@ -603,7 +631,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     immutableFields: [
       'id', 'name', 'displayName', 'displayNameAr', 'displayNameFr',
       'description', 'descriptionAr', 'descriptionFr', 'price', 'currency',
-      'billingCycle', 'maxServices', 'maxBranches', 'maxStaff',
+      'billingCycle', 'maxServices', 'maxBranches', 'maxStaff', 'maxCounters',
       'maxActiveReservations', 'maxSmsPerMonth', 'kioskModeEnabled',
       'analyticsEnabled', 'priorityListing', 'customBranding', 'apiAccess',
       'isActive', 'sortOrder', 'quarterlyDiscount', 'semiAnnualDiscount',

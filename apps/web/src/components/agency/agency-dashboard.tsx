@@ -445,8 +445,12 @@ export function AgencyDashboard() {
         const data = await res.json();
         // Task 37-e: staff must operate from an occupied counter — surface the
         // authority errors as friendly messages instead of raw codes.
+        // Feature C — counter control & queue gating codes.
         let errorMsg: string = data.details || data.error || t('noQueue');
         if (data.error === 'OCCUPY_COUNTER_FIRST') errorMsg = t('occupyFirst');
+        else if (data.error === 'COUNTER_SETUP_REQUIRED') errorMsg = t('counterSetupRequired');
+        else if (data.error === 'COUNTER_CONTROL_REQUIRED') errorMsg = t('counterControlRequired');
+        else if (data.error === 'SERVICE_NOT_ASSIGNED_TO_COUNTER') errorMsg = t('serviceNotAssigned');
         else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) errorMsg = t('counterPermissionDenied');
         toast.error(errorMsg);
       }
@@ -1542,6 +1546,7 @@ export function AgencyDashboard() {
             onCallNext={handleCallNext}
             agencyId={agencyId}
             subscriptionActive={!queueLocked}
+            onViewFullscreen={() => setView('agency-fullscreen')}
             lang={lang}
             t={t as any}
           />

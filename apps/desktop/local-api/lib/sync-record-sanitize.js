@@ -48,7 +48,12 @@ function _parseDdl() {
     const ddlPath = path.join(__dirname, 'schema-init-sql.js')
     const sql = require(ddlPath)
     _parseSource = ddlPath
-    const createRe = /CREATE TABLE "([^"]+)" \(([\s\S]*?)\n\);/g
+    // Feature C: also match "CREATE TABLE IF NOT EXISTS" (the
+    // CounterControlRequest table is declared that way so the migration
+    // convergence pass can run the same DDL idempotently — without this
+    // alternative the sanitizer would treat the model as unknown and pass
+    // cloud rows through unguarded).
+    const createRe = /CREATE TABLE (?:IF NOT EXISTS )?"([^"]+)" \(([\s\S]*?)\n\);/g
     let m
     while ((m = createRe.exec(sql)) !== null) {
       const table = m[1]

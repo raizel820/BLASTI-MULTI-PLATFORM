@@ -21,6 +21,25 @@ import { calculateETA, getEffectiveServiceTime } from '../lib/eta-calculator'
 import { z } from 'zod'
 import QRCode from 'qrcode'
 import { recordSyncChange, recordSyncChangeNow } from '../lib/sync-helpers'
+// UNIFIED QUEUE — atomic next-ticket claiming (the ONE shared implementation
+// for every call-next surface: DB-level mutual exclusion, staff+counter
+// assignment in a single transaction, automatic concurrent-operation retry)
+// and the shared transaction retry wrapper for status-update conflicts.
+import { claimNextTicket } from '../lib/queue-claim'
+import {
+  claimCounterControl,
+  releaseCounterControl,
+  counterControlHeartbeat,
+  enforceCounterControlGate,
+  canBypassCounterApproval,
+  isUserActiveMember,
+  releaseAllUserControl,
+  transferCounterControl,
+  parseCounterServiceIds,
+  getControlledByInfo,
+  CONTROL_TTL_MS,
+} from '../lib/counter-control'
+import { withTxRetry } from '../lib/tx-retry'
 import { normalizeRecordFileUrls } from '../lib/file-url'
 import { computeAnalyticsDashboard, DASHBOARD_PERIODS, round1, type DashboardPeriod } from '../lib/analytics-dashboard'
 import {
@@ -190,6 +209,61 @@ async function checkPlanLimit(
   return { ok: true }
 }
 
+// ─── Feature C: per-branch counter limit (SubscriptionPlan.maxCounters) ─────
+//
+// Each branch can only hold as many ACTIVE counters as its subscription plan
+// allows (maxCounters, -1 = unlimited). Same fail-open contract as
+// checkPlanLimit: a missing plan catalog must never block counter setup.
+async function checkBranchCounterLimit(
+  branchId: string,
+  agencyId: string,
+): Promise<{ ok: true } | { ok: false; limit: number; current: number; message: string }> {
+  const agency = await db.agency.findUnique({
+    where: { id: agencyId },
+    select: { subscriptionPlanId: true },
+  })
+  if (!agency) return { ok: true }
+
+  let plan = agency.subscriptionPlanId
+    ? await db.subscriptionPlan.findUnique({ where: { id: agency.subscriptionPlanId } })
+    : null
+  if (!plan) {
+    plan = await db.subscriptionPlan.findFirst({ where: { name: 'FREE' } })
+  }
+  if (!plan) return { ok: true }
+
+  const limit = (plan as unknown as { maxCounters?: number }).maxCounters
+  if (limit === null || limit === undefined || limit === -1) return { ok: true }
+
+  const current = await db.counter.count({ where: { branchId, isActive: true } })
+  if (current >= limit) {
+    return {
+      ok: false,
+      limit,
+      current,
+      message: `Your ${plan.displayName} plan allows up to ${limit} counters per branch. Upgrade your subscription to add more.`,
+    }
+  }
+  return { ok: true }
+}
+
+/** Validate counter→service assignment: every id must be an agency service. Returns the deduped list. */
+async function validateCounterServiceIds(
+  agencyId: string,
+  serviceIds: string[],
+): Promise<{ ok: true; normalized: string[] } | { ok: false; error: string }> {
+  const unique = [...new Set(serviceIds)]
+  if (unique.length === 0) return { ok: true, normalized: [] }
+  const services = await db.service.findMany({
+    where: { agencyId, id: { in: unique } },
+    select: { id: true },
+  })
+  if (services.length !== unique.length) {
+    return { ok: false, error: 'One or more services do not belong to this agency' }
+  }
+  return { ok: true, normalized: unique }
+}
+
 // ─── Task 37-c: 2-tier staff authority helpers ────────────────────────────
 //
 // Authority model (user-facing):
@@ -264,16 +338,21 @@ function pickKnownPermissions(input: unknown): Partial<Record<StaffPermission, b
 }
 
 /**
- * Queue authority + counter-occupancy gate (Task 37-c).
+ * Queue authority gate (Task 37-c, updated for Feature C control model).
  *
  * Owner/SUPER_ADMIN pass untouched (owner keeps counterId optional). Staff
- * need the ALWAYS-SHARED canManageQueue authority AND an occupied counter:
- *   - counterId provided → that counter MUST be occupied by the caller
- *     (Counter.staffId === caller's AgencyStaff.id) → else 403
- *     OCCUPY_COUNTER_FIRST (also 403 when the counter is not theirs).
- *   - no counterId → caller must occupy SOME active counter in the agency.
+ * need the ALWAYS-SHARED canManageQueue authority AND live CONTROL of a
+ * counter (controlledByUserId === user.id — the staffId/occupiedAt columns
+ * are legacy roster/display fields and no longer gate anything):
+ *   - counterId provided → that counter MUST be controlled by the caller
+ *     → else 403 OCCUPY_COUNTER_FIRST (legacy code kept for client compat).
+ *   - no counterId → caller must control SOME active counter in the agency.
  * A staff member without an active AgencyStaff row or without canManageQueue
  * gets 403 PERMISSION_DENIED:canManageQueue.
+ *
+ * NOTE: call-next uses the STRICTER enforceCounterControlGate (owner included)
+ * — see lib/counter-control.ts. This gate only backs walk-in / pause / ticket
+ * status actions where owner bypass remains intentional.
  */
 async function enforceQueueStaffAuthority(
   user: SessionUser,
@@ -291,19 +370,19 @@ async function enforceQueueStaffAuthority(
   if (counterId) {
     const counter = await db.counter.findFirst({
       where: { id: counterId, branch: { agencyId } },
-      select: { id: true, staffId: true },
+      select: { id: true, controlledByUserId: true },
     })
-    if (!counter || counter.staffId !== authority.staffId) {
+    if (!counter || counter.controlledByUserId !== user.id) {
       return { ok: false, status: 403, error: 'OCCUPY_COUNTER_FIRST' }
     }
     return { ok: true }
   }
 
-  const occupied = await db.counter.findFirst({
-    where: { staffId: authority.staffId, branch: { agencyId }, isActive: true },
+  const controlled = await db.counter.findFirst({
+    where: { controlledByUserId: user.id, branch: { agencyId }, isActive: true },
     select: { id: true },
   })
-  if (!occupied) {
+  if (!controlled) {
     return { ok: false, status: 403, error: 'OCCUPY_COUNTER_FIRST' }
   }
   return { ok: true }
@@ -671,12 +750,20 @@ app.get('/counters', async (c) => {
       where: { branch: { agencyId } },
       include: {
         staff: { include: { user: { select: { fullName: true, username: true } } } },
+        controlledByUser: { select: { id: true, fullName: true, username: true } },
         currentReservation: { select: { id: true, displayNumber: true, status: true } },
       },
       orderBy: { number: 'asc' },
     })
 
-    return c.json({ success: true, counters })
+    // Feature C: expose the parsed service assignment alongside the raw JSON.
+    return c.json({
+      success: true,
+      counters: counters.map((counter) => ({
+        ...counter,
+        serviceIdList: parseCounterServiceIds((counter as { serviceIds?: string | null }).serviceIds),
+      })),
+    })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -996,12 +1083,20 @@ app.get('/branches/:id/counters', async (c) => {
       where: { branchId },
       include: {
         staff: { include: { user: { select: { fullName: true, username: true } } } },
+        controlledByUser: { select: { id: true, fullName: true, username: true } },
         currentReservation: { select: { id: true, displayNumber: true, status: true } },
       },
       orderBy: { number: 'asc' },
     })
 
-    return c.json({ success: true, counters })
+    // Feature C: expose the parsed service assignment alongside the raw JSON.
+    return c.json({
+      success: true,
+      counters: counters.map((counter) => ({
+        ...counter,
+        serviceIdList: parseCounterServiceIds((counter as { serviceIds?: string | null }).serviceIds),
+      })),
+    })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -1040,6 +1135,33 @@ app.post('/branches/:id/counters', async (c) => {
       )
     }
 
+    // Feature C: the branch can only hold as many ACTIVE counters as its
+    // subscription plan allows (maxCounters per branch).
+    const limitCheck = await checkBranchCounterLimit(branchId, branch.agencyId)
+    if (!limitCheck.ok) {
+      return c.json(
+        {
+          success: false,
+          error: 'PLAN_LIMIT_REACHED',
+          message: limitCheck.message,
+          limit: limitCheck.limit,
+          current: limitCheck.current,
+          resource: 'counters',
+        },
+        403,
+      )
+    }
+
+    // Feature C: counter→service assignment — every id must be an agency service.
+    let serviceIdList: string[] = []
+    if (data.serviceIds && data.serviceIds.length > 0) {
+      const svc = await validateCounterServiceIds(branch.agencyId, data.serviceIds)
+      if (!svc.ok) {
+        return c.json({ success: false, error: svc.error }, 400)
+      }
+      serviceIdList = svc.normalized
+    }
+
     const counter = await db.counter.create({
       data: {
         number: data.number,
@@ -1047,6 +1169,9 @@ app.post('/branches/:id/counters', async (c) => {
         nameAr: data.nameAr || null,
         nameFr: data.nameFr || null,
         branchId,
+        ...(data.serviceIds !== undefined
+          ? { serviceIds: serviceIdList.length > 0 ? JSON.stringify(serviceIdList) : null }
+          : {}),
       },
     })
 
@@ -1103,6 +1228,48 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
       }
     }
 
+    // Feature C: counter→service assignment update (empty array = serve all).
+    let serviceIdsPatch: string | null | undefined
+    if (data.serviceIds !== undefined) {
+      const svc = await validateCounterServiceIds(counter.branch.agencyId, data.serviceIds ?? [])
+      if (!svc.ok) {
+        return c.json({ success: false, error: svc.error }, 400)
+      }
+      serviceIdsPatch = svc.normalized.length > 0 ? JSON.stringify(svc.normalized) : null
+      // Re-activating a counter? It re-occupies a plan slot — enforce the limit.
+      if (data.isActive === true && !counter.isActive) {
+        const limitCheck = await checkBranchCounterLimit(branchId, counter.branch.agencyId)
+        if (!limitCheck.ok) {
+          return c.json(
+            {
+              success: false,
+              error: 'PLAN_LIMIT_REACHED',
+              message: limitCheck.message,
+              limit: limitCheck.limit,
+              current: limitCheck.current,
+              resource: 'counters',
+            },
+            403,
+          )
+        }
+      }
+    } else if (data.isActive === true && !counter.isActive) {
+      const limitCheck = await checkBranchCounterLimit(branchId, counter.branch.agencyId)
+      if (!limitCheck.ok) {
+        return c.json(
+          {
+            success: false,
+            error: 'PLAN_LIMIT_REACHED',
+            message: limitCheck.message,
+            limit: limitCheck.limit,
+            current: limitCheck.current,
+            resource: 'counters',
+          },
+          403,
+        )
+      }
+    }
+
     const updated = await db.counter.update({
       where: { id: counterId },
       data: {
@@ -1111,6 +1278,7 @@ app.patch('/branches/:id/counters/:counterId', async (c) => {
         ...(data.nameFr !== undefined && { nameFr: data.nameFr || null }),
         ...(data.isActive !== undefined && { isActive: data.isActive }),
         ...(data.staffId !== undefined && { staffId: data.staffId }),
+        ...(serviceIdsPatch !== undefined && { serviceIds: serviceIdsPatch }),
       },
     })
 
@@ -1233,39 +1401,38 @@ async function handleCounterOccupy(c: Context) {
       return c.json({ success: false, error: 'PERMISSION_DENIED:canManageQueue' }, 403)
     }
 
-    // Held by ANOTHER ACTIVE staff member? → 409. A stale staffId pointing at
-    // a deleted/inactive row is treated as free and gets taken over.
-    if (counter.staffId && counter.staffId !== authority.staffId) {
-      const occupier = await db.agencyStaff.findUnique({
-        where: { id: counter.staffId },
-        select: { isActive: true },
-      })
-      if (occupier?.isActive) {
-        return c.json({ success: false, error: 'COUNTER_OCCUPIED' }, 409)
-      }
+    // Feature C — ATOMIC claim of counter control. Free (or stale-heartbeat)
+    // counters are claimed; a counter held by another live member returns 409
+    // COUNTER_CONTROLLED with the controller's identity so the client can
+    // offer the "request control" flow.
+    const claim = await claimCounterControl({
+      counterId: counter.id,
+      agencyId,
+      userId: user.id,
+      staffId: authority.staffId,
+    })
+    if (!claim.ok) {
+      return c.json(
+        {
+          success: false,
+          error: claim.error === 'COUNTER_CONTROLLED' ? 'COUNTER_OCCUPIED' : claim.error,
+          controlError: claim.error,
+          ...(claim.controlledBy ? { controlledBy: claim.controlledBy } : {}),
+        },
+        claim.status as any,
+      )
     }
 
-    // Staff occupation sets BOTH staffId + occupiedAt; owner/SUPER_ADMIN sets
-    // occupiedAt ONLY (staffId stays untouched — owners have no staff row).
-    const updated = await db.counter.update({
-      where: { id: counter.id },
-      data: {
-        ...(authority.staffId ? { staffId: authority.staffId } : {}),
-        occupiedAt: new Date(),
-      },
-      include: { branch: { select: { id: true, name: true } } },
-    })
-
-    // Fire-safe change-feed row so desktop sync + realtime see the occupation.
+    // Fire-safe change-feed row so desktop sync + realtime see the claim.
     await recordSyncChangeNow({ agencyId, model: 'Counter', recordId: counter.id, operation: 'update' })
     emitAgencyEvent('agency:updated', agencyId, {
-      action: 'counter-occupied',
+      action: 'counter-controlled',
       counterId: counter.id,
-      staffId: authority.staffId,
+      controlledByUserId: user.id,
       branchId: counter.branch.id,
     })
 
-    return c.json({ success: true, counter: updated })
+    return c.json({ success: true, counter: claim.counter, refreshed: claim.refreshed })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -1283,19 +1450,19 @@ async function handleCounterRelease(c: Context) {
     const user = await requireAuth(c)
 
     const authority = await getAgencyAuthority(user.id, agencyId)
-    // Staff can release ONLY their own occupation; owner/SUPER_ADMIN can
-    // release any counter in their agency.
-    if (user.role !== 'SUPER_ADMIN' && !authority.isOwner) {
-      if (!authority.staffId || counter.staffId !== authority.staffId) {
-        return c.json({ success: false, error: 'NOT_COUNTER_OCCUPIER' }, 403)
-      }
-    }
-
-    const updated = await db.counter.update({
-      where: { id: counter.id },
-      data: { staffId: null, occupiedAt: null },
-      include: { branch: { select: { id: true, name: true } } },
+    // Controller can release their own control; agency owner / branch
+    // MANAGER / SUPER_ADMIN can force-release anyone's counter.
+    const bypass = user.role === 'SUPER_ADMIN' || authority.isOwner
+      || (authority.staffId != null && await canBypassCounterApproval(user, agencyId, counter.branch.id))
+    const release = await releaseCounterControl({
+      counterId: counter.id,
+      agencyId,
+      userId: user.id,
+      force: bypass,
     })
+    if (!release.ok) {
+      return c.json({ success: false, error: release.error }, release.status as any)
+    }
 
     await recordSyncChangeNow({ agencyId, model: 'Counter', recordId: counter.id, operation: 'update' })
     emitAgencyEvent('agency:updated', agencyId, {
@@ -1304,6 +1471,10 @@ async function handleCounterRelease(c: Context) {
       branchId: counter.branch.id,
     })
 
+    const updated = await db.counter.findUnique({
+      where: { id: counter.id },
+      include: { branch: { select: { id: true, name: true } } },
+    })
     return c.json({ success: true, counter: updated })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -1333,6 +1504,338 @@ app.post('/branches/:id/counters/:counterId/release', async (c) => {
     return c.json({ success: false, error: 'Counter not found' }, 404)
   }
   return handleCounterRelease(c)
+})
+
+// ─── Feature C: counter control — heartbeat / requests / transfer ────────────
+
+/** POST /counters/:counterId/heartbeat — controller liveness ping (60s cadence). */
+app.post('/counters/:counterId/heartbeat', async (c) => {
+  try {
+    const resolved = await resolveCounterForOccupation(c)
+    if (!resolved.ok) return c.json(resolved.body, resolved.status as any)
+    const agencyId = resolved.counter.branch.agencyId
+    const user = await requireAuth(c)
+    const beat = await counterControlHeartbeat({ counterId: resolved.counter.id, agencyId, userId: user.id })
+    if (!beat.ok) return c.json({ success: false, error: beat.error }, beat.status as any)
+    return c.json({ success: true, counterId: beat.counterId, serverTime: new Date().toISOString() })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+/**
+ * POST /counters/:counterId/request-control — claim when free; when another
+ * account controls it, file a CounterControlRequest the controller must
+ * approve (owner / branch MANAGER are auto-granted instead).
+ */
+app.post('/counters/:counterId/request-control', async (c) => {
+  try {
+    const resolved = await resolveCounterForOccupation(c)
+    if (!resolved.ok) return c.json(resolved.body, resolved.status as any)
+    const counter = resolved.counter
+    const agencyId = counter.branch.agencyId
+    const user = await requireAuth(c)
+    const authority = await getAgencyAuthority(user.id, agencyId)
+    if (user.role !== 'SUPER_ADMIN' && !authority.isOwner && !authority.staffId) {
+      return c.json({ success: false, error: 'PERMISSION_DENIED:canManageQueue' }, 403)
+    }
+
+    const current = await db.counter.findUnique({
+      where: { id: counter.id },
+      select: { controlledByUserId: true, controlHeartbeatAt: true },
+    })
+    const freeOrStale =
+      !current?.controlledByUserId ||
+      !current.controlHeartbeatAt ||
+      current.controlHeartbeatAt < new Date(Date.now() - CONTROL_TTL_MS)
+
+    if (freeOrStale || current.controlledByUserId === user.id) {
+      const claim = await claimCounterControl({ counterId: counter.id, agencyId, userId: user.id, staffId: authority.staffId })
+      if (claim.ok) {
+        emitAgencyEvent('agency:updated', agencyId, {
+          action: 'counter-controlled',
+          counterId: counter.id,
+          controlledByUserId: user.id,
+          branchId: counter.branch.id,
+        })
+        return c.json({ success: true, status: 'GRANTED', counter: claim.counter })
+      }
+      return c.json({ success: false, error: claim.error, controlledBy: claim.controlledBy }, claim.status as any)
+    }
+
+    // Owner / branch MANAGER bypass the approval flow entirely.
+    if (user.role !== 'SUPER_ADMIN' && (authority.isOwner || (await canBypassCounterApproval(user, agencyId, counter.branch.id)))) {
+      const transfer = await transferCounterControl({
+        counterId: counter.id,
+        agencyId,
+        toUserId: user.id,
+        toStaffId: authority.staffId,
+        actorUserId: user.id,
+      })
+      if (transfer.ok) {
+        return c.json({ success: true, status: 'GRANTED', counter: transfer.counter })
+      }
+      return c.json({ success: false, error: transfer.error }, transfer.status as any)
+    }
+
+    // Held by another live member → upsert a PENDING request (one per requester).
+    const existing = await db.counterControlRequest.findFirst({
+      where: { counterId: counter.id, requestedByUserId: user.id, status: 'PENDING' },
+    })
+    const request = existing ?? (await db.counterControlRequest.create({
+      data: {
+        counterId: counter.id,
+        agencyId,
+        branchId: counter.branch.id,
+        requestedByUserId: user.id,
+      },
+    }))
+    const controlledBy = await getControlledByInfo({ controlledByUserId: current.controlledByUserId, controlledByStaffId: null })
+    emitAgencyEvent('agency:updated', agencyId, {
+      action: 'counter-control-requested',
+      counterId: counter.id,
+      requestId: request.id,
+      requestedByUserId: user.id,
+      controlledByUserId: current.controlledByUserId,
+    })
+    return c.json({
+      success: true,
+      status: 'REQUEST_PENDING',
+      request: { id: request.id, status: request.status, createdAt: request.createdAt },
+      controlledBy,
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+/** GET /counters/control-requests?agencyId=&status=PENDING — requests I filed + pending on counters I control. */
+app.get('/counters/control-requests', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const agencyId = user.agencyId || (await resolveUserAgencyId(user))
+    if (!agencyId) return c.json({ success: true, incoming: [], outgoing: [] })
+    await ensureAgencyIdOwnership(c, agencyId)
+    await requireAgencyAccess(c, agencyId)
+
+    const status = c.req.query('status') || 'PENDING'
+    const controlled = await db.counter.findMany({
+      where: { controlledByUserId: user.id, branch: { agencyId } },
+      select: { id: true },
+    })
+    const controlledIds = controlled.map((x) => x.id)
+
+    const [incoming, outgoing] = await Promise.all([
+      db.counterControlRequest.findMany({
+        where: { agencyId, status, counterId: { in: controlledIds } },
+        include: {
+          counter: { select: { id: true, number: true, name: true, nameAr: true } },
+          requester: { select: { id: true, fullName: true, username: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      }),
+      db.counterControlRequest.findMany({
+        where: { agencyId, requestedByUserId: user.id, ...(status === 'ALL' ? {} : { status }) },
+        include: {
+          counter: { select: { id: true, number: true, name: true, nameAr: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      }),
+    ])
+    return c.json({ success: true, incoming, outgoing })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+/** POST /counters/control-requests/:id/approve — controller (or owner/manager) approves → atomic transfer. */
+app.post('/counters/control-requests/:id/approve', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const request = await db.counterControlRequest.findUnique({
+      where: { id: c.req.param('id') },
+      include: { counter: { select: { id: true, controlledByUserId: true, branchId: true, branch: { select: { agencyId: true } } } } },
+    })
+    if (!request) return c.json({ success: false, error: 'Request not found' }, 404)
+    const agencyId = request.counter.branch.agencyId
+    await ensureAgencyIdOwnership(c, agencyId)
+    if (request.status !== 'PENDING') {
+      return c.json({ success: false, error: `Request already ${request.status.toLowerCase()}` }, 409)
+    }
+
+    const authority = await getAgencyAuthority(user.id, agencyId)
+    const isController = request.counter.controlledByUserId === user.id
+    const bypass = await canBypassCounterApproval(user, agencyId, request.counter.branchId)
+    if (!isController && !bypass) {
+      return c.json({ success: false, error: 'NOT_COUNTER_CONTROLLER' }, 403)
+    }
+
+    // The requester must still be a live member.
+    if (!(await isUserActiveMember(request.requestedByUserId, agencyId))) {
+      return c.json({ success: false, error: 'Requester is no longer an active member' }, 409)
+    }
+
+    const counterNow = await db.counter.findUnique({
+      where: { id: request.counterId },
+      select: { controlledByUserId: true },
+    })
+    if (!counterNow?.controlledByUserId) {
+      // Freed meanwhile → the requester can just claim; auto-grant here.
+      const requesterAuthority = await getAgencyAuthority(request.requestedByUserId, agencyId)
+      const claim = await claimCounterControl({
+        counterId: request.counterId,
+        agencyId,
+        userId: request.requestedByUserId,
+        staffId: requesterAuthority.staffId,
+      })
+      if (claim.ok) {
+        await db.counterControlRequest.update({
+          where: { id: request.id },
+          data: { status: 'APPROVED', resolvedAt: new Date(), resolvedByUserId: user.id },
+        })
+        emitAgencyEvent('agency:updated', agencyId, {
+          action: 'counter-controlled',
+          counterId: request.counterId,
+          controlledByUserId: request.requestedByUserId,
+        })
+        return c.json({ success: true, status: 'APPROVED', counter: claim.counter })
+      }
+      return c.json({ success: false, error: claim.error }, claim.status as any)
+    }
+
+    const transfer = await transferCounterControl({
+      counterId: request.counterId,
+      agencyId,
+      toUserId: request.requestedByUserId,
+      actorUserId: user.id,
+      expectFromUserId: counterNow.controlledByUserId,
+    })
+    if (!transfer.ok) return c.json({ success: false, error: transfer.error }, transfer.status as any)
+
+    await db.counterControlRequest.update({
+      where: { id: request.id },
+      data: { status: 'APPROVED', resolvedAt: new Date(), resolvedByUserId: user.id },
+    })
+    // Supersede any other PENDING requests for the same counter.
+    await db.counterControlRequest.updateMany({
+      where: { counterId: request.counterId, status: 'PENDING', id: { not: request.id } },
+      data: { status: 'SUPERSEDED', resolvedAt: new Date(), resolvedByUserId: user.id },
+    })
+    emitAgencyEvent('agency:updated', agencyId, {
+      action: 'counter-control-approved',
+      counterId: request.counterId,
+      controlledByUserId: request.requestedByUserId,
+    })
+    return c.json({ success: true, status: 'APPROVED', counter: transfer.counter })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+/** POST /counters/control-requests/:id/reject — controller (or owner/manager) rejects. */
+app.post('/counters/control-requests/:id/reject', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const request = await db.counterControlRequest.findUnique({
+      where: { id: c.req.param('id') },
+      include: { counter: { select: { id: true, controlledByUserId: true, branchId: true, branch: { select: { agencyId: true } } } } },
+    })
+    if (!request) return c.json({ success: false, error: 'Request not found' }, 404)
+    const agencyId = request.counter.branch.agencyId
+    await ensureAgencyIdOwnership(c, agencyId)
+    if (request.status !== 'PENDING') {
+      return c.json({ success: false, error: `Request already ${request.status.toLowerCase()}` }, 409)
+    }
+    const isController = request.counter.controlledByUserId === user.id
+    const bypass = await canBypassCounterApproval(user, agencyId, request.counter.branchId)
+    if (!isController && !bypass) {
+      return c.json({ success: false, error: 'NOT_COUNTER_CONTROLLER' }, 403)
+    }
+    const updated = await db.counterControlRequest.update({
+      where: { id: request.id },
+      data: { status: 'REJECTED', resolvedAt: new Date(), resolvedByUserId: user.id },
+    })
+    emitAgencyEvent('agency:updated', agencyId, {
+      action: 'counter-control-rejected',
+      counterId: request.counterId,
+      requestId: request.id,
+    })
+    return c.json({ success: true, request: updated })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+/**
+ * POST /counters/:counterId/transfer-control { toUserId } — agency owner or
+ * branch MANAGER (or SUPER_ADMIN) manually hands control to a member without
+ * the current controller's approval. Atomic: fails if control changed mid-flight.
+ */
+app.post('/counters/:counterId/transfer-control', async (c) => {
+  try {
+    const resolved = await resolveCounterForOccupation(c)
+    if (!resolved.ok) return c.json(resolved.body, resolved.status as any)
+    const counter = resolved.counter
+    const agencyId = counter.branch.agencyId
+    const user = await requireAuth(c)
+    const body = await c.req.json().catch(() => ({}))
+    const toUserId = typeof body?.toUserId === 'string' ? body.toUserId : null
+    if (!toUserId) return c.json({ success: false, error: 'toUserId required' }, 400)
+    if (user.role !== 'SUPER_ADMIN' && !(await canBypassCounterApproval(user, agencyId, counter.branch.id))) {
+      return c.json({ success: false, error: 'PERMISSION_DENIED:counterTransfer' }, 403)
+    }
+    if (!(await isUserActiveMember(toUserId, agencyId))) {
+      return c.json({ success: false, error: 'Target user is not an active member' }, 404)
+    }
+    const toAuthority = await getAgencyAuthority(toUserId, agencyId)
+    const transfer = await transferCounterControl({
+      counterId: counter.id,
+      agencyId,
+      toUserId,
+      toStaffId: toAuthority.staffId,
+      actorUserId: user.id,
+    })
+    if (!transfer.ok) return c.json({ success: false, error: transfer.error }, transfer.status as any)
+    emitAgencyEvent('agency:updated', agencyId, {
+      action: 'counter-transferred',
+      counterId: counter.id,
+      controlledByUserId: toUserId,
+      branchId: counter.branch.id,
+    })
+    return c.json({ success: true, counter: transfer.counter })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+/**
+ * POST /counters/release-mine — release EVERY counter controlled by the caller.
+ * Fired on logout and on app close (keepalive) so control never outlives the
+ * session (Feature C auto-release requirement).
+ */
+app.post('/counters/release-mine', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const agencyIds = await releaseAllUserControl(user.id)
+    for (const agencyId of agencyIds) {
+      emitAgencyEvent('agency:updated', agencyId, {
+        action: 'counter-released',
+        controlledByUserId: user.id,
+      })
+    }
+    return c.json({ success: true, released: agencyIds.length })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
 })
 
 // ─── agency/daily-chart ───────────────────────────────────────────────────────
@@ -2882,12 +3385,21 @@ app.post('/queue/call-next', async (c) => {
     // Rate limit by user ID
     checkRateLimit(user.id, QUEUE_RATE_LIMIT)
 
-    // Task 37-c: staff queue authority + counter occupancy. Owner/SUPER_ADMIN
-    // pass (counterId stays optional for them); staff must hold canManageQueue
-    // AND occupy the exact counter they pass (OCCUPY_COUNTER_FIRST otherwise).
-    const queueGate = await enforceQueueStaffAuthority(user, agencyId, counterId)
-    if (!queueGate.ok) {
-      return c.json({ success: false, error: queueGate.error }, queueGate.status as any)
+    // Task 37-c → Feature C: the queue gate is now COUNTER-CONTROL based —
+    // nobody (owner included) can call next until (a) the agency has at least
+    // one ACTIVE counter set up and (b) the caller CONTROLS a counter. The
+    // gate returns the caller's controlled counter so the desk is always
+    // scoped: the ticket links to it and only its assigned services are drawn.
+    const controlGate = await enforceCounterControlGate(user, agencyId, counterId ?? null)
+    if (!controlGate.ok) {
+      return c.json({ success: false, error: controlGate.error }, controlGate.status as any)
+    }
+    // Default the target counter to the caller's controlled counter.
+    const effectiveCounterId = counterId ?? controlGate.controlledCounter?.id ?? null
+    const counterServiceIds = controlGate.controlledCounter?.serviceIds ?? []
+    // An explicitly requested service must be one the counter serves.
+    if (serviceId && counterServiceIds.length > 0 && !counterServiceIds.includes(serviceId)) {
+      return c.json({ success: false, error: 'SERVICE_NOT_ASSIGNED_TO_COUNTER' }, 400)
     }
 
     // Check agency has an active subscription
@@ -2908,12 +3420,12 @@ app.post('/queue/call-next', async (c) => {
       return c.json({ error: 'Queue is paused' }, 400)
     }
 
-    // Validate counterId if provided — must belong to the agency's branch
+    // Validate the effective counter — must belong to the agency and be active
     let targetCounter: { id: string; currentReservationId: string | null } | null = null
-    if (counterId) {
+    if (effectiveCounterId) {
       targetCounter = await db.counter.findFirst({
         where: {
-          id: counterId,
+          id: effectiveCounterId,
           branch: { agencyId },
           isActive: true,
         },
@@ -2924,119 +3436,44 @@ app.post('/queue/call-next', async (c) => {
       }
     }
 
-    // Use transaction to prevent double-calling
-    // Returns both the next reservation and any auto-completed entries
-    // Task 2-a — also returns the WAITING-partition counts so the "nothing to
-    // call" response can TELL the staff why (scheduled vs empty queue).
-    const { nextReservation: next, autoCompleted, queueWaitingCount, queueCallableCount, queueScheduledCount } = await db.$transaction(async (tx) => {
-      // ─── Auto-complete the PREVIOUS customer for THIS counter only ───
-      // Scoping to counterId ensures multiple receptions can serve simultaneously
-      const completedEntries: { id: string; displayNumber: string }[] = []
-
-      if (counterId) {
-        // Per-counter auto-complete: find CALLED reservations for this specific counter
-        const counterCalled = await tx.reservation.findMany({
-          where: { counterId, status: 'CALLED' },
-          select: { id: true, displayNumber: true },
-        })
-        for (const called of counterCalled) {
-          await tx.reservation.update({
-            where: { id: called.id },
-            data: { status: 'COMPLETED', completedAt: new Date() },
-          })
-          // Spec Part O: tx op invisible to the auto-tracking extension.
-          await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: called.id, operation: 'update' })
-          await tx.auditLog.create({
-            data: {
-              action: 'QUEUE_AUTO_COMPLETE',
-              entityType: 'RESERVATION',
-              entityId: called.id,
-              details: JSON.stringify({
-                displayNumber: called.displayNumber,
-                agencyId,
-                counterId,
-                reason: 'Auto-completed when counter called next customer',
-              }),
-            },
-          })
-          completedEntries.push({ id: called.id, displayNumber: called.displayNumber })
-        }
-      }
-
-      // Get all WAITING reservations for this agency, ordered by queueNumber
-      const waitingReservations = await tx.reservation.findMany({
-        where: {
-          agencyId,
-          status: 'WAITING',
-          ...(serviceId ? { serviceId } : {}),
-        },
-        orderBy: { queueNumber: 'asc' },
-        select: {
-          id: true,
-          status: true,
-          queueNumber: true,
-          preferredTime: true,
-          fixedTimeEnabled: true,
-          reservedDate: true,
-        },
-      })
-
-      // Task 2-a — SHARED criteria (lib/queue-waiting.ts): the SAME predicate
-      // the waiting list and the stats count use. Scheduled tickets (future
-      // reservedDate / future fixed preferredTime) are excluded here and
-      // reported via scheduledCount instead of silently becoming phantoms.
-      const { callable: callableNow, scheduled: scheduledNow } = partitionWaiting(waitingReservations)
-      const nextId = pickNextCallable(waitingReservations)?.id ?? null
-      if (!nextId) {
-        return {
-          nextReservation: null,
-          autoCompleted: completedEntries,
-          queueWaitingCount: waitingReservations.length,
-          queueCallableCount: callableNow.length,
-          queueScheduledCount: scheduledNow.length,
-        }
-      }
-
-      const candidate = await tx.reservation.findUnique({
-        where: { id: nextId },
-        include: {
-          service: true,
-          user: { select: { id: true, fullName: true } },
-        },
-      })
-      if (!candidate) {
-        return {
-          nextReservation: null,
-          autoCompleted: completedEntries,
-          queueWaitingCount: waitingReservations.length,
-          queueCallableCount: callableNow.length,
-          queueScheduledCount: scheduledNow.length,
-        }
-      }
-
-      // Re-check status inside transaction
-      const recheck = await tx.reservation.findUnique({ where: { id: candidate.id } })
-      if (!recheck || recheck.status !== 'WAITING') {
-        return {
-          nextReservation: null,
-          autoCompleted: completedEntries,
-          queueWaitingCount: waitingReservations.length,
-          queueCallableCount: callableNow.length,
-          queueScheduledCount: scheduledNow.length,
-        }
-      }
-
-      await processCandidate(tx, candidate, queueSettings, agencyId, counterId ?? undefined)
-      return {
-        nextReservation: candidate,
-        autoCompleted: completedEntries,
-        queueWaitingCount: waitingReservations.length,
-        queueCallableCount: callableNow.length,
-        queueScheduledCount: scheduledNow.length,
-      }
+    // ── UNIFIED QUEUE (atomic claim) ──
+    // One shared, DB-level-atomic implementation for ALL staff workstations:
+    // optimistic-concurrency claim (updateMany WHERE status='WAITING' — two
+    // desks can never call the same ticket; the loser claims the NEXT
+    // candidate), the staff+counter+queueSettings assignment committed in the
+    // SAME transaction, automatic concurrent-operation retries (withTxRetry),
+    // and retransmission protection via the X-Idempotency-Key header (the
+    // global idempotencyGuard). Task 2-a counts still travel on every
+    // "nothing to call" response. Feature C: the claim is scoped to the
+    // controlled counter's assigned services (all counters serving the same
+    // service still share the SAME queue pool).
+    const claim = await claimNextTicket({
+      agencyId,
+      counterId: effectiveCounterId,
+      serviceId: serviceId ?? null,
+      allowedServiceIds: counterServiceIds.length > 0 ? counterServiceIds : null,
+      actorUserId: user.id,
     })
 
-    const nextReservation = next
+    const nextReservation = claim.ok ? (claim.reservation as any) : null
+    const autoCompleted = claim.ok ? claim.autoCompleted : []
+    const queueWaitingCount = claim.counts.waitingCount
+    const queueCallableCount = claim.counts.callableCount
+    const queueScheduledCount = claim.counts.scheduledCount
+
+    // Automatic-conflict-retry contract: when EVERY callable candidate was
+    // taken by concurrent desks mid-transaction, surface a retryable 409 —
+    // the retry re-evaluates the whole queue and claims the next ticket.
+    if (!claim.ok && claim.kind === 'CONFLICT') {
+      return c.json({
+        success: false,
+        error: 'Concurrent call detected. Please try again.',
+        shouldRetry: true,
+        waitingCount: queueWaitingCount,
+        callableCount: queueCallableCount,
+        scheduledCount: queueScheduledCount,
+      }, 409)
+    }
 
     // Task 2-a — this call changed reservation-state-derived numbers exposed
     // by the CACHED public GETs (/api/stats tag 'stats', /api/agencies tag
@@ -3105,6 +3542,14 @@ app.post('/queue/call-next', async (c) => {
         displayNumber: nextReservation.displayNumber,
         customerName: (nextReservation as any).walkInCustomerName || (nextReservation as any).user?.fullName || '',
         isWalkIn: !!(nextReservation as any).isWalkIn,
+        // UNIFIED QUEUE: full mirror fields so desktop workstations can apply
+        // the authoritative result to their local mirror without a re-fetch.
+        queueNumber: nextReservation.queueNumber,
+        calledAt: nextReservation.calledAt,
+        counterId: nextReservation.counterId || null,
+        serviceId: nextReservation.serviceId,
+        userId: nextReservation.userId || null,
+        status: 'CALLED',
       },
     })
   } catch (error: unknown) {
@@ -3498,8 +3943,10 @@ app.patch('/queue/:id', async (c) => {
   try {
     const id = c.req.param('id')
     const body = await c.req.json()
+    // UNIFIED QUEUE: serve/recall accepted so desktop workstations can route
+    // their FULL status-update surface through the central API when online.
     const queueActionSchema = z.object({
-      action: z.enum(['complete', 'no_show', 'cancel']),
+      action: z.enum(['complete', 'no_show', 'cancel', 'serve', 'recall']),
     })
     const validation = validateBody(queueActionSchema, body)
     if (validation.error) {
@@ -3536,10 +3983,19 @@ app.patch('/queue/:id', async (c) => {
       return c.json({ success: false, error: queueActionGate.error }, queueActionGate.status as any)
     }
 
+    // ── UNIFIED QUEUE (atomic status update) ──
+    // The state flip, the counter unlink, the customer notification and the
+    // audit row commit in ONE transaction guarded by an OCC conditional
+    // update (WHERE status equals the status read inside the tx), so a
+    // concurrent call-next / auto-skip can no longer interleave and lose a
+    // transition. Write conflicts auto-retry (withTxRetry); a genuine
+    // concurrent-state change surfaces as a retryable 409.
     const statusMap: Record<string, string> = {
       complete: 'COMPLETED',
       no_show: 'NO_SHOW',
       cancel: 'CANCELLED',
+      serve: 'SERVING',
+      recall: 'CALLED',
     }
 
     const status = statusMap[action]
@@ -3547,73 +4003,106 @@ app.patch('/queue/:id', async (c) => {
       status,
       completedAt: action === 'complete' ? new Date() : undefined,
       cancelledAt: action === 'cancel' ? new Date() : undefined,
+      // Parity with the desktop route + stats expectations: NO_SHOW rows carry
+      // skippedAt (stats count NO_SHOW by skippedAt); recall re-announces, so
+      // calledAt moves to the new announcement time.
+      skippedAt: action === 'no_show' ? new Date() : undefined,
+      calledAt: action === 'recall' ? new Date() : undefined,
     }
 
-    await db.reservation.update({
-      where: { id },
-      data: updateData,
-    })
-
-    // Task 44: explicit SyncChange capture — queue actions performed from the
-    // desktop's own UI still flow through this CLOUD route on replay, and
-    // webapp/kiosk actions must reach every other device (see POST /branches
-    // note).
-    try {
-      await recordSyncChangeNow({ agencyId: reservation.agencyId, model: 'Reservation', recordId: id, operation: 'update' })
-    } catch { /* capture must never fail the business write */ }
-
-    // Clear the counter's currentReservationId when this reservation is completed/cancelled/no-show
-    if (reservation.counterId) {
-      await db.counter.updateMany({
-        where: { currentReservationId: id },
-        data: { currentReservationId: null },
+    const actionOutcome = await withTxRetry(async (tx) => {
+      const current = await tx.reservation.findUnique({
+        where: { id },
+        select: { id: true, status: true, counterId: true },
       })
-      try {
-        await recordSyncChangeNow({ agencyId: reservation.agencyId, model: 'Counter', recordId: reservation.counterId, operation: 'update' })
-      } catch { /* capture must never fail the business write */ }
-    }
+      if (!current) return { kind: 'NOT_FOUND' as const }
 
-    // Create notification (only for registered users)
-    if (reservation.userId) {
-      const agencyName = reservation.agency?.name || 'the agency'
-      const number = reservation.displayNumber
+      // OCC: flip ONLY if the status is unchanged since the validated read.
+      const occ = await tx.reservation.updateMany({
+        where: { id, status: current.status },
+        data: updateData,
+      })
+      if (occ.count === 0) return { kind: 'CONFLICT' as const }
 
-      const notificationData: { type: string; title: string; message: string } =
-        action === 'cancel'
-          ? { type: 'CANCELLED', title: 'Reservation Cancelled by Agency', message: `Your reservation #${number} at ${agencyName} has been cancelled by the agency.` }
-          : action === 'complete'
-          ? { type: 'COMPLETED', title: 'Service Completed', message: `Your reservation #${number} at ${agencyName} has been marked as completed. Thank you for your visit!` }
-          : { type: 'NO_SHOW', title: 'Marked as No-Show', message: `Your reservation #${number} at ${agencyName} has been marked as no-show. Please contact the agency if this is an error.` }
+      // Task 44: explicit SyncChange capture — queue actions performed from
+      // the desktop's own UI still flow through this CLOUD route on replay,
+      // and webapp/kiosk actions must reach every other device. Captured
+      // INSIDE the transaction (Spec Part O).
+      await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Reservation', recordId: id, operation: 'update' })
 
-      await db.notification.create({
+      // Clear the counter's currentReservationId on terminal actions
+      // (complete/no_show/cancel — serve/recall keep the ticket at the desk).
+      const effectiveCounterId = current.counterId || reservation.counterId || null
+      if (effectiveCounterId && ['complete', 'no_show', 'cancel'].includes(action)) {
+        await tx.counter.updateMany({
+          where: { currentReservationId: id },
+          data: { currentReservationId: null },
+        })
+        await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Counter', recordId: effectiveCounterId, operation: 'update' })
+      }
+
+      // Create notification (only for registered users)
+      if (reservation.userId) {
+        const agencyName = reservation.agency?.name || 'the agency'
+        const number = reservation.displayNumber
+
+        const notificationData: { type: string; title: string; message: string } =
+          action === 'cancel'
+            ? { type: 'CANCELLED', title: 'Reservation Cancelled by Agency', message: `Your reservation #${number} at ${agencyName} has been cancelled by the agency.` }
+            : action === 'complete'
+            ? { type: 'COMPLETED', title: 'Service Completed', message: `Your reservation #${number} at ${agencyName} has been marked as completed. Thank you for your visit!` }
+            : action === 'no_show'
+            ? { type: 'NO_SHOW', title: 'Marked as No-Show', message: `Your reservation #${number} at ${agencyName} has been marked as no-show. Please contact the agency if this is an error.` }
+            : { type: 'STATUS_UPDATED', title: 'Queue Updated', message: `Your reservation #${number} at ${agencyName} has been updated.` }
+
+        const notif = await tx.notification.create({
+          data: {
+            userId: reservation.userId,
+            type: notificationData.type,
+            title: notificationData.title,
+            message: notificationData.message,
+          },
+        })
+        await recordSyncChange({ tx, agencyId: reservation.agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
+      }
+
+      // Create audit log
+      await tx.auditLog.create({
         data: {
-          userId: reservation.userId,
-          type: notificationData.type,
-          title: notificationData.title,
-          message: notificationData.message,
+          userId: reservation.userId ?? undefined,
+          action: `QUEUE_${action.toUpperCase()}`,
+          entityType: 'RESERVATION',
+          entityId: id,
+          details: JSON.stringify({ displayNumber: reservation.displayNumber, status }),
         },
       })
-    }
 
-    // Create audit log
-    await db.auditLog.create({
-      data: {
-        userId: reservation.userId ?? undefined,
-        action: `QUEUE_${action.toUpperCase()}`,
-        entityType: 'RESERVATION',
-        entityId: id,
-        details: JSON.stringify({ displayNumber: reservation.displayNumber, status }),
-      },
+      return { kind: 'OK' as const }
     })
+
+    if (actionOutcome.kind === 'NOT_FOUND') {
+      return c.json({ error: 'Reservation not found' }, 404)
+    }
+    if (actionOutcome.kind === 'CONFLICT') {
+      return c.json({
+        success: false,
+        error: 'Ticket state changed concurrently — please retry',
+        shouldRetry: true,
+      }, 409)
+    }
 
     // Task 2-a — complete/no-show/cancel all change the reservation-derived
     // counts exposed by the cached public GETs.
     invalidateResponseCacheTag('stats', 'agencies')
 
-    // Emit realtime events (non-blocking — fire and forget)
+    // Emit realtime events (non-blocking — fire and forget). UNIFIED QUEUE:
+    // every status change reaches every staff workstation in realtime —
+    // recall RE-ANNOUNCES (queue:called → kiosks + dashboards refresh).
     const eventType = action === 'complete' ? 'queue:completed'
       : action === 'no_show' ? 'queue:no-show'
-      : 'queue:cancelled'
+      : action === 'cancel' ? 'queue:cancelled'
+      : action === 'recall' ? 'queue:called'
+      : 'queue:updated'
 
     emitQueueEvent(eventType, reservation.agencyId, {
       reservationId: id,
@@ -5669,73 +6158,6 @@ app.patch('/working-hours', async (c) => {
   }
 })
 
-// ─── Helper: processCandidate for call-next ───────────────────────────────────
-
-async function processCandidate(tx: any, candidate: any, queueSettings: any, agencyId: string, counterId?: string) {
-  const reservationData: Record<string, unknown> = { status: 'CALLED', calledAt: new Date() }
-  if (counterId) reservationData.counterId = counterId
-
-  await tx.reservation.update({
-    where: { id: candidate.id },
-    data: reservationData,
-  })
-  // Spec Part O: transactional writes are invisible to the auto-tracking
-  // extension — record every change of the call-next flow INSIDE the tx so
-  // the change feed (and desktop realtime) never misses a call-next.
-  await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: candidate.id, operation: 'update' })
-
-  // Link reservation to counter as the active serving ticket
-  if (counterId) {
-    await tx.counter.update({
-      where: { id: counterId },
-      data: { currentReservationId: candidate.id },
-    })
-    await recordSyncChange({ tx, agencyId, model: 'Counter', recordId: counterId, operation: 'update' })
-  }
-
-  if (queueSettings) {
-    await tx.queueSettings.update({
-      where: { id: queueSettings.id },
-      data: { currentServingNumber: candidate.queueNumber },
-    })
-    await recordSyncChange({ tx, agencyId, model: 'QueueSettings', recordId: queueSettings.id, operation: 'update' })
-  }
-
-  // Only create notification if user exists (not walk-in)
-  if (candidate.userId) {
-    const notif = await tx.notification.create({
-      data: {
-        userId: candidate.userId,
-        type: 'QUEUE_CALLED',
-        title: 'Queue Called',
-        message: `Your number ${candidate.displayNumber} has been called. Please proceed.`,
-      },
-    })
-    await recordSyncChange({ tx, agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
-  }
-
-  const auditUser = candidate.userId
-    ? await tx.user.findUnique({ where: { id: candidate.userId } })
-    : null
-
-  await tx.auditLog.create({
-    data: {
-      userId: auditUser ? candidate.userId : null,
-      action: 'QUEUE_CALL',
-      entityType: 'RESERVATION',
-      entityId: candidate.id,
-      details: JSON.stringify({
-        displayNumber: candidate.displayNumber,
-        agencyId,
-        serviceId: candidate.serviceId,
-        isWalkIn: candidate.isWalkIn || false,
-        walkInCustomerName: candidate.walkInCustomerName || null,
-        counterId: counterId || null,
-      }),
-    },
-  })
-}
-
 // ─── Phase 5d: handleDowngrade ────────────────────────────────────────────────
 //
 // When an agency's subscription is downgraded (e.g. PREMIUM → BASIC), some
@@ -5768,32 +6190,37 @@ export async function handleDowngrade(
   let countersDeactivated = 0;
 
   // 2. Check if active counters exceed the new plan's limit
-  //    We look across all branches of this agency. Since SubscriptionPlan doesn't
-  //    have an explicit maxCounters field, we use maxStaff as a proxy (one counter
-  //    per staff member is a reasonable default). If a dedicated maxCounters is
-  //    added to SubscriptionPlan in the future, swap this out.
+  //    Feature C: SubscriptionPlan.maxCounters is the PER-BRANCH cap (-1 =
+  //    unlimited). Each branch is trimmed independently; for pre-existing
+  //    plan rows without the value, fall back to the historic maxStaff proxy.
   const maxCounters = (targetPlan as Record<string, unknown>)?.maxCounters as number | undefined ?? maxStaff;
 
-  // Count currently active counters for this agency
-  const activeCounters = await db.counter.findMany({
-    where: {
-      branch: { agencyId },
-      isActive: true,
-    },
-    orderBy: { createdAt: 'desc' }, // deactivate newest first, keep oldest
-  });
-
-  if (activeCounters.length > maxCounters) {
-    const excess = activeCounters.length - maxCounters;
-    const countersToDeactivate = activeCounters.slice(0, excess); // newest first
-    const idsToDeactivate = countersToDeactivate.map((c) => c.id);
-
-    await db.counter.updateMany({
-      where: { id: { in: idsToDeactivate } },
-      data: { isActive: false },
+  if (maxCounters !== -1) {
+    // Count currently active counters per branch of this agency
+    const activeCounters = await db.counter.findMany({
+      where: {
+        branch: { agencyId },
+        isActive: true,
+      },
+      orderBy: { createdAt: 'desc' }, // deactivate newest first, keep oldest
+      select: { id: true, branchId: true },
     });
 
-    countersDeactivated = idsToDeactivate.length;
+    const perBranchCount = new Map<string, number>();
+    const idsToDeactivate: string[] = [];
+    for (const counter of activeCounters) {
+      const n = (perBranchCount.get(counter.branchId) ?? 0) + 1;
+      perBranchCount.set(counter.branchId, n);
+      if (n > maxCounters) idsToDeactivate.push(counter.id);
+    }
+
+    if (idsToDeactivate.length > 0) {
+      await db.counter.updateMany({
+        where: { id: { in: idsToDeactivate } },
+        data: { isActive: false },
+      });
+      countersDeactivated = idsToDeactivate.length;
+    }
   }
 
   // 3. Do NOT revoke existing reservations — they complete naturally.

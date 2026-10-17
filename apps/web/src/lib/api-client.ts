@@ -986,6 +986,29 @@ export class ApiClient {
       ...options?.headers,
     };
 
+    // ── UNIFIED QUEUE: idempotency keys on every mutating request ───────────
+    // A network-level retransmission must never execute an operation twice
+    // (e.g. call-next claiming TWO tickets from one double-click over a flaky
+    // link). The central API's idempotencyGuard replays the STORED response
+    // for a repeated X-Idempotency-Key, so the same logical operation always
+    // yields the same result. Callers may pass their own key via headers.
+    const upperMethod = method.toUpperCase();
+    if (upperMethod === 'POST' || upperMethod === 'PUT' || upperMethod === 'PATCH' || upperMethod === 'DELETE') {
+      let callerKey: string | undefined;
+      const callerHeaders = options?.headers;
+      if (callerHeaders) {
+        if (typeof Headers !== 'undefined' && callerHeaders instanceof Headers) {
+          callerKey = callerHeaders.get('X-Idempotency-Key') ?? callerHeaders.get('x-idempotency-key') ?? undefined;
+        } else {
+          const rec = callerHeaders as Record<string, string>;
+          callerKey = rec['X-Idempotency-Key'] ?? rec['x-idempotency-key'];
+        }
+      }
+      if (!callerKey && typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        headers['X-Idempotency-Key'] = crypto.randomUUID();
+      }
+    }
+
     // ── Fast LAN bypass: if the cloud API was recently marked unreachable
     // (5xx or network error in the last 30s) and we're on a native platform,
     // try the LAN server (port 3080) FIRST. This avoids waiting through the

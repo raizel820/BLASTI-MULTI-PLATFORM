@@ -62,6 +62,7 @@ interface SubscriptionPlan {
   maxServices: number;
   maxBranches: number;
   maxStaff: number;
+  maxCounters: number;
   maxActiveReservations: number;
   maxSmsPerMonth: number;
   kioskModeEnabled: boolean;
@@ -95,6 +96,7 @@ interface PlanFormData {
   maxServices: number;
   maxBranches: number;
   maxStaff: number;
+  maxCounters: number;
   maxActiveReservations: number;
   maxSmsPerMonth: number;
   kioskModeEnabled: boolean;
@@ -124,6 +126,8 @@ const defaultFormData: PlanFormData = {
   maxServices: 5,
   maxBranches: 1,
   maxStaff: 3,
+  // Feature C — counters cap; -1 = unlimited (server contract).
+  maxCounters: 2,
   maxActiveReservations: 50,
   maxSmsPerMonth: 50,
   kioskModeEnabled: false,
@@ -233,6 +237,7 @@ export function AdminSubscriptionPlans() {
       maxServices: plan.maxServices,
       maxBranches: plan.maxBranches,
       maxStaff: plan.maxStaff,
+      maxCounters: plan.maxCounters ?? 2,
       maxActiveReservations: plan.maxActiveReservations,
       maxSmsPerMonth: plan.maxSmsPerMonth,
       kioskModeEnabled: plan.kioskModeEnabled,
@@ -525,6 +530,15 @@ export function AdminSubscriptionPlans() {
                           <Users className="h-3.5 w-3.5 text-muted-foreground" />
                           <span className="text-xs text-foreground">{plan.maxStaff} {t('maxStaffShort')}</span>
                         </div>
+                        {/* Feature C — counters cap (-1 = unlimited badge) */}
+                        <div className="flex items-center gap-1.5 p-2 rounded-lg bg-white/60 dark:bg-gray-800/40">
+                          <Monitor className="h-3.5 w-3.5 text-muted-foreground" />
+                          {plan.maxCounters === -1 ? (
+                            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">{t('unlimited')}</Badge>
+                          ) : (
+                            <span className="text-xs text-foreground">{plan.maxCounters} {t('maxCountersShort')}</span>
+                          )}
+                        </div>
                         <div className="flex items-center gap-1.5 p-2 rounded-lg bg-white/60 dark:bg-gray-800/40">
                           <CreditCard className="h-3.5 w-3.5 text-muted-foreground" />
                           <span className="text-xs text-foreground">{plan.maxActiveReservations} {t('maxReservationsShort')}</span>
@@ -793,6 +807,18 @@ export function AdminSubscriptionPlans() {
                     onChange={(e) => setFormData({ ...formData, maxStaff: parseInt(e.target.value) || 1 })}
                     className="h-9 text-sm"
                   />
+                </div>
+                {/* Feature C — counters cap; -1 = unlimited (hint below). */}
+                <div className="space-y-1.5">
+                  <Label className="text-xs font-medium">{t('maxCounters')}</Label>
+                  <Input
+                    type="number"
+                    min={-1}
+                    value={formData.maxCounters}
+                    onChange={(e) => setFormData({ ...formData, maxCounters: parseInt(e.target.value) || 0 })}
+                    className="h-9 text-sm"
+                  />
+                  <p className="text-[10px] text-muted-foreground">-1 = {t('unlimited')}</p>
                 </div>
                 <div className="space-y-1.5">
                   <Label className="text-xs font-medium">{t('maxReservations')}</Label>

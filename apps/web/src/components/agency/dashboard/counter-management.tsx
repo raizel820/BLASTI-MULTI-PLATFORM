@@ -3,11 +3,13 @@
 // Task 37-e: real counter cards — replaces the fabricated STAFF_NAMES mock
 // with the agency's ACTUAL counters (GET /api/agency/counters, enriched with
 // branch names from GET /api/agency/branches — the endpoints the branches
-// page / fullscreen consume). Each card shows the counter's occupation state
-// (occupied-by name via counter.staff.user.fullName, or Free) and a Call Next
-// button that posts { agencyId, counterId } to /api/agency/queue/call-next —
-// surfacing OCCUPY_COUNTER_FIRST / PERMISSION_DENIED as friendly toasts
-// (the server enforces the authority contract).
+// page / fullscreen consume). Each card shows the counter's CONTROL state
+// (Feature C: controlledByUser — staffId is only the roster assignment now)
+// and a Call Next button that posts { agencyId, counterId } to
+// /api/agency/queue/call-next — surfacing OCCUPY_COUNTER_FIRST /
+// COUNTER_SETUP_REQUIRED / COUNTER_CONTROL_REQUIRED /
+// SERVICE_NOT_ASSIGNED_TO_COUNTER as friendly toasts (the server enforces the
+// authority contract).
 
 import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
@@ -23,6 +25,10 @@ import {
   Loader2,
   Hash,
   Lock,
+  AlertCircle,
+  DoorOpen,
+  ShieldAlert,
+  Maximize,
 } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
@@ -42,6 +48,10 @@ interface CounterInfo {
   staffName: string | null;
   currentTicket: string | null;
   isActive: boolean;
+  // Feature C — live control state + service assignment.
+  controlledByUserId: string | null;
+  controlledByName: string | null;
+  serviceIdList: string[];
 }
 
 interface CounterManagementProps {
@@ -79,6 +89,8 @@ interface CounterManagementProps {
    *  Call Next buttons are locked. Defaults to true so unknown state never
    *  falsely locks — the server still enforces the real gate. */
   subscriptionActive?: boolean;
+  /** Feature C — open the fullscreen console (counter claiming lives there). */
+  onViewFullscreen?: () => void;
   lang: string;
   t: (key: TranslationKeys, params?: Record<string, string>) => string;
 }
@@ -107,6 +119,7 @@ export function CounterManagement({
   onCallNext,
   agencyId,
   subscriptionActive = true,
+  onViewFullscreen,
   lang,
   t,
 }: CounterManagementProps) {
@@ -117,9 +130,14 @@ export function CounterManagement({
   const [counters, setCounters] = useState<CounterInfo[]>([]);
   const [loadingCounters, setLoadingCounters] = useState(true);
   const [callingCounterId, setCallingCounterId] = useState<string | null>(null);
+  // Feature C — release / claim in-flight marker per counter.
+  const [releaseLoadingId, setReleaseLoadingId] = useState<string | null>(null);
+  // Feature C — service id → localized name (chips next to the control badge).
+  const [serviceNames, setServiceNames] = useState<Map<string, string>>(new Map());
 
-  const myStaffId = authority?.staffId ?? null;
-  const isOwnerCaller = authority?.isOwner === true || user?.role === 'AGENCY_OWNER' || user?.role === 'SUPER_ADMIN';
+  const myUserId = user?.id ?? '';
+  const isControllerManager =
+    user?.role === 'AGENCY_OWNER' || user?.role === 'SUPER_ADMIN' || authority?.role === 'MANAGER';
 
   const fetchCounters = useCallback(async () => {
     if (!effectiveAgencyId) {
@@ -131,9 +149,10 @@ export function CounterManagement({
       // the fullscreen console consume). Dual-envelope tolerant: the cloud
       // returns { counters } / { branches }, the desktop local API returns
       // { data } for the agency-wide counters list.
-      const [cRes, bRes] = await Promise.all([
+      const [cRes, bRes, sRes] = await Promise.all([
         apiFetch(`/api/agency/counters?agencyId=${encodeURIComponent(effectiveAgencyId)}`),
         apiFetch(`/api/agency/branches?agencyId=${encodeURIComponent(effectiveAgencyId)}`).catch(() => null),
+        apiFetch(`/api/agency/services?agencyId=${encodeURIComponent(effectiveAgencyId)}`).catch(() => null),
       ]);
       const branchNames = new Map<string, string>();
       if (bRes && bRes.ok) {
@@ -143,6 +162,11 @@ export function CounterManagement({
         const branches = unwrapListPayload<{ id: string; name: string }>(bData, ['branches', 'data']);
         branches.forEach((b) => branchNames.set(b.id, b.name));
       }
+      if (sRes && sRes.ok) {
+        const sData = await sRes.json().catch(() => null);
+        const services = (sData?.services ?? []) as Array<{ id: string; name: string; nameAr?: string | null; nameFr?: string | null }>;
+        setServiceNames(new Map(services.map((s) => [s.id, (lang === 'ar' && s.nameAr) || (lang === 'fr' && s.nameFr) || s.name])));
+      }
       if (cRes.ok) {
         const cData = await cRes.json();
         // Task 45 root cause: same unwrap collapse as the branch list.
@@ -150,8 +174,20 @@ export function CounterManagement({
         setCounters(
           raw.map((c) => {
             const staff = c.staff as { user?: { fullName?: string; username?: string } } | null | undefined;
+            const controlledByUser = c.controlledByUser as { id?: string; fullName?: string; username?: string } | null | undefined;
             const reservation = c.currentReservation as { displayNumber?: string; status?: string } | null | undefined;
             const branchId = typeof c.branchId === 'string' ? c.branchId : null;
+            // Feature C — serviceIdList is pre-parsed by the API; tolerate a
+            // raw JSON string from older local-API builds too.
+            let serviceIdList: string[] = [];
+            if (Array.isArray(c.serviceIdList)) {
+              serviceIdList = (c.serviceIdList as unknown[]).filter((x): x is string => typeof x === 'string');
+            } else if (typeof c.serviceIds === 'string' && c.serviceIds.trim()) {
+              try {
+                const parsed = JSON.parse(c.serviceIds);
+                if (Array.isArray(parsed)) serviceIdList = parsed.filter((x): x is string => typeof x === 'string');
+              } catch { /* tolerate garbage */ }
+            }
             return {
               id: String(c.id),
               number: Number(c.number ?? 0),
@@ -168,6 +204,9 @@ export function CounterManagement({
                   ? reservation.displayNumber ?? null
                   : null,
               isActive: c.isActive !== false,
+              controlledByUserId: (c.controlledByUserId as string | null) ?? null,
+              controlledByName: controlledByUser?.fullName ?? controlledByUser?.username ?? null,
+              serviceIdList,
             };
           })
         );
@@ -177,7 +216,7 @@ export function CounterManagement({
     } finally {
       setLoadingCounters(false);
     }
-  }, [effectiveAgencyId]);
+  }, [effectiveAgencyId, lang]);
 
   useEffect(() => {
     fetchCounters();
@@ -208,8 +247,15 @@ export function CounterManagement({
       } else {
         const data = await res.json().catch(() => ({}));
         // Task 37-c contract: friendly toasts for the authority errors.
+        // Feature C — new counter-control gating codes.
         if (data.error === 'OCCUPY_COUNTER_FIRST') {
           toast.error(t('occupyFirst'));
+        } else if (data.error === 'COUNTER_SETUP_REQUIRED') {
+          toast.error(t('counterSetupRequired'));
+        } else if (data.error === 'COUNTER_CONTROL_REQUIRED') {
+          toast.error(t('counterControlRequired'));
+        } else if (data.error === 'SERVICE_NOT_ASSIGNED_TO_COUNTER') {
+          toast.error(t('serviceNotAssigned'));
         } else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) {
           toast.error(t('counterPermissionDenied'));
         } else if (data.error === 'COUNTER_OCCUPIED') {
@@ -226,8 +272,73 @@ export function CounterManagement({
     }
   };
 
-  const occupiedCounters = counters.filter((c) => c.staffId).length;
-  const freeCounters = counters.length - occupiedCounters;
+  // Feature C — release my control (controller) / force-release (owner-manager).
+  const handleReleaseControl = async (counter: CounterInfo) => {
+    setReleaseLoadingId(counter.id);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${counter.id}/release`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        toast.success(t('counterReleased'));
+        fetchCounters();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        if (
+          data.error === 'NOT_COUNTER_CONTROLLER' ||
+          (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED'))
+        ) {
+          toast.error(t('counterPermissionDenied'));
+        } else {
+          toast.error(data.error || t('error'));
+        }
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setReleaseLoadingId(null);
+    }
+  };
+
+  // Feature C — claim the FIRST free counter straight from the dashboard hint.
+  const handleClaimFirstFree = async () => {
+    const free = counters.find((c) => !c.controlledByUserId && c.isActive);
+    if (!free) {
+      // No free counter here — the fullscreen console offers the full
+      // claim / request-control flow (steal via approval, etc.).
+      if (onViewFullscreen) onViewFullscreen();
+      return;
+    }
+    setReleaseLoadingId(free.id);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${free.id}/occupy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        toast.success(t('counterControlledByYou'));
+        fetchCounters();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        if (data.error === 'COUNTER_OCCUPIED') {
+          toast.error(t('counterOccupied'));
+          fetchCounters();
+        } else {
+          toast.error(data.error || t('error'));
+        }
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setReleaseLoadingId(null);
+    }
+  };
+
+  // Feature C — control-based state (staffId is the ROSTER assignment only).
+  const controlledCounters = counters.filter((c) => c.controlledByUserId).length;
+  const freeCounters = counters.length - controlledCounters;
+  const iControlACounter = counters.some((c) => c.controlledByUserId === myUserId);
 
   return (
     <motion.div
@@ -246,7 +357,7 @@ export function CounterManagement({
             <div className="flex items-center gap-2">
               <div className="flex items-center gap-1">
                 <span className="h-2 w-2 rounded-full bg-emerald-500" />
-                <span className="text-[10px] text-muted-foreground">{occupiedCounters} {t('active' as any) || 'active'}</span>
+                <span className="text-[10px] text-muted-foreground">{controlledCounters} {t('active' as any) || 'active'}</span>
               </div>
               <div className="flex items-center gap-1">
                 <span className="h-2 w-2 rounded-full bg-gray-300 dark:bg-gray-600" />
@@ -256,6 +367,46 @@ export function CounterManagement({
           </div>
         </CardHeader>
         <CardContent className="pt-0">
+          {/* Feature C — claim hint: counters exist but the caller controls
+              none → call-next will 403 COUNTER_CONTROL_REQUIRED. Offer the
+              one-tap claim of the first free counter (or the fullscreen). */}
+          {!loadingCounters && counters.length > 0 && !iControlACounter && (
+            <div
+              role="alert"
+              className="mb-3 flex flex-col sm:flex-row sm:items-center gap-2 rounded-xl border border-amber-200 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-950/30 p-3"
+            >
+              <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-400 flex-shrink-0" />
+              <p className="text-xs text-amber-800 dark:text-amber-300 flex-1 min-w-0">
+                {counters.some((c) => c.isActive)
+                  ? t('claimCounterHint')
+                  : t('noCountersSetup')}
+              </p>
+              <div className="flex items-center gap-1.5 flex-shrink-0">
+                {counters.some((c) => c.isActive) && (
+                  <Button
+                    size="sm"
+                    onClick={handleClaimFirstFree}
+                    disabled={!!releaseLoadingId}
+                    className="h-7 px-2.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-[11px] font-semibold gap-1"
+                  >
+                    {releaseLoadingId ? <Loader2 className="h-3 w-3 animate-spin" /> : <PhoneCall className="h-3 w-3" />}
+                    {t('claimCounter')}
+                  </Button>
+                )}
+                {onViewFullscreen && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={onViewFullscreen}
+                    className="h-7 px-2.5 rounded-lg border-amber-300 dark:border-amber-800 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40 text-[11px] gap-1"
+                  >
+                    <Maximize className="h-3 w-3" />
+                    {t('selectCounter')}
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
           <div className="space-y-2.5 max-h-96 overflow-y-auto custom-scrollbar">
             {loadingCounters && counters.length === 0 ? (
               <p className="text-xs text-muted-foreground py-4 text-center">{t('loading' as any) || '...'}</p>
@@ -263,8 +414,10 @@ export function CounterManagement({
               <p className="text-xs text-muted-foreground py-4 text-center">{t('noData' as any)}</p>
             ) : (
               counters.map((counter, idx) => {
-                const occupiedByOther =
-                  !!counter.staffId && !isOwnerCaller && counter.staffId !== myStaffId;
+                // Feature C — control state (NOT the staffId roster relation).
+                const isMine = !!counter.controlledByUserId && counter.controlledByUserId === myUserId;
+                const controlledByOther =
+                  !!counter.controlledByUserId && !isMine;
                 return (
                   <motion.div
                     key={counter.id}
@@ -292,19 +445,36 @@ export function CounterManagement({
                               · {counter.branchName}
                             </span>
                           )}
-                          {/* Occupation state — real staff relation */}
-                          {counter.staffId ? (
-                            <Badge className="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400 text-[9px] px-1.5 py-0 h-4 border-0">
-                              <User className="h-2.5 w-2.5 me-0.5" />
-                              {counter.staffName
-                                ? t('counterOccupiedBy', { name: counter.staffName })
-                                : t('counterOccupied')}
-                            </Badge>
+                          {/* Feature C — CONTROL state badge */}
+                          {counter.controlledByUserId ? (
+                            isMine ? (
+                              <Badge className="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400 text-[9px] px-1.5 py-0 h-4 border-0">
+                                <User className="h-2.5 w-2.5 me-0.5" />
+                                {t('counterControlledByYou')}
+                              </Badge>
+                            ) : (
+                              <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400 text-[9px] px-1.5 py-0 h-4 border-0">
+                                <User className="h-2.5 w-2.5 me-0.5" />
+                                {counter.controlledByName
+                                  ? t('counterOccupiedBy', { name: counter.controlledByName })
+                                  : t('counterOccupied')}
+                              </Badge>
+                            )
                           ) : (
                             <Badge className="bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 text-[9px] px-1.5 py-0 h-4 border-0">
                               {t('counterFree')}
                             </Badge>
                           )}
+                          {/* Feature C — service assignment chips */}
+                          {counter.serviceIdList.map((sid) => {
+                            const svc = serviceNames.get(sid);
+                            if (!svc) return null;
+                            return (
+                              <Badge key={sid} variant="outline" className="text-[9px] px-1.5 py-0 h-4 border-teal-200 dark:border-teal-800 bg-teal-50/60 dark:bg-teal-900/20 text-teal-700 dark:text-teal-400">
+                                {svc}
+                              </Badge>
+                            );
+                          })}
                           {counter.currentTicket && (
                             <Badge className="bg-white/80 dark:bg-gray-900/60 text-emerald-700 dark:text-emerald-400 text-[9px] px-1.5 py-0 h-4 border border-emerald-200 dark:border-emerald-800">
                               {t('serving' as any) || 'Serving'}
@@ -327,7 +497,50 @@ export function CounterManagement({
 
                       {/* Actions */}
                       <div className="flex items-center gap-1.5 flex-shrink-0">
-                        {occupiedByOther ? (
+                        {/* Feature C — release (controller) / force-release (owner-manager) */}
+                        {isMine && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => handleReleaseControl(counter)}
+                                disabled={releaseLoadingId === counter.id}
+                                className="h-8 w-8 p-0 text-muted-foreground hover:text-emerald-600"
+                                aria-label={t('releaseCounter')}
+                              >
+                                {releaseLoadingId === counter.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <DoorOpen className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{t('releaseCounter')}</TooltipContent>
+                          </Tooltip>
+                        )}
+                        {controlledByOther && isControllerManager && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => handleReleaseControl(counter)}
+                                disabled={releaseLoadingId === counter.id}
+                                className="h-8 w-8 p-0 text-amber-500 hover:text-amber-600"
+                                aria-label={t('forceRelease')}
+                              >
+                                {releaseLoadingId === counter.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <ShieldAlert className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{t('forceRelease')}</TooltipContent>
+                          </Tooltip>
+                        )}
+                        {controlledByOther ? (
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <div className="cursor-not-allowed">
@@ -342,8 +555,8 @@ export function CounterManagement({
                               </div>
                             </TooltipTrigger>
                             <TooltipContent className="max-w-[220px]">
-                              {counter.staffName
-                                ? t('counterOccupiedBy', { name: counter.staffName })
+                              {counter.controlledByName
+                                ? t('counterOccupiedBy', { name: counter.controlledByName })
                                 : t('counterOccupied')}
                             </TooltipContent>
                           </Tooltip>

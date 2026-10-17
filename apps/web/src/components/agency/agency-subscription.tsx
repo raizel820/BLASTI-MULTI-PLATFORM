@@ -131,6 +131,8 @@ interface SubscriptionPlan {
   maxServices: number;
   maxBranches: number;
   maxStaff: number;
+  // Feature C — counter control: plan cap on counters (-1 = unlimited).
+  maxCounters: number;
   maxActiveReservations: number;
   maxSmsPerMonth: number;
   kioskModeEnabled: boolean;
@@ -2958,9 +2960,15 @@ export function AgencySubscription() {
     { label: lang === 'ar' ? 'خدمات' : lang === 'fr' ? 'Services' : 'Services', value: plan.maxServices },
     { label: lang === 'ar' ? 'فروع' : lang === 'fr' ? 'Branches' : 'Branches', value: plan.maxBranches },
     { label: lang === 'ar' ? 'موظفين' : lang === 'fr' ? 'Personnel' : 'Staff', value: plan.maxStaff },
+    // Feature C — counter cap (server-side plan gate for POST /branches/:id/counters).
+    { label: lang === 'ar' ? 'شبابيك' : lang === 'fr' ? 'Guichets' : 'Counters', value: plan.maxCounters },
     { label: lang === 'ar' ? 'حجوزات نشطة' : lang === 'fr' ? 'Réservations' : 'Active Res.', value: plan.maxActiveReservations },
     { label: lang === 'ar' ? 'رسائل/شهر' : lang === 'fr' ? 'SMS/mois' : 'SMS/mo', value: plan.maxSmsPerMonth },
   ];
+
+  // Feature C — -1 caps render as the localized "Unlimited" badge instead of
+  // a negative number.
+  const formatPlanLimit = (value: number) => (value === -1 ? t('unlimited') : value.toLocaleString());
 
   const availablePlans = data?.availablePlans ?? [];
 
@@ -3452,11 +3460,11 @@ export function AgencySubscription() {
                 </div>
 
                 {/* ── Limits grid ── */}
-                <div className="mt-5 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
+                <div className="mt-5 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2">
                   {limitItems(currentPlanObj).map((l) => (
                     <div key={l.label} className="rounded-xl bg-gray-50 dark:bg-gray-800/40 px-3 py-2 border border-border/40">
                       <p className="text-[10px] text-muted-foreground uppercase tracking-wide">{l.label}</p>
-                      <p className="text-sm font-bold text-foreground mt-0.5">{l.value.toLocaleString()}</p>
+                      <p className="text-sm font-bold text-foreground mt-0.5">{formatPlanLimit(l.value)}</p>
                     </div>
                   ))}
                 </div>
@@ -3787,7 +3795,7 @@ export function AgencySubscription() {
                       {limitItems(plan).map((l) => (
                         <div key={l.label} className="rounded-lg bg-gray-50 dark:bg-gray-800/40 px-2.5 py-2">
                           <p className="text-[10px] text-muted-foreground uppercase tracking-wide">{l.label}</p>
-                          <p className="text-sm font-bold text-foreground">{l.value.toLocaleString()}</p>
+                          <p className="text-sm font-bold text-foreground">{formatPlanLimit(l.value)}</p>
                         </div>
                       ))}
                     </div>
@@ -3969,6 +3977,7 @@ export function AgencySubscription() {
                       { key: 'maxServices', label: t('maxServices') },
                       { key: 'maxBranches', label: t('maxBranches') },
                       { key: 'maxStaff', label: t('maxStaff') },
+                      { key: 'maxCounters', label: t('maxCounters') },
                       { key: 'maxActiveReservations', label: t('maxActiveReservations') },
                       { key: 'maxSmsPerMonth', label: t('maxSmsPerMonth') },
                     ].map((row, i) => (
@@ -3977,7 +3986,7 @@ export function AgencySubscription() {
                         {visiblePlans.map((plan) => (
                           <td key={plan.id} className="text-center py-2.5 px-4">
                             <span className="text-xs font-medium text-foreground">
-                              {(plan as any)[row.key] as number}
+                              {formatPlanLimit((plan as any)[row.key] as number)}
                             </span>
                           </td>
                         ))}

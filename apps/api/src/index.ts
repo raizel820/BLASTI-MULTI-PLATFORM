@@ -114,6 +114,7 @@ import { setSyncNotifyIo, startSyncNotifyTimer } from './lib/sync-notify'
 import { installSyncTracking, pruneSyncChanges } from './lib/sync-helpers'
 import { cancelPendingCustomerAlerts } from './lib/cancel-pending-alerts'
 import { startNotificationWorker, stopNotificationWorker } from './workers/notification-worker'
+import { startCounterControlSweeper, stopCounterControlSweeper } from './workers/counter-control-sweeper'
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -1566,6 +1567,9 @@ httpServer.listen(PORT, HOST, async () => {
   // Start the background notification worker
   startNotificationWorker()
   console.log('   📨 Notification worker started (30s poll interval)')
+
+  // Feature C: free counter control with stale heartbeats (logout/close safety net)
+  startCounterControlSweeper()
 })
 
 // ─── Graceful Shutdown ──────────────────────────────────────────────────────
@@ -1586,11 +1590,13 @@ process.on('uncaughtException', (err) => {
 
 process.on('SIGTERM', () => {
   stopNotificationWorker()
+  stopCounterControlSweeper()
   if (io) io.close()
   process.exit(0)
 })
 process.on('SIGINT', () => {
   stopNotificationWorker()
+  stopCounterControlSweeper()
   if (io) io.close()
   process.exit(0)
 })

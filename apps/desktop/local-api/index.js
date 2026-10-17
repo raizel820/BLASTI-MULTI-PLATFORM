@@ -99,6 +99,11 @@ let outboxV3Ensured = false
 let localOrigin = `http://${BIND_ADDRESS}:${DEFAULT_PORT}`
 let fileSync = null
 
+// Feature C — stale-control sweeper handle. Runs every 60s while the local
+// API is up, freeing counters whose control heartbeat went stale (>3 min) so
+// a crashed/closed client can never hold a counter forever. Cleared on stop.
+let controlSweeperInterval = null
+
 // ─── Task 51: Map configuration cache (GET /api/config/maps) ────────────────
 // Desktop parity of the cloud's public map config (spec §39 Electron: "use the
 // same provider abstraction"; §40: offline behavior). The route tries the
@@ -470,7 +475,17 @@ const NEW_STAFF_PERMISSION_COLUMNS = [
   'canPurchaseSubscription',
   'canManageSubscription',
 ]
-const NEW_COUNTER_COLUMNS = ['occupiedAt']
+const NEW_COUNTER_COLUMNS = [
+  'occupiedAt',
+  // Feature C — control model + service assignment (transition-window
+  // tolerance: a stale generated client predating these columns degrades
+  // gracefully instead of 500ing every counter write).
+  'serviceIds',
+  'controlledByUserId',
+  'controlledByStaffId',
+  'controlClaimedAt',
+  'controlHeartbeatAt',
+]
 
 // Tier defaults applied on a role change (mirror the cloud exactly):
 //   STAFF   → queue + analytics only.
@@ -634,16 +649,390 @@ async function checkAgencyOwnerOnly(explicitAgencyId) {
   }
 }
 
+// ─── Feature C — Counter CONTROL model (local mirror of the cloud lib) ──────
+//
+// Exactly ONE agency account CONTROLS a counter at a time. The legacy
+// staffId/occupiedAt columns become roster/display mirrors only. The cloud
+// implementation lives in apps/api/src/lib/counter-control.ts; every constant,
+// status code and error string below mirrors it (legacy occupy-route strings
+// kept for client compat where the task contract says so).
+//
+//   CONTROL_TTL_MS            — controls without a heartbeat for longer than
+//                               this are stale (takeable / swept free).
+//   CONTROL_HEARTBEAT_INTERVAL_MS — cadence the controlling client must ping.
+//   counterControlFreeData()  — the field set written when a counter loses
+//                               control (occupiedAt = legacy Task 37-c stamp).
+const CONTROL_TTL_MS = 3 * 60 * 1000
+const CONTROL_HEARTBEAT_INTERVAL_MS = 60 * 1000
+
+/** Parse the counter→service assignment JSON (null/invalid/empty = all services). */
+function parseCounterServiceIds(raw) {
+  if (!raw) return []
+  try {
+    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+    return Array.isArray(parsed) ? parsed.filter((v) => typeof v === 'string') : []
+  } catch { return [] }
+}
+
+/** Feature C — expose the parsed service assignment alongside the raw JSON. */
+function withCounterServiceIdList(counter) {
+  if (!counter) return counter
+  return { ...counter, serviceIdList: parseCounterServiceIds(counter.serviceIds) }
+}
+
 /**
- * Task 37-d OCCUPANCY RULE for the queue action routes: a non-owner caller
- * must operate from a counter they personally occupy.
- *   - staff without counterId                → denied OCCUPY_COUNTER_FIRST
+ * Validate counter→service assignment (cloud parity): every id must belong to
+ * the agency. Accepts an array or a JSON string; null/undefined clears the
+ * assignment (counter serves ALL agency services). Returns the JSON string to
+ * store (or { ok:false, error }).
+ */
+async function validateCounterServiceIds(value, agencyId) {
+  let list = value
+  if (typeof list === 'string') {
+    try { list = JSON.parse(list) } catch {
+      return { ok: false, error: 'serviceIds must be a JSON array of service ids' }
+    }
+  }
+  if (list === null || list === undefined) return { ok: true, json: null }
+  if (!Array.isArray(list) || list.some((v) => typeof v !== 'string')) {
+    return { ok: false, error: 'serviceIds must be an array of service ids' }
+  }
+  const unique = [...new Set(list)]
+  if (unique.length === 0) return { ok: true, json: null }
+  const services = await db.service.findMany({
+    where: { agencyId, id: { in: unique } },
+    select: { id: true },
+  }).catch(() => [])
+  if (services.length !== unique.length) {
+    return { ok: false, error: 'One or more services do not belong to this agency' }
+  }
+  return { ok: true, json: JSON.stringify(unique) }
+}
+
+/**
+ * Feature C per-branch counter limit (SubscriptionPlan.maxCounters) —
+ * BEST-EFFORT, FAIL-OPEN: the plan catalog syncs to the desktop but may be
+ * absent locally (or predate maxCounters) — a missing plan must never block
+ * counter setup. -1/undefined = unlimited. Counts ACTIVE counters of the
+ * BRANCH (per-branch limit, cloud parity). Returns a 403 response descriptor
+ * or null when creation may proceed.
+ */
+async function checkBranchCounterLimit(branchId, agencyId) {
+  try {
+    if (!branchId || !agencyId) return null
+    const agency = await db.agency.findUnique({
+      where: { id: agencyId },
+      select: { subscriptionPlanId: true },
+    }).catch(() => null)
+    if (!agency) return null
+    let plan = agency.subscriptionPlanId
+      ? await db.subscriptionPlan.findUnique({ where: { id: agency.subscriptionPlanId } }).catch(() => null)
+      : null
+    if (!plan) {
+      plan = await db.subscriptionPlan.findFirst({ where: { name: 'FREE' } }).catch(() => null)
+    }
+    if (!plan) return null
+    const limit = plan.maxCounters
+    if (limit === null || limit === undefined || limit === -1) return null
+    const current = await db.counter.count({ where: { branchId, isActive: true } }).catch(() => 0)
+    if (current >= limit) {
+      return {
+        status: 403,
+        body: {
+          success: false,
+          error: 'PLAN_LIMIT_REACHED',
+          message: `Your ${plan.displayName || plan.name} plan allows up to ${limit} counters per branch. Upgrade your subscription to add more.`,
+          limit,
+          current,
+          resource: 'counters',
+        },
+      }
+    }
+    return null
+  } catch { return null }
+}
+
+/** Stale cutoff for takeover/sweep eligibility (control older than 3 min). */
+function controlStaleCutoff() {
+  return new Date(Date.now() - CONTROL_TTL_MS)
+}
+
+/** Field set written when a counter loses control (legacy mirror included). */
+function counterControlFreeData() {
+  return {
+    controlledByUserId: null,
+    controlledByStaffId: null,
+    controlClaimedAt: null,
+    controlHeartbeatAt: null,
+    occupiedAt: null,
+  }
+}
+
+/**
+ * Who currently controls the counter (for 409 bodies + UI display).
+ * Resolves the controller's display name from the local User mirror.
+ */
+async function controlledByInfo(controlledByUserId, controlledByStaffId) {
+  if (!controlledByUserId) {
+    return { userId: null, name: null, staffId: controlledByStaffId ?? null }
+  }
+  const user = await db.user.findUnique({
+    where: { id: controlledByUserId },
+    select: { fullName: true, username: true },
+  }).catch(() => null)
+  return {
+    userId: controlledByUserId,
+    name: (user && (user.fullName || user.username)) || null,
+    staffId: controlledByStaffId ?? null,
+  }
+}
+
+/** Is this user still a valid agency member (owner, active staff, SUPER_ADMIN)? */
+async function isUserActiveAgencyMember(userId, agencyId) {
+  if (!userId || !agencyId) return false
+  const user = await db.user.findUnique({ where: { id: userId }, select: { isActive: true, role: true } }).catch(() => null)
+  if (!user || !user.isActive) return false
+  if (user.role === 'SUPER_ADMIN') return true
+  const owned = await db.agency.findFirst({ where: { id: agencyId, ownerId: userId }, select: { id: true } }).catch(() => null)
+  if (owned) return true
+  const staff = await db.agencyStaff.findFirst({
+    where: { userId, agencyId, isActive: true },
+    select: { id: true },
+  }).catch(() => null)
+  return !!staff
+}
+
+/** Can this user bypass the approval flow (owner, branch MANAGER, SUPER_ADMIN)? */
+async function canBypassCounterApproval(user, agencyId, branchId) {
+  if (!user) return false
+  if (user.role === 'SUPER_ADMIN') return true
+  const owned = await db.agency.findFirst({ where: { id: agencyId, ownerId: user.id }, select: { id: true } }).catch(() => null)
+  if (owned) return true
+  const manager = await db.agencyStaff.findFirst({
+    where: {
+      userId: user.id,
+      agencyId,
+      isActive: true,
+      role: 'MANAGER',
+      ...(branchId ? { OR: [{ branchId }, { branchId: null }] } : {}),
+    },
+    select: { id: true },
+  }).catch(() => null)
+  return !!manager
+}
+
+/**
+ * ATOMIC claim of counter control (runs INSIDE withOutboxTransaction so the
+ * claim + its deterministic-outcome row commit together). Mirrors the cloud
+ * claimCounterControl: free (or stale-heartbeat) counters are claimed; already
+ * mine → heartbeat refresh (refreshed:true); held by another LIVE member →
+ * conflict with the controller's identity. Legacy staffId/occupiedAt are
+ * written as display mirrors.
+ */
+async function claimCounterControlInTx(tx, params) {
+  const { counterId, agencyId, userId, staffId } = params
+  const now = new Date()
+  const counter = await tx.counter.findUnique({ where: { id: counterId } })
+  if (!counter) return { ok: false, status: 404, error: 'Counter not found' }
+  if (counter.isActive === false) return { ok: false, status: 403, error: 'Counter is inactive' }
+
+  const mine = counter.controlledByUserId === userId
+  const free = !counter.controlledByUserId
+  const stale = !!counter.controlledByUserId &&
+    (!counter.controlHeartbeatAt || new Date(counter.controlHeartbeatAt) < controlStaleCutoff())
+
+  // Controlled by someone else whose membership ended → treat as free.
+  let invalidController = false
+  if (counter.controlledByUserId && !mine && !stale) {
+    invalidController = !(await isUserActiveAgencyMember(counter.controlledByUserId, agencyId))
+  }
+
+  if (!mine && !free && !stale && !invalidController) {
+    return { ok: false, status: 409, error: 'COUNTER_CONTROLLED', controlledBy: await controlledByInfo(counter.controlledByUserId, counter.controlledByStaffId) }
+  }
+
+  // Auto-free an invalid controller record before claiming (cloud parity —
+  // claimCounterControl frees the dead-membership row first; without this the
+  // atomic claim's `controlledByUserId: null` arm can never match a holder
+  // whose heartbeat is still fresh but whose membership ended → permanent 409).
+  // Inside the outbox transaction the free + claim commit atomically.
+  if (invalidController) {
+    await tx.counter.updateMany({ where: { id: counterId }, data: counterControlFreeData() })
+  }
+
+  const claimed = await tx.counter.updateMany({
+    where: {
+      id: counterId,
+      OR: [
+        { controlledByUserId: null },
+        { controlledByUserId: userId },
+        { controlHeartbeatAt: { lt: controlStaleCutoff() } },
+      ],
+    },
+    data: {
+      controlledByUserId: userId,
+      controlledByStaffId: staffId || null,
+      controlClaimedAt: now,
+      controlHeartbeatAt: now,
+      // legacy mirror so older clients still render an occupied state
+      occupiedAt: now,
+      // legacy staff pointer for staff callers (display/roster only)
+      ...(staffId ? { staffId } : {}),
+    },
+  })
+  if (claimed.count === 0) {
+    // Lost a race against another claimant — re-read for the 409 body.
+    const fresh = await tx.counter.findUnique({ where: { id: counterId } })
+    return { ok: false, status: 409, error: 'COUNTER_CONTROLLED', controlledBy: await controlledByInfo(fresh && fresh.controlledByUserId, fresh && fresh.controlledByStaffId) }
+  }
+  const row = await tx.counter.findUnique({ where: { id: counterId } })
+  await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+  return { ok: true, refreshed: mine, counter: row }
+}
+
+/**
+ * Transition-window fallback for claimCounterControlInTx: the local generated
+ * client predates the control columns → degrade to the legacy Task 37-d
+ * occupation write (staffId + occupiedAt) so the desk keeps working.
+ */
+async function claimCounterControlLegacyInTx(tx, params) {
+  const { counterId, userId, staffId } = params
+  const now = new Date()
+  const counter = await tx.counter.findUnique({ where: { id: counterId } })
+  if (!counter) return { ok: false, status: 404, error: 'Counter not found' }
+  if (counter.isActive === false) return { ok: false, status: 403, error: 'Counter is inactive' }
+  // Legacy rule: held by ANOTHER ACTIVE staff row → conflict.
+  if (counter.staffId && counter.staffId !== staffId) {
+    const holder = await tx.agencyStaff.findUnique({ where: { id: counter.staffId } }).catch(() => null)
+    if (holder && holder.isActive) {
+      return { ok: false, status: 409, error: 'COUNTER_CONTROLLED', controlledBy: { userId: null, name: null, staffId: counter.staffId } }
+    }
+  }
+  const row = await tx.counter.update({
+    where: { id: counterId },
+    data: staffId ? { staffId, occupiedAt: now } : { occupiedAt: now },
+  })
+  await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+  return { ok: true, refreshed: false, counter: row, legacy: true }
+}
+
+/**
+ * Clear ALL control fields on a counter (controller or force path) inside the
+ * outbox transaction. Falls back to the legacy clear (staffId/occupiedAt) in
+ * the transition window.
+ */
+async function releaseCounterControlInTx(tx, params) {
+  const { counterId } = params
+  let row
+  try {
+    await tx.counter.update({ where: { id: counterId }, data: counterControlFreeData() })
+    row = await tx.counter.findUnique({ where: { id: counterId } })
+    // Legacy mirrors: a staff-held roster pointer is cleared too.
+    await tx.counter.update({ where: { id: counterId }, data: { staffId: null } })
+    row = await tx.counter.findUnique({ where: { id: counterId } })
+  } catch (err) {
+    if (!isUnknownColumnError(err, NEW_COUNTER_COLUMNS)) throw err
+    row = await tx.counter.update({ where: { id: counterId }, data: { staffId: null, occupiedAt: null } })
+  }
+  await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+  return { ok: true, counter: row }
+}
+
+/**
+ * Feature C queue gate — THE call-next gate (local mirror of the cloud
+ * enforceCounterControlGate). Nobody (owner included) calls next until
+ *   (a) the agency has at least one ACTIVE counter configured
+ *       → 403 COUNTER_SETUP_REQUIRED,
+ *   (b) the caller CONTROLS one (controlledByUserId === sessionUser.id)
+ *       → 403 COUNTER_CONTROL_REQUIRED,
+ *   (c) an explicitly passed counterId IS the controlled counter
+ *       → 403 COUNTER_CONTROL_REQUIRED.
+ * Returns the caller's controlled counter (id + assigned services) so the
+ * claim can be scoped to the counter's services. SUPER_ADMIN keeps the
+ * historic bypass. canManageQueue is enforced by the caller's
+ * checkAgencyPermission gate.
+ */
+async function enforceCounterControlGate(ctx, counterId) {
+  if (sessionUser && sessionUser.role === 'SUPER_ADMIN') {
+    if (!counterId) return { ok: true, controlledCounter: null }
+    const c = await db.counter.findFirst({
+      where: { id: counterId, branch: { agencyId: ctx.agencyId } },
+      select: { id: true, serviceIds: true },
+    }).catch(() => null)
+    return { ok: true, controlledCounter: c ? { id: c.id, serviceIds: parseCounterServiceIds(c.serviceIds) } : null }
+  }
+
+  try {
+    const activeCounters = await db.counter.count({
+      where: { branch: { agencyId: ctx.agencyId }, isActive: true },
+    })
+    if (activeCounters === 0) {
+      return { ok: false, status: 403, body: { success: false, error: 'COUNTER_SETUP_REQUIRED' } }
+    }
+    const controlled = await db.counter.findFirst({
+      where: { controlledByUserId: sessionUser.id, branch: { agencyId: ctx.agencyId }, isActive: true },
+      select: { id: true, serviceIds: true },
+    })
+    if (!controlled) {
+      return { ok: false, status: 403, body: { success: false, error: 'COUNTER_CONTROL_REQUIRED' } }
+    }
+    if (counterId && counterId !== controlled.id) {
+      return { ok: false, status: 403, body: { success: false, error: 'COUNTER_CONTROL_REQUIRED' } }
+    }
+    return { ok: true, controlledCounter: { id: controlled.id, serviceIds: parseCounterServiceIds(controlled.serviceIds) } }
+  } catch (err) {
+    // Transition window (client predates the control columns) → fall back to
+    // the legacy occupancy rule so the desk keeps working offline.
+    if (!isUnknownColumnError(err, NEW_COUNTER_COLUMNS)) throw err
+    const legacy = await checkCounterOccupancyLegacy(ctx, counterId)
+    if (!legacy.ok) {
+      return { ok: false, status: 403, body: { success: false, error: 'COUNTER_CONTROL_REQUIRED' } }
+    }
+    return { ok: true, controlledCounter: legacy.counter ? { id: legacy.counter.id, serviceIds: [] } : null }
+  }
+}
+
+/**
+ * Task 37-d OCCUPANCY RULE for the queue action routes — UPDATED for the
+ * Feature C CONTROL model (mirror of the cloud enforceQueueStaffAuthority):
+ * a non-owner caller must operate from a counter they personally CONTROL
+ * (counter.controlledByUserId === sessionUser.id — the legacy staffId/
+ * occupiedAt columns no longer gate anything).
+ *   - staff without counterId                → must control SOME active
+ *                                              counter → else OCCUPY_COUNTER_FIRST
+ *   - counterId provided                     → that counter MUST be controlled
+ *                                              by the caller → else OCCUPY_COUNTER_FIRST
  *   - counter missing / outside the agency   → denied OCCUPY_COUNTER_FIRST
- *   - counter occupied by another ACTIVE row → denied OCCUPY_COUNTER_FIRST
- * Owner is unaffected (counterId optional, no occupancy requirement).
+ * Owner (and SUPER_ADMIN) is unaffected (counterId optional, no requirement).
+ * The legacy OCCUPY_COUNTER_FIRST string is deliberately KEPT for client
+ * compat (walk-in / call-specific / status routes still answer with it).
  */
 async function checkCounterOccupancy(ctx, counterId) {
   if (ctx.isOwner) return { ok: true, counter: null }
+  const deny = () => ({ ok: false, body: { success: false, error: 'OCCUPY_COUNTER_FIRST' } })
+  try {
+    if (counterId) {
+      const counter = await db.counter.findUnique({
+        where: { id: counterId },
+        include: { branch: true },
+      })
+      if (!counter || !counter.branch || counter.branch.agencyId !== ctx.agencyId) return deny()
+      if (counter.controlledByUserId !== sessionUser.id) return deny()
+      return { ok: true, counter }
+    }
+    const controlled = await db.counter.findFirst({
+      where: { controlledByUserId: sessionUser.id, branch: { agencyId: ctx.agencyId }, isActive: true },
+    })
+    if (!controlled) return deny()
+    return { ok: true, counter: controlled }
+  } catch (err) {
+    if (!isUnknownColumnError(err, NEW_COUNTER_COLUMNS)) throw err
+    return checkCounterOccupancyLegacy(ctx, counterId)
+  }
+}
+
+/** Legacy Task 37-d occupancy rule (staffId-based) — transition window only. */
+async function checkCounterOccupancyLegacy(ctx, counterId) {
   if (!counterId) {
     return { ok: false, body: { success: false, error: 'OCCUPY_COUNTER_FIRST' } }
   }
@@ -658,6 +1047,107 @@ async function checkCounterOccupancy(ctx, counterId) {
     return { ok: false, body: { success: false, error: 'OCCUPY_COUNTER_FIRST' } }
   }
   return { ok: true, counter }
+}
+
+/**
+ * ATOMIC control transfer (approval path + owner/manager manual grant) inside
+ * the outbox transaction. `expectFromUserId` guards the approval path — the
+ * transfer only lands if control is still held by that account. Mirrors the
+ * cloud transferCounterControl (COUNTER_CONTROL_CHANGED on a lost race).
+ */
+async function transferCounterControlInTx(tx, params) {
+  const { counterId, toUserId, toStaffId, expectFromUserId } = params
+  const now = new Date()
+  const counter = await tx.counter.findUnique({ where: { id: counterId } })
+  if (!counter) return { ok: false, status: 404, error: 'Counter not found' }
+  if (expectFromUserId && counter.controlledByUserId !== expectFromUserId) {
+    return { ok: false, status: 409, error: 'COUNTER_CONTROL_CHANGED' }
+  }
+  const claimed = await tx.counter.updateMany({
+    where: { id: counterId, controlledByUserId: counter.controlledByUserId || null },
+    data: {
+      controlledByUserId: toUserId,
+      controlledByStaffId: toStaffId || null,
+      controlClaimedAt: now,
+      controlHeartbeatAt: now,
+      occupiedAt: now,
+    },
+  })
+  if (claimed.count === 0) {
+    return { ok: false, status: 409, error: 'COUNTER_CONTROL_CHANGED' }
+  }
+  const row = await tx.counter.findUnique({ where: { id: counterId } })
+  await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+  return { ok: true, counter: row }
+}
+
+/**
+ * Release EVERY counter controlled by the user (logout / app close /
+ * release-mine route). Each release commits through its own outbox
+ * transaction so the deterministic replay reaches the cloud. Returns the
+ * number of freed counters.
+ */
+async function releaseAllCountersForUser(userId) {
+  if (!db || !userId) return 0
+  const held = await db.counter.findMany({
+    where: { controlledByUserId: userId },
+    select: { id: true, branch: { select: { agencyId: true } } },
+  }).catch(() => [])
+  let released = 0
+  for (const counter of held) {
+    try {
+      await withOutboxTransaction(async (tx) => {
+        await releaseCounterControlInTx(tx, { counterId: counter.id })
+      })
+      emitEvent('counter:released', {
+        agencyId: counter.branch ? counter.branch.agencyId : null,
+        counterId: counter.id,
+        controlledByUserId: userId,
+        auto: true,
+      })
+      released++
+    } catch (err) {
+      console.warn('[LocalAPI] release-all: failed to free counter', counter.id, err && err.message)
+    }
+  }
+  return released
+}
+
+/**
+ * Sweeper pass — free counters whose control heartbeat went stale (>3 min) or
+ * that were claimed but never heartbeated (claimedAt stale). Mirrors the
+ * cloud sweepStaleCounterControl. Returns the freed count.
+ */
+async function sweepStaleCounterControl() {
+  if (!db) return 0
+  const stale = await db.counter.findMany({
+    where: {
+      controlledByUserId: { not: null },
+      OR: [
+        { controlHeartbeatAt: { lt: controlStaleCutoff() } },
+        { controlHeartbeatAt: null, controlClaimedAt: { lt: controlStaleCutoff() } },
+      ],
+    },
+    select: { id: true, controlledByUserId: true, branch: { select: { agencyId: true } } },
+  }).catch(() => [])
+  let freed = 0
+  for (const counter of stale) {
+    try {
+      await withOutboxTransaction(async (tx) => {
+        await releaseCounterControlInTx(tx, { counterId: counter.id })
+      })
+      emitEvent('counter:released', {
+        agencyId: counter.branch ? counter.branch.agencyId : null,
+        counterId: counter.id,
+        controlledByUserId: counter.controlledByUserId,
+        swept: true,
+      })
+      freed++
+    } catch (err) {
+      console.warn('[LocalAPI] control sweeper: failed to free counter', counter.id, err && err.message)
+    }
+  }
+  return freed
 }
 
 /**
@@ -783,6 +1273,211 @@ async function isCloudReachable(timeoutMs) {
     return res.ok
   } catch {
     return false
+  }
+}
+
+// ─── UNIFIED QUEUE / Enhanced Online Operational Mode ────────────────────────
+//
+// When the central API is reachable it is the DEFINITIVE source of truth for
+// every branch-staff queue operation: ticket-calling, reservation-creation
+// and status updates are executed there as ONE atomic, idempotent,
+// OCC-guarded PostgreSQL transaction, then mirrored into the local SQLite
+// mirror. When the cloud is unreachable, the proven local-first outbox path
+// still applies below each route's online branch.
+//
+// NEVER log an outbox row for an operation the CENTRAL API already applied —
+// Reservation pushes replay unconditionally (no updatedAt column), so a
+// replayed local outcome could clobber a newer central state.
+
+/**
+ * Cached online verdict from the sync engine (fast path: zero round trips
+ * when the cloud socket is live or the verdict is <15s old). Returns
+ * true/false, or null when the engine has no verdict yet (treat as offline).
+ */
+function cloudOnlineFast() {
+  try {
+    // Lazy require — sync-service lazily requires ./index (circular dep).
+    const syncService = require('./sync-service')
+    if (syncService && typeof syncService.cloudReachableFast === 'function') {
+      return syncService.cloudReachableFast()
+    }
+  } catch { /* engine not started — treat as offline */ }
+  return null
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Forward a queue mutation to the central API with an idempotency key.
+ *
+ * Idempotency contract: the SAME X-Idempotency-Key is reused across internal
+ * retries — if the first attempt actually landed, the cloud's
+ * idempotencyGuard replays the STORED response instead of executing twice
+ * ("prevent the same operation executing twice due to request
+ * retransmission"). The renderer's own key is forwarded when present so a
+ * renderer-level retransmission maps to the same central execution.
+ *
+ * Retry contract (automatic retries on concurrent-operation conflicts):
+ *   - 409 conflict → retry with the same key (a fresh execution claims the
+ *     NEXT ticket; a stored one replays).
+ *   - network error / timeout / 5xx / 429 / 408 → retry with backoff.
+ *   - 401 / 423 → NEVER retried and NEVER masked as offline — the session
+ *     was rejected (Task 33-C principle): surfaced as errorKind 'AUTH'.
+ *   - other 4xx → definitive business answer, errorKind 'CLIENT'.
+ * Exhausted retryable failures → errorKind 'UNREACHABLE' (caller falls back
+ * to the local outbox path — full offline-mode behavior preserved).
+ *
+ * Returns { ok, status, data, errorKind, error } — never throws.
+ */
+async function callCentralQueueApi(method, path, body, opts) {
+  opts = opts || {}
+  const base = cloudBaseUrl()
+  const maxAttempts = opts.maxAttempts || 3
+  const idempotencyKey = opts.idempotencyKey || ('qop-' + require('crypto').randomUUID())
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(base + path, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Idempotency-Key': idempotencyKey,
+          ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(opts.timeoutMs || 6000),
+      })
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) return { ok: true, status: res.status, data, errorKind: null }
+      // Auth rejection is definitive — surface it, never go local silently.
+      if (res.status === 401 || res.status === 423) {
+        return { ok: false, status: res.status, data, errorKind: 'AUTH' }
+      }
+      // Concurrent-operation conflict: the central claim/tx lost a race —
+      // retrying re-evaluates the queue (a landed attempt replays instead).
+      if (res.status === 409) {
+        if (attempt < maxAttempts) { await sleep(350); continue }
+        return { ok: false, status: res.status, data, errorKind: 'CONFLICT' }
+      }
+      // Transient failures (cloud hiccup / rate limit / gateway timeout).
+      if (res.status >= 500 || res.status === 429 || res.status === 408) {
+        if (attempt < maxAttempts) { await sleep(400 * attempt); continue }
+        return { ok: false, status: res.status, data, errorKind: 'UNREACHABLE' }
+      }
+      // Definitive business answer (paused, closed, ONLY_SCHEDULED_WAITING,
+      // OCCUPY_COUNTER_FIRST, PERMISSION_DENIED, …) — pass through verbatim.
+      return { ok: false, status: res.status, data, errorKind: 'CLIENT' }
+    } catch (err) {
+      // Network error / timeout — retry with the SAME idempotency key: if the
+      // request landed despite the client-side timeout, the replay path
+      // returns the stored response instead of double-executing.
+      if (attempt < maxAttempts) { await sleep(400 * attempt); continue }
+      return { ok: false, status: 0, data: null, error: err?.message || 'cloud unreachable', errorKind: 'UNREACHABLE' }
+    }
+  }
+  return { ok: false, status: 0, data: null, errorKind: 'UNREACHABLE' }
+}
+
+/**
+ * Map a queue action to the exact local/central state delta (both paths use
+ * THIS mapping so the local mirror always matches the central outcome).
+ */
+function queueActionUpdateData(action, now) {
+  if (action === 'complete') return { status: 'COMPLETED', completedAt: now }
+  if (action === 'no_show') return { status: 'NO_SHOW', skippedAt: now }
+  if (action === 'cancel') return { status: 'CANCELLED', cancelledAt: now }
+  if (action === 'serve') return { status: 'SERVING' }
+  if (action === 'recall') return { status: 'CALLED', calledAt: now }
+  return { status: action }
+}
+
+/**
+ * Apply an authoritative CENTRAL claim (call-next) to the local mirror —
+ * WITHOUT an outbox row (the cloud owns this change; the immediate pull
+ * reconciles counter links and anything else).
+ */
+async function applyCentralClaimLocally(centralRes, agencyId) {
+  if (!centralRes || !centralRes.id || !db) return
+  try {
+    const localRow = await db.reservation.findUnique({ where: { id: centralRes.id } }).catch(() => null)
+    if (localRow && localRow.status === 'WAITING') {
+      const data = { status: 'CALLED', calledAt: centralRes.calledAt ? new Date(centralRes.calledAt) : new Date() }
+      if (centralRes.counterId !== undefined) data.counterId = centralRes.counterId
+      await db.reservation.update({ where: { id: centralRes.id }, data })
+    }
+    // Mirror the authoritative "now serving" number for kiosks/dashboards.
+    if (typeof centralRes.queueNumber === 'number') {
+      const qs = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      if (qs) {
+        await db.queueSettings.update({ where: { id: qs.id }, data: { currentServingNumber: centralRes.queueNumber } }).catch(() => {})
+      }
+    }
+    try {
+      const syncService = require('./sync-service')
+      if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+    } catch { /* non-fatal */ }
+  } catch (e) {
+    // The mirror is best-effort — the pull brings the authoritative row.
+    console.warn('[LocalAPI] applyCentralClaimLocally failed (pull will reconcile):', e?.message || e)
+  }
+}
+
+/**
+ * Mirror a CENTRALLY-created reservation into the local DB (walk-ins) —
+ * skipped when the row already exists (idempotent); never outboxed.
+ */
+async function mirrorCentralReservationCreate(centralRes) {
+  if (!centralRes || !centralRes.id || !db) return
+  try {
+    const existing = await db.reservation.findUnique({ where: { id: centralRes.id } }).catch(() => null)
+    if (existing) return
+    await db.reservation.create({
+      data: {
+        id: centralRes.id,
+        agencyId: centralRes.agencyId,
+        serviceId: centralRes.serviceId,
+        userId: centralRes.userId ?? null,
+        queueNumber: typeof centralRes.queueNumber === 'number' ? centralRes.queueNumber : 0,
+        displayNumber: centralRes.displayNumber || '',
+        status: centralRes.status || 'WAITING',
+        isWalkIn: !!centralRes.isWalkIn,
+        walkInCustomerName: centralRes.walkInCustomerName ?? null,
+        joinedAt: centralRes.joinedAt ? new Date(centralRes.joinedAt) : new Date(),
+        estimatedWait: typeof centralRes.estimatedWait === 'number' ? centralRes.estimatedWait : 0,
+      },
+    })
+    try {
+      const syncService = require('./sync-service')
+      if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+    } catch { /* non-fatal */ }
+  } catch (e) {
+    console.warn('[LocalAPI] mirrorCentralReservationCreate failed (pull will reconcile):', e?.message || e)
+  }
+}
+
+/**
+ * Apply an authoritative CENTRAL status update to the local mirror — same
+ * delta mapping as the local path, plus the counter unlink on terminal
+ * actions (parity with the cloud PATCH), never outboxed.
+ */
+async function applyCentralStatusLocally(reservationId, action) {
+  if (!db) return
+  try {
+    const updateData = queueActionUpdateData(action, new Date())
+    const row = await db.reservation.findUnique({ where: { id: reservationId } }).catch(() => null)
+    if (row) await db.reservation.update({ where: { id: reservationId }, data: updateData })
+    if (['complete', 'no_show', 'cancel'].includes(action)) {
+      await db.counter.updateMany({
+        where: { currentReservationId: reservationId },
+        data: { currentReservationId: null },
+      }).catch(() => {})
+    }
+    try {
+      const syncService = require('./sync-service')
+      if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+    } catch { /* non-fatal */ }
+  } catch (e) {
+    console.warn('[LocalAPI] applyCentralStatusLocally failed (pull will reconcile):', e?.message || e)
   }
 }
 
@@ -3630,8 +4325,22 @@ function createApp() {
     })
   })
 
-  app.post('/api/auth/logout', (c) => {
+  app.post('/api/auth/logout', async (c) => {
     const previousUser = sessionUser
+    // Feature C — logout auto-release: every counter this session controls is
+    // freed BEFORE the session is cleared so control can never outlive the
+    // session (cloud parity with POST /counters/release-mine on logout).
+    // Best-effort: a failed release must not block the logout itself.
+    if (previousUser && db) {
+      try {
+        const released = await releaseAllCountersForUser(previousUser.id)
+        if (released > 0) {
+          console.log(`[LocalAPI] Logout auto-release: freed ${released} counter(s) controlled by ${previousUser.username || previousUser.id}`)
+        }
+      } catch (err) {
+        console.warn('[LocalAPI] Logout auto-release failed (non-fatal):', err && err.message)
+      }
+    }
     sessionToken = null
     sessionUser = null
     // Task 41 — a logout invalidates the WHOLE session chain (no grace).
@@ -5240,12 +5949,18 @@ function createApp() {
         where = { branchId: { in: branches.map(b => b.id) } }
       }
 
+      // Feature C: include the live controller's user so the UI can show WHO
+      // holds each counter (relation exists in the desktop schema).
       const counters = await db.counter.findMany({
         where,
+        include: {
+          controlledByUser: { select: { id: true, fullName: true, username: true } },
+        },
         orderBy: { number: 'asc' },
       })
 
-      return c.json({ success: true, data: counters })
+      // Feature C: expose the parsed service assignment alongside the raw JSON.
+      return c.json({ success: true, data: counters.map(withCounterServiceIdList) })
     } catch (error) {
       console.error('[LocalAPI] List counters error:', error)
       return c.json({ success: false, error: 'Failed to list counters' }, 500)
@@ -5264,10 +5979,33 @@ function createApp() {
       if (!permGate.ok) return c.json(permGate.body, permGate.status)
 
       const body = await c.req.json()
-      const { name, number, branchId, isActive } = body
+      const { name, number, branchId, isActive, serviceIds } = body
 
       if (number === undefined) {
         return c.json({ success: false, error: 'Counter number is required' }, 400)
+      }
+
+      // Feature C: validate branch ownership when a branch is named.
+      if (branchId) {
+        const branch = await db.branch.findUnique({ where: { id: branchId } }).catch(() => null)
+        if (!branch || branch.agencyId !== agencyId) {
+          return c.json({ success: false, error: 'Branch not found' }, 404)
+        }
+      }
+
+      // Feature C: counter→service assignment — every id must be an agency service
+      // (validated BEFORE the plan cap so a bad payload answers 400, not 403).
+      let serviceIdsJson = null
+      if (serviceIds !== undefined) {
+        const svcCheck = await validateCounterServiceIds(serviceIds, agencyId)
+        if (!svcCheck.ok) return c.json({ success: false, error: svcCheck.error }, 400)
+        serviceIdsJson = svcCheck.json
+      }
+
+      // Feature C: per-branch plan limit (best-effort, fail-open).
+      if (branchId) {
+        const limitCheck = await checkBranchCounterLimit(branchId, agencyId)
+        if (limitCheck) return c.json(limitCheck.body, limitCheck.status)
       }
 
       // Part Q: business write + outbox row commit atomically.
@@ -5279,6 +6017,7 @@ function createApp() {
             number,
             branchId: branchId || null,
             isActive: isActive !== undefined ? Boolean(isActive) : true,
+            ...(serviceIds !== undefined ? { serviceIds: serviceIdsJson } : {}),
           },
         })
         // Canonical replay (round-7): id-preserving record-level create.
@@ -5288,7 +6027,7 @@ function createApp() {
 
       emitEvent('counter:created', { agencyId, counter })
 
-      return c.json({ success: true, data: counter }, 201)
+      return c.json({ success: true, data: await withCounterServiceIdList(counter) }, 201)
     } catch (error) {
       console.error('[LocalAPI] Create counter error:', error)
       return c.json({ success: false, error: 'Failed to create counter' }, 500)
@@ -5321,12 +6060,17 @@ function createApp() {
         }
       }
 
-      const allowedFields = ['name', 'number', 'branchId', 'isActive']
+      const allowedFields = ['name', 'number', 'branchId', 'isActive', 'serviceIds']
       const updateData = {}
       for (const field of allowedFields) {
         if (body[field] !== undefined) {
           updateData[field] = body[field]
         }
+      }
+      if (updateData.serviceIds !== undefined) {
+        const svcCheck = await validateCounterServiceIds(updateData.serviceIds, agencyId)
+        if (!svcCheck.ok) return c.json({ success: false, error: svcCheck.error }, 400)
+        updateData.serviceIds = svcCheck.json
       }
 
       // Part Q: business write + outbox row commit atomically.
@@ -5338,7 +6082,8 @@ function createApp() {
 
       emitEvent('counter:updated', { agencyId, counterId: id, ...updateData })
 
-      return c.json({ success: true, data: updated })
+      // Feature C: mirror the GET shape — parsed serviceIdList rides along.
+      return c.json({ success: true, data: await withCounterServiceIdList(updated) })
     } catch (error) {
       console.error('[LocalAPI] Update counter error:', error)
       return c.json({ success: false, error: 'Failed to update counter' }, 500)
@@ -5361,12 +6106,17 @@ function createApp() {
       // (agency.ts GET /branches/:id/counters).
       const branch = await db.branch.findFirst({ where: { id: branchId, agencyId } })
       if (!branch) return c.json({ success: false, error: 'Branch not found' }, 404)
+      // Feature C: include the live controller's user + parsed service list.
       const counters = await db.counter.findMany({
         where: { branchId },
+        include: {
+          controlledByUser: { select: { id: true, fullName: true, username: true } },
+        },
         orderBy: { name: 'asc' },
       })
+      const countersEnriched = counters.map(withCounterServiceIdList)
       // Dual-key — the UI reads data.counters, the cloud contract is { counters }.
-      return c.json({ success: true, counters, data: counters })
+      return c.json({ success: true, counters: countersEnriched, data: countersEnriched })
     } catch (error) {
       console.error('[LocalAPI] List branch counters error:', error)
       return c.json({ success: false, error: 'Failed to list counters' }, 500)
@@ -5379,11 +6129,22 @@ function createApp() {
       const agencyId = sessionUser.agencyId
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
       const { counterId } = c.req.param()
-      const counter = await db.counter.findUnique({ where: { id: counterId } })
-      if (!counter || counter.agencyId !== agencyId) {
+      const counter = await db.counter.findUnique({
+        where: { id: counterId },
+        include: { controlledByUser: { select: { id: true, fullName: true, username: true } } },
+      })
+      // FIX (Feature C): Counter has NO agencyId column — the old
+      // `counter.agencyId !== agencyId` was ALWAYS truthy → every GET 404'd.
+      // Resolve the counter's agency via its branch instead, and validate the
+      // nested branchId param like the cloud alias routes.
+      if (!counter || counter.branchId !== c.req.param('branchId')) {
         return c.json({ success: false, error: 'Counter not found' }, 404)
       }
-      return c.json({ success: true, data: counter })
+      const branch = await db.branch.findUnique({ where: { id: counter.branchId } }).catch(() => null)
+      if (!branch || branch.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Counter not found' }, 404)
+      }
+      return c.json({ success: true, data: await withCounterServiceIdList(counter) })
     } catch (error) {
       console.error('[LocalAPI] Get counter error:', error)
       return c.json({ success: false, error: 'Failed to get counter' }, 500)
@@ -5399,13 +6160,27 @@ function createApp() {
         const { counterId } = c.req.param()
         const body = await c.req.json()
         const existing = await db.counter.findUnique({ where: { id: counterId } })
-        if (!existing || existing.agencyId !== agencyId) {
+        // FIX (Feature C): Counter has no agencyId — resolve ownership via the
+        // counter's branch (the old `existing.agencyId !== agencyId` was
+        // ALWAYS truthy → every update 404'd). Validate the nested branchId.
+        if (!existing || existing.branchId !== c.req.param('branchId')) {
           return c.json({ success: false, error: 'Counter not found' }, 404)
         }
-        const allowedFields = ['name', 'branchId', 'isActive', 'prefix']
+        const branch = await db.branch.findUnique({ where: { id: existing.branchId } }).catch(() => null)
+        if (!branch || branch.agencyId !== agencyId) {
+          return c.json({ success: false, error: 'Counter not found' }, 404)
+        }
+        const allowedFields = ['name', 'branchId', 'isActive', 'prefix', 'serviceIds']
         const updateData = {}
         for (const field of allowedFields) {
           if (body[field] !== undefined) updateData[field] = body[field]
+        }
+        if (updateData.serviceIds !== undefined) {
+          const svcCheck = await validateCounterServiceIds(updateData.serviceIds, agencyId)
+          if (!svcCheck.ok) {
+            return c.json({ success: false, error: svcCheck.error }, 400)
+          }
+          updateData.serviceIds = svcCheck.json
         }
         // Part Q: business write + outbox row commit atomically.
         const updated = await withOutboxTransaction(async (tx) => {
@@ -5414,7 +6189,8 @@ function createApp() {
           return row
         })
         emitEvent('counter:updated', { agencyId, counterId, ...updateData })
-        return c.json({ success: true, data: updated })
+        // Feature C: mirror the GET shape — parsed serviceIdList rides along.
+        return c.json({ success: true, data: await withCounterServiceIdList(updated) })
       } catch (error) {
         console.error('[LocalAPI] Update branch counter error:', error)
         return c.json({ success: false, error: 'Failed to update counter' }, 500)
@@ -5430,7 +6206,14 @@ function createApp() {
       if (!agencyId) return c.json({ success: false, error: 'No agency' }, 403)
       const { counterId } = c.req.param()
       const existing = await db.counter.findUnique({ where: { id: counterId } })
-      if (!existing || existing.agencyId !== agencyId) {
+      // FIX (Feature C): Counter has no agencyId — resolve ownership via the
+      // counter's branch (the old `existing.agencyId !== agencyId` was
+      // ALWAYS truthy → every delete 404'd). Validate the nested branchId.
+      if (!existing || existing.branchId !== c.req.param('branchId')) {
+        return c.json({ success: false, error: 'Counter not found' }, 404)
+      }
+      const branch = await db.branch.findUnique({ where: { id: existing.branchId } }).catch(() => null)
+      if (!branch || branch.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Counter not found' }, 404)
       }
       // Part Q: business write + outbox row commit atomically.
@@ -5487,126 +6270,574 @@ function createApp() {
     }
   })
 
-  // POST /api/agency/counters/:counterId/occupy — claim a service counter.
-  // Contract: the counter must belong to the caller's agency (validated via
-  // counter.branch.agencyId — Counter has NO agencyId column, join through
-  // Branch). If Counter.staffId points at ANOTHER ACTIVE staff row → 409
-  // COUNTER_OCCUPIED. Staff callers claim with their own AgencyStaff.id;
-  // owners set occupiedAt only (staffId untouched). Persisted through the
-  // SAME outbox pattern as the counter PATCH routes so the occupation
-  // replays deterministically to the cloud.
-  app.post('/api/agency/counters/:counterId/occupy', authMiddleware, async (c) => {
+  // ── Feature C: counter CONTROL (occupy = atomic claim, release = controller
+  //    or owner/manager force). Shared handlers so the canonical routes and
+  //    the branch-nested aliases run IDENTICAL logic (cloud parity).
+  //
+  //   POST /api/agency/counters/:counterId/occupy                  ← CANONICAL
+  //   POST /api/agency/counters/:counterId/release                 ← CANONICAL
+  //   POST /api/agency/branches/:branchId/counters/:counterId/occupy  ← alias
+  //   POST /api/agency/branches/:branchId/counters/:counterId/release ← alias
+  //
+  // occupy: atomic conditional claim (free OR stale-heartbeat OR mine →
+  // claimed; held by another LIVE member → 409 COUNTER_OCCUPIED +
+  // controlError COUNTER_CONTROLLED + controlledBy identity so the client can
+  // offer the "request control" flow; refreshed:true when already mine).
+  // release: the controller can always release; agency owner / branch
+  // MANAGER / SUPER_ADMIN can force-release anyone's; another staff member
+  // gets 403 NOT_COUNTER_OCCUPIER (legacy string kept for client compat).
+  // Both persist through withOutboxTransaction + logDeterministicOutcome so
+  // the state change replays deterministically to the cloud.
+
+  /**
+   * Resolve the counter for a control action and verify the caller's
+   * canManageQueue authority. Returns { ok, ctx?, counter?, body?, response? }.
+   * `body` is the (single) parsed request body — Hono does NOT reliably cache
+   * a second c.req.json() on the node adapter, so consumers MUST reuse this
+   * instead of re-reading the stream (the transfer-control 400 regression).
+   */
+  async function resolveCounterForControlAction(c) {
+    const body = await c.req.json().catch(() => ({}))
+    const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
+    if (!gate.ok) return { ok: false, response: () => c.json(gate.body, gate.status) }
+    const { ctx } = gate
+    const counterId = c.req.param('counterId')
+    const counter = await db.counter.findUnique({
+      where: { id: counterId },
+      include: { branch: true },
+    }).catch(() => null)
+    if (!counter || !counter.branch || counter.branch.agencyId !== ctx.agencyId) {
+      return { ok: false, response: () => c.json({ success: false, error: 'Counter not found' }, 404) }
+    }
+    return { ok: true, ctx, counterId, counter, body }
+  }
+
+  async function handleCounterOccupy(c) {
     try {
-      const body = await c.req.json().catch(() => ({}))
-      const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
-      if (!gate.ok) return c.json(gate.body, gate.status)
-      const { ctx } = gate
-
-      const counterId = c.req.param('counterId')
-      const counter = await db.counter.findUnique({
-        where: { id: counterId },
-        include: { branch: true },
-      })
-      if (!counter || !counter.branch || counter.branch.agencyId !== ctx.agencyId) {
-        return c.json({ success: false, error: 'Counter not found' }, 404)
-      }
-
-      // Occupied by ANOTHER ACTIVE staff row → 409. A stale holder row
-      // (deleted or deactivated) does not block a fresh occupation.
-      if (counter.staffId && counter.staffId !== ctx.staffId) {
-        const holder = await db.agencyStaff.findUnique({ where: { id: counter.staffId } }).catch(() => null)
-        if (holder && holder.isActive) {
-          return c.json({ success: false, error: 'COUNTER_OCCUPIED' }, 409)
-        }
-      }
-
+      const resolved = await resolveCounterForControlAction(c)
+      if (!resolved.ok) return resolved.response()
+      const { ctx, counterId } = resolved
       const now = new Date()
-      const counterUpdated = await withOutboxTransaction(async (tx) => {
-        const data = ctx.isOwner ? { occupiedAt: now } : { staffId: ctx.staffId, occupiedAt: now }
-        let row
+
+      const claimResult = await withOutboxTransaction(async (tx) => {
+        let claim
         try {
-          row = await tx.counter.update({ where: { id: counterId }, data })
+          claim = await claimCounterControlInTx(tx, {
+            counterId,
+            agencyId: ctx.agencyId,
+            userId: sessionUser.id,
+            staffId: ctx.staffId,
+          })
         } catch (err) {
-          // Transition window: a stale generated client without occupiedAt.
+          // Transition window: the generated client predates the control columns.
           if (!isUnknownColumnError(err, NEW_COUNTER_COLUMNS)) throw err
-          console.warn('[LocalAPI] occupy: local Prisma client lacks occupiedAt — writing staffId only (non-fatal)')
-          row = await tx.counter.update({
-            where: { id: counterId },
-            data: ctx.isOwner ? {} : { staffId: ctx.staffId },
+          console.warn('[LocalAPI] occupy: local Prisma client lacks control columns — legacy staffId claim (non-fatal)')
+          claim = await claimCounterControlLegacyInTx(tx, {
+            counterId,
+            agencyId: ctx.agencyId,
+            userId: sessionUser.id,
+            staffId: ctx.staffId,
           })
         }
-        await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
-        return row
+        return claim
       })
 
+      if (!claimResult.ok) {
+        if (claimResult.status === 404) {
+          return c.json({ success: false, error: 'Counter not found' }, 404)
+        }
+        if (claimResult.status === 403) {
+          return c.json({ success: false, error: claimResult.error }, 403)
+        }
+        // 409 COUNTER_CONTROLLED → legacy surface: COUNTER_OCCUPIED (the web
+        // bundle maps both old+new) + controlError + who holds it.
+        return c.json({
+          success: false,
+          error: 'COUNTER_OCCUPIED',
+          controlError: claimResult.error,
+          ...(claimResult.controlledBy ? { controlledBy: claimResult.controlledBy } : {}),
+        }, 409)
+      }
+
+      const row = claimResult.counter || {}
       emitEvent('counter:occupied', {
         agencyId: ctx.agencyId,
         counterId,
-        staffId: counterUpdated.staffId,
-        occupiedAt: counterUpdated.occupiedAt || now,
+        staffId: row.staffId || null,
+        occupiedAt: row.occupiedAt || now,
+        controlledByUserId: row.controlledByUserId || sessionUser.id,
         byOwner: ctx.isOwner,
+        refreshed: !!claimResult.refreshed,
       })
-      return c.json({ success: true, counter: counterUpdated })
+      return c.json({ success: true, counter: row, refreshed: !!claimResult.refreshed })
     } catch (error) {
       console.error('[LocalAPI] Occupy counter error:', error)
       return c.json({ success: false, error: 'Failed to occupy counter' }, 500)
     }
-  })
+  }
 
-  // POST /api/agency/counters/:counterId/release — free a service counter.
-  // Staff may release only their own occupation (a counter held by ANOTHER
-  // ACTIVE staff row → 409 COUNTER_OCCUPIED); an owner may release ANY
-  // counter of the agency (clearing its staffId too — otherwise a staff-held
-  // counter could never be freed). staffId is cleared only when it was the
-  // caller's own row (or the caller is an owner); occupiedAt = null always.
-  // Same outbox pattern as occupy.
-  app.post('/api/agency/counters/:counterId/release', authMiddleware, async (c) => {
+  async function handleCounterRelease(c) {
     try {
-      const body = await c.req.json().catch(() => ({}))
-      const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
-      if (!gate.ok) return c.json(gate.body, gate.status)
-      const { ctx } = gate
+      const resolved = await resolveCounterForControlAction(c)
+      if (!resolved.ok) return resolved.response()
+      const { ctx, counterId, counter } = resolved
 
-      const counterId = c.req.param('counterId')
-      const counter = await db.counter.findUnique({
-        where: { id: counterId },
-        include: { branch: true },
-      })
-      if (!counter || !counter.branch || counter.branch.agencyId !== ctx.agencyId) {
-        return c.json({ success: false, error: 'Counter not found' }, 404)
+      // Controller can release their own control; agency owner / branch
+      // MANAGER / SUPER_ADMIN can force-release anyone's counter.
+      const force = sessionUser.role === 'SUPER_ADMIN' || ctx.isOwner ||
+        (await canBypassCounterApproval(sessionUser, ctx.agencyId, counter.branchId))
+      const heldByOther = counter.controlledByUserId &&
+        counter.controlledByUserId !== sessionUser.id
+      if (heldByOther && !force) {
+        // Cloud parity: releaseCounterControl answers NOT_COUNTER_CONTROLLER —
+        // the web bundle (branches rows + dashboard + fullscreen) matches THIS
+        // string for the friendly permission-denied toast. (The historic
+        // NOT_COUNTER_OCCUPIER alias is kept on controlError for old clients.)
+        return c.json({ success: false, error: 'NOT_COUNTER_CONTROLLER', controlError: 'NOT_COUNTER_CONTROLLER' }, 403)
       }
 
-      if (!ctx.isOwner && counter.staffId && counter.staffId !== ctx.staffId) {
-        const holder = await db.agencyStaff.findUnique({ where: { id: counter.staffId } }).catch(() => null)
-        if (holder && holder.isActive) {
-          return c.json({ success: false, error: 'COUNTER_OCCUPIED' }, 409)
-        }
-      }
-
-      const counterUpdated = await withOutboxTransaction(async (tx) => {
-        const data = { occupiedAt: null }
-        if (ctx.isOwner || counter.staffId === ctx.staffId) data.staffId = null
-        let row
-        try {
-          row = await tx.counter.update({ where: { id: counterId }, data })
-        } catch (err) {
-          // Transition window: a stale generated client without occupiedAt.
-          if (!isUnknownColumnError(err, NEW_COUNTER_COLUMNS)) throw err
-          console.warn('[LocalAPI] release: local Prisma client lacks occupiedAt — clearing staffId only (non-fatal)')
-          row = await tx.counter.update({
-            where: { id: counterId },
-            data: data.staffId !== undefined ? { staffId: data.staffId } : {},
-          })
-        }
-        await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
-        return row
+      const released = await withOutboxTransaction(async (tx) => {
+        return releaseCounterControlInTx(tx, { counterId })
       })
 
-      emitEvent('counter:released', { agencyId: ctx.agencyId, counterId, staffId: counterUpdated.staffId })
-      return c.json({ success: true, counter: counterUpdated })
+      emitEvent('counter:released', {
+        agencyId: ctx.agencyId,
+        counterId,
+        staffId: released.counter ? released.counter.staffId : null,
+        forced: heldByOther && force,
+        byUserId: sessionUser.id,
+      })
+      return c.json({ success: true, counter: released.counter })
     } catch (error) {
       console.error('[LocalAPI] Release counter error:', error)
       return c.json({ success: false, error: 'Failed to release counter' }, 500)
+    }
+  }
+
+  // CANONICAL paths
+  app.post('/api/agency/counters/:counterId/occupy', authMiddleware, handleCounterOccupy)
+  app.post('/api/agency/counters/:counterId/release', authMiddleware, handleCounterRelease)
+
+  // Branch-nested aliases (the branchId param is validated against the
+  // counter's actual branch → 404 on mismatch, mirroring the cloud aliases).
+  app.post('/api/agency/branches/:branchId/counters/:counterId/occupy', authMiddleware, async (c) => {
+    const branchId = c.req.param('branchId')
+    const counter = await db.counter.findUnique({
+      where: { id: c.req.param('counterId') },
+      select: { branchId: true },
+    }).catch(() => null)
+    if (!counter || counter.branchId !== branchId) {
+      return c.json({ success: false, error: 'Counter not found' }, 404)
+    }
+    return handleCounterOccupy(c)
+  })
+  app.post('/api/agency/branches/:branchId/counters/:counterId/release', authMiddleware, async (c) => {
+    const branchId = c.req.param('branchId')
+    const counter = await db.counter.findUnique({
+      where: { id: c.req.param('counterId') },
+      select: { branchId: true },
+    }).catch(() => null)
+    if (!counter || counter.branchId !== branchId) {
+      return c.json({ success: false, error: 'Counter not found' }, 404)
+    }
+    return handleCounterRelease(c)
+  })
+
+  // ── Feature C: heartbeat / request-control / requests / transfer / release-mine ──
+
+  // POST /api/agency/counters/:counterId/heartbeat — controller liveness ping
+  // (60s cadence). 403 COUNTER_CONTROL_LOST when control was lost meanwhile
+  // (swept / transferred / force-released) so the client can re-claim.
+  app.post('/api/agency/counters/:counterId/heartbeat', authMiddleware, async (c) => {
+    try {
+      const resolved = await resolveCounterForControlAction(c)
+      if (!resolved.ok) return resolved.response()
+      const { ctx, counterId, counter } = resolved
+      if (!counter.controlledByUserId || counter.controlledByUserId !== sessionUser.id) {
+        return c.json({ success: false, error: 'COUNTER_CONTROL_LOST' }, 403)
+      }
+      const beat = await withOutboxTransaction(async (tx) => {
+        const updated = await tx.counter.updateMany({
+          where: { id: counterId, controlledByUserId: sessionUser.id },
+          data: { controlHeartbeatAt: new Date() },
+        })
+        if (updated.count === 0) return { ok: false }
+        const row = await tx.counter.findUnique({ where: { id: counterId } })
+        await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+        return { ok: true, counter: row }
+      }).catch(() => ({ ok: false }))
+      if (!beat.ok) {
+        return c.json({ success: false, error: 'COUNTER_CONTROL_LOST' }, 403)
+      }
+      return c.json({ success: true, counterId, serverTime: new Date().toISOString() })
+    } catch (error) {
+      console.error('[LocalAPI] Counter heartbeat error:', error)
+      return c.json({ success: false, error: 'Failed to record heartbeat' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/:counterId/request-control — claim when free;
+  // when another account controls it, file a CounterControlRequest the
+  // controller must approve (owner / branch MANAGER force-transfer instead).
+  app.post('/api/agency/counters/:counterId/request-control', authMiddleware, async (c) => {
+    try {
+      const resolved = await resolveCounterForControlAction(c)
+      if (!resolved.ok) return resolved.response()
+      const { ctx, counterId, counter } = resolved
+
+      let current = counter
+      try {
+        current = await db.counter.findUnique({ where: { id: counterId } })
+      } catch (err) {
+        if (!isUnknownColumnError(err, NEW_COUNTER_COLUMNS)) throw err
+      }
+
+      const freeOrStale = !current.controlledByUserId ||
+        !current.controlHeartbeatAt ||
+        new Date(current.controlHeartbeatAt) < controlStaleCutoff()
+
+      if (freeOrStale || current.controlledByUserId === sessionUser.id) {
+        const claimResult = await withOutboxTransaction(async (tx) => {
+          let claim
+          try {
+            claim = await claimCounterControlInTx(tx, {
+              counterId, agencyId: ctx.agencyId, userId: sessionUser.id, staffId: ctx.staffId,
+            })
+          } catch (err) {
+            if (!isUnknownColumnError(err, NEW_COUNTER_COLUMNS)) throw err
+            claim = await claimCounterControlLegacyInTx(tx, {
+              counterId, agencyId: ctx.agencyId, userId: sessionUser.id, staffId: ctx.staffId,
+            })
+          }
+          return claim
+        })
+        if (claimResult.ok) {
+          emitEvent('counter:occupied', {
+            agencyId: ctx.agencyId,
+            counterId,
+            controlledByUserId: sessionUser.id,
+            byOwner: ctx.isOwner,
+            via: 'request-control',
+          })
+          return c.json({ success: true, status: 'GRANTED', counter: claimResult.counter })
+        }
+        return c.json({
+          success: false,
+          error: claimResult.error === 'COUNTER_CONTROLLED' ? 'COUNTER_OCCUPIED' : (claimResult.error || 'COUNTER_OCCUPIED'),
+          controlError: claimResult.error,
+          ...(claimResult.controlledBy ? { controlledBy: claimResult.controlledBy } : {}),
+        }, claimResult.status === 404 ? 404 : 409)
+      }
+
+      // Owner / branch MANAGER bypass the approval flow entirely (force-transfer).
+      if (await canBypassCounterApproval(sessionUser, ctx.agencyId, counter.branchId)) {
+        const transfer = await withOutboxTransaction(async (tx) => {
+          return transferCounterControlInTx(tx, {
+            counterId,
+            toUserId: sessionUser.id,
+            toStaffId: ctx.staffId,
+            actorUserId: sessionUser.id,
+          })
+        })
+        if (transfer.ok) {
+          emitEvent('counter:occupied', {
+            agencyId: ctx.agencyId,
+            counterId,
+            controlledByUserId: sessionUser.id,
+            byOwner: ctx.isOwner,
+            via: 'force-transfer',
+          })
+          return c.json({ success: true, status: 'GRANTED', counter: transfer.counter })
+        }
+        return c.json({ success: false, error: transfer.error }, transfer.status === 404 ? 404 : 409)
+      }
+
+      // Held by another live member → upsert a PENDING request (one per requester).
+      let request = await db.counterControlRequest.findFirst({
+        where: { counterId, requestedByUserId: sessionUser.id, status: 'PENDING' },
+      }).catch(() => null)
+      if (!request) {
+        request = await withOutboxTransaction(async (tx) => {
+          const created = await tx.counterControlRequest.create({
+            data: {
+              counterId,
+              agencyId: ctx.agencyId,
+              branchId: counter.branchId,
+              requestedByUserId: sessionUser.id,
+            },
+          })
+          await logDeterministicOutcome('CounterControlRequest', created.id, 'create', created, null, { tx })
+          return created
+        })
+      }
+      const controlledBy = await controlledByInfo(current.controlledByUserId, current.controlledByStaffId)
+      emitEvent('counter:control-requested', {
+        agencyId: ctx.agencyId,
+        counterId,
+        requestId: request.id,
+        requestedByUserId: sessionUser.id,
+        controlledByUserId: current.controlledByUserId,
+      })
+      return c.json({
+        success: true,
+        status: 'REQUEST_PENDING',
+        request: { id: request.id, status: request.status, createdAt: request.createdAt },
+        controlledBy,
+      })
+    } catch (error) {
+      console.error('[LocalAPI] request-control error:', error)
+      return c.json({ success: false, error: 'Failed to request control' }, 500)
+    }
+  })
+
+  // GET /api/agency/counters/control-requests?status=PENDING — requests I
+  // filed (outgoing) + pending on counters I control (incoming). Cloud shape:
+  // { success, incoming, outgoing }.
+  app.get('/api/agency/counters/control-requests', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser.agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      const status = c.req.query('status') || 'PENDING'
+      const controlled = await db.counter.findMany({
+        where: { controlledByUserId: sessionUser.id, branch: { agencyId: sessionUser.agencyId } },
+        select: { id: true },
+      }).catch(() => [])
+      const controlledIds = controlled.map((x) => x.id)
+
+      const baseInclude = {
+        counter: { select: { id: true, number: true, name: true, nameAr: true } },
+      }
+      const [incoming, outgoing] = await Promise.all([
+        db.counterControlRequest.findMany({
+          where: { agencyId: sessionUser.agencyId, status, counterId: { in: controlledIds } },
+          include: { ...baseInclude, requester: { select: { id: true, fullName: true, username: true } } },
+          orderBy: { createdAt: 'desc' },
+          take: 50,
+        }).catch(() => []),
+        db.counterControlRequest.findMany({
+          where: { agencyId: sessionUser.agencyId, requestedByUserId: sessionUser.id, ...(status === 'ALL' ? {} : { status }) },
+          include: baseInclude,
+          orderBy: { createdAt: 'desc' },
+          take: 50,
+        }).catch(() => []),
+      ])
+      return c.json({ success: true, incoming, outgoing })
+    } catch (error) {
+      console.error('[LocalAPI] control-requests list error:', error)
+      return c.json({ success: false, error: 'Failed to list control requests' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/control-requests/:id/approve — controller (or
+  // owner/branch MANAGER) approves → atomic transfer guarded by expectFrom
+  // (fails 409 COUNTER_CONTROL_CHANGED when control moved mid-flight).
+  app.post('/api/agency/counters/control-requests/:id/approve', authMiddleware, async (c) => {
+    try {
+      const request = await db.counterControlRequest.findUnique({
+        where: { id: c.req.param('id') },
+        include: { counter: { include: { branch: true } } },
+      }).catch(() => null)
+      if (!request || !request.counter) {
+        return c.json({ success: false, error: 'Request not found' }, 404)
+      }
+      const agencyId = request.counter.branch ? request.counter.branch.agencyId : request.agencyId
+      if (agencyId !== sessionUser.agencyId && sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Request not found' }, 404)
+      }
+      if (request.status !== 'PENDING') {
+        return c.json({ success: false, error: `Request already ${String(request.status).toLowerCase()}` }, 409)
+      }
+
+      const isController = request.counter.controlledByUserId === sessionUser.id
+      const bypass = await canBypassCounterApproval(sessionUser, agencyId, request.counter.branchId)
+      if (!isController && !bypass) {
+        return c.json({ success: false, error: 'NOT_COUNTER_CONTROLLER' }, 403)
+      }
+
+      // The requester must still be a live member.
+      if (!(await isUserActiveAgencyMember(request.requestedByUserId, agencyId))) {
+        return c.json({ success: false, error: 'Requester is no longer an active member' }, 409)
+      }
+
+      const counterNow = await db.counter.findUnique({
+        where: { id: request.counterId },
+        select: { controlledByUserId: true },
+      }).catch(() => null)
+      if (!counterNow || !counterNow.controlledByUserId) {
+        // Freed meanwhile → the requester can just claim; auto-grant here.
+        const requesterStaff = await db.agencyStaff.findFirst({
+          where: { userId: request.requestedByUserId, agencyId, isActive: true },
+          select: { id: true },
+        }).catch(() => null)
+        const requesterStaffId = requesterStaff ? requesterStaff.id : null
+        const claimResult = await withOutboxTransaction(async (tx) => {
+          return claimCounterControlInTx(tx, {
+            counterId: request.counterId,
+            agencyId,
+            userId: request.requestedByUserId,
+            staffId: requesterStaffId,
+          })
+        })
+        if (claimResult.ok) {
+          await db.counterControlRequest.update({
+            where: { id: request.id },
+            data: { status: 'APPROVED', resolvedAt: new Date(), resolvedByUserId: sessionUser.id },
+          }).catch(() => {})
+          emitEvent('counter:occupied', {
+            agencyId, counterId: request.counterId, controlledByUserId: request.requestedByUserId,
+          })
+          return c.json({ success: true, status: 'APPROVED', counter: claimResult.counter })
+        }
+        return c.json({ success: false, error: claimResult.error }, claimResult.status === 404 ? 404 : 409)
+      }
+
+      const transfer = await withOutboxTransaction(async (tx) => {
+        return transferCounterControlInTx(tx, {
+          counterId: request.counterId,
+          toUserId: request.requestedByUserId,
+          actorUserId: sessionUser.id,
+          expectFromUserId: counterNow.controlledByUserId,
+        })
+      })
+      if (!transfer.ok) {
+        return c.json({ success: false, error: transfer.error }, transfer.status === 404 ? 404 : 409)
+      }
+
+      await db.counterControlRequest.update({
+        where: { id: request.id },
+        data: { status: 'APPROVED', resolvedAt: new Date(), resolvedByUserId: sessionUser.id },
+      }).catch(() => {})
+      // Supersede any other PENDING requests for the same counter.
+      try {
+        const others = await db.counterControlRequest.findMany({
+          where: { counterId: request.counterId, status: 'PENDING', id: { not: request.id } },
+          select: { id: true },
+        })
+        for (const other of others) {
+          await db.counterControlRequest.update({
+            where: { id: other.id },
+            data: { status: 'SUPERSEDED', resolvedAt: new Date(), resolvedByUserId: sessionUser.id },
+          }).catch(() => {})
+        }
+      } catch { /* supersede is best-effort */ }
+      emitEvent('counter:control-approved', {
+        agencyId,
+        counterId: request.counterId,
+        controlledByUserId: request.requestedByUserId,
+        requestId: request.id,
+      })
+      return c.json({ success: true, status: 'APPROVED', counter: transfer.counter })
+    } catch (error) {
+      console.error('[LocalAPI] control-requests approve error:', error)
+      return c.json({ success: false, error: 'Failed to approve request' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/control-requests/:id/reject — controller (or
+  // owner/branch MANAGER) rejects the pending request.
+  app.post('/api/agency/counters/control-requests/:id/reject', authMiddleware, async (c) => {
+    try {
+      const request = await db.counterControlRequest.findUnique({
+        where: { id: c.req.param('id') },
+        include: { counter: { include: { branch: true } } },
+      }).catch(() => null)
+      if (!request || !request.counter) {
+        return c.json({ success: false, error: 'Request not found' }, 404)
+      }
+      const agencyId = request.counter.branch ? request.counter.branch.agencyId : request.agencyId
+      if (agencyId !== sessionUser.agencyId && sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Request not found' }, 404)
+      }
+      if (request.status !== 'PENDING') {
+        return c.json({ success: false, error: `Request already ${String(request.status).toLowerCase()}` }, 409)
+      }
+      const isController = request.counter.controlledByUserId === sessionUser.id
+      const bypass = await canBypassCounterApproval(sessionUser, agencyId, request.counter.branchId)
+      if (!isController && !bypass) {
+        return c.json({ success: false, error: 'NOT_COUNTER_CONTROLLER' }, 403)
+      }
+      const updated = await withOutboxTransaction(async (tx) => {
+        const row = await tx.counterControlRequest.update({
+          where: { id: request.id },
+          data: { status: 'REJECTED', resolvedAt: new Date(), resolvedByUserId: sessionUser.id },
+        })
+        await logDeterministicOutcome('CounterControlRequest', request.id, 'update', row, null, { tx })
+        return row
+      })
+      emitEvent('counter:control-rejected', {
+        agencyId,
+        counterId: request.counterId,
+        requestId: request.id,
+      })
+      return c.json({ success: true, request: updated })
+    } catch (error) {
+      console.error('[LocalAPI] control-requests reject error:', error)
+      return c.json({ success: false, error: 'Failed to reject request' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/:counterId/transfer-control { toUserId } —
+  // agency owner or branch MANAGER (or SUPER_ADMIN) manually hands control to
+  // a member without the current controller's approval. Atomic.
+  app.post('/api/agency/counters/:counterId/transfer-control', authMiddleware, async (c) => {
+    try {
+      const resolved = await resolveCounterForControlAction(c)
+      if (!resolved.ok) return resolved.response()
+      const { ctx, counterId, counter, body } = resolved
+      // NOTE: reuse resolved.body — keep ONE body read per request.
+      // BUGFIX (Feature C audit): the old expression was
+      //   typeof body && body.toUserId === 'string'
+      // which parses as `(typeof body) && (body.toUserId === 'string')` — it
+      // compared the VALUE against the literal 'string' instead of checking
+      // its TYPE, so every valid { toUserId } body answered 400. Must be
+      // `typeof body.toUserId === 'string'`.
+      const toUserId = body && typeof body.toUserId === 'string' ? body.toUserId : null
+      if (!toUserId) return c.json({ success: false, error: 'toUserId required' }, 400)
+      if (!(await canBypassCounterApproval(sessionUser, ctx.agencyId, counter.branchId))) {
+        return c.json({ success: false, error: 'PERMISSION_DENIED:counterTransfer' }, 403)
+      }
+      if (!(await isUserActiveAgencyMember(toUserId, ctx.agencyId))) {
+        return c.json({ success: false, error: 'Target user is not an active member' }, 404)
+      }
+      const toStaff = await db.agencyStaff.findFirst({
+        where: { userId: toUserId, agencyId: ctx.agencyId, isActive: true },
+        select: { id: true },
+      }).catch(() => null)
+      const transfer = await withOutboxTransaction(async (tx) => {
+        return transferCounterControlInTx(tx, {
+          counterId,
+          toUserId,
+          toStaffId: toStaff ? toStaff.id : null,
+          actorUserId: sessionUser.id,
+        })
+      })
+      if (!transfer.ok) {
+        return c.json({ success: false, error: transfer.error }, transfer.status === 404 ? 404 : 409)
+      }
+      emitEvent('counter:transferred', {
+        agencyId: ctx.agencyId,
+        counterId,
+        controlledByUserId: toUserId,
+        branchId: counter.branchId,
+      })
+      return c.json({ success: true, counter: transfer.counter })
+    } catch (error) {
+      console.error('[LocalAPI] transfer-control error:', error)
+      return c.json({ success: false, error: 'Failed to transfer control' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/release-mine — release EVERY counter controlled
+  // by the caller. Fired on logout and app close so control never outlives
+  // the session (Feature C auto-release requirement).
+  app.post('/api/agency/counters/release-mine', authMiddleware, async (c) => {
+    try {
+      const released = await releaseAllCountersForUser(sessionUser.id)
+      return c.json({ success: true, released })
+    } catch (error) {
+      console.error('[LocalAPI] release-mine error:', error)
+      return c.json({ success: false, error: 'Failed to release counters' }, 500)
     }
   })
 
@@ -5991,7 +7222,8 @@ function createApp() {
   // Task 24 — local mirror of the cloud call-next selection rules
   // (api/src/lib/queue-scheduler.ts): future-date tickets are never callable
   // today, and fixed-time tickets wait until their preferred HH:MM.
-  function pickNextLocalCustomer(candidates, now) {
+  function isCallableNowLocal(r, now) {
+    if (!r) return false
     const pad = (n) => String(n).padStart(2, '0')
     const todayStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
     const nowMinutes = now.getHours() * 60 + now.getMinutes()
@@ -6002,11 +7234,13 @@ function createApp() {
         return parts[0] * 60 + parts[1] <= nowMinutes
       } catch { return true }
     }
-    return (candidates || []).find((r) => {
-      if (r.reservedDate && String(r.reservedDate).slice(0, 10) > todayStr) return false
-      if (r.preferredTime && r.fixedTimeEnabled && !timePassed(r.preferredTime)) return false
-      return true
-    }) || null
+    if (r.reservedDate && String(r.reservedDate).slice(0, 10) > todayStr) return false
+    if (r.preferredTime && r.fixedTimeEnabled && !timePassed(r.preferredTime)) return false
+    return true
+  }
+
+  function pickNextLocalCustomer(candidates, now) {
+    return (candidates || []).find((r) => isCallableNowLocal(r, now)) || null
   }
 
   // POST /api/queue/call-next — call next customer
@@ -6020,18 +7254,34 @@ function createApp() {
       const body = await c.req.json().catch(() => ({}))
       const { serviceId, counterId, branchId } = body
 
-      // Task 37-d: queue actions need canManageQueue; a non-owner caller must
-      // operate from a counter they personally occupy (OCCUPY_COUNTER_FIRST).
+      // Task 37-d: queue actions need canManageQueue.
       const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
       if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
-      const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
-      if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
+      // Feature C: the queue gate is now COUNTER-CONTROL based — nobody (owner
+      // included) can call next until (a) the agency has at least one ACTIVE
+      // counter configured (COUNTER_SETUP_REQUIRED) and (b) the caller
+      // CONTROLS a counter (COUNTER_CONTROL_REQUIRED). The gate returns the
+      // caller's controlled counter so the desk is always scoped: the ticket
+      // links to it and only its assigned services are drawn. SUPER_ADMIN
+      // keeps the historic bypass.
+      const controlGate = await enforceCounterControlGate(queueGate.ctx, counterId)
+      if (!controlGate.ok) return c.json(controlGate.body, controlGate.status)
+      // Default the target counter to the caller's controlled counter.
+      const effectiveCounterId = counterId || (controlGate.controlledCounter ? controlGate.controlledCounter.id : null)
+      const allowedServiceIds = controlGate.controlledCounter ? controlGate.controlledCounter.serviceIds : []
+      // An explicitly requested service must be one the counter serves.
+      if (serviceId && allowedServiceIds.length > 0 && !allowedServiceIds.includes(serviceId)) {
+        return c.json({ success: false, error: 'SERVICE_NOT_ASSIGNED_TO_COUNTER' }, 400)
+      }
 
       // Task 24: parity with the CLOUD call-next — order by queueNumber ASC
       // (Postpone Paradox fix), skip FUTURE-DATE tickets, and skip fixed-time
       // tickets whose preferred time has not arrived yet.
       const where = { agencyId, status: 'WAITING' }
       if (serviceId) where.serviceId = serviceId
+      // Feature C: no explicit service → draw ONLY from the controlled
+      // counter's assigned services (empty assignment = all services).
+      else if (allowedServiceIds.length > 0) where.serviceId = { in: allowedServiceIds }
       // branchId filter removed — Reservation has no branchId field
 
       const candidates = await db.reservation.findMany({
@@ -6066,7 +7316,7 @@ function createApp() {
             status: 'CALLED',
             calledAt: now,
             // calledBy: removed — not a Reservation schema field
-            counterId: counterId || null,
+            counterId: effectiveCounterId || null,
           },
         })
 
@@ -6955,34 +8205,85 @@ function createApp() {
         return c.json({ success: false, error: 'Invalid action' }, 400)
       }
 
+      // UNIFIED QUEUE parity: status updates are queue management — require
+      // canManageQueue like every other queue route (the cloud PATCH
+      // enforces enforceQueueStaffAuthority; the local gate was missing).
+      const patchQueueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!patchQueueGate.ok) return c.json(patchQueueGate.body, patchQueueGate.status)
+
       const reservation = await db.reservation.findUnique({ where: { id: reservationId } })
       if (!reservation) {
         return c.json({ success: false, error: 'Reservation not found' }, 404)
       }
 
-      const updateData = {}
-      const now = new Date()
-      if (action === 'complete') {
-        updateData.status = 'COMPLETED'
-        updateData.completedAt = now
-      } else if (action === 'no_show') {
-        updateData.status = 'NO_SHOW'
-        updateData.skippedAt = now
-      } else if (action === 'cancel') {
-        updateData.status = 'CANCELLED'
-        updateData.cancelledAt = now
-      } else if (action === 'serve') {
-        updateData.status = 'SERVING'
-      } else if (action === 'recall') {
-        updateData.status = 'CALLED'
+      // Both the central and local paths use THIS delta mapping, so the local
+      // mirror always matches the authoritative central outcome.
+      const updateData = queueActionUpdateData(action, new Date())
+
+      // ── Enhanced Online Operational Mode (UNIFIED QUEUE) ──
+      // Route the status update through the CENTRAL API when it is reachable
+      // (definitive source of truth; atomic OCC-guarded transaction there),
+      // then mirror the authoritative result locally. The renderer's
+      // idempotency key is forwarded so a retransmission maps to the SAME
+      // central execution.
+      const patchIdempotencyKey = c.req.header('X-Idempotency-Key') || c.req.header('x-idempotency-key')
+      if (cloudOnlineFast() === true) {
+        const central = await callCentralQueueApi(
+          'PATCH',
+          `/api/agency/queue/${reservationId}`,
+          { action },
+          { idempotencyKey: patchIdempotencyKey },
+        )
+        if (central.ok && central.data && central.data.success !== false) {
+          await applyCentralStatusLocally(reservationId, action)
+          const mirrored = await db.reservation.findUnique({ where: { id: reservationId } }).catch(() => null)
+          const merged = mirrored || { ...reservation, ...queueActionUpdateData(action, new Date()) }
+          // Task 75: the payload MUST carry agencyId — broadcastLocalRealtime
+          // routes queue:* events by data.agencyId.
+          emitEvent('queue:updated', { agencyId: merged.agencyId || reservation.agencyId, reservationId, action, reservation: merged, ...updateData })
+          return c.json({ success: true, reservation: merged, source: 'central' })
+        }
+        if (central.errorKind === 'AUTH') {
+          return c.json({
+            success: false,
+            error: (central.data && central.data.error) || 'Session rejected by the central server — please sign in again',
+            code: 'CENTRAL_AUTH_REJECTED',
+          }, central.status === 423 ? 423 : 401)
+        }
+        if (central.errorKind === 'CLIENT') {
+          return c.json(central.data || { success: false, error: 'Central queue rejected the request' }, central.status)
+        }
+        if (central.errorKind === 'CONFLICT') {
+          return c.json({ success: false, error: 'Ticket state changed concurrently — please retry', shouldRetry: true }, 409)
+        }
+        // UNREACHABLE → fall through to the local outbox path below.
+        console.warn('[LocalAPI] queue/:id PATCH: central update unavailable (' + (central.error || central.errorKind) + ') — using local outbox path')
       }
 
+      // UNIFIED QUEUE (offline path): OCC conditional update — flip ONLY if
+      // the status is unchanged since the pre-read, so a concurrent claim
+      // (sync pull) can no longer be clobbered by a stale action click.
       const updatedReservation = await withOutboxTransaction(async (tx) => {
-        await tx.reservation.update({ where: { id: reservationId }, data: updateData })
+        const occ = await tx.reservation.updateMany({
+          where: { id: reservationId, status: reservation.status },
+          data: updateData,
+        })
+        if (occ.count === 0) {
+          const conflictErr = new Error('Ticket state changed — concurrent update')
+          conflictErr.code = 'QUEUE_ACTION_CONFLICT'
+          throw conflictErr
+        }
         // Part Q: outcome row is atomic with the state flip. The logged
         // outcome merges the pre-read with the intended delta (deterministic
         // desired-state replay per Part V).
         await logDeterministicOutcome('Reservation', reservationId, 'update', { ...reservation, ...updateData }, null, { tx })
+        // Parity with the cloud PATCH: terminal actions unlink the counter.
+        if (['complete', 'no_show', 'cancel'].includes(action)) {
+          await tx.counter.updateMany({
+            where: { currentReservationId: reservationId },
+            data: { currentReservationId: null },
+          })
+        }
         return { ...reservation, ...updateData }
       })
 
@@ -6992,6 +8293,9 @@ function createApp() {
       emitEvent('queue:updated', { agencyId: updatedReservation.agencyId, reservationId, action, reservation: updatedReservation, ...updateData })
       return c.json({ success: true, reservation: updatedReservation })
     } catch (error) {
+      if (error && error.code === 'QUEUE_ACTION_CONFLICT') {
+        return c.json({ success: false, error: 'Ticket state changed concurrently — please retry', shouldRetry: true }, 409)
+      }
       console.error('[LocalAPI] /api/agency/queue/:id PATCH error:', error)
       return c.json({ success: false, error: 'Failed to update reservation' }, 500)
     }
@@ -7280,6 +8584,43 @@ function createApp() {
       if (!service || service.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Service not found' }, 404)
       }
+
+      // ── Enhanced Online Operational Mode (UNIFIED QUEUE) ──
+      // Reservation-creation is routed through the CENTRAL API when online:
+      // the walk-in is created there inside one atomic transaction (queue
+      // number allocation + capacity + audit + SyncChange), then mirrored
+      // into the local DB. Bonus parity: the cloud response carries a REAL
+      // cloud-verifiable QR importToken (the local path cannot mint one).
+      const walkInIdempotencyKey = c.req.header('X-Idempotency-Key') || c.req.header('x-idempotency-key')
+      if (cloudOnlineFast() === true) {
+        const central = await callCentralQueueApi(
+          'POST',
+          '/api/agency/queue/walk-in',
+          { agencyId, serviceId, customerName },
+          { idempotencyKey: walkInIdempotencyKey },
+        )
+        if (central.ok && central.data && central.data.success && central.data.reservation) {
+          await mirrorCentralReservationCreate(central.data.reservation)
+          emitEvent('queue:walk-in', { agencyId, reservation: central.data.reservation })
+          return c.json({ success: true, reservation: central.data.reservation, source: 'central' }, 201)
+        }
+        if (central.errorKind === 'AUTH') {
+          return c.json({
+            success: false,
+            error: (central.data && central.data.error) || 'Session rejected by the central server — please sign in again',
+            code: 'CENTRAL_AUTH_REJECTED',
+          }, central.status === 423 ? 423 : 401)
+        }
+        if (central.errorKind === 'CLIENT') {
+          return c.json(central.data || { success: false, error: 'Central queue rejected the walk-in' }, central.status)
+        }
+        if (central.errorKind === 'CONFLICT') {
+          return c.json({ success: false, error: 'Walk-in conflict at the central queue — please retry', shouldRetry: true }, 409)
+        }
+        // UNREACHABLE → fall through to the local outbox path below.
+        console.warn('[LocalAPI] walk-in: central creation unavailable (' + (central.error || central.errorKind) + ') — using local outbox path')
+      }
+
       const now = new Date()
       const qsWalkIn = await db.queueSettings.findFirst({ where: { agencyId } })
       const newWalkInNumber = (qsWalkIn?.lastIssuedNumber || 0) + 1
@@ -8387,7 +9728,7 @@ function createApp() {
       const permGate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageBranches')
       if (!permGate.ok) return c.json(permGate.body, permGate.status)
       const branchId = c.req.param('id')
-      const { number, name, nameAr, nameFr } = body
+      const { number, name, nameAr, nameFr, serviceIds } = body
       if (!number || !name) return c.json({ success: false, error: 'number and name required' }, 400)
       // Verify branch ownership
       const branch = await db.branch.findUnique({ where: { id: branchId } })
@@ -8395,16 +9736,30 @@ function createApp() {
       // Check duplicate
       const existing = await db.counter.findFirst({ where: { branchId, number } })
       if (existing) return c.json({ success: false, error: 'Counter number already exists in this branch' }, 409)
+      // Feature C: counter→service assignment — every id must be an agency service
+      // (validated BEFORE the plan cap so a bad payload answers 400, not 403).
+      let serviceIdsJson = null
+      if (serviceIds !== undefined) {
+        const svcCheck = await validateCounterServiceIds(serviceIds, agencyId)
+        if (!svcCheck.ok) return c.json({ success: false, error: svcCheck.error }, 400)
+        serviceIdsJson = svcCheck.json
+      }
+      // Feature C: per-branch plan limit (best-effort, fail-open).
+      const limitCheck = await checkBranchCounterLimit(branchId, agencyId)
+      if (limitCheck) return c.json(limitCheck.body, limitCheck.status)
       // Part Q: business write + outbox row commit atomically.
       const counter = await withOutboxTransaction(async (tx) => {
         const created = await tx.counter.create({
-          data: { number, name, nameAr: nameAr || null, nameFr: nameFr || null, branchId },
+          data: {
+            number, name, nameAr: nameAr || null, nameFr: nameFr || null, branchId,
+            ...(serviceIds !== undefined ? { serviceIds: serviceIdsJson } : {}),
+          },
         })
         await logDeterministicOutcome('Counter', created && created.id, 'create', created, null, { tx })
         return created
       })
       emitEvent('counter:created', { agencyId, counterId: counter.id, branchId })
-      return c.json({ success: true, counter }, 201)
+      return c.json({ success: true, counter: await withCounterServiceIdList(counter) }, 201)
     } catch (error) {
       console.error('[LocalAPI] /api/agency/branches/:id/counters POST error:', error)
       return c.json({ success: false, error: 'Failed to create counter' }, 500)
@@ -8427,10 +9782,15 @@ function createApp() {
       if (!counter || counter.branchId !== branchId || counter.branch.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Counter not found' }, 404)
       }
-      const allowedFields = ['name', 'nameAr', 'nameFr', 'isActive', 'staffId']
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'isActive', 'staffId', 'serviceIds']
       const updateData = {}
       for (const field of allowedFields) {
         if (body[field] !== undefined) updateData[field] = body[field]
+      }
+      if (updateData.serviceIds !== undefined) {
+        const svcCheck = await validateCounterServiceIds(updateData.serviceIds, agencyId)
+        if (!svcCheck.ok) return c.json({ success: false, error: svcCheck.error }, 400)
+        updateData.serviceIds = svcCheck.json
       }
       // Part Q: business write + outbox row commit atomically.
       const updated = await withOutboxTransaction(async (tx) => {
@@ -9690,12 +11050,9 @@ function createApp() {
       const body = await c.req.json().catch(() => ({}))
       const { serviceId, counterId, branchId } = body
 
-      // Task 37-d: queue actions need canManageQueue; a non-owner caller must
-      // operate from a counter they personally occupy (OCCUPY_COUNTER_FIRST).
+      // Task 37-d: queue actions need canManageQueue.
       const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
       if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
-      const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
-      if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
 
       // Task 24: parity with the CLOUD call-next — order by queueNumber ASC
       // (Postpone Paradox fix), skip FUTURE-DATE tickets, and skip fixed-time
@@ -9703,6 +11060,82 @@ function createApp() {
       const where = { agencyId, status: 'WAITING' }
       if (serviceId) where.serviceId = serviceId
       // branchId filter removed — Reservation has no branchId field
+      // NOTE (Feature C): the COUNTER-CONTROL gate + service scoping run in
+      // the LOCAL fallback path below — when the request is cloud-forwarded
+      // the CENTRAL API enforces the same gate against PostgreSQL.
+
+      // ── Enhanced Online Operational Mode (UNIFIED QUEUE) ──
+      // When the central API is reachable it is the DEFINITIVE source of
+      // truth: the claim runs THERE as one atomic, idempotent, OCC-guarded
+      // transaction (two desks can never call the same ticket; assignment to
+      // staff + counter is a single DB transaction) and the authoritative
+      // result is mirrored locally. The renderer's idempotency key is
+      // forwarded so a retransmission maps to the SAME central execution.
+      const incomingIdempotencyKey = c.req.header('X-Idempotency-Key') || c.req.header('x-idempotency-key')
+      if (cloudOnlineFast() === true) {
+        const central = await callCentralQueueApi(
+          'POST',
+          '/api/agency/queue/call-next',
+          { agencyId, serviceId: serviceId || undefined, counterId: counterId || undefined },
+          { idempotencyKey: incomingIdempotencyKey },
+        )
+        if (central.ok && central.data && central.data.success !== false && central.data.reservation) {
+          const cRes = central.data.reservation
+          await applyCentralClaimLocally(cRes, agencyId)
+          const localRow = await db.reservation.findUnique({ where: { id: cRes.id } }).catch(() => null)
+          const merged = localRow || {
+            id: cRes.id,
+            agencyId,
+            serviceId: cRes.serviceId || serviceId || null,
+            displayNumber: cRes.displayNumber,
+            queueNumber: cRes.queueNumber,
+            status: 'CALLED',
+            calledAt: cRes.calledAt ? new Date(cRes.calledAt) : new Date(),
+            counterId: cRes.counterId || counterId || null,
+          }
+          emitEvent('queue:called', { agencyId, reservation: merged })
+          return c.json({ success: true, data: merged, reservation: merged, source: 'central' })
+        }
+        if (central.errorKind === 'AUTH') {
+          // 401/423 is NEVER "offline" — the session was rejected; surface it
+          // (Task 33-C principle) instead of silently claiming locally.
+          return c.json({
+            success: false,
+            error: (central.data && central.data.error) || 'Session rejected by the central server — please sign in again',
+            code: 'CENTRAL_AUTH_REJECTED',
+          }, central.status === 423 ? 423 : 401)
+        }
+        if (central.errorKind === 'CLIENT') {
+          // Definitive business answer from the central queue (paused, closed,
+          // ONLY_SCHEDULED_WAITING, OCCUPY_COUNTER_FIRST, …) — verbatim.
+          return c.json(central.data || { success: false, error: 'Central queue rejected the request' }, central.status)
+        }
+        if (central.errorKind === 'CONFLICT') {
+          // Falling back locally could DOUBLE-call a ticket the central queue
+          // just assigned — surface the conflict; the retry re-claims.
+          return c.json({ success: false, error: 'Concurrent call detected. Please try again.', shouldRetry: true }, 409)
+        }
+        // UNREACHABLE → fall through to the proven local outbox path below.
+        console.warn('[LocalAPI] call-next: central claim unavailable (' + (central.error || central.errorKind) + ') — using local outbox path')
+      }
+
+      // ── Feature C — LOCAL fallback path gate (cloud-forwarded requests were
+      // gated by the CENTRAL queue). Nobody (owner included) calls next until
+      // (a) the agency has at least one ACTIVE counter configured
+      //     (COUNTER_SETUP_REQUIRED) and (b) the caller CONTROLS one
+      //     (COUNTER_CONTROL_REQUIRED) — the ticket then links to the
+      //     controlled counter and only its assigned services are drawn.
+      const controlGate = await enforceCounterControlGate(queueGate.ctx, counterId)
+      if (!controlGate.ok) return c.json(controlGate.body, controlGate.status)
+      const effectiveCounterId = counterId || (controlGate.controlledCounter ? controlGate.controlledCounter.id : null)
+      const allowedServiceIds = controlGate.controlledCounter ? controlGate.controlledCounter.serviceIds : []
+      // An explicitly requested service must be one the counter serves.
+      if (serviceId && allowedServiceIds.length > 0 && !allowedServiceIds.includes(serviceId)) {
+        return c.json({ success: false, error: 'SERVICE_NOT_ASSIGNED_TO_COUNTER' }, 400)
+      }
+      // No explicit service → draw ONLY from the controlled counter's assigned
+      // services (empty assignment = all services).
+      if (!serviceId && allowedServiceIds.length > 0) where.serviceId = { in: allowedServiceIds }
 
       const candidates = await db.reservation.findMany({
         where,
@@ -9710,7 +11143,9 @@ function createApp() {
         take: 200,
       })
 
-      const next = pickNextLocalCustomer(candidates, new Date())
+      const now = new Date()
+
+      const next = pickNextLocalCustomer(candidates, now)
 
       if (!next) {
         const anyWaiting = await db.reservation.findFirst({ where, orderBy: { queueNumber: 'asc' } })
@@ -9724,8 +11159,6 @@ function createApp() {
         })
       }
 
-      const now = new Date()
-
       // ── Call the customer + OUTBOX (field report: "the turn notification
       // never reaches the customer when the agency uses the desktop app").
       // This alias route updated the LOCAL row only — no outbox entry — so
@@ -9737,31 +11170,49 @@ function createApp() {
         status: 'CALLED',
         calledAt: now,
         // calledBy: removed — not a Reservation schema field
-        counterId: counterId || null,
       }
-      const updated = await withOutboxTransaction(async (tx) => {
-        await tx.reservation.update({ where: { id: next.id }, data: calledData })
-        // Part Q: outcome row atomic with the state flip.
-        await logDeterministicOutcome('Reservation', next.id, 'update', { ...next, ...calledData }, null, { tx })
+      // Feature C: default the target counter to the caller's controlled one.
+      if (effectiveCounterId) calledData.counterId = effectiveCounterId
+
+      // UNIFIED QUEUE (offline path): OCC-guarded claim with a next-candidate
+      // loop. The conditional updateMany (WHERE status='WAITING') makes a
+      // double-claim impossible even when the sync pull flips a candidate
+      // between our read and our write — the loser silently moves to the
+      // NEXT candidate instead of double-calling the same ticket.
+      const claimResult = await withOutboxTransaction(async (tx) => {
+        let claimedRow = null
+        for (const cand of candidates) {
+          if (!isCallableNowLocal(cand, now)) continue
+          const occ = await tx.reservation.updateMany({
+            where: { id: cand.id, status: 'WAITING' },
+            data: calledData,
+          })
+          if (occ.count === 0) continue // lost THIS ticket to a concurrent claimant
+          // Part Q: outcome row atomic with the state flip.
+          await logDeterministicOutcome('Reservation', cand.id, 'update', { ...cand, ...calledData }, null, { tx })
+          claimedRow = { ...cand, ...calledData }
+          break
+        }
+        if (!claimedRow) return { claimed: null }
 
         // Update current serving number in queue settings (synced table —
         // keeps kiosks / other devices on the same "now serving" number).
         const qs = await tx.queueSettings.findFirst({ where: { agencyId } })
         if (qs) {
-          const qsData = { currentServingNumber: next.queueNumber }
+          const qsData = { currentServingNumber: claimedRow.queueNumber }
           await tx.queueSettings.update({ where: { id: qs.id }, data: qsData })
           await logDeterministicOutcome('QueueSettings', qs.id, 'update', { ...qs, ...qsData }, null, { tx })
         }
 
-        return { ...next, ...calledData }
+        return { claimed: claimedRow }
       })
 
-      // Update positions of remaining waiting reservations
-      const remainingWaiting = await db.reservation.findMany({
-        where: { agencyId, status: 'WAITING' },
-        orderBy: { joinedAt: 'asc' },
-      })
-      // position reassignment loop removed — position is not a schema field
+      const updated = claimResult.claimed
+      if (!updated) {
+        // Every candidate was claimed concurrently between the read and the
+        // write — the client retry re-evaluates the whole queue.
+        return c.json({ success: false, error: 'Concurrent call detected. Please try again.', shouldRetry: true }, 409)
+      }
 
       emitEvent('queue:called', { agencyId, reservation: updated })
 
@@ -10591,6 +12042,27 @@ async function startLocalApi(dbPath, port, options) {
     console.warn('[LocalAPI] Local realtime init failed (non-fatal — interval sync unaffected):', rtErr.message)
   }
 
+  // ── Feature C — stale-control sweeper (60s cadence) ──────────────────────
+  // Frees local counters whose controlHeartbeatAt is older than 3 minutes (or
+  // that were controlled with a NULL heartbeat and claimed >3 min ago — the
+  // pre-sweeper legacy shape). Logout / app-close release eagerly; this
+  // sweeper is the crash backstop so a dead client can never hold a counter
+  // forever (cloud parity: sweepStaleCounterControl). Each freed counter goes
+  // through the outbox so the release replays to the cloud.
+  try {
+    if (controlSweeperInterval) clearInterval(controlSweeperInterval)
+    controlSweeperInterval = setInterval(() => {
+      sweepStaleCounterControl().catch((err) => {
+        console.warn('[LocalAPI] control sweeper pass failed (non-fatal):', err && err.message)
+      })
+    }, 60000)
+    // Never hold the event loop open for the sweeper itself.
+    if (typeof controlSweeperInterval.unref === 'function') controlSweeperInterval.unref()
+    console.log('[LocalAPI] Counter-control sweeper armed (60s cadence, 3min TTL)')
+  } catch (swErr) {
+    console.warn('[LocalAPI] Counter-control sweeper could not be armed (non-fatal):', swErr && swErr.message)
+  }
+
   // ── Parent-liveness watchdog (Task 2-b, sub-task 5) ─────────────────────
   // The embedded API runs INSIDE the Electron main process, so it can only
   // outlive the app if a future build moves it into a spawned CHILD process.
@@ -10630,6 +12102,9 @@ async function startLocalApi(dbPath, port, options) {
  * Stop the embedded local API server.
  */
 function stopLocalApi() {
+  // Feature C — stop the stale-control sweeper FIRST so no pass races the
+  // teardown (the DB disconnect below would fail it anyway).
+  try { if (controlSweeperInterval) { clearInterval(controlSweeperInterval); controlSweeperInterval = null } } catch { /* not armed */ }
   // Close the realtime socket server BEFORE the HTTP server (it wraps it).
   try { localRealtime.closeLocalRealtime() } catch { /* not started */ }
   try { if (fileSync) fileSync.stop() } catch { /* not started */ }
@@ -10700,6 +12175,19 @@ function clearSession() {
 }
 
 /**
+ * Feature C — release EVERY counter controlled by the CURRENT session user.
+ * Exported for the Electron main process: shutdownEmbeddedServices() calls it
+ * BEFORE stopping the local API so control never outlives the app (app-close
+ * auto-release). Best-effort by design — the caller wraps it in try/catch and
+ * it must never block shutdown. Returns the number of freed counters (0 when
+ * there is no session / no db).
+ */
+async function releaseAllCountersForSession() {
+  if (!db || !sessionUser || !sessionUser.id) return 0
+  return releaseAllCountersForUser(sessionUser.id)
+}
+
+/**
  * Get the current status of the local API.
  * @returns {{ port: number|null, dbReady: boolean, sessionActive: boolean, uptime: number }}
  */
@@ -10721,6 +12209,7 @@ module.exports = {
   getSession,
   setSession,
   clearSession,
+  releaseAllCountersForSession,
   onEvent,
   setMutationListener,
   getStatus,

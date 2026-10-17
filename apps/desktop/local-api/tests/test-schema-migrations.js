@@ -26,7 +26,19 @@
 const path = require('path')
 const fs = require('fs')
 const { execFileSync } = require('child_process')
-const { PrismaClient } = require('@prisma/client')
+
+// Resolve the DESKTOP SQLite client for the independent per-test clients.
+// NOTE: plain `require('@prisma/client')` resolves to the workspace
+// PostgreSQL client (packages/db), which REJECTS the `file:` URLs these
+// tests construct — every clientFor()-based test failed with "the URL must
+// start with the protocol postgresql://". The desktop generated client is
+// the one built from apps/desktop/prisma/schema.prisma (SQLite).
+let PrismaClient
+try {
+  PrismaClient = require('../../prisma/generated/client').PrismaClient
+} catch {
+  PrismaClient = require('@prisma/client').PrismaClient
+}
 
 // ─── Minimal Test Framework ──────────────────────────────────────────────────
 

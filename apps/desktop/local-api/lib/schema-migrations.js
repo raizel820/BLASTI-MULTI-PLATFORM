@@ -52,7 +52,7 @@ const path = require('path')
 // ─── Versioning ─────────────────────────────────────────────────────────────
 
 /** Current local schema version. Bump when adding MIGRATION_STEPS. */
-const LOCAL_SCHEMA_VERSION = 7
+const LOCAL_SCHEMA_VERSION = 8
 
 /**
  * Incremental upgrade steps BETWEEN versions. Each step:
@@ -157,6 +157,38 @@ const MIGRATION_STEPS = [
     name: 'smslog-provider-message-id (DLR webhook correlation — Task 3)',
     statements: [
       'ALTER TABLE "SmsLog" ADD COLUMN "providerMessageId" TEXT',
+    ],
+  },
+  {
+    // Feature C — counter CONTROL (live operator claim) + counter→service
+    // assignment + the CounterControlRequest approval queue:
+    //   Counter.serviceIds            — JSON array of Service ids (null/empty
+    //                                   = serves ALL agency services).
+    //   Counter.controlledByUserId / controlledByStaffId /
+    //   controlClaimedAt / controlHeartbeatAt — WHO controls the counter
+    //   RIGHT NOW and since when (the legacy staffId/occupiedAt columns stay
+    //   as roster/display mirrors). Call-next is gated on CONTROL.
+    //   CounterControlRequest — the "give me control" request queue the
+    //   controller approves/rejects (owner / branch MANAGER bypass).
+    //   SubscriptionPlan.maxCounters — per-branch ACTIVE-counter plan cap
+    //   (already in the shared Prisma schema; without the column every local
+    //   SubscriptionPlan read throws P2022 and plan syncs drop the limit).
+    // The regenerated shared Prisma client includes these fields/models, so
+    // the local SQLite tables MUST carry them. The convergence pass below
+    // additionally self-heals any database shape that skipped this step.
+    version: 8,
+    name: 'counter-control + serviceIds + CounterControlRequest + plan maxCounters (Feature C)',
+    statements: [
+      'ALTER TABLE "Counter" ADD COLUMN "serviceIds" TEXT',
+      'ALTER TABLE "Counter" ADD COLUMN "controlledByUserId" TEXT',
+      'ALTER TABLE "Counter" ADD COLUMN "controlledByStaffId" TEXT',
+      'ALTER TABLE "Counter" ADD COLUMN "controlClaimedAt" DATETIME',
+      'ALTER TABLE "Counter" ADD COLUMN "controlHeartbeatAt" DATETIME',
+      'ALTER TABLE "SubscriptionPlan" ADD COLUMN "maxCounters" INTEGER NOT NULL DEFAULT 2',
+      'CREATE TABLE "CounterControlRequest" ("id" TEXT NOT NULL PRIMARY KEY, "counterId" TEXT NOT NULL, "agencyId" TEXT NOT NULL, "branchId" TEXT NOT NULL, "requestedByUserId" TEXT NOT NULL, "status" TEXT DEFAULT \'PENDING\', "createdAt" DATETIME DEFAULT CURRENT_TIMESTAMP, "resolvedAt" DATETIME, "resolvedByUserId" TEXT)',
+      'CREATE INDEX "CounterControlRequest_counterId_status_idx" ON "CounterControlRequest"("counterId", "status")',
+      'CREATE INDEX "CounterControlRequest_agencyId_status_idx" ON "CounterControlRequest"("agencyId", "status")',
+      'CREATE INDEX "CounterControlRequest_requestedByUserId_status_idx" ON "CounterControlRequest"("requestedByUserId", "status")',
     ],
   },
 ]
@@ -502,6 +534,11 @@ async function ensureSchema(db, opts = {}) {
   //     a crash mid-step must self-heal on the next start).
   await _ensureStaffAuthorityColumns(db, log)
 
+  // 3b-ter. CONVERGENCE (Feature C) — ensure the counter-control columns on
+  //     Counter + the CounterControlRequest table on EVERY path (same
+  //     rationale: legacy adoption / crash mid-step must self-heal).
+  await _ensureCounterControlColumns(db, log)
+
   // 3. CONVERGENCE REBUILD (v2) — relax User.passwordHash to NULL-allowed.
   //    Self-guarding (no-op when already nullable) so it is safe on every
   //    call path: fresh creation (new DDL already nullable → no-op), legacy
@@ -833,6 +870,72 @@ async function _ensureStaffAuthorityColumns(db, log) {
     }
   } catch (err) {
     log(`Warning: staff authority columns check skipped: ${err?.message || err}`)
+  }
+}
+
+/**
+ * Feature C convergence pass — runs on EVERY ensureSchema call (mirrors the
+ * Task 22/37-d passes above): PRAGMA table_info checks + guarded ALTER TABLE
+ * ADD COLUMN for the counter-control columns (Counter.serviceIds,
+ * controlledByUserId, controlledByStaffId, controlClaimedAt,
+ * controlHeartbeatAt), plus CREATE TABLE IF NOT EXISTS for the
+ * CounterControlRequest approval-queue table + its lookup indexes, plus the
+ * SubscriptionPlan.maxCounters plan cap. Additive +
+ * idempotent: only adds what is missing.
+ */
+async function _ensureCounterControlColumns(db, log) {
+  const COUNTER_CONTROL_ADDS = [
+    ['serviceIds', 'TEXT'],
+    ['controlledByUserId', 'TEXT'],
+    ['controlledByStaffId', 'TEXT'],
+    ['controlClaimedAt', 'DATETIME'],
+    ['controlHeartbeatAt', 'DATETIME'],
+  ]
+  // Feature C: the plan cap rides the shared SubscriptionPlan sync — a legacy
+  // local shape without the column must be healed here or every generated
+  // client read of the plan throws P2022 (checkBranchCounterLimit would then
+  // permanently fail open).
+  const PLAN_COUNTER_ADDS = [
+    ['maxCounters', 'INTEGER NOT NULL DEFAULT 2'],
+  ]
+  const COUNTER_REQUEST_TABLE =
+    'CREATE TABLE IF NOT EXISTS "CounterControlRequest" ("id" TEXT NOT NULL PRIMARY KEY, "counterId" TEXT NOT NULL, "agencyId" TEXT NOT NULL, "branchId" TEXT NOT NULL, "requestedByUserId" TEXT NOT NULL, "status" TEXT DEFAULT \'PENDING\', "createdAt" DATETIME DEFAULT CURRENT_TIMESTAMP, "resolvedAt" DATETIME, "resolvedByUserId" TEXT)'
+  const COUNTER_REQUEST_INDEXES = [
+    'CREATE INDEX IF NOT EXISTS "CounterControlRequest_counterId_status_idx" ON "CounterControlRequest"("counterId", "status")',
+    'CREATE INDEX IF NOT EXISTS "CounterControlRequest_agencyId_status_idx" ON "CounterControlRequest"("agencyId", "status")',
+    'CREATE INDEX IF NOT EXISTS "CounterControlRequest_requestedByUserId_status_idx" ON "CounterControlRequest"("requestedByUserId", "status")',
+  ]
+  try {
+    const counterCols = await tableColumns(db, 'Counter')
+    if (counterCols.length) {
+      for (const [col, def] of COUNTER_CONTROL_ADDS) {
+        if (counterCols.includes(col)) continue
+        try {
+          await db.$executeRawUnsafe(`ALTER TABLE "Counter" ADD COLUMN "${col}" ${def}`)
+          log(`Added Counter.${col} column`)
+        } catch (err) {
+          if (!/duplicate column|already exists/i.test(err?.message || '')) throw err
+        }
+      }
+    }
+    const planCols = await tableColumns(db, 'SubscriptionPlan')
+    if (planCols.length) {
+      for (const [col, def] of PLAN_COUNTER_ADDS) {
+        if (planCols.includes(col)) continue
+        try {
+          await db.$executeRawUnsafe(`ALTER TABLE "SubscriptionPlan" ADD COLUMN "${col}" ${def}`)
+          log(`Added SubscriptionPlan.${col} column`)
+        } catch (err) {
+          if (!/duplicate column|already exists/i.test(err?.message || '')) throw err
+        }
+      }
+    }
+    await db.$executeRawUnsafe(COUNTER_REQUEST_TABLE)
+    for (const stmt of COUNTER_REQUEST_INDEXES) {
+      await db.$executeRawUnsafe(stmt)
+    }
+  } catch (err) {
+    log(`Warning: counter control columns check skipped: ${err?.message || err}`)
   }
 }
 

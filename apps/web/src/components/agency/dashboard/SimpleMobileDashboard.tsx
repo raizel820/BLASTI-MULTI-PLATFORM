@@ -43,6 +43,18 @@ interface CurrentlyServing {
   status: string;
 }
 
+/** Feature C: counter row shape (subset) for the mobile control strip. */
+interface CounterControlRow {
+  id: string;
+  number: number;
+  name: string;
+  nameAr?: string | null;
+  isActive: boolean;
+  controlledByUserId?: string | null;
+  controlledByUser?: { id: string; fullName: string; username: string } | null;
+  serviceIdList?: string[];
+}
+
 // ─── Pulse Animation Keyframes ─────────────────────────────────────────────
 
 const pulseGlow = {
@@ -86,6 +98,9 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const keepAwakeSupportedRef = useRef(false);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+  // Feature C: counter control on mobile — claim/release/heartbeat + gate toasts.
+  const [agencyCounters, setAgencyCounters] = useState<CounterControlRow[]>([]);
+  const [myCounter, setMyCounter] = useState<CounterControlRow | null>(null);
 
   // ─── KeepAwake on mount ──────────────────────────────────────────────
   useEffect(() => {
@@ -311,7 +326,96 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
     };
   }, [realtime, fetchData, playSound]);
 
-  // ─── Actions ─────────────────────────────────────────────────────────
+  // ─── Actions ─────────────────────────────────────────────────────
+  // Feature C: fetch counters + derive my controlled counter.
+  const fetchCounters = useCallback(async () => {
+    if (!user?.id) return;
+    try {
+      const res = await apiFetch(`/api/agency/counters?agencyId=${agencyId}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const list: CounterControlRow[] = data?.counters || data?.data || [];
+      setAgencyCounters(list);
+      setMyCounter(list.find((counter) => counter.controlledByUserId === user.id) ?? null);
+    } catch {
+      /* counter strip is best-effort */
+    }
+  }, [agencyId, user?.id]);
+
+  useEffect(() => {
+    fetchCounters();
+    const interval = setInterval(fetchCounters, 20000);
+    return () => clearInterval(interval);
+  }, [fetchCounters]);
+
+  // Feature C: heartbeat every 60s while controlling a counter — losing
+  // control (expired/approved away) clears the strip and tells the user.
+  useEffect(() => {
+    if (!myCounter) return;
+    const beat = async () => {
+      try {
+        const res = await apiFetch(`/api/agency/counters/${myCounter.id}/heartbeat`, { method: 'POST' });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          if (body?.error === 'COUNTER_CONTROL_LOST') {
+            setMyCounter(null);
+            toast.error(t('counterControlLost') || 'Counter control lost');
+          }
+        }
+      } catch {
+        /* transient */
+      }
+    };
+    beat();
+    const interval = setInterval(beat, 60000);
+    return () => clearInterval(interval);
+  }, [myCounter, t]);
+
+  const claimCounter = useCallback(async (counterId?: string) => {
+    setActionLoading('claim');
+    try {
+      const target = counterId ?? agencyCounters.find((counter) => counter.isActive && !counter.controlledByUserId)?.id;
+      if (!target) {
+        toast.error(t('noCountersSetup') || 'No free counter to claim');
+        return;
+      }
+      const res = await apiFetch(`/api/agency/counters/${target}/occupy`, { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) {
+        toast.success(t('counterControlledByYou') || 'Counter is now under your control');
+        await fetchCounters();
+      } else if (body?.error === 'COUNTER_OCCUPIED' || body?.controlError === 'COUNTER_CONTROLLED') {
+        // Controlled by someone else → file a control request.
+        const reqRes = await apiFetch(`/api/agency/counters/${target}/request-control`, { method: 'POST' });
+        const reqBody = await reqRes.json().catch(() => ({}));
+        if (reqRes.ok && reqBody?.status === 'GRANTED') {
+          toast.success(t('counterControlledByYou') || 'Counter is now under your control');
+        } else if (reqRes.ok && reqBody?.status === 'REQUEST_PENDING') {
+          toast.info(t('counterControlRequestPending') || 'Control request sent — waiting for approval');
+        } else {
+          toast.error(reqBody?.error || t('counterOccupied') || 'Counter is occupied');
+        }
+        await fetchCounters();
+      } else {
+        toast.error(body?.error || t('error') || 'Failed to claim counter');
+      }
+    } finally {
+      setActionLoading(null);
+    }
+  }, [agencyCounters, fetchCounters, t]);
+
+  const releaseMyCounter = useCallback(async () => {
+    if (!myCounter) return;
+    setActionLoading('release');
+    try {
+      await apiFetch(`/api/agency/counters/${myCounter.id}/release`, { method: 'POST' });
+      toast.success(t('counterReleased') || 'Counter released');
+      await fetchCounters();
+    } finally {
+      setActionLoading(null);
+    }
+  }, [myCounter, fetchCounters, t]);
+
   const callNext = useCallback(async () => {
     if (actionLoading) return;
     // Task 31 bug 5: client-side feedback for the subscription gate.
@@ -336,14 +440,24 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
         fetchData();
       } else {
         const data = await res.json();
-        toast.error(data.error || t('noQueue') || 'No customers waiting');
+        // Feature C gate codes → clear, actionable feedback.
+        if (data?.error === 'COUNTER_SETUP_REQUIRED') {
+          toast.error(t('counterSetupRequired') || 'Set up a counter first');
+        } else if (data?.error === 'COUNTER_CONTROL_REQUIRED') {
+          toast.error(t('counterControlRequired') || 'Claim a counter to start serving');
+          await fetchCounters();
+        } else if (data?.error === 'SERVICE_NOT_ASSIGNED_TO_COUNTER') {
+          toast.error(t('serviceNotAssigned') || 'This service is not assigned to your counter');
+        } else {
+          toast.error(data.error || t('noQueue') || 'No customers waiting');
+        }
       }
     } catch {
       toast.error(t('error') || 'Failed to call next');
     } finally {
       setActionLoading(null);
     }
-  }, [agencyId, actionLoading, stats, fetchData, playSound, t]);
+  }, [agencyId, actionLoading, stats, fetchData, playSound, t, fetchCounters]);
 
   const markCompleted = useCallback(async () => {
     if (!currentlyServing || actionLoading) return;
@@ -619,8 +733,61 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
         </div>
       </div>
 
-      {/* ─── Action Buttons ───────────────────────────────────────────── */}
+      {/* ─── Action Buttons ─────────────────────────────────────────── */}
       <div className="px-4 pb-4 space-y-3">
+        {/* Feature C: counter control strip — nobody serves without a counter */}
+        <div className="bg-white/5 backdrop-blur-sm rounded-2xl p-3 border border-white/5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0 flex-1">
+              <p className="text-[10px] text-gray-400 font-medium uppercase tracking-wide">
+                {t('counterManagement') || 'Counter'}
+              </p>
+              {myCounter ? (
+                <p className="text-sm font-bold text-emerald-400 truncate">
+                  #{myCounter.number} · {lang === 'ar' && myCounter.nameAr ? myCounter.nameAr : myCounter.name}
+                  <span className="text-gray-400 font-normal"> · {t('counterControlledByYou') || 'yours'}</span>
+                </p>
+              ) : (
+                <p className="text-sm font-bold text-amber-400 truncate">
+                  {t('claimCounterHint') || 'Claim a counter to start serving'}
+                </p>
+              )}
+            </div>
+            {myCounter ? (
+              <button
+                onClick={releaseMyCounter}
+                disabled={!!actionLoading}
+                className="shrink-0 px-3 py-2 min-h-[44px] rounded-xl bg-white/10 text-white text-sm font-semibold active:scale-95 transition"
+              >
+                {actionLoading === 'release' ? <Loader2 className="h-4 w-4 animate-spin" /> : (t('releaseCounter') || 'Release')}
+              </button>
+            ) : (
+              <button
+                onClick={() => claimCounter()}
+                disabled={!!actionLoading}
+                className="shrink-0 px-3 py-2 min-h-[44px] rounded-xl bg-amber-500/90 text-black text-sm font-bold active:scale-95 transition"
+              >
+                {actionLoading === 'claim' ? <Loader2 className="h-4 w-4 animate-spin" /> : (t('claimCounter') || 'Claim')}
+              </button>
+            )}
+          </div>
+          {/* Free counters quick-claim chips */}
+          {!myCounter && agencyCounters.some((counter) => counter.isActive && !counter.controlledByUserId) && (
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {agencyCounters.filter((counter) => counter.isActive && !counter.controlledByUserId).slice(0, 6).map((counter) => (
+                <button
+                  key={counter.id}
+                  onClick={() => claimCounter(counter.id)}
+                  disabled={!!actionLoading}
+                  className="px-2.5 py-1 rounded-full bg-white/10 text-gray-200 text-xs font-semibold active:scale-95 transition"
+                >
+                  #{counter.number} {lang === 'ar' && counter.nameAr ? counter.nameAr : counter.name}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
         {/* Call Next — MASSIVE button (locked when subscription is not active) */}
         <motion.button
           onClick={callNext}

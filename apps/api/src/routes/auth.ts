@@ -978,9 +978,20 @@ app.post('/verification-status', async (c) => {
  *
  * Clears the NextAuth session cookie, effectively logging the user out.
  * The frontend should also clear its local Zustand state.
+ * Feature C: the logging-out account also automatically LOSES control of any
+ * counter it held (control must never outlive the session).
  */
 app.post('/logout', async (c) => {
   try {
+    // Feature C auto-release: fire the counter release before the cookie is
+    // cleared so the still-authenticated request can resolve the user.
+    try {
+      const user = await requireAuth(c)
+      const { releaseAllUserControl } = await import('../lib/counter-control')
+      await releaseAllUserControl(user.id)
+    } catch {
+      // unauthenticated/expired logout — nothing to release
+    }
     clearSessionCookie(c)
     return c.json({ success: true, message: 'Logged out successfully' })
   } catch (error: unknown) {

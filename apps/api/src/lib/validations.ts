@@ -445,6 +445,9 @@ export const createCounterSchema = z.object({
   name: z.string().min(1, 'Counter name is required').max(50),
   nameAr: z.string().optional(),
   nameFr: z.string().optional(),
+  // Feature C: counter→service assignment. Empty/omitted = serves ALL agency
+  // services. Must be a list of Service ids belonging to the agency.
+  serviceIds: z.array(z.string()).max(50).optional(),
 })
 
 export const updateCounterSchema = z.object({
@@ -453,6 +456,8 @@ export const updateCounterSchema = z.object({
   nameFr: z.string().optional(),
   isActive: z.boolean().optional(),
   staffId: z.string().nullable().optional(),
+  // Feature C: counter→service assignment (empty array = serve all services).
+  serviceIds: z.array(z.string()).max(50).nullable().optional(),
 })
 
 // ─── Kiosk ──────────────────────────────────────────────────────────────────

@@ -70,9 +70,10 @@ function _loadSyncRegistry() {
     }
   } catch { /* fall through */ }
   // 4. Frozen fallback (kept in lockstep with packages/core/src/sync-registry.ts).
-  console.warn('[SyncService] sync-registry.json not found — using FROZEN in-file model list (21 models). Regenerate packages/core/sync-registry.json if models changed.');
+  console.warn('[SyncService] sync-registry.json not found — using FROZEN in-file model list (22 models). Regenerate packages/core/sync-registry.json if models changed.');
   SYNC_TABLES = [
     'Agency', 'User', 'AgencyStaff', 'Service', 'Branch', 'Counter',
+    'CounterControlRequest', // Feature C — the counter-control approval queue.
     'QueueSettings', 'Reservation', 'Transaction', 'SmsSettings',
     'PaymentSettings', 'Notification', 'Announcement', 'GlobalAnnouncement',
     'Review', 'Favorite', 'FAQ', 'SubscriptionPlan', 'PlanFeature',

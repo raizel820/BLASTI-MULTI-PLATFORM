@@ -59,12 +59,17 @@ import {
   QrCode,
   Copy,
   Download,
+  Check,
+  DoorOpen,
+  ShieldAlert,
+  User,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { getApiBaseUrl, isElectronRuntime } from '@/lib/api-client';
 import { useSubscriptionActive } from '@/hooks/use-subscription';
+import { useAgencyAuthority } from '@/hooks/use-agency-authority';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import QRCode from 'qrcode';
 // Task 83-b — branch location picker + Algeria address selectors (same
@@ -180,6 +185,21 @@ interface CounterWithStaff {
   staff?: { id: string; user: { fullName: string; username: string } } | null;
   currentReservation?: { id: string; displayNumber: string; status: string } | null;
   currentReservationId?: string | null;
+  // Feature C — counter control state + service assignment. Optional so rows
+  // from older local-API builds keep rendering.
+  serviceIds?: string | null;
+  serviceIdList?: string[];
+  controlledByUserId?: string | null;
+  controlClaimedAt?: string | null;
+  controlHeartbeatAt?: string | null;
+  controlledByUser?: { id: string; fullName: string; username: string } | null;
+}
+
+interface ServiceOptionLite {
+  id: string;
+  name: string;
+  nameAr?: string | null;
+  nameFr?: string | null;
 }
 
 interface StaffMember {
@@ -193,6 +213,11 @@ export function AgencyBranches() {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
   const agencyId = user?.agencyId;
+  // Feature C — counter control: who can force-release someone else's counter.
+  const { authority } = useAgencyAuthority();
+  const myUserId = user?.id ?? '';
+  const canForceReleaseControl =
+    user?.role === 'AGENCY_OWNER' || user?.role === 'SUPER_ADMIN' || authority?.role === 'MANAGER';
 
   // Task 31 bug 5: branch/counter creation is a paid feature. isActive stays
   // true until a concrete INACTIVE/TRIAL-less status arrives (offline-first),
@@ -239,7 +264,13 @@ export function AgencyBranches() {
   const [counterName, setCounterName] = useState('');
   const [counterNameAr, setCounterNameAr] = useState('');
   const [counterNameFr, setCounterNameFr] = useState('');
+  // Feature C — services this counter serves (empty = ALL services).
+  const [counterServiceIds, setCounterServiceIds] = useState<string[]>([]);
+  const [services, setServices] = useState<ServiceOptionLite[]>([]);
   const [counterSaving, setCounterSaving] = useState(false);
+
+  // Feature C — force-release / release-in-flight marker per counter row.
+  const [releasingCounterId, setReleasingCounterId] = useState<string | null>(null);
 
   // Delete dialog
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
@@ -420,10 +451,48 @@ export function AgencyBranches() {
     }
   }, [agencyId]);
 
+  // Feature C — the services catalog the counter dialog assigns from (same
+  // GET /api/agency/services the fullscreen + settings consume).
+  const fetchServices = useCallback(async () => {
+    if (!agencyId) return;
+    try {
+      const res = await apiFetch(`/api/agency/services?agencyId=${agencyId}`);
+      if (res.ok) {
+        const data = await res.json();
+        setServices((data.services ?? []) as ServiceOptionLite[]);
+      }
+    } catch {
+      // silent — the dialog still works, just without chips
+    }
+  }, [agencyId]);
+
+  // Feature C — resolve the current plan's maxCounters from
+  // GET /api/agency/subscription (availablePlans + currentPlan — the exact
+  // staff-cap pattern agency-employees.tsx uses for maxStaff). null = unknown
+  // → no meter; -1 = unlimited.
+  const [planMaxCounters, setPlanMaxCounters] = useState<number | null>(null);
+  const fetchPlanCounterCap = useCallback(async () => {
+    try {
+      const params = agencyId ? `?agencyId=${encodeURIComponent(agencyId)}` : '';
+      const res = await apiFetch(`/api/agency/subscription${params}`);
+      if (res.ok) {
+        const data = await res.json();
+        const plans: Array<{ name?: string; maxCounters?: number }> = data.availablePlans ?? [];
+        const current = String(data.currentPlan ?? '').toUpperCase();
+        const match = plans.find((p) => (p.name ?? '').toUpperCase() === current);
+        setPlanMaxCounters(typeof match?.maxCounters === 'number' ? match.maxCounters : null);
+      }
+    } catch {
+      // silent — the meter simply doesn't render; the server still gates create
+    }
+  }, [agencyId]);
+
   useEffect(() => {
     fetchBranches();
     fetchStaff();
-  }, [fetchBranches, fetchStaff]);
+    fetchServices();
+    fetchPlanCounterCap();
+  }, [fetchBranches, fetchStaff, fetchServices, fetchPlanCounterCap]);
 
   const fetchCounters = useCallback(async (branchId: string) => {
     setCountersLoading(true);
@@ -720,6 +789,7 @@ export function AgencyBranches() {
     setCounterName('');
     setCounterNameAr('');
     setCounterNameFr('');
+    setCounterServiceIds([]);
     setCounterDialogOpen(true);
   };
 
@@ -729,7 +799,14 @@ export function AgencyBranches() {
     setCounterName(counter.name);
     setCounterNameAr(counter.nameAr || '');
     setCounterNameFr(counter.nameFr || '');
+    setCounterServiceIds(counter.serviceIdList ?? []);
     setCounterDialogOpen(true);
+  };
+
+  const toggleCounterService = (serviceId: string) => {
+    setCounterServiceIds((prev) =>
+      prev.includes(serviceId) ? prev.filter((id) => id !== serviceId) : [...prev, serviceId],
+    );
   };
 
   const handleSaveCounter = async () => {
@@ -750,6 +827,9 @@ export function AgencyBranches() {
             name: counterName.trim(),
             nameAr: counterNameAr.trim() || undefined,
             nameFr: counterNameFr.trim() || undefined,
+            // Feature C — service assignment (empty list = serve ALL services;
+            // the server normalizes [] → null).
+            serviceIds: counterServiceIds,
           }),
         });
         if (res.ok) {
@@ -769,6 +849,8 @@ export function AgencyBranches() {
             name: counterName.trim(),
             nameAr: counterNameAr.trim() || undefined,
             nameFr: counterNameFr.trim() || undefined,
+            // Feature C — service assignment (empty list = serve ALL services).
+            serviceIds: counterServiceIds,
           }),
         });
         if (res.ok) {
@@ -776,15 +858,52 @@ export function AgencyBranches() {
           setCounterDialogOpen(false);
           fetchCounters(expandedBranch);
           fetchBranches(); // Refresh counter counts
+          fetchPlanCounterCap(); // refresh the limit meter
         } else {
           const data = await res.json();
-          toast.error(data.error || t('error'));
+          // Feature C — the plan's counter cap returns 403 PLAN_LIMIT_REACHED
+          // with a human `message`; surface it verbatim (falls back to i18n).
+          if (data.error === 'PLAN_LIMIT_REACHED') {
+            toast.error(data.message || t('counterLimitReached'));
+          } else {
+            toast.error(data.error || t('error'));
+          }
         }
       }
     } catch {
       toast.error(t('error'));
     } finally {
       setCounterSaving(false);
+    }
+  };
+
+  // Feature C — release counter control. The controller releases their own;
+  // owner / branch MANAGER force-releases someone else's (server enforces).
+  const handleReleaseCounterControl = async (counter: CounterWithStaff) => {
+    setReleasingCounterId(counter.id);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${counter.id}/release`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        toast.success(t('counterReleased'));
+        fetchCounters(counter.branchId);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        if (
+          data.error === 'NOT_COUNTER_CONTROLLER' ||
+          (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED'))
+        ) {
+          toast.error(t('counterPermissionDenied'));
+        } else {
+          toast.error(data.error || t('error'));
+        }
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setReleasingCounterId(null);
     }
   };
 
@@ -929,6 +1048,21 @@ export function AgencyBranches() {
     return counter.name;
   };
 
+  const getServiceDisplayName = (s: ServiceOptionLite) => {
+    if (lang === 'ar' && s.nameAr) return s.nameAr;
+    if (lang === 'fr' && s.nameFr) return s.nameFr;
+    return s.name;
+  };
+
+  // Feature C — plan counter cap: the limit is PER BRANCH and counts ACTIVE
+  // counters only (server counts isActive=true in this branch). We compute it
+  // from the expanded branch's loaded counters; -1 = unlimited. null plan =
+  // no meter and no client lock (the server's 403 PLAN_LIMIT_REACHED stays
+  // authoritative).
+  const activeCountersInExpandedBranch = counters.filter((counter) => counter.isActive).length;
+  const counterCapReached =
+    planMaxCounters !== null && planMaxCounters !== -1 && !!expandedBranch && activeCountersInExpandedBranch >= planMaxCounters;
+
   // Loading state
   if (loading) {
     return (
@@ -965,24 +1099,42 @@ export function AgencyBranches() {
           </h2>
           <p className="text-sm text-muted-foreground mt-1">{t('branchesDesc')}</p>
         </div>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="inline-flex">
-              <Button
-                className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl shadow-lg shadow-emerald-500/20 gap-2 h-10 px-4 disabled:opacity-50"
-                onClick={openCreateBranchDialog}
-                disabled={!subscriptionActive}
-              >
-                {!subscriptionActive ? <Lock className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
-                <span className="hidden sm:inline">{t('addBranch')}</span>
-                <span className="sm:hidden">{t('addBranch')}</span>
-              </Button>
-            </span>
-          </TooltipTrigger>
-          {!subscriptionActive && (
-            <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
+        <div className="flex items-center gap-2">
+          {/* Feature C — counter limit meter for the expanded branch (active vs plan cap) */}
+          {planMaxCounters !== null && expandedBranch && (
+            <div
+              className={`hidden sm:flex items-center gap-1.5 px-3 h-9 rounded-xl border text-xs font-medium ${
+                counterCapReached
+                  ? 'bg-amber-50 dark:bg-amber-900/20 border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400'
+                  : 'bg-muted/50 border-border text-muted-foreground'
+              }`}
+              title={counterCapReached ? t('counterLimitReached') : undefined}
+            >
+              <Monitor className="h-3.5 w-3.5" />
+              {planMaxCounters === -1
+                ? t('counterUnlimited', { x: String(activeCountersInExpandedBranch) })
+                : t('counterLimitMeter', { x: String(activeCountersInExpandedBranch), n: String(planMaxCounters) })}
+            </div>
           )}
-        </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex">
+                <Button
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl shadow-lg shadow-emerald-500/20 gap-2 h-10 px-4 disabled:opacity-50"
+                  onClick={openCreateBranchDialog}
+                  disabled={!subscriptionActive}
+                >
+                  {!subscriptionActive ? <Lock className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                  <span className="hidden sm:inline">{t('addBranch')}</span>
+                  <span className="sm:hidden">{t('addBranch')}</span>
+                </Button>
+              </span>
+            </TooltipTrigger>
+            {!subscriptionActive && (
+              <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
+            )}
+          </Tooltip>
+        </div>
       </motion.div>
 
       {/* Task 40 round 4: the embedded local API predates the branch-list
@@ -1321,16 +1473,18 @@ export function AgencyBranches() {
                                     size="sm"
                                     className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg h-8 text-xs gap-1.5 disabled:opacity-50"
                                     onClick={() => openCreateCounterDialog(branch.id)}
-                                    disabled={!subscriptionActive}
+                                    disabled={!subscriptionActive || counterCapReached}
                                   >
-                                    {!subscriptionActive ? <Lock className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+                                    {!subscriptionActive || counterCapReached ? <Lock className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
                                     {t('addCounter')}
                                   </Button>
                                 </span>
                               </TooltipTrigger>
-                              {!subscriptionActive && (
+                              {!subscriptionActive ? (
                                 <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
-                              )}
+                              ) : counterCapReached ? (
+                                <TooltipContent className="max-w-[240px]">{t('counterLimitReached')}</TooltipContent>
+                              ) : null}
                             </Tooltip>
                           </div>
 
@@ -1420,9 +1574,89 @@ export function AgencyBranches() {
                                           </span>
                                         )}
                                       </div>
+                                      {/* Feature C — live CONTROL state (staffId is
+                                          only the roster assignment now) */}
+                                      <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                                        {counter.controlledByUserId ? (
+                                          counter.controlledByUserId === myUserId ? (
+                                            <Badge className="bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-400 border-0 text-[9px] px-1.5 py-0 h-4 gap-0.5">
+                                              <UserCheck className="h-2.5 w-2.5" />
+                                              {t('counterControlledByYou')}
+                                            </Badge>
+                                          ) : (
+                                            <Badge className="bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400 border-0 text-[9px] px-1.5 py-0 h-4 gap-0.5">
+                                              <User className="h-2.5 w-2.5" />
+                                              {counter.controlledByUser?.fullName
+                                                ? t('counterOccupiedBy', { name: counter.controlledByUser.fullName })
+                                                : t('counterOccupied')}
+                                            </Badge>
+                                          )
+                                        ) : (
+                                          <Badge variant="secondary" className="bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 border-0 text-[9px] px-1.5 py-0 h-4">
+                                            {t('counterFree')}
+                                          </Badge>
+                                        )}
+                                        {/* Service assignment chips (Feature C) */}
+                                        {counter.serviceIdList && counter.serviceIdList.length > 0 ? (
+                                          counter.serviceIdList.map((sid) => {
+                                            const svc = services.find((s) => s.id === sid);
+                                            if (!svc) return null;
+                                            return (
+                                              <Badge key={sid} variant="outline" className="text-[9px] px-1.5 py-0 h-4 bg-teal-50 dark:bg-teal-900/20 text-teal-700 dark:text-teal-400 border-teal-200 dark:border-teal-800">
+                                                {getServiceDisplayName(svc)}
+                                              </Badge>
+                                            );
+                                          })
+                                        ) : (
+                                          <span className="text-[9px] text-muted-foreground/70">{t('counterAllServices')}</span>
+                                        )}
+                                      </div>
                                     </div>
                                   </div>
                                   <div className="flex items-center gap-1.5 flex-shrink-0">
+                                    {/* Feature C — control release actions */}
+                                    {counter.controlledByUserId &&
+                                      (counter.controlledByUserId === myUserId ? (
+                                        <Tooltip>
+                                          <TooltipTrigger asChild>
+                                            <Button
+                                              size="sm"
+                                              variant="ghost"
+                                              className="h-8 w-8 p-0 text-muted-foreground hover:text-emerald-600"
+                                              onClick={() => handleReleaseCounterControl(counter)}
+                                              disabled={releasingCounterId === counter.id}
+                                              aria-label={t('releaseCounter')}
+                                            >
+                                              {releasingCounterId === counter.id ? (
+                                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                              ) : (
+                                                <DoorOpen className="h-3.5 w-3.5" />
+                                              )}
+                                            </Button>
+                                          </TooltipTrigger>
+                                          <TooltipContent>{t('releaseCounter')}</TooltipContent>
+                                        </Tooltip>
+                                      ) : canForceReleaseControl ? (
+                                        <Tooltip>
+                                          <TooltipTrigger asChild>
+                                            <Button
+                                              size="sm"
+                                              variant="ghost"
+                                              className="h-8 w-8 p-0 text-amber-500 hover:text-amber-600"
+                                              onClick={() => handleReleaseCounterControl(counter)}
+                                              disabled={releasingCounterId === counter.id}
+                                              aria-label={t('forceRelease')}
+                                            >
+                                              {releasingCounterId === counter.id ? (
+                                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                              ) : (
+                                                <ShieldAlert className="h-3.5 w-3.5" />
+                                              )}
+                                            </Button>
+                                          </TooltipTrigger>
+                                          <TooltipContent>{t('forceRelease')}</TooltipContent>
+                                        </Tooltip>
+                                      ) : null)}
                                     {/* Active/Inactive Toggle for Counter */}
                                     <div className="flex items-center gap-1.5">
                                       <Switch
@@ -1783,6 +2017,37 @@ export function AgencyBranches() {
                 className="h-11"
                 dir="ltr"
               />
+            </div>
+            {/* Feature C — service assignment multi-select (checkbox chips).
+                Empty selection = the counter serves ALL services. */}
+            <div className="space-y-2">
+              <Label>{t('counterServices')}</Label>
+              {services.length === 0 ? (
+                <p className="text-xs text-muted-foreground">{t('counterServicesHint')}</p>
+              ) : (
+                <div className="flex flex-wrap gap-2 max-h-32 overflow-y-auto p-1">
+                  {services.map((s) => {
+                    const checked = counterServiceIds.includes(s.id);
+                    return (
+                      <button
+                        key={s.id}
+                        type="button"
+                        onClick={() => toggleCounterService(s.id)}
+                        className={`inline-flex items-center gap-1.5 px-2.5 h-8 rounded-full border text-xs font-medium transition-colors ${
+                          checked
+                            ? 'bg-emerald-50 dark:bg-emerald-900/30 border-emerald-300 dark:border-emerald-700 text-emerald-700 dark:text-emerald-400'
+                            : 'bg-muted/50 border-border text-muted-foreground hover:bg-muted'
+                        }`}
+                        aria-pressed={checked}
+                      >
+                        {checked && <Check className="h-3 w-3" />}
+                        {getServiceDisplayName(s)}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              <p className="text-xs text-muted-foreground">{t('counterServicesHint')}</p>
             </div>
           </div>
           <DialogFooter>

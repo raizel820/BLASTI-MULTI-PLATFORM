@@ -10,6 +10,8 @@ import { enforcePersistencePolicyAtBoot, purgeAuthState, isSessionEphemeral } fr
 // Task 2-b-2 (sub-task 2) — ONE boot-time session sanity check (desktop):
 // expiry check → single-flight refresh → purge on failure. See session-boot.ts.
 import { validateSessionOnBoot } from '@/lib/session-boot';
+// Feature C — keepalive release of controlled counters on page hide.
+import { fireReleaseMine, readPersistedSessionToken } from '@/lib/counter-release';
 import { Loader2 } from 'lucide-react';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -121,6 +123,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (typeof offQuitting === 'function') offQuitting();
       try { window.removeEventListener('pagehide', onPageHide); } catch { /* ignore */ }
       try { window.removeEventListener('beforeunload', onPageHide); } catch { /* ignore */ }
+    };
+  }, []);
+
+  // ── Feature C: release controlled counters on page hide (ALL platforms) ────
+  // When the tab/app goes away (close, refresh, navigation) any counter the
+  // user still controls must be freed — otherwise the 60s heartbeat dies and
+  // the counter stays locked until the server-side TTL sweeper expires it.
+  // keepalive fetch (survives unload) + the shared module-level timestamp in
+  // counter-release.ts dedupes this against the logout() trigger.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const releaseMineOnPageHide = () => {
+      try {
+        // Store token first (live session); persisted mirrors as fallback —
+        // the store may already be mid-logout by the time this runs.
+        const token =
+          useAppStore.getState().sessionToken || readPersistedSessionToken();
+        fireReleaseMine(token);
+      } catch { /* best-effort — the server sweeper is the backstop */ }
+    };
+    try { window.addEventListener('pagehide', releaseMineOnPageHide); } catch { /* ignore */ }
+    return () => {
+      try { window.removeEventListener('pagehide', releaseMineOnPageHide); } catch { /* ignore */ }
     };
   }, []);
 

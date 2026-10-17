@@ -272,6 +272,8 @@ app.get('/active', async (c) => {
           select: { id: true, name: true, nameFr: true, nameAr: true, customCode: true, category: true, address: true, logoUrl: true, averageServiceTime: true },
         },
         service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
+        // Feature C: which counter is serving this ticket (CALLED only).
+        counter: { select: { id: true, number: true, name: true, nameAr: true, nameFr: true } },
       },
       orderBy: { joinedAt: 'desc' },
       take: 50,
@@ -384,6 +386,10 @@ app.get('/active', async (c) => {
           isPaused: eta.isPaused,
         },
         eta,
+        // Feature C: customer-facing "served at Counter N" info (null while WAITING).
+        counterInfo: res.status === 'CALLED' && res.counter
+          ? { id: res.counter.id, number: res.counter.number, name: res.counter.name, nameAr: res.counter.nameAr, nameFr: res.counter.nameFr }
+          : null,
       }
     })
 
