@@ -46,6 +46,9 @@ const UNREACHABLE_GIVEUP_MS = 15_000;
 interface SyncStatusPayload {
   success: boolean;
   state?: string;
+  /** true when the session user is attached to an agency (missing on older
+   *  local-API builds — the store-side guard covers those). */
+  hasAgency?: boolean;
   needsInitialSync?: boolean | null;
   lastError?: string | null;
   active?: boolean;
@@ -93,6 +96,14 @@ export function PostLoginSyncGate() {
   const { platform } = usePlatform();
   const { t, lang } = useLanguage();
 
+  // Field report (post-registration flow): a freshly-registered agency owner
+  // has NO agency yet. There is nothing to import until the agency exists —
+  // the gate must never show in that window, otherwise it covered the
+  // create-agency wizard with "preparing workspace → failed" (the desktop
+  // app appeared to "sync a db" right after registration instead of
+  // starting the agency-creation phase like the webapp).
+  const userHasAgency = !!user?.agencyId;
+
   const [visible, setVisible] = useState(false);
   const [phase, setPhase] = useState<Phase>('preparing');
   const [status, setStatus] = useState<SyncStatusPayload | null>(null);
@@ -124,6 +135,14 @@ export function PostLoginSyncGate() {
     setPhase('preparing');
 
     if (!isElectron || !user) return;
+    // No agency yet → the workspace does not exist. Stop immediately: the
+    // create-agency wizard owns the screen. The effect re-runs on the
+    // user?.agencyId transition (below) once the agency is created, which
+    // re-engages the gate for the (legitimate, quick) first import.
+    if (!userHasAgency) {
+      setVisible(false);
+      return;
+    }
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -140,6 +159,13 @@ export function PostLoginSyncGate() {
       const st = (data.state || 'UNKNOWN').toUpperCase();
       const active = !!data.active;
       const elapsed = Date.now() - startedAt;
+
+      // Explicit server answer for the no-agency window (older local APIs
+      // reported UNKNOWN here instead) → never show, stop polling.
+      if (st === 'NO_AGENCY') {
+        setVisible(false);
+        return 'stop';
+      }
 
       // Terminal success: workspace READY and no run in flight.
       if (st === 'READY' && !active) {
@@ -220,7 +246,9 @@ export function PostLoginSyncGate() {
       cancelled = true;
       stop();
     };
-  }, [isElectron, user?.id]);
+    // user?.agencyId: re-run when the agency is created (null → id) so the
+    // first real workspace import is observed to completion (READY flash).
+  }, [isElectron, user?.id, userHasAgency]);
 
   const handleRetry = useCallback(async () => {
     setRetrying(true);

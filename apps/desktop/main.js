@@ -2502,6 +2502,19 @@ async function _runInitialSyncFromSessionInner() {
     return { success: false, error: 'No active session — login first' };
   }
 
+  // Feature C follow-up (field report): registering a NEW agency owner used
+  // to trigger a doomed initial-sync run right after set-auth — the session
+  // has NO agencyId yet, runInitialSync throws 'Missing required options:
+  // agencyId…', and the PostLoginSyncGate then blocked the create-agency
+  // wizard with a "Preparing workspace → failed" overlay. The webapp goes
+  // straight to the agency-creation phase; desktop must do the same. The
+  // sync fires naturally AFTER the agency is created (set-auth runs again
+  // with the agency-embedded JWT).
+  if (!session.user.agencyId) {
+    console.log('[IPC] Session has no agency yet — skipping initial sync (agency creation phase)');
+    return { success: true, skipped: 'no-agency', totalRecords: 0, duration: 0 };
+  }
+
   const { localDb } = require('./local-api/lib/db');
   const cloudUrl = process.env.BLASTI_CLOUD_URL || CLOUD_BASE_URL;
 

@@ -56,7 +56,7 @@ export function WaitingList({
             <div className="text-center py-8">
               <motion.div animate={{ y: [0, -5, 0] }} transition={{ duration: 2, repeat: Infinity }}>
                 <div className="relative inline-block mb-3">
-                  <motion.div animate={{ scale: [1, 1.2, 1], opacity: [0.1, 0.05, 0.1] }} transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }} className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-20 w-20 rounded-full bg-emerald-200 dark:bg-emerald-800" />
+                  <motion.div animate={{ scale: [1, 1.2, 1], opacity: [0.1, 0.05, 0.1] }} transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-20 w-20 rounded-full bg-emerald-200 dark:bg-emerald-800" />
                   <Users className="h-10 w-10 text-muted-foreground mx-auto relative" />
                 </div>
               </motion.div>

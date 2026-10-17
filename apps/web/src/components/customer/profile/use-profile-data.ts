@@ -8,12 +8,39 @@ import type { Language } from '@/i18n';
 import { updateDocumentDirection } from '@/store/use-app-store';
 import { mergeSessionUser, markLocalAvatarMutation } from '@/lib/user-store-refresh';
 import { mirrorNotifPrefs } from '@/lib/notification-channel';
+import { useCachedResource, resourceKey } from '@/lib/use-cached-data';
 import type {
   NotifPrefs,
   QueueStats,
   PurchaseHistoryItem,
   SmsStatsData,
 } from '@/components/customer/profile/profile-types';
+
+/** Shape of GET /api/user/profile (subset the profile view consumes). */
+interface ProfileResponse {
+  notificationPreferences?: string | NotifPrefs;
+  phoneNumber?: string;
+  fullName?: string;
+  email?: string | null;
+  avatarUrl?: string | null;
+  freeSmsCount?: number;
+  reminderMinutes?: number;
+  smsNotificationsEnabled?: boolean;
+  [key: string]: unknown;
+}
+
+/** Shape of GET /api/sms/purchase. */
+interface PurchaseResponse {
+  purchases?: PurchaseHistoryItem[];
+  totalPurchased?: number;
+  totalSpent?: number;
+  pendingCount?: number;
+}
+
+/** TTL for profile/stats/purchases revalidation — short enough to stay
+ *  correct on multi-device accounts, long enough that tab-flipping never
+ *  refetches (Task 85 navigation-smoothness requirement). */
+const PROFILE_TTL_MS = 15_000;
 
 export function useProfileData() {
   const { user, setUser, logout } = useAppStore();
@@ -33,7 +60,6 @@ export function useProfileData() {
     turn_approaching: true,
     completed: true,
   });
-  const [notifLoading, setNotifLoading] = useState(false);
   const [notifSaving, setNotifSaving] = useState(false);
 
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
@@ -54,42 +80,29 @@ export function useProfileData() {
   const [smsPurchasingPackId, setSmsPurchasingPackId] = useState<string | null>(null);
 
   const [purchaseHistory, setPurchaseHistory] = useState<PurchaseHistoryItem[]>([]);
-  const [purchaseHistoryLoading, setPurchaseHistoryLoading] = useState(false);
   const [smsStatsData, setSmsStatsData] = useState<SmsStatsData>({ totalPurchased: 0, totalSpent: 0, pendingCount: 0 });
-
-  const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
-  const [statsLoading, setStatsLoading] = useState(true);
 
   const [smsCount, setSmsCount] = useState(user?.freeSmsCount ?? 10);
 
-  const fetchProfile = useCallback(async () => {
-    if (!user?.id) return;
-    setNotifLoading(true);
-    try {
-      const res = await apiFetch(`/api/user/profile?userId=${user.id}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.notificationPreferences) {
-          setNotifPrefs(typeof data.notificationPreferences === 'string'
-            ? JSON.parse(data.notificationPreferences)
-            : data.notificationPreferences);
-          // Mirror for the realtime alert paths (outside React) — keeps the
-          // lock-screen alert mute/takeover prefs in effect app-wide.
-          mirrorNotifPrefs(typeof data.notificationPreferences === 'string'
-            ? JSON.parse(data.notificationPreferences)
-            : data.notificationPreferences);
-        }
-        if (data.phoneNumber) setPhoneNumber(data.phoneNumber);
-        if (data.fullName) setFullName(data.fullName);
-        if (data.email !== undefined && data.email !== null) setEmail(data.email);
-        if (data.avatarUrl !== undefined && data.avatarUrl !== null) setAvatarUrl(data.avatarUrl);
-        if (data.freeSmsCount !== undefined) setSmsCount(data.freeSmsCount);
-        if (data.reminderMinutes !== undefined) setReminderMinutesVal(data.reminderMinutes);
-        if (data.smsNotificationsEnabled !== undefined) setSmsNotifEnabled(data.smsNotificationsEnabled);
-        // Cross-device heal: the persisted store user may be older than the
-        // DB (avatar uploaded on another device). Merge the authoritative
-        // identity fields so the header/sidebar/identity-card avatars update
-        // on THIS device too — without navigation side effects.
+  const userId = user?.id;
+
+  // ─── Task 85: cached SWR resources — views re-mount on every tab switch;
+  // these seed their state from the previous visit's data (memory layer =
+  // zero-latency same-session remounts) and revalidate in the background. ──
+
+  const profileResource = useCachedResource<ProfileResponse>({
+    key: userId ? resourceKey('/api/user/profile', { userId }) : null,
+    enabled: !!userId,
+    ttlMs: PROFILE_TTL_MS,
+    fetcher: useCallback(async () => {
+      if (!userId) return null;
+      try {
+        const res = await apiFetch(`/api/user/profile?userId=${userId}`);
+        if (!res.ok) return null;
+        const data = (await res.json()) as ProfileResponse;
+        // Cross-device heal: merge the authoritative identity fields so the
+        // header/sidebar/identity-card avatars update on THIS device too.
+        // (Network-only — the cache-seed path must not touch the store.)
         mergeSessionUser({
           fullName: typeof data.fullName === 'string' && data.fullName ? data.fullName : undefined,
           email: typeof data.email === 'string' && data.email ? data.email : undefined,
@@ -99,49 +112,87 @@ export function useProfileData() {
             ? data.freeSmsCount
             : undefined,
         });
+        return data;
+      } catch {
+        return null;
       }
-    } catch {
-      toast.error(t('error'));
-    } finally {
-      setNotifLoading(false);
-    }
-  }, [user?.id, t]);
+    }, [userId]),
+  });
 
-  const fetchStats = useCallback(async () => {
-    if (!user?.id) return;
-    setStatsLoading(true);
-    try {
-      const res = await apiFetch(`/api/user/stats?userId=${user.id}`);
-      if (res.ok) { const data = await res.json(); setQueueStats(data); }
-    } catch {
-      toast.error(t('error'));
-    } finally {
-      setStatsLoading(false);
-    }
-  }, [user?.id, t]);
-
-  const fetchPurchaseHistory = useCallback(async () => {
-    if (!user?.id) return;
-    setPurchaseHistoryLoading(true);
-    try {
-      const res = await apiFetch(`/api/sms/purchase?userId=${user.id}`);
-      if (res.ok) {
-        const data = await res.json();
-        setPurchaseHistory(data.purchases || []);
-        // Task 2-b: API now returns real aggregates (APPROVED-only sums + pending count)
-        setSmsStatsData({
-          totalPurchased: data.totalPurchased || 0,
-          totalSpent: data.totalSpent || 0,
-          pendingCount: data.pendingCount || 0,
-        });
-        setPurchasedSms(data.totalPurchased || 0);
+  const statsResource = useCachedResource<QueueStats>({
+    key: userId ? resourceKey('/api/user/stats', { userId }) : null,
+    enabled: !!userId,
+    ttlMs: PROFILE_TTL_MS,
+    fetcher: useCallback(async () => {
+      if (!userId) return null;
+      try {
+        const res = await apiFetch(`/api/user/stats?userId=${userId}`);
+        if (!res.ok) return null;
+        return (await res.json()) as QueueStats;
+      } catch {
+        return null;
       }
-    } catch { /* silent */ } finally {
-      setPurchaseHistoryLoading(false);
-    }
-  }, [user?.id]);
+    }, [userId]),
+  });
 
-  useEffect(() => { fetchProfile(); fetchStats(); fetchPurchaseHistory(); }, []);
+  const purchaseResource = useCachedResource<PurchaseResponse>({
+    key: userId ? resourceKey('/api/sms/purchase', { userId }) : null,
+    enabled: !!userId,
+    ttlMs: PROFILE_TTL_MS,
+    fetcher: useCallback(async () => {
+      if (!userId) return null;
+      try {
+        const res = await apiFetch(`/api/sms/purchase?userId=${userId}`);
+        if (!res.ok) return null;
+        return (await res.json()) as PurchaseResponse;
+      } catch {
+        return null;
+      }
+    }, [userId]),
+  });
+
+  const fetchProfile = profileResource.refresh;
+  const fetchStats = statsResource.refresh;
+  const fetchPurchaseHistory = purchaseResource.refresh;
+
+  const notifLoading = profileResource.loading;
+  const statsLoading = statsResource.loading;
+  const purchaseHistoryLoading = purchaseResource.loading;
+
+  // Apply cached-or-fresh profile payloads to local view state.
+  useEffect(() => {
+    const data = profileResource.data;
+    if (!data) return;
+    if (data.notificationPreferences) {
+      const prefs = typeof data.notificationPreferences === 'string'
+        ? JSON.parse(data.notificationPreferences)
+        : data.notificationPreferences;
+      setNotifPrefs(prefs);
+      // Mirror for the realtime alert paths (outside React) — keeps the
+      // lock-screen alert mute/takeover prefs in effect app-wide.
+      mirrorNotifPrefs(prefs);
+    }
+    if (data.phoneNumber) setPhoneNumber(data.phoneNumber);
+    if (data.fullName) setFullName(data.fullName);
+    if (data.email !== undefined && data.email !== null) setEmail(data.email);
+    if (data.avatarUrl !== undefined && data.avatarUrl !== null) setAvatarUrl(data.avatarUrl);
+    if (data.freeSmsCount !== undefined) setSmsCount(data.freeSmsCount);
+    if (data.reminderMinutes !== undefined) setReminderMinutesVal(data.reminderMinutes);
+    if (data.smsNotificationsEnabled !== undefined) setSmsNotifEnabled(data.smsNotificationsEnabled);
+  }, [profileResource.data]);
+
+  // Apply cached-or-fresh purchase payloads.
+  useEffect(() => {
+    const data = purchaseResource.data;
+    if (!data) return;
+    if (data.purchases) setPurchaseHistory(data.purchases);
+    setSmsStatsData({
+      totalPurchased: data.totalPurchased || 0,
+      totalSpent: data.totalSpent || 0,
+      pendingCount: data.pendingCount || 0,
+    });
+    setPurchasedSms(data.totalPurchased || 0);
+  }, [purchaseResource.data]);
 
   const handleLanguageChange = (newLang: string) => {
     const langTyped = newLang as Language;
@@ -172,6 +223,7 @@ export function useProfileData() {
       if (res.ok) {
         toast.success(t('success'));
         setUser({ ...user, phoneNumber: phoneNumber.trim() });
+        void profileResource.invalidate(); // the cached profile is now stale
       } else {
         const data = await res.json().catch(() => null);
         if (res.status === 409) toast.error(t('phoneNumberTaken'));
@@ -232,6 +284,7 @@ export function useProfileData() {
           phoneNumber: data.phoneNumber ?? user.phoneNumber,
           avatarUrl: data.avatarUrl ?? user.avatarUrl,
         });
+        void profileResource.invalidate();
         toast.success(t('success'));
         return true;
       }
@@ -271,6 +324,7 @@ export function useProfileData() {
         setAvatarUrl(data.avatarUrl ?? url);
         // Refresh the session user so the header/avatar reflect the change.
         setUser({ ...user, avatarUrl: data.avatarUrl ?? url });
+        void profileResource.invalidate();
         return true;
       }
       return false;
@@ -334,17 +388,25 @@ export function useProfileData() {
         body: JSON.stringify({ packId, userId: user.id }),
       });
       if (res.ok) {
-        const data = await res.json();
-        toast.success(`${t('smsPurchaseSuccess')} — ${t('newBalance')}: ${data.newBalance}`);
-        setPurchasedSms((prev) => prev + parseInt(packId, 10));
-        await fetchProfile();
+        // Manual purchase creates a PENDING record — credits are granted only
+        // after admin approval / webhook confirmation. Never optimistically
+        // inflate the balance here (the old code double-counted: the approved
+        // amount is ALREADY merged into freeSmsCount by the server, and this
+        // hook added it a second time on top).
+        toast.success(t('smsPurchaseSubmitted'));
+        // Force a network refresh of both the balance and the purchase list
+        // (bypasses the TTL) so the pending row appears immediately.
+        await Promise.all([profileResource.refresh(), purchaseResource.refresh()]);
       } else if (res.status === 429) { toast.error(t('smsAlreadyPurchasing')); }
       else { const data = await res.json(); toast.error(data.error || t('smsPurchaseFailed')); }
     } catch { toast.error(t('smsPurchaseFailed')); } finally { setSmsPurchasing(false); setSmsPurchasingPackId(null); }
   };
 
-  const totalAvailable = smsCount + purchasedSms;
-  const totalPercent = totalAvailable > 0 ? Math.min(100, (smsCount / totalAvailable) * 100) : 0;
+  // freeSmsCount from the server IS the total spendable balance — purchased
+  // credits are merged into it on approval (sms.ts / chargily-fulfill.ts).
+  // Adding the lifetime purchase total again double-counted (10 free + 200
+  // bought showed "total 410").
+  const totalAvailable = smsCount;
 
   const handleToggleNotifPref = (key: keyof NotifPrefs) => {
     setNotifPrefs((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -368,11 +430,11 @@ export function useProfileData() {
     // SMS settings
     reminderMinutesVal, setReminderMinutesVal, smsNotifEnabled, setSmsNotifEnabled, smsSettingsSaving, handleSaveSmsSettings, smsCount,
     // SMS wallet
-    purchasedSms, totalAvailable, totalPercent, smsPurchasing, smsPurchasingPackId, handlePurchaseSms,
+    purchasedSms, totalAvailable, smsPurchasing, smsPurchasingPackId, handlePurchaseSms,
     // Purchase history
     purchaseHistory, purchaseHistoryLoading, smsStatsData,
     // Stats
-    queueStats, statsLoading,
+    queueStats: statsResource.data, statsLoading,
     // Language & theme
     handleLanguageChange,
   };

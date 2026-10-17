@@ -1,12 +1,12 @@
 'use client';
 
-import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import {
   MessageSquare,
   CreditCard,
   Star,
   Loader2,
+  Clock,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import type { ProfileSmsWalletProps } from './profile-types';
@@ -19,10 +19,9 @@ const smsPacks = [
 ];
 
 export function ProfileSmsWallet({
-  smsCount,
-  purchasedSms,
   totalAvailable,
-  totalPercent,
+  purchasedSms,
+  pendingCount,
   smsPurchasing,
   smsPurchasingPackId,
   onPurchaseSms,
@@ -42,44 +41,30 @@ export function ProfileSmsWallet({
           </CardTitle>
         </CardHeader>
         <CardContent className="pt-0">
-          {/* SMS Usage Breakdown */}
+          {/* SMS balance — the server balance IS the total spendable amount
+              (purchased credits are merged into it on approval). */}
           <div className="bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-900/20 dark:to-teal-900/20 rounded-xl p-4 mb-4">
             <div className="flex items-center justify-between mb-3">
               <div>
                 <p className="text-2xl font-bold text-emerald-700 dark:text-emerald-400">{totalAvailable}</p>
                 <p className="text-xs text-muted-foreground mt-0.5">{t('totalSmsAvailable')}</p>
               </div>
-              {/* Circular progress indicator */}
-              <div className="relative h-14 w-14 flex-shrink-0">
-                <svg className="h-14 w-14 -rotate-90" viewBox="0 0 56 56">
-                  <circle cx="28" cy="28" r="24" className="fill-none stroke-emerald-100 dark:stroke-emerald-900/30" strokeWidth="4" />
-                  <circle
-                    cx="28" cy="28" r="24"
-                    className="fill-none stroke-emerald-500 stroke-linecap:round"
-                    strokeWidth="4"
-                    strokeDasharray={`${2 * Math.PI * 24}`}
-                    strokeDashoffset={`${2 * Math.PI * 24 * (1 - totalPercent / 100)}`}
-                    style={{ transition: 'stroke-dashoffset 1s ease-out' }}
-                  />
-                </svg>
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <span className="text-[10px] font-bold text-emerald-700 dark:text-emerald-400">{totalPercent}%</span>
-                </div>
+              <div className="h-12 w-12 rounded-2xl bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center flex-shrink-0">
+                <MessageSquare className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
               </div>
             </div>
-            {/* Usage breakdown rows */}
-            <div className="grid grid-cols-3 gap-2">
-              <div className="text-center p-2 rounded-lg bg-white/50 dark:bg-gray-900/30">
-                <p className="text-[10px] text-muted-foreground">{t('freeSmsCount')}</p>
-                <p className="text-sm font-bold text-emerald-700 dark:text-emerald-400">{smsCount}</p>
-              </div>
+            {/* Breakdown: lifetime purchased + pending approvals */}
+            <div className="grid grid-cols-2 gap-2">
               <div className="text-center p-2 rounded-lg bg-white/50 dark:bg-gray-900/30">
                 <p className="text-[10px] text-muted-foreground">{t('smsPurchased')}</p>
                 <p className="text-sm font-bold text-amber-700 dark:text-amber-400">{purchasedSms}</p>
               </div>
               <div className="text-center p-2 rounded-lg bg-white/50 dark:bg-gray-900/30">
-                <p className="text-[10px] text-muted-foreground">{t('noAnalyticsData') || 'Used'}</p>
-                <p className="text-sm font-bold text-rose-600 dark:text-rose-400">{Math.max(0, (smsCount + purchasedSms) - totalAvailable)}</p>
+                <p className="text-[10px] text-muted-foreground flex items-center justify-center gap-1">
+                  <Clock className="h-2.5 w-2.5" />
+                  {t('purchaseStatusPending')}
+                </p>
+                <p className={`text-sm font-bold ${pendingCount > 0 ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'}`}>{pendingCount}</p>
               </div>
             </div>
           </div>
@@ -103,7 +88,10 @@ export function ProfileSmsWallet({
                   }`}
                 >
                   {isBestValue && (
-                    <span className="absolute -top-2.5 start-1/2 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[10px] font-bold shadow-lg z-10 whitespace-nowrap">
+                    // Physical centering only (left-1/2 + -translate-x-1/2) —
+                    // the previous start-1/2 + left-1/2 combo over-constrained
+                    // the box in RTL and pushed the badge off the card.
+                    <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[10px] font-bold shadow-lg z-10 whitespace-nowrap">
                       <Star className="h-3 w-3 fill-white inline me-0.5" />
                       {t('bestValue')}
                     </span>

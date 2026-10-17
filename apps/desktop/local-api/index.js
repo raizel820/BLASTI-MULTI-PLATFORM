@@ -9156,6 +9156,167 @@ function createApp() {
   })
 
   // ═══════════════════════════════════════════════════════════════════════
+  // 13b-2. CHARGILY ONLINE PAYMENT (field report: "desktop app does not
+  // have chargily payment") — thin cloud-forwarding proxies.
+  //
+  // Chargily is CLOUD-NATIVE by design: the API keys live on the server, the
+  // hosted checkout page and the webhook settlement run on the VPS, and a
+  // localhost desktop cannot receive webhooks (the cloud's poll fallback
+  // already compensates). But the webapp's ApiClient is pinned to
+  // 127.0.0.1:3080 inside Electron, so the subscription page's
+  // fetchPaymentSettings() → GET /api/payment-settings 404'd, which forced
+  // chargilyEnabled=false and hid the EDAHABIA/CIB cards entirely; and
+  // POST /api/payment/create-checkout would have 404'd too. Same proxy
+  // contract as the /api/agency/subscription/* routes above: forward to the
+  // cloud with the SAME session token requireAuth() validated, pass the
+  // status/body verbatim, 503 CLOUD_UNREACHABLE when offline. The desktop
+  // opens the hosted page in the system browser (setWindowOpenHandler) and
+  // the payment-result view polls checkout/:id through the proxy below —
+  // settlement state flows back without any local payment writes.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // GET /api/payment-settings — public availability flags (mirrors cloud
+  // payment-settings.ts GET '/'). Drives {chargilyOnline && …} rendering.
+  app.get('/api/payment-settings', async (c) => {
+    try {
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/payment-settings', {
+          headers: {
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          signal: AbortSignal.timeout(15000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] payment-settings proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Payment settings require an internet connection.',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] payment-settings proxy error:', error)
+      return c.json({ success: false, error: 'Failed to load payment settings' }, 500)
+    }
+  })
+
+  // POST /api/payment/create-checkout — create a hosted Chargily checkout
+  // (subscription / SMS pack / hardware). The cloud creates the PENDING
+  // Transaction/SmsPurchase/HardwareOrder records and returns the checkout
+  // URL; the regular sync engine pulls the pending rows down.
+  app.post('/api/payment/create-checkout', authMiddleware, async (c) => {
+    try {
+      let body = null
+      try { body = await c.req.json() } catch { body = null }
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/payment/create-checkout', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: JSON.stringify(body || {}),
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] create-checkout proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Online payment requires an internet connection. Please connect and try again.',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) {
+        // Pull the cloud-created PENDING transaction + subscription state down
+        // immediately so the subscription page reflects "pending payment".
+        try { if (fileSync) fileSync.schedule('chargily-checkout-created') } catch { /* non-fatal */ }
+        try {
+          const syncService = require('./sync-service')
+          if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+        } catch { /* non-fatal */ }
+      }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] create-checkout proxy error:', error)
+      return c.json({ success: false, error: 'Failed to create the payment session' }, 500)
+    }
+  })
+
+  // GET /api/payment/checkout/:id — poll a checkout's settlement state
+  // (cloud payment-checkout.ts GET /checkout/:id; the poll fallback that
+  // settles payments even without a webhook). Used by the payment-result
+  // view after the user returns from the hosted page.
+  app.get('/api/payment/checkout/:id', authMiddleware, async (c) => {
+    try {
+      const checkoutId = c.req.param('id')
+      if (!checkoutId || !/^[a-zA-Z0-9_-]+$/.test(checkoutId)) {
+        return c.json({ success: false, error: 'Invalid checkout id' }, 400)
+      }
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + `/api/payment/checkout/${encodeURIComponent(checkoutId)}`, {
+          headers: {
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          signal: AbortSignal.timeout(20000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] checkout-status proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Checking the payment status requires an internet connection.',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) {
+        try { if (fileSync) fileSync.schedule('chargily-checkout-settled') } catch { /* non-fatal */ }
+      }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] checkout-status proxy error:', error)
+      return c.json({ success: false, error: 'Failed to check the payment status' }, 500)
+    }
+  })
+
+  // GET /api/payment/pending — latest pending checkout for the caller
+  // (fallback when localStorage is unavailable in the shell).
+  app.get('/api/payment/pending', authMiddleware, async (c) => {
+    try {
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/payment/pending', {
+          headers: {
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          signal: AbortSignal.timeout(20000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] payment-pending proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Checking the payment status requires an internet connection.',
+          code: 'CLOUD_UNREACHABLE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] payment-pending proxy error:', error)
+      return c.json({ success: false, error: 'Failed to load the pending payment' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
   // 13c. TRANSACTIONS / HARDWARE / ENTERPRISE REQUEST (Task 2-d)
   //
   // Cloud-parity gap routes ported LOCAL-FIRST from apps/api/src/routes:
@@ -10586,7 +10747,15 @@ function createApp() {
   app.get('/api/sync/initial-sync/status', async (c) => {
     try {
       const { checkInitialSyncStatus, getInitialSyncSnapshot } = require('./initial-sync')
-      const agencyId = sessionUser?.agencyId || c.req.query('agencyId') || null
+      const queryAgencyId = c.req.query('agencyId') || null
+      const agencyId = sessionUser?.agencyId || queryAgencyId || null
+      // Field report (post-registration flow): a freshly-registered agency
+      // owner has NO agencyId. The old response reported state 'UNKNOWN'
+      // for that case, which the PostLoginSyncGate rendered as
+      // "preparing → failed after 75s" on top of the create-agency wizard.
+      // Report an explicit NO_AGENCY state so the gate can dismiss and let
+      // the agency-creation phase own the screen (webapp parity).
+      const hasAgency = !!(sessionUser?.agencyId || queryAgencyId)
 
       let state = null
       if (db && agencyId) {
@@ -10635,7 +10804,10 @@ function createApp() {
         serverTime: new Date().toISOString(),
         sessionActive: !!sessionToken,
         agencyId,
-        state: state?.status || (snapshot.active ? 'INITIALIZING' : 'UNKNOWN'),
+        // NO_AGENCY: the session user has no agency yet (fresh registration)
+        // — nothing to import, the gate must not show.
+        state: state?.status || (snapshot.active ? 'INITIALIZING' : hasAgency ? 'UNKNOWN' : 'NO_AGENCY'),
+        hasAgency,
         needsInitialSync: state ? !!state.needsInitialSync : null,
         lastError: state?.lastError || null,
         active: snapshot.active,

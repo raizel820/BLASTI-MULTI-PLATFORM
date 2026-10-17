@@ -5,7 +5,7 @@ import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useUpload } from '@/hooks/use-upload';
-import { getProxiedUrl } from '@/lib/utils';
+import { registerAvatarOverrideFromFile } from '@/lib/avatar-override';
 import { setNativeSessionToken } from '@/lib/api-client';
 import { usePlatform } from '@/hooks/use-platform';
 import { Button } from '@/components/ui/button';
@@ -487,7 +487,12 @@ export function RegisterForm() {
     onSuccess: (result) => {
       uploadedAvatarUrlRef.current = result.url;
       setSelectedPreset(null);
-      setAvatarPreview(getProxiedUrl(result.url));
+      // Keep the LOCAL object-URL preview authoritative (same fix as the
+      // mobile wizard): swapping it for the freshly-uploaded remote URL made
+      // the preview depend on a brand-new cross-origin image fetch with no
+      // error recovery — one failed load = placeholder until account
+      // creation. Every upload path sets the local preview before calling
+      // upload(), so nothing needs to change here on success.
       toast.success(t('avatarUpdated' as any));
     },
     onError: (error) => {
@@ -515,7 +520,12 @@ export function RegisterForm() {
     uploadedAvatarUrlRef.current = null;
     setAvatarPreview(URL.createObjectURL(file));
     const result = await avatarUpload.upload(file);
-    if (result?.url) uploadedAvatarUrlRef.current = result.url;
+    if (result?.url) {
+      uploadedAvatarUrlRef.current = result.url;
+      // Session-scoped override: after account creation UserAvatar renders
+      // these local bytes instantly instead of re-fetching the new URL.
+      void registerAvatarOverrideFromFile(result.url, file);
+    }
   };
 
   // Task 23: pick a preset profile icon instead of uploading a photo.

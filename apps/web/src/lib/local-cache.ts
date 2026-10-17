@@ -17,6 +17,16 @@
  *    The caller always gets a synchronous-feeling first paint.
  *  - Cache is READ-ONLY safe offline: network failure with a cached value
  *    still returns the cached data (flagged `stale`) instead of an error.
+ *
+ * Task 85 (caching overhaul):
+ *  - A synchronous MEMORY layer now fronts IndexedDB. Views remount on every
+ *    tab switch in this hash-SPA — with the memory layer `cachePeek` gives
+ *    callers a same-render answer, so they can paint instantly (previously
+ *    every read paid an IndexedDB round-trip even within one session).
+ *  - `cachedFetch` now honors `ttlMs`: when a cache entry is FRESHER than the
+ *    TTL the network is not touched at all (returning `fromCache: true,
+ *    stale: false`). When absent/stale it revalidates and refreshes the
+ *    cache. This makes repeat navigation genuinely free.
  */
 
 const DB_NAME = 'blasti-local-cache';
@@ -26,6 +36,42 @@ const STORE_NAME = 'responses';
 interface CacheEntry {
   data: unknown;
   cachedAt: number;
+}
+
+// ─── Memory layer (synchronous, survives view switches) ──────────────────
+
+const MAX_MEM_ENTRIES = 120;
+const memCache = new Map<string, CacheEntry>();
+
+function memSet(key: string, entry: CacheEntry): void {
+  // Re-insert to keep Map iteration order = recency order (LRU).
+  memCache.delete(key);
+  memCache.set(key, entry);
+  while (memCache.size > MAX_MEM_ENTRIES) {
+    const oldestKey = memCache.keys().next().value as string | undefined;
+    if (oldestKey === undefined) break;
+    memCache.delete(oldestKey);
+  }
+}
+
+/**
+ * Synchronous memory-only read. Use during render for instant first paint
+ * (e.g. seeding view state from the previous session's data without any
+ * IndexedDB round-trip). Returns null when the entry was never seen in this
+ * JS session (a fresh app boot) — fall back to `cacheGet` (async).
+ */
+export function cachePeek<T>(key: string): { data: T; cachedAt: number } | null {
+  if (typeof window === 'undefined') return null;
+  const entry = memCache.get(key);
+  if (!entry) return null;
+  // Refresh recency without mutating cachedAt.
+  memCache.delete(key);
+  memCache.set(key, entry);
+  return { data: entry.data as T, cachedAt: entry.cachedAt };
+}
+
+export function isCacheFresh(cachedAt: number, ttlMs: number): boolean {
+  return cachedAt > 0 && Date.now() - cachedAt < ttlMs;
 }
 
 // ─── IndexedDB plumbing ───────────────────────────────────────────────────────
@@ -113,11 +159,15 @@ function lsSet(key: string, entry: CacheEntry): void {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-/** Read a cached payload. Returns null when absent or unreadable. */
+/** Read a cached payload (memory → IndexedDB → localStorage). */
 export async function cacheGet<T>(key: string): Promise<{ data: T; cachedAt: number } | null> {
   if (typeof window === 'undefined') return null;
+  const mem = cachePeek<T>(key);
+  if (mem) return mem;
   const entry = (await idbGet(key)) ?? lsGet(key);
   if (!entry) return null;
+  // Re-hydrate the memory layer so later synchronous reads hit it.
+  memSet(key, entry);
   return { data: entry.data as T, cachedAt: entry.cachedAt };
 }
 
@@ -125,6 +175,7 @@ export async function cacheGet<T>(key: string): Promise<{ data: T; cachedAt: num
 export async function cacheSet(key: string, data: unknown): Promise<void> {
   if (typeof window === 'undefined') return;
   const entry: CacheEntry = { data, cachedAt: Date.now() };
+  memSet(key, entry);
   await idbSet(key, entry);
   lsSet(key, entry); // belt & suspenders: cheap mirror for tiny payloads
 }
@@ -132,6 +183,7 @@ export async function cacheSet(key: string, data: unknown): Promise<void> {
 /** Drop one cache entry (used after mutations that invalidate a list). */
 export async function cacheRemove(key: string): Promise<void> {
   if (typeof window === 'undefined') return;
+  memCache.delete(key);
   try {
     const db = await openDb();
     if (db) {
@@ -143,6 +195,35 @@ export async function cacheRemove(key: string): Promise<void> {
   }
   try {
     localStorage.removeItem(lsKey(key));
+  } catch {
+    // non-fatal
+  }
+}
+
+/**
+ * Clear the whole data cache (memory + IndexedDB + localStorage mirror).
+ * Called on logout so one account's cached payloads never leak into the
+ * next session's first paint.
+ */
+export async function clearDataCache(): Promise<void> {
+  if (typeof window === 'undefined') return;
+  memCache.clear();
+  try {
+    const db = await openDb();
+    if (db) {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).clear();
+    }
+  } catch {
+    // non-fatal
+  }
+  try {
+    const staleKeys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k?.startsWith('blasti-cache:')) staleKeys.push(k);
+    }
+    for (const k of staleKeys) localStorage.removeItem(k);
   } catch {
     // non-fatal
   }
@@ -183,12 +264,19 @@ export async function cachedFetch<T>(
   path: string,
   opts?: {
     params?: Record<string, string>;
+    /** When the cached entry is fresher than this, skip the network entirely (default: always revalidate). */
     ttlMs?: number;
     apiFetch?: typeof import('./api-fetch').apiFetch;
   },
 ): Promise<CachedFetchResult<T>> {
   const key = cacheKeyFor(path, opts?.params);
   const cached = await cacheGet<T>(key);
+
+  // Fresh-enough entry: answer WITHOUT touching the network. This is what
+  // makes flipping back and forth between tabs feel instant.
+  if (cached && opts?.ttlMs && isCacheFresh(cached.cachedAt, opts.ttlMs)) {
+    return { data: cached.data, fromCache: true, stale: false };
+  }
 
   // Dynamic import keeps this module importable from anywhere without cycles.
   const { apiFetch } = opts?.apiFetch

@@ -12,6 +12,8 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { ErrorState } from '@/components/shared/error-state';
 import { EmptyState } from '@/components/shared/empty-state';
 import { diag, diagDump } from '@/lib/diag-log';
+// Task 85 — stale-while-revalidate cache: instant paint on remount
+import { cacheGet, cacheSet, isCacheFresh } from '@/lib/local-cache';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -266,6 +268,15 @@ export function AgencyDashboard() {
   const agencyId = user?.agencyId || '';
   const realtime = useRealtime();
 
+  // ─── Task 85: dashboard cache (instant paint on remount) ───
+  // Seeds the previous visit's data before the network round-trip so tab
+  // switches never flash skeletons. Seed freshness is gated to 5 minutes —
+  // stale queue lists could mislead staff actions.
+  const DASH_CACHE_TTL_MS = 5 * 60_000;
+  const dashKey = (section: string) => `/api/agency/${section}?agencyId=${encodeURIComponent(agencyId)}`;
+  const didSeedRef = useRef(false);
+  const seededAnyRef = useRef(false);
+
   // Task 31 bug 5: paid/queue feature gate — ACTIVE|TRIAL, undefined (pre-fetch)
   // stays unlocked; the server still enforces the authoritative 403 gate.
   const queueLocked = !isSubscriptionActive(stats?.subscriptionStatus);
@@ -316,6 +327,35 @@ export function AgencyDashboard() {
     setFetchError(false);
     const fetchStartedAt = Date.now();
     let willAutoRetry = false;
+
+    // Task 85 — one-shot per mount: paint from cache before the network.
+    if (!didSeedRef.current) {
+      didSeedRef.current = true;
+      try {
+        const [cStats, cQueue, cServices] = await Promise.all([
+          cacheGet<DashboardStats>(dashKey('stats')),
+          cacheGet<{ entries?: QueueEntry[] }>(dashKey('queue')),
+          cacheGet<{ services?: ServiceStat[] }>(dashKey('services')),
+        ]);
+        if (cStats && isCacheFresh(cStats.cachedAt, DASH_CACHE_TTL_MS)) { setStats(cStats.data); seededAnyRef.current = true; }
+        if (cQueue?.data?.entries && isCacheFresh(cQueue.cachedAt, DASH_CACHE_TTL_MS)) { setWaitingList(cQueue.data.entries); seededAnyRef.current = true; }
+        if (cServices?.data?.services && isCacheFresh(cServices.cachedAt, DASH_CACHE_TTL_MS)) {
+          setServiceStats(
+            cServices.data.services.map((s: ServiceStat) => ({
+              ...s,
+              waitingCount: s._count?.waiting ?? 0,
+              completedCount: s._count?.completed ?? 0,
+            }))
+          );
+          seededAnyRef.current = true;
+        }
+        if (seededAnyRef.current) {
+          setLastUpdated(new Date());
+          setLoading(false);
+        }
+      } catch { /* non-fatal */ }
+    }
+
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
 
@@ -386,6 +426,11 @@ export function AgencyDashboard() {
           toast.error(t('error'));
           pollErrorShownRef.current = true;
         }
+        // Task 85 — with freshly-seeded cached content on screen, keep it
+        // instead of replacing it with the error UI; the poll retries soon.
+        if (seededAnyRef.current) {
+          return;
+        }
         return;
       }
 
@@ -393,10 +438,12 @@ export function AgencyDashboard() {
       if (statsRes?.ok) {
         const data = await statsRes.json();
         setStats(data);
+        void cacheSet(dashKey('stats'), data);
       }
       if (listRes?.ok) {
         const data = await listRes.json();
         setWaitingList(data.entries ?? []);
+        void cacheSet(dashKey('queue'), data);
       }
       if (servicesRes?.ok) {
         const data = await servicesRes.json();
@@ -408,6 +455,7 @@ export function AgencyDashboard() {
               completedCount: s._count?.completed ?? 0,
             }))
           );
+          void cacheSet(dashKey('services'), data);
         }
       }
       setLastUpdated(new Date());
@@ -558,6 +606,9 @@ export function AgencyDashboard() {
 
   // Adaptive polling: starts at 10s, backs off to 30s on 429 rate limits
   useEffect(() => {
+    // Account/agency switch — reset the one-shot cache seeding.
+    didSeedRef.current = false;
+    seededAnyRef.current = false;
     fetchData();
     fetchAgencyCode();
 

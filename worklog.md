@@ -4932,3 +4932,51 @@ Work Log:
 Stage Summary:
 - Committed 1d7fe9c (38 files, +4059/-313). No one can call tickets without (a) a counter existing and (b) controlling one — owners included; claim conflicts are atomic; handover needs the holder's approval or owner/manager override; control dies with the session (logout/pagehide/app-close/sweeper); counters can be restricted to specific services while counters sharing a service share the same queue; per-branch counters capped by plan.
 - Deployment: API + web deploy as usual; desktop needs an installer rebuild (local-api bundle + prisma client); mobile picks everything up via the next web export build (no native changes).
+
+---
+Task ID: Feature-D
+Agent: Z.ai Code (main)
+Task: Field-report round — mobile avatar preview, lockscreen notification permission, desktop fullscreen claim UI, management UI overhaul, desktop post-registration sync gate, desktop Chargily payment
+
+Work Log:
+- mobile-register.tsx + register-form.tsx: kept the LOCAL camera/blob preview authoritative through the wizard (onSuccess no longer swaps it for the brand-new remote URL that a raw <img> cannot reliably load inside the Capacitor WebView) + registerAvatarOverrideFromFile so post-creation UserAvatar renders local bytes instantly + img onError fallbacks.
+- push-registration.ts: POST_NOTIFICATIONS permission is now requested INDEPENDENTLY of Firebase readiness (registerIfPermitted skipRegister option) — the native lockscreen path never needed Firebase, but on Android 13+ it silently dropped when the old code returned before any permission request.
+- agency-fullscreen.tsx: explicit "Claim counter" header button + glanceable counter control strip (per-counter Claim / Request control / Select) + removed orphan queue/setQueue dead state.
+- agency-branches.tsx: counter rows rebuilt (identity + actions zones), staff-assignment Select now shows the assignee name with a real trigger (was a bare 32px icon), un-scaled the Switch, labeled release/force-release/edit/delete buttons, widened branch dialog to sm:max-w-2xl with 3-col names, counter dialog sm:max-w-xl with grid layout + boxed service chips.
+- agency-employees.tsx: labeled action buttons with Radix tooltips (were icon-only 32px), granted-authorities count badge with tooltip breakdown, create dialog sm:max-w-lg with 2-col grids.
+- counter-management.tsx: per-counter Claim button (was only global claim-first-free), relaxed name/branch truncation caps, labeled release buttons.
+- i18n ar/en/fr: added activate, deactivate, authoritiesCount.
+- Desktop main.js: _runInitialSyncFromSessionInner skips when session has no agencyId (fresh owner registration no longer triggers a doomed initial sync).
+- Desktop local-api/index.js: initial-sync/status reports state NO_AGENCY (+hasAgency) for agency-less sessions; added Chargily cloud-forwarding proxies (GET /api/payment-settings, POST /api/payment/create-checkout, GET /api/payment/checkout/:id, GET /api/payment/pending) mirroring the subscription/pay proxy contract.
+- post-login-sync-gate.tsx: userHasAgency guard (gate never shows before the agency exists; effect re-runs on agency creation), NO_AGENCY state handled.
+- counter-release.ts: web branch of getApiBaseUrlSafe returns the cloud API base (the old relative '' hit the Next server and 404'd since the /api proxy was removed).
+
+Stage Summary:
+- E2E verified (agent-browser + curl): NO_AGENCY status endpoint, payment-settings proxy forwards (chargilyEnabled JSON), create-checkout route 401-gated, fullscreen claim button + counter strip claim/release round-trip 200s, staff combobox shows text, counter dialog 576px, dashboard/branches/employees/subscription render. Web lint 0 errors; desktop node --check OK; local-api suites 4/5 (1 pre-existing sync-engine flake); tsc error count unchanged (424 pre-existing, 0 new).
+
+---
+Task ID: 9
+Agent: main (Z.ai Code)
+Task: Fix dark/light mode contrast mismatches, Arabic/English RTL UI mismatches, SMS wallet counting logic, and implement a solid caching system for smooth navigation
+
+Work Log:
+- Root-caused the RTL star badge bug: Tailwind v4 `translate-x` is PHYSICAL (verified via the tailwindcss compile API — no RTL flip), so `start-1/2 -translate-x-1/2` over-constrains boxes in RTL (right:50% wins over left:50% then translates the wrong way). The best-offer badge had BOTH start-1/2 and left-1/2 — off the card by a full badge width in Arabic.
+- Fixed 16 RTL mis-centering sites: profile-sms-wallet + profile/notification-prefs badges, empty-state, payment-result, waiting-list, QueueEmptyState, customer-home, customer-queue, landing-page, hero-section (start-1/2 → left-1/2); QueueReservationCard perforation dots got rtl:translate overrides to straddle the correct edge in both directions.
+- Root-caused the SMS total double-count: server merges approved purchases INTO freeSmsCount (sms.ts:170, chargily-fulfill.ts:350), but the UI computed totalAvailable = freeSmsCount + lifetimePurchased → 10 free + 200 bought displayed ~410. Old toast also read data.newBalance which never exists, and handlePurchaseSms optimistically inflated purchasedSms before approval.
+- Rewrote the wallet UI (profile-sms-wallet.tsx + profile/notification-prefs.tsx): big number = server balance, breakdown shows lifetime purchased + pending-approval count, REMOVED the percentage ring entirely (user request), removed the dead "Used" cell (always 0). Removed totalPercent from props/types.
+- E2E-verified the purchase flow via API: purchase(200) → PENDING (totalPurchased 0, pendingCount 1) → admin approve → freeSmsCount 210, totalPurchased 200 — then restored test data.
+- staff-permissions-editor.tsx had ZERO dark: variants (white preset buttons + gray-on-gray rows) — added full dark-mode coverage to all chips/rows/toggles/knobs.
+- Caching system (Task 85): new lib/image-cache.ts (memory Map + IndexedDB LRU ≤150 entries, data-URL storage, canonical key stripping ?r= busters, captureImage() fetch+persist), integrated into UserAvatar (synchronous memory paint → IDB hydration → network; onLoad captures bytes; bg-muted disc placeholder).
+- Upgraded lib/local-cache.ts: synchronous memory layer (LRU 120) fronting IndexedDB, cachePeek() for render-phase reads, real ttlMs support in cachedFetch (fresh entry = zero network), clearDataCache().
+- New lib/use-cached-data.ts: stale-while-revalidate hook with module-level in-flight dedupe; applied to the profile page (profile/stats/purchase-history via use-profile-data.ts rewrite — states seeded from cache, network-only mergeSessionUser, invalidate() after mutations).
+- Agency dashboards seed from cache before the network round-trip: agency-dashboard.tsx (stats/queue/services, 5-min seed freshness gate, keeps cached view instead of error UI when seeded) + SimpleMobileDashboard.tsx (stats).
+- Logout now clears both caches (no cross-account data/image leaks). Wired the dead customer-sms-wallet route (previously fell through to LandingPage) to CustomerProfile.
+- Browser-verified end-to-end: star badge offset 200/200px in Arabic RTL and 199/199px in English LTR (exactly centered); dark dashboard/profile/permissions-editor/staff-create all readable; light dashboard/home/profile readable; remounting profile within TTL fires ZERO /api/user/profile|stats|sms/purchase requests and still renders balance; uploaded avatar captured into blasti-image-cache IndexedDB and remounts render the data-URL with 0 network fetches.
+- Cleaned all test data (custwallet, custwallet2, testperm user + staff row + uploaded file + verification codes + notifications).
+
+Stage Summary:
+- Commit 96f468f (patch: download/0008-fix-theme-rtl-sms-caching-dark-light-contrast.patch)
+- SMS wallet math fixed at the model level: total = server balance; purchased shown as lifetime total + pending count; percentage UI removed per request
+- Best-offer star + 15 other components now center identically in Arabic and English (Tailwind translate is physical; logical centering needs left-1/2, not start-1/2)
+- Navigation is now instant: avatars paint from persistent data-URL cache with zero refetch, view data paints from memory-layer SWR cache with zero skeleton flash, both caches cleared on logout
+- Desktop/mobile inherit every fix (they run the same web bundle)

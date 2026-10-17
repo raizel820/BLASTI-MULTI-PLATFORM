@@ -27,7 +27,7 @@ import { apiFetch } from '@/lib/api-fetch';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useUpload } from '@/hooks/use-upload';
-import { getProxiedUrl } from '@/lib/utils';
+import { registerAvatarOverrideFromFile } from '@/lib/avatar-override';
 import { setNativeSessionToken } from '@/lib/api-client';
 import { usePlatform } from '@/hooks/use-platform';
 import { nativeBridge } from '@/lib/native-bridge';
@@ -233,7 +233,16 @@ export function MobileRegisterForm() {
     onSuccess: (result) => {
       uploadedAvatarUrlRef.current = result.url;
       setSelectedPreset(null);
-      setAvatarPreview(getProxiedUrl(result.url));
+      // Mobile field report fix: do NOT swap avatarPreview to the freshly-
+      // uploaded REMOTE URL here. Inside the Capacitor WebView that
+      // cross-origin URL is rendered by a raw <img> with zero error
+      // recovery — one failed image load flipped the preview back to the
+      // placeholder for the rest of the wizard (the photo only "came back"
+      // after account creation because UserAvatar renders through the
+      // hardened useAvatarSrc pipeline). The LOCAL preview set by the pick
+      // handlers (camera data: URL / blob: URL) is guaranteed-displayable
+      // and stays authoritative for the whole wizard — every upload path
+      // sets it before calling upload(), so it is always present here.
       toast.success(t('avatarUpdated' as any));
     },
     onError: (error) => {
@@ -266,7 +275,14 @@ export function MobileRegisterForm() {
       const blob = await (await fetch(dataUrl)).blob();
       const file = new File([blob], `avatar-${Date.now()}.jpg`, { type: blob.type || 'image/jpeg' });
       const result = await avatarUpload.upload(file);
-      if (result?.url) uploadedAvatarUrlRef.current = result.url;
+      if (result?.url) {
+        uploadedAvatarUrlRef.current = result.url;
+        // Session-scoped override: once the account exists, UserAvatar
+        // renders these very local bytes INSTANTLY instead of gambling on
+        // a first-ever cross-origin fetch of the brand-new URL inside the
+        // WebView (the exact failure that produced the placeholder).
+        void registerAvatarOverrideFromFile(result.url, file);
+      }
     } catch {
       toast.error(copy.cameraUnavailable);
     }
@@ -279,7 +295,11 @@ export function MobileRegisterForm() {
     uploadedAvatarUrlRef.current = null;
     setAvatarPreview(URL.createObjectURL(file));
     const result = await avatarUpload.upload(file);
-    if (result?.url) uploadedAvatarUrlRef.current = result.url;
+    if (result?.url) {
+      uploadedAvatarUrlRef.current = result.url;
+      // Same session override as the native-camera path above.
+      void registerAvatarOverrideFromFile(result.url, file);
+    }
     // Allow re-picking the same file
     e.target.value = '';
   };
@@ -614,6 +634,13 @@ export function MobileRegisterForm() {
                             <img
                               src={avatarPreview}
                               alt="Avatar"
+                              onError={() => {
+                                // Last-resort guard: a failed preview (never
+                                // expected for local data:/blob: URLs) must
+                                // fall back to the picker, never sit as a
+                                // broken/empty circle that reads as a bug.
+                                setAvatarPreview(null);
+                              }}
                               className="h-20 w-20 rounded-full object-cover border-2 border-emerald-300 dark:border-emerald-700 shadow-md"
                             />
                             {avatarUpload.uploading && (
@@ -953,7 +980,12 @@ export function MobileRegisterForm() {
                       className="h-16 w-16 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-lg"
                     >
                       {avatarPreview ? (
-                        <img src={avatarPreview} alt="Avatar" className="h-full w-full rounded-full object-cover" />
+                        <img
+                          src={avatarPreview}
+                          alt="Avatar"
+                          onError={() => setAvatarPreview(null)}
+                          className="h-full w-full rounded-full object-cover"
+                        />
                       ) : (
                         <UserRound className="h-8 w-8 text-white" />
                       )}

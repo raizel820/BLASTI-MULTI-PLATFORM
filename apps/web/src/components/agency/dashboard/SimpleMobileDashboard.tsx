@@ -15,6 +15,8 @@ import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
+// Task 85 — stale-while-revalidate cache: instant paint on remount
+import { cacheGet, cacheSet, isCacheFresh } from '@/lib/local-cache';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -185,11 +187,39 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
     }
   }, [soundEnabled]);
 
-  // ─── Data Fetching ───────────────────────────────────────────────────
+  // ─── Data Fetching ─────────────────────────────────────────────────────
+  const DASH_CACHE_TTL_MS = 5 * 60_000;
+  const statsCacheKey = `/api/agency/stats?agencyId=${encodeURIComponent(agencyId)}`;
+  const didSeedRef = useRef(false);
+
   const fetchData = useCallback(async (showRefreshing = false, isPoll = false) => {
     if (!agencyId) return;
 
     if (showRefreshing) setRefreshing(true);
+
+    // Task 85 — one-shot per mount: paint the previous visit's numbers before
+    // the network round-trip (no skeleton flash when flipping back to this
+    // tab). The fetch below still revalidates.
+    if (!isPoll && !didSeedRef.current) {
+      didSeedRef.current = true;
+      try {
+        const cStats = await cacheGet<QueueStats>(statsCacheKey);
+        if (cStats && isCacheFresh(cStats.cachedAt, DASH_CACHE_TTL_MS)) {
+          setStats({
+            currentlyWaiting: cStats.data.currentlyWaiting ?? 0,
+            servedToday: cStats.data.servedToday ?? 0,
+            avgWaitTime: cStats.data.avgWaitTime ?? 0,
+            currentQueueNumber: cStats.data.currentQueueNumber ?? '—',
+            isPaused: cStats.data.isPaused ?? false,
+            noShowCount: cStats.data.noShowCount ?? 0,
+            todayReservations: cStats.data.todayReservations ?? 0,
+            subscriptionStatus: cStats.data.subscriptionStatus,
+          });
+          setLastUpdated(new Date());
+          setLoading(false);
+        }
+      } catch { /* non-fatal */ }
+    }
 
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
@@ -210,6 +240,7 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
           todayReservations: data.todayReservations ?? 0,
           subscriptionStatus: data.subscriptionStatus,
         });
+        void cacheSet(statsCacheKey, data);
       }
 
       if (queueRes.ok) {

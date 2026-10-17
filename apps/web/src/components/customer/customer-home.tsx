@@ -1356,7 +1356,7 @@ function EmptyAgenciesState({ searchQuery, hasCategoryFilter, t, onClear, onExpl
         <motion.div
           animate={{ scale: [1, 1.15, 1], opacity: [0.15, 0.05, 0.15] }}
           transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
-          className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full bg-emerald-200 dark:bg-emerald-800"
+          className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full bg-emerald-200 dark:bg-emerald-800"
         />
         <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-100 to-teal-50 dark:from-emerald-900/30 dark:to-teal-900/20 ring-1 ring-emerald-200/60 dark:ring-emerald-800/60">
           {searchQuery.trim() ? (

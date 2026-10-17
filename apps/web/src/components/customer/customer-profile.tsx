@@ -241,7 +241,7 @@ export function CustomerProfile() {
           smsCount={profile.smsCount}
           purchasedSms={profile.purchasedSms}
           totalAvailable={profile.totalAvailable}
-          totalPercent={profile.totalPercent}
+          pendingCount={profile.smsStatsData.pendingCount}
           smsPurchasing={profile.smsPurchasing}
           smsPurchasingPackId={profile.smsPurchasingPackId}
           onPurchaseSms={(packId) => setSmsBuyPackId(packId)}

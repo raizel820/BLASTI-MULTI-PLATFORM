@@ -117,7 +117,7 @@ function PhoneMockup() {
           {/* Screen */}
           <div className="w-full h-full rounded-[2rem] bg-gradient-to-b from-emerald-50 to-white dark:from-gray-900 dark:to-gray-950 overflow-hidden relative">
             {/* Notch */}
-            <div className="absolute top-0 start-1/2 -translate-x-1/2 w-20 h-5 bg-gray-800 dark:bg-gray-700 rounded-b-2xl z-10" />
+            <div className="absolute top-0 left-1/2 -translate-x-1/2 w-20 h-5 bg-gray-800 dark:bg-gray-700 rounded-b-2xl z-10" />
             
             {/* Status bar */}
             <div className="h-10 flex items-end justify-center pb-1">
@@ -327,7 +327,7 @@ function HeroParticles({ compact = false }: { compact?: boolean }) {
             transition={{ duration: 18, repeat: Infinity, ease: 'easeInOut', delay: 3 }}
           />
           <motion.div
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 rounded-full bg-cyan-300/8 dark:bg-emerald-600/4 blur-3xl"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 rounded-full bg-cyan-300/8 dark:bg-emerald-600/4 blur-3xl"
             animate={{ scale: [1, 1.25, 0.9, 1.15, 1], opacity: [0.06, 0.12, 0.06, 0.1, 0.06] }}
             transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
           />
@@ -499,7 +499,7 @@ export function LandingPage() {
             <motion.div
               animate={{ scale: [1, 1.2, 1] }}
               transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut' }}
-              className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-emerald-300/10 dark:bg-emerald-700/5 rounded-full blur-3xl"
+              className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-emerald-300/10 dark:bg-emerald-700/5 rounded-full blur-3xl"
             />
             {/* Additional mesh layer: cyan blob */}
             <motion.div

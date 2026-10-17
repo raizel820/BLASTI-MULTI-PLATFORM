@@ -789,6 +789,14 @@ export const useAppStore = create<AppState>()(
         // NOTE: the revoked flag is deliberately NOT cleared here — only a
         // successful login (setSessionToken → clearRevoked) recovers it.
         syncEngine.clearSyncCursor();
+        // Task 85 — drop cached view data + images: the next login may be a
+        // different account and cached payloads must never leak across it.
+        import('@/lib/local-cache')
+          .then((m) => m.clearDataCache())
+          .catch(() => { /* ignore */ });
+        import('@/lib/image-cache')
+          .then((m) => m.clearImageCache())
+          .catch(() => { /* ignore */ });
         // Clear persisted storage AFTER set (persist middleware writes during set)
         // Also call the Hono backend logout endpoint to clear the JWT session cookie
         setTimeout(() => {

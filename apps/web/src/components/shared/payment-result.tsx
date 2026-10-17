@@ -373,7 +373,7 @@ export function PaymentResult() {
           <motion.div
             animate={{ scale: [1, 1.12, 1], opacity: [0.15, 0.05, 0.15] }}
             transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full bg-emerald-300 dark:bg-emerald-800"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full bg-emerald-300 dark:bg-emerald-800"
           />
           <div className="relative h-20 w-20 rounded-3xl bg-gradient-to-br from-emerald-100 to-teal-50 dark:from-emerald-900/30 dark:to-teal-900/20 flex items-center justify-center">
             <Loader2 className="h-10 w-10 animate-spin text-emerald-600 dark:text-emerald-400" />
@@ -392,7 +392,7 @@ export function PaymentResult() {
           <motion.div
             animate={{ scale: [1, 1.2, 1], opacity: [0.18, 0.04, 0.18] }}
             transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-emerald-300 dark:bg-emerald-800"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-emerald-300 dark:bg-emerald-800"
           />
           <CheckCircle2 className="relative h-20 w-20 text-emerald-500 dark:text-emerald-400" />
         </motion.div>
@@ -431,7 +431,7 @@ export function PaymentResult() {
           <motion.div
             animate={{ scale: [1, 1.15, 1], opacity: [0.16, 0.05, 0.16] }}
             transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-amber-300 dark:bg-amber-700"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-amber-300 dark:bg-amber-700"
           />
           <HelpCircle className="relative h-20 w-20 text-amber-500 dark:text-amber-400" />
         </motion.div>

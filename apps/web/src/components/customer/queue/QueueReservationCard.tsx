@@ -191,10 +191,10 @@ export function QueueReservationCard({
           />
         </svg>
 
-        {/* Left perforation circle */}
-        <div className="absolute start-0 top-1/2 -translate-y-1/2 -translate-x-1/2 h-3 w-3 sm:h-4 sm:w-4 rounded-full bg-gradient-to-br from-emerald-50 via-white to-teal-50 dark:from-gray-950 dark:via-gray-900 dark:to-emerald-950/20 z-10 shadow-inner" />
-        {/* Right perforation circle */}
-        <div className="absolute end-0 top-1/2 -translate-y-1/2 translate-x-1/2 h-3 w-3 sm:h-4 sm:w-4 rounded-full bg-gradient-to-br from-emerald-50 via-white to-teal-50 dark:from-gray-950 dark:via-gray-900 dark:to-emerald-950/20 z-10 shadow-inner" />
+        {/* Start perforation circle — straddles the start edge in both LTR and RTL */}
+        <div className="absolute start-0 top-1/2 -translate-y-1/2 -translate-x-1/2 rtl:translate-x-1/2 h-3 w-3 sm:h-4 sm:w-4 rounded-full bg-gradient-to-br from-emerald-50 via-white to-teal-50 dark:from-gray-950 dark:via-gray-900 dark:to-emerald-950/20 z-10 shadow-inner" />
+        {/* End perforation circle — straddles the end edge in both LTR and RTL */}
+        <div className="absolute end-0 top-1/2 -translate-y-1/2 translate-x-1/2 rtl:-translate-x-1/2 h-3 w-3 sm:h-4 sm:w-4 rounded-full bg-gradient-to-br from-emerald-50 via-white to-teal-50 dark:from-gray-950 dark:via-gray-900 dark:to-emerald-950/20 z-10 shadow-inner" />
 
         {/* Gradient border wrapper for called status */}
         <div

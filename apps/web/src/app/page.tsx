@@ -274,6 +274,10 @@ const ViewRouter = memo(function ViewRouter() {
               return <CustomerHistory />;
             case 'customer-profile':
               return <CustomerProfile />;
+            case 'customer-sms-wallet':
+              // Task 85 — the SMS wallet lives inside the profile page; this
+              // hash previously fell through to the landing page.
+              return <CustomerProfile />;
             case 'customer-notifications':
               return <CustomerNotifications />;
             case 'customer-favorites':

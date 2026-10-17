@@ -51,6 +51,7 @@ import {
   DoorOpen,
   Bell,
   ShieldAlert,
+  LogIn,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -318,8 +319,9 @@ export function AgencyFullscreen() {
   const realtime = useRealtime();
 
   // State
-  const queue = useState<QueueEntry[]>([])[0];
-  const setQueue = useState<QueueEntry[]>()[1];
+  // (Removed: orphan `queue`/`setQueue` useState pair — two SEPARATE state
+  // instances where `queue` was never read and setQueue wrote to a dead
+  // slot; the render uses `queueEntries`. Dead-write cleanup.)
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [currentServing, setCurrentServing] = useState<QueueEntry | null>(null);
   const [nextInQueue, setNextInQueue] = useState<QueueEntry | null>(null);
@@ -502,6 +504,16 @@ export function AgencyFullscreen() {
   const iControlSelected = !!selectedCounter && isCounterMine(selectedCounter);
   const iControlAny = counters.some((c) => isCounterMine(c));
 
+  // Feature C follow-up — explicit CLAIM affordance. Field feedback: the
+  // claim existed only as a side effect of picking a counter inside a small
+  // dropdown, so the primary action was undiscoverable. First FREE counter
+  // wins (same rule as the dashboard's claim-first-free).
+  const firstFreeCounter = counters.find((c) => !c.controlledByUserId && !isCounterMine(c)) ?? null;
+  const claimFirstFreeCounter = () => {
+    if (!firstFreeCounter) return;
+    void handleCounterSelect(firstFreeCounter.id);
+  };
+
   // HEARTBEAT: while the selected counter is controlled by me, ping
   // /counters/:id/heartbeat every 60s (server TTL expires silent claims).
   // Cleared automatically on release / selection change / unmount / logout.
@@ -604,7 +616,6 @@ export function AgencyFullscreen() {
           customerName: e.customerName || e.walkInCustomerName || 'Walk-in',
         }));
         setQueueEntries(entries);
-        setQueue(entries);
         const called = entries.find((e) => e.status === 'CALLED') || null;
         const waiting = entries.filter((e) => e.status === 'WAITING');
         setCurrentServing(called);
@@ -1192,6 +1203,27 @@ export function AgencyFullscreen() {
                   })}
                 </SelectContent>
               </Select>
+              {/* Feature C follow-up — explicit CLAIM button: whenever the
+                  caller controls no counter and a free one exists. Picking
+                  from the dropdown also claims; this makes the primary
+                  action discoverable in fullscreen mode. */}
+              {!iControlSelected && firstFreeCounter && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={claimFirstFreeCounter}
+                  disabled={!!occupationLoading}
+                  className="h-7 px-2 gap-1 bg-emerald-500/10 text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/20 rounded-lg text-[11px] font-semibold"
+                  aria-label={t('claimCounter')}
+                >
+                  {occupationLoading === firstFreeCounter.id ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <LogIn className="h-3 w-3" />
+                  )}
+                  <span className="hidden sm:inline">{t('claimCounter')}</span>
+                </Button>
+              )}
               {selectedCounterId && (iControlSelected || isOwnerCaller) && (
                 <Button
                   variant="ghost"
@@ -1460,6 +1492,95 @@ export function AgencyFullscreen() {
             </Button>
           </motion.div>
         </div>
+
+        {/* ─── Counter Control Strip (Feature C follow-up) ─────────────────
+            Every active counter as a glanceable card: Free → Claim,
+            controlled-by-someone → Request control, mine → Selected /
+            re-select. The dropdown in the header stays, but the strip makes
+            the counter states and the primary action visible at all times. */}
+        {counters.length > 0 && (
+          <div className="flex-shrink-0 flex items-center gap-1.5 overflow-x-auto custom-scrollbar pb-0.5">
+            {counters.map((c) => {
+              const mine = isCounterMine(c);
+              const free = !c.controlledByUserId;
+              const isSelected = c.id === selectedCounterId;
+              return (
+                <div
+                  key={c.id}
+                  className={`flex-shrink-0 flex items-center gap-2 rounded-lg border px-2.5 py-1.5 ${
+                    mine
+                      ? 'border-emerald-500/40 bg-emerald-500/10'
+                      : free
+                        ? 'border-gray-700 bg-gray-900/80'
+                        : 'border-amber-500/30 bg-amber-500/5'
+                  }`}
+                >
+                  <span className="font-mono font-bold text-xs text-emerald-400">#{c.number}</span>
+                  <span
+                    className="text-[11px] text-gray-300 max-w-[110px] truncate"
+                    title={localCounterName(c)}
+                  >
+                    {localCounterName(c)}
+                  </span>
+                  <span
+                    className={`text-[10px] font-semibold ${
+                      mine ? 'text-emerald-400' : free ? 'text-gray-500' : 'text-amber-400'
+                    }`}
+                  >
+                    {mine
+                      ? t('counterMine')
+                      : free
+                        ? t('counterFree')
+                        : c.occupiedBy
+                          ? t('counterOccupiedBy', { name: c.occupiedBy })
+                          : t('counterOccupied')}
+                  </span>
+                  {free && (
+                    <Button
+                      onClick={() => handleCounterSelect(c.id)}
+                      disabled={!!occupationLoading}
+                      className="h-6 px-2 text-[10px] rounded-md bg-emerald-600 hover:bg-emerald-500 text-white font-semibold flex items-center gap-1"
+                      aria-label={`${t('claimCounter')} #${c.number}`}
+                    >
+                      {occupationLoading === c.id ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <LogIn className="h-3 w-3" />
+                      )}
+                      {t('claimCounter')}
+                    </Button>
+                  )}
+                  {!free && !mine && (
+                    <Button
+                      onClick={() =>
+                        setControlConflict({
+                          counterId: c.id,
+                          counterName: localCounterName(c),
+                          controllerName: c.occupiedBy ?? null,
+                        })
+                      }
+                      disabled={requestControlLoading}
+                      className="h-6 px-2 text-[10px] rounded-md bg-amber-600/80 hover:bg-amber-500 text-white font-semibold"
+                      aria-label={`${t('requestControl')} #${c.number}`}
+                    >
+                      {t('requestControl')}
+                    </Button>
+                  )}
+                  {mine && !isSelected && (
+                    <Button
+                      onClick={() => handleCounterSelect(c.id)}
+                      disabled={!!occupationLoading}
+                      variant="outline"
+                      className="h-6 px-2 text-[10px] rounded-md border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10 hover:text-emerald-200"
+                    >
+                      {t('selectCounter')}
+                    </Button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
 
         {/* ─── Waiting List ──────────────────────────────────────────────── */}
         <div className="flex-1 min-h-0 flex flex-col">

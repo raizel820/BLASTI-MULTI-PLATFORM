@@ -110,10 +110,14 @@ export interface ProfileChangePasswordProps {
 }
 
 export interface ProfileSmsWalletProps {
+  /** Server freeSmsCount — the total spendable balance (purchased credits merged in). */
   smsCount: number;
+  /** Lifetime total of APPROVED purchased SMS (informational). */
   purchasedSms: number;
+  /** Same as smsCount — kept for call-site clarity. */
   totalAvailable: number;
-  totalPercent: number;
+  /** Purchases awaiting approval/payment. */
+  pendingCount: number;
   smsPurchasing: boolean;
   smsPurchasingPackId: string | null;
   onPurchaseSms: (packId: string) => void;

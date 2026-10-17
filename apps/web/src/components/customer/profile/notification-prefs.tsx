@@ -52,7 +52,7 @@ interface NotificationPrefsProps {
   initialPurchasedSms: number;
   initialPurchaseHistory: PurchaseItem[];
   initialPurchaseHistoryLoading: boolean;
-  initialSmsStatsData: { totalPurchased: number; totalSpent: number };
+  initialSmsStatsData: { totalPurchased: number; totalSpent: number; pendingCount?: number };
   onSaveNotifPrefs: (prefs: NotifPrefs) => Promise<void>;
   onSaveSmsSettings: (reminderMinutes: number, smsNotifEnabled: boolean) => Promise<void>;
   onPurchaseSms: (packId: string) => Promise<{ newBalance: number } | null>;
@@ -102,10 +102,11 @@ export function NotificationPrefs({
   const [purchaseHistoryLoading, setPurchaseHistoryLoading] = useState(initialPurchaseHistoryLoading);
   const [smsStatsData, setSmsStatsData] = useState(initialSmsStatsData);
 
-  // Computed SMS values
-  const smsRemaining = smsCount;
-  const totalAvailable = smsCount + purchasedSms;
-  const totalPercent = totalAvailable > 0 ? Math.min(100, (smsRemaining / totalAvailable) * 100) : 0;
+  // Computed SMS values — the server balance IS the total spendable amount
+  // (approved purchases are merged into freeSmsCount). Adding the lifetime
+  // purchase total again double-counted.
+  const totalAvailable = smsCount;
+  const pendingCount = smsStatsData.pendingCount ?? 0;
 
   // Notification card data
   const notifCards = [
@@ -160,8 +161,9 @@ export function NotificationPrefs({
     try {
       const result = await onPurchaseSms(packId);
       if (result) {
-        toast.success(`${t('smsPurchaseSuccess')} — ${t('newBalance')}: ${result.newBalance}`);
-        setPurchasedSms((prev) => prev + parseInt(packId, 10));
+        // Manual purchase creates a PENDING record — credits land only after
+        // approval/webhook. Never optimistically inflate purchasedSms here.
+        toast.success(t('smsPurchaseSubmitted'));
         await onRefreshProfile();
       }
     } finally {
@@ -393,44 +395,29 @@ export function NotificationPrefs({
             </CardTitle>
           </CardHeader>
           <CardContent className="pt-0">
-            {/* SMS Usage Breakdown */}
+            {/* SMS balance — server balance IS the total spendable amount */}
             <div className="bg-gradient-to-br from-emerald-50 to-teal-50 dark:from-emerald-900/20 dark:to-teal-900/20 rounded-xl p-4 mb-4">
               <div className="flex items-center justify-between mb-3">
                 <div>
                   <p className="text-2xl font-bold text-emerald-700 dark:text-emerald-400">{totalAvailable}</p>
                   <p className="text-xs text-muted-foreground mt-0.5">{t('totalSmsAvailable')}</p>
                 </div>
-                {/* Circular progress indicator */}
-                <div className="relative h-14 w-14 flex-shrink-0">
-                  <svg className="h-14 w-14 -rotate-90" viewBox="0 0 56 56">
-                    <circle cx="28" cy="28" r="24" className="fill-none stroke-emerald-100 dark:stroke-emerald-900/30" strokeWidth="4" />
-                    <circle
-                      cx="28" cy="28" r="24"
-                      className="fill-none stroke-emerald-500 stroke-linecap:round"
-                      strokeWidth="4"
-                      strokeDasharray={`${2 * Math.PI * 24}`}
-                      strokeDashoffset={`${2 * Math.PI * 24 * (1 - totalPercent / 100)}`}
-                      style={{ transition: 'stroke-dashoffset 1s ease-out' }}
-                    />
-                  </svg>
-                  <div className="absolute inset-0 flex items-center justify-center">
-                    <span className="text-[10px] font-bold text-emerald-700 dark:text-emerald-400">{totalPercent}%</span>
-                  </div>
+                <div className="h-12 w-12 rounded-2xl bg-emerald-100 dark:bg-emerald-900/40 flex items-center justify-center flex-shrink-0">
+                  <MessageSquare className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
                 </div>
               </div>
-              {/* Usage breakdown rows */}
-              <div className="grid grid-cols-3 gap-2">
-                <div className="text-center p-2 rounded-lg bg-white/50 dark:bg-gray-900/30">
-                  <p className="text-[10px] text-muted-foreground">{t('freeSmsCount')}</p>
-                  <p className="text-sm font-bold text-emerald-700 dark:text-emerald-400">{smsCount}</p>
-                </div>
+              {/* Breakdown: lifetime purchased + pending approvals */}
+              <div className="grid grid-cols-2 gap-2">
                 <div className="text-center p-2 rounded-lg bg-white/50 dark:bg-gray-900/30">
                   <p className="text-[10px] text-muted-foreground">{t('smsPurchased')}</p>
                   <p className="text-sm font-bold text-amber-700 dark:text-amber-400">{purchasedSms}</p>
                 </div>
                 <div className="text-center p-2 rounded-lg bg-white/50 dark:bg-gray-900/30">
-                  <p className="text-[10px] text-muted-foreground">{t('noAnalyticsData') || 'Used'}</p>
-                  <p className="text-sm font-bold text-rose-600 dark:text-rose-400">{Math.max(0, (smsCount + purchasedSms) - totalAvailable)}</p>
+                  <p className="text-[10px] text-muted-foreground flex items-center justify-center gap-1">
+                    <Clock className="h-2.5 w-2.5" />
+                    {t('purchaseStatusPending')}
+                  </p>
+                  <p className={`text-sm font-bold ${pendingCount > 0 ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'}`}>{pendingCount}</p>
                 </div>
               </div>
             </div>
@@ -454,7 +441,10 @@ export function NotificationPrefs({
                     }`}
                   >
                     {isBestValue && (
-                      <span className="absolute -top-2.5 start-1/2 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[10px] font-bold shadow-lg z-10 whitespace-nowrap">
+                      // Physical centering only — the previous start-1/2 +
+                      // left-1/2 combo over-constrained the box in RTL and
+                      // pushed the badge off the card.
+                      <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[10px] font-bold shadow-lg z-10 whitespace-nowrap">
                         <Star className="h-3 w-3 fill-white inline me-0.5" />
                         {t('bestValue')}
                       </span>

@@ -1362,7 +1362,10 @@ export function AgencyBranches() {
                         </div>
                         <div className="flex items-center gap-3 mt-0.5 flex-wrap">
                           {branch.address && (
-                            <span className="text-xs text-muted-foreground truncate max-w-48 flex items-center gap-1">
+                            <span
+                              className="text-xs text-muted-foreground truncate max-w-56 sm:max-w-72 flex items-center gap-1"
+                              title={branch.address}
+                            >
                               <MapPin className="h-3 w-3 flex-shrink-0" />
                               {branch.address}
                             </span>
@@ -1527,13 +1530,14 @@ export function AgencyBranches() {
                                   layout
                                   initial={{ opacity: 0.95 }}
                                   animate={{ opacity: 1 }}
-                                  className={`flex items-center justify-between p-3 rounded-xl transition-colors gap-2 ${
+                                  className={`p-3 rounded-xl transition-colors gap-3 flex flex-col xl:flex-row xl:items-center ${
                                     !counter.isActive
                                       ? 'bg-gray-50/50 dark:bg-gray-900/30 opacity-70 ring-1 ring-gray-100 dark:ring-gray-800/50'
                                       : 'bg-gray-50 dark:bg-gray-900/50'
                                   }`}
                                 >
-                                  <div className="flex items-center gap-3 min-w-0">
+                                  {/* Identity zone — number, names, live state */}
+                                  <div className="flex items-start gap-3 min-w-0 flex-1">
                                     <div className={`h-9 w-9 rounded-lg flex items-center justify-center flex-shrink-0 ${
                                       counter.isActive
                                         ? 'bg-teal-100 dark:bg-teal-900/30'
@@ -1548,8 +1552,8 @@ export function AgencyBranches() {
                                       </span>
                                     </div>
                                     <div className="min-w-0">
-                                      <div className="flex items-center gap-2">
-                                        <p className="text-sm font-medium text-foreground truncate">{getCounterDisplayName(counter)}</p>
+                                      <div className="flex items-center gap-2 flex-wrap">
+                                        <p className="text-sm font-medium text-foreground truncate max-w-56" title={getCounterDisplayName(counter)}>{getCounterDisplayName(counter)}</p>
                                         {!counter.isActive && (
                                           <Badge variant="secondary" className="text-[9px] px-1 py-0 h-4 bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400">
                                             {t('inactive')}
@@ -1613,72 +1617,77 @@ export function AgencyBranches() {
                                       </div>
                                     </div>
                                   </div>
-                                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                                  {/* Actions zone — visible labels instead of the
+                                      icon-only 32px squares the field report called
+                                      "corrupted / too small": label shows from xl up,
+                                      icon stays the compact affordance below that. */}
+                                  <div className="flex items-center gap-1.5 flex-wrap xl:flex-nowrap xl:justify-end">
                                     {/* Feature C — control release actions */}
                                     {counter.controlledByUserId &&
                                       (counter.controlledByUserId === myUserId ? (
-                                        <Tooltip>
-                                          <TooltipTrigger asChild>
-                                            <Button
-                                              size="sm"
-                                              variant="ghost"
-                                              className="h-8 w-8 p-0 text-muted-foreground hover:text-emerald-600"
-                                              onClick={() => handleReleaseCounterControl(counter)}
-                                              disabled={releasingCounterId === counter.id}
-                                              aria-label={t('releaseCounter')}
-                                            >
-                                              {releasingCounterId === counter.id ? (
-                                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                              ) : (
-                                                <DoorOpen className="h-3.5 w-3.5" />
-                                              )}
-                                            </Button>
-                                          </TooltipTrigger>
-                                          <TooltipContent>{t('releaseCounter')}</TooltipContent>
-                                        </Tooltip>
+                                        <Button
+                                          size="sm"
+                                          variant="ghost"
+                                          className="h-8 px-2 gap-1 text-muted-foreground hover:text-emerald-600"
+                                          onClick={() => handleReleaseCounterControl(counter)}
+                                          disabled={releasingCounterId === counter.id}
+                                          aria-label={t('releaseCounter')}
+                                        >
+                                          {releasingCounterId === counter.id ? (
+                                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                          ) : (
+                                            <DoorOpen className="h-3.5 w-3.5" />
+                                          )}
+                                          <span className="hidden xl:inline">{t('releaseCounter')}</span>
+                                        </Button>
                                       ) : canForceReleaseControl ? (
-                                        <Tooltip>
-                                          <TooltipTrigger asChild>
-                                            <Button
-                                              size="sm"
-                                              variant="ghost"
-                                              className="h-8 w-8 p-0 text-amber-500 hover:text-amber-600"
-                                              onClick={() => handleReleaseCounterControl(counter)}
-                                              disabled={releasingCounterId === counter.id}
-                                              aria-label={t('forceRelease')}
-                                            >
-                                              {releasingCounterId === counter.id ? (
-                                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                              ) : (
-                                                <ShieldAlert className="h-3.5 w-3.5" />
-                                              )}
-                                            </Button>
-                                          </TooltipTrigger>
-                                          <TooltipContent>{t('forceRelease')}</TooltipContent>
-                                        </Tooltip>
+                                        <Button
+                                          size="sm"
+                                          variant="ghost"
+                                          className="h-8 px-2 gap-1 text-amber-500 hover:text-amber-600"
+                                          onClick={() => handleReleaseCounterControl(counter)}
+                                          disabled={releasingCounterId === counter.id}
+                                          aria-label={t('forceRelease')}
+                                          title={t('forceRelease')}
+                                        >
+                                          {releasingCounterId === counter.id ? (
+                                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                          ) : (
+                                            <ShieldAlert className="h-3.5 w-3.5" />
+                                          )}
+                                          <span className="hidden xl:inline">{t('forceRelease')}</span>
+                                        </Button>
                                       ) : null)}
-                                    {/* Active/Inactive Toggle for Counter */}
-                                    <div className="flex items-center gap-1.5">
+                                    {/* Active/Inactive Toggle for Counter — full
+                                        size (the old scale-75 shrink read as a
+                                        broken/miniature control) */}
+                                    <div className="flex items-center gap-1.5 h-8 px-1">
                                       <Switch
                                         checked={counter.isActive}
                                         onCheckedChange={() => handleToggleCounterActive(counter)}
                                         disabled={togglingCounterId === counter.id}
-                                        className="data-[state=checked]:bg-emerald-500 data-[state=unchecked]:bg-gray-300 dark:data-[state=unchecked]:bg-gray-600 scale-75 origin-center"
+                                        aria-label={counter.isActive ? t('deactivate') : t('activate')}
+                                        className="data-[state=checked]:bg-emerald-500 data-[state=unchecked]:bg-gray-300 dark:data-[state=unchecked]:bg-gray-600"
                                       />
                                       {togglingCounterId === counter.id && (
                                         <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
                                       )}
                                     </div>
-                                    {/* Staff assignment */}
+                                    {/* Staff assignment — a REAL labeled select:
+                                        the old trigger rendered a bare 32px icon
+                                        (no value, no chevron — looked like a
+                                        corrupted static glyph). */}
                                     <Select
-                                      value={counter.staffId || '__none__'}
+                                      value={counter.staffId || undefined}
                                       onValueChange={(val) => handleAssignStaff(counter.id, val === '__none__' ? null : val)}
                                       disabled={assigningCounterId === counter.id}
                                     >
-                                      <SelectTrigger className="h-8 w-8 p-0 border-0 bg-transparent">
-                                        <SelectValue>
-                                          <UserCheck className="h-4 w-4 text-muted-foreground" />
-                                        </SelectValue>
+                                      <SelectTrigger
+                                        className="h-8 min-w-[132px] max-w-[176px] px-2.5 gap-1.5 text-xs bg-background border-border"
+                                        aria-label={t('noStaffAssigned')}
+                                      >
+                                        <UserCheck className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                                        <SelectValue placeholder={t('noStaffAssigned')} />
                                       </SelectTrigger>
                                       <SelectContent>
                                         <SelectItem value="__none__">{t('unassignStaff')}</SelectItem>
@@ -1692,18 +1701,22 @@ export function AgencyBranches() {
                                     <Button
                                       size="sm"
                                       variant="ghost"
-                                      className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground"
+                                      className="h-8 px-2 gap-1 text-muted-foreground hover:text-foreground"
                                       onClick={() => openEditCounterDialog(counter)}
+                                      aria-label={t('editCounter')}
                                     >
                                       <Edit3 className="h-3.5 w-3.5" />
+                                      <span className="hidden xl:inline">{t('edit')}</span>
                                     </Button>
                                     <Button
                                       size="sm"
                                       variant="ghost"
-                                      className="h-8 w-8 p-0 text-red-500 hover:text-red-600"
+                                      className="h-8 px-2 gap-1 text-red-500 hover:text-red-600"
                                       onClick={() => openDeleteDialog('counter', counter.id, counter.name)}
+                                      aria-label={t('delete')}
                                     >
                                       <Trash2 className="h-3.5 w-3.5" />
+                                      <span className="hidden xl:inline">{t('delete')}</span>
                                     </Button>
                                   </div>
                                 </motion.div>
@@ -1723,9 +1736,11 @@ export function AgencyBranches() {
 
       {/* Create/Edit Branch Dialog */}
       <Dialog open={branchDialogOpen} onOpenChange={setBranchDialogOpen}>
-        {/* Task 83-b — the dialog now carries the location block; make it
-            scrollable and slightly wider (same pattern as history sheets). */}
-        <DialogContent className="sm:max-w-md max-h-[85vh] overflow-y-auto">
+        {/* Task 83-b — the dialog now carries the location block. Desktop
+            window (1200×800) hardening: wide two-column-friendly dialog
+            instead of the old 448px sliver that forced a long narrow
+            scroll; still scrolls on small screens. */}
+        <DialogContent className="sm:max-w-2xl max-h-[88vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Building2 className="h-5 w-5 text-emerald-500" />
@@ -1736,34 +1751,38 @@ export function AgencyBranches() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
-            <div className="space-y-2">
-              <Label>{t('branchName')}</Label>
-              <Input
-                value={branchName}
-                onChange={(e) => setBranchName(e.target.value)}
-                placeholder={t('branchName')}
-                className="h-11"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>{t('branchNameAr')}</Label>
-              <Input
-                value={branchNameAr}
-                onChange={(e) => setBranchNameAr(e.target.value)}
-                placeholder={t('branchNameAr')}
-                className="h-11"
-                dir="rtl"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>{t('branchNameFr')}</Label>
-              <Input
-                value={branchNameFr}
-                onChange={(e) => setBranchNameFr(e.target.value)}
-                placeholder={t('branchNameFr')}
-                className="h-11"
-                dir="ltr"
-              />
+            {/* Names — one responsive row on desktop instead of three stacked
+                full-width fields (workflow: fill once, glance across). */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="space-y-2">
+                <Label>{t('branchName')}</Label>
+                <Input
+                  value={branchName}
+                  onChange={(e) => setBranchName(e.target.value)}
+                  placeholder={t('branchName')}
+                  className="h-11"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>{t('branchNameAr')}</Label>
+                <Input
+                  value={branchNameAr}
+                  onChange={(e) => setBranchNameAr(e.target.value)}
+                  placeholder={t('branchNameAr')}
+                  className="h-11"
+                  dir="rtl"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>{t('branchNameFr')}</Label>
+                <Input
+                  value={branchNameFr}
+                  onChange={(e) => setBranchNameFr(e.target.value)}
+                  placeholder={t('branchNameFr')}
+                  className="h-11"
+                  dir="ltr"
+                />
+              </div>
             </div>
             {/* Task 83-b — optional customer-facing display name ("Downtown
                 Branch", "Mall Kiosk"…). Distinct from the internal name. */}
@@ -1966,7 +1985,7 @@ export function AgencyBranches() {
 
       {/* Create/Edit Counter Dialog */}
       <Dialog open={counterDialogOpen} onOpenChange={setCounterDialogOpen}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-xl max-h-[88vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Monitor className="h-5 w-5 text-teal-500" />
@@ -1977,46 +1996,51 @@ export function AgencyBranches() {
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
-            <div className="space-y-2">
-              <Label>{t('counterNumber')}</Label>
-              <Input
-                type="number"
-                min={1}
-                value={counterNumber}
-                onChange={(e) => setCounterNumber(parseInt(e.target.value) || 1)}
-                className="h-11 w-28"
-                dir="ltr"
-                disabled={!!editingCounter}
-              />
+            {/* Number + primary name share one row on desktop */}
+            <div className="grid grid-cols-1 sm:grid-cols-[120px_1fr] gap-3">
+              <div className="space-y-2">
+                <Label>{t('counterNumber')}</Label>
+                <Input
+                  type="number"
+                  min={1}
+                  value={counterNumber}
+                  onChange={(e) => setCounterNumber(parseInt(e.target.value) || 1)}
+                  className="h-11"
+                  dir="ltr"
+                  disabled={!!editingCounter}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>{t('counterName')}</Label>
+                <Input
+                  value={counterName}
+                  onChange={(e) => setCounterName(e.target.value)}
+                  placeholder={t('counterName')}
+                  className="h-11"
+                />
+              </div>
             </div>
-            <div className="space-y-2">
-              <Label>{t('counterName')}</Label>
-              <Input
-                value={counterName}
-                onChange={(e) => setCounterName(e.target.value)}
-                placeholder={t('counterName')}
-                className="h-11"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>{t('counterNameAr')}</Label>
-              <Input
-                value={counterNameAr}
-                onChange={(e) => setCounterNameAr(e.target.value)}
-                placeholder={t('counterNameAr')}
-                className="h-11"
-                dir="rtl"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>{t('counterNameFr')}</Label>
-              <Input
-                value={counterNameFr}
-                onChange={(e) => setCounterNameFr(e.target.value)}
-                placeholder={t('counterNameFr')}
-                className="h-11"
-                dir="ltr"
-              />
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label>{t('counterNameAr')}</Label>
+                <Input
+                  value={counterNameAr}
+                  onChange={(e) => setCounterNameAr(e.target.value)}
+                  placeholder={t('counterNameAr')}
+                  className="h-11"
+                  dir="rtl"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>{t('counterNameFr')}</Label>
+                <Input
+                  value={counterNameFr}
+                  onChange={(e) => setCounterNameFr(e.target.value)}
+                  placeholder={t('counterNameFr')}
+                  className="h-11"
+                  dir="ltr"
+                />
+              </div>
             </div>
             {/* Feature C — service assignment multi-select (checkbox chips).
                 Empty selection = the counter serves ALL services. */}
@@ -2025,7 +2049,7 @@ export function AgencyBranches() {
               {services.length === 0 ? (
                 <p className="text-xs text-muted-foreground">{t('counterServicesHint')}</p>
               ) : (
-                <div className="flex flex-wrap gap-2 max-h-32 overflow-y-auto p-1">
+                <div className="flex flex-wrap gap-2 max-h-40 overflow-y-auto p-1 rounded-lg border border-border/60 bg-muted/30">
                   {services.map((s) => {
                     const checked = counterServiceIds.includes(s.id);
                     return (

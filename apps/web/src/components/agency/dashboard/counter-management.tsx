@@ -29,6 +29,7 @@ import {
   DoorOpen,
   ShieldAlert,
   Maximize,
+  LogIn,
 } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
@@ -301,18 +302,11 @@ export function CounterManagement({
     }
   };
 
-  // Feature C — claim the FIRST free counter straight from the dashboard hint.
-  const handleClaimFirstFree = async () => {
-    const free = counters.find((c) => !c.controlledByUserId && c.isActive);
-    if (!free) {
-      // No free counter here — the fullscreen console offers the full
-      // claim / request-control flow (steal via approval, etc.).
-      if (onViewFullscreen) onViewFullscreen();
-      return;
-    }
-    setReleaseLoadingId(free.id);
+  // Feature C — claim a SPECIFIC free counter (per-card Claim button).
+  const claimCounter = async (counter: { id: string }) => {
+    setReleaseLoadingId(counter.id);
     try {
-      const res = await apiFetch(`/api/agency/counters/${free.id}/occupy`, {
+      const res = await apiFetch(`/api/agency/counters/${counter.id}/occupy`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
       });
@@ -333,6 +327,18 @@ export function CounterManagement({
     } finally {
       setReleaseLoadingId(null);
     }
+  };
+
+  // Feature C — claim the FIRST free counter straight from the dashboard hint.
+  const handleClaimFirstFree = async () => {
+    const free = counters.find((c) => !c.controlledByUserId && c.isActive);
+    if (!free) {
+      // No free counter here — the fullscreen console offers the full
+      // claim / request-control flow (steal via approval, etc.).
+      if (onViewFullscreen) onViewFullscreen();
+      return;
+    }
+    await claimCounter(free);
   };
 
   // Feature C — control-based state (staffId is the ROSTER assignment only).
@@ -437,11 +443,11 @@ export function CounterManagement({
                       {/* Counter Info */}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-xs font-semibold text-foreground truncate max-w-[120px]">
+                          <span className="text-xs font-semibold text-foreground truncate max-w-[168px]" title={localizeCounterName(counter)}>
                             {localizeCounterName(counter)}
                           </span>
                           {counter.branchName && (
-                            <span className="text-[10px] text-muted-foreground truncate max-w-[100px]">
+                            <span className="text-[10px] text-muted-foreground truncate max-w-[140px]" title={counter.branchName}>
                               · {counter.branchName}
                             </span>
                           )}
@@ -497,6 +503,29 @@ export function CounterManagement({
 
                       {/* Actions */}
                       <div className="flex items-center gap-1.5 flex-shrink-0">
+                        {/* Feature C — per-counter CLAIM for free counters (was
+                            only a global "claim first free" hint button). */}
+                        {!counter.controlledByUserId && counter.isActive && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                size="sm"
+                                onClick={() => claimCounter(counter)}
+                                disabled={!!releaseLoadingId}
+                                className="h-8 px-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold gap-1 shadow-sm"
+                                aria-label={t('claimCounter')}
+                              >
+                                {releaseLoadingId === counter.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <LogIn className="h-3.5 w-3.5" />
+                                )}
+                                <span className="hidden md:inline">{t('claimCounter')}</span>
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{t('claimCounterHint')}</TooltipContent>
+                          </Tooltip>
+                        )}
                         {/* Feature C — release (controller) / force-release (owner-manager) */}
                         {isMine && (
                           <Tooltip>
@@ -506,7 +535,7 @@ export function CounterManagement({
                                 variant="ghost"
                                 onClick={() => handleReleaseControl(counter)}
                                 disabled={releaseLoadingId === counter.id}
-                                className="h-8 w-8 p-0 text-muted-foreground hover:text-emerald-600"
+                                className="h-8 px-2 gap-1 text-muted-foreground hover:text-emerald-600"
                                 aria-label={t('releaseCounter')}
                               >
                                 {releaseLoadingId === counter.id ? (
@@ -514,6 +543,7 @@ export function CounterManagement({
                                 ) : (
                                   <DoorOpen className="h-3.5 w-3.5" />
                                 )}
+                                <span className="hidden lg:inline text-xs">{t('releaseCounter')}</span>
                               </Button>
                             </TooltipTrigger>
                             <TooltipContent>{t('releaseCounter')}</TooltipContent>
@@ -527,7 +557,7 @@ export function CounterManagement({
                                 variant="ghost"
                                 onClick={() => handleReleaseControl(counter)}
                                 disabled={releaseLoadingId === counter.id}
-                                className="h-8 w-8 p-0 text-amber-500 hover:text-amber-600"
+                                className="h-8 px-2 gap-1 text-amber-500 hover:text-amber-600"
                                 aria-label={t('forceRelease')}
                               >
                                 {releaseLoadingId === counter.id ? (

@@ -178,13 +178,13 @@ export function StaffPermissionsEditor({ permissions, onChange, staffRole }: Sta
   return (
     <div className="space-y-4">
       {/* Permission description */}
-      <p className="text-sm text-gray-500">{t('permissionDesc')}</p>
+      <p className="text-sm text-gray-500 dark:text-gray-400">{t('permissionDesc')}</p>
 
       {/* Active permissions count */}
       <div className="flex items-center gap-2">
-        <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-50 border border-emerald-200">
-          <Shield className="h-3.5 w-3.5 text-emerald-600" />
-          <span className="text-xs font-semibold text-emerald-700">
+        <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800">
+          <Shield className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+          <span className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">
             {activeCount}/{permissionItems.length} {t('activePermissions')}
           </span>
         </div>
@@ -192,7 +192,7 @@ export function StaffPermissionsEditor({ permissions, onChange, staffRole }: Sta
 
       {/* Preset templates */}
       <div className="space-y-2">
-        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
+        <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
           {t('presetTemplates')}
         </p>
         <div className="flex flex-wrap gap-2">
@@ -202,7 +202,7 @@ export function StaffPermissionsEditor({ permissions, onChange, staffRole }: Sta
               whileHover={{ scale: 1.03 }}
               whileTap={{ scale: 0.97 }}
               onClick={() => applyPreset(preset.key)}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-xl border border-gray-200 bg-white hover:border-emerald-300 hover:bg-emerald-50 text-xs font-medium text-gray-700 transition-all"
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 hover:border-emerald-300 dark:hover:border-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-900/30 text-xs font-medium text-gray-700 dark:text-gray-300 transition-all"
             >
               {preset.icon}
               {preset.label}
@@ -221,28 +221,28 @@ export function StaffPermissionsEditor({ permissions, onChange, staffRole }: Sta
               whileHover={{ x: rtl ? -4 : 4 }}
               className={`flex items-center justify-between p-3 rounded-xl border transition-all cursor-pointer ${
                 isActive
-                  ? 'border-emerald-200 bg-emerald-50'
-                  : 'border-gray-100 bg-gray-50 hover:border-gray-200'
+                  ? 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-900/20'
+                  : 'border-gray-100 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/50 hover:border-gray-200 dark:hover:border-gray-700'
               }`}
               onClick={() => togglePermission(item.key)}
             >
               <div className={`flex items-center gap-3 ${rtl ? 'flex-row-reverse' : ''}`}>
                 <div className={`h-8 w-8 rounded-lg flex items-center justify-center ${
-                  isActive ? 'bg-emerald-100 text-emerald-600' : 'bg-gray-200 text-gray-400'
+                  isActive ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400' : 'bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400'
                 }`}>
                   {item.icon}
                 </div>
-                <span className={`text-sm font-medium ${isActive ? 'text-gray-800' : 'text-gray-500'}`}>
+                <span className={`text-sm font-medium ${isActive ? 'text-gray-800 dark:text-gray-200' : 'text-gray-500 dark:text-gray-400'}`}>
                   {t(item.labelKey as any)}
                 </span>
               </div>
               <div className={`h-6 w-11 rounded-full relative transition-colors ${
-                isActive ? 'bg-emerald-500' : 'bg-gray-300'
+                isActive ? 'bg-emerald-500' : 'bg-gray-300 dark:bg-gray-600'
               }`}>
                 <motion.div
                   animate={{ x: isActive ? (rtl ? -20 : 20) : 0 }}
                   transition={{ type: 'spring', stiffness: 500, damping: 30 }}
-                  className="absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm"
+                  className="absolute top-0.5 h-5 w-5 rounded-full bg-white dark:bg-gray-200 shadow-sm"
                   style={{ left: rtl ? undefined : 2, right: rtl ? 2 : undefined }}
                 />
               </div>

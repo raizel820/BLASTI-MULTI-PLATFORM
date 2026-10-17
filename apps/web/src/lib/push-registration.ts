@@ -146,8 +146,24 @@ async function isFirebaseConfigured(capacitor: CapacitorShape): Promise<boolean 
  * permitted. `allowRequest` controls whether a permission prompt may be
  * shown (true on initial boot; false on resume — there we only register if
  * permission is ALREADY granted so the user is never re-prompted).
+ *
+ * `opts.skipRegister` — request/check the POST_NOTIFICATIONS permission but
+ * NEVER call plugin.register(). Used on builds WITHOUT Firebase: the FCM
+ * registration must stay skipped (register() used to hard-crash those
+ * builds), yet the permission itself is still required by every OTHER
+ * notification path — the native lockscreen notification
+ * (BlastiNativeStatus.notifyLockscreen) and Capacitor LocalNotifications
+ * are pure OS notifications that do NOT need Firebase, and on Android 13+
+ * they silently drop when POST_NOTIFICATIONS was never granted.
+ * (Field report: "mobile app still cannot show notification on lockscreen"
+ * — the permission prompt was unreachable because the old code returned
+ * before any request whenever the Firebase guard tripped.)
  */
-async function registerIfPermitted(plugin: PushPluginShape, allowRequest: boolean): Promise<void> {
+async function registerIfPermitted(
+  plugin: PushPluginShape,
+  allowRequest: boolean,
+  opts?: { skipRegister?: boolean },
+): Promise<void> {
   try {
     let receive: string | undefined;
 
@@ -162,9 +178,11 @@ async function registerIfPermitted(plugin: PushPluginShape, allowRequest: boolea
     }
 
     if (receive === 'granted') {
-      if (typeof plugin.register === 'function') {
+      if (typeof plugin.register === 'function' && !opts?.skipRegister) {
         plugin.register();
         console.log('[PushRegistration] Registered with the OS push service');
+      } else if (opts?.skipRegister) {
+        console.log('[PushRegistration] Notification permission granted (FCM register skipped — Firebase not configured in this build)');
       }
     } else {
       console.warn('[PushRegistration] Push permission not granted:', receive ?? 'unknown');
@@ -208,21 +226,8 @@ export function initMobilePushRegistration(): Promise<void> {
       const platform =
         typeof capacitor.getPlatform === 'function' ? String(capacitor.getPlatform()) : 'unknown';
 
-      // ── Firebase availability guard (MUST run before any register attempt)
-      const firebaseReady = await isFirebaseConfigured(capacitor);
-      if (firebaseReady === false) {
-        // Unconfigured build: skip the FCM flow entirely — no permission
-        // prompt, no register() call. In-app + local notifications keep
-        // working without it.
-        console.warn(
-          '[PushRegistration] Firebase not configured in this native build ' +
-            '(google-services.json missing from android/app/) — skipping FCM ' +
-            'registration. In-app and local notifications still work.',
-        );
-        return;
-      }
-
       // ── Listeners MUST be wired before register() so no token event is lost
+      // (JS-side only — safe on every build, Firebase or not)
       await plugin.addListener('registration', (event: unknown) => {
         const value = (event as { value?: string })?.value;
         if (!value) return;
@@ -250,6 +255,27 @@ export function initMobilePushRegistration(): Promise<void> {
           }),
         );
       });
+
+      // ── Firebase availability guard (gates ONLY the FCM register() call)
+      const firebaseReady = await isFirebaseConfigured(capacitor);
+      if (firebaseReady === false) {
+        // Unconfigured build: skip the FCM registration flow, but STILL run
+        // the permission request — the native lockscreen notification and
+        // Capacitor LocalNotifications paths need POST_NOTIFICATIONS on
+        // Android 13+ even without Firebase. Skipping the request here is
+        // what left those paths silently dead on such builds.
+        console.warn(
+          '[PushRegistration] Firebase not configured in this native build ' +
+            '(google-services.json missing from android/app/) — skipping FCM ' +
+            'registration; notification permission is still requested for ' +
+            'the lockscreen/local notification paths.',
+        );
+        await registerIfPermitted(plugin, true, { skipRegister: true });
+        window.addEventListener('blasti:app-resume', () => {
+          void registerIfPermitted(plugin, false, { skipRegister: true });
+        });
+        return;
+      }
 
       // ── Initial permission request + register
       await registerIfPermitted(plugin, true);

@@ -74,7 +74,7 @@ function HeroParticles() {
         transition={{ duration: 18, repeat: Infinity, ease: 'easeInOut', delay: 3 }}
       />
       <motion.div
-        className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 w-60 h-60 rounded-full bg-emerald-300/5 dark:bg-emerald-600/3 blur-3xl"
+        className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-60 h-60 rounded-full bg-emerald-300/5 dark:bg-emerald-600/3 blur-3xl"
         animate={{ scale: [1, 1.2, 0.9, 1.1, 1], opacity: [0.05, 0.1, 0.05, 0.08, 0.05] }}
         transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
       />

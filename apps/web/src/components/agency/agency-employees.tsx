@@ -37,6 +37,7 @@ import {
   RefreshCw,
   Loader2,
   Shield,
+  ShieldCheck,
   UserCheck,
   UserX,
   Dices,
@@ -661,75 +662,128 @@ export function AgencyEmployees() {
                       {/* Info */}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <p className="font-semibold text-sm text-foreground truncate">{emp.fullName || '?'}</p>
+                          <p className="font-semibold text-sm text-foreground truncate max-w-48 sm:max-w-none" title={emp.fullName || '?'}>{emp.fullName || '?'}</p>
                           {getRoleBadge(emp.role)}
                           {!emp.isActive && (
                             <Badge variant="outline" className="text-[10px] text-gray-500 border-gray-300">{t('inactive')}</Badge>
                           )}
+                          {/* Granted-authorities summary — "full info" on the card
+                              instead of a permissions-dialog guessing game. */}
+                          {emp.role !== 'AGENCY_OWNER' && emp.permissions && (
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Badge
+                                  variant="outline"
+                                  className="text-[10px] px-1.5 py-0 h-4 bg-teal-50 dark:bg-teal-900/20 text-teal-700 dark:text-teal-400 border-teal-200 dark:border-teal-800/70"
+                                >
+                                  <ShieldCheck className="h-2.5 w-2.5 me-0.5" />
+                                  {t('authoritiesCount', { count: String(Object.values(emp.permissions).filter(Boolean).length) })}
+                                </Badge>
+                              </TooltipTrigger>
+                              <TooltipContent className="max-w-[260px]">
+                                <span className="block text-start">
+                                  {Object.entries(emp.permissions)
+                                    .filter(([, v]) => v)
+                                    .map(([k]) => t(k as any))
+                                    .filter(Boolean)
+                                    .join(' · ') || t('staffPermissions')}
+                                </span>
+                              </TooltipContent>
+                            </Tooltip>
+                          )}
                         </div>
                         <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
-                          <span>@{emp.username || '—'}</span>
+                          <span dir="ltr">@{emp.username || '—'}</span>
                           <span className="hidden sm:inline">•</span>
                           <span className="hidden sm:inline">{formatDate(emp.createdAt)}</span>
                         </div>
                       </div>
 
-                      {/* Actions */}
+                      {/* Actions — labeled from md up (the icon-only 32px row
+                          read as broken/corrupted on desktop); icons stay the
+                          compact affordance on narrow screens, with real
+                          Radix tooltips instead of native title-only. */}
                       <div className="flex items-center gap-1 flex-shrink-0">
                         {/* Toggle Active */}
                         {emp.role !== 'AGENCY_OWNER' && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => handleToggleActive(emp)}
-                            title={emp.isActive ? t('staffDeactivated') : t('staffActivated')}
-                          >
-                            {emp.isActive ? (
-                              <UserCheck className="h-4 w-4 text-emerald-600" />
-                            ) : (
-                              <UserX className="h-4 w-4 text-gray-400" />
-                            )}
-                          </Button>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 px-2 gap-1"
+                                onClick={() => handleToggleActive(emp)}
+                                aria-label={emp.isActive ? t('deactivate') : t('activate')}
+                              >
+                                {emp.isActive ? (
+                                  <UserCheck className="h-4 w-4 text-emerald-600" />
+                                ) : (
+                                  <UserX className="h-4 w-4 text-gray-400" />
+                                )}
+                                <span className="hidden md:inline text-xs text-muted-foreground">
+                                  {emp.isActive ? t('deactivate') : t('activate')}
+                                </span>
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{emp.isActive ? t('deactivate') : t('activate')}</TooltipContent>
+                          </Tooltip>
                         )}
 
                         {/* Edit */}
                         {emp.role !== 'AGENCY_OWNER' && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => openEdit(emp)}
-                            title={t('editStaffMember')}
-                          >
-                            <Pencil className="h-4 w-4 text-muted-foreground" />
-                          </Button>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 px-2 gap-1"
+                                onClick={() => openEdit(emp)}
+                                aria-label={t('editStaffMember')}
+                              >
+                                <Pencil className="h-4 w-4 text-muted-foreground" />
+                                <span className="hidden md:inline text-xs text-muted-foreground">{t('edit')}</span>
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{t('editStaffMember')}</TooltipContent>
+                          </Tooltip>
                         )}
 
                         {/* Permissions */}
                         {emp.role !== 'AGENCY_OWNER' && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => openPermissions(emp)}
-                            title={t('staffPermissions')}
-                          >
-                            <Lock className="h-4 w-4 text-muted-foreground" />
-                          </Button>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 px-2 gap-1"
+                                onClick={() => openPermissions(emp)}
+                                aria-label={t('staffPermissions')}
+                              >
+                                <Lock className="h-4 w-4 text-muted-foreground" />
+                                <span className="hidden md:inline text-xs text-muted-foreground">{t('staffPermissions')}</span>
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{t('staffPermissions')}</TooltipContent>
+                          </Tooltip>
                         )}
 
                         {/* Remove */}
                         {emp.role !== 'AGENCY_OWNER' && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 hover:text-red-500"
-                            onClick={() => { setRemoveEmployee(emp); setRemoveOpen(true); }}
-                            title={t('removeStaff')}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 px-2 gap-1 hover:text-red-500"
+                                onClick={() => { setRemoveEmployee(emp); setRemoveOpen(true); }}
+                                aria-label={t('removeStaff')}
+                              >
+                                <Trash2 className="h-4 w-4 text-muted-foreground" />
+                                <span className="hidden md:inline text-xs text-muted-foreground">{t('removeStaff')}</span>
+                              </Button>
+                            </TooltipTrigger>
+                            <TooltipContent>{t('removeStaff')}</TooltipContent>
+                          </Tooltip>
                         )}
                       </div>
                     </div>
@@ -743,7 +797,7 @@ export function AgencyEmployees() {
 
       {/* Create Employee Dialog */}
       <Dialog open={createOpen} onOpenChange={(open) => { setCreateOpen(open); if (!open) { setNewUsername(''); setNewFullName(''); setNewPassword(''); setNewRole('STAFF'); setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); setNewBranchId(''); setBranchError(false); } }}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-lg max-h-[88vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <UserPlus className="h-5 w-5 text-emerald-600" />
@@ -752,24 +806,27 @@ export function AgencyEmployees() {
             <DialogDescription>{t('createStaffAccountDesc' as any)}</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
-            <div className="space-y-2">
-              <Label className="text-xs">{t('staffUsername')}</Label>
-              <Input
-                value={newUsername}
-                onChange={(e) => setNewUsername(e.target.value)}
-                placeholder={t('enterUsername')}
-                className="h-11"
-                dir="ltr"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs">{t('staffFullName')}</Label>
-              <Input
-                value={newFullName}
-                onChange={(e) => setNewFullName(e.target.value)}
-                placeholder={t('fullName')}
-                className="h-11"
-              />
+            {/* Username + full name share a row on desktop */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label className="text-xs">{t('staffUsername')}</Label>
+                <Input
+                  value={newUsername}
+                  onChange={(e) => setNewUsername(e.target.value)}
+                  placeholder={t('enterUsername')}
+                  className="h-11"
+                  dir="ltr"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs">{t('staffFullName')}</Label>
+                <Input
+                  value={newFullName}
+                  onChange={(e) => setNewFullName(e.target.value)}
+                  placeholder={t('fullName')}
+                  className="h-11"
+                />
+              </div>
             </div>
             <div className="space-y-2">
               <Label className="text-xs">{t('staffInitialPassword')}</Label>
@@ -802,39 +859,42 @@ export function AgencyEmployees() {
                 </Button>
               </div>
             </div>
-            <div className="space-y-2">
-              <Label className="text-xs">{t('staffBranchLabel')}</Label>
-              <Select
-                value={newBranchId || undefined}
-                onValueChange={(v) => { setNewBranchId(v); setBranchError(false); }}
-              >
-                <SelectTrigger className="h-11" aria-invalid={branchError}>
-                  <SelectValue placeholder={t('staffBranchPlaceholder')} />
-                </SelectTrigger>
-                <SelectContent>
-                  {branchOptions.map((b) => (
-                    <SelectItem key={b.id} value={b.id}>
-                      {lang === 'ar' && b.nameAr ? b.nameAr : lang === 'fr' && b.nameFr ? b.nameFr : b.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {branchesLoading && <p className="text-[10px] text-muted-foreground">{t('loading' as any) || '...'}</p>}
-              {branchError && (
-                <p className="text-xs text-red-600 dark:text-red-400">{t('staffBranchRequired')}</p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs">{t('staffRoleSelect')}</Label>
-              <Select value={newRole} onValueChange={(v) => { setNewRole(v); if (v === 'MANAGER') setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); }}>
-                <SelectTrigger className="h-11">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="STAFF">{t('staffRoleStaff')}</SelectItem>
-                  <SelectItem value="MANAGER">{t('staffRoleManager')}</SelectItem>
-                </SelectContent>
-              </Select>
+            {/* Branch + role share a row on desktop */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label className="text-xs">{t('staffBranchLabel')}</Label>
+                <Select
+                  value={newBranchId || undefined}
+                  onValueChange={(v) => { setNewBranchId(v); setBranchError(false); }}
+                >
+                  <SelectTrigger className="h-11" aria-invalid={branchError}>
+                    <SelectValue placeholder={t('staffBranchPlaceholder')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {branchOptions.map((b) => (
+                      <SelectItem key={b.id} value={b.id}>
+                        {lang === 'ar' && b.nameAr ? b.nameAr : lang === 'fr' && b.nameFr ? b.nameFr : b.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {branchesLoading && <p className="text-[10px] text-muted-foreground">{t('loading' as any) || '...'}</p>}
+                {branchError && (
+                  <p className="text-xs text-red-600 dark:text-red-400">{t('staffBranchRequired')}</p>
+                )}
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs">{t('staffRoleSelect')}</Label>
+                <Select value={newRole} onValueChange={(v) => { setNewRole(v); if (v === 'MANAGER') setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); }}>
+                  <SelectTrigger className="h-11">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="STAFF">{t('staffRoleStaff')}</SelectItem>
+                    <SelectItem value="MANAGER">{t('staffRoleManager')}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
             {/* Task 37-e: manager authorities — defaults to ALL CHECKED (tier
                 defaults); the owner unticks what they don't want to grant.

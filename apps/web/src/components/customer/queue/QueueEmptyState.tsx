@@ -24,13 +24,13 @@ export function QueueEmptyState() {
           <motion.div
             animate={{ scale: [1, 1.3, 1], opacity: [0.15, 0.05, 0.15] }}
             transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-32 w-32 rounded-full bg-emerald-200 dark:bg-emerald-800"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-32 w-32 rounded-full bg-emerald-200 dark:bg-emerald-800"
           />
           {/* Decorative dashed circle */}
           <motion.div
             animate={{ rotate: 360 }}
             transition={{ duration: 30, repeat: Infinity, ease: 'linear' }}
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full border-2 border-dashed border-emerald-200/60 dark:border-emerald-700/40"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full border-2 border-dashed border-emerald-200/60 dark:border-emerald-700/40"
           />
           <motion.div
             initial={{ scale: 0 }}

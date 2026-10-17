@@ -30,9 +30,10 @@ export function fireReleaseMine(sessionToken: string | null | undefined): void {
   if (!sessionToken) return;
   lastReleaseMineAt = Date.now();
   try {
-    // getApiBaseUrl(): '' on web (relative — the Next proxy hits the cloud API,
-    // exactly the '/api/agency/...' contract), the embedded local API on
-    // desktop — the same origin every counter control call already uses.
+    // getApiBaseUrlSafe(): the cloud API directly on web — the Next /api
+    // proxy no longer exists, so a relative URL would just 404 against the
+    // Next server — and the embedded local API on desktop (the same origin
+    // every counter control call already uses).
     void fetch(`${getApiBaseUrlSafe()}/api/agency/counters/release-mine`, {
       method: 'POST',
       keepalive: true,
@@ -54,8 +55,8 @@ function getApiBaseUrlSafe(): string {
     if (electron || navigator.userAgent.includes('Electron')) {
       return 'http://127.0.0.1:3080';
     }
-  } catch { /* fall through to relative */ }
-  return '';
+  } catch { /* fall through to web default */ }
+  return process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3003';
 }
 
 /** Read the session token out of the persisted surfaces: the zustand persist

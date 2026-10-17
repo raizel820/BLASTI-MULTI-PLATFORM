@@ -1154,7 +1154,7 @@ export function CustomerQueue() {
           <motion.div
             animate={{ scale: [1, 1.5, 1], opacity: [0.03, 0.01, 0.03] }}
             transition={{ duration: 6, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/4 start-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-emerald-400 dark:bg-emerald-600"
+            className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-emerald-400 dark:bg-emerald-600"
           />
         </div>
       )}
