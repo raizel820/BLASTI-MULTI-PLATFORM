@@ -97,6 +97,7 @@ export const createServiceSchema = z.object({
   nameAr: z.string().optional(),
   nameFr: z.string().optional(),
   description: z.string().max(300).optional(),
+  price: z.number().nonnegative().max(10_000_000).nullable().optional(),
   isActive: z.boolean().optional().default(true),
 })
 
@@ -144,7 +145,7 @@ export const adminCreateAgencySchema = z.object({
   address: z.string().max(200).optional(),
   phone: z.string().max(20).optional(),
   email: z.string().optional(),
-  category: z.string().default('OTHER'),
+  category: z.enum(['DOCTOR', 'CLINIC', 'LAW_FIRM', 'BARBER']).default('CLINIC'),
   ownerId: z.string().optional(), // Optional: derived from session for non-SUPER_ADMIN
   customCode: z.string().min(2).max(10).optional(),
 })
@@ -156,7 +157,7 @@ export const adminUpdateAgencySchema = z.object({
   description: z.string().max(500).optional(),
   address: z.string().max(200).optional(),
   phone: z.string().max(20).optional(),
-  category: z.string().optional(),
+  category: z.enum(['DOCTOR', 'CLINIC', 'LAW_FIRM', 'BARBER']).optional(),
   isActive: z.boolean().optional(),
   ownerId: z.string().optional(),
   customCode: z.string().min(2).max(10).optional(),

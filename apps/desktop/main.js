@@ -62,6 +62,17 @@ function initFileLogger() {
   } catch { return null; }
 }
 initFileLogger();
+// logs-1 — main-process RING BUFFER: the last 300 console lines stay in
+// memory so the renderer's remote logger (lib/remote-logger.ts) can merge
+// them into every desktop upload — Electron-only failures (updater waiter,
+// local API, installer) land in the SAME per-UID vault as the UI logs.
+const _mainLogRing = [];
+function pushMainLog(level, line) {
+  try {
+    _mainLogRing.push(`[${new Date().toISOString()}] [${level}] ${line}`);
+    if (_mainLogRing.length > 300) _mainLogRing.splice(0, _mainLogRing.length - 300);
+  } catch { /* never let logging break the app */ }
+}
 (function mirrorConsoleToFile() {
   const fmt = (a) => {
     if (typeof a === 'string') return a;
@@ -73,8 +84,10 @@ initFileLogger();
     console[level] = (...args) => {
       original(...args);
       try {
+        const line = args.map(fmt).join(' ');
+        pushMainLog(level, line);
         const file = logFilePath || initFileLogger();
-        if (file) fs.appendFileSync(file, `[${new Date().toISOString()}] [${level}] ${args.map(fmt).join(' ')}\n`);
+        if (file) fs.appendFileSync(file, `[${new Date().toISOString()}] [${level}] ${line}\n`);
       } catch { /* never let logging break the app */ }
     };
   }
@@ -670,12 +683,19 @@ let beaconInterval = null;
 
 /** Build the beacon payload (mirrors the /api/discover beacon identity). */
 function buildBeaconPayload() {
+  // R-21F: merge the offline-authority fields (role/term/specScore/instance/
+  // agency) so peer desktops can run the election off beacons alone. The
+  // local-api's lan-authority module fills these once it boots; before that
+  // (and on any error) the beacon stays exactly the historic identity payload.
+  let extras = {};
+  try { extras = require('./local-api/lib/lan-authority').publicBeaconExtras() || {}; } catch { extras = {}; }
   return JSON.stringify({
     service: 'blasti-local',
     name: getMachineDisplayName(),
     hostname: getMachineDisplayName(),
     lanIp: getLocalIP(),
     httpPort: 3080,
+    ...extras,
   });
 }
 
@@ -743,6 +763,127 @@ function stopLanBeacon() {
 }
 
 // ─── Single Instance Lock ─────────────────────────────────────────────────────
+
+// UPDATE-0.6.14 — update-waiter bail-out, BEFORE the single-instance lock.
+// The in-app updater spawns a COPY of this executable as a detached "waiter"
+// (`blasti.exe --blasti-update-waiter <oldPid> <installer> <appExe> <log>`)
+// whose only job is to wait for THIS app to exit, run the NSIS installer
+// silently, and relaunch the freshly installed build. The waiter must never
+// touch the single-instance lock (the real app may still be running), never
+// create windows, and never start the local API — it is pure Node scripting
+// inside Electron: no cmd.exe, no PowerShell, nothing an antivirus can
+// heuristically block between "app closed" and "installer ran".
+const UPDATE_WAITER_ARGS = (() => {
+  try {
+    const idx = process.argv.indexOf('--blasti-update-waiter');
+    if (idx === -1) return null;
+    const rest = process.argv.slice(idx + 1);
+    const [oldPid, installer, appExe, logFile] = rest;
+    if (!installer || !appExe) return null;
+    return {
+      oldPid: parseInt(oldPid, 10) || 0,
+      installer,
+      appExe,
+      logFile: logFile || '',
+    };
+  } catch { return null; }
+})();
+
+/**
+ * UPDATE-0.6.14 — the waiter entry point, dispatched BEFORE the single-
+ * instance lock / any window / the local API. Pure Node: wait for the app
+ * process to exit → run the NSIS installer with /S → wait for the installer
+ * → relaunch the app → log every step to install-log.txt (same file the
+ * PowerShell leg used, so field diagnostics stay in one place).
+ *
+ * MUST live before (outside) the main-app `else` bail-out block — the waiter
+ * branch never executes that block.
+ */
+function runUpdateWaiterMode(w) {
+  const cp = require('child_process');
+  const appendLog = (msg) => {
+    console.log(`[BLASTI update-waiter] ${msg}`);
+    if (!w.logFile) return;
+    try { fs.appendFileSync(w.logFile, `['${new Date().toISOString()}'] ${msg}\n`); } catch { /* best effort */ }
+  };
+  appendLog(`waiter started (pid ${process.pid}) — waiting for app pid ${w.oldPid} to exit before running ${path.basename(w.installer)}`);
+
+  const relaunch = () => {
+    try {
+      const c = cp.spawn(w.appExe, [], { detached: true, stdio: 'ignore', windowsHide: true });
+      c.unref();
+      appendLog('app relaunched');
+    } catch (err) {
+      appendLog('relaunch failed: ' + (err && err.message));
+    }
+    // Give the log a beat to flush, then leave (the waiter must not hold
+    // anything open — the installer may still be finishing its cleanup).
+    setTimeout(() => { try { app.exit(0); } catch { process.exit(0); } }, 300);
+  };
+
+  const runInstaller = () => {
+    if (!fs.existsSync(w.installer)) {
+      appendLog('installer file missing — nothing to do');
+      setTimeout(() => { try { app.exit(1); } catch { process.exit(1); } }, 300);
+      return;
+    }
+    appendLog('app exited — running installer /S');
+    let child;
+    try {
+      child = cp.spawn(w.installer, ['/S'], { stdio: 'ignore', windowsHide: true });
+    } catch (err) {
+      appendLog('installer spawn failed: ' + (err && err.message));
+      relaunch();
+      return;
+    }
+    // Hard ceiling: a wedged installer must not keep the app closed forever —
+    // after 20 minutes relaunch whatever is installed.
+    const timer = setTimeout(() => {
+      appendLog('installer timeout (20 min) — relaunching');
+      relaunch();
+    }, 20 * 60 * 1000);
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      appendLog(`installer finished (exit ${code === null || code === undefined ? 'n/a' : code})`);
+      relaunch();
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      appendLog('installer error: ' + (err && err.message));
+      relaunch();
+    });
+  };
+
+  // Poll for the old process to fully exit (releases every file lock), up to
+  // 30s; proceed anyway afterwards — the NSIS script closes a still-running
+  // app in silent mode on its own. `process.kill(pid, 0)` THROWS when the
+  // process is gone, so "probe succeeded" ⇔ still alive.
+  let waitedMs = 0;
+  const probe = () => {
+    let alive = false;
+    try { process.kill(w.oldPid, 0); alive = true; } catch { alive = false; }
+    return alive;
+  };
+  const pollLoop = () => {
+    if (!probe()) {
+      runInstaller();
+      return;
+    }
+    if (waitedMs >= 30000) {
+      appendLog('app still running after 30s — proceeding (NSIS closes it in silent mode)');
+      runInstaller();
+      return;
+    }
+    waitedMs += 500;
+    setTimeout(pollLoop, 500);
+  };
+  if (w.oldPid > 0) pollLoop();
+  else runInstaller();
+}
+
+if (UPDATE_WAITER_ARGS) {
+  runUpdateWaiterMode(UPDATE_WAITER_ARGS);
+} else {
 
 const gotTheLock = app.requestSingleInstanceLock();
 
@@ -1640,6 +1781,10 @@ ipcMain.handle('get-platform', () => ({
   nodeVersion: process.versions.node,
 }));
 
+// logs-1 — renderer's remote logger merges these main-process lines into its
+// periodic /api/logs uploads (see apps/web/src/lib/remote-logger.ts).
+ipcMain.handle('get-recent-main-logs', () => _mainLogRing.slice(-120));
+
 // Loading screen: user clicked "Launch App" — only proceed if ALL checks passed
 ipcMain.on('loading:finish', () => {
   if (diagnosticsDone && diagnosticsAllPassed) {
@@ -2010,13 +2155,82 @@ function runInstallerAndQuit() {
   if (!installer || !fs.existsSync(installer)) return { ok: false, error: 'no-download' };
   console.log('[BLASTI Desktop] updates:install → quitting and running:', installer);
   if (process.platform === 'win32') {
-    spawnSilentWindowsInstall(installer);
+    // UPDATE-0.6.14 — per-user installs (the DEFAULT for this app:
+    // nsis.perMachine:false) go through the self-contained Electron waiter:
+    // copy of our own exe that waits for this process to exit, runs the NSIS
+    // installer with /S directly (CreateProcessW — Unicode-safe, no cmd /
+    // PowerShell interpreter for an AV to block), waits for it to finish and
+    // relaunches the app. FIELD ROOT CAUSE of "app closes and nothing
+    // happens": the previous flow depended on `powershell -EncodedCommand`,
+    // which endpoint antivirus suites heuristically kill, leaving the
+    // installer unlaunched with no visible error.
+    if (app.isPackaged && isPerUserWindowsInstall() && spawnUpdateWaiter(installer)) {
+      setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 300);
+      return { ok: true };
+    }
+    // Fallbacks: dev runs (not packaged), per-machine (Program Files) installs
+    // (the PowerShell leg elevates via UAC — a non-elevated silent install
+    // into Program Files ALWAYS fails silently), or a failed waiter copy.
+    spawnSilentWindowsInstall(installer, { elevate: app.isPackaged && !isPerUserWindowsInstall() });
   } else {
     try { require('child_process').spawn('xdg-open', [installer], { detached: true, stdio: 'ignore' }).unref(); } catch { shell.openPath(installer); }
   }
   setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 300);
   return { ok: true };
 }
+
+/** True when the running exe lives under %LOCALAPPDATA% (per-user NSIS install). */
+function isPerUserWindowsInstall() {
+  if (process.platform !== 'win32') return false;
+  try {
+    const exe = path.resolve(process.execPath).toLowerCase();
+    const lad = process.env.LOCALAPPDATA ? path.resolve(process.env.LOCALAPPDATA).toLowerCase() : '';
+    return !!lad && exe.startsWith(lad + path.sep);
+  } catch { return false; }
+}
+
+/**
+ * UPDATE-0.6.14 — spawn the detached update waiter (a COPY of this exe so
+ * the NSIS install can freely replace the running app's files; the waiter's
+ * image name differs from blasti.exe so the installer's silent close-app
+ * step never kills it). Returns false when the copy/spawn fails so the
+ * caller can fall back to the PowerShell leg.
+ */
+function spawnUpdateWaiter(installerPath) {
+  const cp = require('child_process');
+  try {
+    fs.mkdirSync(UPDATES_DIR(), { recursive: true });
+  } catch { /* exists */ }
+  const waiterPath = path.join(UPDATES_DIR(), 'blasti-update-waiter.exe');
+  const logFile = path.join(UPDATES_DIR(), 'install-log.txt');
+  try {
+    try { fs.unlinkSync(waiterPath); } catch { /* absent or locked by an old waiter */ }
+    fs.copyFileSync(process.execPath, waiterPath);
+  } catch (err) {
+    console.warn('[BLASTI Desktop] waiter copy failed — falling back to PowerShell leg:', err && err.message);
+    return false;
+  }
+  try {
+    const child = cp.spawn(
+      waiterPath,
+      ['--blasti-update-waiter', String(process.pid), installerPath, process.execPath, logFile],
+      { detached: true, stdio: 'ignore', windowsHide: true },
+    );
+    child.on('error', (err) => console.warn('[BLASTI Desktop] waiter spawn error:', err.message));
+    child.unref();
+    console.log('[BLASTI Desktop] update waiter spawned:', waiterPath);
+    return true;
+  } catch (err) {
+    console.warn('[BLASTI Desktop] waiter spawn failed — falling back to PowerShell leg:', err && err.message);
+    return false;
+  }
+}
+
+/**
+ * UPDATE-0.6.14 — runUpdateWaiterMode lives near the top of the file (before
+ * the single-instance bail-out) because the waiter branch NEVER executes the
+ * main-app else block this function used to sit in.
+ */
 
 // ─── Windows silent install + relaunch (Unicode-safe) ────────────────────────
 // FIELD ROOT CAUSE (updates "succeed" but the old version stays installed):
@@ -2035,7 +2249,13 @@ function runInstallerAndQuit() {
 //   • relaunches the freshly installed app,
 //   • appends every step to <userData>\updates\install-log.txt so failures
 //     are diagnosable from the field.
-function spawnSilentWindowsInstall(installerPath) {
+// UPDATE-0.6.14: `{ elevate: true }` runs the installer via -Verb RunAs (UAC)
+// — REQUIRED for per-machine (Program Files) installs, where a non-elevated
+// silent install always fails with no visible error. Per-user installs use
+// the Electron waiter leg instead; this PowerShell leg remains the fallback
+// and the per-machine path.
+function spawnSilentWindowsInstall(installerPath, opts = {}) {
+  const elevate = opts.elevate === true;
   const cp = require('child_process');
   const pid = process.pid;
   const appExe = process.execPath;
@@ -2047,8 +2267,8 @@ function spawnSilentWindowsInstall(installerPath) {
       q(installerPath)
     }')}catch{}`,
     `for($i=0;$i -lt 60;$i++){ if(-not (Get-Process -Id ${pid} -ErrorAction SilentlyContinue)){break}; Start-Sleep -Milliseconds 500 }`,
-    `try{Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] app exited — running installer /S")}catch{}`,
-    `try{ Start-Process -FilePath '${q(installerPath)}' -ArgumentList '/S' -Wait -WindowStyle Hidden | Out-Null; Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] installer finished (exit " + $LASTEXITCODE + ")") }catch{ Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] installer FAILED: " + $_.Exception.Message) }`,
+    `try{Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] app exited — running installer /S${elevate ? ' (elevated)' : ''}")}catch{}`,
+    `try{ Start-Process -FilePath '${q(installerPath)}' -ArgumentList '/S' -Wait -WindowStyle Hidden${elevate ? ' -Verb RunAs' : ''} | Out-Null; Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] installer finished (exit " + $LASTEXITCODE + ")") }catch{ Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] installer FAILED: " + $_.Exception.Message) }`,
     `try{ if(Test-Path '${q(appExe)}'){ Start-Process -FilePath '${q(appExe)}'; Add-Content -Path $log -Value ("['" + (Get-Date -Format s) + "'] app relaunched") } }catch{}`,
   ].join('; ');
   try {
@@ -2088,7 +2308,11 @@ function selfHealPendingInstaller() {
     const stat = fs.statSync(target);
     if (Date.now() - stat.mtimeMs < 60_000) return; // still downloading
     console.log(`[BLASTI Desktop] self-heal: finishing pending update ${pending[0].ver} (running ${current}) →`, target);
-    spawnSilentWindowsInstall(target);
+    // UPDATE-0.6.14 — same launcher decision as updates:install (waiter for
+    // per-user installs, elevated PowerShell for per-machine installs).
+    if (!spawnUpdateWaiter(target)) {
+      spawnSilentWindowsInstall(target, { elevate: !isPerUserWindowsInstall() });
+    }
     setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 1500);
   } catch (err) {
     console.warn('[BLASTI Desktop] self-heal check failed:', err && err.message);
@@ -2555,7 +2779,7 @@ async function _runInitialSyncFromSessionInner() {
   return result;
 }
 
-ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user, rememberMe }) => {
+ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user, rememberMe, freshSignup }) => {
   try {
     const syncService = require('./local-api/sync-service');
     syncService.setAuth(token, user);
@@ -2583,19 +2807,30 @@ ipcMain.handle('cloud-sync:set-auth', async (_event, { token, user, rememberMe }
       console.warn('[IPC] Failed to import session to local API (early):', sessionErr.message);
     }
     try {
-      _runInitialSyncFromSession().then((result) => {
-        if (result && result.success) {
-          if (result.alreadyInitialized) {
-            console.log('[IPC] Initial sync skipped — workspace already READY');
+      if (freshSignup === true) {
+        // 0.6.20 fresh-signup fix — the account was JUST created from this
+        // very device: there is no agency (and no server data) to import.
+        // Running the staged workspace import here played a fake "importing
+        // your data" process and left the post-login gate on UNKNOWN → 75s
+        // timeout → "failed". The REAL import is triggered by the
+        // create-agency flow's setSessionToken call once the agency (and its
+        // agencyId) exists — normal login paths are unaffected.
+        console.log('[IPC] Fresh signup — skipping workspace initial import (no agency exists yet; the create-agency flow triggers the real import)');
+      } else {
+        _runInitialSyncFromSession().then((result) => {
+          if (result && result.success) {
+            if (result.alreadyInitialized) {
+              console.log('[IPC] Initial sync skipped — workspace already READY');
+            } else {
+              console.log('[IPC] Initial sync after login: imported', result.totalRecords, 'records in', Math.round((result.duration || 0) / 1000) + 's');
+            }
           } else {
-            console.log('[IPC] Initial sync after login: imported', result.totalRecords, 'records in', Math.round((result.duration || 0) / 1000) + 's');
+            console.warn('[IPC] Initial sync after login failed:', result && result.error);
           }
-        } else {
-          console.warn('[IPC] Initial sync after login failed:', result && result.error);
-        }
-      }).catch((err) => {
-        console.warn('[IPC] Initial sync after login error:', err.message);
-      });
+        }).catch((err) => {
+          console.warn('[IPC] Initial sync after login error:', err.message);
+        });
+      }
     } catch (initErr) {
       console.warn('[IPC] Failed to launch initial sync:', initErr.message);
     }
@@ -2648,6 +2883,86 @@ ipcMain.handle('cloud-sync:clear-auth', async () => {
 
     return { success: true };
   } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// ─── 0.6.20 — Full local reset ("fresh install") ─────────────────────────
+// Backs the sidebar "Reset app data" action (desktop only). Wipes EVERYTHING
+// the app stored on this device and relaunches as if freshly installed:
+//   renderer side → cookies, localStorage, sessionStorage, IndexedDB
+//                   (WatermelonDB), service workers, HTTP cache
+//   main side    → the local SQLite workspace DB (blasti-local/), the local
+//                  file store (blasti-files/), the durable auth file
+//                  (blasti-auth.json), the local API session and the logs
+// The CLOUD account and its data are never touched — after the relaunch the
+// user logs in again and everything re-syncs from scratch.
+ipcMain.handle('app:clear-all-data', async () => {
+  try {
+    console.log('[IPC] app:clear-all-data — wiping all local data (fresh-install reset)');
+
+    // 1) Stop the engines FIRST: the background sync must not rewrite the
+    //    auth file or the DB while we delete them, and the SQLite handle
+    //    must be released before the files are removed.
+    try {
+      const syncService = require('./local-api/sync-service');
+      if (typeof syncService.stopSync === 'function') syncService.stopSync();
+      syncService.clearAuth();
+    } catch (err) { console.warn('[Reset] sync engine stop failed (non-fatal):', err.message); }
+    try {
+      const localApi = require('./local-api/index');
+      localApi.clearSession();
+      if (typeof localApi.stopLocalApi === 'function') localApi.stopLocalApi();
+    } catch (err) { console.warn('[Reset] local API stop failed (non-fatal):', err.message); }
+    try { stopLanBeacon(); } catch { /* not started */ }
+
+    // 2) Delete the main-process data directories + durable auth file.
+    //    rmSync with retry — a just-closed SQLite handle can take a beat to
+    //    release on Windows (EBUSY/EPERM).
+    const rmWithRetry = (target, attempts = 3) => {
+      for (let i = 1; i <= attempts; i++) {
+        try {
+          fs.rmSync(target, { recursive: true, force: true });
+          console.log('[Reset] removed', target);
+          return true;
+        } catch (err) {
+          if (i === attempts) { console.warn('[Reset] could not remove', target, ':', err.message); return false; }
+          const wait = 250 * i;
+          const until = Date.now() + wait;
+          while (Date.now() < until) { /* sync spin — process is exiting anyway */ }
+        }
+      }
+      return false;
+    };
+    const userData = app.getPath('userData');
+    rmWithRetry(path.join(userData, 'blasti-local'));   // local SQLite workspace DB
+    rmWithRetry(path.join(userData, 'blasti-files'));   // local file store (cloud keeps the mirrored copies)
+    rmWithRetry(path.join(userData, 'logs'));           // diagnostic logs
+    try { purgeDurableAuthFile('fresh-install reset'); } catch { /* already gone */ }
+
+    // 3) Wipe the renderer session storage (cookies, localStorage,
+    //    sessionStorage, IndexedDB, service workers, caches).
+    try {
+      const ses = (mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents.session)
+        || session.defaultSession;
+      await ses.clearStorageData({
+        storages: [
+          'cookies', 'localstorage', 'sessionstorage', 'indexdb',
+          'serviceworkers', 'cachestoragedata', 'shadercache', 'websql',
+        ],
+      });
+      await ses.clearCache();
+      await ses.clearHostResolverCache();
+      console.log('[Reset] renderer session storage wiped');
+    } catch (err) { console.warn('[Reset] session wipe failed (non-fatal):', err.message); }
+
+    // 4) Relaunch as a fresh install (same args — dev flags preserved).
+    console.log('[Reset] relaunching app fresh');
+    app.relaunch({ args: process.argv.slice(1) });
+    app.exit(0);
+    return { success: true };
+  } catch (err) {
+    console.error('[IPC] app:clear-all-data failed:', err.message);
     return { success: false, error: err.message };
   }
 });
@@ -3101,3 +3416,7 @@ app.on('quit', (_event, exitCode) => {
   // Task 2-b-1: quit completed normally — disarm the hard-quit backstop.
   if (_hardQuitBackstop) { clearTimeout(_hardQuitBackstop); _hardQuitBackstop = null; }
 });
+
+} // ── end else (NOT the update waiter) — closes the bail-out opened before
+  //   requestSingleInstanceLock: the waiter branch above exits on its own
+  //   and must never execute any of the module-level app wiring.

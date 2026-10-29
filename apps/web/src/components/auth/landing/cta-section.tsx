@@ -4,10 +4,10 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Briefcase,
-  FlaskConical,
+  Stethoscope,
+  Hospital,
   Scale,
-  Landmark,
+  Scissors,
   ChevronUp,
   Heart,
   Share2,
@@ -20,17 +20,17 @@ import {
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 
-/* ─── Trusted Categories Data ──────────── */
+/* ─── Trusted Categories Data (4 product agency types — task A) ──── */
 interface TrustedCategory {
   icon: LucideIcon;
-  labelKey: 'trustedClinic' | 'trustedLab' | 'trustedLaw' | 'trustedGov';
+  labelKey: 'trustedDoctor' | 'trustedClinic' | 'trustedLaw' | 'trustedBarber';
 }
 
 const trustedCategories: TrustedCategory[] = [
-  { icon: Briefcase, labelKey: 'trustedClinic' },
-  { icon: FlaskConical, labelKey: 'trustedLab' },
+  { icon: Stethoscope, labelKey: 'trustedDoctor' },
+  { icon: Hospital, labelKey: 'trustedClinic' },
   { icon: Scale, labelKey: 'trustedLaw' },
-  { icon: Landmark, labelKey: 'trustedGov' },
+  { icon: Scissors, labelKey: 'trustedBarber' },
 ];
 
 /* ─── Floating Shapes for CTA Background ──────────── */
@@ -273,7 +273,7 @@ export function CtaSection() {
                 <h4 className="text-xs font-semibold text-foreground mb-3 uppercase tracking-wider">{t('agencies')}</h4>
                 <div className="space-y-2">
                   <p className="text-xs text-muted-foreground hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer transition-colors">{t('trustedClinic')}</p>
-                  <p className="text-xs text-muted-foreground hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer transition-colors">{t('trustedLab')}</p>
+                  <p className="text-xs text-muted-foreground hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer transition-colors">{t('trustedLaw')}</p>
                 </div>
               </div>
               <div className="col-span-2 md:col-span-1">

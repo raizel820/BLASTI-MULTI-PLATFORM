@@ -452,3 +452,80 @@ export function findWilayaByCode(code: string): AlgeriaWilaya | undefined {
   const normalized = code ? code.padStart(2, '0') : '';
   return ALGERIA_WILAYAS.find((w) => w.code === normalized);
 }
+
+/**
+ * r21-5 — Approximate map center for each wilaya (its seat city), keyed by
+ * the official two-digit code. Accuracy is "good to a few km" ON PURPOSE:
+ * this exists so the map can FOLLOW address-input edits (wilaya select /
+ * postal-code prefix cascade) without a forward-geocoding service — the user
+ * fine-tunes the exact spot with the draggable pin afterwards.
+ */
+export const WILAYA_CENTROIDS: Record<string, { lat: number; lng: number }> = {
+  '01': { lat: 27.8743, lng: -0.2939 },
+  '02': { lat: 36.1652, lng: 1.3345 },
+  '03': { lat: 33.8003, lng: 2.8652 },
+  '04': { lat: 35.8754, lng: 7.1135 },
+  '05': { lat: 35.5559, lng: 6.1741 },
+  '06': { lat: 36.7515, lng: 5.0566 },
+  '07': { lat: 34.8449, lng: 5.7249 },
+  '08': { lat: 31.6167, lng: -2.2167 },
+  '09': { lat: 36.4703, lng: 2.8277 },
+  '10': { lat: 36.3734, lng: 3.902 },
+  '11': { lat: 22.785, lng: 5.5228 },
+  '12': { lat: 35.4042, lng: 8.1241 },
+  '13': { lat: 34.8783, lng: -1.315 },
+  '14': { lat: 35.3711, lng: 1.317 },
+  '15': { lat: 36.7169, lng: 4.0497 },
+  '16': { lat: 36.7538, lng: 3.0588 },
+  '17': { lat: 34.6703, lng: 3.263 },
+  '18': { lat: 36.8206, lng: 5.7667 },
+  '19': { lat: 36.1911, lng: 5.4137 },
+  '20': { lat: 34.8303, lng: 0.1517 },
+  '21': { lat: 36.8794, lng: 6.9072 },
+  '22': { lat: 35.1878, lng: 0.6308 },
+  '23': { lat: 36.9, lng: 7.7667 },
+  '24': { lat: 36.4611, lng: 7.4331 },
+  '25': { lat: 36.365, lng: 6.6147 },
+  '26': { lat: 36.2675, lng: 2.75 },
+  '27': { lat: 35.9315, lng: 0.0892 },
+  '28': { lat: 35.7058, lng: 4.5419 },
+  '29': { lat: 35.3975, lng: 0.1403 },
+  '30': { lat: 31.9497, lng: 5.3253 },
+  '31': { lat: 35.6971, lng: -0.6308 },
+  '32': { lat: 33.6831, lng: 1.0192 },
+  '33': { lat: 26.4833, lng: 8.4667 },
+  '34': { lat: 36.0731, lng: 4.7608 },
+  '35': { lat: 36.7667, lng: 3.4772 },
+  '36': { lat: 36.7672, lng: 8.3139 },
+  '37': { lat: 27.6711, lng: -8.1472 },
+  '38': { lat: 35.6072, lng: 1.8111 },
+  '39': { lat: 33.3683, lng: 6.8674 },
+  '40': { lat: 35.4361, lng: 7.1436 },
+  '41': { lat: 36.2864, lng: 7.9553 },
+  '42': { lat: 36.5894, lng: 2.4483 },
+  '43': { lat: 36.4503, lng: 6.2644 },
+  '44': { lat: 36.2639, lng: 1.9678 },
+  '45': { lat: 33.2667, lng: 0.3167 },
+  '46': { lat: 35.2986, lng: -1.1403 },
+  '47': { lat: 32.4909, lng: 3.6735 },
+  '48': { lat: 35.7372, lng: 0.5558 },
+  '49': { lat: 29.2586, lng: 0.2331 },
+  '50': { lat: 21.3333, lng: 0.95 },
+  '51': { lat: 34.4206, lng: 5.0664 },
+  '52': { lat: 30.1306, lng: -2.1656 },
+  '53': { lat: 27.1963, lng: 2.4667 },
+  '54': { lat: 19.5667, lng: 5.7667 },
+  '55': { lat: 33.1047, lng: 6.0589 },
+  '56': { lat: 24.5528, lng: 9.4853 },
+  '57': { lat: 33.9528, lng: 5.9206 },
+  '58': { lat: 30.5806, lng: 2.8834 },
+};
+
+/**
+ * Centroid (wilaya seat) for a wilaya code. The code must already be in the
+ * canonical two-digit form ('01'..'58'); anything else → null.
+ */
+export function findWilayaCentroid(code: string | null | undefined): { lat: number; lng: number } | null {
+  if (!code || !/^\d{2}$/.test(code)) return null;
+  return WILAYA_CENTROIDS[code] ?? null;
+}

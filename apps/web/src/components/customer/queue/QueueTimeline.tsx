@@ -330,7 +330,7 @@ export function QueueTimeline({ reservation, livePosition }: QueueTimelineProps)
                                 }}
                                 className="h-[22px] w-[22px] rounded-full bg-gradient-to-br from-emerald-400 to-teal-500 flex items-center justify-center shadow-md shadow-emerald-500/30"
                               >
-                                <div className="h-2 w-2 rounded-full bg-white" />
+                                <div className="h-2 w-2 rounded-full bg-white dark:bg-gray-900" />
                               </motion.div>
                             ) : (
                               <div

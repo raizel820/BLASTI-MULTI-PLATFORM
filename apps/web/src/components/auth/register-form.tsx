@@ -2,6 +2,7 @@
 import { apiFetch } from '@/lib/api-fetch';;
 
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
+import { adoptLocalLanguagePreference } from '@/hooks/use-language';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useUpload } from '@/hooks/use-upload';
@@ -487,7 +488,9 @@ export function RegisterForm() {
     onSuccess: (result) => {
       uploadedAvatarUrlRef.current = result.url;
       setSelectedPreset(null);
-      setAvatarPreview(getProxiedUrl(result.url));
+      // 0.6.18: keep the LOCAL preview (blob/data URL) — swapping to the
+      // remote URL blanks the circle when the cleartext image fails to paint.
+      setAvatarPreview((prev) => prev ?? getProxiedUrl(result.url));
       toast.success(t('avatarUpdated' as any));
     },
     onError: (error) => {
@@ -703,14 +706,18 @@ export function RegisterForm() {
       }
 
       if (res.ok && data.user) {
-        setUser(data.user);
+        setUser(adoptLocalLanguagePreference(data.user));
 
         // ── Establish the session from the registration response ──
         // LEGACY/DEFENSIVE PATH: kept for a cloud without the verification
         // enforcement (or a local/offline path) that still signs the user in
         // at registration time and returns an explicit session token.
         if (data.token) {
-          setSessionToken(data.token);
+          // 0.6.20 fresh-signup fix — a JUST-CREATED account has no agency and
+          // no server data: the desktop main process must NOT run the staged
+          // workspace import (it played a fake "importing existing data"
+          // process). The create-agency flow triggers the real import.
+          setSessionToken(data.token, { freshSignup: true });
           try { setNativeSessionToken(data.token); } catch { /* non-native runtime */ }
         }
 
@@ -747,8 +754,10 @@ export function RegisterForm() {
   // sync engine auth + electronAPI.setLocalApiSession + local API token key)
   // → native session token → success animation.
   const handleVerificationSuccess = (result: VerificationSuccess) => {
-    setUser(result.user as any);
-    setSessionToken(result.token);
+    setUser(adoptLocalLanguagePreference(result.user) as any);
+    // 0.6.20 fresh-signup fix — same as the direct-register path: skip the
+    // desktop workspace import; the create-agency wizard owns it now.
+    setSessionToken(result.token, { freshSignup: true });
     try { setNativeSessionToken(result.token); } catch { /* non-native runtime */ }
     setRegistrationSuccess(true);
     setVerificationData(null);

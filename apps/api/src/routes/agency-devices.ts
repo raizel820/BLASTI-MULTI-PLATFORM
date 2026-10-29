@@ -460,6 +460,7 @@ app.post('/public/join-queue', async (c) => {
           isWalkIn: true,
           walkInCustomerName: customerName?.trim() || 'Anonymous',
           userId: null,
+          reservedDate: todayLocalDateString(),
         },
       })
       // Spec Part O: tx ops are invisible to the auto-tracking extension.
@@ -752,7 +753,7 @@ app.get('/public/agency', async (c) => {
     const agency = await db.agency.findUnique({
       where: { customCode: code, isActive: true },
       include: {
-        services: { where: { isActive: true }, select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
+        services: { where: { isActive: true }, select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true, durationMinutes: true } },
         queueSettings: { select: { id: true, currentServingNumber: true, lastIssuedNumber: true, isPaused: true }, take: 1, orderBy: { updatedAt: 'desc' } },
       },
     })
@@ -791,7 +792,8 @@ app.get('/public/agency', async (c) => {
       historicalSampleSize: effective.sampleSize,
     })
     const estimatedWait = eta.estimatedMaxMinutes
-    const services = agency.services.map((s) => ({ ...s, avgTime: agency.averageServiceTime }))
+    // P2-10 — per-service avgTime honors the owner-set duration first.
+    const services = agency.services.map((s) => ({ ...s, avgTime: s.durationMinutes ?? agency.averageServiceTime }))
 
     if (clientIp) recordSuccessfulRequest(clientIp)
     return c.json({

@@ -13,6 +13,7 @@
  */
 
 import { db } from '@blasti/db'
+import { todayLocalDateString } from './queue-waiting'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -92,91 +93,117 @@ export async function syncOfflineReservation(
     return { success: false, conflict: SyncConflict.QUEUE_PAUSED }
   }
 
-  // 3. Check for duplicate (same user, same agency, same service, same offline time, same device)
-  const existing = await db.reservation.findFirst({
-    where: {
-      userId,
-      agencyId: offlineReservation.agencyId,
-      serviceId: offlineReservation.serviceId,
-      offlineCreatedAt: new Date(offlineReservation.offlineCreatedAt),
-      syncDeviceId: offlineReservation.syncDeviceId,
-    },
-  })
+  // P0-4: the ENTIRE deferred-reservation conversion (dup check → capacity
+  // check → allocator → create → lastIssuedNumber) is now ONE $transaction.
+  // Previously every step was a separate top-level write: two devices syncing
+  // concurrently could BOTH pass the dup check and BOTH allocate the same
+  // queueNumber; a crash mid-flow could decrement nothing but still create.
+  // The serviceId+reservedDate+queueNumber unique constraint is the final
+  // backstop — a P2002 here surfaces as an explicit DUPLICATE conflict.
+  try {
+    return await db.$transaction(async (tx) => {
+      // 3. Duplicate (same user, same agency, same service, same offline time, same device)
+      const existing = await tx.reservation.findFirst({
+        where: {
+          userId,
+          agencyId: offlineReservation.agencyId,
+          serviceId: offlineReservation.serviceId,
+          offlineCreatedAt: new Date(offlineReservation.offlineCreatedAt),
+          syncDeviceId: offlineReservation.syncDeviceId,
+        },
+      })
+      if (existing) {
+        return { success: false as const, conflict: SyncConflict.DUPLICATE }
+      }
 
-  if (existing) {
-    return { success: false, conflict: SyncConflict.DUPLICATE }
-  }
+      // 4. Capacity
+      const activeCount = await tx.reservation.count({
+        where: {
+          agencyId: offlineReservation.agencyId,
+          serviceId: offlineReservation.serviceId,
+          status: { in: ['WAITING', 'DEFERRED_OFFLINE'] },
+        },
+      })
+      if (agency.maxActiveReservations > 0 && activeCount >= agency.maxActiveReservations) {
+        return { success: false as const, conflict: SyncConflict.QUEUE_FULL }
+      }
 
-  // 4. Check if queue is full
-  const activeCount = await db.reservation.count({
-    where: {
-      agencyId: offlineReservation.agencyId,
-      serviceId: offlineReservation.serviceId,
-      status: { in: ['WAITING', 'DEFERRED_OFFLINE'] },
-    },
-  })
-  if (agency.maxActiveReservations > 0 && activeCount >= agency.maxActiveReservations) {
-    return { success: false, conflict: SyncConflict.QUEUE_FULL }
-  }
+      // 5. Next queue number
+      const lastReservation = await tx.reservation.findFirst({
+        where: { agencyId: offlineReservation.agencyId, serviceId: offlineReservation.serviceId },
+        orderBy: { queueNumber: 'desc' },
+        select: { queueNumber: true },
+      })
+      const queueNumber = (lastReservation?.queueNumber || 0) + 1
 
-  // 5. Get next queue number
-  const lastReservation = await db.reservation.findFirst({
-    where: { agencyId: offlineReservation.agencyId, serviceId: offlineReservation.serviceId },
-    orderBy: { queueNumber: 'desc' },
-    select: { queueNumber: true },
-  })
+      // 6. ETA
+      const waitingCount = await tx.reservation.count({
+        where: {
+          agencyId: offlineReservation.agencyId,
+          serviceId: offlineReservation.serviceId,
+          status: { in: ['WAITING', 'DEFERRED_OFFLINE'] },
+        },
+      })
+      // P2-10 — owner-set per-service duration overrides the agency average.
+      const avgServiceTime =
+        service.durationMinutes != null && service.durationMinutes > 0
+          ? service.durationMinutes
+          : (agency.averageServiceTime || 10)
+      const etaMinutes = waitingCount * avgServiceTime
 
-  const queueNumber = (lastReservation?.queueNumber || 0) + 1
+      // 7. Display number
+      const displayNumber = `${service.prefix}${queueNumber}`
 
-  // 6. Calculate ETA
-  const waitingCount = await db.reservation.count({
-    where: {
-      agencyId: offlineReservation.agencyId,
-      serviceId: offlineReservation.serviceId,
-      status: { in: ['WAITING', 'DEFERRED_OFFLINE'] },
-    },
-  })
+      // 8. Create — DEFERRED_OFFLINE → WAITING.
+      // P0-4 fix (latent 500): `fixedTime` was never a schema column — Prisma
+      // threw on every create here. The offline intent is preserved via
+      // preferredTime + fixedTimeEnabled only.
+      const reservedDate =
+        offlineReservation.reservedDate || todayLocalDateString(new Date())
+      const reservation = await tx.reservation.create({
+        data: {
+          userId,
+          agencyId: offlineReservation.agencyId,
+          serviceId: offlineReservation.serviceId,
+          queueNumber,
+          displayNumber,
+          status: 'WAITING',
+          estimatedWait: etaMinutes,
+          reservedDate,
+          preferredTime: offlineReservation.preferredTime || null,
+          notes: offlineReservation.notes || '',
+          fixedTimeEnabled: offlineReservation.fixedTimeEnabled ?? false,
+          offlineCreatedAt: new Date(offlineReservation.offlineCreatedAt),
+          syncedAt: new Date(),
+          syncDeviceId: offlineReservation.syncDeviceId,
+        },
+        include: {
+          agency: { select: { id: true, name: true, nameFr: true, nameAr: true, customCode: true } },
+          service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
+        },
+      })
 
-  const avgServiceTime = agency.averageServiceTime || 10
-  const etaMinutes = waitingCount * avgServiceTime
+      // 9. lastIssuedNumber
+      if (agency.queueSettings.length > 0) {
+        await tx.queueSettings.update({
+          where: { id: agency.queueSettings[0].id },
+          data: { lastIssuedNumber: queueNumber },
+        })
+      }
 
-  // 7. Build display number (prefix + queueNumber)
-  const displayNumber = `${service.prefix}${queueNumber}`
-
-  // 8. Create the reservation — convert from DEFERRED_OFFLINE to WAITING
-  const reservation = await db.reservation.create({
-    data: {
-      userId,
-      agencyId: offlineReservation.agencyId,
-      serviceId: offlineReservation.serviceId,
-      queueNumber,
-      displayNumber,
-      status: 'WAITING',
-      estimatedWait: etaMinutes,
-      reservedDate: offlineReservation.reservedDate || null,
-      preferredTime: offlineReservation.preferredTime || null,
-      notes: offlineReservation.notes || '',
-      fixedTimeEnabled: offlineReservation.fixedTimeEnabled ?? false,
-      fixedTime: offlineReservation.fixedTime || null,
-      offlineCreatedAt: new Date(offlineReservation.offlineCreatedAt),
-      syncedAt: new Date(),
-      syncDeviceId: offlineReservation.syncDeviceId,
-    },
-    include: {
-      agency: { select: { id: true, name: true, nameFr: true, nameAr: true, customCode: true } },
-      service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
-    },
-  })
-
-  // 9. Update queue settings lastIssuedNumber
-  if (agency.queueSettings.length > 0) {
-    await db.queueSettings.update({
-      where: { id: agency.queueSettings[0].id },
-      data: { lastIssuedNumber: queueNumber },
+      return { success: true as const, reservation }
     })
+  } catch (e: unknown) {
+    // P0-4: the unique constraint is the authoritative backstop — a lost race
+    // on the same (service, date, queueNumber) reports as DUPLICATE.
+    if (
+      typeof e === 'object' && e !== null && 'code' in e &&
+      (e as { code?: string }).code === 'P2002'
+    ) {
+      return { success: false as const, conflict: SyncConflict.DUPLICATE }
+    }
+    throw e
   }
-
-  return { success: true, reservation }
 }
 
 // ─── Batch Sync ─────────────────────────────────────────────────────────────

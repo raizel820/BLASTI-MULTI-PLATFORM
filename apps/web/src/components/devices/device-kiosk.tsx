@@ -250,7 +250,11 @@ export function DeviceKiosk() {
             // Device was unpaired — clear local state and return to login
             if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
             removeDeviceToken();
-            removeDeviceId();
+            // removeDeviceId() call removed (hotfix 0.6.12): no such export
+            // exists — this threw a ReferenceError on every FORCE_DISCONNECT
+            // (device unpair) and took down the kiosk heartbeat flow. The
+            // persisted device id IS cleared by removeDeviceToken() above
+            // (it removes both DEVICE_TOKEN_KEY and DEVICE_ID_KEY).
             removeAgencyCode();
             setDeviceToken('');
             setDeviceId('');
@@ -1138,12 +1142,12 @@ export function DeviceKiosk() {
               transition={{ duration: 0.3, ease: 'easeInOut' }}
               className="w-full max-w-md"
             >
-              <div className="bg-white rounded-3xl shadow-2xl p-5 sm:p-6 text-center">
+              <div className="bg-white dark:bg-gray-900 rounded-3xl shadow-2xl p-5 sm:p-6 text-center">
                 <div className="h-12 w-12 mx-auto rounded-xl bg-emerald-100 flex items-center justify-center mb-2">
                   <Search className="h-6 w-6 text-emerald-600" />
                 </div>
-                <h1 className="text-xl font-bold text-gray-900 mb-1">{t('enterAgencyCode')}</h1>
-                <p className="text-gray-500 mb-4 text-sm">{t('agencyCodePlaceholder')}</p>
+                <h1 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-1">{t('enterAgencyCode')}</h1>
+                <p className="text-gray-500 dark:text-gray-400 mb-4 text-sm">{t('agencyCodePlaceholder')}</p>
 
                 <input
                   type="text"
@@ -1151,7 +1155,7 @@ export function DeviceKiosk() {
                   onChange={(e) => setAgencyCode(e.target.value.toUpperCase())}
                   onKeyDown={(e) => { if (e.key === 'Enter') handleCodeSubmit(); }}
                   placeholder={t('agencyCodePlaceholder')}
-                  className="w-full min-h-[52px] rounded-2xl border-2 border-gray-200 px-5 text-lg text-center font-semibold focus:border-emerald-500 focus:outline-none transition-colors uppercase tracking-widest"
+                  className="w-full min-h-[52px] rounded-2xl border-2 border-gray-200 dark:border-gray-700 px-5 text-lg text-center font-semibold focus:border-emerald-500 focus:outline-none transition-colors uppercase tracking-widest"
                   autoFocus
                   dir="ltr"
                 />
@@ -1217,7 +1221,7 @@ export function DeviceKiosk() {
                   whileHover={{ scale: 1.01 }}
                   whileTap={{ scale: 0.98 }}
                   onClick={() => setStep('method-select')}
-                  className="w-full min-h-[44px] mt-3 rounded-xl bg-gray-100 text-gray-600 font-medium hover:bg-gray-200 transition-colors flex items-center justify-center gap-2 text-sm"
+                  className="w-full min-h-[44px] mt-3 rounded-xl bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 font-medium hover:bg-gray-200 transition-colors flex items-center justify-center gap-2 text-sm"
                 >
                   <ArrowLeft className="h-4 w-4" />
                   {t('kioskBack')}
@@ -1282,11 +1286,11 @@ export function DeviceKiosk() {
               transition={{ duration: 0.3, ease: 'easeInOut' }}
               className="w-full max-w-md"
             >
-              <div className="bg-white rounded-3xl shadow-2xl p-5 sm:p-6 text-center">
+              <div className="bg-white dark:bg-gray-900 rounded-3xl shadow-2xl p-5 sm:p-6 text-center">
                 <div className="h-12 w-12 mx-auto rounded-xl bg-emerald-100 flex items-center justify-center mb-2">
                   <Users className="h-6 w-6 text-emerald-600" />
                 </div>
-                <h2 className="text-xl font-bold text-gray-900 mb-1">{t('enterYourName')}</h2>
+                <h2 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-1">{t('enterYourName')}</h2>
 
                 {services.find((s) => s.id === selectedService) && (
                   <div className="mb-4 mt-3 p-2.5 rounded-xl bg-emerald-50 border border-emerald-200">
@@ -1301,7 +1305,7 @@ export function DeviceKiosk() {
                   value={customerName}
                   onChange={(e) => setCustomerName(e.target.value)}
                   placeholder={t('enterYourName')}
-                  className="w-full min-h-[52px] rounded-2xl border-2 border-gray-200 px-5 text-lg focus:border-emerald-500 focus:outline-none transition-colors text-center text-gray-900"
+                  className="w-full min-h-[52px] rounded-2xl border-2 border-gray-200 dark:border-gray-700 px-5 text-lg focus:border-emerald-500 focus:outline-none transition-colors text-center text-gray-900 dark:text-gray-100"
                   autoFocus
                 />
 
@@ -1328,7 +1332,7 @@ export function DeviceKiosk() {
 
                 <button
                   onClick={() => { setStep('services'); setError(null); }}
-                  className="mt-3 min-h-[44px] px-5 rounded-xl text-gray-500 hover:text-gray-700 hover:bg-gray-100 font-medium transition-colors"
+                  className="mt-3 min-h-[44px] px-5 rounded-xl text-gray-500 dark:text-gray-400 hover:text-gray-700 hover:bg-gray-100 font-medium transition-colors"
                 >
                   {t('kioskBack')}
                 </button>
@@ -1411,15 +1415,15 @@ export function DeviceKiosk() {
 
       {/* LAN Connection Indicator */}
       {!isDiscovering && (
-        <div className="fixed bottom-4 left-4 z-50">
+        <div className="fixed bottom-4 end-4 z-50">
           {lanServer ? (
             <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200 dark:bg-green-950 dark:text-green-400 dark:border-green-800">
-              <Wifi className="h-3 w-3 ml-1" />
+              <Wifi className="h-3 w-3 me-1" />
               LAN: {lanServer.hostname}
             </Badge>
           ) : (
             <Badge variant="outline" className="bg-gray-50 text-gray-500 border-gray-200 dark:bg-gray-900 dark:text-gray-400 dark:border-gray-700">
-              <WifiOff className="h-3 w-3 ml-1" />
+              <WifiOff className="h-3 w-3 me-1" />
               Cloud Mode
             </Badge>
           )}

@@ -55,12 +55,70 @@ const MERGEABLE_PROFILE_FIELDS = [
   'avatarUrl',
   'freeSmsCount',
   'language',
+  // 0.6.17 — the immutable account UID heals into stale sessions too: the
+  // phone's persisted login-era user object predating the uid rollout (or
+  // minted against an older deployed API) never gains it otherwise, and the
+  // profile/settings UID chips render NOTHING while user.uid is undefined.
+  'uid',
 ] as const;
 
 type MergeableField = (typeof MERGEABLE_PROFILE_FIELDS)[number];
 
 let lastRefreshAt = 0;
 let inFlight: Promise<void> | null = null;
+
+/**
+ * Timestamp of the last LOCAL avatar activation (upload confirm / profile
+ * save). Guards the refresher from CLOBBERING a brand-new avatar with the
+ * server's slightly-stale answer: a refresh request that STARTED before the
+ * local mutation (or lands right after it on a slow network) read the OLD
+ * row, and blindly merging it used to overwrite the fresh avatarUrl — the
+ * freshly-uploaded picture vanished back to the previous/placeholder state
+ * seconds after a successful upload.
+ */
+let lastLocalAvatarMutationAt = 0;
+
+/** Suppress window: server answers older than this NEVER clobber. */
+const AVATAR_MUTATION_SUPPRESS_MS = 15_000;
+
+/** Call from every flow that just applied a new avatarUrl locally. */
+export function markLocalAvatarMutation(): void {
+  lastLocalAvatarMutationAt = Date.now();
+}
+
+function avatarMutationGuardsRefresh(requestStartedAt: number): boolean {
+  if (lastLocalAvatarMutationAt === 0) return false;
+  // The request started before the local mutation → its answer is stale.
+  if (requestStartedAt < lastLocalAvatarMutationAt) return true;
+  // Landed within the suppress window → server may not have settled yet.
+  return Date.now() - lastLocalAvatarMutationAt < AVATAR_MUTATION_SUPPRESS_MS;
+}
+
+/**
+ * Language mutation guard (Agencies Management session — language revert fix).
+ *
+ * The header language switcher (and the profile preferences select) now PATCH
+ * the server AND stamp a local mutation. Without this guard the 1.5 s profile
+ * refresher merged the DB's slightly-stale answer over the just-picked
+ * language — the UI visibly "reverted to Arabic shortly after switching".
+ * Mirrors the avatar guard exactly: a refresh that STARTED before the local
+ * switch, or lands within the suppress window, never touches `language`.
+ */
+let lastLocalLanguageMutationAt = 0;
+
+/** Suppress window: server answers older than this NEVER clobber. */
+const LANGUAGE_MUTATION_SUPPRESS_MS = 15_000;
+
+/** Call from every flow that just applied a new language locally. */
+export function markLocalLanguageMutation(): void {
+  lastLocalLanguageMutationAt = Date.now();
+}
+
+function languageMutationGuardsRefresh(requestStartedAt: number): boolean {
+  if (lastLocalLanguageMutationAt === 0) return false;
+  if (requestStartedAt < lastLocalLanguageMutationAt) return true;
+  return Date.now() - lastLocalLanguageMutationAt < LANGUAGE_MUTATION_SUPPRESS_MS;
+}
 
 /**
  * Fetch the logged-in user's profile from the authoritative API and gently
@@ -74,6 +132,7 @@ export async function refreshSessionUser(): Promise<void> {
 
   if (inFlight) return inFlight;
   inFlight = (async () => {
+    const requestStartedAt = Date.now();
     try {
       const res = await apiFetch(`/api/user/profile?userId=${encodeURIComponent(user.id)}`);
       if (!res.ok) return; // 401 → session-heal owns auth repair; silent here
@@ -92,7 +151,24 @@ export async function refreshSessionUser(): Promise<void> {
         if (field === 'freeSmsCount') {
           if (typeof value === 'number' && Number.isFinite(value)) merged[field] = value;
         } else if (field === 'avatarUrl') {
-          merged[field] = typeof value === 'string' && value ? value : undefined;
+          // Guard: a local activation (upload/save) always beats this
+          // request's snapshot of the row — see markLocalAvatarMutation.
+          if (avatarMutationGuardsRefresh(requestStartedAt)) {
+            // Keep the local value untouched for this merge.
+          } else {
+            // Adopt only well-typed values; DB truth wins (a null avatarUrl
+            // means the avatar was removed server-side and MUST clear
+            // locally).
+            merged[field] = typeof value === 'string' && value ? value : undefined;
+          }
+        } else if (field === 'language') {
+          // Guard: a local language switch always beats this request's
+          // snapshot — see markLocalLanguageMutation (language revert fix).
+          if (languageMutationGuardsRefresh(requestStartedAt)) {
+            // Keep the local value untouched for this merge.
+          } else if (typeof value === 'string' && value) {
+            merged[field] = value;
+          }
         } else if (typeof value === 'string' && value) {
           merged[field] = value;
         }
@@ -130,6 +206,37 @@ export async function refreshSessionUser(): Promise<void> {
 }
 
 /**
+ * Post-login authoritative sync (0.6.17 — first-login avatar/UID fix).
+ *
+ * The login response is whatever the DEPLOYED server returns; an older API
+ * (or a server race) can mint a session whose user object lacks fresh
+ * avatarUrl/uid — the shell then renders initials + no UID chip until the
+ * user happens to open a surface that re-fetches. Called once from the
+ * store's setSessionToken (i.e. after EVERY fresh login / session heal), it
+ * re-reads /api/user/profile and merges the authoritative identity fields
+ * into the store ~1.2s later, so the header/sidebar/profile all paint the
+ * real picture without waiting for the 30s+ focus cycle.
+ *
+ * Idempotent: multiple callers inside the dedupe window coalesce into one
+ * fetch (dynamic import — no static store cycle).
+ */
+let lastPostLoginSyncAt = 0;
+let postLoginTimer: ReturnType<typeof setTimeout> | null = null;
+const POST_LOGIN_SYNC_DEDUPE_MS = 10_000;
+
+export function schedulePostLoginProfileSync(): void {
+  if (typeof window === 'undefined') return;
+  const now = Date.now();
+  if (now - lastPostLoginSyncAt < POST_LOGIN_SYNC_DEDUPE_MS) return;
+  lastPostLoginSyncAt = now;
+  if (postLoginTimer) clearTimeout(postLoginTimer);
+  postLoginTimer = setTimeout(() => {
+    postLoginTimer = null;
+    refreshSessionUser().catch(() => { /* silent — best-effort */ });
+  }, 1200);
+}
+
+/**
  * App-lifetime listener wiring: refresh once after boot, then on every
  * window focus / tab-visible event (throttled). Returns a cleanup fn.
  * Designed to be started once from ClientBootHardening.
@@ -139,6 +246,9 @@ export function startUserStoreRefresh(): () => void {
   // first-paint data fetches.
   const bootTimer = setTimeout(() => {
     refreshSessionUser().catch(() => { /* silent */ });
+    // cache-1 — warm the role's core endpoints + avatar into the caches so
+    // the first navigation paints instantly (fire-and-forget, throttled).
+    import('./boot-prefetch').then((m) => m.warmCoreCaches()).catch(() => { /* silent */ });
   }, 1500);
 
   const onFocus = () => {
@@ -154,6 +264,7 @@ export function startUserStoreRefresh(): () => void {
   document.addEventListener('visibilitychange', onVisibility);
   return () => {
     clearTimeout(bootTimer);
+    if (postLoginTimer) { clearTimeout(postLoginTimer); postLoginTimer = null; }
     window.removeEventListener('focus', onFocus);
     document.removeEventListener('visibilitychange', onVisibility);
   };

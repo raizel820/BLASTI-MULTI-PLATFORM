@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { requireAdmin, authErrorResponse } from '../lib/auth'
@@ -316,9 +317,22 @@ function requireDeployToken(c: { req: { header: (name: string) => string | undef
     throw new Error('heartbeat_disabled: set DEPLOY_TOKEN in /etc/blasti/blasti.env')
   }
   const provided = c.req.header('x-deploy-token')
-  if (!provided || provided !== expected) {
+  // P0-3: constant-time compare.
+  if (!provided || !safeEqual(provided, expected)) {
     throw new Error('invalid_deploy_token')
   }
+}
+
+// P0-3: constant-time string comparison for secrets.
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a)
+  const bb = Buffer.from(b)
+  if (ab.length !== bb.length) {
+    const n = Math.min(ab.length, bb.length) || 1
+    timingSafeEqual(ab.subarray(0, n), ab.subarray(0, n))
+    return false
+  }
+  return timingSafeEqual(ab, bb)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

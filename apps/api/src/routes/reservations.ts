@@ -1,3 +1,4 @@
+import { todayLocalDateString } from '../lib/queue-waiting'
 import { Hono } from 'hono'
 import { db } from '@blasti/db'
 import { requireAuth, requireResourceOwnership, requireAgencyAccess, authErrorResponse } from '../lib/auth'
@@ -12,6 +13,9 @@ import { recordSyncChange, recordSyncChangeNow } from '../lib/sync-helpers'
 // that expose reservation-derived numbers (/api/stats, /api/agencies
 // waitingCount). Mutations themselves are never cached (GET-only layers).
 import { invalidateResponseCacheTag } from '../lib/response-cache'
+// r21-7 — the unified queue authority gate (counter CONTROL) closes the
+// PUT /:id/status hole for staff-targeted transitions (CALLED/COMPLETED/SERVING).
+import { enforceQueueStaffAuthority, queueGateErrorBody } from './agency'
 
 const app = new Hono()
 
@@ -40,7 +44,10 @@ app.post('/', async (c) => {
 
     const { agencyId, serviceId, preferredTime, reservedDate, fixedTimeEnabled } = validation.data
 
-    let targetDate: string | null = null
+    // P0-4: join-now (no reservedDate) is stamped with TODAY — a walk-in is
+    // date-scoped anyway, and the (serviceId, reservedDate, queueNumber)
+    // unique backstop only binds non-null dates (PG NULLS DISTINCT).
+    let targetDate: string | null = todayLocalDateString()
     if (reservedDate) {
       const parsed = new Date(reservedDate)
       if (isNaN(parsed.getTime())) {
@@ -79,17 +86,29 @@ app.post('/', async (c) => {
 
     let resolvedServiceId = serviceId
     if (!resolvedServiceId) {
-      const firstService = await db.service.findFirst({
+      // r23 — the service must be EXPLICIT whenever there is a choice. The
+      // old silent "first service wins" fallback joined the customer into an
+      // arbitrary queue when the agency served several services. One active
+      // service still auto-resolves, and a service-less agency still gets its
+      // "General" default; more than one → the client must send serviceId.
+      const activeServices = await db.service.findMany({
         where: { agencyId, isActive: true },
+        select: { id: true },
         orderBy: { createdAt: 'asc' },
       })
-      if (firstService) {
-        resolvedServiceId = firstService.id
-      } else {
+      if (activeServices.length === 1) {
+        resolvedServiceId = activeServices[0].id
+      } else if (activeServices.length === 0) {
         const defaultService = await db.service.create({
           data: { agencyId, name: 'General', nameAr: 'عام', nameFr: 'Général', prefix: 'A' },
         })
         resolvedServiceId = defaultService.id
+      } else {
+        return c.json({
+          success: false,
+          error: 'SERVICE_SELECTION_REQUIRED',
+          message: 'This agency serves multiple services — a service must be selected before joining the queue.',
+        }, 400)
       }
     }
 
@@ -143,13 +162,22 @@ app.post('/', async (c) => {
       take: 200,
     })
     const effectiveForCreate = getEffectiveServiceTime(recentCompletedForCreate, agency.averageServiceTime)
+    // P2-10 — owner-set per-service duration is the authoritative estimate:
+    // it overrides the 7-day history (thin/noisy for young services).
+    if (service.durationMinutes != null && service.durationMinutes > 0) {
+      effectiveForCreate.avgMinutes = service.durationMinutes
+    }
     const fortyFiveForCreate = new Date(Date.now() - 45 * 60 * 1000)
+    // r21-7 — "active counter" = CONTROL heartbeat within 45min OR the legacy
+    // staffId occupation mirror within 45min (pre-r21-7 data keeps working).
     const activeCountersForCreate = await db.counter.count({
       where: {
         isActive: true,
-        staffId: { not: null },
         branch: { agencyId, isActive: true },
-        updatedAt: { gte: fortyFiveForCreate },
+        OR: [
+          { controlHeartbeatAt: { gte: fortyFiveForCreate } },
+          { staffId: { not: null }, updatedAt: { gte: fortyFiveForCreate } },
+        ],
       },
     })
     // Task 24: queueSettings is a LIST relation — use the first row (the code
@@ -1181,7 +1209,12 @@ app.put('/:id/status', async (c) => {
 
     const reservation = await db.reservation.findUnique({
       where: { id },
-      include: { agency: { select: { id: true, name: true } }, service: { select: { id: true, name: true } } },
+      include: {
+        agency: { select: { id: true, name: true } },
+        service: { select: { id: true, name: true } },
+        // r21-7 — counter identity for the customer "اذهب إلى الشباك" pointer.
+        counter: { select: { id: true, name: true, number: true, nameAr: true, nameFr: true } },
+      },
     })
 
     if (!reservation) return c.json({ success: false, error: 'Reservation not found' }, 404)
@@ -1190,6 +1223,20 @@ app.put('/:id/status', async (c) => {
       await requireAgencyAccess(c, reservation.agencyId)
     } else {
       try { await requireResourceOwnership(c, reservation.userId) } catch { await requireAgencyAccess(c, reservation.agencyId) }
+    }
+
+    // r21-7 — CLOSE THE AUTHORITY HOLE: CALLED / COMPLETED / SERVING are QUEUE
+    // operations, not customer self-service. A staff/owner caller must hold
+    // the unified queue authority: control of the ticket's counter (or of ANY
+    // counter when the ticket has none yet); owner/SUPER_ADMIN pass. Customers
+    // keep their own-ticket transitions exactly as before (CANCELLED/NO_SHOW).
+    const STAFF_ONLY_STATUSES = ['CALLED', 'COMPLETED', 'SERVING']
+    if (STAFF_ONLY_STATUSES.includes(status)) {
+      const memberCaller = await requireAgencyAccess(c, reservation.agencyId)
+      const staffGate = await enforceQueueStaffAuthority(memberCaller, reservation.agencyId, reservation.counterId ?? null)
+      if (!staffGate.ok) {
+        return c.json(queueGateErrorBody(staffGate), staffGate.status as any)
+      }
     }
 
     const allowedTransitions = VALID_STATUS_TRANSITIONS[reservation.status] || []
@@ -1217,8 +1264,12 @@ app.put('/:id/status', async (c) => {
     if (reservation.userId) {
       const notificationType = `QUEUE_${status}` as const
       const titleMap: Record<string, string> = { CALLED: 'Your Turn!', COMPLETED: 'Service Completed', CANCELLED: 'Reservation Cancelled', NO_SHOW: 'Missed Your Turn', SERVING: 'Being Served' }
+      // r21-7 — the CALLED text gains the counter pointer ONLY when a counter
+      // is known: "اذهب إلى الشباك: X".
+      const counterLabel = reservation.counter?.name || (reservation.counter ? `#${reservation.counter.number}` : null)
       const messageMap: Record<string, string> = {
-        CALLED: `Please proceed to ${reservation.agency.name} - ${reservation.service.name}. Your ticket: ${reservation.displayNumber}`,
+        CALLED: `Please proceed to ${reservation.agency.name} - ${reservation.service.name}. Your ticket: ${reservation.displayNumber}`
+          + (counterLabel ? ` اذهب إلى الشباك: ${counterLabel}` : ''),
         COMPLETED: `Your visit at ${reservation.agency.name} has been completed.`,
         CANCELLED: `Your reservation ${reservation.displayNumber} at ${reservation.agency.name} has been cancelled.`,
         NO_SHOW: `You missed your turn for ticket ${reservation.displayNumber} at ${reservation.agency.name}.`,
@@ -1245,15 +1296,30 @@ app.put('/:id/status', async (c) => {
     }
     const queueEventType = queueEventTypeMap[status]
     if (queueEventType) {
-      // Task 24: userId inside data so the customer's turn-alert listeners can match it
-      emitQueueEvent(queueEventType, reservation.agencyId, { reservationId: id, displayNumber: reservation.displayNumber, previousStatus: reservation.status, newStatus: status, serviceId: reservation.serviceId, userId: reservation.userId || null })
+      // Task 24: userId inside data so the customer's turn-alert listeners can match it.
+      // r21-7 — counter identity rides on the payload.
+      const statusCounter = reservation.counter || null
+      const statusCounterPayload = statusCounter
+        ? {
+            id: statusCounter.id,
+            name: statusCounter.name,
+            number: statusCounter.number,
+            nameAr: statusCounter.nameAr ?? null,
+            nameFr: statusCounter.nameFr ?? null,
+          }
+        : null
+      emitQueueEvent(queueEventType, reservation.agencyId, { reservationId: id, displayNumber: reservation.displayNumber, previousStatus: reservation.status, newStatus: status, serviceId: reservation.serviceId, userId: reservation.userId || null, counterId: statusCounterPayload?.id ?? null, counterName: statusCounterPayload?.name ?? null, counter: statusCounterPayload })
     }
 
     const reservationEventType = status === 'CANCELLED' ? 'reservation:cancelled' : 'reservation:updated'
     emitReservationEvent(reservationEventType, reservation.agencyId, reservation.userId ?? undefined, { reservationId: id, displayNumber: reservation.displayNumber, previousStatus: reservation.status, newStatus: status, userId: reservation.userId || null })
 
     if (reservation.userId && status === 'CALLED') {
-      emitNotificationEvent('notification:your-turn', reservation.userId, { ticketNumber: reservation.displayNumber, agencyName: reservation.agency.name, userId: reservation.userId, reservationId: id })
+      const calledCounter = reservation.counter || null
+      const calledCounterPayload = calledCounter
+        ? { id: calledCounter.id, name: calledCounter.name, number: calledCounter.number, nameAr: calledCounter.nameAr ?? null, nameFr: calledCounter.nameFr ?? null }
+        : null
+      emitNotificationEvent('notification:your-turn', reservation.userId, { ticketNumber: reservation.displayNumber, agencyName: reservation.agency.name, userId: reservation.userId, reservationId: id, serviceName: reservation.service.name, counterId: calledCounterPayload?.id ?? null, counterName: calledCounterPayload?.name ?? null, counter: calledCounterPayload })
     } else if (reservation.userId && status === 'NO_SHOW') {
       emitNotificationEvent('notification:new', reservation.userId, { message: `You missed your turn for ticket ${reservation.displayNumber}` })
     }

@@ -14,8 +14,13 @@
  */
 
 import { apiFetch } from '@/lib/api-fetch';
+import { getCloudApiBaseUrl } from '@/lib/api-client';
 
 export const PENDING_CHECKOUT_KEY = 'blasti-pending-checkout';
+
+/** Custom-scheme deep link the Capacitor Android shell registers (see
+ *  AndroidManifest.xml BROWSABLE intent-filter + payment-deep-link.ts). */
+const MOBILE_DEEP_LINK = 'blasti://payment/result';
 
 export interface PendingCheckout {
   checkoutId: string;
@@ -76,6 +81,82 @@ export function clearPendingCheckout(): void {
 // ─── Checkout creation + redirect ───────────────────────────────────────────
 
 /**
+ * Device-local / non-routable hosts can NEVER be public redirect targets —
+ * the hosted Chargily page lives on the gateway's servers, so redirecting it
+ * to `localhost` / a LAN IP / the device's WebView origin lands the payer on
+ * a dead "site can't be reached" page (the exact "redirect back to the app
+ * is broken" report). Used to reject such origins when resolving the
+ * success/failure return URL.
+ */
+function isNonPublicHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return (
+    h === 'localhost' || h.endsWith('.localhost') ||
+    h === '127.0.0.1' || h === '0.0.0.0' || h === '[::1]' || h === '::1' ||
+    h.startsWith('10.') || h.startsWith('192.168.') || h.startsWith('169.254.') ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+    h.endsWith('.local')
+  );
+}
+
+/** True inside the Capacitor native shell (Android/iOS WebView). */
+function isCapacitorShell(): boolean {
+  try {
+    const cap = (window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
+    return !!(cap?.isNativePlatform?.());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the return hints sent with create-checkout:
+ *   - `returnUrl` — the PUBLIC web origin the hosted gateway should send the
+ *     payer back to. On a regular browser this is simply the SPA origin.
+ *     Inside a native shell (Capacitor WebView = `https://localhost`,
+ *     Electron loading the bundled SPA = `http://127.0.0.1:3080`) the page
+ *     origin is device-local, so the CLOUD origin this shell already talks
+ *     to (the same domain serves the SPA) is used instead.
+ *   - `deepLink` — Capacitor only: the `blasti://payment/result` scheme the
+ *     Android app registers. The API appends it (encoded) to the success and
+ *     failure URLs; when the payer's browser lands on the result page it
+ *     immediately bounces into the app, which routes to the in-app payment
+ *     result (payment-deep-link.ts).
+ *
+ * An explicit returnUrl from the caller always wins (payload spread below).
+ */
+function computeReturnHints(): { returnUrl?: string; deepLink?: string } {
+  if (typeof window === 'undefined') return {};
+
+  let returnUrl: string | undefined;
+  const origin = window.location.origin;
+  if (/^https?:\/\//i.test(origin)) {
+    try {
+      const u = new URL(origin);
+      if (!isNonPublicHost(u.hostname)) returnUrl = u.origin;
+    } catch { /* ignore */ }
+  }
+
+  if (!returnUrl) {
+    // Device-local page origin — fall back to the cloud origin the shell
+    // resolves for API traffic (locked baked URL on release mobile builds,
+    // BLASTI_CLOUD_URL on desktop).
+    const cloud = getCloudApiBaseUrl();
+    if (cloud && /^https?:\/\//i.test(cloud)) {
+      try {
+        const u = new URL(cloud);
+        if (!isNonPublicHost(u.hostname)) returnUrl = u.origin;
+      } catch { /* ignore */ }
+    }
+  }
+
+  // The deep-link bounce only makes sense on Capacitor (blasti:// handler);
+  // Electron/browser callers just render the result page where they are.
+  const deepLink = isCapacitorShell() && returnUrl ? MOBILE_DEEP_LINK : undefined;
+  return { returnUrl, deepLink };
+}
+
+/**
  * Create a Chargily checkout and send the customer to the hosted payment
  * page. Throws with a human-readable message on failure.
  *
@@ -87,10 +168,13 @@ export async function startChargilyCheckout(
   payload: Record<string, unknown>,
   opts?: { returnView?: string },
 ): Promise<CreateCheckoutResponse> {
+  // Return-target hints — computed here (NOT by the callers) so every
+  // payment surface gets the fix; explicit payload fields still win.
+  const hints = computeReturnHints();
   const res = await apiFetch('/api/payment/create-checkout', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ ...hints, ...payload }),
   });
 
   const body = await res.json().catch(() => ({}));
@@ -152,7 +236,15 @@ export interface PublicPaymentSettings {
   bankRib?: string;
   bankName?: string;
   ewalletNumber?: string;
-  /** true when the super admin has entered both Chargily keys */
+  // r21-6 — display-safe transfer details (null until the super admin fills
+  // them in; callers fall back to the i18n placeholder instructions).
+  ccpHolderName?: string | null;
+  ccpAddress?: string | null;
+  bankHolderName?: string | null;
+  bankAddress?: string | null;
+  baridiMobEnabled?: boolean;
+  baridiMobNumber?: string | null;
+  /** true when the gateway is enabled AND a usable SECRET key is stored */
   chargilyEnabled?: boolean;
   chargilyMode?: 'sandbox' | 'live';
   chargilyMethods?: string[];

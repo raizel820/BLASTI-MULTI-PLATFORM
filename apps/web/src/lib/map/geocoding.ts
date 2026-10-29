@@ -31,6 +31,13 @@ export interface GeocodeComponents {
   postalCode: string | null;
   /** ISO 3166-1 alpha-2 country code, e.g. "DZ". */
   countryCode: string | null;
+  /**
+   * r21-5 — true when the coordinates being described came from a COARSE
+   * device fix (accuracy > 2km — typical of desktop network/IP geolocation).
+   * Set by the picker on the GPS path only; parents must never auto-fill
+   * address fields from a coarse detection (Setif-vs-M'Sila bug).
+   */
+  coarse?: boolean;
 }
 
 /** The geocoder actually used for a call (surfaced for debugging/audit). */

@@ -108,6 +108,16 @@ export type KioskEventType = 'kiosk:update'
 export type AgencyEventType =
   | 'agency:updated'
 
+/** r21-7 — counter control lifecycle events (routed to the agency room). */
+export type CounterEventType =
+  | 'counter:claimed'
+  | 'counter:released'
+  | 'counter:lost'
+  | 'counter:request-created'
+  | 'counter:request-approved'
+  | 'counter:request-rejected'
+  | 'counter:request-expired'
+
 export type StaffEventType =
   | 'staff:updated'
 
@@ -150,6 +160,12 @@ export interface KioskEventPayload {
 
 export interface AgencyEventPayload {
   type: AgencyEventType
+  agencyId: string
+  data: Record<string, unknown>
+}
+
+export interface CounterEventPayload {
+  type: CounterEventType
   agencyId: string
   data: Record<string, unknown>
 }
@@ -303,6 +319,32 @@ export async function emitAgencyEvent(
  */
 export async function emitStaffEvent(
   type: StaffEventType,
+  agencyId: string,
+  data: Record<string, unknown> = {}
+): Promise<boolean> {
+  try {
+    const body = JSON.stringify({ type, agencyId, data })
+    const response = await fetch(`${REALTIME_SERVICE_URL}/emit`, {
+      method: 'POST',
+      headers: emitHeaders(),
+      body,
+      signal: AbortSignal.timeout(3000),
+    })
+    if (response.ok) recordEmitUsage(body, { agencyId }, response.status, '/realtime/emit')
+    return response.ok
+  } catch (error) {
+    console.warn(`[Realtime] Failed to emit ${type} for agency ${agencyId}:`, error instanceof Error ? error.message : error)
+    return false
+  }
+}
+
+/**
+ * r21-7 — Emit a counter control event to the agency room (claim, release,
+ * request lifecycle). The socket relay in index.ts routes every `counter:*`
+ * type to `agency:${agencyId}`.
+ */
+export async function emitCounterEvent(
+  type: CounterEventType,
   agencyId: string,
   data: Record<string, unknown> = {}
 ): Promise<boolean> {

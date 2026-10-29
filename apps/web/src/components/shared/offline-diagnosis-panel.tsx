@@ -27,9 +27,17 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
 import { useLanguage } from '@/hooks/use-language';
 import { getApiBaseUrl } from '@/lib/api-client';
 import { detectPlatform } from '@/lib/platform';
+import { getCachedServer } from '@/lib/lan-discovery';
+import {
+  getLanAuthorityOverride,
+  getLanAuthoritySnapshot,
+  probeLanMasterStatus,
+  type LanStatusSnapshot,
+} from '@/lib/lan-authority-client';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -284,6 +292,41 @@ export function OfflineDiagnosisPanel({ open, onClose, autoRun = true }: Offline
   const [expandedChecks, setExpandedChecks] = useState<Set<string>>(new Set());
   const [runCount, setRunCount] = useState(0);
   const abortRef = useRef(false);
+
+  // ── 0.6.23 (R-21F-S2): LAN authority (offline master) status card ──────
+  const [lanSnap, setLanSnap] = useState<LanStatusSnapshot | null>(null);
+  const [lanOverrideNow, setLanOverrideNow] = useState(false);
+  const [lanDiscoveredRole, setLanDiscoveredRole] = useState<string | null>(null);
+  const [lanRechecking, setLanRechecking] = useState(false);
+
+  // Refresh the snapshot while the panel is open (5s keeps the last-contact
+  // seconds readable without a per-second timer).
+  useEffect(() => {
+    if (!open) return;
+    const refreshLan = () => {
+      try {
+        setLanSnap(getLanAuthoritySnapshot());
+        setLanOverrideNow(getLanAuthorityOverride() !== null);
+        setLanDiscoveredRole(getCachedServer()?.role ?? null);
+      } catch { /* storage unavailable — card stays hidden */ }
+    };
+    refreshLan();
+    const lanInterval = setInterval(refreshLan, 5000);
+    return () => clearInterval(lanInterval);
+  }, [open]);
+
+  const recheckLanMaster = useCallback(async () => {
+    setLanRechecking(true);
+    try {
+      await probeLanMasterStatus();
+      setLanSnap(getLanAuthoritySnapshot());
+      setLanOverrideNow(getLanAuthorityOverride() !== null);
+    } catch {
+      /* probeLanMasterStatus never throws — guarded anyway */
+    } finally {
+      setLanRechecking(false);
+    }
+  }, []);
 
   const toggleCheckDetails = useCallback((checkId: string) => {
     setExpandedChecks((prev) => {
@@ -929,7 +972,7 @@ export function OfflineDiagnosisPanel({ open, onClose, autoRun = true }: Offline
       case 'warning':
         return <AlertTriangle className="h-5 w-5 text-amber-500" />;
       case 'running':
-        return <Loader2 className="h-5 w-5 text-blue-500 animate-spin" />;
+        return <Loader2 className="h-5 w-5 text-teal-500 animate-spin" />;
       default:
         return <Loader2 className="h-5 w-5 text-gray-400 animate-pulse" />;
     }
@@ -940,7 +983,7 @@ export function OfflineDiagnosisPanel({ open, onClose, autoRun = true }: Offline
       case 'success': return 'border-emerald-500/30 bg-emerald-50 dark:bg-emerald-950/20';
       case 'error': return 'border-rose-500/30 bg-rose-50 dark:bg-rose-950/20';
       case 'warning': return 'border-amber-500/30 bg-amber-50 dark:bg-amber-950/20';
-      case 'running': return 'border-blue-500/30 bg-blue-50 dark:bg-blue-950/20';
+      case 'running': return 'border-teal-500/30 bg-teal-50 dark:bg-teal-950/20';
       default: return 'border-gray-500/30 bg-gray-50 dark:bg-gray-950/20';
     }
   };
@@ -1170,6 +1213,11 @@ export function OfflineDiagnosisPanel({ open, onClose, autoRun = true }: Offline
 
   const groupOrder = ['network', 'local-api', 'client-auth', 'data'];
 
+  // ─── 0.6.23: LAN authority card visibility + role badge ─────────────
+  const lanRole = lanSnap?.active ? lanSnap.role : lanDiscoveredRole;
+  const lanVisible = lanOverrideNow || lanSnap?.active === true || lanRole === 'MASTER' || lanRole === 'FOLLOWER';
+  const lanMaster = lanSnap?.master ?? null;
+
   // ─── Render ──────────────────────────────────────────────────────────────
 
   return (
@@ -1224,6 +1272,62 @@ export function OfflineDiagnosisPanel({ open, onClose, autoRun = true }: Offline
 
             {/* Body */}
             <div className="px-5 py-4 max-h-[55vh] overflow-y-auto space-y-4 custom-scrollbar">
+              {/* 0.6.23 (R-21F-S2): LAN authority (offline master) status card */}
+              {lanVisible && (
+                <div className="rounded-xl border border-emerald-200 dark:border-emerald-800/50 bg-emerald-50/60 dark:bg-emerald-950/20 p-3 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Server className="h-4 w-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span className="text-xs font-semibold text-foreground truncate">{t('offline.lanAuthority')}</span>
+                    </div>
+                    {lanRole && (
+                      <Badge
+                        variant="outline"
+                        dir="ltr"
+                        className={
+                          lanRole === 'MASTER'
+                            ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-300 dark:border-emerald-700'
+                            : 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-300 dark:border-amber-700'
+                        }
+                      >
+                        {lanRole}
+                      </Badge>
+                    )}
+                  </div>
+                  {lanMaster ? (
+                    <>
+                      <p className="text-xs text-muted-foreground">
+                        {lanSnap?.role === 'MASTER'
+                          ? t('offline.youAreMaster')
+                          : t('offline.masterConnected', { name: lanMaster.name || lanMaster.ip })}
+                      </p>
+                      <div className="flex items-center justify-between gap-2 text-xs" dir="ltr">
+                        <span className="font-mono text-muted-foreground">{lanMaster.ip}:{lanMaster.port}</span>
+                        <span className="font-mono text-muted-foreground">{t('offline.term')}: {lanMaster.term ?? '—'}</span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs text-muted-foreground">
+                          {t('offline.lastContact')}: {lanSnap?.lastContactSeconds ?? '—'}s
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs gap-1.5"
+                          onClick={recheckLanMaster}
+                          disabled={lanRechecking}
+                        >
+                          {lanRechecking ? <Loader2 className="h-3 w-3 animate-spin" /> : <RefreshCw className="h-3 w-3" />}
+                          {t('offline.recheck')}
+                        </Button>
+                      </div>
+                    </>
+                  ) : (
+                    <p className="text-xs text-amber-700 dark:text-amber-400">
+                      {lanRole === 'FOLLOWER' ? t('offline.followingMaster') : t('offline.masterLost')}
+                    </p>
+                  )}
+                </div>
+              )}
               {result ? (
                 groupOrder.map((groupId) => {
                   const groupChecks = groupedChecks[groupId];
@@ -1321,13 +1425,13 @@ export function OfflineDiagnosisPanel({ open, onClose, autoRun = true }: Offline
             {/* Tips Section */}
             {tips.length > 0 && result && (
               <div className="px-5 pb-2">
-                <div className="rounded-xl bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800/50 p-3 space-y-2">
-                  <div className="flex items-center gap-1.5 text-xs font-semibold text-blue-700 dark:text-blue-400">
+                <div className="rounded-xl bg-teal-50 dark:bg-teal-950/20 border border-teal-200 dark:border-teal-800/50 p-3 space-y-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-teal-700 dark:text-teal-400">
                     <Info className="h-3.5 w-3.5" />
                     {lang === 'fr' ? 'Conseils de dépannage' : lang === 'en' ? 'Troubleshooting Tips' : 'نصائح لحل المشاكل'}
                   </div>
                   {tips.map((tip, i) => (
-                    <div key={i} className="flex items-start gap-2 text-xs text-blue-600 dark:text-blue-400">
+                    <div key={i} className="flex items-start gap-2 text-xs text-teal-600 dark:text-teal-400">
                       <span className="mt-0.5 flex-shrink-0">{tip.icon}</span>
                       <span>
                         {lang === 'fr' ? tip.textFr : lang === 'en' ? tip.textEn : tip.text}

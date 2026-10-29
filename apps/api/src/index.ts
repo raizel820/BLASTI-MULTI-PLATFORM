@@ -95,6 +95,20 @@ import { adminProviderRoutes } from './routes/admin-providers'
 import { adminDbRoutes } from './routes/admin-db'
 // Storage Manager — SUPER_ADMIN file-store console (sidebar "Storage Manager")
 import { adminStorageRoutes } from './routes/admin-storage'
+// Backup Manager — SUPER_ADMIN snapshots / auto-backups / external targets
+import { adminBackupRoutes } from './routes/admin-backups'
+// System Reset — SUPER_ADMIN full/selective data reset (Backup Manager "Reset" card)
+import { adminResetRoutes } from './routes/admin-reset'
+// logs-1 — per-UID account log vault (ingestion from every app + admin browsing)
+import { logRoutes } from './routes/logs'
+import { startBackupScheduler, stopBackupScheduler } from './workers/backup-scheduler'
+import { ensureCategoryDictionary } from './lib/ensure-category-dictionary'
+// UID-0.6.14 — boot-time backfill: every account without a UID gets one
+// (legacy VPS users, freshly seeded users) each time the API (re)starts.
+import { ensureUserUids } from './lib/uid-generator'
+import { adminServicePolicyRoutes } from './routes/admin-service-policies'
+// P0-5: kiosk routes MOUNTED (mount-or-delete decision) — offline-queue.ts calls /api/kiosk/join; unmounted it 404'd
+import { kioskRoutes } from './routes/kiosk'
 import { appVersionRoutes } from './routes/app-versions'
 // Public App Settings rebuild — real device install tracking + update pusher
 import { appInstallRoutes } from './routes/app-installs'
@@ -114,6 +128,9 @@ import { setSyncNotifyIo, startSyncNotifyTimer } from './lib/sync-notify'
 import { installSyncTracking, pruneSyncChanges } from './lib/sync-helpers'
 import { cancelPendingCustomerAlerts } from './lib/cancel-pending-alerts'
 import { startNotificationWorker, stopNotificationWorker } from './workers/notification-worker'
+// r21-7 — counter control sweeper: frees stale counter control (heartbeat TTL)
+// and expires/auto-approves takeover requests past their 60s window.
+import { startCounterControlSweeper, stopCounterControlSweeper } from './workers/counter-control-sweeper'
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -203,7 +220,10 @@ app.use('*', cors({
   // (device attribution) MUST be allowed or every browser request carrying
   // them dies at preflight ("Failed to fetch") — this silently broke the
   // login form when 55-c introduced the header.
-  allowHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-internal-secret', 'X-Idempotency-Key', 'x-blasti-network', 'x-blasti-device'],
+  // Security-0.6.13: x-blasti-client (platform declaration — web/mobile/
+  // desktop) rides on EVERY request and feeds the role×platform login
+  // matrix + the JWT platform claim; same preflight rule applies.
+  allowHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-internal-secret', 'X-Idempotency-Key', 'x-blasti-network', 'x-blasti-device', 'x-blasti-client'],
   exposeHeaders: ['Set-Cookie', 'X-Idempotency-Replayed'],
   credentials: true,
   maxAge: 86400,
@@ -653,6 +673,15 @@ app.route('/api/admin', adminRoutes)
 app.route('/api/admin/providers', adminProviderRoutes)
 app.route('/api/admin/db', adminDbRoutes)
 app.route('/api/admin/storage', adminStorageRoutes)
+app.route('/api/admin/backups', adminBackupRoutes)
+// System Reset — POST /api/admin/reset (full or per-section, SUPER_ADMIN only)
+app.route('/api/admin/reset', adminResetRoutes)
+// logs-1 — account log vault: POST /api/logs (ingest), GET /api/logs[/uid[/file]] (admin browse)
+app.route('/api/logs', logRoutes)
+// Task C — Services Management: per-agency-type service policies
+app.route('/api/admin/service-policies', adminServicePolicyRoutes)
+// P0-5: public kiosk walk-in surface (device tokens handled inside)
+app.route('/api/kiosk', kioskRoutes)
 app.route('/api/agencies', agenciesRoutes)
 app.route('/api/reservations', reservationsRoutes)
 app.route('/api/queue', queueRoutes)
@@ -952,6 +981,18 @@ function broadcastEvent(event: Record<string, unknown>): number {
   }
 
   if (type.startsWith('staff:')) {
+    const agencyId = event.agencyId as string
+    if (agencyId) {
+      const room = `agency:${agencyId}`
+      io.to(room).emit(type, { ...event, timestamp })
+      const sockets = io.sockets.adapter.rooms.get(room)
+      return sockets ? sockets.size : 0
+    }
+  }
+
+  // r21-7 — counter control events (claim/release/request lifecycle) go to
+  // the agency room: every workstation sees who controls which counter.
+  if (type.startsWith('counter:')) {
     const agencyId = event.agencyId as string
     if (agencyId) {
       const room = `agency:${agencyId}`
@@ -1532,6 +1573,20 @@ httpServer.requestTimeout = 300_000
 httpServer.listen(PORT, HOST, async () => {
   // One-shot database connectivity check (legacy SQLite PRAGMA is a no-op now)
   await setupConnectionPragmas()
+  // Self-healing: guarantee the 4 built-in agency categories (+ their
+  // specialties and terminology defaults) exist in EVERY environment. The
+  // VPS shipped with an empty dictionary (the seed script is manual) which
+  // left the admin Categories Manager + Language pages empty. Fire-and-forget
+  // — the category GETs share the same memoized ensure if this races boot.
+  ensureCategoryDictionary().catch((e) => {
+    console.error('[CATEGORY-DICTIONARY-ENSURE] boot ensure failed:', e instanceof Error ? e.message : e)
+  })
+  // UID-0.6.14 — assign UIDs to accounts missing one (super admin excluded).
+  // Monotonic counters make this idempotent and race-free; runs on every boot
+  // so a VPS rebuild/self-heal always converges to "every user has a UID".
+  ensureUserUids().catch((e) => {
+    console.error('[UID] boot backfill failed:', e instanceof Error ? e.message : e)
+  })
   console.log(`🚀 @blasti/api server running on port ${PORT} (bootId: ${BOOT_ID.substring(0, 8)}…)`)
   console.log(`   API:    http://localhost:${PORT}/ (bound to ${HOST})`)
   console.log(`   Health: http://localhost:${PORT}/health`)
@@ -1566,6 +1621,15 @@ httpServer.listen(PORT, HOST, async () => {
   // Start the background notification worker
   startNotificationWorker()
   console.log('   📨 Notification worker started (30s poll interval)')
+
+  // r21-7 — start the counter control sweeper (guarded against double-start;
+  // frees heartbeat-stale control + expires takeover requests).
+  startCounterControlSweeper()
+  console.log('   🖥️ Counter control sweeper started (60s interval, TTL 3min)')
+
+  // Start the auto-backup scheduler (Backup Manager)
+  startBackupScheduler()
+  console.log('   💾 Backup scheduler started (60s interval)')
 })
 
 // ─── Graceful Shutdown ──────────────────────────────────────────────────────
@@ -1586,11 +1650,15 @@ process.on('uncaughtException', (err) => {
 
 process.on('SIGTERM', () => {
   stopNotificationWorker()
+  stopCounterControlSweeper()
+  stopBackupScheduler()
   if (io) io.close()
   process.exit(0)
 })
 process.on('SIGINT', () => {
   stopNotificationWorker()
+  stopCounterControlSweeper()
+  stopBackupScheduler()
   if (io) io.close()
   process.exit(0)
 })

@@ -123,36 +123,15 @@ export const UserLanguage = {
 export type UserLanguage = (typeof UserLanguage)[keyof typeof UserLanguage]
 
 // ─── Agency Category ──────────────────────────────────────────────────────────
-// Task 42: expanded from 6 to 25 built-ins. Keys map 1:1 to i18n `catXxx`
-// translation keys (CLINIC → catClinic, DENTAL_CLINIC → catDentalClinic, …).
-// User-created categories live in the synced AgencyCategory table and are
-// referenced by their (unique, user-entered) `name`, not by these keys.
+// Task A (R-6): REDUCED from 25 to the 4 product agency types — doctor,
+// clinic, law office, barber. Keys map 1:1 to i18n `catXxx` translation keys
+// (DOCTOR → catDoctor, LAW_FIRM → catLawFirm, …). Custom categories are no
+// longer offered in the UI; legacy stored values degrade gracefully.
 export const AgencyCategory = {
+  DOCTOR: 'DOCTOR',
   CLINIC: 'CLINIC',
-  HOSPITAL: 'HOSPITAL',
-  DENTAL_CLINIC: 'DENTAL_CLINIC',
-  LABORATORY: 'LABORATORY',
-  PHARMACY: 'PHARMACY',
-  VETERINARY: 'VETERINARY',
-  BANK: 'BANK',
-  POST_OFFICE: 'POST_OFFICE',
-  TELECOM: 'TELECOM',
-  INSURANCE: 'INSURANCE',
   LAW_FIRM: 'LAW_FIRM',
-  NOTARY: 'NOTARY',
-  GOVERNMENT: 'GOVERNMENT',
-  EDUCATION: 'EDUCATION',
-  AGENCY: 'AGENCY',
-  TRAVEL: 'TRAVEL',
-  REAL_ESTATE: 'REAL_ESTATE',
-  CAR_SERVICE: 'CAR_SERVICE',
   BARBER: 'BARBER',
-  BEAUTY_SALON: 'BEAUTY_SALON',
-  RESTAURANT: 'RESTAURANT',
-  CAFE: 'CAFE',
-  RETAIL: 'RETAIL',
-  HOTEL: 'HOTEL',
-  OTHER: 'OTHER',
 } as const
 export type AgencyCategory = (typeof AgencyCategory)[keyof typeof AgencyCategory]
 

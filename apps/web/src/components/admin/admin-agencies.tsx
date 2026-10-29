@@ -76,13 +76,13 @@ const statusOptions = [
   { value: 'SUSPENDED', key: 'inactive' as TranslationKeys },
 ];
 
+// Task A (R-6) — the 4 product agency types (single source kept inline to
+// avoid pulling the hook store into the admin bundle).
 const categoryOptions: { value: string; key: TranslationKeys }[] = [
+  { value: 'DOCTOR', key: 'catDoctor' },
   { value: 'CLINIC', key: 'catClinic' },
-  { value: 'AGENCY', key: 'catAgency' },
   { value: 'LAW_FIRM', key: 'catLawFirm' },
-  { value: 'LABORATORY', key: 'catLaboratory' },
-  { value: 'GOVERNMENT', key: 'catGovernment' },
-  { value: 'OTHER', key: 'catOther' },
+  { value: 'BARBER', key: 'catBarber' },
 ];
 
 export function AdminAgencies() {

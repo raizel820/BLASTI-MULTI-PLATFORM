@@ -24,10 +24,10 @@ import {
   Building2,
   Users,
   Zap,
-  Briefcase,
-  FlaskConical,
+  Stethoscope,
+  Hospital,
   Scale,
-  Landmark,
+  Scissors,
   Star,
   Quote,
   ArrowUp,
@@ -117,7 +117,7 @@ function PhoneMockup() {
           {/* Screen */}
           <div className="w-full h-full rounded-[2rem] bg-gradient-to-b from-emerald-50 to-white dark:from-gray-900 dark:to-gray-950 overflow-hidden relative">
             {/* Notch */}
-            <div className="absolute top-0 start-1/2 -translate-x-1/2 w-20 h-5 bg-gray-800 dark:bg-gray-700 rounded-b-2xl z-10" />
+            <div className="absolute top-0 left-1/2 -translate-x-1/2 w-20 h-5 bg-gray-800 dark:bg-gray-700 rounded-b-2xl z-10" />
             
             {/* Status bar */}
             <div className="h-10 flex items-end justify-center pb-1">
@@ -327,7 +327,7 @@ function HeroParticles({ compact = false }: { compact?: boolean }) {
             transition={{ duration: 18, repeat: Infinity, ease: 'easeInOut', delay: 3 }}
           />
           <motion.div
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 rounded-full bg-cyan-300/8 dark:bg-emerald-600/4 blur-3xl"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-72 h-72 rounded-full bg-cyan-300/8 dark:bg-emerald-600/4 blur-3xl"
             animate={{ scale: [1, 1.25, 0.9, 1.15, 1], opacity: [0.06, 0.12, 0.06, 0.1, 0.06] }}
             transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
           />
@@ -421,10 +421,10 @@ export function LandingPage() {
   ];
 
   const trustedCategories = [
-    { icon: Briefcase, labelKey: 'trustedClinic' as const },
-    { icon: FlaskConical, labelKey: 'trustedLab' as const },
+    { icon: Stethoscope, labelKey: 'trustedDoctor' as const },
+    { icon: Hospital, labelKey: 'trustedClinic' as const },
     { icon: Scale, labelKey: 'trustedLaw' as const },
-    { icon: Landmark, labelKey: 'trustedGov' as const },
+    { icon: Scissors, labelKey: 'trustedBarber' as const },
   ];
 
   // Back to top button visibility + sticky header scroll tracking.
@@ -499,7 +499,7 @@ export function LandingPage() {
             <motion.div
               animate={{ scale: [1, 1.2, 1] }}
               transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut' }}
-              className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-emerald-300/10 dark:bg-emerald-700/5 rounded-full blur-3xl"
+              className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-emerald-300/10 dark:bg-emerald-700/5 rounded-full blur-3xl"
             />
             {/* Additional mesh layer: cyan blob */}
             <motion.div
@@ -1554,7 +1554,7 @@ export function LandingPage() {
                 <motion.div whileHover={{ scale: 1.06, y: -3 }} whileTap={{ scale: 0.97 }}>
                   <Button
                     size="lg"
-                    className="bg-white text-emerald-700 hover:bg-emerald-50 font-bold px-8 md:px-10 py-6 md:py-7 text-base md:text-lg rounded-2xl shadow-xl shadow-black/10 min-h-12 md:min-h-14 hover:shadow-2xl hover:shadow-black/15 transition-all duration-300 w-full sm:w-auto"
+                    className="bg-white dark:bg-gray-900 text-emerald-700 hover:bg-emerald-50 font-bold px-8 md:px-10 py-6 md:py-7 text-base md:text-lg rounded-2xl shadow-xl shadow-black/10 min-h-12 md:min-h-14 hover:shadow-2xl hover:shadow-black/15 transition-all duration-300 w-full sm:w-auto"
                     onClick={() => setView('register')}
                   >
                     <span className="flex items-center">
@@ -1660,7 +1660,7 @@ export function LandingPage() {
                 <h4 className="text-xs font-semibold text-foreground mb-3 uppercase tracking-wider">{t('agencies')}</h4>
                 <div className="space-y-2">
                   <p className="text-xs text-muted-foreground hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer transition-colors">{t('trustedClinic')}</p>
-                  <p className="text-xs text-muted-foreground hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer transition-colors">{t('trustedLab')}</p>
+                  <p className="text-xs text-muted-foreground hover:text-emerald-600 dark:hover:text-emerald-400 cursor-pointer transition-colors">{t('trustedLaw')}</p>
                 </div>
               </div>
               <div className="col-span-2 md:col-span-1">

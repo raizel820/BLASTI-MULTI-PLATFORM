@@ -23,6 +23,7 @@ import {
   Loader2,
   Hash,
   Lock,
+  LogIn,
 } from 'lucide-react';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { toast } from 'sonner';
@@ -42,6 +43,10 @@ interface CounterInfo {
   staffName: string | null;
   currentTicket: string | null;
   isActive: boolean;
+  // r21-8 — control model (claim/heartbeat) + bound services
+  controlledByUserId?: string | null;
+  controlledByName?: string | null;
+  boundServices?: Array<{ serviceId: string; name: string; nameAr?: string | null; nameFr?: string | null }>;
 }
 
 interface CounterManagementProps {
@@ -120,6 +125,10 @@ export function CounterManagement({
 
   const myStaffId = authority?.staffId ?? null;
   const isOwnerCaller = authority?.isOwner === true || user?.role === 'AGENCY_OWNER' || user?.role === 'SUPER_ADMIN';
+  // r23 — only the platform operator bypasses the claim gate now. The agency
+  // OWNER needs a claimed counter exactly like staff (server parity:
+  // COUNTER_SETUP_REQUIRED / COUNTER_CONTROL_REQUIRED for everyone else).
+  const bypassesClaim = user?.role === 'SUPER_ADMIN';
 
   const fetchCounters = useCallback(async () => {
     if (!effectiveAgencyId) {
@@ -152,6 +161,20 @@ export function CounterManagement({
             const staff = c.staff as { user?: { fullName?: string; username?: string } } | null | undefined;
             const reservation = c.currentReservation as { displayNumber?: string; status?: string } | null | undefined;
             const branchId = typeof c.branchId === 'string' ? c.branchId : null;
+            // r21-8 — enriched control fields (cloud r21-7 / local r21-8);
+            // accept the plain ids and the nested controlledBy object shape.
+            const controlledByObj = c.controlledBy as { user?: { fullName?: string }; fullName?: string; name?: string } | null | undefined;
+            const boundServices = Array.isArray(c.counterServices)
+              ? (c.counterServices as Array<Record<string, unknown>>).map((cs) => {
+                  const s = cs.service as { name?: string; nameAr?: string; nameFr?: string } | null | undefined;
+                  return {
+                    serviceId: String(cs.serviceId ?? ''),
+                    name: String(s?.name ?? ''),
+                    nameAr: s?.nameAr ?? null,
+                    nameFr: s?.nameFr ?? null,
+                  };
+                }).filter((s) => s.serviceId)
+              : undefined;
             return {
               id: String(c.id),
               number: Number(c.number ?? 0),
@@ -168,6 +191,14 @@ export function CounterManagement({
                   ? reservation.displayNumber ?? null
                   : null,
               isActive: c.isActive !== false,
+              controlledByUserId: (c.controlledByUserId as string | null | undefined) ?? null,
+              controlledByName:
+                (c.controlledByName as string | null | undefined)
+                ?? controlledByObj?.user?.fullName
+                ?? controlledByObj?.fullName
+                ?? controlledByObj?.name
+                ?? null,
+              boundServices: boundServices && boundServices.length > 0 ? boundServices : undefined,
             };
           })
         );
@@ -208,8 +239,13 @@ export function CounterManagement({
       } else {
         const data = await res.json().catch(() => ({}));
         // Task 37-c contract: friendly toasts for the authority errors.
+        // r21-8 — the control model's 403 gates + the legacy occupy one.
         if (data.error === 'OCCUPY_COUNTER_FIRST') {
           toast.error(t('occupyFirst'));
+        } else if (data.error === 'COUNTER_CONTROL_REQUIRED') {
+          toast.error(t('counterControlRequired'));
+        } else if (data.error === 'COUNTER_CONTROL_LOST') {
+          toast.error(t('counterControlLost'));
         } else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) {
           toast.error(t('counterPermissionDenied'));
         } else if (data.error === 'COUNTER_OCCUPIED') {
@@ -226,8 +262,25 @@ export function CounterManagement({
     }
   };
 
-  const occupiedCounters = counters.filter((c) => c.staffId).length;
+  const occupiedCounters = counters.filter((c) => c.staffId || c.controlledByUserId).length;
   const freeCounters = counters.length - occupiedCounters;
+
+  // ─── r21-8 — control-aware call gating ──────────────────────────────
+  // A staff member may only call from a counter they CONTROL (claim model);
+  // owners/SUPER_ADMIN bypass the gate. When the caller controls none, the
+  // card shows the "claim a counter first" CTA into the fullscreen console
+  // instead of call-next buttons that would 403.
+  const myUserId = user?.id || '';
+  const isCounterMine = (c: CounterInfo) =>
+    c.controlledByUserId === myUserId || (!!myStaffId && c.staffId === myStaffId);
+  const controlsAny = counters.some(isCounterMine);
+  // r23 — EVERY account (owner included) may only call from a counter they
+  // CONTROL; only SUPER_ADMIN bypasses (server parity).
+  const canCallCounter = (c: CounterInfo) => bypassesClaim || isCounterMine(c);
+  const openConsole = useAppStore((s) => s.setView);
+
+  const localizeServiceName = (s: { name: string; nameAr?: string | null; nameFr?: string | null }) =>
+    lang === 'ar' ? (s.nameAr || s.name) : lang === 'fr' ? (s.nameFr || s.name) : s.name;
 
   return (
     <motion.div
@@ -256,6 +309,27 @@ export function CounterManagement({
           </div>
         </CardHeader>
         <CardContent className="pt-0">
+          {/* r21-8 — CTA: the caller controls NO counter. Call-next from the
+              dashboard would 403 COUNTER_CONTROL_REQUIRED — route them to the
+              fullscreen console's claim flow instead. */}
+          {!loadingCounters && counters.length > 0 && !bypassesClaim && !controlsAny && (
+            <div className="mb-3 flex items-center justify-between gap-2 rounded-xl border border-amber-200 dark:border-amber-800/40 bg-amber-50/70 dark:bg-amber-900/15 px-3.5 py-2.5">
+              <div className="flex items-center gap-2 min-w-0">
+                <Lock className="h-4 w-4 text-amber-600 dark:text-amber-400 flex-shrink-0" />
+                <span className="text-xs font-medium text-amber-800 dark:text-amber-300 truncate">
+                  {t('claimCounterFirstCta')}
+                </span>
+              </div>
+              <Button
+                size="sm"
+                onClick={() => openConsole('agency-fullscreen')}
+                className="h-9 px-3 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold gap-1 flex-shrink-0"
+              >
+                <LogIn className="h-3.5 w-3.5" />
+                {t('openQueueConsole')}
+              </Button>
+            </div>
+          )}
           <div className="space-y-2.5 max-h-96 overflow-y-auto custom-scrollbar">
             {loadingCounters && counters.length === 0 ? (
               <p className="text-xs text-muted-foreground py-4 text-center">{t('loading' as any) || '...'}</p>
@@ -264,49 +338,52 @@ export function CounterManagement({
             ) : (
               counters.map((counter, idx) => {
                 const occupiedByOther =
-                  !!counter.staffId && !isOwnerCaller && counter.staffId !== myStaffId;
+                  !!(counter.controlledByUserId || counter.staffId) &&
+                  !bypassesClaim &&
+                  !isCounterMine(counter);
+                const holderName = counter.controlledByName || counter.staffName || null;
                 return (
                   <motion.div
                     key={counter.id}
                     initial={{ opacity: 0, x: -10 }}
                     animate={{ opacity: 1, x: 0 }}
                     transition={{ delay: Math.min(idx * 0.06, 0.3) }}
-                    className={`relative rounded-xl border p-3 transition-all duration-200 ${COUNTER_BG_COLORS[idx % COUNTER_BG_COLORS.length]} ${
+                    className={`relative rounded-xl border p-4 transition-all duration-200 ${COUNTER_BG_COLORS[idx % COUNTER_BG_COLORS.length]} ${
                       counter.currentTicket ? 'ring-1 ring-emerald-300/50 dark:ring-emerald-700/50' : ''
                     }`}
                   >
                     <div className="flex items-center gap-3">
                       {/* Counter Number Badge */}
-                      <div className={`h-10 w-10 rounded-xl bg-gradient-to-br ${COUNTER_COLORS[idx % COUNTER_COLORS.length]} flex items-center justify-center flex-shrink-0 shadow-md`}>
-                        <span className="text-sm font-black text-white">{counter.number}</span>
+                      <div className={`h-12 w-12 rounded-xl bg-gradient-to-br ${COUNTER_COLORS[idx % COUNTER_COLORS.length]} flex items-center justify-center flex-shrink-0 shadow-md`}>
+                        <span className="text-lg font-black text-white">{counter.number}</span>
                       </div>
 
                       {/* Counter Info */}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-xs font-semibold text-foreground truncate max-w-[120px]">
+                          <span className="text-sm font-semibold text-foreground truncate max-w-[200px]">
                             {localizeCounterName(counter)}
                           </span>
                           {counter.branchName && (
-                            <span className="text-[10px] text-muted-foreground truncate max-w-[100px]">
+                            <span className="text-xs text-muted-foreground truncate max-w-[140px]">
                               · {counter.branchName}
                             </span>
                           )}
-                          {/* Occupation state — real staff relation */}
-                          {counter.staffId ? (
-                            <Badge className="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400 text-[9px] px-1.5 py-0 h-4 border-0">
-                              <User className="h-2.5 w-2.5 me-0.5" />
-                              {counter.staffName
-                                ? t('counterOccupiedBy', { name: counter.staffName })
+                          {/* Occupation / control state — real relations */}
+                          {(counter.controlledByUserId || counter.staffId) ? (
+                            <Badge className="bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400 text-[10px] px-2 py-0 h-5 border-0">
+                              <User className="h-3 w-3 me-0.5" />
+                              {holderName
+                                ? t('counterOccupiedBy', { name: holderName })
                                 : t('counterOccupied')}
                             </Badge>
                           ) : (
-                            <Badge className="bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 text-[9px] px-1.5 py-0 h-4 border-0">
+                            <Badge className="bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400 text-[10px] px-2 py-0 h-5 border-0">
                               {t('counterFree')}
                             </Badge>
                           )}
                           {counter.currentTicket && (
-                            <Badge className="bg-white/80 dark:bg-gray-900/60 text-emerald-700 dark:text-emerald-400 text-[9px] px-1.5 py-0 h-4 border border-emerald-200 dark:border-emerald-800">
+                            <Badge className="bg-white/80 dark:bg-gray-900/60 text-emerald-700 dark:text-emerald-400 text-[10px] px-2 py-0 h-5 border border-emerald-200 dark:border-emerald-800">
                               {t('serving' as any) || 'Serving'}
                             </Badge>
                           )}
@@ -314,14 +391,28 @@ export function CounterManagement({
 
                         {/* Current Ticket Info */}
                         {counter.currentTicket ? (
-                          <div className="flex items-center gap-2 mt-1">
+                          <div className="flex items-center gap-2 mt-1.5">
                             <div className="flex items-center gap-1">
-                              <Hash className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
-                              <span className="text-sm font-bold text-emerald-700 dark:text-emerald-400">{counter.currentTicket}</span>
+                              <Hash className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                              <span className="text-base font-bold text-emerald-700 dark:text-emerald-400">{counter.currentTicket}</span>
                             </div>
                           </div>
                         ) : (
-                          <p className="text-[10px] text-muted-foreground mt-1">{t('noTicketBeingServed' as any)}</p>
+                          <p className="text-xs text-muted-foreground mt-1">{t('noTicketBeingServed' as any)}</p>
+                        )}
+                        {/* r21-8 — bound-services (specialty) chips */}
+                        {!!counter.boundServices && counter.boundServices.length > 0 && (
+                          <div className="flex items-center gap-1 mt-1.5 flex-wrap">
+                            {counter.boundServices.map((s) => (
+                              <Badge
+                                key={s.serviceId}
+                                variant="outline"
+                                className="text-[10px] px-1.5 py-0 h-5 border-gray-200 dark:border-gray-700 text-muted-foreground"
+                              >
+                                {localizeServiceName(s)}
+                              </Badge>
+                            ))}
+                          </div>
                         )}
                       </div>
 
@@ -334,20 +425,20 @@ export function CounterManagement({
                                 <Button
                                   size="sm"
                                   disabled
-                                  className="h-8 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-emerald-700 text-white text-xs font-semibold gap-1 shadow-sm disabled:opacity-50"
+                                  className="h-9 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-emerald-700 text-white text-xs font-semibold gap-1 shadow-sm disabled:opacity-50"
                                 >
-                                  <Lock className="h-3 w-3" />
-                                  <span className="hidden sm:inline">{t('callNext')}</span>
+                                  <Lock className="h-3.5 w-3.5" />
+                                  <span>{t('callNext')}</span>
                                 </Button>
                               </div>
                             </TooltipTrigger>
                             <TooltipContent className="max-w-[220px]">
-                              {counter.staffName
-                                ? t('counterOccupiedBy', { name: counter.staffName })
+                              {holderName
+                                ? t('counterOccupiedBy', { name: holderName })
                                 : t('counterOccupied')}
                             </TooltipContent>
                           </Tooltip>
-                        ) : (
+                        ) : canCallCounter(counter) ? (
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }} className={!subscriptionActive ? 'cursor-not-allowed' : undefined}>
@@ -355,22 +446,41 @@ export function CounterManagement({
                                   size="sm"
                                   onClick={() => { if (subscriptionActive) handleCallNextForCounter(counter.id); }}
                                   disabled={!!callingCounterId || !subscriptionActive}
-                                  className="h-8 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-emerald-700 hover:from-emerald-600 hover:to-emerald-800 text-white text-xs font-semibold gap-1 shadow-sm disabled:opacity-50"
+                                  className="h-9 px-3 rounded-lg bg-gradient-to-r from-emerald-500 to-emerald-700 hover:from-emerald-600 hover:to-emerald-800 text-white text-xs font-semibold gap-1 shadow-sm disabled:opacity-50"
                                 >
                                   {callingCounterId === counter.id ? (
-                                    <Loader2 className="h-3 w-3 animate-spin" />
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
                                   ) : !subscriptionActive ? (
-                                    <Lock className="h-3 w-3" />
+                                    <Lock className="h-3.5 w-3.5" />
                                   ) : (
-                                    <PhoneCall className="h-3 w-3" />
+                                    <PhoneCall className="h-3.5 w-3.5" />
                                   )}
-                                  <span className="hidden sm:inline">{t('callNext')}</span>
+                                  <span>{t('callNext')}</span>
                                 </Button>
                               </motion.div>
                             </TooltipTrigger>
                             {!subscriptionActive && (
                               <TooltipContent>{t('subscriptionLockedTooltip')}</TooltipContent>
                             )}
+                          </Tooltip>
+                        ) : (
+                          // r21-8 — a free counter the caller does NOT control:
+                          // call-next would 403 COUNTER_CONTROL_REQUIRED, so the
+                          // button claims it via the console instead.
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+                                <Button
+                                  size="sm"
+                                  onClick={() => openConsole('agency-fullscreen')}
+                                  className="h-9 px-3 rounded-lg border border-emerald-500/40 bg-transparent text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/10 text-xs font-semibold gap-1"
+                                >
+                                  <LogIn className="h-3.5 w-3.5" />
+                                  <span>{t('claimCounterFirstCta')}</span>
+                                </Button>
+                              </motion.div>
+                            </TooltipTrigger>
+                            <TooltipContent className="max-w-[220px]">{t('claimCounterFirstCta')}</TooltipContent>
                           </Tooltip>
                         )}
                       </div>
@@ -386,15 +496,15 @@ export function CounterManagement({
             <div className="grid grid-cols-3 gap-2 text-center">
               <div>
                 <p className="text-sm font-bold text-foreground">{counters.length}</p>
-                <p className="text-[9px] text-muted-foreground">{t('totalCounters' as any)}</p>
+                <p className="text-[10px] text-muted-foreground">{t('totalCounters' as any)}</p>
               </div>
               <div>
                 <p className="text-sm font-bold text-emerald-600 dark:text-emerald-400">{servedToday}</p>
-                <p className="text-[9px] text-muted-foreground">{t('served' as any) || 'served'}</p>
+                <p className="text-[10px] text-muted-foreground">{t('served' as any) || 'served'}</p>
               </div>
               <div>
                 <p className="text-sm font-bold text-foreground">~{avgWaitTime}{t('min')}</p>
-                <p className="text-[9px] text-muted-foreground">{t('avgServiceTimeLabel') || 'Avg. Service'}</p>
+                <p className="text-[10px] text-muted-foreground">{t('avgServiceTimeLabel') || 'Avg. Service'}</p>
               </div>
             </div>
           </div>

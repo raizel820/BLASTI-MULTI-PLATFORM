@@ -361,6 +361,13 @@ function getEffectiveMode(
 ): ConnectionMode {
   if (!browserOnline) return 'offline';
   if (cloudReachable === true) return 'online';
+  // MOBILE AGENCY-PAGE FIX (logs-1 round): the realtime socket is a LIVE
+  // connection to the API — when it is connected, the API is reachable by
+  // definition. Two aborted HTTP probes during a load spike (heavy compile,
+  // phone radio wake-up) must no longer label the page "You're offline"
+  // while the dashboard itself was happily streaming data (the contradictory
+  // offline banner + "متصل" dot the mobile report showed).
+  if (isConnected) return 'online';
   if (cloudReachable === false) {
     // Cloud is down — check if we're in Electron with LAN
     if (lanReachable === true) return 'local-mode';

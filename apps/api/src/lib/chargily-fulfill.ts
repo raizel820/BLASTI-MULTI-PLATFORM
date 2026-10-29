@@ -216,80 +216,88 @@ export async function fulfillCheckoutPaid(
   })
 
   if (transaction && transaction.status === 'PENDING') {
-    await db.transaction.update({
-      where: { id: transaction.id },
-      data: {
-        status: 'COMPLETED',
-        webhookVerified: true,
-        reviewedAt: new Date(),
-        amountPaid: transaction.amount,
-        ...(methodSnapshot ? { paymentMethod: methodSnapshot } : {}),
-        version: { increment: 1 },
-      },
+    // P0-2: the ENTIRE settlement (Transaction → COMPLETED + Agency
+    // activation + AuditLog) is now ONE $transaction — a crash mid-settle
+    // can no longer leave a COMPLETED payment with an INACTIVE agency
+    // (or vice versa). Notification + realtime emit stay outside: they are
+    // best-effort by contract and must never fail (or roll back) settlement.
+    await db.$transaction(async (tx) => {
+      await tx.transaction.update({
+        where: { id: transaction.id },
+        data: {
+          status: 'COMPLETED',
+          webhookVerified: true,
+          reviewedAt: new Date(),
+          amountPaid: transaction.amount,
+          ...(methodSnapshot ? { paymentMethod: methodSnapshot } : {}),
+          version: { increment: 1 },
+        },
+      })
+
+      // Subscription activation — only for SUBSCRIPTION-type transactions
+      // (HARDWARE transactions just complete; the linked order is approved below).
+      if (transaction.type !== 'HARDWARE') {
+        const planRecord = await tx.subscriptionPlan.findFirst({
+          where: { name: transaction.plan, isActive: true },
+        })
+        const { subscriptionExpiresAt: termExpiry } = computeSubscriptionExpiry(
+          transaction.planName,
+          planRecord?.billingCycle,
+        )
+
+        // ── Upgrade / early-renewal stacking (proration counterpart) ──
+        // Checkout creation does NOT touch subscriptionExpiresAt, so at
+        // settlement time it still holds the CURRENT window's expiry. When
+        // that window is still active, the purchased term STACKS on top of it
+        // (remaining days preserved — the agency paid for them). An expired
+        // window behaves exactly as before (term starts now).
+        const current = await tx.agency.findUnique({
+          where: { id: transaction.agencyId },
+          select: { subscriptionStartsAt: true, subscriptionExpiresAt: true },
+        })
+        const now = new Date()
+        const stillActive = !!current?.subscriptionExpiresAt && current.subscriptionExpiresAt.getTime() > now.getTime()
+        const base = stillActive ? (current.subscriptionExpiresAt as Date) : now
+
+        let subscriptionExpiresAt: Date | null = termExpiry
+        if (termExpiry && stillActive) {
+          const stacked = new Date(base)
+          stacked.setTime(stacked.getTime() + (termExpiry.getTime() - now.getTime()))
+          subscriptionExpiresAt = stacked
+        }
+
+        await tx.agency.update({
+          where: { id: transaction.agencyId },
+          data: {
+            subscriptionStatus: 'ACTIVE',
+            subscriptionTier: transaction.plan,
+            subscriptionPlanId: planRecord?.id || undefined,
+            subscriptionStartsAt: stillActive ? (current?.subscriptionStartsAt ?? now) : now,
+            subscriptionExpiresAt,
+          },
+        })
+      }
+
+      await tx.auditLog.create({
+        data: {
+          action: settlementAuditAction('PAYMENT', 'PAID', source),
+          entityType: 'TRANSACTION',
+          entityId: transaction.id,
+          details: JSON.stringify({
+            checkoutId: checkout.id,
+            amount: checkout.amount,
+            paymentMethod: checkout.payment_method,
+            agencyId: transaction.agencyId,
+            type: transaction.type,
+            source,
+          }),
+        },
+      })
     })
+
     result.transactionId = transaction.id
     result.agencyId = transaction.agencyId
     result.handled = true
-
-    // Subscription activation — only for SUBSCRIPTION-type transactions
-    // (HARDWARE transactions just complete; the linked order is approved below).
-    if (transaction.type !== 'HARDWARE') {
-      const planRecord = await db.subscriptionPlan.findFirst({
-        where: { name: transaction.plan, isActive: true },
-      })
-      const { subscriptionExpiresAt: termExpiry } = computeSubscriptionExpiry(
-        transaction.planName,
-        planRecord?.billingCycle,
-      )
-
-      // ── Upgrade / early-renewal stacking (proration counterpart) ──
-      // Checkout creation does NOT touch subscriptionExpiresAt, so at
-      // settlement time it still holds the CURRENT window's expiry. When
-      // that window is still active, the purchased term STACKS on top of it
-      // (remaining days preserved — the agency paid for them). An expired
-      // window behaves exactly as before (term starts now).
-      const current = await db.agency.findUnique({
-        where: { id: transaction.agencyId },
-        select: { subscriptionStartsAt: true, subscriptionExpiresAt: true },
-      })
-      const now = new Date()
-      const stillActive = !!current?.subscriptionExpiresAt && current.subscriptionExpiresAt.getTime() > now.getTime()
-      const base = stillActive ? (current.subscriptionExpiresAt as Date) : now
-
-      let subscriptionExpiresAt: Date | null = termExpiry
-      if (termExpiry && stillActive) {
-        const stacked = new Date(base)
-        stacked.setTime(stacked.getTime() + (termExpiry.getTime() - now.getTime()))
-        subscriptionExpiresAt = stacked
-      }
-
-      await db.agency.update({
-        where: { id: transaction.agencyId },
-        data: {
-          subscriptionStatus: 'ACTIVE',
-          subscriptionTier: transaction.plan,
-          subscriptionPlanId: planRecord?.id || undefined,
-          subscriptionStartsAt: stillActive ? (current?.subscriptionStartsAt ?? now) : now,
-          subscriptionExpiresAt,
-        },
-      })
-    }
-
-    await db.auditLog.create({
-      data: {
-        action: settlementAuditAction('PAYMENT', 'PAID', source),
-        entityType: 'TRANSACTION',
-        entityId: transaction.id,
-        details: JSON.stringify({
-          checkoutId: checkout.id,
-          amount: checkout.amount,
-          paymentMethod: checkout.payment_method,
-          agencyId: transaction.agencyId,
-          type: transaction.type,
-          source,
-        }),
-      },
-    })
 
     // Task 2-e: notify the agency owner (best-effort — never fail settlement).
     try {
@@ -482,32 +490,36 @@ export async function fulfillCheckoutFailed(
     result.handled = true
 
     if (transaction.status === 'PENDING') {
-      await db.transaction.update({
-        where: { id: transaction.id },
-        data: {
-          status: 'FAILED',
-          webhookVerified: true,
-          rejectionReason: 'Chargily checkout failed or was canceled',
-          version: { increment: 1 },
-        },
-      })
-
-      // Only demote agencies that were flipped to PENDING by the checkout
-      // creation — never downgrade an already-ACTIVE subscription.
-      if (transaction.agency.subscriptionStatus === 'PENDING') {
-        await db.agency.update({
-          where: { id: transaction.agencyId },
-          data: { subscriptionStatus: 'INACTIVE' },
+      // P0-2: failure settlement is equally atomic (Transaction FAILED +
+      // agency demotion + AuditLog in ONE $transaction).
+      await db.$transaction(async (tx) => {
+        await tx.transaction.update({
+          where: { id: transaction.id },
+          data: {
+            status: 'FAILED',
+            webhookVerified: true,
+            rejectionReason: 'Chargily checkout failed or was canceled',
+            version: { increment: 1 },
+          },
         })
-      }
 
-      await db.auditLog.create({
-        data: {
-          action: settlementAuditAction('PAYMENT', 'FAILED', source),
-          entityType: 'TRANSACTION',
-          entityId: transaction.id,
-          details: JSON.stringify({ checkoutId: checkout.id, agencyId: transaction.agencyId, source }),
-        },
+        // Only demote agencies that were flipped to PENDING by the checkout
+        // creation — never downgrade an already-ACTIVE subscription.
+        if (transaction.agency.subscriptionStatus === 'PENDING') {
+          await tx.agency.update({
+            where: { id: transaction.agencyId },
+            data: { subscriptionStatus: 'INACTIVE' },
+          })
+        }
+
+        await tx.auditLog.create({
+          data: {
+            action: settlementAuditAction('PAYMENT', 'FAILED', source),
+            entityType: 'TRANSACTION',
+            entityId: transaction.id,
+            details: JSON.stringify({ checkoutId: checkout.id, agencyId: transaction.agencyId, source }),
+          },
+        })
       })
 
       // Task 2-e: notify the agency owner (best-effort — never fail settlement).

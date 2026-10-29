@@ -310,8 +310,8 @@ export async function seed() {
       name: 'My Agency',
       // Exactly what the real auto-derive produces: name.slice(0, 3).toUpperCase()
       customCode: 'MYA',
-      // Route default when the create form omits a category
-      category: 'OTHER',
+      // One of the 4 product agency types (doctor/clinic/law office/barber)
+      category: 'CLINIC',
       ownerId: owner.id,
       // ── Task 47 — EXPLICIT initial values, identical to the schema
       // defaults the real POST /agencies flow lands on. Written out so a

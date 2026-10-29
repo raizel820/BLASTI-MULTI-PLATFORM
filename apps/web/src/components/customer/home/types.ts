@@ -2,30 +2,9 @@ import type { TranslationKeys } from '@/i18n';
 import {
   Navigation,
   Stethoscope,
-  Globe,
+  Hospital,
   Scale,
-  FlaskConical,
-  Landmark,
-  Building2,
-  Cross,
-  Smile,
-  Pill,
-  PawPrint,
-  Banknote,
-  Mail,
-  Smartphone,
-  Shield,
-  FileText,
-  GraduationCap,
-  Plane,
-  Home,
-  Car,
   Scissors,
-  Sparkles,
-  Utensils,
-  Coffee,
-  ShoppingBag,
-  Hotel,
 } from 'lucide-react';
 
 export interface AgencyListItem {
@@ -52,6 +31,10 @@ export interface AgencyListItem {
   // access is granted. Optional: older payloads omit them.
   latitude?: number | null;
   longitude?: number | null;
+  // Task 5-b — Agencies Management: parsed specialty ids the agency serves
+  // (GET /api/agencies now enriches them). Optional: cached/older payloads
+  // and desktop local builds omit them → the specialty filter skips them.
+  specialtyIds?: string[];
 }
 
 export interface AgencyDetail {
@@ -95,45 +78,18 @@ export interface CategoryKey {
 }
 
 /**
- * Cast an i18n key that is not in the generated TranslationKeys union yet
- * (the catXxx additions land with the Task 42 i18n pass). Keeps the literal
- * at the call site for greppability.
- */
-const k = (key: string) => key as TranslationKeys;
-
-/**
- * Task 42 — the 25 built-in category filter chips (ALL first). Custom
- * (user-created) categories are appended dynamically in CategoryFilters.tsx
- * via useAgencyCategories(); they use the Tag icon and are matched/displayed
+ * Task A (R-6) — reduced to the 4 product agency types (doctor, clinic,
+ * law office, barber). Legacy custom (user-created) categories, if any rows
+ * still exist, are appended dynamically in CategoryFilters.tsx via
+ * useAgencyCategories(); they use the Tag icon and are matched/displayed
  * by their user-entered name (uppercased for the case-insensitive filter).
  */
 export const categoryKeys: CategoryKey[] = [
   { key: 'catAll', value: 'ALL', icon: Navigation },
-  { key: 'catClinic', value: 'CLINIC', icon: Stethoscope },
-  { key: k('catHospital'), value: 'HOSPITAL', icon: Cross },
-  { key: k('catDentalClinic'), value: 'DENTAL_CLINIC', icon: Smile },
-  { key: 'catLaboratory', value: 'LABORATORY', icon: FlaskConical },
-  { key: k('catPharmacy'), value: 'PHARMACY', icon: Pill },
-  { key: k('catVeterinary'), value: 'VETERINARY', icon: PawPrint },
-  { key: k('catBank'), value: 'BANK', icon: Banknote },
-  { key: k('catPostOffice'), value: 'POST_OFFICE', icon: Mail },
-  { key: k('catTelecom'), value: 'TELECOM', icon: Smartphone },
-  { key: k('catInsurance'), value: 'INSURANCE', icon: Shield },
+  { key: 'catDoctor', value: 'DOCTOR', icon: Stethoscope },
+  { key: 'catClinic', value: 'CLINIC', icon: Hospital },
   { key: 'catLawFirm', value: 'LAW_FIRM', icon: Scale },
-  { key: k('catNotary'), value: 'NOTARY', icon: FileText },
-  { key: 'catGovernment', value: 'GOVERNMENT', icon: Landmark },
-  { key: k('catEducation'), value: 'EDUCATION', icon: GraduationCap },
-  { key: 'catAgency', value: 'AGENCY', icon: Globe },
-  { key: k('catTravel'), value: 'TRAVEL', icon: Plane },
-  { key: k('catRealEstate'), value: 'REAL_ESTATE', icon: Home },
-  { key: k('catCarService'), value: 'CAR_SERVICE', icon: Car },
-  { key: k('catBarber'), value: 'BARBER', icon: Scissors },
-  { key: k('catBeautySalon'), value: 'BEAUTY_SALON', icon: Sparkles },
-  { key: k('catRestaurant'), value: 'RESTAURANT', icon: Utensils },
-  { key: k('catCafe'), value: 'CAFE', icon: Coffee },
-  { key: k('catRetail'), value: 'RETAIL', icon: ShoppingBag },
-  { key: k('catHotel'), value: 'HOTEL', icon: Hotel },
-  { key: 'catOther', value: 'OTHER', icon: Building2 },
+  { key: 'catBarber', value: 'BARBER', icon: Scissors },
 ];
 
 export function getAgencyName(a: AgencyListItem | AgencyDetail, lang: string): string {

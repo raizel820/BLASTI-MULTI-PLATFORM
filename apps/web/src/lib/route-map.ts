@@ -36,7 +36,8 @@ export const viewToUrl: Record<ViewName, string> = {
   // Task 42-e: dedicated Analytics & Statistics section. While wiring the new
   // view, this legacy map was also completed to be exhaustive over ViewName
   // (it previously missed 9 views and failed the Record<ViewName,string>
-  // typecheck; it is not imported anywhere today, but kept type-safe).
+  // typecheck). LIVE via payment-result.tsx (viewToUrl + getAllowedRolesForView);
+  // the app-store hash map (#/…) is the one used for day-to-day URL sync.
   'agency-analytics': '/agency/analytics',
   'agency-support': '/agency/support',
   'agency-devices': '/agency/devices',
@@ -44,7 +45,14 @@ export const viewToUrl: Record<ViewName, string> = {
   'agency-fullscreen-history': '/agency/fullscreen/history',
   'admin-dashboard': '/admin',
   'admin-transactions': '/admin/transactions',
+  // Task 5-a: Agencies Management group. The role guard for all three is
+  // inherited from the `admin-` prefix branch in getAllowedRolesForView
+  // (SUPER_ADMIN only), same as every other admin view.
+  'admin-agencies-management': '/admin/agencies-management',
   'admin-agencies': '/admin/agencies',
+  'admin-services-management': '/admin/services-management',
+  'admin-category-manager': '/admin/category-manager',
+  'admin-category-language': '/admin/category-language',
   'admin-audit': '/admin/audit',
   'admin-users': '/admin/users',
   'admin-analytics': '/admin/analytics',
@@ -60,6 +68,9 @@ export const viewToUrl: Record<ViewName, string> = {
   'admin-settings-faq': '/admin/settings/faq',
   'admin-settings-config': '/admin/settings/config',
   'admin-settings-financial': '/admin/settings/financial',
+  // r21-6 — unified Payment Center. Role guard inherited from the `admin-`
+  // prefix branch in getAllowedRolesForView (SUPER_ADMIN only).
+  'admin-payment-settings': '/admin/payment-settings',
   'admin-tickets': '/admin/tickets',
   // Task 2-b: dedicated super-admin Maps & Location view. The role guard is
   // inherited from the `admin-` prefix branch in getAllowedRolesForView below
@@ -78,6 +89,9 @@ export const viewToUrl: Record<ViewName, string> = {
   // Role guard is inherited from the `admin-` prefix branch in
   // getAllowedRolesForView (SUPER_ADMIN only), same as admin-db.
   'admin-storage': '/admin/storage',
+  // logs-2 (0.6.19): Logs Manager — realtime log analysis console, same
+  // SUPER_ADMIN guard as every other admin view (admin- prefix branch).
+  'admin-logs-manager': '/admin/logs-manager',
   'kiosk': '/kiosk',
 };
 

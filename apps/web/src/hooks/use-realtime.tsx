@@ -30,6 +30,7 @@ import { shouldShowAlert, enterSleepMode, clearSleep, subscribe as subscribeSlee
 import { markReservationConfirmed, stopNotificationSound } from '@/lib/sounds'
 import { wasTurnAlertDismissedNatively } from '@/lib/notification-channel'
 import { getNativeCloudUrl, ensureNativeCloudUrl, onNativeCloudStateChange } from '@/lib/native-cloud-resolver'
+import { handleRealtimeCacheEvent } from '@/lib/realtime-cache-invalidation'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -269,41 +270,16 @@ async function connectLanSocket() {
     // the primary socket for Electron (see resolveSocketUrl), so this separate
     // LAN fallback is dead code for the desktop. For Capacitor the local API
     // is HTTP-only from the client's perspective; cloud Socket.IO handles all
-    // realtime events. Kept with an early return to preserve the structure.
+    // realtime events. Kept as an early return to preserve the structure.
+    //
+    // Hotfix 0.6.12 — the previously unreachable handler bodies below the
+    // return referenced `setConnectionStatus`, which was never in this
+    // module-level function's scope (it only exists inside the hooks below).
+    // Dead code that would throw a ReferenceError the moment anyone removed
+    // the early return — removed rather than left as a landmine. The
+    // `lanSocket` module variable stays: the disconnect cleanup below still
+    // references it.
     return
-    const lanUrl = `http://${server.ip}:${server.port}`
-    lanSocket = io(lanUrl, {
-      transports: ['websocket', 'polling'],
-      timeout: 5000,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 2000,
-    })
-
-    const queueEvents = [
-      'queue:called', 'queue:joined', 'queue:completed', 'queue:cancelled',
-      'queue:paused', 'queue:resumed', 'queue:walk-in', 'queue:postponed',
-      'notification:new', 'notification:read',
-      'agency:update', 'staff:update',
-    ]
-
-    lanSocket.on('connect', () => {
-      lanSocketConnected = true
-      console.log('[Realtime] LAN socket connected to', lanUrl)
-      // Update connection status to connected
-      setConnectionStatus('connected')
-    })
-
-    lanSocket.on('disconnect', () => {
-      lanSocketConnected = false
-      console.log('[Realtime] LAN socket disconnected')
-      if (!globalSocket?.connected) {
-        setConnectionStatus('disconnected')
-      }
-    })
-
-    lanSocket.on('error', () => {
-      lanSocketConnected = false
-    })
   } catch (err) {
     console.warn('[Realtime] LAN fallback failed:', err)
   }
@@ -607,6 +583,19 @@ export function useRealtime(options?: UseRealtimeOptions) {
 
   const onStaffUpdated = useCallback((handler: EventHandler) => on('staff:updated', handler as SocketHandler), [on])
 
+  // ─── Typed Event Subscriptions (Counter control — r21-8) ────────────
+  // Emitted by the cloud agency room AND the desktop local realtime bridge
+  // (same names). Payload shape: { agencyId, counterId, counterName,
+  // counterNumber, ... } — request events additionally carry requestId,
+  // userId, expiresAt; 'lost' marks an expired/stolen control.
+  const onCounterClaimed = useCallback((handler: EventHandler) => on('counter:claimed', handler as SocketHandler), [on])
+  const onCounterReleased = useCallback((handler: EventHandler) => on('counter:released', handler as SocketHandler), [on])
+  const onCounterRequestCreated = useCallback((handler: EventHandler) => on('counter:request-created', handler as SocketHandler), [on])
+  const onCounterRequestApproved = useCallback((handler: EventHandler) => on('counter:request-approved', handler as SocketHandler), [on])
+  const onCounterRequestRejected = useCallback((handler: EventHandler) => on('counter:request-rejected', handler as SocketHandler), [on])
+  const onCounterRequestExpired = useCallback((handler: EventHandler) => on('counter:request-expired', handler as SocketHandler), [on])
+  const onCounterLost = useCallback((handler: EventHandler) => on('counter:lost', handler as SocketHandler), [on])
+
   // ─── Any Event (debug/logging) ──────────────────────────────────────
 
   const onAnyEvent = useCallback((handler: (...args: unknown[]) => void) => {
@@ -689,6 +678,15 @@ export function useRealtime(options?: UseRealtimeOptions) {
     // Staff event subscriptions
     onStaffUpdated,
 
+    // Counter-control event subscriptions (r21-8)
+    onCounterClaimed,
+    onCounterReleased,
+    onCounterRequestCreated,
+    onCounterRequestApproved,
+    onCounterRequestRejected,
+    onCounterRequestExpired,
+    onCounterLost,
+
     // Generic (backward compat)
     subscribe,
     unsubscribe,
@@ -707,6 +705,9 @@ export function useRealtime(options?: UseRealtimeOptions) {
     onReservationCreated, onReservationUpdated, onReservationCancelled,
     onNotification, onTurnApproaching, onYourTurn,
     onKioskUpdate, onAgencyUpdated, onStaffUpdated,
+    onCounterClaimed, onCounterReleased, onCounterRequestCreated,
+    onCounterRequestApproved, onCounterRequestRejected, onCounterRequestExpired,
+    onCounterLost,
     subscribe, unsubscribe, onAnyEvent,
   ])
 }
@@ -796,6 +797,10 @@ export function useAgencyRealtime(agencyId: string | null) {
     ]
 
     const handleEvent = (data: RealtimeEventData) => {
+      // cache-1: mark the affected GET-cache families stale + revalidate in
+      // the background BEFORE page listeners refetch — their refetches then
+      // bypass/refresh the cache coherently.
+      handleRealtimeCacheEvent(data.type || '')
       setLastEvent(data)
     }
 
@@ -905,6 +910,8 @@ export function useCustomerRealtime() {
     ]
 
     const handleEvent = (data: RealtimeEventData) => {
+      // cache-1: same coherence bridge as the agency side.
+      handleRealtimeCacheEvent(data.type || '')
       setLastEvent(data)
     }
 
@@ -957,10 +964,14 @@ export function useCustomerRealtime() {
  */
 export function useTurnAlert(userId: string | undefined) {
   const [showTurnAlert, setShowTurnAlert] = useState(false)
+  // r21-8 — the queue:called / notification:your-turn payloads now carry
+  // counter: { id, name, number, nameAr?, nameFr? }; surfaced so the alert
+  // overlay can point the customer at the right counter.
   const [turnAlertData, setTurnAlertData] = useState<{
     reservationId?: string;
     ticketNumber: string;
     agencyName: string;
+    counterName?: string;
   } | null>(null)
   // When the CURRENT alert fired — compared against the native lock-screen
   // dismissal timestamp so a swipe/Stop on the OS notification also silences
@@ -991,9 +1002,15 @@ export function useTurnAlert(userId: string | undefined) {
         if (reservationId && !shouldShowAlert(reservationId)) return
         const ticketNumber = data?.ticketNumber || data?.displayNumber || '---'
         const agencyName = data?.agencyName || ''
+        // r21-8 — counter pointer from the enriched payload (name, falling
+        // back to the counter number when the name is absent).
+        const counter = (data?.counter || event?.counter) as { name?: string; number?: number } | undefined
+        const counterName = counter
+          ? (counter.name || (counter.number != null ? `#${counter.number}` : ''))
+          : undefined
 
         turnAlertFiredAtRef.current = Date.now()
-        setTurnAlertData({ reservationId, ticketNumber, agencyName })
+        setTurnAlertData({ reservationId, ticketNumber, agencyName, counterName })
         setShowTurnAlert(true)
 
         // Also fire a local notification (wakes phone, drops banner)
@@ -1017,9 +1034,14 @@ export function useTurnAlert(userId: string | undefined) {
         if (reservationId && !shouldShowAlert(reservationId)) return
         const ticketNumber = data?.displayNumber || data?.ticketNumber || '---'
         const agencyName = data?.agencyName || ''
+        // r21-8 — counter pointer (same shape as notification:your-turn).
+        const counter = (data?.counter || event?.counter) as { name?: string; number?: number } | undefined
+        const counterName = counter
+          ? (counter.name || (counter.number != null ? `#${counter.number}` : ''))
+          : undefined
 
         turnAlertFiredAtRef.current = Date.now()
-        setTurnAlertData({ reservationId, ticketNumber, agencyName })
+        setTurnAlertData({ reservationId, ticketNumber, agencyName, counterName })
         setShowTurnAlert(true)
 
         import('@/lib/notification-channel').then(({ scheduleTurnNotification }) => {

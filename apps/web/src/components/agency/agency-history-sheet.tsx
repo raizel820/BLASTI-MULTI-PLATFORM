@@ -108,11 +108,11 @@ const STATUS_MAP: Record<string, { label: TranslationKeys; className: string }> 
   },
   CALLED: {
     label: 'statusCalled',
-    className: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 border-blue-200 dark:border-blue-800',
+    className: 'bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-400 border-teal-200 dark:border-teal-800',
   },
   SERVING: {
     label: 'statusServed',
-    className: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400 border-indigo-200 dark:border-indigo-800',
+    className: 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400 border-cyan-200 dark:border-cyan-800',
   },
   COMPLETED: {
     label: 'statusCompleted',

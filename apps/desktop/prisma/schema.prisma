@@ -28,6 +28,11 @@ model User {
   email                   String?        @unique
   phoneNumber             String?        @unique
   shortAppId              String?        @unique
+  /// Immutable BLASTI UID (UID-0.6.14) — mirrors the cloud User.uid via the
+  /// sync feed. Assigned ONCE on the cloud (register / boot backfill) and
+  /// never edited afterwards: format {TYPE}-{WILAYA}-{SEQ} ("CU-16-00042").
+  /// SUPER_ADMIN accounts have NO uid (null).
+  uid                     String?        @unique
   /// Cloud-only authentication secret. NEVER synced to the desktop: the cloud
   /// sync feed (initial-data + incremental pull) excludes this field via the
   /// explicit USER_SYNC projection, and synced desktop User profiles keep it
@@ -276,6 +281,8 @@ model Agency {
   /// never required for directions, and never invalidated by provider switch.
   googlePlaceId        String?
   providerLocationId   String?
+  /// Agencies Management — specialties the agency serves (JSON id array string).
+  specialtyIds          String?
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt
   ownerId               String
@@ -287,6 +294,7 @@ model Agency {
   favorites             Favorite[]
   queueSettings         QueueSettings[]
   reservations          Reservation[]
+  counterControlRequests CounterControlRequest[]
   services              Service[]
   transactions          Transaction[]
   reviews               Review[]
@@ -510,11 +518,18 @@ model Service {
   nameAr       String?
   description  String?
   prefix       String        @default("A")
+  // P2-10 — mirrors the cloud Service (sync pull + local claim ordering/ETA).
+  durationMinutes Int?
+  // 0.6.20 parity audit — cloud Service.price (Int, DA). The sync sanitizer
+  // derives columns from the DDL: without this, pulled price was dropped.
+  price           Int?
+  priority     Int           @default(0)
   isActive     Boolean       @default(true)
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
   reservations Reservation[]
   agency       Agency        @relation(fields: [agencyId], references: [id])
+  counterServices CounterService[]
 
   @@unique([agencyId, name])
 }
@@ -823,11 +838,14 @@ model FAQ {
 // shared platform dictionary. `name` is the value stored in Agency.category.
 model AgencyCategory {
   id        String   @id @default(cuid())
+  slug      String   @unique
   name      String   @unique
   nameFr    String?
   nameAr    String?
   icon      String?
   isCustom  Boolean  @default(true)
+  isActive  Boolean  @default(true)
+  sortOrder Int      @default(0)
   createdBy String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -844,6 +862,14 @@ model PaymentSettings {
   bankAccount       String   @default("")
   bankRib           String   @default("")
   ewalletNumber     String   @default("")
+  /// r21-6 — parity with the cloud model: display-safe transfer details
+  /// (holder/address) + the BaridiMob toggle/number.
+  ccpHolderName     String?
+  ccpAddress        String?
+  bankHolderName    String?
+  bankAddress       String?
+  baridiMobEnabled  Boolean  @default(false)
+  baridiMobNumber   String?
   updatedAt         DateTime @updatedAt
   createdAt         DateTime @default(now())
 }
@@ -910,10 +936,55 @@ model Counter {
   occupiedAt           DateTime?
   currentReservationId String?       @unique
   currentReservation   Reservation?  @relation("CurrentReservation", fields: [currentReservationId], references: [id])
+  /// r21-8 — counter CONTROL model (claim + heartbeat lease). controlledBy*
+  /// identify the holding user/staff; the timestamps drive the lease
+  /// (heartbeat every 60s, control lost after 3 minutes without one).
+  controlledByUserId   String?
+  controlledByStaffId  String?
+  controlClaimedAt     DateTime?
+  controlHeartbeatAt   DateTime?
   createdAt            DateTime     @default(now())
   updatedAt            DateTime     @updatedAt
 
+  counterServices      CounterService[]
+  controlRequests      CounterControlRequest[]
   servedReservations Reservation[] @relation("ServedByCounter")
+}
+
+/// P2-10 — Counter↔Service binding (mirrors the cloud join model; composite
+/// PK, both FKs cascade — same shape as the PostgreSQL table).
+model CounterService {
+  counterId String
+  serviceId String
+  createdAt DateTime @default(now())
+  counter   Counter  @relation(fields: [counterId], references: [id], onDelete: Cascade)
+  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([counterId, serviceId])
+  @@index([serviceId])
+}
+
+/// r21-8 — counter control REQUEST: a staff member asking the current holder
+/// to hand over a counter. PENDING for 60s (expiresAt); the holder
+/// approves/rejects (control transfers), the sweeper auto-transfers on expiry
+/// when the requester is still an active member, else marks EXPIRED.
+model CounterControlRequest {
+  id               String    @id @default(cuid())
+  counterId        String
+  counter          Counter   @relation(fields: [counterId], references: [id], onDelete: Cascade)
+  agencyId         String
+  agency           Agency    @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  fromUserId       String
+  fromStaffId      String?
+  requestedAt      DateTime  @default(now())
+  expiresAt        DateTime
+  status           String    @default("PENDING")
+  resolvedByUserId String?
+  resolvedAt       DateTime?
+
+  @@index([counterId])
+  @@index([agencyId])
+  @@index([status, expiresAt])
 }
 
 model DeviceRegistration {

@@ -173,9 +173,10 @@ export async function checkUserSmsCredit(userId: string): Promise<{ hasCredit: b
     return { hasCredit: true, freeCount: user.freeSmsCount, purchasedTotal: 0, purchasedUsed: 0 };
   }
 
-  // Check purchased SMS packages
+  // Check purchased SMS packages — P0-1: ONLY APPROVED purchases grant credit
+  // (PENDING/REJECTED/FAILED packs must never fund sends).
   const purchasedTotal = await db.smsPurchase.aggregate({
-    where: { userId },
+    where: { userId, status: 'APPROVED' },
     _sum: { quantity: true },
   });
 
@@ -277,9 +278,9 @@ export async function sendSms(phoneNumber: string, message: string, userId?: str
     if (decrementResult.count > 0) {
       creditDeducted = true;
     } else {
-      // No free credits — check purchased SMS packages
+      // No free credits — check purchased SMS packages (APPROVED only, P0-1)
       const purchasedTotal = await db.smsPurchase.aggregate({
-        where: { userId },
+        where: { userId, status: 'APPROVED' },
         _sum: { quantity: true },
       });
       const totalPurchased = purchasedTotal._sum.quantity ?? 0;

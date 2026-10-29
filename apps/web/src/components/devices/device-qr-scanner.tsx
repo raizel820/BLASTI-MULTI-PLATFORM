@@ -302,10 +302,10 @@ export function QrClaimScanner({ deviceId = 'kiosk-default', onClaimed, onBack }
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                 <div className="absolute inset-0 bg-black/40" />
                 <div className="relative w-64 h-64">
-                  <div className="absolute -top-1 -start-1 w-12 h-12 border-t-4 border-s-4 border-emerald-400 rounded-tl-3xl" />
-                  <div className="absolute -top-1 -end-1 w-12 h-12 border-t-4 border-e-4 border-emerald-400 rounded-tr-3xl" />
-                  <div className="absolute -bottom-1 -start-1 w-12 h-12 border-b-4 border-s-4 border-emerald-400 rounded-bl-3xl" />
-                  <div className="absolute -bottom-1 -end-1 w-12 h-12 border-b-4 border-e-4 border-emerald-400 rounded-br-3xl" />
+                  <div className="absolute -top-1 -start-1 w-12 h-12 border-t-4 border-s-4 border-emerald-400 rounded-ss-3xl" />
+                  <div className="absolute -top-1 -end-1 w-12 h-12 border-t-4 border-e-4 border-emerald-400 rounded-se-3xl" />
+                  <div className="absolute -bottom-1 -start-1 w-12 h-12 border-b-4 border-s-4 border-emerald-400 rounded-es-3xl" />
+                  <div className="absolute -bottom-1 -end-1 w-12 h-12 border-b-4 border-e-4 border-emerald-400 rounded-ee-3xl" />
                   <motion.div
                     className="absolute start-3 end-3 h-1 bg-gradient-to-r from-transparent via-emerald-400 to-transparent shadow-[0_0_16px_rgba(52,211,153,0.7)]"
                     animate={{ top: `${scanLineY}%` }}

@@ -44,6 +44,13 @@ interface ElectronAPI {
   getPlatform: () => Promise<{ platform: string; arch: string; electronVersion: string; chromeVersion: string; nodeVersion: string }>;
   /** Task 33-C/33-E — desktop revocation push: cb({reason}) → unsubscribe fn. */
   onAuthRevoked?: (callback: (payload: { reason?: string }) => void) => () => void;
+  /**
+   * 0.6.20 — Full local reset ("fresh install"): the main process wipes every
+   * locally-stored artifact (workspace SQLite DB, local file store, durable
+   * auth file, local API session, logs, renderer storage incl. IndexedDB and
+   * cookies) and relaunches the app. The cloud account is untouched.
+   */
+  clearAllAppData?: () => Promise<{ success: boolean; error?: string }>;
 }
 
 /** Minimal shape of window.Capacitor for plugin access */

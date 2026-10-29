@@ -1,9 +1,15 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+// Hotfix 0.6.12 — the `'counterServices' as TranslationKeys` casts below
+// referenced this type without importing it (type-only, so it never crashed
+// at runtime — but it broke every typecheck pass over this file).
+import type { TranslationKeys } from '@/i18n';
 import { useLanguage } from '@/hooks/use-language';
 import { useAppStore } from '@/store/use-app-store';
 import { unwrapListPayload } from '@/lib/list-payload';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -71,7 +77,9 @@ import QRCode from 'qrcode';
 // shared components the create-agency wizard and agency profile use).
 import { MapLocationPicker, type GeocodeComponents } from '@/components/shared/map/map-location-picker';
 import { WilayaSelect, CommuneSelect } from '@/components/shared/algeria-location-selects';
-import { ALGERIA_WILAYAS, findWilayaByCode } from '@/lib/algeria-locations';
+import { ALGERIA_WILAYAS, findWilayaByCode, findWilayaCentroid } from '@/lib/algeria-locations';
+// r21-5 — map-follows-inputs: the branch wilaya→centroid jump is debounced.
+import { useDebounce } from '@/hooks/use-debounce';
 
 // Types
 interface Branch {
@@ -180,6 +188,17 @@ interface CounterWithStaff {
   staff?: { id: string; user: { fullName: string; username: string } } | null;
   currentReservation?: { id: string; displayNumber: string; status: string } | null;
   currentReservationId?: string | null;
+  // P2-10 — services this counter is bound to (empty = serves everything).
+  counterServices?: { service: { id: string; name: string; nameAr?: string | null; nameFr?: string | null; prefix: string } }[];
+}
+
+// P2-10 — minimal service shape for the counter binding picker.
+interface ServiceOption {
+  id: string;
+  name: string;
+  nameAr?: string | null;
+  nameFr?: string | null;
+  prefix: string;
 }
 
 interface StaffMember {
@@ -202,6 +221,10 @@ export function AgencyBranches() {
   // State
   const [branches, setBranches] = useState<Branch[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
   // Task 37-a: list-load failures used to be swallowed (non-ok responses left
   // an empty list that looked like "no branches"). Track the error and offer
   // a retry instead.
@@ -231,6 +254,33 @@ export function AgencyBranches() {
   const [branchPostalCode, setBranchPostalCode] = useState('');
   const [branchLocationSource, setBranchLocationSource] = useState<'GOOGLE' | 'OPENFREEMAP' | 'MANUAL' | 'DEVICE_GPS' | null>(null);
   const [branchSaving, setBranchSaving] = useState(false);
+  // r21-5 — map-follows-inputs: a USER-driven branch wilaya change (select
+  // or zip-prefix cascade) re-centers the branch pin on the wilaya seat
+  // centroid after a short debounce. Ordering stamps mirror the create-
+  // agency wizard: server-loaded dialog values never trigger the jump and a
+  // pin placed after the wilaya edit wins.
+  const lastBranchWilayaEditAtRef = useRef<number | null>(null);
+  const lastBranchPinAtRef = useRef<number | null>(null);
+  const prevBranchCentroidWilayaRef = useRef<string>('');
+  const debouncedBranchWilaya = useDebounce(branchWilayaCode, 400);
+  useEffect(() => {
+    const code = (debouncedBranchWilaya || '').trim();
+    const prev = prevBranchCentroidWilayaRef.current;
+    prevBranchCentroidWilayaRef.current = code;
+    if (code === prev) return; // not a wilaya change
+    if (lastBranchWilayaEditAtRef.current == null) return; // server-loaded branch — keep its pin
+    if (lastBranchPinAtRef.current != null && lastBranchPinAtRef.current > lastBranchWilayaEditAtRef.current) {
+      return; // the user fine-tuned the pin after this edit — never fight them
+    }
+    if (!BRANCH_WILAYA_CODE_REGEX.test(code)) return;
+    const centroid = findWilayaCentroid(code);
+    if (!centroid) return;
+    // 'MANUAL' provenance: the pin moved to a derived centroid, so the Save
+    // payload must not keep a stale (possibly VERIFIED) stored source.
+    setBranchLocationSource('MANUAL');
+    setBranchLatitude(centroid.lat);
+    setBranchLongitude(centroid.lng);
+  }, [debouncedBranchWilaya]);
 
   // Counter dialog
   const [counterDialogOpen, setCounterDialogOpen] = useState(false);
@@ -239,6 +289,9 @@ export function AgencyBranches() {
   const [counterName, setCounterName] = useState('');
   const [counterNameAr, setCounterNameAr] = useState('');
   const [counterNameFr, setCounterNameFr] = useState('');
+  // P2-10 — service binding picker state + the agency's service list.
+  const [counterServiceIds, setCounterServiceIds] = useState<string[]>([]);
+  const [agencyServices, setAgencyServices] = useState<ServiceOption[]>([]);
   const [counterSaving, setCounterSaving] = useState(false);
 
   // Delete dialog
@@ -420,10 +473,27 @@ export function AgencyBranches() {
     }
   }, [agencyId]);
 
+  // P2-10 — the counter binding picker needs the agency's services.
+  const fetchServices = useCallback(async () => {
+    if (!agencyId) return;
+    try {
+      const res = await apiFetch('/api/agency/services');
+      if (res.ok) {
+        const data = await res.json();
+        setAgencyServices(unwrapListPayload<ServiceOption>(data, ['services']));
+      }
+    } catch {
+      // silent — the picker simply renders empty
+    }
+  }, [agencyId]);
+
   useEffect(() => {
     fetchBranches();
     fetchStaff();
-  }, [fetchBranches, fetchStaff]);
+    fetchServices();
+    // resumeNonce — 0.6.16: refetch when the app resumes to the foreground
+    // (close-and-reopen resumes the shell without a remount → stale lists).
+  }, [fetchBranches, fetchStaff, fetchServices, resumeNonce]);
 
   const fetchCounters = useCallback(async (branchId: string) => {
     setCountersLoading(true);
@@ -454,6 +524,11 @@ export function AgencyBranches() {
   // Branch CRUD
   const openCreateBranchDialog = () => {
     setEditingBranch(null);
+    // r21-5 — a freshly opened (empty) branch form re-baselines the centroid
+    // watcher: the reset itself is not a user wilaya edit.
+    lastBranchWilayaEditAtRef.current = null;
+    lastBranchPinAtRef.current = null;
+    prevBranchCentroidWilayaRef.current = '';
     setBranchName('');
     setBranchNameAr('');
     setBranchNameFr('');
@@ -472,6 +547,11 @@ export function AgencyBranches() {
 
   const openEditBranchDialog = (branch: Branch) => {
     setEditingBranch(branch);
+    // r21-5 — server truth resets the map-follow stamps AND re-baselines the
+    // centroid watcher: loading a branch can never yank its saved pin.
+    lastBranchWilayaEditAtRef.current = null;
+    lastBranchPinAtRef.current = null;
+    prevBranchCentroidWilayaRef.current = (branch.wilaya || '').trim();
     setBranchName(branch.name);
     setBranchNameAr(branch.nameAr || '');
     setBranchNameFr(branch.nameFr || '');
@@ -494,6 +574,7 @@ export function AgencyBranches() {
   // Save button. onLocationSource marks a fresh pick this session so the
   // payload can refresh the provenance pair (spec §35 semantics).
   const handleBranchPickerChange = (lat: number | null, lng: number | null) => {
+    lastBranchPinAtRef.current = Date.now(); // r21-5 — explicit pick outranks the centroid follow
     setBranchLatitude(lat);
     setBranchLongitude(lng);
   };
@@ -720,6 +801,7 @@ export function AgencyBranches() {
     setCounterName('');
     setCounterNameAr('');
     setCounterNameFr('');
+    setCounterServiceIds([]);
     setCounterDialogOpen(true);
   };
 
@@ -729,7 +811,14 @@ export function AgencyBranches() {
     setCounterName(counter.name);
     setCounterNameAr(counter.nameAr || '');
     setCounterNameFr(counter.nameFr || '');
+    setCounterServiceIds((counter.counterServices || []).map((cs) => cs.service.id));
     setCounterDialogOpen(true);
+  };
+
+  const toggleCounterService = (serviceId: string) => {
+    setCounterServiceIds((prev) =>
+      prev.includes(serviceId) ? prev.filter((id) => id !== serviceId) : [...prev, serviceId],
+    );
   };
 
   const handleSaveCounter = async () => {
@@ -741,6 +830,20 @@ export function AgencyBranches() {
       return;
     }
     setCounterSaving(true);
+    // r21-8 (W5) — services the user just picked that are STILL bound to a
+    // DIFFERENT counter will move here (the API enforces last-writer-wins
+    // unbinding) — surface that as an informational toast after the save.
+    const movedServiceNames = counterServiceIds
+      .filter((sid) =>
+        counters.some(
+          (c) => c.id !== editingCounter?.id && (c.counterServices || []).some((cs) => cs.service.id === sid),
+        ))
+      .map((sid) => {
+        const s = agencyServices.find((x) => x.id === sid);
+        if (!s) return '';
+        return lang === 'ar' && s.nameAr ? s.nameAr : lang === 'fr' && s.nameFr ? s.nameFr : s.name;
+      })
+      .filter(Boolean);
     try {
       if (editingCounter) {
         const res = await apiFetch(`/api/agency/branches/${expandedBranch}/counters/${editingCounter.id}`, {
@@ -750,10 +853,17 @@ export function AgencyBranches() {
             name: counterName.trim(),
             nameAr: counterNameAr.trim() || undefined,
             nameFr: counterNameFr.trim() || undefined,
+            // P2-10 — replace-all binding; empty = serve every service.
+            serviceIds: counterServiceIds,
           }),
         });
         if (res.ok) {
           toast.success(t('counterUpdated'));
+          // r21-8 (W5) — informational: the picked services moved to THIS
+          // counter (unbound from their previous counters server-side).
+          if (movedServiceNames.length > 0) {
+            toast.info(t('counterServiceMoved', { services: movedServiceNames.join('، ') }));
+          }
           setCounterDialogOpen(false);
           fetchCounters(expandedBranch);
         } else {
@@ -769,10 +879,15 @@ export function AgencyBranches() {
             name: counterName.trim(),
             nameAr: counterNameAr.trim() || undefined,
             nameFr: counterNameFr.trim() || undefined,
+            // P2-10 — optional initial binding.
+            ...(counterServiceIds.length > 0 ? { serviceIds: counterServiceIds } : {}),
           }),
         });
         if (res.ok) {
           toast.success(t('counterCreated'));
+          if (movedServiceNames.length > 0) {
+            toast.info(t('counterServiceMoved', { services: movedServiceNames.join('، ') }));
+          }
           setCounterDialogOpen(false);
           fetchCounters(expandedBranch);
           fetchBranches(); // Refresh counter counts
@@ -1420,6 +1535,19 @@ export function AgencyBranches() {
                                           </span>
                                         )}
                                       </div>
+                                      {/* P2-10 — bound services (empty = every service). */}
+                                      {(counter.counterServices?.length ?? 0) > 0 && (
+                                        <div className="flex items-center gap-1 mt-1 flex-wrap">
+                                          {counter.counterServices!.map((cs) => (
+                                            <span
+                                              key={cs.service.id}
+                                              className="text-[10px] px-1.5 py-0.5 rounded-md bg-teal-50 dark:bg-teal-950/40 text-teal-700 dark:text-teal-300 border border-teal-200 dark:border-teal-900/50"
+                                            >
+                                              {cs.service.prefix}
+                                            </span>
+                                          ))}
+                                        </div>
+                                      )}
                                     </div>
                                   </div>
                                   <div className="flex items-center gap-1.5 flex-shrink-0">
@@ -1583,6 +1711,7 @@ export function AgencyBranches() {
                     value={branchWilayaCode}
                     onValueChange={(code) => {
                       if (code === branchWilayaCode) return;
+                      lastBranchWilayaEditAtRef.current = Date.now(); // r21-5 — user-driven wilaya change
                       setBranchWilayaCode(code);
                       // Dependent list — the commune must belong to the
                       // newly selected wilaya, so reset it.
@@ -1611,7 +1740,25 @@ export function AgencyBranches() {
                 <Label>{t('maps.postalCode')}</Label>
                 <Input
                   value={branchPostalCode}
-                  onChange={(e) => setBranchPostalCode(e.target.value)}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setBranchPostalCode(value);
+                    // r21-5 — zip → wilaya cascade (parity with the create-
+                    // agency wizard): the first two digits ARE the wilaya
+                    // code; a valid 01-58 prefix that differs from the
+                    // current selection switches it (and the debounced
+                    // centroid effect below follows the map).
+                    if (value.trim().length >= 2) {
+                      const digits = value.replace(/\D/g, '');
+                      const prefix = digits.slice(0, 2);
+                      if (BRANCH_WILAYA_CODE_REGEX.test(prefix) && prefix !== branchWilayaCode) {
+                        lastBranchWilayaEditAtRef.current = Date.now(); // zip cascade = user-driven
+                        setBranchWilayaCode(prefix);
+                        // Dependent list — reset the commune.
+                        setBranchCity('');
+                      }
+                    }
+                  }}
                   className="h-11"
                   dir="ltr"
                   maxLength={10}
@@ -1693,7 +1840,7 @@ export function AgencyBranches() {
                 {/* QRCode.toString('svg') output is trusted, locally generated
                     markup — rendered into a white rounded box for scannability. */}
                 <div
-                  className="w-fit rounded-2xl bg-white p-3 border border-gray-100 dark:border-gray-800 shadow-sm"
+                  className="w-fit rounded-2xl bg-white dark:bg-gray-900 p-3 border border-gray-100 dark:border-gray-800 shadow-sm"
                   dangerouslySetInnerHTML={{ __html: qrSvg }}
                 />
               </div>
@@ -1783,6 +1930,43 @@ export function AgencyBranches() {
                 className="h-11"
                 dir="ltr"
               />
+            </div>
+            {/* P2-10 — Counter↔Service binding: pick which services this
+                counter serves. No selection = serves every service. */}
+            <div className="space-y-2">
+              <Label>{t('counterServices' as TranslationKeys)}</Label>
+              {agencyServices.length === 0 ? (
+                <p className="text-xs text-muted-foreground">{t('counterServicesEmpty' as TranslationKeys)}</p>
+              ) : (
+                <>
+                  <div className="flex flex-wrap gap-1.5" role="group" aria-label={t('counterServices' as TranslationKeys)}>
+                    {agencyServices.map((s) => {
+                      const selected = counterServiceIds.includes(s.id);
+                      return (
+                        <button
+                          key={s.id}
+                          type="button"
+                          aria-pressed={selected}
+                          onClick={() => toggleCounterService(s.id)}
+                          className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors min-h-[36px] ${
+                            selected
+                              ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                              : 'bg-background text-foreground border-border hover:bg-muted'
+                          }`}
+                        >
+                          <span className="font-bold me-1">{s.prefix}</span>
+                          {lang === 'ar' && s.nameAr ? s.nameAr : lang === 'fr' && s.nameFr ? s.nameFr : s.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {counterServiceIds.length === 0
+                      ? t('counterServicesAllHint' as TranslationKeys)
+                      : t('counterServicesBoundHint' as TranslationKeys)}
+                  </p>
+                </>
+              )}
             </div>
           </div>
           <DialogFooter>

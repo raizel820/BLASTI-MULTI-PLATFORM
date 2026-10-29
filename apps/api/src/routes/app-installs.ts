@@ -2,6 +2,9 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { db } from '@blasti/db'
 import { requireAdmin, authErrorResponse } from '../lib/auth'
+// r20-3(a): rank "latest published" by semantic name when versionCode is 0
+// (CI rows) so an old admin row (code 5000) can't shadow a newer CI build.
+import { pickLatestAppVersion } from '../lib/app-version-rank'
 import { z } from 'zod'
 
 // ─── App Install Tracking & Update Pusher (Public App Settings rebuild) ─────
@@ -76,10 +79,12 @@ function compareVersions(a: string, b: string): number {
  * device has already satisfied (it now runs ≥ the pushed target).
  */
 async function buildUpdatePayload(platform: string, currentVersion: string, deviceId: string) {
-  const latest = await db.appVersion.findFirst({
+  const latestCandidates = await db.appVersion.findMany({
     where: { platform, isPublished: true },
-    orderBy: [{ versionCode: 'desc' }, { createdAt: 'desc' }],
+    orderBy: { createdAt: 'desc' },
+    take: 50,
   })
+  const latest = pickLatestAppVersion(latestCandidates)
 
   const updateAvailable = !!latest && compareVersions(latest.version, currentVersion) > 0
 

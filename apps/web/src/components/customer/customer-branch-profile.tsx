@@ -53,6 +53,8 @@ import {
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { apiFetch } from '@/lib/api-fetch';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import { getProxiedUrl } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -64,6 +66,9 @@ import { AgencyLocationMap } from '@/components/shared/map/agency-location-map';
 import { useCustomerLocation } from '@/hooks/use-customer-location';
 import { formatDistance, haversineDistanceKm } from '@/lib/geo';
 import { categoryKeys, getCategoryLabel, isOpenNow } from '@/components/customer/home/types';
+// Task 5-b — per-category terminology scope (the branch payload's PARENT
+// agency object carries `category`, so the category words apply here too).
+import { useCategoryTermScope } from '@/hooks/use-category-terms';
 
 /** Shape of GET /api/agencies/branches/:branchId → branch (rendered fields). */
 interface BranchProfileBranch {
@@ -133,7 +138,19 @@ export function CustomerBranchProfile() {
   const [agency, setAgency] = useState<BranchProfileAgency | null>(null);
   const [rating, setRating] = useState({ averageRating: 0, reviewCount: 0 });
 
+  // Task 5-b — per-category terminology scope from the PARENT agency's
+  // category (available once the branch payload resolves). A failed terms
+  // fetch degrades silently to the standard dictionary.
+  // FIX (0.6.16): must stay BELOW the `agency` state declaration — reading
+  // agency.category above the declaration is a TDZ violation that crashes
+  // the page ("Cannot access 'agency' before initialization"), same root
+  // cause as the customer/agency-profile crash fixed in this release.
+  useCategoryTermScope(agency?.category);
+
   const [reviews, setReviews] = useState<ReviewItem[]>([]);
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
   const [totalCount, setTotalCount] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
   const [currentPage, setCurrentPage] = useState(1);
@@ -210,7 +227,7 @@ export function CustomerBranchProfile() {
 
   useEffect(() => {
     fetchData();
-  }, [fetchData]);
+  }, [fetchData, resumeNonce]);
 
   const loadMoreReviews = async () => {
     if (!agency || !branch || loadingMore || currentPage >= totalPages) return;

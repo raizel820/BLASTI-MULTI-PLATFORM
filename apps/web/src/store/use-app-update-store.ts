@@ -123,9 +123,17 @@ interface CapacitorGlobal {
     getDownloadProgress?: (opts: { downloadId: number }) => Promise<{
       status?: string; percent?: number; bytesSoFar?: number; totalBytes?: number; localUri?: string;
     }>;
-    installUpdate?: (opts: { downloadId?: number; filePath?: string }) => Promise<{ ok?: boolean }>;
+    installUpdate?: (opts: { downloadId?: number; filePath?: string }) => Promise<{ ok?: boolean; escalated?: boolean }>;
     /** Open the system "Install unknown apps" grant screen (newer builds). */
     openInstallPermissionSettings?: () => Promise<{ ok?: boolean; canInstall?: boolean }>;
+    /**
+     * 0.6.17 side-effect-free permission probe — { canInstall }. Lets the web
+     * layer read the grant state WITHOUT opening the settings screen (the
+     * old read-path WAS "open settings", half of the field redirect loop).
+     * The Android install RESUME itself is owned by the native
+     * handleOnResume (pending APK + granted → installer auto-launches).
+     */
+    getInstallPermissionState?: () => Promise<{ canInstall?: boolean }>;
   }>;
 }
 
@@ -240,6 +248,20 @@ async function fetchCheck(platform: string, version: string): Promise<CheckRespo
 }
 
 // ─── Android download polling ────────────────────────────────────────────────
+
+/**
+ * 0.6.18 ROOT-CAUSE FIX for the update-install loop (field log: 5×
+ * {"message":"apk-not-found"} per attempt): install() used to call the native
+ * plugin with installUpdate({}) — NO downloadId, NO filePath — so the native
+ * side queried the DownloadManager with id=-1, found zero rows and rejected
+ * "apk-not-found" BEFORE its 0.6.17 permission ladder was ever reached. The
+ * ladder was dead code; the store then mislabeled the failure as "downloaded +
+ * needsInstallPermission" and every trigger re-offered the install forever.
+ * The downloadId returned by downloadUpdate is now REMEMBERED HERE and handed
+ * to installUpdate. (The native side also gained a deterministic-path fallback
+ * for process restarts / old callers.)
+ */
+let lastAndroidDownloadId: number | null = null;
 
 let androidPollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -424,7 +446,10 @@ function createAppUpdateStore() {
           // Progress arrives via onUpdateProgress → applyProgress.
         } else {
           const res = await plugin()?.downloadUpdate?.({ url: info.absoluteDownloadUrl || info.downloadUrl, version: info.version });
-          if (res?.downloadId) startAndroidPolling(res.downloadId);
+          if (res?.downloadId) {
+            lastAndroidDownloadId = res.downloadId; // consumed by install() below
+            startAndroidPolling(res.downloadId);
+          }
           else set({ status: 'error', error: 'download-failed' });
         }
       } catch {
@@ -447,7 +472,9 @@ function createAppUpdateStore() {
           if (!pendingInstallFromVersion) {
             pendingInstallFromVersion = await readNativeVersion();
           }
-          await plugin()?.installUpdate?.({});
+          // 0.6.18: hand the native side the download we actually completed —
+          // without it the plugin could not locate the APK ("apk-not-found").
+          await plugin()?.installUpdate?.({ downloadId: lastAndroidDownloadId ?? undefined });
           // Android: the package installer opens over our activity. It is
           // asynchronous — ok:true only means the installer UI opened, so
           // drop back to 'downloaded' (NOT a success claim). The resume
@@ -456,16 +483,26 @@ function createAppUpdateStore() {
         }
       } catch (err) {
         pendingInstallFromVersion = null;
-        set({ status: 'downloaded', needsInstallPermission: true });
-        // Report #3: "the app does not open the dialog so I can grant it the
-        // authority to install apps". New native builds open the grant screen
-        // THEMSELVES before rejecting (their message carries the marker
-        // below) — for older builds, drive the user there from here.
         const msg = err instanceof Error ? err.message : String(err ?? '');
-        if (!msg.includes('settings screen opened')) {
-          try {
-            await plugin()?.openInstallPermissionSettings?.();
-          } catch { /* older build without the method — the store flag still guides the UI */ }
+        // 0.6.18: only a REAL permission rejection may set needsInstallPermission.
+        // Labeling file-lookup failures ("apk-not-found", "install-failed") as
+        // permission problems was half of the field loop: the UI kept offering
+        // the same install and each trigger bounced the user to settings again.
+        const permissionGate = msg.includes('needs-install-permission')
+          || msg.includes('settings screen opened');
+        if (permissionGate) {
+          set({ status: 'downloaded', needsInstallPermission: true });
+          // Report #3: "the app does not open the dialog so I can grant it the
+          // authority to install apps". New native builds open the grant screen
+          // THEMSELVES before rejecting (their message carries the marker
+          // below) — for older builds, drive the user there from here.
+          if (!msg.includes('settings screen opened')) {
+            try {
+              await plugin()?.openInstallPermissionSettings?.();
+            } catch { /* older build without the method — the store flag still guides the UI */ }
+          }
+        } else {
+          set({ status: 'error', error: 'install-failed' });
         }
       }
     },

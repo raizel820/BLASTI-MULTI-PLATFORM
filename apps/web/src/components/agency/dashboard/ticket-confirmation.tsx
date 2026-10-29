@@ -182,7 +182,7 @@ export function TicketConfirmation({
               initial={{ scaleX: 1 }}
               animate={{ scaleX: 0 }}
               transition={{ duration: 6, ease: 'linear' }}
-              className="absolute bottom-0 left-0 right-0 h-1 bg-emerald-500 origin-left"
+              className="absolute bottom-0 left-0 right-0 h-1 bg-emerald-500 origin-left rtl:origin-right rtl:origin-right rtl:origin-right rtl:origin-right rtl:origin-right rtl:origin-right rtl:origin-right"
             />
           </motion.div>
         </motion.div>

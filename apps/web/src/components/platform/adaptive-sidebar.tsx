@@ -6,7 +6,7 @@ import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useAgencyAuthority, canAccessAgencySection, type AgencySectionView } from '@/hooks/use-agency-authority';
 import { isRTL, type TranslationKeys } from '@/i18n';
-import { getProxiedUrl } from '@/lib/utils';
+import { useAvatarSrc } from '@/lib/avatar-src';
 import { usePlatform } from '@/hooks/use-platform';
 import { nativeBridge } from '@/lib/native-bridge';
 import { useAppUpdateStore } from '@/store/use-app-update-store';
@@ -38,12 +38,13 @@ import {
   Settings2,
   Server,
   BellRing,
-  Banknote,
   ShieldCheck,
   HelpCircle,
   SlidersHorizontal,
   CreditCard,
   Building2,
+  Wallet,
+  Tags,
   LogOut,
   Menu,
   X,
@@ -64,7 +65,11 @@ import {
   Briefcase,
   Package,
   Database,
+  DatabaseBackup,
+  LayoutGrid,
+  Languages,
   HardDrive,
+  ScrollText,
   ChevronDown,
   ChevronRight,
   ChevronLeft,
@@ -76,6 +81,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { toast } from 'sonner';
 import { Toaster } from 'sonner';
 import { AgencyHistorySheet } from '@/components/agency/agency-history-sheet';
+import { ResetAppDataButton } from '@/components/shared/reset-app-data-button';
 
 // ─── Haptic Helper ────────────────────────────────────────────────────────────
 
@@ -133,6 +139,8 @@ function MobileBottomActionBar({ onMenuOpen, onLogout, t }: { onMenuOpen: () => 
 
 export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { currentView, setView, logout, user } = useAppStore();
+  // Avatar with retry + native-fetch fallback (mobile placeholder fix).
+  const { src: avatarSrc, handleError: onAvatarError } = useAvatarSrc(user?.avatarUrl);
   const { t, lang } = useLanguage();
   const { platform, capabilities } = usePlatform();
   // App-update delivery — manual check sits at the bottom of the sidebar
@@ -285,7 +293,7 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
                 {active && (
                   <motion.div
                     layoutId="agency-sidebar-active"
-                    className="absolute start-0 top-1/2 -translate-y-1/2 h-6 w-1.5 rounded-r-full bg-gradient-to-b from-emerald-500 to-teal-500 shadow-sm shadow-emerald-500/30"
+                    className="absolute start-0 top-1/2 -translate-y-1/2 h-6 w-1.5 rounded-e-full bg-gradient-to-b from-emerald-500 to-teal-500 shadow-sm shadow-emerald-500/30"
                     transition={{ type: 'spring', stiffness: 350, damping: 30 }}
                   />
                 )}
@@ -308,8 +316,8 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
       <div className="px-3 py-3 space-y-1">
         <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-muted/30">
           <div className="relative h-9 w-9 rounded-full bg-gradient-to-br from-emerald-100 to-teal-100 dark:from-emerald-900/40 dark:to-teal-900/30 flex items-center justify-center overflow-hidden ring-2 ring-emerald-200/50 dark:ring-emerald-800/30">
-            {user?.avatarUrl ? (
-              <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName} width={36} height={36} className="h-full w-full object-cover" />
+            {avatarSrc ? (
+              <img key={avatarSrc} src={avatarSrc} alt={user?.fullName} width={36} height={36} className="h-full w-full object-cover" onError={onAvatarError} />
             ) : (
               <span className="text-xs font-bold text-emerald-700 dark:text-emerald-400">
                 {user?.fullName?.charAt(0)?.toUpperCase() || 'A'}
@@ -336,6 +344,8 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
           <RefreshCw className={`h-5 w-5 ${updateChecking ? 'animate-spin text-emerald-600 dark:text-emerald-400' : ''}`} />
           {updateChecking ? t('updateChecking') : updatePostponedPending ? t('updateNow') : t('updateCheckForUpdates')}
         </button>
+        {/* 0.6.20 — desktop-only fresh-install reset (renders null on web/mobile) */}
+        <ResetAppDataButton onDismiss={onClose} />
         <button
           onClick={() => { logout(); onClose(); }}
           className="flex items-center gap-3 w-full px-3 py-2 rounded-xl text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors"
@@ -517,7 +527,7 @@ function AdminNavGroupItem({
                 {childActive && (
                   <motion.div
                     layoutId="admin-sidebar-active"
-                    className="absolute start-0 top-1/2 -translate-y-1/2 h-5 w-1.5 rounded-r-full bg-gradient-to-b from-amber-500 to-orange-500 shadow-sm shadow-amber-500/30"
+                    className="absolute start-0 top-1/2 -translate-y-1/2 h-5 w-1.5 rounded-e-full bg-gradient-to-b from-amber-500 to-orange-500 shadow-sm shadow-amber-500/30"
                     transition={{ type: 'spring', stiffness: 350, damping: 30 }}
                   />
                 )}
@@ -542,6 +552,8 @@ function AdminNavGroupItem({
 
 export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { currentView, setView, logout, user } = useAppStore();
+  // Avatar with retry + native-fetch fallback (mobile placeholder fix).
+  const { src: avatarSrc, handleError: onAvatarError } = useAvatarSrc(user?.avatarUrl);
   const { t } = useLanguage();
   const { platform, capabilities } = usePlatform();
 
@@ -559,6 +571,10 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
       children: [
         { view: 'admin-db', icon: Database, label: t('dbManagerTitle') },
         { view: 'admin-storage', icon: HardDrive, label: t('storageManagerTitle') },
+        // logs-2 (0.6.19): the Logs Manager moved OUT of the Storage Manager
+        // into its own page here (realtime analysis + severity + reports).
+        { view: 'admin-logs-manager', icon: ScrollText, label: t('logsManagerTitle') },
+        { view: 'admin-backups', icon: DatabaseBackup, label: t('backupManagerTitle') },
       ],
     },
     // Task 5: the old monolithic "Platform Settings" long-scroll page became
@@ -574,8 +590,11 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
         { view: 'admin-settings-vps', icon: Server, label: t('settingsVps') },
         { view: 'admin-settings-providers', icon: BellRing, label: t('settingsProviders') },
         { view: 'admin-settings-maps', icon: MapPin, label: t('settingsMapsSub') },
-        { view: 'admin-settings-payments', icon: CreditCard, label: t('settingsPaymentsGateway') },
-        { view: 'admin-settings-financial', icon: Banknote, label: t('settingsFinancialEngine') },
+        // r21-6 — ONE unified "Payment Center" entry replaces the retired
+        // admin-settings-payments (gateway) + admin-settings-financial
+        // (financial engine) pair. The old views stay wired but unreachable
+        // from this menu.
+        { view: 'admin-payment-settings', icon: Wallet, label: t('settingsPaymentCenter') },
         { view: 'admin-settings-security', icon: ShieldCheck, label: t('settingsSecuritySub') },
         { view: 'admin-settings-faq', icon: HelpCircle, label: t('settingsFaqSub') },
         { view: 'admin-settings-config', icon: SlidersHorizontal, label: t('settingsSystemConfig') },
@@ -583,7 +602,22 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
     },
     { view: 'admin-app-settings', icon: Smartphone, label: t('publicAppsSettings') },
     { view: 'admin-analytics', icon: BarChart3, label: t('analytics') },
-    { view: 'admin-agencies', icon: Building2, label: t('agencies') },
+    // Task 5-a: the flat Agencies + Services Management entries became a
+    // collapsible group — same pattern as "__platform_settings_group__"
+    // above. 'admin-agencies-management' is the first child (hub) and every
+    // subsection page shows a back button to it.
+    {
+      view: '__agencies_management_group__',
+      icon: Building2,
+      label: t('agenciesManagement' as TranslationKeys),
+      children: [
+        { view: 'admin-agencies-management', icon: Building2, label: t('agenciesManagement' as TranslationKeys) },
+        { view: 'admin-agencies', icon: Building2, label: t('agencies' as TranslationKeys) },
+        { view: 'admin-services-management', icon: Tags, label: t('servicesManagement' as TranslationKeys) },
+        { view: 'admin-category-manager', icon: LayoutGrid, label: t('agenciesMgmtCategories' as TranslationKeys) },
+        { view: 'admin-category-language', icon: Languages, label: t('agenciesMgmtCategoryLanguage' as TranslationKeys) },
+      ],
+    },
     { view: 'admin-audit', icon: ClipboardList, label: t('auditLogsPage') },
     { view: 'admin-users', icon: Users, label: t('userManagement') },
     // Support desk — triage/reply incoming complaints, suggestions,
@@ -630,7 +664,7 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
           // sales ops + platform settings) get the section divider above
           // them — the flat platform-settings entry this check used to test
           // against no longer exists.
-          const isGroup = item.view === '__sales_ops_group__' || item.view === '__platform_settings_group__' || item.view === '__data_storage_group__';
+          const isGroup = item.view === '__sales_ops_group__' || item.view === '__platform_settings_group__' || item.view === '__data_storage_group__' || item.view === '__agencies_management_group__';
           if (item.children) {
             return (
               <div key={item.view}>
@@ -670,7 +704,7 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
                 {active && (
                   <motion.div
                     layoutId="admin-sidebar-active"
-                    className="absolute start-0 top-1/2 -translate-y-1/2 h-6 w-1.5 rounded-r-full bg-gradient-to-b from-amber-500 to-orange-500 shadow-sm shadow-amber-500/30"
+                    className="absolute start-0 top-1/2 -translate-y-1/2 h-6 w-1.5 rounded-e-full bg-gradient-to-b from-amber-500 to-orange-500 shadow-sm shadow-amber-500/30"
                     transition={{ type: 'spring', stiffness: 350, damping: 30 }}
                   />
                 )}
@@ -691,8 +725,8 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
       <div className="px-3 py-3 space-y-1">
         <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl bg-muted/30">
           <div className="relative h-9 w-9 rounded-full bg-gradient-to-br from-amber-100 to-orange-100 dark:from-amber-900/40 dark:to-orange-900/30 flex items-center justify-center overflow-hidden ring-2 ring-amber-200/50 dark:ring-amber-800/30">
-            {user?.avatarUrl ? (
-              <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName} width={36} height={36} className="h-full w-full object-cover" />
+            {avatarSrc ? (
+              <img key={avatarSrc} src={avatarSrc} alt={user?.fullName} width={36} height={36} className="h-full w-full object-cover" onError={onAvatarError} />
             ) : (
               <ShieldCheck className="h-4 w-4 text-amber-700 dark:text-amber-400" />
             )}
@@ -703,6 +737,8 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
             <p className="text-[11px] text-muted-foreground truncate">{t('superAdmin')}</p>
           </div>
         </div>
+        {/* 0.6.20 — desktop-only fresh-install reset (renders null on web/mobile) */}
+        <ResetAppDataButton onDismiss={onClose} />
         <button
           onClick={() => { logout(); onClose(); }}
           className="flex items-center gap-3 w-full px-3 py-2 rounded-xl text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors"

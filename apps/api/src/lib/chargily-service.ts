@@ -179,8 +179,26 @@ async function getApiKey(): Promise<string> {
  * Whether Chargily is usable (a SECRET key exists in either field) — used by
  * the public payment-settings endpoint so clients only show EDAHABIA/CIB
  * options when the super admin has entered a working key.
+ *
+ * r21-6 — gated by the `chargily_enabled` SystemSetting (payment category,
+ * 'true'/'false') so the super admin can turn the gateway OFF without
+ * deleting the keys (keys are encrypted server-side; re-entering them just
+ * to pause payments would be absurd). ABSENT row → enabled (backward
+ * compatible: every deployment that never wrote the flag keeps working).
  */
+export async function isChargilyEnabledFlag(): Promise<boolean> {
+  try {
+    const flag = await getConfig('chargily_enabled')
+    // Absent / empty → default ON. Only the explicit string 'false' disables.
+    return flag !== 'false'
+  } catch {
+    // Config store unavailable → stay permissive (same as pre-r21-6).
+    return true
+  }
+}
+
 export async function isChargilyConfigured(): Promise<boolean> {
+  if (!(await isChargilyEnabledFlag())) return false
   return !!(await getUsableSecretKey())
 }
 

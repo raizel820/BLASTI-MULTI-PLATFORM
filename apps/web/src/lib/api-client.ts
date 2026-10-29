@@ -58,6 +58,17 @@ import { getNativeCloudUrl, startNativeCloudResolution } from './native-cloud-re
 // machine-readable timeline event. See lib/diag-log.ts.
 import { diag } from './diag-log';
 
+// 0.6.23 (R-21F-S2) — LAN authority (offline master) failover client.
+// Cycle-safe by construction: this module never executes these bindings at
+// module scope, and lan-authority-client only touches remote-logger inside
+// functions (remote-logger imports buildCloudUrl from this module).
+import {
+  getLanAuthorityLanToken,
+  getLanAuthorityOverride,
+  handleNotMasterBody,
+  setCloudUnreachable,
+} from './lan-authority-client';
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 /** Configuration for the ApiClient instance. */
@@ -78,12 +89,19 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   /** Override the default timeout for this request (ms). */
   timeout?: number;
-  /** Override the default retry count for this request. */
+  /** Override the default retry count for this request (ms). */
   retries?: number;
   /** URL search params to append. */
   params?: Record<string, string>;
   /** An AbortSignal to cancel the request. */
   signal?: AbortSignal;
+  /**
+   * cache-1: GET response-cache TTL override (ms).
+   *  - undefined → DEFAULT_GET_CACHE_TTL (30s)
+   *  - 0         → bypass the cache entirely (always network, never stored)
+   *  - >0        → fresh window for THIS request
+   */
+  cacheTtl?: number;
 }
 
 /** Normalized API response wrapper. */
@@ -95,6 +113,15 @@ export interface ApiResponse<T> {
   /** The response headers. */
   headers: Headers;
 }
+
+/**
+ * cache-1: fresh window for cached GET responses. Within this window a
+ * repeated GET is answered from the in-memory/persisted cache with ZERO
+ * network; after it the cached value still answers instantly while a
+ * background revalidation (If-None-Match) refreshes it.
+ */
+export const DEFAULT_GET_CACHE_TTL = 30_000;
+void DEFAULT_GET_CACHE_TTL;
 
 // ─── Error Class ──────────────────────────────────────────────────────────────
 
@@ -264,6 +291,18 @@ export function getApiBaseUrl(): string {
   // Server-side: use internal URL
   if (isServerSide()) {
     return process.env.INTERNAL_API_URL || DEFAULT_INTERNAL_URL;
+  }
+
+  // ── 0.6.23 (R-21F-S2): LAN authority override ──────────────────────────────
+  // While this client is joined to an offline LAN master (fresh master
+  // contact OR cloud flagged unreachable), ALL API traffic — web, Capacitor
+  // AND an Electron follower pointed at its own local server — must hit the
+  // master instead (REST contract rule 4). Checked FIRST so no cloud/local
+  // base can shadow it; when null (default), every branch below behaves
+  // exactly as before.
+  const lanOverride = getLanAuthorityOverride();
+  if (lanOverride) {
+    return lanOverride.baseUrl;
   }
 
   // ── Electron: LOCAL-FIRST — always the embedded local API (:3080) ─────────────────────────
@@ -466,14 +505,64 @@ export function clearNativeSessionToken(): void {
   }
 }
 
+// ─── Client Platform Declaration (Security-0.6.13) ────────────────────────────
+
+/**
+ * The declared client platform, sent as `x-blasti-client` on EVERY API
+ * request (including the login POST). The server bakes it into the session
+ * JWT at mint time (assertPlatformLoginAllowed) and denies admin-API access
+ * to sessions minted for 'mobile'/'desktop' (requireAdmin platform gate).
+ *
+ * Mapping uses the NATIVE-SHELL probes (window.electronAPI / window.Capacitor)
+ * — deliberately NOT the screen-size "mobile" category: a phone BROWSER is
+ * still 'web' so the admin console keeps working in a phone browser; only
+ * the native app shells are 'mobile' (Capacitor) / 'desktop' (Electron).
+ */
+let cachedClientPlatform: 'web' | 'mobile' | 'desktop' | undefined;
+
+function blastiClientPlatform(): 'web' | 'mobile' | 'desktop' {
+  if (cachedClientPlatform !== undefined) return cachedClientPlatform;
+  if (isServerSide()) {
+    cachedClientPlatform = 'web';
+    return cachedClientPlatform;
+  }
+  if (isElectronRuntime()) cachedClientPlatform = 'desktop';
+  else if (isCapacitorRuntime()) cachedClientPlatform = 'mobile';
+  else cachedClientPlatform = 'web';
+  return cachedClientPlatform;
+}
+
+/** Header fragment for the request pipeline — {} on the server. */
+function blastiClientHeaders(): Record<string, string> {
+  if (isServerSide()) return {};
+  return { 'x-blasti-client': blastiClientPlatform() };
+}
+
 /**
  * Build auth-related headers for the request.
  *
  * - Web: no explicit header needed; cookies are sent automatically with `credentials: 'include'`.
  * - Electron: uses the local API session token from `localStorage` (set after login).
  * - Capacitor: reads the session token from localStorage and adds `Authorization: Bearer <token>`.
+ *
+ * Every request also carries the `x-blasti-client` platform declaration
+ * (Security-0.6.13) — see blastiClientPlatform().
  */
 function buildAuthHeaders(): Record<string, string> {
+  return { ...blastiClientHeaders(), ...buildAuthHeadersInner() };
+}
+
+function buildAuthHeadersInner(): Record<string, string> {
+  // ── 0.6.23 (R-21F-S2): LAN authority device token FIRST ─────────────────
+  // While the base override points at an offline master, authenticated calls
+  // carry the per-device lanToken minted by POST /api/lan/join (REST contract
+  // rule 3 — the master's requireAuth accepts device tokens). Cloud
+  // cookie/Bearer flows below resume unchanged when the override clears.
+  const lanToken = getLanAuthorityLanToken();
+  if (lanToken) {
+    return { Authorization: `Bearer ${lanToken}` };
+  }
+
   if (isServerSide()) {
     // On the server, the session cookie is available in the request context.
     // Server-side calls go through internal URLs and should rely on the
@@ -585,6 +674,18 @@ function buildUrl(baseUrl: string, path: string, params?: Record<string, string>
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 0.6.23 — JSON.parse that never throws (for probing error bodies of
+ * non-OK responses in the request pipeline below).
+ */
+function safeJsonParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
 // ─── API Unreachable Tracking ────────────────────────────────────────────────
@@ -717,12 +818,14 @@ function markBothUnreachable(): void {
 function markApiReachable(): void {
   _apiUnreachableUntil = 0;
   _bothUnreachableUntil = 0;
+  setCloudUnreachable(false); // 0.6.23 — relax the LAN authority override gate
   persistUnreachableFlags();
   console.log(`[ApiClient:FLAGS] markApiReachable → all flags cleared`);
 }
 
 function markApiUnreachable(): void {
   _apiUnreachableUntil = Date.now() + 30_000; // 30s cooldown
+  setCloudUnreachable(true); // 0.6.23 — cloud network failures widen the LAN authority gate
   persistUnreachableFlags();
   console.log(`[ApiClient:FLAGS] markApiUnreachable → cloud unreachable for 30s`);
 }
@@ -868,6 +971,254 @@ export class ApiClient {
     return this.request<T>('DELETE', path, undefined, options);
   }
 
+  // ── cache-1: completed-GET response cache (SWR + realtime invalidation) ──
+  //
+  // WHY: the SPA view-switcher unmounts every view on navigation, so each
+  // remount re-ran its fetch effects — a full network round-trip per endpoint
+  // per page visit "even if I was there a minute ago". The inflight map above
+  // only coalesces CONCURRENT requests; this layer caches COMPLETED responses:
+  //
+  //   • fresh (age < TTL)  → returned instantly, zero network
+  //   • stale (age ≥ TTL)  → returned instantly AND revalidated in the
+  //                          background with If-None-Match — a 304 costs
+  //                          ~200 bytes, a 200 swaps the data and notifies
+  //                          subscribers (mounted pages update in place)
+  //   • mutations          → soft-invalidate the matching path family
+  //                          (stale + background revalidate, not a hard delete)
+  //   • realtime events    → same soft invalidation from use-realtime
+  //   • persisted          → debounced localStorage snapshot (capped) so a
+  //                          cold app start paints from the last session
+  //
+  // Security: the persisted snapshot is wiped on logout (shared devices must
+  // never leak the previous account's data). Keys include the auth-token
+  // suffix, so two sessions never read each other's entries.
+
+  private static getCache = new Map<string, { data: unknown; etag: string | null; ts: number; path: string }>();
+  private static getCacheRevalidating = new Set<string>();
+  private static getCacheLastRevalidate = new Map<string, number>();
+  private static getCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
+  private static cacheListeners = new Set<(affectedKeys: string[]) => void>();
+  private static readonly GET_CACHE_LS_KEY = 'blasti-get-cache-v1';
+  private static readonly GET_CACHE_MAX_ENTRIES = 80;
+  private static readonly GET_CACHE_MAX_BYTES = 256 * 1024;
+  private static readonly REVALIDATE_THROTTLE_MS = 5_000;
+  /** Fresh window (ms) — class-local twin of the exported DEFAULT_GET_CACHE_TTL. */
+  private static readonly DEFAULT_TTL = 30_000;
+
+  /** Paths that must NEVER be served from cache (auth/session/sync semantics). */
+  private static isUncacheablePath(path: string): boolean {
+    const p = path.split('?')[0];
+    return (
+      p.startsWith('/api/auth') ||
+      p.startsWith('/api/sync') ||
+      p.startsWith('/api/health') ||
+      p.startsWith('/api/discover') ||
+      p.startsWith('/api/upload') ||
+      p.startsWith('/socket.io')
+    );
+  }
+
+  private static loadPersistedGetCache(): void {
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(ApiClient.GET_CACHE_LS_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as Record<string, { data: unknown; etag: string | null; ts: number; path: string }>;
+      let n = 0;
+      for (const [k, v] of Object.entries(parsed)) {
+        if (n >= ApiClient.GET_CACHE_MAX_ENTRIES) break;
+        if (v && typeof v.ts === 'number' && v.path) {
+          ApiClient.getCache.set(k, v);
+          n++;
+        }
+      }
+    } catch {
+      // corrupt snapshot — drop it
+      try {
+        localStorage.removeItem(ApiClient.GET_CACHE_LS_KEY);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private static persistGetCache(): void {
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined') return;
+    if (ApiClient.getCachePersistTimer) clearTimeout(ApiClient.getCachePersistTimer);
+    ApiClient.getCachePersistTimer = setTimeout(() => {
+      ApiClient.getCachePersistTimer = null;
+      try {
+        // LRU cap: keep the newest entries only.
+        const entries = [...ApiClient.getCache.entries()].sort((a, b) => b[1].ts - a[1].ts);
+        const kept = entries.slice(0, ApiClient.GET_CACHE_MAX_ENTRIES);
+        if (kept.length < entries.length) {
+          for (const [k] of entries.slice(ApiClient.GET_CACHE_MAX_ENTRIES)) ApiClient.getCache.delete(k);
+        }
+        const out: Record<string, unknown> = {};
+        let bytes = 0;
+        for (const [k, v] of kept) {
+          const json = JSON.stringify(v);
+          bytes += json.length;
+          if (bytes > ApiClient.GET_CACHE_MAX_BYTES) break;
+          out[k] = v;
+        }
+        localStorage.setItem(ApiClient.GET_CACHE_LS_KEY, JSON.stringify(out));
+      } catch {
+        // quota / private mode — cache stays memory-only
+      }
+    }, 800);
+  }
+
+  /** Wipe everything (logout / account switch). Memory + persisted. */
+  static wipeGetCache(): void {
+    ApiClient.getCache.clear();
+    ApiClient.getCacheRevalidating.clear();
+    ApiClient.getCacheLastRevalidate.clear();
+    if (typeof window !== 'undefined' && typeof localStorage !== 'undefined') {
+      try {
+        localStorage.removeItem(ApiClient.GET_CACHE_LS_KEY);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  /** Subscribe to cache updates (SWR swaps + invalidations). Returns unsub. */
+  static subscribeCache(fn: (affectedKeys: string[]) => void): () => void {
+    ApiClient.cacheListeners.add(fn);
+    return () => ApiClient.cacheListeners.delete(fn);
+  }
+
+  private static notifyCacheListeners(keys: string[]): void {
+    if (keys.length === 0) return;
+    for (const fn of [...ApiClient.cacheListeners]) {
+      try {
+        fn(keys);
+      } catch {
+        // a broken listener must never break the request pipeline
+      }
+    }
+  }
+
+  private static cacheKey(method: string, path: string, paramsKey: string, authKey: string): string {
+    return `${method} ${path}?${paramsKey}#${authKey.slice(-24)}`;
+  }
+
+  /**
+   * Soft-invalidate every cached GET whose path starts with one of the
+   * prefixes: the entry stays (instant stale paint) but is marked stale and
+   * revalidated in the background. Pass `{ hard: true }` to delete outright.
+   */
+  static invalidatePrefixes(prefixes: string[], opts?: { hard?: boolean }): string[] {
+    const affected: string[] = [];
+    for (const [key, entry] of ApiClient.getCache.entries()) {
+      if (prefixes.some((p) => entry.path === p || entry.path.startsWith(p))) {
+        affected.push(key);
+        if (opts?.hard) {
+          ApiClient.getCache.delete(key);
+        } else {
+          entry.ts = 0; // stale → next read paints instantly + revalidates
+        }
+      }
+    }
+    if (affected.length > 0) {
+      if (opts?.hard) ApiClient.persistGetCache();
+      ApiClient.notifyCacheListeners(affected);
+      if (!opts?.hard) {
+        // Kick background revalidation for the stale entries (throttled).
+        for (const key of affected) {
+          const entry = ApiClient.getCache.get(key);
+          if (entry) void ApiClient.revalidateEntry(key, entry.path);
+        }
+      }
+    }
+    return affected;
+  }
+
+  /** Soft-invalidate EVERYTHING (e.g. a full desktop sync landed). */
+  static invalidateAll(): void {
+    ApiClient.invalidatePrefixes(['/'], { hard: false });
+  }
+
+  /** Derive the invalidation family from a mutation path + fire it. */
+  private static invalidateForMutation(path: string): void {
+    const clean = path.split('?')[0];
+    const segments = clean.split('/').filter(Boolean); // ['api', 'agency', 'services']
+    const family = segments.length >= 2 ? `/${segments[0]}/${segments[1]}` : clean;
+    const prefixes = [family, '/api/stats', '/api/analytics'];
+    // 0.6.18 SLOW-CACHE FIX (field: "updating cached info is too slow and
+    // needs refreshing the page"): mutations used to SOFT-invalidate (ts=0) —
+    // the next read painted the PRE-MUTATION payload instantly and only
+    // revalidated in the background, and since ApiClient.subscribeCache has
+    // zero call sites the revalidated bytes never re-rendered anybody. After
+    // a SUCCESSFUL mutation the server state HAS changed, so while online the
+    // entries are HARD-deleted: the very next read goes to the network and
+    // lands the fresh payload in the caller's setState (fetchProfile after
+    // save, settings reload, next mount, ...). Offline we keep soft
+    // invalidation so mounted views never lose their data.
+    const online = typeof navigator === 'undefined' ? true : navigator.onLine !== false;
+    ApiClient.invalidatePrefixes(prefixes, { hard: online });
+  }
+
+  /**
+   * Background revalidation of one cache entry (single-flight + throttled).
+   * Raw fetch (NOT requestUncached) — 304 is an expected success here, and
+   * retry semantics would misread it as a server error.
+   */
+  private static async revalidateEntry(key: string, path: string): Promise<void> {
+    const now = Date.now();
+    const last = ApiClient.getCacheLastRevalidate.get(key) ?? 0;
+    if (now - last < ApiClient.REVALIDATE_THROTTLE_MS) return;
+    if (ApiClient.getCacheRevalidating.has(key)) return;
+    ApiClient.getCacheRevalidating.add(key);
+    ApiClient.getCacheLastRevalidate.set(key, now);
+    try {
+      const entry = ApiClient.getCache.get(key);
+      if (!entry) return;
+      const requestBaseUrl = getLanAuthorityOverride()?.baseUrl
+        ?? (isCapacitorRuntime() && getNativeCloudUrl()
+          ? getNativeCloudUrl() as string
+          : apiClientRef.config.baseUrl);
+      const url = buildUrl(requestBaseUrl, path, undefined);
+      const headers: Record<string, string> = { ...buildAuthHeaders() };
+      if (entry.etag) headers['If-None-Match'] = entry.etag;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 12_000);
+      let res: Response;
+      try {
+        res = await fetch(url, { method: 'GET', headers, credentials: 'include', signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (res.status === 304) {
+        entry.ts = Date.now(); // unchanged — refresh the fresh window
+        ApiClient.notifyCacheListeners([key]);
+        return;
+      }
+      if (res.ok) {
+        const parsed = await apiClientRef.parseResponse<unknown>(res);
+        const etag = res.headers.get('ETag');
+        ApiClient.getCache.set(key, { data: parsed.data, etag, ts: Date.now(), path });
+        ApiClient.persistGetCache();
+        ApiClient.notifyCacheListeners([key]);
+      }
+      // non-ok / network error → keep serving the stale entry
+    } catch {
+      // offline / aborted — stale entry stays for instant paint
+    } finally {
+      ApiClient.getCacheRevalidating.delete(key);
+    }
+  }
+
+  /** Warm the cache at boot/login (fire-and-forget prefetch of core paths). */
+  static warmCache(paths: string[]): void {
+    for (const p of paths) {
+      void this.get(p).catch(() => undefined);
+    }
+  }
+
+  private static loadPersistedOnce = false;
+
   // ── Core Request Logic ─────────────────────────────────────────────────────
 
   // ── Performance Round: in-flight GET dedup ───────────────────────────────
@@ -891,6 +1242,12 @@ export class ApiClient {
    * callers with a custom signal, custom headers, or non-GET methods always
    * execute for themselves. The auth token is part of the dedupe key so two
    * different sessions never share a response.
+   *
+   * cache-1 — on top of dedup, completed GETs are CACHED (fresh window 30s):
+   * fresh entries answer instantly with zero network; stale entries answer
+   * instantly AND revalidate in the background (If-None-Match → 304 or swap).
+   * Successful mutations soft-invalidate their path family so every mounted
+   * view sees fresh data on its next read without a hard reload.
    */
   private async request<T>(
     method: string,
@@ -909,8 +1266,25 @@ export class ApiClient {
     }
     const dedupable = m === 'GET' && !options?.signal && !hasCustomHeaders;
     if (!dedupable) {
-      return this.requestUncached<T>(method, path, body, options);
+      const p = this.requestUncached<T>(method, path, body, options);
+      // Mutations invalidate their cache family (GETs never reach here).
+      if (m !== 'GET') {
+        return p.then((res) => {
+          if (res.status >= 200 && res.status < 300) {
+            ApiClient.invalidateForMutation(path);
+          }
+          return res;
+        });
+      }
+      return p;
     }
+
+    // One-time hydration of the persisted snapshot (cold app start).
+    if (!ApiClient.loadPersistedOnce) {
+      ApiClient.loadPersistedOnce = true;
+      ApiClient.loadPersistedGetCache();
+    }
+
     let authKey = '';
     try {
       const authHeaders = buildAuthHeaders();
@@ -919,14 +1293,50 @@ export class ApiClient {
       authKey = '';
     }
     const paramsKey = options?.params ? JSON.stringify(options.params) : '';
-    const key = `${m} ${path}?${paramsKey}#${authKey.slice(-24)}`;
+    const key = ApiClient.cacheKey(m, path, paramsKey, authKey);
+
+    // ── cache-1 read path ──
+    const ttl = options?.cacheTtl !== undefined ? options.cacheTtl : ApiClient.DEFAULT_TTL;
+    const cacheable = ttl > 0 && !ApiClient.isUncacheablePath(path);
+    if (cacheable) {
+      const entry = ApiClient.getCache.get(key);
+      if (entry) {
+        const age = Date.now() - entry.ts;
+        if (age < ttl) {
+          return { data: entry.data as T, status: 200, headers: new Headers({ 'x-blasti-cache': 'hit' }) };
+        }
+        // Stale-while-revalidate: instant stale paint + background refresh.
+        void ApiClient.revalidateEntry(key, path);
+        return { data: entry.data as T, status: 200, headers: new Headers({ 'x-blasti-cache': 'stale' }) };
+      }
+    }
+
     const existing = ApiClient.inflightGets.get(key);
     if (existing) {
       return existing as Promise<ApiResponse<T>>;
     }
-    const p = this.requestUncached<T>(method, path, body, options).finally(() => {
-      ApiClient.inflightGets.delete(key);
-    });
+    const p = this.requestUncached<T>(method, path, body, options)
+      .then((res) => {
+        // cache-1 write path — completed 200 GETs land in the cache.
+        if (cacheable && res.status === 200) {
+          ApiClient.getCache.set(key, {
+            data: res.data,
+            etag: res.headers.get('ETag'),
+            ts: Date.now(),
+            path,
+          });
+          // In-memory trim (persist re-caps too).
+          if (ApiClient.getCache.size > ApiClient.GET_CACHE_MAX_ENTRIES + 40) {
+            const oldest = [...ApiClient.getCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+            if (oldest) ApiClient.getCache.delete(oldest[0]);
+          }
+          ApiClient.persistGetCache();
+        }
+        return res;
+      })
+      .finally(() => {
+        ApiClient.inflightGets.delete(key);
+      });
     ApiClient.inflightGets.set(key, p as Promise<ApiResponse<unknown>>);
     return p;
   }
@@ -963,9 +1373,12 @@ export class ApiClient {
     // runtime resolver finishes asynchronously after module load, and the
     // singleton's frozen config.baseUrl would otherwise keep pointing at the
     // unreachable build-time default (10.0.2.2) forever on physical phones.
-    const requestBaseUrl = isCapacitorRuntime() && getNativeCloudUrl()
-      ? getNativeCloudUrl() as string
-      : this.config.baseUrl;
+    // 0.6.23: the LAN authority override (joined offline master) wins first —
+    // it must repoint ALL traffic, including this per-request path.
+    const requestBaseUrl = getLanAuthorityOverride()?.baseUrl
+      ?? (isCapacitorRuntime() && getNativeCloudUrl()
+        ? getNativeCloudUrl() as string
+        : this.config.baseUrl);
     const url = buildUrl(requestBaseUrl, path, options?.params);
 
     // ── Electron: pre-discover local API (inert under local-first) ──────────────────
@@ -985,6 +1398,29 @@ export class ApiClient {
       ...blastiNetworkHeaders(),
       ...options?.headers,
     };
+
+    // ── UNIFIED QUEUE: idempotency keys on every mutating request ───────────
+    // A network-level retransmission must never execute an operation twice
+    // (e.g. call-next claiming TWO tickets from one double-click over a flaky
+    // link). The central API's idempotencyGuard replays the STORED response
+    // for a repeated X-Idempotency-Key, so the same logical operation always
+    // yields the same result. Callers may pass their own key via headers.
+    const upperMethod = method.toUpperCase();
+    if (upperMethod === 'POST' || upperMethod === 'PUT' || upperMethod === 'PATCH' || upperMethod === 'DELETE') {
+      let callerKey: string | undefined;
+      const callerHeaders = options?.headers;
+      if (callerHeaders) {
+        if (typeof Headers !== 'undefined' && callerHeaders instanceof Headers) {
+          callerKey = callerHeaders.get('X-Idempotency-Key') ?? callerHeaders.get('x-idempotency-key') ?? undefined;
+        } else {
+          const rec = callerHeaders as Record<string, string>;
+          callerKey = rec['X-Idempotency-Key'] ?? rec['x-idempotency-key'];
+        }
+      }
+      if (!callerKey && typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        headers['X-Idempotency-Key'] = crypto.randomUUID();
+      }
+    }
 
     // ── Fast LAN bypass: if the cloud API was recently marked unreachable
     // (5xx or network error in the last 30s) and we're on a native platform,
@@ -1082,6 +1518,11 @@ export class ApiClient {
         // Client errors (4xx) — do NOT retry, throw immediately
         if (response.status >= 400 && response.status < 500) {
           const errorBody = await this.safeParseBody(response);
+          // 0.6.23 (R-21F-S2): a follower node answers 409 with
+          // { code:'NOT_MASTER', master:{ip,port,...} } — activate the base
+          // override immediately so the NEXT request hits the real master
+          // (REST contract rule 4).
+          handleNotMasterBody(errorBody);
           const elapsed = (performance.now() - attemptStart).toFixed(0);
           console.log(`[ApiClient:CLOUD] ${method} ${path} → 4xx (${response.status}, ${elapsed}ms), no retry`);
           diag('req-4xx', { method, path, status: response.status, ms: elapsed, body: errorBody });
@@ -1426,6 +1867,9 @@ export class ApiClient {
       if (!response.ok) {
         const elapsed = (performance.now() - lanStart).toFixed(0);
         const errorText = await response.text().catch(() => '');
+        // 0.6.23 (R-21F-S2): NOT_MASTER 409 from a LAN node — repoint the
+        // base override to the hinted master before the error propagates.
+        handleNotMasterBody(safeJsonParse(errorText));
         // Structured logging for LAN errors (Issue #17 from offline analysis)
         if (response.status === 404) {
           console.warn(`[LAN 404 ROUTE_NOT_IMPLEMENTED] ${method} ${path} (${elapsed}ms) — local API does not implement this route. If this is needed offline, add it to local-api/index.js.`);
@@ -2122,3 +2566,10 @@ ApiClient.prototype.request = async function<T>(
  * ```
  */
 export const apiClient = new ApiClient();
+
+/**
+ * cache-1: runtime handle for the singleton, reachable from STATIC methods
+ * (revalidateEntry needs parseResponse + config). Assigned at module init;
+ * static cache paths only run after module evaluation completes.
+ */
+const apiClientRef: ApiClient = apiClient;

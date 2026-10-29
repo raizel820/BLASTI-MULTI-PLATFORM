@@ -123,3 +123,7 @@ installer/**/*.exe
 
 # Sub-agent working records (session tooling, not product code)
 /agent-ctx/
+
+# Backup Manager — local backup archive store (engine default: <repo>/backups)
+backups/
+apps/api/logs/

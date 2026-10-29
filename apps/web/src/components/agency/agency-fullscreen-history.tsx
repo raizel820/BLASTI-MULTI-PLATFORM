@@ -297,7 +297,7 @@ export function AgencyFullscreenHistory() {
   // ─── Star Rating ─────────────────────────────────────────────────────
 
   const StarRating = ({ rating }: { rating: number | null }) => {
-    if (rating == null) return <span className="text-gray-500">—</span>;
+    if (rating == null) return <span className="text-gray-500 dark:text-gray-400">—</span>;
     return (
       <div className="flex items-center gap-0.5">
         {[1, 2, 3, 4, 5].map((star) => (
@@ -334,7 +334,7 @@ export function AgencyFullscreenHistory() {
               <p className="text-sm text-gray-400">
                 #{res.queueNumber}
                 {res.isWalkIn && (
-                  <Badge variant="outline" className="ml-2 border-amber-600/30 bg-amber-600/10 text-amber-400 text-[10px]">
+                  <Badge variant="outline" className="ms-2 border-amber-600/30 bg-amber-600/10 text-amber-400 text-[10px]">
                     Walk-in
                   </Badge>
                 )}
@@ -519,7 +519,7 @@ export function AgencyFullscreenHistory() {
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
               <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
             </span>
-            <span className="text-[11px] text-gray-500 hidden sm:inline">Live</span>
+            <span className="text-[11px] text-gray-500 dark:text-gray-400 hidden sm:inline">Live</span>
           </div>
           <Button
             variant="ghost"
@@ -542,7 +542,7 @@ export function AgencyFullscreenHistory() {
             {/* Search */}
             <div className="p-3 pb-2">
               <div className="relative">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500" />
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500 dark:text-gray-400" />
                 <Input
                   placeholder={`${t('search')}...`}
                   value={searchQuery}
@@ -552,7 +552,7 @@ export function AgencyFullscreenHistory() {
                 {searchQuery && (
                   <button
                     onClick={() => setSearchQuery('')}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300"
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 dark:text-gray-400 hover:text-gray-300"
                   >
                     <X className="h-3.5 w-3.5" />
                   </button>
@@ -594,7 +594,7 @@ export function AgencyFullscreenHistory() {
 
               {/* Date From */}
               <div className="relative">
-                <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3 w-3 text-gray-500 pointer-events-none" />
+                <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3 w-3 text-gray-500 dark:text-gray-400 pointer-events-none" />
                 <Input
                   type="date"
                   value={dateFrom}
@@ -605,7 +605,7 @@ export function AgencyFullscreenHistory() {
 
               {/* Date To */}
               <div className="relative">
-                <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3 w-3 text-gray-500 pointer-events-none" />
+                <Calendar className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3 w-3 text-gray-500 dark:text-gray-400 pointer-events-none" />
                 <Input
                   type="date"
                   value={dateTo}
@@ -620,7 +620,7 @@ export function AgencyFullscreenHistory() {
                   variant="ghost"
                   size="sm"
                   onClick={handleClearFilters}
-                  className="h-8 px-2 text-gray-500 hover:text-gray-300 hover:bg-gray-800 rounded-lg text-xs gap-1"
+                  className="h-8 px-2 text-gray-500 dark:text-gray-400 hover:text-gray-300 hover:bg-gray-800 rounded-lg text-xs gap-1"
                 >
                   <X className="h-3 w-3" />
                   {t('clearFilters')}
@@ -649,9 +649,9 @@ export function AgencyFullscreenHistory() {
             ) : reservations.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-full gap-3 p-8 text-center">
                 <div className="h-16 w-16 rounded-2xl bg-gray-900 flex items-center justify-center">
-                  <Ticket className="h-8 w-8 text-gray-600" />
+                  <Ticket className="h-8 w-8 text-gray-600 dark:text-gray-400" />
                 </div>
-                <p className="text-sm text-gray-500">
+                <p className="text-sm text-gray-500 dark:text-gray-400">
                   {hasActiveFilters ? t('noResults') : t('noHistoryYet')}
                 </p>
                 {hasActiveFilters && (
@@ -710,11 +710,11 @@ export function AgencyFullscreenHistory() {
                               </Badge>
                             )}
                           </div>
-                          <div className="flex items-center gap-2 text-xs text-gray-500 mt-0.5">
+                          <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400 mt-0.5">
                             <span className="truncate">
                               {getServiceName(res, lang)}
                             </span>
-                            <span className="text-gray-700">·</span>
+                            <span className="text-gray-700 dark:text-gray-300">·</span>
                             <span className="shrink-0">
                               {formatTime(res.joinedAt, locale)}
                             </span>
@@ -725,7 +725,7 @@ export function AgencyFullscreenHistory() {
                         <div className="flex flex-col items-end gap-1 shrink-0">
                           <QueueStatusBadge status={res.status} compact />
                           {res.serviceDuration != null && (
-                            <span className="text-[11px] text-gray-500 flex items-center gap-0.5">
+                            <span className="text-[11px] text-gray-500 dark:text-gray-400 flex items-center gap-0.5">
                               <Timer className="h-3 w-3" />
                               {formatDuration(res.serviceDuration)}
                             </span>
@@ -742,7 +742,7 @@ export function AgencyFullscreenHistory() {
           {/* Pagination */}
           {!loading && totalPages > 1 && (
             <div className="shrink-0 flex items-center justify-between border-t border-gray-800 bg-gray-950 px-4 py-2">
-              <span className="text-xs text-gray-500">
+              <span className="text-xs text-gray-500 dark:text-gray-400">
                 {t('page')} {page} / {totalPages}
               </span>
               <div className="flex items-center gap-1">
@@ -825,13 +825,13 @@ export function AgencyFullscreenHistory() {
             ) : (
               <div className="flex flex-col items-center justify-center h-full gap-4 p-8 text-center">
                 <div className="h-20 w-20 rounded-2xl bg-gray-900/80 flex items-center justify-center">
-                  <Ticket className="h-10 w-10 text-gray-700" />
+                  <Ticket className="h-10 w-10 text-gray-700 dark:text-gray-300" />
                 </div>
                 <div>
                   <p className="text-sm font-medium text-gray-400">
                     Select a reservation
                   </p>
-                  <p className="text-xs text-gray-600 mt-1">
+                  <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
                     Click on any entry in the list to view full details
                   </p>
                 </div>
@@ -847,7 +847,7 @@ export function AgencyFullscreenHistory() {
           <DialogContent className="bg-gray-950 border-gray-800 text-white max-h-[85vh] overflow-y-auto sm:max-w-lg">
             <DialogHeader>
               <DialogTitle className="text-white">Reservation Details</DialogTitle>
-              <DialogDescription className="text-gray-500">
+              <DialogDescription className="text-gray-500 dark:text-gray-400">
                 Full details for the selected reservation
               </DialogDescription>
             </DialogHeader>
@@ -876,7 +876,7 @@ function DetailRow({
         {icon}
       </div>
       <div className="min-w-0 flex-1">
-        <p className="text-[11px] text-gray-500 uppercase tracking-wide">{label}</p>
+        <p className="text-[11px] text-gray-500 dark:text-gray-400 uppercase tracking-wide">{label}</p>
         <p className="text-sm text-gray-200 truncate">{value || '—'}</p>
       </div>
     </div>

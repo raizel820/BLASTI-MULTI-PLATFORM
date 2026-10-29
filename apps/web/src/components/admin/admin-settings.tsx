@@ -21,8 +21,7 @@ import {
   Server,
   BellRing,
   MapPin,
-  CreditCard,
-  Banknote,
+  Wallet,
   ShieldCheck,
   HelpCircle,
   SlidersHorizontal,
@@ -52,8 +51,10 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   { view: 'admin-settings-vps', icon: Server, titleKey: 'settingsVps', descKey: 'settingsVpsDesc' },
   { view: 'admin-settings-providers', icon: BellRing, titleKey: 'settingsProviders', descKey: 'settingsProvidersDesc' },
   { view: 'admin-settings-maps', icon: MapPin, titleKey: 'settingsMapsSub', descKey: 'settingsMapsSubDesc' },
-  { view: 'admin-settings-payments', icon: CreditCard, titleKey: 'settingsPaymentsGateway', descKey: 'settingsPaymentsGatewayDesc' },
-  { view: 'admin-settings-financial', icon: Banknote, titleKey: 'settingsFinancialEngine', descKey: 'settingsFinancialEngineDesc' },
+  // r21-6 — ONE "Payment Center" card replaces the retired
+  // admin-settings-payments (gateway) + admin-settings-financial (engine)
+  // pair (both views stay wired as harmless dead routes).
+  { view: 'admin-payment-settings', icon: Wallet, titleKey: 'settingsPaymentCenter', descKey: 'settingsPaymentCenterDesc' },
   { view: 'admin-settings-security', icon: ShieldCheck, titleKey: 'settingsSecuritySub', descKey: 'settingsSecuritySubDesc' },
   { view: 'admin-settings-faq', icon: HelpCircle, titleKey: 'settingsFaqSub', descKey: 'settingsFaqSubDesc' },
   { view: 'admin-settings-config', icon: SlidersHorizontal, titleKey: 'settingsSystemConfig', descKey: 'settingsSystemConfigDesc' },

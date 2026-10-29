@@ -23,6 +23,7 @@ import {
   KeyRound,
   Trash2,
   RefreshCw,
+  Fingerprint,
 } from 'lucide-react';
 import {
   AlertDialog,
@@ -51,6 +52,8 @@ interface UserItem {
   phoneNumber?: string;
   agencyName?: string;
   avatarUrl?: string | null;
+  /** UID-0.6.14 — immutable account identifier ({TYPE}-{WILAYA}-{SEQ}). */
+  uid?: string | null;
 }
 
 const roleFilters = [
@@ -393,6 +396,12 @@ export function AdminUsers() {
                           @{user.username}
                           {user.email && ` · ${user.email}`}
                         </p>
+                        {user.uid && (
+                          <div className="flex items-center gap-1 mt-0.5">
+                            <Fingerprint className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                            <span className="text-[10px] font-mono text-muted-foreground" dir="ltr">{user.uid}</span>
+                          </div>
+                        )}
                         {user.agencyName && (
                           <div className="flex items-center gap-1 mt-0.5">
                             <Building2 className="h-3 w-3 text-emerald-500 flex-shrink-0" />
@@ -518,6 +527,15 @@ export function AdminUsers() {
                             <p className="text-sm font-medium text-foreground">@{user.username}</p>
                           </div>
                         </div>
+                        {user.uid && (
+                          <div className="flex items-center gap-2">
+                            <Fingerprint className="h-4 w-4 text-muted-foreground" />
+                            <div>
+                              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">{t('uid')}</p>
+                              <p className="text-sm font-mono font-medium text-foreground" dir="ltr">{user.uid}</p>
+                            </div>
+                          </div>
+                        )}
                         {user.fullName && (
                           <div className="flex items-center gap-2">
                             <ShieldCheck className="h-4 w-4 text-muted-foreground" />

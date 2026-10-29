@@ -151,7 +151,11 @@ function ensureContext(): any {
   if (!framework) throw new Error('Cast framework not loaded');
   const context = framework.CastContext.getInstance();
   context.setOptions({
-    receiverApplicationId: cast.media.DEFAULT_MEDIA_RECEIVER_ID || chrome.cast.media.DEFAULT_MEDIA_RECEIVER_ID,
+    // Hotfix 0.6.12 — the bare `chrome.cast.media...` fallback referenced an
+    // undeclared global (TS2304). `cast` above is `window.chrome?.cast`
+    // narrowed non-null, so `cast.media` is the same lookup, minus the
+    // undeclared-global landmine.
+    receiverApplicationId: cast.media.DEFAULT_MEDIA_RECEIVER_ID,
     autoJoinPolicy: cast.AutoJoinPolicy.ORIGIN_SCOPED,
   });
   // Track the current session so loadMedia/stop/pause/play work without a

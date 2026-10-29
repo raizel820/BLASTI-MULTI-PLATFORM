@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 import type { Language } from '@/i18n';
 import { isRTL } from '@/i18n';
 import { apiFetch } from '@/lib/api-fetch';
+import { ApiClient } from '@/lib/api-client';
 // Native shells (Capacitor mobile / Electron desktop) must boot straight into
 // their dedicated login screen — never the marketing landing page. detectPlatform
 // is SSR-safe (returns isNative:false on the server) and dependency-free.
@@ -47,6 +48,11 @@ import {
   storeSessionToken,
   purgeAuthState,
 } from '@/lib/auth-storage';
+// r21-8 (counter control) — fire-and-forget release of any counter the
+// logged-in user still CONTROLS, sent before logout destroys the session
+// token. Reads the persisted surfaces directly (this closure has no `get`),
+// keepalive:true so it survives the reload logout() performs.
+import { fireReleaseMine, readPersistedSessionToken } from '@/lib/counter-release';
 
 /**
  * Task 2-b — DESKTOP remember-me gate for the persisted store.
@@ -83,7 +89,9 @@ export type ViewName =
   | 'customer-agency-profile'
   | 'customer-branch-profile'
   | 'customer-search'
-  | 'customer-sms-wallet'
+  // 'customer-sms-wallet' removed (UI audit R-6): the view existed in the union
+  // and URL maps but had NO render case — a dead link. The wallet lives in the
+  // profile surface; re-add as a real view when it gets a dedicated screen.
   | 'customer-analytics'
   | 'customer-support'
   // Chargily (EDAHABIA / CIB) payment result — full-screen, role-agnostic,
@@ -101,7 +109,13 @@ export type ViewName =
   | 'agency-support'
   | 'admin-dashboard'
   | 'admin-transactions'
+  // Task 5-a: "Agencies Management" sidebar group — a hub view + the
+  // agencies/services subsections + the two new category pages.
+  | 'admin-agencies-management'
   | 'admin-agencies'
+  | 'admin-services-management'
+  | 'admin-category-manager'
+  | 'admin-category-language'
   | 'admin-audit'
   | 'admin-users'
   | 'admin-analytics'
@@ -118,6 +132,10 @@ export type ViewName =
   | 'admin-settings-faq'
   | 'admin-settings-config'
   | 'admin-settings-financial'
+  // r21-6 — unified Payment Center (replaces the retired
+  // admin-settings-payments / admin-settings-financial pair in the sidebar;
+  // the old views stay wired as harmless dead routes for stale hashes).
+  | 'admin-payment-settings'
   // Task 2-b: dedicated super-admin Maps & Location page (standalone wrapper
   // around AdminMapsSettings, which is also embedded in admin-settings).
   | 'admin-maps'
@@ -133,6 +151,15 @@ export type ViewName =
   // disk usage, per-category breakdown, drill-down browser, orphan cleanup.
   // Lives in the '__data_storage_group__' sidebar group next to admin-db.
   | 'admin-storage'
+  // Logs Manager — SUPER_ADMIN realtime log analysis console (logs-2/0.6.19):
+  // error fingerprint index with severity, daily per-platform JSON aggregates
+  // and the raw per-UID/platform vault browser. Moved OUT of the Storage
+  // Manager into its own page in the '__data_storage_group__' group.
+  | 'admin-logs-manager'
+  // Backup Manager — SUPER_ADMIN snapshots / auto-backups / external targets
+  // (download, restore, migrate to S3/R2/Azure/D1/external Postgres).
+  // Lives in the '__data_storage_group__' sidebar group next to admin-db.
+  | 'admin-backups'
   | 'kiosk'
   | 'agency-fullscreen'
   | 'agency-fullscreen-history';
@@ -152,6 +179,8 @@ interface UserState {
   email?: string;
   freeSmsCount?: number;
   createdAt?: string;
+  /** UID-0.6.14 — immutable account identifier ({TYPE}-{WILAYA}-{SEQ}). */
+  uid?: string | null;
 }
 
 // ─── Task 37-e: agency authority cache ──────────────────────────────────────
@@ -229,8 +258,16 @@ interface AppState {
    * to the Electron main process with cloud-sync:set-auth so blasti-auth.json
    * is persisted ONLY for remember-me logins. Omitting it keeps the historic
    * behavior (durable auth file) for non-desktop callers.
+   *
+   * 0.6.20 fresh-signup fix — `opts.freshSignup` is set ONLY by the register
+   * flow: a brand-new account has NO agency (and no server data) to import,
+   * so the desktop main process must NOT run the staged workspace initial
+   * import for it (it showed a fake "importing your data" process and the
+   * post-login gate hung on UNKNOWN → 75s timeout → "failed"). The REAL
+   * import is triggered by the create-agency flow's setSessionToken call once
+   * the agency (and its agencyId) actually exists.
    */
-  setSessionToken: (token: string, opts?: { rememberMe?: boolean }) => void;
+  setSessionToken: (token: string, opts?: { rememberMe?: boolean; freshSignup?: boolean }) => void;
   setAgencyAuthority: (authority: AgencyAuthorityState | null) => void;
   setView: (view: ViewName) => void;
   goBack: () => void;
@@ -271,7 +308,7 @@ const viewHashMap: Record<ViewName, string> = {
   'customer-settings': '#/customer/settings',
   'customer-analytics': '#/customer/analytics',
   'customer-support': '#/customer/support',
-  'customer-sms-wallet': '#/customer/sms-wallet',
+  // 'customer-sms-wallet' removed (UI audit R-6 — dead view, no render case)
   // Chargily hosted-checkout return URL: /#/payment/result?status=success —
   // the generic prefix match in parseHashToView keeps the query params intact
   // while still resolving the view.
@@ -288,7 +325,13 @@ const viewHashMap: Record<ViewName, string> = {
   'agency-support': '#/agency/support',
   'admin-dashboard': '#/admin',
   'admin-transactions': '#/admin/transactions',
+  // Task 5-a: Agencies Management group — one hash per view. The existing
+  // admin-agencies / admin-services-management hashes are unchanged.
+  'admin-agencies-management': '#/admin/agencies-management',
   'admin-agencies': '#/admin/agencies',
+  'admin-services-management': '#/admin/services-management',
+  'admin-category-manager': '#/admin/category-manager',
+  'admin-category-language': '#/admin/category-language',
   'admin-audit': '#/admin/audit',
   'admin-users': '#/admin/users',
   'admin-analytics': '#/admin/analytics',
@@ -305,6 +348,8 @@ const viewHashMap: Record<ViewName, string> = {
   'admin-settings-faq': '#/admin/settings/faq',
   'admin-settings-config': '#/admin/settings/config',
   'admin-settings-financial': '#/admin/settings/financial',
+  // r21-6 — unified Payment Center (Gateways + Transfers + Reconciliation).
+  'admin-payment-settings': '#/admin/payment-settings',
   'admin-maps': '#/admin/maps', // Task 2-b
   'admin-subscription-plans': '#/admin/subscription-plans',
   'admin-app-settings': '#/admin/app-settings',
@@ -317,6 +362,7 @@ const viewHashMap: Record<ViewName, string> = {
   // parseHashToView via hashViewMap (no prefix-map work needed).
   'admin-db': '#/admin/db',
   'admin-storage': '#/admin/storage',
+  'admin-backups': '#/admin/backups',
   'kiosk': '#/kiosk',
   'agency-fullscreen': '#/agency/fullscreen',
   'agency-fullscreen-history': '#/agency/fullscreen/history',
@@ -418,7 +464,8 @@ function getDefaultViewForRole(role: UserRole): ViewName {
 const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'landing', 'login', 'register',
   'customer-home', 'customer-queue', 'customer-history', 'customer-notifications',
-  'customer-profile', 'customer-favorites', 'customer-settings', 'customer-sms-wallet',
+  // 'customer-sms-wallet' removed (UI audit R-6 — dead view, no render case)
+  'customer-profile', 'customer-favorites', 'customer-settings',
   'customer-agency-profile',
   'customer-branch-profile',
   'customer-search',
@@ -431,6 +478,7 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'agency-analytics',
   'admin-dashboard', 'admin-transactions', 'admin-agencies', 'admin-audit',
   'admin-users', 'admin-analytics', 'admin-settings', 'admin-maps', 'admin-subscription-plans', 'admin-app-settings', 'admin-db',
+  'admin-services-management',
   // Task 2: Storage Manager — must survive persisted-state sanitization
   // (VALID_VIEW_NAMES mirrors the ViewName union).
   'admin-storage',
@@ -439,6 +487,8 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'admin-settings-vps', 'admin-settings-providers', 'admin-settings-maps',
   'admin-settings-payments', 'admin-settings-security', 'admin-settings-faq',
   'admin-settings-config', 'admin-settings-financial',
+  // r21-6 — unified Payment Center (survives persisted-state sanitization).
+  'admin-payment-settings',
   'admin-hardware', 'admin-enterprise-requests',
   'admin-hardware-requests',
   'kiosk', 'agency-fullscreen', 'agency-fullscreen-history',
@@ -498,6 +548,8 @@ function sanitizeUser(user: unknown): UserState | null {
     email: typeof u.email === 'string' && u.email ? u.email : undefined,
     freeSmsCount,
     createdAt: typeof u.createdAt === 'string' ? u.createdAt : undefined,
+    // UID-0.6.14 — immutable account identifier (null for super admin).
+    uid: typeof u.uid === 'string' && u.uid ? u.uid : null,
   };
 }
 
@@ -634,6 +686,9 @@ export const useAppStore = create<AppState>()(
             token,
             user: currentUser,
             ...(opts && typeof opts.rememberMe === 'boolean' ? { rememberMe: opts.rememberMe } : {}),
+            // 0.6.20 — register flow only. Main process skips the staged
+            // workspace import for fresh signups (nothing to import yet).
+            ...(opts?.freshSignup ? { freshSignup: true } : {}),
           });
         }
         // CRITICAL: Also import session into the local API (port 3080)
@@ -654,6 +709,17 @@ export const useAppStore = create<AppState>()(
             }
           }, 500);
         }
+        // 0.6.17 first-login fix — every fresh login (and session heal) now
+        // immediately re-reads the authoritative profile and merges avatarUrl
+        // + uid (+ identity fields) into the session. The login response is
+        // whatever the DEPLOYED server returns; against an older API the
+        // minted user object can miss the avatar/uid, and the shell then
+        // painted initials + no UID chip until the user opened a surface
+        // that re-fetches. Deferred so it never competes with the login
+        // navigation; coalesced by the helper's dedupe window.
+        import('@/lib/user-store-refresh')
+          .then(({ schedulePostLoginProfileSync }) => schedulePostLoginProfileSync())
+          .catch(() => { /* silent — the focus refresher remains the net */ });
       },
 
       setUser: (user) => {
@@ -666,6 +732,14 @@ export const useAppStore = create<AppState>()(
         });
         // Sync hash after state update
         updateHashForView(newView);
+        // logs-1 — rebind the remote account logger to this identity and
+        // flush the boundary (entries buffered while logged out/under the
+        // previous account land with the fresh UID label on the VPS).
+        // Dynamic import: the store must not statically depend on the logger
+        // (the logger's upload path reads this store through localStorage).
+        import('@/lib/remote-logger')
+          .then(({ markAuthBoundary }) => markAuthBoundary(user?.uid ?? null))
+          .catch(() => { /* logger unavailable — boot logging continues */ });
       },
 
       setView: (view) => {
@@ -731,6 +805,15 @@ export const useAppStore = create<AppState>()(
       setOnboarded: (v: boolean) => set({ onboarded: v }),
 
       logout: () => {
+        // r21-8 (counter control) — BEFORE any token is cleared: if this user
+        // still CONTROLS a counter, fire the keepalive release-mine so the
+        // counter frees immediately instead of waiting out the server-side
+        // 3-min heartbeat sweeper. Pure fire-and-forget (the lib swallows
+        // everything) — a failure must never block logout.
+        try {
+          const releaseToken = readPersistedSessionToken();
+          if (releaseToken) fireReleaseMine(releaseToken);
+        } catch { /* never block logout */ }
         set({
           user: null,
           isAuthenticated: false,
@@ -769,6 +852,9 @@ export const useAppStore = create<AppState>()(
         // NOTE: the revoked flag is deliberately NOT cleared here — only a
         // successful login (setSessionToken → clearRevoked) recovers it.
         syncEngine.clearSyncCursor();
+        // cache-1 — wipe the persisted GET-cache snapshot: on shared devices
+        // the next account must never read the previous account's data.
+        try { ApiClient.wipeGetCache(); } catch { /* ignore */ }
         // Clear persisted storage AFTER set (persist middleware writes during set)
         // Also call the Hono backend logout endpoint to clear the JWT session cookie
         setTimeout(() => {

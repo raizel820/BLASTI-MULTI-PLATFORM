@@ -18,11 +18,22 @@
  */
 
 import { apiFetch } from '@/lib/api-fetch';
+// 0.6.16 — revalidate the active ticket when the app resumes to the foreground
+// (close-and-reopen resumes the WebView without a remount; the socket may
+// have silently died while suspended → the ticket looked frozen until a
+// manual refresh; see lib/resume-refresh.ts).
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useRealtime } from '@/hooks/use-realtime';
+// Hotfix 0.6.12 — this import was missing, so the `useCategoryTermScope(...)`
+// call below threw a runtime ReferenceError that crashed the whole queue page
+// into the error boundary ("useCategoryTermScope is not defined", mobile
+// #/customer/queue). Every other consumer of the hook imports it; this file
+// was the only one relying on the (type-check-skipping) build to not catch it.
+import { useCategoryTermScope } from '@/hooks/use-category-terms';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -53,6 +64,7 @@ import {
   Check,
   Settings,
   History,
+  MapPin,
 } from 'lucide-react';
 import { WaitTimePredictor } from '@/components/customer/WaitTimePredictor';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -120,17 +132,36 @@ interface Reservation {
   postponeCount?: number;
   isWalkIn?: boolean;
   customerName?: string;
+  // Task 5-b — parent agency category (raw payload field; drives the
+  // per-category terminology scope below).
+  agencyCategory?: string;
+  // r21-8 — counter pointer for CALLED tickets (queue:called /
+  // notification:your-turn payloads carry counter: { id, name, number }).
+  counterName?: string;
+  counterNumber?: number;
 }
 
 export function CustomerQueue() {
   const { setView, user } = useAppStore();
   const { t, lang } = useLanguage();
   const [reservations, setReservations] = useState<Reservation[]>([]);
+
+  // Task 5-b — per-category terminology scope. The active-reservations
+  // payload includes agency.category; the scope follows the MOST RECENT
+  // active ticket's category (single scope per screen — mixed-category
+  // tickets resolve to the newest one). Falsy until reservations load; a
+  // failed terms fetch degrades silently to the standard dictionary.
+  const queueAgencyCategory = reservations.find((r) => r.agencyCategory)?.agencyCategory ?? null;
+  useCategoryTermScope(queueAgencyCategory);
+
   const [loading, setLoading] = useState(true);
   const [cancelling, setCancelling] = useState<string | null>(null);
   const [showTurnAlert, setShowTurnAlert] = useState(false);
   const [soundMuted, setSoundMuted] = useState(false);
   const [refreshInterval, setRefreshInterval] = useState<number>(10000);
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
   const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
   const [confettiKey, setConfettiKey] = useState(0);
   const [qrDialogOpen, setQrDialogOpen] = useState(false);
@@ -160,6 +191,10 @@ export function CustomerQueue() {
   const connectionStatusWasConnected = useRef(false);
   const [expandedRowId, setExpandedRowId] = useState<string | null>(null);
   const [showPast, setShowPast] = useState(false);
+  // r21-8 — counter hints learned from realtime events (queue:called /
+  // notification:your-turn carry counter { id, name, number }): keyed by
+  // reservationId, merged with any counter fields on the fetched rows.
+  const [calledCounterHints, setCalledCounterHints] = useState<Record<string, string>>({});
 
   const realtime = useRealtime();
 
@@ -177,6 +212,7 @@ export function CustomerQueue() {
           const agency = r.agency as Record<string, string> | undefined;
           const service = r.service as Record<string, string> | undefined;
           const etaData = r.eta as Record<string, unknown> | undefined;
+          const counter = r.counter as { name?: string; number?: number } | null | undefined;
           return {
             id: r.id,
             queueNumber: r.displayNumber || `${r.queueNumber}`,
@@ -189,6 +225,7 @@ export function CustomerQueue() {
             etaConfidence: (etaData?.confidence as 'high' | 'medium' | 'low') || 'medium',
             currentServingNumber: (r.currentServingNumber as string) || '0',
             agencyId: (r.agencyId as string) || agency?.id || '',
+            agencyCategory: typeof agency?.category === 'string' ? agency.category : undefined,
             agencyName: agency?.name || t('defaultAgency'),
             agencyNameAr: agency?.nameAr,
             agencyNameFr: agency?.nameFr,
@@ -204,6 +241,10 @@ export function CustomerQueue() {
             postponeCount: (r.postponeCount as number) || 0,
             isWalkIn: (r as Record<string, unknown>).isWalkIn === true,
             customerName: (r as Record<string, unknown>).walkInCustomerName as string || (r as Record<string, unknown>).customerName as string || undefined,
+            // r21-8 — counter pointer when the payload carries one (the CALLED
+            // hero shows "head to counter: X").
+            counterName: counter?.name || undefined,
+            counterNumber: typeof counter?.number === 'number' ? counter.number : undefined,
           } as Reservation;
         });
 
@@ -375,7 +416,9 @@ export function CustomerQueue() {
 
     timer = setTimeout(tick, getInterval());
     return () => { stopped = true; if (timer) clearTimeout(timer); };
-  }, [fetchReservations, refreshInterval, isFastPolling]);
+    // resumeNonce — 0.6.16: a resume remounts the poller → immediate fresh
+    // fetch instead of waiting out the backoff interval.
+  }, [fetchReservations, refreshInterval, isFastPolling, resumeNonce]);
 
   // ─── Realtime: Join rooms ────────────────────────────────────────────
   useEffect(() => {
@@ -407,7 +450,23 @@ export function CustomerQueue() {
       fetchReservations();
     };
 
-    unsubscribers.push(realtime.onQueueCalled(handleQueueEvent));
+    // r21-8 — learn the counter pointer from the event payloads (the ticket
+    // hero then renders "head to counter: X" once the ticket is CALLED).
+    const learnCounterHint = (event: unknown) => {
+      const d = ((event as { data?: Record<string, unknown> })?.data
+        ?? (event as unknown as Record<string, unknown>)) as Record<string, unknown>;
+      const resId = d.reservationId || d.id;
+      const counter = d.counter as { name?: string; number?: number } | null | undefined;
+      if (!resId || !counter) return;
+      const label = counter.name || (counter.number != null ? `#${counter.number}` : '');
+      if (!label) return;
+      setCalledCounterHints((prev) => ({ ...prev, [String(resId)]: label }));
+    };
+
+    unsubscribers.push(realtime.onQueueCalled((event: unknown) => {
+      learnCounterHint(event);
+      fetchReservations();
+    }));
     unsubscribers.push(realtime.onQueueCompleted(handleTerminalQueueEvent));
     unsubscribers.push(realtime.onQueueNoShow(handleTerminalQueueEvent));
     unsubscribers.push(realtime.onQueueCancelled(handleTerminalQueueEvent));
@@ -417,16 +476,41 @@ export function CustomerQueue() {
     unsubscribers.push(realtime.onQueueResumed(handleQueueEvent));
     unsubscribers.push(realtime.onQueuePositionChanged(handleQueueEvent));
 
-    unsubscribers.push(realtime.onTurnApproaching(() => {
+    unsubscribers.push(realtime.onTurnApproaching((event: unknown) => {
       fetchReservations();
       toast.info(t('turnApproachingNotif'), {
         description: t('turnApproachingNotifDesc'),
         duration: 6000,
         icon: <Clock className="h-4 w-4 text-amber-500" />,
       });
+      // Field report: "cooling turn notification is no longer showing in lock
+      // screen" — the approaching alert was an in-app toast ONLY. Fire the
+      // SAME dedicated native lock-screen notification the turn-call uses
+      // (high-importance PUBLIC channel, Stop action button + swipe-to-stop
+      // via the dismiss receiver), gated by the turn_approaching preference.
+      const data = (event as { data?: Record<string, unknown> })?.data
+        ?? (event as Record<string, unknown> | null);
+      const ticket = (data?.ticketNumber as string) || (data?.displayNumber as string) || '';
+      const agency = (data?.agencyName as string) || '';
+      const ahead = typeof data?.peopleAhead === 'number' ? data.peopleAhead : null;
+      const body =
+        `Ticket ${ticket || '---'}${agency ? ` at ${agency}` : ''}` +
+        (ahead === null ? '' : ahead === 0 ? ' — You are next!' : ` — ~${ahead} ahead of you`);
+      import('@/lib/notification-channel')
+        .then(({ scheduleTurnNotification }) =>
+          scheduleTurnNotification(
+            'دورك يقترب! / Your Turn is Approaching!',
+            body,
+            ticket,
+            undefined,
+            'approaching',
+          ),
+        )
+        .catch(() => { /* notification must never break the queue view */ });
     }));
 
-    unsubscribers.push(realtime.onYourTurn(() => {
+    unsubscribers.push(realtime.onYourTurn((event: unknown) => {
+      learnCounterHint(event);
       fetchReservations();
       const calledRes = reservations.find(r => r.status === 'CALLED');
       if (calledRes && !shouldShowAlert(calledRes.id)) return;
@@ -965,18 +1049,29 @@ export function CustomerQueue() {
         </div>
 
         {/* ─ CALLED Prominent Notice ─ */}
-        {isCalled && (
-          <motion.div
-            animate={{ scale: [1, 1.01, 1] }}
-            transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
-            className="mb-3"
-          >
-            <div className="w-full py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-semibold text-xs flex items-center justify-center gap-2">
-              <AlertTriangle className="h-3.5 w-3.5" />
-              {t('statusCalled')} — {getAgencyName(res)}
-            </div>
-          </motion.div>
-        )}
+        {isCalled && (() => {
+          // r21-8 — counter pointer: fetched row field first, then the
+          // realtime-learned hint.
+          const counterHint = res.counterName || calledCounterHints[res.id];
+          return (
+            <motion.div
+              animate={{ scale: [1, 1.01, 1] }}
+              transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
+              className="mb-3"
+            >
+              <div className="w-full py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white font-semibold text-xs flex items-center justify-center gap-2">
+                <AlertTriangle className="h-3.5 w-3.5" />
+                {t('statusCalled')} — {getAgencyName(res)}
+              </div>
+              {counterHint && (
+                <div className="mt-1.5 w-full py-2 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/40 text-amber-800 dark:text-amber-300 font-semibold text-xs flex items-center justify-center gap-2">
+                  <MapPin className="h-3.5 w-3.5" />
+                  {t('goCounterName', { name: counterHint })}
+                </div>
+              )}
+            </motion.div>
+          );
+        })()}
 
         {/* ─ Action Buttons Row 1: Cancel / Postpone / Leave (WAITING only) ─ */}
         {res.status === 'WAITING' && (
@@ -1124,7 +1219,7 @@ export function CustomerQueue() {
           <motion.div
             animate={{ scale: [1, 1.5, 1], opacity: [0.03, 0.01, 0.03] }}
             transition={{ duration: 6, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/4 start-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-emerald-400 dark:bg-emerald-600"
+            className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-emerald-400 dark:bg-emerald-600"
           />
         </div>
       )}
@@ -1244,7 +1339,11 @@ export function CustomerQueue() {
             <QueueTurnAlert
               showTurnAlert={showTurnAlert}
               confettiKey={confettiKey}
-              activeRes={activeRes}
+              activeRes={{
+                ...activeRes,
+                // r21-8 — surface the realtime-learned counter hint to the alert.
+                counterName: activeRes.counterName || calledCounterHints[activeRes.id],
+              }}
               soundMuted={soundMuted}
               agencyName={getAgencyName(activeRes)}
               onConfirm={handleConfirmTurn}

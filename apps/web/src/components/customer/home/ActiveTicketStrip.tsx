@@ -30,6 +30,8 @@ export interface ActiveTicket {
   estimatedWait?: number;
   position: number;
   status?: string;
+  /** r21-8 — counter pointer for CALLED tickets (payload counter field). */
+  counterName?: string;
 }
 
 interface ActiveTicketStripProps {
@@ -130,6 +132,13 @@ export function ActiveTicketStrip({ tickets, t, lang, onOpenQueue, onFindAgency 
               <span className="block text-[11px] text-emerald-100/90 truncate">
                 {service || t('activeTicket')}
               </span>
+              {/* r21-8 — counter pointer once the ticket is CALLED */}
+              {isCalled && hero.counterName && (
+                <span className="mt-0.5 inline-flex items-center gap-1 max-w-full text-[10px] font-bold text-amber-100 bg-amber-400/25 rounded-full px-1.5 py-0.5">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-300 flex-shrink-0" />
+                  <span className="truncate">{t('goCounterName', { name: hero.counterName })}</span>
+                </span>
+              )}
             </span>
 
             {/* Numbers */}

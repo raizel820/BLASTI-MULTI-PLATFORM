@@ -16,7 +16,7 @@ const iconMap: Record<Platform, typeof Globe> = {
 const colorMap: Record<Platform, string> = {
   electron: 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-400 border-violet-200 dark:border-violet-800',
   android: 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 border-green-200 dark:border-green-800',
-  ios: 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 border-blue-200 dark:border-blue-800',
+  ios: 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400 border-cyan-200 dark:border-cyan-800',
   web: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800',
   unknown: 'bg-gray-100 text-gray-700 dark:bg-gray-900/30 dark:text-gray-400 border-gray-200 dark:border-gray-800',
 };
@@ -28,7 +28,7 @@ const colorMap: Record<Platform, string> = {
 const productionColorMap: Record<Platform, string> = {
   electron: 'bg-violet-50 text-violet-600/80 dark:bg-violet-900/20 dark:text-violet-400/70 border-violet-200/50 dark:border-violet-800/40',
   android: 'bg-green-50 text-green-600/80 dark:bg-green-900/20 dark:text-green-400/70 border-green-200/50 dark:border-green-800/40',
-  ios: 'bg-blue-50 text-blue-600/80 dark:bg-blue-900/20 dark:text-blue-400/70 border-blue-200/50 dark:border-blue-800/40',
+  ios: 'bg-cyan-50 text-cyan-600/80 dark:bg-cyan-900/20 dark:text-cyan-400/70 border-cyan-200/50 dark:border-cyan-800/40',
   web: 'bg-emerald-50 text-emerald-600/80 dark:bg-emerald-900/20 dark:text-emerald-400/70 border-emerald-200/50 dark:border-emerald-800/40',
   unknown: 'bg-gray-50 text-gray-600/80 dark:bg-gray-900/20 dark:text-gray-400/70 border-gray-200/50 dark:border-gray-800/40',
 };

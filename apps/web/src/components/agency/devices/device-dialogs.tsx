@@ -70,6 +70,7 @@ import {
   type CommandType,
   type ScreenLayout,
   type DisplaySettings,
+  type DeviceStatus,
   DEVICE_TYPE_CONFIG,
   STATUS_CONFIG,
   CONNECTION_TYPE_CONFIG,
@@ -1467,11 +1468,11 @@ export function TvQrDialog({
 
           <div className="flex items-center gap-3 w-full">
             <div className="flex-1 h-px bg-gray-700" />
-            <span className="text-xs text-gray-500">{getLocalizedString('أو', 'ou', 'OR')}</span>
+            <span className="text-xs text-gray-500 dark:text-gray-400">{getLocalizedString('أو', 'ou', 'OR')}</span>
             <div className="flex-1 h-px bg-gray-700" />
           </div>
 
-          <div className="bg-white rounded-2xl p-4 shadow-lg">
+          <div className="bg-white dark:bg-gray-900 rounded-2xl p-4 shadow-lg">
             <img
               src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(tvUrl)}&bgcolor=ffffff&color=000000`}
               alt="TV Screen QR Code"
@@ -1600,7 +1601,7 @@ export function ScanResultsDialog({
                               {getLocalizedName(disc, lang)}
                             </span>
                             <Badge variant="secondary" className={`text-[10px] px-1 py-0 ${discStatusConfig.color}`}>
-                              <span className={`inline-block h-1.5 w-1.5 rounded-full ${discStatusConfig.dotColor} mr-1`} />
+                              <span className={`inline-block h-1.5 w-1.5 rounded-full ${discStatusConfig.dotColor} me-1`} />
                               {getLocalizedLabel(discStatusConfig, lang)}
                             </Badge>
                           </div>

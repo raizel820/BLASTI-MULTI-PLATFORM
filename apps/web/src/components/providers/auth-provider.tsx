@@ -10,6 +10,10 @@ import { enforcePersistencePolicyAtBoot, purgeAuthState, isSessionEphemeral } fr
 // Task 2-b-2 (sub-task 2) — ONE boot-time session sanity check (desktop):
 // expiry check → single-flight refresh → purge on failure. See session-boot.ts.
 import { validateSessionOnBoot } from '@/lib/session-boot';
+// r21-8 (counter control) — pagehide/beforeunload release of any counter the
+// session still CONTROLS (keepalive POST lives past the unload). The lib's
+// 5s double-fire guard also keeps this idempotent with logout()'s call.
+import { fireReleaseMine, readPersistedSessionToken } from '@/lib/counter-release';
 import { Loader2 } from 'lucide-react';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -113,7 +117,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // (window destroyed before IPC delivery, hard quit, webContents reload).
     // Idempotent with the broadcast path; pagehide never fires on a plain
     // tray-hide/minimize, so a running ephemeral session is never disturbed.
-    const onPageHide = () => purgeIfEphemeral();
+    // r21-8 (counter control) — the page is going away (quit / reload / hard
+    // navigation): free any counter this session still CONTROLS so the next
+    // staff member is not locked out for the sweeper window. The lib sends
+    // keepalive:true (survives unload) and guards the token internally — a
+    // logged-out session simply no-ops. Fire-and-forget, never throws.
+    const onPageHide = () => {
+      try {
+        const token = readPersistedSessionToken();
+        if (token) fireReleaseMine(token);
+      } catch { /* never block unload */ }
+      purgeIfEphemeral();
+    };
     try { window.addEventListener('pagehide', onPageHide); } catch { /* ignore */ }
     try { window.addEventListener('beforeunload', onPageHide); } catch { /* ignore */ }
 

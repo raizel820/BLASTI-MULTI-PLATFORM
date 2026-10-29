@@ -46,7 +46,9 @@ import {
   CommuneSelect,
   composeLocationLabel,
 } from '@/components/shared/algeria-location-selects';
-import { ALGERIA_WILAYAS, findWilayaByCode } from '@/lib/algeria-locations';
+import { ALGERIA_WILAYAS, findWilayaByCode, findWilayaCentroid } from '@/lib/algeria-locations';
+// r21-5 — map-follows-inputs: the wilaya→centroid jump is debounced.
+import { useDebounce } from '@/hooks/use-debounce';
 // Task 51-b — agency location map picker (provider abstraction, spec §27-30).
 import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
 import { useMapConfig } from '@/lib/map/use-map-config';
@@ -368,11 +370,26 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   const [latitude, setLatitude] = useState<number | null>(null);
   const [longitude, setLongitude] = useState<number | null>(null);
   const [postalCode, setPostalCode] = useState('');
-  const [locationSource, setLocationSource] = useState<'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS' | null>(null);
+  // 'MANUAL' = coordinates derived from the address inputs (wilaya centroid,
+  // r21-5) rather than from the map/device — never counts as VERIFIED.
+  const [locationSource, setLocationSource] = useState<
+    'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS' | 'MANUAL' | null
+  >(null);
   // Manual-override guard (spec §30): raised whenever the user edits an
   // address field, RESET on an explicit location change (picker onChange),
   // so a new detection only overwrites text the user has not typed since.
   const manualTouchedRef = useRef(false);
+  // r21-5 — accuracy class of the last device fix: a COARSE (network/IP)
+  // GPS answer must never submit locationVerified='VERIFIED'.
+  const gpsCoarseRef = useRef(false);
+  // r21-5 — map-follows-inputs ordering stamps: the debounced wilaya→
+  // centroid jump fires only when the wilaya change was USER-driven (select
+  // / zip cascade / register handoff) AND happened AFTER the last explicit
+  // pin placement. Geocode-driven wilaya writes (map pick / GPS detection)
+  // never stamp the edit ref → never yank a pin the user just placed.
+  const lastUserWilayaEditAtRef = useRef<number | null>(null);
+  const lastPinAtRef = useRef<number | null>(null);
+  const prevCentroidWilayaRef = useRef<string>('');
   const { config: mapsConfig } = useMapConfig();
 
   // Step 2: Working Hours + Working Days (Round 15 — days beside the hours)
@@ -437,6 +454,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   // §29) may overwrite fields the user has not typed since this new pick
   // (spec §30 — "unless the owner explicitly selects another location").
   const handlePickerChange = (lat: number | null, lng: number | null) => {
+    lastPinAtRef.current = Date.now(); // r21-5 — explicit pick outranks the centroid follow
     setLatitude(lat);
     setLongitude(lng);
     manualTouchedRef.current = false;
@@ -483,7 +501,16 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   // address fields from the geocoder, then show the human-readable address.
   // Missing components are null and simply leave their field untouched.
   const handleDetectedAddress = (components: GeocodeComponents) => {
+    // r21-5 — remember the accuracy class of the last device fix REGARDLESS
+    // of the guards below: the submit payload needs it even when the user
+    // has manually edited fields since the fix.
+    gpsCoarseRef.current = components.coarse === true;
     if (manualTouchedRef.current) return; // manual override wins (spec §30)
+    // r21-5 — COARSE device fix (accuracy > 2km, typical of desktop
+    // network/IP geolocation): the marker stays on the map, but auto-filling
+    // wilaya/commune/postal code from it is exactly the Setif-vs-M'Sila bug
+    // — never fill from an approximate fix.
+    if (components.coarse) return;
 
     if (components.street && !address.trim()) setAddress(components.street);
 
@@ -515,6 +542,37 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
     if (components.postalCode && !postalCode.trim()) setPostalCode(components.postalCode);
   };
 
+  // ── r21-5 — the map FOLLOWS the address inputs (the user's bug report:
+  // "replaced the zip with 28019 but the map still shows 19000"). One
+  // debounced effect watches the wilaya code: when it was changed BY THE
+  // USER (wilaya select, zip-prefix cascade, register-form handoff — all of
+  // them stamp lastUserWilayaEditAtRef) and the user has not placed a pin
+  // AFTER that edit, the marker jumps to the wilaya's seat centroid. Rules:
+  //  - geocode-driven wilaya writes (map pick / GPS detection) never stamp
+  //    the edit ref → a pin the user just placed is NEVER yanked away;
+  //  - a pin placed after the wilaya edit wins (lastPinAtRef ordering);
+  //  - manualTouchedRef semantics are untouched: this is a coordinate move,
+  //    not a text auto-fill (blocked text fill stays blocked).
+  // Only the wilaya code is debounced/watched: the centroid depends on the
+  // wilaya alone, and a same-wilaya commune change must never re-center.
+  const debouncedWilayaCode = useDebounce(wilayaCode, 400);
+  useEffect(() => {
+    const code = normalizeWilayaInput(debouncedWilayaCode);
+    const prev = prevCentroidWilayaRef.current;
+    prevCentroidWilayaRef.current = code;
+    if (code === prev) return; // not a wilaya change
+    if (lastUserWilayaEditAtRef.current == null) return; // geocode-driven — keep the pin
+    if (lastPinAtRef.current != null && lastPinAtRef.current > lastUserWilayaEditAtRef.current) {
+      return; // the user fine-tuned the pin after this edit — never fight them
+    }
+    if (!WILAYA_CODE_REGEX.test(code)) return;
+    const centroid = findWilayaCentroid(code);
+    if (!centroid) return;
+    setLatitude(centroid.lat);
+    setLongitude(centroid.lng);
+    setLocationSource('MANUAL');
+  }, [debouncedWilayaCode]);
+
   // Task 5 — one-shot location handoff from the register form. Read + REMOVE
   // 'blasti:reg-location' on mount so the selection pre-fills this wizard
   // exactly once (re-opening the wizard later must not resurrect a stale
@@ -528,6 +586,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       const w = typeof parsed.wilaya === 'string' ? parsed.wilaya.trim().padStart(2, '0') : '';
       const c = typeof parsed.commune === 'string' ? parsed.commune.trim() : '';
       if (w) {
+        lastUserWilayaEditAtRef.current = Date.now(); // r21-5 — handoff counts as the user's choice
         setWilayaCode(w);
         if (c) setCommuneName(c);
       }
@@ -716,7 +775,10 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
         body.longitude = longitude;
         if (locationSource) {
           body.locationSource = locationSource;
-          body.locationVerified = locationSource === 'DEVICE_GPS' ? 'VERIFIED' : 'UNVERIFIED';
+          // r21-5 — VERIFIED only for a FINE (≤2km) DEVICE_GPS fix; coarse
+          // network/IP fixes, map picks and MANUAL centroids stay UNVERIFIED.
+          body.locationVerified =
+            locationSource === 'DEVICE_GPS' && !gpsCoarseRef.current ? 'VERIFIED' : 'UNVERIFIED';
         }
       }
       if (workingHoursStart) body.workingHoursStart = workingHoursStart;
@@ -1088,6 +1150,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   <WilayaSelect
                     value={wilayaCode}
                     onValueChange={(code) => {
+                      lastUserWilayaEditAtRef.current = Date.now(); // r21-5 — user-driven wilaya change
                       setWilayaCode(code);
                       // Dependent list — reset the commune on wilaya change.
                       setCommuneName('');
@@ -1181,6 +1244,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                           const digits = v.replace(/\D/g, '');
                           const prefix = normalizeWilayaInput(digits.slice(0, 2));
                           if (WILAYA_CODE_REGEX.test(prefix) && prefix !== wilayaCode) {
+                            lastUserWilayaEditAtRef.current = Date.now(); // r21-5 — zip cascade = user-driven
                             setWilayaCode(prefix);
                             setCommuneName('');
                           }

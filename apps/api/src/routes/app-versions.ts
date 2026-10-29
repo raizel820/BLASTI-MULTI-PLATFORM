@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { db } from '@blasti/db'
@@ -11,6 +12,10 @@ import os from 'os'
 import { Readable } from 'stream'
 // Performance Round — public-download cache invalidation + streaming response.
 import { invalidateResponseCacheTag } from '../lib/response-cache'
+// r20-3(a): CI-published rows carry versionCode 0 — rank "latest" by semantic
+// name when the code is meaningless, else the old admin row (code 5000)
+// permanently shadowed newer CI builds and devices were told "up to date".
+import { pickLatestAppVersion } from '../lib/app-version-rank'
 
 const app = new Hono()
 
@@ -27,8 +32,21 @@ const DEPLOY_TOKEN = () => process.env.BLASTI_DEPLOY_TOKEN || process.env.DEPLOY
 async function requireAdminOrDeployToken(c: Context): Promise<void> {
   const expected = DEPLOY_TOKEN()
   const provided = c.req.header('x-deploy-token')
-  if (expected && provided && provided === expected) return
+  // P0-3: constant-time compare — the deploy token authenticates CI uploads.
+  if (expected && provided && safeEqual(provided, expected)) return
   await requireAdmin(c)
+}
+
+// P0-3: constant-time string comparison for secrets.
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a)
+  const bb = Buffer.from(b)
+  if (ab.length !== bb.length) {
+    const n = Math.min(ab.length, bb.length) || 1
+    timingSafeEqual(ab.subarray(0, n), ab.subarray(0, n))
+    return false
+  }
+  return timingSafeEqual(ab, bb)
 }
 
 // ─── Validation Schemas ─────────────────────────────────────────────────────
@@ -177,10 +195,12 @@ app.get('/check', async (c) => {
       return c.json({ success: false, error: 'platform and version query params are required' }, 400)
     }
 
-    const latestVersion = await db.appVersion.findFirst({
+    const latestCandidates = await db.appVersion.findMany({
       where: { platform, isPublished: true },
-      orderBy: [{ versionCode: 'desc' }, { createdAt: 'desc' }],
+      orderBy: { createdAt: 'desc' },
+      take: 50,
     })
+    const latestVersion = pickLatestAppVersion(latestCandidates)
 
     const updateAvailable = !!latestVersion && compareVersions(latestVersion.version, version) > 0
 
@@ -374,10 +394,12 @@ app.get('/public/active', async (c) => {
     const versions: Array<Record<string, unknown>> = []
 
     for (const platform of platforms) {
-      const v = await db.appVersion.findFirst({
+      const candidates = await db.appVersion.findMany({
         where: { platform, isPublished: true },
-        orderBy: [{ versionCode: 'desc' }, { createdAt: 'desc' }],
+        orderBy: { createdAt: 'desc' },
+        take: 50,
       })
+      const v = pickLatestAppVersion(candidates)
       if (!v) continue
       versions.push({
         platform: v.platform,

@@ -353,8 +353,8 @@ export const STATUS_CONFIG: Record<
     labelAr: 'جاري التحديث',
     labelEn: 'Updating',
     labelFr: 'Mise à jour',
-    color: 'bg-blue-100 text-blue-700 dark:bg-blue-950/40 dark:text-blue-400',
-    dotColor: 'bg-blue-500',
+    color: 'bg-teal-100 text-teal-700 dark:bg-teal-950/40 dark:text-teal-400',
+    dotColor: 'bg-teal-500',
     pulse: true,
   },
 };

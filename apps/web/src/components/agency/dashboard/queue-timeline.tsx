@@ -94,8 +94,8 @@ export function QueueTimeline({
           {/* Timeline Bar Chart */}
           <div className="relative">
             {/* Peak zone indicators */}
-            <div className="absolute top-0 bottom-6 left-[10%] w-[20%] bg-amber-50/50 dark:bg-amber-900/10 rounded-lg" />
-            <div className="absolute top-0 bottom-6 left-[60%] w-[10%] bg-amber-50/50 dark:bg-amber-900/10 rounded-lg" />
+            <div className="absolute top-0 bottom-6 start-[10%] w-[20%] bg-amber-50/50 dark:bg-amber-900/10 rounded-lg" />
+            <div className="absolute top-0 bottom-6 start-[60%] w-[10%] bg-amber-50/50 dark:bg-amber-900/10 rounded-lg" />
 
             <div className="flex items-end gap-1 h-28 relative z-10">
               {timelineData.map((entry, idx) => {

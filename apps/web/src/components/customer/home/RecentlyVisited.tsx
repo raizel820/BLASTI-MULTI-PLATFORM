@@ -89,7 +89,7 @@ export function RecentlyVisited({
                 name: r.agency?.name || '',
                 nameAr: r.agency?.nameAr,
                 nameFr: r.agency?.nameFr,
-                category: r.agency?.category || 'OTHER',
+                category: r.agency?.category || '',
                 visitedAt: r.joinedAt || r.createdAt || new Date().toISOString(),
                 queueNumber: r.displayNumber || r.queueNumber,
                 averageRating: r.agency?.averageRating,

@@ -27,6 +27,13 @@ model User {
   email                   String?        @unique
   phoneNumber             String?        @unique
   shortAppId              String?        @unique
+  /// Immutable BLASTI UID (UID-0.6.14). Format: {TYPE}-{WILAYA}-{SEQ} e.g.
+  /// "CU-16-00042" — account-type prefix (AO owner / ST staff / CU customer),
+  /// the user's wilaya ('00' when unset) and a per-prefix monotonic sequence
+  /// number from UidCounter. NEVER reused after account deletion (the counter
+  /// only ever increments) and NEVER editable once assigned (no endpoint may
+  /// write it after creation). SUPER_ADMIN accounts have NO uid (null).
+  uid                     String?        @unique
   /// Cloud-only authentication secret. NEVER synced to the desktop: the cloud
   /// sync feed (initial-data + incremental pull) excludes this field via the
   /// explicit USER_SYNC projection, and synced desktop User profiles keep it
@@ -77,6 +84,16 @@ model User {
   devices                 DeviceRegistration[]
   deviceCredentials       LocalDeviceCredential[]
   verificationCodes       VerificationCode[]
+}
+
+/// Monotonic per-prefix UID sequence (UID-0.6.14). One row per
+/// "{TYPE}-{WILAYA}" key (e.g. "CU-16"). nextNumber only ever INCREMENTS —
+/// numbers are never reused even when the user account that consumed one is
+/// deleted, which is what makes every BLASTI UID permanently unique.
+model UidCounter {
+  prefix     String @id
+  nextNumber Int    @default(0)
+  updatedAt  DateTime @updatedAt
 }
 
 /// One-time verification codes (OTP) for email/phone verification and
@@ -275,6 +292,11 @@ model Agency {
   /// never required for directions, and never invalidated by provider switch.
   googlePlaceId        String?
   providerLocationId   String?
+  /// Agencies Management: specialties the agency serves, as a JSON array of
+  /// Specialty ids (e.g. '["clx..."]'). A plain JSON string (not a scalar
+  /// list / join table) so it syncs byte-exact through the v2 offline engine
+  /// and mirrors 1:1 into the desktop SQLite column. Null/"[]" = no filter.
+  specialtyIds          String?
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt
   ownerId               String
@@ -296,6 +318,7 @@ model Agency {
   hardwareOrders        HardwareOrder[]
   enterpriseRequests    EnterpriseContractRequest[]
   ownedEnterprisePlans  SubscriptionPlan[] @relation("EnterprisePlanOwner")
+  counterControlRequests CounterControlRequest[]
 
   // Task 84 — public listing performance: the customer home endpoint filters
   // WHERE isActive = true and sorts isSponsored DESC → createdAt DESC.
@@ -517,18 +540,33 @@ model Service {
   nameAr       String?
   description  String?
   prefix       String        @default("A")
+  /// Task C — service price in DZD. Null = not set (optional unless the
+  /// agency-type ServicePolicy marks price MANDATORY + enforce).
+  price        Float?
+  /// P2-10 — owner-set service duration in minutes. When set, this is the
+  /// authoritative ETA estimate for the service (overrides the 7-day history,
+  /// which is thin/noisy for young services). Null = estimate from history.
+  durationMinutes Int?
+  /// P2-10 — queue priority (0 = normal). Call-next and the waiting list
+  /// order tickets by (service priority DESC, queueNumber ASC), so higher
+  /// priority services get called first within the same-day queue.
+  priority     Int           @default(0)
   isActive     Boolean       @default(true)
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
   reservations Reservation[]
   agency       Agency        @relation(fields: [agencyId], references: [id])
+  /// P2-10 — counters bound to this service (see CounterService).
+  counterServices CounterService[]
 
   @@unique([agencyId, name])
 }
 
 model QueueSettings {
   id                   String    @id @default(cuid())
-  agencyId             String
+  /// P0-4: ONE settings row per agency — the DB now enforces what findFirst
+  /// ordering could not (duplicate rows made pause/settings reads racy).
+  agencyId             String    @unique
   currentServingNumber Int       @default(0)
   lastIssuedNumber     Int       @default(0)
   isPaused             Boolean   @default(false)
@@ -601,6 +639,13 @@ model Reservation {
   @@index([agencyId, status, queueNumber])
   @@index([agencyId, serviceId, status])
   @@index([userId, status])
+  // P0-4: queue-number collision backstop — two concurrent joins for the same
+  // service on the same day can no longer both claim the same number (walk-ins
+  // are stamped with today's reservedDate so they are covered too; NULL dates
+  // are DISTINCT in PG and must not be produced by create paths anymore).
+  @@unique([serviceId, reservedDate, queueNumber])  // P1-6: cron auto-skip + serving-duration scans
+  @@index([status, calledAt])
+
 }
 
 model Transaction {
@@ -645,6 +690,8 @@ model Transaction {
   hardwareOrderId String?
   agency          Agency    @relation(fields: [agencyId], references: [id])
   reviewer        User?     @relation("ReviewedBy", fields: [reviewedBy], references: [id])
+  // P1-6: Chargily webhook/poll/sweep lookup by provider checkout id
+  @@index([providerRef])
 }
 
 model SmsPurchase {
@@ -682,6 +729,8 @@ model Notification {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt @default(now())
   user      User     @relation(fields: [userId], references: [id])
+  // P1-6: unread-badge + mark-read per user
+  @@index([userId, isRead])
 }
 
 /// Support tickets: customers AND agencies send complaints, suggestions,
@@ -706,8 +755,14 @@ model SupportTicket {
   repliedBy   String?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt @default(now())
-  user        User      @relation(fields: [userId], references: [id])
-  agency      Agency?   @relation(fields: [agencyId], references: [id])
+  /// P2 fix (delete-account 500): a required FK with NO delete rule blocked
+  /// every user deletion (admin DELETE /users + self DELETE /user/
+  /// delete-account) with P2003 whenever the user had filed a ticket. User
+  /// data dies with the user (same semantics as Notification/Review).
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Tickets survive agency removal (nullable FK → SetNull); user cascade
+  /// still removes the filer's own tickets.
+  agency      Agency?   @relation(fields: [agencyId], references: [id], onDelete: SetNull)
 
   @@index([userId, createdAt])
   @@index([agencyId, createdAt])
@@ -779,6 +834,12 @@ model SmsLog {
   updatedAt         DateTime    @updatedAt @default(now())
   smsSettings   SmsSettings? @relation(fields: [smsSettingsId], references: [id])
   smsSettingsId String?
+  // P1-6: admin/agency SMS analytics window scans
+   // P1-6
+  @@index([userId, createdAt])
+  // P1-6
+  @@index([createdAt])
+
 }
 
 model AuditLog {
@@ -792,6 +853,12 @@ model AuditLog {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt @default(now())
   user       User?    @relation(fields: [userId], references: [id])
+  // P1-6: audit-trail window scans
+   // P1-6
+  @@index([createdAt])
+  // P1-6
+  @@index([userId, createdAt])
+
 }
 
 model Review {
@@ -834,20 +901,92 @@ model FAQ {
 }
 
 // Task 42-a: user-created agency fields/industries. When an agency owner does
-// not find their field among the BUILT-IN categories (see apps/web/src/lib/enums.ts
-// AgencyCategory), they can create a new one — and every other agency owner
-// can then select it too. Global model (not agency-scoped): categories are a
-// shared platform dictionary. `name` is the value stored in Agency.category.
+// not find their field among the BUILT-IN categories, they can create a new
+// one — and every other agency owner can then select it too. Global model
+// (not agency-scoped): categories are a shared platform dictionary.
+//
+// Agencies Management (this session): the dictionary became the single source
+// of truth for agency categories. `slug` is the STABLE identity stored in
+// Agency.category (built-ins keep their UPPERCASE keys DOCTOR/CLINIC/LAW_FIRM/
+// BARBER — zero data migration; custom rows slug = their name, matching the
+// legacy "name is the value in Agency.category" contract). `name` is now the
+// editable English display name; the slug never needs to change when the
+// admin renames a category.
 model AgencyCategory {
   id        String   @id @default(cuid())
+  slug      String   @unique
   name      String   @unique
   nameFr    String?
   nameAr    String?
   icon      String?
   isCustom  Boolean  @default(true)
+  /// Hidden categories stay in the DB (agencies still reference them) but
+  /// disappear from pickers and customer filters.
+  isActive  Boolean  @default(true)
+  /// Display ordering in pickers / customer filter rails.
+  sortOrder Int      @default(0)
   createdBy String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  specialties Specialty[]
+  terms       CategoryTerm[]
+}
+
+/// Agencies Management: per-category specialties (e.g. Dentist under Doctor,
+/// Family Law under Law Office). Global dictionary rows — customer search
+/// filters agencies by these. Cloud-only (NOT in the offline sync registry):
+/// offline clients keep working with category-level data only.
+model Specialty {
+  id         String         @id @default(cuid())
+  categoryId String
+  category   AgencyCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  nameEn     String
+  nameAr     String
+  nameFr     String
+  isActive   Boolean        @default(true)
+  sortOrder  Int            @default(0)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  @@unique([categoryId, nameEn])
+  @@index([categoryId])
+}
+
+/// Agencies Management: per-category UI terminology overrides ("Patient"
+/// instead of "Customer" for doctors). `key` is the i18n dictionary key
+/// (e.g. `customer`, `totalCustomers`); values override the translation for
+/// agencies of this category in all three languages. Cloud-only (NOT synced).
+model CategoryTerm {
+  id         String         @id @default(cuid())
+  categoryId String
+  category   AgencyCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  key        String
+  valueAr    String
+  valueEn    String
+  valueFr    String
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  @@unique([categoryId, key])
+  @@index([categoryId])
+}
+
+/// Task C — admin-controlled per-agency-type service conditions (the admin
+/// "Services Management" section). One row per built-in agency category
+/// (DOCTOR | CLINIC | LAW_FIRM | BARBER); defaults ensured on first read.
+/// `enforce` gates whether the API actually rejects service writes that
+/// violate the policy (price missing when mode is MANDATORY).
+model ServicePolicy {
+  id               String   @id @default(cuid())
+  agencyCategory   String   @unique
+  /// OPTIONAL = price is a free field; MANDATORY = price must be provided
+  /// (only enforced when `enforce` is true).
+  servicePriceMode String   @default("OPTIONAL")
+  enforce          Boolean  @default(false)
+  updatedBy        String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 }
 
 model PaymentSettings {
@@ -861,6 +1000,14 @@ model PaymentSettings {
   bankAccount       String   @default("")
   bankRib           String   @default("")
   ewalletNumber     String   @default("")
+  /// r21-6 — display-safe transfer details shown to agencies when they pick
+  /// a manual payment method in the subscription dialog (CCP / bank / BaridiMob).
+  ccpHolderName     String?
+  ccpAddress        String?
+  bankHolderName    String?
+  bankAddress       String?
+  baridiMobEnabled  Boolean  @default(false)
+  baridiMobNumber   String?
   updatedAt         DateTime @updatedAt
   createdAt         DateTime @default(now())
 }
@@ -928,10 +1075,62 @@ model Counter {
   occupiedAt           DateTime?
   currentReservationId String?       @unique
   currentReservation   Reservation?  @relation("CurrentReservation", fields: [currentReservationId], references: [id])
+  /// P2-10 — services this counter serves. EMPTY binding = the counter serves
+  /// ONLY the FREE services of the agency (bound to no counter) — r21-7 flips
+  /// the old "empty binding = serves every service" semantics. A non-empty
+  /// binding narrows the counter's call-next candidates to these services.
+  counterServices      CounterService[]
+  /// r21-7 — counter CONTROL (Feature C): exactly ONE agency account controls
+  /// a counter at a time. `staffId`/`occupiedAt` above remain the BACK-COMPAT
+  /// MIRROR: claim/release/transfer keep BOTH in sync (claim stamps the
+  /// controller + staffId/occupiedAt; release nulls all).
+  controlledByUserId   String?
+  controlledByStaffId  String?
+  controlClaimedAt     DateTime?
+  controlHeartbeatAt   DateTime?
   createdAt            DateTime     @default(now())
   updatedAt            DateTime     @updatedAt
 
   servedReservations Reservation[] @relation("ServedByCounter")
+  controlRequests    CounterControlRequest[]
+}
+
+/// r21-7 — counter control takeover request. A member requests control of a
+/// counter held by someone else; the holder approves/rejects within 60s
+/// (expiresAt = requestedAt + 60s), else the sweeper AUTO-APPROVES (transfers
+/// control) when the requester is still an active member, or marks EXPIRED.
+model CounterControlRequest {
+  id               String    @id @default(cuid())
+  counterId        String
+  agencyId         String
+  fromUserId       String
+  fromStaffId      String?
+  requestedAt      DateTime  @default(now())
+  expiresAt        DateTime
+  /// PENDING | APPROVED | REJECTED | EXPIRED | CANCELLED
+  status           String    @default("PENDING")
+  resolvedByUserId String?
+  resolvedAt       DateTime?
+  counter          Counter   @relation(fields: [counterId], references: [id], onDelete: Cascade)
+  agency           Agency    @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([counterId, status])
+  @@index([agencyId, status])
+}
+
+/// P2-10 — explicit Counter↔Service binding (join model, not an implicit M2M,
+/// so the desktop SQLite mirror can reproduce the exact table + both FKs).
+/// Deletes cascade from either side (counter soft-deletes keep rows; hard
+/// deletes — branch/agency cascade — clean up automatically).
+model CounterService {
+  counterId String
+  serviceId String
+  createdAt DateTime @default(now())
+  counter   Counter  @relation(fields: [counterId], references: [id], onDelete: Cascade)
+  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@id([counterId, serviceId])
+  @@index([serviceId])
 }
 
 model DeviceRegistration {

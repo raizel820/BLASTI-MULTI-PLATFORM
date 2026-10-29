@@ -74,13 +74,13 @@ export function EmptyState({
         <motion.div
           animate={{ scale: [1, 1.15, 1], opacity: [0.12, 0.04, 0.12] }}
           transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
-          className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-emerald-200 dark:bg-emerald-800"
+          className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-emerald-200 dark:bg-emerald-800"
         />
         {/* Decorative dashed circle */}
         <motion.div
           animate={{ rotate: 360 }}
           transition={{ duration: 30, repeat: Infinity, ease: 'linear' }}
-          className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full border-2 border-dashed border-emerald-200/60 dark:border-emerald-700/40"
+          className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full border-2 border-dashed border-emerald-200/60 dark:border-emerald-700/40"
         />
         <div className="relative h-20 w-20 rounded-3xl bg-gradient-to-br from-emerald-100 to-teal-50 dark:from-emerald-900/30 dark:to-teal-900/20 flex items-center justify-center shadow-inner">
           {iconContent}

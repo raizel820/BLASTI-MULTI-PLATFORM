@@ -1,6 +1,6 @@
 {
   "name": "blasti-multiplatform",
-  "version": "0.5.93",
+  "version": "0.6.26",
   "private": true,
   "workspaces": [
     "apps/*",
@@ -32,6 +32,7 @@
     "db:reset": "bun run --filter @blasti/db db:reset",
     "db:seed": "bun run --filter @blasti/db db:seed",
     "db:seed-if-empty": "bun run --filter @blasti/db db:seed-if-empty",
+    "db:backfill-uids": "bun scripts/backfill-user-uids.ts",
     "db:studio": "bun run --filter @blasti/db db:studio",
     "reset:all": "bun run scripts/reset-all.ts",
     "reset:cloud": "bun run scripts/reset-all.ts --cloud-only",

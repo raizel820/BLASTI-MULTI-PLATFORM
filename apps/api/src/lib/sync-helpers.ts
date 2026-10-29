@@ -551,6 +551,8 @@ export const USER_SYNC_FIELDS = [
   'email',
   'phoneNumber',
   'shortAppId',
+  // UID-0.6.14 — immutable account identifier, mirrored to the desktop.
+  'uid',
   'role',
   'language',
   // Task 5/47 — Algeria address fields. Nullable (null = not set yet); both
@@ -1169,6 +1171,10 @@ async function applyMutationInTx(
 
   const dataWithMeta = { ...data }
   delete dataWithMeta.syncVersion // server-managed
+  // UID-0.6.14 — the account UID is cloud-assigned and immutable: a synced
+  // create/update payload can never plant or rewrite it (updates are already
+  // gated by the registry's mutableFields, which excludes uid).
+  if (model === 'User') delete dataWithMeta.uid
 
   // LWW guard: cloud record strictly newer than the local mutation -> keep
   // cloud. ONLY for models that actually have an updatedAt column - the

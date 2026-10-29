@@ -57,6 +57,107 @@ public class BlastiNativeStatus extends Plugin {
     /** DownloadManager id of the running/last update APK download. */
     private volatile long lastUpdateDownloadId = 0;
 
+    // ─── Update-install permission ladder state (0.6.17 install-loop fix) ────
+    // Field report (Xiaomi / Android 16): after the proactive gate opens the
+    // "Install unknown apps" screen and the user enables the toggle (or it
+    // was ALREADY enabled), returning to the app resumed NOTHING — and every
+    // further "Install now" tap bounced back to the same settings screen
+    // forever, because canRequestPackageInstalls() kept answering false on
+    // that build. The ladder below makes the loop STRUCTURALLY impossible:
+    //
+    //   tap 1 → gate fails → open settings ONCE (state saved)
+    //   resume → permission granted? → auto-launch the installer
+    //   tap 2 → gate STILL fails → NEVER open settings again; fire the
+    //           ACTION_VIEW installer intent directly. The system installer
+    //           runs its own inline grant flow whose SETTINGS button returns
+    //           to the INSTALLER (not to our app) and the install continues
+    //           automatically — the self-resuming path stock Android has
+    //           always had.
+
+    /** Prefs file holding the pending-install ladder state. */
+    private static final String UPDATE_PREFS = "blasti-update";
+    /** Absolute path of the APK waiting for its post-settings resume launch. */
+    private static final String KEY_PENDING_APK = "pendingInstallApkPath";
+    /** How many times the gate has opened the settings screen for this APK. */
+    private static final String KEY_SETTINGS_OPENS = "installSettingsOpens";
+
+    private android.content.SharedPreferences updatePrefs() {
+        return getContext().getSharedPreferences(UPDATE_PREFS, Context.MODE_PRIVATE);
+    }
+
+    private boolean canRequestInstalls() {
+        if (android.os.Build.VERSION.SDK_INT < 26) return true;
+        try {
+            return getContext().getPackageManager().canRequestPackageInstalls();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Launch the system package installer for the given APK. Returns true
+     * when startActivity did not throw (the installer — or its inline
+     * grant flow — is now on screen).
+     */
+    private static boolean launchInstaller(Context ctx, String filePath) {
+        try {
+            java.io.File apk = new java.io.File(filePath);
+            if (!apk.exists()) return false;
+            android.net.Uri apkUri = androidx.core.content.FileProvider.getUriForFile(
+                ctx, ctx.getPackageName() + ".fileprovider", apk);
+            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
+            intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
+            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(intent);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "launchInstaller failed", t);
+            return false;
+        }
+    }
+
+    private void clearPendingInstallState() {
+        try {
+            updatePrefs().edit().remove(KEY_PENDING_APK).remove(KEY_SETTINGS_OPENS).apply();
+        } catch (Throwable ignored) { }
+    }
+
+    /**
+     * Plugin lifecycle hook — THE resume half of the install-loop fix.
+     * Fires when the user comes back from the "Install unknown apps"
+     * settings screen (or from a cancelled installer): if a downloaded APK
+     * is waiting and the permission is NOW granted, the installer launches
+     * itself — the user must NOT have to find and tap "Install now" again
+     * ("after enabling it … nothing happens"). If the permission is still
+     * NOT granted we deliberately do nothing here (no settings re-open —
+     * that was the loop); the next explicit install tap escalates instead.
+     */
+    @Override
+    protected void handleOnResume() {
+        super.handleOnResume();
+        try {
+            android.content.SharedPreferences prefs = updatePrefs();
+            String pending = prefs.getString(KEY_PENDING_APK, null);
+            if (pending == null || pending.isEmpty()) return;
+            if (!new java.io.File(pending).exists()) {
+                clearPendingInstallState();
+                return;
+            }
+            if (canRequestInstalls()) {
+                Context ctx = getContext();
+                if (launchInstaller(ctx, pending)) {
+                    clearPendingInstallState();
+                    Log.i(TAG, "Resumed pending update install after settings grant");
+                }
+            }
+            // else: leave the pending state — the next installUpdate tap
+            // takes the escalation branch (installer fired directly).
+        } catch (Throwable t) {
+            Log.w(TAG, "handleOnResume install-resume failed", t);
+        }
+    }
+
     /** tri-state: null = not yet probed, true = real config, false = placeholder/absent. */
     private static volatile Boolean firebaseReady = null;
 
@@ -349,6 +450,9 @@ public class BlastiNativeStatus extends Plugin {
                 UPDATE_APK_NAME);
             if (apk.exists()) apk.delete();
         } catch (Throwable ignored) { }
+        // 6. The install-permission ladder state (a pending APK that no
+        //    longer exists must never auto-launch on resume).
+        clearPendingInstallState();
         JSObject result = new JSObject();
         result.put("ok", true);
         result.put("clearedSteps", cleared);
@@ -442,6 +546,9 @@ public class BlastiNativeStatus extends Plugin {
                 try { dm.remove(lastUpdateDownloadId); } catch (Throwable ignored) { }
                 lastUpdateDownloadId = 0;
             }
+            // A fresh download also resets the install-permission ladder —
+            // the new APK gets its own first-bounce → resume → escalate cycle.
+            clearPendingInstallState();
             try {
                 java.io.File old = new java.io.File(getContext().getExternalFilesDir(
                     android.os.Environment.DIRECTORY_DOWNLOADS), UPDATE_APK_NAME);
@@ -543,6 +650,14 @@ public class BlastiNativeStatus extends Plugin {
         long id = raw instanceof Number ? ((Number) raw).longValue() : -1;
         String filePath = call.getString("filePath");
         try {
+            // 0.6.18 root-cause fix (field log: 5× {"message":"apk-not-found"}
+            // after every download): the web layer used to call installUpdate({})
+            // with NO downloadId → the query below ran with id=-1 → zero rows →
+            // reject BEFORE the 0.6.17 permission ladder was ever reached.
+            // Recover the id this process enqueued (downloadUpdate remembers it).
+            if (id <= 0 && lastUpdateDownloadId > 0) {
+                id = lastUpdateDownloadId;
+            }
             if (filePath == null || filePath.trim().isEmpty()) {
                 android.app.DownloadManager dm = (android.app.DownloadManager)
                     getContext().getSystemService(Context.DOWNLOAD_SERVICE);
@@ -566,6 +681,21 @@ public class BlastiNativeStatus extends Plugin {
                 }
                 if (cur != null) cur.close();
             }
+            // 0.6.18 deterministic fallback — the FINAL answer before
+            // "apk-not-found": downloadUpdate always writes the APK to THIS
+            // plugin-owned destination (setDestinationInExternalFilesDir above),
+            // so the file is here whenever a download completed, regardless of
+            // whether the caller passed a downloadId and regardless of
+            // DownloadManager hiding COLUMN_LOCAL_FILENAME (API 24+) or
+            // returning a content:// LOCAL_URI. With a file in hand the whole
+            // 0.6.17 permission ladder below is now actually reachable.
+            if (filePath == null || filePath.trim().isEmpty()) {
+                try {
+                    java.io.File fixed = new java.io.File(getContext().getExternalFilesDir(
+                        android.os.Environment.DIRECTORY_DOWNLOADS), UPDATE_APK_NAME);
+                    if (fixed.exists()) filePath = fixed.getAbsolutePath();
+                } catch (Throwable ignored) { }
+            }
             if (filePath == null || filePath.isEmpty()) {
                 call.reject("apk-not-found");
                 return;
@@ -578,30 +708,56 @@ public class BlastiNativeStatus extends Plugin {
             android.net.Uri apkUri = androidx.core.content.FileProvider.getUriForFile(
                 getContext(), getContext().getPackageName() + ".fileprovider", apk);
 
-            // ── PROACTIVE install-permission gate (field report: "the app does
-            // not open the dialog so I can grant it the authority to install
-            // apps"). The old flow only opened the settings screen when
-            // startActivity THREW — on modern Android (and especially MIUI /
-            // Android 14+ on Xiaomi, SDK 36 in the field) the ACTION_VIEW
-            // package-archive launch does NOT throw when
-            // REQUEST_INSTALL_PACKAGES is not granted: the system just shows
-            // nothing (or a dead installer screen) and the user is stuck on
-            // "update downloaded, awaiting install" forever. Check the
-            // permission FIRST and drive the user to the grant screen.
-            if (android.os.Build.VERSION.SDK_INT >= 26) {
-                boolean canInstall = false;
-                try {
-                    android.content.pm.PackageManager pm = getContext().getPackageManager();
-                    canInstall = pm.canRequestPackageInstalls();
-                } catch (Throwable ignored) { }
-                if (!canInstall) {
+            // ── PROACTIVE install-permission gate with an ESCALATION LADDER
+            // (0.6.17 install-loop fix — field report: "after enabling it or
+            // it was already enabled, nothing happens; it keeps redirecting
+            // me to it again without installing the update").
+            //
+            //   tap 1: permission missing → open the grant screen ONCE and
+            //          remember the pending APK (handleOnResume finishes the
+            //          job the moment the user returns with the toggle on).
+            //   tap 2+: if the check STILL fails (MIUI/HyperOS builds where
+            //          canRequestPackageInstalls() stays false even with the
+            //          toggle on), NEVER open the settings screen again —
+            //          fire the installer intent directly. The system
+            //          installer's own inline grant flow returns to the
+            //          INSTALLER and continues automatically, so this cannot
+            //          loop. A throw here rejects install-failed (no more
+            //          settings bounce).
+            if (android.os.Build.VERSION.SDK_INT >= 26 && !canRequestInstalls()) {
+                android.content.SharedPreferences prefs = updatePrefs();
+                int opens = prefs.getInt(KEY_SETTINGS_OPENS, 0);
+                if (opens < 1) {
+                    // First bounce: drive the user to the grant screen.
+                    try {
+                        prefs.edit()
+                            .putString(KEY_PENDING_APK, apk.getAbsolutePath())
+                            .putInt(KEY_SETTINGS_OPENS, 1)
+                            .apply();
+                    } catch (Throwable ignored) { }
                     openInstallPermissionSettingsInternal();
                     call.reject("needs-install-permission",
                         "Install-from-this-source permission not granted — settings screen opened");
                     return;
                 }
+                // Second attempt: escalate straight to the installer (the
+                // system runs its own self-resuming grant flow from here).
+                boolean launched = launchInstaller(getContext(), apk.getAbsolutePath());
+                clearPendingInstallState();
+                if (launched) {
+                    JSObject okResult = new JSObject();
+                    okResult.put("ok", true);
+                    okResult.put("escalated", true);
+                    call.resolve(okResult);
+                } else {
+                    call.reject("install-failed",
+                        "Installer could not be launched and the permission is still ungranted");
+                }
+                return;
             }
 
+            // Permission granted (or SDK < 26): launch the installer normally.
+            clearPendingInstallState();
             android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
             intent.setDataAndType(apkUri, "application/vnd.android.package-archive");
             intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
@@ -667,6 +823,22 @@ public class BlastiNativeStatus extends Plugin {
         } catch (Throwable ignored) { }
         result.put("ok", true);
         result.put("canInstall", canInstall);
+        call.resolve(result);
+    }
+
+    /**
+     * Plugin method (0.6.17): SIDE-EFFECT-FREE permission probe —
+     * { canInstall: boolean }. The web layer uses it to distinguish "the
+     * user returned from the settings screen with the toggle ON" (safe to
+     * re-offer the install) from "still ungranted" (keep showing the hint)
+     * WITHOUT opening the settings screen again — the probe replaces the
+     * old pattern where the only way to read the state was to open settings
+     * (which was itself half of the redirect loop).
+     */
+    @PluginMethod
+    public void getInstallPermissionState(PluginCall call) {
+        JSObject result = new JSObject();
+        result.put("canInstall", canRequestInstalls());
         call.resolve(result);
     }
 

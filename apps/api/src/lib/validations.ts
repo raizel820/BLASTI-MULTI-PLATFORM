@@ -183,7 +183,15 @@ export const updateAgencyProfileSchema = z.object({
   descriptionFr: z.string().max(500).nullable().optional(),
   address: z.string().max(200).nullable().optional(),
   phone: z.string().max(20).nullable().optional(),
-  category: z.string().optional(),
+  // Task A (R-6): agency types reduced to 4 built-ins — but the Agencies
+  // Management dictionary (AgencyCategory table) can now add custom ones, so
+  // the slug is shape-validated here and existence-checked against the table
+  // in the route handler (lib/categories.ts categorySlugError).
+  category: z.string().min(2).max(40).optional(),
+  /// Agencies Management — specialties the agency serves. Null clears the
+  /// selection ("spread the GET response back" semantics). Ids are validated
+  /// against the (possibly updated) category in the handler.
+  specialtyIds: z.array(z.string()).max(50).nullable().optional(),
   website: z.string().url().optional().or(z.literal('')).nullable().optional(),
   // Task 31 (bug 13): nullable so desktop-synced profile saves that carry
   // explicit nulls ("clear this field") no longer fail validation with a 400 —
@@ -223,7 +231,9 @@ export const updateAgencySettingsSchema = z.object({
   maxReservations: z.number().int().min(1).max(1000).optional(),
   avgServiceTime: z.number().int().min(1).max(480).optional(),
   sponsorSms: z.boolean().optional(),
-  smsBalance: z.number().int().min(0).optional(),
+  // P0-1: smsBalance REMOVED from the settings schema — the wallet is owned
+  // by APPROVED purchases + guarded decrements only; it is never a free-edit
+  // settings field (self-serve credit top-ups would bypass the ledger).
 })
 
 export const createServiceSchema = z.object({
@@ -231,6 +241,15 @@ export const createServiceSchema = z.object({
   nameAr: z.string().optional(),
   nameFr: z.string().optional(),
   description: z.string().max(300).optional(),
+  /// Task C — price in DZD; required at runtime when the agency-type
+  /// ServicePolicy is MANDATORY + enforce (checked in routes/agency.ts).
+  price: z.number().nonnegative().max(10_000_000).nullable().optional(),
+  /// P2-10 — owner-set service duration (minutes); the authoritative ETA
+  /// estimate for this service when set (overrides 7-day history).
+  durationMinutes: z.number().int().min(1).max(600).nullable().optional(),
+  /// P2-10 — queue priority; higher-priority services are called first
+  /// (order: priority DESC, queueNumber ASC). 0 = normal.
+  priority: z.number().int().min(0).max(99).optional(),
   isActive: z.boolean().optional().default(true),
 })
 
@@ -239,6 +258,9 @@ export const updateServiceSchema = z.object({
   nameAr: z.string().optional(),
   nameFr: z.string().optional(),
   description: z.string().max(300).optional(),
+  price: z.number().nonnegative().max(10_000_000).nullable().optional(),
+  durationMinutes: z.number().int().min(1).max(600).nullable().optional(),
+  priority: z.number().int().min(0).max(99).optional(),
   isActive: z.boolean().optional(),
 })
 
@@ -282,7 +304,10 @@ export const adminCreateAgencySchema = z.object({
   address: z.string().max(200).optional(),
   phone: z.string().max(20).optional(),
   email: z.string().optional(),
-  category: z.string().default('OTHER'),
+  category: z.string().min(2).max(40).default('CLINIC'),
+  /// Agencies Management — specialties the agency serves (ids from the
+  /// Specialty dictionary; validated to belong to `category` in the handler).
+  specialtyIds: z.array(z.string()).max(50).optional(),
   ownerId: z.string().optional(), // Optional: derived from session for non-SUPER_ADMIN
   customCode: z.string().min(2).max(10).optional(),
   workingHoursStart: z.string().optional(),
@@ -322,7 +347,9 @@ export const adminUpdateAgencySchema = z.object({
   description: z.string().max(500).optional(),
   address: z.string().max(200).optional(),
   phone: z.string().max(20).optional(),
-  category: z.string().optional(),
+  // adminUpdateAgencySchema is currently imported nowhere (dead schema) —
+  // kept in sync with the dictionary-backed category model anyway.
+  category: z.string().min(2).max(40).optional(),
   isActive: z.boolean().optional(),
   ownerId: z.string().optional(),
   customCode: z.string().min(2).max(10).optional(),
@@ -354,6 +381,13 @@ export const paymentSettingsSchema = z.object({
   bankAccount: z.string().max(30).optional(),
   bankRib: z.string().max(30).optional(),
   ewalletNumber: z.string().max(30).optional(),
+  // r21-6 — display-safe transfer details (holder/address) + BaridiMob.
+  ccpHolderName: z.string().max(120).nullish(),
+  ccpAddress: z.string().max(300).nullish(),
+  bankHolderName: z.string().max(120).nullish(),
+  bankAddress: z.string().max(300).nullish(),
+  baridiMobEnabled: z.boolean().optional(),
+  baridiMobNumber: z.string().max(30).nullish(),
 })
 
 // ─── Notifications ───────────────────────────────────────────────────────────
@@ -445,6 +479,10 @@ export const createCounterSchema = z.object({
   name: z.string().min(1, 'Counter name is required').max(50),
   nameAr: z.string().optional(),
   nameFr: z.string().optional(),
+  /// P2-10 — services this counter serves. Omitted/empty = serves EVERY
+  /// service (back-compat); a non-empty list narrows its call-next
+  /// candidates to tickets of these services only.
+  serviceIds: z.array(z.string().min(1)).max(50).optional(),
 })
 
 export const updateCounterSchema = z.object({
@@ -453,6 +491,9 @@ export const updateCounterSchema = z.object({
   nameFr: z.string().optional(),
   isActive: z.boolean().optional(),
   staffId: z.string().nullable().optional(),
+  /// P2-10 — replace the counter's service binding. null/[] clears it
+  /// (counter serves every service again); a list rewrites the binding.
+  serviceIds: z.array(z.string().min(1)).max(50).nullable().optional(),
 })
 
 // ─── Kiosk ──────────────────────────────────────────────────────────────────
@@ -479,8 +520,11 @@ export const subscriptionPaySchema = z.object({
   // any non-empty string is accepted here so admin-managed dynamic plan names
   // (FREE / BASIC / PREMIUM / PRO / custom) all work without schema churn.
   plan: z.string().min(1, 'Plan is required'),
-  method: z.enum(['CCP', 'BANK', 'BANK_TRANSFER', 'ELECTRONIC'], {
-    message: 'Payment method must be CCP, BANK, BANK_TRANSFER, or ELECTRONIC',
+  // r21-6 — BARIDIMOB added so BaridiMob transfer receipts flow through the
+  // exact same upload + admin-review pipeline as CCP / bank receipts.
+  // Transaction.paymentMethod stores the string as-is (no enum migration).
+  method: z.enum(['CCP', 'BANK', 'BANK_TRANSFER', 'ELECTRONIC', 'BARIDIMOB'], {
+    message: 'Payment method must be CCP, BANK, BANK_TRANSFER, ELECTRONIC, or BARIDIMOB',
   }),
   receiptUrl: z.string().max(500).optional(),
   // Billing period (in months). 1 = monthly (default), 3 = quarterly,

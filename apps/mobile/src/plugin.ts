@@ -293,7 +293,10 @@ export const blastiNativePlugin: BlastiNativePlugin = {
         clearTimeout(tid);
         if (!res.ok) return null;
         const data = await res.json();
-        if (data.service === 'blasti-lan') return data as BlastiLanServer;
+        // cache-1 fix: the desktop beacon answers service:'blasti-local'
+        // (local-api/index.js /api/discover); the historic 'blasti-lan' value
+        // is kept for backward compatibility with older desktop builds.
+        if (data.service === 'blasti-lan' || data.service === 'blasti-local') return data as BlastiLanServer;
         return null;
       } catch {
         clearTimeout(tid);
@@ -341,7 +344,7 @@ export const blastiNativePlugin: BlastiNativePlugin = {
               clearTimeout(tid);
               if (!res.ok) return null;
               const data = await res.json();
-              return data.service === 'blasti-lan' ? (data as BlastiLanServer) : null;
+              return (data.service === 'blasti-lan' || data.service === 'blasti-local') ? (data as BlastiLanServer) : null;
             })
             .catch(() => {
               clearTimeout(tid);

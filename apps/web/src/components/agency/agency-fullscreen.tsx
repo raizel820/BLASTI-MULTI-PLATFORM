@@ -24,6 +24,16 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
@@ -49,6 +59,12 @@ import {
   History,
   Lock,
   DoorOpen,
+  Hourglass,
+  Shield,
+  Monitor,
+  LogIn,
+  Plus,
+  AlertTriangle,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -337,6 +353,10 @@ export function AgencyFullscreen() {
   // Task 37-e: the STAFF MEMBER now OCCUPIES the counter they pick (real
   // server-side occupation, mirrored by Counter.staffId / occupiedAt) —
   // call-next requires the target counter to be occupied by the caller.
+  // r21-8 — occupation graduated into the CONTROL model: selecting a free
+  // counter CLAIMS it (POST /claim), a 60s heartbeat keeps the lease alive,
+  // and a counter held by someone else answers 409 COUNTER_CONTROLLED with
+  // the holder's name (request-control / forced-assign flow).
   interface CounterOption {
     id: string;
     number: number;
@@ -347,16 +367,49 @@ export function AgencyFullscreen() {
     staffId?: string | null;
     occupiedBy?: string | null;
     occupiedAt?: string | null;
+    // r21-8 — control fields merged from the enriched GET /api/agency/counters
+    controlledByUserId?: string | null;
+    controlledByName?: string | null;
+    controlHeartbeatAt?: string | null;
+    counterServices?: Array<{ serviceId: string; name: string; nameAr?: string | null; nameFr?: string | null }>;
   }
   const [counters, setCounters] = useState<CounterOption[]>([]);
   const [selectedCounterId, setSelectedCounterId] = useState<string>('');
   const [occupationLoading, setOccupationLoading] = useState<string | null>(null);
+
+  // ─── r21-8 — counter CONTROL claim flow state ──────────────────
+  const myUserId = user?.id || '';
+  // 409 COUNTER_CONTROLLED dialog: someone else holds the picked counter.
+  const [controlDialog, setControlDialog] = useState<{
+    counterId: string;
+    counterName: string;
+    holderName: string;
+  } | null>(null);
+  // Pending request-control — a 60s window driven by the server's expiresAt;
+  // counter:request-approved auto-adopts control, reject/expired closes it.
+  const [controlRequest, setControlRequest] = useState<{
+    requestId: string;
+    counterId: string;
+    counterName: string;
+    expiresAt: number;
+  } | null>(null);
+  const [requestControlLoading, setRequestControlLoading] = useState(false);
+  const [countdownSeconds, setCountdownSeconds] = useState(0);
+  // Refs mirror the async state for the realtime event handlers so the socket
+  // subscriptions never need to re-run when these flip.
+  const selectedCounterIdRef = useRef('');
+  const controlRequestRef = useRef(controlRequest);
+  useEffect(() => { selectedCounterIdRef.current = selectedCounterId; }, [selectedCounterId]);
+  useEffect(() => { controlRequestRef.current = controlRequest; }, [controlRequest]);
 
   // Agency authority — gives the fullscreen the caller's staffId (for "is
   // this counter mine?") and the owner bypass.
   const { authority } = useAgencyAuthority();
   const myStaffId = authority?.staffId ?? null;
   const isOwnerCaller = authority?.isOwner === true;
+  // r21-8 — Owner / SUPER_ADMIN bypass: they additionally see the
+  // forced-takeover action in the 409 dialog (POST /assign { userId: me }).
+  const canForceTakeover = isOwnerCaller || user?.role === 'SUPER_ADMIN' || user?.role === 'AGENCY_OWNER';
 
   // Fetch counters for this agency (all branches)
   const fetchCounters = useCallback(async () => {
@@ -395,22 +448,71 @@ export function AgencyFullscreen() {
       setCounters(allCounters);
       // Task 37-e: the previous localStorage-only restore is now backed by the
       // server's occupation state. A saved counter is only restored when it is
-      // REALLY occupied by this caller (staff) or the caller is an owner
+      // REALLY controlled by this caller (controlledByUserId === me) or
+      // really occupied by this caller's staff row / the caller is an owner
       // (owners don't hold counters via staffId — keep the old convenience).
       const saved = localStorage.getItem(`blasti_counter_${agencyId}`);
       const savedCounter = saved ? allCounters.find(c => c.id === saved) : undefined;
-      if (saved && savedCounter && (isOwnerCaller || (!!myStaffId && savedCounter.staffId === myStaffId))) {
+      if (saved && savedCounter && (savedCounter.controlledByUserId === myUserId || isOwnerCaller || (!!myStaffId && savedCounter.staffId === myStaffId))) {
         setSelectedCounterId(saved);
-      } else if (myStaffId) {
-        // Already occupying one of the agency's counters? Re-attach to it.
-        const mine = allCounters.find(c => !!c.staffId && c.staffId === myStaffId);
+      } else if (myStaffId || myUserId) {
+        // Already controlling/occupying one of the agency's counters? Re-attach.
+        const mine = allCounters.find(c =>
+          (c.controlledByUserId && c.controlledByUserId === myUserId) ||
+          (!!c.staffId && c.staffId === myStaffId));
         if (mine) setSelectedCounterId(mine.id);
         else setSelectedCounterId('');
       } else if (allCounters.length === 1) {
         setSelectedCounterId(allCounters[0].id);
       }
+
+      // ─── r21-8 — merge the CONTROL view ────────────────────────────────
+      // GET /api/agency/counters is enriched (cloud r21-7 + local r21-8) with
+      // counterServices{serviceId,service{name,nameAr}} + controlledByUserId
+      // + controlHeartbeatAt + controlledBy names. The per-branch loop above
+      // stays the BASE (it carries the staff/currentReservation relations);
+      // this merge only layers the control fields on top — a failed or
+      // legacy (un-enriched) response is a silent no-op.
+      try {
+        const ctlRes = await apiFetch(`/api/agency/counters?agencyId=${encodeURIComponent(agencyId)}`);
+        if (ctlRes.ok) {
+          const ctlData = await ctlRes.json();
+          const rows = unwrapListPayload<Record<string, unknown>>(ctlData, ['counters', 'data']);
+          let merged = false;
+          for (const row of rows) {
+            const target = allCounters.find((c) => c.id === String(row.id));
+            if (!target) continue;
+            merged = true;
+            const controlledByObj = row.controlledBy as
+              | { user?: { fullName?: string; username?: string }; fullName?: string; name?: string }
+              | null | undefined;
+            target.controlledByUserId = (row.controlledByUserId as string | null | undefined) ?? null;
+            target.controlledByName =
+              (row.controlledByName as string | null | undefined)
+              ?? controlledByObj?.user?.fullName
+              ?? controlledByObj?.fullName
+              ?? controlledByObj?.name
+              ?? null;
+            target.controlHeartbeatAt = (row.controlHeartbeatAt as string | null | undefined) ?? null;
+            if (Array.isArray(row.counterServices)) {
+              target.counterServices = (row.counterServices as Array<Record<string, unknown>>)
+                .map((cs) => {
+                  const s = cs.service as { name?: string; nameAr?: string; nameFr?: string } | null | undefined;
+                  return {
+                    serviceId: String(cs.serviceId ?? ''),
+                    name: String(s?.name ?? ''),
+                    nameAr: s?.nameAr ?? null,
+                    nameFr: s?.nameFr ?? null,
+                  };
+                })
+                .filter((s) => s.serviceId);
+            }
+          }
+          if (merged) setCounters([...allCounters]);
+        }
+      } catch { /* control enrichment is best-effort */ }
     } catch { /* ignore */ }
-  }, [agencyId, myStaffId, isOwnerCaller]);
+  }, [agencyId, myStaffId, isOwnerCaller, myUserId]);
 
   // Calculate live duration from currentServing's calledAt
   useEffect(() => {
@@ -436,6 +538,65 @@ export function AgencyFullscreen() {
     const secs = serviceDurationSeconds % 60;
     return `${mins}m ${secs.toString().padStart(2, '0')}s`;
   }, [serviceDurationSeconds]);
+
+  // ─── r21-8 helpers ───────────────────────────────────────────────────
+
+  /** Localized counter display name (name per language, falling back to #number). */
+  const counterLabel = (c: { name: string; nameAr?: string | null; nameFr?: string | null; number?: number } | undefined) =>
+    c ? ((lang === 'ar' ? (c.nameAr || c.name) : lang === 'fr' ? (c.nameFr || c.name) : c.name) || `#${c.number ?? 0}`) : '';
+
+  /** Clear the LOCAL control state (no server call) — used on loss/adopt paths. */
+  const releaseLocalControl = useCallback(() => {
+    selectedCounterIdRef.current = '';
+    setSelectedCounterId('');
+    if (agencyId) {
+      try { localStorage.removeItem(`blasti_counter_${agencyId}`); } catch { /* ignore */ }
+    }
+    setControlRequest(null);
+    setControlDialog(null);
+  }, [agencyId]);
+
+  // Control heartbeat — while a counter is selected, renew the server-side
+  // control lease every 60s. A 403 COUNTER_CONTROL_LOST means the lease died
+  // (expired heartbeat, forced takeover, released elsewhere): drop the local
+  // control state and return the console to the claim screen. The interval is
+  // cleared on unmount / release / loss via the effect teardown.
+  useEffect(() => {
+    if (!selectedCounterId) return;
+    let stopped = false;
+    const beat = async () => {
+      try {
+        const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(selectedCounterId)}/heartbeat`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+        });
+        if (res.status === 403 && !stopped) {
+          releaseLocalControl();
+          toast.error(t('counterControlLost'));
+          fetchCounters();
+        }
+      } catch { /* transient — the next beat retries */ }
+    };
+    const id = setInterval(beat, 60_000);
+    return () => { stopped = true; clearInterval(id); };
+  }, [selectedCounterId, releaseLocalControl, fetchCounters, t]);
+
+  // request-control countdown card — driven by the server's expiresAt. When
+  // the window lapses, clear the card (the server's sweeper emits
+  // counter:request-expired independently; both paths are idempotent).
+  useEffect(() => {
+    if (!controlRequest) { setCountdownSeconds(0); return; }
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((controlRequest.expiresAt - Date.now()) / 1000));
+      setCountdownSeconds(left);
+      if (left <= 0) {
+        setControlRequest(null);
+        toast.info(t('counterControlExpired'));
+      }
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [controlRequest, t]);
 
   // Fullscreen permission state
   const fullscreenReady = true;
@@ -636,12 +797,63 @@ export function AgencyFullscreen() {
       realtime.onQueueUpdated(() => fetchAll()),
       realtime.onReservationCreated(() => fetchAll()),
       realtime.onReservationUpdated(() => fetchAll()),
+      // ─── r21-8 — counter-control events ──────────────────────────────
+      realtime.onCounterClaimed(() => fetchCounters()),
+      realtime.onCounterReleased(() => fetchCounters()),
+      // counter:request-created is the HOLDER's concern (a future holder-side
+      // approve/reject surface); the requester console reacts to the outcome.
+      realtime.onCounterRequestApproved((event) => {
+        const d = ((event as { data?: Record<string, unknown> })?.data
+          ?? (event as unknown as Record<string, unknown>)) as Record<string, unknown>;
+        const req = controlRequestRef.current;
+        if (d.userId === myUserId || (req && d.requestId === req.requestId)) {
+          const cid = String(d.counterId || req?.counterId || '');
+          if (cid) {
+            selectedCounterIdRef.current = cid;
+            setSelectedCounterId(cid);
+            localStorage.setItem(`blasti_counter_${agencyId}`, cid);
+            setControlRequest(null);
+            setControlDialog(null);
+            toast.success(t('counterControlGranted'));
+          }
+        }
+        fetchCounters();
+      }),
+      realtime.onCounterRequestRejected((event) => {
+        const d = ((event as { data?: Record<string, unknown> })?.data
+          ?? (event as unknown as Record<string, unknown>)) as Record<string, unknown>;
+        const req = controlRequestRef.current;
+        if (d.userId === myUserId || (req && d.requestId === req.requestId)) {
+          setControlRequest(null);
+          toast.error(t('counterControlRejected'));
+        }
+      }),
+      realtime.onCounterRequestExpired((event) => {
+        const d = ((event as { data?: Record<string, unknown> })?.data
+          ?? (event as unknown as Record<string, unknown>)) as Record<string, unknown>;
+        const req = controlRequestRef.current;
+        if (d.userId === myUserId || (req && d.requestId === req.requestId)) {
+          setControlRequest(null);
+          toast.info(t('counterControlExpired'));
+        }
+      }),
+      realtime.onCounterLost((event) => {
+        const d = ((event as { data?: Record<string, unknown> })?.data
+          ?? (event as unknown as Record<string, unknown>)) as Record<string, unknown>;
+        // My controlled counter lost its lease (heartbeat expiry / takeover):
+        // return the console to the claim screen.
+        if (d.counterId && d.counterId === selectedCounterIdRef.current) {
+          releaseLocalControl();
+          toast.error(t('counterControlLost'));
+        }
+        fetchCounters();
+      }),
     ];
     return () => {
       unsubs.forEach((unsub) => unsub?.());
       realtime.leaveAgency(agencyId);
     };
-  }, [agencyId, realtime, fetchAll, fetchStats]);
+  }, [agencyId, realtime, fetchAll, fetchStats, fetchCounters, myUserId, releaseLocalControl, t]);
 
   // Fetch agency code for QR
   useEffect(() => {
@@ -693,7 +905,10 @@ export function AgencyFullscreen() {
       else {
         const data = await res.json();
         let errorMsg: string = data.details || data.error || t('noQueue');
+        // r21-8 — the control model's gates (403 codes) + the legacy one.
         if (data.error === 'OCCUPY_COUNTER_FIRST') errorMsg = t('occupyFirst');
+        else if (data.error === 'COUNTER_CONTROL_REQUIRED') errorMsg = t('counterControlRequired');
+        else if (data.error === 'COUNTER_CONTROL_LOST') errorMsg = t('counterControlLost');
         else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) errorMsg = t('counterPermissionDenied');
         toast.error(errorMsg);
       }
@@ -701,39 +916,121 @@ export function AgencyFullscreen() {
     finally { setActionLoading(null); }
   };
 
-  // ─── Task 37-e: counter OCCUPATION (staff self-service) ─────────────────
-  // Picking a counter in the selector now OCCUPIES it server-side
-  // (POST /api/agency/counters/:id/occupy). 409 COUNTER_OCCUPIED (another
-  // active staff holds it) toasts + refreshes the list; PERMISSION_DENIED
-  // surfaces a friendly message. The Release action frees it again.
+  // ─── r21-8: counter CONTROL (claim / heartbeat / release) ───────────────
+  // Picking a counter in the selector CLAIMS it (POST /claim). A counter held
+  // by someone else answers 409 COUNTER_CONTROLLED with the holder's name →
+  // the caller gets the request-control / forced-takeover dialog instead of a
+  // bare toast. Release frees the counter again.
 
   const handleCounterSelect = async (counterId: string) => {
     if (!agencyId || counterId === selectedCounterId) return;
     setOccupationLoading(counterId);
     try {
-      const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(counterId)}/occupy`, {
+      const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(counterId)}/claim`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
       });
       if (res.ok) {
         setSelectedCounterId(counterId);
+        selectedCounterIdRef.current = counterId;
         localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
-        toast.success(t('occupyCounter'));
+        toast.success(t('counterClaimed'));
         fetchCounters();
       } else {
         const data = await res.json().catch(() => ({}));
-        if (data.error === 'COUNTER_OCCUPIED') {
-          toast.error(t('counterOccupied'));
-          fetchCounters(); // refresh the occupied-by states
+        if (data.error === 'COUNTER_CONTROLLED' || data.error === 'COUNTER_OCCUPIED') {
+          const opt = counters.find((c) => c.id === counterId);
+          setControlDialog({
+            counterId,
+            counterName: counterLabel(opt),
+            holderName: String(
+              data.holderName
+              || data.details?.holderName
+              || opt?.controlledByName
+              || opt?.occupiedBy
+              || ''
+            ),
+          });
+          fetchCounters(); // refresh the holder states behind the dialog
         } else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) {
           toast.error(t('counterPermissionDenied'));
         } else {
-          toast.error(data.error || t('error'));
+          toast.error(data.details || data.error || t('error'));
         }
       }
     } catch {
       toast.error(t('error'));
     } finally {
       setOccupationLoading(null);
+    }
+  };
+
+  /** Ask the current holder for control — 60s countdown window. */
+  const handleRequestControl = async () => {
+    if (!controlDialog) return;
+    const { counterId, counterName } = controlDialog;
+    setRequestControlLoading(true);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(counterId)}/request-control`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (data.claimed) {
+          // The counter freed while we were asking — control granted directly.
+          setControlDialog(null);
+          setSelectedCounterId(counterId);
+          selectedCounterIdRef.current = counterId;
+          localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
+          toast.success(t('counterClaimed'));
+          fetchCounters();
+        } else if (data.requestId) {
+          setControlRequest({
+            requestId: String(data.requestId),
+            counterId,
+            counterName,
+            expiresAt: data.expiresAt ? new Date(data.expiresAt).getTime() : Date.now() + 60_000,
+          });
+          setControlDialog(null);
+          toast.success(t('requestControlSent'));
+        } else {
+          toast.error(data.error || t('error'));
+        }
+      } else {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.error || t('error'));
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setRequestControlLoading(false);
+    }
+  };
+
+  /** Owner/SUPER_ADMIN forced takeover — control moves to me immediately. */
+  const handleForceTakeover = async () => {
+    if (!controlDialog || !myUserId) return;
+    const { counterId } = controlDialog;
+    setRequestControlLoading(true);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(counterId)}/assign`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: myUserId }),
+      });
+      if (res.ok) {
+        setControlDialog(null);
+        setSelectedCounterId(counterId);
+        selectedCounterIdRef.current = counterId;
+        localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
+        toast.success(t('counterClaimed'));
+        fetchCounters();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.error || t('error'));
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setRequestControlLoading(false);
     }
   };
 
@@ -745,13 +1042,17 @@ export function AgencyFullscreen() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
       });
       if (res.ok) {
-        localStorage.removeItem(`blasti_counter_${agencyId}`);
-        setSelectedCounterId('');
+        releaseLocalControl();
         toast.success(t('counterReleased'));
         fetchCounters();
       } else {
         const data = await res.json().catch(() => ({}));
-        if (data.error === 'COUNTER_OCCUPIED') {
+        if (res.status === 403 && data.error === 'COUNTER_CONTROL_LOST') {
+          // The lease already died server-side — mirror it locally.
+          releaseLocalControl();
+          toast.error(t('counterControlLost'));
+          fetchCounters();
+        } else if (data.error === 'COUNTER_CONTROLLED' || data.error === 'COUNTER_OCCUPIED') {
           toast.error(t('counterOccupied'));
           fetchCounters();
         } else if (typeof data.error === 'string' && (data.error.startsWith('PERMISSION_DENIED') || data.error === 'NOT_COUNTER_OCCUPIER')) {
@@ -949,14 +1250,14 @@ export function AgencyFullscreen() {
             </div>
             <div>
               <h1 className="text-sm font-bold text-white leading-tight">{agencyName}</h1>
-              <p className="text-[10px] text-gray-500 leading-tight">{t('queueManagement') || 'Queue Management'}</p>
+              <p className="text-[10px] text-gray-500 dark:text-gray-400 leading-tight">{t('queueManagement') || 'Queue Management'}</p>
             </div>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {/* Counter / Reception Selector — Task 37-e: picking a counter
-              OCCUPIES it (staff self-service); occupied state is shown per
-              item, and a Release action frees the counter again. */}
+          {/* Counter / Reception Selector — r21-8: picking a counter CLAIMS
+              control of it (heartbeat-backed lease); held counters show their
+              holder, and a Release action frees the counter again. */}
           {counters.length > 0 && (
             <div className="flex items-center gap-1">
               <Select
@@ -964,26 +1265,27 @@ export function AgencyFullscreen() {
                 onValueChange={handleCounterSelect}
                 disabled={!!occupationLoading}
               >
-                <SelectTrigger className="h-7 px-2 bg-gray-800 border-gray-700 text-[11px] text-gray-300 rounded-lg gap-1 min-w-[120px] max-w-[180px]">
+                <SelectTrigger className="h-9 px-3 bg-gray-800 border-gray-700 text-xs text-gray-200 rounded-lg gap-1.5 min-w-[150px] max-w-[260px]">
                   <SelectValue placeholder={t('selectCounter') || 'Select Counter'} />
                 </SelectTrigger>
                 <SelectContent className="bg-gray-900 border-gray-700">
                   {counters.map((c) => {
-                    const mine = !!myStaffId && c.staffId === myStaffId;
+                    const mine = c.controlledByUserId === myUserId || (!!myStaffId && c.staffId === myStaffId);
+                    const holderName = c.controlledByName || c.occupiedBy || '';
                     return (
                       <SelectItem key={c.id} value={c.id} className="text-xs text-gray-300">
                         <div
                           className="flex items-center gap-2"
-                          title={c.staffId ? `${t('counterOccupiedBy', { name: c.occupiedBy || '' })}${c.occupiedAt ? ` · ${formatTime(c.occupiedAt, lang)}` : ''}` : t('counterFree')}
+                          title={(c.controlledByUserId || c.staffId) ? `${t('counterOccupiedBy', { name: holderName })}${c.controlHeartbeatAt ? ` · ${formatTime(c.controlHeartbeatAt, lang)}` : c.occupiedAt ? ` · ${formatTime(c.occupiedAt, lang)}` : ''}` : t('counterFree')}
                         >
                           <span className="font-bold text-emerald-400">#{c.number}</span>
                           <span>{lang === 'ar' ? (c.nameAr || c.name) : lang === 'fr' ? (c.nameFr || c.name) : c.name}</span>
-                          <span className={`text-[10px] ${mine ? 'text-emerald-400' : c.staffId ? 'text-amber-400' : 'text-gray-500'}`}>
-                            {c.staffId
+                          <span className={`text-[10px] ${mine ? 'text-emerald-400' : (c.controlledByUserId || c.staffId) ? 'text-amber-400' : 'text-gray-500'}`}>
+                            {(c.controlledByUserId || c.staffId)
                               ? (mine
                                 ? t('counterMine')
-                                : c.occupiedBy
-                                  ? t('counterOccupiedBy', { name: c.occupiedBy })
+                                : holderName
+                                  ? t('counterOccupiedBy', { name: holderName })
                                   : t('counterOccupied'))
                               : t('counterFree')}
                           </span>
@@ -993,20 +1295,20 @@ export function AgencyFullscreen() {
                   })}
                 </SelectContent>
               </Select>
-              {selectedCounterId && (isOwnerCaller || counters.some((c) => c.id === selectedCounterId && (!!myStaffId && c.staffId === myStaffId))) && (
+              {selectedCounterId && (isOwnerCaller || counters.some((c) => c.id === selectedCounterId && (c.controlledByUserId === myUserId || (!!myStaffId && c.staffId === myStaffId)))) && (
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={handleReleaseCounter}
                   disabled={!!occupationLoading}
-                  className="h-7 px-2 gap-1 text-gray-400 hover:text-white hover:bg-gray-800 rounded-lg text-[11px]"
+                  className="h-9 px-3 gap-1.5 text-gray-300 hover:text-white hover:bg-gray-800 rounded-lg text-xs"
                 >
                   {occupationLoading === selectedCounterId ? (
-                    <Loader2 className="h-3 w-3 animate-spin" />
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   ) : (
-                    <DoorOpen className="h-3 w-3" />
+                    <DoorOpen className="h-3.5 w-3.5" />
                   )}
-                  <span className="hidden sm:inline">{t('releaseCounter')}</span>
+                  <span>{t('releaseCounter')}</span>
                 </Button>
               )}
             </div>
@@ -1039,6 +1341,110 @@ export function AgencyFullscreen() {
 
       {/* ─── Main Content Area ──────────────────────────────────────────── */}
       <main className="flex-1 min-h-0 p-3 sm:p-4 lg:p-6 flex flex-col gap-3 sm:gap-4">
+        {/* ─── r23 — counter CLAIM GATE: nobody manages the queue without a
+            claimed counter — the agency owner included (parity with the
+            server's COUNTER_SETUP_REQUIRED / COUNTER_CONTROL_REQUIRED gates).
+            Replaces the old 28px header dropdown with a full readable panel:
+            big counter cards, visible holder names, real claim buttons. ── */}
+        {counters.length > 0 && !selectedCounterId ? (
+          <div className="flex-1 min-h-0 flex items-center justify-center overflow-y-auto custom-scrollbar py-4">
+            <div className="w-full max-w-xl bg-gray-900 border border-gray-800 rounded-3xl p-5 sm:p-7 shadow-2xl">
+              <div className="flex items-center gap-3.5">
+                <div className="h-12 w-12 rounded-2xl bg-emerald-600 flex items-center justify-center flex-shrink-0 shadow-lg shadow-emerald-900/40">
+                  <Monitor className="h-6 w-6 text-white" />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-lg sm:text-xl font-bold text-white leading-tight">{t('counterClaimGateTitle')}</h2>
+                  <p className="text-xs sm:text-sm text-gray-400 mt-1 leading-relaxed">{t('counterClaimGateDesc')}</p>
+                </div>
+              </div>
+              <div className="mt-5 space-y-2.5 max-h-[52vh] overflow-y-auto custom-scrollbar pe-0.5">
+                {counters.map((c) => {
+                  const mine = c.controlledByUserId === myUserId || (!!myStaffId && c.staffId === myStaffId);
+                  const held = !!(c.controlledByUserId || c.staffId);
+                  const holderName = c.controlledByName || c.occupiedBy || '';
+                  const takenByOther = held && !mine;
+                  return (
+                    <button
+                      key={c.id}
+                      type="button"
+                      disabled={!!occupationLoading}
+                      onClick={() => handleCounterSelect(c.id)}
+                      className={`w-full flex items-center gap-3.5 p-4 rounded-2xl border-2 text-start transition-all duration-200 disabled:opacity-60 ${
+                        takenByOther
+                          ? 'border-gray-800 bg-gray-900/60 cursor-pointer'
+                          : 'border-gray-700 bg-gray-800/60 hover:border-emerald-500 hover:bg-emerald-900/20'
+                      }`}
+                    >
+                      <div className="h-12 w-12 rounded-xl bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center flex-shrink-0 shadow-md">
+                        <span className="text-lg font-black text-white">#{c.number}</span>
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm sm:text-base font-bold text-white truncate">
+                          {lang === 'ar' ? (c.nameAr || c.name) : lang === 'fr' ? (c.nameFr || c.name) : c.name}
+                        </p>
+                        <p className={`text-xs mt-0.5 font-medium ${mine ? 'text-emerald-400' : takenByOther ? 'text-amber-400' : 'text-gray-500'}`}>
+                          {mine
+                            ? t('counterMine')
+                            : takenByOther
+                              ? (holderName ? t('counterOccupiedBy', { name: holderName }) : t('counterOccupied'))
+                              : t('counterFree')}
+                        </p>
+                        {!!c.counterServices?.length && (
+                          <div className="flex flex-wrap gap-1 mt-1.5">
+                            {c.counterServices.filter((s) => s.serviceId).slice(0, 4).map((s) => (
+                              <span key={s.serviceId} className="px-1.5 py-0.5 rounded-md bg-gray-800 text-gray-300 border border-gray-700 text-[10px] font-medium">
+                                {lang === 'ar' ? (s.nameAr || s.name) : lang === 'fr' ? (s.nameFr || s.name) : s.name}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex-shrink-0">
+                        {occupationLoading === c.id ? (
+                          <Loader2 className="h-5 w-5 animate-spin text-emerald-400" />
+                        ) : takenByOther ? (
+                          <div className="h-9 px-3 rounded-xl border border-amber-500/50 bg-amber-500/10 flex items-center gap-1.5 text-amber-300 text-xs font-bold whitespace-nowrap">
+                            <Lock className="h-3.5 w-3.5" />
+                            {t('requestControl')}
+                          </div>
+                        ) : (
+                          <div className="h-9 px-3.5 rounded-xl bg-emerald-600 flex items-center gap-1.5 text-white text-xs font-bold shadow-lg shadow-emerald-900/40 whitespace-nowrap">
+                            <LogIn className="h-3.5 w-3.5" />
+                            {t('claimThisCounter')}
+                          </div>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-4 text-[11px] sm:text-xs text-gray-500 text-center leading-relaxed">{t('counterClaimGateHint')}</p>
+            </div>
+          </div>
+        ) : (
+          <>
+        {/* ─── r23 — no counters AT ALL: honest setup banner (the server
+            answers COUNTER_SETUP_REQUIRED for every queue action) ── */}
+        {counters.length === 0 && (
+          <div className="flex-shrink-0 flex items-center justify-between gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <AlertTriangle className="h-5 w-5 text-amber-400 flex-shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-amber-200">{t('counterSetupRequiredTitle')}</p>
+                <p className="text-xs text-amber-300/80 truncate">{t('counterSetupRequiredDesc')}</p>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              onClick={() => setView('agency-branches')}
+              className="h-9 px-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-gray-950 text-xs font-bold gap-1 flex-shrink-0"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              {t('counterGoCreate')}
+            </Button>
+          </div>
+        )}
         {/* ─── Top Row: Now Serving + Next In Queue ──────────────────────── */}
         <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-2 gap-3 sm:gap-4">
 
@@ -1194,9 +1600,9 @@ export function AgencyFullscreen() {
                 ) : (
                   <div className="flex-1 flex items-center justify-center gap-3">
                     <div className="h-20 w-20 sm:h-28 sm:w-28 lg:h-36 lg:w-36 rounded-full bg-gray-800 border-2 border-dashed border-gray-700 flex items-center justify-center flex-shrink-0">
-                      <span className="text-2xl sm:text-3xl font-black text-gray-700">—</span>
+                      <span className="text-2xl sm:text-3xl font-black text-gray-700 dark:text-gray-300">—</span>
                     </div>
-                    <p className="text-gray-600 text-xs sm:text-sm">
+                    <p className="text-gray-600 dark:text-gray-400 text-xs sm:text-sm">
                       {waitingList.length === 0 ? (t('noQueue') || 'No queue') : (t('noNext') || 'No next ticket')}
                     </p>
                   </div>
@@ -1241,6 +1647,30 @@ export function AgencyFullscreen() {
             </Button>
           </motion.div>
         </div>
+
+        {/* ─── r21-8 — bound services of the controlled counter ──────────── */}
+        {selectedCounterId && (() => {
+          const selectedCounter = counters.find((c) => c.id === selectedCounterId);
+          if (!selectedCounter) return null;
+          const bound = (selectedCounter.counterServices ?? []).filter((s) => s.serviceId);
+          return (
+            <div className="flex-shrink-0 flex flex-wrap items-center gap-1.5 px-1">
+              <span className="text-[10px] text-gray-500">{t('counterServices')}</span>
+              {bound.length > 0 ? (
+                <>
+                  {bound.map((s) => (
+                    <Badge key={s.serviceId} className="bg-gray-800 text-gray-300 border-gray-700 text-[9px] px-1.5">
+                      {lang === 'ar' ? (s.nameAr || s.name) : lang === 'fr' ? (s.nameFr || s.name) : s.name}
+                    </Badge>
+                  ))}
+                  <span className="text-[10px] text-amber-400/80">{t('counterBoundHint')}</span>
+                </>
+              ) : (
+                <span className="text-[10px] text-gray-500">{t('counterUnboundHint')}</span>
+              )}
+            </div>
+          );
+        })()}
 
         {/* ─── Waiting List ──────────────────────────────────────────────── */}
         <div className="flex-1 min-h-0 flex flex-col">
@@ -1289,7 +1719,7 @@ export function AgencyFullscreen() {
                             <span className="text-gray-400 text-[11px]">{getServiceName(entry, lang)}</span>
                           </td>
                           <td className="px-3 py-2">
-                            <span className="text-gray-500 text-[11px]">{formatTime(entry.joinedAt, lang)}</span>
+                            <span className="text-gray-500 dark:text-gray-400 text-[11px]">{formatTime(entry.joinedAt, lang)}</span>
                           </td>
                           <td className="px-2 py-2 text-center">
                             <div className="flex items-center justify-center gap-0.5">
@@ -1328,13 +1758,15 @@ export function AgencyFullscreen() {
             ) : (
               <div className="flex-1 flex items-center justify-center">
                 <div className="flex flex-col items-center gap-2 text-center">
-                  <Users className="h-8 w-8 text-gray-700" />
-                  <p className="text-gray-600 text-xs">{t('noQueue') || 'No customers in queue'}</p>
+                  <Users className="h-8 w-8 text-gray-700 dark:text-gray-300" />
+                  <p className="text-gray-600 dark:text-gray-400 text-xs">{t('noQueue') || 'No customers in queue'}</p>
                 </div>
               </div>
             )}
           </Card>
         </div>
+          </>
+        )}
       </main>
 
       {/* ─── Walk-in Dialog ─────────────────────────────────────────────── */}
@@ -1453,7 +1885,7 @@ export function AgencyFullscreen() {
               </div>
             )}
             {walkInQrUrl ? (
-              <div className="rounded-2xl bg-white p-4 shadow-lg">
+              <div className="rounded-2xl bg-white dark:bg-gray-900 p-4 shadow-lg">
                 <img src={walkInQrUrl} alt="QR Code" className="w-56 h-56 sm:w-64 sm:h-64" />
               </div>
             ) : (
@@ -1525,17 +1957,17 @@ export function AgencyFullscreen() {
 
             {/* Visual preview */}
             {ticketData && (
-              <div className="bg-white rounded-2xl p-5 text-gray-900 w-full max-w-[280px] text-center space-y-3">
+              <div className="bg-white dark:bg-gray-900 rounded-2xl p-5 text-gray-900 dark:text-gray-100 w-full max-w-[280px] text-center space-y-3">
                 <p className="font-bold text-sm">{ticketData.agencyName}</p>
-                <hr className="border-dashed border-gray-300" />
-                <p className="text-3xl font-black text-gray-900">{ticketData.displayNumber}</p>
-                <hr className="border-dashed border-gray-300" />
+                <hr className="border-dashed border-gray-300 dark:border-gray-600" />
+                <p className="text-3xl font-black text-gray-900 dark:text-gray-100">{ticketData.displayNumber}</p>
+                <hr className="border-dashed border-gray-300 dark:border-gray-600" />
                 <div className="text-sm space-y-0.5">
                   <p className="font-bold">{ticketData.customerName}</p>
-                  <p className="text-gray-600">{ticketData.serviceName}</p>
-                  <p className="text-gray-500 text-xs">{new Date(ticketData.joinedAt).toLocaleString()}</p>
+                  <p className="text-gray-600 dark:text-gray-400">{ticketData.serviceName}</p>
+                  <p className="text-gray-500 dark:text-gray-400 text-xs">{new Date(ticketData.joinedAt).toLocaleString()}</p>
                 </div>
-                <hr className="border-dashed border-gray-300" />
+                <hr className="border-dashed border-gray-300 dark:border-gray-600" />
                 {ticketQrUrl ? (
                   <img src={ticketQrUrl} alt="QR" className="w-36 h-36 mx-auto" />
                 ) : (
@@ -1543,7 +1975,7 @@ export function AgencyFullscreen() {
                     <span className="text-gray-400 text-xs">No QR</span>
                   </div>
                 )}
-                <p className="text-[10px] text-gray-500">{t('scanToTrackQueue') || 'Scan QR to track your queue'}</p>
+                <p className="text-[10px] text-gray-500 dark:text-gray-400">{t('scanToTrackQueue') || 'Scan QR to track your queue'}</p>
               </div>
             )}
 
@@ -1570,7 +2002,7 @@ export function AgencyFullscreen() {
           </DialogHeader>
           <div className="flex flex-col items-center gap-4 py-4">
             {qrCodeDataUrl ? (
-              <div className="rounded-2xl bg-white p-4"><img src={qrCodeDataUrl} alt="QR Code" className="w-48 h-48" /></div>
+              <div className="rounded-2xl bg-white dark:bg-gray-900 p-4"><img src={qrCodeDataUrl} alt="QR Code" className="w-48 h-48" /></div>
             ) : (
               <div className="w-48 h-48 rounded-2xl bg-gray-800 flex items-center justify-center">
                 <Loader2 className="h-8 w-8 animate-spin text-emerald-500" />
@@ -1583,6 +2015,80 @@ export function AgencyFullscreen() {
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* ─── r21-8 — COUNTER_CONTROLLED dialog (request control / takeover) ── */}
+      <AlertDialog open={!!controlDialog} onOpenChange={(v) => { if (!v) setControlDialog(null); }}>
+        <AlertDialogContent className="bg-gray-900 border-gray-800 text-white sm:max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2 text-white">
+              <Lock className="h-5 w-5 text-amber-400" />
+              {t('counterControlTitle')}
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-gray-400">
+              {t('counterControlDesc', {
+                counter: controlDialog?.counterName || '',
+                holder: controlDialog?.holderName || '—',
+              })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="flex-col-reverse gap-2 sm:flex-col-reverse sm:justify-start">
+            <AlertDialogCancel
+              className="bg-transparent text-gray-300 border border-gray-700 hover:bg-gray-800 hover:text-white mt-0 sm:mt-0"
+              onClick={() => setControlDialog(null)}
+            >
+              {t('cancel')}
+            </AlertDialogCancel>
+            {canForceTakeover && (
+              <Button
+                onClick={handleForceTakeover}
+                disabled={requestControlLoading}
+                variant="outline"
+                className="border-amber-500/50 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20 hover:text-amber-200"
+              >
+                {requestControlLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Shield className="h-4 w-4" />}
+                {t('forceTakeover')}
+              </Button>
+            )}
+            <AlertDialogAction
+              onClick={(e) => { e.preventDefault(); handleRequestControl(); }}
+              disabled={requestControlLoading}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white"
+            >
+              {requestControlLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Hourglass className="h-4 w-4" />}
+              {t('requestControl')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ─── r21-8 — request-control countdown card (60s window) ──────────── */}
+      <AnimatePresence>
+        {controlRequest && (
+          <motion.div
+            initial={{ opacity: 0, y: -14 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -14 }}
+            className="fixed top-12 left-1/2 -translate-x-1/2 z-[80] flex items-center gap-3 rounded-xl border border-emerald-500/40 bg-gray-900/95 px-4 py-2.5 shadow-2xl backdrop-blur-sm"
+            dir={dir}
+          >
+            <Loader2 className="h-4 w-4 animate-spin text-emerald-400 flex-shrink-0" />
+            <div className="text-xs min-w-0">
+              <p className="text-white font-semibold truncate">{controlRequest.counterName}</p>
+              <p className="text-gray-400 tabular-nums">
+                {t('requestControlCountdown', { seconds: String(countdownSeconds) })}
+              </p>
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-gray-400 hover:text-white flex-shrink-0"
+              onClick={() => setControlRequest(null)}
+            >
+              {t('cancel')}
+            </Button>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

@@ -106,7 +106,8 @@ const NUMERIC_TYPES = new Set(['INTEGER', 'BIGINT', 'REAL', 'FLOAT', 'DOUBLE', '
  */
 const REQUIRED_FALLBACKS = {
   Agency: {
-    category: () => 'OTHER',
+    // Task A (R-6): 'OTHER' no longer exists — the 4-type set defaults to CLINIC
+    category: () => 'CLINIC',
     customCode: (record) => 'AG' + String((record && record.id) || '').replace(/[^a-zA-Z0-9]/g, '').slice(-6).toUpperCase().padEnd(6, 'X'),
   },
 }

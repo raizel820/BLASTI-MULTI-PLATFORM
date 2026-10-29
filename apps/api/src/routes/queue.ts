@@ -1,3 +1,4 @@
+import { enforceQueueStaffAuthority, queueGateErrorBody } from './agency'
 import { Hono } from 'hono'
 import { db } from '@blasti/db'
 import { requireAuth, requireAgencyAccess, authErrorResponse } from '../lib/auth'
@@ -5,52 +6,28 @@ import { validateBody } from '../lib/validations'
 import { emitQueueEvent, emitNotificationEvent, emitKioskEvent } from '../lib/realtime-emit'
 import { enforceRateLimit, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordSuccessfulRequest, recordFailedRequest } from '../lib/rate-limit'
 import { calculateETA, getEffectiveServiceTime, filterImmediateServiceWindow, filterGhostTickets } from '../lib/eta-calculator'
-// Task 2-a — the scheduler's predicate is now reached through the shared
-// criteria in lib/queue-waiting.ts (isCallableNow/partitionWaiting/
-// pickNextCallable), which wrap shouldSkipForPreferredTime — one definition
-// of "callable" everywhere.
-import { partitionWaiting, pickNextCallable } from '../lib/queue-waiting'
+// Task 2-a — the shared callable criteria live in lib/queue-waiting.ts and
+// are consumed INSIDE lib/queue-claim.ts (one definition of "callable"; this
+// route no longer selects candidates itself).
 // Task 2-a — reservation-state mutations must invalidate the cached public
 // GETs that expose reservation-derived numbers (/api/stats, /api/agencies).
 import { invalidateResponseCacheTag } from '../lib/response-cache'
 import { cancelPendingCustomerAlerts } from '../lib/cancel-pending-alerts'
+import { sendViaPushNotification } from '../lib/notification-router'
 import { z } from 'zod'
 import { recordSyncChange } from '../lib/sync-helpers'
+// UNIFIED QUEUE — both call-next surfaces share ONE atomic implementation
+// (DB-level mutual exclusion + staff/counter assignment in a single tx +
+// automatic concurrent-operation retry). The legacy route delegates to it.
+import { claimNextTicket } from '../lib/queue-claim'
 
 const app = new Hono()
 
-// ── Phase 3b: Transaction retry with exponential backoff for SQLite BUSY/DEADLOCK ──
-// Under concurrent load, two desks calling the next ticket simultaneously can
-// cause SQLite BUSY/DEADLOCK errors. This wrapper retries the transaction up
-// to 3 times with exponential backoff (50ms, 150ms, 450ms).
-
-const MAX_TX_RETRIES = 3
-const TX_RETRY_DELAYS = [50, 150, 450]
-
-function isSQLiteBusyError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false
-  const msg = error.message || ''
-  return (
-    /SQLITE_BUSY|busy_timeout|database is locked/i.test(msg) ||
-    (error as any).code === 'P2034' // Prisma: Transaction failed due to a write conflict
-  )
-}
-
-async function withTxRetry<R>(
-  fn: (...args: any[]) => Promise<R>,
-): Promise<R> {
-  for (let attempt = 0; attempt < MAX_TX_RETRIES; attempt++) {
-    try {
-      return await db.$transaction(fn)
-    } catch (error: unknown) {
-      if (!isSQLiteBusyError(error) || attempt === MAX_TX_RETRIES - 1) throw error
-      const delay = TX_RETRY_DELAYS[attempt]
-      console.warn(`[queue] SQLITE_BUSY on attempt ${attempt + 1}/${MAX_TX_RETRIES}, retrying in ${delay}ms…`)
-      await new Promise(resolve => setTimeout(resolve, delay))
-    }
-  }
-  throw new Error('Transaction retry exhausted') // unreachable
-}
+// NOTE (UNIFIED QUEUE): the former route-local withTxRetry + OCC-update block
+// was promoted to the shared lib/tx-retry.ts + lib/queue-claim.ts — both
+// call-next surfaces (this legacy route and the canonical /api/agency/queue
+// route) now run the SAME atomic claim, so retry/mutual-exclusion behavior
+// can never drift between them again.
 
 // POST /queue/call-next — Call the next customer
 // Phase 3: Uses queueNumber-based sorting + optimistic concurrency + preferred time logic
@@ -76,125 +53,57 @@ app.post('/call-next', async (c) => {
       return c.json({ success: false, error: 'An active subscription is required to use queue features' }, 403)
     }
 
-    // Phase 3: Sort by queueNumber ASC (not joinedAt) to fix the Postpone Paradox
-    // When a reservation is postponed, its queueNumber stays the same but joinedAt changes
-    // Sorting by joinedAt would put postponed tickets at the back of the queue,
-    // but sorting by queueNumber preserves their original position
-    // Task 2-a — shared criteria: partitionWaiting uses the SAME predicate as
-    // GET /api/agency/queue and GET /api/agency/stats, so "the list says N
-    // waiting" and "call-next says none" can no longer disagree.
-    const waitingReservations = await db.reservation.findMany({
-      where: { agencyId, serviceId, status: 'WAITING' },
-      orderBy: { queueNumber: 'asc' },
-      include: {
-        agency: { select: { id: true, name: true, nameFr: true, nameAr: true } },
-        service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
-        user: { select: { id: true, username: true, fullName: true, language: true, phoneNumber: true } },
-      },
-    })
+    // P0-5 + r23: parity gate — the legacy route enforces the SAME staff
+    // authority as the canonical /api/agency/queue/call-next: EVERY account
+    // (owner included) needs a CONTROLLED counter (SUPER_ADMIN excepted);
+    // COUNTER_SETUP_REQUIRED when the agency has no active counter.
+    const queueGate = await enforceQueueStaffAuthority(user, agencyId, counterId ?? null)
+    if (!queueGate.ok) {
+      return c.json(queueGateErrorBody(queueGate), queueGate.status as any)
+    }
+    // r23 — bind the ticket to the caller's controlled counter when the
+    // request omitted one (same parity as the canonical route).
+    const effectiveCounterId = counterId || queueGate.controlledCounterId || null
 
-    if (!waitingReservations.length) {
+    // ── UNIFIED QUEUE: delegate to the shared atomic claim core
+    // (lib/queue-claim.ts) — the same DB-level mutual exclusion, candidate
+    // retry loop, transaction retry and Spec Part O SyncChange capture as the
+    // canonical /api/agency/queue/call-next. This legacy surface previously
+    // raced against it (read-then-blind-update); both now share ONE
+    // implementation, so a ticket can never be called by two desks no matter
+    // which route a workstation uses.
+    // Parity gate (was missing here): the pause check.
+    const pauseGate = await db.queueSettings.findFirst({ where: { agencyId } })
+    if (pauseGate?.isPaused) {
+      return c.json({ success: false, error: 'Queue is paused' }, 400)
+    }
+
+    const claim = await claimNextTicket({ agencyId, serviceId, counterId: effectiveCounterId, actorUserId: user.id })
+
+    if (!claim.ok) {
+      if (claim.kind === 'CONFLICT') {
+        // Every callable candidate was taken by concurrent desks
+        // mid-transaction — the caller retries and claims the next ticket.
+        return c.json({ success: false, error: 'Concurrent call detected. Please try again.', shouldRetry: true }, 409)
+      }
+      // NO_CALLABLE — truthful counts with the canonical names, identical
+      // meaning to the list/stats contract (lib/queue-waiting.ts):
+      // waitingCount = callableCount + scheduledCount.
+      if (claim.counts.waitingCount > 0) {
+        return c.json({
+          success: false,
+          error: 'All waiting reservations have preferred times in the future. No one to call yet.',
+          errorKey: 'ONLY_SCHEDULED_WAITING',
+          hasPreferredTimeOnly: true,
+          waitingCount: claim.counts.waitingCount,
+          scheduledCount: claim.counts.scheduledCount,
+          callableCount: claim.counts.callableCount,
+        }, 200)
+      }
       return c.json({ success: false, error: 'No waiting reservations for this service' }, 404)
     }
 
-    const { callable: callableNow, scheduled: scheduledOnly } = partitionWaiting(waitingReservations)
-
-    // Phase 3: Enforce preferred time logic — now via the SHARED picker
-    // (lib/queue-waiting.ts evaluates the same predicate the list/stats
-    // endpoints use; ordering (queueNumber asc) is preserved by the query).
-    // Task 24: reservedDate keeps FUTURE-DATE tickets uncallable today.
-    const nextId = pickNextCallable(waitingReservations)?.id ?? null
-    const nextReservation = nextId ? waitingReservations.find(r => r.id === nextId) ?? null : null
-
-    if (!nextReservation) {
-      // Task 2-a — truthful counts: every WAITING ticket on this service is
-      // scheduled for a later time/date. The same scheduledCount/callableCount
-      // breakdown is returned by the list/stats endpoints, so all surfaces
-      // agree on WHY nothing is callable.
-      return c.json({
-        success: false,
-        error: 'All waiting reservations have preferred times in the future. No one to call yet.',
-        errorKey: 'ONLY_SCHEDULED_WAITING',
-        hasPreferredTimeOnly: true,
-        waitingCount: waitingReservations.length,
-        scheduledCount: scheduledOnly.length,
-        callableCount: callableNow.length,
-      }, 200)
-    }
-
-    // Phase 3b: Wrap all writes in a transaction with retry logic to prevent
-    // SQLite BUSY/DEADLOCK errors under concurrent load (two desks calling next simultaneously)
-    const { updateResult, updatedReservation } = await withTxRetry(async (tx) => {
-      // Phase 3: Optimistic Concurrency — use updateMany with a status check
-      // This prevents two desks from calling the exact same ticket simultaneously
-      const result = await tx.reservation.updateMany({
-        where: {
-          id: nextReservation.id,
-          status: 'WAITING', // Only update if still WAITING (not already called by another desk)
-        },
-        data: {
-          status: 'CALLED',
-          calledAt: new Date(),
-          counterId: counterId || null, // Phase 2: Track which desk called this ticket
-        },
-      })
-
-      // If no rows were updated, another desk already called this ticket
-      if (result.count === 0) {
-        return { updateResult: result, updatedReservation: null }
-      }
-
-      // Spec Part O: tx ops are invisible to the auto-tracking extension —
-      // record the CALLED transition explicitly inside the same tx.
-      await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: nextReservation.id, operation: 'update' })
-
-      // Get the updated reservation with relations
-      const updated = await tx.reservation.findUnique({
-        where: { id: nextReservation.id },
-        include: {
-          agency: { select: { id: true, name: true, nameFr: true, nameAr: true } },
-          service: { select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
-          user: { select: { id: true, username: true, fullName: true, language: true, phoneNumber: true } },
-          counter: { select: { id: true, name: true, number: true } },
-        },
-      })
-
-      const queueSettings = await tx.queueSettings.findFirst({ where: { agencyId }, orderBy: { updatedAt: 'desc' } })
-      if (queueSettings) {
-        await tx.queueSettings.update({ where: { id: queueSettings.id }, data: { currentServingNumber: nextReservation.queueNumber } })
-        await recordSyncChange({ tx, agencyId, model: 'QueueSettings', recordId: queueSettings.id, operation: 'update' })
-      }
-
-      if (nextReservation.userId) {
-        const notif = await tx.notification.create({
-          data: { userId: nextReservation.userId, type: 'QUEUE_CALLED', title: 'Your Turn!', message: `Please proceed to ${nextReservation.agency.name} - ${nextReservation.service.name}. Your ticket: ${nextReservation.displayNumber}` },
-        })
-        await recordSyncChange({ tx, agencyId, model: 'Notification', recordId: notif.id, operation: 'create' })
-      }
-
-      await tx.auditLog.create({
-        data: { userId: user.id, action: 'QUEUE_CALL', entityType: 'RESERVATION', entityId: nextReservation.id, details: JSON.stringify({ agencyId, serviceId, displayNumber: nextReservation.displayNumber, userId: nextReservation.userId, counterId }) },
-      })
-
-      return { updateResult: result, updatedReservation: updated }
-    })
-
-    // If no rows were updated, another desk already called this ticket — return 409
-    if (updateResult.count === 0) {
-      const remainingReservations = waitingReservations.filter(r => r.id !== nextId && r.status === 'WAITING')
-      if (remainingReservations.length > 0) {
-        // Same shared predicate for the concurrent-retry probe (Task 2-a).
-        const retryNextId = pickNextCallable(remainingReservations)?.id ?? null
-        if (retryNextId) {
-          return c.json({
-            success: false,
-            error: 'Concurrent call detected. Please try again.',
-            shouldRetry: true,
-          }, 409)
-        }
-      }
-      return c.json({ success: false, error: 'No available waiting reservations' }, 404)
-    }
+    const updatedReservation = claim.reservation as any
 
     // Task 2-a — invalidate the cached public GETs that expose reservation-
     // derived numbers (/api/stats, /api/agencies waitingCount). POSTs are
@@ -202,14 +111,22 @@ app.post('/call-next', async (c) => {
     // not come from a stale TTL entry.
     invalidateResponseCacheTag('stats', 'agencies')
 
-    // Phase 3a: Merge original data with the mutation state for complete realtime event data
-    const calledNow = new Date()
-    const mergedCallData = {
-      ...nextReservation,
-      status: 'CALLED' as const,
-      calledAt: calledNow,
-      counterId: counterId || null,
-    }
+    // Phase 3a: the claimed row already carries the mutation state + relations
+    // (claim.reservation includes agency/service/user/counter and is CALLED).
+    const mergedCallData = updatedReservation
+
+    // r21-7 — counter identity rides on the claim; customer surfaces use it
+    // for the "اذهب إلى الشباك" pointer.
+    const legacyCallCounter = (mergedCallData as any)?.counter || null
+    const legacyCounterPayload = legacyCallCounter
+      ? {
+          id: legacyCallCounter.id,
+          name: legacyCallCounter.name,
+          number: legacyCallCounter.number,
+          nameAr: legacyCallCounter.nameAr ?? null,
+          nameFr: legacyCallCounter.nameFr ?? null,
+        }
+      : null
 
     emitQueueEvent('queue:called', agencyId, {
       reservationId: mergedCallData.id,
@@ -220,11 +137,33 @@ app.post('/call-next', async (c) => {
       userId: mergedCallData.userId || null,
       customerName: mergedCallData.user?.fullName || '',
       agencyName: mergedCallData.agency?.name,
-      counterId,
-      counterName: updatedReservation?.counter?.name,
+      counterId: counterId ?? legacyCallCounter?.id ?? null,
+      counterName: legacyCallCounter?.name ?? null,
+      counter: legacyCounterPayload,
     })
     if (mergedCallData.userId) {
-      emitNotificationEvent('notification:your-turn', mergedCallData.userId, { ticketNumber: mergedCallData.displayNumber, agencyName: mergedCallData.agency.name, serviceName: mergedCallData.service.name, userId: mergedCallData.userId, reservationId: mergedCallData.id })
+      emitNotificationEvent('notification:your-turn', mergedCallData.userId, { ticketNumber: mergedCallData.displayNumber, agencyName: mergedCallData.agency.name, serviceName: mergedCallData.service.name, userId: mergedCallData.userId, reservationId: mergedCallData.id, counterId: legacyCounterPayload?.id ?? null, counterName: legacyCounterPayload?.name ?? null, counter: legacyCounterPayload })
+
+      // ── Lock-screen delivery when the app is CLOSED/backgrounded ──
+      // The socket event only reaches a LIVE webview; with the app dead the
+      // "It's your turn" alert previously NEVER reached the lock screen
+      // (no FCM push existed — routeNotification is dead code). FCM
+      // notification message → OS tray on the blasti-turn-alert channel
+      // (high-importance, PUBLIC → lock-screen content, native swipe
+      // dismiss). Requires Firebase credentials + the app's FCM token.
+      const fcmToken = mergedCallData.user?.fcmToken
+      if (fcmToken) {
+        void sendViaPushNotification(fcmToken, {
+          userId: mergedCallData.userId,
+          reservationId: mergedCallData.id,
+          agencyId,
+          type: 'TURN_CALL',
+          message: `Your turn now! Ticket ${mergedCallData.displayNumber} at ${mergedCallData.agency.name} — ${mergedCallData.service.name}.`,
+          messageAr: mergedCallData.user?.language === 'ar'
+            ? `دورك الآن! التذكرة ${mergedCallData.displayNumber} في ${mergedCallData.agency.nameAr || mergedCallData.agency.name}.`
+            : `دورك الآن! التذكرة ${mergedCallData.displayNumber} في ${mergedCallData.agency.nameAr || mergedCallData.agency.name}.`,
+        }).catch(() => { /* push is best-effort — the in-app row already exists */ })
+      }
     }
     emitKioskEvent(agencyId, { action: 'call-next', displayNumber: mergedCallData.displayNumber, counterId })
 
@@ -247,6 +186,14 @@ app.put('/pause', async (c) => {
 
     const { agencyId } = validation.data
     const user = await requireAgencyAccess(c, agencyId)
+
+    // r23 — pause IS queue management: same counter-CONTROL gate as call-next
+    // (owner included; SUPER_ADMIN excepted). Parity with the canonical
+    // /api/agency/queue/toggle-pause.
+    const queueGate = await enforceQueueStaffAuthority(user, agencyId)
+    if (!queueGate.ok) {
+      return c.json(queueGateErrorBody(queueGate), queueGate.status as any)
+    }
 
     const queueSettings = await db.queueSettings.findFirst({ where: { agencyId }, orderBy: { updatedAt: 'desc' } })
     if (!queueSettings) return c.json({ success: false, error: 'No queue settings found for this agency' }, 404)
@@ -282,6 +229,12 @@ app.put('/resume', async (c) => {
 
     const { agencyId } = validation.data
     const user = await requireAgencyAccess(c, agencyId)
+
+    // r23 — resume IS queue management: same counter-CONTROL gate as pause.
+    const queueGate = await enforceQueueStaffAuthority(user, agencyId)
+    if (!queueGate.ok) {
+      return c.json(queueGateErrorBody(queueGate), queueGate.status as any)
+    }
 
     const queueSettings = await db.queueSettings.findFirst({ where: { agencyId }, orderBy: { updatedAt: 'desc' } })
     if (!queueSettings) return c.json({ success: false, error: 'No queue settings found for this agency' }, 404)
@@ -367,14 +320,19 @@ app.get('/status', async (c) => {
     const isPaused = queueSettings?.isPaused || false
 
     // Get ALL active counters for the agency (across all branches)
-    // Phantom Counter Protection: only count counters with recent activity (≤45 min)
+    // Phantom Counter Protection: only count counters with recent activity
+    // (≤45 min). r21-7 — "active" = CONTROL heartbeat within 45min (the new
+    // control model) OR the legacy staffId/updatedAt occupation mirror, so
+    // pre-r21-7 occupation data keeps counting.
     const fortyFiveMinsAgo = new Date(Date.now() - 45 * 60 * 1000)
     const allActiveCounters = await db.counter.findMany({
       where: {
         isActive: true,
-        staffId: { not: null },
         branch: { agencyId, isActive: true },
-        updatedAt: { gte: fortyFiveMinsAgo },
+        OR: [
+          { controlHeartbeatAt: { gte: fortyFiveMinsAgo } },
+          { staffId: { not: null }, updatedAt: { gte: fortyFiveMinsAgo } },
+        ],
       },
       select: { id: true, branch: { select: { agencyId: true } } },
     })
@@ -444,7 +402,7 @@ app.get('/status', async (c) => {
 
     const serviceIds = [...waitingByService.keys()]
     const services = serviceIds.length > 0
-      ? await db.service.findMany({ where: { id: { in: serviceIds } }, select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } })
+      ? await db.service.findMany({ where: { id: { in: serviceIds } }, select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true, durationMinutes: true } })
       : []
 
     const serviceMap = new Map(services.map((s) => [s.id, s]))
@@ -455,6 +413,9 @@ app.get('/status', async (c) => {
         completedByService.get(serviceId) || [],
         agency.averageServiceTime,
       )
+      // P2-10 — owner-set per-service duration overrides the 7-day history.
+      const svcDuration = serviceMap.get(serviceId)?.durationMinutes
+      if (svcDuration != null && svcDuration > 0) serviceEffective.avgMinutes = svcDuration
 
       // Phase 3: Use service-specific counter count instead of total agency counters
       const serviceCounters = countersPerService.get(serviceId) || Math.max(1, Math.ceil(totalActiveCounters / Math.max(1, waitingByService.size)))

@@ -68,7 +68,15 @@ const DeviceTvBoard = lazyNamed(() => import('@/components/devices/device-tv-boa
 // Admin Views
 const AdminDashboard = lazyNamed(() => import('@/components/admin/admin-dashboard'), 'AdminDashboard');
 const AdminTransactions = lazyNamed(() => import('@/components/admin/admin-transactions'), 'AdminTransactions');
-const AdminAgencies = lazyNamed(() => import('@/components/admin/admin-agencies'), 'AdminAgencies');
+// Task 5-a: "Agencies Management" group — the hub + section-shell wrappers
+// for the two legacy panels (back button) + the two new category pages.
+// The legacy view names/hashes are unchanged; only the render path gained
+// the shell.
+const AdminAgenciesManagement = lazyNamed(() => import('@/components/admin/admin-agencies-management'), 'AdminAgenciesManagement');
+const AdminAgenciesManagementAgenciesPage = lazyNamed(() => import('@/components/admin/admin-agencies-management-agencies-page'), 'AdminAgenciesManagementAgenciesPage');
+const AdminAgenciesManagementServicesPage = lazyNamed(() => import('@/components/admin/admin-agencies-management-services-page'), 'AdminAgenciesManagementServicesPage');
+const AdminCategoryManager = lazyNamed(() => import('@/components/admin/admin-category-manager'), 'AdminCategoryManager');
+const AdminCategoryLanguage = lazyNamed(() => import('@/components/admin/admin-category-language'), 'AdminCategoryLanguage');
 const AdminAuditLogs = lazyNamed(() => import('@/components/admin/admin-audit-logs'), 'AdminAuditLogs');
 const AdminUsers = lazyNamed(() => import('@/components/admin/admin-users'), 'AdminUsers');
 const AdminAnalytics = lazyNamed(() => import('@/components/admin/admin-analytics'), 'AdminAnalytics');
@@ -82,6 +90,8 @@ const AdminSettingsProvidersPage = lazyNamed(() => import('@/components/admin/ad
 const AdminSettingsMapsPage = lazyNamed(() => import('@/components/admin/admin-settings-maps-page'), 'AdminSettingsMapsPage');
 const AdminSettingsPaymentsPage = lazyNamed(() => import('@/components/admin/admin-payment-gateway-settings'), 'AdminPaymentGatewaySettings');
 const AdminSettingsFinancialPage = lazyNamed(() => import('@/components/admin/admin-settings-financial-page'), 'AdminSettingsFinancialPage');
+// r21-6 — unified Payment Center (Gateways + Transfers + Reconciliation).
+const AdminPaymentSettingsPage = lazyNamed(() => import('@/components/admin/admin-payment-settings'), 'AdminPaymentSettings');
 const AdminSettingsSecurityPage = lazyNamed(() => import('@/components/admin/admin-settings-security-page'), 'AdminSettingsSecurityPage');
 const AdminSettingsFaqPage = lazyNamed(() => import('@/components/admin/admin-settings-faq-page'), 'AdminSettingsFaqPage');
 const AdminSettingsConfigPage = lazyNamed(() => import('@/components/admin/admin-settings-config-page'), 'AdminSettingsConfigPage');
@@ -101,6 +111,13 @@ const AdminDbManager = lazyNamed(() => import('@/components/admin/admin-db-manag
 // Storage Manager — SUPER_ADMIN on-disk file store console (Task 2): disk
 // usage, per-category breakdown, drill-down browser, orphan/missing cleanup.
 const AdminStorageManager = lazyNamed(() => import('@/components/admin/admin-storage-manager'), 'AdminStorageManager');
+// Logs Manager — SUPER_ADMIN realtime log analysis console (logs-2 / 0.6.19):
+// error fingerprint index + severity + daily per-platform JSON + raw vault.
+// Moved OUT of the Storage Manager into its own Database & Storage page.
+const AdminLogsManager = lazyNamed(() => import('@/components/admin/admin-logs-manager'), 'AdminLogsManager');
+// Backup Manager — SUPER_ADMIN snapshots / auto-backups / external targets
+// (download, restore, migrate to S3-R2/Azure/D1/external Postgres).
+const AdminBackupManager = lazyNamed(() => import('@/components/admin/admin-backup-manager'), 'AdminBackupManager');
 
 // Shared (eagerly imported — lightweight)
 import { AgencyAuthorityGate } from '@/components/agency/agency-authority-gate';
@@ -117,6 +134,7 @@ import { PostLoginSyncGate } from '@/components/shared/post-login-sync-gate';
 // Task 81 — biometric app-open lock + remember-me session keeper.
 import { BiometricAppLock } from '@/components/shared/biometric-app-lock';
 import { startSessionKeeper, SESSION_EXPIRED_EVENT } from '@/lib/session-keeper';
+import { initPaymentDeepLinkRouting } from '@/lib/payment-deep-link';
 import { usePlatform } from '@/hooks/use-platform';
 import { Button } from '@/components/ui/button';
 
@@ -181,12 +199,20 @@ function warmRoleViews(role: string): void {
       () => import('@/components/admin/admin-analytics'),
       () => import('@/components/admin/admin-tickets'),
       () => import('@/components/admin/admin-settings'),
+      // Task 5-a: Agencies Management group chunks (hub + wrappers + pages).
+      () => import('@/components/admin/admin-agencies-management'),
+      () => import('@/components/admin/admin-agencies-management-agencies-page'),
+      () => import('@/components/admin/admin-agencies-management-services-page'),
+      () => import('@/components/admin/admin-category-manager'),
+      () => import('@/components/admin/admin-category-language'),
       // Task 5: Platform Settings subsection pages (one chunk each).
       () => import('@/components/admin/admin-settings-vps-page'),
       () => import('@/components/admin/admin-settings-providers-page'),
       () => import('@/components/admin/admin-settings-maps-page'),
       () => import('@/components/admin/admin-payment-gateway-settings'),
       () => import('@/components/admin/admin-settings-financial-page'),
+      // r21-6 — unified Payment Center chunk warmed alongside the settings pages.
+      () => import('@/components/admin/admin-payment-settings'),
       () => import('@/components/admin/admin-settings-security-page'),
       () => import('@/components/admin/admin-settings-faq-page'),
       () => import('@/components/admin/admin-settings-config-page'),
@@ -196,6 +222,8 @@ function warmRoleViews(role: string): void {
       () => import('@/components/admin/admin-db-manager'),
       // Task 2: Storage Manager — same admin group, warmed alongside db.
       () => import('@/components/admin/admin-storage-manager'),
+      // logs-2 (0.6.19): Logs Manager warmed alongside the other storage pages.
+      () => import('@/components/admin/admin-logs-manager'),
     ];
   }
   warmViews([...roleViews, ...shared]);
@@ -332,8 +360,22 @@ const ViewRouter = memo(function ViewRouter() {
               return <AdminDashboard />;
             case 'admin-transactions':
               return <AdminTransactions />;
+            // Task 5-a: Agencies Management group. 'admin-agencies' and
+            // 'admin-services-management' keep their view names + hashes but
+            // now render through the section-shell wrappers (back button to
+            // the group hub); 'admin-agencies-management' is the hub itself.
+            case 'admin-agencies-management':
+              return <AdminAgenciesManagement />;
             case 'admin-agencies':
-              return <AdminAgencies />;
+              return <AdminAgenciesManagementAgenciesPage />;
+            case 'admin-services-management':
+              return <AdminAgenciesManagementServicesPage />;
+            case 'admin-category-manager':
+              // Task 5-a: agency categories + specialties manager.
+              return <AdminCategoryManager />;
+            case 'admin-category-language':
+              // Task 5-a: per-category terminology overrides (ar/en/fr).
+              return <AdminCategoryLanguage />;
             case 'admin-audit':
               return <AdminAuditLogs />;
             case 'admin-users':
@@ -359,6 +401,9 @@ const ViewRouter = memo(function ViewRouter() {
               return <AdminSettingsPaymentsPage />;
             case 'admin-settings-financial':
               return <AdminSettingsFinancialPage />;
+            // r21-6 — unified Payment Center.
+            case 'admin-payment-settings':
+              return <AdminPaymentSettingsPage />;
             case 'admin-settings-security':
               return <AdminSettingsSecurityPage />;
             case 'admin-settings-faq':
@@ -389,6 +434,13 @@ const ViewRouter = memo(function ViewRouter() {
             // (Task 2), same padding/fetch conventions as admin-db.
             case 'admin-storage':
               return <AdminStorageManager />;
+            // Logs Manager — realtime log analysis console (logs-2 / 0.6.19),
+            // moved out of the Storage Manager into its own page.
+            case 'admin-logs-manager':
+              return <AdminLogsManager />;
+            // Backup Manager — snapshots, auto-backups, external targets.
+            case 'admin-backups':
+              return <AdminBackupManager />;
             // Chargily payment result — NO role gate: renders for every role
             // and self-handles the logged-out case (generic result + login
             // CTA, no polling when unauthenticated).
@@ -448,6 +500,22 @@ export default function Home() {
   }, []);
  const { t, lang } = useLanguage();
   const { platform } = usePlatform();
+
+  // ── Security-0.6.13 — native apps NEVER hold an admin session ──────────
+  // The cloud rejects admin logins from the mobile/desktop apps and denies
+  // the admin API to their minted sessions (platform claim in the JWT).
+  // This boot guard revokes any admin session minted BEFORE that fix that
+  // is still persisted on a native shell (web-minted token carried over).
+  // NOTE: declared AFTER usePlatform/useLanguage — the dep array reads
+  // platform during render, so this effect must sit below those consts.
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (!(platform.isElectron || platform.isCapacitor)) return;
+    if (user?.role !== 'SUPER_ADMIN') return;
+    console.warn('[SECURITY] Admin session on a native app — revoking (mobile/desktop have no admin access)');
+    try { toast.error(t('adminLoginNotAllowed')); } catch { /* toast is cosmetic */ }
+    logout();
+  }, [isAuthenticated, platform.isElectron, platform.isCapacitor, user?.role, logout]);
 
   // Task 81 — remember-me session policy: while a remember-me session is
   // active the keeper refreshes the token during use and enforces the 3-day
@@ -637,12 +705,20 @@ export default function Home() {
     }).catch(() => {});
   }, [isAuthenticated, user?.role]);
 
+  // blasti:// deep links (Capacitor Android) — the hosted Chargily checkout
+  // bounces the payer's browser back into the app with
+  // blasti://payment/result; this listener routes it to the in-app result
+  // view (no-op outside the native shell). Registered once.
+  useEffect(() => initPaymentDeepLinkRouting(), []);
+
   // Chargily (EDAHABIA / CIB) payment return — when the customer comes back
   // from the hosted checkout (focus/visible again, or a fresh app load onto
   // the gateway's /#/payment/result?status=… redirect), route the app to the
   // payment-result view so the settlement poll can run. Only while a pending
   // checkout exists and the caller is logged in; the view itself clears the
-  // localStorage marker once the payment settles.
+  // localStorage marker once the payment settles. Re-runs when the user id
+  // changes so a cold-start deep link / pending checkout routes right after
+  // auth finishes booting.
   useEffect(() => {
     const checkPendingCheckout = () => {
       try {
@@ -666,7 +742,7 @@ export default function Home() {
       window.removeEventListener('focus', checkPendingCheckout);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, []);
+  }, [user?.id]);
 
   // Fetch global announcements (cloud-only endpoint — skip when cloud is known-down)
   useEffect(() => {
@@ -749,6 +825,8 @@ export default function Home() {
     'admin-settings-maps': t('settingsMapsSub') + ' - BLASTI',
     'admin-settings-payments': t('settingsPaymentsGateway') + ' - BLASTI',
     'admin-settings-financial': t('settingsFinancialEngine') + ' - BLASTI',
+    // r21-6 — unified Payment Center.
+    'admin-payment-settings': t('settingsPaymentCenter') + ' - BLASTI',
     'admin-settings-security': t('settingsSecuritySub') + ' - BLASTI',
     'admin-settings-faq': t('settingsFaqSub') + ' - BLASTI',
     'admin-settings-config': t('settingsSystemConfig') + ' - BLASTI',
@@ -758,6 +836,8 @@ export default function Home() {
     'admin-db': t('dbManagerTitle') + ' - BLASTI',
     // Task 2: Storage Manager page title.
     'admin-storage': t('storageManagerTitle') + ' - BLASTI',
+    // logs-2 (0.6.19): Logs Manager page title.
+    'admin-logs-manager': t('logsManagerTitle') + ' - BLASTI',
     'payment-result': t('paymentResultTitle') + ' - BLASTI',
     };
     document.title = titles[currentView] || 'BLASTI';
@@ -1095,6 +1175,7 @@ export default function Home() {
         visible={showTurnAlert}
         ticketNumber={turnAlertData?.ticketNumber || ''}
         agencyName={turnAlertData?.agencyName || ''}
+        counterName={turnAlertData?.counterName}
         onDismiss={dismissTurnAlert}
       />
 

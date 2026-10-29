@@ -14,11 +14,13 @@
 import { Hono } from 'hono'
 import { setCookie, deleteCookie } from 'hono/cookie'
 import { db } from '@blasti/db'
-import { createSessionToken, getSessionUser, requireAuth, AuthError, REMEMBER_ME_MAX_AGE, SESSION_MAX_AGE, type SessionUser } from '../lib/auth'
+import { createSessionToken, getSessionUser, requireAuth, AuthError, REMEMBER_ME_MAX_AGE, resolveClientPlatform, assertPlatformLoginAllowed, type ClientPlatform, type SessionUser } from '../lib/auth'
 import { verifyPassword, hashPassword } from '../lib/password'
 import crypto from 'crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import { validateBody, loginSchema, registerSchema, forgotPasswordSchema, resetPasswordSchema } from '../lib/validations'
+// UID-0.6.14 — immutable per-user identifier ({TYPE}-{WILAYA}-{SEQ}).
+import { assignUidToUser } from '../lib/uid-generator'
 import { normalizeRecordFileUrls } from '../lib/file-url'
 import {
   resolveVerificationStatus,
@@ -129,12 +131,15 @@ function requireValidIp(c: import('hono').Context): string {
 /**
  * Set the NextAuth-compatible session cookie on the Hono response.
  * Creates a signed JWT and stores it as an httpOnly cookie.
+ * Security-0.6.13 — `platform` (the minting client's platform) is baked into
+ * the token so requireAdmin can deny admin-API access to app-minted sessions.
  */
 async function setSessionCookie(
   c: import('hono').Context,
   user: SessionUser,
+  platform: ClientPlatform = 'web',
 ): Promise<void> {
-  const token = await createSessionToken(user)
+  const token = await createSessionToken(user, SESSION_MAX_AGE, platform)
   const secure = isSecureCookie()
   const cookieName = getCookieName()
 
@@ -247,6 +252,9 @@ app.post('/login', async (c) => {
         phoneNumber: true,
         emailVerified: true,
         phoneVerified: true,
+        // UID-0.6.14 — the immutable account identifier rides the login
+        // response (native shells store it with the session).
+        uid: true,
         createdAt: true,
       },
     })
@@ -304,6 +312,15 @@ app.post('/login', async (c) => {
         )
       }
     }
+
+    // ── Security-0.6.13: role×platform login matrix ────────────────────
+    // The mobile app (Capacitor) serves CUSTOMER + AGENCY sessions only; the
+    // desktop console (Electron) is AGENCY-ONLY. SUPER_ADMIN sessions can
+    // ONLY be minted for the plain web console — the apps must have nothing
+    // to do with the admin API. Enforced BEFORE any session is minted (and
+    // again on the admin-API side via the token's platform claim).
+    const clientPlatform = resolveClientPlatform(c)
+    assertPlatformLoginAllowed(clientPlatform, user.role)
 
     // ── Task 22: Email/phone verification gate ─────────────────────────
     // Unverified accounts (registered after the enforcement date) get OTPs
@@ -393,7 +410,7 @@ app.post('/login', async (c) => {
     // POST /auth/refresh (which re-issues 3-day tokens), but the total
     // lifetime never exceeds 3 days from login.
     const sessionMaxAge = rememberMe ? REMEMBER_ME_MAX_AGE : SESSION_MAX_AGE
-    const token = await createSessionToken(sessionUser, sessionMaxAge)
+    const token = await createSessionToken(sessionUser, sessionMaxAge, clientPlatform)
     await setCookie(c, getCookieName(), token, {
       httpOnly: true,
       secure: isSecureCookie(),
@@ -410,6 +427,12 @@ app.post('/login', async (c) => {
   } catch (error: unknown) {
     if (error instanceof Error && error.message === 'INVALID_IP') {
       return c.json({ success: false, error: 'Unable to identify client' }, 400)
+    }
+    // Security-0.6.13 — AuthError carries its own status/message (platform
+    // login-matrix rejections like admin-on-mobile): surface it faithfully
+    // instead of masking it behind a generic 500.
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
     }
     if (error instanceof RateLimitError || error instanceof IpBlockedError) {
       return rateLimitResponse(error)(c)
@@ -450,7 +473,11 @@ app.post('/refresh', async (c) => {
     }
 
     const maxAge = body.rememberMe ? REMEMBER_ME_MAX_AGE : SESSION_MAX_AGE
-    const token = await createSessionToken(user, maxAge)
+    // Security-0.6.13 — re-assert the platform policy on refresh: a session
+    // being kept alive from an app whose platform forbids its role dies here.
+    const refreshPlatform = resolveClientPlatform(c)
+    assertPlatformLoginAllowed(refreshPlatform, user.role)
+    const token = await createSessionToken(user, maxAge, refreshPlatform)
 
     await setCookie(c, getCookieName(), token, {
       httpOnly: true,
@@ -466,7 +493,7 @@ app.post('/refresh', async (c) => {
       return c.json({ success: false, error: 'Unable to identify client' }, 400)
     }
     if (error instanceof AuthError) {
-      return c.json({ success: false, error: error.message }, error.statusCode)
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
     }
     if (error instanceof RateLimitError || error instanceof IpBlockedError) {
       return rateLimitResponse(error)(c)
@@ -626,6 +653,13 @@ app.post('/register', async (c) => {
       }
     }
 
+    // UID-0.6.14 — the immutable UID is assigned ONCE, at account creation.
+    // SUPER_ADMIN never gets one; owners get their agency's wilaya as the
+    // fallback when their own profile wilaya is unset.
+    const assignedUid = isSuperAdmin
+      ? ''
+      : await assignUidToUser(user.id, role === 'AGENCY_OWNER' ? (agencyId ? (await db.agency.findUnique({ where: { id: agencyId }, select: { wilaya: true } }))?.wilaya ?? null : null) : null)
+
     // ── Task 31-A: SUPER_ADMIN registers WITHOUT verification ──────────
     // Platform admins must not wait for email/phone OTP: no issueAllPending
     // and no createVerificationToken are called (zero OTP rows), and a full
@@ -642,8 +676,12 @@ app.post('/register', async (c) => {
         avatarUrl: user.avatarUrl,
         agencyId: agencyId ?? null,
       }
-      const token = await createSessionToken(sessionUser)
-      await setSessionCookie(c, sessionUser)
+      // Security-0.6.13 — an admin session can only be minted for the web
+      // console; the mobile/desktop apps never receive one.
+      const registerPlatform = resolveClientPlatform(c)
+      assertPlatformLoginAllowed(registerPlatform, sessionUser.role)
+      const token = await createSessionToken(sessionUser, SESSION_MAX_AGE, registerPlatform)
+      await setSessionCookie(c, sessionUser, registerPlatform)
 
       await db.auditLog.create({
         data: { userId: user.id, action: 'REGISTERED', entityType: 'USER', entityId: user.id },
@@ -716,6 +754,12 @@ app.post('/register', async (c) => {
     if (error instanceof RateLimitError || error instanceof IpBlockedError) {
       return rateLimitResponse(error)(c)
     }
+    // Security-0.6.13 — AuthError carries its own status/message (platform
+    // login-matrix rejections, expired sessions): surface it faithfully
+    // instead of masking it behind a generic 500.
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
+    }
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }
@@ -766,6 +810,8 @@ app.post('/verify', async (c) => {
         id: true, username: true, fullName: true, role: true, language: true,
         avatarUrl: true, email: true, phoneNumber: true,
         emailVerified: true, phoneVerified: true, createdAt: true, isActive: true,
+        // UID-0.6.14 — assigned at register; rides the session response.
+        uid: true,
       },
     })
     if (!user || !user.isActive) {
@@ -834,8 +880,12 @@ app.post('/verify', async (c) => {
       avatarUrl: user.avatarUrl,
       agencyId: agencyId ?? null,
     }
-    const token = await createSessionToken(sessionUser)
-    await setSessionCookie(c, sessionUser)
+    // Security-0.6.13 — platform policy applies at verification too: the
+    // freshly-verified session respects the role×platform matrix.
+    const verifyPlatform = resolveClientPlatform(c)
+    assertPlatformLoginAllowed(verifyPlatform, sessionUser.role)
+    const token = await createSessionToken(sessionUser, SESSION_MAX_AGE, verifyPlatform)
+    await setSessionCookie(c, sessionUser, verifyPlatform)
 
     await db.auditLog.create({
       data: { userId: user.id, action: 'ACCOUNT_VERIFIED', entityType: 'USER', entityId: user.id },
@@ -845,7 +895,7 @@ app.post('/verify', async (c) => {
       success: true,
       verified: true,
       status: { emailVerified, phoneVerified },
-      user: { ...sessionUser, email: refreshed?.email, phoneNumber: refreshed?.phoneNumber },
+      user: { ...sessionUser, uid: user.uid, email: refreshed?.email, phoneNumber: refreshed?.phoneNumber },
       token,
       results,
     })
@@ -855,6 +905,12 @@ app.post('/verify', async (c) => {
     }
     if (error instanceof RateLimitError || error instanceof IpBlockedError) {
       return rateLimitResponse(error)(c)
+    }
+    // Security-0.6.13 — AuthError carries its own status/message (platform
+    // login-matrix rejections, expired sessions): surface it faithfully
+    // instead of masking it behind a generic 500.
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
     }
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
@@ -922,6 +978,12 @@ app.post('/resend-verification', async (c) => {
     if (error instanceof RateLimitError || error instanceof IpBlockedError) {
       return rateLimitResponse(error)(c)
     }
+    // Security-0.6.13 — AuthError carries its own status/message (platform
+    // login-matrix rejections, expired sessions): surface it faithfully
+    // instead of masking it behind a generic 500.
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
+    }
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }
@@ -968,6 +1030,12 @@ app.post('/verification-status', async (c) => {
       },
     })
   } catch (error: unknown) {
+    // Security-0.6.13 — AuthError carries its own status/message (platform
+    // login-matrix rejections, expired sessions): surface it faithfully
+    // instead of masking it behind a generic 500.
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
+    }
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }
@@ -984,6 +1052,12 @@ app.post('/logout', async (c) => {
     clearSessionCookie(c)
     return c.json({ success: true, message: 'Logged out successfully' })
   } catch (error: unknown) {
+    // Security-0.6.13 — AuthError carries its own status/message (platform
+    // login-matrix rejections, expired sessions): surface it faithfully
+    // instead of masking it behind a generic 500.
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
+    }
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }
@@ -1078,8 +1152,14 @@ app.post('/refresh-session', async (c) => {
       avatarUrl: dbUser.avatarUrl ?? null,
       agencyId,
     }
-    const token = await createSessionToken(freshUser)
-    return c.json({ success: true, token, user: freshUser })
+    // Security-0.6.13 — the cookie-heal re-mint re-asserts the platform
+    // policy (a customer session healing inside the desktop app dies here).
+    const healPlatform = resolveClientPlatform(c)
+    assertPlatformLoginAllowed(healPlatform, freshUser.role)
+    const token = await createSessionToken(freshUser, SESSION_MAX_AGE, healPlatform)
+    // UID-0.6.14 — the immutable identifier rides every session (re)issue so
+    // a healed session never drops it.
+    return c.json({ success: true, token, user: { ...freshUser, uid: dbUser.uid ?? null } })
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Internal server error'
     console.error('[AUTH] refresh-session error:', error)
@@ -1097,6 +1177,12 @@ app.get('/logout', async (c) => {
     clearSessionCookie(c)
     return c.json({ success: true, message: 'Logged out successfully' })
   } catch (error: unknown) {
+    // Security-0.6.13 — AuthError carries its own status/message (platform
+    // login-matrix rejections, expired sessions): surface it faithfully
+    // instead of masking it behind a generic 500.
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
+    }
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }
@@ -1220,6 +1306,12 @@ app.post('/forgot-password', async (c) => {
     if (error instanceof RateLimitError || error instanceof IpBlockedError) {
       return rateLimitResponse(error)(c)
     }
+    // Security-0.6.13 — AuthError carries its own status/message (platform
+    // login-matrix rejections, expired sessions): surface it faithfully
+    // instead of masking it behind a generic 500.
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
+    }
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }
@@ -1291,6 +1383,12 @@ app.post('/reset-password', async (c) => {
       message: 'Password has been reset successfully',
     })
   } catch (error: unknown) {
+    // Security-0.6.13 — AuthError carries its own status/message (platform
+    // login-matrix rejections, expired sessions): surface it faithfully
+    // instead of masking it behind a generic 500.
+    if (error instanceof AuthError) {
+      return c.json({ success: false, error: error.message }, error.statusCode as any)
+    }
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }

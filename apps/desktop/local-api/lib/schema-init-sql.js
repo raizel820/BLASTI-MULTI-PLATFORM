@@ -15,6 +15,7 @@ CREATE TABLE "User" (
     "email" TEXT,
     "phoneNumber" TEXT,
     "shortAppId" TEXT,
+    "uid" TEXT,
     "passwordHash" TEXT,
     "role" TEXT NOT NULL DEFAULT 'CUSTOMER',
     "language" TEXT NOT NULL DEFAULT 'ar',
@@ -160,6 +161,7 @@ CREATE TABLE "Agency" (
     "locationUpdatedAt" DATETIME,
     "googlePlaceId" TEXT,
     "providerLocationId" TEXT,
+    "specialtyIds" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
     "ownerId" TEXT NOT NULL,
@@ -342,6 +344,9 @@ CREATE TABLE "Service" (
     "description" TEXT,
     "prefix" TEXT NOT NULL DEFAULT 'A',
     "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "durationMinutes" INTEGER,
+    "price" INTEGER,
+    "priority" INTEGER NOT NULL DEFAULT 0,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
     CONSTRAINT "Service_agencyId_fkey" FOREIGN KEY ("agencyId") REFERENCES "Agency" ("id") ON DELETE RESTRICT ON UPDATE CASCADE
@@ -609,11 +614,14 @@ CREATE TABLE "FAQ" (
 -- CreateTable
 CREATE TABLE "AgencyCategory" (
     "id" TEXT NOT NULL PRIMARY KEY,
+    "slug" TEXT NOT NULL,
     "name" TEXT NOT NULL,
     "nameFr" TEXT,
     "nameAr" TEXT,
     "icon" TEXT,
     "isCustom" BOOLEAN NOT NULL DEFAULT true,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "sortOrder" INTEGER NOT NULL DEFAULT 0,
     "createdBy" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL
@@ -631,6 +639,12 @@ CREATE TABLE "PaymentSettings" (
     "bankAccount" TEXT NOT NULL DEFAULT '',
     "bankRib" TEXT NOT NULL DEFAULT '',
     "ewalletNumber" TEXT NOT NULL DEFAULT '',
+    "ccpHolderName" TEXT,
+    "ccpAddress" TEXT,
+    "bankHolderName" TEXT,
+    "bankAddress" TEXT,
+    "baridiMobEnabled" BOOLEAN NOT NULL DEFAULT false,
+    "baridiMobNumber" TEXT,
     "updatedAt" DATETIME NOT NULL,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -672,6 +686,10 @@ CREATE TABLE "Counter" (
     "branchId" TEXT NOT NULL,
     "staffId" TEXT,
     "occupiedAt" DATETIME,
+    "controlledByUserId" TEXT,
+    "controlledByStaffId" TEXT,
+    "controlClaimedAt" DATETIME,
+    "controlHeartbeatAt" DATETIME,
     "currentReservationId" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
@@ -679,6 +697,41 @@ CREATE TABLE "Counter" (
     CONSTRAINT "Counter_staffId_fkey" FOREIGN KEY ("staffId") REFERENCES "AgencyStaff" ("id") ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT "Counter_currentReservationId_fkey" FOREIGN KEY ("currentReservationId") REFERENCES "Reservation" ("id") ON DELETE SET NULL ON UPDATE CASCADE
 );
+
+-- CreateTable (r21-8 — counter control REQUEST: PENDING for 60s, approved /
+-- rejected by the holder, auto-transferred or EXPIRED by the sweeper)
+CREATE TABLE "CounterControlRequest" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "counterId" TEXT NOT NULL,
+    "agencyId" TEXT NOT NULL,
+    "fromUserId" TEXT NOT NULL,
+    "fromStaffId" TEXT,
+    "requestedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "expiresAt" DATETIME NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'PENDING',
+    "resolvedByUserId" TEXT,
+    "resolvedAt" DATETIME,
+    CONSTRAINT "CounterControlRequest_counterId_fkey" FOREIGN KEY ("counterId") REFERENCES "Counter" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT "CounterControlRequest_agencyId_fkey" FOREIGN KEY ("agencyId") REFERENCES "Agency" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- CreateIndex (r21-8)
+CREATE INDEX "CounterControlRequest_counterId_idx" ON "CounterControlRequest"("counterId");
+CREATE INDEX "CounterControlRequest_agencyId_idx" ON "CounterControlRequest"("agencyId");
+CREATE INDEX "CounterControlRequest_status_expiresAt_idx" ON "CounterControlRequest"("status", "expiresAt");
+
+-- CreateTable (P2-10 — Counter↔Service binding)
+CREATE TABLE "CounterService" (
+    "counterId" TEXT NOT NULL,
+    "serviceId" TEXT NOT NULL,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "CounterService_pkey" PRIMARY KEY ("counterId", "serviceId"),
+    CONSTRAINT "CounterService_counterId_fkey" FOREIGN KEY ("counterId") REFERENCES "Counter" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT "CounterService_serviceId_fkey" FOREIGN KEY ("serviceId") REFERENCES "Service" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+-- CreateIndex
+CREATE INDEX "CounterService_serviceId_idx" ON "CounterService"("serviceId");
 
 -- CreateTable
 CREATE TABLE "DeviceRegistration" (
@@ -1025,6 +1078,9 @@ CREATE UNIQUE INDEX "User_phoneNumber_key" ON "User"("phoneNumber");
 CREATE UNIQUE INDEX "User_shortAppId_key" ON "User"("shortAppId");
 
 -- CreateIndex
+CREATE UNIQUE INDEX "User_uid_key" ON "User"("uid");
+
+-- CreateIndex
 CREATE INDEX "VerificationCode_userId_purpose_idx" ON "VerificationCode"("userId", "purpose");
 
 -- CreateIndex
@@ -1117,6 +1173,7 @@ CREATE INDEX "Review_agencyId_branchId_idx" ON "Review"("agencyId", "branchId");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "AgencyCategory_name_key" ON "AgencyCategory"("name");
+CREATE UNIQUE INDEX "AgencyCategory_slug_key" ON "AgencyCategory"("slug");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "Counter_currentReservationId_key" ON "Counter"("currentReservationId");
@@ -1351,6 +1408,9 @@ CREATE UNIQUE INDEX "User_phoneNumber_key" ON "User"("phoneNumber");
 
 -- CreateIndex
 CREATE UNIQUE INDEX "User_shortAppId_key" ON "User"("shortAppId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "User_uid_key" ON "User"("uid");
 
 -- CreateIndex
 CREATE INDEX "LocalDeviceCredential_userId_idx" ON "LocalDeviceCredential"("userId");

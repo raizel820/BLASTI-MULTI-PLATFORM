@@ -1,8 +1,10 @@
+import { timingSafeEqual } from 'node:crypto'
 import { Hono } from 'hono'
 import { db } from '@blasti/db'
 import { normalizeDzPhone, getSmsTemplate, sendSms } from '../lib/sms-service'
 import { recordSyncChange } from '../lib/sync-helpers'
 import { emitNotificationEvent } from '../lib/realtime-emit'
+import { sendViaPushNotification } from '../lib/notification-router'
 import { getCheckoutStatus, expireCheckout } from '../lib/chargily-service'
 import {
   fulfillCheckoutPaid,
@@ -15,15 +17,37 @@ const app = new Hono()
 const NO_SHOW_SKIP_MINUTES = 3
 const SMS_FALLBACK_MINUTES = 10
 
-// Helper: verify cron secret
+// P0-3: cron endpoints are fail-CLOSED — when CRON_SECRET is unset in a
+// production environment the routes refuse to run (previously they were wide
+// open). Comparison is constant-time.
 function verifyCronSecret(c: import('hono').Context): boolean {
   const cronSecret = process.env.CRON_SECRET
-  if (cronSecret) {
-    const authHeader = c.req.header('Authorization')
-    if (authHeader !== `Bearer ${cronSecret}`) return false
+  if (!cronSecret) {
+    // Allow ONLY local development (NODE_ENV !== 'production') to run crons
+    // without a secret; production MUST set CRON_SECRET.
+    if (process.env.NODE_ENV === 'production') {
+      console.error('[cron] CRON_SECRET is not set — cron endpoints are DISABLED (fail-closed)')
+      return false
+    }
+    return true
   }
-  return true
+  const authHeader = c.req.header('Authorization') || ''
+  const expected = `Bearer ${cronSecret}`
+  return safeEqual(authHeader, expected)
 }
+
+// P0-3: constant-time string comparison for secrets (prevents timing oracles).
+function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a)
+  const bb = Buffer.from(b)
+  if (ab.length !== bb.length) {
+    // Still burn a comparison on equal-length prefixes to blur length leaks.
+    timingSafeEqual(ab.subarray(0, Math.min(ab.length, bb.length) || 1), ab.subarray(0, Math.min(ab.length, bb.length) || 1))
+    return false
+  }
+  return timingSafeEqual(ab, bb)
+}
+
 
 // GET /cron/auto-skip — Auto-skip no-show reservations
 app.get('/auto-skip', async (c) => {
@@ -122,7 +146,7 @@ app.get('/check-reminders', async (c) => {
         user: { reminderMinutes: { gt: 0 } },
       },
       include: {
-        user: { select: { id: true, reminderMinutes: true, fullName: true, language: true } },
+        user: { select: { id: true, reminderMinutes: true, fullName: true, language: true, fcmToken: true } },
         agency: { select: { id: true, name: true, nameAr: true, nameFr: true, averageServiceTime: true } },
       },
       orderBy: { queueNumber: 'asc' },
@@ -188,6 +212,25 @@ app.get('/check-reminders', async (c) => {
             userId: ev.userId,
             reservationId: reservation.id,
           }).catch(() => {})
+
+          // ── Lock-screen delivery when the app is CLOSED/backgrounded ──
+          // The socket event above only reaches a LIVE webview; the field
+          // report ("cooling turn notification is no longer showing in lock
+          // screen") is exactly the app-dead case. FCM notification message
+          // → OS tray on the blasti-turn-alert channel (high-importance,
+          // PUBLIC → lock-screen content, native swipe dismiss).
+          const fcmToken = (reservation.user as { fcmToken?: string | null }).fcmToken
+          if (fcmToken) {
+            void sendViaPushNotification(fcmToken, {
+              userId: reservation.userId!,
+              reservationId: reservation.id,
+              agencyId: reservation.agencyId,
+              type: 'ADVANCE_WARNING',
+              message: `Your ticket ${reservation.displayNumber} at ${agencyName} is coming up soon. ${ev.peopleAhead === 0 ? 'You are next!' : `Approximately ${ev.peopleAhead} ahead of you.`}`,
+              messageAr: `تذكرتك ${reservation.displayNumber} في ${agencyName} يقترب دورك قريبًا.`,
+              remainingMinutes: estimatedMinutesUntilTurn,
+            }).catch(() => { /* push is best-effort — the in-app row already exists */ })
+          }
         }
 
         remindersSent++
@@ -217,7 +260,7 @@ app.get('/check-sms-fallback', async (c) => {
       },
       include: {
         user: {
-          select: { id: true, fullName: true, phoneNumber: true, freeSmsCount: true, language: true, smsPurchases: { select: { id: true, quantity: true, price: true }, orderBy: { createdAt: 'asc' } } },
+          select: { id: true, fullName: true, phoneNumber: true, freeSmsCount: true, language: true, smsPurchases: { where: { status: 'APPROVED' }, select: { id: true, quantity: true, price: true }, orderBy: { createdAt: 'asc' } } },
         },
         agency: { select: { id: true, name: true, nameAr: true, nameFr: true, averageServiceTime: true } },
       },

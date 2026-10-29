@@ -92,12 +92,33 @@ const nextConfig: NextConfig = {
   // Mobile release overrides from apps/mobile/.env.production (see above).
   ...(Object.keys(mobileReleaseEnv).length > 0 ? { env: mobileReleaseEnv } : {}),
 
+  // logs-1 — the REAL monorepo version inlined into the client bundle so the
+  // remote logger (and any UI surface) can label log batches/web sessions
+  // with the actual release even outside the native shells (where
+  // getAppVersion() has no bridge to ask). Bumped automatically by
+  // scripts/version-set.js via package.json — never edit this by hand.
+  env: {
+    NEXT_PUBLIC_BLASTI_VERSION: JSON.parse(
+      readFileSync(resolve(__dirname, "package.json"), "utf8"),
+    ).version as string,
+  },
+
   reactStrictMode: true,
 
   // Skip type-checking during build — type errors are caught by IDE/lint CI.
   typescript: {
     ignoreBuildErrors: true,
   },
+
+  // Cap Turbopack's NATIVE heap (bytes) — the V8 --max-old-space-size cap in
+  // scripts/dev-web.cjs does not cover Turbopack's Rust-side memory, which is
+  // what actually ballooned next-server RSS past 2GB and got it OOM-killed on
+  // 4GB dev machines the moment a browser opened alongside it. 700MB keeps
+  // compilation snappy while forcing aggressive GC instead of unbounded
+  // growth. Dev-only key (builds are unaffected).
+  ...(process.env.NODE_ENV !== "production" && !isExportMode
+    ? { experimental: { turbopackMemoryLimit: 700 * 1024 * 1024 } }
+    : {}),
 
   images: {
     unoptimized: true,

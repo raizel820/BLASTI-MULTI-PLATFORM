@@ -6,11 +6,13 @@
  * The desktop app serves ONLY agencies, so it gets its own login page —
  * distinct from the consumer web login (`login-form.tsx`):
  *  - No customer/agency role tabs: the request always carries
- *    `expectedRole: 'AGENCY_OWNER'` (the cloud accepts AGENCY_OWNER,
- *    AGENCY_STAFF and SUPER_ADMIN for it and rejects CUSTOMER with 403).
- *  - A client-side guard double-checks the role: a CUSTOMER account is
- *    refused with an explicit "desktop is agency-only" message even if a
- *    local/offline path ever returned one.
+ *    `expectedRole: 'AGENCY_OWNER'` (the cloud accepts AGENCY_OWNER and
+ *    AGENCY_STAFF for it; CUSTOMER and SUPER_ADMIN are rejected with 403 —
+ *    Security-0.6.13 removed the old SUPER_ADMIN allowance: the desktop app
+ *    must have nothing to do with the admin API).
+ *  - A client-side guard double-checks the role: a CUSTOMER or SUPER_ADMIN
+ *    account is refused with an explicit "desktop is agency-only" message
+ *    even if a local/offline path ever returned one.
  *  - Agency-branded split layout sized for a desktop window, with the real
  *    BLASTI logo and bilingual (AR/EN) copy.
  *  - Identical Electron session bootstrap to the shared LoginForm:
@@ -28,6 +30,7 @@ import { useState, useCallback, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { apiFetch } from '@/lib/api-fetch'
 import { apiClient, setNativeSessionToken } from '@/lib/api-client'
+import { adoptLocalLanguagePreference } from '@/hooks/use-language'
 import { useAppStore } from '@/store/use-app-store'
 import { adoptImportedLocalSessionUser } from '@/lib/session-heal'
 import { useLanguage } from '@/hooks/use-language'
@@ -196,9 +199,15 @@ export function DesktopAgencyLogin() {
     setTimeout(() => setShakeError(false), 600)
   }, [])
 
-  /** Desktop role guard: the console is for agency accounts (+ SUPER_ADMIN). */
+  /**
+   * Desktop role guard: the console is AGENCY-ONLY (Security-0.6.13).
+   * SUPER_ADMIN was accepted here before — that is exactly the hole the
+   * security policy closes: the desktop app must have nothing to do with
+   * the admin API, so admin accounts cannot hold a desktop session (the
+   * server now rejects the same combination at the login endpoint too).
+   */
   const isAllowedDesktopRole = (role?: string | null) =>
-    role === 'AGENCY_OWNER' || role === 'AGENCY_STAFF' || role === 'SUPER_ADMIN'
+    role === 'AGENCY_OWNER' || role === 'AGENCY_STAFF'
 
   const handleLogin = async () => {
     if (!username.trim() || !password.trim()) {
@@ -244,7 +253,7 @@ export function DesktopAgencyLogin() {
         }
         setLoginSuccess(true)
         setTimeout(() => {
-          setUser(data.user)
+          setUser(adoptLocalLanguagePreference(data.user))
           if (data.token) {
             // Task 2-b (sub-task 3) — REMEMBER-ME ENFORCEMENT (desktop):
             // record the persistence mode FIRST so the store's partialize
@@ -358,7 +367,7 @@ export function DesktopAgencyLogin() {
       // Task 2-b (sub-task 3) — same remember-me enforcement as the direct
       // login path (the checkbox on the sign-in form owns the decision).
       try { setSessionPersistenceMode(rememberMe ? 'remember' : 'ephemeral') } catch { /* ignore */ }
-      setUser(result.user as any)
+      setUser(adoptLocalLanguagePreference(result.user) as any)
       setSessionToken(result.token, { rememberMe })
       // ── Electron: establish the local API session for LAN failover ──
       try {

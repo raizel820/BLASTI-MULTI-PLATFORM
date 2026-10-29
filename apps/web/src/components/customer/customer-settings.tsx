@@ -14,10 +14,14 @@
  *  - Logout: store logout() + success toast
  */
 import { apiFetch } from '@/lib/api-fetch';
+import { registerAvatarOverrideFromFile } from '@/lib/avatar-override';
+import { markLocalAvatarMutation } from '@/lib/user-store-refresh';
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
 import { useState, useEffect } from 'react';
 import { useAppStore } from '@/store/use-app-store';
+import { AccountUidChip, ManualLogUpload } from '@/components/shared/account-log-tools';
 import { useLanguage } from '@/hooks/use-language';
+import { markLocalLanguageMutation } from '@/lib/user-store-refresh';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -278,6 +282,10 @@ export function CustomerSettings() {
     setSelectedLang(langTyped);
     updateDocumentDirection(langTyped);
     if (user) {
+      // Language revert fix: stamp the mutation so a concurrent profile
+      // refresher (started before this switch) cannot merge stale 'ar' over
+      // the fresh choice — same guard the avatar flow uses.
+      markLocalLanguageMutation();
       setUser({ ...user, language: langTyped });
     }
     // Save to server
@@ -337,6 +345,12 @@ export function CustomerSettings() {
       if (res.ok) {
         const data = await res.json();
         toast.success(t('success'));
+        // Session display guarantee: register the LOCAL bytes of the picked
+        // file under the new URL so the new avatar renders instantly and a
+        // failed first fetch of the brand-new URL can never regress this
+        // session's avatar to a placeholder (mobile field report).
+        void registerAvatarOverrideFromFile(data.url, pendingAvatarFile);
+        markLocalAvatarMutation(); // shield the fresh avatar from the refresher
         if (user) setUser({ ...user, avatarUrl: data.url });
         // Persist avatarUrl to the database
         try {
@@ -467,6 +481,13 @@ export function CustomerSettings() {
                 </span>
               </div>
             </div>
+            {/* Immutable account UID — one-tap copy (logs-1/uid-0.6.14) */}
+            {user?.uid ? (
+              <div className="p-4">
+                <Label className="text-xs text-muted-foreground mb-1.5 block">{t('uid')}</Label>
+                <AccountUidChip uid={user.uid} className="w-full" />
+              </div>
+            ) : null}
             {/* Editable name */}
             <div className="p-4 space-y-1.5">
               <Label htmlFor="settings-fullname" className="text-xs text-muted-foreground">{t('fullName')}</Label>
@@ -628,6 +649,17 @@ export function CustomerSettings() {
         >
           <h2 className="text-sm font-semibold text-muted-foreground mb-2 px-1">{t('updateSettingsSection')}</h2>
           <AppUpdateSettingsCard />
+        </motion.section>
+
+        {/* ─── Diagnostics (logs-1): manual log push to the VPS vault ─── */}
+        <motion.section
+          initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.19 }}
+          aria-label={t('uploadLogsNow')}
+        >
+          <h2 className="text-sm font-semibold text-muted-foreground mb-2 px-1">{t('uploadLogsNow')}</h2>
+          <div className="rounded-2xl border border-border bg-white dark:bg-gray-900/80 shadow-sm p-4">
+            <ManualLogUpload />
+          </div>
         </motion.section>
 
         {/* ─── Security group (biometric login + password) ─── */}

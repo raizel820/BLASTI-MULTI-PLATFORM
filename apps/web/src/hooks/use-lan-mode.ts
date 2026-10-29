@@ -1,12 +1,27 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import { readSessionToken } from '@/lib/auth-storage';
+import { getDeviceId } from '@/lib/device-fingerprint';
+import {
+  clearLanAuthority,
+  getLanAuthoritySnapshot,
+  joinMaster,
+  markMasterContact,
+} from '@/lib/lan-authority-client';
+import { logEvent } from '@/lib/remote-logger';
 
 interface LanServerInfo {
   ip: string;
   port: number;
   hostname?: string;
   webPort?: number;
+  // 0.6.23 (R-21F-S2) — LAN-authority beacon fields (additive, optional).
+  role?: string;
+  term?: number;
+  specScore?: number;
+  instanceId?: string;
+  lanAuthority?: boolean;
 }
 
 // ── Global singleton state (accessible from api-client.ts without React) ──
@@ -32,6 +47,87 @@ export function getGlobalLanMode(): boolean {
 export function setGlobalLanMode(val: boolean) {
   globalIsLanMode = val;
   globalLanModeSetters.forEach(setter => setter(val));
+}
+
+// ── 0.6.23 (R-21F-S2): LAN authority join flow ──────────────────────────────────
+
+/** Caller scope read from the persisted zustand store ('blasti-app'). */
+interface StoredSessionContext {
+  agencyId: string | null;
+  branchId: string | null;
+  role: string | null;
+}
+
+/**
+ * Read the logged-in user's agency/branch/role scope for the join call.
+ * Staff branch info may live on user.branchId or user.staff.branchId —
+ * pass what exists, null otherwise (the master validates the scope itself).
+ */
+function readStoredSessionUser(): StoredSessionContext {
+  try {
+    const raw = localStorage.getItem('blasti-app');
+    if (!raw) return { agencyId: null, branchId: null, role: null };
+    const parsed = JSON.parse(raw) as { state?: { user?: Record<string, unknown> | null } } | null;
+    const user = parsed?.state?.user;
+    if (!user || typeof user !== 'object') return { agencyId: null, branchId: null, role: null };
+    const staff = (user as { staff?: { branchId?: unknown } }).staff;
+    const branchId = typeof user.branchId === 'string'
+      ? user.branchId
+      : staff && typeof staff.branchId === 'string' ? staff.branchId : null;
+    return {
+      agencyId: typeof user.agencyId === 'string' ? user.agencyId : null,
+      branchId,
+      role: typeof user.role === 'string' ? user.role : null,
+    };
+  } catch {
+    return { agencyId: null, branchId: null, role: null };
+  }
+}
+
+/**
+ * When a discovered beacon advertises `lanAuthority: true`, join that node
+ * as a follower: cloud session token + stable device fingerprint → the
+ * master mints a per-device lanToken and api-client repoints all traffic.
+ *
+ * Guard: only joins when NOT already joined to that master.instanceId.
+ * NEVER throws — LAN failures must not break discovery.
+ */
+async function attemptLanAuthorityJoin(server: LanServerInfo): Promise<void> {
+  try {
+    if (typeof window === 'undefined' || server.lanAuthority !== true) return;
+
+    // Guard: already joined to THIS master instance — just refresh contact.
+    const snap = getLanAuthoritySnapshot();
+    if (snap.active && server.instanceId && snap.master?.instanceId && snap.master.instanceId === server.instanceId) {
+      markMasterContact();
+      return;
+    }
+
+    const token = readSessionToken();
+    if (!token) {
+      logEvent('lan-join', `LAN master ${server.ip}:${server.port} discovered but no cloud session token — join deferred until login (instance ${server.instanceId ?? '?'}, term ${server.term ?? '?'})`, { ip: server.ip, port: server.port, instanceId: server.instanceId ?? null, term: server.term ?? null });
+      return;
+    }
+
+    const { agencyId, branchId, role } = readStoredSessionUser();
+    const fingerprint = await getDeviceId();
+    const outcome = await joinMaster(
+      {
+        ip: server.ip,
+        port: server.port,
+        instanceId: server.instanceId ?? null,
+        name: server.hostname ?? null,
+        term: server.term ?? null,
+      },
+      { token, agencyId, branchId, role },
+      fingerprint,
+    );
+    if (outcome.joined) {
+      logEvent('lan-discovery', `join flow complete for ${server.ip}:${server.port} — API base override now points at the LAN master`, { ip: server.ip, port: server.port, instanceId: server.instanceId ?? null });
+    }
+  } catch {
+    /* LAN join must never break discovery */
+  }
 }
 
 // ── React hook ──
@@ -69,7 +165,15 @@ export function useLanMode() {
         // and the historic 'blasti-lan' so LAN-mode validation actually works
         // (only the Electron-IPC path succeeded before this).
         if (data.service === 'blasti-lan' || data.service === 'blasti-local') {
-          return data as LanServerInfo & { name: string; version: string };
+          // 0.6.23: carry the LAN-authority fields through for the join flow.
+          return {
+            ...(data as LanServerInfo & { name: string; version: string }),
+            role: typeof data.role === 'string' ? data.role : undefined,
+            term: typeof data.term === 'number' ? data.term : undefined,
+            specScore: typeof data.specScore === 'number' ? data.specScore : undefined,
+            instanceId: typeof data.instanceId === 'string' ? data.instanceId : undefined,
+            lanAuthority: data.lanAuthority === true,
+          };
         }
       }
       return null;
@@ -102,6 +206,8 @@ export function useLanMode() {
     if (globalLanServer) {
       const cached = await healthCheck(globalLanServer.ip, globalLanServer.port);
       if (cached) {
+        // 0.6.23: if the cached node advertises LAN authority, (re)join it.
+        void attemptLanAuthorityJoin(cached);
         setIsDiscovering(false);
         return globalLanServer;
       }
@@ -116,7 +222,19 @@ export function useLanMode() {
         const ip = `${subnet}.${last}`;
         promises.push(
           healthCheck(ip).then(data => {
-            if (data) return { ip, port: data.port || 3080, hostname: data.hostname };
+            if (data) {
+              // 0.6.23: keep the LAN-authority beacon fields for the join flow.
+              return {
+                ip,
+                port: data.port || 3080,
+                hostname: data.hostname,
+                role: data.role,
+                term: data.term,
+                specScore: data.specScore,
+                instanceId: data.instanceId,
+                lanAuthority: data.lanAuthority === true,
+              };
+            }
             return null;
           })
         );
@@ -130,6 +248,8 @@ export function useLanMode() {
       const found = results.find(r => r !== null);
       if (found) {
         setGlobalLanServer(found);
+        // 0.6.23: a lanAuthority beacon triggers the follower join flow.
+        void attemptLanAuthorityJoin(found);
         setIsDiscovering(false);
         return found;
       }
@@ -148,7 +268,15 @@ export function useLanMode() {
     const interval = setInterval(() => {
       if (globalLanServer) {
         healthCheck(globalLanServer.ip, globalLanServer.port).then(ok => {
-          if (!ok) {
+          if (ok) {
+            // 0.6.23: a live beacon refreshes the LAN-authority 30s contact window.
+            markMasterContact();
+          } else {
+            // 0.6.23: master lost — wipe the join (logs lan-master-lost) and
+            // re-discover; a new master may be found and re-joined below.
+            if (getLanAuthoritySnapshot().active) {
+              clearLanAuthority('master-unreachable');
+            }
             setGlobalLanServer(null);
             // Re-discover — the LAN API may have restarted
             discoverServer();

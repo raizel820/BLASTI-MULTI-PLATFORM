@@ -5,6 +5,7 @@
  * won't come before that time. If their turn would come earlier,
  * later customers are served first until the preferred time arrives.
  */
+import { todayLocalDateString } from './queue-waiting'
 
 /**
  * Task 24: format a Date as its LOCAL calendar date 'YYYY-MM-DD'.
@@ -12,8 +13,9 @@
  * toISOString(), it shifts the day for any timezone east of UTC.)
  */
 function localDateString(date: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  // P1-9: delegate to the PINNED Africa/Algiers helper — the twin comment
+  // "MUST match queue-scheduler" is now true by construction (one impl).
+  return todayLocalDateString(date);
 }
 
 /**

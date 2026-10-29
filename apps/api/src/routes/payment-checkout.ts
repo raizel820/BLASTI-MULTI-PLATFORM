@@ -56,6 +56,11 @@ const createCheckoutSchema = z.object({
   // Optional explicit return base (http/https) — overrides Origin detection
   // (used by the Capacitor/Electron shells whose origin is not a web URL).
   returnUrl: z.string().url().optional(),
+  // Optional custom-scheme deep link (Capacitor Android: `blasti://payment/result`)
+  // appended (URL-encoded) to the success AND failure URLs. When the payer's
+  // browser lands on the result page, it bounces straight back into the app
+  // (BROWSABLE intent-filter) which routes to the in-app payment result.
+  deepLink: z.string().regex(/^blasti:\/\/\S+$/, 'deepLink must be a blasti:// URL').optional(),
   // subscription:
   agencyId: z.string().min(1).optional(),
   plan: z.string().min(1).optional(),
@@ -70,6 +75,26 @@ const createCheckoutSchema = z.object({
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 /**
+ * Hosts that can never be PUBLIC redirect targets. The hosted Chargily page
+ * runs on the gateway's servers — a redirect to `localhost` / a LAN IP / the
+ * device's own WebView origin lands the payer on a dead "site can't be
+ * reached" page (mobile/Capacitor: WebView origin = `https://localhost` →
+ * after paying, the phone's browser hit http(s)://localhost and died there).
+ * When the candidate base is one of these we fall through to the next
+ * candidate (NEXTAUTH_URL) instead.
+ */
+function isNonPublicHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return (
+    h === 'localhost' || h.endsWith('.localhost') ||
+    h === '127.0.0.1' || h === '0.0.0.0' || h === '[::1]' || h === '::1' ||
+    h.startsWith('10.') || h.startsWith('192.168.') || h.startsWith('169.254.') ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+    h.endsWith('.local')
+  );
+}
+
+/**
  * Resolve the public base URL for success/failure redirects.
  *
  * Priority:
@@ -78,12 +103,17 @@ const createCheckoutSchema = z.object({
  *      droplet domain, the preview gateway and localhost alike)
  *   3. NEXTAUTH_URL (production env)
  *   4. http://localhost:3000 (dev fallback)
+ *
+ * Device-local candidates (localhost / LAN IP) are SKIPPED at every step
+ * except the dev fallback — they can never be opened by the hosted page's
+ * server-side redirect.
  */
 function resolveBaseUrl(c: { req: { header(name: string): string | undefined; url: string } }, explicit?: string): string {
   if (explicit && /^https?:\/\//i.test(explicit)) {
     // Use only the origin part (strip any path — we append hash routes).
     try {
-      return new URL(explicit).origin
+      const u = new URL(explicit);
+      if (!isNonPublicHost(u.hostname)) return u.origin;
     } catch {
       /* fall through */
     }
@@ -91,7 +121,8 @@ function resolveBaseUrl(c: { req: { header(name: string): string | undefined; ur
   const origin = c.req.header('Origin')
   if (origin && /^https?:\/\//i.test(origin)) {
     try {
-      return new URL(origin).origin
+      const u = new URL(origin);
+      if (!isNonPublicHost(u.hostname)) return u.origin;
     } catch {
       /* fall through */
     }
@@ -119,7 +150,7 @@ app.post('/create-checkout', async (c) => {
       return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
     }
 
-    const { type, paymentMethod, locale, returnUrl } = validation.data
+    const { type, paymentMethod, locale, returnUrl, deepLink } = validation.data
     await ensureChargilyReady()
 
     const baseUrl = resolveBaseUrl(c, returnUrl)
@@ -128,8 +159,11 @@ app.post('/create-checkout', async (c) => {
     // creation time, so the payment-result page recovers it from localStorage
     // (stored by the initiating client right before the redirect) or via
     // GET /api/payment/pending (latest pending checkout for the caller).
-    const successUrl = `${baseUrl}/#/payment/result?status=success`
-    const failureUrl = `${baseUrl}/#/payment/result?status=failed`
+    // `deep` (Capacitor callers only) is the blasti:// scheme the phone bounces
+    // back into the app with — see payment-deep-link.ts on the web side.
+    const deepQuery = deepLink ? `&deep=${encodeURIComponent(deepLink)}` : ''
+    const successUrl = `${baseUrl}/#/payment/result?status=success${deepQuery}`
+    const failureUrl = `${baseUrl}/#/payment/result?status=failed${deepQuery}`
 
     // ─────────────────────────────────────────────────────────────
     // SUBSCRIPTION (optionally bundling pending UPFRONT hardware orders)

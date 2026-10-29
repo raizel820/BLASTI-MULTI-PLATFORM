@@ -748,7 +748,7 @@ export function AdminPaymentEngine() {
             <Card>
               <CardHeader className="pb-3">
                 <CardTitle className="text-base flex items-center gap-2">
-                  <Link className="h-4 w-4 text-blue-600" />
+                  <Link className="h-4 w-4 text-teal-600" />
                   {t('webhookConfiguration')}
                 </CardTitle>
                 <CardDescription>
@@ -847,9 +847,9 @@ export function AdminPaymentEngine() {
                         <p className="text-lg font-bold text-red-700 dark:text-red-400">{reconResult.unmatchedCount}</p>
                         <p className="text-[10px] text-muted-foreground">{t('unmatched')}</p>
                       </div>
-                      <div className="p-3 rounded-lg bg-blue-50 dark:bg-blue-900/10 border border-blue-200 dark:border-blue-800/30 text-center">
-                        <DollarSign className="h-5 w-5 text-blue-600 mx-auto mb-1" />
-                        <p className="text-sm font-bold text-blue-700 dark:text-blue-400">{formatDZD(reconResult.totalReconciled)}</p>
+                      <div className="p-3 rounded-lg bg-teal-50 dark:bg-teal-900/10 border border-teal-200 dark:border-teal-800/30 text-center">
+                        <DollarSign className="h-5 w-5 text-teal-600 mx-auto mb-1" />
+                        <p className="text-sm font-bold text-teal-700 dark:text-teal-400">{formatDZD(reconResult.totalReconciled)}</p>
                         <p className="text-[10px] text-muted-foreground">{t('totalReconciled')}</p>
                       </div>
                     </div>

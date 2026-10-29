@@ -32,7 +32,12 @@ import { useAppUpdateStore } from '@/store/use-app-update-store';
 
 const MIN_DISPLAY_MS = 900;
 const DB_WAIT_CAP_MS = 6000;
-const MAX_WAIT_MS = 15000;
+// 0.6.19 — the 15s cap fired on every cold boot where the FIRST sync pulls
+// the full change feed (fresh install / cleared cursor) over a slow link,
+// releasing the gate mid-pull and flashing "Failed to load data" right after.
+// 25s still bounds the wait (offline-first: never trap the user) but covers
+// a p95 first-pull; the periodic loop + cached data take over if we do cap.
+const MAX_WAIT_MS = 25000;
 const SLOW_NOTE_AFTER_MS = 8000;
 
 type BootPhase = 'preparing' | 'syncing' | 'finishing';

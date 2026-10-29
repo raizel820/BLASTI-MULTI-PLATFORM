@@ -20,6 +20,8 @@ import { apiFetch } from "@/lib/api-fetch";
 // Task 84 — IndexedDB stale-while-revalidate: notifications render instantly
 // from the last-known list on initial load and refresh silently.
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
@@ -290,9 +292,14 @@ export function CustomerNotifications() {
     }
   }, [user?.id, notifications.length, notifications]);
 
+  // 0.6.16 — resume revalidation nonce: the 30s auto-refresh is intentionally
+  // paused while hidden, so a resume is the moment the list MUST revalidate.
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
+
   useEffect(() => {
     fetchNotifications();
-  }, [fetchNotifications]);
+  }, [fetchNotifications, resumeNonce]);
 
   // Auto-refresh every 30s — paused while the tab/app is hidden (Performance
   // Round: the realtime socket pushes notification:* events anyway).

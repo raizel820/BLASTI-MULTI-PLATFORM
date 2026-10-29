@@ -28,6 +28,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { apiFetch } from '@/lib/api-fetch';
 import { apiClient, setNativeSessionToken } from '@/lib/api-client';
+import { adoptLocalLanguagePreference } from '@/hooks/use-language';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
@@ -213,7 +214,7 @@ export function MobileLoginForm() {
     (user: unknown, token: string | undefined, successMsg: string, opts?: { remember?: boolean; loggedInUsername?: string }) => {
       setLoginSuccess(true);
       setTimeout(() => {
-        setUser(user as never);
+        setUser(adoptLocalLanguagePreference(user as never) as never);
         // Task 81 — remember-me session policy: the 3-day window starts at
         // login and is kept alive by the session-keeper while the app is
         // used; after 3 days a re-login (password or biometric) is required.
@@ -233,6 +234,25 @@ export function MobileLoginForm() {
       }, 500);
     },
     [setUser, setSessionToken],
+  );
+
+  /**
+   * Security-0.6.13 — the mobile app NEVER holds an admin session. The cloud
+   * already rejects SUPER_ADMIN logins from this app (403, platform login
+   * matrix); this client-side guard is the second lock for paths the server
+   * response flows through indirectly (biometric quick-unlock, OTP
+   * verification success): refuse the session instead of bootstrapping it.
+   */
+  const bootstrapSessionIfAllowed = useCallback(
+    (user: unknown, token: string | undefined, successMsg: string, opts?: { remember?: boolean; loggedInUsername?: string }) => {
+      const role = (user as { role?: string } | null | undefined)?.role;
+      if (role === 'SUPER_ADMIN') {
+        toast.error(t('adminLoginNotAllowed'));
+        return;
+      }
+      bootstrapSession(user, token, successMsg, opts);
+    },
+    [bootstrapSession, t],
   );
 
   const handleLogin = async (biometricUser?: string, biometricPass?: string) => {
@@ -274,7 +294,7 @@ export function MobileLoginForm() {
       }
 
       if (res.ok && data.user) {
-        bootstrapSession(data.user, data.token, t('loginSuccess'), {
+        bootstrapSessionIfAllowed(data.user, data.token, t('loginSuccess'), {
           remember: rememberMe && !biometricUser,
           loggedInUsername: effUsername.trim(),
         });
@@ -296,7 +316,7 @@ export function MobileLoginForm() {
   const handleVerificationSuccess = (result: VerificationSuccess) => {
     setVerificationData(null);
     setAuthView('login');
-    bootstrapSession(result.user, result.token, t('loginSuccess'), {
+    bootstrapSessionIfAllowed(result.user, result.token, t('loginSuccess'), {
       remember: rememberMe,
       loggedInUsername: username.trim(),
     });

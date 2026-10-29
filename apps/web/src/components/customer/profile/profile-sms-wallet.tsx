@@ -103,7 +103,7 @@ export function ProfileSmsWallet({
                   }`}
                 >
                   {isBestValue && (
-                    <span className="absolute -top-2.5 start-1/2 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[10px] font-bold shadow-lg z-10 whitespace-nowrap">
+                    <span className="absolute -top-2.5 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-full bg-gradient-to-r from-amber-500 to-orange-500 text-white text-[10px] font-bold shadow-lg z-10 whitespace-nowrap">
                       <Star className="h-3 w-3 fill-white inline me-0.5" />
                       {t('bestValue')}
                     </span>

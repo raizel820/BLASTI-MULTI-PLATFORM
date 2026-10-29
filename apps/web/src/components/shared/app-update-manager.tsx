@@ -118,10 +118,10 @@ export function AppUpdateManager() {
             } else if (outcome === 'not-installed') {
               toast.error(
                 lang === 'ar'
-                  ? 'لم يتم تثبيت التحديث — غالبًا بسبب توقيع مختلف. أزل التطبيق ثم ثبّته مرة واحدة من صفحة التحميل، وستعمل التحديثات المقبلة تلقائيًا.'
+                  ? 'لم يتم تثبيت التحديث — تحقق من مساحة التخزين، أو ثبّت النسخة الجديدة مرة واحدة من صفحة التحميل (بعد إزالة التطبيق إن لزم). التحديثات التالية ستُثبّت تلقائيًا.'
                   : lang === 'fr'
-                    ? "La mise à jour n'a pas été installée — signature différente. Désinstallez puis réinstallez une fois ; les mises à jour suivantes seront automatiques."
-                    : 'The update was not installed — signature mismatch. Uninstall the app and reinstall once from the download page; future updates will then install automatically.',
+                    ? "La mise à jour n'a pas été installée — vérifiez l'espace de stockage, ou installez la nouvelle version une fois depuis la page de téléchargement (désinstallez d'abord si nécessaire). Les mises à jour suivantes seront automatiques."
+                    : 'The update was not installed — check free storage, or install the new version once from the download page (uninstall first if needed). Future updates will then install automatically.',
                 { duration: 12000 },
               );
             }

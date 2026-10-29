@@ -318,12 +318,10 @@ export function CustomerQrScanner({ open, onOpenChange, onAgencyFound }: Custome
 
   const getCategoryLabel = (cat: string) => {
     const catMap: Record<string, string> = {
+      DOCTOR: t('catDoctor'),
       CLINIC: t('catClinic'),
-      AGENCY: t('catAgency'),
       LAW_FIRM: t('catLawFirm'),
-      LABORATORY: t('catLaboratory'),
-      GOVERNMENT: t('catGovernment'),
-      OTHER: t('catOther'),
+      BARBER: t('catBarber'),
     };
     return catMap[cat.toUpperCase()] || cat;
   };
@@ -356,10 +354,10 @@ export function CustomerQrScanner({ open, onOpenChange, onAgencyFound }: Custome
       {/* Scanning area */}
       <div className="relative w-56 h-56 sm:w-64 sm:h-64">
         {/* Corner decorations */}
-        <div className="absolute -top-1 -start-1 w-8 h-8 border-t-4 border-s-4 border-emerald-400 rounded-tl-2xl" />
-        <div className="absolute -top-1 -end-1 w-8 h-8 border-t-4 border-e-4 border-emerald-400 rounded-tr-2xl" />
-        <div className="absolute -bottom-1 -start-1 w-8 h-8 border-b-4 border-s-4 border-emerald-400 rounded-bl-2xl" />
-        <div className="absolute -bottom-1 -end-1 w-8 h-8 border-b-4 border-e-4 border-emerald-400 rounded-br-2xl" />
+        <div className="absolute -top-1 -start-1 w-8 h-8 border-t-4 border-s-4 border-emerald-400 rounded-ss-2xl" />
+        <div className="absolute -top-1 -end-1 w-8 h-8 border-t-4 border-e-4 border-emerald-400 rounded-se-2xl" />
+        <div className="absolute -bottom-1 -start-1 w-8 h-8 border-b-4 border-s-4 border-emerald-400 rounded-es-2xl" />
+        <div className="absolute -bottom-1 -end-1 w-8 h-8 border-b-4 border-e-4 border-emerald-400 rounded-ee-2xl" />
         {/* Animated scan line */}
         <motion.div
           className="absolute start-2 end-2 h-0.5 bg-gradient-to-r from-transparent via-emerald-400 to-transparent shadow-[0_0_12px_rgba(52,211,153,0.6)]"

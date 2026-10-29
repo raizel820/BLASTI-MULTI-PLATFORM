@@ -147,7 +147,7 @@ export function SlideToConfirm({ onConfirm, label }: SlideToConfirmProps) {
 
         {/* Slider thumb */}
         <motion.div
-          className="absolute top-1 start-1 h-10 w-10 sm:h-12 sm:w-12 rounded-xl bg-white shadow-lg flex items-center justify-center cursor-grab active:cursor-grabbing z-10"
+          className="absolute top-1 start-1 h-10 w-10 sm:h-12 sm:w-12 rounded-xl bg-white dark:bg-gray-900 shadow-lg flex items-center justify-center cursor-grab active:cursor-grabbing z-10"
           animate={{ x: sliderX }}
           transition={isSliding ? { type: 'tween', duration: 0 } : { type: 'spring', stiffness: 400, damping: 30 }}
           style={{ touchAction: 'none' }}

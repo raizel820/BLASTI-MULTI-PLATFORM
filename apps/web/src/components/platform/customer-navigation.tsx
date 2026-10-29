@@ -28,7 +28,7 @@ import { useEffect, useState } from 'react';
 import { useAppStore, type ViewName } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { type TranslationKeys } from '@/i18n';
-import { getProxiedUrl } from '@/lib/utils';
+import { useAvatarSrc } from '@/lib/avatar-src';
 import { usePlatform } from '@/hooks/use-platform';
 import { nativeBridge } from '@/lib/native-bridge';
 import { useAppUpdateStore } from '@/store/use-app-update-store';
@@ -181,6 +181,8 @@ function CustomerTopTabBar({ currentView, setView, unreadCount, user, logout, t 
   logout: () => void;
   t: (key: TranslationKeys, params?: Record<string, string>) => string;
 }) {
+  // Avatar with retry + native-fetch fallback (mobile placeholder fix).
+  const { src: topAvatarSrc, handleError: onTopAvatarError } = useAvatarSrc(user?.avatarUrl);
   const { mainItems, searchItem, moreItems } = useNavItems(t);
 
   return (
@@ -242,8 +244,8 @@ function CustomerTopTabBar({ currentView, setView, unreadCount, user, logout, t 
           <DropdownMenuContent align="end" className="w-56 rounded-2xl">
             <DropdownMenuLabel className="flex items-center gap-2.5">
               <span className="h-8 w-8 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center overflow-hidden flex-shrink-0">
-                {user?.avatarUrl ? (
-                  <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName ?? ''} width={32} height={32} className="h-full w-full object-cover" />
+                {topAvatarSrc ? (
+                  <img key={topAvatarSrc} src={topAvatarSrc} alt={user?.fullName ?? ''} width={32} height={32} className="h-full w-full object-cover" onError={onTopAvatarError} />
                 ) : (
                   <span className="text-xs font-bold text-white">{user?.fullName?.charAt(0)?.toUpperCase() || 'U'}</span>
                 )}
@@ -339,6 +341,8 @@ function CustomerMobileBottomNav({ currentView, setView, unreadCount, user, logo
 }) {
   const { mainItems, searchItem, moreItems } = useNavItems(t);
   const { lang } = useLanguage();
+  // Avatar with retry + native-fetch fallback (mobile placeholder fix).
+  const { src: bottomAvatarSrc, handleError: onBottomAvatarError } = useAvatarSrc(user?.avatarUrl);
   const [moreOpen, setMoreOpen] = useState(false);
   const searchActive = currentView === searchItem.view;
   // App-update delivery — More-sheet row (mirrors the agency sidebar footer):
@@ -445,8 +449,8 @@ function CustomerMobileBottomNav({ currentView, setView, unreadCount, user, logo
               {/* Account header */}
               <div className="flex items-center gap-3 px-5 pb-3">
                 <div className="h-11 w-11 rounded-full bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-sm flex-shrink-0 overflow-hidden">
-                  {user?.avatarUrl ? (
-                    <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName ?? ''} width={44} height={44} className="h-full w-full object-cover" />
+                  {bottomAvatarSrc ? (
+                    <img key={bottomAvatarSrc} src={bottomAvatarSrc} alt={user?.fullName ?? ''} width={44} height={44} className="h-full w-full object-cover" onError={onBottomAvatarError} />
                   ) : (
                     <span className="text-base font-bold text-white">{user?.fullName?.charAt(0)?.toUpperCase() || 'U'}</span>
                   )}

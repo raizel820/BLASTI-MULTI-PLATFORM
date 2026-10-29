@@ -1,6 +1,7 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
-import { startChargilyCheckout, fetchPaymentSettings } from '@/lib/chargily-checkout';
+import { startChargilyCheckout, fetchPaymentSettings, type PublicPaymentSettings } from '@/lib/chargily-checkout';
+import type { TranslationKeys } from '@/i18n';
 
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -96,6 +97,7 @@ import {
   ArrowDownCircle,
   Lock,
   Zap,
+  Smartphone,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -374,25 +376,72 @@ function getTotalForPeriod(plan: SubscriptionPlan, period: number): number {
   return Math.round(plan.price * period * (1 - discount / 100));
 }
 
-// ─── Chargily availability (module-level TTL cache) ─────────────────────────
+// ─── Public payment settings (module-level TTL cache) ───────────────────────
 // GET /api/payment-settings is public and cheap, but there is no reason to
-// hit it on every dialog open / list render — the result is memoized for
-// 5 minutes (in-flight requests share the same promise). Silent-fails to
-// false so the EDAHABIA / CIB online methods simply stay hidden when the
-// request errors; the manual transfer methods always remain available.
+// hit it on every dialog open / list render — the FULL settings object
+// (Chargily availability + the manual transfer account details the super
+// admin configured: CCP RIP/holder/address, bank name/RIB/holder/address,
+// BaridiMob number) is memoized for 5 minutes (in-flight requests share the
+// same promise). Silent-fails to null so the EDAHABIA / CIB online methods
+// simply stay hidden when the request errors; the manual transfer methods
+// always remain available (with their i18n placeholder instructions).
 
 const CHARGILY_SETTINGS_TTL_MS = 5 * 60 * 1000;
-let chargilySettingsCache: { at: number; value: Promise<boolean> } | null = null;
+let chargilySettingsCache: { at: number; value: Promise<PublicPaymentSettings | null> } | null = null;
 
-function fetchChargilyEnabled(): Promise<boolean> {
+function fetchPaymentSettingsCached(): Promise<PublicPaymentSettings | null> {
   if (chargilySettingsCache && Date.now() - chargilySettingsCache.at < CHARGILY_SETTINGS_TTL_MS) {
     return chargilySettingsCache.value;
   }
-  const value = fetchPaymentSettings()
-    .then((settings) => !!settings?.chargilyEnabled)
-    .catch(() => false);
+  const value = fetchPaymentSettings().catch(() => null);
   chargilySettingsCache = { at: Date.now(), value };
   return value;
+}
+
+function fetchChargilyEnabled(): Promise<boolean> {
+  return fetchPaymentSettingsCached()
+    .then((settings) => !!settings?.chargilyEnabled)
+    .catch(() => false);
+}
+
+// ─── Live transfer instructions (r21-6) ─────────────────────────────────────
+// Build the CCP / bank / BaridiMob instruction text from the super admin's
+// real account details; when a value is missing the i18n placeholder
+// instruction block is used as the fallback.
+
+type TFn = (key: TranslationKeys, params?: Record<string, string>) => string;
+
+function buildCcpInstructions(s: PublicPaymentSettings | null, t: TFn): string {
+  const hasLive = !!(s?.ccpAccount && String(s.ccpAccount).trim());
+  if (!hasLive) return t('ccpInstructions');
+  const lines: string[] = [];
+  lines.push(`${t('ccpAccount')}: ${s!.ccpAccount}`);
+  if (s!.ccpKey && String(s!.ccpKey).trim()) lines.push(`${t('ccpKey')}: ${s!.ccpKey}`);
+  if (s!.ccpHolderName && String(s!.ccpHolderName).trim()) lines.push(`${t('ccpHolderName')}: ${s!.ccpHolderName}`);
+  if (s!.ccpAddress && String(s!.ccpAddress).trim()) lines.push(`${t('ccpAddress')}: ${s!.ccpAddress}`);
+  return lines.join('\n');
+}
+
+function buildBankInstructions(s: PublicPaymentSettings | null, t: TFn): string {
+  const hasLive = !!(
+    (s?.bankAccount && String(s.bankAccount).trim()) ||
+    (s?.bankRib && String(s.bankRib).trim())
+  );
+  if (!hasLive) return t('bankInstructions');
+  const lines: string[] = [];
+  if (s!.bankName && String(s!.bankName).trim()) lines.push(`${t('bankName')}: ${s!.bankName}`);
+  if (s!.bankAccount && String(s!.bankAccount).trim()) lines.push(`${t('bankAccount')}: ${s!.bankAccount}`);
+  if (s!.bankRib && String(s!.bankRib).trim()) lines.push(`RIB: ${s!.bankRib}`);
+  if (s!.bankHolderName && String(s!.bankHolderName).trim()) lines.push(`${t('bankHolderName')}: ${s!.bankHolderName}`);
+  if (s!.bankAddress && String(s!.bankAddress).trim()) lines.push(`${t('bankAddress')}: ${s!.bankAddress}`);
+  return lines.join('\n');
+}
+
+function buildBaridiMobInstructions(s: PublicPaymentSettings | null, t: TFn): string {
+  if (s?.baridiMobNumber && String(s.baridiMobNumber).trim()) {
+    return `${t('baridiMobNumber')}: ${s.baridiMobNumber}`;
+  }
+  return t('baridiMobInstructions');
 }
 
 // ─── Chargily method card ───────────────────────────────────────────────────
@@ -556,16 +605,21 @@ function PaymentDialog({
   // mount-time fetch, then re-checked through the shared 5-minute module
   // cache each time the dialog opens (picks up a mid-session gateway
   // enable/disable without a page reload). Silent-fails to false.
+  // r21-6 — the SAME cached fetch now also carries the full public settings
+  // (CCP/bank/BaridiMob transfer details) used for the live instructions.
   const [chargilyOnline, setChargilyOnline] = useState(!!chargilyEnabled);
+  const [pubSettings, setPubSettings] = useState<PublicPaymentSettings | null>(null);
   useEffect(() => {
     setChargilyOnline(!!chargilyEnabled);
   }, [chargilyEnabled]);
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    fetchChargilyEnabled()
-      .then((enabled) => {
-        if (!cancelled) setChargilyOnline(enabled);
+    fetchPaymentSettingsCached()
+      .then((settings) => {
+        if (cancelled) return;
+        setPubSettings(settings);
+        setChargilyOnline(!!settings?.chargilyEnabled);
       })
       .catch(() => {});
     return () => {
@@ -654,21 +708,26 @@ function PaymentDialog({
     if (method === 'CIB') return t('payCibFull');
     if (method === 'CCP') return t('ccpTransfer');
     if (method === 'BANK_TRANSFER' || method === 'BANK') return t('bankTransfer');
+    if (method === 'BARIDIMOB') return t('baridiMobTransfer');
     return t('electronicPayment');
   };
 
+  // r21-6 — instructions are now built from the LIVE public payment settings
+  // (super admin's CCP/bank/BaridiMob details) with the i18n placeholders as
+  // the fallback when a value is empty. BARIDIMOB is a 4th manual method,
+  // shown only when the super admin enabled it (baridiMobEnabled).
   const paymentMethods = [
     {
       id: 'CCP',
       label: t('ccpTransfer'),
-      instructions: t('ccpInstructions'),
+      instructions: buildCcpInstructions(pubSettings, t),
       icon: Landmark,
       description: lang === 'ar' ? 'تحويل عبر بريد الجزائر' : lang === 'fr' ? 'Virement via Poste Algérienne' : 'Transfer via Algerian Post',
     },
     {
       id: 'BANK_TRANSFER',
       label: t('bankTransfer'),
-      instructions: t('bankInstructions'),
+      instructions: buildBankInstructions(pubSettings, t),
       icon: Building2,
       description: lang === 'ar' ? 'تحويل مصرفي مباشر' : lang === 'fr' ? 'Virement bancaire direct' : 'Direct bank transfer',
     },
@@ -679,6 +738,15 @@ function PaymentDialog({
       icon: Wallet,
       description: lang === 'ar' ? 'باريدي موب أو محفظة إلكترونية' : lang === 'fr' ? 'BaridiMob ou e-wallet' : 'BaridiMob or e-wallet',
     },
+    // r21-6 — dedicated BaridiMob transfer card (receipt upload + admin
+    // review, same pipeline as CCP/bank). Only when enabled server-side.
+    ...(pubSettings?.baridiMobEnabled ? [{
+      id: 'BARIDIMOB',
+      label: t('baridiMobTransfer'),
+      instructions: buildBaridiMobInstructions(pubSettings, t),
+      icon: Smartphone,
+      description: lang === 'ar' ? 'تحويل عبر تطبيق باريدي موب' : lang === 'fr' ? 'Virement via BaridiMob' : 'Transfer via BaridiMob app',
+    }] : []),
   ];
 
   // Instant online payment methods (Chargily gateway) — rendered above the
@@ -1349,7 +1417,9 @@ function PaymentDialog({
                                         <p className="text-[11px] text-amber-600 dark:text-amber-300 mt-0.5">{t('paymentInstructionsDesc')}</p>
                                       </div>
                                     </div>
-                                    <p className="text-[11px] text-muted-foreground leading-relaxed">{method.instructions}</p>
+                                    {/* whitespace-pre-line: live instructions are
+                                        multi-line (RIP / holder / address rows). */}
+                                    <p className="text-[11px] text-muted-foreground leading-relaxed whitespace-pre-line">{method.instructions}</p>
                                   </div>
                                 </motion.div>
                               )}
@@ -2903,6 +2973,7 @@ export function AgencySubscription() {
     if (method === 'CIB') return t('payCibFull');
     if (method === 'CCP') return t('ccpTransfer');
     if (method === 'BANK_TRANSFER' || method === 'BANK') return t('bankTransfer');
+    if (method === 'BARIDIMOB') return t('baridiMobTransfer');
     return t('electronicPayment');
   };
 
@@ -2970,15 +3041,25 @@ export function AgencySubscription() {
   // we double-check via `isExpired` to be defensive).
   const isActive = data?.status === 'ACTIVE' && !data?.isExpired;
 
+  // A subscription is "live" while it is actually ACTIVE — or PENDING (a
+  // receipt / gateway payment awaiting approval, where the tier was already
+  // flipped and a second purchase of the same plan must stay blocked).
+  // After a CANCEL (status → INACTIVE, tier kept for history) or an expiry,
+  // the old tier must NOT pose as the current plan: the plan cards get their
+  // Subscribe button back and the same plan can be activated again.
+  const hasLiveSubscription =
+    (data?.status === 'ACTIVE' || data?.status === 'PENDING') && !data?.isExpired;
+
   // The current plan object (matched by name) — used for upgrade/downgrade
-  // comparisons via sortOrder. Falls back to `null` when the agency has no
-  // active plan or the plan name isn't in the catalog. Enterprise plans owned
-  // by this agency ARE included in `availablePlans` (the backend includes
-  // them for the owner), so this lookup works for bespoke plans too.
+  // comparisons via sortOrder. Only exists while the subscription is live
+  // (see hasLiveSubscription) — after a cancel the stale tier must not keep
+  // filtering the upgrade/downgrade lists. Enterprise plans owned by this
+  // agency ARE included in `availablePlans` (the backend includes them for
+  // the owner), so this lookup works for bespoke plans too.
   const currentPlanObj = useMemo(() => {
-    if (!data?.currentPlan) return null;
+    if (!hasLiveSubscription || !data?.currentPlan) return null;
     return availablePlans.find((p) => p.name === data.currentPlan) ?? null;
-  }, [data?.currentPlan, availablePlans]);
+  }, [hasLiveSubscription, data?.currentPlan, availablePlans]);
 
   // Whether the agency's active subscription is an enterprise (bespoke) plan.
   const isCurrentEnterprise = !!currentPlanObj?.isEnterprise;
@@ -3270,7 +3351,12 @@ export function AgencySubscription() {
               ? t('pending')
               : (lang === 'ar' ? 'غير نشط' : lang === 'fr' ? 'Inactif' : 'Inactive');
         const StatusBadgeIcon = isExpired ? AlertCircle : isActiveStatus ? CheckCircle2 : Clock;
-        const planName = resolvePlanName(data?.currentPlan) || '—';
+        // Show the plan name only while the subscription is actually live —
+        // after a cancel the tier stays in the DB for history, and printing
+        // it here made the old plan look like it was still "current".
+        const planName = hasLiveSubscription
+          ? resolvePlanName(data?.currentPlan) || '—'
+          : '—';
 
         return (
           <motion.div
@@ -3333,7 +3419,7 @@ export function AgencySubscription() {
                 </div>
                 <div className="h-2 rounded-full bg-white/30 overflow-hidden" aria-hidden="true">
                   <div
-                    className="h-full rounded-full bg-white transition-[width] duration-500"
+                    className="h-full rounded-full bg-white dark:bg-gray-900 transition-[width] duration-500"
                     style={{ width: `${progress}%` }}
                   />
                 </div>
@@ -3656,7 +3742,10 @@ export function AgencySubscription() {
           {visiblePlans.map((plan, idx) => {
             const accent = getPlanAccent(plan);
             const PlanIcon = accent.icon;
-            const isCurrent = data?.currentPlan === plan.name;
+            // "Current" only while the subscription is live — a CANCELED
+            // (or expired) tier kept in the DB for history must NOT keep the
+            // card badge + disabled button that blocked re-activating it.
+            const isCurrent = hasLiveSubscription && data?.currentPlan === plan.name;
             const isFree = plan.price === 0;
             // FREE tier (by name, not just price) — the built-in default plan.
             // Display-only in the catalog: never opens the payment flow.

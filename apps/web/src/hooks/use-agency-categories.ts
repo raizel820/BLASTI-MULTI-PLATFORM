@@ -53,34 +53,13 @@ export type CreateCategoryResult =
   | { ok: true; category: AgencyCategoryRow }
   | { ok: false; error: CreateCategoryError };
 
-// ─── The 25 built-in options (single shared list) ─────────────────────
+// ─── The 4 built-in options (single shared list; task A reduction) ────
 
 export const BUILT_IN_CATEGORY_OPTIONS: BuiltInCategoryOption[] = [
+  { value: 'DOCTOR', labelKey: 'catDoctor', icon: '🩺' },
   { value: 'CLINIC', labelKey: 'catClinic', icon: '🏥' },
-  { value: 'HOSPITAL', labelKey: 'catHospital', icon: '🏥' },
-  { value: 'DENTAL_CLINIC', labelKey: 'catDentalClinic', icon: '🦷' },
-  { value: 'LABORATORY', labelKey: 'catLaboratory', icon: '🔬' },
-  { value: 'PHARMACY', labelKey: 'catPharmacy', icon: '💊' },
-  { value: 'VETERINARY', labelKey: 'catVeterinary', icon: '🐾' },
-  { value: 'BANK', labelKey: 'catBank', icon: '🏦' },
-  { value: 'POST_OFFICE', labelKey: 'catPostOffice', icon: '📮' },
-  { value: 'TELECOM', labelKey: 'catTelecom', icon: '📱' },
-  { value: 'INSURANCE', labelKey: 'catInsurance', icon: '🛡️' },
   { value: 'LAW_FIRM', labelKey: 'catLawFirm', icon: '⚖️' },
-  { value: 'NOTARY', labelKey: 'catNotary', icon: '📜' },
-  { value: 'GOVERNMENT', labelKey: 'catGovernment', icon: '🏛️' },
-  { value: 'EDUCATION', labelKey: 'catEducation', icon: '🎓' },
-  { value: 'AGENCY', labelKey: 'catAgency', icon: '🏢' },
-  { value: 'TRAVEL', labelKey: 'catTravel', icon: '✈️' },
-  { value: 'REAL_ESTATE', labelKey: 'catRealEstate', icon: '🏠' },
-  { value: 'CAR_SERVICE', labelKey: 'catCarService', icon: '🚗' },
   { value: 'BARBER', labelKey: 'catBarber', icon: '💈' },
-  { value: 'BEAUTY_SALON', labelKey: 'catBeautySalon', icon: '💅' },
-  { value: 'RESTAURANT', labelKey: 'catRestaurant', icon: '🍽️' },
-  { value: 'CAFE', labelKey: 'catCafe', icon: '☕' },
-  { value: 'RETAIL', labelKey: 'catRetail', icon: '🛍️' },
-  { value: 'HOTEL', labelKey: 'catHotel', icon: '🏨' },
-  { value: 'OTHER', labelKey: 'catOther', icon: '📋' },
 ];
 
 // ─── Module-level shared store (one fetch for the whole app) ──────────
@@ -282,7 +261,14 @@ export function useAgencyCategories(): UseAgencyCategoriesResult {
   }, []);
 
   return {
-    customCategories: snapshot.rows ?? [],
+    // 0.6.18 fix (field: "8 categories not 4, Arabic + English duplicated"):
+    // the dictionary endpoint returns the 4 BUILT-IN rows too (isCustom:false),
+    // and CategoryFilters renders them ON TOP of the 4 i18n-translated built-in
+    // chips — each category appeared twice (once via t(cat.key) in the active
+    // locale, once as the raw English row.name). Only genuinely custom rows
+    // belong in customCategories. The built-in rows stay available to the
+    // specialty rails (use-category-terms), which consume the store directly.
+    customCategories: (snapshot.rows ?? []).filter((r) => r.isCustom),
     loading: snapshot.loading && snapshot.rows === null,
     error: snapshot.error,
     createCategory,

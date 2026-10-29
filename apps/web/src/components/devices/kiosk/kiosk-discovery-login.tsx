@@ -146,7 +146,7 @@ export function KioskDiscoveryLogin({
       transition={{ duration: 0.3, ease: 'easeInOut' }}
       className="w-full max-w-md"
     >
-      <div className="bg-white rounded-3xl shadow-2xl overflow-hidden">
+      <div className="bg-white dark:bg-gray-900 rounded-3xl shadow-2xl overflow-hidden">
         {/* Top gradient bar */}
         <div className="h-1.5 bg-gradient-to-r from-teal-400 via-emerald-400 to-teal-500" />
 
@@ -243,7 +243,7 @@ export function KioskDiscoveryLogin({
           </div>
 
           {/* Status text */}
-          <h2 className="text-xl font-bold text-gray-900 mb-2">
+          <h2 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-2">
             {hasPairingRequests && t('kioskPairingRequest')}
             {!hasPairingRequests && isDiscovered && t('kioskDiscovered')}
             {!hasPairingRequests && isConnecting && t('kioskAutoConnecting')}
@@ -251,7 +251,7 @@ export function KioskDiscoveryLogin({
             {!hasPairingRequests && isWaiting && t('kioskWaitingForManager')}
           </h2>
 
-          <p className="text-gray-500 text-sm mb-1">
+          <p className="text-gray-500 dark:text-gray-400 text-sm mb-1">
             {isRegistering && (
               <span className="flex items-center justify-center gap-2">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -298,7 +298,7 @@ export function KioskDiscoveryLogin({
                 initial={{ opacity: 0, height: 0 }}
                 animate={{ opacity: 1, height: 'auto' }}
                 exit={{ opacity: 0, height: 0 }}
-                className="mt-5 space-y-3 text-left overflow-hidden"
+                className="mt-5 space-y-3 text-start overflow-hidden"
               >
                 {pairingRequests.slice(0, 3).map((req, idx) => (
                   <motion.div
@@ -313,11 +313,11 @@ export function KioskDiscoveryLogin({
                         <Building2 className="h-5 w-5 text-emerald-600" />
                       </div>
                       <div className="min-w-0 flex-1">
-                        <p className="font-bold text-gray-900 truncate text-base">
+                        <p className="font-bold text-gray-900 dark:text-gray-100 truncate text-base">
                           {getAgencyName(req, lang)}
                         </p>
                         {getBranchLabel(req) && (
-                          <p className="text-xs text-gray-500 mt-0.5 truncate">
+                          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5 truncate">
                             {getBranchLabel(req)}
                           </p>
                         )}
@@ -344,7 +344,7 @@ export function KioskDiscoveryLogin({
                         whileHover={{ scale: 1.02 }}
                         whileTap={{ scale: 0.97 }}
                         onClick={() => onRejectPairing(req)}
-                        className="min-h-[48px] px-5 flex items-center justify-center gap-2 rounded-xl bg-white text-gray-500 font-semibold text-sm hover:bg-gray-50 hover:text-gray-700 active:bg-gray-100 transition-colors border border-gray-200"
+                        className="min-h-[48px] px-5 flex items-center justify-center gap-2 rounded-xl bg-white dark:bg-gray-900 text-gray-500 dark:text-gray-400 font-semibold text-sm hover:bg-gray-50 hover:text-gray-700 active:bg-gray-100 transition-colors border border-gray-200 dark:border-gray-700"
                       >
                         <ShieldX className="h-4 w-4" />
                         {t('kioskRejectPairing')}
@@ -363,7 +363,7 @@ export function KioskDiscoveryLogin({
             whileHover={{ scale: 1.01 }}
             whileTap={{ scale: 0.98 }}
             onClick={onBack}
-            className="w-full min-h-[48px] rounded-xl bg-gray-100 text-gray-600 font-medium hover:bg-gray-200 transition-colors flex items-center justify-center gap-2 text-sm"
+            className="w-full min-h-[48px] rounded-xl bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 font-medium hover:bg-gray-200 transition-colors flex items-center justify-center gap-2 text-sm"
           >
             <ArrowLeft className="h-4 w-4" />
             {t('kioskBack')}
@@ -454,7 +454,7 @@ export function KioskMethodSelect({
       transition={{ duration: 0.3, ease: 'easeInOut' }}
       className="w-full max-w-md"
     >
-      <div className="bg-white rounded-3xl shadow-2xl overflow-hidden">
+      <div className="bg-white dark:bg-gray-900 rounded-3xl shadow-2xl overflow-hidden">
         {/* Top accent */}
         <div className="h-1.5 bg-gradient-to-r from-violet-400 via-teal-400 to-cyan-400" />
 
@@ -464,8 +464,8 @@ export function KioskMethodSelect({
             <div className="h-12 w-12 mx-auto rounded-xl bg-gradient-to-br from-teal-500 to-emerald-600 flex items-center justify-center mb-2 shadow-lg shadow-emerald-200">
               <Fingerprint className="h-6 w-6 text-white" />
             </div>
-            <h1 className="text-xl font-bold text-gray-900 mb-1">{t('kioskMethodSelectTitle')}</h1>
-            <p className="text-gray-500 text-sm">{t('kioskMethodSelectDesc')}</p>
+            <h1 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-1">{t('kioskMethodSelectTitle')}</h1>
+            <p className="text-gray-500 dark:text-gray-400 text-sm">{t('kioskMethodSelectDesc')}</p>
           </div>
 
           {/* Two main choices */}
@@ -478,7 +478,7 @@ export function KioskMethodSelect({
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
               onClick={onSelectCredentials}
-              className="w-full p-3.5 rounded-2xl border-2 border-violet-200 bg-violet-50 hover:bg-violet-100 text-left transition-colors group"
+              className="w-full p-3.5 rounded-2xl border-2 border-violet-200 bg-violet-50 hover:bg-violet-100 text-start transition-colors group"
             >
               <div className="flex items-center gap-3">
                 <div className="h-11 w-11 rounded-xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center shadow-md shadow-violet-200 flex-shrink-0">
@@ -486,7 +486,7 @@ export function KioskMethodSelect({
                 </div>
                 <div className="min-w-0 flex-1">
                   <p className="font-bold text-violet-700 text-base">{t('kioskMethodCredTitle')}</p>
-                  <p className="text-gray-500 text-xs mt-0.5 line-clamp-1">{t('kioskMethodCredDesc')}</p>
+                  <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5 line-clamp-1">{t('kioskMethodCredDesc')}</p>
                 </div>
                 <ArrowLeft className="h-5 w-5 text-violet-300 group-hover:text-violet-500 flex-shrink-0 -rotate-180" />
               </div>
@@ -519,7 +519,7 @@ export function KioskMethodSelect({
               whileTap={{ scale: discoveryLoading ? 1 : 0.98 }}
               onClick={onSelectDiscovery}
               disabled={discoveryLoading}
-              className={`w-full p-3.5 rounded-2xl border-2 text-left transition-colors group ${
+              className={`w-full p-3.5 rounded-2xl border-2 text-start transition-colors group ${
                 discoveryLoading
                   ? 'border-cyan-300 bg-cyan-50/80 cursor-wait'
                   : 'border-cyan-200 bg-cyan-50 hover:bg-cyan-100'
@@ -539,7 +539,7 @@ export function KioskMethodSelect({
                       ? (t('kioskDiscoveryRegistering') || 'Registering device...')
                       : t('kioskMethodRadarTitle')}
                   </p>
-                  <p className="text-gray-500 text-xs mt-0.5 line-clamp-1">
+                  <p className="text-gray-500 dark:text-gray-400 text-xs mt-0.5 line-clamp-1">
                     {discoveryLoading
                       ? (t('kioskDiscoveryPleaseWait') || 'Please wait...')
                       : t('kioskMethodRadarDesc')}
@@ -604,7 +604,7 @@ export function KioskCredentialsLogin({
       transition={{ duration: 0.3, ease: 'easeInOut' }}
       className="w-full max-w-md"
     >
-      <div className="bg-white rounded-3xl shadow-2xl overflow-hidden">
+      <div className="bg-white dark:bg-gray-900 rounded-3xl shadow-2xl overflow-hidden">
         {/* Top accent */}
         <div className="h-1.5 bg-gradient-to-r from-violet-400 to-purple-500" />
 
@@ -614,14 +614,14 @@ export function KioskCredentialsLogin({
             <div className="h-12 w-12 mx-auto rounded-xl bg-violet-100 flex items-center justify-center mb-2">
               <KeyRound className="h-6 w-6 text-violet-600" />
             </div>
-            <h1 className="text-xl font-bold text-gray-900 mb-1">{t('kioskCredLoginTitle')}</h1>
-            <p className="text-gray-500 text-sm">{t('kioskCredLoginDesc')}</p>
+            <h1 className="text-xl font-bold text-gray-900 dark:text-gray-100 mb-1">{t('kioskCredLoginTitle')}</h1>
+            <p className="text-gray-500 dark:text-gray-400 text-sm">{t('kioskCredLoginDesc')}</p>
           </div>
 
           {/* Pairing Code field */}
           <div className="space-y-3">
             <div>
-              <label className="flex items-center gap-1.5 text-sm font-semibold text-gray-700 mb-1.5">
+              <label className="flex items-center gap-1.5 text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1.5">
                 <ShieldCheck className="h-3.5 w-3.5 text-violet-500" />
                 {t('kioskPairingCode')}
               </label>
@@ -631,7 +631,7 @@ export function KioskCredentialsLogin({
                 onChange={(e) => setPairingCode(e.target.value.toUpperCase())}
                 onKeyDown={(e) => { if (e.key === 'Enter') handleSubmit(); }}
                 placeholder={t('kioskPairingCodePlaceholder') || 'e.g. A3B7'}
-                className="w-full min-h-[48px] rounded-xl border-2 border-gray-200 px-4 text-lg text-center font-bold font-mono tracking-[0.25em] focus:border-violet-400 focus:outline-none transition-colors uppercase"
+                className="w-full min-h-[48px] rounded-xl border-2 border-gray-200 dark:border-gray-700 px-4 text-lg text-center font-bold font-mono tracking-[0.25em] focus:border-violet-400 focus:outline-none transition-colors uppercase"
                 autoFocus
                 dir="ltr"
                 maxLength={10}
@@ -640,7 +640,7 @@ export function KioskCredentialsLogin({
 
             {/* Device Token field */}
             <div>
-              <label className="flex items-center gap-1.5 text-sm font-semibold text-gray-700 mb-1.5">
+              <label className="flex items-center gap-1.5 text-sm font-semibold text-gray-700 dark:text-gray-300 mb-1.5">
                 <Fingerprint className="h-3.5 w-3.5 text-violet-500" />
                 {t('kioskDeviceToken')}
               </label>
@@ -651,7 +651,7 @@ export function KioskCredentialsLogin({
                   onChange={(e) => setDeviceToken(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') handleSubmit(); }}
                   placeholder={t('kioskDeviceTokenPlaceholder') || 'Enter the device token'}
-                  className="w-full min-h-[48px] rounded-xl border-2 border-gray-200 px-4 pr-12 text-sm font-mono focus:border-violet-400 focus:outline-none transition-colors"
+                  className="w-full min-h-[48px] rounded-xl border-2 border-gray-200 dark:border-gray-700 px-4 pr-12 text-sm font-mono focus:border-violet-400 focus:outline-none transition-colors"
                   dir="ltr"
                 />
                 <button
@@ -702,7 +702,7 @@ export function KioskCredentialsLogin({
             whileHover={{ scale: 1.01 }}
             whileTap={{ scale: 0.98 }}
             onClick={onBack}
-            className="w-full min-h-[44px] mt-3 rounded-xl bg-gray-100 text-gray-600 font-medium hover:bg-gray-200 transition-colors flex items-center justify-center gap-2 text-sm"
+            className="w-full min-h-[44px] mt-3 rounded-xl bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 font-medium hover:bg-gray-200 transition-colors flex items-center justify-center gap-2 text-sm"
           >
             <ArrowLeft className="h-4 w-4" />
             {t('kioskBack')}

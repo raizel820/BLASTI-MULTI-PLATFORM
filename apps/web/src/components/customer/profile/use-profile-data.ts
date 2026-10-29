@@ -6,7 +6,7 @@ import { useLanguage } from '@/hooks/use-language';
 import { toast } from 'sonner';
 import type { Language } from '@/i18n';
 import { updateDocumentDirection } from '@/store/use-app-store';
-import { mergeSessionUser } from '@/lib/user-store-refresh';
+import { mergeSessionUser, markLocalAvatarMutation, markLocalLanguageMutation } from '@/lib/user-store-refresh';
 import { mirrorNotifPrefs } from '@/lib/notification-channel';
 import type {
   NotifPrefs,
@@ -62,6 +62,23 @@ export function useProfileData() {
 
   const [smsCount, setSmsCount] = useState(user?.freeSmsCount ?? 10);
 
+  // 0.6.18 (field: "UID not shown / stale identity until refresh"): the
+  // local states above are initialized ONCE from the store — a heal that
+  // lands AFTER mount (schedulePostLoginProfileSync re-reads the profile
+  // ~1.2s after login and merges uid/avatarUrl/identity into the store)
+  // never reached an already-open page. Sync the healed identity whenever
+  // the SESSION IDENTITY changes (login/logout/adopted account) — NOT on
+  // every store mutation, so in-flight edits are never clobbered.
+  const sessionUserId = user?.id;
+  useEffect(() => {
+    if (!user) return;
+    setFullName(user.fullName || '');
+    setEmail(user.email || '');
+    setAvatarUrl(user.avatarUrl || '');
+    setPhoneNumber(user.phoneNumber || '');
+    if (typeof user.freeSmsCount === 'number') setSmsCount(user.freeSmsCount);
+  }, [sessionUserId]);
+
   const fetchProfile = useCallback(async () => {
     if (!user?.id) return;
     setNotifLoading(true);
@@ -90,6 +107,8 @@ export function useProfileData() {
         // DB (avatar uploaded on another device). Merge the authoritative
         // identity fields so the header/sidebar/identity-card avatars update
         // on THIS device too — without navigation side effects.
+        // 0.6.17: uid joined the heal set — the profile/settings UID chips
+        // render nothing while the persisted user predates the uid rollout.
         mergeSessionUser({
           fullName: typeof data.fullName === 'string' && data.fullName ? data.fullName : undefined,
           email: typeof data.email === 'string' && data.email ? data.email : undefined,
@@ -98,6 +117,7 @@ export function useProfileData() {
           freeSmsCount: typeof data.freeSmsCount === 'number' && Number.isFinite(data.freeSmsCount)
             ? data.freeSmsCount
             : undefined,
+          uid: typeof data.uid === 'string' && data.uid ? data.uid : undefined,
         });
       }
     } catch {
@@ -146,7 +166,17 @@ export function useProfileData() {
   const handleLanguageChange = (newLang: string) => {
     const langTyped = newLang as Language;
     updateDocumentDirection(langTyped);
-    if (user) setUser({ ...user, language: langTyped });
+    if (user) {
+      // Language revert fix: stamp the local mutation (blocks the profile
+      // refresher from clobbering) + persist server-side like Settings does.
+      markLocalLanguageMutation();
+      useAppStore.setState({ user: { ...user, language: langTyped } });
+      apiFetch('/api/user/profile', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: user.id, language: langTyped }),
+      }).catch(() => { /* silent */ });
+    }
   };
 
   const saveNotifPrefs = async () => {
@@ -225,12 +255,17 @@ export function useProfileData() {
         if (data.phoneNumber) setPhoneNumber(data.phoneNumber);
         if (data.avatarUrl !== undefined && data.avatarUrl !== null) setAvatarUrl(data.avatarUrl);
         // Refresh the session user so the header/avatar reflect the change.
+        // 0.6.18: ADOPT the server's uid — the spread above preserved a stale
+        // login-era user object with uid undefined, so a customer whose
+        // account predates the uid rollout never saw their UID chip even
+        // though the VPS (once updated) returns it on every PATCH.
         setUser({
           ...user,
           fullName: data.fullName ?? user.fullName,
           email: data.email ?? undefined,
           phoneNumber: data.phoneNumber ?? user.phoneNumber,
           avatarUrl: data.avatarUrl ?? user.avatarUrl,
+          uid: data.uid ?? user.uid,
         });
         toast.success(t('success'));
         return true;
@@ -267,9 +302,11 @@ export function useProfileData() {
       });
       const data = await res.json().catch(() => null);
       if (res.ok && data) {
+        markLocalAvatarMutation(); // shield the fresh avatar from the refresher
         setAvatarUrl(data.avatarUrl ?? url);
         // Refresh the session user so the header/avatar reflect the change.
-        setUser({ ...user, avatarUrl: data.avatarUrl ?? url });
+        // 0.6.18: adopt data.uid (see handleSavePersonalInfo).
+        setUser({ ...user, avatarUrl: data.avatarUrl ?? url, uid: data.uid ?? user.uid });
         return true;
       }
       return false;
@@ -286,7 +323,16 @@ export function useProfileData() {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId: user.id, reminderMinutes: reminderMinutesVal, smsNotificationsEnabled: smsNotifEnabled }),
       });
-      if (res.ok) toast.success(t('smsSaved')); else toast.error(t('error'));
+      // 0.6.18: adopt the authoritative response — the next mount used to
+      // re-paint the STALE cached GET (soft invalidation) and looked like the
+      // save "did not stick" until a manual page refresh.
+      const data = await res.json().catch(() => null);
+      if (res.ok) {
+        if (typeof data?.reminderMinutes === 'number') setReminderMinutesVal(data.reminderMinutes);
+        if (typeof data?.smsNotificationsEnabled === 'boolean') setSmsNotifEnabled(data.smsNotificationsEnabled);
+        if (typeof data?.freeSmsCount === 'number') setSmsCount(data.freeSmsCount);
+        toast.success(t('smsSaved'));
+      } else toast.error(t('error'));
     } catch { toast.error(t('error')); } finally { setSmsSettingsSaving(false); }
   };
 

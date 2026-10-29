@@ -853,7 +853,7 @@ export function AgencyDevices() {
               {agencyId && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button size="sm" className="gap-1.5 bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-600 hover:to-blue-600 text-white shadow-md">
+                    <Button size="sm" className="gap-1.5 bg-gradient-to-r from-cyan-500 to-teal-500 hover:from-cyan-600 hover:to-teal-600 text-white shadow-md">
                       <Cast className="h-4 w-4" />
                       {getLocalizedString('بث إلى شاشة', 'Diffuser', 'Cast to Screen', lang)}
                     </Button>
@@ -862,11 +862,11 @@ export function AgencyDevices() {
                     <DropdownMenuLabel>{getLocalizedString('خيارات البث', 'Options de diffusion', 'Cast Options', lang)}</DropdownMenuLabel>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem onClick={() => { const url = `${window.location.origin}/?mode=device&type=TV&agencyId=${agencyId}`; window.open(url, '_blank'); }}>
-                      <ExternalLink className="h-4 w-4 mr-2" />
+                      <ExternalLink className="h-4 w-4 me-2" />
                       <div><div>{getLocalizedString('فتح في تبويب جديد', 'Nouvel onglet', 'Open in New Tab', lang)}</div><div className="text-xs text-muted-foreground">{getLocalizedString('للأجهزة الذكية مع متصفح', 'Pour Smart TV avec navigateur', 'For smart TVs with browser', lang)}</div></div>
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={handleCastToChromecast}>
-                      <Cast className="h-4 w-4 mr-2" />
+                      <Cast className="h-4 w-4 me-2" />
                       <div><div>{getLocalizedString('بث Chromecast', 'Diffuser Chromecast', 'Chromecast Cast', lang)}</div><div className="text-xs text-muted-foreground">{getLocalizedString('يتطلب جهاز Chromecast متصل', 'Nécessite Chromecast', 'Requires Chromecast device', lang)}</div></div>
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={() => {
@@ -875,16 +875,16 @@ export function AgencyDevices() {
                       if (electronApi && electronApi.openTvScreen) { electronApi.openTvScreen({ url }); toast.success(getLocalizedString('تم فتح شاشة العرض على HDMI', 'Écran ouvert sur HDMI', 'TV screen opened on HDMI', lang)); }
                       else { navigator.clipboard.writeText(url); toast.info(getLocalizedString('تم نسخ الرابط — افتحه في تطبيق سطح المكتب BLASTI', 'Lien copié — ouvrez-le dans l\'app desktop BLASTI', 'URL copied — open in BLASTI desktop app', lang)); }
                     }}>
-                      <Cable className="h-4 w-4 mr-2" />
+                      <Cable className="h-4 w-4 me-2" />
                       <div><div>{getLocalizedString('شاشة HDMI', 'Écran HDMI', 'HDMI Screen', lang)}</div><div className="text-xs text-muted-foreground">{getLocalizedString('عبر تطبيق سطح المكتب', 'Via app de bureau', 'Via desktop app', lang)}</div></div>
                     </DropdownMenuItem>
                     <DropdownMenuSeparator />
                     <DropdownMenuItem onClick={() => { const url = `${window.location.origin}/?mode=device&type=TV&agencyId=${agencyId}`; navigator.clipboard.writeText(url); toast.success(getLocalizedString('تم نسخ رابط الشاشة', 'Lien copié', 'Screen URL copied', lang)); }}>
-                      <Copy className="h-4 w-4 mr-2" />
+                      <Copy className="h-4 w-4 me-2" />
                       {getLocalizedString('نسخ رابط الشاشة', 'Copier le lien', 'Copy Screen URL', lang)}
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={() => setTvQrDialogOpen(true)}>
-                      <QrCode className="h-4 w-4 mr-2" />
+                      <QrCode className="h-4 w-4 me-2" />
                       {getLocalizedString('عرض رمز QR', 'Afficher QR', 'Show QR Code', lang)}
                     </DropdownMenuItem>
                   </DropdownMenuContent>

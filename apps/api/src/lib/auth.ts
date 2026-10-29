@@ -19,6 +19,14 @@ export interface SessionUser {
   language: string
   avatarUrl: string | null
   agencyId: string | null
+  /**
+   * Security-0.6.13 — the client platform the token was minted for
+   * ('web' | 'mobile' | 'desktop', from the x-blasti-client header at
+   * login). Tokens minted for the mobile/desktop apps can NEVER touch the
+   * admin API (requireAdmin / requireRole('SUPER_ADMIN') reject them),
+   * regardless of role. Legacy tokens without the claim read as 'web'.
+   */
+  platform?: ClientPlatform
 }
 
 export interface SessionToken {
@@ -29,7 +37,68 @@ export interface SessionToken {
   language: string
   avatarUrl: string | null
   agencyId: string
+  platform?: ClientPlatform
   iat?: number  // Phase 2b: issued-at claim for stale JWT detection
+}
+
+// ─── Client Platform Policy (Security-0.6.13) ──────────────────────────────
+
+/**
+ * The platform a session was minted for, as declared by the client via the
+ * `x-blasti-client` header on every API request (see apps/web
+ * lib/api-client.ts buildAuthHeaders — 'mobile' for the Capacitor shell,
+ * 'desktop' for the Electron shell, 'web' for plain browsers).
+ */
+export type ClientPlatform = 'web' | 'mobile' | 'desktop'
+
+/**
+ * Which roles may hold a session on each platform. The mobile app serves
+ * CUSTOMERS and AGENCY users; the desktop console is AGENCY-ONLY; the plain
+ * web app (browser) hosts the admin console and accepts every role.
+ * null = no restriction.
+ */
+const PLATFORM_ALLOWED_ROLES: Record<ClientPlatform, string[] | null> = {
+  web: null,
+  mobile: ['CUSTOMER', 'AGENCY_OWNER', 'AGENCY_STAFF'],
+  desktop: ['AGENCY_OWNER', 'AGENCY_STAFF'],
+}
+
+/**
+ * Read (and validate) the declared client platform from a request.
+ * Absent/unknown values fall back to 'web' so legacy clients keep working —
+ * the enforcement teeth come from the platform claim baked into the JWT at
+ * mint time and from requireAdmin's claim check.
+ */
+export function resolveClientPlatform(c: Context): ClientPlatform {
+  const raw = (c.req.header('x-blasti-client') || '').toLowerCase().trim()
+  if (raw === 'mobile' || raw === 'desktop' || raw === 'web') return raw
+  return 'web'
+}
+
+/**
+ * Enforce the role×platform login matrix. Throws AuthError(403) when the
+ * role may not hold a session on this platform — the mobile/desktop apps
+ * must have NOTHING to do with the admin API, and the desktop app never
+ * carries customer sessions.
+ */
+export function assertPlatformLoginAllowed(platform: ClientPlatform, role: string): void {
+  const allowed = PLATFORM_ALLOWED_ROLES[platform]
+  if (allowed === null || allowed.includes(role)) return
+  if (role === 'SUPER_ADMIN') {
+    throw new AuthError('Admin login is not allowed on this app. Use the web console.', 403)
+  }
+  if (role === 'CUSTOMER' && platform === 'desktop') {
+    throw new AuthError('Customer login is not allowed on the desktop app.', 403)
+  }
+  throw new AuthError('This account type cannot sign in on this app.', 403)
+}
+
+/**
+ * True when the session's mint platform may touch the ADMIN API. Only plain
+ * web sessions (and legacy tokens without a claim) qualify.
+ */
+function platformMayUseAdminApi(platform: ClientPlatform | undefined): boolean {
+  return platform !== 'mobile' && platform !== 'desktop'
 }
 
 // ─── Configuration ─────────────────────────────────────────────────────────
@@ -56,8 +125,11 @@ function getSecretKey(): Uint8Array {
  * This replaces the NextAuth `encode()` function.
  * Task 81: `maxAgeSeconds` parametrizes the lifetime — remember-me logins
  * issue 3-day tokens, everything else keeps the 30-day default.
+ * Security-0.6.13: `platform` bakes the minting client's platform into the
+ * token (default 'web' for legacy callers) so requireAdmin can deny admin-API
+ * access to sessions minted inside the mobile/desktop apps.
  */
-export async function createSessionToken(user: SessionUser, maxAgeSeconds: number = SESSION_MAX_AGE): Promise<string> {
+export async function createSessionToken(user: SessionUser, maxAgeSeconds: number = SESSION_MAX_AGE, platform: ClientPlatform = 'web'): Promise<string> {
   const secret = getSecretKey()
   const token = await new SignJWT({
     id: user.id,
@@ -67,6 +139,7 @@ export async function createSessionToken(user: SessionUser, maxAgeSeconds: numbe
     language: user.language,
     avatarUrl: user.avatarUrl ?? null,
     agencyId: user.agencyId ?? '',
+    platform,
   })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
@@ -222,6 +295,9 @@ export async function getSessionUser(c?: Context): Promise<SessionUser | null> {
       language: payload.language,
       avatarUrl: payload.avatarUrl ?? null,
       agencyId: payload.agencyId ?? null,
+      // Security-0.6.13 — mint platform rides with the session. Tokens
+      // without the claim (pre-0.6.13) read as 'web' (legacy allowance).
+      platform: payload.platform ?? 'web',
     }
   } catch {
     return null
@@ -257,22 +333,36 @@ export async function requireAuth(c: Context): Promise<SessionUser> {
 
 /**
  * Requires SUPER_ADMIN role. Throws AuthError if not admin.
+ *
+ * Security-0.6.13 — PLATFORM GATE: sessions minted inside the mobile
+ * (Capacitor) or desktop (Electron) apps are rejected even when the role is
+ * SUPER_ADMIN. Those apps have nothing to do with the admin API; only
+ * sessions minted for the plain web console (or legacy claim-less tokens)
+ * may use it.
  */
 export async function requireAdmin(c: Context): Promise<SessionUser> {
   const user = await requireAuth(c)
   if (user.role !== 'SUPER_ADMIN') {
     throw new AuthError('Admin access required', 403)
   }
+  if (!platformMayUseAdminApi(user.platform)) {
+    throw new AuthError('Admin API is not accessible from this app.', 403)
+  }
   return user
 }
 
 /**
  * Requires auth + specific role(s). Throws AuthError if wrong role.
+ * Security-0.6.13 — same platform gate as requireAdmin whenever SUPER_ADMIN
+ * is among the accepted roles (e.g. agencies.ts role-wrapped admin surfaces).
  */
 export async function requireRole(c: Context, ...roles: string[]): Promise<SessionUser> {
   const user = await requireAuth(c)
   if (!roles.includes(user.role)) {
     throw new AuthError('Insufficient permissions', 403)
+  }
+  if (roles.includes('SUPER_ADMIN') && !platformMayUseAdminApi(user.platform)) {
+    throw new AuthError('Admin API is not accessible from this app.', 403)
   }
   return user
 }

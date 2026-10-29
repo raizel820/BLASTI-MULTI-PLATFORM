@@ -27,6 +27,8 @@ app.get('/profile', async (c) => {
       where: { id: user.id },
       select: {
         id: true, username: true, fullName: true, email: true, phoneNumber: true,
+        // UID-0.6.14 — immutable account identifier shown in the profile.
+        uid: true,
         role: true, language: true, avatarUrl: true, freeSmsCount: true,
         notificationPreferences: true, reminderMinutes: true, smsNotificationsEnabled: true,
         notificationPref: true, isActive: true, createdAt: true,
@@ -94,6 +96,8 @@ app.patch('/profile', async (c) => {
       data: updateData,
       select: {
         id: true, username: true, fullName: true, email: true, phoneNumber: true,
+        // UID-0.6.14 — returned unchanged; NEVER editable (no write path).
+        uid: true,
         role: true, language: true, avatarUrl: true, freeSmsCount: true,
         notificationPreferences: true, reminderMinutes: true, smsNotificationsEnabled: true, isActive: true,
       },
@@ -221,6 +225,9 @@ app.delete('/delete-account', async (c) => {
       await tx.review.deleteMany({ where: { userId } })
       await tx.delayedJob.deleteMany({ where: { userId } })
       await tx.deviceRegistration.deleteMany({ where: { userId } })
+      // P2 fix: SupportTicket.userId is a required FK — without this the
+      // user.delete below threw P2003 → 500 for any user with tickets.
+      await tx.supportTicket.deleteMany({ where: { userId } })
       await tx.transaction.updateMany({ where: { reviewedBy: userId }, data: { reviewedBy: null } })
       await tx.reservation.deleteMany({ where: { userId } })
 

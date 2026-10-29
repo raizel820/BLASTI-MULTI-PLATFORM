@@ -34,6 +34,14 @@ app.get('/', async (c) => {
         bankRib: '00 000 00000 000 0000 000',
         bankName: 'BNA',
         ewalletNumber: '0XXX XXX XXX',
+        // r21-6 — display-safe transfer details (defaults until the super
+        // admin fills them in; the UI falls back to i18n placeholders).
+        ccpHolderName: null,
+        ccpAddress: null,
+        bankHolderName: null,
+        bankAddress: null,
+        baridiMobEnabled: false,
+        baridiMobNumber: null,
         chargilyEnabled,
         chargilyMode: chargilyLive ? 'live' : 'sandbox',
         chargilyMethods: chargilyEnabled ? ['edahabia', 'cib'] : [],
@@ -50,6 +58,15 @@ app.get('/', async (c) => {
       bankRib: settings.bankRib,
       bankName: settings.bankName,
       ewalletNumber: settings.ewalletNumber,
+      // r21-6 — display-safe transfer details (holder/address) + BaridiMob.
+      // NEVER any gateway keys here — these fields are meant to be shown to
+      // the payer in the subscription dialog.
+      ccpHolderName: settings.ccpHolderName ?? null,
+      ccpAddress: settings.ccpAddress ?? null,
+      bankHolderName: settings.bankHolderName ?? null,
+      bankAddress: settings.bankAddress ?? null,
+      baridiMobEnabled: settings.baridiMobEnabled,
+      baridiMobNumber: settings.baridiMobNumber ?? null,
       chargilyEnabled,
       chargilyMode: chargilyLive ? 'live' : 'sandbox',
       chargilyMethods: chargilyEnabled ? ['edahabia', 'cib'] : [],

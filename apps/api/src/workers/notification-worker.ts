@@ -215,12 +215,17 @@ async function processPendingJobs(): Promise<number> {
 
       // ── Step 5: Update status and deduct balance ──
       if (sendResult.success) {
-        // Deduct 1 from the appropriate balance
+        // Deduct 1 from the appropriate balance — P0-1: atomic conditional
+        // decrement (gte:1) so concurrent workers can never drive the balance
+        // negative; the stale pre-check in Step 3 races by design.
         if (agency.sponsorSms) {
-          await db.agency.update({
-            where: { id: agencyId },
+          const dec = await db.agency.updateMany({
+            where: { id: agencyId, smsBalance: { gte: 1 } },
             data: { smsBalance: { decrement: 1 } },
           })
+          if (dec.count === 0) {
+            console.warn(`[notification-worker] Balance exhausted mid-flight for job ${job.id} — sent on grace, skipping deduction`)
+          }
         }
         // Note: sendSms() already deducts from user.freeSmsCount when userId is passed,
         // so we only need to handle the agency-sponsored case explicitly.

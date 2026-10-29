@@ -179,6 +179,7 @@ export function CustomerProfile() {
           phoneNumber={profile.phoneNumber}
           avatarUrl={profile.avatarUrl}
           saving={profile.savingPersonalInfo}
+          uid={user?.uid}
           onFullNameChange={profile.setFullName}
           onEmailChange={profile.setEmail}
           onPhoneNumberChange={profile.setPhoneNumber}

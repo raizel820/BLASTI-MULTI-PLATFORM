@@ -137,6 +137,9 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
       'latitude', 'longitude', 'postalCode', 'locationVerified',
       'locationSource', 'locationUpdatedAt', 'googlePlaceId',
       'providerLocationId',
+      // Agencies Management — specialties the agency serves (JSON string of
+      // Specialty ids; plain string column, serializes byte-exact).
+      'specialtyIds',
     ],
     immutableFields: ['id', 'createdAt', 'updatedAt'],
     localOnlyFields: ['syncVersion', 'syncedAt'],
@@ -174,7 +177,9 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
       'smsNotificationsEnabled', 'notificationPref', 'isAppOnline', 'fcmToken',
       'isActive', 'lastRoleChangeAt',
     ],
-    immutableFields: ['id', 'passwordHash', 'createdAt', 'updatedAt'],
+    // UID-0.6.14 — the account UID is assigned once on the cloud and is
+    // NEVER mutable from any client (a desktop push must not alter it).
+    immutableFields: ['id', 'passwordHash', 'createdAt', 'updatedAt', 'uid'],
     localOnlyFields: ['syncVersion', 'syncedAt'],
     cloudOnlyFields: [],
     lwwFields: ['updatedAt'],
@@ -278,7 +283,11 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     isAgencyScoped: true,
     agencyField: null, // scoped via Branch relation
     conflictStrategy: ConflictStrategy.VERSION_AWARE,
-    mutableFields: ['number', 'name', 'nameAr', 'nameFr', 'isActive', 'branchId', 'staffId', 'occupiedAt', 'currentReservationId'],
+    mutableFields: [
+      'number', 'name', 'nameAr', 'nameFr', 'isActive', 'branchId', 'staffId', 'occupiedAt', 'currentReservationId',
+      // r21-7 — counter CONTROL columns (staffId/occupiedAt stay as mirrors).
+      'controlledByUserId', 'controlledByStaffId', 'controlClaimedAt', 'controlHeartbeatAt',
+    ],
     immutableFields: ['id', 'createdAt', 'updatedAt'],
     localOnlyFields: ['syncVersion', 'syncedAt'],
     cloudOnlyFields: [],
@@ -292,6 +301,62 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     isReadOnly: false,
     syncOrder: 8,
     dateFields: ['createdAt', 'updatedAt', 'syncedAt'],
+  },
+
+  {
+    // r21-7 — Counter↔Service binding join table. Rows are created/deleted by
+    // the counter PATCH/POST binding write; nothing on the row is ever mutated.
+    model: 'CounterService',
+    delegate: 'counterService',
+    label: 'Counter Service',
+    isSynced: true,
+    isAgencyScoped: true,
+    agencyField: null, // scoped via the Counter → Branch → Agency relation
+    conflictStrategy: ConflictStrategy.VERSION_AWARE,
+    mutableFields: [], // composite-PK join row — immutable, delete + recreate
+    immutableFields: ['counterId', 'serviceId', 'createdAt'],
+    localOnlyFields: ['syncVersion', 'syncedAt'],
+    cloudOnlyFields: [],
+    lwwFields: ['updatedAt'],
+    versionField: 'syncVersion',
+    syncedAtField: 'syncedAt',
+    dependencies: ['Counter', 'Service'],
+    canCreateOffline: true,
+    canUpdateOffline: false,
+    canDeleteOffline: true,
+    isReadOnly: false,
+    syncOrder: 22,
+    dateFields: ['createdAt', 'syncedAt'],
+  },
+
+  {
+    // r21-7 — counter control takeover requests (server-driven state machine:
+    // the sweeper auto-resolves PENDING rows, so the desktop mirrors them
+    // read-mostly via APPEND_ONLY semantics).
+    model: 'CounterControlRequest',
+    delegate: 'counterControlRequest',
+    label: 'Counter Control Request',
+    isSynced: true,
+    isAgencyScoped: true,
+    agencyField: 'agencyId',
+    conflictStrategy: ConflictStrategy.APPEND_ONLY,
+    mutableFields: [],
+    immutableFields: [
+      'id', 'counterId', 'agencyId', 'fromUserId', 'fromStaffId',
+      'requestedAt', 'expiresAt', 'status', 'resolvedByUserId', 'resolvedAt',
+    ],
+    localOnlyFields: ['syncVersion', 'syncedAt'],
+    cloudOnlyFields: [],
+    lwwFields: ['updatedAt'],
+    versionField: 'syncVersion',
+    syncedAtField: 'syncedAt',
+    dependencies: ['Counter', 'Agency'],
+    canCreateOffline: false,
+    canUpdateOffline: false,
+    canDeleteOffline: false,
+    isReadOnly: true,
+    syncOrder: 23,
+    dateFields: ['requestedAt', 'expiresAt', 'resolvedAt', 'syncedAt'],
   },
 
   {
@@ -431,6 +496,9 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     mutableFields: [
       'ccpEnabled', 'bankEnabled', 'electronicEnabled', 'ccpAccount', 'ccpKey',
       'bankName', 'bankAccount', 'bankRib', 'ewalletNumber',
+      // r21-6 — display-safe transfer details + BaridiMob.
+      'ccpHolderName', 'ccpAddress', 'bankHolderName', 'bankAddress',
+      'baridiMobEnabled', 'baridiMobNumber',
     ],
     immutableFields: ['id', 'createdAt', 'updatedAt'],
     localOnlyFields: ['syncVersion', 'syncedAt'],
@@ -662,7 +730,7 @@ export const SYNC_REGISTRY: SyncModelConfig[] = [
     isAgencyScoped: false,
     agencyField: null,
     conflictStrategy: ConflictStrategy.LAST_WRITE_WINS,
-    mutableFields: ['name', 'nameFr', 'nameAr', 'icon', 'isCustom', 'createdBy'],
+    mutableFields: ['name', 'nameFr', 'nameAr', 'icon', 'isCustom', 'createdBy', 'slug', 'isActive', 'sortOrder'],
     immutableFields: ['id', 'createdAt', 'updatedAt'],
     localOnlyFields: ['syncVersion', 'syncedAt'],
     cloudOnlyFields: [],

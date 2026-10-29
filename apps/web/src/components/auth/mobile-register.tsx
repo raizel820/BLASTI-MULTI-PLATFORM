@@ -24,6 +24,7 @@
 
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { apiFetch } from '@/lib/api-fetch';
+import { adoptLocalLanguagePreference } from '@/hooks/use-language';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useUpload } from '@/hooks/use-upload';
@@ -233,7 +234,13 @@ export function MobileRegisterForm() {
     onSuccess: (result) => {
       uploadedAvatarUrlRef.current = result.url;
       setSelectedPreset(null);
-      setAvatarPreview(getProxiedUrl(result.url));
+      // 0.6.18 fix (field: "uploaded image shows just a placeholder in the
+      // form"): the old code swapped the LOCAL blob/data-URL preview for the
+      // remote http URL — on the phone that cleartext URL can fail to paint
+      // inside the WebView (no onError on the <img>), leaving a blank circle.
+      // The picked image is ALREADY on screen as a local preview — keep it;
+      // the remote URL is only needed for submission (uploadedAvatarUrlRef).
+      setAvatarPreview((prev) => prev ?? getProxiedUrl(result.url));
       toast.success(t('avatarUpdated' as any));
     },
     onError: (error) => {
@@ -453,7 +460,7 @@ export function MobileRegisterForm() {
   const bootstrapSession = (user: unknown, token: string | undefined, msg: string) => {
     setRegistrationSuccess(true);
     setTimeout(() => {
-      setUser(user as never);
+      setUser(adoptLocalLanguagePreference(user as never) as never);
       if (token) {
         setSessionToken(token);
         try { setNativeSessionToken(token); } catch { /* non-native runtime */ }

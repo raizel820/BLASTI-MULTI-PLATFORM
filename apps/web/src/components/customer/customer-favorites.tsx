@@ -17,6 +17,8 @@ import { toLocalDateString } from '@/lib/date-utils';
 // Task 84 — IndexedDB stale-while-revalidate: favorites render instantly from
 // the last-known list (shared key with customer-home) and refresh silently.
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 
 import { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -80,9 +82,15 @@ export function CustomerFavorites() {
   const [sortBy, setSortBy] = useState<SortOption>('recent');
   const [heartBreakingId, setHeartBreakingId] = useState<string | null>(null);
 
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
+
   useEffect(() => {
     fetchFavorites();
-  }, []);
+    // resumeNonce — 0.6.16: refetch when the app resumes to the foreground
+    // (close-and-reopen resumes the WebView without a remount).
+  }, [resumeNonce]);
 
   const fetchFavorites = async () => {
     if (!user?.id) return;
@@ -183,7 +191,13 @@ export function CustomerFavorites() {
         setView('customer-queue');
       } else {
         const data = await res.json();
-        toast.error(data.error || t('error'));
+        // r23 — the agency serves several services: the API refuses a
+        // service-less join; point the customer at the agency page picker.
+        if (data.error === 'SERVICE_SELECTION_REQUIRED') {
+          toast.error(t('selectServiceRequired'));
+        } else {
+          toast.error(data.error || t('error'));
+        }
       }
     } catch {
       toast.error(t('error'));

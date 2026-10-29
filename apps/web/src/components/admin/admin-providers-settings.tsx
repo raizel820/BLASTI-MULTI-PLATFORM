@@ -2430,14 +2430,14 @@ export function AdminProvidersSettings() {
                   </div>
                 </div>
                 {/* Final rendered email (branded layout incl. logos) in a script-safe iframe */}
-                <div className="rounded-b-xl border border-border overflow-hidden bg-white">
+                <div className="rounded-b-xl border border-border overflow-hidden bg-white dark:bg-gray-900">
                   <iframe
                     title="email-template-preview"
                     sandbox=""
                     srcDoc={previewData.html
                       ? withAbsoluteAssetUrls(previewData.html)
                       : `<pre style="white-space:pre-wrap;font-family:inherit;padding:16px;margin:0;">${previewData.text.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</pre>`}
-                    className="w-full h-[400px] border-0 bg-white"
+                    className="w-full h-[400px] border-0 bg-white dark:bg-gray-900"
                   />
                 </div>
                 <Collapsible>

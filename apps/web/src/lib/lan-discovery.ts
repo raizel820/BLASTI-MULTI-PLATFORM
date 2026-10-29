@@ -22,6 +22,18 @@ import { getLocalIp } from './get-local-ip';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
+/**
+ * 0.6.23 (R-21F-S2) — the elected master as advertised by a node's beacon
+ * (`GET /api/discover` additive fields). Old desktops omit everything here.
+ */
+export interface DiscoveredMasterHint {
+  instanceId?: string;
+  name?: string;
+  ip?: string;
+  port?: number;
+  term?: number;
+}
+
 export interface DiscoveredServer {
   service: string;
   version: string;
@@ -36,6 +48,23 @@ export interface DiscoveredServer {
   uptime: number;
   networkInterface?: string;
   syncReady?: boolean;
+  // ── 0.6.23 LAN authority (additive, optional — absent on old desktops) ──
+  /** 'MASTER' | 'FOLLOWER' | 'CANDIDATE' — election role of this node. */
+  role?: string;
+  /** Current election term of this node. */
+  term?: number;
+  /** Node hardware/health score used by the election. */
+  specScore?: number;
+  /** Stable instance id of this node. */
+  instanceId?: string;
+  /** Agency scope this node serves (null = unrestricted). */
+  agencyId?: string | null;
+  /** Branch scope this node serves (null = unrestricted). */
+  branchId?: string | null;
+  /** The node's view of the current master (null while it IS the master). */
+  master?: DiscoveredMasterHint | null;
+  /** True when this desktop runs a LAN-authority-capable build. */
+  lanAuthority?: boolean;
 }
 
 export interface DiscoveryState {
@@ -112,6 +141,16 @@ export function clearCache(): void {
 
 // ─── Single IP Scanner ──────────────────────────────────────────────────────
 
+/**
+ * 0.6.23 — rank a discovered node for sweep preference: an elected MASTER
+ * always beats a FOLLOWER, which beats an unknown/CANDIDATE node.
+ */
+function lanAuthorityRank(server: DiscoveredServer): number {
+  if (server.role === 'MASTER') return 0;
+  if (server.role === 'FOLLOWER') return 1;
+  return 2;
+}
+
 async function scanIP(ip: string, port: number): Promise<DiscoveredServer | null> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), DISCOVERY_TIMEOUT);
@@ -134,7 +173,21 @@ async function scanIP(ip: string, port: number): Promise<DiscoveredServer | null
     // helper) responses used to be cached here and made the cache flap
     // between the cloud origin and the real LAN server.
     if (data.service === 'blasti-local') {
-      return data as DiscoveredServer;
+      const beacon = data as DiscoveredServer;
+      // 0.6.23 (R-21F-S2): pass the LAN-authority election fields through
+      // when the desktop serves them (additive — absent fields stay unset and
+      // everything behaves exactly as before on old desktops).
+      return {
+        ...beacon,
+        role: typeof data.role === 'string' ? data.role : undefined,
+        term: typeof data.term === 'number' ? data.term : undefined,
+        specScore: typeof data.specScore === 'number' ? data.specScore : undefined,
+        instanceId: typeof data.instanceId === 'string' ? data.instanceId : undefined,
+        agencyId: typeof data.agencyId === 'string' ? data.agencyId : null,
+        branchId: typeof data.branchId === 'string' ? data.branchId : null,
+        master: data.master && typeof data.master === 'object' ? (data.master as DiscoveredMasterHint) : null,
+        lanAuthority: data.lanAuthority === true,
+      };
     }
     return null;
   } catch {
@@ -196,7 +249,11 @@ async function scanSubnet(
       })
     );
 
-    const found = results.find((r) => r !== null);
+    // 0.6.23: prefer an elected MASTER over a FOLLOWER/unknown node when a
+    // single sweep batch finds several desktops (stable rank, then first hit).
+    const found = results
+      .filter((r): r is DiscoveredServer => r !== null)
+      .sort((a, b) => lanAuthorityRank(a) - lanAuthorityRank(b))[0];
     if (found) return found;
   }
 

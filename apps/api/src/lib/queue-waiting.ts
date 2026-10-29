@@ -59,9 +59,20 @@ export interface WaitingCandidate {
 }
 
 /** Local 'YYYY-MM-DD' — MUST match lib/queue-scheduler.ts localDateString. */
+// P1-9: the bucketing timezone is PINNED to Africa/Algiers (the product's
+// market) instead of the server's TZ — a UTC VPS previously bucketed days at
+// 01:00 local Algerian time (midnight UTC). All date-scoped logic (callable
+// criteria, daily queue numbers, cron windows) flows through here.
+export const APP_TIMEZONE = 'Africa/Algiers'
+
 export function todayLocalDateString(now: Date = new Date()): string {
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: APP_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(now)
+  return parts // en-CA yields YYYY-MM-DD directly
 }
 
 /** Why a WAITING ticket is not callable yet (null → it IS callable). */

@@ -139,36 +139,19 @@ export type UserLanguage = (typeof UserLanguage)[keyof typeof UserLanguage]
 //   - validating Agency.category values (enum-like string column)
 //   - the collision check in POST /api/agency-categories (a user-created
 //     category name must not shadow a built-in key)
+// Agency types — REDUCED to exactly 4 per product directive (worklog task A,
+// R-6 session): doctor, clinic, law office, barber. Legacy values are
+// normalized by packages/db/scripts/normalize-agency-categories.mjs; unknown
+// strings still render (humanized label + fallback icon) until re-picked.
 export const AgencyCategory = {
+  DOCTOR: 'DOCTOR',
   CLINIC: 'CLINIC',
-  HOSPITAL: 'HOSPITAL',
-  DENTAL_CLINIC: 'DENTAL_CLINIC',
-  LABORATORY: 'LABORATORY',
-  PHARMACY: 'PHARMACY',
-  VETERINARY: 'VETERINARY',
-  BANK: 'BANK',
-  POST_OFFICE: 'POST_OFFICE',
-  TELECOM: 'TELECOM',
-  INSURANCE: 'INSURANCE',
   LAW_FIRM: 'LAW_FIRM',
-  NOTARY: 'NOTARY',
-  GOVERNMENT: 'GOVERNMENT',
-  EDUCATION: 'EDUCATION',
-  AGENCY: 'AGENCY',
-  TRAVEL: 'TRAVEL',
-  REAL_ESTATE: 'REAL_ESTATE',
-  CAR_SERVICE: 'CAR_SERVICE',
   BARBER: 'BARBER',
-  BEAUTY_SALON: 'BEAUTY_SALON',
-  RESTAURANT: 'RESTAURANT',
-  CAFE: 'CAFE',
-  RETAIL: 'RETAIL',
-  HOTEL: 'HOTEL',
-  OTHER: 'OTHER',
 } as const
 export type AgencyCategory = (typeof AgencyCategory)[keyof typeof AgencyCategory]
 
-/** All built-in category keys (25) — collision list for custom category creation. */
+/** All built-in category keys (4) — collision list for custom category creation. */
 export const BUILT_IN_AGENCY_CATEGORY_KEYS: string[] = Object.values(AgencyCategory)
 
 // ─── Notification Type ────────────────────────────────────────────────────────

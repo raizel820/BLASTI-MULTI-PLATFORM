@@ -111,7 +111,7 @@ function statusBadgeClass(status: OrderStatus): string {
     case 'REJECTED':
       return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400';
     case 'FULFILLED':
-      return 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400';
+      return 'bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-400';
     default:
       return 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300';
   }
@@ -126,7 +126,7 @@ function statusDotClass(status: OrderStatus): string {
     case 'REJECTED':
       return 'bg-red-500';
     case 'FULFILLED':
-      return 'bg-blue-500';
+      return 'bg-teal-500';
     default:
       return 'bg-gray-500';
   }
@@ -417,7 +417,7 @@ export function AdminHardwareRequests() {
       value: stats?.fulfilled ?? 0,
       status: 'FULFILLED',
       icon: Truck,
-      accent: 'from-blue-100 to-sky-100 dark:from-blue-900/40 dark:to-sky-900/30',
+      accent: 'from-teal-100 to-cyan-100 dark:from-teal-900/40 dark:to-cyan-900/30',
     },
   ];
 
@@ -714,7 +714,7 @@ export function AdminHardwareRequests() {
                         {isApproved && (
                           <Button
                             size="sm"
-                            className="h-8 rounded-xl bg-blue-600 hover:bg-blue-700 text-white gap-1.5"
+                            className="h-8 rounded-xl bg-teal-600 hover:bg-teal-700 text-white gap-1.5"
                             onClick={() => handleFulfill(order)}
                             disabled={isActing}
                           >

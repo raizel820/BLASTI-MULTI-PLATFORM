@@ -211,8 +211,71 @@ app.post('/', async (c) => {
 // Two shapes are served:
 //   /file/<bucket>/<yyyy>/<mm>/<name>   (organized, Round 15+)
 //   /file/<bucket>/<name>               (legacy flat, pre-Round 15)
+//
+// Caching contract (cache-1): the blobs are CONTENT-ADDRESSED (timestamp +
+// uuid in the name → never mutated in place), so `immutable` is correct —
+// but WebViews (Capacitor Android, Electron) evict HTTP-cache entries
+// aggressively and re-download the full body every time. A strong ETag +
+// Last-Modified with If-None-Match/If-Modified-Since handling turns every
+// revalidation into a tiny 304 instead of a full re-download, which is what
+// kills the avatar placeholder flash on navigation.
 
-function fileResponse(data: Buffer, name: string): Response {
+/** Strong validator: content length + mtime — changes whenever bytes change. */
+async function fileValidators(filePath: string, data: Buffer): Promise<{ etag: string; lastModified: string }> {
+  let mtimeMs = Date.now()
+  try {
+    const st = await fs.promises.stat(filePath)
+    mtimeMs = st.mtimeMs
+  } catch {
+    // stat failure is non-fatal — fall back to now (ETag still unique per size)
+  }
+  return {
+    etag: `"${data.length.toString(16)}-${Math.floor(mtimeMs).toString(16)}"`,
+    lastModified: new Date(mtimeMs).toUTCString(),
+  }
+}
+
+/** 304 helper — validators only, never a body. */
+function notModified(etag: string, lastModified: string): Response {
+  return new Response(null, {
+    status: 304,
+    headers: {
+      ETag: etag,
+      'Last-Modified': lastModified,
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    },
+  })
+}
+
+/** Conditional-request check per RFC 7232 (If-None-Match wins over date). */
+function clientHasCurrent(c: { req: { header: (n: string) => string | undefined } }, etag: string, lastModified: string): boolean {
+  const inm = c.req.header('If-None-Match')
+  if (inm) {
+    // "*" or a list — match weakly (strip W/ prefix) to be lenient with proxies.
+    return inm
+      .split(',')
+      .map((t) => t.trim().replace(/^W\//, ''))
+      .some((t) => t === '*' || t === etag)
+  }
+  const ims = c.req.header('If-Modified-Since')
+  if (ims) {
+    const since = Date.parse(ims)
+    if (!Number.isNaN(since)) {
+      const modified = Date.parse(lastModified)
+      if (!Number.isNaN(modified)) return Math.floor(modified / 1000) <= Math.floor(since / 1000)
+    }
+  }
+  return false
+}
+
+async function fileResponse(data: Buffer, name: string, filePath?: string, req?: { req: { header: (n: string) => string | undefined } }): Promise<Response> {
+  const { etag, lastModified } = filePath
+    ? await fileValidators(filePath, data)
+    : { etag: `"${createHash('sha1').update(data).digest('hex').slice(0, 20)}"`, lastModified: new Date().toUTCString() }
+  // Conditional GET → 304 (no body) — turns WebView revalidations into ~200-byte round-trips.
+  if (req && clientHasCurrent(req, etag, lastModified)) {
+    return notModified(etag, lastModified)
+  }
   return new Response(new Uint8Array(data), {
     status: 200,
     headers: {
@@ -220,6 +283,8 @@ function fileResponse(data: Buffer, name: string): Response {
       'Content-Length': String(data.length),
       'Cache-Control': 'public, max-age=31536000, immutable',
       'Content-Disposition': 'inline',
+      ETag: etag,
+      'Last-Modified': lastModified,
     },
   })
 }
@@ -238,7 +303,7 @@ app.get('/file/:type/:yyyy/:mm/:name', async (c) => {
   }
   try {
     const data = await fs.promises.readFile(filePath)
-    return fileResponse(data, name)
+    return await fileResponse(data, name, filePath, c)
   } catch {
     return c.json({ success: false, error: 'File not found' }, 404)
   }
@@ -255,7 +320,7 @@ app.get('/file/:type/:name', async (c) => {
 
   try {
     const data = await fs.promises.readFile(filePath)
-    return fileResponse(data, name)
+    return await fileResponse(data, name, filePath, c)
   } catch {
     return c.json({ success: false, error: 'File not found' }, 404)
   }

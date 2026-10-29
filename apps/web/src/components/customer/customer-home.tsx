@@ -27,11 +27,19 @@ import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 // Task 84 — IndexedDB stale-while-revalidate: the home screen paints instantly
 // from the last-known payload (even fully offline) and refreshes silently.
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+// (close-and-reopen on phones/Electron resumes the WebView WITHOUT a reload
+// — no remount, no refetch, silently-dead socket → stale screens until a
+// manual refresh; see lib/resume-refresh.ts for the full root cause).
+import { useResumeRefresh } from '@/lib/resume-refresh';
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
-import { getProxiedUrl } from '@/lib/utils';
+// Agencies Management — per-category terminology scope for the in-page agency
+// detail view ("Patient Reviews" instead of "Customer Reviews" for clinics).
+import { useCategoryTermScope } from '@/hooks/use-category-terms';
+import { UserAvatar } from '@/components/shared/user-avatar';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
@@ -61,6 +69,8 @@ import {
   RefreshCw,
   Navigation,
   MessageCircle,
+  Briefcase,
+  CheckCircle2,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -95,6 +105,8 @@ function mapActiveReservations(rows: Array<Record<string, unknown>>): ActiveTick
     const agency = r.agency as { name?: string; id?: string; nameAr?: string; nameFr?: string } | undefined;
     const service = r.service as { name?: string; nameAr?: string; nameFr?: string } | undefined;
     const eta = r.eta as { estimatedMaxMinutes?: number } | undefined;
+    // r21-8 — counter pointer when the payload carries one.
+    const counter = r.counter as { name?: string; number?: number } | null | undefined;
     return {
       agencyId: agency?.id || (r.agencyId as string) || '',
       agencyName: agency?.name || '',
@@ -109,6 +121,7 @@ function mapActiveReservations(rows: Array<Record<string, unknown>>): ActiveTick
       estimatedWait: (r.estimatedWait as number | undefined) ?? eta?.estimatedMaxMinutes ?? undefined,
       position: (r.position as number) || (r.queueNumber as number) || 0,
       status: r.status as string | undefined,
+      counterName: counter?.name || (counter?.number != null ? `#${counter.number}` : undefined),
     };
   });
 }
@@ -126,6 +139,11 @@ export function CustomerHome() {
   const [fetchError, setFetchError] = useState(false);
   const [agencyCode, setAgencyCode] = useState('');
   const [selectedAgency, setSelectedAgency] = useState<AgencyDetail | null>(null);
+  // Agencies Management — per-category terminology for the detail view. Called
+  // unconditionally in the body: null slug (list view) clears the scope, an
+  // open detail activates that agency's category words; the hook's internal
+  // version bump re-renders THIS component so every t() re-evaluates.
+  useCategoryTermScope(selectedAgency?.category);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [favoriteIds, setFavoriteIds] = useState<Set<string>>(new Set());
   const [togglingFav, setTogglingFav] = useState<string | null>(null);
@@ -160,6 +178,13 @@ export function CustomerHome() {
   const [dateDialogOpen, setDateDialogOpen] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | undefined>(undefined);
   const [pendingJoin, setPendingJoin] = useState<{ agencyId: string; serviceId?: string } | null>(null);
+  // r23 — explicit service selection: when the join dialog opens without a
+  // preset service, the agency's active services are fetched so the dialog
+  // can REQUIRE a pick whenever it serves more than one.
+  const [pendingServices, setPendingServices] = useState<
+    Array<{ id: string; name: string; nameAr?: string | null; nameFr?: string | null; prefix?: string }>
+  >([]);
+  const [pendingServiceId, setPendingServiceId] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
   const [preferredTime, setPreferredTime] = useState('');
   const [fixedTimeEnabled, setFixedTimeEnabled] = useState(false);
@@ -169,6 +194,13 @@ export function CustomerHome() {
   // per mount (the polling loop owns the screen afterwards).
   const activeCachePainted = useRef(false);
 
+  // 0.6.16 — resume revalidation: bumps a nonce that the fetch effects below
+  // depend on, so coming back to the foreground refetches agencies,
+  // favorites and the active-ticket strip with the view's own fetch paths
+  // (cache-first paint + network revalidate).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
+
   useEffect(() => {
     fetchAgencies();
     // Load recent searches from localStorage
@@ -176,7 +208,7 @@ export function CustomerHome() {
       const stored = localStorage.getItem('blasti-recent-searches');
       if (stored) setRecentSearches(JSON.parse(stored));
     } catch { /* silent */ }
-  }, []);
+  }, [resumeNonce]);
 
   // Handle pending agency code from QR deep link
   useEffect(() => {
@@ -210,7 +242,7 @@ export function CustomerHome() {
 
   useEffect(() => {
     fetchFavorites();
-  }, [fetchFavorites]);
+  }, [fetchFavorites, resumeNonce]);
 
   const fetchAgencies = async () => {
     setLoading(true);
@@ -445,6 +477,8 @@ export function CustomerHome() {
       return;
     }
     setPendingJoin({ agencyId, serviceId });
+    setPendingServices([]);
+    setPendingServiceId(null);
     setSelectedDate(undefined);
     setDateDialogOpen(true);
   };
@@ -457,9 +491,32 @@ export function CustomerHome() {
     }
     // Open date picker dialog instead of joining directly
     setPendingJoin({ agencyId, serviceId });
+    setPendingServices([]);
+    setPendingServiceId(null);
     setSelectedDate(undefined); // Reset to default (today)
     setDateDialogOpen(true);
   };
+
+  // r23 — fetch the pending agency's active services while the join dialog
+  // is open and no service was preselected (quick-join from the cards).
+  useEffect(() => {
+    if (!dateDialogOpen || !pendingJoin || pendingJoin.serviceId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiFetch(`/api/agencies/${encodeURIComponent(pendingJoin.agencyId)}`);
+        if (!res.ok || cancelled) return;
+        const data = await res.json().catch(() => null);
+        const detail = (data?.agency ?? data) as {
+          services?: Array<{ id: string; name: string; nameAr?: string | null; nameFr?: string | null; prefix?: string }>;
+        } | null;
+        if (!cancelled) setPendingServices(Array.isArray(detail?.services) ? detail.services : []);
+      } catch {
+        /* silent — the API's single-service rule still guards the join */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [dateDialogOpen, pendingJoin]);
 
   const confirmJoinQueue = async () => {
     if (!user?.id) {
@@ -469,10 +526,17 @@ export function CustomerHome() {
       return;
     }
     if (!pendingJoin) return;
+    // r23 — explicit service choice required whenever the agency serves
+    // several services (mirrors the API's SERVICE_SELECTION_REQUIRED gate).
+    const chosenServiceId = pendingJoin.serviceId || pendingServiceId;
+    if (!chosenServiceId && pendingServices.length > 1) {
+      toast.error(t('selectServiceRequired'));
+      return;
+    }
     setJoining(true);
     try {
       const body: Record<string, string | boolean> = { userId: user.id, agencyId: pendingJoin.agencyId };
-      if (pendingJoin.serviceId) body.serviceId = pendingJoin.serviceId;
+      if (chosenServiceId) body.serviceId = chosenServiceId;
       // Add reserved date if selected (not today)
       if (selectedDate) {
         const today = new Date();
@@ -506,7 +570,11 @@ export function CustomerHome() {
         setFixedTimeEnabled(false);
         setView('customer-queue');
       } else {
-        toast.error(data.error || t('error'));
+        if (data.error === 'SERVICE_SELECTION_REQUIRED') {
+          toast.error(t('selectServiceRequired'));
+        } else {
+          toast.error(data.error || t('error'));
+        }
       }
     } catch {
       toast.error(t('error'));
@@ -622,7 +690,9 @@ export function CustomerHome() {
     fetchActiveReservations();
     timer = setTimeout(tick, NORMAL);
     return () => { stopped = true; if (timer) clearTimeout(timer); };
-  }, [user?.id]);
+    // resumeNonce — 0.6.16: a resume bumps the nonce → the poller remounts
+    // and immediately fetches fresh active tickets (no 30s wait).
+  }, [user?.id, resumeNonce]);
 
   // Compute quick stats
   const openAgencyCount = useMemo(() => agencies.filter(a => a.isQueueOpen && !a.isPaused).length, [agencies]);
@@ -662,7 +732,7 @@ export function CustomerHome() {
   }, [agencies]);
 
   const dateDialogContent = (
-    <Dialog open={dateDialogOpen} onOpenChange={(open) => { setDateDialogOpen(open); if (!open) { setPendingJoin(null); setSelectedDate(undefined); } }}>
+    <Dialog open={dateDialogOpen} onOpenChange={(open) => { setDateDialogOpen(open); if (!open) { setPendingJoin(null); setSelectedDate(undefined); setPendingServiceId(null); } }}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
@@ -674,6 +744,45 @@ export function CustomerHome() {
           </DialogDescription>
         </DialogHeader>
         <div className="py-2">
+          {/* r23 — REQUIRED service picker whenever the agency serves several
+              services (the API rejects service-less joins in that case). */}
+          {pendingServices.length > 1 && (
+            <div className="mb-4 pb-4 border-b border-border">
+              <div className="flex items-center gap-2 mb-1">
+                <Briefcase className="h-4 w-4 text-emerald-600" />
+                <p className="text-sm font-medium text-foreground">{t('chooseServiceTitle')}</p>
+              </div>
+              <p className="text-xs text-muted-foreground mb-2.5">{t('chooseServiceDesc')}</p>
+              <div className="space-y-1.5 max-h-44 overflow-y-auto custom-scrollbar">
+                {pendingServices.map((svc) => {
+                  const selected = pendingServiceId === svc.id;
+                  return (
+                    <button
+                      key={svc.id}
+                      type="button"
+                      aria-pressed={selected}
+                      onClick={() => setPendingServiceId(svc.id)}
+                      className={`w-full flex items-center gap-2.5 p-2.5 rounded-xl border-2 text-start transition-colors ${
+                        selected
+                          ? 'border-emerald-500 bg-emerald-50/60 dark:bg-emerald-900/20'
+                          : 'border-border hover:border-emerald-300 dark:hover:border-emerald-700'
+                      }`}
+                    >
+                      {svc.prefix && (
+                        <span className="h-7 w-7 rounded-lg bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300 text-xs font-black flex items-center justify-center flex-shrink-0">
+                          {svc.prefix}
+                        </span>
+                      )}
+                      <span className="text-sm font-medium flex-1 min-w-0 truncate">
+                        {lang === 'ar' && svc.nameAr ? svc.nameAr : lang === 'fr' && svc.nameFr ? svc.nameFr : svc.name}
+                      </span>
+                      {selected && <CheckCircle2 className="h-4 w-4 text-emerald-600 flex-shrink-0" />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           <p className="text-sm text-muted-foreground mb-4">{t('selectDate')}</p>
           <div className="flex justify-center">
             <Calendar
@@ -740,7 +849,7 @@ export function CustomerHome() {
                     type="checkbox"
                     checked={fixedTimeEnabled}
                     onChange={(e) => setFixedTimeEnabled(e.target.checked)}
-                    className="h-4 w-4 rounded border-gray-300 text-emerald-600 focus:ring-emerald-500"
+                    className="h-4 w-4 rounded border-gray-300 dark:border-gray-600 text-emerald-600 focus:ring-emerald-500"
                   />
                   <span className="text-xs text-muted-foreground">{t('enableFixedTime')}</span>
                 </label>
@@ -762,7 +871,7 @@ export function CustomerHome() {
           </Button>
           <Button
             onClick={confirmJoinQueue}
-            disabled={joining}
+            disabled={joining || (pendingServices.length > 1 && !pendingServiceId && !pendingJoin?.serviceId)}
             className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl h-10"
           >
             {joining ? <Loader2 className="h-4 w-4 animate-spin me-2" /> : <TicketCheck className="h-4 w-4 me-2" />}
@@ -964,7 +1073,13 @@ export function CustomerHome() {
           aria-label={t('profile')}
         >
           {user?.avatarUrl ? (
-            <img src={getProxiedUrl(user.avatarUrl)} alt={user.fullName ?? ''} width={40} height={40} className="h-full w-full object-cover" />
+            // UserAvatar (NOT a raw <img>): the home header is the FIRST thing
+            // a mobile customer sees — a raw src here had NO error recovery,
+            // so the freshly-uploaded avatar went placeholder for good the
+            // moment its one network request failed. UserAvatar brings the
+            // retry + native-fallback pipeline AND the session upload
+            // override, so the new picture shows instantly and can't regress.
+            <UserAvatar avatarUrl={user.avatarUrl} fullName={user.fullName} />
           ) : (
             <span className="text-sm font-bold text-white">{firstName.charAt(0).toUpperCase() || 'U'}</span>
           )}
@@ -1350,7 +1465,7 @@ function EmptyAgenciesState({ searchQuery, hasCategoryFilter, t, onClear, onExpl
         <motion.div
           animate={{ scale: [1, 1.15, 1], opacity: [0.15, 0.05, 0.15] }}
           transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
-          className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full bg-emerald-200 dark:bg-emerald-800"
+          className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full bg-emerald-200 dark:bg-emerald-800"
         />
         <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-100 to-teal-50 dark:from-emerald-900/30 dark:to-teal-900/20 ring-1 ring-emerald-200/60 dark:ring-emerald-800/60">
           {searchQuery.trim() ? (

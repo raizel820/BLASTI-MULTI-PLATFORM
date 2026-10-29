@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
 import { db, Prisma } from '@blasti/db'
-import { requireRole, requireAgencyAccess, authErrorResponse, createSessionToken } from '../lib/auth'
+import { requireRole, requireAgencyAccess, authErrorResponse, createSessionToken, resolveClientPlatform } from '../lib/auth'
 import { adminCreateAgencySchema, updateAgencyProfileSchema, validateBody, wilayaCodeRegex } from '../lib/validations'
 import { enforceRateLimit, getClientIp, AGENCY_LISTING_RATE_LIMIT, AGENCY_SEARCH_RATE_LIMIT, PUBLIC_RATE_LIMIT, isRateLimitError, rateLimitErrorResponse, recordFailedRequest, recordSuccessfulRequest } from '../lib/rate-limit'
 import { recordSyncChangeNow } from '../lib/sync-helpers'
@@ -8,6 +8,8 @@ import { recordSyncChangeNow } from '../lib/sync-helpers'
 import { invalidateResponseCacheTag } from '../lib/response-cache'
 // Task 51 — Agency Location & Maps: location pair rule + timestamp stamping
 import { buildAgencyLocationPatch } from '../lib/map-settings'
+// Agencies Management — category/specialty validation + payload enrichment.
+import { attachSpecialties, categorySlugError, getActiveSpecialtyMap, serializeSpecialtyIds, specialtyIdsError } from '../lib/categories'
 
 // ─── Case-insensitive search (field-fix: agency & branch search) ───────────
 // Prisma `contains` is CASE-SENSITIVE on PostgreSQL but case-insensitive on
@@ -34,6 +36,7 @@ app.get('/', async (c) => {
 
     const search = c.req.query('search') || ''
     const category = c.req.query('category') || ''
+    const specialty = c.req.query('specialty') || ''
     const rawLimit = parseInt(c.req.query('limit') || '20', 10)
     const rawOffset = parseInt(c.req.query('offset') || '0', 10)
     const limit = Math.min(Math.max(rawLimit, 1), 50)
@@ -54,6 +57,13 @@ app.get('/', async (c) => {
 
     if (category) {
       where.category = category
+    }
+
+    // Specialty filter — Agency.specialtyIds is a JSON string; the quoted id
+    // makes `contains` boundary-exact (ids are cuids, never substrings of
+    // each other once quoted).
+    if (specialty) {
+      where.specialtyIds = { contains: `"${specialty}"` }
     }
 
     const [agencies, total] = await Promise.all([
@@ -102,8 +112,13 @@ app.get('/', async (c) => {
 
     const ratingMap = new Map(ratingResults.map(r => [r.agencyId, { avgRating: r.avgRating ?? 0, reviewCount: Number(r.reviewCount) }]))
 
+    // Agencies Management — resolve specialty ids → localized names in one
+    // shot (the specialty table is small) instead of per-agency queries.
+    const specialtyMap = await getActiveSpecialtyMap()
+
     const formattedAgencies = agencies.map((agency) => {
       const ratingInfo = ratingMap.get(agency.id) || { avgRating: 0, reviewCount: 0 }
+      const enriched = attachSpecialties(agency, specialtyMap)
       return {
         id: agency.id,
         name: agency.name,
@@ -111,6 +126,8 @@ app.get('/', async (c) => {
         nameAr: agency.nameAr,
         customCode: agency.customCode,
         category: agency.category,
+        specialtyIds: enriched.specialtyIds,
+        specialties: enriched.specialties,
         address: agency.address,
         city: agency.city,
         phone: agency.phone,
@@ -344,6 +361,7 @@ app.get('/branches', async (c) => {
 
     const search = c.req.query('search') || ''
     const category = c.req.query('category') || ''
+    const specialty = c.req.query('specialty') || ''
     const rawLimit = parseInt(c.req.query('limit') || '20', 10)
     const rawOffset = parseInt(c.req.query('offset') || '0', 10)
     const limit = Math.min(Math.max(rawLimit, 1), 50)
@@ -354,6 +372,7 @@ app.get('/branches', async (c) => {
       agency: {
         isActive: true,
         ...(category ? { category } : {}),
+        ...(specialty ? { specialtyIds: { contains: `"${specialty}"` } } : {}),
       },
     }
 
@@ -383,6 +402,7 @@ app.get('/branches', async (c) => {
               nameAr: true,
               customCode: true,
               category: true,
+              specialtyIds: true,
               logoUrl: true,
               coverUrl: true,
               isSponsored: true,
@@ -422,6 +442,8 @@ app.get('/branches', async (c) => {
       : []
     const ratingMap = new Map(ratingResults.map(r => [r.branchId, { avgRating: r.avgRating ?? 0, reviewCount: Number(r.reviewCount) }]))
 
+    const specialtyMap = await getActiveSpecialtyMap()
+
     const formattedBranches = branches.map((branch) => {
       const ratingInfo = ratingMap.get(branch.id) || { avgRating: 0, reviewCount: 0 }
       return {
@@ -443,7 +465,7 @@ app.get('/branches', async (c) => {
         counterCount: branch._count.counters,
         branchAverageRating: ratingInfo.avgRating,
         branchReviewCount: ratingInfo.reviewCount,
-        agency: branch.agency,
+        agency: attachSpecialties(branch.agency, specialtyMap),
       }
     })
 
@@ -746,6 +768,26 @@ app.post('/', async (c) => {
 
     const resolvedOwnerId = user.role === 'SUPER_ADMIN' ? (ownerId || user.id) : user.id
 
+    // Agencies Management — category must exist in the dictionary (built-in
+    // or custom), and any specialty ids must belong to that category.
+    const effectiveCategory = category || 'CLINIC'
+    const categoryError = await categorySlugError(effectiveCategory)
+    if (categoryError) {
+      return c.json({ success: false, error: categoryError }, 400)
+    }
+    let specialtyIdsJson: string | undefined
+    if (validation.data.specialtyIds?.length) {
+      const cat = await db.agencyCategory.findUnique({
+        where: { slug: effectiveCategory },
+        select: { id: true },
+      })
+      const specError = await specialtyIdsError(cat!.id, validation.data.specialtyIds)
+      if (specError) {
+        return c.json({ success: false, error: specError }, 400)
+      }
+      specialtyIdsJson = serializeSpecialtyIds(validation.data.specialtyIds)
+    }
+
     if (customCode) {
       const existingCode = await db.agency.findUnique({
         where: { customCode },
@@ -805,7 +847,8 @@ app.post('/', async (c) => {
           nameAr,
           nameFr,
           customCode: finalCustomCode,
-          category: category || 'OTHER',
+          category: category || 'CLINIC',
+          ...(specialtyIdsJson !== undefined ? { specialtyIds: specialtyIdsJson } : {}),
           address,
           phone,
           email: body.email,
@@ -940,7 +983,10 @@ app.post('/', async (c) => {
     // agency so the client can adopt it in one round-trip.
     let sessionToken: string | undefined
     try {
-      sessionToken = await createSessionToken({ ...user, agencyId: agency.id })
+      // Security-0.6.13 — the upgraded token keeps the minting client's
+      // platform claim (an app session stays an app session: still barred
+      // from the admin API; web sessions keep full admin access).
+      sessionToken = await createSessionToken({ ...user, agencyId: agency.id }, undefined, resolveClientPlatform(c))
     } catch (tokErr) {
       console.warn('[agencies] session token re-issue failed (non-fatal):', (tokErr as Error)?.message)
     }

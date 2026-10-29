@@ -1,3 +1,4 @@
+import { todayLocalDateString } from '../lib/queue-waiting'
 import { Hono } from 'hono'
 import { randomBytes } from 'crypto'
 import { db } from '@blasti/db'
@@ -91,7 +92,7 @@ app.post('/join', async (c) => {
       const displayNumber = `${service.prefix}-${String(nextNumber).padStart(3, '0')}`
 
       const res = await tx.reservation.create({
-        data: { agencyId, serviceId, queueNumber: nextNumber, displayNumber, status: 'WAITING', estimatedWait, isWalkIn: true, walkInCustomerName: customerName?.trim() || 'Anonymous', userId: null },
+        data: { agencyId, serviceId, queueNumber: nextNumber, displayNumber, status: 'WAITING', estimatedWait, isWalkIn: true, walkInCustomerName: customerName?.trim() || 'Anonymous', userId: null, reservedDate: todayLocalDateString() },
       })
       // Spec Part O: tx ops are invisible to the auto-tracking extension.
       await recordSyncChange({ tx, agencyId, model: 'Reservation', recordId: res.id, operation: 'create' })
@@ -278,7 +279,7 @@ app.get('/agency', async (c) => {
     const agency = await db.agency.findUnique({
       where: { customCode: code, isActive: true },
       include: {
-        services: { where: { isActive: true }, select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true } },
+        services: { where: { isActive: true }, select: { id: true, name: true, nameFr: true, nameAr: true, prefix: true, durationMinutes: true } },
         queueSettings: { select: { id: true, currentServingNumber: true, lastIssuedNumber: true, isPaused: true }, take: 1, orderBy: { updatedAt: 'desc' } },
       },
     })
@@ -328,7 +329,8 @@ app.get('/agency', async (c) => {
       historicalSampleSize: effective.sampleSize,
     })
     const estimatedWait = eta.estimatedMaxMinutes
-    const services = agency.services.map((s) => ({ ...s, avgTime: agency.averageServiceTime }))
+    // P2-10 — per-service avgTime honors the owner-set duration first.
+    const services = agency.services.map((s) => ({ ...s, avgTime: s.durationMinutes ?? agency.averageServiceTime }))
 
     if (clientIp) recordSuccessfulRequest(clientIp)
     return c.json({

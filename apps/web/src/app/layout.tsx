@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import Script from "next/script";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ThemeProvider } from "next-themes";
@@ -36,6 +36,12 @@ export const metadata: Metadata = {
     ],
     apple: "/apple-touch-icon.png",
   },
+};
+
+// P2-12 — PWA posture: browser UI (address bar / install prompt) tints with
+// the brand emerald; the full manifest lives in app/manifest.ts.
+export const viewport: Viewport = {
+  themeColor: "#059669",
 };
 
 export default function RootLayout({

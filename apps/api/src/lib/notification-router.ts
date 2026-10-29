@@ -541,6 +541,10 @@ export async function sendViaWhatsApp(
 
     const isAgencySponsored = agency?.sponsorSms && agency.smsBalance > 0
     let agencyDeducted = false
+    // P0-1 deduction-awareness: remember EXACTLY what was deducted so a
+    // failure refunds only that — purchased-credit sends deduct nothing and
+    // must never MINT a free credit on refund.
+    let deductedSource: 'agency' | 'user' | null = null
 
     if (isAgencySponsored) {
       // Deduct from agency balance
@@ -549,6 +553,7 @@ export async function sendViaWhatsApp(
         data: { smsBalance: { decrement: 1 } },
       })
       agencyDeducted = deducted.count > 0
+      if (agencyDeducted) deductedSource = 'agency'
 
       if (!agencyDeducted) {
         console.warn(
@@ -564,7 +569,9 @@ export async function sendViaWhatsApp(
         data: { freeSmsCount: { decrement: 1 } },
       })
 
-      if (userDeducted.count === 0) {
+      if (userDeducted.count > 0) {
+        deductedSource = 'user'
+      } else {
         // Check purchased credits
         const purchasedTotal = await db.smsPurchase.aggregate({
           where: { userId, status: 'APPROVED' },
@@ -591,8 +598,8 @@ export async function sendViaWhatsApp(
       console.warn(
         `[NotificationRouter] WhatsApp send failed for user ${userId}: ${waResult.error} ${waResult.responseRaw ?? ''}`
       )
-      // Refund the deducted balance — the message was NOT delivered
-      await refundSmsBalance(agencyId, userId)
+      // P0-1: refund ONLY what was actually deducted (never mint credits)
+      await refundSmsDeduction(agencyId, userId, deductedSource)
       // Log the failure for the admin providers page
       await db.smsLog.create({
         data: {
@@ -628,8 +635,8 @@ export async function sendViaWhatsApp(
 
     return true
   } catch (error) {
-    // Attempt refund on unexpected error
-    await refundSmsBalance(agencyId, userId)
+    // P0-1: refund ONLY what was actually deducted (never mint credits)
+    await refundSmsDeduction(agencyId, userId, null)
     console.error(
       `[NotificationRouter] WhatsApp send error for user ${userId}:`,
       error instanceof Error ? error.message : error
@@ -783,38 +790,30 @@ export async function deductSmsBalance(
  *
  * Checks who originally paid (agency vs user) and refunds accordingly.
  */
-export async function refundSmsBalance(
+export async function refundSmsDeduction(
   agencyId: string,
-  userId: string
+  userId: string,
+  source: 'agency' | 'user' | null
 ): Promise<void> {
+  // P0-1 deduction-aware refund: reverse EXACTLY the deduction that was made.
+  // `null` (purchased-credit path — no deduction happened) is a no-op.
   try {
-    const agency = await db.agency.findUnique({
-      where: { id: agencyId },
-      select: { sponsorSms: true },
-    })
-
-    if (agency?.sponsorSms) {
-      // Try to refund to agency balance first
+    if (source === 'agency') {
       await db.agency.update({
         where: { id: agencyId },
         data: { smsBalance: { increment: 1 } },
       })
-      console.log(
-        `[NotificationRouter] Refunded 1 to agency ${agencyId} smsBalance`
-      )
-    } else {
-      // Refund to user's free SMS count
+      console.log(`[NotificationRouter] Refunded 1 to agency ${agencyId} smsBalance`)
+    } else if (source === 'user') {
       await db.user.update({
         where: { id: userId },
         data: { freeSmsCount: { increment: 1 } },
       })
-      console.log(
-        `[NotificationRouter] Refunded 1 to user ${userId} freeSmsCount`
-      )
+      console.log(`[NotificationRouter] Refunded 1 to user ${userId} freeSmsCount`)
     }
   } catch (error) {
     console.error(
-      `[NotificationRouter] SMS balance refund error:`,
+      '[NotificationRouter] SMS balance refund error:',
       error instanceof Error ? error.message : error
     )
   }

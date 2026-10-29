@@ -3,6 +3,8 @@ import { apiFetch } from '@/lib/api-fetch';;
 
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import { useLanguage } from '@/hooks/use-language';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -377,6 +379,9 @@ export function AgencyReviews() {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
   const agencyId = user?.agencyId || '';
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
 
   const [reviews, setReviews] = useState<Review[]>([]);
   const [loading, setLoading] = useState(true);

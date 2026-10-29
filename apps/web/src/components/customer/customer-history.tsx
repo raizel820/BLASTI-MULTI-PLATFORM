@@ -17,6 +17,8 @@ import { apiFetch } from "@/lib/api-fetch";
 // Task 84 — IndexedDB stale-while-revalidate: history renders instantly from
 // the last-known list and refreshes silently.
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import { toLocalDateString } from '@/lib/date-utils';
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -123,9 +125,15 @@ export function CustomerHistory() {
   const [liveDurationSec, setLiveDurationSec] = useState(0);
   const liveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
+
   useEffect(() => {
     fetchHistory();
-  }, []);
+    // resumeNonce — 0.6.16: refetch when the app resumes to the foreground
+    // (close-and-reopen resumes the WebView without a remount).
+  }, [resumeNonce]);
 
   const fetchHistory = async () => {
     if (!user?.id) return;

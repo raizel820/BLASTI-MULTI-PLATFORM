@@ -57,6 +57,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
    */
   getPlatform: () => ipcRenderer.invoke('get-platform'),
 
+  /**
+   * logs-1 — recent main-process log lines (ring buffer, last ~120 lines).
+   * The web app's remote logger (lib/remote-logger.ts) merges these into
+   * every periodic /api/logs upload so Electron-only failures (updater
+   * waiter, local API, installer) reach the same per-UID VPS log vault.
+   */
+  getRecentMainLogs: () => ipcRenderer.invoke('get-recent-main-logs'),
+
   // ─── Deep Links ────────────────────────────────────────────────────────────
 
   /**
@@ -399,6 +407,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * Clear the local API session (called on logout).
    */
   clearLocalApiSession: () => ipcRenderer.invoke('local-api:clear-session'),
+
+  /**
+   * 0.6.20 — Full local reset ("fresh install"), backs the sidebar
+   * "Reset app data" action. The MAIN process wipes everything stored on
+   * this device: the local SQLite workspace DB, the local file store, the
+   * durable auth file, the local API session, the diagnostic logs AND the
+   * renderer session storage (cookies, localStorage, sessionStorage,
+   * IndexedDB/WatermelonDB, service workers, caches) — then relaunches the
+   * app. The cloud account and its data are never touched.
+   * @returns {Promise<{ success: boolean, error?: string }>}
+   */
+  clearAllAppData: () => ipcRenderer.invoke('app:clear-all-data'),
 
   /**
    * Get the local API server status.

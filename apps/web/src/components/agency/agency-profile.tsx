@@ -2,6 +2,9 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
+import { AccountUidChip } from '@/components/shared/account-log-tools';
 import { useLanguage } from '@/hooks/use-language';
 import { useUpload } from '@/hooks/use-upload';
 import { Button } from '@/components/ui/button';
@@ -46,6 +49,14 @@ import { unwrapListPayload } from '@/lib/list-payload';
 import { formatWorkingDaysList } from '@/lib/enum-i18n';
 import { AgencyCategorySelect } from '@/components/agency/agency-category-select';
 import { BUILT_IN_CATEGORY_OPTIONS } from '@/hooks/use-agency-categories';
+// Task 5-b — specialty picker for the profile editor (categories dictionary
+// with specialties, module-cached; silent-degrade on fetch failure).
+import {
+  fetchCategoriesWithSpecialties,
+  findCategoryBySlug,
+  localizeSpecialtyName,
+  type AgencySpecialty,
+} from '@/hooks/use-category-terms';
 // Task 2-d — preview the picked logo before it is uploaded/set active.
 import { ImageUploadPreviewDialog } from '@/components/shared/image-upload-preview-dialog';
 // Task 5 — Algeria address selectors (58 wilayas + their communes).
@@ -54,7 +65,9 @@ import {
   CommuneSelect,
   composeLocationLabel,
 } from '@/components/shared/algeria-location-selects';
-import { findWilayaByCode } from '@/lib/algeria-locations';
+import { findWilayaByCode, findWilayaCentroid } from '@/lib/algeria-locations';
+// r21-5 — map-follows-inputs: the wilaya→centroid jump is debounced.
+import { useDebounce } from '@/hooks/use-debounce';
 // Task 51-b — agency location map (provider abstraction, spec §31/§35).
 import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
 import { AgencyLocationMap } from '@/components/shared/map/agency-location-map';
@@ -108,6 +121,12 @@ interface AgencyInfo {
   postalCode?: string | null;
   locationVerified?: string | null;
   locationSource?: string | null;
+  // Task 5-b — Agencies Management specialties. GET /api/agency/profile now
+  // returns the parsed ids + resolved localized names; the editor toggles
+  // ids on the draft and the spread-save PATCH carries specialtyIds
+  // (empty array clears; the `specialties` objects are stripped on save).
+  specialtyIds?: string[] | null;
+  specialties?: AgencySpecialty[] | null;
 }
 
 // ─── Task 83-b — branch row for the profile switcher (subset of the fields
@@ -143,6 +162,9 @@ function formatWorkingDays(csv: string, lang: 'en' | 'ar' | 'fr'): string {
 export function AgencyProfile() {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
   const [profile, setProfile] = useState<AgencyInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [editMode, setEditMode] = useState(false);
@@ -162,6 +184,14 @@ export function AgencyProfile() {
   // locationSource/locationVerified overrides in the save payload (spec §35).
   const [locationChanged, setLocationChanged] = useState(false);
   const [locationSourceOverride, setLocationSourceOverride] = useState<'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS' | null>(null);
+  // r21-5 — map-follows-inputs (edit mode only): a USER-driven wilaya change
+  // (wilaya select or the zip-prefix cascade) re-centers the picker on the
+  // wilaya seat centroid after a short debounce. Ordering stamps: a pin
+  // placed after the wilaya edit wins; server-loaded values never trigger
+  // the jump (lastWilayaEditAtRef is only stamped by user handlers).
+  const lastWilayaEditAtRef = useRef<number | null>(null);
+  const lastPinAtRef = useRef<number | null>(null);
+  const prevCentroidWilayaRef = useRef<string>('');
 
   // ─── Task 83-b — branch profile switcher ──────────────────────────────────
   // activeBranchId === null → agency-wide view (EXACTLY the pre-83 render);
@@ -172,10 +202,21 @@ export function AgencyProfile() {
   const [branchQrDataUrl, setBranchQrDataUrl] = useState<string | null>(null);
   const [activeBranchCounters, setActiveBranchCounters] = useState<number | null>(null);
 
+  // Task 5-b — categories dictionary (with specialties) for the editor chips.
+  const [categoryRows, setCategoryRows] = useState<Awaited<ReturnType<typeof fetchCategoriesWithSpecialties>>>([]);
+  useEffect(() => {
+    let cancelled = false;
+    fetchCategoriesWithSpecialties()
+      .then((rows) => { if (!cancelled) setCategoryRows(rows); })
+      .catch(() => { /* silent — the picker degrades to the hint text */ });
+    return () => { cancelled = true; };
+  }, []);
+
   useEffect(() => {
     fetchProfile();
     fetchBranches();
-  }, []);
+    // resumeNonce — 0.6.16: refetch when the app resumes to the foreground.
+  }, [resumeNonce]);
 
   const fetchProfile = async () => {
     setLoading(true);
@@ -185,6 +226,12 @@ export function AgencyProfile() {
     if (res.ok) {
         const data = await res.json();
         setProfile(data);
+        // r21-5 — server truth resets the map-follow stamps AND re-baselines
+        // the centroid watcher: loaded values are never "user edits", so a
+        // mount/save/resume refetch can never yank the pin to a centroid.
+        lastWilayaEditAtRef.current = null;
+        lastPinAtRef.current = null;
+        prevCentroidWilayaRef.current = (data?.wilaya ?? '').trim();
       }
     } catch {
       toast.error(t('error'));
@@ -317,7 +364,10 @@ export function AgencyProfile() {
       // would fail the API's min(1) validation); absent keys leave the
       // currently stored values untouched, so the UI cannot crash against a
       // cloud that does not accept the fields yet either.
-      const { wilaya: _saveWilaya, city: _saveCity, ...restProfile } = profile ?? {};
+      // Task 5-b — `specialties` (resolved NAME objects from the GET) is
+      // stripped from the save payload; `specialtyIds` stays in restProfile
+      // so the PATCH carries the draft selection (empty array clears).
+      const { wilaya: _saveWilaya, city: _saveCity, specialties: _saveSpecialties, ...restProfile } = profile ?? {};
       const payload: Record<string, unknown> = { ...restProfile, agencyId: user?.agencyId };
       const pairWilaya = profile?.wilaya ?? '';
       const pairCity = selectedCommune;
@@ -362,6 +412,39 @@ export function AgencyProfile() {
   const updateField = (field: keyof AgencyInfo, value: string) => {
     setProfile((prev) => (prev ? { ...prev, [field]: value } : prev));
   };
+
+  // Task 5-b — category change: keep only the selected ids that belong to the
+  // NEW category (specialties are per-category rows → the old selection is
+  // dropped; usually to an empty "all specialties" state).
+  const handleProfileCategoryChange = (category: string) => {
+    setProfile((prev) => {
+      if (!prev) return prev;
+      const validIds = new Set(
+        findCategoryBySlug(categoryRows, category)?.specialties.map((s) => s.id) ?? [],
+      );
+      return { ...prev, category, specialtyIds: (prev.specialtyIds ?? []).filter((id) => validIds.has(id)) };
+    });
+  };
+
+  // Task 5-b — toggle one specialty id on the draft selection (chips are a
+  // multi-select; empty = all specialties of the category apply).
+  const toggleProfileSpecialty = (specialtyId: string) => {
+    setProfile((prev) => {
+      if (!prev) return prev;
+      const current = prev.specialtyIds ?? [];
+      const next = current.includes(specialtyId)
+        ? current.filter((id) => id !== specialtyId)
+        : [...current, specialtyId];
+      return { ...prev, specialtyIds: next };
+    });
+  };
+
+  // Task 5-b — chip options: ALL active specialties of the CURRENT profile
+  // category (UI-language names via localizeSpecialtyName).
+  const profileSpecialtyOptions = useMemo(
+    () => findCategoryBySlug(categoryRows, profile?.category)?.specialties ?? [],
+    [categoryRows, profile?.category],
+  );
 
   // Task 2-d — file pick only VALIDATES + OPENS the preview dialog now;
   // the upload runs in handleLogoPreviewConfirm on user confirm.
@@ -433,9 +516,36 @@ export function AgencyProfile() {
   // Task 51-b — picker → TEMPORARY profile state (spec §28); persistence
   // happens through the existing Save button (handleSave payload override).
   const handleLocationChange = (lat: number | null, lng: number | null) => {
+    lastPinAtRef.current = Date.now(); // r21-5 — explicit pick outranks the centroid follow
     setProfile((prev) => (prev ? { ...prev, latitude: lat, longitude: lng } : prev));
     setLocationChanged(true);
   };
+  // r21-5 — debounced wilaya→centroid follow (EDIT MODE ONLY): moves the
+  // picker pin to the wilaya seat when the user changes the wilaya via the
+  // select or the postal-code cascade. Server-loaded values never stamp
+  // lastWilayaEditAtRef → loading/saving a profile never moves the pin.
+  const debouncedProfileWilaya = useDebounce(profile?.wilaya ?? '', 400);
+  useEffect(() => {
+    if (!editMode) return;
+    const code = (debouncedProfileWilaya || '').trim();
+    const prev = prevCentroidWilayaRef.current;
+    prevCentroidWilayaRef.current = code;
+    if (code === prev) return; // not a wilaya change
+    if (lastWilayaEditAtRef.current == null) return; // server-loaded value
+    if (lastPinAtRef.current != null && lastPinAtRef.current > lastWilayaEditAtRef.current) {
+      return; // the user fine-tuned the pin after this edit — never fight them
+    }
+    if (!WILAYA_CODE_REGEX.test(code)) return;
+    const centroid = findWilayaCentroid(code);
+    if (!centroid) return;
+    // locationSource drops to 'MANUAL': the coordinates no longer come from
+    // the map/device, so a later Save must not keep a stale VERIFIED stamp.
+    setProfile((prevP) =>
+      prevP ? { ...prevP, latitude: centroid.lat, longitude: centroid.lng, locationSource: 'MANUAL' } : prevP,
+    );
+    setLocationChanged(true);
+  }, [debouncedProfileWilaya, editMode]);
+
   const handleLocationSource = (source: 'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS') => {
     setLocationSourceOverride(source);
   };
@@ -542,6 +652,12 @@ export function AgencyProfile() {
 
   return (
     <div className="p-4 lg:p-6 space-y-5">
+      {/* Account UID — immutable, one-tap copy (logs-1/uid-0.6.14) */}
+      {user?.uid ? (
+        <div className="flex items-center gap-3 flex-wrap">
+          <AccountUidChip uid={user.uid} />
+        </div>
+      ) : null}
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold text-foreground">{t('agencyProfile')}</h1>
         {editMode ? (
@@ -690,7 +806,7 @@ export function AgencyProfile() {
               {/* Branch QR — client-side, encodes ?branch=<subCode> */}
               {activeBranch.subCode && (
                 <div className="flex items-center gap-4 p-3 rounded-xl bg-muted/50 dark:bg-gray-800/50">
-                  <div className="h-28 w-28 rounded-xl bg-white flex items-center justify-center border-2 border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden flex-shrink-0">
+                  <div className="h-28 w-28 rounded-xl bg-white dark:bg-gray-900 flex items-center justify-center border-2 border-gray-200 dark:border-gray-700 shadow-sm overflow-hidden flex-shrink-0">
                     {branchQrDataUrl ? (
                       <img
                         src={branchQrDataUrl}
@@ -904,11 +1020,12 @@ export function AgencyProfile() {
                   <div className="space-y-2">
                     <Label>{t('agencyCategory')}</Label>
                     {/* Task 42 — shared picker (compact trigger opens the searchable
-                        25-built-in + custom-fields dialog); value shape unchanged. */}
+                        25-built-in + custom-fields dialog); value shape unchanged.
+                        Task 5-b — onChange also re-scopes the specialty selection. */}
                     <AgencyCategorySelect
                       variant="compact"
-                      value={profile?.category ?? 'OTHER'}
-                      onChange={(v) => updateField('category', v)}
+                      value={profile?.category ?? ''}
+                      onChange={handleProfileCategoryChange}
                       disabled={saving}
                     />
                   </div>
@@ -921,6 +1038,7 @@ export function AgencyProfile() {
                       value={profile?.wilaya ?? ''}
                       onValueChange={(code) => {
                         if (code === profile?.wilaya) return;
+                        lastWilayaEditAtRef.current = Date.now(); // r21-5 — user-driven wilaya change
                         updateField('wilaya', code);
                         // Dependent list — the commune must belong to the
                         // newly selected wilaya, so reset it.
@@ -974,14 +1092,65 @@ export function AgencyProfile() {
                     />
                   </div>
                 </div>
+                {/* Task 5-b — Specialties the agency serves: chips of ALL active
+                    specialties for the CURRENT profile category, multi-select
+                    (aria-pressed pattern like the repo's other chip pickers).
+                    Empty selection = all specialties apply. Persisted through
+                    the same Save button (specialtyIds in the PATCH payload). */}
+                <div className="space-y-2">
+                  <Label>{t('specialtiesLabel')}</Label>
+                  {profileSpecialtyOptions.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">{t('specialtyAll')}</p>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap gap-1.5" role="group" aria-label={t('specialtiesLabel')}>
+                        {profileSpecialtyOptions.map((spec) => {
+                          const selected = (profile?.specialtyIds ?? []).includes(spec.id);
+                          return (
+                            <button
+                              key={spec.id}
+                              type="button"
+                              aria-pressed={selected}
+                              onClick={() => toggleProfileSpecialty(spec.id)}
+                              disabled={saving}
+                              className={`px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors min-h-[36px] ${
+                                selected
+                                  ? 'bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700'
+                                  : 'bg-background text-foreground border-border hover:bg-muted'
+                              }`}
+                            >
+                              {localizeSpecialtyName(spec, lang)}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {(profile?.specialtyIds ?? []).length === 0 && (
+                        <p className="text-xs text-muted-foreground">{t('specialtyAll')}</p>
+                      )}
+                    </>
+                  )}
+                </div>
               </div>
             ) : (
               <div className="space-y-3">
                 <h2 className="text-xl font-bold text-foreground">{profile?.name}</h2>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400">
-                    {getCategoryLabel(profile?.category ?? 'OTHER')}
+                    {getCategoryLabel(profile?.category ?? '')}
                   </span>
+                  {/* Task 5-b — served specialties (resolved names from the GET
+                      payload) rendered as small chips next to the category. */}
+                  {(profile?.specialties?.length ?? 0) > 0 && (
+                    <span className="text-[10px] font-semibold text-muted-foreground">{t('specialtiesLabel')}:</span>
+                  )}
+                  {(profile?.specialties ?? []).map((spec) => (
+                    <span
+                      key={spec.id}
+                      className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-400 border border-teal-200/70 dark:border-teal-800"
+                    >
+                      {localizeSpecialtyName(spec, lang)}
+                    </span>
+                  ))}
                 </div>
                 <Separator />
                 <div className="space-y-2.5">
@@ -1088,6 +1257,7 @@ export function AgencyProfile() {
                   if (editMode && value.trim().length >= 2) {
                     const prefix = normalizeWilayaInput(value.slice(0, 2));
                     if (WILAYA_CODE_REGEX.test(prefix) && prefix !== (profile?.wilaya ?? '')) {
+                      lastWilayaEditAtRef.current = Date.now(); // r21-5 — zip cascade = user-driven
                       updateField('wilaya', prefix);
                       updateField('city', '');
                     }

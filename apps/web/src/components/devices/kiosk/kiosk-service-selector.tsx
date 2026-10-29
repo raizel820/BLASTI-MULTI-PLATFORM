@@ -51,25 +51,25 @@ export function KioskServiceSelector({
       transition={{ duration: 0.3, ease: 'easeInOut' }}
       className="w-full max-w-lg"
     >
-      <div className="bg-white rounded-3xl shadow-2xl p-4 sm:p-5">
+      <div className="bg-white dark:bg-gray-900 rounded-3xl shadow-2xl p-4 sm:p-5">
         {/* Agency header with logo */}
         <div className="flex items-center gap-3 mb-3">
           <button
             onClick={onBack}
-            className="min-h-[40px] min-w-[40px] rounded-xl bg-gray-100 flex items-center justify-center hover:bg-gray-200 transition-colors flex-shrink-0"
+            className="min-h-[40px] min-w-[40px] rounded-xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center hover:bg-gray-200 transition-colors flex-shrink-0"
           >
             <svg className={`h-4 w-4 text-gray-600 ${rtl ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
           </button>
           {agency.logoUrl && (
-            <div className="h-10 w-10 rounded-lg overflow-hidden bg-gray-100 flex-shrink-0 p-0.5">
+            <div className="h-10 w-10 rounded-lg overflow-hidden bg-gray-100 dark:bg-gray-800 flex-shrink-0 p-0.5">
               <img src={getProxiedUrl(agency.logoUrl)} alt={getLocalizedName(agency, lang)} className="h-full w-full object-contain" />
             </div>
           )}
           <div className="min-w-0">
-            <h2 className="text-lg font-bold text-gray-900 truncate">
+            <h2 className="text-lg font-bold text-gray-900 dark:text-gray-100 truncate">
               {getLocalizedName(agency, lang)}
             </h2>
-            <p className="text-xs text-gray-500">
+            <p className="text-xs text-gray-500 dark:text-gray-400">
               {agency.workingHoursStart} — {agency.workingHoursEnd}
             </p>
           </div>
@@ -111,7 +111,7 @@ export function KioskServiceSelector({
         )}
 
         {/* Service selection */}
-        <h3 className="text-sm font-semibold text-gray-800 mb-2">
+        <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
           {t('selectServiceKiosk')}
         </h3>
 
@@ -137,10 +137,10 @@ export function KioskServiceSelector({
                       {service.prefix}
                     </span>
                     <div>
-                      <p className="text-base font-semibold text-gray-900">
+                      <p className="text-base font-semibold text-gray-900 dark:text-gray-100">
                         {getLocalizedName(service, lang)}
                       </p>
-                      <p className="text-xs text-gray-500 flex items-center gap-1">
+                      <p className="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-1">
                         <Clock className="h-3 w-3" />
                         ~{service.avgTime} {t('minutesKiosk')}
                       </p>

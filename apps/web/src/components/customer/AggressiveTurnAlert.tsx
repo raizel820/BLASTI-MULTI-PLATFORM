@@ -11,10 +11,12 @@ interface AggressiveTurnAlertProps {
   visible: boolean;
   ticketNumber: string;
   agencyName: string;
+  /** r21-8 — counter pointer from the queue:called payload (optional). */
+  counterName?: string;
   onDismiss: () => void;
 }
 
-export function AggressiveTurnAlert({ visible, ticketNumber, agencyName, onDismiss }: AggressiveTurnAlertProps) {
+export function AggressiveTurnAlert({ visible, ticketNumber, agencyName, counterName, onDismiss }: AggressiveTurnAlertProps) {
   const { t } = useLanguage();
   const [flashColor, setFlashColor] = useState<'red' | 'green'>('red');
   const [soundMuted, setSoundMuted] = useState(false);
@@ -130,7 +132,7 @@ export function AggressiveTurnAlert({ visible, ticketNumber, agencyName, onDismi
           {/* Sound toggle */}
           <button
             onClick={() => setSoundMuted(!soundMuted)}
-            className="absolute top-6 right-6 h-12 w-12 rounded-full bg-white/20 flex items-center justify-center z-10"
+            className="absolute top-6 end-6 h-12 w-12 rounded-full bg-white/20 flex items-center justify-center z-10"
             aria-label={soundMuted ? 'Unmute sound' : 'Mute sound'}
           >
             {soundMuted ? <VolumeX className="h-6 w-6 text-white" /> : <Volume2 className="h-6 w-6 text-white" />}
@@ -174,15 +176,28 @@ export function AggressiveTurnAlert({ visible, ticketNumber, agencyName, onDismi
           </motion.div>
 
           {/* Agency name */}
-          <p className="text-xl text-white/80 mb-12 px-4 text-center">
+          <p className="text-xl text-white/80 mb-4 px-4 text-center">
             {agencyName}
           </p>
+
+          {/* r21-8 — counter pointer: where to go now that it's the customer's turn */}
+          {counterName ? (
+            <motion.p
+              animate={{ scale: [1, 1.04, 1] }}
+              transition={{ duration: 1.2, repeat: Infinity, ease: 'easeInOut' }}
+              className="text-lg font-bold text-white bg-black/25 rounded-full px-5 py-2 mb-12 text-center"
+            >
+              {t('goCounterName', { name: counterName })}
+            </motion.p>
+          ) : (
+            <div className="mb-8" />
+          )}
 
           {/* Giant "I'm Here" dismiss button */}
           <motion.button
             whileTap={{ scale: 0.95 }}
             onClick={handleDismiss}
-            className="w-4/5 max-w-sm h-20 rounded-2xl bg-white text-2xl font-bold shadow-2xl flex items-center justify-center gap-3"
+            className="w-4/5 max-w-sm h-20 rounded-2xl bg-white dark:bg-gray-900 text-2xl font-bold shadow-2xl flex items-center justify-center gap-3"
             style={{ color: flashColor === 'red' ? '#dc2626' : '#059669' }}
           >
             <UserCheck className="h-8 w-8" />

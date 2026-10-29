@@ -72,6 +72,8 @@ import { apiFetch } from '@/lib/api-fetch';
 import { isBothUnreachable } from '@/lib/api-client';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+// Task 5-b — per-category terminology scope (owner side).
+import { useCategoryTermScope } from '@/hooks/use-category-terms';
 
 interface QueueEntry {
   id: string;
@@ -235,6 +237,15 @@ function SectionHeader({ icon: Icon, title, count, action }: { icon: any; title:
 export function AgencyDashboard() {
   const { user, setView } = useAppStore();
   const { t, lang } = useLanguage();
+
+  // Task 5-b — per-category terminology scope for the OWNER side. The agency
+  // profile fetch (fetchAgencyCode below) already runs on mount for the QR
+  // code; it now also captures `category` so every t() call on the dashboard
+  // (customersServed, waiting labels, …) resolves the category's overrides
+  // (e.g. "Customer" → "Patient" for CLINIC). Silent-degrade on failure.
+  const [agencyCategory, setAgencyCategory] = useState<string | null>(null);
+  useCategoryTermScope(agencyCategory);
+
   const isMobile = useIsMobile();
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [waitingList, setWaitingList] = useState<QueueEntry[]>([]);
@@ -285,6 +296,8 @@ export function AgencyDashboard() {
       if (res.ok) {
         const data = await res.json();
         setAgencyCode(data.code || '');
+        // Task 5-b — same payload carries the agency category → terminology scope.
+        if (typeof data.category === 'string' && data.category) setAgencyCategory(data.category);
       }
     } catch { /* silent */ }
   }, [agencyId]);
@@ -447,6 +460,8 @@ export function AgencyDashboard() {
         // authority errors as friendly messages instead of raw codes.
         let errorMsg: string = data.details || data.error || t('noQueue');
         if (data.error === 'OCCUPY_COUNTER_FIRST') errorMsg = t('occupyFirst');
+        else if (data.error === 'COUNTER_CONTROL_REQUIRED') errorMsg = t('counterControlRequired');
+        else if (data.error === 'COUNTER_SETUP_REQUIRED') errorMsg = t('counterSetupRequiredTitle');
         else if (typeof data.error === 'string' && data.error.startsWith('PERMISSION_DENIED')) errorMsg = t('counterPermissionDenied');
         toast.error(errorMsg);
       }
@@ -1631,7 +1646,7 @@ export function AgencyDashboard() {
           </DialogHeader>
           <div className="flex flex-col items-center gap-4 py-4">
             {qrCodeDataUrl ? (
-              <div className="p-3 rounded-2xl bg-white shadow-inner border border-gray-100 dark:border-gray-700">
+              <div className="p-3 rounded-2xl bg-white dark:bg-gray-900 shadow-inner border border-gray-100 dark:border-gray-700">
                 <img src={qrCodeDataUrl} alt="QR Code" className="h-48 w-48 rounded-xl" />
               </div>
             ) : (
@@ -1684,7 +1699,7 @@ export function AgencyDashboard() {
               <div className="flex items-center gap-2">
                 <Button
                   size="sm"
-                  className="bg-white text-emerald-700 hover:bg-emerald-50 font-bold rounded-xl h-9 px-4 text-xs gap-1.5"
+                  className="bg-white dark:bg-gray-900 text-emerald-700 hover:bg-emerald-50 font-bold rounded-xl h-9 px-4 text-xs gap-1.5"
                   onClick={handleBatchComplete}
                   disabled={batchLoading}
                 >

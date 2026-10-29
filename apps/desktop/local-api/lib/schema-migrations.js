@@ -52,7 +52,14 @@ const path = require('path')
 // ─── Versioning ─────────────────────────────────────────────────────────────
 
 /** Current local schema version. Bump when adding MIGRATION_STEPS. */
-const LOCAL_SCHEMA_VERSION = 7
+// v10 = user-uid (UID-0.6.14). NOTE: v8/v9 predate this bump — they were
+// added without raising the constant, so the version-gated runner skipped
+// them (their columns still converged through the DDL column top-up).
+// Bumping to 10 lets the gated runner apply v8/v9/v10 once on stamped DBs;
+// every statement is guarded/tolerant so re-runs are harmless.
+// v12 = payment-settings transfer details (r21-6).
+// v13 = counter control (claim/heartbeat lease + control requests — r21-8).
+const LOCAL_SCHEMA_VERSION = 13
 
 /**
  * Incremental upgrade steps BETWEEN versions. Each step:
@@ -157,6 +164,100 @@ const MIGRATION_STEPS = [
     name: 'smslog-provider-message-id (DLR webhook correlation — Task 3)',
     statements: [
       'ALTER TABLE "SmsLog" ADD COLUMN "providerMessageId" TEXT',
+    ],
+  },
+  {
+    // P2-10 — Service.durationMinutes + Service.priority (queue priority +
+    // per-service ETA estimate) and the CounterService join table (the
+    // Counter↔Service binding). Mirror of the cloud Prisma schema so pulled
+    // cloud records pass the schema-aware sanitizer and the local call-next
+    // can honor priority/binding offline.
+    version: 8,
+    name: 'P2-10 service duration/priority + CounterService binding',
+    statements: [
+      'ALTER TABLE "Service" ADD COLUMN "durationMinutes" INTEGER',
+      'ALTER TABLE "Service" ADD COLUMN "priority" INTEGER NOT NULL DEFAULT 0',
+      'CREATE TABLE IF NOT EXISTS "CounterService" ("counterId" TEXT NOT NULL, "serviceId" TEXT NOT NULL, "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, CONSTRAINT "CounterService_pkey" PRIMARY KEY ("counterId", "serviceId"), CONSTRAINT "CounterService_counterId_fkey" FOREIGN KEY ("counterId") REFERENCES "Counter" ("id") ON DELETE CASCADE ON UPDATE CASCADE, CONSTRAINT "CounterService_serviceId_fkey" FOREIGN KEY ("serviceId") REFERENCES "Service" ("id") ON DELETE CASCADE ON UPDATE CASCADE)',
+      'CREATE INDEX IF NOT EXISTS "CounterService_serviceId_idx" ON "CounterService"("serviceId")',
+    ],
+  },
+  {
+    version: 9,
+    name: 'Agencies Management — AgencyCategory slug/isActive/sortOrder + Agency.specialtyIds',
+    statements: [
+      'ALTER TABLE "AgencyCategory" ADD COLUMN "slug" TEXT',
+      'ALTER TABLE "AgencyCategory" ADD COLUMN "isActive" BOOLEAN NOT NULL DEFAULT true',
+      'ALTER TABLE "AgencyCategory" ADD COLUMN "sortOrder" INTEGER NOT NULL DEFAULT 0',
+      // Backfill slug = name (the legacy contract: the name IS the value in
+      // Agency.category). Built-in slugs arrive via the cloud pull.
+      "UPDATE \"AgencyCategory\" SET \"slug\" = \"name\" WHERE \"slug\" IS NULL",
+      // Unique index may already exist on fresh DBs created from the full DDL.
+      'CREATE UNIQUE INDEX IF NOT EXISTS "AgencyCategory_slug_key" ON "AgencyCategory"("slug")',
+      'ALTER TABLE "Agency" ADD COLUMN "specialtyIds" TEXT',
+    ],
+  },
+  {
+    // UID-0.6.14 — immutable BLASTI UID on User ({TYPE}-{WILAYA}-{SEQ},
+    // e.g. "CU-16-00042"). Assigned once on the cloud; the desktop only ever
+    // MIRRORS it from the sync feed (it is in the User immutableFields set,
+    // so pushes can never alter it). All-NULL existing rows are fine: SQLite
+    // unique indexes allow any number of NULLs.
+    version: 10,
+    name: 'user-uid (immutable BLASTI account identifier — UID-0.6.14)',
+    statements: [
+      'ALTER TABLE "User" ADD COLUMN "uid" TEXT',
+      'CREATE UNIQUE INDEX IF NOT EXISTS "User_uid_key" ON "User"("uid")',
+    ],
+  },
+  {
+    // 0.6.20 parity audit — Service.price (cloud schema has it; the desktop
+    // sanitizer silently DROPPED it from every pulled service row, so prices
+    // edited on the webapp vanished offline and agency-settings could not
+    // show/edit them). Nullable INTEGER, cloud default 0.
+    version: 11,
+    name: 'service-price (cloud parity — Task C pricing)',
+    statements: [
+      'ALTER TABLE "Service" ADD COLUMN "price" INTEGER',
+    ],
+  },
+  {
+    // r21-6 — PaymentSettings transfer details (cloud parity): holder name /
+    // address for the CCP + bank accounts (displayed to agencies picking a
+    // manual payment method) and the BaridiMob toggle + number. All nullable
+    // / defaulted — additive and data-preserving. Mirrors the schema v12 DDL
+    // in schema-init-sql.js and the desktop prisma schema (client regenerated).
+    version: 12,
+    name: 'payment-settings transfer details (ccp/bank holder+address, BaridiMob)',
+    statements: [
+      'ALTER TABLE "PaymentSettings" ADD COLUMN "ccpHolderName" TEXT',
+      'ALTER TABLE "PaymentSettings" ADD COLUMN "ccpAddress" TEXT',
+      'ALTER TABLE "PaymentSettings" ADD COLUMN "bankHolderName" TEXT',
+      'ALTER TABLE "PaymentSettings" ADD COLUMN "bankAddress" TEXT',
+      'ALTER TABLE "PaymentSettings" ADD COLUMN "baridiMobEnabled" BOOLEAN NOT NULL DEFAULT false',
+      'ALTER TABLE "PaymentSettings" ADD COLUMN "baridiMobNumber" TEXT',
+    ],
+  },
+  {
+    // r21-8 — counter CONTROL model (claim/heartbeat/release + requests):
+    //   Counter gains the control lease columns (who controls it + when it
+    //   was claimed / last heartbeated — the sweeper releases counters whose
+    //   heartbeat is older than 3 minutes), and CounterControlRequest stores
+    //   the 60s "request control" window (holder approves/rejects; the
+    //   sweeper auto-transfers on expiry while the requester is still an
+    //   active member, else stamps EXPIRED). All additive / nullable —
+    //   data-preserving. Mirrors the schema v13 DDL in schema-init-sql.js and
+    //   the desktop prisma schema (client regenerated).
+    version: 13,
+    name: 'counter control lease columns + CounterControlRequest table',
+    statements: [
+      'ALTER TABLE "Counter" ADD COLUMN "controlledByUserId" TEXT',
+      'ALTER TABLE "Counter" ADD COLUMN "controlledByStaffId" TEXT',
+      'ALTER TABLE "Counter" ADD COLUMN "controlClaimedAt" DATETIME',
+      'ALTER TABLE "Counter" ADD COLUMN "controlHeartbeatAt" DATETIME',
+      'CREATE TABLE IF NOT EXISTS "CounterControlRequest" ("id" TEXT NOT NULL PRIMARY KEY, "counterId" TEXT NOT NULL, "agencyId" TEXT NOT NULL, "fromUserId" TEXT NOT NULL, "fromStaffId" TEXT, "requestedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, "expiresAt" DATETIME NOT NULL, "status" TEXT NOT NULL DEFAULT \'PENDING\', "resolvedByUserId" TEXT, "resolvedAt" DATETIME, CONSTRAINT "CounterControlRequest_counterId_fkey" FOREIGN KEY ("counterId") REFERENCES "Counter" ("id") ON DELETE CASCADE ON UPDATE CASCADE, CONSTRAINT "CounterControlRequest_agencyId_fkey" FOREIGN KEY ("agencyId") REFERENCES "Agency" ("id") ON DELETE CASCADE ON UPDATE CASCADE)',
+      'CREATE INDEX IF NOT EXISTS "CounterControlRequest_counterId_idx" ON "CounterControlRequest"("counterId")',
+      'CREATE INDEX IF NOT EXISTS "CounterControlRequest_agencyId_idx" ON "CounterControlRequest"("agencyId")',
+      'CREATE INDEX IF NOT EXISTS "CounterControlRequest_status_expiresAt_idx" ON "CounterControlRequest"("status", "expiresAt")',
     ],
   },
 ]

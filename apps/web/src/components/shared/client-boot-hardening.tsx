@@ -54,6 +54,7 @@ import { initMobilePushRegistration } from '@/lib/push-registration';
 import { initNativeBackHandler } from '@/lib/native-back-handler';
 import { startDeviceReporting } from '@/lib/device-report';
 import { startUserStoreRefresh } from '@/lib/user-store-refresh';
+import { installRemoteLogger } from '@/lib/remote-logger';
 import { PaymentRealtimeToasts } from '@/lib/payment-realtime';
 
 const CHUNK_RELOAD_KEY = 'blasti-chunk-reload-at';
@@ -70,6 +71,15 @@ export function ClientBootHardening() {
     initMobilePushRegistration().catch((error) => {
       console.warn('[BootHardening] Mobile push registration failed:', error);
     });
+
+    // ── 0-. Remote account logger (logs-1; ALL shells) ─────────────────
+    // Detailed client log capture + periodic upload to the VPS vault under
+    // the account UID. Fire-and-forget: never blocks or throws at boot.
+    try {
+      installRemoteLogger();
+    } catch (error) {
+      console.warn('[BootHardening] Remote logger install failed:', error);
+    }
 
     // ── 0b. Mobile hardware back button (Capacitor only; no-op elsewhere) ─
     // Same fire-and-forget contract. The listener registers once per session

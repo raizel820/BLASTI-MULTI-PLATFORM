@@ -873,12 +873,12 @@ export function DeviceTvBoard({
         className="min-h-screen bg-gray-900 flex flex-col items-center justify-center text-white p-6"
         dir={rtl ? 'rtl' : 'ltr'}
       >
-        <Link2 className="h-14 w-14 text-gray-600 mb-6" />
+        <Link2 className="h-14 w-14 text-gray-600 dark:text-gray-400 mb-6" />
         <h1 className="text-2xl font-bold mb-2">{t('kioskQueueBoard')}</h1>
         <p className="text-gray-400 text-center max-w-md mb-1">
           {t('tvBoardNotLinked')}
         </p>
-        <p className="text-gray-500 text-sm text-center max-w-md font-mono">
+        <p className="text-gray-500 dark:text-gray-400 text-sm text-center max-w-md font-mono">
           ?agencyId=… {rtl ? 'أو' : 'or'} ?code=…
         </p>
         <button
@@ -907,7 +907,7 @@ export function DeviceTvBoard({
       >
         <WifiOff className="h-14 w-14 text-red-400/70 mb-4" />
         <p className="text-xl mb-1">{t('error')}</p>
-        <p className="text-gray-500 text-sm mb-6">
+        <p className="text-gray-500 dark:text-gray-400 text-sm mb-6">
           {fetchFailed ? t('tvBoardCannotReachServer') : ''}
         </p>
         <button
@@ -1229,7 +1229,7 @@ export function DeviceTvBoard({
                   animate={{ opacity: [0.5, 1, 0.5] }}
                   transition={{ duration: 3, repeat: Infinity , ease: 'easeInOut' }}
                 >
-                  <Users className="h-16 w-16 mx-auto mb-4 text-gray-600" />
+                  <Users className="h-16 w-16 mx-auto mb-4 text-gray-600 dark:text-gray-400" />
                 </motion.div>
                 <p className="text-gray-400 text-xl">
                   {t('noQueue')}
@@ -1266,7 +1266,7 @@ export function DeviceTvBoard({
                       value={stat.waiting}
                       className="text-xl font-bold text-amber-400"
                     />
-                    <p className="text-[10px] text-gray-500 uppercase">{t('kioskWaiting')}</p>
+                    <p className="text-[10px] text-gray-500 dark:text-gray-400 uppercase">{t('kioskWaiting')}</p>
                   </div>
                   {showEstimatedWait && (
                   <div className="text-center">
@@ -1274,7 +1274,7 @@ export function DeviceTvBoard({
                       value={stat.estimatedWait}
                       className="text-xl font-bold text-teal-400"
                     />
-                    <p className="text-[10px] text-gray-500 uppercase">{t('kioskMinutes')}</p>
+                    <p className="text-[10px] text-gray-500 dark:text-gray-400 uppercase">{t('kioskMinutes')}</p>
                   </div>
                   )}
                 </div>

@@ -15,6 +15,8 @@ import {
 import { getMapsSettingsAdmin, validateMapsSettingsPayload, applyMapsSettingsWrites, validateGoogleMaps, validateOpenFreeMap, validateGeocoding, type MapsValidationResult } from '../lib/map-settings'
 import { getSettingRaw } from '../lib/config-manager'
 import { SETTLED_TRANSACTION_STATUSES } from '../lib/enums'
+// Agencies Management — dictionary-backed category validation.
+import { categorySlugError } from '../lib/categories'
 // Online (Chargily) payment reconciliation — the admin transactions console can
 // verify a gateway checkout against the LIVE Chargily API and settle it through
 // the same idempotent fulfillment path used by the webhook + poll fallback.
@@ -48,6 +50,12 @@ app.post('/agencies', async (c) => {
     }
 
     const { name, nameAr, nameFr, description, address, phone, category, ownerId, customCode } = validation.data
+
+    // Agencies Management — category must exist + be active in the dictionary.
+    const categoryError = await categorySlugError(category)
+    if (categoryError) {
+      return c.json({ success: false, error: categoryError }, 400)
+    }
 
     // SECURITY: ownerId must always be provided — derive from admin session if missing
     const resolvedOwnerId = ownerId || admin.id
@@ -1580,8 +1588,11 @@ app.get('/analytics/sms', async (c) => {
     for (const g of byStatus) statusCounts[g.status] = g._count.id
     const failed = (statusCounts.FAILED ?? 0) + (statusCounts.EXPIRED ?? 0)
 
-    const purchasedUnits = purchaseRows.reduce((sum, p) => sum + p.quantity, 0)
-    const purchasedValue = purchaseRows.reduce((sum, p) => sum + p.price, 0)
+    // P0-1: purchased units/value count APPROVED purchases only (PENDING /
+    // REJECTED / FAILED packs never granted credit, so they must not inflate
+    // the totals). Per-status purchase counts stay data-driven below.
+    const purchasedUnits = purchaseRows.filter(p => p.status === 'APPROVED').reduce((sum, p) => sum + p.quantity, 0)
+    const purchasedValue = purchaseRows.filter(p => p.status === 'APPROVED').reduce((sum, p) => sum + p.price, 0)
     const purchasesByStatus: Record<string, number> = {}
     for (const p of purchaseRows) purchasesByStatus[p.status] = (purchasesByStatus[p.status] ?? 0) + 1
 
@@ -2224,6 +2235,7 @@ app.get('/dashboard', async (c) => {
       dailyReservations,
       pendingTransactions,
       approvedTransactionRows,
+      approvedSmsPurchaseRows,
       totalUsers,
       openSupportTickets,
       expiredSubscriptions,
@@ -2241,6 +2253,15 @@ app.get('/dashboard', async (c) => {
       db.transaction.findMany({
         where: { status: { in: [...SETTLED_TRANSACTION_STATUSES] } },
         select: { amount: true, amountPaid: true, priceSnapshot: true },
+      }),
+      // Revenue parity fix (Agencies Management session): the home dashboard
+      // revenue MUST match /analytics/payments, and the analytics endpoint
+      // explicitly counts APPROVED SmsPurchase rows as real revenue ("SMS
+      // pack purchases are REAL revenue" — admin.ts analytics/payments). The
+      // home card was missing them, so it read lower than analytics.
+      db.smsPurchase.findMany({
+        where: { status: 'APPROVED' },
+        select: { price: true },
       }),
       db.user.count({ where: { isActive: true } }),
       // Support desk: OPEN + IN_PROGRESS tickets awaiting admin action
@@ -2275,6 +2296,7 @@ app.get('/dashboard', async (c) => {
       (sum, t) => sum + (t.amountPaid ?? t.priceSnapshot ?? t.amount),
       0,
     )
+      + approvedSmsPurchaseRows.reduce((sum, s) => sum + s.price, 0)
 
     return c.json({
       stats: {
@@ -2391,12 +2413,13 @@ app.get('/export/users', async (c) => {
 
     // Convert to CSV
     const headers = [
-      'Username', 'Full Name', 'Email', 'Phone', 'Role', 'Language',
+      'UID', 'Username', 'Full Name', 'Email', 'Phone', 'Role', 'Language',
       'Is Active', 'Free SMS', 'Reservations', 'Favorites',
       'Audit Logs', 'Notifications', 'Created At',
     ]
 
     const rows = users.map((u) => [
+      u.uid || '',
       u.username,
       u.fullName,
       u.email || '',
@@ -2849,6 +2872,15 @@ app.put('/payment-settings', async (c) => {
         ...(validatedData.bankRib !== undefined && { bankRib: validatedData.bankRib }),
         ...(validatedData.bankName !== undefined && { bankName: validatedData.bankName }),
         ...(validatedData.ewalletNumber !== undefined && { ewalletNumber: validatedData.ewalletNumber }),
+        // r21-6 — display-safe transfer details + BaridiMob. Nullable strings:
+        // '' from the UI normalizes to null so the public endpoint falls back
+        // to the i18n placeholder instructions.
+        ...(validatedData.ccpHolderName !== undefined && { ccpHolderName: validatedData.ccpHolderName || null }),
+        ...(validatedData.ccpAddress !== undefined && { ccpAddress: validatedData.ccpAddress || null }),
+        ...(validatedData.bankHolderName !== undefined && { bankHolderName: validatedData.bankHolderName || null }),
+        ...(validatedData.bankAddress !== undefined && { bankAddress: validatedData.bankAddress || null }),
+        ...(validatedData.baridiMobEnabled !== undefined && { baridiMobEnabled: validatedData.baridiMobEnabled }),
+        ...(validatedData.baridiMobNumber !== undefined && { baridiMobNumber: validatedData.baridiMobNumber || null }),
       },
     })
 
@@ -3848,6 +3880,8 @@ app.get('/users', async (c) => {
           id: true,
           username: true,
           fullName: true,
+          // UID-0.6.14 — immutable account identifier.
+          uid: true,
           email: true,
           role: true,
           language: true,
@@ -4057,6 +4091,9 @@ app.delete('/users', async (c) => {
       await tx.delayedJob.deleteMany({ where: { userId } })
       // Delete user's device registrations
       await tx.deviceRegistration.deleteMany({ where: { userId } })
+      // P2 fix: SupportTicket.userId is a required FK — without this the
+      // user.delete below threw P2003 → 500 for any user with tickets.
+      await tx.supportTicket.deleteMany({ where: { userId } })
       // Clear transaction reviews
       await tx.transaction.updateMany({
         where: { reviewedBy: userId },

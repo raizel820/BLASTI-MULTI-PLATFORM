@@ -2,6 +2,8 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useAppStore } from '@/store/use-app-store';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -68,6 +70,8 @@ interface Employee {
   isActive: boolean;
   createdAt: string;
   permissions?: Record<string, boolean>;
+  /** UID-0.6.14 — immutable account identifier. */
+  uid?: string | null;
 }
 
 interface BranchOption {
@@ -101,6 +105,9 @@ export function AgencyEmployees() {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
   const agencyId = user?.agencyId || '';
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
   // Task 37-e: the employees page is OWNER territory — staff/manager sessions
   // get an owner-only empty state (the ViewRouter gate already redirects, this
   // is the direct-navigation belt-and-braces).
@@ -178,6 +185,7 @@ export function AgencyEmployees() {
           isActive: s.isActive ?? s.user?.isActive ?? true,
           createdAt: s.joinedAt ?? s.user?.createdAt ?? new Date().toISOString(),
           permissions: s.permissions ?? {},
+          uid: s.user?.uid ?? null,
         })));
       } else {
         setEmployees([]);
@@ -192,7 +200,8 @@ export function AgencyEmployees() {
 
   useEffect(() => {
     fetchEmployees();
-  }, [fetchEmployees]);
+    // resumeNonce — 0.6.16: refetch when the app resumes to the foreground.
+  }, [fetchEmployees, resumeNonce]);
 
   // Task 31 bug 8: load the agency's branches when the create dialog opens so
   // the staff member can be associated with one at creation time.
@@ -664,11 +673,14 @@ export function AgencyEmployees() {
                           <p className="font-semibold text-sm text-foreground truncate">{emp.fullName || '?'}</p>
                           {getRoleBadge(emp.role)}
                           {!emp.isActive && (
-                            <Badge variant="outline" className="text-[10px] text-gray-500 border-gray-300">{t('inactive')}</Badge>
+                            <Badge variant="outline" className="text-[10px] text-gray-500 dark:text-gray-400 border-gray-300 dark:border-gray-600">{t('inactive')}</Badge>
                           )}
                         </div>
-                        <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
+                        <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground flex-wrap">
                           <span>@{emp.username || '—'}</span>
+                          {emp.uid && (
+                            <span className="font-mono" dir="ltr">{emp.uid}</span>
+                          )}
                           <span className="hidden sm:inline">•</span>
                           <span className="hidden sm:inline">{formatDate(emp.createdAt)}</span>
                         </div>

@@ -2,6 +2,8 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { useLanguage } from '@/hooks/use-language';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import type { TranslationKeys } from '@/i18n';
 import { unwrapListPayload } from '@/lib/list-payload';
 import { Button } from '@/components/ui/button';
@@ -57,10 +59,13 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { BiometricSettingsCard } from '@/components/shared/biometric-settings';
 import { AppUpdateSettingsCard } from '@/components/shared/app-update-settings-card';
+import { AccountUidChip, ManualLogUpload } from '@/components/shared/account-log-tools';
 // Task 83-b — agency location editor (map picker + Algeria address selectors).
 import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
 import { WilayaSelect, CommuneSelect } from '@/components/shared/algeria-location-selects';
-import { findWilayaByCode } from '@/lib/algeria-locations';
+import { findWilayaByCode, findWilayaCentroid } from '@/lib/algeria-locations';
+// r21-5 — map-follows-inputs: the wilaya→centroid jump is debounced.
+import { useDebounce } from '@/hooks/use-debounce';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -84,6 +89,9 @@ interface AgencyService {
   nameAr?: string;
   nameFr?: string;
   prefix: string;
+  price?: number | null;
+  durationMinutes?: number | null;
+  priority?: number;
 }
 
 interface AgencySettingsData {
@@ -120,6 +128,11 @@ interface SettingsSection {
   danger?: boolean;
 }
 
+// r21-5 — official two-digit ANI wilaya codes 01-58 (client-side copy of
+// the create-agency-form regex; used by the zip→wilaya cascade + centroid
+// follow inside the location section).
+const LOC_WILAYA_CODE_REGEX = /^(0[1-9]|[1-4][0-9]|5[0-8])$/;
+
 const SECTIONS: SettingsSection[] = [
   { id: 'general', icon: Info, titleKey: 'settings' },
   // Task 83-b — agency-level canonical location (map picker + address).
@@ -137,6 +150,9 @@ const SECTIONS: SettingsSection[] = [
 export function AgencySettings() {
   const { user, logout } = useAppStore();
   const { t, lang } = useLanguage();
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
   const [settings, setSettings] = useState<AgencySettingsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -200,6 +216,12 @@ export function AgencySettings() {
   const [svcNameAr, setSvcNameAr] = useState('');
   const [svcNameFr, setSvcNameFr] = useState('');
   const [svcPrefix, setSvcPrefix] = useState('');
+  // Task C — service price (DZD); required when the admin policy enforces it
+  const [svcPrice, setSvcPrice] = useState('');
+  const [priceRequired, setPriceRequired] = useState(false);
+  // P2-10 — per-service duration estimate + queue priority
+  const [svcDuration, setSvcDuration] = useState('');
+  const [svcPriority, setSvcPriority] = useState('0');
 
   // ─── Task 83-b — Location section state (agency-level canonical location).
   // GET /api/agency/settings carries NO location fields, so the section loads
@@ -218,6 +240,30 @@ export function AgencySettings() {
   // null snapshot = profile never loaded → save must not clear anything).
   const [locOriginal, setLocOriginal] = useState<{ latitude: number | null; longitude: number | null } | null>(null);
   const [locSaving, setLocSaving] = useState(false);
+  // r21-5 — map-follows-inputs: a USER-driven wilaya change (select or the
+  // zip-prefix cascade) re-centers the location pin on the wilaya seat
+  // centroid after a short debounce. Ordering stamps mirror the create-
+  // agency wizard: server-loaded values never trigger the jump and a pin
+  // placed after the wilaya edit wins.
+  const lastLocWilayaEditAtRef = useRef<number | null>(null);
+  const lastLocPinAtRef = useRef<number | null>(null);
+  const prevLocCentroidWilayaRef = useRef<string>('');
+  const debouncedLocWilaya = useDebounce(locWilaya, 400);
+  useEffect(() => {
+    const code = (debouncedLocWilaya || '').trim();
+    const prev = prevLocCentroidWilayaRef.current;
+    prevLocCentroidWilayaRef.current = code;
+    if (code === prev) return; // not a wilaya change
+    if (lastLocWilayaEditAtRef.current == null) return; // server-loaded value — keep the saved pin
+    if (lastLocPinAtRef.current != null && lastLocPinAtRef.current > lastLocWilayaEditAtRef.current) {
+      return; // the user fine-tuned the pin after this edit — never fight them
+    }
+    if (!LOC_WILAYA_CODE_REGEX.test(code)) return;
+    const centroid = findWilayaCentroid(code);
+    if (!centroid) return;
+    setLocLatitude(centroid.lat);
+    setLocLongitude(centroid.lng);
+  }, [debouncedLocWilaya]);
 
   useEffect(() => {
     fetchSettings();
@@ -225,7 +271,8 @@ export function AgencySettings() {
     fetchBranches();
     fetchPlanCap();
     fetchProfileLocation();
-  }, []);
+    // resumeNonce — 0.6.16: refetch when the app resumes to the foreground.
+  }, [resumeNonce]);
 
   // Task 37: no early return when the session user lacks agencyId — the APIs
   // (cloud + desktop local) resolve the agency from the session now. The
@@ -312,6 +359,12 @@ export function AgencySettings() {
         setLocAddress(p.address ?? '');
         setLocWilaya(p.wilaya ?? '');
         setLocPostalCode(p.postalCode ?? '');
+        // r21-5 — server truth resets the map-follow stamps AND re-baselines
+        // the centroid watcher: loading the saved agency location can never
+        // yank its pin to a centroid.
+        lastLocWilayaEditAtRef.current = null;
+        lastLocPinAtRef.current = null;
+        prevLocCentroidWilayaRef.current = (p.wilaya ?? '').trim();
         // The stored city counts as selected only when it belongs to the
         // stored wilaya's commune list (agency-profile convention) — a
         // legacy/mismatched city leaves the commune unselected.
@@ -539,6 +592,15 @@ export function AgencySettings() {
         originalSettingsRef.current = JSON.parse(JSON.stringify(data));
         setHasUnsavedChanges(false);
       }
+      // Task C — the admin-controlled service policy for this agency type
+      // decides whether the price field is mandatory in the service dialog.
+      apiFetch('/api/agency/services/policy')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          const p = d?.policy;
+          setPriceRequired(!!p?.enforce && p?.servicePriceMode === 'MANDATORY');
+        })
+        .catch(() => setPriceRequired(false));
     } catch {
       toast.error(t('error'));
     } finally {
@@ -600,6 +662,9 @@ export function AgencySettings() {
     setSvcNameAr('');
     setSvcNameFr('');
     setSvcPrefix('');
+    setSvcPrice('');
+    setSvcDuration('');
+    setSvcPriority('0');
     setDialogOpen(true);
   };
 
@@ -609,11 +674,39 @@ export function AgencySettings() {
     setSvcNameAr(svc.nameAr || '');
     setSvcNameFr(svc.nameFr || '');
     setSvcPrefix(svc.prefix);
+    setSvcPrice(svc.price != null ? String(svc.price) : '');
+    setSvcDuration(svc.durationMinutes != null ? String(svc.durationMinutes) : '');
+    setSvcPriority(String(svc.priority ?? 0));
     setDialogOpen(true);
   };
 
   const handleSaveService = async () => {
     if (!svcName.trim() || !svcPrefix.trim()) {
+      toast.error(t('requiredField'));
+      return;
+    }
+    // Task C — mirror the server-side policy: price mandatory when enforced
+    const parsedPrice = svcPrice.trim() === '' ? null : Number(svcPrice);
+    if (Number.isNaN(parsedPrice as number) || (parsedPrice as number | null) !== null && (parsedPrice as number) < 0) {
+      toast.error(t('requiredField'));
+      return;
+    }
+    if (priceRequired && (parsedPrice === null || parsedPrice <= 0)) {
+      toast.error(t('priceMandatory' as TranslationKeys));
+      return;
+    }
+    // P2-10 — duration is optional; when present it must be a positive whole
+    // number of minutes. Priority is 0-99 (higher called first).
+    const parsedDuration = svcDuration.trim() === '' ? null : Number(svcDuration);
+    if (
+      (parsedDuration as number | null) !== null &&
+      (!Number.isInteger(parsedDuration) || (parsedDuration as number) < 1 || (parsedDuration as number) > 600)
+    ) {
+      toast.error(t('requiredField'));
+      return;
+    }
+    const parsedPriority = svcPriority.trim() === '' ? 0 : Number(svcPriority);
+    if (!Number.isInteger(parsedPriority) || parsedPriority < 0 || parsedPriority > 99) {
       toast.error(t('requiredField'));
       return;
     }
@@ -632,6 +725,9 @@ export function AgencySettings() {
           nameAr: svcNameAr.trim() || undefined,
           nameFr: svcNameFr.trim() || undefined,
           prefix: svcPrefix.trim().toUpperCase(),
+          price: parsedPrice,
+          durationMinutes: parsedDuration,
+          priority: parsedPriority,
         }),
       });
 
@@ -639,6 +735,13 @@ export function AgencySettings() {
         toast.success(t('success'));
         setDialogOpen(false);
         fetchSettings();
+      } else {
+        const err = await res.json().catch(() => ({}));
+        if (err?.error === 'SERVICE_PRICE_REQUIRED') {
+          toast.error(t('priceMandatory' as TranslationKeys));
+        } else {
+          toast.error(t('error'));
+        }
       }
     } catch {
       toast.error(t('error'));
@@ -723,7 +826,11 @@ export function AgencySettings() {
 
   return (
     <div className="p-4 lg:p-6 space-y-4 pb-28">
-      <h1 className="text-2xl font-bold text-foreground">{t('settings')}</h1>
+      <div className="flex items-center justify-between flex-wrap gap-3">
+        <h1 className="text-2xl font-bold text-foreground">{t('settings')}</h1>
+        {/* Immutable account UID — always visible at the top, one-tap copy */}
+        {user?.uid ? <AccountUidChip uid={user.uid} compact /> : null}
+      </div>
 
       {/* Collapsible Settings Sections */}
       {SECTIONS.map((section, sectionIdx) => {
@@ -820,6 +927,7 @@ export function AgencySettings() {
                           <MapLocationPicker
                             value={{ latitude: locLatitude, longitude: locLongitude }}
                             onChange={(lat, lng) => {
+                              lastLocPinAtRef.current = Date.now(); // r21-5 — explicit pick outranks the centroid follow
                               setLocLatitude(lat);
                               setLocLongitude(lng);
                             }}
@@ -844,6 +952,7 @@ export function AgencySettings() {
                                 value={locWilaya}
                                 onValueChange={(code) => {
                                   if (code === locWilaya) return;
+                                  lastLocWilayaEditAtRef.current = Date.now(); // r21-5 — user-driven wilaya change
                                   setLocWilaya(code);
                                   // Dependent list — the commune must belong
                                   // to the newly selected wilaya.
@@ -872,7 +981,26 @@ export function AgencySettings() {
                             <Label className="text-sm">{t('maps.postalCode')}</Label>
                             <Input
                               value={locPostalCode}
-                              onChange={(e) => setLocPostalCode(e.target.value)}
+                              onChange={(e) => {
+                                const value = e.target.value;
+                                setLocPostalCode(value);
+                                // r21-5 — zip → wilaya cascade (parity with
+                                // the create-agency wizard): the first two
+                                // digits ARE the wilaya code; a valid 01-58
+                                // prefix that differs from the current
+                                // selection switches it (and the debounced
+                                // centroid effect above follows the map).
+                                if (value.trim().length >= 2) {
+                                  const digits = value.replace(/\D/g, '');
+                                  const prefix = digits.slice(0, 2);
+                                  if (LOC_WILAYA_CODE_REGEX.test(prefix) && prefix !== locWilaya) {
+                                    lastLocWilayaEditAtRef.current = Date.now(); // zip cascade = user-driven
+                                    setLocWilaya(prefix);
+                                    // Dependent list — reset the commune.
+                                    setLocCommune('');
+                                  }
+                                }
+                              }}
                               className="h-11 w-40"
                               dir="ltr"
                               maxLength={10}
@@ -1586,14 +1714,17 @@ export function AgencySettings() {
                               <MessageSquare className="h-4 w-4 text-teal-600 dark:text-teal-400" />
                               {t('smsBalanceConfig') || 'SMS Balance'}
                             </Label>
-                            <p className="text-[11px] text-muted-foreground">{t('smsBalanceConfigDesc') || 'Number of SMS messages available for the agency'}</p>
+                            <p className="text-[11px] text-muted-foreground">{t('smsBalanceLedgerDesc') || 'Managed by approved purchases — read-only'}</p>
                             <div className="flex items-center gap-3">
+                              {/* P0-1: read-only — the wallet is ledger-managed
+                                  (APPROVED purchases + guarded decrements);
+                                  editing it from settings was removed. */}
                               <Input
                                 type="number"
                                 min={0}
                                 value={settings?.smsBalance ?? 0}
-                                onChange={(e) => updateSetting('smsBalance', parseInt(e.target.value) || 0)}
-                                className="h-11 w-32"
+                                disabled
+                                className="h-11 w-32 opacity-80"
                                 dir="ltr"
                               />
                               <span className="text-xs text-muted-foreground">{t('messages')}</span>
@@ -1632,6 +1763,10 @@ export function AgencySettings() {
                           {/* App-update delivery — auto-download + Wi-Fi-only + manual check */}
                           <p className="text-xs text-muted-foreground">{t('updateSettingsSection')}</p>
                           <AppUpdateSettingsCard />
+                          <Separator />
+                          {/* logs-1 — manual log push to the VPS vault (fallback for a stalled realtime stream) */}
+                          <p className="text-xs text-muted-foreground">{t('uploadLogsNow')}</p>
+                          <ManualLogUpload />
                         </div>
                       )}
 
@@ -1741,7 +1876,9 @@ export function AgencySettings() {
               />
             </div>
             <div className="space-y-2">
-              <Label>{t('servicePrefix')}</Label>
+              <Label>
+                {t('servicePrefix')}
+              </Label>
               <Input
                 value={svcPrefix}
                 onChange={(e) => setSvcPrefix(e.target.value.toUpperCase())}
@@ -1749,6 +1886,66 @@ export function AgencySettings() {
                 className="h-11 w-24"
                 maxLength={3}
               />
+            </div>
+            {/* Task C — service price (DZD). Marked required when the admin
+                policy for this agency type is MANDATORY + enforce. */}
+            <div className="space-y-2">
+              <Label>
+                {t('servicePrice' as TranslationKeys)}
+                {priceRequired && <span className="text-red-500 ms-1">*</span>}
+              </Label>
+              <div className="relative">
+                <Input
+                  value={svcPrice}
+                  onChange={(e) => setSvcPrice(e.target.value.replace(/[^0-9.]/g, ''))}
+                  placeholder={priceRequired ? t('priceMandatory' as TranslationKeys) : t('priceOptional' as TranslationKeys)}
+                  className="h-11 pe-14"
+                  inputMode="decimal"
+                />
+                <span className="absolute end-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground font-medium">
+                  DZD
+                </span>
+              </div>
+              {priceRequired && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  {t('servicePriceRequiredHint' as TranslationKeys)}
+                </p>
+              )}
+            </div>
+            {/* P2-10 — owner-set service duration: the authoritative ETA
+                estimate for this service (overrides measured history). */}
+            <div className="space-y-2">
+              <Label>{t('serviceDuration' as TranslationKeys)}</Label>
+              <div className="relative">
+                <Input
+                  value={svcDuration}
+                  onChange={(e) => setSvcDuration(e.target.value.replace(/[^0-9]/g, ''))}
+                  placeholder={t('serviceDurationPlaceholder' as TranslationKeys)}
+                  className="h-11 pe-14"
+                  inputMode="numeric"
+                />
+                <span className="absolute end-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground font-medium">
+                  {t('minutes' as TranslationKeys)}
+                </span>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {t('serviceDurationHint' as TranslationKeys)}
+              </p>
+            </div>
+            {/* P2-10 — queue priority: higher-priority services are called
+                first; 0 = normal FIFO order. */}
+            <div className="space-y-2">
+              <Label>{t('servicePriority' as TranslationKeys)}</Label>
+              <Input
+                value={svcPriority}
+                onChange={(e) => setSvcPriority(e.target.value.replace(/[^0-9]/g, ''))}
+                placeholder="0"
+                className="h-11 w-24"
+                inputMode="numeric"
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('servicePriorityHint' as TranslationKeys)}
+              </p>
             </div>
           </div>
           <DialogFooter>

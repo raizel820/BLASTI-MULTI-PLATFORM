@@ -24,6 +24,7 @@ const { Hono } = require('hono')
 const { cors } = require('hono/cors')
 const { createServer } = require('http')
 const { randomBytes, timingSafeEqual, createHash, scryptSync } = require('crypto')
+const os = require('os')
 const { localDb, setupPragmas, ensureDatabaseReady } = require('./lib/db')
 const { adoptChildrenThenDelete } = require('./lib/stale-unique')
 const localRealtime = require('./local-realtime')
@@ -44,6 +45,10 @@ const registerAgencyDeviceRoutes = require('./agency-devices')
 // register, pair, heartbeat and pull live queue data from the LOCAL API
 // (LAN mode / offline), closing the parity gap with the cloud API.
 const { registerDeviceBoardRoutes } = require('./lib/device-board-routes')
+
+// R-21F: offline LAN authority — election (spec+OS specScore, term), per-device
+// join tokens, follower write-gate. See lib/lan-authority.js header comment.
+const lanAuthority = require('./lib/lan-authority')
 
 // ─── Configuration ────────────────────────────────────────────────────────
 
@@ -568,6 +573,8 @@ async function resolveAuthorityContext(explicitAgencyId) {
     agencyId,
     agency,
     isOwner,
+    isSuperAdmin: sessionUser.role === 'SUPER_ADMIN',
+    userId: sessionUser.id,
     staffRow,
     staffId: staffRow ? staffRow.id : null,
     role: isOwner ? 'OWNER' : (staffRow ? staffRow.role : null),
@@ -635,29 +642,40 @@ async function checkAgencyOwnerOnly(explicitAgencyId) {
 }
 
 /**
- * Task 37-d OCCUPANCY RULE for the queue action routes: a non-owner caller
- * must operate from a counter they personally occupy.
- *   - staff without counterId                → denied OCCUPY_COUNTER_FIRST
- *   - counter missing / outside the agency   → denied OCCUPY_COUNTER_FIRST
- *   - counter occupied by another ACTIVE row → denied OCCUPY_COUNTER_FIRST
- * Owner is unaffected (counterId optional, no occupancy requirement).
+ * Queue-action counter gate — r23 CONTROL semantics (cloud parity with
+ * enforceQueueStaffAuthority). EVERY agency account — the OWNER included —
+ * must CONTROL (claim) an active counter before managing the queue; only
+ * SUPER_ADMIN keeps the platform bypass.
+ *   - COUNTER_SETUP_REQUIRED   — the agency has no ACTIVE counter at all.
+ *   - COUNTER_CONTROL_REQUIRED (legacy alias OCCUPY_COUNTER_FIRST kept for
+ *     the pre-existing UI toasts) — counters exist but the caller controls
+ *     none, or a counterId was passed that they do not control.
+ * Returns the caller's controlled counter so the call routes can bind the
+ * ticket to the caller's desk when the request omitted the counter.
  */
 async function checkCounterOccupancy(ctx, counterId) {
-  if (ctx.isOwner) return { ok: true, counter: null }
-  if (!counterId) {
-    return { ok: false, body: { success: false, error: 'OCCUPY_COUNTER_FIRST' } }
-  }
-  const counter = await db.counter.findUnique({
-    where: { id: counterId },
-    include: { branch: true },
+  if (ctx.isSuperAdmin) return { ok: true, counter: null }
+  const controlled = await db.counter.findFirst({
+    where: {
+      controlledByUserId: ctx.userId,
+      branch: { agencyId: ctx.agencyId },
+      isActive: true,
+    },
+    select: { id: true },
   }).catch(() => null)
-  if (!counter || !counter.branch || counter.branch.agencyId !== ctx.agencyId) {
-    return { ok: false, body: { success: false, error: 'OCCUPY_COUNTER_FIRST' } }
+  if (!controlled) {
+    const activeCounters = await db.counter.count({
+      where: { branch: { agencyId: ctx.agencyId }, isActive: true },
+    }).catch(() => 0)
+    if (activeCounters === 0) {
+      return { ok: false, body: { success: false, error: 'COUNTER_SETUP_REQUIRED' } }
+    }
+    return { ok: false, body: { success: false, error: 'COUNTER_CONTROL_REQUIRED', legacyError: 'OCCUPY_COUNTER_FIRST' } }
   }
-  if (counter.staffId !== ctx.staffId) {
-    return { ok: false, body: { success: false, error: 'OCCUPY_COUNTER_FIRST' } }
+  if (counterId && counterId !== controlled.id) {
+    return { ok: false, body: { success: false, error: 'COUNTER_CONTROL_REQUIRED', legacyError: 'OCCUPY_COUNTER_FIRST' } }
   }
-  return { ok: true, counter }
+  return { ok: true, counter: controlled }
 }
 
 /**
@@ -786,6 +804,211 @@ async function isCloudReachable(timeoutMs) {
   }
 }
 
+// ─── UNIFIED QUEUE / Enhanced Online Operational Mode ────────────────────────
+//
+// When the central API is reachable it is the DEFINITIVE source of truth for
+// every branch-staff queue operation: ticket-calling, reservation-creation
+// and status updates are executed there as ONE atomic, idempotent,
+// OCC-guarded PostgreSQL transaction, then mirrored into the local SQLite
+// mirror. When the cloud is unreachable, the proven local-first outbox path
+// still applies below each route's online branch.
+//
+// NEVER log an outbox row for an operation the CENTRAL API already applied —
+// Reservation pushes replay unconditionally (no updatedAt column), so a
+// replayed local outcome could clobber a newer central state.
+
+/**
+ * Cached online verdict from the sync engine (fast path: zero round trips
+ * when the cloud socket is live or the verdict is <15s old). Returns
+ * true/false, or null when the engine has no verdict yet (treat as offline).
+ */
+function cloudOnlineFast() {
+  try {
+    // Lazy require — sync-service lazily requires ./index (circular dep).
+    const syncService = require('./sync-service')
+    if (syncService && typeof syncService.cloudReachableFast === 'function') {
+      return syncService.cloudReachableFast()
+    }
+  } catch { /* engine not started — treat as offline */ }
+  return null
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/**
+ * Forward a queue mutation to the central API with an idempotency key.
+ *
+ * Idempotency contract: the SAME X-Idempotency-Key is reused across internal
+ * retries — if the first attempt actually landed, the cloud's
+ * idempotencyGuard replays the STORED response instead of executing twice
+ * ("prevent the same operation executing twice due to request
+ * retransmission"). The renderer's own key is forwarded when present so a
+ * renderer-level retransmission maps to the same central execution.
+ *
+ * Retry contract (automatic retries on concurrent-operation conflicts):
+ *   - 409 conflict → retry with the same key (a fresh execution claims the
+ *     NEXT ticket; a stored one replays).
+ *   - network error / timeout / 5xx / 429 / 408 → retry with backoff.
+ *   - 401 / 423 → NEVER retried and NEVER masked as offline — the session
+ *     was rejected (Task 33-C principle): surfaced as errorKind 'AUTH'.
+ *   - other 4xx → definitive business answer, errorKind 'CLIENT'.
+ * Exhausted retryable failures → errorKind 'UNREACHABLE' (caller falls back
+ * to the local outbox path — full offline-mode behavior preserved).
+ *
+ * Returns { ok, status, data, errorKind, error } — never throws.
+ */
+async function callCentralQueueApi(method, path, body, opts) {
+  opts = opts || {}
+  const base = cloudBaseUrl()
+  const maxAttempts = opts.maxAttempts || 3
+  const idempotencyKey = opts.idempotencyKey || ('qop-' + require('crypto').randomUUID())
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res = await fetch(base + path, {
+        method,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Idempotency-Key': idempotencyKey,
+          ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(opts.timeoutMs || 6000),
+      })
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      if (res.ok) return { ok: true, status: res.status, data, errorKind: null }
+      // Auth rejection is definitive — surface it, never go local silently.
+      if (res.status === 401 || res.status === 423) {
+        return { ok: false, status: res.status, data, errorKind: 'AUTH' }
+      }
+      // Concurrent-operation conflict: the central claim/tx lost a race —
+      // retrying re-evaluates the queue (a landed attempt replays instead).
+      if (res.status === 409) {
+        if (attempt < maxAttempts) { await sleep(350); continue }
+        return { ok: false, status: res.status, data, errorKind: 'CONFLICT' }
+      }
+      // Transient failures (cloud hiccup / rate limit / gateway timeout).
+      if (res.status >= 500 || res.status === 429 || res.status === 408) {
+        if (attempt < maxAttempts) { await sleep(400 * attempt); continue }
+        return { ok: false, status: res.status, data, errorKind: 'UNREACHABLE' }
+      }
+      // Definitive business answer (paused, closed, ONLY_SCHEDULED_WAITING,
+      // OCCUPY_COUNTER_FIRST, PERMISSION_DENIED, …) — pass through verbatim.
+      return { ok: false, status: res.status, data, errorKind: 'CLIENT' }
+    } catch (err) {
+      // Network error / timeout — retry with the SAME idempotency key: if the
+      // request landed despite the client-side timeout, the replay path
+      // returns the stored response instead of double-executing.
+      if (attempt < maxAttempts) { await sleep(400 * attempt); continue }
+      return { ok: false, status: 0, data: null, error: err?.message || 'cloud unreachable', errorKind: 'UNREACHABLE' }
+    }
+  }
+  return { ok: false, status: 0, data: null, errorKind: 'UNREACHABLE' }
+}
+
+/**
+ * Map a queue action to the exact local/central state delta (both paths use
+ * THIS mapping so the local mirror always matches the central outcome).
+ */
+function queueActionUpdateData(action, now) {
+  if (action === 'complete') return { status: 'COMPLETED', completedAt: now }
+  if (action === 'no_show') return { status: 'NO_SHOW', skippedAt: now }
+  if (action === 'cancel') return { status: 'CANCELLED', cancelledAt: now }
+  if (action === 'serve') return { status: 'SERVING' }
+  if (action === 'recall') return { status: 'CALLED', calledAt: now }
+  return { status: action }
+}
+
+/**
+ * Apply an authoritative CENTRAL claim (call-next) to the local mirror —
+ * WITHOUT an outbox row (the cloud owns this change; the immediate pull
+ * reconciles counter links and anything else).
+ */
+async function applyCentralClaimLocally(centralRes, agencyId) {
+  if (!centralRes || !centralRes.id || !db) return
+  try {
+    const localRow = await db.reservation.findUnique({ where: { id: centralRes.id } }).catch(() => null)
+    if (localRow && localRow.status === 'WAITING') {
+      const data = { status: 'CALLED', calledAt: centralRes.calledAt ? new Date(centralRes.calledAt) : new Date() }
+      if (centralRes.counterId !== undefined) data.counterId = centralRes.counterId
+      await db.reservation.update({ where: { id: centralRes.id }, data })
+    }
+    // Mirror the authoritative "now serving" number for kiosks/dashboards.
+    if (typeof centralRes.queueNumber === 'number') {
+      const qs = await db.queueSettings.findFirst({ where: { agencyId } }).catch(() => null)
+      if (qs) {
+        await db.queueSettings.update({ where: { id: qs.id }, data: { currentServingNumber: centralRes.queueNumber } }).catch(() => {})
+      }
+    }
+    try {
+      const syncService = require('./sync-service')
+      if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+    } catch { /* non-fatal */ }
+  } catch (e) {
+    // The mirror is best-effort — the pull brings the authoritative row.
+    console.warn('[LocalAPI] applyCentralClaimLocally failed (pull will reconcile):', e?.message || e)
+  }
+}
+
+/**
+ * Mirror a CENTRALLY-created reservation into the local DB (walk-ins) —
+ * skipped when the row already exists (idempotent); never outboxed.
+ */
+async function mirrorCentralReservationCreate(centralRes) {
+  if (!centralRes || !centralRes.id || !db) return
+  try {
+    const existing = await db.reservation.findUnique({ where: { id: centralRes.id } }).catch(() => null)
+    if (existing) return
+    await db.reservation.create({
+      data: {
+        id: centralRes.id,
+        agencyId: centralRes.agencyId,
+        serviceId: centralRes.serviceId,
+        userId: centralRes.userId ?? null,
+        queueNumber: typeof centralRes.queueNumber === 'number' ? centralRes.queueNumber : 0,
+        displayNumber: centralRes.displayNumber || '',
+        status: centralRes.status || 'WAITING',
+        isWalkIn: !!centralRes.isWalkIn,
+        walkInCustomerName: centralRes.walkInCustomerName ?? null,
+        joinedAt: centralRes.joinedAt ? new Date(centralRes.joinedAt) : new Date(),
+        estimatedWait: typeof centralRes.estimatedWait === 'number' ? centralRes.estimatedWait : 0,
+      },
+    })
+    try {
+      const syncService = require('./sync-service')
+      if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+    } catch { /* non-fatal */ }
+  } catch (e) {
+    console.warn('[LocalAPI] mirrorCentralReservationCreate failed (pull will reconcile):', e?.message || e)
+  }
+}
+
+/**
+ * Apply an authoritative CENTRAL status update to the local mirror — same
+ * delta mapping as the local path, plus the counter unlink on terminal
+ * actions (parity with the cloud PATCH), never outboxed.
+ */
+async function applyCentralStatusLocally(reservationId, action) {
+  if (!db) return
+  try {
+    const updateData = queueActionUpdateData(action, new Date())
+    const row = await db.reservation.findUnique({ where: { id: reservationId } }).catch(() => null)
+    if (row) await db.reservation.update({ where: { id: reservationId }, data: updateData })
+    if (['complete', 'no_show', 'cancel'].includes(action)) {
+      await db.counter.updateMany({
+        where: { currentReservationId: reservationId },
+        data: { currentReservationId: null },
+      }).catch(() => {})
+    }
+    try {
+      const syncService = require('./sync-service')
+      if (syncService && syncService.triggerSyncNow) syncService.triggerSyncNow()
+    } catch { /* non-fatal */ }
+  } catch (e) {
+    console.warn('[LocalAPI] applyCentralStatusLocally failed (pull will reconcile):', e?.message || e)
+  }
+}
+
 /**
  * Create/update the LOCAL OPERATIONAL User row from a cloud login user
  * object — PROFILE-ONLY. Authentication secrets are never written here
@@ -806,6 +1029,9 @@ async function upsertLocalUserFromCloud(cloudUser, overrides) {
     email: cloudUser.email ?? null,
     phoneNumber: cloudUser.phoneNumber ?? null,
     shortAppId: cloudUser.shortAppId ?? null,
+    // UID-0.6.14 — mirror the cloud-assigned immutable UID (null for legacy
+    // clouds / super admin). Never written from any local path afterwards.
+    uid: cloudUser.uid ?? null,
     role: cloudUser.role || 'CUSTOMER',
     language: cloudUser.language || 'ar',
     avatarUrl: cloudUser.avatarUrl ?? null,
@@ -1144,6 +1370,29 @@ function requireAuth() {
       tokenValid = false
     }
     if (!tokenValid) {
+      // R-21F: per-device LAN tokens (answer 3) — a follower device that
+      // joined this master presents its HMAC token instead of the shared
+      // cloud session. Verified against the joined-device registry; the
+      // device's identity snapshot (captured at join) becomes the user.
+      const deviceRec = lanAuthority.verifyDeviceToken(token)
+      if (deviceRec) {
+        if (db) {
+          c.set('user', {
+            id: deviceRec.userId || 'lan-device-' + deviceRec.deviceId,
+            username: deviceRec.username || deviceRec.name || 'lan-device',
+            role: deviceRec.role || 'STAFF',
+            agencyId: deviceRec.agencyId || null,
+            branchId: deviceRec.branchId || null,
+            lanDevice: { deviceId: deviceRec.deviceId, platform: deviceRec.platform, joinedAt: deviceRec.joinedAt },
+          })
+          c.set('db', db)
+          try { diagLog('LAN-AUTH device-token accept device=' + deviceRec.deviceId + ' platform=' + deviceRec.platform) } catch { /* ignore */ }
+          await next()
+          return
+        }
+        diagLog('LAN-AUTH device-token valid but 503 DB_NOT_READY')
+        return c.json({ success: false, error: 'Local database not ready', code: 'DB_NOT_READY' }, 503)
+      }
       // Task 41 — actionable rejection log: fingerprints of what was presented
       // vs what the session holds, so token-mismatch reports are diagnosable
       // from the console alone. Also written to the rolling diag file.
@@ -2251,6 +2500,24 @@ function createApp() {
     }),
   )
 
+  // ─── R-21F: follower write-gate — the offline master owns all writes ─────
+  // While this node is a FOLLOWER with a live master, mutating HTTP requests
+  // are rejected 409 NOT_MASTER (with the master hint so the client repoints).
+  // Reads stay local (followers keep a read cache by design) and the
+  // infrastructure allowlist (lan/auth/sync-pull/…) is unaffected.
+  app.use('/api/*', async (c, next) => {
+    try {
+      let gatePath = ''
+      try { gatePath = new URL(c.req.url).pathname } catch { /* keep '' */ }
+      const gate = lanAuthority.followerWriteGate(c.req.method, gatePath)
+      if (gate) {
+        try { diagLog(`LAN-AUTH write-gate → 409 ${c.req.method} ${gatePath} (follower of term=${gate.body.master && gate.body.master.term})`) } catch { /* ignore */ }
+        return c.json(gate.body, gate.status)
+      }
+    } catch { /* gate must never wedge a request */ }
+    await next()
+  })
+
   // ─── Request diagnostics — "data loading failed" investigation ───────────
   // Every /api/* request is timed. Failures (status ≥ 400) are ALWAYS logged
   // with a response-body snippet; slow responses (>1500 ms) and
@@ -2300,6 +2567,36 @@ function createApp() {
   })
 
   // Alias: /api/health (used by loading-screen diagnostics probe)
+  // ─── R-21F: LAN authority routes (join/status) ─────────────────────────────
+  // POST /api/lan/join — a device holding a valid CLOUD session token joins
+  // this workspace's offline master: scope re-validated (agency + branch),
+  // per-device HMAC token minted (answer 3), device registered. Auto-join by
+  // design (answer 4) — no approval step; the client validated reachability.
+  app.post('/api/lan/join', async (c) => {
+    let body = null
+    try { body = await c.req.json() } catch { /* body optional */ }
+    const bearer = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-Local-Token') || ''
+    const result = await lanAuthority.joinHandler(body, bearer)
+    return c.json(result.body, result.status)
+  })
+
+  // GET /api/lan/status — public subset (role/term/master) for discovery UIs;
+  // authenticated callers additionally get the joined-device registry.
+  app.get('/api/lan/status', async (c) => {
+    const snapshot = lanAuthority.statusSnapshot()
+    const token = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-Local-Token') || c.req.query('token') || ''
+    const isLocalCaller = !!(token && sessionToken && token === sessionToken)
+    const isDeviceCaller = !!lanAuthority.verifyDeviceToken(token)
+    if (isLocalCaller || isDeviceCaller) {
+      try {
+        snapshot.devices = (await db.$queryRawUnsafe("SELECT value FROM '_sync_meta' WHERE key = 'lan_authority_devices'").catch(() => []))
+        const rows = snapshot.devices
+        snapshot.devices = rows && rows[0] ? (JSON.parse(rows[0].value) || []).slice(-50) : []
+      } catch { snapshot.devices = [] }
+    }
+    return c.json({ success: true, data: snapshot })
+  })
+
   app.get('/api/health', async (c) => {
     // Task 42: build identity — lets diagnostics (and the second-launch guard
     // in main.js) tell a CURRENT local API from a STALE one left running by an
@@ -2365,6 +2662,10 @@ function createApp() {
     // to the LAN, lanIp tells the scanner WHICH address answered (the UDP
     // beacon carries the same pair).
     const lanIp = LAN_ENABLED ? bestLanIp() : null
+    // R-21F: offline-authority identity (role/term/specScore/instance/scope).
+    // Additive — legacy clients ignore the extra fields entirely.
+    let lanAuth = null
+    try { lanAuth = lanAuthority.publicIdentity() } catch { /* non-fatal */ }
     return c.json({
       service: 'blasti-local',
       version: '1.0.0',
@@ -2379,6 +2680,7 @@ function createApp() {
       uptime: Math.floor(process.uptime()),
       networkInterface: LAN_ENABLED ? primaryLanInterface(lanIp) : null,
       syncReady: true,
+      ...(lanAuth || {}),
       capabilities: [
         'auth',
         'agency',
@@ -3136,8 +3438,30 @@ function createApp() {
     if (!type || !name || !/^[a-z][a-z0-9-]{0,23}$/.test(type)) {
       return c.json({ success: false, error: 'Invalid file path' }, 400)
     }
+    // cache-1 parity with the cloud API: strong ETag (size-mtime) + Last-Modified
+    // so WebView revalidations answer with a tiny 304 instead of a full re-read.
     // Organized route has yyyy/mm params; legacy flat route passes only the name.
     const storagePath = yyyy && mm ? `${type}/${yyyy}/${mm}/${name}` : `${type}/${name}`
+    const fileEtagFor = (buf) => {
+      try {
+        const abs = fileStore.resolveRelativeStoragePath(storagePath)
+        const st = abs ? require('fs').statSync(abs) : null
+        return `"${buf.length.toString(16)}-${Math.floor(st ? st.mtimeMs : Date.now()).toString(16)}"`
+      } catch {
+        return `"${buf.length.toString(16)}-0"`
+      }
+    }
+    const notModified304 = (etag) => new Response(null, {
+      status: 304,
+      headers: { ETag: etag, 'Cache-Control': 'public, max-age=31536000, immutable' },
+    })
+    const clientHasCurrentLocal = (etag) => {
+      const inm = c.req.header('If-None-Match')
+      if (inm) return inm.split(',').map((t) => t.trim().replace(/^W\//, '')).some((t) => t === '*' || t === etag)
+      return false
+    }
+    // Organized route has yyyy/mm params; legacy flat route passes only the name.
+    // (storagePath declared above, next to the ETag helpers.)
     const data = await fileStore.readByStoragePath(storagePath)
     if (!data) {
       // ── Cloud-fallback proxy (avatar/logo placeholder fix) ──────────────
@@ -3181,6 +3505,8 @@ function createApp() {
     }
     const ext = (name.split('.').pop() || '').toLowerCase()
     const mime = MIME_BY_EXT[ext] || 'application/octet-stream'
+    const etag = fileEtagFor(data)
+    if (clientHasCurrentLocal(etag)) return notModified304(etag)
     return new Response(new Uint8Array(data), {
       status: 200,
       headers: {
@@ -3188,6 +3514,7 @@ function createApp() {
         'Content-Length': String(data.length),
         'Cache-Control': 'public, max-age=31536000, immutable',
         'Content-Disposition': 'inline',
+        ETag: etag,
       },
     })
   }
@@ -3572,6 +3899,61 @@ function createApp() {
     }
   })
 
+  // ─── 0.6.20 audit fix — POST /api/auth/refresh (session-keeper contract) ──
+  // The web frontend's session-keeper (mounted globally in page.tsx) posts
+  // /api/auth/refresh { rememberMe: true } on an interval and expects
+  // { success, token, user } — the CLOUD auth route shape. The desktop only
+  // proxied /api/auth/refresh-session (a different route/shape), so every
+  // keeper tick 404'd locally. Mirrors refresh-session's proxy+adopt flow:
+  // cloud re-issues the token → adoptSession locally (grace window) → return
+  // the cloud JSON unchanged to the renderer.
+  app.post('/api/auth/refresh', async (c) => {
+    try {
+      if (!sessionToken) {
+        return c.json({ success: false, error: 'No active session' }, 401)
+      }
+      let body = {}
+      try { body = await c.req.json() } catch { /* absent body fine — cloud defaults apply */ }
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/auth/refresh', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer ' + sessionToken,
+          },
+          body: JSON.stringify(body && typeof body === 'object' ? body : {}),
+          signal: AbortSignal.timeout(15000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] Refresh proxy: cloud unreachable:', err?.message || err)
+        // 503 (not 401): session-keeper ignores network failures and retries
+        // on the next tick — only a 401 must destroy the remembered session.
+        return c.json({ success: false, error: 'Refreshing the session requires an internet connection', code: 'CLOUD_UNREACHABLE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON */ }
+      if (res.ok && data && data.success && data.token && data.user) {
+        assignSession(data.token, {
+          id: data.user.id,
+          username: data.user.username || data.user.email || 'imported',
+          fullName: data.user.fullName || data.user.name || '',
+          role: data.user.role || 'CUSTOMER',
+          language: data.user.language || 'ar',
+          avatarUrl: await localizeFileUrl(data.user.avatarUrl || null),
+          agencyId: data.user.agencyId || null,
+        }, 'refresh')
+        try { await markAuthorizationAuthorized() } catch { /* non-fatal */ }
+        console.log('[LocalAPI] Session refreshed (keeper contract):', sessionUser.username)
+        emitEvent('auth:login', { user: sessionUser })
+      }
+      return c.json(data || { success: res.ok }, res.ok ? 200 : (res.status || 500))
+    } catch (error) {
+      console.error('[LocalAPI] Refresh proxy error:', error)
+      return c.json({ success: false, error: 'Session refresh failed' }, 500)
+    }
+  })
+
   /**
    * Username availability check for the register form — cloud-first (global
    * uniqueness is a cloud property), with a LOCAL fallback so the form still
@@ -3842,6 +4224,14 @@ function createApp() {
         avatarUrl: await localizeFileUrl(finalUser.avatarUrl || null),
         agencyId: finalUser.agencyId || null,
       }, adopted ? 'import-session:adopted' : 'import-session:offline')
+      // R-21F: a FIRST-import adoption replaces a null session, so assignSession's
+      // rotation bookkeeping never runs — the presented token would be forgotten.
+      // Record it as the grace predecessor so same-session consumers (LAN join,
+      // stale renderers) keep working across the cloud's token re-issue.
+      if (adopted && finalToken !== token) {
+        previousSessionToken = token
+        previousSessionTokenAt = Date.now()
+      }
       // Task 40: offline import of a payload snapshot whose agencyId is null
       // (stale renderer user, wizard-created owner) — hydrate from LOCAL
       // ownership so boot-restore lands with a usable agencyId every time.
@@ -4701,7 +5091,7 @@ function createApp() {
       if (!permGate.ok) return c.json(permGate.body, permGate.status)
 
       const body = await c.req.json()
-      const { name, prefix, estimatedDuration, description } = body
+      const { name, prefix, estimatedDuration, description, price, durationMinutes, priority, nameAr, nameFr } = body
 
       if (!name) {
         return c.json({ success: false, error: 'Service name is required' }, 400)
@@ -4713,8 +5103,14 @@ function createApp() {
           data: {
             agencyId,
             name,
+            nameAr: nameAr || null,
+            nameFr: nameFr || null,
             prefix: prefix || name.charAt(0).toUpperCase(),
             // estimatedDuration: removed — not a Service schema field
+            // 0.6.20 parity audit — full cloud Service field surface:
+            price: price != null ? Number(price) : null,
+            durationMinutes: durationMinutes != null ? Number(durationMinutes) : null,
+            priority: priority != null ? Number(priority) : 0,
             description: description || null,
             isActive: true,
           },
@@ -4755,11 +5151,15 @@ function createApp() {
         return c.json({ success: false, error: 'Service not found' }, 404)
       }
 
-      const allowedFields = ['name', 'prefix', 'description', 'isActive'] // estimatedDuration removed — not a Service schema field
+      // 0.6.20 parity audit — price/durationMinutes/priority are real Service
+      // columns (cloud schema + local DDL v11) the settings UI sends.
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'prefix', 'description', 'isActive', 'price', 'durationMinutes', 'priority'] // estimatedDuration removed — not a Service schema field
       const updateData = {}
       for (const field of allowedFields) {
         if (body[field] !== undefined) {
-          updateData[field] = body[field]
+          updateData[field] = field === 'price' || field === 'durationMinutes' || field === 'priority'
+            ? (body[field] === null ? null : Number(body[field]))
+            : body[field]
         }
       }
 
@@ -4823,21 +5223,20 @@ function createApp() {
   // creates replay to the cloud via the outbox (logDeterministicOutcome →
   // /api/sync/push → registry-driven applyMutationInTx).
 
-  // The 25 built-in category keys (cloud parity) — case-insensitive collision
-  // targets for custom names.
+  // The 4 built-in category keys (cloud parity, task A reduction) —
+  // case-insensitive collision targets for custom names.
   const AGENCY_CATEGORY_BUILTIN_KEYS = [
-    'CLINIC', 'HOSPITAL', 'DENTAL_CLINIC', 'LABORATORY', 'PHARMACY',
-    'VETERINARY', 'BANK', 'POST_OFFICE', 'TELECOM', 'INSURANCE',
-    'LAW_FIRM', 'NOTARY', 'GOVERNMENT', 'EDUCATION', 'AGENCY',
-    'TRAVEL', 'REAL_ESTATE', 'CAR_SERVICE', 'BARBER', 'BEAUTY_SALON',
-    'RESTAURANT', 'CAFE', 'RETAIL', 'HOTEL', 'OTHER',
+    'DOCTOR', 'CLINIC', 'LAW_FIRM', 'BARBER',
   ]
 
   /** Plain JSON record with booleans + ISO datetimes (also the outbox payload). */
   function serializeAgencyCategory(row) {
     return {
       id: row.id,
+      slug: row.slug == null ? row.name : String(row.slug),
       name: row.name,
+      isActive: row.isActive == null ? true : (row.isActive === 1 || row.isActive === true),
+      sortOrder: typeof row.sortOrder === 'number' ? row.sortOrder : (parseInt(row.sortOrder, 10) || 0),
       nameFr: row.nameFr == null ? null : String(row.nameFr),
       nameAr: row.nameAr == null ? null : String(row.nameAr),
       icon: row.icon == null ? null : String(row.icon),
@@ -4885,8 +5284,8 @@ function createApp() {
       if (AGENCY_CATEGORY_BUILTIN_KEYS.some((k) => k.toLowerCase() === lower)) {
         return c.json({ success: false, error: 'CATEGORY_EXISTS' }, 409)
       }
-      const existing = await db.agencyCategory.findMany({ select: { name: true } })
-      if (existing.some((r) => String(r.name || '').trim().toLowerCase() === lower)) {
+      const existing = await db.agencyCategory.findMany({ select: { name: true, slug: true } })
+      if (existing.some((r) => String(r.name || '').trim().toLowerCase() === lower || String(r.slug || '').trim().toLowerCase() === lower)) {
         return c.json({ success: false, error: 'CATEGORY_EXISTS' }, 409)
       }
 
@@ -4895,11 +5294,14 @@ function createApp() {
         const row = await tx.agencyCategory.create({
           data: {
             id: categoryId,
+            slug: name, // legacy contract: the name IS the Agency.category value
             name,
             nameFr,
             nameAr,
             icon,
             isCustom: true,
+            isActive: true,
+            sortOrder: 100,
             createdBy: sessionUser.id || null,
           },
         })
@@ -5610,6 +6012,307 @@ function createApp() {
     }
   })
 
+  // ── Counter CONTROL lease (r21-8 desktop parity — mirrors cloud agency.ts) ──
+  // claim/heartbeat/release-mine/request-control/approve/reject/assign.
+  // The control columns (controlledByUserId/controlledByStaffId/controlClaimedAt/
+  // controlHeartbeatAt) are the lease; staffId/occupiedAt stay mirrored for
+  // back-compat with the older occupation semantics. The lease TTL (3min) and
+  // the 60s request-control auto-claim window are enforced by the local
+  // sweeper started next to the file-sync worker in startLocalApi().
+  // NOTE: heartbeats intentionally bypass the outbox (pure runtime lease state;
+  // replaying them to the cloud would flood _pending_mutations every minute).
+  const CONTROL_COUNTER_COLUMNS = ['controlledByUserId', 'controlledByStaffId', 'controlClaimedAt', 'controlHeartbeatAt']
+  const CONTROL_TTL_MS = 3 * 60 * 1000
+  const CONTROL_REQUEST_WINDOW_MS = 60 * 1000
+
+  async function loadAgencyCounter(counterId, agencyId) {
+    const counter = await db.counter.findUnique({ where: { id: counterId }, include: { branch: true } }).catch(() => null)
+    if (!counter || !counter.branch || counter.branch.agencyId !== agencyId) return null
+    return counter
+  }
+
+  async function resolveControlHolderName(counter) {
+    if (!counter.controlledByUserId) return null
+    if (counter.controlledByStaffId) {
+      const staffRow = await db.agencyStaff.findUnique({ where: { id: counter.controlledByStaffId }, include: { user: true } }).catch(() => null)
+      if (staffRow && staffRow.user && staffRow.user.name) return staffRow.user.name
+    }
+    const user = await db.user.findUnique({ where: { id: counter.controlledByUserId } }).catch(() => null)
+    return (user && user.name) || counter.controlledByUserId
+  }
+
+  // Writes the control lease (+ back-compat mirrors). Falls back to the legacy
+  // columns when the generated client predates v13 (same guard pattern as occupy).
+  async function applyCounterControl(counterId, agencyId, opts) {
+    const { toUserId, toStaffId, isBoss, forced } = opts
+    const now = new Date()
+    return withOutboxTransaction(async (tx) => {
+      const data = {
+        controlledByUserId: toUserId,
+        controlledByStaffId: toStaffId,
+        controlClaimedAt: now,
+        controlHeartbeatAt: now,
+        occupiedAt: now,
+      }
+      if (toStaffId) data.staffId = toStaffId
+      let row
+      try {
+        row = await tx.counter.update({ where: { id: counterId }, data })
+      } catch (err) {
+        if (!isUnknownColumnError(err, CONTROL_COUNTER_COLUMNS)) throw err
+        console.warn('[LocalAPI] counter control: stale client without control columns — mirroring occupation only (non-fatal)')
+        const legacy = { occupiedAt: now }
+        if (toStaffId) legacy.staffId = toStaffId
+        row = await tx.counter.update({ where: { id: counterId }, data: legacy })
+      }
+      await logDeterministicOutcome('Counter', counterId, 'update', row, null, { tx })
+      return { row, forced, isBoss, at: now }
+    })
+  }
+
+  // Clears the control lease (+ mirrors) regardless of which generation of
+  // columns the local client knows about.
+  async function clearCounterControl(counter) {
+    return withOutboxTransaction(async (tx) => {
+      const data = { controlledByUserId: null, controlledByStaffId: null, controlClaimedAt: null, controlHeartbeatAt: null, occupiedAt: null }
+      if (counter.controlledByStaffId || counter.staffId) data.staffId = null
+      let row
+      try {
+        row = await tx.counter.update({ where: { id: counter.id }, data })
+      } catch (err) {
+        if (!isUnknownColumnError(err, CONTROL_COUNTER_COLUMNS)) throw err
+        row = await tx.counter.update({ where: { id: counter.id }, data: { occupiedAt: null, staffId: null } })
+      }
+      await logDeterministicOutcome('Counter', counter.id, 'update', row, null, { tx })
+      return row
+    })
+  }
+
+  // POST /api/agency/counters/:counterId/claim — atomic control claim.
+  // Free → claim; held by the caller → idempotent re-stamp; held by someone
+  // else → 409 COUNTER_CONTROLLED with the holder name (the web console then
+  // offers request-control / forced-assign). Owners + SUPER_ADMIN force-claim.
+  app.post('/api/agency/counters/:counterId/claim', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
+      if (!gate.ok) return c.json(gate.body, gate.status)
+      const { ctx } = gate
+      const isBoss = ctx.isOwner || sessionUser.role === 'SUPER_ADMIN'
+
+      const counter = await loadAgencyCounter(c.req.param('counterId'), ctx.agencyId)
+      if (!counter) return c.json({ success: false, error: 'Counter not found' }, 404)
+
+      const held = !!counter.controlledByUserId
+      if (held && counter.controlledByUserId !== sessionUser.id && !isBoss) {
+        const holderName = await resolveControlHolderName(counter)
+        return c.json({ success: false, error: 'COUNTER_CONTROLLED', holderName: holderName || 'staff' }, 409)
+      }
+
+      const forced = held && counter.controlledByUserId !== sessionUser.id
+      const { row } = await applyCounterControl(counter.id, ctx.agencyId, {
+        toUserId: sessionUser.id,
+        toStaffId: ctx.isOwner ? null : ctx.staffId,
+        isBoss,
+        forced,
+      })
+      emitEvent('counter:claimed', {
+        agencyId: ctx.agencyId,
+        counterId: counter.id,
+        counterName: row.name || counter.name,
+        counterNumber: counter.number,
+        userId: sessionUser.id,
+        assigned: forced,
+      })
+      return c.json({ success: true, counter: row })
+    } catch (error) {
+      console.error('[LocalAPI] Claim counter error:', error)
+      return c.json({ success: false, error: 'Failed to claim counter' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/:counterId/heartbeat — renew the 3min lease.
+  // Local-only write (no outbox). 403 COUNTER_CONTROL_LOST when the caller no
+  // longer controls the counter so the console drops back to the claim screen.
+  app.post('/api/agency/counters/:counterId/heartbeat', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
+      if (!gate.ok) return c.json(gate.body, gate.status)
+      const { ctx } = gate
+      const counter = await loadAgencyCounter(c.req.param('counterId'), ctx.agencyId)
+      if (!counter) return c.json({ success: false, error: 'Counter not found' }, 404)
+      if (counter.controlledByUserId !== sessionUser.id) {
+        return c.json({ success: false, error: 'COUNTER_CONTROL_LOST' }, 403)
+      }
+      try {
+        await db.counter.update({ where: { id: counter.id }, data: { controlHeartbeatAt: new Date() } })
+      } catch (err) {
+        if (!isUnknownColumnError(err, CONTROL_COUNTER_COLUMNS)) throw err
+      }
+      return c.json({ success: true, ok: true })
+    } catch (error) {
+      console.error('[LocalAPI] Counter heartbeat error:', error)
+      return c.json({ success: false, error: 'Failed to heartbeat counter' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/release-mine — release EVERY counter the caller
+  // controls. Powers logout/pagehide/before-quit; must never require anything
+  // beyond authentication.
+  app.post('/api/agency/counters/release-mine', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
+      if (!gate.ok) return c.json(gate.body, gate.status)
+      const { ctx } = gate
+      const counters = await db.counter.findMany({ where: { controlledByUserId: sessionUser.id }, include: { branch: true } }).catch(() => [])
+      const mine = (counters || []).filter((row) => row.branch && row.branch.agencyId === ctx.agencyId)
+      for (const counter of mine) {
+        await clearCounterControl(counter).catch((err) => {
+          if (!isUnknownColumnError(err, CONTROL_COUNTER_COLUMNS)) throw err
+        })
+        emitEvent('counter:released', {
+          agencyId: ctx.agencyId,
+          counterId: counter.id,
+          counterName: counter.name,
+          counterNumber: counter.number,
+          userId: sessionUser.id,
+        })
+      }
+      return c.json({ success: true, released: mine.length })
+    } catch (error) {
+      console.error('[LocalAPI] Release-mine error:', error)
+      return c.json({ success: false, error: 'Failed to release counters' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/:counterId/request-control — takeover request.
+  // A free counter is claimed outright (claimed:true); a held counter spawns a
+  // CounterControlRequest with a 60s window; the current holder approves or the
+  // sweeper auto-transfers on expiry (while the requester is still a member).
+  app.post('/api/agency/counters/:counterId/request-control', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
+      if (!gate.ok) return c.json(gate.body, gate.status)
+      const { ctx } = gate
+      const counter = await loadAgencyCounter(c.req.param('counterId'), ctx.agencyId)
+      if (!counter) return c.json({ success: false, error: 'Counter not found' }, 404)
+
+      if (!counter.controlledByUserId || counter.controlledByUserId === sessionUser.id) {
+        const { row } = await applyCounterControl(counter.id, ctx.agencyId, {
+          toUserId: sessionUser.id,
+          toStaffId: ctx.isOwner ? null : ctx.staffId,
+          isBoss: ctx.isOwner || sessionUser.role === 'SUPER_ADMIN',
+          forced: false,
+        })
+        emitEvent('counter:claimed', { agencyId: ctx.agencyId, counterId: counter.id, counterName: row.name || counter.name, counterNumber: counter.number, userId: sessionUser.id })
+        return c.json({ success: true, claimed: true, counter: row })
+      }
+
+      const now = new Date()
+      const expiresAt = new Date(now.getTime() + CONTROL_REQUEST_WINDOW_MS)
+      const request = await db.counterControlRequest.create({
+        data: {
+          counterId: counter.id,
+          agencyId: ctx.agencyId,
+          fromUserId: sessionUser.id,
+          fromStaffId: ctx.isOwner ? null : ctx.staffId,
+          requestedAt: now,
+          expiresAt,
+          status: 'PENDING',
+        },
+      })
+      emitEvent('counter:request-created', {
+        agencyId: ctx.agencyId,
+        counterId: counter.id,
+        counterName: counter.name,
+        counterNumber: counter.number,
+        requestId: request.id,
+        fromUserId: sessionUser.id,
+        expiresAt: expiresAt.toISOString(),
+      })
+      return c.json({ success: true, requestId: request.id, expiresAt: expiresAt.toISOString() })
+    } catch (error) {
+      console.error('[LocalAPI] Request-control error:', error)
+      return c.json({ success: false, error: 'Failed to request counter control' }, 500)
+    }
+  })
+
+  // POST /api/agency/counters/requests/:requestId/approve|reject — the current
+  // holder (or an owner) resolves a pending takeover request. Approve transfers
+  // the lease to the requester immediately.
+  const resolveCounterControlRequest = (approve) => async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const gate = await checkAgencyPermission(c.req.query('agencyId') || body.agencyId, 'canManageQueue')
+      if (!gate.ok) return c.json(gate.body, gate.status)
+      const { ctx } = gate
+      const isBoss = ctx.isOwner || sessionUser.role === 'SUPER_ADMIN'
+
+      const request = await db.counterControlRequest.findUnique({ where: { id: c.req.param('requestId') } }).catch(() => null)
+      if (!request || request.agencyId !== ctx.agencyId) return c.json({ success: false, error: 'Request not found' }, 404)
+      if (request.status !== 'PENDING') return c.json({ success: false, error: 'REQUEST_ALREADY_RESOLVED' }, 409)
+
+      const counter = await loadAgencyCounter(request.counterId, ctx.agencyId)
+      if (!counter) return c.json({ success: false, error: 'Counter not found' }, 404)
+      if (!isBoss && counter.controlledByUserId !== sessionUser.id) {
+        return c.json({ success: false, error: 'NOT_COUNTER_CONTROLLER' }, 403)
+      }
+
+      if (!approve) {
+        await db.counterControlRequest.update({ where: { id: request.id }, data: { status: 'REJECTED', resolvedByUserId: sessionUser.id, resolvedAt: new Date() } })
+        emitEvent('counter:request-rejected', { agencyId: ctx.agencyId, counterId: counter.id, counterName: counter.name, counterNumber: counter.number, requestId: request.id })
+        return c.json({ success: true })
+      }
+
+      await applyCounterControl(counter.id, ctx.agencyId, {
+        toUserId: request.fromUserId,
+        toStaffId: request.fromStaffId,
+        isBoss: true,
+        forced: false,
+      })
+      await db.counterControlRequest.update({ where: { id: request.id }, data: { status: 'APPROVED', resolvedByUserId: sessionUser.id, resolvedAt: new Date() } })
+      emitEvent('counter:request-approved', { agencyId: ctx.agencyId, counterId: counter.id, counterName: counter.name, counterNumber: counter.number, requestId: request.id, toUserId: request.fromUserId })
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] Resolve control request error:', error)
+      return c.json({ success: false, error: 'Failed to resolve request' }, 500)
+    }
+  }
+  app.post('/api/agency/counters/requests/:requestId/approve', authMiddleware, resolveCounterControlRequest(true))
+  app.post('/api/agency/counters/requests/:requestId/reject', authMiddleware, resolveCounterControlRequest(false))
+
+  // POST /api/agency/counters/:counterId/assign — OWNER force-grant of the
+  // control lease to any agency member (body {userId}).
+  app.post('/api/agency/counters/:counterId/assign', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      const gate = await checkAgencyOwnerOnly(c.req.query('agencyId') || body.agencyId)
+      if (!gate.ok) return c.json(gate.body, gate.status)
+      const { ctx } = gate
+      const targetUserId = body.userId
+      if (!targetUserId) return c.json({ success: false, error: 'userId required' }, 400)
+
+      const counter = await loadAgencyCounter(c.req.param('counterId'), ctx.agencyId)
+      if (!counter) return c.json({ success: false, error: 'Counter not found' }, 404)
+
+      const staffRow = await db.agencyStaff.findFirst({ where: { userId: targetUserId, agencyId: ctx.agencyId, isActive: true } }).catch(() => null)
+      await applyCounterControl(counter.id, ctx.agencyId, {
+        toUserId: targetUserId,
+        toStaffId: staffRow ? staffRow.id : null,
+        isBoss: true,
+        forced: !!counter.controlledByUserId && counter.controlledByUserId !== targetUserId,
+      })
+      emitEvent('counter:claimed', { agencyId: ctx.agencyId, counterId: counter.id, counterName: counter.name, counterNumber: counter.number, userId: targetUserId, assigned: true })
+      return c.json({ success: true })
+    } catch (error) {
+      console.error('[LocalAPI] Assign counter error:', error)
+      return c.json({ success: false, error: 'Failed to assign counter' }, 500)
+    }
+  })
+
   // ═══════════════════════════════════════════════════════════════════════
   // 7. STAFF (auth required)
   // ═══════════════════════════════════════════════════════════════════════
@@ -5991,7 +6694,8 @@ function createApp() {
   // Task 24 — local mirror of the cloud call-next selection rules
   // (api/src/lib/queue-scheduler.ts): future-date tickets are never callable
   // today, and fixed-time tickets wait until their preferred HH:MM.
-  function pickNextLocalCustomer(candidates, now) {
+  function isCallableNowLocal(r, now) {
+    if (!r) return false
     const pad = (n) => String(n).padStart(2, '0')
     const todayStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
     const nowMinutes = now.getHours() * 60 + now.getMinutes()
@@ -6002,11 +6706,73 @@ function createApp() {
         return parts[0] * 60 + parts[1] <= nowMinutes
       } catch { return true }
     }
-    return (candidates || []).find((r) => {
-      if (r.reservedDate && String(r.reservedDate).slice(0, 10) > todayStr) return false
-      if (r.preferredTime && r.fixedTimeEnabled && !timePassed(r.preferredTime)) return false
-      return true
-    }) || null
+    if (r.reservedDate && String(r.reservedDate).slice(0, 10) > todayStr) return false
+    if (r.preferredTime && r.fixedTimeEnabled && !timePassed(r.preferredTime)) return false
+    return true
+  }
+
+  function pickNextLocalCustomer(candidates, now) {
+    return (candidates || []).find((r) => isCallableNowLocal(r, now)) || null
+  }
+
+  // P2-10 — shared candidate selection for BOTH local call-next routes.
+  // Mirrors the cloud contract (lib/queue-claim.ts):
+  //   1. Counter↔Service binding — a counter with a non-empty binding can
+  //      only call tickets of ITS bound services (strict; an explicit
+  //      serviceId outside the binding yields NO candidates).
+  //   2. Ordering (service priority DESC, queueNumber ASC) — higher-priority
+  //      services are called first, FIFO within the same priority. JS sort
+  //      keeps the SQL identical to the legacy query.
+  // Returns { candidates, where } — `where` is the binding-aware WAITING
+  // filter for the caller's "no candidate" fallback diagnostics.
+  async function loadLocalCallCandidates(agencyId, serviceId, counterId) {
+    let boundServiceIds = null
+    if (counterId) {
+      try {
+        const bound = await db.counterService.findMany({
+          where: { counterId },
+          select: { serviceId: true },
+        })
+        if (bound && bound.length > 0) boundServiceIds = bound.map((b) => b.serviceId)
+      } catch (e) {
+        // Legacy local DB without the CounterService table — binding unknown,
+        // keep the unbound (serve-everything) behavior.
+        console.warn('[LocalAPI] counterService lookup failed (legacy schema?):', e.message)
+      }
+    }
+    const where = { agencyId, status: 'WAITING' }
+    if (boundServiceIds && serviceId) {
+      if (!boundServiceIds.includes(serviceId)) {
+        return { candidates: [], where } // counter does not serve this service
+      }
+      where.serviceId = serviceId
+    } else if (boundServiceIds && !serviceId) {
+      where.serviceId = { in: boundServiceIds }
+    } else if (serviceId) {
+      where.serviceId = serviceId
+    }
+    const candidates = await db.reservation.findMany({
+      where,
+      orderBy: { queueNumber: 'asc' },
+      take: 200,
+    })
+    if (candidates.length > 1) {
+      try {
+        const svcIds = [...new Set(candidates.map((r) => r.serviceId))]
+        const svcs = await db.service.findMany({ where: { id: { in: svcIds } }, select: { id: true, priority: true } })
+        const prio = new Map(svcs.map((s) => [s.id, s.priority || 0]))
+        candidates.sort((a, b) => {
+          const pa = prio.get(a.serviceId) || 0
+          const pb = prio.get(b.serviceId) || 0
+          if (pa !== pb) return pb - pa
+          return (a.queueNumber || 0) - (b.queueNumber || 0)
+        })
+      } catch (e) {
+        // Legacy client/DB without Service.priority — FIFO order is correct.
+        console.warn('[LocalAPI] priority sort skipped:', e.message)
+      }
+    }
+    return { candidates, where }
   }
 
   // POST /api/queue/call-next — call next customer
@@ -6020,25 +6786,23 @@ function createApp() {
       const body = await c.req.json().catch(() => ({}))
       const { serviceId, counterId, branchId } = body
 
-      // Task 37-d: queue actions need canManageQueue; a non-owner caller must
-      // operate from a counter they personally occupy (OCCUPY_COUNTER_FIRST).
+      // Task 37-d + r23: queue actions need canManageQueue AND a CONTROLLED
+      // counter — EVERY account, the owner included (COUNTER_SETUP_REQUIRED /
+      // COUNTER_CONTROL_REQUIRED, legacy alias OCCUPY_COUNTER_FIRST).
       const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
       if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
       const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
       if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
+      // r23 — bind the ticket to the caller's controlled counter when the
+      // request omitted one (cloud parity).
+      const effectiveCounterId = counterId || occupancyGate.counter?.id || null
 
       // Task 24: parity with the CLOUD call-next — order by queueNumber ASC
       // (Postpone Paradox fix), skip FUTURE-DATE tickets, and skip fixed-time
       // tickets whose preferred time has not arrived yet.
-      const where = { agencyId, status: 'WAITING' }
-      if (serviceId) where.serviceId = serviceId
-      // branchId filter removed — Reservation has no branchId field
-
-      const candidates = await db.reservation.findMany({
-        where,
-        orderBy: { queueNumber: 'asc' },
-        take: 200,
-      })
+      // P2-10 — shared loader adds the Counter↔Service binding filter and
+      // the (priority DESC, queueNumber ASC) ordering.
+      const { candidates, where } = await loadLocalCallCandidates(agencyId, serviceId, effectiveCounterId)
 
       const next = pickNextLocalCustomer(candidates, new Date())
 
@@ -6066,7 +6830,7 @@ function createApp() {
             status: 'CALLED',
             calledAt: now,
             // calledBy: removed — not a Reservation schema field
-            counterId: counterId || null,
+            counterId: effectiveCounterId || null,
           },
         })
 
@@ -6112,11 +6876,13 @@ function createApp() {
       const body = await c.req.json().catch(() => ({}))
       const { counterId } = body
 
-      // Task 37-d: queue actions need canManageQueue + counter occupancy.
+      // Task 37-d + r23: queue actions need canManageQueue AND a CONTROLLED
+      // counter — EVERY account, the owner included.
       const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
       if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
       const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
       if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
+      const effectiveCounterId = counterId || occupancyGate.counter?.id || null
 
       const existing = await db.reservation.findUnique({ where: { id } })
       if (!existing || existing.agencyId !== agencyId) {
@@ -6138,7 +6904,7 @@ function createApp() {
             status: 'CALLED',
             calledAt: now,
             // calledBy: removed — not a Reservation schema field
-            counterId: counterId || null,
+            counterId: effectiveCounterId || null,
           },
         })
         const row = await tx.reservation.findUnique({ where: { id } })
@@ -6247,6 +7013,75 @@ function createApp() {
     } catch (error) {
       console.error('[LocalAPI] No-show error:', error)
       return c.json({ success: false, error: 'Failed to mark no-show' }, 500)
+    }
+  })
+
+  // ─── 0.6.20 audit fix — PUT /api/reservations/:id/status (unified) ────────
+  // The frontend's dashboards (SimpleMobileDashboard — the AGENCY mobile
+  // dashboard the desktop renders — and customer-queue) drive status changes
+  // through the CLOUD contract `PUT /api/reservations/:id/status` with body
+  // { status: 'COMPLETED'|'NO_SHOW'|'CANCELLED'|'CALLED', agencyId? }. The
+  // local API only exposed the per-action legacy shapes (/api/queue/complete
+  // |no-show|cancel|call), so every unified call 404'd locally (no cloud
+  // failover in Electron). This dispatcher applies the same transition rules
+  // as the cloud route and reuses the local outbox/deterministic-outcome
+  // primitives so the change replicates like every other local write.
+  app.put('/api/reservations/:id/status', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) {
+        return c.json({ success: false, error: 'No agency associated with this account' }, 403)
+      }
+      const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
+
+      const id = c.req.param('id')
+      let body = {}
+      try { body = await c.req.json() } catch { /* handled below */ }
+      const status = String(body?.status || '').toUpperCase()
+
+      // Same transition matrix as the cloud reservations route.
+      const VALID_TRANSITIONS = {
+        WAITING: ['CALLED', 'CANCELLED'],
+        CALLED: ['COMPLETED', 'CANCELLED', 'NO_SHOW'],
+        SERVING: ['COMPLETED'],
+      }
+
+      const existing = await db.reservation.findUnique({ where: { id } })
+      if (!existing || existing.agencyId !== agencyId) {
+        return c.json({ success: false, error: 'Reservation not found' }, 404)
+      }
+      const allowed = VALID_TRANSITIONS[existing.status] || []
+      if (!allowed.includes(status)) {
+        return c.json({ success: false, error: `Cannot transition from ${existing.status} to ${status}` }, 400)
+      }
+
+      const now = new Date()
+      const updateData = { status }
+      if (status === 'CALLED') updateData.calledAt = now
+      if (status === 'COMPLETED') updateData.completedAt = now
+      if (status === 'CANCELLED') updateData.cancelledAt = now
+      if (status === 'NO_SHOW') updateData.completedAt = now // cloud parity: no-show completes
+
+      let reservation
+      try {
+        reservation = await withOutboxTransaction(async (tx) => {
+          const row = await tx.reservation.update({ where: { id }, data: updateData })
+          await logDeterministicOutcome('Reservation', id, 'update', row, null, { tx })
+          return row
+        })
+      } catch (txErr) {
+        // PARITY-SYNC_AUDIT: local-only status flips (SERVING etc.) that the
+        // outbox layer may reject for append-only models must not 500.
+        console.warn('[LocalAPI] status via plain update (outbox unavailable):', txErr?.message || txErr)
+        reservation = await db.reservation.update({ where: { id }, data: updateData })
+      }
+
+      emitEvent('queue:status', { agencyId, reservation, status })
+      return c.json({ success: true, data: reservation })
+    } catch (error) {
+      console.error('[LocalAPI] Reservation status error:', error)
+      return c.json({ success: false, error: 'Failed to update reservation status' }, 500)
     }
   })
 
@@ -6955,34 +7790,85 @@ function createApp() {
         return c.json({ success: false, error: 'Invalid action' }, 400)
       }
 
+      // UNIFIED QUEUE parity: status updates are queue management — require
+      // canManageQueue like every other queue route (the cloud PATCH
+      // enforces enforceQueueStaffAuthority; the local gate was missing).
+      const patchQueueGate = await checkAgencyPermission(undefined, 'canManageQueue')
+      if (!patchQueueGate.ok) return c.json(patchQueueGate.body, patchQueueGate.status)
+
       const reservation = await db.reservation.findUnique({ where: { id: reservationId } })
       if (!reservation) {
         return c.json({ success: false, error: 'Reservation not found' }, 404)
       }
 
-      const updateData = {}
-      const now = new Date()
-      if (action === 'complete') {
-        updateData.status = 'COMPLETED'
-        updateData.completedAt = now
-      } else if (action === 'no_show') {
-        updateData.status = 'NO_SHOW'
-        updateData.skippedAt = now
-      } else if (action === 'cancel') {
-        updateData.status = 'CANCELLED'
-        updateData.cancelledAt = now
-      } else if (action === 'serve') {
-        updateData.status = 'SERVING'
-      } else if (action === 'recall') {
-        updateData.status = 'CALLED'
+      // Both the central and local paths use THIS delta mapping, so the local
+      // mirror always matches the authoritative central outcome.
+      const updateData = queueActionUpdateData(action, new Date())
+
+      // ── Enhanced Online Operational Mode (UNIFIED QUEUE) ──
+      // Route the status update through the CENTRAL API when it is reachable
+      // (definitive source of truth; atomic OCC-guarded transaction there),
+      // then mirror the authoritative result locally. The renderer's
+      // idempotency key is forwarded so a retransmission maps to the SAME
+      // central execution.
+      const patchIdempotencyKey = c.req.header('X-Idempotency-Key') || c.req.header('x-idempotency-key')
+      if (cloudOnlineFast() === true) {
+        const central = await callCentralQueueApi(
+          'PATCH',
+          `/api/agency/queue/${reservationId}`,
+          { action },
+          { idempotencyKey: patchIdempotencyKey },
+        )
+        if (central.ok && central.data && central.data.success !== false) {
+          await applyCentralStatusLocally(reservationId, action)
+          const mirrored = await db.reservation.findUnique({ where: { id: reservationId } }).catch(() => null)
+          const merged = mirrored || { ...reservation, ...queueActionUpdateData(action, new Date()) }
+          // Task 75: the payload MUST carry agencyId — broadcastLocalRealtime
+          // routes queue:* events by data.agencyId.
+          emitEvent('queue:updated', { agencyId: merged.agencyId || reservation.agencyId, reservationId, action, reservation: merged, ...updateData })
+          return c.json({ success: true, reservation: merged, source: 'central' })
+        }
+        if (central.errorKind === 'AUTH') {
+          return c.json({
+            success: false,
+            error: (central.data && central.data.error) || 'Session rejected by the central server — please sign in again',
+            code: 'CENTRAL_AUTH_REJECTED',
+          }, central.status === 423 ? 423 : 401)
+        }
+        if (central.errorKind === 'CLIENT') {
+          return c.json(central.data || { success: false, error: 'Central queue rejected the request' }, central.status)
+        }
+        if (central.errorKind === 'CONFLICT') {
+          return c.json({ success: false, error: 'Ticket state changed concurrently — please retry', shouldRetry: true }, 409)
+        }
+        // UNREACHABLE → fall through to the local outbox path below.
+        console.warn('[LocalAPI] queue/:id PATCH: central update unavailable (' + (central.error || central.errorKind) + ') — using local outbox path')
       }
 
+      // UNIFIED QUEUE (offline path): OCC conditional update — flip ONLY if
+      // the status is unchanged since the pre-read, so a concurrent claim
+      // (sync pull) can no longer be clobbered by a stale action click.
       const updatedReservation = await withOutboxTransaction(async (tx) => {
-        await tx.reservation.update({ where: { id: reservationId }, data: updateData })
+        const occ = await tx.reservation.updateMany({
+          where: { id: reservationId, status: reservation.status },
+          data: updateData,
+        })
+        if (occ.count === 0) {
+          const conflictErr = new Error('Ticket state changed — concurrent update')
+          conflictErr.code = 'QUEUE_ACTION_CONFLICT'
+          throw conflictErr
+        }
         // Part Q: outcome row is atomic with the state flip. The logged
         // outcome merges the pre-read with the intended delta (deterministic
         // desired-state replay per Part V).
         await logDeterministicOutcome('Reservation', reservationId, 'update', { ...reservation, ...updateData }, null, { tx })
+        // Parity with the cloud PATCH: terminal actions unlink the counter.
+        if (['complete', 'no_show', 'cancel'].includes(action)) {
+          await tx.counter.updateMany({
+            where: { currentReservationId: reservationId },
+            data: { currentReservationId: null },
+          })
+        }
         return { ...reservation, ...updateData }
       })
 
@@ -6992,6 +7878,9 @@ function createApp() {
       emitEvent('queue:updated', { agencyId: updatedReservation.agencyId, reservationId, action, reservation: updatedReservation, ...updateData })
       return c.json({ success: true, reservation: updatedReservation })
     } catch (error) {
+      if (error && error.code === 'QUEUE_ACTION_CONFLICT') {
+        return c.json({ success: false, error: 'Ticket state changed concurrently — please retry', shouldRetry: true }, 409)
+      }
       console.error('[LocalAPI] /api/agency/queue/:id PATCH error:', error)
       return c.json({ success: false, error: 'Failed to update reservation' }, 500)
     }
@@ -7058,6 +7947,29 @@ function createApp() {
     } catch (error) {
       console.error('[LocalAPI] /api/agency/stats error:', error)
       return c.json({ success: false, error: 'Failed to load stats', detail: error?.message || String(error) }, 500)
+    }
+  })
+
+  // ─── 0.6.20 audit fix — GET /api/agency/services/policy ───────────────────
+  // Cloud contract (Task C): { success, policy: { agencyCategory,
+  // servicePriceMode, enforce } | null } — drives the "price required" UI in
+  // agency-settings. The ServicePolicy model is cloud-managed (not part of
+  // the sync registry / local schema yet), so the honest local answer is the
+  // SAME shape with policy:null — exactly what the cloud returns when no
+  // policy row is configured (the UI then treats price as optional).
+  // MUST be declared before any /api/agency/services/:id-style route so
+  // Hono never treats 'policy' as an id.
+  app.get('/api/agency/services/policy', authMiddleware, async (c) => {
+    try {
+      const agencyId = sessionUser.agencyId
+      if (!agencyId) return c.json({ success: true, policy: null })
+      const agencyRow = await db.agency.findUnique({ where: { id: agencyId }, select: { category: true } })
+      // No local ServicePolicy table → no configured policy → null (cloud parity).
+      void agencyRow
+      return c.json({ success: true, policy: null })
+    } catch (error) {
+      console.error('[LocalAPI] /api/agency/services/policy error:', error)
+      return c.json({ success: true, policy: null })
     }
   })
 
@@ -7280,6 +8192,43 @@ function createApp() {
       if (!service || service.agencyId !== agencyId) {
         return c.json({ success: false, error: 'Service not found' }, 404)
       }
+
+      // ── Enhanced Online Operational Mode (UNIFIED QUEUE) ──
+      // Reservation-creation is routed through the CENTRAL API when online:
+      // the walk-in is created there inside one atomic transaction (queue
+      // number allocation + capacity + audit + SyncChange), then mirrored
+      // into the local DB. Bonus parity: the cloud response carries a REAL
+      // cloud-verifiable QR importToken (the local path cannot mint one).
+      const walkInIdempotencyKey = c.req.header('X-Idempotency-Key') || c.req.header('x-idempotency-key')
+      if (cloudOnlineFast() === true) {
+        const central = await callCentralQueueApi(
+          'POST',
+          '/api/agency/queue/walk-in',
+          { agencyId, serviceId, customerName },
+          { idempotencyKey: walkInIdempotencyKey },
+        )
+        if (central.ok && central.data && central.data.success && central.data.reservation) {
+          await mirrorCentralReservationCreate(central.data.reservation)
+          emitEvent('queue:walk-in', { agencyId, reservation: central.data.reservation })
+          return c.json({ success: true, reservation: central.data.reservation, source: 'central' }, 201)
+        }
+        if (central.errorKind === 'AUTH') {
+          return c.json({
+            success: false,
+            error: (central.data && central.data.error) || 'Session rejected by the central server — please sign in again',
+            code: 'CENTRAL_AUTH_REJECTED',
+          }, central.status === 423 ? 423 : 401)
+        }
+        if (central.errorKind === 'CLIENT') {
+          return c.json(central.data || { success: false, error: 'Central queue rejected the walk-in' }, central.status)
+        }
+        if (central.errorKind === 'CONFLICT') {
+          return c.json({ success: false, error: 'Walk-in conflict at the central queue — please retry', shouldRetry: true }, 409)
+        }
+        // UNREACHABLE → fall through to the local outbox path below.
+        console.warn('[LocalAPI] walk-in: central creation unavailable (' + (central.error || central.errorKind) + ') — using local outbox path')
+      }
+
       const now = new Date()
       const qsWalkIn = await db.queueSettings.findFirst({ where: { agencyId } })
       const newWalkInNumber = (qsWalkIn?.lastIssuedNumber || 0) + 1
@@ -7811,6 +8760,412 @@ function createApp() {
     } catch (error) {
       console.error('[LocalAPI] Subscription-cancel proxy error:', error)
       return c.json({ success: false, error: 'Failed to cancel subscription' }, 500)
+    }
+  })
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // 13b-bis. PAYMENT SETTINGS + CHARGILY CHECKOUT (r21-6)
+  //
+  // Closes the payment parity gap: the desktop subscription dialog now sees
+  // the super admin's CCP / bank / BaridiMob transfer details and the
+  // Chargily availability flags, and the unified admin Payment Center page
+  // (admin-payment-settings.tsx) works in Electron.
+  //
+  //   GET  /api/payment-settings          PUBLIC — local row (+ cloud merge online)
+  //   GET/PUT /api/admin/payment-settings SUPER_ADMIN — local SQLite read/write
+  //                                       + deterministic outbox replay so the
+  //                                       singleton syncs back to the cloud.
+  //   POST /api/payment/create-checkout   CLOUD-proxy (hosted checkout needs
+  //   GET  /api/payment/checkout/:id      the internet) — 503 PAYMENT_OFFLINE.
+  //   GET  /api/payment/test|test-checkout, /api/settings/category/payment,
+  //   POST /api/settings/bulk, /api/reconciliation/*  CLOUD-proxy (the
+  //                                       gateway keys + reconciliation live in
+  //                                       cloud-only SystemSetting tables).
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // Shared whitelist for the PaymentSettings write path — exactly the sync
+  // registry's mutableFields (packages/core/src/sync-registry.ts) so the
+  // outbox replay can never smuggle an unknown column into the cloud.
+  const PAYMENT_SETTINGS_FIELDS = [
+    'ccpEnabled', 'bankEnabled', 'electronicEnabled', 'ccpAccount', 'ccpKey',
+    'bankName', 'bankAccount', 'bankRib', 'ewalletNumber',
+    'ccpHolderName', 'ccpAddress', 'bankHolderName', 'bankAddress',
+    'baridiMobEnabled', 'baridiMobNumber',
+  ]
+
+  /** Shape a local PaymentSettings row for the PUBLIC endpoint (display-safe). */
+  function publicPaymentSettingsShape(row, chargilyEnabled) {
+    return {
+      ccpEnabled: row ? row.ccpEnabled : true,
+      bankEnabled: row ? row.bankEnabled : true,
+      electronicEnabled: row ? row.electronicEnabled : true,
+      ccpAccount: row ? row.ccpAccount : '0000 0000 0000 0000',
+      ccpKey: row ? row.ccpKey : '00',
+      bankAccount: row ? row.bankAccount : '0000 0000 0000 0000',
+      bankRib: row ? row.bankRib : '00 000 00000 000 0000 000',
+      bankName: row ? row.bankName : 'BNA',
+      ewalletNumber: row ? row.ewalletNumber : '0XXX XXX XXX',
+      ccpHolderName: row ? (row.ccpHolderName ?? null) : null,
+      ccpAddress: row ? (row.ccpAddress ?? null) : null,
+      bankHolderName: row ? (row.bankHolderName ?? null) : null,
+      bankAddress: row ? (row.bankAddress ?? null) : null,
+      baridiMobEnabled: row ? !!row.baridiMobEnabled : false,
+      baridiMobNumber: row ? (row.baridiMobNumber ?? null) : null,
+      // Honest offline semantics: the hosted EDAHABIA/CIB checkout needs
+      // internet, so the gateway methods stay hidden offline. When the cloud
+      // is reachable its (authoritative) flag overrides this below.
+      chargilyEnabled: chargilyEnabled === true,
+      chargilyMode: 'sandbox',
+      chargilyMethods: chargilyEnabled === true ? ['edahabia', 'cib'] : [],
+    }
+  }
+
+  // GET /api/payment-settings — PUBLIC (mirrors cloud payment-settings.ts GET /).
+  app.get('/api/payment-settings', async (c) => {
+    try {
+      if (!db || !db.paymentSettings) {
+        return c.json(publicPaymentSettingsShape(null, false))
+      }
+      const row = await db.paymentSettings.findFirst().catch(() => null)
+      // Cloud merge (best-effort, ≤5s): the cloud is authoritative for the
+      // gateway flags AND the newest transfer details; when unreachable the
+      // local row (synced via the sync engine) still carries everything the
+      // payer needs for manual transfers.
+      try {
+        const res = await fetch(cloudBaseUrl() + '/api/payment-settings', {
+          signal: AbortSignal.timeout(5000),
+        })
+        if (res.ok) {
+          const cloud = await res.json().catch(() => null)
+          if (cloud && typeof cloud === 'object') {
+            return c.json({ ...publicPaymentSettingsShape(row, cloud.chargilyEnabled === true), ...cloud })
+          }
+        }
+      } catch {
+        // Offline — fall through to the local answer (chargilyEnabled=false).
+      }
+      return c.json(publicPaymentSettingsShape(row, false))
+    } catch (error) {
+      console.error('[LocalAPI] /api/payment-settings error:', error)
+      return c.json(publicPaymentSettingsShape(null, false))
+    }
+  })
+
+  // GET /api/admin/payment-settings — SUPER_ADMIN singleton read (local).
+  // Mirrors the cloud admin.ts GET /payment-settings: creates the default row
+  // when missing so the first save has a target.
+  app.get('/api/admin/payment-settings', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser || sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Forbidden' }, 403)
+      }
+      if (!db || !db.paymentSettings) {
+        return c.json({ success: false, error: 'Local database not ready' }, 503)
+      }
+      let row = await db.paymentSettings.findFirst()
+      if (!row) {
+        row = await db.paymentSettings.create({ data: {} })
+      }
+      return c.json({ settings: row })
+    } catch (error) {
+      console.error('[LocalAPI] /api/admin/payment-settings GET error:', error)
+      return c.json({ success: false, error: 'Failed to load payment settings' }, 500)
+    }
+  })
+
+  // PUT /api/admin/payment-settings — SUPER_ADMIN local write + outbox.
+  // The deterministic SYNC_PUSH replay carries the whitelisted fields to the
+  // cloud (registry model PaymentSettings, LAST_WRITE_WINS on updatedAt), so
+  // an offline admin edit converges as soon as the device is back online.
+  app.put('/api/admin/payment-settings', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser || sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Forbidden' }, 403)
+      }
+      if (!db || !db.paymentSettings) {
+        return c.json({ success: false, error: 'Local database not ready' }, 503)
+      }
+      const body = await c.req.json().catch(() => ({}))
+      const data = {}
+      for (const field of PAYMENT_SETTINGS_FIELDS) {
+        if (body && body[field] !== undefined) data[field] = body[field]
+      }
+      // Nullable strings: '' normalizes to null (mirrors the cloud admin.ts).
+      for (const field of ['ccpHolderName', 'ccpAddress', 'bankHolderName', 'bankAddress', 'baridiMobNumber']) {
+        if (data[field] !== undefined) data[field] = data[field] === '' ? null : data[field]
+      }
+      let row = await db.paymentSettings.findFirst()
+      if (!row) {
+        row = await db.paymentSettings.create({ data: { ...data, updatedAt: new Date() } })
+      } else {
+        row = await db.paymentSettings.update({ where: { id: row.id }, data: { ...data, updatedAt: new Date() } })
+      }
+      // Outbox replay — cloud converges (legacy mutableFields whitelist there
+      // accepts these fields since the r21-6 registry regeneration).
+      try {
+        await logDeterministicOutcome('PaymentSettings', row.id, 'update', data, new Date().toISOString())
+      } catch (outboxErr) {
+        console.warn('[LocalAPI] payment-settings PUT: outbox log failed (non-fatal):', outboxErr?.message || outboxErr)
+      }
+      return c.json({ settings: row })
+    } catch (error) {
+      console.error('[LocalAPI] /api/admin/payment-settings PUT error:', error)
+      return c.json({ success: false, error: 'Failed to save payment settings' }, 500)
+    }
+  })
+
+  // POST /api/payment/create-checkout — CLOUD-proxy only. The hosted Chargily
+  // checkout is inherently online (it opens pay.chargily.net); there is no
+  // local gateway to hand off to. Offline → 503 PAYMENT_OFFLINE so the
+  // dialog can show a clear "needs internet" message instead of a bare 404.
+  app.post('/api/payment/create-checkout', authMiddleware, async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}))
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/payment/create-checkout', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: JSON.stringify(body || {}),
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] create-checkout proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Online card payments (EDAHABIA / CIB) require an internet connection. Please connect or pick a manual transfer method.',
+          code: 'PAYMENT_OFFLINE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] create-checkout proxy error:', error)
+      return c.json({ success: false, error: 'Failed to create the payment session' }, 500)
+    }
+  })
+
+  // GET /api/payment/checkout/:id — CLOUD-proxy (the payment-result view
+  // polls this; settlement + webhook verification happen on the cloud).
+  app.get('/api/payment/checkout/:id', authMiddleware, async (c) => {
+    try {
+      const checkoutId = c.req.param('id')
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/payment/checkout/' + encodeURIComponent(checkoutId), {
+          headers: {
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] checkout-status proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Checking this payment requires an internet connection. Please connect and try again.',
+          code: 'PAYMENT_OFFLINE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] checkout-status proxy error:', error)
+      return c.json({ success: false, error: 'Failed to check the payment status' }, 500)
+    }
+  })
+
+  // GET /api/payment/test + /api/payment/test-checkout — CLOUD-proxy (the
+  // super admin's gateway probes; the Chargily keys live in cloud-only
+  // SystemSetting rows so the test can only run against the cloud API).
+  app.get('/api/payment/test', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser || sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Forbidden' }, 403)
+      }
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/payment/test', {
+          headers: { ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}) },
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] payment/test proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Testing the gateway requires an internet connection.', code: 'PAYMENT_OFFLINE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] payment/test proxy error:', error)
+      return c.json({ success: false, error: 'Connection test failed' }, 500)
+    }
+  })
+
+  app.get('/api/payment/test-checkout', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser || sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Forbidden' }, 403)
+      }
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/payment/test-checkout', {
+          headers: { ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}) },
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] payment/test-checkout proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Testing the gateway requires an internet connection.', code: 'PAYMENT_OFFLINE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] payment/test-checkout proxy error:', error)
+      return c.json({ success: false, error: 'Checkout test failed' }, 500)
+    }
+  })
+
+  // GET /api/settings/category/payment + POST /api/settings/bulk — CLOUD-proxy
+  // (the Chargily keys/mode/enable flag are cloud-only SystemSetting rows).
+  app.get('/api/settings/category/:category', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser || sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Forbidden' }, 403)
+      }
+      const category = encodeURIComponent(c.req.param('category'))
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/settings/category/' + category, {
+          headers: { ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}) },
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] settings/category proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Gateway settings require an internet connection.', code: 'CLOUD_UNREACHABLE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] settings/category proxy error:', error)
+      return c.json({ success: false, error: 'Failed to load settings' }, 500)
+    }
+  })
+
+  app.post('/api/settings/bulk', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser || sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Forbidden' }, 403)
+      }
+      const body = await c.req.json().catch(() => ({}))
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/settings/bulk', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: JSON.stringify(body || {}),
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] settings/bulk proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Saving gateway settings requires an internet connection.', code: 'CLOUD_UNREACHABLE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] settings/bulk proxy error:', error)
+      return c.json({ success: false, error: 'Failed to save settings' }, 500)
+    }
+  })
+
+  // /api/reconciliation/* — CLOUD-proxy (the reconciliation engine reads the
+  // cloud Transaction table; 3 paths the Payment Center page calls).
+  app.get('/api/reconciliation/report/:date', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser || sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Forbidden' }, 403)
+      }
+      const date = encodeURIComponent(c.req.param('date'))
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/reconciliation/report/' + date, {
+          headers: { ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}) },
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] reconciliation/report proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Reconciliation requires an internet connection.', code: 'CLOUD_UNREACHABLE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] reconciliation/report proxy error:', error)
+      return c.json({ success: false, error: 'Failed to load the reconciliation report' }, 500)
+    }
+  })
+
+  app.post('/api/reconciliation/run', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser || sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Forbidden' }, 403)
+      }
+      const body = await c.req.json().catch(() => ({}))
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/reconciliation/run', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          body: JSON.stringify(body || {}),
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] reconciliation/run proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Reconciliation requires an internet connection.', code: 'CLOUD_UNREACHABLE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] reconciliation/run proxy error:', error)
+      return c.json({ success: false, error: 'Reconciliation failed' }, 500)
+    }
+  })
+
+  app.get('/api/reconciliation/unreconciled', authMiddleware, async (c) => {
+    try {
+      if (!sessionUser || sessionUser.role !== 'SUPER_ADMIN') {
+        return c.json({ success: false, error: 'Forbidden' }, 403)
+      }
+      const qs = c.req.url.includes('?') ? '?' + c.req.url.split('?')[1] : ''
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/reconciliation/unreconciled' + qs, {
+          headers: { ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}) },
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] reconciliation/unreconciled proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Reconciliation requires an internet connection.', code: 'CLOUD_UNREACHABLE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] reconciliation/unreconciled proxy error:', error)
+      return c.json({ success: false, error: 'Failed to load unreconciled transactions' }, 500)
     }
   })
 
@@ -9690,27 +11045,86 @@ function createApp() {
       const body = await c.req.json().catch(() => ({}))
       const { serviceId, counterId, branchId } = body
 
-      // Task 37-d: queue actions need canManageQueue; a non-owner caller must
-      // operate from a counter they personally occupy (OCCUPY_COUNTER_FIRST).
+      // Task 37-d + r23: queue actions need canManageQueue AND a CONTROLLED
+      // counter — EVERY account, the owner included.
       const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
       if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
       const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
       if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
+      // r23 — bind the ticket to the caller's controlled counter when the
+      // request omitted one (cloud parity).
+      const effectiveCounterId = counterId || occupancyGate.counter?.id || null
 
-      // Task 24: parity with the CLOUD call-next — order by queueNumber ASC
-      // (Postpone Paradox fix), skip FUTURE-DATE tickets, and skip fixed-time
-      // tickets whose preferred time has not arrived yet.
-      const where = { agencyId, status: 'WAITING' }
-      if (serviceId) where.serviceId = serviceId
-      // branchId filter removed — Reservation has no branchId field
+      // Task 24: parity with the CLOUD call-next — skip FUTURE-DATE tickets
+      // and fixed-time tickets whose preferred time has not arrived yet
+      // (P2-10: the binding filter + priority ordering live in the shared
+      // loader below, right before the local claim).
 
-      const candidates = await db.reservation.findMany({
-        where,
-        orderBy: { queueNumber: 'asc' },
-        take: 200,
-      })
+      // ── Enhanced Online Operational Mode (UNIFIED QUEUE) ──
+      // When the central API is reachable it is the DEFINITIVE source of
+      // truth: the claim runs THERE as one atomic, idempotent, OCC-guarded
+      // transaction (two desks can never call the same ticket; assignment to
+      // staff + counter is a single DB transaction) and the authoritative
+      // result is mirrored locally. The renderer's idempotency key is
+      // forwarded so a retransmission maps to the SAME central execution.
+      const incomingIdempotencyKey = c.req.header('X-Idempotency-Key') || c.req.header('x-idempotency-key')
+      if (cloudOnlineFast() === true) {
+        const central = await callCentralQueueApi(
+          'POST',
+          '/api/agency/queue/call-next',
+          { agencyId, serviceId: serviceId || undefined, counterId: effectiveCounterId || undefined },
+          { idempotencyKey: incomingIdempotencyKey },
+        )
+        if (central.ok && central.data && central.data.success !== false && central.data.reservation) {
+          const cRes = central.data.reservation
+          await applyCentralClaimLocally(cRes, agencyId)
+          const localRow = await db.reservation.findUnique({ where: { id: cRes.id } }).catch(() => null)
+          const merged = localRow || {
+            id: cRes.id,
+            agencyId,
+            serviceId: cRes.serviceId || serviceId || null,
+            displayNumber: cRes.displayNumber,
+            queueNumber: cRes.queueNumber,
+            status: 'CALLED',
+            calledAt: cRes.calledAt ? new Date(cRes.calledAt) : new Date(),
+            counterId: cRes.counterId || effectiveCounterId || null,
+          }
+          emitEvent('queue:called', { agencyId, reservation: merged })
+          return c.json({ success: true, data: merged, reservation: merged, source: 'central' })
+        }
+        if (central.errorKind === 'AUTH') {
+          // 401/423 is NEVER "offline" — the session was rejected; surface it
+          // (Task 33-C principle) instead of silently claiming locally.
+          return c.json({
+            success: false,
+            error: (central.data && central.data.error) || 'Session rejected by the central server — please sign in again',
+            code: 'CENTRAL_AUTH_REJECTED',
+          }, central.status === 423 ? 423 : 401)
+        }
+        if (central.errorKind === 'CLIENT') {
+          // Definitive business answer from the central queue (paused, closed,
+          // ONLY_SCHEDULED_WAITING, OCCUPY_COUNTER_FIRST, …) — verbatim.
+          return c.json(central.data || { success: false, error: 'Central queue rejected the request' }, central.status)
+        }
+        if (central.errorKind === 'CONFLICT') {
+          // Falling back locally could DOUBLE-call a ticket the central queue
+          // just assigned — surface the conflict; the retry re-claims.
+          return c.json({ success: false, error: 'Concurrent call detected. Please try again.', shouldRetry: true }, 409)
+        }
+        // UNREACHABLE → fall through to the proven local outbox path below.
+        console.warn('[LocalAPI] call-next: central claim unavailable (' + (central.error || central.errorKind) + ') — using local outbox path')
+      }
 
-      const next = pickNextLocalCustomer(candidates, new Date())
+      // P2-10 — shared loader: binding filter + priority ordering, mirroring
+      // the cloud claim (the central-first path above stays authoritative; the
+      // local outbox path below uses the SAME selection when offline).
+      const loaded = await loadLocalCallCandidates(agencyId, serviceId, effectiveCounterId)
+      const candidates = loaded.candidates
+      const where = loaded.where
+
+      const now = new Date()
+
+      const next = pickNextLocalCustomer(candidates, now)
 
       if (!next) {
         const anyWaiting = await db.reservation.findFirst({ where, orderBy: { queueNumber: 'asc' } })
@@ -9724,8 +11138,6 @@ function createApp() {
         })
       }
 
-      const now = new Date()
-
       // ── Call the customer + OUTBOX (field report: "the turn notification
       // never reaches the customer when the agency uses the desktop app").
       // This alias route updated the LOCAL row only — no outbox entry — so
@@ -9737,31 +11149,48 @@ function createApp() {
         status: 'CALLED',
         calledAt: now,
         // calledBy: removed — not a Reservation schema field
-        counterId: counterId || null,
       }
-      const updated = await withOutboxTransaction(async (tx) => {
-        await tx.reservation.update({ where: { id: next.id }, data: calledData })
-        // Part Q: outcome row atomic with the state flip.
-        await logDeterministicOutcome('Reservation', next.id, 'update', { ...next, ...calledData }, null, { tx })
+      if (effectiveCounterId) calledData.counterId = effectiveCounterId
+
+      // UNIFIED QUEUE (offline path): OCC-guarded claim with a next-candidate
+      // loop. The conditional updateMany (WHERE status='WAITING') makes a
+      // double-claim impossible even when the sync pull flips a candidate
+      // between our read and our write — the loser silently moves to the
+      // NEXT candidate instead of double-calling the same ticket.
+      const claimResult = await withOutboxTransaction(async (tx) => {
+        let claimedRow = null
+        for (const cand of candidates) {
+          if (!isCallableNowLocal(cand, now)) continue
+          const occ = await tx.reservation.updateMany({
+            where: { id: cand.id, status: 'WAITING' },
+            data: calledData,
+          })
+          if (occ.count === 0) continue // lost THIS ticket to a concurrent claimant
+          // Part Q: outcome row atomic with the state flip.
+          await logDeterministicOutcome('Reservation', cand.id, 'update', { ...cand, ...calledData }, null, { tx })
+          claimedRow = { ...cand, ...calledData }
+          break
+        }
+        if (!claimedRow) return { claimed: null }
 
         // Update current serving number in queue settings (synced table —
         // keeps kiosks / other devices on the same "now serving" number).
         const qs = await tx.queueSettings.findFirst({ where: { agencyId } })
         if (qs) {
-          const qsData = { currentServingNumber: next.queueNumber }
+          const qsData = { currentServingNumber: claimedRow.queueNumber }
           await tx.queueSettings.update({ where: { id: qs.id }, data: qsData })
           await logDeterministicOutcome('QueueSettings', qs.id, 'update', { ...qs, ...qsData }, null, { tx })
         }
 
-        return { ...next, ...calledData }
+        return { claimed: claimedRow }
       })
 
-      // Update positions of remaining waiting reservations
-      const remainingWaiting = await db.reservation.findMany({
-        where: { agencyId, status: 'WAITING' },
-        orderBy: { joinedAt: 'asc' },
-      })
-      // position reassignment loop removed — position is not a schema field
+      const updated = claimResult.claimed
+      if (!updated) {
+        // Every candidate was claimed concurrently between the read and the
+        // write — the client retry re-evaluates the whole queue.
+        return c.json({ success: false, error: 'Concurrent call detected. Please try again.', shouldRetry: true }, 409)
+      }
 
       emitEvent('queue:called', { agencyId, reservation: updated })
 
@@ -9838,10 +11267,13 @@ function createApp() {
       if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Service not found' }, 404)
       // Task 37-a: nameAr/nameFr are real Service columns (schema.prisma) the
       // UI sends — the old whitelist silently dropped translations on edits.
-      const allowedFields = ['name', 'nameAr', 'nameFr', 'prefix', 'description', 'isActive'] // estimatedDuration removed — not a Service schema field
+      // 0.6.20 parity audit — price/durationMinutes/priority joined them.
+      const allowedFields = ['name', 'nameAr', 'nameFr', 'prefix', 'description', 'isActive', 'price', 'durationMinutes', 'priority'] // estimatedDuration removed — not a Service schema field
       const updateData = {}
       for (const field of allowedFields) {
-        if (body[field] !== undefined) updateData[field] = body[field]
+        if (body[field] !== undefined) updateData[field] = field === 'price' || field === 'durationMinutes' || field === 'priority'
+          ? (body[field] === null ? null : Number(body[field]))
+          : body[field]
       }
       if (Object.keys(updateData).length === 0) return c.json({ success: false, error: 'No valid fields' }, 400)
       // Task 37-a: wrap in the same outbox transaction as branch create/update
@@ -10196,11 +11628,13 @@ function createApp() {
       const id = c.req.param('id')
       const body = await c.req.json().catch(() => ({}))
       const { counterId } = body
-      // Task 37-d: queue actions need canManageQueue + counter occupancy.
+      // Task 37-d + r23: queue actions need canManageQueue AND a CONTROLLED
+      // counter — EVERY account, the owner included.
       const queueGate = await checkAgencyPermission(undefined, 'canManageQueue')
       if (!queueGate.ok) return c.json(queueGate.body, queueGate.status)
       const occupancyGate = await checkCounterOccupancy(queueGate.ctx, counterId)
       if (!occupancyGate.ok) return c.json(occupancyGate.body, 403)
+      const effectiveCounterId = counterId || occupancyGate.counter?.id || null
       const existing = await db.reservation.findUnique({ where: { id } })
       if (!existing || existing.agencyId !== agencyId) return c.json({ success: false, error: 'Reservation not found' }, 404)
       if (!['WAITING', 'CALLED'].includes(existing.status)) {
@@ -10213,7 +11647,7 @@ function createApp() {
           status: 'CALLED',
           calledAt: now,
           // calledBy: removed — not a Reservation schema field
-          counterId: counterId || null,
+          counterId: effectiveCounterId || null,
         },
       })
       const updated = await db.reservation.findUnique({ where: { id } })
@@ -10458,6 +11892,31 @@ async function startLocalApi(dbPath, port, options) {
   await setupPragmas()
   console.log(`[LocalAPI] Prisma database initialized (local SQLite)`)
 
+  // ── R-21F: offline LAN authority boot (election / join / write-gate) ─────
+  // Runs after the DB is ready (needs _sync_meta for term + device registry
+  // persistence). Loopback-only dev runs keep election idle. All failures
+  // are non-fatal — offline authority must never block API startup.
+  try {
+    await lanAuthority.initAuthority({
+      metaGet: getLocalMeta,
+      metaSet: setLocalMeta,
+      getSession: () => (sessionToken && sessionUser ? { token: sessionToken, previousToken: previousSessionTokenValid() ? previousSessionToken : null, user: sessionUser } : null),
+      getDb: () => db,
+      diag: diagLog,
+      broadcast: (event, payload) => { try { emitEvent(event, payload) } catch { /* ignore */ } },
+      lanEnabled: LAN_ENABLED,
+      instanceId: await getDeviceId(),
+      identity: {
+        name: os.hostname(),
+        hostname: os.hostname(),
+        lanIp: LAN_ENABLED ? bestLanIp() : null,
+        httpPort: port,
+      },
+    })
+  } catch (lanAuthErr) {
+    console.warn('[LocalAPI] LAN authority init failed (non-fatal):', lanAuthErr?.message || lanAuthErr)
+  }
+
   // ── Task 47: startup self-heal for the stale 'BASIC' tier default ─────
   // The pre-Task-32 local DDL defaulted Agency.subscriptionTier to 'BASIC',
   // so any agency row created LOCALLY (before its first sync pull) still
@@ -10498,6 +11957,101 @@ async function startLocalApi(dbPath, port, options) {
   })
   fileSync.start()
   console.log(`[LocalAPI] File store: ${fileStore.resolveFilesRoot()} — file-sync worker started`)
+
+  // ── r21-8: local counter-control sweeper (lease TTL + 60s auto-claim) ──
+  // Mirrors the cloud worker (apps/api/src/workers/counter-control-sweeper.ts)
+  // against the local SQLite source of truth:
+  //   1. counters whose controlHeartbeatAt went quiet for > 3min are released
+  //      (counter:lost + counter:released) — logout/close already releases
+  //      eagerly, this is the crash/force-kill safety net;
+  //   2. PENDING control requests past their 60s window auto-transfer control
+  //      to the requester while they are still an active agency member,
+  //      otherwise the request is stamped EXPIRED.
+  // Raw-SQL on purpose: runs on every boot regardless of generated-client
+  // generation, and lease/request state is runtime state (no outbox rows).
+  try {
+    let counterSweeperBusy = false
+    const counterControlSweeper = setInterval(async () => {
+      if (counterSweeperBusy || !db) return
+      counterSweeperBusy = true
+      try {
+        const nowIso = new Date().toISOString()
+        const cutoff = new Date(Date.now() - 3 * 60 * 1000).toISOString()
+        const stale = await db.$queryRawUnsafe(
+          `SELECT c."id" AS id, c."name" AS name, c."number" AS number, b."agencyId" AS agencyId
+             FROM "Counter" c JOIN "Branch" b ON b."id" = c."branchId"
+            WHERE c."controlledByUserId" IS NOT NULL
+              AND (c."controlHeartbeatAt" IS NULL OR c."controlHeartbeatAt" < ?)`,
+          cutoff
+        ).catch(() => [])
+        for (const row of stale || []) {
+          await db.$executeRawUnsafe(
+            `UPDATE "Counter"
+                SET "controlledByUserId" = NULL, "controlledByStaffId" = NULL,
+                    "controlClaimedAt" = NULL, "controlHeartbeatAt" = NULL,
+                    "occupiedAt" = NULL, "staffId" = NULL, "updatedAt" = ?
+              WHERE "id" = ?`,
+            nowIso, row.id
+          ).catch(() => null)
+          emitEvent('counter:lost', { agencyId: row.agencyId, counterId: row.id, counterName: row.name, counterNumber: row.number })
+          emitEvent('counter:released', { agencyId: row.agencyId, counterId: row.id, counterName: row.name, counterNumber: row.number })
+        }
+        const expired = await db.$queryRawUnsafe(
+          `SELECT * FROM "CounterControlRequest"
+            WHERE "status" = 'PENDING' AND "expiresAt" < ?`,
+          nowIso
+        ).catch(() => [])
+        for (const request of expired || []) {
+          let stillMember = false
+          try {
+            const member = await db.$queryRawUnsafe(
+              `SELECT 1 FROM "AgencyStaff" WHERE "userId" = ? AND "agencyId" = ? AND "isActive" = 1 LIMIT 1`,
+              request.fromUserId, request.agencyId
+            )
+            if (member && member.length > 0) stillMember = true
+            else {
+              const owner = await db.$queryRawUnsafe(
+                `SELECT 1 FROM "User" WHERE "id" = ? AND "agencyId" = ? LIMIT 1`,
+                request.fromUserId, request.agencyId
+              )
+              stillMember = !!(owner && owner.length > 0)
+            }
+          } catch (memberErr) {
+            console.warn('[LocalAPI] counter sweeper member check skipped:', memberErr?.message || memberErr)
+          }
+          if (stillMember) {
+            await db.$executeRawUnsafe(
+              `UPDATE "Counter"
+                  SET "controlledByUserId" = ?, "controlledByStaffId" = ?,
+                      "controlClaimedAt" = ?, "controlHeartbeatAt" = ?,
+                      "occupiedAt" = ?, "staffId" = COALESCE(?, "staffId"), "updatedAt" = ?
+                WHERE "id" = ?`,
+              request.fromUserId, request.fromStaffId, nowIso, nowIso, nowIso, request.fromStaffId, nowIso, request.counterId
+            ).catch(() => null)
+            await db.$executeRawUnsafe(
+              `UPDATE "CounterControlRequest" SET "status" = 'APPROVED', "resolvedAt" = ? WHERE "id" = ?`,
+              nowIso, request.id
+            ).catch(() => null)
+            emitEvent('counter:request-approved', { agencyId: request.agencyId, counterId: request.counterId, requestId: request.id, toUserId: request.fromUserId, autoClaimed: true })
+          } else {
+            await db.$executeRawUnsafe(
+              `UPDATE "CounterControlRequest" SET "status" = 'EXPIRED', "resolvedAt" = ? WHERE "id" = ?`,
+              nowIso, request.id
+            ).catch(() => null)
+            emitEvent('counter:request-expired', { agencyId: request.agencyId, counterId: request.counterId, requestId: request.id })
+          }
+        }
+      } catch (sweepErr) {
+        console.warn('[LocalAPI] counter-control sweeper pass failed (non-fatal):', sweepErr?.message || sweepErr)
+      } finally {
+        counterSweeperBusy = false
+      }
+    }, 60 * 1000)
+    counterControlSweeper.unref && counterControlSweeper.unref()
+    console.log('[LocalAPI] Counter-control sweeper started (lease TTL 3min, request window 60s)')
+  } catch (sweeperBootErr) {
+    console.warn('[LocalAPI] counter-control sweeper boot skipped (non-fatal):', sweeperBootErr?.message || sweeperBootErr)
+  }
 
   // Round-7: repair legacy permanently-failed HTTP create rows before the
   // sync engine starts replaying (idempotent — safe on every startup).
@@ -10630,8 +12184,64 @@ async function startLocalApi(dbPath, port, options) {
  * Stop the embedded local API server.
  */
 function stopLocalApi() {
+  // r21-8: release counters controlled by the closing session BEFORE the DB
+  // goes down — the local API is the queue's source of truth offline, so a
+  // staff member who closes the app must not keep a counter lease alive past
+  // shutdown (requirement: control is lost on logout/app close). The sweeper
+  // TTL is the crash backstop; this is the eager path. Raw SQL + best-effort:
+  // shutdown is NEVER blocked by this, and events may already be unreachable.
+  if (db && sessionUser && sessionUser.id) {
+    try {
+      // stopLocalApi is sync; run the release as a promise and give the event
+      // loop a bounded window (Atomics.wait) so the SQLite writes land before
+      // $disconnect. Never longer than 1.5s — shutdown must never hang.
+      const cleanup = (async () => {
+        const nowIso = new Date().toISOString()
+        const held = await db.$queryRawUnsafe(
+          `SELECT c."id" AS id, c."name" AS name, c."number" AS number, b."agencyId" AS agencyId
+             FROM "Counter" c JOIN "Branch" b ON b."id" = c."branchId"
+            WHERE c."controlledByUserId" = ?`,
+          sessionUser.id
+        ).catch(() => [])
+        for (const row of held || []) {
+          await db.$executeRawUnsafe(
+            `UPDATE "Counter"
+                SET "controlledByUserId" = NULL, "controlledByStaffId" = NULL,
+                    "controlClaimedAt" = NULL, "controlHeartbeatAt" = NULL,
+                    "occupiedAt" = NULL, "staffId" = NULL, "updatedAt" = ?
+              WHERE "id" = ?`,
+            nowIso, row.id
+          ).catch(() => null)
+          emitEvent('counter:released', { agencyId: row.agencyId, counterId: row.id, counterName: row.name, counterNumber: row.number })
+        }
+        // Also cancel this user's PENDING control requests.
+        await db.$executeRawUnsafe(
+          `UPDATE "CounterControlRequest" SET "status" = 'CANCELLED', "resolvedAt" = ?
+            WHERE "fromUserId" = ? AND "status" = 'PENDING'`,
+          nowIso, sessionUser.id
+        ).catch(() => null)
+      })()
+      // Bounded 1.5s drain: enough for these tiny statements, never enough to
+      // hang the quit path (Windows force-kill territory otherwise).
+      const drained = Promise.race([cleanup, new Promise((r) => setTimeout(r, 1500))])
+      try {
+        // stopLocalApi is sync; block the microtask queue just enough via
+        // Atomics.wait on a shared buffer for up to 1.5s so SQLite writes land.
+        const buf = new Int32Array(new SharedArrayBuffer(4))
+        Atomics.store(buf, 0, 0)
+        drained.then(() => Atomics.store(buf, 0, 1)).catch(() => Atomics.store(buf, 0, 1))
+        const t0 = Date.now()
+        while (Atomics.load(buf, 0) === 0 && Date.now() - t0 < 1500) {
+          Atomics.wait(buf, 0, 0, 100)
+        }
+      } catch { /* Atomics.wait unavailable — best-effort */ }
+    } catch (releaseErr) {
+      console.warn('[LocalAPI] Counter release on shutdown failed (non-fatal):', releaseErr && releaseErr.message)
+    }
+  }
   // Close the realtime socket server BEFORE the HTTP server (it wraps it).
   try { localRealtime.closeLocalRealtime() } catch { /* not started */ }
+  try { lanAuthority.shutdownAuthority() } catch { /* not started */ }
   try { if (fileSync) fileSync.stop() } catch { /* not started */ }
   if (httpServer) {
     httpServer.close()

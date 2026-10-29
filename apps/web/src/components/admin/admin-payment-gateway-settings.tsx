@@ -96,10 +96,10 @@ export function AdminPaymentGatewaySettings() {
         </CardHeader>
         <CardContent className="pt-0 space-y-5">
           {/* CCP Section */}
-          <div className="space-y-3 p-3 rounded-xl bg-blue-50/50 dark:bg-blue-900/10 border border-blue-100 dark:border-blue-800/30">
+          <div className="space-y-3 p-3 rounded-xl bg-teal-50/50 dark:bg-teal-900/10 border border-teal-100 dark:border-teal-800/30">
             <div className="flex items-center justify-between">
               <Label className="text-xs font-medium flex items-center gap-2">
-                <Building2 className="h-3.5 w-3.5 text-blue-600" />
+                <Building2 className="h-3.5 w-3.5 text-teal-600" />
                 {t('ccpEnabled')}
               </Label>
               <Switch

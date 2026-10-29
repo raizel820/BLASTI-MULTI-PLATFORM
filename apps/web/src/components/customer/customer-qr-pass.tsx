@@ -231,7 +231,7 @@ export function CustomerQrPass({
               <p className="text-xl text-muted-foreground">{getAgencyName()}</p>
             </div>
 
-            <div className="relative p-6 bg-white rounded-3xl border-2 border-dashed border-emerald-300 dark:border-emerald-700 mb-6">
+            <div className="relative p-6 bg-white dark:bg-gray-900 rounded-3xl border-2 border-dashed border-emerald-300 dark:border-emerald-700 mb-6">
               {qrSvgUrl ? (
                 <img src={qrSvgUrl} alt="QR Code" className="h-64 w-64" />
               ) : (

@@ -100,7 +100,7 @@ export function QueueProgressRing({
               className="absolute -top-1 -end-1 z-10"
             >
               <div className="h-3 w-3 rounded-full bg-red-500 flex items-center justify-center">
-                <div className="h-1.5 w-1.5 rounded-full bg-white" />
+                <div className="h-1.5 w-1.5 rounded-full bg-white dark:bg-gray-900" />
               </div>
             </motion.div>
           )}

@@ -9,7 +9,7 @@ import { SlideToConfirm } from '@/components/shared/slide-to-confirm';
 import {
   PhoneCall, Users, Clock, CheckCircle2, Pause, Play,
   UserX, Volume2, VolumeX, Wifi, WifiOff,
-  RefreshCw, Loader2, Lock
+  RefreshCw, Loader2, Lock, LogIn
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
@@ -69,7 +69,7 @@ const newTicketPulse = {
 // ─── Component ─────────────────────────────────────────────────────────────
 
 export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: SimpleMobileDashboardProps) {
-  const { user } = useAppStore();
+  const { user, setView } = useAppStore();
   const { t, lang } = useLanguage();
   const realtime = useRealtime();
 
@@ -86,6 +86,58 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const keepAwakeSupportedRef = useRef(false);
   const wakeLockRef = useRef<WakeLockSentinel | null>(null);
+
+  // ─── r21-8 — controlled-counter awareness ────────────────────────
+  // The caller may only call from a counter they CONTROL. The enriched
+  // GET /api/agency/counters carries controlledByUserId + the bound services
+  // (specialty); the controlled counter's id rides on every call-next.
+  interface ControlledCounter {
+    id: string;
+    number: number;
+    name: string;
+    nameAr?: string | null;
+    nameFr?: string | null;
+    boundServices: Array<{ serviceId: string; name: string; nameAr?: string | null; nameFr?: string | null }>;
+  }
+  const [myControlledCounter, setMyControlledCounter] = useState<ControlledCounter | null>(null);
+  // r23 — only the platform operator bypasses the claim gate; the agency
+  // OWNER needs a claimed counter exactly like staff (server parity).
+  const bypassesClaim = user?.role === 'SUPER_ADMIN';
+
+  const fetchMyCounter = useCallback(async () => {
+    if (!agencyId || !user?.id) return;
+    try {
+      const res = await apiFetch(`/api/agency/counters?agencyId=${encodeURIComponent(agencyId)}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      const rows = (data.counters ?? data.data ?? (Array.isArray(data) ? data : [])) as Array<Record<string, unknown>>;
+      const mine = rows.find((r) => r.controlledByUserId === user.id);
+      if (!mine) {
+        setMyControlledCounter(null);
+        return;
+      }
+      const boundServices = Array.isArray(mine.counterServices)
+        ? (mine.counterServices as Array<Record<string, unknown>>).map((cs) => {
+            const s = cs.service as { name?: string; nameAr?: string; nameFr?: string } | null | undefined;
+            return { serviceId: String(cs.serviceId ?? ''), name: String(s?.name ?? ''), nameAr: s?.nameAr ?? null, nameFr: s?.nameFr ?? null };
+          }).filter((s) => s.serviceId)
+        : [];
+      setMyControlledCounter({
+        id: String(mine.id),
+        number: Number(mine.number ?? 0),
+        name: String(mine.name ?? ''),
+        nameAr: (mine.nameAr as string | null) ?? null,
+        nameFr: (mine.nameFr as string | null) ?? null,
+        boundServices,
+      });
+    } catch { /* best-effort — the server still gates */ }
+  }, [agencyId, user?.id]);
+
+  useEffect(() => {
+    fetchMyCounter();
+    const interval = setInterval(fetchMyCounter, 60_000);
+    return () => clearInterval(interval);
+  }, [fetchMyCounter]);
 
   // ─── KeepAwake on mount ──────────────────────────────────────────────
   useEffect(() => {
@@ -319,12 +371,21 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
       toast.error(t('subscriptionRequired'));
       return;
     }
+    // r21-8 + r23 — a caller with NO controlled counter (owner included)
+    // would only get a 403 COUNTER_CONTROL_REQUIRED / COUNTER_SETUP_REQUIRED;
+    // route them to the console's claim flow instead.
+    if (!bypassesClaim && !myControlledCounter) {
+      toast.error(t('claimCounterFirstCta'));
+      return;
+    }
     setActionLoading('call');
     try {
       const res = await apiFetch('/api/agency/queue/call-next', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agencyId }),
+        // r21-8 — the controlled counter's id rides on the call so the
+        // server-side control gate passes and the ticket binds to MY counter.
+        body: JSON.stringify({ agencyId, ...(myControlledCounter ? { counterId: myControlledCounter.id } : {}) }),
       });
 
       if (res.ok) {
@@ -335,15 +396,26 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
         setTimeout(() => setIsPulsing(false), 1000);
         fetchData();
       } else {
-        const data = await res.json();
-        toast.error(data.error || t('noQueue') || 'No customers waiting');
+        const data = await res.json().catch(() => ({}));
+        // r21-8 — control-model 403 gates (lost lease / gate rename).
+        if (data.error === 'COUNTER_CONTROL_LOST') {
+          setMyControlledCounter(null);
+          toast.error(t('counterControlLost'));
+        } else if (data.error === 'COUNTER_CONTROL_REQUIRED' || data.error === 'OCCUPY_COUNTER_FIRST') {
+          toast.error(t('counterControlRequired'));
+          fetchMyCounter();
+        } else if (data.error === 'COUNTER_SETUP_REQUIRED') {
+          toast.error(t('counterSetupRequiredTitle'));
+        } else {
+          toast.error(data.error || t('noQueue') || 'No customers waiting');
+        }
       }
     } catch {
       toast.error(t('error') || 'Failed to call next');
     } finally {
       setActionLoading(null);
     }
-  }, [agencyId, actionLoading, stats, fetchData, playSound, t]);
+  }, [agencyId, actionLoading, stats, fetchData, playSound, t, bypassesClaim, myControlledCounter, fetchMyCounter]);
 
   const markCompleted = useCallback(async () => {
     if (!currentlyServing || actionLoading) return;
@@ -487,7 +559,7 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
             {soundEnabled ? (
               <Volume2 className="h-4 w-4 text-emerald-400" />
             ) : (
-              <VolumeX className="h-4 w-4 text-gray-500" />
+              <VolumeX className="h-4 w-4 text-gray-500 dark:text-gray-400" />
             )}
           </button>
           <button
@@ -580,7 +652,7 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
             animate={{ opacity: 1 }}
             className="mt-4"
           >
-            <p className="text-gray-500 text-sm">
+            <p className="text-gray-500 dark:text-gray-400 text-sm">
               {t('noQueue') || 'No customers in queue'}
             </p>
           </motion.div>
@@ -621,6 +693,31 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
 
       {/* ─── Action Buttons ───────────────────────────────────────────── */}
       <div className="px-4 pb-4 space-y-3">
+        {/* r21-8 — controlled-counter chip + specialty badges, or the CTA */}
+        {myControlledCounter ? (
+          <div className="flex flex-wrap items-center justify-center gap-1.5">
+            <span className="text-[10px] font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/30 rounded-full px-2 py-0.5">
+              {lang === 'ar' ? (myControlledCounter.nameAr || myControlledCounter.name) : lang === 'fr' ? (myControlledCounter.nameFr || myControlledCounter.name) : myControlledCounter.name}
+              {' '}#{myControlledCounter.number}
+            </span>
+            {myControlledCounter.boundServices.map((s) => (
+              <span
+                key={s.serviceId}
+                className="text-[9px] text-gray-300 bg-white/5 border border-white/10 rounded-full px-1.5 py-0.5"
+              >
+                {lang === 'ar' ? (s.nameAr || s.name) : lang === 'fr' ? (s.nameFr || s.name) : s.name}
+              </span>
+            ))}
+          </div>
+        ) : !bypassesClaim ? (
+          <button
+            onClick={() => setView('agency-fullscreen')}
+            className="w-full flex items-center justify-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-300 active:scale-[0.99] transition-transform"
+          >
+            <LogIn className="h-3.5 w-3.5" />
+            {t('claimCounterFirstCta')}
+          </button>
+        ) : null}
         {/* Call Next — MASSIVE button (locked when subscription is not active) */}
         <motion.button
           onClick={callNext}
@@ -725,7 +822,7 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
 
       {/* ─── Last Updated ─────────────────────────────────────────────── */}
       <div className="pb-6 text-center">
-        <p className="text-[10px] text-gray-600">
+        <p className="text-[10px] text-gray-600 dark:text-gray-400">
           {t('lastUpdated') || 'Last updated'}: {lastUpdated.toLocaleTimeString()}
         </p>
       </div>

@@ -268,7 +268,7 @@ export function KioskTicketDisplay({
           initial={{ scale: 0.3, opacity: 0, rotateY: -15 }}
           animate={{ scale: 1, opacity: 1, rotateY: 0 }}
           transition={{ type: 'spring', stiffness: 120, damping: 10, delay: 0.2 }}
-          className="bg-white rounded-3xl p-6 sm:p-8 shadow-2xl mb-6 ticket-card relative overflow-hidden"
+          className="bg-white dark:bg-gray-900 rounded-3xl p-6 sm:p-8 shadow-2xl mb-6 ticket-card relative overflow-hidden"
         >
           {/* Decorative corner accents */}
           <div className="absolute top-0 start-0 w-16 h-16">
@@ -302,7 +302,7 @@ export function KioskTicketDisplay({
             initial={{ scale: 0.5, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
             transition={{ type: 'spring', stiffness: 200, damping: 12, delay: 0.5 }}
-            className="text-[80px] sm:text-[96px] leading-none font-black text-gray-900 text-center tracking-tight"
+            className="text-[80px] sm:text-[96px] leading-none font-black text-gray-900 dark:text-gray-100 text-center tracking-tight"
           >
             {ticket.ticketNumber}
           </motion.p>
@@ -317,8 +317,8 @@ export function KioskTicketDisplay({
 
           {/* Customer name & service */}
           <div className="space-y-1 text-center">
-            <p className="text-sm font-bold text-gray-800">{ticket.customerName}</p>
-            <p className="text-xs text-gray-500">{serviceDisplayName}</p>
+            <p className="text-sm font-bold text-gray-800 dark:text-gray-200">{ticket.customerName}</p>
+            <p className="text-xs text-gray-500 dark:text-gray-400">{serviceDisplayName}</p>
             <p className="text-[10px] text-gray-400">
               {ticket.joinedAt ? new Date(ticket.joinedAt).toLocaleString() : ''}
             </p>
@@ -332,7 +332,7 @@ export function KioskTicketDisplay({
               transition={{ delay: 1.0, type: 'spring', stiffness: 200 }}
               className="mt-4 flex flex-col items-center"
             >
-              <div className="rounded-xl bg-gray-50 border border-gray-200 p-2">
+              <div className="rounded-xl bg-gray-50 dark:bg-gray-900/50 border border-gray-200 dark:border-gray-700 p-2">
                 <img src={ticketQrUrl} alt="QR Code" className="w-28 h-28 sm:w-32 sm:h-32" />
               </div>
               <p className="text-[10px] text-gray-400 mt-1.5">
@@ -386,11 +386,11 @@ export function KioskTicketDisplay({
           animate={{ opacity: 1, y: 0 }}
           className="w-full p-3 rounded-xl bg-red-500/20 text-red-200 text-sm text-center mb-2 print:hidden"
         >
-          <AlertTriangle className="h-4 w-4 inline mr-1" />
+          <AlertTriangle className="h-4 w-4 inline me-1" />
           {printError}
           <button
             onClick={onClearPrintError}
-            className="ml-2 text-red-300 hover:text-white"
+            className="ms-2 text-red-300 hover:text-white"
           >
             ✕
           </button>
@@ -452,19 +452,19 @@ export function KioskTicketDisplay({
             initial={{ opacity: 0, scale: 0.9, y: 20 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.9, y: 20 }}
-            className="mt-4 bg-white rounded-3xl p-6 shadow-2xl print:hidden"
+            className="mt-4 bg-white dark:bg-gray-900 rounded-3xl p-6 shadow-2xl print:hidden"
           >
             <div className="text-center mb-3">
-              <p className="text-lg font-bold text-gray-800">{ticket.customerName}</p>
+              <p className="text-lg font-bold text-gray-800 dark:text-gray-200">{ticket.customerName}</p>
               <p className="text-3xl font-black text-emerald-600">{ticket.ticketNumber}</p>
-              <p className="text-xs text-gray-500">{serviceDisplayName}</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400">{serviceDisplayName}</p>
             </div>
             <div className="flex justify-center mb-3">
-              <div className="rounded-2xl bg-white border-2 border-emerald-200 p-4 shadow-lg">
+              <div className="rounded-2xl bg-white dark:bg-gray-900 border-2 border-emerald-200 p-4 shadow-lg">
                 <img src={ticketQrUrl} alt="QR Code" className="w-56 h-56 sm:w-64 sm:h-64" />
               </div>
             </div>
-            <p className="text-[11px] text-gray-500 text-center">
+            <p className="text-[11px] text-gray-500 dark:text-gray-400 text-center">
               {t('walkInQRDescription') || 'Customer can scan this QR to link it to their account and track their queue.'}
             </p>
             <div className="flex gap-2 mt-4">
@@ -477,7 +477,7 @@ export function KioskTicketDisplay({
               </button>
               <button
                 onClick={onToggleQrDetail}
-                className="flex-1 min-h-[48px] rounded-xl bg-gray-100 text-gray-700 font-semibold flex items-center justify-center gap-2 hover:bg-gray-200 transition-colors"
+                className="flex-1 min-h-[48px] rounded-xl bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300 font-semibold flex items-center justify-center gap-2 hover:bg-gray-200 transition-colors"
               >
                 {t('close') || 'Close'}
               </button>

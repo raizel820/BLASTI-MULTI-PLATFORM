@@ -26,6 +26,7 @@ export function getCreateTablesSQL(): string {
       "email" TEXT UNIQUE,
       "phoneNumber" TEXT UNIQUE,
       "shortAppId" TEXT UNIQUE,
+      "uid" TEXT UNIQUE,
       "passwordHash" TEXT NOT NULL,
       "role" TEXT NOT NULL DEFAULT 'CUSTOMER',
       "language" TEXT NOT NULL DEFAULT 'ar',

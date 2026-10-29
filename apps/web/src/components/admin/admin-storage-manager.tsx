@@ -52,6 +52,8 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Input } from '@/components/ui/input';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Progress } from '@/components/ui/progress';
+// NOTE (0.6.19): AdminAccountLogsVault MOVED to the new Logs Manager page
+// (admin-logs-manager view) — see adaptive-sidebar '__data_storage_group__'.
 import {
   Select,
   SelectContent,
@@ -64,6 +66,7 @@ import {
   RefreshCw,
   Loader2,
   Search,
+  ScrollText,
   Trash2,
   Copy,
   Pencil,
@@ -1667,6 +1670,20 @@ export function AdminStorageManager() {
                 {t('storageRefresh')}
               </Button>
             </div>
+          </CardContent>
+        </Card>
+      </motion.div>
+
+      {/* ACCOUNT LOGS VAULT — logs-1 (0.6.16) moved to the new LOGS MANAGER
+          page (logs-2 / 0.6.19) under Database & Storage → "Logs Manager".
+          The vault grew from a file browser into a realtime analysis console
+          (error fingerprint index + severity + daily per-platform JSON), which
+          earned it a dedicated sidebar page next to this one. */}
+      <motion.div {...fadeUp} transition={{ delay: 0.03 }}>
+        <Card>
+          <CardContent className="pt-4 pb-3 px-4 flex items-center gap-2">
+            <ScrollText className="h-4 w-4 text-violet-500 shrink-0" />
+            <p className="text-xs text-muted-foreground flex-1">{t('logsMovedNote')}</p>
           </CardContent>
         </Card>
       </motion.div>

@@ -38,6 +38,8 @@ import {
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { apiFetch } from '@/lib/api-fetch';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import { getProxiedUrl } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -49,6 +51,15 @@ import { AgencyLocationMap } from '@/components/shared/map/agency-location-map';
 import { useCustomerLocation } from '@/hooks/use-customer-location';
 import { formatDistance, haversineDistanceKm } from '@/lib/geo';
 import { categoryKeys, getCategoryLabel, isOpenNow } from '@/components/customer/home/types';
+// Task 5-b — per-category terminology scope + specialty chips helpers.
+import {
+  useCategoryTermScope,
+  fetchCategoriesWithSpecialties,
+  findCategoryBySlug,
+  localizeSpecialtyName,
+  parseAgencySpecialtyIds,
+  type AgencySpecialty,
+} from '@/hooks/use-category-terms';
 
 /** Shape of GET /api/agencies/:id → agency (only the fields this view renders). */
 interface AgencyProfileData {
@@ -78,6 +89,11 @@ interface AgencyProfileData {
   longitude: number | null;
   services: { id: string; name: string; nameFr: string | null; nameAr: string | null; prefix: string }[];
   activeQueueCount: number;
+  // Task 5-b — specialties the agency serves. The detail endpoint spreads the
+  // raw Prisma row (specialtyIds = JSON string) — older builds omit both, so
+  // keep them `unknown` and normalize defensively (see parseAgencySpecialtyIds).
+  specialtyIds?: unknown;
+  specialties?: unknown;
 }
 
 /** Shape of GET /api/reviews → reviews[] (verified against apps/api reviews.ts). */
@@ -105,13 +121,39 @@ export function CustomerAgencyProfile() {
   const [fetchError, setFetchError] = useState(false);
   const [agency, setAgency] = useState<AgencyProfileData | null>(null);
 
+  // Task 5-b — per-category terminology scope: once the agency (and its
+  // category) is known, every t() call on this page resolves the category's
+  // overrides first (e.g. "Customer" → "Patient" for CLINIC). Falsy until the
+  // agency payload arrives → the scope stays inactive; a failed terms fetch
+  // degrades silently to the standard dictionary.
+  // FIX (0.6.16): this hook MUST stay BELOW the `agency` state declaration —
+  // it reads agency.category, and its previous placement above the
+  // declaration was a TDZ violation ("Cannot access 'agency' before
+  // initialization" → minified "Cannot access 'G' before initialization" in
+  // the production APK bundle) that crashed the whole page into the error
+  // boundary on every render.
+  useCategoryTermScope(agency?.category);
+
   const [reviews, setReviews] = useState<ReviewItem[]>([]);
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
   const [averageRating, setAverageRating] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
   const [currentPage, setCurrentPage] = useState(1);
   const [reviewsError, setReviewsError] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+
+  // Task 5-b — category dictionary (with specialties) for chip name display.
+  const [categoryRows, setCategoryRows] = useState<Awaited<ReturnType<typeof fetchCategoriesWithSpecialties>>>([]);
+  useEffect(() => {
+    let cancelled = false;
+    fetchCategoriesWithSpecialties()
+      .then((rows) => { if (!cancelled) setCategoryRows(rows); })
+      .catch(() => { /* silent — chips simply don't render */ });
+    return () => { cancelled = true; };
+  }, []);
 
   const fetchReviews = useCallback(async (targetId: string, page: number, append: boolean) => {
     try {
@@ -170,7 +212,7 @@ export function CustomerAgencyProfile() {
 
   useEffect(() => {
     fetchData();
-  }, [fetchData]);
+  }, [fetchData, resumeNonce]);
 
   const loadMoreReviews = async () => {
     if (!agencyProfileId || loadingMore || currentPage >= totalPages) return;
@@ -249,6 +291,27 @@ export function CustomerAgencyProfile() {
     : null;
 
   const CatIcon = agency ? (categoryKeys.find((c) => c.value === agency.category.toUpperCase())?.icon ?? Building2) : Building2;
+
+  // Task 5-b — specialties the agency serves, resolved for chip display.
+  // Chain: payload `specialties` objects (enriched endpoints) → payload
+  // `specialtyIds` + the categories dictionary (detail endpoints spread the
+  // raw JSON-string column) → nothing (chips don't render). Silent on every
+  // failure path.
+  const agencySpecialties = useMemo<AgencySpecialty[]>(() => {
+    if (!agency) return [];
+    if (Array.isArray(agency.specialties)) {
+      const direct = agency.specialties
+        .map((s) => (s && typeof s === 'object' && typeof (s as AgencySpecialty).id === 'string' && typeof (s as AgencySpecialty).nameEn === 'string' ? (s as AgencySpecialty) : null))
+        .filter((s): s is AgencySpecialty => s !== null);
+      if (direct.length > 0) return direct;
+    }
+    const ids = parseAgencySpecialtyIds(agency.specialtyIds);
+    if (ids.length === 0) return [];
+    const category = findCategoryBySlug(categoryRows, agency.category);
+    if (!category) return [];
+    const idSet = new Set(ids);
+    return category.specialties.filter((s) => idSet.has(s.id));
+  }, [agency, categoryRows]);
 
   const backToHome = (
     <button
@@ -401,6 +464,20 @@ export function CustomerAgencyProfile() {
                 </Badge>
               </div>
               <p className="font-mono text-[11px] text-muted-foreground mt-1.5" dir="ltr">{agency.customCode}</p>
+              {/* Task 5-b — specialties row (chips near the category label). */}
+              {agencySpecialties.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                  <span className="text-[10px] font-semibold text-muted-foreground">{t('specialtiesLabel')}</span>
+                  {agencySpecialties.map((spec) => (
+                    <span
+                      key={spec.id}
+                      className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-400 border border-teal-200/70 dark:border-teal-800"
+                    >
+                      {localizeSpecialtyName(spec, lang)}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </motion.section>

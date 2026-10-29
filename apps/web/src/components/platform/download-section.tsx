@@ -52,7 +52,7 @@ function getOSLabel(os: string, fallback: string): string {
 
 function QRCodePlaceholder() {
   return (
-    <div className="w-28 h-28 bg-white rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600 flex flex-col items-center justify-center gap-1">
+    <div className="w-28 h-28 bg-white dark:bg-gray-900 rounded-xl border-2 border-dashed border-gray-300 dark:border-gray-600 flex flex-col items-center justify-center gap-1">
       <QrCode className="h-8 w-8 text-gray-400 dark:text-gray-500" />
       <span className="text-[8px] text-gray-400 dark:text-gray-500 text-center leading-tight px-1">
         Scan to<br />download

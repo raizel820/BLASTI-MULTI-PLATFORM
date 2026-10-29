@@ -9,6 +9,7 @@ import { apiClient, setNativeSessionToken } from '@/lib/api-client';
 // store's Electron-gated partialize, so behavior there is unchanged.
 // Task 2-b-2 (sub-task 1) — the checkbox also PRE-SHOWS the last choice.
 import { setSessionPersistenceMode, getLastRememberChoice } from '@/lib/auth-storage';
+import { adoptLocalLanguagePreference } from '@/hooks/use-language';
 import { useAppStore } from '@/store/use-app-store';
 import { adoptImportedLocalSessionUser } from '@/lib/session-heal';
 import { useLanguage } from '@/hooks/use-language';
@@ -193,7 +194,10 @@ export function LoginForm() {
       if (res.ok && data.user) {
         setLoginSuccess(true);
         setTimeout(() => {
-          setUser(data.user);
+          setUser(adoptLocalLanguagePreference(data.user));
+          // cache-1 — prefetch this role's core endpoints + avatar into the
+          // caches so the first navigation after login paints instantly.
+          import('@/lib/boot-prefetch').then((m) => m.warmCoreCaches()).catch(() => { /* silent */ });
           // Task 81 — remember-me session policy: a checked box starts the
           // 3-day window (token refreshed in use by the session-keeper);
           // without it the session ends when this platform's default does.
@@ -222,7 +226,12 @@ export function LoginForm() {
             try {
               const w = window as any;
               const isElectron = navigator.userAgent.includes('Electron') || w.electronAPI;
-              if (isElectron) {
+              // Security-0.6.13 — the desktop app must have NOTHING to do
+              // with the admin API: an admin session (minted in a browser on
+              // the same machine) is never imported into the desktop local
+              // API. Agency/customer sessions import as before.
+              const isAdminSession = (data.user as { role?: string } | null | undefined)?.role === 'SUPER_ADMIN';
+              if (isElectron && !isAdminSession) {
                 // 0. Persist the token to the native session key too so EVERY
                 //    token consumer reads it deterministically under local-first
                 //    (buildAuthHeaders fallbacks, db/sync.ts, offline-queue.ts).
@@ -314,7 +323,7 @@ export function LoginForm() {
       if (isDesktopShell) {
         try { setSessionPersistenceMode(rememberMe ? 'remember' : 'ephemeral'); } catch { /* ignore */ }
       }
-      setUser(result.user as any);
+      setUser(adoptLocalLanguagePreference(result.user) as any);
       // Task 81 — same remember-me + enrollment-ownership policy as the
       // direct login path (the OTP flow inherits the form's rememberMe).
       guardBiometricOwnership(result.user?.username ?? username.trim());

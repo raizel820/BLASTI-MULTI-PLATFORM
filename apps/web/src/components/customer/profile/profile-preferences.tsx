@@ -79,7 +79,7 @@ export function ProfilePreferences({ lang, theme, onLanguageChange, onThemeChang
                 }`}
               >
                 {/* Theme preview card */}
-                <div className="h-16 rounded-lg bg-white border border-gray-200 mb-2 p-1.5 overflow-hidden">
+                <div className="h-16 rounded-lg bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 mb-2 p-1.5 overflow-hidden">
                   <div className="h-3 w-8 rounded-sm bg-emerald-500 mb-1" />
                   <div className="space-y-0.5">
                     <div className="h-1.5 w-full rounded-sm bg-gray-200" />
@@ -144,7 +144,7 @@ export function ProfilePreferences({ lang, theme, onLanguageChange, onThemeChang
               >
                 {/* Theme preview card - split */}
                 <div className="h-16 rounded-lg mb-2 overflow-hidden border border-gray-300 dark:border-gray-600 flex">
-                  <div className="w-1/2 bg-white p-1">
+                  <div className="w-1/2 bg-white dark:bg-gray-900 p-1">
                     <div className="h-1.5 w-4 rounded-sm bg-emerald-500 mb-0.5" />
                     <div className="h-1 w-full rounded-sm bg-gray-200" />
                   </div>
@@ -153,7 +153,7 @@ export function ProfilePreferences({ lang, theme, onLanguageChange, onThemeChang
                     <div className="h-1 w-full rounded-sm bg-gray-700" />
                   </div>
                 </div>
-                <Monitor className="h-4 w-4 mx-auto mb-1 text-gray-500" />
+                <Monitor className="h-4 w-4 mx-auto mb-1 text-gray-500 dark:text-gray-400" />
                 <span className="text-[10px] font-medium">{t('systemTheme')}</span>
                 {theme === 'system' && (
                   <motion.div

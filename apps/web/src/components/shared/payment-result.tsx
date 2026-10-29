@@ -98,9 +98,9 @@ type Phase =
  * return null on the second pass — wiping the status the generic (logged-out
  * / no-checkout) states derive their styling from.
  */
-let _returnQueryMemo: { status: string | null; checkout: string | null } | null = null;
+let _returnQueryMemo: { status: string | null; checkout: string | null; deep: string | null } | null = null;
 
-function readReturnQuery(): { status: string | null; checkout: string | null } {
+function readReturnQuery(): { status: string | null; checkout: string | null; deep: string | null } {
   if (_returnQueryMemo) return _returnQueryMemo;
   try {
     const hash = window.location.hash || '';
@@ -116,12 +116,12 @@ function readReturnQuery(): { status: string | null; checkout: string | null } {
         /* private mode — no stash to consume */
       }
     }
-    if (!query) return { status: null, checkout: null };
+    if (!query) return { status: null, checkout: null, deep: null };
     const params = new URLSearchParams(query);
-    _returnQueryMemo = { status: params.get('status'), checkout: params.get('checkout') };
+    _returnQueryMemo = { status: params.get('status'), checkout: params.get('checkout'), deep: params.get('deep') };
     return _returnQueryMemo;
   } catch {
-    return { status: null, checkout: null };
+    return { status: null, checkout: null, deep: null };
   }
 }
 
@@ -153,6 +153,28 @@ export function PaymentResult() {
 
   const attemptsRef = useRef(0);
   const pollingActiveRef = useRef(false);
+
+  // ── Deep-link bounce (Capacitor mobile) ────────────────────────────────────
+  // On phones the hosted checkout opens in the SYSTEM browser, so after
+  // paying, the gateway lands THIS page inside that browser (not the app).
+  // When the return URL carries a `deep` blasti:// link (only Capacitor
+  // callers send one — see computeReturnHints) and we are NOT already inside
+  // the app shell, bounce back into the app: Android opens BLASTI via the
+  // registered intent-filter and the payment-deep-link.ts listener routes to
+  // the in-app result. No-op on desktop/regular web (no deep param) and
+  // inside the app itself.
+  useEffect(() => {
+    const deep = readReturnQuery().deep;
+    if (!deep) return;
+    try {
+      const cap = (window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
+      if (cap?.isNativePlatform?.()) return; // already in the app
+    } catch { /* ignore */ }
+    const timer = setTimeout(() => {
+      try { window.location.href = deep; } catch { /* invalid scheme — stay put */ }
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, []);
 
   // ── Resolve the checkout id (hash query → localStorage → API) ────────────
   useEffect(() => {
@@ -373,7 +395,7 @@ export function PaymentResult() {
           <motion.div
             animate={{ scale: [1, 1.12, 1], opacity: [0.15, 0.05, 0.15] }}
             transition={{ duration: 2.4, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full bg-emerald-300 dark:bg-emerald-800"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-24 w-24 rounded-full bg-emerald-300 dark:bg-emerald-800"
           />
           <div className="relative h-20 w-20 rounded-3xl bg-gradient-to-br from-emerald-100 to-teal-50 dark:from-emerald-900/30 dark:to-teal-900/20 flex items-center justify-center">
             <Loader2 className="h-10 w-10 animate-spin text-emerald-600 dark:text-emerald-400" />
@@ -392,7 +414,7 @@ export function PaymentResult() {
           <motion.div
             animate={{ scale: [1, 1.2, 1], opacity: [0.18, 0.04, 0.18] }}
             transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-emerald-300 dark:bg-emerald-800"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-emerald-300 dark:bg-emerald-800"
           />
           <CheckCircle2 className="relative h-20 w-20 text-emerald-500 dark:text-emerald-400" />
         </motion.div>
@@ -431,7 +453,7 @@ export function PaymentResult() {
           <motion.div
             animate={{ scale: [1, 1.15, 1], opacity: [0.16, 0.05, 0.16] }}
             transition={{ duration: 2.6, repeat: Infinity, ease: 'easeInOut' }}
-            className="absolute top-1/2 start-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-amber-300 dark:bg-amber-700"
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 h-28 w-28 rounded-full bg-amber-300 dark:bg-amber-700"
           />
           <HelpCircle className="relative h-20 w-20 text-amber-500 dark:text-amber-400" />
         </motion.div>

@@ -4771,12 +4771,8 @@ function createApp() {
 
   // The 25 built-in category keys (cloud parity) — case-insensitive collision
   // targets for custom names.
-  const AGENCY_CATEGORY_BUILTIN_KEYS = [
-    'CLINIC', 'HOSPITAL', 'DENTAL_CLINIC', 'LABORATORY', 'PHARMACY',
-    'VETERINARY', 'BANK', 'POST_OFFICE', 'TELECOM', 'INSURANCE',
-    'LAW_FIRM', 'NOTARY', 'GOVERNMENT', 'EDUCATION', 'AGENCY',
-    'TRAVEL', 'REAL_ESTATE', 'CAR_SERVICE', 'BARBER', 'BEAUTY_SALON',
-    'RESTAURANT', 'CAFE', 'RETAIL', 'HOTEL', 'OTHER',
+    const AGENCY_CATEGORY_BUILTIN_KEYS = [
+    'DOCTOR', 'CLINIC', 'LAW_FIRM', 'BARBER',
   ]
 
   /** Plain JSON record with booleans + ISO datetimes (also the outbox payload). */

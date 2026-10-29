@@ -184,6 +184,24 @@ class SyncEngine {
     }
   }
 
+  /**
+   * Hotfix 0.6.12 — the persisted session user's role (same zustand mirror).
+   * Used to detect sessions the cloud can NEVER serve a pull for, so the
+   * engine can skip them gracefully instead of 400-ing every cycle.
+   */
+  private getStoredUserRole(): string | null {
+    if (!isBrowser) return null;
+    try {
+      const storeData = localStorage.getItem('blasti-app');
+      if (!storeData) return null;
+      const parsed = JSON.parse(storeData);
+      const role = parsed?.state?.user?.role;
+      return typeof role === 'string' && role ? role : null;
+    } catch {
+      return null;
+    }
+  }
+
   private emit(event: SyncEvent): void {
     for (const listener of this.listeners) {
       try {
@@ -539,6 +557,31 @@ class SyncEngine {
         diag('sync-skip', { why: 'no-token', target });
         this.emit({ type: 'sync-complete', status: this.getStatus() });
         return;
+      }
+
+      // Hotfix 0.6.12 — sessions with NO agency scope can never be served a
+      // cloud pull: the change feed is agency-scoped and the server 400s any
+      // pull whose user resolves to no agency ("agencyId is required for
+      // SUPER_ADMIN pull"). That hit TWO roles every cycle:
+      //   - SUPER_ADMIN with no agencyId in the stored session (stale login
+      //     predating the login-time agency resolution, or an admin whose
+      //     account has no agency at all), and
+      //   - CUSTOMER (never carries an agency — the pull always 400'd, which
+      //     also meant pushChanges never ran for them anyway, since the WDB
+      //     synchronize() throws on the failed pull before pushing).
+      // Skipping gracefully keeps the boot gate healthy (sync-done instead of
+      // sync-error) and stops the recurring 400 spam in the diagnostics dump.
+      // AGENCY_OWNER/STAFF are NOT skipped: the server resolves their agency
+      // from the DB, and a missing stored agencyId is normal for them.
+      // SUPER_ADMINs WITH an agencyId (fresh login) still sync normally.
+      if (target === 'cloud' && !this.getStoredUserAgencyId()) {
+        const role = this.getStoredUserRole();
+        if (role === 'SUPER_ADMIN' || role === 'CUSTOMER') {
+          console.log(`[SyncEngine] ${role} session has no agency scope — agency-scoped sync not applicable, skipping`);
+          diag('sync-skip', { why: 'no-agency-scope', target, role });
+          this.emit({ type: 'sync-complete', status: this.getStatus() });
+          return;
+        }
       }
 
       const lastPulledAt = this.getLastSyncTimestamp();
@@ -1087,9 +1130,30 @@ export function transformPullChanges(
   // Crash guard: empty/undefined serverChanges → empty change set (no throw).
   if (!serverChanges || typeof serverChanges !== 'object') return result;
 
+  // 0.6.19 fix — the cloud change feed includes server-side tables the local
+  // WatermelonDB schema deliberately does not model (users, agencycategorys,
+  // smssettingss …). Those names used to reach synchronize() verbatim, which
+  // logged "You are trying to sync a collection named X, but it does not
+  // exist. Will skip it" on EVERY pull page and buried real warnings. Drop
+  // them HERE (single compact diag line instead of per-collection noise).
+  const LOCAL_TABLES = new Set([
+    'agencies',
+    'services',
+    'branches',
+    'counters',
+    'reservations',
+    'notifications',
+    'queue_settings',
+  ]);
+  const dropped: string[] = [];
+
   for (const [modelName, modelChanges] of Object.entries(serverChanges)) {
     const mc = (modelChanges && typeof modelChanges === 'object' ? modelChanges : {}) as PullPageBucket;
     const tableName = modelNameToTableName(modelName);
+    if (!LOCAL_TABLES.has(tableName)) {
+      dropped.push(tableName);
+      continue;
+    }
     // Crash guard: every array access defaults to [] (never trust the wire).
     const deleted = (Array.isArray(mc.deleted) ? mc.deleted : []).filter(
       (id): id is string => typeof id === 'string',
@@ -1119,6 +1183,9 @@ export function transformPullChanges(
     }
   }
 
+  if (dropped.length > 0) {
+    diag('sync-pull-dropped-tables', { tables: dropped.join(',') });
+  }
   return result;
 }
 

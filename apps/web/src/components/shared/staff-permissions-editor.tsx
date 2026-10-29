@@ -178,7 +178,7 @@ export function StaffPermissionsEditor({ permissions, onChange, staffRole }: Sta
   return (
     <div className="space-y-4">
       {/* Permission description */}
-      <p className="text-sm text-gray-500">{t('permissionDesc')}</p>
+      <p className="text-sm text-gray-500 dark:text-gray-400">{t('permissionDesc')}</p>
 
       {/* Active permissions count */}
       <div className="flex items-center gap-2">
@@ -192,7 +192,7 @@ export function StaffPermissionsEditor({ permissions, onChange, staffRole }: Sta
 
       {/* Preset templates */}
       <div className="space-y-2">
-        <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider">
+        <p className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">
           {t('presetTemplates')}
         </p>
         <div className="flex flex-wrap gap-2">
@@ -202,7 +202,7 @@ export function StaffPermissionsEditor({ permissions, onChange, staffRole }: Sta
               whileHover={{ scale: 1.03 }}
               whileTap={{ scale: 0.97 }}
               onClick={() => applyPreset(preset.key)}
-              className="flex items-center gap-1.5 px-3 py-2 rounded-xl border border-gray-200 bg-white hover:border-emerald-300 hover:bg-emerald-50 text-xs font-medium text-gray-700 transition-all"
+              className="flex items-center gap-1.5 px-3 py-2 rounded-xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 hover:border-emerald-300 hover:bg-emerald-50 text-xs font-medium text-gray-700 dark:text-gray-300 transition-all"
             >
               {preset.icon}
               {preset.label}
@@ -242,7 +242,7 @@ export function StaffPermissionsEditor({ permissions, onChange, staffRole }: Sta
                 <motion.div
                   animate={{ x: isActive ? (rtl ? -20 : 20) : 0 }}
                   transition={{ type: 'spring', stiffness: 500, damping: 30 }}
-                  className="absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm"
+                  className="absolute top-0.5 h-5 w-5 rounded-full bg-white dark:bg-gray-900 shadow-sm"
                   style={{ left: rtl ? undefined : 2, right: rtl ? 2 : undefined }}
                 />
               </div>

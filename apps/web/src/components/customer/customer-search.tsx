@@ -39,6 +39,8 @@ import { fetchWithRetry } from '@/lib/fetch-with-retry';
 // Task 84 — IndexedDB stale-while-revalidate (cache keys SHARED with home:
 // the list painted here is the last-known home payload and vice versa).
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
+// 0.6.16 — revalidate view data when the app resumes to the foreground
+import { useResumeRefresh } from '@/lib/resume-refresh';
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -67,6 +69,12 @@ import { CardSwiper } from './home/CardSwiper';
 import { useCustomerLocation } from '@/hooks/use-customer-location';
 import { useDebounce } from '@/hooks/use-debounce';
 import { haversineDistanceKm } from '@/lib/geo';
+// Task 5-b — per-category specialties rail (module-cached categories fetch).
+import {
+  fetchCategoriesWithSpecialties,
+  findCategoryBySlug,
+  localizeSpecialtyName,
+} from '@/hooks/use-category-terms';
 
 export function CustomerSearch() {
   const setView = useAppStore((s) => s.setView);
@@ -119,6 +127,10 @@ export function CustomerSearch() {
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState(false);
 
+  // 0.6.16 — resume revalidation nonce (see lib/resume-refresh.ts).
+  const [resumeNonce, setResumeNonce] = useState(0);
+  useResumeRefresh(() => setResumeNonce((n) => n + 1));
+
   const fetchAgencies = useCallback(async () => {
     setLoading(true);
     setFetchError(false);
@@ -146,7 +158,7 @@ export function CustomerSearch() {
     }
   }, []);
 
-  useEffect(() => { void fetchAgencies(); }, [fetchAgencies]);
+  useEffect(() => { void fetchAgencies(); }, [fetchAgencies, resumeNonce]);
 
   // ── Favorites (SWR cache shared with home) ──────────────────────────────
   const [favoriteIds, setFavoriteIds] = useState<Set<string>>(new Set());
@@ -212,6 +224,31 @@ export function CustomerSearch() {
     return counts;
   }, [agencies]);
 
+  // ── Task 5-b — specialty sub-filter (per-category chip rail) ────────────
+  // The dictionary (categories + their specialties) is fetched once through
+  // the module-cached loader; a failure degrades silently to "no rail".
+  const [categoryRows, setCategoryRows] = useState<Awaited<ReturnType<typeof fetchCategoriesWithSpecialties>>>([]);
+  useEffect(() => {
+    let cancelled = false;
+    fetchCategoriesWithSpecialties()
+      .then((rows) => { if (!cancelled) setCategoryRows(rows); })
+      .catch(() => { /* silent — the specialty rail simply doesn't render */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const [selectedSpecialty, setSelectedSpecialty] = useState<string | null>(null);
+  const activeCategorySpecialties = useMemo(
+    () => (selectedCategory === 'ALL' ? [] : findCategoryBySlug(categoryRows, selectedCategory)?.specialties ?? []),
+    [categoryRows, selectedCategory],
+  );
+
+  // Category switch ALWAYS drops the specialty selection (it belongs to the
+  // previous category's dictionary).
+  const handleCategoryChange = (category: string) => {
+    setSelectedCategory(category);
+    setSelectedSpecialty(null);
+  };
+
   // ── Branch search — server-driven, silent-degrade (inherited policy) ────
   const [branchResults, setBranchResults] = useState<BranchListItem[]>([]);
   const [branchTotal, setBranchTotal] = useState(0);
@@ -233,6 +270,8 @@ export function CustomerSearch() {
       try {
         const params = new URLSearchParams({ search: query, limit: '20', offset: '0' });
         if (selectedCategory !== 'ALL') params.set('category', selectedCategory);
+        // Task 5-b — specialty sub-filter (server-side, branch track).
+        if (selectedSpecialty) params.set('specialty', selectedSpecialty);
         const res = await apiFetch(`/api/agencies/branches?${params.toString()}`);
         if (cancelled) return;
         if (res.ok) {
@@ -272,12 +311,16 @@ export function CustomerSearch() {
       cancelled = true;
       if (retryTimer) clearTimeout(retryTimer);
     };
-  }, [activeSearch, selectedCategory]);
+  }, [activeSearch, selectedCategory, selectedSpecialty]);
 
   // ── Agency results — client-side, IDENTICAL matching to home search ─────
   const filteredAgencies = useMemo(() => {
     return agencies.filter((a) => {
       const matchCategory = selectedCategory === 'ALL' || a.category.toUpperCase() === selectedCategory;
+      // Task 5-b — specialty sub-filter (client-side, agency track). Agencies
+      // without the enriched specialtyIds (cached/older payloads) are kept
+      // only when no specialty is selected.
+      const matchSpecialty = !selectedSpecialty || (Array.isArray(a.specialtyIds) && a.specialtyIds.includes(selectedSpecialty));
       const query = activeSearch.toLowerCase().trim();
       // Null-safe: address (and the localized names) are nullable columns —
       // a null-address agency (e.g. freshly seeded) must not crash the filter.
@@ -288,9 +331,9 @@ export function CustomerSearch() {
         a.nameFr?.toLowerCase().includes(query) ||
         a.address?.toLowerCase().includes(query) ||
         a.customCode.toLowerCase().includes(query);
-      return matchCategory && matchSearch;
+      return matchCategory && matchSpecialty && matchSearch;
     });
-  }, [agencies, selectedCategory, activeSearch]);
+  }, [agencies, selectedCategory, selectedSpecialty, activeSearch]);
 
   // ── Task 82 distance chips (only when permission already granted) ───────
   const { position: customerPosition } = useCustomerLocation(true);
@@ -431,10 +474,54 @@ export function CustomerSearch() {
         <div className="-mx-4 px-4">
           <CategoryFilters
             selectedCategory={selectedCategory}
-            onCategoryChange={setSelectedCategory}
+            onCategoryChange={handleCategoryChange}
             categoryCounts={categoryCounts}
             t={t}
           />
+          {/* Task 5-b — specialty sub-filter rail: one chip per specialty of
+              the selected category (UI-language names), "All specialties"
+              first. Same chip classes as CategoryFilters, RTL-safe, horizontal
+              scroll on mobile. Renders only when a category is selected AND
+              the dictionary for it is available. */}
+          {selectedCategory !== 'ALL' && activeCategorySpecialties.length > 0 && (
+            <div
+              className="flex gap-2 overflow-x-auto pb-3 -mt-3 no-scrollbar snap-x snap-mandatory scroll-smooth"
+              style={{ WebkitOverflowScrolling: 'touch' }}
+              role="group"
+              aria-label={t('specialtiesLabel')}
+            >
+              <button
+                type="button"
+                onClick={() => setSelectedSpecialty(null)}
+                aria-pressed={selectedSpecialty === null}
+                className={`snap-start flex items-center gap-1.5 px-3.5 py-2 rounded-full text-xs font-medium whitespace-nowrap transition-all min-h-9 active:scale-95 ${
+                  selectedSpecialty === null
+                    ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-lg shadow-emerald-500/30'
+                    : 'bg-white/60 dark:bg-gray-800/60 text-muted-foreground hover:bg-gray-200 dark:hover:bg-gray-700 backdrop-blur-sm border border-gray-200/50 dark:border-gray-700/50'
+                }`}
+              >
+                {t('specialtyAll')}
+              </button>
+              {activeCategorySpecialties.map((spec) => {
+                const isSelected = selectedSpecialty === spec.id;
+                return (
+                  <button
+                    key={spec.id}
+                    type="button"
+                    onClick={() => setSelectedSpecialty(isSelected ? null : spec.id)}
+                    aria-pressed={isSelected}
+                    className={`snap-start flex items-center gap-1.5 px-3.5 py-2 rounded-full text-xs font-medium whitespace-nowrap transition-all min-h-9 active:scale-95 ${
+                      isSelected
+                        ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-lg shadow-emerald-500/30'
+                        : 'bg-white/60 dark:bg-gray-800/60 text-muted-foreground hover:bg-gray-200 dark:hover:bg-gray-700 backdrop-blur-sm border border-gray-200/50 dark:border-gray-700/50'
+                    }`}
+                  >
+                    {localizeSpecialtyName(spec, lang)}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* ── Branch results (query active; silent-degrade policy) ── */}
@@ -531,7 +618,7 @@ export function CustomerSearch() {
               description={searchActive ? t('noSearchResultsDesc') : t('emptyNoAgenciesDesc')}
               actionLabel={searchActive ? t('clearSearch') : t('emptyNoAgenciesRetry')}
               onAction={() => {
-                if (searchActive) { setSearchQuery(''); setSelectedCategory('ALL'); inputRef.current?.focus(); }
+                if (searchActive) { setSearchQuery(''); handleCategoryChange('ALL'); inputRef.current?.focus(); }
                 else void fetchAgencies();
               }}
             />

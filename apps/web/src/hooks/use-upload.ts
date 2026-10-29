@@ -223,6 +223,14 @@ export function useUpload(options: UseUploadOptions = {}): UseUploadReturn {
         };
 
         setState(successState);
+        // cache-1 — inject the FRESH local bytes into the persistent image
+        // cache: every mounted avatar swaps instantly (no placeholder flash)
+        // and the copy survives restarts even before the server round-trips.
+        if (type === 'avatar' && result.url) {
+          import('../lib/image-cache')
+            .then((m) => m.putImageBytes(result.url, file, file.type || 'image/jpeg'))
+            .catch(() => { /* best-effort */ });
+        }
         onSuccess?.(result);
         return successState;
       } catch (err) {

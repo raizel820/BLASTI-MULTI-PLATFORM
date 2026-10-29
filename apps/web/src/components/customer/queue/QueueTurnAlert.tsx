@@ -142,6 +142,12 @@ export function QueueTurnAlert({
                 <p className="text-xs text-emerald-100 truncate">
                   {agencyName}
                 </p>
+                {/* r21-8 — counter pointer from the queue:called payload */}
+                {activeRes.counterName && (
+                  <p className="mt-0.5 text-xs font-bold text-white bg-amber-400/25 rounded-full px-2 py-0.5 inline-block max-w-full truncate">
+                    {t('goCounterName', { name: activeRes.counterName })}
+                  </p>
+                )}
               </div>
               {/* Sound toggle */}
               <button

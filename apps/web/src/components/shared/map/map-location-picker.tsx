@@ -42,6 +42,7 @@ import {
   type MapsProviderSettings,
 } from '@/lib/map';
 import { useMapConfig } from '@/lib/map/use-map-config';
+import { nativeBridge } from '@/lib/native-bridge';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
 // Re-export so picker consumers (create-agency-form, agency-profile) can
@@ -72,6 +73,10 @@ export interface MapLocationPickerProps {
 
 const GEOSETTLE_DEBOUNCE_MS = 600;
 
+/** r21-5 — a device fix less accurate than this is a NETWORK/IP-grade
+ * answer (desktop browsers silently fall back to those), not true GPS. */
+const COARSE_ACCURACY_METERS = 2000;
+
 /** Format a coordinate for the readout (fixed 6 decimals, LTR). */
 const fmt = (n: number) => n.toFixed(6);
 
@@ -97,6 +102,10 @@ export function MapLocationPicker({
   const [locating, setLocating] = useState(false);
   const [detected, setDetected] = useState<GeocodeComponents | null>(null);
   const [geocodingNow, setGeocodingNow] = useState(false);
+  // r21-5 — the last device fix was COARSE (network/IP-grade): the marker is
+  // placed, but the banner tells the user to refine via pin/commune/zip and
+  // parents must not auto-fill from the detection.
+  const [coarseLocation, setCoarseLocation] = useState(false);
 
   // Stable refs for callbacks registered into the provider. Writes happen in
   // an EFFECT, never during render (react-hooks/refs): every consumer reads
@@ -125,8 +134,10 @@ export function MapLocationPicker({
   }, [onChange, addressFields, onLocationSource, config, lang]);
 
   // ── Reverse geocode with settle debounce (spec §29) ────────────────────
+  // r21-5 — `coarse` rides along on the detection so parents can skip the
+  // auto-fill for network/IP-grade fixes (the geocoder itself is unchanged).
   const geocodeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const settleAndGeocode = useCallback((ll: LatLng) => {
+  const settleAndGeocode = useCallback((ll: LatLng, coarse = false) => {
     if (geocodeTimerRef.current) clearTimeout(geocodeTimerRef.current);
     geocodeTimerRef.current = setTimeout(async () => {
       const cfg = configRef.current;
@@ -134,8 +145,9 @@ export function MapLocationPicker({
       setGeocodingNow(true);
       try {
         const result = await reverseGeocode(ll, cfg, langRef.current);
-        setDetected(result);
-        onDetectedRef.current?.(result);
+        const payload: GeocodeComponents = coarse ? { ...result, coarse: true } : result;
+        setDetected(payload);
+        onDetectedRef.current?.(payload);
       } finally {
         setGeocodingNow(false);
       }
@@ -147,12 +159,18 @@ export function MapLocationPicker({
   }, []);
 
   // ── Explicit location change from map interactions ─────────────────────
-  const emitLocation = useCallback((ll: LatLng, source: 'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS') => {
-    lastEmittedRef.current = `${ll.lat},${ll.lng}`;
-    onChangeRef.current(ll.lat, ll.lng);
-    onLocationSourceRef.current?.(source);
-    settleAndGeocode(ll);
-  }, [settleAndGeocode]);
+  const emitLocation = useCallback(
+    (ll: LatLng, source: 'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS', coarse = false) => {
+      lastEmittedRef.current = `${ll.lat},${ll.lng}`;
+      onChangeRef.current(ll.lat, ll.lng);
+      onLocationSourceRef.current?.(source);
+      // A fresh EXPLICIT map pick (click/drag) is precise by definition —
+      // any previous coarse-fix banner no longer applies to it.
+      if (!coarse) setCoarseLocation(false);
+      settleAndGeocode(ll, coarse);
+    },
+    [settleAndGeocode],
+  );
 
   // ── Provider lifecycle ──────────────────────────────────────────────────
   const hasCoords = typeof value.latitude === 'number' && typeof value.longitude === 'number';
@@ -235,6 +253,10 @@ export function MapLocationPicker({
     if (value.latitude == null || value.longitude == null) return;
     if (valueKey && valueKey === lastEmittedRef.current) return;
 
+    // r21-5 — an EXTERNAL coordinate change (parent-driven: restored saved
+    // location, or the wilaya-centroid follow) supersedes any coarse-fix
+    // banner from a previous device fix.
+    setCoarseLocation(false);
     provider.moveMarker({ lat: value.latitude, lng: value.longitude });
     const current = provider.getCoordinates();
     if (current) {
@@ -249,31 +271,58 @@ export function MapLocationPicker({
   }, [valueKey, mapState, value.latitude, value.longitude]);
 
   // ── Use my current location (spec §27) ──────────────────────────────────
+  // r21-5 — goes through nativeBridge.getCurrentPosition FIRST: on Capacitor
+  // that is the @capacitor/geolocation plugin (true device GPS); on web it
+  // falls back to navigator.geolocation exactly as before. Desktop browsers
+  // may silently answer the W3C API from a network/IP provider → the fix is
+  // classified by `coords.accuracy` and anything coarser than 2km is shown
+  // WITH a coarse banner (marker still moves + location still emits) instead
+  // of being trusted as a real GPS position.
+  const applyDevicePosition = useCallback(
+    (lat: number, lng: number, accuracy?: number) => {
+      setLocating(false);
+      const ll: LatLng = { lat, lng };
+      const coarse = typeof accuracy === 'number' && accuracy > COARSE_ACCURACY_METERS;
+      setCoarseLocation(coarse);
+      const provider = providerRef.current;
+      provider?.moveMarker(ll);
+      provider?.setCenter(ll);
+      provider?.setZoom(MARKER_ZOOM);
+      emitLocation(ll, 'DEVICE_GPS', coarse);
+    },
+    [emitLocation],
+  );
+
   const handleUseMyLocation = useCallback(() => {
-    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+    setLocating(true);
+    const fail = () => {
+      setLocating(false);
       toast.error(t('maps.invalidLocation'));
+    };
+    if (typeof nativeBridge?.getCurrentPosition === 'function') {
+      nativeBridge
+        .getCurrentPosition()
+        .then((pos) => {
+          if (pos) applyDevicePosition(pos.lat, pos.lng, pos.accuracy);
+          else fail();
+        })
+        .catch(fail);
       return;
     }
-    setLocating(true);
+    if (typeof navigator === 'undefined' || !navigator.geolocation) {
+      fail();
+      return;
+    }
     navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setLocating(false);
-        const ll: LatLng = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        const provider = providerRef.current;
-        provider?.moveMarker(ll);
-        provider?.setCenter(ll);
-        provider?.setZoom(MARKER_ZOOM);
-        emitLocation(ll, 'DEVICE_GPS');
-      },
+      (pos) => applyDevicePosition(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy),
       (err) => {
         // Denial / unavailable → keep the picker usable (no data lost).
-        setLocating(false);
         console.warn('[MapLocationPicker] geolocation failed:', err.message);
-        toast.error(t('maps.invalidLocation'));
+        fail();
       },
       { enableHighAccuracy: true, timeout: 10_000, maximumAge: 30_000 },
     );
-  }, [emitLocation, t]);
+  }, [applyDevicePosition, t]);
 
   // Offline while loading → treat as unavailable (tiles cannot arrive);
   // a ready map keeps rendering with whatever tiles were cached.
@@ -359,6 +408,21 @@ export function MapLocationPicker({
           </span>
         )}
       </div>
+
+      {/* r21-5 — coarse-fix banner: the fix came from a network/IP provider
+          (accuracy > 2km). Marker + coordinates are still usable, auto-fill
+          is suppressed by the parents; the user is told how to refine. */}
+      {coarseLocation && (
+        <div
+          className="flex items-start gap-2 rounded-lg border border-amber-200 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-900/20 px-2.5 py-1.5"
+          data-testid="map-coarse-location-banner"
+        >
+          <MapPinOff className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 mt-0.5 shrink-0" />
+          <p className="text-[11px] leading-relaxed text-amber-800 dark:text-amber-200">
+            {t('maps.coarseLocationHint')}
+          </p>
+        </div>
+      )}
 
       {/* Coordinate readout */}
       {readout && (

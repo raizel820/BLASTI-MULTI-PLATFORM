@@ -28,11 +28,18 @@ export function CategoryFilters({
 }: CategoryFiltersProps) {
   const { customCategories } = useAgencyCategories();
 
-  const customChips = customCategories.map((row) => ({
-    id: row.id,
-    value: row.name.toUpperCase(),
-    label: row.name,
-  }));
+  // 0.6.18 defense-in-depth for the duplicate-categories field report: drop
+  // any row that collides with a built-in English display name, so a legacy
+  // dictionary row (e.g. a hand-typed "Doctor") can never re-duplicate the
+  // i18n built-in chips. Genuinely custom categories always pass.
+  const BUILT_IN_NAMES = new Set(['doctor', 'clinic', 'law office', 'law firm', 'barber']);
+  const customChips = customCategories
+    .filter((row) => !BUILT_IN_NAMES.has(row.name.trim().toLowerCase()))
+    .map((row) => ({
+      id: row.id,
+      value: row.name.toUpperCase(),
+      label: row.name,
+    }));
 
   return (
     <div className="flex gap-2 overflow-x-auto pb-3 mb-5 no-scrollbar snap-x snap-mandatory scroll-smooth" style={{ WebkitOverflowScrolling: 'touch' }}>

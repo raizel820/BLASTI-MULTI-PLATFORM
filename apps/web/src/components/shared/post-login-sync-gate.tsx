@@ -123,7 +123,14 @@ export function PostLoginSyncGate() {
     setStatus(null);
     setPhase('preparing');
 
-    if (!isElectron || !user) return;
+    // 0.6.20 fresh-signup fix — a user with NO agency has nothing to import:
+    // the status endpoint cannot resolve a workspace state without an
+    // agencyId (state:'UNKNOWN') and the gate previously rendered a fake
+    // "preparing workspace" screen that ended in the 75s "failed" card.
+    // Skip the gate entirely — the user goes straight to the create-agency
+    // wizard, and the REAL import runs (gate included) once user.agencyId
+    // exists (create-agency-form's setSessionToken adoption).
+    if (!isElectron || !user || !user.agencyId) return;
 
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -220,7 +227,7 @@ export function PostLoginSyncGate() {
       cancelled = true;
       stop();
     };
-  }, [isElectron, user?.id]);
+  }, [isElectron, user?.id, user?.agencyId]);
 
   const handleRetry = useCallback(async () => {
     setRetrying(true);
