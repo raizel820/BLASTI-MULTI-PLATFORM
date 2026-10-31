@@ -9110,6 +9110,38 @@ function createApp() {
     }
   })
 
+  // GET /api/payment/pending — CLOUD-proxy (R-36). The payment-result view's
+  // last-resort checkout recovery: when the localStorage pending checkout is
+  // gone (cleared browser / fresh shell partition), it asks the cloud for the
+  // caller's latest pending Chargily checkout. Desktop deep-link returns (the
+  // blasti:// bounce) land here, so the proxy keeps the loop closed.
+  app.get('/api/payment/pending', authMiddleware, async (c) => {
+    try {
+      let res
+      try {
+        res = await fetch(cloudBaseUrl() + '/api/payment/pending', {
+          headers: {
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (err) {
+        console.warn('[LocalAPI] payment-pending proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Checking this payment requires an internet connection. Please connect and try again.',
+          code: 'PAYMENT_OFFLINE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] payment-pending proxy error:', error)
+      return c.json({ success: false, error: 'Failed to check the pending payment' }, 500)
+    }
+  })
+
   // GET /api/payment/test + /api/payment/test-checkout — CLOUD-proxy (the
   // super admin's gateway probes; the Chargily keys live in cloud-only
   // SystemSetting rows so the test can only run against the cloud API).

@@ -1315,6 +1315,28 @@ function createWindow() {
     shell.openExternal(url);
   });
 
+  // R-36: Windows cold-start deep link — when the OS LAUNCHES the app BY a
+  // blasti:// link (the desktop app was closed when the Chargily payment
+  // bounce fired), the URL arrives in process.argv instead of a
+  // second-instance/open-url event. Forward it to the renderer once the SPA
+  // has actually loaded (one-shot — did-finish-load refires on reloads).
+  let _coldStartDeepLinkSent = false;
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (_coldStartDeepLinkSent) return;
+    try {
+      const deepUrl = (process.argv || []).find(
+        (a) => typeof a === 'string' && a.startsWith(PROTOCOL + '://')
+      );
+      if (deepUrl) {
+        _coldStartDeepLinkSent = true;
+        console.log('[BLASTI Desktop] Cold-start deep link:', deepUrl);
+        mainWindow.webContents.send('deep-link', deepUrl);
+      }
+    } catch (err) {
+      console.warn('[BLASTI Desktop] Cold-start deep-link parse failed:', err && err.message);
+    }
+  });
+
   // ── Window Close → QUIT the app (Task 2-b, sub-task 5) ──────────────────
   // USER BUG FIXED: "desktop app keeps local api running even when the desktop
   // app is closed." The previous behavior hid the window to the tray and kept

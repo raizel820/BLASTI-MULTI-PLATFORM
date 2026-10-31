@@ -23,7 +23,7 @@
  */
 
 import { db } from '@blasti/db'
-import { recordSyncChange, resolveAgencyIdForUser } from './sync-helpers'
+import { recordSyncChange, recordSyncChangeNow, resolveAgencyIdForUser } from './sync-helpers'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -234,6 +234,20 @@ export async function fulfillCheckoutPaid(
         },
       })
 
+      // R-36: explicit sync capture for the settlement itself. The tx-capture
+      // deferral normally records these post-commit, but desktops that pulled
+      // from a build without that mechanism NEVER saw the activation — the
+      // local SQLite kept subscriptionStatus INACTIVE + the transaction PENDING
+      // while the webapp (cloud-direct) showed everything confirmed. Same
+      // explicit-capture convention as the Notification block below.
+      await recordSyncChange({
+        tx,
+        agencyId: transaction.agencyId,
+        model: 'Transaction',
+        recordId: transaction.id,
+        operation: 'update',
+      })
+
       // Subscription activation — only for SUBSCRIPTION-type transactions
       // (HARDWARE transactions just complete; the linked order is approved below).
       if (transaction.type !== 'HARDWARE') {
@@ -275,6 +289,16 @@ export async function fulfillCheckoutPaid(
             subscriptionStartsAt: stillActive ? (current?.subscriptionStartsAt ?? now) : now,
             subscriptionExpiresAt,
           },
+        })
+
+        // R-36: the ACTIVATION must ride the sync feed — this is the exact
+        // change the desktop subscription gate + dashboard banner read.
+        await recordSyncChange({
+          tx,
+          agencyId: transaction.agencyId,
+          model: 'Agency',
+          recordId: transaction.agencyId,
+          operation: 'update',
         })
       }
 
@@ -434,6 +458,14 @@ export async function fulfillCheckoutPaid(
         },
       })
 
+      // R-36: explicit capture (same rationale as the settlement above).
+      await recordSyncChangeNow({
+        agencyId: order.agencyId,
+        model: 'HardwareOrder',
+        recordId: order.id,
+        operation: 'update',
+      })
+
       await db.auditLog.create({
         data: {
           action: settlementAuditAction('HARDWARE_ORDER', 'PAID', source),
@@ -503,12 +535,30 @@ export async function fulfillCheckoutFailed(
           },
         })
 
+        // R-36: explicit sync capture for the FAILED settlement too — the
+        // desktop must flip its pending-payment banner without waiting for
+        // the 6h full reconcile.
+        await recordSyncChange({
+          tx,
+          agencyId: transaction.agencyId,
+          model: 'Transaction',
+          recordId: transaction.id,
+          operation: 'update',
+        })
+
         // Only demote agencies that were flipped to PENDING by the checkout
         // creation — never downgrade an already-ACTIVE subscription.
         if (transaction.agency.subscriptionStatus === 'PENDING') {
           await tx.agency.update({
             where: { id: transaction.agencyId },
             data: { subscriptionStatus: 'INACTIVE' },
+          })
+          await recordSyncChange({
+            tx,
+            agencyId: transaction.agencyId,
+            model: 'Agency',
+            recordId: transaction.agencyId,
+            operation: 'update',
           })
         }
 

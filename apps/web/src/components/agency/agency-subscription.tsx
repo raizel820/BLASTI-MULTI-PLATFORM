@@ -6,6 +6,7 @@ import type { TranslationKeys } from '@/i18n';
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
+import { useRealtime } from '@/hooks/use-realtime';
 import { useUpload } from '@/hooks/use-upload';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -2697,6 +2698,7 @@ function FilterTab({
 export function AgencySubscription() {
   const { user } = useAppStore();
   const { t, lang } = useLanguage();
+  const realtime = useRealtime();
   const [data, setData] = useState<SubscriptionData | null>(null);
   const [loading, setLoading] = useState(true);
   // Task 37-e: normal staff (no purchase/subscription authority) get a 403
@@ -2772,6 +2774,26 @@ export function AgencySubscription() {
     // Chargily availability — module-level 5-min cache, never rejects.
     fetchChargilyEnabled().then((enabled) => setChargilyEnabled(enabled));
   }, []);
+
+  // R-36: live settlement refresh — when a Chargily payment completes while
+  // this view is open (the payer is often sitting RIGHT here on web/mobile,
+  // and the desktop polls through the relay), refetch the subscription +
+  // payment history so the ACTIVE status and the settled row appear without
+  // a manual reload. `payment:failed` refreshes too (the pending row flips).
+  useEffect(() => {
+    const offCompleted = realtime.onPaymentCompleted(() => {
+      fetchSubscription();
+      fetchPaymentHistory();
+    });
+    const offFailed = realtime.onPaymentFailed(() => {
+      fetchSubscription();
+      fetchPaymentHistory();
+    });
+    return () => {
+      offCompleted();
+      offFailed();
+    };
+  }, [realtime]);
 
   const fetchFaqs = async () => {
     try {

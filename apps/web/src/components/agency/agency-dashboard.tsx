@@ -673,6 +673,13 @@ export function AgencyDashboard() {
     // (services, branches, counters, agency settings) updates live too,
     // matching the webapp's cloud-direct behavior. No-op on web/cloud.
     unsubscribers.push(realtime.onSyncDataApplied(handleQueueEvent));
+    // R-36: Chargily settlement — a completed subscription payment flips the
+    // agency's subscriptionStatus, so refetch immediately (the inactive-
+    // subscription banner disappears the moment the payment lands, on web,
+    // mobile AND desktop via the cloud→local relay) instead of waiting for a
+    // poll or a view remount.
+    unsubscribers.push(realtime.onPaymentCompleted(handleQueueEvent));
+    unsubscribers.push(realtime.onPaymentFailed(handleQueueEvent));
 
     return () => {
       unsubscribers.forEach(unsub => unsub());
