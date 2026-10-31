@@ -4419,6 +4419,8 @@ const en: Record<TranslationKeys, string> = {
   publicAppPushMessageRequired: "Write the notification message in at least one language",
   publicAppSendPush: "Send push",
   publicAppPushSent: "Push created — devices receive it on their next check",
+  publicAppPushDeltaReady: "delta updates ready ({size} MB) — devices get the differential update",
+  publicAppPushDeltaUnavailable: "no delta for this route — devices get the full installer",
   publicAppPushFailed: "Failed to create push",
   publicAppPushesTitle: "Push history",
   publicAppPushesDesc: "Real stats: “Delivered” = devices that checked in after the push was created, “Updated” = devices confirmed running the target version.",

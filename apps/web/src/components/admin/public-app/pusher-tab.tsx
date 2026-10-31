@@ -170,7 +170,21 @@ export function PusherTab() {
       });
       const data = await res.json().catch(() => null);
       if (res.ok && (data?.success || res.status === 201)) {
-        toast.success(t('publicAppPushSent'));
+        // DELTA DELIVERY REPORT (0.6.33): the push response carries what
+        // /check will offer devices — differential hops when generation
+        // succeeded, nothing when it did not (devices then fall back to the
+        // FULL installer). Tell the admin WHICH of the two will happen.
+        const gen = data?.deltaGeneration;
+        const hops = Array.isArray(gen) ? gen.filter((r: { ok?: boolean }) => r?.ok) : [];
+        if (hops.length > 0) {
+          const totalMb = (hops.reduce((s: number, r: { size?: number }) => s + (r.size || 0), 0) / 1048576).toFixed(1);
+          toast.success(`${t('publicAppPushSent')} — ${t('publicAppPushDeltaReady', { size: totalMb })}`);
+        } else {
+          const reason = Array.isArray(gen) && gen.length > 0 && gen[0]?.reason ? gen[0].reason : (gen as { error?: string } | null)?.error || '';
+          toast.success(`${t('publicAppPushSent')} — ${t('publicAppPushDeltaUnavailable')}`, {
+            description: reason || undefined,
+          });
+        }
         setNotes(EMPTY_NOTES);
         setPushType('optional');
         await fetchAll(true);

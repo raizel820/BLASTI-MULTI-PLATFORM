@@ -4419,6 +4419,8 @@ const ar = {
   publicAppPushMessageRequired: "اكتب رسالة الإشعار بلغة واحدة على الأقل",
   publicAppSendPush: "إرسال الدفع",
   publicAppPushSent: "تم إنشاء الدفع — سيصل للأجهزة عند أول فحص",
+  publicAppPushDeltaReady: "تحديثات الفروق جاهزة ({size} م.ب) — ستحصل الأجهزة على التحديث التفاضلي",
+  publicAppPushDeltaUnavailable: "لا يوجد تحديث تفاضلي لهذا الإصدار — ستحصل الأجهزة على المثبّت الكامل",
   publicAppPushFailed: "فشل إنشاء الدفع",
   publicAppPushesTitle: "سجل الدفعات",
   publicAppPushesDesc: "إحصائيات حقيقية: «وصل» = الأجهزة التي تفقدت بعد إنشاء الدفع، «حدّث» = الأجهزة المؤكدة على الإصدار الهدف.",

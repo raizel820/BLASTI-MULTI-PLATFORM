@@ -5,6 +5,7 @@ import { requireAdmin, authErrorResponse } from '../lib/auth'
 // r20-3(a): rank "latest published" by semantic name when versionCode is 0
 // (CI rows) so an old admin row (code 5000) can't shadow a newer CI build.
 import { pickLatestAppVersion } from '../lib/app-version-rank'
+import { generateDeltasForVersion } from '../lib/app-version-deltas'
 import { z } from 'zod'
 
 // ─── App Install Tracking & Update Pusher (Public App Settings rebuild) ─────
@@ -534,11 +535,33 @@ app.post('/pushes', async (c) => {
     // downloadable installer, so a DRAFT target is published here. This does
     // NOT shift the platform's active download (public/active picks the
     // HIGHEST published versionCode — an older pushed draft stays passive).
-    if (!appVersion.isPublished) {
+    //
+    // DELTA DELIVERY FIX (field report: "pushed updates arrive as the full
+    // 155 MB installer instead of the 16.5 MB delta"): publishing a draft
+    // here used to be a bare isPublished flip with NO delta generation —
+    // /check then answered delta:null and EVERY device fell back to the
+    // full installer. Generating the hop patches right after the publish
+    // makes pushed updates differential exactly like an activation does.
+    // Best-effort + reported in the response: a generation failure must
+    // never block the push (devices just get the full installer — the
+    // documented fallback), but the admin sees WHY.
+    const publishedNow = !appVersion.isPublished
+    if (publishedNow) {
       await db.appVersion.update({
         where: { id: appVersion.id },
         data: { isPublished: true, publishedAt: appVersion.publishedAt ?? new Date() },
       })
+    }
+
+    // Build/refresh the differential patches for the (now published) target
+    // against every plausible predecessor. Runs for ALREADY-published targets
+    // too — a re-push of the same version is the cheapest moment to backfill
+    // hops that a previous no-delta publish skipped.
+    let deltaGeneration: Array<{ from: string; to: string; size: number; ok: boolean; reason?: string }> | { error: string } | null = null
+    try {
+      deltaGeneration = await generateDeltasForVersion(appVersion.id)
+    } catch (err) {
+      deltaGeneration = { error: String((err as Error)?.message || err).slice(0, 200) }
     }
 
     const push = await db.updatePush.create({
@@ -554,7 +577,16 @@ app.post('/pushes', async (c) => {
       include: { appVersion: true },
     })
 
-    return c.json({ success: true, push }, 201)
+    return c.json({
+      success: true,
+      push,
+      // Delta delivery report (0.6.33): what /check will offer devices that
+      // are still on an older release. An all-ok array → differential hops
+      // are live; an empty array or per-row reason → devices fall back to
+      // the FULL installer of this version (the documented fallback).
+      deltaGeneration,
+      publishedDraft: publishedNow,
+    }, 201)
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

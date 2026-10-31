@@ -4421,6 +4421,8 @@ const fr: Record<TranslationKeys, string> = {
   publicAppPushMessageRequired: "Rédigez le message dans au moins une langue",
   publicAppSendPush: "Envoyer la poussée",
   publicAppPushSent: "Poussée créée — les appareils la reçoivent à leur prochain contrôle",
+  publicAppPushDeltaReady: "mises à jour delta prêtes ({size} Mo) — les appareils reçoivent la mise à jour différentielle",
+  publicAppPushDeltaUnavailable: "pas de delta pour cette version — les appareils reçoivent l'installateur complet",
   publicAppPushFailed: "Échec de la création de la poussée",
   publicAppPushesTitle: "Historique des poussées",
   publicAppPushesDesc: "Statistiques réelles : « Livrées » = appareils ayant vérifié après la création de la poussée, « Mises à jour » = appareils confirmés sur la version cible.",

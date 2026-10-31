@@ -1540,9 +1540,21 @@ app.post('/activate-file', async (c) => {
       })
     })
 
+    // DELTA DELIVERY FIX: activating from the Storage Manager used to skip
+    // hop generation — /check then offered delta:null and devices fell back
+    // to the full installer. Mirror POST /:id/activate: build the differential
+    // patches right after publishing (best-effort — a failure must never
+    // block activation, the full-installer fallback stays the safety net).
+    let deltaGeneration: unknown = null
+    try {
+      deltaGeneration = await generateDeltasForVersion(record.id)
+    } catch (err) {
+      deltaGeneration = { error: String((err as Error).message || err).slice(0, 200) }
+    }
+
     invalidateResponseCacheTag('app-versions')
 
-    return c.json({ success: true, activatedFile: rel, version: activated })
+    return c.json({ success: true, activatedFile: rel, version: activated, deltaGeneration })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -1601,6 +1613,16 @@ app.patch('/:id', async (c) => {
       where: { id: c.req.param('id') },
       data: { ...data, ...publishData },
     })
+
+    // DELTA DELIVERY FIX: publishing through the EDIT form used to skip hop
+    // generation (only /activate and /release-refs had it). When this update
+    // flips isPublished false→true, build the differential patches exactly
+    // like an activation — best-effort, the full-installer fallback remains.
+    if (data.isPublished === true && !existing.isPublished) {
+      try {
+        await generateDeltasForVersion(appVersion.id)
+      } catch { /* generation must never block an edit */ }
+    }
 
     // Performance Round — publish/unpublish edits hit the public downloads.
     invalidateResponseCacheTag('app-versions')
