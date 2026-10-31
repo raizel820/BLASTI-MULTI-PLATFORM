@@ -66,6 +66,11 @@ export interface InstallerDiskFile {
     fileName: string | null;
     fileSize: number | null;
   } | null;
+  /** DELTA-SYSTEM artifact (asar/outref diff reference or hop patch) — never an installer. */
+  internal?: boolean;
+  internalKind?: 'asar-ref' | 'outref-ref' | 'delta-patch' | 'delta-artifact' | string | null;
+  /** For internal files: the owning version (refs) or the hop range (patches). */
+  owner?: { platform: string; version: string; isPublished: boolean | null } | null;
 }
 
 export interface InstallTotals {

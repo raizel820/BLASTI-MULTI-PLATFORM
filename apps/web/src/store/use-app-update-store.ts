@@ -217,7 +217,7 @@ interface CapacitorGlobal {
      * for install. Returns { ok, apkPath? } or { ok:false, error }.
      */
     installDeltaUpdate?: (opts: {
-      deltas: Array<{ url: string; sha256: string; fromVersion: string; toVersion: string }>;
+      deltas: Array<{ url: string; sha256: string; fromVersion: string; toVersion: string; fromArtifactHash?: string }>;
       finalSha256: string;
       fromVersion: string;
       toVersion: string;
@@ -603,7 +603,7 @@ function createAppUpdateStore() {
           // up WITHOUT a DownloadManager id).
           if (info.delta && info.delta.hops.length > 0 && plugin()?.installDeltaUpdate) {
             const result = await plugin()?.installDeltaUpdate({
-              deltas: info.delta.hops.map((h) => ({ url: buildCloudUrl(h.url), sha256: h.sha256, fromVersion: h.fromVersion, toVersion: h.toVersion })),
+              deltas: info.delta.hops.map((h) => ({ url: buildCloudUrl(h.url), sha256: h.sha256, fromVersion: h.fromVersion, toVersion: h.toVersion, fromArtifactHash: h.fromArtifactHash || '' })),
               finalSha256: info.delta.targetApkSha256 || '',
               fromVersion: info.currentVersion,
               toVersion: info.version,

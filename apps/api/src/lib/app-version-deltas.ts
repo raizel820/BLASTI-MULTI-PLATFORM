@@ -47,7 +47,7 @@ function deltaStorageKey(platform: string, from: string, to: string): string {
   return `${group}/delta-${platform}-${from}-to-${to}-${Date.now()}.patch`
 }
 
-interface VersionRowLike {
+export interface VersionRowLike {
   id: string
   platform: string
   version: string
@@ -66,6 +66,24 @@ function resolveStored(key: string | null | undefined): string | null {
   const full = path.resolve(root, key)
   if (!full.startsWith(root + path.sep)) return null
   try { return fs.statSync(full).isFile() ? full : null } catch { return null }
+}
+
+/**
+ * Regenerating a hop writes a NEW timestamped patch file; without this the
+ * replaced one would orphan on disk forever (and resurface as "unknown
+ * platform" clutter in the storage inventory).
+ */
+async function unlinkReplacedPatch(platform: string, fromVersion: string, toVersion: string, newKey: string): Promise<void> {
+  try {
+    const prev = await db.appVersionDelta.findUnique({
+      where: { platform_fromVersion_toVersion: { platform, fromVersion, toVersion } },
+      select: { fileStorageKey: true },
+    })
+    if (prev?.fileStorageKey && prev.fileStorageKey !== newKey) {
+      const old = resolveStored(prev.fileStorageKey)
+      if (old) { try { fs.unlinkSync(old) } catch { /* best effort */ } }
+    }
+  } catch { /* cosmetic only — never block generation */ }
 }
 
 /** Build + persist the delta row for (prev → cur). Returns null when impossible. */
@@ -116,6 +134,7 @@ export async function generateDeltaBetween(
       fs.mkdirSync(path.dirname(filePath), { recursive: true })
       fs.writeFileSync(filePath, patch)
 
+      await unlinkReplacedPatch(platform, prev.version, cur.version, key)
       const row = await db.appVersionDelta.upsert({
         where: { platform_fromVersion_toVersion: { platform, fromVersion: prev.version, toVersion: cur.version } },
         create: {
@@ -165,6 +184,7 @@ export async function generateDeltaBetween(
       fs.mkdirSync(path.dirname(filePath), { recursive: true })
       fs.writeFileSync(filePath, delta.delta)
 
+      await unlinkReplacedPatch(platform, prev.version, cur.version, key)
       const row = await db.appVersionDelta.upsert({
         where: { platform_fromVersion_toVersion: { platform, fromVersion: prev.version, toVersion: cur.version } },
         create: {
@@ -228,6 +248,57 @@ export async function generateDeltasForVersion(curId: string): Promise<Array<{ f
       : { from: prev.version, to: cur.version, size: 0, ok: false, reason: r.reason })
   }
   return results
+}
+
+/**
+ * Delta Update Manager (0.6.33) — does a stored artifact key resolve to a
+ * REAL file on disk right now? The manager UI shows artifact availability
+ * badges from this (a DB key pointing at a deleted file must not count).
+ */
+export function storedArtifactExists(key: string | null | undefined): boolean {
+  return !!resolveStored(key)
+}
+
+/**
+ * Delta Update Manager (0.6.33) — DRY-RUN eligibility for a (prev → cur) hop.
+ * Mirrors the guards inside generateDeltaBetween WITHOUT generating anything:
+ *   desktop → both ends need asar + outref refs ON DISK + identical
+ *             runtimeKey AND nativeFingerprint
+ *   android → both ends need the APK file ON DISK + a recorded hash
+ * The manager UI calls this per version to render WHY a hop is possible or
+ * blocked BEFORE the admin commits to generation.
+ */
+export async function evaluateDeltaEligibility(
+  prev: VersionRowLike,
+  cur: VersionRowLike,
+): Promise<{ ok: boolean; reason?: string }> {
+  const platform = cur.platform
+  if (platform !== prev.platform) return { ok: false, reason: 'platform-mismatch' }
+  // A hop only makes sense FORWARD in semver terms (never downgrade).
+  if (compareVersionStrings(prev.version, cur.version) >= 0) return { ok: false, reason: 'not-forward' }
+
+  if (DESKTOP_PLATFORMS.has(platform)) {
+    if (!prev.asarStorageKey || !cur.asarStorageKey) return { ok: false, reason: 'missing-asar-ref' }
+    if (!prev.outrefStorageKey || !cur.outrefStorageKey) return { ok: false, reason: 'missing-outref-ref' }
+    if ((cur.runtimeKey || '') !== (prev.runtimeKey || '')) return { ok: false, reason: 'runtime-key-changed' }
+    if ((cur.nativeFingerprint || '') !== (prev.nativeFingerprint || '')) return { ok: false, reason: 'native-bits-changed' }
+    if (!resolveStored(prev.asarStorageKey) || !resolveStored(cur.asarStorageKey)
+      || !resolveStored(prev.outrefStorageKey) || !resolveStored(cur.outrefStorageKey)) {
+      return { ok: false, reason: 'ref-file-missing' }
+    }
+    return { ok: true }
+  }
+
+  if (APK_PLATFORMS.has(platform)) {
+    if (!prev.fileStorageKey || !cur.fileStorageKey) return { ok: false, reason: 'missing-apk' }
+    if (!prev.fileHash || !cur.fileHash) return { ok: false, reason: 'missing-apk-hash' }
+    if (!resolveStored(prev.fileStorageKey) || !resolveStored(cur.fileStorageKey)) {
+      return { ok: false, reason: 'apk-file-missing' }
+    }
+    return { ok: true }
+  }
+
+  return { ok: false, reason: 'platform-unsupported' }
 }
 
 export function compareVersionStrings(a: string, b: string): number {

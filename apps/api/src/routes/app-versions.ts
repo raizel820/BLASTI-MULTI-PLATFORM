@@ -17,9 +17,11 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 // permanently shadowed newer CI builds and devices were told "up to date".
 import { pickLatestAppVersion } from '../lib/app-version-rank'
 // Delta Updates (0.6.30) — differential patch graph + generation
-import { computeDeltaChain, generateDeltasForVersion } from '../lib/app-version-deltas'
+import { computeDeltaChain, generateDeltasForVersion, generateDeltaBetween, evaluateDeltaEligibility, storedArtifactExists, compareVersionStrings, type VersionRowLike } from '../lib/app-version-deltas'
 // API Compatibility Map (0.6.31) — app↔server capability matrix
 import { evaluateCompatibility, seedDefaultGates, CURRENT_SERVER_API_LEVEL, MIN_SUPPORTED_API_LEVEL } from '../lib/api-compat'
+// R-31 (0.6.32) — one-press installer regeneration via GitHub Actions workflow_dispatch
+import { getConfig, setConfig } from '../lib/config-manager'
 
 const app = new Hono()
 
@@ -382,6 +384,137 @@ app.delete('/compat/gates/:id', async (c) => {
   }
 })
 
+// ─── Installer regeneration via GitHub Actions (R-31, 0.6.32) ────────────────
+//
+// Public Apps Settings gains a one-press button that dispatches the
+// publish-installers workflow on GitHub (workflow_dispatch), so installers can
+// be regenerated without opening GitHub at all. Configuration lives in
+// SystemSetting through the config-manager (`github.*` keys); the PAT is
+// stored ENCRYPTED and never leaves the server — the status endpoint only
+// reports whether one is configured.
+const GITHUB_PAT_KEY = 'github.pat'
+const GITHUB_REPO_KEY = 'github.repo'
+const GITHUB_WORKFLOW_KEY = 'github.installers_workflow'
+const GITHUB_REF_KEY = 'github.installers_ref'
+const GITHUB_DEFAULT_REPO = 'raizel820/BLASTI-MULTI-PLATFORM'
+const GITHUB_DEFAULT_WORKFLOW = 'publish-installers.yml'
+const GITHUB_DEFAULT_REF = 'master'
+const GITHUB_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
+
+async function readGithubRegenConfig() {
+  const [pat, repo, workflow, ref] = await Promise.all([
+    getConfig(GITHUB_PAT_KEY),
+    getConfig(GITHUB_REPO_KEY),
+    getConfig(GITHUB_WORKFLOW_KEY),
+    getConfig(GITHUB_REF_KEY),
+  ])
+  return {
+    pat,
+    repo: repo || GITHUB_DEFAULT_REPO,
+    workflow: workflow || GITHUB_DEFAULT_WORKFLOW,
+    ref: ref || GITHUB_DEFAULT_REF,
+  }
+}
+
+// GET /app-versions/regenerate-installers/status — admin-only, token never leaves
+app.get('/regenerate-installers/status', async (c) => {
+  try {
+    await requireAdmin(c)
+    const { pat, repo, workflow, ref } = await readGithubRegenConfig()
+    return c.json({
+      success: true,
+      data: {
+        configured: !!pat && pat.trim().length >= 8,
+        repo,
+        workflow,
+        ref,
+      },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// POST /app-versions/regenerate-installers/config — admin-only upsert of the
+// GitHub dispatch settings (repo / workflow / ref / PAT). Empty fields are
+// left untouched so the dialog can update one value at a time.
+app.post('/regenerate-installers/config', async (c) => {
+  try {
+    await requireAdmin(c)
+    const body = await c.req.json().catch(() => ({} as Record<string, unknown>))
+    const repo = typeof body?.repo === 'string' && body.repo.trim() ? body.repo.trim() : null
+    const workflow = typeof body?.workflow === 'string' && body.workflow.trim() ? body.workflow.trim() : null
+    const ref = typeof body?.ref === 'string' && body.ref.trim() ? body.ref.trim() : null
+    const token = typeof body?.token === 'string' && body.token.trim() ? body.token.trim() : null
+    if (repo && !GITHUB_REPO_RE.test(repo)) {
+      return c.json({ success: false, error: 'github-repo-invalid' }, 400)
+    }
+    if (token) await setConfig(GITHUB_PAT_KEY, token, { encrypted: true, category: 'github', description: 'GitHub PAT for workflow_dispatch (installer regeneration)' })
+    if (repo) await setConfig(GITHUB_REPO_KEY, repo, { category: 'github', description: 'GitHub repository (owner/name)' })
+    if (workflow) await setConfig(GITHUB_WORKFLOW_KEY, workflow, { category: 'github', description: 'Installer workflow file name' })
+    if (ref) await setConfig(GITHUB_REF_KEY, ref, { category: 'github', description: 'Branch/tag the dispatch runs on' })
+    return c.json({ success: true })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// POST /app-versions/regenerate-installers — admin-only dispatch. Mirrors the
+// publish-installers.yml workflow_dispatch contract:
+//   inputs.targets: all | desktop-only | mobile-only (default all)
+//   inputs.trigger_vps_rebuild: boolean (default false)
+app.post('/regenerate-installers', async (c) => {
+  try {
+    await requireAdmin(c)
+    const body = await c.req.json().catch(() => ({} as Record<string, unknown>))
+    const targets = body?.targets === 'desktop-only' || body?.targets === 'mobile-only' ? (body.targets as string) : 'all'
+    const triggerVpsRebuild = body?.triggerVpsRebuild === true
+    const { pat, repo, workflow, ref } = await readGithubRegenConfig()
+    if (!pat || pat.trim().length < 8) {
+      return c.json({ success: false, error: 'github-token-missing' }, 400)
+    }
+    if (!GITHUB_REPO_RE.test(repo)) {
+      return c.json({ success: false, error: 'github-repo-invalid' }, 400)
+    }
+    const ghRes = await fetch(
+      `https://api.github.com/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${pat.trim()}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'BLASTI-API (installer-regeneration)',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ref, inputs: { targets, trigger_vps_rebuild: triggerVpsRebuild } }),
+      },
+    )
+    if (ghRes.status === 204) {
+      return c.json({ success: true, dispatched: true, repo, workflow, ref, targets, triggerVpsRebuild })
+    }
+    let detail = `github http ${ghRes.status}`
+    try {
+      const ghJson = (await ghRes.json()) as { message?: string }
+      if (ghJson?.message) detail = ghJson.message
+    } catch { /* non-JSON body — keep the status line */ }
+    const code =
+      ghRes.status === 401 || ghRes.status === 403
+        ? 'github-auth-failed'
+        : ghRes.status === 404
+          ? 'github-not-found'
+          : ghRes.status === 422
+            ? 'github-ref-invalid'
+            : 'github-dispatch-failed'
+    return c.json({ success: false, error: code, detail }, 502)
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
 // ─── POST /app-versions — Create a new app version ──────────────────────────
 
 app.post('/', async (c) => {
@@ -621,6 +754,206 @@ app.post('/:id/regenerate-deltas', async (c) => {
     if (!appVersion) return c.json({ success: false, error: 'Version not found' }, 404)
     const results = await generateDeltasForVersion(appVersion.id)
     return c.json({ success: true, results })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── GET /app-versions/delta-manager — per-platform delta coverage map ──────
+// DELTA UPDATE MANAGER (0.6.33): ONE admin call answering "for EVERY past
+// version of this platform — can it delta-update to the latest published
+// release TODAY, and if not, why not?" The Public Apps Settings manager
+// renders it as a checklist with a version selector for on-demand hops.
+// Per row:
+//   artifacts → availability of the diff-base files (installer APK for
+//               android; asar + outref refs for desktop), checked in the DB
+//               AND on disk (a key pointing at a deleted file never counts),
+//   delta     → the EXISTING direct hop to the latest, if already generated,
+//   chain     → the shortest hash-verified hop chain /check would serve the
+//               client today (BFS over the AppVersionDelta graph),
+//   eligible  → dry-run of the generation guards + the block reason.
+// MUST stay registered BEFORE app.get('/:id') — Hono matches in order.
+app.get('/delta-manager', async (c) => {
+  try {
+    await requireAdmin(c)
+    const platform = c.req.query('platform') || ''
+    if (!platform) return c.json({ success: false, error: 'platform query param is required' }, 400)
+
+    const versions = await db.appVersion.findMany({
+      where: { platform },
+      orderBy: { createdAt: 'desc' },
+    })
+    const latest = pickLatestAppVersion(versions.filter((v) => v.isPublished))
+    const hops = await db.appVersionDelta.findMany({
+      where: { platform },
+      orderBy: { createdAt: 'desc' },
+    })
+
+    // Devices currently reporting each version — the "is this hop worth it"
+    // column (AppDevice.appVersion is the version string devices self-report).
+    const deviceGroups = await db.appDevice.groupBy({
+      by: ['appVersion'],
+      where: { platform },
+      _count: { _all: true },
+    })
+    const devicesByVersion = new Map<string, number>()
+    for (const g of deviceGroups) {
+      if (g.appVersion) devicesByVersion.set(g.appVersion, g._count._all)
+    }
+
+    interface ManagerRow {
+      id: string
+      version: string
+      isPublished: boolean
+      createdAt: string
+      fileName: string | null
+      fileSize: number | null
+      devices: number
+      isTarget: boolean
+      artifacts: { apk: boolean; asar: boolean; outref: boolean }
+      delta: { id: string; fileName: string; fileSize: number; createdAt: string } | null
+      chain: { hopCount: number; totalSize: number; via: string[] } | null
+      eligible: boolean
+      reason: string | null
+    }
+
+    const rows: ManagerRow[] = []
+    for (const v of versions) {
+      const isTarget = !!latest && latest.id === v.id
+      const forward = !!latest && compareVersionStrings(v.version, latest.version) < 0
+      const direct = forward && latest
+        ? hops.find((h) => h.fromVersion === v.version && h.toVersion === latest.version) ?? null
+        : null
+      let chain: ManagerRow['chain'] = null
+      if (forward && latest) {
+        try {
+          const resolved = await computeDeltaChain(platform, v.version, latest.id)
+          if (resolved && resolved.hops.length > 0) {
+            chain = {
+              hopCount: resolved.hops.length,
+              totalSize: resolved.hops.reduce((s, h) => s + (h.size || 0), 0),
+              via: resolved.hops.map((h) => h.toVersion),
+            }
+          }
+        } catch { /* chain resolution must never break the listing */ }
+      }
+      let eligible = false
+      let reason: string | null = null
+      if (!latest) reason = 'no-published-target'
+      else if (isTarget) reason = 'is-latest'
+      else {
+        const elig = await evaluateDeltaEligibility(v as VersionRowLike, latest as VersionRowLike)
+        eligible = elig.ok
+        reason = elig.reason ?? null
+      }
+      rows.push({
+        id: v.id,
+        version: v.version,
+        isPublished: v.isPublished,
+        createdAt: v.createdAt.toISOString(),
+        fileName: v.fileName,
+        fileSize: v.fileSize,
+        devices: devicesByVersion.get(v.version) ?? 0,
+        isTarget,
+        artifacts: {
+          apk: storedArtifactExists(v.fileStorageKey),
+          asar: storedArtifactExists(v.asarStorageKey),
+          outref: storedArtifactExists(v.outrefStorageKey),
+        },
+        delta: direct
+          ? {
+              id: direct.id,
+              fileName: direct.fileName,
+              fileSize: direct.fileSize,
+              createdAt: direct.createdAt.toISOString(),
+            }
+          : null,
+        chain,
+        eligible,
+        reason,
+      })
+    }
+
+    return c.json({
+      success: true,
+      platform,
+      latest: latest
+        ? { id: latest.id, version: latest.version, fileName: latest.fileName, fileSize: latest.fileSize, fileHash: latest.fileHash }
+        : null,
+      totalHops: hops.length,
+      versions: rows,
+    })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── POST /app-versions/delta-manager/generate — on-demand hop build ────────
+// DELTA UPDATE MANAGER (0.6.33): generate differential patches from the
+// SELECTED past versions straight to the latest release, bypassing the
+// "10 newest predecessors" window of generateDeltasForVersion. Body:
+//   { platform, fromVersionIds: string[], targetVersionId?: string }
+// targetVersionId defaults to the latest PUBLISHED version (the same
+// pickLatestAppVersion ranking /check uses). Every pair is dry-run evaluated
+// first — blocked pairs are reported per-row with their reason instead of
+// failing the whole batch. generateDeltaBetween self-verifies each patch
+// server-side (rebuild → sha256) before persisting it.
+app.post('/delta-manager/generate', async (c) => {
+  try {
+    await requireAdmin(c)
+    const body = await c.req.json().catch(() => ({} as Record<string, unknown>))
+    const platform = String(body.platform ?? '')
+    const rawIds = Array.isArray(body.fromVersionIds) ? body.fromVersionIds : []
+    const fromVersionIds = rawIds.map((x: unknown) => String(x)).filter(Boolean).slice(0, 50)
+    const targetVersionId = String(body.targetVersionId ?? '')
+    if (!platform) return c.json({ success: false, error: 'platform is required' }, 400)
+    if (fromVersionIds.length === 0) return c.json({ success: false, error: 'fromVersionIds is required' }, 400)
+
+    let target: Awaited<ReturnType<typeof db.appVersion.findUnique>> = null
+    if (targetVersionId) {
+      target = await db.appVersion.findUnique({ where: { id: targetVersionId } })
+      if (!target || target.platform !== platform) {
+        return c.json({ success: false, error: 'Target version not found for this platform' }, 404)
+      }
+    } else {
+      const published = await db.appVersion.findMany({
+        where: { platform, isPublished: true },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      })
+      target = pickLatestAppVersion(published) ?? null
+    }
+    if (!target) {
+      return c.json({ success: false, error: 'No published target version for this platform' }, 404)
+    }
+
+    const froms = await db.appVersion.findMany({ where: { id: { in: fromVersionIds }, platform } })
+    const results: Array<{ from: string; to: string; ok: boolean; size?: number; reason?: string }> = []
+    for (const from of froms) {
+      // Forward-only, artifact-anchored guard — a stale UI selection (target
+      // changed mid-edit, file deleted, electron upgraded) reports its reason
+      // instead of aborting the remaining rows.
+      const elig = await evaluateDeltaEligibility(from as VersionRowLike, target as VersionRowLike)
+      if (!elig.ok) {
+        results.push({ from: from.version, to: target.version, ok: false, reason: elig.reason ?? 'blocked' })
+        continue
+      }
+      const r = await generateDeltaBetween(from as VersionRowLike, target as VersionRowLike)
+      results.push(
+        r.ok
+          ? { from: from.version, to: target.version, ok: true, size: r.size }
+          : { from: from.version, to: target.version, ok: false, reason: r.reason },
+      )
+    }
+
+    invalidateResponseCacheTag('app-versions')
+    return c.json({
+      success: true,
+      target: { id: target.id, version: target.version },
+      results,
+    })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -984,13 +1317,38 @@ app.get('/storage-files', async (c) => {
     // byte size (same-name/same-size rebuilds with a different push time must
     // never display as active — user requirement).
     const keys = diskFiles.map((f) => f.storageKey)
+    const keySet = new Set(keys)
+    // Installer rows match by fileStorageKey; DELTA-REFERENCE artifacts
+    // (asar/outref, 0.6.30) match by asarStorageKey/outrefStorageKey — they
+    // are internal diff bases users NEVER download, so they must be tagged
+    // and kept out of the installer groups (they used to fall into the
+    // "unknown platform" bucket and look like mystery installers).
     const rows = keys.length
       ? await db.appVersion.findMany({
-          where: { fileStorageKey: { in: keys } },
-          select: { id: true, platform: true, version: true, isPublished: true, fileName: true, fileStorageKey: true, fileSize: true },
+          where: {
+            OR: [
+              { fileStorageKey: { in: keys } },
+              { asarStorageKey: { in: keys } },
+              { outrefStorageKey: { in: keys } },
+            ],
+          },
+          select: { id: true, platform: true, version: true, isPublished: true, fileName: true, fileStorageKey: true, fileSize: true, asarStorageKey: true, outrefStorageKey: true },
         })
       : []
-    const byKey = new Map(rows.map((r) => [r.fileStorageKey as string, r]))
+    const byKey = new Map(rows.filter((r) => r.fileStorageKey && keySet.has(r.fileStorageKey)).map((r) => [r.fileStorageKey as string, r]))
+    const byAsarKey = new Map(rows.filter((r) => r.asarStorageKey && keySet.has(r.asarStorageKey)).map((r) => [r.asarStorageKey as string, r]))
+    const byOutrefKey = new Map(rows.filter((r) => r.outrefStorageKey && keySet.has(r.outrefStorageKey)).map((r) => [r.outrefStorageKey as string, r]))
+
+    // Delta hop patches (desktop/delta-*.patch, mobile/delta-*.patch) are
+    // owned by AppVersionDelta rows; patches whose owner version was deleted
+    // are recognized by the storage-name convention alone.
+    const deltaRows = keys.length
+      ? await db.appVersionDelta.findMany({
+          where: { fileStorageKey: { in: keys } },
+          select: { id: true, platform: true, fromVersion: true, toVersion: true, fileStorageKey: true, fileSize: true, kind: true },
+        })
+      : []
+    const byDeltaKey = new Map(deltaRows.filter((r) => r.fileStorageKey && keySet.has(r.fileStorageKey)).map((r) => [r.fileStorageKey as string, r]))
 
     // Parse the CI/upload naming convention → platform + version.
     const PLATFORMS_DESC = ['android-debug', 'android', 'ios', 'electron', 'windows', 'mac', 'linux']
@@ -1028,6 +1386,27 @@ app.get('/storage-files', async (c) => {
         const parsed = parseKey(f.storageKey)
         const platform =
           parsed?.platform ?? row?.platform ?? classifyByExtension(f.name) ?? null
+
+        // Delta-system internals: asar/outref diff references + hop patches.
+        // Prefer the DB owner, fall back to the storage-name convention so
+        // ORPHANED artifacts (owner version deleted) are tagged too.
+        const asarOwner = byAsarKey.get(f.storageKey) ?? null
+        const outrefOwner = byOutrefKey.get(f.storageKey) ?? null
+        const deltaOwner = byDeltaKey.get(f.storageKey) ?? null
+        const refOwner = asarOwner ?? outrefOwner
+        const internalKind: string | null =
+          asarOwner ? 'asar-ref'
+          : outrefOwner ? 'outref-ref'
+          : deltaOwner ? 'delta-patch'
+          : /^(asar|outref)-[a-z-]+-\d+\.\d+\.\d+-\d+-/.test(f.name) || /^delta-[a-z-]+-.+\.patch$/.test(f.name)
+            ? 'delta-artifact'
+            : null
+        const owner = internalKind === 'delta-patch' && deltaOwner
+          ? { platform: deltaOwner.platform, version: `${deltaOwner.fromVersion} → ${deltaOwner.toVersion}`, isPublished: null as boolean | null }
+          : refOwner
+            ? { platform: refOwner.platform, version: refOwner.version, isPublished: refOwner.isPublished as boolean | null }
+            : null
+
         return {
           ...f,
           parsed: parsed ?? (platform ? { platform, version: row?.version ?? '' } : null),
@@ -1035,6 +1414,9 @@ app.get('/storage-files', async (c) => {
           version: row
             ? { id: row.id, platform: row.platform, version: row.version, isPublished: row.isPublished, fileName: row.fileName, fileSize: row.fileSize }
             : null,
+          internal: !!internalKind,
+          internalKind,
+          owner,
         }
       })
       .sort((a, b) => b.mtimeMs - a.mtimeMs)
@@ -1248,6 +1630,26 @@ app.delete('/:id', async (c) => {
       const filePath = resolveBinaryPath(existing.fileStorageKey)
       if (filePath && fs.existsSync(filePath)) {
         fs.unlinkSync(filePath)
+      }
+    }
+
+    // Delta-system artifacts of this version: the DB rows cascade away, but
+    // their FILES would orphan on disk forever (reappearing as "unknown
+    // platform" clutter) — unlink the hop patches owned by this version plus
+    // its asar/outref diff references.
+    const ownedDeltas = await db.appVersionDelta.findMany({
+      where: { appVersionId: existing.id },
+      select: { fileStorageKey: true },
+    })
+    for (const key of [
+      ...ownedDeltas.map((d) => d.fileStorageKey),
+      existing.asarStorageKey,
+      existing.outrefStorageKey,
+    ]) {
+      if (!key) continue
+      const p = resolveBinaryPath(key)
+      if (p && fs.existsSync(p)) {
+        try { fs.unlinkSync(p) } catch { /* best effort */ }
       }
     }
 

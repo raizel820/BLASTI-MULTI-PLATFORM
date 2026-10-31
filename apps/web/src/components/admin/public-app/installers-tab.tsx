@@ -40,6 +40,7 @@ import {
   FileArchive,
   AlertTriangle,
   Inbox,
+  Github,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -91,6 +92,7 @@ import {
   type InstallerDiskFile,
 } from './shared';
 import { NotesInput, type NotesValue } from './notes-input';
+import { DeltaManagerCard } from './delta-manager-card';
 
 const AUTO_REFRESH_MS = 30_000;
 
@@ -133,6 +135,19 @@ export function InstallersTab() {
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // ── Regenerate-installers (GitHub Actions dispatch) state ──
+  const [regenOpen, setRegenOpen] = useState(false);
+  const [regenBusy, setRegenBusy] = useState(false);
+  const [regenSaving, setRegenSaving] = useState(false);
+  const [regenStatusLoading, setRegenStatusLoading] = useState(false);
+  const [regenConfigured, setRegenConfigured] = useState(false);
+  const [regenRepo, setRegenRepo] = useState('raizel820/BLASTI-MULTI-PLATFORM');
+  const [regenWorkflow, setRegenWorkflow] = useState('publish-installers.yml');
+  const [regenRef, setRegenRef] = useState('master');
+  const [regenToken, setRegenToken] = useState('');
+  const [regenTargets, setRegenTargets] = useState<'all' | 'desktop-only' | 'mobile-only'>('all');
+  const [regenVps, setRegenVps] = useState(false);
+
   // ── Data ──
   const fetchFiles = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true);
@@ -161,21 +176,42 @@ export function InstallersTab() {
   }, [fetchFiles]);
 
   // ── Grouping: one group per platform present, rows sorted push-time desc ──
-  const groups = useMemo(() => {
+  // Internal delta-system artifacts (asar/outref diff references + hop
+  // patches) are NOT installers — they are excluded from the platform groups
+  // (they used to surface as an "unknown platform" installer group) and get
+  // their own section below.
+  const { groups, deltaFiles } = useMemo(() => {
     const byPlatform = new Map<string, InstallerDiskFile[]>();
+    const deltas: InstallerDiskFile[] = [];
     for (const f of files) {
+      if (f.internal) {
+        deltas.push(f);
+        continue;
+      }
       const key = f.platform || f.parsed?.platform || '';
       const list = byPlatform.get(key) || [];
       list.push(f);
       byPlatform.set(key, list);
     }
-    return Array.from(byPlatform.entries())
-      .map(([platform, rows]) => ({
-        platform,
-        rows: rows.sort((a, b) => b.mtimeMs - a.mtimeMs),
-      }))
-      .sort((a, b) => b.rows.length - a.rows.length);
+    deltas.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    return {
+      groups: Array.from(byPlatform.entries())
+        .map(([platform, rows]) => ({
+          platform,
+          rows: rows.sort((a, b) => b.mtimeMs - a.mtimeMs),
+        }))
+        .sort((a, b) => b.rows.length - a.rows.length),
+      deltaFiles: deltas,
+    };
   }, [files]);
+
+  const installerCount = files.length - deltaFiles.length;
+
+  const deltaKindLabel = (kind: string | null | undefined) =>
+    kind === 'asar-ref' ? t('publicAppDeltaKindAsarRef')
+    : kind === 'outref-ref' ? t('publicAppDeltaKindOutref')
+    : kind === 'delta-patch' ? t('publicAppDeltaKindPatch')
+    : t('publicAppDeltaKindOther');
 
   const visibleGroups = useMemo(
     () => (filter === 'all' ? groups : groups.filter((g) => g.platform === filter)),
@@ -330,6 +366,88 @@ export function InstallersTab() {
     }
   }, [uploadFile, canUpload, form, fetchFiles, t]);
 
+  // ── Regenerate-installers handlers ──
+  const loadRegenStatus = useCallback(async () => {
+    setRegenStatusLoading(true);
+    try {
+      const res = await apiFetch('/api/app-versions/regenerate-installers/status');
+      const j = await res.json().catch(() => null);
+      if (res.ok && j?.success && j?.data) {
+        setRegenConfigured(!!j.data.configured);
+        if (j.data.repo) setRegenRepo(j.data.repo);
+        if (j.data.workflow) setRegenWorkflow(j.data.workflow);
+        if (j.data.ref) setRegenRef(j.data.ref);
+      }
+    } catch {
+      /* status is best-effort — the dialog still opens with defaults */
+    } finally {
+      setRegenStatusLoading(false);
+    }
+  }, []);
+
+  const saveRegenConfig = useCallback(async () => {
+    setRegenSaving(true);
+    try {
+      const res = await apiFetch('/api/app-versions/regenerate-installers/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: regenToken.trim() || undefined,
+          repo: regenRepo.trim() || undefined,
+          workflow: regenWorkflow.trim() || undefined,
+          ref: regenRef.trim() || undefined,
+        }),
+      });
+      const j = await res.json().catch(() => null);
+      if (res.ok && j?.success) {
+        setRegenToken('');
+        toast.success(t('publicAppRegenSaved'));
+        await loadRegenStatus();
+      } else {
+        toast.error(j?.error === 'github-repo-invalid' ? t('publicAppRegenErrRepo') : t('publicAppRegenFailed'));
+      }
+    } catch {
+      toast.error(t('publicAppRegenFailed'));
+    } finally {
+      setRegenSaving(false);
+    }
+  }, [regenToken, regenRepo, regenWorkflow, regenRef, loadRegenStatus, t]);
+
+  const launchRegen = useCallback(async () => {
+    setRegenBusy(true);
+    try {
+      const res = await apiFetch('/api/app-versions/regenerate-installers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targets: regenTargets, triggerVpsRebuild: regenVps }),
+      });
+      const j = await res.json().catch(() => null);
+      if (res.ok && j?.success && j?.dispatched) {
+        toast.success(t('publicAppRegenLaunched'));
+        setRegenOpen(false);
+      } else {
+        const code = j?.error || 'github-dispatch-failed';
+        const key =
+          code === 'github-token-missing'
+            ? 'publicAppRegenErrToken'
+            : code === 'github-auth-failed'
+              ? 'publicAppRegenErrAuth'
+              : code === 'github-not-found'
+                ? 'publicAppRegenErrNotFound'
+                : code === 'github-ref-invalid'
+                  ? 'publicAppRegenErrRef'
+                  : code === 'github-repo-invalid'
+                    ? 'publicAppRegenErrRepo'
+                    : 'publicAppRegenFailed';
+        toast.error(t(key) + (j?.detail ? ` — ${j.detail}` : ''));
+      }
+    } catch {
+      toast.error(t('publicAppRegenFailed'));
+    } finally {
+      setRegenBusy(false);
+    }
+  }, [regenTargets, regenVps, t]);
+
   // ── Render ──
   return (
     <div className="space-y-4">
@@ -354,6 +472,19 @@ export function InstallersTab() {
               <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
               {t('publicAppRefresh')}
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-9 flex-1 sm:flex-none"
+              onClick={() => {
+                setRegenOpen(true);
+                void loadRegenStatus();
+              }}
+              aria-label={t('publicAppRegenBtn')}
+            >
+              <Github className="h-4 w-4" />
+              {t('publicAppRegenBtn')}
+            </Button>
             <Button size="sm" className="h-9 flex-1 sm:flex-none" onClick={openUpload}>
               <Upload className="h-4 w-4" />
               {t('publicAppUploadInstaller')}
@@ -362,7 +493,7 @@ export function InstallersTab() {
         </CardHeader>
         <CardContent className="space-y-4">
           {/* Filter chips — All + every platform present, with counts */}
-          {!loading && files.length > 0 && (
+          {!loading && installerCount > 0 && (
             <div className="flex flex-wrap items-center gap-2" role="group" aria-label={t('publicAppFilterPlatform')}>
               <Button
                 size="sm"
@@ -372,7 +503,7 @@ export function InstallersTab() {
               >
                 {t('publicAppFilterAll')}
                 <Badge variant="secondary" className="ms-1.5 h-4 px-1.5 text-[10px] rounded-full">
-                  {files.length}
+                  {installerCount}
                 </Badge>
               </Button>
               {groups.map((g) => {
@@ -539,8 +670,67 @@ export function InstallersTab() {
                 </div>
               );
             })}
+
+          {/* Delta-system artifacts — internal diff references + hop patches.
+              These power differential updates; they are never installable, so
+              they live here instead of the platform groups above. */}
+          {!loading && !error && deltaFiles.length > 0 && (
+            <div className="rounded-lg border overflow-hidden">
+              <div className="flex items-center gap-2 bg-muted/50 px-3 py-2 border-b">
+                <FileArchive className="h-4 w-4 text-muted-foreground shrink-0" />
+                <span className="text-sm font-medium truncate">{t('publicAppDeltaArtifacts')}</span>
+                <Badge variant="secondary" className="text-[10px] h-4 px-1.5 rounded-full shrink-0">
+                  {deltaFiles.length}
+                </Badge>
+              </div>
+              <p className="px-3 py-2 text-xs text-muted-foreground border-b">
+                {t('publicAppDeltaArtifactsHint')}
+              </p>
+              <div className="max-h-[260px] overflow-y-auto custom-scrollbar">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="text-xs">{t('publicAppDeltaColKind')}</TableHead>
+                      <TableHead className="text-xs">{t('publicAppColFile')}</TableHead>
+                      <TableHead className="text-xs">{t('publicAppDeltaColServes')}</TableHead>
+                      <TableHead className="text-xs">{t('publicAppColPushedAt')}</TableHead>
+                      <TableHead className="text-xs">{t('publicAppColSize')}</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {deltaFiles.map((file) => (
+                      <TableRow key={file.storageKey}>
+                        <TableCell>
+                          <Badge variant="secondary" className="text-[10px] h-5 px-1.5 whitespace-nowrap">
+                            {deltaKindLabel(file.internalKind)}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="max-w-[220px] sm:max-w-[280px]">
+                          <span className="text-xs font-mono truncate block" dir="ltr" title={file.name}>
+                            {file.name}
+                          </span>
+                        </TableCell>
+                        <TableCell className="text-xs font-mono" dir="ltr">
+                          {file.owner ? `${file.owner.platform} ${file.owner.version}` : '—'}
+                        </TableCell>
+                        <TableCell className="text-xs whitespace-nowrap">
+                          {formatPushedAt(file.mtimeMs, lang)}
+                        </TableCell>
+                        <TableCell className="text-xs whitespace-nowrap font-mono" dir="ltr">
+                          {formatFileSize(file.size)}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
+
+      {/* ─── Delta Update Manager (0.6.33) — per-platform hop generation ─── */}
+      <DeltaManagerCard />
 
       {/* ─── Activate overwrite confirmation ─── */}
       <AlertDialog open={!!confirmFile} onOpenChange={(open) => !open && setConfirmFile(null)}>
@@ -743,6 +933,102 @@ export function InstallersTab() {
             <Button className="h-10" onClick={() => void submitUpload()} disabled={!canUpload}>
               {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
               {t('publicAppUploadStart')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Regenerate installers — GitHub Actions dispatch dialog */}
+      <Dialog open={regenOpen} onOpenChange={setRegenOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Github className="h-4 w-4 text-primary" />
+              {t('publicAppRegenTitle')}
+            </DialogTitle>
+            <DialogDescription>{t('publicAppRegenDesc')}</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label className="text-sm">{t('publicAppRegenTargets')}</Label>
+              <div className="grid grid-cols-3 gap-2">
+                {(['all', 'desktop-only', 'mobile-only'] as const).map((v) => (
+                  <Button
+                    key={v}
+                    type="button"
+                    variant={regenTargets === v ? 'default' : 'outline'}
+                    size="sm"
+                    className="h-9"
+                    onClick={() => setRegenTargets(v)}
+                  >
+                    {v === 'all' ? t('publicAppRegenAll') : v === 'desktop-only' ? t('publicAppRegenDesktop') : t('publicAppRegenMobile')}
+                  </Button>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center justify-between rounded-lg border p-3">
+              <Label htmlFor="regen-vps" className="text-sm font-normal">
+                {t('publicAppRegenVps')}
+              </Label>
+              <Switch id="regen-vps" checked={regenVps} onCheckedChange={setRegenVps} />
+            </div>
+            <div className="space-y-2 rounded-lg border p-3">
+              <div className="flex items-center justify-between">
+                <Label className="text-sm">{t('publicAppRegenConfig')}</Label>
+                <Badge variant={regenConfigured ? 'default' : 'destructive'} className="text-[10px]">
+                  {regenStatusLoading ? '…' : regenConfigured ? t('publicAppRegenTokenConfigured') : t('publicAppRegenTokenMissing')}
+                </Badge>
+              </div>
+              <Input
+                dir="ltr"
+                className="h-9 text-xs"
+                placeholder="owner/repo"
+                value={regenRepo}
+                onChange={(e) => setRegenRepo(e.target.value)}
+              />
+              <div className="grid grid-cols-2 gap-2">
+                <Input
+                  dir="ltr"
+                  className="h-9 text-xs"
+                  placeholder="publish-installers.yml"
+                  value={regenWorkflow}
+                  onChange={(e) => setRegenWorkflow(e.target.value)}
+                />
+                <Input
+                  dir="ltr"
+                  className="h-9 text-xs"
+                  placeholder="master"
+                  value={regenRef}
+                  onChange={(e) => setRegenRef(e.target.value)}
+                />
+              </div>
+              <Input
+                dir="ltr"
+                type="password"
+                className="h-9 text-xs"
+                placeholder={t('publicAppRegenToken')}
+                value={regenToken}
+                onChange={(e) => setRegenToken(e.target.value)}
+              />
+              <Button
+                variant="secondary"
+                size="sm"
+                className="h-8 w-full text-xs"
+                onClick={() => void saveRegenConfig()}
+                disabled={regenSaving || (!regenToken.trim() && !regenRepo.trim() && !regenWorkflow.trim() && !regenRef.trim())}
+              >
+                {regenSaving ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                {t('publicAppRegenSave')}
+              </Button>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" className="h-10" onClick={() => setRegenOpen(false)} disabled={regenBusy}>
+              {t('publicAppCancel')}
+            </Button>
+            <Button className="h-10" onClick={() => void launchRegen()} disabled={regenBusy}>
+              {regenBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Github className="h-4 w-4" />}
+              {t('publicAppRegenLaunch')}
             </Button>
           </DialogFooter>
         </DialogContent>
