@@ -33,6 +33,11 @@ import {
 } from '@blasti/binary-delta'
 import { db } from '@blasti/db'
 import { STORAGE_ROOT } from './storage'
+import {
+  autoRefBackfillEnabled,
+  backfillRefsForVersion,
+  refBackfillFailureRecent,
+} from './app-version-ref-backfill'
 
 const DELTA_DIR = path.join(STORAGE_ROOT, 'app-versions')
 
@@ -224,6 +229,16 @@ export async function generateDeltaBetween(
  * Build the delta for the NEWLY published `cur` against EVERY plausible
  * published predecessor (usually just the immediately-previous release).
  * Called from activate + release-refs upload.
+ *
+ * REF BACKFILL (0.6.38): desktop rows whose reference artifacts never arrived
+ * (published before the CI refs wiring, or the refs upload failed silently)
+ * used to poison the whole graph — every hop touching them died with
+ * 'missing-asar-ref' and devices fell back to the full installer. The refs
+ * are now REBUILT from the stored installer (7z-wasm in-process extraction)
+ * right here, for the target row and for the predecessors a hop would need.
+ * Best-effort + throttled: BLASTI_REF_BACKFILL=0 disables, failed rows are
+ * not retried for 10 minutes, and at most 3 extractions run per call so a
+ * publish request stays responsive.
  */
 export async function generateDeltasForVersion(curId: string): Promise<Array<{ from: string; to: string; size: number; ok: boolean; reason?: string }>> {
   const cur = await db.appVersion.findUnique({ where: { id: curId } })
@@ -238,6 +253,21 @@ export async function generateDeltasForVersion(curId: string): Promise<Array<{ f
     orderBy: { createdAt: 'desc' },
     take: 10,
   })
+
+  // ── Auto backfill: heal missing refs before any guard can refuse the hop ──
+  if (DESKTOP_PLATFORMS.has(cur.platform) && autoRefBackfillEnabled()) {
+    let budget = 3
+    const heal = async (row: { id: string; asarStorageKey: string | null; outrefStorageKey: string | null }) => {
+      if (budget <= 0) return
+      if (row.asarStorageKey && row.outrefStorageKey) return
+      if (refBackfillFailureRecent(row.id)) return
+      budget--
+      try { await backfillRefsForVersion(row.id) } catch { /* best effort */ }
+    }
+    await heal(cur)
+    for (const prev of predecessors) await heal(prev)
+  }
+
   const results: Array<{ from: string; to: string; size: number; ok: boolean; reason?: string }> = []
   for (const prev of predecessors) {
     // Only build hops that move FORWARD in semver terms.

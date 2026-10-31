@@ -18,6 +18,7 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 import { pickLatestAppVersion } from '../lib/app-version-rank'
 // Delta Updates (0.6.30) — differential patch graph + generation
 import { computeDeltaChain, generateDeltasForVersion, generateDeltaBetween, evaluateDeltaEligibility, storedArtifactExists, compareVersionStrings, type VersionRowLike } from '../lib/app-version-deltas'
+import { backfillRefsForVersion, rowIsBackfillable } from '../lib/app-version-ref-backfill'
 // API Compatibility Map (0.6.31) — app↔server capability matrix
 import { evaluateCompatibility, seedDefaultGates, CURRENT_SERVER_API_LEVEL, MIN_SUPPORTED_API_LEVEL } from '../lib/api-compat'
 // R-31 (0.6.32) — one-press installer regeneration via GitHub Actions workflow_dispatch
@@ -745,8 +746,38 @@ app.post('/:id/release-refs', async (c) => {
   }
 })
 
-// ─── POST /app-versions/:id/regenerate-deltas — admin rebuild of hop patches ─
+// ─── POST /app-versions/:id/backfill-refs — rebuild delta refs from installer ─
+// REF BACKFILL (0.6.38): desktop versions published before the CI refs wiring
+// (or whose refs upload failed) have NO asar/outref references, so no delta
+// hop can ever touch them and /check answers delta:null → devices fall back
+// to the FULL installer. The stored NSIS setup is self-contained, so the refs
+// are rebuilt from it in-process (7z-wasm): payload → app.asar + app.asar.
+// unpacked + Electron UA scan for the runtimeKey. After a successful backfill
+// the delta graph is regenerated immediately. ?force=1 overwrites refs that
+// already exist (e.g. re-run after a broken upload).
+app.post('/:id/backfill-refs', async (c) => {
+  try {
+    await requireAdminOrDeployToken(c)
+    const id = c.req.param('id')
+    const force = c.req.query('force') === '1'
+    const backfill = await backfillRefsForVersion(id, { force })
+    let deltaGeneration: unknown = null
+    if (backfill.ok) {
+      try {
+        deltaGeneration = await generateDeltasForVersion(id)
+      } catch (err) {
+        deltaGeneration = { error: String((err as Error).message || err).slice(0, 200) }
+      }
+    }
+    invalidateResponseCacheTag('app-versions')
+    return c.json({ success: backfill.ok, backfill, deltaGeneration })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
 
+// ─── POST /app-versions/:id/regenerate-deltas — admin rebuild of hop patches ─
 app.post('/:id/regenerate-deltas', async (c) => {
   try {
     await requireAdmin(c)
@@ -811,6 +842,7 @@ app.get('/delta-manager', async (c) => {
       fileSize: number | null
       devices: number
       isTarget: boolean
+      backfillable: boolean
       artifacts: { apk: boolean; asar: boolean; outref: boolean }
       delta: { id: string; fileName: string; fileSize: number; createdAt: string } | null
       chain: { hopCount: number; totalSize: number; via: string[] } | null
@@ -856,6 +888,9 @@ app.get('/delta-manager', async (c) => {
         fileSize: v.fileSize,
         devices: devicesByVersion.get(v.version) ?? 0,
         isTarget,
+        // REF BACKFILL (0.6.38) — a desktop row whose asar/outref refs never
+        // arrived can be healed from the stored installer with one click.
+        backfillable: rowIsBackfillable(v),
         artifacts: {
           apk: storedArtifactExists(v.fileStorageKey),
           asar: storedArtifactExists(v.asarStorageKey),
@@ -930,6 +965,21 @@ app.post('/delta-manager/generate', async (c) => {
     }
 
     const froms = await db.appVersion.findMany({ where: { id: { in: fromVersionIds }, platform } })
+
+    // REF BACKFILL (0.6.38) — heal missing refs on the selected rows (and the
+    // target) from their stored installers BEFORE the guards run, so an old
+    // release can still become a delta base. Budget-capped; failures report
+    // per-row like every other block reason.
+    let backfillBudget = 4
+    const healRow = async (row: { platform: string; id: string; asarStorageKey: string | null; outrefStorageKey: string | null; fileStorageKey: string | null }) => {
+      if (backfillBudget <= 0) return
+      if (!rowIsBackfillable(row)) return
+      backfillBudget--
+      try { await backfillRefsForVersion(row.id) } catch { /* reported via the guards below */ }
+    }
+    for (const from of froms) await healRow(from)
+    await healRow(target)
+
     const results: Array<{ from: string; to: string; ok: boolean; size?: number; reason?: string }> = []
     for (const from of froms) {
       // Forward-only, artifact-anchored guard — a stale UI selection (target

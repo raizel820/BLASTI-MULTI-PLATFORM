@@ -40,8 +40,8 @@ android {
         applicationId "com.blasti.mobile"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 6037
-        versionName "0.6.37"
+        versionCode 6038
+        versionName "0.6.38"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

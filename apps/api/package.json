@@ -1,6 +1,6 @@
 {
   "name": "@blasti/api",
-  "version": "0.6.37",
+  "version": "0.6.38",
   "private": true,
   "main": "src/index.ts",
   "scripts": {
@@ -8,6 +8,7 @@
     "start": "bun src/index.ts"
   },
   "dependencies": {
+    "7z-wasm": "^1.2.0",
     "@blasti/binary-delta": "workspace:*",
     "@blasti/core": "workspace:*",
     "@blasti/db": "workspace:*",

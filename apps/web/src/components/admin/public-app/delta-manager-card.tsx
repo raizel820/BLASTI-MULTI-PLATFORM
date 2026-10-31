@@ -38,6 +38,7 @@ import {
   Link2,
   Wand2,
   Smartphone,
+  Wrench,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -63,6 +64,7 @@ interface ManagerRow {
   fileSize: number | null;
   devices: number;
   isTarget: boolean;
+  backfillable: boolean;
   artifacts: { apk: boolean; asar: boolean; outref: boolean };
   delta: { id: string; fileName: string; fileSize: number; createdAt: string } | null;
   chain: { hopCount: number; totalSize: number; via: string[] } | null;
@@ -89,6 +91,7 @@ export function DeltaManagerCard() {
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [generating, setGenerating] = useState(false);
+  const [backfillingId, setBackfillingId] = useState<string | null>(null);
 
   const fetchManager = useCallback(async (pl: InstallerPlatform, isRefresh = false) => {
     if (isRefresh) setLoading(false);
@@ -136,6 +139,46 @@ export function DeltaManagerCard() {
       const allSelected = eligibleRows.length > 0 && eligibleRows.every((r) => prev.has(r.id));
       return allSelected ? new Set<string>() : new Set(eligibleRows.map((r) => r.id));
     });
+  };
+
+  /**
+   * REF BACKFILL (0.6.38) — rebuild this row's asar/outref refs from its
+   * stored installer (server-side NSIS extraction). The response also carries
+   * the freshly generated delta hops, so one click heals the whole row.
+   */
+  const backfillRefs = async (row: ManagerRow) => {
+    setBackfillingId(row.id);
+    try {
+      const res = await apiFetch(`/api/app-versions/${row.id}/backfill-refs`, { method: 'POST' });
+      const payload = await res.json().catch(() => null);
+      const backfill = payload?.backfill;
+      if (res.ok && payload?.success && backfill?.ok) {
+        const hops: Array<{ ok: boolean; from: string; to: string; size?: number }> =
+          Array.isArray(payload.deltaGeneration) ? payload.deltaGeneration : [];
+        const built = hops.filter((h) => h.ok);
+        toast.success(
+          t('publicAppDeltaMgrBackfillDone', {
+            version: row.version,
+            runtime: backfill.runtimeKey || '',
+            hops: String(built.length),
+          }),
+        );
+      } else if (res.ok && backfill?.skipped) {
+        toast.info(t('publicAppDeltaMgrBackfillSkipped', { version: row.version, reason: backfill.skipped }));
+      } else {
+        toast.error(
+          t('publicAppDeltaMgrBackfillFailed', {
+            version: row.version,
+            reason: backfill?.reason || payload?.error || `HTTP ${res.status}`,
+          }),
+        );
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Network error');
+    } finally {
+      setBackfillingId(null);
+      void fetchManager(platform, true);
+    }
   };
 
   const generateDeltas = async () => {
@@ -373,7 +416,7 @@ export function DeltaManagerCard() {
                         {row.devices > 0 ? row.devices : '—'}
                       </TableCell>
                       <TableCell>
-                        <div className="flex flex-wrap gap-1">
+                        <div className="flex flex-wrap gap-1 items-center">
                           {row.artifacts.apk ? (
                             <Badge variant="secondary" className="text-[9px] h-4 px-1 font-mono">APK</Badge>
                           ) : null}
@@ -385,6 +428,25 @@ export function DeltaManagerCard() {
                           ) : null}
                           {!row.artifacts.apk && !row.artifacts.asar && !row.artifacts.outref ? (
                             <span className="text-[10px] text-muted-foreground">—</span>
+                          ) : null}
+                          {row.backfillable ? (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-6 px-2 text-[10px] gap-1 text-amber-700 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300"
+                              disabled={backfillingId !== null || generating}
+                              onClick={() => void backfillRefs(row)}
+                              title={t('publicAppDeltaMgrBackfill')}
+                            >
+                              {backfillingId === row.id ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : (
+                                <Wrench className="h-3 w-3" />
+                              )}
+                              {backfillingId === row.id
+                                ? t('publicAppDeltaMgrBackfilling')
+                                : t('publicAppDeltaMgrBackfill')}
+                            </Button>
                           ) : null}
                         </div>
                       </TableCell>
