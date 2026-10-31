@@ -2330,6 +2330,19 @@ function isPerUserWindowsInstall() {
  * image name differs from blasti.exe so the installer's silent close-app
  * step never kills it). Returns false when the copy/spawn fails so the
  * caller can fall back to the PowerShell leg.
+ *
+ * 0.6.38 — FIELD ROOT CAUSE of "تعذّر بدء المُثبِّت تلقائيًا" on packaged
+ * per-user installs: the bare exe copy could never boot — a packaged
+ * Electron exe loads its bundle from <exe_dir>\resources\app.asar, and the
+ * updates dir had no resources/ beside the copy, so the waiter exited
+ * instantly (or lingered as the default-app zombie) and EVERY install fell
+ * through to the AV-killed PowerShell leg. The copy now carries its own
+ * bundle: <updates>\resources\app.asar is copied next to the waiter exe, so
+ * it boots the REAL main.js, dispatches runUpdateWaiterMode (which sits
+ * before the single-instance lock) and runs the installer — still pure
+ * Electron/Node, no cmd.exe/PowerShell for an AV to heuristically block.
+ * (app.asar.unpacked is intentionally NOT copied: the waiter path requires
+ * no native modules, keeping the copy fast.)
  */
 function spawnUpdateWaiter(installerPath) {
   const cp = require('child_process');
@@ -2344,6 +2357,15 @@ function spawnUpdateWaiter(installerPath) {
     // 0.6.30: prove the copy — a zero-byte waiter spawns nothing.
     const ws = fs.statSync(waiterPath);
     if (ws.size !== fs.statSync(process.execPath).size) throw new Error('waiter copy truncated');
+    // 0.6.38: ship the app bundle with the waiter — without it the copied
+    // exe never reached main.js and the whole leg was dead on packaged installs.
+    const srcAsar = path.join(process.resourcesPath || '', 'app.asar');
+    if (!srcAsar || !fs.existsSync(srcAsar)) throw new Error('app.asar not found next to the running exe');
+    const waiterResources = path.join(UPDATES_DIR(), 'resources');
+    fs.mkdirSync(waiterResources, { recursive: true });
+    const dstAsar = path.join(waiterResources, 'app.asar');
+    fs.copyFileSync(srcAsar, dstAsar);
+    if (fs.statSync(dstAsar).size !== fs.statSync(srcAsar).size) throw new Error('app.asar copy truncated');
   } catch (err) {
     console.warn('[BLASTI Desktop] waiter copy failed — falling back to PowerShell leg:', err && err.message);
     return null;

@@ -5,6 +5,12 @@
 #   • https://blasti.example.com  → automatic Let's Encrypt HTTPS
 #   • :80                         → plain HTTP (IP-only testing)
 #
+# www SUBDOMAIN: the native VPS installer (render_caddyfile() in
+# scripts/deploy-oracle-vps.sh) APPENDS a second site block for
+# www.<domain> — its own auto-TLS certificate + a 308 redirect of every
+# path to the canonical apex origin. Docker stacks can add the same
+# block manually if they want the alias.
+#
 # Works in BOTH deployment architectures (see DEPLOY-GUIDE.md):
 #   • Docker stack (ops/docker-compose.yml): the docker-compose
 #     `api`/`web` service names are used as-is.

@@ -18,8 +18,9 @@ import { getCloudApiBaseUrl } from '@/lib/api-client';
 
 export const PENDING_CHECKOUT_KEY = 'blasti-pending-checkout';
 
-/** Custom-scheme deep link the Capacitor Android shell registers (see
- *  AndroidManifest.xml BROWSABLE intent-filter + payment-deep-link.ts). */
+/** Custom-scheme deep link the Capacitor Android shell AND the Electron
+ *  desktop app both register (AndroidManifest BROWSABLE intent-filter /
+ *  main.js setAsDefaultProtocolClient — see payment-deep-link.ts). */
 const MOBILE_DEEP_LINK = 'blasti://payment/result';
 
 export interface PendingCheckout {
@@ -109,6 +110,16 @@ function isCapacitorShell(): boolean {
   }
 }
 
+/** True inside the Electron desktop shell (the renderer of the packaged app
+ *  or the dev app — main.js exposes the preload bridge as electronAPI). */
+function isElectronShell(): boolean {
+  try {
+    return !!(window as unknown as { electronAPI?: unknown }).electronAPI;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Resolve the return hints sent with create-checkout:
  *   - `returnUrl` — the PUBLIC web origin the hosted gateway should send the
@@ -117,11 +128,11 @@ function isCapacitorShell(): boolean {
  *     Electron loading the bundled SPA = `http://127.0.0.1:3080`) the page
  *     origin is device-local, so the CLOUD origin this shell already talks
  *     to (the same domain serves the SPA) is used instead.
- *   - `deepLink` — Capacitor only: the `blasti://payment/result` scheme the
- *     Android app registers. The API appends it (encoded) to the success and
- *     failure URLs; when the payer's browser lands on the result page it
- *     immediately bounces into the app, which routes to the in-app payment
- *     result (payment-deep-link.ts).
+ *   - `deepLink` — Capacitor AND Electron: the `blasti://payment/result`
+ *     scheme both shells register. The API appends it (encoded) to the
+ *     success and failure URLs; when the payer's browser lands on the result
+ *     page it immediately bounces into the app that started the payment
+ *     (payment-deep-link.ts routes it to the in-app settlement poll).
  *
  * An explicit returnUrl from the caller always wins (payload spread below).
  */
@@ -150,9 +161,10 @@ function computeReturnHints(): { returnUrl?: string; deepLink?: string } {
     }
   }
 
-  // The deep-link bounce only makes sense on Capacitor (blasti:// handler);
-  // Electron/browser callers just render the result page where they are.
-  const deepLink = isCapacitorShell() && returnUrl ? MOBILE_DEEP_LINK : undefined;
+  // The deep-link bounce makes sense on Capacitor AND Electron — both shells
+  // register the blasti:// handler. Without it the desktop payer stayed on
+  // the web app after paying (0.6.37 report) instead of returning to the app.
+  const deepLink = (isCapacitorShell() || isElectronShell()) && returnUrl ? MOBILE_DEEP_LINK : undefined;
   return { returnUrl, deepLink };
 }
 

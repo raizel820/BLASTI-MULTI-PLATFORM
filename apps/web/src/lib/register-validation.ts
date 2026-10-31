@@ -2,9 +2,13 @@
  * Task 41 — shared account-creation validation + server-error mapping.
  *
  * Two user-reported bugs live here:
- * 1. "this URL is invalid" when picking a PRESET avatar — the server used to
- *    reject data URIs (fixed API-side in validations.ts); the client keeps
- *    sending the preset data URI as-is (max ~1.8KB, well under the 8KB cap).
+ * 1. "this URL is invalid" when picking a PRESET avatar — the server's
+ *    uploadFileUrlSchema only accepted upload paths and http(s) URLs, so the
+ *    preset data URI 400'd the registration. 0.6.38 fixes it properly: the
+ *    presets ship as SHARED static files served by every api under the
+ *    regular /api/upload/file/avatar/… namespace and the forms submit the
+ *    shared PATH (no upload, no per-user copy); small data:image URIs stay
+ *    accepted as the legacy fallback for already-fielded 0.6.36/37 clients.
  * 2. "unexpected string" when the phone field was left empty — the client
  *    silently OMITTED phoneNumber, and zod v4 answered with its raw machine
  *    message. Now: the client validates every field BEFORE submit (with a

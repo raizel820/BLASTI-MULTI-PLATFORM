@@ -776,6 +776,40 @@ function createAppUpdateStore() {
         set({ postponedVersion: null });
       }
       set({ info: next, status: 'available', error: null, lastCheckAt: Date.now() });
+      // ─── 0.6.38 — graft the DELTA offer onto the pushed payload ──────────
+      // Push rows are built WITHOUT /check's delta field, so the electron
+      // install path skipped its delta branch and pulled the FULL installer
+      // even when the cloud had a verified hop chain (mobile got 7.2MB while
+      // desktop pulled 155MB). One fresh /check right here — BEFORE
+      // maybeAutoDownload can start the full download — merges delta +
+      // fileHash + compat into the offer; any failure keeps the pushed
+      // payload as-is (full-installer fallback, exactly the old behavior).
+      if (shell === 'electron') {
+        try {
+          const api = electronAPI();
+          const res = api
+            ? ((await api.checkForUpdates?.()) ?? null)
+            : await fetchCheck(desktopPlatform(), '0.0.1');
+          if (
+            res?.success && res.updateAvailable && res.latestVersion && res.downloadUrl &&
+            get().status === 'available' && get().info?.version === next.version
+          ) {
+            const fresh: AppUpdateInfo = {
+              ...next,
+              currentVersion: res.currentVersion || next.currentVersion,
+              isMandatory: next.isMandatory || res.isMandatory === true || res.compat?.updateRequired === true,
+              downloadUrl: res.downloadUrl,
+              fileSize: res.fileSize ?? next.fileSize,
+              fileHash: res.fileHash ?? undefined,
+              delta: res.delta && res.delta.supported && Array.isArray(res.delta.hops) && res.delta.hops.length > 0 ? res.delta : null,
+              compat: res.compat ?? next.compat ?? null,
+            };
+            set({ info: fresh });
+            await maybeAutoDownload(fresh);
+            return;
+          }
+        } catch { /* keep the pushed payload — full-installer fallback */ }
+      }
       await maybeAutoDownload(next);
     },
 

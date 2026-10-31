@@ -70,9 +70,19 @@ export function PaymentRealtimeToasts() {
     if (!connected) return;
     const offCompleted = on('payment:completed', () => {
       toast.success(t('paymentToastCompleted'));
+      // 0.6.38 — toast-only left the subscription UI stale ("inactive
+      // subscription" long after a successful payment). Announce settlement
+      // so any mounted surface (agency-subscription, dashboards, profile)
+      // can refetch immediately — no restart, no re-navigation required.
+      try {
+        window.dispatchEvent(new CustomEvent('blasti:payment-settled', { detail: { ok: true } }));
+      } catch { /* ignore */ }
     });
     const offFailed = on('payment:failed', () => {
       toast.error(t('paymentToastFailed'));
+      try {
+        window.dispatchEvent(new CustomEvent('blasti:payment-settled', { detail: { ok: false } }));
+      } catch { /* ignore */ }
     });
     return () => {
       offCompleted();

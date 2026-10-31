@@ -3479,6 +3479,30 @@ function createApp() {
       if (inm) return inm.split(',').map((t) => t.trim().replace(/^W\//, '')).some((t) => t === '*' || t === etag)
       return false
     }
+    // ── 0.6.38 — SHARED preset avatars (static, zero per-user copies) ────
+    // The twelve presets ship inside the app bundle
+    // (local-api/static/avatars/presets — packaged via local-api/**) and ride
+    // the SAME /api/upload/file/avatar/… namespace as real uploads, so every
+    // client rebase branch treats them like any avatar. Serve straight from
+    // the bundle — no store read, no cloud proxy, fully offline. The
+    // whitelist is strict; the store's filename scheme never sees these names.
+    if (type === 'avatar' && /^preset-(1[0-2]|[1-9])\.svg$/.test(name)) {
+      try {
+        const presetData = require('fs').readFileSync(require('path').join(__dirname, 'static', 'avatars', 'presets', name))
+        const presetEtag = `"${presetData.length.toString(16)}-0"`
+        if (clientHasCurrentLocal(presetEtag)) return notModified304(presetEtag)
+        return new Response(new Uint8Array(presetData), {
+          status: 200,
+          headers: {
+            'Content-Type': 'image/svg+xml',
+            'Content-Length': String(presetData.length),
+            'Cache-Control': 'public, max-age=31536000, immutable',
+            'Content-Disposition': 'inline',
+            ETag: presetEtag,
+          },
+        })
+      } catch { /* missing file → fall through to the store/cloud proxy */ }
+    }
     // Organized route has yyyy/mm params; legacy flat route passes only the name.
     // (storagePath declared above, next to the ETag helpers.)
     const data = await fileStore.readByStoragePath(storagePath)

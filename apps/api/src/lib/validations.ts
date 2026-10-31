@@ -60,11 +60,20 @@ const wilayaField = z
  *   • relative upload path  /api/upload/file/<bucket>/...   (canonical)
  *   • absolute http(s) URL                                   (legacy rows,
  *                                                            external CDNs)
+ * 0.6.38 — ALSO accept small inline image data URIs: 0.6.36/37 field clients
+ * still send preset avatars as tiny SVG data URIs (~1–2 KB). Current clients
+ * submit the preset's SHARED static path instead
+ * (/api/upload/file/avatar/preset-N.svg — already covered by the first arm).
+ * Size-capped because avatarUrl rides the session JWT on every request.
  */
 export const uploadFileUrlSchema = z
   .string()
   .refine(
-    (v) => v === '' || v.startsWith('/api/upload/file/') || /^https?:\/\//i.test(v),
+    (v) =>
+      v === '' ||
+      v.startsWith('/api/upload/file/') ||
+      /^https?:\/\//i.test(v) ||
+      (/^data:image\/[a-z0-9.+-]+(;base64)?,/i.test(v) && v.length <= 8192),
     'Invalid file URL',
   );
 

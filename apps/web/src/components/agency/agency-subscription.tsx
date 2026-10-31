@@ -2773,6 +2773,35 @@ export function AgencySubscription() {
     fetchChargilyEnabled().then((enabled) => setChargilyEnabled(enabled));
   }, []);
 
+  // ─── 0.6.38 — live settlement refresh ──────────────────────────────────
+  // The webhook/socket may confirm the payment while the user sits on this
+  // page; toast-only left the banner stuck on "inactive subscription" until
+  // a full remount. A silent refetch (no skeleton flash) runs on the settle
+  // event, plus a second pass to close the desktop sync race.
+  useEffect(() => {
+    const refresh = async () => {
+      try {
+        const params = user?.agencyId ? `?agencyId=${user.agencyId}` : '';
+        const res = await apiFetch(`/api/agency/subscription${params}`);
+        if (res.ok) setData(await res.json());
+      } catch { /* keep the current view — the next remount refetches */ }
+      try {
+        const res = await apiFetch('/api/transactions?limit=20');
+        if (res.ok) {
+          const result = await res.json();
+          setPaymentHistory(result.transactions ?? []);
+        }
+      } catch { /* ignore */ }
+    };
+    const onSettled = () => {
+      void refresh();
+      const t2 = setTimeout(() => { void refresh(); }, 4000);
+      return () => clearTimeout(t2);
+    };
+    window.addEventListener('blasti:payment-settled', onSettled);
+    return () => window.removeEventListener('blasti:payment-settled', onSettled);
+  }, [user?.agencyId]);
+
   const fetchFaqs = async () => {
     try {
       const res = await apiFetch(`/api/faqs?category=SUBSCRIPTION&lang=${lang}`);

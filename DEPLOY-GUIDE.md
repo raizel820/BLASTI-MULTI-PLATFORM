@@ -422,6 +422,12 @@ it was done and the recipe for any future domain.
 
    (Fresh installs instead: `sudo bash deploy-oracle-vps.sh --domain blastidz.online`.)
 
+   The `www` alias needs no extra step: the deploy script bakes a
+   `www.<domain>` Caddy site block (own Let's Encrypt certificate + a
+   308 redirect of every path to the canonical apex) on every
+   domain-mode install/update — just keep the `www` A record pointing
+   at the same VPS IP.
+
    This rewrites `SITE_ADDRESS` / `CORS_ORIGIN` / `ALLOWED_ORIGINS` in
    `/etc/blasti/blasti.env` (Part 6.1) and re-renders the Caddyfile. Since
    0.6.36 the domain switch keeps **both doors**: `https://blastidz.online`

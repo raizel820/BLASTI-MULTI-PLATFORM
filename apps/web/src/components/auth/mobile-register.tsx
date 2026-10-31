@@ -44,7 +44,7 @@ import {
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'framer-motion';
 import type { UserRole } from '@/store/use-app-store';
-import { PRESET_AVATARS } from './preset-avatars';
+import { PRESET_AVATARS, presetAvatarPath } from './preset-avatars';
 import {
   VerificationStep,
   type VerificationPending,
@@ -296,6 +296,10 @@ export function MobileRegisterForm() {
     uploadedAvatarUrlRef.current = null;
     setSelectedPreset(uri);
     setAvatarPreview(uri);
+    // 0.6.38 — NO upload happens: the submitted value is the preset's shared
+    // static path (presetAvatarPath, derived at submit), the preview keeps
+    // the instant inline data URI. The server serves every preset through
+    // the regular /api/upload/file/avatar/… namespace on all platforms.
   };
 
   const handleAvatarRemove = () => {
@@ -397,9 +401,13 @@ export function MobileRegisterForm() {
         email: trimmedEmail,
       };
       if (phoneNumber.trim()) body.phoneNumber = phoneNumber.trim();
-      // Uploaded photo URL OR the picked preset icon (data URI).
+      // Uploaded photo URL OR the picked preset icon. 0.6.38 — a preset
+      // submits its SHARED static path (presetAvatarPath — same bytes served
+      // to everyone, no upload round-trip); unknown picks keep the inline
+      // data URI (the API accepts ≤ 8KB ones for older clients).
       // Computed here so the ref read stays outside render (Task 78).
-      const avatarValue = avatarUpload.url || uploadedAvatarUrlRef.current || selectedPreset;
+      const presetPath = selectedPreset ? presetAvatarPath(selectedPreset) : null;
+      const avatarValue = avatarUpload.url || uploadedAvatarUrlRef.current || presetPath || selectedPreset;
       if (avatarValue) body.avatarUrl = avatarValue;
 
       // Algeria location: handed to the create-agency wizard for agency

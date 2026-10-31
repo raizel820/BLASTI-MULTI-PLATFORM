@@ -162,11 +162,20 @@ app.post('/create-checkout', async (c) => {
     // creation time, so the payment-result page recovers it from localStorage
     // (stored by the initiating client right before the redirect) or via
     // GET /api/payment/pending (latest pending checkout for the caller).
-    // `deep` (Capacitor callers only) is the blasti:// scheme the phone bounces
-    // back into the app with — see payment-deep-link.ts on the web side.
+    // `deep` (Capacitor + Electron shells) is the blasti:// scheme the phone
+    // or desktop bounces back into the app with — see payment-deep-link.ts.
     const deepQuery = deepLink ? `&deep=${encodeURIComponent(deepLink)}` : ''
     const successUrl = `${baseUrl}/#/payment/result?status=success${deepQuery}`
     const failureUrl = `${baseUrl}/#/payment/result?status=failed${deepQuery}`
+
+    // 0.6.38 — per-checkout webhook: pin settlement to THIS server so the
+    // confirmation no longer depends on a dashboard-configured webhook URL
+    // or the 30-minute stale-checkout sweeper. Chargily POSTs checkout.paid /
+    // checkout.failed here the moment the payer completes (chargily-service
+    // maps webhookEndpoint → webhook_endpoint). Falls back to NEXTAUTH_URL;
+    // empty when neither is set (unchanged legacy behavior).
+    const webhookBase = (process.env.PUBLIC_BASE_URL || process.env.NEXTAUTH_URL || '').replace(/\/+$/, '')
+    const webhookEndpoint = webhookBase ? `${webhookBase}/api/payment/webhook` : undefined
 
     // ─────────────────────────────────────────────────────────────
     // SUBSCRIPTION (optionally bundling pending UPFRONT hardware orders)
@@ -283,6 +292,7 @@ app.post('/create-checkout', async (c) => {
           },
           successUrl,
           failureUrl,
+          webhookEndpoint,
           // Full agency identity — the hosted checkout page shows the
           // agency's name, email, phone and address (not just the payer).
           customerName: agency.name || user.fullName,
@@ -418,6 +428,7 @@ app.post('/create-checkout', async (c) => {
           },
           successUrl,
           failureUrl,
+          webhookEndpoint,
           customerName: payer?.fullName || user.fullName,
           customerEmail: payer?.email || undefined,
           customerPhone: payer?.phoneNumber || undefined,
@@ -538,6 +549,7 @@ app.post('/create-checkout', async (c) => {
         },
         successUrl,
         failureUrl,
+        webhookEndpoint,
         customerName: agency?.name || user.fullName,
         customerEmail: agency?.email || undefined,
         customerPhone: agency?.phone || undefined,

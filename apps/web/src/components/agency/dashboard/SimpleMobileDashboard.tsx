@@ -15,6 +15,7 @@ import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
+import { CreateAgencyForm } from '@/components/agency/create-agency-form';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -221,6 +222,14 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
       // Silent fail
     }
   }, [soundEnabled]);
+
+  // ─── 0.6.38 — Bug B: a brand-new AGENCY_OWNER has user.agencyId = null ──
+  // fetchData early-returns BEFORE its try/finally, so `loading` stayed true
+  // forever and the screen froze on the spinner. Flip it off the moment there
+  // is no agency to fetch — the no-agency branch renders the creator instead.
+  useEffect(() => {
+    if (!agencyId) setLoading(false);
+  }, [agencyId]);
 
   // ─── Data Fetching ───────────────────────────────────────────────────
   const fetchData = useCallback(async (showRefreshing = false, isPoll = false) => {
@@ -502,6 +511,27 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
           <p className="text-emerald-400/70 text-sm font-medium">
             {t('loading') || 'Loading...'}
           </p>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── 0.6.38 — Bug B: no agency yet → start agency creation ───────────
+  // Parity with the desktop dashboard: a fresh owner must land in the
+  // create-agency wizard, never in an infinite spinner or an empty shell.
+  if (!agencyId) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 flex items-start justify-center safe-area-inset">
+        <div className="w-full max-w-lg px-3 py-6">
+          <CreateAgencyForm
+            onAgencyCreated={() => {
+              // The store already carries the new agencyId — the parent
+              // re-renders with it and the fetch effect re-fires; show the
+              // loader until the first real fetch lands.
+              setLoading(true);
+              setTimeout(() => { void fetchData(); }, 600);
+            }}
+          />
         </div>
       </div>
     );

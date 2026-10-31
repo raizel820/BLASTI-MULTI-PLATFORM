@@ -52,7 +52,11 @@
 #                       Security-List instructions.
 #
 # OPTIONS (install)
-#   --domain D   domain for automatic HTTPS (A-record must point here)
+#   --domain D   domain for automatic HTTPS (A-record must point here).
+#                www.D is aliased automatically: Caddy obtains its own
+#                certificate for www.D and 308-redirects every request
+#                (pages, /api, /socket.io) to the canonical https://D —
+#                add an A-record for www.D too, pointing at the same IP.
 #   --https-only serve ONLY https://D — close the legacy raw-IP cleartext door
 #                (update mode forwards it; install mode bakes a domain-only site)
 #   --ip IP      public IP override (default: OCI metadata → ifconfig.me)
@@ -73,7 +77,7 @@ ok()   { printf '\033[1;32m[  ok  ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[ warn ]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[FAIL  ]\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,61p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,65p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || die "must run as root — Oracle's default user is 'ubuntu':
@@ -185,6 +189,44 @@ env_set() { # env_set <file> <KEY> <value>
   fi
 }
 
+# Extract the first DNS hostname from a SITE string:
+#   "https://d.tld,http://1.2.3.4" -> "d.tld" ; ":80" or a raw IP -> empty.
+# Drives the www alias: raw-IP/:80 installs have no hostname to alias.
+derive_domain_from_site() { # derive_domain_from_site <site-string>
+  local first="${1%%,*}" host
+  case "$first" in
+    https://* | http://*) host="${first#*://}" ;;
+    *) return 0 ;;
+  esac
+  host="${host%%/*}"
+  case "$host" in
+    *[[:alpha:]]*) printf '%s' "$host" ;;   # DNS names contain letters, IPs don't
+  esac
+}
+
+origin_list_add() { # origin_list_add <csv-list> <entry> -> list with <entry> appended once
+  local list="$1" entry="$2"
+  [ -n "$entry" ] || { printf '%s' "$list"; return 0; }
+  case ",$list," in *",$entry,"*) printf '%s' "$list" ;; *)
+    [ -n "$list" ] && printf '%s,%s' "$list" "$entry" || printf '%s' "$entry"
+  ;; esac
+}
+
+# DNS A-record sanity check (best effort) — shared by apex + www checks
+dns_check() { # dns_check <host> <server-ip> <what-depends-on-it>
+  local host="$1" ip="$2" what="$3" resolved
+  resolved="$(getent hosts "$host" 2>/dev/null | awk '{print $1; exit}' || true)"
+  if [ -z "$resolved" ]; then
+    warn "DNS: $host does not resolve yet — add an A record -> $ip"
+    warn "     ($what retries in the background; it activates once DNS points here)"
+    return 1
+  elif [ "$resolved" != "$ip" ]; then
+    warn "DNS: $host resolves to $resolved but this server is $ip — $what cannot work until it points here"
+    return 1
+  fi
+  ok "DNS check passed: $host -> $ip"
+}
+
 resolve_next_bin() { # prints the Next.js CLI path inside bun's layout
   local root="$1" p
   for p in "$root/apps/web/node_modules/next/dist/bin/next" "$root/node_modules/next/dist/bin/next"; do
@@ -226,13 +268,38 @@ migrate_db() { # prisma generate + db push + seed-if-empty (seed skips when user
 }
 
 render_caddyfile() { # repo template → /etc/caddy/Caddyfile with localhost upstreams
-  local root="$1" site="$2"
+  local root="$1" site="$2" domain site_render
   [ -f "$root/ops/Caddyfile" ] || die "ops/Caddyfile missing in $root"
   mkdir -p /etc/caddy
-  sed -e "s|{\$SITE_ADDRESS}|${site}|g" \
+  # Caddyfile site-address lists need a SPACE after each comma
+  # ("https://d, http://ip") — a bare comma reads as one invalid address.
+  site_render="${site//,/, }"
+  sed -e "s|{\$SITE_ADDRESS}|${site_render}|g" \
       -e 's|reverse_proxy api:3003|reverse_proxy 127.0.0.1:3003|g' \
       -e 's|reverse_proxy web:3000|reverse_proxy 127.0.0.1:3000|g' \
       "$root/ops/Caddyfile" > /etc/caddy/Caddyfile
+
+  # ── www alias: own auto-TLS certificate + 308 redirect to the apex ──────
+  # Domain installs get a second site block so www.DOMAIN is a real,
+  # certificate-carrying hostname that bounces EVERY path (pages, /api,
+  # /socket.io) to the canonical https://DOMAIN origin — one canonical
+  # host for cookies, SEO and the URLs baked into the apps. Caddy handles
+  # issuance + renewal for both names by itself (HTTP-01 on port 80).
+  domain="$(derive_domain_from_site "$site")"
+  case "$domain" in
+    '' | www.*) : ;;   # :80 / raw-IP site, or the domain already IS a www host
+    *)
+      log "www alias: www.$domain -> https://$domain (own auto-TLS cert + 308 redirect)"
+      cat >> /etc/caddy/Caddyfile <<EOF
+
+# www -> apex canonical redirect (appended by deploy-oracle-vps.sh).
+# Caddy obtains and renews a separate certificate for www.${domain}.
+www.${domain} {
+        redir https://${domain}{uri} 308
+}
+EOF
+    ;;
+  esac
 }
 
 wait_healthy() {
@@ -366,6 +433,9 @@ print_summary() { # <site-url> <ip> <domain>
    Server IP    :  $ip
   ============================================================
 EOF
+  case "$domain" in www.*) : ;; '') : ;; *)
+    printf '   WWW alias    :  https://www.%s  ->  %s  (308 redirect, own auto-TLS cert)\n' "$domain" "$url"
+  ;; esac
   security_list_notice
   cat <<EOF
    NEXT STEPS:
@@ -578,14 +648,19 @@ EOF
   # raw IP over cleartext HTTP — installs still baked with http://IP (old APKs,
   # desktop build-stamps) keep working until they migrate to the domain.
   # --https-only completes the migration: domain-only, IP door closed.
-  local SITE ORIGIN
+  # CORS keeps BOTH hosts (apex + www) even though Caddy redirects www —
+  # a browser following the 308 replays on the apex, but tools that don't
+  # follow redirects still preflight against www and must not break.
+  local SITE ORIGIN WWW_ALIAS
   if [ -n "$DOMAIN" ]; then
+    case "$DOMAIN" in www.*) WWW_ALIAS="" ;; *) WWW_ALIAS="www.$DOMAIN" ;; esac
     [ -n "$PUB_IP" ] || PUB_IP="$(curl -4 -s --max-time 6 https://ifconfig.me || hostname -I 2>/dev/null | awk '{print $1}')"
     if [ -n "$PUB_IP" ] && [ -z "$HTTPS_ONLY" ]; then
-      SITE="https://$DOMAIN,http://$PUB_IP"; ORIGIN="https://$DOMAIN,http://$PUB_IP"
+      SITE="https://$DOMAIN,http://$PUB_IP"
+      ORIGIN="$(origin_list_add "$(origin_list_add "https://$DOMAIN" "https://$WWW_ALIAS")" "http://$PUB_IP")"
     else
       [ -n "$HTTPS_ONLY" ] && ok "https-only: the raw-IP cleartext door (http://$PUB_IP) stays CLOSED"
-      SITE="https://$DOMAIN"; ORIGIN="https://$DOMAIN"
+      SITE="https://$DOMAIN"; ORIGIN="$(origin_list_add "https://$DOMAIN" "https://$WWW_ALIAS")"
     fi
   else
     [ -n "$PUB_IP" ] || die "could not detect the public IP — pass --ip <PUBLIC_IP> or --domain"
@@ -597,17 +672,11 @@ EOF
 
   # -- 9. DNS sanity check (domain mode, best effort) ------------------------
   if [ -n "$DOMAIN" ] && [ -n "$PUB_IP" ]; then
-    local resolved
-    resolved="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)"
-    if [ -z "$resolved" ]; then
-      warn "DNS: $DOMAIN does not resolve yet — add an A record -> $PUB_IP"
-      warn "     (HTTP on the raw IP keeps working meanwhile; Caddy retries HTTPS)"
-    elif [ "$resolved" != "$PUB_IP" ]; then
-      warn "DNS: $DOMAIN resolves to $resolved but this server is $PUB_IP"
-      warn "     Caddy cannot obtain an HTTPS certificate until it points here."
-    else
-      ok "DNS check passed: $DOMAIN -> $PUB_IP"
-    fi
+    dns_check "$DOMAIN" "$PUB_IP" "the apex HTTPS site"
+    case "$DOMAIN" in
+      www.*) : ;;
+      *) dns_check "www.$DOMAIN" "$PUB_IP" "the www redirect + its certificate" ;;
+    esac
   fi
 
   # -- 10. the code: clone (or refresh) from GitHub ---------------------------
@@ -734,19 +803,24 @@ cmd_update() {
   # the migration. Pass --https-only to COMPLETE the migration: closes the IP
   # door (Caddy keeps port 80 only for the ACME challenge + https redirect).
   if [ -n "$DOMAIN" ]; then
-    local MIG_IP MIG_SITE
+    local MIG_IP MIG_SITE MIG_ORIGIN
     MIG_IP="$(detect_public_ip)"
     [ -n "$MIG_IP" ] || MIG_IP="$(curl -4 -s --max-time 6 https://ifconfig.me || hostname -I 2>/dev/null | awk '{print $1}')"
     MIG_SITE="https://$DOMAIN"
+    MIG_ORIGIN="https://$DOMAIN"
+    case "$DOMAIN" in www.*) ;; *) MIG_ORIGIN="$(origin_list_add "$MIG_ORIGIN" "https://www.$DOMAIN")" ;; esac
     if [ -z "$HTTPS_ONLY" ]; then
-      [ -n "$MIG_IP" ] && MIG_SITE="https://$DOMAIN,http://$MIG_IP"
+      if [ -n "$MIG_IP" ]; then
+        MIG_SITE="https://$DOMAIN,http://$MIG_IP"
+        MIG_ORIGIN="$(origin_list_add "$MIG_ORIGIN" "http://$MIG_IP")"
+      fi
     else
       ok "https-only: the raw-IP cleartext door (http://$MIG_IP) stays CLOSED"
     fi
     env_set "$ENV_FILE" SITE_ADDRESS "$MIG_SITE"
-    env_set "$ENV_FILE" CORS_ORIGIN "$MIG_SITE"
-    env_set "$ENV_FILE" ALLOWED_ORIGINS "$MIG_SITE"
-    warn "domain set to $DOMAIN — make sure the DNS A-record points at this server"
+    env_set "$ENV_FILE" CORS_ORIGIN "$MIG_ORIGIN"
+    env_set "$ENV_FILE" ALLOWED_ORIGINS "$MIG_ORIGIN"
+    warn "domain set to $DOMAIN — make sure the DNS A-records (apex AND www) point at this server"
   fi
 
   # -- 4. refresh systemd units (ships unit changes to existing installs) -------
@@ -761,10 +835,29 @@ cmd_update() {
   ensure_deploy_token
 
   # -- 5. restart services + re-render Caddy (ships ops/Caddyfile changes) -------
-  local SITE
+  local SITE UPD_DOMAIN UPD_CORS key
   SITE="$(grep '^SITE_ADDRESS=' "$ENV_FILE" | cut -d= -f2- || true)"
   [ -n "$SITE" ] || SITE=":80"
+
+  # www alias in CORS — idempotent, also on watcher-driven updates that
+  # carry no --domain: a domain-mode install gets https://www.DOMAIN added
+  # to both origin lists exactly once.
+  UPD_DOMAIN="$(derive_domain_from_site "$SITE")"
+  case "$UPD_DOMAIN" in
+    '' | www.*) : ;;
+    *)
+      for key in CORS_ORIGIN ALLOWED_ORIGINS; do
+        UPD_CORS="$(grep "^${key}=" "$ENV_FILE" | tail -1 | cut -d= -f2- || true)"
+        [ -n "$UPD_CORS" ] || UPD_CORS="https://$UPD_DOMAIN"
+        UPD_CORS="$(origin_list_add "$UPD_CORS" "https://www.$UPD_DOMAIN")"
+        env_set "$ENV_FILE" "$key" "$UPD_CORS"
+      done
+    ;;
+  esac
+
   render_caddyfile "$DIR" "$SITE"
+  caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
+    || die "generated Caddyfile is invalid — inspect /etc/caddy/Caddyfile"
   systemctl restart blasti-api.service blasti-web.service caddy
   ok "services restarted (api, web, caddy)"
 
