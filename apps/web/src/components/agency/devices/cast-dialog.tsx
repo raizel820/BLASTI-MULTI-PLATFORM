@@ -33,10 +33,15 @@ import {
   Info,
 } from 'lucide-react';
 import { useLanguage } from '@/hooks/use-language';
-import { getLocalizedName, type RealDiscoveredDevice } from './types';
+import { apiFetch } from '@/lib/api-fetch';
+import { getLocalizedName, deviceApi, type RealDiscoveredDevice } from './types';
 import { getCastApi } from '@/lib/google-cast';
 
-const PORT_Q = 'XTransformPort=3003';
+// NOTE: all cast/protocol requests go through `apiFetch` → apiClient, which
+// resolves the correct API base per runtime (Electron → local :3080 where the
+// working cast routes live, LAN-override → desktop master, plain browser →
+// cloud with the gateway hint injected automatically). Never append
+// XTransformPort manually here.
 
 // ── Protocol metadata ──────────────────────────────────────────────────────
 
@@ -97,20 +102,17 @@ export function CastDialog({ open, onOpenChange, device, agencyId, onToast }: Ca
 
     (async () => {
       // 1. Backend detection (DLNA / Samsung / LG / Roku) via the real
-      //    detectCastProtocols() helper.
+      //    detectCastProtocols() helper — routed through the shared client.
       try {
-        const params = new URLSearchParams({
-          ip: device.ip,
-          XTransformPort: '3003',
-        });
-        if (device.port) params.set('port', String(device.port));
-        if (device.manufacturer) params.set('manufacturer', device.manufacturer);
-        if (device.macVendor) params.set('manufacturer', device.macVendor);
-        if (device.model) params.set('model', device.model);
-        if (device.ssdpLocation) params.set('ssdpLocation', device.ssdpLocation);
-        if (device.mdnsService) params.set('mdnsService', device.mdnsService);
+        const params: Record<string, string> = { ip: device.ip };
+        if (device.port) params.port = String(device.port);
+        if (device.manufacturer) params.manufacturer = device.manufacturer;
+        if (device.macVendor) params.manufacturer = device.macVendor;
+        if (device.model) params.model = device.model;
+        if (device.ssdpLocation) params.ssdpLocation = device.ssdpLocation;
+        if (device.mdnsService) params.mdnsService = device.mdnsService;
 
-        const res = await fetch(`/api/agency-devices/discovery/cast/protocols?${params}`);
+        const res = await apiFetch(deviceApi('/discovery/cast/protocols', params));
         const data = await res.json();
         if (!cancelled && data.success) {
           setProtocols(data.protocols || []);
@@ -208,10 +210,10 @@ export function CastDialog({ open, onOpenChange, device, agencyId, onToast }: Ca
       }
 
       const endpoint = protocol && protocol !== 'url'
-        ? `/api/agency-devices/discovery/cast/${endpointForProtocol(protocol)}?${PORT_Q}`
-        : `/api/agency-devices/discovery/cast?${PORT_Q}`;
+        ? deviceApi(`/discovery/cast/${endpointForProtocol(protocol)}`)
+        : deviceApi('/discovery/cast');
 
-      const res = await fetch(endpoint, {
+      const res = await apiFetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -275,7 +277,7 @@ export function CastDialog({ open, onOpenChange, device, agencyId, onToast }: Ca
 
     // Stop DLNA session via the backend SOAP Stop command.
     try {
-      await fetch(`/api/agency-devices/discovery/cast/stop?${PORT_Q}`, {
+      await apiFetch(deviceApi('/discovery/cast/stop'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

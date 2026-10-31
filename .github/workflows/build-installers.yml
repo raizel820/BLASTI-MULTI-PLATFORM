@@ -76,6 +76,17 @@ jobs:
       - name: Package Windows installer (prebuild + electron-builder NSIS)
         run: bun run --filter @blasti/desktop build:win
 
+      # DELTA UPDATES (0.6.30): snapshot the diffable references (app.asar +
+      # out tree archive + runtime/native fingerprints) BEFORE dist/ is lost.
+      - name: Build release refs for delta updates
+        shell: pwsh
+        run: |
+          $electron = (Get-Content apps/desktop/node_modules/electron/package.json | ConvertFrom-Json).version
+          node scripts/make-release-refs.mjs `
+            --unpacked apps/desktop/dist/win-unpacked `
+            --out apps/desktop/dist/release-refs `
+            --electron-version $electron
+
       - name: Collect installer into installer/desktop/
         shell: pwsh
         run: |
@@ -90,6 +101,14 @@ jobs:
           path: installer/desktop/*.exe
           retention-days: 30
           if-no-files-found: error
+
+      - name: Upload desktop release refs artifact (delta updates)
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-release-refs
+          path: apps/desktop/dist/release-refs/*
+          retention-days: 30
+          if-no-files-found: warn
 
   # ─────────────────────────────────────────────────────────────────────────
   mobile-apk:
@@ -188,6 +207,14 @@ jobs:
           name: desktop-exe
           path: installer/desktop
 
+      - name: Download desktop release refs (delta updates)
+        if: needs.desktop-exe.result == 'success'
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: desktop-release-refs
+          path: release-refs
+
       - name: Download mobile APK
         if: needs.mobile-apk.result == 'success'
         uses: actions/download-artifact@v4
@@ -234,8 +261,20 @@ jobs:
               --version "$ver" \
               --api-url "$BLASTI_API_URL" \
               --token "$BLASTI_DEPLOY_TOKEN" \
-              --notes "Automated build from commit ${GITHUB_SHA::7} (run #${GITHUB_RUN_NUMBER})"
+              --notes "Automated build from commit ${GITHUB_SHA::7} (run #${GITHUB_RUN_NUMBER})" \
+              ${REF_ARGS}
           }
+
+          # Delta refs (desktop only, when the artifact exists)
+          REF_ARGS=""
+          if [ -f release-refs/app.asar ] && [ -f release-refs/outref.bin ] && [ -f release-refs/refs.json ]; then
+            REF_ARGS="--asar release-refs/app.asar --outref release-refs/outref.bin"
+            REF_ARGS="$REF_ARGS --runtime-key $(node -p "JSON.parse(require('fs').readFileSync('release-refs/refs.json','utf8')).runtimeKey")"
+            REF_ARGS="$REF_ARGS --native-fingerprint $(node -p "JSON.parse(require('fs').readFileSync('release-refs/refs.json','utf8')).nativeFingerprint")"
+            echo "delta refs found — differential updates will be generated"
+          else
+            echo "no delta refs artifact — desktop updates fall back to full installers"
+          fi
 
           uploaded=false
           for f in installer/desktop/*.exe; do

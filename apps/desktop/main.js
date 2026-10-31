@@ -429,6 +429,7 @@ function showFatalErrorBox(title, message) {
 
 process.on('uncaughtException', (err) => {
   console.error('[BLASTI Desktop] UNCAUGHT EXCEPTION:', err && (err.stack || err.message) || err);
+  requestRendererLogFlush(); // STRICT LOGS (0.6.30): main errors reach the vault in seconds
   if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) {
     showFatalErrorBox(
       'BLASTI — error',
@@ -440,6 +441,7 @@ process.on('uncaughtException', (err) => {
 
 process.on('unhandledRejection', (reason) => {
   console.error('[BLASTI Desktop] UNHANDLED REJECTION:', reason && (reason.stack || reason.message) || reason);
+  requestRendererLogFlush();
   if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) {
     showFatalErrorBox(
       'BLASTI — error',
@@ -448,6 +450,22 @@ process.on('unhandledRejection', (reason) => {
     );
   }
 });
+
+// ─── STRICT LOGS (0.6.30) — main→renderer flush request ────────────────────
+// The remote logger lives in the renderer; when the MAIN process hits an
+// error (uncaughtException / unhandledRejection / updater / installer) it
+// pushes a flush request so the merged ring (which already carries the main
+// lines) uploads within seconds instead of the next 30 s tick.
+let lastFlushRequestAt = 0;
+function requestRendererLogFlush() {
+  // Throttle: main errors can burst — one flush request per 10 s is plenty.
+  const now = Date.now();
+  if (now - lastFlushRequestAt < 10_000) return;
+  lastFlushRequestAt = now;
+  for (const win of BrowserWindow.getAllWindows()) {
+    try { if (!win.isDestroyed()) win.webContents.send('logs:flush-requested'); } catch { /* window gone */ }
+  }
+}
 
 // Task 2-b (sub-task 5): SIGINT/SIGTERM must run the SAME embedded-service
 // teardown as a UI quit — a terminal Ctrl+C (dev) or a process-manager stop
@@ -1785,6 +1803,29 @@ ipcMain.handle('get-platform', () => ({
 // periodic /api/logs uploads (see apps/web/src/lib/remote-logger.ts).
 ipcMain.handle('get-recent-main-logs', () => _mainLogRing.slice(-120));
 
+// ─── STRICT LOGS (0.6.30) — diagnostic tails for the remote-logger flush ────
+// The local API's rolling diag file and the updater's install log hold most
+// desktop failures — the renderer merges their tails into every flush so
+// LAN-side errors and installer problems reach the SAME cloud vault.
+ipcMain.handle('get-recent-diag-logs', () => {
+  const out = { diag: [], install: [] };
+  try {
+    const diagFile = path.join(app.getPath('userData'), 'logs', 'local-api-diag.log');
+    if (fs.existsSync(diagFile)) {
+      const raw = fs.readFileSync(diagFile, 'utf8').split('\n');
+      out.diag = raw.slice(-120);
+    }
+  } catch { /* diag log unreadable — skip */ }
+  try {
+    const installFile = path.join(UPDATES_DIR(), 'install-log.txt');
+    if (fs.existsSync(installFile)) {
+      const raw = fs.readFileSync(installFile, 'utf8').split('\n');
+      out.install = raw.slice(-60);
+    }
+  } catch { /* install log unreadable — skip */ }
+  return out;
+});
+
 // Loading screen: user clicked "Launch App" — only proceed if ALL checks passed
 ipcMain.on('loading:finish', () => {
   if (diagnosticsDone && diagnosticsAllPassed) {
@@ -1962,7 +2003,7 @@ ipcMain.handle('updates:check', async () => {
 });
 
 ipcMain.handle('updates:download', async (_e, payload) => {
-  const { url, version } = payload || {};
+  const { url, version, fileHash, fileSize } = payload || {};
   const resolved = resolveUpdateUrl(url);
   if (!resolved) return { status: 'error', error: 'missing-url' };
   if (activeUpdateDownload) return { status: 'busy', version: activeUpdateDownload.version };
@@ -1971,7 +2012,7 @@ ipcMain.handle('updates:download', async (_e, payload) => {
   const dest = path.join(UPDATES_DIR(), /^BLASTI-Setup-.*\.exe$/i.test(fileName) ? fileName : `BLASTI-Setup-${version || 'update'}.exe`);
   try { fs.mkdirSync(path.dirname(dest), { recursive: true }); } catch { /* exists */ }
 
-  activeUpdateDownload = { version: version || '', url: resolved, dest };
+  activeUpdateDownload = { version: version || '', url: resolved, dest, fileHash: String(fileHash || ''), fileSize: Number(fileSize || 0) };
   console.log('[BLASTI Desktop] updates:download →', resolved, '→', dest);
   (async () => {
     let lastSentPercent = -1;
@@ -1988,11 +2029,24 @@ ipcMain.handle('updates:download', async (_e, payload) => {
     try {
       const received = await downloadUpdateFile(resolved, dest, emit);
       lastDownloadedInstaller = dest;
+      // INSTALL FIX (0.6.30): the field bug "app closes and nothing happens"
+      // was a CORRUPTED installereaching the NSIS run — /S fails instantly and
+      // silently, the app had already quit. Verify size + sha256 BEFORE the
+      // downloaded state is announced; a bad file is deleted and re-downloadable.
+      const verify = await verifyDownloadedInstaller(dest, activeUpdateDownload.fileHash, activeUpdateDownload.fileSize);
+      if (!verify.ok) {
+        console.warn('[BLASTI Desktop] update download FAILED INTEGRITY CHECK:', verify.error);
+        try { fs.unlinkSync(dest); } catch { /* already gone */ }
+        lastDownloadedInstaller = null;
+        requestRendererLogFlush();
+        sendUpdateProgress({ status: 'error', error: verify.error, version: activeUpdateDownload.version });
+        return;
+      }
       sendUpdateProgress({ status: 'downloaded', percent: 100, receivedBytes: received, totalBytes: received, filePath: dest, version: activeUpdateDownload.version });
       for (const win of BrowserWindow.getAllWindows()) {
         try { if (!win.isDestroyed()) win.webContents.send('update:downloaded', { filePath: dest, version: activeUpdateDownload.version }); } catch { /* window gone */ }
       }
-      console.log('[BLASTI Desktop] update downloaded:', dest, `(${received} bytes)`);
+      console.log('[BLASTI Desktop] update downloaded + verified:', dest, `(${received} bytes, sha256 ${verify.sha256.slice(0, 12)}…)`);
     } catch (err) {
       console.warn('[BLASTI Desktop] update download failed:', err && err.message);
       sendUpdateProgress({ status: 'error', error: (err && err.message) || 'download-failed', version: activeUpdateDownload ? activeUpdateDownload.version : '' });
@@ -2003,6 +2057,31 @@ ipcMain.handle('updates:download', async (_e, payload) => {
   })();
   return { status: 'started', dest };
 });
+
+/** INSTALL FIX — size + sha256 gate every downloaded installer must pass. */
+async function verifyDownloadedInstaller(filePath, expectedHash, expectedSize) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size === 0) return { ok: false, error: 'empty-download' };
+    if (expectedSize && stat.size !== expectedSize) {
+      return { ok: false, error: `size-mismatch (${stat.size} != ${expectedSize})` };
+    }
+    const crypto = require('crypto');
+    const sha256 = await new Promise((resolve, reject) => {
+      const h = crypto.createHash('sha256');
+      const s = fs.createReadStream(filePath);
+      s.on('data', (chunk) => h.update(chunk));
+      s.on('error', reject);
+      s.on('end', () => resolve(h.digest('hex')));
+    });
+    if (expectedHash && expectedHash.length >= 16 && sha256 !== expectedHash) {
+      return { ok: false, error: `hash-mismatch (got ${sha256.slice(0, 12)}…, want ${String(expectedHash).slice(0, 12)}…)`, sha256 };
+    }
+    return { ok: true, sha256 };
+  } catch (err) {
+    return { ok: false, error: `verify-failed: ${(err && err.message) || err}` };
+  }
+}
 
 // ─── Fast parallel update downloader ─────────────────────────────────────────
 // The old single-connection fetch felt dramatically slower than the browser
@@ -2143,7 +2222,18 @@ async function downloadSingleStream(url, dest, emit) {
   return received;
 }
 
-function runInstallerAndQuit() {
+/**
+ * INSTALL FIX (0.6.30) — the OLD flow quit unconditionally 300 ms after
+ * spawning the installer, so every spawn failure looked like "the app just
+ * closed". The rewrite:
+ *   1. verifies the downloaded installer again before touching it,
+ *   2. only schedules app.quit() AFTER the spawned helper process is
+ *      CONFIRMED alive (pid + still running 900 ms later),
+ *   3. returns { ok:false } instead of quitting when every launcher leg
+ *      fails — the renderer keeps running, tells the user, and offers the
+ *      manual "open installer file" fallback (updates:open-installer).
+ */
+async function installDownloadedUpdate() {
   const installer = lastDownloadedInstaller || (() => {
     try {
       const files = fs.readdirSync(UPDATES_DIR()).filter((f) => /\.(exe|dmg|appimage|deb)$/i.test(f))
@@ -2153,7 +2243,29 @@ function runInstallerAndQuit() {
     } catch { return null; }
   })();
   if (!installer || !fs.existsSync(installer)) return { ok: false, error: 'no-download' };
-  console.log('[BLASTI Desktop] updates:install → quitting and running:', installer);
+
+  const stat = fs.statSync(installer);
+  if (!stat.isFile() || stat.size === 0) {
+    console.warn('[BLASTI Desktop] updates:install → downloaded file is empty/corrupt, refusing to quit:', installer);
+    try { fs.unlinkSync(installer); } catch { /* keep */ }
+    lastDownloadedInstaller = null;
+    return { ok: false, error: 'corrupt-download' };
+  }
+  console.log('[BLASTI Desktop] updates:install → installing:', installer, `(${stat.size} bytes)`);
+
+  const procAlive = (pid) => new Promise((resolve) => {
+    try {
+      process.kill(pid, 0); // signal 0 = existence probe
+      setTimeout(() => {
+        try { process.kill(pid, 0); resolve(true); } catch { resolve(false); }
+      }, 900);
+    } catch { resolve(false); }
+  });
+
+  const quitForUpdate = () => {
+    setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 300);
+  };
+
   if (process.platform === 'win32') {
     // UPDATE-0.6.14 — per-user installs (the DEFAULT for this app:
     // nsis.perMachine:false) go through the self-contained Electron waiter:
@@ -2164,18 +2276,38 @@ function runInstallerAndQuit() {
     // happens": the previous flow depended on `powershell -EncodedCommand`,
     // which endpoint antivirus suites heuristically kill, leaving the
     // installer unlaunched with no visible error.
-    if (app.isPackaged && isPerUserWindowsInstall() && spawnUpdateWaiter(installer)) {
-      setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 300);
-      return { ok: true };
+    if (app.isPackaged && isPerUserWindowsInstall()) {
+      const pid = spawnUpdateWaiter(installer);
+      if (pid && await procAlive(pid)) {
+        console.log('[BLASTI Desktop] update waiter confirmed alive (pid', pid + ') — quitting for install');
+        quitForUpdate();
+        return { ok: true };
+      }
+      console.warn('[BLASTI Desktop] update waiter did not stay alive — trying the PowerShell leg');
     }
     // Fallbacks: dev runs (not packaged), per-machine (Program Files) installs
     // (the PowerShell leg elevates via UAC — a non-elevated silent install
     // into Program Files ALWAYS fails silently), or a failed waiter copy.
-    spawnSilentWindowsInstall(installer, { elevate: app.isPackaged && !isPerUserWindowsInstall() });
-  } else {
-    try { require('child_process').spawn('xdg-open', [installer], { detached: true, stdio: 'ignore' }).unref(); } catch { shell.openPath(installer); }
+    const psPid = spawnSilentWindowsInstall(installer, { elevate: app.isPackaged && !isPerUserWindowsInstall() });
+    if (psPid && await procAlive(psPid)) {
+      console.log('[BLASTI Desktop] PowerShell installer leg confirmed alive (pid', psPid + ') — quitting for install');
+      quitForUpdate();
+      return { ok: true };
+    }
+    // 0.6.30: NEVER quit on a failed spawn — report the failure instead so
+    // the user keeps their session and can run the installer manually.
+    console.error('[BLASTI Desktop] every installer launcher failed — the app stays open (manual install available)');
+    requestRendererLogFlush();
+    sendUpdateProgress({ status: 'error', error: 'install-spawn-failed', version: '' });
+    return { ok: false, error: 'install-spawn-failed' };
   }
-  setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 300);
+
+  // macOS / Linux: open the artifact with the OS handler.
+  let opened = false;
+  try { require('child_process').spawn('xdg-open', [installer], { detached: true, stdio: 'ignore' }).unref(); opened = true; } catch { /* fallthrough */ }
+  if (!opened) { try { await shell.openPath(installer); opened = true; } catch { /* last try */ } }
+  if (!opened) return { ok: false, error: 'install-spawn-failed' };
+  quitForUpdate();
   return { ok: true };
 }
 
@@ -2206,9 +2338,12 @@ function spawnUpdateWaiter(installerPath) {
   try {
     try { fs.unlinkSync(waiterPath); } catch { /* absent or locked by an old waiter */ }
     fs.copyFileSync(process.execPath, waiterPath);
+    // 0.6.30: prove the copy — a zero-byte waiter spawns nothing.
+    const ws = fs.statSync(waiterPath);
+    if (ws.size !== fs.statSync(process.execPath).size) throw new Error('waiter copy truncated');
   } catch (err) {
     console.warn('[BLASTI Desktop] waiter copy failed — falling back to PowerShell leg:', err && err.message);
-    return false;
+    return null;
   }
   try {
     const child = cp.spawn(
@@ -2218,11 +2353,12 @@ function spawnUpdateWaiter(installerPath) {
     );
     child.on('error', (err) => console.warn('[BLASTI Desktop] waiter spawn error:', err.message));
     child.unref();
-    console.log('[BLASTI Desktop] update waiter spawned:', waiterPath);
-    return true;
+    if (!child.pid) return null;
+    console.log('[BLASTI Desktop] update waiter spawned:', waiterPath, 'pid', child.pid);
+    return child.pid;
   } catch (err) {
     console.warn('[BLASTI Desktop] waiter spawn failed — falling back to PowerShell leg:', err && err.message);
-    return false;
+    return null;
   }
 }
 
@@ -2278,8 +2414,12 @@ function spawnSilentWindowsInstall(installerPath, opts = {}) {
       { detached: true, stdio: 'ignore', windowsHide: true, cwd: os.tmpdir() });
     child.on('error', (err) => console.warn('[BLASTI Desktop] installer spawn failed:', err.message));
     child.unref();
+    // 0.6.30: the caller confirms the process STAYS alive before quitting —
+    // AV-killed PowerShell legs used to leave the app closed with no install.
+    return child.pid || null;
   } catch (err) {
     console.warn('[BLASTI Desktop] installer spawn threw:', err && err.message);
+    return null;
   }
 }
 
@@ -2319,7 +2459,200 @@ function selfHealPendingInstaller() {
   }
 }
 
-ipcMain.handle('updates:install', async () => runInstallerAndQuit());
+ipcMain.handle('updates:install', async () => {
+  const result = await installDownloadedUpdate();
+  if (!result.ok) {
+    // 0.6.30 — tell the renderer the install did NOT start; it keeps the
+    // user's session alive and shows the manual-open-installer fallback.
+    for (const win of BrowserWindow.getAllWindows()) {
+      try { if (!win.isDestroyed()) win.webContents.send('update:install-failed', { error: result.error }); } catch { /* gone */ }
+    }
+  }
+  return result;
+});
+
+/** Manual fallback — open the downloaded installer in Explorer's handler. */
+ipcMain.handle('updates:open-installer', async () => {
+  const installer = lastDownloadedInstaller || (() => {
+    try {
+      const files = fs.readdirSync(UPDATES_DIR()).filter((f) => /\.(exe|dmg|appimage|deb)$/i.test(f))
+        .map((f) => ({ f, t: fs.statSync(path.join(UPDATES_DIR(), f)).mtimeMs }))
+        .sort((a, b) => b.t - a.t);
+      return files.length ? path.join(UPDATES_DIR(), files[0].f) : null;
+    } catch { return null; }
+  })();
+  if (!installer || !fs.existsSync(installer)) return { ok: false, error: 'no-download' };
+  const result = await shell.openPath(installer);
+  return { ok: !result, error: result || undefined, path: installer };
+});
+
+/** Relaunch AFTER a successful delta apply — the new asar loads on boot. */
+ipcMain.handle('updates:relaunch-after-delta', () => {
+  try {
+    console.log('[BLASTI Desktop] relaunching after delta update…');
+    app.relaunch();
+    setTimeout(() => { try { app.exit(0); } catch { /* falling */ } }, 250);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err && err.message || err) };
+  }
+});
+
+// ─── Delta Updates (0.6.30) — apply the differential chain in place ──────────
+// payload: { hops: [{ url, sha256, size, fromVersion, toVersion, fromArtifactHash }],
+//            target: { version, asarSha256, runtimeKey, nativeFingerprint } }
+// The renderer resolves the URLs to absolute cloud paths; every hop is
+// downloaded to <userData>/updates/, sha-verified, then applied IN ORDER:
+//   hop patch = BLSTRLS1 { asar delta (→ new app.asar) + out tree patch }
+// A failure anywhere keeps the running install intact (asar swap is atomic
+// rename; the tree patch is verified per file) and returns { ok:false } so
+// the renderer falls back to the full installer download.
+ipcMain.handle('updates:install-delta', async (_e, payload) => {
+  const hops = Array.isArray(payload && payload.hops) ? payload.hops : [];
+  const target = (payload && payload.target) || {};
+  if (hops.length === 0) return { ok: false, error: 'no-hops' };
+  const fsDelta = require('@blasti/binary-delta');
+  const resourcesPath = process.resourcesPath || path.join(path.dirname(process.execPath), 'resources');
+  const asarPath = path.join(resourcesPath, 'app.asar');
+  const unpackedTree = path.join(resourcesPath, 'app.asar.unpacked');
+  const sendStage = (percent, stage) => sendUpdateProgress({ status: 'downloading', percent, receivedBytes: percent, totalBytes: 100, version: target.version || '', stage });
+  try {
+    if (!fs.existsSync(asarPath)) return { ok: false, error: 'asar-not-found' };
+
+    // 1) Verify the CURRENT asar against the FIRST hop's anchor.
+    const firstAnchor = hops[0].fromArtifactHash || '';
+    if (firstAnchor) {
+      sendStage(2, 'verify-current');
+      const currentSha = await fsDelta.sha256OfFile(asarPath);
+      if (currentSha !== firstAnchor) {
+        console.warn('[BLASTI Desktop] delta chain anchor mismatch: local asar', currentSha.slice(0, 12), '≠ expected', firstAnchor.slice(0, 12));
+        return { ok: false, error: 'asar-anchor-mismatch' };
+      }
+    }
+
+    // 2) Download every hop patch + verify sha256.
+    const hopFiles = [];
+    let doneBytes = 0;
+    const totalBytes = hops.reduce((s, h) => s + (h.size || 0), 0) || 1;
+    for (let i = 0; i < hops.length; i++) {
+      const hop = hops[i];
+      const url = resolveUpdateUrl(hop.url);
+      if (!url) return { ok: false, error: 'hop-url-missing' };
+      const dest = path.join(UPDATES_DIR(), `delta-${hop.fromVersion}-to-${hop.toVersion}-${Date.now()}.patch`);
+      try { fs.mkdirSync(UPDATES_DIR(), { recursive: true }); } catch { /* exists */ }
+      sendStage(Math.round((doneBytes / totalBytes) * 90), 'download');
+      const size = await downloadUpdateFile(url, dest, (received, total) => {
+        sendStage(Math.round(((doneBytes + Math.min(received, total)) / totalBytes) * 90), 'download');
+      });
+      const dl = await verifyDownloadedInstaller(dest, hop.sha256, size);
+      if (!dl.ok) {
+        try { fs.unlinkSync(dest); } catch { /* keep */ }
+        return { ok: false, error: `hop-verify-failed: ${dl.error}` };
+      }
+      doneBytes += size;
+      hopFiles.push(dest);
+    }
+
+    // 3) Apply the hops in order. `currentAsar` chains: hop k+1's asar delta
+    // applies to hop k's RESULT (that is what the server diffed against).
+    let appliedAsar = 0;
+    let appliedTree = 0;
+    let currentAsar = asarPath;
+    const stashedAsars = [];
+    for (let i = 0; i < hopFiles.length; i++) {
+      const patchBuf = fs.readFileSync(hopFiles[i]);
+      const parsed = fsDelta.parseReleasePatch(patchBuf);
+      const hop = hops[i];
+      if (parsed.header.fromVersion !== hop.fromVersion || parsed.header.toVersion !== hop.toVersion) {
+        return { ok: false, error: `hop-version-mismatch (${parsed.header.fromVersion}→${parsed.header.toVersion})` };
+      }
+      if (parsed.header.asar) {
+        sendStage(92, `apply-asar-${i + 1}`);
+        const newAsar = path.join(UPDATES_DIR(), `app.asar.hop${i}`);
+        await fsDelta.applyDeltaToFile(currentAsar, patchBuf, newAsar); // verify sha256 inside
+        appliedAsar++;
+        stashedAsars.push(newAsar);
+        currentAsar = newAsar;
+      }
+      if (parsed.header.tree) {
+        sendStage(94, `apply-tree-${i + 1}`);
+        const treePart = extractTreePart(patchBuf, parsed);
+        const result = fsDelta.applyTreePatch(unpackedTree, treePart);
+        if (result.failed.length > 0) {
+          console.error('[BLASTI Desktop] tree patch failures:', result.failed.slice(0, 5));
+          return { ok: false, error: `tree-patch-failed:${result.failed[0].p}` };
+        }
+        appliedTree++;
+      }
+    }
+
+    // 4) Atomic asar swap: only the LAST chained result goes live.
+    if (appliedAsar > 0) {
+      sendStage(98, 'swap-asar');
+      const finalAsar = stashedAsars[stashedAsars.length - 1];
+      const backup = path.join(UPDATES_DIR(), 'app.asar.pre-delta');
+      try { fs.unlinkSync(backup); } catch { /* absent */ }
+      try {
+        fs.renameSync(asarPath, backup);
+      } catch (err) {
+        // Windows file lock → schedule the swap for the next boot instead of
+        // failing outright (boot-time self-heal finishes the job).
+        console.warn('[BLASTI Desktop] asar rename blocked at runtime — scheduling boot swap:', err.message);
+        fs.writeFileSync(path.join(UPDATES_DIR(), 'asar-pending.json'), JSON.stringify({
+          pendingAsar: finalAsar,
+          targetVersion: target.version || '',
+          at: new Date().toISOString(),
+        }, null, 2));
+        return { ok: true, pendingBootSwap: true };
+      }
+      fs.copyFileSync(finalAsar, asarPath);
+      try { fs.unlinkSync(finalAsar); } catch { /* cleanup */ }
+      try { fs.unlinkSync(backup); } catch { /* keep one generation */ }
+    }
+
+    sendStage(100, 'done');
+    console.log(`[BLASTI Desktop] delta chain applied: ${hops.map((h) => `${h.fromVersion}→${h.toVersion}`).join(', ')} (asar hops: ${appliedAsar}, tree hops: ${appliedTree})`);
+    // Clean the downloaded hop files.
+    for (const f of hopFiles) { try { fs.unlinkSync(f); } catch { /* best effort */ } }
+    return { ok: true, version: target.version || '' };
+  } catch (err) {
+    console.error('[BLASTI Desktop] delta install failed:', err && (err.stack || err.message));
+    requestRendererLogFlush();
+    return { ok: false, error: `delta-failed: ${(err && err.message) || err}` };
+  }
+});
+
+/** Split a BLSTRLS1 release patch into its TREE part (BLSTOUT1 bytes). */
+function extractTreePart(releasePatchBuf, parsed) {
+  let offset = 12 + releasePatchBuf.readUInt32BE(8);
+  const header = parsed.header;
+  if (header.asar) offset += header.asar.size;
+  if (header.tree) return releasePatchBuf.subarray(offset, offset + header.tree.size);
+  throw new Error('release patch has no tree part');
+}
+
+/** Boot-time completion of a delta asar swap the running app could not do. */
+function selfHealPendingAsarSwap() {
+  try {
+    const markerPath = path.join(UPDATES_DIR(), 'asar-pending.json');
+    if (!fs.existsSync(markerPath)) return;
+    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    fs.unlinkSync(markerPath);
+    if (!marker.pendingAsar || !fs.existsSync(marker.pendingAsar)) return;
+    const resourcesPath = process.resourcesPath || path.join(path.dirname(process.execPath), 'resources');
+    const asarPath = path.join(resourcesPath, 'app.asar');
+    try {
+      const backup = path.join(UPDATES_DIR(), 'app.asar.pre-delta');
+      try { fs.renameSync(asarPath, backup); } catch { /* may still be locked */ }
+      fs.copyFileSync(marker.pendingAsar, asarPath);
+      fs.unlinkSync(marker.pendingAsar);
+      console.log('[BLASTI Desktop] boot self-heal: pending delta asar swap completed →', marker.targetVersion);
+      setTimeout(() => { try { app.relaunch(); app.exit(0); } catch { /* fallthrough */ } }, 1200);
+    } catch (err) {
+      console.warn('[BLASTI Desktop] boot asar swap failed:', err.message);
+    }
+  } catch { /* marker unreadable — ignore */ }
+}
 
 ipcMain.handle('updates:network-info', () => {
   // Best-effort Wi-Fi/metered classification for "auto-download on Wi-Fi only".
@@ -2347,7 +2680,7 @@ ipcMain.on('update:install', () => {
   try {
     const haveLocal = lastDownloadedInstaller && fs.existsSync(lastDownloadedInstaller);
     if (haveLocal) {
-      runInstallerAndQuit();
+      void installDownloadedUpdate();
       return;
     }
     const telemetry = require('./device-telemetry');
@@ -3237,6 +3570,12 @@ app.whenReady().then(async () => {
   // PowerShell wrapper relaunch the freshly installed build.
   try { selfHealPendingInstaller(); } catch (healErr) {
     console.warn('[BLASTI Desktop] update self-heal failed (non-fatal):', healErr && healErr.message);
+  }
+
+  // DELTA UPDATES (0.6.30): finish an asar swap the previous session could
+  // not perform (Windows file lock) — BEFORE anything else reads the asar.
+  try { selfHealPendingAsarSwap(); } catch (healErr) {
+    console.warn('[BLASTI Desktop] asar self-heal failed (non-fatal):', healErr && healErr.message);
   }
 
   // Task 40: stale-bundle guard — the build stamp is written by prebuild.js on

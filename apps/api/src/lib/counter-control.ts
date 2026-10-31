@@ -498,14 +498,19 @@ export async function sweepStaleCounterControl(): Promise<SweptCounter[]> {
 }
 
 export type ExpiredRequestOutcome =
-  | { kind: 'AUTO_APPROVED'; requestId: string; agencyId: string; counterId: string; counterName: string; counterNumber: number; fromUserId: string }
-  | { kind: 'EXPIRED'; requestId: string; agencyId: string; counterId: string; counterName: string; counterNumber: number; fromUserId: string }
+  | { kind: 'AUTO_APPROVED'; requestId: string; reason: 'HOLDER_GONE'; agencyId: string; counterId: string; counterName: string; counterNumber: number; fromUserId: string }
+  | { kind: 'EXPIRED'; requestId: string; reason: 'HOLDER_ACTIVE' | 'NOT_MEMBER' | 'TRANSFER_RACE'; agencyId: string; counterId: string; counterName: string; counterNumber: number; fromUserId: string }
 
 /**
  * Sweeper pass #2 — resolve PENDING CounterControlRequests past expiresAt
- * (the 60s no-response window): auto-approve (transfer control) when the
- * requester is STILL an active member of the agency, else mark EXPIRED.
- * Returns the outcomes so the worker can emit the matching counter:* events.
+ * (the 60s no-response window).
+ *
+ * r24 (user ruling): an account whose app is OPEN and RUNNING is ACTIVE —
+ * idle does NOT mean gone. The auto-claim therefore fires ONLY when the
+ * current holder's control lease itself went stale (crash / closed app) or
+ * there is no holder at all. A live holder (fresh heartbeat) keeps control;
+ * its request expires with reason HOLDER_ACTIVE and the requester is told
+ * the holder is still active (they can retry, or an owner can force-assign).
  */
 export async function sweepExpiredCounterRequests(): Promise<ExpiredRequestOutcome[]> {
   const pending = await db.counterControlRequest.findMany({
@@ -526,9 +531,40 @@ export async function sweepExpiredCounterRequests(): Promise<ExpiredRequestOutco
     })
     if (claimedRow.count === 0) continue
 
+    // r24 — HOLDER LIVENESS GATE. The holder is "active" while its control
+    // heartbeat is fresh (app open — heartbeats flow every 60s, TTL 3min).
+    // A just-claimed counter with no heartbeat yet counts as alive too.
+    const counter = await db.counter.findUnique({
+      where: { id: req.counter.id },
+      select: { controlledByUserId: true, controlHeartbeatAt: true, controlClaimedAt: true },
+    })
+    const cutoff = staleCutoff()
+    const holderAlive =
+      !!counter?.controlledByUserId &&
+      (counter.controlHeartbeatAt
+        ? counter.controlHeartbeatAt >= cutoff
+        : !!counter.controlClaimedAt && counter.controlClaimedAt >= cutoff)
+    if (holderAlive) {
+      await db.counterControlRequest.updateMany({
+        where: { id: req.id, status: 'APPROVED', resolvedByUserId: null },
+        data: { status: 'EXPIRED' },
+      })
+      outcomes.push({
+        kind: 'EXPIRED',
+        reason: 'HOLDER_ACTIVE',
+        requestId: req.id,
+        agencyId: req.agencyId,
+        counterId: req.counter.id,
+        counterName: req.counter.name,
+        counterNumber: req.counter.number,
+        fromUserId: req.fromUserId,
+      })
+      continue
+    }
+
     const stillMember = await isUserActiveMember(req.fromUserId, req.agencyId)
     if (stillMember) {
-      // Auto-claim: transfer control to the requester (1-minute no-response).
+      // Auto-claim: transfer control to the requester (holder really gone).
       const staff = await db.agencyStaff.findFirst({
         where: { userId: req.fromUserId, agencyId: req.agencyId, isActive: true },
         select: { id: true },
@@ -543,6 +579,7 @@ export async function sweepExpiredCounterRequests(): Promise<ExpiredRequestOutco
       if (transfer.ok) {
         outcomes.push({
           kind: 'AUTO_APPROVED',
+          reason: 'HOLDER_GONE',
           requestId: req.id,
           agencyId: req.agencyId,
           counterId: req.counter.id,
@@ -562,6 +599,7 @@ export async function sweepExpiredCounterRequests(): Promise<ExpiredRequestOutco
     })
     outcomes.push({
       kind: 'EXPIRED',
+      reason: stillMember ? 'TRANSFER_RACE' : 'NOT_MEMBER',
       requestId: req.id,
       agencyId: req.agencyId,
       counterId: req.counter.id,

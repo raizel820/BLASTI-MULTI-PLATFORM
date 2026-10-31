@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useCallback } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -21,9 +21,10 @@ import {
   Timer,
   WifiOff,
   Search,
+  X,
   XCircle,
   Radio,
-  Smartphone,
+  MapPin,
   Unplug,
 } from 'lucide-react';
 import { useLanguage } from '@/hooks/use-language';
@@ -36,6 +37,7 @@ import {
   HeartbeatIndicator,
   ConnectionQualityBar,
   ScreenLayoutIcon,
+  DeviceIconComponent,
   getHeartbeatLabel,
   formatUptime,
   isRecentlyAlive,
@@ -128,7 +130,7 @@ function DeviceCard({
             </div>
             <div className="flex-1 min-w-0 space-y-1">
               <div className="flex items-center gap-2">
-                <h3 className="font-semibold text-sm truncate">
+                <h3 className="text-sm font-medium max-w-[12rem] truncate">
                   {getLocalizedName(device, lang)}
                 </h3>
                 {/* Pulse status indicator */}
@@ -140,12 +142,21 @@ function DeviceCard({
                 )}
               </div>
               <div className="flex items-center gap-1.5 flex-wrap">
-                <Badge variant="secondary" className={`text-[10px] px-1.5 py-0 ${typeConfig.color}`}>
+                <Badge variant="secondary" className={`text-[10px] px-1.5 py-0 gap-1 ${typeConfig.color}`}>
                   {getLocalizedLabel(typeConfig, lang)}
                 </Badge>
-                <Badge variant="secondary" className={`text-[10px] px-1.5 py-0 ${statusConfig.color}`}>
+                {/* Status badge with its dot (online emerald / offline gray / pending amber) */}
+                <Badge variant="secondary" className={`text-[10px] px-1.5 py-0 gap-1 ${statusConfig.color}`}>
+                  <span className={`h-1.5 w-1.5 rounded-full ${statusConfig.dotColor}`} />
                   {getLocalizedLabel(statusConfig, lang)}
                 </Badge>
+                {/* Branch chip */}
+                {device.branch && (
+                  <Badge variant="outline" className="text-[10px] px-1.5 py-0 gap-1 max-w-[9rem]">
+                    <MapPin className="h-2.5 w-2.5 shrink-0" />
+                    <span className="truncate">{getLocalizedName(device.branch, lang)}</span>
+                  </Badge>
+                )}
               </div>
             </div>
           </div>
@@ -190,31 +201,31 @@ function DeviceCard({
             </Badge>
           </div>
 
-          {/* Quick Actions */}
-          <div className="flex items-center gap-1 pt-1 border-t border-border/40">
+          {/* Quick Actions — always visible, sized h-9, wrap on mobile */}
+          <div className="flex items-center gap-1 pt-2 border-t border-border/40 flex-wrap">
             {(device.type === 'TV' || device.type === 'DISPLAY') && (
               <Button
                 variant="ghost"
                 size="sm"
                 onClick={(e) => { e.stopPropagation(); onTvPreview(device); }}
-                className="h-7 gap-1.5 px-2 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-50 dark:hover:bg-cyan-950/20"
+                className="h-9 gap-1.5 px-2.5 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-50 dark:hover:bg-cyan-950/20"
               >
-                <Monitor className="h-3.5 w-3.5" />
-                <span className="text-[11px] font-medium">{getLocalizedString('شاشة العرض', 'Écran', 'Display', lang)}</span>
+                <Monitor className="h-4 w-4" />
+                <span className="text-xs font-medium">{getLocalizedString('شاشة العرض', 'Écran', 'Display', lang)}</span>
               </Button>
             )}
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onEdit(device); }} className="h-7 w-7 p-0">
-                  <Edit3 className="h-3.5 w-3.5" />
+                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onEdit(device); }} className="h-9 w-9 p-0">
+                  <Edit3 className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{getLocalizedString('تعديل', 'Modifier', 'Edit', lang)}</TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onPair(device); }} className="h-7 w-7 p-0">
-                  <QrCode className="h-3.5 w-3.5" />
+                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onPair(device); }} className="h-9 w-9 p-0">
+                  <QrCode className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{getLocalizedString('ربط', 'Associer', 'Pair', lang)}</TooltipContent>
@@ -222,8 +233,8 @@ function DeviceCard({
             {device.type === 'KIOSK' && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onKioskCredentials(device); }} className="h-7 w-7 p-0 text-amber-600 dark:text-amber-400">
-                    <KeyRound className="h-3.5 w-3.5" />
+                  <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onKioskCredentials(device); }} className="h-9 w-9 p-0 text-amber-600 dark:text-amber-400">
+                    <KeyRound className="h-4 w-4" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>{getLocalizedString('بيانات الكيوسك', 'Identifiants kiosque', 'Kiosk Credentials', lang)}</TooltipContent>
@@ -231,27 +242,27 @@ function DeviceCard({
             )}
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onCommand(device); }} className="h-7 w-7 p-0">
-                  <Terminal className="h-3.5 w-3.5" />
+                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onCommand(device); }} className="h-9 w-9 p-0">
+                  <Terminal className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{getLocalizedString('إرسال أمر', 'Envoyer une commande', 'Send Command', lang)}</TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onQuickRefresh(device); }} className="h-7 w-7 p-0">
-                  <RefreshCw className="h-3.5 w-3.5" />
+                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onQuickRefresh(device); }} className="h-9 w-9 p-0">
+                  <RefreshCw className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{getLocalizedString('تحديث', 'Rafraîchir', 'Refresh', lang)}</TooltipContent>
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onToggleEnable(device); }} className="h-7 w-7 p-0">
+                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onToggleEnable(device); }} className="h-9 w-9 p-0">
                   {device.status === 'DISABLED' ? (
-                    <Eye className="h-3.5 w-3.5 text-emerald-500" />
+                    <Eye className="h-4 w-4 text-emerald-500" />
                   ) : (
-                    <EyeOff className="h-3.5 w-3.5 text-red-500" />
+                    <EyeOff className="h-4 w-4 text-red-500" />
                   )}
                 </Button>
               </TooltipTrigger>
@@ -261,11 +272,11 @@ function DeviceCard({
                   : getLocalizedString('تعطيل', 'Désactiver', 'Disable', lang)}
               </TooltipContent>
             </Tooltip>
-            {device.status !== 'DISABLED' && device.agencyId && (
+            {device.status !== 'DISABLED' && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onUnpair(device); }} className="h-7 w-7 p-0 text-orange-500 hover:text-orange-600 hover:bg-orange-50 dark:hover:bg-orange-950/20">
-                    <Unplug className="h-3.5 w-3.5" />
+                  <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onUnpair(device); }} className="h-9 w-9 p-0 text-orange-500 hover:text-orange-600 hover:bg-orange-50 dark:hover:bg-orange-950/20">
+                    <Unplug className="h-4 w-4" />
                   </Button>
                 </TooltipTrigger>
                 <TooltipContent>{getLocalizedString('فك الربط', 'Dissocier', 'Unpair', lang)}</TooltipContent>
@@ -274,8 +285,8 @@ function DeviceCard({
             <div className="flex-1" />
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onDelete(device); }} className="h-7 w-7 p-0 text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20">
-                  <Trash2 className="h-3.5 w-3.5" />
+                <Button variant="ghost" size="sm" onClick={(e) => { e.stopPropagation(); onDelete(device); }} className="h-9 w-9 p-0 text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20">
+                  <Trash2 className="h-4 w-4" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent>{getLocalizedString('حذف', 'Supprimer', 'Delete', lang)}</TooltipContent>
@@ -297,6 +308,7 @@ function FilterBar({
   onTypeFilterChange,
   statusFilter,
   onStatusFilterChange,
+  onClearAll,
   devices,
 }: {
   lang: string;
@@ -306,11 +318,12 @@ function FilterBar({
   onTypeFilterChange: (f: TypeFilter) => void;
   statusFilter: StatusFilter;
   onStatusFilterChange: (f: StatusFilter) => void;
+  onClearAll: () => void;
   devices: AgencyDevice[];
 }) {
   const { t } = useLanguage();
 
-  const typeFilters: { value: TypeFilter; label: string; icon: typeof Monitor; count: number }[] = [
+  const typeFilters: { value: TypeFilter; label: string; icon: DeviceIconComponent | typeof Monitor; count: number }[] = [
     { value: 'ALL', label: t('dmFilterAll'), icon: Monitor, count: devices.length },
     { value: 'TV', label: getLocalizedLabel(DEVICE_TYPE_CONFIG.TV, lang), icon: DEVICE_TYPE_CONFIG.TV.icon, count: devices.filter((d) => d.type === 'TV').length },
     { value: 'KIOSK', label: getLocalizedLabel(DEVICE_TYPE_CONFIG.KIOSK, lang), icon: DEVICE_TYPE_CONFIG.KIOSK.icon, count: devices.filter((d) => d.type === 'KIOSK').length },
@@ -327,10 +340,12 @@ function FilterBar({
     { value: 'DISABLED', label: t('dmFilterDisabled'), count: devices.filter((d) => d.status === 'DISABLED').length, color: 'bg-red-500' },
   ];
 
+  const hasActiveFilters = !!searchQuery.trim() || typeFilter !== 'ALL' || statusFilter !== 'ALL';
+
   return (
-    <div className="space-y-3">
+    <div className="flex items-center gap-2 flex-wrap">
       {/* Search */}
-      <div className="relative max-w-sm">
+      <div className="relative flex-1 min-w-[10rem] max-w-xs">
         <Search className="absolute start-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
         <Input
           value={searchQuery}
@@ -340,23 +355,27 @@ function FilterBar({
         />
       </div>
 
-      {/* Type filter tabs */}
-      <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+      {/* Type filter pills */}
+      <div className="flex items-center gap-1.5">
+        <span className="text-[10px] uppercase tracking-wide text-muted-foreground me-0.5 hidden lg:inline">
+          {t('deviceDiscovery.filterType')}
+        </span>
         {typeFilters.map((f) => {
           const Icon = f.icon;
           const active = typeFilter === f.value;
           return (
             <button
               key={f.value}
+              type="button"
               onClick={() => onTypeFilterChange(f.value)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-all ${
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-all ${
                 active
                   ? 'bg-primary text-primary-foreground shadow-sm'
                   : 'bg-muted text-muted-foreground hover:bg-muted/80'
               }`}
             >
               <Icon className="h-3.5 w-3.5" />
-              {f.label}
+              <span className="hidden md:inline">{f.label}</span>
               <span className={`text-[10px] ${active ? 'bg-white/20' : 'bg-muted-foreground/20'} rounded-full px-1.5 py-0.5`}>
                 {f.count}
               </span>
@@ -365,22 +384,26 @@ function FilterBar({
         })}
       </div>
 
-      {/* Status filter tabs */}
-      <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+      {/* Status filter pills */}
+      <div className="flex items-center gap-1.5">
+        <span className="text-[10px] uppercase tracking-wide text-muted-foreground me-0.5 hidden lg:inline">
+          {t('deviceDiscovery.filterStatus')}
+        </span>
         {statusFilters.map((f) => {
           const active = statusFilter === f.value;
           return (
             <button
               key={f.value}
+              type="button"
               onClick={() => onStatusFilterChange(f.value)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-all ${
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-all ${
                 active
                   ? 'bg-primary text-primary-foreground shadow-sm'
                   : 'bg-muted text-muted-foreground hover:bg-muted/80'
               }`}
             >
               {f.color && <span className={`h-2 w-2 rounded-full ${f.color}`} />}
-              {f.label}
+              <span className="hidden xl:inline">{f.label}</span>
               <span className={`text-[10px] ${active ? 'bg-white/20' : 'bg-muted-foreground/20'} rounded-full px-1.5 py-0.5`}>
                 {f.count}
               </span>
@@ -388,6 +411,19 @@ function FilterBar({
           );
         })}
       </div>
+
+      {/* Clear all — visible only when something is active */}
+      {hasActiveFilters && (
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onClearAll}
+          className="h-9 gap-1.5 px-2.5 text-xs text-muted-foreground hover:text-foreground"
+        >
+          <X className="h-3.5 w-3.5" />
+          {t('deviceDiscovery.clearFilters')}
+        </Button>
+      )}
     </div>
   );
 }
@@ -437,6 +473,12 @@ export function DeviceGrid({
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('ALL');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL');
 
+  const clearAllFilters = useCallback(() => {
+    setSearchQuery('');
+    setTypeFilter('ALL');
+    setStatusFilter('ALL');
+  }, []);
+
   // Filter devices
   const filteredDevices = useMemo(() => {
     let result = devices;
@@ -469,7 +511,7 @@ export function DeviceGrid({
             ))}
           </div>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
           {[1, 2, 3, 4, 5, 6].map((i) => (
             <Card key={i} className="rounded-xl">
               <div className="h-1.5 w-full bg-muted" />
@@ -547,7 +589,7 @@ export function DeviceGrid({
 
   return (
     <div className="space-y-4">
-      {/* Filter bar */}
+      {/* Filter bar — compact single row with clear-all */}
       <FilterBar
         lang={lang}
         searchQuery={searchQuery}
@@ -556,6 +598,7 @@ export function DeviceGrid({
         onTypeFilterChange={setTypeFilter}
         statusFilter={statusFilter}
         onStatusFilterChange={setStatusFilter}
+        onClearAll={clearAllFilters}
         devices={devices}
       />
 
@@ -574,7 +617,7 @@ export function DeviceGrid({
           variants={staggerContainer}
           initial="hidden"
           animate="visible"
-          className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"
+          className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4 max-h-96 overflow-y-auto custom-scrollbar pe-1"
         >
           <AnimatePresence mode="popLayout">
             {filteredDevices.map((device, index) => (

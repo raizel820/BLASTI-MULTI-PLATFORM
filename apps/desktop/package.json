@@ -1,6 +1,6 @@
 {
   "name": "@blasti/desktop",
-  "version": "0.6.26",
+  "version": "0.6.31",
   "private": true,
   "description": "BLASTI Desktop — Multi-agency queue management system",
   "main": "main.js",
@@ -17,6 +17,7 @@
     "build:portable": "node scripts/prebuild.js && electron-builder --dir"
   },
   "dependencies": {
+    "@blasti/binary-delta": "workspace:*",
     "@hono/node-server": "^2.0.12",
     "@prisma/client": "^6.11.1",
     "bcryptjs": "^2.4.3",

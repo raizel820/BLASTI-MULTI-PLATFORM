@@ -92,7 +92,9 @@ export interface NetworkScanResponse {
 }
 
 // ── Discovery Protocol Types ──────────────────────────────────────────
-export type DiscoverySource = 'udp_broadcast' | 'ssdp' | 'http_probe' | 'mdns' | 'database' | 'arp' | 'ping' | 'usb' | 'local';
+// 'tcp' is emitted by the 5-a backend tcp-sweep phase (runs concurrently with
+// mDNS/SSDP); kept optional in payloads and tolerated by the UI.
+export type DiscoverySource = 'udp_broadcast' | 'ssdp' | 'http_probe' | 'mdns' | 'database' | 'arp' | 'ping' | 'tcp' | 'usb' | 'local';
 export type DiscoveredDeviceCategory = 'BLASTI' | 'NETWORK' | 'UPNP' | 'LOCAL';
 
 export interface RealDiscoveredDevice {
@@ -143,7 +145,7 @@ export interface RealDiscoveredDevice {
   netbiosName?: string;
 }
 
-export type ScanPhase = 'idle' | 'arp' | 'ping' | 'udp' | 'ssdp' | 'mdns' | 'names' | 'http' | 'https' | 'local' | 'fingerprinting' | 'complete' | 'error';
+export type ScanPhase = 'idle' | 'arp' | 'ping' | 'udp' | 'ssdp' | 'mdns' | 'tcp-sweep' | 'names' | 'http' | 'https' | 'local' | 'fingerprinting' | 'complete' | 'error';
 
 export interface ScanState {
   scanning: boolean;
@@ -208,13 +210,34 @@ export const DEFAULT_SCAN_STATE: ScanState = {
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 export const API_BASE = '/api/agency-devices';
-export const PORT_Q = 'XTransformPort=3003';
+
+/**
+ * Build a device-API path for use with the shared `apiFetch` client.
+ *
+ * ROUTING CONTRACT (do NOT append `XTransformPort` manually — that forced
+ * every call to the cloud gateway even inside the Electron desktop app, where
+ * the real working discovery/cast routes live on the local API):
+ * - Electron        → apiClient resolves http://127.0.0.1:3080 (local-first)
+ * - LAN override    → apiClient resolves the joined desktop master's base URL
+ * - plain browser   → relative path; apiClient injects XTransformPort=3003
+ *                     ONLY when the page sits behind the sandbox gateway,
+ *                     or an absolute cloud URL when directly reachable.
+ * Method/body/auth semantics are preserved by `apiFetch` (drop-in fetch).
+ */
+export function deviceApi(path = '', params?: Record<string, string>): string {
+  const normalized = path.startsWith('/') ? path : `/${path}`;
+  const full = `${API_BASE}${normalized}`;
+  if (!params || Object.keys(params).length === 0) return full;
+  const qs = new URLSearchParams(params).toString();
+  return qs ? `${full}?${qs}` : full;
+}
+
 export const HEARTBEAT_THRESHOLD_MS = 30_000;
 export const PAIRING_EXPIRE_MS = 10 * 60 * 1000;
 
 export const DEVICE_TYPE_CONFIG: Record<
   DeviceType,
-  { icon: typeof Monitor; labelAr: string; labelEn: string; labelFr?: string; color: string }
+  { icon: DeviceIconComponent; labelAr: string; labelEn: string; labelFr?: string; color: string }
 > = {
   TV: {
     icon: () => null,
@@ -299,8 +322,16 @@ import {
   Cpu,
   Usb,
   ServerCog,
+  RadioTower,
 } from 'lucide-react';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, type ComponentType } from 'react';
+
+/**
+ * Shared icon slot for the device config records. Deliberately looser than
+ * `typeof LucideIcon` so the runtime placeholder `() => null` (replaced by
+ * `initDeviceTypeIcons()`) is assignable alongside real lucide components.
+ */
+export type DeviceIconComponent = ComponentType<{ className?: string }>;
 
 export function initDeviceTypeIcons() {
   DEVICE_TYPE_CONFIG.TV.icon = Tv;
@@ -361,7 +392,7 @@ export const STATUS_CONFIG: Record<
 
 export const CONNECTION_TYPE_CONFIG: Record<
   ConnectionType,
-  { labelAr: string; labelEn: string; labelFr?: string; icon: typeof Wifi }
+  { labelAr: string; labelEn: string; labelFr?: string; icon: DeviceIconComponent }
 > = {
   LAN: { labelAr: 'شبكة محلية', labelEn: 'LAN', labelFr: 'Réseau local', icon: Cable },
   WIFI: { labelAr: 'واي فاي', labelEn: 'Wi-Fi', labelFr: 'Wi-Fi', icon: Wifi },
@@ -372,7 +403,7 @@ export const CONNECTION_TYPE_CONFIG: Record<
 
 export const SCREEN_LAYOUT_CONFIG: Record<
   ScreenLayout,
-  { labelAr: string; labelEn: string; labelFr?: string; icon: typeof Monitor }
+  { labelAr: string; labelEn: string; labelFr?: string; icon: DeviceIconComponent }
 > = {
   QUEUE_BOARD: { labelAr: 'لوحة الطابور', labelEn: 'Queue Board', labelFr: 'Tableau d\'attente', icon: Tv },
   TICKET_PRINTER: { labelAr: 'طابعة التذاكر', labelEn: 'Ticket Printer', labelFr: 'Imprimante de tickets', icon: Printer },
@@ -382,7 +413,7 @@ export const SCREEN_LAYOUT_CONFIG: Record<
 
 export const COMMAND_TYPE_CONFIG: Record<
   CommandType,
-  { labelAr: string; labelEn: string; labelFr?: string; icon: typeof RefreshCw; color: string }
+  { labelAr: string; labelEn: string; labelFr?: string; icon: DeviceIconComponent; color: string }
 > = {
   REFRESH: {
     icon: RefreshCw,
@@ -459,7 +490,7 @@ export const COMMAND_STATUS_CONFIG: Record<
 
 export const DISCOVERY_SOURCE_CONFIG: Record<
   DiscoverySource,
-  { labelAr: string; labelEn: string; labelFr?: string; icon: typeof Radio; color: string }
+  { labelAr: string; labelEn: string; labelFr?: string; icon: DeviceIconComponent; color: string }
 > = {
   udp_broadcast: {
     icon: Radio,
@@ -509,6 +540,13 @@ export const DISCOVERY_SOURCE_CONFIG: Record<
     labelEn: 'Ping',
     labelFr: 'Ping',
     color: 'bg-sky-100 text-sky-700 dark:bg-sky-950/40 dark:text-sky-400',
+  },
+  tcp: {
+    icon: RadioTower,
+    labelAr: 'مسح TCP',
+    labelEn: 'TCP sweep',
+    labelFr: 'Balayage TCP',
+    color: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-400',
   },
   usb: {
     icon: Usb,

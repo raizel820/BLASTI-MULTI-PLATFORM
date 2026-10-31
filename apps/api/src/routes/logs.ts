@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import type { Context } from 'hono'
 import { requireAuth, requireRole, authErrorResponse } from '../lib/auth'
 import { db } from '@blasti/db'
 
@@ -115,7 +116,7 @@ const MAX_ENTRY_CHARS = 8_000        // one NDJSON line ceiling (post-trim)
 const MAX_ENTRIES_PER_BATCH = 200    // client batches stay well under this
 const MAX_BODY_ENTRIES = 500         // hard ceiling across all body shapes
 const PER_UID_BYTE_CAP = 25 * 1024 * 1024 // 25 MB per account — oldest days get truncated first
-const KNOWN_PLATFORMS = new Set(['web', 'mobile', 'desktop', 'legacy'])
+const KNOWN_PLATFORMS = new Set(['web', 'mobile', 'desktop', 'kiosk', 'tv', 'legacy'])
 
 interface IncomingEntry {
   ts?: unknown
@@ -199,6 +200,7 @@ const ingestSchema = {
     deviceSpecs?: Record<string, string | number | boolean>
     perf?: Record<string, string | number | boolean>
     manual?: boolean
+    reason?: string
   } | null {
     if (!body || typeof body !== 'object') return null
     const b = body as Record<string, unknown>
@@ -214,17 +216,64 @@ const ingestSchema = {
       deviceSpecs: sanitizeSmallObject(b.deviceSpecs),
       perf: sanitizeSmallObject(b.perf),
       manual: b.manual === true,
+      reason: typeof b.reason === 'string' ? b.reason.slice(0, 20) : undefined,
     }
   },
 }
 
-app.post('/', async (c) => {
-  let user: Awaited<ReturnType<typeof requireAuth>>
+// ── STRICT MODE (0.6.30) identity resolution ─────────────────────────────────
+// The kiosk/TV surfaces hold NO user session — every upload 401'd and their
+// buffer stayed on-device forever. resolveUploader() accepts:
+//   1. a user session JWT (the classic requireAuth path), or
+//   2. an AgencyDevice token (Bearer) from the kiosk join/pair flow.
+// Device folders land as "device-<id>" with the device's agency in the meta.
+interface UploaderIdentity {
+  kind: 'user' | 'device'
+  folder: string
+  label: string
+  meta: Record<string, unknown>
+}
+
+async function resolveUploader(c: Context): Promise<UploaderIdentity> {
+  // Try the user session first (requireAuth throws on failure).
   try {
-    user = await requireAuth(c)
+    const user = await requireAuth(c)
+    const resolvedUid = await resolveUid(user.id)
+    return {
+      kind: 'user',
+      folder: folderFor(resolvedUid, user.id, user.role),
+      label: user.username,
+      meta: { uid: resolvedUid, userId: user.id, username: user.username, role: user.role },
+    }
+  } catch { /* fall through to device-token auth */ }
+  // Device token — Bearer <agencyDevice.deviceToken> (same token the kiosk
+  // already uses for status/heartbeat/realtime).
+  const authHeader = c.req.header('authorization') || ''
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : (c.req.header('x-device-token') || '').trim()
+  if (token) {
+    const device = await db.agencyDevice.findUnique({
+      where: { deviceToken: token },
+      select: { id: true, name: true, type: true, agencyId: true, branchId: true },
+    })
+    if (device) {
+      return {
+        kind: 'device',
+        folder: `device-${safeComponent(device.id, 40, 'unknown')}`,
+        label: device.name || device.type || 'device',
+        meta: { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId: device.agencyId, branchId: device.branchId },
+      }
+    }
+  }
+  throw Object.assign(new Error('unauthorized'), { status: 401 })
+}
+
+app.post('/', async (c) => {
+  let uploader: UploaderIdentity
+  try {
+    uploader = await resolveUploader(c)
   } catch (error) {
-    const err = authErrorResponse(error)
-    return c.json({ success: false, error: err.error }, err.status as any)
+    const status = (error as { status?: number }).status === 401 ? 401 : 500
+    return c.json({ success: false, error: status === 401 ? 'Unauthorized' : 'Auth check failed' }, status as any)
   }
 
   let body: ReturnType<typeof ingestSchema.parse>
@@ -235,9 +284,9 @@ app.post('/', async (c) => {
   }
   if (!body) return c.json({ success: false, error: 'Invalid log payload' }, 400)
 
-  const resolvedUid = await resolveUid(user.id)
-  const uidDir = path.join(logRoot(), folderFor(resolvedUid, user.id, user.role))
+  const uidDir = path.join(logRoot(), uploader.folder)
   // 0.6.19 — PLATFORM-SEPARATED streams under the SAME account folder.
+  // 0.6.30 — 'kiosk' and 'tv' streams join the whitelist (device-mode URLs).
   const platform = safeComponent(
     body.platform && KNOWN_PLATFORMS.has(body.platform) ? body.platform : 'web',
     20,
@@ -266,17 +315,17 @@ app.post('/', async (c) => {
     ts: new Date().toISOString(),
     level: 'meta',
     tag: 'session',
-    message: `batch ${body.manual ? '(MANUAL)' : '(auto)'} from ${platform} v${body.appVersion ?? '?'}`,
+    message: `batch ${body.manual ? '(MANUAL)' : '(auto)'}${body.reason ? `[${body.reason}]` : ''} from ${platform} v${body.appVersion ?? '?'}`,
     data: {
-      uid: resolvedUid,
-      userId: user.id,
-      username: user.username,
-      role: user.role,
+      ...uploader.meta,
+      uploaderKind: uploader.kind,
+      label: uploader.label,
       platform,
       appVersion: body.appVersion,
       device: body.device,
       href: body.sessionHref,
       sessionId: body.sessionId,
+      flushReason: body.reason,
       deviceSpecs,
       perf,
       count: sanitized.length,
@@ -303,9 +352,9 @@ app.post('/', async (c) => {
       device: body.device,
       deviceSpecs,
       perf,
-      uid: resolvedUid,
-      username: user.username,
-      role: user.role,
+      ...uploader.meta,
+      uploaderKind: uploader.kind,
+      label: uploader.label,
     }
     fs.writeFileSync(path.join(dir, `meta-${dayStamp()}.json`), JSON.stringify(metaPayload, null, 1), { encoding: 'utf8' })
     fs.writeFileSync(path.join(uidDir, `meta-${dayStamp()}.json`), JSON.stringify(metaPayload, null, 1), { encoding: 'utf8' })
@@ -318,8 +367,8 @@ app.post('/', async (c) => {
   try {
     analyzeBatch(
       {
-        uid: resolvedUid,
-        role: user.role,
+        uid: uploader.kind === 'user' ? ((uploader.meta.uid as string | null) ?? null) : uploader.folder,
+        role: uploader.kind === 'user' ? String(uploader.meta.role ?? 'USER') : 'DEVICE',
         platform,
         appVersion: body.appVersion ?? 'unknown',
         device: body.device ?? 'unknown',
@@ -332,7 +381,7 @@ app.post('/', async (c) => {
     )
   } catch { /* analyzer guards itself too */ }
 
-  return c.json({ success: true, accepted: sanitized.length, folder: `${folderFor(resolvedUid, user.id, user.role)}/${platform}` })
+  return c.json({ success: true, accepted: sanitized.length, folder: `${uploader.folder}/${platform}` })
 })
 
 // ─── Realtime analysis endpoints (SUPER_ADMIN — the Logs Manager) ────────────

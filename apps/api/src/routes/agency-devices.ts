@@ -29,6 +29,21 @@ import {
   type DiscoveredDeviceRaw,
   type ScanPhase,
 } from '../lib/discovery/scanner'
+// Task 5-a — real multi-protocol cast engine (DLNA SOAP, Samsung Tizen WS,
+// LG webOS WS, Roku ECP). Previously dead code; now wired into the routes
+// below, mirroring the working desktop local-api implementation.
+import {
+  castToTv,
+  castViaDlna,
+  castViaSamsungTizen,
+  castViaLgWebOS,
+  castViaRokuEcp,
+  stopDlnaCast,
+  detectCastProtocols,
+  type CastProtocol,
+  type CastResult,
+  type CastTarget,
+} from '../lib/discovery/cast-service'
 
 const app = new Hono()
 
@@ -3098,12 +3113,90 @@ app.delete('/discovery/default-printer', async (c) => {
 
 // ─── Cast to TV ─────────────────────────────────────────────────────────────
 
+// Task 5-a — the old inline implementation POSTed plain HTTP to Samsung's
+// WebSocket endpoint (always failed) and had no DLNA/LG support at all, while
+// the real multi-protocol engine in lib/discovery/cast-service.ts was dead
+// code. Everything below now routes through that engine, mirroring the
+// desktop local-api cast routes (the behavioral reference).
+
+/** Per-attempt timeout — the cast dialog should never wait longer than 8s. */
+const CAST_TIMEOUT_MS = 8000
+
+/** Normalize a client-supplied protocol name to a CastProtocol, or null. */
+function normalizeCastProtocol(raw: string | undefined): CastProtocol | null {
+  const p = (raw || '').toLowerCase()
+  if (p === 'dlna') return 'dlna'
+  if (p === 'samsung-tizen' || p === 'samsung') return 'samsung-tizen'
+  if (p === 'lg-webos' || p === 'lg') return 'lg-webos'
+  if (p === 'roku-ecp' || p === 'roku') return 'roku-ecp'
+  if (p === 'url') return 'url'
+  return null
+}
+
+/** Run a single cast protocol with a hard timeout (≤ CAST_TIMEOUT_MS). */
+async function castAttempt(target: CastTarget, mediaUrl: string, protocol: CastProtocol, timeoutMs = CAST_TIMEOUT_MS): Promise<CastResult> {
+  const run = ((): Promise<CastResult> => {
+    switch (protocol) {
+      case 'dlna': return castViaDlna(target, mediaUrl)
+      case 'samsung-tizen': return castViaSamsungTizen(target, mediaUrl)
+      case 'lg-webos': return castViaLgWebOS(target, mediaUrl)
+      case 'roku-ecp': return castViaRokuEcp(target, mediaUrl)
+      default:
+        return Promise.resolve({ success: false, protocol, message: `Unsupported cast protocol: ${protocol}` })
+    }
+  })()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<CastResult>((resolve) => {
+    timer = setTimeout(
+      () => resolve({ success: false, protocol, message: `${protocol} cast timed out after ${Math.round(timeoutMs / 1000)}s — TV did not respond.` }),
+      timeoutMs,
+    )
+  })
+  try {
+    return await Promise.race([run, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/** Build a CastTarget from request fields, enriched from the agency's saved
+ *  TV row (SavedTv carries manufacturer/model/ssdpLocation/mdnsService/port)
+ *  when the caller omits discovery metadata. */
+async function buildCastTarget(agencyId: string, ip: string, fields: {
+  port: number
+  manufacturer: string
+  model: string
+  ssdpLocation: string
+  mdnsService: string
+  name: string
+}): Promise<CastTarget> {
+  let { port, manufacturer, model, ssdpLocation, mdnsService, name } = fields
+  if (!manufacturer || !ssdpLocation || !mdnsService || !port) {
+    try {
+      const saved = await db.savedTv.findUnique({ where: { agencyId_ip: { agencyId, ip } } })
+      if (saved) {
+        manufacturer = manufacturer || saved.manufacturer || ''
+        model = model || saved.model || ''
+        ssdpLocation = ssdpLocation || saved.ssdpLocation || ''
+        mdnsService = mdnsService || saved.mdnsService || ''
+        if (!port && saved.port) port = saved.port
+        name = name || saved.name || ''
+      }
+    } catch { /* best-effort enrichment — saved TV lookup is optional */ }
+  }
+  return { ip, port, manufacturer, model, ssdpLocation, mdnsService, name }
+}
+
 // POST /discovery/cast — Cast the BLASTI TV board to a discovered/saved TV.
-// Tries, in order:
-//   1. If the TV is a Samsung/LG with a known REST cast API and is reachable
-//      → send the cast command.
-//   2. Otherwise → return the TV board URL so the frontend can open it in a new
-//      tab (Smart TV browser) or hand off to Chromecast / HDMI desktop app.
+// Body: { ip, port?, manufacturer?, model?, ssdpLocation?, mdnsService?, name?, protocol? }
+//   protocol 'dlna' | 'samsung-tizen' | 'lg-webos' | 'roku' → single real attempt
+//   protocol 'auto'/omitted → try in order [dlna, samsung, lg, roku], brand /
+//     detected-protocol first when the TV metadata says so (via castToTv +
+//     detectCastProtocols, fed by the saved TV row when available)
+//   protocol 'url' → unchanged behavior: hand the TV board URL back to the
+//     frontend (opened in a new tab / used by Chromecast or HDMI)
+// Response shape preserved: { success, message?, tvBoardUrl?, error? }
+// (+ castKind/protocol additively, same as the desktop implementation).
 app.post('/discovery/cast', async (c) => {
   try {
     const user = await requireAuth(c)
@@ -3113,9 +3206,8 @@ app.post('/discovery/cast', async (c) => {
     const body = await c.req.json()
     const ip = String(body.ip || '')
     const port = Number(body.port) || 0
-    const manufacturer = String(body.manufacturer || '').toLowerCase()
-    const ssdpLocation = String(body.ssdpLocation || '')
     const tvName = String(body.name || 'BLASTI TV')
+    const protocol = normalizeCastProtocol(body.protocol ? String(body.protocol) : undefined)
 
     if (!ip) {
       return c.json({ success: false, error: 'IP required' }, 400)
@@ -3125,68 +3217,232 @@ app.post('/discovery/cast', async (c) => {
     const origin = new URL(c.req.url).origin
     const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
 
-    // Build a list of cast targets to try
-    const castTargets: Array<{ kind: string; url: string; method?: string; body?: string; headers?: Record<string, string> }> = []
-
-    // 1. Samsung Tizen (port 8001 / 9197) — REST channel sendCustomCommand
-    if (manufacturer.includes('samsung') || port === 8001 || port === 9197) {
-      const samsungPort = port === 9197 ? 9197 : 8001
-      castTargets.push({
-        kind: 'samsung-tizen',
-        url: `http://${ip}:${samsungPort}/ws/app/WEBAPP`,
-        method: 'POST',
-        body: JSON.stringify({ method: 'ms.webapp.launch', id: tvBoardUrl, token: '' }),
-        headers: { 'Content-Type': 'application/json' },
+    // 'url' → unchanged behavior: hand the URL to the frontend (it opens it
+    // in a new tab so the user can navigate on the TV or use Chromecast/HDMI).
+    if (protocol === 'url') {
+      return c.json({
+        success: true,
+        castKind: 'url',
+        tvBoardUrl,
+        message: 'Open the TV board URL on the TV or use Chromecast / HDMI',
       })
     }
 
-    // 2. LG WebOS (port 3000 / 3001) — requires websocket; we can't do that
-    //    here in a simple HTTP route, so we just return the URL for the
-    //    frontend to open in the TV's browser.
+    const target = await buildCastTarget(user.agencyId, ip, {
+      port,
+      manufacturer: String(body.manufacturer || ''),
+      model: String(body.model || ''),
+      ssdpLocation: String(body.ssdpLocation || ''),
+      mdnsService: String(body.mdnsService || ''),
+      name: tvName,
+    })
 
-    // 3. Roku (port 8060) — launch the web browser with the URL
-    if (manufacturer.includes('roku') || port === 8060) {
-      castTargets.push({
-        kind: 'roku',
-        url: `http://${ip}:8060/launch/11?contentId=${encodeURIComponent(tvBoardUrl)}`,
-        method: 'POST',
-      })
-    }
-
-    // Try each cast target sequentially
-    for (const target of castTargets) {
-      try {
-        const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), 3000)
-        const res = await fetch(target.url, {
-          method: (target.method as any) || 'GET',
-          headers: target.headers,
-          body: target.body,
-          signal: controller.signal,
+    // Explicit protocol → one real attempt through the cast engine.
+    if (protocol) {
+      const result = await castAttempt(target, tvBoardUrl, protocol)
+      if (result.success) {
+        return c.json({
+          success: true,
+          protocol: result.protocol,
+          castKind: result.protocol,
+          tvBoardUrl,
+          message: result.message,
         })
-        clearTimeout(timeout)
-        if (res.ok || res.status < 500) {
-          return c.json({
-            success: true,
-            castKind: target.kind,
-            tvBoardUrl,
-            message: `Cast sent to ${target.kind} at ${ip}`,
-          })
-        }
-      } catch {
-        // try next target
       }
+      // Clear per-failure error message (cast-service error style, ≤8s).
+      return c.json({
+        success: false,
+        protocol: result.protocol,
+        castKind: result.protocol,
+        tvBoardUrl,
+        message: result.message,
+        error: result.message,
+      })
     }
 
-    // Fallback: return the URL — the frontend will open it in a new tab so the
-    // user can navigate to it on the TV's browser, or use Chromecast / HDMI.
+    // 'auto'/omitted → castToTv tries the best-matching real protocol first
+    // (brand-native when manufacturer/ports say Samsung/LG/Roku, then DLNA),
+    // falling back through the list until one succeeds. Raced against the
+    // ≤8s ceiling; on total failure we degrade gracefully to the URL fallback
+    // the frontend already knows how to handle.
+    const man = (target.manufacturer || '').toLowerCase()
+    const svc = (target.mdnsService || '').toLowerCase()
+    const isSamsung = man.includes('samsung') || svc.includes('samsung') || port === 8001 || port === 9197
+    const isLg = man.includes('lg ') || man.includes('lge') || man.includes('webos') || svc.includes('webos') || svc.includes('lg') || port === 3000
+    const isRoku = man.includes('roku') || port === 8060
+    const preferred: CastProtocol | undefined = isSamsung ? 'samsung-tizen' : isLg ? 'lg-webos' : isRoku ? 'roku-ecp' : undefined
+
+    let autoResult: CastResult | undefined
+    try {
+      autoResult = await Promise.race([
+        castToTv(target, tvBoardUrl, preferred),
+        new Promise<CastResult>((resolve) => {
+          setTimeout(() => resolve({ success: false, protocol: 'url', message: `Cast timed out after ${Math.round(CAST_TIMEOUT_MS / 1000)}s — TV did not respond to any cast protocol.` }), CAST_TIMEOUT_MS)
+        }),
+      ])
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      autoResult = { success: false, protocol: 'url', message: `Cast failed: ${msg}` }
+    }
+
+    if (autoResult?.success && autoResult.protocol !== 'url') {
+      return c.json({
+        success: true,
+        protocol: autoResult.protocol,
+        castKind: autoResult.protocol,
+        tvBoardUrl,
+        message: autoResult.message,
+      })
+    }
+
+    // Fallback (unchanged shape): return the URL — the frontend opens it in a
+    // new tab so the user can navigate to it on the TV's browser, or use
+    // Chromecast / HDMI.
     return c.json({
       success: true,
       castKind: 'url',
       tvBoardUrl,
-      ssdpLocation,
+      ssdpLocation: target.ssdpLocation || undefined,
       message: 'Open the TV board URL on the TV or use Chromecast / HDMI',
     })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// Per-protocol cast endpoints the cast dialog calls on desktop (cloud parity —
+// Task 5-a). Same request/response contract as apps/desktop/local-api.
+app.post('/discovery/cast/dlna', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    if (!user.agencyId) return c.json({ success: false, error: 'No agency assigned' }, 403)
+    const body = await c.req.json()
+    const origin = new URL(c.req.url).origin
+    const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+    const target = await buildCastTarget(user.agencyId, String(body.ip || ''), {
+      port: Number(body.port) || 0,
+      manufacturer: String(body.manufacturer || ''),
+      model: String(body.model || ''),
+      ssdpLocation: String(body.ssdpLocation || ''),
+      mdnsService: String(body.mdnsService || ''),
+      name: String(body.name || ''),
+    })
+    if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
+    const result = await castAttempt(target, tvBoardUrl, 'dlna')
+    return c.json({ success: result.success, protocol: 'dlna', tvBoardUrl, message: result.message })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, protocol: 'dlna', message: err.error }, err.status as any)
+  }
+})
+
+app.post('/discovery/cast/samsung', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    if (!user.agencyId) return c.json({ success: false, error: 'No agency assigned' }, 403)
+    const body = await c.req.json()
+    const origin = new URL(c.req.url).origin
+    const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+    const target = await buildCastTarget(user.agencyId, String(body.ip || ''), {
+      port: Number(body.port) || 8001,
+      manufacturer: String(body.manufacturer || ''),
+      model: String(body.model || ''),
+      ssdpLocation: String(body.ssdpLocation || ''),
+      mdnsService: String(body.mdnsService || ''),
+      name: String(body.name || ''),
+    })
+    if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
+    const result = await castAttempt(target, tvBoardUrl, 'samsung-tizen')
+    return c.json({ success: result.success, protocol: 'samsung-tizen', tvBoardUrl, message: result.message })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, protocol: 'samsung-tizen', message: err.error }, err.status as any)
+  }
+})
+
+app.post('/discovery/cast/lg', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    if (!user.agencyId) return c.json({ success: false, error: 'No agency assigned' }, 403)
+    const body = await c.req.json()
+    const origin = new URL(c.req.url).origin
+    const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+    const target = await buildCastTarget(user.agencyId, String(body.ip || ''), {
+      port: Number(body.port) || 3000,
+      manufacturer: String(body.manufacturer || ''),
+      model: String(body.model || ''),
+      ssdpLocation: String(body.ssdpLocation || ''),
+      mdnsService: String(body.mdnsService || ''),
+      name: String(body.name || ''),
+    })
+    if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
+    const result = await castAttempt(target, tvBoardUrl, 'lg-webos')
+    return c.json({ success: result.success, protocol: 'lg-webos', tvBoardUrl, message: result.message })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, protocol: 'lg-webos', message: err.error }, err.status as any)
+  }
+})
+
+app.post('/discovery/cast/roku', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    if (!user.agencyId) return c.json({ success: false, error: 'No agency assigned' }, 403)
+    const body = await c.req.json()
+    const origin = new URL(c.req.url).origin
+    const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+    const target = await buildCastTarget(user.agencyId, String(body.ip || ''), {
+      port: Number(body.port) || 8060,
+      manufacturer: String(body.manufacturer || ''),
+      model: String(body.model || ''),
+      ssdpLocation: String(body.ssdpLocation || ''),
+      mdnsService: String(body.mdnsService || ''),
+      name: String(body.name || ''),
+    })
+    if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
+    const result = await castAttempt(target, tvBoardUrl, 'roku-ecp')
+    return c.json({ success: result.success, protocol: 'roku-ecp', tvBoardUrl, message: result.message })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, protocol: 'roku-ecp', message: err.error }, err.status as any)
+  }
+})
+
+app.post('/discovery/cast/stop', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    if (!user.agencyId) return c.json({ success: false, error: 'No agency assigned' }, 403)
+    const body = await c.req.json()
+    const target: CastTarget = {
+      ip: String(body.ip || ''),
+      port: Number(body.port) || 0,
+      ssdpLocation: String(body.ssdpLocation || ''),
+      manufacturer: String(body.manufacturer || ''),
+    }
+    if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
+    const result = await stopDlnaCast(target)
+    return c.json({ success: result.success, message: result.message })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, message: err.error }, err.status as any)
+  }
+})
+
+app.get('/discovery/cast/protocols', async (c) => {
+  try {
+    await requireAuth(c)
+    const target: CastTarget = {
+      ip: c.req.query('ip') || '',
+      port: Number(c.req.query('port')) || 0,
+      manufacturer: c.req.query('manufacturer') || '',
+      model: c.req.query('model') || '',
+      ssdpLocation: c.req.query('ssdpLocation') || '',
+      mdnsService: c.req.query('mdnsService') || '',
+    }
+    if (!target.ip) return c.json({ success: false, error: 'IP required' }, 400)
+    const protocols = detectCastProtocols(target)
+    return c.json({ success: true, protocols })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

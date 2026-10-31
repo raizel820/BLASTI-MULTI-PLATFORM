@@ -5,9 +5,11 @@ import { useLanguage } from '@/hooks/use-language';
 import { useRealtime } from '@/hooks/use-realtime';
 import { isRTL, type Language } from '@/i18n';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Monitor, Clock, Users, ArrowLeft, RefreshCw, Wifi, WifiOff, Maximize, Minimize, Megaphone, PauseCircle, Link2 } from 'lucide-react';
+import { Monitor, Clock, Users, ArrowLeft, RefreshCw, Wifi, WifiOff, Maximize, Minimize, Megaphone, PauseCircle, Link2, FileUp } from 'lucide-react';
 import { quickDiscover, type DiscoveredServer } from '@/lib/lan-discovery';
 import { apiFetch } from '@/lib/api-fetch';
+import { flushLogsNow } from '@/lib/remote-logger';
+import { toast } from 'sonner';
 import { translateStatus } from '@/lib/enum-i18n';
 import { getCachedLocalIp } from '@/lib/get-local-ip';
 import { getProxiedUrl } from '@/lib/utils';
@@ -1026,6 +1028,21 @@ export function DeviceTvBoard({
             {Math.round(POLL_INTERVAL_MS / 1000)}s
           </span>
           {statusBadge}
+          {/* STRICT LOGS (0.6.30) — manual upload, TV-board surfaces included.
+              The paired device token authenticates the batch. */}
+          <button
+            onClick={() => {
+              void flushLogsNow({ manual: true }).then((res) => {
+                if (res.ok) toast.success(t('logsUploadedOk') || 'Logs uploaded');
+                else toast.error((t('logsUploadFailed') || 'Log upload failed') + (res.error ? ` (${res.error})` : ''));
+              });
+            }}
+            className="min-h-[48px] min-w-[48px] rounded-xl bg-gray-700/60 flex items-center justify-center hover:bg-gray-600/60 transition-colors"
+            title={t('uploadLogsNow') || 'Upload logs now'}
+            aria-label={t('uploadLogsNow') || 'Upload logs now'}
+          >
+            <FileUp className="h-5 w-5" />
+          </button>
           {/* Fullscreen toggle — always visible on TV mode */}
           <button
             onClick={toggleFullscreen}

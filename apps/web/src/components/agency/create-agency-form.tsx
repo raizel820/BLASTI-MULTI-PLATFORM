@@ -51,6 +51,8 @@ import { ALGERIA_WILAYAS, findWilayaByCode, findWilayaCentroid } from '@/lib/alg
 import { useDebounce } from '@/hooks/use-debounce';
 // Task 51-b — agency location map picker (provider abstraction, spec §27-30).
 import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
+import { GpsAddressButton, type GpsFillOutcome } from '@/components/shared/map/gps-address-button';
+import { matchCommuneInWilaya } from '@/lib/map/gps-field-matching';
 import { useMapConfig } from '@/lib/map/use-map-config';
 import type { GeocodeComponents } from '@/lib/map';
 
@@ -540,6 +542,40 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       if (match && !communeName) setCommuneName(match.name);
     }
     if (components.postalCode && !postalCode.trim()) setPostalCode(components.postalCode);
+  };
+
+  // r26 — EXPLICIT GPS fill (the button beside the address input): unlike
+  // the passive map-detection path above, an explicit button press IS the
+  // user's intent, so the manual-override guard does not block it and the
+  // matched components overwrite the fields. COARSE fixes still never fill
+  // text (r21-5 policy) — they only move the pin, with the amber warning.
+  const handleGpsOutcome = (outcome: GpsFillOutcome) => {
+    if (outcome.kind === 'OK') {
+      const c = outcome.components;
+      const text = c.formatted || c.street;
+      if (text) {
+        setAddress(text);
+        manualTouchedRef.current = false;
+      }
+      const code = findWilayaCodeByGeocodeName(c.wilaya);
+      if (code && code !== wilayaCode) {
+        setWilayaCode(code);
+        setCommuneName(''); // dependent list — reset the commune
+      }
+      const effectiveCode = code || wilayaCode;
+      const commune = matchCommuneInWilaya(effectiveCode, c.city);
+      if (commune) setCommuneName(commune);
+      if (c.postalCode) setPostalCode(c.postalCode);
+      gpsCoarseRef.current = false;
+      setLatitude(outcome.coords.lat);
+      setLongitude(outcome.coords.lng);
+      setLocationSource('DEVICE_GPS');
+    } else if (outcome.kind === 'COARSE') {
+      gpsCoarseRef.current = true;
+      setLatitude(outcome.coords.lat);
+      setLongitude(outcome.coords.lng);
+      setLocationSource('DEVICE_GPS');
+    }
   };
 
   // ── r21-5 — the map FOLLOWS the address inputs (the user's bug report:
@@ -1203,6 +1239,11 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                   placeholder={t('agencyAddressPlaceholder' as any)}
                   icon={MapPin}
                 />
+                {/* r26 — explicit GPS auto-fill (user request): one press fills
+                    address/wilaya/commune/zip from the device GPS. */}
+                <div className="flex justify-end">
+                  <GpsAddressButton onFilled={handleGpsOutcome} />
+                </div>
 
                 {/* Task 51-b — Location block (spec §27): map picker + postal
                     code. Rendered whenever maps are not explicitly disabled;
@@ -1220,7 +1261,7 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                       onChange={handlePickerChange}
                       onLocationSource={setLocationSource}
                       addressFields={{ onDetected: handleDetectedAddress }}
-                      height={260}
+                      height={340}
                     />
                     {/* Postal code (spec §27 — Postal Code field) */}
                     <FloatingInput

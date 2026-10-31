@@ -48,10 +48,22 @@ const MAX_PERSISTED = 900;                // localStorage cap across restarts
 const STORE_KEY = 'blasti-remote-log-buffer';
 const LAST_FLUSH_KEY = 'blasti-remote-log-lastflush';
 const MIN_FLUSH_GAP_MS = 8_000;           // manual-button debounce
+// STRICT MODE (0.6.30): the user's field report — "logs autoupload is not
+// working" — traced to three root causes, all fixed here:
+//   1. ERRORS WAITED for the next 30 s tick → every error now schedules an
+//      URGENT flush (2 s debounce batches a burst into one request).
+//   2. KIOSK/TV devices hold no user session → uploads 401'd forever. The
+//      device token (blasti_kiosk_device_token) is now used when no session
+//      exists, and the API accepts it (device-<id> vault folder).
+//   3. LAN clients (apiFetch → the desktop local API :3080) 404'd — the
+//      local API now has a /api/logs ingest+forward route.
+const URGENT_FLUSH_DEBOUNCE_MS = 2_000;
+const DEVICE_TOKEN_KEY = 'blasti_kiosk_device_token';
 
 let buffer: LogEntry[] = [];
 let installed = false;
 let flushing = false;
+let urgentTimer: ReturnType<typeof setTimeout> | null = null;
 
 // 0.6.16 field-fix — a 404 from POST /api/logs means the SERVER is too old
 // (the vault route only exists since 0.6.15; the VPS was still pre-0.6.15).
@@ -106,6 +118,31 @@ export function logWarn(tag: string, message: string, data?: unknown): void {
 }
 export function logError(tag: string, message: string, data?: unknown): void {
   pushEntry('error', tag, message, data);
+  scheduleUrgentFlush(); // STRICT: an error never waits for the next tick
+}
+
+/**
+ * STRICT MODE — schedule an urgent flush after a tiny debounce (batch a
+ * burst of errors from one crash into a single request). Errors from ANY
+ * source funnel here: console.error, window.onerror, unhandledrejection,
+ * logError() calls, and Electron's main-process flush requests.
+ */
+function scheduleUrgentFlush(): void {
+  if (typeof window === 'undefined') return;
+  if (urgentTimer) return; // a scheduled urgent flush already covers this burst
+  urgentTimer = setTimeout(() => {
+    urgentTimer = null;
+    void flushLogsNow({ reason: 'error' });
+  }, URGENT_FLUSH_DEBOUNCE_MS);
+}
+
+// Expose a global hook — the kiosk surface and the Electron main process
+// (via the preload bridge) trigger uploads without importing this module.
+if (typeof window !== 'undefined') {
+  try {
+    (window as unknown as Record<string, unknown>).__blastiFlushLogs = (opts?: { manual?: boolean }) => flushLogsNow({ manual: opts?.manual, reason: opts?.manual ? 'manual' : 'external' });
+    (window as unknown as Record<string, unknown>).__blastiLogError = (tag: string, message: string, data?: unknown) => logError(tag, message, data);
+  } catch { /* frozen window — the exported functions still work */ }
 }
 
 // ─── Console interception ────────────────────────────────────────────────────
@@ -147,15 +184,18 @@ function installConsoleHook(): void {
   console.error = (...args: unknown[]) => {
     pushEntry('error', 'console', fmt(args));
     orig.error(...args);
+    scheduleUrgentFlush(); // STRICT: every console.error uploads within 2 s
   };
   window.addEventListener('error', (e) => {
     pushEntry('error', 'window-error', e.message || 'unknown', { source: e.filename, line: e.lineno });
+    scheduleUrgentFlush();
   });
   window.addEventListener('unhandledrejection', (e) => {
     const r = e.reason;
     pushEntry('error', 'unhandled-rejection', (r && (r as Error).message) || String(r), {
       stack: r && (r as Error).stack ? String((r as Error).stack).slice(0, 2_000) : undefined,
     });
+    scheduleUrgentFlush();
   });
 }
 
@@ -163,14 +203,37 @@ function installConsoleHook(): void {
 
 async function mergeDesktopMainLogs(): Promise<void> {
   try {
-    const w = window as unknown as { electronAPI?: { getRecentMainLogs?: () => unknown[] } };
+    const w = window as unknown as {
+      electronAPI?: {
+        getRecentMainLogs?: () => unknown[];
+        // 0.6.30 — diagnostic tails (local-api diag + updater install log).
+        getRecentDiagLogs?: () => { diag?: string[]; install?: string[] } | undefined;
+      };
+    };
     const lines = w.electronAPI?.getRecentMainLogs?.();
-    if (!Array.isArray(lines) || lines.length === 0) return;
-    const lastMerged = buffer.findLastIndex?.((e) => e.tag === 'electron-main') ?? -1;
-    const already = lastMerged >= 0 ? new Set(buffer.slice(lastMerged).map((e) => e.message)) : new Set<string>();
-    for (const line of lines.slice(-120)) {
-      const msg = typeof line === 'string' ? line : String((line as { line?: string })?.line ?? '');
-      if (msg && !already.has(msg)) pushEntry('info', 'electron-main', msg.slice(0, 2_000));
+    if (Array.isArray(lines) && lines.length > 0) {
+      const lastMerged = buffer.findLastIndex?.((e) => e.tag === 'electron-main') ?? -1;
+      const already = lastMerged >= 0 ? new Set(buffer.slice(lastMerged).map((e) => e.message)) : new Set<string>();
+      for (const line of lines.slice(-120)) {
+        const msg = typeof line === 'string' ? line : String((line as { line?: string })?.line ?? '');
+        if (msg && !already.has(msg)) pushEntry('info', 'electron-main', msg.slice(0, 2_000));
+      }
+    }
+    // STRICT (0.6.30): merge the local-api diag tail + updater install log —
+    // most desktop failures (LAN auth, DB warmup, NSIS installs) live there.
+    const tails = w.electronAPI?.getRecentDiagLogs?.();
+    if (tails) {
+      const mergeTail = (arr: string[] | undefined, tag: string) => {
+        if (!Array.isArray(arr) || arr.length === 0) return;
+        const lastIdx = buffer.findLastIndex?.((e) => e.tag === tag) ?? -1;
+        const already = lastIdx >= 0 ? new Set(buffer.slice(lastIdx).map((e) => e.message)) : new Set<string>();
+        for (const line of arr.slice(-80)) {
+          const msg = typeof line === 'string' ? line : String(line);
+          if (msg && !already.has(msg)) pushEntry('info', tag, msg.slice(0, 2_000));
+        }
+      };
+      mergeTail(tails.diag, 'local-api-diag');
+      mergeTail(tails.install, 'updater-install');
     }
   } catch { /* bridge unavailable — renderer-only logging continues */ }
 }
@@ -185,6 +248,26 @@ function readUidFromStore(): string | null {
     const uid = state?.user?.uid;
     return typeof uid === 'string' && uid ? uid : null;
   } catch { return null; }
+}
+
+/** Kiosk/TV pairing token — used for uploads when no user session exists. */
+function readDeviceToken(): string {
+  try { return localStorage.getItem(DEVICE_TOKEN_KEY) || ''; } catch { return ''; }
+}
+
+/**
+ * Current device mode from the URL (?mode=device&type=KIOSK|TV|DISPLAY) —
+ * the same signal page.tsx uses to render the fullscreen kiosk/TV surfaces.
+ */
+function readDeviceMode(): string | null {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('mode') === 'device') {
+      const type = params.get('type');
+      if (type) return type;
+    }
+  } catch { /* no window */ }
+  return null;
 }
 
 // ─── Upload ──────────────────────────────────────────────────────────────────
@@ -220,12 +303,16 @@ async function fetchLogsDirect(url: string, body: unknown): Promise<Response> {
   }
 }
 
-async function uploadBatch(manual: boolean): Promise<{ ok: boolean; accepted?: number; error?: string }> {
+async function uploadBatch(manual: boolean, reason?: string): Promise<{ ok: boolean; accepted?: number; error?: string }> {
   if (buffer.length === 0) return { ok: true, accepted: 0 };
   if (typeof window === 'undefined') return { ok: false, error: 'no-window' };
 
   const platform = detectPlatform();
-  const platformName = platform.isElectron ? 'desktop' : platform.isCapacitor ? 'mobile' : 'web';
+  const deviceMode = readDeviceMode();
+  const isKioskLike = deviceMode === 'KIOSK' || deviceMode === 'TV' || deviceMode === 'DISPLAY';
+  const platformName = isKioskLike
+    ? (deviceMode === 'KIOSK' ? 'kiosk' : 'tv')
+    : platform.isElectron ? 'desktop' : platform.isCapacitor ? 'mobile' : 'web';
 
   // Desktop: pull the main-process ring buffer into this flush.
   if (platform.isElectron) await mergeDesktopMainLogs();
@@ -236,6 +323,7 @@ async function uploadBatch(manual: boolean): Promise<{ ok: boolean; accepted?: n
   const batch = buffer.slice(-MAX_BUFFER);
   const body = {
     manual,
+    reason: reason || 'interval',
     platform: platformName,
     appVersion: await appVersionSafe(),
     device: deviceDescription(),
@@ -248,17 +336,20 @@ async function uploadBatch(manual: boolean): Promise<{ ok: boolean; accepted?: n
 
   // 0.6.20 audit fix — the logs vault lives ONLY on the cloud VPS. apiFetch
   // routes EVERYTHING to the embedded local API (:3080, local-first, no
-  // cloud failover) inside Electron, and the local API has no /api/logs
-  // ingest route — every desktop upload 404'd ("server too old" cooldown)
-  // and renderer+main logs never left the device. Desktop uploads therefore
-  // go to the CLOUD base directly (buildCloudUrl resolves electronAPI.
-  // cloudBaseUrl), authenticated with the cloud-minted session JWT the store
-  // already holds. Offline → fetch throws → same buffered-retry semantics.
+  // cloud failover) inside Electron; since 0.6.30 the local API HAS a
+  // /api/logs ingest route (LAN clients land there) but the desktop shell
+  // itself still uploads DIRECT to the cloud with the session JWT.
+  // KIOSK/TV devices have no session — they authenticate with the DEVICE
+  // token (paired via the kiosk join flow) which the cloud accepts since
+  // 0.6.30. Anonymous-but-tokenless uploads stay buffered (401 semantics).
   const res = platform.isElectron
     ? await fetchLogsDirect(buildCloudUrl('/api/logs'), body)
     : await apiFetch('/api/logs', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...(!readUidFromStore() && readDeviceToken() ? { Authorization: `Bearer ${readDeviceToken()}` } : {}),
+        },
         body: JSON.stringify(body),
       });
 
@@ -379,13 +470,14 @@ function sessionIdSafe(): string {
 
 // ─── Public flush API (auto + manual button) ─────────────────────────────────
 
-export async function flushLogsNow(opts?: { manual?: boolean }): Promise<{ ok: boolean; accepted?: number; error?: string }> {
+export async function flushLogsNow(opts?: { manual?: boolean; reason?: 'error' | 'interval' | 'manual' | 'pagehide' | 'auth' | 'main-process' | 'external' }): Promise<{ ok: boolean; accepted?: number; error?: string }> {
   if (flushing) return { ok: false, error: 'flush-in-progress' };
   const now = Date.now();
   // Stale-server cooldown: skip AUTO flushes only — the manual button
-  // (opts.manual) always goes through so support can still force a snapshot
-  // and see the real server answer.
-  if (!opts?.manual && now < staleServer404Until) {
+  // (opts.manual) and ERROR-driven urgent flushes always go through so a
+  // failing upload never hides the very trail the system exists to keep.
+  const isUrgent = opts?.reason === 'error' || opts?.reason === 'main-process';
+  if (!opts?.manual && !isUrgent && now < staleServer404Until) {
     return { ok: false, error: 'stale-server-cooldown' };
   }
   if (opts?.manual && now - lastFlushAt < MIN_FLUSH_GAP_MS) {
@@ -393,7 +485,7 @@ export async function flushLogsNow(opts?: { manual?: boolean }): Promise<{ ok: b
   }
   flushing = true;
   try {
-    const out = await uploadBatch(opts?.manual === true);
+    const out = await uploadBatch(opts?.manual === true, opts?.reason || (opts?.manual ? 'manual' : 'interval'));
     lastFlushAt = Date.now();
     // A success clears the stale-server state (server got updated).
     if (out.ok) staleServer404Until = 0;
@@ -435,9 +527,17 @@ export function installRemoteLogger(): void {
   // Flush triggers: interval, tab hide (mobile app pause), and beforeunload.
   flushTimer = setInterval(() => { void flushLogsNow(); }, FLUSH_INTERVAL_MS);
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') { void flushLogsNow(); }
+    if (document.visibilityState === 'hidden') { void flushLogsNow({ reason: 'pagehide' }); }
   });
-  window.addEventListener('pagehide', () => { void flushLogsNow(); });
+  window.addEventListener('pagehide', () => { void flushLogsNow({ reason: 'pagehide' }); });
+
+  // STRICT (0.6.30): the Electron MAIN process asks for an immediate flush
+  // whenever a main-process error or updater/installer event lands in its
+  // ring buffer — those lines reach the vault within seconds, not minutes.
+  try {
+    const w = window as unknown as { electronAPI?: { onLogsFlushRequest?: (cb: () => void) => void } };
+    w.electronAPI?.onLogsFlushRequest?.(() => { void flushLogsNow({ reason: 'main-process' }); });
+  } catch { /* bridge unavailable */ }
 
   pushEntry('info', 'logger', `remote logger installed (buffer restored: ${buffer.length} entries)`);
 }

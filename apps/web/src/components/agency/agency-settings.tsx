@@ -62,6 +62,13 @@ import { AppUpdateSettingsCard } from '@/components/shared/app-update-settings-c
 import { AccountUidChip, ManualLogUpload } from '@/components/shared/account-log-tools';
 // Task 83-b — agency location editor (map picker + Algeria address selectors).
 import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
+// r26 — explicit GPS auto-fill for the settings location section (user request).
+import { GpsAddressButton, type GpsFillOutcome } from '@/components/shared/map/gps-address-button';
+import {
+  findWilayaCodeByGeocodeName,
+  matchCommuneInWilaya,
+} from '@/lib/map/gps-field-matching';
+import type { GeocodeComponents } from '@/lib/map';
 import { WilayaSelect, CommuneSelect } from '@/components/shared/algeria-location-selects';
 import { findWilayaByCode, findWilayaCentroid } from '@/lib/algeria-locations';
 // r21-5 — map-follows-inputs: the wilaya→centroid jump is debounced.
@@ -385,6 +392,49 @@ export function AgencySettings() {
     } catch {
       // silent — the section renders empty; locOriginal stays null so a
       // save can never clear values it never saw.
+    }
+  };
+
+  // r26 — EXPLICIT GPS fill for the location settings section (user
+  // request): an explicit button press overwrites the matched fields and
+  // stamps DEVICE_GPS (→ VERIFIED on save, same contract as the profile);
+  // COARSE fixes only move the pin (r21-5 honest-GPS policy).
+  const handleGpsDetectedAddress = (components: GeocodeComponents) => {
+    if (components.coarse) return;
+    applyGpsComponents(components);
+  };
+
+  const applyGpsComponents = (c: {
+    formatted: string | null;
+    street: string | null;
+    wilaya: string | null;
+    city: string | null;
+    postalCode: string | null;
+  }) => {
+    const text = c.formatted || c.street;
+    if (text) setLocAddress(text);
+    const code = findWilayaCodeByGeocodeName(c.wilaya);
+    if (code && code !== locWilaya) {
+      setLocWilaya(code);
+      setLocCommune(''); // dependent list — reset the commune
+    }
+    const commune = matchCommuneInWilaya(code || locWilaya, c.city);
+    if (commune) setLocCommune(commune);
+    if (c.postalCode) setLocPostalCode(c.postalCode);
+  };
+
+  const handleSettingsGpsOutcome = (outcome: GpsFillOutcome) => {
+    if (outcome.kind === 'OK') {
+      applyGpsComponents(outcome.components);
+      lastLocPinAtRef.current = Date.now();
+      setLocLatitude(outcome.coords.lat);
+      setLocLongitude(outcome.coords.lng);
+      setLocSource('DEVICE_GPS');
+    } else if (outcome.kind === 'COARSE') {
+      lastLocPinAtRef.current = Date.now();
+      setLocLatitude(outcome.coords.lat);
+      setLocLongitude(outcome.coords.lng);
+      setLocSource('DEVICE_GPS');
     }
   };
 
@@ -932,7 +982,8 @@ export function AgencySettings() {
                               setLocLongitude(lng);
                             }}
                             onLocationSource={(source) => setLocSource(source)}
-                            height={260}
+                            addressFields={{ onDetected: handleGpsDetectedAddress }}
+                            height={340}
                           />
                           <div className="space-y-2">
                             <Label className="text-sm flex items-center gap-2">
@@ -944,6 +995,10 @@ export function AgencySettings() {
                               onChange={(e) => setLocAddress(e.target.value)}
                               className="h-11"
                             />
+                            {/* r26 — explicit GPS auto-fill (user request) */}
+                            <div className="flex justify-end">
+                              <GpsAddressButton onFilled={handleSettingsGpsOutcome} />
+                            </div>
                           </div>
                           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                             <div className="space-y-2">

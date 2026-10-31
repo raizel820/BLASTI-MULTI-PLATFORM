@@ -8,9 +8,13 @@ import {
   type ProtocolStatus,
   type Diagnostics,
   DEFAULT_SCAN_STATE,
+  deviceApi,
 } from '@/components/agency/devices/types';
 
-const API_Q = 'XTransformPort=3003';
+// Routing note: all discovery endpoints go through `apiFetch` (shared client).
+// Paths are built with deviceApi() — apiClient injects the gateway hint
+// (XTransformPort=3003) ONLY on gateway origins; inside Electron every call
+// targets the local API on :3080 where the real discovery routes live.
 const POLL_INTERVAL = 3000;
 const SLOW_POLL_INTERVAL = 30000;
 const AUTO_SCAN_INTERVAL = 30000;
@@ -58,7 +62,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   // Health check — proxy through API
   const checkHealth = useCallback(async () => {
     try {
-      const res = await apiFetch(`/api/agency-devices/discovery/health?${API_Q}`);
+      const res = await apiFetch(deviceApi('/discovery/health'));
       if (res.ok) {
         const data = await res.json();
         if (data.status === 'ok' && mountedRef.current) {
@@ -75,7 +79,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   // Poll discovered devices — proxy through API
   const pollDevices = useCallback(async () => {
     try {
-      const res = await apiFetch(`/api/agency-devices/discovery/devices?${API_Q}`);
+      const res = await apiFetch(deviceApi('/discovery/devices'));
       if (!res.ok) return;
       const data = await res.json();
       if (data.devices && Array.isArray(data.devices) && mountedRef.current) {
@@ -127,7 +131,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   // Poll scan status — proxy through API
   const pollScanStatus = useCallback(async () => {
     try {
-      const res = await apiFetch(`/api/agency-devices/discovery/scan/status?${API_Q}`);
+      const res = await apiFetch(deviceApi('/discovery/scan/status'));
       if (!res.ok) {
         noteScanPollFailure();
         return;
@@ -171,7 +175,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   // Poll protocols (less frequent — every 30s) — proxy through API
   const pollProtocols = useCallback(async () => {
     try {
-      const res = await apiFetch(`/api/agency-devices/discovery/protocols?${API_Q}`);
+      const res = await apiFetch(deviceApi('/discovery/protocols'));
       if (!res.ok) return;
       const data = await res.json();
       if (data.protocols && Array.isArray(data.protocols) && mountedRef.current) {
@@ -193,7 +197,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   // Poll diagnostics (less frequent — every 30s) — proxy through API
   const pollDiagnostics = useCallback(async () => {
     try {
-      const res = await apiFetch(`/api/agency-devices/discovery/diagnostics?${API_Q}`);
+      const res = await apiFetch(deviceApi('/discovery/diagnostics'));
       if (!res.ok) return;
       const data = await res.json();
       if (mountedRef.current) {
@@ -208,7 +212,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   const startScan = useCallback(async () => {
     try {
       const res = await apiFetch(
-        `/api/agency-devices/discovery/scan/start?${API_Q}`,
+        deviceApi('/discovery/scan/start'),
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -248,7 +252,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
   // Stop scan — proxy through API
   const stopScan = useCallback(async () => {
     try {
-      await apiFetch(`/api/agency-devices/discovery/scan/stop?${API_Q}`, {
+      await apiFetch(deviceApi('/discovery/scan/stop'), {
         method: 'POST',
       });
     } catch {

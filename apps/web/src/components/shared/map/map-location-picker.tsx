@@ -25,7 +25,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { Crosshair, MapPin, MapPinOff, Loader2, LocateFixed } from 'lucide-react';
+import { Crosshair, MapPin, MapPinOff, Loader2, LocateFixed, Maximize2, Minimize2 } from 'lucide-react';
 import { useLanguage } from '@/hooks/use-language';
 import { useOnlineStatus } from '@/hooks/use-online-status';
 import { toast } from 'sonner';
@@ -42,6 +42,7 @@ import {
   type MapsProviderSettings,
 } from '@/lib/map';
 import { useMapConfig } from '@/lib/map/use-map-config';
+import { useMapFullscreen } from './use-map-fullscreen';
 import { nativeBridge } from '@/lib/native-bridge';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
@@ -62,7 +63,7 @@ export interface MapLocationPickerProps {
   addressFields?: {
     onDetected: (components: GeocodeComponents) => void;
   };
-  /** Map height in px (default 280). */
+  /** Map height in px (default 340 — r26: taller box per user report). */
   height?: number;
   /**
    * Optional: receives the locationSource of each explicit pick
@@ -84,12 +85,25 @@ export function MapLocationPicker({
   value,
   onChange,
   addressFields,
-  height = 280,
+  height = 340,
   onLocationSource,
 }: MapLocationPickerProps) {
   const { t, lang } = useLanguage();
   const online = useOnlineStatus();
   const { config, loading: configLoading } = useMapConfig();
+
+  // r27 — fullscreen map (user report: the map box is good but too short).
+  // r26's CSS-only promotion (`fixed inset-0` on the same node) is pinned to
+  // the nearest TRANSFORMED ancestor — the page wrapper `.blasti-view-enter`
+  // keeps a computed transform after its entrance animation — so the map
+  // opened ~1200px above the viewport (browser-measured). useMapFullscreen
+  // promotes via the native Fullscreen API (top layer, escapes everything)
+  // and keeps the CSS promotion only as fallback + `blasti-fs-open` root
+  // class that neutralizes transformed ancestors. Same node in all cases (no
+  // re-parent: moving a maplibre container would remount the map); the
+  // existing ResizeObserver → provider.resize() re-measures for free.
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const { fullscreen, toggle: toggleFullscreen } = useMapFullscreen();
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const providerRef = useRef<MapProviderInstance | null>(null);
@@ -339,14 +353,33 @@ export function MapLocationPicker({
       {/* Map surface / offline box (spec §40) */}
       {showMap && (
         <div
-          className="relative w-full rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800"
-          style={{ height }}
+          ref={surfaceRef}
+          className={
+            fullscreen
+              ? // r27 — fullscreen: native top-layer when available, else the
+                // same-node fixed promotion (no re-parent — maplibre containers
+                // must not move in the DOM; ResizeObserver re-measures itself).
+                'fixed inset-0 z-[100] overflow-hidden bg-gray-100 dark:bg-gray-900'
+              : 'relative w-full rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800'
+          }
+          style={{ height: fullscreen ? '100dvh' : height }}
+          aria-label={fullscreen ? t('fullscreen') : undefined}
         >
           {/* NOTE: h-full w-full instead of `absolute inset-0` — maplibre-gl.css
               sets `.maplibregl-map { position: relative }` UNLAYERED, which beats
               Tailwind 4's layered `absolute` utility → the container collapsed to
               0 height and the map was invisible (same fix as agency-location-map). */}
           <div ref={containerRef} className="h-full w-full" dir="ltr" />
+          {/* r27 — fullscreen toggle (top-end corner, RTL-safe) */}
+          <button
+            type="button"
+            onClick={() => toggleFullscreen(surfaceRef.current)}
+            aria-label={fullscreen ? t('exitFullscreen') : t('fullscreen')}
+            title={fullscreen ? t('exitFullscreen') : t('fullscreen')}
+            className="absolute top-2 end-2 z-20 inline-flex h-9 w-9 items-center justify-center rounded-lg bg-white/90 dark:bg-gray-900/90 border border-gray-200 dark:border-gray-700 shadow-sm text-gray-700 dark:text-gray-200 hover:bg-white dark:hover:bg-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+          >
+            {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+          </button>
           {mapState === 'loading' && (
             <div className="absolute inset-0 flex items-center justify-center bg-gray-100/80 dark:bg-gray-800/80 z-10">
               <Loader2 className="h-6 w-6 animate-spin text-emerald-600" />

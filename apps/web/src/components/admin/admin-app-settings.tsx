@@ -26,6 +26,7 @@ import { InstallersTab } from './public-app/installers-tab';
 import { VersionsTab } from './public-app/versions-tab';
 import { PusherTab } from './public-app/pusher-tab';
 import { DevicesTab } from './public-app/devices-tab';
+import { CompatTab } from './public-app/compat-tab';
 
 export function AdminAppSettings() {
   const { t } = useLanguage();
@@ -91,6 +92,9 @@ export function AdminAppSettings() {
           <TabsTrigger value="devices" className="text-xs sm:text-sm min-h-[36px] px-3">
             {t('publicAppTabDevices')}
           </TabsTrigger>
+          <TabsTrigger value="compat" className="text-xs sm:text-sm min-h-[36px] px-3">
+            {t('publicAppTabCompat')}
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="installers" className="mt-3">
@@ -104,6 +108,9 @@ export function AdminAppSettings() {
         </TabsContent>
         <TabsContent value="devices" className="mt-3">
           <DevicesTab />
+        </TabsContent>
+        <TabsContent value="compat" className="mt-3">
+          <CompatTab />
         </TabsContent>
       </Tabs>
     </div>

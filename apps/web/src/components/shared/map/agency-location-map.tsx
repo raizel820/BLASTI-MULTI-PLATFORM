@@ -21,7 +21,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { MapPinOff, Loader2, Navigation } from 'lucide-react';
+import { MapPinOff, Loader2, Navigation, Maximize2, Minimize2 } from 'lucide-react';
 import { useLanguage } from '@/hooks/use-language';
 import { useOnlineStatus } from '@/hooks/use-online-status';
 import {
@@ -34,6 +34,7 @@ import {
   type MapProviderInstance,
 } from '@/lib/map';
 import { useMapConfig } from '@/lib/map/use-map-config';
+import { useMapFullscreen } from './use-map-fullscreen';
 import 'maplibre-gl/dist/maplibre-gl.css';
 
 export interface AgencyLocationMapAgency {
@@ -51,7 +52,7 @@ export interface AgencyLocationMapProps {
   /** Task 82 — show directions even when config.directionsEnabled is false
    *  (customer-facing agency profile). URL building stays centralized. */
   alwaysAllowDirections?: boolean;
-  /** Map height in px (default 220). */
+  /** Map height in px (default 280 — r26: taller display box). */
   height?: number;
 }
 
@@ -59,11 +60,22 @@ export function AgencyLocationMap({
   agency,
   showDirections = false,
   alwaysAllowDirections = false,
-  height = 220,
+  height = 280,
 }: AgencyLocationMapProps) {
   const { t } = useLanguage();
   const online = useOnlineStatus();
   const { config, loading: configLoading } = useMapConfig();
+
+  // r27 — fullscreen display map. r26 promoted the SAME node to `fixed
+  // inset-0`, but any transformed ancestor (`.blasti-view-enter` keeps a
+  // computed transform after its entrance animation) becomes the containing
+  // block for fixed descendants — the overlay opened pinned to that ancestor,
+  // NOT the viewport (browser-measured top -1244px). useMapFullscreen uses
+  // the native Fullscreen API (top layer) with the CSS promotion kept only as
+  // fallback + the `blasti-fs-open` root class. Same node in all cases — no
+  // re-parent (maplibre containers must not move); ResizeObserver re-measures.
+  const surfaceRef = useRef<HTMLDivElement | null>(null);
+  const { fullscreen, toggle: toggleFullscreen } = useMapFullscreen();
 
   // Task 82 — settings fallback used when the maps config never loaded:
   // plain coordinates destination, current-location origin.
@@ -206,8 +218,13 @@ export function AgencyLocationMap({
   return (
     <div className="space-y-2" data-testid="agency-location-map">
       <div
-        className="relative w-full rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800"
-        style={{ height }}
+        ref={surfaceRef}
+        className={
+          fullscreen
+            ? 'fixed inset-0 z-[100] overflow-hidden bg-gray-100 dark:bg-gray-900'
+            : 'relative w-full rounded-xl overflow-hidden border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800'
+        }
+        style={{ height: fullscreen ? '100dvh' : height }}
       >
         {/* NOTE: h-full w-full instead of `absolute inset-0` — maplibre-gl.css
             sets `.maplibregl-map { position: relative }` UNLAYERED, which beats
@@ -216,6 +233,16 @@ export function AgencyLocationMap({
             explicit height; maplibre's own relative positioning provides the
             anchor for its absolutely-positioned children. */}
         <div ref={containerRef} className="h-full w-full" dir="ltr" />
+        {/* r27 — fullscreen toggle (top-end corner, RTL-safe) */}
+        <button
+          type="button"
+          onClick={() => toggleFullscreen(surfaceRef.current)}
+          aria-label={fullscreen ? t('exitFullscreen') : t('fullscreen')}
+          title={fullscreen ? t('exitFullscreen') : t('fullscreen')}
+          className="absolute top-2 end-2 z-20 inline-flex h-9 w-9 items-center justify-center rounded-lg bg-white/90 dark:bg-gray-900/90 border border-gray-200 dark:border-gray-700 shadow-sm text-gray-700 dark:text-gray-200 hover:bg-white dark:hover:bg-gray-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500"
+        >
+          {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+        </button>
         {mapState === 'loading' && (
           <div className="absolute inset-0 flex items-center justify-center bg-gray-100/80 dark:bg-gray-800/80 z-10">
             <Loader2 className="h-6 w-6 animate-spin text-emerald-600" />

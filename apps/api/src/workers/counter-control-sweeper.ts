@@ -76,6 +76,7 @@ async function runSweepPass(): Promise<void> {
         counterName: outcome.counterName,
         counterNumber: outcome.counterNumber,
         autoClaimed: true,
+        reason: outcome.reason,
         requester: { userId: outcome.fromUserId },
         actor: { kind: 'SYSTEM', reason: 'REQUEST_EXPIRED_AUTO_CLAIM' },
       })
@@ -96,6 +97,7 @@ async function runSweepPass(): Promise<void> {
         counterId: outcome.counterId,
         counterName: outcome.counterName,
         counterNumber: outcome.counterNumber,
+        reason: outcome.reason,
         requester: { userId: outcome.fromUserId },
         actor: { kind: 'SYSTEM', reason: 'REQUEST_EXPIRED' },
       })

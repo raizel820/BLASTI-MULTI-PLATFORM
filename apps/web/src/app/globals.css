@@ -1888,7 +1888,15 @@ html {
 }
 
 .blasti-view-enter {
-  animation: blasti-view-enter 0.2s ease-out both;
+  /* r27 — fill-mode `backwards`, NOT `both`: `both` keeps the final keyframe's
+     translateY(0) applied FOREVER → a computed transform on every page view →
+     any `position:fixed` descendant (fullscreen map, customer QR pass, …)
+     gets positioned against this ancestor instead of the viewport (browser-
+     measured top -1244px). The `to` state IS the natural state (opacity 1,
+     no offset), so dropping the forwards fill changes nothing visually — it
+     only stops the lingering transform. `backwards` still covers the reason
+     this animation exists: a lazily-suspended view can't get stuck invisible. */
+  animation: blasti-view-enter 0.2s ease-out backwards;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1896,3 +1904,18 @@ html {
     animation: none;
   }
 }
+
+/* r27 — fullscreen-map fallback support. The fill-mode:both above keeps
+   translateY(0) applied forever → a computed transform on EVERY page view
+   wrapper → any `position:fixed` descendant (the CSS-promotion fullscreen
+   map) is positioned against this ancestor instead of the viewport.
+   useMapFullscreen's fallback path adds `blasti-fs-open` on <html> while a
+   promoted map is open, which drops the animation (and with it the lingering
+   transform) so `inset-0` resolves against the real viewport again. The
+   native Fullscreen-API path never needs this — the top layer escapes all
+   containing blocks — but keeping the class harmless for it. */
+html.blasti-fs-open .blasti-view-enter {
+  animation: none;
+  transform: none;
+}
+

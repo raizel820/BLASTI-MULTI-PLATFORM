@@ -10,6 +10,7 @@ import { DeviceQrScanner } from './device-qr-scanner';
 import { quickDiscover, type DiscoveredServer } from '@/lib/lan-discovery';
 import { apiFetch } from '@/lib/api-fetch';
 import { getLocalIp } from '@/lib/get-local-ip';
+import { flushLogsNow } from '@/lib/remote-logger';
 import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -26,6 +27,7 @@ import {
   WifiOff,
   Monitor,
   ArrowLeft,
+  FileUp,
 } from 'lucide-react';
 
 import {
@@ -1040,7 +1042,22 @@ export function DeviceKiosk() {
           </p>
         </motion.div>
 
-        <div className="flex gap-1">
+        <div className="flex gap-1 items-center">
+          {/* STRICT LOGS (0.6.30) — manual upload even on the kiosk surface.
+              The device token authenticates the batch (no user session). */}
+          <button
+            onClick={() => {
+              void flushLogsNow({ manual: true }).then((res) => {
+                if (res.ok) toast.success(t('logsUploadedOk') || 'Logs uploaded');
+                else toast.error((t('logsUploadFailed') || 'Log upload failed') + (res.error ? ` (${res.error})` : ''));
+              });
+            }}
+            title={t('uploadLogsNow') || 'Upload logs now'}
+            aria-label={t('uploadLogsNow') || 'Upload logs now'}
+            className="min-h-[32px] min-w-[32px] rounded-lg bg-white/20 text-white hover:bg-white/30 flex items-center justify-center transition-all"
+          >
+            <FileUp className="h-3.5 w-3.5" />
+          </button>
           {languages.map((l) => (
             <button
               key={l.code}

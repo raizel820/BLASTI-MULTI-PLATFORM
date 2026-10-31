@@ -31,12 +31,17 @@ import {
   ExternalLink,
   Unplug,
   Loader2,
+  Tv,
+  Printer,
+  Crown,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useDiscoveryService, useDiscoveryAutoScan } from '@/hooks/use-discovery-service';
+import { Badge } from '@/components/ui/badge';
 
 // ─── Sub-components ───────────────────────────────────────────────────────
 import { initDeviceTypeIcons } from './devices/types';
+import { LanTopologyPanel } from './devices/lan-topology-panel';
 import {
   type AgencyDevice,
   type RealDiscoveredDevice,
@@ -48,7 +53,7 @@ import {
   type ScreenLayout,
   type DisplaySettings,
   API_BASE,
-  PORT_Q,
+  deviceApi,
   PAIRING_EXPIRE_MS,
   DEVICE_TYPE_CONFIG,
   fadeUp,
@@ -73,6 +78,39 @@ import {
 
 // Initialize lucide icons in type config
 initDeviceTypeIcons();
+
+// ─── Section header with live count ──────────────────────────────────────
+
+function SectionHeader({
+  icon: Icon,
+  title,
+  count,
+  tone = 'emerald',
+}: {
+  icon: typeof Radio;
+  title: string;
+  count?: number;
+  tone?: 'emerald' | 'sky' | 'amber' | 'violet';
+}) {
+  const tones: Record<string, string> = {
+    emerald: 'bg-emerald-100 text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-400',
+    sky: 'bg-sky-100 text-sky-600 dark:bg-sky-950/50 dark:text-sky-400',
+    amber: 'bg-amber-100 text-amber-600 dark:bg-amber-950/50 dark:text-amber-400',
+    violet: 'bg-violet-100 text-violet-600 dark:bg-violet-950/50 dark:text-violet-400',
+  };
+  return (
+    <div className="flex items-center gap-3">
+      <div className={`p-2 rounded-lg shrink-0 ${tones[tone]}`}>
+        <Icon className="h-5 w-5" />
+      </div>
+      <h2 className="text-base font-semibold tracking-tight">{title}</h2>
+      {count !== undefined && (
+        <Badge variant="secondary" className="text-xs">{count}</Badge>
+      )}
+      <div className="flex-1 h-px bg-border/60 min-w-[1.5rem]" aria-hidden />
+    </div>
+  );
+}
 
 // ─── Main Component ─────────────────────────────────────────────────────────
 
@@ -239,7 +277,7 @@ export function AgencyDevices() {
   const fetchBranches = useCallback(async () => {
     if (!agencyId) return;
     try {
-      const res = await apiFetch(`/api/agency/branches?agencyId=${agencyId}&${PORT_Q}`);
+      const res = await apiFetch(`/api/agency/branches?agencyId=${agencyId}`);
       if (res.ok) {
         const data = await res.json();
         // Task 45 root cause: apiClient's parseResponse auto-unwrap collapses
@@ -329,7 +367,7 @@ export function AgencyDevices() {
   const fetchSavedTvs = useCallback(async () => {
     if (!agencyId) return;
     try {
-      const res = await apiFetch(`/api/agency-devices/discovery/saved-tvs?${PORT_Q}`);
+      const res = await apiFetch(deviceApi('/discovery/saved-tvs'));
       if (!res.ok) return;
       const data = await res.json();
       if (data.success && Array.isArray(data.savedTvs)) {
@@ -344,7 +382,7 @@ export function AgencyDevices() {
   const fetchDefaultPrinter = useCallback(async () => {
     if (!agencyId) return;
     try {
-      const res = await apiFetch(`/api/agency-devices/discovery/default-printer?${PORT_Q}`);
+      const res = await apiFetch(deviceApi('/discovery/default-printer'));
       if (!res.ok) return;
       const data = await res.json();
       if (data.success && data.defaultPrinter) {
@@ -367,7 +405,7 @@ export function AgencyDevices() {
   const handleSaveTv = useCallback(async (device: RealDiscoveredDevice) => {
     setSavingTvId(device.id);
     try {
-      const res = await apiFetch(`/api/agency-devices/discovery/saved-tvs?${PORT_Q}`, {
+      const res = await apiFetch(deviceApi('/discovery/saved-tvs'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -400,7 +438,7 @@ export function AgencyDevices() {
   const handleCastTv = useCallback(async (device: RealDiscoveredDevice) => {
     setCastingId(device.id);
     try {
-      const res = await apiFetch(`/api/agency-devices/discovery/cast?${PORT_Q}`, {
+      const res = await apiFetch(deviceApi('/discovery/cast'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -436,7 +474,7 @@ export function AgencyDevices() {
     setSavingPrinterId(device.id);
     try {
       const isUsb = device.connectionType === 'USB' || !device.ip;
-      const res = await apiFetch(`/api/agency-devices/discovery/default-printer?${PORT_Q}`, {
+      const res = await apiFetch(deviceApi('/discovery/default-printer'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -927,52 +965,133 @@ export function AgencyDevices() {
           </div>
         </motion.div>
 
-        {/* Network Discovery Panel (new real discovery) */}
-        <NetworkDiscoveryPanel
-          scanState={scanState}
-          discoveredDevices={discoveredDevices}
-          onStartScan={discoveryStartScan}
-          onStopScan={discoveryStopScan}
-          onAutoScanChange={setDiscoveryAutoScan}
-          onSaveTv={handleSaveTv}
-          onCast={handleCastTv}
-          onSavePrinter={handleSavePrinter}
-          onTestPrinter={handleTestDiscoveryPrinter}
-          autoScanEnabled={v2AutoScan}
-          serviceAvailable={discoveryServiceAvailable}
-          savedTvIps={savedTvIps}
-          savingTvId={savingTvId}
-          castingId={castingId}
-          savingPrinterId={savingPrinterId}
-          defaultPrinterIp={defaultPrinterIp}
-          testingPrinterId={testingPrinterId}
-          printerTestResults={printerTestResult}
-          onDismissDevice={handleDismissDiscoveryDevice}
-          protocols={protocols}
-          unpairedDevices={unpairedDevices}
-          pairingRequestId={pairingRequestId}
-          onSendPairingRequest={handleSendPairingRequest}
-        />
+        {/* ── Section: Branch LAN & Master PC (r21-9) — live branch connections,
+                the CURRENT MASTER PC, and manual master selection ── */}
+        <section className="space-y-3">
+          <SectionHeader
+            icon={Crown}
+            title={t('dmBranchLanTitle')}
+            tone="amber"
+          />
+          <LanTopologyPanel agencyId={agencyId} lang={lang} />
+        </section>
 
-        {/* Device Cards Grid */}
-        <DeviceGrid
-          devices={devices}
-          loading={loading}
-          error={error}
-          lang={lang}
-          onRetry={() => fetchDevices()}
-          onScanNetwork={() => { discoveryStartScan(); }}
-          onDetail={(d) => { setDetailDeviceId(d.id); setTokenRevealed(false); }}
-          onEdit={openEditDialog}
-          onPair={handlePair}
-          onDelete={openDeleteDialog}
-          onCommand={openCommandDialog}
-          onQuickRefresh={handleQuickRefresh}
-          onToggleEnable={handleToggleEnable}
-          onTvPreview={openTvPreview}
-          onKioskCredentials={openKioskCredentials}
-          onUnpair={openUnpairDialog}
-        />
+        {/* ── Section: Discovery ── */}
+        <section className="space-y-3">
+          <SectionHeader
+            icon={Radio}
+            title={t('dmDiscoveryTitle')}
+            count={discoveredDevices.length}
+            tone="emerald"
+          />
+          <NetworkDiscoveryPanel
+            scanState={scanState}
+            discoveredDevices={discoveredDevices}
+            onStartScan={discoveryStartScan}
+            onStopScan={discoveryStopScan}
+            onAutoScanChange={setDiscoveryAutoScan}
+            onSaveTv={handleSaveTv}
+            onCast={handleCastTv}
+            onSavePrinter={handleSavePrinter}
+            onTestPrinter={handleTestDiscoveryPrinter}
+            autoScanEnabled={v2AutoScan}
+            serviceAvailable={discoveryServiceAvailable}
+            savedTvIps={savedTvIps}
+            savingTvId={savingTvId}
+            castingId={castingId}
+            savingPrinterId={savingPrinterId}
+            defaultPrinterIp={defaultPrinterIp}
+            testingPrinterId={testingPrinterId}
+            printerTestResults={printerTestResult}
+            onDismissDevice={handleDismissDiscoveryDevice}
+            protocols={protocols}
+            unpairedDevices={unpairedDevices}
+            pairingRequestId={pairingRequestId}
+            onSendPairingRequest={handleSendPairingRequest}
+          />
+        </section>
+
+        {/* ── Section: Connected devices ── */}
+        <section className="space-y-3">
+          <SectionHeader
+            icon={Monitor}
+            title={t('deviceDiscovery.sectionConnected')}
+            count={devices.length}
+            tone="sky"
+          />
+          <DeviceGrid
+            devices={devices}
+            loading={loading}
+            error={error}
+            lang={lang}
+            onRetry={() => fetchDevices()}
+            onScanNetwork={() => { discoveryStartScan(); }}
+            onDetail={(d) => { setDetailDeviceId(d.id); setTokenRevealed(false); }}
+            onEdit={openEditDialog}
+            onPair={handlePair}
+            onDelete={openDeleteDialog}
+            onCommand={openCommandDialog}
+            onQuickRefresh={handleQuickRefresh}
+            onToggleEnable={handleToggleEnable}
+            onTvPreview={openTvPreview}
+            onKioskCredentials={openKioskCredentials}
+            onUnpair={openUnpairDialog}
+          />
+        </section>
+
+        {/* ── Section: Saved TVs & Printers ── */}
+        <section className="space-y-3">
+          <SectionHeader
+            icon={Tv}
+            title={t('deviceDiscovery.sectionSavedTvs')}
+            count={savedTvIps.size}
+            tone="violet"
+          />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {/* Saved TVs summary */}
+            <Card>
+              <CardContent className="p-4 flex items-center gap-3">
+                <div className="p-2 rounded-lg bg-violet-100 text-violet-600 dark:bg-violet-950/50 dark:text-violet-400 shrink-0">
+                  <Tv className="h-5 w-5" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold">{t('dmSavedTvsTitle')}</p>
+                  <p className="text-xs text-muted-foreground truncate">
+                    {savedTvIps.size > 0
+                      ? [...savedTvIps].slice(0, 3).join(' · ') + (savedTvIps.size > 3 ? ' …' : '')
+                      : getLocalizedString(
+                          'لم تحفظ تلفزيونات بعد — احفظ واحداً من نتائج الاكتشاف',
+                          'Aucun téléviseur enregistré — enregistrez-en un depuis la découverte',
+                          'No saved TVs yet — save one from the discovery results',
+                          lang,
+                        )}
+                  </p>
+                </div>
+                <Badge variant="secondary" className="text-xs shrink-0">{savedTvIps.size}</Badge>
+              </CardContent>
+            </Card>
+
+            {/* Default printer summary */}
+            <Card>
+              <CardContent className="p-4 flex items-center gap-3">
+                <div className={`p-2 rounded-lg shrink-0 ${defaultPrinterIp ? 'bg-amber-100 text-amber-600 dark:bg-amber-950/50 dark:text-amber-400' : 'bg-gray-100 text-gray-500 dark:bg-gray-900 dark:text-gray-500'}`}>
+                  <Printer className="h-5 w-5" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold">{t('deviceDiscovery.sectionPrinters')}</p>
+                  <p className="text-xs text-muted-foreground truncate" dir={defaultPrinterIp ? 'ltr' : undefined}>
+                    {defaultPrinterIp || t('dmNoDefaultPrinter')}
+                  </p>
+                </div>
+                {defaultPrinterIp && (
+                  <Badge variant="secondary" className="text-xs shrink-0 bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400">
+                    {getLocalizedString('افتراضية', 'Par défaut', 'Default', lang)}
+                  </Badge>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        </section>
 
         {/* Device Detail Sheet */}
         {detailDevice && (
@@ -1015,6 +1134,8 @@ export function AgencyDevices() {
           onFormAutoDiscoveryChange={setFormAutoDiscovery} onFormScreenLayoutChange={setFormScreenLayout}
           onFormBranchIdChange={setFormBranchId} onFormServiceFilterChange={setFormServiceFilter}
           onFormStatusChange={setFormStatus} onFormDisplaySettingsChange={setFormDisplaySettings}
+          onTokenRevealedChange={setTokenRevealed}
+          onCopy={copyToClipboard}
           onSubmit={handleEditDevice} onReset={resetForm}
         />
 

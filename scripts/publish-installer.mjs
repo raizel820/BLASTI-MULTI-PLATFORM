@@ -114,6 +114,40 @@ try {
         `, size ${((buf.length / (1024 * 1024)) | 0)} MB, sha256 ${body.fileInfo?.hash?.slice(0, 12) ?? '?'}…`
     );
     console.log('[publish] it is a DRAFT — activate it in Admin -> Public Apps Settings');
+
+    // ── DELTA UPDATES (0.6.30) — attach reference artifacts ──────────────────
+    // When the CI job also produced release refs (make-release-refs.mjs), push
+    // them so the cloud can build the differential patch vs the previous
+    // release: --asar + --outref + --runtime-key + --native-fingerprint.
+    if (args.asar || args.outref) {
+      try {
+        const refForm = new FormData();
+        if (args.asar) {
+          refForm.append('asar', new Blob([readFileSync(String(args.asar))]), 'app.asar');
+        }
+        if (args.outref) {
+          refForm.append('outref', new Blob([readFileSync(String(args.outref))]), 'outref.bin');
+        }
+        if (args['runtime-key']) refForm.append('runtimeKey', String(args['runtime-key']));
+        if (args['native-fingerprint']) refForm.append('nativeFingerprint', String(args['native-fingerprint']));
+        const refRes = await fetch(`${apiUrl}/api/app-versions/${v.id}/release-refs`, {
+          method: 'POST',
+          headers: { 'x-deploy-token': token },
+          body: refForm,
+        });
+        const refText = await refRes.text();
+        let refBody = {};
+        try { refBody = JSON.parse(refText); } catch { /* non-JSON */ }
+        if (refRes.ok && refBody.success) {
+          console.log(`[publish] delta refs attached → ${JSON.stringify(refBody.deltaGeneration ?? {})}`);
+        } else {
+          console.warn(`[publish] WARN: delta refs upload failed (HTTP ${refRes.status}) — full-installers still fine`);
+        }
+      } catch (err) {
+        console.warn(`[publish] WARN: delta refs upload error: ${err?.message ?? err}`);
+      }
+    }
+
     process.exit(0);
   }
 

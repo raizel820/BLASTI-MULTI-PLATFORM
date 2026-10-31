@@ -780,6 +780,294 @@ public class BlastiNativeStatus extends Plugin {
         }
     }
 
+    // ─── DELTA UPDATES (0.6.30) — differential APK patches ──────────────────
+
+    /**
+     * DELTA UPDATES (0.6.30): instead of downloading the FULL APK for every
+     * release, the cloud serves a chain of binary-delta patches (BLSTDLT1
+     * format — see packages/binary-delta/index.js for the canonical writer).
+     * This method:
+     *   1. reads the INSTALLED base APK (getApplicationInfo().sourceDir),
+     *   2. downloads every hop patch to cache + verifies its sha256,
+     *   3. applies the chain in order (each hop's header.fromSha256 must
+     *      match the file it applies to), producing the target APK,
+     *   4. verifies the FINAL sha256 and stages the result as
+     *      DOWNLOADS/blasti-update.apk — the existing installUpdate flow
+     *      installs it (filePath branch).
+     * Resolves { ok, apkPath } or rejects ("base-apk-unreadable",
+     * "delta-download-failed", "delta-verify-failed", "delta-apply-failed").
+     * Any failure leaves the installed app untouched — the web layer falls
+     * back to the full-APK DownloadManager path.
+     */
+    @PluginMethod
+    public void installDeltaUpdate(PluginCall call) {
+        com.getcapacitor.JSArray deltas = call.getArray("deltas");
+        String finalSha256 = call.getString("finalSha256");
+        if (deltas == null || deltas.length() == 0) {
+            call.reject("no-deltas");
+            return;
+        }
+        try {
+            String baseApkPath = getContext().getApplicationInfo() != null
+                ? getContext().getApplicationInfo().sourceDir : null;
+            if (baseApkPath == null || baseApkPath.isEmpty()) {
+                call.reject("base-apk-unreadable");
+                return;
+            }
+            java.io.File baseApk = new java.io.File(baseApkPath);
+            if (!baseApk.exists() || !baseApk.canRead()) {
+                call.reject("base-apk-unreadable");
+                return;
+            }
+            Log.i(TAG, "[delta] base apk: " + baseApkPath + " (" + baseApk.length() + " bytes)");
+
+            java.io.File cacheDir = new java.io.File(getContext().getCacheDir(), "delta-updates");
+            if (!cacheDir.exists()) cacheDir.mkdirs();
+            java.io.File current = baseApk;
+            int hopCount = deltas.length();
+            for (int i = 0; i < hopCount; i++) {
+                org.json.JSONObject hop = deltas.getJSONObject(i);
+                String url = hop.optString("url", "");
+                String sha256 = hop.optString("sha256", "");
+                String fromV = hop.optString("fromVersion", "");
+                String toV = hop.optString("toVersion", "");
+                if (url.isEmpty()) { call.reject("delta-download-failed", "hop " + i + ": missing url"); return; }
+
+                // 1) Download the patch (no DownloadManager — patches are small).
+                java.io.File patch = new java.io.File(cacheDir, "hop-" + i + "-" + System.currentTimeMillis() + ".patch");
+                try {
+                    downloadToFile(url, patch);
+                } catch (Throwable t) {
+                    Log.w(TAG, "[delta] hop " + i + " download failed", t);
+                    call.reject("delta-download-failed", "hop " + i + ": " + t.getMessage());
+                    return;
+                }
+                if (!sha.isEmpty() && !sha256Matches(patch, sha)) {
+                    patch.delete();
+                    call.reject("delta-verify-failed", "hop " + i + " (" + fromV + "→" + toV + "): patch sha256 mismatch");
+                    return;
+                }
+
+                // 2) Apply the patch onto the CURRENT apk file.
+                java.io.File out = new java.io.File(cacheDir, "apk-" + (i + 1) + "-" + System.currentTimeMillis() + ".apk");
+                try {
+                    applyBinaryDelta(current, patch, out);
+                } catch (Throwable t) {
+                    Log.w(TAG, "[delta] hop " + i + " apply failed", t);
+                    patch.delete();
+                    call.reject("delta-apply-failed", "hop " + i + " (" + fromV + "→" + toV + "): " + t.getMessage());
+                    return;
+                }
+                patch.delete();
+                if (i > 0 && current != baseApk) current.delete();
+                current = out;
+                Log.i(TAG, "[delta] hop " + i + " applied (" + fromV + "→" + toV + ") → " + out.length() + " bytes");
+            }
+
+            // 3) Final integrity gate — the target APK sha256 from /check.
+            if (finalSha256 != null && finalSha256.length() >= 16 && !sha256Matches(current, finalSha256)) {
+                current.delete();
+                call.reject("delta-verify-failed", "final apk sha256 mismatch");
+                return;
+            }
+
+            // 4) Stage as the SAME path installUpdate() knows ("filePath" arg
+            // or the deterministic fallback) — same layout as a DownloadManager
+            // download so the permission ladder + resume flow work unchanged.
+            java.io.File staged = new java.io.File(
+                getContext().getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS), UPDATE_APK_NAME);
+            if (staged.exists()) staged.delete();
+            java.io.FileInputStream in = new java.io.FileInputStream(current);
+            java.io.FileOutputStream outStream = new java.io.FileOutputStream(staged);
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) outStream.write(buf, 0, n);
+            in.close();
+            outStream.close();
+            if (current != baseApk) current.delete();
+            try { clearPendingInstallState(); } catch (Throwable ignored) { }
+
+            JSObject result = new JSObject();
+            result.put("ok", true);
+            result.put("apkPath", staged.getAbsolutePath());
+            result.put("bytes", staged.length());
+            call.resolve(result);
+        } catch (Throwable t) {
+            Log.w(TAG, "installDeltaUpdate failed", t);
+            call.reject("delta-apply-failed", t.getMessage());
+        }
+    }
+
+    /** Stream a URL to a file with permissive timeouts (patch-sized artifacts). */
+    private void downloadToFile(String url, java.io.File dest) throws Exception {
+        // TLS stays on the platform default (network_security_config.xml) —
+        // no trust-all overrides; the VPS serves a valid certificate chain.
+        java.net.URL u = new java.net.URL(url.trim());
+        java.net.HttpURLConnection conn = (java.net.HttpURLConnection) u.openConnection();
+        conn.setConnectTimeout(15000);
+        conn.setReadTimeout(30000);
+        conn.setInstanceFollowRedirects(true);
+        int code = conn.getResponseCode();
+        if (code < 200 || code >= 300) {
+            conn.disconnect();
+            throw new Exception("http-" + code);
+        }
+        java.io.InputStream in = conn.getInputStream();
+        java.io.FileOutputStream out = new java.io.FileOutputStream(dest);
+        byte[] buf = new byte[1 << 16];
+        int n;
+        long total = 0;
+        while ((n = in.read(buf)) > 0) { out.write(buf, 0, n); total += n; }
+        in.close();
+        out.close();
+        conn.disconnect();
+        if (total <= 0) throw new Exception("empty-body");
+    }
+
+    private boolean sha256Matches(java.io.File file, String expectedHex) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            java.io.FileInputStream in = new java.io.FileInputStream(file);
+            byte[] buf = new byte[1 << 16];
+            int n;
+            while ((n = in.read(buf)) > 0) md.update(buf, 0, n);
+            in.close();
+            byte[] digest = md.digest();
+            StringBuilder sb = new StringBuilder(digest.length * 2);
+            for (byte b : digest) sb.append(String.format("%02x", b));
+            return sb.toString().equalsIgnoreCase(expectedHex.trim());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Apply a BLSTDLT1 binary-delta (format contract in
+     * packages/binary-delta/index.js — identical byte layout):
+     *   magic "BLSTDLT1" (8B) · u32be headerLen · JSON header
+     *   { v:1, fromSize, toSize, fromSha256, toSha256, ops } · zlib(ops)
+     *   ops: 0x01 COPY varint:len varint:oldOffset · 0x02 DATA varint:len bytes
+     * Throws when ANY verification fails (input sha, output sha, sizes) —
+     * the caller then falls back to the full APK.
+     */
+    private void applyBinaryDelta(java.io.File baseFile, java.io.File deltaFile, java.io.File outFile) throws Exception {
+        byte[] deltaBytes = readFileBytes(deltaFile);
+        if (deltaBytes.length < 12) throw new Exception("delta-too-small");
+        byte[] magic = new byte[] { 'B', 'L', 'S', 'T', 'D', 'L', 'T', '1' };
+        for (int i = 0; i < 8; i++) {
+            if (deltaBytes[i] != magic[i]) throw new Exception("bad-magic");
+        }
+        long headerLen = ((deltaBytes[8] & 0xFFL) << 24) | ((deltaBytes[9] & 0xFFL) << 16)
+            | ((deltaBytes[10] & 0xFFL) << 8) | (deltaBytes[11] & 0xFFL);
+        if (headerLen <= 2 || headerLen > 65536 || 12 + headerLen > deltaBytes.length) {
+            throw new Exception("bad-header-length");
+        }
+        String headerJson = new String(deltaBytes, 12, (int) headerLen, "UTF-8");
+        org.json.JSONObject header = new org.json.JSONObject(headerJson);
+        long toSize = header.getLong("toSize");
+        String expectedToSha = header.optString("toSha256", "");
+        String expectedFromSha = header.optString("fromSha256", "");
+
+        // Input anchor: the base file must be EXACTLY the artifact the patch
+        // was diffed against (signature/channel mismatch → clean fallback).
+        if (!expectedFromSha.isEmpty() && !sha256Matches(baseFile, expectedFromSha)) {
+            throw new Exception("base-sha-mismatch");
+        }
+
+        java.util.zip.Inflater inflater = new java.util.zip.Inflater();
+        inflater.setInput(deltaBytes, 12 + (int) headerLen, deltaBytes.length - 12 - (int) headerLen);
+        java.io.ByteArrayOutputStream opsBuf = new java.io.ByteArrayOutputStream();
+        byte[] infBuf = new byte[1 << 16];
+        while (!inflater.finished()) {
+            int n = inflater.inflate(infBuf);
+            if (n == 0 && inflater.needsInput()) throw new Exception("delta-truncated");
+            if (n == 0 && inflater.needsDictionary()) throw new Exception("delta-dictionary");
+            opsBuf.write(infBuf, 0, n);
+        }
+        inflater.end();
+        byte[] ops = opsBuf.toByteArray();
+
+        java.io.RandomAccessFile base = new java.io.RandomAccessFile(baseFile, "r");
+        java.io.FileOutputStream out = new java.io.FileOutputStream(outFile);
+        java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+        byte[] copyBuf = new byte[1 << 16];
+        long written = 0;
+        int p = 0;
+        try {
+            while (p < ops.length) {
+                int op = ops[p++] & 0xFF;
+                if (op == 0x01) { // COPY
+                    long[] lenRef = readVarint(ops, p); p = (int) lenRef[1];
+                    long[] offRef = readVarint(ops, p); p = (int) offRef[1];
+                    long len = lenRef[0], off = offRef[0];
+                    if (off + len > baseFile.length()) throw new Exception("copy-out-of-bounds");
+                    long remaining = len;
+                    long src = off;
+                    base.seek(src);
+                    while (remaining > 0) {
+                        int take = (int) Math.min(remaining, copyBuf.length);
+                        int r = base.read(copyBuf, 0, take);
+                        if (r != take) throw new Exception("short-read");
+                        out.write(copyBuf, 0, r);
+                        md.update(copyBuf, 0, r);
+                        remaining -= r;
+                        written += r;
+                    }
+                } else if (op == 0x02) { // DATA
+                    long[] lenRef = readVarint(ops, p); p = (int) lenRef[1];
+                    long len = lenRef[0];
+                    if (p + len > ops.length) throw new Exception("data-out-of-bounds");
+                    out.write(ops, p, (int) len);
+                    md.update(ops, p, (int) len);
+                    p += (int) len;
+                    written += len;
+                } else {
+                    throw new Exception("unknown-op-" + op);
+                }
+            }
+        } finally {
+            base.close();
+            out.close();
+        }
+        if (written != toSize) {
+            outFile.delete();
+            throw new Exception("size-mismatch: " + written + " != " + toSize);
+        }
+        if (!expectedToSha.isEmpty() && !sha256Matches(outFile, expectedToSha)) {
+            outFile.delete();
+            throw new Exception("output-sha-mismatch");
+        }
+    }
+
+    /** LEB128 unsigned varint → { value, newPos } (mirrors the JS writer). */
+    private long[] readVarint(byte[] buf, int pos) throws Exception {
+        long result = 0;
+        int shift = 0;
+        int p = pos;
+        while (true) {
+            if (p >= buf.length) throw new Exception("varint-oob");
+            int b = buf[p++] & 0xFF;
+            result += (long) (b & 0x7F) << shift;
+            if ((b & 0x80) == 0) return new long[] { result, p };
+            shift += 7;
+            if (shift > 42) throw new Exception("varint-too-long");
+        }
+    }
+
+    private byte[] readFileBytes(java.io.File f) throws Exception {
+        byte[] data = new byte[(int) f.length()];
+        java.io.FileInputStream in = new java.io.FileInputStream(f);
+        int off = 0;
+        while (off < data.length) {
+            int r = in.read(data, off, data.length - off);
+            if (r < 0) break;
+            off += r;
+        }
+        in.close();
+        if (off != data.length) throw new Exception("short-file");
+        return data;
+    }
+
     // ─── Lock-screen notifications (channels + full-screen alerts) ──────────
 
     /**

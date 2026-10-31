@@ -12,6 +12,9 @@
  * Protocols implemented (no external service required):
  *   1. ARP table read      — `/proc/net/arp` on Linux, `arp -a` on macOS/Windows
  *   2. Ping sweep          — parallel `ping` per host (cross-platform flags)
+ *   2b. TCP-connect sweep  — raw net.Socket probes for SMB/RDP/WSD/iOS-sync/
+ *                           AirPlay/Chromecast/Roku ports (finds Windows PCs,
+ *                           iPhones, Chromecasts that ignore everything else)
  *   3. mDNS / DNS-SD       — UDP multicast to 224.0.0.251:5353
  *   4. SSDP / UPnP         — UDP multicast M-SEARCH to 239.255.255.250:1900
  *   5. HTTP probe          — fetch on an expanded port set incl. 631/9100/8001/9197/8060
@@ -58,12 +61,40 @@ const SCAN_PORTS = [
   49152, // UPnP ephemeral
 ]
 
-const PING_CONCURRENCY = 64
-const PING_TIMEOUT_MS = 1000
+// Speed pass (Task 5-a): tighter windows, higher concurrency — same protocol
+// coverage, less dead time per scan.
+const PING_CONCURRENCY = 128
+const PING_TIMEOUT_MS = 700
 const HTTP_CONCURRENCY = 16
-const HTTP_TIMEOUT_MS = 1500
-const MDNS_TIMEOUT_MS = 5000
-const SSDP_TIMEOUT_MS = 6000
+const HTTP_TIMEOUT_MS = 1100
+const MDNS_TIMEOUT_MS = 3500
+const SSDP_TIMEOUT_MS = 3500
+
+// TCP-connect sweep ('tcp-sweep' phase) — Windows PCs drop ICMP and run
+// nothing on the HTTP scan ports; their hallmark services (SMB 445, RDP 3389,
+// WSD 5357) and phone/cast ports (iOS sync 62078, AirPlay 7000, Chromecast
+// 8008/8009) are probed here with raw net.Socket connect attempts.
+const TCP_SWEEP_CONCURRENCY = 128
+const TCP_SWEEP_TIMEOUT_MS = 1200
+/** Hard cap on the whole tcp-sweep window (all subnets × all ports). */
+const TCP_SWEEP_MAX_WINDOW_MS = 15000
+
+/** TCP ports probed by the tcp-sweep phase and how a hit is classified. */
+const TCP_SWEEP_PORTS = [
+  { port: 445, service: 'smb' },        // Windows PC (file sharing)
+  { port: 3389, service: 'rdp' },       // Windows PC / Server (Remote Desktop)
+  { port: 5357, service: 'wsd' },       // Windows device (WSD web services)
+  { port: 7000, service: 'airplay' },   // Apple TV / AirPlay
+  { port: 8008, service: 'googlecast' },// Chromecast / Android TV
+  { port: 8009, service: 'googlecast' },// Chromecast / Android TV
+  { port: 62078, service: 'ios-sync' }, // iPhone / iPad (lockdownd sync port)
+  { port: 9100, service: 'jetdirect' }, // raw print / HP JetDirect
+  { port: 8060, service: 'roku' },      // Roku TV (ECP)
+  { port: 8080, service: 'http-alt' },  // generic alt HTTP
+  { port: 3000, service: 'http-alt' },  // generic HTTP / dev servers
+  { port: 5000, service: 'http-alt' },  // generic HTTP / UPnP
+  { port: 49152, service: 'http-alt' }, // generic UPnP ephemeral
+]
 
 const MDNS_ADDR = '224.0.0.251'
 const MDNS_PORT = 5353
@@ -566,15 +597,57 @@ async function readArpCommand() {
   })
 }
 
+/** Normalise a MAC address to lowercase colon-separated form.
+ *  Accepts `aa:bb:cc:dd:ee:ff` (Linux/macOS) and `aa-bb-cc-dd-ee-ff` (Windows).
+ *  Returns null for anything that is not a real MAC: "incomplete" entries,
+ *  all-zero placeholders, and the all-f broadcast address. Windows `arp -a`
+ *  lists the broadcast entry (`192.168.1.255  ff-ff-ff-ff-ff-ff  static`)
+ *  which must never become a "device". */
+function normalizeArpMac(raw) {
+  const hex = raw.toLowerCase().replace(/-/g, ':')
+  if (!/^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/.test(hex)) return null
+  if (hex === '00:00:00:00:00:00') return null
+  if (hex === 'ff:ff:ff:ff:ff:ff') return null
+  return hex
+}
+
+/**
+ * Parse `arp -a` output from Linux, macOS AND Windows.
+ *
+ * Formats handled:
+ *   Linux:   `? (192.168.1.5) at aa:bb:cc:dd:ee:ff [ether] on eth0`
+ *   macOS:   `hostname (192.168.1.5) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]`
+ *   Windows: `  192.168.1.5          aa-bb-cc-dd-ee-ff     dynamic`
+ *            (dash-MAC, no parentheses/"at"; multicast entries with the
+ *             01-xx leading vendor bit parse like any other MAC)
+ *
+ * Windows `arp -a` also emits interface headers (`Interface: 192.168.1.5 --- 0x2`)
+ * and "incomplete" entries — non-MAC-shaped lines are skipped naturally, and
+ * `incomplete`/`invalid` rows show `ff-ff-ff-ff-ff-ff` (or no MAC at all),
+ * which normalizeArpMac() rejects.
+ */
 function parseArpOutput(out) {
   const entries = []
-  // Linux `arp -a` format: `? (192.168.1.5) at aa:bb:cc:dd:ee:ff [ether] on eth0`
-  // macOS `arp -a` format: `hostname (192.168.1.5) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]`
   for (const line of out.split('\n')) {
-    const m = line.match(/\((\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+([0-9a-fA-F:]{11,17})/)
+    // Linux/macOS: "(ip) at mac" — also accepts a dash-MAC if a platform
+    // ever prints one inside the parentheses form.
+    const m = line.match(/\((\d{1,3}(?:\.\d{1,3}){3})\)\s+at\s+([0-9a-fA-F:-]{11,17})/)
     if (m) {
-      const ifaceMatch = line.match(/\bon\s+(\S+)/)
-      entries.push({ ip: m[1], mac: m[2].toLowerCase(), iface: ifaceMatch?.[1] || '' })
+      const mac = normalizeArpMac(m[2])
+      if (mac) {
+        const ifaceMatch = line.match(/\bon\s+(\S+)/)
+        entries.push({ ip: m[1], mac, iface: ifaceMatch?.[1] || '' })
+      }
+      continue
+    }
+    // Windows: IP in the first column, dash-separated MAC in the second,
+    // state keyword ("dynamic"/"static"/"invalid") in the third. Interface
+    // headers ("Interface: x.x.x.x --- 0x...") never match because "---" is
+    // not a MAC.
+    const w = line.trim().match(/^(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})/)
+    if (w) {
+      const mac = normalizeArpMac(w[2])
+      if (mac) entries.push({ ip: w[1], mac, iface: '' })
     }
   }
   return entries
@@ -645,6 +718,93 @@ function pingHost(ip, timeoutMs = PING_TIMEOUT_MS) {
     // Hard timeout in case ping itself hangs
     setTimeout(() => done(false), timeoutMs + 800)
   })
+}
+
+// ─── 2b. TCP-connect sweep ──────────────────────────────────────────────
+//
+// Windows PCs drop ICMP (no ping reply) and run nothing on the HTTP scan
+// ports, so they were invisible to every other phase. Their hallmark services
+// — SMB 445, RDP 3389, WSD 5357 — are probed here with raw net.Socket connect
+// attempts, along with phone/cast ports (iOS sync 62078, AirPlay 7000,
+// Chromecast 8008/8009, Roku ECP 8060) and generic HTTP ports.
+
+/**
+ * Attempt a single TCP connection to `ip:port`.
+ * Resolves true when the socket connects within `timeoutMs`, false on
+ * timeout / error / refusal. The socket is always destroyed.
+ */
+function tcpProbePort(ip, port, timeoutMs = TCP_SWEEP_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let settled = false
+    const sock = new net.Socket()
+    const done = (ok) => {
+      if (settled) return
+      settled = true
+      try { sock.destroy() } catch { /* ignore */ }
+      resolve(ok)
+    }
+    sock.setTimeout(timeoutMs)
+    sock.once('connect', () => done(true))
+    sock.once('timeout', () => done(false))
+    sock.once('error', () => done(false))
+    try { sock.connect(port, ip) } catch { done(false) }
+  })
+}
+
+/**
+ * Sweep every IP in each /24 subnet against the TCP_SWEEP_PORTS set.
+ * Concurrency 128, per-socket timeout 1.2s, whole sweep hard-capped at
+ * `maxWindowMs` (15s) so a full /24 × ~12 ports never stalls the scan.
+ * Closed ports on a LAN usually fail fast (RST), so in practice the sweep
+ * finishes far before the cap; the cap only bounds the worst case.
+ */
+async function tcpSweep(
+  subnets,
+  opts = {},
+) {
+  const concurrency = Math.max(1, opts.concurrency ?? TCP_SWEEP_CONCURRENCY)
+  const timeoutMs = opts.timeoutMs ?? TCP_SWEEP_TIMEOUT_MS
+  const maxWindowMs = opts.maxWindowMs ?? TCP_SWEEP_MAX_WINDOW_MS
+  const isAborted = opts.isAborted ?? (() => false)
+  const onProgress = opts.onProgress ?? (() => {})
+  const skipServicesFor = opts.skipServicesFor
+
+  const jobs = []
+  for (const subnet of subnets) {
+    for (let i = 1; i <= 254; i++) {
+      const ip = `${subnet}.${i}`
+      const skipped = skipServicesFor?.get(ip)
+      for (const target of TCP_SWEEP_PORTS) {
+        if (skipped?.has(target.service)) continue
+        jobs.push({ ip, port: target.port, service: target.service })
+      }
+    }
+  }
+
+  const deadline = Date.now() + maxWindowMs
+  const hits = []
+  const seen = new Set()
+  const queue = [...jobs]
+
+  async function worker() {
+    while (queue.length > 0) {
+      if (isAborted() || Date.now() > deadline) return
+      const job = queue.shift()
+      if (!job) break
+      const open = await tcpProbePort(job.ip, job.port, timeoutMs)
+      if (open) {
+        const key = `${job.ip}:${job.port}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          hits.push({ ip: job.ip, port: job.port, service: job.service })
+        }
+      }
+      onProgress()
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+  return hits
 }
 
 // ─── 3. mDNS / DNS-SD ───────────────────────────────────────────────────────
@@ -2276,8 +2436,18 @@ function fingerprintDevice(input) {
   }
 
   // ── 4. TV detection without UPnP (vendor HTTP ports or mDNS cast services) ──
+  // TCP-sweep hint names (Roku/Chromecast/AirPlay confirmed by port connect)
+  // take precedence over the generic "Smart TV @ IP" placeholder.
+  const tcpServices = (input.tcpServices || []).map((s) => String(s).toLowerCase())
+  const tcpHintName = tcpServices.includes('roku')
+    ? 'Roku TV'
+    : tcpServices.includes('googlecast')
+      ? 'Chromecast/Android TV'
+      : tcpServices.includes('airplay')
+        ? (macInfo.vendor ? `${macInfo.vendor} AirPlay` : 'Apple TV/AirPlay')
+        : undefined
   if (input.port === 8001 || input.port === 9197 || input.port === 8060) {
-    const name = safeFriendlyName || input.httpTitle || bestSecondaryName || (macInfo.vendor ? `${macInfo.vendor} TV` : `Smart TV @ ${input.ip}`)
+    const name = safeFriendlyName || input.httpTitle || bestSecondaryName || tcpHintName || (macInfo.vendor ? `${macInfo.vendor} TV` : `Smart TV @ ${input.ip}`)
     return { category: 'NETWORK', type: 'TV', name }
   }
   // mDNS cast / media-renderer services → TV or streaming stick
@@ -2344,6 +2514,46 @@ function fingerprintDevice(input) {
     const httpTitleSafe = input.httpTitle && !isVirtualPrinterName(input.httpTitle) ? input.httpTitle : undefined
     const name = safeFriendlyName || httpTitleSafe || bestSecondaryName || (macInfo.vendor ? `${macInfo.vendor} Router` : `Router @ ${input.ip}`)
     return { category: 'NETWORK', type: 'ROUTER', name }
+  }
+
+  // ── 6b. TCP-connect sweep signals ('tcp-sweep' phase) ──
+  // Raw TCP port hits classify hosts that drop ICMP and expose nothing on the
+  // HTTP scan ports — Windows PCs above all. Ordered so the most specific
+  // service wins: phone sync > cast targets > printer > Windows PC cluster.
+  // Runs AFTER router detection so a gateway that happens to run SMB is still
+  // a Router, not a "Windows PC".
+  // (tcpServices is extracted in section 4 above.)
+  if (tcpServices.length > 0) {
+    if (tcpServices.includes('ios-sync')) {
+      const name = safeFriendlyName || bestSecondaryName || 'iPhone/iPad'
+      return { category: 'NETWORK', type: 'PHONE', name }
+    }
+    if (tcpServices.includes('airplay')) {
+      const name = safeFriendlyName || bestSecondaryName || (macInfo.vendor ? `${macInfo.vendor} AirPlay` : 'Apple TV/AirPlay')
+      return { category: 'NETWORK', type: 'TV', name }
+    }
+    if (tcpServices.includes('googlecast')) {
+      const name = safeFriendlyName || bestSecondaryName || 'Chromecast/Android TV'
+      return { category: 'NETWORK', type: 'TV', name }
+    }
+    if (tcpServices.includes('roku')) {
+      const name = safeFriendlyName || bestSecondaryName || 'Roku TV'
+      return { category: 'NETWORK', type: 'TV', name }
+    }
+    if (tcpServices.includes('jetdirect')) {
+      const name = safeFriendlyName || bestSecondaryName || (macInfo.vendor ? `${macInfo.vendor} Printer` : 'Network Printer')
+      return { category: 'NETWORK', type: 'PRINTER', name }
+    }
+    if (tcpServices.includes('smb') || tcpServices.includes('rdp') || tcpServices.includes('wsd')) {
+      // Windows hallmarks: SMB 445 / RDP 3389 / WSD 5357 → a Windows PC.
+      const name = safeFriendlyName || bestSecondaryName
+        || (tcpServices.includes('rdp') ? 'Windows PC/Server'
+          : tcpServices.includes('smb') ? 'Windows PC'
+            : 'Windows Device')
+      return { category: 'NETWORK', type: 'KIOSK', name }
+    }
+    // 'http-alt' hits alone carry no classification — fall through so generic
+    // HTTP / vendor logic still applies (the device was still registered).
   }
 
   // ── 7. IoT detection — HomeKit, HAP, MQTT, etc. ──
@@ -2533,6 +2743,9 @@ async function runDiscoveryScan(
         reverseDnsName: patch.reverseDnsName || existing.reverseDnsName,
         netbiosName: patch.netbiosName || existing.netbiosName,
         dhcpHostname: patch.dhcpHostname || existing.dhcpHostname,
+        // Union the TCP-sweep services — later merges (HTTP probe, names)
+        // don't carry them and must never erase a confirmed service.
+        tcpServices: Array.from(new Set([...(existing.tcpServices || []), ...(patch.tcpServices || [])])),
       }
       // Re-fingerprint with merged signals. Use the preserved raw friendlyName
       // (NOT merged.name, which may be a placeholder or HTTP title) so the
@@ -2546,6 +2759,7 @@ async function runDiscoveryScan(
         mdnsService: merged.mdnsService, mac: merged.mac,
         reverseDnsName: merged.reverseDnsName, netbiosName: merged.netbiosName,
         dhcpHostname: merged.dhcpHostname,
+        tcpServices: merged.tcpServices,
       })
       merged.category = fp.category
       merged.type = fp.type
@@ -2586,6 +2800,7 @@ async function runDiscoveryScan(
         reverseDnsName: patch.reverseDnsName,
         netbiosName: patch.netbiosName,
         dhcpHostname: patch.dhcpHostname,
+        tcpServices: patch.tcpServices,
       }
       // Re-fingerprint using the raw friendlyName, not the display name.
       const fp = fingerprintDevice({
@@ -2597,6 +2812,7 @@ async function runDiscoveryScan(
         mdnsService: device.mdnsService, mac: device.mac,
         reverseDnsName: device.reverseDnsName, netbiosName: device.netbiosName,
         dhcpHostname: device.dhcpHostname,
+        tcpServices: device.tcpServices,
       })
       device.category = fp.category
       device.type = fp.type
@@ -2700,83 +2916,150 @@ async function runDiscoveryScan(
     } catch { /* ignore — best-effort */ }
   }
 
-  // ── Phase 3: mDNS ──
+  // ── Phases 3 + 4 + 4a: mDNS, SSDP and TCP-connect sweep — CONCURRENT ──
+  // Speed pass (Task 5-a): the three phases are independent listeners/probes,
+  // so they run under one Promise.all instead of back-to-back. Progress is
+  // still EMITTED in the declared phase order (mdns → ssdp → tcp-sweep) before
+  // launch and after completion, so the phase indicator is unchanged.
+  // The tcp-sweep phase probes Windows/phone/cast hallmark ports (SMB 445,
+  // RDP 3389, WSD 5357, iOS sync 62078, AirPlay 7000, Chromecast 8008/8009,
+  // Roku 8060, generic HTTP) — hosts that drop ICMP and expose nothing on the
+  // HTTP scan ports (i.e. Windows PCs) become visible for the first time.
+  // Hits collected by the concurrent tcp-sweep — hoisted so the rDNS/NBNS
+  // enrichment phase below can union them into its resolution set.
+  let tcpHits = []
   if (!cb.isAborted()) {
+    // Declared-order start emissions (both phases in order, for progress UI)
     emitProgress('mdns', totalIPs)
-    if (!protocolsUsed.includes('mDNS')) protocolsUsed.push('mDNS')
-    try {
-      const records = await mdnsQuery(MDNS_SERVICE_TYPES, {
-        timeoutMs: MDNS_TIMEOUT_MS,
-        isAborted: cb.isAborted,
-      })
-      for (const rec of records) {
-        if (!rec.ip) continue
-        // Filter to our subnets
-        if (!subnets.some((s) => rec.ip.startsWith(s + '.'))) continue
-        // Store the raw mDNS instance name in friendlyName (preserved across
-        // merges for re-fingerprinting). Only set it as the display `name` if
-        // it's NOT a virtual-printer queue name ("Adobe PDF", etc.) — those are
-        // host-side CUPS artifacts, not real device names.
-        // instanceName: friendly/model name correlated from TXT records —
-        // preferred over the raw hostname (mirror of the cloud scanner).
-        const cleanName = cleanMdnsName(rec.instanceName || rec.name) || rec.name
-        const safeName = cleanName && !isVirtualPrinterName(cleanName) ? cleanName : undefined
-        const txtModel = (rec.txt && (rec.txt.md || rec.txt.model || rec.txt.am)) || undefined
-        upsertDevice(rec.ip, {
-          source: 'mdns',
-          port: rec.port || 0,
-          mdnsService: rec.serviceType,
-          friendlyName: cleanName,
-          name: safeName,
-          model: txtModel && !isVirtualPrinterName(txtModel) ? txtModel : undefined,
-          capabilities: [`mDNS:${rec.serviceType}`],
-        })
-      }
-    } catch { /* ignore */ }
-  }
-  emitProgress('mdns', totalIPs)
-
-  // ── Phase 4: SSDP ──
-  if (!cb.isAborted()) {
     emitProgress('ssdp', totalIPs)
-    if (!protocolsUsed.includes('SSDP')) protocolsUsed.push('SSDP')
-    try {
-      const ssdpRecords = await ssdpDiscover({
-        timeoutMs: SSDP_TIMEOUT_MS,
-        isAborted: cb.isAborted,
-      })
-      // Fetch UPnP descriptions in parallel (limited concurrency)
-      const descResults = await Promise.all(
-        ssdpRecords.slice(0, 32).map(async (r) => {
-          const desc = await fetchUpnpDescription(r.location)
-          return { ssdp: r, desc }
-        }),
-      )
-      for (const { ssdp, desc } of descResults) {
-        // Parse IP:port from LOCATION URL
-        const m = ssdp.location.match(/^https?:\/\/([^:/]+)(?::(\d+))?/)
-        if (!m) continue
-        const ip = m[1]
-        const port = m[2] ? parseInt(m[2], 10) : 80
-        if (!subnets.some((s) => ip.startsWith(s + '.'))) continue
-        upsertDevice(ip, {
-          source: 'ssdp',
-          port,
-          ssdpLocation: ssdp.location,
-          ssdpServer: ssdp.server,
-          ssdpSt: ssdp.st,
-          manufacturer: desc?.manufacturer,
-          model: desc?.modelName,
-          friendlyName: desc?.friendlyName,
-          // Only use the UPnP friendlyName as display name if it's not a
-          // virtual-printer queue name.
-          name: desc?.friendlyName && !isVirtualPrinterName(desc.friendlyName) ? desc.friendlyName : undefined,
-          capabilities: ['SSDP/UPnP', ...(desc?.deviceType ? [`UPnP:${desc.deviceType.split(':').slice(-1)[0]}`] : [])],
+    emitProgress('tcp-sweep', 0)
+
+    // "Already has this service" skip map: don't re-probe ports whose service
+    // another phase already classified — e.g. don't probe 9100 on a device the
+    // ARP OUI lookup already typed as a printer.
+    const skipServicesFor = new Map()
+    for (const [ip, d] of devicesByIp) {
+      const skip = new Set(d.tcpServices || [])
+      if (d.type === 'PRINTER') skip.add('jetdirect')
+      if (d.type === 'PHONE') skip.add('ios-sync')
+      if (d.type === 'TV') { skip.add('airplay'); skip.add('googlecast'); skip.add('roku') }
+      if (d.type === 'KIOSK') { skip.add('smb'); skip.add('rdp'); skip.add('wsd') }
+      if (skip.size > 0) skipServicesFor.set(ip, skip)
+    }
+
+    const mdnsTask = (async () => {
+      if (!protocolsUsed.includes('mDNS')) protocolsUsed.push('mDNS')
+      try {
+        return await mdnsQuery(MDNS_SERVICE_TYPES, {
+          timeoutMs: MDNS_TIMEOUT_MS,
+          isAborted: cb.isAborted,
         })
-      }
-    } catch { /* ignore */ }
+      } catch { return [] }
+    })()
+
+    const ssdpTask = (async () => {
+      if (!protocolsUsed.includes('SSDP')) protocolsUsed.push('SSDP')
+      try {
+        const ssdpRecords = await ssdpDiscover({
+          timeoutMs: SSDP_TIMEOUT_MS,
+          isAborted: cb.isAborted,
+        })
+        // Fetch UPnP descriptions in parallel (limited concurrency)
+        return await Promise.all(
+          ssdpRecords.slice(0, 32).map(async (r) => {
+            const desc = await fetchUpnpDescription(r.location)
+            return { ssdp: r, desc }
+          }),
+        )
+      } catch { return [] }
+    })()
+
+    const tcpSweepTask = (async () => {
+      if (cb.isAborted()) return []
+      if (!protocolsUsed.includes('TCP')) protocolsUsed.push('TCP')
+      try {
+        return await tcpSweep(subnets, {
+          isAborted: cb.isAborted,
+          skipServicesFor,
+        })
+      } catch { return [] }
+    })()
+
+    const [mdnsRecords, ssdpDescResults, tcpSweepHits] = await Promise.all([mdnsTask, ssdpTask, tcpSweepTask])
+    tcpHits = tcpSweepHits
+
+    // Process mDNS records
+    for (const rec of mdnsRecords) {
+      if (cb.isAborted()) break
+      if (!rec.ip) continue
+      // Filter to our subnets
+      if (!subnets.some((s) => rec.ip.startsWith(s + '.'))) continue
+      // Store the raw mDNS instance name in friendlyName (preserved across
+      // merges for re-fingerprinting). Only set it as the display `name` if
+      // it's NOT a virtual-printer queue name ("Adobe PDF", etc.) — those are
+      // host-side CUPS artifacts, not real device names.
+      // instanceName: friendly/model name correlated from TXT records —
+      // preferred over the raw hostname (mirror of the cloud scanner).
+      const cleanName = cleanMdnsName(rec.instanceName || rec.name) || rec.name
+      const safeName = cleanName && !isVirtualPrinterName(cleanName) ? cleanName : undefined
+      const txtModel = (rec.txt && (rec.txt.md || rec.txt.model || rec.txt.am)) || undefined
+      upsertDevice(rec.ip, {
+        source: 'mdns',
+        port: rec.port || 0,
+        mdnsService: rec.serviceType,
+        friendlyName: cleanName,
+        name: safeName,
+        model: txtModel && !isVirtualPrinterName(txtModel) ? txtModel : undefined,
+        capabilities: [`mDNS:${rec.serviceType}`],
+      })
+    }
+
+    // Process SSDP records
+    for (const { ssdp, desc } of ssdpDescResults) {
+      if (cb.isAborted()) break
+      // Parse IP:port from LOCATION URL
+      const m = ssdp.location.match(/^https?:\/\/([^:/]+)(?::(\d+))?/)
+      if (!m) continue
+      const ip = m[1]
+      const port = m[2] ? parseInt(m[2], 10) : 80
+      if (!subnets.some((s) => ip.startsWith(s + '.'))) continue
+      upsertDevice(ip, {
+        source: 'ssdp',
+        port,
+        ssdpLocation: ssdp.location,
+        ssdpServer: ssdp.server,
+        ssdpSt: ssdp.st,
+        manufacturer: desc?.manufacturer,
+        model: desc?.modelName,
+        friendlyName: desc?.friendlyName,
+        // Only use the UPnP friendlyName as display name if it's not a
+        // virtual-printer queue name.
+        name: desc?.friendlyName && !isVirtualPrinterName(desc.friendlyName) ? desc.friendlyName : undefined,
+        capabilities: ['SSDP/UPnP', ...(desc?.deviceType ? [`UPnP:${desc.deviceType.split(':').slice(-1)[0]}`] : [])],
+      })
+    }
+
+    // Process TCP-sweep hits — every hit IP becomes a discovered device (even
+    // with no name yet) and therefore flows into the rDNS/NBNS enrichment
+    // phase below. "Already has this service" devices are not re-emitted.
+    for (const hit of tcpHits) {
+      if (cb.isAborted()) break
+      if (!subnets.some((s) => hit.ip.startsWith(s + '.'))) continue
+      if (selfIps.has(hit.ip)) continue
+      const existingTcp = devicesByIp.get(hit.ip)
+      if (existingTcp?.tcpServices?.includes(hit.service)) continue
+      upsertDevice(hit.ip, {
+        source: 'tcp-sweep',
+        port: hit.port,
+        tcpServices: [hit.service],
+        capabilities: [`TCP:${hit.service}`, `PORT:${hit.port}`],
+      })
+    }
   }
+  // Declared-order completion emissions (both phases in order, for progress UI)
+  emitProgress('mdns', totalIPs)
   emitProgress('ssdp', totalIPs)
+  emitProgress('tcp-sweep', totalIPs)
 
   // ── Phase 4b: Reverse DNS + NetBIOS name resolution ──
   // For devices that responded to ping/ARP but NOT to mDNS/SSDP, we have no
@@ -2800,12 +3083,20 @@ async function runDiscoveryScan(
     emitProgress('names', 0)
     if (!protocolsUsed.includes('rDNS/NBNS')) protocolsUsed.push('rDNS/NBNS')
     try {
-      // Only query IPs that don't already have a friendlyName (mDNS/SSDP
-      // already gave us a name) — saves time and avoids redundant lookups.
-      const ipsToResolve = Array.from(devicesByIp.entries())
-        .filter(([, d]) => !d.friendlyName)
-        .map(([ip]) => ip)
-        .filter((ip) => !ip.startsWith('local:')) // skip USB/local printers
+      // Enrichment set = every device WITHOUT a self-advertised name, UNION
+      // the tcp-sweep hit IPs (Task 5-a). TCP-only devices (Windows PCs that
+      // drop ICMP and speak nothing on HTTP) usually have no name yet — they
+      // MUST flow through NBNS + rDNS so "Device @ IP" becomes "DESKTOP-ABC".
+      // (tcp-sweep runs before this phase, so its hits are already in
+      // devicesByIp; the explicit union guarantees they're never filtered out.)
+      const tcpHitIps = new Set(tcpHits.map((h) => h.ip))
+      const ipsToResolve = Array.from(new Set([
+        ...Array.from(devicesByIp.entries())
+          .filter(([, d]) => !d.friendlyName)
+          .map(([ip]) => ip)
+          .filter((ip) => !ip.startsWith('local:')), // skip USB/local printers
+        ...tcpHitIps,
+      ]))
 
       // Run reverse DNS and NetBIOS in parallel — they're independent.
       const [rdnsResults, nbnsResults] = await Promise.all([
@@ -3015,6 +3306,7 @@ function sourcePriority(s) {
     case 'ssdp': return 5
     case 'mdns': return 4
     case 'http_probe': return 3
+    case 'tcp-sweep': return 3 // TCP port connect — same tier as http_probe
     case 'ping': return 2
     case 'arp': return 1
     case 'local': return 6  // CUPS queues are authoritative for local printers
@@ -3096,6 +3388,11 @@ function getProtocolAvailability() {
       description: `ICMP echo sweep with ${PING_CONCURRENCY} concurrent workers (${PING_TIMEOUT_MS}ms timeout)`,
     },
     {
+      name: 'TCP',
+      status: 'available',
+      description: `TCP-connect sweep (${TCP_SWEEP_CONCURRENCY} concurrent sockets, ${TCP_SWEEP_TIMEOUT_MS}ms timeout) on ports ${TCP_SWEEP_PORTS.map((t) => t.port).join(', ')} — finds Windows PCs (SMB 445 / RDP 3389 / WSD 5357), iPhones (62078), AirPlay (7000), Chromecast (8008/8009), Roku (8060) that drop ICMP`,
+    },
+    {
       name: 'mDNS',
       status: 'available',
       description: `DNS-SD multicast on ${MDNS_ADDR}:${MDNS_PORT} (${MDNS_SERVICE_TYPES.length} service types incl. phones, TVs, printers)`,
@@ -3146,12 +3443,13 @@ function getProtocolAvailability() {
 
 // ─── CommonJS exports ───────────────────────────────────────────────────────
 // Mirrors every runtime export of apps/api/src/lib/discovery/scanner.ts
-// (27 values) plus `sourcePriority` (module-private in the TS source but
+// plus `sourcePriority` (module-private in the TS source but
 // required as a public export by the desktop local-api contract).
 
 module.exports = {
   // Constants
   SCAN_PORTS,
+  TCP_SWEEP_PORTS,
   // Network helpers
   getLocalSubnets,
   getNetworkInterfacesDetailed,
@@ -3161,8 +3459,11 @@ module.exports = {
   isPrinterMacVendor,
   // Probes
   readArpTable,
+  parseArpOutput,
   pingSweep,
   pingHost,
+  tcpProbePort,
+  tcpSweep,
   mdnsQuery,
   ssdpDiscover,
   reverseDnsLookup,

@@ -69,8 +69,14 @@ import { findWilayaByCode, findWilayaCentroid } from '@/lib/algeria-locations';
 // r21-5 — map-follows-inputs: the wilaya→centroid jump is debounced.
 import { useDebounce } from '@/hooks/use-debounce';
 // Task 51-b — agency location map (provider abstraction, spec §31/§35).
-import { MapLocationPicker } from '@/components/shared/map/map-location-picker';
+import { MapLocationPicker, type GeocodeComponents } from '@/components/shared/map/map-location-picker';
 import { AgencyLocationMap } from '@/components/shared/map/agency-location-map';
+// r26 — explicit GPS auto-fill for the profile address (user request).
+import { GpsAddressButton, type GpsFillOutcome } from '@/components/shared/map/gps-address-button';
+import {
+  findWilayaCodeByGeocodeName,
+  matchCommuneInWilaya,
+} from '@/lib/map/gps-field-matching';
 
 // ─── Task 2-c — tolerant wilaya helpers (client-side copies, same logic as
 // create-agency-form.tsx; server code is NOT imported on purpose) ──────────
@@ -548,6 +554,55 @@ export function AgencyProfile() {
 
   const handleLocationSource = (source: 'GOOGLE' | 'OPENFREEMAP' | 'DEVICE_GPS') => {
     setLocationSourceOverride(source);
+  };
+
+  // r26 — GPS auto-fill for the profile address fields (user request): the
+  // picker previously had no addressFields plumbing here, so neither its
+  // "use my location" button nor the new explicit GPS button could fill
+  // the address. An explicit fill overwrites the matched fields and stamps
+  // DEVICE_GPS (→ VERIFIED on save, same rule as the create wizard);
+  // COARSE fixes only move the pin (r21-5 honest-GPS policy).
+  const applyGpsComponents = (c: {
+    formatted: string | null;
+    street: string | null;
+    wilaya: string | null;
+    city: string | null;
+    postalCode: string | null;
+  }) => {
+    setProfile((prev) => {
+      if (!prev) return prev;
+      const next = { ...prev };
+      const text = c.formatted || c.street;
+      if (text) next.address = text;
+      const code = findWilayaCodeByGeocodeName(c.wilaya);
+      if (code && code !== prev.wilaya) {
+        next.wilaya = code;
+        next.city = ''; // dependent list — reset the commune
+      } else if (code) {
+        next.wilaya = code;
+      }
+      const commune = matchCommuneInWilaya(next.wilaya || '', c.city);
+      if (commune) next.city = commune;
+      if (c.postalCode) next.postalCode = c.postalCode;
+      return next;
+    });
+  };
+
+  const handleGpsDetectedAddress = (components: GeocodeComponents) => {
+    if (components.coarse) return; // passive path — never fill from a coarse fix
+    applyGpsComponents(components);
+  };
+
+  const handleProfileGpsOutcome = (outcome: GpsFillOutcome) => {
+    if (!editMode) return;
+    if (outcome.kind === 'OK') {
+      applyGpsComponents(outcome.components);
+      handleLocationChange(outcome.coords.lat, outcome.coords.lng);
+      handleLocationSource('DEVICE_GPS');
+    } else if (outcome.kind === 'COARSE') {
+      handleLocationChange(outcome.coords.lat, outcome.coords.lng);
+      handleLocationSource('DEVICE_GPS');
+    }
   };
 
   // Task 5 — effective commune selection: the stored city only counts as
@@ -1073,6 +1128,11 @@ export function AgencyProfile() {
                       onChange={(e) => updateField('address', e.target.value)}
                       className="h-11 rounded-xl border-gray-200 dark:border-gray-700 focus:border-emerald-400 focus:ring-2 focus:ring-emerald-500/20"
                     />
+                    {/* r26 — explicit GPS auto-fill (user request): fills
+                        address/wilaya/commune/zip + pins the location card. */}
+                    <div className="flex justify-end">
+                      <GpsAddressButton onFilled={handleProfileGpsOutcome} />
+                    </div>
                   </div>
                   <div className="space-y-2">
                     <Label>{t('agencyPhone')}</Label>
@@ -1226,7 +1286,8 @@ export function AgencyProfile() {
                 value={{ latitude: profile?.latitude ?? null, longitude: profile?.longitude ?? null }}
                 onChange={handleLocationChange}
                 onLocationSource={handleLocationSource}
-                height={240}
+                addressFields={{ onDetected: handleGpsDetectedAddress }}
+                height={340}
               />
             ) : (
               <AgencyLocationMap

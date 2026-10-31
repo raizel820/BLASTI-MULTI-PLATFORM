@@ -314,6 +314,7 @@ model Agency {
   subscriptionPlan      SubscriptionPlan? @relation(fields: [subscriptionPlanId], references: [id])
   devices               AgencyDevice[]
   savedTvs              SavedTv[]
+  lanNodes              LanNode[]
   defaultPrinter        DefaultPrinter?
   hardwareOrders        HardwareOrder[]
   enterpriseRequests    EnterpriseContractRequest[]
@@ -1048,6 +1049,7 @@ model Branch {
   staff     AgencyStaff[]
   devices   AgencyDevice[]
   reviews   Review[]
+  lanNodes  LanNode[]
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1055,6 +1057,52 @@ model Branch {
   // branch listing filter (isActive) / sort (isMain DESC, createdAt ASC).
   @@index([agencyId])
   @@index([isActive, isMain, createdAt])
+}
+
+// ─── r21-9 — Branch LAN topology (Owner Device Manager → Master PC) ────────────
+
+/// One row per BLASTI DESKTOP PC reporting its offline LAN-authority state to
+/// the cloud. The desktop local-api posts a status snapshot every 30s
+/// (lib/lan-authority.js): identity, election role/term, spec score, uptime
+/// and — while it is the elected MASTER — its joined-device registry. The
+/// Owner Device Manager renders this as the "Branch LAN & Master PC" section:
+/// every connected device, the active one, the CURRENT MASTER PC, and the
+/// owner's MANUAL master pin (isPreferredMaster) that desktops fetch and
+/// enforce in their election.
+model LanNode {
+  id                String   @id @default(cuid())
+  agencyId          String
+  agency            Agency   @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  /// Branch of the reporting node's workspace (null = agency-wide/owner machine)
+  branchId          String?
+  branch            Branch?  @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  /// Durable per-installation desktop id (lan-authority instanceId)
+  instanceId        String
+  /// Human label: identity name of the machine (hostname fallback)
+  name              String
+  hostname          String?
+  /// LAN IP + local API port the node serves on (:3080)
+  ipAddress         String?
+  lanPort           Int      @default(3080)
+  /// CANDIDATE | FOLLOWER | MASTER (as reported by the node itself)
+  role              String   @default("CANDIDATE")
+  /// Election term (higher wins after failover) + master-worthiness score
+  term              Int      @default(0)
+  specScore         Float    @default(0)
+  /// Process uptime as reported (drives the "online for …" label)
+  uptimeSec         Int      @default(0)
+  /// MASTER-only: joined-device registry snapshot (JSON array — phones,
+  /// tablets, kiosks and other desktops that joined the offline master)
+  devicesJson       String?
+  /// The owner's MANUAL master pin — desktops enforce it over auto-election
+  isPreferredMaster Boolean  @default(false)
+  lastReportAt      DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([agencyId, instanceId])
+  @@index([agencyId, lastReportAt])
+  @@index([role])
 }
 
 model Counter {
@@ -1406,6 +1454,36 @@ model AppVersion {
   fileHash        String?
   /// Minimum app version required to update from (for delta updates)
   minAppVersion   String?
+  // ── Delta Updates (0.6.30) — release reference artifacts ─────────────────
+  // The cloud diffs the PREVIOUS release against this one to build a small
+  // patch (app.asar binary-delta + out/** tree patch for desktop, APK
+  // binary-delta for Android). These columns hold THIS version's reference
+  // artifacts so the NEXT release can diff against it. Users never download
+  // them directly — only the generated patches.
+  /// Desktop: the packaged app.asar (from win-unpacked/resources)
+  asarStorageKey  String?
+  asarSha256      String?
+  asarSize        Int?
+  /// Desktop: archive of the app.asar.unpacked tree (out/**, per-file hashes
+  /// in its header) — the tree-diff base for the next release
+  outrefStorageKey String?
+  outrefSha256    String?
+  outrefSize      Int?
+  /// Desktop runtime guard: "electron-<version>-<arch>" — a delta is only
+  /// served when the client's runtimeKey matches (native bits unchanged)
+  runtimeKey      String?
+  /// Desktop guard: sha256 over every packaged file OUTSIDE app.asar and
+  /// app.asar.unpacked/out/** (electron dlls, node_modules, prisma engine,
+  /// data) — any change ⇒ full installer only
+  nativeFingerprint String?
+  // ── API Compatibility Map (0.6.31) ────────────────────────────────────────
+  /// API protocol level this build was compiled against (null = unknown —
+  /// compat then falls back to feature gates only). The /compat endpoint
+  /// compares it against the server's CURRENT_SERVER_API_LEVEL.
+  apiLevel        Int?
+  /// True when the release ONLY changes the server — installed desktop/mobile
+  /// apps keep running their current version with zero action required.
+  serverOnly      Boolean @default(false)
   /// When this version was published (made available to users)
   publishedAt     DateTime?
   /// Number of times this version has been downloaded
@@ -1414,10 +1492,73 @@ model AppVersion {
   updatedAt       DateTime  @updatedAt
 
   pushes          UpdatePush[]
+  deltas          AppVersionDelta[]
 
   @@unique([platform, version])
   @@index([platform])
   @@index([isPublished])
+}
+
+/// API COMPATIBILITY MAP (0.6.31) — the server-authoritative matrix that
+/// answers, for ANY running app version:
+///   • can this app run against the CURRENT server API at all?
+///   • WHICH functions are unavailable until the app updates (soft gates)?
+///   • is an update ABSOLUTELY REQUIRED (critical gates / api-level floor)?
+///   • or is the newest release SERVER-ONLY (apps keep running, no update)?
+/// One row per feature; seeded from the release history, managed by admins
+/// (Public Apps Settings → Compatibility).
+model ApiFeatureGate {
+  id            String   @id @default(cuid())
+  /// Stable feature key, e.g. "delta-updates", "counter-control-live-holder"
+  feature       String   @unique
+  /// Minimum APP version (semver) that supports this feature
+  minAppVersion String
+  /// critical = update ABSOLUTELY required (app blocked against this server)
+  /// soft     = the feature is unavailable until the app updates
+  /// server   = server-side only — no app action needed, informational
+  severity      String   @default("soft")
+  /// API protocol level that introduced the feature (0 = level-less)
+  apiLevel      Int      @default(0)
+  description   String   @default("")
+  descriptionAr String?
+  descriptionFr String?
+  enabled       Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+/// One differential-update hop: a patch that upgrades a device from
+/// `fromVersion` to `toVersion` WITHOUT downloading the full installer/APK.
+/// Desktop patches are "release-patch" containers (asar delta + out tree
+/// patch); Android patches are raw binary-delta (delta-1) files.
+model AppVersionDelta {
+  id             String     @id @default(cuid())
+  /// The TARGET version row (the version a device ends up on)
+  appVersionId   String
+  appVersion     AppVersion @relation(fields: [appVersionId], references: [id], onDelete: Cascade)
+  platform       String
+  fromVersion    String
+  toVersion      String
+  fileName       String
+  fileSize       Int
+  /// sha256 of the patch file itself (verified after download)
+  fileHash       String
+  fileStorageKey String
+  /// sha256 of the OLD artifact the patch applies to (asar / apk) — the
+  /// client checks its local artifact BEFORE applying
+  fromArtifactHash String
+  /// sha256 of the artifact the patch PRODUCES
+  toArtifactHash   String
+  /// asar (desktop single asar diff) | tree (desktop out tree) | apk (android)
+  /// | release-patch (desktop combined container)
+  kind           String     @default("release-patch")
+  /// Runtime guards copied from the target version at generation time
+  runtimeKey        String  @default("")
+  nativeFingerprint String  @default("")
+  createdAt      DateTime   @default(now())
+
+  @@unique([platform, fromVersion, toVersion])
+  @@index([platform, fromVersion])
 }
 
 // ─── Device Install Tracking (Public App Settings rebuild) ────────────────────

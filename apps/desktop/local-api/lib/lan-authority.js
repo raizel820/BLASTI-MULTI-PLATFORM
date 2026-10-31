@@ -74,6 +74,10 @@ const state = {
   broadcast: null,           // (event, payload) => void — local realtime
   secret: null,              // HMAC secret for device tokens (persisted)
   devices: [],               // joined-device registry (persisted)
+  // r21-9 — the OWNER's manual master pick (instanceId). Cloud-pinned via the
+  // lan-status reporter, or set locally through POST /api/lan/preferred-master.
+  // Persisted in _sync_meta so it survives restarts AND offline periods.
+  preferredMasterInstanceId: null,
 }
 
 let listenSocket = null
@@ -173,6 +177,44 @@ function activeMasterPeer() {
   return null
 }
 
+// ─── r21-9 — Manual master selection (owner's pin) ──────────────────────────
+
+/** The live peer record of the owner-pinned master, or null when absent/dead. */
+function preferredPeerAlive() {
+  if (!state.preferredMasterInstanceId) return null
+  for (const peer of state.peers.values()) {
+    if (peer.instanceId === state.preferredMasterInstanceId && peerAlive(peer)) return peer
+  }
+  return null
+}
+
+/** TRUE when the given instanceId is the owner's pinned master. */
+function isPreferredMaster(instanceId) {
+  return !!state.preferredMasterInstanceId && !!instanceId && state.preferredMasterInstanceId === instanceId
+}
+
+/**
+ * Apply the owner's manual master pick. `instanceId` = the pinned desktop's
+ * durable id, or null to return to automatic election. Called by the local
+ * POST /api/lan/preferred-master route and by the cloud reporter when the
+ * owner pins from the web Device Manager. Persists + re-evaluates at once.
+ */
+async function setPreferredMaster(instanceId) {
+  const next = typeof instanceId === 'string' && instanceId.trim() ? instanceId.trim().slice(0, 80) : null
+  const prev = state.preferredMasterInstanceId
+  if (prev === next) return state.preferredMasterInstanceId
+  state.preferredMasterInstanceId = next
+  await persistElection().catch(() => {})
+  log(`PREFERRED MASTER ${prev ? prev.slice(0, 12) + '…' : '∅'} → ${next ? next.slice(0, 12) + '…' : '∅ (automatic)'} — re-evaluating role now`)
+  // Re-run the election immediately so the pin takes effect within one tick.
+  evaluateRole().catch(() => {})
+  return state.preferredMasterInstanceId
+}
+
+function getPreferredMasterInstanceId() {
+  return state.preferredMasterInstanceId
+}
+
 // ─── Persistence (meta adapters) ─────────────────────────────────────────────
 
 async function persistElection() {
@@ -180,6 +222,7 @@ async function persistElection() {
     if (state.metaSet) {
       await state.metaSet('lan_authority_term', String(state.term))
       await state.metaSet('lan_authority_role', state.role)
+      await state.metaSet('lan_authority_preferred_master', state.preferredMasterInstanceId || '')
     }
   } catch { /* non-fatal */ }
 }
@@ -538,10 +581,34 @@ async function evaluateRole() {
   electionBusy = true
   try {
     const prevRole = state.role
+
+    // 0) r21-9 — the OWNER'S PIN outranks every automatic rule: when THIS
+    //    machine is the pinned master it claims (or keeps) mastership at once;
+    //    every other path below defers to a live pinned peer.
+    if (isPreferredMaster(state.instanceId) && state.role !== 'MASTER') {
+      let maxTerm = state.term
+      for (const peer of state.peers.values()) if (peerAlive(peer)) maxTerm = Math.max(maxTerm, peer.term || 0)
+      state.term = maxTerm + 1
+      state.role = 'MASTER'
+      state.claimedAt = nowIso()
+      state.master = null
+      await persistElection()
+      log(`CLAIMED MASTER by OWNER PIN term=${state.term} (this machine is the manual master pick)`)
+      notifyRole(prevRole)
+      return
+    }
+
     const masterPeer = activeMasterPeer()
 
     // 1) FOLLOWER upkeep: follow a live master; otherwise start claiming.
     if (state.role === 'FOLLOWER') {
+      // The owner pinned a DIFFERENT live machine → switch to it at once.
+      const pinned = preferredPeerAlive()
+      if (pinned && pinned.instanceId !== state.master?.instanceId) {
+        log(`owner pin — follower switches to preferred master ${pinned.name || pinned.instanceId} @${pinned.ip}:${pinned.port}`)
+        state.master = { instanceId: pinned.instanceId, name: pinned.name, ip: pinned.ip, port: pinned.port, term: pinned.term, specScore: pinned.specScore, lastSeenAt: pinned.lastSeenAt }
+        return
+      }
       if (masterPeer && state.master && masterPeer.instanceId === state.master.instanceId) {
         state.master.lastSeenAt = masterPeer.lastSeenAt
         state.master.term = masterPeer.term
@@ -569,12 +636,16 @@ async function evaluateRole() {
 
     // 2) MASTER upkeep: a strictly better live master ⇒ step down (answer 5:
     //    better specs AND modern OS win via specScore; term outranks both).
+    //    r21-9: the owner's pin outranks EVERYTHING — a live pinned peer takes
+    //    over regardless of term/spec, while the pinned machine never yields.
     if (state.role === 'MASTER') {
       if (masterPeer && masterPeer.instanceId !== state.instanceId) {
-        const peerWins = masterPeer.term > state.term ||
+        if (isPreferredMaster(state.instanceId)) return // owner pinned ME — keep mastership
+        const peerWins = isPreferredMaster(masterPeer.instanceId) ||
+          masterPeer.term > state.term ||
           (masterPeer.term === state.term && betterThan(masterPeer, { instanceId: state.instanceId, specScore: computeSpecScore(), uptime: Math.floor(process.uptime()) }))
         if (peerWins) {
-          log(`STEPPING DOWN — better master ${masterPeer.name || masterPeer.instanceId} (term ${masterPeer.term} ≥ ${state.term}, spec ${masterPeer.specScore})`)
+          log(`STEPPING DOWN — ${isPreferredMaster(masterPeer.instanceId) ? 'OWNER-PINNED' : 'better'} master ${masterPeer.name || masterPeer.instanceId} (term ${masterPeer.term} ≥ ${state.term}, spec ${masterPeer.specScore})`)
           state.role = 'FOLLOWER'
           state.master = { instanceId: masterPeer.instanceId, name: masterPeer.name, ip: masterPeer.ip, port: masterPeer.port, term: masterPeer.term, specScore: masterPeer.specScore, lastSeenAt: masterPeer.lastSeenAt }
           await persistElection()
@@ -587,7 +658,17 @@ async function evaluateRole() {
     // 3) CANDIDATE: adopt a live same-scope master whose term outranks ours
     //    (split-brain prevention — the E2E drill caught both nodes claiming
     //    when term equality made neither "strictly better"), otherwise claim
-    //    after CLAIM_WINDOWS quiet windows.
+    //    after CLAIM_WINDOWS quiet windows. r21-9: a live pinned peer is
+    //    adopted unconditionally (owner's will) and blocks claiming.
+    const pinned = preferredPeerAlive()
+    if (pinned) {
+      log(`candidate adopts OWNER-PINNED master ${pinned.name || pinned.instanceId} @${pinned.ip}:${pinned.port}`)
+      state.role = 'FOLLOWER'
+      state.master = { instanceId: pinned.instanceId, name: pinned.name, ip: pinned.ip, port: pinned.port, term: pinned.term, specScore: pinned.specScore, lastSeenAt: pinned.lastSeenAt }
+      await persistElection()
+      notifyRole(prevRole)
+      return
+    }
     if (masterPeer && masterPeer.term > state.term) {
       log(`candidate adopts live master ${masterPeer.name || masterPeer.instanceId} (term ${masterPeer.term} > ${state.term})`)
       state.role = 'FOLLOWER'
@@ -685,7 +766,7 @@ function followerWriteGate(method, pathname) {
   }
 }
 
-/** LAN status for /api/lan/status (public subset + authed detail flag). */
+/** LAN status for /api/lan/status + the cloud reporter (r21-9). */
 function statusSnapshot() {
   return {
     role: state.role,
@@ -697,6 +778,23 @@ function statusSnapshot() {
     master: masterHint(),
     startedAt: state.claimedAt,
     deviceCount: state.role === 'MASTER' ? state.devices.length : undefined,
+    // r21-9 — identity + manual-master fields for the topology report/panel
+    name: state.identity.name || state.identity.hostname || os.hostname(),
+    hostname: state.identity.hostname || os.hostname(),
+    lanIp: state.identity.lanIp || null,
+    lanPort: state.identity.httpPort || 3080,
+    uptimeSec: Math.floor(process.uptime()),
+    preferredMasterInstanceId: state.preferredMasterInstanceId,
+    // The joined-device registry — MASTER only (followers keep no registry).
+    devices: state.role === 'MASTER'
+      ? state.devices.slice(-MAX_DEVICES).map((d) => ({
+          deviceId: d.deviceId,
+          name: d.name,
+          platform: d.platform,
+          username: d.username,
+          lastSeenAt: d.lastSeenAt,
+        }))
+      : [],
   }
 }
 
@@ -731,6 +829,9 @@ async function initAuthority(opts) {
       }
       const sec = await state.metaGet('lan_authority_secret')
       if (sec) state.secret = sec
+      // r21-9 — resume the owner's manual master pick across restarts.
+      const pref = await state.metaGet('lan_authority_preferred_master')
+      if (pref) state.preferredMasterInstanceId = pref
     }
   } catch { /* defaults hold */ }
   if (!state.secret) {
@@ -779,4 +880,8 @@ module.exports = {
   joinHandler,
   verifyDeviceToken,
   computeSpecScore,
+  // r21-9 — manual master selection
+  setPreferredMaster,
+  getPreferredMasterInstanceId,
+  isPreferredMaster,
 }

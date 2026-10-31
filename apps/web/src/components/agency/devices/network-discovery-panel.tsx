@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -27,16 +27,23 @@ import {
   Signal,
   Send,
   Usb,
-  Router as RouterIcon,
-  Cpu,
   Tv,
-  Tablet,
+  Monitor,
+  Copy,
+  Check,
+  ScanSearch,
+  Cloud,
+  MonitorSmartphone,
 } from 'lucide-react';
 import { useLanguage } from '@/hooks/use-language';
+import type { TranslationKeys } from '@/i18n';
+import { getApiBaseUrl, isElectronRuntime } from '@/lib/api-client';
+import { getLanAuthorityOverride } from '@/lib/lan-authority-client';
 import {
   type RealDiscoveredDevice,
   type ScanState,
   type DiscoveredDeviceCategory,
+  type DiscoverySource,
   type ProtocolStatus,
   type ScanPhase,
   DEVICE_TYPE_CONFIG,
@@ -84,70 +91,169 @@ function RadarAnimation({ active }: { active: boolean }) {
   );
 }
 
-// ── Phase Indicator ─────────────────────────────────────────────────
+// ── Scan-Host Honesty (BUG 2) ────────────────────────────────────────
+// A scan executed through the cloud API scans the SERVER's LAN, not the
+// user's. Resolve who actually performs the scan: when the shared client
+// targets a local/LAN desktop base (Electron embedded API or an active
+// LAN-authority override), the scan really runs on this machine.
 
-// Phase order must match the backend runDiscoveryScan() sequence in
-// apps/api/src/lib/discovery/scanner.ts:
-//   ARP → Ping → mDNS → SSDP → rDNS/NBNS → USB/CUPS → HTTP (last) → Fingerprinting → Complete
-// HTTP runs LAST so that mDNS/SSDP/rDNS device names are not overwritten by
-// misleading HTTP <title> values (e.g. "Adobe PDF" from a CUPS web admin).
-const SCAN_PHASES: ScanPhase[] = ['arp', 'ping', 'mdns', 'ssdp', 'names', 'local', 'http', 'fingerprinting', 'complete'];
+function resolveScanHost(): 'local' | 'cloud' {
+  if (typeof window === 'undefined') return 'cloud';
+  if (isElectronRuntime()) return 'local';
+  if (getLanAuthorityOverride()) return 'local';
+  const base = getApiBaseUrl();
+  if (base.includes('127.0.0.1:3080') || base.includes('localhost:3080')) return 'local';
+  return 'cloud';
+}
 
-function PhaseIndicator({ phase }: { phase: ScanPhase }) {
+function ScanHostBadge() {
   const { t } = useLanguage();
-  const phaseLabels: Record<ScanPhase, string> = {
-    idle: t('dmScanPhase'),
-    arp: t('dmScanPhaseArp'),
-    ping: t('dmScanPhasePing'),
-    udp: t('dmScanPhaseUdp'),
-    ssdp: t('dmScanPhaseSsdp'),
-    mdns: t('dmScanPhaseMdns'),
-    names: 'rDNS/NBNS',
-    http: t('dmScanPhaseHttp'),
-    https: t('dmScanPhaseHttps'),
-    local: 'USB/CUPS',
-    fingerprinting: t('dmScanPhaseFingerprinting'),
-    complete: t('dmScanPhaseComplete'),
-    error: t('dmScanPhaseError'),
-  };
-  const activeIndex = SCAN_PHASES.indexOf(phase);
-  const isErrored = phase === 'error';
+  const host = useMemo(() => resolveScanHost(), []);
+  const isLocal = host === 'local';
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <span
+        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium ${
+          isLocal
+            ? 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/40 dark:text-emerald-400'
+            : 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-400'
+        }`}
+      >
+        {isLocal ? (
+          <MonitorSmartphone className="h-3.5 w-3.5" />
+        ) : (
+          <Cloud className="h-3.5 w-3.5" />
+        )}
+        {isLocal ? t('deviceDiscovery.scanByLocal') : t('deviceDiscovery.scanByCloud')}
+      </span>
+      {!isLocal && (
+        <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+          <WifiOff className="h-3 w-3 shrink-0" />
+          {t('deviceDiscovery.scanByCloudHint')}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// ── Phase Stepper ────────────────────────────────────────────────────
+// Backend pipeline (task 5-a): UDP beacons → ARP → Ping → TCP sweep (runs
+// concurrently with mDNS/SSDP) → mDNS+SSDP → enrichment (rDNS/NBNS, USB/CUPS,
+// fingerprinting) → HTTP probe. Legacy and UNKNOWN phase keys from the scan
+// status endpoint are tolerated: mapped onto the closest step or rendered as
+// a raw-key chip instead of breaking the stepper.
+
+type DiscoveryStep = 'beacons' | 'arp' | 'ping' | 'tcp-sweep' | 'mdns+ssdp' | 'enrichment' | 'http-probe';
+
+const DISCOVERY_STEPS: DiscoveryStep[] = ['beacons', 'arp', 'ping', 'tcp-sweep', 'mdns+ssdp', 'enrichment', 'http-probe'];
+
+function stepIndexForPhase(phase: string): number {
+  switch (phase) {
+    case 'beacons':
+    case 'udp':
+      return 0;
+    case 'arp':
+      return 1;
+    case 'ping':
+      return 2;
+    case 'tcp-sweep':
+    case 'tcp_sweep':
+    case 'tcpSweep':
+    case 'tcp':
+      return 3;
+    case 'mdns':
+    case 'ssdp':
+    case 'mdns+ssdp':
+      return 4;
+    case 'names':
+    case 'enrichment':
+    case 'local':
+    case 'usb':
+    case 'fingerprinting':
+      return 5;
+    case 'http':
+    case 'https':
+    case 'http-probe':
+      return 6;
+    default:
+      return -1;
+  }
+}
+
+/** Localized phase label — tolerant: unknown keys render as-is. */
+function localizedPhaseLabel(phase: string, t: (key: TranslationKeys, params?: Record<string, string>) => string): string {
+  switch (phase) {
+    case 'beacons': return t('deviceDiscovery.phaseBeacons');
+    case 'udp': return t('dmScanPhaseUdp');
+    case 'arp': return t('dmScanPhaseArp');
+    case 'ping': return t('dmScanPhasePing');
+    case 'tcp-sweep':
+    case 'tcp_sweep':
+    case 'tcpSweep':
+    case 'tcp': return t('deviceDiscovery.phaseTcpSweep');
+    case 'mdns+ssdp': return t('deviceDiscovery.phaseMdnsSsdp');
+    case 'mdns': return t('dmScanPhaseMdns');
+    case 'ssdp': return t('dmScanPhaseSsdp');
+    case 'enrichment': return t('deviceDiscovery.phaseEnrichment');
+    case 'names': return 'rDNS/NBNS';
+    case 'fingerprinting': return t('dmScanPhaseFingerprinting');
+    case 'local':
+    case 'usb': return 'USB/CUPS';
+    case 'http-probe': return t('deviceDiscovery.phaseHttpProbe');
+    case 'http': return t('dmScanPhaseHttp');
+    case 'https': return t('dmScanPhaseHttps');
+    case 'complete': return t('dmScanPhaseComplete');
+    case 'error': return t('dmScanPhaseError');
+    default: return phase; // tolerant fallback — raw key for unknown phases
+  }
+}
+
+function PhaseStepper({ phase }: { phase: ScanPhase | string }) {
+  const { t } = useLanguage();
+  const phaseStr = String(phase ?? 'idle');
+  const isIdle = phaseStr === 'idle';
+  const isComplete = phaseStr === 'complete';
+  const isErrored = phaseStr === 'error';
+  const currentIndex = stepIndexForPhase(phaseStr);
+  const knownCurrent = currentIndex >= 0;
+  // Backend phase the stepper doesn't know yet — surface it honestly.
+  const unknownPhase = !isIdle && !isComplete && !isErrored && !knownCurrent;
 
   return (
-    <div className="flex items-center gap-1.5 overflow-x-auto">
-      {SCAN_PHASES.map((p, i) => {
-        const isActive = i <= activeIndex && phase !== 'idle' && !isErrored;
-        const isCurrent = p === phase;
+    <div className="flex items-center gap-1.5 overflow-x-auto pb-0.5">
+      {DISCOVERY_STEPS.map((step, i) => {
+        const isCurrent = knownCurrent && i === currentIndex;
+        const isDone = isComplete || (knownCurrent && i < currentIndex);
         return (
-          <div key={p} className="flex items-center gap-1.5">
+          <div key={step} className="flex items-center gap-1.5">
             {i > 0 && (
-              <div className={`h-px w-4 transition-colors ${isActive ? 'bg-emerald-500' : 'bg-muted'}`} />
+              <div className={`h-px w-4 transition-colors ${isDone ? 'bg-emerald-500' : 'bg-muted'}`} />
             )}
             <div
-              className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition-all ${
-                isErrored && p === phase
-                  ? 'bg-red-500 text-white shadow-sm'
-                  : isCurrent
-                    ? 'bg-emerald-500 text-white shadow-sm'
-                    : isActive
-                      ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
-                      : 'bg-muted text-muted-foreground'
+              className={`flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-medium transition-all ${
+                isCurrent
+                  ? 'bg-emerald-500 text-white shadow-sm'
+                  : isDone
+                    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
+                    : 'bg-muted text-muted-foreground'
               }`}
             >
-              {isCurrent && p !== 'complete' && p !== 'error' && (
-                <Loader2 className="h-3 w-3 animate-spin" />
-              )}
-              {isActive && !isCurrent && p !== 'error' && (
-                <CheckCircle2 className="h-3 w-3" />
-              )}
-              {isErrored && p === phase && (
-                <XCircle className="h-3 w-3" />
-              )}
-              {phaseLabels[p]}
+              {isCurrent && <Loader2 className="h-3 w-3 animate-spin" />}
+              {isDone && !isCurrent && <CheckCircle2 className="h-3 w-3" />}
+              {localizedPhaseLabel(step, t)}
             </div>
           </div>
         );
       })}
+      {unknownPhase && (
+        <div className="flex items-center gap-1.5">
+          <div className="h-px w-4 bg-muted" />
+          <div className="flex items-center gap-1.5 whitespace-nowrap rounded-full bg-emerald-500 px-2.5 py-1 text-[11px] font-medium text-white shadow-sm">
+            <Loader2 className="h-3 w-3 animate-spin" />
+            {phaseStr}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -173,6 +279,23 @@ function formatTimeAgo(timestamp: number, lang: string): string {
 }
 
 // ── Discovered Device Card ──────────────────────────────────────────
+
+// Display-source priority: the strongest discovery signal wins when several
+// are available on the same device (ssdp > mdns > tcp > http > ping > arp).
+const SOURCE_PRIORITY: DiscoverySource[] = ['ssdp', 'mdns', 'tcp', 'http_probe', 'ping', 'arp'];
+
+function sourceRank(s: DiscoverySource): number {
+  const i = SOURCE_PRIORITY.indexOf(s);
+  return i === -1 ? 99 : i;
+}
+
+function resolveDisplaySource(device: RealDiscoveredDevice): DiscoverySource {
+  let best = device.source;
+  if (device.ssdpLocation && sourceRank('ssdp') < sourceRank(best)) best = 'ssdp';
+  if (device.mdnsService && sourceRank('mdns') < sourceRank(best)) best = 'mdns';
+  if (device.httpUrl && sourceRank('http_probe') < sourceRank(best)) best = 'http_probe';
+  return best;
+}
 
 function DiscoveredDeviceCard({
   device,
@@ -211,10 +334,28 @@ function DiscoveredDeviceCard({
   // Lookup the device type config; fall back to a per-category default
   const typeConfig = (device.type !== 'UNKNOWN' && DEVICE_TYPE_CONFIG[device.type as keyof typeof DEVICE_TYPE_CONFIG]) || null;
   const TypeIcon = typeConfig?.icon ?? Globe;
-  const sourceConfig = DISCOVERY_SOURCE_CONFIG[device.source];
+  // Strongest available discovery signal (ssdp > mdns > tcp > http > ping > arp)
+  const displaySource = resolveDisplaySource(device);
+  const sourceConfig = DISCOVERY_SOURCE_CONFIG[displaySource] ?? DISCOVERY_SOURCE_CONFIG[device.source];
   const SourceIcon = sourceConfig?.icon ?? Radio;
+  const vendor = device.manufacturer || device.macVendor;
   const signal = getSignalFromLastSeen(device.lastSeen);
   const isOnline = device.status === 'ONLINE';
+  const hasIp = device.connectionType !== 'USB' && !!device.ip;
+
+  // Copy-IP with transient copied feedback
+  const [ipCopied, setIpCopied] = useState(false);
+  const handleCopyIp = (e: ReactMouseEvent) => {
+    e.stopPropagation();
+    if (!hasIp) return;
+    navigator.clipboard
+      .writeText(device.ip)
+      .then(() => {
+        setIpCopied(true);
+        setTimeout(() => setIpCopied(false), 1500);
+      })
+      .catch(() => { /* clipboard unavailable */ });
+  };
 
   return (
     <motion.div
@@ -241,16 +382,16 @@ function DiscoveredDeviceCard({
       }`} />
 
       <div className="p-4 space-y-3">
-        {/* Header row */}
+        {/* Header row — icon + name + vendor prominent */}
         <div className="flex items-start gap-3">
-          <div className={`p-2 rounded-lg shrink-0 ${
+          <div className={`p-2.5 rounded-lg shrink-0 ${
             typeConfig?.color ?? 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-400'
           }`}>
             <TypeIcon className="h-5 w-5" />
           </div>
           <div className="flex-1 min-w-0 space-y-1">
             <div className="flex items-center gap-2">
-              <h4 className="font-semibold text-sm truncate">
+              <h4 className="text-sm font-semibold max-w-full truncate">
                 {getLocalizedName(device, lang)}
               </h4>
               {!isOnline && (
@@ -259,6 +400,9 @@ function DiscoveredDeviceCard({
                 </Badge>
               )}
             </div>
+            {vendor && (
+              <p className="text-xs font-medium text-muted-foreground truncate">{vendor}</p>
+            )}
             <div className="flex items-center gap-1.5 flex-wrap">
               {typeConfig && (
                 <Badge variant="secondary" className={`text-[10px] px-1.5 py-0 ${typeConfig.color}`}>
@@ -273,36 +417,40 @@ function DiscoveredDeviceCard({
               )}
             </div>
           </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={(e) => { e.stopPropagation(); onDismiss(); }}
-            className="h-7 w-7 p-0 text-muted-foreground hover:text-red-500 shrink-0"
-          >
-            <X className="h-3.5 w-3.5" />
-          </Button>
         </div>
 
         {/* Info row */}
         <div className="space-y-2 text-xs text-muted-foreground">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-1.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 min-w-0">
               {device.connectionType === 'WIFI' ? (
-                <Wifi className="h-3 w-3" />
+                <Wifi className="h-3 w-3 shrink-0" />
               ) : device.connectionType === 'LAN' ? (
-                <Signal className="h-3 w-3" />
+                <Signal className="h-3 w-3 shrink-0" />
               ) : device.connectionType === 'USB' ? (
-                <Printer className="h-3 w-3" />
+                <Printer className="h-3 w-3 shrink-0" />
               ) : (
-                <Globe className="h-3 w-3" />
+                <Globe className="h-3 w-3 shrink-0" />
               )}
               {device.connectionType === 'USB' ? (
-                <span className="font-mono">USB{device.usbBusDevice ? ` ${device.usbBusDevice}` : ''}</span>
+                <span className="font-mono" dir="ltr">USB{device.usbBusDevice ? ` ${device.usbBusDevice}` : ''}</span>
               ) : (
-                <span className="font-mono">{device.ip}:{device.port}</span>
+                <span className="font-mono truncate" dir="ltr">{device.ip}:{device.port}</span>
+              )}
+              {hasIp && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={handleCopyIp}
+                  title={ipCopied ? t('deviceDiscovery.copied') : t('deviceDiscovery.copyIp')}
+                  aria-label={ipCopied ? t('deviceDiscovery.copied') : t('deviceDiscovery.copyIp')}
+                  className="h-6 w-6 p-0 shrink-0 text-muted-foreground hover:text-foreground"
+                >
+                  {ipCopied ? <Check className="h-3 w-3 text-emerald-500" /> : <Copy className="h-3 w-3" />}
+                </Button>
               )}
             </div>
-            <div className="flex items-center gap-1">
+            <div className="flex items-center gap-1 shrink-0">
               <Clock className="h-3 w-3" />
               <span>{formatTimeAgo(device.lastSeen, lang)}</span>
             </div>
@@ -403,8 +551,8 @@ function DiscoveredDeviceCard({
           )}
         </div>
 
-        {/* Action buttons — type-specific */}
-        <div className="flex items-center gap-2 pt-1 flex-wrap">
+        {/* Action buttons — ALWAYS visible, sized h-9, wrap on mobile */}
+        <div className="flex items-center gap-2 pt-2 border-t border-border/40 flex-wrap">
           {/* TV: Save TV + Cast buttons */}
           {isTv && (
             <>
@@ -412,7 +560,7 @@ function DiscoveredDeviceCard({
                 size="sm"
                 onClick={(e) => { e.stopPropagation(); onSaveTv(); }}
                 disabled={isSavingTv || isSavedTv}
-                className="flex-1 gap-1.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white text-xs h-8 min-w-[110px]"
+                className="flex-1 gap-1.5 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-600 hover:to-teal-700 text-white text-xs h-9 min-w-[110px]"
               >
                 {isSavingTv ? (
                   <><Loader2 className="h-3.5 w-3.5 animate-spin" />{t('dmSaving')}</>
@@ -427,7 +575,7 @@ function DiscoveredDeviceCard({
                 variant="outline"
                 onClick={(e) => { e.stopPropagation(); onCast(); }}
                 disabled={isCasting}
-                className="gap-1.5 text-xs h-8 border-cyan-300 text-cyan-700 hover:bg-cyan-50 dark:border-cyan-800 dark:text-cyan-400 dark:hover:bg-cyan-950/30"
+                className="gap-1.5 text-xs h-9 border-cyan-300 text-cyan-700 hover:bg-cyan-50 dark:border-cyan-800 dark:text-cyan-400 dark:hover:bg-cyan-950/30"
               >
                 {isCasting ? (
                   <><Loader2 className="h-3.5 w-3.5 animate-spin" />{t('dmCasting')}</>
@@ -445,7 +593,7 @@ function DiscoveredDeviceCard({
                 size="sm"
                 onClick={(e) => { e.stopPropagation(); onSavePrinter(); }}
                 disabled={isSavingPrinter || isDefaultPrinter}
-                className="flex-1 gap-1.5 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white text-xs h-8 min-w-[110px]"
+                className="flex-1 gap-1.5 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white text-xs h-9 min-w-[110px]"
               >
                 {isSavingPrinter ? (
                   <><Loader2 className="h-3.5 w-3.5 animate-spin" />{t('dmSaving')}</>
@@ -460,7 +608,7 @@ function DiscoveredDeviceCard({
                 variant="outline"
                 onClick={(e) => { e.stopPropagation(); onTestPrinter(); }}
                 disabled={isTestingPrinter}
-                className="gap-1.5 text-xs h-8"
+                className="gap-1.5 text-xs h-9"
               >
                 {isTestingPrinter ? (
                   <><Loader2 className="h-3.5 w-3.5 animate-spin" />{t('dmTestingPrinter')}</>
@@ -468,31 +616,44 @@ function DiscoveredDeviceCard({
                   <><Signal className="h-3.5 w-3.5" />{t('dmTestPrinter')}</>
                 )}
               </Button>
-              {printerTestResult && (
-                <Badge
-                  variant="secondary"
-                  className={`text-[10px] px-1.5 py-0 gap-1 ${
-                    printerTestResult === 'online'
-                      ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
-                      : 'bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-400'
-                  }`}
-                >
-                  {printerTestResult === 'online' ? (
-                    <><CheckCircle2 className="h-3 w-3" />{t('dmPrinterOnline')}</>
-                  ) : (
-                    <><XCircle className="h-3 w-3" />{t('dmPrinterOffline')}</>
-                  )}
-                </Badge>
-              )}
             </>
           )}
 
-          {/* Other types: no primary action — just dismiss */}
+          {/* Other types: no primary action — just the hint */}
           {!isTv && !isPrinter && (
-            <div className="text-[11px] text-muted-foreground italic flex-1">
+            <div className="text-[11px] text-muted-foreground italic flex-1 min-w-[8rem]">
               {t('dmNoActionHint')}
             </div>
           )}
+
+          {/* Printer test result badge */}
+          {isPrinter && printerTestResult && (
+            <Badge
+              variant="secondary"
+              className={`text-[10px] px-1.5 py-0 gap-1 ${
+                printerTestResult === 'online'
+                  ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
+                  : 'bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-400'
+              }`}
+            >
+              {printerTestResult === 'online' ? (
+                <><CheckCircle2 className="h-3 w-3" />{t('dmPrinterOnline')}</>
+              ) : (
+                <><XCircle className="h-3 w-3" />{t('dmPrinterOffline')}</>
+              )}
+            </Badge>
+          )}
+
+          {/* Dismiss — always available */}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={(e) => { e.stopPropagation(); onDismiss(); }}
+            className="ms-auto h-9 gap-1.5 px-2.5 text-xs text-muted-foreground hover:text-red-500"
+          >
+            <X className="h-3.5 w-3.5" />
+            {t('dmDismiss')}
+          </Button>
         </div>
       </div>
     </motion.div>
@@ -664,7 +825,7 @@ function CategoryGroup({
           {devices.length}
         </Badge>
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 max-h-96 overflow-y-auto">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 max-h-96 overflow-y-auto custom-scrollbar pe-1">
         <AnimatePresence>
           {devices.map((device) => (
             <DiscoveredDeviceCard
@@ -729,58 +890,74 @@ function ProtocolBadges({ protocols }: { protocols: ProtocolStatus[] }) {
   );
 }
 
-// ── Device type filter for the scanner panel ───────────────────────────
+// ── Results toolbar — grouped count badges (TV/PC/Phone/Printer/Other) ──
+// Badges double as the type filter: click to isolate, click again to clear.
 
-type DiscoveryTypeFilter = 'ALL' | 'TV' | 'PRINTER' | 'KIOSK' | 'PHONE' | 'ROUTER' | 'IOT' | 'APP';
+type ResultsFilter = 'ALL' | 'TV' | 'PC' | 'PHONE' | 'PRINTER' | 'OTHER';
 
-const DISCOVERY_TYPE_FILTERS: { value: DiscoveryTypeFilter; labelAr: string; labelEn: string; labelFr: string; icon: typeof Globe }[] = [
-  { value: 'ALL', labelAr: 'الكل', labelEn: 'All', labelFr: 'Tous', icon: Globe },
-  { value: 'TV', labelAr: 'تلفزيون', labelEn: 'TV', labelFr: 'Télé', icon: Tv },
-  { value: 'PRINTER', labelAr: 'طابعة', labelEn: 'Printer', labelFr: 'Imprimante', icon: Printer },
-  { value: 'KIOSK', labelAr: 'كيوسك', labelEn: 'Kiosk', labelFr: 'Kiosque', icon: Tablet },
-  { value: 'PHONE', labelAr: 'هاتف', labelEn: 'Phone', labelFr: 'Téléphone', icon: Smartphone },
-  { value: 'ROUTER', labelAr: 'راوتر', labelEn: 'Router', labelFr: 'Routeur', icon: RouterIcon },
-  { value: 'IOT', labelAr: 'IoT', labelEn: 'IoT', labelFr: 'IoT', icon: Cpu },
-  { value: 'APP', labelAr: 'تطبيق', labelEn: 'App', labelFr: 'App', icon: Radio },
+const RESULT_GROUPS: {
+  value: ResultsFilter;
+  labelKey: TranslationKeys;
+  icon: typeof Tv;
+  types: string[];
+}[] = [
+  { value: 'TV', labelKey: 'deviceDiscovery.groupTv', icon: Tv, types: ['TV'] },
+  { value: 'PC', labelKey: 'deviceDiscovery.groupPc', icon: Monitor, types: ['KIOSK', 'DISPLAY'] },
+  { value: 'PHONE', labelKey: 'deviceDiscovery.groupPhone', icon: Smartphone, types: ['PHONE', 'APP'] },
+  { value: 'PRINTER', labelKey: 'deviceDiscovery.groupPrinter', icon: Printer, types: ['PRINTER'] },
+  { value: 'OTHER', labelKey: 'deviceDiscovery.groupOther', icon: ScanSearch, types: ['ROUTER', 'IOT', 'UNKNOWN'] },
 ];
 
-function DiscoveryTypeFilterBar({
+function resultGroupFor(filter: ResultsFilter): string[] | null {
+  if (filter === 'ALL') return null;
+  return RESULT_GROUPS.find((g) => g.value === filter)?.types ?? null;
+}
+
+function ResultsToolbar({
   devices,
   value,
   onChange,
-  lang,
 }: {
   devices: RealDiscoveredDevice[];
-  value: DiscoveryTypeFilter;
-  onChange: (f: DiscoveryTypeFilter) => void;
-  lang: string;
+  value: ResultsFilter;
+  onChange: (f: ResultsFilter) => void;
 }) {
+  const { t } = useLanguage();
   const counts = useMemo(() => {
-    const c: Record<string, number> = {};
-    for (const d of devices) c[d.type] = (c[d.type] || 0) + 1;
+    const c: Partial<Record<ResultsFilter, number>> = {};
+    for (const g of RESULT_GROUPS) {
+      c[g.value] = devices.filter((d) => g.types.includes(d.type)).length;
+    }
     return c;
   }, [devices]);
+
   return (
-    <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-      {DISCOVERY_TYPE_FILTERS.map((f) => {
-        const Icon = f.icon;
-        const active = value === f.value;
-        const count = f.value === 'ALL' ? devices.length : (counts[f.value] || 0);
-        if (f.value !== 'ALL' && count === 0) return null;
-        const label = lang === 'ar' ? f.labelAr : lang === 'fr' ? f.labelFr : f.labelEn;
+    <div className="flex items-center gap-2 flex-wrap">
+      <span className="text-xs font-semibold text-foreground">
+        {t('deviceDiscovery.resultsCount', { count: String(devices.length) })}
+      </span>
+      <div className="h-4 w-px bg-border" aria-hidden />
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+        {t('deviceDiscovery.filterType')}
+      </span>
+      {RESULT_GROUPS.map((g) => {
+        const Icon = g.icon;
+        const active = value === g.value;
+        const count = counts[g.value] ?? 0;
         return (
           <button
-            key={f.value}
-            onClick={() => onChange(f.value)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-all ${
+            key={g.value}
+            type="button"
+            onClick={() => onChange(active ? 'ALL' : g.value)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs font-medium whitespace-nowrap transition-all ${
               active
                 ? 'bg-primary text-primary-foreground shadow-sm'
                 : 'bg-muted text-muted-foreground hover:bg-muted/80'
             }`}
           >
             <Icon className="h-3.5 w-3.5" />
-            {label}
-            <span className={`text-[10px] ${active ? 'bg-white/20' : 'bg-muted-foreground/20'} rounded-full px-1.5 py-0.5`}>
+            <span className="hidden sm:inline">{t(g.labelKey)}</span>
+            <span className={`text-[10px] rounded-full px-1.5 py-0.5 ${active ? 'bg-white/20' : 'bg-muted-foreground/20'}`}>
               {count}
             </span>
           </button>
@@ -850,9 +1027,9 @@ export function NetworkDiscoveryPanel({
   onSendPairingRequest,
 }: NetworkDiscoveryPanelProps) {
   const { t, lang } = useLanguage();
-  const [typeFilter, setTypeFilter] = useState<DiscoveryTypeFilter>('ALL');
+  const [typeFilter, setTypeFilter] = useState<ResultsFilter>('ALL');
 
-  // Filter devices by selected type, then group by category
+  // Filter devices by selected type-group, then group by category
   const grouped = useMemo(() => {
     const groups: Record<DiscoveredDeviceCategory, RealDiscoveredDevice[]> = {
       BLASTI: [],
@@ -860,8 +1037,9 @@ export function NetworkDiscoveryPanel({
       UPNP: [],
       LOCAL: [],
     };
+    const allowedTypes = resultGroupFor(typeFilter);
     for (const dev of discoveredDevices) {
-      if (typeFilter !== 'ALL' && dev.type !== typeFilter) continue;
+      if (allowedTypes && !allowedTypes.includes(dev.type)) continue;
       if (groups[dev.category]) {
         groups[dev.category].push(dev);
       }
@@ -891,7 +1069,11 @@ export function NetworkDiscoveryPanel({
           {/* ── Top Bar ── */}
           <div className="flex items-center justify-between gap-4 flex-wrap">
             <div className="flex items-center gap-3">
-              <div className="p-2 rounded-xl bg-emerald-100 dark:bg-emerald-950/50 text-emerald-600 dark:text-emerald-400">
+              <div className={`p-2 rounded-xl text-white shadow-sm ${
+                scanState.scanning
+                  ? 'bg-gradient-to-br from-emerald-500 to-teal-600 animate-pulse'
+                  : 'bg-emerald-100 dark:bg-emerald-950/50 text-emerald-600 dark:text-emerald-400'
+              }`}>
                 <Radar className="h-5 w-5" />
               </div>
               <div>
@@ -903,6 +1085,10 @@ export function NetworkDiscoveryPanel({
                   </span>
                 </div>
                 <p className="text-xs text-muted-foreground">{t('dmDiscoverySubtitle')}</p>
+                {/* Who performs the scan — this machine (desktop) vs cloud server */}
+                <div className="mt-1.5">
+                  <ScanHostBadge />
+                </div>
               </div>
             </div>
             <div className="flex items-center gap-3">
@@ -942,10 +1128,10 @@ export function NetworkDiscoveryPanel({
           </div>
 
           {/* ── Radar + Phase + Progress ── */}
-          <div className="flex items-center gap-6">
+          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 sm:gap-6">
             <RadarAnimation active={scanState.scanning} />
-            <div className="flex-1 space-y-3">
-              <PhaseIndicator phase={scanState.phase} />
+            <div className="flex-1 space-y-3 min-w-0">
+              <PhaseStepper phase={scanState.phase} />
               {(scanState.scanning || scanState.elapsed > 0) && scanState.totalIPs > 0 && (
                 <div className="space-y-1.5">
                   <Progress value={progress} className="h-1.5" />
@@ -1006,13 +1192,12 @@ export function NetworkDiscoveryPanel({
             </div>
           )}
 
-          {/* ── Device type filter ── */}
+          {/* ── Results toolbar: count + grouped type badges ── */}
           {discoveredDevices.length > 0 && (
-            <DiscoveryTypeFilterBar
+            <ResultsToolbar
               devices={discoveredDevices}
               value={typeFilter}
               onChange={setTypeFilter}
-              lang={lang}
             />
           )}
 
@@ -1145,7 +1330,7 @@ export function NetworkDiscoveryPanel({
             </motion.div>
           )}
 
-          {/* ── Empty state ── */}
+          {/* ── Empty state — honest explanation + hint + rescan ── */}
           {!scanState.scanning && discoveredDevices.length === 0 && unpairedDevices.length === 0 && (
             <div className="text-center py-8 space-y-3">
               <div className="mx-auto w-14 h-14 rounded-2xl bg-gray-100 dark:bg-gray-800 flex items-center justify-center">
@@ -1156,6 +1341,21 @@ export function NetworkDiscoveryPanel({
                   ? (lang === 'ar' ? 'خدمة الاكتشاف غير متاحة حالياً. تأكد من تشغيل خادم الاكتشاف.' : lang === 'fr' ? 'Le service de découverte est indisponible. Vérifiez que le serveur de découverte est en cours d\'exécution.' : 'Discovery service is currently unavailable. Make sure the discovery server is running.')
                   : t('dmDiscoveryHint')}
               </p>
+              {/* Honest hint about who runs the scan + what to do about it */}
+              <p className="text-xs text-muted-foreground/80 max-w-md mx-auto">
+                {t('deviceDiscovery.emptyHint')}
+              </p>
+              <div className="flex items-center justify-center pt-1">
+                <Button
+                  variant="outline"
+                  onClick={onStartScan}
+                  disabled={!serviceAvailable}
+                  className="gap-2 h-9 border-emerald-300 text-emerald-700 hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-400 dark:hover:bg-emerald-950/30"
+                >
+                  <Radar className="h-4 w-4" />
+                  {t('dmStartScan')}
+                </Button>
+              </div>
               {/* When service unavailable, show which protocols would be available */}
               {!serviceAvailable && protocols.length > 0 && (
                 <div className="flex items-center justify-center gap-1.5 flex-wrap max-w-md mx-auto">

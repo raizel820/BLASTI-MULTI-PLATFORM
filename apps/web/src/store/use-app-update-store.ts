@@ -27,6 +27,7 @@
 
 import { create } from 'zustand';
 import { buildCloudUrl } from '@/lib/api-client';
+import { APP_API_LEVEL } from '@/lib/api-level';
 import {
   loadAppUpdateSettings,
   loadPostponedVersion,
@@ -56,9 +57,47 @@ export interface AppUpdateInfo {
   releaseNotesAr?: string;
   releaseNotesFr?: string;
   fileSize: number;
+  /** sha256 of the full installer/APK — the main process verifies after download. */
+  fileHash?: string;
   pushMessage?: string;
   pushMessageAr?: string;
   pushMessageFr?: string;
+  /**
+   * DELTA UPDATES (0.6.30) — differential hop chain offered by /check.
+   * Desktop: release patches applied onto app.asar + the out tree. Android:
+   * raw APK binary-deltas applied onto the installed base.apk. Absent/null →
+   * full installer (the always-correct fallback).
+   */
+  delta?: DeltaManifest | null;
+  /**
+   * API COMPATIBILITY MAP (0.6.31) — can this app run against the current
+   * server, which functions need a newer app, and is the newest release
+   * server-only (apps keep running). Absent on older servers.
+   */
+  compat?: CompatEvaluation | null;
+}
+
+export interface DeltaHop {
+  id: string;
+  kind: string;
+  fromVersion: string;
+  toVersion: string;
+  url: string;
+  size: number;
+  sha256: string;
+  fromArtifactHash: string;
+  toArtifactHash: string;
+}
+
+export interface DeltaManifest {
+  supported: boolean;
+  kind: string;
+  runtimeKey: string;
+  nativeFingerprint: string;
+  targetAsarSha256: string;
+  targetApkSha256: string;
+  totalSize: number;
+  hops: DeltaHop[];
 }
 
 export interface AppUpdateProgress {
@@ -72,8 +111,16 @@ type Shell = 'electron' | 'capacitor' | 'web';
 interface ElectronUpdatesAPI {
   getAppVersion?: () => Promise<string>;
   checkForUpdates?: () => Promise<CheckResponse>;
-  downloadUpdate?: (payload: { url: string; version: string }) => Promise<unknown>;
+  downloadUpdate?: (payload: { url: string; version: string; fileHash?: string; fileSize?: number }) => Promise<unknown>;
   installUpdate?: () => Promise<{ ok?: boolean; error?: string }>;
+  /** 0.6.30 — download+apply the delta chain (asar + tree patches). */
+  installDeltaUpdate?: (payload: { hops: DeltaHop[]; target: { version: string; asarSha256: string } }) => Promise<{ ok?: boolean; error?: string; version?: string; pendingBootSwap?: boolean }>;
+  /** 0.6.30 — relaunch after a successful delta apply (new asar loads). */
+  relaunchAfterDelta?: () => Promise<{ ok?: boolean }>;
+  /** 0.6.30 — fired when the NSIS install could not even be started. */
+  onUpdateInstallFailed?: (cb: (payload: { error: string }) => void) => () => void;
+  /** 0.6.30 manual fallback — open the downloaded installer with the OS. */
+  openDownloadedInstaller?: () => Promise<{ ok?: boolean; error?: string }>;
   getNetworkInfo?: () => Promise<{ isWifi?: boolean }>;
   onUpdateProgress?: (cb: (payload: UpdateProgressEvent) => void) => () => void;
   onUpdateAvailable?: (cb: (payload: PushPayload) => void) => void;
@@ -86,6 +133,8 @@ interface UpdateProgressEvent {
   totalBytes?: number;
   error?: string;
   version?: string;
+  /** 0.6.30 — delta pipeline stage (download / apply-asar-n / apply-tree-n / swap-asar). */
+  stage?: string;
 }
 
 interface PushPayload {
@@ -111,6 +160,44 @@ interface CheckResponse {
   releaseNotesAr?: string;
   releaseNotesFr?: string;
   fileSize?: number;
+  fileHash?: string;
+  delta?: DeltaManifest | null;
+  /** 0.6.31 — API compatibility map evaluation (absent on older servers). */
+  compat?: CompatEvaluation | null;
+}
+
+/** Shape of the server's compat block (apps/api/src/lib/api-compat.ts). */
+export interface CompatFeatureGate {
+  feature: string;
+  severity: 'critical' | 'soft' | 'server';
+  minAppVersion: string;
+  apiLevel: number;
+  description: string;
+  descriptionAr?: string | null;
+  descriptionFr?: string | null;
+}
+
+export interface CompatEvaluation {
+  serverVersion: string;
+  serverApiLevel: number;
+  appVersion: string;
+  appApiLevel: number | null;
+  /** The app can run against this server (nothing critical pending). */
+  compatible: boolean;
+  /** Update ABSOLUTELY required — the app is blocked until it updates. */
+  updateRequired: boolean;
+  /** Update available AND app-facing — recommended. */
+  updateRecommended: boolean;
+  /** The newest release only changes the server — apps keep running. */
+  serverOnlyUpdate: boolean;
+  updateAvailable: boolean;
+  latestVersion: string;
+  latestServerOnly: boolean;
+  blockedFeatures: CompatFeatureGate[];
+  serverOnlyChanges: string[];
+  summary: string;
+  summaryAr: string;
+  summaryFr: string;
 }
 
 interface CapacitorGlobal {
@@ -124,6 +211,17 @@ interface CapacitorGlobal {
       status?: string; percent?: number; bytesSoFar?: number; totalBytes?: number; localUri?: string;
     }>;
     installUpdate?: (opts: { downloadId?: number; filePath?: string }) => Promise<{ ok?: boolean; escalated?: boolean }>;
+    /**
+     * DELTA UPDATES (0.6.30) — download every APK hop patch, apply the chain
+     * onto the installed base.apk, verify the final sha256, stage the result
+     * for install. Returns { ok, apkPath? } or { ok:false, error }.
+     */
+    installDeltaUpdate?: (opts: {
+      deltas: Array<{ url: string; sha256: string; fromVersion: string; toVersion: string }>;
+      finalSha256: string;
+      fromVersion: string;
+      toVersion: string;
+    }) => Promise<{ ok?: boolean; apkPath?: string; error?: string }>;
     /** Open the system "Install unknown apps" grant screen (newer builds). */
     openInstallPermissionSettings?: () => Promise<{ ok?: boolean; canInstall?: boolean }>;
     /**
@@ -151,10 +249,19 @@ export interface AppUpdateState {
   lastCheckFailed: boolean;
   /** User opened the optional-update dialog via a manual button (Update now). */
   dialogRequested: boolean;
+  /** 0.6.30 — the applied update was a DELTA chain (install = relaunch, not NSIS). */
+  deltaApplied: boolean;
+  /** 0.6.30 — NSIS/APK install could not even start → UI offers manual open. */
+  manualInstallAvailable: boolean;
 
   check: (trigger: 'startup' | 'sync' | 'manual' | 'resume' | 'push') => Promise<boolean>;
   startDownload: () => Promise<void>;
   install: () => Promise<void>;
+  /**
+   * 0.6.30 — the NSIS launcher failed everywhere; open the downloaded
+   * installer with the OS handler so the user can run it manually.
+   */
+  openInstallerManually: () => Promise<void>;
   /**
    * Android honesty gate: after the package installer closes, compare the
    * native versionName against the one recorded when install() handed the
@@ -237,7 +344,7 @@ const AUTO_CHECK_THROTTLE_MS = 60_000;
 
 async function fetchCheck(platform: string, version: string): Promise<CheckResponse | null> {
   try {
-    const res = await fetch(buildCloudUrl('/api/app-versions/check', { platform, version }), {
+    const res = await fetch(buildCloudUrl('/api/app-versions/check', { platform, version, apiLevel: String(APP_API_LEVEL) }), {
       headers: { accept: 'application/json' },
     });
     if (!res.ok) return null;
@@ -262,6 +369,9 @@ async function fetchCheck(platform: string, version: string): Promise<CheckRespo
  * for process restarts / old callers.)
  */
 let lastAndroidDownloadId: number | null = null;
+
+/** 0.6.30 — local path of the delta-rebuilt APK handed to installUpdate. */
+let lastAndroidDeltaPath: string | null = null;
 
 let androidPollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -344,6 +454,8 @@ function createAppUpdateStore() {
     checking: false,
     lastCheckFailed: false,
     dialogRequested: false,
+    deltaApplied: false,
+    manualInstallAvailable: false,
 
     check: async (trigger) => {
       const shell = currentShell();
@@ -381,7 +493,14 @@ function createAppUpdateStore() {
               releaseNotesAr: res.releaseNotesAr,
               releaseNotesFr: res.releaseNotesFr,
               fileSize: res.fileSize ?? 0,
+              fileHash: res.fileHash,
+              delta: res.delta && res.delta.supported && Array.isArray(res.delta.hops) && res.delta.hops.length > 0 ? res.delta : null,
+              compat: res.compat ?? null,
             };
+            // COMPATIBILITY MAP (0.6.31): a CRITICAL gate (or an API-level
+            // floor breach) means the app CANNOT run against this server —
+            // escalate the update to the mandatory full-screen gate.
+            if (info.compat?.updateRequired) info.isMandatory = true;
           }
         } else {
           // Android: try the release channel first, then the debug channel
@@ -403,7 +522,12 @@ function createAppUpdateStore() {
               releaseNotesAr: res.releaseNotesAr,
               releaseNotesFr: res.releaseNotesFr,
               fileSize: res.fileSize ?? 0,
+              fileHash: res.fileHash,
+              delta: res.delta && res.delta.supported && Array.isArray(res.delta.hops) && res.delta.hops.length > 0 ? res.delta : null,
+              compat: res.compat ?? null,
             };
+            // COMPATIBILITY MAP (0.6.31): critical gates escalate to mandatory.
+            if (info.compat?.updateRequired) info.isMandatory = true;
             break;
           }
         }
@@ -413,6 +537,16 @@ function createAppUpdateStore() {
         if (!info) {
           // Up to date (or the cloud was unreachable — lastCheckFailed marks it)
           set({ status: 'idle', error: null });
+          return false;
+        }
+
+        // COMPATIBILITY MAP (0.6.31) — SERVER-ONLY releases: the newest
+        // version only changes the server (flagged serverOnly or same API
+        // level with nothing app-facing). The app keeps running with ZERO
+        // action — no dialog, no auto-download; the info is kept so the
+        // manual check can say "server-side update, nothing to do".
+        if (info.compat?.serverOnlyUpdate && !info.isMandatory) {
+          set({ status: 'idle', error: null, info });
           return false;
         }
 
@@ -439,12 +573,49 @@ function createAppUpdateStore() {
     startDownload: async () => {
       const { info, status } = get();
       if (!info || status === 'downloading' || status === 'downloaded') return;
-      set({ status: 'downloading', error: null, needsInstallPermission: false, progress: { percent: 0, receivedBytes: 0, totalBytes: info.fileSize } });
+      set({ status: 'downloading', error: null, needsInstallPermission: false, manualInstallAvailable: false, progress: { percent: 0, receivedBytes: 0, totalBytes: info.fileSize } });
       try {
         if (currentShell() === 'electron') {
-          await electronAPI()?.downloadUpdate?.({ url: info.downloadUrl, version: info.version });
+          // DELTA FIRST (0.6.30): when the cloud offered a verified hop chain
+          // (asar binary-delta + out tree patches) download+apply it IN PLACE
+          // — no NSIS run at all, the app relaunches into the new version.
+          // Any failure falls back to the full installer download below.
+          if (info.delta && info.delta.hops.length > 0 && electronAPI()?.installDeltaUpdate) {
+            const result = await electronAPI()?.installDeltaUpdate({
+              hops: info.delta.hops,
+              target: { version: info.version, asarSha256: info.delta.targetAsarSha256 || '' },
+            });
+            if (result?.ok) {
+              set({ deltaApplied: true, status: 'downloaded', progress: { percent: 100, receivedBytes: info.delta.totalSize, totalBytes: info.delta.totalSize } });
+              void maybeAutoInstall();
+              return;
+            }
+            // Delta failed — report why, then fall through to the FULL installer.
+            set({ deltaApplied: false });
+            console.warn('[update] delta chain failed — falling back to full installer:', result?.error);
+          }
+          await electronAPI()?.downloadUpdate?.({ url: info.downloadUrl, version: info.version, fileHash: info.fileHash, fileSize: info.fileSize });
           // Progress arrives via onUpdateProgress → applyProgress.
         } else {
+          // Android delta path: the native side downloads the hop patches,
+          // applies them onto the installed base.apk and stages the rebuilt
+          // APK; on success it returns the local path (installUpdate picks it
+          // up WITHOUT a DownloadManager id).
+          if (info.delta && info.delta.hops.length > 0 && plugin()?.installDeltaUpdate) {
+            const result = await plugin()?.installDeltaUpdate({
+              deltas: info.delta.hops.map((h) => ({ url: buildCloudUrl(h.url), sha256: h.sha256, fromVersion: h.fromVersion, toVersion: h.toVersion })),
+              finalSha256: info.delta.targetApkSha256 || '',
+              fromVersion: info.currentVersion,
+              toVersion: info.version,
+            });
+            if (result?.ok && result.apkPath) {
+              set({ deltaApplied: true, status: 'downloaded', progress: { percent: 100, receivedBytes: info.delta.totalSize, totalBytes: info.delta.totalSize } });
+              lastAndroidDeltaPath = result.apkPath;
+              void maybeAutoInstall();
+              return;
+            }
+            console.warn('[update] android delta chain failed — falling back to full APK:', result?.error);
+          }
           const res = await plugin()?.downloadUpdate?.({ url: info.absoluteDownloadUrl || info.downloadUrl, version: info.version });
           if (res?.downloadId) {
             lastAndroidDownloadId = res.downloadId; // consumed by install() below
@@ -458,12 +629,26 @@ function createAppUpdateStore() {
     },
 
     install: async () => {
-      const { status } = get();
+      const { status, deltaApplied } = get();
       if (status !== 'downloaded') return;
       set({ status: 'installing' });
       try {
         if (currentShell() === 'electron') {
-          await electronAPI()?.installUpdate?.();
+          if (deltaApplied) {
+            // The chain is ALREADY applied on disk — a relaunch is the whole
+            // install (the new asar + tree load on boot). No NSIS, no quit
+            // dance: this is the differential update payoff.
+            await electronAPI()?.relaunchAfterDelta?.();
+            return;
+          }
+          const result = await electronAPI()?.installUpdate?.();
+          // 0.6.30 install fix: ok:false means the app did NOT quit — every
+          // launcher leg (waiter + PowerShell) failed. Surface the manual
+          // fallback instead of pretending.
+          if (result && result.ok === false) {
+            set({ status: 'downloaded', error: 'install-spawn-failed', manualInstallAvailable: true });
+            return;
+          }
           // The main process quits and runs the NSIS installer.
         } else {
           // Record the CURRENT native version BEFORE the installer opens —
@@ -472,9 +657,15 @@ function createAppUpdateStore() {
           if (!pendingInstallFromVersion) {
             pendingInstallFromVersion = await readNativeVersion();
           }
-          // 0.6.18: hand the native side the download we actually completed —
-          // without it the plugin could not locate the APK ("apk-not-found").
-          await plugin()?.installUpdate?.({ downloadId: lastAndroidDownloadId ?? undefined });
+          if (deltaApplied && lastAndroidDeltaPath) {
+            // Delta path: the rebuilt APK already sits in app files — hand the
+            // native installer the DIRECT path (no DownloadManager id).
+            await plugin()?.installUpdate?.({ filePath: lastAndroidDeltaPath });
+          } else {
+            // 0.6.18: hand the native side the download we actually completed —
+            // without it the plugin could not locate the APK ("apk-not-found").
+            await plugin()?.installUpdate?.({ downloadId: lastAndroidDownloadId ?? undefined });
+          }
           // Android: the package installer opens over our activity. It is
           // asynchronous — ok:true only means the installer UI opened, so
           // drop back to 'downloaded' (NOT a success claim). The resume
@@ -590,11 +781,22 @@ function createAppUpdateStore() {
 
     clearError: () => set({ error: null, status: get().info ? 'available' : 'idle' }),
     resetNeedsPermission: () => set({ needsInstallPermission: false }),
+
+    openInstallerManually: async () => {
+      try {
+        const result = await electronAPI()?.openDownloadedInstaller?.();
+        if (result && result.ok === false) {
+          set({ error: 'no-download' });
+        }
+      } catch { /* the button is best-effort by definition */ }
+    },
   }));
 }
 
 /** Auto-download honouring the user settings + Wi-Fi-only sub-setting. */
 async function maybeAutoDownload(info: AppUpdateInfo) {
+  // SERVER-ONLY releases never trigger an app download (nothing app-facing).
+  if (info.compat?.serverOnlyUpdate && !info.isMandatory) return;
   const settings = loadAppUpdateSettings();
   if (!settings.autoDownload) return;
   if (settings.autoDownloadWifiOnly && !(await isWifiConnection())) return;
@@ -633,14 +835,19 @@ export const useAppUpdateStore = (() => {
  * the settings cards. Returns what happened so callers can toast:
  * 'up-to-date' | 'available' | 'failed' | 'throttled'
  */
-export type ManualCheckResult = 'up-to-date' | 'available' | 'failed' | 'throttled';
-
 export async function manualUpdateCheck(): Promise<ManualCheckResult> {
   if (currentShell() === 'web') return 'up-to-date';
   const state = useAppUpdateStore.getState();
   const alreadyAvailable = state.status === 'available' || state.status === 'downloading' || state.status === 'downloaded';
   const found = await state.check('manual');
   if (found || alreadyAvailable) return 'available';
+  // COMPATIBILITY MAP (0.6.31): the newest release is SERVER-ONLY — tell the
+  // user the truth instead of a generic "up to date": the server moved, the
+  // app did not need to.
+  const after = useAppUpdateStore.getState();
+  if (after.info?.compat?.serverOnlyUpdate) return 'server-only';
   // Distinguish a failed network check from a genuine "up to date".
-  return useAppUpdateStore.getState().lastCheckFailed ? 'failed' : 'up-to-date';
+  return after.lastCheckFailed ? 'failed' : 'up-to-date';
 }
+
+export type ManualCheckResult = 'up-to-date' | 'available' | 'failed' | 'throttled' | 'server-only';

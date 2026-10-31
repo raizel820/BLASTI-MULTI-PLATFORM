@@ -1,0 +1,12 @@
+{
+  "name": "@blasti/binary-delta",
+  "version": "0.6.30",
+  "private": true,
+  "description": "BLASTI binary delta patches — content-defined chunk diff (create) + apply, shared by the cloud API (generation), the Electron desktop updater and the reference for the Android patcher",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ]
+}

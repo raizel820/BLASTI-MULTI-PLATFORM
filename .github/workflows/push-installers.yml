@@ -239,6 +239,18 @@ jobs:
           name: desktop-exe
           path: installer/desktop
 
+      # DELTA UPDATES (0.6.30): refs artifact from the SAME source run (when
+      # it has one) → the re-pushed release keeps its differential patches.
+      - name: Download desktop release refs (delta updates)
+        if: steps.resolve.outputs.want_desktop_exe == 'true'
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          run-id: ${{ steps.resolve.outputs.run_id }}
+          github-token: ${{ github.token }}
+          name: desktop-release-refs
+          path: release-refs
+
       - name: Download mobile-apk artifact (Android debug)
         if: steps.resolve.outputs.want_mobile_apk == 'true'
         uses: actions/download-artifact@v4
@@ -336,9 +348,21 @@ jobs:
               --version "$ver" \
               --api-url "$BLASTI_API_URL" \
               --token "$BLASTI_DEPLOY_TOKEN" \
-              --notes "Re-pushed from run ${SOURCE_RUN_ID} (no rebuild, commit ${SOURCE_HEAD_SHA:0:7})"
+              --notes "Re-pushed from run ${SOURCE_RUN_ID} (no rebuild, commit ${SOURCE_HEAD_SHA:0:7})" \
+              ${REF_ARGS}
             printf '| `%s` | %s | %s | %s MB | %s |\n' "$(basename "$f")" "$artifact" "$platform" "$size_mb" "$ver" >> /tmp/pushed-rows.md
           }
+
+          # Delta refs (desktop, when the source run had them)
+          REF_ARGS=""
+          if [ -f release-refs/app.asar ] && [ -f release-refs/outref.bin ] && [ -f release-refs/refs.json ]; then
+            REF_ARGS="--asar release-refs/app.asar --outref release-refs/outref.bin"
+            REF_ARGS="$REF_ARGS --runtime-key $(node -p "JSON.parse(require('fs').readFileSync('release-refs/refs.json','utf8')).runtimeKey")"
+            REF_ARGS="$REF_ARGS --native-fingerprint $(node -p "JSON.parse(require('fs').readFileSync('release-refs/refs.json','utf8')).nativeFingerprint")"
+            echo "delta refs found — differential updates will be generated"
+          else
+            echo "no delta refs artifact — desktop updates fall back to full installers"
+          fi
 
           desktop_ver="$(node -p "require('./apps/desktop/package.json').version")"
           mobile_ver="$(sed -n 's/.*versionName[^"]*"\([^"]*\)".*/\1/p' apps/mobile/android/app/build.gradle | head -1)"

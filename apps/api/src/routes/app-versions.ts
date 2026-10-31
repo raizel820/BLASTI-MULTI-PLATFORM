@@ -16,6 +16,10 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 // name when the code is meaningless, else the old admin row (code 5000)
 // permanently shadowed newer CI builds and devices were told "up to date".
 import { pickLatestAppVersion } from '../lib/app-version-rank'
+// Delta Updates (0.6.30) — differential patch graph + generation
+import { computeDeltaChain, generateDeltasForVersion } from '../lib/app-version-deltas'
+// API Compatibility Map (0.6.31) — app↔server capability matrix
+import { evaluateCompatibility, seedDefaultGates, CURRENT_SERVER_API_LEVEL, MIN_SUPPORTED_API_LEVEL } from '../lib/api-compat'
 
 const app = new Hono()
 
@@ -65,6 +69,10 @@ const createAppVersionSchema = z.object({
   isPatch: z.boolean().default(false),
   downloadUrl: z.string().default(''),
   minAppVersion: z.string().optional(),
+  // API Compatibility Map (0.6.31): the API protocol level this build speaks
+  // + whether the release is server-side only (apps skip it entirely).
+  apiLevel: z.number().int().min(0).optional(),
+  serverOnly: z.boolean().optional(),
 })
 
 const updateAppVersionSchema = z.object({
@@ -78,6 +86,8 @@ const updateAppVersionSchema = z.object({
   isPatch: z.boolean().optional(),
   downloadUrl: z.string().optional(),
   minAppVersion: z.string().nullable().optional(),
+  apiLevel: z.number().int().min(0).nullable().optional(),
+  serverOnly: z.boolean().optional(),
 })
 
 // ─── Upload directory ───────────────────────────────────────────────────────
@@ -204,6 +214,30 @@ app.get('/check', async (c) => {
 
     const updateAvailable = !!latestVersion && compareVersions(latestVersion.version, version) > 0
 
+    // ── Delta Updates (0.6.30) — resolve the hop chain for THIS client ──────
+    // A device several versions behind receives the shortest verified chain
+    // (client version → latest); it applies the hops sequentially and falls
+    // back to the full installer on the first verification failure. Clients
+    // that predate deltas simply ignore the extra field.
+    let delta: Record<string, unknown> | null = null
+    if (updateAvailable && latestVersion) {
+      try {
+        const chain = await computeDeltaChain(platform, version, latestVersion.id)
+        if (chain && chain.hops.length >= 1) {
+          delta = {
+            supported: true,
+            kind: chain.hops.length > 1 ? 'chain' : chain.hops[0].kind,
+            runtimeKey: chain.runtimeKey,
+            nativeFingerprint: chain.nativeFingerprint,
+            targetAsarSha256: chain.targetAsarSha256,
+            targetApkSha256: chain.targetApkSha256,
+            totalSize: chain.hops.reduce((sum, h) => sum + (h.size || 0), 0),
+            hops: chain.hops,
+          }
+        }
+      } catch { /* delta resolution must never break the basic check */ }
+    }
+
     return c.json({
       success: true,
       platform,
@@ -223,9 +257,128 @@ app.get('/check', async (c) => {
       fileName: updateAvailable ? (latestVersion?.fileName ?? '') : '',
       isPatch: updateAvailable ? (latestVersion?.isPatch ?? false) : false,
       minAppVersion: updateAvailable ? (latestVersion?.minAppVersion ?? '') : '',
+      // Differential update offer (null/absent on older servers → full install)
+      delta,
+      // API COMPATIBILITY MAP (0.6.31) — the same evaluation the dedicated
+      // /compat endpoint returns, embedded in the boot-time check so apps get
+      // "can I run / what is blocked / is the update required or server-only"
+      // in ONE round trip. Absent on older servers → clients ignore it.
+      compat: await (async () => {
+        try {
+          const apiLevelRaw = c.req.query('apiLevel')
+          const appApiLevel = apiLevelRaw != null && apiLevelRaw !== '' && !Number.isNaN(Number(apiLevelRaw)) ? Number(apiLevelRaw) : null
+          return await evaluateCompatibility(version, appApiLevel, platform)
+        } catch { return null }
+      })(),
     })
   } catch (error: unknown) {
     return c.json({ success: false, error: 'Update check failed' }, 500)
+  }
+})
+
+// ─── GET /app-versions/compat — PUBLIC compatibility evaluation ───────────
+//
+// THE COMPATIBILITY MAP CHECK (0.6.31): "can this app version run with the
+// current server API version, which functions cannot run unless the app is
+// updated, when is an update ABSOLUTELY required, and when is the update
+// just for the server (apps keep running)?" One public call, no session:
+//   GET /api/app-versions/compat?platform=windows&version=0.6.29&apiLevel=1
+// The same evaluation is embedded in GET /check (the boot-time call), this
+// endpoint exposes the FULL map for UIs, admin tooling and diagnostics.
+
+app.get('/compat', async (c) => {
+  try {
+    const platform = c.req.query('platform') || 'windows'
+    const version = c.req.query('version')
+    if (!version) return c.json({ success: false, error: 'version query param is required' }, 400)
+    const apiLevelRaw = c.req.query('apiLevel')
+    const appApiLevel = apiLevelRaw != null && apiLevelRaw !== '' && !Number.isNaN(Number(apiLevelRaw)) ? Number(apiLevelRaw) : null
+    const compat = await evaluateCompatibility(version, appApiLevel, platform)
+    return c.json({ success: true, platform, compat })
+  } catch (error: unknown) {
+    return c.json({ success: false, error: 'Compatibility check failed' }, 500)
+  }
+})
+
+// ─── GET /app-versions/compat/map — the full map (admin) ────────────────────
+// Every gate + a per-platform evaluation matrix for the most recent client
+// versions — the admin "Compatibility" tab renders this directly.
+
+app.get('/compat/map', async (c) => {
+  try {
+    await requireAdmin(c)
+    const gates = await db.apiFeatureGate.findMany({ orderBy: { feature: 'asc' } })
+    const matrix: Record<string, unknown> = {}
+    for (const platform of ['windows', 'android']) {
+      const candidates = await db.appVersion.findMany({
+        where: { platform, isPublished: true },
+        orderBy: { createdAt: 'desc' },
+        take: 6,
+      })
+      const rows = []
+      for (const v of candidates) {
+        const compat = await evaluateCompatibility(v.version, v.apiLevel ?? null, platform)
+        rows.push({
+          version: v.version,
+          apiLevel: v.apiLevel,
+          serverOnly: v.serverOnly,
+          compatible: compat.compatible,
+          updateRequired: compat.updateRequired,
+          serverOnlyUpdate: compat.serverOnlyUpdate,
+          blocked: compat.blockedFeatures.map((g) => ({ feature: g.feature, severity: g.severity })),
+        })
+      }
+      matrix[platform] = rows
+    }
+    return c.json({
+      success: true,
+      serverApiLevel: CURRENT_SERVER_API_LEVEL,
+      minSupportedApiLevel: MIN_SUPPORTED_API_LEVEL,
+      gates,
+      matrix,
+    })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+const gateSchema = z.object({
+  feature: z.string().min(2).max(80).regex(/^[a-z0-9-]+$/),
+  minAppVersion: z.string().regex(/^\d+\.\d+\.\d+/),
+  severity: z.enum(['critical', 'soft', 'server']).default('soft'),
+  apiLevel: z.number().int().min(0).default(0),
+  description: z.string().max(500).default(''),
+  descriptionAr: z.string().max(500).nullable().optional(),
+  descriptionFr: z.string().max(500).nullable().optional(),
+  enabled: z.boolean().default(true),
+})
+
+app.post('/compat/gates', async (c) => {
+  try {
+    await requireAdmin(c)
+    const parsed = gateSchema.safeParse(await c.req.json())
+    if (!parsed.success) return c.json({ success: false, error: 'Invalid gate', details: parsed.error.issues }, 400)
+    const gate = await db.apiFeatureGate.upsert({
+      where: { feature: parsed.data.feature },
+      create: parsed.data,
+      update: parsed.data,
+    })
+    return c.json({ success: true, gate })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+app.delete('/compat/gates/:id', async (c) => {
+  try {
+    await requireAdmin(c)
+    await db.apiFeatureGate.delete({ where: { id: c.req.param('id') } })
+    return c.json({ success: true })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
   }
 })
 
@@ -264,6 +417,8 @@ app.post('/', async (c) => {
         isPatch: data.isPatch,
         downloadUrl: data.downloadUrl,
         minAppVersion: data.minAppVersion,
+        apiLevel: data.apiLevel,
+        serverOnly: data.serverOnly ?? false,
         publishedAt: data.isPublished ? new Date() : null,
       },
     })
@@ -331,6 +486,8 @@ app.post('/upload', async (c) => {
       const versionCodeRaw = formData.get('versionCode')
       const versionCode = versionCodeRaw ? parseInt(String(versionCodeRaw), 10) || 0 : 0
       const notes = String(formData.get('releaseNotes') ?? '')
+      const apiLevelRaw = formData.get('apiLevel')
+      const serverOnlyRaw = String(formData.get('serverOnly') ?? '')
       appVersion = await db.appVersion.create({
         data: {
           platform,
@@ -338,6 +495,10 @@ app.post('/upload', async (c) => {
           versionCode,
           releaseNotes: notes.slice(0, 2000),
           isPublished: false, // CI uploads land as drafts — an admin activates them
+          // API Compatibility Map (0.6.31) — CI stamps the build's API level;
+          // serverOnly=1 marks releases installed apps can skip entirely.
+          apiLevel: apiLevelRaw ? parseInt(String(apiLevelRaw), 10) || null : null,
+          serverOnly: serverOnlyRaw === '1' || serverOnlyRaw === 'true',
         },
       })
     }
@@ -355,6 +516,9 @@ app.post('/upload', async (c) => {
         fileSize: file.size,
         fileHash: hash,
         downloadUrl: `/api/app-versions/${appVersion.id}/download`,
+        // Re-stamping on re-upload keeps the compat map honest (idempotent CI).
+        ...(formData.get('apiLevel') ? { apiLevel: parseInt(String(formData.get('apiLevel')), 10) || null } : {}),
+        ...(String(formData.get('serverOnly') ?? '') === '1' || String(formData.get('serverOnly') ?? '') === 'true' ? { serverOnly: true } : {}),
       },
     })
 
@@ -375,6 +539,160 @@ app.post('/upload', async (c) => {
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── POST /app-versions/:id/release-refs — upload delta reference artifacts ──
+//
+// CI (make-release-refs.mjs / publish-installer.mjs) attaches THIS release's
+// diffable references right after uploading the installer:
+//   desktop: asar (win-unpacked/resources/app.asar) + outref (tree archive
+//            of resources/app.asar.unpacked) + runtimeKey + nativeFingerprint
+//   android: nothing extra — the APK itself is the base
+// On success the API immediately tries to build the delta patch vs the
+// previous published release so the update is differential from day one.
+
+app.post('/:id/release-refs', async (c) => {
+  try {
+    await requireAdminOrDeployToken(c)
+    ensureUploadDir()
+
+    const appVersion = await db.appVersion.findUnique({ where: { id: c.req.param('id') } })
+    if (!appVersion) return c.json({ success: false, error: 'Version not found' }, 404)
+
+    const formData = await c.req.formData()
+    const runtimeKey = String(formData.get('runtimeKey') ?? '').slice(0, 80)
+    const nativeFingerprint = String(formData.get('nativeFingerprint') ?? '').slice(0, 80)
+
+    const data: Record<string, string | number> = {}
+    if (runtimeKey) data.runtimeKey = runtimeKey
+    if (nativeFingerprint) data.nativeFingerprint = nativeFingerprint
+
+    for (const field of ['asar', 'outref'] as const) {
+      const file = formData.get(field) as File | null
+      if (!file) continue
+      const buffer = Buffer.from(await file.arrayBuffer())
+      const safeName = `desktop/${field}-${appVersion.platform}-${appVersion.version}-${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`
+      const filePath = path.join(UPLOAD_DIR, safeName)
+      fs.mkdirSync(path.dirname(filePath), { recursive: true })
+      fs.writeFileSync(filePath, buffer)
+      const hash = crypto.createHash('sha256').update(buffer).digest('hex')
+      if (field === 'asar') {
+        data.asarStorageKey = safeName
+        data.asarSha256 = hash
+        data.asarSize = buffer.length
+      } else {
+        data.outrefStorageKey = safeName
+        data.outrefSha256 = hash
+        data.outrefSize = buffer.length
+      }
+    }
+
+    if (Object.keys(data).length === 0) {
+      return c.json({ success: false, error: 'No reference artifacts provided (asar/outref/runtimeKey/nativeFingerprint)' }, 400)
+    }
+
+    const updated = await db.appVersion.update({ where: { id: appVersion.id }, data })
+
+    // Build the patch vs the previous release right away (release-ref uploads
+    // only happen once per release — the 7s generation cost is fine here).
+    let deltaGeneration: unknown = null
+    try {
+      const results = await generateDeltasForVersion(appVersion.id)
+      deltaGeneration = results
+    } catch (err) {
+      deltaGeneration = { error: String((err as Error).message || err).slice(0, 200) }
+    }
+
+    invalidateResponseCacheTag('app-versions')
+    return c.json({ success: true, version: updated, deltaGeneration })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── POST /app-versions/:id/regenerate-deltas — admin rebuild of hop patches ─
+
+app.post('/:id/regenerate-deltas', async (c) => {
+  try {
+    await requireAdmin(c)
+    const appVersion = await db.appVersion.findUnique({ where: { id: c.req.param('id') } })
+    if (!appVersion) return c.json({ success: false, error: 'Version not found' }, 404)
+    const results = await generateDeltasForVersion(appVersion.id)
+    return c.json({ success: true, results })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── GET /app-versions/delta/:id/download — PUBLIC delta patch download ────
+// Same streaming semantics as /:id/download (Range/resume aware) — the desktop
+// parallel downloader depends on it.
+
+app.get('/delta/:id/download', async (c) => {
+  try {
+    const deltaRow = await db.appVersionDelta.findUnique({ where: { id: c.req.param('id') } })
+    if (!deltaRow || !deltaRow.fileStorageKey) {
+      return c.json({ success: false, error: 'Delta not found' }, 404)
+    }
+    const filePath = resolveBinaryPath(deltaRow.fileStorageKey)
+    if (!filePath) return c.json({ success: false, error: 'Delta file not found' }, 404)
+    let fileStat: fs.Stats
+    try {
+      fileStat = fs.statSync(filePath)
+      if (!fileStat.isFile()) throw new Error('not a file')
+    } catch {
+      return c.json({ success: false, error: 'Delta file missing on disk' }, 404)
+    }
+
+    const fileSize = fileStat.size
+    const etag = `W/"${fileSize.toString(16)}-${Math.floor(fileStat.mtimeMs).toString(16)}"`
+    const baseHeaders: Record<string, string> = {
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${deltaRow.fileName}"`,
+      'Accept-Ranges': 'bytes',
+      ETag: etag,
+      'Cache-Control': 'public, max-age=300',
+    }
+
+    const rangeHeader = c.req.header('range')
+    let start = 0
+    let end = fileSize - 1
+    let status = 200
+    if (rangeHeader) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim())
+      if (m && (m[1] !== '' || m[2] !== '')) {
+        if (m[1] === '') {
+          const suffix = Math.min(parseInt(m[2], 10), fileSize)
+          start = Math.max(0, fileSize - suffix)
+          end = fileSize - 1
+        } else {
+          start = parseInt(m[1], 10)
+          end = m[2] === '' ? fileSize - 1 : Math.min(parseInt(m[2], 10), fileSize - 1)
+        }
+        if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= fileSize) {
+          return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${fileSize}` } })
+        }
+        status = 206
+      }
+    }
+
+    const headers: Record<string, string> = { ...baseHeaders, 'Content-Length': String(end - start + 1) }
+    if (status === 206) headers['Content-Range'] = `bytes ${start}-${end}/${fileSize}`
+
+    void db.appVersionDelta.update({ where: { id: deltaRow.id }, data: {} }).catch(() => { /* stats optional */ })
+
+    const nodeStream = fs.createReadStream(filePath, { start, end })
+    nodeStream.on('error', (err) => {
+      console.error('[app-versions] delta stream error:', err.message)
+      nodeStream.destroy()
+    })
+    const webStream = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>
+    return new Response(webStream, { status, headers })
+  } catch (error: unknown) {
+    return c.json({ success: false, error: 'Delta download failed' }, 500)
   }
 })
 
@@ -454,11 +772,21 @@ app.post('/:id/activate', async (c) => {
       })
     })
 
+    // Delta Updates (0.6.30): activation is the moment a release becomes the
+    // chain target — build/refresh hop patches from every published older
+    // release that has reference artifacts (best-effort, never blocks).
+    let deltaGeneration: unknown = null
+    try {
+      deltaGeneration = await generateDeltasForVersion(existing.id)
+    } catch (err) {
+      deltaGeneration = { error: String((err as Error).message || err).slice(0, 200) }
+    }
+
     // Performance Round — the landing download buttons must switch to the
     // newly activated installer on the very next visit.
     invalidateResponseCacheTag('app-versions')
 
-    return c.json({ success: true, version: activated })
+    return c.json({ success: true, version: activated, deltaGeneration })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -999,5 +1327,10 @@ function compareVersions(a: string, b: string): number {
   }
   return 0
 }
+
+// API Compatibility Map (0.6.31) — one-time idempotent seed of the feature
+// gates from this codebase's real release history (delta-updates, strict
+// logs, master-pin, counter-control, payments). Admins manage them after.
+void seedDefaultGates().catch(() => { /* seeding must never break boot */ })
 
 export const appVersionRoutes = app

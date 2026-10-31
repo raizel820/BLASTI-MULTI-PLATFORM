@@ -189,17 +189,17 @@ function parseDlnaServices(xml: string, ip: string): DlnaServiceUrls | null {
   const avTransportMatch = xml.match(/<service>[\s\S]*?<serviceType>urn:schemas-upnp-org:service:AVTransport:1<\/serviceType>[\s\S]*?<\/service>/i);
   const renderingMatch = xml.match(/<service>[\s\S]*?<serviceType>urn:schemas-upnp-org:service:RenderingControl:1<\/serviceType>[\s\S]*?<\/service>/i);
 
-  const controlUrl = (block: string | undefined): string | null => {
+  const controlUrl = (block: string | undefined | null): string | null => {
     if (!block) return null;
     const m = block.match(/<controlURL>([^<]+)<\/controlURL>/i);
     if (!m) return null;
     return resolveUrl(baseURL, m[1].trim());
   };
 
-  const avTransportControlUrl = controlUrl(avTransportMatch);
+  const avTransportControlUrl = controlUrl(avTransportMatch?.[0]);
   if (!avTransportControlUrl) return null;
 
-  const renderingControlUrl = controlUrl(renderingMatch) || undefined;
+  const renderingControlUrl = controlUrl(renderingMatch?.[0]) || undefined;
 
   const friendly = xml.match(/<friendlyName>([^<]+)<\/friendlyName>/i);
 

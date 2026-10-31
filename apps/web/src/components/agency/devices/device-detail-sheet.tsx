@@ -307,7 +307,8 @@ export function DeviceDetailSheet({
                   {getLocalizedString('حذف', 'Supprimer', 'Delete', lang)}
                 </Button>
               </div>
-              {device.agencyId && (
+              {/* Unpair — available for any agency device that isn't disabled */}
+              {device.status !== 'DISABLED' && (
                 <Button
                   variant="outline"
                   size="sm"

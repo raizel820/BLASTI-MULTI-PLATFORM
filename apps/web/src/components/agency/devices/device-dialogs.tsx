@@ -80,6 +80,10 @@ import {
   getLocalizedLabel,
   getLocalizedString,
 } from './types';
+import type { TranslationKeys } from '@/i18n';
+
+/** Translator prop type — matches the real t() from useLanguage(). */
+type Translator = (key: TranslationKeys, params?: Record<string, string>) => string;
 
 // ─── Shared form fields for Add / Edit ──────────────────────────────────────
 
@@ -100,7 +104,7 @@ interface DeviceFormFieldsProps {
   formStatus?: DeviceStatus;
   formDisplaySettings?: DisplaySettings;
   branches: Branch[];
-  t: (key: string) => string;
+  t: Translator;
   onFormNameChange: (v: string) => void;
   onFormNameArChange: (v: string) => void;
   onFormNameFrChange: (v: string) => void;
@@ -442,7 +446,7 @@ interface AddDeviceDialogProps {
   open: boolean;
   lang: string;
   rtl: boolean;
-  t: (key: string) => string;
+  t: Translator;
   submitting: boolean;
   createdToken: string | null;
   createdPairingCode: string | null;
@@ -974,7 +978,7 @@ interface KioskCredentialsDialogProps {
   token: string;
   tokenVisible: boolean;
   copiedField: string | null;
-  t: (key: string) => string;
+  t: Translator;
   onOpenChange: (open: boolean) => void;
   onTokenVisibleChange: (v: boolean) => void;
   onCopyField: (text: string, field: string) => void;
@@ -1090,7 +1094,7 @@ interface CreateKioskDialogProps {
   open: boolean;
   lang: string;
   rtl: boolean;
-  t: (key: string) => string;
+  t: Translator;
   loading: boolean;
   name: string;
   nameAr: string;
@@ -1468,7 +1472,7 @@ export function TvQrDialog({
 
           <div className="flex items-center gap-3 w-full">
             <div className="flex-1 h-px bg-gray-700" />
-            <span className="text-xs text-gray-500 dark:text-gray-400">{getLocalizedString('أو', 'ou', 'OR')}</span>
+            <span className="text-xs text-gray-500 dark:text-gray-400">{getLocalizedString('أو', 'ou', 'OR', lang)}</span>
             <div className="flex-1 h-px bg-gray-700" />
           </div>
 

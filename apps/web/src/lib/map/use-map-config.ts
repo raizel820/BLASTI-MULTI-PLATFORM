@@ -112,6 +112,31 @@ export function useMapConfig(): UseMapConfigResult {
 
   useEffect(() => {
     let cancelled = false;
+    // r27 — transient API hiccups (documented: a running LAN scan saturates
+    // the API's event loop and the 6s config call times out) used to leave a
+    // MOUNTED map surface stuck in action-row-only mode forever: the failure
+    // negative-cache lives 30s and this effect ran exactly once per mount.
+    // Retry while still null (bounded) so the map self-heals instead of
+    // requiring a manual page reload.
+    const RETRY_INTERVAL_MS = 10_000;
+    const MAX_RETRIES = 6; // ~1 minute of resilience per mount
+    let retries = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const attempt = () => {
+      fetchMapsConfig().then((config) => {
+        if (cancelled) return;
+        setState({
+          config,
+          loading: false,
+          error: config ? null : 'MAPS_CONFIG_UNAVAILABLE',
+        });
+        if (!config && retries < MAX_RETRIES) {
+          retries += 1;
+          timer = setTimeout(attempt, RETRY_INTERVAL_MS);
+        }
+      });
+    };
 
     const fresh = cache && Date.now() - cache.fetchedAt < CONFIG_TTL_MS;
     if (fresh && cache) {
@@ -120,17 +145,11 @@ export function useMapConfig(): UseMapConfigResult {
     }
 
     setState((prev) => ({ ...prev, loading: true }));
-    fetchMapsConfig().then((config) => {
-      if (cancelled) return;
-      setState({
-        config,
-        loading: false,
-        error: config ? null : 'MAPS_CONFIG_UNAVAILABLE',
-      });
-    });
+    attempt();
 
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
   }, []);
 

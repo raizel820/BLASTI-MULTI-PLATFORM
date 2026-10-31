@@ -2597,6 +2597,25 @@ function createApp() {
     return c.json({ success: true, data: snapshot })
   })
 
+  // POST /api/lan/preferred-master — r21-9 MANUAL master selection from the
+  // branch itself (the web Device Manager pins via the cloud; this route lets
+  // an on-LAN owner session pin DIRECTLY on any desktop node). Body:
+  // { instanceId: "<durable id>" } — or { instanceId: null } to return to
+  // automatic election. Auth: the shared session token or a device token.
+  app.post('/api/lan/preferred-master', async (c) => {
+    const token = c.req.header('Authorization')?.replace('Bearer ', '') || c.req.header('X-Local-Token') || ''
+    const isLocalCaller = !!(token && sessionToken && token === sessionToken)
+    const isDeviceCaller = !!lanAuthority.verifyDeviceToken(token)
+    if (!isLocalCaller && !isDeviceCaller) {
+      return c.json({ success: false, code: 'AUTH_NO_TOKEN', error: 'Session or device token required' }, 401)
+    }
+    let body = null
+    try { body = await c.req.json() } catch { /* body optional → treated as clear */ }
+    const instanceId = body && typeof body.instanceId === 'string' ? body.instanceId : null
+    const applied = await lanAuthority.setPreferredMaster(instanceId)
+    return c.json({ success: true, data: { preferredMasterInstanceId: applied, ...lanAuthority.statusSnapshot() } })
+  })
+
   app.get('/api/health', async (c) => {
     // Task 42: build identity — lets diagnostics (and the second-launch guard
     // in main.js) tell a CURRENT local API from a STALE one left running by an
@@ -3680,6 +3699,118 @@ function createApp() {
    */
   app.all('/api/app-installs', forwardAppVersions)
   app.all('/api/app-installs/*', forwardAppVersions)
+
+  // ─── STRICT LOGS (0.6.30) — /api/logs ingest for the LOCAL-FIRST world ────
+  // The user's field report: "logs autoupload is not working". One root cause
+  // lived here — LAN web/mobile clients (and kiosk webviews pointing at this
+  // box) POST to the local-first base URL and used to get a bare 404, entered
+  // the renderer's 15-minute stale-server cooldown and never uploaded again.
+  // The local API now accepts the batches itself:
+  //   1. appends them to <userData>/logs/client-logs/<platform>-<date>.ndjson
+  //      (day-rotated, byte-capped — the offline-safe trail),
+  //   2. queues the batch for CLOUD forwarding — flushed as soon as a session
+  //      token exists, retried on every later ingest (cap 40 batches).
+  const pendingCloudLogBatches = []
+  const PENDING_LOG_BATCH_CAP = 40
+
+  function localClientLogsDir() {
+    try {
+      // userData comes from the main process via the bootstrap context —
+      // fall back to a sibling of the diag log dir when unavailable.
+      const electron = require('electron')
+      const ud = (electron && electron.app && typeof electron.app.getPath === 'function')
+        ? electron.app.getPath('userData')
+        : (global.__blastiUserData || require('os').homedir() + '/.blasti')
+      const dir = require('path').join(ud, 'logs', 'client-logs')
+      require('fs').mkdirSync(dir, { recursive: true })
+      return dir
+    } catch {
+      try { return require('path').join(require('os').tmpdir(), 'blasti-client-logs') } catch { return '/tmp/blasti-client-logs' }
+    }
+  }
+
+  const forwardPendingLogs = async () => {
+    if (!sessionToken || pendingCloudLogBatches.length === 0) return
+    const batches = pendingCloudLogBatches.splice(0, pendingCloudLogBatches.length)
+    for (const batch of batches) {
+      try {
+        const res = await fetch(cloudBaseUrl() + '/api/logs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
+          body: JSON.stringify(batch),
+          signal: AbortSignal.timeout(15000),
+        })
+        if (!res.ok && res.status !== 400) {
+          // 4xx ≠ 400 → auth/server problems — put it back (cap applies).
+          if (pendingCloudLogBatches.length < PENDING_LOG_BATCH_CAP) pendingCloudLogBatches.push(batch)
+        }
+      } catch {
+        if (pendingCloudLogBatches.length < PENDING_LOG_BATCH_CAP) pendingCloudLogBatches.push(batch)
+        return // cloud unreachable — keep the rest queued for the next call
+      }
+    }
+  }
+
+  app.post('/api/logs', async (c) => {
+    try {
+      const body = await c.req.json()
+      const entries = Array.isArray(body && body.entries) ? body.entries.slice(0, 200) : []
+      const platformRaw = String((body && body.platform) || 'web').replace(/[^a-z0-9_-]/gi, '').slice(0, 20) || 'web'
+      if (entries.length === 0) return c.json({ success: true, accepted: 0 })
+      const day = new Date().toISOString().slice(0, 10)
+      const envelope = {
+        ts: new Date().toISOString(),
+        level: 'meta',
+        tag: 'session',
+        message: `batch via LOCAL API (${body && body.manual ? 'MANUAL' : 'auto'}) from ${platformRaw}`,
+        data: { localForward: true, appVersion: body && body.appVersion, count: entries.length },
+      }
+      const lines = [JSON.stringify(envelope), ...entries.slice(0, 200).map((e) => {
+        try {
+          const t = typeof e === 'object' && e ? e : {}
+          return JSON.stringify({
+            ts: String(t.ts || new Date().toISOString()).slice(0, 40),
+            level: String(t.level || 'info').slice(0, 10),
+            tag: String(t.tag || 'app').slice(0, 60),
+            message: String(t.message ?? '').slice(0, 8000),
+          })
+        } catch { return null }
+      }).filter(Boolean)]
+      try {
+        const fsMod = require('fs')
+        const pathMod = require('path')
+        const file = pathMod.join(localClientLogsDir(), `${platformRaw}-${day}.ndjson`)
+        fsMod.appendFileSync(file, lines.join('\n') + '\n', 'utf8')
+        // Soft cap: 8 MB per platform stream — trim oldest half when over.
+        try {
+          const st = fsMod.statSync(file)
+          if (st.size > 8 * 1024 * 1024) {
+            const raw = fsMod.readFileSync(file, 'utf8').split('\n')
+            fsMod.writeFileSync(file, raw.slice(Math.floor(raw.length / 2)).join('\n'), 'utf8')
+          }
+        } catch { /* cap is best-effort */ }
+      } catch (err) {
+        console.warn('[LocalAPI] client-log write failed:', err && err.message)
+      }
+      // Cloud forward — session-gated; failures re-queue (offline-first).
+      if (entries.length > 0 && pendingCloudLogBatches.length < PENDING_LOG_BATCH_CAP) {
+        pendingCloudLogBatches.push(body)
+      }
+      void forwardPendingLogs()
+      return c.json({ success: true, accepted: entries.length, stored: 'local', queued: pendingCloudLogBatches.length })
+    } catch (error) {
+      console.error('[LocalAPI] logs ingest error:', error)
+      return c.json({ success: false, error: 'Log ingest failed' }, 500)
+    }
+  })
+
+  /** Manual "upload logs now" from a LAN client also flushes the forward queue. */
+  app.post('/api/logs/flush', async (c) => {
+    try { await forwardPendingLogs(); return c.json({ success: true, queued: pendingCloudLogBatches.length }) }
+    catch { return c.json({ success: false, error: 'flush failed' }, 503) }
+  })
+  // Back-compat alias — some web builds POST the manual flush to /flush only.
+  app.post('/api/logs/flush/*', (c) => c.req.path.endsWith('/flush') ? c.json({ success: true }) : c.next())
 
   /**
    * Round 15 — /api/agencies cloud proxy. Agency CREATION is a cloud-native
@@ -11913,6 +12044,16 @@ async function startLocalApi(dbPath, port, options) {
         httpPort: port,
       },
     })
+    // r21-9 — report the branch-LAN status to the cloud every ~30s (Owner
+    // Device Manager "Branch Connections & Master PC") and pull the owner's
+    // manual master pin back so the web pick wins the offline election.
+    const { startLanStatusReporter } = require('./lib/lan-status-reporter')
+    startLanStatusReporter({
+      getSession: () => (sessionToken && sessionUser ? { token: sessionToken, user: sessionUser } : null),
+      statusSnapshot: () => lanAuthority.statusSnapshot(),
+      setPreferredMaster: (id) => lanAuthority.setPreferredMaster(id),
+      diag: diagLog,
+    })
   } catch (lanAuthErr) {
     console.warn('[LocalAPI] LAN authority init failed (non-fatal):', lanAuthErr?.message || lanAuthErr)
   }
@@ -12241,6 +12382,7 @@ function stopLocalApi() {
   }
   // Close the realtime socket server BEFORE the HTTP server (it wraps it).
   try { localRealtime.closeLocalRealtime() } catch { /* not started */ }
+  try { require('./lib/lan-status-reporter').stopLanStatusReporter() } catch { /* not started */ }
   try { lanAuthority.shutdownAuthority() } catch { /* not started */ }
   try { if (fileSync) fileSync.stop() } catch { /* not started */ }
   if (httpServer) {

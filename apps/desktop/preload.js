@@ -196,9 +196,55 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   /**
    * Install the downloaded installer: the app quits, then the NSIS installer
-   * runs silently. Returns { ok } or { ok:false, error:'no-download' }.
+   * runs silently. Returns { ok } or { ok:false, error:'no-download' } —
+   * 0.6.30: ok:false means the app did NOT quit (spawn failed) — the UI must
+   * offer the manual open-installer fallback.
    */
   installUpdate: () => ipcRenderer.invoke('updates:install'),
+
+  /**
+   * 0.6.30 — fired when updates:install could not start ANY installer leg;
+   * the app stays open. Payload { error }. Use openDownloadedInstaller() for
+   * the manual fallback.
+   */
+  onUpdateInstallFailed: (callback) => {
+    ipcRenderer.on('update:install-failed', (_event, payload) => callback(payload));
+  },
+
+  /**
+   * 0.6.30 manual fallback — open the downloaded installer with the OS
+   * handler (Explorer / open / xdg-open). Returns { ok, path? }.
+   */
+  openDownloadedInstaller: () => ipcRenderer.invoke('updates:open-installer'),
+
+  /**
+   * DELTA UPDATES (0.6.30) — download + apply the differential chain in place
+   * (app.asar binary-delta + out tree patch per hop). Progress events arrive
+   * on the SAME update:progress channel with a `stage` field. Returns
+   * { ok, version?, pendingBootSwap? } or { ok:false, error }.
+   */
+  installDeltaUpdate: (payload) => ipcRenderer.invoke('updates:install-delta', payload),
+
+  /** Relaunch the app after a successful delta apply (new asar loads on boot). */
+  relaunchAfterDelta: () => ipcRenderer.invoke('updates:relaunch-after-delta'),
+
+  // ─── STRICT LOGS (0.6.30) ──────────────────────────────────────────────────
+
+  /**
+   * Fired when the MAIN process wants the remote logger to upload NOW
+   * (main errors, updater/installer events). Returns an unsubscribe.
+   */
+  onLogsFlushRequest: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on('logs:flush-requested', handler);
+    return () => ipcRenderer.removeListener('logs:flush-requested', handler);
+  },
+
+  /**
+   * Diagnostic tails the remote logger merges into every flush:
+   * { diag: string[] (local-api diag log), install: string[] (updater log) }.
+   */
+  getRecentDiagLogs: () => ipcRenderer.invoke('get-recent-diag-logs'),
 
   /**
    * Best-effort network classification for "auto-download on Wi-Fi only":

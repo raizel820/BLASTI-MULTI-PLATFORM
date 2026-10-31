@@ -76,6 +76,8 @@ import QRCode from 'qrcode';
 // Task 83-b — branch location picker + Algeria address selectors (same
 // shared components the create-agency wizard and agency profile use).
 import { MapLocationPicker, type GeocodeComponents } from '@/components/shared/map/map-location-picker';
+import { GpsAddressButton, type GpsFillOutcome } from '@/components/shared/map/gps-address-button';
+import { matchCommuneInWilaya } from '@/lib/map/gps-field-matching';
 import { WilayaSelect, CommuneSelect } from '@/components/shared/algeria-location-selects';
 import { ALGERIA_WILAYAS, findWilayaByCode, findWilayaCentroid } from '@/lib/algeria-locations';
 // r21-5 — map-follows-inputs: the branch wilaya→centroid jump is debounced.
@@ -609,6 +611,32 @@ export function AgencyBranches() {
       }
     }
     if (components.postalCode && !branchPostalCode.trim()) setBranchPostalCode(components.postalCode);
+  };
+
+  // r26 — EXPLICIT GPS fill (the button under the branch address input):
+  // an explicit press overwrites the matched fields (the user's intent) and
+  // moves the pin; COARSE fixes only move the pin (r21-5 policy).
+  const handleBranchGpsOutcome = (outcome: GpsFillOutcome) => {
+    if (outcome.kind === 'OK') {
+      const c = outcome.components;
+      const text = c.formatted || c.street;
+      if (text) setBranchAddress(text);
+      const code = branchWilayaCodeFromGeocodeName(c.wilaya);
+      if (code && code !== branchWilayaCode) {
+        setBranchWilayaCode(code);
+        setBranchCity(''); // dependent list — reset the commune
+      }
+      const commune = matchCommuneInWilaya(code || branchWilayaCode, c.city);
+      if (commune) setBranchCity(commune);
+      if (c.postalCode) setBranchPostalCode(c.postalCode);
+      setBranchLatitude(outcome.coords.lat);
+      setBranchLongitude(outcome.coords.lng);
+      setBranchLocationSource('DEVICE_GPS');
+    } else if (outcome.kind === 'COARSE') {
+      setBranchLatitude(outcome.coords.lat);
+      setBranchLongitude(outcome.coords.lng);
+      setBranchLocationSource('DEVICE_GPS');
+    }
   };
 
   const handleSaveBranch = async () => {
@@ -1687,7 +1715,7 @@ export function AgencyBranches() {
                 onChange={handleBranchPickerChange}
                 onLocationSource={handleBranchLocationSource}
                 addressFields={{ onDetected: handleBranchDetectedAddress }}
-                height={260}
+                height={340}
               />
               {!editingBranch && (branchLatitude === null || branchLongitude === null) && (
                 <p className="text-xs flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
@@ -1703,6 +1731,10 @@ export function AgencyBranches() {
                   placeholder={t('branchAddress')}
                   className="h-11"
                 />
+                {/* r26 — explicit GPS auto-fill (user request) */}
+                <div className="flex justify-end">
+                  <GpsAddressButton onFilled={handleBranchGpsOutcome} />
+                </div>
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div className="space-y-2">

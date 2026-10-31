@@ -32,7 +32,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Download, Loader2, RefreshCw, ShieldAlert, Sparkles } from 'lucide-react';
+import { Download, FolderOpen, Loader2, RefreshCw, ShieldAlert, Sparkles } from 'lucide-react';
 import {
   manualUpdateCheck,
   useAppUpdateStore,
@@ -59,6 +59,8 @@ export function AppUpdateManager() {
   const dialogRequested = useAppUpdateStore((s) => s.dialogRequested);
   const startDownload = useAppUpdateStore((s) => s.startDownload);
   const install = useAppUpdateStore((s) => s.install);
+  const manualInstallAvailable = useAppUpdateStore((s) => s.manualInstallAvailable);
+  const openInstallerManually = useAppUpdateStore((s) => s.openInstallerManually);
   const postpone = useAppUpdateStore((s) => s.postpone);
   const closeDialog = useAppUpdateStore((s) => s.closeDialog);
   const applyProgress = useAppUpdateStore((s) => s.applyProgress);
@@ -72,6 +74,7 @@ export function AppUpdateManager() {
       electronAPI?: {
         onUpdateAvailable?: (cb: (raw: unknown) => void) => void;
         onUpdateProgress?: (cb: (raw: unknown) => void) => () => void;
+        onUpdateInstallFailed?: (cb: (raw: { error: string }) => void) => void;
         sendNotification?: (title: string, body: string) => void;
       };
       Capacitor?: { Plugins?: Record<string, CapacitorAppPlugin | undefined> };
@@ -79,6 +82,13 @@ export function AppUpdateManager() {
 
     // Pushed updates from device-telemetry check-ins (desktop).
     const unsubProgress = w.electronAPI?.onUpdateProgress?.((raw) => applyProgress(raw as Parameters<typeof applyProgress>[0]));
+    // 0.6.30 install fix — the NSIS launcher failed on every leg; the app did
+    // NOT quit. Tell the user + arm the manual "open installer" fallback.
+    if (w.electronAPI?.onUpdateInstallFailed) {
+      w.electronAPI.onUpdateInstallFailed(() => {
+        toast.error(t('updateInstallFailedManual'), { duration: 9000 });
+      });
+    }
     if (w.electronAPI?.onUpdateAvailable) {
       w.electronAPI.onUpdateAvailable((raw) => {
         void ingestPushPayload((raw ?? {}) as Parameters<typeof ingestPushPayload>[0]);
@@ -165,7 +175,12 @@ export function AppUpdateManager() {
   }
 
   const message = pickMessage();
-  const size = formatSize(info.fileSize);
+  // DELTA (0.6.30): when a differential chain is offered, the honest download
+  // size is the PATCH total (often 10-30× smaller than the installer).
+  const size = formatSize(info.delta && info.delta.totalSize > 0 ? info.delta.totalSize : info.fileSize);
+  // COMPATIBILITY MAP (0.6.31): features that will NOT work until this update
+  // lands — rendered under the dialog so the user knows WHY the update matters.
+  const blockedFeatures = (info.compat?.blockedFeatures ?? []).filter((g) => g.severity !== 'server');
 
   // ─── MANDATORY UPDATE — full-screen blocking gate ─────────────────────────
   if (mandatory) {
@@ -264,6 +279,19 @@ export function AppUpdateManager() {
           <p className="text-sm text-muted-foreground">{t('updateOptionalMessage')}</p>
         )}
         {size ? <p className="text-xs text-muted-foreground" dir="ltr">{t('updateFileSize').replace('{size}', size)}</p> : null}
+        {blockedFeatures.length > 0 && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 max-h-36 overflow-y-auto" role="note">
+            <p className="text-xs font-semibold text-amber-700 dark:text-amber-300 mb-1">{t('compatBlockedTitle')}</p>
+            <ul className="text-xs text-amber-700/90 dark:text-amber-300/90 space-y-1">
+              {blockedFeatures.map((g) => (
+                <li key={g.feature}>
+                  <span className="font-medium">{(lang === 'ar' && g.descriptionAr) || (lang === 'fr' && g.descriptionFr) || g.description || g.feature}</span>
+                  <span className="opacity-70" dir="ltr"> (≥ {g.minAppVersion})</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {status === 'downloading' && (
           <div>
@@ -283,6 +311,15 @@ export function AppUpdateManager() {
         )}
         {needsInstallPermission && (
           <p className="text-xs text-amber-600 dark:text-amber-400">{t('updateAllowInstallPermission')}</p>
+        )}
+        {manualInstallAvailable && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300 space-y-2">
+            <p>{t('updateInstallFailedManual')}</p>
+            <Button variant="outline" size="sm" onClick={() => void openInstallerManually()} className="gap-2 w-full">
+              <FolderOpen className="h-4 w-4" />
+              {t('updateOpenInstaller')}
+            </Button>
+          </div>
         )}
 
         <DialogFooter className="flex-col gap-2 sm:flex-row">
@@ -339,6 +376,9 @@ export async function runManualUpdateCheck(lang: 'ar' | 'en' | 'fr'): Promise<vo
     useAppUpdateStore.getState().requestDialog();
   } else if (result === 'failed') {
     toast.error(t('updateCheckFailedToast', lang));
+  } else if (result === 'server-only') {
+    // COMPATIBILITY MAP (0.6.31): the newest release only changed the server.
+    toast.info(t('updateServerOnlyToast', lang), { duration: 7000 });
   } else {
     toast.success(t('updateUpToDate', lang));
   }

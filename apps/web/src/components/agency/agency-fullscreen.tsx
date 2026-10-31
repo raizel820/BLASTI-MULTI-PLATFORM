@@ -561,6 +561,9 @@ export function AgencyFullscreen() {
   // (expired heartbeat, forced takeover, released elsewhere): drop the local
   // control state and return the console to the claim screen. The interval is
   // cleared on unmount / release / loss via the effect teardown.
+  // r24: an OPEN app IS active — the beat fires immediately on claim/restore
+  // and on every return to the foreground (browsers throttle hidden-tab
+  // timers), so an idle-but-running account can never drift past the lease TTL.
   useEffect(() => {
     if (!selectedCounterId) return;
     let stopped = false;
@@ -576,8 +579,17 @@ export function AgencyFullscreen() {
         }
       } catch { /* transient — the next beat retries */ }
     };
+    void beat(); // instant renewal on claim / tab restore — no 60s dead zone
     const id = setInterval(beat, 60_000);
-    return () => { stopped = true; clearInterval(id); };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible' && !stopped) void beat();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      stopped = true;
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [selectedCounterId, releaseLocalControl, fetchCounters, t]);
 
   // request-control countdown card — driven by the server's expiresAt. When
@@ -834,7 +846,10 @@ export function AgencyFullscreen() {
         const req = controlRequestRef.current;
         if (d.userId === myUserId || (req && d.requestId === req.requestId)) {
           setControlRequest(null);
-          toast.info(t('counterControlExpired'));
+          // r24: HOLDER_ACTIVE means the current holder's app is open and
+          // running — control was deliberately NOT taken from a live account.
+          if (d.reason === 'HOLDER_ACTIVE') toast.info(t('counterControlHolderActive'));
+          else toast.info(t('counterControlExpired'));
         }
       }),
       realtime.onCounterLost((event) => {

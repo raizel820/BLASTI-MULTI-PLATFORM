@@ -60,6 +60,7 @@ const API_VERSION = (
 
 import { authRoutes } from './routes/auth'
 import { agencyRoutes } from './routes/agency'
+import { lanTopologyRoutes } from './routes/lan-topology'
 import { adminRoutes } from './routes/admin'
 import { agenciesRoutes } from './routes/agencies'
 import { reservationsRoutes } from './routes/reservations'
@@ -718,6 +719,10 @@ app.route('/api/reconciliation', reconciliationRoutes)
 app.route('/api/offline-sync', offlineSyncRoutes)
 app.route('/api/qr-claim', qrClaimRoutes)
 app.route('/api/agency-devices', agencyDeviceRoutes)
+// r21-9 — branch LAN topology: desktop status reports + owner Master-PC pin
+// (consumed by the Owner Device Manager "Branch LAN & Master PC" panel and
+// by the desktops' preferred-master poller).
+app.route('/api/lan-topology', lanTopologyRoutes)
 // Task 42-b — user-created agency fields/industries (global dictionary).
 app.route('/api/agency-categories', agencyCategoriesRoutes)
 app.route('/api/app-versions', appVersionRoutes)
