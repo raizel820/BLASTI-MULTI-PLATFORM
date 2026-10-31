@@ -60,23 +60,11 @@ const wilayaField = z
  *   • relative upload path  /api/upload/file/<bucket>/...   (canonical)
  *   • absolute http(s) URL                                   (legacy rows,
  *                                                            external CDNs)
- *
- * FIELD REPORT (0.6.35, "this URL is invalid" when picking a PRESET avatar
- * at account creation): the Task 2-c refine accidentally REGRESSED the
- * ready-made preset avatars — PRESET_AVATARS (Task 24) are compact SVG
- * data URIs stored DIRECTLY in avatarUrl (`data:image/svg+xml,<encoded>`,
- * ≈1.8KB), and the pre-2-c `z.string().url()` happily accepted data: URIs
- * while this refine rejected them. Accept image data URIs too, with a size
- * cap (presets are ~1.8KB; 8KB guards the DB row + the JWT payload).
  */
 export const uploadFileUrlSchema = z
   .string()
   .refine(
-    (v) =>
-      v === '' ||
-      v.startsWith('/api/upload/file/') ||
-      /^https?:\/\//i.test(v) ||
-      (/^data:image\/(png|jpe?g|gif|webp|svg\+xml)[;,]/i.test(v) && v.length <= 8192),
+    (v) => v === '' || v.startsWith('/api/upload/file/') || /^https?:\/\//i.test(v),
     'Invalid file URL',
   );
 

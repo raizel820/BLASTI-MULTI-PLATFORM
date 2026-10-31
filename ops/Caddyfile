@@ -8,7 +8,7 @@
 # Works in BOTH deployment architectures (see DEPLOY-GUIDE.md):
 #   • Docker stack (ops/docker-compose.yml): the docker-compose
 #     `api`/`web` service names are used as-is.
-#   • Native VPS stack (deploy-digitalocean.sh server-install):
+#   • Native VPS stack (deploy-oracle-vps.sh install):
 #     the installer rewrites api:3003 / web:3000 → 127.0.0.1:3003 /
 #     127.0.0.1:3000 and bakes SITE_ADDRESS into /etc/caddy/Caddyfile.
 #

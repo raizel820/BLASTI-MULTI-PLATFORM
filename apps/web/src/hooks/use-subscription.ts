@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { apiClient } from '@/lib/api-client';
-import { useRealtime } from '@/hooks/use-realtime';
 
 /**
  * Subscription gating helper (Task 31, bug 5) — the client-side single source
@@ -46,11 +45,6 @@ export interface UseSubscriptionActiveResult {
 export function useSubscriptionActive(agencyId?: string | null): UseSubscriptionActiveResult {
   const [status, setStatus] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  // R-36: settlement events refresh the gate — the Chargily fulfillment flips
-  // subscriptionStatus on the cloud (desktop: relayed through the local
-  // socket after the sync pull commits), so a payment completed while the
-  // gated view is open unlocks it immediately instead of on remount.
-  const { onPaymentCompleted, onPaymentFailed } = useRealtime();
 
   const fetchStatus = useCallback(async () => {
     setLoading(true);
@@ -74,15 +68,6 @@ export function useSubscriptionActive(agencyId?: string | null): UseSubscription
   useEffect(() => {
     fetchStatus();
   }, [fetchStatus]);
-
-  useEffect(() => {
-    const offCompleted = onPaymentCompleted(() => { void fetchStatus(); });
-    const offFailed = onPaymentFailed(() => { void fetchStatus(); });
-    return () => {
-      offCompleted();
-      offFailed();
-    };
-  }, [onPaymentCompleted, onPaymentFailed, fetchStatus]);
 
   return { status, isActive: isSubscriptionActive(status), loading };
 }

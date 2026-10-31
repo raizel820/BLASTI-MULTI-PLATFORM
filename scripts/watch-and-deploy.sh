@@ -8,14 +8,14 @@
 # MODES
 #   A) Watch FROM YOUR MACHINE - tell the VPS to pull from GitHub:
 #        ./scripts/watch-and-deploy.sh watch root@VPS_IP [--domain d.tld]
-#      Every new commit runs scripts/deploy-digitalocean.sh update
+#      Every new commit runs scripts/deploy-oracle-vps.sh server-update
 #      (one ssh call -> server-update: git pull + rebuild + restart),
 #      identical to a manual update. No upload, no GitHub credentials
 #      needed on your machine (the repo is public).
 #
 #   B) Watch ON THE VPS (recommended for always-on auto-deploy):
 #      The VPS clone is updated with git, then rebuilt in place.
-#      deploy-digitalocean.sh server-install / server-update arm this
+#      deploy-oracle-vps.sh server-install / server-update arm this
 #      automatically as a systemd timer (blasti-watcher.timer) that
 #      checks GitHub every 2 minutes - no cron needed:
 #        systemctl status  blasti-watcher.timer
@@ -36,7 +36,7 @@
 #   --force           Deploy even when the SHA did not change
 #   --dir PATH        (VPS mode) server-side clone location (default /opt/blasti)
 #   --port N          (upload mode) ssh port (default 22)
-#   --domain D        (upload mode) passed through to deploy-digitalocean.sh
+#   --domain D        (upload mode) passed through to deploy-oracle-vps.sh
 #
 # PRIVATE REPOS: mode B (on the VPS) needs read credentials on the VPS
 # (export GITHUB_TOKEN before the first clone, or use a deploy key).
@@ -57,7 +57,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DEFAULT="https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git"
 RETRY_AFTER_SEC="${BLASTI_WATCH_RETRY_SEC:-1800}" # wait 30 min after a failed deploy
-UPDATE_LOCK="${BLASTI_WATCH_UPDATE_LOCK:-/run/lock/blasti-update.lock}" # shared with deploy-digitalocean.sh
+UPDATE_LOCK="${BLASTI_WATCH_UPDATE_LOCK:-/run/lock/blasti-update.lock}" # shared with deploy-oracle-vps.sh
 
 # ----------------------------------------------------------------
 # Heartbeat: report every check / deploy to the cloud API so the
@@ -98,7 +98,7 @@ heartbeat() { # heartbeat <kind> <status> <commit> <message> [extra_json]
   case "$code" in
     200 | 201 | 204) : ;;
     401) log "heartbeat REJECTED (HTTP 401) — the server did not accept this DEPLOY_TOKEN; Public Apps Settings stays 'no data'. Check that DEPLOY_TOKEN in /etc/blasti/blasti.env is the same secret the watcher (and GitHub Actions BLASTI_DEPLOY_TOKEN) use." ;;
-    404) log "heartbeat endpoint missing (HTTP 404) — the server API predates deploy heartbeats; run: bash scripts/deploy-digitalocean.sh server-update" ;;
+    404) log "heartbeat endpoint missing (HTTP 404) — the server API predates deploy heartbeats; run: bash scripts/deploy-oracle-vps.sh server-update" ;;
     unreachable) log "heartbeat unreachable at $HB_URL (connection failed) — is blasti-api running?" ;;
     *) log "heartbeat failed (HTTP $code)" ;;
   esac
@@ -297,7 +297,7 @@ deploy_now() { # deploy_now <sha> -> 0 ok | 1 failed | 2 skipped (lock busy)
   local sha="$1"
   if [ "$ON_SERVER" -eq 1 ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
-      log "dry-run: would run: git -C $DIR fetch+reset to $sha && deploy-digitalocean.sh server-update"
+      log "dry-run: would run: git -C $DIR fetch+reset to $sha && deploy-oracle-vps.sh server-update"
       return 0
     fi
     # never race a manual install/update (same lock the deploy script holds)
@@ -314,7 +314,7 @@ deploy_now() { # deploy_now <sha> -> 0 ok | 1 failed | 2 skipped (lock busy)
     git -C "$DIR" reset --hard "FETCH_HEAD" >/dev/null || return 1
     flock -u 8 2>/dev/null || true # release: server-update takes the lock itself
     log "code updated to $sha - rebuilding + restarting services (secrets untouched)"
-    if ( cd "$DIR" && bash scripts/deploy-digitalocean.sh server-update ${DOMAIN:+--domain "$DOMAIN"} ); then
+    if ( cd "$DIR" && bash scripts/deploy-oracle-vps.sh server-update ${DOMAIN:+--domain "$DOMAIN"} ); then
       printf '%s' "$sha" > "$base.sha" 2>/dev/null || true
       rm -f "$base.fail" 2>/dev/null || true
       return 0
@@ -323,10 +323,13 @@ deploy_now() { # deploy_now <sha> -> 0 ok | 1 failed | 2 skipped (lock busy)
     return 1
   else
     if [ "$DRY_RUN" -eq 1 ]; then
-      log "dry-run: would run: deploy-digitalocean.sh update $TARGET (ssh -> server-update)"
+      log "dry-run: would deploy over ssh — remote ssh deploys were removed with the DigitalOcean pipeline"
       return 0
     fi
-    "$SCRIPT_DIR/deploy-digitalocean.sh" update "$TARGET" --port "$PORT" ${DOMAIN:+--domain "$DOMAIN"} || return 1
+    die "remote ssh deploys were removed with the DigitalOcean pipeline —
+         ssh into the VPS yourself and run:
+           sudo bash /opt/blasti/scripts/deploy-oracle-vps.sh update
+         (or simply push to GitHub: the on-VPS auto-updater deploys within ~2 minutes)"
   fi
 }
 

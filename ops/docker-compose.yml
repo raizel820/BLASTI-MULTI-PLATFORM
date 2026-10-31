@@ -62,6 +62,10 @@ services:
       NODE_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER:-blasti}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-blasti}?schema=public
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?Set NEXTAUTH_SECRET in ops/.env}
+      # LAST-resort public origin for payment return URLs (resolveBaseUrl).
+      # Defaults to the production domain so a missing Origin header can
+      # never redirect the Chargily hosted page to localhost.
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-https://blastidz.online}
       INTERNAL_SECRET: ${INTERNAL_SECRET:-}
       CORS_ORIGIN: ${CORS_ORIGIN}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS}

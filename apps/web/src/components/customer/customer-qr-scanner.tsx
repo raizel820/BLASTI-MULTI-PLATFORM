@@ -185,7 +185,7 @@ export function CustomerQrScanner({ open, onOpenChange, onAgencyFound }: Custome
       }
 
       // ─── Parse QR code data - extract agency code ───
-      // Supports URLs like: https://blasti.dz/?code=CLINIC01
+      // Supports URLs like: https://blastidz.online/?code=CLINIC01
       // Supports legacy: "QW:CLINIC01", or plain "CLINIC01"
       let agencyCode = rawQrData;
       

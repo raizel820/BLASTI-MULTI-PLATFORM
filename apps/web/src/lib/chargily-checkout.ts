@@ -19,9 +19,7 @@ import { getCloudApiBaseUrl } from '@/lib/api-client';
 export const PENDING_CHECKOUT_KEY = 'blasti-pending-checkout';
 
 /** Custom-scheme deep link the Capacitor Android shell registers (see
- *  AndroidManifest.xml BROWSABLE intent-filter + payment-deep-link.ts) AND
- *  the Electron desktop shell registers via app.setAsDefaultProtocolClient
- *  (main.js) — the same `blasti://payment/result` target for both apps. */
+ *  AndroidManifest.xml BROWSABLE intent-filter + payment-deep-link.ts). */
 const MOBILE_DEEP_LINK = 'blasti://payment/result';
 
 export interface PendingCheckout {
@@ -112,21 +110,6 @@ function isCapacitorShell(): boolean {
 }
 
 /**
- * True inside the Electron desktop shell. The desktop registers the
- * `blasti://` protocol handler (main.js setAsDefaultProtocolClient) and
- * forwards deep links to the SPA through preload's onDeepLink — so, exactly
- * like the phone, a payment started in the desktop app can bounce the
- * payer's browser straight back into the desktop app.
- */
-function isElectronShell(): boolean {
-  try {
-    return typeof window !== 'undefined' && !!(window as unknown as { electronAPI?: unknown }).electronAPI;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Resolve the return hints sent with create-checkout:
  *   - `returnUrl` — the PUBLIC web origin the hosted gateway should send the
  *     payer back to. On a regular browser this is simply the SPA origin.
@@ -134,13 +117,11 @@ function isElectronShell(): boolean {
  *     Electron loading the bundled SPA = `http://127.0.0.1:3080`) the page
  *     origin is device-local, so the CLOUD origin this shell already talks
  *     to (the same domain serves the SPA) is used instead.
- *   - `deepLink` — Capacitor AND Electron: the `blasti://payment/result`
- *     scheme both apps register. The API appends it (encoded) to the success
- *     and failure URLs; when the payer's browser lands on the result page it
- *     immediately bounces back into the app that started the payment
- *     (payment-deep-link.ts routes it on the phone; the desktop routes the
- *     same URL through its deep-link IPC). Regular-browser callers just
- *     render the result page where they are.
+ *   - `deepLink` — Capacitor only: the `blasti://payment/result` scheme the
+ *     Android app registers. The API appends it (encoded) to the success and
+ *     failure URLs; when the payer's browser lands on the result page it
+ *     immediately bounces into the app, which routes to the in-app payment
+ *     result (payment-deep-link.ts).
  *
  * An explicit returnUrl from the caller always wins (payload spread below).
  */
@@ -169,11 +150,9 @@ function computeReturnHints(): { returnUrl?: string; deepLink?: string } {
     }
   }
 
-  // R-36 fix — "the Chargily redirect goes to the webapp only": the deep-link
-  // bounce used to be Capacitor-only, so desktop payments never returned the
-  // user to the desktop app. Both native shells handle blasti:// — issue the
-  // bounce for each; plain browsers still get none (no handler registered).
-  const deepLink = (isCapacitorShell() || isElectronShell()) && returnUrl ? MOBILE_DEEP_LINK : undefined;
+  // The deep-link bounce only makes sense on Capacitor (blasti:// handler);
+  // Electron/browser callers just render the result page where they are.
+  const deepLink = isCapacitorShell() && returnUrl ? MOBILE_DEEP_LINK : undefined;
   return { returnUrl, deepLink };
 }
 

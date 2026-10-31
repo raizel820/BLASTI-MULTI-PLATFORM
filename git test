@@ -1,5 +1,8 @@
-bash /opt/blasti/scripts/deploy-digitalocean.sh server-update
-bash /opt/blasti/scripts/deploy-digitalocean.sh server-doctor
+ssh -i "$env:USERPROFILE\Downloads\VPS SSH\ssh-key-2026-10-09.key" ubuntu@129.151.242.219
+
+bash /opt/blasti/scripts/deploy-oracle-vps.sh update
+bash /opt/blasti/scripts/deploy-oracle-vps.sh doctor
+
 
 NEXT_PUBLIC_API_URL=http://129.151.242.219 
 

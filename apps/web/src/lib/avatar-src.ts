@@ -7,7 +7,8 @@
  *   Uploaded files are served from the cloud API as PUBLIC capability URLs
  *   (GET /api/upload/file/... needs no auth), so a plain <img> tag should
  *   just work. On the Capacitor phone the URL is rebased by getProxiedUrl()
- *   onto the baked cloud base (http://129.151.242.219) and loaded from a
+ *   onto the baked cloud base (https://blastidz.online — legacy installs may
+ *   still carry http://129.151.242.219) and loaded from a
  *   https://localhost WebView — a cross-origin CLEARTEXT image. Whether that
  *   renders depends on WebView policy layers (NSC cleartext exception,
  *   mixed-content mode, image cache state) that we cannot fully control from

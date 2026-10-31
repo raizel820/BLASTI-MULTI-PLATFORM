@@ -493,8 +493,8 @@ export function AdminVpsStatus() {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {isRTL
-                ? 'يشغّل نفس ما يشغّله المشرف عبر SSH: ‏deploy-digitalocean.sh server-update (سحب الإصدار الجديد ← bun install ← db push ← بناء الويب ← إعادة تشغيل blasti-api و blasti-web و caddy) ثم تقرير server-doctor. يعمل في وحدة systemd مستقلة (blasti-rebuild) فلا تُوقفه إعادة تشغيل الـ API أثناء النشر.'
-                : 'Runs exactly what an admin runs over ssh: deploy-digitalocean.sh server-update (git pull → bun install → db push → web build → restart blasti-api + blasti-web + caddy) followed by a server-doctor health report. It runs in its own systemd unit (blasti-rebuild), so the mid-deploy API restart cannot kill it.'}
+                ? 'يشغّل نفس ما يشغّله المشرف عبر SSH: ‏deploy-oracle-vps.sh server-update (سحب الإصدار الجديد ← bun install ← db push ← بناء الويب ← إعادة تشغيل blasti-api و blasti-web و caddy) ثم تقرير server-doctor. يعمل في وحدة systemd مستقلة (blasti-rebuild) فلا تُوقفه إعادة تشغيل الـ API أثناء النشر.'
+                : 'Runs exactly what an admin runs over ssh: deploy-oracle-vps.sh server-update (git pull → bun install → db push → web build → restart blasti-api + blasti-web + caddy) followed by a server-doctor health report. It runs in its own systemd unit (blasti-rebuild), so the mid-deploy API restart cannot kill it.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

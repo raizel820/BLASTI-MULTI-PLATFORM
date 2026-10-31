@@ -821,19 +821,6 @@ public class BlastiNativeStatus extends Plugin {
             }
             Log.i(TAG, "[delta] base apk: " + baseApkPath + " (" + baseApk.length() + " bytes)");
 
-            // 0) ANCHOR GATE — hop #1 was diffed against one EXACT previous
-            // APK. If the installed base does not match its sha256 (rebuilt,
-            // repacked, or another build of the same version), applying the
-            // chain would only fail at the final gate AFTER all downloads —
-            // reject now so the web layer falls back to the full APK at once.
-            String baseAnchor = "";
-            try { baseAnchor = deltas.getJSONObject(0).optString("fromArtifactHash", ""); } catch (Throwable ignored) { }
-            if (!baseAnchor.isEmpty() && !sha256Matches(baseApk, baseAnchor)) {
-                Log.w(TAG, "[delta] base apk sha256 does not match the delta anchor — full installer required");
-                call.reject("delta-anchor-mismatch", "installed base apk differs from the delta base");
-                return;
-            }
-
             java.io.File cacheDir = new java.io.File(getContext().getCacheDir(), "delta-updates");
             if (!cacheDir.exists()) cacheDir.mkdirs();
             java.io.File current = baseApk;
@@ -855,7 +842,7 @@ public class BlastiNativeStatus extends Plugin {
                     call.reject("delta-download-failed", "hop " + i + ": " + t.getMessage());
                     return;
                 }
-                if (!sha256.isEmpty() && !sha256Matches(patch, sha256)) {
+                if (!sha.isEmpty() && !sha256Matches(patch, sha)) {
                     patch.delete();
                     call.reject("delta-verify-failed", "hop " + i + " (" + fromV + "→" + toV + "): patch sha256 mismatch");
                     return;

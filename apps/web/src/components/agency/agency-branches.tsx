@@ -1011,10 +1011,10 @@ export function AgencyBranches() {
     }
     let cancelled = false;
     setQrLoading(true);
-    const origin = typeof window !== 'undefined' ? window.location.origin : 'https://blasti.dz';
+    const origin = typeof window !== 'undefined' ? window.location.origin : 'https://blastidz.online';
     const payload = qrBranch.subCode
       ? `${origin}/?branch=${encodeURIComponent(qrBranch.subCode)}`
-      : 'https://blasti.dz';
+      : 'https://blastidz.online';
     QRCode.toString(payload, {
       type: 'svg',
       width: 256,

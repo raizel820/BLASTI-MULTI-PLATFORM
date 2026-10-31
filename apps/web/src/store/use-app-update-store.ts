@@ -162,8 +162,6 @@ interface CheckResponse {
   fileSize?: number;
   fileHash?: string;
   delta?: DeltaManifest | null;
-  /** 0.6.36 — why no delta was offered (diagnostic only; absent when one was). */
-  deltaUnavailable?: { reason: string; edges?: number; hopBases?: string[] } | null;
   /** 0.6.31 — API compatibility map evaluation (absent on older servers). */
   compat?: CompatEvaluation | null;
 }
@@ -219,7 +217,7 @@ interface CapacitorGlobal {
      * for install. Returns { ok, apkPath? } or { ok:false, error }.
      */
     installDeltaUpdate?: (opts: {
-      deltas: Array<{ url: string; sha256: string; fromVersion: string; toVersion: string; fromArtifactHash?: string }>;
+      deltas: Array<{ url: string; sha256: string; fromVersion: string; toVersion: string }>;
       finalSha256: string;
       fromVersion: string;
       toVersion: string;
@@ -605,7 +603,7 @@ function createAppUpdateStore() {
           // up WITHOUT a DownloadManager id).
           if (info.delta && info.delta.hops.length > 0 && plugin()?.installDeltaUpdate) {
             const result = await plugin()?.installDeltaUpdate({
-              deltas: info.delta.hops.map((h) => ({ url: buildCloudUrl(h.url), sha256: h.sha256, fromVersion: h.fromVersion, toVersion: h.toVersion, fromArtifactHash: h.fromArtifactHash || '' })),
+              deltas: info.delta.hops.map((h) => ({ url: buildCloudUrl(h.url), sha256: h.sha256, fromVersion: h.fromVersion, toVersion: h.toVersion })),
               finalSha256: info.delta.targetApkSha256 || '',
               fromVersion: info.currentVersion,
               toVersion: info.version,

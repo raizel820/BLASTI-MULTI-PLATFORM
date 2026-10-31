@@ -379,7 +379,7 @@ export function AdminDeployStatus() {
             <div className="text-[11px] text-muted-foreground space-y-1">
               <p>
                 <code className="bg-muted px-1.5 py-0.5 rounded font-mono text-[10px]">
-                  bash scripts/deploy-digitalocean.sh server-watch-status
+                  bash scripts/deploy-oracle-vps.sh watch-status
                 </code>{' '}
                 — {isRTL ? 'تقرير كامل عن المراقب والنشر' : 'full watcher + deploy report'}
               </p>
@@ -394,7 +394,7 @@ export function AdminDeployStatus() {
               </p>
               <p>
                 <code className="bg-muted px-1.5 py-0.5 rounded font-mono text-[10px]">
-                  bash scripts/deploy-digitalocean.sh server-watch-disable
+                  bash scripts/deploy-oracle-vps.sh watch-disable
                 </code>{' '}
                 — {isRTL ? 'إيقاف النشر التلقائي' : 'turn auto-deploy off'}
               </p>

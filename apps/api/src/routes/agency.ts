@@ -3333,11 +3333,11 @@ app.get('/qr-code', async (c) => {
           404
         )
       }
-      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz'
+      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online'
       qrData = `${baseUrl}/?branch=${branch.subCode}`
     } else {
       // Encode as a URL so phone scanners can open it as a clickable link
-      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz'
+      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online'
       qrData = `${baseUrl}/?code=${code}`
     }
 

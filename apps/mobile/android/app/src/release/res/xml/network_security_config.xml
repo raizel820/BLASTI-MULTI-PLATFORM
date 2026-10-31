@@ -8,19 +8,19 @@
   permissive debug config at src/main/res/xml/network_security_config.xml.
 
   Task 70 (phone audit): release builds previously forbade ALL cleartext
-  traffic — correct once the server serves HTTPS, but today the production
-  VPS is plain HTTP behind Caddy on port 80 (no domain/TLS yet), so every
-  release APK failed with net::ERR_CLEARTEXT_NOT_PERMITTED while the debug
-  APK (permissive main config) worked. allowMixedContent in
+  traffic — correct once the server serves HTTPS, but until the domain+TLS
+  migration the production VPS was plain HTTP behind Caddy on port 80, so
+  every release APK failed with net::ERR_CLEARTEXT_NOT_PERMITTED while the
+  debug APK (permissive main config) worked. allowMixedContent in
   capacitor.config.ts CANNOT grant this — cleartext is enforced by the
   network stack, not the WebView.
 
-  Current policy:
-    - HTTPS everywhere by default, system CAs only (unchanged).
-    - ONE narrow, temporary exception: the known cloud VPS IP is allowed to
-      serve cleartext HTTP until a domain + TLS are provisioned. Remove this
-      domain-config block as soon as https:// is live on the server
-      (see DEPLOY-GUIDE.md Part 8, the domain setup section).
+  Current policy (HTTPS-ONLY, 0.6.36):
+    - HTTPS everywhere, system CAs only. New builds are locked to
+      https://blastidz.online (Let's Encrypt on the VPS).
+    - The temporary cleartext exception for the raw cloud VPS IP has been
+      REMOVED — the migration to the domain is complete, so release builds
+      now refuse cleartext to ANY host (mitm-safe).
     - The debug variant remains fully permissive (separate file).
 -->
 <network-security-config>
@@ -29,9 +29,4 @@
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-
-    <!-- TEMPORARY until the VPS serves HTTPS: allow the cloud server IP. -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">129.151.242.219</domain>
-    </domain-config>
 </network-security-config>

@@ -1067,7 +1067,7 @@ app.get('/:id/share', async (c) => {
       serviceNameFr: reservation.service.nameFr,
       position,
       estimatedWait,
-      queueUrl: process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz',
+      queueUrl: process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online',
     })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -1127,7 +1127,7 @@ app.post('/:id/share', async (c) => {
       serviceNameFr: reservation.service.nameFr,
       position,
       estimatedWait,
-      queueUrl: process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz',
+      queueUrl: process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online',
     })
   } catch (error: unknown) {
     const err = authErrorResponse(error)

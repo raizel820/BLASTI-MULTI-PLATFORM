@@ -1,6 +1,5 @@
 /**
- * blasti:// deep-link routing for the native shells (0.6.24 Capacitor, R-36
- * Electron desktop).
+ * blasti:// deep-link routing for the Capacitor mobile shell (0.6.24).
  *
  * The Android manifest registers a BROWSABLE `blasti://` intent-filter and
  * the Chargily hosted checkout appends the `blasti://payment/result` deep
@@ -16,13 +15,6 @@
  *      `App.addListener('appUrlOpen')` (app already alive) or
  *      `App.getLaunchUrl()` (cold start) → route the SPA to the in-app
  *      payment-result view so the settlement poll can run.
- *
- * The Electron desktop shell mirrors this end-to-end (R-36 — "the Chargily
- * redirect goes to the webapp only"): main.js registers the SAME `blasti://`
- * protocol (setAsDefaultProtocolClient) and forwards the URL to the renderer
- * through preload's `onDeepLink` IPC (second-instance on Windows, open-url
- * on macOS). This module subscribes to that bridge and routes the identical
- * `blasti://payment/result` URL to the same in-app result view.
  *
  * Uses the same `(window as any).Capacitor` bridge pattern as
  * mobile-back-button.tsx — @capacitor/app is a dependency of the mobile
@@ -67,31 +59,10 @@ export function routePaymentDeepLink(rawUrl: string): boolean {
 
 /**
  * Register the native listeners. Safe to call on ANY platform — it no-ops
- * outside the native shells. Returns an unregister function.
+ * outside the Capacitor shell. Returns an unregister function.
  */
 export function initPaymentDeepLinkRouting(): () => void {
   if (typeof window === 'undefined') return () => undefined;
-  const unregisters: Array<() => void> = [];
-
-  // ── Electron desktop (blasti:// → second-instance/open-url → IPC) ────────
-  // R-36: the SPA never consumed preload's onDeepLink bridge, so even when
-  // the OS handed the payment deep link to the desktop app, nothing routed
-  // it. Wire it here — same routing as the phone.
-  try {
-    const electron = (window as unknown as {
-      electronAPI?: { onDeepLink?: (cb: (url: string) => void) => void };
-    }).electronAPI;
-    if (electron && typeof electron.onDeepLink === 'function') {
-      electron.onDeepLink((url) => {
-        if (url) routePaymentDeepLink(url);
-      });
-      // The bridge has no unsubscribe contract (ipcRenderer.on only) — the
-      // listener lives for the renderer's lifetime, which matches how the
-      // Capacitor subscription is used by page.tsx (registered once).
-      unregisters.push(() => undefined);
-    }
-  } catch { /* non-Electron — ignore */ }
-
   try {
     const cap = (window as unknown as {
       Capacitor?: {
@@ -104,9 +75,7 @@ export function initPaymentDeepLinkRouting(): () => void {
       };
     }).Capacitor;
     if (!cap || typeof cap.isNativePlatform !== 'function' || !cap.isNativePlatform()) {
-      return unregisters.length > 0
-        ? () => { for (const u of unregisters) { try { u(); } catch { /* ignore */ } } }
-        : () => undefined;
+      return () => undefined;
     }
     const App = (typeof cap.isPluginAvailable === 'function' ? cap.isPluginAvailable('App') : true)
       ? cap.Plugins?.['App']
@@ -137,7 +106,6 @@ export function initPaymentDeepLinkRouting(): () => void {
 
     return () => {
       try { unsubscribe?.(); } catch { /* ignore */ }
-      for (const u of unregisters) { try { u(); } catch { /* ignore */ } }
     };
   } catch {
     return () => undefined;

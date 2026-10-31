@@ -6,7 +6,7 @@
 #      12 GB RAM) or any Intel/AMD shape — running an UBUNTU 22.04 /
 #      24.04 image. A fresh instance needs NOTHING pre-installed.
 #
-# ARCHITECTURE (identical to the proven DigitalOcean pipeline):
+# ARCHITECTURE (the proven single-VPS pipeline):
 #
 #     Internet ──▶ Caddy  :80/:443   (native apt package, auto-HTTPS)
 #                    │
@@ -19,7 +19,7 @@
 #
 #     Code comes from GITHUB (this repo) — the VPS clones it itself.
 #
-# ORACLE-SPECIFIC (why this script exists next to deploy-digitalocean.sh):
+# ORACLE-SPECIFIC (the ONE deploy script — no DigitalOcean pipeline):
 #   • Oracle Ubuntu images ship REJECT-all iptables rules that block
 #     80/443 even with ufw "inactive" — this script inserts ACCEPT
 #     rules at the top of INPUT and persists them across reboots.
@@ -37,12 +37,15 @@
 #   ssh ubuntu@YOUR_ORACLE_IP
 #   curl -fsSL https://raw.githubusercontent.com/raizel820/BLASTI-MULTI-PLATFORM/master/scripts/deploy-oracle-vps.sh -o deploy-oracle-vps.sh
 #   sudo bash deploy-oracle-vps.sh                       # HTTP on the raw IP
-#   sudo bash deploy-oracle-vps.sh --domain blasti.dz    # + automatic HTTPS
+#   sudo bash deploy-oracle-vps.sh --domain blastidz.online    # + automatic HTTPS
 #
 # MODES
 #   install  (default)  First-time install on a fresh instance.
-#   update              Pull latest code + rebuild + restart.
-#   doctor              Full health report (one paste = full picture).
+#   update              Pull latest code + rebuild + restart (alias: server-update).
+#   doctor              Full health report (alias: server-doctor).
+#   watch-enable        Arm the GitHub auto-updater (alias: server-watch-install).
+#   watch-disable       Disarm it (alias: server-watch-disable).
+#   watch-status        Timer + pending commit + last deploys (server-watch-status).
 #   status              Quick services overview.
 #   logs [svc] [-f]     Show service logs (api | web | db | caddy).
 #   firewall            Re-apply the Oracle iptables fix + show the
@@ -50,6 +53,8 @@
 #
 # OPTIONS (install)
 #   --domain D   domain for automatic HTTPS (A-record must point here)
+#   --https-only serve ONLY https://D — close the legacy raw-IP cleartext door
+#                (update mode forwards it; install mode bakes a domain-only site)
 #   --ip IP      public IP override (default: OCI metadata → ifconfig.me)
 #   --repo URL   git repo (default: the BLASTI GitHub repo)
 #   --branch B   branch to track (default: master)
@@ -68,7 +73,7 @@ ok()   { printf '\033[1;32m[  ok  ]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[ warn ]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[FAIL  ]\033[0m %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '2,58p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,61p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || die "must run as root — Oracle's default user is 'ubuntu':
@@ -169,7 +174,7 @@ EOF
 }
 
 # --------------------------------------------------------------------
-# ON-VPS helpers (same contracts as deploy-digitalocean.sh)
+# ON-VPS helpers
 # --------------------------------------------------------------------
 env_set() { # env_set <file> <KEY> <value>
   local file="$1" key="$2" value="$3"
@@ -303,8 +308,8 @@ EOF
 }
 
 # GitHub auto-updater: systemd timer → repo's watch-and-deploy.sh →
-# deploy-digitalocean.sh server-update (git pull + rebuild + restart).
-# Same units the DigitalOcean pipeline uses — fully Oracle-compatible.
+# deploy-oracle-vps.sh server-update (git pull + rebuild + restart).
+# Fully self-contained in THIS script.
 install_auto_update_watcher() {
   local root="$1"
   if [ ! -f "$root/scripts/watch-and-deploy.sh" ]; then
@@ -387,13 +392,47 @@ EOF
 }
 
 # --------------------------------------------------------------------
+# watcher/CI shared token (DEPLOY_TOKEN in $ENV_FILE) — the shared
+# secret used by the GitHub watcher + CI to authenticate heartbeats
+# and installer uploads against the API. Older installs get it
+# automatically on the next server-update — never overwrites.
+# --------------------------------------------------------------------
+ensure_deploy_token() {
+  [ -f "$ENV_FILE" ] || return 0
+  if ! grep -q '^DEPLOY_TOKEN=' "$ENV_FILE" 2>/dev/null; then
+    printf '\n# Shared token: GitHub auto-updater heartbeats + CI installer uploads\nDEPLOY_TOKEN=%s\n' "$(openssl rand -hex 24)" >> "$ENV_FILE"
+    ok "DEPLOY_TOKEN added to $ENV_FILE (watcher/CI auth)"
+  fi
+}
+
+# --------------------------------------------------------------------
+# ON-VPS: report a deploy result to the API (deploy-status card in the
+# admin panel). Best-effort: if the API is down (failed deploy) the
+# POST is silently skipped.
+# --------------------------------------------------------------------
+post_deploy_heartbeat() { # <status:success|failure> <commit> <duration_sec> <message>
+  local status="$1" commit="$2" duration="$3" message="$4"
+  local api_url token
+  case "$duration" in '' | *[!0-9]*) duration=0 ;; esac
+  api_url="$(grep '^INTERNAL_API_URL=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  api_url="${api_url:-http://127.0.0.1:3003}"
+  token="$(grep '^DEPLOY_TOKEN=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  [ -n "$token" ] || return 0
+  curl -fsS -m 5 -X POST "$api_url/api/system/deploy-heartbeat" \
+    -H 'Content-Type: application/json' -H "x-deploy-token: $token" \
+    -d "{\"kind\":\"deploy-result\",\"status\":\"$status\",\"commit\":\"$commit\",\"durationSec\":$duration,\"message\":\"$message\"}" \
+    >/dev/null 2>&1 || true
+}
+
+# --------------------------------------------------------------------
 # MODE: install (default) — runs ON the VPS, as root
 # --------------------------------------------------------------------
 cmd_install() {
-  local DOMAIN="" REPO="$REPO_DEFAULT" BRANCH="$BRANCH_DEFAULT" DIR="$DIR_DEFAULT" TOKEN="" IP_OVERRIDE=""
+  local DOMAIN="" HTTPS_ONLY="" REPO="$REPO_DEFAULT" BRANCH="$BRANCH_DEFAULT" DIR="$DIR_DEFAULT" TOKEN="" IP_OVERRIDE=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --domain) DOMAIN="$2"; shift 2 ;;
+      --https-only) HTTPS_ONLY=1; shift ;;
       --ip)     IP_OVERRIDE="$2"; shift 2 ;;
       --repo)   REPO="$2";   shift 2 ;;
       --branch) BRANCH="$2"; shift 2 ;;
@@ -535,9 +574,19 @@ EOF
   fi
 
   # public address (CORS + Caddy site). --domain wins on every run.
+  # DOMAIN mode serves BOTH doors: https://DOMAIN (Let's Encrypt TLS) AND the
+  # raw IP over cleartext HTTP — installs still baked with http://IP (old APKs,
+  # desktop build-stamps) keep working until they migrate to the domain.
+  # --https-only completes the migration: domain-only, IP door closed.
   local SITE ORIGIN
   if [ -n "$DOMAIN" ]; then
-    SITE="https://$DOMAIN"; ORIGIN="https://$DOMAIN"
+    [ -n "$PUB_IP" ] || PUB_IP="$(curl -4 -s --max-time 6 https://ifconfig.me || hostname -I 2>/dev/null | awk '{print $1}')"
+    if [ -n "$PUB_IP" ] && [ -z "$HTTPS_ONLY" ]; then
+      SITE="https://$DOMAIN,http://$PUB_IP"; ORIGIN="https://$DOMAIN,http://$PUB_IP"
+    else
+      [ -n "$HTTPS_ONLY" ] && ok "https-only: the raw-IP cleartext door (http://$PUB_IP) stays CLOSED"
+      SITE="https://$DOMAIN"; ORIGIN="https://$DOMAIN"
+    fi
   else
     [ -n "$PUB_IP" ] || die "could not detect the public IP — pass --ip <PUBLIC_IP> or --domain"
     SITE=":80"; ORIGIN="http://$PUB_IP"
@@ -636,47 +685,271 @@ EOF
 }
 
 # --------------------------------------------------------------------
-# MODE: update — delegates to the repo's proven server-update
-# (git pull + bun install + migrate + build + restart + caddy re-render)
+# MODE: update (alias: server-update) — runs ON the VPS, as root.
+# git pull → bun install → schema → web build → (domain switch) →
+# systemd units → auto-updater → deploy token → Caddy re-render →
+# restart → health check → deploy heartbeat. Fully self-contained.
 # --------------------------------------------------------------------
 cmd_update() {
-  local DOMAIN="" DIR="$DIR_DEFAULT"
+  local DOMAIN="" HTTPS_ONLY="" DIR="$DIR_DEFAULT"
+  local deploy_started deployed_commit
+  deploy_started="$(date +%s)"
   while [ $# -gt 0 ]; do
     case "$1" in
       --domain) DOMAIN="$2"; shift 2 ;;
+      --https-only) HTTPS_ONLY=1; shift ;;
       --dir)    DIR="$2";    shift 2 ;;
       --help|-h) usage; exit 0 ;;
       *) die "update: unknown argument: $1 (try --help)" ;;
     esac
   done
   require_root "update"
-  [ -f "$DIR/scripts/deploy-digitalocean.sh" ] \
-    || die "no repo at $DIR — run install first (or pass --dir)"
-  local args=()
-  [ -n "$DOMAIN" ] && args+=(--domain "$DOMAIN")
-  exec bash "$DIR/scripts/deploy-digitalocean.sh" server-update "${args[@]}"
+  [ -d "$DIR/.git" ] || die "no git repo at $DIR — run install first (or pass --dir)"
+  [ -f "$ENV_FILE" ] || die "$ENV_FILE missing — run install first"
+  # serialize with the auto-updater / other manual runs — two builds at
+  # once would OOM a small instance
+  mkdir -p /run/lock
+  exec 8>/run/lock/blasti-update.lock
+  flock -n 8 || die "another install/update is already running (auto-updater busy?) — try again in a few minutes"
+
+  local branch
+  branch="$(git -C "$DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo master)"
+  [ "$branch" = "HEAD" ] && branch="master"
+  log "BLASTI server-update starting (branch: $branch)..."
+
+  # -- 1. latest code from GitHub (untracked files like uploads survive) ------
+  git -C "$DIR" fetch origin "$branch"
+  git -C "$DIR" reset --hard FETCH_HEAD
+  ok "code updated to $(git -C "$DIR" rev-parse --short HEAD)"
+  deployed_commit="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || echo "")"
+
+  # -- 2. dependencies + schema + build ----------------------------------------
+  ( cd "$DIR" && bun install )
+  migrate_db "$DIR"
+  build_web "$DIR"
+
+  # -- 3. optional domain switch (updates CORS + Caddy site) --------------------
+  # Default: serves BOTH doors — https://DOMAIN (TLS) AND the raw IP over
+  # cleartext HTTP so installs still baked with http://IP keep working during
+  # the migration. Pass --https-only to COMPLETE the migration: closes the IP
+  # door (Caddy keeps port 80 only for the ACME challenge + https redirect).
+  if [ -n "$DOMAIN" ]; then
+    local MIG_IP MIG_SITE
+    MIG_IP="$(detect_public_ip)"
+    [ -n "$MIG_IP" ] || MIG_IP="$(curl -4 -s --max-time 6 https://ifconfig.me || hostname -I 2>/dev/null | awk '{print $1}')"
+    MIG_SITE="https://$DOMAIN"
+    if [ -z "$HTTPS_ONLY" ]; then
+      [ -n "$MIG_IP" ] && MIG_SITE="https://$DOMAIN,http://$MIG_IP"
+    else
+      ok "https-only: the raw-IP cleartext door (http://$MIG_IP) stays CLOSED"
+    fi
+    env_set "$ENV_FILE" SITE_ADDRESS "$MIG_SITE"
+    env_set "$ENV_FILE" CORS_ORIGIN "$MIG_SITE"
+    env_set "$ENV_FILE" ALLOWED_ORIGINS "$MIG_SITE"
+    warn "domain set to $DOMAIN — make sure the DNS A-record points at this server"
+  fi
+
+  # -- 4. refresh systemd units (ships unit changes to existing installs) -------
+  write_systemd_units "$DIR"
+  systemctl daemon-reload
+
+  # -- 4b. keep the GitHub auto-updater armed + its unit fresh (idempotent) ------
+  install_auto_update_watcher "$DIR"
+
+  # -- 4c. watcher/CI shared token (idempotent; must exist BEFORE restart so
+  #        the API can authenticate heartbeats and CI installer uploads) --------
+  ensure_deploy_token
+
+  # -- 5. restart services + re-render Caddy (ships ops/Caddyfile changes) -------
+  local SITE
+  SITE="$(grep '^SITE_ADDRESS=' "$ENV_FILE" | cut -d= -f2- || true)"
+  [ -n "$SITE" ] || SITE=":80"
+  render_caddyfile "$DIR" "$SITE"
+  systemctl restart blasti-api.service blasti-web.service caddy
+  ok "services restarted (api, web, caddy)"
+
+  if wait_healthy; then
+    local PUB_IP ORIGIN_URL
+    PUB_IP="$(detect_public_ip)"
+    case "$SITE" in
+      https://*) ORIGIN_URL="${SITE%%,*}" ;;
+      *)         ORIGIN_URL="http://${PUB_IP:-<server-ip>}" ;;
+    esac
+    print_summary "$ORIGIN_URL" "${PUB_IP:-?}" "$DOMAIN"
+    post_deploy_heartbeat success "$deployed_commit" "$(( $(date +%s) - deploy_started ))" \
+      "server-update ok (git pull + rebuild + restart)"
+  else
+    warn "API not healthy after update. Diagnose with:"
+    warn "  bash $0 doctor    (or: bash $0 server-doctor)"
+    warn "  journalctl -u blasti-api -n 50 --no-pager && systemctl status blasti-api"
+    post_deploy_heartbeat failure "$deployed_commit" "$(( $(date +%s) - deploy_started ))" \
+      "server-update finished but API health check failed"
+    exit 1
+  fi
 }
 
 # --------------------------------------------------------------------
-# MODE: doctor — delegates to the repo's server-doctor (one-paste report)
+# MODE: doctor (alias: server-doctor) — one-paste health report.
+# Prints everything needed to diagnose a stuck deployment.
+# NEVER prints secret values from the env file — key names only.
 # --------------------------------------------------------------------
 cmd_doctor() {
-  require_root "doctor"
   local DIR="$DIR_DEFAULT"
-  [ $# -gt 0 ] && { case "$1" in --dir) DIR="$2" ;; *) die "doctor: unknown argument: $1" ;; esac; }
-  if [ -f "$DIR/scripts/deploy-digitalocean.sh" ]; then
-    exec bash "$DIR/scripts/deploy-digitalocean.sh" server-doctor
+  [ $# -gt 0 ] && { case "$1" in --dir) DIR="$2"; shift ;; *) die "doctor: unknown argument: $1" ;; esac; }
+  require_root "doctor"
+  echo "============================================================"
+  echo " BLASTI server-doctor report - $(date '+%F %T %Z')"
+  echo "============================================================"
+
+  echo; echo "── 1. code version ($DIR) ──────────────────────────"
+  if [ -d "$DIR/.git" ]; then
+    git -C "$DIR" fetch origin master >/dev/null 2>&1 || true
+    echo "local : $(git -C "$DIR" rev-parse --short HEAD 2>/dev/null) $(git -C "$DIR" log -1 --format=%s 2>/dev/null)"
+    echo "github: $(git -C "$DIR" rev-parse --short origin/master 2>/dev/null)"
+  else
+    echo "MISSING: no git repo at $DIR"
   fi
-  # pre-install fallback: basic report
-  echo "── services ──────────────────────────────────────────"
-  systemctl is-active blasti-api blasti-web caddy docker 2>/dev/null || true
-  echo "── blasti-db container ───────────────────────────────"
-  docker ps --filter name=blasti-db --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null || true
-  echo "── health (loopback) ─────────────────────────────────"
-  curl -fsS --max-time 4 http://127.0.0.1:3003/api/health 2>/dev/null || echo "API NOT HEALTHY (or not installed yet)"
+
+  echo; echo "── 2. services ────────────────────────────────────────"
+  for svc in blasti-api blasti-web caddy docker; do
+    printf '%-12s %s\n' "$svc" "$(systemctl is-active "$svc" 2>/dev/null)"
+  done
+  systemctl show blasti-api -p ExecMainStatus -p ExecMainStartTimestamp -p NRestarts 2>/dev/null
+  printf '%-12s %s/%s\n' "auto-update" \
+    "$(systemctl is-active blasti-watcher.timer 2>/dev/null || echo '?')" \
+    "$(systemctl is-enabled blasti-watcher.timer 2>/dev/null || echo '?')"
+  systemctl show blasti-watcher.service -p ExecMainStatus -p ExecMainExitTimestamp 2>/dev/null || true
+
+  echo; echo "── 3. blasti-api unit (key lines) ─────────────────"
+  grep -E 'ExecStart|WorkingDirectory|ReadWritePaths|EnvironmentFile' /etc/systemd/system/blasti-api.service 2>/dev/null || echo "unit file missing!"
+
+  echo; echo "── 4. uploads directory ───────────────────────────────"
+  ls -ld "$DIR/apps/api/uploads" 2>&1 || true
+
+  echo; echo "── 5. ports listening ─────────────────────────────────"
+  ss -tlnp 2>/dev/null | grep -E ':(80|443|3000|3003|5432)\b' || netstat -tlnp 2>/dev/null | grep -E ':(80|443|3000|3003|5432)\b' || echo "could not list ports"
+
+  echo; echo "── 6. PostgreSQL container ────────────────────────────"
+  docker ps --filter name=blasti-db --format '{{.Names}}  {{.Status}}  {{.Ports}}' 2>/dev/null || true
+  docker logs --tail 5 blasti-db 2>&1 | tail -5 || true
+
+  echo; echo "── 7. direct health checks (loopback) ─────────────────"
+  printf 'api  :3003 -> '; curl -fsS -m 4 http://127.0.0.1:3003/api/health 2>/dev/null | head -c 200 || echo 'FAILED / no answer'
   echo
-  echo "── disk / memory ─────────────────────────────────────"
-  df -h / | tail -1; free -h | head -2
+  printf 'web  :3000 -> '; curl -fsS -m 4 -o /dev/null -w 'HTTP %{http_code}' http://127.0.0.1:3000/ 2>/dev/null || echo 'FAILED / no answer'
+  echo
+  printf 'caddy:80   -> '; curl -fsS -m 4 http://127.0.0.1/api/health 2>/dev/null | head -c 200 || echo 'FAILED / no answer'
+  echo
+
+  echo; echo "── 8. blasti-api logs (last 30 lines) ─────────────────"
+  journalctl -u blasti-api -n 30 --no-pager 2>/dev/null | tail -30 || true
+
+  echo; echo "── 9. blasti-web logs (last 8 lines) ──────────────────"
+  journalctl -u blasti-web -n 8 --no-pager 2>/dev/null | tail -8 || true
+
+  echo; echo "── 10. memory / disk ──────────────────────────────────"
+  free -m | head -2
+  df -h / | tail -1
+
+  echo; echo "── 11. env file keys (values hidden) ──────────────────"
+  [ -f "$ENV_FILE" ] && grep -oE '^[A-Z_]+' "$ENV_FILE" | sort | tr '\n' ' ' || echo "$ENV_FILE missing!"
+  echo
+  echo "============================================================ end of report ============================================================"
+}
+
+# --------------------------------------------------------------------
+# MODES: watch-enable / watch-disable / watch-status
+#        (aliases: server-watch-install / -disable / -status)
+# --------------------------------------------------------------------
+cmd_watch_enable() {
+  require_root "watch-enable"
+  local DIR="$DIR_DEFAULT"
+  [ $# -gt 0 ] && { case "$1" in --dir) DIR="$2"; shift ;; *) die "watch-enable: unknown argument: $1" ;; esac; }
+  [ -d "$DIR/.git" ] || die "no git repo at $DIR — run install first"
+  install_auto_update_watcher "$DIR"
+  echo
+  systemctl --no-pager --full status blasti-watcher.timer 2>/dev/null | head -8 || true
+  echo
+  ok "from now on: every 'git push' to the repo deploys itself within ~2 minutes."
+  ok "watch it live:   journalctl -u blasti-watcher.service -f"
+  ok "turn it off:     bash $0 watch-disable"
+}
+
+cmd_watch_disable() {
+  require_root "watch-disable"
+  systemctl disable --now blasti-watcher.timer 2>/dev/null || true
+  systemctl daemon-reload
+  ok "GitHub auto-updater is OFF (blasti-watcher.timer disabled)."
+  ok "updates are manual again:  bash $0 update"
+  ok "re-enable with:            bash $0 watch-enable"
+}
+
+# --------------------------------------------------------------------
+# MODE: watch-status — answer in one command:
+#   1. is the GitHub auto-updater timer alive + when did it last fire?
+#   2. is the local checkout behind GitHub (new commit pending)?
+#   3. what did the last deploy do (watcher/deploy heartbeats stored
+#      by the API in its SystemSetting table)?
+# --------------------------------------------------------------------
+cmd_watch_status() {
+  local DIR="$DIR_DEFAULT"
+  echo "============================================================"
+  echo " BLASTI auto-update status - $(date '+%F %T %Z')"
+  echo "============================================================"
+
+  echo; echo "── 1. systemd timer (blasti-watcher) ──────────────"
+  printf 'timer state    : %s / %s\n' \
+    "$(systemctl is-active blasti-watcher.timer 2>/dev/null || echo '?')" \
+    "$(systemctl is-enabled blasti-watcher.timer 2>/dev/null || echo '?')"
+  systemctl show blasti-watcher.timer -p LastTriggerUSec -p NextElapseUSecRealtime 2>/dev/null
+  printf 'last check     : exit=%s at %s\n' \
+    "$(systemctl show blasti-watcher.service -p ExecMainStatus --value 2>/dev/null || echo '?')" \
+    "$(systemctl show blasti-watcher.service -p ExecMainExitTimestamp --value 2>/dev/null || echo '?')"
+
+  echo; echo "── 2. watcher journal (last 12 lines) ───────────────"
+  journalctl -u blasti-watcher.service -n 12 --no-pager 2>/dev/null | tail -12 || echo "no journal yet"
+
+  echo; echo "── 3. code version ($DIR) vs GitHub ──────────"
+  if [ -d "$DIR/.git" ]; then
+    git -C "$DIR" fetch origin master >/dev/null 2>&1 || true
+    local local_sha remote_sha
+    local_sha="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    remote_sha="$(git -C "$DIR" rev-parse --short origin/master 2>/dev/null || echo '?')"
+    echo "deployed : $local_sha $(git -C "$DIR" log -1 --format=%s 2>/dev/null)"
+    echo "github   : $remote_sha"
+    if [ "$local_sha" = "$remote_sha" ]; then
+      ok "up to date — this VPS already has the latest master"
+    else
+      warn "BEHIND — a new commit exists; the watcher will deploy it on its next check (or run: bash $0 update)"
+    fi
+  else
+    warn "no git repo at $DIR"
+  fi
+
+  echo; echo "── 4. last heartbeats stored by the API ─────────────"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q blasti-db; then
+    local pg_user pg_db
+    pg_user="$(grep '^POSTGRES_USER=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+    pg_db="$(grep '^POSTGRES_DB=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+    pg_user="${pg_user:-blasti}"; pg_db="${pg_db:-blasti}"
+    for key in deploy.watcher.lastCheck deploy.last; do
+      printf '%s:\n  ' "$key"
+      docker exec blasti-db psql -U "$pg_user" -d "$pg_db" -Atc \
+        "select value from \"SystemSetting\" where key='$key'" 2>/dev/null \
+        || echo '(unavailable)'
+      echo
+    done
+    echo 'recent events:'
+    docker exec blasti-db psql -U "$pg_user" -d "$pg_db" -Atc \
+      "select value from \"SystemSetting\" where key='deploy.events'" 2>/dev/null \
+      | head -c 2000 || true
+    echo
+  else
+    warn "blasti-db container not running — cannot read heartbeats (API still starting?)"
+  fi
+  echo
+  echo "hint: the same status is visible in the web admin panel:"
+  echo "      Public Apps Settings -> Auto-Deploy & Watcher Status"
 }
 
 # --------------------------------------------------------------------
@@ -729,7 +1002,9 @@ if [ $# -eq 0 ]; then
   MODE="install"
 else
   case "$1" in
-    install|init|update|deploy|doctor|status|logs|firewall|help|-h|--help)
+    install|init|update|deploy|doctor|status|logs|firewall|\
+    server-update|server-doctor|server-watch-install|server-watch-disable|server-watch-status|\
+    watch-enable|watch-disable|watch-status|help|-h|--help)
       MODE="$1"; shift ;;
     -*) MODE="install" ;;   # options-only invocation → install
     *) die "unknown mode: $1 (try --help)" ;;
@@ -738,8 +1013,11 @@ fi
 
 case "$MODE" in
   install|init)  cmd_install "$@" ;;
-  update|deploy) cmd_update "$@" ;;
-  doctor)        cmd_doctor "$@" ;;
+  update|deploy|server-update) cmd_update "$@" ;;
+  doctor|server-doctor)        cmd_doctor "$@" ;;
+  watch-enable|server-watch-install)  cmd_watch_enable "$@" ;;
+  watch-disable|server-watch-disable) cmd_watch_disable "$@" ;;
+  watch-status|server-watch-status)   cmd_watch_status "$@" ;;
   status)        cmd_status "$@" ;;
   logs)          cmd_logs "$@" ;;
   firewall)      cmd_firewall "$@" ;;

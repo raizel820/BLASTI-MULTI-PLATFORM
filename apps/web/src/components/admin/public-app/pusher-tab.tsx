@@ -170,20 +170,21 @@ export function PusherTab() {
       });
       const data = await res.json().catch(() => null);
       if (res.ok && (data?.success || res.status === 201)) {
-        // DELTA DELIVERY REPORT (0.6.33): the push response carries what
-        // /check will offer devices — differential hops when generation
-        // succeeded, nothing when it did not (devices then fall back to the
-        // FULL installer). Tell the admin WHICH of the two will happen.
-        const gen = data?.deltaGeneration;
-        const hops = Array.isArray(gen) ? gen.filter((r: { ok?: boolean }) => r?.ok) : [];
-        if (hops.length > 0) {
-          const totalMb = (hops.reduce((s: number, r: { size?: number }) => s + (r.size || 0), 0) / 1048576).toFixed(1);
-          toast.success(`${t('publicAppPushSent')} — ${t('publicAppPushDeltaReady', { size: totalMb })}`);
-        } else {
-          const reason = Array.isArray(gen) && gen.length > 0 && gen[0]?.reason ? gen[0].reason : (gen as { error?: string } | null)?.error || '';
-          toast.success(`${t('publicAppPushSent')} — ${t('publicAppPushDeltaUnavailable')}`, {
-            description: reason || undefined,
-          });
+        toast.success(t('publicAppPushSent'));
+        // Delta backfill report (the push path generates the delta hops for a
+        // draft it publishes): surface the outcome right where the admin acts.
+        const dg = data?.deltaGeneration;
+        if (Array.isArray(dg) && dg.length > 0) {
+          const okHop = dg.find((h: { ok?: boolean }) => h?.ok);
+          if (okHop) {
+            toast.success(t('publicAppPushDeltaReady', { size: formatFileSize(okHop.size) }), {
+              description: `${okHop.from} → ${okHop.to}`,
+            });
+          } else {
+            toast.info(t('publicAppPushDeltaUnavailable', { reason: dg[0]?.reason || '—' }));
+          }
+        } else if (dg && typeof dg === 'object' && 'error' in dg) {
+          toast.info(t('publicAppPushDeltaUnavailable', { reason: String(dg.error).slice(0, 120) }));
         }
         setNotes(EMPTY_NOTES);
         setPushType('optional');

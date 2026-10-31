@@ -31,7 +31,7 @@ two commands — the installer pulls everything from GitHub:
 ```bash
 # on YOUR machine:  ssh root@<DROPLET_IP>
 # on the SERVER:
-curl -fsSL https://raw.githubusercontent.com/raizel820/BLASTI-MULTI-PLATFORM/master/scripts/deploy-digitalocean.sh -o blasti-deploy.sh
+curl -fsSL https://raw.githubusercontent.com/raizel820/BLASTI-MULTI-PLATFORM/master/scripts/deploy-oracle-vps.sh -o blasti-deploy.sh
 bash blasti-deploy.sh server-install
 ```
 
@@ -40,17 +40,17 @@ Or trigger the identical install from your own machine
 
 ```bash
 git clone https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git blasti && cd blasti
-./scripts/deploy-digitalocean.sh install root@<DROPLET_IP>
+./scripts/deploy-oracle-vps.sh install root@<DROPLET_IP>
 ```
 
 Everyday operations:
 
 ```bash
-./scripts/deploy-digitalocean.sh update  root@<DROPLET_IP>   # git pull + rebuild + restart
-./scripts/deploy-digitalocean.sh status  root@<DROPLET_IP>   # services + db + health
-./scripts/deploy-digitalocean.sh logs    root@<DROPLET_IP> api  # api | web | db | caddy
-./scripts/deploy-digitalocean.sh backup  root@<DROPLET_IP>   # pg_dump to a local file
-./scripts/deploy-digitalocean.sh restore root@<DROPLET_IP> blasti-DATE.sql
+./scripts/deploy-oracle-vps.sh update  root@<DROPLET_IP>   # git pull + rebuild + restart
+./scripts/deploy-oracle-vps.sh status  root@<DROPLET_IP>   # services + db + health
+./scripts/deploy-oracle-vps.sh logs    root@<DROPLET_IP> api  # api | web | db | caddy
+./scripts/deploy-oracle-vps.sh backup  root@<DROPLET_IP>   # pg_dump to a local file
+./scripts/deploy-oracle-vps.sh restore root@<DROPLET_IP> blasti-DATE.sql
 ```
 
 Notes:

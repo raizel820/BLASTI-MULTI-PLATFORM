@@ -260,10 +260,13 @@ try {
 //   4. packaged production fallback (the VPS the release APK is locked to)
 //   5. dev fallback localhost:3003   (dev runs only — never packaged apps)
 const DEV_CLOUD_FALLBACK = 'http://localhost:3003';
-// Same server as apps/mobile/.env.production. Used ONLY when a PACKAGED build
-// finds no configuration anywhere. To repoint an installed app without
-// rebuilding, create <install>\resources\.env with BLASTI_CLOUD_URL="…".
-const PRODUCTION_CLOUD_FALLBACK = 'http://129.151.242.219';
+// Same origin as apps/mobile/.env.production. Used ONLY when a PACKAGED build
+// finds no configuration anywhere. blastidz.online is the production domain
+// (Namecheap) → Oracle VPS 129.151.242.219 with Caddy-managed Let's Encrypt
+// TLS. HTTPS-ONLY since 0.6.36: the raw-IP cleartext door is closed and every
+// build bakes the domain. To repoint an installed app without rebuilding,
+// create <install>\resources\.env with BLASTI_CLOUD_URL="…".
+const PRODUCTION_CLOUD_FALLBACK = 'https://blastidz.online';
 
 /** The cloudBaseUrl baked by scripts/prebuild.js into build-stamp.json, if any. */
 function readBuildStampCloudUrl() {
@@ -876,39 +879,15 @@ function runUpdateWaiterMode(w) {
   // 30s; proceed anyway afterwards — the NSIS script closes a still-running
   // app in silent mode on its own. `process.kill(pid, 0)` THROWS when the
   // process is gone, so "probe succeeded" ⇔ still alive.
-  //
-  // 0.6.38 FIELD FIX — the main pid vanishing is NOT the whole app: Electron
-  // child processes (GPU / renderer / crashpad) can outlive it for seconds
-  // while still holding locks on blasti.exe and app.asar. A silent NSIS run
-  // started in that window fails instantly with NO error and the old version
-  // stays installed (the "app closes → relaunches → still 0.6.x" loop). The
-  // waiter now ALSO waits until the app exe OPENS FOR WRITING — the precise
-  // pure-Node signal that every process using the image is really gone
-  // (Windows refuses write access to a running image), capped at 10s.
   let waitedMs = 0;
-  let exeWaitedMs = 0;
   const probe = () => {
     let alive = false;
     try { process.kill(w.oldPid, 0); alive = true; } catch { alive = false; }
     return alive;
   };
-  const exeUnlocked = () => {
-    try {
-      const fd = fs.openSync(w.appExe, 'r+');
-      fs.closeSync(fd);
-      return true;
-    } catch { return false; }
-  };
   const pollLoop = () => {
     if (!probe()) {
-      if (exeWaitedMs >= 10_000 || exeUnlocked()) {
-        if (exeWaitedMs > 0) appendLog(`exe unlocked after ${exeWaitedMs}ms — every app process is gone`);
-        runInstaller();
-        return;
-      }
-      exeWaitedMs += 250;
-      if (exeWaitedMs === 250) appendLog('app exited — waiting for the exe to unlock (all processes gone)…');
-      setTimeout(pollLoop, 250);
+      runInstaller();
       return;
     }
     if (waitedMs >= 30000) {
@@ -1337,28 +1316,6 @@ function createWindow() {
     // Block everything else
     event.preventDefault();
     shell.openExternal(url);
-  });
-
-  // R-36: Windows cold-start deep link — when the OS LAUNCHES the app BY a
-  // blasti:// link (the desktop app was closed when the Chargily payment
-  // bounce fired), the URL arrives in process.argv instead of a
-  // second-instance/open-url event. Forward it to the renderer once the SPA
-  // has actually loaded (one-shot — did-finish-load refires on reloads).
-  let _coldStartDeepLinkSent = false;
-  mainWindow.webContents.on('did-finish-load', () => {
-    if (_coldStartDeepLinkSent) return;
-    try {
-      const deepUrl = (process.argv || []).find(
-        (a) => typeof a === 'string' && a.startsWith(PROTOCOL + '://')
-      );
-      if (deepUrl) {
-        _coldStartDeepLinkSent = true;
-        console.log('[BLASTI Desktop] Cold-start deep link:', deepUrl);
-        mainWindow.webContents.send('deep-link', deepUrl);
-      }
-    } catch (err) {
-      console.warn('[BLASTI Desktop] Cold-start deep-link parse failed:', err && err.message);
-    }
   });
 
   // ── Window Close → QUIT the app (Task 2-b, sub-task 5) ──────────────────
@@ -2039,20 +1996,8 @@ ipcMain.handle('updates:check', async () => {
     clearTimeout(timer);
     if (!res.ok) return { success: false, error: `http-${res.status}` };
     const data = await res.json();
-    // 0.6.36 — log the DELTA decision too. The recurring field report "desktop
-    // downloads the full 155MB installer while phones get a 7.2MB delta" is
-    // undiagnosable without knowing whether the server offered a chain at all
-    // (delta:null + deltaUnavailable reason) or the client rejected one
-    // (asar-anchor-mismatch → renderer falls back to the full installer).
-    const deltaNote = data && data.updateAvailable
-      ? (data.delta
-        ? ` | delta YES ${((Number(data.delta.totalSize) || 0) / 1048576).toFixed(2)}MB / ${Array.isArray(data.delta.hops) ? data.delta.hops.length : 0} hop(s)`
-        : data.deltaUnavailable
-          ? ` | delta NO (${typeof data.deltaUnavailable === 'object' ? JSON.stringify(data.deltaUnavailable) : String(data.deltaUnavailable)})`
-          : ' | delta NO (legacy server?)')
-      : '';
     console.log('[BLASTI Desktop] updates:check →', data && data.updateAvailable
-      ? `v${data.currentVersion} → v${data.latestVersion} (mandatory: ${data.isMandatory})${deltaNote}` : 'up to date');
+      ? `v${data.currentVersion} → v${data.latestVersion} (mandatory: ${data.isMandatory})` : 'up to date');
     return data;
   } catch (err) {
     console.warn('[BLASTI Desktop] updates:check failed:', err && err.message);
@@ -2341,26 +2286,7 @@ async function installDownloadedUpdate() {
         quitForUpdate();
         return { ok: true };
       }
-      console.warn('[BLASTI Desktop] update waiter did not stay alive — trying the direct NSIS leg');
-      // 0.6.36 FIELD FIX — the direct leg runs the downloaded installer itself
-      // (no self-copied exe, no PowerShell for AV to kill). Confirmed alive →
-      // quit; NSIS silent closes any leftover app processes on its own.
-      const directPid = spawnDirectWindowsInstall(installer);
-      if (directPid && await procAlive(directPid)) {
-        console.log('[BLASTI Desktop] direct installer leg confirmed alive (pid', directPid + ') — quitting for install');
-        quitForUpdate();
-        return { ok: true };
-      }
-      console.warn('[BLASTI Desktop] direct installer leg did not stay alive — trying the PowerShell leg');
-    } else if (!app.isPackaged) {
-      // Dev runs: no waiter machinery — try the direct leg first (fast, no AV
-      // bait), then fall through to the non-elevated PowerShell leg.
-      const devPid = spawnDirectWindowsInstall(installer);
-      if (devPid && await procAlive(devPid)) {
-        console.log('[BLASTI Desktop] direct installer leg confirmed alive (pid', devPid + ') — quitting for install');
-        quitForUpdate();
-        return { ok: true };
-      }
+      console.warn('[BLASTI Desktop] update waiter did not stay alive — trying the PowerShell leg');
     }
     // Fallbacks: dev runs (not packaged), per-machine (Program Files) installs
     // (the PowerShell leg elevates via UAC — a non-elevated silent install
@@ -2440,37 +2366,6 @@ function spawnUpdateWaiter(installerPath) {
 }
 
 /**
- * 0.6.36 FIELD FIX — direct NSIS spawn leg. The two other Windows legs are
- * the two MOST heuristic-antivirus-sensitive launch patterns that exist:
- * (1) the waiter = a freshly-copied exe executing from userData with odd argv
- * (classic malware shape → behaviorally killed before the 900 ms probe ends),
- * (2) PowerShell -EncodedCommand (a canonical LOLBin signature → killed on
- * sight on hardened endpoints). Field reports show BOTH legs dying, which the
- * renderer surfaced as "تعذّر بدء المُثبِّت تلقائيًا — يمكنك تشغيل ملف
- * التحديث يدويًا". Spawning the DOWNLOADED installer itself is the pattern
- * every vendor updater uses (a signed NSIS setup launched by the app that
- * fetched it) and is the least AV-suspicious thing we can run. electron-
- * builder's silent NSIS run closes a still-running app on its own, and this
- * app quits ~1.2 s after the spawn anyway (same contract as the PowerShell
- * leg). Per-user installs only — a per-machine (Program Files) silent run
- * needs elevation and must keep using the elevated PowerShell leg.
- */
-function spawnDirectWindowsInstall(installerPath) {
-  const cp = require('child_process');
-  try {
-    const child = cp.spawn(installerPath, ['/S'], { detached: true, stdio: 'ignore', windowsHide: true });
-    child.on('error', (err) => console.warn('[BLASTI Desktop] direct installer spawn error:', err.message));
-    child.unref();
-    if (!child.pid) return null;
-    console.log('[BLASTI Desktop] direct installer spawned: pid', child.pid);
-    return child.pid;
-  } catch (err) {
-    console.warn('[BLASTI Desktop] direct installer spawn threw:', err && err.message);
-    return null;
-  }
-}
-
-/**
  * UPDATE-0.6.14 — runUpdateWaiterMode lives near the top of the file (before
  * the single-instance bail-out) because the waiter branch NEVER executes the
  * main-app else block this function used to sit in.
@@ -2538,31 +2433,8 @@ function spawnSilentWindowsInstall(installerPath, opts = {}) {
 // run that installer silently and exit — the relaunch comes back as the new
 // version. This closes the "success message but still the old version" loop
 // permanently, even when the NSIS run itself failed once.
-/**
- * 0.6.38 — surface the waiter/PowerShell install log inside main.log. The
- * silent NSIS run writes its steps + exit code ONLY to
- * <userData>\updates\install-log.txt; without this echo a failed update
- * ("app closed, still the old version") shipped ZERO evidence in the log the
- * user sends us. Last 15 lines, only when the log changed in the last 24h.
- */
-function echoInstallLogTail() {
-  try {
-    const logFile = path.join(UPDATES_DIR(), 'install-log.txt');
-    const stat = fs.statSync(logFile);
-    if (Date.now() - stat.mtimeMs > 24 * 3600_000) return;
-    const lines = fs.readFileSync(logFile, 'utf8').split(/\r?\n/).filter(Boolean).slice(-15);
-    console.log(`[BLASTI Desktop] install-log.txt (last ${lines.length} line(s), age ${Math.round((Date.now() - stat.mtimeMs) / 60000)}min):`);
-    for (const line of lines) console.log(`[BLASTI Desktop]   | ${line}`);
-  } catch { /* no log yet — nothing was ever installed */ }
-}
-
 function selfHealPendingInstaller() {
   if (process.platform !== 'win32' || !app.isPackaged) return;
-  // 0.6.38 — echo the waiter/PowerShell install log into main.log: the silent
-  // NSIS run leaves its exit code ONLY there, and without this line the
-  // "app closed → relaunch → still the old version" loop is undiagnosable
-  // from a shipped main.log alone.
-  echoInstallLogTail();
   try {
     const dir = UPDATES_DIR();
     const files = fs.readdirSync(dir).filter((f) => /^BLASTI-Setup-(\d+\.\d+\.\d+[^\s]*)\.exe$/i.test(f));
@@ -2579,40 +2451,10 @@ function selfHealPendingInstaller() {
     const stat = fs.statSync(target);
     if (Date.now() - stat.mtimeMs < 60_000) return; // still downloading
     console.log(`[BLASTI Desktop] self-heal: finishing pending update ${pending[0].ver} (running ${current}) →`, target);
-
-    // 0.6.38 SELF-HEAL LOOP GUARD — the field log showed the app quit for the
-    // SAME pending installer 3 times in 20 seconds: a silent install that
-    // fails instantly (locked files, disk, AV) used to bounce the app forever
-    // — "the desktop app closes itself after downloading the update". Track
-    // attempts per installer file: after 2 quits within 10 minutes STOP
-    // auto-quitting, tell the renderer, and let the user install manually
-    // (the installer stays in updates\ and updates:open-installer opens it).
-    const statePath = path.join(dir, 'selfheal-state.json');
-    let attempts = { file: '', count: 0, at: 0 };
-    try { attempts = JSON.parse(fs.readFileSync(statePath, 'utf8')) || attempts; } catch { /* fresh */ }
-    const sameRun = attempts.file === pending[0].f && (Date.now() - attempts.at) < 10 * 60_000;
-    if (sameRun && attempts.count >= 2) {
-      console.error(`[BLASTI Desktop] self-heal: ${attempts.count} install attempts for ${pending[0].f} did not take effect — stopping auto-quit (manual install required). See install-log.txt echo above.`);
-      sendUpdateProgress({ status: 'error', error: 'selfheal-gave-up', version: pending[0].ver });
-      requestRendererLogFlush();
-      return;
-    }
-    try {
-      fs.writeFileSync(statePath, JSON.stringify({
-        file: pending[0].f,
-        count: sameRun ? attempts.count + 1 : 1,
-        at: Date.now(),
-      }));
-    } catch { /* guard is best-effort */ }
-
     // UPDATE-0.6.14 — same launcher decision as updates:install (waiter for
     // per-user installs, elevated PowerShell for per-machine installs).
-    // 0.6.36 — the direct NSIS leg slots in between: when the waiter copy is
-    // blocked by AV, the downloaded installer itself still launches.
     if (!spawnUpdateWaiter(target)) {
-      if (!spawnDirectWindowsInstall(target)) {
-        spawnSilentWindowsInstall(target, { elevate: !isPerUserWindowsInstall() });
-      }
+      spawnSilentWindowsInstall(target, { elevate: !isPerUserWindowsInstall() });
     }
     setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 1500);
   } catch (err) {

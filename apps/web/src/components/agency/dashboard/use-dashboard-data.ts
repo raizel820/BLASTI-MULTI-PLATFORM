@@ -58,7 +58,7 @@ export function useDashboardData() {
 
   useEffect(() => {
     if (!agencyCode) return;
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz';
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online';
     QRCode.toDataURL(`${baseUrl}/?code=${agencyCode}`, {
       width: 256, margin: 2, color: { dark: '#047857', light: '#ffffff' }, errorCorrectionLevel: 'M',
     }).then((url) => setQrCodeDataUrl(url)).catch(() => {});

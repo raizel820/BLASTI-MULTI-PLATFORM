@@ -127,7 +127,10 @@ function resolveBaseUrl(c: { req: { header(name: string): string | undefined; ur
       /* fall through */
     }
   }
-  return process.env.NEXTAUTH_URL || 'http://localhost:3000'
+  // 0.6.36: production domain instead of localhost — when neither an explicit
+  // returnUrl nor an Origin header is available (origin-less shell clients),
+  // the Chargily hosted page must land on the PUBLIC web app, never localhost.
+  return process.env.NEXTAUTH_URL || 'https://blastidz.online'
 }
 
 /** Ensure Chargily keys are configured before creating a checkout. */

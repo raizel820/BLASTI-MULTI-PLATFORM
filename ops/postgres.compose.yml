@@ -8,7 +8,7 @@
 #     blasti-web  → Node (Next.js server)    127.0.0.1:3000
 #     caddy       → apt package              0.0.0.0:80/443
 #
-# Installed + managed automatically by scripts/deploy-digitalocean.sh
+# Installed + managed automatically by scripts/deploy-oracle-vps.sh
 # (modes: server-install / server-update). Reference: DEPLOY-GUIDE.md.
 #
 # Run manually from the ops/ folder:

@@ -8,14 +8,14 @@
 # MODES
 #   A) Watch FROM YOUR MACHINE - tell the VPS to pull from GitHub:
 #        ./scripts/watch-and-deploy.sh watch root@VPS_IP [--domain d.tld]
-#      Every new commit runs scripts/deploy-digitalocean.sh update
+#      Every new commit runs scripts/deploy-oracle-vps.sh server-update
 #      (one ssh call -> server-update: git pull + rebuild + restart),
 #      identical to a manual update. No upload, no GitHub credentials
 #      needed on your machine (the repo is public).
 #
 #   B) Watch ON THE VPS (recommended for always-on auto-deploy):
 #      The VPS clone is updated with git, then rebuilt in place.
-#      deploy-digitalocean.sh server-install / server-update arm this
+#      deploy-oracle-vps.sh server-install / server-update arm this
 #      automatically as a systemd timer (blasti-watcher.timer) that
 #      checks GitHub every 2 minutes - no cron needed:
 #        systemctl status  blasti-watcher.timer
@@ -36,7 +36,7 @@
 #   --force           Deploy even when the SHA did not change
 #   --dir PATH        (VPS mode) server-side clone location (default /opt/blasti)
 #   --port N          (upload mode) ssh port (default 22)
-#   --domain D        (upload mode) passed through to deploy-digitalocean.sh
+#   --domain D        (upload mode) passed through to deploy-oracle-vps.sh
 #
 # PRIVATE REPOS: mode B (on the VPS) needs read credentials on the VPS
 # (export GITHUB_TOKEN before the first clone, or use a deploy key).
@@ -57,13 +57,62 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DEFAULT="https://github.com/raizel820/BLASTI-MULTI-PLATFORM.git"
 RETRY_AFTER_SEC="${BLASTI_WATCH_RETRY_SEC:-1800}" # wait 30 min after a failed deploy
-UPDATE_LOCK="${BLASTI_WATCH_UPDATE_LOCK:-/run/lock/blasti-update.lock}" # shared with deploy-digitalocean.sh
+UPDATE_LOCK="${BLASTI_WATCH_UPDATE_LOCK:-/run/lock/blasti-update.lock}" # shared with deploy-oracle-vps.sh
+
+# ----------------------------------------------------------------
+# Heartbeat: report every check / deploy to the cloud API so the
+# admin panel (Public Apps Settings -> deploy status) can show that
+# the watcher is alive and what the last deploy did.
+#   - ON THE VPS: nothing to configure — systemd exports
+#     INTERNAL_API_URL + DEPLOY_TOKEN from /etc/blasti/blasti.env.
+#   - FROM YOUR MACHINE (mode A): export BLASTI_HEARTBEAT_URL and
+#     BLASTI_DEPLOY_TOKEN to enable it, otherwise it is skipped.
+# A failed heartbeat NEVER breaks the watcher (curl failure ignored).
+# ----------------------------------------------------------------
+HB_URL="${BLASTI_HEARTBEAT_URL:-}"
+HB_TOKEN="${BLASTI_DEPLOY_TOKEN:-${DEPLOY_TOKEN:-}}"
+if [ -z "$HB_URL" ] && [ -r /etc/blasti/blasti.env ]; then
+  HB_URL="$(grep '^INTERNAL_API_URL=' /etc/blasti/blasti.env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+  HB_URL="${HB_URL:-http://127.0.0.1:3003}"
+fi
+if [ -z "$HB_TOKEN" ] && [ -r /etc/blasti/blasti.env ]; then
+  HB_TOKEN="$(grep '^DEPLOY_TOKEN=' /etc/blasti/blasti.env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"')"
+fi
+HB_REPO="${BLASTI_WATCH_REPO:-$REPO_DEFAULT}"
+HB_BRANCH_DEFAULT="master"
+
+hb_enabled() { [ -n "$HB_URL" ] && [ -n "$HB_TOKEN" ]; }
+
+heartbeat() { # heartbeat <kind> <status> <commit> <message> [extra_json]
+  hb_enabled || return 0
+  local kind="$1" status="$2" commit="$3" message="$4" extra="${5:-}"
+  local payload code
+  payload="{\"kind\":\"$kind\",\"status\":\"$status\",\"commit\":\"$commit\",\"branch\":\"$BRANCH_NAME\",\"repo\":\"$HB_REPO\",\"intervalSec\":$INTERVAL_NAME,\"message\":\"$message\"$extra}"
+  # A failed heartbeat NEVER breaks the watcher, but a SILENT failure is
+  # invisible: the admin panel (Public Apps Settings) shows "no data" with no
+  # clue why. Log the rejection reason so `journalctl -u blasti-watcher`
+  # answers it (401 = token mismatch, 404 = server API outdated, else network).
+  code="$(curl -fsS -m 5 -o /dev/null -w '%{http_code}' -X POST "$HB_URL/api/system/deploy-heartbeat" \
+    -H 'Content-Type: application/json' -H "x-deploy-token: $HB_TOKEN" \
+    -d "$payload" 2>/dev/null)" || code="unreachable"
+  case "$code" in
+    200 | 201 | 204) : ;;
+    401) log "heartbeat REJECTED (HTTP 401) — the server did not accept this DEPLOY_TOKEN; Public Apps Settings stays 'no data'. Check that DEPLOY_TOKEN in /etc/blasti/blasti.env is the same secret the watcher (and GitHub Actions BLASTI_DEPLOY_TOKEN) use." ;;
+    404) log "heartbeat endpoint missing (HTTP 404) — the server API predates deploy heartbeats; run: bash scripts/deploy-oracle-vps.sh server-update" ;;
+    unreachable) log "heartbeat unreachable at $HB_URL (connection failed) — is blasti-api running?" ;;
+    *) log "heartbeat failed (HTTP $code)" ;;
+  esac
+}
 
 log() { printf '%s [watch] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
 die() { printf '%s [watch] FAIL: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2; exit 1; }
 usage() { sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
-state_dir() { printf '%s' "${BLASTI_WATCH_STATE_DIR:-$HOME/.blasti-watch}"; }
+# HOME can be UNSET when this script is spawned by a systemd service
+# (blasti-api has no HOME in its environment). Under `set -u` a bare
+# $HOME reference would kill the script instantly with
+# "HOME: unbound variable" — fall back like the watcher unit does.
+state_dir() { printf '%s' "${BLASTI_WATCH_STATE_DIR:-${HOME:-/root}/.blasti-watch}"; }
 
 state_key() { # stable id for repo+branch
   local raw="$1|$2"
@@ -98,12 +147,14 @@ remote_sha() { # remote_sha <repo> <branch> -> latest commit on the branch
 cmd_watch() {
   local TARGET="" ON_SERVER=0 REPO="$REPO_DEFAULT" BRANCH="master" INTERVAL=300
   local ONCE=0 DRY_RUN=0 DEPLOY_NOW=0 FORCE=0 DIR="/opt/blasti" PORT=22 DOMAIN=""
+  BRANCH_NAME="$BRANCH"
+  INTERVAL_NAME="$INTERVAL"
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo)       REPO="$2";      shift 2 ;;
-      --branch)     BRANCH="$2";    shift 2 ;;
-      --interval)   INTERVAL="$2";  shift 2 ;;
+      --repo)       REPO="$2";                           shift 2 ;;
+      --branch)     BRANCH="$2";    BRANCH_NAME="$2";    shift 2 ;;
+      --interval)   INTERVAL="$2";  INTERVAL_NAME="$2";  shift 2 ;;
       --on-server)  ON_SERVER=1;    shift ;;
       --once)       ONCE=1;         shift ;;
       --dry-run)    DRY_RUN=1;      shift ;;
@@ -154,6 +205,7 @@ cmd_watch() {
     if [ -z "$sha" ]; then
       log "could not read remote refs (offline? missing credentials?) - will retry"
       failures=$((failures + 1))
+      heartbeat "watcher-check" "error" "" "could not read remote refs"
     else
       last=""
       if [ "$ON_SERVER" -eq 1 ]; then
@@ -199,18 +251,24 @@ cmd_watch() {
         fi
         if [ "$skip_deploy" -eq 0 ]; then
           log "new commit detected: $last -> $sha - deploying"
-          local rc=0
+          heartbeat "deploy-start" "ok" "$sha" "new commit detected - deploying"
+          local rc=0 deploy_started
+          deploy_started="$(date +%s)"
           deploy_now "$sha" || rc=$?
           if [ "$rc" -eq 0 ]; then
             failures=0
             if [ "$ON_SERVER" -ne 1 ]; then printf '%s' "$sha" > "$base.sha"; fi
             log "deploy finished - now at $sha"
+            heartbeat "deploy-result" "success" "$sha" "deploy finished" \
+              ",\"durationSec\":$(( $(date +%s) - deploy_started ))"
           elif [ "$rc" -eq 2 ]; then
             log "deploy skipped - another install/update is running; will check again next cycle"
+            heartbeat "watcher-check" "ok" "$sha" "deploy skipped - update lock busy"
           else
             failures=$((failures + 1))
             last_rc=1 # --once mode reports the failed deploy to systemd/cron
             log "deploy FAILED (attempt $failures) - will retry (state not updated)"
+            heartbeat "deploy-result" "failure" "$sha" "deploy failed (attempt $failures)"
           fi
         fi
       fi
@@ -218,6 +276,7 @@ cmd_watch() {
 
     if [ -n "$sha" ] && [ "$sha" = "$last" ] && [ "$FORCE" -eq 0 ]; then
       log "up to date ($sha)"
+      heartbeat "watcher-check" "ok" "$sha" "up to date"
       # first peaceful run: record the baseline so restarts never re-deploy
       if [ "$ON_SERVER" -eq 1 ] && [ "$DRY_RUN" -eq 0 ] && [ ! -f "$base.sha" ]; then
         printf '%s' "$sha" > "$base.sha" 2>/dev/null || true
@@ -238,7 +297,7 @@ deploy_now() { # deploy_now <sha> -> 0 ok | 1 failed | 2 skipped (lock busy)
   local sha="$1"
   if [ "$ON_SERVER" -eq 1 ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
-      log "dry-run: would run: git -C $DIR fetch+reset to $sha && deploy-digitalocean.sh server-update"
+      log "dry-run: would run: git -C $DIR fetch+reset to $sha && deploy-oracle-vps.sh server-update"
       return 0
     fi
     # never race a manual install/update (same lock the deploy script holds)
@@ -255,7 +314,7 @@ deploy_now() { # deploy_now <sha> -> 0 ok | 1 failed | 2 skipped (lock busy)
     git -C "$DIR" reset --hard "FETCH_HEAD" >/dev/null || return 1
     flock -u 8 2>/dev/null || true # release: server-update takes the lock itself
     log "code updated to $sha - rebuilding + restarting services (secrets untouched)"
-    if ( cd "$DIR" && bash scripts/deploy-digitalocean.sh server-update ${DOMAIN:+--domain "$DOMAIN"} ); then
+    if ( cd "$DIR" && bash scripts/deploy-oracle-vps.sh server-update ${DOMAIN:+--domain "$DOMAIN"} ); then
       printf '%s' "$sha" > "$base.sha" 2>/dev/null || true
       rm -f "$base.fail" 2>/dev/null || true
       return 0
@@ -264,10 +323,13 @@ deploy_now() { # deploy_now <sha> -> 0 ok | 1 failed | 2 skipped (lock busy)
     return 1
   else
     if [ "$DRY_RUN" -eq 1 ]; then
-      log "dry-run: would run: deploy-digitalocean.sh update $TARGET (ssh -> server-update)"
+      log "dry-run: would deploy over ssh — remote ssh deploys were removed with the DigitalOcean pipeline"
       return 0
     fi
-    "$SCRIPT_DIR/deploy-digitalocean.sh" update "$TARGET" --port "$PORT" ${DOMAIN:+--domain "$DOMAIN"} || return 1
+    die "remote ssh deploys were removed with the DigitalOcean pipeline —
+         ssh into the VPS yourself and run:
+           sudo bash /opt/blasti/scripts/deploy-oracle-vps.sh update
+         (or simply push to GitHub: the on-VPS auto-updater deploys within ~2 minutes)"
   fi
 }
 

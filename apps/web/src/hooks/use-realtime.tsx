@@ -558,15 +558,6 @@ export function useRealtime(options?: UseRealtimeOptions) {
   // fetches; the desktop uses it to refetch views driven by non-Reservation
   // data without waiting for a poll tick or a section swap.
   const onSyncDataApplied = useCallback((handler: EventHandler) => on('sync:data-applied', handler as SocketHandler), [on])
-  // R-36: Chargily settlement events — the API emits these on EVERY fulfillment
-  // (webhook / poll fallback / sweep / admin reconcile) into the agency +
-  // customer rooms. A completed subscription payment flips the agency's
-  // subscriptionStatus, so views showing the activation state (dashboard
-  // banner, subscription page, gate hooks) refetch on these instead of
-  // waiting for a poll or a remount. On desktop the cloud→local relay
-  // re-emits them into the local room, so the SAME subscription works.
-  const onPaymentCompleted = useCallback((handler: EventHandler) => on('payment:completed', handler as SocketHandler), [on])
-  const onPaymentFailed = useCallback((handler: EventHandler) => on('payment:failed', handler as SocketHandler), [on])
 
   // ─── Typed Event Subscriptions (Reservation) ────────────────────────
 
@@ -667,8 +658,6 @@ export function useRealtime(options?: UseRealtimeOptions) {
     onQueuePositionChanged,
     onQueueSettingsUpdated,
     onSyncDataApplied,
-    onPaymentCompleted,
-    onPaymentFailed,
 
     // Reservation event subscriptions
     onReservationCreated,
@@ -713,7 +702,6 @@ export function useRealtime(options?: UseRealtimeOptions) {
     onQueueNoShow, onQueueCancelled, onQueueJoined, onQueueWalkIn,
     onQueuePaused, onQueueResumed, onQueuePositionChanged, onQueueSettingsUpdated,
     onSyncDataApplied,
-    onPaymentCompleted, onPaymentFailed,
     onReservationCreated, onReservationUpdated, onReservationCancelled,
     onNotification, onTurnApproaching, onYourTurn,
     onKioskUpdate, onAgencyUpdated, onStaffUpdated,

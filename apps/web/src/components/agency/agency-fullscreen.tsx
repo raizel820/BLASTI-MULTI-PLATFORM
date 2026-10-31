@@ -715,7 +715,7 @@ export function AgencyFullscreen() {
     setWalkInQrOpen(true);
     setWalkInQrUrl(null); // loading state
 
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz';
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online';
     const url = await generateQRDataURL(`${baseUrl}/?claim=${entry.importToken}`, { width: 300 });
     setWalkInQrUrl(url);
   };
@@ -723,7 +723,7 @@ export function AgencyFullscreen() {
   // ─── Reprint ticket from a waiting list entry ───────────────────────────
 
   const handleReprintFromQueue = async (entry: QueueEntry) => {
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz';
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online';
     const result: WalkInResult = {
       id: entry.id,
       queueNumber: entry.queueNumber,
@@ -886,7 +886,7 @@ export function AgencyFullscreen() {
   useEffect(() => {
     if (!agencyCode) return;
     const genAgencyQR = async () => {
-      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz';
+      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online';
       const url = await generateQRDataURL(`${baseUrl}/?code=${agencyCode}`, {
         width: 256,
         darkColor: '#10b981',
@@ -1186,7 +1186,7 @@ export function AgencyFullscreen() {
 
     // Generate QR for the ticket
     if (result.importToken) {
-      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz';
+      const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online';
       const url = await generateQRDataURL(`${baseUrl}/?claim=${result.importToken}`, { width: 200 });
       setTicketQrUrl(url || '');
     } else {

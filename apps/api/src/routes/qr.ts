@@ -54,7 +54,7 @@ app.get('/', async (c) => {
     const code = c.req.query('code')
     if (!code) return c.json({ success: false, error: 'code query param is required' }, 400)
 
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blasti.dz'
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://blastidz.online'
 
     // Phase 1f: Sign the QR payload with HMAC (includes serviceDate & expiry)
     const timestamp = Math.floor(Date.now() / 1000)

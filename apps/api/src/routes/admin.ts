@@ -22,7 +22,6 @@ import { categorySlugError } from '../lib/categories'
 // the same idempotent fulfillment path used by the webhook + poll fallback.
 import { getCheckoutStatus } from '../lib/chargily-service'
 import { fulfillCheckoutPaid, fulfillCheckoutFailed, normalizeChargilyStatus, type FulfillmentCheckout } from '../lib/chargily-fulfill'
-import { recordSyncChangeNow } from '../lib/sync-helpers'
 // Task 2-a FIX 3 — the admin-dashboard SMS tab reads/writes /admin/sms-settings.
 import { getSmsSettings, getSmsUsageStats, testSms, validateGatewayConnection } from '../lib/sms-service'
 import { PROVIDER_REGISTRY } from '../lib/messaging/provider-registry'
@@ -3459,15 +3458,6 @@ app.post('/transactions/:id', async (c) => {
       },
     })
 
-    // R-36: explicit sync capture — the desktop payment-history + subscription
-    // banner read the LOCAL Transaction row; never rely on the auto-hook alone.
-    await recordSyncChangeNow({
-      agencyId: transaction.agencyId,
-      model: 'Transaction',
-      recordId: transaction.id,
-      operation: 'update',
-    })
-
     if (action === 'approve') {
       // ─── Chargily HARDWARE transactions ──────────────────────────────
       // Device payments (type=HARDWARE) are not subscriptions: approving
@@ -3483,12 +3473,6 @@ app.post('/transactions/:id', async (c) => {
             await db.hardwareOrder.update({
               where: { id: hwOrder.id },
               data: { status: 'APPROVED' },
-            })
-            await recordSyncChangeNow({
-              agencyId: transaction.agencyId,
-              model: 'HardwareOrder',
-              recordId: hwOrder.id,
-              operation: 'update',
             })
           }
         }
@@ -3569,14 +3553,6 @@ app.post('/transactions/:id', async (c) => {
           subscriptionExpiresAt,
         },
       })
-      // R-36: the manual-receipt activation must reach the desktops the same
-      // way the Chargily settlement does.
-      await recordSyncChangeNow({
-        agencyId: transaction.agencyId,
-        model: 'Agency',
-        recordId: transaction.agencyId,
-        operation: 'update',
-      })
     } else {
       // Rejected - reset agency subscription status
       await db.agency.update({
@@ -3584,12 +3560,6 @@ app.post('/transactions/:id', async (c) => {
         data: {
           subscriptionStatus: 'INACTIVE',
         },
-      })
-      await recordSyncChangeNow({
-        agencyId: transaction.agencyId,
-        model: 'Agency',
-        recordId: transaction.agencyId,
-        operation: 'update',
       })
     }
 

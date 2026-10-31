@@ -20,7 +20,7 @@ const execFileAsync = promisify(execFile)
 //   2. Did the droplet pull the latest code and rebuild the API?
 //
 // The watcher + deploy scripts POST a heartbeat here after every check
-// and every deploy (see scripts/watch-and-deploy.sh + deploy-digitalocean.sh).
+// and every deploy (see scripts/watch-and-deploy.sh + deploy-oracle-vps.sh).
 // The heartbeat is authenticated with the shared DEPLOY_TOKEN from
 // /etc/blasti/blasti.env (systemd exports it to both the API and the
 // watcher, so no manual configuration is needed on the VPS).
@@ -568,10 +568,10 @@ app.get('/github-check', async (c) => {
 // ─── Rebuild pipeline (shared by the manual button + the CI trigger) ────────
 //
 // Both endpoints run EXACTLY what an operator runs over ssh:
-//   bash scripts/deploy-digitalocean.sh server-update   (git pull → bun install →
+//   bash scripts/deploy-oracle-vps.sh server-update   (git pull → bun install →
 //     prisma db push → next build → restart blasti-api/blasti-web/caddy →
 //     health check → posts its own deploy heartbeat)
-//   bash scripts/deploy-digitalocean.sh server-doctor   (health report appended)
+//   bash scripts/deploy-oracle-vps.sh server-doctor   (health report appended)
 //
 // The pipeline is launched through `systemd-run` as the transient unit
 // blasti-rebuild.service so it lives in its OWN cgroup — the blasti-api
@@ -640,7 +640,7 @@ function buildRebuildInnerScript(
     `echo " BLASTI server-update (source: ${source}) - $(date '+%F %T %Z')"`,
     `echo " target commit: ${commit ?? 'latest on the checked-out branch'}"`,
     `echo "============================================================"`,
-    `echo "$ bash scripts/deploy-digitalocean.sh server-update"`,
+    `echo "$ bash scripts/deploy-oracle-vps.sh server-update"`,
     `echo`,
     `bash "${scriptPath}" server-update`,
     `rc=$?`,
@@ -671,9 +671,9 @@ async function startServerUpdate(opts: {
   const { source, commit, dryRun } = opts
   const repoRoot = findRepoRoot()
   if (!repoRoot) throw new Error('no_repo: this server does not serve from a git checkout')
-  const scriptPath = path.join(repoRoot, 'scripts', 'deploy-digitalocean.sh')
+  const scriptPath = path.join(repoRoot, 'scripts', 'deploy-oracle-vps.sh')
   if (!fs.existsSync(scriptPath)) {
-    throw new Error('missing_script: scripts/deploy-digitalocean.sh not found in the checkout')
+    throw new Error('missing_script: scripts/deploy-oracle-vps.sh not found in the checkout')
   }
 
   const logDir = path.join(STORAGE_ROOT, 'logs')
