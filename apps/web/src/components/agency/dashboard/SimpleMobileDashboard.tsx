@@ -15,6 +15,7 @@ import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable, isBothUnreachable } from '@/lib/api-client';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
+import { CreateAgencyForm } from '@/components/agency/create-agency-form';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -224,7 +225,13 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
 
   // ─── Data Fetching ───────────────────────────────────────────────────
   const fetchData = useCallback(async (showRefreshing = false, isPoll = false) => {
-    if (!agencyId) return;
+    if (!agencyId) {
+      // 0.6.36 FIELD FIX — a brand-new AGENCY_OWNER lands here with agencyId=""
+      // (no agency yet). The old early-return left `loading` stuck true and the
+      // owner sat on an endless spinner with no way to create the agency.
+      setLoading(false);
+      return;
+    }
 
     if (showRefreshing) setRefreshing(true);
 
@@ -502,6 +509,21 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
           <p className="text-emerald-400/70 text-sm font-medium">
             {t('loading') || 'Loading...'}
           </p>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── No Agency Yet (0.6.36) ──────────────────────────────────────────
+  // Belt-and-braces: AgencyDashboard now routes a fresh owner to the creation
+  // wizard BEFORE ever reaching this component; this fallback covers any other
+  // caller so an agency-less owner can ALWAYS create the agency from a phone
+  // (instead of a zeroed dashboard or an endless spinner).
+  if (!agencyId) {
+    return (
+      <div className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 flex items-center justify-center p-4">
+        <div className="w-full max-w-lg">
+          <CreateAgencyForm />
         </div>
       </div>
     );

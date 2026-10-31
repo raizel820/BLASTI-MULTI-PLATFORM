@@ -799,7 +799,33 @@ export function AgencyDashboard() {
     }
   }, [lastUpdated, lang]);
 
+  // ─── No-agency onboarding FIRST (0.6.36 — both desktop AND mobile) ────
+  // FIELD BUG (mobile): a freshly-registered AGENCY_OWNER has agencyId="" and
+  // the old order rendered SimpleMobileDashboard BEFORE this wizard branch; its
+  // fetch bails on the empty id WITHOUT clearing `loading` → the owner was
+  // trapped on an endless spinner and could never create the agency (the
+  // desktop-only wizard fix of 0.6.20 never reached the mobile branch). The
+  // wizard now wins over the mobile early-return, exactly like desktop.
+  if (!agencyId && !loading) {
+    return (
+      <div className="p-4 lg:p-5">
+        <div className="min-h-[60vh] flex items-center justify-center">
+          <CreateAgencyForm
+            onAgencyCreated={() => {
+              // The Zustand store is already updated by CreateAgencyForm.
+              // After a short delay for re-render, fetch the dashboard data.
+              setLoading(true);
+              setFetchError(false);
+              setTimeout(() => fetchData(), 500);
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
   // ─── Mobile: Show SimpleMobileDashboard (barber/mechanic mode) ────────
+  // 0.6.36: agencyId is guaranteed non-empty here (the branch above handled "").
   if (isMobile) {
     return <SimpleMobileDashboard agencyId={agencyId} />;
   }
@@ -838,24 +864,8 @@ export function AgencyDashboard() {
     );
   }
 
-  // Show agency creation form if user has no agency assigned
-  if (!agencyId && !loading) {
-    return (
-      <div className="p-4 lg:p-5">
-        <div className="min-h-[60vh] flex items-center justify-center">
-          <CreateAgencyForm
-            onAgencyCreated={() => {
-              // The Zustand store is already updated by CreateAgencyForm.
-              // After a short delay for re-render, fetch the dashboard data.
-              setLoading(true);
-              setFetchError(false);
-              setTimeout(() => fetchData(), 500);
-            }}
-          />
-        </div>
-      </div>
-    );
-  }
+  // (The no-agency creation form moved ABOVE the mobile early-return — 0.6.36.
+  // A fresh owner on a phone must reach the wizard, never a frozen dashboard.)
 
   // Generate sparkline data from actual stats
   const sparkData1 = stats?.todayReservations ? [Math.round(stats.todayReservations * 0.4), Math.round(stats.todayReservations * 0.6), Math.round(stats.todayReservations * 0.5), stats.todayReservations, Math.round(stats.todayReservations * 0.8), stats.todayReservations, Math.round(stats.todayReservations * 0.7)] : [0, 1, 0, 2, 1, 3, 1];

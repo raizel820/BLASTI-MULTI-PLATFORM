@@ -162,6 +162,8 @@ interface CheckResponse {
   fileSize?: number;
   fileHash?: string;
   delta?: DeltaManifest | null;
+  /** 0.6.36 — why no delta was offered (diagnostic only; absent when one was). */
+  deltaUnavailable?: { reason: string; edges?: number; hopBases?: string[] } | null;
   /** 0.6.31 — API compatibility map evaluation (absent on older servers). */
   compat?: CompatEvaluation | null;
 }

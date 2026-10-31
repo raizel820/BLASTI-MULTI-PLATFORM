@@ -223,6 +223,7 @@ app.get('/check', async (c) => {
     // back to the full installer on the first verification failure. Clients
     // that predate deltas simply ignore the extra field.
     let delta: Record<string, unknown> | null = null
+    let deltaUnavailable: Record<string, unknown> | null = null
     if (updateAvailable && latestVersion) {
       try {
         const chain = await computeDeltaChain(platform, version, latestVersion.id)
@@ -239,6 +240,37 @@ app.get('/check', async (c) => {
           }
         }
       } catch { /* delta resolution must never break the basic check */ }
+      // 0.6.36 — WHY did this device get no delta? The recurring field report
+      // "desktop falls back to the full 155MB installer while phones receive a
+      // small delta" was undiagnosable because delta:null carried no reason.
+      // Additive diagnostic (old clients ignore it): the delta ROW count for
+      // this platform + which base versions have outgoing hops, so an admin
+      // can instantly tell 'no rows were ever generated' apart from 'rows
+      // exist but none chains from THIS client version' (e.g. the client's
+      // installed build predates every generated hop, or the hop base is a
+      // re-pushed installer whose bits differ from what devices run).
+      if (!delta) {
+        try {
+          const [edgeCount, fromVersions] = await Promise.all([
+            db.appVersionDelta.count({ where: { platform } }),
+            db.appVersionDelta.findMany({
+              where: { platform },
+              distinct: ['fromVersion'],
+              select: { fromVersion: true },
+              orderBy: { createdAt: 'desc' },
+              take: 12,
+            }),
+          ])
+          deltaUnavailable = edgeCount === 0
+            ? { reason: 'no-delta-rows-for-platform' }
+            : {
+              reason: 'no-chain-from-client-version',
+              edges: edgeCount,
+              hopBases: fromVersions.map((r) => r.fromVersion),
+            }
+          console.log(`[app-versions/check] ${platform} ${version} → delta unavailable: ${JSON.stringify(deltaUnavailable)}`)
+        } catch { deltaUnavailable = { reason: 'delta-resolution-error' } }
+      }
     }
 
     return c.json({
@@ -262,6 +294,9 @@ app.get('/check', async (c) => {
       minAppVersion: updateAvailable ? (latestVersion?.minAppVersion ?? '') : '',
       // Differential update offer (null/absent on older servers → full install)
       delta,
+      // 0.6.36 — WHY delta is null (diagnostic only; additive, old clients
+      // ignore it). null when a chain WAS offered or no update is available.
+      deltaUnavailable,
       // API COMPATIBILITY MAP (0.6.31) — the same evaluation the dedicated
       // /compat endpoint returns, embedded in the boot-time check so apps get
       // "can I run / what is blocked / is the update required or server-only"

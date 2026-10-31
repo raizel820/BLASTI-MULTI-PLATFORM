@@ -2039,8 +2039,20 @@ ipcMain.handle('updates:check', async () => {
     clearTimeout(timer);
     if (!res.ok) return { success: false, error: `http-${res.status}` };
     const data = await res.json();
+    // 0.6.36 — log the DELTA decision too. The recurring field report "desktop
+    // downloads the full 155MB installer while phones get a 7.2MB delta" is
+    // undiagnosable without knowing whether the server offered a chain at all
+    // (delta:null + deltaUnavailable reason) or the client rejected one
+    // (asar-anchor-mismatch → renderer falls back to the full installer).
+    const deltaNote = data && data.updateAvailable
+      ? (data.delta
+        ? ` | delta YES ${((Number(data.delta.totalSize) || 0) / 1048576).toFixed(2)}MB / ${Array.isArray(data.delta.hops) ? data.delta.hops.length : 0} hop(s)`
+        : data.deltaUnavailable
+          ? ` | delta NO (${typeof data.deltaUnavailable === 'object' ? JSON.stringify(data.deltaUnavailable) : String(data.deltaUnavailable)})`
+          : ' | delta NO (legacy server?)')
+      : '';
     console.log('[BLASTI Desktop] updates:check →', data && data.updateAvailable
-      ? `v${data.currentVersion} → v${data.latestVersion} (mandatory: ${data.isMandatory})` : 'up to date');
+      ? `v${data.currentVersion} → v${data.latestVersion} (mandatory: ${data.isMandatory})${deltaNote}` : 'up to date');
     return data;
   } catch (err) {
     console.warn('[BLASTI Desktop] updates:check failed:', err && err.message);
@@ -2329,7 +2341,26 @@ async function installDownloadedUpdate() {
         quitForUpdate();
         return { ok: true };
       }
-      console.warn('[BLASTI Desktop] update waiter did not stay alive — trying the PowerShell leg');
+      console.warn('[BLASTI Desktop] update waiter did not stay alive — trying the direct NSIS leg');
+      // 0.6.36 FIELD FIX — the direct leg runs the downloaded installer itself
+      // (no self-copied exe, no PowerShell for AV to kill). Confirmed alive →
+      // quit; NSIS silent closes any leftover app processes on its own.
+      const directPid = spawnDirectWindowsInstall(installer);
+      if (directPid && await procAlive(directPid)) {
+        console.log('[BLASTI Desktop] direct installer leg confirmed alive (pid', directPid + ') — quitting for install');
+        quitForUpdate();
+        return { ok: true };
+      }
+      console.warn('[BLASTI Desktop] direct installer leg did not stay alive — trying the PowerShell leg');
+    } else if (!app.isPackaged) {
+      // Dev runs: no waiter machinery — try the direct leg first (fast, no AV
+      // bait), then fall through to the non-elevated PowerShell leg.
+      const devPid = spawnDirectWindowsInstall(installer);
+      if (devPid && await procAlive(devPid)) {
+        console.log('[BLASTI Desktop] direct installer leg confirmed alive (pid', devPid + ') — quitting for install');
+        quitForUpdate();
+        return { ok: true };
+      }
     }
     // Fallbacks: dev runs (not packaged), per-machine (Program Files) installs
     // (the PowerShell leg elevates via UAC — a non-elevated silent install
@@ -2404,6 +2435,37 @@ function spawnUpdateWaiter(installerPath) {
     return child.pid;
   } catch (err) {
     console.warn('[BLASTI Desktop] waiter spawn failed — falling back to PowerShell leg:', err && err.message);
+    return null;
+  }
+}
+
+/**
+ * 0.6.36 FIELD FIX — direct NSIS spawn leg. The two other Windows legs are
+ * the two MOST heuristic-antivirus-sensitive launch patterns that exist:
+ * (1) the waiter = a freshly-copied exe executing from userData with odd argv
+ * (classic malware shape → behaviorally killed before the 900 ms probe ends),
+ * (2) PowerShell -EncodedCommand (a canonical LOLBin signature → killed on
+ * sight on hardened endpoints). Field reports show BOTH legs dying, which the
+ * renderer surfaced as "تعذّر بدء المُثبِّت تلقائيًا — يمكنك تشغيل ملف
+ * التحديث يدويًا". Spawning the DOWNLOADED installer itself is the pattern
+ * every vendor updater uses (a signed NSIS setup launched by the app that
+ * fetched it) and is the least AV-suspicious thing we can run. electron-
+ * builder's silent NSIS run closes a still-running app on its own, and this
+ * app quits ~1.2 s after the spawn anyway (same contract as the PowerShell
+ * leg). Per-user installs only — a per-machine (Program Files) silent run
+ * needs elevation and must keep using the elevated PowerShell leg.
+ */
+function spawnDirectWindowsInstall(installerPath) {
+  const cp = require('child_process');
+  try {
+    const child = cp.spawn(installerPath, ['/S'], { detached: true, stdio: 'ignore', windowsHide: true });
+    child.on('error', (err) => console.warn('[BLASTI Desktop] direct installer spawn error:', err.message));
+    child.unref();
+    if (!child.pid) return null;
+    console.log('[BLASTI Desktop] direct installer spawned: pid', child.pid);
+    return child.pid;
+  } catch (err) {
+    console.warn('[BLASTI Desktop] direct installer spawn threw:', err && err.message);
     return null;
   }
 }
@@ -2545,8 +2607,12 @@ function selfHealPendingInstaller() {
 
     // UPDATE-0.6.14 — same launcher decision as updates:install (waiter for
     // per-user installs, elevated PowerShell for per-machine installs).
+    // 0.6.36 — the direct NSIS leg slots in between: when the waiter copy is
+    // blocked by AV, the downloaded installer itself still launches.
     if (!spawnUpdateWaiter(target)) {
-      spawnSilentWindowsInstall(target, { elevate: !isPerUserWindowsInstall() });
+      if (!spawnDirectWindowsInstall(target)) {
+        spawnSilentWindowsInstall(target, { elevate: !isPerUserWindowsInstall() });
+      }
     }
     setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 1500);
   } catch (err) {
