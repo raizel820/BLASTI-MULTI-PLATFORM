@@ -53,7 +53,8 @@ const args = parseArgs(process.argv.slice(2));
 const file = args.file;
 const platform = args.platform;
 const version = args.version;
-let apiUrl = args['api-url'] || process.env.BLASTI_API_URL || '';
+let rawApiUrl = String(args['api-url'] || process.env.BLASTI_API_URL || '');
+let apiUrl = rawApiUrl;
 const token = args.token || process.env.BLASTI_DEPLOY_TOKEN || process.env.DEPLOY_TOKEN || '';
 const notes = String(args.notes ?? '');
 const versionCode = Number.parseInt(String(args['version-code'] ?? '0'), 10) || 0;
@@ -70,13 +71,32 @@ if (!/^\d+\.\d+\.\d+/.test(version)) fail(`version "${version}" is not semver`);
 if (!apiUrl) fail('--api-url <https://host> or BLASTI_API_URL is required');
 if (!token) fail('--token <DEPLOY_TOKEN> or BLASTI_DEPLOY_TOKEN is required');
 
+// Self-heal the paste mistakes that GitHub-secrets commonly carry (CI run
+// 2026-11-01 died here with a masked "***" value): wrapping quotes,
+// surrounding whitespace/newlines, a missing scheme. Healing these keeps the
+// upload on HTTPS — none of them can downgrade the channel to cleartext.
+if (apiUrl) {
+  apiUrl = apiUrl.trim().replace(/^["']+|["']+$/g, '').trim();
+  if (apiUrl && !/^[a-z][a-z0-9+.\-]*:\/\//i.test(apiUrl)) {
+    apiUrl = `https://${apiUrl}`; // scheme-less host ("blastidz.online") → assume TLS
+  }
+}
 apiUrl = apiUrl.replace(/\/+$/, '');
 // STRICT-HTTPS policy: uploads carry the shared DEPLOY_TOKEN — never send it
 // over a cleartext channel. Only loopback exceptions (local dev testing).
 if (!/^https:\/\//i.test(apiUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(apiUrl)) {
+  // Diagnosis WITHOUT leaking the secret's content (GitHub masks the value
+  // itself with "***" — these structural hints still show in the log).
+  const diag = [
+    /^https:\/\//i.test(rawApiUrl) ? 'scheme=https' : /^http:\/\//i.test(rawApiUrl) ? 'scheme=http (explicit cleartext — not allowed)' : 'scheme=missing',
+    /^\s|\s$/.test(rawApiUrl) ? 'whitespace-padded' : '',
+    /^["']|["']$/.test(rawApiUrl) ? 'wrapped-in-quotes' : '',
+    rawApiUrl ? '' : 'value-empty',
+  ].filter(Boolean).join(', ');
   fail(
-    `api-url must be https:// (got "${apiUrl}") — strict-HTTPS policy refuses to ` +
-      `send the deploy token over plain HTTP`,
+    `api-url must be https:// (got "${apiUrl}"; diagnosis: ${diag || 'no https:// prefix'}) — ` +
+      `strict-HTTPS policy refuses to send the deploy token over plain HTTP. ` +
+      `Fix the BLASTI_API_URL repo secret to exactly: https://your-domain`,
   );
 }
 try {
