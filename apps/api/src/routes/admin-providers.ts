@@ -89,126 +89,35 @@ app.get('/', async (c) => {
   }
 })
 
-// ─── PUT /:channel — save config ─────────────────────────────────────────────
+// ─── Verification & Security — platform verification mode ──────────────
 
-const saveConfigSchema = z.object({
-  enabled: z.boolean().optional(),
-  apiKey: z.string().max(512).optional(),
-  apiKeyIsMasked: z.boolean().optional(),
-  senderId: z.string().max(120).optional(),
-  phoneNumberId: z.string().max(64).optional(),
-  accountId: z.string().max(64).optional(),
-  apiUrl: z.string().max(256).optional(),
-  extra: z.record(z.string(), z.string().max(512).optional()).optional(),
-})
-
-app.put('/:channel', async (c) => {
+/**
+ * GET /verification-mode — current mandatory-verification mode.
+ * 'both' (default) · 'email' · 'phone' · 'none' — which contacts are
+ * mandatory at account creation/login (strict reset rule is INDEPENDENT:
+ * password reset only ever uses VERIFIED contacts).
+ */
+app.get('/verification-mode', async (c) => {
   try {
     await requireAdmin(c)
-    const channel = c.req.param('channel')
-    if (!isChannel(channel)) {
-      return c.json({ success: false, error: `Invalid channel. Allowed: ${CHANNELS.join(', ')}` }, 400)
-    }
-
-    const body = await c.req.json()
-    const validation = validateBody(saveConfigSchema, body)
-    if (validation.error) {
-      return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
-    }
-    const data = validation.data
-
-    const saved = await saveProviderConfig({
-      channel,
-      enabled: data.enabled,
-      apiKey: data.apiKey,
-      apiKeyIsMasked: data.apiKeyIsMasked,
-      senderId: data.senderId,
-      phoneNumberId: data.phoneNumberId,
-      accountId: data.accountId,
-      apiUrl: data.apiUrl,
-      extra: data.extra as Record<string, string | undefined>,
-    })
-
-    // Sender ID sanity (SMS alphanumeric sender max 11 chars)
-    if (channel === 'SMS' && saved.senderId && saved.senderId.length > 11) {
-      await recordTestResult(channel, false, 'Sender ID must be 11 characters or fewer')
-      return c.json({ success: false, error: 'Sender ID must be 11 characters or fewer' }, 400)
-    }
-
-    return c.json({ success: true, config: await getProviderConfigMasked(channel) })
+    return c.json({ success: true, mode: await getVerificationMode() })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: false, error: err.error }, err.status as 400)
   }
 })
 
-// ─── POST /:channel/test — connection / OTP / message test ──────────────────
-
-type TestMode = 'connection' | 'otp' | 'message'
-
-app.post('/:channel/test', async (c) => {
+/** PUT /verification-mode — { mode }: persist the platform gate. */
+app.put('/verification-mode', async (c) => {
   try {
     await requireAdmin(c)
-    const channel = c.req.param('channel')
-    if (!isChannel(channel)) {
-      return c.json({ success: false, error: `Invalid channel. Allowed: ${CHANNELS.join(', ')}` }, 400)
-    }
-
     const body = await c.req.json().catch(() => ({}))
-    const { to, mode } = body as { to?: string; mode?: string }
-    if (mode !== undefined && mode !== 'connection' && mode !== 'otp' && mode !== 'message') {
-      return c.json({ success: false, error: "Invalid mode. Allowed: 'connection' (free probe) | 'otp' | 'message'" }, 400)
+    const mode = body?.mode as VerificationMode
+    if (!['none', 'email', 'phone', 'both'].includes(mode)) {
+      return c.json({ success: false, error: "mode must be 'none' | 'email' | 'phone' | 'both'" }, 400)
     }
-    const testMode: TestMode = mode ?? 'message'
-
-    // ── mode='connection' — FREE probe: validates the stored credentials reach
-    //    the provider without sending any message. Works with an empty target. ──
-    if (testMode === 'connection') {
-      let probe: { ok: boolean; error?: string; responseRaw?: string; details?: Record<string, unknown> }
-      if (channel === 'SMS') probe = await getEsmsBalance()
-      else if (channel === 'EMAIL') probe = await checkEmailConnection()
-      else probe = await verifyWhatsAppConnection()
-
-      await recordTestResult(channel, probe.ok, probe.error)
-      return c.json({
-        success: probe.ok,
-        error: probe.error,
-        responseRaw: probe.responseRaw,
-        details: probe.details,
-      })
-    }
-
-    if (!to) {
-      return c.json({ success: false, error: 'Test recipient (to) is required' }, 400)
-    }
-
-    // ── mode='otp' — real end-to-end test of the verification path: sends the
-    //    ACTUAL template used at signup (verify_phone / verify_email) with a
-    //    sample code to the test target. ──
-    if (testMode === 'otp') {
-      const templateKey = channel === 'EMAIL' ? 'verify_email' : 'verify_phone'
-      const vars = channel === 'EMAIL'
-        ? { fullName: 'BLASTI Test', code: '87654321', expiryMinutes: 10 }
-        : { fullName: 'BLASTI Test', code: '654321', expiryMinutes: 10 }
-      const delivered = await deliverTemplate({ key: templateKey, channel, target: to, language: 'ar', vars })
-
-      await recordTestResult(channel, delivered.success, delivered.error)
-      return c.json({
-        success: delivered.success,
-        error: delivered.error,
-        responseRaw: delivered.responseRaw,
-        providerMessageId: delivered.providerMessageId,
-        details: { mode: 'otp', templateKey, deliveredVia: delivered.deliveredVia },
-      })
-    }
-
-    // ── mode='message' (default) — raw free-form test message (unchanged) ──
-    let result: { success: boolean; error?: string; responseRaw?: string; providerMessageId?: string }
-    if (channel === 'EMAIL') result = await sendTestEmail(to)
-    else if (channel === 'SMS') result = await sendTestSms(to)
-    else result = await sendTestWhatsApp(to)
-
-    return c.json({ success: result.success, error: result.error, responseRaw: result.responseRaw, providerMessageId: result.providerMessageId })
+    await setVerificationMode(mode)
+    return c.json({ success: true, mode })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: false, error: err.error }, err.status as 400)
@@ -497,41 +406,6 @@ app.post('/templates/preview', async (c) => {
   }
 })
 
-// ─── Verification & Security — platform verification mode ──────────────
-
-/**
- * GET /verification-mode — current mandatory-verification mode.
- * 'both' (default) · 'email' · 'phone' · 'none' — which contacts are
- * mandatory at account creation/login (strict reset rule is INDEPENDENT:
- * password reset only ever uses VERIFIED contacts).
- */
-app.get('/verification-mode', async (c) => {
-  try {
-    await requireAdmin(c)
-    return c.json({ success: true, mode: await getVerificationMode() })
-  } catch (error) {
-    const err = authErrorResponse(error)
-    return c.json({ success: false, error: err.error }, err.status as 400)
-  }
-})
-
-/** PUT /verification-mode — { mode }: persist the platform gate. */
-app.put('/verification-mode', async (c) => {
-  try {
-    await requireAdmin(c)
-    const body = await c.req.json().catch(() => ({}))
-    const mode = body?.mode as VerificationMode
-    if (!['none', 'email', 'phone', 'both'].includes(mode)) {
-      return c.json({ success: false, error: "mode must be 'none' | 'email' | 'phone' | 'both'" }, 400)
-    }
-    await setVerificationMode(mode)
-    return c.json({ success: true, mode })
-  } catch (error) {
-    const err = authErrorResponse(error)
-    return c.json({ success: false, error: err.error }, err.status as 400)
-  }
-})
-
 // ─── GET /logs — recent outbound messages ────────────────────────────────────
 
 app.get('/logs', async (c) => {
@@ -547,6 +421,132 @@ app.get('/logs', async (c) => {
       },
     })
     return c.json({ success: true, logs })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
+// ─── PUT /:channel — save config ─────────────────────────────────────────────
+
+const saveConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  apiKey: z.string().max(512).optional(),
+  apiKeyIsMasked: z.boolean().optional(),
+  senderId: z.string().max(120).optional(),
+  phoneNumberId: z.string().max(64).optional(),
+  accountId: z.string().max(64).optional(),
+  apiUrl: z.string().max(256).optional(),
+  extra: z.record(z.string(), z.string().max(512).optional()).optional(),
+})
+
+app.put('/:channel', async (c) => {
+  try {
+    await requireAdmin(c)
+    const channel = c.req.param('channel')
+    if (!isChannel(channel)) {
+      return c.json({ success: false, error: `Invalid channel. Allowed: ${CHANNELS.join(', ')}` }, 400)
+    }
+
+    const body = await c.req.json()
+    const validation = validateBody(saveConfigSchema, body)
+    if (validation.error) {
+      return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
+    }
+    const data = validation.data
+
+    const saved = await saveProviderConfig({
+      channel,
+      enabled: data.enabled,
+      apiKey: data.apiKey,
+      apiKeyIsMasked: data.apiKeyIsMasked,
+      senderId: data.senderId,
+      phoneNumberId: data.phoneNumberId,
+      accountId: data.accountId,
+      apiUrl: data.apiUrl,
+      extra: data.extra as Record<string, string | undefined>,
+    })
+
+    // Sender ID sanity (SMS alphanumeric sender max 11 chars)
+    if (channel === 'SMS' && saved.senderId && saved.senderId.length > 11) {
+      await recordTestResult(channel, false, 'Sender ID must be 11 characters or fewer')
+      return c.json({ success: false, error: 'Sender ID must be 11 characters or fewer' }, 400)
+    }
+
+    return c.json({ success: true, config: await getProviderConfigMasked(channel) })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
+// ─── POST /:channel/test — connection / OTP / message test ──────────────────
+
+type TestMode = 'connection' | 'otp' | 'message'
+
+app.post('/:channel/test', async (c) => {
+  try {
+    await requireAdmin(c)
+    const channel = c.req.param('channel')
+    if (!isChannel(channel)) {
+      return c.json({ success: false, error: `Invalid channel. Allowed: ${CHANNELS.join(', ')}` }, 400)
+    }
+
+    const body = await c.req.json().catch(() => ({}))
+    const { to, mode } = body as { to?: string; mode?: string }
+    if (mode !== undefined && mode !== 'connection' && mode !== 'otp' && mode !== 'message') {
+      return c.json({ success: false, error: "Invalid mode. Allowed: 'connection' (free probe) | 'otp' | 'message'" }, 400)
+    }
+    const testMode: TestMode = mode ?? 'message'
+
+    // ── mode='connection' — FREE probe: validates the stored credentials reach
+    //    the provider without sending any message. Works with an empty target. ──
+    if (testMode === 'connection') {
+      let probe: { ok: boolean; error?: string; responseRaw?: string; details?: Record<string, unknown> }
+      if (channel === 'SMS') probe = await getEsmsBalance()
+      else if (channel === 'EMAIL') probe = await checkEmailConnection()
+      else probe = await verifyWhatsAppConnection()
+
+      await recordTestResult(channel, probe.ok, probe.error)
+      return c.json({
+        success: probe.ok,
+        error: probe.error,
+        responseRaw: probe.responseRaw,
+        details: probe.details,
+      })
+    }
+
+    if (!to) {
+      return c.json({ success: false, error: 'Test recipient (to) is required' }, 400)
+    }
+
+    // ── mode='otp' — real end-to-end test of the verification path: sends the
+    //    ACTUAL template used at signup (verify_phone / verify_email) with a
+    //    sample code to the test target. ──
+    if (testMode === 'otp') {
+      const templateKey = channel === 'EMAIL' ? 'verify_email' : 'verify_phone'
+      const vars = channel === 'EMAIL'
+        ? { fullName: 'BLASTI Test', code: '87654321', expiryMinutes: 10 }
+        : { fullName: 'BLASTI Test', code: '654321', expiryMinutes: 10 }
+      const delivered = await deliverTemplate({ key: templateKey, channel, target: to, language: 'ar', vars })
+
+      await recordTestResult(channel, delivered.success, delivered.error)
+      return c.json({
+        success: delivered.success,
+        error: delivered.error,
+        responseRaw: delivered.responseRaw,
+        providerMessageId: delivered.providerMessageId,
+        details: { mode: 'otp', templateKey, deliveredVia: delivered.deliveredVia },
+      })
+    }
+
+    // ── mode='message' (default) — raw free-form test message (unchanged) ──
+    let result: { success: boolean; error?: string; responseRaw?: string; providerMessageId?: string }
+    if (channel === 'EMAIL') result = await sendTestEmail(to)
+    else if (channel === 'SMS') result = await sendTestSms(to)
+    else result = await sendTestWhatsApp(to)
+
+    return c.json({ success: result.success, error: result.error, responseRaw: result.responseRaw, providerMessageId: result.providerMessageId })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: false, error: err.error }, err.status as 400)

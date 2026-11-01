@@ -105,6 +105,7 @@ interface ResetResult {
   summary: Record<string, number>;
   wipedLogFiles: number;
   wipedAppFiles: number;
+  wipedStorageFiles: number;
   at: string;
 }
 
@@ -557,6 +558,7 @@ export function AdminBackupManager() {
           summary: json.summary && typeof json.summary === 'object' ? json.summary : {},
           wipedLogFiles: typeof json.wipedLogFiles === 'number' ? json.wipedLogFiles : 0,
           wipedAppFiles: typeof json.wipedAppFiles === 'number' ? json.wipedAppFiles : 0,
+          wipedStorageFiles: typeof json.wipedStorageFiles === 'number' ? json.wipedStorageFiles : 0,
           at: typeof json.at === 'string' ? json.at : new Date().toISOString(),
         });
         // refresh every count the manager shows (storage usage, backups…)
@@ -1554,6 +1556,11 @@ export function AdminBackupManager() {
             {resetResult && resetResult.wipedAppFiles > 0 && (
               <p className="text-xs text-muted-foreground">
                 {tr('resetAppFilesWiped', { count: resetResult.wipedAppFiles })}
+              </p>
+            )}
+            {resetResult && resetResult.wipedStorageFiles > 0 && (
+              <p className="text-xs text-muted-foreground">
+                {tr('resetStorageFilesWiped', { count: resetResult.wipedStorageFiles })}
               </p>
             )}
             <Button variant="outline" className="w-full" onClick={() => setResetResult(null)}>

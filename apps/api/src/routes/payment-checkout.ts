@@ -266,6 +266,17 @@ app.post('/create-checkout', async (c) => {
         .filter(Boolean)
         .join(', ')
 
+      // 0.6.46 — the hosted Chargily page must NEVER ask the payer to type
+      // their contact by hand. A fresh agency often has no email/phone yet;
+      // fall back to the PAYING USER's account contact so the gateway page
+      // comes pre-filled (the exact "i have to fill the field myself" report).
+      const payerContact = agency.email && agency.phone
+        ? null
+        : await db.user.findUnique({
+            where: { id: user.id },
+            select: { email: true, phoneNumber: true },
+          })
+
       let checkout
       try {
         checkout = await createCheckout({
@@ -293,11 +304,10 @@ app.post('/create-checkout', async (c) => {
           successUrl,
           failureUrl,
           webhookEndpoint,
-          // Full agency identity — the hosted checkout page shows the
-          // agency's name, email, phone and address (not just the payer).
+          // Full identity — agency first, payer account as fallback.
           customerName: agency.name || user.fullName,
-          customerEmail: agency.email || undefined,
-          customerPhone: agency.phone || undefined,
+          customerEmail: agency.email || payerContact?.email || undefined,
+          customerPhone: agency.phone || payerContact?.phoneNumber || undefined,
           customerAddress: agencyAddress || undefined,
           paymentMethod,
           locale: locale || 'ar',
@@ -535,6 +545,15 @@ app.post('/create-checkout', async (c) => {
       ? [agency.address, agency.city, agency.wilaya, agency.postalCode].filter(Boolean).join(', ')
       : ''
 
+    // 0.6.46 — payer contact fallback (same rule as the subscription site):
+    // the hosted page must never ask for details the platform already knows.
+    const hwPayerContact = agency?.email && agency?.phone
+      ? null
+      : await db.user.findUnique({
+          where: { id: user.id },
+          select: { email: true, phoneNumber: true },
+        })
+
     let checkout
     try {
       checkout = await createCheckout({
@@ -551,8 +570,8 @@ app.post('/create-checkout', async (c) => {
         failureUrl,
         webhookEndpoint,
         customerName: agency?.name || user.fullName,
-        customerEmail: agency?.email || undefined,
-        customerPhone: agency?.phone || undefined,
+        customerEmail: agency?.email || hwPayerContact?.email || undefined,
+        customerPhone: agency?.phone || hwPayerContact?.phoneNumber || undefined,
         customerAddress: hwAddress || undefined,
         paymentMethod,
         locale: locale || 'ar',

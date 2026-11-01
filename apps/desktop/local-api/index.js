@@ -8579,9 +8579,76 @@ function createApp() {
   // the plan catalog and recent payments are mirrored with the exact cloud
   // queries (agency.ts GET /subscription) instead of hardcoded empty arrays.
   // Payment/cancellation/unsubscribe actions still require cloud.
+  // ── 0.6.46 — subscription reconcile helper ────────────────────────────────
+  // A Chargily checkout that settles on the CLOUD (hosted-page poll, webhook,
+  // or another device's result view) used to leave the desktop mirror at
+  // PENDING forever: the sync engine only re-carries the Agency row when the
+  // cloud marks it dirty, so the stale status survived restarts AND data
+  // resets. This helper upserts the cloud's subscription snapshot into the
+  // local agency row so every local reader (subscription page, queue gates)
+  // sees the truth. Best-effort by design — never throws.
+  async function reconcileLocalSubscriptionFromCloud(agencyId, sub) {
+    if (!db || !agencyId || !sub || typeof sub !== 'object') return false
+    try {
+      const data = {}
+      if (typeof sub.currentPlan === 'string' && sub.currentPlan) data.subscriptionTier = sub.currentPlan
+      if (typeof sub.status === 'string' && sub.status) data.subscriptionStatus = sub.status
+      if (sub.subscriptionStartsAt) data.subscriptionStartsAt = sub.subscriptionStartsAt
+      if (sub.subscriptionExpiresAt) data.subscriptionExpiresAt = sub.subscriptionExpiresAt
+      if (Object.keys(data).length === 0) return false
+      const current = await db.agency.findUnique({
+        where: { id: agencyId },
+        select: { subscriptionTier: true, subscriptionStatus: true, subscriptionStartsAt: true, subscriptionExpiresAt: true },
+      })
+      if (!current) return false
+      const differs =
+        current.subscriptionTier !== data.subscriptionTier ||
+        current.subscriptionStatus !== data.subscriptionStatus ||
+        String(current.subscriptionStartsAt || '') !== String(data.subscriptionStartsAt || '') ||
+        String(current.subscriptionExpiresAt || '') !== String(data.subscriptionExpiresAt || '')
+      if (!differs) return false
+      await db.agency.update({ where: { id: agencyId }, data })
+      console.log('[LocalAPI] subscription reconciled from cloud:', agencyId, '→', data.subscriptionStatus, '/', data.subscriptionTier)
+      return true
+    } catch (err) {
+      console.warn('[LocalAPI] subscription reconcile failed (non-fatal):', err?.message || err)
+      return false
+    }
+  }
+
+  /** Cloud-first fetch of the caller's subscription snapshot (null offline). */
+  async function fetchCloudSubscription(query) {
+    if (!sessionToken) return null
+    try {
+      const res = await fetch(cloudBaseUrl() + '/api/agency/subscription' + (query || ''), {
+        headers: { Authorization: `Bearer ${sessionToken}` },
+        signal: AbortSignal.timeout(30000),
+      })
+      if (!res.ok) return null
+      return await res.json().catch(() => null)
+    } catch {
+      return null // offline / cloud unreachable — caller falls back to local
+    }
+  }
+
   app.get('/api/agency/subscription', authMiddleware, async (c) => {
     try {
       const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
+
+      // ── 0.6.46 — CLOUD-FIRST with local reconcile ────────────────────────
+      // The subscription page is payment-critical: when the desktop is
+      // ONLINE the cloud snapshot is the truth (a checkout can settle there
+      // through the hosted-page poll, the webhook or another device — none
+      // of which touch this mirror until the next dirty-field sync). Serve
+      // the cloud response and reconcile the local agency row; any failure
+      // (offline, timeout, non-OK) falls through to the local mirror below.
+      const cloudSub = await fetchCloudSubscription(c.req.url.includes('?') ? '?' + c.req.url.split('?')[1] : '')
+      if (cloudSub && (cloudSub.success !== false)) {
+        if (agencyId) {
+          await reconcileLocalSubscriptionFromCloud(agencyId, cloudSub)
+        }
+        return c.json(cloudSub, 200)
+      }
 
       // Cloud parity (agency.ts:3393-3403): the active plan catalog is
       // embedded in EVERY response — even when the session has no agency.
@@ -9127,6 +9194,30 @@ function createApp() {
       }
       let data = null
       try { data = await res.json() } catch { /* non-JSON error body */ }
+
+      // ── 0.6.46 — reconcile the local subscription mirror on settlement ──
+      // When the poll-fallback (or the webhook) just settled a SUBSCRIPTION
+      // payment on the cloud, pull the fresh subscription snapshot and
+      // upsert it locally — otherwise the desktop kept showing PENDING even
+      // though the payment was confirmed (the mirror only refreshes on the
+      // next dirty-field sync of the Agency row).
+      const settled = data?.data || data
+      if (
+        settled && typeof settled === 'object' &&
+        settled.normalizedStatus === 'paid' &&
+        (settled.type === 'subscription' || settled.type === 'hardware')
+      ) {
+        try {
+          const localAgencyId = await resolveSessionAgencyId()
+          if (localAgencyId) {
+            const sub = await fetchCloudSubscription()
+            if (sub) await reconcileLocalSubscriptionFromCloud(localAgencyId, sub)
+          }
+        } catch (recErr) {
+          console.warn('[LocalAPI] checkout settlement reconcile failed (non-fatal):', recErr?.message || recErr)
+        }
+      }
+
       return c.json(data || { success: res.ok }, res.status)
     } catch (error) {
       console.error('[LocalAPI] checkout-status proxy error:', error)

@@ -146,9 +146,15 @@ function resolveBinaryPath(storageKey: string): string | null {
 //
 // 'android-debug' is tested before 'android' (longer prefix wins) so a debug
 // name can never be swallowed by the plain-android pattern. Files matching NO
-// convention classify as null — callers fall back to row/extension hints.
-// Without this shared parser every delta patch and release reference landed
-// in the admin storage views as "unknown platform" (120 of 163 files once).
+// convention fall through to the TOLERANT parser below — the bucket also
+// holds RAW artifacts pushed before the naming convention existed (CI copies
+// like "BLASTI-Setup-0.6.30.exe", "BLASTI-v0.6.30-debug.apk", "*.blockmap")
+// and those MUST stay version-cleanable: the 0.6.40-and-older range delete
+// used to skip every one of them (they were invisible to the scope planner)
+// while the registry-based UI only offered the newest rows.
+// Without the strict parser half, every delta patch and release reference
+// landed in the admin storage views as "unknown platform" (120 of 163 files
+// once); without the tolerant half, every pre-convention installer did.
 
 const PLATFORMS_DESC = ['android-debug', 'android', 'ios', 'electron', 'windows', 'mac', 'linux']
 
@@ -170,7 +176,83 @@ function classifyBucketFile(baseName: string): BucketFileClass | null {
     const mi = new RegExp(`^${platform}-(\\d+\\.\\d+\\.\\d+)-\\d+-.+$`).exec(baseName)
     if (mi) return { kind: 'installer', platform, version: mi[1] }
   }
+  return classifyLooseBucketFile(baseName)
+}
+
+// ─── Tolerant fallback (raw / pre-convention artifacts) ─────────────────────
+
+/** First "X.Y.Z" token (1–2 digits per part) NOT embedded in a longer number
+ *  — "BLASTI-Setup-0.6.30.exe" → 0.6.30, "BLASTI-v0.6.30-debug.apk" → 0.6.30.
+ *  Date-like tokens (2026.01.15) never match (4-digit year is too long). */
+const SEMVER_TOKEN_RE = /(?<!\d)(\d{1,2}\.\d{1,2}\.\d{1,2})(?!\d|\.\d)/
+
+/** Legacy delta naming variants (no push timestamp): delta-<p>-<a>-to-<b>(-ts)?.patch */
+const LOOSE_DELTA_RE = /^delta-([a-z-]+?)-(\d{1,2}\.\d{1,2}\.\d{1,2})-to-(\d{1,2}\.\d{1,2}\.\d{1,2})(?:-\d+)?\.patch$/i
+
+/** Platform from a name TOKEN (checked before extensions; most specific first). */
+const PLATFORM_TOKENS: Array<[RegExp, string]> = [
+  [/android-debug/, 'android-debug'],
+  [/android|[^a-z]apk|[^a-z]apk$/, 'android'],
+  [/(^|[^a-z])ios($|[^a-z])|[^a-z]ipa/, 'ios'],
+  [/(^|[^a-z])(win32|win64|win|windows|nsis)($|[^a-z])/, 'windows'],
+  [/(^|[^a-z])(mac|macos|osx|darwin)($|[^a-z])/, 'mac'],
+  [/(^|[^a-z])(linux|appimage|debian)($|[^a-z])/, 'linux'],
+  [/electron/, 'electron'],
+]
+
+/** Platform from the file EXTENSION (raw installer artifacts). */
+const PLATFORM_EXTS: Array<[RegExp, string]> = [
+  [/\.apk$/, 'android'],
+  [/\.ipa$/, 'ios'],
+  [/\.exe$|\.msi$/, 'windows'],
+  [/\.dmg$|\.pkg$|\.app\.zip$|\.mac\.zip$/, 'mac'],
+  [/\.appimage$|\.deb$|\.rpm$|\.snap$/, 'linux'],
+]
+
+function platformFromName(lower: string): string | null {
+  for (const [re, platform] of PLATFORM_TOKENS) if (re.test(lower)) return platform
   return null
+}
+
+function platformFromExtension(lower: string): string | null {
+  for (const [re, platform] of PLATFORM_EXTS) if (re.test(lower)) return platform
+  return null
+}
+
+/**
+ * Best-effort classification of files the strict conventions above reject:
+ *   BLASTI-Setup-0.6.30.exe            → windows installer 0.6.30 (.exe)
+ *   BLASTI-v0.6.30-debug.apk           → android-debug installer (.apk+debug)
+ *   Blasti-0.6.30-arm64-mac.zip        → mac (token) installer
+ *   BLASTI-Setup-0.6.30.exe.blockmap   → windows ref (blockmap artifact)
+ *   delta-android-0.6.40-to-0.6.41.patch → legacy delta (no ts suffix)
+ * Files with NO version token classify null on purpose — channel metadata
+ * (latest.yml and friends) advertises the CURRENT release and must survive
+ * every "old versions" sweep.
+ */
+function classifyLooseBucketFile(baseName: string): BucketFileClass | null {
+  const lower = baseName.toLowerCase()
+
+  const legacyDelta = LOOSE_DELTA_RE.exec(lower)
+  if (legacyDelta && PLATFORMS_DESC.includes(legacyDelta[1])) {
+    return { kind: 'delta', platform: legacyDelta[1], version: legacyDelta[2], versionTo: legacyDelta[3] }
+  }
+
+  const vm = SEMVER_TOKEN_RE.exec(lower)
+  if (!vm) return null
+  const version = vm[1]
+
+  // .blockmap is a differential-download companion of a specific build — a
+  // release REFERENCE, not an installer; resolve the platform from the inner
+  // extension ("BLASTI-Setup-0.6.30.exe.blockmap" → .exe → windows).
+  const isBlockmap = lower.endsWith('.blockmap')
+  const probe = isBlockmap ? lower.slice(0, -'.blockmap'.length) : lower
+  let platform = platformFromName(probe) ?? platformFromExtension(probe)
+  // Debug APK convention ("BLASTI-v0.6.30-debug.apk") — same rule as the
+  // storage-files extension fallback, so both views always agree.
+  if (platform === 'android' && lower.includes('debug')) platform = 'android-debug'
+  if (!platform) return null
+  return { kind: isBlockmap ? 'ref' : 'installer', platform, version }
 }
 
 interface BucketFile {
@@ -1465,7 +1547,19 @@ interface CleanupPlan {
   installers: Array<{ storageKey: string; size: number }>
   refs: Array<{ storageKey: string; size: number }>
   deltas: Array<{ id: string; fromVersion: string; toVersion: string; storageKey: string; size: number }>
-  orphans: Array<{ storageKey: string; size: number }>
+  orphans: Array<{ storageKey: string; size: number; version: string }>
+  /** Per-version breakdown for the preview table (files ∪ bytes, both delta ends). */
+  perVersion: Array<{
+    version: string
+    files: number
+    bytes: number
+    installers: number
+    refs: number
+    deltas: number
+    orphans: number
+    hasDbRow: boolean
+    isPublished: boolean
+  }>
 }
 
 /** DB size when known, else a stat of the resolved file (0 when missing). */
@@ -1549,10 +1643,12 @@ async function buildCleanupPlan(
   // Unreferenced files: scan the WHOLE bucket (group folders + legacy flat
   // root) through the shared naming parser — installer, asar/outref refs and
   // delta patches all classify here, so old releases with no DB row are
-  // swept too. Every match is pinned to the CLEANUP platform —
-  // 'windows-9.9.0-…' in desktop/ shares its version string with an android
-  // scope but must never be classified as an android orphan; 'android' also
-  // excludes 'android-debug-…' files.
+  // swept too — INCLUDING raw pre-convention artifacts the tolerant parser
+  // recognizes (BLASTI-Setup-0.6.30.exe, BLASTI-v0.6.30-debug.apk, .blockmap).
+  // Every match is pinned to the CLEANUP platform — 'windows-9.9.0-…' in
+  // desktop/ shares its version string with an android scope but must never
+  // be classified as an android orphan; the classifier also flags debug APKs
+  // as 'android-debug', so an 'android' cleanup can never swallow them.
   const orphans: CleanupPlan['orphans'] = []
   if (scopeStrings.length > 0) {
     const referenced = new Set([
@@ -1564,9 +1660,6 @@ async function buildCleanupPlan(
     const bucketFiles = await walkBucket()
     for (const f of bucketFiles) {
       if (referenced.has(f.storageKey)) continue
-      // 'android' cleanup must not swallow 'android-debug-…' files.
-      if (platform === 'android' && f.name.startsWith('android-debug-')) continue
-      if (platform === 'android-debug' && !f.name.startsWith('android-debug-')) continue
       const cls = classifyBucketFile(f.name)
       if (!cls || cls.platform !== platform) continue
       let matchedVersion: string | null = cls.version
@@ -1574,9 +1667,63 @@ async function buildCleanupPlan(
         matchedVersion = scopeSet.has(cls.version) ? cls.version : (cls.versionTo ?? null)
       }
       if (matchedVersion && scopeSet.has(matchedVersion)) {
-        orphans.push({ storageKey: f.storageKey, size: f.size })
+        orphans.push({ storageKey: f.storageKey, size: f.size, version: matchedVersion })
       }
     }
+  }
+
+  // Per-version breakdown for the preview table — DB-referenced artifacts
+  // attribute to their row's version, delta patches to BOTH endpoints (same
+  // convention as /storage-versions), orphans to the version string their
+  // name matched. Rows never sum in the UI, so double-attribution is safe.
+  const perVersionMap = new Map<string, CleanupPlan['perVersion'][number]>()
+  const touchV = (v: string) => {
+    let row = perVersionMap.get(v)
+    if (!row) {
+      row = {
+        version: v,
+        files: 0,
+        bytes: 0,
+        installers: 0,
+        refs: 0,
+        deltas: 0,
+        orphans: 0,
+        hasDbRow: targets.some((t) => t.version === v),
+        isPublished: targets.find((t) => t.version === v)?.isPublished ?? false,
+      }
+      perVersionMap.set(v, row)
+    }
+    return row
+  }
+  for (const r of targets) {
+    const add = (size: number, kind: 'installers' | 'refs') => {
+      const row = touchV(r.version)
+      row.files += 1
+      row.bytes += size
+      row[kind] += 1
+    }
+    if (r.fileStorageKey) add(cleanupArtifactSize(r.fileStorageKey, r.fileSize), 'installers')
+    if (r.asarStorageKey) add(cleanupArtifactSize(r.asarStorageKey, r.asarSize), 'refs')
+    if (r.outrefStorageKey) add(cleanupArtifactSize(r.outrefStorageKey, r.outrefSize), 'refs')
+  }
+  for (const d of deltas) {
+    const size = cleanupArtifactSize(d.fileStorageKey, d.fileSize)
+    touchV(d.fromVersion).deltas += 1
+    const fromRow = touchV(d.fromVersion)
+    fromRow.files += 1
+    fromRow.bytes += size
+    if (d.toVersion !== d.fromVersion) {
+      touchV(d.toVersion).deltas += 1
+      const toRow = touchV(d.toVersion)
+      toRow.files += 1
+      toRow.bytes += size
+    }
+  }
+  for (const o of orphans) {
+    const row = touchV(o.version)
+    row.files += 1
+    row.bytes += o.size
+    row.orphans += 1
   }
 
   return {
@@ -1599,6 +1746,7 @@ async function buildCleanupPlan(
       size: d.fileSize,
     })),
     orphans,
+    perVersion: [...perVersionMap.values()].sort((a, b) => compareVersionStrings(b.version, a.version)),
   }
 }
 
@@ -1640,6 +1788,7 @@ app.post('/cleanup-preview', async (c) => {
           pairs: plan.deltas.map((d) => `${d.fromVersion} → ${d.toVersion}`),
         },
         orphanedBuilds: { count: plan.orphans.length, bytes: orphanBytes },
+        perVersion: plan.perVersion,
         totalFiles: plan.installers.length + plan.refs.length + plan.deltas.length + plan.orphans.length,
         totalBytes: installerBytes + refBytes + deltaBytes + orphanBytes,
       },

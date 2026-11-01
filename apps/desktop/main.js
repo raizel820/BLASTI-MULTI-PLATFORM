@@ -2290,6 +2290,26 @@ async function installDownloadedUpdate() {
     // Fallbacks: dev runs (not packaged), per-machine (Program Files) installs
     // (the PowerShell leg elevates via UAC — a non-elevated silent install
     // into Program Files ALWAYS fails silently), or a failed waiter copy.
+    // 0.6.46 — AV-PROOF MIDDLE LEG: ShellExecute the installer EXACTLY like a
+    // user double-click (explorer → CreateProcessW via the shell). Field
+    // reports show endpoint AV suites heuristically kill BOTH remaining legs:
+    // the freshly-copied waiter exe (unsigned exe appearing in
+    // %APPDATA%\BLASTI\updates\) AND powershell.exe -EncodedCommand. Opening
+    // the installer through the shell gives the assisted NSIS wizard
+    // (oneClick:false) — the user clicks Install, elevation (per-machine) is
+    // requested BY THE WIZARD (allowElevation:true), and the finish page
+    // relaunches the app. No script, no suspicious process for an AV to shoot.
+    if (app.isPackaged) {
+      let shellOpenErr = '';
+      try { shellOpenErr = await shell.openPath(installer); } catch (err) { shellOpenErr = String(err); }
+      if (!shellOpenErr) {
+        console.log('[BLASTI Desktop] installer opened through the shell (visible wizard) — quitting for install');
+        sendUpdateProgress({ status: 'installing', version: '' });
+        quitForUpdate();
+        return { ok: true, via: 'shell-wizard' };
+      }
+      console.warn('[BLASTI Desktop] shell.openPath leg failed:', shellOpenErr);
+    }
     const psPid = spawnSilentWindowsInstall(installer, { elevate: app.isPackaged && !isPerUserWindowsInstall() });
     if (psPid && await procAlive(psPid)) {
       console.log('[BLASTI Desktop] PowerShell installer leg confirmed alive (pid', psPid + ') — quitting for install');

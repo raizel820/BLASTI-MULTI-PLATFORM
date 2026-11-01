@@ -16,13 +16,26 @@
  *       devices | sessions
  *
  * Response: { success: true, mode, sections, summary: {model: deletedCount},
- *             wipedLogFiles: n, wipedAppFiles: n, at: iso }
+ *             wipedLogFiles: n, wipedAppFiles: n, wipedStorageFiles: n,
+ *             wipedStorage: { avatar: n, logo: n, receipt: n }, at: iso }
  *
  * PUBLIC APPS MANAGER (user requirement): a full reset WITHOUT
  * preserveVersions also resets the Public Apps Manager — AppVersion AND
  * AppVersionDelta rows are deleted AND the whole app-versions storage bucket
  * (installers, asar/outref release references, delta patches) is wiped from
  * disk after the transaction commits, so no orphaned binaries survive.
+ *
+ * STORAGE MANAGER (user requirement): a full reset ALSO wipes the storage
+ * buckets that hold personal/agency artifacts — avatar/ (profile pictures),
+ * logo/ (agency logos + covers) and receipt/ (payment receipts). Their
+ * FileAsset rows already die inside the transaction; the FILES are removed
+ * post-commit (a DB rollback never destroys files). Section resets clean up
+ * after themselves too, scoped to what the section actually deleted:
+ *   customers    → avatar files of the DELETED customer users
+ *   agencies     → logo files of the DELETED agencies
+ *   transactions → every tracked receipt file (all transactions die)
+ * Untracked leftovers stay visible in the Storage Manager on purpose —
+ * only the full reset is a bucket-wide wipe.
  *
  * SAFETY MODEL (hard guarantees, both modes):
  *   - SUPER_ADMIN only (requireAdmin — same gate as the other admin routes).
@@ -189,6 +202,58 @@ function wipePublicAppFiles(): number {
   return wiped
 }
 
+// ─── storage-manager buckets (avatars / logos / receipts) ───────────────────
+
+/** Buckets a FULL reset wipes bucket-wide (files whose FileAsset rows already
+ *  died inside the transaction + untracked leftovers). */
+const STORAGE_WIPE_BUCKETS = ['avatar', 'logo', 'receipt'] as const
+
+/**
+ * Wipe every entry under ONE storage bucket (avatar/ logo/ receipt/).
+ * Traversal-hardened: the bucket name must be one of the fixed constants and
+ * the resolved path must stay inside STORAGE_ROOT. Returns files removed.
+ */
+function wipeStorageBucket(bucket: string): number {
+  if (!(STORAGE_WIPE_BUCKETS as readonly string[]).includes(bucket)) return 0
+  const rootResolved = path.resolve(STORAGE_ROOT)
+  const bucketDir = path.resolve(rootResolved, bucket)
+  if (!bucketDir.startsWith(rootResolved + path.sep)) return 0
+  let wiped = 0
+  let entries: fs.Dirent[] = []
+  try {
+    entries = fs.readdirSync(bucketDir, { withFileTypes: true })
+  } catch {
+    return 0 // missing bucket → nothing to wipe
+  }
+  for (const e of entries) {
+    wiped += rmCountingFiles(path.join(bucketDir, e.name))
+  }
+  return wiped
+}
+
+/**
+ * Delete EXACT files by FileAsset storagePath ("avatar/2025/06/x.png"). Used
+ * by section resets so only the artifacts of the deleted rows are removed —
+ * surviving accounts (admins) keep their avatars/logos. Returns files removed.
+ */
+function wipeStoragePaths(paths: string[]): number {
+  const rootResolved = path.resolve(STORAGE_ROOT)
+  let wiped = 0
+  for (const p of paths) {
+    const abs = path.resolve(rootResolved, p.replace(/\\/g, '/'))
+    if (!abs.startsWith(rootResolved + path.sep)) continue
+    try {
+      if (fs.statSync(abs).isFile()) {
+        fs.unlinkSync(abs)
+        wiped++
+      }
+    } catch {
+      // missing / raced — best effort
+    }
+  }
+  return wiped
+}
+
 // ─── tx helpers ─────────────────────────────────────────────────────────────
 
 type Summary = Record<string, number>
@@ -196,6 +261,10 @@ type Summary = Record<string, number>
 function bump(summary: Summary, key: string, count: number): void {
   if (count > 0) summary[key] = (summary[key] ?? 0) + count
 }
+
+/** Storage paths (FileAsset.storagePath) collected in-tx for the post-commit
+ *  file wipe — the DB rollback can't cover files, so deletion runs after. */
+const pendingFileWipes: string[] = []
 
 // Prisma's interactive-transaction client type is not exported — the shared
 // tx-retry helper (lib/tx-retry.ts) uses the same `(tx: any)` convention.
@@ -220,6 +289,16 @@ async function resetCustomers(tx: any, summary: Summary): Promise<void> {
   bump(summary, 'favorites', (await tx.favorite.deleteMany({ where: { userId: { in: ids } } })).count)
   bump(summary, 'notifications', (await tx.notification.deleteMany({ where: { userId: { in: ids } } })).count)
   bump(summary, 'smsPurchases', (await tx.smsPurchase.deleteMany({ where: { userId: { in: ids } } })).count)
+
+  // Profile pictures of the deleted customers — FileAsset rows die in-tx,
+  // the FILES follow after commit (surviving admins keep their avatars).
+  const avatarRows = await tx.fileAsset.findMany({
+    where: { bucket: 'avatar', ownerId: { in: ids }, deletedAt: null },
+    select: { id: true, storagePath: true },
+  })
+  for (const r of avatarRows) pendingFileWipes.push(r.storagePath)
+  bump(summary, 'fileAssets', (await tx.fileAsset.deleteMany({ where: { id: { in: avatarRows.map((r: { id: string }) => r.id) } } })).count)
+
   bump(summary, 'users', (await tx.user.deleteMany({ where: { id: { in: ids } } })).count)
 }
 
@@ -258,6 +337,16 @@ async function resetAgencies(tx: any, summary: Summary): Promise<void> {
     bump(summary, 'syncMutations', (await tx.syncMutation.deleteMany({ where: { agencyId: inIds } })).count)
     bump(summary, 'agencyLocalStates', (await tx.agencyLocalState.deleteMany({ where: { agencyId: inIds } })).count)
     bump(summary, 'branches', (await tx.branch.deleteMany({ where: { agencyId: inIds } })).count)
+
+    // Agency logos + covers of the deleted agencies — FileAsset rows die
+    // in-tx, the FILES follow after commit.
+    const logoRows = await tx.fileAsset.findMany({
+      where: { bucket: 'logo', agencyId: inIds, deletedAt: null },
+      select: { id: true, storagePath: true },
+    })
+    for (const r of logoRows) pendingFileWipes.push(r.storagePath)
+    bump(summary, 'fileAssets', (await tx.fileAsset.deleteMany({ where: { id: { in: logoRows.map((r: { id: string }) => r.id) } } })).count)
+
     bump(summary, 'agencies', (await tx.agency.deleteMany({ where: { id: inIds } })).count)
   }
 
@@ -277,6 +366,14 @@ async function resetAnalytics(tx: any, summary: Summary): Promise<void> {
 async function resetTransactions(tx: any, summary: Summary): Promise<void> {
   bump(summary, 'transactions', (await tx.transaction.deleteMany({})).count)
   bump(summary, 'smsPurchases', (await tx.smsPurchase.deleteMany({})).count)
+
+  // Every payment receipt/invoice file — all transactions just died.
+  const receiptRows = await tx.fileAsset.findMany({
+    where: { bucket: 'receipt', deletedAt: null },
+    select: { id: true, storagePath: true },
+  })
+  for (const r of receiptRows) pendingFileWipes.push(r.storagePath)
+  bump(summary, 'fileAssets', (await tx.fileAsset.deleteMany({ where: { id: { in: receiptRows.map((r: { id: string }) => r.id) } } })).count)
 }
 
 /** Section: logs — account-log DB rows (audit trail). Files after commit. */
@@ -480,8 +577,13 @@ app.post('/', async (c) => {
   const summary: Summary = {}
   let wipedLogFiles = 0
   let wipedAppFiles = 0
+  const wipedStorage: Record<string, number> = {}
 
   try {
+    // Fresh wipe list per call — the array is module-level so a retry never
+    // re-deletes paths from an earlier failed attempt.
+    pendingFileWipes.length = 0
+
     // ── ONE interactive transaction: everything rolls back on any failure ──
     await db.$transaction(
       async (tx: any) => {
@@ -540,6 +642,32 @@ app.post('/', async (c) => {
     }
   }
 
+  // ── after commit: wipe the STORAGE MANAGER personal-artifact files ──
+  // Full reset → bucket-wide wipe of avatar/ logo/ receipt/ (their FileAsset
+  // rows already died in-tx; untracked leftovers go too — this IS the wipe
+  // the user asked for). Section resets → only the exact files whose
+  // FileAsset rows were deleted inside the transaction (customers → customer
+  // avatars, agencies → agency logos, transactions → payment receipts), so
+  // surviving accounts (admins) keep their profile images.
+  let wipedStorageFiles = 0
+  if (isFull) {
+    for (const bucket of STORAGE_WIPE_BUCKETS) {
+      try {
+        const n = wipeStorageBucket(bucket)
+        if (n > 0) wipedStorage[bucket] = n
+        wipedStorageFiles += n
+      } catch (err) {
+        console.error(`[admin-reset] storage bucket wipe failed (${bucket}):`, err)
+      }
+    }
+  } else if (pendingFileWipes.length > 0) {
+    try {
+      wipedStorageFiles = wipeStoragePaths(pendingFileWipes)
+    } catch (err) {
+      console.error('[admin-reset] storage file wipe failed (DB reset unaffected):', err)
+    }
+  }
+
   const at = new Date().toISOString()
 
   // ── audit trail (written AFTER the reset so it survives it) ──
@@ -555,6 +683,8 @@ app.post('/', async (c) => {
       summary,
       wipedLogFiles,
       wipedAppFiles,
+      wipedStorageFiles,
+      wipedStorage,
     },
   })
 
@@ -565,6 +695,8 @@ app.post('/', async (c) => {
     summary,
     wipedLogFiles,
     wipedAppFiles,
+    wipedStorageFiles,
+    wipedStorage,
     at,
   })
 })

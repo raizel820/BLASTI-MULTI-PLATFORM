@@ -521,8 +521,12 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
   // create-agency wizard, never in an infinite spinner or an empty shell.
   if (!agencyId) {
     return (
-      <div className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 flex items-start justify-center safe-area-inset">
-        <div className="w-full max-w-lg px-3 py-6">
+      // min-h-dvh (dynamic viewport) — on the mobile WebView the keyboard and
+      // browser chrome shrink the VISIBLE area; 100vh kept the bottom of the
+      // wizard (the Next button) outside the scrollable range. dvh + the
+      // wizard's own sticky nav bar keep every control reachable.
+      <div className="min-h-dvh bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 flex items-start justify-center safe-area-inset">
+        <div className="w-full max-w-lg px-3 py-6 pb-10">
           <CreateAgencyForm
             onAgencyCreated={() => {
               // The store already carries the new agencyId — the parent

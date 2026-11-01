@@ -94,6 +94,21 @@ import { NotesInput, type NotesValue } from './notes-input';
 
 const AUTO_REFRESH_MS = 30_000;
 
+/**
+ * File-type bucket for the type filter — the extension the admin thinks in:
+ * apk / exe / msi / dmg / pkg / appimage / deb / rpm / snap / zip / yml /
+ * blockmap / patch / asar / outref / bin / other. Multi-part artifacts
+ * collapse sensibly ("*.exe.blockmap" → blockmap, "*.tar.gz" → gz).
+ */
+function fileTypeOf(name: string): string {
+  const lower = name.toLowerCase();
+  if (lower.endsWith('.blockmap')) return 'blockmap';
+  const ext = lower.includes('.') ? lower.slice(lower.lastIndexOf('.') + 1) : '';
+  if (!ext) return 'other';
+  if (ext === 'yaml') return 'yml';
+  return ext;
+}
+
 interface UploadForm {
   platform: InstallerPlatform;
   version: string;
@@ -119,6 +134,7 @@ export function InstallersTab() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<string>('all');
+  const [typeFilter, setTypeFilter] = useState<string>('all');
 
   // ── Activate state ──
   const [activatingKey, setActivatingKey] = useState<string | null>(null);
@@ -180,6 +196,33 @@ export function InstallersTab() {
   const visibleGroups = useMemo(
     () => (filter === 'all' ? groups : groups.filter((g) => g.platform === filter)),
     [groups, filter],
+  );
+
+  // ── File-type filter (apk / exe / bin / asar / patch / …) ──
+  // Type options derive from EVERY file on disk so the counts stay honest;
+  // the platform groups keep their shape and only their ROWS narrow — an
+  // empty group disappears instead of showing an empty table.
+  const typeOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const f of files) {
+      const type = fileTypeOf(f.name);
+      counts.set(type, (counts.get(type) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([type, count]) => ({ type, count }));
+  }, [files]);
+
+  const typeVisibleGroups = useMemo(() => {
+    if (typeFilter === 'all') return visibleGroups;
+    return visibleGroups
+      .map((g) => ({ ...g, rows: g.rows.filter((f) => fileTypeOf(f.name) === typeFilter) }))
+      .filter((g) => g.rows.length > 0);
+  }, [visibleGroups, typeFilter]);
+
+  const visibleFileCount = useMemo(
+    () => typeVisibleGroups.reduce((n, g) => n + g.rows.length, 0),
+    [typeVisibleGroups],
   );
 
   // Currently active file per platform (EXACT identity) — used to decide
@@ -363,36 +406,80 @@ export function InstallersTab() {
         <CardContent className="space-y-4">
           {/* Filter chips — All + every platform present, with counts */}
           {!loading && files.length > 0 && (
-            <div className="flex flex-wrap items-center gap-2" role="group" aria-label={t('publicAppFilterPlatform')}>
-              <Button
-                size="sm"
-                variant={filter === 'all' ? 'default' : 'outline'}
-                className="h-8 rounded-full px-3 text-xs"
-                onClick={() => setFilter('all')}
-              >
-                {t('publicAppFilterAll')}
-                <Badge variant="secondary" className="ms-1.5 h-4 px-1.5 text-[10px] rounded-full">
-                  {files.length}
-                </Badge>
-              </Button>
-              {groups.map((g) => {
-                const Icon = platformIcon(g.platform);
-                return (
-                  <Button
-                    key={g.platform || 'unknown'}
-                    size="sm"
-                    variant={filter === g.platform ? 'default' : 'outline'}
-                    className="h-8 rounded-full px-3 text-xs"
-                    onClick={() => setFilter(g.platform)}
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2" role="group" aria-label={t('publicAppFilterPlatform')}>
+                <Button
+                  size="sm"
+                  variant={filter === 'all' ? 'default' : 'outline'}
+                  className="h-8 rounded-full px-3 text-xs"
+                  onClick={() => setFilter('all')}
+                >
+                  {t('publicAppFilterAll')}
+                  <Badge variant="secondary" className="ms-1.5 h-4 px-1.5 text-[10px] rounded-full">
+                    {files.length}
+                  </Badge>
+                </Button>
+                {groups.map((g) => {
+                  const Icon = platformIcon(g.platform);
+                  return (
+                    <Button
+                      key={g.platform || 'unknown'}
+                      size="sm"
+                      variant={filter === g.platform ? 'default' : 'outline'}
+                      className="h-8 rounded-full px-3 text-xs"
+                      onClick={() => setFilter(g.platform)}
+                    >
+                      <Icon className="h-3.5 w-3.5" />
+                      {platformLabel(g.platform, lang)}
+                      <Badge variant="secondary" className="ms-1.5 h-4 px-1.5 text-[10px] rounded-full">
+                        {g.rows.length}
+                      </Badge>
+                    </Button>
+                  );
+                })}
+              </div>
+
+              {/* File-type filter — apk / exe / bin / asar / patch / … */}
+              <div className="flex items-center gap-2">
+                <Select value={typeFilter} onValueChange={setTypeFilter}>
+                  <SelectTrigger
+                    className="h-8 w-full sm:w-56 text-xs rounded-full"
+                    aria-label={t('publicAppFilterType')}
                   >
-                    <Icon className="h-3.5 w-3.5" />
-                    {platformLabel(g.platform, lang)}
-                    <Badge variant="secondary" className="ms-1.5 h-4 px-1.5 text-[10px] rounded-full">
-                      {g.rows.length}
-                    </Badge>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">
+                      <span className="flex items-center justify-between gap-2 w-full">
+                        <span>{t('publicAppFilterAllTypes')}</span>
+                        <Badge variant="secondary" className="h-4 px-1.5 text-[10px] rounded-full">
+                          {files.length}
+                        </Badge>
+                      </span>
+                    </SelectItem>
+                    {typeOptions.map(({ type, count }) => (
+                      <SelectItem key={type} value={type}>
+                        <span className="flex items-center justify-between gap-2 w-full">
+                          <span className="font-mono" dir="ltr">.{type}</span>
+                          <Badge variant="secondary" className="h-4 px-1.5 text-[10px] rounded-full">
+                            {count}
+                          </Badge>
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {typeFilter !== 'all' && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-8 rounded-full px-3 text-xs"
+                    onClick={() => setTypeFilter('all')}
+                  >
+                    {t('publicAppFilterClear')}
                   </Button>
-                );
-              })}
+                )}
+              </div>
             </div>
           )}
 
@@ -429,10 +516,23 @@ export function InstallersTab() {
             </div>
           )}
 
+          {/* Type-filter empty state — files exist but none match the type */}
+          {!loading && !error && files.length > 0 && visibleFileCount === 0 && (
+            <div className="flex flex-col items-center gap-2 py-10 text-center">
+              <div className="h-10 w-10 rounded-full bg-muted flex items-center justify-center">
+                <FileArchive className="h-5 w-5 text-muted-foreground" />
+              </div>
+              <p className="text-sm font-medium text-foreground">{t('publicAppFilterNoMatch')}</p>
+              <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => setTypeFilter('all')}>
+                {t('publicAppFilterAllTypes')}
+              </Button>
+            </div>
+          )}
+
           {/* Grouped tables */}
           {!loading &&
             !error &&
-            visibleGroups.map((group) => {
+            typeVisibleGroups.map((group) => {
               const Icon = platformIcon(group.platform);
               const activeKey = activeByPlatform.get(group.platform)?.storageKey;
 

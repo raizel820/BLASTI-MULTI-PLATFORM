@@ -1708,48 +1708,58 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
         </motion.div>
       </AnimatePresence>
 
-      {/* Navigation Buttons */}
-      <div className="flex items-center justify-between mt-5 gap-3">
-        {step > 0 ? (
-          <Button
-            variant="outline"
-            onClick={handleBack}
-            className="gap-1.5 rounded-xl h-10"
-          >
-            <ArrowLeft className="h-3.5 w-3.5 rtl:rotate-180" />
-            {t('back' as any)}
-          </Button>
-        ) : (
-          <div />
-        )}
+      {/* Navigation Buttons — STICKY above the keyboard: on phones the step
+          content is taller than the visual viewport and the in-flow button
+          under a long first step was unreachable (the exact "no next button,
+          stuck at step 1" mobile report). Sticky keeps Back/Next on screen
+          at every scroll position, on every host (mobile WebView, desktop
+          shell, browser). */}
+      <div
+        className="sticky bottom-0 z-20 mt-5 pb-[max(env(safe-area-inset-bottom),0.25rem)] pt-2"
+        style={{ backgroundColor: 'transparent' }}
+      >
+        <div className="flex items-center justify-between gap-3 rounded-2xl border bg-background/95 p-2 shadow-lg shadow-black/5 backdrop-blur supports-[backdrop-filter]:bg-background/85">
+          {step > 0 ? (
+            <Button
+              variant="outline"
+              onClick={handleBack}
+              className="gap-1.5 rounded-xl h-10"
+            >
+              <ArrowLeft className="h-3.5 w-3.5 rtl:rotate-180" />
+              {t('back' as any)}
+            </Button>
+          ) : (
+            <div />
+          )}
 
-        {step < totalSteps - 1 ? (
-          <Button
-            onClick={handleNext}
-            className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white gap-1.5 shadow-sm rounded-xl h-10 px-5"
-          >
-            {t('next' as any)}
-            <ArrowRight className="h-3.5 w-3.5 rtl:rotate-180" />
-          </Button>
-        ) : (
-          <Button
-            onClick={handleCreate}
-            disabled={creating}
-            className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white gap-1.5 shadow-lg shadow-emerald-500/20 rounded-xl h-10 px-5"
-          >
-            {creating ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                {t('creating' as any)}
-              </>
-            ) : (
-              <>
-                <Building2 className="h-4 w-4" />
-                {t('createAgency' as any)}
-              </>
-            )}
-          </Button>
-        )}
+          {step < totalSteps - 1 ? (
+            <Button
+              onClick={handleNext}
+              className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white gap-1.5 shadow-sm rounded-xl h-10 px-5"
+            >
+              {t('next' as any)}
+              <ArrowRight className="h-3.5 w-3.5 rtl:rotate-180" />
+            </Button>
+          ) : (
+            <Button
+              onClick={handleCreate}
+              disabled={creating}
+              className="bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white gap-1.5 shadow-lg shadow-emerald-500/20 rounded-xl h-10 px-5"
+            >
+              {creating ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {t('creating' as any)}
+                </>
+              ) : (
+                <>
+                  <Building2 className="h-4 w-4" />
+                  {t('createAgency' as any)}
+                </>
+              )}
+            </Button>
+          )}
+        </div>
       </div>
     </div>
   );
