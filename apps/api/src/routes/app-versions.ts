@@ -3,6 +3,7 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { db } from '@blasti/db'
 import { requireAdmin, authErrorResponse } from '../lib/auth'
+import { auditLog } from '../lib/audit'
 import { STORAGE_ROOT } from '../lib/storage'
 import { z } from 'zod'
 import crypto from 'crypto'
@@ -17,7 +18,7 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 // permanently shadowed newer CI builds and devices were told "up to date".
 import { pickLatestAppVersion } from '../lib/app-version-rank'
 // Delta Updates (0.6.30) — differential patch graph + generation
-import { computeDeltaChain, generateDeltasForVersion } from '../lib/app-version-deltas'
+import { computeDeltaChain, generateDeltasForVersion, compareVersionStrings } from '../lib/app-version-deltas'
 // API Compatibility Map (0.6.31) — app↔server capability matrix
 import { evaluateCompatibility, seedDefaultGates, CURRENT_SERVER_API_LEVEL, MIN_SUPPORTED_API_LEVEL } from '../lib/api-compat'
 
@@ -1258,6 +1259,331 @@ app.delete('/:id', async (c) => {
     invalidateResponseCacheTag('app-versions')
 
     return c.json({ success: true })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── Storage cleanup (Public Apps Manager — Versions tab) ───────────────────
+//
+// Backs the "Cleanup" button: pick one version of one platform, choose how
+// much release history to remove, and delete ALL installers + ALL delta
+// update patches + ALL related files of everything in scope. Scopes:
+//
+//   this           → ONLY the selected version
+//   with-previous  → the selected version + EVERY older version (semver) of
+//                    the same platform — its full release history
+//
+// For every version in scope this removes EVERYTHING related:
+//   • the AppVersion row (UpdatePush rows cascade with it),
+//   • ALL its installer files — the current binary (fileStorageKey, legacy
+//     tmpdir fallback) AND unreferenced older builds still sitting in the
+//     bucket (same-name CI rebuilds — AppVersion keeps only the newest file
+//     per platform+version, everything else was invisible to the DB),
+//   • the desktop release references (asar / outref),
+//   • EVERY AppVersionDelta row + patch file touching an in-scope version
+//     string (fromVersion OR toVersion) — with the endpoint rows gone those
+//     patches are unreachable dead weight.
+//
+// Preview and execution share ONE planner, so the summary the UI shows is
+// always exactly what the execute call deletes.
+
+const cleanupBodySchema = z.object({
+  platform: z.enum(['android', 'android-debug', 'ios', 'electron', 'windows', 'mac', 'linux']),
+  version: z.string().regex(/^\d+\.\d+\.\d+/, 'Version must be semver (e.g. 1.2.3)'),
+  scope: z.enum(['this', 'with-previous']),
+})
+
+interface CleanupPlan {
+  targets: Array<{
+    id: string
+    platform: string
+    version: string
+    isPublished: boolean
+    fileName: string | null
+    createdAt: Date
+  }>
+  installers: Array<{ storageKey: string; size: number }>
+  refs: Array<{ storageKey: string; size: number }>
+  deltas: Array<{ id: string; fromVersion: string; toVersion: string; storageKey: string; size: number }>
+  orphans: Array<{ storageKey: string; size: number }>
+}
+
+/** DB size when known, else a stat of the resolved file (0 when missing). */
+function cleanupArtifactSize(storageKey: string, dbSize: number | null): number {
+  if (typeof dbSize === 'number' && dbSize > 0) return dbSize
+  const p = resolveBinaryPath(storageKey)
+  if (!p) return 0
+  try {
+    return fs.statSync(p).size
+  } catch {
+    return 0
+  }
+}
+
+async function buildCleanupPlan(
+  platform: string,
+  version: string,
+  scope: 'this' | 'with-previous',
+): Promise<CleanupPlan | null> {
+  // Both scopes operate ON the selected row — a typo must not guess what the
+  // admin meant, so the row has to exist.
+  const selected = await db.appVersion.findUnique({
+    where: { platform_version: { platform, version } },
+  })
+  if (!selected) return null
+
+  const rows = await db.appVersion.findMany({ where: { platform } })
+  const targets = rows.filter((r) => {
+    if (scope === 'this') return r.version === version
+    return r.version === version || compareVersionStrings(r.version, version) < 0
+  })
+
+  const scopeStrings = [...new Set(targets.map((r) => r.version))]
+  const deltas = scopeStrings.length
+    ? await db.appVersionDelta.findMany({
+        where: {
+          platform,
+          OR: [{ fromVersion: { in: scopeStrings } }, { toVersion: { in: scopeStrings } }],
+        },
+      })
+    : []
+
+  const installers: CleanupPlan['installers'] = []
+  const refs: CleanupPlan['refs'] = []
+  for (const r of targets) {
+    if (r.fileStorageKey) {
+      installers.push({ storageKey: r.fileStorageKey, size: cleanupArtifactSize(r.fileStorageKey, r.fileSize) })
+    }
+    if (r.asarStorageKey) {
+      refs.push({ storageKey: r.asarStorageKey, size: cleanupArtifactSize(r.asarStorageKey, r.asarSize) })
+    }
+    if (r.outrefStorageKey) {
+      refs.push({ storageKey: r.outrefStorageKey, size: cleanupArtifactSize(r.outrefStorageKey, r.outrefSize) })
+    }
+  }
+
+  // Unreferenced same-version builds: scan the bucket's group folders and
+  // match the upload naming conventions (mirrors GET /storage-files parseKey
+  // + the release-refs / delta writers):
+  //   installer  <platform>-<semver>-<ts>-<original>
+  //   ref        (asar|outref)-<platform>-<semver>-<ts>-<original>
+  //   delta      delta-<platform>-<semver>-to-<semver>-<ts>.patch
+  // Every pattern is pinned to the CLEANUP platform — 'windows-9.9.0-…' in
+  // desktop/ shares its version string with an android scope but must never
+  // be classified as an android orphan. 'android' also has to exclude
+  // 'android-debug-…' files (longer platform prefix wins the name).
+  const orphans: CleanupPlan['orphans'] = []
+  if (scopeStrings.length > 0) {
+    const referenced = new Set([
+      ...installers.map((f) => f.storageKey),
+      ...refs.map((f) => f.storageKey),
+      ...deltas.map((d) => d.fileStorageKey),
+    ])
+    const scopeSet = new Set(scopeStrings)
+    const instRe = new RegExp(`^${platform}-(\\d+\\.\\d+\\.\\d+)-\\d+-.+$`)
+    const refRe = new RegExp(`^(?:asar|outref)-${platform}-(\\d+\\.\\d+\\.\\d+)-\\d+-`)
+    const deltaRe = new RegExp(`^delta-${platform}-(\\d+\\.\\d+\\.\\d+)-to-(\\d+\\.\\d+\\.\\d+)-\\d+\\.patch$`)
+    let dirEntries: fs.Dirent[] = []
+    try {
+      dirEntries = await fs.promises.readdir(UPLOAD_DIR, { withFileTypes: true })
+    } catch {
+      /* bucket missing — nothing to scan */
+    }
+    for (const e of dirEntries) {
+      if (!e.isDirectory()) continue // legacy flat binaries are never name-parsed
+      let inner: fs.Dirent[] = []
+      try {
+        inner = await fs.promises.readdir(path.join(UPLOAD_DIR, e.name), { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const f of inner) {
+        if (!f.isFile()) continue
+        const key = `${e.name}/${f.name}`
+        if (referenced.has(key)) continue
+        // 'android' cleanup must not swallow 'android-debug-…' files.
+        if (platform === 'android' && f.name.startsWith('android-debug-')) continue
+        if (platform === 'android-debug' && !f.name.startsWith('android-debug-')) continue
+        let matchedVersion: string | null = null
+        const mi = instRe.exec(f.name)
+        const mr = refRe.exec(f.name)
+        const md = deltaRe.exec(f.name)
+        if (mi) matchedVersion = mi[1]
+        else if (mr) matchedVersion = mr[1]
+        else if (md) matchedVersion = scopeSet.has(md[1]) ? md[1] : md[2]
+        if (matchedVersion && scopeSet.has(matchedVersion)) {
+          orphans.push({ storageKey: key, size: cleanupArtifactSize(key, null) })
+        }
+      }
+    }
+  }
+
+  return {
+    targets: targets.map((t) => ({
+      id: t.id,
+      platform: t.platform,
+      version: t.version,
+      isPublished: t.isPublished,
+      fileName: t.fileName,
+      createdAt: t.createdAt,
+    })),
+    installers,
+    refs,
+    deltas: deltas.map((d) => ({
+      id: d.id,
+      fromVersion: d.fromVersion,
+      toVersion: d.toVersion,
+      storageKey: d.fileStorageKey,
+      size: d.fileSize,
+    })),
+    orphans,
+  }
+}
+
+function sumSizes(list: Array<{ size: number }>): number {
+  return list.reduce((n, x) => n + x.size, 0)
+}
+
+app.post('/cleanup-preview', async (c) => {
+  try {
+    await requireAdmin(c)
+    const body = await c.req.json().catch(() => null)
+    const parsed = cleanupBodySchema.safeParse(body)
+    if (!parsed.success) {
+      return c.json({ success: false, error: 'platform + version (semver) + scope are required' }, 400)
+    }
+    const plan = await buildCleanupPlan(parsed.data.platform, parsed.data.version, parsed.data.scope)
+    if (!plan) return c.json({ success: false, error: 'Version not found' }, 404)
+
+    const installerBytes = sumSizes(plan.installers)
+    const refBytes = sumSizes(plan.refs)
+    const deltaBytes = sumSizes(plan.deltas)
+    const orphanBytes = sumSizes(plan.orphans)
+    return c.json({
+      success: true,
+      plan: {
+        versions: plan.targets.map((t) => ({
+          id: t.id,
+          platform: t.platform,
+          version: t.version,
+          isPublished: t.isPublished,
+          fileName: t.fileName,
+          createdAt: t.createdAt,
+        })),
+        installers: { count: plan.installers.length, bytes: installerBytes },
+        refArtifacts: { count: plan.refs.length, bytes: refBytes },
+        deltas: {
+          count: plan.deltas.length,
+          bytes: deltaBytes,
+          pairs: plan.deltas.map((d) => `${d.fromVersion} → ${d.toVersion}`),
+        },
+        orphanedBuilds: { count: plan.orphans.length, bytes: orphanBytes },
+        totalFiles: plan.installers.length + plan.refs.length + plan.deltas.length + plan.orphans.length,
+        totalBytes: installerBytes + refBytes + deltaBytes + orphanBytes,
+      },
+    })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+app.post('/cleanup', async (c) => {
+  try {
+    const caller = await requireAdmin(c)
+    const body = await c.req.json().catch(() => null)
+
+    // Same typed-confirmation contract as the System Reset card.
+    if (body?.confirm !== 'CLEANUP') {
+      return c.json(
+        { success: false, error: 'Confirmation failed: the confirm field must be exactly "CLEANUP"' },
+        400,
+      )
+    }
+    const parsed = cleanupBodySchema.safeParse(body)
+    if (!parsed.success) {
+      return c.json({ success: false, error: 'platform + version (semver) + scope are required' }, 400)
+    }
+    const { platform, version, scope } = parsed.data
+    const plan = await buildCleanupPlan(platform, version, scope)
+    if (!plan) return c.json({ success: false, error: 'Version not found' }, 404)
+    if (plan.targets.length === 0 && plan.deltas.length === 0 && plan.orphans.length === 0) {
+      return c.json({ success: false, error: 'Nothing in scope to clean up' }, 400)
+    }
+
+    // 1) Files first — an unlink failure leaves the DB rows intact so the
+    //    admin can simply retry, instead of rows pointing at missing files.
+    let deletedFiles = 0
+    for (const f of [...plan.installers, ...plan.refs]) {
+      const p = resolveBinaryPath(f.storageKey)
+      if (p) {
+        try {
+          fs.unlinkSync(p)
+          deletedFiles++
+        } catch {
+          /* raced delete — keep going */
+        }
+      }
+    }
+    for (const d of plan.deltas) {
+      const p = resolveBinaryPath(d.storageKey)
+      if (p) {
+        try {
+          fs.unlinkSync(p)
+          deletedFiles++
+        } catch {
+          /* raced delete — keep going */
+        }
+      }
+    }
+    for (const o of plan.orphans) {
+      const p = path.resolve(UPLOAD_DIR, o.storageKey)
+      if (p.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
+        try {
+          fs.unlinkSync(p)
+          deletedFiles++
+        } catch {
+          /* raced delete — keep going */
+        }
+      }
+    }
+
+    // 2) Rows — delta edges (children) before the version rows themselves.
+    let deletedDeltas = 0
+    let deletedVersions = 0
+    if (plan.deltas.length > 0) {
+      deletedDeltas = (
+        await db.appVersionDelta.deleteMany({ where: { id: { in: plan.deltas.map((d) => d.id) } } })
+      ).count
+    }
+    if (plan.targets.length > 0) {
+      deletedVersions = (
+        await db.appVersion.deleteMany({ where: { id: { in: plan.targets.map((t) => t.id) } } })
+      ).count
+    }
+
+    // 3) A deleted release must vanish from the public download list at once.
+    invalidateResponseCacheTag('app-versions')
+
+    await auditLog.userAction({
+      userId: caller.id,
+      action: 'admin.app-cleanup',
+      entityType: 'SYSTEM',
+      entityId: `app-versions:${platform}`,
+      details: {
+        platform,
+        version,
+        scope,
+        deletedVersions,
+        deletedDeltas,
+        deletedFiles,
+        versions: plan.targets.map((t) => t.version),
+      },
+    })
+
+    return c.json({ success: true, deletedVersions, deletedDeltas, deletedFiles })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

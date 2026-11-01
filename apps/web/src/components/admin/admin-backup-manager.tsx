@@ -104,6 +104,7 @@ interface ResetResult {
   sections: string[];
   summary: Record<string, number>;
   wipedLogFiles: number;
+  wipedAppFiles: number;
   at: string;
 }
 
@@ -555,6 +556,7 @@ export function AdminBackupManager() {
           sections: Array.isArray(json.sections) ? json.sections : [],
           summary: json.summary && typeof json.summary === 'object' ? json.summary : {},
           wipedLogFiles: typeof json.wipedLogFiles === 'number' ? json.wipedLogFiles : 0,
+          wipedAppFiles: typeof json.wipedAppFiles === 'number' ? json.wipedAppFiles : 0,
           at: typeof json.at === 'string' ? json.at : new Date().toISOString(),
         });
         // refresh every count the manager shows (storage usage, backups…)
@@ -1136,9 +1138,14 @@ export function AdminBackupManager() {
                 <p className="text-xs text-red-700 dark:text-red-300 font-medium">{tr('resetFullScopeNote')}</p>
               </div>
               <div className="flex items-center justify-between rounded-lg border px-3 py-2.5">
-                <Label htmlFor="reset-versions" className="cursor-pointer text-sm font-normal">
-                  {tr('resetPreserveVersions')}
-                </Label>
+                <div className="space-y-0.5">
+                  <Label htmlFor="reset-versions" className="cursor-pointer text-sm font-normal">
+                    {tr('resetPreserveVersions')}
+                  </Label>
+                  {!resetVersions && (
+                    <p className="text-[11px] text-muted-foreground max-w-md">{tr('resetVersionsWipedNote')}</p>
+                  )}
+                </div>
                 <Switch id="reset-versions" checked={resetVersions} onCheckedChange={setResetVersions} />
               </div>
             </div>
@@ -1542,6 +1549,11 @@ export function AdminBackupManager() {
             {resetResult && resetResult.wipedLogFiles > 0 && (
               <p className="text-xs text-muted-foreground">
                 {tr('resetLogFilesWiped', { count: resetResult.wipedLogFiles })}
+              </p>
+            )}
+            {resetResult && resetResult.wipedAppFiles > 0 && (
+              <p className="text-xs text-muted-foreground">
+                {tr('resetAppFilesWiped', { count: resetResult.wipedAppFiles })}
               </p>
             )}
             <Button variant="outline" className="w-full" onClick={() => setResetResult(null)}>

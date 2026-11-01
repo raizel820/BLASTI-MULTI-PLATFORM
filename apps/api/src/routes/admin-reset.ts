@@ -16,7 +16,13 @@
  *       devices | sessions
  *
  * Response: { success: true, mode, sections, summary: {model: deletedCount},
- *             wipedLogFiles: n, at: iso }
+ *             wipedLogFiles: n, wipedAppFiles: n, at: iso }
+ *
+ * PUBLIC APPS MANAGER (user requirement): a full reset WITHOUT
+ * preserveVersions also resets the Public Apps Manager — AppVersion AND
+ * AppVersionDelta rows are deleted AND the whole app-versions storage bucket
+ * (installers, asar/outref release references, delta patches) is wiped from
+ * disk after the transaction commits, so no orphaned binaries survive.
  *
  * SAFETY MODEL (hard guarantees, both modes):
  *   - SUPER_ADMIN only (requireAdmin — same gate as the other admin routes).
@@ -41,10 +47,12 @@
 
 import { Hono } from 'hono'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { requireAdmin } from '../lib/auth'
 import { auditLog } from '../lib/audit'
 import { db } from '@blasti/db'
+import { STORAGE_ROOT } from '../lib/storage'
 
 const app = new Hono()
 
@@ -141,6 +149,42 @@ function wipeLogVaultFiles(): number {
   }
   for (const e of entries) {
     wiped += rmCountingFiles(path.join(logRoot(), e.name))
+  }
+  return wiped
+}
+
+// ─── public-apps artifacts (SAME base-dir logic as routes/app-versions.ts) ──
+
+/** app-versions storage bucket — identical resolution to app-versions.ts. */
+function appBucketRoot(): string {
+  return path.join(STORAGE_ROOT, 'app-versions')
+}
+
+/** Pre-Round-15 binaries fallback — identical resolution to app-versions.ts. */
+function legacyAppUploadRoot(): string {
+  return path.join(os.tmpdir(), 'blasti-app-uploads')
+}
+
+/**
+ * Wipe every entry under the app-versions bucket (+ the legacy tmpdir
+ * uploads). Full reset only — installers, asar/outref release references and
+ * delta patches ALL live inside these roots, so wiping the trees removes
+ * every Public Apps artifact including files no DB row references anymore
+ * (same-name CI rebuilds stay on disk as unreferenced rows by design).
+ * Returns the file count removed.
+ */
+function wipePublicAppFiles(): number {
+  let wiped = 0
+  for (const root of [appBucketRoot(), legacyAppUploadRoot()]) {
+    let entries: fs.Dirent[] = []
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true })
+    } catch {
+      continue // missing root → nothing to wipe
+    }
+    for (const e of entries) {
+      wiped += rmCountingFiles(path.join(root, e.name))
+    }
   }
   return wiped
 }
@@ -367,6 +411,12 @@ async function resetFull(
   bump(summary, 'queueSettings', (await tx.queueSettings.deleteMany({})).count)
   bump(summary, 'services', (await tx.service.deleteMany({})).count)
   bump(summary, 'faqs', (await tx.fAQ.deleteMany({})).count)
+  // PUBLIC APPS MANAGER: when versions are not preserved, the delta patch
+  // graph goes too (rows cascade with AppVersion — deleted explicitly for the
+  // count; the PATCH FILES on disk are wiped after commit by the caller).
+  if (!preserveVersions) {
+    bump(summary, 'appVersionDeltas', (await tx.appVersionDelta.deleteMany({})).count)
+  }
   bump(summary, 'appVersions', preserveVersions ? 0 : (await tx.appVersion.deleteMany({})).count)
   bump(summary, 'dataUsageEvents', (await tx.dataUsageEvent.deleteMany({})).count)
 
@@ -429,6 +479,7 @@ app.post('/', async (c) => {
 
   const summary: Summary = {}
   let wipedLogFiles = 0
+  let wipedAppFiles = 0
 
   try {
     // ── ONE interactive transaction: everything rolls back on any failure ──
@@ -476,6 +527,19 @@ app.post('/', async (c) => {
     }
   }
 
+  // ── after commit: reset the PUBLIC APPS MANAGER disk artifacts ──
+  // A full reset without preserveVersions deleted AppVersion + AppVersionDelta
+  // rows above — the installers / release references / delta patch FILES now
+  // follow (a DB rollback never destroys files, so this runs post-commit only).
+  const wantsAppFiles = isFull && !preserveVersions
+  if (wantsAppFiles) {
+    try {
+      wipedAppFiles = wipePublicAppFiles()
+    } catch (err) {
+      console.error('[admin-reset] public-app file wipe failed (DB reset unaffected):', err)
+    }
+  }
+
   const at = new Date().toISOString()
 
   // ── audit trail (written AFTER the reset so it survives it) ──
@@ -490,6 +554,7 @@ app.post('/', async (c) => {
       preserveVersions,
       summary,
       wipedLogFiles,
+      wipedAppFiles,
     },
   })
 
@@ -499,6 +564,7 @@ app.post('/', async (c) => {
     sections: isFull ? ['*'] : requested,
     summary,
     wipedLogFiles,
+    wipedAppFiles,
     at,
   })
 })

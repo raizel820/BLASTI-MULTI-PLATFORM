@@ -24,6 +24,7 @@ import {
   AlertTriangle,
   PackageX,
   ShieldCheck,
+  Eraser,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -76,6 +77,7 @@ import {
 } from './shared';
 import { NotesInput, type NotesValue } from './notes-input';
 import { INSTALLER_PLATFORMS, isValidSemver, type InstallerPlatform } from '@/lib/admin-upload';
+import type { TranslationKeys } from '@/i18n';
 
 interface VersionForm {
   platform: InstallerPlatform;
@@ -97,6 +99,41 @@ const EMPTY_FORM: VersionForm = {
   minAppVersion: '',
 };
 
+/** Live response of POST /api/app-versions/cleanup-preview. */
+interface CleanupPreviewPlan {
+  versions: Array<{
+    id: string;
+    platform: string;
+    version: string;
+    isPublished: boolean;
+    fileName: string | null;
+    createdAt: string;
+  }>;
+  installers: { count: number; bytes: number };
+  refArtifacts: { count: number; bytes: number };
+  deltas: { count: number; bytes: number; pairs: string[] };
+  orphanedBuilds: { count: number; bytes: number };
+  totalFiles: number;
+  totalBytes: number;
+}
+
+type CleanupScope = 'this' | 'with-previous';
+
+const CLEANUP_SCOPES: Array<{ value: CleanupScope; labelKey: TranslationKeys; hintKey: TranslationKeys }> = [
+  { value: 'this', labelKey: 'publicAppCleanupScopeThis', hintKey: 'publicAppCleanupScopeThisHint' },
+  { value: 'with-previous', labelKey: 'publicAppCleanupScopeWithPrev', hintKey: 'publicAppCleanupScopeWithPrevHint' },
+];
+
+/** One preview line: label on the start side, value (files · size) on the end. */
+function CleanupPreviewRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center justify-between gap-3 min-w-0">
+      <span className="text-xs text-muted-foreground truncate">{label}</span>
+      <span className="text-xs font-medium font-mono text-end truncate" dir="ltr">{value}</span>
+    </div>
+  );
+}
+
 export function VersionsTab() {
   const { t, lang } = useLanguage();
 
@@ -115,6 +152,17 @@ export function VersionsTab() {
   const [activating, setActivating] = useState<AppVersion | null>(null);
   const [deleting, setDeleting] = useState<AppVersion | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  // Cleanup state
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupPlatform, setCleanupPlatform] = useState<string>('');
+  const [cleanupVersion, setCleanupVersion] = useState<string>('');
+  const [cleanupScope, setCleanupScope] = useState<CleanupScope>('with-previous');
+  const [cleanupPreview, setCleanupPreview] = useState<CleanupPreviewPlan | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState(false);
+  const [cleanupConfirm, setCleanupConfirm] = useState(false);
+  const [cleanupBusy, setCleanupBusy] = useState(false);
 
   const fetchAll = useCallback(async (isRefresh = false) => {
     if (!isRefresh) setLoading(true);
@@ -287,6 +335,106 @@ export function VersionsTab() {
     [fetchAll, t],
   );
 
+  // ── Cleanup (installers + delta patches of the selected scope) ──
+  const cleanupPlatforms = useMemo(
+    () => [...new Set(versions.map((v) => v.platform))],
+    [versions],
+  );
+  const cleanupVersionsForPlatform = useMemo(
+    () => versions.filter((v) => v.platform === cleanupPlatform),
+    [versions, cleanupPlatform],
+  );
+
+  const openCleanup = useCallback(() => {
+    const firstPlatform = [...new Set(versions.map((v) => v.platform))][0] ?? '';
+    const firstVersion = versions.find((v) => v.platform === firstPlatform)?.version ?? '';
+    setCleanupPlatform(firstPlatform);
+    setCleanupVersion(firstVersion);
+    setCleanupScope('with-previous');
+    setCleanupPreview(null);
+    setPreviewError(false);
+    setCleanupConfirm(false);
+    setCleanupOpen(true);
+  }, [versions]);
+
+  // Live preview: refetched whenever the selection changes (cancelled on change).
+  useEffect(() => {
+    if (!cleanupOpen || !cleanupPlatform || !cleanupVersion) {
+      setCleanupPreview(null);
+      return;
+    }
+    let cancelled = false;
+    setPreviewLoading(true);
+    setPreviewError(false);
+    apiFetch('/api/app-versions/cleanup-preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform: cleanupPlatform, version: cleanupVersion, scope: cleanupScope }),
+    })
+      .then(async (res) => {
+        const data = await res.json().catch(() => null);
+        if (cancelled) return;
+        if (res.ok && data?.success) {
+          setCleanupPreview(data.plan as CleanupPreviewPlan);
+          setPreviewError(false);
+        } else {
+          setCleanupPreview(null);
+          setPreviewError(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCleanupPreview(null);
+          setPreviewError(true);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cleanupOpen, cleanupPlatform, cleanupVersion, cleanupScope]);
+
+  const runCleanup = useCallback(async () => {
+    setCleanupBusy(true);
+    try {
+      const res = await apiFetch('/api/app-versions/cleanup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          platform: cleanupPlatform,
+          version: cleanupVersion,
+          scope: cleanupScope,
+          confirm: 'CLEANUP',
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success) {
+        toast.success(t('publicAppCleanupDone'), {
+          description: t('publicAppCleanupDoneDesc', {
+            versions: String(data.deletedVersions ?? 0),
+            deltas: String(data.deletedDeltas ?? 0),
+            files: String(data.deletedFiles ?? 0),
+          }),
+        });
+        setCleanupConfirm(false);
+        setCleanupOpen(false);
+        await fetchAll(true);
+      } else {
+        toast.error(t('publicAppCleanupFailed'), {
+          description: data?.error || `HTTP ${res.status}`,
+        });
+      }
+    } catch (err) {
+      toast.error(t('publicAppCleanupFailed'), {
+        description: err instanceof Error ? err.message : undefined,
+      });
+    } finally {
+      setCleanupBusy(false);
+    }
+  }, [cleanupPlatform, cleanupVersion, cleanupScope, fetchAll, t]);
+
   return (
     <div className="space-y-4">
       <Card>
@@ -298,10 +446,22 @@ export function VersionsTab() {
             </CardTitle>
             <CardDescription className="text-xs">{t('publicAppVersionsDesc')}</CardDescription>
           </div>
-          <Button size="sm" className="h-9 w-full sm:w-auto" onClick={openCreate}>
-            <Plus className="h-4 w-4" />
-            {t('publicAppNewVersion')}
-          </Button>
+          <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-9 w-full sm:w-auto"
+              onClick={openCleanup}
+              disabled={versions.length === 0}
+            >
+              <Eraser className="h-4 w-4" />
+              {t('publicAppCleanup')}
+            </Button>
+            <Button size="sm" className="h-9 w-full sm:w-auto" onClick={openCreate}>
+              <Plus className="h-4 w-4" />
+              {t('publicAppNewVersion')}
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="space-y-3">
           {loading && (
@@ -637,6 +797,208 @@ export function VersionsTab() {
               }}
             >
               {busyId ? <Loader2 className="h-4 w-4 animate-spin" /> : t('publicAppDelete')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* ─── Cleanup dialog (installers + delta patches of the selected scope) ─── */}
+      <Dialog open={cleanupOpen} onOpenChange={(open) => { if (!open) setCleanupOpen(false); }}>
+        <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto custom-scrollbar">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <Eraser className="h-4 w-4 text-primary" />
+              {t('publicAppCleanupTitle')}
+            </DialogTitle>
+            <DialogDescription className="text-xs">{t('publicAppCleanupDesc')}</DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            {/* platform + version */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">{t('publicAppCleanupPlatform')}</Label>
+                <Select
+                  value={cleanupPlatform}
+                  onValueChange={(v) => {
+                    setCleanupPlatform(v);
+                    const next = versions.find((x) => x.platform === v);
+                    setCleanupVersion(next?.version ?? '');
+                  }}
+                >
+                  <SelectTrigger className="h-10 text-sm" aria-label={t('publicAppCleanupPlatform')}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {cleanupPlatforms.map((p) => (
+                      <SelectItem key={p} value={p}>
+                        {platformLabel(p, lang)}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">{t('publicAppCleanupVersion')}</Label>
+                <Select value={cleanupVersion} onValueChange={setCleanupVersion}>
+                  <SelectTrigger className="h-10 text-sm" aria-label={t('publicAppCleanupVersion')}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {cleanupVersionsForPlatform.map((v) => (
+                      <SelectItem key={v.id} value={v.version}>
+                        <span className="font-mono" dir="ltr">{v.version}</span>
+                        {v.isPublished ? ` · ${t('publicAppStatusActive')}` : ''}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            {/* scope */}
+            <div className="space-y-1.5">
+              <Label className="text-xs">{t('publicAppCleanupScope')}</Label>
+              <div className="space-y-2" role="radiogroup" aria-label={t('publicAppCleanupScope')}>
+                {CLEANUP_SCOPES.map((opt) => (
+                  <button
+                    key={opt.value}
+                    type="button"
+                    role="radio"
+                    aria-checked={cleanupScope === opt.value}
+                    onClick={() => setCleanupScope(opt.value)}
+                    className={`w-full rounded-lg border p-3 text-start transition-all ${
+                      cleanupScope === opt.value
+                        ? 'border-destructive/60 bg-destructive/5'
+                        : 'hover:bg-muted/50'
+                    }`}
+                  >
+                    <span className="block text-xs font-semibold">{t(opt.labelKey)}</span>
+                    <span className="mt-0.5 block text-[11px] text-muted-foreground">{t(opt.hintKey)}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* live preview */}
+            <div className="space-y-2 rounded-lg border p-3">
+              <p className="flex items-center gap-1.5 text-xs font-semibold">
+                <AlertTriangle className="h-3.5 w-3.5 text-destructive" />
+                {t('publicAppCleanupPreviewTitle')}
+              </p>
+              {previewLoading && (
+                <div className="flex items-center gap-2 py-1.5 text-xs text-muted-foreground" aria-busy="true">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <Skeleton className="h-3.5 w-40" />
+                </div>
+              )}
+              {!previewLoading && previewError && (
+                <p className="text-xs text-destructive">{t('publicAppCleanupPreviewFailed')}</p>
+              )}
+              {!previewLoading && !previewError && cleanupPreview && (
+                <div className="space-y-1.5">
+                  {cleanupPreview.totalFiles === 0 ? (
+                    <p className="text-xs text-muted-foreground">{t('publicAppCleanupNothing')}</p>
+                  ) : (
+                    <>
+                      <CleanupPreviewRow
+                        label={t('publicAppCleanupVersionsLabel')}
+                        value={cleanupPreview.versions.map((v) => v.version).join(', ')}
+                      />
+                      {cleanupPreview.installers.count > 0 && (
+                        <CleanupPreviewRow
+                          label={t('publicAppCleanupInstallers')}
+                          value={t('publicAppCleanupFiles', {
+                            count: String(cleanupPreview.installers.count),
+                            size: formatFileSize(cleanupPreview.installers.bytes),
+                          })}
+                        />
+                      )}
+                      {cleanupPreview.deltas.count > 0 && (
+                        <CleanupPreviewRow
+                          label={t('publicAppCleanupDeltas')}
+                          value={t('publicAppCleanupFiles', {
+                            count: String(cleanupPreview.deltas.count),
+                            size: formatFileSize(cleanupPreview.deltas.bytes),
+                          })}
+                        />
+                      )}
+                      {cleanupPreview.refArtifacts.count > 0 && (
+                        <CleanupPreviewRow
+                          label={t('publicAppCleanupRefs')}
+                          value={t('publicAppCleanupFiles', {
+                            count: String(cleanupPreview.refArtifacts.count),
+                            size: formatFileSize(cleanupPreview.refArtifacts.bytes),
+                          })}
+                        />
+                      )}
+                      {cleanupPreview.orphanedBuilds.count > 0 && (
+                        <CleanupPreviewRow
+                          label={t('publicAppCleanupOrphans')}
+                          value={t('publicAppCleanupFiles', {
+                            count: String(cleanupPreview.orphanedBuilds.count),
+                            size: formatFileSize(cleanupPreview.orphanedBuilds.bytes),
+                          })}
+                        />
+                      )}
+                      <div className="mt-1.5 flex items-center justify-between gap-3 border-t pt-1.5">
+                        <span className="text-xs font-semibold">{t('publicAppCleanupTotal')}</span>
+                        <span className="text-xs font-bold font-mono text-destructive" dir="ltr">
+                          {formatFileSize(cleanupPreview.totalBytes)}
+                        </span>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" className="h-10" onClick={() => setCleanupOpen(false)} disabled={cleanupBusy}>
+              {t('publicAppCancel')}
+            </Button>
+            <Button
+              className="h-10 bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={previewLoading || previewError || !cleanupPreview || cleanupPreview.totalFiles === 0}
+              onClick={() => setCleanupConfirm(true)}
+            >
+              <Eraser className="h-4 w-4" />
+              {t('publicAppCleanupExecute')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ─── Cleanup confirmation ─── */}
+      <AlertDialog open={cleanupConfirm} onOpenChange={(open) => !open && setCleanupConfirm(false)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-destructive" />
+              {t('publicAppCleanupConfirmTitle')}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {cleanupPreview && cleanupPreview.totalFiles > 0
+                ? `${t('publicAppCleanupConfirmBody')}\n\n${t('publicAppCleanupVersionsLabel')}: ${cleanupPreview.versions
+                    .map((v) => `${platformLabel(v.platform, lang)} ${v.version}`)
+                    .join(', ')}`
+                : t('publicAppCleanupConfirmBody')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="h-10" disabled={cleanupBusy}>
+              {t('publicAppCancel')}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="h-10 bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              disabled={cleanupBusy}
+              onClick={(e) => {
+                e.preventDefault();
+                void runCleanup();
+              }}
+            >
+              {cleanupBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : t('publicAppCleanupExecute')}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
