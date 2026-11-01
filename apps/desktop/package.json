@@ -8,13 +8,13 @@
     "dev": "electron . --dev",
     "dev:verbose": "electron . --dev --enable-logging",
     "prebuild": "node scripts/prebuild.js",
-    "build": "node scripts/prebuild.js && electron-builder",
-    "build:win": "node scripts/prebuild.js && electron-builder --win",
-    "build:mac": "node scripts/prebuild.js && electron-builder --mac",
-    "build:linux": "node scripts/prebuild.js && electron-builder --linux",
-    "build:all": "node scripts/prebuild.js && electron-builder --mac --win --linux",
+    "build": "node scripts/prebuild.js && electron-builder --publish never",
+    "build:win": "node scripts/prebuild.js && electron-builder --publish never --win",
+    "build:mac": "node scripts/prebuild.js && electron-builder --publish never --mac",
+    "build:linux": "node scripts/prebuild.js && electron-builder --publish never --linux",
+    "build:all": "node scripts/prebuild.js && electron-builder --publish never --mac --win --linux",
     "build:export": "bun run --filter @blasti/web build:export",
-    "build:portable": "node scripts/prebuild.js && electron-builder --dir"
+    "build:portable": "node scripts/prebuild.js && electron-builder --publish never --dir"
   },
   "dependencies": {
     "@blasti/binary-delta": "workspace:*",

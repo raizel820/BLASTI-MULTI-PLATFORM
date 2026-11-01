@@ -842,7 +842,7 @@ public class BlastiNativeStatus extends Plugin {
                     call.reject("delta-download-failed", "hop " + i + ": " + t.getMessage());
                     return;
                 }
-                if (!sha.isEmpty() && !sha256Matches(patch, sha)) {
+                if (!sha256.isEmpty() && !sha256Matches(patch, sha256)) {
                     patch.delete();
                     call.reject("delta-verify-failed", "hop " + i + " (" + fromV + "→" + toV + "): patch sha256 mismatch");
                     return;

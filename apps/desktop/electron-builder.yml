@@ -37,7 +37,6 @@ files:
   - "!local-api/tests/**"
   - loading-screen.js
   - out/**/*
-  - data/**/*
   - prisma/schema.prisma
   - prisma/generated/**/*
   # The desktop SQLite Prisma client (prisma/generated) is also copied into
@@ -52,7 +51,6 @@ files:
 asar: true
 asarUnpack:
   - out/**/*
-  - data/**/*
   - prisma/generated/**/*
 
 npmRebuild: true
