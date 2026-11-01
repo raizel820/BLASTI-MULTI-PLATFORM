@@ -14,7 +14,7 @@ name: Build Installers
 #     installer (public download section + app update checks follow).
 #   → Immediately afterwards the job POSTs /api/system/deploy-trigger
 #     (same DEPLOY_TOKEN) so the VPS rebuilds right away: the API launches
-#     deploy-digitalocean.sh server-update + server-doctor in the transient
+#     deploy-oracle-vps.sh server-update + server-doctor in the transient
 #     blasti-rebuild systemd unit (git pull → bun install → db push →
 #     next build → service restarts). No waiting for the periodic
 #     blasti-watcher.timer — that timer stays armed as a fallback only.
@@ -42,6 +42,19 @@ name: Build Installers
 
 on:
   workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Which installers to build (manual runs only)'
+        type: choice
+        default: all
+        options:
+          - all
+          - desktop-only
+          - mobile-only
+      trigger_vps_rebuild:
+        description: 'Also trigger the VPS web-app rebuild after upload? (push runs always trigger)'
+        type: boolean
+        default: true
   push:
     branches: [master]
     paths-ignore:
@@ -59,6 +72,8 @@ jobs:
     name: Desktop .exe (Windows NSIS)
     runs-on: windows-latest
     timeout-minutes: 45
+    # Selective builds: a manual run with targets=mobile-only skips this job.
+    if: github.event_name == 'push' || inputs.targets != 'mobile-only'
     steps:
       - uses: actions/checkout@v5
 
@@ -115,6 +130,8 @@ jobs:
     name: Mobile debug APK (Android)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Selective builds: a manual run with targets=desktop-only skips this job.
+    if: github.event_name == 'push' || inputs.targets != 'desktop-only'
     steps:
       - uses: actions/checkout@v5
 
@@ -298,7 +315,7 @@ jobs:
       # blasti-watcher.timer tick. Best-effort: a skipped/failed trigger is a
       # warning, never a job failure — the periodic watcher stays the fallback.
       - name: Trigger the VPS rebuild (server-update)
-        if: always() && steps.upload.outputs.uploaded == 'true'
+        if: always() && steps.upload.outputs.uploaded == 'true' && (github.event_name == 'push' || inputs.trigger_vps_rebuild == true)
         env:
           BLASTI_API_URL: ${{ secrets.BLASTI_API_URL }}
           BLASTI_DEPLOY_TOKEN: ${{ secrets.BLASTI_DEPLOY_TOKEN }}

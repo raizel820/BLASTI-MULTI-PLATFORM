@@ -89,6 +89,10 @@ export const viewToUrl: Record<ViewName, string> = {
   // Role guard is inherited from the `admin-` prefix branch in
   // getAllowedRolesForView (SUPER_ADMIN only), same as admin-db.
   'admin-storage': '/admin/storage',
+  // Task 2: Backups Manager — same SUPER_ADMIN guard as admin-db/storage.
+  // (Was missing from this Record while present in ViewName — a silent type
+  // hole hidden by ignoreBuildErrors.)
+  'admin-backups': '/admin/backups',
   // logs-2 (0.6.19): Logs Manager — realtime log analysis console, same
   // SUPER_ADMIN guard as every other admin view (admin- prefix branch).
   'admin-logs-manager': '/admin/logs-manager',

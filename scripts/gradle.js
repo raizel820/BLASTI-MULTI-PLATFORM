@@ -12,7 +12,7 @@
  *
  * Always targets apps/mobile/android regardless of the caller's CWD.
  *
- * Task 52 additions (so `bun run mobile:apk` works from a plain terminal,
+ * Task 52 additions (so `bun run mobile:apk:debug` works from a plain terminal,
  * without opening Android Studio first):
  *   • Auto-detects JAVA_HOME (Android Studio's bundled JBR → system JDKs)
  *   • Auto-detects the Android SDK and writes local.properties if missing

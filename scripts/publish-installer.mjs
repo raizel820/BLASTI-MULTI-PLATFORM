@@ -71,6 +71,14 @@ if (!apiUrl) fail('--api-url <https://host> or BLASTI_API_URL is required');
 if (!token) fail('--token <DEPLOY_TOKEN> or BLASTI_DEPLOY_TOKEN is required');
 
 apiUrl = apiUrl.replace(/\/+$/, '');
+// STRICT-HTTPS policy: uploads carry the shared DEPLOY_TOKEN — never send it
+// over a cleartext channel. Only loopback exceptions (local dev testing).
+if (!/^https:\/\//i.test(apiUrl) && !/^http:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(apiUrl)) {
+  fail(
+    `api-url must be https:// (got "${apiUrl}") — strict-HTTPS policy refuses to ` +
+      `send the deploy token over plain HTTP`,
+  );
+}
 try {
   if (!statSync(file).isFile()) fail(`--file is not a regular file: ${file}`);
 } catch {
@@ -81,6 +89,12 @@ try {
 
 const uploadUrl = `${apiUrl}/api/app-versions/upload?create=1`;
 console.log(`[publish] uploading ${basename(file)} (${platform} v${version}) -> ${uploadUrl}`);
+
+// NO RETRIES (deliberate): retry loops with backoff burned GitHub Actions
+// free-plan minutes on persistent failures. One attempt, fail fast — if a
+// transient network error ("fetch failed") kills the run, just re-run the
+// job from the Actions tab; the upload is idempotent (binary replaced).
+// 401/404/413 fail fast as well (they will never succeed on a retry anyway).
 
 try {
   const buf = readFileSync(file);
@@ -93,11 +107,14 @@ try {
   if (notes) form.append('releaseNotes', notes.slice(0, 2000));
 
   // Large binaries: give the transfer time (APKs ~50 MB, desktop 80-120 MB).
-  const res = await fetch(uploadUrl, {
-    method: 'POST',
-    headers: { 'x-deploy-token': token },
-    body: form,
-  });
+  const res = await fetch(
+    uploadUrl,
+    {
+      method: 'POST',
+      headers: { 'x-deploy-token': token },
+      body: form,
+    },
+  );
 
   const text = await res.text();
   let body = {};
@@ -130,11 +147,14 @@ try {
         }
         if (args['runtime-key']) refForm.append('runtimeKey', String(args['runtime-key']));
         if (args['native-fingerprint']) refForm.append('nativeFingerprint', String(args['native-fingerprint']));
-        const refRes = await fetch(`${apiUrl}/api/app-versions/${v.id}/release-refs`, {
-          method: 'POST',
-          headers: { 'x-deploy-token': token },
-          body: refForm,
-        });
+        const refRes = await fetch(
+          `${apiUrl}/api/app-versions/${v.id}/release-refs`,
+          {
+            method: 'POST',
+            headers: { 'x-deploy-token': token },
+            body: refForm,
+          },
+        );
         const refText = await refRes.text();
         let refBody = {};
         try { refBody = JSON.parse(refText); } catch { /* non-JSON */ }

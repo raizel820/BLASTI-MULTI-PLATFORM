@@ -218,10 +218,12 @@ app.use('*', cors({
     // 0.6.36 — PRODUCTION DOMAIN, hardcoded so the API keeps accepting the
     // production origins even when the VPS env (CORS_ORIGIN/ALLOWED_ORIGINS)
     // is missing or stale. https://blastidz.online is the canonical origin
-    // (www included for completeness; Caddy redirects it to the apex).
+    // (www included; it 308-redirects to the apex).
+    // 0.6.41 — STRICT-HTTPS: the http:// origin entry was removed. Caddy
+    // 308-redirects every cleartext request before a page can even load,
+    // so no client can ever send a preflight from that origin anyway.
     'https://blastidz.online',
     'https://www.blastidz.online',
-    'http://blastidz.online', // Caddy 308-redirects to https — preflights safe
   ],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   // Task 55: x-blasti-network (web network-type attribution) + x-blasti-device
@@ -1118,9 +1120,9 @@ const STRICT_ALLOWED_ORIGINS = new Set([
   // 0.6.36 — production domain, hardcoded (mirrors the CORS list above) so
   // browser realtime (socket.io) from https://blastidz.online survives even
   // when ALLOWED_ORIGINS is not set on the VPS.
+  // 0.6.41 — strict-HTTPS: cleartext origin dropped (Caddy 308s it first).
   'https://blastidz.online',
   'https://www.blastidz.online',
-  'http://blastidz.online',
 ])
 
 const isDevelopment = process.env.NODE_ENV !== 'production'

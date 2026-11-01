@@ -33,6 +33,8 @@ files:
   - package.json
   - build-stamp.json
   - local-api/**/*
+  # Keep the manual test scripts out of the production asar.
+  - "!local-api/tests/**"
   - loading-screen.js
   - out/**/*
   - data/**/*

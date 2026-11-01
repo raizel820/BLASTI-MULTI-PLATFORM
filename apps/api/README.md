@@ -8,8 +8,9 @@
 ## Quick Start
 
 ```bash
-# From repo root
-DATABASE_URL="file:/path/to/packages/db/data/custom.db" \
+# From repo root — DATABASE_URL lives in packages/db/.env (PostgreSQL).
+# BLASTI no longer supports SQLite; a file: URL is treated as a fatal
+# config error at startup.
 NEXTAUTH_SECRET="blast1-dev-s3cr3t-k3y-f0r-d3v3l0pm3nt-0nly" \
 CORS_ORIGIN="*" \
 INTERNAL_SECRET="blast1-internal-secret-dev" \

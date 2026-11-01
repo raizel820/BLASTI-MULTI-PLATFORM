@@ -414,7 +414,7 @@ jobs:
       # ─────────────────────────────────────────────────────────────────────
       # STEP 4 — Trigger the VPS refresh (server-update)
       # Same endpoint as build-installers.yml: POST /api/system/deploy-trigger
-      # (x-deploy-token). The API runs deploy-digitalocean.sh server-update +
+      # (x-deploy-token). The API runs deploy-oracle-vps.sh server-update +
       # server-doctor in the transient blasti-rebuild systemd unit, which
       # re-syncs storage + restarts the services. Best-effort: a skipped or
       # failed trigger is a warning, never a job failure (the periodic

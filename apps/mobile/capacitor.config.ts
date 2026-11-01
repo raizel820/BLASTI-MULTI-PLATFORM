@@ -90,8 +90,10 @@ const config: CapacitorConfig = {
 
   // ─── Android Configuration ───────────────────────────────────────────────────
   android: {
-    // Allow mixed content so the WebView can load from localhost during dev
-    allowMixedContent: true,
+    // Strict-HTTPS: no mixed content. Dev cleartext is handled by the
+    // debug network-security-config + cleartext:isDev / androidScheme above;
+    // production loads https://blastidz.online only.
+    allowMixedContent: false,
     backgroundColor: '#FFFFFF',
     buildOptions: {
       keystorePath: undefined,

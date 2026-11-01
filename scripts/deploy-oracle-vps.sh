@@ -19,7 +19,7 @@
 #
 #     Code comes from GITHUB (this repo) — the VPS clones it itself.
 #
-# ORACLE-SPECIFIC (the ONE deploy script — no DigitalOcean pipeline):
+# ORACLE-SPECIFIC (the ONE deploy script — no legacy pipeline):
 #   • Oracle Ubuntu images ship REJECT-all iptables rules that block
 #     80/443 even with ufw "inactive" — this script inserts ACCEPT
 #     rules at the top of INPUT and persists them across reboots.
@@ -268,7 +268,7 @@ migrate_db() { # prisma generate + db push + seed-if-empty (seed skips when user
 }
 
 render_caddyfile() { # repo template → /etc/caddy/Caddyfile with localhost upstreams
-  local root="$1" site="$2" domain site_render
+  local root="$1" site="$2" domain site_render pub_ip ip_esc
   [ -f "$root/ops/Caddyfile" ] || die "ops/Caddyfile missing in $root"
   mkdir -p /etc/caddy
   # Caddyfile site-address lists need a SPACE after each comma
@@ -298,6 +298,41 @@ www.${domain} {
         redir https://${domain}{uri} 308
 }
 EOF
+    ;;
+  esac
+
+  # ── legacy raw-IP rescue (0.6.41, strict-HTTPS) ─────────────────────────
+  # A bare IP can never have a TLS certificate, so a client still baked with
+  # http://IP used to hit Caddy's automatic http->https redirect and die on a
+  # dead TLS handshake. When the IP is NOT a serving door (domain-mode site
+  # without the dual-door bridge), give it a REDIRECT-ONLY block to the
+  # canonical apex — cleartext never reaches the app, old installs rescue
+  # themselves. Skipped for :80/IP-mode installs and whenever the IP appears
+  # as a serving door anywhere in the config (broad match — a second block
+  # for the same host would make the whole config invalid).
+  case "$domain" in
+    '' | www.*) : ;;
+    *)
+      pub_ip="$(detect_public_ip)"
+      case "$pub_ip" in
+        '' | 10.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | 192.168.*) : ;; # unknown/private — skip
+        *)
+          ip_esc="$(printf '%s' "$pub_ip" | sed 's/\./\\./g')"
+          if grep -q "http://$ip_esc" /etc/caddy/Caddyfile; then
+            : # the IP is already a serving door (dual-door bridge) — leave it alone
+          else
+            log "raw-IP rescue: http://$pub_ip -> https://$domain (308, redirect-only)"
+            cat >> /etc/caddy/Caddyfile <<EOF
+
+# legacy raw-IP clients -> canonical apex (appended by deploy-oracle-vps.sh).
+# Cleartext door is redirect-only: no app or API is served over plain HTTP.
+http://${pub_ip} {
+        redir https://${domain}{uri} 308
+}
+EOF
+          fi
+        ;;
+      esac
     ;;
   esac
 }

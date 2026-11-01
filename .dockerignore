@@ -11,10 +11,8 @@
 tool-results
 agent-ctx
 upload
-download
 skills
-examples
-mini-services
+tool-results
 
 # Build outputs (recreated inside the image)
 **/.next

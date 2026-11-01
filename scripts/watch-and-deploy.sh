@@ -3,7 +3,7 @@
 # BLASTI - git watcher: auto-deploy the VPS on every new commit
 # ====================================================================
 # Monitors the BLASTI repo for new commits and applies them to the
-# DigitalOcean (or any) VPS automatically.
+# Oracle Cloud (or any) VPS automatically.
 #
 # MODES
 #   A) Watch FROM YOUR MACHINE - tell the VPS to pull from GitHub:
@@ -323,10 +323,10 @@ deploy_now() { # deploy_now <sha> -> 0 ok | 1 failed | 2 skipped (lock busy)
     return 1
   else
     if [ "$DRY_RUN" -eq 1 ]; then
-      log "dry-run: would deploy over ssh — remote ssh deploys were removed with the DigitalOcean pipeline"
+      log "dry-run: would deploy over ssh — remote ssh deploys were removed with the old deploy pipeline"
       return 0
     fi
-    die "remote ssh deploys were removed with the DigitalOcean pipeline —
+    die "remote ssh deploys were removed with the old deploy pipeline —
          ssh into the VPS yourself and run:
            sudo bash /opt/blasti/scripts/deploy-oracle-vps.sh update
          (or simply push to GitHub: the on-VPS auto-updater deploys within ~2 minutes)"

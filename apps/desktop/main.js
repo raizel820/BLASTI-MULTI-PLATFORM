@@ -17,7 +17,6 @@
  *   - Dock/taskbar badge counts
  *   - Content Security Policy headers
  *   - Single-instance lock
- *   - Auto-update support (via electron-updater, optional)
  */
 
 const {

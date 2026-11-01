@@ -1,5 +1,5 @@
 # BLASTI — Step-by-Step VPS Deployment Guide
-### Oracle Cloud — also works on DigitalOcean or any Ubuntu VPS
+### Oracle Cloud — also works on Hetzner, OVHcloud or any Ubuntu VPS
 
 **For everyone — no developer experience required.** This guide takes you
 from *"I have a cloud account"* to *"BLASTI is live on my own VPS,
@@ -9,7 +9,7 @@ pulled straight from GitHub, and my desktop app talks to it."*
 > (Namecheap domain → A record `129.151.242.219`; the raw IP keeps working on
 > port 80 as a migration bridge for installs baked with the old origin.
 > Previously the plain-IP `http://129.151.242.219`, and before that the
-> retired DigitalOcean droplet `68.183.137.227`).
+> very first server `68.183.137.227`).
 > Moving servers again? Follow the migration box in Part 10.
 
 Just copy-paste the commands exactly as shown. Every step explains what it
@@ -60,8 +60,8 @@ does and what you should see.
 
 Everything is installed for you by **one script**: `scripts/deploy-oracle-vps.sh`
 (it is part of the GitHub repo — the server downloads it itself).
-The filename mentions DigitalOcean for historical reasons only — the script
-itself provisions **any Ubuntu 22.04+/Debian 12+ VPS, including Oracle Cloud**.
+The one script provisions **any Ubuntu 22.04+/Debian 12+ VPS, including
+Oracle Cloud, Hetzner and OVHcloud**.
 
 ---
 
@@ -69,7 +69,7 @@ itself provisions **any Ubuntu 22.04+/Debian 12+ VPS, including Oracle Cloud**.
 
 | # | Requirement | Notes |
 |---|---|---|
-| 1 | A cloud account — **Oracle Cloud** (or DigitalOcean, Hetzner, any provider) | [cloud.oracle.com](https://cloud.oracle.com) — sign up |
+| 1 | A cloud account — **Oracle Cloud** (or Hetzner, OVHcloud, any provider) | [cloud.oracle.com](https://cloud.oracle.com) — sign up |
 | 2 | Your computer | Windows 10/11 (use **PowerShell**), macOS or Linux (use **Terminal**) |
 | 3 | The BLASTI GitHub repo | `https://github.com/raizel820/BLASTI-MULTI-PLATFORM` (public — no GitHub login needed on the server) |
 | 4 | A domain name *(optional but recommended)* | Needed for automatic HTTPS. You can start with just the IP |
@@ -95,8 +95,8 @@ noticeably faster.
 7. **Networking (CRITICAL on Oracle):** open **TCP 22**, **TCP 80** and
    **TCP 443** to source `0.0.0.0/0` in the subnet's **Security List**
    (Ingress Rules). Oracle blocks every port at the CLOUD level by default —
-   a fresh BLASTI install is unreachable if this is skipped. (On
-   DigitalOcean you can skip this — the installer configures the firewall.)
+   a fresh BLASTI install is unreachable if this is skipped. (On other
+   providers you can often skip this — the installer configures the firewall.)
 8. Click **Create** and wait until the instance shows **RUNNING**.
 9. **Write down the Public IP address** (shown on the instance page,
    e.g. `203.0.113.10`). You will use it constantly.
@@ -131,7 +131,7 @@ sudo chown -R root:root /root/.ssh
 sudo chmod 700 /root/.ssh && sudo chmod 600 /root/.ssh/authorized_keys
 ```
 
-- With **password auth** (DigitalOcean): type the root password (nothing
+- With **password auth** (provider-dependent): type the root password (nothing
   appears while typing — that is normal) and press Enter.
 - ✅ Success looks like: the prompt changes to something like
   `root@blasti:~#`. You are now "inside" the server. All commands in the
@@ -162,7 +162,7 @@ That's it. The installer now runs unattended for roughly **8–15 minutes**
 the web app). You will see `[deploy]` progress lines the whole time.
 
 > ✅ **Success looks like** a box at the end that says **"BLASTI is UP on
-> this droplet"** with your web address. Open that address in your browser —
+> this server"** with your web address. Open that address in your browser —
 > you should see the BLASTI login page.
 >
 > ❌ If a line ends with `[FAIL]`, note the message and jump to Part 12
@@ -453,6 +453,42 @@ it was done and the recipe for any future domain.
 > The domain also switches the web login/sessions to secure cookies — tell
 > all users the new `https://` address.
 
+### 8.1 The one-click SSL script (the manual PowerShell step)
+
+Normal workflow: **download the app here → push to GitHub → Actions build +
+deploy automatically → then run the dedicated SSL script once from your own
+Windows PowerShell.** It grants HTTPS for **both** `blastidz.online` AND
+`www.blastidz.online` (www gets its own auto-TLS certificate + a 308 redirect
+to the apex) and performs every app-side update that goes with it (CORS
+origins, gateway config + validation + reload). Safe to re-run at any time.
+
+```powershell
+# on Windows, from the folder that holds blasti-ssl.ps1 + blasti-ssl.sh:
+.\blasti-ssl.ps1                 # defaults: root@129.151.242.219, blastidz.online
+.\blasti-ssl.ps1 -Check          # verify only (DNS + 200 + 308), changes nothing
+.\blasti-ssl.ps1 -Vps root@IP -Domain your.domain   # any other server/domain
+```
+
+Or directly on the server (same effect, no PowerShell needed):
+
+```bash
+sudo bash /opt/blasti/scripts/blasti-ssl.sh            # apply
+sudo bash /opt/blasti/scripts/blasti-ssl.sh --check    # verify only
+```
+
+What the script does, in order: DNS check (apex + www, warn-only) →
+`/etc/blasti/blasti.env` **strict-HTTPS** (`SITE_ADDRESS` becomes the apex
+ONLY — cleartext doors like `:80` / `http://IP` are removed; `CORS_ORIGIN` +
+`ALLOWED_ORIGINS` gain apex + www and lose any cleartext origin) → gateway
+config rendered from the repo template (or patched in place when the
+template is missing) with the `www.<domain>` site block **and a legacy
+raw-IP rescue block** ensured (`http://<server-ip>` becomes a redirect-only
+door to the apex, so old installs baked with the bare IP land on HTTPS
+instead of a dead TLS handshake) → config **validated** before reload →
+gateway reloaded + api restarted → live verification (`/api/health` → 200,
+`https://www.…` → 308 → apex). A backup of the previous config is kept at
+`/etc/caddy/Caddyfile.pre-ssl.bak`.
+
 ---
 
 ## Part 9 — Update the app (always from GitHub)
@@ -525,7 +561,7 @@ bash /opt/blasti/scripts/deploy-oracle-vps.sh server-watch-install  # turn ON ag
 **Boot volume backup policy** (assign *Bronze* = weekly, small extra cost) —
 or simply rely on the `pg_dump` routine above. Keep both.
 
-### Migrating to a NEW VPS (e.g. DigitalOcean → Oracle Cloud)
+### Migrating to a NEW VPS (provider change or fresh instance)
 
 Done it once? Do it again in four steps:
 
@@ -628,4 +664,4 @@ systemctl restart blasti-api blasti-web
 (install / update / status / logs / backup / restore — plus the on-VPS
 `server-install` / `server-update` / `server-watch-install` helpers) and
 `scripts/watch-and-deploy.sh` (the engine behind the built-in auto-updater).
-Full architecture reference: `DEPLOYMENT.md`.*
+This guide is the single deployment reference.*

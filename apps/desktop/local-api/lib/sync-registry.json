@@ -2,7 +2,7 @@
   "_comment": "GENERATED ARTIFACT — DO NOT EDIT BY HAND. Single source of truth: packages/core/src/sync-registry.ts (regenerate with packages/core/scripts/generate-sync-registry-json.js whenever the .ts changes). The desktop local-api (plain JS in Electron, cannot import TypeScript) requires this file: apps/desktop/local-api/sync-service.js.",
   "protocolVersion": 2,
   "generatedFrom": "packages/core/src/sync-registry.ts",
-  "syncedModelCount": 21,
+  "syncedModelCount": 23,
   "syncedModels": [
     "Agency",
     "User",
@@ -10,6 +10,8 @@
     "Service",
     "Branch",
     "Counter",
+    "CounterService",
+    "CounterControlRequest",
     "QueueSettings",
     "Reservation",
     "Transaction",
@@ -68,6 +70,20 @@
       "isAgencyScoped": true,
       "conflictStrategy": "VERSION_AWARE",
       "syncOrder": 8
+    },
+    "CounterService": {
+      "delegate": "counterService",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "VERSION_AWARE",
+      "syncOrder": 22
+    },
+    "CounterControlRequest": {
+      "delegate": "counterControlRequest",
+      "isSynced": true,
+      "isAgencyScoped": true,
+      "conflictStrategy": "APPEND_ONLY",
+      "syncOrder": 23
     },
     "QueueSettings": {
       "delegate": "queueSettings",

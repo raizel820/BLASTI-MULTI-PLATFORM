@@ -63,14 +63,6 @@
                         defer
                 }
 
-                # The service worker MUST revalidate on every load or stale
-                # shells can pin users to old app versions.
-                @swFile path /sw.js
-                header @swFile {
-                        Cache-Control "no-cache"
-                        defer
-                }
-
                 reverse_proxy web:3000
         }
 }
