@@ -131,15 +131,17 @@ export function wrapEmailHtml(opts: WrapEmailOptions): string {
   const branding = opts.branding
   const year = new Date().getFullYear()
 
-  // ── Header: app logo (or wordmark) + optional agency logo / name ──
+  // ── Header: emerald brand band — white chip holds the real app logo ──
+  // The logo is served by /api/branding/logo (the live admin-uploaded asset);
+  // the white chip keeps colored logos readable on the green band.
   const appLogoHtml = appLogo
-    ? `<img src="${appLogo}" alt="${APP_NAME}" height="34" style="height:34px;width:auto;display:block;border:0;outline:none;" />`
-    : `<span style="font-size:20px;font-weight:800;color:${BRAND_GREEN};letter-spacing:0.06em;">${APP_NAME}</span>`
+    ? `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="background:#ffffff;border-radius:10px;"><tr><td style="padding:8px 14px;background:#ffffff;border-radius:10px;"><img src="${appLogo}" alt="${APP_NAME}" height="30" style="height:30px;width:auto;display:block;border:0;outline:none;" /></td></tr></table>`
+    : `<span style="font-size:21px;font-weight:800;color:#ffffff;letter-spacing:0.08em;">${APP_NAME}</span>`
 
   const agencyLogoHtml = branding?.logoUrl
-    ? `<img src="${branding.logoUrl}" alt="${escapeHtml(branding.name ?? '')}" height="40" style="height:40px;max-width:120px;width:auto;display:inline-block;border:0;outline:none;" />`
+    ? `<img src="${branding.logoUrl}" alt="${escapeHtml(branding.name ?? '')}" height="36" style="height:36px;max-width:110px;width:auto;display:inline-block;border:0;outline:none;border-radius:6px;" />`
     : branding?.name
-      ? `<span style="font-size:14px;font-weight:700;color:${INK};">${escapeHtml(branding.name)}</span>`
+      ? `<span style="font-size:13px;font-weight:700;color:#d1fae5;background:rgba(255,255,255,0.14);border-radius:999px;padding:5px 12px;display:inline-block;">${escapeHtml(branding.name)}</span>`
       : ''
 
   // ── Footer: agency contact block + platform line ──
@@ -150,7 +152,7 @@ export function wrapEmailHtml(opts: WrapEmailOptions): string {
     branding?.address,
   ].filter((bit): bit is string => Boolean(bit && bit.trim()))
   const agencyContactHtml = agencyContactBits.length
-    ? `<p style="margin:6px 0 0 0;font-size:11px;line-height:1.7;color:${MUTED};text-align:${align};">${escapeHtml(agencyContactBits.join('  ·  '))}</p>`
+    ? `<p style="margin:6px 0 0 0;font-size:11px;line-height:1.7;color:#94a3b8;text-align:${align};">${escapeHtml(agencyContactBits.join('  ·  '))}</p>`
     : ''
 
   const preheader = opts.preheader
@@ -171,13 +173,19 @@ ${preheader}
   <tr>
     <td align="center" style="padding:24px 12px;">
       <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;background-color:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
-        <!-- Header -->
+        <!-- Header — full-width emerald brand band -->
         <tr>
-          <td style="padding:22px 28px 16px 28px;border-bottom:1px solid #eef2f7;" dir="${dir}">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <td style="padding:0;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:${BRAND_GREEN};background-image:linear-gradient(135deg,#059669 0%,#047857 60%,#065f46 100%);">
               <tr>
-                <td align="${align}" style="text-align:${align};">${appLogoHtml}</td>
-                ${agencyLogoHtml ? `<td align="${rtl ? 'left' : 'right'}" style="text-align:${rtl ? 'left' : 'right'};">${agencyLogoHtml}</td>` : ''}
+                <td style="padding:20px 28px;" dir="${dir}">
+                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                    <tr>
+                      <td align="${align}" style="text-align:${align};">${appLogoHtml}</td>
+                      ${agencyLogoHtml ? `<td align="${rtl ? 'left' : 'right'}" style="text-align:${rtl ? 'left' : 'right'};">${agencyLogoHtml}</td>` : ''}
+                    </tr>
+                  </table>
+                </td>
               </tr>
             </table>
           </td>
@@ -188,12 +196,12 @@ ${preheader}
             ${opts.bodyHtml}
           </td>
         </tr>
-        <!-- Footer -->
+        <!-- Footer — dark ink footer with agency contact -->
         <tr>
-          <td style="padding:16px 28px 20px 28px;background-color:#f8fafc;border-top:1px solid #eef2f7;" dir="${dir}">
-            ${branding?.name ? `<p style="margin:0;font-size:12px;font-weight:700;color:${INK};text-align:${align};">${escapeHtml(branding.name)}</p>` : ''}
+          <td style="padding:18px 28px 20px 28px;background-color:#0f172a;border-top:3px solid ${BRAND_GREEN};" dir="${dir}">
+            ${branding?.name ? `<p style="margin:0;font-size:12px;font-weight:700;color:#f8fafc;text-align:${align};">${escapeHtml(branding.name)}</p>` : ''}
             ${agencyContactHtml}
-            <p style="margin:8px 0 0 0;font-size:10px;line-height:1.6;color:#94a3b8;text-align:${align};">
+            <p style="margin:8px 0 0 0;font-size:10px;line-height:1.6;color:#64748b;text-align:${align};">
               ${copy.sentVia} · © ${year} ${APP_NAME} — ${copy.rights}
             </p>
           </td>

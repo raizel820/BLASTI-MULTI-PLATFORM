@@ -36,15 +36,29 @@ const APP_NAME = 'BLASTI'
 
 // ─── Professional email inner-content builders (BRD-green code cards) ───────
 
-/** Inner HTML for an OTP-code email — big dashed code card, works in all clients. */
+/** Inner HTML for an OTP-code email — solid emerald brand card, works in all clients. */
 function codeEmailInner(opts: { hello: string; intro: string; expiresNote: string; expiryUnit?: string }): string {
   return `<div style="text-align:center;padding:6px 0 2px 0;">
   <p style="margin:0 0 14px 0;font-size:15px;color:#374151;line-height:1.7;">${opts.hello}</p>
   <p style="margin:0 0 16px 0;font-size:15px;color:#374151;line-height:1.7;">${opts.intro}</p>
-  <div style="margin:0 auto 18px auto;display:inline-block;padding:14px 30px;border:2px dashed #059669;border-radius:14px;background:#ecfdf5;">
-    <span style="font-size:30px;font-weight:800;letter-spacing:8px;color:#059669;font-family:'Courier New',Courier,monospace;">{{code}}</span>
-  </div>
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 18px auto;"><tr><td style="background:#059669;background-image:linear-gradient(135deg,#059669 0%,#047857 100%);border-radius:16px;padding:18px 36px;">
+    <span style="font-size:32px;font-weight:800;letter-spacing:10px;color:#ffffff;font-family:'Courier New',Courier,monospace;">{{code}}</span>
+  </td></tr></table>
   <p style="margin:0;font-size:12px;color:#6b7280;line-height:1.7;">${opts.expiresNote}</p>
+</div>`
+}
+
+/** Inner HTML for a queue-event email — branded event banner + detail rows. */
+function queueEmailInner(opts: { emoji: string; headline: string; rows: Array<[string, string]>; outro?: string }): string {
+  const rowHtml = opts.rows
+    .map(([label, value]) => `<tr><td style="padding:7px 12px;font-size:13px;color:#6b7280;border-bottom:1px solid #eef2f7;">${label}</td><td style="padding:7px 12px;font-size:13px;font-weight:700;color:#111827;border-bottom:1px solid #eef2f7;text-align:left;">${value}</td></tr>`)
+    .join('\n  ')
+  return `<div style="padding:6px 0 2px 0;">
+  <p style="margin:0 0 14px 0;font-size:17px;font-weight:800;color:#059669;text-align:center;">${opts.emoji} &nbsp;${opts.headline}</p>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border:1px solid #e2e8f0;border-radius:12px;border-collapse:separate;overflow:hidden;">
+  ${rowHtml}
+  </table>
+  ${opts.outro ? `<p style="margin:14px 0 0 0;font-size:13px;color:#374151;line-height:1.7;text-align:center;">${opts.outro}</p>` : ''}
 </div>`
 }
 
@@ -244,6 +258,122 @@ export const DEFAULT_TEMPLATES: TemplateSeed[] = [
     body: `⚠️ ${APP_NAME}: {{customerName}}، تم تخطي تذكرتك *{{ticketNumber}}* في {{agencyName}} بسبب عدم الحضور. يمكنك استعادة مركزك من التطبيق.`,
     variables: ['customerName', 'ticketNumber', 'agencyName'],
   },
+  // ── Password reset (WHATSAPP) — dedicated WhatsApp wording (bold code) ──
+  {
+    key: 'password_reset', channel: 'WHATSAPP', language: 'en', name: 'Password reset (WhatsApp)',
+    body: `${APP_NAME}: Your password reset code is *{{code}}*. Valid for {{expiryMinutes}} minutes. If you did not request it, ignore this message.`,
+    variables: ['code', 'expiryMinutes'],
+  },
+  {
+    key: 'password_reset', channel: 'WHATSAPP', language: 'ar', name: 'إعادة تعيين كلمة المرور (واتساب)',
+    body: `${APP_NAME}: رمز إعادة تعيين كلمة المرور هو *{{code}}*. صالح لمدة {{expiryMinutes}} دقيقة. إذا لم تطلبه تجاهل هذه الرسالة.`,
+    variables: ['code', 'expiryMinutes'],
+  },
+  {
+    key: 'password_reset', channel: 'WHATSAPP', language: 'fr', name: 'Réinitialisation du mot de passe (WhatsApp)',
+    body: `${APP_NAME} : Votre code de réinitialisation est *{{code}}*. Valable {{expiryMinutes}} minutes. Si vous ne l'avez pas demandé, ignorez ce message.`,
+    variables: ['code', 'expiryMinutes'],
+  },
+  // ── Queue notifications (EMAIL) — dedicated branded variants ──
+  {
+    key: 'turn_approaching', channel: 'EMAIL', language: 'en', name: 'Turn approaching',
+    subject: `${APP_NAME} — Your turn is approaching ({{ticketNumber}})`,
+    body: `Hello {{customerName}},\n\nYour turn is approaching! Ticket {{ticketNumber}} at {{agencyName}}. Position: {{position}}. Estimated wait: {{estimatedMinutes}} minutes.\n\n— The ${APP_NAME} Team`,
+    htmlBody: queueEmailInner({
+      emoji: '🔄', headline: 'Your turn is approaching!',
+      rows: [['Ticket', '{{ticketNumber}}'], ['Agency', '{{agencyName}}'], ['Position', '{{position}}'], ['Estimated wait', '{{estimatedMinutes}} minutes']],
+      outro: 'Head over to the agency now so you do not miss your turn.',
+    }),
+    variables: ['customerName', 'ticketNumber', 'agencyName', 'position', 'estimatedMinutes'],
+  },
+  {
+    key: 'turn_approaching', channel: 'EMAIL', language: 'ar', name: 'اقتراب الدور',
+    subject: `${APP_NAME} — اقترب دورك ({{ticketNumber}})`,
+    body: `مرحباً {{customerName}}،\n\nاقترب دورك! تذكرتك {{ticketNumber}} في {{agencyName}}. المركز: {{position}}. الانتظار المتوقع: {{estimatedMinutes}} دقيقة.\n\n— فريق ${APP_NAME}`,
+    htmlBody: queueEmailInner({
+      emoji: '🔄', headline: 'اقترب دورك!',
+      rows: [['التذكرة', '{{ticketNumber}}'], ['الوكالة', '{{agencyName}}'], ['المركز', '{{position}}'], ['الانتظار المتوقع', '{{estimatedMinutes}} دقيقة']],
+      outro: 'توجه إلى الوكالة الآن حتى لا يفوتك دورك.',
+    }),
+    variables: ['customerName', 'ticketNumber', 'agencyName', 'position', 'estimatedMinutes'],
+  },
+  {
+    key: 'turn_approaching', channel: 'EMAIL', language: 'fr', name: 'Tour approchant',
+    subject: `${APP_NAME} — Votre tour approche ({{ticketNumber}})`,
+    body: `Bonjour {{customerName}},\n\nVotre tour approche ! Billet {{ticketNumber}} a {{agencyName}}. Position : {{position}}. Attente estimee : {{estimatedMinutes}} minutes.\n\n— L'équipe ${APP_NAME}`,
+    htmlBody: queueEmailInner({
+      emoji: '🔄', headline: 'Votre tour approche !',
+      rows: [['Billet', '{{ticketNumber}}'], ['Agence', '{{agencyName}}'], ['Position', '{{position}}'], ['Attente estimee', '{{estimatedMinutes}} minutes']],
+      outro: "Rendez-vous a l'agence maintenant pour ne pas manquer votre tour.",
+    }),
+    variables: ['customerName', 'ticketNumber', 'agencyName', 'position', 'estimatedMinutes'],
+  },
+  {
+    key: 'your_turn', channel: 'EMAIL', language: 'en', name: 'Your turn now',
+    subject: `${APP_NAME} — It is your turn now ({{ticketNumber}})`,
+    body: `Hello {{customerName}},\n\nIt is your turn now! Ticket {{ticketNumber}} at {{agencyName}}. Please proceed to the counter.\n\n— The ${APP_NAME} Team`,
+    htmlBody: queueEmailInner({
+      emoji: '🎫', headline: "It's your turn now!",
+      rows: [['Ticket', '{{ticketNumber}}'], ['Agency', '{{agencyName}}']],
+      outro: 'Please proceed to the counter immediately.',
+    }),
+    variables: ['customerName', 'ticketNumber', 'agencyName'],
+  },
+  {
+    key: 'your_turn', channel: 'EMAIL', language: 'ar', name: 'دورك الآن',
+    subject: `${APP_NAME} — دورك الآن ({{ticketNumber}})`,
+    body: `مرحباً {{customerName}}،\n\nدورك الآن! تذكرتك {{ticketNumber}} في {{agencyName}}. يرجى التوجه إلى الشباك فوراً.\n\n— فريق ${APP_NAME}`,
+    htmlBody: queueEmailInner({
+      emoji: '🎫', headline: 'دورك الآن!',
+      rows: [['التذكرة', '{{ticketNumber}}'], ['الوكالة', '{{agencyName}}']],
+      outro: 'يرجى التوجه إلى الشباك فوراً.',
+    }),
+    variables: ['customerName', 'ticketNumber', 'agencyName'],
+  },
+  {
+    key: 'your_turn', channel: 'EMAIL', language: 'fr', name: "C'est votre tour",
+    subject: `${APP_NAME} — C'est votre tour ({{ticketNumber}})`,
+    body: `Bonjour {{customerName}},\n\nC'est votre tour ! Billet {{ticketNumber}} a {{agencyName}}. Veuillez vous presenter au guichet.\n\n— L'équipe ${APP_NAME}`,
+    htmlBody: queueEmailInner({
+      emoji: '🎫', headline: "C'est votre tour !",
+      rows: [['Billet', '{{ticketNumber}}'], ['Agence', '{{agencyName}}']],
+      outro: 'Veuillez vous presenter au guichet immediatement.',
+    }),
+    variables: ['customerName', 'ticketNumber', 'agencyName'],
+  },
+  {
+    key: 'no_show', channel: 'EMAIL', language: 'en', name: 'No-show warning',
+    subject: `${APP_NAME} — Missed turn ({{ticketNumber}})`,
+    body: `Hello {{customerName}},\n\nYour ticket {{ticketNumber}} at {{agencyName}} was skipped due to no-show. You can reclaim your position from the app.\n\n— The ${APP_NAME} Team`,
+    htmlBody: queueEmailInner({
+      emoji: '⚠️', headline: 'Missed turn — no-show',
+      rows: [['Ticket', '{{ticketNumber}}'], ['Agency', '{{agencyName}}']],
+      outro: 'You can reclaim your position from the app while spots remain.',
+    }),
+    variables: ['customerName', 'ticketNumber', 'agencyName'],
+  },
+  {
+    key: 'no_show', channel: 'EMAIL', language: 'ar', name: 'تحذير عدم الحضور',
+    subject: `${APP_NAME} — تم تخطي دورك ({{ticketNumber}})`,
+    body: `مرحباً {{customerName}}،\n\nتم تخطي تذكرتك {{ticketNumber}} في {{agencyName}} بسبب عدم الحضور. يمكنك استعادة مركزك من التطبيق.\n\n— فريق ${APP_NAME}`,
+    htmlBody: queueEmailInner({
+      emoji: '⚠️', headline: 'تم تخطي الدور — عدم حضور',
+      rows: [['التذكرة', '{{ticketNumber}}'], ['الوكالة', '{{agencyName}}']],
+      outro: 'يمكنك استعادة مركزك من التطبيق ما دامت هناك أماكن.',
+    }),
+    variables: ['customerName', 'ticketNumber', 'agencyName'],
+  },
+  {
+    key: 'no_show', channel: 'EMAIL', language: 'fr', name: 'Absence',
+    subject: `${APP_NAME} — Tour manque ({{ticketNumber}})`,
+    body: `Bonjour {{customerName}},\n\nVotre billet {{ticketNumber}} a {{agencyName}} a ete saute (absence). Vous pouvez recuperer votre position depuis l'application.\n\n— L'équipe ${APP_NAME}`,
+    htmlBody: queueEmailInner({
+      emoji: '⚠️', headline: 'Tour manque — absence',
+      rows: [['Billet', '{{ticketNumber}}'], ['Agence', '{{agencyName}}']],
+      outro: "Vous pouvez recuperer votre position depuis l'application tant qu'il reste des places.",
+    }),
+    variables: ['customerName', 'ticketNumber', 'agencyName'],
+  },
   // ── Welcome (EMAIL) — sent once when the account becomes fully verified ──
   {
     key: 'welcome', channel: 'EMAIL', language: 'en', name: 'Welcome email',
@@ -293,10 +423,10 @@ export const DEFAULT_TEMPLATES: TemplateSeed[] = [
 export const TEMPLATE_CATALOG: Array<{ key: string; channels: TemplateChannel[]; descriptionEn: string; descriptionAr: string }> = [
   { key: 'verify_email', channels: ['EMAIL'], descriptionEn: 'Email address verification OTP', descriptionAr: 'رمز تأكيد البريد الإلكتروني' },
   { key: 'verify_phone', channels: ['SMS', 'WHATSAPP'], descriptionEn: 'Phone number verification OTP', descriptionAr: 'رمز تأكيد رقم الهاتف' },
-  { key: 'password_reset', channels: ['EMAIL', 'SMS'], descriptionEn: 'Password reset code (email, or SMS when no email)', descriptionAr: 'رمز إعادة تعيين كلمة المرور (بريد، أو SMS عند غياب البريد)' },
-  { key: 'turn_approaching', channels: ['SMS', 'WHATSAPP'], descriptionEn: 'Queue reminder — turn approaching', descriptionAr: 'تذكير الطابور — اقتراب الدور' },
-  { key: 'your_turn', channels: ['SMS', 'WHATSAPP'], descriptionEn: 'Queue alert — it is your turn', descriptionAr: 'تنبيه الطابور — دورك الآن' },
-  { key: 'no_show', channels: ['SMS', 'WHATSAPP'], descriptionEn: 'No-show warning', descriptionAr: 'تحذير عدم الحضور' },
+  { key: 'password_reset', channels: ['EMAIL', 'SMS', 'WHATSAPP'], descriptionEn: 'Password reset code — dedicated wording per channel (sent to VERIFIED contacts only)', descriptionAr: 'رمز إعادة تعيين كلمة المرور — صياغة مخصصة لكل قناة (يُرسل للجهات المُتحقق منها فقط)' },
+  { key: 'turn_approaching', channels: ['EMAIL', 'SMS', 'WHATSAPP'], descriptionEn: 'Queue reminder — turn approaching', descriptionAr: 'تذكير الطابور — اقتراب الدور' },
+  { key: 'your_turn', channels: ['EMAIL', 'SMS', 'WHATSAPP'], descriptionEn: 'Queue alert — it is your turn', descriptionAr: 'تنبيه الطابور — دورك الآن' },
+  { key: 'no_show', channels: ['EMAIL', 'SMS', 'WHATSAPP'], descriptionEn: 'No-show warning', descriptionAr: 'تحذير عدم الحضور' },
   { key: 'welcome', channels: ['EMAIL'], descriptionEn: 'Welcome email after verification', descriptionAr: 'رسالة ترحيب بعد التأكيد' },
 ]
 

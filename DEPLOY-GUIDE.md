@@ -352,6 +352,26 @@ The database container reads `POSTGRES_USER`, `POSTGRES_PASSWORD`,
 separate database .env file to manage. The compose file also publishes the
 port on **127.0.0.1 only**, so the database is invisible to the internet.
 
+### 6.5 Transactional email (Resend — e.g. a dedicated subdomain like `verify.blastidz.online`)
+
+Email (verification OTP at registration, password reset, notifications) is
+sent through **Resend**. No env var is required — the provider is configured
+once in the admin panel and stored AES-encrypted in the database:
+
+1. **Resend dashboard → Domains** — add your domain/subdomain, add the DNS
+   records it shows (DKIM `resend._domainkey`, the `send` SPF/MX pair), and
+   wait for the green **Verified** badge.
+2. **Resend dashboard → API Keys** — create a *restricted sending* key (`re_...`).
+3. **BLASTI admin panel → Settings → Notifications & Providers → EMAIL (Resend)** —
+   turn the channel ON, paste the key, and set the From address to an address
+   on the verified domain, e.g. `BLASTI <no-reply@verify.blastidz.online>`.
+4. Press **Test connection** (free probe — no email sent) then **Send test email**.
+
+> The `RESEND_API_KEY` env var in section 6.1 is only a half-fallback: it can
+> supply the KEY when the channel was never configured, but the ON/OFF switch
+> and the From address live in the database — production sends only after the
+> admin-panel setup above.
+
 ---
 
 ## Part 7 — Verify the deployment (2-minute checklist)

@@ -351,6 +351,24 @@ const COPY = {
     justNow: 'الآن',
     minAgo: 'دقيقة',
     hoursAgo: 'ساعة',
+    verifTitle: 'التحقق والأمان',
+    verifSubtitle: 'اختر جهات الاتصال الإلزامية عند إنشاء الحساب وتسجيل الدخول. قاعدة صارمة دائمة: استعادة كلمة المرور تُرسل فقط إلى بريد/هاتف مُتحقق منه.',
+    verifModeLabel: 'وضع التحقق الإلزامي',
+    verifModeBoth: 'بريد + هاتف (كلاهما)',
+    verifModeBothDesc: 'يجب تأكيد البريد والهاتف معاً قبل تفعيل الحساب (السلوك الأكثر صرامة).',
+    verifModeEmail: 'البريد الإلكتروني فقط',
+    verifModeEmailDesc: 'يجب تأكيد البريد؛ الهاتف اختياري.',
+    verifModePhone: 'الهاتف فقط',
+    verifModePhoneDesc: 'يجب تأكيد الهاتف؛ البريد اختياري.',
+    verifModeNone: 'بدون تحقق إلزامي',
+    verifModeNoneDesc: 'لا يُطلب تأكيد عند التسجيل — يمكن للمستخدم التحقق ذاتياً من إعداداته لاحقاً (يُنصح به مع القاعدة الصارمة).',
+    verifStrictNote: 'قاعدة صارمة غير قابلة للتعديل: رموز استعادة كلمة المرور تُرسل حصرياً إلى جهات اتصال مُتحقق منها — البريد المُتحقق أولاً، ثم الهاتف المُتحقق عبر SMS. المستخدمون يتحققون ذاتياً من صفحة حسابهم.',
+    verifSave: 'حفظ وضع التحقق',
+    verifSaving: 'جارٍ الحفظ…',
+    verifSaved: 'تم حفظ وضع التحقق',
+    verifFailed: 'تعذر حفظ وضع التحقق',
+    verifCurrent: 'الوضع الحالي',
+    verifIcon: 'درع التحقق',
   },
   en: {
     title: 'Notifications & Providers',
@@ -498,6 +516,24 @@ const COPY = {
     justNow: 'just now',
     minAgo: 'min ago',
     hoursAgo: 'h ago',
+    verifTitle: 'Verification & Security',
+    verifSubtitle: 'Pick which contacts are mandatory at account creation and login. Permanent strict rule: password-reset codes are ONLY sent to a verified email/phone.',
+    verifModeLabel: 'Mandatory verification mode',
+    verifModeBoth: 'Email + phone (both)',
+    verifModeBothDesc: 'Both the email and the phone must be confirmed before the account becomes active (strictest).',
+    verifModeEmail: 'Email only',
+    verifModeEmailDesc: 'The email must be confirmed; the phone is optional.',
+    verifModePhone: 'Phone only',
+    verifModePhoneDesc: 'The phone must be confirmed; the email is optional.',
+    verifModeNone: 'No mandatory verification',
+    verifModeNoneDesc: 'No confirmation required at registration — users can still self-verify from their account settings later (recommended alongside the strict rule).',
+    verifStrictNote: 'Immutable strict rule: password-reset codes are delivered exclusively to VERIFIED contacts — verified email first, else the verified phone via SMS. Users self-verify from their account page.',
+    verifSave: 'Save verification mode',
+    verifSaving: 'Saving…',
+    verifSaved: 'Verification mode saved',
+    verifFailed: 'Could not save the verification mode',
+    verifCurrent: 'Current mode',
+    verifIcon: 'verification shield',
   },
 };
 
@@ -773,6 +809,7 @@ function RegistryFieldInput({
 // ─── Main component ─────────────────────────────────────────────────
 
 type TabKey = 'overview' | Channel | 'templates' | 'logs';
+type VerificationModeUI = 'none' | 'email' | 'phone' | 'both';
 
 export function AdminProvidersSettings() {
   const { lang } = useLanguage();
@@ -840,6 +877,9 @@ export function AdminProvidersSettings() {
   const [resettingTemplate, setResettingTemplate] = useState(false);
   const [seeding, setSeeding] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(false);
+  // ── Verification & Security (platform gate) ──
+  const [verifMode, setVerifMode] = useState<VerificationModeUI>('both');
+  const [verifSaving, setVerifSaving] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewData, setPreviewData] = useState<{ subject: string | null; text: string; html: string | null; useProviderTemplate: boolean; providerTemplateId: string | null } | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -1300,6 +1340,43 @@ export function AdminProvidersSettings() {
     }
   };
 
+  // ── Verification & Security: load + save the platform gate ──
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiFetch('/api/admin/providers/verification-mode');
+        const json = await res.json().catch(() => ({}));
+        if (!cancelled && res.ok && json?.success && json.mode) {
+          setVerifMode(json.mode as VerificationModeUI);
+        }
+      } catch { /* default stays */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const saveVerificationMode = async (mode: VerificationModeUI) => {
+    setVerifSaving(true);
+    try {
+      const res = await apiFetch('/api/admin/providers/verification-mode', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && json?.success) {
+        setVerifMode(mode);
+        toast.success(c.verifSaved);
+      } else {
+        toast.error(json?.error || c.verifFailed);
+      }
+    } catch {
+      toast.error(c.verifFailed);
+    } finally {
+      setVerifSaving(false);
+    }
+  };
+
   // ── Formatting helpers ──
   const formatTime = (dateStr: string) => {
     try {
@@ -1530,9 +1607,61 @@ export function AdminProvidersSettings() {
               );
             })}
           </div>
-        </TabsContent>
 
-        {/* ═════════ SMS / EMAIL / WHATSAPP (registry-driven) ═════════ */}
+          {/* ── Verification & Security — platform gate ── */}
+          <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base flex items-center gap-2">
+                <div className="h-8 w-8 rounded-lg bg-gradient-to-br from-emerald-200 to-teal-300 dark:from-emerald-900/40 dark:to-teal-800/40 flex items-center justify-center shadow-sm">
+                  <ShieldCheck className="h-4 w-4 text-emerald-700 dark:text-emerald-400" />
+                </div>
+                {c.verifTitle}
+              </CardTitle>
+              <p className="text-xs text-muted-foreground mt-1">{c.verifSubtitle}</p>
+            </CardHeader>
+            <CardContent className="pt-0 space-y-3">
+              <Label className="text-xs font-semibold text-foreground">{c.verifModeLabel}</Label>
+              <RadioGroup
+                value={verifMode}
+                onValueChange={(v) => saveVerificationMode(v as VerificationModeUI)}
+                className="grid grid-cols-1 sm:grid-cols-2 gap-2"
+                disabled={verifSaving}
+              >
+                {([
+                  ['both', c.verifModeBoth, c.verifModeBothDesc],
+                  ['email', c.verifModeEmail, c.verifModeEmailDesc],
+                  ['phone', c.verifModePhone, c.verifModePhoneDesc],
+                  ['none', c.verifModeNone, c.verifModeNoneDesc],
+                ] as Array<[VerificationModeUI, string, string]>).map(([value, label, desc]) => (
+                  <Label
+                    key={value}
+                    htmlFor={`verif-mode-${value}`}
+                    className={`flex items-start gap-2.5 rounded-xl border p-3 cursor-pointer transition-all ${
+                      verifMode === value
+                        ? 'bg-emerald-50 dark:bg-emerald-900/20 border-emerald-300 dark:border-emerald-700 shadow-sm'
+                        : 'bg-muted/30 border-transparent hover:border-border hover:bg-muted/50'
+                    }`}
+                  >
+                    <RadioGroupItem value={value} id={`verif-mode-${value}`} className="mt-0.5" />
+                    <span className="space-y-0.5 min-w-0">
+                      <span className="block text-xs font-bold text-foreground">{label}</span>
+                      <span className="block text-[10px] leading-relaxed text-muted-foreground">{desc}</span>
+                    </span>
+                  </Label>
+                ))}
+              </RadioGroup>
+              {verifSaving && (
+                <p className="text-[11px] text-muted-foreground flex items-center gap-1.5">
+                  <Loader2 className="h-3 w-3 animate-spin" /> {c.verifSaving}
+                </p>
+              )}
+              <div className="rounded-xl border border-emerald-200/70 dark:border-emerald-900/40 bg-emerald-50/60 dark:bg-emerald-950/20 p-3 flex items-start gap-2">
+                <ShieldCheck className="h-4 w-4 mt-0.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                <p className="text-[11px] leading-relaxed text-emerald-800 dark:text-emerald-300">{c.verifStrictNote}</p>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
         {CHANNELS.map((channel) => {
           const registry = getRegistry(channel);
           const config = getConfig(channel);

@@ -50,6 +50,7 @@ import { ImageUploadPreviewDialog } from '@/components/shared/image-upload-previ
 // Task 2-c-2 — manual full data resync (shared: web + Capacitor mobile + Electron desktop).
 import { FullResyncButton } from '@/components/shared/full-resync-button';
 import { AppUpdateSettingsCard } from '@/components/shared/app-update-settings-card';
+import { AccountVerificationCard } from '@/components/shared/account-verification-card';
 // Task 2-a — real app version for the About row (null in plain browsers →
 // the static fallback label stays).
 import { getAppVersion } from '@/lib/app-version';
@@ -641,6 +642,14 @@ export function CustomerSettings() {
 
         {/* ─── Notification sound (volume + custom song — Task 82) ─── */}
         <ProfileSoundSettings t={t} />
+
+        {/* ─── Contact verification (strict-rule companion) ─── */}
+        <motion.section
+          initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.25, delay: 0.17 }}
+          aria-label="Contact verification"
+        >
+          <AccountVerificationCard />
+        </motion.section>
 
         {/* ─── Updates (auto-download + Wi-Fi-only + manual check) ─── */}
         <motion.section

@@ -19,6 +19,8 @@
  *   DELETE /templates/:id              → delete a template
  *   POST  /templates/seed              → re-create any missing default templates
  *   POST  /templates/preview           → render a template with sample variables
+ *   GET   /verification-mode           → platform verification gate (none|email|phone|both)
+ *   PUT   /verification-mode           → persist the platform verification gate
  *   GET   /logs                        → recent SmsLog entries (sms+whatsapp)
  */
 
@@ -38,7 +40,7 @@ import {
   saveProviderConfig,
   recordTestResult,
 } from '../lib/messaging/provider-config'
-import { DEV_BYPASS_CODES } from '../lib/verification-service'
+import { DEV_BYPASS_CODES, getVerificationMode, setVerificationMode, type VerificationMode } from '../lib/verification-service'
 import { sendTestEmail, checkEmailConnection } from '../lib/messaging/email-service'
 import { sendTestSms, getEsmsBalance } from '../lib/messaging/sms-sender'
 import {
@@ -489,6 +491,41 @@ app.post('/templates/preview', async (c) => {
         providerTemplateId: rendered?.providerTemplateId ?? null,
       },
     })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
+// ─── Verification & Security — platform verification mode ──────────────
+
+/**
+ * GET /verification-mode — current mandatory-verification mode.
+ * 'both' (default) · 'email' · 'phone' · 'none' — which contacts are
+ * mandatory at account creation/login (strict reset rule is INDEPENDENT:
+ * password reset only ever uses VERIFIED contacts).
+ */
+app.get('/verification-mode', async (c) => {
+  try {
+    await requireAdmin(c)
+    return c.json({ success: true, mode: await getVerificationMode() })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error }, err.status as 400)
+  }
+})
+
+/** PUT /verification-mode — { mode }: persist the platform gate. */
+app.put('/verification-mode', async (c) => {
+  try {
+    await requireAdmin(c)
+    const body = await c.req.json().catch(() => ({}))
+    const mode = body?.mode as VerificationMode
+    if (!['none', 'email', 'phone', 'both'].includes(mode)) {
+      return c.json({ success: false, error: "mode must be 'none' | 'email' | 'phone' | 'both'" }, 400)
+    }
+    await setVerificationMode(mode)
+    return c.json({ success: true, mode })
   } catch (error) {
     const err = authErrorResponse(error)
     return c.json({ success: false, error: err.error }, err.status as 400)

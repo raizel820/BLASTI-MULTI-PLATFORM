@@ -100,6 +100,15 @@ model UidCounter {
 /// password reset. Codes are stored HASHED (sha256) — the plaintext code
 /// exists only inside the delivered message. Dev-mode bypass codes are
 /// accepted by verification-service.ts WITHOUT a row match.
+// Platform-wide key/value settings (super-admin editable). Used for
+// cross-cutting switches that have no dedicated model — e.g.
+// 'verification.mode' = none | email | phone | both (Task: verification gate).
+model PlatformSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
 model VerificationCode {
   id          String    @id @default(cuid())
   userId      String

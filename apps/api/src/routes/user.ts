@@ -27,6 +27,7 @@ app.get('/profile', async (c) => {
       where: { id: user.id },
       select: {
         id: true, username: true, fullName: true, email: true, phoneNumber: true,
+        emailVerified: true, phoneVerified: true,
         // UID-0.6.14 — immutable account identifier shown in the profile.
         uid: true,
         role: true, language: true, avatarUrl: true, freeSmsCount: true,
@@ -57,12 +58,24 @@ app.patch('/profile', async (c) => {
     const { phoneNumber, email, language, avatarUrl, fullName, notificationPreferences, reminderMinutes, smsNotificationsEnabled, notificationPref } = validation.data
 
     const updateData: Record<string, unknown> = {}
-    if (phoneNumber !== undefined) updateData.phoneNumber = phoneNumber
+    // requireAuth returns the JWT payload (no email/phone on it) — fetch the
+    // current row so contact CHANGES can be detected reliably.
+    const current = await db.user.findUnique({
+      where: { id: user.id },
+      select: { email: true, phoneNumber: true },
+    })
+    if (phoneNumber !== undefined) {
+      // STRICT verification rule: a CHANGED phone number starts unverified —
+      // a user must never inherit the old number's verified status.
+      if (phoneNumber !== current?.phoneNumber) updateData.phoneVerified = false
+      updateData.phoneNumber = phoneNumber
+    }
     if (email !== undefined) {
       // '' clears the email; a value must be globally unique (User.email @unique).
       const normalizedEmail = email.trim().toLowerCase()
       if (normalizedEmail === '') {
         updateData.email = null
+        updateData.emailVerified = false
       } else {
         const taken = await db.user.findFirst({
           where: { email: normalizedEmail, id: { not: user.id } },
@@ -71,6 +84,8 @@ app.patch('/profile', async (c) => {
         if (taken) {
           return c.json({ success: false, error: 'This email is already used by another account' }, 409)
         }
+        // STRICT verification rule: a CHANGED email starts unverified.
+        if (normalizedEmail !== current?.email) updateData.emailVerified = false
         updateData.email = normalizedEmail
       }
     }
@@ -96,6 +111,7 @@ app.patch('/profile', async (c) => {
       data: updateData,
       select: {
         id: true, username: true, fullName: true, email: true, phoneNumber: true,
+        emailVerified: true, phoneVerified: true,
         // UID-0.6.14 — returned unchanged; NEVER editable (no write path).
         uid: true,
         role: true, language: true, avatarUrl: true, freeSmsCount: true,

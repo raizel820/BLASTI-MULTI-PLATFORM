@@ -25,10 +25,12 @@ import { normalizeRecordFileUrls } from '../lib/file-url'
 import {
   resolveVerificationStatus,
   issueAllPending,
+  issueVerification,
   verifyCode,
   createVerificationToken,
   verifyVerificationToken,
   maskTarget,
+  getVerifiedContacts,
   type VerificationPurpose,
 } from '../lib/verification-service'
 import { deliverTemplate } from '../lib/messaging/template-service'
@@ -1013,17 +1015,22 @@ app.post('/verification-status', async (c) => {
     }
     const user = await db.user.findUnique({
       where: { id: userId },
-      select: { email: true, phoneNumber: true, emailVerified: true, phoneVerified: true },
+      select: { id: true, email: true, phoneNumber: true, emailVerified: true, phoneVerified: true, createdAt: true, role: true },
     })
     if (!user) {
       return c.json({ success: false, error: 'USER_NOT_FOUND' }, 404)
     }
+    // Mode-aware: the UI must show ONLY the channels the current platform
+    // verification mode actually mandates (none/email/phone/both).
+    const status = await resolveVerificationStatus(user).catch(() => null)
     return c.json({
       success: true,
-      pending: {
-        email: Boolean(user.email) && !user.emailVerified,
-        phone: Boolean(user.phoneNumber) && !user.phoneVerified,
-      },
+      pending: status
+        ? { email: status.emailRequired, phone: status.phoneRequired }
+        : {
+            email: Boolean(user.email) && !user.emailVerified,
+            phone: Boolean(user.phoneNumber) && !user.phoneVerified,
+          },
       targets: {
         email: user.email ? maskTarget(user.email) : null,
         phone: user.phoneNumber ? maskTarget(user.phoneNumber) : null,
@@ -1036,6 +1043,102 @@ app.post('/verification-status', async (c) => {
     if (error instanceof AuthError) {
       return c.json({ success: false, error: error.message }, error.statusCode as any)
     }
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return c.json({ success: false, error: message }, 500)
+  }
+})
+
+/**
+ * POST /auth/account/verification/issue — SESSION required.
+ *
+ * Self-service verification from the user's own account settings: (re)send
+ * the OTP for their email and/or phone regardless of the platform mode, so
+ * an unverified contact can ALWAYS become verified (strict reset rule then
+ * accepts it). Rate limits + cooldown live inside issueVerification().
+ */
+app.post('/account/verification/issue', async (c) => {
+  try {
+    const sessionUser = await getSessionUser(c)
+    if (!sessionUser) return c.json({ success: false, error: 'UNAUTHORIZED' }, 401)
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400)
+    }
+    const { channel } = body as { channel?: string }
+    if (channel !== 'email' && channel !== 'phone') {
+      return c.json({ success: false, error: "channel must be 'email' or 'phone'" }, 400)
+    }
+
+    const user = await db.user.findUnique({
+      where: { id: sessionUser.id },
+      select: { id: true, email: true, phoneNumber: true, language: true },
+    })
+    if (!user) return c.json({ success: false, error: 'USER_NOT_FOUND' }, 404)
+
+    const target = channel === 'email' ? user.email : user.phoneNumber
+    if (!target) {
+      return c.json({ success: false, error: 'NO_CONTACT_ON_FILE' }, 400)
+    }
+
+    const ip = getConnInfo(c)?.remote?.address
+    const purpose: VerificationPurpose = channel === 'email' ? 'EMAIL_VERIFY' : 'PHONE_VERIFY'
+    const r = await issueVerification({
+      userId: user.id,
+      purpose,
+      target,
+      language: user.language || 'en',
+      ip,
+    })
+    return c.json({
+      success: r.success,
+      error: r.error,
+      channel: r.channel,
+      target: maskTarget(target),
+      expiresInMinutes: r.expiresInMinutes,
+      retryAfterSeconds: r.retryAfterSeconds,
+      ...(r.devBypass ? { devBypass: true, devCode: r.devCode } : {}),
+    }, r.success ? 200 : 429)
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Internal server error'
+    return c.json({ success: false, error: message }, 500)
+  }
+})
+
+/**
+ * POST /auth/account/verification/confirm — SESSION required.
+ *
+ * Confirm a self-service OTP ({ channel, code }). On success the matching
+ * verified flag is set; the response carries the fresh verification status.
+ */
+app.post('/account/verification/confirm', async (c) => {
+  try {
+    const sessionUser = await getSessionUser(c)
+    if (!sessionUser) return c.json({ success: false, error: 'UNAUTHORIZED' }, 401)
+
+    let body: unknown
+    try {
+      body = await c.req.json()
+    } catch {
+      return c.json({ success: false, error: 'Invalid JSON body' }, 400)
+    }
+    const { channel, code } = body as { channel?: string; code?: string }
+    if ((channel !== 'email' && channel !== 'phone') || !code) {
+      return c.json({ success: false, error: "channel ('email'|'phone') and code are required" }, 400)
+    }
+
+    const purpose: VerificationPurpose = channel === 'email' ? 'EMAIL_VERIFY' : 'PHONE_VERIFY'
+    const r = await verifyCode({ userId: sessionUser.id, purpose, code })
+    return c.json({
+      success: r.success,
+      error: r.error,
+      remainingAttempts: r.remainingAttempts,
+      expired: r.expired,
+      status: r.status,
+    }, r.success ? 200 : 400)
+  } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Internal server error'
     return c.json({ success: false, error: message }, 500)
   }
@@ -1246,7 +1349,7 @@ app.post('/forgot-password', async (c) => {
     // Find user by username (but don't reveal existence)
     const user = await db.user.findUnique({
       where: { username },
-      select: { id: true, username: true, fullName: true, email: true, phoneNumber: true, language: true },
+      select: { id: true, username: true, fullName: true, email: true, phoneNumber: true, language: true, emailVerified: true, phoneVerified: true },
     })
 
     if (user) {
@@ -1261,19 +1364,21 @@ app.post('/forgot-password', async (c) => {
         expiresAt,
       })
 
-      // ── Deliver the reset code through the notification templates ──
-      // EMAIL when the user has an address, otherwise SMS (both use the
-      // admin-editable password_reset template). Fallback: console log so
-      // dev environments never lose the token.
+      // ── Deliver the reset code — STRICT RULE (verified contacts ONLY) ──
+      // Auth-critical codes are sent exclusively to VERIFIED channels:
+      // verified email first, else the verified phone via SMS. Unverified
+      // contacts are NEVER used, no matter the verification mode — users
+      // verify them self-service from their account settings.
+      const verified = await getVerifiedContacts(user)
       const vars = { fullName: user.fullName ?? user.username, code: resetToken, expiryMinutes: 15 }
       let delivered = false
-      if (user.email) {
+      if (verified.email) {
         const r = await deliverTemplate({
-          key: 'password_reset', channel: 'EMAIL', target: user.email,
+          key: 'password_reset', channel: 'EMAIL', target: verified.email,
           language: user.language || 'en', vars,
         }).catch(() => null)
         delivered = Boolean(r?.success)
-      } else if (user.phoneNumber) {
+      } else if (verified.phone) {
         // SMS legibility: a compact 8-char code instead of the 64-hex token
         const smsCode = crypto.randomBytes(4).toString('hex').toUpperCase()
         resetTokenStore.set(smsCode, {
@@ -1282,15 +1387,21 @@ app.post('/forgot-password', async (c) => {
           expiresAt,
         })
         const r = await deliverTemplate({
-          key: 'password_reset', channel: 'SMS', target: user.phoneNumber,
+          key: 'password_reset', channel: 'SMS', target: verified.phone,
           language: user.language || 'en',
           vars: { ...vars, code: smsCode },
         }).catch(() => null)
         delivered = Boolean(r?.success)
       }
       if (!delivered) {
-        // Log to console (dev mode — no provider configured)
-        console.log(`[Forgot Password] Reset token for user "${user.username}": ${resetToken} (expires in 15 min)`)
+        if (process.env.NODE_ENV === 'production') {
+          // STRICT: no verified channel → the code is NEVER emitted (the
+          // generic response below prevents account enumeration either way).
+          console.warn(`[Forgot Password] "${user.username}" has NO verified contact — reset code withheld (strict rule)`)
+        } else {
+          // Dev fallback: console log so dev environments never lose the token
+          console.log(`[Forgot Password] Reset token for user "${user.username}": ${resetToken} (expires in 15 min)`)
+        }
       }
     }
 

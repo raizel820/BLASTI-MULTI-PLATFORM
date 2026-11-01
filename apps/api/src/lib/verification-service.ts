@@ -61,7 +61,58 @@ function hashCode(code: string): string {
   return createHash('sha256').update(`blasti-otp:${code}`).digest('hex')
 }
 
-// ─── Enforcement gate ────────────────────────────────────────────────────────
+// ─── Verification mode (super-admin setting, PlatformSetting row) ───────────
+
+export type VerificationMode = 'none' | 'email' | 'phone' | 'both'
+const VERIFICATION_MODE_KEY = 'verification.mode'
+const VERIFICATION_MODES: VerificationMode[] = ['none', 'email', 'phone', 'both']
+
+/** Read the platform verification mode (default 'both' = the historical gate). */
+export async function getVerificationMode(): Promise<VerificationMode> {
+  try {
+    const row = await db.platformSetting.findUnique({ where: { key: VERIFICATION_MODE_KEY } })
+    const value = row?.value as VerificationMode | undefined
+    return value && VERIFICATION_MODES.includes(value) ? value : 'both'
+  } catch {
+    return 'both'
+  }
+}
+
+/** Persist the platform verification mode. */
+export async function setVerificationMode(mode: VerificationMode): Promise<void> {
+  if (!VERIFICATION_MODES.includes(mode)) throw new Error(`INVALID_VERIFICATION_MODE:${mode}`)
+  await db.platformSetting.upsert({
+    where: { key: VERIFICATION_MODE_KEY },
+    create: { key: VERIFICATION_MODE_KEY, value: mode },
+    update: { value: mode },
+  })
+}
+
+/** Which contacts does the mode mandate for a user that has both? */
+function modeRequires(mode: VerificationMode): { email: boolean; phone: boolean } {
+  return {
+    email: mode === 'email' || mode === 'both',
+    phone: mode === 'phone' || mode === 'both',
+  }
+}
+
+/**
+ * STRICT-RULE helper — the ONLY contacts eligible for password-reset and
+ * auth-critical delivery. Unverified contacts are never returned, no matter
+ * the verification mode (self-service verification keeps them verifiable).
+ */
+export async function getVerifiedContacts(user: {
+  id: string
+  email: string | null
+  phoneNumber: string | null
+  emailVerified: boolean
+  phoneVerified: boolean
+}): Promise<{ email: string | null; phone: string | null }> {
+  return {
+    email: user.email && user.emailVerified ? user.email : null,
+    phone: user.phoneNumber && user.phoneVerified ? user.phoneNumber : null,
+  }
+}
 
 export interface VerificationStatus {
   required: boolean
@@ -119,8 +170,13 @@ export async function resolveVerificationStatus(user: UserLike): Promise<Verific
     return status
   }
 
-  status.emailRequired = Boolean(user.email) && !user.emailVerified
-  status.phoneRequired = Boolean(user.phoneNumber) && !user.phoneVerified
+  // Mode-aware gate: the super-admin picks which contacts are mandatory
+  // (Platform Settings → Notifications & Providers → Verification & Security).
+  const mode = await getVerificationMode()
+  if (mode === 'none') return status
+  const requires = modeRequires(mode)
+  status.emailRequired = requires.email && Boolean(user.email) && !user.emailVerified
+  status.phoneRequired = requires.phone && Boolean(user.phoneNumber) && !user.phoneVerified
   status.required = status.emailRequired || status.phoneRequired
   return status
 }
@@ -418,7 +474,17 @@ export async function issueAllPending(opts: {
 }): Promise<{ email?: IssueResult; phone?: IssueResult }> {
   const out: { email?: IssueResult; phone?: IssueResult } = {}
 
-  if (opts.email && !opts.emailVerified) {
+  // Mode-aware: only channels the platform mode MANDATES get OTPs
+  // (mode 'none' → nothing; 'email' → email only; 'phone' → phone only).
+  const user = await db.user.findUnique({
+    where: { id: opts.userId },
+    select: { id: true, email: true, phoneNumber: true, emailVerified: true, phoneVerified: true, createdAt: true, role: true },
+  })
+  const status = user ? await resolveVerificationStatus(user).catch(() => null) : null
+  const emailMandated = status ? status.emailRequired : Boolean(opts.email) && !opts.emailVerified
+  const phoneMandated = status ? status.phoneRequired : Boolean(opts.phoneNumber) && !opts.phoneVerified
+
+  if (opts.email && !opts.emailVerified && emailMandated) {
     out.email = await issueVerification({
       userId: opts.userId,
       purpose: 'EMAIL_VERIFY',
@@ -427,7 +493,7 @@ export async function issueAllPending(opts: {
       ip: opts.ip,
     })
   }
-  if (opts.phoneNumber && !opts.phoneVerified) {
+  if (opts.phoneNumber && !opts.phoneVerified && phoneMandated) {
     out.phone = await issueVerification({
       userId: opts.userId,
       purpose: 'PHONE_VERIFY',
