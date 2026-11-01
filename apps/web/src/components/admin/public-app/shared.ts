@@ -46,6 +46,9 @@ export interface AppVersion {
   updatedAt: string;
 }
 
+/** What kind of artifact a bucket file is (server-parsed from the name). */
+export type InstallerFileKind = 'installer' | 'ref' | 'delta' | 'unknown';
+
 /** One entry PER FILE on disk — same-name rebuilds stay distinct rows. */
 export interface InstallerDiskFile {
   /** Bucket-relative path "<group>/<name>" — the EXACT disk reference. */
@@ -57,6 +60,10 @@ export interface InstallerDiskFile {
   mtimeMs: number;
   platform?: string | null;
   parsed?: { platform: string; version: string } | null;
+  /** Artifact kind — delta patches + release refs are NOT installable. */
+  kind?: InstallerFileKind | null;
+  /** Delta patches only: the version the patch updates TO. */
+  versionTo?: string | null;
   /** AppVersion row pointing at this exact file (if any). */
   version?: {
     id: string;
@@ -66,6 +73,28 @@ export interface InstallerDiskFile {
     fileName: string | null;
     fileSize: number | null;
   } | null;
+}
+
+/**
+ * One entry per (platform, version) the server can touch — aggregated from
+ * the ACTUAL bucket files (GET /api/app-versions/storage-versions) and merged
+ * with the DB rows. Versions whose rows were deleted but whose installers /
+ * delta patches remain on disk appear here with hasDbRow=false ("orphan").
+ */
+export interface StorageVersion {
+  platform: string;
+  version: string;
+  installers: { count: number; bytes: number };
+  deltas: { count: number; bytes: number };
+  refs: { count: number; bytes: number };
+  dbDeltaRows: number;
+  totalFiles: number;
+  totalBytes: number;
+  latestMtimeMs: number;
+  hasDbRow: boolean;
+  isPublished: boolean;
+  dbId: string | null;
+  dbFileName: string | null;
 }
 
 export interface InstallTotals {

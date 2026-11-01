@@ -74,6 +74,7 @@ import {
   platformLabel,
   type AppVersion,
   type InstallStats,
+  type StorageVersion,
 } from './shared';
 import { NotesInput, type NotesValue } from './notes-input';
 import { INSTALLER_PLATFORMS, isValidSemver, type InstallerPlatform } from '@/lib/admin-upload';
@@ -109,6 +110,8 @@ interface CleanupPreviewPlan {
     fileName: string | null;
     createdAt: string;
   }>;
+  /** Every version string in scope — DB rows ∪ disk-only files (orphan). */
+  scopeVersions: string[];
   installers: { count: number; bytes: number };
   refArtifacts: { count: number; bytes: number };
   deltas: { count: number; bytes: number; pairs: string[] };
@@ -139,6 +142,10 @@ export function VersionsTab() {
 
   const [versions, setVersions] = useState<AppVersion[]>([]);
   const [stats, setStats] = useState<InstallStats | null>(null);
+  // Disk truth: every (platform, version) the ACTUAL bucket files cover —
+  // including versions whose DB rows are gone but installers/delta patches
+  // remain. Feeds the Cleanup picker so old releases stay cleanable.
+  const [storageVersions, setStorageVersions] = useState<StorageVersion[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -167,12 +174,14 @@ export function VersionsTab() {
   const fetchAll = useCallback(async (isRefresh = false) => {
     if (!isRefresh) setLoading(true);
     try {
-      const [versionsRes, statsRes] = await Promise.all([
+      const [versionsRes, statsRes, storageRes] = await Promise.all([
         apiFetch('/api/app-versions'),
         apiFetch('/api/app-installs/stats'),
+        apiFetch('/api/app-versions/storage-versions'),
       ]);
       const versionsData = await versionsRes.json().catch(() => null);
       const statsData = await statsRes.json().catch(() => null);
+      const storageData = await storageRes.json().catch(() => null);
 
       if (versionsRes.ok && versionsData?.success) {
         setVersions(versionsData.versions || []);
@@ -181,6 +190,8 @@ export function VersionsTab() {
         setError(versionsData?.error || `HTTP ${versionsRes.status}`);
       }
       if (statsRes.ok && statsData?.success) setStats(statsData);
+      // Non-fatal: the picker falls back to the DB rows when unavailable.
+      if (storageRes.ok && storageData?.success) setStorageVersions(storageData.versions || []);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Network error');
     } finally {
@@ -336,18 +347,39 @@ export function VersionsTab() {
   );
 
   // ── Cleanup (installers + delta patches of the selected scope) ──
-  const cleanupPlatforms = useMemo(
-    () => [...new Set(versions.map((v) => v.platform))],
-    [versions],
-  );
-  const cleanupVersionsForPlatform = useMemo(
-    () => versions.filter((v) => v.platform === cleanupPlatform),
-    [versions, cleanupPlatform],
-  );
+  // Pickers are fed from the DISK inventory (storage-versions) so versions
+  // that exist only as files on disk stay cleanable; the DB rows are the
+  // fallback when the disk inventory is unavailable.
+  const cleanupPlatforms = useMemo(() => {
+    const fromDisk = [...new Set(storageVersions.map((v) => v.platform))];
+    if (fromDisk.length > 0) return fromDisk;
+    return [...new Set(versions.map((v) => v.platform))];
+  }, [storageVersions, versions]);
+  const cleanupVersionsForPlatform = useMemo(() => {
+    const disk = storageVersions.filter((v) => v.platform === cleanupPlatform);
+    if (disk.length > 0) return disk;
+    return versions
+      .filter((v) => v.platform === cleanupPlatform)
+      .map((v) => ({
+        platform: v.platform,
+        version: v.version,
+        installers: { count: v.fileStorageKey ? 1 : 0, bytes: v.fileSize ?? 0 },
+        deltas: { count: 0, bytes: 0 },
+        refs: { count: 0, bytes: 0 },
+        dbDeltaRows: 0,
+        totalFiles: v.fileStorageKey ? 1 : 0,
+        totalBytes: v.fileSize ?? 0,
+        latestMtimeMs: 0,
+        hasDbRow: true,
+        isPublished: !!v.isPublished,
+        dbId: v.id,
+        dbFileName: v.fileName ?? null,
+      }));
+  }, [storageVersions, versions, cleanupPlatform]);
 
   const openCleanup = useCallback(() => {
-    const firstPlatform = [...new Set(versions.map((v) => v.platform))][0] ?? '';
-    const firstVersion = versions.find((v) => v.platform === firstPlatform)?.version ?? '';
+    const firstPlatform = cleanupPlatforms[0] ?? '';
+    const firstVersion = cleanupVersionsForPlatform.find((v) => v.platform === firstPlatform)?.version ?? '';
     setCleanupPlatform(firstPlatform);
     setCleanupVersion(firstVersion);
     setCleanupScope('with-previous');
@@ -355,7 +387,7 @@ export function VersionsTab() {
     setPreviewError(false);
     setCleanupConfirm(false);
     setCleanupOpen(true);
-  }, [versions]);
+  }, [cleanupPlatforms, cleanupVersionsForPlatform]);
 
   // Live preview: refetched whenever the selection changes (cancelled on change).
   useEffect(() => {
@@ -452,7 +484,7 @@ export function VersionsTab() {
               variant="outline"
               className="h-9 w-full sm:w-auto"
               onClick={openCleanup}
-              disabled={versions.length === 0}
+              disabled={loading || cleanupPlatforms.length === 0}
             >
               <Eraser className="h-4 w-4" />
               {t('publicAppCleanup')}
@@ -814,7 +846,8 @@ export function VersionsTab() {
           </DialogHeader>
 
           <div className="space-y-4">
-            {/* platform + version */}
+            {/* platform + version — fed from the DISK inventory, so versions
+                that exist only as files (no DB row) stay selectable */}
             <div className="grid grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <Label className="text-xs">{t('publicAppCleanupPlatform')}</Label>
@@ -822,7 +855,7 @@ export function VersionsTab() {
                   value={cleanupPlatform}
                   onValueChange={(v) => {
                     setCleanupPlatform(v);
-                    const next = versions.find((x) => x.platform === v);
+                    const next = storageVersions.find((x) => x.platform === v);
                     setCleanupVersion(next?.version ?? '');
                   }}
                 >
@@ -846,15 +879,39 @@ export function VersionsTab() {
                   </SelectTrigger>
                   <SelectContent>
                     {cleanupVersionsForPlatform.map((v) => (
-                      <SelectItem key={v.id} value={v.version}>
-                        <span className="font-mono" dir="ltr">{v.version}</span>
-                        {v.isPublished ? ` · ${t('publicAppStatusActive')}` : ''}
+                      <SelectItem key={`${v.platform}|${v.version}`} value={v.version}>
+                        <span className="flex items-center gap-1.5">
+                          <span className="font-mono" dir="ltr">{v.version}</span>
+                          {v.isPublished ? (
+                            <Badge className="bg-emerald-600 hover:bg-emerald-600 text-[9px] h-4 px-1 rounded-full">
+                              {t('publicAppStatusActive')}
+                            </Badge>
+                          ) : !v.hasDbRow ? (
+                            <Badge variant="secondary" className="text-[9px] h-4 px-1 rounded-full">
+                              {t('publicAppCleanupFilesOnly')}
+                            </Badge>
+                          ) : null}
+                        </span>
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
+                {cleanupVersion && (
+                  <p className="text-[11px] text-muted-foreground" dir="ltr">
+                    {(() => {
+                      const sel = cleanupVersionsForPlatform.find((x) => x.version === cleanupVersion);
+                      if (!sel) return null;
+                      return t('publicAppCleanupFiles', {
+                        count: String(sel.totalFiles),
+                        size: formatFileSize(sel.totalBytes),
+                      });
+                    })()}
+                  </p>
+                )}
               </div>
             </div>
+
+            <p className="text-[11px] text-muted-foreground">{t('publicAppCleanupDiskHint')}</p>
 
             {/* scope */}
             <div className="space-y-1.5">
@@ -903,7 +960,11 @@ export function VersionsTab() {
                     <>
                       <CleanupPreviewRow
                         label={t('publicAppCleanupVersionsLabel')}
-                        value={cleanupPreview.versions.map((v) => v.version).join(', ')}
+                        value={
+                          cleanupPreview.scopeVersions?.length
+                            ? cleanupPreview.scopeVersions.join(', ')
+                            : cleanupPreview.versions.map((v) => v.version).join(', ')
+                        }
                       />
                       {cleanupPreview.installers.count > 0 && (
                         <CleanupPreviewRow
@@ -980,8 +1041,12 @@ export function VersionsTab() {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {cleanupPreview && cleanupPreview.totalFiles > 0
-                ? `${t('publicAppCleanupConfirmBody')}\n\n${t('publicAppCleanupVersionsLabel')}: ${cleanupPreview.versions
-                    .map((v) => `${platformLabel(v.platform, lang)} ${v.version}`)
+                ? `${t('publicAppCleanupConfirmBody')}\n\n${t('publicAppCleanupVersionsLabel')}: ${
+                    (cleanupPreview.scopeVersions?.length
+                      ? cleanupPreview.scopeVersions
+                      : cleanupPreview.versions.map((v) => v.version)
+                    )
+                    .map((version) => `${platformLabel(cleanupPlatform, lang)} ${version}`)
                     .join(', ')}`
                 : t('publicAppCleanupConfirmBody')}
             </AlertDialogDescription>

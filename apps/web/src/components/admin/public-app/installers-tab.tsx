@@ -475,6 +475,9 @@ export function InstallersTab() {
                           const active = isActiveInstaller(file);
                           const linked = !!file.version && !active;
                           const busy = activatingKey === file.storageKey;
+                          // Delta patches + asar/outref release references are
+                          // support artifacts — they can never be activated.
+                          const notInstallable = file.kind === 'delta' || file.kind === 'ref';
 
                           return (
                             <TableRow key={file.storageKey} className={active ? 'bg-emerald-500/5' : undefined}>
@@ -493,13 +496,21 @@ export function InstallersTab() {
                                 {formatFileSize(file.size)}
                               </TableCell>
                               <TableCell className="text-xs font-mono" dir="ltr">
-                                {file.parsed?.version || file.version?.version || '—'}
+                                {file.kind === 'delta' && file.parsed?.version
+                                  ? `${file.parsed.version} → ${file.versionTo ?? '—'}`
+                                  : file.parsed?.version || file.version?.version || '—'}
                               </TableCell>
                               <TableCell>
                                 {active ? (
                                   <Badge className="bg-emerald-600 hover:bg-emerald-600 text-[10px] h-5 px-1.5">
                                     <CheckCircle2 className="h-3 w-3 me-1" />
                                     {t('publicAppStatusActive')}
+                                  </Badge>
+                                ) : notInstallable ? (
+                                  <Badge variant="outline" className="text-[10px] h-5 px-1.5">
+                                    {file.kind === 'delta'
+                                      ? t('publicAppKindDelta')
+                                      : t('publicAppKindRef')}
                                   </Badge>
                                 ) : linked ? (
                                   <Badge variant="secondary" className="text-[10px] h-5 px-1.5">
@@ -511,7 +522,7 @@ export function InstallersTab() {
                                 )}
                               </TableCell>
                               <TableCell className="text-end">
-                                {!active && (
+                                {!active && !notInstallable && (
                                   <Button
                                     size="sm"
                                     variant="outline"

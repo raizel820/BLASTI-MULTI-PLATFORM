@@ -137,6 +137,84 @@ function resolveBinaryPath(storageKey: string): string | null {
   return null
 }
 
+// ─── Bucket file classification (shared) ───────────────────────────────────
+//
+// ONE parser for every artifact naming convention this server writes:
+//   installer  <platform>-<semver>-<ts>-<original>            (POST /upload)
+//   ref        (asar|outref)-<platform>-<semver>-<ts>-<orig>  (release-refs)
+//   delta      delta-<platform>-<from>-to-<to>-<ts>.patch     (delta generator)
+//
+// 'android-debug' is tested before 'android' (longer prefix wins) so a debug
+// name can never be swallowed by the plain-android pattern. Files matching NO
+// convention classify as null — callers fall back to row/extension hints.
+// Without this shared parser every delta patch and release reference landed
+// in the admin storage views as "unknown platform" (120 of 163 files once).
+
+const PLATFORMS_DESC = ['android-debug', 'android', 'ios', 'electron', 'windows', 'mac', 'linux']
+
+export interface BucketFileClass {
+  kind: 'installer' | 'ref' | 'delta'
+  platform: string
+  /** installer/ref: the artifact's own version. delta: the version patched FROM. */
+  version: string
+  /** delta only: the version the patch updates TO. */
+  versionTo?: string
+}
+
+function classifyBucketFile(baseName: string): BucketFileClass | null {
+  for (const platform of PLATFORMS_DESC) {
+    const md = new RegExp(`^delta-${platform}-(\\d+\\.\\d+\\.\\d+)-to-(\\d+\\.\\d+\\.\\d+)-\\d+\\.patch$`).exec(baseName)
+    if (md) return { kind: 'delta', platform, version: md[1], versionTo: md[2] }
+    const mr = new RegExp(`^(?:asar|outref)-${platform}-(\\d+\\.\\d+\\.\\d+)-\\d+-.+`).exec(baseName)
+    if (mr) return { kind: 'ref', platform, version: mr[1] }
+    const mi = new RegExp(`^${platform}-(\\d+\\.\\d+\\.\\d+)-\\d+-.+$`).exec(baseName)
+    if (mi) return { kind: 'installer', platform, version: mi[1] }
+  }
+  return null
+}
+
+interface BucketFile {
+  storageKey: string
+  name: string
+  /** 'desktop' | 'mobile' | '' (legacy flat root). */
+  group: string
+  size: number
+  mtimeMs: number
+}
+
+/** LIVE walk of the app-versions bucket (group folders + legacy flat root). */
+async function walkBucket(): Promise<BucketFile[]> {
+  const root = path.resolve(UPLOAD_DIR)
+  const out: BucketFile[] = []
+  let entries: fs.Dirent[] = []
+  try {
+    entries = await fs.promises.readdir(root, { withFileTypes: true })
+  } catch {
+    return out // bucket missing — empty list
+  }
+  const stat = async (abs: string, group: string, name: string) => {
+    try {
+      const st = await fs.promises.stat(abs)
+      if (!st.isFile()) return
+      out.push({ storageKey: group ? `${group}/${name}` : name, name, group, size: st.size, mtimeMs: st.mtimeMs })
+    } catch { /* raced delete — skip */ }
+  }
+  for (const e of entries) {
+    if (e.isFile()) {
+      await stat(path.join(root, e.name), '', e.name) // legacy flat binaries
+    } else if (e.isDirectory()) {
+      let inner: fs.Dirent[] = []
+      try {
+        inner = await fs.promises.readdir(path.join(root, e.name), { withFileTypes: true })
+      } catch { continue }
+      for (const f of inner) {
+        if (f.isFile()) await stat(path.join(root, e.name, f.name), e.name, f.name)
+      }
+    }
+  }
+  return out
+}
+
 // ─── GET /app-versions — List all app versions ──────────────────────────────
 
 app.get('/', async (c) => {
@@ -923,9 +1001,11 @@ app.get('/:id/download', async (c) => {
 //
 //   • name / storageKey / group (desktop|mobile|flat) / size / mtimeMs —
 //     mtime is the PUSH TIME (CI writes the file at push time),
-//   • parsed platform + version from the upload naming convention
-//     `<platform>-<semver>-<ts>-<original-name>` ('android-debug' checked
-//     before 'android'; unknown naming → parsed=null),
+//   • kind ('installer' | 'ref' | 'delta' | 'unknown') + platform + version
+//     from the shared naming parser — delta patches and asar/outref release
+//     references therefore group under their REAL platform instead of
+//     landing in "unknown" (extension fallback covers manually copied
+//     binaries; 'android-debug' checked before 'android'),
 //   • version: { id, platform, version, isPublished, fileName } of the
 //     AppVersion row whose fileStorageKey points at this exact file.
 //
@@ -937,48 +1017,7 @@ app.get('/storage-files', async (c) => {
     await requireAdmin(c)
     ensureUploadDir()
 
-    interface DiskFile {
-      storageKey: string
-      name: string
-      group: string
-      size: number
-      mtimeMs: number
-    }
-    const diskFiles: DiskFile[] = []
-
-    const root = path.resolve(UPLOAD_DIR)
-    const pushFile = async (abs: string, group: string) => {
-      try {
-        const st = await fs.promises.stat(abs)
-        if (!st.isFile()) return
-        diskFiles.push({
-          storageKey: group ? `${group}/${path.basename(abs)}` : path.basename(abs),
-          name: path.basename(abs),
-          group,
-          size: st.size,
-          mtimeMs: st.mtimeMs,
-        })
-      } catch { /* raced delete — skip */ }
-    }
-
-    let dirEntries: fs.Dirent[] = []
-    try {
-      dirEntries = await fs.promises.readdir(root, { withFileTypes: true })
-    } catch { /* bucket missing — empty list */ }
-
-    for (const e of dirEntries) {
-      if (e.isFile()) {
-        await pushFile(path.join(root, e.name), '') // legacy flat binaries
-      } else if (e.isDirectory()) {
-        let inner: fs.Dirent[] = []
-        try {
-          inner = await fs.promises.readdir(path.join(root, e.name), { withFileTypes: true })
-        } catch { continue }
-        for (const f of inner) {
-          if (f.isFile()) await pushFile(path.join(root, e.name, f.name), e.name)
-        }
-      }
-    }
+    const diskFiles = await walkBucket()
 
     // Enrich in ONE query: which AppVersion rows reference these exact keys?
     // fileSize is included so the UI can verify the ACTIVE identity by EXACT
@@ -993,12 +1032,8 @@ app.get('/storage-files', async (c) => {
       : []
     const byKey = new Map(rows.map((r) => [r.fileStorageKey as string, r]))
 
-    // Parse the CI/upload naming convention → platform + version.
-    const PLATFORMS_DESC = ['android-debug', 'android', 'ios', 'electron', 'windows', 'mac', 'linux']
-    // Extension/pattern fallback — classifies binaries that do not follow the
-    // `<platform>-<semver>-<ts>-<original>` storage-key convention (e.g. files
-    // copied onto disk manually). 'android-debug' must be checked before
-    // 'android' so a debug APK name containing "debug" wins.
+    // Extension/pattern fallback — classifies binaries that do not follow any
+    // naming convention (e.g. files copied onto disk manually).
     const classifyByExtension = (name: string): string | null => {
       const lower = name.toLowerCase()
       if (lower.endsWith('.apk')) {
@@ -1011,27 +1046,26 @@ app.get('/storage-files', async (c) => {
       if (lower.endsWith('.app.zip')) return 'mac'
       return null
     }
-    const parseKey = (key: string): { platform: string; version: string } | null => {
-      const base = key.includes('/') ? key.slice(key.indexOf('/') + 1) : key
-      for (const platform of PLATFORMS_DESC) {
-        if (!base.startsWith(`${platform}-`)) continue
-        const m = new RegExp(`^${platform}-(\\d+\\.\\d+\\.\\d+)-\\d+-.+$`).exec(base)
-        if (m) return { platform, version: m[1] }
-      }
-      return null
-    }
 
     const files = diskFiles
       .map((f) => {
         const row = byKey.get(f.storageKey) ?? null
+        const cls = classifyBucketFile(f.name)
+        const extPlatform = classifyByExtension(f.name)
         // Platform classification precedence: upload-name convention →
         // linked AppVersion row → file-extension/pattern fallback.
-        const parsed = parseKey(f.storageKey)
-        const platform =
-          parsed?.platform ?? row?.platform ?? classifyByExtension(f.name) ?? null
+        const platform = cls?.platform ?? row?.platform ?? extPlatform ?? null
+        const kind: 'installer' | 'ref' | 'delta' | 'unknown' =
+          cls?.kind ?? (row || extPlatform ? 'installer' : 'unknown')
         return {
           ...f,
-          parsed: parsed ?? (platform ? { platform, version: row?.version ?? '' } : null),
+          kind,
+          ...(cls?.kind === 'delta' && cls.versionTo ? { versionTo: cls.versionTo } : {}),
+          parsed: cls
+            ? { platform: cls.platform, version: cls.version }
+            : platform
+              ? { platform, version: row?.version ?? '' }
+              : null,
           platform,
           version: row
             ? { id: row.id, platform: row.platform, version: row.version, isPublished: row.isPublished, fileName: row.fileName, fileSize: row.fileSize }
@@ -1041,6 +1075,128 @@ app.get('/storage-files', async (c) => {
       .sort((a, b) => b.mtimeMs - a.mtimeMs)
 
     return c.json({ success: true, files, uploadDir: UPLOAD_DIR })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── GET /app-versions/storage-versions — disk-truth version inventory ─────
+//
+// The Versions tab + the Cleanup dialog used to offer ONLY the AppVersion DB
+// rows. When rows are deleted (full reset, manual deletes) their INSTALLERS,
+// DELTA PATCHES and RELEASE REFS stay on disk with no row pointing at them —
+// the admin then sees 163 files but a version picker offering a single row.
+//
+// This endpoint aggregates the ACTUAL bucket contents per (platform, version)
+// using the shared naming parser, then merges the DB rows + delta rows on
+// top. Every version string the cleanup can possibly touch appears here —
+// including versions that exist ONLY as files ("orphan", hasDbRow=false).
+
+app.get('/storage-versions', async (c) => {
+  try {
+    await requireAdmin(c)
+    ensureUploadDir()
+
+    const bucketFiles = await walkBucket()
+
+    interface Agg {
+      platform: string
+      version: string
+      installers: { count: number; bytes: number }
+      deltas: { count: number; bytes: number }
+      refs: { count: number; bytes: number }
+      /** Delta DB rows touching this version (their patch file may be gone). */
+      dbDeltaRows: number
+      totalFiles: number
+      totalBytes: number
+      latestMtimeMs: number
+    }
+    const agg = new Map<string, Agg>()
+    const touch = (platform: string, version: string): Agg => {
+      const key = `${platform}|${version}`
+      let a = agg.get(key)
+      if (!a) {
+        a = {
+          platform,
+          version,
+          installers: { count: 0, bytes: 0 },
+          deltas: { count: 0, bytes: 0 },
+          refs: { count: 0, bytes: 0 },
+          dbDeltaRows: 0,
+          totalFiles: 0,
+          totalBytes: 0,
+          latestMtimeMs: 0,
+        }
+        agg.set(key, a)
+      }
+      return a
+    }
+
+    for (const f of bucketFiles) {
+      const cls = classifyBucketFile(f.name)
+      if (!cls) continue
+      // A delta patch touches TWO versions — list it under BOTH endpoints so
+      // either side is selectable in the cleanup picker. (The UI never sums
+      // entries, so the double attribution cannot produce a wrong total.)
+      const ends = cls.kind === 'delta' && cls.versionTo ? [cls.version, cls.versionTo] : [cls.version]
+      for (const v of ends) {
+        const a = touch(cls.platform, v)
+        const bucketKind = cls.kind === 'delta' ? a.deltas : cls.kind === 'ref' ? a.refs : a.installers
+        bucketKind.count += 1
+        bucketKind.bytes += f.size
+        a.totalFiles += 1
+        a.totalBytes += f.size
+        a.latestMtimeMs = Math.max(a.latestMtimeMs, f.mtimeMs)
+      }
+    }
+
+    // DB merge — version rows (hasDbRow/active flag) + delta rows (versions
+    // that currently exist only as patch endpoints).
+    const [dbRows, dbDeltas] = await Promise.all([
+      db.appVersion.findMany({
+        select: { id: true, platform: true, version: true, isPublished: true, fileName: true },
+      }),
+      db.appVersionDelta.findMany({ select: { platform: true, fromVersion: true, toVersion: true } }),
+    ])
+    const rowByKey = new Map(dbRows.map((r) => [`${r.platform}|${r.version}`, r]))
+    for (const d of dbDeltas) {
+      touch(d.platform, d.fromVersion).dbDeltaRows += 1
+      if (d.toVersion !== d.fromVersion) touch(d.platform, d.toVersion).dbDeltaRows += 1
+    }
+
+    const versions = Array.from(agg.values())
+      .map((a) => {
+        const row = rowByKey.get(`${a.platform}|${a.version}`) ?? null
+        return {
+          platform: a.platform,
+          version: a.version,
+          installers: a.installers,
+          deltas: a.deltas,
+          refs: a.refs,
+          dbDeltaRows: a.dbDeltaRows,
+          totalFiles: a.totalFiles,
+          totalBytes: a.totalBytes,
+          latestMtimeMs: a.latestMtimeMs,
+          hasDbRow: !!row,
+          isPublished: row?.isPublished ?? false,
+          dbId: row?.id ?? null,
+          dbFileName: row?.fileName ?? null,
+        }
+      })
+      .sort((x, y) => x.platform.localeCompare(y.platform) || compareVersionStrings(y.version, x.version))
+
+    return c.json({
+      success: true,
+      versions,
+      totals: {
+        versions: versions.length,
+        orphanVersions: versions.filter((v) => !v.hasDbRow).length,
+        files: bucketFiles.length,
+        bytes: bucketFiles.reduce((n, f) => n + f.size, 0),
+      },
+      uploadDir: UPLOAD_DIR,
+    })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -1304,6 +1460,8 @@ interface CleanupPlan {
     fileName: string | null
     createdAt: Date
   }>
+  /** Every version string in scope (DB rows ∪ disk files ∪ delta endpoints). */
+  scopeVersions: string[]
   installers: Array<{ storageKey: string; size: number }>
   refs: Array<{ storageKey: string; size: number }>
   deltas: Array<{ id: string; fromVersion: string; toVersion: string; storageKey: string; size: number }>
@@ -1326,21 +1484,45 @@ async function buildCleanupPlan(
   platform: string,
   version: string,
   scope: 'this' | 'with-previous',
-): Promise<CleanupPlan | null> {
-  // Both scopes operate ON the selected row — a typo must not guess what the
-  // admin meant, so the row has to exist.
-  const selected = await db.appVersion.findUnique({
-    where: { platform_version: { platform, version } },
-  })
-  if (!selected) return null
-
+): Promise<CleanupPlan> {
+  // Scope 'this' operates on the version STRING — a version whose rows were
+  // already deleted (full reset, manual deletes) but whose installers and
+  // delta patches still sit on disk MUST stay cleanable, so a missing
+  // AppVersion row is no longer an error (it used to 404 here).
   const rows = await db.appVersion.findMany({ where: { platform } })
+
+  // 'with-previous' ranks every KNOWN version of the platform — DB rows AND
+  // disk-only files AND delta-row endpoints — so old releases like 0.6.30
+  // whose rows are long gone are still swept when cleaning up from 0.6.43.
+  const known = new Set<string>([version, ...rows.map((r) => r.version)])
+  if (scope === 'with-previous') {
+    const bucketFiles = await walkBucket()
+    for (const f of bucketFiles) {
+      const cls = classifyBucketFile(f.name)
+      if (!cls || cls.platform !== platform) continue
+      known.add(cls.version)
+      if (cls.versionTo) known.add(cls.versionTo)
+    }
+    const deltaRows = await db.appVersionDelta.findMany({
+      where: { platform },
+      select: { fromVersion: true, toVersion: true },
+    })
+    for (const d of deltaRows) {
+      known.add(d.fromVersion)
+      known.add(d.toVersion)
+    }
+  }
+
   const targets = rows.filter((r) => {
     if (scope === 'this') return r.version === version
     return r.version === version || compareVersionStrings(r.version, version) < 0
   })
 
-  const scopeStrings = [...new Set(targets.map((r) => r.version))]
+  const scopeStrings =
+    scope === 'this'
+      ? [version]
+      : [...known].filter((v) => v === version || compareVersionStrings(v, version) < 0)
+
   const deltas = scopeStrings.length
     ? await db.appVersionDelta.findMany({
         where: {
@@ -1364,16 +1546,13 @@ async function buildCleanupPlan(
     }
   }
 
-  // Unreferenced same-version builds: scan the bucket's group folders and
-  // match the upload naming conventions (mirrors GET /storage-files parseKey
-  // + the release-refs / delta writers):
-  //   installer  <platform>-<semver>-<ts>-<original>
-  //   ref        (asar|outref)-<platform>-<semver>-<ts>-<original>
-  //   delta      delta-<platform>-<semver>-to-<semver>-<ts>.patch
-  // Every pattern is pinned to the CLEANUP platform — 'windows-9.9.0-…' in
-  // desktop/ shares its version string with an android scope but must never
-  // be classified as an android orphan. 'android' also has to exclude
-  // 'android-debug-…' files (longer platform prefix wins the name).
+  // Unreferenced files: scan the WHOLE bucket (group folders + legacy flat
+  // root) through the shared naming parser — installer, asar/outref refs and
+  // delta patches all classify here, so old releases with no DB row are
+  // swept too. Every match is pinned to the CLEANUP platform —
+  // 'windows-9.9.0-…' in desktop/ shares its version string with an android
+  // scope but must never be classified as an android orphan; 'android' also
+  // excludes 'android-debug-…' files.
   const orphans: CleanupPlan['orphans'] = []
   if (scopeStrings.length > 0) {
     const referenced = new Set([
@@ -1382,40 +1561,20 @@ async function buildCleanupPlan(
       ...deltas.map((d) => d.fileStorageKey),
     ])
     const scopeSet = new Set(scopeStrings)
-    const instRe = new RegExp(`^${platform}-(\\d+\\.\\d+\\.\\d+)-\\d+-.+$`)
-    const refRe = new RegExp(`^(?:asar|outref)-${platform}-(\\d+\\.\\d+\\.\\d+)-\\d+-`)
-    const deltaRe = new RegExp(`^delta-${platform}-(\\d+\\.\\d+\\.\\d+)-to-(\\d+\\.\\d+\\.\\d+)-\\d+\\.patch$`)
-    let dirEntries: fs.Dirent[] = []
-    try {
-      dirEntries = await fs.promises.readdir(UPLOAD_DIR, { withFileTypes: true })
-    } catch {
-      /* bucket missing — nothing to scan */
-    }
-    for (const e of dirEntries) {
-      if (!e.isDirectory()) continue // legacy flat binaries are never name-parsed
-      let inner: fs.Dirent[] = []
-      try {
-        inner = await fs.promises.readdir(path.join(UPLOAD_DIR, e.name), { withFileTypes: true })
-      } catch {
-        continue
+    const bucketFiles = await walkBucket()
+    for (const f of bucketFiles) {
+      if (referenced.has(f.storageKey)) continue
+      // 'android' cleanup must not swallow 'android-debug-…' files.
+      if (platform === 'android' && f.name.startsWith('android-debug-')) continue
+      if (platform === 'android-debug' && !f.name.startsWith('android-debug-')) continue
+      const cls = classifyBucketFile(f.name)
+      if (!cls || cls.platform !== platform) continue
+      let matchedVersion: string | null = cls.version
+      if (cls.kind === 'delta') {
+        matchedVersion = scopeSet.has(cls.version) ? cls.version : (cls.versionTo ?? null)
       }
-      for (const f of inner) {
-        if (!f.isFile()) continue
-        const key = `${e.name}/${f.name}`
-        if (referenced.has(key)) continue
-        // 'android' cleanup must not swallow 'android-debug-…' files.
-        if (platform === 'android' && f.name.startsWith('android-debug-')) continue
-        if (platform === 'android-debug' && !f.name.startsWith('android-debug-')) continue
-        let matchedVersion: string | null = null
-        const mi = instRe.exec(f.name)
-        const mr = refRe.exec(f.name)
-        const md = deltaRe.exec(f.name)
-        if (mi) matchedVersion = mi[1]
-        else if (mr) matchedVersion = mr[1]
-        else if (md) matchedVersion = scopeSet.has(md[1]) ? md[1] : md[2]
-        if (matchedVersion && scopeSet.has(matchedVersion)) {
-          orphans.push({ storageKey: key, size: cleanupArtifactSize(key, null) })
-        }
+      if (matchedVersion && scopeSet.has(matchedVersion)) {
+        orphans.push({ storageKey: f.storageKey, size: f.size })
       }
     }
   }
@@ -1429,6 +1588,7 @@ async function buildCleanupPlan(
       fileName: t.fileName,
       createdAt: t.createdAt,
     })),
+    scopeVersions: [...scopeStrings].sort((a, b) => compareVersionStrings(b, a)),
     installers,
     refs,
     deltas: deltas.map((d) => ({
@@ -1455,7 +1615,6 @@ app.post('/cleanup-preview', async (c) => {
       return c.json({ success: false, error: 'platform + version (semver) + scope are required' }, 400)
     }
     const plan = await buildCleanupPlan(parsed.data.platform, parsed.data.version, parsed.data.scope)
-    if (!plan) return c.json({ success: false, error: 'Version not found' }, 404)
 
     const installerBytes = sumSizes(plan.installers)
     const refBytes = sumSizes(plan.refs)
@@ -1472,6 +1631,7 @@ app.post('/cleanup-preview', async (c) => {
           fileName: t.fileName,
           createdAt: t.createdAt,
         })),
+        scopeVersions: plan.scopeVersions,
         installers: { count: plan.installers.length, bytes: installerBytes },
         refArtifacts: { count: plan.refs.length, bytes: refBytes },
         deltas: {
@@ -1508,7 +1668,6 @@ app.post('/cleanup', async (c) => {
     }
     const { platform, version, scope } = parsed.data
     const plan = await buildCleanupPlan(platform, version, scope)
-    if (!plan) return c.json({ success: false, error: 'Version not found' }, 404)
     if (plan.targets.length === 0 && plan.deltas.length === 0 && plan.orphans.length === 0) {
       return c.json({ success: false, error: 'Nothing in scope to clean up' }, 400)
     }
