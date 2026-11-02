@@ -294,20 +294,10 @@ export function NotificationCenter({ className, userId }: NotificationCenterProp
         >
           <div className="relative">
             <Bell className="h-5 w-5 text-muted-foreground" />
-            <AnimatePresence>
-              {unreadCount > 0 && (
-                <motion.span
-                  initial={{ scale: 0 }}
-                  animate={{ scale: 1 }}
-                  exit={{ scale: 0 }}
-                  transition={{ type: 'spring', stiffness: 400, damping: 20 }}
-                  className="absolute -top-2 -end-2 h-5 min-w-5 px-1 flex items-center justify-center rounded-full bg-gradient-to-r from-emerald-500 to-teal-500 text-white text-[10px] font-bold shadow-lg shadow-emerald-500/30"
-                >
-                  {unreadCount > 99 ? '99+' : unreadCount}
-                </motion.span>
-              )}
-            </AnimatePresence>
-            {/* Pulse ring for unread */}
+            {/* 0.6.47: the pulse ring used to render ON TOP of the count badge
+                (same anchor, later in DOM) — with unread > 0 the badge looked
+                duplicated / blurry. The pulse now renders FIRST and sits
+                behind the badge (badge z-10). */}
             {unreadCount > 0 && (
               <motion.span
                 className="absolute -top-2 -end-2 h-5 min-w-5 rounded-full bg-emerald-400"
@@ -315,6 +305,19 @@ export function NotificationCenter({ className, userId }: NotificationCenterProp
                 transition={{ duration: 2, repeat: Infinity, ease: 'easeInOut' }}
               />
             )}
+            <AnimatePresence>
+              {unreadCount > 0 && (
+                <motion.span
+                  initial={{ scale: 0 }}
+                  animate={{ scale: 1 }}
+                  exit={{ scale: 0 }}
+                  transition={{ type: 'spring', stiffness: 400, damping: 20 }}
+                  className="absolute -top-2 -end-2 z-10 h-5 min-w-5 px-1 flex items-center justify-center rounded-full bg-gradient-to-r from-emerald-500 to-teal-500 text-white text-[10px] font-bold shadow-lg shadow-emerald-500/30"
+                >
+                  {unreadCount > 99 ? '99+' : unreadCount}
+                </motion.span>
+              )}
+            </AnimatePresence>
           </div>
         </Button>
       </div>

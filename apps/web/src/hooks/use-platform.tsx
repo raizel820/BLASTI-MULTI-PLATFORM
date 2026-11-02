@@ -17,8 +17,16 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
   const [detected] = useState<PlatformInfo>(() => detectPlatform());
   const [override, setOverride] = useState<Platform | null>(null);
 
-  // Persist override in localStorage
+  // Persist override in localStorage — DEV BUILDS ONLY.
+  // 0.6.47: a QA override (e.g. 'android') stored on the same origin used to
+  // leak into production builds on that device — the app then behaved as the
+  // faked platform AND the detector chip showed again. Production ignores
+  // (and clears) any stored override.
   useEffect(() => {
+    if (process.env.NODE_ENV !== 'development') {
+      try { localStorage.removeItem('blasti-platform-override'); } catch { /* silent */ }
+      return;
+    }
     try {
       const stored = localStorage.getItem('blasti-platform-override');
       if (stored) {
@@ -29,6 +37,8 @@ export function PlatformProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const handleSetOverride = (p: Platform | null) => {
+    // Dev-only guard mirrors the reader above — production never fakes a shell.
+    if (process.env.NODE_ENV !== 'development') return;
     setOverride(p);
     try {
       if (p) localStorage.setItem('blasti-platform-override', p);

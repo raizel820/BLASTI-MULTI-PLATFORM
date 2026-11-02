@@ -127,3 +127,4 @@ installer/**/*.exe
 # Backup Manager — local backup archive store (engine default: <repo>/backups)
 backups/
 apps/api/logs/
+audit-shots/

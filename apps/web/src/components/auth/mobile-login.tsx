@@ -31,6 +31,7 @@ import { apiClient, setNativeSessionToken } from '@/lib/api-client';
 import { adoptLocalLanguagePreference } from '@/hooks/use-language';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
+import { usePlatform } from '@/hooks/use-platform';
 import { Button } from '@/components/ui/button';
 import { nativeBridge } from '@/lib/native-bridge';
 import { Input } from '@/components/ui/input';
@@ -106,6 +107,12 @@ type MobileAuthView = 'login' | 'forgot-password' | 'reset-password' | 'verify';
 export function MobileLoginForm() {
   const { setUser, setView, setSessionToken } = useAppStore();
   const { t, lang } = useLanguage();
+  // 0.6.47 — this component now renders ONLY inside the Capacitor shell
+  // (apk). The platform probe is kept as a second lock on the admin block:
+  // if the component ever renders outside the native shell (phone browser)
+  // the SUPER_ADMIN refusal below stays silent and the server's own
+  // platform matrix (x-blasti-client: web) decides.
+  const { platform } = usePlatform();
   const copy = MOBILE_LOGIN_COPY[lang === 'ar' ? 'ar' : 'en'];
 
   const [username, setUsername] = useState('');
@@ -237,22 +244,25 @@ export function MobileLoginForm() {
   );
 
   /**
-   * Security-0.6.13 — the mobile app NEVER holds an admin session. The cloud
-   * already rejects SUPER_ADMIN logins from this app (403, platform login
-   * matrix); this client-side guard is the second lock for paths the server
-   * response flows through indirectly (biometric quick-unlock, OTP
+   * Security-0.6.13 — the mobile APP (apk) NEVER holds an admin session. The
+   * cloud already rejects SUPER_ADMIN logins from this shell (403, platform
+   * login matrix); this client-side guard is the second lock for paths the
+   * server response flows through indirectly (biometric quick-unlock, OTP
    * verification success): refuse the session instead of bootstrapping it.
+   * 0.6.47 — gated on the native shell: a phone BROWSER is 'web' to the
+   * server and never passes through this screen anymore (ViewRouter), so
+   * the guard only fires for the apk.
    */
   const bootstrapSessionIfAllowed = useCallback(
     (user: unknown, token: string | undefined, successMsg: string, opts?: { remember?: boolean; loggedInUsername?: string }) => {
       const role = (user as { role?: string } | null | undefined)?.role;
-      if (role === 'SUPER_ADMIN') {
+      if (role === 'SUPER_ADMIN' && platform.isCapacitor) {
         toast.error(t('adminLoginNotAllowed'));
         return;
       }
       bootstrapSession(user, token, successMsg, opts);
     },
-    [bootstrapSession, t],
+    [bootstrapSession, t, platform.isCapacitor],
   );
 
   const handleLogin = async (biometricUser?: string, biometricPass?: string) => {

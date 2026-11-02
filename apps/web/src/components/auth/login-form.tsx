@@ -438,6 +438,11 @@ export function LoginForm() {
   const getRoleFromTab = (tab: string): UserRole => {
     switch (tab) {
       case 'agency': return 'AGENCY_OWNER';
+      // 0.6.47 — explicit admin tab restored for the web console (any browser,
+      // including a phone browser): the server accepts SUPER_ADMIN for the
+      // matching tab, and the platform matrix still blocks admin sessions in
+      // the apk/exe shells (x-blasti-client).
+      case 'admin': return 'SUPER_ADMIN';
       default: return 'CUSTOMER';
     }
   };
@@ -568,15 +573,19 @@ export function LoginForm() {
                         <div className="text-center mb-2">
                           <p className="text-xs text-muted-foreground">{t('selectRole')}</p>
                         </div>
-                        <TabsList className="w-full grid grid-cols-2 h-12 relative bg-gray-100 dark:bg-gray-800 rounded-xl p-1 overflow-hidden">
+                        <TabsList className="w-full grid grid-cols-3 h-12 relative bg-gray-100 dark:bg-gray-800 rounded-xl p-1 overflow-hidden">
                           {[
                             { value: 'customer', label: t('loginAsCustomer') },
                             { value: 'agency', label: t('loginAsAgency') },
+                            // 0.6.47 — visible admin entry point for the web
+                            // console (phone browsers included). The native
+                            // shells never render this form.
+                            { value: 'admin', label: t('loginAsAdmin') },
                           ].map((tab) => (
                             <TabsTrigger
                               key={tab.value}
                               value={tab.value}
-                              className="text-xs sm:text-sm rounded-lg relative z-10 transition-all duration-300 data-[state=active]:bg-gradient-to-r data-[state=active]:from-emerald-500 data-[state=active]:to-teal-500 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=active]:shadow-emerald-500/25 data-[state=active]:scale-[1.02]"
+                              className="text-[11px] sm:text-sm rounded-lg relative z-10 transition-all duration-300 data-[state=active]:bg-gradient-to-r data-[state=active]:from-emerald-500 data-[state=active]:to-teal-500 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=active]:shadow-emerald-500/25 data-[state=active]:scale-[1.02]"
                             >
                               {tab.label}
                             </TabsTrigger>

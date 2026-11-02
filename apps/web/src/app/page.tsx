@@ -279,13 +279,17 @@ const ViewRouter = memo(function ViewRouter() {
             case 'landing':
               return <LandingPage />;
             case 'login':
-              // The DESKTOP app is agency-only and opens its dedicated console
-              // login. The MOBILE shell (Capacitor, or a phone browser) gets
-              // its own dedicated customer-first sign-in screen (Task 78).
-              // Desktop/laptop web browsers keep the shared form.
+              // 0.6.47 — the dedicated screens are for the NATIVE shells only:
+              // the DESKTOP app (exe) is agency-only (DesktopAgencyLogin) and
+              // the MOBILE app (apk) gets the customer-first MobileLoginForm,
+              // which carries the admin-login block. A phone BROWSER is still
+              // the web platform — it renders the shared LoginForm so the
+              // admin console stays reachable from a phone (field report:
+              // the admin was locked out of their own phone browser because
+              // the mobile shell keyed on screen size, not the app shell).
               return platform.isElectron ? (
                 <DesktopAgencyLogin />
-              ) : platform.isCapacitor || platform.isMobile ? (
+              ) : platform.isCapacitor ? (
                 <MobileLoginForm />
               ) : (
                 <LoginForm />
@@ -989,11 +993,11 @@ export default function Home() {
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.2 }}
           >
-            {/* Desktop gets the dedicated agency login; the mobile shell gets
-                the dedicated mobile sign-in (Task 78); web falls back to the
-                landing page */}
+            {/* Desktop app gets the dedicated agency login; the mobile APP
+                (apk) gets the dedicated mobile sign-in (Task 78); any browser
+                — including a phone browser — falls back to the landing page */}
             {fallbackView === 'login' ? (
-              platform.isElectron ? <DesktopAgencyLogin /> : <MobileLoginForm />
+              platform.isElectron ? <DesktopAgencyLogin /> : platform.isCapacitor ? <MobileLoginForm /> : <LoginForm />
             ) : <LandingPage />}
           </motion.div>
         </AnimatePresence>
@@ -1053,17 +1057,29 @@ export default function Home() {
 
         {/* Top bar for agency/admin */}
         {(isAgency || isAdmin) && (
-          <header className="sticky top-0 z-30 h-16 bg-white/80 dark:bg-gray-950/80 backdrop-blur-xl border-b border-border flex items-center justify-between px-4">
-            <Button variant="ghost" size="icon" className="lg:hidden h-10 w-10" onClick={toggleSidebar}>
+          <header className="sticky top-0 z-30 h-16 bg-white/80 dark:bg-gray-950/80 backdrop-blur-xl border-b border-border flex items-center justify-between px-4 overflow-x-clip">
+            <Button variant="ghost" size="icon" className="lg:hidden h-10 w-10 flex-shrink-0" onClick={toggleSidebar}>
               <Menu className="h-5 w-5" />
             </Button>
-            {/* max-w + overflow-x: on narrow phones the 7 icon controls exceed the
-                viewport and used to force page-wide horizontal overflow (Task 54-b
-                mobile audit). They now shrink into a swipeable strip instead. */}
+            {/* max-w + overflow-x: on narrow phones the icon controls used to
+                exceed the viewport and force page-wide horizontal overflow
+                (Task 54-b mobile audit) — the strip scrolls instead.
+                0.6.47: the header ALSO carries overflow-x-clip because the
+                RTL overflow of this strip leaked ~27px into the document
+                scroll area, and phone browsers "zoomed out to fit" — the
+                whole dashboard rendered tiny (field report: agency account
+                corrupted / components too small on mobile).
+                0.6.47: the connection dot now sits in its own bordered chip
+                with a divider — a bare green dot right next to the bell read
+                as a detached notification dot ("the bell dot is far from the
+                bell" field report). */}
             <div className="flex items-center gap-2 ms-auto min-w-0 max-w-[calc(100vw-5.5rem)] overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-              <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span
+                className="flex-shrink-0 flex items-center justify-center h-7 w-7 rounded-full border border-border/70 bg-background/60"
+              >
                 <ConnectionDot />
               </span>
+              <span className="flex-shrink-0 h-5 w-px bg-border/70" aria-hidden="true" />
               {/* One-bell rule (field report): agency/admin get exactly ONE bell —
                   the rich NotificationCenter panel. The small NotificationBadge
                   popover was a duplicate bell next to it. */}

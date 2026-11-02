@@ -887,7 +887,10 @@ export function AgencyDevices() {
                 <p className="text-sm text-muted-foreground">{getLocalizedString('إدارة التلفزيونات، الكيوسكات، وأجهزة العرض المتصلة بوكالتك', 'Gérez les téléviseurs, kiosques et écrans connectés à votre agence', 'Manage TVs, kiosks, and display devices connected to your agency', lang)}</p>
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            {/* 0.6.47 mobile audit: this row used to be flex-nowrap — the four
+                labelled action buttons overflowed a 390px phone viewport by
+                ~200px and dragged the whole page into horizontal scroll. */}
+            <div className="flex items-center gap-2 flex-wrap">
               {agencyId && (
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -945,22 +948,24 @@ export function AgencyDevices() {
             </div>
           </div>
 
-          {/* Stats */}
-          <div className="grid grid-cols-3 gap-3 max-w-md">
-            <div className="flex items-center gap-2 rounded-lg border bg-card px-3 py-2">
-              <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
-              <span className="text-sm font-medium text-emerald-700 dark:text-emerald-400">{onlineCount}</span>
-              <span className="text-xs text-muted-foreground">{getLocalizedString('متصل', 'En ligne', 'Online', lang)}</span>
+          {/* Stats — 0.6.47 mobile audit: max-w-md (448px) exceeded a 390px
+              viewport and the three chips clipped. Full-width on phones, capped
+              on desktop; labels truncate instead of pushing the grid out. */}
+          <div className="grid grid-cols-3 gap-2 w-full sm:gap-3 sm:max-w-md">
+            <div className="flex items-center gap-2 min-w-0 rounded-lg border bg-card px-2 sm:px-3 py-2">
+              <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 flex-shrink-0" />
+              <span className="text-sm font-medium text-emerald-700 dark:text-emerald-400 flex-shrink-0">{onlineCount}</span>
+              <span className="text-xs text-muted-foreground truncate">{getLocalizedString('متصل', 'En ligne', 'Online', lang)}</span>
             </div>
-            <div className="flex items-center gap-2 rounded-lg border bg-card px-3 py-2">
-              <span className="h-2.5 w-2.5 rounded-full bg-gray-400" />
-              <span className="text-sm font-medium">{offlineCount}</span>
-              <span className="text-xs text-muted-foreground">{getLocalizedString('غير متصل', 'Hors ligne', 'Offline', lang)}</span>
+            <div className="flex items-center gap-2 min-w-0 rounded-lg border bg-card px-2 sm:px-3 py-2">
+              <span className="h-2.5 w-2.5 rounded-full bg-gray-400 flex-shrink-0" />
+              <span className="text-sm font-medium flex-shrink-0">{offlineCount}</span>
+              <span className="text-xs text-muted-foreground truncate">{getLocalizedString('غير متصل', 'Hors ligne', 'Offline', lang)}</span>
             </div>
-            <div className="flex items-center gap-2 rounded-lg border bg-card px-3 py-2">
-              <span className="h-2.5 w-2.5 rounded-full bg-primary" />
-              <span className="text-sm font-medium">{totalCount}</span>
-              <span className="text-xs text-muted-foreground">{getLocalizedString('الكل', 'Total', 'Total', lang)}</span>
+            <div className="flex items-center gap-2 min-w-0 rounded-lg border bg-card px-2 sm:px-3 py-2">
+              <span className="h-2.5 w-2.5 rounded-full bg-primary flex-shrink-0" />
+              <span className="text-sm font-medium flex-shrink-0">{totalCount}</span>
+              <span className="text-xs text-muted-foreground truncate">{getLocalizedString('الكل', 'Total', 'Total', lang)}</span>
             </div>
           </div>
         </motion.div>

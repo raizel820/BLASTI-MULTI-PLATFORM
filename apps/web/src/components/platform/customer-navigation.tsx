@@ -218,11 +218,15 @@ function CustomerTopTabBar({ currentView, setView, unreadCount, user, logout, t 
         })}
       </div>
 
-      {/* Right cluster: ONE bell + connection + language + theme + more */}
+      {/* Right cluster: ONE bell + connection + language + theme + more.
+          0.6.47: the connection dot sits in its own bordered chip with a
+          divider — a bare dot next to the bell read as a detached
+          notification badge ("bell dot far from the bell" field report). */}
       <div className="ms-auto flex items-center gap-1 flex-shrink-0">
-        <span className="hidden sm:flex items-center gap-1.5 text-xs text-muted-foreground">
+        <span className="hidden sm:flex flex-shrink-0 items-center justify-center h-7 w-7 rounded-full border border-border/70 bg-background/60">
           <ConnectionDot />
         </span>
+        <span className="hidden sm:block flex-shrink-0 h-5 w-px bg-border/70" aria-hidden="true" />
         <CustomerBell
           unreadCount={unreadCount}
           label={t('notifications')}
