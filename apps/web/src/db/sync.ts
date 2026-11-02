@@ -77,7 +77,11 @@ type SyncEventListener = (event: SyncEvent) => void;
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const LAST_SYNC_KEY = 'blasti-wdb-last-sync';
-const DEFAULT_SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+// Sync-speed 0.6.48 — the incremental cursor-based pull is cheap (only rows
+// newer than the last sequence), so the old 5-minute ceiling mostly added
+// staleness for nothing. 2 minutes keeps every shell visibly fresher; the
+// realtime push channel and the resume-refresh bus still cover the fast path.
+const DEFAULT_SYNC_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const LAN_PROBE_INTERVAL_MS = 30 * 1000; // Re-probe LAN every 30s
 const LAN_PROBE_TIMEOUT_MS = 2000; // 2s timeout for LAN server probe
 const LAN_SYNC_BASE_PATH = '/api/sync'; // Same path on desktop LAN server

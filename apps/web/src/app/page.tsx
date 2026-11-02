@@ -15,12 +15,13 @@ import { getPendingCheckout } from '@/lib/chargily-checkout';
 
 // Auth Views — lazy loaded to reduce initial compilation footprint
 const LandingPage = lazyNamed(() => import('@/components/auth/landing-page'), 'LandingPage');
-const LoginForm = lazyNamed(() => import('@/components/auth/login-form'), 'LoginForm');
-const DesktopAgencyLogin = lazyNamed(() => import('@/components/auth/desktop-agency-login'), 'DesktopAgencyLogin');
+// 0.6.48 — ONE unified login for every platform and account type (no role
+// tabs; the server auto-detects the account). The component adapts its layout
+// to the REAL app shell (Electron split-screen / Capacitor touch / web card).
+const UnifiedLoginForm = lazyNamed(() => import('@/components/auth/unified-login'), 'UnifiedLoginForm');
 const RegisterForm = lazyNamed(() => import('@/components/auth/register-form'), 'RegisterForm');
 // Task 78 — dedicated MOBILE (Capacitor) auth screens: customer-first,
 // touch-first, safe-area aware replacements for the desktop-oriented forms.
-const MobileLoginForm = lazyNamed(() => import('@/components/auth/mobile-login'), 'MobileLoginForm');
 const MobileRegisterForm = lazyNamed(() => import('@/components/auth/mobile-register'), 'MobileRegisterForm');
 
 // Customer Views
@@ -279,21 +280,16 @@ const ViewRouter = memo(function ViewRouter() {
             case 'landing':
               return <LandingPage />;
             case 'login':
-              // 0.6.47 — the dedicated screens are for the NATIVE shells only:
-              // the DESKTOP app (exe) is agency-only (DesktopAgencyLogin) and
-              // the MOBILE app (apk) gets the customer-first MobileLoginForm,
-              // which carries the admin-login block. A phone BROWSER is still
-              // the web platform — it renders the shared LoginForm so the
-              // admin console stays reachable from a phone (field report:
-              // the admin was locked out of their own phone browser because
-              // the mobile shell keyed on screen size, not the app shell).
-              return platform.isElectron ? (
-                <DesktopAgencyLogin />
-              ) : platform.isCapacitor ? (
-                <MobileLoginForm />
-              ) : (
-                <LoginForm />
-              );
+              // 0.6.48 — ONE unified login for every platform and account
+              // type. The component picks its layout from the REAL app shell
+              // (window.electronAPI / window.Capacitor — never the screen
+              // size): a phone BROWSER renders the responsive web card and
+              // keeps full web powers (including the admin console); the
+              // apk/exe shells get their tailored layouts. The server
+              // auto-detects the account type from the credentials and
+              // enforces the role×platform matrix with a SECRECY-preserving
+              // generic error.
+              return <UnifiedLoginForm />;
             case 'register':
               // Task 78 — the phone registers through the dedicated 3-step
               // mobile wizard (native camera/gallery avatar, customer-first).
@@ -993,11 +989,10 @@ export default function Home() {
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.2 }}
           >
-            {/* Desktop app gets the dedicated agency login; the mobile APP
-                (apk) gets the dedicated mobile sign-in (Task 78); any browser
+            {/* 0.6.48 — the unified login covers every shell; any browser
                 — including a phone browser — falls back to the landing page */}
             {fallbackView === 'login' ? (
-              platform.isElectron ? <DesktopAgencyLogin /> : platform.isCapacitor ? <MobileLoginForm /> : <LoginForm />
+              <UnifiedLoginForm />
             ) : <LandingPage />}
           </motion.div>
         </AnimatePresence>

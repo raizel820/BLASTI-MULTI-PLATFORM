@@ -3,8 +3,8 @@
 /**
  * Shared email+phone OTP verification step (Task 22-b).
  *
- * Rendered by `register-form.tsx`, `login-form.tsx` and
- * `desktop-agency-login.tsx` whenever the auth API responds with
+ * Rendered by the register forms and the UNIFIED login
+ * (`unified-login.tsx`) whenever the auth API responds with
  * `requiresVerification: true` + a short-lived `verificationToken`
  * (Task 22 backend contract).
  *

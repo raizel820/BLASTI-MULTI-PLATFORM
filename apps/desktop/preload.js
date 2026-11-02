@@ -58,6 +58,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getPlatform: () => ipcRenderer.invoke('get-platform'),
 
   /**
+   * Secrecy-0.6.48 — signed client attestation for the `x-blasti-attest`
+   * request header. The HMAC is computed in the MAIN process (secret never
+   * enters this preload/renderer bundle); the renderer caches the value ~45s.
+   */
+  getClientAttestation: () => ipcRenderer.invoke('blasti:attest'),
+
+  /**
    * logs-1 — recent main-process log lines (ring buffer, last ~120 lines).
    * The web app's remote logger (lib/remote-logger.ts) merges these into
    * every periodic /api/logs upload so Electron-only failures (updater

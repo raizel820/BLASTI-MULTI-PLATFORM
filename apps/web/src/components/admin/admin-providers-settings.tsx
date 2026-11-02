@@ -22,7 +22,7 @@
  * extras diff so the stored secret is kept untouched.
  *
  * All user-visible strings live in a LOCAL bilingual COPY dict (AR/EN, with
- * the global i18n dictionaries untouched — see desktop-agency-login.tsx for
+ * the global i18n dictionaries untouched — see unified-login.tsx for
  * the pattern). RTL is driven by the active language.
  */
 

@@ -1417,6 +1417,7 @@ const fr: Record<TranslationKeys, string> = {
   devicesConnection: 'Appareils & Connexion',
   publicAppsSettings: 'Paramètres des applications publiques',
   welcomeBack: 'Bon retour',
+  loginAutoDetectHint: 'Le serveur détecte automatiquement votre type de compte après vérification de vos identifiants',
   subscriptionInactive: 'Abonnement inactif',
   queueUnavailable: "La file d'attente est actuellement indisponible",
   activatePlan: 'Activer le plan',

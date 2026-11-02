@@ -1801,6 +1801,16 @@ ipcMain.handle('get-platform', () => ({
   nodeVersion: process.versions.node,
 }));
 
+// ─── Client attestation (Secrecy-0.6.48) ──────────────────────────────────────
+// The renderer asks for a signed platform token for its API request pipeline
+// (`x-blasti-attest` header — cached ~45s client-side). The HMAC secret lives
+// ONLY here in the main process (apps/desktop/client-attestation.js) — never
+// in the shared web bundle — so a plain browser cannot forge the desktop
+// identity. The cloud verifies the signature, timestamp skew and nonce replay
+// before trusting any 'desktop' platform claim (apps/api lib/auth.ts).
+const { buildDesktopAttestation } = require('./client-attestation');
+ipcMain.handle('blasti:attest', () => buildDesktopAttestation());
+
 // logs-1 — renderer's remote logger merges these main-process lines into its
 // periodic /api/logs uploads (see apps/web/src/lib/remote-logger.ts).
 ipcMain.handle('get-recent-main-logs', () => _mainLogRing.slice(-120));

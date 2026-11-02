@@ -1469,6 +1469,7 @@ const en: Record<TranslationKeys, string> = {
   devicesConnection: 'Devices & Connection',
   publicAppsSettings: 'Public Apps Settings',
   welcomeBack: 'Welcome back',
+  loginAutoDetectHint: 'The server detects your account type automatically after verifying your credentials',
   subscriptionInactive: 'Subscription Inactive',
   queueUnavailable: 'Queue is currently unavailable',
   activatePlan: 'Activate Plan',

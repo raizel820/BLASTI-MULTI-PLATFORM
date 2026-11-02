@@ -235,7 +235,22 @@ app.post('/login', async (c) => {
       )
     }
 
-    const { username, password, expectedRole, rememberMe } = validation.data
+    const { username, password, rememberMe } = validation.data
+    // Secrecy-0.6.48 — `expectedRole` (still accepted in the schema for
+    // backward-compatible clients) is deliberately IGNORED: the server
+    // auto-detects the account type from the credentials themselves. Role
+    // tabs are gone from every login screen.
+    void validation.data.expectedRole
+
+    // Secrecy-0.6.48 — TIMING EQUALIZER. An unknown username currently skips
+    // the (~50-100ms) scrypt password check, so response latency would leak
+    // which usernames exist. On a miss we burn one scrypt verification
+    // against a fixed dummy hash so both paths cost the same.
+    let timingHash: string | null = null
+    const equalizeTiming = () => {
+      if (timingHash === null) timingHash = hashPassword('blasti-timing-equalizer-0.6.48')
+      verifyPassword('blasti-timing-probe', timingHash)
+    }
 
     // Find user by username
     const user = await db.user.findUnique({
@@ -262,6 +277,8 @@ app.post('/login', async (c) => {
     })
 
     if (!user) {
+      // Same generic body/status as a wrong password — and now the same cost.
+      equalizeTiming()
       return c.json(
         { success: false, error: 'Invalid username or password' },
         401,
@@ -287,40 +304,17 @@ app.post('/login', async (c) => {
       )
     }
 
-    // Check if user's role matches the expected role from login tab
-    // Customer tab: accepts CUSTOMER and SUPER_ADMIN roles
-    // Agency tab: accepts AGENCY_OWNER, AGENCY_STAFF, and SUPER_ADMIN roles
-    // SUPER_ADMIN can login from either tab
-    const agencyRoles = ['AGENCY_OWNER', 'AGENCY_STAFF']
-    const isAgencyTab = !!expectedRole && agencyRoles.includes(expectedRole)
-    const isCustomerTab = expectedRole === 'CUSTOMER'
-
-    if (expectedRole) {
-      // SUPER_ADMIN can login from any tab
-      if (user.role === 'SUPER_ADMIN') {
-        // allowed
-      }
-      // Agency tab: AGENCY_OWNER and AGENCY_STAFF are allowed
-      else if (isAgencyTab && agencyRoles.includes(user.role)) {
-        // allowed
-      }
-      // Customer tab: only CUSTOMER role is allowed
-      else if (isCustomerTab && user.role === 'CUSTOMER') {
-        // allowed
-      } else {
-        return c.json(
-          { success: false, error: 'wrongRoleError' },
-          403,
-        )
-      }
-    }
-
-    // ── Security-0.6.13: role×platform login matrix ────────────────────
-    // The mobile app (Capacitor) serves CUSTOMER + AGENCY sessions only; the
-    // desktop console (Electron) is AGENCY-ONLY. SUPER_ADMIN sessions can
-    // ONLY be minted for the plain web console — the apps must have nothing
-    // to do with the admin API. Enforced BEFORE any session is minted (and
-    // again on the admin-API side via the token's platform claim).
+    // ── Secrecy-0.6.48: role×platform login matrix (AUTO-DETECT) ────────
+    // The server recognizes the account type from the credentials and only
+    // compares them against the roles this platform allows:
+    //   mobile (apk)  → CUSTOMER + AGENCY sessions (no admin, ever)
+    //   desktop (exe) → AGENCY sessions only
+    //   web (ANY browser — phone browsers included) → every role
+    // A correct-but-unsupported account answers EXACTLY like a wrong
+    // password (generic 401) — no message ever mentions the account type,
+    // its existence, or which platforms support it. Enforced BEFORE any
+    // session is minted (and again on the admin-API side via the token's
+    // platform claim).
     const clientPlatform = resolveClientPlatform(c)
     assertPlatformLoginAllowed(clientPlatform, user.role)
 
@@ -430,9 +424,10 @@ app.post('/login', async (c) => {
     if (error instanceof Error && error.message === 'INVALID_IP') {
       return c.json({ success: false, error: 'Unable to identify client' }, 400)
     }
-    // Security-0.6.13 — AuthError carries its own status/message (platform
-    // login-matrix rejections like admin-on-mobile): surface it faithfully
-    // instead of masking it behind a generic 500.
+    // Security-0.6.13 — AuthError carries its own status/message. Since
+    // Secrecy-0.6.48 the platform-matrix rejection IS the generic
+    // wrong-credentials answer (401) — surfaced faithfully so no client
+    // can ever distinguish it from a real password failure.
     if (error instanceof AuthError) {
       return c.json({ success: false, error: error.message }, error.statusCode as any)
     }

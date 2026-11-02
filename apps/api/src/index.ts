@@ -233,7 +233,10 @@ app.use('*', cors({
   // Security-0.6.13: x-blasti-client (platform declaration — web/mobile/
   // desktop) rides on EVERY request and feeds the role×platform login
   // matrix + the JWT platform claim; same preflight rule applies.
-  allowHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-internal-secret', 'X-Idempotency-Key', 'x-blasti-network', 'x-blasti-device', 'x-blasti-client'],
+  // Secrecy-0.6.48: x-blasti-attest (HMAC-signed platform proof from the
+  // native shells) — same preflight rule; without it every Capacitor
+  // request carrying it dies at OPTIONS before reaching the API.
+  allowHeaders: ['Content-Type', 'Authorization', 'Cookie', 'x-internal-secret', 'X-Idempotency-Key', 'x-blasti-network', 'x-blasti-device', 'x-blasti-client', 'x-blasti-attest'],
   exposeHeaders: ['Set-Cookie', 'X-Idempotency-Replayed'],
   credentials: true,
   maxAge: 86400,

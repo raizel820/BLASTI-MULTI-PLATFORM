@@ -765,6 +765,13 @@ function cloudBaseUrl() {
   return process.env.BLASTI_CLOUD_URL || 'http://localhost:3003'
 }
 
+// Secrecy-0.6.48 — the desktop local API signs its cloud login proxy with
+// the SAME desktop attestation secret as the Electron main process. Before
+// this, the proxy sent NO platform identity at all, so the cloud minted
+// every desktop-proxied session JWT with platform:'web' — silently
+// bypassing the role×platform matrix (Security-0.6.13).
+const { buildDesktopAttestation } = require('../client-attestation');
+
 /**
  * Attempt a cloud login (username + password) from the local API. Used when
  * the local profile has no unlock credential yet (first login through the
@@ -775,7 +782,15 @@ async function cloudLoginProxy(username, password, extra) {
   try {
     const res = await fetch(base + '/api/auth/login', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // Security-0.6.13 identity + Secrecy-0.6.48 signed proof: the cloud
+        // now bakes 'desktop' (verified) into the minted session JWT, so the
+        // desktop app can only ever hold AGENCY sessions — exactly like the
+        // direct browser→cloud path already did.
+        'x-blasti-client': 'desktop',
+        'x-blasti-attest': buildDesktopAttestation(),
+      },
       body: JSON.stringify(Object.assign({ username, password }, extra || {})),
       signal: AbortSignal.timeout(8000),
     })
@@ -2491,7 +2506,7 @@ function createApp() {
         return null
       },
       allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowHeaders: ['Content-Type', 'Authorization', 'X-Local-Token'],
+      allowHeaders: ['Content-Type', 'Authorization', 'X-Local-Token', 'x-blasti-client', 'x-blasti-attest'],
       // Task 41/67: the grace-window accept signals the stale renderer to
       // catch up — the custom header must be readable cross-origin.
       exposeHeaders: ['X-Blasti-Session-Rotated'],

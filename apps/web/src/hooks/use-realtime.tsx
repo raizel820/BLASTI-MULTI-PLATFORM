@@ -162,8 +162,13 @@ function resolveSocketOptions(): Parameters<typeof io>[1] {
     // a phone that regained connectivity (elevator, tunnel, Wi-Fi↔cellular)
     // stay realtime-dead until the component remounted.
     reconnectionAttempts: isNative && !getNativeCloudUrl() ? 5 : Infinity,
-    reconnectionDelay: isNative ? 3000 : 1000,
-    reconnectionDelayMax: 30000,
+    // Sync-speed 0.6.48 — snappier reconnect on ALL platforms: the old
+    // native backoff (3s start / 30s ceiling) left screens stale for up to
+    // half a minute after the socket silently died (OS-suspended WebView,
+    // flaky mobile handover). 0.8s start / 15s ceiling restores the push
+    // channel much faster without spamming a dead endpoint.
+    reconnectionDelay: isNative ? 800 : 500,
+    reconnectionDelayMax: 15000,
     timeout: 10000,
     auth: {
       token: authToken,

@@ -1416,6 +1416,7 @@ const ar = {
   devicesConnection: 'الأجهزة والاتصال',
   publicAppsSettings: 'إعدادات التطبيقات العامة',
   welcomeBack: 'مرحباً بعودتك',
+  loginAutoDetectHint: 'يتعرف السيرفر تلقائيًا على نوع حسابك بعد التحقق من بياناتك',
   subscriptionInactive: 'الاشتراك غير نشط',
   queueUnavailable: 'الطابور غير متاح حالياً',
   activatePlan: 'تفعيل الخطة',

@@ -58,6 +58,11 @@ import { getNativeCloudUrl, startNativeCloudResolution } from './native-cloud-re
 // machine-readable timeline event. See lib/diag-log.ts.
 import { diag } from './diag-log';
 
+// Secrecy-0.6.48 — signed platform attestation (native shells only). The
+// HMAC secret lives in the app binary (Electron main / Android APK), never
+// in this bundle; browsers simply return null and stay 'web'.
+import { getBlastiAttestHeader } from './client-attestation';
+
 // 0.6.23 (R-21F-S2) — LAN authority (offline master) failover client.
 // Cycle-safe by construction: this module never executes these bindings at
 // module scope, and lan-authority-client only touches remote-logger inside
@@ -1389,8 +1394,12 @@ export class ApiClient {
     }
 
     const isFormData = typeof FormData !== 'undefined' && body instanceof FormData;
+    // Secrecy-0.6.48 — attach the signed attestation (cached 45s; null on
+    // browsers). Concurrent callers share one bridge round-trip.
+    const attest = await getBlastiAttestHeader().catch(() => null);
     const headers: Record<string, string> = {
       ...buildAuthHeaders(),
+      ...(attest ? { 'x-blasti-attest': attest } : {}),
       // Don't set Content-Type for FormData — browser sets it with correct boundary
       ...(body !== undefined && !isFormData ? { 'Content-Type': 'application/json' } : {}),
       // Task 55-c: client network classification for the server-side data-usage

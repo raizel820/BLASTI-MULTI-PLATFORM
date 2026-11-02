@@ -42,8 +42,8 @@ import {
   type NativeCloudState,
 } from '@/lib/native-cloud-resolver';
 
-// ⚠️ NativeServerStatus is instantiated on BOTH login screens (customer
-// login-form and desktop-agency-login) — keep them in sync.
+// ⚠️ NativeServerStatus is instantiated by the UNIFIED login screen
+// (components/auth/unified-login.tsx, all three layouts) — keep them in sync.
 
 function hostOf(url: string | null): string {
   if (!url) return '';

@@ -219,6 +219,57 @@ public class BlastiNativeStatus extends Plugin {
 
     // ─── Plugin Methods (callable from the web app) ─────────────────────────────
 
+    // ─── Client attestation (Secrecy-0.6.48) ───────────────────────────────
+    // HMAC secret for the `x-blasti-attest` login/request header. Lives ONLY
+    // inside the APK (this class) — never in the shared web bundle — so a
+    // plain browser cannot forge the mobile-app identity. Rotate for
+    // production by shipping a release build with this constant changed AND
+    // setting BLASTI_ATTEST_SECRET_MOBILE on the VPS.
+    private static final String ATTEST_SECRET =
+        "blasti-attest-mobile-dev-key-rotate-in-production";
+
+    /**
+     * Secrecy-0.6.48 — signed client attestation ("prove this login really
+     * comes from the BLASTI android app"). The web request pipeline
+     * (apps/web lib/client-attestation.ts) calls this via the Capacitor
+     * bridge and attaches the returned value as `x-blasti-attest` on API
+     * requests; the cloud verifies the HMAC-SHA256 signature, the ±5min
+     * timestamp window and the nonce replay cache before trusting any
+     * 'mobile' platform claim (apps/api lib/auth.ts).
+     *
+     * Format: v1.mobile.<tsMs>.<nonce>.<hex-hmac(platform|tsMs|nonce)>
+     */
+    @PluginMethod
+    public void getAttestation(PluginCall call) {
+        JSObject result = new JSObject();
+        try {
+            String platform = "mobile";
+            String tsMs = String.valueOf(System.currentTimeMillis());
+            byte[] nonceBytes = new byte[12];
+            new java.security.SecureRandom().nextBytes(nonceBytes);
+            StringBuilder nonceHex = new StringBuilder(nonceBytes.length * 2);
+            for (byte b : nonceBytes) {
+                nonceHex.append(String.format("%02x", b));
+            }
+            String nonce = nonceHex.toString();
+
+            javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new javax.crypto.spec.SecretKeySpec(
+                ATTEST_SECRET.getBytes("UTF-8"), "HmacSHA256"));
+            byte[] sig = mac.doFinal((platform + "|" + tsMs + "|" + nonce).getBytes("UTF-8"));
+            StringBuilder sigHex = new StringBuilder(sig.length * 2);
+            for (byte b : sig) {
+                sigHex.append(String.format("%02x", b));
+            }
+
+            result.put("value", "v1." + platform + "." + tsMs + "." + nonce + "." + sigHex);
+            call.resolve(result);
+        } catch (Exception e) {
+            Log.e(TAG, "getAttestation failed", e);
+            call.reject("attestation unavailable");
+        }
+    }
+
     /**
      * Reports whether FCM push is usable in this build. The web app's
      * push-registration.ts queries this before touching PushNotifications so

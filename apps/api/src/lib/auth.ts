@@ -8,6 +8,9 @@
 
 import { jwtVerify, SignJWT } from 'jose'
 import type { Context } from 'hono'
+// Secrecy-0.6.48 — HMAC attestation: proof that a native-platform claim
+// really comes from the genuine desktop (Electron) / mobile (Android) binary.
+import { verifyClientAttestation } from './client-attestation'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -65,32 +68,69 @@ const PLATFORM_ALLOWED_ROLES: Record<ClientPlatform, string[] | null> = {
 
 /**
  * Read (and validate) the declared client platform from a request.
- * Absent/unknown values fall back to 'web' so legacy clients keep working —
- * the enforcement teeth come from the platform claim baked into the JWT at
- * mint time and from requireAdmin's claim check.
+ *
+ * Secrecy-0.6.48 — resolution order:
+ *   1. SIGNED attestation (`x-blasti-attest`, HMAC-SHA256 with the app
+ *      binary's secret — lib/client-attestation.ts). This is the ONLY
+ *      trustworthy way to claim 'desktop'/'mobile'; it also carries a
+ *      fresh timestamp + replay-protected nonce.
+ *   2. Legacy `x-blasti-client` header — kept as a GRACE path for native
+ *      apps already in the field (pre-0.6.48 builds). Each unattested
+ *      native claim is logged so spoofing attempts are visible.
+ *   3. Absent/unknown → 'web' (plain browsers, phone browsers included —
+ *      a browser is NEVER treated as a native app: the distinction is the
+ *      app shell itself — window.electronAPI / window.Capacitor — and its
+ *      binary secret, never the user-agent or the screen size).
+ *
+ * The enforcement teeth stay in the platform claim baked into the JWT at
+ * mint time and in requireAdmin's claim check.
  */
 export function resolveClientPlatform(c: Context): ClientPlatform {
+  // 1. Signed attestation wins — it proves the binary.
+  const attest = verifyClientAttestation(c.req.header('x-blasti-attest'))
+  if (attest.attested && attest.platform) {
+    return attest.platform
+  }
+
+  // 2. Legacy grace path (pre-0.6.48 native builds in the field).
   const raw = (c.req.header('x-blasti-client') || '').toLowerCase().trim()
-  if (raw === 'mobile' || raw === 'desktop' || raw === 'web') return raw
+  if (raw === 'mobile' || raw === 'desktop') {
+    // A SPOOF attempt: the client explicitly sent a bogus/absent attestation
+    // while claiming to be a native app. Old genuine builds simply don't
+    // send the header at all — both land here and keep the legacy grant,
+    // but the attempt is logged for observability.
+    if (c.req.header('x-blasti-attest')) {
+      console.warn(
+        `[AUTH] Attestation rejected (${attest.reason ?? 'unknown'}) for native claim '${raw}' — ` +
+        'falling back to the legacy grant. If this repeats it is a forged client.',
+      )
+    }
+    return raw
+  }
+
   return 'web'
 }
 
 /**
- * Enforce the role×platform login matrix. Throws AuthError(403) when the
- * role may not hold a session on this platform — the mobile/desktop apps
- * must have NOTHING to do with the admin API, and the desktop app never
- * carries customer sessions.
+ * Enforce the role×platform login matrix.
+ *
+ * Secrecy-0.6.48 — ACCOUNT-TYPE SECRECY: when the credentials are CORRECT
+ * but this platform does not support the account's role, the caller gets
+ * EXACTLY the same answer as a wrong password — generic 401
+ * 'Invalid username or password'. We never say (nor hint) that the account
+ * exists, what its type is, or which platforms support it. The server
+ * simply compares the credentials against the roles ALLOWED here and, when
+ * nothing matches, reports wrong credentials (user requirement:
+ * "قارن المعلومات فقط بنوع الحسابات المسموحة وإن لم يوجد فأوصل رسالة أن
+ *  المعلومات غير صحيحة").
  */
 export function assertPlatformLoginAllowed(platform: ClientPlatform, role: string): void {
   const allowed = PLATFORM_ALLOWED_ROLES[platform]
   if (allowed === null || allowed.includes(role)) return
-  if (role === 'SUPER_ADMIN') {
-    throw new AuthError('Admin login is not allowed on this app. Use the web console.', 403)
-  }
-  if (role === 'CUSTOMER' && platform === 'desktop') {
-    throw new AuthError('Customer login is not allowed on the desktop app.', 403)
-  }
-  throw new AuthError('This account type cannot sign in on this app.', 403)
+  // Same body, same status, same everything as the wrong-password path —
+  // including for SUPER_ADMIN (an admin attempt from the apk/exe must not
+  // even confirm that an admin account exists behind the username).
+  throw new AuthError('Invalid username or password', 401)
 }
 
 /**
