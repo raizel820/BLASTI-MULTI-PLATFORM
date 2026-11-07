@@ -137,3 +137,18 @@ export function useResumeRefresh(callback: () => void, enabled = true): void {
     };
   }, [enabled]);
 }
+
+/**
+ * 0.6.49 — plain (non-React) subscription for non-component consumers —
+ * the sync engine reacts to foreground resumes with an immediate
+ * incremental pull, so returning to the app also refreshes the local copy
+ * while the views' own resume handlers refresh the REST paints.
+ */
+export function onResume(fn: ResumeListener): () => void {
+  wireWeb();
+  void wireNative();
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+  };
+}

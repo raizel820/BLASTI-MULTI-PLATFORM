@@ -254,7 +254,14 @@ export interface AppUpdateState {
   /** 0.6.30 — NSIS/APK install could not even start → UI offers manual open. */
   manualInstallAvailable: boolean;
 
-  check: (trigger: 'startup' | 'sync' | 'manual' | 'resume' | 'push') => Promise<boolean>;
+  /**
+   * 0.6.49 — 'periodic' joined the trigger set: AppUpdateManager polls the
+   * release feed every 4h (and on every foreground resume via the
+   * resume-refresh bus), so long-lived sessions (kiosk TVs, always-on
+   * desktops, phones that never close the app) still learn about releases
+   * without a manual check.
+   */
+  check: (trigger: 'startup' | 'sync' | 'manual' | 'resume' | 'push' | 'periodic') => Promise<boolean>;
   startDownload: () => Promise<void>;
   install: () => Promise<void>;
   /**

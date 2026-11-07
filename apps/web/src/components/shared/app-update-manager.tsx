@@ -24,6 +24,7 @@ import { useLanguage } from '@/hooks/use-language';
 import { t } from '@/i18n';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
+import { useResumeRefresh } from '@/lib/resume-refresh';
 import {
   Dialog,
   DialogContent,
@@ -155,6 +156,27 @@ export function AppUpdateManager() {
       clearTimeout(timer);
     };
   }, [lang]);
+
+  // ── 0.6.49 — PERIODIC auto-check (every 4h) + foreground resume check ────
+  // Update discovery used to be purely event-driven (one startup check,
+  // one boot-gate check, Capacitor resume) — an app that stayed open for
+  // DAYS (kiosk TV, always-on desktop, a phone that never gets closed)
+  // never learned about a new release until restart. The store's own
+  // 60s auto-check throttle guards spam, and the web shell no-ops inside
+  // check() (browsers have no in-app updater).
+  useEffect(() => {
+    const PERIODIC_UPDATE_CHECK_MS = 4 * 60 * 60 * 1000;
+    const id = setInterval(() => {
+      void check('periodic');
+    }, PERIODIC_UPDATE_CHECK_MS);
+    return () => clearInterval(id);
+  }, [check]);
+
+  // Foreground resume (desktop restore, browser tab return) — the bus fires
+  // only after a REAL absence (≥3s hidden), so this is not a focus spinner.
+  useResumeRefresh(() => {
+    void check('resume');
+  });
 
   if (!info) return null;
 

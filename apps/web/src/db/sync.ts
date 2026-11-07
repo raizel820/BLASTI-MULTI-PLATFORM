@@ -24,6 +24,7 @@ import type { Database } from '@nozbe/watermelondb';
 import { buildCloudUrl } from '@/lib/api-client';
 import { isRevoked, setRevoked, clearRevoked } from '@/lib/authz-state';
 import { diag } from '@/lib/diag-log';
+import { onResume } from '@/lib/resume-refresh';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -80,8 +81,18 @@ const LAST_SYNC_KEY = 'blasti-wdb-last-sync';
 // Sync-speed 0.6.48 — the incremental cursor-based pull is cheap (only rows
 // newer than the last sequence), so the old 5-minute ceiling mostly added
 // staleness for nothing. 2 minutes keeps every shell visibly fresher; the
-// realtime push channel and the resume-refresh bus still cover the fast path.
+// realtime push channel, the resume-refresh bus AND the engine's own
+// resume reaction (0.6.49) cover the fast path.
 const DEFAULT_SYNC_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
+// 0.6.49 — steady-sync round:
+//   • Backoff — a failing target (offline, dead LAN host, cloud blip) no
+//     longer retries at the full cadence; the delay doubles per consecutive
+//     failure up to this ceiling and resets on the first success.
+const MAX_SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+//   • Resume reaction — returning to the foreground triggers ONE immediate
+//     incremental pull (throttled to this gap so tab flapping doesn't
+//     machine-gun the server); the 2-min loop continues on top of it.
+const RESUME_SYNC_MIN_GAP_MS = 20_000;
 const LAN_PROBE_INTERVAL_MS = 30 * 1000; // Re-probe LAN every 30s
 const LAN_PROBE_TIMEOUT_MS = 2000; // 2s timeout for LAN server probe
 const LAN_SYNC_BASE_PATH = '/api/sync'; // Same path on desktop LAN server
@@ -109,7 +120,16 @@ const isBrowser = typeof window !== 'undefined';
 class SyncEngine {
   private listeners: Set<SyncEventListener> = new Set();
   private isSyncing: boolean = false;
-  private syncIntervalId: ReturnType<typeof setInterval> | null = null;
+  // 0.6.49 — holds a setTimeout handle now (self-scheduling cycle chain
+  // replaces the fixed setInterval so failures can back off and successes
+  // reset). `periodicRunning` distinguishes "stopped" from "timer pending" —
+  // while a sync is IN FLIGHT the handle is null but the loop is alive.
+  private syncIntervalId: ReturnType<typeof setTimeout> | null = null;
+  private periodicRunning: boolean = false;
+  private consecutiveFailures: number = 0;
+  private lastResumeSyncAt: number = 0;
+  private lastPullRowCount: number = 0;
+  private resumeUnsubscribe: (() => void) | null = null;
   private lanProbeIntervalId: ReturnType<typeof setInterval> | null = null;
   private lastError: string | null = null;
 
@@ -692,6 +712,12 @@ class SyncEngine {
 
           const changes = transformPullChanges(collected, { localIdIndex });
 
+          // 0.6.49 — remember whether this cycle actually landed rows, so the
+          // success path can soft-stale the REST caches ONLY when the local
+          // copy advanced (an empty pull must not churn every mounted view).
+          this.lastPullRowCount =
+            changes.created.length + changes.updated.length + changes.deleted.length;
+
           console.log('[SyncEngine] Pull complete, timestamp:', timestamp);
           return {
             changes,
@@ -747,12 +773,34 @@ class SyncEngine {
       const now = String(Date.now());
       this.setLastSyncTimestamp(now);
 
+      // 0.6.49 — success resets the backoff ladder.
+      this.consecutiveFailures = 0;
+
+      // 0.6.49 — the local copy just advanced with server rows: mark every
+      // cached GET entry stale (soft — data stays servable for instant
+      // paints) so mounted views revalidate once in the background and
+      // re-render with fresh bytes. This is the bridge that was MISSING
+      // between the WDB sync plane and the REST plane pages actually read:
+      // previously a 2-min pull changed nothing the UI could see until the
+      // next manual navigation.
+      if (this.lastPullRowCount > 0) {
+        diag('sync-rest-stale', { target, rows: this.lastPullRowCount });
+        void import('@/lib/api-client')
+          .then(({ apiClient }) => apiClient.invalidateAll())
+          .catch(() => {
+            /* cache bridge is best-effort */
+          });
+      }
+
       this.emit({ type: 'sync-complete', status: this.getStatus() });
       console.log('[SyncEngine] Sync complete at', now, 'via', target);
       diag('sync-complete', { target, ms: Date.now() - syncStartedAt });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Sync failed';
       this.lastError = message;
+      // 0.6.49 — backoff ladder: each consecutive failure doubles the next
+      // cycle delay (2→4→8→15min ceiling); reset on the first success above.
+      this.consecutiveFailures = Math.min(this.consecutiveFailures + 1, 6);
       console.warn('[SyncEngine] Sync failed:', message);
       diag('sync-error', {
         target,
@@ -825,13 +873,13 @@ class SyncEngine {
   resumeAfterAuth(): void {
     this.revokedSession = false;
     if (!isBrowser || !this.lastDatabase) return;
-    // Intervals still running (e.g. pause never happened) — nothing to do
+    // Cycle chain still running (e.g. pause never happened) — nothing to do
     // (also avoids duplicating the online/offline listeners startPeriodicSync owns).
-    if (this.syncIntervalId || this.lanProbeIntervalId) return;
+    if (this.periodicRunning) return;
     console.log('[SyncEngine] Session re-authenticated — resuming periodic sync');
-    this.syncIntervalId = setInterval(() => {
-      if (this.lastDatabase) this.sync(this.lastDatabase);
-    }, this.lastIntervalMs);
+    this.periodicRunning = true;
+    this.armNextCycle(3000);
+    this.armResumeReaction(this.lastDatabase);
     this.lanProbeIntervalId = setInterval(() => {
       this.probeLanServer().catch(() => {});
     }, LAN_PROBE_INTERVAL_MS);
@@ -912,19 +960,21 @@ class SyncEngine {
 
     if (!isBrowser) return () => {};
 
-    // Initial sync after 3s (let the app settle + run LAN probe)
-    setTimeout(() => this.sync(database), 3000);
+    this.periodicRunning = true;
 
-    // Periodic sync
-    this.syncIntervalId = setInterval(() => {
-      this.sync(database);
-    }, intervalMs);
+    // Initial sync after 3s (let the app settle + run LAN probe)
+    this.armNextCycle(3000);
 
     // LAN probe loop — re-probe every 30s even if not syncing
     // This ensures we switch to LAN quickly when a desktop comes online
     this.lanProbeIntervalId = setInterval(() => {
       this.probeLanServer().catch(() => {});
     }, LAN_PROBE_INTERVAL_MS);
+
+    // 0.6.49 — resume reaction: foregrounding the app pulls the increment
+    // IMMEDIATELY (the WDB copy catches up before the next 2-min tick),
+    // then soft-stales the REST caches so mounted views revalidate.
+    this.armResumeReaction(database);
 
     const goOnline = () => {
       console.log('[SyncEngine] Back online — triggering sync');
@@ -951,14 +1001,60 @@ class SyncEngine {
     };
   }
 
+  /**
+   * 0.6.49 — foreground-resume → immediate incremental pull (throttled).
+   * Shared by startPeriodicSync and resumeAfterAuth so the reaction survives
+   * a revocation pause + re-auth cycle.
+   */
+  private armResumeReaction(database: Database): void {
+    if (this.resumeUnsubscribe) return;
+    this.resumeUnsubscribe = onResume(() => {
+      const now = Date.now();
+      if (now - this.lastResumeSyncAt < RESUME_SYNC_MIN_GAP_MS) return;
+      this.lastResumeSyncAt = now;
+      console.log('[SyncEngine] App resumed — triggering incremental sync');
+      void this.sync(database);
+    });
+  }
+
+  /**
+   * 0.6.49 — steady cycle chain. Replaces the fixed setInterval: each cycle
+   * schedules the NEXT one only after the current attempt settles, at
+   * `effectiveIntervalMs` (full cadence after success, doubled per failure
+   * up to MAX_SYNC_INTERVAL_MS). The engine stays steady when healthy and
+   * backs off politely when the target is down instead of hammering it.
+   */
+  private armNextCycle(delayMs?: number): void {
+    if (!isBrowser || !this.periodicRunning) return;
+    if (this.syncIntervalId) clearTimeout(this.syncIntervalId);
+    const delay = delayMs ?? this.effectiveIntervalMs;
+    this.syncIntervalId = setTimeout(() => {
+      this.syncIntervalId = null;
+      if (!this.periodicRunning || !this.lastDatabase) return;
+      void this.sync(this.lastDatabase).finally(() => {
+        this.armNextCycle();
+      });
+    }, delay);
+  }
+
+  private get effectiveIntervalMs(): number {
+    const multiplier = 2 ** Math.min(this.consecutiveFailures, 4);
+    return Math.min(this.lastIntervalMs * multiplier, MAX_SYNC_INTERVAL_MS);
+  }
+
   stopPeriodicSync(): void {
+    this.periodicRunning = false;
     if (this.syncIntervalId) {
-      clearInterval(this.syncIntervalId);
+      clearTimeout(this.syncIntervalId);
       this.syncIntervalId = null;
     }
     if (this.lanProbeIntervalId) {
       clearInterval(this.lanProbeIntervalId);
       this.lanProbeIntervalId = null;
+    }
+    if (this.resumeUnsubscribe) {
+      this.resumeUnsubscribe();
+      this.resumeUnsubscribe = null;
     }
   }
 

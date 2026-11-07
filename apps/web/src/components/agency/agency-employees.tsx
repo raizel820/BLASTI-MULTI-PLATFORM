@@ -60,6 +60,7 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { apiFetch } from '@/lib/api-fetch';
 import { unwrapListPayload } from '@/lib/list-payload';
+import { apiClient } from '@/lib/api-client';
 
 interface Employee {
   id: string;
@@ -79,6 +80,26 @@ interface BranchOption {
   name: string;
   nameAr?: string | null;
   nameFr?: string | null;
+}
+
+/**
+ * 0.6.49 — shared row mapper for the network payload AND the cache paint:
+ * both sources go through the exact same transform, so the instant cache
+ * paint renders objects identical in shape to the ones the revalidation
+ * will land (no remount/flicker when fresh data replaces painted data).
+ */
+function mapStaffRows(rows: unknown[]): Employee[] {
+  return (rows as Record<string, any>[]).map((s) => ({
+    id: s.id,
+    userId: s.userId,
+    username: s.user?.username ?? '',
+    fullName: s.user?.fullName ?? '',
+    role: s.role === 'OWNER' ? 'AGENCY_OWNER' : s.role === 'MANAGER' ? 'AGENCY_MANAGER' : s.role,
+    isActive: s.isActive ?? s.user?.isActive ?? true,
+    createdAt: s.joinedAt ?? s.user?.createdAt ?? new Date().toISOString(),
+    permissions: s.permissions ?? {},
+    uid: s.user?.uid ?? null,
+  }));
 }
 
 function generatePassword(): string {
@@ -166,7 +187,21 @@ export function AgencyEmployees() {
       setLoading(false);
       return;
     }
-    setLoading(true);
+    // 0.6.49 — instant paint from the ApiClient GET-cache: navigating back
+    // to Employees repaints the last known staff list immediately; the
+    // network below (ETag revalidate via cache-1) silently corrects it.
+    // Nothing cached → previous skeleton behavior.
+    let paintedFromCache = false;
+    const cachedStaff = apiClient.peekCache(`/api/agency/staff?agencyId=${encodeURIComponent(agencyId)}`);
+    if (cachedStaff) {
+      const cachedRows = unwrapListPayload(cachedStaff.data, ['staff']);
+      if (Array.isArray(cachedRows)) {
+        setEmployees(mapStaffRows(cachedRows));
+        setLoading(false);
+        paintedFromCache = true;
+      }
+    }
+    if (!paintedFromCache) setLoading(true);
     try {
       const res = await apiFetch(`/api/agency/staff?agencyId=${encodeURIComponent(agencyId)}`);
       if (res.ok) {
@@ -176,17 +211,7 @@ export function AgencyEmployees() {
         // the local dual envelope { success, staff, data } to the RAW ARRAY —
         // `data.staff` on an array was always undefined (empty staff list on
         // desktop). Accept every envelope outcome.
-        setEmployees(unwrapListPayload(data, ['staff']).map((s: any) => ({
-          id: s.id,
-          userId: s.userId,
-          username: s.user?.username ?? '',
-          fullName: s.user?.fullName ?? '',
-          role: s.role === 'OWNER' ? 'AGENCY_OWNER' : s.role === 'MANAGER' ? 'AGENCY_MANAGER' : s.role,
-          isActive: s.isActive ?? s.user?.isActive ?? true,
-          createdAt: s.joinedAt ?? s.user?.createdAt ?? new Date().toISOString(),
-          permissions: s.permissions ?? {},
-          uid: s.user?.uid ?? null,
-        })));
+        setEmployees(mapStaffRows(unwrapListPayload(data, ['staff'])));
       } else {
         setEmployees([]);
       }

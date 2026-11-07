@@ -44,6 +44,10 @@ const EVENT_PREFIXES: Record<string, string[]> = {
 export function handleSyncDataApplied(): void {
   void (async () => {
     const { apiClient } = await import('./api-client');
+    // 0.6.49 NOTE: `apiClient.invalidateAll()` reaches a STATIC method
+    // through the singleton — that used to throw "not a function" at
+    // runtime (dead bridge). The instance delegates on ApiClient fixed it;
+    // this call now actually soft-stales every cached GET + revalidates.
     apiClient.invalidateAll();
   })();
 }
@@ -54,6 +58,9 @@ export function handleRealtimeCacheEvent(event: string): void {
   if (!prefixes || prefixes.length === 0) return;
   void (async () => {
     const { apiClient } = await import('./api-client');
+    // Same 0.6.49 static-through-instance fix as above — this bridge now
+    // really runs, which is what lets mounted views update in place on
+    // live queue/reservation events instead of only on their own refetches.
     apiClient.invalidatePrefixes(prefixes, { hard: false });
   })();
 }

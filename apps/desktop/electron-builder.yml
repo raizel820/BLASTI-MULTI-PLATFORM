@@ -30,6 +30,12 @@ files:
   # class as load-env.js — dev works, packaged app would crash with
   # "Cannot find module './device-telemetry'" on first launch.
   - device-telemetry.js
+  # Login unification + client attestation (0.6.48): main.js and
+  # local-api/index.js both require ./client-attestation.js (HMAC attestation
+  # header for cloud login). Same failure class as load-env.js — dev works,
+  # packaged app would crash with "Cannot find module './client-attestation'"
+  # on first launch. Caught by the check-packaging guard in CI.
+  - client-attestation.js
   - package.json
   - build-stamp.json
   - local-api/**/*

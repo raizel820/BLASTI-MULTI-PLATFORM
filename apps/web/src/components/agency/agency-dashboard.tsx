@@ -69,6 +69,7 @@ import { ETABadge } from '@/components/agency/dashboard/eta-badge';
 import { TicketConfirmation } from '@/components/agency/dashboard/ticket-confirmation';
 import { CreateAgencyForm } from '@/components/agency/create-agency-form';
 import { apiFetch } from '@/lib/api-fetch';
+import { apiClient } from '@/lib/api-client';
 import { isBothUnreachable } from '@/lib/api-client';
 import { isSubscriptionActive } from '@/hooks/use-subscription';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -268,6 +269,10 @@ export function AgencyDashboard() {
   const [ticketConfirmation, setTicketConfirmation] = useState<{ visible: boolean; ticketNumber: string; customerName: string; serviceName: string }>({ visible: false, ticketNumber: '', customerName: '', serviceName: '' });
   const [wasOffline, setWasOffline] = useState(false);
   const fetchInProgressRef = useRef(false);
+  // 0.6.49 — reference guard for the cache-paint block in fetchData (see
+  // there): identical cached payloads never re-setState across the 10s
+  // poll ticks / realtime refetches.
+  const paintedCacheRef = useRef<{ stats?: unknown; queue?: unknown; services?: unknown }>({});
   const autoRetryCountRef = useRef(0); // Task 41 — bounded silent auto-retry
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollErrorShownRef = useRef(false); // Prevent toast spam during polling
@@ -329,6 +334,48 @@ export function AgencyDashboard() {
     setFetchError(false);
     const fetchStartedAt = Date.now();
     let willAutoRetry = false;
+
+    // 0.6.49 — instant paint from the ApiClient GET-cache: a returning
+    // navigation repaints the last known dashboard IMMEDIATELY and lets the
+    // network below revalidate silently — no skeleton flash when the data
+    // is already on the device (desktop local SQLite via cache-1, or the
+    // persisted snapshot from the last session). Reference-guarded so the
+    // 10s poll and realtime refetches never re-setState identical payloads.
+    let paintedSections = 0;
+    const cachedStats = apiClient.peekCache(`/api/agency/stats?agencyId=${encodeURIComponent(agencyId)}`);
+    const cachedQueue = apiClient.peekCache(`/api/agency/queue?agencyId=${encodeURIComponent(agencyId)}&status=WAITING,CALLED`);
+    const cachedServices = apiClient.peekCache(`/api/agency/services?agencyId=${encodeURIComponent(agencyId)}`);
+    if (cachedStats && paintedCacheRef.current.stats !== cachedStats.data) {
+      paintedCacheRef.current.stats = cachedStats.data;
+      setStats(cachedStats.data as DashboardStats);
+      paintedSections++;
+    }
+    if (cachedQueue) {
+      const entries = (cachedQueue.data as { entries?: QueueEntry[] } | null)?.entries;
+      if (Array.isArray(entries) && paintedCacheRef.current.queue !== cachedQueue.data) {
+        paintedCacheRef.current.queue = cachedQueue.data;
+        setWaitingList(entries);
+        paintedSections++;
+      }
+    }
+    if (cachedServices) {
+      const services = (cachedServices.data as { services?: ServiceStat[] } | null)?.services;
+      if (Array.isArray(services) && paintedCacheRef.current.services !== cachedServices.data) {
+        paintedCacheRef.current.services = cachedServices.data;
+        setServiceStats(
+          services.map((s) => ({
+            ...s,
+            waitingCount: s._count?.waiting ?? 0,
+            completedCount: s._count?.completed ?? 0,
+          }))
+        );
+        paintedSections++;
+      }
+    }
+    // Anything painted → content mode; unpainted sections render their own
+    // empty states for the (usually sub-second) revalidation instead of a
+    // full-page skeleton. Nothing cached → previous skeleton behavior.
+    if (paintedSections > 0) setLoading(false);
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
 

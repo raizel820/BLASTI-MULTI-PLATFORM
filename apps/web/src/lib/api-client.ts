@@ -1004,8 +1004,14 @@ export class ApiClient {
   private static getCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
   private static cacheListeners = new Set<(affectedKeys: string[]) => void>();
   private static readonly GET_CACHE_LS_KEY = 'blasti-get-cache-v1';
-  private static readonly GET_CACHE_MAX_ENTRIES = 80;
-  private static readonly GET_CACHE_MAX_BYTES = 256 * 1024;
+  // 0.6.49 — instant-navigation round: the snapshot is the cold-boot paint
+  // layer for EVERY view (dashboard, employees, admin lists, history…), and
+  // 80 entries / 256KB evicted the long tail (analytics, announcements,
+  // admin pages) before they ever survived a restart. 160 / 512KB keeps a
+  // full working session warm across app relaunches — still trivial for
+  // localStorage (5MB budget) and wiped on logout.
+  private static readonly GET_CACHE_MAX_ENTRIES = 160;
+  private static readonly GET_CACHE_MAX_BYTES = 512 * 1024;
   private static readonly REVALIDATE_THROTTLE_MS = 5_000;
   /** Fresh window (ms) — class-local twin of the exported DEFAULT_GET_CACHE_TTL. */
   private static readonly DEFAULT_TTL = 30_000;
@@ -1092,6 +1098,24 @@ export class ApiClient {
   static subscribeCache(fn: (affectedKeys: string[]) => void): () => void {
     ApiClient.cacheListeners.add(fn);
     return () => ApiClient.cacheListeners.delete(fn);
+  }
+
+  /**
+   * 0.6.49 — synchronous cache read for instant-paint rendering.
+   * Returns the newest entry whose stored path matches `path` (exact match
+   * including query string; when the caller passes a bare path, any query
+   * variant of the same endpoint is accepted — newest wins). null on miss.
+   * O(entries) ≤ 160 — trivial; called once per view mount/subscription tick.
+   */
+  static peekCache(path: string): { data: unknown; ts: number } | null {
+    const exact = path.includes('?');
+    const bare = path.split('?')[0];
+    let best: { data: unknown; ts: number } | null = null;
+    for (const entry of ApiClient.getCache.values()) {
+      const match = exact ? entry.path === path : entry.path === path || entry.path.split('?')[0] === bare;
+      if (match && (!best || entry.ts > best.ts)) best = { data: entry.data, ts: entry.ts };
+    }
+    return best;
   }
 
   private static notifyCacheListeners(keys: string[]): void {
@@ -1221,6 +1245,24 @@ export class ApiClient {
       void this.get(p).catch(() => undefined);
     }
   }
+
+  // ── 0.6.49 — instance delegates for the static cache API ─────────────────
+  //
+  // CRITICAL FIX: several call sites reach this API through the SINGLETON
+  // (`apiClient.warmCache(…)`, `apiClient.invalidateAll()`, …). Static
+  // members are not reachable through an instance — with
+  // `next.config.ignoreBuildErrors: true` those calls compiled silently and
+  // then THREW "not a function" at runtime, which means boot cache warm-up
+  // and the realtime/sync soft-invalidation bridge were DEAD in production
+  // (direct view refetches masked the gap). These instance delegates make
+  // both call styles work; new code may use either.
+  peekCache = (path: string): { data: unknown; ts: number } | null => ApiClient.peekCache(path);
+  subscribeCache = (fn: (affectedKeys: string[]) => void): (() => void) => ApiClient.subscribeCache(fn);
+  invalidateAll = (): void => ApiClient.invalidateAll();
+  invalidatePrefixes = (prefixes: string[], opts?: { hard?: boolean }): string[] =>
+    ApiClient.invalidatePrefixes(prefixes, opts);
+  warmCache = (paths: string[]): void => ApiClient.warmCache(paths);
+  wipeGetCache = (): void => ApiClient.wipeGetCache();
 
   private static loadPersistedOnce = false;
 

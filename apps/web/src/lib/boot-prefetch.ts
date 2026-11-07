@@ -42,11 +42,21 @@ export function warmCoreCaches(): void {
       const role = user.role;
       const paths: string[] = [];
 
+      // 0.6.49 — instant-navigation round: the warmed set now covers the
+      // HIGH-TRAFFIC navigation targets per role, not just the shell
+      // headers. NOTE: before 0.6.49 this whole warm-up was silently DEAD
+      // (`apiClient.warmCache` is a STATIC method reached through the
+      // singleton instance → "not a function" at runtime, swallowed by this
+      // try/catch) — the instance delegates on ApiClient fixed that.
       if (role === 'CUSTOMER') {
         paths.push(
           '/api/agencies',
           '/api/user/notifications?take=20',
           '/api/reservations',
+          // First-paint payloads of the hottest customer views:
+          '/api/reservations/active',
+          '/api/favorites',
+          '/api/reservations/history',
         );
       } else if (role === 'AGENCY_OWNER' || role === 'AGENCY_STAFF') {
         paths.push(
@@ -55,6 +65,9 @@ export function warmCoreCaches(): void {
           '/api/agency/queue',
           '/api/agency/branches',
           '/api/user/notifications?take=20',
+          // Dashboard widgets + announcement banner:
+          '/api/agency/activity',
+          '/api/agency/announcements',
         );
       } else if (role === 'SUPER_ADMIN') {
         paths.push(

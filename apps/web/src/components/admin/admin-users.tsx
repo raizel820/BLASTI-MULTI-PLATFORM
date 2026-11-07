@@ -1,5 +1,6 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
+import { apiClient } from '@/lib/api-client';
 
 import { useState, useEffect, useCallback } from 'react';
 import { useLanguage } from '@/hooks/use-language';
@@ -86,22 +87,37 @@ export function AdminUsers() {
   const [deleteConfirmText, setDeleteConfirmText] = useState('');
 
   const fetchUsers = useCallback(async (targetPage: number, loadMore: boolean) => {
+    const params = new URLSearchParams();
+    if (debouncedSearch) params.set('search', debouncedSearch);
+    if (roleFilter) params.set('role', roleFilter);
+    if (statusFilter) params.set('status', statusFilter);
+    params.set('page', String(targetPage));
+    params.set('limit', String(PAGE_SIZE));
+    const requestUrl = `/api/admin/users?${params.toString()}`;
+
     if (loadMore) {
       setLoadingMore(true);
     } else {
-      setLoading(true);
+      // 0.6.49 — instant paint from the ApiClient GET-cache: switching back
+      // to Users with the same filters/page repaints the last known list
+      // immediately; the fetch below revalidates it silently (ETag via
+      // cache-1). Nothing cached for this identity → previous skeleton.
+      const cachedUsers = apiClient.peekCache(requestUrl);
+      const cachedPayload = cachedUsers?.data as { users?: UserItem[]; total?: number } | null | undefined;
+      if (cachedPayload && Array.isArray(cachedPayload.users)) {
+        setUsers(cachedPayload.users);
+        setTotal(cachedPayload.total ?? 0);
+        setPage(targetPage);
+        setLoading(false);
+      } else {
+        setLoading(true);
+      }
     }
     setLoadError(false);
     try {
       const { fetchWithRetry } = await import('@/lib/fetch-with-retry');
-      const params = new URLSearchParams();
-      if (debouncedSearch) params.set('search', debouncedSearch);
-      if (roleFilter) params.set('role', roleFilter);
-      if (statusFilter) params.set('status', statusFilter);
-      params.set('page', String(targetPage));
-      params.set('limit', String(PAGE_SIZE));
 
-      const res = await fetchWithRetry(`/api/admin/users?${params.toString()}`);
+      const res = await fetchWithRetry(requestUrl);
       if (res.ok) {
         const data = await res.json();
         if (loadMore) {
