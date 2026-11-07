@@ -2483,7 +2483,10 @@ function EnterpriseRequestDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       {/* Wide on desktop so the feature grid and message box breathe (Task 33-D) */}
-      <DialogContent className="sm:max-w-2xl lg:max-w-3xl p-0 gap-0 overflow-hidden rounded-2xl">
+      {/* 0.6.51 mobile audit — flex column + dvh cap (same pattern as the
+          checkout dialog): the header + 65vh body + footer exceeded short
+          phone viewports, pushing the footer off-screen. */}
+      <DialogContent className="sm:max-w-2xl lg:max-w-3xl p-0 gap-0 overflow-hidden rounded-2xl flex flex-col max-h-[90dvh]">
         <div className="relative overflow-hidden bg-gradient-to-r from-purple-700 via-fuchsia-600 to-pink-500 px-5 py-4 sm:px-6 text-white">
           <div className="absolute -top-8 -end-8 h-28 w-28 rounded-full bg-white/10" />
           <div className="absolute -bottom-6 -start-6 h-20 w-20 rounded-full bg-white/5" />
@@ -2500,7 +2503,7 @@ function EnterpriseRequestDialog({
           </DialogHeader>
         </div>
 
-        <div className="p-5 sm:px-6 space-y-4 max-h-[65vh] overflow-y-auto">
+        <div className="p-5 sm:px-6 space-y-4 flex-1 min-h-0 overflow-y-auto">
           {/* Message */}
           <div className="space-y-1.5">
             <Label className="text-sm font-semibold flex items-center gap-2">

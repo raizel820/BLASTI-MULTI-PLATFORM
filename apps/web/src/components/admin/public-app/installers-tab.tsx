@@ -40,6 +40,9 @@ import {
   FileArchive,
   AlertTriangle,
   Inbox,
+  ArrowDown,
+  ArrowUp,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -47,6 +50,7 @@ import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
+import { Checkbox } from '@/components/ui/checkbox';
 import { Progress } from '@/components/ui/progress';
 import { Skeleton } from '@/components/ui/skeleton';
 import {
@@ -88,11 +92,60 @@ import {
   isActiveInstaller,
   platformIcon,
   platformLabel,
+  isDeltaRelated,
+  compareDiskFiles,
   type InstallerDiskFile,
+  type InstallerSortKey,
+  type InstallerSortDir,
 } from './shared';
 import { NotesInput, type NotesValue } from './notes-input';
 
 const AUTO_REFRESH_MS = 30_000;
+
+// ── 0.6.50 — persisted view preferences (hide-delta + sort) ────────────────
+// The Installers tab lists EVERY file in the bucket; the admin usually cares
+// about the regular installers, so delta patches + blockmap/asar refs start
+// HIDDEN and the preference (together with the sort choice) survives
+// navigation across the session. Guarded for the prerender pass.
+const VIEW_PREFS_KEY = 'blasti-installer-view-prefs-v1';
+
+interface InstallerViewPrefs {
+  hideDelta: boolean;
+  sortKey: InstallerSortKey;
+  sortDir: InstallerSortDir;
+}
+
+const DEFAULT_VIEW_PREFS: InstallerViewPrefs = {
+  hideDelta: true,
+  sortKey: 'time',
+  sortDir: 'desc',
+};
+
+function loadViewPrefs(): InstallerViewPrefs {
+  if (typeof window === 'undefined') return DEFAULT_VIEW_PREFS;
+  try {
+    const raw = window.localStorage.getItem(VIEW_PREFS_KEY);
+    if (!raw) return DEFAULT_VIEW_PREFS;
+    const parsed = JSON.parse(raw) as Partial<InstallerViewPrefs>;
+    const keys: InstallerSortKey[] = ['time', 'name', 'size', 'version'];
+    return {
+      hideDelta: typeof parsed.hideDelta === 'boolean' ? parsed.hideDelta : DEFAULT_VIEW_PREFS.hideDelta,
+      sortKey: keys.includes(parsed.sortKey as InstallerSortKey) ? (parsed.sortKey as InstallerSortKey) : DEFAULT_VIEW_PREFS.sortKey,
+      sortDir: parsed.sortDir === 'asc' || parsed.sortDir === 'desc' ? parsed.sortDir : DEFAULT_VIEW_PREFS.sortDir,
+    };
+  } catch {
+    return DEFAULT_VIEW_PREFS;
+  }
+}
+
+function saveViewPrefs(prefs: InstallerViewPrefs): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(VIEW_PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    /* quota/private mode — view prefs are best-effort */
+  }
+}
 
 /**
  * File-type bucket for the type filter — the extension the admin thinks in:
@@ -136,6 +189,18 @@ export function InstallersTab() {
   const [filter, setFilter] = useState<string>('all');
   const [typeFilter, setTypeFilter] = useState<string>('all');
 
+  // ── 0.6.50 — view prefs: hide delta-related files + sort order ──
+  const [hideDelta, setHideDelta] = useState<boolean>(() => loadViewPrefs().hideDelta);
+  const [sortKey, setSortKey] = useState<InstallerSortKey>(() => loadViewPrefs().sortKey);
+  const [sortDir, setSortDir] = useState<InstallerSortDir>(() => loadViewPrefs().sortDir);
+  const updatePrefs = useCallback((patch: Partial<InstallerViewPrefs>) => {
+    const next = { hideDelta, sortKey, sortDir, ...patch };
+    if (patch.hideDelta !== undefined) setHideDelta(patch.hideDelta);
+    if (patch.sortKey !== undefined) setSortKey(patch.sortKey);
+    if (patch.sortDir !== undefined) setSortDir(patch.sortDir);
+    saveViewPrefs(next);
+  }, [hideDelta, sortKey, sortDir]);
+
   // ── Activate state ──
   const [activatingKey, setActivatingKey] = useState<string | null>(null);
   const [confirmFile, setConfirmFile] = useState<InstallerDiskFile | null>(null);
@@ -176,22 +241,32 @@ export function InstallersTab() {
     return () => clearInterval(interval);
   }, [fetchFiles]);
 
-  // ── Grouping: one group per platform present, rows sorted push-time desc ──
+  // ── 0.6.50 — delta filter applied FIRST: when hideDelta is on, delta
+  // patches + blockmap/asar refs never enter the grouping, the type options
+  // or ANY of the counts (platform chips, type list, totals stay honest).
+  const baseFiles = useMemo(
+    () => (hideDelta ? files.filter((f) => !isDeltaRelated(f)) : files),
+    [files, hideDelta],
+  );
+  const hiddenDeltaCount = files.length - baseFiles.length;
+
+  // ── Grouping: one group per platform present, rows sorted by the view sort ──
   const groups = useMemo(() => {
     const byPlatform = new Map<string, InstallerDiskFile[]>();
-    for (const f of files) {
+    for (const f of baseFiles) {
       const key = f.platform || f.parsed?.platform || '';
       const list = byPlatform.get(key) || [];
       list.push(f);
       byPlatform.set(key, list);
     }
+    const cmp = compareDiskFiles(sortKey, sortDir);
     return Array.from(byPlatform.entries())
       .map(([platform, rows]) => ({
         platform,
-        rows: rows.sort((a, b) => b.mtimeMs - a.mtimeMs),
+        rows: rows.sort(cmp),
       }))
       .sort((a, b) => b.rows.length - a.rows.length);
-  }, [files]);
+  }, [baseFiles, sortKey, sortDir]);
 
   const visibleGroups = useMemo(
     () => (filter === 'all' ? groups : groups.filter((g) => g.platform === filter)),
@@ -199,19 +274,20 @@ export function InstallersTab() {
   );
 
   // ── File-type filter (apk / exe / bin / asar / patch / …) ──
-  // Type options derive from EVERY file on disk so the counts stay honest;
-  // the platform groups keep their shape and only their ROWS narrow — an
-  // empty group disappears instead of showing an empty table.
+  // Type options derive from the VISIBLE base (delta-hidden when checked) so
+  // the counts stay honest; the platform groups keep their shape and only
+  // their ROWS narrow — an empty group disappears instead of showing an
+  // empty table.
   const typeOptions = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const f of files) {
+    for (const f of baseFiles) {
       const type = fileTypeOf(f.name);
       counts.set(type, (counts.get(type) ?? 0) + 1);
     }
     return [...counts.entries()]
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .map(([type, count]) => ({ type, count }));
-  }, [files]);
+  }, [baseFiles]);
 
   const typeVisibleGroups = useMemo(() => {
     if (typeFilter === 'all') return visibleGroups;
@@ -416,7 +492,7 @@ export function InstallersTab() {
                 >
                   {t('publicAppFilterAll')}
                   <Badge variant="secondary" className="ms-1.5 h-4 px-1.5 text-[10px] rounded-full">
-                    {files.length}
+                    {baseFiles.length}
                   </Badge>
                 </Button>
                 {groups.map((g) => {
@@ -439,8 +515,8 @@ export function InstallersTab() {
                 })}
               </div>
 
-              {/* File-type filter — apk / exe / bin / asar / patch / … */}
-              <div className="flex items-center gap-2">
+              {/* File-type filter + 0.6.50 view controls (hide delta / sort) */}
+              <div className="flex flex-wrap items-center gap-2">
                 <Select value={typeFilter} onValueChange={setTypeFilter}>
                   <SelectTrigger
                     className="h-8 w-full sm:w-56 text-xs rounded-full"
@@ -453,7 +529,7 @@ export function InstallersTab() {
                       <span className="flex items-center justify-between gap-2 w-full">
                         <span>{t('publicAppFilterAllTypes')}</span>
                         <Badge variant="secondary" className="h-4 px-1.5 text-[10px] rounded-full">
-                          {files.length}
+                          {baseFiles.length}
                         </Badge>
                       </span>
                     </SelectItem>
@@ -479,6 +555,55 @@ export function InstallersTab() {
                     {t('publicAppFilterClear')}
                   </Button>
                 )}
+
+                {/* 0.6.50 — hide delta-update files (patches + blockmap/asar refs):
+                    checked by default so the view shows regular installers only. */}
+                <label className="flex items-center gap-2 h-8 px-3 rounded-full border bg-background text-xs cursor-pointer select-none hover:bg-muted/50">
+                  <Checkbox
+                    checked={hideDelta}
+                    onCheckedChange={(v) => updatePrefs({ hideDelta: v === true })}
+                    className="h-3.5 w-3.5"
+                    aria-label={t('publicAppHideDelta')}
+                  />
+                  <span>{t('publicAppHideDelta')}</span>
+                  {hideDelta && hiddenDeltaCount > 0 && (
+                    <Badge variant="secondary" className="h-4 px-1.5 text-[10px] rounded-full">
+                      {hiddenDeltaCount}
+                    </Badge>
+                  )}
+                </label>
+
+                {/* 0.6.50 — sort control: version / name / time / size + direction */}
+                <div className="flex items-center gap-1.5 ms-auto">
+                  <SlidersHorizontal className="h-3.5 w-3.5 text-muted-foreground shrink-0" aria-hidden="true" />
+                  <Select
+                    value={sortKey}
+                    onValueChange={(v) => updatePrefs({ sortKey: v as InstallerSortKey })}
+                  >
+                    <SelectTrigger
+                      className="h-8 w-32 sm:w-36 text-xs rounded-full"
+                      aria-label={t('publicAppSortBy')}
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="time">{t('publicAppSortTime')}</SelectItem>
+                      <SelectItem value="name">{t('publicAppSortName')}</SelectItem>
+                      <SelectItem value="size">{t('publicAppSortSize')}</SelectItem>
+                      <SelectItem value="version">{t('publicAppSortVersion')}</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-8 w-8 rounded-full shrink-0"
+                    onClick={() => updatePrefs({ sortDir: sortDir === 'asc' ? 'desc' : 'asc' })}
+                    aria-label={sortDir === 'asc' ? t('publicAppSortAsc') : t('publicAppSortDesc')}
+                    title={sortDir === 'asc' ? t('publicAppSortAsc') : t('publicAppSortDesc')}
+                  >
+                    {sortDir === 'asc' ? <ArrowUp className="h-3.5 w-3.5" /> : <ArrowDown className="h-3.5 w-3.5" />}
+                  </Button>
+                </div>
               </div>
             </div>
           )}
@@ -516,16 +641,25 @@ export function InstallersTab() {
             </div>
           )}
 
-          {/* Type-filter empty state — files exist but none match the type */}
+          {/* Type-filter empty state — files exist but none match the filters */}
           {!loading && !error && files.length > 0 && visibleFileCount === 0 && (
             <div className="flex flex-col items-center gap-2 py-10 text-center">
               <div className="h-10 w-10 rounded-full bg-muted flex items-center justify-center">
                 <FileArchive className="h-5 w-5 text-muted-foreground" />
               </div>
               <p className="text-sm font-medium text-foreground">{t('publicAppFilterNoMatch')}</p>
-              <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => setTypeFilter('all')}>
-                {t('publicAppFilterAllTypes')}
-              </Button>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                {typeFilter !== 'all' && (
+                  <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => setTypeFilter('all')}>
+                    {t('publicAppFilterAllTypes')}
+                  </Button>
+                )}
+                {hideDelta && (
+                  <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => updatePrefs({ hideDelta: false })}>
+                    {t('publicAppShowDelta')}
+                  </Button>
+                )}
+              </div>
             </div>
           )}
 

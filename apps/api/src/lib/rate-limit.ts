@@ -334,6 +334,16 @@ export const PASSWORD_RESET_RATE_LIMIT: RateLimitOptions = {
   prefix: 'pwreset',
 }
 
+/** 0.6.51 — admin account (username/password) changes: 5 per 15 min per user.
+ *  Separate, STRICTER bucket than the generic /user/* self-service endpoints —
+ *  renaming an admin account or rotating its password must never be
+ *  brute-forceable and is a rare, deliberate operation. */
+export const ADMIN_ACCOUNT_CHANGE_RATE_LIMIT: RateLimitOptions = {
+  windowMs: 15 * 60 * 1000,
+  maxRequests: 5,
+  prefix: 'adm-acct',
+}
+
 /** SMS sending: 10 per hour per user */
 export const SMS_RATE_LIMIT: RateLimitOptions = {
   windowMs: 60 * 60 * 1000,

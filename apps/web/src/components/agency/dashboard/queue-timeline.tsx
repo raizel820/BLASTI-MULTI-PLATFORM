@@ -144,8 +144,8 @@ export function QueueTimeline({
             </div>
           </div>
 
-          {/* Legend */}
-          <div className="flex items-center justify-center gap-4 mt-3">
+          {/* Legend — 0.6.51: flex-wrap, the 3 chips overflowed ~320px cards */}
+          <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 mt-3">
             <div className="flex items-center gap-1.5">
               <div className="h-2.5 w-2.5 rounded-sm bg-gradient-to-t from-emerald-600 to-emerald-400" />
               <span className="text-[10px] text-muted-foreground">{t('current' as any) || 'Current'}</span>

@@ -1243,7 +1243,7 @@ export function AgencyFullscreen() {
 
   if (loading) {
     return (
-      <div className="h-screen w-screen bg-gray-950 text-white flex items-center justify-center overflow-hidden" dir={dir}>
+      <div className="h-dvh w-full bg-gray-950 text-white flex items-center justify-center overflow-hidden" dir={dir}>
         <div className="flex flex-col items-center gap-4">
           <Loader2 className="h-10 w-10 animate-spin text-emerald-500" />
           <p className="text-gray-400 text-sm">{t('loading') || 'Loading queue...'}</p>
@@ -1255,7 +1255,13 @@ export function AgencyFullscreen() {
   // ─── Render ────────────────────────────────────────────────────────────
 
   return (
-    <div ref={containerRef} className="h-screen w-screen bg-gray-950 text-white flex flex-col overflow-hidden" dir={dir}>
+    // 0.6.51 mobile audit — phones reach this kiosk console via the mobile
+    // dashboard's "Claim counter" CTA: h-screen (100vh large-viewport) +
+    // overflow-hidden clipped the waiting-list card bottom (and its action
+    // rows) behind the address bar with no page scroll. h-dvh tracks the real
+    // viewport; the inner lists keep their own overflow-y-auto. w-screen
+    // (100vw) also clipped the right edge under a visible scrollbar → w-full.
+    <div ref={containerRef} className="h-dvh w-full bg-gray-950 text-white flex flex-col overflow-hidden" dir={dir}>
       {/* ─── Top Bar (compact) ─────────────────────────────────────────── */}
       <header className="flex-shrink-0 flex items-center justify-between px-4 sm:px-6 py-2 bg-gray-900/80 border-b border-gray-800 backdrop-blur-sm">
         <div className="flex items-center gap-3">

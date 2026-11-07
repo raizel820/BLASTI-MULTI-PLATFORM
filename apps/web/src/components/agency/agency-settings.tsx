@@ -1400,7 +1400,7 @@ export function AgencySettings() {
                           ) : staffList.length === 0 ? (
                             <p className="text-sm text-muted-foreground text-center py-4">{t('noData')}</p>
                           ) : (
-                            <div className="space-y-2 max-h-96 overflow-y-auto">
+                            <div className="space-y-2 max-h-[60dvh] md:max-h-96 overflow-y-auto">
                               {staffList.map((staff) => {
                                 const isOwner = staff.role === 'OWNER';
                                 const isUserActive = staff.user.isActive;
@@ -1678,7 +1678,7 @@ export function AgencySettings() {
                               <p className="text-xs text-muted-foreground max-w-sm mb-4">{t('noBranchesDesc')}</p>
                             </div>
                           ) : (
-                            <div className="space-y-2 max-h-96 overflow-y-auto">
+                            <div className="space-y-2 max-h-[60dvh] md:max-h-96 overflow-y-auto">
                               {branchList.map((branch) => {
                                 const branchLabel = (lang === 'ar' && branch.nameAr) || (lang === 'fr' && branch.nameFr) || branch.name;
                                 const counterCount = branch._count?.counters ?? 0;
@@ -2025,7 +2025,7 @@ export function AgencySettings() {
             animate={{ y: 0, opacity: 1 }}
             exit={{ y: 80, opacity: 0 }}
             transition={{ type: 'spring', stiffness: 300, damping: 25 }}
-            className="fixed bottom-20 inset-x-4 z-40 lg:inset-x-auto lg:start-auto lg:end-6"
+            className="fixed bottom-[calc(5rem+env(safe-area-inset-bottom,0px))] lg:bottom-20 inset-x-4 z-40 lg:inset-x-auto lg:start-auto lg:end-6"
           >
             <div className="flex items-center justify-center gap-2">
               {/* Unsaved changes toast */}
@@ -2051,7 +2051,11 @@ export function AgencySettings() {
         initial={{ y: 40, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
         transition={{ delay: 0.3 }}
-        className="fixed bottom-6 inset-x-4 z-50 lg:inset-x-auto lg:start-auto lg:end-6"
+        // 0.6.51 mobile audit — bottom-6 landed the Save button squarely on
+        // the shell's fixed MobileBottomActionBar (both z-50, Save painted on
+        // top → taps meant for Menu/Logout hit Save). Ride above the bar on
+        // mobile; desktop keeps the original float.
+        className="fixed bottom-[calc(3.5rem+env(safe-area-inset-bottom,0px))] lg:bottom-6 inset-x-4 z-50 lg:inset-x-auto lg:start-auto lg:end-6"
       >
         <div className="max-w-lg mx-auto lg:max-w-none">
           <Button

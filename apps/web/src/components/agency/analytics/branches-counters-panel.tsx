@@ -114,8 +114,12 @@ export function BranchesCountersPanel({
                 <p className="text-sm">{t('noDataYet')}</p>
               </div>
             ) : (
-              <ScrollArea className="h-72 custom-scrollbar">
-                <Table>
+              // 0.6.51 mobile audit — vertical-only ScrollArea compressed the 4
+              // columns on 360px screens (AR headers collided with truncated
+              // names); both-axis scroll + a min table width, same pattern as
+              // the heatmap panel.
+              <div className="h-72 overflow-y-auto overflow-x-auto custom-scrollbar">
+                <Table className="min-w-[420px]">
                   <TableHeader>
                     <TableRow>
                       <TableHead className="text-start h-8 text-[11px]">{t('name')}</TableHead>
@@ -139,7 +143,7 @@ export function BranchesCountersPanel({
                     ))}
                   </TableBody>
                 </Table>
-              </ScrollArea>
+              </div>
             )}
           </TabsContent>
         </CardContent>

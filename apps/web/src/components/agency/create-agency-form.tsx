@@ -1714,8 +1714,14 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
           stuck at step 1" mobile report). Sticky keeps Back/Next on screen
           at every scroll position, on every host (mobile WebView, desktop
           shell, browser). */}
+      {/* 0.6.51 mobile audit — the sticky nav pins to the VIEWPORT bottom,
+          which is exactly where the shell's fixed MobileBottomActionBar
+          (h-14 + safe-area, z-50) sits — Back/Next rendered underneath it
+          and were untappable. Offset the pin by the bar height on mobile;
+          desktop (no bottom bar) keeps the flush pin. z-20 → z-30 keeps the
+          nav above page content. */}
       <div
-        className="sticky bottom-0 z-20 mt-5 pb-[max(env(safe-area-inset-bottom),0.25rem)] pt-2"
+        className="sticky bottom-[calc(3.5rem+env(safe-area-inset-bottom,0px))] lg:bottom-0 z-30 mt-5 pb-[max(env(safe-area-inset-bottom),0.25rem)] pt-2"
         style={{ backgroundColor: 'transparent' }}
       >
         <div className="flex items-center justify-between gap-3 rounded-2xl border bg-background/95 p-2 shadow-lg shadow-black/5 backdrop-blur supports-[backdrop-filter]:bg-background/85">

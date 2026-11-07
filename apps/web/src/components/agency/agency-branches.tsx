@@ -1229,30 +1229,30 @@ export function AgencyBranches() {
           initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.05 }}
-          className="grid grid-cols-3 gap-3"
+          className="grid grid-cols-3 gap-2"
         >
           <div className="rounded-2xl bg-gradient-to-br from-emerald-500 to-emerald-700 p-3 text-white shadow-lg shadow-emerald-500/15">
             <div className="flex items-center gap-1.5 mb-1">
               <Building2 className="h-3.5 w-3.5 text-emerald-200" />
-              <span className="text-[10px] text-emerald-200 font-medium">{t('branches')}</span>
+              <span className="text-[10px] text-emerald-200 font-medium min-w-0 truncate">{t('branches')}</span>
             </div>
-            <p className="text-2xl font-black">{branches.length}</p>
+            <p className="text-xl sm:text-2xl font-black">{branches.length}</p>
           </div>
           <div className="rounded-2xl bg-gradient-to-br from-teal-500 to-teal-700 p-3 text-white shadow-lg shadow-teal-500/15">
             <div className="flex items-center gap-1.5 mb-1">
               <Monitor className="h-3.5 w-3.5 text-teal-200" />
-              <span className="text-[10px] text-teal-200 font-medium">{t('counters')}</span>
+              <span className="text-[10px] text-teal-200 font-medium min-w-0 truncate">{t('counters')}</span>
             </div>
-            <p className="text-2xl font-black">
+            <p className="text-xl sm:text-2xl font-black">
               {branches.reduce((sum, b) => sum + (b._count?.counters || 0), 0)}
             </p>
           </div>
           <div className="rounded-2xl bg-gradient-to-br from-amber-500 to-amber-700 p-3 text-white shadow-lg shadow-amber-500/15">
             <div className="flex items-center gap-1.5 mb-1">
               <Star className="h-3.5 w-3.5 text-amber-200" />
-              <span className="text-[10px] text-amber-200 font-medium">{t('mainBranch')}</span>
+              <span className="text-[10px] text-amber-200 font-medium min-w-0 truncate">{t('mainBranch')}</span>
             </div>
-            <p className="text-2xl font-black">
+            <p className="text-xl sm:text-2xl font-black">
               {branches.filter(b => b.isMain).length}
             </p>
           </div>

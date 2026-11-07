@@ -1,7 +1,9 @@
 import { Hono } from 'hono'
 import { db, dbRaw, Prisma } from '@blasti/db'
 import { requireAuth, requireAdmin, authErrorResponse } from '../lib/auth'
-import { validateBody, adminCreateAgencySchema, adminUserActionSchema, faqSchema, paymentSettingsSchema, createSubscriptionPlanSchema, updateSubscriptionPlanSchema, createHardwareProductSchema, updateHardwareProductSchema, updateHardwareSettingsSchema, updateHardwareCommitmentTierSchema, updateEnterpriseRequestStatusSchema, createEnterprisePlanFromRequestSchema } from '../lib/validations'
+import { validateBody, adminCreateAgencySchema, adminUserActionSchema, faqSchema, paymentSettingsSchema, createSubscriptionPlanSchema, updateSubscriptionPlanSchema, createHardwareProductSchema, updateHardwareProductSchema, updateHardwareSettingsSchema, updateHardwareCommitmentTierSchema, updateEnterpriseRequestStatusSchema, createEnterprisePlanFromRequestSchema, changeUsernameSchema, adminChangePasswordSchema } from '../lib/validations'
+import { hashPassword, verifyPassword } from '../lib/password'
+import { checkRateLimit, RateLimitError, ADMIN_ACCOUNT_CHANGE_RATE_LIMIT } from '../lib/rate-limit'
 import { getTodayStart, getTodayEnd } from '../lib/date-utils'
 import { computeAnalyticsDashboard, DASHBOARD_PERIODS, round1, type AnalyticsDashboardPayload, type DashboardPeriod } from '../lib/analytics-dashboard'
 import {
@@ -36,7 +38,143 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 
 const app = new Hono()
 
-// ─── Agencies ────────────────────────────────────────────────────────────────
+// ─── Admin account self-service (0.6.51 — SECURED) ─────────────────────────
+// PATCH /admin/account/username + PATCH /admin/account/password — the admin
+// can rotate their OWN login identity. Security posture (moved from the
+// generic /user/* routes so the capability is admin-scoped):
+//   • requireAdmin — SUPER_ADMIN sessions only, AND the admin-API platform
+//     gate (an apk/exe client is rejected) is inherited for free.
+//   • Dedicated strict rate limit (5 changes / 15 min / user) in its own
+//     bucket — never shared with generic self-service endpoints.
+//   • The CURRENT password must be re-proved on every change — a stolen
+//     session token alone can neither rename the account nor rotate the
+//     password.
+//   • Every success writes an AuditLog row (username changes record
+//     old→new; passwords NEVER appear in the audit trail).
+//   • Stronger admin password policy: 8+ chars with letter + digit.
+
+/** Best-effort client IP for the audit trail (same header the rate limiter trusts). */
+function auditIp(c: { req: { header: (name: string) => string | undefined } }): string | undefined {
+  return (c.req.header('x-forwarded-for') || '').split(',')[0].trim() || undefined
+}
+
+app.patch('/account/username', async (c) => {
+  try {
+    const admin = await requireAdmin(c)
+
+    checkRateLimit(admin.id, ADMIN_ACCOUNT_CHANGE_RATE_LIMIT)
+
+    const body = await c.req.json()
+    const validation = validateBody(changeUsernameSchema, body)
+    if (validation.error) {
+      return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
+    }
+
+    const { currentPassword, newUsername } = validation.data
+    const nextUsername = newUsername.trim()
+
+    const dbAdmin = await db.user.findUnique({
+      where: { id: admin.id },
+      select: { id: true, username: true, passwordHash: true },
+    })
+    if (!dbAdmin) return c.json({ error: 'User not found' }, 404)
+
+    const isCorrect = !!dbAdmin.passwordHash && verifyPassword(currentPassword, dbAdmin.passwordHash)
+    if (!isCorrect) return c.json({ success: false, error: 'Current password is incorrect' }, 401)
+
+    // No-op rename — succeed without touching the row.
+    if (nextUsername === dbAdmin.username) {
+      return c.json({ success: true, username: dbAdmin.username, unchanged: true })
+    }
+
+    const taken = await db.user.findFirst({
+      where: { username: nextUsername, id: { not: admin.id } },
+      select: { id: true },
+    })
+    if (taken) return c.json({ success: false, error: 'Username already taken' }, 409)
+
+    await db.user.update({ where: { id: admin.id }, data: { username: nextUsername } })
+
+    // Audit trail — old→new name recorded; audit failure never blocks the change.
+    await db.auditLog
+      .create({
+        data: {
+          userId: admin.id,
+          action: 'ADMIN_USERNAME_CHANGED',
+          entityType: 'USER',
+          entityId: admin.id,
+          details: JSON.stringify({ from: dbAdmin.username, to: nextUsername }),
+          ipAddress: auditIp(c),
+        },
+      })
+      .catch(() => {})
+
+    return c.json({ success: true, username: nextUsername })
+  } catch (error: unknown) {
+    if (error instanceof RateLimitError) {
+      return c.json({ success: false, error: error.message, retryAfter: error.retryAfter }, 429)
+    }
+    // Raced uniqueness (another account claimed the name between the
+    // pre-check and the write) — surface as friendly 409, not a raw 500.
+    if ((error as { code?: string })?.code === 'P2002') {
+      return c.json({ success: false, error: 'Username already taken' }, 409)
+    }
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+app.patch('/account/password', async (c) => {
+  try {
+    const admin = await requireAdmin(c)
+
+    checkRateLimit(admin.id, ADMIN_ACCOUNT_CHANGE_RATE_LIMIT)
+
+    const body = await c.req.json()
+    const validation = validateBody(adminChangePasswordSchema, body)
+    if (validation.error) {
+      return c.json({ success: false, error: validation.error.error, details: validation.error.details }, 400)
+    }
+
+    const { currentPassword, newPassword } = validation.data
+
+    const dbAdmin = await db.user.findUnique({
+      where: { id: admin.id },
+      select: { id: true, passwordHash: true },
+    })
+    if (!dbAdmin) return c.json({ error: 'User not found' }, 404)
+
+    const isCorrect = !!dbAdmin.passwordHash && verifyPassword(currentPassword, dbAdmin.passwordHash)
+    if (!isCorrect) return c.json({ success: false, error: 'Current password is incorrect' }, 401)
+
+    const newHash = hashPassword(newPassword)
+    await db.user.update({ where: { id: admin.id }, data: { passwordHash: newHash } })
+
+    // Audit trail — NEVER the password itself, not even a hash.
+    await db.auditLog
+      .create({
+        data: {
+          userId: admin.id,
+          action: 'ADMIN_PASSWORD_CHANGED',
+          entityType: 'USER',
+          entityId: admin.id,
+          details: JSON.stringify({ policy: 'admin-8-plus-letter-digit' }),
+          ipAddress: auditIp(c),
+        },
+      })
+      .catch(() => {})
+
+    return c.json({ success: true })
+  } catch (error: unknown) {
+    if (error instanceof RateLimitError) {
+      return c.json({ success: false, error: error.message, retryAfter: error.retryAfter }, 429)
+    }
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── Agencies ────────────────────────────────────────────────────────────────────
 
 // POST /admin/agencies — Create a new agency
 app.post('/agencies', async (c) => {

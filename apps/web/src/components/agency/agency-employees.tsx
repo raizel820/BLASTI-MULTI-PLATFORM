@@ -548,8 +548,10 @@ export function AgencyEmployees() {
   return (
     <div className="p-4 lg:p-5 space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between gap-3">
-        <div>
+      {/* 0.6.51 mobile audit — flex-wrap + min-w-0: long AR titles squeezed
+          the refresh/Add buttons off-edge on 360px screens. */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
           <h1 className="text-xl lg:text-2xl font-bold text-foreground flex items-center gap-2">
             <Users className="h-6 w-6 text-emerald-600" />
             {t('employeeManagement')}
@@ -680,7 +682,7 @@ export function AgencyEmployees() {
               >
                 <Card className={`border-0 shadow-sm transition-all duration-200 hover:shadow-md ${!emp.isActive ? 'opacity-60' : 'bg-white dark:bg-gray-900/80'}`}>
                   <CardContent className="p-4">
-                    <div className="flex items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-3">
                       {/* Avatar */}
                       <div className={`h-11 w-11 rounded-xl flex items-center justify-center flex-shrink-0 ${
                         emp.isActive
@@ -711,8 +713,9 @@ export function AgencyEmployees() {
                         </div>
                       </div>
 
-                      {/* Actions */}
-                      <div className="flex items-center gap-1 flex-shrink-0">
+                      {/* Actions — 0.6.51: wrap instead of squeezing the info
+                          column to nothing on narrow phones */}
+                      <div className="flex items-center gap-1 flex-shrink-0 flex-wrap">
                         {/* Toggle Active */}
                         {emp.role !== 'AGENCY_OWNER' && (
                           <Button

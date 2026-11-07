@@ -913,7 +913,10 @@ export function AgencyDashboard() {
   };
 
   return (
-    <div className="p-4 lg:p-6 space-y-6 max-w-7xl mx-auto relative" ref={sectionRef}>
+    // 0.6.51 mobile audit — the floating batch action bar (fixed bottom-20,
+    // see below) overlays the last section on <lg screens; the page needs its
+    // own bottom clearance. Desktop keeps the original spacing.
+    <div className="p-4 lg:p-6 pb-28 lg:pb-6 space-y-6 max-w-7xl mx-auto relative" ref={sectionRef}>
       {/* Gradient top border */}
       <div className="absolute top-0 start-0 end-0 h-[3px] bg-gradient-to-r from-emerald-500 via-teal-400 to-emerald-500 rounded-full" />
 
@@ -1498,7 +1501,7 @@ export function AgencyDashboard() {
                 description={t('noQueueHint')}
               />
             ) : (
-              <div className="space-y-2 max-h-80 overflow-y-auto custom-scrollbar">
+              <div className="space-y-2 max-h-[60dvh] md:max-h-80 overflow-y-auto custom-scrollbar">
                 {waitingList.map((entry, idx) => (
                   <motion.div
                     key={entry.id}

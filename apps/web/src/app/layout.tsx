@@ -42,6 +42,11 @@ export const metadata: Metadata = {
 // the brand emerald; the full manifest lives in app/manifest.ts.
 export const viewport: Viewport = {
   themeColor: "#059669",
+  // 0.6.51 mobile audit — without viewport-fit=cover every env(safe-area-*)
+  // value in the app (bottom bar, PlatformFrame top pad, sticky header)
+  // resolves to 0 on notched iPhones in browsers → bars land under the home
+  // indicator / status bar.
+  viewportFit: "cover",
 };
 
 export default function RootLayout({

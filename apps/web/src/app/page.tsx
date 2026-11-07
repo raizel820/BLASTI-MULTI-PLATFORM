@@ -940,7 +940,7 @@ export default function Home() {
   // but the Home component itself reads the store directly.
   if (!mounted) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
+      <div className="min-h-dvh flex items-center justify-center bg-background">
         <BlastiSkeleton />
       </div>
     );
@@ -1040,19 +1040,28 @@ export default function Home() {
 
   return (
     <PlatformFrame>
-    <div className="min-h-screen flex bg-gray-50 dark:bg-gray-950" dir={isRTL(lang) ? 'rtl' : 'ltr'}>
+    <div className="min-h-dvh flex bg-gray-50 dark:bg-gray-950" dir={isRTL(lang) ? 'rtl' : 'ltr'}>
       {/* Sidebar for agency/admin — adaptive to platform */}
       {isAgency && <AdaptiveAgencySidebar open={sidebarOpen} onClose={toggleSidebar} />}
       {isAdmin && <AdaptiveAdminSidebar open={sidebarOpen} onClose={toggleSidebar} />}
 
       {/* Main Content */}
-      <main className={`flex-1 min-w-0 ${isAgency || isAdmin ? 'lg:ms-64' : ''}`}>
+      {/* 0.6.51 mobile audit — on phone browsers (platform.isMobile) the agency
+          shell renders a FIXED bottom action bar (h-14 + safe-area, see
+          AdaptiveAgencySidebar). Without a compensating padding the bar
+          overlays the last section of EVERY agency page — exactly the
+          "bottom components missing / can't scroll down" field report. The
+          padding stays at ALL widths for isMobile (Android tablets still
+          draw the bar past md/lg) and only applies on the mobile platform —
+          desktop browsers have no bottom bar and no padding. */}
+      <main className={`flex-1 min-w-0 ${isAgency || isAdmin ? 'lg:ms-64' : ''} ${platform.isMobile ? 'pb-[calc(3.5rem+env(safe-area-inset-bottom,0px))]' : ''}`}>
         {/* Connection status banner — shows when offline */}
         <ConnectionStatus />
 
         {/* Top bar for agency/admin */}
+        {/* 0.6.51 — sticky offset respects the notch safe area (viewport-fit=cover) */}
         {(isAgency || isAdmin) && (
-          <header className="sticky top-0 z-30 h-16 bg-white/80 dark:bg-gray-950/80 backdrop-blur-xl border-b border-border flex items-center justify-between px-4 overflow-x-clip">
+          <header className="sticky top-[env(safe-area-inset-top,0px)] z-30 h-16 bg-white/80 dark:bg-gray-950/80 backdrop-blur-xl border-b border-border flex items-center justify-between px-4 overflow-x-clip">
             <Button variant="ghost" size="icon" className="lg:hidden h-10 w-10 flex-shrink-0" onClick={toggleSidebar}>
               <Menu className="h-5 w-5" />
             </Button>

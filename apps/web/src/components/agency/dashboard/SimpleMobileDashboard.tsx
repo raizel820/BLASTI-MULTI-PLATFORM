@@ -505,7 +505,7 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
   // ─── Loading State ───────────────────────────────────────────────────
   if (loading) {
     return (
-      <div className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 flex items-center justify-center">
+      <div className="min-h-dvh bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 flex items-center justify-center">
         <div className="flex flex-col items-center gap-4">
           <Loader2 className="h-12 w-12 text-emerald-500 animate-spin" />
           <p className="text-emerald-400/70 text-sm font-medium">
@@ -554,7 +554,16 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
   const isRTL = lang === 'ar';
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 flex flex-col safe-area-inset">
+    // 0.6.51 mobile audit — min-h-screen (100vh) on phone browsers equals the
+    // LARGE viewport, so the bottom of this flex column (Pause/Resume + "Last
+    // updated") landed behind the address bar / the shell's fixed bottom bar —
+    // the exact "page missing bottom components, can't scroll down" report.
+    // min-h-dvh tracks the real visible viewport (same fix the loading branch
+    // and the create-agency branch above already document). The dead
+    // `safe-area-inset` utility class (never defined in globals.css) is
+    // dropped; safe areas are handled by PlatformFrame (top) and the shell's
+    // main padding (bottom).
+    <div className="min-h-dvh bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 flex flex-col">
       {/* ─── Top Bar ─────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between px-4 pt-4 pb-2">
         {/* Connection Status */}

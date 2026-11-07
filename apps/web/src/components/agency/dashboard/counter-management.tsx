@@ -330,7 +330,9 @@ export function CounterManagement({
               </Button>
             </div>
           )}
-          <div className="space-y-2.5 max-h-96 overflow-y-auto custom-scrollbar">
+          {/* 0.6.51 mobile audit — dvh-relative cap: rows clipped mid-card at
+              the fixed 24rem boundary on short viewports. */}
+          <div className="space-y-2.5 max-h-[60dvh] md:max-h-96 overflow-y-auto custom-scrollbar">
             {loadingCounters && counters.length === 0 ? (
               <p className="text-xs text-muted-foreground py-4 text-center">{t('loading' as any) || '...'}</p>
             ) : counters.length === 0 ? (

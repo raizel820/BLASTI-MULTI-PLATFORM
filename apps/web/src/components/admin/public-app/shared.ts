@@ -306,3 +306,68 @@ export function isActiveInstaller(file: InstallerDiskFile): boolean {
   if (v.fileSize != null && file.size != null && v.fileSize !== file.size) return false;
   return true;
 }
+
+// ─── 0.6.50 — Installers-tab view helpers (delta filter + sorting) ─────────
+
+/**
+ * Delta-update SUPPORT artifacts: delta patches (`kind: 'delta'`) plus the
+ * differential-download companions classified as release references
+ * (`kind: 'ref'` — *.blockmap, asar/outref snapshots). These power the
+ * updater's delta chain; they are never installable and the admin usually
+ * wants them out of the installers view.
+ */
+export function isDeltaRelated(file: InstallerDiskFile): boolean {
+  return file.kind === 'delta' || file.kind === 'ref';
+}
+
+/** The artifact's own version (server-parsed or the linked AppVersion row). */
+export function fileVersionOf(file: InstallerDiskFile): string {
+  return file.parsed?.version || file.version?.version || '';
+}
+
+/** Numeric semver compare of "X.Y.Z" strings (missing parts count as 0). */
+export function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = b.split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+export type InstallerSortKey = 'time' | 'name' | 'size' | 'version';
+export type InstallerSortDir = 'asc' | 'desc';
+
+/**
+ * Row comparator for the Installers tab (0.6.50 sort control). Ties and
+ * version-less files fall back to push time so the order stays stable and
+ * meaningful; version-less rows always sort AFTER versioned ones regardless
+ * of direction.
+ */
+export function compareDiskFiles(
+  key: InstallerSortKey,
+  dir: InstallerSortDir,
+): (a: InstallerDiskFile, b: InstallerDiskFile) => number {
+  const sign = dir === 'asc' ? 1 : -1;
+  return (a, b) => {
+    switch (key) {
+      case 'name':
+        return sign * a.name.localeCompare(b.name, undefined, { numeric: true });
+      case 'size':
+        return sign * ((a.size || 0) - (b.size || 0));
+      case 'version': {
+        const va = fileVersionOf(a);
+        const vb = fileVersionOf(b);
+        if (!va && !vb) return sign * (a.mtimeMs - b.mtimeMs);
+        if (!va) return 1; // version-less rows last in BOTH directions
+        if (!vb) return -1;
+        const d = compareSemver(va, vb);
+        return d !== 0 ? sign * d : sign * (a.mtimeMs - b.mtimeMs);
+      }
+      case 'time':
+      default:
+        return sign * (a.mtimeMs - b.mtimeMs);
+    }
+  };
+}

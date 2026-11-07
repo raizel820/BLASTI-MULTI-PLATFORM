@@ -484,7 +484,7 @@ export function AgencyFullscreenHistory() {
   return (
     <div
       dir={rtl ? 'rtl' : 'ltr'}
-      className="h-screen w-screen flex flex-col overflow-hidden bg-gray-950 text-white"
+      className="h-dvh w-full flex flex-col overflow-hidden bg-gray-950 text-white"
     >
       {/* ─── Header ──────────────────────────────────────────────────── */}
       <header className="flex items-center justify-between border-b border-gray-800 bg-gray-950 px-4 py-2.5 shrink-0">

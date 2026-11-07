@@ -1,7 +1,7 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useAgencyAuthority, canAccessAgencySection, type AgencySectionView } from '@/hooks/use-agency-authority';
@@ -137,6 +137,31 @@ function MobileBottomActionBar({ onMenuOpen, onLogout, t }: { onMenuOpen: () => 
 
 // ─── Agency Sidebar ───────────────────────────────────────────────────────────
 
+/**
+ * 0.6.51 mobile audit — shared drawer chrome for the web/tablet overlay
+ * drawers (framer-motion path) and the Capacitor Sheet path:
+ *   • body scroll-lock while the drawer is open — the page behind the
+ *     overlay used to scroll on touch drag (no lock on the motion.aside
+ *     path; Radix locks it only inside the Sheet).
+ *   • Escape closes the drawer (parity with Radix Sheet/Dialog behavior).
+ */
+function useDrawerChrome(open: boolean, onClose: () => void): void {
+  useEffect(() => {
+    if (!open) return;
+    // Scroll-lock: remember the previous value so nested locks can't fight.
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = prev;
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [open, onClose]);
+}
+
 export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { currentView, setView, logout, user } = useAppStore();
   // Avatar with retry + native-fetch fallback (mobile placeholder fix).
@@ -159,6 +184,9 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
   const [cpConfirmPwd, setCpConfirmPwd] = useState('');
   const [cpLoading, setCpLoading] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+
+  // 0.6.51 — body scroll-lock + Escape-to-close while any drawer is open.
+  useDrawerChrome(open, onClose);
 
   const handleChangePassword = async () => {
     if (!cpCurrentPwd || !cpNewPwd || !cpConfirmPwd) {
@@ -398,7 +426,10 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
         <Sheet open={open} onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
           <SheetContent
             side={isRTL(user?.language ?? 'ar') ? 'right' : 'left'}
-            className="w-72 p-0"
+            // 0.6.51 — suppress the built-in top-corner Close: the sidebar
+            // header already renders its own X (and in RTL the built-in one
+            // landed on the logo block).
+            className="w-72 p-0 [&>button]:hidden"
           >
             <SheetHeader className="sr-only">
               <SheetTitle>Navigation</SheetTitle>
@@ -437,7 +468,7 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
               animate={{ x: 0 }}
               exit={{ x: isRTL(user?.language ?? 'ar') ? '100%' : '-100%' }}
               transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-              className="fixed inset-y-0 z-50 w-72 bg-white/90 dark:bg-gray-950/90 backdrop-blur-xl border-e border-border lg:hidden shadow-xl"
+              className="fixed inset-y-0 start-0 z-50 w-72 bg-white/90 dark:bg-gray-950/90 backdrop-blur-xl border-e border-border lg:hidden shadow-xl"
             >
               {sidebar}
             </motion.aside>
@@ -556,6 +587,9 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
   const { src: avatarSrc, handleError: onAvatarError } = useAvatarSrc(user?.avatarUrl);
   const { t } = useLanguage();
   const { platform, capabilities } = usePlatform();
+
+  // 0.6.51 — body scroll-lock + Escape-to-close while any drawer is open.
+  useDrawerChrome(open, onClose);
 
   const navItems: SidebarNavItem[] = [
     { view: 'admin-dashboard', icon: LayoutDashboard, label: t('dashboard') },
@@ -757,7 +791,10 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
         <Sheet open={open} onOpenChange={(isOpen) => { if (!isOpen) onClose(); }}>
           <SheetContent
             side={isRTL(user?.language ?? 'ar') ? 'right' : 'left'}
-            className="w-72 p-0"
+            // 0.6.51 — suppress the built-in top-corner Close: the sidebar
+            // header already renders its own X (and in RTL the built-in one
+            // landed on the logo block).
+            className="w-72 p-0 [&>button]:hidden"
           >
             <SheetHeader className="sr-only">
               <SheetTitle>Navigation</SheetTitle>
@@ -792,7 +829,7 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
               animate={{ x: 0 }}
               exit={{ x: isRTL(user?.language ?? 'ar') ? '100%' : '-100%' }}
               transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-              className="fixed inset-y-0 z-50 w-72 bg-white/90 dark:bg-gray-950/90 backdrop-blur-xl border-e border-border lg:hidden shadow-xl"
+              className="fixed inset-y-0 start-0 z-50 w-72 bg-white/90 dark:bg-gray-950/90 backdrop-blur-xl border-e border-border lg:hidden shadow-xl"
             >
               {sidebar}
             </motion.aside>

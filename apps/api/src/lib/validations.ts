@@ -117,6 +117,29 @@ export const changePasswordSchema = z.object({
   newPassword: z.string().min(6, 'New password must be at least 6 characters').max(128),
 })
 
+// 0.6.50 — admin account self-service: change the LOGIN username.
+// Rules mirror registerSchema.username (3–30 chars) so no account can end up
+// with a username the register/login validators would reject. The current
+// password is mandatory — a hijacked session must not be able to rename the
+// account without knowing the secret.
+export const changeUsernameSchema = z.object({
+  currentPassword: z.string().min(1, 'Current password is required'),
+  newUsername: z.string().min(3, 'Username must be at least 3 characters').max(30),
+})
+
+// 0.6.51 — ADMIN-scoped password policy: longer than the customer minimum
+// (8+ vs 6) and must mix letters with digits. Applied only on the admin
+// account route — existing customer/agency accounts keep the 6-char rule.
+export const adminChangePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Current password is required'),
+  newPassword: z
+    .string()
+    .min(8, 'Admin password must be at least 8 characters')
+    .max(128, 'Password is too long')
+    .regex(/[A-Za-z]/, 'Admin password must contain at least one letter')
+    .regex(/\d/, 'Admin password must contain at least one digit'),
+})
+
 export const forgotPasswordSchema = z.object({
   username: z.string().min(1, 'Username is required'),
 })

@@ -210,6 +210,20 @@ app.patch('/change-password', async (c) => {
     const newHash = hashPassword(newPassword)
     await db.user.update({ where: { id: user.id }, data: { passwordHash: newHash } })
 
+    // 0.6.51 — audit trail on every self-service password rotation (the
+    // password itself NEVER lands here). Best-effort: audit failure must not
+    // block the change.
+    await db.auditLog
+      .create({
+        data: {
+          userId: user.id,
+          action: 'PASSWORD_CHANGED',
+          entityType: 'USER',
+          entityId: user.id,
+        },
+      })
+      .catch(() => {})
+
     return c.json({ success: true })
   } catch (error: unknown) {
     if (error instanceof RateLimitError) {

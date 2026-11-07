@@ -102,8 +102,12 @@ export function PlatformFrame({ children }: { children: React.ReactNode }) {
   // Mobile (Capacitor): Add safe area insets padding (notch handling)
   if (platform.isMobile) {
     return (
+      // 0.6.51 mobile audit — h-screen (100vh) on phone BROWSERS equals the
+      // LARGE viewport: the bottom of the frame (and anything pinned to it)
+      // lands behind the address bar until the user scrolls. min-h-dvh tracks
+      // the real visible viewport; the page still grows and scrolls normally.
       <div
-        className="flex flex-col h-screen"
+        className="flex flex-col min-h-dvh"
         style={{ paddingTop: 'env(safe-area-inset-top, 0px)' }}
       >
         {children}

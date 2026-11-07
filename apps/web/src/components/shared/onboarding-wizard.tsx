@@ -96,7 +96,10 @@ export function OnboardingWizard({ open, user, onComplete, onSkip }: OnboardingP
 
   return (
     <Dialog open={open} onOpenChange={(v) => { if (!v) onSkip(); }}>
-      <DialogContent className="sm:max-w-[480px] p-0 gap-0 overflow-hidden border-0 bg-white dark:bg-gray-950">
+      {/* 0.6.51 mobile audit — overflow-hidden had no inner scroll region: a
+          tall step clipped mid-element with no way down. Scroll the content
+          (x-hidden keeps the step slide animation contained) within a dvh cap. */}
+      <DialogContent className="sm:max-w-[480px] p-0 gap-0 max-h-[90dvh] overflow-x-hidden overflow-y-auto border-0 bg-white dark:bg-gray-950 custom-scrollbar">
         <DialogHeader className="sr-only">
           <DialogTitle>{t(welcomeTitleKey)}</DialogTitle>
           <DialogDescription>{t(setupDescKey)}</DialogDescription>
