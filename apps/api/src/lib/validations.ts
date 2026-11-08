@@ -252,6 +252,17 @@ export const updateAgencyProfileSchema = z.object({
   postalCode: z.string().max(20).nullable().optional(),
   locationVerified: z.enum(['VERIFIED', 'UNVERIFIED', 'MANUAL']).nullable().optional(),
   locationSource: z.enum(['GOOGLE', 'OPENFREEMAP', 'MANUAL', 'DEVICE_GPS']).nullable().optional(),
+  // ── Billing / legal identity (NOT public — invoices only) ──
+  // Nullable + optional to follow the spread-the-GET-response pattern; these
+  // fields are never returned by public agency endpoints and only appear on
+  // the authenticated profile GET + invoice documents.
+  legalNif: z.string().max(60).nullable().optional(),
+  legalNis: z.string().max(60).nullable().optional(),
+  legalRib: z.string().max(80).nullable().optional(),
+  legalRc: z.string().max(60).nullable().optional(),
+  legalServicePhone: z.string().max(200).nullable().optional(),
+  legalName: z.string().max(120).nullable().optional(),
+  legalAddress: z.string().max(300).nullable().optional(),
 })
 
 export const updateAgencySettingsSchema = z.object({

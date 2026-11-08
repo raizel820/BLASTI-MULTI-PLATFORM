@@ -8,7 +8,7 @@ import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useUpload } from '@/hooks/use-upload';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
@@ -98,9 +98,16 @@ import {
   Lock,
   Zap,
   Smartphone,
+  ReceiptText,
+  ScanLine,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
+// v0.6.53 — billing/invoice surfaces: the panel auto-scopes via
+// GET /api/billing/invoices (agency owner/staff → own agency) and the
+// scanner dialog verifies any BLASTI document QR (marks it checked).
+import { InvoicesPanel } from '@/components/shared/billing/invoices-panel';
+import { InvoiceQrScannerDialog } from '@/components/shared/billing/invoice-qr-scanner-dialog';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 // These mirror the Phase-2 SubscriptionPlan / PlanFeature models in
@@ -2715,6 +2722,9 @@ export function AgencySubscription() {
   const [paymentHistory, setPaymentHistory] = useState<Transaction[] | null>(null);
   const [paymentHistoryFailed, setPaymentHistoryFailed] = useState(false);
 
+  // v0.6.53 — invoice QR scanner dialog (verify any BLASTI document).
+  const [scannerOpen, setScannerOpen] = useState(false);
+
   // ─── New state for the rewrite ────────────────────────────────────────────
   // `showPlansList` toggles the plans grid open when an ACTIVE subscriber
   // clicks Upgrade / Downgrade (or the "View Plans" affordance).
@@ -4506,6 +4516,34 @@ export function AgencySubscription() {
         </Card>
       </motion.div>
 
+      {/* ─── Billing invoices (v0.6.53) ─── */}
+      {/* Official invoices/receipts issued for this agency (GET
+          /api/billing/invoices auto-scopes). Sits right next to the payment
+          history so subscription billing has one coherent surface; the QR
+          scanner verifies any BLASTI document (marks it checked). */}
+      <motion.div
+        initial={{ opacity: 0, y: 15 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.32 }}
+      >
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:shadow-gray-900/50">
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base sm:text-lg">
+              <ReceiptText className="h-5 w-5 text-teal-600" />
+              {t('billingInvoicesForAgency')}
+            </CardTitle>
+            <CardDescription className="text-xs sm:text-sm">{t('billingInvoicesSubtitle')}</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button variant="outline" className="min-h-[44px] mb-3" onClick={() => setScannerOpen(true)}>
+              <ScanLine className="h-4 w-4 me-2" />
+              {t('billingScanQr')}
+            </Button>
+            <InvoicesPanel title="" />
+          </CardContent>
+        </Card>
+      </motion.div>
+
       {/* ─── Payment Dialog (with optional hardware picker) ─── */}
       <PaymentDialog
         open={showPaymentDialog}
@@ -4515,6 +4553,10 @@ export function AgencySubscription() {
         hardware={hardwareProp}
         chargilyEnabled={chargilyEnabled}
       />
+
+      {/* ─── Invoice QR scanner dialog (v0.6.53) — rendered at the component
+          root, outside the nested cards. ─── */}
+      <InvoiceQrScannerDialog open={scannerOpen} onOpenChange={setScannerOpen} />
 
       {/* ─── Pay Now Dialog (Chargily checkout for a pending UPFRONT hardware order) ─── */}
       <Dialog

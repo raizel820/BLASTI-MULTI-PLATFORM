@@ -5,7 +5,7 @@
 // transactions by status and by payment method.
 
 import { useLanguage } from '@/hooks/use-language';
-import { Banknote, CircleCheckBig, Clock3, CreditCard, Receipt, TrendingUp, XCircle } from 'lucide-react';
+import { Banknote, CircleCheckBig, Clock3, CreditCard, Receipt, ReceiptText, ShieldCheck, TrendingUp, XCircle } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { humanizeEnum, translatePaymentMethod } from '@/lib/enum-i18n';
 import {
@@ -20,6 +20,21 @@ import {
 import { useAdminSectionData, type AdminSectionQuery } from './use-admin-section-data';
 import { ak } from './i18n-keys';
 import type { AdminPaymentsData } from './section-types';
+
+// ─── v0.6.53 — billing/invoice KPI block ─────────────────────────────────
+// GET /api/admin/analytics/payments now ALSO returns a `data.billing` block
+// (new invoice system). Declared locally as an optional intersection so the
+// section type stays untouched and payloads cached before the field existed
+// render without crashing (guarded render below).
+interface PaymentsBillingKpis {
+  invoicesIssued: number;
+  invoicedAmount: number;
+  currency: string;
+  cancelledInvoices: number;
+  qrVerifications: number;
+  byType: Record<string, number>;
+}
+type AdminPaymentsDataWithBilling = AdminPaymentsData & { billing?: PaymentsBillingKpis };
 
 export function PaymentsSection({ query, customHint }: { query: AdminSectionQuery; customHint: string }) {
   const { t, lang } = useLanguage();
@@ -37,6 +52,8 @@ export function PaymentsSection({ query, customHint }: { query: AdminSectionQuer
   const safe = (v: unknown): number => (Number.isFinite(v as number) ? (v as number) : 0);
   const totals = data.totals;
   const currency = totals.currency || 'DZD';
+  // v0.6.53 — optional billing block; undefined on old cached payloads.
+  const billing = (data as AdminPaymentsDataWithBilling).billing;
 
   const trendData = (data.revenueTimeseries ?? []).map((p) => ({ bucket: p.bucket, revenue: safe(p.revenue) }));
   const hasTrend = trendData.some((p) => p.revenue > 0);
@@ -99,6 +116,34 @@ export function PaymentsSection({ query, customHint }: { query: AdminSectionQuer
           },
         ]}
       />
+
+      {/* ─── v0.6.53 — billing KPI tiles (new invoice system) ───
+          Rendered only when the payload carries the billing block, so old
+          cached responses never crash this section. */}
+      {billing ? (
+        <StatTiles
+          items={[
+            {
+              icon: ReceiptText,
+              iconClass: 'bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-400',
+              label: t('billingStatsIssued'),
+              value: safe(billing.invoicesIssued),
+            },
+            {
+              icon: Banknote,
+              iconClass: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+              label: `${t('billingStatsInvoiced')} (${billing.currency || currency})`,
+              text: `${safe(billing.invoicedAmount).toLocaleString()} ${billing.currency || currency}`,
+            },
+            {
+              icon: ShieldCheck,
+              iconClass: 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400',
+              label: t('billingStatsVerified'),
+              value: safe(billing.qrVerifications),
+            },
+          ]}
+        />
+      ) : null}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2 min-w-0">

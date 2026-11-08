@@ -79,6 +79,7 @@ model User {
   supportTickets          SupportTicket[]
   reservations            Reservation[]
   smsPurchases            SmsPurchase[]
+  invoices                Invoice[]
   managedTransactions     Transaction[]  @relation("ReviewedBy")
   reviews                 Review[]
   devices                 DeviceRegistration[]
@@ -306,6 +307,27 @@ model Agency {
   /// list / join table) so it syncs byte-exact through the v2 offline engine
   /// and mirrors 1:1 into the desktop SQLite column. Null/"[]" = no filter.
   specialtyIds          String?
+
+  // ── Billing / legal identity (NOT public) ─────────────────────────────
+  // These fields are the agency's legal information used exclusively on
+  // invoices/receipts issued for its payments. They are NEVER exposed by
+  // public agency endpoints (directory, profile listing) — only via the
+  // authenticated agency settings/profile endpoints and invoice documents.
+  /// NIF — رقم التعريف الجبائي (tax identification number)
+  legalNif             String?
+  /// NIS — رقم التعريف الإحصائي (statistical identification number)
+  legalNis             String?
+  /// RIB / RIP — رقم الحساب البريدي أو الحساب البنكي
+  legalRib             String?
+  /// RC number or auto-entrepreneur registration (رقم المقاول الذاتي)
+  legalRc              String?
+  /// Customer service phone number(s) shown on invoices (CSV for multiple)
+  legalServicePhone    String?
+  /// Legal trade name override shown on invoices (falls back to agency name)
+  legalName            String?
+  /// Legal address override shown on invoices (falls back to agency address)
+  legalAddress         String?
+
   createdAt             DateTime        @default(now())
   updatedAt             DateTime        @updatedAt
   ownerId               String
@@ -319,6 +341,7 @@ model Agency {
   reservations          Reservation[]
   services              Service[]
   transactions          Transaction[]
+  invoices              Invoice[]
   reviews               Review[]
   subscriptionPlan      SubscriptionPlan? @relation(fields: [subscriptionPlanId], references: [id])
   devices               AgencyDevice[]
@@ -726,6 +749,98 @@ model SmsPurchase {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt @default(now())
   user          User     @relation(fields: [userId], references: [id])
+}
+
+// ── Billing / Invoicing ────────────────────────────────────────────────────
+
+/// Invoice — legal invoice/receipt issued for a settled payment.
+///
+/// The PDF is NEVER stored or generated server-side: the invoice RECORD is
+/// created at settlement time (atomic per-year sequence) and the PDF is
+/// rendered on-demand on the user's device (Electron printToPDF / browser
+/// print / Capacitor share) from the transaction info returned by the API.
+///
+/// Numbering: `number` is a per-year sequence (1-based) rendered zero-padded
+/// as `0003/2026`. `@@unique([year, number])` guarantees a number can never
+/// be reused within the same year.
+///
+/// Verification: `verificationToken` is a 256-bit random capability token
+/// embedded in the invoice QR code. Scanning it (agency/customer/admin app
+/// scanner or the public web link) hits POST /api/billing/invoices/verify,
+/// which returns the invoice summary and marks the invoice "checked"
+/// (verificationCount/lastVerifiedAt + an InvoiceVerification audit row).
+model Invoice {
+  id                 String    @id @default(cuid())
+  /// Per-year sequence number (1-based) — displayed zero-padded with `year`.
+  number             Int
+  /// 4-digit year the sequence belongs to (e.g. 2026).
+  year               Int
+  /// SUBSCRIPTION | SMS | HARDWARE — mirrors the settled payment source.
+  sourceType         String
+  /// Transaction.id or SmsPurchase.id — one invoice per settled payment.
+  sourceId           String    @unique
+  /// Owning agency (null for customer SMS purchases).
+  agencyId           String?
+  /// Buyer user id (agency owner for subscriptions, customer for SMS packs).
+  userId             String
+  /// AGENCY | CUSTOMER — recipient kind used to pick the invoice layout copy.
+  recipientType      String    @default("AGENCY")
+  /// Snapshot: buyer display name at issuance.
+  recipientName      String
+  /// Snapshot: JSON of the Blasti (issuer) legal info at issuance.
+  issuerSnapshot     String    @default("{}")
+  /// Snapshot: JSON of the recipient (agency/customer) legal info at issuance.
+  recipientSnapshot  String    @default("{}")
+  /// Snapshot: JSON with the full transaction detail (tier, price, period,
+  /// starts/expires, payment method, provider/chargily reference, quantity…).
+  detailsSnapshot    String    @default("{}")
+  amount             Int
+  currency           String    @default("DZD")
+  /// ISSUED | CANCELLED
+  status             String    @default("ISSUED")
+  /// 256-bit random capability token embedded in the verification QR.
+  verificationToken  String    @unique
+  /// How many times the QR verification endpoint returned "valid".
+  verificationCount  Int       @default(0)
+  /// Last successful QR verification time.
+  lastVerifiedAt     DateTime?
+  /// How the invoice was created: AUTO (settlement) or ADMIN (manual issue).
+  issuedBy           String    @default("AUTO")
+  issuedAt           DateTime  @default(now())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  agency             Agency?   @relation(fields: [agencyId], references: [id])
+  user               User      @relation(fields: [userId], references: [id])
+  verifications      InvoiceVerification[]
+
+  @@unique([year, number])
+  @@index([agencyId])
+  @@index([userId])
+  @@index([year, sourceType])
+}
+
+/// Per-year invoice sequence counter. Rows are created inside the same
+/// SQLite write transaction as the invoice itself, so concurrent settlements
+/// can never receive the same number.
+model InvoiceCounter {
+  year       Int   @id
+  lastNumber Int   @default(0)
+}
+
+/// Audit trail of QR verifications — who checked the invoice and when.
+/// verifierRole is PUBLIC for unauthenticated link scans, otherwise the
+/// session user's role (SUPER_ADMIN | AGENCY_OWNER | AGENCY_STAFF | CUSTOMER…).
+model InvoiceVerification {
+  id           String   @id @default(cuid())
+  invoiceId    String
+  verifierRole String   @default("PUBLIC")
+  verifierId   String?
+  /// IP captured for basic fraud tracing (best-effort).
+  ip           String?
+  verifiedAt   DateTime @default(now())
+  invoice      Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId, verifiedAt])
 }
 
 model Notification {

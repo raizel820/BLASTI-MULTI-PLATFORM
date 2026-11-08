@@ -282,6 +282,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
    */
   getPrinters: () => ipcRenderer.invoke('get-printers'),
 
+  // ─── Invoice / Receipt PDF (native, on-device) ──────────────────────────
+
+  /**
+   * Render the standalone invoice HTML (built by the web app, invoice-html.ts)
+   * with Chromium's native printToPDF engine and save it to disk via the
+   * system save dialog. A4, printBackground on. Nothing is stored server-side.
+   * @param {string} html — full standalone HTML document
+   * @param {string} suggestedName — e.g. 'BLASTI-0003-2026.pdf'
+   * @returns {Promise<{ ok: boolean, path?: string, canceled?: boolean, error?: string }>}
+   */
+  saveInvoicePdf: (html, suggestedName) => ipcRenderer.invoke('invoice:save-pdf', { html, suggestedName }),
+
   // ─── Offline Retry ──────────────────────────────────────────────────────────
 
   /**

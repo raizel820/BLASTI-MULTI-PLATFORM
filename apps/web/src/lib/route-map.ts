@@ -45,6 +45,12 @@ export const viewToUrl: Record<ViewName, string> = {
   'agency-fullscreen-history': '/agency/fullscreen/history',
   'admin-dashboard': '/admin',
   'admin-transactions': '/admin/transactions',
+  // Task 5 (0.6.53): Billing Manager — merged transactions/invoices/legal view.
+  // Role guard inherited from the `admin-` prefix branch in
+  // getAllowedRolesForView (SUPER_ADMIN only).
+  'admin-billing-manager': '/admin/billing',
+  // Billing 0.6.53 — public verify landing (hash-only, no filesystem route).
+  'invoice-verify': '/invoice/verify',
   // Task 5-a: Agencies Management group. The role guard for all three is
   // inherited from the `admin-` prefix branch in getAllowedRolesForView
   // (SUPER_ADMIN only), same as every other admin view.

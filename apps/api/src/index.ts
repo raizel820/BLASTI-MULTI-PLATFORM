@@ -76,6 +76,7 @@ import { cronRoutes } from './routes/cron'
 import { deviceRoutes } from './routes/devices'
 import { favoriteRoutes } from './routes/favorites'
 import { paymentSettingsRoutes } from './routes/payment-settings'
+import { billingRoutes } from './routes/billing'
 import { qrRoutes } from './routes/qr'
 import { transactionRoutes } from './routes/transactions'
 import { uploadRoutes } from './routes/upload'
@@ -710,6 +711,7 @@ app.route('/api/cron', cronRoutes)
 app.route('/api/devices', deviceRoutes)
 app.route('/api/favorites', favoriteRoutes)
 app.route('/api/payment-settings', paymentSettingsRoutes)
+app.route('/api/billing', billingRoutes)
 app.route('/api/qr', qrRoutes)
 app.route('/api/transactions', transactionRoutes)
 app.route('/api/upload', uploadRoutes)

@@ -2982,6 +2982,21 @@ app.get('/analytics/payments', async (c) => {
       ? await db.subscriptionPlan.findUnique({ where: { id: agency.subscriptionPlanId }, select: { name: true, displayName: true, price: true, billingCycle: true } })
       : null
 
+    // ── Billing analyzer upgrade: invoice KPIs for this agency (documents
+    // issued for its settled subscription payments, QR-verified count).
+    const [invoiceRows, invoiceVerifyCount] = await Promise.all([
+      db.invoice.findMany({
+        where: { agencyId, issuedAt: { gte: start, lte: end } },
+        select: { amount: true, currency: true, status: true, sourceType: true, verificationCount: true },
+      }),
+      db.invoiceVerification.count({
+        where: { verifiedAt: { gte: start, lte: end }, invoice: { agencyId } },
+      }),
+    ])
+    const invoicedAmount = invoiceRows
+      .filter((i) => i.status === 'ISSUED')
+      .reduce((sum, i) => sum + i.amount, 0)
+
     return c.json({
       success: true,
       data: {
@@ -3006,6 +3021,14 @@ app.get('/analytics/payments', async (c) => {
         byStatus,
         byPaymentMethod: byMethod,
         paymentTimeseries: Array.from(bucketValues.entries()).map(([bucket, value]) => ({ bucket, value })),
+        // Billing manager / invoice KPIs (new canonical document source)
+        billing: {
+          invoicesIssued: invoiceRows.length,
+          invoicedAmount,
+          currency: invoiceRows[0]?.currency ?? currency ?? 'DZD',
+          cancelledInvoices: invoiceRows.filter((i) => i.status === 'CANCELLED').length,
+          qrVerifications: invoiceVerifyCount,
+        },
       },
     })
   } catch (error) {
@@ -3145,6 +3168,15 @@ app.get('/profile', async (c) => {
         const enriched = attachSpecialties(agency, map)
         return { specialtyIds: enriched.specialtyIds, specialties: enriched.specialties }
       })(),
+      // ── Billing / legal identity (authenticated profile only — NEVER
+      // returned by public agency endpoints; shown on invoices) ──
+      legalNif: agency.legalNif,
+      legalNis: agency.legalNis,
+      legalRib: agency.legalRib,
+      legalRc: agency.legalRc,
+      legalServicePhone: agency.legalServicePhone,
+      legalName: agency.legalName,
+      legalAddress: agency.legalAddress,
     })
   } catch (error) {
     const err = authErrorResponse(error)
@@ -3276,6 +3308,14 @@ async function handleAgencyProfileUpdate(c: Context) {
         ...(('city' in normalizedData) && { city: (normalizedData as Record<string, unknown>).city as string | undefined }),
         // Task 51 — canonical location (lat/lng pair + stamp + metadata)
         ...locationPatch.data,
+        // ── Billing / legal identity (NOT public — invoices only) ──
+        ...(('legalNif' in normalizedData) && { legalNif: (normalizedData as Record<string, unknown>).legalNif as string | null | undefined }),
+        ...(('legalNis' in normalizedData) && { legalNis: (normalizedData as Record<string, unknown>).legalNis as string | null | undefined }),
+        ...(('legalRib' in normalizedData) && { legalRib: (normalizedData as Record<string, unknown>).legalRib as string | null | undefined }),
+        ...(('legalRc' in normalizedData) && { legalRc: (normalizedData as Record<string, unknown>).legalRc as string | null | undefined }),
+        ...(('legalServicePhone' in normalizedData) && { legalServicePhone: (normalizedData as Record<string, unknown>).legalServicePhone as string | null | undefined }),
+        ...(('legalName' in normalizedData) && { legalName: (normalizedData as Record<string, unknown>).legalName as string | null | undefined }),
+        ...(('legalAddress' in normalizedData) && { legalAddress: (normalizedData as Record<string, unknown>).legalAddress as string | null | undefined }),
       },
     })
 

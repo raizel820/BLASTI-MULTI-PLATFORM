@@ -348,6 +348,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           useAppStore.getState().setView('kiosk');
           return;
         }
+        // Billing 0.6.53 — the invoice verification QR deep-link must be
+        // honored for logged-in users too: an admin/agency/customer clicking
+        // a verification link (or scanning into the browser) lands on the
+        // public verify screen instead of being bounced to their dashboard.
+        if (/^#\/invoice\/verify\//.test(hash)) {
+          setViewFromHash(hash);
+          return;
+        }
       }
       // No deep link — just update the hash to match the persisted view
       updateHashForView(store.currentView);

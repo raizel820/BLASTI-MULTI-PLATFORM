@@ -54,6 +54,7 @@ import {
   ArrowRight,
   Building2,
   Fingerprint,
+  ScrollText,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -144,6 +145,8 @@ const SECTIONS: SettingsSection[] = [
   { id: 'general', icon: Info, titleKey: 'settings' },
   // Task 83-b — agency-level canonical location (map picker + address).
   { id: 'location', icon: MapPin, titleKey: 'locationSettings' },
+  // v0.6.53 — billing/legal identity block (NIF/NIS/RIB/RC/... invoices only).
+  { id: 'legal', icon: ScrollText, titleKey: 'legalInfoSection' },
   { id: 'hours', icon: Clock, titleKey: 'workingHours' },
   { id: 'services', icon: Settings, titleKey: 'manageServices' },
   { id: 'capacity', icon: Gauge, titleKey: 'queueCapacity' },
@@ -169,6 +172,7 @@ export function AgencySettings() {
   const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
     general: true,
     location: true,
+    legal: true,
     hours: true,
     services: true,
     capacity: true,
@@ -256,6 +260,22 @@ export function AgencySettings() {
   const lastLocPinAtRef = useRef<number | null>(null);
   const prevLocCentroidWilayaRef = useRef<string>('');
   const debouncedLocWilaya = useDebounce(locWilaya, 400);
+
+  // ─── v0.6.53 — Legal Information section state (billing/invoice identity).
+  // Same GET/PUT(PATCH) /api/agency/profile flow as the location section:
+  // nullable strings, loaded once and saved explicitly. `legalRcType` is a
+  // LOCAL toggle only (the Agency model has no such column) — it just
+  // relabels the RC input; default 'RC', never persisted.
+  const [legalNif, setLegalNif] = useState('');
+  const [legalNis, setLegalNis] = useState('');
+  const [legalRib, setLegalRib] = useState('');
+  const [legalRc, setLegalRc] = useState('');
+  const [legalRcType, setLegalRcType] = useState<'RC' | 'AUTO_ENTREPRENEUR'>('RC');
+  const [legalServicePhone, setLegalServicePhone] = useState('');
+  const [legalName, setLegalName] = useState('');
+  const [legalAddress, setLegalAddress] = useState('');
+  const [legalSaving, setLegalSaving] = useState(false);
+
   useEffect(() => {
     const code = (debouncedLocWilaya || '').trim();
     const prev = prevLocCentroidWilayaRef.current;
@@ -362,10 +382,26 @@ export function AgencySettings() {
           postalCode?: string | null;
           latitude?: number | null;
           longitude?: number | null;
+          // v0.6.53 — billing/legal identity fields (same GET payload).
+          legalNif?: string | null;
+          legalNis?: string | null;
+          legalRib?: string | null;
+          legalRc?: string | null;
+          legalServicePhone?: string | null;
+          legalName?: string | null;
+          legalAddress?: string | null;
         };
         setLocAddress(p.address ?? '');
         setLocWilaya(p.wilaya ?? '');
         setLocPostalCode(p.postalCode ?? '');
+        // v0.6.53 — map the legal identity block into its section state.
+        setLegalNif(p.legalNif ?? '');
+        setLegalNis(p.legalNis ?? '');
+        setLegalRib(p.legalRib ?? '');
+        setLegalRc(p.legalRc ?? '');
+        setLegalServicePhone(p.legalServicePhone ?? '');
+        setLegalName(p.legalName ?? '');
+        setLegalAddress(p.legalAddress ?? '');
         // r21-5 — server truth resets the map-follow stamps AND re-baselines
         // the centroid watcher: loading the saved agency location can never
         // yank its pin to a centroid.
@@ -483,6 +519,44 @@ export function AgencySettings() {
       toast.error(t('locationSaveFailed'));
     } finally {
       setLocSaving(false);
+    }
+  };
+
+  // v0.6.53 — save the legal identity block. Follows the location save
+  // contract exactly: PATCH /api/agency/profile (same handler as PUT),
+  // trimmed empty values are sent as null ("clear this field"), agencyId
+  // rides along when the session has one. On success the section re-syncs
+  // with the server truth via fetchProfileLocation().
+  const handleSaveLegalInfo = async () => {
+    setLegalSaving(true);
+    try {
+      const payload: Record<string, unknown> = {
+        legalNif: legalNif.trim() || null,
+        legalNis: legalNis.trim() || null,
+        legalRib: legalRib.trim() || null,
+        legalRc: legalRc.trim() || null,
+        legalServicePhone: legalServicePhone.trim() || null,
+        legalName: legalName.trim() || null,
+        legalAddress: legalAddress.trim() || null,
+      };
+      if (user?.agencyId) payload.agencyId = user.agencyId;
+      const res = await apiFetch('/api/agency/profile', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        toast.success(t('legalInfoSaved'));
+        // Re-sync with the server truth (also refreshes the location block).
+        fetchProfileLocation();
+      } else {
+        const data = await res.json().catch(() => null);
+        toast.error((data && data.error) || t('error'));
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setLegalSaving(false);
     }
   };
 
@@ -1069,6 +1143,122 @@ export function AgencySettings() {
                           >
                             {locSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                             {t('saveLocation')}
+                          </Button>
+                        </div>
+                      )}
+
+                      {/* ─── v0.6.53 — Legal Information section ───
+                          Billing/invoice identity (NIF/NIS/RIB/RC/service
+                          phone/legal name+address), loaded from the SAME
+                          GET /api/agency/profile fetch as the location
+                          section and saved via the same PATCH flow.
+                          legalRcType is a local label toggle only — the
+                          Agency model has no such column; it just relabels
+                          the RC input (default 'RC', not persisted). */}
+                      {section.id === 'legal' && (
+                        <div className="space-y-4">
+                          <p className="text-xs text-muted-foreground -mt-1 mb-2">
+                            {t('legalInfoSection')} — {t('legalInfoHint')}
+                          </p>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div className="space-y-2">
+                              <Label className="text-sm">{t('legalName')}</Label>
+                              <Input
+                                value={legalName}
+                                onChange={(e) => setLegalName(e.target.value)}
+                                className="h-11 min-h-[44px]"
+                                maxLength={120}
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label className="text-sm">{t('legalServicePhone')}</Label>
+                              <Input
+                                value={legalServicePhone}
+                                onChange={(e) => setLegalServicePhone(e.target.value)}
+                                className="h-11 min-h-[44px]"
+                                dir="ltr"
+                                maxLength={200}
+                                inputMode="tel"
+                              />
+                            </div>
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-sm">{t('legalAddress')}</Label>
+                            <Input
+                              value={legalAddress}
+                              onChange={(e) => setLegalAddress(e.target.value)}
+                              className="h-11 min-h-[44px]"
+                              maxLength={300}
+                            />
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div className="space-y-2">
+                              <Label className="text-sm">{t('legalNif')}</Label>
+                              <Input
+                                value={legalNif}
+                                onChange={(e) => setLegalNif(e.target.value)}
+                                className="h-11 min-h-[44px]"
+                                dir="ltr"
+                                maxLength={60}
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label className="text-sm">{t('legalNis')}</Label>
+                              <Input
+                                value={legalNis}
+                                onChange={(e) => setLegalNis(e.target.value)}
+                                className="h-11 min-h-[44px]"
+                                dir="ltr"
+                                maxLength={60}
+                              />
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div className="space-y-2">
+                              <Label className="text-sm">{t('legalRib')}</Label>
+                              <Input
+                                value={legalRib}
+                                onChange={(e) => setLegalRib(e.target.value)}
+                                className="h-11 min-h-[44px]"
+                                dir="ltr"
+                                maxLength={80}
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label className="text-sm">{t('legalRcType')}</Label>
+                              <Select
+                                value={legalRcType}
+                                onValueChange={(v) => setLegalRcType(v === 'AUTO_ENTREPRENEUR' ? 'AUTO_ENTREPRENEUR' : 'RC')}
+                              >
+                                <SelectTrigger className="min-h-[44px]" aria-label={t('legalRcType')}>
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="RC">{t('legalRcTypeRc')}</SelectItem>
+                                  <SelectItem value="AUTO_ENTREPRENEUR">{t('legalRcTypeAuto')}</SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </div>
+                          </div>
+                          <div className="space-y-2">
+                            <Label className="text-sm">
+                              {legalRcType === 'AUTO_ENTREPRENEUR' ? t('legalRcTypeAuto') : t('legalRcTypeRc')}
+                            </Label>
+                            <Input
+                              value={legalRc}
+                              onChange={(e) => setLegalRc(e.target.value)}
+                              className="h-11 min-h-[44px]"
+                              dir="ltr"
+                              maxLength={60}
+                            />
+                          </div>
+                          <Button
+                            className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl h-10 gap-2"
+                            onClick={handleSaveLegalInfo}
+                            disabled={legalSaving}
+                          >
+                            {legalSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+                            {t('save')}
                           </Button>
                         </div>
                       )}

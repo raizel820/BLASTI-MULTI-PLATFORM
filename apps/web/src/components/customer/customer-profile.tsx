@@ -35,6 +35,7 @@ import { ProfileSmsSettings } from './profile/profile-sms-settings';
 import { ProfileSmsWallet } from './profile/profile-sms-wallet';
 import { SmsPurchaseDialog, type SmsPackId } from './profile/sms-purchase-dialog';
 import { ProfilePurchaseHistory } from './profile/profile-purchase-history';
+import { ProfileInvoices } from './profile/profile-invoices';
 import { ProfileDangerZone } from './profile/profile-danger-zone';
 
 export function CustomerProfile() {
@@ -270,6 +271,10 @@ export function CustomerProfile() {
           lang={lang}
           t={t}
         />
+
+        {/* ─── My invoices (v0.6.53) — auto-scoped to this customer + QR
+            verification scanner, adjacent to the purchase history ─── */}
+        <ProfileInvoices />
 
         {/* ─── Danger zone: logout + delete account ─── */}
         <ProfileDangerZone

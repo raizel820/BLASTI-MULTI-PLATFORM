@@ -97,6 +97,10 @@ export type ViewName =
   // Chargily (EDAHABIA / CIB) payment result — full-screen, role-agnostic,
   // self-handles the logged-out case (generic result + login CTA).
   | 'payment-result'
+  // Billing 0.6.53 — public invoice/receipt QR verification landing
+  // (the QR on every invoice encodes #/invoice/verify/<token>). Public,
+  // role-agnostic: anonymous camera scans must be able to verify.
+  | 'invoice-verify'
   | 'agency-dashboard'
   | 'agency-settings'
   | 'agency-employees'
@@ -109,6 +113,10 @@ export type ViewName =
   | 'agency-support'
   | 'admin-dashboard'
   | 'admin-transactions'
+  // Task 5 (0.6.53): Billing Manager — merged transactions + invoices + legal
+  // info view that replaces the old transactions page in the sidebar group.
+  // 'admin-transactions' stays valid (legacy view for stale hashes).
+  | 'admin-billing-manager'
   // Task 5-a: "Agencies Management" sidebar group — a hub view + the
   // agencies/services subsections + the two new category pages.
   | 'admin-agencies-management'
@@ -313,6 +321,9 @@ const viewHashMap: Record<ViewName, string> = {
   // the generic prefix match in parseHashToView keeps the query params intact
   // while still resolving the view.
   'payment-result': '#/payment/result',
+  // Billing 0.6.53 — invoice verification QR target. Resolved via the
+  // prefix match in parseHashToView (token rides the hash tail).
+  'invoice-verify': '#/invoice/verify',
   'agency-dashboard': '#/agency',
   'agency-settings': '#/agency/settings',
   'agency-employees': '#/agency/employees',
@@ -325,6 +336,8 @@ const viewHashMap: Record<ViewName, string> = {
   'agency-support': '#/agency/support',
   'admin-dashboard': '#/admin',
   'admin-transactions': '#/admin/transactions',
+  // Task 5 (0.6.53): Billing Manager — merged transactions/invoices/legal view.
+  'admin-billing-manager': '#/admin/billing',
   // Task 5-a: Agencies Management group — one hash per view. The existing
   // admin-agencies / admin-services-management hashes are unchanged.
   'admin-agencies-management': '#/admin/agencies-management',
@@ -386,7 +399,16 @@ export function isHashChangeSuppressed(): boolean {
 
 export function updateHashForView(view: ViewName): void {
   if (typeof window === 'undefined') return;
-  const hash = viewHashMap[view] || '#/';
+  let hash = viewHashMap[view] || '#/';
+  // Billing 0.6.53 — the public verification landing carries its token in
+  // the hash tail (#/invoice/verify/<token>). setView() rewrites the hash on
+  // every navigation; without this guard the QR token would be stripped the
+  // moment the view is assigned and the verify screen would read an empty
+  // token. Keep the full hash whenever it already carries a token.
+  if (view === 'invoice-verify') {
+    const current = window.location.hash || '';
+    if (/^#\/invoice\/verify\/.+/.test(current)) hash = current;
+  }
   _suppressHashChange = true;
   window.location.hash = hash;
   setTimeout(() => { _suppressHashChange = false; }, 50);
@@ -396,6 +418,11 @@ export function parseHashToView(hash: string): ViewName | null {
   // Handle #/join/CODE deep link
   const joinMatch = hash.match(/^#\/join\/(.+)$/);
   if (joinMatch) return 'customer-queue';
+
+  // Billing 0.6.53 — #/invoice/verify/<token> public QR landing. The token
+  // must survive sanitization, so keep it in the raw hash and let the view
+  // read it via parseInvoiceVerifyToken().
+  if (/^#\/invoice\/verify\//.test(hash)) return 'invoice-verify';
 
   // Handle #/kiosk/CODE deep link
   const kioskMatch = hash.match(/^#\/kiosk\/?(.*)$/);
@@ -424,6 +451,15 @@ export function parseHashToView(hash: string): ViewName | null {
 
 export function parseJoinCodeFromHash(hash: string): string | null {
   const match = hash.match(/^#\/join\/(.+)$/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Billing 0.6.53 — extract the verification token from a
+ * `#/invoice/verify/<token>` hash (the payload encoded in the invoice QR).
+ */
+export function parseInvoiceVerifyToken(hash: string): string | null {
+  const match = hash.match(/^#\/invoice\/verify\/([A-Za-z0-9_.\-]+)$/);
   return match ? match[1] : null;
 }
 
@@ -473,10 +509,15 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   // Chargily payment result — must survive persisted-state sanitization
   // (VALID_VIEW_NAMES is the runtime mirror of the ViewName union).
   'payment-result',
+  // Billing 0.6.53 — public invoice verification view (same rationale).
+  'invoice-verify',
   'agency-dashboard', 'agency-settings', 'agency-employees', 'agency-profile',
   'agency-reviews', 'agency-subscription', 'agency-branches', 'agency-devices',
   'agency-analytics',
   'admin-dashboard', 'admin-transactions', 'admin-agencies', 'admin-audit',
+  // Task 5 (0.6.53): Billing Manager — must survive persisted-state
+  // sanitization (VALID_VIEW_NAMES mirrors the ViewName union).
+  'admin-billing-manager',
   'admin-users', 'admin-analytics', 'admin-settings', 'admin-maps', 'admin-subscription-plans', 'admin-app-settings', 'admin-db',
   'admin-services-management',
   // Task 2: Storage Manager — must survive persisted-state sanitization

@@ -24,6 +24,7 @@ import { categorySlugError } from '../lib/categories'
 // the same idempotent fulfillment path used by the webhook + poll fallback.
 import { getCheckoutStatus } from '../lib/chargily-service'
 import { fulfillCheckoutPaid, fulfillCheckoutFailed, normalizeChargilyStatus, type FulfillmentCheckout } from '../lib/chargily-fulfill'
+import { ensureInvoiceForTransaction } from '../lib/billing-invoices'
 // Task 2-a FIX 3 — the admin-dashboard SMS tab reads/writes /admin/sms-settings.
 import { getSmsSettings, getSmsUsageStats, testSms, validateGatewayConnection } from '../lib/sms-service'
 import { PROVIDER_REGISTRY } from '../lib/messaging/provider-registry'
@@ -1683,6 +1684,26 @@ app.get('/analytics/payments', async (c) => {
     }
 
     const approvedCount = unified.filter((r) => (SETTLED_TRANSACTION_STATUSES as readonly string[]).includes(r.status) || r.status === 'APPROVED').length
+
+    // ── Billing analyzer upgrade: the Invoice ledger is now the canonical
+    // source for issued-document metrics. Revenue figures still come from
+    // the unified transaction feed above; invoicing KPIs come from Invoice
+    // + InvoiceVerification created in-period (one invoice per settled
+    // subscription/SMS payment, QR-verifiable by agencies and customers).
+    const [invoiceRows, invoiceVerifyCount] = await Promise.all([
+      db.invoice.findMany({
+        where: { issuedAt: { gte: start, lte: end } },
+        select: { amount: true, currency: true, status: true, sourceType: true, verificationCount: true },
+      }),
+      db.invoiceVerification.count({ where: { verifiedAt: { gte: start, lte: end } } }),
+    ])
+    const invoicedAmount = invoiceRows
+      .filter((i) => i.status === 'ISSUED')
+      .reduce((sum, i) => sum + i.amount, 0)
+    const invoiceCurrency = invoiceRows[0]?.currency ?? currency ?? 'DZD'
+    const invoiceByType: Record<string, number> = {}
+    for (const i of invoiceRows) invoiceByType[i.sourceType] = (invoiceByType[i.sourceType] ?? 0) + 1
+
     return c.json({
       success: true,
       data: {
@@ -1699,6 +1720,15 @@ app.get('/analytics/payments', async (c) => {
         byStatus,
         byPaymentMethod: byMethod,
         revenueTimeseries: Array.from(bucketValues.entries()).map(([bucket, value]) => ({ bucket, revenue: value })),
+        // Billing manager / invoice KPIs (new canonical document source)
+        billing: {
+          invoicesIssued: invoiceRows.length,
+          invoicedAmount,
+          currency: invoiceCurrency,
+          cancelledInvoices: invoiceRows.filter((i) => i.status === 'CANCELLED').length,
+          qrVerifications: invoiceVerifyCount,
+          byType: invoiceByType,
+        },
       },
     })
   } catch (error) {
@@ -3715,6 +3745,16 @@ app.post('/transactions/:id', async (c) => {
     // revenue tiles (/api/stats) and the agency directory display — drop
     // their cached responses immediately (mirrors the reconcile endpoint).
     invalidateResponseCacheTag('stats', 'agencies')
+
+    // Billing: issue the legal invoice when a manual (receipt) subscription
+    // payment is approved (best-effort — backfillable via /api/billing).
+    if (action === 'approve' && transaction.type !== 'HARDWARE') {
+      try {
+        await ensureInvoiceForTransaction(id, { issuedBy: `ADMIN:${admin.id}` })
+      } catch (err) {
+        console.warn('[admin] Failed to issue invoice for approved transaction:', err)
+      }
+    }
 
     return c.json({ success: true, transaction: updated })
   } catch (error) {

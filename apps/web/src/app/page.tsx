@@ -69,6 +69,9 @@ const DeviceTvBoard = lazyNamed(() => import('@/components/devices/device-tv-boa
 // Admin Views
 const AdminDashboard = lazyNamed(() => import('@/components/admin/admin-dashboard'), 'AdminDashboard');
 const AdminTransactions = lazyNamed(() => import('@/components/admin/admin-transactions'), 'AdminTransactions');
+// Task 5 (0.6.53): Billing Manager — merged transactions + invoices + legal
+// info view that replaces the old transactions page in the sidebar group.
+const AdminBillingManager = lazyNamed(() => import('@/components/admin/admin-billing-manager'), 'AdminBillingManager');
 // Task 5-a: "Agencies Management" group — the hub + section-shell wrappers
 // for the two legacy panels (back button) + the two new category pages.
 // The legacy view names/hashes are unchanged; only the render path gained
@@ -145,6 +148,8 @@ const NotificationCenter = lazyNamed(() => import('@/components/shared/Notificat
 // Chargily (EDAHABIA / CIB) payment result — full-screen, role-agnostic,
 // self-handles the logged-out case (no role gate below).
 const PaymentResult = lazyNamed(() => import('@/components/shared/payment-result'), 'PaymentResult');
+// Billing 0.6.53 — public invoice/receipt QR verification landing.
+const InvoiceVerifyView = lazyNamed(() => import('@/components/shared/billing/invoice-verify-view'), 'InvoiceVerifyView');
 // QueueE2ETestPanel removed — test button no longer needed
 
 // ─── Task 84: idle-time view warming ─────────────────────────────────────────
@@ -360,6 +365,9 @@ const ViewRouter = memo(function ViewRouter() {
               return <AdminDashboard />;
             case 'admin-transactions':
               return <AdminTransactions />;
+            // Task 5 (0.6.53): Billing Manager — merged transactions/invoices/legal.
+            case 'admin-billing-manager':
+              return <AdminBillingManager />;
             // Task 5-a: Agencies Management group. 'admin-agencies' and
             // 'admin-services-management' keep their view names + hashes but
             // now render through the section-shell wrappers (back button to
@@ -446,6 +454,10 @@ const ViewRouter = memo(function ViewRouter() {
             // CTA, no polling when unauthenticated).
             case 'payment-result':
               return <PaymentResult />;
+            // Billing 0.6.53 — public invoice verification (NO role gate:
+            // anonymous camera scans of the invoice QR land here).
+            case 'invoice-verify':
+              return <InvoiceVerifyView />;
             default:
               return <LandingPage />;
           }
@@ -812,6 +824,9 @@ export default function Home() {
       'agency-analytics': t('analytics') + ' - BLASTI',
       'admin-dashboard': t('dashboard') + ' - BLASTI',
       'admin-transactions': t('transactions') + ' - BLASTI',
+      // Task 5 (0.6.53): Billing Manager — merged transactions/invoices/legal view.
+      'admin-billing-manager': t('billingManager') + ' - BLASTI',
+      'invoice-verify': t('billingScannerTitle') + ' - BLASTI',
       'admin-agencies': t('agencies') + ' - BLASTI',
       'admin-audit': t('auditLogs') + ' - BLASTI',
       'admin-users': t('userManagement') + ' - BLASTI',
@@ -950,8 +965,11 @@ export default function Home() {
   // payment-result joins this branch: full-screen for every role, and it
   // self-handles the logged-out case (generic result + login CTA) — so it
   // must never be bounced to landing/login by the guard below.
+  // Billing 0.6.53: the public invoice QR verification landing joins too —
+  // anonymous camera scans land here with no session, full-screen, no chrome.
   const isAuthPage = currentView === 'landing' || currentView === 'login' || currentView === 'register'
-    || currentView === 'payment-result';
+    || currentView === 'payment-result'
+    || currentView === 'invoice-verify';
 
   // Agency fullscreen mode bypasses sidebar + header
   if (currentView === 'agency-fullscreen' || currentView === 'agency-fullscreen-history') {

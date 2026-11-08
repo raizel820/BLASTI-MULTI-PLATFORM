@@ -3106,6 +3106,77 @@ ipcMain.handle('get-printers', async () => {
   }
 });
 
+// ─── Invoice / Receipt PDF (native, on-device) ──────────────────────────────
+//
+// IPC: 'invoice:save-pdf' — payload { html: string, suggestedName: string }
+//
+// The web app renders the A4 invoice HTML on-device (invoice-html.ts) and
+// hands the FULL standalone document here. The main process generates a real
+// .pdf file with Chromium's native printToPDF engine (A4, background colors,
+// print headers/footers off) and saves it through the system save dialog.
+// Nothing is generated or stored server-side — billing documents are always
+// produced locally on the user's machine.
+ipcMain.handle('invoice:save-pdf', async (_event, { html, suggestedName } = {}) => {
+  if (!html || typeof html !== 'string') {
+    return { ok: false, error: 'Missing invoice HTML payload' };
+  }
+
+  let pdfWindow = null;
+  try {
+    pdfWindow = new BrowserWindow({
+      show: false, // hidden render surface — never flashes on screen
+      webPreferences: {
+        offscreen: true,
+        javascriptEnabled: false, // the document is fully static markup
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+      },
+    });
+
+    // Load the standalone invoice document. data: URLs keep the document
+    // fully self-contained (embedded base64 logo + QR code render fine).
+    const dataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
+    await pdfWindow.loadURL(dataUrl);
+
+    // Give the embedded images (logo/QR data URLs) a beat to decode.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const pdfBuffer = await pdfWindow.webContents.printToPDF({
+      pageSize: 'A4',
+      printBackground: true,
+      printSelectionOnly: false,
+      margins: { top: 0.4, bottom: 0.4, left: 0.4, right: 0.4 },
+      preferCSSPageSize: true,
+    });
+
+    const safeName = typeof suggestedName === 'string' && suggestedName.trim()
+      ? suggestedName.trim()
+      : `BLASTI-invoice-${Date.now()}.pdf`;
+
+    const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+      title: 'Save invoice PDF',
+      defaultPath: safeName,
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    });
+
+    if (canceled || !filePath) {
+      return { ok: false, canceled: true };
+    }
+
+    await require('fs').promises.writeFile(filePath, pdfBuffer);
+    console.log('[BLASTI Desktop] Invoice PDF saved:', filePath, `(${pdfBuffer.length} bytes)`);
+    return { ok: true, path: filePath };
+  } catch (err) {
+    console.error('[BLASTI Desktop] Invoice PDF generation failed:', err);
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    if (pdfWindow && !pdfWindow.isDestroyed()) {
+      pdfWindow.destroy();
+    }
+  }
+});
+
 // ─── TV Screen / Second Monitor ─────────────────────────────────────────────
 let tvWindow = null;
 

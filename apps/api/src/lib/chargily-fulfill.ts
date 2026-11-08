@@ -24,6 +24,7 @@
 
 import { db } from '@blasti/db'
 import { recordSyncChange, resolveAgencyIdForUser } from './sync-helpers'
+import { ensureInvoiceForTransaction, ensureInvoiceForSmsPurchase } from './billing-invoices'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -323,6 +324,17 @@ export async function fulfillCheckoutPaid(
         type: transaction.type,
       },
     })
+
+    // Billing: issue the legal invoice/receipt for this settled subscription
+    // payment (best-effort — never fail settlement; backfillable via
+    // POST /api/billing/invoices/ensure).
+    if (transaction.type !== 'HARDWARE') {
+      try {
+        await ensureInvoiceForTransaction(transaction.id)
+      } catch (err) {
+        console.warn('[chargily-fulfill] Failed to issue invoice for transaction:', err)
+      }
+    }
   } else if (transaction) {
     // Already settled — still count as handled so callers can report state.
     result.transactionId = transaction.id
@@ -387,6 +399,13 @@ export async function fulfillCheckoutPaid(
       })
 
       result.smsCreditsGranted = smsPurchase.quantity
+
+      // Billing: issue the legal receipt for this settled SMS pack.
+      try {
+        await ensureInvoiceForSmsPurchase(smsPurchase.id)
+      } catch (err) {
+        console.warn('[chargily-fulfill] Failed to issue receipt for SMS purchase:', err)
+      }
 
       await emitPaymentEvent('payment:completed', {
         userId: smsPurchase.userId,

@@ -662,7 +662,10 @@ export function AdaptiveAdminSidebar({ open, onClose }: { open: boolean; onClose
       icon: Briefcase,
       label: t('managingSalesOps'),
       children: [
-        { view: 'admin-transactions', icon: CreditCard, label: t('transactions') },
+        // Task 5 (0.6.53): Billing Manager replaces the old transactions page
+        // here (merged transactions + invoices + legal info). The legacy
+        // 'admin-transactions' view stays wired for stale hashes.
+        { view: 'admin-billing-manager', icon: Wallet, label: t('billingManager') },
         { view: 'admin-subscription-plans', icon: Crown, label: t('subscriptionPlans') },
         { view: 'admin-hardware', icon: Cpu, label: t('hardwareManagement') },
         { view: 'admin-hardware-requests', icon: Package, label: t('hardwareRequests') },

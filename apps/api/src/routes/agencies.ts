@@ -716,10 +716,20 @@ app.get('/:id', async (c) => {
       return c.json({ success: false, error: 'Agency not found' }, 404)
     }
 
+    // Billing/legal identity fields (legalNif/legalNis/legalRib/legalRc/
+    // legalServicePhone/legalName/legalAddress) are NOT public — they are
+    // only exposed to the authenticated agency via GET /api/agency/profile
+    // and appear on invoice documents. Strip them from this public shape.
+    const {
+      legalNif: _l1, legalNis: _l2, legalRib: _l3, legalRc: _l4,
+      legalServicePhone: _l5, legalName: _l6, legalAddress: _l7,
+      ...publicAgency
+    } = agency as typeof agency & Record<string, unknown>
+
     return c.json({
       success: true,
       agency: {
-        ...agency,
+        ...publicAgency,
         activeQueueCount: agency._count.reservations,
       },
     })

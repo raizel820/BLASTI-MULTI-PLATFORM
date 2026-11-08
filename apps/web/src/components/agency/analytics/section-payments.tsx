@@ -8,7 +8,7 @@
 // (staff → 403 server-side per §37).
 
 import { useLanguage } from '@/hooks/use-language';
-import { BadgeDollarSign, CheckCircle2, Clock3, CreditCard, Receipt, TrendingUp, XCircle } from 'lucide-react';
+import { BadgeDollarSign, CheckCircle2, Clock3, CreditCard, Receipt, ReceiptText, ShieldCheck, TrendingUp, XCircle } from 'lucide-react';
 import {
   AreaChart,
   Area,
@@ -40,6 +40,21 @@ const STATUS_COLORS: Record<string, string> = {
   CANCELLED: '#94a3b8',
 };
 
+// ─── v0.6.53 — billing/invoice KPI block ─────────────────────────────────
+// GET /api/agency/analytics/payments now ALSO returns a `data.billing` block
+// (new invoice system, scoped to this agency). Declared locally as an
+// optional intersection so the section type stays untouched and payloads
+// cached before the field existed render without crashing (guarded render).
+interface PaymentsBillingKpis {
+  invoicesIssued: number;
+  invoicedAmount: number;
+  currency: string;
+  cancelledInvoices: number;
+  qrVerifications: number;
+  byType: Record<string, number>;
+}
+type OwnerPaymentsDataWithBilling = OwnerPaymentsData & { billing?: PaymentsBillingKpis };
+
 export function OwnerPaymentsSection({ query, customHint }: { query: OwnerSectionQuery; customHint: string }) {
   const { t, lang } = useLanguage();
   const { data, state, refresh, isQueryReady } = useOwnerSectionData<OwnerPaymentsData>(
@@ -57,6 +72,8 @@ export function OwnerPaymentsSection({ query, customHint }: { query: OwnerSectio
   const safe = (v: unknown): number => (Number.isFinite(v as number) ? (v as number) : 0);
   const totals = data.totals;
   const currency = totals.currency || 'DZD';
+  // v0.6.53 — optional billing block; undefined on old cached payloads.
+  const billing = (data as OwnerPaymentsDataWithBilling).billing;
 
   const fmtMoney = (v: number): string => {
     try {
@@ -167,6 +184,34 @@ export function OwnerPaymentsSection({ query, customHint }: { query: OwnerSectio
           },
         ]}
       />
+
+      {/* ─── v0.6.53 — billing KPI tiles (new invoice system, agency-scoped)
+          Rendered only when the payload carries the billing block, so old
+          cached responses never crash this section. ─── */}
+      {billing ? (
+        <StatTiles
+          items={[
+            {
+              icon: ReceiptText,
+              iconClass: 'bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-400',
+              label: t('billingStatsIssued'),
+              value: safe(billing.invoicesIssued),
+            },
+            {
+              icon: BadgeDollarSign,
+              iconClass: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
+              label: `${t('billingStatsInvoiced')} (${billing.currency || currency})`,
+              text: `${safe(billing.invoicedAmount).toLocaleString()} ${billing.currency || currency}`,
+            },
+            {
+              icon: ShieldCheck,
+              iconClass: 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-400',
+              label: t('billingStatsVerified'),
+              value: safe(billing.qrVerifications),
+            },
+          ]}
+        />
+      ) : null}
 
       <ChartCard
         title={t(ak('ownerAnalytics.pay.trend'))}

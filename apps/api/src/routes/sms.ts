@@ -5,6 +5,7 @@ import { checkRateLimit, RateLimitError, SMS_RATE_LIMIT } from '../lib/rate-limi
 import { validateBody } from '../lib/validations'
 import { z } from 'zod'
 import { recordSyncChange, resolveAgencyIdForUser } from '../lib/sync-helpers'
+import { ensureInvoiceForSmsPurchase } from '../lib/billing-invoices'
 
 const app = new Hono()
 
@@ -197,6 +198,13 @@ app.post('/approve/:id', async (c) => {
         details: JSON.stringify({ approvedFor: purchase.userId, quantity: purchase.quantity }),
       },
     })
+
+    // Billing: issue the legal receipt for the approved SMS pack (best-effort).
+    try {
+      await ensureInvoiceForSmsPurchase(purchaseId)
+    } catch (err) {
+      console.warn('[sms] Failed to issue receipt for approved SMS purchase:', err)
+    }
 
     return c.json({ success: true, purchase: result })
   } catch (error: unknown) {

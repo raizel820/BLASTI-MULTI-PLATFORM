@@ -71,7 +71,8 @@ jobs:
   desktop-exe:
     name: Desktop .exe (Windows NSIS)
     runs-on: windows-latest
-    timeout-minutes: 45
+    # Headroom for the 3× retry loop below (transient GitHub CDN 504s).
+    timeout-minutes: 60
     # Selective builds: a manual run with targets=mobile-only skips this job.
     if: github.event_name == 'push' || inputs.targets != 'mobile-only'
     steps:
@@ -88,8 +89,38 @@ jobs:
         env:
           NEXT_TELEMETRY_DISABLED: '1'
 
-      - name: Package Windows installer (prebuild + electron-builder NSIS)
-        run: bun run --filter @blasti/desktop build:win
+      # electron-builder downloads the electron zip + winCodeSign + NSIS from
+      # GitHub releases — a burst of 504 Gateway Time-outs there killed runs
+      # mid-build ("Response code 504 … failedTask=build"). Caching these
+      # archives means repeat runs download NOTHING, and the retry loop below
+      # covers the rare cold-cache case.
+      - name: Cache electron + electron-builder downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/AppData/Local/electron/Cache
+            ~/AppData/Local/electron-builder/Cache
+          key: electron-win-${{ hashFiles('apps/desktop/package.json') }}
+          restore-keys: |
+            electron-win-
+
+      - name: Package Windows installer (prebuild + electron-builder NSIS, 3× retry)
+        shell: pwsh
+        run: |
+          $attempts = 3
+          for ($i = 1; $i -le $attempts; $i++) {
+            Write-Host "::group::electron-builder packaging — attempt $i/$attempts"
+            bun run --filter @blasti/desktop build:win
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            if ($code -eq 0) { exit 0 }
+            if ($i -lt $attempts) {
+              Write-Host "::warning::Packaging failed (attempt $i/$attempts, exit $code) — likely a transient GitHub 504; retrying in 20s."
+              Start-Sleep -Seconds 20
+            }
+          }
+          Write-Host "::error::Packaging failed after $attempts attempts."
+          exit 1
 
       # DELTA UPDATES (0.6.30): snapshot the diffable references (app.asar +
       # out tree archive + runtime/native fingerprints) BEFORE dist/ is lost.
@@ -129,7 +160,8 @@ jobs:
   mobile-apk:
     name: Mobile debug APK (Android)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Headroom for the 3× retry loop below (transient GitHub CDN 504s).
+    timeout-minutes: 60
     # Selective builds: a manual run with targets=desktop-only skips this job.
     if: github.event_name == 'push' || inputs.targets != 'desktop-only'
     steps:
@@ -141,6 +173,23 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
+          # Cache ~/.gradle/caches (AGP/Kotlin/dependency artifacts) — fewer
+          # Maven Central / Google Maven downloads on retries and later runs.
+          cache: gradle
+
+      # The Gradle wrapper pulls gradle-8.14.3-*.zip from services.gradle.org
+      # which REDIRECTS to github.com/gradle/gradle-distributions/releases —
+      # and that redirect returned a 504 that killed the run. Cache the
+      # wrapper dists: once any run succeeds, later runs never touch the CDN
+      # again (the key follows gradle-wrapper.properties, e.g. an -all → -bin
+      # switch re-keys automatically).
+      - name: Cache Gradle wrapper distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.gradle/wrapper/dists
+          key: gradle-wrapper-${{ runner.os }}-${{ hashFiles('apps/mobile/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-wrapper-${{ runner.os }}-
 
       # Android SDK is preinstalled on ubuntu runners; accepting the licenses
       # lets AGP auto-download any missing platform/build-tool (e.g. android-36).
@@ -180,8 +229,26 @@ jobs:
             -storepass blasti-mobile -storetype PKCS12 > /dev/null
           echo "Stable keystore OK — alias 'blasti' readable by this JDK."
 
-      - name: Build debug APK
-        run: bun run --filter @blasti/mobile build:android:debug
+      # Retry up to 3×: the Gradle wrapper / Maven downloads sit behind
+      # GitHub-hosted CDNs that occasionally reply 504. A single transient
+      # burst must not fail the run — the wrapper dist is cached above, so
+      # only the first-ever successful attempt pays the full download.
+      - name: Build debug APK (3× retry)
+        run: |
+          for i in 1 2 3; do
+            echo "::group::APK build — attempt $i/3"
+            if bun run --filter @blasti/mobile build:android:debug; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            if [ "$i" -lt 3 ]; then
+              echo "::warning::APK build failed (attempt $i/3) — likely a transient GitHub 504; retrying in 20s."
+              sleep 20
+            fi
+          done
+          echo "::error::APK build failed after 3 attempts."
+          exit 1
         env:
           NEXT_TELEMETRY_DISABLED: '1'
           BLASTI_MOBILE_BUILD: '1'
