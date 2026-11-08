@@ -380,10 +380,14 @@ app.get('/check', async (c) => {
     // (client version → latest); it applies the hops sequentially and falls
     // back to the full installer on the first verification failure. Clients
     // that predate deltas simply ignore the extra field.
+    // 0.6.52 — when no chain resolves, `deltaUnavailableReason` names exactly
+    // WHY (no-deltas-published / no-verifiable-chain / …) so clients can log
+    // the refusal and "only full installers" becomes diagnosable.
     let delta: Record<string, unknown> | null = null
+    let deltaUnavailableReason = ''
     if (updateAvailable && latestVersion) {
       try {
-        const chain = await computeDeltaChain(platform, version, latestVersion.id)
+        const { chain, reason } = await computeDeltaChain(platform, version, latestVersion.id)
         if (chain && chain.hops.length >= 1) {
           delta = {
             supported: true,
@@ -395,6 +399,8 @@ app.get('/check', async (c) => {
             totalSize: chain.hops.reduce((sum, h) => sum + (h.size || 0), 0),
             hops: chain.hops,
           }
+        } else {
+          deltaUnavailableReason = reason || 'unknown'
         }
       } catch { /* delta resolution must never break the basic check */ }
     }
@@ -420,6 +426,9 @@ app.get('/check', async (c) => {
       minAppVersion: updateAvailable ? (latestVersion?.minAppVersion ?? '') : '',
       // Differential update offer (null/absent on older servers → full install)
       delta,
+      // 0.6.52 — WHY the offer above is null (empty string when a chain IS
+      // offered or no update is available). Clients log it verbatim.
+      deltaUnavailableReason: delta ? '' : deltaUnavailableReason,
       // API COMPATIBILITY MAP (0.6.31) — the same evaluation the dedicated
       // /compat endpoint returns, embedded in the boot-time check so apps get
       // "can I run / what is blocked / is the update required or server-only"

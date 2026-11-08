@@ -207,7 +207,9 @@ async function mergeDesktopMainLogs(): Promise<void> {
       electronAPI?: {
         getRecentMainLogs?: () => unknown[];
         // 0.6.30 — diagnostic tails (local-api diag + updater install log).
-        getRecentDiagLogs?: () => { diag?: string[]; install?: string[] } | undefined;
+        // 0.6.52 — +update: the dedicated update-pipeline log (delta decisions,
+        // hop verification, installer launcher legs, self-heals).
+        getRecentDiagLogs?: () => { diag?: string[]; install?: string[]; update?: string[] } | undefined;
       };
     };
     const lines = w.electronAPI?.getRecentMainLogs?.();
@@ -234,6 +236,10 @@ async function mergeDesktopMainLogs(): Promise<void> {
       };
       mergeTail(tails.diag, 'local-api-diag');
       mergeTail(tails.install, 'updater-install');
+      // 0.6.52 — the update-pipeline log reaches the cloud vault on every
+      // flush, INCLUDING update failures that happened before login or at
+      // boot (self-heal) — the sessions the old tail merge could never see.
+      mergeTail(tails.update, 'update-diag');
     }
   } catch { /* bridge unavailable — renderer-only logging continues */ }
 }

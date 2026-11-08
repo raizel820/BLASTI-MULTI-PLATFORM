@@ -86,7 +86,10 @@ export function AppUpdateManager() {
     // 0.6.30 install fix — the NSIS launcher failed on every leg; the app did
     // NOT quit. Tell the user + arm the manual "open installer" fallback.
     if (w.electronAPI?.onUpdateInstallFailed) {
-      w.electronAPI.onUpdateInstallFailed(() => {
+      w.electronAPI.onUpdateInstallFailed((raw) => {
+        // 0.6.52 — mirror the failure into the console so the remote logger
+        // carries it; the main process's update-diag.log holds the leg detail.
+        console.warn(`[update:install-failed] every installer launcher leg failed | error=${raw?.error || 'unknown'}`);
         toast.error(t('updateInstallFailedManual'), { duration: 9000 });
       });
     }

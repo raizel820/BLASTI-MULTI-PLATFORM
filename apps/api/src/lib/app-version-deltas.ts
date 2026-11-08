@@ -244,14 +244,39 @@ export function compareVersionStrings(a: string, b: string): number {
  * Shortest hop chain from `fromVersion` to `toVersion` over the delta graph
  * (BFS). Every returned hop is verified to CHAIN: hop[k].toArtifactHash must
  * equal hop[k+1].fromArtifactHash — guarantees sequential application works.
+ *
+ * 0.6.52 — the return shape is `{ chain, reason }`: when `chain` is null,
+ * `reason` names exactly WHY (no-deltas-published / no-verifiable-chain /
+ * runtime-target-missing / not-newer) so /check can expose the refusal and
+ * clients can LOG it — "only full installers" becomes diagnosable instead
+ * of looking like a broken client.
  */
-export async function computeDeltaChain(platform: string, fromVersion: string, toVersionId: string) {
+export async function computeDeltaChain(platform: string, fromVersion: string, toVersionId: string): Promise<{
+  chain: {
+    runtimeKey: string
+    nativeFingerprint: string
+    targetAsarSha256: string
+    targetApkSha256: string
+    hops: Array<{
+      id: string
+      kind: string
+      fromVersion: string
+      toVersion: string
+      url: string
+      size: number | null
+      sha256: string | null
+      fromArtifactHash: string
+      toArtifactHash: string
+    }>
+  } | null
+  reason: string
+}> {
   const target = await db.appVersion.findUnique({ where: { id: toVersionId } })
-  if (!target || target.platform !== platform) return null
-  if (compareVersionStrings(fromVersion, target.version) >= 0) return null
+  if (!target || target.platform !== platform) return { chain: null, reason: 'target-version-not-found' }
+  if (compareVersionStrings(fromVersion, target.version) >= 0) return { chain: null, reason: 'client-not-older-than-target' }
 
   const edges = await db.appVersionDelta.findMany({ where: { platform } })
-  if (edges.length === 0) return null
+  if (edges.length === 0) return { chain: null, reason: 'no-deltas-published' }
 
   // BFS from fromVersion → target.version
   const adjacency = new Map<string, typeof edges>()
@@ -276,21 +301,24 @@ export async function computeDeltaChain(platform: string, fromVersion: string, t
         const newPath = [...node.path, edge]
         if (edge.toVersion === target.version) {
           return {
-            runtimeKey: target.runtimeKey || '',
-            nativeFingerprint: target.nativeFingerprint || '',
-            targetAsarSha256: target.asarSha256 || '',
-            targetApkSha256: target.fileHash || '',
-            hops: newPath.map((h) => ({
-              id: h.id,
-              kind: h.kind,
-              fromVersion: h.fromVersion,
-              toVersion: h.toVersion,
-              url: `/api/app-versions/delta/${h.id}/download`,
-              size: h.fileSize,
-              sha256: h.fileHash,
-              fromArtifactHash: h.fromArtifactHash,
-              toArtifactHash: h.toArtifactHash,
-            })),
+            reason: 'ok',
+            chain: {
+              runtimeKey: target.runtimeKey || '',
+              nativeFingerprint: target.nativeFingerprint || '',
+              targetAsarSha256: target.asarSha256 || '',
+              targetApkSha256: target.fileHash || '',
+              hops: newPath.map((h) => ({
+                id: h.id,
+                kind: h.kind,
+                fromVersion: h.fromVersion,
+                toVersion: h.toVersion,
+                url: `/api/app-versions/delta/${h.id}/download`,
+                size: h.fileSize,
+                sha256: h.fileHash,
+                fromArtifactHash: h.fromArtifactHash,
+                toArtifactHash: h.toArtifactHash,
+              })),
+            },
           }
         }
         if (newPath.length < MAX_CHAIN_HOPS) {
@@ -301,7 +329,7 @@ export async function computeDeltaChain(platform: string, fromVersion: string, t
     }
     frontier = nextFrontier
   }
-  return null
+  return { chain: null, reason: 'no-verifiable-chain' }
 }
 
 export { readOutrefHeader, createOutref }

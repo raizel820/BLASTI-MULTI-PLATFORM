@@ -189,10 +189,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   /**
    * Stateless update check against the cloud (GET /api/app-versions/check).
+   * Payload (optional): { apiLevel?: number } — forwarded so the server's
+   * compatibility map evaluates THIS desktop build accurately (0.6.52).
    * Returns { success, updateAvailable, isMandatory, latestVersion, downloadUrl,
-   * releaseNotes*, fileSize, fileHash, ... } or { success:false, error }.
+   * releaseNotes*, fileSize, fileHash, delta?, ... } or { success:false, error }.
    */
-  checkForUpdates: () => ipcRenderer.invoke('updates:check'),
+  checkForUpdates: (payload) => ipcRenderer.invoke('updates:check', payload),
 
   /**
    * Start downloading an installer in the main process. Payload { url, version } —

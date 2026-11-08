@@ -36,6 +36,11 @@ files:
   # packaged app would crash with "Cannot find module './client-attestation'"
   # on first launch. Caught by the check-packaging guard in CI.
   - client-attestation.js
+  # 0.6.52 update observability: main.js requires ./update-log.js (the
+  # dedicated update-pipeline diagnostic logger behind every updates:* IPC
+  # handler + both boot self-heals). Same failure class as load-env.js —
+  # missing it would crash EVERY packaged app at the first update check.
+  - update-log.js
   - package.json
   - build-stamp.json
   - local-api/**/*

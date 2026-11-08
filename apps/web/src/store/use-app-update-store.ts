@@ -110,7 +110,8 @@ type Shell = 'electron' | 'capacitor' | 'web';
 
 interface ElectronUpdatesAPI {
   getAppVersion?: () => Promise<string>;
-  checkForUpdates?: () => Promise<CheckResponse>;
+  /** 0.6.52 — accepts { apiLevel? } so the server's compat map sees the desktop build. */
+  checkForUpdates?: (payload?: { apiLevel?: number }) => Promise<CheckResponse>;
   downloadUpdate?: (payload: { url: string; version: string; fileHash?: string; fileSize?: number }) => Promise<unknown>;
   installUpdate?: () => Promise<{ ok?: boolean; error?: string }>;
   /** 0.6.30 — download+apply the delta chain (asar + tree patches). */
@@ -151,6 +152,7 @@ interface PushPayload {
 
 interface CheckResponse {
   success?: boolean;
+  error?: string;
   updateAvailable?: boolean;
   isMandatory?: boolean;
   latestVersion?: string;
@@ -162,6 +164,8 @@ interface CheckResponse {
   fileSize?: number;
   fileHash?: string;
   delta?: DeltaManifest | null;
+  /** 0.6.52 — when delta is null the server says WHY (no-chain-published, runtime-key-changed…). */
+  deltaUnavailableReason?: string;
   /** 0.6.31 — API compatibility map evaluation (absent on older servers). */
   compat?: CompatEvaluation | null;
 }
@@ -361,6 +365,36 @@ async function fetchCheck(platform: string, version: string): Promise<CheckRespo
   }
 }
 
+// ─── 0.6.52 — update-pipeline decision logging ──────────────────────────────
+// Every check/decision/failure prints ONE structured line; the renderer's
+// remote logger captures console.* and merges the main process's
+// update-diag.log tail, so a single cloud-vault query shows WHY an update
+// was delivered as a full installer, why a delta chain was refused, and
+// which installer launcher leg failed — no more "nothing happened".
+function ulog(tag: string, message: string, extra?: Record<string, unknown>): void {
+  try {
+    let line = `[update:${tag}] ${message}`;
+    if (extra) {
+      const parts = Object.entries(extra)
+        .filter(([, v]) => v !== undefined)
+        .map(([k, v]) => (typeof v === 'object' && v !== null ? `${k}=${JSON.stringify(v)}` : `${k}=${String(v)}`));
+      if (parts.length) line += ` | ${parts.join(' ')}`;
+    }
+    console.info(line);
+  } catch { /* logging must never break the store */ }
+}
+
+/** One-line summary of the server's delta offer (or refusal reason). */
+function describeDelta(res: CheckResponse): Record<string, unknown> {
+  const d = res.delta && res.delta.supported && Array.isArray(res.delta.hops) ? res.delta : null;
+  return {
+    deltaOffered: d ? `${d.hops.length} hop(s)` : (res.delta ? 'present-but-unusable' : 'none'),
+    deltaBytes: d ? d.totalSize : 0,
+    deltaChain: d ? d.hops.map((h) => `${h.fromVersion}→${h.toVersion}`).join('+') : undefined,
+    serverReason: d ? undefined : (res.deltaUnavailableReason || (res.delta ? 'malformed-delta' : 'no-chain-published')),
+  };
+}
+
 // ─── Android download polling ────────────────────────────────────────────────
 
 /**
@@ -482,13 +516,24 @@ function createAppUpdateStore() {
           if (api && !version) return finishIdle();
           let res: CheckResponse | null = null;
           if (api) {
-            res = (await api.checkForUpdates?.()) ?? null;
+            // 0.6.52 — forward APP_API_LEVEL so the server's compat map
+            // evaluates the desktop build (main resolves it into the URL).
+            res = (await api.checkForUpdates?.({ apiLevel: APP_API_LEVEL })) ?? null;
           } else {
             // Dev/preview (no preload bridge): query the same public endpoint
             // from the renderer with a placeholder current version.
             res = await fetchCheck(desktopPlatform(), '0.0.1');
           }
-          if (!res?.success) checkFailed = true;
+          if (!res?.success) {
+            ulog('check', 'check FAILED — cloud unreachable or endpoint error', { trigger, error: res && res.error ? res.error : 'no-response' });
+            checkFailed = true;
+          }
+          if (res?.success) {
+            ulog('check', res.updateAvailable
+              ? `update available v${res.currentVersion || version} → v${res.latestVersion}`
+              : 'app is up to date',
+            { trigger, mandatory: res.isMandatory === true, installerBytes: res.fileSize || 0, ...(res.updateAvailable ? describeDelta(res) : {}) });
+          }
           if (res?.success && res.updateAvailable && res.latestVersion && res.downloadUrl) {
             info = {
               version: res.latestVersion,
@@ -519,6 +564,7 @@ function createAppUpdateStore() {
           for (const platform of ['android', 'android-debug']) {
             const res = await fetchCheck(platform, version);
             if (!res?.success || !res.updateAvailable || !res.latestVersion || !res.downloadUrl) continue;
+            ulog('check', `update available v${res.currentVersion || version} → v${res.latestVersion}`, { trigger, platform, mandatory: res.isMandatory === true, installerBytes: res.fileSize || 0, ...describeDelta(res) });
             info = {
               version: res.latestVersion,
               currentVersion: res.currentVersion || version,
@@ -580,6 +626,17 @@ function createAppUpdateStore() {
     startDownload: async () => {
       const { info, status } = get();
       if (!info || status === 'downloading' || status === 'downloaded') return;
+      // 0.6.52 — THE delivery-mode decision line: delta chain vs full
+      // installer, with the exact reason. Paired with [update:check]'s
+      // deltaOffered field this closes the "only full installers" mystery.
+      const useDelta = !!(info.delta && info.delta.hops.length > 0 && electronAPI()?.installDeltaUpdate);
+      ulog('decision', useDelta ? 'delivery mode: DELTA CHAIN (differential patches, no NSIS run)' : 'delivery mode: FULL INSTALLER', {
+        from: info.currentVersion,
+        to: info.version,
+        deltaBytes: info.delta ? info.delta.totalSize : 0,
+        installerBytes: info.fileSize,
+        reason: useDelta ? 'delta-offered' : (!info.delta ? 'no-delta-offered-by-server' : (!electronAPI()?.installDeltaUpdate ? 'delta-bridge-missing' : 'no-hops')),
+      });
       set({ status: 'downloading', error: null, needsInstallPermission: false, manualInstallAvailable: false, progress: { percent: 0, receivedBytes: 0, totalBytes: info.fileSize } });
       try {
         if (currentShell() === 'electron') {
@@ -588,7 +645,7 @@ function createAppUpdateStore() {
           // — no NSIS run at all, the app relaunches into the new version.
           // Any failure falls back to the full installer download below.
           if (info.delta && info.delta.hops.length > 0 && electronAPI()?.installDeltaUpdate) {
-            const result = await electronAPI()?.installDeltaUpdate({
+            const result = await electronAPI()?.installDeltaUpdate?.({
               hops: info.delta.hops,
               target: { version: info.version, asarSha256: info.delta.targetAsarSha256 || '' },
             });
@@ -599,6 +656,7 @@ function createAppUpdateStore() {
             }
             // Delta failed — report why, then fall through to the FULL installer.
             set({ deltaApplied: false });
+            ulog('delta', 'delta chain FAILED — falling back to full installer', { error: result?.error || 'unknown', hops: info.delta.hops.length });
             console.warn('[update] delta chain failed — falling back to full installer:', result?.error);
           }
           await electronAPI()?.downloadUpdate?.({ url: info.downloadUrl, version: info.version, fileHash: info.fileHash, fileSize: info.fileSize });
@@ -609,7 +667,7 @@ function createAppUpdateStore() {
           // APK; on success it returns the local path (installUpdate picks it
           // up WITHOUT a DownloadManager id).
           if (info.delta && info.delta.hops.length > 0 && plugin()?.installDeltaUpdate) {
-            const result = await plugin()?.installDeltaUpdate({
+            const result = await plugin()?.installDeltaUpdate?.({
               deltas: info.delta.hops.map((h) => ({ url: buildCloudUrl(h.url), sha256: h.sha256, fromVersion: h.fromVersion, toVersion: h.toVersion })),
               finalSha256: info.delta.targetApkSha256 || '',
               fromVersion: info.currentVersion,
@@ -622,6 +680,7 @@ function createAppUpdateStore() {
               return;
             }
             console.warn('[update] android delta chain failed — falling back to full APK:', result?.error);
+            ulog('delta', 'android delta chain FAILED — falling back to full APK', { error: result?.error || 'unknown' });
           }
           const res = await plugin()?.downloadUpdate?.({ url: info.absoluteDownloadUrl || info.downloadUrl, version: info.version });
           if (res?.downloadId) {
@@ -630,7 +689,8 @@ function createAppUpdateStore() {
           }
           else set({ status: 'error', error: 'download-failed' });
         }
-      } catch {
+      } catch (err) {
+        ulog('decision', 'startDownload threw — download never started', { error: err instanceof Error ? err.message : String(err ?? '') });
         set({ status: 'error', error: 'download-failed' });
       }
     },
@@ -638,6 +698,7 @@ function createAppUpdateStore() {
     install: async () => {
       const { status, deltaApplied } = get();
       if (status !== 'downloaded') return;
+      ulog('install', deltaApplied ? 'install = RELAUNCH ONLY (delta already applied — no NSIS run)' : 'install = NSIS INSTALLER (main quits, silent install, relaunch)', { to: get().info?.version });
       set({ status: 'installing' });
       try {
         if (currentShell() === 'electron') {
@@ -653,6 +714,7 @@ function createAppUpdateStore() {
           // launcher leg (waiter + PowerShell) failed. Surface the manual
           // fallback instead of pretending.
           if (result && result.ok === false) {
+            ulog('install', 'NSIS install could NOT start — manual open-installer fallback armed', { error: result.error || 'unknown' });
             set({ status: 'downloaded', error: 'install-spawn-failed', manualInstallAvailable: true });
             return;
           }
@@ -682,6 +744,7 @@ function createAppUpdateStore() {
       } catch (err) {
         pendingInstallFromVersion = null;
         const msg = err instanceof Error ? err.message : String(err ?? '');
+        ulog('install', 'install() threw', { error: msg });
         // 0.6.18: only a REAL permission rejection may set needsInstallPermission.
         // Labeling file-lookup failures ("apk-not-found", "install-failed") as
         // permission problems was half of the field loop: the UI kept offering
@@ -735,6 +798,9 @@ function createAppUpdateStore() {
 
     applyProgress: (payload) => {
       if (payload.status === 'downloading') {
+        // 0.6.52 — stage-tagged progress: 'download' | 'apply-asar-N' |
+        // 'apply-tree-N' | 'swap-asar' reveal exactly where a delta sits.
+        if (payload.stage) ulog('progress', `delta stage: ${payload.stage}`, { percent: payload.percent ?? 0 });
         set({
           status: 'downloading',
           progress: {
@@ -752,6 +818,7 @@ function createAppUpdateStore() {
         void maybeAutoInstall();
       } else if (payload.status === 'error') {
         stopAndroidPolling();
+        ulog('progress', 'main reported a download/install ERROR event', { error: payload.error || 'unknown', version: payload.version || '', stage: payload.stage });
         set({ status: 'error', error: payload.error || 'download-failed' });
       }
     },
@@ -760,6 +827,7 @@ function createAppUpdateStore() {
       const shell = currentShell();
       if (shell === 'web') return;
       if (!payload?.version || !payload?.downloadUrl) return;
+      ulog('push', 'pushed update payload received (device-telemetry check-in)', { version: payload.version, mandatory: payload.isMandatory === true || payload.push?.isMandatory === true });
       const { info, status } = get();
       // A download already targeting THIS version keeps running untouched.
       if (status === 'downloading' && info?.version === payload.version) return;
@@ -812,6 +880,7 @@ function createAppUpdateStore() {
               compat: res.compat ?? next.compat ?? null,
             };
             set({ info: fresh });
+            ulog('push', 'fresh /check grafted onto the pushed payload', describeDelta(res));
             await maybeAutoDownload(fresh);
             return;
           }
@@ -839,8 +908,16 @@ async function maybeAutoDownload(info: AppUpdateInfo) {
   // SERVER-ONLY releases never trigger an app download (nothing app-facing).
   if (info.compat?.serverOnlyUpdate && !info.isMandatory) return;
   const settings = loadAppUpdateSettings();
-  if (!settings.autoDownload) return;
-  if (settings.autoDownloadWifiOnly && !(await isWifiConnection())) return;
+  if (!settings.autoDownload) {
+    ulog('decision', 'auto-download skipped — disabled in update settings', { to: info.version });
+    return;
+  }
+  const wifiOk = !(settings.autoDownloadWifiOnly && !(await isWifiConnection()));
+  if (!wifiOk) {
+    ulog('decision', 'auto-download skipped — not on an unmetered/Wi-Fi connection', { to: info.version });
+    return;
+  }
+  ulog('decision', 'auto-download accepted — starting delivery', { to: info.version, autoInstall: settings.autoInstall });
   // Mandatory or optional — download in the background either way.
   storeInstance?.getState().startDownload();
 }
