@@ -921,18 +921,25 @@ function runUpdateWaiterMode(w) {
     setTimeout(() => { try { app.exit(0); } catch { process.exit(0); } }, 300);
   };
 
-  const runInstaller = () => {
+  // UPDATE-0.6.57 — a spawn failure or a nonzero NSIS exit at install moment
+  // is RETRIED (up to 4 attempts, 5s apart) before the waiter gives up and
+  // relaunches the OLD app: endpoint AV suites regularly hold the freshly
+  // written installer (or the target files) right after the app exits, and
+  // the old one-shot flow surfaced that as a silent "update did nothing".
+  const runInstaller = (attempt) => {
+    const tryNo = attempt || 1;
     if (!fs.existsSync(w.installer)) {
       appendLog('installer file missing — nothing to do');
       setTimeout(() => { try { app.exit(1); } catch { process.exit(1); } }, 300);
       return;
     }
-    appendLog('app exited — running installer /S');
+    appendLog(`app exited — running installer /S (attempt ${tryNo}/4)`);
     let child;
     try {
       child = cp.spawn(w.installer, ['/S'], { stdio: 'ignore', windowsHide: true });
     } catch (err) {
-      appendLog('installer spawn failed: ' + (err && err.message));
+      appendLog(`installer spawn failed (attempt ${tryNo}/4): ` + (err && err.message));
+      if (tryNo < 4) return setTimeout(() => runInstaller(tryNo + 1), 5000);
       relaunch();
       return;
     }
@@ -942,14 +949,25 @@ function runUpdateWaiterMode(w) {
       appendLog('installer timeout (20 min) — relaunching');
       relaunch();
     }, 20 * 60 * 1000);
+    let decided = false; // 'error' and 'exit' must never both act
     child.on('exit', (code) => {
+      if (decided) return;
+      decided = true;
       clearTimeout(timer);
-      appendLog(`installer finished (exit ${code === null || code === undefined ? 'n/a' : code})`);
+      const codeStr = code === null || code === undefined ? 'n/a' : String(code);
+      appendLog(`installer finished (exit ${codeStr})`);
+      if (code && tryNo < 4) {
+        appendLog(`installer exit ${codeStr} nonzero — retrying in 5s (AV/target file lock suspected)`);
+        return setTimeout(() => runInstaller(tryNo + 1), 5000);
+      }
       relaunch();
     });
     child.on('error', (err) => {
+      if (decided) return;
+      decided = true;
       clearTimeout(timer);
-      appendLog('installer error: ' + (err && err.message));
+      appendLog(`installer error (attempt ${tryNo}/4): ` + (err && err.message));
+      if (tryNo < 4) return setTimeout(() => runInstaller(tryNo + 1), 5000);
       relaunch();
     });
   };
@@ -2111,6 +2129,119 @@ async function sha256File(filePath) {
   });
 }
 
+// UPDATE-0.6.57 — LOCK PROBE. shell.openPath collapses sharing violations,
+// ACL denials and SmartScreen blocks into one generic "Failed to open path",
+// which made the 0.6.55 field logs useless ("which process? what lock?").
+// A write handle ('r+') is exactly what an executing image section and an AV
+// real-time scan deny, while the owner process (us) can always take it when
+// nothing else holds the file — so the probe verdict is definitive evidence
+// for the field log and the cloud telemetry.
+function probeInstallerLock(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r+');
+  } catch (err) {
+    return { locked: true, code: (err && err.code) || 'unknown', message: (err && err.message) || String(err) };
+  }
+  try { fs.closeSync(fd); } catch { /* already closed */ }
+  return { locked: false, code: '', message: '' };
+}
+
+// UPDATE-0.6.57 — WAIT FOR LOCK RELEASE. The 0.6.55 field log (2026-11-09)
+// shows a fresh 162 MB installer staying unopenable for 2+ MINUTES while the
+// endpoint AV finished its real-time scan — the old single 2s shell retry
+// never had a chance. When the probe says the file is held, poll every 3s up
+// to maxMs for release BEFORE spending the launcher legs; every transition is
+// logged so the field log shows exactly how long the lock lasted.
+async function waitForInstallerUnlock(file, maxMs = 45000) {
+  const startedAt = Date.now();
+  const first = probeInstallerLock(file);
+  if (!first.locked) return { locked: false, waitedMs: 0, code: '' };
+  updateLog('INSTALL', 'installer file is LOCKED by another process (sharing violation) — waiting for release before the launcher legs', { file, code: first.code, maxWaitMs: maxMs });
+  while (Date.now() - startedAt < maxMs) {
+    await new Promise((r) => setTimeout(r, 3000));
+    const p = probeInstallerLock(file);
+    if (!p.locked) {
+      updateLog('INSTALL', 'installer lock RELEASED — continuing with the launcher legs', { file, waitedMs: Date.now() - startedAt });
+      return { locked: false, waitedMs: Date.now() - startedAt, code: '' };
+    }
+  }
+  updateLog('INSTALL', 'installer STILL locked after the wait window — attempting legs anyway', { file, waitedMs: Date.now() - startedAt, code: first.code });
+  pushUpdateFailureToCloud('INSTALL', 'installer file locked by another process past the wait window (AV real-time scan suspected)', { file, code: first.code, waitedMs: Date.now() - startedAt });
+  return { locked: true, waitedMs: Date.now() - startedAt, code: first.code };
+}
+
+// UPDATE-0.6.57 — FRESH-COPY LAUNCH. The classic Windows workaround for a
+// stubborn installer lock: AV verdicts are cached PER FILE, so a byte-
+// identical copy under a new name starts with a clean slate, rescans briefly
+// and executes — while the original stays held. If even READING the original
+// fails (copyFileSync throws EBUSY/EPERM) that is the definitive "exclusively
+// locked" diagnosis for the field log. The copy name is namespaced
+// `blasti-update-launch-*` so neither the self-heal regex (`^BLASTI-Setup-`)
+// nor the newest-exe fallbacks (which exclude the namespace) can mistake it
+// for a pending release artifact.
+function makeFreshInstallerCopy(installer) {
+  try {
+    const dir = UPDATES_DIR();
+    const copyPath = path.join(dir, `blasti-update-launch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.exe`);
+    fs.copyFileSync(installer, copyPath);
+    stripZoneIdentifier(copyPath);
+    updateLog('INSTALL-LEG', 'fresh installer copy created (lock-dodge launch candidate)', { copyPath, bytes: fs.statSync(copyPath).size });
+    return copyPath;
+  } catch (err) {
+    updateLog('INSTALL-LEG', 'fresh installer copy FAILED — the original is EXCLUSIVELY locked (even read access denied)', { installer, code: (err && err.code) || '', error: (err && err.message) || String(err) });
+    return null;
+  }
+}
+
+// UPDATE-0.6.57 — housekeeping: fresh-copy launch candidates are one-shot;
+// anything older than 24h is swept at download/install time so the updates
+// dir never accumulates hundreds of MB of stale launchers.
+function sweepStaleLauncherCopies() {
+  if (process.platform !== 'win32') return;
+  try {
+    const dir = UPDATES_DIR();
+    if (!fs.existsSync(dir)) return;
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const f of fs.readdirSync(dir)) {
+      if (!/^blasti-update-launch-.*\.exe$/i.test(f)) continue;
+      const p = path.join(dir, f);
+      try { if (fs.statSync(p).mtimeMs < cutoff) fs.unlinkSync(p); } catch { /* locked — next sweep */ }
+    }
+  } catch { /* best effort */ }
+}
+
+// UPDATE-0.6.57 — shared ShellExecute launcher with the fresh-copy dodge:
+// attempt 1 opens the ORIGINAL installer; on failure a byte-identical copy is
+// tried, then up to two settle retries (5s apart) with a probe verdict logged
+// before each. Returns { ok, via, target, error } — ok=true means a wizard
+// window is up. Used by BOTH the install shell leg and the manual fallback so
+// their field behaviour can never drift apart again.
+async function openInstallerViaShellWithFallbacks(installer, logStage) {
+  const openOnce = async (p) => {
+    try { return await shell.openPath(p); } catch (err) { return String(err && err.message || err); }
+  };
+  let target = installer;
+  let err = await openOnce(target);
+  if (!err) return { ok: true, via: 'original', target };
+  logStage('shell.openPath of the original failed — creating a fresh copy (lock-dodge)', { error: err, target });
+  const copyPath = makeFreshInstallerCopy(installer);
+  if (copyPath) {
+    target = copyPath;
+    err = await openOnce(copyPath);
+    if (!err) return { ok: true, via: 'fresh-copy', target };
+    logStage('shell.openPath of the fresh copy failed too — settle retries follow', { error: err, target });
+  }
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    const probe = probeInstallerLock(installer);
+    logStage(`shell.openPath settle retry ${attempt}/2`, { target, lockProbe: probe.locked ? `locked:${probe.code}` : 'unlocked' });
+    err = await openOnce(target);
+    if (!err) return { ok: true, via: copyPath ? 'fresh-copy-retry' : 'original-retry', target };
+  }
+  return { ok: false, target, error: err || 'unknown-shell-error' };
+}
+
 function sendUpdateProgress(payload) {
   for (const win of BrowserWindow.getAllWindows()) {
     try { if (!win.isDestroyed()) win.webContents.send('update:progress', payload); } catch { /* window gone */ }
@@ -2202,6 +2333,7 @@ ipcMain.handle('updates:download', async (_e, payload) => {
     return { status: 'busy', version: activeUpdateDownload.version };
   }
 
+  sweepStaleLauncherCopies(); // 0.6.57 — one-shot launch copies never pile up
   const fileName = path.basename(resolved.split('?')[0]) || `BLASTI-Setup-${version || 'update'}.exe`;
   const dest = path.join(UPDATES_DIR(), /^BLASTI-Setup-.*\.exe$/i.test(fileName) ? fileName : `BLASTI-Setup-${version || 'update'}.exe`);
   try { fs.mkdirSync(path.dirname(dest), { recursive: true }); } catch { /* exists */ }
@@ -2478,7 +2610,9 @@ async function downloadSingleStream(url, dest, emit) {
 async function installDownloadedUpdate() {
   const installer = lastDownloadedInstaller || (() => {
     try {
-      const files = fs.readdirSync(UPDATES_DIR()).filter((f) => /\.(exe|dmg|appimage|deb)$/i.test(f))
+      // 0.6.57 — exclude the `blasti-update-*` namespace (fresh-copy launch
+      // candidates, stray old waiter copies) from the newest-artifact guess.
+      const files = fs.readdirSync(UPDATES_DIR()).filter((f) => /\.(exe|dmg|appimage|deb)$/i.test(f) && !/^blasti-update-/i.test(f))
         .map((f) => ({ f, t: fs.statSync(path.join(UPDATES_DIR(), f)).mtimeMs }))
         .sort((a, b) => b.t - a.t);
       return files.length ? path.join(UPDATES_DIR(), files[0].f) : null;
@@ -2568,6 +2702,39 @@ async function installDownloadedUpdate() {
       updateLog('INSTALL-LEG', 'waiter leg FAILED (no heartbeat within 6s — boot crash or AV kill) — trying shell leg', { pid: pid || 'none' });
       pushUpdateFailureToCloud('INSTALL-LEG', 'waiter leg FAILED (no heartbeat within 6s — boot crash or AV kill)', { pid: pid || 'none' });
     }
+    // UPDATE-0.6.57 — LEG 2: WAIT + DIRECT SPAWN. If the installer is still
+    // held by another process (sharing violation — the endpoint AV finishing
+    // a real-time scan of a fresh 160+ MB exe is the usual holder; the
+    // 0.6.55 field log shows such locks outliving TWO shell attempts AND the
+    // manual open), wait up to 45s for release first. Then spawn the NSIS
+    // wizard DIRECTLY (CreateProcessW — the same call the waiter uses
+    // internally): shell.openPath's ShellExecute layer is where SmartScreen
+    // reputation checks and AV shell hooks delay/deny fresh unsigned
+    // installers ("Failed to open path" after ~20s in the field log); a
+    // direct spawn skips that layer entirely.
+    if (app.isPackaged) {
+      sweepStaleLauncherCopies();
+      const lock = await waitForInstallerUnlock(installer);
+      const cpDirect = require('child_process');
+      let spawnErr = '';
+      let wizardPid = 0;
+      try {
+        const child = cpDirect.spawn(installer, [], { detached: true, stdio: 'ignore' });
+        child.on('error', () => { /* async exec failure — procAlive() below decides */ });
+        child.unref();
+        wizardPid = child.pid || 0;
+      } catch (err) { spawnErr = (err && err.message) || String(err); }
+      updateLog('INSTALL-LEG', 'direct spawn leg (CreateProcessW wizard — no ShellExecute)', { installer, wizardPid: wizardPid || 'none', spawnThrow: spawnErr || undefined, wasLocked: lock.locked, lockWaitMs: lock.waitedMs });
+      if (wizardPid && await procAlive(wizardPid, 2000)) {
+        console.log('[BLASTI Desktop] installer wizard spawned directly (pid', wizardPid + ') — quitting for install');
+        updateLog('INSTALL-LEG', 'direct spawn leg CONFIRMED alive — quitting for install', { pid: wizardPid });
+        sendUpdateProgress({ status: 'installing', version: '' });
+        quitForUpdate();
+        return { ok: true, via: 'direct-spawn-wizard' };
+      }
+      if (!spawnErr) spawnErr = wizardPid ? 'process died within 2s' : 'spawn returned no pid';
+      updateLog('INSTALL-LEG', 'direct spawn leg FAILED — trying the shell leg', { wizardPid: wizardPid || 'none', error: spawnErr });
+    }
     // Fallbacks: dev runs (not packaged), per-machine (Program Files) installs
     // (the PowerShell leg elevates via UAC — a non-elevated silent install
     // into Program Files ALWAYS fails silently), or a failed waiter copy.
@@ -2590,21 +2757,13 @@ async function installDownloadedUpdate() {
       // of seconds ("Failed to open path"). Harmless when the stream is absent.
       const motwStripped = stripZoneIdentifier(installer);
       updateLog('INSTALL-LEG', 'shell.openPath leg starting (visible NSIS wizard)', { installer, preStatExists: preStat.exists, preStatBytes: preStat.bytes, motwStripped });
-      const openViaShell = async () => {
-        try { return await shell.openPath(installer); } catch (err) { return String(err && err.message || err); }
-      };
-      let shellOpenErr = await openViaShell();
-      // 0.6.56 — one retry after a short settle: an AV real-time scan can hold
-      // the fresh exe exclusively for a while; the second attempt succeeds
-      // once the scan releases it.
-      if (shellOpenErr) {
-        updateLog('INSTALL-LEG', 'shell.openPath attempt 1 failed — retrying after 2s settle (AV scan release suspected)', { error: shellOpenErr });
-        await new Promise((r) => setTimeout(r, 2000));
-        shellOpenErr = await openViaShell();
-      }
-      if (!shellOpenErr) {
-        console.log('[BLASTI Desktop] installer opened through the shell (visible wizard) — quitting for install');
-        updateLog('INSTALL-LEG', 'shell.openPath leg SUCCEEDED — quitting for install');
+      // UPDATE-0.6.57 — the shared launcher: original → fresh copy → settle
+      // retries, each with a lock-probe verdict in the log (replaces the old
+      // single 2s retry that the 2-minute field lock defeated).
+      const shellResult = await openInstallerViaShellWithFallbacks(installer, (msg, extra) => updateLog('INSTALL-LEG', msg, extra));
+      if (shellResult.ok) {
+        console.log('[BLASTI Desktop] installer opened through the shell (' + shellResult.via + ') — quitting for install');
+        updateLog('INSTALL-LEG', 'shell.openPath leg SUCCEEDED — quitting for install', { via: shellResult.via, target: shellResult.target });
         sendUpdateProgress({ status: 'installing', version: '' });
         quitForUpdate();
         return { ok: true, via: 'shell-wizard' };
@@ -2612,12 +2771,13 @@ async function installDownloadedUpdate() {
       const postExists = fs.existsSync(installer);
       // AV-QUARANTINE SIGNAL: openPath failed AND the file disappeared while
       // the shell call ran (~seconds of AV scanning) → say so in the log.
-      updateLog('INSTALL-LEG', 'shell.openPath leg failed', {
-        error: shellOpenErr,
+      updateLog('INSTALL-LEG', 'shell.openPath leg failed (original + fresh copy + settle retries exhausted)', {
+        error: shellResult.error,
+        lastTarget: shellResult.target,
         installerStillExists: postExists,
         avQuarantineSuspected: preStat.exists && !postExists,
       });
-      console.warn('[BLASTI Desktop] shell.openPath leg failed:', shellOpenErr, postExists ? '' : '(installer file VANISHED — AV quarantine suspected)');
+      console.warn('[BLASTI Desktop] shell.openPath leg failed:', shellResult.error, postExists ? '' : '(installer file VANISHED — AV quarantine suspected)');
     }
     const psPid = spawnSilentWindowsInstall(installer, { elevate: app.isPackaged && !perUser });
     if (psPid && await procAlive(psPid, 2000)) {
@@ -2970,7 +3130,9 @@ ipcMain.handle('updates:install', async () => {
 ipcMain.handle('updates:open-installer', async () => {
   const installer = lastDownloadedInstaller || (() => {
     try {
-      const files = fs.readdirSync(UPDATES_DIR()).filter((f) => /\.(exe|dmg|appimage|deb)$/i.test(f))
+      // 0.6.57 — exclude the `blasti-update-*` namespace (fresh-copy launch
+      // candidates, stray old waiter copies) from the newest-artifact guess.
+      const files = fs.readdirSync(UPDATES_DIR()).filter((f) => /\.(exe|dmg|appimage|deb)$/i.test(f) && !/^blasti-update-/i.test(f))
         .map((f) => ({ f, t: fs.statSync(path.join(UPDATES_DIR(), f)).mtimeMs }))
         .sort((a, b) => b.t - a.t);
       return files.length ? path.join(UPDATES_DIR(), files[0].f) : null;
@@ -2980,29 +3142,26 @@ ipcMain.handle('updates:open-installer', async () => {
     updateLog('MANUAL', 'manual open refused — no installer on disk', { requestedPath: installer || 'none' });
     return { ok: false, error: 'no-download' };
   }
-  // 0.6.56 — strip Mark-of-the-Web + one settle retry (same reasoning as the
-  // shell leg of updates:install — SmartScreen/AV can hold a fresh exe).
+  // 0.6.56 — strip Mark-of-the-Web (SmartScreen can delay/deny a fresh exe).
+  // UPDATE-0.6.57 — full hardening for the manual path too: lock probe → 20s
+  // release wait → original → fresh copy → settle retries (the 0.6.55 field
+  // log shows the manual open failing against the same 2-minute AV lock).
   const motwStripped = stripZoneIdentifier(installer);
-  let result = '';
-  try { result = await shell.openPath(installer); } catch (err) { result = String(err && err.message || err); }
-  if (result) {
-    updateLog('MANUAL', 'manual open attempt 1 failed — retrying after 2s settle', { installer, error: result, motwStripped });
-    await new Promise((r) => setTimeout(r, 2000));
-    try { result = await shell.openPath(installer); } catch (err) { result = String(err && err.message || err); }
-  }
-  if (!result) {
+  await waitForInstallerUnlock(installer, 20000);
+  const shellResult = await openInstallerViaShellWithFallbacks(installer, (msg, extra) => updateLog('MANUAL', msg, extra));
+  if (shellResult.ok) {
     // 0.6.56 — FIELD ROOT CAUSE of the "this file is being used by another
     // app" dialog during manual installs: the wizard opened WHILE this app
     // was still running, so the assisted NSIS run hit blasti.exe's image
     // lock. Schedule our exit right after the wizard is up — the installer
     // takes over cleanly and its finish page relaunches the app.
-    updateLog('MANUAL', 'manual open succeeded — quitting so the wizard never hits the running app image lock', { installer });
+    updateLog('MANUAL', 'manual open succeeded (' + shellResult.via + ') — quitting so the wizard never hits the running app image lock', { target: shellResult.target, motwStripped });
     sendUpdateProgress({ status: 'installing', version: '' });
     setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 1500);
-    return { ok: true, quittingForInstall: true, path: installer };
+    return { ok: true, quittingForInstall: true, path: shellResult.target };
   }
-  updateLog('MANUAL', 'manual open FAILED (user must run the file from Explorer themselves)', { installer, error: result || undefined });
-  return { ok: false, error: result || undefined, path: installer };
+  updateLog('MANUAL', 'manual open FAILED (user must run the file from Explorer themselves)', { installer, error: shellResult.error || undefined, motwStripped });
+  return { ok: false, error: shellResult.error || undefined, path: installer };
 });
 
 /** Relaunch AFTER a successful delta apply — the new asar loads on boot. */
