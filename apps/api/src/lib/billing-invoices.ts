@@ -398,6 +398,119 @@ export async function ensureInvoiceForSmsPurchase(
   return created
 }
 
+/**
+ * 0.6.55 — Ensure an invoice exists for a FULFILLED `HardwareOrder`.
+ * Closes the dead-code gap found in the 0.6.55 audit: the schema advertised
+ * `sourceType: 'HARDWARE'` but no fulfillment path ever issued the document.
+ * Idempotent like the other ensure* helpers; only FULFILLED orders (the paid
+ * state — approved-but-unshipped orders are not yet billable) get an invoice.
+ */
+export async function ensureInvoiceForHardwareOrder(
+  orderId: string,
+  opts: { issuedBy?: string } = {},
+): Promise<{ id: string; year: number; number: number } | null> {
+  const existing = await db.invoice.findUnique({ where: { sourceId: orderId } })
+  if (existing) return { id: existing.id, year: existing.year, number: existing.number }
+
+  const order = await db.hardwareOrder.findUnique({
+    where: { id: orderId },
+    include: {
+      agency: {
+        select: {
+          id: true, name: true, customCode: true, address: true, city: true,
+          wilaya: true, phone: true, email: true, ownerId: true,
+          legalNif: true, legalNis: true, legalRib: true, legalRc: true,
+          legalServicePhone: true, legalName: true, legalAddress: true,
+        },
+      },
+      items: { include: { product: { select: { name: true, sku: true, category: true } } } },
+    },
+  })
+  if (!order) return null
+  if (order.status !== 'FULFILLED') return null
+  const agency = order.agency
+  if (!agency) return null
+
+  const issuer = await getBlastiLegalInfo()
+  const amount = order.upfrontTotal || order.totalBasePrice
+  const details = {
+    kind: 'HARDWARE',
+    paymentModel: order.paymentModel,
+    commitmentMonths: order.commitmentMonths ?? null,
+    items: order.items.map((i) => ({
+      name: i.product?.name || 'Hardware item',
+      sku: i.product?.sku || '',
+      category: i.product?.category || '',
+      quantity: i.quantity,
+      unitPrice: i.unitPrice,
+      lineTotal: i.unitPrice * i.quantity,
+    })),
+    hardwareOrderId: order.id,
+    paidAt: (order.updatedAt || order.createdAt).toISOString(),
+  }
+
+  const token = generateVerificationToken()
+  const year = new Date().getFullYear()
+
+  const created = await db.$transaction(async (tx) => {
+    let next: number
+    const counter = await tx.invoiceCounter.findUnique({ where: { year } })
+    if (!counter) {
+      await tx.invoiceCounter.create({ data: { year, lastNumber: 1 } })
+      next = 1
+    } else {
+      const updated = await tx.invoiceCounter.update({
+        where: { year },
+        data: { lastNumber: { increment: 1 } },
+      })
+      next = updated.lastNumber
+    }
+
+    return tx.invoice.create({
+      data: {
+        number: next,
+        year,
+        sourceType: 'HARDWARE',
+        sourceId: order.id,
+        agencyId: agency.id,
+        userId: agency.ownerId,
+        recipientType: 'AGENCY',
+        recipientName: agency.name,
+        issuerSnapshot: JSON.stringify(issuer),
+        recipientSnapshot: JSON.stringify(buildAgencySnapshot(agency)),
+        detailsSnapshot: JSON.stringify(details),
+        amount,
+        currency: 'DZD',
+        status: 'ISSUED',
+        verificationToken: token,
+        issuedBy: opts.issuedBy || 'AUTO',
+      },
+      select: { id: true, year: true, number: true },
+    })
+  })
+
+  try {
+    await db.auditLog.create({
+      data: {
+        action: 'INVOICE_ISSUED',
+        entityType: 'INVOICE',
+        entityId: created.id,
+        details: JSON.stringify({
+          displayNumber: formatInvoiceNumber(created.year, created.number),
+          sourceType: 'HARDWARE',
+          sourceId: order.id,
+          agencyId: agency.id,
+          amount,
+        }),
+      },
+    })
+  } catch (err) {
+    console.warn('[billing] Failed to write INVOICE_ISSUED audit log:', err)
+  }
+
+  return created
+}
+
 // ─── Verification ──────────────────────────────────────────────────────────
 
 export interface InvoiceVerificationResult {

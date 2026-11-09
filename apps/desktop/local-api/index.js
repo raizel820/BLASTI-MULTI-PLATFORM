@@ -3097,24 +3097,37 @@ function createApp() {
 
       // ── Task 22: account created but UNVERIFIED — no session yet ──
       if (reg.data.requiresVerification && reg.data.verificationToken) {
-        try {
-          // Task 5 — mirror the Algeria address onto the local User row from
-          // the register request body (cloud value preferred inside the
-          // helper; the body is the fallback for older clouds).
-          await upsertLocalUserFromCloud(cloudUser, { wilaya: body.wilaya, commune: body.commune })
-        } catch (e) {
-          console.warn('[LocalAPI] Register: local profile upsert failed:', e?.message || e)
+        // 0.6.54 — STAGED registration: the cloud NO LONGER creates the User
+        // row at register time (it lands in PendingRegistration and the real
+        // account is created at verify time). Mirroring the staged payload
+        // into the local User table would key a ghost row by the pending id
+        // that never matches the real account — skip the upsert entirely;
+        // POST /api/auth/verify upserts the REAL profile when it arrives.
+        if (reg.data.stagedRegistration !== true) {
+          try {
+            // Task 5 — mirror the Algeria address onto the local User row from
+            // the register request body (cloud value preferred inside the
+            // helper; the body is the fallback for older clouds).
+            await upsertLocalUserFromCloud(cloudUser, { wilaya: body.wilaya, commune: body.commune })
+          } catch (e) {
+            console.warn('[LocalAPI] Register: local profile upsert failed:', e?.message || e)
+          }
         }
         pendingVerificationPasswords.set(reg.data.verificationToken, {
           userId: cloudUser.id,
+          // 0.6.54 — staged signups carry the PENDING id here (no real user
+          // exists yet); the verify handler detects `staged` and re-keys the
+          // credential onto the verified account's id.
+          staged: reg.data.stagedRegistration === true,
           password,
           storedAt: Date.now(),
         })
-        // Prune stashes older than 30 minutes (verificationToken TTL is 15)
+        // Prune stashes older than 90 minutes (0.6.54 pending token TTL is 1h;
+        // the old 15-minute token only needed 30).
         for (const [k, v] of pendingVerificationPasswords) {
-          if (Date.now() - v.storedAt > 30 * 60 * 1000) pendingVerificationPasswords.delete(k)
+          if (Date.now() - v.storedAt > 90 * 60 * 1000) pendingVerificationPasswords.delete(k)
         }
-        console.log(`[LocalAPI] Account registered — awaiting email/phone verification: ${cloudUser.username || username}`)
+        console.log(`[LocalAPI] Registration staged — awaiting email/phone verification${reg.data.stagedRegistration === true ? ' (no account created yet)' : ''}: ${cloudUser.username || username}`)
         return c.json(reg.data, 201)
       }
 
@@ -3225,7 +3238,10 @@ function createApp() {
       }
 
       const stashed = pendingVerificationPasswords.get(body.verificationToken)
-      if (stashed && stashed.userId === verifiedUser.id) {
+      // 0.6.54 — staged signups stash the PENDING id (no real user existed at
+      // register time), so the id match only applies to legacy stashes; the
+      // credential is derived onto the REAL verified account id either way.
+      if (stashed && (stashed.staged || stashed.userId === verifiedUser.id)) {
         try {
           await storeDeviceCredential(verifiedUser.id, stashed.password)
         } catch (e) {
@@ -3769,13 +3785,21 @@ function createApp() {
   }
 
   const forwardPendingLogs = async () => {
-    if (!sessionToken || pendingCloudLogBatches.length === 0) return
+    if (pendingCloudLogBatches.length === 0) return
+    // 0.6.55 — ANONYMOUS FORWARD: the old gate (`!sessionToken → return`) kept
+    // update-failure trails hostage on machines where NOBODY signed in. The
+    // cloud vault now accepts tokenless batches (anon-<deviceId> folder), so
+    // batches without a session go out WITHOUT the Authorization header —
+    // same retry semantics, nothing dropped, nothing blocked on login.
     const batches = pendingCloudLogBatches.splice(0, pendingCloudLogBatches.length)
     for (const batch of batches) {
       try {
         const res = await fetch(cloudBaseUrl() + '/api/logs', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${sessionToken}` },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
+          },
           body: JSON.stringify(batch),
           signal: AbortSignal.timeout(15000),
         })
@@ -3831,8 +3855,31 @@ function createApp() {
       } catch (err) {
         console.warn('[LocalAPI] client-log write failed:', err && err.message)
       }
-      // Cloud forward — session-gated; failures re-queue (offline-first).
+      // Cloud forward — session-gated identities when a session exists;
+      // 0.6.55: tokenless batches forward ANONYMOUSLY (see forwardPendingLogs).
       if (entries.length > 0 && pendingCloudLogBatches.length < PENDING_LOG_BATCH_CAP) {
+        // Stamp the desktop install identity so anonymous batches land in the
+        // per-device anon-<deviceId> folder even from old web builds that do
+        // not send a deviceId themselves.
+        try {
+          if (body && typeof body === 'object' && !body.deviceId) {
+            const identity = require('path').join(
+              (global.__blastiUserData) || require('os').homedir() + '/.blasti',
+              'app-device-identity.json',
+            )
+            // The identity file lives under the REAL userData dir — prefer it.
+            let identityPath = identity
+            try {
+              const electron = require('electron')
+              if (electron && electron.app && typeof electron.app.getPath === 'function') {
+                identityPath = require('path').join(electron.app.getPath('userData'), 'app-device-identity.json')
+              }
+            } catch { /* bootstrap context without electron — keep the fallback */ }
+            const parsedIdentity = JSON.parse(require('fs').readFileSync(identityPath, 'utf8'))
+            const installId = parsedIdentity && (parsedIdentity.installId || parsedIdentity.deviceId || parsedIdentity.id)
+            if (typeof installId === 'string' && installId) body.deviceId = String(installId).slice(0, 64)
+          }
+        } catch { /* identity unavailable — anonymous shared folder is fine */ }
         pendingCloudLogBatches.push(body)
       }
       void forwardPendingLogs()

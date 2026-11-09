@@ -23,6 +23,7 @@ import {
   buildInvoiceVerifyUrl,
   ensureInvoiceForTransaction,
   ensureInvoiceForSmsPurchase,
+  ensureInvoiceForHardwareOrder,
   verifyInvoiceByToken,
 } from '../lib/billing-invoices'
 import {
@@ -41,7 +42,10 @@ const app = new Hono()
 function handleError(c: Context, error: unknown) {
   if (isRateLimitError(error)) {
     const rl = rateLimitErrorResponse(error)
-    return c.json({ success: false, error: rl.error }, rl.status as any)
+    // 0.6.55 fix — the payload lives under rl.data (rateLimitErrorResponse
+    // returns { data, status, headers }); rl.error was always undefined, so
+    // rate-limited billing calls answered with a bodyless error message.
+    return c.json({ success: false, error: rl.data.error }, rl.status as any)
   }
   const err = authErrorResponse(error)
   return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -203,12 +207,152 @@ app.get('/invoices', async (c) => {
       db.invoice.count({ where: where as any }),
     ])
 
+    // 0.6.55 — page-independent KPI totals over the SAME filtered set: issued
+    // count + invoiced amount (ISSUED only), cancelled count and the QR
+    // verification counter sum. The panel used to compute these from the
+    // loaded page only, so "invoiced total" lied whenever >50 invoices.
+    const [issuedAgg, cancelledCount] = await Promise.all([
+      db.invoice.aggregate({
+        where: { ...(where as any), status: 'ISSUED' },
+        _count: { _all: true },
+        _sum: { amount: true, verificationCount: true },
+      }),
+      db.invoice.count({ where: { ...(where as any), status: 'CANCELLED' } as any }),
+    ])
+    const totals = {
+      issuedCount: issuedAgg._count._all || 0,
+      invoicedAmount: issuedAgg._sum.amount ?? 0,
+      cancelled: cancelledCount,
+      verifications: issuedAgg._sum.verificationCount ?? 0,
+    }
+
     return c.json({
       success: true,
       invoices: rows.map(parseInvoice),
       total,
       limit,
       offset,
+      totals,
+    })
+  } catch (error) {
+    return handleError(c, error)
+  }
+})
+
+// ─── 0.6.55 — legacy backfill STATUS (admin) ────────────────────────────────
+// NOTE: MUST stay BEFORE GET /invoices/:id — otherwise Hono matches
+// "backfill-status" as an :id (same trap admin.ts documents for
+// /hardware/orders/stats). Drives the manager's backfill banner.
+app.get('/invoices/backfill-status', async (c) => {
+  try {
+    await requireAdmin(c)
+    const settledTx = await db.transaction.findMany({
+      where: { status: { in: ['APPROVED', 'COMPLETED'] }, type: { not: 'HARDWARE' } },
+      select: { id: true },
+    })
+    const settledSms = await db.smsPurchase.findMany({
+      where: { status: 'APPROVED' },
+      select: { id: true },
+    })
+    const candidateIds = [...settledTx.map((t) => t.id), ...settledSms.map((s) => s.id)]
+    const invoiced = await db.invoice.findMany({
+      where: { sourceId: { in: candidateIds } },
+      select: { sourceId: true },
+    })
+    const invoicedSet = new Set(invoiced.map((i) => i.sourceId))
+    const missing = candidateIds.filter((id) => !invoicedSet.has(id))
+    return c.json({
+      success: true,
+      missing: missing.length,
+      candidates: candidateIds.length,
+      byType: {
+        transaction: settledTx.filter((t) => !invoicedSet.has(t.id)).length,
+        sms: settledSms.filter((s) => !invoicedSet.has(s.id)).length,
+      },
+    })
+  } catch (error) {
+    return handleError(c, error)
+  }
+})
+
+const backfillAllSchema = z.object({
+  /** Per-call batch cap — the button repeats until "missing" hits zero. */
+  max: z.number().int().min(1).max(500).optional(),
+})
+
+/**
+ * POST /api/billing/invoices/backfill-all
+ * Idempotently issues invoices for up to `max` (default 100) settled payments
+ * that lack one. Returns what was created and how many remain, so the UI can
+ * loop or report completion. Year attribution follows the PAYMENT's year
+ * (createdAt) via the ensure helpers' numbering when they run in that year —
+ * the invoice NUMBER sequence stays per-issue-year as designed.
+ */
+app.post('/invoices/backfill-all', async (c) => {
+  try {
+    const admin = await requireAdmin(c)
+    let max = 100
+    try {
+      const parsed = backfillAllSchema.parse(await c.req.json().catch(() => ({})))
+      max = parsed.max ?? 100
+    } catch { /* default cap */ }
+
+    const settledTx = await db.transaction.findMany({
+      where: { status: { in: ['APPROVED', 'COMPLETED'] }, type: { not: 'HARDWARE' } },
+      select: { id: true },
+      orderBy: { createdAt: 'asc' },
+    })
+    const settledSms = await db.smsPurchase.findMany({
+      where: { status: 'APPROVED' },
+      select: { id: true },
+      orderBy: { createdAt: 'asc' },
+    })
+    const candidateIds: Array<{ sourceType: 'TRANSACTION' | 'SMS'; sourceId: string }> = [
+      ...settledTx.map((t) => ({ sourceType: 'TRANSACTION' as const, sourceId: t.id })),
+      ...settledSms.map((s) => ({ sourceType: 'SMS' as const, sourceId: s.id })),
+    ]
+    const invoiced = await db.invoice.findMany({
+      where: { sourceId: { in: candidateIds.map((x) => x.sourceId) } },
+      select: { sourceId: true },
+    })
+    const invoicedSet = new Set(invoiced.map((i) => i.sourceId))
+    const missing = candidateIds.filter((x) => !invoicedSet.has(x.sourceId))
+
+    let created = 0
+    let failed = 0
+    const errors: Array<{ sourceId: string; error: string }> = []
+    for (const candidate of missing.slice(0, max)) {
+      try {
+        const result = candidate.sourceType === 'TRANSACTION'
+          ? await ensureInvoiceForTransaction(candidate.sourceId, { issuedBy: `ADMIN:${admin.id}` })
+          : await ensureInvoiceForSmsPurchase(candidate.sourceId, { issuedBy: `ADMIN:${admin.id}` })
+        if (result) created += 1
+        else failed += 1
+      } catch (err) {
+        failed += 1
+        errors.push({ sourceId: candidate.sourceId, error: (err as Error)?.message || String(err) })
+      }
+    }
+
+    try {
+      await db.auditLog.create({
+        data: {
+          userId: admin.id,
+          action: 'INVOICE_BACKFILL_RUN',
+          entityType: 'INVOICE',
+          entityId: 'backfill-all',
+          details: JSON.stringify({ created, failed, remaining: Math.max(0, missing.length - created - failed), scanned: candidateIds.length }),
+        },
+      })
+    } catch { /* audit best-effort */ }
+
+    return c.json({
+      success: true,
+      created,
+      failed,
+      remaining: Math.max(0, missing.length - created - failed),
+      scanned: candidateIds.length,
+      errors: errors.slice(0, 10),
     })
   } catch (error) {
     return handleError(c, error)

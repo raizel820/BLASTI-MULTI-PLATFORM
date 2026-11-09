@@ -14,6 +14,7 @@
  *  - Logout: store logout() + success toast
  */
 import { apiFetch } from '@/lib/api-fetch';
+import { logError } from '@/lib/remote-logger';
 import { registerAvatarOverrideFromFile } from '@/lib/avatar-override';
 import { markLocalAvatarMutation } from '@/lib/user-store-refresh';
 import { cacheGet, cacheSet, cacheKeyFor } from '@/lib/local-cache';
@@ -376,9 +377,14 @@ export function CustomerSettings() {
           }).catch(() => { /* best-effort cleanup */ });
         }
       } else {
+        // 0.6.55 — profile-image failures carry the trigger tag so the Logs
+        // Manager's error-trigger filter isolates them (user mandate).
+        const detail = await res.json().catch(() => ({}));
+        logError('profile', `avatar upload failed (HTTP ${res.status})`, { status: res.status, error: (detail as { error?: string })?.error }, 'profile-image');
         toast.error(t('error'));
       }
-    } catch {
+    } catch (err) {
+      logError('profile', 'avatar upload threw', { error: err instanceof Error ? err.message : String(err) }, 'profile-image');
       toast.error(t('error'));
     } finally {
       setAvatarUploading(false);

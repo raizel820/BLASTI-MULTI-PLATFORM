@@ -24,6 +24,13 @@ import {
 import { Badge } from '@/components/ui/badge';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import {
   Table,
   TableBody,
   TableCell,
@@ -41,14 +48,17 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import { Eye, FileText, Loader2, ShieldCheck, Search, ReceiptText, Ban } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Eye, FileText, Loader2, ShieldCheck, Search, ReceiptText, Ban, History } from 'lucide-react';
 import { toast } from 'sonner';
 import { useLanguage } from '@/hooks/use-language';
 import {
   cancelInvoice,
   fetchInvoiceQr,
+  fetchInvoiceVerifications,
   fetchInvoices,
   type InvoiceRecord,
+  type InvoiceTotals,
+  type InvoiceVerificationEvent,
 } from '@/lib/billing-client';
 import { InvoicePreviewDialog } from './invoice-preview-dialog';
 
@@ -62,37 +72,47 @@ interface InvoicesPanelProps {
   pageSize?: number;
 }
 
-export function InvoicesPanel({ title = '', subtitle = '', adminMode = false, pageSize = 50 }: InvoicesPanelProps) {
+export function InvoicesPanel({ title = '', subtitle = '', adminMode = false, pageSize = 25 }: InvoicesPanelProps) {
   const { t, lang } = useLanguage();
   const [invoices, setInvoices] = useState<InvoiceRecord[]>([]);
   const [total, setTotal] = useState(0);
+  const [totals, setTotals] = useState<InvoiceTotals | null>(null);
   const [loading, setLoading] = useState(true);
   const [year, setYear] = useState<string>('ALL');
   const [sourceType, setSourceType] = useState<string>('ALL');
   const [status, setStatus] = useState<string>('ALL');
   const [q, setQ] = useState('');
+  // 0.6.55 — real server pagination (the panel used to fetch 50 rows and
+  // stop; everything past the first page was invisible).
+  const [page, setPage] = useState(0);
   const [previewInvoice, setPreviewInvoice] = useState<InvoiceRecord | null>(null);
   const [cancelTarget, setCancelTarget] = useState<InvoiceRecord | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  // 0.6.55 — QR verification audit trail (endpoint existed, no UI did).
+  const [verifInvoice, setVerifInvoice] = useState<InvoiceRecord | null>(null);
+  const [verifEvents, setVerifEvents] = useState<InvoiceVerificationEvent[] | null>(null);
+  const [verifLoading, setVerifLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const { invoices: rows, total: count } = await fetchInvoices({
+      const { invoices: rows, total: count, totals: serverTotals } = await fetchInvoices({
         year: year !== 'ALL' ? parseInt(year, 10) : undefined,
         sourceType: sourceType !== 'ALL' ? sourceType : undefined,
         status: status !== 'ALL' ? status : undefined,
         q: q.trim() || undefined,
         limit: pageSize,
+        offset: page * pageSize,
       });
       setInvoices(rows);
       setTotal(count);
+      setTotals(serverTotals ?? null);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [year, sourceType, status, q, pageSize]);
+  }, [year, sourceType, status, q, pageSize, page]);
 
   useEffect(() => {
     load();
@@ -103,12 +123,17 @@ export function InvoicesPanel({ title = '', subtitle = '', adminMode = false, pa
     return Array.from({ length: 6 }, (_, i) => String(now - i));
   }, []);
 
+  // 0.6.55 — server totals first (whole filtered set); the client-side
+  // page computation stays as the fallback for older servers.
   const kpis = useMemo(() => {
+    if (totals) {
+      return { issuedCount: totals.issuedCount, invoiced: totals.invoicedAmount, verifications: totals.verifications };
+    }
     const issued = invoices.filter((i) => i.status === 'ISSUED');
     const invoiced = issued.reduce((sum, i) => sum + i.amount, 0);
     const verifications = invoices.reduce((sum, i) => sum + i.verificationCount, 0);
     return { issuedCount: issued.length, invoiced, verifications };
-  }, [invoices]);
+  }, [totals, invoices]);
 
   const handleCancel = async () => {
     if (!cancelTarget) return;
@@ -125,8 +150,24 @@ export function InvoicesPanel({ title = '', subtitle = '', adminMode = false, pa
     }
   };
 
-  const typeLabel = (s: string) => (s === 'SMS' ? t('billingTypeSms') : s === 'SUBSCRIPTION' ? t('billingTypeSubscription') : s);
+  const typeLabel = (s: string) => (s === 'SMS' ? t('billingTypeSms') : s === 'SUBSCRIPTION' ? t('billingTypeSubscription') : s === 'HARDWARE' ? t('txHardwarePayment') : s);
   const money = (n: number, currency: string) => `${n.toLocaleString()} ${currency === 'DZD' && lang === 'ar' ? 'دج' : currency}`;
+
+  /** 0.6.55 — open the QR verification audit trail for one invoice. */
+  const openVerifications = async (inv: InvoiceRecord) => {
+    setVerifInvoice(inv);
+    setVerifEvents(null);
+    setVerifLoading(true);
+    try {
+      const events = await fetchInvoiceVerifications(inv.id);
+      setVerifEvents(events);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+      setVerifInvoice(null);
+    } finally {
+      setVerifLoading(false);
+    }
+  };
 
   return (
     <div className="space-y-4">
@@ -180,7 +221,7 @@ export function InvoicesPanel({ title = '', subtitle = '', adminMode = false, pa
             ))}
           </SelectContent>
         </Select>
-        <Select value={sourceType} onValueChange={setSourceType}>
+        <Select value={sourceType} onValueChange={(v) => { setSourceType(v); setPage(0); }}>
           <SelectTrigger className="w-[140px] min-h-[44px]" aria-label={t('billingType')}>
             <SelectValue />
           </SelectTrigger>
@@ -188,9 +229,12 @@ export function InvoicesPanel({ title = '', subtitle = '', adminMode = false, pa
             <SelectItem value="ALL">{t('billingAllTypes')}</SelectItem>
             <SelectItem value="SUBSCRIPTION">{t('billingTypeSubscription')}</SelectItem>
             <SelectItem value="SMS">{t('billingTypeSms')}</SelectItem>
+            {/* 0.6.55 — HARDWARE invoices are issued since the fulfilment
+                wiring; the filter was advertising-only before. */}
+            <SelectItem value="HARDWARE">{t('txHardwarePayment')}</SelectItem>
           </SelectContent>
         </Select>
-        <Select value={status} onValueChange={setStatus}>
+        <Select value={status} onValueChange={(v) => { setStatus(v); setPage(0); }}>
           <SelectTrigger className="w-[130px] min-h-[44px]" aria-label={t('billingStatus')}>
             <SelectValue />
           </SelectTrigger>
@@ -249,10 +293,16 @@ export function InvoicesPanel({ title = '', subtitle = '', adminMode = false, pa
                   </TableCell>
                   <TableCell>
                     {inv.verificationCount > 0 ? (
-                      <span className="inline-flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-400">
+                      <button
+                        type="button"
+                        onClick={() => adminMode && void openVerifications(inv)}
+                        className="inline-flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-400"
+                        title={adminMode ? t('billingVerificationsTitle') || 'Verification audit trail' : undefined}
+                      >
                         <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
                         {inv.verificationCount}
-                      </span>
+                        {adminMode && <History className="h-3 w-3 opacity-60" aria-hidden="true" />}
+                      </button>
                     ) : (
                       <span className="text-xs text-muted-foreground">—</span>
                     )}
@@ -285,8 +335,36 @@ export function InvoicesPanel({ title = '', subtitle = '', adminMode = false, pa
               ))}
             </TableBody>
           </Table>
-          <div className="px-3 py-2 text-xs text-muted-foreground border-t">
-            {total > invoices.length ? `${invoices.length} / ${total}` : `${total}`}
+          <div className="px-3 py-2 flex items-center justify-between gap-2 text-xs text-muted-foreground border-t">
+            <span dir="ltr">
+              {total > invoices.length ? `${page * pageSize + 1}–${page * pageSize + invoices.length} / ${total}` : `${total}`}
+            </span>
+            {/* 0.6.55 — real pagination controls. */}
+            {total > pageSize && (
+              <span className="inline-flex items-center gap-1">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-1.5"
+                  disabled={page === 0 || loading}
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                  aria-label="previous"
+                >
+                  <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+                </Button>
+                <span dir="ltr">{page + 1}/{Math.max(1, Math.ceil(total / pageSize))}</span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-1.5"
+                  disabled={(page + 1) * pageSize >= total || loading}
+                  onClick={() => setPage((p) => p + 1)}
+                  aria-label="next"
+                >
+                  <ChevronRight className="h-4 w-4" aria-hidden="true" />
+                </Button>
+              </span>
+            )}
           </div>
         </div>
       )}
@@ -296,6 +374,50 @@ export function InvoicesPanel({ title = '', subtitle = '', adminMode = false, pa
         open={previewInvoice !== null}
         onOpenChange={(open) => { if (!open) setPreviewInvoice(null); }}
       />
+
+      {/* ── 0.6.55 — QR verification audit trail (admin) ── */}
+      <Dialog open={verifLoading || verifInvoice !== null} onOpenChange={(open) => { if (!open) setVerifInvoice(null); }}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-sm">
+              <History className="h-4 w-4 text-emerald-600" aria-hidden="true" />
+              {t('billingVerificationsTitle') || 'Verification audit trail'}
+              {verifInvoice && <span className="font-mono text-xs text-muted-foreground" dir="ltr">{verifInvoice.displayNumber}</span>}
+            </DialogTitle>
+            <DialogDescription className="text-[11px]">
+              {t('billingVerificationsDesc') || 'Every QR verification of this document, newest first (last 100).'}
+            </DialogDescription>
+          </DialogHeader>
+          {verifLoading || verifEvents === null ? (
+            <div className="flex items-center justify-center py-8">
+              <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
+            </div>
+          ) : verifEvents.length === 0 ? (
+            <p className="text-sm text-muted-foreground py-6 text-center">{t('billingNoVerifications') || 'This invoice has never been verified.'}</p>
+          ) : (
+            <div className="rounded-lg border max-h-[50vh] overflow-y-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>{t('billingVerifRole') || 'Verifier'}</TableHead>
+                    <TableHead>{t('billingVerifIp') || 'IP'}</TableHead>
+                    <TableHead>{t('billingVerifAt') || 'When'}</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {verifEvents.map((v) => (
+                    <TableRow key={v.id}>
+                      <TableCell><Badge variant="outline" className="text-[10px]" dir="ltr">{v.verifierRole}</Badge></TableCell>
+                      <TableCell className="font-mono text-[11px]" dir="ltr">{v.ip || '—'}</TableCell>
+                      <TableCell className="text-[11px] whitespace-nowrap" dir="ltr">{new Date(v.verifiedAt).toLocaleString()}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
 
       <AlertDialog open={cancelTarget !== null} onOpenChange={(open) => { if (!open) setCancelTarget(null); }}>
         <AlertDialogContent dir={lang === 'ar' ? 'rtl' : 'ltr'}>

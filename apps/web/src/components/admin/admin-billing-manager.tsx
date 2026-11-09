@@ -38,12 +38,17 @@ import {
   Phone,
   Save,
   Loader2,
+  AlertTriangle,
+  History,
 } from 'lucide-react';
 import { AdminTransactions } from './admin-transactions';
 import { InvoicesPanel } from '@/components/shared/billing/invoices-panel';
 import {
   fetchBlastiLegalInfo,
   saveBlastiLegalInfo,
+  fetchBackfillStatus,
+  runBackfillAll,
+  type BackfillStatus,
   type BlastiLegalInfo,
 } from '@/lib/billing-client';
 
@@ -66,6 +71,45 @@ export function AdminBillingManager() {
   const [legal, setLegal] = useState<BlastiLegalInfo>(EMPTY_LEGAL_INFO);
   const [loadingLegal, setLoadingLegal] = useState(true);
   const [savingLegal, setSavingLegal] = useState(false);
+
+  // ── 0.6.55 — legacy backfill banner state ──────────────────────────────
+  // Settled payments from BEFORE the 0.6.53 billing upgrade carry no invoice;
+  // the banner surfaces how many and issues them in idempotent batches.
+  const [backfill, setBackfill] = useState<BackfillStatus | null>(null);
+  const [backfillRunning, setBackfillRunning] = useState(false);
+  const [backfillRefreshKey, setBackfillRefreshKey] = useState(0);
+
+  useEffect(() => {
+    let alive = true;
+    fetchBackfillStatus()
+      .then((s) => { if (alive) setBackfill(s); })
+      .catch(() => { /* server older than 0.6.55 — no banner */ });
+    return () => { alive = false; };
+  }, [backfillRefreshKey]);
+
+  const handleBackfillRun = async () => {
+    setBackfillRunning(true);
+    try {
+      let last = { created: 0, remaining: 0, failed: 0 };
+      // Up to 5 rounds × 100 — most ledgers converge in one round.
+      for (let round = 0; round < 5; round += 1) {
+        last = await runBackfillAll(100);
+        if (last.remaining === 0 || (last.created === 0 && last.failed === 0)) break;
+      }
+      if (last.created > 0) {
+        toast.success(`${t('billingBackfillDone') || 'Backfill complete'}: ${last.created}`);
+      } else if (last.failed > 0) {
+        toast.error(t('billingBackfillFailed') || 'Some invoices could not be issued');
+      } else {
+        toast.info(t('billingBackfillNone') || 'Nothing to backfill');
+      }
+      setBackfillRefreshKey((k) => k + 1);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBackfillRunning(false);
+    }
+  };
 
   // Load the issuer block once on mount. Failure keeps the empty form so the
   // admin can still fill it in — the first save will create the record.
@@ -105,20 +149,52 @@ export function AdminBillingManager() {
   };
 
   return (
-    <div dir={lang === 'ar' ? 'rtl' : 'ltr'} className="w-full">
+    <div
+      dir={lang === 'ar' ? 'rtl' : 'ltr'}
+      // 0.6.54 — page-shell padding (p-4 / lg:p-6): the manager previously
+      // rendered flush against the screen corners. Same convention as the
+      // other admin pages that own their own padding.
+      className="w-full p-4 lg:p-6 space-y-5"
+    >
+      {/* Page header — mirrors the admin section-page pattern */}
+      <div className="flex items-start gap-3">
+        <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-500 to-teal-600 shadow-lg shadow-emerald-500/20">
+          <CreditCard className="h-5 w-5 text-white" aria-hidden="true" />
+        </div>
+        <div className="min-w-0">
+          <h1 className="text-lg sm:text-xl font-bold tracking-tight text-foreground">
+            {t('billingManager')}
+          </h1>
+          <p className="mt-0.5 text-xs sm:text-sm text-muted-foreground">
+            {t('billingManagerSubtitle')}
+          </p>
+        </div>
+      </div>
+
       <Tabs defaultValue="transactions" className="w-full gap-4">
-        {/* Mobile-friendly tab bar: scrollable on narrow screens, min 44px triggers */}
-        <div className="overflow-x-auto pb-1">
-          <TabsList className="inline-flex min-w-max h-auto p-1">
-            <TabsTrigger value="transactions" className="gap-2 min-h-[44px] px-4 text-sm">
+        {/* Mobile-friendly tab bar: scrollable on narrow screens, min 44px triggers.
+            0.6.54 — segmented rounded bar with an active state that actually
+            reads as active (data-[state=active] styling on the triggers). */}
+        <div className="-mx-1 overflow-x-auto pb-1">
+          <TabsList className="inline-flex min-w-max h-auto items-center gap-1 rounded-2xl border border-border/70 bg-muted/50 p-1.5 shadow-sm">
+            <TabsTrigger
+              value="transactions"
+              className="gap-2 min-h-[44px] rounded-xl px-4 text-sm font-medium data-[state=active]:bg-background data-[state=active]:shadow-sm"
+            >
               <CreditCard className="h-4 w-4 shrink-0" aria-hidden="true" />
               <span className="whitespace-nowrap">{t('billingTabTransactions')}</span>
             </TabsTrigger>
-            <TabsTrigger value="invoices" className="gap-2 min-h-[44px] px-4 text-sm">
+            <TabsTrigger
+              value="invoices"
+              className="gap-2 min-h-[44px] rounded-xl px-4 text-sm font-medium data-[state=active]:bg-background data-[state=active]:shadow-sm"
+            >
               <ReceiptText className="h-4 w-4 shrink-0" aria-hidden="true" />
               <span className="whitespace-nowrap">{t('billingTabInvoices')}</span>
             </TabsTrigger>
-            <TabsTrigger value="legal" className="gap-2 min-h-[44px] px-4 text-sm">
+            <TabsTrigger
+              value="legal"
+              className="gap-2 min-h-[44px] rounded-xl px-4 text-sm font-medium data-[state=active]:bg-background data-[state=active]:shadow-sm"
+            >
               <Landmark className="h-4 w-4 shrink-0" aria-hidden="true" />
               <span className="whitespace-nowrap">{t('billingTabLegal')}</span>
             </TabsTrigger>
@@ -130,8 +206,40 @@ export function AdminBillingManager() {
           <AdminTransactions />
         </TabsContent>
 
-        {/* ── Tab 2: Invoices & Receipts (shared panel, admin mode) ───────── */}
-        <TabsContent value="invoices" className="mt-0">
+        {/* ── Tab 2: Invoices & Receipts (shared panel, admin mode) ───── */}
+        <TabsContent value="invoices" className="mt-0 space-y-4">
+          {/* 0.6.55 — LEGACY BACKFILL banner: old-system payments without an
+              invoice. Zero-missing stays silent — the ledger is complete. */}
+          {backfill && backfill.missing > 0 && (
+            <Card className="border-amber-200 bg-amber-50/60 dark:border-amber-900/60 dark:bg-amber-950/20">
+              <CardContent className="p-4 flex flex-col sm:flex-row sm:items-center gap-3">
+                <div className="h-10 w-10 rounded-xl shrink-0 flex items-center justify-center bg-amber-100 dark:bg-amber-900/40">
+                  <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400" aria-hidden="true" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold text-foreground">
+                    {t('billingBackfillTitle') || 'Legacy payments without an invoice'}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    {t('billingBackfillDesc') || 'Settled payments from before the billing upgrade still lack an official invoice.'}
+                    {' '}
+                    <span dir="ltr" className="font-semibold">
+                      {backfill.missing} ({backfill.byType.transaction} TX · {backfill.byType.sms} SMS)
+                    </span>
+                  </p>
+                </div>
+                <Button
+                  size="sm"
+                  className="h-10 shrink-0 bg-amber-600 hover:bg-amber-700 text-white"
+                  onClick={() => void handleBackfillRun()}
+                  disabled={backfillRunning}
+                >
+                  {backfillRunning ? <Loader2 className="h-4 w-4 animate-spin me-1.5" aria-hidden="true" /> : <History className="h-4 w-4 me-1.5" aria-hidden="true" />}
+                  {t('billingBackfillRun') || 'Backfill now'}
+                </Button>
+              </CardContent>
+            </Card>
+          )}
           <InvoicesPanel
             title={t('billingInvoicesTitle')}
             subtitle={t('billingInvoicesSubtitle')}

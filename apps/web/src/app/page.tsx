@@ -364,7 +364,9 @@ const ViewRouter = memo(function ViewRouter() {
             case 'admin-dashboard':
               return <AdminDashboard />;
             case 'admin-transactions':
-              return <AdminTransactions />;
+              // 0.6.54 — AdminTransactions is now padding-free (the billing
+              // manager owns the shell); the standalone view wraps it here.
+              return <div className="p-4 lg:p-6"><AdminTransactions /></div>;
             // Task 5 (0.6.53): Billing Manager — merged transactions/invoices/legal.
             case 'admin-billing-manager':
               return <AdminBillingManager />;

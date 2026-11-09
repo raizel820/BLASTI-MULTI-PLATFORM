@@ -506,6 +506,257 @@ export async function issueAllPending(opts: {
 }
 
 /**
+ * Shared phone-OTP channel decision: SMS by default, WhatsApp when the
+ * provider config selects an approved template (with the SMS fallback
+ * checked by the caller after a failed template send).
+ */
+export async function resolvePhoneChannel(): Promise<'SMS' | 'WHATSAPP'> {
+  const smsCfg = await getResolvedConfig('SMS')
+  const waCfg = await getResolvedConfig('WHATSAPP')
+  const preference = waCfg.extra.otpChannel || 'SMS'
+  let channel: 'SMS' | 'WHATSAPP' = preference === 'WHATSAPP' ? 'WHATSAPP' : 'SMS'
+  // Prefer a channel that is actually configured; WhatsApp OTP needs an approved template
+  if (channel === 'WHATSAPP' && !(waCfg.enabled && waCfg.apiKey && waCfg.phoneNumberId && waCfg.extra.otpTemplateName)) {
+    channel = 'SMS'
+  }
+  if (channel === 'SMS' && !(smsCfg.enabled && smsCfg.apiKey) && waCfg.enabled && waCfg.apiKey && waCfg.phoneNumberId && waCfg.extra.otpTemplateName) {
+    channel = 'WHATSAPP'
+  }
+  return channel
+}
+
+// ─── Pending-registration (0.6.54) ───────────────────────────────────────────
+//
+// The signup payload is STAGED in PendingRegistration (NO User row) and OTPs
+// are issued against that staged row. The User account is created ONLY when
+// every mandated channel verifies — so a user can freely go back and fix a
+// typo (e.g. a wrong email) at any earlier step without creating orphan
+// accounts or locking identifiers. Reuses the same code shape/policy as the
+// post-registration VerificationCode flow (hashed codes, TTL, attempts,
+// 60s resend cooldown, 6/hour, dev bypass codes).
+
+export const PENDING_REGISTRATION_TTL_HOURS = 24
+
+const PENDING_TOKEN_TTL = '1h'
+
+export async function createPendingRegistrationToken(pendingId: string): Promise<string> {
+  return new SignJWT({ sub: pendingId, purpose: 'pending_registration' })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime(PENDING_TOKEN_TTL)
+    .sign(getSecretKey())
+}
+
+/** Resolves a pending-registration JWT → the PendingRegistration row id. */
+export async function verifyPendingRegistrationToken(token: string): Promise<string | null> {
+  try {
+    const { payload } = await jwtVerify(token, getSecretKey(), { algorithms: ['HS256'] })
+    if (payload.purpose !== 'pending_registration' || typeof payload.sub !== 'string') return null
+    return payload.sub
+  } catch {
+    return null
+  }
+}
+
+/** Frees usernames/emails/phones held by signups abandoned for over TTL. */
+export async function purgeStalePendingRegistrations(): Promise<void> {
+  try {
+    await db.pendingRegistration.deleteMany({
+      where: { updatedAt: { lt: new Date(Date.now() - PENDING_REGISTRATION_TTL_HOURS * 60 * 60 * 1000) } },
+    })
+  } catch { /* best-effort cleanup — never blocks a registration */ }
+}
+
+/** Which channels does the platform mode mandate for a PENDING signup? */
+export function pendingModeRequires(
+  mode: VerificationMode,
+  hasEmail: boolean,
+  hasPhone: boolean,
+): { email: boolean; phone: boolean } {
+  const requires = modeRequires(mode)
+  return {
+    email: requires.email && hasEmail,
+    phone: requires.phone && hasPhone,
+  }
+}
+
+/**
+ * Issue an OTP for a pending registration channel. Same rate limits as the
+ * registered-user flow (60s cooldown / 6 per hour — scoped to the pending
+ * row + purpose). The cooldown is skipped when the TARGET changed (edited
+ * contact) so going back to fix a typo never gets stuck behind a timer.
+ */
+export async function issuePendingRegistrationOtp(opts: {
+  pendingId: string
+  purpose: 'EMAIL_VERIFY' | 'PHONE_VERIFY'
+  target: string
+  fullName: string
+  language?: string
+  ip?: string
+  /** When true (target changed since the last issue) the resend cooldown is skipped. */
+  targetChanged?: boolean
+}): Promise<IssueResult> {
+  const isEmailPurpose = opts.purpose === 'EMAIL_VERIFY'
+  const since = new Date(Date.now() - 60 * 60 * 1000)
+  const recent = await db.pendingRegistrationCode.findMany({
+    where: { pendingRegistrationId: opts.pendingId, purpose: opts.purpose, createdAt: { gte: since } },
+    orderBy: { createdAt: 'desc' },
+    select: { createdAt: true, target: true },
+  })
+  if (recent.length >= MAX_PER_HOUR) {
+    return {
+      success: false, error: 'TOO_MANY_ATTEMPTS', expiresInMinutes: CODE_TTL_MINUTES,
+      ...(isDevMode() ? { devBypass: true, devCode: isEmailPurpose ? DEV_BYPASS_CODES.EMAIL : DEV_BYPASS_CODES.SMS } : {}),
+    }
+  }
+  if (!opts.targetChanged && recent[0]) {
+    const elapsed = (Date.now() - recent[0].createdAt.getTime()) / 1000
+    if (elapsed < RESEND_COOLDOWN_SECONDS) {
+      return {
+        success: false,
+        error: 'RESEND_COOLDOWN',
+        expiresInMinutes: CODE_TTL_MINUTES,
+        retryAfterSeconds: Math.ceil(RESEND_COOLDOWN_SECONDS - elapsed),
+        ...(isDevMode() ? { devBypass: true, devCode: isEmailPurpose ? DEV_BYPASS_CODES.EMAIL : DEV_BYPASS_CODES.SMS } : {}),
+      }
+    }
+  }
+
+  // ── Channel selection (shared with the registered-user flow) ──
+  const channel = isEmailPurpose ? 'EMAIL' as const : await resolvePhoneChannel()
+
+  // ── Invalidate previous codes for this purpose (old target included) ──
+  await db.pendingRegistrationCode.updateMany({
+    where: { pendingRegistrationId: opts.pendingId, purpose: opts.purpose, consumedAt: null },
+    data: { consumedAt: new Date() },
+  })
+
+  const code = generateCode(channel)
+  await db.pendingRegistrationCode.create({
+    data: {
+      pendingRegistrationId: opts.pendingId,
+      purpose: opts.purpose,
+      channel,
+      target: opts.target,
+      codeHash: hashCode(code),
+      maxAttempts: MAX_ATTEMPTS,
+      expiresAt: new Date(Date.now() + CODE_TTL_MINUTES * 60 * 1000),
+      requestIp: opts.ip ?? null,
+    },
+  })
+
+  const language = opts.language || 'en'
+  const vars = {
+    fullName: opts.fullName,
+    code,
+    expiryMinutes: CODE_TTL_MINUTES,
+  }
+
+  let sent = false
+  let sendError: string | undefined
+  let usedChannel = channel
+
+  if (channel === 'EMAIL') {
+    const r = await deliverTemplate({ key: 'verify_email', channel: 'EMAIL', target: opts.target, language, vars })
+    sent = r.success
+    sendError = r.error
+  } else if (channel === 'WHATSAPP') {
+    const waCfg = await getResolvedConfig('WHATSAPP')
+    const tpl = waCfg.extra.otpTemplateName
+    if (tpl) {
+      const r = await sendWhatsAppOtp({ phoneNumber: opts.target, code, templateName: tpl, languageCode: waCfg.extra.otpTemplateLang })
+      if (!r.success && r.fallbackToSms) {
+        const fb = await deliverTemplate({ key: 'verify_phone', channel: 'SMS', target: opts.target, language, vars })
+        usedChannel = 'SMS'
+        sent = fb.success
+        sendError = fb.error
+      } else {
+        sent = r.success
+        sendError = r.error
+      }
+    } else {
+      const r = await deliverTemplate({ key: 'verify_phone', channel: 'WHATSAPP', target: opts.target, language, vars })
+      sent = r.success
+      sendError = r.error
+    }
+  } else {
+    const r = await deliverTemplate({ key: 'verify_phone', channel: 'SMS', target: opts.target, language, vars })
+    sent = r.success
+    sendError = r.error
+  }
+
+  if (!sent && !isDevMode()) {
+    console.error(`[verification] Failed to deliver pending ${opts.purpose} to ${opts.target}: ${sendError}`)
+    return { success: false, error: sendError || 'DELIVERY_FAILED', channel: usedChannel, expiresInMinutes: CODE_TTL_MINUTES }
+  }
+
+  return {
+    success: true,
+    channel: usedChannel,
+    target: opts.target,
+    expiresInMinutes: CODE_TTL_MINUTES,
+    ...(isDevMode() ? { devBypass: true, devCode: DEV_BYPASS_CODES[usedChannel] } : {}),
+  }
+}
+
+/**
+ * Check an OTP against the PENDING registration codes (no User row exists
+ * yet). Dev bypass codes accepted like the registered flow. On success the
+ * pending row's per-channel flag is set.
+ */
+export async function verifyPendingRegistrationOtp(opts: {
+  pendingId: string
+  purpose: 'EMAIL_VERIFY' | 'PHONE_VERIFY'
+  code: string
+}): Promise<{ success: boolean; error?: string; remainingAttempts?: number; expired?: boolean }> {
+  const code = opts.code.trim()
+  const isEmailPurpose = opts.purpose === 'EMAIL_VERIFY'
+
+  // ── Dev bypass (accepted even with no stored row) ──
+  if (isDevMode()) {
+    const bypassMatch = isEmailPurpose
+      ? code === DEV_BYPASS_CODES.EMAIL
+      : code === DEV_BYPASS_CODES.SMS || code === DEV_BYPASS_CODES.WHATSAPP
+    if (bypassMatch) {
+      await db.pendingRegistration.update({
+        where: { id: opts.pendingId },
+        data: isEmailPurpose ? { emailVerified: true } : { phoneVerified: true },
+      }).catch(() => undefined)
+      return { success: true }
+    }
+  }
+
+  const record = await db.pendingRegistrationCode.findFirst({
+    where: { pendingRegistrationId: opts.pendingId, purpose: opts.purpose, consumedAt: null },
+    orderBy: { createdAt: 'desc' },
+  })
+  if (!record) return { success: false, error: 'NO_PENDING_CODE' }
+  if (record.expiresAt.getTime() < Date.now()) return { success: false, error: 'CODE_EXPIRED', expired: true }
+  if (record.attempts >= record.maxAttempts) {
+    return { success: false, error: 'TOO_MANY_ATTEMPTS', remainingAttempts: 0 }
+  }
+  if (record.codeHash !== hashCode(code)) {
+    const updated = await db.pendingRegistrationCode.update({
+      where: { id: record.id },
+      data: { attempts: { increment: 1 } },
+      select: { attempts: true, maxAttempts: true },
+    })
+    return {
+      success: false,
+      error: 'INVALID_CODE',
+      remainingAttempts: Math.max(0, updated.maxAttempts - updated.attempts),
+    }
+  }
+
+  await db.pendingRegistrationCode.update({ where: { id: record.id }, data: { consumedAt: new Date() } })
+  await db.pendingRegistration.update({
+    where: { id: opts.pendingId },
+    data: isEmailPurpose ? { emailVerified: true } : { phoneVerified: true },
+  }).catch(() => undefined)
+  return { success: true }
+}
+
+/**
  * Mask an email/phone for display (a***@d***.com / +213**1234567)
  */
 export function maskTarget(target: string): string {

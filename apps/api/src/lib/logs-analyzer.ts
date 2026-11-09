@@ -45,6 +45,9 @@ export interface LogMeta {
   date: string // YYYY-MM-DD (UTC day the batch belongs to)
   deviceSpecs?: Record<string, unknown>
   perf?: Record<string, unknown>
+  /** 0.6.55 — WHY the batch was flushed (update / crash / rate-limit / …).
+   *  Per-entry `trigger` fields override this batch-level default. */
+  trigger?: string
 }
 
 interface HitSample {
@@ -72,6 +75,9 @@ export interface ErrorRecord {
     devices: string[]
     roles: string[]
     dates: string[]
+    /** 0.6.55 — the error-trigger reasons this bug was seen with
+     *  (update / profile-image / reservation-rejection / rate-limit / …). */
+    triggers: string[]
   }
 }
 
@@ -99,6 +105,8 @@ export interface DailyRecord {
   }
   accounts: AccountDaily[]
   topErrors: Array<{ fp: string; count: number; severity: string; message: string; uids: number }>
+  /** 0.6.55 — error-trigger breakdown for the day (update → 12, …). */
+  triggers: Record<string, number>
   perf: {
     pageLoadMsAvg: number | null
     pageLoadMsSamples: number
@@ -187,7 +195,7 @@ function pushToList(arr: string[], v: string): void {
   }
 }
 
-function addError(meta: LogMeta, level: 'warn' | 'error', tag: string, message: string, ts: string, data?: unknown): void {
+function addError(meta: LogMeta, level: 'warn' | 'error', tag: string, message: string, ts: string, data?: unknown, trigger?: string): void {
   const fp = fingerprint(tag, message)
   let rec = errors.get(fp)
   if (!rec) {
@@ -202,7 +210,7 @@ function addError(meta: LogMeta, level: 'warn' | 'error', tag: string, message: 
       firstSeen: ts,
       lastSeen: ts,
       samples: [],
-      affected: { uids: [], platforms: [], appVersions: [], devices: [], roles: [], dates: [] },
+      affected: { uids: [], platforms: [], appVersions: [], devices: [], roles: [], dates: [], triggers: [] },
     }
     errors.set(fp, rec)
   }
@@ -217,6 +225,11 @@ function addError(meta: LogMeta, level: 'warn' | 'error', tag: string, message: 
   pushToList(rec.affected.devices, meta.device)
   pushToList(rec.affected.roles, meta.role)
   pushToList(rec.affected.dates, meta.date)
+  // 0.6.55 — attribute the hit to its trigger reason (entry-level wins over
+  // the batch-level default) so the Logs Manager can slice bugs by WHY they
+  // were triggered: updates, profile-image, reservation-rejection, …
+  const hitTrigger = normalizeTrigger(trigger || meta.trigger)
+  if (hitTrigger) pushToList(rec.affected.triggers, hitTrigger)
   const scored = scoreSeverity({ level: rec.level, count: rec.count, affected: rec.affected, lastSeen: rec.lastSeen, tag: rec.tag })
   rec.severityScore = scored.score
   rec.severity = scored.severity
@@ -234,6 +247,7 @@ function blankDaily(platform: string, date: string): DailyRecord {
     totals: { batches: 0, entries: 0, errors: 0, warns: 0, accounts: 0 },
     accounts: [],
     topErrors: [],
+    triggers: {},
     perf: { pageLoadMsAvg: null, pageLoadMsSamples: 0, domReadyMsAvg: null, heapMbAvg: null },
   }
 }
@@ -291,6 +305,11 @@ function addDaily(meta: LogMeta, entries: Array<Record<string, unknown>>, batchC
       d.totals.warns += 1
       acc.warns += 1
     }
+    // 0.6.55 — daily trigger tally (errors + warns only, same as the index).
+    if (level === 'error' || level === 'warn') {
+      const trig = normalizeTrigger((typeof e.trigger === 'string' && e.trigger) || meta.trigger)
+      if (trig) d.triggers[trig] = (d.triggers[trig] ?? 0) + 1
+    }
   }
   d.accounts.sort((a, b) => b.entries - a.entries)
   if (d.accounts.length > 500) d.accounts.length = 500
@@ -320,11 +339,22 @@ export function analyzeBatch(meta: LogMeta, entries: Array<Record<string, unknow
       if (level !== 'error' && level !== 'warn') continue
       // Session envelopes are the server's own bookkeeping — never bugs.
       if (String(e.tag ?? '') === 'session') continue
-      addError(meta, level === 'error' ? 'error' : 'warn', String(e.tag ?? 'app'), String(e.message ?? ''), String(e.ts ?? new Date().toISOString()), e.data)
+      const entryTrigger = typeof e.trigger === 'string' ? e.trigger : undefined
+      addError(meta, level === 'error' ? 'error' : 'warn', String(e.tag ?? 'app'), String(e.message ?? ''), String(e.ts ?? new Date().toISOString()), e.data, entryTrigger)
     }
     if (manual) markDirty() // manual uploads flush fast so the UI shows them immediately
     markDirty()
   } catch { /* analysis must never break ingestion */ }
+}
+
+/**
+ * 0.6.55 — canonical error-trigger slug. Lowercase, [a-z0-9-_], ≤ 24 chars.
+ * Unknown shapes collapse to undefined rather than polluting the index.
+ */
+export function normalizeTrigger(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const s = raw.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 24)
+  return s || undefined
 }
 
 function markDirty(): void {
@@ -396,6 +426,8 @@ export interface AnalysisFilters {
   q?: string
   from?: string
   to?: string
+  /** 0.6.55 — error-trigger reason (update / profile-image / …). */
+  trigger?: string
   limit?: number
 }
 
@@ -407,6 +439,11 @@ function matchesFilters(rec: ErrorRecord, f: AnalysisFilters): boolean {
   if (f.device && !rec.affected.devices.some((d) => d.toLowerCase().includes(f.device!.toLowerCase()))) return false
   if (f.severity && rec.severity !== f.severity) return false
   if (f.minCount && rec.count < f.minCount) return false
+  // 0.6.55 — trigger filter: exact slug match against the bug's trigger set.
+  if (f.trigger) {
+    const want = normalizeTrigger(f.trigger)
+    if (!want || !rec.affected.triggers?.includes(want)) return false
+  }
   if (f.from && rec.lastSeen.slice(0, 10) < f.from) return false
   if (f.to && rec.firstSeen.slice(0, 10) > f.to) return false
   if (f.q) {
@@ -433,19 +470,22 @@ export function analysisSummary(): {
   totalErrors: number
   bySeverity: Record<string, number>
   byPlatform: Record<string, number>
+  byTrigger: Record<string, number>
   last24h: number
   updatedAt: string
 } {
   const bySeverity: Record<string, number> = { LOW: 0, MEDIUM: 0, HIGH: 0, CRITICAL: 0 }
   const byPlatform: Record<string, number> = {}
+  const byTrigger: Record<string, number> = {}
   let last24h = 0
   const cutoff = Date.now() - 24 * 60 * 60_000
   for (const r of errors.values()) {
     bySeverity[r.severity] = (bySeverity[r.severity] ?? 0) + 1
     for (const p of r.affected.platforms) byPlatform[p] = (byPlatform[p] ?? 0) + 1
+    for (const trig of r.affected.triggers ?? []) byTrigger[trig] = (byTrigger[trig] ?? 0) + 1
     if (new Date(r.lastSeen).getTime() >= cutoff) last24h += 1
   }
-  return { totalErrors: errors.size, bySeverity, byPlatform, last24h, updatedAt: new Date().toISOString() }
+  return { totalErrors: errors.size, bySeverity, byPlatform, byTrigger, last24h, updatedAt: new Date().toISOString() }
 }
 
 export function listDailyFiles(): Array<{ platform: string; date: string; file: string; bytes: number }> {
@@ -512,6 +552,8 @@ function metaFromEnvelope(obj: Record<string, unknown>, fallback: LogMeta): LogM
     // restart backfills keep the daily performance averages alive.
     deviceSpecs: (d.deviceSpecs && typeof d.deviceSpecs === 'object' ? d.deviceSpecs : fallback.deviceSpecs) as LogMeta['deviceSpecs'],
     perf: (d.perf && typeof d.perf === 'object' ? d.perf : fallback.perf) as LogMeta['perf'],
+    // 0.6.55 — the batch-level flush trigger rides the envelope.
+    trigger: normalizeTrigger(d.trigger) ?? fallback.trigger,
   }
 }
 
@@ -591,6 +633,8 @@ export function bootBackfill(root: string): void {
       const raw = fs.readFileSync(path.join(analysisRoot(), 'index.json'), 'utf8')
       const parsed = JSON.parse(raw) as { errors?: Record<string, ErrorRecord> }
       for (const [fp, rec] of Object.entries(parsed.errors ?? {})) {
+        // Migrate pre-0.6.55 index records (no triggers dimension yet).
+        if (!Array.isArray(rec.affected?.triggers)) rec.affected.triggers = []
         const existing = errors.get(fp)
         if (!existing || existing.count < rec.count) errors.set(fp, { ...rec })
       }

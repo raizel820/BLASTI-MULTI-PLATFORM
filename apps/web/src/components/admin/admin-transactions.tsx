@@ -1,11 +1,13 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { translateStatus, translatePaymentMethod } from '@/lib/enum-i18n';
+import { ensureInvoice } from '@/lib/billing-client';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Label } from '@/components/ui/label';
@@ -31,6 +33,13 @@ import {
   BadgeCheck,
   ShieldCheck,
   Landmark,
+  Search,
+  ReceiptText,
+  ChevronRight,
+  ChevronLeft,
+  Wallet,
+  Clock,
+  XCircle,
 } from 'lucide-react';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
@@ -81,6 +90,17 @@ type ReconcileAction = 'verify' | 'mark-settled' | 'mark-failed';
 
 const STATUS_FILTERS = ['ALL', 'PENDING', 'COMPLETED', 'FAILED', 'APPROVED', 'REJECTED'] as const;
 
+/** 0.6.55 — server-driven page size (real pagination, no more fixed 50). */
+const PAGE_SIZE = 25;
+
+/** KPI totals shape returned by GET /api/transactions (0.6.55). */
+interface TxTotals {
+  pending: number;
+  settled: number;
+  failed: number;
+  settledAmount: number;
+}
+
 /**
  * Get a safe URL for accessing uploaded files.
  * All uploads live on the API server's local disk and are served
@@ -98,6 +118,16 @@ export function AdminTransactions() {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('ALL');
+  // 0.6.55 — search + date range + real pagination + server KPIs.
+  const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [fromDate, setFromDate] = useState('');
+  const [toDate, setToDate] = useState('');
+  const [page, setPage] = useState(0); // 0-based
+  const [total, setTotal] = useState(0);
+  const [totals, setTotals] = useState<TxTotals | null>(null);
+  const [invoiceSourceIds, setInvoiceSourceIds] = useState<string[]>([]);
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Reject dialog
   const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
@@ -110,9 +140,22 @@ export function AdminTransactions() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState(false);
 
+  // Issue-invoice action (legacy settled rows without an invoice)
+  const [invoicingId, setInvoicingId] = useState<string | null>(null);
+
+  // Debounce the free-text search so typing does not hammer the API.
+  useEffect(() => {
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    searchTimer.current = setTimeout(() => {
+      setDebouncedSearch(search.trim());
+      setPage(0);
+    }, 400);
+    return () => { if (searchTimer.current) clearTimeout(searchTimer.current); };
+  }, [search]);
+
   useEffect(() => {
     fetchPayments();
-  }, [statusFilter, typeFilter]);
+  }, [statusFilter, typeFilter, debouncedSearch, fromDate, toDate, page]);
 
   const fetchPayments = async () => {
     setLoading(true);
@@ -120,10 +163,18 @@ export function AdminTransactions() {
       const params = new URLSearchParams();
       if (statusFilter !== 'ALL') params.set('status', statusFilter);
       if (typeFilter !== 'ALL') params.set('type', typeFilter);
-      params.set('limit', '50');
+      if (debouncedSearch) params.set('q', debouncedSearch);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(fromDate)) params.set('from', fromDate);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(toDate)) params.set('to', toDate);
+      params.set('limit', String(PAGE_SIZE));
+      params.set('offset', String(page * PAGE_SIZE));
       const res = await apiFetch(`/api/transactions?${params.toString()}`);
       if (res.ok) {
         const data = await res.json();
+        // 0.6.55 — server totals + invoice coverage ride every response.
+        if (data.totals) setTotals(data.totals as TxTotals);
+        if (Array.isArray(data.invoiceSourceIds)) setInvoiceSourceIds(data.invoiceSourceIds as string[]);
+        setTotal(typeof data.total === 'number' ? data.total : 0);
         const mapped = (data.transactions ?? []).map((tx: Record<string, unknown>) => {
           const kind = (tx.kind as string) === 'sms_purchase' ? 'sms_purchase' : 'subscription';
           const agency = tx.agency as
@@ -286,6 +337,54 @@ export function AdminTransactions() {
     setRejectDialogOpen(true);
   };
 
+  // ── 0.6.55 — issue an invoice for a settled row the ledger missed ──
+  // Legacy payments (pre-0.6.53) and any settlement whose invoice issuance
+  // failed get a one-click backfill straight from the row.
+  const handleIssueInvoice = async (payment: AdminPayment) => {
+    setInvoicingId(payment.id);
+    try {
+      await ensureInvoice(payment.kind === 'sms_purchase' ? 'SMS' : 'TRANSACTION', payment.id);
+      toast.success(t('txInvoiceIssuedToast') || 'Invoice issued');
+      fetchPayments();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      setInvoicingId(null);
+    }
+  };
+
+  // 0.6.55 — CSV export of the CURRENT page (same filters the user sees).
+  const exportCsv = () => {
+    if (payments.length === 0) return;
+    const esc = (v: unknown) => {
+      const s = String(v ?? '').replace(/"/g, '""');
+      return /[",\n]/.test(s) ? `"${s}"` : s;
+    };
+    const header = ['date', 'payer', 'kind', 'plan', 'amount', 'status', 'method', 'channel', 'gatewayRef', 'hasInvoice'];
+    const rows = payments.map((p) => [
+      new Date(p.createdAt).toISOString(),
+      p.kind === 'sms_purchase' ? (p.payerName || p.agencyName) : p.agencyName,
+      p.kind,
+      p.planName || p.plan,
+      p.amount,
+      p.status,
+      p.method,
+      p.isOnline ? 'online' : 'manual',
+      p.providerRef,
+      invoiceSourceIds.includes(p.id) ? 'yes' : 'no',
+    ].map(esc).join(','));
+    const csv = '\uFEFF' + [header.join(','), ...rows].join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `blasti-transactions-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  };
+
   const openPreview = (url: string) => {
     // Use proxy URL for blob URLs, direct URL for local files
     const proxiedUrl = getProxiedUrl(url);
@@ -322,7 +421,9 @@ export function AdminTransactions() {
 
   if (loading) {
     return (
-      <div className="p-4 lg:p-6 space-y-4">
+      // 0.6.54 — padding-free: the host owns the page shell (admin-billing-manager
+      // p-4 lg:p-6; the standalone admin-transactions view wraps it the same way).
+      <div className="space-y-4">
         <Skeleton className="h-8 w-48" />
         <Skeleton className="h-10 w-full max-w-xl rounded-lg" />
         <Skeleton className="h-64 rounded-2xl" />
@@ -330,16 +431,101 @@ export function AdminTransactions() {
     );
   }
 
-  const pendingCount = payments.filter((p) => p.status === 'PENDING').length;
+  const pendingCount = totals?.pending ?? payments.filter((p) => p.status === 'PENDING').length;
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
-    <div className="p-4 lg:p-6 space-y-5">
+    // 0.6.54 — padding-free (the host owns the page shell — see above).
+    <div className="space-y-5">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
         <h1 className="text-2xl font-bold text-foreground">{t('transactions')}</h1>
-        {pendingCount > 0 && (
-          <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 text-xs px-2 py-1 self-start">
-            {pendingCount} {t('statusPending').toLowerCase()}
-          </Badge>
+        <div className="flex items-center gap-2">
+          {pendingCount > 0 && (
+            <Badge className="bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 text-xs px-2 py-1">
+              {pendingCount} {t('statusPending').toLowerCase()}
+            </Badge>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-9 px-3"
+            onClick={exportCsv}
+            disabled={payments.length === 0}
+            title={t('txExportCsv') || 'Export CSV'}
+          >
+            <Download className="h-4 w-4 me-1.5" />
+            <span className="hidden sm:inline">CSV</span>
+          </Button>
+        </div>
+      </div>
+
+      {/* ── 0.6.55 — server-side KPI cards (page-independent, both feeds) ── */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50">
+          <CardContent className="p-4 flex items-center gap-3">
+            <div className="h-10 w-10 rounded-xl flex items-center justify-center shrink-0 bg-amber-100 dark:bg-amber-900/30">
+              <Clock className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-[11px] text-muted-foreground truncate">{t('txKpiPending') || 'Pending'}</p>
+              <p className="text-xl font-bold text-foreground" dir="ltr">{totals ? totals.pending : '—'}</p>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50">
+          <CardContent className="p-4 flex items-center gap-3">
+            <div className="h-10 w-10 rounded-xl flex items-center justify-center shrink-0 bg-emerald-100 dark:bg-emerald-900/30">
+              <Check className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-[11px] text-muted-foreground truncate">{t('txKpiSettled') || 'Settled payments'}</p>
+              <p className="text-xl font-bold text-foreground" dir="ltr">{totals ? totals.settled : '—'}</p>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50">
+          <CardContent className="p-4 flex items-center gap-3">
+            <div className="h-10 w-10 rounded-xl flex items-center justify-center shrink-0 bg-teal-100 dark:bg-teal-900/30">
+              <Wallet className="h-5 w-5 text-teal-600 dark:text-teal-400" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-[11px] text-muted-foreground truncate">{t('txKpiAmount') || 'Settled total'}</p>
+              <p className="text-xl font-bold text-foreground truncate" dir="ltr">
+                {totals ? totals.settledAmount.toLocaleString() : '—'} <span className="text-xs font-medium text-muted-foreground">{t('currency')}</span>
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 dark:border-gray-800/50">
+          <CardContent className="p-4 flex items-center gap-3">
+            <div className="h-10 w-10 rounded-xl flex items-center justify-center shrink-0 bg-red-100 dark:bg-red-900/30">
+              <XCircle className="h-5 w-5 text-red-600 dark:text-red-400" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-[11px] text-muted-foreground truncate">{t('txKpiFailed') || 'Failed / rejected'}</p>
+              <p className="text-xl font-bold text-foreground" dir="ltr">{totals ? totals.failed : '—'}</p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* ── 0.6.55 — search + date range toolbar ── */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 min-w-[200px]">
+          <Search className="absolute start-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <Input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder={t('txSearchPlaceholder') || 'Search: agency, payer, gateway ref…'}
+            className="ps-9 h-10"
+          />
+        </div>
+        <Input type="date" value={fromDate} onChange={(e) => { setFromDate(e.target.value); setPage(0); }} className="w-40 h-10" dir="ltr" title={t('txDateFrom') || 'From'} />
+        <Input type="date" value={toDate} onChange={(e) => { setToDate(e.target.value); setPage(0); }} className="w-40 h-10" dir="ltr" title={t('txDateTo') || 'To'} />
+        {(search || fromDate || toDate) && (
+          <Button size="sm" variant="ghost" className="h-9" onClick={() => { setSearch(''); setFromDate(''); setToDate(''); setPage(0); }}>
+            <X className="h-3.5 w-3.5 me-1" />{t('clear') || '✕'}
+          </Button>
         )}
       </div>
 
@@ -353,7 +539,7 @@ export function AdminTransactions() {
         ]).map((item) => (
           <button
             key={item.key}
-            onClick={() => { setTypeFilter(item.key); }}
+            onClick={() => { setTypeFilter(item.key); setPage(0); }}
             className={`px-4 py-2 rounded-lg text-xs font-medium transition-all duration-200 ${
               typeFilter === item.key
               ? 'filter-chip-active'
@@ -371,7 +557,7 @@ export function AdminTransactions() {
         {STATUS_FILTERS.map((status) => (
           <button
             key={status}
-            onClick={() => { setStatusFilter(status); }}
+            onClick={() => { setStatusFilter(status); setPage(0); }}
             className={`px-4 py-2 rounded-lg text-xs font-medium transition-all duration-200 ${
               statusFilter === status
               ? 'filter-chip-active'
@@ -522,6 +708,26 @@ export function AdminTransactions() {
                         </Button>
                       )}
 
+                      {/* ── 0.6.55 — settled row without an invoice? One-click
+                          issue (legacy payments the 0.6.53 ledger missed). */}
+                      {(payment.status === 'APPROVED' || payment.status === 'COMPLETED') && !invoiceSourceIds.includes(payment.id) && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-9 px-3 border-teal-200 text-teal-700 hover:bg-teal-50 dark:border-teal-800 dark:text-teal-400 dark:hover:bg-teal-900/20"
+                          onClick={() => handleIssueInvoice(payment)}
+                          disabled={!!actionLoading || invoicingId === payment.id}
+                          title={t('txIssueInvoice') || 'Issue invoice'}
+                        >
+                          {invoicingId === payment.id ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <ReceiptText className="h-4 w-4 me-1.5" />
+                          )}
+                          <span className="hidden md:inline">{t('txIssueInvoice') || 'Issue invoice'}</span>
+                        </Button>
+                      )}
+
                       {/* ── MANUAL payments: approve / reject (unchanged flow).
                           SMS purchases are NOT reviewable here — their manual
                           approval lives in the SMS purchase admin flow; online
@@ -623,6 +829,38 @@ export function AdminTransactions() {
               </Card>
             </motion.div>
           ))}
+        </div>
+      )}
+
+      {/* ── 0.6.55 — pagination footer (real server paging) ── */}
+      {total > PAGE_SIZE && (
+        <div className="flex items-center justify-between gap-2 pt-1">
+          <p className="text-xs text-muted-foreground" dir="ltr">
+            {total === 0 ? '0' : `${page * PAGE_SIZE + 1}–${Math.min(total, (page + 1) * PAGE_SIZE)}`} / {total}
+          </p>
+          <div className="flex items-center gap-1.5">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-9"
+              disabled={page === 0 || loading}
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              title={t('txPrevPage') || 'Previous'}
+            >
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+            <span className="text-xs text-muted-foreground px-1" dir="ltr">{page + 1}/{totalPages}</span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-9"
+              disabled={page + 1 >= totalPages || loading}
+              onClick={() => setPage((p) => p + 1)}
+              title={t('txNextPage') || 'Next'}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
         </div>
       )}
 

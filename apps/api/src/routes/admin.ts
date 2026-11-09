@@ -24,7 +24,7 @@ import { categorySlugError } from '../lib/categories'
 // the same idempotent fulfillment path used by the webhook + poll fallback.
 import { getCheckoutStatus } from '../lib/chargily-service'
 import { fulfillCheckoutPaid, fulfillCheckoutFailed, normalizeChargilyStatus, type FulfillmentCheckout } from '../lib/chargily-fulfill'
-import { ensureInvoiceForTransaction } from '../lib/billing-invoices'
+import { ensureInvoiceForTransaction, ensureInvoiceForHardwareOrder } from '../lib/billing-invoices'
 // Task 2-a FIX 3 — the admin-dashboard SMS tab reads/writes /admin/sms-settings.
 import { getSmsSettings, getSmsUsageStats, testSms, validateGatewayConnection } from '../lib/sms-service'
 import { PROVIDER_REGISTRY } from '../lib/messaging/provider-registry'
@@ -93,6 +93,14 @@ app.patch('/account/username', async (c) => {
       select: { id: true },
     })
     if (taken) return c.json({ success: false, error: 'Username already taken' }, 409)
+
+    // 0.6.54 — in-flight signups hold usernames too; the rename must not
+    // collide with a pending registration that will consume the name soon.
+    const pendingHolder = await db.pendingRegistration.findUnique({
+      where: { username: nextUsername },
+      select: { id: true },
+    })
+    if (pendingHolder) return c.json({ success: false, error: 'Username already taken' }, 409)
 
     await db.user.update({ where: { id: admin.id }, data: { username: nextUsername } })
 
@@ -5343,6 +5351,17 @@ app.post('/hardware/orders/:id', async (c) => {
         }),
       },
     })
+
+    // 0.6.55 — FULFILLED hardware orders are billable NOW: issue the legal
+    // HARDWARE invoice (idempotent) instead of leaving the advertised
+    // sourceType as dead code. Best-effort — fulfilment never fails on it.
+    if (status === 'FULFILLED') {
+      try {
+        await ensureInvoiceForHardwareOrder(id, { issuedBy: `ADMIN:${admin.id}` })
+      } catch (invErr) {
+        console.warn('[admin hardware] invoice issue failed:', invErr)
+      }
+    }
 
     return c.json({ success: true, order })
   } catch (error) {

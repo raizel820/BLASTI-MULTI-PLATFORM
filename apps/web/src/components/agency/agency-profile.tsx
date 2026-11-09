@@ -45,6 +45,7 @@ import QRCode from 'qrcode';
 import type { TranslationKeys } from '@/i18n';
 import { getProxiedUrl } from '@/lib/utils';
 import { apiFetch } from '@/lib/api-fetch';
+import { logError } from '@/lib/remote-logger';
 import { unwrapListPayload } from '@/lib/list-payload';
 import { formatWorkingDaysList } from '@/lib/enum-i18n';
 import { AgencyCategorySelect } from '@/components/agency/agency-category-select';
@@ -175,6 +176,14 @@ export function AgencyProfile() {
   const [loading, setLoading] = useState(true);
   const [editMode, setEditMode] = useState(false);
   const [saving, setSaving] = useState(false);
+  // 0.6.54 — owner/staff phone numbers for the agency-phone picker: the
+  // agency phone must be a DEDICATED number or one of THESE numbers (the
+  // server rejects anything held by an unrelated account).
+  const [phoneOptions, setPhoneOptions] = useState<{
+    owner: { name: string; phone: string } | null;
+    staff: { name: string; phone: string }[];
+    current: string | null;
+  } | null>(null);
   // Client-side generated QR (PNG data URL) — works OFFLINE on the desktop
   // (the old flow fetched an SVG from /api/agency/qr-code, which the local
   // API answered with a JSON placeholder → the QR section never rendered).
@@ -245,6 +254,29 @@ export function AgencyProfile() {
       setLoading(false);
     }
   };
+
+  // 0.6.54 — owner/staff phone numbers for the agency-phone picker
+  // (GET /api/agency/phone-options). Best-effort: an older cloud without the
+  // endpoint simply leaves the picker empty and the free-typed input works.
+  useEffect(() => {
+    let alive = true;
+    apiFetch('/api/agency/phone-options')
+      .then(async (res) => {
+        if (!alive || !res.ok) return null;
+        return res.json().catch(() => null);
+      })
+      .then((data) => {
+        if (alive && data?.success) {
+          setPhoneOptions({
+            owner: data.owner ?? null,
+            staff: Array.isArray(data.staff) ? data.staff : [],
+            current: data.current ?? null,
+          });
+        }
+      })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, []);
 
   // Task 83-b — the switcher's branch list. GET /api/agency/branches returns
   // the SESSION agency's branches; the ?agencyId param mirrors the profile
@@ -510,9 +542,13 @@ export function AgencyProfile() {
           }).catch(() => { /* best-effort cleanup */ });
         }
       } else {
+        // 0.6.55 — image failures carry the profile-image trigger tag.
+        const detail = await uploadRes.json().catch(() => ({}));
+        logError('profile', `agency logo upload failed (HTTP ${uploadRes.status})`, { status: uploadRes.status, error: (detail as { error?: string })?.error }, 'profile-image');
         toast.error(t('error'));
       }
-    } catch {
+    } catch (err) {
+      logError('profile', 'agency logo upload threw', { error: err instanceof Error ? err.message : String(err) }, 'profile-image');
       toast.error(t('error'));
     } finally {
       setLogoUploading(false);
@@ -1141,6 +1177,49 @@ export function AgencyProfile() {
                       onChange={(e) => updateField('phone', e.target.value)}
                       className="h-11 rounded-xl border-gray-200 dark:border-gray-700 focus:border-emerald-400 focus:ring-2 focus:ring-emerald-500/20"
                     />
+                    {/* 0.6.54 — one-tap picker for the ALLOWED numbers: the
+                        owner's and the active staff's own numbers (a dedicated
+                        number typed freely is equally valid). The server
+                        rejects any other user's number with a clear 409. */}
+                    {(() => {
+                      const ownerChip = phoneOptions?.owner && phoneOptions.owner.phone !== profile?.phone ? phoneOptions.owner : null;
+                      const staffChips = (phoneOptions?.staff ?? []).filter((s) => s.phone && s.phone !== profile?.phone);
+                      if (!ownerChip && staffChips.length === 0) return null;
+                      return (
+                        <div className="pt-1 space-y-1.5">
+                          <p className="text-[11px] leading-snug text-muted-foreground">{t('agencyPhoneOptionsHint')}</p>
+                          <div className="flex flex-wrap gap-1.5">
+                            {ownerChip && (
+                              <button
+                                type="button"
+                                onClick={() => updateField('phone', ownerChip.phone)}
+                                disabled={saving}
+                                className="inline-flex min-h-[32px] items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-100 dark:border-emerald-800/60 dark:bg-emerald-950/30 dark:text-emerald-300 dark:hover:bg-emerald-900/40 disabled:opacity-50"
+                                title={ownerChip.name}
+                              >
+                                <Phone className="h-3 w-3 shrink-0" aria-hidden="true" />
+                                <span className="max-w-[110px] truncate">{ownerChip.name}</span>
+                                <span dir="ltr" className="font-mono">{ownerChip.phone}</span>
+                              </button>
+                            )}
+                            {staffChips.map((s) => (
+                              <button
+                                key={s.phone}
+                                type="button"
+                                onClick={() => updateField('phone', s.phone)}
+                                disabled={saving}
+                                className="inline-flex min-h-[32px] items-center gap-1.5 rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs font-medium text-foreground transition-colors hover:bg-gray-100 dark:border-gray-700 dark:bg-gray-800/60 dark:hover:bg-gray-800 disabled:opacity-50"
+                                title={s.name}
+                              >
+                                <Phone className="h-3 w-3 shrink-0 text-muted-foreground" aria-hidden="true" />
+                                <span className="max-w-[110px] truncate">{s.name}</span>
+                                <span dir="ltr" className="font-mono">{s.phone}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </div>
                   <div className="space-y-2">
                     <Label>{t('agencyEmail')}</Label>

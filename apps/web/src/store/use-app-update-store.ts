@@ -27,6 +27,7 @@
 
 import { create } from 'zustand';
 import { buildCloudUrl } from '@/lib/api-client';
+import { logError, flushLogsNow } from '@/lib/remote-logger';
 import { APP_API_LEVEL } from '@/lib/api-level';
 import {
   loadAppUpdateSettings,
@@ -384,6 +385,31 @@ function ulog(tag: string, message: string, extra?: Record<string, unknown>): vo
   } catch { /* logging must never break the store */ }
 }
 
+/**
+ * 0.6.55 — STRICT UPDATE-FAILURE TELEMETRY.
+ * Every update-pipeline FAILURE goes through here: the structured line is
+ * logged as a real ERROR (tag 'update', trigger 'update') and an IMMEDIATE
+ * flush with reason 'update' uploads the trail — WITH OR WITHOUT an open
+ * account. The cloud vault files tokenless batches under anon-<deviceId>,
+ * so "the update failed on a machine nobody signed into" is diagnosable
+ * from the field instead of waiting for the next 30 s tick or a login.
+ */
+function ulogFail(tag: string, message: string, extra?: Record<string, unknown>): void {
+  let line = `[update:${tag}] ${message}`;
+  if (extra) {
+    try {
+      const parts = Object.entries(extra)
+        .filter(([, v]) => v !== undefined)
+        .map(([k, v]) => (typeof v === 'object' && v !== null ? `${k}=${JSON.stringify(v)}` : `${k}=${String(v)}`));
+      if (parts.length) line += ` | ${parts.join(' ')}`;
+    } catch { /* line stays as-is */ }
+  }
+  try {
+    logError('update', line, extra, 'update');
+  } catch { /* logging must never break the store */ }
+  void flushLogsNow({ reason: 'update', trigger: 'update' }).catch(() => { /* retried by the logger */ });
+}
+
 /** One-line summary of the server's delta offer (or refusal reason). */
 function describeDelta(res: CheckResponse): Record<string, unknown> {
   const d = res.delta && res.delta.supported && Array.isArray(res.delta.hops) ? res.delta : null;
@@ -435,6 +461,7 @@ function startAndroidPolling(downloadId: number) {
         void maybeAutoInstall();
       } else if (res.status === 'failed') {
         stopAndroidPolling();
+        ulogFail('download', 'android DownloadManager reported the download FAILED', { downloadId });
         getStore().setState({ status: 'error', error: 'download-failed' });
       } else if (res.status === 'running' || res.status === 'pending' || res.status === 'paused') {
         getStore().setState({
@@ -526,6 +553,7 @@ function createAppUpdateStore() {
           }
           if (!res?.success) {
             ulog('check', 'check FAILED — cloud unreachable or endpoint error', { trigger, error: res && res.error ? res.error : 'no-response' });
+            ulogFail('check', 'update check FAILED — cloud unreachable or endpoint error', { trigger, error: res && res.error ? res.error : 'no-response' });
             checkFailed = true;
           }
           if (res?.success) {
@@ -657,6 +685,7 @@ function createAppUpdateStore() {
             // Delta failed — report why, then fall through to the FULL installer.
             set({ deltaApplied: false });
             ulog('delta', 'delta chain FAILED — falling back to full installer', { error: result?.error || 'unknown', hops: info.delta.hops.length });
+            ulogFail('delta', 'delta chain FAILED — falling back to full installer', { error: result?.error || 'unknown', hops: info.delta.hops.length });
             console.warn('[update] delta chain failed — falling back to full installer:', result?.error);
           }
           await electronAPI()?.downloadUpdate?.({ url: info.downloadUrl, version: info.version, fileHash: info.fileHash, fileSize: info.fileSize });
@@ -681,16 +710,21 @@ function createAppUpdateStore() {
             }
             console.warn('[update] android delta chain failed — falling back to full APK:', result?.error);
             ulog('delta', 'android delta chain FAILED — falling back to full APK', { error: result?.error || 'unknown' });
+            ulogFail('delta', 'android delta chain FAILED — falling back to full APK', { error: result?.error || 'unknown' });
           }
           const res = await plugin()?.downloadUpdate?.({ url: info.absoluteDownloadUrl || info.downloadUrl, version: info.version });
           if (res?.downloadId) {
             lastAndroidDownloadId = res.downloadId; // consumed by install() below
             startAndroidPolling(res.downloadId);
           }
-          else set({ status: 'error', error: 'download-failed' });
+          else {
+            ulogFail('download', 'android downloadUpdate returned NO downloadId — download never registered', { version: info.version });
+            set({ status: 'error', error: 'download-failed' });
+          }
         }
       } catch (err) {
         ulog('decision', 'startDownload threw — download never started', { error: err instanceof Error ? err.message : String(err ?? '') });
+        ulogFail('decision', 'startDownload threw — download never started', { error: err instanceof Error ? err.message : String(err ?? '') });
         set({ status: 'error', error: 'download-failed' });
       }
     },
@@ -715,6 +749,7 @@ function createAppUpdateStore() {
           // fallback instead of pretending.
           if (result && result.ok === false) {
             ulog('install', 'NSIS install could NOT start — manual open-installer fallback armed', { error: result.error || 'unknown' });
+            ulogFail('install', 'NSIS install could NOT start — manual open-installer fallback armed', { error: result.error || 'unknown' });
             set({ status: 'downloaded', error: 'install-spawn-failed', manualInstallAvailable: true });
             return;
           }
@@ -745,6 +780,7 @@ function createAppUpdateStore() {
         pendingInstallFromVersion = null;
         const msg = err instanceof Error ? err.message : String(err ?? '');
         ulog('install', 'install() threw', { error: msg });
+        ulogFail('install', 'install() threw', { error: msg });
         // 0.6.18: only a REAL permission rejection may set needsInstallPermission.
         // Labeling file-lookup failures ("apk-not-found", "install-failed") as
         // permission problems was half of the field loop: the UI kept offering
@@ -764,6 +800,7 @@ function createAppUpdateStore() {
           }
         } else {
           set({ status: 'error', error: 'install-failed' });
+          ulogFail('install', 'install failed — not a permission gate', { nativeError: msg });
         }
       }
     },
@@ -783,6 +820,7 @@ function createAppUpdateStore() {
       // Android refused the APK (signature mismatch / cancelled / corrupt
       // download). Keep the update available and let the UI tell the user
       // the ONE-TIME fix: uninstall + reinstall.
+      ulogFail('install', 'android silently refused the staged APK (signature mismatch / cancelled / corrupt) — still on the same version', { fromVersion: from, nowVersion: nowVersion || 'unknown' });
       return 'not-installed';
     },
 
@@ -819,6 +857,7 @@ function createAppUpdateStore() {
       } else if (payload.status === 'error') {
         stopAndroidPolling();
         ulog('progress', 'main reported a download/install ERROR event', { error: payload.error || 'unknown', version: payload.version || '', stage: payload.stage });
+        ulogFail('progress', 'main reported a download/install ERROR event', { error: payload.error || 'unknown', version: payload.version || '', stage: payload.stage });
         set({ status: 'error', error: payload.error || 'download-failed' });
       }
     },

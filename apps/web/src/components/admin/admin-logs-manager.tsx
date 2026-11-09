@@ -57,6 +57,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { AdminAccountLogsVault } from '@/components/admin/admin-account-logs-vault';
+import { LOG_TRIGGERS } from '@/lib/remote-logger';
 
 // ─── Types (mirror apps/api/src/lib/logs-analyzer.ts payloads) ───────────────
 
@@ -78,6 +79,8 @@ interface ErrorRec {
     devices: string[];
     roles: string[];
     dates: string[];
+    /** 0.6.55 — error-trigger reasons (update / profile-image / …). */
+    triggers?: string[];
   };
 }
 
@@ -85,6 +88,8 @@ interface AnalysisSummary {
   totalErrors: number;
   bySeverity: Record<string, number>;
   byPlatform: Record<string, number>;
+  /** 0.6.55 — fingerprints per error-trigger reason. */
+  byTrigger?: Record<string, number>;
   last24h: number;
   updatedAt: string;
 }
@@ -175,8 +180,12 @@ const SEVERITY_STYLES: Record<string, string> = {
 };
 
 const PLATFORMS = ['web', 'mobile', 'desktop'] as const;
-const ROLES = ['SUPER_ADMIN', 'AGENCY_OWNER', 'STAFF', 'CUSTOMER'] as const;
+const ROLES = ['SUPER_ADMIN', 'AGENCY_OWNER', 'STAFF', 'CUSTOMER', 'DEVICE', 'ANONYMOUS'] as const;
 const SEVERITIES = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'] as const;
+/** 0.6.55 — the error-trigger taxonomy (mirrors the analyzer's slugs).
+ *  The Select merges these with whatever the live summary reports so custom
+ *  slugs from future call sites are filterable too. */
+const ERROR_TRIGGERS = LOG_TRIGGERS;
 
 /** Client-side markdown render of a report payload (copy/download). */
 function reportToMarkdown(r: ReportPayload, lang: { t: (k: never) => string }): string {
@@ -188,6 +197,7 @@ function reportToMarkdown(r: ReportPayload, lang: { t: (k: never) => string }): 
     `- Total tracked bugs: ${r.summary.totalErrors} (last 24h: ${r.summary.last24h})`,
     `- By severity: ${Object.entries(r.summary.bySeverity).map(([k, v]) => `${k}=${v}`).join(', ')}`,
     `- By platform: ${Object.entries(r.summary.byPlatform).map(([k, v]) => `${k}=${v}`).join(', ')}`,
+    `- By trigger: ${Object.entries(r.summary.byTrigger ?? {}).map(([k, v]) => `${k}=${v}`).join(', ') || 'n/a'}`,
     `- Filters: ${JSON.stringify(r.filters)}`,
     '',
     `---`,
@@ -205,6 +215,7 @@ function reportToMarkdown(r: ReportPayload, lang: { t: (k: never) => string }): 
       `- First seen: ${b.firstSeen} · Last seen: ${b.lastSeen}`,
       `- UIDs (${b.affected.uids.length}): ${b.affected.uids.slice(0, 10).join(', ')}${b.affected.uids.length > 10 ? ' …' : ''}`,
       `- Platforms: ${b.affected.platforms.join(', ')} · Roles: ${b.affected.roles.join(', ')}`,
+      `- Triggers: ${(b.affected.triggers ?? []).join(', ') || 'n/a'}`,
       `- App versions: ${b.affected.appVersions.join(', ') || 'unknown'}`,
       `- Devices: ${b.affected.devices.slice(0, 5).join(' | ')}${b.affected.devices.length > 5 ? ' …' : ''}`,
       `- Dates: ${b.affected.dates.join(', ')}`,
@@ -234,12 +245,13 @@ interface Filters {
   appVersion: string;
   device: string;
   severity: string;
+  trigger: string;
   minCount: string;
   from: string;
   to: string;
 }
 
-const EMPTY_FILTERS: Filters = { q: '', uid: '', platform: '', role: '', appVersion: '', device: '', severity: '', minCount: '', from: '', to: '' };
+const EMPTY_FILTERS: Filters = { q: '', uid: '', platform: '', role: '', appVersion: '', device: '', severity: '', trigger: '', minCount: '', from: '', to: '' };
 
 export function AdminLogsManager() {
   const { t } = useLanguage();
@@ -279,6 +291,7 @@ export function AdminLogsManager() {
     if (f.appVersion) p.set('appVersion', f.appVersion);
     if (f.device) p.set('device', f.device);
     if (f.severity) p.set('severity', f.severity);
+    if (f.trigger) p.set('trigger', f.trigger);
     if (f.minCount) p.set('minCount', f.minCount);
     if (f.from) p.set('from', f.from);
     if (f.to) p.set('to', f.to);
@@ -485,7 +498,7 @@ export function AdminLogsManager() {
             </Card>
           </div>
 
-          <div className="grid md:grid-cols-2 gap-3">
+          <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-3">
             <Card>
               <CardHeader className="pb-2"><CardTitle className="text-sm">{t('logsManagerBySeverity')}</CardTitle></CardHeader>
               <CardContent className="space-y-2">
@@ -523,6 +536,35 @@ export function AdminLogsManager() {
                     </div>
                   );
                 })}
+              </CardContent>
+            </Card>
+            {/* 0.6.55 — BY TRIGGER: which error causes dominate (updates,
+                profile-image, rate-limit, …) — the first triage lens. */}
+            <Card className="md:col-span-2 xl:col-span-1">
+              <CardHeader className="pb-2"><CardTitle className="text-sm">{t('logsManagerByTrigger')}</CardTitle></CardHeader>
+              <CardContent className="space-y-2">
+                {(() => {
+                  const entries = Object.entries(summary?.byTrigger ?? {}).sort((a, b) => b[1] - a[1]).slice(0, 8);
+                  const max = Math.max(1, ...entries.map(([, v]) => v));
+                  if (entries.length === 0) {
+                    return <p className="text-xs text-muted-foreground py-2 text-center">{t('logsManagerNoErrors')}</p>;
+                  }
+                  return entries.map(([trig, v]) => (
+                    <button
+                      key={trig}
+                      type="button"
+                      onClick={() => { setFilters((f) => ({ ...f, trigger: trig })); setTab('errors'); }}
+                      className="w-full flex items-center gap-2 group"
+                      title={t('logsManagerFilterTrigger')}
+                    >
+                      <Badge variant="outline" className="w-24 justify-center shrink-0 text-[9px] bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900 group-hover:bg-violet-100 dark:group-hover:bg-violet-900/60" dir="ltr">{trig}</Badge>
+                      <div className="flex-1 h-2 rounded-full bg-muted overflow-hidden">
+                        <div className="h-full rounded-full bg-violet-500" style={{ width: `${(v / max) * 100}%` }} />
+                      </div>
+                      <span className="text-xs font-medium w-8 text-end" dir="ltr">{v}</span>
+                    </button>
+                  ));
+                })()}
               </CardContent>
             </Card>
           </div>
@@ -598,6 +640,18 @@ export function AdminLogsManager() {
                     {SEVERITIES.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
                   </SelectContent>
                 </Select>
+                {/* 0.6.55 — ERROR TRIGGER filter: why the log fired (update /
+                    profile-image / reservation-rejection / rate-limit / …). */}
+                <Select value={filters.trigger || 'all'} onValueChange={(v) => setFilters((f) => ({ ...f, trigger: v === 'all' ? '' : v }))}>
+                  <SelectTrigger className="w-44 h-9"><SelectValue placeholder={t('logsManagerFilterTrigger')} /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">{t('logsManagerFilterTrigger')}: {t('logsManagerAll')}</SelectItem>
+                    {(() => {
+                      const live = Object.keys(summary?.byTrigger ?? {}).filter((s) => !ERROR_TRIGGERS.includes(s as never));
+                      return [...ERROR_TRIGGERS, ...live].map((s) => <SelectItem key={s} value={s} dir="ltr">{s}</SelectItem>);
+                    })()}
+                  </SelectContent>
+                </Select>
                 <Input type="date" value={filters.from} onChange={(e) => setFilters((f) => ({ ...f, from: e.target.value }))} className="w-36 h-9" dir="ltr" title={t('logsManagerFilterFrom')} />
                 <Input type="date" value={filters.to} onChange={(e) => setFilters((f) => ({ ...f, to: e.target.value }))} className="w-36 h-9" dir="ltr" title={t('logsManagerFilterTo')} />
                 <Button size="sm" className="h-9" onClick={() => fetchErrors()}>{t('logsManagerApply')}</Button>
@@ -635,6 +689,7 @@ export function AdminLogsManager() {
                           <TableRow>
                             <TableHead className="w-24">{t('logsManagerSeverity')}</TableHead>
                             <TableHead className="w-28">{t('logsManagerColTag')}</TableHead>
+                            <TableHead className="w-32">{t('logsManagerFilterTrigger')}</TableHead>
                             <TableHead>{t('logsManagerColMessage')}</TableHead>
                             <TableHead className="w-16 text-center">{t('logsManagerColCount')}</TableHead>
                             <TableHead className="w-16 text-center">{t('logsManagerColUids')}</TableHead>
@@ -647,6 +702,17 @@ export function AdminLogsManager() {
                             <TableRow key={e.fp} className="cursor-pointer" onClick={() => void openDetail(e.fp)}>
                               <TableCell>{severityChip(e.severity)}</TableCell>
                               <TableCell><Badge variant="secondary" className="text-[10px]" dir="ltr">{e.tag}</Badge></TableCell>
+                              <TableCell>
+                                {(e.affected.triggers ?? []).length > 0 ? (
+                                  <div className="flex flex-wrap gap-0.5">
+                                    {(e.affected.triggers ?? []).slice(0, 2).map((tr) => (
+                                      <Badge key={tr} variant="outline" className="text-[9px] px-1 py-0 bg-violet-50 text-violet-700 border-violet-200 dark:bg-violet-950/40 dark:text-violet-300 dark:border-violet-900" dir="ltr">{tr}</Badge>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <span className="text-[10px] text-muted-foreground">—</span>
+                                )}
+                              </TableCell>
                               <TableCell><span className="text-xs line-clamp-2" dir="ltr">{e.message}</span></TableCell>
                               <TableCell className="text-center text-xs font-semibold" dir="ltr">{e.count}</TableCell>
                               <TableCell className="text-center text-xs" dir="ltr">{e.affected.uids.length}</TableCell>
@@ -736,6 +802,10 @@ export function AdminLogsManager() {
                   <div className="rounded-lg border p-2">
                     <span className="font-medium" dir="ltr">{t('logsManagerColPlatforms')} / roles / versions</span>
                     <p className="font-mono mt-1" dir="ltr">{detail.affected.platforms.join(', ')} · {detail.affected.roles.join(', ')} · {detail.affected.appVersions.join(', ') || '?'}</p>
+                  </div>
+                  <div className="rounded-lg border p-2 sm:col-span-2">
+                    <span className="font-medium" dir="ltr">{t('logsManagerFilterTrigger')}</span>
+                    <p className="font-mono mt-1" dir="ltr">{(detail.affected.triggers ?? []).join(', ') || '—'}</p>
                   </div>
                   <div className="rounded-lg border p-2 sm:col-span-2">
                     <span className="font-medium" dir="ltr">{t('logsManagerColDevices')} ({detail.affected.devices.length})</span>

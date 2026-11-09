@@ -110,6 +110,68 @@ model PlatformSetting {
   updatedAt DateTime @updatedAt
 }
 
+/// Pre-registration staging (0.6.54). The User row is created ONLY after the
+/// email/phone OTP verification completes — until then the signup payload is
+/// staged here (password stored as a hash, same policy as User.passwordHash),
+/// so a user can freely go back and fix a typo (e.g. a wrong email) without
+/// any account being created and without username/email/phone being locked.
+/// Rows are purged after PENDING_REGISTRATION_TTL_HOURS and deleted as soon
+/// as the verification succeeds and the real account is created.
+model PendingRegistration {
+  id             String   @id @default(cuid())
+  /// Unique — the username is HELD for the duration of the signup so two
+  /// in-flight registrations can never silently claim the same username.
+  username       String   @unique
+  fullName       String
+  /// Cloud-only secret (same policy as User.passwordHash — never synced).
+  passwordHash   String
+  /// Unique — normalized lowercase, same as User.email.
+  email          String   @unique
+  /// Unique — Algerian mobile, same normalization as the register schema.
+  phoneNumber    String?  @unique
+  role           String   @default("CUSTOMER")
+  agencyCode     String?
+  avatarUrl      String?
+  wilaya         String?
+  commune        String?
+  language       String   @default("ar")
+  /// Per-channel OTP progress on the STAGED signup (mirrors User flags).
+  emailVerified  Boolean  @default(false)
+  phoneVerified  Boolean  @default(false)
+  /// IP that started the registration (audit).
+  requestIp      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  codes          PendingRegistrationCode[]
+}
+
+/// OTP rows for PendingRegistration (same shape/policy as VerificationCode,
+/// but keyed by the staged signup instead of a User row).
+model PendingRegistrationCode {
+  id                    String    @id @default(cuid())
+  pendingRegistrationId String
+  /// EMAIL_VERIFY | PHONE_VERIFY
+  purpose               String
+  /// EMAIL | SMS | WHATSAPP (delivery channel used)
+  channel               String
+  /// The email address / phone number the code was sent to (dedup + audit)
+  target                String
+  /// sha256 hex of the plaintext OTP
+  codeHash              String
+  attempts              Int       @default(0)
+  maxAttempts           Int       @default(5)
+  expiresAt             DateTime
+  consumedAt            DateTime?
+  /// IP that requested the code (rate-limit + audit)
+  requestIp             String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  pendingRegistration   PendingRegistration @relation(fields: [pendingRegistrationId], references: [id], onDelete: Cascade)
+
+  @@index([pendingRegistrationId, purpose])
+  @@index([target])
+}
+
 model VerificationCode {
   id          String    @id @default(cuid())
   userId      String

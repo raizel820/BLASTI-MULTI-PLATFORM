@@ -10,6 +10,8 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 import { buildAgencyLocationPatch } from '../lib/map-settings'
 // Agencies Management — category/specialty validation + payload enrichment.
 import { attachSpecialties, categorySlugError, getActiveSpecialtyMap, serializeSpecialtyIds, specialtyIdsError } from '../lib/categories'
+// 0.6.54 — the agency phone must be a DEDICATED number or one of the
+// owner's/staff's own numbers (the create path checks holder users inline).
 
 // ─── Case-insensitive search (field-fix: agency & branch search) ───────────
 // Prisma `contains` is CASE-SENSITIVE on PostgreSQL but case-insensitive on
@@ -840,6 +842,23 @@ app.post('/', async (c) => {
         error: 'Your session refers to an account that no longer exists. Please log in again.',
         code: 'SESSION_USER_MISSING',
       }, 401)
+    }
+
+    // 0.6.54 — the agency phone must be a DEDICATED number (used by no user
+    // outside this agency's own circle). For a NEW agency the only allowed
+    // holder is its owner-to-be; every other user holding that number is a
+    // conflict.
+    if (phone) {
+      const holder = await db.user.findFirst({
+        where: { phoneNumber: phone, id: { not: resolvedOwnerId } },
+        select: { id: true, fullName: true, username: true },
+      })
+      if (holder) {
+        return c.json({
+          success: false,
+          error: 'This phone number is used by another account — the agency phone must be a dedicated number or one of the owner/staff numbers',
+        }, 409)
+      }
     }
 
     // Task 83 — typed extraction of the agency location for the auto-created

@@ -126,7 +126,15 @@ export interface InvoiceListFilters {
   offset?: number
 }
 
-export async function fetchInvoices(filters: InvoiceListFilters = {}): Promise<{ invoices: InvoiceRecord[]; total: number }> {
+/** 0.6.55 — server-computed KPI totals over the whole filtered set. */
+export interface InvoiceTotals {
+  issuedCount: number
+  invoicedAmount: number
+  cancelled: number
+  verifications: number
+}
+
+export async function fetchInvoices(filters: InvoiceListFilters = {}): Promise<{ invoices: InvoiceRecord[]; total: number; totals?: InvoiceTotals }> {
   const params = new URLSearchParams()
   if (filters.year) params.set('year', String(filters.year))
   if (filters.sourceType) params.set('sourceType', filters.sourceType)
@@ -134,8 +142,8 @@ export async function fetchInvoices(filters: InvoiceListFilters = {}): Promise<{
   if (filters.q) params.set('q', filters.q)
   params.set('limit', String(filters.limit ?? 50))
   params.set('offset', String(filters.offset ?? 0))
-  const data = await getJson<{ invoices: InvoiceRecord[]; total: number }>(`/api/billing/invoices?${params.toString()}`)
-  return { invoices: data.invoices ?? [], total: data.total ?? 0 }
+  const data = await getJson<{ invoices: InvoiceRecord[]; total: number; totals?: InvoiceTotals }>(`/api/billing/invoices?${params.toString()}`)
+  return { invoices: data.invoices ?? [], total: data.total ?? 0, totals: data.totals }
 }
 
 export async function fetchInvoice(id: string): Promise<InvoiceRecord> {
@@ -157,6 +165,33 @@ export async function fetchInvoiceVerifications(id: string): Promise<InvoiceVeri
 export async function ensureInvoice(sourceType: 'TRANSACTION' | 'SMS', sourceId: string): Promise<InvoiceRecord> {
   const data = await sendJson<{ invoice: InvoiceRecord }>('/api/billing/invoices/ensure', 'POST', { sourceType, sourceId })
   return data.invoice
+}
+
+// ─── 0.6.55 — legacy backfill (bulk) ────────────────────────────────────────
+
+export interface BackfillStatus {
+  missing: number
+  candidates: number
+  byType: { transaction: number; sms: number }
+}
+
+export interface BackfillRunResult {
+  created: number
+  failed: number
+  remaining: number
+  scanned: number
+  errors: Array<{ sourceId: string; error: string }>
+}
+
+/** How many settled payments still lack an invoice (drives the banner). */
+export async function fetchBackfillStatus(): Promise<BackfillStatus> {
+  const data = await getJson<BackfillStatus>('/api/billing/invoices/backfill-status')
+  return data
+}
+
+/** Idempotently issue invoices for up to `max` settled payments lacking one. */
+export async function runBackfillAll(max = 100): Promise<BackfillRunResult> {
+  return sendJson<BackfillRunResult>('/api/billing/invoices/backfill-all', 'POST', { max })
 }
 
 export async function cancelInvoice(id: string): Promise<InvoiceRecord> {

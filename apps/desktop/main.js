@@ -469,6 +469,70 @@ function requestRendererLogFlush() {
   }
 }
 
+// ─── 0.6.55 — DIRECT-TO-CLOUD update-failure upload (works with NO account) ─
+// requestRendererLogFlush() asks the RENDERER to flush, but the mandate is
+// "upload logs immediately when an update fails … EVEN IF NO ACCOUNT IS OPEN".
+// The renderer's flush used to 401 without a session and the trail sat on
+// disk until someone signed in. This helper POSTs the update-diag tail to the
+// cloud vault ANONYMOUSLY (the vault files tokenless batches under
+// anon-<deviceId>, trigger 'update') — fire-and-forget, throttled to one
+// upload per 20 s, never throws, never blocks the updater.
+let lastDirectUpdateUploadAt = 0;
+function pushUpdateFailureToCloud(stage, message, extra) {
+  try {
+    const now = Date.now();
+    if (now - lastDirectUpdateUploadAt < 20_000) return; // burst guard
+    lastDirectUpdateUploadAt = now;
+    const base = String(CLOUD_BASE_URL || '').replace(/\/+$/, '');
+    if (!base) return;
+    const fsMod = require('fs');
+    const pathMod = require('path');
+    // Device identity — one folder per machine even with no account.
+    let deviceId = '';
+    try {
+      const identity = JSON.parse(fsMod.readFileSync(pathMod.join(app.getPath('userData'), 'app-device-identity.json'), 'utf8'));
+      if (identity && typeof identity.deviceId === 'string') deviceId = identity.deviceId.slice(0, 64);
+    } catch { /* identity unavailable — shared anonymous folder still works */ }
+    // Tail of the dedicated update pipeline log (the failing stage lines live
+    // here) — capped so a huge log file cannot balloon the payload.
+    let tail = [];
+    try {
+      const { updateLogFilePath } = require('./update-log');
+      if (updateLogFilePath) {
+        tail = fsMod.readFileSync(updateLogFilePath, 'utf8').split('\n').filter(Boolean).slice(-40);
+      }
+    } catch { /* no update log yet — the event line alone still goes out */ }
+    const line = `[${new Date().toISOString()}] [${stage}] ${message}` + (extra ? ' | ' + Object.entries(extra).filter(([, v]) => v !== undefined).map(([k, v]) => `${k}=${typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v)}`).join(' ') : '');
+    if (!tail.includes(line)) tail.push(line);
+    const entries = tail.slice(-60).map((l) => ({
+      ts: new Date().toISOString(),
+      level: 'warn',
+      tag: 'update-diag',
+      message: String(l).slice(0, 2000),
+      trigger: 'update',
+    }));
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => { try { ctrl.abort(); } catch { /* ignore */ } }, 8000);
+    void fetch(base + '/api/logs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-blasti-client': 'desktop' },
+      body: JSON.stringify({
+        manual: false,
+        reason: 'update',
+        trigger: 'update',
+        platform: 'desktop',
+        appVersion: app.getVersion(),
+        ...(deviceId ? { deviceId } : {}),
+        device: `electron-main; ${process.platform}`,
+        entries,
+      }),
+      signal: ctrl.signal,
+    }).catch(() => { /* best-effort — the renderer flush + local queue retry */ })
+      .finally(() => clearTimeout(timer));
+    console.log('[BLASTI Desktop] update failure telemetry queued for direct cloud upload (anonymous OK)');
+  } catch { /* diagnostics must never break the updater */ }
+}
+
 // Task 2-b (sub-task 5): SIGINT/SIGTERM must run the SAME embedded-service
 // teardown as a UI quit — a terminal Ctrl+C (dev) or a process-manager stop
 // used to leave the :3080 server + timers to the OS's mercy.
@@ -2032,6 +2096,7 @@ ipcMain.handle('updates:check', async (_e, payload) => {
     clearTimeout(timer);
     if (!res.ok) {
       updateLog('CHECK', 'release feed unreachable', { httpStatus: res.status });
+      pushUpdateFailureToCloud('CHECK', 'release feed unreachable', { httpStatus: res.status });
       return { success: false, error: `http-${res.status}` };
     }
     const data = await res.json();
@@ -2064,6 +2129,7 @@ ipcMain.handle('updates:check', async (_e, payload) => {
     return data;
   } catch (err) {
     updateLog('CHECK', 'update check failed', { error: (err && err.message) || String(err), tookMs: Date.now() - checkStartedAt });
+    pushUpdateFailureToCloud('CHECK', 'update check failed', { error: (err && err.message) || String(err) });
     console.warn('[BLASTI Desktop] updates:check failed:', err && err.message);
     return { success: false, error: (err && err.message) || 'check-failed' };
   }
@@ -2130,6 +2196,7 @@ ipcMain.handle('updates:download', async (_e, payload) => {
         try { fs.unlinkSync(dest); } catch { /* already gone */ }
         lastDownloadedInstaller = null;
         requestRendererLogFlush();
+        pushUpdateFailureToCloud('VERIFY', 'downloaded installer FAILED the integrity check — deleted', { version, error: verify.error });
         sendUpdateProgress({ status: 'error', error: verify.error, version: activeUpdateDownload.version });
         return;
       }
@@ -2141,6 +2208,7 @@ ipcMain.handle('updates:download', async (_e, payload) => {
       console.log('[BLASTI Desktop] update downloaded + verified:', dest, `(${received} bytes, sha256 ${verify.sha256.slice(0, 12)}…)`);
     } catch (err) {
       updateLog('DOWNLOAD', 'installer download failed', { version, error: (err && err.message) || String(err) });
+      pushUpdateFailureToCloud('DOWNLOAD', 'installer download failed', { version, error: (err && err.message) || String(err) });
       console.warn('[BLASTI Desktop] update download failed:', err && err.message);
       sendUpdateProgress({ status: 'error', error: (err && err.message) || 'download-failed', version: activeUpdateDownload ? activeUpdateDownload.version : '' });
       try { fs.unlinkSync(dest); } catch { /* nothing to clean */ }
@@ -2445,6 +2513,7 @@ async function installDownloadedUpdate() {
       hint: 'check INSTALL-LEG lines above for the failing leg and error',
     });
     requestRendererLogFlush();
+    pushUpdateFailureToCloud('INSTALL', 'ALL launcher legs failed — app stays open, manual install fallback armed', { installer });
     sendUpdateProgress({ status: 'error', error: 'install-spawn-failed', version: '' });
     return { ok: false, error: 'install-spawn-failed' };
   }
@@ -2533,6 +2602,7 @@ function spawnUpdateWaiter(installerPath) {
   } catch (err) {
     console.warn('[BLASTI Desktop] waiter copy failed — falling back to PowerShell leg:', err && err.message);
     updateLog('INSTALL-LEG', 'waiter copy FAILED — falling back to next leg', { error: (err && err.message) || String(err) });
+    pushUpdateFailureToCloud('INSTALL-LEG', 'waiter copy FAILED — falling back to next leg', { error: (err && err.message) || String(err) });
     return null;
   }
   try {
@@ -2909,6 +2979,10 @@ ipcMain.handle('updates:install-delta', async (_e, payload) => {
       stack: (err && err.stack ? String(err.stack).split('\n').slice(0, 4).join(' ⏎ ') : undefined),
     });
     requestRendererLogFlush();
+    pushUpdateFailureToCloud('DELTA', 'delta chain FAILED — falling back to full installer', {
+      targetVersion: target.version || 'unknown',
+      error: (err && err.message) || String(err),
+    });
     return { ok: false, error: `delta-failed: ${(err && err.message) || err}` };
   }
 });

@@ -6,6 +6,9 @@ import { validateBody, updateProfileSchema, updatePreferencesSchema, changePassw
 import { hashPassword, verifyPassword } from '../lib/password'
 import { checkRateLimit, RateLimitError, PASSWORD_RESET_RATE_LIMIT } from '../lib/rate-limit'
 import { normalizeRecordFileUrls } from '../lib/file-url'
+// 0.6.54 — one phone number must never alias two unrelated identities: the
+// user↔agency ownership rule + friendly duplicate detection live here.
+import { assertUserPhoneAvailable, assertUserPhoneNotAgencyConflicting } from '../lib/phone-contacts'
 
 const app = new Hono()
 
@@ -68,6 +71,19 @@ app.patch('/profile', async (c) => {
       // STRICT verification rule: a CHANGED phone number starts unverified —
       // a user must never inherit the old number's verified status.
       if (phoneNumber !== current?.phoneNumber) updateData.phoneVerified = false
+      if (phoneNumber !== current?.phoneNumber) {
+        // 0.6.54 — friendly duplicate detection (instead of a raw P2002 500)
+        // PLUS the user↔agency rule: a phone number already used by an agency
+        // may only be adopted by that agency's owner/staff.
+        const phoneError = await assertUserPhoneAvailable(user.id, phoneNumber)
+        if (phoneError) {
+          return c.json({ success: false, error: phoneError }, 409)
+        }
+        const agencyRule = await assertUserPhoneNotAgencyConflicting(user.id, phoneNumber)
+        if (!agencyRule.ok) {
+          return c.json({ success: false, error: 'This phone number is already used by an agency account' }, 409)
+        }
+      }
       updateData.phoneNumber = phoneNumber
     }
     if (email !== undefined) {

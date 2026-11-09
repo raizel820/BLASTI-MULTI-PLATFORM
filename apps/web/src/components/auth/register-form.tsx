@@ -234,12 +234,12 @@ function getPasswordStrength(password: string): { score: number; label: string; 
 }
 
 // Username availability check with debounce
-function useUsernameAvailability(username: string) {
+function useUsernameAvailability(username: string, pendingToken?: string | null) {
   const [status, setStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'error'>('idle');
   const abortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const checkUsername = useCallback(async (name: string) => {
+  const checkUsername = useCallback(async (name: string, token?: string | null) => {
     // Cancel any pending request
     if (abortRef.current) abortRef.current.abort();
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -256,7 +256,11 @@ function useUsernameAvailability(username: string) {
       abortRef.current = controller;
 
       try {
-        const res = await apiFetch(`/api/auth/check-username?username=${encodeURIComponent(name.trim())}`, {
+        // 0.6.54 — in-flight signups hold usernames too; the registrant's OWN
+        // pending row (staged token) must never block their own re-checks.
+        const params = new URLSearchParams({ username: name.trim() });
+        if (token) params.set('pendingToken', token);
+        const res = await apiFetch(`/api/auth/check-username?${params.toString()}`, {
           signal: controller.signal,
         });
 
@@ -339,11 +343,19 @@ export function RegisterForm() {
     dev?: VerificationDev | null;
   } | null>(null);
 
+  // 0.6.54 — STAGED registration: the account is created ONLY after the
+  // email/phone OTP step completes. When the user goes back from the OTP
+  // step to fix a typo (e.g. a wrong email), the staged token is KEPT here
+  // so the re-submit UPDATES the same pending signup: no orphan account, no
+  // "already registered" dead end, and re-issued codes for the edited
+  // contact arrive instantly (no cooldown).
+  const [pendingRegToken, setPendingRegToken] = useState<string | null>(null);
+
   // Inline field errors
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
 
   // Username availability
-  const { status: usernameStatus, checkUsername } = useUsernameAvailability(username);
+  const { status: usernameStatus, checkUsername } = useUsernameAvailability(username, pendingRegToken);
 
   const avatarUpload = useUpload({
     type: 'avatar',
@@ -554,6 +566,13 @@ export function RegisterForm() {
         if (communeName) body.commune = communeName;
       }
 
+      // 0.6.54 — continuation token: when this is a RE-submit of a staged
+      // signup (user went back from the OTP step), the server updates the
+      // SAME pending registration instead of colliding with it.
+      if (pendingRegToken) {
+        body.pendingToken = pendingRegToken;
+      }
+
       const res = await apiFetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -563,11 +582,12 @@ export function RegisterForm() {
       const data = await res.json();
 
       // ── Task 22-b: the account requires email+phone OTP verification ──
-      // The response carries a short-lived verificationToken instead of a
-      // session — show the shared VerificationStep; the session is issued
-      // by POST /api/auth/verify once BOTH codes pass (see
-      // handleVerificationSuccess below).
+      // 0.6.54 — the response STAGES the signup (no User row exists yet) and
+      // carries a short-lived staged token. The session is issued by
+      // POST /api/auth/verify once BOTH codes pass — only then is the real
+      // account created.
       if (res.ok && data.requiresVerification && data.verificationToken) {
+        setPendingRegToken(null);
         setVerificationData({
           verificationToken: data.verificationToken,
           pending: (data.pending ?? { email: true, phone: true }) as VerificationPending,
@@ -601,16 +621,19 @@ export function RegisterForm() {
         // user.agencyId) — previously it popped over the create-agency form
         // 300ms after registration, which buried the agency wizard.
       } else {
-        // Map API errors to field errors
-        if (data.error?.includes('Username')) {
-          setFieldErrors((prev) => ({ ...prev, username: data.error }));
-        } else if (data.error?.includes('Email')) {
+        // Map API errors to field errors (case-insensitive — 0.6.54 adds the
+        // agency-phone wording which starts with "This phone number…").
+        const errText = String(data.error || '');
+        const errLower = errText.toLowerCase();
+        if (errLower.includes('username')) {
+          setFieldErrors((prev) => ({ ...prev, username: errText }));
+        } else if (errLower.includes('email')) {
           // 409 'Email already registered' → inline error on the email field
-          setFieldErrors((prev) => ({ ...prev, email: data.error }));
-        } else if (data.error?.includes('Phone')) {
-          setFieldErrors((prev) => ({ ...prev, phoneNumber: data.error }));
+          setFieldErrors((prev) => ({ ...prev, email: errText }));
+        } else if (errLower.includes('phone')) {
+          setFieldErrors((prev) => ({ ...prev, phoneNumber: errText }));
         } else {
-          toast.error(data.error || t('error'));
+          toast.error(errText || t('error'));
         }
       }
     } catch {
@@ -633,6 +656,7 @@ export function RegisterForm() {
     try { setNativeSessionToken(result.token); } catch { /* non-native runtime */ }
     setRegistrationSuccess(true);
     setVerificationData(null);
+    setPendingRegToken(null);
     toast.success(t('registerSuccess'));
     // NOTE: onboarding is NOT dispatched here — it is gated on the user
     // having an agency and fires on first dashboard entry after agency
@@ -643,11 +667,16 @@ export function RegisterForm() {
   // login re-issues the OTPs and a new verification token).
   const handleVerificationTokenInvalid = () => {
     setVerificationData(null);
+    setPendingRegToken(null);
     setView('login');
   };
 
-  // Manual back from the verification step (header arrow or back link)
+  // Manual back from the verification step (header arrow or back link).
+  // 0.6.54 — the staged token is KEPT: re-submitting after fixing the typo
+  // updates the SAME pending signup (the account was never created, so
+  // nothing needs cleaning up and nothing is locked).
   const handleVerificationBack = () => {
+    setPendingRegToken(verificationData?.verificationToken ?? null);
     setVerificationData(null);
     setStep(3);
   };
@@ -1118,7 +1147,7 @@ export function RegisterForm() {
                                   onChange={(e) => {
                                     setUsername(e.target.value);
                                     clearFieldError('username');
-                                    checkUsername(e.target.value);
+                                    checkUsername(e.target.value, pendingRegToken);
                                   }}
                                   onFocus={() => setFocusedField('username')}
                                   onBlur={() => setFocusedField(null)}

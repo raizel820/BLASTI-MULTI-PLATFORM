@@ -40,7 +40,35 @@ export interface LogEntry {
   tag: string;
   message: string;
   data?: unknown;
+  /** 0.6.55 — WHY this entry happened: the error-trigger taxonomy slug
+   *  (update / crash / profile-image / reservation-rejection / rate-limit /
+   *  auth / payment / network / sync / api / database). Attached per entry,
+   *  lifted to the batch envelope on flush, indexed server-side and
+   *  filterable in the Logs Manager. */
+  trigger?: string;
 }
+
+/**
+ * 0.6.55 — canonical error-trigger slugs. Features SHOULD pass one of these
+ * as the 4th argument of logError/logWarn/logEvent so the Logs Manager's
+ * "error trigger" filter can slice bugs by cause (the user's mandate:
+ * "updates, profile image update, reservation rejection, too many requests…").
+ * Unknown slugs are still accepted (normalized server-side).
+ */
+export const LOG_TRIGGERS = [
+  'update',                 // app update pipeline (desktop delta/NSIS, mobile APK)
+  'crash',                  // uncaught errors / unhandled rejections
+  'profile-image',          // profile picture upload/update failures
+  'reservation-rejection',  // reservation reject flow
+  'rate-limit',             // HTTP 429 / too many requests
+  'auth',                   // login / session / token problems
+  'payment',                // payments, checkout, billing
+  'network',                // connectivity / offline failures
+  'sync',                   // desktop sync engine
+  'api',                    // unexpected API errors
+  'database',               // local/remote DB errors
+] as const;
+export type LogTrigger = (typeof LOG_TRIGGERS)[number] | (string & {});
 
 const FLUSH_INTERVAL_MS = 30_000;         // auto-upload cadence while logged in
 const MAX_BUFFER = 600;                   // in-memory cap (oldest dropped)
@@ -51,13 +79,17 @@ const MIN_FLUSH_GAP_MS = 8_000;           // manual-button debounce
 // STRICT MODE (0.6.30): the user's field report — "logs autoupload is not
 // working" — traced to three root causes, all fixed here:
 //   1. ERRORS WAITED for the next 30 s tick → every error now schedules an
-//      URGENT flush (2 s debounce batches a burst into one request).
+//      URGENT flush (debounce batches a burst into one request).
 //   2. KIOSK/TV devices hold no user session → uploads 401'd forever. The
 //      device token (blasti_kiosk_device_token) is now used when no session
 //      exists, and the API accepts it (device-<id> vault folder).
 //   3. LAN clients (apiFetch → the desktop local API :3080) 404'd — the
 //      local API now has a /api/logs ingest+forward route.
-const URGENT_FLUSH_DEBOUNCE_MS = 2_000;
+// 0.6.55 STRICTER: debounce 2 s → 1.2 s (errors reach the vault in about a
+// second) and a FAILED urgent flush self-retries once after 15 s so a
+// transient network blip can no longer swallow the only copy of a crash.
+const URGENT_FLUSH_DEBOUNCE_MS = 1_200;
+const URGENT_RETRY_DELAY_MS = 15_000;
 const DEVICE_TOKEN_KEY = 'blasti_kiosk_device_token';
 
 let buffer: LogEntry[] = [];
@@ -99,9 +131,9 @@ function restore(): void {
 
 // ─── Entry intake ────────────────────────────────────────────────────────────
 
-function pushEntry(level: LogEntry['level'], tag: string, message: string, data?: unknown): void {
+function pushEntry(level: LogEntry['level'], tag: string, message: string, data?: unknown, trigger?: string): void {
   if (buffer.length >= MAX_BUFFER) buffer = buffer.slice(-MAX_BUFFER + 1);
-  buffer.push({ ts: new Date().toISOString(), level, tag, message, data });
+  buffer.push({ ts: new Date().toISOString(), level, tag, message, data, ...(trigger ? { trigger } : {}) });
   // Cheap persistence throttle — at most once per 5s.
   if (Date.now() - lastPersistAt > 5_000) {
     lastPersistAt = Date.now();
@@ -109,16 +141,16 @@ function pushEntry(level: LogEntry['level'], tag: string, message: string, data?
   }
 }
 
-/** Public API for features: logEvent('queue', 'claim failed', { id }). */
-export function logEvent(tag: string, message: string, data?: unknown): void {
-  pushEntry('info', tag, message, data);
+/** Public API for features: logEvent('queue', 'claim failed', { id }, 'sync'). */
+export function logEvent(tag: string, message: string, data?: unknown, trigger?: LogTrigger): void {
+  pushEntry('info', tag, message, data, trigger);
 }
-export function logWarn(tag: string, message: string, data?: unknown): void {
-  pushEntry('warn', tag, message, data);
+export function logWarn(tag: string, message: string, data?: unknown, trigger?: LogTrigger): void {
+  pushEntry('warn', tag, message, data, trigger);
 }
-export function logError(tag: string, message: string, data?: unknown): void {
-  pushEntry('error', tag, message, data);
-  scheduleUrgentFlush(); // STRICT: an error never waits for the next tick
+export function logError(tag: string, message: string, data?: unknown, trigger?: LogTrigger): void {
+  pushEntry('error', tag, message, data, trigger);
+  scheduleUrgentFlush(trigger); // STRICT: an error never waits for the next tick
 }
 
 /**
@@ -126,13 +158,22 @@ export function logError(tag: string, message: string, data?: unknown): void {
  * burst of errors from one crash into a single request). Errors from ANY
  * source funnel here: console.error, window.onerror, unhandledrejection,
  * logError() calls, and Electron's main-process flush requests.
+ * 0.6.55 — carries the triggering reason so the batch envelope names WHY,
+ * and a FAILED urgent flush retries ONCE after 15 s (transient network
+ * failures used to swallow the only copy of a crash until the next tick).
  */
-function scheduleUrgentFlush(): void {
+function scheduleUrgentFlush(trigger?: string): void {
   if (typeof window === 'undefined') return;
   if (urgentTimer) return; // a scheduled urgent flush already covers this burst
+  const pendingTrigger = trigger;
   urgentTimer = setTimeout(() => {
     urgentTimer = null;
-    void flushLogsNow({ reason: 'error' });
+    void flushLogsNow({ reason: 'error', trigger: pendingTrigger }).then((out) => {
+      if (!out.ok && out.error !== 'flush-in-progress' && out.error !== 'too-soon') {
+        // One self-retry — entries stay buffered, nothing is lost.
+        setTimeout(() => { void flushLogsNow({ reason: 'error', trigger: pendingTrigger }); }, URGENT_RETRY_DELAY_MS);
+      }
+    }).catch(() => { /* never propagate */ });
   }, URGENT_FLUSH_DEBOUNCE_MS);
 }
 
@@ -187,15 +228,15 @@ function installConsoleHook(): void {
     scheduleUrgentFlush(); // STRICT: every console.error uploads within 2 s
   };
   window.addEventListener('error', (e) => {
-    pushEntry('error', 'window-error', e.message || 'unknown', { source: e.filename, line: e.lineno });
-    scheduleUrgentFlush();
+    pushEntry('error', 'window-error', e.message || 'unknown', { source: e.filename, line: e.lineno }, 'crash');
+    scheduleUrgentFlush('crash');
   });
   window.addEventListener('unhandledrejection', (e) => {
     const r = e.reason;
     pushEntry('error', 'unhandled-rejection', (r && (r as Error).message) || String(r), {
       stack: r && (r as Error).stack ? String((r as Error).stack).slice(0, 2_000) : undefined,
-    });
-    scheduleUrgentFlush();
+    }, 'crash');
+    scheduleUrgentFlush('crash');
   });
 }
 
@@ -309,7 +350,7 @@ async function fetchLogsDirect(url: string, body: unknown): Promise<Response> {
   }
 }
 
-async function uploadBatch(manual: boolean, reason?: string): Promise<{ ok: boolean; accepted?: number; error?: string }> {
+async function uploadBatch(manual: boolean, reason?: string, triggerOverride?: string): Promise<{ ok: boolean; accepted?: number; error?: string }> {
   if (buffer.length === 0) return { ok: true, accepted: 0 };
   if (typeof window === 'undefined') return { ok: false, error: 'no-window' };
 
@@ -327,12 +368,23 @@ async function uploadBatch(manual: boolean, reason?: string): Promise<{ ok: bool
   uidCache = uid ?? null;
 
   const batch = buffer.slice(-MAX_BUFFER);
+  // 0.6.55 — batch trigger: the explicit override (why the flush fired) wins,
+  // otherwise lift the newest entry-level trigger so the envelope names the
+  // cause even when the feature only tagged its entries.
+  const batchTrigger = triggerOverride
+    || [...batch].reverse().find((e) => typeof e.trigger === 'string' && e.trigger)?.trigger;
+
   const body = {
     manual,
     reason: reason || 'interval',
     platform: platformName,
     appVersion: await appVersionSafe(),
     device: deviceDescription(),
+    // 0.6.55 — stable per-install device id: tokenless (anonymous) uploads
+    // file under anon-<deviceId> instead of the shared bucket, and account
+    // folders gain a correlatable device dimension.
+    deviceId: await deviceIdSafe(),
+    ...(batchTrigger ? { trigger: batchTrigger } : {}),
     sessionHref: typeof window !== 'undefined' ? window.location.hash || window.location.pathname : '',
     sessionId: sessionIdSafe(),
     deviceSpecs: deviceSpecsSafe(),
@@ -367,10 +419,13 @@ async function uploadBatch(manual: boolean, reason?: string): Promise<{ ok: bool
     try { localStorage.setItem(LAST_FLUSH_KEY, new Date().toISOString()); } catch { /* ignore */ }
     return { ok: true, accepted: typeof data?.accepted === 'number' ? data.accepted : batch.length };
   }
-  // 401 → not logged in yet; keep buffering. A 404 → the server predates the
-  // logs vault: keep EVERYTHING (nothing is wrong with the payload) and open
-  // the stale-server cooldown instead of retrying every 30s. Other 4xx →
-  // drop the poisoned half. 5xx/network → keep everything.
+  // 401 → not logged in yet; keep buffering. 0.6.55 note: the vault now
+  // accepts tokenless batches anonymously, so a 401 here means the SERVER
+  // predates 0.6.55 — the trail stays buffered until an account signs in.
+  // A 404 → the server predates the logs vault: keep EVERYTHING (nothing is
+  // wrong with the payload) and open the stale-server cooldown instead of
+  // retrying every 30s. Other 4xx → drop the poisoned half. 5xx/network →
+  // keep everything.
   if (res.status === 404) {
     staleServer404Until = Date.now() + STALE_SERVER_404_COOLDOWN_MS;
     pushEntry('warn', 'logger', 'log vault unavailable (server too old — /api/logs 404). Auto-upload paused 15 min; entries kept. Update the VPS API to 0.6.15+ to restore streaming.');
@@ -384,6 +439,27 @@ async function uploadBatch(manual: boolean, reason?: string): Promise<{ ok: bool
   let error = `HTTP ${res.status}`;
   try { error = (await res.json())?.error || error; } catch { /* keep status text */ }
   return { ok: false, error };
+}
+
+/**
+ * 0.6.55 — stable per-install device id for the upload envelope. Dynamic
+ * import keeps this module loadable before the fingerprint module exists and
+ * falls back to a locally-generated id when storage is unavailable.
+ */
+async function deviceIdSafe(): Promise<string> {
+  try {
+    const { getDeviceId } = await import('./device-fingerprint');
+    const id = await getDeviceId();
+    if (id) return id;
+  } catch { /* fall through */ }
+  try {
+    let id = localStorage.getItem('blasti-log-device-id');
+    if (!id) {
+      id = `log-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+      localStorage.setItem('blasti-log-device-id', id);
+    }
+    return id;
+  } catch { return 'unknown-device'; }
 }
 
 let cachedAppVersion: string | null = null;
@@ -476,13 +552,18 @@ function sessionIdSafe(): string {
 
 // ─── Public flush API (auto + manual button) ─────────────────────────────────
 
-export async function flushLogsNow(opts?: { manual?: boolean; reason?: 'error' | 'interval' | 'manual' | 'pagehide' | 'auth' | 'main-process' | 'external' }): Promise<{ ok: boolean; accepted?: number; error?: string }> {
+export async function flushLogsNow(opts?: {
+  manual?: boolean;
+  reason?: 'error' | 'interval' | 'manual' | 'pagehide' | 'auth' | 'main-process' | 'external' | 'update' | 'crash';
+  /** 0.6.55 — WHY: names the batch envelope for the trigger taxonomy. */
+  trigger?: string;
+}): Promise<{ ok: boolean; accepted?: number; error?: string }> {
   if (flushing) return { ok: false, error: 'flush-in-progress' };
   const now = Date.now();
   // Stale-server cooldown: skip AUTO flushes only — the manual button
   // (opts.manual) and ERROR-driven urgent flushes always go through so a
   // failing upload never hides the very trail the system exists to keep.
-  const isUrgent = opts?.reason === 'error' || opts?.reason === 'main-process';
+  const isUrgent = opts?.reason === 'error' || opts?.reason === 'main-process' || opts?.reason === 'update' || opts?.reason === 'crash';
   if (!opts?.manual && !isUrgent && now < staleServer404Until) {
     return { ok: false, error: 'stale-server-cooldown' };
   }
@@ -491,7 +572,7 @@ export async function flushLogsNow(opts?: { manual?: boolean; reason?: 'error' |
   }
   flushing = true;
   try {
-    const out = await uploadBatch(opts?.manual === true, opts?.reason || (opts?.manual ? 'manual' : 'interval'));
+    const out = await uploadBatch(opts?.manual === true, opts?.reason || (opts?.manual ? 'manual' : 'interval'), opts?.trigger);
     lastFlushAt = Date.now();
     // A success clears the stale-server state (server got updated).
     if (out.ok) staleServer404Until = 0;

@@ -40,6 +40,8 @@ import {
   canBypassCounterApproval,
 } from '../lib/counter-control'
 import { normalizeRecordFileUrls } from '../lib/file-url'
+// 0.6.54 — phone-uniqueness rules (user↔agency) + the phone-options picker.
+import { assertAgencyPhoneUsable, assertUserPhoneNotAgencyConflicting, getAgencyPhoneOptions } from '../lib/phone-contacts'
 // UID-0.6.14 — immutable per-user identifier ({TYPE}-{WILAYA}-{SEQ}).
 import { assignUidToUser } from '../lib/uid-generator'
 // Agencies Management — category/specialty validation + payload enrichment.
@@ -3220,6 +3222,19 @@ async function handleAgencyProfileUpdate(c: Context) {
     const targetAgency = await db.agency.findUnique({ where: { id: agencyId } })
     if (!targetAgency) return c.json({ error: 'No agency found' }, 404)
 
+    // 0.6.54 — agency phone rule: the number must be DEDICATED (held by no
+    // user outside this agency's own owner/staff circle) or one of the
+    // owner's/staff's own numbers (surfaced by GET /agency/phone-options).
+    if ((validatedData as { phone?: string | null }).phone !== undefined) {
+      const phoneRule = await assertAgencyPhoneUsable(targetAgency.id, (validatedData as { phone?: string | null }).phone)
+      if (!phoneRule.ok) {
+        return c.json({
+          success: false,
+          error: 'This phone number is used by another account — use a dedicated number or pick one of the owner/staff numbers',
+        }, 409)
+      }
+    }
+
     // Agencies Management — category must exist + be active in the dictionary.
     if ((validatedData as { category?: string }).category !== undefined) {
       const categoryError = await categorySlugError((validatedData as { category: string }).category)
@@ -3339,6 +3354,35 @@ async function handleAgencyProfileUpdate(c: Context) {
 
 app.patch('/profile', handleAgencyProfileUpdate)
 app.put('/profile', handleAgencyProfileUpdate)
+
+// ─── 0.6.54 — phone options for the agency-phone picker ──────────────────────
+// The agency phone must be a DEDICATED number or one of these numbers; the
+// profile editor renders them as one-tap chips under the phone field.
+app.get('/phone-options', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    let agencyId: string | null = user.agencyId || null
+    if (!agencyId) agencyId = await resolveUserAgencyId(user)
+
+    // SUPER_ADMIN may inspect any agency via ?agencyId= (owner/staff are
+    // pinned to their own agency through the session).
+    const requestedId = c.req.query('agencyId')
+    if (requestedId) {
+      if (user.role !== 'SUPER_ADMIN') {
+        await ensureAgencyIdOwnership(c, requestedId)
+        await requireAgencyAccess(c, requestedId)
+      }
+      agencyId = requestedId
+    }
+    if (!agencyId) return c.json({ success: false, error: 'No agency found' }, 404)
+
+    const options = await getAgencyPhoneOptions(agencyId)
+    return c.json({ success: true, ...options })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
 
 // ─── agency/qr-code ───────────────────────────────────────────────────────────
 
@@ -5190,6 +5234,25 @@ app.post('/staff/create', async (c) => {
 
     if (existingUser) {
       return c.json({ error: 'This username is already taken' }, 409)
+    }
+
+    // 0.6.54 — staff phone: free among user accounts, and may match an
+    // agency phone ONLY for an agency this user is about to be staff of
+    // (THIS one — hence its custom code in the allow-list).
+    if (phoneNumber) {
+      const phoneHolder = await db.user.findFirst({
+        where: { phoneNumber },
+        select: { id: true },
+      })
+      if (phoneHolder) {
+        return c.json({ success: false, error: 'This phone number is already used by another account' }, 409)
+      }
+      const staffPhoneRule = await assertUserPhoneNotAgencyConflicting(null, phoneNumber, {
+        allowOwnerOfAgencyCodes: [agency.customCode],
+      })
+      if (!staffPhoneRule.ok) {
+        return c.json({ success: false, error: 'This phone number is already used by an agency account' }, 409)
+      }
     }
 
     // Hash the password

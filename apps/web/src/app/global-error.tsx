@@ -37,10 +37,55 @@ import { useEffect, useState } from 'react';
 import { getAppVersion } from '@/lib/app-version';
 import { diagDump } from '@/lib/diag-log';
 import { getNativeDiagnostics, clearNativeWebviewData } from '@/lib/native-diagnostics';
+import { buildCloudUrl } from '@/lib/api-client';
 
 interface GlobalErrorProps {
   error: Error & { digest?: string };
   reset: () => void;
+}
+
+/**
+ * 0.6.55 — STRICT crash upload. The recovery screen previously reported
+ * NOWHERE: the report lived only in the user's clipboard. This best-effort
+ * POST pushes the crash + the persisted remote-logger buffer straight to the
+ * cloud vault with the 'crash' trigger — anonymously when no account is open
+ * (the vault files it under anon-<deviceId>). Fire-and-forget with a 6 s
+ * timeout; it must never delay or break the recovery screen.
+ */
+function uploadCrashReport(error: Error & { digest?: string }, version: string | null): void {
+  try {
+    let deviceId = '';
+    let entries: unknown[] = [];
+    try { deviceId = localStorage.getItem('blasti_device_id') || localStorage.getItem('blasti-log-device-id') || ''; } catch { /* ignore */ }
+    try {
+      const buf = JSON.parse(localStorage.getItem('blasti-remote-log-buffer') || '[]');
+      if (Array.isArray(buf)) entries = buf.slice(-120);
+    } catch { /* ignore */ }
+    entries.push({
+      ts: new Date().toISOString(),
+      level: 'error',
+      tag: 'global-error',
+      message: `root crash: ${error?.message || 'unknown'}${error?.digest ? ` [digest ${error.digest}]` : ''}`,
+      data: { stack: String(error?.stack || '').slice(0, 2000), appVersion: version || 'unknown', href: window.location.hash || window.location.pathname },
+      trigger: 'crash',
+    });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 6000);
+    void fetch(buildCloudUrl('/api/logs'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, // anonymous on purpose — the vault accepts tokenless crash uploads
+      body: JSON.stringify({
+        manual: false,
+        reason: 'crash',
+        trigger: 'crash',
+        platform: (window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor?.isNativePlatform?.() ? 'mobile' : 'web',
+        ...(deviceId ? { deviceId } : {}),
+        entries: entries.slice(-150),
+      }),
+      signal: ctrl.signal,
+      keepalive: true,
+    }).catch(() => { /* best-effort */ }).finally(() => clearTimeout(timer));
+  } catch { /* the recovery screen must never crash on its own telemetry */ }
 }
 
 function safeStorageClear(): void {
@@ -81,7 +126,11 @@ export default function GlobalError({ error, reset }: GlobalErrorProps) {
   useEffect(() => {
     try { setUa(navigator.userAgent || ''); } catch { /* ignore */ }
     let alive = true;
-    getAppVersion().then((v) => { if (alive) setVersion(v); }).catch(() => { /* keep null */ });
+    getAppVersion().then((v) => {
+      if (alive) setVersion(v);
+      // 0.6.55 — upload as soon as we know the version (one shot per mount).
+      uploadCrashReport(error, v);
+    }).catch(() => { /* keep null */ });
     return () => { alive = false; };
   }, []);
 

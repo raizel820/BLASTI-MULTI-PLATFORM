@@ -104,6 +104,12 @@ export const registerSchema = z.object({
   // create platform admins; they skip email/phone verification entirely (auth.ts).
   role: z.enum(['CUSTOMER', 'AGENCY_OWNER', 'SUPER_ADMIN']).optional().default('CUSTOMER'),
   agencyCode: z.string().optional(),
+  // 0.6.54 — staged-registration continuation token: when the user goes BACK
+  // from the OTP step to fix a typo (e.g. the email) and re-submits, the form
+  // sends the token it received earlier so the server UPDATES that same
+  // pending row (keeps the username/identifiers reserved for THEM, releases
+  // the abandoned contact, re-issues OTPs for changed targets only).
+  pendingToken: z.string().max(4096).optional(),
   avatarUrl: uploadFileUrlSchema.optional(),
   // Task 5 — optional Algeria address (register form location selectors).
   // wilaya = two-digit official code, commune = baladiya Latin name.

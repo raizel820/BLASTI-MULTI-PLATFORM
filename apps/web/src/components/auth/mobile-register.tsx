@@ -138,12 +138,12 @@ function getPasswordStrength(password: string) {
 }
 
 // Username availability (debounced, same contract as the desktop form).
-function useUsernameAvailability(username: string) {
+function useUsernameAvailability(username: string, pendingToken?: string | null) {
   const [status, setStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'error'>('idle');
   const abortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const checkUsername = useCallback(async (name: string) => {
+  const checkUsername = useCallback(async (name: string, token?: string | null) => {
     if (abortRef.current) abortRef.current.abort();
     if (debounceRef.current) clearTimeout(debounceRef.current);
     if (!name || name.trim().length < 3) {
@@ -155,7 +155,11 @@ function useUsernameAvailability(username: string) {
       const controller = new AbortController();
       abortRef.current = controller;
       try {
-        const res = await apiFetch(`/api/auth/check-username?username=${encodeURIComponent(name.trim())}`, {
+        // 0.6.54 — the registrant's OWN staged signup must never block their
+        // own re-checks while they edit the form.
+        const params = new URLSearchParams({ username: name.trim() });
+        if (token) params.set('pendingToken', token);
+        const res = await apiFetch(`/api/auth/check-username?${params.toString()}`, {
           signal: controller.signal,
         });
         if (controller.signal.aborted) return;
@@ -225,7 +229,13 @@ export function MobileRegisterForm() {
     dev?: VerificationDev | null;
   } | null>(null);
 
-  const { status: usernameStatus, checkUsername } = useUsernameAvailability(username);
+  // 0.6.54 — STAGED registration: the account is created ONLY after the
+  // email/phone OTP step completes. Going back from the OTP step keeps the
+  // staged token so a re-submit UPDATES the same pending signup — fixing a
+  // typo in the email/phone never creates an orphan account.
+  const [pendingRegToken, setPendingRegToken] = useState<string | null>(null);
+
+  const { status: usernameStatus, checkUsername } = useUsernameAvailability(username, pendingRegToken);
 
   const avatarUpload = useUpload({
     type: 'avatar',
@@ -422,6 +432,11 @@ export function MobileRegisterForm() {
         if (communeName) body.commune = communeName;
       }
 
+      // 0.6.54 — continuation token for a re-submit of a staged signup.
+      if (pendingRegToken) {
+        body.pendingToken = pendingRegToken;
+      }
+
       const res = await apiFetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -431,7 +446,10 @@ export function MobileRegisterForm() {
       const data = await res.json();
 
       // ── Requires OTP verification → shared VerificationStep ──
+      // 0.6.54 — the response STAGES the signup (no User row yet); the real
+      // account is created by POST /api/auth/verify once BOTH codes pass.
       if (res.ok && data.requiresVerification && data.verificationToken) {
+        setPendingRegToken(null);
         setVerificationData({
           verificationToken: data.verificationToken,
           pending: (data.pending ?? { email: true, phone: true }) as VerificationPending,
@@ -444,14 +462,18 @@ export function MobileRegisterForm() {
       if (res.ok && data.user) {
         bootstrapSession(data.user, data.token, t('registerSuccess'));
       } else {
-        if (data.error?.includes('Username')) {
-          setFieldErrors((prev) => ({ ...prev, username: data.error }));
-        } else if (data.error?.includes('Email')) {
-          setFieldErrors((prev) => ({ ...prev, email: data.error }));
-        } else if (data.error?.includes('Phone')) {
-          setFieldErrors((prev) => ({ ...prev, phoneNumber: data.error }));
+        // Map API errors to field errors (case-insensitive — 0.6.54 adds the
+        // agency-phone wording which starts with "This phone number…").
+        const errText = String(data.error || '');
+        const errLower = errText.toLowerCase();
+        if (errLower.includes('username')) {
+          setFieldErrors((prev) => ({ ...prev, username: errText }));
+        } else if (errLower.includes('email')) {
+          setFieldErrors((prev) => ({ ...prev, email: errText }));
+        } else if (errLower.includes('phone')) {
+          setFieldErrors((prev) => ({ ...prev, phoneNumber: errText }));
         } else {
-          toast.error(data.error || t('error'));
+          toast.error(errText || t('error'));
         }
       }
     } catch {
@@ -480,15 +502,20 @@ export function MobileRegisterForm() {
 
   const handleVerificationSuccess = (result: VerificationSuccess) => {
     setVerificationData(null);
+    setPendingRegToken(null);
     bootstrapSession(result.user, result.token, t('registerSuccess'));
   };
 
   const handleVerificationTokenInvalid = () => {
     setVerificationData(null);
+    setPendingRegToken(null);
     setView('login');
   };
 
+  // 0.6.54 — the staged token is KEPT: re-submitting after fixing the typo
+  // updates the SAME pending signup (nothing was created, nothing is locked).
   const handleVerificationBack = () => {
+    setPendingRegToken(verificationData?.verificationToken ?? null);
     setVerificationData(null);
     setStep(3);
   };
@@ -756,7 +783,7 @@ export function MobileRegisterForm() {
                         <Input
                           id="m-reg-username"
                           value={username}
-                          onChange={(e) => { setUsername(e.target.value); clearFieldError('username'); checkUsername(e.target.value); }}
+                          onChange={(e) => { setUsername(e.target.value); clearFieldError('username'); checkUsername(e.target.value, pendingRegToken); }}
                           placeholder={t('username')}
                           autoCapitalize="none"
                           autoCorrect="off"

@@ -2,6 +2,13 @@ import { Hono } from 'hono'
 import type { Context } from 'hono'
 import { requireAuth, requireRole, authErrorResponse } from '../lib/auth'
 import { db } from '@blasti/db'
+import {
+  enforceRateLimit,
+  LOGS_INGEST_RATE_LIMIT,
+  isRateLimitError,
+  rateLimitErrorResponse,
+} from '../lib/rate-limit'
+import { normalizeTrigger } from '../lib/logs-analyzer'
 
 /**
  * BLASTI Account Log Vault (logs-1) + Logs Manager backend (logs-2 / 0.6.19).
@@ -124,6 +131,8 @@ interface IncomingEntry {
   tag?: unknown
   message?: unknown
   data?: unknown
+  /** 0.6.55 — per-entry error-trigger reason (update / profile-image / …). */
+  trigger?: unknown
 }
 
 /** Shallow whitelist-flatten for deviceSpecs / perf objects (values capped). */
@@ -156,7 +165,11 @@ function sanitizeEntry(raw: IncomingEntry): Record<string, unknown> | null {
       if (json && json.length > MAX_ENTRY_CHARS) data = { truncated: json.slice(0, MAX_ENTRY_CHARS) + '…' }
     } catch { data = { unserializable: true } }
   }
-  return { ts, level, tag, message, ...(data !== undefined ? { data } : {}) }
+  return { ts, level, tag, message, ...(data !== undefined ? { data } : {}), ...(
+    // 0.6.55 — normalized error-trigger slug rides the stored entry so the
+    // analyzer and the Logs Manager can attribute the bug to its cause.
+    normalizeTrigger(raw.trigger) ? { trigger: normalizeTrigger(raw.trigger) } : {}
+  ) }
 }
 
 function appendNdjson(file: string, lines: string[]): void {
@@ -197,10 +210,12 @@ const ingestSchema = {
     device?: string
     sessionHref?: string
     sessionId?: string
+    deviceId?: string
     deviceSpecs?: Record<string, string | number | boolean>
     perf?: Record<string, string | number | boolean>
     manual?: boolean
     reason?: string
+    trigger?: string
   } | null {
     if (!body || typeof body !== 'object') return null
     const b = body as Record<string, unknown>
@@ -213,10 +228,16 @@ const ingestSchema = {
       device: typeof b.device === 'string' ? b.device.slice(0, 120) : undefined,
       sessionHref: typeof b.sessionHref === 'string' ? b.sessionHref.slice(0, 300) : undefined,
       sessionId: typeof b.sessionId === 'string' ? b.sessionId.slice(0, 64) : undefined,
+      // 0.6.55 — stable install/device id (device-fingerprint / desktop install
+      // identity). Folders UNLINKED from any account are filed per-device
+      // instead of one shared "anonymous" bucket.
+      deviceId: typeof b.deviceId === 'string' ? b.deviceId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64) : undefined,
       deviceSpecs: sanitizeSmallObject(b.deviceSpecs),
       perf: sanitizeSmallObject(b.perf),
       manual: b.manual === true,
       reason: typeof b.reason === 'string' ? b.reason.slice(0, 20) : undefined,
+      // 0.6.55 — WHY this batch was flushed (error trigger taxonomy).
+      trigger: normalizeTrigger(b.trigger),
     }
   },
 }
@@ -227,14 +248,21 @@ const ingestSchema = {
 //   1. a user session JWT (the classic requireAuth path), or
 //   2. an AgencyDevice token (Bearer) from the kiosk join/pair flow.
 // Device folders land as "device-<id>" with the device's agency in the meta.
+//
+// 0.6.55 — THIRD path: a tokenless upload (update failed on a machine where
+// nobody signed in, an anonymous crash before login) is ACCEPTED as kind
+// 'anonymous' and filed under `anon-<deviceId>` — one folder per DEVICE, no
+// longer the shared pre-0.6.55 "anonymous" bucket. Without a client-reported
+// deviceId the batch still lands in the shared "anonymous" folder so nothing
+// is ever dropped.
 interface UploaderIdentity {
-  kind: 'user' | 'device'
+  kind: 'user' | 'device' | 'anonymous'
   folder: string
   label: string
   meta: Record<string, unknown>
 }
 
-async function resolveUploader(c: Context): Promise<UploaderIdentity> {
+async function resolveUploader(c: Context, body?: { deviceId?: string }): Promise<UploaderIdentity> {
   // Try the user session first (requireAuth throws on failure).
   try {
     const user = await requireAuth(c)
@@ -264,18 +292,35 @@ async function resolveUploader(c: Context): Promise<UploaderIdentity> {
       }
     }
   }
-  throw Object.assign(new Error('unauthorized'), { status: 401 })
+  // 0.6.55 — ANONYMOUS accept: update failures / pre-login crashes must reach
+  // the vault even with NO account and NO device token (the user's mandate).
+  // Rate limiting (LOGS_INGEST_RATE_LIMIT) + the per-folder byte cap bound the
+  // abuse surface; the deviceId keeps every device's trail separable.
+  const anonDevice = body?.deviceId
+    ? safeComponent(body.deviceId, 48, '')
+    : ''
+  return {
+    kind: 'anonymous',
+    folder: anonDevice ? `anon-${anonDevice}` : 'anonymous',
+    label: anonDevice ? `device ${anonDevice.slice(0, 12)}` : 'anonymous',
+    meta: { anonymous: true, deviceId: anonDevice || undefined },
+  }
 }
 
 app.post('/', async (c) => {
-  let uploader: UploaderIdentity
+  // 0.6.55 — DEDICATED ingest rate limit: anonymous uploads are accepted on
+  // this route now, so the bucket (120/min/IP) is the first abuse gate.
   try {
-    uploader = await resolveUploader(c)
+    enforceRateLimit(c, LOGS_INGEST_RATE_LIMIT)
   } catch (error) {
-    const status = (error as { status?: number }).status === 401 ? 401 : 500
-    return c.json({ success: false, error: status === 401 ? 'Unauthorized' : 'Auth check failed' }, status as any)
+    if (isRateLimitError(error)) {
+      const rl = rateLimitErrorResponse(error)
+      return c.json(rl.data, rl.status as any)
+    }
+    throw error
   }
 
+  // Body FIRST — the anonymous fallback needs the client deviceId.
   let body: ReturnType<typeof ingestSchema.parse>
   try {
     body = ingestSchema.parse(await c.req.json())
@@ -283,6 +328,14 @@ app.post('/', async (c) => {
     return c.json({ success: false, error: 'Invalid log payload' }, 400)
   }
   if (!body) return c.json({ success: false, error: 'Invalid log payload' }, 400)
+
+  let uploader: UploaderIdentity
+  try {
+    uploader = await resolveUploader(c, body)
+  } catch (error) {
+    const status = (error as { status?: number }).status === 401 ? 401 : 500
+    return c.json({ success: false, error: status === 401 ? 'Unauthorized' : 'Auth check failed' }, status as any)
+  }
 
   const uidDir = path.join(logRoot(), uploader.folder)
   // 0.6.19 — PLATFORM-SEPARATED streams under the SAME account folder.
@@ -323,9 +376,11 @@ app.post('/', async (c) => {
       platform,
       appVersion: body.appVersion,
       device: body.device,
+      deviceId: body.deviceId,
       href: body.sessionHref,
       sessionId: body.sessionId,
       flushReason: body.reason,
+      trigger: body.trigger,
       deviceSpecs,
       perf,
       count: sanitized.length,
@@ -368,13 +423,15 @@ app.post('/', async (c) => {
     analyzeBatch(
       {
         uid: uploader.kind === 'user' ? ((uploader.meta.uid as string | null) ?? null) : uploader.folder,
-        role: uploader.kind === 'user' ? String(uploader.meta.role ?? 'USER') : 'DEVICE',
+        role: uploader.kind === 'user' ? String(uploader.meta.role ?? 'USER') : uploader.kind === 'device' ? 'DEVICE' : 'ANONYMOUS',
         platform,
         appVersion: body.appVersion ?? 'unknown',
         device: body.device ?? 'unknown',
         date: dayStamp(),
         deviceSpecs,
         perf,
+        // 0.6.55 — the batch trigger feeds the analyzer's per-cause index.
+        trigger: body.trigger,
       },
       sanitized,
       body.manual === true,
@@ -405,6 +462,8 @@ function analysisFiltersFromQuery(c: { req: { query(name: string): string | unde
     q: q('q') || undefined,
     from: q('from') || undefined,
     to: q('to') || undefined,
+    // 0.6.55 — filter the error index by the triggering reason.
+    trigger: q('trigger') || undefined,
     limit: intOr(q('limit'), 100),
   }
 }

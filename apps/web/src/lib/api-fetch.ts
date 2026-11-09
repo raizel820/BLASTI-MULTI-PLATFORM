@@ -22,6 +22,7 @@
  */
 
 import { apiClient, ApiClientError } from './api-client';
+import { logWarn } from './remote-logger';
 
 export interface ApiFetchResponse {
   ok: boolean;
@@ -47,6 +48,9 @@ export interface ApiFetchResponse {
  *   - path: URL string (relative or absolute to API)
  *   - options.method, options.headers, options.body (string | FormData), options.signal
  */
+// 0.6.55 — module-level throttle: one rate-limit log entry per 30 s max.
+let lastRateLimitLogAt = 0;
+
 export async function apiFetch(
   path: string,
   options?: {
@@ -89,6 +93,17 @@ export async function apiFetch(
 
   const requestOptions = options?.signal ? { signal: options.signal } : undefined;
 
+  // 0.6.55 — "too many requests" observability: every 429 that reaches the
+  // app lands in the log vault with the rate-limit trigger (throttled to one
+  // entry per 30 s so a storm cannot spam the buffer).
+  const noteRateLimit = (status: number) => {
+    if (status !== 429) return;
+    const now = Date.now();
+    if (now - lastRateLimitLogAt < 30_000) return;
+    lastRateLimitLogAt = now;
+    logWarn('api', `rate limited by the server (HTTP 429) — ${method} ${path}`, { path, method }, 'rate-limit');
+  };
+
   try {
     let res;
     switch (method) {
@@ -119,6 +134,7 @@ export async function apiFetch(
     const data = res.data;
     const isJson = typeof data === 'object' || data === null || data === undefined;
     const textData = isJson ? JSON.stringify(data) : String(data);
+    noteRateLimit(res.status);
 
     return {
       ok: true,
@@ -135,6 +151,7 @@ export async function apiFetch(
     if (error instanceof ApiClientError) {
       const errBody = error.body ?? { error: error.message };
       const errText = typeof errBody === 'string' ? errBody : JSON.stringify(errBody);
+      noteRateLimit(error.status || 0);
       return {
         ok: false,
         status: error.status || 500,

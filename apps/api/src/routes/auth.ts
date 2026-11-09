@@ -31,8 +31,19 @@ import {
   verifyVerificationToken,
   maskTarget,
   getVerifiedContacts,
+  getVerificationMode,
+  createPendingRegistrationToken,
+  verifyPendingRegistrationToken,
+  issuePendingRegistrationOtp,
+  verifyPendingRegistrationOtp,
+  pendingModeRequires,
+  purgeStalePendingRegistrations,
   type VerificationPurpose,
+  type IssueResult,
 } from '../lib/verification-service'
+// 0.6.54 — one phone number must never alias two unrelated identities
+// (user↔agency rule lives here; the unique-constraint checks stay inline).
+import { assertUserPhoneNotAgencyConflicting } from '../lib/phone-contacts'
 import { deliverTemplate } from '../lib/messaging/template-service'
 import {
   checkRateLimit,
@@ -547,11 +558,42 @@ app.post('/register', async (c) => {
     // reachable from every device once the file-sync push delivers the blob.
     const avatarUrl = normalizeRecordFileUrls({ avatarUrl: validation.data.avatarUrl }).avatarUrl
 
-    // Check for duplicate username
+    // 0.6.54 — resolve the staged-registration continuation token FIRST: a
+    // user who went BACK from the OTP step to fix a typo (wrong email/phone)
+    // re-submits the SAME signup — their own pending row must be UPDATED, not
+    // collide with the uniqueness checks below.
+    const normalizedUsername = username.trim()
+    let ownPendingId: string | null = null
+    if (validation.data.pendingToken) {
+      const pendingId = await verifyPendingRegistrationToken(validation.data.pendingToken)
+      if (pendingId) {
+        const ownPending = await db.pendingRegistration.findUnique({
+          where: { id: pendingId },
+          select: { id: true },
+        })
+        if (ownPending) ownPendingId = ownPending.id
+      }
+    }
+    // Free identifiers held by signups abandoned for over 24h (best-effort).
+    if (!ownPendingId) await purgeStalePendingRegistrations()
+
+    const notOwnPending = ownPendingId ? { id: { not: ownPendingId } } : {}
+
+    // Check for duplicate username — live accounts AND in-flight signups.
     const existingUser = await db.user.findUnique({
-      where: { username },
+      where: { username: normalizedUsername },
     })
     if (existingUser) {
+      return c.json(
+        { success: false, error: 'Username already taken' },
+        409,
+      )
+    }
+    const pendingUsername = await db.pendingRegistration.findFirst({
+      where: { username: normalizedUsername, ...notOwnPending },
+      select: { id: true },
+    })
+    if (pendingUsername) {
       return c.json(
         { success: false, error: 'Username already taken' },
         409,
@@ -569,8 +611,18 @@ app.post('/register', async (c) => {
         409,
       )
     }
+    const pendingEmail = await db.pendingRegistration.findFirst({
+      where: { email: normalizedEmail, ...notOwnPending },
+      select: { id: true },
+    })
+    if (pendingEmail) {
+      return c.json(
+        { success: false, error: 'Email already registered' },
+        409,
+      )
+    }
 
-    // Check for duplicate phone number
+    // Check for duplicate phone number — live accounts AND in-flight signups.
     if (phoneNumber) {
       const existingPhone = await db.user.findUnique({
         where: { phoneNumber },
@@ -578,6 +630,29 @@ app.post('/register', async (c) => {
       if (existingPhone) {
         return c.json(
           { success: false, error: 'Phone number already registered' },
+          409,
+        )
+      }
+      const pendingPhone = await db.pendingRegistration.findFirst({
+        where: { phoneNumber, ...notOwnPending },
+        select: { id: true },
+      })
+      if (pendingPhone) {
+        return c.json(
+          { success: false, error: 'Phone number already registered' },
+          409,
+        )
+      }
+      // 0.6.54 — a user's phone may match an AGENCY phone only when they are
+      // (or are about to become) that agency's owner/staff. A registrant
+      // carrying an agencyCode is allowed against THAT agency (they become
+      // its owner the moment the account is created).
+      const phoneRule = await assertUserPhoneNotAgencyConflicting(null, phoneNumber, {
+        allowOwnerOfAgencyCodes: agencyCode ? [agencyCode] : [],
+      })
+      if (!phoneRule.ok) {
+        return c.json(
+          { success: false, error: 'This phone number is already used by an agency account' },
           409,
         )
       }
@@ -589,152 +664,252 @@ app.post('/register', async (c) => {
     // Task 31-A: SUPER_ADMIN accounts are created pre-verified — they skip
     // the email/phone OTP flow entirely (see the early return below).
     const isSuperAdmin = role === 'SUPER_ADMIN'
+    // 0.6.54 — platform verification mode 'none' mandates NO OTP: the account
+    // is created immediately. (Previously this mode returned
+    // requiresVerification with zero codes issued — an unsignable dead end.)
+    const verificationMode = await getVerificationMode()
+    const immediateCreation = isSuperAdmin || verificationMode === 'none'
 
-    // Create user (Task 22: unverified — both channels must pass OTP before
-    // a session is issued; SUPER_ADMIN is the pre-verified exception)
-    const user = await db.user.create({
-      data: {
-        username,
-        fullName,
-        passwordHash,
-        email: normalizedEmail,
-        phoneNumber,
-        role: role || 'CUSTOMER',
-        avatarUrl: avatarUrl || undefined,
-        emailVerified: isSuperAdmin,
-        phoneVerified: isSuperAdmin,
-        // Task 5 — optional Algeria address (absent → NULL columns).
-        wilaya: registerWilaya,
-        commune: registerCommune,
-      },
-      select: {
-        id: true,
-        username: true,
-        fullName: true,
-        role: true,
-        language: true,
-        avatarUrl: true,
-        freeSmsCount: true,
-        isActive: true,
-        email: true,
-        phoneNumber: true,
-        // Task 5 — included so the desktop register proxy can mirror the
-        // address onto the local operational User row.
-        wilaya: true,
-        commune: true,
-        createdAt: true,
-      },
-    })
-
-    // If agency code provided and role is AGENCY_OWNER, link to agency
-    let agencyId: string | undefined
-    let agencyName: string | undefined
-    let agencyNameAr: string | undefined
-    let agencyNameFr: string | undefined
-    if (agencyCode && role === 'AGENCY_OWNER') {
-      const agency = await db.agency.findUnique({
-        where: { customCode: agencyCode.toUpperCase() },
-      })
-      if (agency) {
-        await db.agencyStaff.create({
-          data: {
-            userId: user.id,
-            agencyId: agency.id,
-            role: 'OWNER',
-          },
-        })
-        agencyId = agency.id
-        agencyName = agency.name
-        agencyNameAr = agency.nameAr ?? undefined
-        agencyNameFr = agency.nameFr ?? undefined
-      }
-    }
-
-    // UID-0.6.14 — the immutable UID is assigned ONCE, at account creation.
-    // SUPER_ADMIN never gets one; owners get their agency's wilaya as the
-    // fallback when their own profile wilaya is unset.
-    const assignedUid = isSuperAdmin
-      ? ''
-      : await assignUidToUser(user.id, role === 'AGENCY_OWNER' ? (agencyId ? (await db.agency.findUnique({ where: { id: agencyId }, select: { wilaya: true } }))?.wilaya ?? null : null) : null)
-
-    // ── Task 31-A: SUPER_ADMIN registers WITHOUT verification ──────────
-    // Platform admins must not wait for email/phone OTP: no issueAllPending
-    // and no createVerificationToken are called (zero OTP rows), and a full
-    // session is issued immediately — mirroring the verify-flow session
-    // issuance below. requiresVerification is intentionally NOT returned:
-    // the register UI would render an empty verification step.
-    if (isSuperAdmin) {
-      const sessionUser: SessionUser = {
-        id: user.id,
-        username: user.username,
-        fullName: user.fullName,
-        role: user.role,
-        language: user.language,
-        avatarUrl: user.avatarUrl,
-        agencyId: agencyId ?? null,
-      }
-      // Security-0.6.13 — an admin session can only be minted for the web
-      // console; the mobile/desktop apps never receive one.
-      const registerPlatform = resolveClientPlatform(c)
-      assertPlatformLoginAllowed(registerPlatform, sessionUser.role)
-      const token = await createSessionToken(sessionUser, SESSION_MAX_AGE, registerPlatform)
-      await setSessionCookie(c, sessionUser, registerPlatform)
-
-      await db.auditLog.create({
-        data: { userId: user.id, action: 'REGISTERED', entityType: 'USER', entityId: user.id },
-      })
-
-      return c.json(
-        {
-          success: true,
-          user: {
-            ...user,
-            agencyId,
-            agencyName,
-            agencyNameAr,
-            agencyNameFr,
-          },
-          token,
-          isNewUser: true,
+    // ── Immediate creation (SUPER_ADMIN, or platform mode 'none') ────────
+    // 0.6.54 — the account row is created ONLY inside this branch. The
+    // staged path below NEVER touches db.user: every mandated OTP channel
+    // must verify first (that is the whole point of the staged flow).
+    if (immediateCreation) {
+      const user = await db.user.create({
+        data: {
+          username: normalizedUsername,
+          fullName,
+          passwordHash,
+          email: normalizedEmail,
+          phoneNumber,
+          role: role || 'CUSTOMER',
+          avatarUrl: avatarUrl || undefined,
+          emailVerified: true,
+          phoneVerified: true,
+          // Task 5 — optional Algeria address (absent → NULL columns).
+          wilaya: registerWilaya,
+          commune: registerCommune,
         },
-        201,
-      )
+        select: {
+          id: true,
+          username: true,
+          fullName: true,
+          role: true,
+          language: true,
+          avatarUrl: true,
+          freeSmsCount: true,
+          isActive: true,
+          email: true,
+          phoneNumber: true,
+          // Task 5 — included so the desktop register proxy can mirror the
+          // address onto the local operational User row.
+          wilaya: true,
+          commune: true,
+          createdAt: true,
+        },
+      })
+
+      // If agency code provided and role is AGENCY_OWNER, link to agency
+      let agencyId: string | undefined
+      let agencyName: string | undefined
+      let agencyNameAr: string | undefined
+      let agencyNameFr: string | undefined
+      if (agencyCode && role === 'AGENCY_OWNER') {
+        const agency = await db.agency.findUnique({
+          where: { customCode: agencyCode.toUpperCase() },
+        })
+        if (agency) {
+          await db.agencyStaff.create({
+            data: {
+              userId: user.id,
+              agencyId: agency.id,
+              role: 'OWNER',
+            },
+          })
+          agencyId = agency.id
+          agencyName = agency.name
+          agencyNameAr = agency.nameAr ?? undefined
+          agencyNameFr = agency.nameFr ?? undefined
+        }
+      }
+
+      // UID-0.6.14 — the immutable UID is assigned ONCE, at account creation.
+      // SUPER_ADMIN never gets one; owners get their agency's wilaya as the
+      // fallback when their own profile wilaya is unset.
+      const assignedUid = isSuperAdmin
+        ? ''
+        : await assignUidToUser(user.id, role === 'AGENCY_OWNER' ? (agencyId ? (await db.agency.findUnique({ where: { id: agencyId }, select: { wilaya: true } }))?.wilaya ?? null : null) : null)
+
+      // ── Task 31-A: SUPER_ADMIN registers WITHOUT verification ──────────
+      // Platform admins must not wait for email/phone OTP: no issueAllPending
+      // and no createVerificationToken are called (zero OTP rows), and a full
+      // session is issued immediately — mirroring the verify-flow session
+      // issuance below. requiresVerification is intentionally NOT returned:
+      // the register UI would render an empty verification step.
+      // 0.6.54 — the SAME immediate path serves platform mode 'none'.
+      {
+        const sessionUser: SessionUser = {
+          id: user.id,
+          username: user.username,
+          fullName: user.fullName,
+          role: user.role,
+          language: user.language,
+          avatarUrl: user.avatarUrl,
+          agencyId: agencyId ?? null,
+        }
+        // Security-0.6.13 — an admin session can only be minted for the web
+        // console; the mobile/desktop apps never receive one.
+        const registerPlatform = resolveClientPlatform(c)
+        assertPlatformLoginAllowed(registerPlatform, sessionUser.role)
+        const token = await createSessionToken(sessionUser, SESSION_MAX_AGE, registerPlatform)
+        await setSessionCookie(c, sessionUser, registerPlatform)
+
+        await db.auditLog.create({
+          data: { userId: user.id, action: 'REGISTERED', entityType: 'USER', entityId: user.id },
+        })
+
+        return c.json(
+          {
+            success: true,
+            user: {
+              ...user,
+              uid: assignedUid || undefined,
+              agencyId,
+              agencyName,
+              agencyNameAr,
+              agencyNameFr,
+            },
+            token,
+            isNewUser: true,
+          },
+          201,
+        )
+      }
     }
 
-    // ── Task 22: verification instead of an immediate session ─────────
-    // Both email and phone must be verified via OTP before the account is
-    // usable. The client receives a short-lived verificationToken and shows
-    // the OTP step; POST /auth/verify exchanges verified codes for a session.
-    const issued = await issueAllPending({
-      userId: user.id,
-      email: user.email,
-      phoneNumber: user.phoneNumber,
-      emailVerified: false,
-      phoneVerified: false,
-      language: user.language,
-      ip,
-    })
-    const verificationToken = await createVerificationToken(user.id)
+    // ── 0.6.54: STAGED registration — NO User row exists yet ────────────
+    // The signup payload lands in PendingRegistration and the OTPs are issued
+    // against it. POST /auth/verify creates the real account ONLY once every
+    // mandated channel confirms — going back to fix a typo never creates an
+    // orphan account and never locks an identifier.
+    const requires = pendingModeRequires(verificationMode, true, Boolean(phoneNumber))
+
+    const PENDING_SELECT = {
+      id: true, username: true, fullName: true, email: true, phoneNumber: true,
+      role: true, agencyCode: true, avatarUrl: true, wilaya: true, commune: true,
+      language: true, emailVerified: true, phoneVerified: true, createdAt: true,
+    } as const
+
+    let pendingRow = ownPendingId
+      ? await db.pendingRegistration.findUnique({ where: { id: ownPendingId }, select: PENDING_SELECT })
+      : null
+    let emailChanged = false
+    let phoneChanged = false
+    if (pendingRow) {
+      // Same signup, edited details → update the staged row in place.
+      emailChanged = pendingRow.email !== normalizedEmail
+      phoneChanged = (pendingRow.phoneNumber ?? null) !== (phoneNumber ?? null)
+      pendingRow = await db.pendingRegistration.update({
+        where: { id: pendingRow.id },
+        data: {
+          username: normalizedUsername,
+          fullName,
+          passwordHash,
+          email: normalizedEmail,
+          phoneNumber: phoneNumber || null,
+          role: role || 'CUSTOMER',
+          agencyCode,
+          avatarUrl: avatarUrl || undefined,
+          wilaya: registerWilaya,
+          commune: registerCommune,
+          requestIp: ip,
+          // Editing a contact resets THAT channel's verification progress —
+          // a new address must be re-proven by a new code.
+          ...(emailChanged ? { emailVerified: false } : {}),
+          ...(phoneChanged ? { phoneVerified: false } : {}),
+        },
+        select: PENDING_SELECT,
+      })
+    } else {
+      pendingRow = await db.pendingRegistration.create({
+        data: {
+          username: normalizedUsername,
+          fullName,
+          passwordHash,
+          email: normalizedEmail,
+          phoneNumber: phoneNumber || null,
+          role: role || 'CUSTOMER',
+          agencyCode,
+          avatarUrl: avatarUrl || undefined,
+          wilaya: registerWilaya,
+          commune: registerCommune,
+          requestIp: ip,
+        },
+        select: PENDING_SELECT,
+      })
+    }
+
+    // Issue OTPs ONLY for still-unverified mandated channels: an unchanged
+    // re-submit keeps the codes already in flight (no cooldown penalty for
+    // toggling back and forth); an EDITED contact gets fresh codes
+    // immediately (targetChanged skips the resend cooldown).
+    const issued: { email?: IssueResult; phone?: IssueResult } = {}
+    if (requires.email && !pendingRow.emailVerified) {
+      issued.email = await issuePendingRegistrationOtp({
+        pendingId: pendingRow.id,
+        purpose: 'EMAIL_VERIFY',
+        target: pendingRow.email,
+        fullName: pendingRow.fullName,
+        language: pendingRow.language || 'ar',
+        ip,
+        targetChanged: emailChanged,
+      })
+    }
+    if (requires.phone && pendingRow.phoneNumber && !pendingRow.phoneVerified) {
+      issued.phone = await issuePendingRegistrationOtp({
+        pendingId: pendingRow.id,
+        purpose: 'PHONE_VERIFY',
+        target: pendingRow.phoneNumber,
+        fullName: pendingRow.fullName,
+        language: pendingRow.language || 'ar',
+        ip,
+        targetChanged: phoneChanged,
+      })
+    }
+    const verificationToken = await createPendingRegistrationToken(pendingRow.id)
 
     return c.json(
       {
         success: true,
         requiresVerification: true,
+        // 0.6.54 marker — the payload is STAGED, not a created account.
+        // Desktop proxies use it to skip the local profile upsert.
+        stagedRegistration: true,
         verificationToken,
+        // Staged-payload mirror for legacy consumers (desktop logging/UI).
+        // NOT a real account — it disappears if the signup is abandoned.
         user: {
-          ...user,
-          agencyId,
-          agencyName,
-          agencyNameAr,
-          agencyNameFr,
+          id: pendingRow.id,
+          username: pendingRow.username,
+          fullName: pendingRow.fullName,
+          role: pendingRow.role,
+          language: pendingRow.language,
+          avatarUrl: pendingRow.avatarUrl,
+          freeSmsCount: 10,
+          isActive: true,
+          email: pendingRow.email,
+          phoneNumber: pendingRow.phoneNumber,
+          wilaya: pendingRow.wilaya,
+          commune: pendingRow.commune,
+          createdAt: pendingRow.createdAt,
         },
         pending: {
-          email: true,
-          phone: Boolean(user.phoneNumber),
+          email: requires.email,
+          phone: requires.phone,
         },
         targets: {
-          email: user.email ? maskTarget(user.email) : null,
-          phone: user.phoneNumber ? maskTarget(user.phoneNumber) : null,
+          email: maskTarget(pendingRow.email),
+          phone: pendingRow.phoneNumber ? maskTarget(pendingRow.phoneNumber) : null,
         },
         dev: {
           email: issued.email?.devBypass ? { devCode: issued.email.devCode, error: issued.email.error } : null,
@@ -793,6 +968,183 @@ app.post('/verify', async (c) => {
     if (!verificationToken) {
       return c.json({ success: false, error: 'verificationToken is required' }, 400)
     }
+
+    // ── 0.6.54: pending-registration branch ──────────────────────────────
+    // The token may belong to a STAGED signup (PendingRegistration — no User
+    // row yet). Codes are checked against the staged row; the USER ACCOUNT is
+    // created HERE, only once every mandated channel has verified.
+    const pendingId = await verifyPendingRegistrationToken(verificationToken)
+    if (pendingId) {
+      const pending = await db.pendingRegistration.findUnique({ where: { id: pendingId } })
+      if (!pending) {
+        return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
+      }
+      if (!emailCode && !phoneCode) {
+        return c.json({ success: false, error: 'Provide at least one code' }, 400)
+      }
+
+      const results: Record<string, unknown> = {}
+
+      if (emailCode) {
+        const r = await verifyPendingRegistrationOtp({ pendingId: pending.id, purpose: 'EMAIL_VERIFY' as VerificationPurpose, code: emailCode })
+        results.email = r
+        if (!r.success) {
+          return c.json({ success: false, channel: 'email', error: r.error, remainingAttempts: r.remainingAttempts, results }, 400)
+        }
+      }
+      if (phoneCode) {
+        const r = await verifyPendingRegistrationOtp({ pendingId: pending.id, purpose: 'PHONE_VERIFY' as VerificationPurpose, code: phoneCode })
+        results.phone = r
+        if (!r.success) {
+          return c.json({ success: false, channel: 'phone', error: r.error, remainingAttempts: r.remainingAttempts, results }, 400)
+        }
+      }
+
+      const refreshed = await db.pendingRegistration.findUnique({ where: { id: pending.id } })
+      if (!refreshed) {
+        return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
+      }
+
+      const pendingMode = await getVerificationMode()
+      const pendingRequires = pendingModeRequires(pendingMode, Boolean(refreshed.email), Boolean(refreshed.phoneNumber))
+      const stillPending = (pendingRequires.email && !refreshed.emailVerified) || (pendingRequires.phone && !refreshed.phoneVerified)
+
+      if (stillPending) {
+        return c.json({
+          success: true,
+          verified: false,
+          status: { emailVerified: refreshed.emailVerified, phoneVerified: refreshed.phoneVerified },
+          message: 'Partial verification — the other channel is still pending',
+          results,
+        })
+      }
+
+      // ── ALL mandated channels verified → create the account NOW ────────
+      // Uniqueness re-check: another signup may have claimed an identifier
+      // while this one was in flight. On conflict the pending row SURVIVES so
+      // the user can go back, edit the colliding field, and re-verify —
+      // nothing was created yet, so nothing has to be cleaned up.
+      const conflicts: string[] = []
+      if (await db.user.findUnique({ where: { username: refreshed.username }, select: { id: true } })) {
+        conflicts.push('USERNAME_CONFLICT_ON_CREATE')
+      }
+      if (await db.user.findUnique({ where: { email: refreshed.email }, select: { id: true } })) {
+        conflicts.push('EMAIL_CONFLICT_ON_CREATE')
+      }
+      if (refreshed.phoneNumber) {
+        if (await db.user.findUnique({ where: { phoneNumber: refreshed.phoneNumber }, select: { id: true } })) {
+          conflicts.push('PHONE_CONFLICT_ON_CREATE')
+        }
+        const agencyRule = await assertUserPhoneNotAgencyConflicting(null, refreshed.phoneNumber, {
+          allowOwnerOfAgencyCodes: refreshed.agencyCode ? [refreshed.agencyCode] : [],
+        })
+        if (!agencyRule.ok) conflicts.push('PHONE_CONFLICT_ON_CREATE')
+      }
+      if (conflicts.length > 0) {
+        return c.json({ success: false, error: conflicts[0], conflicts, results }, 409)
+      }
+
+      // Agency link (AGENCY_OWNER + code) — resolves the owner's UID fallback.
+      let pendingAgencyId: string | null = null
+      let pendingAgencyWilaya: string | null = null
+      if (refreshed.agencyCode && refreshed.role === 'AGENCY_OWNER') {
+        const agency = await db.agency.findUnique({
+          where: { customCode: refreshed.agencyCode.toUpperCase() },
+          select: { id: true, wilaya: true },
+        })
+        if (agency) {
+          pendingAgencyId = agency.id
+          pendingAgencyWilaya = agency.wilaya
+        }
+      }
+
+      const user = await db.user.create({
+        data: {
+          username: refreshed.username,
+          fullName: refreshed.fullName,
+          passwordHash: refreshed.passwordHash,
+          email: refreshed.email,
+          phoneNumber: refreshed.phoneNumber,
+          role: refreshed.role,
+          avatarUrl: refreshed.avatarUrl || undefined,
+          emailVerified: refreshed.emailVerified,
+          phoneVerified: refreshed.phoneVerified,
+          wilaya: refreshed.wilaya ?? undefined,
+          commune: refreshed.commune ?? undefined,
+        },
+        select: {
+          id: true, username: true, fullName: true, role: true, language: true,
+          avatarUrl: true, freeSmsCount: true, isActive: true, email: true,
+          phoneNumber: true, wilaya: true, commune: true, createdAt: true,
+        },
+      })
+
+      if (pendingAgencyId) {
+        await db.agencyStaff.create({
+          data: { userId: user.id, agencyId: pendingAgencyId, role: 'OWNER' },
+        })
+      }
+
+      // UID-0.6.14 — assigned ONCE at creation (owners inherit the agency
+      // wilaya as the fallback segment).
+      const assignedUid = await assignUidToUser(user.id, refreshed.role === 'AGENCY_OWNER' ? pendingAgencyWilaya : null)
+
+      // ── Welcome email (fire-and-forget, never blocks the session) ──
+      // Sent once when the account becomes FULLY verified.
+      if (refreshed.email && refreshed.emailVerified) {
+        deliverTemplate({
+          key: 'welcome', channel: 'EMAIL', target: refreshed.email,
+          language: refreshed.language || 'en', vars: { fullName: refreshed.fullName },
+        }).catch(() => undefined)
+      }
+
+      await db.auditLog.create({
+        data: { userId: user.id, action: 'REGISTERED', entityType: 'USER', entityId: user.id },
+      }).catch(() => undefined)
+      await db.auditLog.create({
+        data: { userId: user.id, action: 'ACCOUNT_VERIFIED', entityType: 'USER', entityId: user.id },
+      }).catch(() => undefined)
+
+      // The staged payload is consumed — its OTP codes cascade with it.
+      await db.pendingRegistration.delete({ where: { id: refreshed.id } }).catch(() => undefined)
+
+      // Fully verified → issue the real session (cookie for web, token for native)
+      const sessionUser: SessionUser = {
+        id: user.id,
+        username: user.username,
+        fullName: user.fullName,
+        role: user.role,
+        language: user.language,
+        avatarUrl: user.avatarUrl,
+        agencyId: pendingAgencyId,
+      }
+      // Security-0.6.13 — platform policy applies at verification too: the
+      // freshly-verified session respects the role×platform matrix.
+      const verifyPlatform = resolveClientPlatform(c)
+      assertPlatformLoginAllowed(verifyPlatform, sessionUser.role)
+      const token = await createSessionToken(sessionUser, SESSION_MAX_AGE, verifyPlatform)
+      await setSessionCookie(c, sessionUser, verifyPlatform)
+
+      return c.json({
+        success: true,
+        verified: true,
+        status: { emailVerified: refreshed.emailVerified, phoneVerified: refreshed.phoneVerified },
+        user: {
+          ...sessionUser,
+          uid: assignedUid,
+          email: refreshed.email,
+          phoneNumber: refreshed.phoneNumber,
+          freeSmsCount: user.freeSmsCount,
+          isActive: user.isActive,
+          wilaya: user.wilaya,
+          commune: user.commune,
+          createdAt: user.createdAt,
+        },
+        token,
+        results,
+      })
+    }
+
     const userId = await verifyVerificationToken(verificationToken)
     if (!userId) {
       return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
@@ -937,6 +1289,49 @@ app.post('/resend-verification', async (c) => {
     if (!verificationToken || (channel !== 'email' && channel !== 'phone')) {
       return c.json({ success: false, error: 'verificationToken and channel (email|phone) are required' }, 400)
     }
+
+    // ── 0.6.54: pending-registration branch (staged signup, no User row) ──
+    const pendingId = await verifyPendingRegistrationToken(verificationToken)
+    if (pendingId) {
+      const pending = await db.pendingRegistration.findUnique({ where: { id: pendingId } })
+      if (!pending) {
+        return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
+      }
+      const result: IssueResult | { success: false; error: string; expiresInMinutes: number } =
+        channel === 'email'
+          ? pending.email && !pending.emailVerified
+            ? await issuePendingRegistrationOtp({
+                pendingId: pending.id,
+                purpose: 'EMAIL_VERIFY',
+                target: pending.email,
+                fullName: pending.fullName,
+                language: pending.language || 'ar',
+                ip,
+              })
+            : { success: false, error: 'ALREADY_VERIFIED', expiresInMinutes: 0 }
+          : pending.phoneNumber && !pending.phoneVerified
+            ? await issuePendingRegistrationOtp({
+                pendingId: pending.id,
+                purpose: 'PHONE_VERIFY',
+                target: pending.phoneNumber,
+                fullName: pending.fullName,
+                language: pending.language || 'ar',
+                ip,
+              })
+            : { success: false, error: 'ALREADY_VERIFIED', expiresInMinutes: 0 }
+
+      return c.json({
+        success: result.success,
+        error: result.error,
+        channel,
+        target: 'target' in result && result.target ? maskTarget(result.target) : undefined,
+        devBypass: 'devBypass' in result ? result.devBypass : undefined,
+        devCode: 'devCode' in result ? result.devCode : undefined,
+        retryAfterSeconds: 'retryAfterSeconds' in result ? result.retryAfterSeconds : undefined,
+        expiresInMinutes: result.expiresInMinutes,
+      })
+    }
+
     const userId = await verifyVerificationToken(verificationToken)
     if (!userId) {
       return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
@@ -1004,6 +1399,30 @@ app.post('/verification-status', async (c) => {
     if (!verificationToken) {
       return c.json({ success: false, error: 'verificationToken is required' }, 400)
     }
+
+    // ── 0.6.54: staged signups resume through the same endpoint ──
+    const pendingId = await verifyPendingRegistrationToken(verificationToken)
+    if (pendingId) {
+      const pending = await db.pendingRegistration.findUnique({ where: { id: pendingId } })
+      if (!pending) {
+        return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
+      }
+      const pendingMode = await getVerificationMode()
+      const pendingRequires = pendingModeRequires(pendingMode, Boolean(pending.email), Boolean(pending.phoneNumber))
+      return c.json({
+        success: true,
+        stagedRegistration: true,
+        pending: {
+          email: pendingRequires.email && !pending.emailVerified,
+          phone: pendingRequires.phone && !pending.phoneVerified,
+        },
+        targets: {
+          email: pending.email ? maskTarget(pending.email) : null,
+          phone: pending.phoneNumber ? maskTarget(pending.phoneNumber) : null,
+        },
+      })
+    }
+
     const userId = await verifyVerificationToken(verificationToken)
     if (!userId) {
       return c.json({ success: false, error: 'VERIFICATION_TOKEN_INVALID' }, 401)
@@ -1551,7 +1970,16 @@ app.get('/check-username', async (c) => {
       select: { id: true },
     })
 
-    return c.json({ available: !existingUser })
+    // 0.6.54 — in-flight signups hold usernames too. The registrant's OWN
+    // pending row (identified by the optional pendingToken) never blocks
+    // their own re-checks while they edit the rest of the form.
+    const ownPendingId = await verifyPendingRegistrationToken(c.req.query('pendingToken') || '')
+    const pendingUser = await db.pendingRegistration.findFirst({
+      where: { username, ...(ownPendingId ? { id: { not: ownPendingId } } : {}) },
+      select: { id: true },
+    })
+
+    return c.json({ available: !existingUser && !pendingUser })
   } catch (error: unknown) {
     if (error instanceof Error && error.message === 'INVALID_IP') {
       return c.json({ success: false, error: 'Unable to identify client' }, 400)

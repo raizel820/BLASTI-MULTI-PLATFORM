@@ -327,6 +327,21 @@ export const REGISTRATION_RATE_LIMIT: RateLimitOptions = {
   prefix: 'register',
 }
 
+/**
+ * 0.6.55 — log vault ingest: 120 requests per minute per IP.
+ * DEDICATED, stricter tier than the general 300/min: anonymous crash uploads
+ * (no account, no device token) are accepted on this route, so the bucket
+ * must absorb a burst of urgent flushes from every device behind a venue's
+ * shared egress IP (30 s interval + error-driven flushes ≈ 2-6 req/min per
+ * device) while still choking a runaway/forged uploader long before it can
+ * fill the disk vault.
+ */
+export const LOGS_INGEST_RATE_LIMIT: RateLimitOptions = {
+  windowMs: 60 * 1000,
+  maxRequests: 120,
+  prefix: 'logs-ingest',
+}
+
 /** Password reset: 3 per hour per IP */
 export const PASSWORD_RESET_RATE_LIMIT: RateLimitOptions = {
   windowMs: 60 * 60 * 1000,
