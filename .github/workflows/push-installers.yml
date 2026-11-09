@@ -364,6 +364,14 @@ jobs:
             echo "no delta refs artifact — desktop updates fall back to full installers"
           fi
 
+          # 0.6.56 — DELTA REFS ARE MANDATORY for desktop: a re-push without
+          # them would overwrite the stored version and leave clients with
+          # full-installers-only (no-deltas-published incident on 0.6.55).
+          if ls installer/desktop/*.exe >/dev/null 2>&1 && [ -z "$REF_ARGS" ]; then
+            echo "::error::a desktop exe is present but the source run's release-refs artifact is missing — refusing to push (clients would never receive delta updates). Re-run the build with 'Build release refs for delta updates' enabled."
+            exit 1
+          fi
+
           desktop_ver="$(node -p "require('./apps/desktop/package.json').version")"
           mobile_ver="$(sed -n 's/.*versionName[^"]*"\([^"]*\)".*/\1/p' apps/mobile/android/app/build.gradle | head -1)"
           count=0

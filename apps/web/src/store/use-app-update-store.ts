@@ -71,6 +71,13 @@ export interface AppUpdateInfo {
    */
   delta?: DeltaManifest | null;
   /**
+   * 0.6.56 — when delta is null the server's own refusal word
+   * (no-deltas-published / no-verifiable-chain / runtime-key-changed…) is
+   * carried here and echoed into the [update:decision] log so "only full
+   * installers" is diagnosable from ONE renderer line.
+   */
+  deltaUnavailableReason?: string;
+  /**
    * API COMPATIBILITY MAP (0.6.31) — can this app run against the current
    * server, which functions need a newer app, and is the newest release
    * server-only (apps keep running). Absent on older servers.
@@ -575,6 +582,7 @@ function createAppUpdateStore() {
               fileSize: res.fileSize ?? 0,
               fileHash: res.fileHash,
               delta: res.delta && res.delta.supported && Array.isArray(res.delta.hops) && res.delta.hops.length > 0 ? res.delta : null,
+              deltaUnavailableReason: res.deltaUnavailableReason || undefined,
               compat: res.compat ?? null,
             };
             // COMPATIBILITY MAP (0.6.31): a CRITICAL gate (or an API-level
@@ -605,6 +613,7 @@ function createAppUpdateStore() {
               fileSize: res.fileSize ?? 0,
               fileHash: res.fileHash,
               delta: res.delta && res.delta.supported && Array.isArray(res.delta.hops) && res.delta.hops.length > 0 ? res.delta : null,
+              deltaUnavailableReason: res.deltaUnavailableReason || undefined,
               compat: res.compat ?? null,
             };
             // COMPATIBILITY MAP (0.6.31): critical gates escalate to mandatory.
@@ -663,7 +672,14 @@ function createAppUpdateStore() {
         to: info.version,
         deltaBytes: info.delta ? info.delta.totalSize : 0,
         installerBytes: info.fileSize,
-        reason: useDelta ? 'delta-offered' : (!info.delta ? 'no-delta-offered-by-server' : (!electronAPI()?.installDeltaUpdate ? 'delta-bridge-missing' : 'no-hops')),
+        // 0.6.56 — surface the server's own refusal word in the decision log
+        // (pairs with [update:check].serverReason) so "only full installers"
+        // is diagnosable from ONE renderer line.
+        reason: useDelta
+          ? 'delta-offered'
+          : (!info.delta
+            ? `no-delta-offered-by-server${info.deltaUnavailableReason ? `:${info.deltaUnavailableReason}` : ''}`
+            : (!electronAPI()?.installDeltaUpdate ? 'delta-bridge-missing' : 'no-hops')),
       });
       set({ status: 'downloading', error: null, needsInstallPermission: false, manualInstallAvailable: false, progress: { percent: 0, receivedBytes: 0, totalBytes: info.fileSize } });
       try {

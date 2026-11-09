@@ -156,6 +156,11 @@ try {
     // When the CI job also produced release refs (make-release-refs.mjs), push
     // them so the cloud can build the differential patch vs the previous
     // release: --asar + --outref + --runtime-key + --native-fingerprint.
+    // 0.6.56 — FIELD ROOT CAUSE of "every update is a full installer": a
+    // failed refs upload used to be a WARN and the run stayed green, so
+    // versions shipped WITHOUT delta refs for months (no-deltas-published on
+    // 0.6.53→0.6.55). Refs are now MANDATORY when the artifact exists — a
+    // failure fails the publish and the operator sees it same-day.
     if (args.asar || args.outref) {
       try {
         const refForm = new FormData();
@@ -179,12 +184,31 @@ try {
         let refBody = {};
         try { refBody = JSON.parse(refText); } catch { /* non-JSON */ }
         if (refRes.ok && refBody.success) {
-          console.log(`[publish] delta refs attached → ${JSON.stringify(refBody.deltaGeneration ?? {})}`);
+          const gen = Array.isArray(refBody.deltaGeneration) ? refBody.deltaGeneration : [];
+          if (gen.length > 0) {
+            for (const g of gen) {
+              if (g.ok) {
+                console.log(`[publish] delta v${g.from} → v${g.to} generated (${((g.size || 0) / 1048576).toFixed(2)} MB)`);
+              } else if (g.reason === 'runtime-key-changed' || g.reason === 'native-bits-changed') {
+                console.log(`[publish] delta v${g.from} → v${g.to} skipped BY DESIGN (${g.reason}) — full installer is the correct path for that hop`);
+              } else {
+                console.warn(`[publish] WARN: delta v${g.from} → v${g.to} refused (${g.reason}) — run scripts/regenerate-deltas.mjs after fixing the base version's refs`);
+              }
+            }
+          } else {
+            console.log(`[publish] delta refs attached (generation result: ${JSON.stringify(refBody.deltaGeneration ?? {})})`);
+          }
         } else {
-          console.warn(`[publish] WARN: delta refs upload failed (HTTP ${refRes.status}) — full-installers still fine`);
+          // 0.6.56 — FATAL: shipping without refs silently downgrades every
+          // client to full installers until someone notices the storage
+          // manifest months later. Fail now with the exact remediation.
+          fail(`delta refs upload failed (HTTP ${refRes.status}) — refusing to publish without delta refs. ` +
+            `Fix and re-run: check the token, the API storage volume and ${args.asar ? 'asar path ' + args.asar : ''}${args.outref ? ' outref path ' + args.outref : ''}. ` +
+            `Raw response: ${refText.slice(0, 300)}`);
         }
       } catch (err) {
-        console.warn(`[publish] WARN: delta refs upload error: ${err?.message ?? err}`);
+        if (err && /delta refs upload failed/.test(String(err?.message ?? err))) throw err;
+        fail(`delta refs upload error: ${err?.message ?? err}`);
       }
     }
 

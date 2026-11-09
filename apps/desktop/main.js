@@ -885,6 +885,22 @@ const UPDATE_WAITER_ARGS = (() => {
  */
 function runUpdateWaiterMode(w) {
   const cp = require('child_process');
+  // UPDATE-0.6.56 — FIRST BREATH: prove the mirrored runtime actually booted.
+  // Written before anything else; the launcher polls this file (matching pid +
+  // fresh timestamp) instead of trusting a 900ms pid probe, which both an AV
+  // kill and a missing-runtime crash defeated silently.
+  try {
+    const hbDir = w.logFile ? path.dirname(w.logFile) : app.getPath('userData');
+    if (hbDir) {
+      fs.mkdirSync(hbDir, { recursive: true });
+      fs.writeFileSync(path.join(hbDir, 'waiter-heartbeat.json'), JSON.stringify({
+        pid: process.pid,
+        installer: w.installer,
+        startedAt: Date.now(),
+        version: app.getVersion(),
+      }));
+    }
+  } catch { /* launcher falls back to pid probing */ }
   const appendLog = (msg) => {
     console.log(`[BLASTI update-waiter] ${msg}`);
     if (!w.logFile) return;
@@ -2060,6 +2076,41 @@ const UPDATES_DIR = () => path.join(app.getPath('userData'), 'updates');
 let activeUpdateDownload = null; // { version, url, dest } while running
 let lastDownloadedInstaller = null; // absolute path of the last completed download
 
+// UPDATE-0.6.56 — remove the Mark-of-the-Web zone alternate data stream some
+// network stacks attach to downloaded executables. SmartScreen evaluates this
+// stream on ShellExecute and can delay/deny a fresh unsigned installer for
+// tens of seconds ("Failed to open path" after ~20s). fs addresses NTFS ADS
+// directly, so the stream is removable without any external tool.
+function stripZoneIdentifier(file) {
+  if (process.platform !== 'win32') return false;
+  try { fs.unlinkSync(`${file}:Zone.Identifier`); return true; } catch { return false; }
+}
+
+// UPDATE-0.6.56 — unlink that survives AV scan locks: two immediate attempts,
+// then a rename aside (a rename only needs DELETE access) so a partial or
+// corrupt download can never linger as a runnable-looking BLASTI-Setup-*.exe
+// that boot-time self-heal would run again (and fail) forever.
+function safeUnlinkSync(file) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { fs.unlinkSync(file); return true; } catch (err) {
+      if (!err || err.code === 'ENOENT') return true;
+    }
+  }
+  try { fs.renameSync(file, `${file}.stale-${Date.now()}`); return true; } catch { return false; }
+}
+
+// UPDATE-0.6.56 — shared streaming sha256 (download verify + self-heal gate).
+async function sha256File(filePath) {
+  const crypto = require('crypto');
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    const s = fs.createReadStream(filePath);
+    s.on('data', (chunk) => h.update(chunk));
+    s.on('error', reject);
+    s.on('end', () => resolve(h.digest('hex')));
+  });
+}
+
 function sendUpdateProgress(payload) {
   for (const win of BrowserWindow.getAllWindows()) {
     try { if (!win.isDestroyed()) win.webContents.send('update:progress', payload); } catch { /* window gone */ }
@@ -2118,6 +2169,10 @@ ipcMain.handle('updates:check', async (_e, payload) => {
         deltaBytes: d ? d.totalSize : 0,
         deltaChain: d ? d.hops.map((h) => `${h.fromVersion}→${h.toVersion}@${h.size}B`).join(' + ') : undefined,
         deltaRuntimeKey: d ? d.runtimeKey : undefined,
+        // 0.6.56 — the server's own refusal word (no-deltas-published /
+        // no-verifiable-chain / …) logged verbatim so field logs answer WHY
+        // without a round trip to the server.
+        serverReason: d ? undefined : String(data.deltaUnavailableReason || 'none'),
         serverSaysCompatible: data.compat ? data.compat.compatible : 'unknown',
         tookMs: Date.now() - checkStartedAt,
       });
@@ -2193,14 +2248,30 @@ ipcMain.handle('updates:download', async (_e, payload) => {
       if (!verify.ok) {
         updateLog('VERIFY', 'downloaded installer FAILED the integrity check — deleted', { version, error: verify.error, expectedBytes: Number(fileSize || 0) });
         console.warn('[BLASTI Desktop] update download FAILED INTEGRITY CHECK:', verify.error);
-        try { fs.unlinkSync(dest); } catch { /* already gone */ }
+        // 0.6.56 — AV-scan-lock-proof delete (retry + rename aside) and drop
+        // any pending-install manifest pointing at the discarded file.
+        safeUnlinkSync(dest);
+        try { fs.unlinkSync(path.join(UPDATES_DIR(), 'pending-install.json')); } catch { /* absent */ }
         lastDownloadedInstaller = null;
         requestRendererLogFlush();
         pushUpdateFailureToCloud('VERIFY', 'downloaded installer FAILED the integrity check — deleted', { version, error: verify.error });
         sendUpdateProgress({ status: 'error', error: verify.error, version: activeUpdateDownload.version });
         return;
       }
-      updateLog('VERIFY', 'downloaded installer integrity OK', { version, bytes: received, sha256: verify.sha256.slice(0, 12) });
+      updateLog('VERIFY', 'downloaded installer integrity OK', { version, bytes: received, sha256: verify.sha256.slice(0, 12), motwRemoved: stripZoneIdentifier(dest) });
+      // UPDATE-0.6.56 — pin the verified bytes so boot-time self-heal only
+      // ever launches a file whose sha256 PROVABLY matches what we verified
+      // here (a partial download from an earlier failed attempt used to be
+      // runnable by self-heal: size>0 and 60s old was its entire test).
+      try {
+        fs.writeFileSync(path.join(UPDATES_DIR(), 'pending-install.json'), JSON.stringify({
+          version: version || '',
+          fileName: path.basename(dest),
+          sha256: verify.sha256,
+          size: received,
+          verifiedAt: Date.now(),
+        }));
+      } catch { /* manifest is an optimization — self-heal falls back to legacy rules */ }
       sendUpdateProgress({ status: 'downloaded', percent: 100, receivedBytes: received, totalBytes: received, filePath: dest, version: activeUpdateDownload.version });
       for (const win of BrowserWindow.getAllWindows()) {
         try { if (!win.isDestroyed()) win.webContents.send('update:downloaded', { filePath: dest, version: activeUpdateDownload.version }); } catch { /* window gone */ }
@@ -2211,7 +2282,8 @@ ipcMain.handle('updates:download', async (_e, payload) => {
       pushUpdateFailureToCloud('DOWNLOAD', 'installer download failed', { version, error: (err && err.message) || String(err) });
       console.warn('[BLASTI Desktop] update download failed:', err && err.message);
       sendUpdateProgress({ status: 'error', error: (err && err.message) || 'download-failed', version: activeUpdateDownload ? activeUpdateDownload.version : '' });
-      try { fs.unlinkSync(dest); } catch { /* nothing to clean */ }
+      safeUnlinkSync(dest);
+      try { fs.unlinkSync(path.join(UPDATES_DIR(), 'pending-install.json')); } catch { /* absent */ }
     } finally {
       activeUpdateDownload = null;
     }
@@ -2227,14 +2299,7 @@ async function verifyDownloadedInstaller(filePath, expectedHash, expectedSize) {
     if (expectedSize && stat.size !== expectedSize) {
       return { ok: false, error: `size-mismatch (${stat.size} != ${expectedSize})` };
     }
-    const crypto = require('crypto');
-    const sha256 = await new Promise((resolve, reject) => {
-      const h = crypto.createHash('sha256');
-      const s = fs.createReadStream(filePath);
-      s.on('data', (chunk) => h.update(chunk));
-      s.on('error', reject);
-      s.on('end', () => resolve(h.digest('hex')));
-    });
+    const sha256 = await sha256File(filePath);
     if (expectedHash && expectedHash.length >= 16 && sha256 !== expectedHash) {
       return { ok: false, error: `hash-mismatch (got ${sha256.slice(0, 12)}…, want ${String(expectedHash).slice(0, 12)}…)`, sha256 };
     }
@@ -2329,7 +2394,12 @@ async function downloadParallelRanges(url, dest, total, emit) {
       headers: { Range: `bytes=${part.start}-${part.end}` },
       redirect: 'follow',
     });
-    if (res.status !== 206) throw new Error(`range-http-${res.status}`);
+    if (res.status !== 206) {
+      // 0.6.56 — cancel the undrained body so the socket is released before
+      // the retry path opens new ranges.
+      try { await res.body?.cancel(); } catch { /* already gone */ }
+      throw new Error(`range-http-${res.status}`);
+    }
     const nodeStream = require('stream').Readable.fromWeb(res.body);
     await new Promise((resolveP, rejectP) => {
       const fd = fs.openSync(dest, 'r+');
@@ -2345,7 +2415,7 @@ async function downloadParallelRanges(url, dest, total, emit) {
           emit(Math.min(receivedRef.value, total), total);
         }
       });
-      nodeStream.on('error', (e) => { try { fs.closeSync(fd); } catch { /* closed */ } rejectP(e); });
+      nodeStream.on('error', (e) => { try { nodeStream.destroy(); } catch { /* gone */ } try { fs.closeSync(fd); } catch { /* closed */ } rejectP(e); });
       nodeStream.on('end', () => { try { fs.closeSync(fd); } catch { /* closed */ } resolveP(); });
     });
     if (part.start + part.received !== part.end + 1) throw new Error('range-short-read');
@@ -2371,14 +2441,25 @@ async function downloadSingleStream(url, dest, emit) {
   const fileStream = fs.createWriteStream(dest, resumed ? { flags: 'r+', start: have } : { flags: 'w' });
   const nodeStream = require('stream').Readable.fromWeb(res.body);
   await new Promise((resolveP, rejectP) => {
+    // 0.6.56 — FIELD ROOT CAUSE of installer files left LOCKED on Windows
+    // ("this file is being used by another app" on the manual install): on a
+    // network/pipe error the write stream was never destroyed — its open fd
+    // kept the partial file locked, fs.unlinkSync failed silently and the
+    // stale BLASTI-Setup-*.exe lingered for self-heal to trip over. Every
+    // failure path now tears BOTH streams down before rejecting.
+    const fail = (err) => {
+      try { nodeStream.destroy(); } catch { /* gone */ }
+      try { fileStream.destroy(); } catch { /* gone */ }
+      rejectP(err);
+    };
     nodeStream.on('data', (chunk) => {
       received += chunk.length;
       fileStream.write(chunk);
       emit(received, total);
     });
-    nodeStream.on('error', rejectP);
-    fileStream.on('error', rejectP);
-    nodeStream.on('end', () => fileStream.end(resolveP));
+    nodeStream.on('error', fail);
+    fileStream.on('error', fail);
+    nodeStream.on('end', () => { try { fileStream.end(() => resolveP()); } catch { resolveP(); } });
   });
   return received;
 }
@@ -2412,7 +2493,8 @@ async function installDownloadedUpdate() {
   if (!stat.isFile() || stat.size === 0) {
     console.warn('[BLASTI Desktop] updates:install → downloaded file is empty/corrupt, refusing to quit:', installer);
     updateLog('INSTALL', 'refused — downloaded file is empty/corrupt, deleted', { installer, bytes: stat.size });
-    try { fs.unlinkSync(installer); } catch { /* keep */ }
+    safeUnlinkSync(installer);
+    try { fs.unlinkSync(path.join(UPDATES_DIR(), 'pending-install.json')); } catch { /* absent */ }
     lastDownloadedInstaller = null;
     return { ok: false, error: 'corrupt-download' };
   }
@@ -2426,13 +2508,38 @@ async function installDownloadedUpdate() {
     mtimeAgeSec: Math.round((Date.now() - stat.mtimeMs) / 1000),
   });
 
-  const procAlive = (pid) => new Promise((resolve) => {
+  const procAlive = (pid, confirmAfterMs = 900) => new Promise((resolve) => {
     try {
       process.kill(pid, 0); // signal 0 = existence probe
       setTimeout(() => {
         try { process.kill(pid, 0); resolve(true); } catch { resolve(false); }
-      }, 900);
+      }, confirmAfterMs);
     } catch { resolve(false); }
+  });
+
+  // UPDATE-0.6.56 — prove the waiter BOOOTED, not merely that the pid exists.
+  // A pid alive at 900ms says nothing: Chromium needs ICU data, V8 snapshots,
+  // pak bundles and DLLs beside the exe (pre-0.6.56 the lone exe+asar copy
+  // CHECK-failed and died instantly), and AV suites can suspend/kill the
+  // fresh copy inside that window. runUpdateWaiterMode now writes
+  // waiter-heartbeat.json the moment the copied runtime comes up; poll it for
+  // up to 6s and fall back to pid aliveness only as a last resort.
+  const waiterAlive = (pid) => new Promise((resolve) => {
+    const hbPath = path.join(UPDATES_DIR(), 'waiter-heartbeat.json');
+    const startedAt = Date.now();
+    try { fs.rmSync(hbPath, { force: true }); } catch { /* absent */ }
+    const poll = () => {
+      try {
+        const hb = JSON.parse(fs.readFileSync(hbPath, 'utf8'));
+        if (hb && hb.pid === pid && hb.startedAt >= startedAt - 1500) { resolve(true); return; }
+      } catch { /* heartbeat not written yet */ }
+      if (Date.now() - startedAt >= 6000) {
+        try { process.kill(pid, 0); resolve(true); } catch { resolve(false); }
+        return;
+      }
+      setTimeout(poll, 250);
+    };
+    poll();
   });
 
   const quitForUpdate = () => {
@@ -2451,14 +2558,15 @@ async function installDownloadedUpdate() {
     // installer unlaunched with no visible error.
     if (app.isPackaged && perUser) {
       const pid = spawnUpdateWaiter(installer);
-      if (pid && await procAlive(pid)) {
-        console.log('[BLASTI Desktop] update waiter confirmed alive (pid', pid + ') — quitting for install');
-        updateLog('INSTALL-LEG', 'waiter leg CONFIRMED alive — quitting for install', { pid });
+      if (pid && await waiterAlive(pid)) {
+        console.log('[BLASTI Desktop] update waiter confirmed booted (heartbeat, pid', pid + ') — quitting for install');
+        updateLog('INSTALL-LEG', 'waiter leg CONFIRMED booted (heartbeat) — quitting for install', { pid });
         quitForUpdate();
         return { ok: true };
       }
-      console.warn('[BLASTI Desktop] update waiter did not stay alive — trying the PowerShell leg');
-      updateLog('INSTALL-LEG', 'waiter leg FAILED (spawn failed or process died within 900ms) — trying shell leg', { pid: pid || 'none' });
+      console.warn('[BLASTI Desktop] update waiter never booted — trying the shell leg');
+      updateLog('INSTALL-LEG', 'waiter leg FAILED (no heartbeat within 6s — boot crash or AV kill) — trying shell leg', { pid: pid || 'none' });
+      pushUpdateFailureToCloud('INSTALL-LEG', 'waiter leg FAILED (no heartbeat within 6s — boot crash or AV kill)', { pid: pid || 'none' });
     }
     // Fallbacks: dev runs (not packaged), per-machine (Program Files) installs
     // (the PowerShell leg elevates via UAC — a non-elevated silent install
@@ -2477,9 +2585,23 @@ async function installDownloadedUpdate() {
       // between download and here, endpoint AV quarantined the installer and
       // every leg after this is doomed. Record it explicitly.
       const preStat = (() => { try { const s = fs.statSync(installer); return { exists: true, bytes: s.size }; } catch { return { exists: false, bytes: 0 }; } })();
-      updateLog('INSTALL-LEG', 'shell.openPath leg starting (visible NSIS wizard)', { installer, preStatExists: preStat.exists, preStatBytes: preStat.bytes });
-      let shellOpenErr = '';
-      try { shellOpenErr = await shell.openPath(installer); } catch (err) { shellOpenErr = String(err); }
+      // 0.6.56 — strip Mark-of-the-Web before ShellExecute: SmartScreen scans
+      // the zone ad and can delay/deny an unsigned fresh installer for tens
+      // of seconds ("Failed to open path"). Harmless when the stream is absent.
+      const motwStripped = stripZoneIdentifier(installer);
+      updateLog('INSTALL-LEG', 'shell.openPath leg starting (visible NSIS wizard)', { installer, preStatExists: preStat.exists, preStatBytes: preStat.bytes, motwStripped });
+      const openViaShell = async () => {
+        try { return await shell.openPath(installer); } catch (err) { return String(err && err.message || err); }
+      };
+      let shellOpenErr = await openViaShell();
+      // 0.6.56 — one retry after a short settle: an AV real-time scan can hold
+      // the fresh exe exclusively for a while; the second attempt succeeds
+      // once the scan releases it.
+      if (shellOpenErr) {
+        updateLog('INSTALL-LEG', 'shell.openPath attempt 1 failed — retrying after 2s settle (AV scan release suspected)', { error: shellOpenErr });
+        await new Promise((r) => setTimeout(r, 2000));
+        shellOpenErr = await openViaShell();
+      }
       if (!shellOpenErr) {
         console.log('[BLASTI Desktop] installer opened through the shell (visible wizard) — quitting for install');
         updateLog('INSTALL-LEG', 'shell.openPath leg SUCCEEDED — quitting for install');
@@ -2498,12 +2620,18 @@ async function installDownloadedUpdate() {
       console.warn('[BLASTI Desktop] shell.openPath leg failed:', shellOpenErr, postExists ? '' : '(installer file VANISHED — AV quarantine suspected)');
     }
     const psPid = spawnSilentWindowsInstall(installer, { elevate: app.isPackaged && !perUser });
-    if (psPid && await procAlive(psPid)) {
+    if (psPid && await procAlive(psPid, 2000)) {
       console.log('[BLASTI Desktop] PowerShell installer leg confirmed alive (pid', psPid + ') — quitting for install');
       updateLog('INSTALL-LEG', 'PowerShell leg CONFIRMED alive — quitting for install', { pid: psPid });
       quitForUpdate();
       return { ok: true };
     }
+    // 0.6.56 — the PS leg's failure used to be SILENT (no log line between
+    // "shell.openPath leg failed" and "ALL launcher legs failed"), so field
+    // logs could not tell WHICH leg died. powershell.exe -EncodedCommand is a
+    // documented AV heuristic kill target — say so explicitly.
+    updateLog('INSTALL-LEG', 'PowerShell leg FAILED (spawn failed or died quickly — AV heuristics suspected)', { pid: psPid || 'none' });
+    pushUpdateFailureToCloud('INSTALL-LEG', 'PowerShell leg FAILED (spawn failed or died quickly)', { pid: psPid || 'none' });
     // 0.6.30: NEVER quit on a failed spawn — report the failure instead so
     // the user keeps their session and can run the installer manually.
     console.error('[BLASTI Desktop] every installer launcher failed — the app stays open (manual install available)');
@@ -2558,49 +2686,89 @@ function isPerUserWindowsInstall() {
  * it boots the REAL main.js, dispatches runUpdateWaiterMode (which sits
  * before the single-instance lock) and runs the installer — still pure
  * Electron/Node, no cmd.exe/PowerShell for an AV to heuristically block.
- * (app.asar.unpacked is intentionally NOT copied: the waiter path requires
- * no native modules, keeping the copy fast.)
+ * 0.6.56 — the copy is now a FULL RUNTIME MIRROR (see the FIELD ROOT CAUSE
+ * note inside): a lone exe + asar can never boot Electron on Windows.
  */
 function spawnUpdateWaiter(installerPath) {
   const cp = require('child_process');
   try {
     fs.mkdirSync(UPDATES_DIR(), { recursive: true });
   } catch { /* exists */ }
-  const waiterPath = path.join(UPDATES_DIR(), 'blasti-update-waiter.exe');
   const logFile = path.join(UPDATES_DIR(), 'install-log.txt');
+  // UPDATE-0.6.56 — the waiter lives in a FULL RUNTIME MIRROR of the install
+  // dir under <updates>\waiter-runtime\ (the exe is carried under the waiter
+  // name so the installer's silent close-app step never kills it).
+  const runtimeDir = path.join(UPDATES_DIR(), 'waiter-runtime');
+  const waiterPath = path.join(runtimeDir, 'blasti-update-waiter.exe');
   try {
-    try { fs.unlinkSync(waiterPath); } catch { /* absent or locked by an old waiter */ }
-    fs.copyFileSync(process.execPath, waiterPath);
-    updateLog('INSTALL-LEG', 'waiter: exe copied', { waiterPath, bytes: fs.statSync(waiterPath).size });
-    // 0.6.30: prove the copy — a zero-byte waiter spawns nothing.
-    const ws = fs.statSync(waiterPath);
-    if (ws.size !== fs.statSync(process.execPath).size) throw new Error('waiter copy truncated');
-    // 0.6.38: ship the app bundle with the waiter — without it the copied
-    // exe never reached main.js and the whole leg was dead on packaged installs.
-    const srcAsar = path.join(process.resourcesPath || '', 'app.asar');
-    if (!srcAsar || !fs.existsSync(srcAsar)) throw new Error('app.asar not found next to the running exe');
-    const waiterResources = path.join(UPDATES_DIR(), 'resources');
-    fs.mkdirSync(waiterResources, { recursive: true });
-    const dstAsar = path.join(waiterResources, 'app.asar');
-    // 0.6.52 — FIELD ROOT CAUSE of "waiter copy failed: ENOENT,  not found in
-    // …\resources\app.asar": Electron patches fs.copyFile* so a path ENDING in
-    // ".asar" is treated as an ARCHIVE and the requested file is the part
-    // after it — copying the asar FILE ITSELF resolved to reading the file ''
-    // inside the archive → ENOENT on EVERY packaged install, the waiter leg
-    // was dead on arrival and every update fell through to the AV-killed
-    // PowerShell leg. process.noAsar=true is Electron's documented escape
-    // hatch: while set, the asar fs patch is bypassed and the raw file copies.
-    const prevNoAsar = process.noAsar;
-    process.noAsar = true;
+    const appDir = path.dirname(process.execPath);
+    const exeStat = fs.statSync(process.execPath);
+    const srcAsar = path.join(process.resourcesPath || path.join(appDir, 'resources'), 'app.asar');
+    if (!fs.existsSync(srcAsar)) throw new Error('app.asar not found next to the running exe');
+    const withNoAsar = (fn) => {
+      const prev = process.noAsar;
+      process.noAsar = true;
+      try { return fn(); } finally { process.noAsar = prev; }
+    };
+    const asarStat = withNoAsar(() => fs.statSync(srcAsar));
+
+    // Housekeeping: the pre-0.6.56 waiter layout (a lone exe + a lone asar
+    // directly in updates\) can never boot — remove its leftovers once.
+    try { fs.unlinkSync(path.join(UPDATES_DIR(), 'blasti-update-waiter.exe')); } catch { /* absent or locked by an old waiter */ }
+    try { fs.rmSync(path.join(UPDATES_DIR(), 'resources'), { recursive: true, force: true }); } catch { /* absent */ }
+
+    // Fast path: an identical mirror from a previous attempt is reusable —
+    // a retried install skips a ~300-500 MB recopy. Match on exe + asar size
+    // (the two artifacts that change together on every release).
+    const markerPath = path.join(runtimeDir, 'marker.json');
+    let reused = false;
     try {
-      fs.copyFileSync(srcAsar, dstAsar);
-    } finally {
-      process.noAsar = prevNoAsar;
+      const m = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+      const dstAsarProbe = path.join(runtimeDir, 'resources', 'app.asar');
+      reused = !!m && m.exeBytes === exeStat.size && m.asarBytes === asarStat.size
+        && fs.existsSync(waiterPath)
+        && withNoAsar(() => fs.statSync(dstAsarProbe).size) === asarStat.size;
+    } catch { reused = false; }
+
+    if (!reused) {
+      try { fs.rmSync(runtimeDir, { recursive: true, force: true }); } catch { /* locked — cpSync overwrites below */ }
+      fs.mkdirSync(runtimeDir, { recursive: true });
+      // 0.6.56 — FIELD ROOT CAUSE of "waiter leg FAILED (spawn failed or
+      // process died within 900ms)" on EVERY packaged install: a lone exe +
+      // app.asar copy can never boot Electron. The Windows runtime loads
+      // icudtl.dat, v8_context_snapshot.bin, snapshot_blob.bin, *.pak,
+      // locales\*.pak and a dozen DLLs from the EXE'S OWN DIRECTORY —
+      // Chromium CHECK-fails the instant ICU data is missing and exits before
+      // main.js ever runs. Mirror the WHOLE install dir instead.
+      fs.cpSync(appDir, runtimeDir, {
+        recursive: true,
+        force: true,
+        filter: (src) => {
+          if (src === process.execPath) return false;                // copied under the waiter name below
+          if (/^Uninstall /i.test(path.basename(src))) return false; // NSIS uninstaller
+          return src !== srcAsar;                                    // app.asar is copied RAW below
+        },
+      });
+      fs.copyFileSync(process.execPath, waiterPath);
+      if (fs.statSync(waiterPath).size !== exeStat.size) throw new Error('waiter exe copy truncated');
+      // 0.6.52 (kept) — process.noAsar=true is Electron's documented escape
+      // hatch: while set, the .asar fs patch is bypassed and the raw file
+      // copies. ALL size stats run INSIDE the bypass too — statting through
+      // the patch returns the synthetic 0-byte archive root, which made the
+      // old truncation check vacuous (logged bytes=0) and let a truncated
+      // copy pass silently.
+      withNoAsar(() => fs.copyFileSync(srcAsar, path.join(runtimeDir, 'resources', 'app.asar')));
+      const dstBytes = withNoAsar(() => fs.statSync(path.join(runtimeDir, 'resources', 'app.asar')).size);
+      if (dstBytes !== asarStat.size) throw new Error('app.asar copy truncated');
+      try {
+        fs.writeFileSync(markerPath, JSON.stringify({ exeBytes: exeStat.size, asarBytes: asarStat.size, at: Date.now() }));
+      } catch { /* marker is an optimization only */ }
+      updateLog('INSTALL-LEG', 'waiter runtime mirrored (full Electron runtime beside the exe)', { runtimeDir, exeBytes: exeStat.size, asarBytes: asarStat.size, reused: false });
+    } else {
+      updateLog('INSTALL-LEG', 'waiter runtime REUSED (marker matched — no recopy)', { runtimeDir, exeBytes: exeStat.size, asarBytes: asarStat.size, reused: true });
     }
-    if (fs.statSync(dstAsar).size !== fs.statSync(srcAsar).size) throw new Error('app.asar copy truncated');
-    updateLog('INSTALL-LEG', 'waiter: app.asar copied (raw, noAsar bypass)', { bytes: fs.statSync(dstAsar).size });
   } catch (err) {
-    console.warn('[BLASTI Desktop] waiter copy failed — falling back to PowerShell leg:', err && err.message);
+    console.warn('[BLASTI Desktop] waiter copy failed — falling back to next leg:', err && err.message);
     updateLog('INSTALL-LEG', 'waiter copy FAILED — falling back to next leg', { error: (err && err.message) || String(err) });
     pushUpdateFailureToCloud('INSTALL-LEG', 'waiter copy FAILED — falling back to next leg', { error: (err && err.message) || String(err) });
     return null;
@@ -2618,7 +2786,7 @@ function spawnUpdateWaiter(installerPath) {
       return null;
     }
     console.log('[BLASTI Desktop] update waiter spawned:', waiterPath, 'pid', child.pid);
-    updateLog('INSTALL-LEG', 'waiter spawned', { waiterPath, pid: child.pid });
+    updateLog('INSTALL-LEG', 'waiter spawned (full runtime mirror)', { waiterPath, pid: child.pid });
     return child.pid;
   } catch (err) {
     console.warn('[BLASTI Desktop] waiter spawn failed — falling back to PowerShell leg:', err && err.message);
@@ -2716,12 +2884,62 @@ function selfHealPendingInstaller() {
     try { fs.accessSync(target); } catch { return; }
     const stat = fs.statSync(target);
     if (Date.now() - stat.mtimeMs < 60_000) return; // still downloading
-    console.log(`[BLASTI Desktop] self-heal: finishing pending update ${pending[0].ver} (running ${current}) →`, target);
+    // UPDATE-0.6.56 — integrity gate: when a pending-install manifest exists
+    // (written right after the sha256 verify at download time), self-heal
+    // launches ONLY a file whose bytes provably match. A truncated/AV-tampered
+    // leftover used to be runnable here — size>0 and 60s old was the entire
+    // qualification, and a corrupt NSIS run fails silently with the app gone.
+    const manifestPath = path.join(dir, 'pending-install.json');
+    let manifestVerified = false;
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      if (manifest && manifest.fileName === pending[0].f && manifest.sha256) {
+        // async gate: quarantine below then bail out before launching.
+        void (async () => {
+          try {
+            const actual = await sha256File(target);
+            if (actual !== manifest.sha256) {
+              console.warn('[BLASTI Desktop] self-heal: installer FAILED the manifest sha256 gate — quarantining', pending[0].f);
+              updateLog('SELF-HEAL', 'pending installer FAILED the manifest sha256 gate — renamed .stale, NOT run', {
+                installer: target,
+                expectedSha256: String(manifest.sha256).slice(0, 12),
+                actualSha256: actual.slice(0, 12),
+              });
+              try { fs.renameSync(target, `${target}.stale-${Date.now()}`); } catch { /* locked — leave it */ }
+              try { fs.unlinkSync(manifestPath); } catch { /* gone */ }
+              return;
+            }
+            updateLog('SELF-HEAL', 'manifest sha256 verified — installer is byte-identical to the verified download', { installer: target });
+            selfHealLaunch(target);
+          } catch (err) {
+            updateLog('SELF-HEAL', 'manifest gate errored — legacy launch path', { error: (err && err.message) || String(err) });
+            selfHealLaunch(target);
+          }
+        })();
+        manifestVerified = true;
+      }
+      // No manifest / different file → legacy rule (pre-0.6.56 downloads carry
+      // no manifest; self-heal keeps finishing them the old way).
+    } catch { /* no manifest — legacy path */ }
+    if (manifestVerified) return;
+    selfHealLaunch(target);
+  } catch (err) {
+    console.warn('[BLASTI Desktop] self-heal check failed:', err && err.message);
+    updateLog('SELF-HEAL', 'pending-installer scan failed', { error: (err && err.message) || String(err) });
+  }
+}
+
+/** UPDATE-0.6.56 — extracted launcher tail of self-heal (waiter → PS → quit). */
+function selfHealLaunch(target) {
+  try {
+    const current = app.getVersion();
+    const pending = [/^BLASTI-Setup-(\d+\.\d+\.\d+[^\s]*)\.exe$/i.exec(path.basename(target))?.[1] || 'unknown'];
+    console.log(`[BLASTI Desktop] self-heal: finishing pending update ${pending[0]} (running ${current}) →`, target);
     updateLog('SELF-HEAL', 'pending installer found at boot — finishing the interrupted install', {
       installer: target,
-      pendingVersion: pending[0].ver,
+      pendingVersion: pending[0],
       runningVersion: current,
-      bytes: stat.size,
+      bytes: fs.statSync(target).size,
     });
     // UPDATE-0.6.14 — same launcher decision as updates:install (waiter for
     // per-user installs, elevated PowerShell for per-machine installs).
@@ -2730,8 +2948,8 @@ function selfHealPendingInstaller() {
     }
     setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 1500);
   } catch (err) {
-    console.warn('[BLASTI Desktop] self-heal check failed:', err && err.message);
-    updateLog('SELF-HEAL', 'pending-installer scan failed', { error: (err && err.message) || String(err) });
+    console.warn('[BLASTI Desktop] self-heal launch failed:', err && err.message);
+    updateLog('SELF-HEAL', 'self-heal launch failed', { error: (err && err.message) || String(err) });
   }
 }
 
@@ -2762,9 +2980,29 @@ ipcMain.handle('updates:open-installer', async () => {
     updateLog('MANUAL', 'manual open refused — no installer on disk', { requestedPath: installer || 'none' });
     return { ok: false, error: 'no-download' };
   }
-  const result = await shell.openPath(installer);
-  updateLog('MANUAL', result ? 'manual open FAILED (user must run the file from Explorer themselves)' : 'manual open succeeded — installer wizard opened by hand', { installer, error: result || undefined });
-  return { ok: !result, error: result || undefined, path: installer };
+  // 0.6.56 — strip Mark-of-the-Web + one settle retry (same reasoning as the
+  // shell leg of updates:install — SmartScreen/AV can hold a fresh exe).
+  const motwStripped = stripZoneIdentifier(installer);
+  let result = '';
+  try { result = await shell.openPath(installer); } catch (err) { result = String(err && err.message || err); }
+  if (result) {
+    updateLog('MANUAL', 'manual open attempt 1 failed — retrying after 2s settle', { installer, error: result, motwStripped });
+    await new Promise((r) => setTimeout(r, 2000));
+    try { result = await shell.openPath(installer); } catch (err) { result = String(err && err.message || err); }
+  }
+  if (!result) {
+    // 0.6.56 — FIELD ROOT CAUSE of the "this file is being used by another
+    // app" dialog during manual installs: the wizard opened WHILE this app
+    // was still running, so the assisted NSIS run hit blasti.exe's image
+    // lock. Schedule our exit right after the wizard is up — the installer
+    // takes over cleanly and its finish page relaunches the app.
+    updateLog('MANUAL', 'manual open succeeded — quitting so the wizard never hits the running app image lock', { installer });
+    sendUpdateProgress({ status: 'installing', version: '' });
+    setTimeout(() => { try { app.quit(); } catch { /* already quitting */ } }, 1500);
+    return { ok: true, quittingForInstall: true, path: installer };
+  }
+  updateLog('MANUAL', 'manual open FAILED (user must run the file from Explorer themselves)', { installer, error: result || undefined });
+  return { ok: false, error: result || undefined, path: installer };
 });
 
 /** Relaunch AFTER a successful delta apply — the new asar loads on boot. */

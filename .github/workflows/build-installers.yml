@@ -154,7 +154,9 @@ jobs:
           name: desktop-release-refs
           path: apps/desktop/dist/release-refs/*
           retention-days: 30
-          if-no-files-found: warn
+          # 0.6.56 — MANDATORY: a release without refs silently downgrades
+          # every client to full installers (no-deltas-published incident).
+          if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────────────────
   mobile-apk:
@@ -358,6 +360,15 @@ jobs:
             echo "delta refs found — differential updates will be generated"
           else
             echo "no delta refs artifact — desktop updates fall back to full installers"
+          fi
+
+          # 0.6.56 — DELTA REFS ARE MANDATORY for desktop. A publish without
+          # them silently downgrades EVERY client to 100+ MB full installers
+          # until someone reads the storage manifest months later (field
+          # incident: no-deltas-published on 0.6.53→0.6.55). Refuse to publish.
+          if ls installer/desktop/*.exe >/dev/null 2>&1 && [ -z "$REF_ARGS" ]; then
+            echo "::error::a desktop exe is present but the desktop-release-refs artifact is missing — refusing to publish (clients would never receive delta updates). Check the 'Build release refs for delta updates' step output and re-run."
+            exit 1
           fi
 
           uploaded=false

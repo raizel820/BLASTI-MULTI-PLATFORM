@@ -786,7 +786,12 @@ app.post('/:id/release-refs', async (c) => {
 
 app.post('/:id/regenerate-deltas', async (c) => {
   try {
-    await requireAdmin(c)
+    // 0.6.56 — deploy-token accepted alongside an admin session: rebuilding
+    // hop patches is a CI-adjacent repair operation (the token guards the
+    // upload of the very artifacts these patches are derived from), and the
+    // field incident (no-deltas-published on 0.6.53→0.6.55) needed a
+    // token-driven repair script because no admin session exists on the VPS.
+    await requireAdminOrDeployToken(c)
     const appVersion = await db.appVersion.findUnique({ where: { id: c.req.param('id') } })
     if (!appVersion) return c.json({ success: false, error: 'Version not found' }, 404)
     const results = await generateDeltasForVersion(appVersion.id)
