@@ -536,6 +536,13 @@ const VALID_VIEW_NAMES: Set<string> = new Set<string>([
   'admin-payment-settings',
   'admin-hardware', 'admin-enterprise-requests',
   'admin-hardware-requests',
+  // 0.6.62 — views added after the original whitelist MUST survive
+  // persisted-state sanitization too: a reload while on any of them used to
+  // bounce the user back to the landing page (sanitizeViewName → 'landing').
+  'admin-logs-manager', 'admin-backups',
+  'admin-agencies-management', 'admin-category-manager', 'admin-category-language',
+  'admin-translation-agent', 'admin-tickets',
+  'agency-support', 'customer-support',
   'kiosk', 'agency-fullscreen', 'agency-fullscreen-history',
 ]);
 

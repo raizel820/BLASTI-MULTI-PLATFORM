@@ -845,17 +845,18 @@ export function AdminTranslationAgent() {
               </Select>
             </div>
             {keyForm.provider === 'openai-compatible' && (
-              <>
-                <div className="space-y-1.5">
-                  <Label className="text-xs">{t('trAgentKeyBaseUrl')}</Label>
-                  <Input value={keyForm.baseUrl} onChange={(e) => setKeyForm((f) => ({ ...f, baseUrl: e.target.value }))} dir="ltr" placeholder="https://api.z.ai/api/paas/v4" />
-                </div>
-                <div className="space-y-1.5">
-                  <Label className="text-xs">{t('trAgentKeyModel')}</Label>
-                  <Input value={keyForm.model} onChange={(e) => setKeyForm((f) => ({ ...f, model: e.target.value }))} dir="ltr" placeholder="glm-4.6-flash" />
-                </div>
-              </>
+              <div className="space-y-1.5">
+                <Label className="text-xs">{t('trAgentKeyBaseUrl')}</Label>
+                <Input value={keyForm.baseUrl} onChange={(e) => setKeyForm((f) => ({ ...f, baseUrl: e.target.value }))} dir="ltr" placeholder="https://api.z.ai/api/paas/v4" />
+              </div>
             )}
+            <div className="space-y-1.5">
+              <Label className="text-xs">{t('trAgentKeyModel')}</Label>
+              {/* 0.6.63 — model matters for BOTH providers now: a pasted z.ai
+                  key is called via api.z.ai where only glm-4.7-flash (free
+                  flash tier) exists. Empty → engine default. */}
+              <Input value={keyForm.model} onChange={(e) => setKeyForm((f) => ({ ...f, model: e.target.value }))} dir="ltr" placeholder="glm-4.7-flash" />
+            </div>
             <div className="space-y-1.5">
               <Label className="text-xs">{t('trAgentKeyValue')}</Label>
               <Input

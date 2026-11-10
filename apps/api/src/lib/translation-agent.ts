@@ -18,13 +18,65 @@
  * (agency name/description, service names, category names, category terms)
  * — only EMPTY target fields are filled, so manual edits are never overrun.
  *
- * PROVIDERS: an active 'openai-compatible' TranslationApiKey (custom
- * baseUrl + key, e.g. the z.ai open platform serving glm-4.6-flash) wins;
- * otherwise the bundled z-ai-web-dev-sdk (free GLM flash) is used.
+ * PROVIDERS: an active TranslationApiKey with real key material (an explicit
+ * 'openai-compatible' entry, or a z.ai platform key pasted under 'zai') wins
+ * — z.ai base is the default, model glm-4.7-flash (free flash tier);
+ * otherwise the bundled z-ai-web-dev-sdk (free GLM flash) is used. Transient
+ * flash-tier errors (1305/429/5xx) are retried automatically.
  */
 
 import { createHash } from 'node:crypto'
 import { db } from '@blasti/db'
+
+// ─── Action trail (0.6.62 — Logs Manager + Category Language page) ──────────
+
+export type AgentLogAction =
+  | 'ENQUEUE_AGENCY' | 'ENQUEUE_CATEGORY' | 'CREATE_CATEGORY'
+  | 'BATCH_RUN' | 'BATCH_FAIL' | 'KEY_TEST' | 'PROCESS_NOW'
+  | 'SETTINGS_UPDATE' | 'KEY_CREATE' | 'KEY_UPDATE' | 'KEY_DELETE'
+  | 'DICTIONARY_EDIT' | 'DICTIONARY_DELETE'
+
+export interface AgentLogInput {
+  action: AgentLogAction
+  status?: 'success' | 'error' | 'info'
+  summary: string
+  details?: Record<string, unknown>
+  refType?: string | null
+  refId?: string | null
+  /** 'scheduler' | 'admin:<userId>' | 'owner:<userId>' | 'system'. */
+  actor?: string
+  provider?: string | null
+  durationMs?: number | null
+}
+
+/**
+ * Append ONE row to the agent action trail (TranslationAgentLog). The trail
+ * feeds the Logs Manager's "Translation agent" tab AND the per-category call
+ * log on the Category Language page. Logging must NEVER break its caller —
+ * every failure is swallowed after a console warning.
+ */
+export async function logAgentAction(input: AgentLogInput): Promise<void> {
+  try {
+    await db.translationAgentLog.create({
+      data: {
+        action: input.action,
+        status: input.status ?? 'success',
+        summary: String(input.summary || '').slice(0, 500),
+        details: input.details ? JSON.stringify(input.details).slice(0, 8000) : null,
+        refType: input.refType ?? null,
+        refId: input.refId ?? null,
+        actor: input.actor || 'system',
+        provider: input.provider ?? null,
+        durationMs:
+          typeof input.durationMs === 'number' && Number.isFinite(input.durationMs)
+            ? Math.round(input.durationMs)
+            : null,
+      },
+    })
+  } catch (error) {
+    console.warn('[translation-agent] action-log failed:', (error as Error)?.message || error)
+  }
+}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -39,6 +91,55 @@ const MAX_JOB_ATTEMPTS = 3
 const MAX_CATEGORY_JOBS_PER_RUN = 5
 /** Hard LLM call timeout — a stuck provider must never wedge the window. */
 const LLM_TIMEOUT_MS = 120_000
+
+// ─── Provider constants (0.6.63 — verified against the live z.ai platform) ──
+
+/** Default OpenAI-compatible base for the z.ai open platform. */
+const ZAI_DEFAULT_BASE = 'https://api.z.ai/api/paas/v4'
+/**
+ * The free flash model on the z.ai open platform. `glm-4.6-flash` — the old
+ * default — DOES NOT EXIST there (live-verified: error 1211 "Unknown Model"),
+ * which is exactly why stored-key connections kept failing. Anything that
+ * still points at it is healed to the working flash model at USE time.
+ */
+const DEFAULT_AGENT_MODEL = 'glm-4.7-flash'
+const LEGACY_MODEL_MAP: Record<string, string> = {
+  'glm-4.6-flash': DEFAULT_AGENT_MODEL, // nonexistent on api.z.ai (1211)
+}
+const MODEL_ID_RE = /^[A-Za-z0-9._\-/]{2,80}$/
+
+/**
+ * Heal the stored model id: legacy nonexistent ids map to the working flash
+ * model, empty/invalid ids fall back to the default, everything else passes
+ * through untouched (power users may pin any provider-specific id).
+ */
+export function normalizeAgentModel(raw: unknown): string {
+  const s = String(raw ?? '').trim()
+  if (!s || !MODEL_ID_RE.test(s)) return DEFAULT_AGENT_MODEL
+  return LEGACY_MODEL_MAP[s] ?? s
+}
+
+/** A stored 'zai'-provider key counts as REAL key material unless it is the placeholder. */
+function isRealKeyMaterial(apiKey: string | null | undefined): boolean {
+  const s = String(apiKey ?? '').trim()
+  return s.length > 0 && s !== 'SDK-MANAGED'
+}
+
+/**
+ * Transient provider failures worth retrying: HTTP 429, any 5xx, and the
+ * z.ai flash-tier saturation error 1305 ("temporarily overloaded") —
+ * live-verified to clear within a few seconds on retry. Definitive errors
+ * (401/403 auth, 1113 balance, 1211 unknown model, 400 body) fail fast.
+ */
+function isRetryableHttpFailure(status: number, body: string): boolean {
+  if (status === 429 || status >= 500) return true
+  return /"code"\s*:\s*"1305"/.test(body)
+}
+
+/** True when the base URL is a GLM-native endpoint that accepts `thinking`. */
+function supportsThinkingDisable(base: string): boolean {
+  return /z\.ai|bigmodel\.cn/i.test(base)
+}
 
 const REF_TYPES = ['agency', 'service', 'agency-category', 'category-term'] as const
 type RefType = (typeof REF_TYPES)[number]
@@ -328,6 +429,8 @@ export async function enqueueAgencyContentTranslations(input: {
   descriptionFr?: string | null
   services?: Array<{ id: string; name: string; nameAr?: string | null; nameFr?: string | null }>
   contentLanguage?: string | null
+  /** Trail actor (who triggered the enqueue) — defaults to 'system'. */
+  actor?: string
 }): Promise<EnqueueSummary> {
   const total: EnqueueSummary = { queued: 0, applied: 0, skipped: 0 }
   const sourceLang = sanitizeLang(input.contentLanguage)
@@ -388,6 +491,24 @@ export async function enqueueAgencyContentTranslations(input: {
     }
   }
 
+  // Action trail — one row per agency-content enqueue (never per string).
+  if (total.queued > 0 || total.applied > 0) {
+    await logAgentAction({
+      action: 'ENQUEUE_AGENCY',
+      status: total.queued > 0 ? 'success' : 'info',
+      summary: `agency content → ${total.queued} queued for the agent, ${total.applied} served from the dictionary, ${total.skipped} skipped`,
+      details: {
+        ...total,
+        name: (input.name || '').slice(0, 80),
+        contentLanguage: sourceLang,
+        services: (input.services || []).length,
+      },
+      refType: 'agency',
+      refId: input.agencyId,
+      actor: input.actor,
+    })
+  }
+
   return total
 }
 
@@ -396,7 +517,7 @@ export async function enqueueAgencyContentTranslations(input: {
  * still missing translations. Source language per string: explicit columns
  * carry their own language; the base `name` is detected heuristically.
  */
-export async function enqueueCategoryTranslations(categoryId: string): Promise<EnqueueSummary> {
+export async function enqueueCategoryTranslations(categoryId: string, actor?: string): Promise<EnqueueSummary> {
   const total: EnqueueSummary = { queued: 0, applied: 0, skipped: 0 }
   const category = await db.agencyCategory.findUnique({
     where: { id: categoryId },
@@ -439,6 +560,25 @@ export async function enqueueCategoryTranslations(categoryId: string): Promise<E
         refType: 'category-term', refId: term.id, field: target.field,
       }))
     }
+  }
+
+  // Action trail — the Category Language page reads this back as its call log.
+  if (total.queued > 0 || total.applied > 0) {
+    await logAgentAction({
+      action: 'ENQUEUE_CATEGORY',
+      status: total.queued > 0 ? 'success' : 'info',
+      summary: `category "${category.name}" → ${total.queued} queued for the agent, ${total.applied} served from the dictionary, ${total.skipped} skipped`,
+      details: {
+        ...total,
+        categorySlug: category.slug,
+        categoryName: category.name,
+        terms: category.terms.length,
+        termIds: category.terms.map((term) => term.id).slice(0, 60),
+      },
+      refType: 'agency-category',
+      refId: categoryId,
+      actor,
+    })
   }
 
   return total
@@ -491,6 +631,15 @@ export async function createPendingCategory(
         },
       })
     }
+    await logAgentAction({
+      action: 'CREATE_CATEGORY',
+      status: 'info',
+      summary: `category "${name}" reused (existing slug ${existing.slug}) — ${pending ? 'enrichment already queued' : 'enrichment queued for the agent'}`,
+      details: { slug: existing.slug, name, sourceLang, reused: true },
+      refType: 'agency-category',
+      refId: existing.id,
+      actor: createdBy ? `owner:${createdBy}` : 'system',
+    })
     return { ...existing, alreadyExisted: true }
   }
 
@@ -516,6 +665,16 @@ export async function createPendingCategory(
     },
   })
 
+  await logAgentAction({
+    action: 'CREATE_CATEGORY',
+    status: 'success',
+    summary: `new category "${name}" created (slug ${row.slug}) — trilingual names + emoji icon queued for the agent`,
+    details: { slug: row.slug, name, sourceLang, reused: false },
+    refType: 'agency-category',
+    refId: row.id,
+    actor: createdBy ? `owner:${createdBy}` : 'system',
+  })
+
   return { ...row, alreadyExisted: false }
 }
 
@@ -538,106 +697,221 @@ interface LLMCallResult {
   provider: string
 }
 
+interface ChatMessage {
+  role: 'system' | 'assistant' | 'user'
+  content: string
+}
+
+interface HTTPAttemptResult {
+  ok: boolean
+  content?: string
+  error?: string
+  /** true → the failure is transient (retryable); false → definitive. */
+  retryable?: boolean
+}
+
+/**
+ * ONE OpenAI-compatible chat attempt. Z.ai is live-verified: it returns
+ * proper HTTP error codes with a JSON body {error:{code,message}}, and the
+ * flash model may answer with `reasoning_content` alongside `content` —
+ * only `content` is ever used (strict contract).
+ */
+async function chatCompletionAttempt(opts: {
+  base: string
+  apiKey: string
+  model: string
+  messages: ChatMessage[]
+  temperature: number
+  timeoutMs: number
+}): Promise<HTTPAttemptResult> {
+  const base = opts.base.replace(/\/+$/, '')
+  try {
+    const res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${opts.apiKey}` },
+      body: JSON.stringify({
+        model: opts.model,
+        temperature: opts.temperature,
+        stream: false,
+        ...(supportsThinkingDisable(base) ? { thinking: { type: 'disabled' } } : {}),
+        messages: opts.messages,
+      }),
+      signal: AbortSignal.timeout(opts.timeoutMs),
+    })
+    const body = await res.text().catch(() => '')
+    if (!res.ok) {
+      const detail = body.slice(0, 300) || `HTTP ${res.status}`
+      return { ok: false, error: `HTTP ${res.status} — ${detail}`, retryable: isRetryableHttpFailure(res.status, body) }
+    }
+    const data = JSON.parse(body || '{}') as {
+      choices?: Array<{ message?: { content?: string } }>
+      error?: { code?: string; message?: string }
+    }
+    // Some gateways answer HTTP 200 with an error object inside — treat it honestly.
+    if (data?.error?.message) {
+      const code = data.error.code ? ` (${data.error.code})` : ''
+      const transient = String(data.error.code) === '1305'
+      return { ok: false, error: `${data.error.message}${code}`, retryable: transient }
+    }
+    const content = data?.choices?.[0]?.message?.content
+    if (!content) return { ok: false, error: 'empty response', retryable: true }
+    return { ok: true, content }
+  } catch (error) {
+    const msg = (error as Error)?.message || 'request failed'
+    const isTimeout = (error as Error)?.name === 'TimeoutError' || /timeout|abort/i.test(msg)
+    return { ok: false, error: msg, retryable: isTimeout }
+  }
+}
+
+/**
+ * OpenAI-compatible chat WITH retries for transient failures (the z.ai flash
+ * tier saturates regularly — a single attempt fails the whole batch window;
+ * live-verified that later attempts succeed once capacity frees up).
+ * 4 attempts, escalating delays 3s → 8s → 15s.
+ */
+async function chatCompletionWithRetry(opts: {
+  base: string
+  apiKey: string
+  model: string
+  messages: ChatMessage[]
+  temperature: number
+  timeoutMs: number
+  attempts?: number
+}): Promise<HTTPAttemptResult> {
+  const attempts = Math.max(1, Math.min(5, opts.attempts ?? 4))
+  const DELAYS_MS = [3_000, 8_000, 15_000, 20_000]
+  let last: HTTPAttemptResult = { ok: false, error: 'unreachable' }
+  for (let i = 0; i < attempts; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, DELAYS_MS[Math.min(i - 1, DELAYS_MS.length - 1)]))
+    last = await chatCompletionAttempt(opts)
+    if (last.ok || !last.retryable) return last
+  }
+  return last
+}
+
 async function callTranslationLLM(
   userPrompt: string,
   config: Awaited<ReturnType<typeof getAgentConfig>>,
 ): Promise<LLMCallResult> {
-  const customKey = await db.translationApiKey.findFirst({
-    where: { isActive: true, provider: 'openai-compatible' },
-    orderBy: { updatedAt: 'desc' },
-  })
+  // Key priority: an explicit openai-compatible key first; then a REAL key
+  // material stored under the 'zai' provider (0.6.63 — admins paste their
+  // z.ai platform key there, the UI even invites them to — never ignore it).
+  const [compatKey, zaiKey] = await Promise.all([
+    db.translationApiKey.findFirst({
+      where: { isActive: true, provider: 'openai-compatible' },
+      orderBy: { updatedAt: 'desc' },
+    }),
+    db.translationApiKey.findFirst({
+      where: { isActive: true, provider: 'zai' },
+      orderBy: { updatedAt: 'desc' },
+    }),
+  ])
 
-  if (customKey?.baseUrl && customKey.apiKey) {
-    try {
-      const base = customKey.baseUrl.replace(/\/+$/, '')
-      const res = await fetch(`${base}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${customKey.apiKey}` },
-        body: JSON.stringify({
-          model: customKey.model || config.model || 'glm-4.6-flash',
-          temperature: 0.2,
-          stream: false,
-          messages: [
-            { role: 'system', content: AGENT_SYSTEM_PROMPT },
-            { role: 'user', content: userPrompt },
-          ],
-        }),
-        signal: AbortSignal.timeout(LLM_TIMEOUT_MS),
-      })
-      if (!res.ok) {
-        const body = await res.text().catch(() => '')
-        return { ok: false, error: `HTTP ${res.status} — ${body.slice(0, 200)}`, provider: `key:${customKey.label}` }
-      }
-      const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
-      const content = data?.choices?.[0]?.message?.content
-      if (!content) return { ok: false, error: 'empty response', provider: `key:${customKey.label}` }
-      return { ok: true, content, provider: `key:${customKey.label}` }
-    } catch (error) {
-      return { ok: false, error: (error as Error)?.message || 'request failed', provider: `key:${customKey.label}` }
-    }
-  }
+  const httpKey =
+    compatKey && compatKey.apiKey
+      ? { key: compatKey, base: compatKey.baseUrl?.trim() || ZAI_DEFAULT_BASE }
+      : zaiKey && isRealKeyMaterial(zaiKey.apiKey)
+        ? { key: zaiKey, base: zaiKey.baseUrl?.trim() || ZAI_DEFAULT_BASE }
+        : null
 
-  // Bundled SDK — the free GLM flash path.
-  try {
-    const { default: ZAI } = await import('z-ai-web-dev-sdk')
-    const zai = await ZAI.create()
-    const completion = await zai.chat.completions.create({
+  if (httpKey) {
+    const provider = `key:${httpKey.key.label}`
+    const result = await chatCompletionWithRetry({
+      base: httpKey.base,
+      apiKey: httpKey.key.apiKey,
+      model: normalizeAgentModel(httpKey.key.model || config.model),
       messages: [
-        { role: 'assistant', content: AGENT_SYSTEM_PROMPT },
+        { role: 'system', content: AGENT_SYSTEM_PROMPT },
         { role: 'user', content: userPrompt },
       ],
-      thinking: { type: 'disabled' },
+      temperature: 0.2,
+      timeoutMs: LLM_TIMEOUT_MS,
     })
-    const content = completion.choices[0]?.message?.content
-    if (!content) return { ok: false, error: 'empty response', provider: 'zai-sdk' }
-    return { ok: true, content, provider: 'zai-sdk' }
-  } catch (error) {
-    return { ok: false, error: (error as Error)?.message || 'SDK failed', provider: 'zai-sdk' }
+    if (result.ok) return { ok: true, content: result.content, provider }
+    // 0.6.63 — TRANSIENT key-path failures (z.ai flash saturation 1305/429,
+    // 5xx, timeouts) fall back to the bundled SDK so the window still ships:
+    // the two tiers run on SEPARATE capacity pools (live-verified: the SDK
+    // answered in 357ms while the platform key was being 429'd). DEFINITIVE
+    // failures (401/403 auth, 1113 balance, 1211 unknown model) do NOT fall
+    // back — the admin must see the real key problem in the trail.
+    if (!result.retryable) return { ok: false, error: result.error, provider }
+    const fallback = await runSdkPath(userPrompt)
+    return fallback.ok
+      ? { ok: true, content: fallback.content, provider: `${provider}→zai-sdk (fallback)` }
+      : { ok: false, error: `${result.error} | sdk fallback: ${fallback.error}`, provider }
   }
+
+  return runSdkPath(userPrompt)
+}
+
+/** The bundled SDK path (free GLM flash) with one retry on transient replies. */
+async function runSdkPath(userPrompt: string): Promise<LLMCallResult> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      if (attempt > 0) await new Promise((r) => setTimeout(r, 3_000))
+      const { default: ZAI } = await import('z-ai-web-dev-sdk')
+      const zai = await ZAI.create()
+      const completion = await zai.chat.completions.create({
+        messages: [
+          { role: 'assistant', content: AGENT_SYSTEM_PROMPT },
+          { role: 'user', content: userPrompt },
+        ],
+        thinking: { type: 'disabled' },
+      })
+      const content = completion.choices[0]?.message?.content
+      if (!content) continue // transient empty reply → one retry
+      return { ok: true, content, provider: 'zai-sdk' }
+    } catch (error) {
+      if (attempt === 1) return { ok: false, error: (error as Error)?.message || 'SDK failed', provider: 'zai-sdk' }
+    }
+  }
+  return { ok: false, error: 'empty response (2 attempts)', provider: 'zai-sdk' }
 }
 
 /** Test one stored API key with a tiny real translation round-trip. */
-export async function testTranslationApiKey(keyId: string): Promise<{ ok: boolean; message: string; sample?: string }> {
+export async function testTranslationApiKey(
+  keyId: string,
+  actor?: string,
+): Promise<{ ok: boolean; message: string; sample?: string }> {
   const key = await db.translationApiKey.findUnique({ where: { id: keyId } })
   if (!key) return { ok: false, message: 'key not found' }
 
+  const TEST_MESSAGES: ChatMessage[] = [
+    { role: 'system', content: 'You are a translator. Reply with the translation only.' },
+    { role: 'user', content: 'Translate to French: "Welcome to Blasti"' },
+  ]
   let ok = false
   let message = ''
   let sample: string | undefined
 
   try {
-    if (key.provider === 'openai-compatible') {
-      if (!key.baseUrl || !key.apiKey) throw new Error('baseUrl and apiKey are required')
-      const base = key.baseUrl.replace(/\/+$/, '')
-      const res = await fetch(`${base}/chat/completions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key.apiKey}` },
-        body: JSON.stringify({
-          model: key.model || 'glm-4.6-flash',
-          temperature: 0,
-          stream: false,
-          messages: [
-            { role: 'system', content: 'You are a translator. Reply with the translation only.' },
-            { role: 'user', content: 'Translate to French: "Welcome to Blasti"' },
-          ],
-        }),
-        signal: AbortSignal.timeout(30_000),
+    if (key.provider === 'openai-compatible' || isRealKeyMaterial(key.apiKey)) {
+      // Real key material — hit the OpenAI-compatible endpoint directly.
+      // 0.6.63: provider 'zai' with a pasted platform key is tested THROUGH
+      // that key (previously it silently tested the SDK instead — the exact
+      // "key connection failing" confusion). baseUrl is optional for z.ai.
+      if (!key.apiKey) throw new Error('apiKey is required')
+      const base = key.baseUrl?.trim() || ZAI_DEFAULT_BASE
+      const model = normalizeAgentModel(key.model)
+      const result = await chatCompletionWithRetry({
+        base,
+        apiKey: key.apiKey,
+        model,
+        messages: TEST_MESSAGES,
+        temperature: 0,
+        timeoutMs: 60_000,
+        attempts: 4,
       })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
-      sample = data?.choices?.[0]?.message?.content?.trim()
-      if (!sample) throw new Error('empty response')
+      if (!result.ok) throw new Error(result.error || 'request failed')
+      sample = result.content?.trim()
       ok = true
-      message = `OK — model ${key.model || 'glm-4.6-flash'} replied`
+      message = `OK — model ${model} replied`
     } else {
-      // 'zai' — the bundled SDK path (no key material involved).
+      // 'zai' without key material — the bundled SDK path.
       const { default: ZAI } = await import('z-ai-web-dev-sdk')
       const zai = await ZAI.create()
       const completion = await zai.chat.completions.create({
-        messages: [
-          { role: 'assistant', content: 'You are a translator. Reply with the translation only.' },
-          { role: 'user', content: 'Translate to French: "Welcome to Blasti"' },
-        ],
+        messages: TEST_MESSAGES,
         thinking: { type: 'disabled' },
       })
       sample = completion.choices[0]?.message?.content?.trim()
@@ -653,6 +927,16 @@ export async function testTranslationApiKey(keyId: string): Promise<{ ok: boolea
   await db.translationApiKey.update({
     where: { id: keyId },
     data: { lastTestAt: new Date(), lastTestOk: ok, lastTestMessage: message.slice(0, 500) },
+  })
+  await logAgentAction({
+    action: 'KEY_TEST',
+    status: ok ? 'success' : 'error',
+    summary: `API key "${key.label}" test ${ok ? 'passed' : 'failed'}: ${message}`,
+    details: { ok, message, sample: sample?.slice(0, 200), keyProvider: key.provider, keyModel: key.model },
+    refType: 'api-key',
+    refId: keyId,
+    actor,
+    provider: key.provider,
   })
   return { ok, message, sample }
 }
@@ -716,7 +1000,8 @@ export interface BatchRunStats {
  * ONE agent window: claim pending jobs → single batched LLM call → validate
  * → store dictionary entries → apply to rows. NEVER throws (scheduler-safe).
  */
-export async function runTranslationBatch(force = false): Promise<BatchRunStats> {
+export async function runTranslationBatch(force = false, actor = 'scheduler'): Promise<BatchRunStats> {
+  const startedAt = Date.now()
   const stats: BatchRunStats = { ran: false, textJobs: 0, categoryJobs: 0, applied: 0, stored: 0 }
   const config = await getAgentConfig()
   if (!config.enabled && !force) {
@@ -801,6 +1086,20 @@ export async function runTranslationBatch(force = false): Promise<BatchRunStats>
       where: { id: 'singleton' },
       data: { lastRunAt: new Date(), lastRunOk: false, lastRunMessage: `${llm.provider}: ${String(llm.error).slice(0, 400)}` },
     })
+    await logAgentAction({
+      action: 'BATCH_FAIL',
+      status: 'error',
+      summary: `batch window failed — ${llm.provider}: ${String(llm.error).slice(0, 300)} (${textJobs.length} text + ${categoryJobs.length} category jobs re-queued/parked)`,
+      details: {
+        provider: llm.provider,
+        error: String(llm.error).slice(0, 500),
+        textJobs: textJobs.length,
+        categoryJobs: categoryJobs.length,
+      },
+      actor,
+      provider: llm.provider,
+      durationMs: Date.now() - startedAt,
+    })
     stats.reason = 'llm-failed'
     stats.message = llm.error
     return stats
@@ -835,6 +1134,8 @@ export async function runTranslationBatch(force = false): Promise<BatchRunStats>
   // ── Apply text results (sorted: items first, then rows, then jobs) ──
   const doneTextIds: string[] = []
   const failedTextIds: string[] = []
+  /** Trail payload — every row the window actually wrote. */
+  const appliedRefs: Array<Record<string, unknown>> = []
   for (const g of groups.values()) {
     const result = itemResults.get(g.item.id)
     if (!result) { failedTextIds.push(...g.jobs.map((j) => j.id)); continue }
@@ -853,6 +1154,13 @@ export async function runTranslationBatch(force = false): Promise<BatchRunStats>
       stats.stored++
       if (await applyTranslation(job.refType as RefType, String(job.refId || ''), String(job.field || ''), translated)) {
         stats.applied++
+        appliedRefs.push({
+          refType: job.refType,
+          refId: job.refId,
+          field: job.field,
+          targetLang,
+          sourceText: String(job.sourceText || '').slice(0, 80),
+        })
       }
       doneTextIds.push(job.id)
     }
@@ -918,6 +1226,12 @@ export async function runTranslationBatch(force = false): Promise<BatchRunStats>
       }
     }
     stats.applied++
+    appliedRefs.push({
+      refType: 'agency-category',
+      refId: row.id,
+      name: finalName,
+      icon: result.icon || row.icon || null,
+    })
     doneCategoryIds.push(job.id)
   }
   if (doneCategoryIds.length) {
@@ -932,6 +1246,23 @@ export async function runTranslationBatch(force = false): Promise<BatchRunStats>
   await db.translationAgentConfig.update({
     where: { id: 'singleton' },
     data: { lastRunAt: new Date(), lastRunOk: true, lastRunMessage: message.slice(0, 400) },
+  })
+  await logAgentAction({
+    action: 'BATCH_RUN',
+    status: 'success',
+    summary: `batch window done — ${message} via ${llm.provider}`,
+    details: {
+      textJobs: doneTextIds.length,
+      textTotal: textJobs.length,
+      categories: doneCategoryIds.length,
+      categoryTotal: categoryJobs.length,
+      applied: stats.applied,
+      stored: stats.stored,
+      refs: appliedRefs.slice(0, 50),
+    },
+    actor,
+    provider: llm.provider,
+    durationMs: Date.now() - startedAt,
   })
   stats.ran = true
   stats.textJobs = doneTextIds.length

@@ -1233,8 +1233,9 @@ model TranslationAgentConfig {
   intervalMinutes Int       @default(5)
   /// Max translation items submitted per run.
   batchSize       Int       @default(40)
-  /// GLM flash model id used with openai-compatible providers.
-  model           String    @default("glm-4.6-flash")
+  /// GLM flash model id used with openai-compatible providers (glm-4.6-flash
+  /// does NOT exist on api.z.ai — error 1211; use-time normalization heals it).
+  model           String    @default("glm-4.7-flash")
   lastRunAt       DateTime?
   lastRunOk       Boolean?
   lastRunMessage  String?
@@ -1257,6 +1258,40 @@ model TranslationApiKey {
   lastTestMessage String?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
+}
+
+/// 0.6.62 — Translation agent ACTION TRAIL. One row per agent action so the
+/// Logs Manager (new "Translation agent" tab) and the Category Language page
+/// (per-category call log) can track exactly what the agent did, when, why,
+/// with which provider, and how long it took.
+model TranslationAgentLog {
+  id         String   @id @default(cuid())
+  /// ENQUEUE_AGENCY | ENQUEUE_CATEGORY | CREATE_CATEGORY | BATCH_RUN |
+  /// BATCH_FAIL | KEY_TEST | PROCESS_NOW | SETTINGS_UPDATE |
+  /// KEY_CREATE | KEY_UPDATE | KEY_DELETE | DICTIONARY_EDIT | DICTIONARY_DELETE
+  action     String
+  /// 'success' | 'error' | 'info'
+  status     String   @default("success")
+  /// Human-readable one-liner (the table column).
+  summary    String
+  /// JSON blob with the structured payload (stats, touched refs, per-item
+  /// results, error messages…) — rendered in the detail dialog.
+  details    String?
+  /// Entity link: 'agency' | 'service' | 'agency-category' | 'category-term' | 'api-key'.
+  refType    String?
+  refId      String?
+  /// Who triggered it: 'scheduler' | 'admin:<userId>' | 'system'.
+  actor      String   @default("system")
+  /// LLM provider used for batch runs ('zai-sdk' | 'key:<label>').
+  provider   String?
+  durationMs Int?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([action, createdAt])
+  @@index([status, createdAt])
+  @@index([refType, refId])
+  @@index([createdAt])
 }
 
 /// Task C — admin-controlled per-agency-type service conditions (the admin

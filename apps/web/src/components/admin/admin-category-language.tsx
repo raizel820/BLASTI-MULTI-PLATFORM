@@ -70,6 +70,7 @@ import {
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
 import { AdminAgenciesManagementSectionPage } from '@/components/admin/admin-agencies-management-section-page';
+import { AgentCallLogCard } from '@/components/admin/admin-agent-logs-section';
 import type { TranslationKeys } from '@/i18n';
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -153,7 +154,14 @@ export function AdminCategoryLanguage() {
   // Delete confirm
   const [deleteTarget, setDeleteTarget] = useState<CategoryTerm | null>(null);
 
+  // 0.6.62 — per-category agent call log (bumped to refetch after "translate via agent")
+  const [agentLogSignal, setAgentLogSignal] = useState(0);
+
   const selectedCategory = categories?.find((c) => c.slug === selectedSlug) ?? null;
+  // Entity ids for the agent call log: the category row + every term row.
+  const agentEntityIds = selectedCategory
+    ? [selectedCategory.id, ...(terms ?? []).map((term) => term.id)]
+    : [];
 
   // ── Categories (picker source) ──
 
@@ -236,6 +244,7 @@ export function AdminCategoryLanguage() {
           toast.info(t('catLangAgentNothing') as any);
         }
         setTimeout(() => { void loadTerms(selectedCategory.slug); }, 1500);
+        setAgentLogSignal((v) => v + 1);
       } else {
         toast.error(String(data?.error || (t('error') as any)));
       }
@@ -580,6 +589,13 @@ export function AdminCategoryLanguage() {
               </div>
             </CardContent>
           </Card>
+        )}
+
+        {/* 0.6.62 — AI translation agent call log for THIS category + its terms.
+            Shows enqueues, batch windows that applied translations, and any
+            errors — expandable to the raw JSON payload. */}
+        {selectedCategory && (
+          <AgentCallLogCard entityIds={agentEntityIds} refreshSignal={agentLogSignal} />
         )}
       </div>
 

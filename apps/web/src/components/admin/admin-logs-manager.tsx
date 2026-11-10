@@ -39,6 +39,7 @@ import {
   Search,
   Siren,
   Server,
+  Bot,
   X,
 } from 'lucide-react';
 import { apiFetch } from '@/lib/api-fetch';
@@ -59,6 +60,7 @@ import {
 } from '@/components/ui/dialog';
 import { AdminAccountLogsVault } from '@/components/admin/admin-account-logs-vault';
 import { AdminServerLogsSection } from '@/components/admin/admin-server-logs-section';
+import { AdminAgentLogsSection } from '@/components/admin/admin-agent-logs-section';
 import { LOG_TRIGGERS } from '@/lib/remote-logger';
 
 // ─── Types (mirror apps/api/src/lib/logs-analyzer.ts payloads) ───────────────
@@ -464,12 +466,14 @@ export function AdminLogsManager() {
       </Card>
 
       <Tabs value={tab} onValueChange={setTab} className="space-y-4">
-        <TabsList className="grid grid-cols-3 sm:grid-cols-5 w-full max-w-2xl">
+        <TabsList className="grid grid-cols-3 sm:grid-cols-6 w-full max-w-3xl">
           <TabsTrigger value="overview" className="gap-1"><Siren className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabOverview')}</span></TabsTrigger>
           <TabsTrigger value="errors" className="gap-1"><Bug className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabErrors')}</span></TabsTrigger>
           <TabsTrigger value="daily" className="gap-1"><CalendarDays className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabDaily')}</span></TabsTrigger>
           {/* 0.6.59 — dedicated VPS server-logs section (journal + deploy files + cross-analysis) */}
           <TabsTrigger value="server" className="gap-1"><Server className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabServer')}</span></TabsTrigger>
+          {/* 0.6.62 — translation agent action trail */}
+          <TabsTrigger value="agent" className="gap-1"><Bot className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabAgent')}</span></TabsTrigger>
           <TabsTrigger value="raw" className="gap-1"><ScrollText className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabRaw')}</span></TabsTrigger>
         </TabsList>
 
@@ -773,6 +777,11 @@ export function AdminLogsManager() {
         {/* ── Server logs (0.6.59 — VPS journal + deploy files + cross-analysis) ── */}
         <TabsContent value="server" className="space-y-4">
           <AdminServerLogsSection />
+        </TabsContent>
+
+        {/* ── Translation agent action trail (0.6.62) ─────────────────── */}
+        <TabsContent value="agent" className="space-y-4">
+          <AdminAgentLogsSection />
         </TabsContent>
 
         {/* ── Raw logs (the moved vault) ──────────────────────────────── */}
