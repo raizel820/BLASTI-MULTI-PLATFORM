@@ -1662,6 +1662,15 @@ model AppVersion {
   /// app.asar.unpacked/out/** (electron dlls, node_modules, prisma engine,
   /// data) — any change ⇒ full installer only
   nativeFingerprint String?
+  /// 0.6.58 — LEGACY-scope fingerprint (the pre-0.6.58 hash: EVERYTHING
+  /// outside app.asar + app.asar.unpacked/out/**, including the whole
+  /// app.asar.unpacked tree and resources/node_modules). CI uploads BOTH
+  /// scopes: new releases compare NEW-vs-NEW (patchable copies excluded —
+  /// asar/unpacked tree patches deliver them), while hops against OLD rows
+  /// (pre-0.6.58, which only have the legacy hash) compare
+  /// legacy-vs-legacy so the fingerprint-scope change never manufactures
+  /// spurious refusals or dead hops.
+  legacyNativeFingerprint String?
   // ── API Compatibility Map (0.6.31) ────────────────────────────────────────
   /// API protocol level this build was compiled against (null = unknown —
   /// compat then falls back to feature gates only). The /compat endpoint

@@ -56,11 +56,32 @@ if (!fs.existsSync(asarPath)) fail(`app.asar not found at ${asarPath}`);
 if (!fs.existsSync(unpackedTree)) fail(`app.asar.unpacked not found at ${unpackedTree}`);
 
 console.log('[refs] hashing native payload (everything outside app.asar + out/**)...');
-// nativeFingerprint — sha256 over the sorted [relPath, fileSha256] list of
-// EVERY packaged file EXCEPT resources/app.asar and the out/** web bundle.
-// Any change (electron dlls, node_modules, prisma engine, data) ⇒ the cloud
-// refuses to hand out deltas and devices fall back to the full installer.
-const skipForFingerprint = (rel) => rel === 'resources/app.asar' || rel.startsWith('resources/app.asar.unpacked/out/');
+// 0.6.58 — DUAL-SCOPE fingerprints, computed in ONE walk (per-file sha256
+// hashed once into both scopes):
+//
+//   nativeFingerprint (NEW scope — the honest guard)
+//     sha256 over the sorted [relPath, fileSha256] list of every packaged
+//     file EXCEPT resources/app.asar (asar delta delivers it) and the WHOLE
+//     resources/app.asar.unpacked/** + resources/node_modules/** (the tree
+//     patch delivers unpacked; the afterPack node_modules copy is a runtime
+//     FALLBACK only — db.js resolution prefers the asar/unpacked copies).
+//     Any change to the genuinely UNPATCHABLE bits (electron dlls, locales,
+//     resources/assets, resources/data) ⇒ the cloud refuses deltas and
+//     devices fall back to the full installer — correct.
+//     Schema/prisma changes live in asar + unpacked ⇒ deltas keep flowing.
+//
+//   legacyNativeFingerprint (OLD scope — pre-0.6.58 compatibility)
+//     the pre-0.6.58 hash: everything EXCEPT resources/app.asar and
+//     resources/app.asar.unpacked/out/** (i.e. the whole unpacked tree and
+//     resources/node_modules INCLUDED). Uploaded alongside the new scope so
+//     hops against older rows (which only store the old hash) compare
+//     legacy-vs-legacy instead of refusing on a scope mismatch. See
+//     compareNativeFingerprints() in apps/api/src/lib/app-version-deltas.ts.
+const skipForFingerprint = (rel) =>
+  rel === 'resources/app.asar' ||
+  rel.startsWith('resources/app.asar.unpacked/') ||
+  rel.startsWith('resources/node_modules/');
+const skipForLegacyFingerprint = (rel) => rel === 'resources/app.asar' || rel.startsWith('resources/app.asar.unpacked/out/');
 function walk(dir, rel, acc) {
   let entries = [];
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
@@ -75,14 +96,29 @@ const allFiles = [];
 walk(unpacked, '', allFiles);
 const fingerprintFiles = allFiles.filter((rel) => !skipForFingerprint(rel));
 fingerprintFiles.sort();
-const hash = createHash('sha256');
-for (const rel of fingerprintFiles) {
-  hash.update(rel);
-  hash.update('\u0000');
-  hash.update(createHash('sha256').update(fs.readFileSync(path.join(unpacked, rel))).digest('hex'));
-  hash.update('\u0000');
+const legacyFingerprintFiles = allFiles.filter((rel) => !skipForLegacyFingerprint(rel));
+legacyFingerprintFiles.sort();
+const fileShas = new Map(); // relPath → sha256 (computed once, reused by both scopes)
+const hashNew = createHash('sha256');
+const hashLegacy = createHash('sha256');
+for (const rel of allFiles.slice().sort()) {
+  const fileSha = createHash('sha256').update(fs.readFileSync(path.join(unpacked, rel))).digest('hex');
+  fileShas.set(rel, fileSha);
 }
-const nativeFingerprint = hash.digest('hex');
+for (const rel of fingerprintFiles) {
+  hashNew.update(rel);
+  hashNew.update('\u0000');
+  hashNew.update(fileShas.get(rel));
+  hashNew.update('\u0000');
+}
+for (const rel of legacyFingerprintFiles) {
+  hashLegacy.update(rel);
+  hashLegacy.update('\u0000');
+  hashLegacy.update(fileShas.get(rel));
+  hashLegacy.update('\u0000');
+}
+const nativeFingerprint = hashNew.digest('hex');
+const legacyNativeFingerprint = hashLegacy.digest('hex');
 
 console.log('[refs] building outref tree archive...');
 const outref = createOutref(unpackedTree);
@@ -98,6 +134,7 @@ fs.writeFileSync(outrefDest, outref.buf);
 const refs = {
   runtimeKey,
   nativeFingerprint,
+  legacyNativeFingerprint,
   asarSha256: await sha256OfFile(asarDest),
   asarSize: fs.statSync(asarDest).size,
   outrefSha256: createHash('sha256').update(outref.buf).digest('hex'),

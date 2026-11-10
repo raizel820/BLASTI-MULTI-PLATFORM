@@ -58,6 +58,50 @@ interface VersionRowLike {
   outrefStorageKey: string | null
   runtimeKey: string | null
   nativeFingerprint: string | null
+  /** 0.6.58 — legacy-scope fingerprint (pre-0.6.58 hash) for old rows. */
+  legacyNativeFingerprint?: string | null
+}
+
+/**
+ * 0.6.58 — SCOPE-AWARE fingerprint comparison.
+ *
+ * The fingerprint guard answers ONE question: "are the files this patch does
+ * NOT deliver byte-identical between the two releases?" The patch delivers
+ * app.asar + the WHOLE app.asar.unpacked tree, so the honest scope is
+ * "everything else" (electron bits, assets, data, resources/node_modules).
+ *
+ * Release refs 0.6.58+ carry BOTH scopes:
+ *   • nativeFingerprint        → new scope (patchable copies excluded)
+ *   • legacyNativeFingerprint  → the old, broader hash (unpacked + node_modules
+ *                                INCLUDED) so hops against pre-0.6.58 rows
+ *                                (which only store the old hash) stay
+ *                                comparable without a spurious refusal.
+ *
+ * Comparison matrix:
+ *   both rows have the new scope        → compare new-vs-new (correct guard)
+ *   either row lacks the new scope      → compare legacy-vs-legacy (old rows,
+ *                                         consistent scope on both sides)
+ *   scopes mixed with no legacy fallback → refuse (cannot prove safety)
+ * Returns { ok: true } or { ok: false, reason: 'native-bits-changed' | 'fingerprint-scope-mismatch' }.
+ */
+function compareNativeFingerprints(
+  prev: VersionRowLike,
+  cur: VersionRowLike,
+): { ok: true } | { ok: false; reason: string } {
+  const prevNew = (prev.nativeFingerprint || '').trim()
+  const curNew = (cur.nativeFingerprint || '').trim()
+  if (prevNew && curNew) {
+    return prevNew === curNew ? { ok: true } : { ok: false, reason: 'native-bits-changed' }
+  }
+  // At least one side predates the dual-scope refs — fall back to the legacy
+  // hash, which BOTH sides can provide (new releases upload it explicitly;
+  // old rows only ever had it as their primary hash).
+  const prevLegacy = (prev.legacyNativeFingerprint || prev.nativeFingerprint || '').trim()
+  const curLegacy = (cur.legacyNativeFingerprint || '').trim()
+  if (prevLegacy && curLegacy) {
+    return prevLegacy === curLegacy ? { ok: true } : { ok: false, reason: 'native-bits-changed' }
+  }
+  return { ok: false, reason: 'fingerprint-scope-mismatch' }
 }
 
 function resolveStored(key: string | null | undefined): string | null {
@@ -82,7 +126,10 @@ export async function generateDeltaBetween(
       if (!prev.asarStorageKey || !cur.asarStorageKey) return { ok: false, reason: 'missing-asar-ref' }
       if (!prev.outrefStorageKey || !cur.outrefStorageKey) return { ok: false, reason: 'missing-outref-ref' }
       if ((cur.runtimeKey || '') !== (prev.runtimeKey || '')) return { ok: false, reason: 'runtime-key-changed' }
-      if ((cur.nativeFingerprint || '') !== (prev.nativeFingerprint || '')) return { ok: false, reason: 'native-bits-changed' }
+      // 0.6.58 — scope-aware guard: new-scope when both rows carry it,
+      // legacy fallback for hops against pre-0.6.58 rows (see the helper).
+      const fpCheck = compareNativeFingerprints(prev, cur)
+      if (!fpCheck.ok) return { ok: false, reason: fpCheck.reason }
 
       const prevAsar = resolveStored(prev.asarStorageKey)
       const curAsar = resolveStored(cur.asarStorageKey)
@@ -204,8 +251,22 @@ export async function generateDeltaBetween(
  * Build the delta for the NEWLY published `cur` against EVERY plausible
  * published predecessor (usually just the immediately-previous release).
  * Called from activate + release-refs upload.
+ *
+ * 0.6.58 — OBSERVABILITY: every attempt (successes AND refusals) is persisted
+ * to the audit log (`APP_VERSION_DELTA_GENERATION`, userId 'system') so a
+ * release that ships without deltas is diagnosable from the admin audit UI
+ * FOREVER — the 0.6.53→0.6.55 and 0.6.56→0.6.57 field incidents stayed
+ * invisible for weeks because the per-hop outcome existed only in the CI log
+ * of a single run and in one transient HTTP response.
+ *
+ * `limit` caps how many predecessors get hops (CI self-heal passes 3 to keep
+ * the synchronous HTTP request short on the 2-core VPS; the admin repair UI
+ * and the default use all 10).
  */
-export async function generateDeltasForVersion(curId: string): Promise<Array<{ from: string; to: string; size: number; ok: boolean; reason?: string }>> {
+export async function generateDeltasForVersion(
+  curId: string,
+  opts?: { limit?: number },
+): Promise<Array<{ from: string; to: string; size: number; ok: boolean; reason?: string }>> {
   const cur = await db.appVersion.findUnique({ where: { id: curId } })
   if (!cur) return []
   // Predecessor lookup IGNORES isPublished on purpose: the activate
@@ -213,10 +274,11 @@ export async function generateDeltasForVersion(curId: string): Promise<Array<{ f
   // "published only" filter would never find the immediately-previous
   // release — the most valuable hop. What matters for a delta base is the
   // REFERENCE ARTIFACTS (asar/outref/apk), not the publication flag.
+  const takeLimit = Math.max(1, Math.min(10, opts?.limit ?? 10))
   const predecessors = await db.appVersion.findMany({
     where: { platform: cur.platform, id: { not: cur.id } },
     orderBy: { createdAt: 'desc' },
-    take: 10,
+    take: takeLimit,
   })
   const results: Array<{ from: string; to: string; size: number; ok: boolean; reason?: string }> = []
   for (const prev of predecessors) {
@@ -227,6 +289,30 @@ export async function generateDeltasForVersion(curId: string): Promise<Array<{ f
       ? { from: prev.version, to: cur.version, size: r.size, ok: true }
       : { from: prev.version, to: cur.version, size: 0, ok: false, reason: r.reason })
   }
+
+  // 0.6.58 — persist the outcome for the admin audit trail (best-effort:
+  // audit failures must never break generation or the calling request).
+  // userId stays NULL: AuditLog.userId is a nullable FK to User and no
+  // 'system' user row exists — a fabricated id would violate the FK and the
+  // entry would silently never persist.
+  try {
+    await db.auditLog.create({
+      data: {
+        userId: null,
+        action: 'APP_VERSION_DELTA_GENERATION',
+        entityType: 'APP_VERSION',
+        entityId: curId,
+        details: JSON.stringify({
+          platform: cur.platform,
+          version: cur.version,
+          generated: results.filter((r) => r.ok).length,
+          refusals: results.filter((r) => !r.ok).length,
+          results,
+        }),
+      },
+    })
+  } catch { /* audit is best-effort */ }
+
   return results
 }
 

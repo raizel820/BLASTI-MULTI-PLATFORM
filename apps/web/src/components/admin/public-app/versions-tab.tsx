@@ -25,6 +25,7 @@ import {
   PackageX,
   ShieldCheck,
   Eraser,
+  RefreshCw,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -89,6 +90,18 @@ interface VersionForm {
   isPublished: boolean;
   minAppVersion: string;
 }
+
+/** One hop of POST /api/app-versions/:id/regenerate-deltas. */
+interface DeltaGenResult {
+  from: string;
+  to: string;
+  size: number;
+  ok: boolean;
+  reason?: string;
+}
+
+/** Platforms the desktop release-patch pipeline covers (asar + tree patch). */
+const DELTA_DESKTOP_PLATFORMS = new Set(['windows', 'mac', 'linux', 'electron']);
 
 const EMPTY_FORM: VersionForm = {
   platform: 'android',
@@ -171,6 +184,13 @@ export function VersionsTab() {
   const [activating, setActivating] = useState<AppVersion | null>(null);
   const [deleting, setDeleting] = useState<AppVersion | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  // 0.6.58 — delta self-heal state (admin repair of the hop patches)
+  const [regenBusyId, setRegenBusyId] = useState<string | null>(null);
+  const [regenDialog, setRegenDialog] = useState<{
+    version: AppVersion;
+    results: DeltaGenResult[];
+  } | null>(null);
 
   // Cleanup state
   const [cleanupOpen, setCleanupOpen] = useState(false);
@@ -356,6 +376,43 @@ export function VersionsTab() {
       }
     },
     [fetchAll, t],
+  );
+
+  // ── 0.6.58 — Regenerate delta patches (self-heal) ──
+  // Rebuilds every hop (previous releases → this version) from the stored
+  // release refs. This is the ONE-CLICK repair for "delta: null
+  // (no-deltas-published)" — previously only reachable via a CLI script that
+  // needed the VPS deploy token.
+  const regenerateDeltas = useCallback(
+    async (v: AppVersion) => {
+      setRegenBusyId(v.id);
+      try {
+        const res = await apiFetch(`/api/app-versions/${v.id}/regenerate-deltas`, { method: 'POST' });
+        const data = await res.json().catch(() => null);
+        const results: DeltaGenResult[] = Array.isArray(data?.results) ? data.results : [];
+        if (res.ok && data?.success) {
+          const okCount = results.filter((r) => r.ok).length;
+          if (results.length > 0) {
+            setRegenDialog({ version: v, results });
+            if (okCount > 0) toast.success(t('publicAppRegenDeltasDone').replace('{count}', String(okCount)));
+            else toast.warning(t('publicAppRegenDeltasNone'));
+          } else {
+            toast.info(t('publicAppRegenDeltasEmpty'));
+          }
+        } else {
+          toast.error(t('publicAppRegenDeltasFailed'), {
+            description: data?.error || `HTTP ${res.status}`,
+          });
+        }
+      } catch (err) {
+        toast.error(t('publicAppRegenDeltasFailed'), {
+          description: err instanceof Error ? err.message : undefined,
+        });
+      } finally {
+        setRegenBusyId(null);
+      }
+    },
+    [t],
   );
 
   // ── Cleanup (installers + delta patches of the selected scope) ──
@@ -615,6 +672,25 @@ export function VersionsTab() {
                             >
                               <Pencil className="h-3.5 w-3.5" />
                             </Button>
+                            {/* 0.6.58 — one-click delta self-heal (desktop pipeline
+                                only; android hops rebuild at activation). */}
+                            {DELTA_DESKTOP_PLATFORMS.has(v.platform) && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 w-8 p-0"
+                                aria-label={t('publicAppRegenDeltas')}
+                                title={t('publicAppRegenDeltas')}
+                                disabled={busy || !!regenBusyId}
+                                onClick={() => void regenerateDeltas(v)}
+                              >
+                                {regenBusyId === v.id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <RefreshCw className="h-3.5 w-3.5" />
+                                )}
+                              </Button>
+                            )}
                             {!v.isPublished && (
                               <Button
                                 variant="outline"
@@ -845,6 +921,65 @@ export function VersionsTab() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* ─── 0.6.58 — Delta regeneration results ─── */}
+      <Dialog open={!!regenDialog} onOpenChange={(open) => { if (!open) setRegenDialog(null); }}>
+        <DialogContent className="max-w-xl max-h-[90vh] overflow-y-auto custom-scrollbar">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <RefreshCw className="h-4 w-4 text-primary" />
+              {t('publicAppRegenDeltasTitle')}
+            </DialogTitle>
+            <DialogDescription className="text-xs">
+              {regenDialog
+                ? t('publicAppRegenDeltasDesc')
+                    .replace('{platform}', platformLabel(regenDialog.version.platform, lang))
+                    .replace('{version}', regenDialog.version.version)
+                : ''}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-2">
+            {regenDialog?.results.map((r) => (
+              <div
+                key={`${r.from}->${r.to}`}
+                className="flex items-center justify-between gap-3 rounded-lg border p-3"
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <Badge
+                    className={
+                      r.ok
+                        ? 'bg-emerald-600 hover:bg-emerald-600 text-[10px] h-5 px-1.5'
+                        : 'bg-amber-600 hover:bg-amber-600 text-[10px] h-5 px-1.5'
+                    }
+                  >
+                    {r.ok ? t('publicAppRegenDeltasGenerated') : t('publicAppRegenDeltasRefused')}
+                  </Badge>
+                  <span className="text-sm font-mono" dir="ltr">
+                    {r.from} → {r.to}
+                  </span>
+                </div>
+                <div className="text-xs text-muted-foreground shrink-0" dir="ltr">
+                  {r.ok
+                    ? formatFileSize(r.size)
+                    : r.reason || '—'}
+                </div>
+              </div>
+            ))}
+            {regenDialog && regenDialog.results.some((r) => !r.ok) && (
+              <p className="text-[11px] text-muted-foreground leading-relaxed">
+                {t('publicAppRegenDeltasHint')}
+              </p>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" className="h-10" onClick={() => setRegenDialog(null)}>
+              {t('publicAppCancel')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* ─── Cleanup dialog (installers + delta patches of the selected scope) ───
           Wide two-column layout: selection on the start side, live preview

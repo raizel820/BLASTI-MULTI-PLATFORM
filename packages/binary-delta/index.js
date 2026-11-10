@@ -310,7 +310,12 @@ async function applyDeltaToFile(oldPath, deltaBuf, outPath, opts = {}) {
   const hash = crypto.createHash('sha256');
   try {
     // Output pre-sized so progress can be derived from size alone.
-    fs.truncateSync(out, header.toSize);
+    // ⚠️ ftruncate (fd-based), NOT truncate: Node ≥ 24 removed the implicit
+    // fd overload of truncateSync (ERR_INVALID_ARG_TYPE "path" = number) —
+    // this call is on BOTH the server self-verify path (a throw here makes
+    // generateDeltaBetween refuse EVERY hop with "error:…" → the table stays
+    // empty → no-deltas-published) and the desktop client's hop applier.
+    fs.ftruncateSync(out, header.toSize);
     const copyBuf = Buffer.alloc(1024 * 1024);
     let p = 0;
     let o = 0;

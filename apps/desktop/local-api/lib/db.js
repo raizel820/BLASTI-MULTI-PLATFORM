@@ -61,6 +61,27 @@ const DESKTOP_SCHEMA_PATH = path.join(MONOREPO_ROOT, 'apps', 'desktop', 'prisma'
 const DESKTOP_GENERATED_CLIENT_DIR = path.join(MONOREPO_ROOT, 'apps', 'desktop', 'prisma', 'generated', 'client')
 
 /**
+ * 0.6.58 — PACKAGED location of the SAME desktop-generated client.
+ *
+ * asarUnpack ships prisma/generated/** to
+ *   <resources>/app.asar.unpacked/prisma/generated/client
+ * and DELTA UPDATES deliver schema changes exactly there (the outref tree
+ * patch covers the WHOLE unpacked tree). This candidate MUST win in a
+ * packaged install — the old MONOREPO_ROOT-based path above never exists in
+ * production (see the field main.log: "Desktop schema not found: ...\\apps\\
+ * desktop\\prisma\\schema.prisma"), so resolution fell through to the
+ * afterPack copy in resources/node_modules/.prisma/client — a location tree
+ * patches can NEVER update, which would leave the runtime on a STALE schema
+ * after a schema-changing delta. Preferring the unpacked copy makes the
+ * tree-patched client operative and keeps resources/node_modules as a pure
+ * fallback.
+ */
+const DESKTOP_GENERATED_CLIENT_DIR_PACKAGED =
+  process.resourcesPath
+    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'prisma', 'generated', 'client')
+    : null
+
+/**
  * Legacy output dir (pre-PostgreSQL era): the shared client used to be
  * copied here. Kept ONLY as a low-priority resolution candidate so databases
  * prepared by older builds keep working.
@@ -354,7 +375,10 @@ let prismaRequireError = null
  */
 function tryResolvePrismaClient() {
   const candidatePaths = [
-    // 1. DESKTOP-generated SQLite client (the correct one for the local DB)
+    // 0. 0.6.58 — PACKAGED unpacked copy FIRST (delta-updatable location —
+    // see the note on DESKTOP_GENERATED_CLIENT_DIR_PACKAGED above).
+    ...(DESKTOP_GENERATED_CLIENT_DIR_PACKAGED ? [DESKTOP_GENERATED_CLIENT_DIR_PACKAGED] : []),
+    // 1. DESKTOP-generated SQLite client (dev layout — the correct one)
     DESKTOP_GENERATED_CLIENT_DIR,
     // 2. Legacy stable dir (older builds copied the shared client here)
     GENERATED_CLIENT_DIR,

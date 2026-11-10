@@ -48,6 +48,11 @@ for (let i = 2; i < process.argv.length; i++) {
 const apiUrl = String(args['api-url'] || process.env.BLASTI_API_URL || '').replace(/\/+$/, '');
 const token = String(args.token || process.env.BLASTI_DEPLOY_TOKEN || process.env.DEPLOY_TOKEN || '');
 const platform = String(args.platform || 'windows');
+// 0.6.58 — cap how many predecessors get hop patches (1..10). The CI
+// self-heal step passes 3 so the server-side synchronous diffing stays short;
+// manual repairs omit the flag and cover all 10.
+const limitRaw = parseInt(String(args.limit || ''), 10);
+const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(10, limitRaw) : null;
 
 const say = (msg) => console.log(`[regenerate-deltas] ${msg}`);
 const fail = (code, msg) => { console.error(`[regenerate-deltas] ERROR: ${msg}`); process.exit(code); };
@@ -77,8 +82,8 @@ async function main() {
   say(`latest published: v${check.latestVersion} (id ${versionId}, ${((check.fileSize || 0) / 1048576).toFixed(1)} MB installer)`);
 
   // 2) Rebuild the hop patches.
-  say('calling regenerate-deltas (x-deploy-token) …');
-  const regRes = await fetch(`${apiUrl}/api/app-versions/${versionId}/regenerate-deltas`, {
+  say(`calling regenerate-deltas (x-deploy-token${limit ? `, limit=${limit}` : ''}) …`);
+  const regRes = await fetch(`${apiUrl}/api/app-versions/${versionId}/regenerate-deltas${limit ? `?limit=${limit}` : ''}`, {
     method: 'POST',
     headers: { 'x-deploy-token': token },
   });
@@ -107,10 +112,12 @@ async function main() {
       actionable.push(`v${r.from} has no release refs on the server — re-run the "push-installers" workflow (or publish-installer.mjs) so refs for that version are uploaded, then run this tool again.`);
     } else if (r.reason === 'ref-file-missing') {
       actionable.push(`the stored refs for v${r.from} were removed from storage (cleanup?) — re-push them via the push-installers workflow, then run this tool again.`);
-    } else if (r.reason === 'runtime-key-changed' || r.reason === 'native-bits-changed') {
+    } else if (r.reason === 'runtime-key-changed' || r.reason === 'native-bits-changed' || r.reason === 'fingerprint-scope-mismatch') {
       say(`   ↳ this one is BY DESIGN: electron runtime / native bits changed between v${r.from} and v${r.to} — a full installer is the correct path for that hop.`);
     } else if (r.reason === 'older-than-predecessor') {
       say(`   ↳ skipped: not a forward semver hop.`);
+    } else if (String(r.reason || '').startsWith('error:')) {
+      actionable.push(`generation ERRORED for v${r.from} → v${r.to}: ${r.reason} — check the VPS API logs (memory/disk/DB) and re-run this tool.`);
     }
   }
 

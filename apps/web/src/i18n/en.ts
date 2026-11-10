@@ -4409,6 +4409,17 @@ const en: Record<TranslationKeys, string> = {
   publicAppDeleteConfirmBody: "The {version} record of {platform} will be permanently deleted — and its installer file will be deleted from server storage too. This cannot be undone.",
   publicAppNoVersions: "No version records yet",
   publicAppNoVersionsHint: "Create a new version or upload an installer from the Installers tab.",
+  // 0.6.58 — delta self-heal (regenerate hop patches)
+  publicAppRegenDeltas: "Regenerate delta patches",
+  publicAppRegenDeltasTitle: "Delta patches rebuilt",
+  publicAppRegenDeltasDesc: "Hop patches for {platform} {version}, rebuilt from the stored release refs. Devices on covered source versions now receive differential updates.",
+  publicAppRegenDeltasDone: "{count} delta patch(es) generated",
+  publicAppRegenDeltasNone: "No delta patch could be generated — see the reasons below",
+  publicAppRegenDeltasEmpty: "No older release of this platform has reference artifacts to diff against",
+  publicAppRegenDeltasFailed: "Delta regeneration failed",
+  publicAppRegenDeltasGenerated: "Generated",
+  publicAppRegenDeltasRefused: "Refused",
+  publicAppRegenDeltasHint: "Refusals by design (runtime-key-changed / native-bits-changed) mean the release changed bits the patch cannot deliver (electron runtime, assets, data) — those hops correctly use the full installer. missing-asar-ref / missing-outref-ref mean the older release lacks reference artifacts — re-publish it so refs upload, then regenerate again.",
 
   // Tab 3 — Update Pusher
   publicAppPusherTitle: "New update push",

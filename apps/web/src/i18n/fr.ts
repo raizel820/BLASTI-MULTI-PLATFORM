@@ -4411,6 +4411,17 @@ const fr: Record<TranslationKeys, string> = {
   publicAppDeleteConfirmBody: "La fiche {version} de {platform} sera définitivement supprimée — et son fichier installateur sera également supprimé du stockage du serveur. Action irréversible.",
   publicAppNoVersions: "Aucune fiche de version",
   publicAppNoVersionsHint: "Créez une nouvelle version ou téléversez un installateur depuis l'onglet Installateurs.",
+  // 0.6.58 — auto-réparation delta (régénération des correctifs de saut)
+  publicAppRegenDeltas: "Régénérer les correctifs delta",
+  publicAppRegenDeltasTitle: "Correctifs delta régénérés",
+  publicAppRegenDeltasDesc: "Correctifs de saut pour {version} sur {platform}, reconstruits depuis les références stockées. Les appareils sur les versions couvertes reçoivent désormais des mises à jour différentielles.",
+  publicAppRegenDeltasDone: "{count} correctif(s) delta généré(s)",
+  publicAppRegenDeltasNone: "Aucun correctif delta n'a pu être généré — voir les raisons ci-dessous",
+  publicAppRegenDeltasEmpty: "Aucune version plus ancienne de cette plateforme ne possède de références à comparer",
+  publicAppRegenDeltasFailed: "Échec de la régénération delta",
+  publicAppRegenDeltasGenerated: "Généré",
+  publicAppRegenDeltasRefused: "Refusé",
+  publicAppRegenDeltasHint: "Les refus BY DESIGN (runtime-key-changed / native-bits-changed) signifient que la version a changé des éléments que le correctif ne peut pas livrer (runtime Electron, assets, données) — ces sauts utilisent à juste titre l'installateur complet. missing-asar-ref / missing-outref-ref signifient que la version antérieure n'a pas de références — republiez-la pour téléverser les refs, puis régénérez à nouveau.",
 
   // Tab 3 — Update Pusher
   publicAppPusherTitle: "Nouvelle poussée de mise à jour",

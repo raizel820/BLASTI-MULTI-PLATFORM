@@ -4409,6 +4409,17 @@ const ar = {
   publicAppDeleteConfirmBody: "سيُحذف سجل إصدار {version} لمنصة {platform} نهائياً — وسيُحذف ملف المثبّت من تخزين الخادم أيضاً. لا يمكن التراجع.",
   publicAppNoVersions: "لا توجد إصدارات مسجلة بعد",
   publicAppNoVersionsHint: "أنشئ إصداراً جديداً أو ارفع مثبّتاً من تبويب المثبّتات.",
+  // 0.6.58 — الإصلاح الذاتي للتحديث التفاضلي (إعادة توليد رقع الوثبات)
+  publicAppRegenDeltas: "إعادة توليد رقع التحديث التفاضلي",
+  publicAppRegenDeltasTitle: "أُعيد توليد رقع الدلتا",
+  publicAppRegenDeltasDesc: "رقع الوثبات للإصدار {version} على {platform}، أعيد بناؤها من ملفات المرجع المخزّنة. الأجهزة على الإصدارات المغطّاة ستستقبل تحديثات تفاضلية الآن.",
+  publicAppRegenDeltasDone: "تم توليد {count} رقعة تفاضلية",
+  publicAppRegenDeltasNone: "تعذّر توليد أي رقعة تفاضلية — انظر الأسباب أدناه",
+  publicAppRegenDeltasEmpty: "لا يوجد إصدار أقدم لهذه المنصة يحمل ملفات مرجع يمكن المقارنة معها",
+  publicAppRegenDeltasFailed: "فشلت إعادة توليد الدلتا",
+  publicAppRegenDeltasGenerated: "تولّدت",
+  publicAppRegenDeltasRefused: "مرفوضة",
+  publicAppRegenDeltasHint: "الرفوض بالتصميم (runtime-key-changed / native-bits-changed) تعني أن الإصدار غيّر أجزاء لا تستطيع الرقعة توصيلها (وقت تشغيل Electron، الأصول، البيانات) — وهذه الوثبات تستخدم المُثبِّت الكامل بشكل صحيح. أما missing-asar-ref / missing-outref-ref فتعني أن الإصدار الأقدم يفتقر لملفات المرجع — أعد نشره لترفع المراجع ثم أعد التوليد.",
 
   // Tab 3 — Update Pusher
   publicAppPusherTitle: "دفع تحديث جديد",

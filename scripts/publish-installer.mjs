@@ -172,6 +172,9 @@ try {
         }
         if (args['runtime-key']) refForm.append('runtimeKey', String(args['runtime-key']));
         if (args['native-fingerprint']) refForm.append('nativeFingerprint', String(args['native-fingerprint']));
+        // 0.6.58 — legacy-scope hash so hops against pre-0.6.58 rows keep a
+        // consistent comparison basis (see compareNativeFingerprints()).
+        if (args['legacy-native-fingerprint']) refForm.append('legacyNativeFingerprint', String(args['legacy-native-fingerprint']));
         const refRes = await fetch(
           `${apiUrl}/api/app-versions/${v.id}/release-refs`,
           {
@@ -189,7 +192,7 @@ try {
             for (const g of gen) {
               if (g.ok) {
                 console.log(`[publish] delta v${g.from} → v${g.to} generated (${((g.size || 0) / 1048576).toFixed(2)} MB)`);
-              } else if (g.reason === 'runtime-key-changed' || g.reason === 'native-bits-changed') {
+              } else if (g.reason === 'runtime-key-changed' || g.reason === 'native-bits-changed' || g.reason === 'fingerprint-scope-mismatch') {
                 console.log(`[publish] delta v${g.from} → v${g.to} skipped BY DESIGN (${g.reason}) — full installer is the correct path for that hop`);
               } else {
                 console.warn(`[publish] WARN: delta v${g.from} → v${g.to} refused (${g.reason}) — run scripts/regenerate-deltas.mjs after fixing the base version's refs`);

@@ -733,10 +733,16 @@ app.post('/:id/release-refs', async (c) => {
     const formData = await c.req.formData()
     const runtimeKey = String(formData.get('runtimeKey') ?? '').slice(0, 80)
     const nativeFingerprint = String(formData.get('nativeFingerprint') ?? '').slice(0, 80)
+    // 0.6.58 — CI uploads BOTH fingerprint scopes (see make-release-refs.mjs):
+    // nativeFingerprint = new scope (patchable copies excluded),
+    // legacyNativeFingerprint = the pre-0.6.58 broader hash so hops against
+    // older rows keep a consistent comparison basis.
+    const legacyNativeFingerprint = String(formData.get('legacyNativeFingerprint') ?? '').slice(0, 80)
 
     const data: Record<string, string | number> = {}
     if (runtimeKey) data.runtimeKey = runtimeKey
     if (nativeFingerprint) data.nativeFingerprint = nativeFingerprint
+    if (legacyNativeFingerprint) data.legacyNativeFingerprint = legacyNativeFingerprint
 
     for (const field of ['asar', 'outref'] as const) {
       const file = formData.get(field) as File | null
@@ -794,7 +800,12 @@ app.post('/:id/regenerate-deltas', async (c) => {
     await requireAdminOrDeployToken(c)
     const appVersion = await db.appVersion.findUnique({ where: { id: c.req.param('id') } })
     if (!appVersion) return c.json({ success: false, error: 'Version not found' }, 404)
-    const results = await generateDeltasForVersion(appVersion.id)
+    // 0.6.58 — ?limit=N caps how many predecessors get hops (1..10). The CI
+    // self-heal step passes 3 so the synchronous request stays short on the
+    // 2-core VPS; admin repairs and the default use all 10.
+    const limitRaw = parseInt(c.req.query('limit') || '', 10)
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined
+    const results = await generateDeltasForVersion(appVersion.id, { limit })
     return c.json({ success: true, results })
   } catch (error: unknown) {
     const err = authErrorResponse(error)

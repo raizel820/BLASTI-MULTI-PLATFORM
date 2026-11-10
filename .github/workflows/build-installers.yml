@@ -357,6 +357,14 @@ jobs:
             REF_ARGS="--asar release-refs/app.asar --outref release-refs/outref.bin"
             REF_ARGS="$REF_ARGS --runtime-key $(node -p "JSON.parse(require('fs').readFileSync('release-refs/refs.json','utf8')).runtimeKey")"
             REF_ARGS="$REF_ARGS --native-fingerprint $(node -p "JSON.parse(require('fs').readFileSync('release-refs/refs.json','utf8')).nativeFingerprint")"
+            # 0.6.58 — legacy-scope hash (pre-0.6.58 comparison basis for hops
+            # against older rows); tolerated missing on stale refs artifacts.
+            LEGACY_FP="$(node -p "try{JSON.parse(require('fs').readFileSync('release-refs/refs.json','utf8')).legacyNativeFingerprint||''}catch{''}")"
+            if [ -n "$LEGACY_FP" ]; then
+              REF_ARGS="$REF_ARGS --legacy-native-fingerprint $LEGACY_FP"
+            else
+              echo "::warning::refs.json lacks legacyNativeFingerprint — re-run 'Build release refs' with the updated make-release-refs.mjs"
+            fi
             echo "delta refs found — differential updates will be generated"
           else
             echo "no delta refs artifact — desktop updates fall back to full installers"
@@ -386,6 +394,42 @@ jobs:
             fi
           done
           echo "uploaded=$uploaded" >> "$GITHUB_OUTPUT"
+
+      # ── 0.6.58 — DELTA SELF-HEAL ────────────────────────────────────────────
+      # The delta patches for the JUST-UPLOADED desktop version were already
+      # generated inline by the refs upload; this step retro-repairs the
+      # LATEST PUBLISHED version per platform (the previous release, still
+      # active while the new one is a draft) so a hop that failed at its own
+      # release time gets rebuilt on the very next push. Android APK deltas
+      # have NO inline generation (the APK is its own base) — they are built
+      # at activation and repaired HERE. Exit 3 = actionable refusals (missing
+      # refs / storage / generation errors) → the run goes RED with the exact
+      # remediation; by-design refusals (electron/runtime changes) stay green.
+      # limit=3 keeps the server-side diffing short on the 2-core VPS.
+      - name: Delta self-heal (regenerate patches for the published release)
+        if: always() && steps.upload.outputs.uploaded == 'true'
+        env:
+          BLASTI_API_URL: ${{ secrets.BLASTI_API_URL }}
+          BLASTI_DEPLOY_TOKEN: ${{ secrets.BLASTI_DEPLOY_TOKEN }}
+        run: |
+          fatal=0
+          for platform in windows android-debug; do
+            code=0
+            node scripts/regenerate-deltas.mjs \
+              --api-url "$BLASTI_API_URL" \
+              --token "$BLASTI_DEPLOY_TOKEN" \
+              --platform "$platform" \
+              --limit 3 || code=$?
+            if [ "$code" -eq 0 ]; then
+              echo "delta self-heal OK (${platform})"
+            elif [ "$code" -eq 3 ]; then
+              echo "::error::delta self-heal reported ACTIONABLE refusals for ${platform} (missing refs / storage / generation errors) — the previous release still cannot serve delta updates. See the log above for the per-hop reasons and the remediation."
+              fatal=1
+            else
+              echo "::warning::delta self-heal could not run for ${platform} (HTTP/auth, exit ${code}) — the admin Versions tab repair (Regenerate delta patches) remains available."
+            fi
+          done
+          exit $fatal
 
       # The installers were built from THIS commit — tell the VPS to pull and
       # rebuild right now (server-update + server-doctor in the transient
