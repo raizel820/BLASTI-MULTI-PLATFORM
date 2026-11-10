@@ -103,6 +103,8 @@ import { adminBackupRoutes } from './routes/admin-backups'
 import { adminResetRoutes } from './routes/admin-reset'
 // logs-1 — per-UID account log vault (ingestion from every app + admin browsing)
 import { logRoutes } from './routes/logs'
+// 0.6.59 — VPS server-logs (journal + deploy files) for the Logs Manager
+import { serverLogRoutes } from './routes/server-logs'
 import { startBackupScheduler, stopBackupScheduler } from './workers/backup-scheduler'
 import { ensureCategoryDictionary } from './lib/ensure-category-dictionary'
 // UID-0.6.14 — boot-time backfill: every account without a UID gets one
@@ -112,6 +114,8 @@ import { adminServicePolicyRoutes } from './routes/admin-service-policies'
 // P0-5: kiosk routes MOUNTED (mount-or-delete decision) — offline-queue.ts calls /api/kiosk/join; unmounted it 404'd
 import { kioskRoutes } from './routes/kiosk'
 import { appVersionRoutes } from './routes/app-versions'
+// Delta Updates (0.6.59) — boot-time self-heal of missing hop patches
+import { scheduleBootDeltaSelfHeal } from './lib/app-version-deltas'
 // Public App Settings rebuild — real device install tracking + update pusher
 import { appInstallRoutes } from './routes/app-installs'
 import { systemStatusRoutes } from './routes/system-status'
@@ -692,6 +696,10 @@ app.route('/api/admin/backups', adminBackupRoutes)
 app.route('/api/admin/reset', adminResetRoutes)
 // logs-1 — account log vault: POST /api/logs (ingest), GET /api/logs[/uid[/file]] (admin browse)
 app.route('/api/logs', logRoutes)
+// 0.6.59 — server-logs section: /api/logs/server (sources/view/download/analysis)
+// MUST be mounted on a DIFFERENT base than logRoutes' param routes — /api/logs/server
+// would otherwise be captured by GET /api/logs/:uid. Separate mount keeps both live.
+app.route('/api/logs-server', serverLogRoutes)
 // Task C — Services Management: per-agency-type service policies
 app.route('/api/admin/service-policies', adminServicePolicyRoutes)
 // P0-5: public kiosk walk-in surface (device tokens handled inside)
@@ -1655,6 +1663,12 @@ httpServer.listen(PORT, HOST, async () => {
   // Start the auto-backup scheduler (Backup Manager)
   startBackupScheduler()
   console.log('   💾 Backup scheduler started (60s interval)')
+
+  // Delta Updates (0.6.59) — rebuild missing hop patches 45 s after boot
+  // (only for platforms with a published target and ZERO delta rows — cheap
+  // no-op on healthy chains). Best-effort; never blocks or crashes boot.
+  scheduleBootDeltaSelfHeal()
+  console.log('   🔀 Delta self-heal scheduled (45s after boot, missing-chains only)')
 })
 
 // ─── Graceful Shutdown ──────────────────────────────────────────────────────

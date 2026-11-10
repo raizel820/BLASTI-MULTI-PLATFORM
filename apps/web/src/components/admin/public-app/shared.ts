@@ -325,6 +325,60 @@ export function fileVersionOf(file: InstallerDiskFile): string {
   return file.parsed?.version || file.version?.version || '';
 }
 
+// ─── 0.6.59 — Artifact-category filter (android/desktop × installer/delta/ref) ──
+
+/**
+ * The six update-artifact categories the admin filters by (user request):
+ * each combines the DEVICE GROUP (android vs desktop) with the artifact KIND
+ * (installable installer vs delta patch vs delta-reference file). iOS joins
+ * the mobile group; every other platform is desktop.
+ */
+export type ArtifactCategory =
+  | 'android-installer'
+  | 'android-delta'
+  | 'android-ref'
+  | 'desktop-installer'
+  | 'desktop-delta'
+  | 'desktop-ref';
+
+export const ARTIFACT_CATEGORIES: ArtifactCategory[] = [
+  'android-installer',
+  'android-delta',
+  'android-ref',
+  'desktop-installer',
+  'desktop-delta',
+  'desktop-ref',
+];
+
+const MOBILE_GROUP_PLATFORMS = new Set(['android', 'android-debug', 'ios']);
+
+/** Device group of a bucket file — 'mobile' | 'desktop' | null (unknown platform). */
+export function artifactGroupOf(file: InstallerDiskFile): 'desktop' | 'mobile' | null {
+  const platform = file.platform || file.parsed?.platform || '';
+  if (!platform) return null;
+  return MOBILE_GROUP_PLATFORMS.has(platform) ? 'mobile' : 'desktop';
+}
+
+/** Does the file belong to the requested update-artifact category? */
+export function matchesArtifactCategory(file: InstallerDiskFile, category: ArtifactCategory): boolean {
+  const group = artifactGroupOf(file);
+  const kind = file.kind ?? 'unknown';
+  switch (category) {
+    case 'android-installer':
+      return group === 'mobile' && kind === 'installer';
+    case 'android-delta':
+      return group === 'mobile' && kind === 'delta';
+    case 'android-ref':
+      return group === 'mobile' && kind === 'ref';
+    case 'desktop-installer':
+      return group === 'desktop' && kind === 'installer';
+    case 'desktop-delta':
+      return group === 'desktop' && kind === 'delta';
+    case 'desktop-ref':
+      return group === 'desktop' && kind === 'ref';
+  }
+}
+
 /** Numeric semver compare of "X.Y.Z" strings (missing parts count as 0). */
 export function compareSemver(a: string, b: string): number {
   const pa = a.split('.').map((n) => parseInt(n, 10) || 0);

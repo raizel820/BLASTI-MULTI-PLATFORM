@@ -112,6 +112,41 @@ function resolveStored(key: string | null | undefined): string | null {
   try { return fs.statSync(full).isFile() ? full : null } catch { return null }
 }
 
+/**
+ * 0.6.59 — CHEAP hop diagnosis for the admin "Delta Health" view.
+ *
+ * Runs the EXACT guard sequence of generateDeltaBetween (same order, same
+ * reason codes) WITHOUT touching the big artifacts — no asar diffing, no
+ * self-verify, no patch build. Disk existence of the stored refs IS checked
+ * (stat only), so "why is this hop not served?" is answerable in one request
+ * instead of requiring the operator to run a generation that may take
+ * minutes on an 80 MB asar.
+ */
+export function diagnoseDeltaHop(
+  prev: VersionRowLike,
+  cur: VersionRowLike,
+): { ok: boolean; reason?: string } {
+  const platform = cur.platform
+  if (platform !== prev.platform) return { ok: false, reason: 'platform-mismatch' }
+  if (DESKTOP_PLATFORMS.has(platform)) {
+    if (!prev.asarStorageKey || !cur.asarStorageKey) return { ok: false, reason: 'missing-asar-ref' }
+    if (!prev.outrefStorageKey || !cur.outrefStorageKey) return { ok: false, reason: 'missing-outref-ref' }
+    if ((cur.runtimeKey || '') !== (prev.runtimeKey || '')) return { ok: false, reason: 'runtime-key-changed' }
+    const fpCheck = compareNativeFingerprints(prev, cur)
+    if (!fpCheck.ok) return { ok: false, reason: fpCheck.reason }
+    if (!resolveStored(prev.asarStorageKey) || !resolveStored(cur.asarStorageKey)) return { ok: false, reason: 'ref-file-missing' }
+    if (!resolveStored(prev.outrefStorageKey) || !resolveStored(cur.outrefStorageKey)) return { ok: false, reason: 'ref-file-missing' }
+    return { ok: true }
+  }
+  if (APK_PLATFORMS.has(platform)) {
+    if (!prev.fileStorageKey || !cur.fileStorageKey) return { ok: false, reason: 'missing-apk' }
+    if (!prev.fileHash || !cur.fileHash) return { ok: false, reason: 'missing-apk-hash' }
+    if (!resolveStored(prev.fileStorageKey) || !resolveStored(cur.fileStorageKey)) return { ok: false, reason: 'apk-file-missing' }
+    return { ok: true }
+  }
+  return { ok: false, reason: 'platform-unsupported' }
+}
+
 /** Build + persist the delta row for (prev → cur). Returns null when impossible. */
 export async function generateDeltaBetween(
   prev: VersionRowLike,
@@ -419,3 +454,60 @@ export async function computeDeltaChain(platform: string, fromVersion: string, t
 }
 
 export { readOutrefHeader, createOutref }
+
+/**
+ * 0.6.59 — BOOT-TIME DELTA SELF-HEAL.
+ *
+ * The field pattern behind "the VPS still serves full installers" was almost
+ * always: refs arrived (or were repaired) at a moment when no delta
+ * generation ran afterwards, and the AppVersionDelta table stayed empty until
+ * the next CI push — which may be days later. This runs ONCE per process,
+ * 45 s after boot (so restarts triggered by server-update finish first), and
+ * for every delta-capable platform:
+ *
+ *   1. finds the latest PUBLISHED version (the chain target devices see),
+ *   2. SKIPS the platform entirely when delta rows already exist for it
+ *      (generation is expensive on desktop — 80 MB asar diffs; never burn
+ *      boot time on a healthy chain),
+ *   3. rebuilds the hop patches for the 3 nearest predecessors (same cap the
+ *      CI self-heal uses to keep the synchronous work short on the 2-core
+ *      VPS).
+ *
+ * Everything is best-effort: any error is logged and swallowed — a failing
+ * self-heal must never delay or break the API boot.
+ */
+let bootSelfHealStarted = false
+export function scheduleBootDeltaSelfHeal(): void {
+  if (bootSelfHealStarted) return
+  bootSelfHealStarted = true
+  const run = async () => {
+    const platforms = ['windows', 'mac', 'linux', 'electron', 'android', 'android-debug']
+    for (const platform of platforms) {
+      try {
+        const candidates = await db.appVersion.findMany({
+          where: { platform, isPublished: true },
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+        })
+        const target = candidates[0]
+        if (!target) continue
+        const existingRows = await db.appVersionDelta.count({ where: { platform } })
+        if (existingRows > 0) continue // chain already alive — nothing to heal
+        const preds = await db.appVersion.findMany({
+          where: { platform, id: { not: target.id } },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+        })
+        if (preds.length === 0) continue // first release — nothing to diff against
+        console.log(`[app-version-deltas] boot self-heal: platform ${platform} has no delta rows — rebuilding hops for v${target.version}`)
+        const results = await generateDeltasForVersion(target.id, { limit: 3 })
+        const ok = results.filter((r) => r.ok).length
+        const refused = results.filter((r) => !r.ok)
+        console.log(`[app-version-deltas] boot self-heal: ${platform} v${target.version} → ${ok} hop(s) generated, ${refused.length} refused${refused.length ? ` (${refused.map((r) => `${r.from}:${r.reason}`).join(', ')})` : ''}`)
+      } catch (err) {
+        console.warn(`[app-version-deltas] boot self-heal: ${platform} failed:`, (err as Error).message)
+      }
+    }
+  }
+  setTimeout(() => { run().catch(() => { /* guarded per platform */ }) }, 45_000).unref?.()
+}

@@ -18,7 +18,11 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 // permanently shadowed newer CI builds and devices were told "up to date".
 import { pickLatestAppVersion } from '../lib/app-version-rank'
 // Delta Updates (0.6.30) — differential patch graph + generation
-import { computeDeltaChain, generateDeltasForVersion, compareVersionStrings } from '../lib/app-version-deltas'
+import { computeDeltaChain, generateDeltasForVersion, compareVersionStrings, diagnoseDeltaHop } from '../lib/app-version-deltas'
+// 0.6.59 — the running API's version for the delta-health report
+const API_VERSION = (
+  JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf-8')) as { version?: string }
+).version ?? 'unknown'
 // API Compatibility Map (0.6.31) — app↔server capability matrix
 import { evaluateCompatibility, seedDefaultGates, CURRENT_SERVER_API_LEVEL, MIN_SUPPORTED_API_LEVEL } from '../lib/api-compat'
 
@@ -807,6 +811,157 @@ app.post('/:id/regenerate-deltas', async (c) => {
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined
     const results = await generateDeltasForVersion(appVersion.id, { limit })
     return c.json({ success: true, results })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── GET /app-versions/delta-health — per-hop delta diagnosis (0.6.59) ──────
+//
+// Answers the operator question "WHY is the VPS still serving full
+// installers?" in ONE request, without running any expensive diffing:
+//
+//   • per delta-capable platform: the latest PUBLISHED target version and
+//     whether its own refs are present in the DB AND on disk,
+//   • every forward hop to that target: the guard verdicts (refs present,
+//     ref FILES on disk, runtimeKey equal, fingerprint comparable) — the
+//     exact sequence generateDeltaBetween refuses on,
+//   • whether a delta row exists, whether its patch file is on disk, and
+//     whether a client on that source version would actually receive a chain
+//     (computeDeltaChain — the SAME resolver /check uses),
+//   • the last APP_VERSION_DELTA_GENERATION audit outcome per target, so a
+//     refusal seen in CI months ago is still visible.
+//
+// Registered BEFORE GET /:id (Hono matches in registration order).
+
+app.get('/delta-health', async (c) => {
+  try {
+    await requireAdmin(c)
+
+    const DELTA_PLATFORMS = ['windows', 'mac', 'linux', 'electron', 'android', 'android-debug']
+    const requested = c.req.query('platform')
+    const platforms = requested && DELTA_PLATFORMS.includes(requested) ? [requested] : DELTA_PLATFORMS
+
+    // Last audit outcome per (entityId = AppVersion id): the 0.6.58
+    // observability entry records generated/refused counts + per-hop results.
+    const auditRows = await db.auditLog.findMany({
+      where: { action: 'APP_VERSION_DELTA_GENERATION' },
+      orderBy: { createdAt: 'desc' },
+      take: 120,
+    })
+    const auditByEntity = new Map<string, { at: string; generated: number; refusals: number; results: unknown[] }>()
+    for (const row of auditRows) {
+      if (!row.entityId || auditByEntity.has(row.entityId)) continue
+      try {
+        const details = JSON.parse(row.details || '{}') as { generated?: number; refusals?: number; results?: unknown[] }
+        auditByEntity.set(row.entityId, {
+          at: row.createdAt instanceof Date ? row.createdAt.toISOString() : String(row.createdAt),
+          generated: Number(details.generated ?? 0),
+          refusals: Number(details.refusals ?? 0),
+          results: Array.isArray(details.results) ? details.results : [],
+        })
+      } catch { /* malformed details — skip */ }
+    }
+
+    const rowLike = (v: Record<string, unknown>) => v as unknown as Parameters<typeof diagnoseDeltaHop>[0]
+    const out: unknown[] = []
+
+    for (const platform of platforms) {
+      const versions = await db.appVersion.findMany({
+        where: { platform },
+        orderBy: { createdAt: 'desc' },
+        take: 12,
+      })
+      if (versions.length === 0) continue
+
+      // The chain target = latest PUBLISHED version (exactly what /check serves).
+      // `as Record<string, any>`: the generated Prisma types are unavailable in
+      // every environment this route compiles in (same class as the /check
+      // route above) — the fields below are guarded with ?? null anyway.
+      const target = pickLatestAppVersion(
+        versions.filter((v: { isPublished?: boolean }) => v.isPublished),
+      ) as unknown as Record<string, any>
+      if (!target) {
+        out.push({ platform, target: null, hops: [], lastAudit: null, note: 'no-published-version' })
+        continue
+      }
+
+      const deltaRows = (await db.appVersionDelta.findMany({ where: { platform } })) as Array<Record<string, any>>
+      const rowsByPair = new Map(deltaRows.map((r) => [`${r.fromVersion}->${r.toVersion}`, r] as const))
+
+      const targetRow = rowLike(target as unknown as Record<string, unknown>)
+      const hops: unknown[] = []
+      for (const prev of versions as Array<Record<string, any>>) {
+        if (prev.id === target.id) continue
+        if (compareVersionStrings(prev.version, target.version) >= 0) continue
+        const prevRow = rowLike(prev as unknown as Record<string, unknown>)
+        const diagnosis = diagnoseDeltaHop(prevRow, targetRow)
+        const row = (rowsByPair.get(`${prev.version}->${target.version}`) as Record<string, any> | undefined) || null
+        let deltaFileOnDisk: boolean | null = null
+        let deltaSizeMatchesDisk: boolean | null = null
+        if (row?.fileStorageKey) {
+          const p = resolveBinaryPath(row.fileStorageKey)
+          deltaFileOnDisk = !!p
+          if (p) deltaSizeMatchesDisk = fs.statSync(p).size === row.fileSize
+        }
+        // The client view: would /check actually hand this source a chain?
+        let clientChain: { reachable: boolean; hopCount: number; reason: string } = { reachable: false, hopCount: 0, reason: 'unchecked' }
+        try {
+          const chain = await computeDeltaChain(platform, prev.version, target.id)
+          clientChain = { reachable: !!chain.chain, hopCount: chain.chain?.hops.length ?? 0, reason: chain.reason }
+        } catch (e) {
+          clientChain = { reachable: false, hopCount: 0, reason: `error:${String((e as Error).message).slice(0, 60)}` }
+        }
+        hops.push({
+          from: prev.version,
+          fromVersionId: prev.id,
+          fromCreatedAt: prev.createdAt,
+          guards: {
+            verdict: diagnosis.ok ? 'ready' : 'refused',
+            reason: diagnosis.reason ?? null,
+            prevRefs: {
+              asarKey: prev.asarStorageKey ?? null,
+              outrefKey: prev.outrefStorageKey ?? null,
+              apkKey: prev.fileStorageKey ?? null,
+              runtimeKey: prev.runtimeKey ?? null,
+              nativeFingerprint: prev.nativeFingerprint ?? null,
+              legacyNativeFingerprint: (prev as unknown as { legacyNativeFingerprint?: string | null }).legacyNativeFingerprint ?? null,
+            },
+          },
+          deltaRow: row
+            ? { id: row.id, fileName: row.fileName, fileSize: row.fileSize, fileHash: row.fileHash, createdAt: row.createdAt }
+            : null,
+          deltaFileOnDisk,
+          deltaSizeMatchesDisk,
+          clientChain,
+        })
+      }
+
+      out.push({
+        platform,
+        target: {
+          id: target.id,
+          version: target.version,
+          isPublished: target.isPublished,
+          publishedAt: target.publishedAt,
+          runtimeKey: target.runtimeKey ?? null,
+          nativeFingerprint: target.nativeFingerprint ?? null,
+          legacyNativeFingerprint: (target as unknown as { legacyNativeFingerprint?: string | null }).legacyNativeFingerprint ?? null,
+          asarKey: target.asarStorageKey ?? null,
+          asarOnDisk: target.asarStorageKey ? !!resolveBinaryPath(target.asarStorageKey) : null,
+          outrefKey: target.outrefStorageKey ?? null,
+          outrefOnDisk: target.outrefStorageKey ? !!resolveBinaryPath(target.outrefStorageKey) : null,
+          apkKey: target.fileStorageKey ?? null,
+          apkOnDisk: target.fileStorageKey ? !!resolveBinaryPath(target.fileStorageKey) : null,
+        },
+        hops,
+        totalDeltaRows: deltaRows.length,
+        lastAudit: auditByEntity.get(target.id) ?? null,
+      })
+    }
+
+    return c.json({ success: true, server: { apiVersion: API_VERSION, now: new Date().toISOString() }, platforms: out })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

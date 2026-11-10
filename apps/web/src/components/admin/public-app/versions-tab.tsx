@@ -26,6 +26,10 @@ import {
   ShieldCheck,
   Eraser,
   RefreshCw,
+  Stethoscope,
+  Wrench,
+  CheckCircle2,
+  XCircle,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -98,6 +102,58 @@ interface DeltaGenResult {
   size: number;
   ok: boolean;
   reason?: string;
+}
+
+// ─── 0.6.59 — Delta Health (GET /api/app-versions/delta-health) ────────────
+
+interface DeltaHealthHop {
+  from: string;
+  fromVersionId: string;
+  fromCreatedAt: string;
+  guards: {
+    verdict: 'ready' | 'refused';
+    reason: string | null;
+    prevRefs: {
+      asarKey: string | null;
+      outrefKey: string | null;
+      apkKey: string | null;
+      runtimeKey: string | null;
+      nativeFingerprint: string | null;
+      legacyNativeFingerprint: string | null;
+    };
+  };
+  deltaRow: { id: string; fileName: string; fileSize: number; fileHash: string; createdAt: string } | null;
+  deltaFileOnDisk: boolean | null;
+  deltaSizeMatchesDisk: boolean | null;
+  clientChain: { reachable: boolean; hopCount: number; reason: string };
+}
+
+interface DeltaHealthPlatform {
+  platform: string;
+  note?: string;
+  target: {
+    id: string;
+    version: string;
+    isPublished: boolean;
+    publishedAt: string | null;
+    runtimeKey: string | null;
+    nativeFingerprint: string | null;
+    legacyNativeFingerprint: string | null;
+    asarKey: string | null;
+    asarOnDisk: boolean | null;
+    outrefKey: string | null;
+    outrefOnDisk: boolean | null;
+    apkKey: string | null;
+    apkOnDisk: boolean | null;
+  } | null;
+  hops: DeltaHealthHop[];
+  totalDeltaRows: number;
+  lastAudit: { at: string; generated: number; refusals: number; results: DeltaGenResult[] } | null;
+}
+
+interface DeltaHealthPayload {
+  server: { apiVersion: string; now: string };
+  platforms: DeltaHealthPlatform[];
 }
 
 /** Platforms the desktop release-patch pipeline covers (asar + tree patch). */
@@ -191,6 +247,13 @@ export function VersionsTab() {
     version: AppVersion;
     results: DeltaGenResult[];
   } | null>(null);
+
+  // 0.6.59 — Delta Health diagnosis dialog
+  const [healthOpen, setHealthOpen] = useState(false);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [healthData, setHealthData] = useState<DeltaHealthPayload | null>(null);
+  const [healthError, setHealthError] = useState<string | null>(null);
+  const [healthRepairBusy, setHealthRepairBusy] = useState<string | null>(null);
 
   // Cleanup state
   const [cleanupOpen, setCleanupOpen] = useState(false);
@@ -415,6 +478,58 @@ export function VersionsTab() {
     [t],
   );
 
+  // ── 0.6.59 — Delta Health: WHY is a platform serving full installers? ──
+  const fetchDeltaHealth = useCallback(async () => {
+    setHealthLoading(true);
+    setHealthError(null);
+    try {
+      const res = await apiFetch('/api/app-versions/delta-health');
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success) {
+        setHealthData({ server: data.server, platforms: data.platforms || [] });
+      } else {
+        setHealthError(data?.error || `HTTP ${res.status}`);
+      }
+    } catch (err) {
+      setHealthError(err instanceof Error ? err.message : 'Network error');
+    } finally {
+      setHealthLoading(false);
+    }
+  }, []);
+
+  const openDeltaHealth = useCallback(() => {
+    setHealthData(null);
+    setHealthOpen(true);
+    void fetchDeltaHealth();
+  }, [fetchDeltaHealth]);
+
+  /** Repair button inside the health dialog: rebuild hops for a target id. */
+  const repairFromHealth = useCallback(
+    async (targetId: string, version: string) => {
+      setHealthRepairBusy(targetId);
+      try {
+        const res = await apiFetch(`/api/app-versions/${targetId}/regenerate-deltas`, { method: 'POST' });
+        const data = await res.json().catch(() => null);
+        const results: DeltaGenResult[] = Array.isArray(data?.results) ? data.results : [];
+        const okCount = results.filter((r) => r.ok).length;
+        if (res.ok && data?.success) {
+          if (okCount > 0) toast.success(t('publicAppRegenDeltasDone').replace('{count}', String(okCount)));
+          else toast.warning(t('publicAppRegenDeltasNone'));
+          await fetchDeltaHealth();
+        } else {
+          toast.error(t('publicAppRegenDeltasFailed'), { description: data?.error || `HTTP ${res.status}` });
+        }
+      } catch (err) {
+        toast.error(t('publicAppRegenDeltasFailed'), {
+          description: err instanceof Error ? err.message : undefined,
+        });
+      } finally {
+        setHealthRepairBusy(null);
+      }
+    },
+    [fetchDeltaHealth, t],
+  );
+
   // ── Cleanup (installers + delta patches of the selected scope) ──
   // Pickers are fed from the DISK inventory (storage-versions) so versions
   // that exist only as files on disk stay cleanable; the DB rows are the
@@ -548,6 +663,16 @@ export function VersionsTab() {
             <CardDescription className="text-xs">{t('publicAppVersionsDesc')}</CardDescription>
           </div>
           <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-9 w-full sm:w-auto"
+              onClick={openDeltaHealth}
+              disabled={loading}
+            >
+              {healthLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Stethoscope className="h-4 w-4" />}
+              {t('publicAppDeltaHealth')}
+            </Button>
             <Button
               size="sm"
               variant="outline"
@@ -977,6 +1102,202 @@ export function VersionsTab() {
             <Button variant="outline" className="h-10" onClick={() => setRegenDialog(null)}>
               {t('publicAppCancel')}
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ─── 0.6.59 — Delta Health diagnosis ───
+          Per-platform hop matrix: guard verdicts + delta row/disk status +
+          the client-side chain result — answers "why full installers?". */}
+      <Dialog open={healthOpen} onOpenChange={(open) => { if (!open) setHealthOpen(false); }}>
+        <DialogContent className="max-w-2xl w-[calc(100vw-2rem)] max-h-[90vh] overflow-y-auto custom-scrollbar">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <Stethoscope className="h-4 w-4 text-primary" />
+              {t('publicAppDeltaHealthTitle')}
+            </DialogTitle>
+            <DialogDescription className="text-xs">{t('publicAppDeltaHealthDesc')}</DialogDescription>
+          </DialogHeader>
+
+          {healthLoading && (
+            <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              {t('publicAppDeltaHealthChecking')}
+            </div>
+          )}
+
+          {!healthLoading && healthError && (
+            <div className="flex flex-col items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-6 text-center">
+              <AlertTriangle className="h-6 w-6 text-destructive" />
+              <p className="text-sm text-destructive font-medium">{t('publicAppDeltaHealthFailed')}</p>
+              <p className="text-xs text-muted-foreground" dir="ltr">{healthError}</p>
+              <Button variant="outline" size="sm" onClick={() => void fetchDeltaHealth()}>
+                {t('publicAppRetry')}
+              </Button>
+            </div>
+          )}
+
+          {!healthLoading && healthData && healthData.platforms.length === 0 && (
+            <p className="py-8 text-center text-sm text-muted-foreground">{t('publicAppDeltaHealthEmpty')}</p>
+          )}
+
+          {!healthLoading && healthData && (
+            <div className="space-y-4">
+              <p className="text-[11px] text-muted-foreground" dir="ltr">
+                API v{healthData.server.apiVersion} · {new Date(healthData.server.now).toLocaleString()}
+              </p>
+              {healthData.platforms.map((p) => {
+                const ready = p.hops.filter((h) => h.guards.verdict === 'ready').length;
+                const served = p.hops.filter((h) => h.clientChain.reachable).length;
+                const Icon = platformIcon(p.platform);
+                return (
+                  <div key={p.platform} className="rounded-lg border p-3 space-y-3">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Icon className="h-4 w-4 text-primary shrink-0" />
+                        <span className="text-sm font-semibold">{platformLabel(p.platform, lang)}</span>
+                        {p.target && (
+                          <Badge variant="outline" className="text-[10px] font-mono h-5 px-1.5" dir="ltr">
+                            v{p.target.version}
+                          </Badge>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <Badge variant="secondary" className="text-[10px] h-5">{t('publicAppDeltaHealthRows')}: {p.totalDeltaRows}</Badge>
+                        <Badge
+                          className={`text-[10px] h-5 px-1.5 ${served > 0 ? 'bg-emerald-600 hover:bg-emerald-600' : 'bg-amber-600 hover:bg-amber-600'}`}
+                        >
+                          {served > 0
+                            ? t('publicAppDeltaHealthServed').replace('{count}', String(served))
+                            : t('publicAppDeltaHealthNoneServed')}
+                        </Badge>
+                        {p.target && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 text-xs"
+                            disabled={healthRepairBusy === p.target.id}
+                            onClick={() => void repairFromHealth(p.target!.id, p.target!.version)}
+                          >
+                            {healthRepairBusy === p.target.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Wrench className="h-3 w-3" />}
+                            {t('publicAppDeltaHealthRepair')}
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+
+                    {p.note && <p className="text-xs text-muted-foreground">{t('publicAppDeltaHealthNoPublished')}</p>}
+
+                    {p.target && (
+                      <div className="flex flex-wrap gap-1.5">
+                        {DELTA_DESKTOP_PLATFORMS.has(p.platform) ? (
+                          <>
+                            <Badge variant={p.target.asarOnDisk ? 'secondary' : 'destructive'} className="text-[10px] h-5 gap-1">
+                              {p.target.asarOnDisk ? <CheckCircle2 className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
+                              asar {p.target.asarOnDisk ? t('publicAppDeltaHealthOnDisk') : t('publicAppDeltaHealthMissing')}
+                            </Badge>
+                            <Badge variant={p.target.outrefOnDisk ? 'secondary' : 'destructive'} className="text-[10px] h-5 gap-1">
+                              {p.target.outrefOnDisk ? <CheckCircle2 className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
+                              outref {p.target.outrefOnDisk ? t('publicAppDeltaHealthOnDisk') : t('publicAppDeltaHealthMissing')}
+                            </Badge>
+                          </>
+                        ) : (
+                          <Badge variant={p.target.apkOnDisk ? 'secondary' : 'destructive'} className="text-[10px] h-5 gap-1">
+                            {p.target.apkOnDisk ? <CheckCircle2 className="h-3 w-3" /> : <XCircle className="h-3 w-3" />}
+                            APK {p.target.apkOnDisk ? t('publicAppDeltaHealthOnDisk') : t('publicAppDeltaHealthMissing')}
+                          </Badge>
+                        )}
+                      </div>
+                    )}
+
+                    {p.hops.length > 0 && (
+                      <div className="rounded-md border overflow-hidden">
+                        <Table>
+                          <TableHeader>
+                            <TableRow>
+                              <TableHead className="text-[10px] py-1.5">{t('publicAppDeltaHealthHop')}</TableHead>
+                              <TableHead className="text-[10px] py-1.5">{t('publicAppDeltaHealthGuards')}</TableHead>
+                              <TableHead className="text-[10px] py-1.5">{t('publicAppDeltaHealthPatch')}</TableHead>
+                              <TableHead className="text-[10px] py-1.5">{t('publicAppDeltaHealthClient')}</TableHead>
+                            </TableRow>
+                          </TableHeader>
+                          <TableBody>
+                            {p.hops.map((h) => (
+                              <TableRow key={h.from}>
+                                <TableCell className="py-1.5">
+                                  <span className="text-[11px] font-mono" dir="ltr">{h.from} → v{p.target?.version}</span>
+                                </TableCell>
+                                <TableCell className="py-1.5">
+                                  <div className="flex items-center gap-1">
+                                    {h.guards.verdict === 'ready' ? (
+                                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
+                                    ) : (
+                                      <XCircle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
+                                    )}
+                                    <span className="text-[10px] font-mono text-muted-foreground truncate" dir="ltr" title={h.guards.reason ?? ''}>
+                                      {h.guards.reason ?? 'ready'}
+                                    </span>
+                                  </div>
+                                </TableCell>
+                                <TableCell className="py-1.5">
+                                  {h.deltaRow ? (
+                                    h.deltaFileOnDisk === false ? (
+                                      <Badge variant="destructive" className="text-[10px] h-5 px-1.5">{t('publicAppDeltaHealthMissing')}</Badge>
+                                    ) : (
+                                      <span className="text-[10px] font-mono text-muted-foreground" dir="ltr">
+                                        {formatFileSize(h.deltaRow.fileSize)}
+                                      </span>
+                                    )
+                                  ) : (
+                                    <span className="text-[10px] text-muted-foreground">—</span>
+                                  )}
+                                </TableCell>
+                                <TableCell className="py-1.5">
+                                  {h.clientChain.reachable ? (
+                                    <Badge className="bg-emerald-600 hover:bg-emerald-600 text-[10px] h-5 px-1.5">
+                                      {t('publicAppDeltaHealthDelta').replace('{count}', String(h.clientChain.hopCount))}
+                                    </Badge>
+                                  ) : (
+                                    <Badge variant="outline" className="text-[10px] h-5 px-1.5 font-mono" dir="ltr" title={h.clientChain.reason}>
+                                      {t('publicAppDeltaHealthFull')}
+                                    </Badge>
+                                  )}
+                                </TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </div>
+                    )}
+
+                    {p.lastAudit && (
+                      <p className="text-[10px] text-muted-foreground" dir="ltr">
+                        {t('publicAppDeltaHealthAudit')
+                          .replace('{at}', new Date(p.lastAudit.at).toLocaleString())
+                          .replace('{ok}', String(p.lastAudit.generated))
+                          .replace('{refused}', String(p.lastAudit.refusals))}
+                      </p>
+                    )}
+
+                    {ready === 0 && p.hops.length > 0 && (
+                      <p className="text-[11px] text-muted-foreground leading-relaxed">{t('publicAppDeltaHealthHint')}</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <DialogFooter>
+            <div className="flex w-full flex-col gap-2 sm:flex-row sm:justify-between">
+              <Button variant="outline" className="h-9" onClick={() => void fetchDeltaHealth()} disabled={healthLoading}>
+                <RefreshCw className="h-4 w-4" />
+                {t('publicAppRefresh')}
+              </Button>
+              <Button variant="outline" className="h-9" onClick={() => setHealthOpen(false)}>
+                {t('publicAppCancel')}
+              </Button>
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>

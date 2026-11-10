@@ -43,6 +43,8 @@ import {
   ArrowDown,
   ArrowUp,
   SlidersHorizontal,
+  Smartphone,
+  Monitor,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -93,7 +95,10 @@ import {
   platformIcon,
   platformLabel,
   isDeltaRelated,
+  matchesArtifactCategory,
+  ARTIFACT_CATEGORIES,
   compareDiskFiles,
+  type ArtifactCategory,
   type InstallerDiskFile,
   type InstallerSortKey,
   type InstallerSortDir,
@@ -188,6 +193,8 @@ export function InstallersTab() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<string>('all');
   const [typeFilter, setTypeFilter] = useState<string>('all');
+  // 0.6.59 — artifact-category filter (android/desktop × installer/delta/ref)
+  const [categoryFilter, setCategoryFilter] = useState<string>('all');
 
   // ── 0.6.50 — view prefs: hide delta-related files + sort order ──
   const [hideDelta, setHideDelta] = useState<boolean>(() => loadViewPrefs().hideDelta);
@@ -241,14 +248,32 @@ export function InstallersTab() {
     return () => clearInterval(interval);
   }, [fetchFiles]);
 
-  // ── 0.6.50 — delta filter applied FIRST: when hideDelta is on, delta
-  // patches + blockmap/asar refs never enter the grouping, the type options
-  // or ANY of the counts (platform chips, type list, totals stay honest).
-  const baseFiles = useMemo(
-    () => (hideDelta ? files.filter((f) => !isDeltaRelated(f)) : files),
+  // ── 0.6.59 — category filter applied FIRST: picking a delta/ref category
+  // deliberately OVERRIDES the "hide delta files" checkbox (the admin asked
+  // to see exactly those rows); otherwise the hide-delta view is preserved.
+  const baseFiles = useMemo(() => {
+    if (categoryFilter !== 'all') {
+      return files.filter((f) => matchesArtifactCategory(f, categoryFilter as ArtifactCategory));
+    }
+    return hideDelta ? files.filter((f) => !isDeltaRelated(f)) : files;
+  }, [files, hideDelta, categoryFilter]);
+  const hiddenDeltaCount = useMemo(
+    () => (hideDelta ? files.filter((f) => isDeltaRelated(f)).length : 0),
     [files, hideDelta],
   );
-  const hiddenDeltaCount = files.length - baseFiles.length;
+
+  // Honest per-category totals — computed from the FULL file list, never
+  // affected by the hide-delta checkbox or the other filters.
+  const categoryCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const cat of ARTIFACT_CATEGORIES) counts.set(cat, 0);
+    for (const f of files) {
+      for (const cat of ARTIFACT_CATEGORIES) {
+        if (matchesArtifactCategory(f, cat)) counts.set(cat, (counts.get(cat) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }, [files]);
 
   // ── Grouping: one group per platform present, rows sorted by the view sort ──
   const groups = useMemo(() => {
@@ -510,6 +535,40 @@ export function InstallersTab() {
                       <Badge variant="secondary" className="ms-1.5 h-4 px-1.5 text-[10px] rounded-full">
                         {g.rows.length}
                       </Badge>
+                    </Button>
+                  );
+                })}
+              </div>
+
+              {/* 0.6.59 — Artifact-category filter: the six update-artifact
+                  families (android/desktop × installer/delta/ref files). */}
+              <div className="flex flex-wrap items-center gap-2" role="group" aria-label={t('publicAppFilterCategory')}>
+                <Button
+                  size="sm"
+                  variant={categoryFilter === 'all' ? 'default' : 'outline'}
+                  className="h-8 rounded-full px-3 text-xs"
+                  onClick={() => setCategoryFilter('all')}
+                >
+                  {t('publicAppFilterAllCategories')}
+                </Button>
+                {ARTIFACT_CATEGORIES.map((cat) => {
+                  const count = categoryCounts.get(cat) ?? 0;
+                  const CatIcon = cat.startsWith('android') ? Smartphone : Monitor;
+                  return (
+                    <Button
+                      key={cat}
+                      size="sm"
+                      variant={categoryFilter === cat ? 'default' : 'outline'}
+                      className="h-8 rounded-full px-3 text-xs"
+                      onClick={() => setCategoryFilter(cat)}
+                    >
+                      <CatIcon className="h-3.5 w-3.5" />
+                      {t(`publicAppCat_${cat.replace('-', '_')}` as Parameters<typeof t>[0])}
+                      {count > 0 && (
+                        <Badge variant="secondary" className="ms-1.5 h-4 px-1.5 text-[10px] rounded-full">
+                          {count}
+                        </Badge>
+                      )}
                     </Button>
                   );
                 })}
