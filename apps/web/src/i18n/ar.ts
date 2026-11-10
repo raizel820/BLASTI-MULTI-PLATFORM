@@ -4419,7 +4419,7 @@ const ar = {
   publicAppRegenDeltasFailed: "فشلت إعادة توليد الدلتا",
   publicAppRegenDeltasGenerated: "تولّدت",
   publicAppRegenDeltasRefused: "مرفوضة",
-  publicAppRegenDeltasHint: "الرفوض بالتصميم (runtime-key-changed / native-bits-changed) تعني أن الإصدار غيّر أجزاء لا تستطيع الرقعة توصيلها (وقت تشغيل Electron، الأصول، البيانات) — وهذه الوثبات تستخدم المُثبِّت الكامل بشكل صحيح. أما missing-asar-ref / missing-outref-ref فتعني أن الإصدار الأقدم يفتقر لملفات المرجع — أعد نشره لترفع المراجع ثم أعد التوليد.",
+  publicAppRegenDeltasHint: "runtime-key-changed تعني أن بيئة electron تغيّرت — المُثبِّت الكامل صحيح ولا يمكن تجاوزه. أما native-bits-changed / fingerprint-scope-mismatch فتعني أن البصمات المخزنة لا تستطيع إثبات أمان القفزة (بصمات ما قبل 0.6.59 كانت تضم Blasti.exe الذي تتغير موارده مع كل بناء) — افتح «فحص التفاضلية» واستخدم «فرض التفاضلية» إذا كانت الإصدارات غيّرت كود التطبيق فقط. وmissing-asar-ref / missing-outref-ref تعني أن الإصدار الأقدم يفتقر لملفات المرجع — أعد نشره لترفع المراجع ثم أعد التوليد.",
 
   // Tab 3 — Update Pusher
   publicAppPusherTitle: "دفع تحديث جديد",
@@ -4834,6 +4834,12 @@ const ar = {
   publicAppDeltaHealthFull: "مُثبِّت كامل",
   publicAppDeltaHealthAudit: "آخر نتيجة توليد: {at} — نجح {ok} · رُفض {refused}",
   publicAppDeltaHealthHint: "كل القفزات مرفوضة — راجع سبب كل رفض أعلاه: مراجع مفقودة (أعد رفع الإصدار عبر CI) أو تغيّر بيئة التشغيل/البصمة (مُثبِّت كامل هو المسار الصحيح لتلك القفزة).",
+  // ─── 0.6.59 — رفض البصمة القابل للتجاوز ──────────────────────────────
+  publicAppDeltaHealthOverridable: "قابل للتجاوز",
+  publicAppDeltaHealthOverride: "فرض التفاضلية",
+  publicAppDeltaHealthOverrideConfirm: "توليد {count} قفزة تفاضلية مرفوضة بسبب البصمة بالقوة؟ استخدم ذلك فقط إذا كانت هذه الإصدارات غيّرت كود التطبيق (asar/unpacked) دون تغيير بيئة electron أو الموارد المرفقة. كل قفزة مفرضة تُسجَّل في سجل التدقيق.",
+  publicAppDeltaHealthOverrideHint: "أسباب رفض البصمة (native-bits-changed / fingerprint-scope-mismatch) موسومة قابلة للتجاوز: بصمات ما قبل 0.6.59 كانت تضم Blasti.exe الذي يتغير موارده مع كل بناء — إذا كانت هذه الإصدارات غيّرت كود التطبيق فقط، استخدم «فرض التفاضلية» لتوليد الرقع.",
+  publicAppDeltaHealthOverrideDone: "وُلّدت {count} رقعة تفاضلية بالقوة (تجاوز بصمة)",
 
   // ─── 0.6.59 — Public Apps: artifact-category filters ─────────────────────
   publicAppFilterCategory: "فئة ملفات التحديث",

@@ -25,6 +25,8 @@
  *     --api-url https://blastidz.online \
  *     --token "$DEPLOY_TOKEN" \
  *     [--platform windows]        # default: windows
+ *     [--limit N]                 # cap predecessors (1..10)
+ *     [--allow-fingerprint-risk]  # force fingerprint-refused hops (0.6.59)
  *
  * Exit codes: 0 = at least one delta generated (or generation genuinely
  * impossible for a documented reason), 2 = auth/HTTP failure, 3 = versions
@@ -53,6 +55,17 @@ const platform = String(args.platform || 'windows');
 // manual repairs omit the flag and cover all 10.
 const limitRaw = parseInt(String(args.limit || ''), 10);
 const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(10, limitRaw) : null;
+// 0.6.59 — consciously override fingerprint refusals (native-bits-changed /
+// fingerprint-scope-mismatch). ROOT CAUSE CONTEXT: pre-0.6.59 fingerprints
+// hashed Blasti.exe, whose embedded version resource (rcedit) changes on
+// EVERY build — so no two versions could ever share a hash and every desktop
+// hop was refused. That is fixed for NEW releases (v3 spec, exe excluded),
+// but hops FROM older rows can never be hash-verified: their stored hashes
+// include the stamped exe irreversibly. When the operator has verified that
+// two releases only differ in asar/unpacked/stamp bits (normal app-code
+// releases), this flag forces those hops anyway; runtime-key-changed and
+// missing refs stay absolute. Every overridden hop is audited server-side.
+const allowFingerprintRisk = args['allow-fingerprint-risk'] === true || String(args['allow-fingerprint-risk'] || '') === '1';
 
 const say = (msg) => console.log(`[regenerate-deltas] ${msg}`);
 const fail = (code, msg) => { console.error(`[regenerate-deltas] ERROR: ${msg}`); process.exit(code); };
@@ -82,8 +95,11 @@ async function main() {
   say(`latest published: v${check.latestVersion} (id ${versionId}, ${((check.fileSize || 0) / 1048576).toFixed(1)} MB installer)`);
 
   // 2) Rebuild the hop patches.
-  say(`calling regenerate-deltas (x-deploy-token${limit ? `, limit=${limit}` : ''}) …`);
-  const regRes = await fetch(`${apiUrl}/api/app-versions/${versionId}/regenerate-deltas${limit ? `?limit=${limit}` : ''}`, {
+  say(`calling regenerate-deltas (x-deploy-token${limit ? `, limit=${limit}` : ''}${allowFingerprintRisk ? ', allowFingerprintRisk=1' : ''}) …`);
+  const regQuery = new URLSearchParams();
+  if (limit) regQuery.set('limit', String(limit));
+  if (allowFingerprintRisk) regQuery.set('allowFingerprintRisk', '1');
+  const regRes = await fetch(`${apiUrl}/api/app-versions/${versionId}/regenerate-deltas${regQuery.toString() ? `?${regQuery.toString()}` : ''}`, {
     method: 'POST',
     headers: { 'x-deploy-token': token },
   });
@@ -100,11 +116,13 @@ async function main() {
     process.exit(0);
   }
   let okCount = 0;
+  let overriddenCount = 0;
   const actionable = [];
   for (const r of results) {
     if (r.ok) {
       okCount += 1;
-      say(`✅ delta v${r.from} → v${r.to} generated (${((r.size || 0) / 1048576).toFixed(2)} MB)`);
+      if (r.overridden) overriddenCount += 1;
+      say(`✅ delta v${r.from} → v${r.to} generated (${((r.size || 0) / 1048576).toFixed(2)} MB)${r.overridden ? ' [fingerprint-risk OVERRIDE]' : ''}`);
       continue;
     }
     say(`❌ delta v${r.from} → v${r.to} REFUSED: ${r.reason}`);
@@ -112,8 +130,13 @@ async function main() {
       actionable.push(`v${r.from} has no release refs on the server — re-run the "push-installers" workflow (or publish-installer.mjs) so refs for that version are uploaded, then run this tool again.`);
     } else if (r.reason === 'ref-file-missing') {
       actionable.push(`the stored refs for v${r.from} were removed from storage (cleanup?) — re-push them via the push-installers workflow, then run this tool again.`);
-    } else if (r.reason === 'runtime-key-changed' || r.reason === 'native-bits-changed' || r.reason === 'fingerprint-scope-mismatch') {
-      say(`   ↳ this one is BY DESIGN: electron runtime / native bits changed between v${r.from} and v${r.to} — a full installer is the correct path for that hop.`);
+    } else if (r.reason === 'runtime-key-changed') {
+      say(`   ↳ this one is BY DESIGN and NOT overridable: the electron runtime changed between v${r.from} and v${r.to} — a full installer is the correct path for that hop.`);
+    } else if (r.reason === 'native-bits-changed' || r.reason === 'fingerprint-scope-mismatch') {
+      say(`   ↳ 0.6.59 context: pre-0.6.59 fingerprints hashed Blasti.exe, whose version resource changes on EVERY build — v${r.from}'s stored hash can never match a newer release's hash, so this hop cannot be automatically verified.`);
+      if (!allowFingerprintRisk) {
+        say(`   ↳ if v${r.from} → v${r.to} only changed app code (asar/unpacked) — the normal case — re-run with --allow-fingerprint-risk to force this hop (audited server-side).`);
+      }
     } else if (r.reason === 'older-than-predecessor') {
       say(`   ↳ skipped: not a forward semver hop.`);
     } else if (String(r.reason || '').startsWith('error:')) {
@@ -122,14 +145,15 @@ async function main() {
   }
 
   if (okCount > 0) {
-    say(`done — ${okCount}/${results.length} delta(s) generated. Desktop clients on the covered source versions now receive differential updates from /check.`);
+    say(`done — ${okCount}/${results.length} delta(s) generated${overriddenCount ? ` (${overriddenCount} via fingerprint-risk override)` : ''}. Desktop clients on the covered source versions now receive differential updates from /check.`);
     if (actionable.length) console.warn(`[regenerate-deltas] note: ${actionable.length} predecessor(s) still need refs re-pushed — see the ❌ lines above.`);
     process.exit(0);
   }
   if (actionable.length) {
     fail(3, `no delta could be generated — ${actionable.join(' | ')}`);
   }
-  say('no delta generated, but every refusal is by-design (runtime/native changes) — full installers remain correct there.');
+  say('no delta generated, but every refusal is by-design (electron runtime changes) — full installers remain correct there.');
+  say('hint: fingerprint refusals (native-bits-changed / fingerprint-scope-mismatch) CAN be forced with --allow-fingerprint-risk once you verify the two releases only differ in app-code bits.');
   process.exit(0);
 }
 

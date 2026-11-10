@@ -18,7 +18,7 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 // permanently shadowed newer CI builds and devices were told "up to date".
 import { pickLatestAppVersion } from '../lib/app-version-rank'
 // Delta Updates (0.6.30) — differential patch graph + generation
-import { computeDeltaChain, generateDeltasForVersion, compareVersionStrings, diagnoseDeltaHop } from '../lib/app-version-deltas'
+import { computeDeltaChain, generateDeltasForVersion, compareVersionStrings, diagnoseDeltaHop, fingerprintSpecOf } from '../lib/app-version-deltas'
 // 0.6.59 — the running API's version for the delta-health report
 const API_VERSION = (
   JSON.parse(fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf-8')) as { version?: string }
@@ -742,11 +742,19 @@ app.post('/:id/release-refs', async (c) => {
     // legacyNativeFingerprint = the pre-0.6.58 broader hash so hops against
     // older rows keep a consistent comparison basis.
     const legacyNativeFingerprint = String(formData.get('legacyNativeFingerprint') ?? '').slice(0, 80)
+    // 0.6.59 — WHICH definition nativeFingerprint uses ('v3' = exe-excluded:
+    // electron-builder stamps the app version into the exe on every build, so
+    // an exe-inclusive hash can never match across two versions). Storing the
+    // spec lets compareNativeFingerprints refuse MIXED-spec hops honestly
+    // instead of comparing hashes that were never computed over the same
+    // file set (the bug behind "native-bits-changed on every hop").
+    const fingerprintSpec = String(formData.get('fingerprintSpec') ?? '').slice(0, 20)
 
     const data: Record<string, string | number> = {}
     if (runtimeKey) data.runtimeKey = runtimeKey
     if (nativeFingerprint) data.nativeFingerprint = nativeFingerprint
     if (legacyNativeFingerprint) data.legacyNativeFingerprint = legacyNativeFingerprint
+    if (fingerprintSpec) data.fingerprintSpec = fingerprintSpec
 
     for (const field of ['asar', 'outref'] as const) {
       const file = formData.get(field) as File | null
@@ -809,8 +817,15 @@ app.post('/:id/regenerate-deltas', async (c) => {
     // 2-core VPS; admin repairs and the default use all 10.
     const limitRaw = parseInt(c.req.query('limit') || '', 10)
     const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : undefined
-    const results = await generateDeltasForVersion(appVersion.id, { limit })
-    return c.json({ success: true, results })
+    // 0.6.59 — ?allowFingerprintRisk=1: consciously override fingerprint
+    // refusals (native-bits-changed / fingerprint-scope-mismatch) for hops
+    // the operator has verified to be stamp-level-only native diffs. NEVER
+    // overrides runtime-key-changed or missing refs. Every overridden hop is
+    // marked in the results AND in the APP_VERSION_DELTA_GENERATION audit.
+    const riskFlag = String(c.req.query('allowFingerprintRisk') || '').toLowerCase()
+    const allowFingerprintRisk = riskFlag === '1' || riskFlag === 'true'
+    const results = await generateDeltasForVersion(appVersion.id, { limit, allowFingerprintRisk })
+    return c.json({ success: true, results, allowFingerprintRisk })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -920,6 +935,13 @@ app.get('/delta-health', async (c) => {
           guards: {
             verdict: diagnosis.ok ? 'ready' : 'refused',
             reason: diagnosis.reason ?? null,
+            // 0.6.59 — fingerprint refusals are consciously overridable by
+            // the operator (allowFingerprintRisk=1) once they verify the hop
+            // only differs in version-stamp bits. The UI surfaces this so
+            // "native-bits-changed" stops looking like a dead end.
+            overridable: diagnosis.ok ? false : !!diagnosis.overridable,
+            prevSpec: fingerprintSpecOf(prevRow),
+            targetSpec: fingerprintSpecOf(targetRow),
             prevRefs: {
               asarKey: prev.asarStorageKey ?? null,
               outrefKey: prev.outrefStorageKey ?? null,
@@ -948,6 +970,7 @@ app.get('/delta-health', async (c) => {
           runtimeKey: target.runtimeKey ?? null,
           nativeFingerprint: target.nativeFingerprint ?? null,
           legacyNativeFingerprint: (target as unknown as { legacyNativeFingerprint?: string | null }).legacyNativeFingerprint ?? null,
+          fingerprintSpec: (target as unknown as { fingerprintSpec?: string | null }).fingerprintSpec ?? null,
           asarKey: target.asarStorageKey ?? null,
           asarOnDisk: target.asarStorageKey ? !!resolveBinaryPath(target.asarStorageKey) : null,
           outrefKey: target.outrefStorageKey ?? null,

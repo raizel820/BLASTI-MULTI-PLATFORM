@@ -365,6 +365,15 @@ jobs:
             else
               echo "::warning::refs.json lacks legacyNativeFingerprint — re-run 'Build release refs' with the updated make-release-refs.mjs"
             fi
+            # 0.6.59 — fingerprint definition marker ('v3' = exe-excluded):
+            # without it the cloud must refuse mixed-spec hops (the root cause
+            # of "native-bits-changed on every hop").
+            FP_SPEC="$(node -p "try{JSON.parse(require('fs').readFileSync('release-refs/refs.json','utf8')).fingerprintSpec||''}catch{''}")"
+            if [ -n "$FP_SPEC" ]; then
+              REF_ARGS="$REF_ARGS --fingerprint-spec $FP_SPEC"
+            else
+              echo "::warning::refs.json lacks fingerprintSpec — re-run 'Build release refs' with the updated make-release-refs.mjs"
+            fi
             echo "delta refs found — differential updates will be generated"
           else
             echo "no delta refs artifact — desktop updates fall back to full installers"

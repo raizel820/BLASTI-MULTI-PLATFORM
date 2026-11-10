@@ -59,12 +59,26 @@ console.log('[refs] hashing native payload (everything outside app.asar + out/**
 // 0.6.58 — DUAL-SCOPE fingerprints, computed in ONE walk (per-file sha256
 // hashed once into both scopes):
 //
-//   nativeFingerprint (NEW scope — the honest guard)
+// 0.6.59 — FIELD ROOT CAUSE FIX ("native-bits-changed on every hop, even
+// 0.6.57→0.6.58"): electron-builder stamps the app version into Blasti.exe's
+// Windows version resource (rcedit: FileVersion/ProductVersion) on EVERY
+// build, so the exe bytes differ between ANY two releases. Both pre-0.6.59
+// scopes hashed that exe → no two versions could ever share a fingerprint →
+// the cloud refused 100% of delta hops and every device fell back to the
+// full installer. Top-level *.exe files are now EXCLUDED from the new scope:
+// their runtime identity is already pinned by runtimeKey (electron version +
+// arch), the only same-runtime exe delta is the version stamp, the patch
+// system never delivers the exe (it is locked while the app runs), and the
+// client's reported version comes from package.json inside the PATCHED asar
+// (app.setVersion on manifest load), so a stale exe stamp is cosmetic only.
+//
+//   nativeFingerprint (NEW scope v3 — the honest guard)
 //     sha256 over the sorted [relPath, fileSha256] list of every packaged
-//     file EXCEPT resources/app.asar (asar delta delivers it) and the WHOLE
-//     resources/app.asar.unpacked/** + resources/node_modules/** (the tree
-//     patch delivers unpacked; the afterPack node_modules copy is a runtime
-//     FALLBACK only — db.js resolution prefers the asar/unpacked copies).
+//     file EXCEPT resources/app.asar (asar delta delivers it), the WHOLE
+//     resources/app.asar.unpacked/** (tree patch delivers it),
+//     resources/node_modules/** (afterPack fallback copy — db.js resolution
+//     prefers the asar/unpacked copies) and TOP-LEVEL *.exe (version-stamp
+//     launchers — see above).
 //     Any change to the genuinely UNPATCHABLE bits (electron dlls, locales,
 //     resources/assets, resources/data) ⇒ the cloud refuses deltas and
 //     devices fall back to the full installer — correct.
@@ -72,15 +86,21 @@ console.log('[refs] hashing native payload (everything outside app.asar + out/**
 //
 //   legacyNativeFingerprint (OLD scope — pre-0.6.58 compatibility)
 //     the pre-0.6.58 hash: everything EXCEPT resources/app.asar and
-//     resources/app.asar.unpacked/out/** (i.e. the whole unpacked tree and
-//     resources/node_modules INCLUDED). Uploaded alongside the new scope so
-//     hops against older rows (which only store the old hash) compare
-//     legacy-vs-legacy instead of refusing on a scope mismatch. See
+//     resources/app.asar.unpacked/out/** (i.e. the whole unpacked tree,
+//     resources/node_modules AND the exe INCLUDED). Uploaded alongside the
+//     new scope for structural compatibility with the 0.6.58 refs contract;
+//     hops against pre-0.6.58 rows can never be fingerprint-verified (their
+//     stored hashes include the stamped exe) and require the operator's
+//     allowFingerprintRisk override. See fingerprintSpecOf() +
 //     compareNativeFingerprints() in apps/api/src/lib/app-version-deltas.ts.
 const skipForFingerprint = (rel) =>
   rel === 'resources/app.asar' ||
   rel.startsWith('resources/app.asar.unpacked/') ||
-  rel.startsWith('resources/node_modules/');
+  rel.startsWith('resources/node_modules/') ||
+  // 0.6.59 — version-stamped launcher binaries (Blasti.exe and any
+  // electron-dist helper exes). Top level only: resources/** exes that ARE
+  // patchable stay in the scope via their own tree deliveries.
+  (!rel.includes('/') && rel.toLowerCase().endsWith('.exe'));
 const skipForLegacyFingerprint = (rel) => rel === 'resources/app.asar' || rel.startsWith('resources/app.asar.unpacked/out/');
 function walk(dir, rel, acc) {
   let entries = [];
@@ -135,6 +155,11 @@ const refs = {
   runtimeKey,
   nativeFingerprint,
   legacyNativeFingerprint,
+  // 0.6.59 — fingerprint definition marker: the cloud refuses to compare
+  // hashes from different definitions (v1 pre-0.6.58 broad hash / v2 0.6.58
+  // exe-inclusive / v3 0.6.59 exe-EXCLUDED). Only v3-vs-v3 hops are
+  // automatically verifiable; mixed-spec hops need the operator override.
+  fingerprintSpec: 'v3',
   asarSha256: await sha256OfFile(asarDest),
   asarSize: fs.statSync(asarDest).size,
   outrefSha256: createHash('sha256').update(outref.buf).digest('hex'),

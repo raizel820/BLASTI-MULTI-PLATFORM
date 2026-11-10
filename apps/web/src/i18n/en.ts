@@ -4419,7 +4419,7 @@ const en: Record<TranslationKeys, string> = {
   publicAppRegenDeltasFailed: "Delta regeneration failed",
   publicAppRegenDeltasGenerated: "Generated",
   publicAppRegenDeltasRefused: "Refused",
-  publicAppRegenDeltasHint: "Refusals by design (runtime-key-changed / native-bits-changed) mean the release changed bits the patch cannot deliver (electron runtime, assets, data) — those hops correctly use the full installer. missing-asar-ref / missing-outref-ref mean the older release lacks reference artifacts — re-publish it so refs upload, then regenerate again.",
+  publicAppRegenDeltasHint: "runtime-key-changed means the electron runtime changed — full installer is correct (never overridable). native-bits-changed / fingerprint-scope-mismatch mean the stored fingerprints cannot prove the hop safe (pre-0.6.59 hashes included Blasti.exe, whose version resource changes every build) — open Delta Health and use \"Force deltas\" if the releases only changed app code. missing-asar-ref / missing-outref-ref mean the older release lacks reference artifacts — re-publish it so refs upload, then regenerate again.",
 
   // Tab 3 — Update Pusher
   publicAppPusherTitle: "New update push",
@@ -4834,6 +4834,12 @@ const en: Record<TranslationKeys, string> = {
   publicAppDeltaHealthFull: "full installer",
   publicAppDeltaHealthAudit: "Last generation: {at} — {ok} ok · {refused} refused",
   publicAppDeltaHealthHint: "Every hop is refused — review each reason above: missing refs (re-push the release via CI) or runtime/fingerprint changes (a full installer is the correct path for that hop).",
+  // ─── 0.6.59 — overridable fingerprint refusals ────────────────────────────
+  publicAppDeltaHealthOverridable: "overridable",
+  publicAppDeltaHealthOverride: "Force deltas",
+  publicAppDeltaHealthOverrideConfirm: "Force-generate {count} fingerprint-refused delta hop(s)? Use ONLY when these releases changed app code (asar/unpacked) and not the electron runtime or packaged assets. Every forced hop is recorded in the audit log.",
+  publicAppDeltaHealthOverrideHint: "Fingerprint refusals (native-bits-changed / fingerprint-scope-mismatch) are marked overridable: pre-0.6.59 fingerprints included Blasti.exe, whose version resource changes on every build — if these releases only changed app code, use \"Force deltas\" to generate the patches anyway.",
+  publicAppDeltaHealthOverrideDone: "{count} delta patch(es) force-generated (fingerprint override)",
 
   // ─── 0.6.59 — Public Apps: artifact-category filters ─────────────────────
   publicAppFilterCategory: "Update artifact category",

@@ -60,48 +60,101 @@ interface VersionRowLike {
   nativeFingerprint: string | null
   /** 0.6.58 — legacy-scope fingerprint (pre-0.6.58 hash) for old rows. */
   legacyNativeFingerprint?: string | null
+  /**
+   * 0.6.59 — WHICH fingerprint definition `nativeFingerprint` holds:
+   *   'v3'  → exe-excluded scope (make-release-refs 0.6.59+)
+   *   'v2'  → 0.6.58 scope, exe INCLUDED
+   *   null  → pre-0.6.58 row (nativeFingerprint holds the old broad hash)
+   * See fingerprintSpecOf() — this is the discriminator that fixed the
+   * "native-bits-changed on every hop" field incident.
+   */
+  fingerprintSpec?: string | null
+}
+
+/** Fingerprint spec values emitted since 0.6.58. */
+export type FingerprintSpec = 'v1' | 'v2' | 'v3'
+
+/**
+ * 0.6.59 — WHICH fingerprint definition does this row's `nativeFingerprint`
+ * column hold? Discriminated by `fingerprintSpec` (v3, uploaded by CI from
+ * 0.6.59 on) falling back to `legacyNativeFingerprint` presence (v2 = the
+ * 0.6.58 dual-scope rows) and finally null (pre-0.6.58 rows, whose only hash
+ * is the old broad legacy-scope one).
+ */
+export function fingerprintSpecOf(row: Pick<VersionRowLike, 'fingerprintSpec' | 'legacyNativeFingerprint'>): FingerprintSpec {
+  const spec = String(row.fingerprintSpec || '').trim().toLowerCase()
+  if (spec === 'v3' || spec === 'v2') return spec
+  if ((row.legacyNativeFingerprint || '').trim()) return 'v2'
+  return 'v1'
 }
 
 /**
- * 0.6.58 — SCOPE-AWARE fingerprint comparison.
+ * Fingerprint refusals the OPERATOR may consciously override via
+ * allowFingerprintRisk=1 (regenerate-deltas) — everything else
+ * (runtime-key-changed, missing refs, platform mismatch…) is absolute.
+ *
+ * 0.6.59 FIELD ROOT CAUSE ("native-bits-changed on EVERY hop, even
+ * 0.6.57→0.6.58"): electron-builder stamps the app version into the exe's
+ * Windows version resource on every build, so Blasti.exe's bytes differ
+ * between ANY two versions. The fingerprint scope hashed that exe → the
+ * hash differed between every pair of releases → every hop was refused and
+ * desktop delta updates were effectively dead despite the whole pipeline
+ * being in place. The 0.6.59 fix removes top-level *.exe from the scope
+ * (the exe's runtime identity is already pinned by runtimeKey = electron
+ * version + arch; the only same-runtime exe delta is the version stamp,
+ * which the patch system never delivers and app.getVersion() does not
+ * depend on — it reads the version from package.json inside the patched
+ * asar). Refusals on v3-vs-v3 native-bits-changed are now REAL native
+ * changes (dlls/locales/assets/data) — full installer remains the correct
+ * path there, but the operator retains a conscious override for hops where
+ * they can verify only stamp-level bits changed.
+ */
+const OVERRIDABLE_FINGERPRINT_REASONS = new Set(['native-bits-changed', 'fingerprint-scope-mismatch'])
+
+export function isOverridableFingerprintReason(reason: string | null | undefined): boolean {
+  return OVERRIDABLE_FINGERPRINT_REASONS.has(String(reason || ''))
+}
+
+/**
+ * 0.6.58 → 0.6.59 — SPEC-AWARE fingerprint comparison.
  *
  * The fingerprint guard answers ONE question: "are the files this patch does
  * NOT deliver byte-identical between the two releases?" The patch delivers
  * app.asar + the WHOLE app.asar.unpacked tree, so the honest scope is
- * "everything else" (electron bits, assets, data, resources/node_modules).
+ * "everything else" minus the version-stamped launchers.
  *
- * Release refs 0.6.58+ carry BOTH scopes:
- *   • nativeFingerprint        → new scope (patchable copies excluded)
- *   • legacyNativeFingerprint  → the old, broader hash (unpacked + node_modules
- *                                INCLUDED) so hops against pre-0.6.58 rows
- *                                (which only store the old hash) stay
- *                                comparable without a spurious refusal.
+ * Stored scopes by era (see fingerprintSpecOf):
+ *   v1 (pre-0.6.58)  nativeFingerprint          = broad legacy hash (exe + unpacked + node_modules INCLUDED)
+ *   v2 (0.6.58)      nativeFingerprint          = exe-INCLUSIVE new-scope hash; legacyNativeFingerprint = broad legacy hash
+ *   v3 (0.6.59+)     nativeFingerprint          = exe-EXCLUDED new-scope hash; legacyNativeFingerprint = broad legacy hash
  *
  * Comparison matrix:
- *   both rows have the new scope        → compare new-vs-new (correct guard)
- *   either row lacks the new scope      → compare legacy-vs-legacy (old rows,
- *                                         consistent scope on both sides)
- *   scopes mixed with no legacy fallback → refuse (cannot prove safety)
- * Returns { ok: true } or { ok: false, reason: 'native-bits-changed' | 'fingerprint-scope-mismatch' }.
+ *   same spec on both sides → compare nativeFingerprint-vs-nativeFingerprint
+ *                             (only v3-vs-v3 can EVER match in practice: v1
+ *                             and v2 hashes both include the version-stamped
+ *                             exe, which differs between any two versions)
+ *   mixed specs             → refuse 'fingerprint-scope-mismatch' (no honest
+ *                             common basis exists on stored data) — the
+ *                             operator may override with
+ *                             allowFingerprintRisk=1 after verifying the two
+ *                             releases only differ in asar/unpacked/stamp
+ *                             bits.
+ * Returns { ok: true } or { ok: false, reason, overridable }.
  */
 function compareNativeFingerprints(
   prev: VersionRowLike,
   cur: VersionRowLike,
-): { ok: true } | { ok: false; reason: string } {
-  const prevNew = (prev.nativeFingerprint || '').trim()
-  const curNew = (cur.nativeFingerprint || '').trim()
-  if (prevNew && curNew) {
-    return prevNew === curNew ? { ok: true } : { ok: false, reason: 'native-bits-changed' }
+): { ok: true } | { ok: false; reason: string; overridable: boolean } {
+  const prevSpec = fingerprintSpecOf(prev)
+  const curSpec = fingerprintSpecOf(cur)
+  const prevHash = (prev.nativeFingerprint || '').trim()
+  const curHash = (cur.nativeFingerprint || '').trim()
+  if (prevSpec === curSpec && prevHash && curHash) {
+    return prevHash === curHash
+      ? { ok: true }
+      : { ok: false, reason: 'native-bits-changed', overridable: true }
   }
-  // At least one side predates the dual-scope refs — fall back to the legacy
-  // hash, which BOTH sides can provide (new releases upload it explicitly;
-  // old rows only ever had it as their primary hash).
-  const prevLegacy = (prev.legacyNativeFingerprint || prev.nativeFingerprint || '').trim()
-  const curLegacy = (cur.legacyNativeFingerprint || '').trim()
-  if (prevLegacy && curLegacy) {
-    return prevLegacy === curLegacy ? { ok: true } : { ok: false, reason: 'native-bits-changed' }
-  }
-  return { ok: false, reason: 'fingerprint-scope-mismatch' }
+  return { ok: false, reason: 'fingerprint-scope-mismatch', overridable: true }
 }
 
 function resolveStored(key: string | null | undefined): string | null {
@@ -125,7 +178,7 @@ function resolveStored(key: string | null | undefined): string | null {
 export function diagnoseDeltaHop(
   prev: VersionRowLike,
   cur: VersionRowLike,
-): { ok: boolean; reason?: string } {
+): { ok: boolean; reason?: string; overridable?: boolean } {
   const platform = cur.platform
   if (platform !== prev.platform) return { ok: false, reason: 'platform-mismatch' }
   if (DESKTOP_PLATFORMS.has(platform)) {
@@ -133,7 +186,7 @@ export function diagnoseDeltaHop(
     if (!prev.outrefStorageKey || !cur.outrefStorageKey) return { ok: false, reason: 'missing-outref-ref' }
     if ((cur.runtimeKey || '') !== (prev.runtimeKey || '')) return { ok: false, reason: 'runtime-key-changed' }
     const fpCheck = compareNativeFingerprints(prev, cur)
-    if (!fpCheck.ok) return { ok: false, reason: fpCheck.reason }
+    if (!fpCheck.ok) return { ok: false, reason: fpCheck.reason, overridable: fpCheck.overridable }
     if (!resolveStored(prev.asarStorageKey) || !resolveStored(cur.asarStorageKey)) return { ok: false, reason: 'ref-file-missing' }
     if (!resolveStored(prev.outrefStorageKey) || !resolveStored(cur.outrefStorageKey)) return { ok: false, reason: 'ref-file-missing' }
     return { ok: true }
@@ -147,11 +200,24 @@ export function diagnoseDeltaHop(
   return { ok: false, reason: 'platform-unsupported' }
 }
 
-/** Build + persist the delta row for (prev → cur). Returns null when impossible. */
+/**
+ * Build + persist the delta row for (prev → cur). Returns null when impossible.
+ *
+ * 0.6.59 — `opts.allowFingerprintRisk`: when the ONLY refusal is a
+ * fingerprint one (native-bits-changed / fingerprint-scope-mismatch — both
+ * tagged overridable), the operator may consciously accept the residual risk
+ * (files outside asar/unpacked may have changed between the releases in ways
+ * stored hashes cannot verify) and force the hop anyway. runtime-key-changed
+ * and missing refs are NEVER overridable: an electron-version change or a
+ * missing base artifact makes the patch objectively inapplicable/unsafe.
+ * Every override is recorded in the result (`overridden: true`) and lands in
+ * the APP_VERSION_DELTA_GENERATION audit entry.
+ */
 export async function generateDeltaBetween(
   prev: VersionRowLike,
   cur: VersionRowLike,
-): Promise<{ ok: true; deltaId: string; size: number } | { ok: false; reason: string }> {
+  opts?: { allowFingerprintRisk?: boolean },
+): Promise<{ ok: true; deltaId: string; size: number; overridden?: boolean } | { ok: false; reason: string }> {
   const platform = cur.platform
   if (platform !== prev.platform) return { ok: false, reason: 'platform-mismatch' }
 
@@ -161,10 +227,19 @@ export async function generateDeltaBetween(
       if (!prev.asarStorageKey || !cur.asarStorageKey) return { ok: false, reason: 'missing-asar-ref' }
       if (!prev.outrefStorageKey || !cur.outrefStorageKey) return { ok: false, reason: 'missing-outref-ref' }
       if ((cur.runtimeKey || '') !== (prev.runtimeKey || '')) return { ok: false, reason: 'runtime-key-changed' }
-      // 0.6.58 — scope-aware guard: new-scope when both rows carry it,
-      // legacy fallback for hops against pre-0.6.58 rows (see the helper).
+      // 0.6.58→0.6.59 — spec-aware guard: only same-spec hashes are
+      // comparable; fingerprint refusals may be consciously overridden by
+      // the operator (allowFingerprintRisk) after verifying the hop.
       const fpCheck = compareNativeFingerprints(prev, cur)
-      if (!fpCheck.ok) return { ok: false, reason: fpCheck.reason }
+      let overridden = false
+      if (!fpCheck.ok) {
+        if (opts?.allowFingerprintRisk && fpCheck.overridable) {
+          overridden = true
+          console.warn(`[app-version-deltas] OVERRIDE (allowFingerprintRisk): v${prev.version} → v${cur.version} generated despite ${fpCheck.reason} — operator-accepted risk`)
+        } else {
+          return { ok: false, reason: fpCheck.reason }
+        }
+      }
 
       const prevAsar = resolveStored(prev.asarStorageKey)
       const curAsar = resolveStored(cur.asarStorageKey)
@@ -223,7 +298,7 @@ export async function generateDeltaBetween(
           toArtifactHash: asarDelta.header.toSha256,
         },
       })
-      return { ok: true, deltaId: row.id, size: patch.length }
+      return { ok: true, deltaId: row.id, size: patch.length, ...(overridden ? { overridden: true } : {}) }
     }
 
     if (APK_PLATFORMS.has(platform)) {
@@ -300,8 +375,8 @@ export async function generateDeltaBetween(
  */
 export async function generateDeltasForVersion(
   curId: string,
-  opts?: { limit?: number },
-): Promise<Array<{ from: string; to: string; size: number; ok: boolean; reason?: string }>> {
+  opts?: { limit?: number; allowFingerprintRisk?: boolean },
+): Promise<Array<{ from: string; to: string; size: number; ok: boolean; overridden?: boolean; reason?: string }>> {
   const cur = await db.appVersion.findUnique({ where: { id: curId } })
   if (!cur) return []
   // Predecessor lookup IGNORES isPublished on purpose: the activate
@@ -315,14 +390,18 @@ export async function generateDeltasForVersion(
     orderBy: { createdAt: 'desc' },
     take: takeLimit,
   })
-  const results: Array<{ from: string; to: string; size: number; ok: boolean; reason?: string }> = []
+  const results: Array<{ from: string; to: string; size: number; ok: boolean; overridden?: boolean; reason?: string }> = []
   for (const prev of predecessors) {
     // Only build hops that move FORWARD in semver terms.
     if (compareVersionStrings(prev.version, cur.version) >= 0) continue
-    const r = await generateDeltaBetween(prev as VersionRowLike, cur as VersionRowLike)
-    results.push(r.ok
-      ? { from: prev.version, to: cur.version, size: r.size, ok: true }
-      : { from: prev.version, to: cur.version, size: 0, ok: false, reason: r.reason })
+    const r = await generateDeltaBetween(prev as VersionRowLike, cur as VersionRowLike, {
+      allowFingerprintRisk: opts?.allowFingerprintRisk,
+    })
+    if (r.ok) {
+      results.push({ from: prev.version, to: cur.version, size: r.size, ok: true, ...(r.overridden ? { overridden: true } : {}) })
+    } else {
+      results.push({ from: prev.version, to: cur.version, size: 0, ok: false, reason: r.reason })
+    }
   }
 
   // 0.6.58 — persist the outcome for the admin audit trail (best-effort:
@@ -342,6 +421,8 @@ export async function generateDeltasForVersion(
           version: cur.version,
           generated: results.filter((r) => r.ok).length,
           refusals: results.filter((r) => !r.ok).length,
+          overridden: results.filter((r) => r.ok && r.overridden).length,
+          allowFingerprintRisk: opts?.allowFingerprintRisk === true,
           results,
         }),
       },

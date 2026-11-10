@@ -1671,6 +1671,15 @@ model AppVersion {
   /// legacy-vs-legacy so the fingerprint-scope change never manufactures
   /// spurious refusals or dead hops.
   legacyNativeFingerprint String?
+  /// 0.6.59 — WHICH fingerprint definition the stored nativeFingerprint uses.
+  /// 'v3' = exe-excluded scope (top-level *.exe excluded — electron-builder
+  /// stamps the app version into the exe's version resource on EVERY build,
+  /// so an exe-inclusive hash can never match across versions and vetoed
+  /// 100% of delta hops). 'v2' = the 0.6.58 scope (exe INCLUDED). null =
+  /// pre-0.6.58 legacy row (nativeFingerprint holds the old broad hash).
+  /// Hops only compare fingerprints of the SAME spec — mixed-spec hops are
+  /// refused as fingerprint-scope-mismatch (overridable by the operator).
+  fingerprintSpec String?
   // ── API Compatibility Map (0.6.31) ────────────────────────────────────────
   /// API protocol level this build was compiled against (null = unknown —
   /// compat then falls back to feature gates only). The /compat endpoint

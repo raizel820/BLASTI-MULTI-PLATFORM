@@ -28,6 +28,7 @@ import {
   RefreshCw,
   Stethoscope,
   Wrench,
+  ShieldAlert,
   CheckCircle2,
   XCircle,
 } from 'lucide-react';
@@ -101,6 +102,8 @@ interface DeltaGenResult {
   to: string;
   size: number;
   ok: boolean;
+  /** 0.6.59 — true when the hop was generated via allowFingerprintRisk. */
+  overridden?: boolean;
   reason?: string;
 }
 
@@ -113,6 +116,11 @@ interface DeltaHealthHop {
   guards: {
     verdict: 'ready' | 'refused';
     reason: string | null;
+    /** 0.6.59 — fingerprint refusals are consciously overridable. */
+    overridable: boolean;
+    /** 0.6.59 — fingerprint definition eras of both rows (v1/v2/v3). */
+    prevSpec: string;
+    targetSpec: string;
     prevRefs: {
       asarKey: string | null;
       outrefKey: string | null;
@@ -139,6 +147,7 @@ interface DeltaHealthPlatform {
     runtimeKey: string | null;
     nativeFingerprint: string | null;
     legacyNativeFingerprint: string | null;
+    fingerprintSpec: string | null;
     asarKey: string | null;
     asarOnDisk: boolean | null;
     outrefKey: string | null;
@@ -505,16 +514,27 @@ export function VersionsTab() {
 
   /** Repair button inside the health dialog: rebuild hops for a target id. */
   const repairFromHealth = useCallback(
-    async (targetId: string, version: string) => {
+    async (targetId: string, version: string, allowFingerprintRisk = false) => {
       setHealthRepairBusy(targetId);
       try {
-        const res = await apiFetch(`/api/app-versions/${targetId}/regenerate-deltas`, { method: 'POST' });
+        const res = await apiFetch(
+          `/api/app-versions/${targetId}/regenerate-deltas${allowFingerprintRisk ? '?allowFingerprintRisk=1' : ''}`,
+          { method: 'POST' },
+        );
         const data = await res.json().catch(() => null);
         const results: DeltaGenResult[] = Array.isArray(data?.results) ? data.results : [];
         const okCount = results.filter((r) => r.ok).length;
+        const overriddenCount = results.filter((r) => r.ok && r.overridden).length;
         if (res.ok && data?.success) {
-          if (okCount > 0) toast.success(t('publicAppRegenDeltasDone').replace('{count}', String(okCount)));
-          else toast.warning(t('publicAppRegenDeltasNone'));
+          if (okCount > 0) {
+            toast.success(
+              overriddenCount > 0
+                ? t('publicAppDeltaHealthOverrideDone').replace('{count}', String(overriddenCount))
+                : t('publicAppRegenDeltasDone').replace('{count}', String(okCount)),
+            );
+          } else {
+            toast.warning(t('publicAppRegenDeltasNone'));
+          }
           await fetchDeltaHealth();
         } else {
           toast.error(t('publicAppRegenDeltasFailed'), { description: data?.error || `HTTP ${res.status}` });
@@ -1149,6 +1169,9 @@ export function VersionsTab() {
               {healthData.platforms.map((p) => {
                 const ready = p.hops.filter((h) => h.guards.verdict === 'ready').length;
                 const served = p.hops.filter((h) => h.clientChain.reachable).length;
+                // 0.6.59 — hops refused ONLY by the fingerprint guard can be
+                // consciously overridden (allowFingerprintRisk=1).
+                const overridable = p.hops.filter((h) => !h.clientChain.reachable && h.guards.verdict === 'refused' && h.guards.overridable).length;
                 const Icon = platformIcon(p.platform);
                 return (
                   <div key={p.platform} className="rounded-lg border p-3 space-y-3">
@@ -1181,6 +1204,22 @@ export function VersionsTab() {
                           >
                             {healthRepairBusy === p.target.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <Wrench className="h-3 w-3" />}
                             {t('publicAppDeltaHealthRepair')}
+                          </Button>
+                        )}
+                        {p.target && overridable > 0 && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-7 text-xs border-amber-500/50 text-amber-700 dark:text-amber-400"
+                            disabled={healthRepairBusy === p.target.id}
+                            onClick={() => {
+                              if (window.confirm(t('publicAppDeltaHealthOverrideConfirm').replace('{count}', String(overridable)))) {
+                                void repairFromHealth(p.target!.id, p.target!.version, true);
+                              }
+                            }}
+                          >
+                            {healthRepairBusy === p.target.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <ShieldAlert className="h-3 w-3" />}
+                            {t('publicAppDeltaHealthOverride')}
                           </Button>
                         )}
                       </div>
@@ -1231,12 +1270,19 @@ export function VersionsTab() {
                                   <div className="flex items-center gap-1">
                                     {h.guards.verdict === 'ready' ? (
                                       <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 shrink-0" />
+                                    ) : h.guards.overridable ? (
+                                      <ShieldAlert className="h-3.5 w-3.5 text-amber-600 shrink-0" />
                                     ) : (
                                       <XCircle className="h-3.5 w-3.5 text-amber-600 shrink-0" />
                                     )}
                                     <span className="text-[10px] font-mono text-muted-foreground truncate" dir="ltr" title={h.guards.reason ?? ''}>
                                       {h.guards.reason ?? 'ready'}
                                     </span>
+                                    {h.guards.verdict === 'refused' && h.guards.overridable && (
+                                      <Badge variant="outline" className="text-[9px] h-4 px-1 border-amber-500/40 text-amber-700 dark:text-amber-400 shrink-0">
+                                        {t('publicAppDeltaHealthOverridable')}
+                                      </Badge>
+                                    )}
                                   </div>
                                 </TableCell>
                                 <TableCell className="py-1.5">
@@ -1279,8 +1325,11 @@ export function VersionsTab() {
                       </p>
                     )}
 
-                    {ready === 0 && p.hops.length > 0 && (
+                    {ready === 0 && p.hops.length > 0 && overridable === 0 && (
                       <p className="text-[11px] text-muted-foreground leading-relaxed">{t('publicAppDeltaHealthHint')}</p>
+                    )}
+                    {overridable > 0 && (
+                      <p className="text-[11px] text-amber-700 dark:text-amber-400 leading-relaxed">{t('publicAppDeltaHealthOverrideHint')}</p>
                     )}
                   </div>
                 );

@@ -4421,7 +4421,7 @@ const fr: Record<TranslationKeys, string> = {
   publicAppRegenDeltasFailed: "Échec de la régénération delta",
   publicAppRegenDeltasGenerated: "Généré",
   publicAppRegenDeltasRefused: "Refusé",
-  publicAppRegenDeltasHint: "Les refus BY DESIGN (runtime-key-changed / native-bits-changed) signifient que la version a changé des éléments que le correctif ne peut pas livrer (runtime Electron, assets, données) — ces sauts utilisent à juste titre l'installateur complet. missing-asar-ref / missing-outref-ref signifient que la version antérieure n'a pas de références — republiez-la pour téléverser les refs, puis régénérez à nouveau.",
+  publicAppRegenDeltasHint: "runtime-key-changed signifie que le runtime Electron a changé — l'installateur complet est correct (jamais contournable). native-bits-changed / fingerprint-scope-mismatch signifient que les empreintes stockées ne peuvent pas prouver la sécurité du saut (les empreintes pré-0.6.59 incluaient Blasti.exe dont la ressource de version change à chaque build) — ouvrez Delta Health et utilisez « Forcer les deltas » si ces versions n'ont changé que le code applicatif. missing-asar-ref / missing-outref-ref signifient que la version antérieure n'a pas de références — republiez-la pour téléverser les refs, puis régénérez à nouveau.",
 
   // Tab 3 — Update Pusher
   publicAppPusherTitle: "Nouvelle poussée de mise à jour",
@@ -4836,6 +4836,12 @@ const fr: Record<TranslationKeys, string> = {
   publicAppDeltaHealthFull: "installeur complet",
   publicAppDeltaHealthAudit: "Dernière génération : {at} — {ok} OK · {refused} refusés",
   publicAppDeltaHealthHint: "Tous les sauts sont refusés — examinez chaque raison ci-dessus : références manquantes (re-poussez la version via CI) ou changement d'exécution/empreinte (un installeur complet est le bon chemin pour ce saut).",
+  // ─── 0.6.59 — refus d'empreinte contournable ──────────────────────────────
+  publicAppDeltaHealthOverridable: "contournable",
+  publicAppDeltaHealthOverride: "Forcer les deltas",
+  publicAppDeltaHealthOverrideConfirm: "Générer de force {count} saut(s) delta refusé(s) pour empreinte ? À utiliser UNIQUEMENT si ces versions n'ont changé que le code applicatif (asar/unpacked) sans toucher au runtime electron ni aux ressources empaquetées. Chaque saut forcé est consigné dans le journal d'audit.",
+  publicAppDeltaHealthOverrideHint: "Les refus d'empreinte (native-bits-changed / fingerprint-scope-mismatch) sont marqués contournables : les empreintes pré-0.6.59 incluaient Blasti.exe dont la ressource de version change à chaque build — si ces versions n'ont changé que le code applicatif, utilisez « Forcer les deltas ».",
+  publicAppDeltaHealthOverrideDone: "{count} correctif(s) delta généré(s) de force (contournement d'empreinte)",
 
   // ─── 0.6.59 — Public Apps: artifact-category filters ─────────────────────
   publicAppFilterCategory: "Catégorie d'artefacts de mise à jour",

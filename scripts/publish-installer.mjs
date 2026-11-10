@@ -175,6 +175,11 @@ try {
         // 0.6.58 — legacy-scope hash so hops against pre-0.6.58 rows keep a
         // consistent comparison basis (see compareNativeFingerprints()).
         if (args['legacy-native-fingerprint']) refForm.append('legacyNativeFingerprint', String(args['legacy-native-fingerprint']));
+        // 0.6.59 — fingerprint definition marker ('v3' = exe-excluded scope).
+        // Without it the cloud cannot tell WHICH file set a hash was computed
+        // over and must refuse mixed-spec hops — the exact failure that kept
+        // every desktop hop on "native-bits-changed".
+        if (args['fingerprint-spec']) refForm.append('fingerprintSpec', String(args['fingerprint-spec']));
         const refRes = await fetch(
           `${apiUrl}/api/app-versions/${v.id}/release-refs`,
           {
