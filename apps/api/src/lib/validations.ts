@@ -87,19 +87,67 @@ export const loginSchema = z.object({
   rememberMe: z.boolean().optional(),
 })
 
+// ─── 0.6.60 — Algerian phone normalization (FIELD-INCIDENT fix) ─────────────
+//
+// Desktop 0.6.58 incident: the register form had NO client-side phone check,
+// the server rejected slightly-off formats with a 400 the user never saw
+// (tiny inline label), and every 400 still consumed the 3/min register rate
+// bucket → three retries → "Too many requests" lockout. Two of the fixes live
+// here: ACCEPT every format a real Algerian user types, and STORE one
+// canonical form so uniqueness checks compare like-for-like instead of
+// registering +213555123456 and 0555123456 as two different phones.
+//
+// Mirrors apps/web/src/lib/phone.ts — KEEP THE TWO IN SYNC.
+
+const ARABIC_INDIC_RE = /[\u0660-\u0669]/g // ٠-٩
+const EXT_ARABIC_INDIC_RE = /[\u06F0-\u06F9]/g // ۰-۹
+const FULLWIDTH_DIGIT_RE = /[\uFF10-\uFF19]/g // ０-９
+const PHONE_JUNK_RE = /[\s\u00A0\u202F.\-–—−()]+/g
+
+/** Arabic/fullwidth digit glyphs → ASCII, junk stripped, prefix unified. */
+export function normalizeAlgerianPhoneInput(v: unknown): string {
+  let s = String(v ?? '')
+    .replace(ARABIC_INDIC_RE, (d) => String(d.charCodeAt(0) - 0x0660))
+    .replace(EXT_ARABIC_INDIC_RE, (d) => String(d.charCodeAt(0) - 0x06f0))
+    .replace(FULLWIDTH_DIGIT_RE, (d) => String(d.charCodeAt(0) - 0xff10))
+    .replace(PHONE_JUNK_RE, '')
+    .trim()
+  if (s.startsWith('00213')) s = s.slice(5)
+  else if (s.startsWith('+213')) s = s.slice(4)
+  else if (/^213\d{9}$/.test(s)) s = s.slice(3)
+  return s
+}
+
+/** Canonical stored/transport form: 0XXXXXXXXX (mobile 05/06/07), or null. */
+export function canonicalAlgerianPhone(v: unknown): string | null {
+  const s = normalizeAlgerianPhoneInput(v)
+  if (/^[5-7]\d{8}$/.test(s)) return `0${s}`
+  if (/^0[5-7]\d{8}$/.test(s)) return s
+  return null
+}
+
+/** Zod pipeline: normalize → validate → canonicalize. */
+const dzPhoneNumberSchema = z.preprocess(
+  normalizeAlgerianPhoneInput,
+  z
+    .string()
+    .min(1, 'Phone number is required')
+    .refine(
+      (v) => canonicalAlgerianPhone(v) !== null,
+      'Enter a valid Algerian phone number (e.g. 0555123456)',
+    )
+    .transform((v) => canonicalAlgerianPhone(v) as string),
+)
+
 export const registerSchema = z.object({
   username: z.string().min(3, 'Username must be at least 3 characters').max(30),
   fullName: z.string().min(1, 'Full name is required').max(100),
   password: z.string().min(6, 'Password must be at least 6 characters').max(128),
   // Task 22: email + phone are REQUIRED and both verified via OTP at signup
+  // 0.6.60: normalized + canonicalized — accepts ٠٥٥٥… / +213 … / 213 … /
+  // 05 55 12 34 56 and stores 0555123456.
   email: z.string().email('A valid email address is required'),
-  phoneNumber: z
-    .string()
-    .min(1, 'Phone number is required')
-    .refine(
-      (v) => /^(\+213|00213)?0?[5-7]\d{8}$/.test(v.replace(/[\s\-\.]/g, '')),
-      'Enter a valid Algerian phone number (e.g. 0555123456)',
-    ),
+  phoneNumber: dzPhoneNumberSchema,
   // Task 31: SUPER_ADMIN accepted so programmatic/admin-console registrations can
   // create platform admins; they skip email/phone verification entirely (auth.ts).
   role: z.enum(['CUSTOMER', 'AGENCY_OWNER', 'SUPER_ADMIN']).optional().default('CUSTOMER'),
@@ -354,6 +402,11 @@ export const adminCreateAgencySchema = z.object({
   phone: z.string().max(20).optional(),
   email: z.string().optional(),
   category: z.string().min(2).max(40).default('CLINIC'),
+  // 0.6.61 — AI Translation Agent: the UI language the content was typed in
+  // (authoritative source language for the translation queue) and the wizard's
+  // brand-new category name (sent with category='__new__').
+  contentLanguage: z.enum(['ar', 'en', 'fr']).optional(),
+  newCategoryName: z.string().min(2, 'Category name must be at least 2 characters').max(60).optional(),
   /// Agencies Management — specialties the agency serves (ids from the
   /// Specialty dictionary; validated to belong to `category` in the handler).
   specialtyIds: z.array(z.string()).max(50).optional(),

@@ -81,6 +81,8 @@ const AdminAgenciesManagementAgenciesPage = lazyNamed(() => import('@/components
 const AdminAgenciesManagementServicesPage = lazyNamed(() => import('@/components/admin/admin-agencies-management-services-page'), 'AdminAgenciesManagementServicesPage');
 const AdminCategoryManager = lazyNamed(() => import('@/components/admin/admin-category-manager'), 'AdminCategoryManager');
 const AdminCategoryLanguage = lazyNamed(() => import('@/components/admin/admin-category-language'), 'AdminCategoryLanguage');
+// 0.6.61 — AI Translation Agent console (agent settings + local dictionary + API keys)
+const AdminTranslationAgent = lazyNamed(() => import('@/components/admin/admin-translation-agent'), 'AdminTranslationAgent');
 const AdminAuditLogs = lazyNamed(() => import('@/components/admin/admin-audit-logs'), 'AdminAuditLogs');
 const AdminUsers = lazyNamed(() => import('@/components/admin/admin-users'), 'AdminUsers');
 const AdminAnalytics = lazyNamed(() => import('@/components/admin/admin-analytics'), 'AdminAnalytics');
@@ -386,6 +388,9 @@ const ViewRouter = memo(function ViewRouter() {
             case 'admin-category-language':
               // Task 5-a: per-category terminology overrides (ar/en/fr).
               return <AdminCategoryLanguage />;
+            case 'admin-translation-agent':
+              // 0.6.61 — AI Translation Agent console.
+              return <AdminTranslationAgent />;
             case 'admin-audit':
               return <AdminAuditLogs />;
             case 'admin-users':

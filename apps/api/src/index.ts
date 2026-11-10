@@ -105,6 +105,8 @@ import { adminResetRoutes } from './routes/admin-reset'
 import { logRoutes } from './routes/logs'
 // 0.6.59 — VPS server-logs (journal + deploy files) for the Logs Manager
 import { serverLogRoutes } from './routes/server-logs'
+// 0.6.61 — AI Translation Agent console (SUPER_ADMIN) + batch scheduler
+import translationAgentRoutes, { startTranslationAgentScheduler } from './routes/translation-agent'
 import { startBackupScheduler, stopBackupScheduler } from './workers/backup-scheduler'
 import { ensureCategoryDictionary } from './lib/ensure-category-dictionary'
 // UID-0.6.14 — boot-time backfill: every account without a UID gets one
@@ -700,6 +702,8 @@ app.route('/api/logs', logRoutes)
 // MUST be mounted on a DIFFERENT base than logRoutes' param routes — /api/logs/server
 // would otherwise be captured by GET /api/logs/:uid. Separate mount keeps both live.
 app.route('/api/logs-server', serverLogRoutes)
+// 0.6.61 — AI Translation Agent console (dictionary, keys, settings, queue)
+app.route('/api/translation-agent', translationAgentRoutes)
 // Task C — Services Management: per-agency-type service policies
 app.route('/api/admin/service-policies', adminServicePolicyRoutes)
 // P0-5: public kiosk walk-in surface (device tokens handled inside)
@@ -1620,6 +1624,9 @@ httpServer.listen(PORT, HOST, async () => {
   ensureUserUids().catch((e) => {
     console.error('[UID] boot backfill failed:', e instanceof Error ? e.message : e)
   })
+  // 0.6.61 — AI Translation Agent: dictionary-first batched translation
+  // windows (default every 5 minutes). Never blocks boot; failures only log.
+  startTranslationAgentScheduler()
   console.log(`🚀 @blasti/api server running on port ${PORT} (bootId: ${BOOT_ID.substring(0, 8)}…)`)
   console.log(`   API:    http://localhost:${PORT}/ (bound to ${HOST})`)
   console.log(`   Health: http://localhost:${PORT}/health`)

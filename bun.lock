@@ -16,7 +16,7 @@
     },
     "apps/api": {
       "name": "@blasti/api",
-      "version": "0.6.41",
+      "version": "0.6.60",
       "dependencies": {
         "@blasti/binary-delta": "workspace:*",
         "@blasti/core": "workspace:*",
@@ -27,6 +27,7 @@
         "jose": "^6.0.0",
         "qrcode": "^1.5.4",
         "socket.io": "^4.8.1",
+        "z-ai-web-dev-sdk": "^0.0.18",
         "zod": "^4.0.2",
       },
       "devDependencies": {
@@ -36,7 +37,7 @@
     },
     "apps/desktop": {
       "name": "@blasti/desktop",
-      "version": "0.6.41",
+      "version": "0.6.60",
       "dependencies": {
         "@blasti/binary-delta": "workspace:*",
         "@hono/node-server": "^2.0.12",
@@ -56,7 +57,7 @@
     },
     "apps/mobile": {
       "name": "@blasti/mobile",
-      "version": "0.6.41",
+      "version": "0.6.60",
       "dependencies": {
         "@capacitor/app": "^8.0.0",
         "@capacitor/camera": "^8.0.0",
@@ -79,7 +80,7 @@
     },
     "apps/web": {
       "name": "@blasti/web",
-      "version": "0.6.41",
+      "version": "0.6.60",
       "dependencies": {
         "@nozbe/watermelondb": "^0.28.0",
         "@radix-ui/react-alert-dialog": "^1.1.14",
@@ -2055,6 +2056,8 @@
     "yauzl": ["yauzl@2.10.0", "", { "dependencies": { "buffer-crc32": "~0.2.3", "fd-slicer": "~1.1.0" } }, "sha512-p4a9I6X6nu6IhoGmBqAcbJy1mlC4j27vEPZX9F4L4/vZT3Lyq1VkFHw/V/PUcB9Buo+DG3iHkT0x3Qya58zc3g=="],
 
     "yocto-queue": ["yocto-queue@0.1.0", "", {}, "sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q=="],
+
+    "z-ai-web-dev-sdk": ["z-ai-web-dev-sdk@0.0.18", "", { "bin": { "z-ai": "dist/cli.js", "z-ai-generate": "dist/cli.js" } }, "sha512-xVoZIEME2F+/Z06orHCgUKzOMuFPhoHuzN4ZFZqcD71g11nzbzq2jKSP53igi3lJFE8ZbMB4WKb4gp6lCGrMXQ=="],
 
     "zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
 

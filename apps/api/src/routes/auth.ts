@@ -520,9 +520,13 @@ app.post('/refresh', async (c) => {
 app.post('/register', async (c) => {
   try {
     // Phase 2a: Require a valid IP before rate-limiting
+    // 0.6.60 — the strict AUTH bucket (5/15min) is consumed AFTER validation
+    // passes, not here: validation failures (a phone typo) must never burn
+    // the user's 15-minute registration allowance — that lockout, stacked on
+    // the global register bucket, was the "too many requests" field incident
+    // (3 typo-retries → 429 with a UI that never showed the actual 400).
     const ip = requireValidIp(c)
     checkIpBlocked(ip)
-    checkRateLimit(ip, AUTH_RATE_LIMIT)
 
     // P2 FIX: Handle empty/malformed body gracefully → 400 instead of 500
     let body: unknown
@@ -542,6 +546,10 @@ app.post('/register', async (c) => {
         validation.error.status,
       )
     }
+
+    // Validation passed — NOW the request is a real signup attempt: charge
+    // the strict auth bucket before any DB write / OTP dispatch.
+    checkRateLimit(ip, AUTH_RATE_LIMIT)
 
     const { username, fullName, password, email, phoneNumber, role, agencyCode } = validation.data
     // Task 5 — optional Algeria address (register form location selectors).

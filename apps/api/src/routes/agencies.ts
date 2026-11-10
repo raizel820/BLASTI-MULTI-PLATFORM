@@ -10,6 +10,9 @@ import { invalidateResponseCacheTag } from '../lib/response-cache'
 import { buildAgencyLocationPatch } from '../lib/map-settings'
 // Agencies Management — category/specialty validation + payload enrichment.
 import { attachSpecialties, categorySlugError, getActiveSpecialtyMap, serializeSpecialtyIds, specialtyIdsError } from '../lib/categories'
+// 0.6.61 — AI Translation Agent: dictionary-first translation of everything
+// the owner typed in ONE language + the wizard's brand-new category flow.
+import { createPendingCategory, enqueueAgencyContentTranslations, sanitizeLang } from '../lib/translation-agent'
 // 0.6.54 — the agency phone must be a DEDICATED number or one of the
 // owner's/staff's own numbers (the create path checks holder users inline).
 
@@ -782,7 +785,25 @@ app.post('/', async (c) => {
 
     // Agencies Management — category must exist in the dictionary (built-in
     // or custom), and any specialty ids must belong to that category.
-    const effectiveCategory = category || 'CLINIC'
+    // 0.6.61 — NEW category from the create-agency wizard: the row is created
+    // NOW (so Agency.category references a real slug and the dashboard works
+    // immediately) and the agent enriches it — trilingual name + emoji icon —
+    // in its next 5-minute window, merging it into every picker/filter.
+    const newCategoryName = String((validation.data as { newCategoryName?: string }).newCategoryName || '').trim()
+    let effectiveCategory = category || 'CLINIC'
+    if (newCategoryName) {
+      try {
+        const row = await createPendingCategory(
+          newCategoryName,
+          sanitizeLang((validation.data as { contentLanguage?: string }).contentLanguage),
+          resolvedOwnerId,
+        )
+        effectiveCategory = row.slug
+      } catch (catErr) {
+        console.warn('[agencies] new-category create failed:', (catErr as Error)?.message || catErr)
+        return c.json({ success: false, error: 'Could not create the new agency category' }, 500)
+      }
+    }
     const categoryError = await categorySlugError(effectiveCategory)
     if (categoryError) {
       return c.json({ success: false, error: categoryError }, 400)
@@ -876,7 +897,7 @@ app.post('/', async (c) => {
           nameAr,
           nameFr,
           customCode: finalCustomCode,
-          category: category || 'CLINIC',
+          category: effectiveCategory,
           ...(specialtyIdsJson !== undefined ? { specialtyIds: specialtyIdsJson } : {}),
           address,
           phone,
@@ -1020,7 +1041,31 @@ app.post('/', async (c) => {
       console.warn('[agencies] session token re-issue failed (non-fatal):', (tokErr as Error)?.message)
     }
 
-    return c.json({ success: true, agency, ...(sessionToken ? { token: sessionToken } : {}) }, 201)
+    // 0.6.61 — AI Translation Agent: queue trilingual coverage for everything
+    // the owner typed in ONE language (agency name/description, service
+    // names). Dictionary hits apply instantly; misses wait for the next
+    // 5-minute agent window. NEVER blocks or fails the create.
+    let translationQueued = 0
+    try {
+      const summary = await enqueueAgencyContentTranslations({
+        agencyId: agency.id,
+        name,
+        nameAr: (agency as { nameAr?: string | null }).nameAr,
+        nameFr: (agency as { nameFr?: string | null }).nameFr,
+        description: (agency as { description?: string | null }).description,
+        contentLanguage: (validation.data as { contentLanguage?: string }).contentLanguage,
+        services: ((agency as { services?: Array<{ id: string; name: string; nameAr?: string | null; nameFr?: string | null }> }).services || [])
+          .map((s) => ({ id: s.id, name: s.name, nameAr: s.nameAr, nameFr: s.nameFr })),
+      })
+      translationQueued = summary.queued
+      if (summary.queued || summary.applied) {
+        console.log(`[agencies] translation agent: ${summary.queued} queued, ${summary.applied} applied from dictionary (agency ${agency.id})`)
+      }
+    } catch (trErr) {
+      console.warn('[agencies] translation enqueue failed (non-fatal):', (trErr as Error)?.message || trErr)
+    }
+
+    return c.json({ success: true, agency, ...(sessionToken ? { token: sessionToken } : {}), translationQueued }, 201)
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

@@ -353,6 +353,12 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   const [nameAr, setNameAr] = useState('');
   const [nameFr, setNameFr] = useState('');
   const [category, setCategory] = useState('CLINIC');
+  // 0.6.61 — AI Translation Agent: the agency's specialty is NOT in the list?
+  // The owner types a NEW category name; after the account + agency are fully
+  // created, the agent translates it into the three languages, picks its emoji
+  // icon, and merges it into every picker/filter (batched 5-minute windows).
+  const [newCategoryEnabled, setNewCategoryEnabled] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState('');
 
   // Step 1: Contact Details
   const [address, setAddress] = useState('');
@@ -698,7 +704,10 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
   const validateStep0 = () => {
     const errs: Record<string, string> = {};
     if (!name.trim()) errs.name = t('agencyNameRequired' as any);
-    if (!category) errs.category = t('agencyCategoryRequired' as any);
+    if (newCategoryEnabled) {
+      // New-category path — the select value is ignored; the typed name rules.
+      if (newCategoryName.trim().length < 2) errs.category = t('newCategoryMinLength' as any);
+    } else if (!category) errs.category = t('agencyCategoryRequired' as any);
     setErrors(errs);
     return Object.keys(errs).length === 0;
   };
@@ -782,7 +791,10 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
     try {
       const body: Record<string, unknown> = {
         name: name.trim(),
-        category,
+        category: newCategoryEnabled && newCategoryName.trim() ? '__new__' : category,
+      // 0.6.61 — AI Translation Agent: authoritative source language of every
+      // string this wizard submits (name/description/services).
+      contentLanguage: lang,
       };
       if (nameAr.trim()) body.nameAr = nameAr.trim();
       if (nameFr.trim()) body.nameFr = nameFr.trim();
@@ -1152,6 +1164,31 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
                     value={category}
                     onChange={(v) => { setCategory(v); setErrors((p) => ({ ...p, category: '' })); }}
                   />
+                  {/* 0.6.61 — new-category entry point (AI Translation Agent) */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setNewCategoryEnabled((v) => !v);
+                      setErrors((p) => ({ ...p, category: '' }));
+                    }}
+                    className="flex items-center gap-1.5 text-xs font-medium text-teal-600 dark:text-teal-400 hover:text-teal-700 dark:hover:text-teal-300 transition-colors"
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                    {newCategoryEnabled ? t('newCategoryCancel' as any) : t('newCategoryToggle' as any)}
+                  </button>
+                  {newCategoryEnabled && (
+                    <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="overflow-hidden space-y-1.5">
+                      <Input
+                        id="new-category-name"
+                        value={newCategoryName}
+                        onChange={(e) => { setNewCategoryName(e.target.value); setErrors((p) => ({ ...p, category: '' })); }}
+                        placeholder={t('newCategoryPlaceholder' as any)}
+                        maxLength={60}
+                        className="h-11"
+                      />
+                      <p className="text-[11px] text-muted-foreground leading-relaxed">{t('newCategoryHint' as any)}</p>
+                    </motion.div>
+                  )}
                   {errors.category && (
                     <motion.p
                       initial={{ opacity: 0, y: -4 }}

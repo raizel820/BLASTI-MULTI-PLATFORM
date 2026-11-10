@@ -20,6 +20,11 @@ import { ThemeToggle } from '@/components/shared/theme-toggle';
 import { ArrowLeft, ArrowRight, Loader2, Eye, EyeOff, UserPlus, Shield, Camera, Check, CircleDot, X, AlertCircle, Users, WifiOff, MapPin, Clock, Bell } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'framer-motion';
+// 0.6.60 — FIELD-INCIDENT fix: client-side Algerian phone normalization +
+// validation. Previously ANY bad format flew to the cloud, got a 400 on a
+// tiny inline label the user never noticed, burned the register rate-limit
+// bucket, and ended in a blind "Too many requests" lockout.
+import { canonicalDZPhone, isValidDZPhone } from '@/lib/phone';
 import type { UserRole } from '@/store/use-app-store';
 import {
   VerificationStep,
@@ -505,6 +510,17 @@ export function RegisterForm() {
       errors.fullName = t('fieldRequired' as any);
     }
 
+    // 0.6.60 — validate the phone EXACTLY like the server (after the same
+    // normalization) BEFORE submitting: the request never fires with a bad
+    // number, so no 400, no wasted rate-limit window, and the error is
+    // unmissable (inline + toast).
+    const canonicalPhone = canonicalDZPhone(phoneNumber);
+    if (!phoneNumber.trim()) {
+      errors.phoneNumber = t('fieldRequired' as any);
+    } else if (!canonicalPhone || !isValidDZPhone(phoneNumber)) {
+      errors.phoneNumber = t('phoneInvalid' as any);
+    }
+
     if (!password || password.length < 6) {
       errors.password = t('passwordMinLength');
     }
@@ -535,8 +551,9 @@ export function RegisterForm() {
         email: trimmedEmail,
       };
 
-      if (phoneNumber.trim()) {
-        body.phoneNumber = phoneNumber.trim();
+      // 0.6.60 — canonical form (see canonicalDZPhone above).
+      if (canonicalPhone) {
+        body.phoneNumber = canonicalPhone;
       }
       // NOTE: no agency code here BY DESIGN — the agency (and its code) is
       // chosen ONLY in the create-agency wizard after registration. An extra
@@ -627,11 +644,20 @@ export function RegisterForm() {
         const errLower = errText.toLowerCase();
         if (errLower.includes('username')) {
           setFieldErrors((prev) => ({ ...prev, username: errText }));
+          toast.error(errText);
         } else if (errLower.includes('email')) {
           // 409 'Email already registered' → inline error on the email field
           setFieldErrors((prev) => ({ ...prev, email: errText }));
+          toast.error(errText);
         } else if (errLower.includes('phone')) {
           setFieldErrors((prev) => ({ ...prev, phoneNumber: errText }));
+          // 0.6.60 — the inline label alone was invisible in the field
+          // incident; the toast makes the rejection unmissable.
+          toast.error(errText);
+        } else if (Number(data?.retryAfter) > 0) {
+          // 0.6.60 — rate-limited: say HOW LONG instead of a bare error.
+          const secs = Math.max(1, Math.ceil(Number(data.retryAfter)));
+          toast.error(t('tooManyRequestsRetry' as any).replace('{seconds}', String(secs)), { duration: Math.min(12000, 4000 + secs * 1000) });
         } else {
           toast.error(errText || t('error'));
         }

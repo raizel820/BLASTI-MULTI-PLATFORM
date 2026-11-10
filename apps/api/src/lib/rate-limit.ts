@@ -320,10 +320,18 @@ export const GENERAL_RATE_LIMIT: RateLimitOptions = {
   prefix: 'api',
 }
 
-/** Registration: 3 requests per minute per IP */
+/**
+ * Registration: 10 requests per minute per IP.
+ * 0.6.60 — was 3/min: this bucket is charged by the GLOBAL middleware BEFORE
+ * validation, so a user fixing a phone/email typo burned it in 3 clicks and
+ * got a blind "Too many requests" (desktop field incident 0.6.58). 10/min
+ * still throttles scripted floods (the abuse blocker + the strict 5/15min
+ * auth bucket on the route itself remain the second and third layers), while
+ * a human re-submitting after a validation error never sees a 429.
+ */
 export const REGISTRATION_RATE_LIMIT: RateLimitOptions = {
   windowMs: 60 * 1000,
-  maxRequests: 3,
+  maxRequests: 10,
   prefix: 'register',
 }
 

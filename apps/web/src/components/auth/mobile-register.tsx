@@ -29,6 +29,10 @@ import { useAppStore } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
 import { useUpload } from '@/hooks/use-upload';
 import { getProxiedUrl } from '@/lib/utils';
+// 0.6.60 — FIELD-INCIDENT fix: client-side Algerian phone normalization +
+// validation (same rules as the server) — a bad number can no longer reach
+// the cloud, burn the register rate-limit bucket and end in a blind 429.
+import { canonicalDZPhone, isValidDZPhone } from '@/lib/phone';
 import { setNativeSessionToken } from '@/lib/api-client';
 import { usePlatform } from '@/hooks/use-platform';
 import { nativeBridge } from '@/lib/native-bridge';
@@ -388,6 +392,13 @@ export function MobileRegisterForm() {
     else if (!EMAIL_REGEX.test(trimmedEmail)) errors.email = emailCopy.invalid;
 
     if (!fullName.trim()) errors.fullName = t('fieldRequired' as any);
+
+    // 0.6.60 — validate the phone EXACTLY like the server (after the same
+    // normalization) BEFORE submitting.
+    const canonicalPhone = canonicalDZPhone(phoneNumber);
+    if (!phoneNumber.trim()) errors.phoneNumber = t('fieldRequired' as any);
+    else if (!canonicalPhone || !isValidDZPhone(phoneNumber)) errors.phoneNumber = t('phoneInvalid' as any);
+
     if (!password || password.length < 6) errors.password = t('passwordMinLength');
     if (password !== confirmPassword) errors.confirmPassword = t('passwordMismatch');
 
@@ -410,7 +421,9 @@ export function MobileRegisterForm() {
         role,
         email: trimmedEmail,
       };
-      if (phoneNumber.trim()) body.phoneNumber = phoneNumber.trim();
+      // 0.6.60 — send the CANONICAL 0XXXXXXXXX form (+213/00213/213/spaces/
+      // Arabic digits are all unified here AND on the server).
+      if (canonicalPhone) body.phoneNumber = canonicalPhone;
       // Uploaded photo URL OR the picked preset icon. 0.6.38 — a preset
       // submits its SHARED static path (presetAvatarPath — same bytes served
       // to everyone, no upload round-trip); unknown picks keep the inline
@@ -468,10 +481,19 @@ export function MobileRegisterForm() {
         const errLower = errText.toLowerCase();
         if (errLower.includes('username')) {
           setFieldErrors((prev) => ({ ...prev, username: errText }));
+          toast.error(errText);
         } else if (errLower.includes('email')) {
           setFieldErrors((prev) => ({ ...prev, email: errText }));
+          toast.error(errText);
         } else if (errLower.includes('phone')) {
           setFieldErrors((prev) => ({ ...prev, phoneNumber: errText }));
+          // 0.6.60 — make the rejection unmissable (the inline label alone
+          // was invisible in the desktop field incident).
+          toast.error(errText);
+        } else if (Number(data?.retryAfter) > 0) {
+          // 0.6.60 — rate-limited: say HOW LONG instead of a bare error.
+          const secs = Math.max(1, Math.ceil(Number(data.retryAfter)));
+          toast.error(t('tooManyRequestsRetry' as any).replace('{seconds}', String(secs)), { duration: Math.min(12000, 4000 + secs * 1000) });
         } else {
           toast.error(errText || t('error'));
         }

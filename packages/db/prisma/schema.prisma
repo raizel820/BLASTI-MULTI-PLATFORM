@@ -1159,6 +1159,106 @@ model CategoryTerm {
   @@index([categoryId])
 }
 
+// ─── 0.6.61 — AI Translation Agent (GLM flash) ───────────────────────────────
+//
+// Every user-typed string (agency name/description, service names, category
+// names/terms) is translated to the other two app languages (ar/en/fr) by a
+// STRICT translation agent. Jobs accumulate between 5-minute processing
+// windows; completed translations land in the local dictionary below and are
+// consulted FIRST forever after — the agent is only called for vocabulary the
+// dictionary does not have yet. The dictionary handles words AND sentences
+// (the whole source string is the unit, keyed by its normalized sha256).
+
+/// The local translation dictionary — wide library built over time.
+model TranslationEntry {
+  id           String   @id @default(cuid())
+  /// sha256 of normalizeForDictionary(sourceText) — the dedup identity.
+  sourceHash   String
+  /// 'ar' | 'en' | 'fr'
+  sourceLang   String
+  sourceText   String
+  /// 'ar' | 'en' | 'fr'
+  targetLang   String
+  targetText   String
+  /// First domain that needed it: 'agency' | 'service' | 'category' | 'term' | 'manual'.
+  domain       String   @default("general")
+  /// Stable key when the translation feeds a keyed surface (e.g. a category-term key).
+  key          String?
+  /// 'agent' (GLM batch) | 'manual' (admin edit).
+  origin       String   @default("agent")
+  usageCount   Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([sourceHash, sourceLang, targetLang])
+  @@index([sourceLang, targetLang])
+  @@index([domain])
+}
+
+/// Batch queue — pending work between the 5-minute agent windows.
+model TranslationJob {
+  id          String    @id @default(cuid())
+  /// 'translate-text' | 'create-category'
+  type        String
+  status      String    @default("pending")
+  /// translate-text columns (denormalized for clean dedup + batch grouping).
+  sourceHash  String?
+  sourceLang  String?
+  targetLang  String?
+  sourceText  String?
+  domain      String?
+  key         String?
+  /// Where the result is applied: 'agency' | 'service' | 'agency-category' | 'category-term'.
+  refType     String?
+  refId       String?
+  /// Target column on the ref row (nameAr/nameFr/descriptionAr/…/valueAr/…).
+  field       String?
+  /// create-category JSON payload ({ categoryRowId, slug, name, sourceLang }).
+  payload     String?
+  attempts    Int       @default(0)
+  error       String?
+  result      String?
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([status, createdAt])
+  @@index([sourceHash, status])
+}
+
+/// Singleton agent settings row (id fixed to 'singleton').
+model TranslationAgentConfig {
+  id              String    @id @default("singleton")
+  enabled         Boolean   @default(true)
+  /// Minutes between agent runs — the batching gate (default 5).
+  intervalMinutes Int       @default(5)
+  /// Max translation items submitted per run.
+  batchSize       Int       @default(40)
+  /// GLM flash model id used with openai-compatible providers.
+  model           String    @default("glm-4.6-flash")
+  lastRunAt       DateTime?
+  lastRunOk       Boolean?
+  lastRunMessage  String?
+  updatedAt       DateTime  @updatedAt
+}
+
+/// Admin-managed, testable agent API keys.
+model TranslationApiKey {
+  id              String    @id @default(cuid())
+  label           String
+  /// 'zai' (bundled SDK — free GLM flash) | 'openai-compatible' (baseUrl+key).
+  provider        String    @default("zai")
+  /// OpenAI-compatible chat endpoint origin (e.g. https://api.z.ai/api/paas/v4).
+  baseUrl         String?
+  apiKey          String
+  model           String?
+  isActive        Boolean   @default(true)
+  lastTestAt      DateTime?
+  lastTestOk      Boolean?
+  lastTestMessage String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
 /// Task C — admin-controlled per-agency-type service conditions (the admin
 /// "Services Management" section). One row per built-in agency category
 /// (DOCTOR | CLINIC | LAW_FIRM | BARBER); defaults ensured on first read.

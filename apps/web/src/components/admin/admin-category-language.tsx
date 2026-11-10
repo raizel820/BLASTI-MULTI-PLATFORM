@@ -208,6 +208,44 @@ export function AdminCategoryLanguage() {
 
   // ── Add term ──
 
+  const [translatingViaAgent, setTranslatingViaAgent] = useState(false);
+
+  /**
+   * 0.6.61 — AI Translation Agent: queue the selected category's name + every
+   * term still missing translations. The agent window runs every 5 minutes;
+   * results land in the local dictionary AND on the category/term rows.
+   */
+  const translateViaAgent = async () => {
+    if (!selectedCategory || translatingViaAgent) return;
+    setTranslatingViaAgent(true);
+    try {
+      const res = await apiFetch('/api/translation-agent/enqueue-category', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ categoryId: selectedCategory.id }),
+      });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.success) {
+        const queued = Number(data?.data?.summary?.queued ?? 0);
+        const applied = Number(data?.data?.summary?.applied ?? 0);
+        if (queued > 0) {
+          toast.success((t('catLangAgentQueued') as any as string).replace('{count}', String(queued)));
+        } else if (applied > 0) {
+          toast.success((t('catLangAgentDictionary') as any as string).replace('{count}', String(applied)));
+        } else {
+          toast.info(t('catLangAgentNothing') as any);
+        }
+        setTimeout(() => { void loadTerms(selectedCategory.slug); }, 1500);
+      } else {
+        toast.error(String(data?.error || (t('error') as any)));
+      }
+    } catch {
+      toast.error(t('error') as any);
+    } finally {
+      setTranslatingViaAgent(false);
+    }
+  };
+
   const openAdd = () => {
     setAddForm(EMPTY_TERM_FORM);
     setAddOpen(true);
@@ -452,6 +490,18 @@ export function AdminCategoryLanguage() {
             >
               {loadingTerms ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
               {t('refresh')}
+            </Button>
+            {/* 0.6.61 — translate the category name + missing term values via
+                the AI Translation Agent (batched, dictionary-backed). */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={translateViaAgent}
+              disabled={!selectedCategory || translatingViaAgent}
+              className="gap-2 border-teal-500/50 text-teal-700 dark:text-teal-400 hover:bg-teal-500/10"
+            >
+              {translatingViaAgent ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+              {t('catLangTranslateAgent')}
             </Button>
             <Button
               size="sm"

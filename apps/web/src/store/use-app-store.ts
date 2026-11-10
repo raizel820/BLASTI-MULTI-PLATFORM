@@ -124,6 +124,7 @@ export type ViewName =
   | 'admin-services-management'
   | 'admin-category-manager'
   | 'admin-category-language'
+  | 'admin-translation-agent'
   | 'admin-audit'
   | 'admin-users'
   | 'admin-analytics'
@@ -305,6 +306,8 @@ const viewHashMap: Record<ViewName, string> = {
   'login': '#/login',
   'register': '#/register',
   'customer-home': '#/customer',
+  // 0.6.59 — Logs Manager (was missing → Record<ViewName,string> type error)
+  'admin-logs-manager': '#/admin/logs-manager',
   'customer-queue': '#/customer/queue',
   'customer-history': '#/customer/history',
   'customer-notifications': '#/customer/notifications',
@@ -345,6 +348,7 @@ const viewHashMap: Record<ViewName, string> = {
   'admin-services-management': '#/admin/services-management',
   'admin-category-manager': '#/admin/category-manager',
   'admin-category-language': '#/admin/category-language',
+  'admin-translation-agent': '#/admin/translation-agent',
   'admin-audit': '#/admin/audit',
   'admin-users': '#/admin/users',
   'admin-analytics': '#/admin/analytics',

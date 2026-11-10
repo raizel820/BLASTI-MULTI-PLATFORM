@@ -1,6 +1,6 @@
 {
   "name": "@blasti/api",
-  "version": "0.6.58",
+  "version": "0.6.61",
   "private": true,
   "main": "src/index.ts",
   "scripts": {
@@ -17,6 +17,7 @@
     "jose": "^6.0.0",
     "qrcode": "^1.5.4",
     "socket.io": "^4.8.1",
+    "z-ai-web-dev-sdk": "^0.0.18",
     "zod": "^4.0.2"
   },
   "devDependencies": {

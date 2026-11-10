@@ -1,6 +1,6 @@
 {
   "name": "@blasti/mobile",
-  "version": "0.6.57",
+  "version": "0.6.61",
   "private": true,
   "scripts": {
     "dev": "echo 'Run bun run dev:web and then cap:sync'",
