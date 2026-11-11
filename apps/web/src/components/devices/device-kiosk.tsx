@@ -9,6 +9,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { DeviceQrScanner } from './device-qr-scanner';
 import { quickDiscover, type DiscoveredServer } from '@/lib/lan-discovery';
 import { apiFetch } from '@/lib/api-fetch';
+import { APP_VERSION } from '@/lib/version';
 import { getLocalIp } from '@/lib/get-local-ip';
 import { flushLogsNow } from '@/lib/remote-logger';
 import { toast } from 'sonner';
@@ -234,7 +235,7 @@ export function DeviceKiosk() {
         const res = await apiFetch('/api/agency-devices/device/heartbeat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-          body: JSON.stringify({ appVersion: '1.0.0', ipAddress: kioskIp || lanServer?.ip || undefined }),
+          body: JSON.stringify({ appVersion: APP_VERSION, ipAddress: kioskIp || lanServer?.ip || undefined }),
         });
         if (res.status === 401) {
           console.warn('[Kiosk] Heartbeat 401 — token invalid, clearing credentials');
@@ -895,7 +896,7 @@ export function DeviceKiosk() {
         await apiFetch('/api/agency-devices/device/heartbeat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-          body: JSON.stringify({ appVersion: '1.0.0', ipAddress: kioskIp || lanServer?.ip || undefined }),
+          body: JSON.stringify({ appVersion: APP_VERSION, ipAddress: kioskIp || lanServer?.ip || undefined }),
         }).catch(() => {});
 
         if (cancelled || userChoseStep.current) return;

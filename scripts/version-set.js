@@ -31,6 +31,10 @@
  *     5. apps/mobile/package.json          → the mobile source of truth
  *     6. apps/mobile/android/app/build.gradle → versionName + versionCode (derived, always
  *                                             monotonic: major*1e6 + minor*1e3 + patch)
+ *     7. apps/web/src/lib/version.ts       → the UI-facing APP_VERSION constant
+ *                                             (landing/login/register footers,
+ *                                             settings About fallback, admin
+ *                                             dashboard, kiosk/TV registration)
  *
  *   scripts/gradle.js additionally re-syncs build.gradle from
  *   apps/mobile/package.json before every Android build as a safety net, so
@@ -55,6 +59,8 @@ const TARGETS = [
   'apps/mobile/package.json',
 ];
 const GRADLE = path.join(ROOT, 'apps', 'mobile', 'android', 'app', 'build.gradle');
+/** The UI-facing version constant (kept in lockstep with the package.jsons). */
+const WEB_VERSION_TS = path.join(ROOT, 'apps', 'web', 'src', 'lib', 'version.ts');
 
 const SEMVER = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 
@@ -108,6 +114,10 @@ const files = TARGETS.map((rel) => ({ rel, ...readJson(rel) }));
 let gradleSrc = '';
 try { gradleSrc = fs.readFileSync(GRADLE, 'utf8'); } catch { /* missing — reported below */ }
 const gradle = gradleVersion(gradleSrc);
+let webVersionTs = null;
+try {
+  webVersionTs = fs.readFileSync(WEB_VERSION_TS, 'utf8').match(/APP_VERSION\s*=\s*'([^']+)'/);
+} catch { /* missing — reported below */ }
 
 console.log('');
 log(checkOnly ? 'Current version map:' : `Setting version → ${nextVersion}`);
@@ -122,10 +132,11 @@ for (const f of files) {
   console.log(`  ${f.rel.padEnd(50)}${String(f.data.version).padEnd(9)}${note}`);
 }
 console.log(`  ${path.relative(ROOT, GRADLE).padEnd(50)}versionName ${gradle.name} / versionCode ${gradle.code}   ← APK name`);
+console.log(`  ${path.relative(ROOT, WEB_VERSION_TS).padEnd(50)}APP_VERSION ${webVersionTs ? webVersionTs[1] : '(missing)'}   ← UI labels`);
 console.log('');
 
 if (checkOnly) {
-  const unique = new Set([...files.map((f) => String(f.data.version)), gradle.name]);
+  const unique = new Set([...files.map((f) => String(f.data.version)), gradle.name, webVersionTs ? webVersionTs[1] : null]);
   if (unique.size > 1) {
     warn(`Versions DIVERGE across ${unique.size} different values — run:  bun run version:set <x.y.z>`);
     process.exitCode = 1;
@@ -141,6 +152,17 @@ for (const f of files) {
   f.data.version = nextVersion;
   writeJson(f.rel, f);
   if (before !== nextVersion) log(`    (was ${before})`);
+}
+
+if (!webVersionTs) {
+  warn('apps/web/src/lib/version.ts not found or malformed — UI version NOT updated.');
+} else if (webVersionTs[1] !== nextVersion) {
+  const updatedTs = fs.readFileSync(WEB_VERSION_TS, 'utf8')
+    .replace(/APP_VERSION\s*=\s*'[^']*'/, `APP_VERSION = '${nextVersion}'`);
+  fs.writeFileSync(WEB_VERSION_TS, updatedTs);
+  log(`  ✔ ${path.relative(ROOT, WEB_VERSION_TS)} → APP_VERSION ${nextVersion} (was ${webVersionTs[1]})`);
+} else {
+  log(`  ✔ ${path.relative(ROOT, WEB_VERSION_TS)} already at ${nextVersion} — untouched`);
 }
 
 if (!gradleSrc) {

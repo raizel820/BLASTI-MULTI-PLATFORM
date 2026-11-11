@@ -872,6 +872,19 @@ function isOnlineOnlyPath(path: string, includeAuth: boolean = true): boolean {
   return false;
 }
 
+/**
+ * Account creation / confirmation / recovery endpoints that must NEVER be
+ * short-circuited by the "cloud known-down" fail-fast (0.6.66): register,
+ * verify, the OTP resend and the password-recovery pair are cloud-only,
+ * user-initiated operations, and in Electron they are live cloud proxies on
+ * the local API. See the fail-fast call site.
+ */
+const AUTH_CONFIRM_PATH_RE = /^\/api\/auth\/(register|verify|resend-verification|forgot-password|reset-password)$/;
+
+function isAuthConfirmPath(path: string): boolean {
+  return AUTH_CONFIRM_PATH_RE.test(path);
+}
+
 // ─── Electron LAN Pre-Discovery ─────────────────────────────────────────────
 // LOCAL-FIRST NOTE: in Electron the base URL is now ALWAYS 127.0.0.1:3080,
 // so this pre-discovery can no longer influence where requests go (it never
@@ -1478,7 +1491,13 @@ export class ApiClient {
     // try the LAN server (port 3080) FIRST. This avoids waiting through the
     // full cloud-retry cycle on every button click when the API is down.
     // Use includeAuth=false: Electron local API (port 3080) has its own auth endpoints.
-    const _fastBypassEligible = isApiUnreachable() && isNativeRuntime() && !isOnlineOnlyPath(path, false);
+    //
+    // 0.6.66 — in Electron requestViaLan targets the SAME local endpoint
+    // (127.0.0.1:3080), so for the auth confirmation proxies (register/verify/
+    // resend — each waits up to 15s on their cloud fetch) the bypass would
+    // just double an already slow doomed request. Do it once, normally.
+    const _sameEndpointLanRetry = isElectronRuntime() && isAuthConfirmPath(path);
+    const _fastBypassEligible = isApiUnreachable() && isNativeRuntime() && !isOnlineOnlyPath(path, false) && !_sameEndpointLanRetry;
     if (_fastBypassEligible) {
       console.log(`[ApiClient:FAST_LAN] ${method} ${path} → skipping cloud (isApiUnreachable=true, ~${Math.max(0, _apiUnreachableUntil - Date.now())}ms remaining)`);
       try {
@@ -1697,7 +1716,10 @@ export class ApiClient {
     // OR a server error (5xx — which happens when the Next.js proxy can't reach the backend),
     // try the LAN desktop server (port 3080) before giving up.
     // Use includeAuth=false: auth routes are allowed to fall through to LAN in Electron.
-    const _lanEligible = lastError && isNativeRuntime() && !isOnlineOnlyPath(path, false) && (lastError.status === 0 || (lastError.status >= 500 && lastError.status < 600));
+    // 0.6.66 — EXCEPT the auth confirmation paths in Electron: requestViaLan
+    // retries the SAME local endpoint there, i.e. another 15s cloud-proxy wait
+    // after the identical request just returned a definitive answer.
+    const _lanEligible = lastError && isNativeRuntime() && !isOnlineOnlyPath(path, false) && !_sameEndpointLanRetry && (lastError.status === 0 || (lastError.status >= 500 && lastError.status < 600));
     if (_lanEligible) {
       markApiUnreachable(); // Mark cloud as unreachable so future requests try LAN first
       console.log(`[ApiClient:LAN] ${method} ${path} → cloud failed (status=${lastError.status}), trying LAN failover`);
@@ -2365,7 +2387,19 @@ ApiClient.prototype.request = async function<T>(
   // When the cloud API is unreachable and the path has no offline/LAN
   // implementation, don't waste 2+ seconds on a guaranteed cloud failure.
   // The caller should handle this gracefully (e.g., hide analytics charts).
-  if (isNativeRuntime() && isApiUnreachable() && isOnlineOnlyPath(path, false)) {
+  //
+  // 0.6.66 — ACCOUNT CREATION / CONFIRMATION IS ALWAYS ATTEMPTED. The 30s
+  // `isApiUnreachable` flag is set by ANY 5xx/network failure of the
+  // configured base — in Electron that base is the LOCAL API (:3080), whose
+  // /api/auth/register + /api/auth/verify routes are live CLOUD PROXIES.
+  // Fail-fast-ing those paths here blocked new signups for 30s after one
+  // transient error and surfaced the raw "Cloud API unreachable and this
+  // endpoint has no offline fallback" message at the confirmation step
+  // ("stuck at confirmation") — even though the very next attempt would have
+  // succeeded. These endpoints are rare, user-initiated, and short, so the
+  // worst case (one doomed request) is acceptable; a blocked signup is not.
+  const isAuthConfirm = isAuthConfirmPath(path);
+  if (isNativeRuntime() && isApiUnreachable() && isOnlineOnlyPath(path, false) && !isAuthConfirm) {
     const rem = Math.max(0, _apiUnreachableUntil - Date.now());
     console.log(`[ApiClient:SKIP] ${method} ${path} → cloud down & online-only, failing fast (~${rem}ms until retry)`);
     throw new ApiClientError('Cloud API unreachable and this endpoint has no offline fallback', 0, null);

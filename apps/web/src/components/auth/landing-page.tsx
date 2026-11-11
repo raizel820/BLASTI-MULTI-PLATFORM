@@ -1,5 +1,6 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
+import { APP_VERSION } from '@/lib/version';
 
 import { useRef, useState, useEffect, useCallback } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -1683,7 +1684,7 @@ export function LandingPage() {
               <p className="text-xs text-muted-foreground/60">
                 BLASTI © {new Date().getFullYear()} · {t('rightsReserved')}
               </p>
-              <p className="text-[10px] text-muted-foreground/40 mt-1">{t('version')}</p>
+              <p className="text-[10px] text-muted-foreground/40 mt-1">{t('version').replace('{v}', APP_VERSION)}</p>
             </div>
           </div>
         </footer>

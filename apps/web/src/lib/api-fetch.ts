@@ -59,6 +59,14 @@ export async function apiFetch(
     body?: BodyInit | null;
     signal?: AbortSignal;
     credentials?: RequestCredentials;
+    /**
+     * Per-request timeout override (ms) — forwarded to apiClient.
+     * 0.6.66: the desktop local API's auth proxies (register/verify/resend)
+     * wait up to 15s on their own cloud fetch before answering — callers of
+     * those endpoints MUST pass ≥ 20000 or the renderer aborts first and the
+     * accurate error body never arrives.
+     */
+    timeout?: number;
   },
 ): Promise<ApiFetchResponse> {
   const method = (options?.method || 'GET').toUpperCase();
@@ -91,7 +99,10 @@ export async function apiFetch(
     }
   }
 
-  const requestOptions = options?.signal ? { signal: options.signal } : undefined;
+  const requestOptions = {
+    ...(options?.signal ? { signal: options.signal } : {}),
+    ...(options?.timeout ? { timeout: options.timeout } : {}),
+  };
 
   // 0.6.55 — "too many requests" observability: every 429 that reaches the
   // app lands in the log vault with the rate-limit trigger (throttled to one

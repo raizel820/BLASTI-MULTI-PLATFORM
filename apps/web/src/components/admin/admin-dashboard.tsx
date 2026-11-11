@@ -1,5 +1,6 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
+import { APP_VERSION } from '@/lib/version';
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useAppStore } from '@/store/use-app-store';
@@ -2216,7 +2217,7 @@ export function AdminDashboard() {
         className="text-center pb-2"
       >
         <Badge variant="outline" className="text-[10px] text-muted-foreground font-normal border-dashed">
-          {t('platformVersion')}: v1.0.0 · {t('lastUpdated')}: {formatTime(new Date().toISOString())}
+          {t('platformVersion')}: v{APP_VERSION} · {t('lastUpdated')}: {formatTime(new Date().toISOString())}
         </Badge>
       </motion.div>
     </div>

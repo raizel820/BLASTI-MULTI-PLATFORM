@@ -428,7 +428,8 @@ const fr: Record<TranslationKeys, string> = {
   confirmLogout: "Êtes-vous sûr de vouloir vous déconnecter ?",
   poweredBy: "Propulsé par",
   rightsReserved: "Tous droits réservés",
-  version: "Version 1.0",
+  version: "Version {v}",
+  accountNeedsInternet: "Cette opération nécessite une connexion Internet — le serveur est injoignable. Vérifiez votre connexion et réessayez.",
 
   // ─── Themes �n─────────────────────────────
   lightMode: "Mode clair",

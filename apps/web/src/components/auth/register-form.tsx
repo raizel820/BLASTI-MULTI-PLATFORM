@@ -1,5 +1,6 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
+import { APP_VERSION } from '@/lib/version';
 
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { adoptLocalLanguagePreference } from '@/hooks/use-language';
@@ -593,6 +594,10 @@ export function RegisterForm() {
       const res = await apiFetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // 0.6.66 — the desktop local API's register proxy waits up to 15s on
+        // its own cloud fetch; the renderer must not abort before the
+        // accurate error body arrives (default Electron timeout is 12s).
+        timeout: 20000,
         body: JSON.stringify(body),
       });
 
@@ -642,7 +647,12 @@ export function RegisterForm() {
         // agency-phone wording which starts with "This phone number…").
         const errText = String(data.error || '');
         const errLower = errText.toLowerCase();
-        if (errLower.includes('username')) {
+        // 0.6.66 — network-class failures (the desktop local API answers 503
+        // CLOUD_UNREACHABLE; a dead local API surfaces as 'Failed to fetch')
+        // get the localized needs-internet message instead of raw English.
+        if (data.code === 'CLOUD_UNREACHABLE' || /unreachab|network|failed to fetch|timed out|offline/i.test(errText)) {
+          toast.error(t('accountNeedsInternet'));
+        } else if (errLower.includes('username')) {
           setFieldErrors((prev) => ({ ...prev, username: errText }));
           toast.error(errText);
         } else if (errLower.includes('email')) {
@@ -1744,7 +1754,7 @@ export function RegisterForm() {
                     BLASTI
                   </span>
                 </div>
-                <p className="text-[10px] text-muted-foreground/50">{t('rightsReserved')} · {t('version')}</p>
+                <p className="text-[10px] text-muted-foreground/50">{t('rightsReserved')} · {t('version').replace('{v}', APP_VERSION)}</p>
               </motion.div>
             </div>
           </div>

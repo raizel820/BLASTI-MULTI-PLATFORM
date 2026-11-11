@@ -428,7 +428,8 @@ const en: Record<TranslationKeys, string> = {
   confirmLogout: "Are you sure you want to logout?",
   poweredBy: "Powered by",
   rightsReserved: "All rights reserved",
-  version: "Version 1.0",
+  version: "Version {v}",
+  accountNeedsInternet: "This operation requires an internet connection — the server is unreachable. Check your connection and try again.",
 
   // ─── Themes ──────────────────────────────
   lightMode: "Light Mode",

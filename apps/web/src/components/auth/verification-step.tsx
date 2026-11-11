@@ -131,6 +131,7 @@ const COPY = {
       USERNAME_CONFLICT_ON_CREATE: 'اسم المستخدم حُجز من حساب آخر أثناء التحقق — ارجع وغيّره ثم أكّد الرموز مجدداً',
       EMAIL_CONFLICT_ON_CREATE: 'البريد الإلكتروني حُجز من حساب آخر أثناء التحقق — ارجع وغيّره ثم أكّد الرموز مجدداً',
       PHONE_CONFLICT_ON_CREATE: 'رقم الهاتف حُجز من حساب آخر أثناء التحقق — ارجع وغيّره ثم أكّد الرموز مجدداً',
+      CLOUD_UNREACHABLE: 'يتطلب تأكيد الحساب اتصالاً بالإنترنت — تحقق من اتصالك ثم أعد المحاولة',
       GENERIC: 'حدث خطأ — حاول مجدداً',
     },
     remainingAttempts: ' · محاولات متبقية: {n}',
@@ -168,6 +169,7 @@ const COPY = {
       USERNAME_CONFLICT_ON_CREATE: 'That username was claimed by another account while you were verifying — go back, change it, and confirm the codes again',
       EMAIL_CONFLICT_ON_CREATE: 'That email was claimed by another account while you were verifying — go back, change it, and confirm the codes again',
       PHONE_CONFLICT_ON_CREATE: 'That phone number was claimed by another account while you were verifying — go back, change it, and confirm the codes again',
+      CLOUD_UNREACHABLE: 'Account confirmation requires an internet connection — check your connection and try again',
       GENERIC: 'Something went wrong — please try again',
     },
     remainingAttempts: ' · {n} attempts left',
@@ -309,6 +311,11 @@ export function VerificationStep({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
+        // 0.6.66 — the desktop local API's verify proxy waits up to 15s on its
+        // own cloud fetch; the renderer default (12s in Electron) aborted
+        // first, so the accurate error body never arrived and the step felt
+        // stuck. 20s lets the definitive answer land.
+        timeout: 20000,
         body: JSON.stringify({
           verificationToken,
           ...(submitEmail ? { emailCode } : {}),
@@ -355,7 +362,15 @@ export function VerificationStep({
       if (results.phone?.success) markVerified('phone')
 
       const channel: VerificationChannel = data.channel === 'phone' ? 'phone' : 'email'
-      const message = verificationErrorMessage(c, data.error, { attempts: data.remainingAttempts })
+      // 0.6.66 — network-class failures (the desktop local API answers 503
+      // CLOUD_UNREACHABLE when its cloud fetch fails; a dead server surfaces
+      // as a raw English fetch error) map to the localized needs-internet
+      // message instead of the misleading generic one.
+      const errCode = (data.code === 'CLOUD_UNREACHABLE' || res.status === 503
+        || /unreachab|network|failed to fetch|timed out|offline/i.test(String(data.error || '')))
+        ? 'CLOUD_UNREACHABLE'
+        : data.error
+      const message = verificationErrorMessage(c, errCode, { attempts: data.remainingAttempts })
       setChannelError({ channel, message })
       triggerShake(channel)
       toast.error(message)
@@ -382,6 +397,8 @@ export function VerificationStep({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
+        // 0.6.66 — same proxy-wait rationale as the verify call above.
+        timeout: 20000,
         body: JSON.stringify({ verificationToken, channel }),
       })
       const data = await res.json()
@@ -411,10 +428,16 @@ export function VerificationStep({
         onTokenInvalid?.()
         return
       }
-      // TOO_MANY_ATTEMPTS or delivery failure
-      setChannelError({ channel, message: verificationErrorMessage(c, data.error) })
+      // TOO_MANY_ATTEMPTS or delivery failure — 0.6.66: network-class
+      // failures (503 CLOUD_UNREACHABLE from the desktop proxy, raw fetch
+      // errors) map to the localized needs-internet message.
+      const resendErrCode = (data.code === 'CLOUD_UNREACHABLE' || res.status === 503
+        || /unreachab|network|failed to fetch|timed out|offline/i.test(String(data.error || '')))
+        ? 'CLOUD_UNREACHABLE'
+        : data.error
+      setChannelError({ channel, message: verificationErrorMessage(c, resendErrCode) })
       triggerShake(channel)
-      toast.error(verificationErrorMessage(c, data.error))
+      toast.error(verificationErrorMessage(c, resendErrCode))
     } catch {
       toast.error(c.resendFailed)
     } finally {

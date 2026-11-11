@@ -8,6 +8,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Monitor, Clock, Users, ArrowLeft, RefreshCw, Wifi, WifiOff, Maximize, Minimize, Megaphone, PauseCircle, Link2, FileUp } from 'lucide-react';
 import { quickDiscover, type DiscoveredServer } from '@/lib/lan-discovery';
 import { apiFetch } from '@/lib/api-fetch';
+import { APP_VERSION } from '@/lib/version';
 import { flushLogsNow } from '@/lib/remote-logger';
 import { toast } from 'sonner';
 import { translateStatus } from '@/lib/enum-i18n';
@@ -548,7 +549,7 @@ export function DeviceTvBoard({
             'Authorization': `Bearer ${token}`,
           },
           body: JSON.stringify({
-            appVersion: '1.0.0',
+            appVersion: APP_VERSION,
             ipAddress: getCachedLocalIp() || lanServer?.ip || undefined,
           }),
         });

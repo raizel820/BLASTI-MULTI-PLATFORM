@@ -52,9 +52,10 @@ import { ImageUploadPreviewDialog } from '@/components/shared/image-upload-previ
 import { FullResyncButton } from '@/components/shared/full-resync-button';
 import { AppUpdateSettingsCard } from '@/components/shared/app-update-settings-card';
 import { AccountVerificationCard } from '@/components/shared/account-verification-card';
-// Task 2-a — real app version for the About row (null in plain browsers →
-// the static fallback label stays).
+// Task 2-a — real app version for the About row (the native probe wins; the
+// bundle APP_VERSION constant is the fallback in plain browsers / Electron).
 import { getAppVersion } from '@/lib/app-version';
+import { APP_VERSION } from '@/lib/version';
 import {
   User,
   Bell,
@@ -780,7 +781,7 @@ export function CustomerSettings() {
                 <Info className="h-4 w-4 text-muted-foreground" />
               </div>
               <p className="text-xs text-muted-foreground">{t('appVersion')}</p>
-              <p className="text-sm font-medium text-foreground ms-auto" dir="ltr">{appVersion ?? '1.0.0'}</p>
+              <p className="text-sm font-medium text-foreground ms-auto" dir="ltr">{appVersion ?? APP_VERSION}</p>
             </div>
             {isNativeShell() && (
               <button

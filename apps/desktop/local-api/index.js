@@ -2692,6 +2692,12 @@ function createApp() {
       hostname = os.hostname() || ''
       platform = `${os.type()} ${os.arch()}`.trim()
     } catch { /* non-fatal */ }
+    // 0.6.66 — report the REAL desktop version (same source as /api/health).
+    // This used to be a hardcoded '1.0.0', so the desktop loading screen's
+    // server identity label ("إصدار …") always said 1.0.0 while the actual
+    // release train was 0.6.x.
+    let version = null
+    try { version = require('../package.json').version || null } catch { /* dev run */ }
     // LAN-reachability fields — clients treat extra fields safely. When bound
     // to the LAN, lanIp tells the scanner WHICH address answered (the UDP
     // beacon carries the same pair).
@@ -2702,7 +2708,7 @@ function createApp() {
     try { lanAuth = lanAuthority.publicIdentity() } catch { /* non-fatal */ }
     return c.json({
       service: 'blasti-local',
-      version: '1.0.0',
+      version,
       mode: 'local-first',
       hostname,
       displayName: hostname ? `BLASTI Desktop — ${hostname}` : 'BLASTI Desktop',

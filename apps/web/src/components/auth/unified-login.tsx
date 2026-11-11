@@ -39,6 +39,7 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { apiFetch } from '@/lib/api-fetch'
+import { APP_VERSION } from '@/lib/version'
 import { apiClient, setNativeSessionToken } from '@/lib/api-client'
 import { setSessionPersistenceMode, getLastRememberChoice } from '@/lib/auth-storage'
 import { adoptLocalLanguagePreference } from '@/hooks/use-language'
@@ -458,7 +459,12 @@ export function UnifiedLoginForm() {
       setForgotSent(true)
       toast.success(t('forgotPasswordSuccess'))
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : t('error')
+      // 0.6.66 — network-class failures get the localized needs-internet
+      // message instead of the raw English ApiClientError text.
+      const raw = err instanceof Error ? err.message : ''
+      const message = /unreachab|network|failed to fetch|timed out|offline/i.test(raw)
+        ? t('accountNeedsInternet')
+        : (raw || t('error'))
       toast.error(message)
     } finally {
       setForgotLoading(false)
@@ -480,7 +486,11 @@ export function UnifiedLoginForm() {
       setResetDone(true)
       toast.success(t('resetPasswordSuccess'))
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : t('error')
+      // 0.6.66 — same network-class mapping as the forgot flow above.
+      const raw = err instanceof Error ? err.message : ''
+      const message = /unreachab|network|failed to fetch|timed out|offline/i.test(raw)
+        ? t('accountNeedsInternet')
+        : (raw || t('error'))
       toast.error(message)
     } finally {
       setResetLoading(false)
@@ -870,7 +880,7 @@ export function UnifiedLoginForm() {
             </motion.div>
           </div>
           <footer className="px-5 py-3 text-center text-[11px] text-muted-foreground">
-            {t('rightsReserved')} · {t('version')}
+            {t('rightsReserved')} · {t('version').replace('{v}', APP_VERSION)}
           </footer>
         </main>
 
@@ -988,7 +998,7 @@ export function UnifiedLoginForm() {
         </main>
 
         <footer className="px-5 pb-4 text-center text-[11px] text-muted-foreground flex items-center justify-center gap-3">
-          <span>{t('rightsReserved')} · {t('version')}</span>
+          <span>{t('rightsReserved')} · {t('version').replace('{v}', APP_VERSION)}</span>
           <button
             type="button"
             onClick={() => setDiagOpen(true)}
@@ -1149,7 +1159,7 @@ export function UnifiedLoginForm() {
         </a>
       </div>
       <footer className="relative z-10 pb-5 text-center text-[11px] text-muted-foreground">
-        {t('rightsReserved')} · {t('version')}
+        {t('rightsReserved')} · {t('version').replace('{v}', APP_VERSION)}
       </footer>
 
       <MobileDiagnosticsSheet open={diagOpen} onOpenChange={setDiagOpen} />

@@ -453,6 +453,9 @@ export function MobileRegisterForm() {
       const res = await apiFetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // 0.6.66 — generous timeout: the desktop local API's register proxy
+        // waits up to 15s on its cloud fetch before answering.
+        timeout: 20000,
         body: JSON.stringify(body),
       });
 
@@ -479,7 +482,11 @@ export function MobileRegisterForm() {
         // agency-phone wording which starts with "This phone number…").
         const errText = String(data.error || '');
         const errLower = errText.toLowerCase();
-        if (errLower.includes('username')) {
+        // 0.6.66 — network-class failures get the localized needs-internet
+        // message instead of raw English (see register-form.tsx).
+        if (data.code === 'CLOUD_UNREACHABLE' || /unreachab|network|failed to fetch|timed out|offline/i.test(errText)) {
+          toast.error(t('accountNeedsInternet'));
+        } else if (errLower.includes('username')) {
           setFieldErrors((prev) => ({ ...prev, username: errText }));
           toast.error(errText);
         } else if (errLower.includes('email')) {
