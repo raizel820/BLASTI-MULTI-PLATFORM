@@ -765,6 +765,66 @@ function cloudBaseUrl() {
   return process.env.BLASTI_CLOUD_URL || 'http://localhost:3003'
 }
 
+/**
+ * 0.6.67 — cloud fetch with TRANSPARENT retry on transient network failures.
+ *
+ * Field pattern (stable internet, first try always fails, second passes): the
+ * FIRST fetch a freshly-booted local API process makes to the cloud pays the
+ * one-time connection costs — DNS resolution (IPv6 fallback on Windows can
+ * burn seconds), TCP connect, TLS handshake — and when that budget exceeds
+ * the caller's timeout the user sees "requires an internet connection" even
+ * though the network is fine. The SECOND attempt reuses the warm connection
+ * pool and lands instantly. Instead of forcing the user to be the retry
+ * loop, the proxy itself retries thrown network failures (never HTTP error
+ * STATUSES — a 400/409/404 is a deterministic answer, not a flake).
+ */
+async function cloudFetchWithRetry(path, init, opts = {}) {
+  const timeoutMs = opts.timeoutMs || 15000
+  const attempts = opts.attempts || 2
+  const delayMs = opts.delayMs || 1200
+  let lastErr = null
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fetch(cloudBaseUrl() + path, { ...init, signal: AbortSignal.timeout(timeoutMs) })
+    } catch (err) {
+      lastErr = err
+      if (attempt < attempts) {
+        console.warn(`[LocalAPI] Cloud fetch ${init?.method || 'GET'} ${path} failed (attempt ${attempt}/${attempts}) — retrying in ${delayMs}ms:`, err?.message || err)
+        await new Promise((r) => setTimeout(r, delayMs))
+      }
+    }
+  }
+  throw lastErr
+}
+
+/**
+ * 0.6.67 — boot-time cloud warm-up. Right after the local API starts
+ * listening, quietly establish the cloud connection (DNS + TCP + TLS land in
+ * the SAME connection pool the auth/agency proxies use) so the user's FIRST
+ * register/verify/agency-create request of the session is already warm.
+ * Best-effort: stops on the first success, gives up silently after ~6 tries,
+ * and never blocks or fails the boot.
+ */
+async function warmCloudConnection() {
+  const attempts = 6
+  const delayMs = 3000
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const res = await fetch(cloudBaseUrl() + '/api/health', { signal: AbortSignal.timeout(5000) })
+      if (res.ok) {
+        console.log(`[LocalAPI] Cloud warm-up OK (attempt ${attempt}/${attempts}) — connection pool ready for the auth/agency proxies`)
+        return true
+      }
+      console.warn(`[LocalAPI] Cloud warm-up attempt ${attempt}/${attempts}: health answered ${res.status}`)
+    } catch (err) {
+      console.warn(`[LocalAPI] Cloud warm-up attempt ${attempt}/${attempts} failed:`, err?.message || err)
+    }
+    if (attempt < attempts) await new Promise((r) => setTimeout(r, delayMs))
+  }
+  console.warn('[LocalAPI] Cloud warm-up gave up — the proxies still retry per-request, no action needed')
+  return false
+}
+
 // Secrecy-0.6.48 — the desktop local API signs its cloud login proxy with
 // the SAME desktop attestation secret as the Electron main process. Before
 // this, the proxy sent NO platform identity at all, so the cloud minted
@@ -2582,6 +2642,18 @@ function createApp() {
   })
 
   // Alias: /api/health (used by loading-screen diagnostics probe)
+  // 0.6.68 — /api/cloud-status: the renderer's internet-gated flows (the
+  // register-view ConnectivityGate) probe THIS route instead of the cloud
+  // directly: the local API always answers even fully offline, and the
+  // `reachable` field is ITS live view of the cloud — the sync engine's fast
+  // verdict when fresh, otherwise a real 2.5 s /api/health probe. A stale
+  // false verdict is re-probed for real (a false negative would lock a
+  // working user out of the sign-up page for a full retry cycle).
+  app.get('/api/cloud-status', async (c) => {
+    const fast = cloudOnlineFast()
+    const reachable = fast === true ? true : await isCloudReachable(2500)
+    return c.json({ success: true, reachable, checkedAt: new Date().toISOString() })
+  })
   // ─── R-21F: LAN authority routes (join/status) ─────────────────────────────
   // POST /api/lan/join — a device holding a valid CLOUD session token joins
   // this workspace's offline master: scope re-validated (agency + branch),
@@ -3067,15 +3139,22 @@ function createApp() {
         return c.json({ success: false, error: 'Password must be at least 6 characters' }, 400)
       }
 
-      const base = cloudBaseUrl()
       let reg
       try {
-        const res = await fetch(base + '/api/auth/register', {
+        // 0.6.67 — signed desktop identity (parity with cloudLoginProxy): the
+        // cloud resolves the platform from the attestation when it enforces
+        // the role×platform matrix at verify time AND when it picks the
+        // welcome-email variant — without it a desktop signup looked 'web'.
+        // The fetch itself retries transient network failures transparently.
+        const res = await cloudFetchWithRetry('/api/auth/register', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-blasti-client': 'desktop',
+            'x-blasti-attest': buildDesktopAttestation(),
+          },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(15000),
-        })
+        }, { timeoutMs: 15000, attempts: 2 })
         let data = null
         try { data = await res.json() } catch { /* non-JSON error body */ }
         reg = { ok: res.ok, status: res.status, data }
@@ -3205,15 +3284,20 @@ function createApp() {
       if (!body || !body.verificationToken) {
         return c.json({ success: false, error: 'verificationToken is required' }, 400)
       }
-      const base = cloudBaseUrl()
       let cloud
       try {
-        const res = await fetch(base + '/api/auth/verify', {
+        // 0.6.67 — desktop attestation + transparent retry (see the register
+        // proxy): the verify response is where the cloud mints the session
+        // (platform matrix + welcome-email variant both read the platform).
+        const res = await cloudFetchWithRetry('/api/auth/verify', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'x-blasti-client': 'desktop',
+            'x-blasti-attest': buildDesktopAttestation(),
+          },
           body: JSON.stringify(body),
-          signal: AbortSignal.timeout(15000),
-        })
+        }, { timeoutMs: 15000, attempts: 2 })
         let data = null
         try { data = await res.json() } catch { /* non-JSON */ }
         cloud = { ok: res.ok, status: res.status, data }
@@ -3294,13 +3378,15 @@ function createApp() {
       if (!body || !body.verificationToken || !body.channel) {
         return c.json({ success: false, error: 'verificationToken and channel are required' }, 400)
       }
-      const base = cloudBaseUrl()
-      const res = await fetch(base + '/api/auth/resend-verification', {
+      const res = await cloudFetchWithRetry('/api/auth/resend-verification', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-blasti-client': 'desktop',
+          'x-blasti-attest': buildDesktopAttestation(),
+        },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15000),
-      })
+      }, { timeoutMs: 15000, attempts: 2 })
       let data = null
       try { data = await res.json() } catch { /* non-JSON */ }
       return c.json(data || { success: false, error: 'Resend failed' }, res.ok ? 200 : (res.status || 500))
@@ -3321,13 +3407,15 @@ function createApp() {
       if (!body || !body.verificationToken) {
         return c.json({ success: false, error: 'verificationToken is required' }, 400)
       }
-      const base = cloudBaseUrl()
-      const res = await fetch(base + '/api/auth/verification-status', {
+      // 0.6.68 — transient-failure retry (same rationale as register/verify):
+      // this proxy resumes an interrupted confirmation, i.e. it runs right
+      // after boot/reconnect when the cloud pool is cold — the exact moment
+      // the "fails first try" pattern hits hardest.
+      const res = await cloudFetchWithRetry('/api/auth/verification-status', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(10000),
-      })
+      }, { timeoutMs: 10000, attempts: 2, delayMs: 1000 })
       let data = null
       try { data = await res.json() } catch { /* non-JSON */ }
       return c.json(data || { success: false, error: 'Status check failed' }, res.ok ? 200 : (res.status || 500))
@@ -3927,7 +4015,6 @@ function createApp() {
       const reqUrl = new URL(c.req.url)
       // Strip the web-gateway routing hint — meaningless to the cloud.
       reqUrl.searchParams.delete('XTransformPort')
-      const target = cloudBaseUrl() + reqUrl.pathname + (reqUrl.search || '')
       const method = c.req.method
       let bodyBuffer = null
       if (method !== 'GET' && method !== 'HEAD') {
@@ -3935,7 +4022,10 @@ function createApp() {
       }
       let res
       try {
-        res = await fetch(target, {
+        // 0.6.67 — transient-failure retry (the agency create is a rare,
+        // user-initiated write; a cold first connection used to burn the
+        // whole budget and surface "فشل إنشاء المؤسسة" until the 2nd try).
+        res = await cloudFetchWithRetry(reqUrl.pathname + (reqUrl.search || ''), {
           method,
           headers: {
             'Content-Type': 'application/json',
@@ -3943,8 +4033,7 @@ function createApp() {
             ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
           },
           body: bodyBuffer,
-          signal: AbortSignal.timeout(30000),
-        })
+        }, { timeoutMs: 15000, attempts: 2 })
       } catch (err) {
         console.warn('[LocalAPI] Agencies proxy: cloud unreachable:', err?.message || err)
         return c.json({
@@ -4003,7 +4092,8 @@ function createApp() {
       try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
       let res
       try {
-        res = await fetch(cloudBaseUrl() + cloudPath, {
+        // 0.6.67 — transient-failure retry (same rationale as the register proxy).
+        res = await cloudFetchWithRetry(cloudPath, {
           method: c.req.method,
           headers: {
             'Content-Type': 'application/json',
@@ -4013,8 +4103,7 @@ function createApp() {
             ...(opts.withAuth && sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
           },
           body: bodyBuffer,
-          signal: AbortSignal.timeout(30000),
-        })
+        }, { timeoutMs: 15000, attempts: 2 })
       } catch (err) {
         console.warn(`[LocalAPI] ${cloudPath} proxy: cloud unreachable:`, err?.message || err)
         return c.json({
@@ -4192,9 +4281,10 @@ function createApp() {
       return c.json({ available: username.length >= 3 })
     }
     try {
-      const res = await fetch(cloudBaseUrl() + '/api/auth/check-username?username=' + encodeURIComponent(username), {
-        signal: AbortSignal.timeout(5000),
-      })
+      // 0.6.68 — retry the cloud hop (2×5s): this check fires right after the
+      // register form mounts, i.e. on the coldest connection of the session.
+      // The local fallback below still covers a genuinely dead cloud.
+      const res = await cloudFetchWithRetry('/api/auth/check-username?username=' + encodeURIComponent(username), {}, { timeoutMs: 5000, attempts: 2, delayMs: 800 })
       const data = await res.json().catch(() => null)
       if (data && typeof data.available === 'boolean') {
         return c.json({ available: data.available })
@@ -12441,6 +12531,12 @@ async function startLocalApi(dbPath, port, options) {
       }
     })
   })
+
+  // 0.6.67 — warm the cloud connection NOW (background, non-blocking): the
+  // user's first register/verify/agency-create of the session then reuses a
+  // ready DNS/TLS/connection-pool instead of paying the cold-start budget
+  // and failing "requires an internet connection" on the first try.
+  try { warmCloudConnection().catch(() => undefined) } catch { /* never fatal */ }
 
   // ── Local realtime socket server (local-first, spec §7/§8) ────────────────
   // The desktop UI connects its Socket.IO client to THIS server (use-realtime

@@ -62,6 +62,24 @@ function queueEmailInner(opts: { emoji: string; headline: string; rows: Array<[s
 </div>`
 }
 
+/**
+ * 0.6.67 — inner HTML for the differentiated welcome emails. One checklist
+ * card whose steps depend on the AUDIENCE (agency owner vs regular customer)
+ * and whose framing depends on the PLATFORM the account was verified from
+ * (desktop app / mobile app / web browser).
+ */
+function welcomeChecklistInner(opts: { headline: string; intro: string; items: string[]; outro: string }): string {
+  const itemsHtml = opts.items
+    .map((item) => `<p style="margin:0 0 6px 0;font-size:14px;color:#374151;line-height:1.9;">✅ &nbsp;${item}</p>`)
+    .join('\n  ')
+  return `<div style="padding:6px 0 2px 0;">
+  <p style="margin:0 0 14px 0;font-size:20px;font-weight:800;color:#059669;text-align:center;">${opts.headline}</p>
+  <p style="margin:0 0 12px 0;font-size:15px;color:#374151;line-height:1.8;">${opts.intro}</p>
+  ${itemsHtml}
+  <p style="margin:14px 0 0 0;font-size:13px;color:#6b7280;line-height:1.7;text-align:center;">${opts.outro}</p>
+</div>`
+}
+
 // ─── Seeded defaults ─────────────────────────────────────────────────────────
 
 export const DEFAULT_TEMPLATES: TemplateSeed[] = [
@@ -417,6 +435,311 @@ export const DEFAULT_TEMPLATES: TemplateSeed[] = [
 </div>`,
     variables: ['fullName'],
   },
+
+  // ── 0.6.67 — DIFFERENTIATED welcome emails ─────────────────────────────────
+  // The welcome email adapts to WHO the account is (agency owner vs regular
+  // customer) and WHERE it was verified (desktop app / mobile app / web
+  // browser). Six variants × three languages; deliverWelcomeEmail() walks the
+  // specificity cascade (variant → generic 'welcome') so an admin can delete
+  // any variant row without breaking delivery. Each variant is fully
+  // editable in the admin templates manager like every other row.
+  {
+    key: 'welcome_owner_desktop', channel: 'EMAIL', language: 'en', name: 'Welcome — agency owner (desktop app)',
+    subject: `Welcome to ${APP_NAME}, {{fullName}}! — your agency desktop console is ready`,
+    body: `Hi {{fullName}},\n\nYour ${APP_NAME} agency account is verified and your desktop console is ready. Create your agency profile, add your services and counters, invite your staff — and run the queue from a console that keeps working even when the internet drops (offline-first).\n\n— The ${APP_NAME} Team`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Welcome aboard, {{fullName}}! 🎉`,
+      intro: `Your ${APP_NAME} <strong>agency owner</strong> account is verified — and you signed in from the <strong>desktop app</strong>, so your console works offline too. Here is your setup path:`,
+      items: [
+        'Create your agency profile — name, specialty, location',
+        'Add your services and counters so the queue starts flowing',
+        'Invite your staff and grant them the right permissions',
+        'Run the queue from the desktop console — it keeps working even when the internet drops',
+      ],
+      outro: `See you in your console!<br/>— The ${APP_NAME} Team`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_owner_desktop', channel: 'EMAIL', language: 'ar', name: 'ترحيب — صاحب وكالة (تطبيق سطح المكتب)',
+    subject: `مرحباً بك في ${APP_NAME}، {{fullName}}! — منصة وكالتك على سطح المكتب جاهزة`,
+    body: `مرحباً {{fullName}}،\n\nتم تأكيد حسابك كصاحب وكالة في ${APP_NAME}، ومنصة سطح المكتب جاهزة. أنشئ ملف وكالتك، أضف خدماتك ومكاتبك، وادعُ فريقك — وتحكّم في الطابور من منصة تعمل حتى عند انقطاع الإنترنت (العمل دون اتصال أولاً).\n\n— فريق ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `مرحباً بك، {{fullName}}! 🎉`,
+      intro: `تم تأكيد حسابك في ${APP_NAME} بصفتك <strong>صاحب وكالة</strong> — وقد سجّلت الدخول من <strong>تطبيق سطح المكتب</strong>، لذا تعمل منصتك دون اتصال أيضاً. إليك خطوات البدء:`,
+      items: [
+        'أنشئ ملف وكالتك — الاسم، التخصص، الموقع',
+        'أضف خدماتك ومكاتبك ليتدفق الطابور',
+        'ادعُ موظفيك وامنحهم الصلاحيات المناسبة',
+        'أدر الطابور من منصة سطح المكتب — تُبقي العمل جارياً حتى عند انقطاع الإنترنت',
+      ],
+      outro: `نراك في منصتك!<br/>— فريق ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_owner_desktop', channel: 'EMAIL', language: 'fr', name: 'Bienvenue — propriétaire d\u2019agence (appli bureau)',
+    subject: `Bienvenue sur ${APP_NAME}, {{fullName}} ! — votre console de bureau est prête`,
+    body: `Bonjour {{fullName}},\n\nVotre compte ${APP_NAME} propriétaire d'agence est vérifié et votre console de bureau est prête. Créez la fiche de votre agence, ajoutez services et guichets, invitez votre équipe — et gérez la file depuis une console qui fonctionne même sans Internet (hors ligne d'abord).\n\n— L'équipe ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Bienvenue, {{fullName}} ! 🎉`,
+      intro: `Votre compte ${APP_NAME} <strong>propriétaire d'agence</strong> est vérifié — et vous êtes connecté depuis l'<strong>application de bureau</strong>, votre console fonctionne donc aussi hors ligne. Voici votre parcours :`,
+      items: [
+        'Créez la fiche de votre agence — nom, spécialité, localisation',
+        'Ajoutez vos services et guichets pour faire circuler la file',
+        'Invitez votre équipe et accordez les bonnes permissions',
+        'Gérez la file depuis la console de bureau — elle fonctionne même sans Internet',
+      ],
+      outro: `À bientôt dans votre console !<br/>— L'équipe ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_owner_mobile', channel: 'EMAIL', language: 'en', name: 'Welcome — agency owner (mobile app)',
+    subject: `Welcome to ${APP_NAME}, {{fullName}}! — run your agency from your phone`,
+    body: `Hi {{fullName}},\n\nYour ${APP_NAME} agency account is verified and the mobile app is ready. Create your agency, call the next turns, and watch your queue live — everything from your phone, wherever you are.\n\n— The ${APP_NAME} Team`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Welcome aboard, {{fullName}}! 🎉`,
+      intro: `Your ${APP_NAME} <strong>agency owner</strong> account is verified — and you are set up on the <strong>mobile app</strong>, so your agency fits in your pocket:`,
+      items: [
+        'Create your agency profile — name, specialty, location',
+        'Add your services and counters, then open the queue',
+        'Call the next turn with one tap and keep the line moving',
+        'Watch live stats and get alerts wherever you are',
+      ],
+      outro: `See you in the app!<br/>— The ${APP_NAME} Team`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_owner_mobile', channel: 'EMAIL', language: 'ar', name: 'ترحيب — صاحب وكالة (تطبيق الهاتف)',
+    subject: `مرحباً بك في ${APP_NAME}، {{fullName}}! — أدر وكالتك من هاتفك`,
+    body: `مرحباً {{fullName}}،\n\nتم تأكيد حسابك كصاحب وكالة في ${APP_NAME}، وتطبيق الهاتف جاهز. أنشئ وكالتك، اتصل بالأدوار التالية، وتابع الطابور مباشرة — كل ذلك من هاتفك وأينما كنت.\n\n— فريق ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `مرحباً بك، {{fullName}}! 🎉`,
+      intro: `تم تأكيد حسابك في ${APP_NAME} بصفتك <strong>صاحب وكالة</strong> — وأنت الآن على <strong>تطبيق الهاتف</strong>، فوكالتك في جيبك:`,
+      items: [
+        'أنشئ ملف وكالتك — الاسم، التخصص، الموقع',
+        'أضف خدماتك ومكاتبك ثم افتح الطابور',
+        'اتصل بالدور التالي بلمسة واحدة وحافظ على انسياب الطابور',
+        'تابع الإحصائيات مباشرة واستلم التنبيهات أينما كنت',
+      ],
+      outro: `نراك في التطبيق!<br/>— فريق ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_owner_mobile', channel: 'EMAIL', language: 'fr', name: 'Bienvenue — propriétaire d\u2019agence (appli mobile)',
+    subject: `Bienvenue sur ${APP_NAME}, {{fullName}} ! — gérez votre agence depuis votre téléphone`,
+    body: `Bonjour {{fullName}},\n\nVotre compte ${APP_NAME} propriétaire d'agence est vérifié et l'application mobile est prête. Créez votre agence, appelez les tours suivants et suivez votre file en direct — le tout depuis votre téléphone, où que vous soyez.\n\n— L'équipe ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Bienvenue, {{fullName}} ! 🎉`,
+      intro: `Votre compte ${APP_NAME} <strong>propriétaire d'agence</strong> est vérifié — et vous êtes sur l'<strong>application mobile</strong> : votre agence tient dans votre poche :`,
+      items: [
+        'Créez la fiche de votre agence — nom, spécialité, localisation',
+        'Ajoutez services et guichets, puis ouvrez la file',
+        'Appelez le tour suivant en un geste et gardez la file fluide',
+        'Suivez les statistiques en direct et recevez les alertes partout',
+      ],
+      outro: `À bientôt dans l'application !<br/>— L'équipe ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_owner_web', channel: 'EMAIL', language: 'en', name: 'Welcome — agency owner (web console)',
+    subject: `Welcome to ${APP_NAME}, {{fullName}}! — your agency workspace is ready`,
+    body: `Hi {{fullName}},\n\nYour ${APP_NAME} agency account is verified and your browser workspace is ready. Create your agency profile, add services and counters, invite staff, and follow the analytics — all from the web console.\n\n— The ${APP_NAME} Team`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Welcome aboard, {{fullName}}! 🎉`,
+      intro: `Your ${APP_NAME} <strong>agency owner</strong> account is verified — and you are on the <strong>web console</strong>, the full workspace in your browser:`,
+      items: [
+        'Create your agency profile — name, specialty, location',
+        'Add your services and counters so the queue starts flowing',
+        'Invite your staff and grant them the right permissions',
+        'Follow the queue and the analytics from the dashboard',
+      ],
+      outro: `See you in your workspace!<br/>— The ${APP_NAME} Team`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_owner_web', channel: 'EMAIL', language: 'ar', name: 'ترحيب — صاحب وكالة (منصة الويب)',
+    subject: `مرحباً بك في ${APP_NAME}، {{fullName}}! — مساحة عمل وكالتك جاهزة`,
+    body: `مرحباً {{fullName}}،\n\nتم تأكيد حسابك كصاحب وكالة في ${APP_NAME}، ومساحة العمل في المتصفح جاهزة. أنشئ ملف وكالتك، أضف الخدمات والمكاتب، وادعُ الموظفين، وتابع التحليلات — كل ذلك من منصة الويب.\n\n— فريق ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `مرحباً بك، {{fullName}}! 🎉`,
+      intro: `تم تأكيد حسابك في ${APP_NAME} بصفتك <strong>صاحب وكالة</strong> — وأنت على <strong>منصة الويب</strong>، مساحة العمل الكاملة في متصفحك:`,
+      items: [
+        'أنشئ ملف وكالتك — الاسم، التخصص، الموقع',
+        'أضف خدماتك ومكاتبك ليتدفق الطابور',
+        'ادعُ موظفيك وامنحهم الصلاحيات المناسبة',
+        'تابع الطابور والتحليلات من لوحة التحكم',
+      ],
+      outro: `نراك في مساحة عملك!<br/>— فريق ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_owner_web', channel: 'EMAIL', language: 'fr', name: 'Bienvenue — propriétaire d\u2019agence (console web)',
+    subject: `Bienvenue sur ${APP_NAME}, {{fullName}} ! — votre espace agence est prêt`,
+    body: `Bonjour {{fullName}},\n\nVotre compte ${APP_NAME} propriétaire d'agence est vérifié et votre espace de travail navigateur est prêt. Créez la fiche de votre agence, ajoutez services et guichets, invitez l'équipe et suivez les analyses — tout depuis la console web.\n\n— L'équipe ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Bienvenue, {{fullName}} ! 🎉`,
+      intro: `Votre compte ${APP_NAME} <strong>propriétaire d'agence</strong> est vérifié — et vous êtes sur la <strong>console web</strong>, l'espace de travail complet dans votre navigateur :`,
+      items: [
+        'Créez la fiche de votre agence — nom, spécialité, localisation',
+        'Ajoutez vos services et guichets pour faire circuler la file',
+        'Invitez votre équipe et accordez les bonnes permissions',
+        'Suivez la file et les analyses depuis le tableau de bord',
+      ],
+      outro: `À bientôt dans votre espace !<br/>— L'équipe ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_customer_desktop', channel: 'EMAIL', language: 'en', name: 'Welcome — customer (desktop app)',
+    subject: `Welcome to ${APP_NAME}, {{fullName}}! — skip the line from your desktop`,
+    body: `Hi {{fullName}},\n\nYour ${APP_NAME} account is verified and ready. Browse partner agencies, take a ticket, and track your turn live — right from your desktop app.\n\n— The ${APP_NAME} Team`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Welcome aboard, {{fullName}}! 🎉`,
+      intro: `Your ${APP_NAME} account is now <strong>verified and ready</strong> — on the <strong>desktop app</strong>:`,
+      items: [
+        'Browse every partner agency and pick where to go',
+        'Take a ticket from your desk — no more standing in line',
+        'Track your turn live and get notified before it comes',
+      ],
+      outro: `See you in the app!<br/>— The ${APP_NAME} Team`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_customer_desktop', channel: 'EMAIL', language: 'ar', name: 'ترحيب — زبون (تطبيق سطح المكتب)',
+    subject: `مرحباً بك في ${APP_NAME}، {{fullName}}! — ادفع الطابور من سطح مكتبك`,
+    body: `مرحباً {{fullName}}،\n\nتم تأكيد حسابك في ${APP_NAME} بنجاح. تصفّح الوكالات الشريكة، خذ تذكرتك، وتابع دورك مباشرة — من تطبيق سطح المكتب مباشرة.\n\n— فريق ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `مرحباً بك، {{fullName}}! 🎉`,
+      intro: `تم تأكيد حسابك في ${APP_NAME} بنجاح — على <strong>تطبيق سطح المكتب</strong>:`,
+      items: [
+        'تصفّح كل الوكالات الشريكة واختر وجهتك',
+        'خذ تذكرتك من مكانك — دون الوقوف في الطابور',
+        'تابع دورك مباشرة واستلم إشعاراً قبل قدومه',
+      ],
+      outro: `نراك في التطبيق!<br/>— فريق ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_customer_desktop', channel: 'EMAIL', language: 'fr', name: 'Bienvenue — client (appli bureau)',
+    subject: `Bienvenue sur ${APP_NAME}, {{fullName}} ! — évitez la file depuis votre bureau`,
+    body: `Bonjour {{fullName}},\n\nVotre compte ${APP_NAME} est vérifié et prêt. Parcourez les agences partenaires, prenez un ticket et suivez votre tour en direct — directement depuis l'application de bureau.\n\n— L'équipe ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Bienvenue, {{fullName}} ! 🎉`,
+      intro: `Votre compte ${APP_NAME} est désormais <strong>vérifié et prêt</strong> — sur l'<strong>application de bureau</strong> :`,
+      items: [
+        'Parcourez toutes les agences partenaires et choisissez votre destination',
+        'Prenez un ticket depuis votre bureau — sans faire la queue',
+        'Suivez votre tour en direct et soyez notifié avant qu\u2019il arrive',
+      ],
+      outro: `À bientôt dans l'application !<br/>— L'équipe ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_customer_mobile', channel: 'EMAIL', language: 'en', name: 'Welcome — customer (mobile app)',
+    subject: `Welcome to ${APP_NAME}, {{fullName}}! — your ticket is in your pocket`,
+    body: `Hi {{fullName}},\n\nYour ${APP_NAME} account is verified and ready. Take a ticket at any partner agency, track your turn live, and get notified the moment it is almost your time — all from your phone.\n\n— The ${APP_NAME} Team`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Welcome aboard, {{fullName}}! 🎉`,
+      intro: `Your ${APP_NAME} account is now <strong>verified and ready</strong> — on the <strong>mobile app</strong>:`,
+      items: [
+        'Take a ticket at any partner agency — no more standing in line',
+        'Track your turn live from your phone, wherever you are',
+        'Get notified the moment it is almost your time',
+      ],
+      outro: `See you in the app!<br/>— The ${APP_NAME} Team`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_customer_mobile', channel: 'EMAIL', language: 'ar', name: 'ترحيب — زبون (تطبيق الهاتف)',
+    subject: `مرحباً بك في ${APP_NAME}، {{fullName}}! — تذكرتك في جيبك`,
+    body: `مرحباً {{fullName}}،\n\nتم تأكيد حسابك في ${APP_NAME} بنجاح. خذ تذكرة من أي وكالة شريكة، تابع دورك مباشرة، واحصل على إشعار لحظة اقترابه — كل ذلك من هاتفك.\n\n— فريق ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `مرحباً بك، {{fullName}}! 🎉`,
+      intro: `تم تأكيد حسابك في ${APP_NAME} بنجاح — على <strong>تطبيق الهاتف</strong>:`,
+      items: [
+        'خذ تذكرة من أي وكالة شريكة — دون الوقوف في الطابور',
+        'تابع دورك مباشرة من هاتفك، من أي مكان',
+        'احصل على إشعار لحظة اقتراب دورك',
+      ],
+      outro: `نراك في التطبيق!<br/>— فريق ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_customer_mobile', channel: 'EMAIL', language: 'fr', name: 'Bienvenue — client (appli mobile)',
+    subject: `Bienvenue sur ${APP_NAME}, {{fullName}} ! — votre ticket dans votre poche`,
+    body: `Bonjour {{fullName}},\n\nVotre compte ${APP_NAME} est vérifié et prêt. Prenez un ticket dans toute agence partenaire, suivez votre tour en direct et soyez notifié dès que votre tour approche — le tout depuis votre téléphone.\n\n— L'équipe ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Bienvenue, {{fullName}} ! 🎉`,
+      intro: `Votre compte ${APP_NAME} est désormais <strong>vérifié et prêt</strong> — sur l'<strong>application mobile</strong> :`,
+      items: [
+        'Prenez un ticket dans toute agence partenaire — sans faire la queue',
+        'Suivez votre tour en direct depuis votre téléphone, où que vous soyez',
+        'Soyez notifié dès que votre tour approche',
+      ],
+      outro: `À bientôt dans l'application !<br/>— L'équipe ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_customer_web', channel: 'EMAIL', language: 'en', name: 'Welcome — customer (web)',
+    subject: `Welcome to ${APP_NAME}, {{fullName}}! — skip the line from your browser`,
+    body: `Hi {{fullName}},\n\nYour ${APP_NAME} account is verified and ready. Browse partner agencies, take a ticket, and track your turn live — all from your browser.\n\n— The ${APP_NAME} Team`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Welcome aboard, {{fullName}}! 🎉`,
+      intro: `Your ${APP_NAME} account is now <strong>verified and ready</strong> — on the <strong>web app</strong>:`,
+      items: [
+        'Browse every partner agency and pick where to go',
+        'Take a ticket from your browser — no more standing in line',
+        'Track your turn live and get notified before it comes',
+      ],
+      outro: `See you in the app!<br/>— The ${APP_NAME} Team`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_customer_web', channel: 'EMAIL', language: 'ar', name: 'ترحيب — زبون (الويب)',
+    subject: `مرحباً بك في ${APP_NAME}، {{fullName}}! — ادفع الطابور من متصفحك`,
+    body: `مرحباً {{fullName}}،\n\nتم تأكيد حسابك في ${APP_NAME} بنجاح. تصفّح الوكالات الشريكة، خذ تذكرتك، وتابع دورك مباشرة — كل ذلك من متصفحك.\n\n— فريق ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `مرحباً بك، {{fullName}}! 🎉`,
+      intro: `تم تأكيد حسابك في ${APP_NAME} بنجاح — على <strong>تطبيق الويب</strong>:`,
+      items: [
+        'تصفّح كل الوكالات الشريكة واختر وجهتك',
+        'خذ تذكرتك من متصفحك — دون الوقوف في الطابور',
+        'تابع دورك مباشرة واستلم إشعاراً قبل قدومه',
+      ],
+      outro: `نراك في التطبيق!<br/>— فريق ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
+  {
+    key: 'welcome_customer_web', channel: 'EMAIL', language: 'fr', name: 'Bienvenue — client (web)',
+    subject: `Bienvenue sur ${APP_NAME}, {{fullName}} ! — évitez la file depuis votre navigateur`,
+    body: `Bonjour {{fullName}},\n\nVotre compte ${APP_NAME} est vérifié et prêt. Parcourez les agences partenaires, prenez un ticket et suivez votre tour en direct — le tout depuis votre navigateur.\n\n— L'équipe ${APP_NAME}`,
+    htmlBody: welcomeChecklistInner({
+      headline: `Bienvenue, {{fullName}} ! 🎉`,
+      intro: `Votre compte ${APP_NAME} est désormais <strong>vérifié et prêt</strong> — sur l'<strong>application web</strong> :`,
+      items: [
+        'Parcourez toutes les agences partenaires et choisissez votre destination',
+        'Prenez un ticket depuis votre navigateur — sans faire la queue',
+        'Suivez votre tour en direct et soyez notifié avant qu\u2019il arrive',
+      ],
+      outro: `À bientôt dans l'application !<br/>— L'équipe ${APP_NAME}`,
+    }),
+    variables: ['fullName'],
+  },
 ]
 
 /** Known template keys + their user-facing metadata (admin UI) */
@@ -427,7 +750,14 @@ export const TEMPLATE_CATALOG: Array<{ key: string; channels: TemplateChannel[];
   { key: 'turn_approaching', channels: ['EMAIL', 'SMS', 'WHATSAPP'], descriptionEn: 'Queue reminder — turn approaching', descriptionAr: 'تذكير الطابور — اقتراب الدور' },
   { key: 'your_turn', channels: ['EMAIL', 'SMS', 'WHATSAPP'], descriptionEn: 'Queue alert — it is your turn', descriptionAr: 'تنبيه الطابور — دورك الآن' },
   { key: 'no_show', channels: ['EMAIL', 'SMS', 'WHATSAPP'], descriptionEn: 'No-show warning', descriptionAr: 'تحذير عدم الحضور' },
-  { key: 'welcome', channels: ['EMAIL'], descriptionEn: 'Welcome email after verification', descriptionAr: 'رسالة ترحيب بعد التأكيد' },
+  { key: 'welcome', channels: ['EMAIL'], descriptionEn: 'Welcome email after verification (generic fallback)', descriptionAr: 'رسالة ترحيب بعد التأكيد (احتياطية عامة)' },
+  // 0.6.67 — differentiated welcome variants (audience × device type)
+  { key: 'welcome_owner_desktop', channels: ['EMAIL'], descriptionEn: 'Welcome email — agency owner, verified from the desktop app', descriptionAr: 'رسالة ترحيب — صاحب وكالة، تم التأكيد من تطبيق سطح المكتب' },
+  { key: 'welcome_owner_mobile', channels: ['EMAIL'], descriptionEn: 'Welcome email — agency owner, verified from the mobile app', descriptionAr: 'رسالة ترحيب — صاحب وكالة، تم التأكيد من تطبيق الهاتف' },
+  { key: 'welcome_owner_web', channels: ['EMAIL'], descriptionEn: 'Welcome email — agency owner, verified from the web console', descriptionAr: 'رسالة ترحيب — صاحب وكالة، تم التأكيد من منصة الويب' },
+  { key: 'welcome_customer_desktop', channels: ['EMAIL'], descriptionEn: 'Welcome email — regular customer, verified from the desktop app', descriptionAr: 'رسالة ترحيب — زبون عادي، تم التأكيد من تطبيق سطح المكتب' },
+  { key: 'welcome_customer_mobile', channels: ['EMAIL'], descriptionEn: 'Welcome email — regular customer, verified from the mobile app', descriptionAr: 'رسالة ترحيب — زبون عادي، تم التأكيد من تطبيق الهاتف' },
+  { key: 'welcome_customer_web', channels: ['EMAIL'], descriptionEn: 'Welcome email — regular customer, verified from the web app', descriptionAr: 'رسالة ترحيب — زبون عادي، تم التأكيد من تطبيق الويب' },
 ]
 
 // ─── Core ─────────────────────────────────────────────────────────────────────
@@ -583,4 +913,57 @@ export async function deliverTemplate(opts: {
     return { ...r, deliveredVia: 'SMS' }
   }
   return { ...wa, deliveredVia: 'WHATSAPP' }
+}
+
+// ─── 0.6.67 — Differentiated welcome email (audience × device type) ──────────
+
+export type WelcomePlatform = 'desktop' | 'mobile' | 'web'
+export type WelcomeAudience = 'owner' | 'customer'
+
+/**
+ * Agency accounts (owners/staff) get setup-oriented wording; everyone else
+ * (regular customers) gets take-a-ticket wording.
+ */
+export function welcomeAudienceForRole(role: string): WelcomeAudience {
+  return role === 'AGENCY_OWNER' || role === 'AGENCY_STAFF' ? 'owner' : 'customer'
+}
+
+/** The most specific welcome template key for an audience × platform pair. */
+export function welcomeTemplateKey(audience: WelcomeAudience, platform: WelcomePlatform): string {
+  return `welcome_${audience}_${platform}`
+}
+
+/**
+ * Deliver the welcome email for a freshly fully-verified account, choosing
+ * the template by WHO the account is (agency owner vs regular customer) and
+ * WHERE the verification happened (desktop app / mobile app / web browser).
+ *
+ * Specificity cascade: (audience × platform) row → the generic 'welcome' row.
+ * renderTemplate() returns null for a key with neither a DB row nor a seed,
+ * so a deleted/customized variant gracefully falls back. Every row stays
+ * admin-editable in the templates manager.
+ */
+export async function deliverWelcomeEmail(opts: {
+  target: string
+  language: string
+  fullName: string
+  role: string
+  platform: WelcomePlatform
+  /** Optional agency branding for the email layout footer. */
+  agencyId?: string
+}): Promise<DeliverResult> {
+  const audience = welcomeAudienceForRole(opts.role)
+  const vars: TemplateVars = { fullName: opts.fullName }
+  for (const key of [welcomeTemplateKey(audience, opts.platform), 'welcome']) {
+    const rendered = await renderTemplate(key, 'EMAIL', opts.language, vars)
+    if (!rendered) continue
+    let html = rendered.html ?? undefined
+    if (html && !isFullHtmlDocument(html)) {
+      const branding = opts.agencyId ? await loadAgencyBranding(opts.agencyId) : undefined
+      html = wrapEmailHtml({ bodyHtml: html, language: opts.language, branding })
+    }
+    const r = await sendEmail({ to: opts.target, subject: rendered.subject ?? `[${APP_NAME}]`, text: rendered.text, html })
+    return { ...r, deliveredVia: 'EMAIL' }
+  }
+  return { success: false, error: `TEMPLATE_MISSING:welcome:${opts.language}` }
 }

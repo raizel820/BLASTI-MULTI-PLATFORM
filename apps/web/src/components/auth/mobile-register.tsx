@@ -453,9 +453,9 @@ export function MobileRegisterForm() {
       const res = await apiFetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        // 0.6.66 — generous timeout: the desktop local API's register proxy
-        // waits up to 15s on its cloud fetch before answering.
-        timeout: 20000,
+        // 0.6.67 — retry-aware budget: the desktop register proxy retries
+        // its cloud fetch (2×15s); keep that inside ONE user action.
+        timeout: 35000,
         body: JSON.stringify(body),
       });
 

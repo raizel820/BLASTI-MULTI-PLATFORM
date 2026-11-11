@@ -44,7 +44,7 @@ import {
 // 0.6.54 — one phone number must never alias two unrelated identities
 // (user↔agency rule lives here; the unique-constraint checks stay inline).
 import { assertUserPhoneNotAgencyConflicting } from '../lib/phone-contacts'
-import { deliverTemplate } from '../lib/messaging/template-service'
+import { deliverTemplate, deliverWelcomeEmail } from '../lib/messaging/template-service'
 import {
   checkRateLimit,
   checkIpBlocked,
@@ -1097,12 +1097,24 @@ app.post('/verify', async (c) => {
       // wilaya as the fallback segment).
       const assignedUid = await assignUidToUser(user.id, refreshed.role === 'AGENCY_OWNER' ? pendingAgencyWilaya : null)
 
+      // Security-0.6.13 — platform policy applies at verification too: the
+      // freshly-verified session respects the role×platform matrix.
+      // 0.6.67 — resolved BEFORE the welcome email so the email variant can
+      // also reflect the device type (desktop app / mobile app / web).
+      const verifyPlatform = resolveClientPlatform(c)
+
       // ── Welcome email (fire-and-forget, never blocks the session) ──
       // Sent once when the account becomes FULLY verified.
+      // 0.6.67 — differentiated by audience (agency owner vs regular
+      // customer) AND device type (desktop/mobile/web) via the template
+      // cascade in deliverWelcomeEmail().
       if (refreshed.email && refreshed.emailVerified) {
-        deliverTemplate({
-          key: 'welcome', channel: 'EMAIL', target: refreshed.email,
-          language: refreshed.language || 'en', vars: { fullName: refreshed.fullName },
+        deliverWelcomeEmail({
+          target: refreshed.email,
+          language: refreshed.language || 'en',
+          fullName: refreshed.fullName,
+          role: refreshed.role,
+          platform: verifyPlatform,
         }).catch(() => undefined)
       }
 
@@ -1126,9 +1138,6 @@ app.post('/verify', async (c) => {
         avatarUrl: user.avatarUrl,
         agencyId: pendingAgencyId,
       }
-      // Security-0.6.13 — platform policy applies at verification too: the
-      // freshly-verified session respects the role×platform matrix.
-      const verifyPlatform = resolveClientPlatform(c)
       assertPlatformLoginAllowed(verifyPlatform, sessionUser.role)
       const token = await createSessionToken(sessionUser, SESSION_MAX_AGE, verifyPlatform)
       await setSessionCookie(c, sessionUser, verifyPlatform)
@@ -1218,13 +1227,24 @@ app.post('/verify', async (c) => {
         ? (await db.agencyStaff.findFirst({ where: { userId: user.id, isActive: true }, select: { agencyId: true } }))?.agencyId ?? null
         : null
 
+    // Security-0.6.13 — platform policy applies at verification too: the
+    // freshly-verified session respects the role×platform matrix.
+    // 0.6.67 — resolved BEFORE the welcome email so the email variant can
+    // also reflect the device type (desktop app / mobile app / web).
+    const verifyPlatform = resolveClientPlatform(c)
+
     // ── Welcome email (fire-and-forget, never blocks the session) ──
     // Sent once when the account becomes FULLY verified — this endpoint is
     // only reachable while verification is pending, so it naturally runs once.
+    // 0.6.67 — differentiated by audience (agency owner vs regular customer)
+    // AND device type (desktop/mobile/web) via deliverWelcomeEmail().
     if (refreshed?.email && emailVerified) {
-      deliverTemplate({
-        key: 'welcome', channel: 'EMAIL', target: refreshed.email,
-        language: user.language || 'en', vars: { fullName: user.fullName },
+      deliverWelcomeEmail({
+        target: refreshed.email,
+        language: user.language || 'en',
+        fullName: user.fullName,
+        role: user.role,
+        platform: verifyPlatform,
       }).catch(() => undefined)
     }
 
@@ -1237,9 +1257,6 @@ app.post('/verify', async (c) => {
       avatarUrl: user.avatarUrl,
       agencyId: agencyId ?? null,
     }
-    // Security-0.6.13 — platform policy applies at verification too: the
-    // freshly-verified session respects the role×platform matrix.
-    const verifyPlatform = resolveClientPlatform(c)
     assertPlatformLoginAllowed(verifyPlatform, sessionUser.role)
     const token = await createSessionToken(sessionUser, SESSION_MAX_AGE, verifyPlatform)
     await setSessionCookie(c, sessionUser, verifyPlatform)

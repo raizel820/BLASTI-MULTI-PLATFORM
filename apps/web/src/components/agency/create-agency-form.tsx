@@ -39,7 +39,7 @@ import {
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import { AgencyCategorySelect } from '@/components/agency/agency-category-select';
-import { BUILT_IN_CATEGORY_OPTIONS } from '@/hooks/use-agency-categories';
+import { BUILT_IN_CATEGORY_OPTIONS, fetchAgencyCategoriesOnce } from '@/hooks/use-agency-categories';
 // Task 5 — Algeria address selectors (58 wilayas + their communes).
 import {
   WilayaSelect,
@@ -791,7 +791,13 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
     try {
       const body: Record<string, unknown> = {
         name: name.trim(),
+        // 0.6.67 — the new-category path MUST carry the typed name: the cloud
+        // creates the AgencyCategory row from `newCategoryName` and replaces
+        // the sentinel. Sending bare '__new__' (the old behavior) made the
+        // cloud validate the literal slug '__new__' against the dictionary →
+        // INVALID_CATEGORY → "فشل إنشاء المؤسسة" on EVERY first submit.
         category: newCategoryEnabled && newCategoryName.trim() ? '__new__' : category,
+        ...(newCategoryEnabled && newCategoryName.trim() ? { newCategoryName: newCategoryName.trim() } : {}),
       // 0.6.61 — AI Translation Agent: authoritative source language of every
       // string this wizard submits (name/description/services).
       contentLanguage: lang,
@@ -886,6 +892,14 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
           setErrors({ customCode: t('agencyCodeTaken' as any) });
           toast.error(t('agencyCodeTaken' as any));
           goToStep(1);
+        } else if (data.error === 'INVALID_CATEGORY' || data.error === 'CATEGORY_INACTIVE' || data.error === 'INVALID_SPECIALTY' || data.error === 'SPECIALTY_CATEGORY_MISMATCH') {
+          // 0.6.67 — raw dictionary error codes used to surface verbatim in
+          // the toast ("INVALID_CATEGORY"). Show an actionable localized
+          // message and send the user back to the category step.
+          const catMsg = t('agencyCategoryInvalid' as any);
+          setErrors({ category: catMsg });
+          toast.error(catMsg);
+          goToStep(0);
         } else {
           toast.error(data.error || t('createAgencyFailed' as any));
         }
@@ -921,6 +935,18 @@ export function CreateAgencyForm({ onAgencyCreated }: CreateAgencyFormProps) {
       setCreatedAgencyCode(data.agency?.customCode || customCode || name.slice(0, 3).toUpperCase());
       setCreated(true);
       toast.success(t('agencyCreatedSuccess' as any));
+
+      // 0.6.68 — a NEW category was just born with this agency: force-refresh
+      // the shared category store so the fresh row (created by the cloud from
+      // `newCategoryName`, enrichment pending) is visible in every picker /
+      // filter IMMEDIATELY — without this, the module-level session cache
+      // kept serving the pre-create list until the next full reload.
+      if (newCategoryEnabled && newCategoryName.trim()) {
+        void fetchAgencyCategoriesOnce(true).catch(() => {
+          /* non-fatal — pickers keep the cached list; the agent enrichment
+             and the next mount fetch will surface the category anyway */
+        });
+      }
 
       // Notify parent component
       if (onAgencyCreated && data.agency) {

@@ -594,10 +594,10 @@ export function RegisterForm() {
       const res = await apiFetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        // 0.6.66 — the desktop local API's register proxy waits up to 15s on
-        // its own cloud fetch; the renderer must not abort before the
-        // accurate error body arrives (default Electron timeout is 12s).
-        timeout: 20000,
+        // 0.6.67 — the desktop local API's register proxy now retries its
+        // cloud fetch (2×15s); the renderer budget must cover the whole
+        // proxy run so the transparent retry lands as ONE user action.
+        timeout: 35000,
         body: JSON.stringify(body),
       });
 

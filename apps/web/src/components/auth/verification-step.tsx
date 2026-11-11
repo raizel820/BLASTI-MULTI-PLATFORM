@@ -311,11 +311,11 @@ export function VerificationStep({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        // 0.6.66 — the desktop local API's verify proxy waits up to 15s on its
-        // own cloud fetch; the renderer default (12s in Electron) aborted
-        // first, so the accurate error body never arrived and the step felt
-        // stuck. 20s lets the definitive answer land.
-        timeout: 20000,
+        // 0.6.67 — the desktop local API's verify proxy retries its cloud
+        // fetch (2×15s); the 35s renderer budget keeps that transparent
+        // retry inside ONE user action (the first press) instead of
+        // demanding a manual second press.
+        timeout: 35000,
         body: JSON.stringify({
           verificationToken,
           ...(submitEmail ? { emailCode } : {}),
@@ -397,8 +397,8 @@ export function VerificationStep({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        // 0.6.66 — same proxy-wait rationale as the verify call above.
-        timeout: 20000,
+        // 0.6.67 — same retry-aware budget as the verify call above.
+        timeout: 35000,
         body: JSON.stringify({ verificationToken, channel }),
       })
       const data = await res.json()

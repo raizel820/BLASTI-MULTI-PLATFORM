@@ -1419,8 +1419,22 @@ export class ApiClient {
     // default (30s × 3 retries) meant a dead/slow API black-screened every
     // navigation for 90+s ("loads after 30s or never"). Mutations keep the
     // long timeout so uploads on slow links are never cut short.
+    //
+    // 0.6.67 — ONBOARDING WRITES (auth confirm paths + agency create/update)
+    // are the exception: each one is a rare, user-initiated, cloud-proxied
+    // operation the local API cannot serve offline. The field pattern
+    // "always fails on the first try, passes on the second" was the USER
+    // being the retry loop — a cold first cloud connection (DNS/TLS warm-up)
+    // burned the budget once, then everything was warm. These paths now
+    // auto-retry twice with backoff and carry a 35s timeout so the local
+    // API's own 2×15s proxy retry fits inside one renderer attempt.
+    const isAuthConfirm = isAuthConfirmPath(path);
+    const isAgencyWrite = method.toUpperCase() !== 'GET' && /^\/api\/agencies(\/|$)/.test(path);
+    const isOnboardingWrite = isAuthConfirm || isAgencyWrite;
     const maxRetries = options?.retries
-      ?? (isElectronRuntime() ? 0 : (method === 'GET' ? 1 : this.config.retries));
+      ?? (isOnboardingWrite
+        ? 2
+        : (isElectronRuntime() ? 0 : (method === 'GET' ? 1 : this.config.retries)));
     // In Electron, use a shorter-than-default timeout so cloud failures are
     // detected quickly and LAN failover kicks in. Connection-stability round:
     // 12s (was 5s) — the renderer request is proxied through the local API
@@ -1428,7 +1442,9 @@ export class ApiClient {
     // requests that were still being served, producing spurious "cloud
     // unreachable" flaps right when the API was merely slow.
     const timeoutMs = options?.timeout
-      ?? (isElectronRuntime() ? 12_000 : (method === 'GET' ? 10_000 : this.config.timeout));
+      ?? (isOnboardingWrite
+        ? 35_000
+        : (isElectronRuntime() ? 12_000 : (method === 'GET' ? 10_000 : this.config.timeout)));
     // Re-resolve the base URL PER REQUEST (not per construction): the Capacitor
     // runtime resolver finishes asynchronously after module load, and the
     // singleton's frozen config.baseUrl would otherwise keep pointing at the
@@ -1606,7 +1622,13 @@ export class ApiClient {
         // 503 from our middleware — cloud API is down, skip retries and
         // go straight to LAN failover. This avoids wasting time retrying
         // a known-down server.
-        if (response.status === 503) {
+        //
+        // 0.6.67 — onboarding writes (auth confirm + agency create/update)
+        // are the exception: the LAN failover target IS the same local
+        // proxy, so breaking here just turned one transient 503 into an
+        // instant user-visible failure. Fall through to the generic 5xx
+        // retry block instead (the proxy itself retries its cloud hop too).
+        if (response.status === 503 && !isOnboardingWrite) {
           const errorBody = await this.safeParseBody(response);
           const elapsed = (performance.now() - attemptStart).toFixed(0);
           lastError = new ApiClientError(

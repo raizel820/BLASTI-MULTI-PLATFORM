@@ -12,6 +12,11 @@ import { getProxiedUrl } from '@/lib/utils';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable } from '@/lib/api-client';
 import { getPendingCheckout } from '@/lib/chargily-checkout';
+// 0.6.68 — connection-stability round: a periodic keep-alive keeps the app's
+// connection pool to the server warm (no more cold first-request failures)
+// and the register view is HARD-GATED on real server reachability.
+import { startCloudKeepalive } from '@/lib/cloud-keepalive';
+import { ConnectivityGate } from '@/components/auth/connectivity-gate';
 
 // Auth Views — lazy loaded to reduce initial compilation footprint
 const LandingPage = lazyNamed(() => import('@/components/auth/landing-page'), 'LandingPage');
@@ -300,7 +305,16 @@ const ViewRouter = memo(function ViewRouter() {
             case 'register':
               // Task 78 — the phone registers through the dedicated 3-step
               // mobile wizard (native camera/gallery avatar, customer-first).
-              return platform.isCapacitor || platform.isMobile ? <MobileRegisterForm /> : <RegisterForm />;
+              // 0.6.68 — BOTH forms are wrapped in the connectivity gate: the
+              // sign-up page only mounts once the server answered a live
+              // reachability probe (verification codes + account confirmation
+              // + agency creation are all cloud-native — starting the wizard
+              // offline only guarantees a mid-wizard failure).
+              return (
+                <ConnectivityGate>
+                  {platform.isCapacitor || platform.isMobile ? <MobileRegisterForm /> : <RegisterForm />}
+                </ConnectivityGate>
+              );
             case 'customer-home':
               return <CustomerHome />;
             case 'customer-queue':
@@ -552,7 +566,16 @@ export default function Home() {
     };
     window.addEventListener(SESSION_EXPIRED_EVENT, onExpired);
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired);
-     
+
+  }, []);
+
+  // 0.6.68 — connection-stability heartbeat: keeps the app↔server connection
+  // pool warm (DNS/TCP/TLS already established) so the FIRST user action of
+  // the session (register/verify/agency create) no longer pays the cold-start
+  // connection cost that produced the "fails on the first try, passes on the
+  // second" field pattern. Idempotent, invisible, diag-only logging.
+  useEffect(() => {
+    startCloudKeepalive();
   }, []);
   // Aggressive turn alert — full-screen overlay when customer's turn is called
   // Hook is always called (rules of hooks) but only activates for customers via userId filtering
