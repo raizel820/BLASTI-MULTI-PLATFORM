@@ -9,6 +9,7 @@ import {
   enqueueCategoryTranslations,
   logAgentAction,
   AGENT_LANGS,
+  DEFAULT_AGENT_MODEL,
 } from '../lib/translation-agent'
 import { db } from '@blasti/db'
 
@@ -107,9 +108,11 @@ app.put('/settings', async (c) => {
       data.batchSize = Math.round(n)
     }
     if (body.model !== undefined) {
-      const m = String(body.model || '').trim()
-      if (m && !/^[A-Za-z0-9._\-\/]{2,80}$/.test(m)) return c.json({ success: false, error: 'invalid model id' }, 400)
-      data.model = m || 'glm-4.7-flash'
+      // 0.6.64 — PINNED in ALL cases: any client-sent id is ignored and the
+      // row is stamped with the fixed flash model (glm-4.6-flash never
+      // existed on api.z.ai — error 1211 — and hand-typed ids kept breaking
+      // key connections; the model is no longer a user-facing setting).
+      data.model = DEFAULT_AGENT_MODEL
     }
     const config = await db.translationAgentConfig.upsert({
       where: { id: 'singleton' },
@@ -305,7 +308,10 @@ app.post('/keys', async (c) => {
       const baseUrl = String(body.baseUrl || '').trim()
       if (!/^https?:\/\//.test(baseUrl)) return c.json({ success: false, error: 'baseUrl must be an http(s) URL' }, 400)
     }
-    const model = String(body.model || '').trim().slice(0, 80) || null
+    // 0.6.64 — PINNED in ALL cases: body.model is ignored, the key row is
+    // stamped with the fixed flash model (the engine calls it regardless —
+    // this keeps the admin display honest).
+    const model = DEFAULT_AGENT_MODEL
     const key = await db.translationApiKey.create({
       data: {
         label, provider,
@@ -336,7 +342,9 @@ app.patch('/keys/:id', async (c) => {
     const body = await c.req.json().catch(() => ({}))
     const data: Record<string, unknown> = {}
     if (body.label !== undefined) data.label = String(body.label).trim().slice(0, 60) || 'key'
-    if (body.model !== undefined) data.model = String(body.model || '').trim().slice(0, 80) || null
+    // 0.6.64 — PINNED in ALL cases: a client-sent model is ignored; the row
+    // is re-stamped with the fixed flash id.
+    if (body.model !== undefined) data.model = DEFAULT_AGENT_MODEL
     if (body.baseUrl !== undefined) data.baseUrl = String(body.baseUrl || '').trim() || null
     if (body.apiKey !== undefined && String(body.apiKey).trim()) data.apiKey = String(body.apiKey).trim()
     if (typeof body.isActive === 'boolean') data.isActive = body.isActive

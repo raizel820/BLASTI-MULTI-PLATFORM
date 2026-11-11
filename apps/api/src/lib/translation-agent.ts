@@ -20,9 +20,9 @@
  *
  * PROVIDERS: an active TranslationApiKey with real key material (an explicit
  * 'openai-compatible' entry, or a z.ai platform key pasted under 'zai') wins
- * — z.ai base is the default, model glm-4.7-flash (free flash tier);
- * otherwise the bundled z-ai-web-dev-sdk (free GLM flash) is used. Transient
- * flash-tier errors (1305/429/5xx) are retried automatically.
+ * — z.ai base is the default; otherwise the bundled z-ai-web-dev-sdk is used.
+ * 0.6.64: the model is PINNED to glm-4.7-flash (free flash tier) in ALL
+ * cases. Transient flash-tier errors (1305/429/5xx) are retried automatically.
  */
 
 import { createHash } from 'node:crypto'
@@ -97,27 +97,16 @@ const LLM_TIMEOUT_MS = 120_000
 /** Default OpenAI-compatible base for the z.ai open platform. */
 const ZAI_DEFAULT_BASE = 'https://api.z.ai/api/paas/v4'
 /**
- * The free flash model on the z.ai open platform. `glm-4.6-flash` — the old
- * default — DOES NOT EXIST there (live-verified: error 1211 "Unknown Model"),
- * which is exactly why stored-key connections kept failing. Anything that
- * still points at it is healed to the working flash model at USE time.
+ * 0.6.64 — PINNED MODEL, admin decision: the agent calls the free flash
+ * model on the z.ai open platform in ALL cases. Nothing can point it at a
+ * different model anymore — not a hand-typed id on a stored key, not the
+ * editable settings field (now display-only), nothing. `glm-4.6-flash` —
+ * the old default — DOES NOT EXIST on api.z.ai (live-verified: error 1211
+ * "Unknown Model"), which is exactly why stored-key connections kept
+ * failing; every stored/typed id is ignored and every DB row is re-stamped
+ * with the pinned id at boot (see the heal in startTranslationAgentScheduler).
  */
-const DEFAULT_AGENT_MODEL = 'glm-4.7-flash'
-const LEGACY_MODEL_MAP: Record<string, string> = {
-  'glm-4.6-flash': DEFAULT_AGENT_MODEL, // nonexistent on api.z.ai (1211)
-}
-const MODEL_ID_RE = /^[A-Za-z0-9._\-/]{2,80}$/
-
-/**
- * Heal the stored model id: legacy nonexistent ids map to the working flash
- * model, empty/invalid ids fall back to the default, everything else passes
- * through untouched (power users may pin any provider-specific id).
- */
-export function normalizeAgentModel(raw: unknown): string {
-  const s = String(raw ?? '').trim()
-  if (!s || !MODEL_ID_RE.test(s)) return DEFAULT_AGENT_MODEL
-  return LEGACY_MODEL_MAP[s] ?? s
-}
+export const DEFAULT_AGENT_MODEL = 'glm-4.7-flash'
 
 /** A stored 'zai'-provider key counts as REAL key material unless it is the placeholder. */
 function isRealKeyMaterial(apiKey: string | null | undefined): boolean {
@@ -791,11 +780,11 @@ async function chatCompletionWithRetry(opts: {
 
 async function callTranslationLLM(
   userPrompt: string,
-  config: Awaited<ReturnType<typeof getAgentConfig>>,
 ): Promise<LLMCallResult> {
   // Key priority: an explicit openai-compatible key first; then a REAL key
   // material stored under the 'zai' provider (0.6.63 — admins paste their
   // z.ai platform key there, the UI even invites them to — never ignore it).
+  // 0.6.64 — the config row is no longer consulted: the model is pinned.
   const [compatKey, zaiKey] = await Promise.all([
     db.translationApiKey.findFirst({
       where: { isActive: true, provider: 'openai-compatible' },
@@ -819,7 +808,9 @@ async function callTranslationLLM(
     const result = await chatCompletionWithRetry({
       base: httpKey.base,
       apiKey: httpKey.key.apiKey,
-      model: normalizeAgentModel(httpKey.key.model || config.model),
+      // 0.6.64 — pinned in ALL cases: any id stored on the key or in the
+      // config is ignored by design (they kept pointing at dead model ids).
+      model: DEFAULT_AGENT_MODEL,
       messages: [
         { role: 'system', content: AGENT_SYSTEM_PROMPT },
         { role: 'user', content: userPrompt },
@@ -852,6 +843,8 @@ async function runSdkPath(userPrompt: string): Promise<LLMCallResult> {
       const { default: ZAI } = await import('z-ai-web-dev-sdk')
       const zai = await ZAI.create()
       const completion = await zai.chat.completions.create({
+        // 0.6.64 — the SDK path calls the SAME pinned flash model.
+        model: DEFAULT_AGENT_MODEL,
         messages: [
           { role: 'assistant', content: AGENT_SYSTEM_PROMPT },
           { role: 'user', content: userPrompt },
@@ -892,7 +885,8 @@ export async function testTranslationApiKey(
       // "key connection failing" confusion). baseUrl is optional for z.ai.
       if (!key.apiKey) throw new Error('apiKey is required')
       const base = key.baseUrl?.trim() || ZAI_DEFAULT_BASE
-      const model = normalizeAgentModel(key.model)
+      // 0.6.64 — pinned in ALL cases (the key's stored id is never used).
+      const model = DEFAULT_AGENT_MODEL
       const result = await chatCompletionWithRetry({
         base,
         apiKey: key.apiKey,
@@ -911,6 +905,8 @@ export async function testTranslationApiKey(
       const { default: ZAI } = await import('z-ai-web-dev-sdk')
       const zai = await ZAI.create()
       const completion = await zai.chat.completions.create({
+        // 0.6.64 — pinned flash model here too (ALL cases).
+        model: DEFAULT_AGENT_MODEL,
         messages: TEST_MESSAGES,
         thinking: { type: 'disabled' },
       })
@@ -1077,7 +1073,6 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
 
   const llm = await callTranslationLLM(
     `Translate for a queue-management platform. Return ONLY the JSON object.\n${JSON.stringify(promptPayload)}`,
-    config,
   )
 
   if (!llm.ok) {
@@ -1284,6 +1279,30 @@ let runInFlight = false
 export function startTranslationAgentScheduler(): void {
   if (schedulerStarted) return
   schedulerStarted = true
+
+  // 0.6.64 — one-time boot heal: re-stamp EVERY stored model id (keys with a
+  // hand-typed/wrong/empty id and the config row) with the pinned flash id so
+  // admin displays always match what the engine actually calls. Purely
+  // cosmetic on top of the use-time pinning — the engine ignores stored ids.
+  void (async () => {
+    try {
+      const [keys, cfg] = await Promise.all([
+        db.translationApiKey.updateMany({
+          where: { OR: [{ model: null }, { model: { not: DEFAULT_AGENT_MODEL } }] },
+          data: { model: DEFAULT_AGENT_MODEL },
+        }),
+        db.translationAgentConfig.updateMany({
+          where: { OR: [{ model: null }, { model: { not: DEFAULT_AGENT_MODEL } }] },
+          data: { model: DEFAULT_AGENT_MODEL },
+        }),
+      ])
+      if (keys.count || cfg.count) {
+        console.log(`[translation-agent] model pinned to ${DEFAULT_AGENT_MODEL} — healed ${keys.count} key(s), ${cfg.count} config row(s)`)
+      }
+    } catch (error) {
+      console.warn('[translation-agent] model heal failed:', (error as Error)?.message || error)
+    }
+  })()
 
   const tick = async (): Promise<void> => {
     if (runInFlight) return

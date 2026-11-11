@@ -1583,7 +1583,7 @@ const ar = {
   trAgentBatch: "حجم الدفعة",
   trAgentBatchHint: "أقصى عدد عناصر ترجمة تُقدَّم في كل دفعة.",
   trAgentModel: "معرّف النموذج",
-  trAgentModelHint: "يُستخدم مع المفاتيح المتوافقة مع OpenAI (GLM 4.6 Flash مجاني عبر SDK المدمج).",
+  trAgentModelHint: "النموذج مثبّت من الخادم في كل الحالات ولا يمكن تغييره — glm-4.7-flash المجاني هو المستخدم دائماً.",
   trAgentQueuePending: "بالانتظار",
   trAgentQueueProcessing: "قيد المعالجة",
   trAgentQueueDone: "مكتملة",

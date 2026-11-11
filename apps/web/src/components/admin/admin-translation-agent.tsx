@@ -200,7 +200,7 @@ export function AdminTranslationAgent() {
   const [keys, setKeys] = useState<ApiKeyRow[] | null>(null);
   const [keysLoading, setKeysLoading] = useState(true);
   const [addKeyOpen, setAddKeyOpen] = useState(false);
-  const [keyForm, setKeyForm] = useState({ label: '', provider: 'zai', baseUrl: '', apiKey: '', model: '' });
+  const [keyForm, setKeyForm] = useState({ label: '', provider: 'zai', baseUrl: '', apiKey: '' });
   const [savingKey, setSavingKey] = useState(false);
   const [testingKeyId, setTestingKeyId] = useState<string | null>(null);
   const [deleteKeyId, setDeleteKeyId] = useState<string | null>(null);
@@ -363,7 +363,7 @@ export function AdminTranslationAgent() {
       if (res.ok && data?.success) {
         toast.success(t('trAgentKeyAdded') as any);
         setAddKeyOpen(false);
-        setKeyForm({ label: '', provider: 'zai', baseUrl: '', apiKey: '', model: '' });
+        setKeyForm({ label: '', provider: 'zai', baseUrl: '', apiKey: '' });
         await loadKeys();
         await loadSettings();
       } else {
@@ -493,16 +493,12 @@ export function AdminTranslationAgent() {
                     </div>
                     <div className="space-y-1.5">
                       <Label className="text-xs">{t('trAgentModel')}</Label>
-                      <Input
-                        defaultValue={settings.config.model}
-                        id="tr-agent-model"
-                        key={`model-${settings.config.model}`}
-                        dir="ltr"
-                        onBlur={(e) => {
-                          const v = (e.target as HTMLInputElement).value.trim();
-                          if (v && v !== settings.config.model) void patchSettings({ model: v });
-                        }}
-                      />
+                      {/* 0.6.64 — the model is PINNED server-side to the free
+                          flash id in ALL cases (stored key ids / hand-typed
+                          ids kept pointing at models that do not exist on
+                          api.z.ai and broke key connections). Display-only —
+                          there is nothing to edit anymore. */}
+                      <Input value="glm-4.7-flash" readOnly dir="ltr" className="font-mono bg-muted/50 cursor-default" aria-readonly />
                       <p className="text-[11px] text-muted-foreground">{t('trAgentModelHint')}</p>
                     </div>
                   </div>
@@ -852,10 +848,10 @@ export function AdminTranslationAgent() {
             )}
             <div className="space-y-1.5">
               <Label className="text-xs">{t('trAgentKeyModel')}</Label>
-              {/* 0.6.63 — model matters for BOTH providers now: a pasted z.ai
-                  key is called via api.z.ai where only glm-4.7-flash (free
-                  flash tier) exists. Empty → engine default. */}
-              <Input value={keyForm.model} onChange={(e) => setKeyForm((f) => ({ ...f, model: e.target.value }))} dir="ltr" placeholder="glm-4.7-flash" />
+              {/* 0.6.64 — display-only: the model is PINNED server-side in
+                  ALL cases (glm-4.7-flash, the free flash tier on api.z.ai);
+                  there is no model input to get wrong anymore. */}
+              <Input value="glm-4.7-flash" readOnly dir="ltr" className="font-mono bg-muted/50 cursor-default" aria-readonly />
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">{t('trAgentKeyValue')}</Label>

@@ -1233,8 +1233,9 @@ model TranslationAgentConfig {
   intervalMinutes Int       @default(5)
   /// Max translation items submitted per run.
   batchSize       Int       @default(40)
-  /// GLM flash model id used with openai-compatible providers (glm-4.6-flash
-  /// does NOT exist on api.z.ai — error 1211; use-time normalization heals it).
+  /// GLM flash model — PINNED since 0.6.64: the engine always calls
+  /// glm-4.7-flash regardless of this value (glm-4.6-flash does NOT exist on
+  /// api.z.ai — error 1211; hand-typed ids are ignored too). Display-only.
   model           String    @default("glm-4.7-flash")
   lastRunAt       DateTime?
   lastRunOk       Boolean?
@@ -1251,6 +1252,8 @@ model TranslationApiKey {
   /// OpenAI-compatible chat endpoint origin (e.g. https://api.z.ai/api/paas/v4).
   baseUrl         String?
   apiKey          String
+  /// Informational only since 0.6.64 — the engine pins glm-4.7-flash in ALL
+  /// cases; rows are re-stamped at boot and on every write.
   model           String?
   isActive        Boolean   @default(true)
   lastTestAt      DateTime?

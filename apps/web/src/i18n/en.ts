@@ -1581,7 +1581,7 @@ const en: Record<TranslationKeys, string> = {
   trAgentBatch: "Batch size",
   trAgentBatchHint: "Max translation items submitted per window.",
   trAgentModel: "Model id",
-  trAgentModelHint: "Used with OpenAI-compatible keys (GLM 4.6 flash is free via the bundled SDK).",
+  trAgentModelHint: "Pinned server-side in ALL cases — it cannot be changed; the free glm-4.7-flash is always used.",
   trAgentQueuePending: "Pending",
   trAgentQueueProcessing: "Processing",
   trAgentQueueDone: "Done",
