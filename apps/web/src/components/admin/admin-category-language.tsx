@@ -233,9 +233,15 @@ export function AdminCategoryLanguage() {
         body: JSON.stringify({ categoryId: selectedCategory.id }),
       });
       const data = await res.json().catch(() => null);
-      if (res.ok && data?.success) {
-        const queued = Number(data?.data?.summary?.queued ?? 0);
-        const applied = Number(data?.data?.summary?.applied ?? 0);
+      // 0.6.65 — res.ok is the ONLY success signal: apiClient.parseResponse
+      // strips the { success, data } envelope for small bodies, so the 200
+      // response arrives as { summary } and the old data?.success check was
+      // always undefined → the generic error toast fired while the enqueue
+      // had actually succeeded (same root cause as the add-key "حدث خطأ").
+      if (res.ok) {
+        const summary = (data as { summary?: { queued?: number; applied?: number } } | null)?.summary ?? {};
+        const queued = Number(summary.queued ?? 0);
+        const applied = Number(summary.applied ?? 0);
         if (queued > 0) {
           toast.success((t('catLangAgentQueued') as any as string).replace('{count}', String(queued)));
         } else if (applied > 0) {
@@ -246,7 +252,7 @@ export function AdminCategoryLanguage() {
         setTimeout(() => { void loadTerms(selectedCategory.slug); }, 1500);
         setAgentLogSignal((v) => v + 1);
       } else {
-        toast.error(String(data?.error || (t('error') as any)));
+        toast.error(String((data as { error?: unknown } | null)?.error || (t('error') as any)));
       }
     } catch {
       toast.error(t('error') as any);

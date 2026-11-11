@@ -28,16 +28,24 @@ import {
   ChevronRight,
   Copy,
   Check,
+  Download,
   Loader2,
   RefreshCw,
   Search,
   Sparkles,
 } from 'lucide-react';
+import { toast } from 'sonner';
 import { apiFetch } from '@/lib/api-fetch';
 import { useLanguage } from '@/hooks/use-language';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { Input } from '@/components/ui/input';
 import {
   Dialog,
@@ -100,6 +108,7 @@ const ACTION_LABEL_KEYS: Record<string, TranslationKeys> = {
   KEY_DELETE: 'agentLogActionKeyDelete',
   DICTIONARY_EDIT: 'agentLogActionDictionaryEdit',
   DICTIONARY_DELETE: 'agentLogActionDictionaryDelete',
+  LOGS_EXPORT: 'agentLogActionLogsExport',
 };
 
 function actionLabelKey(action: string): TranslationKeys {
@@ -122,6 +131,18 @@ function statusLabelKey(status: string): TranslationKeys {
   if (status === 'error') return 'agentLogStatusError';
   if (status === 'info') return 'agentLogStatusInfo';
   return 'agentLogStatusSuccess';
+}
+
+/** Date-range presets shared by the list fetch and the batch download. */
+const RANGE_OPTIONS = ['all', '1h', '24h', '7d', '30d'] as const;
+type RangeOption = (typeof RANGE_OPTIONS)[number];
+
+function rangeLabelKey(range: string): TranslationKeys {
+  if (range === '1h') return 'agentLogRange1h';
+  if (range === '24h') return 'agentLogRange24h';
+  if (range === '7d') return 'agentLogRange7d';
+  if (range === '30d') return 'agentLogRange30d';
+  return 'agentLogRangeAll';
 }
 
 function fmtDuration(ms: number | null): string {
@@ -187,10 +208,23 @@ export function AdminAgentLogsSection() {
   const [page, setPage] = useState(1);
   const [action, setAction] = useState('all');
   const [status, setStatus] = useState('all');
+  const [range, setRange] = useState<RangeOption>('all');
   const [q, setQ] = useState('');
   const [qLive, setQLive] = useState('');
   const [detail, setDetail] = useState<AgentLogRow | null>(null);
   const [copied, setCopied] = useState(false);
+  const [downloading, setDownloading] = useState<'csv' | 'json' | 'txt' | null>(null);
+
+  /** Query string carrying the CURRENT filters — the download must match
+   *  exactly what the table shows (type, status, search, date range). */
+  const currentFilterQuery = useCallback(() => {
+    const p = new URLSearchParams();
+    if (action !== 'all') p.set('action', action);
+    if (status !== 'all') p.set('status', status);
+    if (range !== 'all') p.set('range', range);
+    if (q.trim()) p.set('q', q.trim());
+    return p.toString();
+  }, [action, status, range, q]);
 
   const fetchData = useCallback(async () => {
     setLoading(true);
@@ -198,10 +232,8 @@ export function AdminAgentLogsSection() {
       const p = new URLSearchParams();
       p.set('page', String(page));
       p.set('perPage', String(PER_PAGE));
-      if (action !== 'all') p.set('action', action);
-      if (status !== 'all') p.set('status', status);
-      if (q.trim()) p.set('q', q.trim());
-      const res = await apiFetch(`/api/translation-agent/logs?${p.toString()}`);
+      const filters = currentFilterQuery();
+      const res = await apiFetch(`/api/translation-agent/logs?${filters ? `${filters}&` : ''}${p.toString()}`);
       const body = await res.json().catch(() => null);
       const data = res.ok ? unwrapData<LogsPayload>(body) : null;
       if (data) setPayload(data);
@@ -210,7 +242,7 @@ export function AdminAgentLogsSection() {
     } finally {
       setLoading(false);
     }
-  }, [page, action, status, q]);
+  }, [page, currentFilterQuery]);
 
   // Initial + filter/page-driven fetch.
   useEffect(() => {
@@ -232,6 +264,39 @@ export function AdminAgentLogsSection() {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch { /* non-fatal */ }
+  };
+
+  /**
+   * 0.6.65 — BATCH DOWNLOAD: one request downloads EVERY log row matching
+   * the current filters + date range (up to the server cap) as csv/json/txt
+   * — no more copying single reports action by action.
+   */
+  const downloadLogs = async (format: 'csv' | 'json' | 'txt') => {
+    setDownloading(format);
+    try {
+      const res = await apiFetch(`/api/translation-agent/logs/export?${currentFilterQuery()}${currentFilterQuery() ? '&' : ''}format=${format}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => null);
+        const errText = (body as { error?: unknown } | null)?.error;
+        toast.error(String(typeof errText === 'string' && errText ? errText : t('error')));
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+      a.href = url;
+      a.download = `blasti-agent-logs_${action !== 'all' ? action : 'all-actions'}_${status !== 'all' ? status : 'all-statuses'}_${range}_${stamp}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      toast.success(t('agentLogDownloaded') as any);
+    } catch {
+      toast.error(t('error') as any);
+    } finally {
+      setDownloading(null);
+    }
   };
 
   const counts = payload?.counts ?? { total: 0, errors: 0, last24h: 0 };
@@ -285,6 +350,32 @@ export function AdminAgentLogsSection() {
               {loading ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : <RefreshCw className="h-4 w-4 me-1" />}
               {t('refresh')}
             </Button>
+            {/* 0.6.65 — BATCH DOWNLOAD: the WHOLE filtered trail in one file,
+                respecting the exact filters + date range shown below. */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm" disabled={downloading !== null} className="shrink-0 h-8 gap-1.5">
+                  {downloading ? <Loader2 className="h-4 w-4 animate-spin me-0.5" /> : <Download className="h-4 w-4 me-0.5" />}
+                  {t('download')}
+                  <ChevronDown className="h-3.5 w-3.5 opacity-60" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-56">
+                <p className="px-2 py-1.5 text-[11px] text-muted-foreground leading-4">{t('agentLogDownloadHint')}</p>
+                <DropdownMenuItem onClick={() => void downloadLogs('csv')} disabled={downloading !== null}>
+                  <span className="font-mono text-[11px] w-10 shrink-0">CSV</span>
+                  <span className="text-[11px] text-muted-foreground">Excel</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => void downloadLogs('json')} disabled={downloading !== null}>
+                  <span className="font-mono text-[11px] w-10 shrink-0">JSON</span>
+                  <span className="text-[11px] text-muted-foreground">raw / backup</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => void downloadLogs('txt')} disabled={downloading !== null}>
+                  <span className="font-mono text-[11px] w-10 shrink-0">TXT</span>
+                  <span className="text-[11px] text-muted-foreground">{t('agentLogDownloadReport')}</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -320,6 +411,21 @@ export function AdminAgentLogsSection() {
                 <SelectItem value="success">{t('agentLogStatusSuccess')}</SelectItem>
                 <SelectItem value="error">{t('agentLogStatusError')}</SelectItem>
                 <SelectItem value="info">{t('agentLogStatusInfo')}</SelectItem>
+              </SelectContent>
+            </Select>
+            {/* 0.6.65 — date-range filter: applies to the table AND the batch
+                download (e.g. "failed, last 24 hours"). */}
+            <Select
+              value={range}
+              onValueChange={(v) => { setRange(v as RangeOption); setPage(1); }}
+            >
+              <SelectTrigger className="w-full sm:w-44 h-9" aria-label={t('agentLogRange')}>
+                <SelectValue placeholder={t('agentLogRange')} />
+              </SelectTrigger>
+              <SelectContent>
+                {RANGE_OPTIONS.map((r) => (
+                  <SelectItem key={r} value={r}>{t(rangeLabelKey(r))}</SelectItem>
+                ))}
               </SelectContent>
             </Select>
             <div className="flex items-center gap-1.5 flex-1 min-w-[200px]">

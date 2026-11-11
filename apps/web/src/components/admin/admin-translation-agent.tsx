@@ -157,6 +157,16 @@ function unwrapPayload<T>(payload: unknown): T {
   return payload as T;
 }
 
+/**
+ * Server error text from a non-ok apiFetch response body.
+ * 0.6.65 — error bodies are NOT envelope-stripped (only small 2xx bodies
+ * with a `data` key are), so `.error` is reliably present on failures.
+ */
+function errTextOf(body: unknown): string {
+  const e = (body as { error?: unknown } | null)?.error;
+  return typeof e === 'string' && e.trim() ? e.trim() : '';
+}
+
 function timeAgo(iso: string | null, lang: string): string {
   if (!iso) return '—';
   const diff = Date.now() - new Date(iso).getTime();
@@ -271,12 +281,13 @@ export function AdminTranslationAgent() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch),
       });
-      const data = await res.json().catch(() => null);
-      if (res.ok && data?.success) {
+      const body = await res.json().catch(() => null);
+      // 0.6.65 — res.ok is the ONLY success signal (see addKey below).
+      if (res.ok) {
         toast.success(t('trAgentSaved') as any);
         await loadSettings();
       } else {
-        toast.error(String(data?.error || t('error')));
+        toast.error(String(errTextOf(body) || t('error')));
       }
     } catch {
       toast.error(t('error'));
@@ -288,9 +299,10 @@ export function AdminTranslationAgent() {
     setProcessingNow(true);
     try {
       const res = await apiFetch('/api/translation-agent/process-now', { method: 'POST' });
-      const data = await res.json().catch(() => null);
-      if (res.ok && data?.success) {
-        const stats = data?.data?.stats || {};
+      const body = await res.json().catch(() => null);
+      // 0.6.65 — res.ok is the ONLY success signal (see addKey below).
+      if (res.ok) {
+        const stats = unwrapPayload<{ stats?: { ran?: boolean; textJobs?: number; categoryJobs?: number } }>(body)?.stats ?? {};
         if (stats.ran) {
           toast.success((t('trAgentWindowDone') as any as string)
             .replace('{text}', String(stats.textJobs ?? 0))
@@ -300,7 +312,7 @@ export function AdminTranslationAgent() {
         }
         await Promise.all([loadSettings(), loadJobs(jobFilter)]);
       } else {
-        toast.error(String(data?.error || t('error')));
+        toast.error(String(errTextOf(body) || t('error')));
       }
     } catch {
       toast.error(t('error'));
@@ -317,13 +329,14 @@ export function AdminTranslationAgent() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ targetText: editText.trim() }),
       });
-      const data = await res.json().catch(() => null);
-      if (res.ok && data?.success) {
+      const body = await res.json().catch(() => null);
+      // 0.6.65 — res.ok is the ONLY success signal (see addKey below).
+      if (res.ok) {
         toast.success(t('trAgentSaved') as any);
         setEditEntry(null);
         await loadEntries(entriesPage);
       } else {
-        toast.error(String(data?.error || t('error')));
+        toast.error(String(errTextOf(body) || t('error')));
       }
     } catch {
       toast.error(t('error'));
@@ -334,12 +347,13 @@ export function AdminTranslationAgent() {
   const deleteEntry = async (id: string) => {
     try {
       const res = await apiFetch(`/api/translation-agent/dictionary/${id}`, { method: 'DELETE' });
-      const data = await res.json().catch(() => null);
-      if (res.ok && data?.success) {
+      const body = await res.json().catch(() => null);
+      // 0.6.65 — res.ok is the ONLY success signal (see addKey below).
+      if (res.ok) {
         toast.success(t('trAgentEntryDeleted') as any);
         await loadEntries(entriesPage);
       } else {
-        toast.error(String(data?.error || t('error')));
+        toast.error(String(errTextOf(body) || t('error')));
       }
     } catch {
       toast.error(t('error'));
@@ -359,15 +373,24 @@ export function AdminTranslationAgent() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(keyForm),
       });
-      const data = await res.json().catch(() => null);
-      if (res.ok && data?.success) {
+      const body = await res.json().catch(() => null);
+      /**
+       * 0.6.65 — THE "حدث خطأ on add" ROOT CAUSE: apiClient.parseResponse
+       * strips the `{ success, data }` envelope for small bodies (a `data`
+       * field + ≤3 top-level keys), so the 201 response arrived as `{ id }`
+       * and `data?.success` was undefined → the generic error toast fired
+       * WHILE the key was actually created (the exact "حدث خطأ + the key
+       * got registered anyway" report). res.ok is the ONLY success signal;
+       * error text comes from the raw non-ok body (never stripped).
+       */
+      if (res.ok) {
         toast.success(t('trAgentKeyAdded') as any);
         setAddKeyOpen(false);
         setKeyForm({ label: '', provider: 'zai', baseUrl: '', apiKey: '' });
         await loadKeys();
         await loadSettings();
       } else {
-        toast.error(String(data?.error || t('error')));
+        toast.error(String(errTextOf(body) || t('error')));
       }
     } catch {
       toast.error(t('error'));
@@ -379,9 +402,11 @@ export function AdminTranslationAgent() {
     setTestingKeyId(id);
     try {
       const res = await apiFetch(`/api/translation-agent/keys/${id}/test`, { method: 'POST' });
-      const data = await res.json().catch(() => null);
-      if (res.ok && data?.success) {
-        const result = data?.data || {};
+      const body = await res.json().catch(() => null);
+      // 0.6.65 — res.ok is the ONLY success signal; the test result IS the
+      // stripped payload ({ ok, message, sample }) — no nested .data anymore.
+      if (res.ok) {
+        const result = unwrapPayload<{ ok?: boolean; message?: string; sample?: string }>(body) ?? {};
         if (result.ok) {
           toast.success((t('trAgentKeyTestOk') as any as string) + (result.sample ? ` — "${String(result.sample).slice(0, 60)}"` : ''));
         } else {
@@ -389,7 +414,7 @@ export function AdminTranslationAgent() {
         }
         await loadKeys();
       } else {
-        toast.error(String(data?.error || t('error')));
+        toast.error(String(errTextOf(body) || t('error')));
       }
     } catch {
       toast.error(t('error'));
@@ -400,13 +425,14 @@ export function AdminTranslationAgent() {
   const deleteKey = async (id: string) => {
     try {
       const res = await apiFetch(`/api/translation-agent/keys/${id}`, { method: 'DELETE' });
-      const data = await res.json().catch(() => null);
-      if (res.ok && data?.success) {
+      const body = await res.json().catch(() => null);
+      // 0.6.65 — res.ok is the ONLY success signal (see addKey below).
+      if (res.ok) {
         toast.success(t('trAgentKeyDeleted') as any);
         await loadKeys();
         await loadSettings();
       } else {
-        toast.error(String(data?.error || t('error')));
+        toast.error(String(errTextOf(body) || t('error')));
       }
     } catch {
       toast.error(t('error'));

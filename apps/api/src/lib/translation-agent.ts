@@ -35,6 +35,7 @@ export type AgentLogAction =
   | 'BATCH_RUN' | 'BATCH_FAIL' | 'KEY_TEST' | 'PROCESS_NOW'
   | 'SETTINGS_UPDATE' | 'KEY_CREATE' | 'KEY_UPDATE' | 'KEY_DELETE'
   | 'DICTIONARY_EDIT' | 'DICTIONARY_DELETE'
+  | 'LOGS_EXPORT'
 
 export interface AgentLogInput {
   action: AgentLogAction
@@ -1280,10 +1281,14 @@ export function startTranslationAgentScheduler(): void {
   if (schedulerStarted) return
   schedulerStarted = true
 
-  // 0.6.64 — one-time boot heal: re-stamp EVERY stored model id (keys with a
+  // 0.6.65 — one-time boot heal: re-stamp EVERY stored model id (keys with a
   // hand-typed/wrong/empty id and the config row) with the pinned flash id so
   // admin displays always match what the engine actually calls. Purely
   // cosmetic on top of the use-time pinning — the engine ignores stored ids.
+  // NOTE: TranslationApiKey.model is nullable (null branch is valid there),
+  // but TranslationAgentConfig.model is NOT — filtering a non-nullable column
+  // with null makes Prisma reject the whole query ("Argument `model` is
+  // missing"), so the config heal uses the not-clause only (0.6.64 bug).
   void (async () => {
     try {
       const [keys, cfg] = await Promise.all([
@@ -1292,7 +1297,7 @@ export function startTranslationAgentScheduler(): void {
           data: { model: DEFAULT_AGENT_MODEL },
         }),
         db.translationAgentConfig.updateMany({
-          where: { OR: [{ model: null }, { model: { not: DEFAULT_AGENT_MODEL } }] },
+          where: { model: { not: DEFAULT_AGENT_MODEL } },
           data: { model: DEFAULT_AGENT_MODEL },
         }),
       ])

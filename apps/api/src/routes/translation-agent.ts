@@ -35,7 +35,12 @@ import { db } from '@blasti/db'
  *   GET    /api/translation-agent/logs                  → agent ACTION TRAIL (0.6.62) —
  *                                                          filters: action, status, refType,
  *                                                          refId, entity (csv ids → refId OR
- *                                                          details contains), q, page/perPage
+ *                                                          details contains), q, range (0.6.65:
+ *                                                          1h|24h|7d|30d), since, page/perPage
+ *   GET    /api/translation-agent/logs/export           → BATCH DOWNLOAD (0.6.65) — the WHOLE
+ *                                                          filtered trail in one file:
+ *                                                          format=csv|json|txt + the same
+ *                                                          filters + range/since/until (cap 10k)
  *
  * The agent engine itself lives in lib/translation-agent.ts; the scheduler
  * is started once at boot from index.ts.
@@ -413,51 +418,88 @@ app.post('/enqueue-category', async (c) => {
 
 // ─── Agent action trail (Logs Manager tab + Category Language page) ────────
 
+interface LogsFilters {
+  action: string
+  status: string
+  refType: string
+  refId: string
+  entityIds: string[]
+  q: string
+  since: string
+  until: string
+  range: string
+}
+
+/** Date-range presets (hours) — mirrors the UI selector. */
+const RANGE_PRESETS_HOURS: Record<string, number> = { '1h': 1, '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }
+
+/** Shared where-builder for /logs + /logs/export (0.6.65). */
+function logsWhereFromQuery(f: LogsFilters): Record<string, unknown> {
+  const where: Record<string, unknown> = {}
+  if (f.action) where.action = f.action
+  if (f.status) where.status = f.status
+  if (f.refType) where.refType = f.refType
+  if (f.refId) where.refId = f.refId
+
+  // Time window: explicit since/until win over the range preset.
+  const createdAt: Record<string, Date> = {}
+  if (RANGE_PRESETS_HOURS[f.range]) createdAt.gte = new Date(Date.now() - RANGE_PRESETS_HOURS[f.range] * 3_600_000)
+  if (f.since) {
+    const d = new Date(f.since)
+    if (!Number.isNaN(d.getTime())) createdAt.gte = d
+  }
+  if (f.until) {
+    const d = new Date(f.until)
+    if (!Number.isNaN(d.getTime())) createdAt.lte = d
+  }
+  if (Object.keys(createdAt).length) where.createdAt = createdAt
+
+  const andConds: Array<Record<string, unknown>> = []
+  if (f.entityIds.length) {
+    andConds.push({
+      OR: [
+        { refId: { in: f.entityIds } },
+        ...f.entityIds.map((id) => ({ details: { contains: id } })),
+      ],
+    })
+  }
+  if (f.q) {
+    andConds.push({
+      OR: [
+        { summary: { contains: f.q, mode: 'insensitive' as const } },
+        { details: { contains: f.q, mode: 'insensitive' as const } },
+      ],
+    })
+  }
+  if (andConds.length) where.AND = andConds
+  return where
+}
+
+/** Parse the shared trail filters off a request (both /logs and /logs/export). */
+function logsFiltersFrom(c: Context): LogsFilters {
+  const entityRaw = (c.req.query('entity') || '').trim()
+  return {
+    action: c.req.query('action') || '',
+    status: c.req.query('status') || '',
+    refType: c.req.query('refType') || '',
+    refId: c.req.query('refId') || '',
+    entityIds: entityRaw
+      ? entityRaw.split(',').map((s) => s.trim()).filter(Boolean).slice(0, 80)
+      : [],
+    q: (c.req.query('q') || '').trim(),
+    since: (c.req.query('since') || '').trim(),
+    until: (c.req.query('until') || '').trim(),
+    range: (c.req.query('range') || '').toLowerCase(),
+  }
+}
+
 app.get('/logs', async (c) => {
   try {
     const pageRaw = parseInt(c.req.query('page') || '1', 10)
     const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1
     const perPage = Math.min(100, Math.max(5, parseInt(c.req.query('perPage') || '25', 10) || 25))
-    const action = c.req.query('action') || ''
-    const status = c.req.query('status') || ''
-    const refType = c.req.query('refType') || ''
-    const refId = c.req.query('refId') || ''
-    /** CSV entity ids — matches refId IN (...) OR the details blob containing
-     *  the id (BATCH_RUN rows carry their touched refs inside details). */
-    const entityRaw = (c.req.query('entity') || '').trim()
-    const entityIds = entityRaw
-      ? entityRaw.split(',').map((s) => s.trim()).filter(Boolean).slice(0, 80)
-      : []
-    const q = (c.req.query('q') || '').trim()
-    const sinceRaw = c.req.query('since') || ''
-
-    const where: Record<string, unknown> = {}
-    if (action) where.action = action
-    if (status) where.status = status
-    if (refType) where.refType = refType
-    if (refId) where.refId = refId
-    if (sinceRaw) {
-      const since = new Date(sinceRaw)
-      if (!Number.isNaN(since.getTime())) where.createdAt = { gte: since }
-    }
-    const andConds: Array<Record<string, unknown>> = []
-    if (entityIds.length) {
-      andConds.push({
-        OR: [
-          { refId: { in: entityIds } },
-          ...entityIds.map((id) => ({ details: { contains: id } })),
-        ],
-      })
-    }
-    if (q) {
-      andConds.push({
-        OR: [
-          { summary: { contains: q, mode: 'insensitive' as const } },
-          { details: { contains: q, mode: 'insensitive' as const } },
-        ],
-      })
-    }
-    if (andConds.length) where.AND = andConds
+    const f = logsFiltersFrom(c)
+    const where = logsWhereFromQuery(f)
 
     const [total, allTotal, logs, errorTotal, last24h, byActionRaw] = await Promise.all([
       db.translationAgentLog.count({ where }),
@@ -490,6 +532,116 @@ app.get('/logs', async (c) => {
     return c.json({ success: err.success, error: err.error }, err.status as 500)
   }
 })
+
+// ─── BATCH EXPORT (0.6.65) — the WHOLE filtered trail in one download ────────
+//
+// GET /api/translation-agent/logs/export?format=csv|json|txt
+//     &action=&status=&q=&entity=&since=&until=&range=1h|24h|7d|30d
+//
+// The admin picks the SAME filters shown in the Logs Manager (type, status,
+// search) plus a date-range preset — "translation agent: failed, last 24
+// hours" — and downloads every matching row at once (capped) instead of
+// copying reports action by action. csv carries a UTF-8 BOM so Excel opens
+// Arabic summaries correctly; txt is a formatted human-readable report.
+
+const EXPORT_CAP = 10_000
+
+function csvCell(v: unknown): string {
+  // Dates → ISO (a raw Date stringifies verbosely and breaks column parsing).
+  const s = v instanceof Date ? v.toISOString() : String(v ?? '')
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+app.get('/logs/export', async (c) => {
+  try {
+    const format = (c.req.query('format') || 'csv').toLowerCase()
+    if (!['csv', 'json', 'txt'].includes(format)) {
+      return c.json({ success: false, error: 'format must be csv|json|txt' }, 400)
+    }
+
+    const f = logsFiltersFrom(c)
+    const where = logsWhereFromQuery(f)
+    const rangeLabel = RANGE_PRESETS_HOURS[f.range] ? f.range : f.since || f.until ? 'custom' : 'all'
+
+    const rows = await db.translationAgentLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: EXPORT_CAP,
+    })
+
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+    const filename = `blasti-agent-logs_${f.action || 'all-actions'}_${f.status || 'all-statuses'}_${rangeLabel}_${stamp}.${format}`
+
+    let body: string
+    let contentType: string
+    if (format === 'json') {
+      body = JSON.stringify(
+        {
+          generatedAt: new Date().toISOString(),
+          filters: { action: f.action || 'all', status: f.status || 'all', q: f.q || null, range: rangeLabel, since: f.since || null, until: f.until || null },
+          count: rows.length,
+          truncated: rows.length >= EXPORT_CAP,
+          logs: rows,
+        },
+        null,
+        2,
+      )
+      contentType = 'application/json; charset=utf-8'
+    } else if (format === 'csv') {
+      const COLS = ['createdAt', 'action', 'status', 'summary', 'refType', 'refId', 'actor', 'provider', 'durationMs'] as const
+      const lines = [COLS.join(',')]
+      for (const r of rows) lines.push(COLS.map((col) => csvCell((r as Record<string, unknown>)[col])).join(','))
+      // UTF-8 BOM → Excel renders the Arabic summaries correctly.
+      body = '\uFEFF' + lines.join('\r\n')
+      contentType = 'text/csv; charset=utf-8'
+    } else {
+      const head = [
+        'BLASTI — Translation agent action trail report',
+        `Generated : ${new Date().toISOString()}`,
+        `Filters   : action=${f.action || 'all'} · status=${f.status || 'all'}${f.q ? ` · search="${f.q}"` : ''} · range=${rangeLabel}`,
+        `Rows      : ${rows.length}${rows.length >= EXPORT_CAP ? ` (capped at ${EXPORT_CAP})` : ''}`,
+        ''.padEnd(72, '='),
+      ]
+      const lines = rows.map((r) =>
+        [
+          `[${r.createdAt.toISOString()}] ${r.action} · ${r.status.toUpperCase()}`,
+          r.summary,
+          `actor=${r.actor}${r.provider ? ` · provider=${r.provider}` : ''}${r.durationMs != null ? ` · ${fmtMs(r.durationMs)}` : ''}${r.refType ? ` · ref=${r.refType}:${r.refId ?? ''}` : ''}`,
+          r.details ? `details: ${r.details.slice(0, 800)}` : '',
+          ''.padEnd(72, '-'),
+        ].filter(Boolean).join('\n'),
+      )
+      body = [...head, ...lines].join('\n')
+      contentType = 'text/plain; charset=utf-8'
+    }
+
+    await logAgentAction({
+      action: 'LOGS_EXPORT',
+      status: 'info',
+      summary: `trail export — ${rows.length} row(s) as ${format.toUpperCase()} (action=${f.action || 'all'} · status=${f.status || 'all'} · range=${rangeLabel})`,
+      details: { format, rows: rows.length, action: f.action || 'all', status: f.status || 'all', q: f.q || null, range: rangeLabel },
+      actor: await actorOf(c),
+    })
+
+    return new Response(body, {
+      status: 200,
+      headers: {
+        'Content-Type': contentType,
+        'Content-Disposition': `attachment; filename="${filename}"`,
+        'Cache-Control': 'no-store',
+      },
+    })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as 500)
+  }
+})
+
+/** Tiny ms formatter for the txt report. */
+function fmtMs(ms: number): string {
+  if (!Number.isFinite(ms)) return '—'
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`
+}
 
 // Exported for index.ts — the boot hook also warms the singleton row.
 export { startTranslationAgentScheduler }
