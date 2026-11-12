@@ -102,7 +102,7 @@ function copyDereference(src, dest) {
 //   • @prisma/client shell        → package.json · index.js · default.js · LICENSE
 //   • generated desktop client    → package.json · index.js · default.js ·
 //                                   client.js · schema.prisma ·
-//                                   libquery_engine*.node · runtime/library.js
+//                                   (lib)?query_engine-*.node · runtime/library.js
 // The PRIMARY runtime copy (app.asar.unpacked/prisma/generated/client) is
 // trimmed by the matching `files:` negations in electron-builder.yml.
 function copyWhitelisted(src, dest, keepRel) {
@@ -126,7 +126,14 @@ const PRISMA_SHELL_KEEP = new Set(['package.json', 'index.js', 'default.js', 'LI
 function generatedClientKeep(rel) {
   if (['package.json', 'index.js', 'default.js', 'client.js', 'schema.prisma'].includes(rel)) return true;
   if (rel === 'runtime') return true; // the DIRECTORY itself — its content is filtered below
-  if (rel.startsWith('libquery_engine')) return true; // the platform query engine binary
+  // Platform query engine binary. The filename is OS-specific:
+  //   Linux/macOS  libquery_engine-<platform>.so.node / .dylib.node
+  //   Windows      query_engine-windows-x64.dll.node   (NO 'lib' prefix!)
+  // The whitelist MUST cover both — the 0.6.70 CI breakage: the 'lib'
+  // prefix-only rule excluded the Windows engine from the resources copy,
+  // then the step-4 verification threw and electron-builder exited 1 on
+  // every windows-latest attempt (3× retry loop, all exit 1).
+  if (/^(lib)?query_engine-.+\.node$/.test(rel)) return true;
   if (rel === 'runtime/library.js') return true; // the ONLY runtime file index.js requires
   return false;
 }
@@ -183,7 +190,7 @@ module.exports = async function afterPack(context) {
   // 4. Verify a query engine binary landed in the copied generated client.
   const copiedGenerated = path.join(destNodeModules, '.prisma', 'client');
   const engine = fs.readdirSync(copiedGenerated)
-    .find((f) => f.startsWith('libquery_engine') || f.endsWith('.node'));
+    .find((f) => /^(lib)?query_engine-.+\.node$/.test(f));
   if (!engine) {
     throw new Error('[afterPack] No query engine binary found in the copied .prisma/client — the local DB would fail to start.');
   }
