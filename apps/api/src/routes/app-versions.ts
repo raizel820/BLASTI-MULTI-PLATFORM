@@ -26,6 +26,13 @@ const API_VERSION = (
 // API Compatibility Map (0.6.31) — app↔server capability matrix
 import { evaluateCompatibility, seedDefaultGates, CURRENT_SERVER_API_LEVEL, MIN_SUPPORTED_API_LEVEL } from '../lib/api-compat'
 
+// Speed round (0.6.65) — disk-read chunk size for every binary download
+// (full installers + delta patches). 512KB chunks: fewer read syscalls per
+// byte and fewer event-loop trips before the client's TCP window refills —
+// measurably faster on long-fat routes where small transfers never leave
+// TCP slow-start.
+const DOWNLOAD_STREAM_CHUNK_BYTES = 512 * 1024
+
 const app = new Hono()
 
 // ─── Deploy-token auth (CI / automation) ────────────────────────────────────
@@ -1021,6 +1028,22 @@ app.get('/delta/:id/download', async (c) => {
       'Cache-Control': 'public, max-age=300',
     }
 
+    // Speed round (0.6.65) — parity with the installer route: a conditional
+    // re-download of the SAME delta id (client retry after a failed apply,
+    // manual re-run) now short-circuits with a 304, and Chromium's cache
+    // transparently serves the cached patch bytes at disk speed instead of
+    // re-pulling them from the VPS over a high-RTT route.
+    const ifNoneMatch = c.req.header('if-none-match')
+    if (ifNoneMatch && !c.req.header('range')) {
+      const matches = ifNoneMatch.split(',').map((t) => t.trim())
+      if (matches.includes(etag) || matches.includes(etag.replace(/^W\//, '')) || ifNoneMatch.trim() === '*') {
+        return new Response(null, {
+          status: 304,
+          headers: { ETag: etag, 'Cache-Control': baseHeaders['Cache-Control']!, 'Accept-Ranges': 'bytes' },
+        })
+      }
+    }
+
     const rangeHeader = c.req.header('range')
     let start = 0
     let end = fileSize - 1
@@ -1048,7 +1071,12 @@ app.get('/delta/:id/download', async (c) => {
 
     void db.appVersionDelta.update({ where: { id: deltaRow.id }, data: {} }).catch(() => { /* stats optional */ })
 
-    const nodeStream = fs.createReadStream(filePath, { start, end })
+    // Speed round (0.6.65) — 512KB read chunks instead of Node's 64KB default:
+    // delta patches are fetched in SEVERAL parallel Range streams by the
+    // desktop updater; bigger disk-read buffers cut syscalls per byte on the
+    // 2-core ARM VPS and fill the client's TCP window with fewer event-loop
+    // trips, which is exactly what short-lived patch downloads need.
+    const nodeStream = fs.createReadStream(filePath, { start, end, highWaterMark: DOWNLOAD_STREAM_CHUNK_BYTES })
     nodeStream.on('error', (err) => {
       console.error('[app-versions] delta stream error:', err.message)
       nodeStream.destroy()
@@ -1258,7 +1286,8 @@ app.get('/:id/download', async (c) => {
         // counter loss is acceptable; the download is not
       })
 
-    const nodeStream = fs.createReadStream(filePath, { start, end })
+    // Speed round (0.6.65) — same 512KB read-chunk bump as the delta route.
+    const nodeStream = fs.createReadStream(filePath, { start, end, highWaterMark: DOWNLOAD_STREAM_CHUNK_BYTES })
     nodeStream.on('error', (err) => {
       console.error('[app-versions] download stream error:', err.message)
       nodeStream.destroy()

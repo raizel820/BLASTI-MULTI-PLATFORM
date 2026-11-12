@@ -21,4 +21,4 @@
  * (lib/app-version.ts → Device.getInfo().appVersion) — this constant is the
  * bundle-side fallback, always equal to the built release.
  */
-export const APP_VERSION = '0.6.68';
+export const APP_VERSION = '0.6.69';

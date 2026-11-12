@@ -2441,19 +2441,38 @@ async function verifyDownloadedInstaller(filePath, expectedHash, expectedSize) {
   }
 }
 
-// ─── Fast parallel update downloader ─────────────────────────────────────────
+// ─── Fast parallel update downloader ─────────────────────────────────────────────────────
 // The old single-connection fetch felt dramatically slower than the browser
 // download from the landing page on long-fat links (single TCP stream on a
 // high-latency route). This downloader:
 //   • uses Electron's net.fetch (system proxy + HTTP/2 aware) when available,
-//   • probes Range support and downloads in 3 PARALLEL chunks for files
-//     larger than 8 MB (multiplies the effective throughput exactly like a
-//     browser's parallel-connection behaviour),
+//   • probes Range support and downloads in PARALLEL chunks (multiplies the
+//     effective throughput exactly like a browser's parallel-connection
+//     behaviour),
 //   • falls back to a single resumed stream (Range: bytes=<have>-) when the
 //     server ignores ranges or a chunk fails,
 //   • never buffers the file in memory (positional fs writes / streaming).
+//
+// SPEED ROUND (0.6.65) — DELTA PATCHES WERE THE SLOW ONES. Full installers
+// (≥ 8 MB) took the parallel-range path and matched browser speed, but delta
+// hop patches are usually a few hundred KB … a few MB — ALWAYS below the old
+// 8 MB threshold, so every hop downloaded over ONE TCP stream. On a
+// long-fat route (client ↔ VPS with high RTT) a small transfer never leaves
+// TCP slow-start, so per-hop throughput stayed low no matter how good the
+// link was — the exact "delta slow, full installer fast" report.
+// Fix: every caller now carries its own parallelism profile:
+//   • installers (unchanged): threshold 8 MB, 3 parts, ≥ 1 MB per part,
+//   • delta hops: threshold 256 KB, up to 6 parts, ≥ 128 KB per part — a
+//     512 KB patch downloads over 4 concurrent streams, a 4 MB patch over 6,
+//     so even one-hop patches now fill the pipe like the browser does.
 const UPDATE_PARALLEL_MIN_BYTES = 8 * 1024 * 1024;
 const UPDATE_PARTS = 3;
+const UPDATE_MIN_PART_BYTES = 1024 * 1024;
+const DELTA_PARALLEL_MIN_BYTES = 256 * 1024;
+const DELTA_MAX_PARTS = 6;
+const DELTA_MIN_PART_BYTES = 128 * 1024;
+/** Parallelism profile for delta hop patches (see speed-round note above). */
+const DELTA_DOWNLOAD_OPTS = { parallelMinBytes: DELTA_PARALLEL_MIN_BYTES, maxParts: DELTA_MAX_PARTS, minPartBytes: DELTA_MIN_PART_BYTES };
 
 function updateFetch(url, init) {
   // Electron net.fetch honors the OS proxy and TLS stack — prefer it; the
@@ -2475,7 +2494,14 @@ function semverGreaterThan(a, b) {
   return false;
 }
 
-async function downloadUpdateFile(url, dest, emit) {
+async function downloadUpdateFile(url, dest, emit, opts) {
+  // Per-caller parallelism profile (0.6.65) — installers keep the proven
+  // 8 MB / 3-part defaults; delta hop patches pass a much lower threshold so
+  // small patches also download over several concurrent streams.
+  const o = opts || {};
+  const parallelMinBytes = Number(o.parallelMinBytes) || UPDATE_PARALLEL_MIN_BYTES;
+  const maxParts = Math.max(UPDATE_PARTS, Number(o.maxParts) || UPDATE_PARTS);
+  const minPartBytes = Math.max(64 * 1024, Number(o.minPartBytes) || UPDATE_MIN_PART_BYTES);
   // ── Probe: size + Range support in one cheap ranged request. ──────────────
   let total = 0;
   let ranges = false;
@@ -2492,24 +2518,29 @@ async function downloadUpdateFile(url, dest, emit) {
     try { await probe.body?.cancel(); } catch { /* already closed */ }
   } catch { /* probe failure is non-fatal — the real request rechecks */ }
 
-  // Large file + server-side ranges → parallel chunked download.
-  if (ranges && total >= UPDATE_PARALLEL_MIN_BYTES) {
-    try {
-      const got = await downloadParallelRanges(url, dest, total, emit);
-      return got;
-    } catch (err) {
-      console.warn('[BLASTI Desktop] parallel download failed — falling back to single stream:', err && err.message);
+  // File + server-side ranges → parallel chunked download. The part count is
+  // ADAPTIVE (0.6.65): never more than maxParts, never fewer than one part
+  // per minPartBytes — a 300 KB patch at the 128 KB floor → 3 parts, not 6.
+  if (ranges && total >= parallelMinBytes) {
+    const parts = Math.max(1, Math.min(maxParts, Math.ceil(total / minPartBytes)));
+    if (parts > 1) {
+      try {
+        const got = await downloadParallelRanges(url, dest, total, emit, parts);
+        return got;
+      } catch (err) {
+        console.warn('[BLASTI Desktop] parallel download failed — falling back to single stream:', err && err.message);
+      }
     }
   }
   return downloadSingleStream(url, dest, emit);
 }
 
-async function downloadParallelRanges(url, dest, total, emit) {
-  const parts = [];
+async function downloadParallelRanges(url, dest, total, emit, parts = UPDATE_PARTS) {
+  const partList = [];
   const boundaries = [];
-  for (let i = 0; i <= UPDATE_PARTS; i++) boundaries.push(Math.round((total * i) / UPDATE_PARTS));
-  for (let i = 0; i < UPDATE_PARTS; i++) {
-    parts.push({ start: boundaries[i], end: boundaries[i + 1] - 1, received: 0 });
+  for (let i = 0; i <= parts; i++) boundaries.push(Math.round((total * i) / parts));
+  for (let i = 0; i < parts; i++) {
+    partList.push({ start: boundaries[i], end: boundaries[i + 1] - 1, received: 0 });
   }
   // Preallocate the file to the exact final size so positional writes never
   // race ahead of the file length.
@@ -2521,7 +2552,7 @@ async function downloadParallelRanges(url, dest, total, emit) {
 
   const receivedRef = { value: 0 };
   const throttle = { last: 0 };
-  await Promise.all(parts.map(async (part) => {
+  await Promise.all(partList.map(async (part) => {
     const res = await updateFetch(url, {
       headers: { Range: `bytes=${part.start}-${part.end}` },
       redirect: 'follow',
@@ -3246,9 +3277,12 @@ ipcMain.handle('updates:install-delta', async (_e, payload) => {
       try { fs.mkdirSync(UPDATES_DIR(), { recursive: true }); } catch { /* exists */ }
       sendStage(Math.round((doneBytes / totalBytes) * 90), 'download');
       const hopStartedAt = Date.now();
+      // SPEED ROUND (0.6.65) — delta hops use the LOW-threshold parallelism
+      // profile: patches are almost always < 8 MB, so without this they fell
+      // to a single TCP stream and crawled on long-fat routes to the VPS.
       const size = await downloadUpdateFile(url, dest, (received, total) => {
         sendStage(Math.round(((doneBytes + Math.min(received, total)) / totalBytes) * 90), 'download');
-      });
+      }, DELTA_DOWNLOAD_OPTS);
       const dl = await verifyDownloadedInstaller(dest, hop.sha256, size);
       if (!dl.ok) {
         updateLog('DELTA', `hop ${i + 1} integrity check FAILED — patch deleted, falling back to full installer`, {
@@ -3265,6 +3299,7 @@ ipcMain.handle('updates:install-delta', async (_e, payload) => {
         hop: `${hop.fromVersion}→${hop.toVersion}`,
         bytes: size,
         seconds: ((Date.now() - hopStartedAt) / 1000).toFixed(1),
+        speedKBps: Math.round(size / Math.max(1, Date.now() - hopStartedAt) / 1.024),
         sha256: String(hop.sha256 || '').slice(0, 12) || 'none',
       });
     }
