@@ -12,6 +12,20 @@ directories:
   output: dist
   buildResources: assets
 
+# SIZE ROUND (0.6.69) — maximum NSIS/AppImage/dmg compression (LZMA ultra).
+# Slower builds, measurably smaller installers on the electron+prisma payload.
+compression: maximum
+
+# SIZE ROUND (0.6.69) — ship ONLY the locales the app actually speaks.
+# The electron dist carries ~55 Chromium locale .pak files (~15 MB) that
+# nothing in the UI ever uses (the app's own i18n is ar/en/fr in the web
+# layer; ar/en/fr Chromium locales keep native context menus correct).
+electronLanguages:
+  - ar
+  - en
+  - en-US
+  - fr
+
 # ─── Files to Package ───────────────────────────────────────────────────────
 # Main process files, web app output, and local database.
 # node_modules production deps are auto-included by electron-builder.
@@ -50,6 +64,44 @@ files:
   - out/**/*
   - prisma/schema.prisma
   - prisma/generated/**/*
+  # ─── SIZE ROUND (0.6.69) — dead runtime weight out of the package ──────
+  # The generated SQLite client is SELF-CONTAINED at runtime: its index.js
+  # requires ONLY ./runtime/library.js (verified against a fresh
+  # `prisma generate` — zero external packages). Everything below (wasm
+  # engines for OTHER database providers, edge/react-native/browser
+  # variants, driver-adapter loaders, d.ts, source maps) is never loaded by
+  # the packaged app — stripping it shrinks the asar AND the unpacked tree
+  # (which is also what delta references/diffs are built from).
+  - "!prisma/generated/client/query_engine_bg.js"
+  - "!prisma/generated/client/query_engine_bg.wasm"
+  - "!prisma/generated/client/wasm.js"
+  - "!prisma/generated/client/wasm.d.ts"
+  - "!prisma/generated/client/wasm-edge-light-loader.mjs"
+  - "!prisma/generated/client/wasm-worker-loader.mjs"
+  - "!prisma/generated/client/edge.js"
+  - "!prisma/generated/client/edge.d.ts"
+  - "!prisma/generated/client/index-browser.js"
+  - "!prisma/generated/client/default.d.ts"
+  - "!prisma/generated/client/index.d.ts"
+  - "!prisma/generated/client/client.d.ts"
+  - "!prisma/generated/client/**/*.map"
+  - "!prisma/generated/client/runtime/edge.js"
+  - "!prisma/generated/client/runtime/edge-esm.js"
+  - "!prisma/generated/client/runtime/react-native.js"
+  - "!prisma/generated/client/runtime/index-browser.js"
+  - "!prisma/generated/client/runtime/index-browser.d.ts"
+  - "!prisma/generated/client/runtime/wasm-engine-edge.js"
+  - "!prisma/generated/client/runtime/wasm-compiler-edge.js"
+  # Same dead weight inside the auto-collected @prisma/client runtime
+  # package (if electron-builder manages to collect it from the bun store):
+  # its runtime/ folder is ~73 MB of wasm-base64 engines for postgres /
+  # mysql / sqlserver / cockroach / mongodb — the desktop runs SQLite via
+  # the generated client's own self-contained runtime, never this.
+  - "!node_modules/@prisma/client/runtime/**"
+  - "!node_modules/@prisma/client/generator-build/**"
+  - "!node_modules/@prisma/client/scripts/**"
+  - "!node_modules/@prisma/client/*.md"
+  - "!node_modules/@prisma/client/**/*.map"
   # The desktop SQLite Prisma client (prisma/generated) is also copied into
   # resources/node_modules/.prisma/client by scripts/after-pack.js (outside
   # asar — the query engine .node binary cannot load from inside an archive).

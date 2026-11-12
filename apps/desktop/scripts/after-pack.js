@@ -87,6 +87,50 @@ function copyDereference(src, dest) {
   fs.cpSync(src, dest, { recursive: true, dereference: true, force: true });
 }
 
+// ─── SIZE ROUND (0.6.69) — slim the packaged fallback copies ────────────────
+//
+// The bun-store @prisma/client package is ~74 MB, but the packaged app only
+// ever uses it as a RE-EXPORT SHELL: index.js → require('.prisma/client') →
+// the generated desktop client, whose runtime/library.js is fully
+// self-contained (verified: requires only node: builtins). The other ~73 MB
+// (wasm-base64 engines for postgres/mysql/sqlserver/cockroach/mongodb,
+// generator-build, scripts, edge/react-native/browser variants, d.ts,
+// source maps) can NEVER load at runtime — they were silently doubling the
+// installer payload under NSIS compression.
+//
+// Both fallback copies below now ship whitelists instead of full trees:
+//   • @prisma/client shell        → package.json · index.js · default.js · LICENSE
+//   • generated desktop client    → package.json · index.js · default.js ·
+//                                   client.js · schema.prisma ·
+//                                   libquery_engine*.node · runtime/library.js
+// The PRIMARY runtime copy (app.asar.unpacked/prisma/generated/client) is
+// trimmed by the matching `files:` negations in electron-builder.yml.
+function copyWhitelisted(src, dest, keepRel) {
+  fs.mkdirSync(path.dirname(dest), { recursive: true });
+  fs.cpSync(src, dest, {
+    recursive: true,
+    dereference: true,
+    force: true,
+    filter: (srcPath) => {
+      const rel = path.relative(src, srcPath);
+      if (!rel) return true; // the root itself
+      return keepRel(rel.split(path.sep).join('/'));
+    },
+  });
+}
+
+/** @prisma/client re-export shell — everything else is dead weight here. */
+const PRISMA_SHELL_KEEP = new Set(['package.json', 'index.js', 'default.js', 'LICENSE']);
+
+/** Generated desktop client runtime whitelist (engine + library.js + schema). */
+function generatedClientKeep(rel) {
+  if (['package.json', 'index.js', 'default.js', 'client.js', 'schema.prisma'].includes(rel)) return true;
+  if (rel === 'runtime') return true; // the DIRECTORY itself — its content is filtered below
+  if (rel.startsWith('libquery_engine')) return true; // the platform query engine binary
+  if (rel === 'runtime/library.js') return true; // the ONLY runtime file index.js requires
+  return false;
+}
+
 module.exports = async function afterPack(context) {
   const appOutDir = context.appOutDir;
   const resourcesDir = path.join(appOutDir, 'resources');
@@ -119,13 +163,16 @@ module.exports = async function afterPack(context) {
   }
   log(`Desktop generated client found at: ${generatedDir}`);
 
-  // 1. Runtime package
-  copyDereference(clientPkg, path.join(destNodeModules, '@prisma', 'client'));
-  log('Copied @prisma/client → resources/node_modules/@prisma/client');
+  // 1. Runtime package — WHITELISTED shell (0.6.69): the full bun-store
+  // copy carried ~73 MB of never-loaded wasm engines / variants.
+  copyWhitelisted(clientPkg, path.join(destNodeModules, '@prisma', 'client'),
+    (rel) => PRISMA_SHELL_KEEP.has(rel));
+  log('Copied @prisma/client (slim re-export shell) → resources/node_modules/@prisma/client');
 
   // 2. Desktop generated client (SQLite schema + platform query engine binary)
-  copyDereference(generatedDir, path.join(destNodeModules, '.prisma', 'client'));
-  log('Copied desktop SQLite client → resources/node_modules/.prisma/client');
+  // — WHITELISTED (0.6.69): engine + library.js + schema + entries only.
+  copyWhitelisted(generatedDir, path.join(destNodeModules, '.prisma', 'client'), generatedClientKeep);
+  log('Copied desktop SQLite client (engine + runtime, slimmed) → resources/node_modules/.prisma/client');
 
   // 3. Runtime dependencies of @prisma/client (tiny JS helpers)
   for (const dep of collectDependencyDirs(clientPkg)) {
@@ -141,6 +188,21 @@ module.exports = async function afterPack(context) {
     throw new Error('[afterPack] No query engine binary found in the copied .prisma/client — the local DB would fail to start.');
   }
   log(`Query engine shipped: ${engine}`);
+
+  // 5. SIZE ROUND (0.6.69) — fail the BUILD (not the runtime) if the slimmed
+  // copies lost anything the re-export chain needs. Cheap; catches whitelist
+  // drift after a future prisma upgrade.
+  const shellDir = path.join(destNodeModules, '@prisma', 'client');
+  for (const required of ['package.json', 'index.js', 'default.js']) {
+    if (!fs.existsSync(path.join(shellDir, required))) {
+      throw new Error(`[afterPack] slimmed @prisma/client shell is missing ${required} — the resources fallback re-export would break.`);
+    }
+  }
+  for (const required of ['package.json', 'index.js', 'schema.prisma', 'runtime/library.js']) {
+    if (!fs.existsSync(path.join(copiedGenerated, required))) {
+      throw new Error(`[afterPack] slimmed generated client is missing ${required} — the resources fallback would break.`);
+    }
+  }
 
   console.log('  ✔ afterPack — Prisma client runtime shipped successfully');
 };
