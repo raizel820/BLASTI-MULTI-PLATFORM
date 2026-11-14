@@ -73,6 +73,9 @@ function sectionPeriodLabelKey(period: AdminSectionPeriod): string {
       return 'analyticsSection.period7d';
     case '30d':
       return 'analyticsSection.period30d';
+    // Task 6-b: 90-day window for the server analyzer (key exists in ar/en/fr).
+    case '90d':
+      return 'analyticsSection.period90d';
     case 'today':
       return 'adminAnalytics.period.today';
     case 'this-month':

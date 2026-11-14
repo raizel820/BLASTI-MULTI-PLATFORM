@@ -19,6 +19,8 @@ import { getSettingRaw } from '../lib/config-manager'
 import { SETTLED_TRANSACTION_STATUSES } from '../lib/enums'
 // Agencies Management — dictionary-backed category validation.
 import { categorySlugError } from '../lib/categories'
+// Server analyzer (VPS resource samples + engine/manager classification).
+import { SERVER_COMPONENTS, getLinkMbpsCap } from '../lib/server-metrics'
 // Online (Chargily) payment reconciliation — the admin transactions console can
 // verify a gateway checkout against the LIVE Chargily API and settle it through
 // the same idempotent fulfillment path used by the webhook + poll fallback.
@@ -4255,6 +4257,12 @@ app.delete('/users', async (c) => {
         await tx.service.deleteMany({ where: { agencyId: agency.id } })
         await tx.announcement.deleteMany({ where: { agencyId: agency.id } })
         await tx.transaction.deleteMany({ where: { agencyId: agency.id } })
+        // 0.6.72 — Invoice.agencyId carries NO onDelete rule: an agency with
+        // a settled subscription invoice blocked tx.agency.delete with P2003
+        // → the WHOLE delete tx rolled back → the account silently survived
+        // (field incident: "email already registered" after an admin delete).
+        // Invoices are point-in-time snapshots — they go with the account.
+        await tx.invoice.deleteMany({ where: { agencyId: agency.id } })
         await tx.branch.deleteMany({ where: { agencyId: agency.id } })
         await tx.agency.delete({ where: { id: agency.id } })
       }
@@ -4285,6 +4293,33 @@ app.delete('/users', async (c) => {
         where: { reviewedBy: userId },
         data: { reviewedBy: null },
       })
+
+      // 0.6.72 — free the identity channels held by any staged-signup row
+      // for this user. PendingRegistration.email/username/phoneNumber are
+      // UNIQUE columns; the verify flow deletes its pending row best-effort
+      // (a swallowed error there leaks the row), and a leaked row OUTLIVED
+      // the account here — it kept answering 'Email already registered' on
+      // re-registration after the admin delete (field incident). Purge at
+      // ANY row age: the register-side sweep only reclaims rows after the
+      // dead window (PENDING_REGISTRATION_TTL_HOURS), which does not help a
+      // user that no longer exists.
+      if (targetUser.username || targetUser.email || targetUser.phoneNumber) {
+        await tx.pendingRegistration.deleteMany({
+          where: {
+            OR: [
+              ...(targetUser.email ? [{ email: targetUser.email }] : []),
+              ...(targetUser.phoneNumber ? [{ phoneNumber: targetUser.phoneNumber }] : []),
+              { username: targetUser.username },
+            ],
+          },
+        })
+      }
+
+      // 0.6.72 — Invoice.userId is REQUIRED with no onDelete rule: a
+      // customer SMS-pack invoice (agencyId null) blocked tx.user.delete
+      // with P2003 → 500 → the account survived → 'Email already
+      // registered' on re-registration. Snapshots go with the account.
+      await tx.invoice.deleteMany({ where: { userId } })
 
       // Finally delete the user
       await tx.user.delete({ where: { id: userId } })
@@ -5494,6 +5529,444 @@ app.post('/settings/maps/validate', async (c) => {
     return c.json({
       success: true,
       data: { target, valid: result.valid, checks: result.checks, ...(result.error ? { error: result.error } : {}) },
+    })
+  } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── Server section (VPS resource analyzer) ─────────────────────────────────
+//
+// GET /api/admin/analytics/server          — full analyzer payload
+//
+// Query: period (today|yesterday|7d|30d|90d|this-week|this-month|this-quarter|
+// this-year|custom; custom REQUIRES from+to), component (optional engine/
+// manager key — '' or absent = ALL).
+//
+// Answers, for the resolved window: averages per day/week/month/90d (the
+// period selector), per-weekday patterns, per-hour-of-day average+peak on any
+// weekday, connection-loss episodes (gap-derived + persisted restarts),
+// per-resource bottleneck verdicts, and the per-engine/manager activity share.
+
+const SERVER_COMPONENT_KEY_SET = new Set(SERVER_COMPONENTS)
+
+function percentile95(sorted: number[]): number {
+  if (sorted.length === 0) return 0
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(0.95 * sorted.length) - 1))
+  return sorted[idx]
+}
+
+app.get('/analytics/server', async (c) => {
+  try {
+    await requireAdmin(c)
+    const pq = resolvePeriodFromQuery(c, '7d')
+    if (!pq.ok) return c.json({ success: false, error: pq.message }, 400)
+    const { start, end } = pq.range
+
+    const rawComponent = (c.req.query('component') ?? '').trim()
+    const componentFilter = rawComponent && SERVER_COMPONENT_KEY_SET.has(rawComponent) ? rawComponent : ''
+
+    const sampleWhere = { createdAt: { gte: start, lte: end } }
+
+    const [samples, persistedOutages, compGroups, recordedSinceAgg, latest, linkMbps] = await Promise.all([
+      db.serverMetricSample.findMany({
+        where: sampleWhere,
+        select: {
+          createdAt: true,
+          cpuUsagePct: true,
+          cpuIowaitPct: true,
+          loadAvg1: true,
+          ramUsedMb: true,
+          ramTotalMb: true,
+          diskUsedGb: true,
+          diskTotalGb: true,
+          diskReadKbps: true,
+          diskWriteKbps: true,
+          netUpKbps: true,
+          netDownKbps: true,
+        },
+        orderBy: { createdAt: 'asc' },
+      }),
+      db.serverOutage.findMany({
+        where: { startedAt: { lte: end }, OR: [{ endedAt: null }, { endedAt: { gte: start } }] },
+        orderBy: { startedAt: 'asc' },
+      }),
+      db.serverComponentSample.groupBy({
+        by: ['component'],
+        where: sampleWhere,
+        _sum: { requests: true, errors: true, bytesIn: true, bytesOut: true },
+      }),
+      db.serverMetricSample.aggregate({ _min: { createdAt: true } }),
+      db.serverMetricSample.findFirst({ orderBy: { createdAt: 'desc' } }),
+      getLinkMbpsCap(),
+    ])
+
+    // ── window stats ────────────────────────────────────────────────────────
+    const n = samples.length
+    const sum = (arr: number[]) => arr.reduce((a, b) => a + b, 0)
+    const avg = (arr: number[]) => (arr.length > 0 ? sum(arr) / arr.length : 0)
+    const peakOf = (arr: number[]) => (arr.length > 0 ? Math.max(...arr) : 0)
+
+    const cpuArr = samples.map((s) => s.cpuUsagePct)
+    const iowaitArr = samples.map((s) => s.cpuIowaitPct)
+    const loadArr = samples.map((s) => s.loadAvg1)
+    const ramPctArr = samples.map((s) => (s.ramTotalMb > 0 ? (s.ramUsedMb / s.ramTotalMb) * 100 : 0))
+    const diskPctArr = samples
+      .filter((s) => s.diskTotalGb > 0)
+      .map((s) => (s.diskUsedGb / s.diskTotalGb) * 100)
+    const readArr = samples.map((s) => s.diskReadKbps)
+    const writeArr = samples.map((s) => s.diskWriteKbps)
+    const netUpArr = samples.map((s) => s.netUpKbps)
+    const netDownArr = samples.map((s) => s.netDownKbps)
+
+    // Sample spacing is ~60s → total GB moved = KB/s × 60s / 1,048,576 KB/GB.
+    const kbpsSeriesToGb = (arr: number[]) => round1((sum(arr) * 60) / 1048576)
+
+    const cores = os.cpus()?.length || 1
+
+    // ── outages: gap-derived (single source of truth) + persisted restarts ──
+    interface OutageRow {
+      startedAt: string
+      endedAt: string | null
+      durationSec: number
+      reason: string
+    }
+    const outages: OutageRow[] = []
+    const GAP_MS = 5 * 60 * 1000
+    for (let i = 1; i < samples.length; i++) {
+      const gapMs = samples[i].createdAt.getTime() - samples[i - 1].createdAt.getTime()
+      if (gapMs > GAP_MS) {
+        outages.push({
+          startedAt: new Date(samples[i - 1].createdAt.getTime() + 60_000).toISOString(),
+          endedAt: samples[i].createdAt.toISOString(),
+          durationSec: Math.round((gapMs - 60_000) / 1000),
+          reason: 'unreachable',
+        })
+      }
+    }
+    // Ongoing loss right now: newest sample is older than the gap threshold.
+    const nowMs = Date.now()
+    if (latest && nowMs - latest.createdAt.getTime() > GAP_MS) {
+      outages.push({
+        startedAt: new Date(latest.createdAt.getTime() + 60_000).toISOString(),
+        endedAt: null,
+        durationSec: Math.round((nowMs - latest.createdAt.getTime() - 60_000) / 1000),
+        reason: 'unreachable',
+      })
+    }
+    // Overlay persisted restart records: a persisted outage that overlaps a
+    // gap-derived one REPLACES it (better label); non-overlapping persisted
+    // rows (e.g. samples pruned) are appended.
+    for (const po of persistedOutages) {
+      const pStart = po.startedAt.getTime()
+      const pEnd = (po.endedAt ?? new Date(nowMs)).getTime()
+      const overlapIdx = outages.findIndex((o) => {
+        const oStart = new Date(o.startedAt).getTime()
+        const oEnd = o.endedAt ? new Date(o.endedAt).getTime() : nowMs
+        return pStart <= oEnd + 2 * 60_000 && pEnd >= oStart - 2 * 60_000
+      })
+      const row: OutageRow = {
+        startedAt: po.startedAt.toISOString(),
+        endedAt: po.endedAt ? po.endedAt.toISOString() : null,
+        durationSec: po.durationSec,
+        reason: po.reason || 'api-restart',
+      }
+      if (overlapIdx >= 0) outages[overlapIdx] = row
+      else outages.push(row)
+    }
+    outages.sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime())
+
+    const periodSec = Math.max(60, Math.round((end.getTime() - start.getTime()) / 1000))
+    const outageTotalSec = sum(outages.map((o) => o.durationSec))
+    const availabilityPct = Math.max(0, Math.min(100, 100 - (outageTotalSec / periodSec) * 100))
+
+    // ── timeline (downsampled to ≤120 buckets, avg per bucket) ─────────────
+    const TIMELINE_TARGET = 120
+    const bucketSize = Math.max(1, Math.ceil(n / TIMELINE_TARGET))
+    const timeline: Array<{
+      t: string; cpu: number; ram: number; diskSpace: number
+      diskRead: number; diskWrite: number; netUp: number; netDown: number; load: number
+    }> = []
+    for (let i = 0; i < n; i += bucketSize) {
+      const slice = samples.slice(i, i + bucketSize)
+      timeline.push({
+        t: slice[0].createdAt.toISOString(),
+        cpu: round1(avg(slice.map((s) => s.cpuUsagePct))),
+        ram: round1(avg(slice.map((s) => (s.ramTotalMb > 0 ? (s.ramUsedMb / s.ramTotalMb) * 100 : 0)))),
+        diskSpace: round1(avg(slice.filter((s) => s.diskTotalGb > 0).map((s) => (s.diskUsedGb / s.diskTotalGb) * 100))),
+        diskRead: round1(avg(slice.map((s) => s.diskReadKbps))),
+        diskWrite: round1(avg(slice.map((s) => s.diskWriteKbps))),
+        netUp: round1(avg(slice.map((s) => s.netUpKbps))),
+        netDown: round1(avg(slice.map((s) => s.netDownKbps))),
+        load: Math.round(avg(slice.map((s) => s.loadAvg1)) * 100) / 100,
+      })
+    }
+
+    // ── hourly profile (0-23, avg + peak across every day in the window) ────
+    type HourCell = { sums: number[]; peaks: number[]; count: number }
+    const makeHourCells = (): HourCell[] => Array.from({ length: 24 }, () => ({ sums: [0, 0, 0], peaks: [0, 0, 0], count: 0 }))
+    // index 0=cpu 1=ram 2=net(total Kbps)
+    const hourCells = makeHourCells()
+    const weekdayCells: Array<HourCell[]> = Array.from({ length: 7 }, makeHourCells)
+    for (const s of samples) {
+      const h = s.createdAt.getUTCHours()
+      const wd = s.createdAt.getUTCDay()
+      const ramPct = s.ramTotalMb > 0 ? (s.ramUsedMb / s.ramTotalMb) * 100 : 0
+      const netTotal = s.netUpKbps + s.netDownKbps
+      const vals = [s.cpuUsagePct, ramPct, netTotal]
+      const cells = [hourCells[h], weekdayCells[wd][h]]
+      for (const cell of cells) {
+        for (let k = 0; k < 3; k++) {
+          cell.sums[k] += vals[k]
+          cell.peaks[k] = Math.max(cell.peaks[k], vals[k])
+        }
+        cell.count += 1
+      }
+    }
+    const hourly = hourCells.map((cell, hour) => ({
+      hour,
+      cpuAvg: cell.count > 0 ? round1(cell.sums[0] / cell.count) : null,
+      cpuPeak: cell.count > 0 ? round1(cell.peaks[0]) : null,
+      ramAvg: cell.count > 0 ? round1(cell.sums[1] / cell.count) : null,
+      ramPeak: cell.count > 0 ? round1(cell.peaks[1]) : null,
+      netAvg: cell.count > 0 ? round1(cell.sums[2] / cell.count) : null,
+      netPeak: cell.count > 0 ? round1(cell.peaks[2]) : null,
+      ioAvg: cell.count > 0 ? round1(avg(samples.filter((s) => s.createdAt.getUTCHours() === hour).map((s) => s.diskReadKbps + s.diskWriteKbps))) : null,
+      ioPeak: cell.count > 0 ? round1(peakOf(samples.filter((s) => s.createdAt.getUTCHours() === hour).map((s) => s.diskReadKbps + s.diskWriteKbps))) : null,
+      samples: cell.count,
+    }))
+    const weekday = weekdayCells.map((cells, wd) => {
+      const flat = cells.flat()
+      const cnt = flat.reduce((a, b) => a + b.count, 0)
+      const cpuAvg = cnt > 0 ? flat.reduce((a, b) => a + b.sums[0], 0) / cnt : null
+      const cpuPeak = flat.length > 0 ? Math.max(...flat.map((b) => (b.count > 0 ? b.peaks[0] : 0))) : null
+      const ramAvg = cnt > 0 ? flat.reduce((a, b) => a + b.sums[1], 0) / cnt : null
+      const ramPeak = flat.length > 0 ? Math.max(...flat.map((b) => (b.count > 0 ? b.peaks[1] : 0))) : null
+      const netAvg = cnt > 0 ? flat.reduce((a, b) => a + b.sums[2], 0) / cnt : null
+      const netPeak = flat.length > 0 ? Math.max(...flat.map((b) => (b.count > 0 ? b.peaks[2] : 0))) : null
+      return {
+        weekday: wd,
+        cpuAvg: cpuAvg !== null ? round1(cpuAvg) : null,
+        cpuPeak: cpuPeak !== null ? round1(cpuPeak) : null,
+        ramAvg: ramAvg !== null ? round1(ramAvg) : null,
+        ramPeak: ramPeak !== null ? round1(ramPeak) : null,
+        netAvg: netAvg !== null ? round1(netAvg) : null,
+        netPeak: netPeak !== null ? round1(netPeak) : null,
+        samples: cnt,
+      }
+    })
+    // 7×24 matrices of AVG cpu / ram / net (null where a cell has no samples)
+    // — the weekday×hour heatmap the analyzer renders.
+    const matrixOf = (idx: 0 | 1 | 2): Array<Array<number | null>> =>
+      weekdayCells.map((cells) =>
+        cells.map((cell) => (cell.count > 0 ? round1(cell.sums[idx] / cell.count) : null)),
+      )
+    const weekdayHour = { cpu: matrixOf(0), ram: matrixOf(1), net: matrixOf(2) }
+
+    // Busiest highlights (max AVERAGE load — peaks live in the hourly series).
+    let busiestHour: number | null = null
+    let busiestHourVal = -1
+    for (const h of hourly) {
+      if (h.cpuAvg !== null && h.cpuAvg > busiestHourVal) {
+        busiestHourVal = h.cpuAvg
+        busiestHour = h.hour
+      }
+    }
+    let busiestWeekday: number | null = null
+    let busiestWeekdayVal = -1
+    for (const wd of weekday) {
+      if (wd.cpuAvg !== null && wd.cpuAvg > busiestWeekdayVal) {
+        busiestWeekdayVal = wd.cpuAvg
+        busiestWeekday = wd.weekday
+      }
+    }
+    let busiestCell: { weekday: number; hour: number } | null = null
+    let busiestCellVal = -1
+    for (let wd = 0; wd < 7; wd++) {
+      for (let h = 0; h < 24; h++) {
+        const v = weekdayHour.cpu[wd][h]
+        if (v !== null && v > busiestCellVal) {
+          busiestCellVal = v
+          busiestCell = { weekday: wd, hour: h }
+        }
+      }
+    }
+
+    // ── bottleneck verdicts (explainable thresholds, worst level wins) ──────
+    const cpuAvg = round1(avg(cpuArr))
+    const cpuPeak = round1(peakOf(cpuArr))
+    const ramAvgPct = round1(avg(ramPctArr))
+    const ramPeakPct = round1(peakOf(ramPctArr))
+    const diskAvgPct = diskPctArr.length > 0 ? round1(avg(diskPctArr)) : null
+    const diskPeakPct = diskPctArr.length > 0 ? round1(peakOf(diskPctArr)) : null
+    const iowaitAvg = round1(avg(iowaitArr))
+    const loadAvg = round1(avg(loadArr))
+    const loadPeak = round1(peakOf(loadArr))
+    const netTotalAvgKbps = round1(avg(netUpArr) + avg(netDownArr))
+    const netPeakKbps = round1(peakOf(netUpArr.map((v, i) => v + netDownArr[i])))
+
+    // NOTE on units: netUpKbps/netDownKbps are KILOBYTES/s (binary KB). A
+    // link of L Mbps carries ≈ L/8 × 1024 KB/s. The cap converts once here so
+    // the verdict math stays honest.
+    const capKbps = (linkMbps / 8) * 1024
+
+    type Bottleneck = { resource: string; level: 'ok' | 'watch' | 'critical'; reason: string }
+    const bottlenecks: Bottleneck[] = []
+    const push = (resource: string, worst: 'ok' | 'watch' | 'critical', reasons: string[]) =>
+      bottlenecks.push({ resource, level: worst, reason: reasons.join(' · ') || 'ok' })
+    const worstOf = (...levels: Array<'ok' | 'watch' | 'critical'>): 'ok' | 'watch' | 'critical' =>
+      levels.includes('critical') ? 'critical' : levels.includes('watch') ? 'watch' : 'ok'
+
+    {
+      const reasons: string[] = []
+      let l1: 'ok' | 'watch' | 'critical' = 'ok'
+      let l2: 'ok' | 'watch' | 'critical' = 'ok'
+      if (cpuAvg >= 85) { l1 = 'critical'; reasons.push(`avg CPU ${cpuAvg}% ≥ 85%`) }
+      else if (cpuAvg >= 70) { l1 = 'watch'; reasons.push(`avg CPU ${cpuAvg}% ≥ 70%`) }
+      if (cpuPeak >= 98 || loadPeak >= cores * 2) { l2 = 'critical'; reasons.push(`peak CPU ${cpuPeak}% / load ${loadPeak} vs ${cores} cores`) }
+      else if (cpuPeak >= 92 || loadPeak >= cores) { l2 = 'watch'; reasons.push(`peak CPU ${cpuPeak}% / load ${loadPeak} vs ${cores} cores`) }
+      push('cpu', worstOf(l1, l2), reasons)
+    }
+    {
+      const reasons: string[] = []
+      let l1: 'ok' | 'watch' | 'critical' = 'ok'
+      let l2: 'ok' | 'watch' | 'critical' = 'ok'
+      if (ramAvgPct >= 90) { l1 = 'critical'; reasons.push(`avg RAM ${ramAvgPct}% ≥ 90%`) }
+      else if (ramAvgPct >= 75) { l1 = 'watch'; reasons.push(`avg RAM ${ramAvgPct}% ≥ 75%`) }
+      if (ramPeakPct >= 97) { l2 = 'critical'; reasons.push(`peak RAM ${ramPeakPct}% ≥ 97%`) }
+      else if (ramPeakPct >= 92) { l2 = 'watch'; reasons.push(`peak RAM ${ramPeakPct}% ≥ 92%`) }
+      push('ram', worstOf(l1, l2), reasons)
+    }
+    if (diskAvgPct !== null) {
+      const reasons: string[] = []
+      let lvl: 'ok' | 'watch' | 'critical' = 'ok'
+      if (diskAvgPct >= 90) { lvl = 'critical'; reasons.push(`disk ${diskAvgPct}% full ≥ 90%`) }
+      else if (diskAvgPct >= 80) { lvl = 'watch'; reasons.push(`disk ${diskAvgPct}% full ≥ 80%`) }
+      else reasons.push(`disk ${diskAvgPct}% full`)
+      push('diskSpace', lvl, reasons)
+    }
+    {
+      const reasons: string[] = []
+      let lvl: 'ok' | 'watch' | 'critical' = 'ok'
+      if (iowaitAvg >= 30) { lvl = 'critical'; reasons.push(`I/O wait ${iowaitAvg}% ≥ 30%`) }
+      else if (iowaitAvg >= 15) { lvl = 'watch'; reasons.push(`I/O wait ${iowaitAvg}% ≥ 15%`) }
+      else reasons.push(`I/O wait ${iowaitAvg}%`)
+      push('diskIo', lvl, reasons)
+    }
+    {
+      const reasons: string[] = []
+      let lvl: 'ok' | 'watch' | 'critical' = 'ok'
+      const capPct = capKbps > 0 ? (netTotalAvgKbps / capKbps) * 100 : 0
+      if (capPct >= 85) { lvl = 'critical'; reasons.push(`avg traffic ${netTotalAvgKbps} KB/s ≈ ${round1(capPct)}% of the ${linkMbps} Mbps link`) }
+      else if (capPct >= 60) { lvl = 'watch'; reasons.push(`avg traffic ${netTotalAvgKbps} KB/s ≈ ${round1(capPct)}% of the ${linkMbps} Mbps link`) }
+      else reasons.push(`avg traffic ${netTotalAvgKbps} KB/s of ${Math.round(capKbps)} KB/s cap`)
+      push('network', lvl, reasons)
+    }
+
+    // ── component share + optional per-component series ─────────────────────
+    const totalRequests = sum(compGroups.map((g) => g._sum.requests ?? 0))
+    const components = compGroups
+      .map((g) => {
+        const requests = g._sum.requests ?? 0
+        const errors = g._sum.errors ?? 0
+        return {
+          component: g.component,
+          requests,
+          errors,
+          errorRatePct: requests > 0 ? round1((errors / requests) * 100) : 0,
+          bytesIn: g._sum.bytesIn ?? 0,
+          bytesOut: g._sum.bytesOut ?? 0,
+          sharePct: totalRequests > 0 ? round1((requests / totalRequests) * 100) : 0,
+        }
+      })
+      .sort((a, b) => b.requests - a.requests)
+
+    const compRows = await db.serverComponentSample.findMany({
+      where: { createdAt: { gte: start, lte: end }, ...(componentFilter ? { component: componentFilter } : {}) },
+      select: { createdAt: true, requests: true, errors: true, bytesIn: true, bytesOut: true },
+      orderBy: { createdAt: 'asc' },
+    })
+    const compBucket = Math.max(1, Math.ceil(compRows.length / TIMELINE_TARGET))
+    const componentTimeseries: Array<{ t: string; requests: number; errors: number; bytesIn: number; bytesOut: number }> = []
+    for (let i = 0; i < compRows.length; i += compBucket) {
+      const slice = compRows.slice(i, i + compBucket)
+      componentTimeseries.push({
+        t: slice[0].createdAt.toISOString(),
+        requests: sum(slice.map((r) => r.requests)),
+        errors: sum(slice.map((r) => r.errors)),
+        bytesIn: sum(slice.map((r) => r.bytesIn)),
+        bytesOut: sum(slice.map((r) => r.bytesOut)),
+      })
+    }
+
+    const snapshot = latest
+      ? {
+          at: latest.createdAt.toISOString(),
+          cpuUsagePct: latest.cpuUsagePct,
+          cpuIowaitPct: latest.cpuIowaitPct,
+          loadAvg1: latest.loadAvg1,
+          ramUsedMb: latest.ramUsedMb,
+          ramTotalMb: latest.ramTotalMb,
+          ramUsagePct: latest.ramTotalMb > 0 ? round1((latest.ramUsedMb / latest.ramTotalMb) * 100) : 0,
+          diskUsedGb: latest.diskUsedGb,
+          diskTotalGb: latest.diskTotalGb,
+          diskUsagePct: latest.diskTotalGb > 0 ? round1((latest.diskUsedGb / latest.diskTotalGb) * 100) : 0,
+          diskReadKbps: latest.diskReadKbps,
+          diskWriteKbps: latest.diskWriteKbps,
+          netUpKbps: latest.netUpKbps,
+          netDownKbps: latest.netDownKbps,
+        }
+      : null
+
+    return c.json({
+      success: true,
+      data: {
+        resolved: resolvedWindowPayload(pq.range),
+        snapshot,
+        window: {
+          sampleCount: n,
+          availabilityPct: round1(availabilityPct),
+          outageCount: outages.length,
+          outageTotalSec,
+          outageLongestSec: outages.length > 0 ? Math.max(...outages.map((o) => o.durationSec)) : 0,
+          linkMbpsCap: linkMbps,
+        },
+        resources: {
+          cpu: { avg: cpuAvg, peak: cpuPeak, p95: round1(percentile95([...cpuArr].sort((a, b) => a - b))) },
+          ram: {
+            avgPct: ramAvgPct,
+            peakPct: ramPeakPct,
+            avgUsedMb: round1(avg(samples.map((s) => s.ramUsedMb))),
+            totalMb: latest?.ramTotalMb ?? 0,
+          },
+          diskSpace: {
+            avgPct: diskAvgPct,
+            peakPct: diskPeakPct,
+            usedGb: latest?.diskUsedGb ?? 0,
+            totalGb: latest?.diskTotalGb ?? 0,
+          },
+          diskRead: { avgKbps: round1(avg(readArr)), peakKbps: round1(peakOf(readArr)), totalGb: kbpsSeriesToGb(readArr) },
+          diskWrite: { avgKbps: round1(avg(writeArr)), peakKbps: round1(peakOf(writeArr)), totalGb: kbpsSeriesToGb(writeArr) },
+          netUp: { avgKbps: round1(avg(netUpArr)), peakKbps: round1(peakOf(netUpArr)), totalGb: kbpsSeriesToGb(netUpArr) },
+          netDown: { avgKbps: round1(avg(netDownArr)), peakKbps: round1(peakOf(netDownArr)), totalGb: kbpsSeriesToGb(netDownArr) },
+          load: { avg: loadAvg, peak: loadPeak, cores },
+        },
+        timeline,
+        hourly,
+        weekday,
+        weekdayHour,
+        busiest: {
+          hour: busiestHour,
+          weekday: busiestWeekday,
+          weekdayHour: busiestCell,
+        },
+        outages,
+        bottlenecks,
+        components,
+        componentTimeseries,
+        meta: { recordedSince: recordedSinceAgg._min.createdAt ? recordedSinceAgg._min.createdAt.toISOString() : null },
+      },
     })
   } catch (error) {
     const err = authErrorResponse(error)

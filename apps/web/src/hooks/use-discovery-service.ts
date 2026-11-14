@@ -6,7 +6,6 @@ import {
   type ScanState,
   type RealDiscoveredDevice,
   type ProtocolStatus,
-  type Diagnostics,
   DEFAULT_SCAN_STATE,
   deviceApi,
 } from '@/components/agency/devices/types';
@@ -17,7 +16,6 @@ import {
 // targets the local API on :3080 where the real discovery routes live.
 const POLL_INTERVAL = 3000;
 const SLOW_POLL_INTERVAL = 30000;
-const AUTO_SCAN_INTERVAL = 30000;
 // Stop the 3s scan polling after this many consecutive failures — otherwise a
 // dead/misconfigured API gets polled FOREVER while the UI shows a fake scan.
 // (Regression guard: this stop existed in 95b4d90 and was wiped by the a2ce27b revert.)
@@ -28,7 +26,6 @@ interface DiscoveryServiceReturn {
   discoveredDevices: RealDiscoveredDevice[];
   serviceAvailable: boolean;
   protocols: ProtocolStatus[];
-  diagnostics: Diagnostics | null;
   startScan: () => Promise<void>;
   stopScan: () => Promise<void>;
 }
@@ -36,13 +33,10 @@ interface DiscoveryServiceReturn {
 export function useDiscoveryService(agencyId: string | undefined): DiscoveryServiceReturn {
   const [scanState, setScanState] = useState<ScanState>(DEFAULT_SCAN_STATE);
   const [discoveredDevices, setDiscoveredDevices] = useState<RealDiscoveredDevice[]>([]);
-  const [autoScanEnabled, setAutoScanEnabled] = useState(false);
   const [serviceAvailable, setServiceAvailable] = useState(false);
   const [protocols, setProtocols] = useState<ProtocolStatus[]>([]);
-  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
 
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
-  const autoScanTimerRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const mountedRef = useRef(true);
   const scanPollFailuresRef = useRef(0);
 
@@ -194,20 +188,6 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
     }
   }, []);
 
-  // Poll diagnostics (less frequent — every 30s) — proxy through API
-  const pollDiagnostics = useCallback(async () => {
-    try {
-      const res = await apiFetch(deviceApi('/discovery/diagnostics'));
-      if (!res.ok) return;
-      const data = await res.json();
-      if (mountedRef.current) {
-        setDiagnostics(data);
-      }
-    } catch {
-      // Silent
-    }
-  }, []);
-
   // Start scan — proxy through API
   const startScan = useCallback(async () => {
     try {
@@ -267,26 +247,8 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
     }
   }, []);
 
-  // Auto-scan effect
-  useEffect(() => {
-    if (autoScanEnabled && serviceAvailable) {
-      startScan();
-      autoScanTimerRef.current = setInterval(() => {
-        startScan();
-      }, AUTO_SCAN_INTERVAL);
-    } else {
-      if (autoScanTimerRef.current) {
-        clearInterval(autoScanTimerRef.current);
-        autoScanTimerRef.current = undefined;
-      }
-    }
-    return () => {
-      if (autoScanTimerRef.current) {
-        clearInterval(autoScanTimerRef.current);
-        autoScanTimerRef.current = undefined;
-      }
-    };
-  }, [autoScanEnabled, serviceAvailable, startScan]);
+  // Auto-scan was removed (0.6.74) — it never persisted and re-scanned behind
+  // the user's back. Scans are always explicit now.
 
   // Initial health check + periodic
   useEffect(() => {
@@ -295,18 +257,13 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
     return () => clearInterval(id);
   }, [checkHealth]);
 
-  // Periodic protocols + diagnostics polling (slower)
+  // Periodic protocols polling (slower)
   useEffect(() => {
     if (!serviceAvailable) return;
-    // Initial poll
     pollProtocols();
-    pollDiagnostics();
-    const id = setInterval(() => {
-      pollProtocols();
-      pollDiagnostics();
-    }, SLOW_POLL_INTERVAL);
+    const id = setInterval(pollProtocols, SLOW_POLL_INTERVAL);
     return () => clearInterval(id);
-  }, [serviceAvailable, pollProtocols, pollDiagnostics]);
+  }, [serviceAvailable, pollProtocols]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -314,7 +271,6 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
     return () => {
       mountedRef.current = false;
       if (pollTimerRef.current) clearInterval(pollTimerRef.current);
-      if (autoScanTimerRef.current) clearInterval(autoScanTimerRef.current);
     };
   }, []);
 
@@ -323,13 +279,7 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
     discoveredDevices,
     serviceAvailable,
     protocols,
-    diagnostics,
     startScan,
     stopScan,
   };
-}
-
-export function useDiscoveryAutoScan() {
-  const [enabled, setEnabled] = useState(false);
-  return { autoScanEnabled: enabled, setAutoScanEnabled: setEnabled };
 }

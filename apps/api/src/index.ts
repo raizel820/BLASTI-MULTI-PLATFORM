@@ -25,6 +25,7 @@ import { timingSafeEqual, randomUUID } from 'crypto'
 import { verifySessionToken, SessionToken } from './lib/auth'
 // Task 55-b — data-consumption recorder (contract agent-ctx/55-data-consumption-contract.md §2.2)
 import { recordDataUsage, classifyTrafficType, normalizeNetworkType, resolveAgencyIdFallback } from './lib/data-usage'
+import { startServerMetricsCollector, recordComponentRequest } from './lib/server-metrics'
 import { decodeJwt } from 'jose'
 import {
   getClientIp,
@@ -283,6 +284,34 @@ app.use('/api/*', idempotencyGuard)
 // authorize anything. Errors thrown by route handlers are recorded as 500s
 // and re-thrown so app.onError still answers them; the recorder itself is
 // fully try/catch-wrapped — a recorder bug must NEVER affect a response.
+// ─── Component-Activity Counter Middleware (Server analyzer) ────────────
+//
+// Counts EVERY /api/* request against its logical engine/manager (sync
+// engine, storage manager, logs manager, public app settings, sales,
+// billing, … — lib/server-metrics.ts classifyComponent). Pure in-memory
+// increments; the 60s collector tick flushes them into ServerComponentSample.
+// Mounted BEFORE the data-usage recorder so admin-console traffic is counted
+// HERE (the data-usage skip list below deliberately excludes /api/admin to
+// keep the customer-consumption dashboard honest — that concern does not
+// apply to server-load attribution). Health probes and WebSocket upgrades
+// are excluded: they are liveness noise, not engine activity.
+app.use('/api/*', async (c, next) => {
+  const isWsUpgrade = (c.req.header('upgrade') ?? '').toLowerCase() === 'websocket'
+  if (c.req.path === '/api/health' || isWsUpgrade) {
+    await next()
+    return
+  }
+  const componentBytesIn = Number(c.req.header('content-length') ?? 0)
+  await next()
+  try {
+    const res = c.res
+    const contentLength = res?.headers?.get('content-length')
+    recordComponentRequest(c.req.path, res?.status ?? 0, componentBytesIn, contentLength !== null ? Number(contentLength) || 0 : 0)
+  } catch {
+    // counter bug — never the response
+  }
+})
+
 app.use('/api/*', async (c, next) => {
   const requestPath = c.req.path
   const isWebSocketUpgrade = (c.req.header('upgrade') ?? '').toLowerCase() === 'websocket'
@@ -1627,6 +1656,9 @@ httpServer.listen(PORT, HOST, async () => {
   // 0.6.61 — AI Translation Agent: dictionary-first batched translation
   // windows (default every 5 minutes). Never blocks boot; failures only log.
   startTranslationAgentScheduler()
+  // Server analyzer collector: 60s VPS resource samples + per-component
+  // counters + boot outage records (SUPER ADMIN analytics → Server section).
+  startServerMetricsCollector()
   console.log(`🚀 @blasti/api server running on port ${PORT} (bootId: ${BOOT_ID.substring(0, 8)}…)`)
   console.log(`   API:    http://localhost:${PORT}/ (bound to ${HOST})`)
   console.log(`   Health: http://localhost:${PORT}/health`)

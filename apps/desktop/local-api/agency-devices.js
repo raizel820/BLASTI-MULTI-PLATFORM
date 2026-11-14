@@ -44,6 +44,7 @@ function generatePairingCode() {
   return crypto.randomBytes(2).toString('hex').toUpperCase()
 }
 
+
 const DEVICE_SELECT_FIELDS = {
   id: true,
   agencyId: true,
@@ -77,7 +78,7 @@ const BRANCH_SELECT = { id: true, name: true, nameAr: true, nameFr: true }
 
 const DEVICE_TYPES = ['TV', 'KIOSK', 'DISPLAY', 'PRINTER', 'APP']
 const CONNECTION_TYPES = ['LAN', 'WIFI', 'CABLE', 'MANUAL']
-const SCREEN_LAYOUTS = ['QUEUE_BOARD', 'TICKET_PRINTER', 'SERVICE_SELECTOR', 'CUSTOM']
+const SCREEN_LAYOUTS = ['QUEUE_BOARD', 'TICKET_PRINTER', 'SERVICE_SELECTOR', 'CUSTOM', 'TV_CLASSIC', 'TV_COUNTERS', 'TV_FOCUS', 'TV_MINIMAL']
 const DEVICE_STATUSES = ['ONLINE', 'OFFLINE', 'PAIRING', 'DISABLED', 'UPDATING']
 
 // Hand-rolled validators (zod is not available in the local API). They accept
@@ -676,7 +677,15 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       }
 
       const origin = new URL(c.req.url).origin
-      const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+      // 0.6.74: the manager may send its OWN origin-built URL (mediaUrl) —
+      // the browser origin is what the LAN TV can actually reach.
+      let tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+      if (typeof body.mediaUrl === 'string') {
+        try {
+          const parsed = new URL(body.mediaUrl)
+          if (parsed.protocol === 'http:' || parsed.protocol === 'https:') tvBoardUrl = parsed.toString()
+        } catch { /* invalid → keep the origin-built URL */ }
+      }
 
       // Explicit protocol from the cast dialog → use the cast service.
       if (protocol && protocol !== 'url') {
@@ -869,11 +878,6 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     }
   })
 
-  // ═══ Back-compat token endpoint (cloud parity) ═══════════════════════════
-
-  app.get('/api/agency-devices/discovery-token', authMiddleware, (c) => {
-    return c.json({ token: null, mode: 'embedded' })
-  })
 
   // ═══ Management ══════════════════════════════════════════════════════════
 
@@ -906,14 +910,6 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
     }
   })
 
-  // POST /scan-network and /scan — kick off the embedded scan (cloud parity)
-  app.post('/api/agency-devices/scan-network', authMiddleware, (c) => {
-    return c.json(scanStartResponse())
-  })
-
-  app.post('/api/agency-devices/scan', authMiddleware, (c) => {
-    return c.json(scanStartResponse())
-  })
 
   // GET / — List devices for the agency
   app.get('/api/agency-devices', authMiddleware, async (c) => {

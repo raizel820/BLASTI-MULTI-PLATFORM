@@ -55,6 +55,8 @@ export function localizedPeriodLabel(period: string, t: Translate): string {
       return t(ak('analyticsSection.period7d'));
     case '30d':
       return t(ak('analyticsSection.period30d'));
+    case '90d':
+      return t(ak('analyticsSection.period90d'));
     case 'this-week':
       return t(ak('adminAnalytics.period.thisWeek'));
     case 'this-month':

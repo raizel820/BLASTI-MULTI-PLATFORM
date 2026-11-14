@@ -18,6 +18,7 @@ export type AdminSectionPeriod =
   | 'today'
   | '7d'
   | '30d'
+  | '90d'
   | 'this-month'
   | 'this-year'
   | 'custom';
@@ -26,6 +27,7 @@ export const ADMIN_SECTION_PERIODS: AdminSectionPeriod[] = [
   'today',
   '7d',
   '30d',
+  '90d',
   'this-month',
   'this-year',
   'custom',
@@ -46,8 +48,9 @@ export type AdminSectionId =
   | 'sms'
   | 'notifications'
   | 'devices'
-  | 'security-audit'
-  | 'data-consumption';
+  | 'data-consumption'
+  | 'server'
+  | 'security-audit';
 
 /** §0.1 `resolved` window (present on every new section payload). */
 export interface AdminResolvedWindow {
@@ -448,6 +451,128 @@ export const EMPTY_DATA_CONSUMPTION_FILTERS: AdminDataConsumptionFilters = {
   trafficType: '',
 };
 
+// ─── Task 6-b: server (VPS resource analyzer — /api/admin/analytics/server) ─
+// Query: `period` (today|yesterday|7d|30d|90d|this-week|this-month|this-quarter|
+// this-year|custom+from+to) and `component` = '' (ALL) | one of the 12 fixed
+// engine/manager keys (sync-engine, storage-manager, logs-manager,
+// public-app-settings, sales-manager, billing-manager, messaging, reservations,
+// agencies, auth, admin-console, other).
+export interface AdminServerData {
+  resolved: AdminResolvedWindow;
+  /** Latest collector sample — null until the first minute ticks. */
+  snapshot: {
+    at: string;
+    cpuUsagePct: number;
+    cpuIowaitPct: number;
+    loadAvg1: number;
+    ramUsedMb: number;
+    ramTotalMb: number;
+    ramUsagePct: number;
+    diskUsedGb: number;
+    diskTotalGb: number;
+    diskUsagePct: number;
+    diskReadKbps: number;
+    diskWriteKbps: number;
+    netUpKbps: number;
+    netDownKbps: number;
+  } | null;
+  window: {
+    sampleCount: number;
+    availabilityPct: number;
+    outageCount: number;
+    outageTotalSec: number;
+    outageLongestSec: number;
+    linkMbpsCap: number;
+  };
+  resources: {
+    cpu: { avg: number; peak: number; p95: number };
+    ram: { avgPct: number; peakPct: number; avgUsedMb: number; totalMb: number };
+    diskSpace: { avgPct: number | null; peakPct: number | null; usedGb: number; totalGb: number };
+    diskRead: { avgKbps: number; peakKbps: number; totalGb: number };
+    diskWrite: { avgKbps: number; peakKbps: number; totalGb: number };
+    netUp: { avgKbps: number; peakKbps: number; totalGb: number };
+    netDown: { avgKbps: number; peakKbps: number; totalGb: number };
+    load: { avg: number; peak: number; cores: number };
+  };
+  /** ≤120 UTC ZERO-FILLED buckets — 'YYYY-MM-DDTHH' (hourly) | 'YYYY-MM-DD' (daily). */
+  timeline: Array<{
+    t: string;
+    cpu: number;
+    ram: number;
+    diskSpace: number;
+    diskRead: number;
+    diskWrite: number;
+    netUp: number;
+    netDown: number;
+    load: number;
+  }>;
+  /** Per hour-of-day averages + peaks — null when the hour has no samples. */
+  hourly: Array<{
+    hour: number;
+    cpuAvg: number | null;
+    cpuPeak: number | null;
+    ramAvg: number | null;
+    ramPeak: number | null;
+    netAvg: number | null;
+    netPeak: number | null;
+    ioAvg: number | null;
+    ioPeak: number | null;
+    samples: number;
+  }>;
+  /** Per weekday averages + peaks — weekday 0-6, Sunday = 0. */
+  weekday: Array<{
+    weekday: number;
+    cpuAvg: number | null;
+    cpuPeak: number | null;
+    ramAvg: number | null;
+    ramPeak: number | null;
+    netAvg: number | null;
+    netPeak: number | null;
+    samples: number;
+  }>;
+  /** [7][24] weekday×hour average matrices — null cell = no samples. */
+  weekdayHour: {
+    cpu: Array<Array<number | null>>;
+    ram: Array<Array<number | null>>;
+    net: Array<Array<number | null>>;
+  };
+  busiest: {
+    hour: number | null;
+    weekday: number | null;
+    weekdayHour: { weekday: number; hour: number } | null;
+  };
+  outages: Array<{
+    startedAt: string;
+    endedAt: string | null;
+    durationSec: number;
+    reason: 'api-restart' | 'unreachable';
+  }>;
+  bottlenecks: Array<{
+    resource: 'cpu' | 'ram' | 'diskSpace' | 'diskIo' | 'network';
+    level: 'ok' | 'watch' | 'critical';
+    reason: string;
+  }>;
+  /** One row per engine/manager WITH activity — sorted requests desc. */
+  components: Array<{
+    component: string;
+    requests: number;
+    errors: number;
+    errorRatePct: number;
+    bytesIn: number;
+    bytesOut: number;
+    sharePct: number;
+  }>;
+  /** For the selected component — ALL-aggregated when component=''. */
+  componentTimeseries: Array<{
+    t: string;
+    requests: number;
+    errors: number;
+    bytesIn: number;
+    bytesOut: number;
+  }>;
+  meta: { recordedSince: string | null };
+}
+
 /** Union of every section payload the parameterized hook can return. */
 export type AdminSectionPayload =
   | AdminUsersData
@@ -463,7 +588,8 @@ export type AdminSectionPayload =
   | AdminNotificationsData
   | AdminDevicesData
   | AdminSecurityAuditData
-  | AdminDataConsumptionData;
+  | AdminDataConsumptionData
+  | AdminServerData;
 
 /** §3.2 org filters — admin/analytics/reservations only. */
 export interface AdminReservationFilters {

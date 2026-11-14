@@ -230,6 +230,71 @@ async function queueStatusResponse(db, agencyId, deviceId) {
     where: { agencyId, status: 'COMPLETED', completedAt: { gte: startOfToday } },
   })
 
+  // ── Active CLAIMED counters with their current ticket (0.6.74 TV screens,
+    // cloud parity with apps/api/src/routes/agency-devices.ts queue-status).
+    // Only counters that are active, on a live branch, touched within 45min
+    // AND claimed (controlled by a user / mirrored-occupied) are returned.
+  let counters = []
+  try {
+    const claimedCounters = await db.counter.findMany({
+      where: {
+        isActive: true,
+        branch: { agencyId, isActive: true },
+        updatedAt: { gte: fortyFiveMinsAgo },
+        OR: [{ controlledByUserId: { not: null } }, { staffId: { not: null } }],
+      },
+      select: {
+        id: true, number: true, name: true, nameAr: true, nameFr: true, controlClaimedAt: true,
+        currentReservation: {
+          select: {
+            id: true, displayNumber: true, status: true, calledAt: true,
+            service: { select: { name: true, nameAr: true, nameFr: true, prefix: true } },
+          },
+        },
+      },
+      orderBy: { number: 'asc' },
+    })
+    counters = claimedCounters.map((ctr) => ({
+      id: ctr.id,
+      number: ctr.number,
+      name: ctr.name,
+      nameAr: ctr.nameAr,
+      nameFr: ctr.nameFr,
+      claimedAt: ctr.controlClaimedAt,
+      ticket: ctr.currentReservation && (ctr.currentReservation.status === 'CALLED' || ctr.currentReservation.status === 'SERVING')
+        ? {
+            id: ctr.currentReservation.id,
+            ticketNumber: ctr.currentReservation.displayNumber,
+            status: ctr.currentReservation.status,
+            calledAt: ctr.currentReservation.calledAt,
+            serviceName: ctr.currentReservation.service.name,
+            serviceNameAr: ctr.currentReservation.service.nameAr,
+            serviceNameFr: ctr.currentReservation.service.nameFr,
+            servicePrefix: ctr.currentReservation.service.prefix,
+          }
+        : null,
+    }))
+  } catch { /* very old local mirrors may lack control columns */ }
+
+  // Average SERVING time today (cloud parity — completedAt − calledAt,
+  // outliers >4h excluded, null when nothing completed yet today).
+  let avgServiceTimeSec = null
+  try {
+    const todayServedTimes = await db.reservation.findMany({
+      where: { agencyId, status: 'COMPLETED', calledAt: { not: null }, completedAt: { gte: startOfToday } },
+      select: { calledAt: true, completedAt: true },
+      take: 500,
+      orderBy: { completedAt: 'desc' },
+    })
+    const todayDurations = todayServedTimes
+      .filter((r) => r.completedAt && r.calledAt)
+      .map((r) => new Date(r.completedAt).getTime() - new Date(r.calledAt).getTime())
+      .filter((ms) => ms > 0 && ms < 4 * 3_600_000)
+    if (todayDurations.length) {
+      avgServiceTimeSec = Math.round(todayDurations.reduce((a, b) => a + b, 0) / todayDurations.length / 1000)
+    }
+  } catch { /* best-effort */ }
+
   const nowForAnnouncements = new Date()
   let announcements = []
   try {
@@ -264,6 +329,8 @@ async function queueStatusResponse(db, agencyId, deviceId) {
       serviceStats,
       totalWaiting,
       totalServedToday,
+      avgServiceTimeSec,
+      counters,
       totalEstimatedWait: estimateWaitMinutes(totalWaiting, agency.averageServiceTime, totalActiveCounters),
       activeCounters: totalActiveCounters,
       recentCalls: recentCalls.map((r) => ({
@@ -725,6 +792,36 @@ function registerDeviceBoardRoutes(app, ctx) {
     }
   })
 
+  // ─── Pairing brute-force guard (0.6.74 — cloud parity) ────────────────────
+  // Locks a pairing code for 10 minutes after 6 consecutive failed kiosk-auth
+  // attempts, on top of any per-IP limiting. In-memory (resets on restart).
+  const pairingFailures = new Map()
+  const PAIRING_MAX_FAILURES = 6
+  const PAIRING_LOCKOUT_MS = 10 * 60 * 1000
+
+  function isPairingCodeLocked(pairingCode) {
+    const entry = pairingFailures.get(pairingCode)
+    if (!entry) return false
+    if (entry.lockedUntil > Date.now()) return true
+    if (entry.lockedUntil !== 0 && entry.lockedUntil <= Date.now()) {
+      pairingFailures.delete(pairingCode)
+    }
+    return false
+  }
+
+  function recordPairingFailure(pairingCode) {
+    const entry = pairingFailures.get(pairingCode) || { count: 0, lockedUntil: 0 }
+    entry.count += 1
+    if (entry.count >= PAIRING_MAX_FAILURES) {
+      entry.lockedUntil = Date.now() + PAIRING_LOCKOUT_MS
+    }
+    pairingFailures.set(pairingCode, entry)
+  }
+
+  function clearPairingFailures(pairingCode) {
+    pairingFailures.delete(pairingCode)
+  }
+
   // ─── POST /public/kiosk-auth — login with pairing code + device token ─────
   app.post('/api/agency-devices/public/kiosk-auth', async (c) => {
     const db = getDb()
@@ -735,6 +832,12 @@ function registerDeviceBoardRoutes(app, ctx) {
       const deviceToken = typeof body.deviceToken === 'string' ? body.deviceToken : ''
       if (!pairingCode || !deviceToken) {
         return c.json({ success: false, error: 'Pairing code and device token are required' }, 400)
+      }
+
+      // Brute-force guard (0.6.74): a code with too many recent failures is
+      // rejected even for the correct token until the lockout expires.
+      if (isPairingCodeLocked(pairingCode)) {
+        return c.json({ success: false, error: 'Too many failed attempts for this pairing code. Try again later.' }, 429)
       }
 
       const foundDevice = await db.agencyDevice.findUnique({
@@ -754,10 +857,15 @@ function registerDeviceBoardRoutes(app, ctx) {
         },
       })
 
-      if (!foundDevice) return c.json({ success: false, error: 'Device not found. Check pairing code.' }, 404)
+      if (!foundDevice) {
+        recordPairingFailure(pairingCode)
+        return c.json({ success: false, error: 'Device not found. Check pairing code.' }, 404)
+      }
       if (foundDevice.deviceToken !== deviceToken) {
+        recordPairingFailure(pairingCode)
         return c.json({ success: false, error: 'Invalid device token. Contact your agency admin.' }, 401)
       }
+      clearPairingFailures(pairingCode)
       if (!foundDevice.agency || !foundDevice.agency.isActive) {
         return c.json({ success: false, error: 'Agency is not active' }, 403)
       }

@@ -29,7 +29,7 @@
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-export type CastProtocol = 'dlna' | 'samsung-tizen' | 'lg-webos' | 'roku-ecp' | 'url';
+export type CastProtocol = 'dlna' | 'samsung-tizen' | 'lg-webos' | 'roku-ecp' | 'google-cast' | 'airplay' | 'url';
 
 export interface CastTarget {
   ip: string;
@@ -77,6 +77,14 @@ export function detectCastProtocols(target: CastTarget): CastProtocolInfo[] {
   // the presence of an SSDP location (discovered via UPnP M-SEARCH in the
   // scanner). If we have an SSDP location we can attempt the SOAP cast.
   const hasDlna = !!target.ssdpLocation || svc.includes('mediarenderer') || svc.includes('dlna');
+  // Google Cast (Chromecast / Android TV / most modern smart TVs) is detected
+  // via the _googlecast._tcp mDNS service. The actual cast session is driven
+  // from the browser (Presentation API / cast sender) — reported here so the
+  // UI can surface the right guidance.
+  const hasGoogleCast = svc.includes('googlecast') || svc.includes('google_cast') || svc.includes('_androidtv') || man.includes('google');
+  // Apple TV / AirPlay devices cannot load arbitrary URLs natively — reported
+  // for guidance (HDMI or AirPlay screen mirroring from macOS/iOS).
+  const hasAirplay = svc.includes('airplay') || svc.includes('airtunes') || man.includes('apple');
 
   const list: CastProtocolInfo[] = [];
 
@@ -109,6 +117,20 @@ export function detectCastProtocols(target: CastTarget): CastProtocolInfo[] {
     label: 'Roku ECP',
     available: isRoku,
     description: 'Roku External Control Protocol — launches the Roku web browser with the URL.',
+  });
+
+  list.push({
+    protocol: 'google-cast',
+    label: 'Google Cast',
+    available: hasGoogleCast,
+    description: 'Chromecast / Android TV detected — cast from Chrome (Presentation API) or the cast menu.',
+  });
+
+  list.push({
+    protocol: 'airplay',
+    label: 'AirPlay',
+    available: hasAirplay,
+    description: 'Apple TV detected — use AirPlay screen mirroring or HDMI (URL casting is not supported by Apple).',
   });
 
   list.push({
@@ -350,9 +372,12 @@ export async function castViaSamsungTizen(target: CastTarget, mediaUrl: string):
     }, 6000);
 
     ws.onopen = () => {
+      // Real Tizen web-app launch payload: {method, params:{url}, id}.
+      // The historic shape (id: mediaUrl) was ignored by newer Tizen firmwares.
       const payload = JSON.stringify({
         method: 'ms.webapp.launch',
-        id: mediaUrl,
+        params: { url: mediaUrl },
+        id: 'blasti-cast-1',
         token: '',
       });
       ws.send(payload);
@@ -531,11 +556,15 @@ export async function castToTv(
   preferred?: CastProtocol,
 ): Promise<CastResult> {
   const protocols = detectCastProtocols(target);
-  // Order: preferred → brand-native → DLNA → URL fallback
+  // Order: preferred → brand-native → DLNA → URL fallback.
+  // 'google-cast' and 'airplay' are INFORMATIONAL entries (the actual session
+  // is driven by the browser/OS) — they must never enter the executable order,
+  // otherwise they'd short-circuit the real protocols via the default branch.
+  const executable: CastProtocol[] = ['dlna', 'samsung-tizen', 'lg-webos', 'roku-ecp'];
   const order: CastProtocol[] = [];
   if (preferred) order.push(preferred);
   for (const p of protocols) {
-    if (p.available && !order.includes(p.protocol) && p.protocol !== 'url') {
+    if (p.available && !order.includes(p.protocol) && executable.includes(p.protocol)) {
       order.push(p.protocol);
     }
   }

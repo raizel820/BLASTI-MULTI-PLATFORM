@@ -2310,3 +2310,76 @@ model DataUsageEvent {
   @@index([trafficType])
   @@index([networkType])
 }
+
+// ─── Server metrics (SUPER ADMIN analyzer — Server section) ──────────────────
+// One 60-second sample of VPS-wide resource usage, written by the in-process
+// collector (apps/api/src/lib/server-metrics.ts). Flat floats (no arrays —
+// schema rule) so rows are compact and index-scans stay cheap: 90d ≈ 130k rows.
+// Loose attribution on purpose — NO foreign keys; pruning old rows must never
+// cascade.
+//   • cpuUsagePct   = whole-machine CPU busy % (1−(idle+iowait))/total from
+//     /proc/stat deltas (0-100)
+//   • cpuIowaitPct  = I/O wait share of the same delta — the honest "disk
+//     saturated the bus" signal for bottleneck detection (0-100)
+//   • ramUsedMb/ramTotalMb — from /proc/meminfo MemTotal−MemAvailable (honest
+//     "used", includes reclaimable caches exclusion)
+//   • diskUsedGb/diskTotalGb — statfs on the data directory (or df -kP fallback)
+//   • diskReadKbps/diskWriteKbps — /proc/diskstats sectors-read/written delta
+//     across physical disks, KB/s
+//   • netUpKbps/netDownKbps — /proc/net/dev tx/rx byte delta across external
+//     interfaces (loopback excluded), KB/s — "internet speed/usage"
+//   • loadAvg1 — 1-minute load average (bottleneck context vs cpu cores)
+model ServerMetricSample {
+  id            String   @id @default(cuid())
+  cpuUsagePct   Float    @default(0)
+  cpuIowaitPct  Float    @default(0)
+  loadAvg1      Float    @default(0)
+  ramUsedMb     Float    @default(0)
+  ramTotalMb    Float    @default(0)
+  diskUsedGb    Float    @default(0)
+  diskTotalGb   Float    @default(0)
+  diskReadKbps  Float    @default(0)
+  diskWriteKbps Float    @default(0)
+  netUpKbps     Float    @default(0)
+  netDownKbps   Float    @default(0)
+  createdAt     DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+// Per-minute activity counters for one logical engine/manager component.
+// The classifier maps HTTP route prefixes → component keys; WebSocket frames
+// are NOT counted (Socket.IO is mounted outside the HTTP pipeline).
+//   component = sync-engine | storage-manager | logs-manager |
+//               public-app-settings | sales-manager | billing-manager |
+//               messaging | reservations | agencies | auth | admin-console |
+//               other
+model ServerComponentSample {
+  id        String   @id @default(cuid())
+  component String
+  requests  Int      @default(0)
+  errors    Int      @default(0)
+  bytesIn   Int      @default(0)
+  bytesOut  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([component, createdAt])
+}
+
+// Connection-loss records. The collector writes an 'api-restart' row on every
+// boot when the previous sample is older than the tick (the API process died
+// or the machine lost power/connectivity); the analyzer additionally derives
+// outages from sample gaps so periods BEFORE this model existed still report.
+//   reason = api-restart | unreachable
+model ServerOutage {
+  id          String    @id @default(cuid())
+  startedAt   DateTime
+  endedAt     DateTime?
+  durationSec Int       @default(0)
+  reason      String    @default("api-restart")
+  details     String    @default("")
+  createdAt   DateTime  @default(now())
+
+  @@index([startedAt])
+}

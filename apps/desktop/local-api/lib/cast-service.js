@@ -61,6 +61,10 @@ function detectCastProtocols(target) {
   // the presence of an SSDP location (discovered via UPnP M-SEARCH in the
   // scanner). If we have an SSDP location we can attempt the SOAP cast.
   const hasDlna = !!target.ssdpLocation || svc.includes('mediarenderer') || svc.includes('dlna');
+  // Google Cast (Chromecast / Android TV) + AirPlay — informational entries
+  // (the actual session is driven by the browser / OS).
+  const hasGoogleCast = svc.includes('googlecast') || svc.includes('google_cast') || svc.includes('_androidtv') || man.includes('google');
+  const hasAirplay = svc.includes('airplay') || svc.includes('airtunes') || man.includes('apple');
 
   const list = [];
 
@@ -93,6 +97,20 @@ function detectCastProtocols(target) {
     label: 'Roku ECP',
     available: isRoku,
     description: 'Roku External Control Protocol — launches the Roku web browser with the URL.',
+  });
+
+  list.push({
+    protocol: 'google-cast',
+    label: 'Google Cast',
+    available: hasGoogleCast,
+    description: 'Chromecast / Android TV detected — cast from Chrome (Presentation API) or the cast menu.',
+  });
+
+  list.push({
+    protocol: 'airplay',
+    label: 'AirPlay',
+    available: hasAirplay,
+    description: 'Apple TV detected — use AirPlay mirroring or HDMI (URL casting is not supported by Apple).',
   });
 
   list.push({
@@ -330,9 +348,12 @@ async function castViaSamsungTizen(target, mediaUrl) {
     }, 6000);
 
     ws.onopen = () => {
+      // Real Tizen web-app launch payload: {method, params:{url}, id}.
+      // The historic shape (id: mediaUrl) was ignored by newer Tizen firmwares.
       const payload = JSON.stringify({
         method: 'ms.webapp.launch',
-        id: mediaUrl,
+        params: { url: mediaUrl },
+        id: 'blasti-cast-1',
         token: '',
       });
       ws.send(payload);
@@ -507,11 +528,13 @@ async function stopDlnaCast(target) {
  */
 async function castToTv(target, mediaUrl, preferred) {
   const protocols = detectCastProtocols(target);
-  // Order: preferred → brand-native → DLNA → URL fallback
+  // Order: preferred → brand-native → DLNA → URL fallback.
+  // 'google-cast' and 'airplay' are informational — never executable here.
+  const executable = ['dlna', 'samsung-tizen', 'lg-webos', 'roku-ecp'];
   const order = [];
   if (preferred) order.push(preferred);
   for (const p of protocols) {
-    if (p.available && !order.includes(p.protocol) && p.protocol !== 'url') {
+    if (p.available && !order.includes(p.protocol) && executable.includes(p.protocol)) {
       order.push(p.protocol);
     }
   }

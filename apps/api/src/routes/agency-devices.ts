@@ -69,6 +69,13 @@ let lastWatchdogRun = 0
 
 // ─── Validation Schemas ─────────────────────────────────────────────────────
 
+// TV screen layouts — 0.6.74 adds four simple TV board designs alongside the
+// historic rich board (QUEUE_BOARD). Pure string values, no DB enum change.
+const SCREEN_LAYOUT_VALUES = [
+  'QUEUE_BOARD', 'TICKET_PRINTER', 'SERVICE_SELECTOR', 'CUSTOM',
+  'TV_CLASSIC', 'TV_COUNTERS', 'TV_FOCUS', 'TV_MINIMAL',
+] as const
+
 const createDeviceSchema = z.object({
   name: z.string().min(1).max(100),
   nameAr: z.string().max(100).optional(),
@@ -78,7 +85,7 @@ const createDeviceSchema = z.object({
   ipAddress: z.string().max(50).optional(),
   port: z.number().int().min(1).max(65535).optional(),
   autoDiscovery: z.boolean().default(true),
-  screenLayout: z.enum(['QUEUE_BOARD', 'TICKET_PRINTER', 'SERVICE_SELECTOR', 'CUSTOM'], { message: 'Invalid screen layout' }).default('QUEUE_BOARD'),
+  screenLayout: z.enum(SCREEN_LAYOUT_VALUES, { message: 'Invalid screen layout' }).default('QUEUE_BOARD'),
   branchId: z.string().optional(),
   displaySettings: z.record(z.any()).default({}),
   printerConfig: z.record(z.any()).default({}),
@@ -95,7 +102,7 @@ const updateDeviceSchema = z.object({
   ipAddress: z.string().max(50).optional(),
   port: z.number().int().min(1).max(65535).optional(),
   autoDiscovery: z.boolean().optional(),
-  screenLayout: z.enum(['QUEUE_BOARD', 'TICKET_PRINTER', 'SERVICE_SELECTOR', 'CUSTOM'], { message: 'Invalid screen layout' }).optional(),
+  screenLayout: z.enum(SCREEN_LAYOUT_VALUES, { message: 'Invalid screen layout' }).optional(),
   branchId: z.string().nullable().optional(),
   displaySettings: z.record(z.any()).optional(),
   printerConfig: z.record(z.any()).optional(),
@@ -134,6 +141,39 @@ const syncDeviceSchema = z.object({
 
 function generatePairingCode(): string {
   return crypto.randomBytes(2).toString('hex').toUpperCase()
+}
+
+// ─── Pairing brute-force guard (0.6.74) ────────────────────────────────────
+// 4-char pairing codes (65 536 combinations) are brute-forceable by a bot
+// hammering /public/kiosk-auth. We now track consecutive failures per code
+// (in-memory — resets on API restart, acceptable for a 10-minute code TTL).
+// After PAIRING_MAX_FAILURES wrong token attempts the code is locked out for
+// 10 minutes, on top of the per-IP rate limit.
+const pairingFailures = new Map<string, { count: number; lockedUntil: number }>()
+const PAIRING_MAX_FAILURES = 6
+const PAIRING_LOCKOUT_MS = 10 * 60 * 1000
+
+function isPairingCodeLocked(pairingCode: string): boolean {
+  const entry = pairingFailures.get(pairingCode)
+  if (!entry) return false
+  if (entry.lockedUntil > Date.now()) return true
+  if (entry.lockedUntil !== 0 && entry.lockedUntil <= Date.now()) {
+    pairingFailures.delete(pairingCode)
+  }
+  return false
+}
+
+function recordPairingFailure(pairingCode: string): void {
+  const entry = pairingFailures.get(pairingCode) || { count: 0, lockedUntil: 0 }
+  entry.count += 1
+  if (entry.count >= PAIRING_MAX_FAILURES) {
+    entry.lockedUntil = Date.now() + PAIRING_LOCKOUT_MS
+  }
+  pairingFailures.set(pairingCode, entry)
+}
+
+function clearPairingFailures(pairingCode: string): void {
+  pairingFailures.delete(pairingCode)
 }
 
 /** Select clause used for every device response — never includes deviceToken. */
@@ -626,6 +666,10 @@ app.get('/public/queue-status', async (c) => {
 
     const isPaused = agency.queueSettings.length > 0 ? agency.queueSettings[0].isPaused : false
 
+    // Local midnight — drives "served today" and the average serving time.
+    const startOfToday = new Date()
+    startOfToday.setHours(0, 0, 0, 0)
+
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
     const recentCompletedForAgency = await db.reservation.findMany({
       where: {
@@ -679,6 +723,30 @@ app.get('/public/queue-status', async (c) => {
       take: 5,
     })
 
+    // ── Active CLAIMED counters with their current ticket (0.6.74 TV screens).
+    // A counter appears only when it is active, belongs to a live branch, was
+    // touched within the last 45 minutes, AND is actually claimed (controlled
+    // by a user or mirrored-occupied). Only such counters are rendered by the
+    // new simple TV designs.
+    const claimedCounters = await db.counter.findMany({
+      where: {
+        isActive: true,
+        branch: { agencyId, isActive: true },
+        updatedAt: { gte: fortyFiveMinsAgo },
+        OR: [{ controlledByUserId: { not: null } }, { staffId: { not: null } }],
+      },
+      select: {
+        id: true, number: true, name: true, nameAr: true, nameFr: true, controlClaimedAt: true,
+        currentReservation: {
+          select: {
+            id: true, displayNumber: true, status: true, calledAt: true,
+            service: { select: { name: true, nameAr: true, nameFr: true, prefix: true } },
+          },
+        },
+      },
+      orderBy: { number: 'asc' },
+    })
+
     const totalWaiting = serviceStats.reduce((sum, s) => sum + s.waiting, 0)
     const overallEta = calculateETA({
       peopleAhead: totalWaiting,
@@ -692,11 +760,26 @@ app.get('/public/queue-status', async (c) => {
 
     // TV footer "Served Today" — COMPLETED reservations within the local day.
     // (Historically missing from this response → the TV footer showed 0 forever.)
-    const startOfToday = new Date()
-    startOfToday.setHours(0, 0, 0, 0)
     const totalServedToday = await db.reservation.count({
       where: { agencyId, status: 'COMPLETED', completedAt: { gte: startOfToday } },
     })
+
+    // Average SERVING time today (completedAt − calledAt) for the new TV
+    // designs. Outliers (>4h — forgotten open ticket) are excluded; null when
+    // no completed ticket exists yet today (UI falls back to “—”).
+    const todayServedTimes = await db.reservation.findMany({
+      where: { agencyId, status: 'COMPLETED', calledAt: { not: null }, completedAt: { gte: startOfToday } },
+      select: { calledAt: true, completedAt: true },
+      take: 500,
+      orderBy: { completedAt: 'desc' },
+    })
+    const todayDurations = todayServedTimes
+      .filter((r) => r.completedAt && r.calledAt)
+      .map((r) => (r.completedAt as Date).getTime() - (r.calledAt as Date).getTime())
+      .filter((ms) => ms > 0 && ms < 4 * 3_600_000)
+    const avgServiceTimeSec = todayDurations.length
+      ? Math.round(todayDurations.reduce((a, b) => a + b, 0) / todayDurations.length / 1000)
+      : null
 
     // Active announcements for the TV ticker (agency-scoped first, then
     // platform-wide). Expired agency announcements are excluded.
@@ -728,6 +811,27 @@ app.get('/public/queue-status', async (c) => {
       serviceStats,
       totalWaiting,
       totalServedToday,
+      avgServiceTimeSec,
+      counters: claimedCounters.map((ctr) => ({
+        id: ctr.id,
+        number: ctr.number,
+        name: ctr.name,
+        nameAr: ctr.nameAr,
+        nameFr: ctr.nameFr,
+        claimedAt: ctr.controlClaimedAt,
+        ticket: ctr.currentReservation && (ctr.currentReservation.status === 'CALLED' || ctr.currentReservation.status === 'SERVING')
+          ? {
+              id: ctr.currentReservation.id,
+              ticketNumber: ctr.currentReservation.displayNumber,
+              status: ctr.currentReservation.status,
+              calledAt: ctr.currentReservation.calledAt,
+              serviceName: ctr.currentReservation.service.name,
+              serviceNameAr: ctr.currentReservation.service.nameAr,
+              serviceNameFr: ctr.currentReservation.service.nameFr,
+              servicePrefix: ctr.currentReservation.service.prefix,
+            }
+          : null,
+      })),
       totalEstimatedWait,
       activeCounters: totalActiveCounters,
       recentCalls: recentCalls.map((r) => ({ id: r.id, ticketNumber: r.displayNumber, status: r.status, calledAt: r.calledAt, counterName: r.counter?.name ?? null })),
@@ -861,9 +965,18 @@ app.post('/public/kiosk-auth', async (c) => {
 
     const { pairingCode, deviceToken } = validation.data
 
+    // Brute-force guard: a code with too many recent failures is temporarily
+    // rejected even for the CORRECT token (the kiosk retries — legitimate
+    // clients recover automatically when the lockout expires).
+    const normalizedPairingCode = pairingCode.toUpperCase()
+    if (isPairingCodeLocked(normalizedPairingCode)) {
+      if (clientIp) recordFailedRequest(clientIp)
+      return c.json({ success: false, error: 'Too many failed attempts for this pairing code. Try again later.' }, 429)
+    }
+
     // Look up device by pairing code (case-insensitive)
     const foundDevice = await db.agencyDevice.findUnique({
-      where: { pairingCode: pairingCode.toUpperCase() },
+      where: { pairingCode: normalizedPairingCode },
       include: {
         branch: { select: { id: true, name: true, nameAr: true, nameFr: true } },
         agency: {
@@ -881,14 +994,18 @@ app.post('/public/kiosk-auth', async (c) => {
 
     if (!foundDevice) {
       if (clientIp) recordFailedRequest(clientIp)
+      recordPairingFailure(normalizedPairingCode)
       return c.json({ success: false, error: 'Device not found. Check pairing code.' }, 404)
     }
 
     // Validate deviceToken matches
     if (foundDevice.deviceToken !== deviceToken) {
       if (clientIp) recordFailedRequest(clientIp)
+      recordPairingFailure(normalizedPairingCode)
       return c.json({ success: false, error: 'Invalid device token. Contact your agency admin.' }, 401)
     }
+
+    clearPairingFailures(normalizedPairingCode)
 
     // Check agency is active
     if (!foundDevice.agency.isActive) {
@@ -1846,24 +1963,6 @@ app.post('/', async (c) => {
   }
 })
 
-// ─── POST /scan-network — Proxy to Discovery Service ──────────────────────
-// Triggers the embedded multi-protocol LAN discovery scanner (ARP + ping
-// sweep + mDNS + SSDP + HTTP probe). Returns immediately with a scanId;
-// poll /discovery/scan/status for progress and /discovery/devices for results.
-
-app.post('/scan-network', async (c) => {
-  try {
-    const user = await requireAuth(c)
-    if (!user.agencyId) {
-      return c.json({ success: false, error: 'No agency assigned' }, 403)
-    }
-    return c.json(scanStartResponse())
-  } catch (error: unknown) {
-    const err = authErrorResponse(error)
-    return c.json({ success: err.success, error: err.error }, err.status as any)
-  }
-})
-
 // ─── POST /auto-register — Auto-register a discovered device ───────────────
 
 app.post('/auto-register', async (c) => {
@@ -2473,23 +2572,6 @@ app.get('/:id/commands', async (c) => {
   }
 })
 
-// ─── POST /scan — Proxy to Discovery Service ──────────────────────────────
-// Triggers the embedded multi-protocol LAN discovery scanner.
-// Poll /discovery/scan/status for progress and /discovery/devices for results.
-
-app.post('/scan', async (c) => {
-  try {
-    const user = await requireAuth(c)
-    if (!user.agencyId) {
-      return c.json({ success: false, error: 'No agency assigned' }, 403)
-    }
-    return c.json(scanStartResponse())
-  } catch (error: unknown) {
-    const err = authErrorResponse(error)
-    return c.json({ success: err.success, error: err.error }, err.status as any)
-  }
-})
-
 // ─── POST /:id/kiosk-credentials — Get/regenerate kiosk login credentials ──
 // Returns pairingCode + deviceToken that the kiosk operator uses to log in
 
@@ -2579,20 +2661,6 @@ app.post('/:id/kiosk-credentials/regenerate', async (c) => {
     })
 
     return c.json({ success: true, pairingCode, deviceToken, regenerated: true })
-  } catch (error: unknown) {
-    const err = authErrorResponse(error)
-    return c.json({ success: err.success, error: err.error }, err.status as any)
-  }
-})
-
-// ─── GET /discovery-token ───────────────────────────────────────────────────
-// No longer needed — discovery is embedded in the API process, no separate
-// service to authenticate against. Kept for backward compatibility with the
-// frontend hook that may still call it.
-app.get('/discovery-token', async (c) => {
-  try {
-    await requireAuth(c)
-    return c.json({ token: null, mode: 'embedded' })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
@@ -3213,9 +3281,18 @@ app.post('/discovery/cast', async (c) => {
       return c.json({ success: false, error: 'IP required' }, 400)
     }
 
-    // The TV board URL we want to display on the TV
+    // The TV board URL we want to display on the TV.
+    // 0.6.74: the manager may send its OWN origin-built URL (mediaUrl) — the
+    // browser origin is what the TV on the same LAN can actually reach, while
+    // the server-side origin can differ (proxy / gateway deployments).
     const origin = new URL(c.req.url).origin
-    const tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+    let tvBoardUrl = `${origin}/?mode=device&type=TV&agencyId=${user.agencyId}`
+    if (typeof body.mediaUrl === 'string') {
+      try {
+        const parsed = new URL(body.mediaUrl)
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') tvBoardUrl = parsed.toString()
+      } catch { /* invalid → keep the origin-built URL */ }
+    }
 
     // 'url' → unchanged behavior: hand the URL to the frontend (it opens it
     // in a new tab so the user can navigate on the TV or use Chromecast/HDMI).

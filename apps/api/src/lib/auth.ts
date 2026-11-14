@@ -393,15 +393,26 @@ export async function requireAdmin(c: Context): Promise<SessionUser> {
 
 /**
  * Requires auth + specific role(s). Throws AuthError if wrong role.
- * Security-0.6.13 — same platform gate as requireAdmin whenever SUPER_ADMIN
- * is among the accepted roles (e.g. agencies.ts role-wrapped admin surfaces).
+ * Security-0.6.13 — platform gate: a session minted inside the mobile/desktop
+ * apps may not drive the ADMIN console, even when the role is SUPER_ADMIN.
+ *
+ * 0.6.72 — the gate keys on the CALLER'S ACTUAL ROLE, no longer on whether
+ * 'SUPER_ADMIN' merely appears in the accepted-roles list. Mixed-role
+ * surfaces that legitimately serve AGENCY_OWNER/AGENCY_STAFF from the
+ * desktop/mobile workspace — above all POST /agencies (agency onboarding,
+ * including the new-category path) and POST /agency-categories — used to be
+ * unreachable from those apps with "Admin API is not accessible from this
+ * app." (field incident: an owner could not get past the confirmation
+ * page). Single-role admin surfaces (requireRole(c, 'SUPER_ADMIN'), logs,
+ * server-logs, translation-agent, category admin ops) keep the exact same
+ * protection: a SUPER_ADMIN session minted in an app is still rejected.
  */
 export async function requireRole(c: Context, ...roles: string[]): Promise<SessionUser> {
   const user = await requireAuth(c)
   if (!roles.includes(user.role)) {
     throw new AuthError('Insufficient permissions', 403)
   }
-  if (roles.includes('SUPER_ADMIN') && !platformMayUseAdminApi(user.platform)) {
+  if (user.role === 'SUPER_ADMIN' && !platformMayUseAdminApi(user.platform)) {
     throw new AuthError('Admin API is not accessible from this app.', 403)
   }
   return user

@@ -535,7 +535,20 @@ export async function resolvePhoneChannel(): Promise<'SMS' | 'WHATSAPP'> {
 // post-registration VerificationCode flow (hashed codes, TTL, attempts,
 // 60s resend cooldown, 6/hour, dev bypass codes).
 
-export const PENDING_REGISTRATION_TTL_HOURS = 24
+/**
+ * How long a PENDING signup row may keep holding its UNIQUE
+ * email/username/phone after its last touch.
+ *
+ * 0.6.72 — 24h → 2h. The staged-signup token (PENDING_TOKEN_TTL) lives ONE
+ * hour: a row untouched for longer can NEVER complete verification (its
+ * token is expired; the client must restart the signup, which mints a fresh
+ * row). Such a row is dead by construction, and keeping it a full day meant
+ * a leaked/abandoned row blocked its identity for 24h — the field incident:
+ * a pending row that outlived its account kept answering 'Email already
+ * registered' after the account was deleted from the admin. One hour of
+ * token life + one hour of margin; nothing that can still verify is purged.
+ */
+export const PENDING_REGISTRATION_TTL_HOURS = 2
 
 const PENDING_TOKEN_TTL = '1h'
 

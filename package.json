@@ -1,6 +1,6 @@
 {
   "name": "blasti-multiplatform",
-  "version": "0.6.71",
+  "version": "0.6.74",
   "private": true,
   "workspaces": [
     "apps/*",

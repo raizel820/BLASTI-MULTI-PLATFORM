@@ -132,11 +132,15 @@ export const SCAN_PORTS = [
 // Speed pass (Task 5-a): tighter windows, higher concurrency — same protocol
 // coverage, less dead time per scan.
 const PING_CONCURRENCY = 128
-const PING_TIMEOUT_MS = 700
+// 0.6.74 speed pass: 400ms catches every LAN host on healthy Wi-Fi; the ping
+// sweep is 2 batches of 254 ÷ 128 → ~0.8s total instead of ~1.4s.
+const PING_TIMEOUT_MS = 400
 const HTTP_CONCURRENCY = 16
 const HTTP_TIMEOUT_MS = 1100
-const MDNS_TIMEOUT_MS = 3500
-const SSDP_TIMEOUT_MS = 3500
+// 0.6.74 speed pass: mDNS/SSDP answer within ~2.5s on real networks; 3s keeps
+// a margin for standby TVs without lengthening the total scan.
+const MDNS_TIMEOUT_MS = 3000
+const SSDP_TIMEOUT_MS = 3000
 
 // TCP-connect sweep ('tcp-sweep' phase) — Windows PCs drop ICMP and run
 // nothing on the HTTP scan ports; their hallmark services (SMB 445, RDP 3389,
@@ -145,7 +149,7 @@ const SSDP_TIMEOUT_MS = 3500
 const TCP_SWEEP_CONCURRENCY = 128
 const TCP_SWEEP_TIMEOUT_MS = 1200
 /** Hard cap on the whole tcp-sweep window (all subnets × all ports). */
-const TCP_SWEEP_MAX_WINDOW_MS = 15000
+const TCP_SWEEP_MAX_WINDOW_MS = 9000
 
 /** TCP ports probed by the tcp-sweep phase and how a hit is classified. */
 export const TCP_SWEEP_PORTS: Array<{ port: number; service: string }> = [
@@ -174,7 +178,7 @@ const SSDP_PORT = 1900
 // port every few seconds; the scanner listens for it and turns those
 // announcements into high-confidence BLASTI devices without any probing.
 const BEACON_UDP_PORT = 3081
-const BEACON_LISTEN_MS = 2500
+const BEACON_LISTEN_MS = 2000
 
 /** mDNS service types we actively query for.
  *
@@ -3065,28 +3069,17 @@ export async function runDiscoveryScan(
     }
   }
 
-  // ── Phase 0: UDP beacon listener ──
+  // ── Phase 0: UDP beacon listener (0.6.74: overlapped with ARP + ping) ──
   // BLASTI shells announce themselves on UDP 3081 (apps/desktop/main.js).
   // A self-announcing beacon is the highest-signal BLASTI result — no
-  // guessing, no port probing.
+  // guessing, no port probing. The 2s listen window used to BLOCK the whole
+  // pipeline; we now start it as a promise and harvest results after the ARP
+  // + ping sweeps complete — saving the full window from the critical path.
+  let beaconPromise: Promise<Array<{ ip: string; port?: number; name?: string }>> = Promise.resolve([])
   if (!cb.isAborted()) {
     emitProgress('beacon', 0)
     if (!protocolsUsed.includes('UDP beacon')) protocolsUsed.push('UDP beacon')
-    try {
-      const beacons = await listenForUdpBeacons({ selfIps, isAborted: cb.isAborted })
-      for (const b of beacons) {
-        if (cb.isAborted()) break
-        if (!subnets.some((s) => b.ip.startsWith(s + '.'))) continue
-        upsertDevice(b.ip, {
-          source: 'udp-beacon',
-          port: b.port || 0,
-          httpServer: 'blasti-local',
-          friendlyName: b.name,
-          name: b.name,
-          capabilities: ['UDP_BEACON'],
-        })
-      }
-    } catch { /* beacon listener is best-effort */ }
+    beaconPromise = listenForUdpBeacons({ selfIps, isAborted: cb.isAborted }).catch(() => [] as Array<{ ip: string; port?: number; name?: string }>)
   }
   emitProgress('beacon', 0)
 
@@ -3131,6 +3124,25 @@ export async function runDiscoveryScan(
     scanned = Math.max(scanned, totalIPs / subnets.length)
   }
   emitProgress('ping', totalIPs)
+
+  // ── Harvest overlapped beacon results (after ping) ──
+  if (!cb.isAborted()) {
+    try {
+      const beacons = await beaconPromise
+      for (const b of beacons) {
+        if (cb.isAborted()) break
+        if (!subnets.some((s) => b.ip.startsWith(s + '.'))) continue
+        upsertDevice(b.ip, {
+          source: 'udp-beacon',
+          port: b.port || 0,
+          httpServer: 'blasti-local',
+          friendlyName: b.name,
+          name: b.name,
+          capabilities: ['UDP_BEACON'],
+        })
+      }
+    } catch { /* beacon listener is best-effort */ }
+  }
 
   // ── Phase 2b: Re-read ARP table (capture MACs for ping-only devices) ──
   // The initial ARP read (Phase 1) only sees devices the OS already had in

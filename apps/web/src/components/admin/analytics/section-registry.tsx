@@ -18,6 +18,7 @@ import {
   ListOrdered,
   MessageSquare,
   MonitorSmartphone,
+  Server,
   ShieldCheck,
   Users,
   UsersRound,
@@ -38,6 +39,7 @@ import { SmsSection, NotificationsSection } from './section-messaging';
 import { DevicesSection } from './section-devices';
 import { SecurityAuditSection } from './section-security-audit';
 import { DataConsumptionSection } from './section-data-consumption';
+import { ServerSection } from './section-server';
 import type { AdminSectionId } from './section-types';
 
 export interface AdminSectionNavItem {
@@ -62,6 +64,8 @@ export const ADMIN_SECTION_NAV: AdminSectionNavItem[] = [
   { id: 'devices', icon: MonitorSmartphone, labelKey: 'adminAnalytics.nav.devices' },
   // Task 55-c: data-consumption (doc-2 §14 + 55 contract) — after 'devices'.
   { id: 'data-consumption', icon: Wifi, labelKey: 'adminAnalytics.nav.dataConsumption' },
+  // Task 6-b: server (VPS resource analyzer) — before 'security-audit'.
+  { id: 'server', icon: Server, labelKey: 'adminAnalytics.nav.server' },
   { id: 'security-audit', icon: ShieldCheck, labelKey: 'adminAnalytics.nav.securityAudit' },
 ];
 
@@ -89,6 +93,7 @@ export const ADMIN_SECTION_COMPONENTS: Record<
   devices: DevicesSection,
   'security-audit': SecurityAuditSection,
   'data-consumption': DataConsumptionSection,
+  server: ServerSection,
 };
 
 /** Title key per section (used by the shared toolbar header). */
@@ -107,4 +112,5 @@ export const ADMIN_SECTION_TITLE_KEYS: Record<Exclude<AdminSectionId, 'overview'
   devices: 'adminAnalytics.devices.title',
   'security-audit': 'adminAnalytics.audit.title',
   'data-consumption': 'adminAnalytics.dataConsumption.title',
+  server: 'adminAnalytics.server.title',
 };
