@@ -557,14 +557,16 @@ function metaFromEnvelope(obj: Record<string, unknown>, fallback: LogMeta): LogM
   }
 }
 
-function backfillFile(file: string, fallback: LogMeta): void {
+function backfillFile(file: string, fallback: LogMeta): { batches: number; entries: number } {
   let content = ''
   try {
-    if (fs.statSync(file).size > MAX_BACKFILL_FILE_BYTES) return
+    if (fs.statSync(file).size > MAX_BACKFILL_FILE_BYTES) return { batches: 0, entries: 0 }
     content = fs.readFileSync(file, 'utf8')
   } catch {
-    return
+    return { batches: 0, entries: 0 }
   }
+  let batches = 0
+  let entries = 0
   let meta = fallback
   // Batch-grouped replay: a session envelope starts a new batch; entries
   // accumulate until the next envelope/EOF, then feed analyzeBatch ONCE —
@@ -574,6 +576,8 @@ function backfillFile(file: string, fallback: LogMeta): void {
   const drain = () => {
     if (pending.length === 0) return
     analyzeBatch(meta, pending, false)
+    batches += 1
+    entries += pending.length
     pending = []
   }
   for (const line of content.split('\n')) {
@@ -593,6 +597,7 @@ function backfillFile(file: string, fallback: LogMeta): void {
     } catch { /* skip malformed line */ }
   }
   drain()
+  return { batches, entries }
 }
 
 /**
@@ -646,4 +651,194 @@ export function bootBackfill(root: string): void {
 /** Test/diagnostic helper — current in-memory sizes. */
 export function analyzerStats(): { errorsInMemory: number; dailiesInMemory: number } {
   return { errorsInMemory: errors.size, dailiesInMemory: dailies.size }
+}
+
+// ─── Deep history scan (0.6.66 — OLD logs on the server) ────────────────────
+//
+// bootBackfill only replays the last BACKFILL_DAYS days, so everything older
+// than that is INVISIBLE to the realtime error index and the daily
+// aggregates. deepScanHistory() replays ANY day-file in the requested window
+// (both layouts: <UID>/<platform>/<date>.ndjson and legacy <UID>/<date>.ndjson)
+// through the SAME backfillFile pipeline — the fingerprint index gains the
+// old bugs and the daily aggregates for those old dates are rebuilt and
+// flushed to disk by the regular debounce.
+//
+// Idempotency is critical: addError() does `count += 1`, so replaying the
+// same file twice would double every count. Each replayed file is marked by
+// path+mtimeMs in logs/_analysis/deepscan.json (survives restarts — the
+// hydrated index.json already contains those hits) and in memory.
+
+interface DeepScanOptions {
+  /** Inclusive file-date window (YYYY-MM-DD); empty = unbounded. */
+  from?: string
+  to?: string
+  /** Hard cap on files replayed per call (server stays responsive). */
+  maxFiles?: number
+}
+
+export interface DeepScanResult {
+  filesSeen: number
+  filesReplayed: number
+  filesMarked: number
+  filesTooBig: number
+  batches: number
+  entries: number
+  bytesSeen: number
+  oldestDate: string | null
+  newestDate: string | null
+  truncated: boolean
+}
+
+/** Cumulative read budget per deep scan — bounds the worst case on the VPS. */
+const DEEP_SCAN_BYTE_BUDGET = 256 * 1024 * 1024
+
+const deepScanMarkers = new Map<string, number>()
+let deepScanLoaded = false
+
+function deepScanMarkerPath(): string {
+  return path.join(analysisRoot(), 'deepscan.json')
+}
+
+function loadDeepScanMarkers(): void {
+  if (deepScanLoaded) return
+  deepScanLoaded = true
+  try {
+    const raw = JSON.parse(fs.readFileSync(deepScanMarkerPath(), 'utf8')) as Record<string, number>
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v === 'number') deepScanMarkers.set(k, v)
+    }
+  } catch { /* none yet */ }
+}
+
+function saveDeepScanMarkers(): void {
+  try {
+    // Keep the marker file bounded — 20k files is far beyond any real vault.
+    if (deepScanMarkers.size > 20_000) {
+      const excess = deepScanMarkers.size - 20_000
+      let dropped = 0
+      for (const k of deepScanMarkers.keys()) {
+        if (dropped++ >= excess) break
+        deepScanMarkers.delete(k)
+      }
+    }
+    fs.mkdirSync(path.dirname(deepScanMarkerPath()), { recursive: true })
+    const tmp = `${deepScanMarkerPath()}.tmp-${process.pid}`
+    fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(deepScanMarkers)))
+    fs.renameSync(tmp, deepScanMarkerPath())
+  } catch { /* best-effort — worst case a file is replayed once more */ }
+}
+
+/**
+ * deepScanHistory — replay OLD day-files into the analyzer (idempotent).
+ * Called by the unified export endpoint (deep=1) before the errors/daily
+ * sections are collected, so exports include the FULL history on disk, not
+ * just the live 3-day boot window.
+ */
+export function deepScanHistory(root: string, opts: DeepScanOptions = {}): DeepScanResult {
+  const res: DeepScanResult = {
+    filesSeen: 0,
+    filesReplayed: 0,
+    filesMarked: 0,
+    filesTooBig: 0,
+    batches: 0,
+    entries: 0,
+    bytesSeen: 0,
+    oldestDate: null,
+    newestDate: null,
+    truncated: false,
+  }
+  loadDeepScanMarkers()
+  const maxFiles = Math.max(1, Math.min(opts.maxFiles ?? 600, 5_000))
+  const markFile = (full: string, mtimeMs: number, st: { batches: number; entries: number }): void => {
+    deepScanMarkers.set(full, mtimeMs)
+    res.filesMarked += 1
+    res.batches += st.batches
+    res.entries += st.entries
+  }
+
+  let accountDirs: fs.Dirent[] = []
+  try {
+    accountDirs = fs.readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory() && !d.name.startsWith('_'))
+  } catch {
+    return res
+  }
+
+  const considerDayFile = (full: string, date: string, fallback: LogMeta): void => {
+    res.filesSeen += 1
+    if (res.filesReplayed >= maxFiles) {
+      res.truncated = true
+      return
+    }
+    if (opts.from && date < opts.from) return
+    if (opts.to && date > opts.to) return
+    if (res.oldestDate === null || date < res.oldestDate) res.oldestDate = date
+    if (res.newestDate === null || date > res.newestDate) res.newestDate = date
+    let mtimeMs = 0
+    let size = 0
+    try {
+      const st = fs.statSync(full)
+      mtimeMs = st.mtimeMs
+      size = st.size
+    } catch { return }
+    const marked = deepScanMarkers.get(full)
+    if (marked === mtimeMs) {
+      res.filesMarked += 1 // already replayed previously — never double-count
+      return
+    }
+    if (res.bytesSeen + size > DEEP_SCAN_BYTE_BUDGET) {
+      res.truncated = true
+      return
+    }
+    res.bytesSeen += size
+    if (marked !== undefined) deepScanMarkers.delete(full) // file changed → replay
+    let st = { batches: 0, entries: 0 }
+    try {
+      if (size > MAX_BACKFILL_FILE_BYTES) {
+        res.filesTooBig += 1
+        return
+      }
+      st = backfillFile(full, fallback)
+    } catch { return }
+    if (st.batches > 0) {
+      res.filesReplayed += 1
+      markFile(full, mtimeMs, st)
+    }
+  }
+
+  for (const ent of accountDirs) {
+    const uidDir = path.join(root, ent.name)
+    let inner: fs.Dirent[] = []
+    try { inner = fs.readdirSync(uidDir, { withFileTypes: true }) } catch { continue }
+    for (const f of inner) {
+      try {
+        const full = path.join(uidDir, f.name)
+        if (f.isDirectory()) {
+          if (f.name.startsWith('meta-')) continue
+          // Platform subfolder (0.6.19+ layout) — platform = folder name.
+          for (const day of fs.readdirSync(full)) {
+            if (!day.endsWith('.ndjson')) continue
+            const date = day.slice(0, 10)
+            if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue
+            considerDayFile(path.join(full, day), date, {
+              uid: ent.name, role: 'unknown', platform: f.name, appVersion: 'unknown', device: 'unknown', date,
+            })
+          }
+        } else if (f.name.endsWith('.ndjson')) {
+          // Legacy flat layout (<UID>/<date>.ndjson).
+          const date = f.name.slice(0, 10)
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue
+          considerDayFile(full, date, {
+            uid: ent.name, role: 'unknown', platform: 'legacy', appVersion: 'unknown', device: 'unknown', date,
+          })
+        }
+      } catch { /* raced file */ }
+    }
+  }
+
+  if (res.filesReplayed > 0) {
+    // Persist the rebuilt index + the OLD daily aggregates to disk.
+    markDirty()
+    saveDeepScanMarkers()
+  }
+  return res
 }

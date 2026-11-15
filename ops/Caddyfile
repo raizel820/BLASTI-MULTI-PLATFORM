@@ -24,14 +24,32 @@
 # ════════════════════════════════════════════════════════════════
 
 {$SITE_ADDRESS} {
-        encode zstd gzip
+        # Compression for text responses (JSON/HTML/JS/CSS). App binaries are
+        # excluded via the regex below — see the SPEED ROUND 2 note at /api/*.
+        encode {
+                match {
+                        not path_regexp app_binary_download ^/api/app-versions/.+/download$
+                }
+                zstd gzip
+        }
 
         # API (Bun, :3003) — REST endpoints.
         # NOTE: response caching/compression policy is set by the API itself
         # (ETag + Cache-Control middleware). Caddy only compresses on the way
         # out; it never re-compresses an already-encoded response.
+        # SPEED ROUND 2 (0.6.78) — two proxy-side changes for update delivery:
+        #   • flush_interval -1 → byte frames reach the client the moment the
+        #     API emits them (no proxy write-buffering on binary streams — the
+        #     desktop updater downloads each delta hop over several short
+        #     ranged requests where every buffered ms is visible),
+        #   • the encode middleware SKIPS app binaries (installers + delta
+        #     patches): they are pre-compressed, opaque octet-streams, so
+        #     gzip/zstd on the fly only burns VPS CPU per streamed byte and
+        #     can cap throughput below the client's line rate.
         handle /api/* {
-                reverse_proxy api:3003
+                reverse_proxy api:3003 {
+                        flush_interval -1
+                }
         }
 
         # API — realtime engine.io/socket.io handshake + transports.

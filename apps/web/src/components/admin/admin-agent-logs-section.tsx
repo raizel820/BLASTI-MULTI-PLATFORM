@@ -44,6 +44,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Input } from '@/components/ui/input';
@@ -65,6 +66,7 @@ import {
 } from '@/components/ui/table';
 import { cn } from '@/lib/utils';
 import type { TranslationKeys } from '@/i18n';
+import { AdminLogsExportDialog } from '@/components/admin/admin-logs-export-dialog';
 
 // ─── Types (mirror the TranslationAgentLog model) ────────────────────────────
 
@@ -214,6 +216,8 @@ export function AdminAgentLogsSection() {
   const [detail, setDetail] = useState<AgentLogRow | null>(null);
   const [copied, setCopied] = useState(false);
   const [downloading, setDownloading] = useState<'csv' | 'json' | 'txt' | null>(null);
+  // 0.6.66 — unified filtered export (custom parameters beyond the dropdown)
+  const [exportOpen, setExportOpen] = useState(false);
 
   /** Query string carrying the CURRENT filters — the download must match
    *  exactly what the table shows (type, status, search, date range). */
@@ -373,6 +377,13 @@ export function AdminAgentLogsSection() {
                 <DropdownMenuItem onClick={() => void downloadLogs('txt')} disabled={downloading !== null}>
                   <span className="font-mono text-[11px] w-10 shrink-0">TXT</span>
                   <span className="text-[11px] text-muted-foreground">{t('agentLogDownloadReport')}</span>
+                </DropdownMenuItem>
+                {/* 0.6.66 — custom export: full parameter composer (time range,
+                    analyze mode, format, row cap) on the unified route. */}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={() => setExportOpen(true)}>
+                  <Sparkles className="h-3.5 w-3.5 me-1.5 text-violet-600 dark:text-violet-400" />
+                  <span className="text-[11px] font-medium">{t('logsExportCustom')}</span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -572,6 +583,19 @@ export function AdminAgentLogsSection() {
           )}
         </DialogContent>
       </Dialog>
+
+      {/* ── 0.6.66 — unified filtered export (agent scope) ── */}
+      <AdminLogsExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        scope="agent"
+        agentActionOptions={Object.keys(byAction)}
+        defaults={{
+          action: action !== 'all' ? action : '',
+          status: status !== 'all' ? status : '',
+          q: q.trim(),
+        }}
+      />
     </div>
   );
 }

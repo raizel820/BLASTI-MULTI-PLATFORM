@@ -779,6 +779,9 @@ function buildBeaconPayload() {
     hostname: getMachineDisplayName(),
     lanIp: getLocalIP(),
     httpPort: 3080,
+    // 0.6.78 — identity fields the Device Manager surfaces directly
+    appVersion: (() => { try { return app.getVersion() } catch { return '' } })(),
+    mode: 'desktop',
     ...extras,
   });
 }
@@ -2465,6 +2468,22 @@ async function verifyDownloadedInstaller(filePath, expectedHash, expectedSize) {
 //   • delta hops: threshold 256 KB, up to 6 parts, ≥ 128 KB per part — a
 //     512 KB patch downloads over 4 concurrent streams, a 4 MB patch over 6,
 //     so even one-hop patches now fill the pipe like the browser does.
+//
+// SPEED ROUND 2 (0.6.78) — STILL SLOW IN THE FIELD ("30 s for 2-3 MB while
+// the landing-page installer pulls at line speed"). Three compounding costs
+// the 0.6.65 profile could not remove:
+//   1. every hop paid a full PROBE round trip (Range: bytes=0-0) before the
+//      first payload byte — pure latency tax when the size is already known
+//      from the /check manifest (hop.size / fileSize),
+//   2. a multi-hop chain downloaded its hops ONE AFTER ANOTHER, so total
+//      time = Σ(hop) instead of max(hop) — 5 small hops each re-entering
+//      TCP slow-start on its own connection is exactly "2-3 MB in 30 s",
+//   3. a failed parallel attempt left the file PREALLOCATED to its full
+//      size, so the single-stream fallback resumed at Range: bytes=<full>
+//      → HTTP 416 → the whole delta hard-failed → 155 MB installer.
+// Fixes here: probe is SKIPPED whenever the size is known, the fallback
+// resets the partial file, parts carry one inline retry, and the delta
+// chain handler (updates:install-delta) downloads all hops CONCURRENTLY.
 const UPDATE_PARALLEL_MIN_BYTES = 8 * 1024 * 1024;
 const UPDATE_PARTS = 3;
 const UPDATE_MIN_PART_BYTES = 1024 * 1024;
@@ -2494,7 +2513,7 @@ function semverGreaterThan(a, b) {
   return false;
 }
 
-async function downloadUpdateFile(url, dest, emit, opts) {
+async function downloadUpdateFile(url, dest, emit, opts, knownSize) {
   // Per-caller parallelism profile (0.6.65) — installers keep the proven
   // 8 MB / 3-part defaults; delta hop patches pass a much lower threshold so
   // small patches also download over several concurrent streams.
@@ -2502,36 +2521,69 @@ async function downloadUpdateFile(url, dest, emit, opts) {
   const parallelMinBytes = Number(o.parallelMinBytes) || UPDATE_PARALLEL_MIN_BYTES;
   const maxParts = Math.max(UPDATE_PARTS, Number(o.maxParts) || UPDATE_PARTS);
   const minPartBytes = Math.max(64 * 1024, Number(o.minPartBytes) || UPDATE_MIN_PART_BYTES);
-  // ── Probe: size + Range support in one cheap ranged request. ──────────────
+
+  const fallbackToSingleStream = (err) => {
+    console.warn('[BLASTI Desktop] parallel download failed — falling back to single stream:', err && err.message);
+    // SPEED ROUND 2 (0.6.78) — the parallel path preallocates the file to
+    // its FULL size, so a partial attempt must not leak that length into
+    // the resuming single stream (it would resume at bytes=<full> → 416 →
+    // hard failure). Reset to a clean slate; a 2-3 MB patch re-pulls in a
+    // blink compared to the old total-failure → 155 MB installer fallback.
+    try { fs.unlinkSync(dest); } catch { /* gone */ }
+    return downloadSingleStream(url, dest, emit);
+  };
+
+  const tryParallel = async (total) => {
+    const parts = Math.max(1, Math.min(maxParts, Math.ceil(total / minPartBytes)));
+    if (parts <= 1) return null;
+    return downloadParallelRanges(url, dest, total, emit, parts);
+  };
+
+  // SPEED ROUND 2 (0.6.78) — KNOWN SIZE → SKIP THE PROBE ENTIRELY. Every
+  // delta hop carries `size` in the /check manifest and installers carry
+  // fileSize; probing Range support costs a full round trip per hop before
+  // byte one. With the size in hand we fire the ranged parts straight away;
+  // a server that ignores Range simply 200s them and we fall back below.
+  const size = Number(knownSize) > 0 ? Number(knownSize) : 0;
+  if (size >= parallelMinBytes) {
+    try {
+      const got = await tryParallel(size);
+      if (got != null) return got;
+    } catch (err) {
+      return await fallbackToSingleStream(err);
+    }
+  }
+
+  // Unknown size → probe (size + Range support in one cheap ranged request).
   let total = 0;
   let ranges = false;
-  try {
-    const probe = await updateFetch(url, { headers: { Range: 'bytes=0-0' }, redirect: 'follow' });
-    if (probe.status === 206) {
-      ranges = true;
-      const cr = probe.headers.get('content-range') || '';
-      const m = /\/(\d+)\s*$/.exec(cr);
-      if (m) total = parseInt(m[1], 10);
-    } else if (probe.ok) {
-      total = Number(probe.headers.get('content-length') || 0);
-    }
-    try { await probe.body?.cancel(); } catch { /* already closed */ }
-  } catch { /* probe failure is non-fatal — the real request rechecks */ }
+  if (!size) {
+    try {
+      const probe = await updateFetch(url, { headers: { Range: 'bytes=0-0' }, redirect: 'follow' });
+      if (probe.status === 206) {
+        ranges = true;
+        const cr = probe.headers.get('content-range') || '';
+        const m = /\/(\d+)\s*$/.exec(cr);
+        if (m) total = parseInt(m[1], 10);
+      } else if (probe.ok) {
+        total = Number(probe.headers.get('content-length') || 0);
+      }
+      try { await probe.body?.cancel(); } catch { /* already closed */ }
+    } catch { /* probe failure is non-fatal — the real request rechecks */ }
 
-  // File + server-side ranges → parallel chunked download. The part count is
-  // ADAPTIVE (0.6.65): never more than maxParts, never fewer than one part
-  // per minPartBytes — a 300 KB patch at the 128 KB floor → 3 parts, not 6.
-  if (ranges && total >= parallelMinBytes) {
-    const parts = Math.max(1, Math.min(maxParts, Math.ceil(total / minPartBytes)));
-    if (parts > 1) {
+    // File + server-side ranges → parallel chunked download. The part count
+    // is ADAPTIVE (0.6.65): never more than maxParts, never fewer than one
+    // part per minPartBytes — a 300 KB patch at the 128 KB floor → 3 parts.
+    if (ranges && total >= parallelMinBytes) {
       try {
-        const got = await downloadParallelRanges(url, dest, total, emit, parts);
-        return got;
+        const got = await tryParallel(total);
+        if (got != null) return got;
       } catch (err) {
-        console.warn('[BLASTI Desktop] parallel download failed — falling back to single stream:', err && err.message);
+        return await fallbackToSingleStream(err);
       }
     }
   }
+
   return downloadSingleStream(url, dest, emit);
 }
 
@@ -2553,35 +2605,62 @@ async function downloadParallelRanges(url, dest, total, emit, parts = UPDATE_PAR
   const receivedRef = { value: 0 };
   const throttle = { last: 0 };
   await Promise.all(partList.map(async (part) => {
-    const res = await updateFetch(url, {
-      headers: { Range: `bytes=${part.start}-${part.end}` },
-      redirect: 'follow',
-    });
-    if (res.status !== 206) {
-      // 0.6.56 — cancel the undrained body so the socket is released before
-      // the retry path opens new ranges.
-      try { await res.body?.cancel(); } catch { /* already gone */ }
-      throw new Error(`range-http-${res.status}`);
-    }
-    const nodeStream = require('stream').Readable.fromWeb(res.body);
-    await new Promise((resolveP, rejectP) => {
-      const fd = fs.openSync(dest, 'r+');
-      let pos = part.start;
-      nodeStream.on('data', (chunk) => {
-        fs.writeSync(fd, chunk, 0, chunk.length, pos);
-        pos += chunk.length;
-        part.received = pos - part.start;
-        receivedRef.value += chunk.length;
-        const now = Date.now();
-        if (now - throttle.last > 250) {
-          throttle.last = now;
-          emit(Math.min(receivedRef.value, total), total);
+    // SPEED ROUND 2 (0.6.78) — one inline retry per part: a single dropped
+    // range (transient 5xx, proxy hiccup, short read) no longer scraps the
+    // whole parallel attempt and demotes the download to one slow stream.
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const res = await updateFetch(url, {
+          headers: { Range: `bytes=${part.start}-${part.end}` },
+          redirect: 'follow',
+        });
+        if (res.status !== 206) {
+          // 0.6.56 — cancel the undrained body so the socket is released
+          // before the retry path opens new ranges.
+          try { await res.body?.cancel(); } catch { /* already gone */ }
+          throw new Error(`range-http-${res.status}`);
         }
-      });
-      nodeStream.on('error', (e) => { try { nodeStream.destroy(); } catch { /* gone */ } try { fs.closeSync(fd); } catch { /* closed */ } rejectP(e); });
-      nodeStream.on('end', () => { try { fs.closeSync(fd); } catch { /* closed */ } resolveP(); });
-    });
-    if (part.start + part.received !== part.end + 1) throw new Error('range-short-read');
+        const nodeStream = require('stream').Readable.fromWeb(res.body);
+        await new Promise((resolveP, rejectP) => {
+          let fd = -1;
+          // SPEED ROUND 2 — fd opens lazily on the first data chunk and is
+          // closed on EVERY exit path: a writeSync throw mid-part used to
+          // leak the descriptor and keep the file locked on Windows.
+          const closeFd = () => { try { if (fd >= 0) fs.closeSync(fd); } catch { /* closed */ } fd = -1; };
+          let pos = part.start;
+          nodeStream.on('data', (chunk) => {
+            try {
+              if (fd < 0) fd = fs.openSync(dest, 'r+');
+              fs.writeSync(fd, chunk, 0, chunk.length, pos);
+            } catch (err) {
+              try { nodeStream.destroy(); } catch { /* gone */ }
+              closeFd();
+              rejectP(err);
+              return;
+            }
+            pos += chunk.length;
+            part.received = pos - part.start;
+            receivedRef.value += chunk.length;
+            const now = Date.now();
+            if (now - throttle.last > 250) {
+              throttle.last = now;
+              emit(Math.min(receivedRef.value, total), total);
+            }
+          });
+          nodeStream.on('error', (e) => { try { nodeStream.destroy(); } catch { /* gone */ } closeFd(); rejectP(e); });
+          nodeStream.on('end', () => { closeFd(); resolveP(); });
+        });
+        if (part.start + part.received !== part.end + 1) throw new Error('range-short-read');
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        part.received = 0;
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+    if (lastErr) throw lastErr;
   }));
   return total;
 }
@@ -3263,46 +3342,75 @@ ipcMain.handle('updates:install-delta', async (_e, payload) => {
     }
 
     // 2) Download every hop patch + verify sha256.
-    const hopFiles = [];
-    let doneBytes = 0;
+    // SPEED ROUND 2 (0.6.78) — hops download IN PARALLEL. Chains used to run
+    // hop after hop (download → sha-verify → next), so a multi-hop update on
+    // a high-RTT route paid Σ(per-hop time) with every hop re-entering TCP
+    // slow-start on a fresh connection — the reported "30 s for 2-3 MB".
+    // Now total time ≈ max(hop): every hop fetches concurrently with its own
+    // parallel-range profile, aggregate progress is emitted as one bar, and
+    // APPLY order below is unchanged (patches are byte-independent until
+    // applied, and each is sha-verified before anything touches disk state).
     const totalBytes = hops.reduce((s, h) => s + (h.size || 0), 0) || 1;
-    for (let i = 0; i < hops.length; i++) {
-      const hop = hops[i];
+    const perHopReceived = new Array(hops.length).fill(0);
+    const emitAggregate = () => {
+      const got = perHopReceived.reduce((s, v) => s + v, 0);
+      sendStage(Math.round((Math.min(got, totalBytes) / totalBytes) * 90), 'download');
+    };
+    sendStage(0, 'download');
+    const hopResults = await Promise.all(hops.map(async (hop, i) => {
       const url = resolveUpdateUrl(hop.url);
       if (!url) {
-        updateLog('DELTA', `hop ${i + 1} rejected — missing URL`, { hop: `${hop.fromVersion}→${hop.toVersion}` });
-        return { ok: false, error: 'hop-url-missing' };
+        return { i, hop, ok: false, error: 'hop-url-missing' };
       }
-      const dest = path.join(UPDATES_DIR(), `delta-${hop.fromVersion}-to-${hop.toVersion}-${Date.now()}.patch`);
       try { fs.mkdirSync(UPDATES_DIR(), { recursive: true }); } catch { /* exists */ }
-      sendStage(Math.round((doneBytes / totalBytes) * 90), 'download');
+      const dest = path.join(UPDATES_DIR(), `delta-${hop.fromVersion}-to-${hop.toVersion}-${Date.now()}-${i}.patch`);
       const hopStartedAt = Date.now();
-      // SPEED ROUND (0.6.65) — delta hops use the LOW-threshold parallelism
-      // profile: patches are almost always < 8 MB, so without this they fell
-      // to a single TCP stream and crawled on long-fat routes to the VPS.
-      const size = await downloadUpdateFile(url, dest, (received, total) => {
-        sendStage(Math.round(((doneBytes + Math.min(received, total)) / totalBytes) * 90), 'download');
-      }, DELTA_DOWNLOAD_OPTS);
-      const dl = await verifyDownloadedInstaller(dest, hop.sha256, size);
-      if (!dl.ok) {
-        updateLog('DELTA', `hop ${i + 1} integrity check FAILED — patch deleted, falling back to full installer`, {
+      try {
+        // SPEED ROUND 2 — hop.size from the /check manifest skips the probe
+        // round trip and starts the ranged parts immediately.
+        const size = await downloadUpdateFile(url, dest, (received, total) => {
+          perHopReceived[i] = Math.min(received, total);
+          emitAggregate();
+        }, DELTA_DOWNLOAD_OPTS, hop.size);
+        const dl = await verifyDownloadedInstaller(dest, hop.sha256, size);
+        if (!dl.ok) {
+          try { fs.unlinkSync(dest); } catch { /* keep */ }
+          return { i, hop, ok: false, error: `hop-verify-failed: ${dl.error}` };
+        }
+        perHopReceived[i] = size;
+        emitAggregate();
+        updateLog('DELTA', `hop ${i + 1}/${hops.length} downloaded + verified`, {
           hop: `${hop.fromVersion}→${hop.toVersion}`,
-          error: dl.error,
-          url,
+          bytes: size,
+          seconds: ((Date.now() - hopStartedAt) / 1000).toFixed(1),
+          speedKBps: Math.round(size / Math.max(1, Date.now() - hopStartedAt) / 1.024),
+          sha256: String(hop.sha256 || '').slice(0, 12) || 'none',
         });
+        return { i, hop, ok: true, dest, size };
+      } catch (err) {
         try { fs.unlinkSync(dest); } catch { /* keep */ }
-        return { ok: false, error: `hop-verify-failed: ${dl.error}` };
+        return { i, hop, ok: false, error: (err && err.message) || 'download-failed' };
       }
-      doneBytes += size;
-      hopFiles.push(dest);
-      updateLog('DELTA', `hop ${i + 1}/${hops.length} downloaded + verified`, {
-        hop: `${hop.fromVersion}→${hop.toVersion}`,
-        bytes: size,
-        seconds: ((Date.now() - hopStartedAt) / 1000).toFixed(1),
-        speedKBps: Math.round(size / Math.max(1, Date.now() - hopStartedAt) / 1.024),
-        sha256: String(hop.sha256 || '').slice(0, 12) || 'none',
+    }));
+
+    const failedHop = hopResults.find((r) => !r.ok);
+    if (failedHop) {
+      // Bail out EXACTLY like a single-hop failure: keep the running install
+      // intact, delete every already-downloaded patch, let the renderer fall
+      // back to the full installer.
+      for (const r of hopResults) {
+        if (r.ok && r.dest) { try { fs.unlinkSync(r.dest); } catch { /* keep */ } }
+      }
+      updateLog('DELTA', `hop ${failedHop.i + 1} FAILED — falling back to full installer`, {
+        hop: `${failedHop.hop.fromVersion}→${failedHop.hop.toVersion}`,
+        error: failedHop.error,
       });
+      return { ok: false, error: failedHop.error };
     }
+    const hopFiles = hopResults
+      .slice()
+      .sort((a, b) => a.i - b.i)
+      .map((r) => r.dest);
 
     // 3) Apply the hops in order. `currentAsar` chains: hop k+1's asar delta
     // applies to hop k's RESULT (that is what the server diffed against).

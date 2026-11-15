@@ -14,7 +14,7 @@ import {
 // Paths are built with deviceApi() — apiClient injects the gateway hint
 // (XTransformPort=3003) ONLY on gateway origins; inside Electron every call
 // targets the local API on :3080 where the real discovery routes live.
-const POLL_INTERVAL = 3000;
+const POLL_INTERVAL = 2000;
 const SLOW_POLL_INTERVAL = 30000;
 // Stop the 3s scan polling after this many consecutive failures — otherwise a
 // dead/misconfigured API gets polled FOREVER while the UI shows a fake scan.
@@ -114,6 +114,17 @@ export function useDiscoveryService(agencyId: string | undefined): DiscoveryServ
           cupsState: d.cupsState ? String(d.cupsState) : undefined,
           usbBusDevice: d.usbBusDevice ? String(d.usbBusDevice) : undefined,
           macVendor: d.macVendor ? String(d.macVendor) : undefined,
+          reverseDnsName: d.reverseDnsName ? String(d.reverseDnsName) : undefined,
+          netbiosName: d.netbiosName ? String(d.netbiosName) : undefined,
+          // 0.6.78 — identification quality + BLASTI identity + cache flag
+          confidence: typeof d.confidence === 'number' ? d.confidence : undefined,
+          identitySource: d.identitySource ? String(d.identitySource) : undefined,
+          cached: Boolean(d.cached),
+          verifiedAt: typeof d.verifiedAt === 'number' ? d.verifiedAt : undefined,
+          blastiMode: d.blastiMode ? String(d.blastiMode) : undefined,
+          blastiInfo: (d.blastiInfo && typeof d.blastiInfo === 'object')
+            ? d.blastiInfo as RealDiscoveredDevice['blastiInfo']
+            : undefined,
         }));
         setDiscoveredDevices(devices);
       }

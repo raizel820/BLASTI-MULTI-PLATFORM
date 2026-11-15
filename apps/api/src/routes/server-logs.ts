@@ -246,15 +246,20 @@ interface ServerLogEntry {
   source: string
   level: 'debug' | 'info' | 'warn' | 'error'
   message: string
+  /** 0.6.66 — true when the line carried a real timestamp (deploy logs write
+   *  "YYYY-MM-DD HH:MM:SS …" prefixes). Undated file lines fabricate "now";
+   *  time-window filters must NOT silently drop them. */
+  dated?: boolean
 }
 
 async function readJournal(
   unit: string,
-  opts: { lines: number; priority: number | null; since: string | null },
+  opts: { lines: number; priority: number | null; since: string | null; until?: string | null },
 ): Promise<ServerLogEntry[]> {
   const args = ['--unit', unit, '--no-pager', '--quiet', '--output=json', '-n', String(Math.min(opts.lines, MAX_TAIL_LINES))]
   if (opts.priority != null) args.push('--priority', String(opts.priority))
   if (opts.since) args.push('--since', opts.since)
+  if (opts.until) args.push('--until', opts.until)
   let stdout = ''
   try {
     const res = await execFileAsync('journalctl', args, { timeout: EXEC_TIMEOUT_MS, maxBuffer: MAX_BUFFER })
@@ -319,8 +324,111 @@ async function readFileTail(
           : /\b(debug|trace)\b/.test(lower)
             ? 'debug'
             : 'info'
-    return { ts, source: name, level, message: line.slice(0, 4_000) }
+    return { ts, source: name, level, message: line.slice(0, 4_000), dated: !!m }
   })
+}
+
+// ─── Reusable snapshot (0.6.66 — unified Logs Manager export) ────────────────
+
+export interface ServerSnapshotOptions {
+  /** Source ids: bare journal unit names OR "vps:<file>" / "app:<file>" ids. */
+  sources: string[]
+  /** Tail cap per source (1..MAX_TAIL_LINES). */
+  linesPerSource?: number
+  /** Entry-level filter (debug|info|warn|error). */
+  level?: string | null
+  /** Case-insensitive text filter on the message. */
+  q?: string | null
+  /** journalctl-style bounds ("2026-01-15", ISO, "-24h", …) — journal sources
+   *  get them natively; file sources are filtered on their parsed timestamps
+   *  (only when the line actually carried a date — see `dated`). */
+  since?: string | null
+  until?: string | null
+}
+
+export interface ServerSnapshotResult {
+  journalAvailable: boolean
+  generatedAt: string
+  sources: Array<{
+    id: string
+    kind: 'journal' | 'file' | 'unknown'
+    available: boolean
+    count: number
+    truncated: boolean
+    entries: ServerLogEntry[]
+  }>
+  /** Per-source read failures — never thrown, always reported. */
+  errors: Array<{ id: string; error: string }>
+}
+
+/**
+ * collectServerSnapshot — the export-bundle reader used by
+ * GET /api/logs/analysis/export (types=server). Resolves each requested
+ * source, tails it under the SAME caps as /view, and applies the level / q /
+ * time filters. Never throws: unreadable sources land in `errors`.
+ */
+export async function collectServerSnapshot(opts: ServerSnapshotOptions): Promise<ServerSnapshotResult> {
+  const linesPerSource = Math.min(Math.max(Math.round(opts.linesPerSource ?? 300) || 300, 1), MAX_TAIL_LINES)
+  const level = opts.level && ['debug', 'info', 'warn', 'error'].includes(opts.level) ? opts.level : null
+  const q = (opts.q || '').toLowerCase().slice(0, 200)
+  const since = opts.since || null
+  const until = opts.until || null
+  const journalOk = await journalAvailable()
+
+  const result: ServerSnapshotResult = {
+    journalAvailable: journalOk,
+    generatedAt: new Date().toISOString(),
+    sources: [],
+    errors: [],
+  }
+
+  const sinceMs = since ? new Date(since).getTime() : null
+  const untilMs = until ? new Date(until).getTime() : null
+  const inWindow = (e: ServerLogEntry): boolean => {
+    if (!e.dated) return true // undated file lines — keep (see `dated` note)
+    const t = new Date(e.ts).getTime()
+    if (sinceMs != null && Number.isFinite(sinceMs) && t < sinceMs) return false
+    if (untilMs != null && Number.isFinite(untilMs) && t > untilMs) return false
+    return true
+  }
+
+  const ids = (opts.sources ?? []).map((s) => String(s).trim()).filter(Boolean).slice(0, 12)
+  await Promise.all(ids.map(async (id) => {
+    const src = resolveSource(id)
+    if (!src) {
+      result.sources.push({ id, kind: 'unknown', available: false, count: 0, truncated: false, entries: [] })
+      result.errors.push({ id, error: 'Unknown or unsafe log source' })
+      return
+    }
+    if (src.kind === 'journal' && !journalOk) {
+      result.sources.push({ id, kind: 'journal', available: false, count: 0, truncated: false, entries: [] })
+      result.errors.push({ id, error: 'journalctl not available on this machine' })
+      return
+    }
+    try {
+      let entries = src.kind === 'journal'
+        ? await readJournal(src.unit, { lines: linesPerSource, priority: null, since, until })
+        : await readFileTail(src.full, src.name, { lines: linesPerSource })
+      if (src.kind === 'file') entries = entries.filter(inWindow)
+      if (level) entries = entries.filter((e) => e.level === level)
+      if (q) entries = entries.filter((e) => e.message.toLowerCase().includes(q))
+      entries.sort((a, b) => b.ts.localeCompare(a.ts))
+      const truncated = entries.length > linesPerSource
+      result.sources.push({
+        id,
+        kind: src.kind,
+        available: true,
+        count: Math.min(entries.length, linesPerSource),
+        truncated,
+        entries: entries.slice(0, linesPerSource),
+      })
+    } catch (err) {
+      result.sources.push({ id, kind: src.kind, available: false, count: 0, truncated: false, entries: [] })
+      result.errors.push({ id, error: String((err as Error).message || err).slice(0, 200) })
+    }
+  }))
+
+  return result
 }
 
 /** GET /view?source=…&lines=…&priority=…&since=…&level=…&q=… */

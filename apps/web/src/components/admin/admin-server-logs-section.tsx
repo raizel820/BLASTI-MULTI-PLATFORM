@@ -36,6 +36,7 @@ import {
 } from 'lucide-react';
 import { apiFetch } from '@/lib/api-fetch';
 import { useLanguage } from '@/hooks/use-language';
+import { AdminLogsExportDialog, type LogsExportServerSource } from '@/components/admin/admin-logs-export-dialog';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -171,6 +172,9 @@ export function AdminServerLogsSection() {
   // ── Download formats ──
   const [formats, setFormats] = useState<ServerFormat[]>([]);
   const [downloading, setDownloading] = useState<string | null>(null);
+
+  // ── 0.6.66 — unified filtered export dialog ──
+  const [exportOpen, setExportOpen] = useState(false);
 
   // ── Cross-analysis ──
   const [analysisHours, setAnalysisHours] = useState('24');
@@ -328,6 +332,13 @@ export function AdminServerLogsSection() {
     ...(sources?.files ?? []),
   ];
 
+  const exportSources: LogsExportServerSource[] = allSources.map((s) => ({
+    id: s.id,
+    label: s.label,
+    kind: s.kind,
+    available: s.available,
+  }));
+
   return (
     <div className="space-y-4">
       {/* ── Sources + viewer ── */}
@@ -364,6 +375,17 @@ export function AdminServerLogsSection() {
               >
                 <Activity className="h-4 w-4" />
                 <span className="hidden sm:inline">{t('serverLogsLive')}</span>
+              </Button>
+              {/* 0.6.66 — FILTERED export (the composer dialog): current source,
+                  level and search ride along as defaults. */}
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-9"
+                onClick={() => setExportOpen(true)}
+              >
+                <FileDown className="h-4 w-4" />
+                <span className="hidden sm:inline">{t('logsExportBtn')}</span>
               </Button>
             </div>
           </div>
@@ -649,6 +671,20 @@ export function AdminServerLogsSection() {
           )}
         </CardContent>
       </Card>
+
+      {/* ── 0.6.66 — unified filtered export (server scope) ── */}
+      <AdminLogsExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        scope="server"
+        serverSources={exportSources}
+        defaults={{
+          serverSources: selected ? [selected] : [],
+          level: levelFilter,
+          q: query,
+          serverLines: lines,
+        }}
+      />
     </div>
   );
 }

@@ -12348,6 +12348,29 @@ async function startLocalApi(dbPath, port, options) {
     console.warn('[LocalAPI] LAN authority init failed (non-fatal):', lanAuthErr?.message || lanAuthErr)
   }
 
+  // ── 0.6.78: BLASTI mDNS self-advertisement (Device Manager discovery) ──
+  // Answers mDNS queries for _blasti-kiosk._tcp / _blasti-desktop._tcp with
+  // this instance's identity so phones/PCs running the Device Manager see
+  // this machine as a typed, high-confidence BLASTI device with zero probing.
+  // Purely additive: a firewall or a busy :5353 degrades to the UDP beacon +
+  // TCP sweep, never breaks the API.
+  if (LAN_ENABLED) {
+    try {
+      const advertiser = require('./lib/discovery-scanner')
+      advertiser.startBlastiMdnsAdvertiser({
+        deviceName: `BLASTI ${os.hostname()}`.slice(0, 60),
+        deviceId: await getDeviceId(),
+        appVersion: process.env.BLASTI_APP_VERSION || '',
+        mode: 'desktop',
+        apiPort: port,
+        status: 'online',
+      })
+      console.log('[LocalAPI] BLASTI mDNS advertiser started (_blasti-desktop._tcp / _blasti-kiosk._tcp)')
+    } catch (mdnsErr) {
+      console.warn('[LocalAPI] mDNS advertiser unavailable (non-fatal):', mdnsErr?.message || mdnsErr)
+    }
+  }
+
   // ── Task 47: startup self-heal for the stale 'BASIC' tier default ─────
   // The pre-Task-32 local DDL defaulted Agency.subscriptionTier to 'BASIC',
   // so any agency row created LOCALLY (before its first sync pull) still

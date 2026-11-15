@@ -639,6 +639,43 @@ export function DeviceKiosk() {
       } catch (err) { toast.error(t('printerError')); setPrintError('Failed to communicate with printer'); }
       return;
     }
+    // 0.6.78 — LAN printer path: ask the BLASTI local API to push this ticket
+    // to the agency's saved default printer over raw TCP/ESC-POS (port 9100).
+    // Works from a browser kiosk (tablet) with no OS printer driver — the
+    // master PC on the same network does the socket work. Falls back to the
+    // browser print popup when the local API or printer is unreachable.
+    try {
+      const printRes = await apiFetch('/api/agency-devices/discovery/print', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(deviceToken ? { 'X-Device-Token': deviceToken } : {}),
+        },
+        body: JSON.stringify({
+          ticket: {
+            agencyName: ticket.agencyName,
+            branchName: ticket.branchName || undefined,
+            ticketNumber: ticket.ticketNumber,
+            lines: [
+              ticket.serviceName || '',
+              ticket.customerName ? `Customer: ${ticket.customerName}` : '',
+              ticket.joinedAt ? new Date(ticket.joinedAt).toLocaleString('en-GB') : '',
+              `Wait: ~${ticket.estimatedWaitMinutes} min`,
+            ].filter(Boolean),
+            qrData: ticket.importToken && typeof window !== 'undefined'
+              ? `${window.location.origin}/?claim=${ticket.importToken}`
+              : undefined,
+            footer: 'BLASTI',
+          },
+        }),
+      });
+      const printData = await printRes.json().catch(() => ({}));
+      if (printRes.ok && printData.success) {
+        toast.success(t('printTicket') || 'Ticket sent to printer');
+        return;
+      }
+      // Non-success — continue to the browser popup fallback below.
+    } catch { /* local API unreachable — fall back to browser print */ }
     let qrImage = ticketQrUrl;
     if (!qrImage && ticket.importToken) {
       try {

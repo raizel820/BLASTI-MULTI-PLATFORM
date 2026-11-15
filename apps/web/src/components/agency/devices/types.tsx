@@ -3,7 +3,7 @@
 // manager shipped but nothing imported (DiscoveredDevice, NetworkScanResponse,
 // DeviceStats, formatDiscoveryLastSeen…) was removed.
 
-export type DeviceType = 'TV' | 'KIOSK' | 'DISPLAY' | 'PRINTER' | 'APP' | 'PHONE' | 'ROUTER' | 'IOT';
+export type DeviceType = 'TV' | 'KIOSK' | 'DISPLAY' | 'PRINTER' | 'APP' | 'PHONE' | 'PC' | 'ROUTER' | 'IOT';
 export type ConnectionType = 'LAN' | 'WIFI' | 'CABLE' | 'MANUAL' | 'USB';
 export type DeviceStatus = 'ONLINE' | 'OFFLINE' | 'PAIRING' | 'DISABLED' | 'UPDATING';
 export type ScreenLayout =
@@ -77,7 +77,7 @@ export interface DeviceCommand {
 }
 
 // ── Discovery protocol types (contract with /discovery/* endpoints) ────────
-export type DiscoverySource = 'udp_broadcast' | 'ssdp' | 'http_probe' | 'mdns' | 'database' | 'arp' | 'ping' | 'tcp' | 'usb' | 'local';
+export type DiscoverySource = 'udp_broadcast' | 'ssdp' | 'http_probe' | 'mdns' | 'database' | 'arp' | 'ping' | 'tcp' | 'usb' | 'local' | 'ws-discovery' | 'udp-beacon';
 export type DiscoveredDeviceCategory = 'BLASTI' | 'NETWORK' | 'UPNP' | 'LOCAL';
 
 export interface RealDiscoveredDevice {
@@ -117,9 +117,20 @@ export interface RealDiscoveredDevice {
   macVendor?: string;
   reverseDnsName?: string;
   netbiosName?: string;
+  // ── 0.6.78 identification quality + BLASTI identity ──
+  /** 0-100 — how confident the classification is (self-advertised ≈ 90+). */
+  confidence?: number;
+  /** Which signal produced the identification (blasti/mdns/ssdp/tcp/oui…). */
+  identitySource?: string;
+  /** Previously discovered (from the persistent cache) — shown immediately. */
+  cached?: boolean;
+  verifiedAt?: number;
+  /** 'kiosk' | 'desktop' — for BLASTI instances. */
+  blastiMode?: string;
+  blastiInfo?: { instanceId?: string; master?: boolean; role?: string; agencyId?: string };
 }
 
-export type ScanPhase = 'idle' | 'arp' | 'ping' | 'udp' | 'ssdp' | 'mdns' | 'tcp-sweep' | 'names' | 'http' | 'https' | 'local' | 'fingerprinting' | 'beacon' | 'complete' | 'error';
+export type ScanPhase = 'idle' | 'arp' | 'ping' | 'udp' | 'ssdp' | 'mdns' | 'tcp-sweep' | 'ws-discovery' | 'names' | 'http' | 'https' | 'local' | 'fingerprinting' | 'beacon' | 'complete' | 'error';
 
 export interface ScanState {
   scanning: boolean;
@@ -247,6 +258,13 @@ export const DEVICE_TYPE_CONFIG: Record<
     labelFr: 'Téléphone',
     color: 'bg-rose-100 text-rose-700 dark:bg-rose-950/40 dark:text-rose-400',
   },
+  PC: {
+    icon: () => null,
+    labelAr: 'حاسوب',
+    labelEn: 'PC',
+    labelFr: 'PC',
+    color: 'bg-slate-100 text-slate-700 dark:bg-slate-950/40 dark:text-slate-400',
+  },
   ROUTER: {
     icon: () => null,
     labelAr: 'موجّه (راوتر)',
@@ -290,6 +308,7 @@ import {
   LayoutGrid,
   Focus,
   SunMedium,
+  Laptop,
 } from 'lucide-react';
 import { useState, useEffect, type ComponentType } from 'react';
 
@@ -300,6 +319,7 @@ export function initDeviceTypeIcons() {
   DEVICE_TYPE_CONFIG.PRINTER.icon = Printer;
   DEVICE_TYPE_CONFIG.APP.icon = Smartphone;
   DEVICE_TYPE_CONFIG.PHONE.icon = Smartphone;
+  DEVICE_TYPE_CONFIG.PC.icon = Laptop;
   DEVICE_TYPE_CONFIG.ROUTER.icon = Router;
   DEVICE_TYPE_CONFIG.IOT.icon = Cpu;
 }
@@ -436,6 +456,8 @@ export const DISCOVERY_SOURCE_CONFIG: Record<
   ssdp: { icon: Cast, labelAr: 'SSDP/UPnP', labelEn: 'UPnP', labelFr: 'UPnP', color: 'bg-amber-100 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400' },
   http_probe: { icon: Globe, labelAr: 'فحص HTTP', labelEn: 'HTTP', labelFr: 'HTTP', color: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400' },
   mdns: { icon: Wifi, labelAr: 'mDNS', labelEn: 'mDNS', labelFr: 'mDNS', color: 'bg-violet-100 text-violet-700 dark:bg-violet-950/40 dark:text-violet-400' },
+  'ws-discovery': { icon: RadioTower, labelAr: 'WS-Discovery', labelEn: 'WSD', labelFr: 'WSD', color: 'bg-indigo-50 text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-400' },
+  'udp-beacon': { icon: Radio, labelAr: 'إعلان BLASTI', labelEn: 'BLASTI beacon', labelFr: 'Balise BLASTI', color: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400' },
   database: { icon: Database, labelAr: 'قاعدة البيانات', labelEn: 'Database', labelFr: 'Base de données', color: 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400' },
   arp: { icon: Radio, labelAr: 'ARP', labelEn: 'ARP', labelFr: 'ARP', color: 'bg-sky-100 text-sky-700 dark:bg-sky-950/40 dark:text-sky-400' },
   ping: { icon: Radio, labelAr: 'Ping', labelEn: 'Ping', labelFr: 'Ping', color: 'bg-sky-100 text-sky-700 dark:bg-sky-950/40 dark:text-sky-400' },
@@ -465,6 +487,28 @@ export const staggerContainer = {
   hidden: { opacity: 0 },
   visible: { opacity: 1, transition: { staggerChildren: 0.05 } },
 };
+
+export const staggerItem = {
+  hidden: { opacity: 0, y: 8 },
+  visible: { opacity: 1, y: 0, transition: { duration: 0.3, ease: 'easeOut' as const } },
+};
+
+/** Small reception-strength bar shown on discovered-device cards. */
+export function ConnectionQualityBar({ quality }: { quality: 'excellent' | 'good' | 'fair' | 'poor' }) {
+  const bars = { excellent: 4, good: 3, fair: 2, poor: 1 }[quality] ?? 1;
+  const colors = { excellent: 'bg-emerald-500', good: 'bg-emerald-500', fair: 'bg-amber-500', poor: 'bg-red-500' };
+  return (
+    <span className="inline-flex items-end gap-0.5" title={quality} aria-label={`signal ${quality}`}>
+      {[0, 1, 2, 3].map((i) => (
+        <span
+          key={i}
+          className={`w-1 rounded-sm ${i < bars ? colors[quality] : 'bg-muted-foreground/25'}`}
+          style={{ height: `${4 + i * 3}px` }}
+        />
+      ))}
+    </span>
+  );
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -542,6 +586,7 @@ export function getScanPhaseLabelKey(phase: string): string {
     case 'tcp-sweep': return 'dmScanPhaseHttps';
     case 'mdns': return 'dmScanPhaseMdns';
     case 'ssdp': return 'dmScanPhaseSsdp';
+    case 'ws-discovery': return 'dmScanPhaseSsdp';
     case 'names': return 'dmScanPhaseArp';
     case 'http': case 'https': return 'dmScanPhaseHttp';
     case 'local': return 'dmScanPhaseHttp';

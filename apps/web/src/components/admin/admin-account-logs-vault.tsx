@@ -32,6 +32,7 @@ import {
 } from 'lucide-react';
 import { apiFetch } from '@/lib/api-fetch';
 import { useLanguage } from '@/hooks/use-language';
+import { AdminLogsExportDialog } from '@/components/admin/admin-logs-export-dialog';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -99,6 +100,9 @@ export function AdminAccountLogsVault() {
   // Raw NDJSON viewer
   const [viewer, setViewer] = useState<{ uid: string; platform: string; file: string; content: string; truncated: boolean } | null>(null);
   const [viewerLoading, setViewerLoading] = useState(false);
+
+  // 0.6.66 — unified filtered export (raw scope)
+  const [exportOpen, setExportOpen] = useState(false);
 
   const fetchFolders = useCallback(async () => {
     setLoading(true);
@@ -208,6 +212,12 @@ export function AdminAccountLogsVault() {
           <Button variant="outline" size="sm" onClick={fetchFolders} disabled={loading} className="shrink-0">
             {loading ? <Loader2 className="h-4 w-4 animate-spin me-1" /> : <RefreshCw className="h-4 w-4 me-1" />}
             {t('storageRefresh')}
+          </Button>
+          {/* 0.6.66 — filtered vault export: uid pre-filled from the open
+              account (or the grep search), platform from the open stream. */}
+          <Button variant="outline" size="sm" onClick={() => setExportOpen(true)} className="shrink-0">
+            <Download className="h-4 w-4 me-1" />
+            {t('logsExportBtn')}
           </Button>
         </div>
         {root && (
@@ -380,6 +390,16 @@ export function AdminAccountLogsVault() {
           ) : null}
         </DialogContent>
       </Dialog>
+
+      {/* ── 0.6.66 — unified filtered export (raw scope) ── */}
+      <AdminLogsExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        scope="raw"
+        defaults={{
+          uid: openUid ?? (search.trim() ? search.trim() : ''),
+        }}
+      />
     </Card>
   );
 }

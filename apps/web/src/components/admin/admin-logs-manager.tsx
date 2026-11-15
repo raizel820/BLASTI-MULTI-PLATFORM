@@ -61,6 +61,7 @@ import {
 import { AdminAccountLogsVault } from '@/components/admin/admin-account-logs-vault';
 import { AdminServerLogsSection } from '@/components/admin/admin-server-logs-section';
 import { AdminAgentLogsSection } from '@/components/admin/admin-agent-logs-section';
+import { AdminLogsExportDialog, type LogsExportScope } from '@/components/admin/admin-logs-export-dialog';
 import { LOG_TRIGGERS } from '@/lib/remote-logger';
 
 // ─── Types (mirror apps/api/src/lib/logs-analyzer.ts payloads) ───────────────
@@ -282,6 +283,15 @@ export function AdminLogsManager() {
   const [reportLoading, setReportLoading] = useState(false);
   const [copied, setCopied] = useState(false);
 
+  // 0.6.66 — unified export dialog (per-tab scopes + the Overview advanced one)
+  const [exportScope, setExportScope] = useState<LogsExportScope | null>(null);
+  const [exportDefaults, setExportDefaults] = useState<Partial<Record<string, string | string[]>>>({});
+
+  const openExport = (scope: LogsExportScope, defaults: Partial<Record<string, string | string[]>> = {}) => {
+    setExportDefaults(defaults);
+    setExportScope(scope);
+  };
+
   const filtersRef = useRef(filters);
   useEffect(() => {
     filtersRef.current = filters;
@@ -479,6 +489,18 @@ export function AdminLogsManager() {
 
         {/* ── Overview ─────────────────────────────────────────────────── */}
         <TabsContent value="overview" className="space-y-4">
+          {/* 0.6.66 — the ADVANCED EXPORT button (bordered, prominent): log
+              types multi-select + analyze type + every filter in one dialog. */}
+          <div className="flex justify-end">
+            <Button
+              variant="outline"
+              className="border-2 border-violet-400 dark:border-violet-600 hover:bg-violet-50 dark:hover:bg-violet-950/40 text-violet-700 dark:text-violet-300"
+              onClick={() => openExport('advanced')}
+            >
+              <Download className="h-4 w-4 me-1.5" />
+              {t('logsExportAdvancedBtn')}
+            </Button>
+          </div>
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <Card>
               <CardContent className="pt-4 pb-3 px-4">
@@ -663,6 +685,22 @@ export function AdminLogsManager() {
                 <Input type="date" value={filters.from} onChange={(e) => setFilters((f) => ({ ...f, from: e.target.value }))} className="w-36 h-9" dir="ltr" title={t('logsManagerFilterFrom')} />
                 <Input type="date" value={filters.to} onChange={(e) => setFilters((f) => ({ ...f, to: e.target.value }))} className="w-36 h-9" dir="ltr" title={t('logsManagerFilterTo')} />
                 <Button size="sm" className="h-9" onClick={() => fetchErrors()}>{t('logsManagerApply')}</Button>
+                {/* 0.6.66 — per-tab EXPORT button: opens the download composer
+                    pre-filled with the CURRENT tab filters. */}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-9"
+                  onClick={() => openExport('errors', {
+                    uid: filters.uid, platform: filters.platform, role: filters.role,
+                    appVersion: filters.appVersion, device: filters.device, severity: filters.severity,
+                    trigger: filters.trigger, minCount: filters.minCount, q: filters.q,
+                    from: filters.from, to: filters.to,
+                  })}
+                >
+                  <Download className="h-4 w-4 me-1" />
+                  {t('logsExportBtn')}
+                </Button>
                 {activeFilterCount > 0 && (
                   <Button size="sm" variant="ghost" className="h-9" onClick={() => { setFilters(EMPTY_FILTERS); }}>
                     <X className="h-3.5 w-3.5 me-1" />{t('logsManagerFiltersClear')} ({activeFilterCount})
@@ -742,8 +780,17 @@ export function AdminLogsManager() {
         <TabsContent value="daily" className="space-y-3">
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="text-sm">{t('logsManagerDailyTitle')}</CardTitle>
-              <CardDescription className="text-[11px]">{t('logsManagerDailyDesc')}</CardDescription>
+              <div className="flex items-start justify-between gap-2 flex-wrap">
+                <div className="min-w-0">
+                  <CardTitle className="text-sm">{t('logsManagerDailyTitle')}</CardTitle>
+                  <CardDescription className="text-[11px]">{t('logsManagerDailyDesc')}</CardDescription>
+                </div>
+                {/* 0.6.66 — per-tab EXPORT button (time range / platform). */}
+                <Button variant="outline" size="sm" className="h-8 shrink-0" onClick={() => openExport('daily')}>
+                  <Download className="h-4 w-4 me-1" />
+                  {t('logsExportBtn')}
+                </Button>
+              </div>
             </CardHeader>
             <CardContent>
               {dailyLoading && !dailyFiles ? (
@@ -907,6 +954,15 @@ export function AdminLogsManager() {
           )}
         </DialogContent>
       </Dialog>
+
+      {/* ── Unified export dialog (0.6.66 — per-tab scopes + advanced) ──── */}
+      <AdminLogsExportDialog
+        open={exportScope !== null}
+        onOpenChange={(v) => { if (!v) setExportScope(null); }}
+        scope={exportScope ?? 'advanced'}
+        triggerOptions={[...ERROR_TRIGGERS, ...Object.keys(summary?.byTrigger ?? {})]}
+        defaults={exportDefaults}
+      />
     </div>
   );
 }

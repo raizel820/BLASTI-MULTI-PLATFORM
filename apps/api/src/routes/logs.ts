@@ -9,6 +9,7 @@ import {
   rateLimitErrorResponse,
 } from '../lib/rate-limit'
 import { normalizeTrigger } from '../lib/logs-analyzer'
+import { collectServerSnapshot } from './server-logs'
 
 /**
  * BLASTI Account Log Vault (logs-1) + Logs Manager backend (logs-2 / 0.6.19).
@@ -42,6 +43,12 @@ import { normalizeTrigger } from '../lib/logs-analyzer'
  *   GET /api/logs/analysis/daily                — list daily JSON files
  *   GET /api/logs/analysis/daily/:platform/:date — the daily aggregate JSON
  *   GET /api/logs/analysis/report               — report (one bug or all)
+ *   GET /api/logs/analysis/export               — 0.6.66 UNIFIED DOWNLOAD: the
+ *             admin picks log types (errors/daily/raw/agent/server), an
+ *             analyze mode (raw/report/summary), a file format (json/md/csv/
+ *             ndjson) and every filter (time range, platform, account role,
+ *             uid, device, app version, severity, trigger, agent action/
+ *             status, server sources) — the response IS the final file.
  *   GET /api/logs            — account folders (SUPER_ADMIN)
  *   GET /api/logs/:uid       — platforms + files in one account folder
  *   GET /api/logs/:uid/:platform/:file — raw NDJSON (also legacy 2-segment)
@@ -58,6 +65,7 @@ import {
   listDailyFiles,
   readDailyFile,
   buildReport,
+  deepScanHistory,
   type AnalysisFilters,
 } from '../lib/logs-analyzer'
 
@@ -510,6 +518,607 @@ app.get('/analysis/report', async (c) => {
   const fp = c.req.query('fp') || null
   const report = buildReport(fp, analysisFiltersFromQuery(c))
   return c.json({ success: true, report })
+})
+
+// ─── Unified export (0.6.66) — the "final log" composer ──────────────────────
+//
+// GET /api/logs/analysis/export?types=errors,daily,raw,agent,server
+//                              &analyze=raw|report|summary
+//                              &format=json|md|csv|ndjson
+//                              &uid=&platform=&role=&appVersion=&device=
+//                              &severity=&trigger=&minCount=&q=&from=&to=
+//                              &range=all|1h|24h|7d|30d&limit=
+//                              &action=&status=            (agent trail)
+//                              &serverSources=&serverLines= (VPS journal/files)
+//                              &deep=1&deepMaxFiles=       (OLD logs on disk —
+//                               replay day-files older than the live 3-day
+//                               boot window into the index before collecting)
+//
+// Every "Create / update download" button in the Logs Manager (per-tab and
+// the Overview advanced dialog) rides this ONE route: the admin tunes the
+// parameters, hits download, and the response body IS the final file.
+
+const EXPORT_RAW_LIMIT_MAX = 20_000
+const EXPORT_AGENT_ROWS_MAX = 10_000
+const EXPORT_DAILY_FILES_MAX = 31
+const EXPORT_SERVER_LINES_MAX = 1_000
+// Old vaults can hold big day-files (before the 25 MB per-UID cap existed) —
+// per-file and total read budgets keep the export bounded without skipping
+// meaningful history.
+const RAW_SCAN_FILE_BYTES = 32 * 1024 * 1024
+const RAW_SCAN_TOTAL_BYTES = 128 * 1024 * 1024
+const RAW_SCAN_LINES_MAX = 80_000
+const DEEP_SCAN_DEFAULT_FILES = 600
+/** Time-range presets — hours back from now (the `range` query param). */
+const EXPORT_RANGE_HOURS: Record<string, number> = { '1h': 1, '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }
+
+interface RawExportFilters {
+  uid?: string
+  platform?: string
+  date?: string
+  level?: string
+  tag?: string
+  role?: string
+  appVersion?: string
+  device?: string
+  q?: string
+  from?: string
+  to?: string
+  limit: number
+}
+
+interface RawExportEntry {
+  ts: string
+  level: string
+  tag: string
+  message: string
+  data?: unknown
+  uid: string | null
+  username: string | null
+  role: string | null
+  platform: string
+  appVersion: string | null
+  device: string | null
+  file: string
+}
+
+/** Old logs may carry legacy role labels (AGENCY_STAFF) or different casing —
+ *  the export role (account type) filter matches BOTH vintages. */
+function roleMatches(ctxRole: string | null, want: string | undefined): boolean {
+  if (!want) return true
+  if (!ctxRole) return false
+  const a = ctxRole.toLowerCase()
+  const b = want.toLowerCase()
+  if (a === b) return true
+  if ((a === 'staff' && b === 'agency_staff') || (a === 'agency_staff' && b === 'staff')) return true
+  return false
+}
+
+/**
+ * Walk the per-UID NDJSON vault with the export filters — the same session-
+ * ctx enrichment the Logs Manager entry browser uses (a `session` envelope
+ * line carries uid/username/role/appVersion/device for the batch after it).
+ * Handles ALL layout vintages on the server: platform subfolders (0.6.19+),
+ * the legacy flat <UID>/<date>.ndjson layout, kiosk/tv/unknown platform
+ * folders, and big old day-files (bounded by the byte budgets above).
+ */
+function collectRawExportEntries(f: RawExportFilters): {
+  entries: RawExportEntry[]
+  scanned: number
+  files: number
+  truncated: boolean
+} {
+  const root = logRoot()
+  const out: RawExportEntry[] = []
+  let scanned = 0
+  let filesSeen = 0
+  let totalBytes = 0
+  let truncated = false
+
+  let accounts: string[] = []
+  try {
+    accounts = fs.readdirSync(root, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('_'))
+      .map((d) => d.name)
+  } catch {
+    return { entries: out, scanned, files: 0, truncated }
+  }
+  if (f.uid) accounts = accounts.filter((a) => a.toLowerCase().includes(f.uid!.toLowerCase()))
+
+  outer:
+  for (const uid of accounts) {
+    const accDir = path.join(root, uid)
+    let entries: fs.Dirent[] = []
+    try { entries = fs.readdirSync(accDir, { withFileTypes: true }) } catch { continue }
+    for (const entry of entries) {
+      const isPlatformDir = entry.isDirectory()
+      const isLegacy = entry.isFile() && entry.name.endsWith('.ndjson')
+      if (f.platform) {
+        if (f.platform === 'legacy' ? !isLegacy : !(isPlatformDir && entry.name === f.platform)) continue
+      }
+      const platformLabel = isPlatformDir ? entry.name : 'legacy'
+      const dir = isPlatformDir ? path.join(accDir, entry.name) : accDir
+      let names: string[] = []
+      try { names = isPlatformDir ? fs.readdirSync(dir) : [entry.name] } catch { continue }
+      for (const name of names) {
+        if (!name.endsWith('.ndjson')) continue
+        // Day-files are named YYYY-MM-DD.ndjson — the date filters ride the
+        // filename (no per-line timestamp parsing needed for the window).
+        const fileDate = name.slice(0, 10)
+        const isDated = /^\d{4}-\d{2}-\d{2}$/.test(fileDate)
+        if (f.date && (!isDated || fileDate !== f.date)) continue
+        if (f.from && isDated && fileDate < f.from) continue
+        if (f.to && isDated && fileDate > f.to) continue
+        const full = path.join(dir, name)
+        filesSeen++
+        let bytes = 0
+        try { bytes = fs.statSync(full).size } catch { continue }
+        if (bytes > RAW_SCAN_FILE_BYTES) { truncated = true; continue }
+        if (totalBytes + bytes > RAW_SCAN_TOTAL_BYTES) { truncated = true; break outer }
+        totalBytes += bytes
+        let content = ''
+        try { content = fs.readFileSync(full, 'utf8') } catch { continue }
+        // Session envelopes PRECEDE their batch in file order — attribute the
+        // context with one FORWARD pass (exact per-batch ctx, important for
+        // old files holding many batches), then collect NEWEST first.
+        const lines = content.split('\n').filter((l) => l.trim())
+        let ctx: { uid: string | null; username: string | null; role: string | null; appVersion: string | null; device: string | null } =
+          { uid: null, username: null, role: null, appVersion: null, device: null }
+        const rows: Array<{ obj: Record<string, unknown>; ctx: typeof ctx }> = []
+        for (const line of lines) {
+          scanned++
+          if (scanned > RAW_SCAN_LINES_MAX) { truncated = true; break outer }
+          let obj: Record<string, unknown>
+          try { obj = JSON.parse(line) } catch { continue }
+          if (obj.tag === 'session' && obj.data && typeof obj.data === 'object') {
+            const d = obj.data as Record<string, unknown>
+            ctx = {
+              uid: typeof d.uid === 'string' ? d.uid : ctx.uid,
+              username: typeof d.username === 'string' ? d.username : ctx.username,
+              role: typeof d.role === 'string' ? d.role : ctx.role,
+              appVersion: typeof d.appVersion === 'string' ? d.appVersion : ctx.appVersion,
+              device: typeof d.device === 'string' ? d.device : ctx.device,
+            }
+            continue
+          }
+          rows.push({ obj, ctx })
+        }
+        for (let i = rows.length - 1; i >= 0; i--) {
+          const { obj, ctx: rowCtx } = rows[i]
+          if (f.level && String(obj.level ?? '') !== f.level) continue
+          if (f.tag && String(obj.tag ?? '') !== f.tag) continue
+          if (!roleMatches(rowCtx.role, f.role)) continue
+          if (f.appVersion && rowCtx.appVersion !== f.appVersion) continue
+          if (f.device && !(rowCtx.device ?? '').toLowerCase().includes(f.device.toLowerCase())) continue
+          const message = String(obj.message ?? '')
+          if (f.q && !`${obj.tag ?? ''} ${message}`.toLowerCase().includes(f.q.toLowerCase())) continue
+          out.push({
+            ts: String(obj.ts ?? ''),
+            level: String(obj.level ?? ''),
+            tag: String(obj.tag ?? ''),
+            message,
+            data: obj.data,
+            uid: rowCtx.uid,
+            username: rowCtx.username,
+            role: rowCtx.role,
+            platform: platformLabel,
+            appVersion: rowCtx.appVersion,
+            device: rowCtx.device,
+            file: `${uid}/${platformLabel}/${name}`,
+          })
+          if (out.length >= f.limit) { truncated = true; break outer }
+        }
+      }
+    }
+  }
+  return { entries: out, scanned, files: filesSeen, truncated }
+}
+
+/** Agent-trail where-builder (mirrors translation-agent.ts /logs filters). */
+async function agentExportRows(opts: {
+  action?: string
+  status?: string
+  q?: string
+  since?: string
+  until?: string
+  limit: number
+}) {
+  const where: Record<string, unknown> = {}
+  if (opts.action) where.action = opts.action
+  if (opts.status) where.status = opts.status
+  const createdAt: Record<string, Date> = {}
+  if (opts.since) {
+    const d = new Date(opts.since)
+    if (!Number.isNaN(d.getTime())) createdAt.gte = d
+  }
+  if (opts.until) {
+    const d = new Date(opts.until)
+    if (!Number.isNaN(d.getTime())) createdAt.lte = d
+  }
+  if (Object.keys(createdAt).length) where.createdAt = createdAt
+  if (opts.q) {
+    where.AND = [{
+      OR: [
+        { summary: { contains: opts.q, mode: 'insensitive' as const } },
+        { details: { contains: opts.q, mode: 'insensitive' as const } },
+      ],
+    }]
+  }
+  return db.translationAgentLog.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    take: Math.min(opts.limit, EXPORT_AGENT_ROWS_MAX),
+  })
+}
+
+function csvCell(v: unknown): string {
+  const s = v instanceof Date ? v.toISOString() : String(v ?? '')
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
+}
+
+/** GET /api/logs/analysis/export — see the block comment above. */
+app.get('/analysis/export', async (c) => {
+  try { await requireRole(c, 'SUPER_ADMIN') } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error }, err.status as any)
+  }
+  const q = (name: string) => (c.req.query(name) || '').trim()
+
+  // ── Resolve types ──
+  const ALL_TYPES = ['errors', 'daily', 'raw', 'agent', 'server'] as const
+  const typesRaw = q('types') || ALL_TYPES.join(',')
+  const types = new Set<string>(
+    typesRaw.split(',').map((s) => s.trim()).filter((s) => (ALL_TYPES as readonly string[]).includes(s)),
+  )
+  if (types.size === 0) return c.json({ success: false, error: 'types must include at least one of: errors, daily, raw, agent, server' }, 400)
+
+  // ── Resolve analyze + format ──
+  const analyzeRaw = q('analyze') || 'raw'
+  const analyze = ['raw', 'report', 'summary'].includes(analyzeRaw) ? analyzeRaw : 'raw'
+  const formatRaw = q('format') || 'json'
+  const format = ['json', 'md', 'csv', 'ndjson'].includes(formatRaw) ? formatRaw : 'json'
+  if (format === 'csv' && types.size > 1) {
+    return c.json({ success: false, error: 'CSV export needs exactly ONE log type — pick a single type or use json/md' }, 400)
+  }
+  if (format === 'ndjson' && !(types.size === 1 && types.has('raw'))) {
+    return c.json({ success: false, error: 'NDJSON export applies to the raw type only' }, 400)
+  }
+
+  // ── Resolve the time window: preset range wins only when from/to absent ──
+  const range = q('range') || 'all'
+  const rangeHours = EXPORT_RANGE_HOURS[range]
+  const from = q('from') || (rangeHours ? new Date(Date.now() - rangeHours * 3_600_000).toISOString().slice(0, 10) : '')
+  const to = q('to') || ''
+  const rangeLabel = rangeHours ? range : from || to ? 'custom' : 'all'
+
+  const limitRaw = Number(q('limit')) || 0
+  const limit = Math.max(1, Math.min(limitRaw || 5_000, EXPORT_RAW_LIMIT_MAX))
+
+  const filters = {
+    uid: q('uid') || undefined,
+    platform: q('platform') || undefined,
+    role: q('role') || undefined,
+    appVersion: q('appVersion') || undefined,
+    device: q('device') || undefined,
+    severity: q('severity') || undefined,
+    trigger: q('trigger') || undefined,
+    minCount: q('minCount') ? Number(q('minCount')) || undefined : undefined,
+    q: q('q') || undefined,
+    from: from || undefined,
+    to: to || undefined,
+  }
+
+  const bundle: Record<string, unknown> = {
+    generatedAt: new Date().toISOString(),
+    analyze,
+    filters,
+    range: rangeLabel,
+    types: [...types],
+    summary: analysisSummary(),
+  }
+
+  // ── Deep scan (OLD logs) ──
+  // bootBackfill only replays the last 3 days at boot — everything older sits
+  // on disk unseen by the index. deep=1 replays the requested window's
+  // day-files (both layouts, idempotent via _analysis/deepscan.json markers)
+  // BEFORE any section is collected, so errors + daily aggregates include the
+  // FULL history on the server. The raw section never needs it (it walks the
+  // whole vault directly).
+  if (q('deep') === '1') {
+    const deepMaxFiles = Math.max(1, Math.min(Number(q('deepMaxFiles')) || DEEP_SCAN_DEFAULT_FILES, 5_000))
+    try {
+      bundle.deepScan = deepScanHistory(logRoot(), { from: from || undefined, to: to || undefined, maxFiles: deepMaxFiles })
+      // Counts may have changed — refresh the summary AFTER the replay.
+      bundle.summary = analysisSummary()
+    } catch { /* never fail the export because of the deep scan */ }
+  }
+
+  // ── errors ──
+  if (types.has('errors')) {
+    const errFilters = {
+      ...filters,
+      minCount: filters.minCount,
+      limit: Math.min(limit, 500),
+    } as AnalysisFilters
+    if (analyze === 'summary') {
+      const top = queryErrors(errFilters)
+      bundle.errors = {
+        total: top.total,
+        topBugs: top.errors.slice(0, 20).map((b) => ({
+          fp: b.fp, tag: b.tag, level: b.level, count: b.count, severity: b.severity,
+          severityScore: b.severityScore, lastSeen: b.lastSeen, message: b.message,
+        })),
+      }
+    } else {
+      const top = queryErrors(errFilters)
+      bundle.errors = { total: top.total, updatedAt: top.updatedAt, bugs: top.errors }
+    }
+  }
+
+  // ── daily ──
+  if (types.has('daily')) {
+    const all = listDailyFiles().filter((f) => {
+      if (filters.platform && f.platform !== filters.platform) return false
+      if (from && f.date < from) return false
+      if (to && f.date > to) return false
+      return true
+    })
+    const files = analyze === 'summary'
+      ? all.slice(0, EXPORT_DAILY_FILES_MAX)
+      : all.slice(0, EXPORT_DAILY_FILES_MAX).map((f) => {
+          let content: unknown = null
+          try { content = JSON.parse(readDailyFile(f.platform, f.date) ?? 'null') } catch { content = null }
+          return { ...f, content }
+        })
+    bundle.daily = {
+      count: all.length,
+      truncated: all.length > files.length,
+      files,
+    }
+  }
+
+  // ── raw (per-UID NDJSON vault) ──
+  if (types.has('raw')) {
+    if (analyze === 'summary') {
+      bundle.raw = { note: 'raw entries are excluded in summary mode — use analyze=raw or report' }
+    } else {
+      const scan = collectRawExportEntries({
+        ...filters,
+        level: q('level') || undefined,
+        tag: q('tag') || undefined,
+        date: q('date') || undefined,
+        limit: analyze === 'report' ? Math.min(limit, 2_000) : limit,
+      })
+      bundle.raw = scan
+    }
+  }
+
+  // ── agent (translation agent trail — DB rows) ──
+  if (types.has('agent')) {
+    const since = from ? `${from}T00:00:00.000Z` : rangeHours ? new Date(Date.now() - rangeHours * 3_600_000).toISOString() : ''
+    const until = to ? `${to}T23:59:59.999Z` : ''
+    if (analyze === 'summary') {
+      const [total, errors, byActionRaw] = await Promise.all([
+        db.translationAgentLog.count(),
+        db.translationAgentLog.count({ where: { status: 'error' } }),
+        db.translationAgentLog.groupBy({ by: ['action'], _count: { _all: true } }),
+      ])
+      const byAction: Record<string, number> = {}
+      for (const g of byActionRaw) byAction[g.action] = g._count._all
+      bundle.agent = { total, errors, byAction, since: since || null, until: until || null }
+    } else {
+      const rows = await agentExportRows({ action: q('action') || undefined, status: q('status') || undefined, q: filters.q, since, until, limit })
+      bundle.agent = { count: rows.length, truncated: rows.length >= EXPORT_AGENT_ROWS_MAX, since: since || null, until: until || null, rows }
+    }
+  }
+
+  // ── server (VPS journal + deploy/file logs) ──
+  if (types.has('server')) {
+    const serverSources = q('serverSources')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 12)
+    const serverLines = Math.max(1, Math.min(Number(q('serverLines')) || 300, EXPORT_SERVER_LINES_MAX))
+    // Journal bounds: journalctl understands both "YYYY-MM-DD" and ISO.
+    const since = from || (rangeHours ? `-${rangeHours}h` : '')
+    const snapshot = await collectServerSnapshot({
+      sources: serverSources,
+      linesPerSource: serverLines,
+      level: q('level') || null,
+      q: filters.q ?? null,
+      since: since || null,
+      until: to || null,
+    })
+    if (analyze === 'summary') {
+      bundle.server = {
+        journalAvailable: snapshot.journalAvailable,
+        generatedAt: snapshot.generatedAt,
+        errors: snapshot.errors,
+        sources: snapshot.sources.map((s) => ({
+          id: s.id, kind: s.kind, available: s.available, count: s.count, truncated: s.truncated,
+          errorWarn: s.entries.filter((e) => e.level === 'error' || e.level === 'warn').length,
+        })),
+      }
+    } else {
+      bundle.server = snapshot
+    }
+  }
+
+  // ── Render ──
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+  const base = `blasti-logs_${[...types].join('+')}_${rangeLabel}_${stamp}`
+
+  if (format === 'json') {
+    return new Response(JSON.stringify(bundle, null, 2), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${base}.json"`,
+        'Cache-Control': 'no-store',
+      },
+    })
+  }
+
+  if (format === 'ndjson') {
+    const scan = bundle.raw as { entries: RawExportEntry[] } | undefined
+    const lines = (scan?.entries ?? []).map((e) => JSON.stringify(e))
+    return new Response(lines.join('\n') + '\n', {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/x-ndjson; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${base}.ndjson"`,
+        'Cache-Control': 'no-store',
+      },
+    })
+  }
+
+  if (format === 'csv') {
+    const type = [...types][0]
+    const COLS: Record<string, readonly string[]> = {
+      errors: ['fp', 'tag', 'level', 'severity', 'severityScore', 'count', 'firstSeen', 'lastSeen', 'message', 'platforms', 'roles', 'uids', 'devices', 'triggers'],
+      daily: ['platform', 'date', 'bytes', 'totals.entries', 'totals.errors', 'totals.warns', 'totals.accounts', 'updatedAt'],
+      raw: ['ts', 'level', 'tag', 'message', 'uid', 'username', 'role', 'platform', 'appVersion', 'device', 'file'],
+      agent: ['createdAt', 'action', 'status', 'summary', 'refType', 'refId', 'actor', 'provider', 'durationMs'],
+      server: ['ts', 'source', 'level', 'message'],
+    }
+    const rowsOf = (b: Record<string, unknown>): Array<Record<string, unknown>> => {
+      if (type === 'errors') {
+        const sec = b.errors as { bugs?: Array<Record<string, unknown>> } | undefined
+        return (sec?.bugs ?? []).map((bug) => ({
+          ...bug,
+          platforms: ((bug.affected as { platforms?: string[] })?.platforms ?? []).join('|'),
+          roles: ((bug.affected as { roles?: string[] })?.roles ?? []).join('|'),
+          uids: ((bug.affected as { uids?: string[] })?.uids ?? []).join('|'),
+          devices: ((bug.affected as { devices?: string[] })?.devices ?? []).join('|'),
+          triggers: ((bug.affected as { triggers?: string[] })?.triggers ?? []).join('|'),
+          affected: undefined,
+          samples: undefined,
+        }))
+      }
+      if (type === 'daily') {
+        const sec = b.daily as { files?: Array<Record<string, unknown>> } | undefined
+        return (sec?.files ?? []).map((f) => {
+          const content = (f.content ?? {}) as { totals?: Record<string, unknown>; updatedAt?: string }
+          return {
+            platform: f.platform, date: f.date, bytes: f.bytes,
+            'totals.entries': content.totals?.entries, 'totals.errors': content.totals?.errors,
+            'totals.warns': content.totals?.warns, 'totals.accounts': content.totals?.accounts,
+            updatedAt: content.updatedAt,
+          }
+        })
+      }
+      if (type === 'raw') return ((b.raw as { entries?: RawExportEntry[] })?.entries ?? []) as unknown as Array<Record<string, unknown>>
+      if (type === 'agent') return (((b.agent as { rows?: unknown[] })?.rows ?? []) as Array<Record<string, unknown>>)
+      // server — flatten the per-source entries
+      const snap = b.server as { sources?: Array<{ id: string; entries: Array<Record<string, unknown>> }> } | undefined
+      return (snap?.sources ?? []).flatMap((s) => (s.entries ?? []).map((e) => ({ ...e, source: e.source ?? s.id })))
+    }
+    const rows = rowsOf(bundle)
+    const lines = [COLS[type].join(',')]
+    for (const row of rows) lines.push(COLS[type].map((col) => csvCell(row[col])).join(','))
+    // UTF-8 BOM → Excel renders Arabic messages correctly.
+    return new Response('\uFEFF' + lines.join('\r\n'), {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${base}.csv"`,
+        'Cache-Control': 'no-store',
+      },
+    })
+  }
+
+  // ── markdown ──
+  const s = bundle.summary as ReturnType<typeof analysisSummary>
+  const md: string[] = [
+    '# BLASTI Logs Export',
+    '',
+    `- Generated: ${bundle.generatedAt}`,
+    `- Log types: ${[...types].join(', ')}`,
+    `- Analyze mode: ${analyze}`,
+    `- Time range: ${rangeLabel}${from ? ` (from ${from})` : ''}${to ? ` (to ${to})` : ''}`,
+    `- Filters: ${JSON.stringify(filters)}`,
+    `- Tracked bugs: ${s.totalErrors} (last 24h: ${s.last24h})`,
+    `- By severity: ${Object.entries(s.bySeverity).map(([k, v]) => `${k}=${v}`).join(', ')}`,
+    `- By platform: ${Object.entries(s.byPlatform).map(([k, v]) => `${k}=${v}`).join(', ')}`,
+    `- By trigger: ${Object.entries(s.byTrigger).map(([k, v]) => `${k}=${v}`).join(', ') || 'n/a'}`,
+    '',
+    '---',
+    '',
+  ]
+  if (types.has('errors')) {
+    const sec = bundle.errors as { total: number; bugs?: Array<Record<string, unknown>>; topBugs?: Array<Record<string, unknown>> }
+    const bugs = (sec.bugs ?? sec.topBugs ?? []) as Array<{
+      severity: string; tag: string; count: number; fp: string; level: string; message: string
+      firstSeen?: string; lastSeen: string; affected?: Record<string, string[] | undefined>
+    }>
+    md.push(`## Errors — ${sec.total} tracked bug(s), showing ${bugs.length}`, '')
+    for (const b of bugs) {
+      md.push(
+        `### [${b.severity}] ${b.tag} — ${b.count} hit(s)`,
+        '',
+        `- Fingerprint: \`${b.fp}\` · Level: ${b.level} · Last seen: ${b.lastSeen}`,
+        b.affected ? `- Platforms: ${(b.affected.platforms ?? []).join(', ')} · Roles: ${(b.affected.roles ?? []).join(', ')} · Triggers: ${(b.affected.triggers ?? []).join(', ') || 'n/a'}` : '',
+        b.affected ? `- Devices: ${(b.affected.devices ?? []).slice(0, 5).join(' | ')}` : '',
+        '',
+        'Latest message:',
+        '```',
+        b.message,
+        '```',
+        '',
+      )
+    }
+  }
+  if (types.has('daily')) {
+    const sec = bundle.daily as { count: number; truncated: boolean; files: Array<{ platform: string; date: string; bytes: number; content?: { totals?: Record<string, number>; updatedAt?: string } }> }
+    md.push(`## Daily aggregates — ${sec.count} file(s)${sec.truncated ? ' (truncated)' : ''}`, '')
+    for (const f of sec.files) {
+      const t = f.content?.totals
+      md.push(`### ${f.platform} · ${f.date}`, '', t ? `- entries=${t.entries} errors=${t.errors} warns=${t.warns} accounts=${t.accounts}` : '- (no content)', '')
+    }
+  }
+  if (types.has('raw')) {
+    const sec = bundle.raw as { entries?: RawExportEntry[]; scanned?: number; truncated?: boolean }
+    const entries = sec.entries ?? []
+    md.push(`## Raw entries — ${entries.length} row(s)${sec.truncated ? ' (TRUNCATED — raise the row limit)' : ''}`, '')
+    for (const e of entries.slice(0, 500)) {
+      md.push(`- \`${e.ts}\` **${e.level}** [${e.tag}] (${e.platform}${e.uid ? ` · ${e.uid}` : ''}${e.role ? ` · ${e.role}` : ''}) ${e.message.replace(/\n/g, ' ').slice(0, 400)}`)
+    }
+    md.push('')
+  }
+  if (types.has('agent')) {
+    const sec = bundle.agent as { count?: number; total?: number; errors?: number; byAction?: Record<string, number>; rows?: Array<{ createdAt: Date | string; action: string; status: string; summary: string; actor: string; provider?: string | null; durationMs?: number | null }> }
+    if (sec.rows) {
+      md.push(`## Translation agent trail — ${sec.count} row(s)`, '')
+      for (const r of sec.rows) {
+        md.push(`- \`${typeof r.createdAt === 'string' ? r.createdAt : r.createdAt.toISOString()}\` **${r.action}** · ${r.status.toUpperCase()} — ${r.summary.slice(0, 300)}`)
+      }
+      md.push('')
+    } else {
+      md.push(`## Translation agent trail — total ${sec.total ?? 0}, errors ${sec.errors ?? 0}`, '', `Actions: ${JSON.stringify(sec.byAction ?? {})}`, '')
+    }
+  }
+  if (types.has('server')) {
+    const sec = bundle.server as { journalAvailable: boolean; sources: Array<{ id: string; kind: string; available: boolean; count: number; truncated: boolean; entries: Array<{ ts: string; source: string; level: string; message: string }> }>; errors: Array<{ id: string; error: string }> }
+    md.push(`## Server logs — journal ${sec.journalAvailable ? 'available' : 'NOT available'}`, '')
+    for (const e of sec.errors) md.push(`- ⚠ ${e.id}: ${e.error}`)
+    for (const src of sec.sources) {
+      md.push(`### ${src.id} (${src.kind}) — ${src.count} line(s)${src.truncated ? ' (truncated)' : ''}${src.available ? '' : ' · UNAVAILABLE'}`, '')
+      for (const e of src.entries.slice(0, 300)) {
+        md.push(`- \`${e.ts}\` **${e.level}** ${e.message.replace(/\n/g, ' ').slice(0, 300)}`)
+      }
+      md.push('')
+    }
+  }
+
+  return new Response(md.filter((l) => l !== undefined).join('\n'), {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/markdown; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${base}.md"`,
+      'Cache-Control': 'no-store',
+    },
+  })
 })
 
 /** GET /api/logs/analysis/errors/:fp — full detail for ONE bug. */

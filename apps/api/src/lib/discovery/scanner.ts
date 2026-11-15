@@ -30,9 +30,18 @@ import { Buffer } from 'node:buffer'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
-export type DiscoverySource = 'arp' | 'ping' | 'tcp-sweep' | 'mdns' | 'ssdp' | 'http_probe' | 'usb' | 'local' | 'udp-beacon'
+export type DiscoverySource = 'arp' | 'ping' | 'tcp-sweep' | 'mdns' | 'ssdp' | 'ws-discovery' | 'http_probe' | 'usb' | 'local' | 'udp-beacon'
 export type DeviceCategory = 'BLASTI' | 'NETWORK' | 'UPNP' | 'LOCAL'
-export type DeviceType = 'TV' | 'KIOSK' | 'DISPLAY' | 'PRINTER' | 'APP' | 'PHONE' | 'ROUTER' | 'IOT' | 'UNKNOWN'
+export type DeviceType = 'TV' | 'KIOSK' | 'DISPLAY' | 'PRINTER' | 'APP' | 'PHONE' | 'ROUTER' | 'IOT' | 'PC' | 'UNKNOWN'
+
+/** 0.6.78 — BLASTI LAN-authority extras surfaced by the beacon payload or
+ *  the /api/discover identification probe. */
+export interface BlastiDeviceInfo {
+  instanceId?: string
+  master?: boolean
+  role?: string
+  agencyId?: string
+}
 
 export interface DiscoveredDeviceRaw {
   id: string
@@ -91,10 +100,25 @@ export interface DiscoveredDeviceRaw {
    *  'smb' | 'rdp' | 'wsd' (Windows PC), 'airplay', 'googlecast',
    *  'ios-sync' (iPhone/iPad), 'jetdirect' (printer), 'roku', 'http-alt'. */
   tcpServices?: string[]
+  /** 0.6.78 — identification strength (0-100) and the evidence source that
+   *  produced the strongest identity signal ('usb' | 'blasti' | 'ssdp' |
+   *  'mdns' | 'tcp' | 'ws-discovery' | 'http' | 'oui' | 'arp'). */
+  confidence?: number
+  identitySource?: string
+  identitySourcePriority?: number
+  /** 0.6.78 — BLASTI self-identification (kiosk vs desktop mode, app
+   *  version, LAN-authority role). Set by beacons, mDNS TXT or the
+   *  /api/discover probe. */
+  blastiMode?: string
+  appVersion?: string
+  blastiInfo?: BlastiDeviceInfo
+  /** WS-Discovery device class from the ProbeMatch Types field
+   *  ('PC' | 'PRINTER' | 'TV'). */
+  wsdType?: string
 }
 
 export type ScanPhase =
-  | 'idle' | 'beacon' | 'arp' | 'ping' | 'mdns' | 'ssdp' | 'tcp-sweep' | 'names'
+  | 'idle' | 'beacon' | 'arp' | 'ping' | 'mdns' | 'ssdp' | 'ws-discovery' | 'tcp-sweep' | 'names'
   | 'http' | 'local' | 'fingerprinting' | 'complete' | 'error'
 
 export interface ScanProgress {
@@ -114,7 +138,12 @@ export interface ScanCallbacks {
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
-/** Expanded port set — covers web apps + printers + TVs + media streamers. */
+/** Expanded port set — covers web apps + printers + TVs + media streamers.
+ *  0.6.78 redesign: this list is now EVIDENCE-ONLY — the HTTP probe runs
+ *  against (ip, port) pairs whose TCP connect already succeeded, plus the
+ *  BLASTI API port on every responsive host. The old probe-everything sweep
+ *  (254 IPs × 13 ports, fetch with a hard timeout on silent firewalls) was
+ *  the single biggest reason a scan could run past 5 minutes. */
 export const SCAN_PORTS = [
   80,    // router admin / printer web UI
   443,   // HTTPS
@@ -122,6 +151,7 @@ export const SCAN_PORTS = [
   9100,  // raw print / HP JetDirect
   3000,  // BLASTI API / dev servers
   3003,  // BLASTI API
+  3080,  // BLASTI local API (desktop / kiosk shell)
   5000,  // UPnP / synology / dev
   8001,  // Samsung TV
   8060,  // Roku
@@ -130,6 +160,21 @@ export const SCAN_PORTS = [
   9197,  // Samsung TV (legacy)
   49152, // UPnP ephemeral
 ]
+
+/** Ports that identify a BLASTI instance when they answer HTTP. */
+export const BLASTI_API_PORTS = new Set([3000, 3003, 3080])
+
+/** Hard budget for one full scan. When the wall clock passes this point the
+ *  orchestrator skips whatever enrichment stages are left and emits
+ *  'complete' with everything gathered so far. 0.6.78 redesign target:
+ *  a healthy /24 finishes in 10-20s; the deadline only guards pathological
+ *  networks (silent-dropping firewalls, satellite links, …). */
+export const SCAN_DEADLINE_MS = 25000
+/** Budget for the concurrent first stage (ping + tcp sweep + mDNS + SSDP +
+ *  WS-Discovery + beacon). Everything else keys off the overall deadline. */
+const FAST_STAGE_MAX_MS = 12000
+/** Cap on (ip, port) HTTP identification probes per scan. */
+const HTTP_PROBE_CAP = 384
 
 /** Ports in SCAN_PORTS that speak TLS — they get a raw TLS handshake probe
  *  instead of a plain-HTTP fetch, which can never succeed against them and
@@ -161,7 +206,11 @@ const SSDP_TIMEOUT_MS = 3000
 // nothing on the HTTP scan ports; their hallmark services (SMB 445, RDP 3389,
 // WSD 5357) and phone/cast ports (iOS sync 62078, AirPlay 7000, Chromecast
 // 8008/8009) are probed here with raw net.Socket connect attempts.
-const TCP_SWEEP_CONCURRENCY = 128
+// 0.6.78 redesign: this sweep is now the PRIMARY discovery probe (raw TCP
+// connects are ~100× cheaper than fetch attempts against silent firewalls);
+// it also feeds the evidence-based HTTP identification stage, so the union of
+// SCAN_PORTS and these hallmark ports is swept here.
+const TCP_SWEEP_CONCURRENCY = 192
 // 0.6.75: 1200→700ms — a TCP connect is one SYN→SYN-ACK round trip on a LAN;
 // only unreachable hosts ever hit the ceiling, and they cost the sweep 128
 // sockets in parallel anyway.
@@ -169,21 +218,67 @@ const TCP_SWEEP_TIMEOUT_MS = 700
 /** Hard cap on the whole tcp-sweep window (all subnets × all ports). */
 const TCP_SWEEP_MAX_WINDOW_MS = 9000
 
-/** TCP ports probed by the tcp-sweep phase and how a hit is classified. */
+/** TCP ports probed by the tcp-sweep phase and how a hit is classified.
+ *  0.6.78: this set is the UNION of the old hallmark ports and SCAN_PORTS —
+ *  one raw-connect sweep now produces all the evidence the HTTP stage needs
+ *  (ports 80/443/631/3003/8001/8443/9197 were previously only reachable via
+ *  the blind 254×13 fetch sweep that made scans take >5 minutes). */
 export const TCP_SWEEP_PORTS: Array<{ port: number; service: string }> = [
+  { port: 80, service: 'http' },        // router admin / printer web UI
+  { port: 443, service: 'https' },      // HTTPS (TLS probe in stage C)
+  { port: 631, service: 'ipp' },        // IPP (printers)
   { port: 445, service: 'smb' },        // Windows PC (file sharing)
+  { port: 3003, service: 'blasti-api' },// BLASTI API
   { port: 3389, service: 'rdp' },       // Windows PC / Server (Remote Desktop)
   { port: 5357, service: 'wsd' },       // Windows device (WSD web services)
   { port: 7000, service: 'airplay' },   // Apple TV / AirPlay
+  { port: 8001, service: 'samsung-tv' },// Samsung TV
   { port: 8008, service: 'googlecast' },// Chromecast / Android TV
   { port: 8009, service: 'googlecast' },// Chromecast / Android TV
   { port: 62078, service: 'ios-sync' }, // iPhone / iPad (lockdownd sync port)
   { port: 9100, service: 'jetdirect' }, // raw print / HP JetDirect
   { port: 8060, service: 'roku' },      // Roku TV (ECP)
   { port: 8080, service: 'http-alt' },  // generic alt HTTP
+  { port: 8443, service: 'https-alt' }, // alt HTTPS (TLS probe in stage C)
+  { port: 9197, service: 'samsung-tv' },// Samsung TV (legacy)
   { port: 3000, service: 'http-alt' },  // generic HTTP / dev servers
   { port: 5000, service: 'http-alt' },  // generic HTTP / UPnP
   { port: 49152, service: 'http-alt' }, // generic UPnP ephemeral
+  { port: 3080, service: 'blasti-api' },// BLASTI desktop / kiosk local API
+]
+
+// WS-Discovery ('ws-discovery') — the protocol Windows PCs, network printers
+// and NAS boxes actually ANSWER. One multicast UDP Probe on 239.255.255.250:3702
+// returns typed XML (Device/Printer/…) from hosts that ignore ping, mDNS and
+// SSDP. No privileges required. (0.6.78)
+const WSD_ADDR = '239.255.255.250'
+const WSD_PORT = 3702
+const WSD_TIMEOUT_MS = 2000
+const WSD_PROBE_XML =
+  '<?xml version="1.0" encoding="utf-8"?>' +
+  '<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" ' +
+  'xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing" ' +
+  'xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery">' +
+  '<soap:Header>' +
+  '<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</wsa:Action>' +
+  '<wsa:MessageID>urn:uuid:blasti-probe-1</wsa:MessageID>' +
+  '<wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>' +
+  '</soap:Header>' +
+  '<soap:Body>' +
+  '<wsd:Probe><wsd:Types/></wsd:Probe>' +
+  '</soap:Body>' +
+  '</soap:Envelope>'
+
+// ─── BLASTI mDNS advertiser (0.6.78) ────────────────────────────────────────────
+// The desktop / kiosk shell answers mDNS PTR queries for
+//   _blasti-kiosk._tcp.local  (app running in kiosk mode)
+//   _blasti-desktop._tcp.local (app running as desktop / counter PC)
+// with SRV + TXT records carrying {deviceType, deviceName, deviceId,
+// appVersion, mode, apiPort, status}. The Device Manager picks these up as
+// high-confidence BLASTI devices — no port probing required.
+const MDNS_BLASTI_SERVICES = [
+  { type: '_blasti-kiosk._tcp.local', mode: 'kiosk' },
+  { type: '_blasti-desktop._tcp.local', mode: 'desktop' },
 ]
 
 const MDNS_ADDR = '224.0.0.251'
@@ -205,6 +300,9 @@ const BEACON_LISTEN_MS = 2000
  * they ignore a generic `_services._dns-sd._udp.local` enumeration query. */
 const MDNS_SERVICE_TYPES = [
   '_services._dns-sd._udp.local',     // enumerate all advertised services
+  // ── BLASTI self-advertisement (answered by the embedded mDNS responder) ──
+  '_blasti-kiosk._tcp.local',          // BLASTI app in kiosk mode (0.6.78)
+  '_blasti-desktop._tcp.local',        // BLASTI desktop / counter PC (0.6.78)
   '_ipp._tcp.local',                   // printers (IPP)
   '_ipps._tcp.local',                  // printers (IPPS)
   '_printer._tcp.local',               // printers (LPD)
@@ -1312,6 +1410,329 @@ function parseSsdpResponse(text: string, ip: string, port: number): SsdpRecord |
     usn: headers['USN'] || '',
     ip,
     port,
+  }
+}
+
+// ─── 3b. WS-Discovery (Windows PCs / network printers / NAS) (0.6.78) ───────
+
+/** One WS-Discovery ProbeMatch, deduped per responder IP. */
+export interface WsDiscoveryMatch {
+  ip: string
+  port: number
+  /** Device class derived from the Types field: 'PC' | 'PRINTER' | 'TV'. */
+  type: string
+  name?: string
+  /** Raw wsdp:Types string from the ProbeMatch. */
+  types: string
+  source: 'ws-discovery'
+}
+
+export interface ParsedWsDiscoveryXml {
+  types: string
+  type: string
+  name?: string
+  ip?: string
+  port: number
+  xaddrs: string
+}
+
+/**
+ * Extract a human-readable name + device class from a WS-Discovery
+ * ProbeMatch XML blob. Windows sends `<wsd:Types>` like
+ * "dn:Computer" / "pn:Printer" plus XAddrs with the transport URL.
+ */
+export function parseWsDiscoveryXml(text: string): ParsedWsDiscoveryXml {
+  const tag = (name: string): string => {
+    const m = text.match(new RegExp(`<(?:[\\w-]+:)?${name}[^>]*>([\\s\\S]*?)</(?:[\\w-]+:)?${name}>`, 'i'))
+    return m ? m[1].trim() : ''
+  }
+  const types = tag('Types')
+  const xaddrs = tag('XAddrs')
+  const name = cleanReverseDnsHostname(tag('EndpointReference').split(/\s+/)[0] || '') || undefined
+  let type = 'PC'
+  if (/printer|pn:/i.test(types)) type = 'PRINTER'
+  else if (/mediaserver|mediarenderer| Basic:/i.test(types)) type = 'TV'
+  const xaddrMatch = xaddrs.match(/https?:\/\/([^:/]+)(?::(\d+))?/)
+  const ip = xaddrMatch ? xaddrMatch[1] : undefined
+  const port = xaddrMatch && xaddrMatch[2] ? parseInt(xaddrMatch[2], 10) : 80
+  return { types, type, name, ip, port, xaddrs }
+}
+
+/**
+ * One multicast WS-Discovery Probe on 239.255.255.250:3702. Resolves the
+ * deduped match list after `timeoutMs` (devices answer within ~1s).
+ * Windows PCs, WSD-capable printers and many NAS devices respond here even
+ * when they ignore ICMP, mDNS and SSDP.
+ */
+export function wsDiscover(
+  opts: { timeoutMs?: number; isAborted?: () => boolean } = {},
+): Promise<WsDiscoveryMatch[]> {
+  const timeoutMs = opts.timeoutMs ?? WSD_TIMEOUT_MS
+  const isAborted = opts.isAborted ?? (() => false)
+  return new Promise((resolve) => {
+    const found = new Map<string, WsDiscoveryMatch>()
+    let settled = false
+    let sock: dgram.Socket | null = null
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearInterval(abortPoll)
+      clearTimeout(timer)
+      try { sock?.close() } catch { /* already closed */ }
+      resolve(Array.from(found.values()))
+    }
+    const abortPoll = setInterval(() => { if (isAborted()) finish() }, 150)
+    const timer = setTimeout(finish, timeoutMs)
+    try {
+      sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+      sock.on('error', () => finish())
+      sock.on('message', (msg: Buffer, rinfo: dgram.RemoteInfo) => {
+        try {
+          const text = msg.toString('utf8')
+          if (!/ProbeMatch/i.test(text)) return
+          const parsed = parseWsDiscoveryXml(text)
+          if (!parsed.ip) {
+            // No XAddrs — fall back to the responder's source address
+            if (!rinfo || !rinfo.address) return
+            parsed.ip = rinfo.address
+            parsed.port = 80
+          }
+          const key = `${parsed.ip}`
+          if (!found.has(key)) {
+            found.set(key, { ip: parsed.ip, port: parsed.port, type: parsed.type, name: parsed.name, types: parsed.types, source: 'ws-discovery' })
+          }
+        } catch { /* malformed XML — ignore */ }
+      })
+      sock.bind(() => {
+        try { sock?.setBroadcast(true) } catch { /* ignore */ }
+        const probe = Buffer.from(WSD_PROBE_XML)
+        sock?.send(probe, 0, probe.length, WSD_PORT, WSD_ADDR, () => {})
+      })
+    } catch {
+      finish() // UDP unavailable — degrade silently
+    }
+  })
+}
+
+// ─── 3c. BLASTI mDNS advertiser (self-announcement) (0.6.78) ─────────────────
+
+/** Identity advertised by the embedded mDNS responder for this instance. */
+export interface BlastiMdnsIdentity {
+  deviceType: string
+  deviceName: string
+  deviceId: string
+  appVersion: string
+  mode: string
+  apiPort: number
+  status: string
+  lanIp?: string
+}
+
+let blastiMdnsIdentity: BlastiMdnsIdentity = {
+  deviceType: 'blasti_desktop',
+  deviceName: 'BLASTI Desktop',
+  deviceId: '',
+  appVersion: '',
+  mode: 'desktop',
+  apiPort: 3080,
+  status: 'online',
+}
+let blastiMdnsSocket: dgram.Socket | null = null
+
+/** Update the advertised identity (e.g. when kiosk mode starts). */
+export function setBlastiMdnsIdentity(patch: Partial<BlastiMdnsIdentity> | null): BlastiMdnsIdentity {
+  try {
+    blastiMdnsIdentity = { ...blastiMdnsIdentity, ...(patch || {}) }
+    return { ...blastiMdnsIdentity }
+  } catch { return blastiMdnsIdentity }
+}
+
+export function getBlastiMdnsIdentity(): BlastiMdnsIdentity {
+  return { ...blastiMdnsIdentity }
+}
+
+/** Encode one DNS label-sequence name (labels split on '.'). */
+function mdnsEncodeName(name: string): Buffer {
+  const out: Buffer[] = []
+  for (const label of String(name).split('.')) {
+    if (!label) continue
+    const buf = Buffer.alloc(1 + label.length)
+    buf.writeUInt8(Math.min(63, label.length), 0)
+    buf.write(label, 1, 'utf8')
+    out.push(buf)
+  }
+  out.push(Buffer.from([0]))
+  return Buffer.concat(out)
+}
+
+/** Build a TXT record RDATA from a flat string map. */
+function mdnsEncodeTxt(map: Record<string, string | number | boolean | null | undefined>): Buffer {
+  const parts: Buffer[] = []
+  for (const [k, v] of Object.entries(map || {})) {
+    if (v === undefined || v === null || v === '') continue
+    const entry = Buffer.from(`${k}=${v}`, 'utf8')
+    if (entry.length > 255) continue
+    const buf = Buffer.alloc(1 + entry.length)
+    buf.writeUInt8(entry.length, 0)
+    entry.copy(buf, 1)
+    parts.push(buf)
+  }
+  if (parts.length === 0) return Buffer.from([0])
+  return Buffer.concat(parts)
+}
+
+/**
+ * Build the full mDNS unicast answer for one of the BLASTI service types:
+ * PTR (service → instance), SRV (port + host), TXT (identity), A (ip).
+ */
+function buildBlastiMdnsAnswers(
+  instanceName: string,
+  serviceType: string,
+  hostLabel: string,
+  ip: string | undefined,
+  port: number,
+  txt: Record<string, string | number | boolean | null | undefined>,
+): Buffer {
+  const instanceFullName = `${instanceName}.${serviceType}`
+  const hostFullName = `${hostLabel}.local`
+  const answers: Array<{ name: string; rtype: number; rdata: Buffer }> = []
+  // PTR
+  answers.push({ name: serviceType, rtype: 12, rdata: mdnsEncodeName(instanceFullName) })
+  // SRV (priority 0, weight 0, port, target)
+  const srv = Buffer.alloc(6)
+  srv.writeUInt16BE(0, 0)
+  srv.writeUInt16BE(0, 2)
+  srv.writeUInt16BE(port, 4)
+  answers.push({ name: instanceFullName, rtype: 33, rdata: Buffer.concat([srv, mdnsEncodeName(hostFullName)]) })
+  // TXT
+  answers.push({ name: instanceFullName, rtype: 16, rdata: mdnsEncodeTxt(txt) })
+  // A (only when we know the IP)
+  if (ip) {
+    const parts = ip.split('.').map((n) => parseInt(n, 10))
+    if (parts.length === 4 && parts.every((n) => !Number.isNaN(n))) {
+      answers.push({ name: hostFullName, rtype: 1, rdata: Buffer.from(parts) })
+    }
+  }
+  let out = Buffer.alloc(12)
+  out.writeUInt16BE(0x8400, 2) // flags: QR=1, AA=1
+  out.writeUInt16BE(answers.length, 6) // ANCOUNT
+  for (const ans of answers) {
+    const rr = Buffer.alloc(10)
+    rr.writeUInt16BE(ans.rtype, 0)
+    rr.writeUInt16BE(0x8001, 2) // class IN + cache-flush
+    rr.writeUInt32BE(120, 4) // TTL
+    rr.writeUInt16BE(ans.rdata.length, 8)
+    out = Buffer.concat([out, mdnsEncodeName(ans.name), rr, ans.rdata])
+  }
+  return out
+}
+
+/**
+ * Start the embedded mDNS responder advertising this BLASTI instance as
+ * _blasti-desktop._tcp (or _blasti-kiosk._tcp when mode='kiosk'). Best-effort:
+ * every failure degrades silently (e.g. a firewall blocking :5353 must never
+ * break the local API). Returns true when the socket is listening.
+ */
+export function startBlastiMdnsAdvertiser(identity: Partial<BlastiMdnsIdentity> = {}): boolean {
+  if (identity && typeof identity === 'object') setBlastiMdnsIdentity(identity)
+  if (blastiMdnsSocket) return true // already advertising
+  try {
+    const hostLabel = (blastiMdnsIdentity.deviceId || os.hostname() || 'blasti')
+      .toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 40) || 'blasti'
+    const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+    sock.on('error', () => {
+      // Port busy (system mDNS responder owns it) or blocked — stop advertising
+      try { sock.close() } catch { /* ignore */ }
+      if (blastiMdnsSocket === sock) blastiMdnsSocket = null
+    })
+    sock.on('message', (msg: Buffer, rinfo: dgram.RemoteInfo) => {
+      try {
+        if (msg.length < 12) return
+        const qdcount = msg.readUInt16BE(4)
+        let offset = 12
+        for (let i = 0; i < qdcount && offset < msg.length; i++) {
+          const name = readName(msg, offset)
+          offset = skipName(msg, offset) + 4 // skip QTYPE/QCLASS
+          if (!name) continue
+          const lower = name.toLowerCase()
+          const svc = MDNS_BLASTI_SERVICES.find((s) => lower.endsWith(s.type))
+          if (!svc) continue
+          // Answer with the mode-specific service type + current identity.
+          const lanIp = blastiMdnsIdentity.lanIp
+            || Object.values(os.networkInterfaces()).flat().find((a) => a && a.family === 'IPv4' && !a.internal)?.address
+          const port = Number(blastiMdnsIdentity.apiPort) || 3080
+          const instanceName = (blastiMdnsIdentity.deviceName || 'BLASTI').replace(/[.\s]+/g, '-').slice(0, 60)
+          const response = buildBlastiMdnsAnswers(
+            instanceName,
+            svc.type,
+            hostLabel,
+            lanIp,
+            port,
+            { ...blastiMdnsIdentity },
+          )
+          sock.send(response, 0, response.length, rinfo.port, rinfo.address, () => {})
+        }
+      } catch { /* malformed query — ignore */ }
+    })
+    sock.bind(MDNS_PORT, () => {
+      try { sock.setBroadcast(true) } catch { /* ignore */ }
+    })
+    blastiMdnsSocket = sock
+    return true
+  } catch {
+    blastiMdnsSocket = null
+    return false
+  }
+}
+
+/** Stop the mDNS responder (app shutdown). */
+export function stopBlastiMdnsAdvertiser(): void {
+  if (blastiMdnsSocket) {
+    try { blastiMdnsSocket.close() } catch { /* already closed */ }
+    blastiMdnsSocket = null
+  }
+}
+
+/**
+ * BLASTI identification probe (0.6.78): GET /api/discover on a candidate
+ * host:port and detect the `service: 'blasti-local'` marker. Used by the
+ * evidence-based HTTP stage and by POST /discovery/connect.
+ */
+export interface BlastiIdentifyResult {
+  blasti: true
+  name: string
+  mode: 'kiosk' | 'desktop'
+  version?: string
+  instanceId?: string
+  agencyId?: string
+  master: boolean
+  role?: string
+  apiPort: number
+}
+
+export async function blastiIdentifyProbe(ip: string, port: number, timeoutMs = 1500): Promise<BlastiIdentifyResult | null> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(`http://${ip}:${port}/api/discover`, { signal: controller.signal })
+    clearTimeout(timer)
+    if (!res.ok) return null
+    const body = await res.json() as Record<string, unknown> | null
+    if (!body || (body.service !== 'blasti-local' && body.service !== 'blasti-lan')) return null
+    return {
+      blasti: true,
+      name: (body.displayName as string) || (body.hostname as string) || `BLASTI @ ${ip}`,
+      mode: body.mode === 'kiosk' ? 'kiosk' : (String(body.role || '').toLowerCase() === 'kiosk' ? 'kiosk' : 'desktop'),
+      version: (body.version as string) || undefined,
+      instanceId: (body.instanceId as string) || undefined,
+      agencyId: (body.agencyId as string) || undefined,
+      master: !!body.master,
+      role: (body.role as string) || undefined,
+      apiPort: port,
+    }
+  } catch {
+    clearTimeout(timer)
+    return null
   }
 }
 
@@ -2573,47 +2994,16 @@ export interface FingerprintResult {
   category: DeviceCategory
   type: DeviceType
   name: string
+  /** 0.6.78 — identification strength (0-100). The Device Manager shows this
+   *  as an identification-strength badge so users can tell a device that
+   *  announced itself (mDNS/UPnP/BLASTI) from one the scanner had to guess. */
+  confidence: number
+  /** 0.6.78 — the evidence source behind the strongest identity signal. */
+  identitySource: string
 }
 
-/**
- * Categorise a discovered device based on all signals collected about it.
- *
- * Naming philosophy:
- *   - Self-advertised names (UPnP friendlyName, mDNS instance name, USB product
- *     name) are the most authoritative — the device names itself.
- *   - Manufacturer + model from UPnP description XML is the next best thing.
- *   - MAC OUI vendor lookup gives a vendor + type hint for bare ARP entries.
- *   - HTTP <title> is the LEAST reliable — a CUPS server on :631 may serve the
- *     host's default print queue name (e.g. "Adobe PDF"), which has nothing to
- *     do with the device's real identity. We refuse to use HTTP titles that
- *     match known virtual-printer names.
- *   - Generic placeholders ("Device @ 192.168.1.5") are only used as a last
- *     resort and are always overwritten by any richer name.
- *
- * Heuristics (checked in priority order):
- *   1. USB / CUPS local printer probe           → LOCAL / PRINTER
- *   2. "blasti" in any title/server             → BLASTI / APP
- *   3. UPnP printer device type / keywords      → UPNP / PRINTER
- *   4. UPnP MediaRenderer / DMP / TV keywords   → UPNP / TV
- *   5. UPnP InternetGatewayDevice               → UPNP / ROUTER
- *   6. mDNS _ipp/_ipps/_printer/_pdl OR port 9100 (STRONG printer signals)
- *      → NETWORK / PRINTER  (port 631 alone is NOT enough — every CUPS host
- *      exposes a queue there)
- *   7. HTTP port 8001/9197/8060 + TV keywords   → NETWORK / TV
- *   8. mDNS _airplay / _googlecast / _raop      → NETWORK / TV
- *   9. mDNS _androidtvremote / "android tv"     → NETWORK / TV
- *  10. mDNS _android / _apple-mobdev2 / _companion-link → NETWORK / PHONE
- *  11. HTTP title / mDNS router keywords        → NETWORK / ROUTER
- *  12. mDNS _homekit / _hap / _mqtt / Tuya/etc  → NETWORK / IOT
- *  13. mDNS _smb / _ssh / _vnc / _rdp           → NETWORK / KIOSK  (desktop-like)
- *  14. MAC OUI vendor lookup                    → vendor + type hint
- *  15. HTTP title (non-virtual-printer)         → NETWORK / UNKNOWN
- *  16. otherwise                                → NETWORK / UNKNOWN
- *
- * `usbSource` is set when this fingerprint is for a USB / CUPS local printer
- * (not on the network) — the category becomes LOCAL with type PRINTER.
- */
-export function fingerprintDevice(input: {
+/** Input signals for the classifier — one row per discovery-signal source. */
+export interface FingerprintInput {
   ip: string
   port: number
   httpTitle?: string
@@ -2640,7 +3030,55 @@ export function fingerprintDevice(input: {
    *  'smb' | 'rdp' | 'wsd' | 'airplay' | 'googlecast' | 'ios-sync' |
    *  'jetdirect' | 'roku' | 'http-alt'. */
   tcpServices?: string[]
-}): FingerprintResult {
+  /** 0.6.78 — BLASTI mode from the beacon payload / mDNS TXT /
+   *  /api/discover probe ('kiosk' | 'desktop'). */
+  blastiMode?: string
+  /** 0.6.78 — WS-Discovery device class ('PC' | 'PRINTER' | 'TV'). */
+  wsdType?: string
+  /** Kept for parity with the CommonJS port — usually unset; callers pass
+   *  the self-advertised name via upnpFriendlyName instead. */
+  friendlyName?: string
+}
+
+/**
+ * Categorise a discovered device based on all signals collected about it.
+ *
+ * Naming philosophy:
+ *   - Self-advertised names (UPnP friendlyName, mDNS instance name, USB product
+ *     name) are the most authoritative — the device names itself.
+ *   - Manufacturer + model from UPnP description XML is the next best thing.
+ *   - MAC OUI vendor lookup gives a vendor + type hint for bare ARP entries.
+ *   - HTTP <title> is the LEAST reliable — a CUPS server on :631 may serve the
+ *     host's default print queue name (e.g. "Adobe PDF"), which has nothing to
+ *     do with the device's real identity. We refuse to use HTTP titles that
+ *     match known virtual-printer names.
+ *   - Generic placeholders ("Device @ 192.168.1.5") are only used as a last
+ *     resort and are always overwritten by any richer name.
+ *
+ * Heuristics (checked in priority order):
+ *   1. USB / CUPS local printer probe           → LOCAL / PRINTER
+ *   2. "blasti" in any title/server or blastiMode set → BLASTI / KIOSK|APP
+ *   3. UPnP printer device type / keywords      → UPNP / PRINTER
+ *   4. UPnP MediaRenderer / DMP / TV keywords   → UPNP / TV
+ *   5. UPnP InternetGatewayDevice               → UPNP / ROUTER
+ *   6. mDNS _ipp/_ipps/_printer/_pdl OR port 9100 (STRONG printer signals)
+ *      → NETWORK / PRINTER  (port 631 alone is NOT enough — every CUPS host
+ *      exposes a queue there)
+ *   7. HTTP port 8001/9197/8060 + TV keywords   → NETWORK / TV
+ *   8. mDNS _airplay / _googlecast / _raop      → NETWORK / TV
+ *   9. mDNS _androidtvremote / "android tv"     → NETWORK / TV
+ *  10. mDNS _android / _apple-mobdev2 / _companion-link → NETWORK / PHONE
+ *  11. HTTP title / mDNS router keywords        → NETWORK / ROUTER
+ *  12. mDNS _homekit / _hap / _mqtt / Tuya/etc  → NETWORK / IOT
+ *  13. TCP sweep SMB/RDP/WSD or mDNS _smb/_ssh/_vnc/_rdp → NETWORK / PC
+ *  14. MAC OUI vendor lookup                    → vendor + type hint
+ *  15. HTTP title (non-virtual-printer)         → NETWORK / UNKNOWN
+ *  16. otherwise                                → NETWORK / UNKNOWN
+ *
+ * `usbSource` is set when this fingerprint is for a USB / CUPS local printer
+ * (not on the network) — the category becomes LOCAL with type PRINTER.
+ */
+function classifyDeviceSignals(input: FingerprintInput): { category: DeviceCategory; type: DeviceType; name: string } {
   // ── USB / CUPS local printer — never on the network ──
   if (input.usbSource) {
     const vendor = input.usbManufacturer || input.upnpManufacturer
@@ -2729,9 +3167,13 @@ export function fingerprintDevice(input: {
   const hasStrongPrinterSignal = hasPrinterServiceMdns || hasPrinterPort || hasPrinterMac || hasPrinterUpnpSignal
 
   // ── 1. BLASTI app detection ──
-  if (joined.includes('blasti') || joined.includes('blast')) {
+  // 0.6.78: the mDNS TXT record / /api/discover marker can distinguish the
+  // app running in KIOSK mode from the desktop / counter-PC shell.
+  const isBlasti = joined.includes('blasti') || joined.includes('blast') || !!input.blastiMode
+  if (isBlasti) {
+    const kioskMode = input.blastiMode === 'kiosk' || /kiosk/i.test(joined)
     const name = safeFriendlyName || input.httpTitle || bestSecondaryName || `BLASTI @ ${input.ip}`
-    return { category: 'BLASTI', type: 'APP', name }
+    return { category: 'BLASTI', type: kioskMode ? 'KIOSK' : 'APP', name }
   }
 
   // ── 2. UPnP category (any SSDP response counts) ──
@@ -2912,11 +3354,13 @@ export function fingerprintDevice(input: {
     }
     if (tcpServices.includes('smb') || tcpServices.includes('rdp') || tcpServices.includes('wsd')) {
       // Windows hallmarks: SMB 445 / RDP 3389 / WSD 5357 → a Windows PC.
+      // 0.6.78: typed as 'PC' (the Device Manager shows a Laptop chip) —
+      // the old 'KIOSK' label confused real kiosks with ordinary computers.
       const name = safeFriendlyName || bestSecondaryName
         || (tcpServices.includes('rdp') ? 'Windows PC/Server'
           : tcpServices.includes('smb') ? 'Windows PC'
             : 'Windows Device')
-      return { category: 'NETWORK', type: 'KIOSK', name }
+      return { category: 'NETWORK', type: 'PC', name }
     }
     // 'http-alt' hits alone carry no classification — fall through so generic
     // HTTP / vendor logic still applies (the device was still registered).
@@ -2939,10 +3383,10 @@ export function fingerprintDevice(input: {
     return { category: 'NETWORK', type: 'IOT', name }
   }
 
-  // ── 8. Kiosk / desktop detection — SMB, SSH, VNC, RDP, workstation ──
+  // ── 8. PC / desktop detection — SMB, SSH, VNC, RDP, workstation, WSD ──
   // Also catch a CUPS-only host (mDNS _ipp but no printer-vendor MAC and no
   // real printer model) — that's a desktop sharing a print queue, not a
-  // dedicated network printer. Label it as a Computer/Kiosk.
+  // dedicated network printer. Label it as a Computer/PC.
   // (isCupsOnlyHost is defined above in the printer-detection section.)
   if (
     joined.includes('_smb._tcp') ||
@@ -2951,13 +3395,14 @@ export function fingerprintDevice(input: {
     joined.includes('_rdp._tcp') ||
     joined.includes('_workstation._tcp') ||
     joined.includes('_sftp-ssh._tcp') ||
+    input.wsdType === 'PC' ||
     isCupsOnlyHost
   ) {
     const httpTitleSafe = input.httpTitle && !isVirtualPrinterName(input.httpTitle) ? input.httpTitle : undefined
     // For CUPS-only hosts, prefer the hostname/MAC-vendor name — NEVER use
     // the virtual-printer queue name ("Adobe PDF") as the device name.
     const name = safeFriendlyName || bestSecondaryName || httpTitleSafe || (macInfo.vendor ? `${macInfo.vendor} Computer` : `Computer @ ${input.ip}`)
-    return { category: 'NETWORK', type: 'KIOSK', name }
+    return { category: 'NETWORK', type: 'PC', name }
   }
 
   // ── 9. MAC OUI vendor hint — strong signal for bare ARP entries ──
@@ -3053,6 +3498,66 @@ export function fingerprintDevice(input: {
   }
 }
 
+/**
+ * Confidence score (0-100) for a classification. The Device Manager shows
+ * this as an identification-strength badge so users can tell a device that
+ * announced itself (mDNS/UPnP/BLASTI) from one the scanner had to guess.
+ */
+function computeDeviceConfidence(
+  input: FingerprintInput,
+  cls: { category: DeviceCategory; type: DeviceType },
+): { confidence: number; identitySource: string } {
+  const tcpServices = (input.tcpServices || []).map((s) => String(s).toLowerCase())
+  let confidence = 20
+  let identitySource = 'arp'
+  if (input.usbSource) {
+    confidence = 98; identitySource = 'usb'
+  } else if (cls.category === 'BLASTI') {
+    confidence = input.blastiMode ? 97 : 92; identitySource = 'blasti'
+  } else if (cls.category === 'UPNP') {
+    confidence = 85; identitySource = 'ssdp'
+  } else if (input.mdnsService) {
+    confidence = 88; identitySource = 'mdns'
+  } else if (tcpServices.includes('jetdirect') || input.port === 9100) {
+    confidence = 90; identitySource = 'tcp'
+  } else if (
+    tcpServices.includes('samsung-tv') || tcpServices.includes('roku')
+    || tcpServices.includes('googlecast') || tcpServices.includes('airplay')
+    || input.port === 8001 || input.port === 8060 || input.port === 9197
+  ) {
+    // TV-identifying ports (Samsung 8001/9197, Roku ECP 8060) or cast services
+    confidence = 82; identitySource = 'tcp'
+  } else if (input.wsdType) {
+    confidence = 82; identitySource = 'ws-discovery'
+  } else if (tcpServices.length > 0) {
+    confidence = 75; identitySource = 'tcp'
+  } else if (cls.type === 'ROUTER') {
+    confidence = 70; identitySource = 'http'
+  } else if (input.httpTitle || input.httpServer) {
+    confidence = 65; identitySource = 'http'
+  } else if (cls.type !== 'UNKNOWN') {
+    // Vendor OUI / secondary-name-only classifications
+    confidence = 55; identitySource = 'oui'
+  }
+  // A real self-advertised or resolved name raises certainty
+  if (input.friendlyName || input.reverseDnsName || input.netbiosName || input.dhcpHostname) {
+    confidence = Math.min(99, confidence + 5)
+  }
+  // Unknown stays low no matter what
+  if (cls.type === 'UNKNOWN') confidence = Math.min(confidence, 45)
+  return { confidence, identitySource }
+}
+
+/**
+ * Classify a device AND score how confident the classification is.
+ * Returns {category, type, name, confidence, identitySource}.
+ */
+export function fingerprintDevice(input: FingerprintInput): FingerprintResult {
+  const cls = classifyDeviceSignals(input)
+  const { confidence, identitySource } = computeDeviceConfidence(input, cls)
+  return { ...cls, confidence, identitySource }
+}
+
 // ─── Orchestrator ───────────────────────────────────────────────────────────
 
 /**
@@ -3109,6 +3614,14 @@ export async function runDiscoveryScan(
         reverseDnsName: patch.reverseDnsName || existing.reverseDnsName,
         netbiosName: patch.netbiosName || existing.netbiosName,
         dhcpHostname: patch.dhcpHostname || existing.dhcpHostname,
+        // Preserve BLASTI identity + confidence across merges (never downgrade) (0.6.78)
+        blastiMode: patch.blastiMode || existing.blastiMode,
+        appVersion: patch.appVersion || existing.appVersion,
+        blastiInfo: patch.blastiInfo || existing.blastiInfo,
+        identitySource: (patch.identitySource && (patch.identitySourcePriority ?? 0) >= (existing.identitySourcePriority ?? 0))
+          ? patch.identitySource
+          : existing.identitySource,
+        confidence: Math.max(existing.confidence || 0, patch.confidence || 0),
         // Union the TCP-sweep services — later merges (HTTP probe, names)
         // don't carry them and must never erase a confirmed service.
         tcpServices: Array.from(new Set([...(existing.tcpServices || []), ...(patch.tcpServices || [])])),
@@ -3126,9 +3639,14 @@ export async function runDiscoveryScan(
         reverseDnsName: merged.reverseDnsName, netbiosName: merged.netbiosName,
         dhcpHostname: merged.dhcpHostname,
         tcpServices: merged.tcpServices,
+        blastiMode: merged.blastiMode,
+        wsdType: merged.wsdType,
       })
       merged.category = fp.category
       merged.type = fp.type
+      merged.confidence = Math.max(existing.confidence || 0, fp.confidence || 0)
+      merged.identitySource = fp.identitySource
+      merged.identitySourcePriority = merged.confidence
       // Keep the higher-quality name — real self-advertised device names beat
       // placeholders and virtual-printer titles. Virtual-printer names score 0,
       // so they're always replaced by any real name (even a placeholder).
@@ -3167,6 +3685,14 @@ export async function runDiscoveryScan(
         netbiosName: patch.netbiosName,
         dhcpHostname: patch.dhcpHostname,
         tcpServices: patch.tcpServices,
+        // 0.6.78 — identification strength + BLASTI identity fields
+        confidence: patch.confidence,
+        identitySource: patch.identitySource,
+        identitySourcePriority: patch.confidence,
+        blastiMode: patch.blastiMode,
+        appVersion: patch.appVersion,
+        blastiInfo: patch.blastiInfo,
+        wsdType: patch.wsdType,
       }
       // Re-fingerprint using the raw friendlyName, not the display name.
       const fp = fingerprintDevice({
@@ -3179,9 +3705,14 @@ export async function runDiscoveryScan(
         reverseDnsName: device.reverseDnsName, netbiosName: device.netbiosName,
         dhcpHostname: device.dhcpHostname,
         tcpServices: device.tcpServices,
+        blastiMode: device.blastiMode,
+        wsdType: device.wsdType,
       })
       device.category = fp.category
       device.type = fp.type
+      device.confidence = fp.confidence
+      device.identitySource = fp.identitySource
+      device.identitySourcePriority = fp.confidence
       // Use the fingerprint's name if it's higher quality than the patch name.
       if (nameQuality(fp.name) > nameQuality(device.name)) device.name = fp.name
       devicesByIp.set(ip, device)
@@ -3189,21 +3720,22 @@ export async function runDiscoveryScan(
     }
   }
 
-  // ── Phase 0: UDP beacon listener (0.6.74: overlapped with ARP + ping) ──
-  // BLASTI shells announce themselves on UDP 3081 (apps/desktop/main.js).
-  // A self-announcing beacon is the highest-signal BLASTI result — no
-  // guessing, no port probing. The 2s listen window used to BLOCK the whole
-  // pipeline; we now start it as a promise and harvest results after the ARP
-  // + ping sweeps complete — saving the full window from the critical path.
-  let beaconPromise: Promise<Array<{ ip: string; port?: number; name?: string }>> = Promise.resolve([])
-  if (!cb.isAborted()) {
-    emitProgress('beacon', 0)
-    if (!protocolsUsed.includes('UDP beacon')) protocolsUsed.push('UDP beacon')
-    beaconPromise = listenForUdpBeacons({ selfIps, isAborted: cb.isAborted }).catch(() => [] as Array<{ ip: string; port?: number; name?: string }>)
-  }
-  emitProgress('beacon', 0)
+  // ── 0.6.78 pipeline redesign ───────────────────────────────────────────────
+  // STAGE A (fast, ≤12s): EVERYTHING runs at once — UDP beacon listener, ping
+  // sweep, raw TCP sweep, mDNS, SSDP and WS-Discovery. Raw TCP connects are
+  // the primary probe (one SYN/SYN-ACK, ~100× cheaper than a fetch against a
+  // silent firewall), multicast protocols answer in parallel, and the ping
+  // sweep fills in ICMP-only hosts. No stage waits on the previous one.
+  // STAGE B (~1-3s): name enrichment (rDNS + NBNS), DHCP leases, USB printers.
+  // STAGE C (evidence-based): HTTP identification ONLY on (ip, port) pairs a
+  // TCP connect already proved open, plus a BLASTI /api/discover probe on
+  // every open BLASTI API port. No more 254×13 blind fetch sweeps — that was
+  // the >5-minute bottleneck.
+  const scanDeadline = Date.now() + SCAN_DEADLINE_MS
+  const deadlineReached = () => Date.now() > scanDeadline
 
-  // ── Phase 1: ARP ──
+  // ── ARP (instant — local table read, feeds the skip-maps below) ──
+  emitProgress('beacon', 0)
   emitProgress('arp', 0)
   if (!protocolsUsed.includes('ARP')) protocolsUsed.push('ARP')
   try {
@@ -3223,89 +3755,13 @@ export async function runDiscoveryScan(
   } catch { /* ignore */ }
   emitProgress('arp', totalIPs)
 
-  // ── Phase 2: Ping sweep ──
-  let scanned = 0
-  for (const subnet of subnets) {
-    if (cb.isAborted()) break
-    emitProgress('ping', scanned, subnet)
-    if (!protocolsUsed.includes('Ping')) protocolsUsed.push('Ping')
-    const alive = await pingSweep(subnet, {
-      isAborted: cb.isAborted,
-      onProgress: () => {
-        scanned++
-        if (scanned % 16 === 0) emitProgress('ping', scanned, subnet)
-      },
-    })
-    for (const ip of alive) {
-      // Task 2-b: skip the host's own IPs from the ping results
-      if (selfIps.has(ip)) continue
-      upsertDevice(ip, { source: 'ping', capabilities: ['ICMP'] })
-    }
-    scanned = Math.max(scanned, totalIPs / subnets.length)
-  }
-  emitProgress('ping', totalIPs)
-
-  // ── Harvest overlapped beacon results (after ping) ──
-  if (!cb.isAborted()) {
-    try {
-      const beacons = await beaconPromise
-      for (const b of beacons) {
-        if (cb.isAborted()) break
-        if (!subnets.some((s) => b.ip.startsWith(s + '.'))) continue
-        upsertDevice(b.ip, {
-          source: 'udp-beacon',
-          port: b.port || 0,
-          httpServer: 'blasti-local',
-          friendlyName: b.name,
-          name: b.name,
-          capabilities: ['UDP_BEACON'],
-        })
-      }
-    } catch { /* beacon listener is best-effort */ }
-  }
-
-  // ── Phase 2b: Re-read ARP table (capture MACs for ping-only devices) ──
-  // The initial ARP read (Phase 1) only sees devices the OS already had in
-  // its neighbour cache. Devices that responded to our ping sweep just now
-  // will have a fresh ARP entry — re-reading the table here lets us backfill
-  // the MAC (and therefore the OUI vendor) for ping-only devices that mDNS /
-  // SSDP / HTTP won't be able to name later. Without this step, a firewalled
-  // phone or IoT gadget that only answers ICMP ends up as "Device @ IP"
-  // because the fingerprint has no MAC-vendor hint to fall back on.
-  if (!cb.isAborted()) {
-    try {
-      const arpRefresh = await readArpTable()
-      for (const entry of arpRefresh) {
-        if (cb.isAborted()) break
-        if (!subnets.some((s) => entry.ip.startsWith(s + '.'))) continue
-        const existing = devicesByIp.get(entry.ip)
-        // Only backfill if we already know this IP (from ping) but have no MAC
-        if (existing && !existing.mac && entry.mac) {
-          upsertDevice(entry.ip, {
-            mac: entry.mac,
-            capabilities: ['ARP'],
-          })
-        }
-      }
-    } catch { /* ignore — best-effort */ }
-  }
-
-  // ── Phases 3 + 4 + 4a: mDNS, SSDP and TCP-connect sweep — CONCURRENT ──
-  // Speed pass (Task 5-a): the three phases are independent listeners/probes,
-  // so they run under one Promise.all instead of back-to-back. Progress is
-  // still EMITTED in the declared phase order (mdns → ssdp → tcp-sweep) before
-  // launch and after completion, so the frontend phase indicator is unchanged.
-  // The tcp-sweep phase probes Windows/phone/cast hallmark ports (SMB 445,
-  // RDP 3389, WSD 5357, iOS sync 62078, AirPlay 7000, Chromecast 8008/8009,
-  // Roku 8060, generic HTTP) — hosts that drop ICMP and expose nothing on the
-  // HTTP scan ports (i.e. Windows PCs) become visible for the first time.
-  // Hits collected by the concurrent tcp-sweep — hoisted so the rDNS/NBNS
-  // enrichment phase below can union them into its resolution set.
+  // STAGE A — launch everything concurrently
   let tcpHits: TcpSweepHit[] = []
   if (!cb.isAborted()) {
-    // Declared-order start emissions (both phases in order, for progress UI)
+    emitProgress('ping', 0)
     emitProgress('mdns', totalIPs)
     emitProgress('ssdp', totalIPs)
+    emitProgress('ws-discovery', totalIPs)
     emitProgress('tcp-sweep', 0)
 
     // "Already has this service" skip map: don't re-probe ports whose service
@@ -3320,6 +3776,35 @@ export async function runDiscoveryScan(
       if (d.type === 'KIOSK') { skip.add('smb'); skip.add('rdp'); skip.add('wsd') }
       if (skip.size > 0) skipServicesFor.set(ip, skip)
     }
+
+    const pingTask = (async (): Promise<string[]> => {
+      if (!protocolsUsed.includes('Ping')) protocolsUsed.push('Ping')
+      let scannedLocal = 0
+      for (const subnet of subnets) {
+        if (cb.isAborted() || deadlineReached()) break
+        const alive = await pingSweep(subnet, {
+          isAborted: cb.isAborted,
+          onProgress: () => {
+            scannedLocal++
+            if (scannedLocal % 16 === 0) emitProgress('ping', scannedLocal, subnet)
+          },
+        })
+        for (const ip of alive) {
+          // Task 2-b: skip the host's own IPs from the ping results
+          if (selfIps.has(ip)) continue
+          upsertDevice(ip, { source: 'ping', capabilities: ['ICMP'] })
+        }
+      }
+      emitProgress('ping', totalIPs)
+      return []
+    })()
+
+    const beaconTask = (async (): Promise<UdpBeaconRecord[]> => {
+      if (!protocolsUsed.includes('UDP beacon')) protocolsUsed.push('UDP beacon')
+      try {
+        return await listenForUdpBeacons({ selfIps, isAborted: cb.isAborted })
+      } catch { return [] }
+    })()
 
     const mdnsTask = (async (): Promise<MdnsRecord[]> => {
       if (!protocolsUsed.includes('mDNS')) protocolsUsed.push('mDNS')
@@ -3348,6 +3833,13 @@ export async function runDiscoveryScan(
       } catch { return [] }
     })()
 
+    const wsdTask = (async (): Promise<WsDiscoveryMatch[]> => {
+      if (!protocolsUsed.includes('WS-Discovery')) protocolsUsed.push('WS-Discovery')
+      try {
+        return await wsDiscover({ timeoutMs: WSD_TIMEOUT_MS, isAborted: cb.isAborted })
+      } catch { return [] }
+    })()
+
     const tcpSweepTask = (async (): Promise<TcpSweepHit[]> => {
       if (cb.isAborted()) return []
       if (!protocolsUsed.includes('TCP')) protocolsUsed.push('TCP')
@@ -3359,8 +3851,49 @@ export async function runDiscoveryScan(
       } catch { return [] }
     })()
 
-    const [mdnsRecords, ssdpDescResults, tcpSweepHits] = await Promise.all([mdnsTask, ssdpTask, tcpSweepTask])
+    const [beacons, mdnsRecords, ssdpDescResults, wsdMatches, tcpSweepHits] = await Promise.all([
+      beaconTask, mdnsTask, ssdpTask, wsdTask, tcpSweepTask,
+    ])
+    try { await pingTask } catch { /* ping upserts its own results */ }
     tcpHits = tcpSweepHits
+
+    // ── Harvest STAGE A results ──
+
+    // Beacon announcements — self-identified BLASTI shells. The payload may
+    // carry mode ('kiosk'/'desktop'), appVersion and LAN-authority extras.
+    for (const b of beacons) {
+      if (cb.isAborted()) break
+      if (!subnets.some((s) => b.ip.startsWith(s + '.'))) continue
+      upsertDevice(b.ip, {
+        source: 'udp-beacon',
+        port: b.port || 0,
+        httpServer: 'blasti-local',
+        friendlyName: b.name,
+        name: b.name,
+        blastiMode: b.mode === 'kiosk' ? 'kiosk' : b.mode === 'desktop' ? 'desktop' : undefined,
+        appVersion: b.appVersion,
+        blastiInfo: b.instanceId
+          ? { instanceId: b.instanceId, master: !!b.master, role: b.role }
+          : undefined,
+        capabilities: ['UDP_BEACON'],
+      })
+    }
+
+    // WS-Discovery matches — Windows PCs / WSD printers / NAS that ignore
+    // ping, mDNS and SSDP but always answer the WSD multicast Probe.
+    for (const m of wsdMatches) {
+      if (cb.isAborted()) break
+      if (!subnets.some((s) => m.ip.startsWith(s + '.'))) continue
+      if (selfIps.has(m.ip)) continue
+      upsertDevice(m.ip, {
+        source: 'ws-discovery',
+        port: m.port || 0,
+        wsdType: m.type,
+        friendlyName: m.name,
+        name: m.name,
+        capabilities: ['WS-Discovery', ...(m.types ? [`WSD:${String(m.types).split(/\s+/)[0]}`] : [])],
+      })
+    }
 
     // Process mDNS records
     for (const rec of mdnsRecords) {
@@ -3373,11 +3906,18 @@ export async function runDiscoveryScan(
       // it's NOT a virtual-printer queue name ("Adobe PDF", etc.) — those are
       // host-side CUPS artifacts, not real device names.
       // instanceName: friendly/model name correlated from TXT records —
-      // preferred over the raw hostname ("Living-Room-TV" beats
-      // "living-room-tv.local"; "Bedroom Chromecast" beats an mDNS id).
+      // preferred over the raw hostname (mirror of the cloud scanner).
       const cleanName = cleanMdnsName(rec.instanceName || rec.name) || rec.name
       const safeName = cleanName && !isVirtualPrinterName(cleanName) ? cleanName : undefined
-      const txtModel = rec.txt?.md || rec.txt?.model || rec.txt?.am
+      const txtModel = (rec.txt && (rec.txt.md || rec.txt.model || rec.txt.am)) || undefined
+      // BLASTI self-advertisement: TXT carries mode ('kiosk'/'desktop'),
+      // appVersion and deviceType. Source of truth for BLASTI KIOSK vs APP.
+      const txtDeviceType = String((rec.txt && (rec.txt.devicetype || rec.txt.deviceType)) || '')
+      const txtBlastiMode = rec.txt && (rec.txt.mode === 'kiosk' || rec.txt.mode === 'desktop')
+        ? rec.txt.mode
+        : (txtDeviceType.includes('kiosk') ? 'kiosk'
+          : txtDeviceType.startsWith('blasti') ? 'desktop'
+            : undefined)
       upsertDevice(rec.ip, {
         source: 'mdns',
         port: rec.port || 0,
@@ -3385,6 +3925,8 @@ export async function runDiscoveryScan(
         friendlyName: cleanName,
         name: safeName,
         model: txtModel && !isVirtualPrinterName(txtModel) ? txtModel : undefined,
+        blastiMode: txtBlastiMode,
+        appVersion: rec.txt && (rec.txt.appversion || rec.txt.ver) || undefined,
         capabilities: [`mDNS:${rec.serviceType}`],
       })
     }
@@ -3431,10 +3973,36 @@ export async function runDiscoveryScan(
       })
     }
   }
-  // Declared-order completion emissions (both phases in order, for progress UI)
+  // Declared-order completion emissions (in order, for progress UI)
   emitProgress('mdns', totalIPs)
   emitProgress('ssdp', totalIPs)
   emitProgress('tcp-sweep', totalIPs)
+
+  // ── Phase 2b: Re-read ARP table (capture MACs for ping-only devices) ──
+  // The initial ARP read (Phase 1) only sees devices the OS already had in
+  // its neighbour cache. Devices that responded to our ping sweep just now
+  // will have a fresh ARP entry — re-reading the table here lets us backfill
+  // the MAC (and therefore the OUI vendor) for ping-only devices that mDNS /
+  // SSDP / HTTP won't be able to name later. Without this step, a firewalled
+  // phone or IoT gadget that only answers ICMP ends up as "Device @ IP"
+  // because the fingerprint has no MAC-vendor hint to fall back on.
+  if (!cb.isAborted()) {
+    try {
+      const arpRefresh = await readArpTable()
+      for (const entry of arpRefresh) {
+        if (cb.isAborted()) break
+        if (!subnets.some((s) => entry.ip.startsWith(s + '.'))) continue
+        const existing = devicesByIp.get(entry.ip)
+        // Only backfill if we already know this IP (from ping) but have no MAC
+        if (existing && !existing.mac && entry.mac) {
+          upsertDevice(entry.ip, {
+            mac: entry.mac,
+            capabilities: ['ARP'],
+          })
+        }
+      }
+    } catch { /* ignore — best-effort */ }
+  }
 
   // ── Phase 4b: Reverse DNS + NetBIOS name resolution ──
   // For devices that responded to ping/ARP but NOT to mDNS/SSDP, we have no
@@ -3454,7 +4022,7 @@ export async function runDiscoveryScan(
   // This phase runs AFTER mDNS/SSDP (so self-advertised names win) but BEFORE
   // the HTTP probe (so devices that only respond to ping can still get a real
   // name instead of an IP placeholder).
-  if (!cb.isAborted() && devicesByIp.size > 0) {
+  if (!cb.isAborted() && !deadlineReached() && devicesByIp.size > 0) {
     emitProgress('names', 0)
     if (!protocolsUsed.includes('rDNS/NBNS')) protocolsUsed.push('rDNS/NBNS')
     try {
@@ -3519,7 +4087,7 @@ export async function runDiscoveryScan(
   // This phase runs AFTER mDNS/SSDP/rDNS/NBNS (so self-advertised names win)
   // but BEFORE the HTTP probe (so phones that only respond to ping can still
   // get their real name from the DHCP lease).
-  if (!cb.isAborted() && devicesByIp.size > 0) {
+  if (!cb.isAborted() && !deadlineReached() && devicesByIp.size > 0) {
     emitProgress('names', totalIPs)
     if (!protocolsUsed.includes('DHCP')) protocolsUsed.push('DHCP')
     try {
@@ -3556,7 +4124,7 @@ export async function runDiscoveryScan(
   // (`lpstat`, `lpinfo`) and USB enumeration (`lsusb`) to find printers
   // connected directly to this machine (USB cable, parallel port, or local
   // CUPS queue).
-  if (!cb.isAborted()) {
+  if (!cb.isAborted() && !deadlineReached()) {
     emitProgress('local', totalIPs)
     if (!protocolsUsed.includes('USB/CUPS')) protocolsUsed.push('USB/CUPS')
     try {
@@ -3613,60 +4181,119 @@ export async function runDiscoveryScan(
   }
   emitProgress('local', totalIPs)
 
-  // ── Phase 6: HTTP probe (LAST — after all richer metadata sources) ──
-  // HTTP <title> is the LEAST reliable name signal (a CUPS server on :631 may
-  // serve the host's default print-queue name, e.g. "Adobe PDF"). By running
-  // HTTP last, devices already have their real name from mDNS/SSDP/UPnP, and
-  // the name-quality scoring in upsertDevice() ensures the HTTP title only
-  // replaces a placeholder — never a real self-advertised name.
-  if (!cb.isAborted()) {
+  // ── STAGE C: Evidence-based HTTP identification (0.6.78) ──
+  // The old stage fetched http://ip:port for EVERY (254 IPs × 13 ports) pair —
+  // 3302 fetches, each burning its full 800ms timeout on silently-dropping
+  // firewalls. On one subnet alone that was ~55s; multi-subnet networks blew
+  // past five minutes. Now we only fetch where a TCP connect ALREADY succeeded
+  // (raw SYN/SYN-ACK evidence from STAGE A), plus a precise /api/discover
+  // probe on every open BLASTI API port. Typical /24: 20-80 fetches, ~1-2s.
+  if (!cb.isAborted() && !deadlineReached()) {
     emitProgress('http', 0)
     if (!protocolsUsed.includes('HTTP')) protocolsUsed.push('HTTP')
-    // Probe each known IP on each SCAN_PORT
-    const ips = Array.from(devicesByIp.keys())
-    // Also probe all .1-.254 on each subnet if we didn't find many devices yet
-    const allProbeIps = new Set<string>(ips)
-    if (ips.length < 32) {
-      for (const subnet of subnets) {
-        for (let i = 1; i <= 254; i++) allProbeIps.add(`${subnet}.${i}`)
+
+    // Build the evidence map: ip → Map(port → {tls, blasti})
+    const evidence = new Map<string, Map<number, { tls: boolean; blasti: boolean }>>()
+    const addEvidence = (ip: string, port: number, opts: { tls?: boolean; blasti?: boolean } = {}) => {
+      const p = Number(port)
+      if (!ip || !p || p < 1 || p > 65535) return
+      if (selfIps.has(ip) || ip.startsWith('local:')) return
+      if (!evidence.has(ip)) evidence.set(ip, new Map())
+      const ports = evidence.get(ip)!
+      const prev = ports.get(p) || { tls: false, blasti: false }
+      ports.set(p, {
+        tls: prev.tls || opts.tls || TLS_PORTS.has(p),
+        blasti: prev.blasti || opts.blasti || BLASTI_API_PORTS.has(p),
+      })
+    }
+    // 1. TCP-sweep hits — the connect already succeeded, an HTTP fetch can win.
+    for (const hit of tcpHits) addEvidence(hit.ip, hit.port, { blasti: BLASTI_API_PORTS.has(hit.port) })
+    // 2. Ports advertised by mDNS / SSDP / beacon for that host.
+    for (const [ip, d] of devicesByIp) {
+      if (d.port) addEvidence(ip, d.port)
+      if (d.ssdpLocation) {
+        const m = d.ssdpLocation.match(/:(\d+)/)
+        if (m) addEvidence(ip, parseInt(m[1], 10))
+      }
+      if (d.httpUrl) {
+        const m = d.httpUrl.match(/:(\d+)/)
+        if (m) addEvidence(ip, parseInt(m[1], 10))
       }
     }
-    // 0.6.75 — split the queue by transport: TLS ports (443/8443) get a raw
-    // TLS handshake + same-socket GET; plain ports keep the fetch probe.
-    // Probing https ports with plain http used to fail 100% of the time while
-    // still paying the full timeout for every pair.
-    const probeQueue: Array<{ ip: string; port: number; tls: boolean }> = []
-    for (const ip of allProbeIps) {
-      for (const port of SCAN_PORTS) probeQueue.push({ ip, port, tls: TLS_PORTS.has(port) })
+    // 3. BLASTI API ports on every responsive host — the local API answers
+    //    /api/discover instantly and is the ONLY reliable BLASTI marker.
+    for (const ip of devicesByIp.keys()) {
+      for (const p of BLASTI_API_PORTS) addEvidence(ip, p, { blasti: true })
     }
 
+    const probeQueue: Array<{ ip: string; port: number; tls: boolean; blasti: boolean }> = []
+    for (const [ip, ports] of evidence) {
+      for (const [port, meta] of ports) probeQueue.push({ ip, port, tls: meta.tls, blasti: meta.blasti })
+    }
+    // Hard cap — a pathological network can still produce thousands of open
+    // pairs; identification beyond this size has no user value.
+    const capped = probeQueue.slice(0, HTTP_PROBE_CAP)
+
     let httpScanned = 0
-    const totalHttp = probeQueue.length
-    const workers = Array.from({ length: HTTP_CONCURRENCY }, async () => {
-      while (probeQueue.length > 0) {
-        if (cb.isAborted()) return
-        const job = probeQueue.shift()
-        if (!job) break
-        const result = job.tls
-          ? await httpsProbe(job.ip, job.port, { isAborted: cb.isAborted })
-          : await httpProbe(job.ip, job.port, { isAborted: cb.isAborted })
-        if (result) {
-          upsertDevice(job.ip, {
-            source: 'http_probe',
-            port: job.port,
-            httpUrl: `${job.tls ? 'https' : 'http'}://${job.ip}:${job.port}`,
-            httpTitle: result.title,
-            httpServer: result.server,
-            httpStatus: result.status,
-            capabilities: [`${job.tls ? 'HTTPS' : 'HTTP'}:${job.port}`],
-          })
+    const totalHttp = Math.max(1, capped.length)
+    const workers = Array.from(
+      { length: Math.max(1, Math.min(HTTP_CONCURRENCY, capped.length)) },
+      async () => {
+        while (capped.length > 0) {
+          if (cb.isAborted() || deadlineReached()) return
+          const job = capped.shift()
+          if (!job) break
+          try {
+            // BLASTI ports first — the /api/discover marker is far more
+            // precise than any HTML <title> and sets mode/appVersion.
+            if (job.blasti) {
+              const blasti = await blastiIdentifyProbe(job.ip, job.port, 1200)
+              if (blasti) {
+                upsertDevice(job.ip, {
+                  source: 'udp-beacon',
+                  port: job.port,
+                  httpServer: 'blasti-local',
+                  friendlyName: blasti.name,
+                  name: blasti.name,
+                  appVersion: blasti.version,
+                  blastiMode: blasti.mode,
+                  blastiInfo: {
+                    instanceId: blasti.instanceId,
+                    master: blasti.master,
+                    role: blasti.role,
+                    agencyId: blasti.agencyId,
+                  },
+                  capabilities: ['BLASTI_API'],
+                })
+                httpScanned++
+                if (httpScanned % 24 === 0) {
+                  emitProgress('http', Math.floor((httpScanned / totalHttp) * totalIPs))
+                }
+                continue
+              }
+            }
+            const result = job.tls
+              ? await httpsProbe(job.ip, job.port, { isAborted: cb.isAborted })
+              : await httpProbe(job.ip, job.port, { isAborted: cb.isAborted })
+            if (result) {
+              upsertDevice(job.ip, {
+                source: 'http_probe',
+                port: job.port,
+                httpUrl: `${job.tls ? 'https' : 'http'}://${job.ip}:${job.port}`,
+                httpTitle: result.title,
+                httpServer: result.server,
+                httpStatus: result.status,
+                capabilities: [`${job.tls ? 'HTTPS' : 'HTTP'}:${job.port}`],
+              })
+            }
+          } catch { /* single probe failure is fine */ }
+          httpScanned++
+          if (httpScanned % 24 === 0) {
+            emitProgress('http', Math.floor((httpScanned / totalHttp) * totalIPs))
+          }
         }
-        httpScanned++
-        if (httpScanned % 32 === 0) {
-          emitProgress('http', Math.floor((httpScanned / totalHttp) * totalIPs))
-        }
-      }
-    })
+      },
+    )
     await Promise.all(workers)
   }
   emitProgress('http', totalIPs)
@@ -3686,7 +4313,9 @@ function sourcePriority(s: DiscoverySource): number {
   switch (s) {
     case 'ssdp': return 5
     case 'mdns': return 4
+    case 'ws-discovery': return 4
     case 'http_probe': return 3
+    case 'tcp-sweep': return 3 // TCP port connect — same tier as http_probe
     case 'ping': return 2
     case 'arp': return 1
     case 'local': return 6  // CUPS queues are authoritative for local printers
@@ -3694,6 +4323,19 @@ function sourcePriority(s: DiscoverySource): number {
     case 'udp-beacon': return 6 // self-announcing BLASTI shells — high confidence
     default: return 0
   }
+}
+
+/** One deduped UDP beacon announcement (0.6.78 — carries the BLASTI identity
+ *  fields so the scan can mark kiosk vs desktop mode, version and role). */
+interface UdpBeaconRecord {
+  ip: string
+  port: number
+  name: string
+  mode?: string
+  appVersion?: string
+  instanceId?: string
+  master: boolean
+  role?: string
 }
 
 /**
@@ -3709,9 +4351,9 @@ function listenForUdpBeacons(
     selfIps?: Set<string>
     isAborted?: () => boolean
   } = {},
-): Promise<{ ip: string; port: number; name: string }[]> {
+): Promise<UdpBeaconRecord[]> {
   return new Promise((resolve) => {
-    const found = new Map<string, { ip: string; port: number; name: string }>()
+    const found = new Map<string, UdpBeaconRecord>()
     let settled = false
     const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
     const finish = () => {
@@ -3741,6 +4383,13 @@ function listenForUdpBeacons(
           ip: rinfo.address,
           port: Number(payload.httpPort) || Number(payload.port) || 3080,
           name,
+          // 0.6.78 — pass through the BLASTI identity fields so the scan can
+          // mark kiosk vs desktop mode, version and LAN-authority role.
+          mode: typeof payload.mode === 'string' ? payload.mode : undefined,
+          appVersion: typeof payload.appVersion === 'string' ? payload.appVersion : undefined,
+          instanceId: typeof payload.instanceId === 'string' ? payload.instanceId : undefined,
+          master: !!payload.master,
+          role: typeof payload.role === 'string' ? payload.role : undefined,
         })
       } catch { /* non-JSON packet — ignore */ }
     })
@@ -3793,6 +4442,16 @@ export function getProtocolAvailability(): ProtocolAvailability[] {
       name: 'SSDP',
       status: 'available',
       description: `UPnP M-SEARCH on ${SSDP_ADDR}:${SSDP_PORT} with device description fetch`,
+    },
+    {
+      name: 'WS-Discovery',
+      status: 'available',
+      description: `WS-Discovery Probe on ${WSD_ADDR}:${WSD_PORT} — Windows PCs, network printers and NAS answer here even when they ignore ping, mDNS and SSDP`,
+    },
+    {
+      name: 'BLASTI-mDNS',
+      status: 'available',
+      description: 'This instance answers mDNS queries for _blasti-kiosk._tcp / _blasti-desktop._tcp with its identity (deviceType, mode, appVersion) — other BLASTI devices find it with zero probing',
     },
     {
       name: 'rDNS/NBNS',

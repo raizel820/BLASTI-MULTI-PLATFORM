@@ -19,6 +19,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useLanguage } from '@/hooks/use-language';
 import { isRTL } from '@/i18n';
+import type { TranslationKeys } from '@/i18n';
 import { useAppStore } from '@/store/use-app-store';
 import { useRealtime } from '@/hooks/use-realtime';
 import { apiFetch } from '@/lib/api-fetch';
@@ -36,6 +37,7 @@ import {
   Monitor, RefreshCw, Copy, Radio, QrCode, Cast, Cable, ExternalLink,
   Loader2, Tv, Printer, Plus, Settings, Square, CheckCheck, Wifi,
   AlertTriangle, RadioTower, Usb, X, Search, MonitorPlay, Trash2, Unplug,
+  Plug, Send, Smartphone, Laptop, Router as RouterIcon, Cpu,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useDiscoveryService } from '@/hooks/use-discovery-service';
@@ -110,6 +112,11 @@ export function DeviceManager() {
   const [savedTvIps, setSavedTvIps] = useState<Set<string>>(new Set());
   const [defaultPrinterIp, setDefaultPrinterIp] = useState<string | null>(null);
   const [busyDeviceId, setBusyDeviceId] = useState<string | null>(null);
+
+  // 0.6.78 — connect protocol + raw print states (per discovered-device id)
+  const [connectingId, setConnectingId] = useState<string | null>(null);
+  const [connectResults, setConnectResults] = useState<Record<string, 'verified' | 'failed'>>({});
+  const [printingTestId, setPrintingTestId] = useState<string | null>(null);
 
   const fetchDevicesTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -614,6 +621,64 @@ export function DeviceManager() {
     } finally { setBusyDeviceId(null); }
   };
 
+  // ─── Connect protocol (0.6.78) ────────────────────────────────────────────
+  // Deep-verify a discovered device: raw TCP connects + BLASTI /api/discover
+  // marker. Returns the connection profile (open ports, mode, protocols) and
+  // marks the device ONLINE in the discovery cache.
+  const handleConnectDevice = async (device: RealDiscoveredDevice) => {
+    if (!device.ip) return;
+    setConnectingId(device.id);
+    try {
+      const res = await apiFetch(deviceApi('/discovery/connect'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip: device.ip, port: device.port || undefined }),
+      });
+      const data = await res.json();
+      if (data.success && data.verified) {
+        setConnectResults((prev) => ({ ...prev, [device.id]: 'verified' }));
+        const profile = data.profile || {};
+        const protocolBits = profile.connection?.protocols
+          ? Object.entries(profile.connection.protocols).filter(([, v]) => v).map(([k]) => k).join(', ')
+          : '';
+        toast.success(
+          getLocalizedString(
+            `تم الاتصال بـ ${profile.name || device.name}${protocolBits ? ` — ${protocolBits}` : ''}`,
+            `Connecté à ${profile.name || device.name}${protocolBits ? ` — ${protocolBits}` : ''}`,
+            `Connected to ${profile.name || device.name}${protocolBits ? ` — ${protocolBits}` : ''}`,
+            lang,
+          ),
+        );
+      } else {
+        setConnectResults((prev) => ({ ...prev, [device.id]: 'failed' }));
+        toast.error(getLocalizedString('تعذر الاتصال بالجهاز', 'Connexion impossible', 'Could not reach the device', lang));
+      }
+    } catch {
+      setConnectResults((prev) => ({ ...prev, [device.id]: 'failed' }));
+      toast.error(getLocalizedString('تعذر الاتصال بالجهاز', 'Connexion impossible', 'Could not reach the device', lang));
+    } finally { setConnectingId(null); }
+  };
+
+  // Raw ESC/POS test page over the network — proves the printer connection
+  // end-to-end without any OS driver.
+  const handlePrintTestPage = async (device: RealDiscoveredDevice) => {
+    if (!device.ip) return;
+    setPrintingTestId(device.id);
+    try {
+      const res = await apiFetch(deviceApi('/discovery/print'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip: device.ip, port: device.port || 9100, test: true }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        toast.success(getLocalizedString('تمت الطباعة', 'Page imprimée', 'Test page printed', lang));
+      } else {
+        toast.error(data.error || getLocalizedString('تعذر الاتصال بالطابعة', 'Imprimante injoignable', 'Printer unreachable', lang));
+      }
+    } catch {
+      toast.error(getLocalizedString('تعذر الاتصال بالطابعة', 'Imprimante injoignable', 'Printer unreachable', lang));
+    } finally { setPrintingTestId(null); }
+  };
+
   const handleSendPairingRequest = async (deviceId: string) => {
     setBusyDeviceId(deviceId);
     try {
@@ -839,7 +904,7 @@ export function DeviceManager() {
                   <div className="flex items-center justify-between gap-3 text-sm">
                     <span className="flex items-center gap-2 font-medium">
                       <Radio className="h-4 w-4 animate-pulse text-emerald-500" />
-                      {t(getScanPhaseLabelKey(scanState.phase))}
+                      {t(getScanPhaseLabelKey(scanState.phase) as TranslationKeys)}
                     </span>
                     <span className="text-xs text-muted-foreground tabular-nums" dir="ltr">
                       {scanState.devicesFound} · {scanState.scannedIPs}/{scanState.totalIPs || '…'}
@@ -900,10 +965,15 @@ export function DeviceManager() {
                         busy={busyDeviceId === d.id}
                         tvSaved={savedTvIps.has(d.ip)}
                         isDefaultPrinter={!!defaultPrinterIp && defaultPrinterIp === d.ip}
+                        connecting={connectingId === d.id}
+                        connectVerified={connectResults[d.id]}
+                        printingTest={printingTestId === d.id}
                         onSaveTv={() => handleSaveTv(d)}
                         onCast={() => handleCastTv(d)}
                         onSavePrinter={() => handleSavePrinter(d)}
                         onTestPrinter={() => handleTestPrinter(d)}
+                        onPrintTest={() => handlePrintTestPage(d)}
+                        onConnect={() => handleConnectDevice(d)}
                         onDismiss={() => setDismissedIds((prev) => new Set(prev).add(d.id))}
                       />
                     ))}
@@ -1236,41 +1306,93 @@ function ManagerDeviceCard({
 
 // ─── Discovered (unregistered) device card ──────────────────────────────────
 
+/** Icon per discovered type (DEVICE_TYPE_CONFIG icons are injected lazily). */
+function DiscoveredTypeIcon({ device }: { device: RealDiscoveredDevice }) {
+  const cfg = device.type !== 'UNKNOWN' ? DEVICE_TYPE_CONFIG[device.type as keyof typeof DEVICE_TYPE_CONFIG] : null;
+  if (cfg && cfg.icon) {
+    const Icon = cfg.icon;
+    return <Icon className="h-4 w-4" />;
+  }
+  if (device.connectionType === 'USB') return <Usb className="h-4 w-4" />;
+  return <RadioTower className="h-4 w-4" />;
+}
+
 function DiscoveredCard({
   device, lang, busy, tvSaved, isDefaultPrinter,
-  onSaveTv, onCast, onSavePrinter, onTestPrinter, onDismiss,
+  connecting, connectVerified, printingTest,
+  onSaveTv, onCast, onSavePrinter, onTestPrinter, onPrintTest, onConnect, onDismiss,
 }: {
   device: RealDiscoveredDevice;
   lang: string;
   busy: boolean;
   tvSaved: boolean;
   isDefaultPrinter: boolean;
+  connecting: boolean;
+  connectVerified: 'verified' | 'failed' | undefined;
+  printingTest: boolean;
   onSaveTv: () => void;
   onCast: () => void;
   onSavePrinter: () => void;
   onTestPrinter: () => void;
+  onPrintTest: () => void;
+  onConnect: () => void;
   onDismiss: () => void;
 }) {
   const isTv = device.type === 'TV';
   const isPrinter = device.type === 'PRINTER';
+  const isConnectable = !!device.ip && device.connectionType !== 'USB'
+    && ['PC', 'APP', 'KIOSK', 'PHONE', 'ROUTER', 'IOT', 'UNKNOWN'].includes(device.type);
   const sourceCfg = DISCOVERY_SOURCE_CONFIG[device.source];
   const SourceIcon = sourceCfg?.icon ?? RadioTower;
+  const typeCfg = device.type !== 'UNKNOWN' ? DEVICE_TYPE_CONFIG[device.type as keyof typeof DEVICE_TYPE_CONFIG] : null;
+  const confidence = typeof device.confidence === 'number' ? device.confidence : undefined;
+  const isBlasti = device.category === 'BLASTI';
 
   return (
-    <div className="flex items-center gap-2.5 rounded-xl border bg-background px-3 py-2.5">
-      <div className={`p-2 rounded-lg shrink-0 ${sourceCfg?.color ?? 'bg-muted'}`}>
-        {isPrinter ? <Printer className="h-4 w-4" /> : isTv ? <Tv className="h-4 w-4" /> : device.connectionType === 'USB' ? <Usb className="h-4 w-4" /> : <RadioTower className="h-4 w-4" />}
+    <div className={`flex items-center gap-2.5 rounded-xl border bg-background px-3 py-2.5 ${isBlasti ? 'border-emerald-300/60 dark:border-emerald-900/50' : ''}`}>
+      <div className={`p-2 rounded-lg shrink-0 ${typeCfg?.color ?? sourceCfg?.color ?? 'bg-muted'}`}>
+        <DiscoveredTypeIcon device={device} />
       </div>
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium">{device.name}</p>
-        <p className="text-[11px] text-muted-foreground truncate" dir="ltr">
-          {device.ip ? `${device.ip}${device.port ? `:${device.port}` : ''}` : (device.cupsName || 'USB')}
+        <div className="flex items-center gap-1.5 min-w-0">
+          <p className="truncate text-sm font-medium">{device.name}</p>
+          {device.cached && device.status !== 'ONLINE' && (
+            <span className="shrink-0 rounded-full bg-muted px-1.5 py-px text-[9px] text-muted-foreground">
+              {getLocalizedString('سابق', 'cache', 'cached', lang)}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-1 flex-wrap text-[11px] text-muted-foreground">
+          <span className="truncate" dir="ltr">
+            {device.ip ? `${device.ip}${device.port ? `:${device.port}` : ''}` : (device.cupsName || 'USB')}
+          </span>
+          {typeCfg && (
+            <span className={`rounded-full px-1.5 py-px text-[9px] ${typeCfg.color}`}>
+              {getLocalizedLabel(typeCfg, lang)}
+            </span>
+          )}
+          {isBlasti && device.blastiMode === 'kiosk' && (
+            <span className="rounded-full bg-teal-100 text-teal-700 dark:bg-teal-950/40 dark:text-teal-400 px-1.5 py-px text-[9px]">
+              {getLocalizedString('كيوسك', 'kiosque', 'kiosk', lang)}
+            </span>
+          )}
+          {typeof confidence === 'number' && (
+            <span className={`rounded-full px-1.5 py-px text-[9px] ${
+              confidence >= 85
+                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-400'
+                : confidence >= 60
+                  ? 'bg-amber-100 text-amber-700 dark:bg-amber-950/40 dark:text-amber-400'
+                  : 'bg-muted text-muted-foreground'
+            }`}>
+              {confidence}%
+            </span>
+          )}
           {' · '}
           <SourceIcon className="inline h-3 w-3" /> {sourceCfg?.labelEn ?? device.source}
           {isDefaultPrinter ? ` · ${getLocalizedString('افتراضية', 'défaut', 'default', lang)}` : ''}
-        </p>
+        </div>
       </div>
-      <div className="flex items-center gap-1 shrink-0">
+      <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end">
         {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />}
         {isTv && (
           <>
@@ -1295,7 +1417,29 @@ function DiscoveredCard({
             <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={onTestPrinter}>
               {getLocalizedString('اختبار', 'Tester', 'Test', lang)}
             </Button>
+            {device.ip && (
+              <Button variant="outline" size="sm" className="h-7 gap-1 text-xs" onClick={onPrintTest} disabled={printingTest} title="ESC/POS">
+                {printingTest ? <Loader2 className="h-3 w-3 animate-spin" /> : <Send className="h-3 w-3" />}
+                {getLocalizedString('صفحة اختبار', 'page test', 'test page', lang)}
+              </Button>
+            )}
           </>
+        )}
+        {isConnectable && (
+          <Button
+            variant="outline"
+            size="sm"
+            className={`h-7 gap-1 text-xs ${connectVerified === 'verified' ? 'border-emerald-300 text-emerald-700 dark:text-emerald-400' : connectVerified === 'failed' ? 'border-red-200 text-red-600' : ''}`}
+            onClick={onConnect}
+            disabled={connecting}
+          >
+            {connecting ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plug className="h-3 w-3" />}
+            {connectVerified === 'verified'
+              ? getLocalizedString('متصل', 'Connecté', 'Connected', lang)
+              : connectVerified === 'failed'
+                ? getLocalizedString('غير متاح', 'Injoignable', 'Unreachable', lang)
+                : getLocalizedString('اتصال', 'Connecter', 'Connect', lang)}
+          </Button>
         )}
         <Button variant="ghost" size="icon" className="h-7 w-7" onClick={onDismiss} aria-label="dismiss">
           <X className="h-3.5 w-3.5" />

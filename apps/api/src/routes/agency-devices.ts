@@ -1,5 +1,8 @@
 import os from 'node:os'
-import { Hono, type Context } from 'hono'
+import fs from 'node:fs'
+import path from 'node:path'
+import net from 'node:net'
+import { Hono, type Context, type MiddlewareHandler } from 'hono'
 import { db, dbRaw } from '@blasti/db'
 import { requireAuth, authErrorResponse, AuthError } from '../lib/auth'
 import { z } from 'zod'
@@ -20,13 +23,21 @@ import {
   recordFailedRequest,
 } from '../lib/rate-limit'
 import { calculateETA, getEffectiveServiceTime, filterGhostTickets } from '../lib/eta-calculator'
+import { todayLocalDateString } from '../lib/queue-waiting'
 import {
   runDiscoveryScan,
   getLocalSubnets,
   getNetworkInterfacesDetailed,
   getProtocolAvailability,
+  tcpProbePort,
+  httpProbe,
+  fingerprintDevice,
+  blastiIdentifyProbe,
   SCAN_PORTS as EMBEDDED_SCAN_PORTS,
+  TCP_SWEEP_PORTS,
+  type BlastiIdentifyResult,
   type DiscoveredDeviceRaw,
+  type DeviceType,
   type ScanPhase,
 } from '../lib/discovery/scanner'
 // Task 5-a — real multi-protocol cast engine (DLNA SOAP, Samsung Tizen WS,
@@ -45,7 +56,14 @@ import {
   type CastTarget,
 } from '../lib/discovery/cast-service'
 
-const app = new Hono()
+// 0.6.78 — the printAuth middleware on POST /discovery/print resolves the
+// kiosk device from the X-Device-Token header and hands it to the route
+// handler through this context variable.
+interface AgencyDevicesEnv {
+  Variables: { printDevice?: { agencyId: string | null } }
+}
+
+const app = new Hono<AgencyDevicesEnv>()
 
 // ─── JSON parse helper (M8) ────────────────────────────────────────────────
 
@@ -2685,9 +2703,62 @@ let scanState = {
   protocolsUsed: [] as string[],
   elapsed: 0,
 }
-let scanDevices: Array<DiscoveredDeviceRaw> = []
+/** One entry of the embedded scan device list. `cached` / `verifiedAt` are
+ *  0.6.78 additions from the persistent discovery cache (additive JSON). */
+type ScanDeviceRecord = DiscoveredDeviceRaw & { cached?: boolean; verifiedAt?: number }
+let scanDevices: ScanDeviceRecord[] = []
 let scanAbort: { aborted: boolean } | null = null
 let scanTimer: ReturnType<typeof setInterval> | null = null
+
+// ─── Persistent discovery cache (0.6.78) ─────────────────────────────────────
+// The last scan's results are written to ~/.blasti/discovery-cache.json so the
+// Device Manager opens with the PREVIOUSLY DISCOVERED devices (typed, named,
+// marked STALE) instead of an empty list. Live scan results replace them as
+// they stream in; the cache is refreshed (debounced) during the scan.
+
+function discoveryCachePath(): string {
+  return process.env.BLASTI_DISCOVERY_CACHE
+    ? path.resolve(process.env.BLASTI_DISCOVERY_CACHE)
+    : path.join(os.homedir(), '.blasti', 'discovery-cache.json')
+}
+
+function loadDiscoveryCache(): ScanDeviceRecord[] {
+  try {
+    const raw = fs.readFileSync(discoveryCachePath(), 'utf8')
+    const parsed = JSON.parse(raw) as { devices?: unknown } | null
+    if (!parsed || !Array.isArray(parsed.devices)) return []
+    return (parsed.devices as ScanDeviceRecord[])
+      .filter((d) => d && typeof d.ip === 'string' && !d.ip.startsWith('local:'))
+      .slice(0, 500)
+  } catch { return [] }
+}
+
+function markCachedDevice(d: ScanDeviceRecord): ScanDeviceRecord {
+  return { ...d, status: 'STALE', cached: true, capabilities: Array.isArray(d.capabilities) ? d.capabilities : [] }
+}
+
+let discoveryCacheSaveTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleDiscoveryCacheSave(): void {
+  if (discoveryCacheSaveTimer) return
+  discoveryCacheSaveTimer = setTimeout(() => {
+    discoveryCacheSaveTimer = null
+    try {
+      const file = discoveryCachePath()
+      fs.mkdirSync(path.dirname(file), { recursive: true })
+      const payload = {
+        savedAt: new Date().toISOString(),
+        devices: scanDevices
+          .filter((d) => d && typeof d.ip === 'string' && !d.ip.startsWith('local:'))
+          .slice(0, 500),
+      }
+      fs.writeFileSync(`${file}.tmp`, JSON.stringify(payload))
+      fs.renameSync(`${file}.tmp`, file)
+    } catch { /* best-effort — cache must never break a scan */ }
+  }, 2000)
+}
+
+// Preload the cache so the UI shows previously discovered devices instantly.
+scanDevices = loadDiscoveryCache().map(markCachedDevice)
 
 async function runEmbeddedScan() {
   if (scanState.scanning) return
@@ -2706,7 +2777,11 @@ async function runEmbeddedScan() {
     protocolsUsed: [],
     elapsed: 0,
   }
-  scanDevices = []
+  // Start from the cached devices (STALE) — live results replace them as the
+  // scanner streams each identified device, so the UI never shows an empty
+  // list and previously discovered entries keep their type/name while the
+  // fresh scan runs. (0.6.78)
+  scanDevices = loadDiscoveryCache().map(markCachedDevice)
   scanAbort = { aborted: false }
 
   const startTime = Date.now()
@@ -2729,6 +2804,7 @@ async function runEmbeddedScan() {
         const idx = scanDevices.findIndex((x) => x.ip === d.ip)
         if (idx >= 0) scanDevices[idx] = d
         else scanDevices.push(d)
+        scheduleDiscoveryCacheSave()
       },
     })
     scanState.phase = scanAbort?.aborted ? 'idle' : 'complete'
@@ -2744,6 +2820,7 @@ async function runEmbeddedScan() {
       clearInterval(scanTimer)
       scanTimer = null
     }
+    scheduleDiscoveryCacheSave()
   }
 }
 
@@ -2762,7 +2839,7 @@ function stopEmbeddedScan() {
 function healthResponse() {
   return {
     status: 'ok',
-    message: 'Embedded multi-protocol discovery active (ARP + Ping + mDNS + SSDP + HTTP)',
+    message: 'Embedded multi-protocol discovery active (ARP + Ping + TCP + mDNS + SSDP + WS-Discovery + HTTP)',
     fallback: 'embedded',
     uptime: process.uptime(),
     version: '2.0.0-embedded',
@@ -2855,6 +2932,223 @@ function diagnosticsResponse() {
       heapTotal: mem.heapTotal,
     },
     source: 'embedded',
+  }
+}
+
+// ─── Raw ESC/POS network printing (0.6.78 connect protocol) ─────────────────
+// Kiosk / counter ticket printing over the LAN without any OS driver:
+// a raw TCP socket to the printer's JetDirect port (default 9100) carrying an
+// ESC/POS receipt (header, big ticket number, service lines, optional QR,
+// paper cut). Works for every ESC/POS thermal printer — Epson, Xprinter,
+// GPrinter, Rongta, HP, Bixolon, … — as long as :9100 is reachable.
+
+/** One detail line of an ESC/POS receipt. */
+interface EscposTicketLine {
+  text: string
+  bold?: boolean
+}
+
+interface EscposTicketSpec {
+  title?: string
+  subtitle?: string
+  ticketNumber?: string
+  lines?: Array<string | EscposTicketLine>
+  qrData?: string
+  footer?: string
+  /** Characters per line (32 for 58mm printers, 42/48 for 80mm). */
+  widthCols?: number
+}
+
+/** Build one ESC/POS receipt buffer. All inputs optional; sane defaults. */
+function buildEscposTicket({ title, subtitle, ticketNumber, lines = [], qrData, footer, widthCols = 42 }: EscposTicketSpec): Buffer {
+  const ESC = 0x1b
+  const GS = 0x1d
+  const chunks: Buffer[] = []
+  const push = (...bytes: number[]) => chunks.push(Buffer.from(bytes))
+  const text = (s: unknown) => chunks.push(Buffer.from(String(s == null ? '' : s), 'latin1'))
+  const textLine = (s: unknown) => { text(String(s == null ? '' : s).slice(0, widthCols)); push(0x0a) }
+  const sep = () => textLine('-'.repeat(Math.max(16, Math.min(48, widthCols))))
+
+  // init — reset styles
+  push(ESC, 0x40)
+  // codepage CP437-ish; keep latin1 (Arabic receipts should use the OS print path)
+  // centered ON
+  push(ESC, 0x61, 0x01)
+  if (title) {
+    // double height+width for the header
+    push(GS, 0x21, 0x11)
+    textLine(title)
+    push(GS, 0x21, 0x00)
+  }
+  if (subtitle) textLine(subtitle)
+  // normal style, center
+  push(ESC, 0x61, 0x01)
+  sep()
+  if (ticketNumber) {
+    // 4× tall for the ticket number
+    push(GS, 0x21, 0x33)
+    textLine(ticketNumber)
+    push(GS, 0x21, 0x00)
+  }
+  sep()
+  // left-aligned detail lines
+  push(ESC, 0x61, 0x00)
+  for (const line of lines) {
+    if (line == null) continue
+    if (typeof line === 'object' && line.bold) {
+      push(ESC, 0x45, 0x01)
+      textLine(line.text)
+      push(ESC, 0x45, 0x00)
+    } else {
+      textLine(typeof line === 'string' ? line : line.text)
+    }
+  }
+  // QR (standard ESC/POS GS ( k commands)
+  if (qrData) {
+    try {
+      const data = Buffer.from(String(qrData), 'utf8')
+      if (data.length > 0 && data.length < 1024) {
+        push(ESC, 0x61, 0x01)
+        // function 165: model
+        push(GS, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00)
+        // function 167: module size (6)
+        push(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, 0x06)
+        // function 169: error correction M
+        push(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31)
+        // function 180: store data
+        const pl = (data.length + 3) & 0xff
+        const ph = ((data.length + 3) >> 8) & 0xff
+        push(GS, 0x28, 0x6b, pl, ph, 0x31, 0x50, 0x30)
+        chunks.push(data)
+        // function 181: print
+        push(GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30)
+      }
+    } catch { /* skip QR on any error */ }
+  }
+  push(ESC, 0x61, 0x01)
+  if (footer) textLine(footer)
+  // feed + partial cut
+  push(0x0a, 0x0a, 0x0a)
+  push(GS, 0x56, 0x42, 0x00)
+  return Buffer.concat(chunks)
+}
+
+type RawPrintResult = { ok: true; bytesSent: number; latencyMs: number } | { ok: false; error: string }
+
+/**
+ * Open a raw TCP socket to ip:port and write the payload.
+ * Resolves {ok, bytesSent, latencyMs} or {ok:false, error}.
+ */
+function sendRawToPrinter(ip: string, port: number, payload: Buffer, timeoutMs = 6000): Promise<RawPrintResult> {
+  return new Promise((resolve) => {
+    const startedAt = Date.now()
+    let settled = false
+    const sock = new net.Socket()
+    const finish = (result: RawPrintResult) => {
+      if (settled) return
+      settled = true
+      try { sock.destroy() } catch { /* already closed */ }
+      resolve(result)
+    }
+    sock.setTimeout(timeoutMs)
+    sock.once('connect', () => {
+      sock.write(payload, (err) => {
+        if (err) finish({ ok: false, error: err.message })
+        // give the printer a moment to accept the buffer, then close
+        setTimeout(() => finish({ ok: true, bytesSent: payload.length, latencyMs: Date.now() - startedAt }), 250)
+      })
+    })
+    sock.once('timeout', () => finish({ ok: false, error: 'timeout' }))
+    sock.once('error', (err) => finish({ ok: false, error: err && err.message ? err.message : 'connect failed' }))
+    try { sock.connect(port, ip) } catch (err) { finish({ ok: false, error: err instanceof Error ? err.message : 'connect failed' }) }
+  })
+}
+
+/** Connection profile returned by POST /discovery/connect (0.6.78). */
+interface DeviceConnectionProfile {
+  reachable: boolean
+  latencyMs: number | null
+  openPorts: number[]
+  type: DeviceType
+  name: string
+  manufacturer: undefined
+  confidence: number
+  blasti: BlastiIdentifyResult | null
+  connection: {
+    ip: string
+    port: number
+    protocols: {
+      rawPrint: boolean
+      ipp: boolean
+      blastiApi: boolean
+      castSamsung: boolean
+      castRoku: boolean
+      smb: boolean
+      rdp: boolean
+    }
+  }
+}
+
+/**
+ * Deep-identification probe behind POST /discovery/connect.
+ * TCP-connects the device's ports, asks for the BLASTI /api/discover marker,
+ * and returns a connection profile the UI can act on.
+ */
+async function buildConnectionProfile(ip: string, preferredPort?: number): Promise<DeviceConnectionProfile> {
+  const portsToTry = preferredPort ? [preferredPort] : [3080, 9100, 80, 8001, 8060, 445, 631, 3389]
+  const openPorts: number[] = []
+  for (const p of portsToTry.slice(0, 8)) {
+    // eslint-disable-next-line no-await-in-loop — bounded (≤8) sequential probes
+    if (await tcpProbePort(ip, p, 900)) openPorts.push(p)
+  }
+  // BLASTI identity (kiosk vs desktop, version, role)
+  let blasti: BlastiIdentifyResult | null = null
+  const blastiPorts = [...new Set([preferredPort, 3080, 3003, 3000].filter((p): p is number => !!p))]
+  for (const p of blastiPorts) {
+    // eslint-disable-next-line no-await-in-loop — bounded (≤4) sequential probes
+    const found = await blastiIdentifyProbe(ip, p, 1200)
+    if (found) { blasti = { ...found, apiPort: p }; break }
+  }
+  // HTTP title on the first open non-BLASTI port (best-effort name hint)
+  let httpTitle: string | undefined
+  const httpPort = openPorts.find((p) => p === 80 || p === 8080 || p === 5000) || openPorts[0]
+  if (httpPort && !blasti) {
+    const probe = await httpProbe(ip, httpPort, { timeoutMs: 1200 })
+    if (probe && probe.title) httpTitle = probe.title
+  }
+  const fp = fingerprintDevice({
+    ip,
+    port: preferredPort || openPorts[0] || 0,
+    httpTitle,
+    httpServer: blasti ? 'blasti-local' : undefined,
+    tcpServices: openPorts.map((p) => {
+      const entry = TCP_SWEEP_PORTS.find((t) => t.port === p)
+      return entry ? entry.service : `port-${p}`
+    }),
+    blastiMode: blasti ? blasti.mode : undefined,
+  })
+  return {
+    reachable: openPorts.length > 0 || !!blasti,
+    latencyMs: null,
+    openPorts,
+    type: fp.type,
+    name: blasti ? blasti.name : (fp.name && !fp.name.startsWith('Device @') ? fp.name : (httpTitle || fp.name)),
+    manufacturer: undefined,
+    confidence: fp.confidence,
+    blasti,
+    connection: {
+      ip,
+      port: preferredPort || openPorts[0] || 0,
+      protocols: {
+        rawPrint: openPorts.includes(9100),
+        ipp: openPorts.includes(631),
+        blastiApi: !!blasti,
+        castSamsung: openPorts.includes(8001),
+        castRoku: openPorts.includes(8060),
+        smb: openPorts.includes(445),
+        rdp: openPorts.includes(3389),
+      },
+    },
   }
 }
 
@@ -3002,6 +3296,163 @@ app.get('/discovery/diagnostics', async (c) => {
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ═══ Connect protocol (0.6.78) ═══════════════════════════════════════
+// Deep-identify one discovered device and return its connection profile —
+// the ports that are actually open, whether it is a BLASTI instance (and in
+// which mode), and which cast/print protocols the UI can offer. Also marks
+// the device as verified in the persistent discovery cache.
+
+// POST /discovery/connect — Deep-identify one device + mark it verified
+app.post('/discovery/connect', async (c) => {
+  try {
+    await requireAuth(c)
+    const raw = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    // Same validation contract as the desktop CommonJS port: ip required
+    // (≤50 chars), port optional 1..65535 (invalid → treated as absent).
+    const ip = typeof raw.ip === 'string' && raw.ip.length > 0 && raw.ip.length <= 50 ? raw.ip : null
+    if (!ip) return c.json({ success: false, error: 'ip: required string' }, 400)
+    const port = raw.port === undefined || raw.port === null
+      ? undefined
+      : (Number.isInteger(Number(raw.port)) && Number(raw.port) >= 1 && Number(raw.port) <= 65535 ? Number(raw.port) : undefined)
+    const startedAt = Date.now()
+    const profile = await buildConnectionProfile(ip, port)
+    profile.latencyMs = Date.now() - startedAt
+    // Mark verified in the in-memory list + refresh the cache entry
+    const entry = scanDevices.find((d) => d.ip === ip)
+    if (entry) {
+      entry.status = 'ONLINE'
+      entry.lastSeen = Date.now()
+      entry.cached = false
+      entry.verifiedAt = Date.now()
+      if (profile.type && entry.type !== profile.type) entry.type = profile.type
+      if (profile.blasti) {
+        entry.blastiMode = profile.blasti.mode
+        entry.appVersion = profile.blasti.version || entry.appVersion
+        entry.blastiInfo = { ...(entry.blastiInfo || {}), instanceId: profile.blasti.instanceId, master: profile.blasti.master, role: profile.blasti.role }
+      }
+      scheduleDiscoveryCacheSave()
+    }
+    return c.json({ success: true, verified: profile.reachable, profile })
+  } catch (error: unknown) {
+    if (isRateLimitError(error)) {
+      return c.json(rateLimitErrorResponse(error).data, 429)
+    }
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error ?? (error instanceof Error ? error.message : 'Connect probe failed') }, err.status as any)
+  }
+})
+
+// Raw ESC/POS ticket print — accepts EITHER a staff session (manager "print
+// test page") OR a kiosk deviceToken in the X-Device-Token header, so a
+// kiosk can print its tickets on the agency's LAN printer without any OS
+// driver. The printer target: explicit ip:port, else the agency's saved
+// default printer.
+const printAuth: MiddlewareHandler<AgencyDevicesEnv> = async (c, next) => {
+  const deviceToken = c.req.header('x-device-token')
+  if (deviceToken) {
+    try {
+      const device = await db.agencyDevice.findUnique({ where: { deviceToken } })
+      if (device) {
+        c.set('printDevice', device)
+        await next()
+        return
+      }
+    } catch { /* fall through to staff auth */ }
+  }
+  // Staff session path — shape auth failures like every other route here.
+  try {
+    await requireAuth(c)
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+  await next()
+}
+
+const discoveryPrintSchema = z.object({
+  ip: z.string().max(50).optional(),
+  port: z.number().int().min(1).max(65535).optional(),
+  test: z.boolean().optional(),
+  ticket: z.object({
+    agencyName: z.string().max(200).optional(),
+    branchName: z.string().max(200).optional(),
+    ticketNumber: z.string().max(100).optional(),
+    lines: z.array(z.union([
+      z.string().max(500),
+      z.object({ text: z.string().max(500), bold: z.boolean().optional() }),
+    ])).max(200).optional(),
+    qrData: z.string().max(1000).optional(),
+    footer: z.string().max(200).optional(),
+  }).optional(),
+})
+
+// POST /discovery/print — Raw ESC/POS ticket print (kiosk token OR staff)
+app.post('/discovery/print', printAuth, async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    const validation = discoveryPrintSchema.safeParse(body)
+    if (!validation.success) {
+      return c.json({ success: false, error: 'Invalid input', details: validation.error.issues }, 400)
+    }
+    const printBody = validation.data
+    // Kiosk device stashed by the printAuth middleware (kiosk path only).
+    const kioskDevice = c.get('printDevice')
+    let ip = printBody.ip
+    let port = printBody.port
+
+    // No explicit target → the agency's saved default printer
+    if (!ip) {
+      let agencyId: string | null = null
+      if (kioskDevice) {
+        agencyId = kioskDevice.agencyId
+      } else {
+        const user = await requireAuth(c)
+        agencyId = user.agencyId
+      }
+      if (!agencyId) return c.json({ success: false, error: 'ip required (no default printer context)' }, 400)
+      try {
+        const def = await db.defaultPrinter.findUnique({ where: { agencyId } })
+        if (def && def.ip) {
+          ip = def.ip
+          port = port || (def.port || 9100)
+        }
+      } catch { /* fall through */ }
+    }
+    if (!ip) return c.json({ success: false, error: 'No printer target — save a default printer or pass ip' }, 400)
+
+    // Ticket content: either a structured ticket, or a simple test page
+    const isTest = !!printBody.test
+    const ticket = printBody.ticket || {}
+    const payload = buildEscposTicket({
+      title: ticket.agencyName || (isTest ? 'BLASTI' : undefined),
+      subtitle: ticket.branchName || (isTest ? 'Printer test page' : undefined),
+      ticketNumber: ticket.ticketNumber || (isTest ? 'T-001' : undefined),
+      lines: isTest
+        ? [
+            { text: `Date: ${new Date().toISOString()}`, bold: false },
+            { text: `Target: ${ip}:${port || 9100}` },
+            'Connection: raw TCP / ESC-POS',
+            'If you can read this, the',
+            'printer is connected.',
+          ]
+        : (ticket.lines || []),
+      qrData: ticket.qrData,
+      footer: ticket.footer || (isTest ? 'BLASTI' : 'Thank you'),
+    })
+    const result = await sendRawToPrinter(ip, port || 9100, payload, 6000)
+    if (!result.ok) {
+      return c.json({ success: false, error: result.error || 'Printer unreachable', target: `${ip}:${port || 9100}` }, 502)
+    }
+    return c.json({ success: true, bytesSent: result.bytesSent, latencyMs: result.latencyMs, target: `${ip}:${port || 9100}` })
+  } catch (error: unknown) {
+    if (isRateLimitError(error)) {
+      return c.json(rateLimitErrorResponse(error).data, 429)
+    }
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error ?? (error instanceof Error ? error.message : 'Print failed') }, err.status as any)
   }
 })
 
