@@ -21,66 +21,84 @@
 # Caddy handles WebSocket upgrades automatically, so the realtime
 # socket and the REST API share the same public origin as the web
 # app — no CORS headaches, native shells always allowed by the API.
+#
+# 0.6.79 FIX — the SPEED ROUND 2 exclusion of app binaries used
+# `encode { match { not path_regexp … } }`, but encode's match block is
+# a RESPONSE matcher and only accepts `status` / `header` — a request
+# `path_regexp` there fails `caddy validate` and blocked every deploy
+# at the Caddy step. The exclusion is now done the valid way: a
+# download-only `handle` declared BEFORE the site-wide `encode` inside
+# an explicit `route` block (written order is honored inside route),
+# so binary responses never enter the encode middleware.
 # ════════════════════════════════════════════════════════════════
 
 {$SITE_ADDRESS} {
-        # Compression for text responses (JSON/HTML/JS/CSS). App binaries are
-        # excluded via the regex below — see the SPEED ROUND 2 note at /api/*.
-        encode {
-                match {
-                        not path_regexp app_binary_download ^/api/app-versions/.+/download$
-                }
-                zstd gzip
-        }
-
-        # API (Bun, :3003) — REST endpoints.
-        # NOTE: response caching/compression policy is set by the API itself
-        # (ETag + Cache-Control middleware). Caddy only compresses on the way
-        # out; it never re-compresses an already-encoded response.
-        # SPEED ROUND 2 (0.6.78) — two proxy-side changes for update delivery:
-        #   • flush_interval -1 → byte frames reach the client the moment the
-        #     API emits them (no proxy write-buffering on binary streams — the
-        #     desktop updater downloads each delta hop over several short
-        #     ranged requests where every buffered ms is visible),
-        #   • the encode middleware SKIPS app binaries (installers + delta
-        #     patches): they are pre-compressed, opaque octet-streams, so
-        #     gzip/zstd on the fly only burns VPS CPU per streamed byte and
-        #     can cap throughput below the client's line rate.
-        handle /api/* {
-                reverse_proxy api:3003 {
-                        flush_interval -1
-                }
-        }
-
-        # API — realtime engine.io/socket.io handshake + transports.
-        # flush_interval -1 → every frame is forwarded the moment it arrives
-        # (no proxy buffering on long-poll fallback transports).
-        handle /socket.io/* {
-                reverse_proxy api:3003 {
-                        flush_interval -1
-                }
-        }
-
-        # Everything else → Next.js web app (:3000)
-        handle {
-                # ── Performance Round — static asset caching ─────────────
-                # Fingerprinted build chunks already carry immutable caching
-                # from Next itself. Everything below overrides the upstream's
-                # `max-age=0` for public/ assets; `defer` makes our value win
-                # over the header the Next server just set.
-                #
-                # Icons/images/fonts/manifest/audio: 7 days (content changes
-                # are rare and redeploy-busting is acceptable for them).
-                @staticAssets {
-                        path *.png *.jpg *.jpeg *.gif *.svg *.ico *.webp *.avif
-                        path *.woff *.woff2 *.ttf *.otf *.eot
-                        path *.webmanifest *.wav *.mp3
-                }
-                header @staticAssets {
-                        Cache-Control "public, max-age=604800"
-                        defer
+        route {
+                # ── Binary downloads bypass compression (SPEED ROUND 2) ──
+                # Installers + delta patches are pre-compressed opaque
+                # octet-streams; gzip/zstd on the fly only burns VPS CPU per
+                # streamed byte and can cap throughput below the client's
+                # line rate. This handle is evaluated FIRST inside the route
+                # (handle blocks are mutually exclusive, first match wins),
+                # so download responses stream raw byte-for-byte.
+                # `*` matches ONE segment — the delta route has an extra
+                # `/delta/<id>/` hop, hence the second pattern.
+                handle /api/app-versions/*/download /api/app-versions/delta/*/download {
+                        reverse_proxy api:3003 {
+                                flush_interval -1
+                        }
                 }
 
-                reverse_proxy web:3000
+                # Compression for text responses (JSON/HTML/JS/CSS).
+                encode zstd gzip
+
+                # API (Bun, :3003) — REST endpoints.
+                # NOTE: response caching/compression policy is set by the API
+                # itself (ETag + Cache-Control middleware). Caddy only
+                # compresses on the way out; it never re-compresses an
+                # already-encoded response.
+                # flush_interval -1 → byte frames reach the client the moment
+                # the API emits them (no proxy write-buffering — the desktop
+                # updater downloads each delta hop over several short ranged
+                # requests where every buffered ms is visible).
+                handle /api/* {
+                        reverse_proxy api:3003 {
+                                flush_interval -1
+                        }
+                }
+
+                # API — realtime engine.io/socket.io handshake + transports.
+                # flush_interval -1 → every frame is forwarded the moment it
+                # arrives (no proxy buffering on long-poll fallback transports).
+                handle /socket.io/* {
+                        reverse_proxy api:3003 {
+                                flush_interval -1
+                        }
+                }
+
+                # Everything else → Next.js web app (:3000)
+                handle {
+                        # ── Performance Round — static asset caching ─────────
+                        # Fingerprinted build chunks already carry immutable
+                        # caching from Next itself. Everything below overrides
+                        # the upstream's `max-age=0` for public/ assets;
+                        # `defer` makes our value win over the header the Next
+                        # server just set.
+                        #
+                        # Icons/images/fonts/manifest/audio: 7 days (content
+                        # changes are rare and redeploy-busting is acceptable
+                        # for them).
+                        @staticAssets {
+                                path *.png *.jpg *.jpeg *.gif *.svg *.ico *.webp *.avif
+                                path *.woff *.woff2 *.ttf *.otf *.eot
+                                path *.webmanifest *.wav *.mp3
+                        }
+                        header @staticAssets {
+                                Cache-Control "public, max-age=604800"
+                                defer
+                        }
+
+                        reverse_proxy web:3000
+                }
         }
 }
