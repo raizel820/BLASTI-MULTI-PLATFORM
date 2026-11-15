@@ -145,20 +145,47 @@ function MobileBottomActionBar({ onMenuOpen, onLogout, t }: { onMenuOpen: () => 
  *     overlay used to scroll on touch drag (no lock on the motion.aside
  *     path; Radix locks it only inside the Sheet).
  *   • Escape closes the drawer (parity with Radix Sheet/Dialog behavior).
+ *
+ * 0.6.77 — counter-based lock ownership + view-change self-close. The old
+ * stale-`prev` restore could resurrect an older lock value (or wipe a newer
+ * one written by another owner) and leave the body permanently
+ * `overflow:hidden` — the "page can't scroll until refresh" report. The
+ * drawer also closes itself when the view swaps underneath it
+ * (blasti:view-changed from setView), so the lock can never outlive the
+ * navigation that opened it.
  */
 function useDrawerChrome(open: boolean, onClose: () => void): void {
   useEffect(() => {
     if (!open) return;
-    // Scroll-lock: remember the previous value so nested locks can't fight.
-    const prev = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
+    // 0.6.77 — the drawer markup is `lg:hidden` (≥lg shows the permanent
+    // aside instead). An open state on a wide viewport = an INVISIBLE drawer
+    // — locking the body there left the page unscrollable with nothing on
+    // screen to explain it (observed live: body overflow=hidden, backdrop
+    // display:none at 1280px). Only lock when the drawer can actually show.
+    if (typeof window !== 'undefined' && window.innerWidth >= 1024) {
+      const onKeyWide = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+      const onViewChangedWide = () => onClose();
+      window.addEventListener('keydown', onKeyWide);
+      window.addEventListener('blasti:view-changed', onViewChangedWide);
+      return () => {
+        window.removeEventListener('keydown', onKeyWide);
+        window.removeEventListener('blasti:view-changed', onViewChangedWide);
+      };
+    }
+    // Lock only if no other owner already locked the body — and release only
+    // what WE locked (removeProperty, never a stale captured value).
+    const weLocked = document.body.style.overflow !== 'hidden';
+    if (weLocked) document.body.style.overflow = 'hidden';
+    const onViewChanged = () => onClose();
+    window.addEventListener('blasti:view-changed', onViewChanged);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
     };
     window.addEventListener('keydown', onKey);
     return () => {
-      document.body.style.overflow = prev;
+      if (weLocked) document.body.style.removeProperty('overflow');
       window.removeEventListener('keydown', onKey);
+      window.removeEventListener('blasti:view-changed', onViewChanged);
     };
   }, [open, onClose]);
 }
@@ -188,6 +215,19 @@ export function AdaptiveAgencySidebar({ open, onClose }: { open: boolean; onClos
 
   // 0.6.51 — body scroll-lock + Escape-to-close while any drawer is open.
   useDrawerChrome(open, onClose);
+
+  // 0.6.77 — a programmatic view swap (browser back, deep link, authority
+  // gate) must not leave OUR dialogs open under the new view: their Radix
+  // scroll lock (body[data-scroll-locked]) would survive the navigation and
+  // block page scrolling until a full refresh.
+  useEffect(() => {
+    const closeSidebarOverlays = () => {
+      setChangePasswordOpen(false);
+      setHistoryOpen(false);
+    };
+    window.addEventListener('blasti:view-changed', closeSidebarOverlays);
+    return () => window.removeEventListener('blasti:view-changed', closeSidebarOverlays);
+  }, []);
 
   const handleChangePassword = async () => {
     if (!cpCurrentPwd || !cpNewPwd || !cpConfirmPwd) {

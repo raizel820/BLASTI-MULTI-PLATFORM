@@ -69,6 +69,19 @@ async function runSweepPass(): Promise<void> {
   const outcomes = await sweepExpiredCounterRequests()
   for (const outcome of outcomes) {
     if (outcome.kind === 'AUTO_APPROVED') {
+      // 0.6.77 — the DISPLACED holder learns of the takeover instantly (the
+      // console matches by counterId and shows the loss banner) instead of
+      // at its next heartbeat, up to a minute later.
+      void emitCounterEvent('counter:lost', outcome.agencyId, {
+        agencyId: outcome.agencyId,
+        counterId: outcome.counterId,
+        counterName: outcome.counterName,
+        counterNumber: outcome.counterNumber,
+        reason: 'AUTO_APPROVED_TAKEOVER',
+        previousController: outcome.previousControllerUserId
+          ? { userId: outcome.previousControllerUserId }
+          : null,
+      })
       void emitCounterEvent('counter:request-approved', outcome.agencyId, {
         agencyId: outcome.agencyId,
         requestId: outcome.requestId,

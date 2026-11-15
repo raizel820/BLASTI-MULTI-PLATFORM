@@ -1462,6 +1462,19 @@ async function handleCounterClaim(c: Context) {
         })
         if (transferred.ok) {
           const actor = await counterActorSummary(user.id, user.fullName || user.username)
+          // 0.6.77 — tell the DISPLACED holder IMMEDIATELY. Without this the
+          // previous holder only learned of the takeover via its next
+          // heartbeat (≤60s later) — the delayed "ghost claim dialog"
+          // report. The console matches by counterId and demotes to the
+          // loss banner.
+          emitCounterEvent('counter:lost', agencyId, {
+            agencyId,
+            counterId: counter.id,
+            counterName: counter.name,
+            counterNumber: counter.number,
+            reason: 'FORCED_TRANSFER',
+            previousController: result.controlledBy ?? null,
+          })
           emitCounterEvent('counter:claimed', agencyId, {
             agencyId,
             counterId: counter.id,

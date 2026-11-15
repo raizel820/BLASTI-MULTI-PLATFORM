@@ -103,6 +103,8 @@ interface TermForm {
 const EMPTY_TERM_FORM: TermForm = { key: '', valueAr: '', valueEn: '', valueFr: '' };
 
 // Quick-pick dictionary keys the admin most likely wants to override.
+// 0.6.76 — matches the audited CATEGORY_TERM_KEYS the agent generates:
+// six stat labels + the three queue-sentence keys.
 const SUGGESTED_KEYS: string[] = [
   'customer',
   'totalCustomers',
@@ -110,6 +112,9 @@ const SUGGESTED_KEYS: string[] = [
   'waitingCustomers',
   'customerReviews',
   'customersPerHour',
+  'noQueue',
+  'noCustomersWaiting',
+  'customerJoinedQueue',
 ];
 
 // ─── Helpers ────────────────────────────────────────────────────────

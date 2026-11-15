@@ -321,6 +321,9 @@ async function queueStatusResponse(db, agencyId, deviceId) {
       agency: {
         id: agency.id, name: agency.name, nameAr: agency.nameAr, nameFr: agency.nameFr,
         logoUrl: agency.logoUrl, isQueueOpen: agency.isQueueOpen, isPaused,
+        // 0.6.76 — mirrors the cloud queue-status: TV boards use it to
+        // activate the agency's specialized terminology scope.
+        category: agency.category || null,
       },
       currentlyServing: servingReservations.map((r) => ({
         id: r.id, ticketNumber: r.displayNumber, serviceId: r.serviceId, serviceName: r.service.name,

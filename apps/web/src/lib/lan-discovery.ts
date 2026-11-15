@@ -70,29 +70,19 @@ export interface DiscoveredServer {
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const DISCOVERY_ENDPOINT = '/api/discover';
-const DISCOVERY_TIMEOUT = 1000; // 1s per IP — local HTTP beacons answer in ms
+const DISCOVERY_TIMEOUT = 800; // 0.6.75: local HTTP beacons answer in ms — 800ms is generous
 const CACHE_KEY = 'blasti_lan_server';
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes cache
-const SCAN_CONCURRENCY = 10; // Scan 10 IPs at once
+// 0.6.75 speed pass: bounded worker pool (48) instead of sequential waves of
+// 10 — the batch loop waited for the slowest IP of each wave (up to one full
+// timeout) before the next wave started, so a /24 took ~13s in the worst case.
+const SCAN_CONCURRENCY = 48; // Probe 48 IPs at once (32–64 recommended band)
 const SCAN_CAP = 128; // Max IPs scanned per subnet — bounds a full sweep
 const DEFAULT_API_PORT = parseInt(process.env.NEXT_PUBLIC_API_PORT || '3080', 10);
 
-// Common LAN subnets to scan
-const LAN_SUBNETS = [
-  '192.168.1',   // Most home routers
-  '192.168.0',   // Alternative common subnet
-  '192.168.2',   // Less common but exists
-  '10.0.0',      // Corporate networks
-  '10.0.1',      // Apple AirPort
-  '192.168.4',   // Android hotspot
-  '172.16.0',    // Corporate VPN
-  '192.168.5',   // M30: Additional common subnets
-  '192.168.8',
-  '192.168.86',
-  '192.168.10',
-  '10.0.2',      // VirtualBox/Genymotion
-  '169.254',     // L12: Link-local addresses
-];
+// M27: single-sweep mutex — 0.6.75 restores the actual flag (the check
+// existed but the flag was never assigned, so the mutex never engaged).
+let isScanning = false;
 
 // ─── Cache Management ───────────────────────────────────────────────────────
 
@@ -195,13 +185,17 @@ async function scanIP(ip: string, port: number): Promise<DiscoveredServer | null
  * blasti._tcp.local — names nothing in the system announces — so it burned
  * a DNS timeout on every discovery pass. The gateway .1 is where the BLASTI
  * desktop (often also the router/NAT) is most likely to live.
+ * 0.6.75: all gateways probed in PARALLEL (was: one sequential await each).
  */
 async function checkGatewayServers(subnets: string[]): Promise<DiscoveredServer | null> {
-  for (const subnet of subnets) {
-    const server = await scanIP(`${subnet}.1`, DEFAULT_API_PORT);
-    if (server) return server;
-  }
-  return null;
+  const results = await Promise.all(
+    subnets.map((subnet) => scanIP(`${subnet}.1`, DEFAULT_API_PORT))
+  );
+  return (
+    results
+      .filter((r): r is DiscoveredServer => r !== null)
+      .sort((a, b) => lanAuthorityRank(a) - lanAuthorityRank(b))[0] ?? null
+  );
 }
 
 // ─── Localhost Check ────────────────────────────────────────────────────────
@@ -226,29 +220,37 @@ async function scanSubnet(
   // unresponsive hosts; SCAN_CAP bounds each subnet scan.
   const ips = Array.from({ length: Math.min(254, SCAN_CAP) }, (_, i) => `${subnet}.${i + 1}`);
   const total = ips.length;
+  // 0.6.75 — bounded worker pool instead of sequential batches of 10. The old
+  // loop waited for the SLOWEST IP of each batch (up to one full timeout)
+  // before starting the next batch; a shared-index worker pool keeps every
+  // slot busy and stops the whole subnet the moment an elected MASTER answers.
+  let index = 0;
   let scanned = 0;
+  let best: DiscoveredServer | null = null;
+  let bestRank = 3; // 0 = MASTER (best possible) … 2 = unknown — 3 = none yet
 
-  // Scan in batches of SCAN_CONCURRENCY
-  for (let i = 0; i < ips.length; i += SCAN_CONCURRENCY) {
-    const batch = ips.slice(i, i + SCAN_CONCURRENCY);
-    const results = await Promise.all(
-      batch.map(async (ip) => {
+  const workers = Array.from(
+    { length: Math.min(SCAN_CONCURRENCY, ips.length) },
+    async () => {
+      while (index < ips.length) {
+        if (bestRank === 0) return; // early exit — nothing beats a MASTER
+        const ip = ips[index++];
         const result = await scanIP(ip, port);
         scanned++;
         onProgress?.(scanned, total);
-        return result;
-      })
-    );
+        if (result) {
+          const rank = lanAuthorityRank(result);
+          if (rank < bestRank) {
+            bestRank = rank;
+            best = result;
+          }
+        }
+      }
+    }
+  );
 
-    // 0.6.23: prefer an elected MASTER over a FOLLOWER/unknown node when a
-    // single sweep batch finds several desktops (stable rank, then first hit).
-    const found = results
-      .filter((r): r is DiscoveredServer => r !== null)
-      .sort((a, b) => lanAuthorityRank(a) - lanAuthorityRank(b))[0];
-    if (found) return found;
-  }
-
-  return null;
+  await Promise.all(workers);
+  return best;
 }
 
 // ─── Local Subnet Derivation (Task 2-b) ─────────────────────────────────
@@ -286,56 +288,64 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
   // M27: Check isScanning mutex
   if (isScanning) return null;
   if (typeof window === 'undefined') return null;
+  isScanning = true;
+  try {
+    const derived = await deriveCandidateSubnets();
 
-  // Check cache
-  const cached = getCachedServer();
-  if (cached) {
-    // Filter out stale cache entries pointing to wrong ports (3003 = cloud, not LAN)
-    const cachePort = cached.apiPort || cached.port;
-    if (cachePort === 3000 || cachePort === 3003) {
-      clearCache();
-    } else {
+    // 0.6.75 — stage 1 runs in PARALLEL: cached-server liveness, localhost
+    // probe and all derived-subnet gateway probes used to run back-to-back,
+    // each paying up to one full timeout before the next stage started.
+    const cached = getCachedServer();
+    const cacheTask = (async (): Promise<DiscoveredServer | null> => {
+      if (!cached) return null;
+      // Filter out stale cache entries pointing to wrong ports (3003 = cloud, not LAN)
+      const cachePort = cached.apiPort || cached.port;
+      if (cachePort === 3000 || cachePort === 3003) {
+        clearCache();
+        return null;
+      }
       // H14: Use apiPort for cache liveness check
       const alive = await scanIP(cached.ip, cachePort);
       if (alive) return alive;
       clearCache();
+      return null;
+    })();
+    const localhostTask = checkLocalhost();
+    const gatewayTask = checkGatewayServers(derived);
+
+    const [cachedAlive, localhost, gateway] = await Promise.all([
+      cacheTask,
+      localhostTask,
+      gatewayTask,
+    ]);
+
+    // Strict precedence preserved from the sequential version:
+    // a live cached server > localhost > derived-subnet gateway.
+    if (cachedAlive) return cachedAlive;
+    if (localhost) {
+      cacheServer(localhost); // M26: Cache localhost result
+      return localhost;
     }
-  }
-
-  // Check localhost
-  const localhost = await checkLocalhost();
-  if (localhost) {
-    cacheServer(localhost); // M26: Cache localhost result
-    return localhost;
-  }
-
-  // Probe the gateway (.1) of the derived subnet(s), then scan them.
-  const derived = await deriveCandidateSubnets();
-  const gateway = await checkGatewayServers(derived);
-  if (gateway) {
-    cacheServer(gateway); // M26: Cache gateway result
-    return gateway;
-  }
-
-  const scannedSubnets = new Set<string>(); // M25
-  for (const subnet of derived) {
-    scannedSubnets.add(subnet); // M25: Track scanned subnet
-    const server = await scanSubnet(subnet, DEFAULT_API_PORT);
-    if (server) {
-      cacheServer(server);
-      return server;
+    if (gateway) {
+      cacheServer(gateway); // M26: Cache gateway result
+      return gateway;
     }
-  }
 
-  // Try the most common subnet (M25: skip if already scanned)
-  if (!scannedSubnets.has('192.168.1')) {
-    scannedSubnets.add('192.168.1');
-    const commonServer = await scanSubnet('192.168.1', DEFAULT_API_PORT);
-    if (commonServer) {
-      cacheServer(commonServer);
-      return commonServer;
-    }
-  }
+    // 0.6.75 — all candidate subnets scan CONCURRENTLY; the sequential loop
+    // paid a full sweep per subnet before even trying the next one. The
+    // common subnet (M25) joins the candidates instead of a second pass;
+    // equal ranks keep candidate order (derived subnets first, stable sort).
+    const candidates = derived.includes('192.168.1') ? derived : [...derived, '192.168.1'];
+    const found = (
+      await Promise.all(candidates.map((subnet) => scanSubnet(subnet, DEFAULT_API_PORT)))
+    )
+      .filter((s): s is DiscoveredServer => s !== null)
+      .sort((a, b) => lanAuthorityRank(a) - lanAuthorityRank(b));
 
-  return null;
+    const winner = found[0] ?? null;
+    if (winner) cacheServer(winner);
+    return winner;
+  } finally {
+    isScanning = false;
+  }
 }

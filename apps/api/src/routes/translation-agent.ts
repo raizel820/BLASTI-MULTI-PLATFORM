@@ -7,6 +7,7 @@ import {
   startTranslationAgentScheduler,
   testTranslationApiKey,
   enqueueCategoryTranslations,
+  enqueueCategoryTermGeneration,
   logAgentAction,
   AGENT_LANGS,
   DEFAULT_AGENT_MODEL,
@@ -408,8 +409,19 @@ app.post('/enqueue-category', async (c) => {
     const body = await c.req.json().catch(() => ({}))
     const categoryId = String(body.categoryId || '').trim()
     if (!categoryId) return c.json({ success: false, error: 'categoryId is required' }, 400)
-    const summary = await enqueueCategoryTranslations(categoryId, await actorOf(c))
-    return c.json({ success: true, data: { summary } })
+    const actor = await actorOf(c)
+    const summary = await enqueueCategoryTranslations(categoryId, actor)
+    // 0.6.76 — also queue the SPECIALIZED terminology generation: any audited
+    // key (customer/noQueue/...) the category is still missing gets derived by
+    // the agent in the category's own domain vocabulary. Admin-deleted keys
+    // come back ONLY through this explicit button — never on boot.
+    let termsQueued = false
+    try {
+      termsQueued = await enqueueCategoryTermGeneration(categoryId, actor)
+    } catch (termsErr) {
+      console.warn('[translation-agent] term generation queue failed (non-fatal):', termsErr instanceof Error ? termsErr.message : termsErr)
+    }
+    return c.json({ success: true, data: { summary, termsQueued } })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as 500)

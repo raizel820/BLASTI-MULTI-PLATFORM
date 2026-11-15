@@ -68,6 +68,9 @@ export interface TvQueueStatus {
     logoUrl?: string | null;
     isQueueOpen: boolean;
     isPaused: boolean;
+    /** 0.6.76 — agency category slug → drives the TV's specialized
+     *  terminology scope ("Patient" instead of "Customer"). */
+    category?: string | null;
   };
   currentlyServing: TvCurrentlyServing[];
   counters?: TvCounter[];

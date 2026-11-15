@@ -11,7 +11,8 @@
  *                           iPhones, Chromecasts that ignore everything else)
  *   3. mDNS / DNS-SD       — UDP multicast to 224.0.0.251:5353
  *   4. SSDP / UPnP         — UDP multicast M-SEARCH to 239.255.255.250:1900
- *   5. HTTP probe          — fetch on an expanded port set incl. 631/9100/8001/9197/8060
+ *   5. HTTP/HTTPS probe    — fetch on an expanded port set incl. 631/9100/8001/9197/8060;
+ *                           raw TLS handshake + same-socket GET for 443/8443
  *   6. Fingerprinting      — categorise BLASTI / NETWORK / UPNP, type TV/PRINTER/APP/...
  *
  * All multicast/probe work is async, abortable, and concurrency-limited.
@@ -22,6 +23,7 @@ import os from 'node:os'
 import fs from 'node:fs'
 import dgram from 'node:dgram'
 import net from 'node:net'
+import tls from 'node:tls'
 import dns from 'node:dns/promises'
 import { spawn } from 'node:child_process'
 import { Buffer } from 'node:buffer'
@@ -129,14 +131,27 @@ export const SCAN_PORTS = [
   49152, // UPnP ephemeral
 ]
 
-// Speed pass (Task 5-a): tighter windows, higher concurrency — same protocol
-// coverage, less dead time per scan.
+/** Ports in SCAN_PORTS that speak TLS — they get a raw TLS handshake probe
+ *  instead of a plain-HTTP fetch, which can never succeed against them and
+ *  used to burn the full HTTP timeout on every (ip, 443/8443) pair. */
+const TLS_PORTS = new Set<number>([443, 8443])
+// Staged TLS budgets (independent windows, never summed): the TLS handshake
+// and the HTTP response each get their own ceiling.
+const TLS_HANDSHAKE_TIMEOUT_MS = 900
+const HTTPS_RESP_TIMEOUT_MS = 700
+/** Cap on the raw bytes collected by httpsProbe before parsing. */
+const RAW_RESPONSE_CAP = 16384
+
+// Speed pass (Task 5-a / 0.6.75): tighter windows, higher concurrency — same
+// protocol coverage, far less dead time per scan.
 const PING_CONCURRENCY = 128
 // 0.6.74 speed pass: 400ms catches every LAN host on healthy Wi-Fi; the ping
 // sweep is 2 batches of 254 ÷ 128 → ~0.8s total instead of ~1.4s.
 const PING_TIMEOUT_MS = 400
-const HTTP_CONCURRENCY = 16
-const HTTP_TIMEOUT_MS = 1100
+// 0.6.75: HTTP probe concurrency 16→48 and timeout 1100→800ms — a /24 × 13
+// port sweep drains ~5× faster; LAN servers answer headers in <100ms anyway.
+const HTTP_CONCURRENCY = 48
+const HTTP_TIMEOUT_MS = 800
 // 0.6.74 speed pass: mDNS/SSDP answer within ~2.5s on real networks; 3s keeps
 // a margin for standby TVs without lengthening the total scan.
 const MDNS_TIMEOUT_MS = 3000
@@ -147,7 +162,10 @@ const SSDP_TIMEOUT_MS = 3000
 // WSD 5357) and phone/cast ports (iOS sync 62078, AirPlay 7000, Chromecast
 // 8008/8009) are probed here with raw net.Socket connect attempts.
 const TCP_SWEEP_CONCURRENCY = 128
-const TCP_SWEEP_TIMEOUT_MS = 1200
+// 0.6.75: 1200→700ms — a TCP connect is one SYN→SYN-ACK round trip on a LAN;
+// only unreachable hosts ever hit the ceiling, and they cost the sweep 128
+// sockets in parallel anyway.
+const TCP_SWEEP_TIMEOUT_MS = 700
 /** Hard cap on the whole tcp-sweep window (all subnets × all ports). */
 const TCP_SWEEP_MAX_WINDOW_MS = 9000
 
@@ -1789,6 +1807,108 @@ export async function httpProbe(
     clearTimeout(timer)
     return null
   }
+}
+
+// ─── 5a. TLS / HTTPS probe (0.6.75 speed pass) ────────────────────────────
+
+/**
+ * Raw TLS handshake check. Establishes a TLS session and destroys it — no
+ * HTTP request is sent. `rejectUnauthorized: false` is appropriate HERE ONLY:
+ * discovery probes LAN devices that overwhelmingly present self-signed
+ * certificates. Connections that carry credentials always validate certs.
+ */
+export function tlsProbePort(
+  ip: string,
+  port: number,
+  opts: { timeoutMs?: number; isAborted?: () => boolean } = {},
+): Promise<boolean> {
+  const timeoutMs = opts.timeoutMs ?? TLS_HANDSHAKE_TIMEOUT_MS
+  const isAborted = opts.isAborted ?? (() => false)
+  return new Promise((resolve) => {
+    if (isAborted()) return resolve(false)
+    let settled = false
+    const socket = tls.connect({ host: ip, port, rejectUnauthorized: false })
+    const finish = (result: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { socket.destroy() } catch { /* already closed */ }
+      resolve(result)
+    }
+    const timer = setTimeout(() => finish(false), timeoutMs)
+    socket.once('secureConnect', () => finish(true))
+    socket.once('error', () => finish(false))
+    socket.once('timeout', () => finish(false))
+    socket.setTimeout(timeoutMs)
+  })
+}
+
+/** Parse a raw HTTP response captured by httpsProbe into an HttpProbeResult. */
+function parseRawHttpResponse(raw: string): HttpProbeResult | null {
+  if (!raw) return null
+  const headerEnd = raw.indexOf('\r\n\r\n')
+  if (headerEnd < 0) return null
+  const head = raw.slice(0, headerEnd)
+  const body = raw.slice(headerEnd + 4)
+  const statusLine = head.split('\r\n')[0] || ''
+  const status = Number.parseInt(statusLine.split(' ')[1] || '0', 10) || 0
+  let server = ''
+  const serverMatch = head.match(/^server:\s*(.*)$/im)
+  if (serverMatch) server = serverMatch[1].trim()
+  let title = ''
+  const titleMatch = body.match(/<title[^>]*>(.*?)<\/title>/i)
+  if (titleMatch) title = titleMatch[1].trim().slice(0, 200)
+  return { title, server, status, body: body.slice(0, 4096) }
+}
+
+/**
+ * HTTPS probe: TLS handshake first (fast rejection of dead hosts), then a
+ * minimal HTTP/1.1 GET written over the SAME socket to grab the status line,
+ * Server header and <title> — one round trip, capped at RAW_RESPONSE_CAP
+ * bytes. Staged timeouts: the TLS handshake and the response window are
+ * independent, so a slow handshake never eats into the response budget.
+ */
+export function httpsProbe(
+  ip: string,
+  port: number,
+  opts: { isAborted?: () => boolean } = {},
+): Promise<HttpProbeResult | null> {
+  const isAborted = opts.isAborted ?? (() => false)
+  return new Promise((resolve) => {
+    if (isAborted()) return resolve(null)
+    let settled = false
+    let buffer = ''
+    let tlsTimer: ReturnType<typeof setTimeout> | undefined
+    let respTimer: ReturnType<typeof setTimeout> | undefined
+    const socket = tls.connect({ host: ip, port, rejectUnauthorized: false })
+    const finish = (result: HttpProbeResult | null) => {
+      if (settled) return
+      settled = true
+      if (tlsTimer) clearTimeout(tlsTimer)
+      if (respTimer) clearTimeout(respTimer)
+      try { socket.destroy() } catch { /* already closed */ }
+      resolve(result)
+    }
+    // Stage 1 — TLS handshake window (independent of the response window).
+    tlsTimer = setTimeout(() => finish(null), TLS_HANDSHAKE_TIMEOUT_MS)
+    socket.once('secureConnect', () => {
+      if (settled) return
+      if (tlsTimer) clearTimeout(tlsTimer)
+      // Stage 2 — response window: minimal GET on the same socket.
+      respTimer = setTimeout(() => finish(parseRawHttpResponse(buffer)), HTTPS_RESP_TIMEOUT_MS)
+      try {
+        socket.write(`GET / HTTP/1.1\r\nHost: ${ip}\r\nConnection: close\r\n\r\n`)
+      } catch { finish(null); return }
+    })
+    socket.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('latin1')
+      if (buffer.length >= RAW_RESPONSE_CAP) finish(parseRawHttpResponse(buffer))
+    })
+    socket.once('error', () => finish(parseRawHttpResponse(buffer)))
+    socket.once('close', () => finish(parseRawHttpResponse(buffer)))
+    socket.once('timeout', () => finish(parseRawHttpResponse(buffer)))
+    socket.setTimeout(HTTPS_RESP_TIMEOUT_MS)
+  })
 }
 
 // ─── UPnP device description fetch ──────────────────────────────────────────
@@ -3511,9 +3631,13 @@ export async function runDiscoveryScan(
         for (let i = 1; i <= 254; i++) allProbeIps.add(`${subnet}.${i}`)
       }
     }
-    const probeQueue: Array<{ ip: string; port: number }> = []
+    // 0.6.75 — split the queue by transport: TLS ports (443/8443) get a raw
+    // TLS handshake + same-socket GET; plain ports keep the fetch probe.
+    // Probing https ports with plain http used to fail 100% of the time while
+    // still paying the full timeout for every pair.
+    const probeQueue: Array<{ ip: string; port: number; tls: boolean }> = []
     for (const ip of allProbeIps) {
-      for (const port of SCAN_PORTS) probeQueue.push({ ip, port })
+      for (const port of SCAN_PORTS) probeQueue.push({ ip, port, tls: TLS_PORTS.has(port) })
     }
 
     let httpScanned = 0
@@ -3523,16 +3647,18 @@ export async function runDiscoveryScan(
         if (cb.isAborted()) return
         const job = probeQueue.shift()
         if (!job) break
-        const result = await httpProbe(job.ip, job.port, { isAborted: cb.isAborted })
+        const result = job.tls
+          ? await httpsProbe(job.ip, job.port, { isAborted: cb.isAborted })
+          : await httpProbe(job.ip, job.port, { isAborted: cb.isAborted })
         if (result) {
           upsertDevice(job.ip, {
             source: 'http_probe',
             port: job.port,
-            httpUrl: `http://${job.ip}:${job.port}`,
+            httpUrl: `${job.tls ? 'https' : 'http'}://${job.ip}:${job.port}`,
             httpTitle: result.title,
             httpServer: result.server,
             httpStatus: result.status,
-            capabilities: [`HTTP:${job.port}`],
+            capabilities: [`${job.tls ? 'HTTPS' : 'HTTP'}:${job.port}`],
           })
         }
         httpScanned++
@@ -3681,7 +3807,7 @@ export function getProtocolAvailability(): ProtocolAvailability[] {
     {
       name: 'HTTP',
       status: 'available',
-      description: `Probes ports: ${SCAN_PORTS.join(', ')} (runs LAST so mDNS/SSDP/rDNS/DHCP names are not overwritten by HTTP titles)`,
+      description: `Probes ports: ${SCAN_PORTS.join(', ')} — plain-HTTP GET with <title> extraction (${HTTP_CONCURRENCY} workers, ${HTTP_TIMEOUT_MS}ms) and raw TLS handshake + same-socket GET for HTTPS ports 443/8443 (self-signed tolerant, staged 900ms handshake / 700ms response). Runs LAST so mDNS/SSDP/rDNS/DHCP names are not overwritten by HTTP titles`,
     },
     {
       name: 'USB/CUPS',

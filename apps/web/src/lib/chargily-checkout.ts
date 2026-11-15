@@ -164,7 +164,17 @@ function computeReturnHints(): { returnUrl?: string; deepLink?: string } {
   // The deep-link bounce makes sense on Capacitor AND Electron — both shells
   // register the blasti:// handler. Without it the desktop payer stayed on
   // the web app after paying (0.6.37 report) instead of returning to the app.
-  const deepLink = (isCapacitorShell() || isElectronShell()) && returnUrl ? MOBILE_DEEP_LINK : undefined;
+  //
+  // 0.6.76 — the deep link is now INDEPENDENT of the resolved returnUrl.
+  // Previously it was only issued when a PUBLIC origin had been resolved —
+  // but a shell page origin is always device-local (Capacitor =
+  // https://localhost, Electron = http://127.0.0.1:3080) and a shell's cloud
+  // fallback can be a LAN address too, so real desktop/mobile payments went
+  // out with NO `deep` param: after paying, the gateway dropped the payer on
+  // the web result page in the browser forever (the "always to webapp"
+  // report) while the app kept waiting. The API resolves the public base on
+  // its own — the deep param only needs to ride along.
+  const deepLink = isCapacitorShell() || isElectronShell() ? MOBILE_DEEP_LINK : undefined;
   return { returnUrl, deepLink };
 }
 

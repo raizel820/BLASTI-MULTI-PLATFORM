@@ -498,7 +498,7 @@ export async function sweepStaleCounterControl(): Promise<SweptCounter[]> {
 }
 
 export type ExpiredRequestOutcome =
-  | { kind: 'AUTO_APPROVED'; requestId: string; reason: 'HOLDER_GONE'; agencyId: string; counterId: string; counterName: string; counterNumber: number; fromUserId: string }
+  | { kind: 'AUTO_APPROVED'; requestId: string; reason: 'HOLDER_GONE'; agencyId: string; counterId: string; counterName: string; counterNumber: number; fromUserId: string; previousControllerUserId?: string | null }
   | { kind: 'EXPIRED'; requestId: string; reason: 'HOLDER_ACTIVE' | 'NOT_MEMBER' | 'TRANSFER_RACE'; agencyId: string; counterId: string; counterName: string; counterNumber: number; fromUserId: string }
 
 /**
@@ -586,6 +586,9 @@ export async function sweepExpiredCounterRequests(): Promise<ExpiredRequestOutco
           counterName: req.counter.name,
           counterNumber: req.counter.number,
           fromUserId: req.fromUserId,
+          // 0.6.77 — the displaced holder, so the sweeper's counter:lost
+          // emit can name them (console matches by counterId anyway).
+          previousControllerUserId: counter?.controlledByUserId ?? null,
         })
         continue
       }

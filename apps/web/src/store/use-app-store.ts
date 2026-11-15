@@ -800,6 +800,15 @@ export const useAppStore = create<AppState>()(
           previousView: state.currentView,
           sidebarOpen: false,
         }));
+        // 0.6.77 — announce the swap so MOUNTED overlays self-close
+        // (notification panel, sidebar dialogs). setView can fire without a
+        // user gesture (back button, deep link, authority gate) and swaps the
+        // view UNDER an open overlay — any scroll lock or fixed backdrop that
+        // overlay owns would otherwise survive until a full refresh (the
+        // "page can't scroll until refresh" report).
+        if (typeof window !== 'undefined') {
+          try { window.dispatchEvent(new CustomEvent('blasti:view-changed', { detail: { view } })); } catch { /* ignore */ }
+        }
         // Sync hash after state update
         updateHashForView(view);
       },

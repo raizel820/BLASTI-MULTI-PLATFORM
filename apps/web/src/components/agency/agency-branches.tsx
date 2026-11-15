@@ -1,5 +1,26 @@
 'use client';
 
+/**
+ * AgencyBranches — Branches & Counters management (0.6.77 full rebuild).
+ *
+ * Design contract (fixes the "collapsed text / oversized icons / too-small
+ * staff selector" report):
+ *   • Two tabs — "Branches" (branch cards with inline counters) and
+ *     "Counters" (agency-wide counter grid) — both reusing ONE counter-card
+ *     component so the management surface is identical everywhere.
+ *   • The counter STAFF SELECTOR is a full-size, labelled Select
+ *     (h-9, min-w 10rem, visible name) — replacing the old 32×32 px
+ *     icon-only trigger that hid who was assigned.
+ *   • No scale-75 switches, no unlabeled h-8 w-8 icon-only controls: every
+ *     control carries an aria-label (or visible label) and a ≥36px hit area.
+ *   • Text columns are min-w-0 + truncate with title tooltips — nothing is
+ *     clipped mid-glyph; badges wrap instead of squeezing.
+ *
+ * All API interactions, the map/location flow, QR generation and the
+ * stale-local-API diagnostics are preserved verbatim from the previous
+ * implementation (Tasks 40/45/83-b, r21-5/7/8, P2-10).
+ */
+
 import { useState, useEffect, useCallback, useRef } from 'react';
 // Hotfix 0.6.12 — the `'counterServices' as TranslationKeys` casts below
 // referenced this type without importing it (type-only, so it never crashed
@@ -16,6 +37,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
   Dialog,
   DialogContent,
@@ -190,8 +212,13 @@ interface CounterWithStaff {
   staff?: { id: string; user: { fullName: string; username: string } } | null;
   currentReservation?: { id: string; displayNumber: string; status: string } | null;
   currentReservationId?: string | null;
+  // r21-7 — live CONTROL state (GET /counters enrichment; per-branch lists
+  // on older local builds may omit it — all optional).
+  controlledByName?: string | null;
   // P2-10 — services this counter is bound to (empty = serves everything).
-  counterServices?: { service: { id: string; name: string; nameAr?: string | null; nameFr?: string | null; prefix: string } }[];
+  // `prefix` is optional: the agency-wide /counters select omits it, the
+  // per-branch list carries it — UI falls back to the service name.
+  counterServices?: { service: { id: string; name: string; nameAr?: string | null; nameFr?: string | null; prefix?: string } }[];
 }
 
 // P2-10 — minimal service shape for the counter binding picker.
@@ -235,6 +262,11 @@ export function AgencyBranches() {
   const [counters, setCounters] = useState<CounterWithStaff[]>([]);
   const [countersLoading, setCountersLoading] = useState(false);
   const [staffList, setStaffList] = useState<StaffMember[]>([]);
+
+  // 0.6.77 — Counters tab (agency-wide surface, GET /api/agency/counters).
+  const [activeTab, setActiveTab] = useState<'branches' | 'counters'>('branches');
+  const [allCounters, setAllCounters] = useState<CounterWithStaff[]>([]);
+  const [allCountersLoading, setAllCountersLoading] = useState(false);
 
   // Branch dialog
   const [branchDialogOpen, setBranchDialogOpen] = useState(false);
@@ -287,6 +319,10 @@ export function AgencyBranches() {
   // Counter dialog
   const [counterDialogOpen, setCounterDialogOpen] = useState(false);
   const [editingCounter, setEditingCounter] = useState<CounterWithStaff | null>(null);
+  // 0.6.77 — the branch the dialog writes into. Previously the handlers
+  // read `expandedBranch`, which forced counters management to live inside
+  // an expanded branch card; the Counters tab passes its own target.
+  const [counterDialogBranchId, setCounterDialogBranchId] = useState<string | null>(null);
   const [counterNumber, setCounterNumber] = useState(1);
   const [counterName, setCounterName] = useState('');
   const [counterNameAr, setCounterNameAr] = useState('');
@@ -298,7 +334,7 @@ export function AgencyBranches() {
 
   // Delete dialog
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
-  const [deletingItem, setDeletingItem] = useState<{ type: 'branch' | 'counter'; id: string; name: string } | null>(null);
+  const [deletingItem, setDeletingItem] = useState<{ type: 'branch' | 'counter'; id: string; name: string; branchId?: string } | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
 
   // Staff assignment
@@ -512,6 +548,30 @@ export function AgencyBranches() {
       setCountersLoading(false);
     }
   }, [t]);
+
+  // 0.6.77 — Counters tab feed: ONE agency-wide fetch (r21-7 enriched rows:
+  // staff, current reservation, control name, bound services).
+  const fetchAllCounters = useCallback(async () => {
+    if (!agencyId) return;
+    setAllCountersLoading(true);
+    try {
+      const res = await apiFetch(`/api/agency/counters?agencyId=${agencyId}`);
+      if (res.ok) {
+        const data = await res.json();
+        setAllCounters(unwrapListPayload<CounterWithStaff>(data, ['counters']));
+      }
+    } catch {
+      // silent — the tab keeps its previous rows
+    } finally {
+      setAllCountersLoading(false);
+    }
+  }, [agencyId]);
+
+  // Load the Counters tab data on first activation (and after every mutation
+  // that touched counters — the fetchAllCounters() calls in the handlers).
+  useEffect(() => {
+    if (activeTab === 'counters') void fetchAllCounters();
+  }, [activeTab, fetchAllCounters]);
 
   const toggleBranchExpand = (branchId: string) => {
     if (expandedBranch === branchId) {
@@ -810,7 +870,9 @@ export function AgencyBranches() {
       });
       if (res.ok) {
         toast.success(counter.isActive ? t('inactive') : t('active'));
+        // 0.6.77 — refresh BOTH surfaces (the branch panel and the tab feed).
         fetchCounters(counter.branchId);
+        fetchAllCounters();
       } else {
         const data = await res.json();
         toast.error(data.error || t('error'));
@@ -823,9 +885,12 @@ export function AgencyBranches() {
   };
 
   // Counter CRUD
-  const openCreateCounterDialog = (_branchId: string) => {
+  const openCreateCounterDialog = (branchId: string) => {
     setEditingCounter(null);
-    setCounterNumber(counters.length + 1);
+    // 0.6.77 — explicit dialog target (branch card OR Counters tab).
+    setCounterDialogBranchId(branchId);
+    const branchCounters = branchId === expandedBranch ? counters : allCounters.filter((c) => c.branchId === branchId);
+    setCounterNumber((branchCounters.length || 0) + 1);
     setCounterName('');
     setCounterNameAr('');
     setCounterNameFr('');
@@ -835,6 +900,7 @@ export function AgencyBranches() {
 
   const openEditCounterDialog = (counter: CounterWithStaff) => {
     setEditingCounter(counter);
+    setCounterDialogBranchId(counter.branchId);
     setCounterNumber(counter.number);
     setCounterName(counter.name);
     setCounterNameAr(counter.nameAr || '');
@@ -849,8 +915,13 @@ export function AgencyBranches() {
     );
   };
 
+  /** 0.6.77 — rows for the "services moved" toast, scoped to the dialog's branch. */
+  const countersForDialogBranch = counterDialogBranchId === expandedBranch
+    ? counters
+    : allCounters.filter((c) => c.branchId === counterDialogBranchId);
+
   const handleSaveCounter = async () => {
-    if (!expandedBranch || !counterName.trim()) return;
+    if (!counterDialogBranchId || !counterName.trim()) return;
     // Task 31 bug 5: creating counters requires an active subscription
     // (editing an existing one stays allowed — server only gates POST).
     if (!editingCounter && !subscriptionActive) {
@@ -863,7 +934,7 @@ export function AgencyBranches() {
     // unbinding) — surface that as an informational toast after the save.
     const movedServiceNames = counterServiceIds
       .filter((sid) =>
-        counters.some(
+        countersForDialogBranch.some(
           (c) => c.id !== editingCounter?.id && (c.counterServices || []).some((cs) => cs.service.id === sid),
         ))
       .map((sid) => {
@@ -874,7 +945,7 @@ export function AgencyBranches() {
       .filter(Boolean);
     try {
       if (editingCounter) {
-        const res = await apiFetch(`/api/agency/branches/${expandedBranch}/counters/${editingCounter.id}`, {
+        const res = await apiFetch(`/api/agency/branches/${counterDialogBranchId}/counters/${editingCounter.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -893,13 +964,14 @@ export function AgencyBranches() {
             toast.info(t('counterServiceMoved', { services: movedServiceNames.join('، ') }));
           }
           setCounterDialogOpen(false);
-          fetchCounters(expandedBranch);
+          fetchCounters(counterDialogBranchId);
+          fetchAllCounters();
         } else {
           const data = await res.json();
           toast.error(data.error || t('error'));
         }
       } else {
-        const res = await apiFetch(`/api/agency/branches/${expandedBranch}/counters`, {
+        const res = await apiFetch(`/api/agency/branches/${counterDialogBranchId}/counters`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -917,7 +989,8 @@ export function AgencyBranches() {
             toast.info(t('counterServiceMoved', { services: movedServiceNames.join('، ') }));
           }
           setCounterDialogOpen(false);
-          fetchCounters(expandedBranch);
+          fetchCounters(counterDialogBranchId);
+          fetchAllCounters();
           fetchBranches(); // Refresh counter counts
         } else {
           const data = await res.json();
@@ -932,8 +1005,8 @@ export function AgencyBranches() {
   };
 
   // Delete
-  const openDeleteDialog = (type: 'branch' | 'counter', id: string, name: string) => {
-    setDeletingItem({ type, id, name });
+  const openDeleteDialog = (type: 'branch' | 'counter', id: string, name: string, branchId?: string) => {
+    setDeletingItem({ type, id, name, branchId });
     setDeleteDialogOpen(true);
   };
 
@@ -946,6 +1019,7 @@ export function AgencyBranches() {
         if (res.ok) {
           toast.success(t('branchDeleted'));
           fetchBranches();
+          fetchAllCounters();
           if (expandedBranch === deletingItem.id) {
             setExpandedBranch(null);
             setCounters([]);
@@ -955,10 +1029,14 @@ export function AgencyBranches() {
           toast.error(data.error || t('error'));
         }
       } else {
-        const res = await apiFetch(`/api/agency/branches/${expandedBranch}/counters/${deletingItem.id}`, { method: 'DELETE' });
+        // 0.6.77 — branchId rides on deletingItem (works from BOTH tabs).
+        const branchId = deletingItem.branchId || expandedBranch;
+        if (!branchId) return;
+        const res = await apiFetch(`/api/agency/branches/${branchId}/counters/${deletingItem.id}`, { method: 'DELETE' });
         if (res.ok) {
           toast.success(t('counterDeleted'));
-          fetchCounters(expandedBranch!);
+          fetchCounters(branchId);
+          fetchAllCounters();
           fetchBranches();
         } else {
           const data = await res.json();
@@ -974,19 +1052,21 @@ export function AgencyBranches() {
     }
   };
 
-  // Staff assignment
-  const handleAssignStaff = async (counterId: string, staffId: string | null) => {
-    if (!expandedBranch) return;
+  // Staff assignment — 0.6.77: branchId is a parameter (not the expanded
+  // card), so assignment works identically from the branch panel and the
+  // Counters tab.
+  const handleAssignStaff = async (branchId: string, counterId: string, staffId: string | null) => {
     setAssigningCounterId(counterId);
     try {
-      const res = await apiFetch(`/api/agency/branches/${expandedBranch}/counters/${counterId}`, {
+      const res = await apiFetch(`/api/agency/branches/${branchId}/counters/${counterId}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ staffId }),
       });
       if (res.ok) {
         toast.success(staffId ? t('assignStaff') : t('unassignStaff'));
-        fetchCounters(expandedBranch);
+        fetchCounters(branchId);
+        fetchAllCounters();
       } else {
         const data = await res.json();
         toast.error(data.error || t('error'));
@@ -1072,72 +1152,262 @@ export function AgencyBranches() {
     return counter.name;
   };
 
+  // 0.6.77 — the ONE counter card used by BOTH surfaces (branch panel +
+  // Counters tab). Everything is full-size: labelled staff Select (h-9,
+  // min-w 10rem), regular Switch, labelled icon buttons with tooltips.
+  const renderCounterCard = (counter: CounterWithStaff, opts: { showBranch?: boolean } = {}) => {
+    const branchName = opts.showBranch
+      ? (() => {
+          const b = branches.find((x) => x.id === counter.branchId);
+          return b ? (b.specialName?.trim() || getBranchDisplayName(b)) : '';
+        })()
+      : null;
+    return (
+      <motion.div
+        key={counter.id}
+        layout
+        initial={{ opacity: 0.9, y: 4 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.18 }}
+        className={`rounded-2xl border p-4 transition-colors ${
+          !counter.isActive
+            ? 'border-gray-100 dark:border-gray-800 bg-gray-50/60 dark:bg-gray-900/40 opacity-80'
+            : 'border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-900/70 hover:border-emerald-200 dark:hover:border-emerald-900/50'
+        }`}
+      >
+        {/* Row 1 — identity */}
+        <div className="flex items-start gap-3 min-w-0">
+          <div className={`h-11 w-11 rounded-xl flex items-center justify-center flex-shrink-0 ${
+            counter.isActive
+              ? 'bg-gradient-to-br from-teal-500 to-emerald-600 text-white shadow-sm shadow-emerald-500/20'
+              : 'bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500'
+          }`}>
+            <span className="text-sm font-bold">{counter.number}</span>
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 flex-wrap">
+              <p className="text-sm font-semibold text-foreground truncate min-w-0" title={getCounterDisplayName(counter)}>
+                {getCounterDisplayName(counter)}
+              </p>
+              {!counter.isActive && (
+                <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-4.5 bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 gap-0.5">
+                  <Power className="h-2.5 w-2.5" />
+                  {t('inactive')}
+                </Badge>
+              )}
+              {branchName && (
+                <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4.5 text-muted-foreground border-gray-200 dark:border-gray-700 gap-0.5 max-w-40">
+                  <Building2 className="h-2.5 w-2.5 shrink-0" />
+                  <span className="truncate">{branchName}</span>
+                </Badge>
+              )}
+            </div>
+            <div className="flex items-center gap-2 mt-1 flex-wrap">
+              {counter.currentReservation ? (
+                <span className="text-xs text-amber-600 dark:text-amber-400 font-medium flex items-center gap-1">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse flex-shrink-0" />
+                  {t('currentlyServing')}: {counter.currentReservation.displayNumber}
+                </span>
+              ) : (
+                <span className="text-xs text-muted-foreground/70">{t('noCustomersWaiting')}</span>
+              )}
+              {counter.controlledByName && (
+                <span className="text-[10px] text-muted-foreground/70 flex items-center gap-1" title={counter.controlledByName}>
+                  <UserCheck className="h-3 w-3 flex-shrink-0" />
+                  <span className="truncate max-w-32">{counter.controlledByName}</span>
+                </span>
+              )}
+            </div>
+            {/* P2-10 — bound services (empty = every service). */}
+            {(counter.counterServices?.length ?? 0) > 0 ? (
+              <div className="flex items-center gap-1 mt-2 flex-wrap">
+                {counter.counterServices!.map((cs) => (
+                  <span
+                    key={cs.service.id}
+                    className="text-[10px] px-1.5 py-0.5 rounded-md bg-teal-50 dark:bg-teal-950/40 text-teal-700 dark:text-teal-300 border border-teal-200 dark:border-teal-900/50"
+                  >
+                    {cs.service.prefix || cs.service.name.slice(0, 2)}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <p className="text-[10px] text-muted-foreground/60 mt-2">{t('counterServicesAllHint' as TranslationKeys)}</p>
+            )}
+          </div>
+        </div>
+
+        {/* Row 2 — controls: full-size staff selector + labelled switch + actions */}
+        <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800/60 flex flex-col sm:flex-row sm:items-center gap-2.5">
+          {/* THE staff selector — full-size, labelled, always readable */}
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <UserCheck className="h-4 w-4 text-muted-foreground flex-shrink-0" aria-hidden="true" />
+            <Select
+              value={counter.staffId || '__none__'}
+              onValueChange={(val) => handleAssignStaff(counter.branchId, counter.id, val === '__none__' ? null : val)}
+              disabled={assigningCounterId === counter.id}
+            >
+              <SelectTrigger
+                className="h-9 w-full min-w-40 max-w-full sm:max-w-60 bg-background rounded-lg text-xs"
+                aria-label={t('assignStaff')}
+              >
+                <SelectValue placeholder={t('noStaffAssigned')} />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__none__">
+                  <span className="flex items-center gap-2 text-muted-foreground">
+                    <UserX className="h-3.5 w-3.5" />
+                    {t('unassignStaff')}
+                  </span>
+                </SelectItem>
+                {staffList.filter((s) => s.user.isActive).map((s) => (
+                  <SelectItem key={s.id} value={s.id}>
+                    <span className="flex items-center gap-2">
+                      <UserCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                      {s.user.fullName}
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {assigningCounterId === counter.id && (
+              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground flex-shrink-0" />
+            )}
+          </div>
+
+          <div className="flex items-center justify-between sm:justify-end gap-2.5">
+            {/* Active toggle — full size, labelled (no more scale-75) */}
+            <div className="flex items-center gap-2">
+              <Label className="text-xs text-muted-foreground whitespace-nowrap">{t('active')}</Label>
+              <Switch
+                checked={counter.isActive}
+                onCheckedChange={() => handleToggleCounterActive(counter)}
+                disabled={togglingCounterId === counter.id}
+                aria-label={`${t('active')} — ${getCounterDisplayName(counter)}`}
+                className="data-[state=checked]:bg-emerald-500 data-[state=unchecked]:bg-gray-300 dark:data-[state=unchecked]:bg-gray-600"
+              />
+            </div>
+            <div className="flex items-center gap-1">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-9 w-9 p-0 text-muted-foreground hover:text-foreground"
+                    onClick={() => openEditCounterDialog(counter)}
+                    aria-label={t('editCounter')}
+                  >
+                    <Edit3 className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{t('editCounter')}</TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-9 w-9 p-0 text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+                    onClick={() => openDeleteDialog('counter', counter.id, counter.name, counter.branchId)}
+                    aria-label={t('deleteCounter')}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>{t('deleteCounter')}</TooltipContent>
+              </Tooltip>
+            </div>
+          </div>
+        </div>
+      </motion.div>
+    );
+  };
+
   // Loading state
   if (loading) {
     return (
-      <div className="p-4 lg:p-6 space-y-4">
-        <div className="flex items-center justify-between">
-          <div className="space-y-2">
-            <Skeleton className="h-8 w-48" />
-            <Skeleton className="h-4 w-64" />
+      <div className="p-4 md:p-6 max-w-7xl mx-auto space-y-5 pb-28 lg:pb-10">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <Skeleton className="h-12 w-12 rounded-2xl" />
+            <div className="space-y-2 min-w-0">
+              <Skeleton className="h-7 w-48" />
+              <Skeleton className="h-4 w-64" />
+            </div>
           </div>
-          <Skeleton className="h-10 w-36 rounded-lg" />
+          <Skeleton className="h-10 w-36 rounded-xl" />
         </div>
-        <Skeleton className="h-32 rounded-2xl" />
-        <Skeleton className="h-32 rounded-2xl" />
-        <Skeleton className="h-24 rounded-2xl" />
+        <Skeleton className="h-10 w-full max-w-md rounded-xl" />
+        <div className="grid gap-3 xl:grid-cols-2">
+          <Skeleton className="h-36 rounded-2xl" />
+          <Skeleton className="h-36 rounded-2xl" />
+        </div>
       </div>
     );
   }
 
+  const totalCounters = branches.reduce((sum, b) => sum + (b._count?.counters || 0), 0);
+  const totalStaff = branches.reduce((sum, b) => sum + (b._count?.staff || 0), 0);
+
   return (
-    <div className="p-4 lg:p-6 space-y-4 pb-28">
+    <div className="relative p-4 md:p-6 max-w-7xl mx-auto space-y-5 pb-28 lg:pb-10">
       {/* Gradient top border */}
       <div className="absolute top-0 start-0 end-0 h-[3px] bg-gradient-to-r from-emerald-500 via-teal-400 to-emerald-500 rounded-full" />
 
-      {/* Header */}
+      {/* ── Header ── */}
       <motion.div
-        initial={{ opacity: 0, y: -10 }}
+        initial={{ opacity: 0, y: -8 }}
         animate={{ opacity: 1, y: 0 }}
-        className="flex items-center justify-between gap-4"
+        className="flex items-center justify-between gap-3 flex-wrap"
       >
-        <div className="min-w-0">
-          <h2 className="text-2xl font-bold text-foreground flex items-center gap-2">
-            <Building2 className="h-6 w-6 text-emerald-600 dark:text-emerald-400" />
-            {t('branches')}
-          </h2>
-          <p className="text-sm text-muted-foreground mt-1">{t('branchesDesc')}</p>
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="h-12 w-12 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-lg shadow-emerald-500/20 flex-shrink-0">
+            <Building2 className="h-6 w-6 text-white" />
+          </div>
+          <div className="min-w-0">
+            <h1 className="text-xl md:text-2xl font-bold text-foreground">{t('branches')}</h1>
+            <p className="text-sm text-muted-foreground mt-0.5 truncate">{t('branchesDesc')}</p>
+          </div>
         </div>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span className="inline-flex">
+        <div className="flex items-center gap-2">
+          <Tooltip>
+            <TooltipTrigger asChild>
               <Button
-                className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl shadow-lg shadow-emerald-500/20 gap-2 h-10 px-4 disabled:opacity-50"
-                onClick={openCreateBranchDialog}
-                disabled={!subscriptionActive}
+                variant="outline"
+                size="icon"
+                className="h-10 w-10 rounded-xl"
+                onClick={() => { fetchBranches(); fetchStaff(); fetchAllCounters(); }}
+                aria-label={t('refresh')}
               >
-                {!subscriptionActive ? <Lock className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
-                <span className="hidden sm:inline">{t('addBranch')}</span>
-                <span className="sm:hidden">{t('addBranch')}</span>
+                <RefreshCw className="h-4 w-4" />
               </Button>
-            </span>
-          </TooltipTrigger>
-          {!subscriptionActive && (
-            <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
-          )}
-        </Tooltip>
+            </TooltipTrigger>
+            <TooltipContent>{t('refresh')}</TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="inline-flex">
+                <Button
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl shadow-lg shadow-emerald-500/20 gap-2 h-10 px-4 disabled:opacity-50"
+                  onClick={openCreateBranchDialog}
+                  disabled={!subscriptionActive}
+                >
+                  {!subscriptionActive ? <Lock className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                  {t('addBranch')}
+                </Button>
+              </span>
+            </TooltipTrigger>
+            {!subscriptionActive && (
+              <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
+            )}
+          </Tooltip>
+        </div>
       </motion.div>
 
       {/* Task 40 round 4: the embedded local API predates the branch-list
           fixes (old install / old tray instance still owning :3080) — say so
           HERE instead of letting the list render a misleading empty state. */}
       {localApiStale && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="flex items-start gap-3 rounded-2xl border border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-950/30 p-4"
-          role="alert"
-        >
+        <div className="flex items-start gap-3 rounded-2xl border border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-950/30 p-4" role="alert">
           <div className="h-9 w-9 rounded-xl bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center flex-shrink-0">
             <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
           </div>
@@ -1148,22 +1418,14 @@ export function AgencyBranches() {
               <span className="font-mono font-semibold">{localApiStale.version ?? 'unknown'}</span>
             </p>
           </div>
-        </motion.div>
+        </div>
       )}
 
       {/* Task 45: a create returned 201 but the very next list of the SAME
           server did not contain the row — historically the silent "created a
-          branch and the desktop keeps showing no branches yet". Name the
-          divergence, show the server's workspace identity (Task 45
-          /api/health), and give the exact remediation. Auto-clears once a
-          refetch returns the row (e.g. after restart + sync). */}
+          branch and the desktop keeps showing no branches yet". */}
       {createDivergence && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="flex items-start gap-3 rounded-2xl border border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-950/30 p-4"
-          role="alert"
-        >
+        <div className="flex items-start gap-3 rounded-2xl border border-amber-200 dark:border-amber-900/40 bg-amber-50 dark:bg-amber-950/30 p-4" role="alert">
           <div className="h-9 w-9 rounded-xl bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center flex-shrink-0">
             <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
           </div>
@@ -1190,18 +1452,13 @@ export function AgencyBranches() {
             <RefreshCw className="h-4 w-4" />
             {t('retry')}
           </Button>
-        </motion.div>
+        </div>
       )}
 
       {/* Task 37-a: load failure surfaced with a retry (previously a silent
           empty list indistinguishable from "no branches yet") */}
       {loadError && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 rounded-2xl border border-red-200 dark:border-red-900/40 bg-red-50 dark:bg-red-950/30 p-4"
-          role="alert"
-        >
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 rounded-2xl border border-red-200 dark:border-red-900/40 bg-red-50 dark:bg-red-950/30 p-4" role="alert">
           <div className="flex items-center gap-3 min-w-0">
             <div className="h-9 w-9 rounded-xl bg-red-100 dark:bg-red-900/40 flex items-center justify-center flex-shrink-0">
               <Building2 className="h-4 w-4 text-red-600 dark:text-red-400" />
@@ -1220,434 +1477,355 @@ export function AgencyBranches() {
             <RefreshCw className="h-4 w-4" />
             {t('retry')}
           </Button>
-        </motion.div>
-      )}
-
-      {/* Summary stats */}
-      {branches.length > 0 && (
-        <motion.div
-          initial={{ opacity: 0, y: 10 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.05 }}
-          className="grid grid-cols-3 gap-2"
-        >
-          <div className="rounded-2xl bg-gradient-to-br from-emerald-500 to-emerald-700 p-3 text-white shadow-lg shadow-emerald-500/15">
-            <div className="flex items-center gap-1.5 mb-1">
-              <Building2 className="h-3.5 w-3.5 text-emerald-200" />
-              <span className="text-[10px] text-emerald-200 font-medium min-w-0 truncate">{t('branches')}</span>
-            </div>
-            <p className="text-xl sm:text-2xl font-black">{branches.length}</p>
-          </div>
-          <div className="rounded-2xl bg-gradient-to-br from-teal-500 to-teal-700 p-3 text-white shadow-lg shadow-teal-500/15">
-            <div className="flex items-center gap-1.5 mb-1">
-              <Monitor className="h-3.5 w-3.5 text-teal-200" />
-              <span className="text-[10px] text-teal-200 font-medium min-w-0 truncate">{t('counters')}</span>
-            </div>
-            <p className="text-xl sm:text-2xl font-black">
-              {branches.reduce((sum, b) => sum + (b._count?.counters || 0), 0)}
-            </p>
-          </div>
-          <div className="rounded-2xl bg-gradient-to-br from-amber-500 to-amber-700 p-3 text-white shadow-lg shadow-amber-500/15">
-            <div className="flex items-center gap-1.5 mb-1">
-              <Star className="h-3.5 w-3.5 text-amber-200" />
-              <span className="text-[10px] text-amber-200 font-medium min-w-0 truncate">{t('mainBranch')}</span>
-            </div>
-            <p className="text-xl sm:text-2xl font-black">
-              {branches.filter(b => b.isMain).length}
-            </p>
-          </div>
-        </motion.div>
-      )}
-
-      {/* Branches List */}
-      {branches.length === 0 ? (
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="flex flex-col items-center justify-center py-16 text-center"
-        >
-          <div className="h-20 w-20 rounded-2xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center mb-4">
-            <MapPin className="h-10 w-10 text-emerald-600 dark:text-emerald-400" />
-          </div>
-          <p className="text-lg font-semibold text-foreground">{t('noBranches')}</p>
-          <p className="text-sm text-muted-foreground mt-1 max-w-sm">{t('noBranchesDesc')}</p>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="inline-flex">
-                <Button
-                  className="mt-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl gap-2 disabled:opacity-50"
-                  onClick={openCreateBranchDialog}
-                  disabled={!subscriptionActive}
-                >
-                  {!subscriptionActive ? <Lock className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
-                  {t('addBranch')}
-                </Button>
-              </span>
-            </TooltipTrigger>
-            {!subscriptionActive && (
-              <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
-            )}
-          </Tooltip>
-        </motion.div>
-      ) : (
-        <div className="space-y-3">
-          {branches.map((branch, idx) => {
-            const isExpanded = expandedBranch === branch.id;
-            return (
-              <motion.div
-                key={branch.id}
-                initial={{ opacity: 0, y: 12 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: idx * 0.05 }}
-              >
-                <Card className={`border-0 shadow-sm overflow-hidden transition-all duration-300 ${
-                  !branch.isActive
-                    ? 'bg-gray-50 dark:bg-gray-900/40 opacity-80 ring-1 ring-gray-200 dark:ring-gray-800'
-                    : 'bg-white dark:bg-gray-900/80'
-                }`}>
-                  {/* Branch Header */}
-                  <button
-                    onClick={() => toggleBranchExpand(branch.id)}
-                    className="w-full flex items-center justify-between p-4 hover:bg-gray-50 dark:hover:bg-gray-800/30 transition-colors text-start"
-                  >
-                    <div className="flex items-center gap-3">
-                      <div className={`h-10 w-10 rounded-xl flex items-center justify-center flex-shrink-0 ${
-                        branch.isMain
-                          ? 'bg-amber-100 dark:bg-amber-900/30'
-                          : branch.isActive
-                          ? 'bg-emerald-100 dark:bg-emerald-900/30'
-                          : 'bg-gray-100 dark:bg-gray-800/50'
-                      }`}>
-                        {branch.isMain ? (
-                          <Crown className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-                        ) : (
-                          <Building2 className={`h-5 w-5 ${branch.isActive ? 'text-emerald-600 dark:text-emerald-400' : 'text-gray-400 dark:text-gray-500'}`} />
-                        )}
-                      </div>
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          {/* Task 83-b — specialName is the display title when present */}
-                          <p className="text-sm font-semibold text-foreground truncate">
-                            {branch.specialName?.trim() || getBranchDisplayName(branch)}
-                          </p>
-                          {branch.subCode && (
-                            <span
-                              className="font-mono text-[10px] px-1.5 py-0.5 rounded-md bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-400 border border-teal-200/70 dark:border-teal-800/60 flex-shrink-0"
-                              dir="ltr"
-                            >
-                              {branch.subCode}
-                            </span>
-                          )}
-                          {branch.isMain && (
-                            <Badge className="bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 border-0 text-[10px] px-1.5 py-0.5 gap-0.5">
-                              <Star className="h-3 w-3" />
-                              {t('mainBranch')}
-                            </Badge>
-                          )}
-                          {!branch.isActive && (
-                            <Badge variant="secondary" className="text-[10px] px-1.5 py-0.5 bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400">
-                              <Power className="h-3 w-3 me-0.5" />
-                              {t('inactive')}
-                            </Badge>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-3 mt-0.5 flex-wrap">
-                          {branch.address && (
-                            <span className="text-xs text-muted-foreground truncate max-w-48 flex items-center gap-1">
-                              <MapPin className="h-3 w-3 flex-shrink-0" />
-                              {branch.address}
-                            </span>
-                          )}
-                          <span className="text-xs text-muted-foreground">
-                            {branch._count?.counters || 0} {t('counters')}
-                          </span>
-                          {branch.phone && (
-                            <span className="text-xs text-muted-foreground flex items-center gap-1">
-                              <Phone className="h-3 w-3" />
-                              {branch.phone}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                    <motion.div
-                      animate={{ rotate: isExpanded ? 180 : 0 }}
-                      transition={{ duration: 0.25 }}
-                      className="flex-shrink-0"
-                    >
-                      <ChevronDown className="h-5 w-5 text-muted-foreground" />
-                    </motion.div>
-                  </button>
-
-                  {/* Expanded Content */}
-                  <AnimatePresence initial={false}>
-                    {isExpanded && (
-                      <motion.div
-                        initial={{ height: 0, opacity: 0 }}
-                        animate={{ height: 'auto', opacity: 1 }}
-                        exit={{ height: 0, opacity: 0 }}
-                        transition={{ duration: 0.3, ease: 'easeInOut' }}
-                        className="overflow-hidden"
-                      >
-                        <div className="px-4 pb-4">
-                          <Separator className="mb-4" />
-
-                          {/* Branch Actions Row */}
-                          <div className="flex items-center gap-2 mb-4 flex-wrap">
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-8 text-xs rounded-lg gap-1.5"
-                              onClick={(e) => { e.stopPropagation(); openEditBranchDialog(branch); }}
-                            >
-                              <Edit3 className="h-3.5 w-3.5" />
-                              {t('editBranch')}
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-8 text-xs text-red-600 hover:text-red-700 border-red-200 dark:border-red-800 rounded-lg gap-1.5"
-                              onClick={(e) => { e.stopPropagation(); openDeleteDialog('branch', branch.id, branch.name); }}
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                              {t('deleteBranch')}
-                            </Button>
-                            {/* Task 83-b — per-branch QR (hidden until a subCode
-                                exists — nothing meaningful to encode before that) */}
-                            {branch.subCode && (
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-8 w-8 p-0 rounded-lg"
-                                onClick={(e) => { e.stopPropagation(); setQrBranch(branch); }}
-                                aria-label={t('branchQrTitle')}
-                              >
-                                <QrCode className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
-                              </Button>
-                            )}
-                            {!branch.isMain && branch.isActive && (
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-8 text-xs text-amber-700 hover:text-amber-800 border-amber-200 dark:border-amber-800 rounded-lg gap-1.5"
-                                onClick={(e) => { e.stopPropagation(); handleSetAsMain(branch); }}
-                                disabled={togglingBranchId === branch.id}
-                              >
-                                {togglingBranchId === branch.id ? (
-                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                ) : (
-                                  <Crown className="h-3.5 w-3.5" />
-                                )}
-                                {t('setAsMain')}
-                              </Button>
-                            )}
-                            <div className="flex-1" />
-
-                            {/* Active/Inactive Toggle */}
-                            <div className="flex items-center gap-2 me-2">
-                              <Label className="text-xs text-muted-foreground">{t('active')}</Label>
-                              <Switch
-                                checked={branch.isActive}
-                                onCheckedChange={() => handleToggleBranchActive(branch)}
-                                disabled={togglingBranchId === branch.id}
-                                className="data-[state=checked]:bg-emerald-500 data-[state=unchecked]:bg-gray-300 dark:data-[state=unchecked]:bg-gray-600"
-                              />
-                              {togglingBranchId === branch.id && (
-                                <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
-                              )}
-                            </div>
-
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <span className="inline-flex">
-                                  <Button
-                                    size="sm"
-                                    className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg h-8 text-xs gap-1.5 disabled:opacity-50"
-                                    onClick={() => openCreateCounterDialog(branch.id)}
-                                    disabled={!subscriptionActive}
-                                  >
-                                    {!subscriptionActive ? <Lock className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
-                                    {t('addCounter')}
-                                  </Button>
-                                </span>
-                              </TooltipTrigger>
-                              {!subscriptionActive && (
-                                <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
-                              )}
-                            </Tooltip>
-                          </div>
-
-                          {/* Branch Info Grid */}
-                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">
-                            {branch.phone && (
-                              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                                <Phone className="h-3.5 w-3.5" />
-                                {branch.phone}
-                              </div>
-                            )}
-                            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                              <Monitor className="h-3.5 w-3.5" />
-                              {branch._count?.counters || 0} {t('counters')}
-                            </div>
-                            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                              <Users className="h-3.5 w-3.5" />
-                              {branch._count?.staff || 0} {t('staffCount')}
-                            </div>
-                          </div>
-
-                          {/* Counters */}
-                          {countersLoading ? (
-                            <div className="space-y-2">
-                              {[...Array(2)].map((_, i) => (
-                                <Skeleton key={i} className="h-14 rounded-xl" />
-                              ))}
-                            </div>
-                          ) : counters.length === 0 ? (
-                            <div className="flex flex-col items-center py-8 text-center">
-                              <Monitor className="h-8 w-8 text-muted-foreground/50 mb-2" />
-                              <p className="text-sm text-muted-foreground">{t('noCounters')}</p>
-                              <p className="text-xs text-muted-foreground/70 mt-0.5">{t('noCountersDesc')}</p>
-                            </div>
-                          ) : (
-                            <div className="space-y-2 max-h-96 overflow-y-auto">
-                              {counters.map((counter) => (
-                                <motion.div
-                                  key={counter.id}
-                                  layout
-                                  initial={{ opacity: 0.95 }}
-                                  animate={{ opacity: 1 }}
-                                  className={`flex items-center justify-between p-3 rounded-xl transition-colors gap-2 ${
-                                    !counter.isActive
-                                      ? 'bg-gray-50/50 dark:bg-gray-900/30 opacity-70 ring-1 ring-gray-100 dark:ring-gray-800/50'
-                                      : 'bg-gray-50 dark:bg-gray-900/50'
-                                  }`}
-                                >
-                                  <div className="flex items-center gap-3 min-w-0">
-                                    <div className={`h-9 w-9 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                                      counter.isActive
-                                        ? 'bg-teal-100 dark:bg-teal-900/30'
-                                        : 'bg-gray-100 dark:bg-gray-800/50'
-                                    }`}>
-                                      <span className={`text-xs font-bold ${
-                                        counter.isActive
-                                          ? 'text-teal-700 dark:text-teal-400'
-                                          : 'text-gray-400 dark:text-gray-500'
-                                      }`}>
-                                        #{counter.number}
-                                      </span>
-                                    </div>
-                                    <div className="min-w-0">
-                                      <div className="flex items-center gap-2">
-                                        <p className="text-sm font-medium text-foreground truncate">{getCounterDisplayName(counter)}</p>
-                                        {!counter.isActive && (
-                                          <Badge variant="secondary" className="text-[9px] px-1 py-0 h-4 bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400">
-                                            {t('inactive')}
-                                          </Badge>
-                                        )}
-                                      </div>
-                                      <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                                        {counter.staff ? (
-                                          <span className="text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
-                                            <UserCheck className="h-3 w-3" />
-                                            {counter.staff.user.fullName}
-                                          </span>
-                                        ) : (
-                                          <span className="text-xs text-muted-foreground flex items-center gap-1">
-                                            <UserX className="h-3 w-3" />
-                                            {t('noStaffAssigned')}
-                                          </span>
-                                        )}
-                                        {counter.currentReservation && (
-                                          <span className="text-xs text-amber-600 dark:text-amber-400">
-                                            · {t('currentlyServing')}: {counter.currentReservation.displayNumber}
-                                          </span>
-                                        )}
-                                      </div>
-                                      {/* P2-10 — bound services (empty = every service). */}
-                                      {(counter.counterServices?.length ?? 0) > 0 && (
-                                        <div className="flex items-center gap-1 mt-1 flex-wrap">
-                                          {counter.counterServices!.map((cs) => (
-                                            <span
-                                              key={cs.service.id}
-                                              className="text-[10px] px-1.5 py-0.5 rounded-md bg-teal-50 dark:bg-teal-950/40 text-teal-700 dark:text-teal-300 border border-teal-200 dark:border-teal-900/50"
-                                            >
-                                              {cs.service.prefix}
-                                            </span>
-                                          ))}
-                                        </div>
-                                      )}
-                                    </div>
-                                  </div>
-                                  <div className="flex items-center gap-1.5 flex-shrink-0">
-                                    {/* Active/Inactive Toggle for Counter */}
-                                    <div className="flex items-center gap-1.5">
-                                      <Switch
-                                        checked={counter.isActive}
-                                        onCheckedChange={() => handleToggleCounterActive(counter)}
-                                        disabled={togglingCounterId === counter.id}
-                                        className="data-[state=checked]:bg-emerald-500 data-[state=unchecked]:bg-gray-300 dark:data-[state=unchecked]:bg-gray-600 scale-75 origin-center"
-                                      />
-                                      {togglingCounterId === counter.id && (
-                                        <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-                                      )}
-                                    </div>
-                                    {/* Staff assignment */}
-                                    <Select
-                                      value={counter.staffId || '__none__'}
-                                      onValueChange={(val) => handleAssignStaff(counter.id, val === '__none__' ? null : val)}
-                                      disabled={assigningCounterId === counter.id}
-                                    >
-                                      <SelectTrigger className="h-8 w-8 p-0 border-0 bg-transparent">
-                                        <SelectValue>
-                                          <UserCheck className="h-4 w-4 text-muted-foreground" />
-                                        </SelectValue>
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        <SelectItem value="__none__">{t('unassignStaff')}</SelectItem>
-                                        {staffList.filter(s => s.user.isActive).map((s) => (
-                                          <SelectItem key={s.id} value={s.id}>
-                                            {s.user.fullName}
-                                          </SelectItem>
-                                        ))}
-                                      </SelectContent>
-                                    </Select>
-                                    <Button
-                                      size="sm"
-                                      variant="ghost"
-                                      className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground"
-                                      onClick={() => openEditCounterDialog(counter)}
-                                    >
-                                      <Edit3 className="h-3.5 w-3.5" />
-                                    </Button>
-                                    <Button
-                                      size="sm"
-                                      variant="ghost"
-                                      className="h-8 w-8 p-0 text-red-500 hover:text-red-600"
-                                      onClick={() => openDeleteDialog('counter', counter.id, counter.name)}
-                                    >
-                                      <Trash2 className="h-3.5 w-3.5" />
-                                    </Button>
-                                  </div>
-                                </motion.div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </Card>
-              </motion.div>
-            );
-          })}
         </div>
       )}
 
+      {/* ── Stat chips (compact, wrap-safe — replaces the cramped 3-tile row) ── */}
+      {branches.length > 0 && (
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.04 }}
+          className="flex items-center gap-2 flex-wrap"
+        >
+          <Badge className="bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-900/50 h-8 px-3 gap-1.5 text-xs font-semibold rounded-lg">
+            <Building2 className="h-3.5 w-3.5" />
+            {branches.length} {t('branches')}
+          </Badge>
+          <Badge className="bg-teal-50 dark:bg-teal-950/40 text-teal-700 dark:text-teal-400 border border-teal-200 dark:border-teal-900/50 h-8 px-3 gap-1.5 text-xs font-semibold rounded-lg">
+            <Monitor className="h-3.5 w-3.5" />
+            {totalCounters} {t('counters')}
+          </Badge>
+          <Badge className="bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-900/50 h-8 px-3 gap-1.5 text-xs font-semibold rounded-lg">
+            <Crown className="h-3.5 w-3.5" />
+            {branches.filter((b) => b.isMain).length} {t('mainBranch')}
+          </Badge>
+          <Badge className="bg-gray-50 dark:bg-gray-900 text-muted-foreground border h-8 px-3 gap-1.5 text-xs font-semibold rounded-lg">
+            <Users className="h-3.5 w-3.5" />
+            {totalStaff} {t('staffCount')}
+          </Badge>
+        </motion.div>
+      )}
+
+      {/* ── Tabs: Branches | Counters ── */}
+      <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as 'branches' | 'counters')}>
+        <TabsList className="h-11 bg-muted/70 dark:bg-gray-900/60 rounded-xl p-1 w-full sm:w-auto grid grid-cols-2 sm:flex">
+          <TabsTrigger value="branches" className="rounded-lg gap-2 text-sm data-[state=active]:bg-white dark:data-[state=active]:bg-gray-800 data-[state=active]:shadow-sm">
+            <Building2 className="h-4 w-4" />
+            {t('branches')}
+          </TabsTrigger>
+          <TabsTrigger value="counters" className="rounded-lg gap-2 text-sm data-[state=active]:bg-white dark:data-[state=active]:bg-gray-800 data-[state=active]:shadow-sm">
+            <Monitor className="h-4 w-4" />
+            {t('counters')}
+          </TabsTrigger>
+        </TabsList>
+
+        {/* ── Branches tab ── */}
+        <TabsContent value="branches" className="mt-4 space-y-3 outline-none">
+          {branches.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <div className="h-20 w-20 rounded-3xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center mb-4">
+                <MapPin className="h-9 w-9 text-emerald-600 dark:text-emerald-400" />
+              </div>
+              <p className="text-lg font-semibold text-foreground">{t('noBranches')}</p>
+              <p className="text-sm text-muted-foreground mt-1 max-w-sm">{t('noBranchesDesc')}</p>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex">
+                    <Button
+                      className="mt-4 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl gap-2 disabled:opacity-50"
+                      onClick={openCreateBranchDialog}
+                      disabled={!subscriptionActive}
+                    >
+                      {!subscriptionActive ? <Lock className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+                      {t('addBranch')}
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                {!subscriptionActive && (
+                  <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
+                )}
+              </Tooltip>
+            </div>
+          ) : (
+            <div className="grid gap-3 xl:grid-cols-2">
+              {branches.map((branch, idx) => {
+                const isExpanded = expandedBranch === branch.id;
+                return (
+                  <motion.div
+                    key={branch.id}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: Math.min(idx * 0.04, 0.3) }}
+                  >
+                    <Card className={`border-0 shadow-sm overflow-hidden transition-all duration-300 ${
+                      !branch.isActive
+                        ? 'bg-gray-50 dark:bg-gray-900/40 opacity-80 ring-1 ring-gray-200 dark:ring-gray-800'
+                        : 'bg-white dark:bg-gray-900/80'
+                    }`}>
+                      {/* Branch header */}
+                      <button
+                        onClick={() => toggleBranchExpand(branch.id)}
+                        className="w-full flex items-start justify-between gap-3 p-4 hover:bg-gray-50 dark:hover:bg-gray-800/30 transition-colors text-start"
+                        aria-expanded={isExpanded}
+                      >
+                        <div className="flex items-start gap-3 min-w-0">
+                          <div className={`h-11 w-11 rounded-xl flex items-center justify-center flex-shrink-0 ${
+                            branch.isMain
+                              ? 'bg-gradient-to-br from-amber-400 to-amber-600 text-white shadow-sm shadow-amber-500/20'
+                              : branch.isActive
+                              ? 'bg-gradient-to-br from-emerald-500 to-teal-600 text-white shadow-sm shadow-emerald-500/20'
+                              : 'bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500'
+                          }`}>
+                            {branch.isMain ? (
+                              <Crown className="h-5 w-5" />
+                            ) : (
+                              <Building2 className="h-5 w-5" />
+                            )}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className="text-sm font-semibold text-foreground truncate min-w-0 max-w-52" title={branch.specialName?.trim() || getBranchDisplayName(branch)}>
+                                {branch.specialName?.trim() || getBranchDisplayName(branch)}
+                              </p>
+                              {branch.subCode && (
+                                <span
+                                  className="font-mono text-[10px] px-1.5 py-0.5 rounded-md bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-400 border border-teal-200/70 dark:border-teal-800/60 flex-shrink-0"
+                                  dir="ltr"
+                                >
+                                  {branch.subCode}
+                                </span>
+                              )}
+                              {branch.isMain && (
+                                <Badge className="bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 border-0 text-[10px] px-1.5 py-0.5 gap-0.5">
+                                  <Star className="h-3 w-3" />
+                                  {t('mainBranch')}
+                                </Badge>
+                              )}
+                              {!branch.isActive && (
+                                <Badge variant="secondary" className="text-[10px] px-1.5 py-0.5 bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400">
+                                  <Power className="h-3 w-3 me-0.5" />
+                                  {t('inactive')}
+                                </Badge>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2.5 mt-1 flex-wrap min-w-0">
+                              {branch.address && (
+                                <span className="text-xs text-muted-foreground truncate max-w-52 flex items-center gap-1" title={branch.address}>
+                                  <MapPin className="h-3 w-3 flex-shrink-0" />
+                                  {branch.address}
+                                </span>
+                              )}
+                              <span className="text-xs text-muted-foreground flex-shrink-0">
+                                {branch._count?.counters || 0} {t('counters')}
+                              </span>
+                              {branch.phone && (
+                                <span className="text-xs text-muted-foreground flex items-center gap-1 flex-shrink-0" dir="ltr">
+                                  <Phone className="h-3 w-3" />
+                                  {branch.phone}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                        <motion.div
+                          animate={{ rotate: isExpanded ? 180 : 0 }}
+                          transition={{ duration: 0.25 }}
+                          className="flex-shrink-0 mt-1"
+                        >
+                          <ChevronDown className="h-5 w-5 text-muted-foreground" />
+                        </motion.div>
+                      </button>
+
+                      {/* Expanded content */}
+                      <AnimatePresence initial={false}>
+                        {isExpanded && (
+                          <motion.div
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            transition={{ duration: 0.28, ease: 'easeInOut' }}
+                            className="overflow-hidden"
+                          >
+                            <div className="px-4 pb-4">
+                              <Separator className="mb-4" />
+
+                              {/* Branch actions */}
+                              <div className="flex items-center gap-2 mb-4 flex-wrap">
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-9 text-xs rounded-lg gap-1.5"
+                                  onClick={(e) => { e.stopPropagation(); openEditBranchDialog(branch); }}
+                                >
+                                  <Edit3 className="h-3.5 w-3.5" />
+                                  {t('editBranch')}
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-9 text-xs text-red-600 hover:text-red-700 border-red-200 dark:border-red-800 rounded-lg gap-1.5"
+                                  onClick={(e) => { e.stopPropagation(); openDeleteDialog('branch', branch.id, branch.name); }}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                  {t('deleteBranch')}
+                                </Button>
+                                {/* Task 83-b — per-branch QR (hidden until a subCode
+                                    exists — nothing meaningful to encode before that) */}
+                                {branch.subCode && (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-9 w-9 p-0 rounded-lg"
+                                    onClick={(e) => { e.stopPropagation(); setQrBranch(branch); }}
+                                    aria-label={t('branchQrTitle')}
+                                  >
+                                    <QrCode className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                                  </Button>
+                                )}
+                                {!branch.isMain && branch.isActive && (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-9 text-xs text-amber-700 hover:text-amber-800 border-amber-200 dark:border-amber-800 rounded-lg gap-1.5"
+                                    onClick={(e) => { e.stopPropagation(); handleSetAsMain(branch); }}
+                                    disabled={togglingBranchId === branch.id}
+                                  >
+                                    {togglingBranchId === branch.id ? (
+                                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                    ) : (
+                                      <Crown className="h-3.5 w-3.5" />
+                                    )}
+                                    {t('setAsMain')}
+                                  </Button>
+                                )}
+                                <div className="flex-1" />
+
+                                {/* Active/Inactive toggle */}
+                                <div className="flex items-center gap-2">
+                                  <Label className="text-xs text-muted-foreground">{t('active')}</Label>
+                                  <Switch
+                                    checked={branch.isActive}
+                                    onCheckedChange={() => handleToggleBranchActive(branch)}
+                                    disabled={togglingBranchId === branch.id}
+                                    aria-label={`${t('active')} — ${getBranchDisplayName(branch)}`}
+                                    className="data-[state=checked]:bg-emerald-500 data-[state=unchecked]:bg-gray-300 dark:data-[state=unchecked]:bg-gray-600"
+                                  />
+                                </div>
+
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <span className="inline-flex">
+                                      <Button
+                                        size="sm"
+                                        className="bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg h-9 text-xs gap-1.5 disabled:opacity-50"
+                                        onClick={() => openCreateCounterDialog(branch.id)}
+                                        disabled={!subscriptionActive}
+                                      >
+                                        {!subscriptionActive ? <Lock className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+                                        {t('addCounter')}
+                                      </Button>
+                                    </span>
+                                  </TooltipTrigger>
+                                  {!subscriptionActive && (
+                                    <TooltipContent>{t('subscriptionRequiredBranches')}</TooltipContent>
+                                  )}
+                                </Tooltip>
+                              </div>
+
+                              {/* Branch info chips */}
+                              <div className="flex items-center gap-3 mb-4 flex-wrap">
+                                {branch.phone && (
+                                  <span className="text-xs text-muted-foreground flex items-center gap-1.5" dir="ltr">
+                                    <Phone className="h-3.5 w-3.5" />
+                                    {branch.phone}
+                                  </span>
+                                )}
+                                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                                  <Monitor className="h-3.5 w-3.5" />
+                                  {branch._count?.counters || 0} {t('counters')}
+                                </span>
+                                <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                                  <Users className="h-3.5 w-3.5" />
+                                  {branch._count?.staff || 0} {t('staffCount')}
+                                </span>
+                              </div>
+
+                              {/* Counters — same card as the Counters tab */}
+                              {countersLoading ? (
+                                <div className="grid gap-2.5 sm:grid-cols-2">
+                                  {[...Array(2)].map((_, i) => (
+                                    <Skeleton key={i} className="h-36 rounded-2xl" />
+                                  ))}
+                                </div>
+                              ) : counters.length === 0 ? (
+                                <div className="flex flex-col items-center py-8 text-center">
+                                  <Monitor className="h-8 w-8 text-muted-foreground/50 mb-2" />
+                                  <p className="text-sm text-muted-foreground">{t('noCounters')}</p>
+                                  <p className="text-xs text-muted-foreground/70 mt-0.5">{t('noCountersDesc')}</p>
+                                </div>
+                              ) : (
+                                <div className="grid gap-2.5 sm:grid-cols-2">
+                                  {counters.map((counter) => renderCounterCard(counter))}
+                                </div>
+                              )}
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </Card>
+                  </motion.div>
+                );
+              })}
+            </div>
+          )}
+        </TabsContent>
+
+        {/* ── Counters tab (agency-wide) ── */}
+        <TabsContent value="counters" className="mt-4 space-y-3 outline-none">
+          {allCountersLoading && allCounters.length === 0 ? (
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              {[...Array(3)].map((_, i) => (
+                <Skeleton key={i} className="h-44 rounded-2xl" />
+              ))}
+            </div>
+          ) : allCounters.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <div className="h-20 w-20 rounded-3xl bg-teal-100 dark:bg-teal-900/30 flex items-center justify-center mb-4">
+                <Monitor className="h-9 w-9 text-teal-600 dark:text-teal-400" />
+              </div>
+              <p className="text-lg font-semibold text-foreground">{t('noCounters')}</p>
+              <p className="text-sm text-muted-foreground mt-1 max-w-sm">{t('noCountersDesc')}</p>
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <p className="text-xs text-muted-foreground">
+                  {allCounters.length} {t('counters')} · {allCounters.filter((c) => c.isActive).length} {t('active')}
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 rounded-lg gap-1.5 text-xs"
+                  onClick={fetchAllCounters}
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${allCountersLoading ? 'animate-spin' : ''}`} />
+                  {t('refresh')}
+                </Button>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                {allCounters.map((counter) => renderCounterCard(counter, { showBranch: true }))}
+              </div>
+            </>
+          )}
+        </TabsContent>
+      </Tabs>
+
       {/* Create/Edit Branch Dialog */}
       <Dialog open={branchDialogOpen} onOpenChange={setBranchDialogOpen}>
-        {/* Task 83-b — the dialog now carries the location block; make it
-            scrollable and slightly wider (same pattern as history sheets). */}
-        <DialogContent className="sm:max-w-md max-h-[85vh] overflow-y-auto">
+        {/* Task 83-b — the dialog carries the location block; wider (lg) and
+            scrollable so nothing inside is cramped or clipped. */}
+        <DialogContent className="sm:max-w-lg max-h-[88vh] overflow-y-auto custom-scrollbar">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Building2 className="h-5 w-5 text-emerald-500" />
@@ -1667,25 +1845,27 @@ export function AgencyBranches() {
                 className="h-11"
               />
             </div>
-            <div className="space-y-2">
-              <Label>{t('branchNameAr')}</Label>
-              <Input
-                value={branchNameAr}
-                onChange={(e) => setBranchNameAr(e.target.value)}
-                placeholder={t('branchNameAr')}
-                className="h-11"
-                dir="rtl"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>{t('branchNameFr')}</Label>
-              <Input
-                value={branchNameFr}
-                onChange={(e) => setBranchNameFr(e.target.value)}
-                placeholder={t('branchNameFr')}
-                className="h-11"
-                dir="ltr"
-              />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label>{t('branchNameAr')}</Label>
+                <Input
+                  value={branchNameAr}
+                  onChange={(e) => setBranchNameAr(e.target.value)}
+                  placeholder={t('branchNameAr')}
+                  className="h-11"
+                  dir="rtl"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>{t('branchNameFr')}</Label>
+                <Input
+                  value={branchNameFr}
+                  onChange={(e) => setBranchNameFr(e.target.value)}
+                  placeholder={t('branchNameFr')}
+                  className="h-11"
+                  dir="ltr"
+                />
+              </div>
             </div>
             {/* Task 83-b — optional customer-facing display name ("Downtown
                 Branch", "Mall Kiosk"…). Distinct from the internal name. */}
@@ -1715,7 +1895,7 @@ export function AgencyBranches() {
                 onChange={handleBranchPickerChange}
                 onLocationSource={handleBranchLocationSource}
                 addressFields={{ onDetected: handleBranchDetectedAddress }}
-                height={340}
+                height={300}
               />
               {!editingBranch && (branchLatitude === null || branchLongitude === null) && (
                 <p className="text-xs flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
@@ -1816,6 +1996,7 @@ export function AgencyBranches() {
               <Switch
                 checked={branchIsMain}
                 onCheckedChange={setBranchIsMain}
+                aria-label={t('setAsMain')}
                 className="data-[state=checked]:bg-amber-500 data-[state=unchecked]:bg-gray-300 dark:data-[state=unchecked]:bg-gray-600"
               />
             </div>
@@ -1911,7 +2092,7 @@ export function AgencyBranches() {
 
       {/* Create/Edit Counter Dialog */}
       <Dialog open={counterDialogOpen} onOpenChange={setCounterDialogOpen}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-md max-h-[88vh] overflow-y-auto custom-scrollbar">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Monitor className="h-5 w-5 text-teal-500" />
@@ -1943,25 +2124,27 @@ export function AgencyBranches() {
                 className="h-11"
               />
             </div>
-            <div className="space-y-2">
-              <Label>{t('counterNameAr')}</Label>
-              <Input
-                value={counterNameAr}
-                onChange={(e) => setCounterNameAr(e.target.value)}
-                placeholder={t('counterNameAr')}
-                className="h-11"
-                dir="rtl"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>{t('counterNameFr')}</Label>
-              <Input
-                value={counterNameFr}
-                onChange={(e) => setCounterNameFr(e.target.value)}
-                placeholder={t('counterNameFr')}
-                className="h-11"
-                dir="ltr"
-              />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label>{t('counterNameAr')}</Label>
+                <Input
+                  value={counterNameAr}
+                  onChange={(e) => setCounterNameAr(e.target.value)}
+                  placeholder={t('counterNameAr')}
+                  className="h-11"
+                  dir="rtl"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>{t('counterNameFr')}</Label>
+                <Input
+                  value={counterNameFr}
+                  onChange={(e) => setCounterNameFr(e.target.value)}
+                  placeholder={t('counterNameFr')}
+                  className="h-11"
+                  dir="ltr"
+                />
+              </div>
             </div>
             {/* P2-10 — Counter↔Service binding: pick which services this
                 counter serves. No selection = serves every service. */}

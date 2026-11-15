@@ -141,6 +141,24 @@ async function ensureChargilyReady() {
   }
 }
 
+/**
+ * 0.6.76 — build the hosted-page return URLs for ONE branch, AFTER its local
+ * ledger row exists. `ref` is that row's id (Transaction / SmsPurchase): the
+ * paying browser has NO localStorage, so the result page used to recover the
+ * checkout id via GET /payment/pending — the single most-recent pending row,
+ * ambiguous with concurrent payments and wrong across devices. With `ref` in
+ * the URL the browser result page (and the app that bounces back from it)
+ * polls the EXACT payment. `deep` is the blasti:// scheme shells bounce into.
+ */
+function buildReturnUrls(baseUrl: string, deepLink?: string, ref?: string): { successUrl: string; failureUrl: string } {
+  const refQuery = ref ? `&ref=${encodeURIComponent(ref)}` : ''
+  const deepQuery = deepLink ? `&deep=${encodeURIComponent(deepLink)}` : ''
+  return {
+    successUrl: `${baseUrl}/#/payment/result?status=success${refQuery}${deepQuery}`,
+    failureUrl: `${baseUrl}/#/payment/result?status=failed${refQuery}${deepQuery}`,
+  }
+}
+
 // ─── POST /create-checkout — Create a Chargily checkout session ───────
 
 app.post('/create-checkout', async (c) => {
@@ -157,16 +175,10 @@ app.post('/create-checkout', async (c) => {
     await ensureChargilyReady()
 
     const baseUrl = resolveBaseUrl(c, returnUrl)
-    // Static redirect targets — the Chargily hosted page redirects the
-    // customer's browser here after payment. The checkout id is NOT known at
-    // creation time, so the payment-result page recovers it from localStorage
-    // (stored by the initiating client right before the redirect) or via
-    // GET /api/payment/pending (latest pending checkout for the caller).
-    // `deep` (Capacitor + Electron shells) is the blasti:// scheme the phone
-    // or desktop bounces back into the app with — see payment-deep-link.ts.
-    const deepQuery = deepLink ? `&deep=${encodeURIComponent(deepLink)}` : ''
-    const successUrl = `${baseUrl}/#/payment/result?status=success${deepQuery}`
-    const failureUrl = `${baseUrl}/#/payment/result?status=failed${deepQuery}`
+    // Static redirect targets are built PER BRANCH (buildReturnUrls) once the
+    // local ledger row exists — its id rides in the URL as `ref` and the
+    // shells' `deep` blasti:// link bounces the payer's browser into the app
+    // that started the payment (see payment-deep-link.ts).
 
     // 0.6.38 — per-checkout webhook: pin settlement to THIS server so the
     // confirmation no longer depends on a dashboard-configured webhook URL
@@ -276,6 +288,8 @@ app.post('/create-checkout', async (c) => {
             where: { id: user.id },
             select: { email: true, phoneNumber: true },
           })
+
+      const { successUrl, failureUrl } = buildReturnUrls(baseUrl, deepLink, transaction.id)
 
       let checkout
       try {
@@ -424,6 +438,8 @@ app.post('/create-checkout', async (c) => {
         select: { fullName: true, email: true, phoneNumber: true },
       })
 
+      const { successUrl, failureUrl } = buildReturnUrls(baseUrl, deepLink, purchase.id)
+
       let checkout
       try {
         checkout = await createCheckout({
@@ -553,6 +569,8 @@ app.post('/create-checkout', async (c) => {
           where: { id: user.id },
           select: { email: true, phoneNumber: true },
         })
+
+    const { successUrl, failureUrl } = buildReturnUrls(baseUrl, deepLink, transaction.id)
 
     let checkout
     try {
@@ -764,13 +782,20 @@ app.get('/checkout/:id', async (c) => {
       return c.json({ success: false, error: 'Invalid checkout id' }, 400)
     }
 
-    // Find the local records associated with this checkout.
+    // 0.6.76 — the id in the path may be EITHER the Chargily checkout id
+    // (providerRef) OR a local ledger row id: the static return URLs now carry
+    // `ref=<record id>` (buildReturnUrls) because the paying browser has no
+    // localStorage, so the result page polls by the exact record instead of
+    // guessing via GET /payment/pending.
     const transaction = await db.transaction.findFirst({
-      where: { providerRef: checkoutId },
+      where: { OR: [{ providerRef: checkoutId }, { id: checkoutId }] },
     })
     const smsPurchase = await db.smsPurchase.findFirst({
-      where: { providerRef: checkoutId },
+      where: { OR: [{ providerRef: checkoutId }, { id: checkoutId }] },
     })
+    // Chargily-facing id — when the caller passed a local record id, resolve
+    // the real checkout ref for the remote status call and the settlement pass.
+    const remoteRef = transaction?.providerRef || smsPurchase?.providerRef || checkoutId
 
     if (!transaction && !smsPurchase) {
       return c.json({ success: false, error: 'Checkout not found' }, 404)
@@ -850,7 +875,7 @@ app.get('/checkout/:id', async (c) => {
     let remoteStatus: string | null = null
     let remoteCheckoutUrl: string | undefined
     try {
-      const remote = await getCheckoutStatus(checkoutId)
+      const remote = await getCheckoutStatus(remoteRef)
       remoteStatus = remote.status
       remoteCheckoutUrl = remote.checkout_url
     } catch (err) {
@@ -881,7 +906,7 @@ app.get('/checkout/:id', async (c) => {
     if (normalized === 'paid') {
       await fulfillCheckoutPaid(
         {
-          id: checkoutId,
+          id: remoteRef,
           status: remoteStatus || 'paid',
           amount: 0,
           payment_method: null,
@@ -892,7 +917,7 @@ app.get('/checkout/:id', async (c) => {
     } else if (normalized === 'failed') {
       await fulfillCheckoutFailed(
         {
-          id: checkoutId,
+          id: remoteRef,
           status: remoteStatus || 'failed',
           amount: 0,
           payment_method: null,

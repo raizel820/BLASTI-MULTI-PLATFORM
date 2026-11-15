@@ -75,7 +75,7 @@ import { NativeServerStatus } from './native-server-status'
 import { MobileDiagnosticsSheet } from '@/components/shared/mobile-diagnostics-sheet'
 import {
   ArrowLeft, ArrowRight, Loader2, Eye, EyeOff, CheckCircle2, KeyRound,
-  Users, CloudOff, MonitorPlay, ShieldCheck, Fingerprint, LifeBuoy, Building2,
+  Users, CloudOff, MonitorPlay, MonitorSmartphone, ShieldCheck, Fingerprint, LifeBuoy, Building2,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -936,6 +936,23 @@ export function UnifiedLoginForm() {
             <span className="font-bold bg-gradient-to-r from-emerald-700 to-teal-600 dark:from-emerald-400 dark:to-teal-300 bg-clip-text text-transparent">BLASTI</span>
           </div>
           <div className="flex items-center gap-1">
+            {/* 0.6.76 — Kiosk mode switch (TOP of the mobile login page): turns
+                this phone/tablet into a self-service ticketing terminal without
+                signing in. Routes to the full-screen device kiosk (same entry
+                the web layout exposes in its footer) — agency code / staff
+                credentials / QR pairing all work server-side in the WebView,
+                and the Android back button exits back to the login. */}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => { window.location.href = '/?mode=device&type=KIOSK'; }}
+              aria-label={t('kioskMode')}
+              title={t('kioskMode')}
+              className="h-9 min-h-[36px] gap-1.5 rounded-xl px-2.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100/60 hover:text-emerald-800 dark:text-emerald-400 dark:hover:bg-emerald-900/30 dark:hover:text-emerald-300"
+            >
+              <MonitorSmartphone className="h-4 w-4" />
+              <span className="hidden sm:inline">{t('kioskMode')}</span>
+            </Button>
             <LanguageSwitcher />
             <ThemeToggle />
           </div>

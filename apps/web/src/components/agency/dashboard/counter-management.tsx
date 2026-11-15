@@ -265,6 +265,43 @@ export function CounterManagement({
   const occupiedCounters = counters.filter((c) => c.staffId || c.controlledByUserId).length;
   const freeCounters = counters.length - occupiedCounters;
 
+  // 0.6.77 — inline claim state (see handleClaimCounter below).
+  const [claimingCounterId, setClaimingCounterId] = useState<string | null>(null);
+
+  // 0.6.77 — the dashboard "claim" button performs the claim INLINE
+  // (POST /api/agency/counters/:id/claim) and STAYS on the dashboard. It
+  // used to hard-navigate to the fullscreen console — the exact "claiming
+  // from the dashboard immediately throws me into fullscreen" report. On
+  // success the card refreshes and Call-Next unlocks; on 409 (held by a
+  // colleague) the takeover flow stays available via the explicit console
+  // banner.
+  const handleClaimCounter = async (counterId: string) => {
+    if (!effectiveAgencyId) return;
+    setClaimingCounterId(counterId);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(counterId)}/claim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agencyId: effectiveAgencyId }),
+      });
+      if (res.ok) {
+        toast.success(t('counterClaimed'));
+      } else {
+        const data = await res.json().catch(() => ({}));
+        if (data.error === 'COUNTER_CONTROLLED') {
+          toast.error(t('counterControlTitle'));
+        } else {
+          toast.error(data.error || t('error'));
+        }
+      }
+      fetchCounters();
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setClaimingCounterId(null);
+    }
+  };
+
   // ─── r21-8 — control-aware call gating ──────────────────────────────
   // A staff member may only call from a counter they CONTROL (claim model);
   // owners/SUPER_ADMIN bypass the gate. When the caller controls none, the
@@ -466,18 +503,24 @@ export function CounterManagement({
                             )}
                           </Tooltip>
                         ) : (
-                          // r21-8 — a free counter the caller does NOT control:
-                          // call-next would 403 COUNTER_CONTROL_REQUIRED, so the
-                          // button claims it via the console instead.
+                          // 0.6.77 — a free counter the caller does NOT control:
+                          // claim it INLINE and stay on the dashboard (no
+                          // fullscreen redirect). Takeover of a HELD counter
+                          // remains a console flow (the banner above).
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
                                 <Button
                                   size="sm"
-                                  onClick={() => openConsole('agency-fullscreen')}
+                                  onClick={() => handleClaimCounter(counter.id)}
+                                  disabled={claimingCounterId === counter.id}
                                   className="h-9 px-3 rounded-lg border border-emerald-500/40 bg-transparent text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/10 text-xs font-semibold gap-1"
                                 >
-                                  <LogIn className="h-3.5 w-3.5" />
+                                  {claimingCounterId === counter.id ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                  ) : (
+                                    <LogIn className="h-3.5 w-3.5" />
+                                  )}
                                   <span>{t('claimCounterFirstCta')}</span>
                                 </Button>
                               </motion.div>

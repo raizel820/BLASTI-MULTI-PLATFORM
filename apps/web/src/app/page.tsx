@@ -888,9 +888,38 @@ export default function Home() {
     document.title = titles[currentView] || 'BLASTI';
   }, [currentView, t]);
 
-  // Scroll to top on view change
+  // Scroll to top on view change + 0.6.77 scroll-lock self-heal.
+  //
+  // The reported bug: after in-app navigation a page could not be scrolled
+  // until a full refresh. Root causes are scroll locks that survive view
+  // swaps: Radix's ref-counted body[data-scroll-locked] (a Dialog/Sheet
+  // unmounting on exit-animation delay), useDrawerChrome's manual
+  // body.style.overflow, or a stuck framer-motion backdrop. None of those
+  // owners reset when setView swaps the view UNDER them. This effect is the
+  // defensive last line: on every view change, if no dialog is actually open
+  // and the sidebar drawer is closed, force-clear every lock and scroll to
+  // the top (window AND the Electron inner scroller — window.scrollTo is a
+  // no-op for that container).
   useEffect(() => {
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    const clearStaleScrollLocks = () => {
+      try {
+        const dialogOpen = document.querySelector('[role="dialog"][data-state="open"], [data-state="open"][data-radix-popper-content-wrapper]') !== null;
+        // The drawer backdrop may be MOUNTED but invisible (lg:hidden on
+        // desktop widths) — only honour locks from overlays that can
+        // actually intercept the viewport.
+        const drawerBackdropVisible = Array.from(
+          document.querySelectorAll('.fixed.inset-0.z-40'),
+        ).some((el) => getComputedStyle(el).display !== 'none');
+        if (dialogOpen || drawerBackdropVisible) return;
+        if (document.body.style.overflow === 'hidden') document.body.style.removeProperty('overflow');
+        if (document.body.hasAttribute('data-scroll-locked')) document.body.removeAttribute('data-scroll-locked');
+        if (document.documentElement.style.overflow === 'hidden') document.documentElement.style.removeProperty('overflow');
+      } catch { /* never break navigation */ }
+    };
+    clearStaleScrollLocks();
+    window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+    const scroller = document.querySelector('[data-app-scroller]');
+    if (scroller) scroller.scrollTop = 0;
   }, [currentView]);
 
   // Update document direction on language change

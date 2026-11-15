@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -255,6 +255,16 @@ interface NotificationCenterProps {
 
 export function NotificationCenter({ className, userId }: NotificationCenterProps) {
   const [isOpen, setIsOpen] = useState(false);
+
+  // 0.6.77 — self-close when the view swaps underneath us (setView fires
+  // blasti:view-changed). The panel renders a fixed full-viewport backdrop
+  // that swallows wheel/touch; surviving a programmatic navigation left the
+  // next view unable to scroll until refresh.
+  useEffect(() => {
+    const closePanel = () => setIsOpen(false);
+    window.addEventListener('blasti:view-changed', closePanel);
+    return () => window.removeEventListener('blasti:view-changed', closePanel);
+  }, []);
 
   const {
     notifications,

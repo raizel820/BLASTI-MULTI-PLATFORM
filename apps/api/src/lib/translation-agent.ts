@@ -27,6 +27,7 @@
 
 import { createHash } from 'node:crypto'
 import { db } from '@blasti/db'
+import { CATEGORY_TERM_KEYS } from './ensure-category-dictionary'
 
 // ─── Action trail (0.6.62 — Logs Manager + Category Language page) ──────────
 
@@ -608,16 +609,24 @@ export async function createPendingCategory(
     select: { id: true, slug: true, name: true },
   })
   if (existing) {
-    // Still queue enrichment in case its translations/icon are incomplete.
+    // Still queue enrichment in case its translations/icon/terms are
+    // incomplete — the payload carries generateTerms since 0.6.76, so the
+    // agent also creates any audited terminology keys the row is missing.
     const pending = await db.translationJob.findFirst({
-      where: { type: 'create-category', status: { in: ['pending', 'processing'] }, payload: { contains: existing.id } },
+      where: {
+        type: 'create-category', status: { in: ['pending', 'processing'] },
+        AND: [{ payload: { contains: existing.id } }, { payload: { contains: 'generateTerms' } }],
+      },
       select: { id: true },
     })
     if (!pending) {
       await db.translationJob.create({
         data: {
           type: 'create-category', status: 'pending',
-          payload: JSON.stringify({ categoryRowId: existing.id, slug: existing.slug, name, sourceLang }),
+          payload: JSON.stringify({
+            categoryRowId: existing.id, slug: existing.slug, name, sourceLang,
+            generateTerms: true, termKeys: [...CATEGORY_TERM_KEYS],
+          }),
         },
       })
     }
@@ -651,7 +660,13 @@ export async function createPendingCategory(
   await db.translationJob.create({
     data: {
       type: 'create-category', status: 'pending',
-      payload: JSON.stringify({ categoryRowId: row.id, slug: row.slug, name, sourceLang }),
+      // 0.6.76 — generateTerms: the agent also derives the category's
+      // SPECIALIZED terminology (Patient/Client/Customer...) for every
+      // audited key — new categories no longer stay on generic words.
+      payload: JSON.stringify({
+        categoryRowId: row.id, slug: row.slug, name, sourceLang,
+        generateTerms: true, termKeys: [...CATEGORY_TERM_KEYS],
+      }),
     },
   })
 
@@ -668,17 +683,67 @@ export async function createPendingCategory(
   return { ...row, alreadyExisted: false }
 }
 
+/**
+ * 0.6.76 — queue the SPECIALIZED terminology generation for a category:
+ * one `create-category` job that asks the agent to derive CategoryTerm values
+ * ("Patient" vs "Customer" vs "Client"...) for every audited key in
+ * CATEGORY_TERM_KEYS. Used by the super-admin direct creation route (which
+ * previously queued NOTHING — new categories stayed on generic words) and by
+ * the Category Language page ("Translate via agent" also fills any audited
+ * keys the category is still missing — admin deletions stay respected).
+ * @returns true when a generation job was actually queued.
+ */
+export async function enqueueCategoryTermGeneration(categoryId: string, actor?: string): Promise<boolean> {
+  const category = await db.agencyCategory.findUnique({
+    where: { id: categoryId },
+    select: { id: true, slug: true, name: true },
+  })
+  if (!category) return false
+  // Dedup: only skip when a TERMS-generation job for THIS category is already
+  // queued/running — a legacy name-only job does not cover the terms.
+  const pending = await db.translationJob.findFirst({
+    where: {
+      type: 'create-category',
+      status: { in: ['pending', 'processing'] },
+      AND: [{ payload: { contains: category.id } }, { payload: { contains: 'generateTerms' } }],
+    },
+    select: { id: true },
+  })
+  if (pending) return false
+  await db.translationJob.create({
+    data: {
+      type: 'create-category', status: 'pending',
+      payload: JSON.stringify({
+        categoryRowId: category.id, slug: category.slug, name: category.name,
+        sourceLang: 'en', generateTerms: true, termKeys: [...CATEGORY_TERM_KEYS],
+      }),
+    },
+  })
+  await logAgentAction({
+    action: 'CREATE_CATEGORY',
+    status: 'success',
+    summary: `specialized terminology (${CATEGORY_TERM_KEYS.length} audited keys) queued for category "${category.name}"`,
+    details: { slug: category.slug, name: category.name, termKeys: [...CATEGORY_TERM_KEYS] },
+    refType: 'agency-category',
+    refId: category.id,
+    actor: actor || 'system',
+  })
+  return true
+}
+
 // ─── LLM call (strict contract) ─────────────────────────────────────────────
 
-const AGENT_SYSTEM_PROMPT = `You are the BLASTI translation agent. You do EXACTLY ONE job: translate the given strings between Arabic (ar), English (en) and French (fr), and — only when an item is marked as a category — pick ONE emoji icon for it.
+const AGENT_SYSTEM_PROMPT = `You are the BLASTI translation agent. You do EXACTLY ONE job: translate the given strings between Arabic (ar), English (en) and French (fr), and — only when an item is marked as a category — pick ONE emoji icon for it and, when the category carries "termKeys", derive that business domain's SPECIALIZED UI terminology.
 ABSOLUTE RULES:
 1. Output ONLY one minified JSON object. No markdown fences, no commentary, no extra keys, no trailing text.
 2. Exact shape: {"items":[{"id":"<as given>","t":{"<lang>":"<translation>"}}],"categories":[{"id":"<as given>","name":"<english name>","nameAr":"<arabic name>","nameFr":"<french name>","icon":"<one emoji>"}]}
+   When a category item carries "termKeys", ALSO add to it "terms":[{"key":"<as given>","ar":"...","en":"...","fr":"..."}] with EXACTLY one entry per requested key, same order.
 3. Omit "items" when there are none; omit "categories" when there are none.
 4. Translate faithfully, concisely and professionally. Keep numbers, codes and brand names as-is. Do not add quotes, notes or explanations around translations.
 5. "icon" MUST be exactly ONE emoji character suitable for the business category. Never a word, never more than one emoji.
 6. If a string is already written in a target language, return it unchanged for that language.
-7. Never invent content beyond the provided strings. Never answer anything that is not this JSON.`
+7. Never invent content beyond the provided strings. Never answer anything that is not this JSON.
+8. SPECIALIZED TERMINOLOGY (only for categories carrying "termKeys"): the terms name the PERSON the business serves and its queue wording — they MUST use the vocabulary of THAT exact business domain (the category name is the domain), never the generic platform word. Medical (doctor, clinic, dentist, laboratory...) → "Patient" / "مريض"; legal (law firm, attorney) → "Client" / "موكّل"; beauty (barber, salon, spa) → "Customer" / "زبون"; food (restaurant, café) → "Guest" / "ضيف"; anything else → the most natural professional word a business of that kind uses for the person it serves. Key meanings, so every language reads naturally: customer = the served person (singular noun); totalCustomers = "Total <term>s"; customersServed = "<term>s served"; waitingCustomers = "Waiting <term>s"; customerReviews = "<term> reviews"; customersPerHour = short throughput label ("patients/hr" / "مرضى/ساعة"); noQueue = "No <term>s in queue"; noCustomersWaiting = "No <term>s waiting"; customerJoinedQueue = "<name> joined the queue" — the {name} placeholder MUST be kept verbatim in every language.`
 
 interface LLMCallResult {
   ok: boolean
@@ -1066,14 +1131,24 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
       text: g.item.sourceText,
     })),
     categories: categoryJobs.map((job, index) => {
-      let payload: { categoryRowId?: string; name?: string } = {}
+      let payload: { categoryRowId?: string; name?: string; termKeys?: unknown } = {}
       try { payload = JSON.parse(String(job.payload || '{}')) } catch { /* malformed → empty */ }
-      return { id: `c${index}`, name: String(payload.name || ''), sourceLang: 'auto' }
+      // 0.6.76 — categories with generateTerms also request their SPECIALIZED
+      // terminology (the agent derives "Patient"-style terms per domain).
+      const requestedTermKeys = Array.isArray(payload.termKeys)
+        ? (payload.termKeys as unknown[]).filter((k): k is string => typeof k === 'string' && /^[A-Za-z][A-Za-z0-9_.]{1,59}$/.test(k))
+        : []
+      return {
+        id: `c${index}`,
+        name: String(payload.name || ''),
+        sourceLang: 'auto',
+        ...(requestedTermKeys.length > 0 ? { termKeys: requestedTermKeys } : {}),
+      }
     }),
   }
 
   const llm = await callTranslationLLM(
-    `Translate for a queue-management platform. Return ONLY the JSON object.\n${JSON.stringify(promptPayload)}`,
+    `Translate for a queue-management platform. For any category carrying "termKeys", also produce its specialized domain terminology (system rule 8). Return ONLY the JSON object.\n${JSON.stringify(promptPayload)}`,
   )
 
   if (!llm.ok) {
@@ -1103,7 +1178,10 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
 
   const parsed = extractJsonBlock(llm.content || '')
   const itemResults = new Map<string, Record<string, string>>()
-  const categoryResults = new Map<string, { name?: string; nameAr?: string; nameFr?: string; icon?: string }>()
+  interface GeneratedTerm { key: string; ar?: string; en?: string; fr?: string }
+  const categoryResults = new Map<string, {
+    name?: string; nameAr?: string; nameFr?: string; icon?: string; terms?: GeneratedTerm[]
+  }>()
   if (parsed) {
     for (const raw of Array.isArray(parsed.items) ? parsed.items : []) {
       const it = raw as { id?: string; t?: Record<string, unknown> }
@@ -1116,13 +1194,29 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
       itemResults.set(String(it.id), t)
     }
     for (const raw of Array.isArray(parsed.categories) ? parsed.categories : []) {
-      const ct = raw as { id?: string; name?: unknown; nameAr?: unknown; nameFr?: unknown; icon?: unknown }
+      const ct = raw as { id?: string; name?: unknown; nameAr?: unknown; nameFr?: unknown; icon?: unknown; terms?: unknown }
       if (!ct?.id) continue
+      // 0.6.76 — parse the generated terminology entries (validated again at
+      // apply time against the REQUESTED keys — hallucinated keys are dropped).
+      const terms: GeneratedTerm[] = Array.isArray(ct.terms)
+        ? (ct.terms as Array<Record<string, unknown>>)
+          .map((term): GeneratedTerm | null => {
+            if (!term || typeof term.key !== 'string' || !term.key.trim()) return null
+            return {
+              key: term.key.trim(),
+              ar: typeof term.ar === 'string' ? term.ar.trim().slice(0, 120) : undefined,
+              en: typeof term.en === 'string' ? term.en.trim().slice(0, 120) : undefined,
+              fr: typeof term.fr === 'string' ? term.fr.trim().slice(0, 120) : undefined,
+            }
+          })
+          .filter((t): t is GeneratedTerm => t !== null)
+        : []
       categoryResults.set(String(ct.id), {
         name: typeof ct.name === 'string' ? ct.name.trim().slice(0, 60) : undefined,
         nameAr: typeof ct.nameAr === 'string' ? ct.nameAr.trim().slice(0, 60) : undefined,
         nameFr: typeof ct.nameFr === 'string' ? ct.nameFr.trim().slice(0, 60) : undefined,
         icon: isValidEmojiIcon(ct.icon) ? ct.icon : undefined,
+        ...(terms.length > 0 ? { terms } : {}),
       })
     }
   }
@@ -1175,7 +1269,7 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
   for (let index = 0; index < categoryJobs.length; index++) {
     const job = categoryJobs[index]
     const result = categoryResults.get(`c${index}`)
-    let payload: { categoryRowId?: string; name?: string; sourceLang?: string } = {}
+    let payload: { categoryRowId?: string; name?: string; sourceLang?: string; termKeys?: unknown } = {}
     try { payload = JSON.parse(String(job.payload || '{}')) } catch { /* malformed */ }
     if (!result || (!result.name && !result.nameAr && !result.nameFr)) {
       failedCategoryIds.push(job.id)
@@ -1221,6 +1315,76 @@ export async function runTranslationBatch(force = false, actor = 'scheduler'): P
         stats.stored++
       }
     }
+
+    // ── 0.6.76 — apply the generated SPECIALIZED terminology ──
+    // Upsert CategoryTerm rows for the requested keys only (hallucinated keys
+    // are dropped). Existing rows get their EMPTY values filled — admin wording
+    // is never overrun — missing rows are created.
+    const requestedTermKeys = Array.isArray(payload.termKeys)
+      ? (payload.termKeys as unknown[]).filter(
+          (k): k is string => typeof k === 'string' && /^[A-Za-z][A-Za-z0-9_.]{1,59}$/.test(k),
+        )
+      : []
+    const generatedTerms = Array.isArray(result.terms) ? result.terms : []
+    if (requestedTermKeys.length > 0 && generatedTerms.length > 0) {
+      const requested = new Set(requestedTermKeys)
+      let termsWritten = 0
+      for (const term of generatedTerms) {
+        if (!requested.has(term.key)) continue
+        const valueAr = (term.ar || '').trim()
+        const valueEn = (term.en || '').trim()
+        const valueFr = (term.fr || '').trim()
+        if (!valueAr && !valueEn && !valueFr) continue
+        try {
+          const existing = await db.categoryTerm.findFirst({
+            where: { categoryId: row.id, key: term.key },
+            select: { id: true, valueAr: true, valueEn: true, valueFr: true },
+          })
+          if (existing) {
+            const updates = {
+              ...(valueAr && !existing.valueAr?.trim() ? { valueAr } : {}),
+              ...(valueEn && !existing.valueEn?.trim() ? { valueEn } : {}),
+              ...(valueFr && !existing.valueFr?.trim() ? { valueFr } : {}),
+            }
+            if (Object.keys(updates).length > 0) {
+              await db.categoryTerm.update({ where: { id: existing.id }, data: updates })
+              termsWritten++
+            }
+          } else {
+            await db.categoryTerm.create({
+              data: {
+                categoryId: row.id, key: term.key,
+                valueAr: valueAr || valueEn, valueEn: valueEn || valueAr, valueFr: valueFr || valueEn,
+              },
+            })
+            termsWritten++
+          }
+          // Feed the dictionary (EN is the canonical term source) so future
+          // categories in the same domain cost zero LLM calls.
+          if (valueEn) {
+            if (valueAr) {
+              await storeDictionaryEntry({ sourceText: valueEn, sourceLang: 'en', targetLang: 'ar', targetText: valueAr, domain: 'term', key: term.key })
+              stats.stored++
+            }
+            if (valueFr) {
+              await storeDictionaryEntry({ sourceText: valueEn, sourceLang: 'en', targetLang: 'fr', targetText: valueFr, domain: 'term', key: term.key })
+              stats.stored++
+            }
+          }
+        } catch (termErr) {
+          console.warn('[translation-agent] term upsert failed:', (termErr as Error)?.message || termErr)
+        }
+      }
+      if (termsWritten > 0) {
+        appliedRefs.push({
+          refType: 'category-term',
+          refId: row.id,
+          termsWritten,
+          keys: generatedTerms.map((t) => t.key).slice(0, 20),
+        })
+      }
+    }
+
     stats.applied++
     appliedRefs.push({
       refType: 'agency-category',

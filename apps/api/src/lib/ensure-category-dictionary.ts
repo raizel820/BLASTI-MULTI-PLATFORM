@@ -169,6 +169,25 @@ const SPECIALTY_CATALOG: Record<string, Array<[string, string, string]>> = {
 // ─── Default terminology overrides (key = i18n dictionary key) ──────────────
 // Doctor/Clinic callers are PATIENTS; law-office callers are CLIENTS
 // (موكل); barber callers are CUSTOMERS (زبناء).
+//
+// 0.6.76 — terminology AUDIT expansion: beyond the six stat labels, three
+// queue-sentence keys also carry customer-flavored wording and MUST follow
+// the category vocabulary ("No patients in queue" vs "No customers in
+// queue"): `noQueue`, `noCustomersWaiting`, `customerJoinedQueue`. The
+// translation agent generates exactly this key set for NEW custom
+// categories (CATEGORY_TERM_KEYS below); built-ins are seeded with it.
+
+export const CATEGORY_TERM_KEYS = [
+  'customer',
+  'totalCustomers',
+  'customersServed',
+  'waitingCustomers',
+  'customerReviews',
+  'customersPerHour',
+  'noQueue',
+  'noCustomersWaiting',
+  'customerJoinedQueue',
+] as const
 
 const TERMS: Record<string, Array<[string, string, string, string]>> = {
   DOCTOR: [
@@ -178,6 +197,9 @@ const TERMS: Record<string, Array<[string, string, string, string]>> = {
     ['waitingCustomers', 'المرضى المنتظرون', 'Waiting Patients', 'Patients en attente'],
     ['customerReviews', 'تقييمات المرضى', 'Patient Reviews', 'Avis des patients'],
     ['customersPerHour', 'مريض/ساعة', 'patients/hr', 'patients/heure'],
+    ['noQueue', 'لا يوجد مرضى في الانتظار', 'No patients in queue', 'Aucun patient en attente'],
+    ['noCustomersWaiting', 'لا يوجد مرضى منتظرون', 'No patients waiting', 'Aucun patient en attente'],
+    ['customerJoinedQueue', '{name} انضم إلى قائمة الانتظار', '{name} joined the queue', '{name} a rejoint la file d\'attente'],
   ],
   CLINIC: [
     ['customer', 'مريض', 'Patient', 'Patient'],
@@ -186,6 +208,9 @@ const TERMS: Record<string, Array<[string, string, string, string]>> = {
     ['waitingCustomers', 'المرضى المنتظرون', 'Waiting Patients', 'Patients en attente'],
     ['customerReviews', 'تقييمات المرضى', 'Patient Reviews', 'Avis des patients'],
     ['customersPerHour', 'مريض/ساعة', 'patients/hr', 'patients/heure'],
+    ['noQueue', 'لا يوجد مرضى في الانتظار', 'No patients in queue', 'Aucun patient en attente'],
+    ['noCustomersWaiting', 'لا يوجد مرضى منتظرون', 'No patients waiting', 'Aucun patient en attente'],
+    ['customerJoinedQueue', '{name} انضم إلى قائمة الانتظار', '{name} joined the queue', '{name} a rejoint la file d\'attente'],
   ],
   LAW_FIRM: [
     ['customer', 'موكّل', 'Client', 'Client'],
@@ -194,6 +219,9 @@ const TERMS: Record<string, Array<[string, string, string, string]>> = {
     ['waitingCustomers', 'الموكلون المنتظرون', 'Waiting Clients', 'Clients en attente'],
     ['customerReviews', 'تقييمات الموكلين', 'Client Reviews', 'Avis des clients'],
     ['customersPerHour', 'موكّل/ساعة', 'clients/hr', 'clients/heure'],
+    ['noQueue', 'لا يوجد موكلين في الانتظار', 'No clients in queue', 'Aucun client en attente'],
+    ['noCustomersWaiting', 'لا يوجد موكلين منتظرون', 'No clients waiting', 'Aucun client en attente'],
+    ['customerJoinedQueue', '{name} انضم إلى قائمة الانتظار', '{name} joined the queue', '{name} a rejoint la file d\'attente'],
   ],
   BARBER: [
     ['customer', 'زبون', 'Customer', 'Client'],
@@ -202,6 +230,9 @@ const TERMS: Record<string, Array<[string, string, string, string]>> = {
     ['waitingCustomers', 'الزبناء المنتظرون', 'Waiting Customers', 'Clients en attente'],
     ['customerReviews', 'تقييمات الزبناء', 'Customer Reviews', 'Avis des clients'],
     ['customersPerHour', 'زبون/ساعة', 'customers/hr', 'clients/heure'],
+    ['noQueue', 'لا يوجد زبناء في الانتظار', 'No customers in queue', 'Aucun client en attente'],
+    ['noCustomersWaiting', 'لا يوجد زبناء منتظرون', 'No customers waiting', 'Aucun client en attente'],
+    ['customerJoinedQueue', '{name} انضم للطابور', '{name} joined the queue', '{name} a rejoint la file d\'attente'],
   ],
 }
 

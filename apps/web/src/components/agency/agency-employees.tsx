@@ -1,16 +1,42 @@
 'use client';
 
+/**
+ * AgencyEmployees — Employee management (0.6.77 full rebuild).
+ *
+ * Design contract (fixes the "icons too big for the buttons / cramped rows"
+ * report):
+ *   • Responsive member-card GRID (md:2 / xl:3 columns) instead of a single
+ *     cramped list row where 4 unlabeled h-8 w-8 icon buttons squeezed the
+ *     name column to nothing.
+ *   • Actions live in ONE labelled overflow menu (DropdownMenu) + a full-size
+ *     labelled active Switch — every control has an aria-label and a ≥36px
+ *     hit area; nothing is icon-only-without-a-name anymore.
+ *   • Light stat cards with proper proportions; toolbar search/filter inline.
+ *
+ * All API interactions (staff CRUD, branch binding, plan cap meter, cache
+ * paint) and every dialog are preserved verbatim from the previous
+ * implementation (Tasks 31/37-e/45, 0.6.49/0.6.51).
+ */
+
 import { useState, useEffect, useCallback } from 'react';
 import { useAppStore } from '@/store/use-app-store';
 // 0.6.16 — revalidate view data when the app resumes to the foreground
 import { useResumeRefresh } from '@/lib/resume-refresh';
 import { useLanguage } from '@/hooks/use-language';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Skeleton } from '@/components/ui/skeleton';
+import { Switch } from '@/components/ui/switch';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import {
   Dialog,
   DialogContent,
@@ -33,7 +59,6 @@ import {
   Trash2,
   Copy,
   CheckCircle2,
-  XCircle,
   Eye,
   EyeOff,
   RefreshCw,
@@ -42,12 +67,12 @@ import {
   UserCheck,
   UserX,
   Dices,
-  ChevronDown,
-  ChevronUp,
   KeyRound,
   Lock,
+  MoreVertical,
+  Building2,
 } from 'lucide-react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import {
   StaffPermissionsEditor,
@@ -181,6 +206,10 @@ export function AgencyEmployees() {
   const [editPermissions, setEditPermissions] = useState<StaffPermissions>({ ...DEFAULT_PERMISSIONS });
   const [permissionsLoading, setPermissionsLoading] = useState(false);
 
+  // 0.6.77 — per-row busy flags for the switch (the old code had none, so a
+  // slow toggle left the Switch free to double-fire).
+  const [togglingUserId, setTogglingUserId] = useState<string | null>(null);
+
   const fetchEmployees = useCallback(async () => {
     if (!agencyId) {
       setEmployees([]);
@@ -284,12 +313,12 @@ export function AgencyEmployees() {
 
   // Stats
   const totalEmployees = employees.length;
-  const activeEmployees = employees.filter(e => e.isActive).length;
+  const activeEmployees = employees.filter((e) => e.isActive).length;
   const inactiveEmployees = totalEmployees - activeEmployees;
-  const managerCount = employees.filter(e => e.role === 'AGENCY_MANAGER' || e.role === 'MANAGER').length;
+  const managerCount = employees.filter((e) => e.role === 'AGENCY_MANAGER' || e.role === 'MANAGER').length;
 
   // Filter
-  const filtered = employees.filter(e => {
+  const filtered = employees.filter((e) => {
     const matchSearch = !searchQuery ||
       e.fullName.toLowerCase().includes(searchQuery.toLowerCase()) ||
       e.username.toLowerCase().includes(searchQuery.toLowerCase());
@@ -389,6 +418,7 @@ export function AgencyEmployees() {
   };
 
   const handleToggleActive = async (emp: Employee) => {
+    setTogglingUserId(emp.userId);
     try {
       const res = await apiFetch(`/api/agency/staff/${emp.id}`, {
         method: 'PATCH',
@@ -404,6 +434,8 @@ export function AgencyEmployees() {
       }
     } catch {
       toast.error(t('error'));
+    } finally {
+      setTogglingUserId(null);
     }
   };
 
@@ -503,13 +535,6 @@ export function AgencyEmployees() {
     return <Badge className="bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400 border-0 text-[10px]">{t('staffRoleStaff')}</Badge>;
   };
 
-  const stats = [
-    { label: t('employeeTotal' as any), value: totalEmployees, icon: Users, color: 'from-emerald-500 to-emerald-700', shadow: 'shadow-emerald-500/15' },
-    { label: t('employeeActive' as any), value: activeEmployees, icon: UserCheck, color: 'from-teal-500 to-teal-700', shadow: 'shadow-teal-500/15' },
-    { label: t('employeeInactive' as any), value: inactiveEmployees, icon: UserX, color: 'from-gray-400 to-gray-600', shadow: 'shadow-gray-500/15' },
-    { label: t('employeeManagers' as any), value: managerCount, icon: Shield, color: 'from-amber-500 to-amber-700', shadow: 'shadow-amber-500/15' },
-  ];
-
   // Task 37-e: plan staff-cap — when the active roster reaches the plan's
   // maxStaff the Add button locks (the server's 403 PLAN_LIMIT_REACHED stays
   // the authoritative gate).
@@ -520,7 +545,7 @@ export function AgencyEmployees() {
   // view directly (deep link / stale view) gets an explicit empty state.
   if (user?.role === 'AGENCY_STAFF' && authority && !authority.isOwner) {
     return (
-      <div className="p-4 lg:p-5">
+      <div className="p-4 md:p-6 max-w-7xl mx-auto pb-28 lg:pb-10">
         <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80">
           <CardContent className="p-10 text-center">
             <Shield className="h-12 w-12 text-muted-foreground/30 mx-auto mb-3" />
@@ -534,35 +559,53 @@ export function AgencyEmployees() {
 
   if (loading) {
     return (
-      <div className="p-4 lg:p-5 space-y-4">
-        <Skeleton className="h-8 w-48 rounded-lg" />
+      <div className="p-4 md:p-6 max-w-7xl mx-auto space-y-5 pb-28 lg:pb-10">
+        <div className="flex items-center gap-3">
+          <Skeleton className="h-12 w-12 rounded-2xl" />
+          <div className="space-y-2 min-w-0">
+            <Skeleton className="h-7 w-52" />
+            <Skeleton className="h-4 w-64" />
+          </div>
+        </div>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          {[1, 2, 3, 4].map(i => <Skeleton key={i} className="h-24 rounded-2xl" />)}
+          {[1, 2, 3, 4].map((i) => <Skeleton key={i} className="h-24 rounded-2xl" />)}
         </div>
         <Skeleton className="h-12 rounded-xl" />
-        {[1, 2, 3].map(i => <Skeleton key={i} className="h-20 rounded-xl" />)}
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {[1, 2, 3].map((i) => <Skeleton key={i} className="h-32 rounded-2xl" />)}
+        </div>
       </div>
     );
   }
 
+  const stats = [
+    { label: t('employeeTotal' as any), value: totalEmployees, icon: Users, tint: 'bg-emerald-500' },
+    { label: t('employeeActive' as any), value: activeEmployees, icon: UserCheck, tint: 'bg-teal-500' },
+    { label: t('employeeInactive' as any), value: inactiveEmployees, icon: UserX, tint: 'bg-gray-400' },
+    { label: t('employeeManagers' as any), value: managerCount, icon: Shield, tint: 'bg-amber-500' },
+  ];
+
   return (
-    <div className="p-4 lg:p-5 space-y-4">
-      {/* Header */}
-      {/* 0.6.51 mobile audit — flex-wrap + min-w-0: long AR titles squeezed
-          the refresh/Add buttons off-edge on 360px screens. */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="min-w-0">
-          <h1 className="text-xl lg:text-2xl font-bold text-foreground flex items-center gap-2">
-            <Users className="h-6 w-6 text-emerald-600" />
-            {t('employeeManagement')}
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">{t('employeeManagementDesc' as any)}</p>
+    <div className="relative p-4 md:p-6 max-w-7xl mx-auto space-y-5 pb-28 lg:pb-10">
+      {/* Gradient top border */}
+      <div className="absolute top-0 start-0 end-0 h-[3px] bg-gradient-to-r from-emerald-500 via-teal-400 to-emerald-500 rounded-full" />
+
+      {/* ── Header ── */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="h-12 w-12 rounded-2xl bg-gradient-to-br from-emerald-500 to-teal-600 flex items-center justify-center shadow-lg shadow-emerald-500/20 flex-shrink-0">
+            <Users className="h-6 w-6 text-white" />
+          </div>
+          <div className="min-w-0">
+            <h1 className="text-xl md:text-2xl font-bold text-foreground">{t('employeeManagement')}</h1>
+            <p className="text-sm text-muted-foreground mt-0.5 truncate">{t('employeeManagementDesc' as any)}</p>
+          </div>
         </div>
         <div className="flex items-center gap-2">
           {/* Task 37-e: staff count meter — "X / N staff" (or unlimited) */}
           {planMaxStaff !== null && (
             <div
-              className={`hidden sm:flex items-center gap-1.5 px-3 h-9 rounded-xl border text-xs font-medium ${
+              className={`hidden sm:flex items-center gap-1.5 px-3 h-10 rounded-xl border text-xs font-medium ${
                 staffCapReached
                   ? 'border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-700/50 dark:bg-amber-900/20 dark:text-amber-400'
                   : 'border-border bg-muted/40 text-muted-foreground'
@@ -575,21 +618,27 @@ export function AgencyEmployees() {
                 : t('staffMeter', { x: String(activeEmployees), n: String(planMaxStaff) })}
             </div>
           )}
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={fetchEmployees}
-            className="h-9 w-9"
-          >
-            <RefreshCw className="h-4 w-4" />
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={fetchEmployees}
+                className="h-10 w-10 rounded-xl"
+                aria-label={t('refresh')}
+              >
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{t('refresh')}</TooltipContent>
+          </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
               <div className={staffCapReached ? 'cursor-not-allowed' : ''}>
                 <Button
                   onClick={() => setCreateOpen(true)}
                   disabled={staffCapReached}
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white gap-2 rounded-xl h-10"
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white gap-2 rounded-xl h-10 shadow-lg shadow-emerald-500/20"
                 >
                   <UserPlus className="h-4 w-4" />
                   <span className="hidden sm:inline">{t('createStaffAccount')}</span>
@@ -604,7 +653,7 @@ export function AgencyEmployees() {
         </div>
       </div>
 
-      {/* Stats Cards */}
+      {/* ── Stats — light cards with room to breathe ── */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {stats.map((stat, idx) => {
           const Icon = stat.icon;
@@ -615,175 +664,182 @@ export function AgencyEmployees() {
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: idx * 0.05 }}
             >
-              <div className={`relative overflow-hidden rounded-2xl bg-gradient-to-br ${stat.color} p-4 text-white shadow-lg ${stat.shadow}`}>
-                <div className="absolute -top-2 -start-2 h-12 w-12 rounded-full bg-white/10 blur-lg" />
-                <div className="relative flex items-center justify-between">
-                  <div>
-                    <div className="h-7 w-7 rounded-lg bg-white/20 flex items-center justify-center mb-2">
-                      <Icon className="h-3.5 w-3.5 text-white" />
-                    </div>
-                    <p className="text-2xl font-black">{stat.value}</p>
-                    <p className="text-[10px] text-white/70 font-medium mt-0.5">{stat.label}</p>
+              <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80 h-full">
+                <CardContent className="p-4 flex items-center gap-3">
+                  <div className={`h-11 w-11 rounded-xl ${stat.tint} bg-opacity-10 flex items-center justify-center flex-shrink-0`}>
+                    <Icon className={`h-5 w-5 ${stat.tint.replace('bg-', 'text-')}`} />
                   </div>
-                </div>
-              </div>
+                  <div className="min-w-0">
+                    <p className="text-2xl font-black text-foreground leading-none">{stat.value}</p>
+                    <p className="text-[11px] text-muted-foreground font-medium mt-1 truncate">{stat.label}</p>
+                  </div>
+                </CardContent>
+              </Card>
             </motion.div>
           );
         })}
       </div>
 
-      {/* Search & Filter */}
-      <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80">
-        <CardContent className="p-4">
-          <div className="flex flex-col sm:flex-row gap-3">
-            <div className="relative flex-1">
-              <Search className="absolute start-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-              <Input
-                placeholder={t('searchEmployees' as any)}
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="ps-9 h-10"
-              />
-            </div>
-            <Select value={roleFilter} onValueChange={setRoleFilter}>
-              <SelectTrigger className="w-full sm:w-40 h-10">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="ALL">{t('all')}</SelectItem>
-                <SelectItem value="AGENCY_OWNER">{t('agencyOwner')}</SelectItem>
-                <SelectItem value="AGENCY_MANAGER">{t('staffRoleManager')}</SelectItem>
-                <SelectItem value="STAFF">{t('staffRoleStaff')}</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-        </CardContent>
-      </Card>
+      {/* ── Search & filter toolbar ── */}
+      <div className="flex flex-col sm:flex-row gap-3">
+        <div className="relative flex-1">
+          <Search className="absolute start-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+          <Input
+            placeholder={t('searchEmployees' as any)}
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="ps-9 h-11 rounded-xl"
+            aria-label={t('searchEmployees' as any)}
+          />
+        </div>
+        <Select value={roleFilter} onValueChange={setRoleFilter}>
+          <SelectTrigger className="w-full sm:w-44 h-11 rounded-xl" aria-label={t('staffRoleSelect')}>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="ALL">{t('all')}</SelectItem>
+            <SelectItem value="AGENCY_OWNER">{t('agencyOwner')}</SelectItem>
+            <SelectItem value="AGENCY_MANAGER">{t('staffRoleManager')}</SelectItem>
+            <SelectItem value="STAFF">{t('staffRoleStaff')}</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
 
-      {/* Employee List */}
-      <div className="space-y-2">
-        {filtered.length === 0 ? (
-          <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80">
-            <CardContent className="p-8 text-center">
-              <Users className="h-12 w-12 text-muted-foreground/30 mx-auto mb-3" />
-              <p className="text-sm text-muted-foreground">{t('noEmployeesFound' as any)}</p>
-            </CardContent>
-          </Card>
-        ) : (
-          <AnimatePresence mode="popLayout">
-            {filtered.map((emp, idx) => (
+      {/* ── Employee card grid ── */}
+      {filtered.length === 0 ? (
+        <Card className="border-0 shadow-sm bg-white dark:bg-gray-900/80">
+          <CardContent className="p-10 text-center">
+            <Users className="h-12 w-12 text-muted-foreground/30 mx-auto mb-3" />
+            <p className="text-sm text-muted-foreground">{t('noEmployeesFound' as any)}</p>
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {filtered.map((emp, idx) => {
+            const isOwner = emp.role === 'AGENCY_OWNER';
+            return (
               <motion.div
                 key={emp.userId}
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, x: -200 }}
-                transition={{ delay: idx * 0.03 }}
+                transition={{ delay: Math.min(idx * 0.03, 0.25) }}
                 layout
               >
-                <Card className={`border-0 shadow-sm transition-all duration-200 hover:shadow-md ${!emp.isActive ? 'opacity-60' : 'bg-white dark:bg-gray-900/80'}`}>
-                  <CardContent className="p-4">
-                    <div className="flex flex-wrap items-center gap-3">
-                      {/* Avatar */}
+                <Card className={`border-0 shadow-sm transition-all duration-200 hover:shadow-md h-full ${
+                  !emp.isActive ? 'opacity-70 bg-gray-50 dark:bg-gray-900/50' : 'bg-white dark:bg-gray-900/80'
+                }`}>
+                  <CardContent className="p-4 flex flex-col gap-3">
+                    {/* Identity row */}
+                    <div className="flex items-start gap-3 min-w-0">
                       <div className={`h-11 w-11 rounded-xl flex items-center justify-center flex-shrink-0 ${
                         emp.isActive
                           ? 'bg-gradient-to-br from-emerald-400 to-teal-500'
                           : 'bg-gradient-to-br from-gray-400 to-gray-500'
                       }`}>
                         <span className="text-sm font-bold text-white">
-                          {(emp.fullName || '').split(' ').map(n => n[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || '?'}
+                          {(emp.fullName || '').split(' ').map((n) => n[0]).filter(Boolean).slice(0, 2).join('').toUpperCase() || '?'}
                         </span>
                       </div>
-
-                      {/* Info */}
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <p className="font-semibold text-sm text-foreground truncate">{emp.fullName || '?'}</p>
+                          <p className="font-semibold text-sm text-foreground truncate min-w-0" title={emp.fullName || '?'}>
+                            {emp.fullName || '?'}
+                          </p>
                           {getRoleBadge(emp.role)}
                           {!emp.isActive && (
                             <Badge variant="outline" className="text-[10px] text-gray-500 dark:text-gray-400 border-gray-300 dark:border-gray-600">{t('inactive')}</Badge>
                           )}
                         </div>
-                        <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground flex-wrap">
-                          <span>@{emp.username || '—'}</span>
+                        <div className="flex items-center gap-2 mt-1 text-xs text-muted-foreground flex-wrap min-w-0">
+                          <span className="truncate" dir="ltr">@{emp.username || '—'}</span>
                           {emp.uid && (
-                            <span className="font-mono" dir="ltr">{emp.uid}</span>
+                            <span className="font-mono truncate" dir="ltr">{emp.uid}</span>
                           )}
                           <span className="hidden sm:inline">•</span>
                           <span className="hidden sm:inline">{formatDate(emp.createdAt)}</span>
                         </div>
                       </div>
 
-                      {/* Actions — 0.6.51: wrap instead of squeezing the info
-                          column to nothing on narrow phones */}
-                      <div className="flex items-center gap-1 flex-shrink-0 flex-wrap">
-                        {/* Toggle Active */}
-                        {emp.role !== 'AGENCY_OWNER' && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => handleToggleActive(emp)}
-                            title={emp.isActive ? t('staffDeactivated') : t('staffActivated')}
-                          >
-                            {emp.isActive ? (
-                              <UserCheck className="h-4 w-4 text-emerald-600" />
-                            ) : (
-                              <UserX className="h-4 w-4 text-gray-400" />
-                            )}
-                          </Button>
-                        )}
-
-                        {/* Edit */}
-                        {emp.role !== 'AGENCY_OWNER' && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => openEdit(emp)}
-                            title={t('editStaffMember')}
-                          >
-                            <Pencil className="h-4 w-4 text-muted-foreground" />
-                          </Button>
-                        )}
-
-                        {/* Permissions */}
-                        {emp.role !== 'AGENCY_OWNER' && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8"
-                            onClick={() => openPermissions(emp)}
-                            title={t('staffPermissions')}
-                          >
-                            <Lock className="h-4 w-4 text-muted-foreground" />
-                          </Button>
-                        )}
-
-                        {/* Remove */}
-                        {emp.role !== 'AGENCY_OWNER' && (
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-8 w-8 hover:text-red-500"
-                            onClick={() => { setRemoveEmployee(emp); setRemoveOpen(true); }}
-                            title={t('removeStaff')}
-                          >
-                            <Trash2 className="h-4 w-4" />
-                          </Button>
-                        )}
-                      </div>
+                      {/* 0.6.77 — ONE labelled overflow menu instead of four
+                          unlabeled h-8 icon buttons. */}
+                      {!isOwner && (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-9 w-9 flex-shrink-0"
+                              aria-label={`${t('editStaffMember')} — ${emp.fullName}`}
+                            >
+                              <MoreVertical className="h-4 w-4 text-muted-foreground" />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="w-48">
+                            <DropdownMenuItem onClick={() => openEdit(emp)} className="gap-2">
+                              <Pencil className="h-4 w-4 text-muted-foreground" />
+                              {t('editStaffMember')}
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={() => openPermissions(emp)} className="gap-2">
+                              <Lock className="h-4 w-4 text-muted-foreground" />
+                              {t('staffPermissions')}
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onClick={() => { setRemoveEmployee(emp); setRemoveOpen(true); }}
+                              className="gap-2 text-red-600 focus:text-red-600 focus:bg-red-50 dark:focus:bg-red-950/30"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                              {t('removeStaff')}
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      )}
                     </div>
+
+                    {/* Footer row — labelled active switch, full size */}
+                    {!isOwner && (
+                      <div className="pt-2 border-t border-gray-100 dark:border-gray-800/60 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          {emp.isActive ? (
+                            <UserCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+                          ) : (
+                            <UserX className="h-4 w-4 text-gray-400 flex-shrink-0" />
+                          )}
+                          <Label className="text-xs text-muted-foreground whitespace-nowrap">
+                            {emp.isActive ? t('active') : t('inactive')}
+                          </Label>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {togglingUserId === emp.userId && (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                          )}
+                          <Switch
+                            checked={emp.isActive}
+                            onCheckedChange={() => handleToggleActive(emp)}
+                            disabled={togglingUserId === emp.userId}
+                            aria-label={`${emp.isActive ? t('active') : t('inactive')} — ${emp.fullName}`}
+                            className="data-[state=checked]:bg-emerald-500 data-[state=unchecked]:bg-gray-300 dark:data-[state=unchecked]:bg-gray-600"
+                          />
+                        </div>
+                      </div>
+                    )}
+                    {isOwner && (
+                      <div className="pt-2 border-t border-gray-100 dark:border-gray-800/60 flex items-center gap-2">
+                        <Shield className="h-4 w-4 text-amber-500 flex-shrink-0" />
+                        <span className="text-xs text-muted-foreground">{t('agencyOwner')}</span>
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               </motion.div>
-            ))}
-          </AnimatePresence>
-        )}
-      </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* Create Employee Dialog */}
       <Dialog open={createOpen} onOpenChange={(open) => { setCreateOpen(open); if (!open) { setNewUsername(''); setNewFullName(''); setNewPassword(''); setNewRole('STAFF'); setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); setNewBranchId(''); setBranchError(false); } }}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="sm:max-w-lg max-h-[88vh] overflow-y-auto custom-scrollbar">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <UserPlus className="h-5 w-5 text-emerald-600" />
@@ -792,24 +848,26 @@ export function AgencyEmployees() {
             <DialogDescription>{t('createStaffAccountDesc' as any)}</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-2">
-            <div className="space-y-2">
-              <Label className="text-xs">{t('staffUsername')}</Label>
-              <Input
-                value={newUsername}
-                onChange={(e) => setNewUsername(e.target.value)}
-                placeholder={t('enterUsername')}
-                className="h-11"
-                dir="ltr"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs">{t('staffFullName')}</Label>
-              <Input
-                value={newFullName}
-                onChange={(e) => setNewFullName(e.target.value)}
-                placeholder={t('fullName')}
-                className="h-11"
-              />
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label className="text-xs">{t('staffUsername')}</Label>
+                <Input
+                  value={newUsername}
+                  onChange={(e) => setNewUsername(e.target.value)}
+                  placeholder={t('enterUsername')}
+                  className="h-11"
+                  dir="ltr"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs">{t('staffFullName')}</Label>
+                <Input
+                  value={newFullName}
+                  onChange={(e) => setNewFullName(e.target.value)}
+                  placeholder={t('fullName')}
+                  className="h-11"
+                />
+              </div>
             </div>
             <div className="space-y-2">
               <Label className="text-xs">{t('staffInitialPassword')}</Label>
@@ -828,6 +886,7 @@ export function AgencyEmployees() {
                     size="icon"
                     className="absolute end-1 top-1/2 -translate-y-1/2 h-8 w-8"
                     onClick={() => setShowPassword(!showPassword)}
+                    aria-label={showPassword ? t('hidePassword') : t('showPassword')}
                   >
                     {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   </Button>
@@ -842,39 +901,44 @@ export function AgencyEmployees() {
                 </Button>
               </div>
             </div>
-            <div className="space-y-2">
-              <Label className="text-xs">{t('staffBranchLabel')}</Label>
-              <Select
-                value={newBranchId || undefined}
-                onValueChange={(v) => { setNewBranchId(v); setBranchError(false); }}
-              >
-                <SelectTrigger className="h-11" aria-invalid={branchError}>
-                  <SelectValue placeholder={t('staffBranchPlaceholder')} />
-                </SelectTrigger>
-                <SelectContent>
-                  {branchOptions.map((b) => (
-                    <SelectItem key={b.id} value={b.id}>
-                      {lang === 'ar' && b.nameAr ? b.nameAr : lang === 'fr' && b.nameFr ? b.nameFr : b.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {branchesLoading && <p className="text-[10px] text-muted-foreground">{t('loading' as any) || '...'}</p>}
-              {branchError && (
-                <p className="text-xs text-red-600 dark:text-red-400">{t('staffBranchRequired')}</p>
-              )}
-            </div>
-            <div className="space-y-2">
-              <Label className="text-xs">{t('staffRoleSelect')}</Label>
-              <Select value={newRole} onValueChange={(v) => { setNewRole(v); if (v === 'MANAGER') setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); }}>
-                <SelectTrigger className="h-11">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="STAFF">{t('staffRoleStaff')}</SelectItem>
-                  <SelectItem value="MANAGER">{t('staffRoleManager')}</SelectItem>
-                </SelectContent>
-              </Select>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label className="text-xs">{t('staffBranchLabel')}</Label>
+                <Select
+                  value={newBranchId || undefined}
+                  onValueChange={(v) => { setNewBranchId(v); setBranchError(false); }}
+                >
+                  <SelectTrigger className="h-11" aria-invalid={branchError}>
+                    <SelectValue placeholder={t('staffBranchPlaceholder')} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {branchOptions.map((b) => (
+                      <SelectItem key={b.id} value={b.id}>
+                        <span className="flex items-center gap-1.5">
+                          <Building2 className="h-3.5 w-3.5 text-muted-foreground" />
+                          {lang === 'ar' && b.nameAr ? b.nameAr : lang === 'fr' && b.nameFr ? b.nameFr : b.name}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {branchesLoading && <p className="text-[10px] text-muted-foreground">{t('loading' as any) || '...'}</p>}
+                {branchError && (
+                  <p className="text-xs text-red-600 dark:text-red-400">{t('staffBranchRequired')}</p>
+                )}
+              </div>
+              <div className="space-y-2">
+                <Label className="text-xs">{t('staffRoleSelect')}</Label>
+                <Select value={newRole} onValueChange={(v) => { setNewRole(v); if (v === 'MANAGER') setNewPermissions({ ...MANAGER_TIER_DEFAULTS }); }}>
+                  <SelectTrigger className="h-11">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="STAFF">{t('staffRoleStaff')}</SelectItem>
+                    <SelectItem value="MANAGER">{t('staffRoleManager')}</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
             {/* Task 37-e: manager authorities — defaults to ALL CHECKED (tier
                 defaults); the owner unticks what they don't want to grant.
@@ -1037,12 +1101,14 @@ export function AgencyEmployees() {
             {removeEmployee && (
               <div className="flex items-center gap-3 p-3 rounded-xl bg-red-50 dark:bg-red-900/10">
                 <div className="h-10 w-10 rounded-full bg-red-200 dark:bg-red-900/30 flex items-center justify-center flex-shrink-0">
+                  {/* 0.6.77 — guarded initial: an empty fullName used to crash
+                      on .charAt(0).toUpperCase() of undefined. */}
                   <span className="text-sm font-bold text-red-700 dark:text-red-400">
-                    {removeEmployee.fullName.charAt(0).toUpperCase()}
+                    {(removeEmployee.fullName || '?').charAt(0).toUpperCase()}
                   </span>
                 </div>
                 <div>
-                  <p className="font-semibold text-sm text-foreground">{removeEmployee.fullName}</p>
+                  <p className="font-semibold text-sm text-foreground">{removeEmployee.fullName || '?'}</p>
                   <p className="text-xs text-muted-foreground">@{removeEmployee.username}</p>
                 </div>
               </div>

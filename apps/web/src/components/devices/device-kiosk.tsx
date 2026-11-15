@@ -74,6 +74,7 @@ import {
   loadDeviceId,
   saveDeviceId,
 } from './kiosk/kiosk-types';
+import { useCategoryTermScope } from '@/hooks/use-category-terms';
 
 export function DeviceKiosk() {
   const { t, lang, setLang } = useLanguage();
@@ -85,6 +86,12 @@ export function DeviceKiosk() {
   const [credError, setCredError] = useState<string | null>(null);
   const [agencyCode, setAgencyCode] = useState(() => loadSavedAgencyCode());
   const [agency, setAgency] = useState<AgencyInfo | null>(null);
+
+  // 0.6.76 — activate the paired agency's SPECIALIZED terminology for every
+  // t() call in the kiosk tree ("Patient" instead of "Customer" for a clinic,
+  // "Client" for a law firm...). Silent-degrade: unpaired / fetch failure →
+  // standard dictionary words.
+  useCategoryTermScope(agency?.category || null);
   const [services, setServices] = useState<ServiceInfo[]>([]);
   const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
   const [selectedService, setSelectedService] = useState<string | null>(null);

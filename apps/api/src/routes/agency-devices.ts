@@ -806,7 +806,9 @@ app.get('/public/queue-status', async (c) => {
     if (clientIp) recordSuccessfulRequest(clientIp)
     return c.json({
       success: true,
-      agency: { id: agency.id, name: agency.name, nameAr: agency.nameAr, nameFr: agency.nameFr, logoUrl: agency.logoUrl, isQueueOpen: agency.isQueueOpen, isPaused },
+      // 0.6.76 — `category` rides along so TV boards activate the agency's
+      // SPECIALIZED terminology scope (Patient/Client/Customer...).
+      agency: { id: agency.id, name: agency.name, nameAr: agency.nameAr, nameFr: agency.nameFr, logoUrl: agency.logoUrl, isQueueOpen: agency.isQueueOpen, isPaused, category: agency.category },
       currentlyServing: servingReservations.map((r) => ({ id: r.id, ticketNumber: r.displayNumber, serviceId: r.serviceId, serviceName: r.service.name, status: r.status, calledAt: r.calledAt, counterName: r.counter?.name ?? null })),
       serviceStats,
       totalWaiting,

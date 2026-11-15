@@ -376,6 +376,14 @@ export function AgencyFullscreen() {
   const [counters, setCounters] = useState<CounterOption[]>([]);
   const [selectedCounterId, setSelectedCounterId] = useState<string>('');
   const [occupationLoading, setOccupationLoading] = useState<string | null>(null);
+  // 0.6.77 — mid-session CONTROL LOSS banner mode. When a claimed lease dies
+  // (heartbeat expiry, forced takeover, another tab's release), the console
+  // used to swap ENTIRELY to the full-screen claim-gate panel — which read as
+  // a "ghost dialog appearing with no reason". Now the loss demotes to a
+  // compact amber banner above the (still visible) serving surface; the full
+  // gate stays only for the deliberate entry path. Cleared by ANY successful
+  // claim/adopt and by a user-initiated release.
+  const [controlLostMode, setControlLostMode] = useState(false);
 
   // ─── r21-8 — counter CONTROL claim flow state ──────────────────
   const myUserId = user?.id || '';
@@ -442,6 +450,11 @@ export function AgencyFullscreen() {
             staffId: (c.staffId as string | null) ?? null,
             occupiedBy: staff?.user?.fullName ?? null,
             occupiedAt: (c.occupiedAt as string | null) ?? null,
+            // 0.6.77 — copy the CONTROL id in the BASE mapping: `include`
+            // responses carry the scalar even from older local builds, so the
+            // claim-restore below no longer depends on the (async, sometimes
+            // later-failing) control merge to know which counter is mine.
+            controlledByUserId: (c.controlledByUserId as string | null | undefined) ?? null,
           });
         }
       }
@@ -574,6 +587,8 @@ export function AgencyFullscreen() {
         });
         if (res.status === 403 && !stopped) {
           releaseLocalControl();
+          // 0.6.77 — loss demotes to a banner, not a full-screen gate takeover.
+          setControlLostMode(true);
           toast.error(t('counterControlLost'));
           fetchCounters();
         }
@@ -826,6 +841,8 @@ export function AgencyFullscreen() {
             localStorage.setItem(`blasti_counter_${agencyId}`, cid);
             setControlRequest(null);
             setControlDialog(null);
+            // 0.6.77 — control is back: leave banner mode.
+            setControlLostMode(false);
             toast.success(t('counterControlGranted'));
           }
         }
@@ -856,9 +873,12 @@ export function AgencyFullscreen() {
         const d = ((event as { data?: Record<string, unknown> })?.data
           ?? (event as unknown as Record<string, unknown>)) as Record<string, unknown>;
         // My controlled counter lost its lease (heartbeat expiry / takeover):
-        // return the console to the claim screen.
+        // 0.6.77 — drop the local control state but keep the serving surface;
+        // a compact banner replaces the old full-screen gate takeover (the
+        // "ghost dialog with no reason" report).
         if (d.counterId && d.counterId === selectedCounterIdRef.current) {
           releaseLocalControl();
+          setControlLostMode(true);
           toast.error(t('counterControlLost'));
         }
         fetchCounters();
@@ -948,6 +968,8 @@ export function AgencyFullscreen() {
         setSelectedCounterId(counterId);
         selectedCounterIdRef.current = counterId;
         localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
+        // 0.6.77 — a successful claim always ends banner mode.
+        setControlLostMode(false);
         toast.success(t('counterClaimed'));
         fetchCounters();
       } else {
@@ -996,6 +1018,7 @@ export function AgencyFullscreen() {
           setSelectedCounterId(counterId);
           selectedCounterIdRef.current = counterId;
           localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
+          setControlLostMode(false);
           toast.success(t('counterClaimed'));
           fetchCounters();
         } else if (data.requestId) {
@@ -1036,6 +1059,7 @@ export function AgencyFullscreen() {
         setSelectedCounterId(counterId);
         selectedCounterIdRef.current = counterId;
         localStorage.setItem(`blasti_counter_${agencyId}`, counterId);
+        setControlLostMode(false);
         toast.success(t('counterClaimed'));
         fetchCounters();
       } else {
@@ -1058,6 +1082,9 @@ export function AgencyFullscreen() {
       });
       if (res.ok) {
         releaseLocalControl();
+        // 0.6.77 — deliberate release: the user asked for it, so the normal
+        // claim gate (not the loss banner) comes back.
+        setControlLostMode(false);
         toast.success(t('counterReleased'));
         fetchCounters();
       } else {
@@ -1362,12 +1389,37 @@ export function AgencyFullscreen() {
 
       {/* ─── Main Content Area ──────────────────────────────────────────── */}
       <main className="flex-1 min-h-0 p-3 sm:p-4 lg:p-6 flex flex-col gap-3 sm:gap-4">
+        {/* ─── 0.6.77 — mid-session control loss: a compact banner, NOT the
+            full-screen claim gate. The serving surface stays visible (calls
+            simply answer COUNTER_CONTROL_REQUIRED until a counter is
+            re-claimed), so a lost lease never reads as a ghost dialog. ── */}
+        {controlLostMode && counters.length > 0 && !selectedCounterId && (
+          <div className="flex-shrink-0 flex items-center justify-between gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <AlertTriangle className="h-5 w-5 text-amber-400 flex-shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-amber-200">{t('counterControlLost')}</p>
+                <p className="text-xs text-amber-300/80 truncate">{t('counterClaimGateDesc')}</p>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              onClick={() => setControlLostMode(false)}
+              className="flex-shrink-0 h-9 px-3 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold gap-1.5"
+            >
+              <LogIn className="h-3.5 w-3.5" />
+              {t('claimThisCounter')}
+            </Button>
+          </div>
+        )}
         {/* ─── r23 — counter CLAIM GATE: nobody manages the queue without a
             claimed counter — the agency owner included (parity with the
             server's COUNTER_SETUP_REQUIRED / COUNTER_CONTROL_REQUIRED gates).
             Replaces the old 28px header dropdown with a full readable panel:
-            big counter cards, visible holder names, real claim buttons. ── */}
-        {counters.length > 0 && !selectedCounterId ? (
+            big counter cards, visible holder names, real claim buttons.
+            0.6.77 — the gate is SKIPPED in banner mode (controlLostMode): the
+            loss keeps the serving surface up. ── */}
+        {counters.length > 0 && !selectedCounterId && !controlLostMode ? (
           <div className="flex-1 min-h-0 flex items-center justify-center overflow-y-auto custom-scrollbar py-4">
             <div className="w-full max-w-xl bg-gray-900 border border-gray-800 rounded-3xl p-5 sm:p-7 shadow-2xl">
               <div className="flex items-center gap-3.5">

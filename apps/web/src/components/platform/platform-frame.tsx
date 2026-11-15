@@ -93,8 +93,10 @@ export function PlatformFrame({ children }: { children: React.ReactNode }) {
       <div className="flex flex-col h-screen">
         <ElectronTitleBar />
         {/* overflow-y-auto so the page scrolls inside the Electron window.
-            overflow-hidden here was clipping all content and preventing scroll. */}
-        <div className="flex-1 overflow-y-auto">{children}</div>
+            overflow-hidden here was clipping all content and preventing scroll.
+            data-app-scroller — page.tsx resets THIS element's scrollTop on view
+            change (window.scrollTo is a no-op for an inner scroll container). */}
+        <div data-app-scroller className="flex-1 overflow-y-auto">{children}</div>
       </div>
     );
   }

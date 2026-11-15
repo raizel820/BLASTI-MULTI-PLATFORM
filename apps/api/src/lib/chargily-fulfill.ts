@@ -317,6 +317,9 @@ export async function fulfillCheckoutPaid(
 
     await emitPaymentEvent('payment:completed', {
       agencyId: transaction.agencyId,
+      // 0.6.76 — checkoutId lets the in-app waiting screen match THIS checkout
+      // and settle instantly (push instead of waiting for the next poll tick).
+      checkoutId: checkout.id,
       data: {
         transactionId: transaction.id,
         amount: transaction.amount,
@@ -409,6 +412,7 @@ export async function fulfillCheckoutPaid(
 
       await emitPaymentEvent('payment:completed', {
         userId: smsPurchase.userId,
+        checkoutId: checkout.id,
         data: {
           smsPurchaseId: smsPurchase.id,
           quantity: smsPurchase.quantity,
@@ -469,6 +473,7 @@ export async function fulfillCheckoutPaid(
 
       await emitPaymentEvent('payment:completed', {
         agencyId: order.agencyId,
+        checkoutId: checkout.id,
         data: {
           hardwareOrderId: order.id,
           amount: order.upfrontTotal,
@@ -558,6 +563,7 @@ export async function fulfillCheckoutFailed(
 
       await emitPaymentEvent('payment:failed', {
         agencyId: transaction.agencyId,
+        checkoutId: checkout.id,
         data: {
           transactionId: transaction.id,
           amount: transaction.amount,

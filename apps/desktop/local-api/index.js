@@ -6429,6 +6429,23 @@ function createApp() {
         isBoss,
         forced,
       })
+      // 0.6.77 — mirror the cloud: tell the DISPLACED holder immediately on a
+      // forced takeover so its console demotes to the loss banner instead of
+      // discovering the loss at its next heartbeat (≤60s).
+      if (forced) {
+        const holderName = await resolveControlHolderName(counter)
+        emitEvent('counter:lost', {
+          agencyId: ctx.agencyId,
+          counterId: counter.id,
+          counterName: row.name || counter.name,
+          counterNumber: counter.number,
+          reason: 'FORCED_TRANSFER',
+          previousController: {
+            userId: counter.controlledByUserId,
+            name: holderName || null,
+          },
+        })
+      }
       emitEvent('counter:claimed', {
         agencyId: ctx.agencyId,
         counterId: counter.id,

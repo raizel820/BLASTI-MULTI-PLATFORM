@@ -35,10 +35,21 @@ import { Badge } from '@/components/ui/badge';
 // ─── Polling budget ─────────────────────────────────────────────────────────
 const POLL_INTERVAL_MS = 3_000;
 const MAX_POLL_ATTEMPTS = 40;
+// 0.6.76 — after the fast 2-minute budget the loop no longer dead-stops: it
+// stretches to a slow background window (bank OTP flows and hosted-page
+// retries easily outlive 2 minutes). A settlement during the slow window
+// still flips the screen to paid/failed automatically — and the realtime
+// push (blasti:payment-settled) short-circuits the wait entirely.
+const SLOW_POLL_INTERVAL_MS = 15_000;
+const SLOW_POLL_ATTEMPTS = 40;
 
 /** Mirrors GET /api/payment/checkout/:id → data (see apps/api payment-checkout). */
 interface CheckoutStatusData {
   checkoutId: string;
+  // 0.6.76 — local ledger row ids (the push listener matches settlements
+  // against them; the API returns them on every poll response).
+  transactionId?: string;
+  smsPurchaseId?: string;
   status?: string;
   normalizedStatus?: string;
   amount?: number;
@@ -98,9 +109,9 @@ type Phase =
  * return null on the second pass — wiping the status the generic (logged-out
  * / no-checkout) states derive their styling from.
  */
-let _returnQueryMemo: { status: string | null; checkout: string | null; deep: string | null } | null = null;
+let _returnQueryMemo: { status: string | null; checkout: string | null; ref: string | null; deep: string | null } | null = null;
 
-function readReturnQuery(): { status: string | null; checkout: string | null; deep: string | null } {
+function readReturnQuery(): { status: string | null; checkout: string | null; ref: string | null; deep: string | null } {
   if (_returnQueryMemo) return _returnQueryMemo;
   try {
     const hash = window.location.hash || '';
@@ -116,12 +127,19 @@ function readReturnQuery(): { status: string | null; checkout: string | null; de
         /* private mode — no stash to consume */
       }
     }
-    if (!query) return { status: null, checkout: null, deep: null };
+    if (!query) return { status: null, checkout: null, ref: null, deep: null };
     const params = new URLSearchParams(query);
-    _returnQueryMemo = { status: params.get('status'), checkout: params.get('checkout'), deep: params.get('deep') };
+    _returnQueryMemo = {
+      status: params.get('status'),
+      checkout: params.get('checkout'),
+      // 0.6.76 — `ref` is the LOCAL ledger row id the API bakes into the
+      // success/failure URLs (the paying browser has no localStorage).
+      ref: params.get('ref'),
+      deep: params.get('deep'),
+    };
     return _returnQueryMemo;
   } catch {
-    return { status: null, checkout: null, deep: null };
+    return { status: null, checkout: null, ref: null, deep: null };
   }
 }
 
@@ -153,6 +171,10 @@ export function PaymentResult() {
 
   const attemptsRef = useRef(0);
   const pollingActiveRef = useRef(false);
+  /** Latest poll payload (kept in a ref so the push listener can match ids). */
+  const dataRef = useRef<CheckoutStatusData | null>(null);
+  /** Immediate one-shot check — used by the realtime settlement push. */
+  const pollNowRef = useRef<(() => Promise<void>) | null>(null);
 
   // ── Deep-link bounce (Capacitor mobile) ────────────────────────────────────
   // On phones the hosted checkout opens in the SYSTEM browser, so after
@@ -188,13 +210,17 @@ export function PaymentResult() {
     }
 
     const run = async () => {
-      const { status, checkout } = readReturnQuery();
+      const { status, checkout, ref } = readReturnQuery();
       if (!cancelled) setStatusParam(status);
 
       const pendingCheckout = getPendingCheckout();
       setPending(pendingCheckout);
 
-      let id: string | null = checkout || pendingCheckout?.checkoutId || null;
+      // 0.6.76 — `ref` (the ledger row id carried by the return URL) wins over
+      // the localStorage pending checkout: GET /payment/checkout/:id accepts a
+      // record id too, so the browser result page — which has NO localStorage
+      // — polls the exact payment instead of the ambiguous /pending fallback.
+      let id: string | null = checkout || ref || pendingCheckout?.checkoutId || null;
       if (!id) {
         // Last resort — the payment may have been started in another browser.
         try {
@@ -225,29 +251,35 @@ export function PaymentResult() {
     };
   }, []);
 
-  // ── Poll GET /api/payment/checkout/:id until settled (or budget out) ─────
+  // ── Poll GET /api/payment/checkout/:id until settled ─────────────────────
+  // Fast 3s window → slow 15s background window (0.6.76) — the screen flips
+  // to paid/failed the moment either window sees a settlement, and the
+  // realtime push below short-circuits the wait entirely.
   useEffect(() => {
     if (!checkoutId) return;
 
     let disposed = false;
-    let timer: ReturnType<typeof setInterval> | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     pollingActiveRef.current = true;
     attemptsRef.current = 0;
 
     const stopPolling = () => {
       pollingActiveRef.current = false;
       if (timer !== null) {
-        clearInterval(timer);
+        clearTimeout(timer);
         timer = null;
       }
     };
 
-    const poll = async () => {
-      if (disposed || !pollingActiveRef.current) return;
+    const TOTAL_BUDGET = MAX_POLL_ATTEMPTS + SLOW_POLL_ATTEMPTS;
+
+    const poll = async (force = false) => {
+      // `force` — the realtime push checking AFTER the budgeted loop stopped.
+      if (disposed || (!pollingActiveRef.current && !force)) return;
       attemptsRef.current += 1;
       try {
         const res = await apiFetch(`/api/payment/checkout/${encodeURIComponent(checkoutId)}`);
-        if (disposed || !pollingActiveRef.current) return;
+        if (disposed) return;
         const body = await res.json().catch(() => null);
 
         if (!res.ok && res.status === 404) {
@@ -258,13 +290,14 @@ export function PaymentResult() {
         const d = extractPaymentData<CheckoutStatusData>(body);
         if (!res.ok || !d) {
           // Transient API/network hiccup — keep polling while budget remains.
-          if (attemptsRef.current >= MAX_POLL_ATTEMPTS) {
+          if (attemptsRef.current >= TOTAL_BUDGET) {
             stopPolling();
             setPhase('still-pending');
           }
           return;
         }
 
+        dataRef.current = d;
         setData(d);
         if (d.normalizedStatus === 'paid' || d.normalizedStatus === 'failed') {
           // Settled — the localStorage marker has served its purpose.
@@ -273,29 +306,47 @@ export function PaymentResult() {
           setPhase(d.normalizedStatus);
           return;
         }
-        if (attemptsRef.current >= MAX_POLL_ATTEMPTS) {
+        if (attemptsRef.current >= TOTAL_BUDGET) {
           stopPolling();
           setPhase('still-pending');
         }
       } catch {
-        if (attemptsRef.current >= MAX_POLL_ATTEMPTS) {
+        if (attemptsRef.current >= TOTAL_BUDGET) {
           stopPolling();
           setPhase('still-pending');
         }
       }
     };
 
-    // Immediate first check, then every 3s.
-    void poll();
-    timer = setInterval(() => {
-      void poll();
-    }, POLL_INTERVAL_MS);
+    pollNowRef.current = async () => {
+      if (!disposed) await poll(true);
+    };
+
+    const loop = async () => {
+      // Immediate first check, then a self-adjusting cadence: every 3s during
+      // the fast window, every 15s afterwards. Keeps the UI phase honest
+      // ("still pending" once the fast window is out) while never giving up
+      // on the payment within the combined budget.
+      while (!disposed && pollingActiveRef.current) {
+        await poll();
+        if (disposed || !pollingActiveRef.current) return;
+        if (attemptsRef.current >= MAX_POLL_ATTEMPTS) {
+          setPhase((p) => (p === 'confirming' ? 'still-pending' : p));
+        }
+        const delay = attemptsRef.current >= MAX_POLL_ATTEMPTS ? SLOW_POLL_INTERVAL_MS : POLL_INTERVAL_MS;
+        await new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, delay);
+        });
+      }
+    };
+    void loop();
 
     // Returning from the hosted payment tab — check right away instead of
-    // waiting for the next interval tick.
+    // waiting for the next interval tick. `force` also covers the post-budget
+    // return: the user paid, came back, the screen settles without a click.
     const onReturn = () => {
       if (document.visibilityState === 'hidden') return;
-      void poll();
+      void poll(true);
     };
     window.addEventListener('focus', onReturn);
     document.addEventListener('visibilitychange', onReturn);
@@ -303,10 +354,42 @@ export function PaymentResult() {
     return () => {
       disposed = true;
       stopPolling();
+      pollNowRef.current = null;
       window.removeEventListener('focus', onReturn);
       document.removeEventListener('visibilitychange', onReturn);
     };
   }, [checkoutId, pollSession]);
+
+  // ── Push confirmation (0.6.76) — the server announces settlement over the
+  // realtime socket the moment a checkout settles (webhook, poll fallback or
+  // the 5-min sweeper). The toast bridge re-dispatches it as
+  // `blasti:payment-settled`; when the event is about THIS checkout (or
+  // carries no ids to rule it out), run an immediate check — the screen
+  // updates without waiting for the next poll tick, even after the budget
+  // ran out. This is what lets the desktop/mobile app auto-confirm the
+  // subscription while the payer is still closing the gateway tab.
+  useEffect(() => {
+    if (!checkoutId) return;
+    const onSettled = (e: Event) => {
+      const detail = (e as CustomEvent).detail as
+        | { ok?: boolean; event?: { checkoutId?: string; data?: { transactionId?: string; smsPurchaseId?: string } } }
+        | undefined;
+      const ev = detail?.event ?? {};
+      const evData = ev.data ?? {};
+      const d = dataRef.current;
+      // Skip only when the payload POSITIVELY names a different checkout —
+      // matching is best-effort: the payload checkoutId is the Chargily id,
+      // while our checkoutId state may be the local record id (`ref` path).
+      let foreign = false;
+      if (ev.checkoutId && d?.checkoutId && ev.checkoutId !== d.checkoutId && ev.checkoutId !== checkoutId) foreign = true;
+      if (evData.transactionId && d?.transactionId && evData.transactionId !== d.transactionId) foreign = true;
+      if (evData.smsPurchaseId && d?.smsPurchaseId && evData.smsPurchaseId !== d.smsPurchaseId) foreign = true;
+      if (foreign) return;
+      void pollNowRef.current?.();
+    };
+    window.addEventListener('blasti:payment-settled', onSettled);
+    return () => window.removeEventListener('blasti:payment-settled', onSettled);
+  }, [checkoutId]);
 
   const restartPolling = () => {
     attemptsRef.current = 0;

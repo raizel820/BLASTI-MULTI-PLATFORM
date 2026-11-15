@@ -30,6 +30,7 @@ import { randomUUID } from 'crypto'
 import { z } from 'zod'
 import { db, Prisma } from '@blasti/db'
 import { ensureCategoryDictionary } from '../lib/ensure-category-dictionary'
+import { enqueueCategoryTermGeneration } from '../lib/translation-agent'
 import { requireAuth, requireRole, authErrorResponse } from '../lib/auth'
 import { validateBody } from '../lib/validations'
 import { BUILT_IN_AGENCY_CATEGORY_KEYS } from '../lib/enums'
@@ -263,6 +264,17 @@ app.post('/', async (c) => {
 
     // Performance Round — the dictionary feeds the customer filter bar.
     invalidateResponseCacheTag('categories')
+
+    // 0.6.76 — queue the agent's SPECIALIZED terminology generation for the
+    // new category ("Patient" vs "Customer" vs "Client"...). Direct creation
+    // previously queued NOTHING, so custom categories stayed on generic words
+    // until an admin hand-seeded terms. Best-effort: creation must not fail
+    // because the queue write did.
+    try {
+      await enqueueCategoryTermGeneration(category.id, `admin:${user.id}`)
+    } catch (queueErr) {
+      console.warn('[AGENCY-CATEGORIES] terminology generation queue failed (non-fatal):', queueErr instanceof Error ? queueErr.message : queueErr)
+    }
 
     return c.json({ success: true, data: category }, 201)
   } catch (error: unknown) {

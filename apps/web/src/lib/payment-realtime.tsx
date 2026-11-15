@@ -68,20 +68,25 @@ export function PaymentRealtimeToasts() {
   // survive reconnects (the singleton socket object persists across them).
   useEffect(() => {
     if (!connected) return;
-    const offCompleted = on('payment:completed', () => {
+    // 0.6.76 — the raw socket payload rides in the DOM event detail so the
+    // payment-result waiting screen can match the settlement to ITS checkout
+    // (checkoutId / transactionId / smsPurchaseId) and confirm instantly —
+    // the desktop renderer receives these via the local API's cloud relay,
+    // mobile straight from the cloud socket.
+    const offCompleted = on('payment:completed', (payload) => {
       toast.success(t('paymentToastCompleted'));
       // 0.6.38 — toast-only left the subscription UI stale ("inactive
       // subscription" long after a successful payment). Announce settlement
       // so any mounted surface (agency-subscription, dashboards, profile)
       // can refetch immediately — no restart, no re-navigation required.
       try {
-        window.dispatchEvent(new CustomEvent('blasti:payment-settled', { detail: { ok: true } }));
+        window.dispatchEvent(new CustomEvent('blasti:payment-settled', { detail: { ok: true, event: payload } }));
       } catch { /* ignore */ }
     });
-    const offFailed = on('payment:failed', () => {
+    const offFailed = on('payment:failed', (payload) => {
       toast.error(t('paymentToastFailed'));
       try {
-        window.dispatchEvent(new CustomEvent('blasti:payment-settled', { detail: { ok: false } }));
+        window.dispatchEvent(new CustomEvent('blasti:payment-settled', { detail: { ok: false, event: payload } }));
       } catch { /* ignore */ }
     });
     return () => {

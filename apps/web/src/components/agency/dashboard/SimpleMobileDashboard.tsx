@@ -104,6 +104,12 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
   // r23 — only the platform operator bypasses the claim gate; the agency
   // OWNER needs a claimed counter exactly like staff (server parity).
   const bypassesClaim = user?.role === 'SUPER_ADMIN';
+  // 0.6.77 — inline claim: the first FREE counter id, recorded during the
+  // same fetch so the dashboard's claim button can claim WITHOUT navigating
+  // to the fullscreen console (bug report: claiming from the dashboard threw
+  // the user into fullscreen mode immediately).
+  const [claimableCounterId, setClaimableCounterId] = useState<string | null>(null);
+  const [claimLoading, setClaimLoading] = useState(false);
 
   const fetchMyCounter = useCallback(async () => {
     if (!agencyId || !user?.id) return;
@@ -113,6 +119,9 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
       const data = await res.json();
       const rows = (data.counters ?? data.data ?? (Array.isArray(data) ? data : [])) as Array<Record<string, unknown>>;
       const mine = rows.find((r) => r.controlledByUserId === user.id);
+      // 0.6.77 — first active counter nobody controls → the inline-claim target.
+      const claimable = rows.find((r) => r.isActive !== false && !r.controlledByUserId);
+      setClaimableCounterId(claimable ? String(claimable.id) : null);
       if (!mine) {
         setMyControlledCounter(null);
         return;
@@ -133,6 +142,41 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
       });
     } catch { /* best-effort — the server still gates */ }
   }, [agencyId, user?.id]);
+
+  // 0.6.77 — claim INLINE (no navigation). The button used to hard-navigate
+  // to the fullscreen console; now the claim API call happens right here and
+  // the dashboard refreshes into "my counter" state. If nothing is claimable
+  // (all taken), fall back to the console where the takeover flow lives.
+  const handleClaimInline = async () => {
+    if (!agencyId) return;
+    if (!claimableCounterId) {
+      setView('agency-fullscreen');
+      return;
+    }
+    setClaimLoading(true);
+    try {
+      const res = await apiFetch(`/api/agency/counters/${encodeURIComponent(claimableCounterId)}/claim`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agencyId }),
+      });
+      if (res.ok) {
+        toast.success(t('counterClaimed'));
+        // fetchMyCounter alone is enough: claiming only changes WHO controls
+        // a counter (queue stats are untouched), and fetchData is declared
+        // further down — no ordering coupling needed.
+        fetchMyCounter();
+      } else {
+        const d = await res.json().catch(() => ({}));
+        toast.error(d.error === 'COUNTER_CONTROLLED' ? t('counterControlTitle') : (d.error || t('error')));
+        fetchMyCounter();
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setClaimLoading(false);
+    }
+  };
 
   useEffect(() => {
     fetchMyCounter();
@@ -754,10 +798,15 @@ export function SimpleMobileDashboard({ agencyId, onNavigateToSettings }: Simple
           </div>
         ) : !bypassesClaim ? (
           <button
-            onClick={() => setView('agency-fullscreen')}
-            className="w-full flex items-center justify-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-300 active:scale-[0.99] transition-transform"
+            onClick={handleClaimInline}
+            disabled={!claimableCounterId || claimLoading}
+            className="w-full flex items-center justify-center gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-300 active:scale-[0.99] transition-transform disabled:opacity-60"
           >
-            <LogIn className="h-3.5 w-3.5" />
+            {claimLoading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <LogIn className="h-3.5 w-3.5" />
+            )}
             {t('claimCounterFirstCta')}
           </button>
         ) : null}

@@ -4519,6 +4519,37 @@ app.whenReady().then(async () => {
   createWindow();
   console.log('[BLASTI Desktop] Window created — loading screen active');
 
+  // 0.6.76 — payment deep link on COLD start (Windows/Linux). When the OS
+  // opens `blasti://payment/result?...` while the app is NOT running, this
+  // process launches WITH the URL in argv; macOS delivers it via 'open-url'
+  // and a warm start via 'second-instance', but a Windows cold start was
+  // silently dropped — the payer returned from the gateway into a freshly
+  // opened app that never routed to the payment result. Forward the argv URL
+  // to the renderer once its page has finished loading.
+  try {
+    const coldDeepLink = (process.argv || []).find((arg) => String(arg).startsWith(`${PROTOCOL}://`));
+    if (coldDeepLink && mainWindow && !mainWindow.isDestroyed()) {
+      const wc = mainWindow.webContents;
+      const sendColdDeepLink = () => {
+        try {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('deep-link', coldDeepLink);
+            console.log('[BLASTI Desktop] Cold-start deep link forwarded:', coldDeepLink);
+          }
+        } catch (sendErr) {
+          console.warn('[BLASTI Desktop] Cold-start deep link send failed:', sendErr && sendErr.message);
+        }
+      };
+      if (wc.isLoading()) {
+        wc.once('did-finish-load', sendColdDeepLink);
+      } else {
+        sendColdDeepLink();
+      }
+    }
+  } catch (deepLinkErr) {
+    console.warn('[BLASTI Desktop] Cold-start deep link parse failed:', deepLinkErr && deepLinkErr.message);
+  }
+
   try {
     createTray();
   } catch (err) {

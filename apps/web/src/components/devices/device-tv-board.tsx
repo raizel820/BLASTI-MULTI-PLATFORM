@@ -25,6 +25,7 @@ import { TvCounters } from './tv/layouts/tv-counters';
 import { TvFocus } from './tv/layouts/tv-focus';
 import { TvMinimal } from './tv/layouts/tv-minimal';
 import { useTvBoardData, type TvScreenLayout } from './tv/use-tv-board-data';
+import { useCategoryTermScope } from '@/hooks/use-category-terms';
 
 const TV_LAYOUTS: TvScreenLayout[] = ['TV_CLASSIC', 'TV_COUNTERS', 'TV_FOCUS', 'TV_MINIMAL'];
 
@@ -125,6 +126,11 @@ export function DeviceTvBoard({ agencyId, onBack, currentLang }: DeviceTvBoardPr
         ? !richBoardActive
         : false;
   const tvData = useTvBoardData({ agencyId, registerEnabled });
+
+  // 0.6.76 — activate the agency's SPECIALIZED terminology for every t() call
+  // in the board tree ("No patients in queue" vs "No customers in queue").
+  // Silent-degrade: no category / failed fetch → standard dictionary words.
+  useCategoryTermScope(tvData.status?.agency?.category ?? null);
 
   // First-boot layout discovery: a freshly provisioned TV has no stored token
   // when the shell probes, so we re-probe the device config as soon as the
