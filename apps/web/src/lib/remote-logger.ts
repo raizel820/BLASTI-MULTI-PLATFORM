@@ -46,6 +46,11 @@ export interface LogEntry {
    *  lifted to the batch envelope on flush, indexed server-side and
    *  filterable in the Logs Manager. */
   trigger?: string;
+  /** 0.6.81 — 'transactions' entries ride the SAME buffer/ingest but are
+   *  MIRRORED server-side into the dedicated cross-account transaction
+   *  stream (logs/_transactions/<date>.ndjson) that powers the Logs
+   *  Manager "Transactions" tab. Only this value is whitelisted. */
+  channel?: 'transactions';
 }
 
 /**
@@ -69,6 +74,29 @@ export const LOG_TRIGGERS = [
   'database',               // local/remote DB errors
 ] as const;
 export type LogTrigger = (typeof LOG_TRIGGERS)[number] | (string & {});
+
+/**
+ * 0.6.81 — canonical TRANSACTION FUNNEL stages (mirror apps/api/src/lib/
+ * tx-log.ts). Every money movement — subscriptions, SMS packs, hardware —
+ * is logged through logTx() with one of these stages, from the moment the
+ * user ENTERS a purchase surface until settlement + final redirection land.
+ * The server adds its own authoritative stages (checkout_created,
+ * webhook_received, settle_paid/failed, manual_*). Unknown stages are kept
+ * verbatim so new call sites never silently disappear from the stream.
+ */
+export const TX_STAGES = [
+  'page_enter',
+  'purchase_ui_open',
+  'purchase_ui_interact',
+  'checkout_creating',
+  'redirect_gateway',
+  'return_received',
+  'verify_poll',
+  'settle_push',
+  'redirect_back',
+  'result_final',
+] as const;
+export type TxStage = (typeof TX_STAGES)[number] | (string & {});
 
 const FLUSH_INTERVAL_MS = 30_000;         // auto-upload cadence while logged in
 const MAX_BUFFER = 600;                   // in-memory cap (oldest dropped)
@@ -151,6 +179,49 @@ export function logWarn(tag: string, message: string, data?: unknown, trigger?: 
 export function logError(tag: string, message: string, data?: unknown, trigger?: LogTrigger): void {
   pushEntry('error', tag, message, data, trigger);
   scheduleUrgentFlush(trigger); // STRICT: an error never waits for the next tick
+}
+
+/**
+ * 0.6.81 — REAL-TIME TRANSACTION FUNNEL LOGGER.
+ *
+ * ONE entry point for every payment/checkout UI event (subscriptions page,
+ * SMS purchase dialog, hardware order payment, payment result view). Entries:
+ *   • carry tag 'tx' + channel 'transactions' so the server ingest mirrors
+ *     them into the unified cross-account transaction stream;
+ *   • carry the funnel stage + txType + ref/checkoutId/amount inside `data`
+ *     (the mirror lifts stage/txType/ref/checkoutId/status/amount/method to
+ *     top-level stream fields);
+ *   • FLUSH IMMEDIATELY — the same urgent-flush path errors use (≈1.2 s
+ *     debounce batches a UI burst into one request), so the Logs Manager
+ *     "Transactions" tab follows the user's money journey in real time
+ *     instead of the 30 s ambient cadence.
+ *
+ * Never throws, never blocks — identical safety contract to logEvent().
+ *
+ * @param stage    - one of TX_STAGES (or a new slug — kept verbatim)
+ * @param message  - human-readable line (i18n-free, support-facing English)
+ * @param data     - { txType, ref, checkoutId, status, amount, method, ...extras }
+ * @param level    - info (default) | warn | error | debug
+ */
+export function logTx(stage: TxStage, message: string, data?: Record<string, unknown>, level: LogEntry['level'] = 'info'): void {
+  if (buffer.length >= MAX_BUFFER) buffer = buffer.slice(-MAX_BUFFER + 1);
+  // The stage RIDES INSIDE `data` — the server ingest mirror lifts it (with
+  // txType/ref/checkoutId/status/amount/method) to top-level stream fields.
+  buffer.push({
+    ts: new Date().toISOString(),
+    level,
+    tag: 'tx',
+    message,
+    channel: 'transactions',
+    data: { stage, ...(data ?? {}) },
+    trigger: 'payment', // lands in the analyzer's per-cause index too
+  });
+  if (Date.now() - lastPersistAt > 5_000) {
+    lastPersistAt = Date.now();
+    persist();
+  }
+  // REAL-TIME: a transaction event never waits for the 30 s tick.
+  scheduleUrgentFlush('payment');
 }
 
 /**
@@ -554,7 +625,7 @@ function sessionIdSafe(): string {
 
 export async function flushLogsNow(opts?: {
   manual?: boolean;
-  reason?: 'error' | 'interval' | 'manual' | 'pagehide' | 'auth' | 'main-process' | 'external' | 'update' | 'crash';
+  reason?: 'error' | 'interval' | 'manual' | 'pagehide' | 'auth' | 'main-process' | 'external' | 'update' | 'crash' | 'tx';
   /** 0.6.55 — WHY: names the batch envelope for the trigger taxonomy. */
   trigger?: string;
 }): Promise<{ ok: boolean; accepted?: number; error?: string }> {
@@ -563,7 +634,7 @@ export async function flushLogsNow(opts?: {
   // Stale-server cooldown: skip AUTO flushes only — the manual button
   // (opts.manual) and ERROR-driven urgent flushes always go through so a
   // failing upload never hides the very trail the system exists to keep.
-  const isUrgent = opts?.reason === 'error' || opts?.reason === 'main-process' || opts?.reason === 'update' || opts?.reason === 'crash';
+  const isUrgent = opts?.reason === 'error' || opts?.reason === 'main-process' || opts?.reason === 'update' || opts?.reason === 'crash' || opts?.reason === 'tx';
   if (!opts?.manual && !isUrgent && now < staleServer404Until) {
     return { ok: false, error: 'stale-server-cooldown' };
   }

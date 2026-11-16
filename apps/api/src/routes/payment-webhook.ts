@@ -27,6 +27,7 @@
 import { Hono } from 'hono'
 import { verifyWebhookSignature, type ChargilyWebhookEvent } from '../lib/chargily-service'
 import { fulfillCheckoutPaid, fulfillCheckoutFailed } from '../lib/chargily-fulfill'
+import { appendTxEvent } from '../lib/tx-log'
 
 const app = new Hono()
 
@@ -42,6 +43,11 @@ app.post('/', async (c) => {
 
     if (!signature) {
       console.warn('[payment-webhook] Missing signature header')
+      appendTxEvent({
+        stage: 'webhook_rejected',
+        message: 'Chargily webhook rejected — missing signature header',
+        level: 'warn',
+      })
       return c.json({ success: false, error: 'Missing signature' }, 400)
     }
 
@@ -56,6 +62,11 @@ app.post('/', async (c) => {
 
     if (!isValid) {
       console.warn('[payment-webhook] Invalid webhook signature')
+      appendTxEvent({
+        stage: 'webhook_rejected',
+        message: 'Chargily webhook rejected — invalid HMAC signature',
+        level: 'warn',
+      })
       return c.json({ success: false, error: 'Invalid signature' }, 401)
     }
 
@@ -75,6 +86,18 @@ app.post('/', async (c) => {
     if (!data?.id) {
       return c.json({ success: true, message: 'No checkout id (ignored)' })
     }
+
+    // 0.6.81 — the gateway just spoke: land the push in the transaction
+    // stream the moment it arrives (settlement events follow from the
+    // shared fulfillment library).
+    appendTxEvent({
+      stage: 'webhook_received',
+      message: `Chargily webhook: ${type} for checkout ${data.id}`,
+      level: type === 'checkout.paid' ? 'info' : type === 'checkout.failed' ? 'warn' : 'info',
+      data: { eventType: type, gatewayStatus: data.status, paymentMethod: data.payment_method },
+      checkoutId: data.id,
+      identity: { role: 'SERVER' },
+    })
 
     // Process based on event type — shared idempotent fulfillment.
     if (type === 'checkout.paid') {

@@ -22,6 +22,7 @@ import { calculateETA, getEffectiveServiceTime } from '../lib/eta-calculator'
 import { z } from 'zod'
 import QRCode from 'qrcode'
 import { recordSyncChange, recordSyncChangeNow } from '../lib/sync-helpers'
+import { appendTxEvent } from '../lib/tx-log'
 // UNIFIED QUEUE — atomic next-ticket claiming (the ONE shared implementation
 // for every call-next surface: DB-level mutual exclusion, staff+counter
 // assignment in a single transaction, automatic concurrent-operation retry)
@@ -6296,6 +6297,20 @@ app.post('/subscription/pay', async (c) => {
         subscriptionTier: validation.data.plan,
         subscriptionPlanId: planRecord.id,
       },
+    })
+
+    // 0.6.81 — manual (receipt-upload) subscription request in the tx stream.
+    appendTxEvent({
+      stage: 'manual_submit',
+      message: `Manual subscription request — ${amount} DA for plan ${validation.data.plan} (receipt under review)`,
+      level: 'info',
+      data: { plan: validation.data.plan, period, discountPercent, creditApplied, listTotal, chargeAmount: amount, receiptUploaded: !!receiptUrlNormalized, agencyName: agency.name },
+      identity: { userId: user.id, username: user.username, role: user.role, agencyId: agency.id },
+      ref: transaction.id,
+      txType: 'subscription',
+      status: 'PENDING',
+      amount,
+      method: validation.data.method,
     })
 
     return c.json({

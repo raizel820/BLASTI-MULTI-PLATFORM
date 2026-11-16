@@ -40,6 +40,7 @@ import {
   startChargilyCheckout,
   type PublicPaymentSettings,
 } from '@/lib/chargily-checkout';
+import { logTx } from '@/lib/remote-logger';
 
 export type SmsPackId = '20' | '50' | '100' | '200';
 
@@ -93,6 +94,12 @@ export function SmsPurchaseDialog({
   // Fetch Chargily availability when the dialog opens (cached 5 min).
   useEffect(() => {
     if (!open) return;
+    // 0.6.81 — the user touched the SMS purchase UI: funnel starts HERE.
+    logTx('purchase_ui_open', `SMS purchase dialog opened for pack ${packId ?? '?'} (${packId ? SMS_PACK_PRICES[packId] : 0} DA)`, {
+      txType: 'sms',
+      packId: packId ?? undefined,
+      ...(packId ? { amount: SMS_PACK_PRICES[packId] } : {}),
+    });
     let cancelled = false;
     getCachedPaymentSettings().then((settings) => {
       if (!cancelled) setChargilyEnabled(!!settings?.chargilyEnabled);
@@ -100,7 +107,7 @@ export function SmsPurchaseDialog({
     return () => {
       cancelled = true;
     };
-  }, [open]);
+  }, [open, packId]);
 
   // Reset the transient state whenever the dialog closes.
   useEffect(() => {
@@ -114,6 +121,13 @@ export function SmsPurchaseDialog({
     async (method: 'edahabia' | 'cib') => {
       if (!packId || startingMethod) return;
       setStartingMethod(method);
+      // 0.6.81 — gateway method chosen inside the purchase UI.
+      logTx('purchase_ui_interact', `SMS pack ${packId} — instant payment via ${method.toUpperCase()} selected`, {
+        txType: 'sms',
+        packId,
+        amount: SMS_PACK_PRICES[packId],
+        method: method.toUpperCase(),
+      });
       try {
         toast.info(t('redirectingToPayment'));
         await startChargilyCheckout(
@@ -135,6 +149,14 @@ export function SmsPurchaseDialog({
 
   const handleManual = () => {
     if (!packId) return;
+    // 0.6.81 — manual (receipt-verification) path chosen. The server logs
+    // manual_submit when the request lands; this marks the UI decision.
+    logTx('purchase_ui_interact', `SMS pack ${packId} — manual payment path selected`, {
+      txType: 'sms',
+      packId,
+      amount: SMS_PACK_PRICES[packId],
+      method: 'MANUAL',
+    });
     onOpenChange(false);
     onManualPurchase(packId);
   };

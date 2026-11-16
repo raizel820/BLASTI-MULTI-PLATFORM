@@ -28,6 +28,7 @@ import {
   type PendingCheckout,
 } from '@/lib/chargily-checkout';
 import { viewToUrl, getAllowedRolesForView } from '@/lib/route-map';
+import { logTx } from '@/lib/remote-logger';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -193,6 +194,8 @@ export function PaymentResult() {
       if (cap?.isNativePlatform?.()) return; // already in the app
     } catch { /* ignore */ }
     const timer = setTimeout(() => {
+      // 0.6.81 — the final redirection leg: gateway browser → app.
+      logTx('redirect_back', 'blasti:// deep-link bounce into the app fired', { redirectTarget: 'blasti://payment/result' });
       try { window.location.href = deep; } catch { /* invalid scheme — stay put */ }
     }, 1200);
     return () => clearTimeout(timer);
@@ -206,6 +209,11 @@ export function PaymentResult() {
     if (!useAppStore.getState().user) {
       setStatusParam(readReturnQuery().status);
       setPhase('unauthenticated');
+      // 0.6.81 — the funnel ends here for logged-out returns.
+      logTx('result_final', 'Payment result final: unauthenticated (generic result, no verification)', {
+        gatewayStatusParam: readReturnQuery().status,
+        status: 'unauthenticated',
+      }, 'warn');
       return;
     }
 
@@ -215,6 +223,16 @@ export function PaymentResult() {
 
       const pendingCheckout = getPendingCheckout();
       setPending(pendingCheckout);
+
+      // 0.6.81 — the payer is BACK from the hosted gateway page. This closes
+      // the redirect_gateway → return_received leg of the funnel.
+      logTx('return_received', `Payer returned to the payment result view (status=${status ?? 'unknown'})`, {
+        txType: pendingCheckout?.type,
+        checkoutId: checkout || pendingCheckout?.checkoutId || undefined,
+        ref,
+        gatewayStatusParam: status,
+        ...(pendingCheckout?.amount ? { amount: pendingCheckout.amount } : {}),
+      });
 
       // 0.6.76 — `ref` (the ledger row id carried by the return URL) wins over
       // the localStorage pending checkout: GET /payment/checkout/:id accepts a
@@ -242,6 +260,11 @@ export function PaymentResult() {
         setPhase('confirming');
       } else {
         setPhase('no-checkout');
+        // 0.6.81 — the funnel ended without anything to verify.
+        logTx('result_final', 'Payment result final: no checkout could be recovered', {
+          gatewayStatusParam: status,
+          status: 'no-checkout',
+        }, 'warn');
       }
     };
 
@@ -277,6 +300,13 @@ export function PaymentResult() {
       // `force` — the realtime push checking AFTER the budgeted loop stopped.
       if (disposed || (!pollingActiveRef.current && !force)) return;
       attemptsRef.current += 1;
+      if (attemptsRef.current === 1) {
+        // 0.6.81 — first verification tick of this poll session.
+        logTx('verify_poll', `Settlement verification poll started for ${checkoutId}`, {
+          checkoutId,
+          ...(dataRef.current?.type ? { txType: dataRef.current.type } : {}),
+        });
+      }
       try {
         const res = await apiFetch(`/api/payment/checkout/${encodeURIComponent(checkoutId)}`);
         if (disposed) return;
@@ -285,6 +315,10 @@ export function PaymentResult() {
         if (!res.ok && res.status === 404) {
           stopPolling();
           setPhase('no-checkout');
+          logTx('result_final', 'Payment result final: checkout not found on the server', {
+            checkoutId,
+            status: 'no-checkout',
+          }, 'warn');
           return;
         }
         const d = extractPaymentData<CheckoutStatusData>(body);
@@ -293,6 +327,10 @@ export function PaymentResult() {
           if (attemptsRef.current >= TOTAL_BUDGET) {
             stopPolling();
             setPhase('still-pending');
+            logTx('result_final', 'Payment result final: still pending (budget exhausted on API errors)', {
+              checkoutId,
+              status: 'still-pending',
+            }, 'warn');
           }
           return;
         }
@@ -304,16 +342,37 @@ export function PaymentResult() {
           clearPendingCheckout();
           stopPolling();
           setPhase(d.normalizedStatus);
+          // 0.6.81 — CONFIRMATION COMPLETE: the funnel's final client state
+          // (the server logs settle_paid/settle_failed authoritatively).
+          logTx('result_final', `Payment result final: ${d.normalizedStatus.toUpperCase()}`, {
+            checkoutId: d.checkoutId || checkoutId,
+            ref: d.transactionId || d.smsPurchaseId,
+            txType: d.type,
+            status: d.normalizedStatus === 'paid' ? 'paid' : 'failed',
+            ...(d.amount != null ? { amount: d.amount } : {}),
+            source: d.source,
+          }, d.normalizedStatus === 'paid' ? 'info' : 'warn');
           return;
         }
         if (attemptsRef.current >= TOTAL_BUDGET) {
           stopPolling();
           setPhase('still-pending');
+          logTx('result_final', 'Payment result final: still pending (poll budget exhausted)', {
+            checkoutId: d.checkoutId || checkoutId,
+            ref: d.transactionId || d.smsPurchaseId,
+            txType: d.type,
+            status: 'still-pending',
+            ...(d.amount != null ? { amount: d.amount } : {}),
+          }, 'warn');
         }
       } catch {
         if (attemptsRef.current >= TOTAL_BUDGET) {
           stopPolling();
           setPhase('still-pending');
+          logTx('result_final', 'Payment result final: still pending (network unreachable)', {
+            checkoutId,
+            status: 'still-pending',
+          }, 'warn');
         }
       }
     };
@@ -385,6 +444,12 @@ export function PaymentResult() {
       if (evData.transactionId && d?.transactionId && evData.transactionId !== d.transactionId) foreign = true;
       if (evData.smsPurchaseId && d?.smsPurchaseId && evData.smsPurchaseId !== d.smsPurchaseId) foreign = true;
       if (foreign) return;
+      // 0.6.81 — realtime settlement push received while waiting.
+      logTx('settle_push', `Realtime settlement push received${detail?.ok === true ? ' (paid)' : detail?.ok === false ? ' (failed)' : ''}`, {
+        checkoutId,
+        ...(d?.type ? { txType: d.type } : {}),
+        pushOk: detail?.ok,
+      });
       void pollNowRef.current?.();
     };
     window.addEventListener('blasti:payment-settled', onSettled);

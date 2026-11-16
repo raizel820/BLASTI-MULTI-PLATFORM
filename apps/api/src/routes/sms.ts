@@ -6,6 +6,7 @@ import { validateBody } from '../lib/validations'
 import { z } from 'zod'
 import { recordSyncChange, resolveAgencyIdForUser } from '../lib/sync-helpers'
 import { ensureInvoiceForSmsPurchase } from '../lib/billing-invoices'
+import { appendTxEvent } from '../lib/tx-log'
 
 const app = new Hono()
 
@@ -71,6 +72,20 @@ app.post('/purchase', async (c) => {
         title: 'SMS Purchase Pending',
         message: `Your purchase of ${pack.quantity} SMS credits (${pack.price} DA) is pending payment verification. Credits will be added once approved.`,
       },
+    })
+
+    // 0.6.81 — manual (receipt-verification) purchase intent in the tx stream.
+    appendTxEvent({
+      stage: 'manual_submit',
+      message: `Manual SMS pack request — ${pack.price} DA for ${pack.quantity} credits (awaiting admin review)`,
+      level: 'info',
+      data: { packId, quantity: pack.quantity },
+      identity: { userId: user.id, username: user.username, role: user.role },
+      ref: purchase.id,
+      txType: 'sms',
+      status: 'PENDING',
+      amount: pack.price,
+      method: 'MANUAL',
     })
 
     return c.json({
@@ -199,6 +214,20 @@ app.post('/approve/:id', async (c) => {
       },
     })
 
+    // 0.6.81 — admin review outcome in the tx stream.
+    appendTxEvent({
+      stage: 'manual_approved',
+      message: `Manual SMS purchase APPROVED by admin — ${purchase.quantity} credits granted`,
+      level: 'info',
+      data: { approvedFor: purchase.userId, quantity: purchase.quantity, adminId: admin.id, adminUsername: admin.username },
+      identity: { userId: purchase.userId, role: 'SERVER' },
+      ref: purchaseId,
+      txType: 'sms',
+      status: 'APPROVED',
+      amount: purchase.price,
+      method: 'MANUAL',
+    })
+
     // Billing: issue the legal receipt for the approved SMS pack (best-effort).
     try {
       await ensureInvoiceForSmsPurchase(purchaseId)
@@ -258,6 +287,20 @@ app.post('/reject/:id', async (c) => {
         entityId: purchaseId,
         details: JSON.stringify({ rejectedFor: purchase.userId, quantity: purchase.quantity }),
       },
+    })
+
+    // 0.6.81 — admin review outcome in the tx stream.
+    appendTxEvent({
+      stage: 'manual_rejected',
+      message: `Manual SMS purchase REJECTED by admin — no credits granted`,
+      level: 'warn',
+      data: { rejectedFor: purchase.userId, quantity: purchase.quantity, adminId: admin.id, adminUsername: admin.username },
+      identity: { userId: purchase.userId, role: 'SERVER' },
+      ref: purchaseId,
+      txType: 'sms',
+      status: 'REJECTED',
+      amount: purchase.price,
+      method: 'MANUAL',
     })
 
     return c.json({ success: true, purchase: result })

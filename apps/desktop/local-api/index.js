@@ -3925,12 +3925,26 @@ function createApp() {
       const lines = [JSON.stringify(envelope), ...entries.slice(0, 200).map((e) => {
         try {
           const t = typeof e === 'object' && e ? e : {}
-          return JSON.stringify({
+          // 0.6.81 — preserve channel/data/trigger in the OFFLINE copy too:
+          // transaction-funnel entries (channel 'transactions') and analyzer
+          // metadata used to be stripped here, making the local trail lossy
+          // while the cloud forward carried the full shape.
+          const out = {
             ts: String(t.ts || new Date().toISOString()).slice(0, 40),
             level: String(t.level || 'info').slice(0, 10),
             tag: String(t.tag || 'app').slice(0, 60),
             message: String(t.message ?? '').slice(0, 8000),
-          })
+          }
+          if (t.channel) out.channel = String(t.channel).slice(0, 20)
+          if (t.trigger) out.trigger = String(t.trigger).slice(0, 40)
+          if (t.data !== undefined) {
+            try {
+              const json = JSON.stringify(t.data)
+              if (json && json.length <= 8000) out.data = t.data
+              else out.data = { truncated: json.slice(0, 8000) + '…' }
+            } catch { /* skip unserializable data */ }
+          }
+          return JSON.stringify(out)
         } catch { return null }
       }).filter(Boolean)]
       try {

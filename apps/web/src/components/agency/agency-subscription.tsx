@@ -1,6 +1,7 @@
 'use client'
 import { apiFetch } from '@/lib/api-fetch';;
 import { startChargilyCheckout, fetchPaymentSettings, type PublicPaymentSettings } from '@/lib/chargily-checkout';
+import { logTx } from '@/lib/remote-logger';
 import type { TranslationKeys } from '@/i18n';
 
 import { useState, useEffect, useRef, useCallback, useMemo, type ReactNode } from 'react';
@@ -699,6 +700,13 @@ function PaymentDialog({
       // Reset the billing period to the default (1 = monthly) — the user
       // re-picks an extended period each time they open the dialog.
       setPeriod(1);
+      // 0.6.81 — purchase funnel: the plan payment dialog OPENED.
+      logTx('purchase_ui_open', `Subscription payment dialog opened (plan ${selectedPlan?.name ?? '?'}, ${selectedPlan?.price ?? 0} DA)`, {
+        txType: 'subscription',
+        plan: selectedPlan?.name,
+        amount: selectedPlan?.price,
+        ...(user?.agencyId ? { agencyId: user.agencyId } : {}),
+      });
     }
     prevDialogOpen.current = open;
   }, [open, hardware]);
@@ -851,6 +859,16 @@ function PaymentDialog({
     // blocks the subscription checkout.
     if (isChargilyMethod) {
       setSubmitting(true);
+      // 0.6.81 — gateway method + plan + period chosen in the UI.
+      logTx('purchase_ui_interact', `Subscription ${selectedPlan.name} — instant payment via ${paymentMethod} selected (${period}m period)`, {
+        txType: 'subscription',
+        plan: selectedPlan.name,
+        amount: selectedPlan.price,
+        period,
+        method: paymentMethod,
+        ...(user?.agencyId ? { agencyId: user.agencyId } : {}),
+        ...(quote ? { chargeAmount: quote.chargeAmount, creditApplied: quote.credit?.creditApplied } : {}),
+      });
       try {
         const orderIds: string[] = [];
         if (hasHardware) {
@@ -916,6 +934,16 @@ function PaymentDialog({
       return;
     }
     setSubmitting(true);
+    // 0.6.81 — manual receipt path chosen. The server logs manual_submit
+    // when POST /agency/subscription/pay lands; this marks the UI decision.
+    logTx('purchase_ui_interact', `Subscription ${selectedPlan.name} — manual receipt path selected (${paymentMethod}, ${period}m period)`, {
+      txType: 'subscription',
+      plan: selectedPlan.name,
+      amount: selectedPlan.price,
+      period,
+      method: 'MANUAL',
+      ...(user?.agencyId ? { agencyId: user.agencyId } : {}),
+    });
     try {
       const uploadResult = await receiptUpload.upload(receiptFile, {
         agencyId: user?.agencyId || '',
@@ -2776,6 +2804,14 @@ export function AgencySubscription() {
   const [faqs, setFaqs] = useState<FaqItem[]>([]);
 
   useEffect(() => {
+    // 0.6.81 — REAL-TIME funnel entry point: the user entered the
+    // subscriptions page. Everything from here until settlement + final
+    // redirection lands in the unified transaction stream.
+    logTx('page_enter', 'Subscriptions page opened', {
+      txType: 'subscription',
+      ...(user?.agencyId ? { agencyId: user.agencyId } : {}),
+      ...(user ? { role: user.role } : {}),
+    });
     fetchSubscription();
     fetchPaymentHistory();
     fetchFaqs();
@@ -2901,6 +2937,14 @@ export function AgencySubscription() {
   const handlePayOrder = async () => {
     if (!payOrderTarget) return;
     setPayOrderSubmitting(true);
+    // 0.6.81 — hardware "Pay now" chosen from the subscription page.
+    logTx('purchase_ui_interact', `Hardware order ${payOrderTarget.id} — pay now via ${payOrderMethod} (${payOrderTarget.upfrontTotal} DA)`, {
+      txType: 'hardware',
+      ref: payOrderTarget.id,
+      amount: payOrderTarget.upfrontTotal,
+      method: payOrderMethod,
+      ...(user?.agencyId ? { agencyId: user.agencyId } : {}),
+    });
     try {
       await startChargilyCheckout(
         {

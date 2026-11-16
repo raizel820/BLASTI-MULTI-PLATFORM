@@ -68,6 +68,12 @@ import {
   deepScanHistory,
   type AnalysisFilters,
 } from '../lib/logs-analyzer'
+import {
+  appendTxEvent,
+  readTxEntries,
+  summarizeTxEntries,
+  type TxFilters,
+} from '../lib/tx-log'
 
 const app = new Hono()
 
@@ -141,6 +147,8 @@ interface IncomingEntry {
   data?: unknown
   /** 0.6.55 — per-entry error-trigger reason (update / profile-image / …). */
   trigger?: unknown
+  /** 0.6.81 — 'transactions' entries are mirrored into the dedicated tx stream. */
+  channel?: unknown
 }
 
 /** Shallow whitelist-flatten for deviceSpecs / perf objects (values capped). */
@@ -177,6 +185,10 @@ function sanitizeEntry(raw: IncomingEntry): Record<string, unknown> | null {
     // 0.6.55 — normalized error-trigger slug rides the stored entry so the
     // analyzer and the Logs Manager can attribute the bug to its cause.
     normalizeTrigger(raw.trigger) ? { trigger: normalizeTrigger(raw.trigger) } : {}
+  ), ...(
+    // 0.6.81 — the transaction channel survives sanitization so the ingest
+    // mirror can route these entries into the dedicated tx stream.
+    raw.channel === 'transactions' ? { channel: 'transactions' as const } : {}
   ) }
 }
 
@@ -424,6 +436,48 @@ app.post('/', async (c) => {
   } catch (err) {
     console.error('[logs] append failed:', err)
     return c.json({ success: false, error: 'Log write failed' }, 500)
+  }
+
+  // ── 0.6.81 — TRANSACTION CHANNEL MIRROR (one pipeline, one store) ──
+  // Entries tagged channel:'transactions' (the client tx funnel logger) are
+  // mirrored into the dedicated cross-account stream
+  // logs/_transactions/<date>.ndjson with the uploader identity resolved
+  // HERE — the Logs Manager "Transactions" tab reads exactly that stream.
+  // The account-vault write above is untouched: the full per-account trail
+  // still carries the tx entries too (two VIEWS, one ingest path).
+  const txMirrored = sanitized.filter((e) => (e as { channel?: string }).channel === 'transactions')
+  if (txMirrored.length > 0) {
+    for (const e of txMirrored) {
+      const d = (e.data && typeof e.data === 'object' ? e.data : {}) as Record<string, unknown>
+      try {
+        appendTxEvent({
+          stage: typeof d.stage === 'string' ? d.stage : 'unknown',
+          message: String(e.message ?? ''),
+          level: typeof e.level === 'string' && ['debug', 'info', 'warn', 'error'].includes(e.level)
+            ? (e.level as 'debug' | 'info' | 'warn' | 'error')
+            : 'info',
+          data: d.stage !== undefined || d.txType !== undefined || d.ref !== undefined || d.checkoutId !== undefined || d.status !== undefined || d.amount !== undefined || d.method !== undefined
+            ? Object.fromEntries(Object.entries(d).filter(([k]) => !['stage', 'txType', 'ref', 'checkoutId', 'status', 'amount', 'method'].includes(k)))
+            : d,
+          identity: {
+            uid: (uploader.meta.uid as string | null) ?? null,
+            userId: (uploader.meta.userId as string | null) ?? null,
+            username: (uploader.meta.username as string | null) ?? null,
+            role: (uploader.meta.role as string | null) ?? null,
+            agencyId: (d.agencyId as string | undefined) ?? null,
+          },
+          origin: 'client',
+          platform,
+          appVersion: body.appVersion,
+          ref: typeof d.ref === 'string' ? d.ref : undefined,
+          checkoutId: typeof d.checkoutId === 'string' ? d.checkoutId : undefined,
+          txType: typeof d.txType === 'string' ? d.txType : undefined,
+          status: typeof d.status === 'string' ? d.status : undefined,
+          amount: typeof d.amount === 'number' ? d.amount : undefined,
+          method: typeof d.method === 'string' ? d.method : undefined,
+        })
+      } catch { /* the mirror never fails the ingestion */ }
+    }
   }
 
   // ── Realtime analysis (logs-2) — never fails the ingestion. ──
@@ -765,12 +819,12 @@ app.get('/analysis/export', async (c) => {
   const q = (name: string) => (c.req.query(name) || '').trim()
 
   // ── Resolve types ──
-  const ALL_TYPES = ['errors', 'daily', 'raw', 'agent', 'server'] as const
+  const ALL_TYPES = ['errors', 'daily', 'raw', 'agent', 'server', 'transactions'] as const
   const typesRaw = q('types') || ALL_TYPES.join(',')
   const types = new Set<string>(
     typesRaw.split(',').map((s) => s.trim()).filter((s) => (ALL_TYPES as readonly string[]).includes(s)),
   )
-  if (types.size === 0) return c.json({ success: false, error: 'types must include at least one of: errors, daily, raw, agent, server' }, 400)
+  if (types.size === 0) return c.json({ success: false, error: 'types must include at least one of: errors, daily, raw, agent, server, transactions' }, 400)
 
   // ── Resolve analyze + format ──
   const analyzeRaw = q('analyze') || 'raw'
@@ -945,6 +999,35 @@ app.get('/analysis/export', async (c) => {
     }
   }
 
+  // ── transactions (0.6.81 — the unified payment/checkout funnel stream) ──
+  if (types.has('transactions')) {
+    const txRead = readTxEntries({
+      stage: q('stage') || undefined,
+      txType: q('txType') || undefined,
+      status: q('status') || undefined,
+      origin: q('origin') || undefined,
+      ref: q('ref') || undefined,
+      checkoutId: q('checkoutId') || undefined,
+      uid: filters.uid,
+      agencyId: q('agencyId') || undefined,
+      q: filters.q,
+      from: from || undefined,
+      to: to || undefined,
+      limit,
+    })
+    if (analyze === 'summary') {
+      bundle.transactions = summarizeTxEntries(txRead.entries)
+    } else {
+      bundle.transactions = {
+        count: txRead.entries.length,
+        truncated: txRead.truncated,
+        scanned: txRead.scanned,
+        summary: summarizeTxEntries(txRead.entries),
+        entries: txRead.entries,
+      }
+    }
+  }
+
   // ── Render ──
   const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
   const base = `blasti-logs_${[...types].join('+')}_${rangeLabel}_${stamp}`
@@ -981,6 +1064,7 @@ app.get('/analysis/export', async (c) => {
       raw: ['ts', 'level', 'tag', 'message', 'uid', 'username', 'role', 'platform', 'appVersion', 'device', 'file'],
       agent: ['createdAt', 'action', 'status', 'summary', 'refType', 'refId', 'actor', 'provider', 'durationMs'],
       server: ['ts', 'source', 'level', 'message'],
+      transactions: ['ts', 'stage', 'txType', 'status', 'amount', 'method', 'origin', 'ref', 'checkoutId', 'uid', 'username', 'role', 'agencyId', 'platform', 'appVersion', 'message'],
     }
     const rowsOf = (b: Record<string, unknown>): Array<Record<string, unknown>> => {
       if (type === 'errors') {
@@ -1010,6 +1094,7 @@ app.get('/analysis/export', async (c) => {
       }
       if (type === 'raw') return ((b.raw as { entries?: RawExportEntry[] })?.entries ?? []) as unknown as Array<Record<string, unknown>>
       if (type === 'agent') return (((b.agent as { rows?: unknown[] })?.rows ?? []) as Array<Record<string, unknown>>)
+      if (type === 'transactions') return ((b.transactions as { entries?: Array<Record<string, unknown>> })?.entries ?? []) as unknown as Array<Record<string, unknown>>
       // server — flatten the per-source entries
       const snap = b.server as { sources?: Array<{ id: string; entries: Array<Record<string, unknown>> }> } | undefined
       return (snap?.sources ?? []).flatMap((s) => (s.entries ?? []).map((e) => ({ ...e, source: e.source ?? s.id })))
@@ -1110,6 +1195,15 @@ app.get('/analysis/export', async (c) => {
       md.push('')
     }
   }
+  if (types.has('transactions')) {
+    const sec = bundle.transactions as { count?: number; truncated?: boolean; entries?: Array<{ ts: string; stage: string; txType?: string; status?: string; amount?: number; origin: string; ref?: string; checkoutId?: string; uid?: string | null; message: string }> ; summary?: { byType?: Record<string, number> } }
+    md.push(`## Transaction events — ${sec.count ?? 0} row(s)${sec.truncated ? ' (TRUNCATED)' : ''}`, '')
+    md.push(`- By type: ${Object.entries(sec.summary?.byType ?? {}).map(([k, v]) => `${k}=${v}`).join(', ') || 'n/a'}`, '')
+    for (const e of (sec.entries ?? []).slice(0, 500)) {
+      md.push(`- \`${e.ts}\` **${e.stage}** ${e.txType ?? ''}${e.amount !== undefined ? ` ${e.amount} DA` : ''}${e.origin === 'server' ? ' [server]' : ''}${e.ref ? ` ref=${e.ref}` : ''}${e.uid ? ` uid=${e.uid}` : ''} — ${e.message.replace(/\n/g, ' ').slice(0, 300)}`)
+    }
+    md.push('')
+  }
 
   return new Response(md.filter((l) => l !== undefined).join('\n'), {
     status: 200,
@@ -1118,6 +1212,49 @@ app.get('/analysis/export', async (c) => {
       'Content-Disposition': `attachment; filename="${base}.md"`,
       'Cache-Control': 'no-store',
     },
+  })
+})
+
+// ─── Transaction event stream (0.6.81) — the Logs Manager "Transactions" tab ─
+//
+// GET /api/logs/transactions?stage=&txType=&status=&origin=&uid=&agencyId=
+//                          &ref=&checkoutId=&q=&from=&to=&limit=
+//
+// Reads the unified cross-account stream (logs/_transactions/<date>.ndjson)
+// that BOTH the client funnel logger (mirrored by the ingest route) and the
+// server-side payment mutations (tx-log.ts) write to. Returns the newest
+// entries + KPI aggregation + per-transaction funnels.
+
+app.get('/transactions', async (c) => {
+  try { await requireRole(c, 'SUPER_ADMIN') } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error }, err.status as any)
+  }
+  const q = (name: string) => (c.req.query(name) || '').trim()
+  const limitRaw = Number(q('limit')) || 0
+  const filters: TxFilters = {
+    stage: q('stage') || undefined,
+    txType: q('txType') || undefined,
+    status: q('status') || undefined,
+    origin: q('origin') || undefined,
+    uid: q('uid') || undefined,
+    agencyId: q('agencyId') || undefined,
+    ref: q('ref') || undefined,
+    checkoutId: q('checkoutId') || undefined,
+    q: q('q') || undefined,
+    from: q('from') || undefined,
+    to: q('to') || undefined,
+    limit: Math.max(1, Math.min(limitRaw || 600, 5_000)),
+  }
+  const read = readTxEntries(filters)
+  const summary = summarizeTxEntries(read.entries)
+  return c.json({
+    success: true,
+    entries: read.entries,
+    scanned: read.scanned,
+    files: read.files,
+    truncated: read.truncated,
+    summary,
   })
 })
 

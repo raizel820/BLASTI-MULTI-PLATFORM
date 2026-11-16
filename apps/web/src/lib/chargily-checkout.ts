@@ -15,6 +15,7 @@
 
 import { apiFetch } from '@/lib/api-fetch';
 import { getCloudApiBaseUrl } from '@/lib/api-client';
+import { logTx } from '@/lib/remote-logger';
 
 export const PENDING_CHECKOUT_KEY = 'blasti-pending-checkout';
 
@@ -193,6 +194,18 @@ export async function startChargilyCheckout(
   // Return-target hints — computed here (NOT by the callers) so every
   // payment surface gets the fix; explicit payload fields still win.
   const hints = computeReturnHints();
+  const txType = typeof payload.type === 'string' ? payload.type : 'unknown';
+  // 0.6.81 — REAL-TIME funnel: the request left the UI (server logs the
+  // ledger-truth checkout_created / checkout_failed separately).
+  logTx('checkout_creating', `${txType} checkout request sent (${String(payload.paymentMethod ?? 'edahabia').toUpperCase()})`, {
+    txType,
+    ...(typeof payload.packId === 'string' ? { packId: payload.packId } : {}),
+    ...(typeof payload.plan === 'string' ? { plan: payload.plan } : {}),
+    ...(typeof payload.period === 'number' ? { period: payload.period } : {}),
+    ...(typeof payload.agencyId === 'string' ? { agencyId: payload.agencyId } : {}),
+    ...(typeof payload.orderId === 'string' ? { ref: payload.orderId } : {}),
+    returnView: opts?.returnView,
+  });
   const res = await apiFetch('/api/payment/create-checkout', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -215,6 +228,17 @@ export async function startChargilyCheckout(
     // Surface the gateway's raw answer (details) so the REAL rejection
     // reason is visible in the toast, not just the generic headline.
     const details = errBody?.details ? ` — ${errBody.details.slice(0, 240)}` : '';
+    // 0.6.81 — client-side refusal (validation / network / gateway 4xx that
+    // never produced a ledger row). Server-side refusals log the same stage
+    // with origin 'server'.
+    logTx('checkout_failed', `${txType} checkout failed client-side: ${base.slice(0, 200)}`, {
+      txType,
+      status: 'FAILED',
+      ...(typeof payload.packId === 'string' ? { packId: payload.packId } : {}),
+      ...(typeof payload.plan === 'string' ? { plan: payload.plan } : {}),
+      ...(typeof payload.agencyId === 'string' ? { agencyId: payload.agencyId } : {}),
+      httpStatus: res.status,
+    }, 'warn');
     throw new Error(`${base}${details}`);
   }
 
@@ -224,6 +248,18 @@ export async function startChargilyCheckout(
     type: checkout.type,
     amount: checkout.amount,
     createdAt: Date.now(),
+    returnView: opts?.returnView,
+  });
+
+  // 0.6.81 — the payer is being handed to the hosted gateway page.
+  logTx('redirect_gateway', `${txType} payer sent to the hosted gateway page (checkout ${checkout.checkoutId})`, {
+    txType,
+    checkoutId: checkout.checkoutId,
+    ref: checkout.transactionId || checkout.smsPurchaseId || checkout.orderId,
+    amount: checkout.amount,
+    currency: checkout.currency,
+    method: typeof payload.paymentMethod === 'string' ? String(payload.paymentMethod).toUpperCase() : undefined,
+    deepLinkIssued: !!hints.deepLink,
     returnView: opts?.returnView,
   });
 

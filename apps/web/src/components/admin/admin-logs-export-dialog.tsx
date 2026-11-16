@@ -27,6 +27,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
+  ArrowLeftRight,
   Bot,
   CalendarDays,
   Check,
@@ -59,7 +60,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { cn } from '@/lib/utils';
 import type { TranslationKeys } from '@/i18n';
 
-export type LogsExportScope = 'errors' | 'daily' | 'raw' | 'agent' | 'server' | 'advanced';
+export type LogsExportScope = 'errors' | 'daily' | 'raw' | 'agent' | 'server' | 'transactions' | 'advanced';
 export type LogsExportFormat = 'json' | 'md' | 'csv' | 'ndjson';
 
 export interface LogsExportServerSource {
@@ -92,6 +93,8 @@ interface LogsExportDialogProps {
     to: string;
     action: string;
     status: string;
+    stage: string;
+    txType: string;
     serverSources: string[];
     serverLines: string;
     level: string;
@@ -120,12 +123,14 @@ interface ExportState {
   limit: string;
   agentAction: string;
   agentStatus: string;
+  stage: string;
+  txType: string;
   serverSources: string[];
   serverLines: string;
   deep: boolean;
 }
 
-const ALL_TYPES = ['errors', 'daily', 'raw', 'agent', 'server'] as const;
+const ALL_TYPES = ['errors', 'daily', 'raw', 'agent', 'server', 'transactions'] as const;
 
 const PLATFORMS = ['web', 'mobile', 'desktop', 'kiosk', 'tv', 'legacy'] as const;
 /** STAFF + AGENCY_STAFF both listed — old logs carry the legacy label. */
@@ -138,6 +143,17 @@ const AGENT_ACTIONS = [
   'KEY_DELETE', 'DICTIONARY_EDIT', 'DICTIONARY_DELETE', 'LOGS_EXPORT',
 ] as const;
 const AGENT_STATUSES = ['success', 'error', 'info'] as const;
+/** 0.6.81 — transaction funnel stage/type choices (mirror tx-log.ts). */
+const TX_STAGE_CHOICES = [
+  'page_enter', 'purchase_ui_open', 'purchase_ui_interact',
+  'checkout_creating', 'checkout_created', 'checkout_failed',
+  'redirect_gateway', 'return_received', 'verify_poll',
+  'webhook_received', 'webhook_rejected', 'settle_push',
+  'settle_paid', 'settle_failed', 'settle_duplicate',
+  'manual_submit', 'manual_approved', 'manual_rejected',
+  'redirect_back', 'result_final',
+] as const;
+const TX_TYPE_CHOICES = ['subscription', 'sms', 'hardware'] as const;
 
 const SCOPE_BASE: Record<LogsExportScope, Partial<ExportState>> = {
   errors: { types: ['errors'], analyze: 'report', format: 'md' },
@@ -145,6 +161,7 @@ const SCOPE_BASE: Record<LogsExportScope, Partial<ExportState>> = {
   raw: { types: ['raw'], analyze: 'raw', format: 'json' },
   agent: { types: ['agent'], analyze: 'raw', format: 'csv' },
   server: { types: ['server'], analyze: 'raw', format: 'md' },
+  transactions: { types: ['transactions'], analyze: 'raw', format: 'json' },
   advanced: { types: [...ALL_TYPES], analyze: 'raw', format: 'json' },
 };
 
@@ -168,6 +185,8 @@ const BASE_STATE: ExportState = {
   limit: '',
   agentAction: '',
   agentStatus: '',
+  stage: '',
+  txType: '',
   serverSources: [],
   serverLines: '300',
   deep: false,
@@ -179,6 +198,7 @@ const SCOPE_TITLE_KEY: Record<LogsExportScope, TranslationKeys> = {
   raw: 'logsExportScopeRaw',
   agent: 'logsExportScopeAgent',
   server: 'logsExportScopeServer',
+  transactions: 'logsExportScopeTransactions',
   advanced: 'logsExportAdvancedTitle',
 };
 
@@ -188,6 +208,7 @@ const TYPE_ICON: Record<string, typeof Siren> = {
   raw: ScrollText,
   agent: Bot,
   server: Server,
+  transactions: ArrowLeftRight,
 };
 
 const TYPE_LABEL_KEY: Record<string, TranslationKeys> = {
@@ -196,6 +217,7 @@ const TYPE_LABEL_KEY: Record<string, TranslationKeys> = {
   raw: 'logsExportTypeRaw',
   agent: 'logsExportTypeAgent',
   server: 'logsExportTypeServer',
+  transactions: 'logsExportTypeTransactions',
 };
 
 export function AdminLogsExportDialog({
@@ -266,6 +288,7 @@ export function AdminLogsExportDialog({
     raw: state.types.includes('raw'),
     agent: state.types.includes('agent'),
     server: serverTypeSelected,
+    transactions: state.types.includes('transactions'),
   };
   const anyVaultType = show.errors || show.daily || show.raw;
 
@@ -302,6 +325,7 @@ export function AdminLogsExportDialog({
       if (state.q) p.set('q', state.q);
       if (state.limit) p.set('limit', state.limit);
     }
+    if (show.transactions && state.uid) p.set('uid', state.uid);
     if (show.raw) {
       if (state.device) p.set('device', state.device);
       if (state.appVersion) p.set('appVersion', state.appVersion);
@@ -315,6 +339,12 @@ export function AdminLogsExportDialog({
     if (show.agent) {
       if (state.agentAction) p.set('action', state.agentAction);
       if (state.agentStatus) p.set('status', state.agentStatus);
+      if (state.q) p.set('q', state.q);
+      if (state.limit) p.set('limit', state.limit);
+    }
+    if (show.transactions) {
+      if (state.stage) p.set('stage', state.stage);
+      if (state.txType) p.set('txType', state.txType);
       if (state.q) p.set('q', state.q);
       if (state.limit) p.set('limit', state.limit);
     }
@@ -611,6 +641,35 @@ export function AdminLogsExportDialog({
                     <SelectContent>
                       <SelectItem value="all">{t('logsManagerAll')}</SelectItem>
                       {AGENT_STATUSES.map((s) => <SelectItem key={s} value={s} dir="ltr">{s}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── Transaction filters (0.6.81) ── */}
+          {show.transactions && (
+            <div className="space-y-2">
+              <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">{t('logsManagerTabTransactions')}</p>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <Label className="text-[11px] text-muted-foreground">{t('txColStage')}</Label>
+                  <Select value={state.stage || 'all'} onValueChange={(v) => set('stage', v === 'all' ? '' : v)}>
+                    <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
+                    <SelectContent className="max-h-72">
+                      <SelectItem value="all">{t('logsManagerAll')}</SelectItem>
+                      {TX_STAGE_CHOICES.map((s) => <SelectItem key={s} value={s} dir="ltr" className="font-mono text-[11px]">{s}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-1">
+                  <Label className="text-[11px] text-muted-foreground">{t('txColType')}</Label>
+                  <Select value={state.txType || 'all'} onValueChange={(v) => set('txType', v === 'all' ? '' : v)}>
+                    <SelectTrigger className="h-9"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">{t('logsManagerAll')}</SelectItem>
+                      {TX_TYPE_CHOICES.map((ty) => <SelectItem key={ty} value={ty} dir="ltr">{ty}</SelectItem>)}
                     </SelectContent>
                   </Select>
                 </div>

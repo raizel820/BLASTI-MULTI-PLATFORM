@@ -25,6 +25,7 @@
 import { db } from '@blasti/db'
 import { recordSyncChange, resolveAgencyIdForUser } from './sync-helpers'
 import { ensureInvoiceForTransaction, ensureInvoiceForSmsPurchase } from './billing-invoices'
+import { appendTxEvent } from './tx-log'
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -338,11 +339,42 @@ export async function fulfillCheckoutPaid(
         console.warn('[chargily-fulfill] Failed to issue invoice for transaction:', err)
       }
     }
+
+    // 0.6.81 — AUTHORITATIVE settlement event in the unified transaction
+    // stream (the Logs Manager "Transactions" tab tail this in real time).
+    appendTxEvent({
+      stage: 'settle_paid',
+      message: `${transaction.type === 'HARDWARE' ? 'Hardware' : 'Subscription'} payment CONFIRMED (${source}) — ${transaction.amount} DA`,
+      level: 'info',
+      data: { source, gatewayStatus: checkout.status, agencyName: transaction.agency.name, planName: transaction.planName, subscriptionActivated: transaction.type !== 'HARDWARE', notificationSent: true, invoiceIssued: transaction.type !== 'HARDWARE' },
+      identity: { agencyId: transaction.agencyId, role: 'SERVER' },
+      ref: transaction.id,
+      checkoutId: checkout.id,
+      txType: transaction.type === 'HARDWARE' ? 'hardware' : 'subscription',
+      status: 'COMPLETED',
+      amount: transaction.amount,
+      method: checkout.payment_method || undefined,
+    })
   } else if (transaction) {
     // Already settled — still count as handled so callers can report state.
     result.transactionId = transaction.id
     result.agencyId = transaction.agencyId
     result.handled = true
+    // 0.6.81 — a replayed webhook / racing poll hit an already-settled row:
+    // record the idempotency guard in the transaction stream so support can
+    // see duplicate delivery vs real double settlement.
+    appendTxEvent({
+      stage: 'settle_duplicate',
+      message: `Settlement replay ignored — transaction ${transaction.id} already ${transaction.status}`,
+      level: 'info',
+      data: { source, gatewayStatus: checkout.status },
+      identity: { agencyId: transaction.agencyId, role: 'SERVER' },
+      ref: transaction.id,
+      checkoutId: checkout.id,
+      txType: transaction.type === 'HARDWARE' ? 'hardware' : 'subscription',
+      status: transaction.status,
+      amount: transaction.amount,
+    })
   }
 
   // ── 2. SMS purchase (customer credit packs) ──
@@ -402,6 +434,21 @@ export async function fulfillCheckoutPaid(
       })
 
       result.smsCreditsGranted = smsPurchase.quantity
+
+      // 0.6.81 — authoritative SMS settlement event.
+      appendTxEvent({
+        stage: 'settle_paid',
+        message: `SMS pack CONFIRMED (${source}) — ${smsPurchase.quantity} credits for ${smsPurchase.price} DA`,
+        level: 'info',
+        data: { source, gatewayStatus: checkout.status, quantity: smsPurchase.quantity, creditsGranted: smsPurchase.quantity, notificationSent: true, receiptIssued: true },
+        identity: { userId: smsPurchase.userId, role: 'CUSTOMER' },
+        ref: smsPurchase.id,
+        checkoutId: checkout.id,
+        txType: 'sms',
+        status: 'APPROVED',
+        amount: smsPurchase.price,
+        method: methodSnapshot || undefined,
+      })
 
       // Billing: issue the legal receipt for this settled SMS pack.
       try {
@@ -469,6 +516,20 @@ export async function fulfillCheckoutPaid(
             source,
           }),
         },
+      })
+
+      // 0.6.81 — authoritative hardware settlement event.
+      appendTxEvent({
+        stage: 'settle_paid',
+        message: `Hardware order APPROVED (${source}) — ${order.upfrontTotal} DA`,
+        level: 'info',
+        data: { source, gatewayStatus: checkout.status, hardwareOrderId: order.id },
+        identity: { agencyId: order.agencyId, role: 'SERVER' },
+        ref: order.id,
+        checkoutId: checkout.id,
+        txType: 'hardware',
+        status: 'APPROVED',
+        amount: order.upfrontTotal,
       })
 
       await emitPaymentEvent('payment:completed', {
@@ -570,6 +631,20 @@ export async function fulfillCheckoutFailed(
           plan: transaction.plan,
         },
       })
+
+      // 0.6.81 — authoritative failure event.
+      appendTxEvent({
+        stage: 'settle_failed',
+        message: `${transaction.type === 'HARDWARE' ? 'Hardware' : 'Subscription'} payment FAILED (${source}) — ${transaction.amount} DA`,
+        level: 'warn',
+        data: { source, gatewayStatus: checkout.status, plan: transaction.plan },
+        identity: { agencyId: transaction.agencyId, role: 'SERVER' },
+        ref: transaction.id,
+        checkoutId: checkout.id,
+        txType: transaction.type === 'HARDWARE' ? 'hardware' : 'subscription',
+        status: 'FAILED',
+        amount: transaction.amount,
+      })
     }
   }
 
@@ -606,6 +681,20 @@ export async function fulfillCheckoutFailed(
           entityId: smsPurchase.id,
           details: JSON.stringify({ checkoutId: checkout.id, userId: smsPurchase.userId, source }),
         },
+      })
+
+      // 0.6.81 — authoritative SMS failure event.
+      appendTxEvent({
+        stage: 'settle_failed',
+        message: `SMS pack payment FAILED (${source}) — ${smsPurchase.price} DA`,
+        level: 'warn',
+        data: { source, gatewayStatus: checkout.status, quantity: smsPurchase.quantity },
+        identity: { userId: smsPurchase.userId, role: 'CUSTOMER' },
+        ref: smsPurchase.id,
+        checkoutId: checkout.id,
+        txType: 'sms',
+        status: 'FAILED',
+        amount: smsPurchase.price,
       })
     }
   }

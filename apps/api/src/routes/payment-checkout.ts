@@ -34,6 +34,7 @@ import {
 import { fulfillCheckoutPaid, fulfillCheckoutFailed, normalizeChargilyStatus } from '../lib/chargily-fulfill'
 import { validateBody } from '../lib/validations'
 import { computeUpgradeCredit, applyProration, computePeriodDiscount } from '../lib/subscription-proration'
+import { appendTxEvent } from '../lib/tx-log'
 import { z } from 'zod'
 
 const app = new Hono()
@@ -334,6 +335,19 @@ app.post('/create-checkout', async (c) => {
             data: { status: 'FAILED', rejectionReason: 'Chargily checkout creation failed', reviewedAt: new Date() },
           })
           .catch(() => undefined)
+        // 0.6.81 — the funnel needs the refusal, not just the ledger row.
+        appendTxEvent({
+          stage: 'checkout_failed',
+          message: `Subscription checkout refused by the gateway: ${err instanceof Error ? err.message.slice(0, 200) : 'unknown error'}`,
+          level: 'warn',
+          data: { plan, period: effectivePeriod, discountPercent, creditApplied: proration.creditApplied, bundledHardware: bundledOrders.length },
+          identity: { userId: user.id, username: user.username, role: user.role, agencyId },
+          ref: transaction.id,
+          txType: 'subscription',
+          status: 'FAILED',
+          amount: totalAmount,
+          method: paymentMethod.toUpperCase(),
+        })
         throw err
       }
 
@@ -359,6 +373,22 @@ app.post('/create-checkout', async (c) => {
           subscriptionTier: plan,
           subscriptionPlanId: planRecord.id,
         },
+      })
+
+      // 0.6.81 — server-authoritative "checkout exists" event (the client
+      // logs creating/redirect; this row is the ledger truth).
+      appendTxEvent({
+        stage: 'checkout_created',
+        message: `Subscription checkout created — ${totalAmount} DA for plan ${plan} (${effectivePeriod}m)${bundledOrders.length > 0 ? ` + ${bundledOrders.length} hardware order(s)` : ''}`,
+        level: 'info',
+        data: { plan, period: effectivePeriod, discountPercent, listTotal, creditApplied: proration.creditApplied, chargeAmount: proration.chargeAmount, subscriptionAmount, hardwareAmount, bundledHardware: bundledOrders.length, agencyName: agency.name, checkoutUrl: checkout.checkout_url.slice(0, 120) },
+        identity: { userId: user.id, username: user.username, role: user.role, agencyId },
+        ref: transaction.id,
+        checkoutId: checkout.id,
+        txType: 'subscription',
+        status: 'PENDING',
+        amount: totalAmount,
+        method: paymentMethod.toUpperCase(),
       })
 
       await db.auditLog.create({
@@ -465,12 +495,40 @@ app.post('/create-checkout', async (c) => {
         await db.smsPurchase
           .update({ where: { id: purchase.id }, data: { status: 'FAILED', webhookVerified: true } })
           .catch(() => undefined)
+        // 0.6.81 — the funnel needs the refusal, not just the ledger row.
+        appendTxEvent({
+          stage: 'checkout_failed',
+          message: `SMS pack checkout refused by the gateway: ${err instanceof Error ? err.message.slice(0, 200) : 'unknown error'}`,
+          level: 'warn',
+          data: { packId, quantity: pack.quantity },
+          identity: { userId: user.id, username: user.username, role: user.role },
+          ref: purchase.id,
+          txType: 'sms',
+          status: 'FAILED',
+          amount: pack.price,
+          method: paymentMethod.toUpperCase(),
+        })
         throw err
       }
 
       purchase = await db.smsPurchase.update({
         where: { id: purchase.id },
         data: { providerRef: checkout.id },
+      })
+
+      // 0.6.81 — server-authoritative "checkout exists" event.
+      appendTxEvent({
+        stage: 'checkout_created',
+        message: `SMS pack checkout created — ${pack.price} DA for ${pack.quantity} credits`,
+        level: 'info',
+        data: { packId, quantity: pack.quantity, checkoutUrl: checkout.checkout_url.slice(0, 120) },
+        identity: { userId: user.id, username: user.username, role: user.role },
+        ref: purchase.id,
+        checkoutId: checkout.id,
+        txType: 'sms',
+        status: 'PENDING',
+        amount: pack.price,
+        method: paymentMethod.toUpperCase(),
       })
 
       await db.auditLog.create({
@@ -601,6 +659,19 @@ app.post('/create-checkout', async (c) => {
           data: { status: 'FAILED', rejectionReason: 'Chargily checkout creation failed', reviewedAt: new Date() },
         })
         .catch(() => undefined)
+      // 0.6.81 — the funnel needs the refusal, not just the ledger row.
+      appendTxEvent({
+        stage: 'checkout_failed',
+        message: `Hardware checkout refused by the gateway: ${err instanceof Error ? err.message.slice(0, 200) : 'unknown error'}`,
+        level: 'warn',
+        data: { orderId: order.id, itemsSummary },
+        identity: { userId: user.id, username: user.username, role: user.role, agencyId: order.agencyId },
+        ref: transaction.id,
+        txType: 'hardware',
+        status: 'FAILED',
+        amount: order.upfrontTotal,
+        method: paymentMethod.toUpperCase(),
+      })
       throw err
     }
 
@@ -613,6 +684,21 @@ app.post('/create-checkout', async (c) => {
     await db.hardwareOrder.update({
       where: { id: order.id },
       data: { providerRef: checkout.id, paymentProvider: 'chargily' },
+    })
+
+    // 0.6.81 — server-authoritative "checkout exists" event.
+    appendTxEvent({
+      stage: 'checkout_created',
+      message: `Hardware checkout created — ${order.upfrontTotal} DA (${itemsSummary || 'devices'})`,
+      level: 'info',
+      data: { orderId: order.id, itemsSummary, checkoutUrl: checkout.checkout_url.slice(0, 120) },
+      identity: { userId: user.id, username: user.username, role: user.role, agencyId: order.agencyId },
+      ref: transaction.id,
+      checkoutId: checkout.id,
+      txType: 'hardware',
+      status: 'PENDING',
+      amount: order.upfrontTotal,
+      method: paymentMethod.toUpperCase(),
     })
 
     await db.auditLog.create({

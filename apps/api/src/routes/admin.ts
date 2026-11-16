@@ -27,6 +27,7 @@ import { SERVER_COMPONENTS, getLinkMbpsCap } from '../lib/server-metrics'
 import { getCheckoutStatus } from '../lib/chargily-service'
 import { fulfillCheckoutPaid, fulfillCheckoutFailed, normalizeChargilyStatus, type FulfillmentCheckout } from '../lib/chargily-fulfill'
 import { ensureInvoiceForTransaction, ensureInvoiceForHardwareOrder } from '../lib/billing-invoices'
+import { appendTxEvent } from '../lib/tx-log'
 // Task 2-a FIX 3 — the admin-dashboard SMS tab reads/writes /admin/sms-settings.
 import { getSmsSettings, getSmsUsageStats, testSms, validateGatewayConnection } from '../lib/sms-service'
 import { PROVIDER_REGISTRY } from '../lib/messaging/provider-registry'
@@ -3765,6 +3766,20 @@ app.post('/transactions/:id', async (c) => {
         console.warn('[admin] Failed to issue invoice for approved transaction:', err)
       }
     }
+
+    // 0.6.81 — admin manual review outcome in the tx stream.
+    appendTxEvent({
+      stage: action === 'approve' ? 'manual_approved' : 'manual_rejected',
+      message: `Manual ${transaction.type === 'HARDWARE' ? 'hardware' : 'subscription'} payment ${action === 'approve' ? 'APPROVED' : 'REJECTED'} by admin — ${transaction.amount} DA${action === 'reject' && reason ? ` (${reason.slice(0, 120)})` : ''}`,
+      level: action === 'approve' ? 'info' : 'warn',
+      data: { plan: transaction.plan, adminId: admin.id, adminUsername: admin.username, reason: reason || null, subscriptionActivated: action === 'approve' && transaction.type !== 'HARDWARE' },
+      identity: { agencyId: transaction.agencyId, role: 'SERVER' },
+      ref: transaction.id,
+      txType: transaction.type === 'HARDWARE' ? 'hardware' : 'subscription',
+      status: action === 'approve' ? 'APPROVED' : 'REJECTED',
+      amount: transaction.amount,
+      method: transaction.paymentMethod,
+    })
 
     return c.json({ success: true, transaction: updated })
   } catch (error) {

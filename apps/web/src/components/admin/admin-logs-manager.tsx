@@ -30,6 +30,7 @@ import {
   CalendarDays,
   Check,
   Copy,
+  CreditCard,
   Download,
   FileJson,
   FlaskConical,
@@ -61,6 +62,7 @@ import {
 import { AdminAccountLogsVault } from '@/components/admin/admin-account-logs-vault';
 import { AdminServerLogsSection } from '@/components/admin/admin-server-logs-section';
 import { AdminAgentLogsSection } from '@/components/admin/admin-agent-logs-section';
+import { AdminTxLogsSection } from '@/components/admin/admin-tx-logs-section';
 import { AdminLogsExportDialog, type LogsExportScope } from '@/components/admin/admin-logs-export-dialog';
 import { LOG_TRIGGERS } from '@/lib/remote-logger';
 
@@ -476,7 +478,7 @@ export function AdminLogsManager() {
       </Card>
 
       <Tabs value={tab} onValueChange={setTab} className="space-y-4">
-        <TabsList className="grid grid-cols-3 sm:grid-cols-6 w-full max-w-3xl">
+        <TabsList className="grid grid-cols-4 sm:grid-cols-7 w-full max-w-3xl">
           <TabsTrigger value="overview" className="gap-1"><Siren className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabOverview')}</span></TabsTrigger>
           <TabsTrigger value="errors" className="gap-1"><Bug className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabErrors')}</span></TabsTrigger>
           <TabsTrigger value="daily" className="gap-1"><CalendarDays className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabDaily')}</span></TabsTrigger>
@@ -484,6 +486,8 @@ export function AdminLogsManager() {
           <TabsTrigger value="server" className="gap-1"><Server className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabServer')}</span></TabsTrigger>
           {/* 0.6.62 — translation agent action trail */}
           <TabsTrigger value="agent" className="gap-1"><Bot className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabAgent')}</span></TabsTrigger>
+          {/* 0.6.81 — REAL-TIME TRANSACTION STREAM (subscriptions/SMS/hardware funnel) */}
+          <TabsTrigger value="transactions" className="gap-1"><CreditCard className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabTransactions')}</span></TabsTrigger>
           <TabsTrigger value="raw" className="gap-1"><ScrollText className="h-3.5 w-3.5" /><span className="hidden sm:inline">{t('logsManagerTabRaw')}</span></TabsTrigger>
         </TabsList>
 
@@ -831,7 +835,12 @@ export function AdminLogsManager() {
           <AdminAgentLogsSection />
         </TabsContent>
 
-        {/* ── Raw logs (the moved vault) ──────────────────────────────── */}
+        {/* ── Transaction event stream (0.6.81) ───────────────────── */}
+        <TabsContent value="transactions" className="space-y-4">
+          <AdminTxLogsSection />
+        </TabsContent>
+
+        {/* ── Raw logs (the moved vault) ──────────────────────────── */}
         <TabsContent value="raw">
           <AdminAccountLogsVault />
         </TabsContent>
