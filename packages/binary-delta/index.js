@@ -97,13 +97,52 @@ function sha256Buf(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
+// ─── Electron asar-virtualization guard (ROOT FIX: delta ENOENT) ─────────────
+// Production failure: `delta-failed: ENOENT,  not found in …\resources\app.asar`
+// (note the EMPTY inner-file path — double space). Inside Electron, fs is
+// patched by asar-fs-wrapper: ANY path ending in `.asar` is classified as an
+// asar ARCHIVE, so opening/hashing the bare archive itself as a RAW file
+// (inner path "") → copyFileOut("") → root node has no "size" →
+// `ENOENT, '' not found in <asar>` — 100% of the time on packaged installs.
+// The delta pipeline MUST read the current app.asar RAW (positional reads of
+// the real bytes). `process.noAsar = true` is Electron's documented escape
+// hatch; in plain Node/Bun the flag is a harmless no-op (server-side callers
+// are unaffected).
+
+function acquireRawFs(paths) {
+  if (typeof process === 'undefined' || process.noAsar === true) return () => {};
+  const targets = Array.isArray(paths) ? paths : [paths];
+  const needsGuard = targets.some((p) => typeof p === 'string' && /\.asar$/i.test(p.replace(/[\\/]+$/, '')));
+  if (!needsGuard) return () => {};
+  const was = process.noAsar;
+  process.noAsar = true;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    process.noAsar = was;
+  };
+}
+
 function sha256OfFile(filePath) {
   return new Promise((resolve, reject) => {
     const h = crypto.createHash('sha256');
-    const s = fs.createReadStream(filePath);
+    // The guard must span the WHOLE lifetime of the stream: createReadStream
+    // returns immediately but the fs.open/data events fire AFTER this function
+    // returns — restore only on 'close' (fires after both end and error).
+    const release = acquireRawFs(filePath);
+    let s;
+    try {
+      s = fs.createReadStream(filePath);
+    } catch (err) {
+      release();
+      reject(err);
+      return;
+    }
     s.on('data', (c) => h.update(c));
-    s.on('error', reject);
+    s.on('error', (err) => { release(); reject(err); });
     s.on('end', () => resolve(h.digest('hex')));
+    s.on('close', () => release());
   });
 }
 
@@ -305,6 +344,13 @@ function applyDeltaBuffer(oldBuf, deltaBuf) {
  */
 async function applyDeltaToFile(oldPath, deltaBuf, outPath, opts = {}) {
   const { header, ops } = parseDelta(deltaBuf);
+  // ROOT FIX (delta ENOENT on packaged installs): positional RAW reads against
+  // the current app.asar — without the guard, Electron's asar-fs-wrapper
+  // intercepts fs.openSync('…app.asar') and throws `ENOENT, '' not found in
+  // …app.asar` before a single hop can ever be applied. The whole body below
+  // is synchronous until the final output-verify hash, so a sync
+  // acquire/release in `finally` fully covers every read/write of the asar.
+  const releaseRawFs = acquireRawFs([oldPath, outPath]);
   const oldFd = fs.openSync(oldPath, 'r');
   const out = fs.openSync(outPath, 'w');
   const hash = crypto.createHash('sha256');
@@ -361,6 +407,7 @@ async function applyDeltaToFile(oldPath, deltaBuf, outPath, opts = {}) {
   } finally {
     fs.closeSync(oldFd);
     fs.closeSync(out);
+    releaseRawFs();
   }
   const sha = await sha256OfFile(outPath);
   if (opts.verify !== false && sha !== header.toSha256) {

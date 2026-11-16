@@ -44,6 +44,8 @@ export const TX_STAGES = [
   'redirect_gateway',    // hosted Chargily page opened
   'return_received',     // payer back on the result view
   'verify_poll',         // settlement status poll fired (first of a session)
+  'verify_error',        // poll/verify attempt FAILED (http status captured) — error-path coverage
+  'checkout_abandoned',  // result view closed before the checkout reached a final state
   'settle_push',         // realtime settlement push received by the app
   'redirect_back',       // blasti:// deep-link bounce into the app fired
   'result_final',        // final result state shown (paid | failed | still-pending | unverified)

@@ -42,9 +42,17 @@ function wipeWebStorage(): void {
     }
   } catch { /* ignore */ }
   try {
-    if (typeof indexedDB !== 'undefined' && indexedDB.deleteDatabase) {
-      indexedDB.deleteDatabase('blasti-watermelondb');
-    }
+    // PRODUCTION FIX: the bare deleteDatabase had NO handlers and the live
+    // Loki/WatermelonDB connection kept it blocked forever ("Deleting database
+    // failed because it's blocked by another connection"). The shared helper
+    // closes the singleton first and handles onblocked/onerror.
+    void import('@/lib/idb-reset').then(({ deleteAppIndexedDb }) => deleteAppIndexedDb())
+      .then((outcome) => {
+        if (outcome !== 'deleted' && outcome !== 'unsupported') {
+          console.warn('[root-recovery] IndexedDB delete outcome:', outcome, '(another tab may hold the database — the reload below releases it)');
+        }
+      })
+      .catch(() => { /* ignore */ });
   } catch { /* ignore */ }
 }
 

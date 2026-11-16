@@ -2855,6 +2855,14 @@ function _scheduleNextIncremental() {
   if (_incrementalTimeoutId) clearTimeout(_incrementalTimeoutId);
   var jitter = Math.floor(Math.random() * (2 * SYNC_INTERVAL_JITTER_MS + 1)) - SYNC_INTERVAL_JITTER_MS;
   var delay = Math.max(5000, (_config.syncIntervalMs || DEFAULT_SYNC_INTERVAL_MS) + jitter);
+  // PRODUCTION FIX — the backoff ladder was COMPUTED (_increaseBackoff →
+  // _backoffMs, cap 60s) but never APPLIED: failed pulls kept retrying every
+  // ~15s no matter how many failures stacked up. Apply _backoffMs on top of
+  // the base interval so consecutive failures actually slow the cycle down;
+  // _resetBackoff() (first successful pull) restores the normal cadence.
+  if (_backoffMs > 0) {
+    delay = Math.max(delay, Math.min(_backoffMs, 60000));
+  }
   _incrementalTimeoutId = setTimeout(async function() {
     try {
       await _incrementalPullCycle('interval');

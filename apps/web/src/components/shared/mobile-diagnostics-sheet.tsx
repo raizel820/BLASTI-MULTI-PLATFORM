@@ -179,9 +179,17 @@ export function MobileDiagnosticsSheet({ open, onOpenChange, errorLine }: Props)
           const keys = await caches.keys();
           await Promise.all(keys.map((k) => caches.delete(k).catch(() => {})));
         }
-        if (typeof indexedDB !== 'undefined' && indexedDB.deleteDatabase) {
-          indexedDB.deleteDatabase('blasti-watermelondb');
-        }
+        // PRODUCTION FIX: the bare deleteDatabase had NO handlers and the live
+        // Loki/WatermelonDB connection kept it blocked forever ("Deleting
+        // database failed because it's blocked by another connection"). The
+        // shared helper closes the singleton first and handles the events.
+        try {
+          const { deleteAppIndexedDb } = await import('@/lib/idb-reset');
+          const outcome = await deleteAppIndexedDb();
+          if (outcome !== 'deleted' && outcome !== 'unsupported') {
+            console.warn('[diag-reset] IndexedDB delete outcome:', outcome);
+          }
+        } catch { /* hardened reset — keep going */ }
       } catch { /* hardened reset — keep going */ }
       // 2. Native shell wipe (WebView cache + storage + cookies + SW dir +
       //    pending update APK) — the real fix when the web layer is the

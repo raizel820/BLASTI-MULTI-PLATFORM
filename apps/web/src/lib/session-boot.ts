@@ -38,11 +38,12 @@
 import { readSessionToken } from '@/lib/auth-storage';
 
 export type SessionBootVerdict =
-  | 'skipped'     // non-Electron runtime — web settle owns the boot check
-  | 'no-session'  // nothing to validate (optionally swept leftover mirrors)
-  | 'valid'       // token present and usable — boot continues as before
-  | 'refreshed'   // expired token was refreshed single-flight — boot continues
-  | 'purged';     // session could not be proven valid — clean slate, login
+  | 'skipped'        // non-Electron runtime — web settle owns the boot check
+  | 'no-session'     // nothing to validate (optionally swept leftover mirrors)
+  | 'valid'          // token present and usable — boot continues as before
+  | 'refreshed'      // expired token was refreshed single-flight — boot continues
+  | 'kept-offline'   // expired token, refresh UNAVAILABLE (offline/cloud booting) — session KEPT; the server stays the auth authority (production fix: users were purged exactly when the API restarted)
+  | 'purged';        // session explicitly rejected by the cloud — clean slate, login
 
 /** Same Electron detection every desktop branch in these files uses. */
 function isElectronRuntime(): boolean {
@@ -186,16 +187,26 @@ export async function validateSessionOnBoot(): Promise<SessionBootVerdict> {
       console.log('[SessionBoot] Expired token refreshed at boot — session continues');
       return 'refreshed';
     }
-    await purgeSessionState(
-      result.rejected
-        ? 'cloud explicitly rejected the expired session (401/403)'
-        : 'expired session and refresh unavailable (offline) — no stale offline session may continue',
-    );
-    return 'purged';
+    // PRODUCTION FIX (desktop users logged out after every API restart):
+    // purge ONLY when the cloud EXPLICITLY rejected the session (401/403 —
+    // `result.rejected`). The old code ALSO purged when the refresh was
+    // merely UNAVAILABLE (offline / cloud still booting right after an app
+    // update) — that destroyed recoverable sessions at the exact moment the
+    // API was coming back, producing `session: authenticated=false` in every
+    // diagnostic dump. The server is the auth authority: keep the session on
+    // unavailability; the expired token simply 401s on use, which routes into
+    // the centralized refresh→adopt→restore chain instead of a hard logout.
+    if (result.rejected) {
+      await purgeSessionState('cloud explicitly rejected the expired session (401/403)');
+      return 'purged';
+    }
+    console.log('[SessionBoot] Expired token but refresh unavailable (offline/cloud booting) — KEEPING session; the 401 recovery chain will refresh it on first use');
+    return 'kept-offline';
   } catch (err) {
-    // Refresh module itself failed — treat like an unavailable refresh.
-    console.warn('[SessionBoot] Refresh attempt failed at boot:', err);
-    await purgeSessionState('expired session and refresh attempt errored');
-    return 'purged';
+    // Refresh attempt itself failed (network/IPC error) — same principle as
+    // above: the cloud has NOT confirmed the session is dead, so do not purge
+    // a recoverable session. The first authenticated request will decide.
+    console.warn('[SessionBoot] Refresh attempt failed at boot — keeping session (server remains the auth authority):', err);
+    return 'kept-offline';
   }
 }

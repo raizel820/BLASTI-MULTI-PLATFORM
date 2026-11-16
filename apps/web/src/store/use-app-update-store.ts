@@ -712,12 +712,27 @@ function createAppUpdateStore() {
           // APK; on success it returns the local path (installUpdate picks it
           // up WITHOUT a DownloadManager id).
           if (info.delta && info.delta.hops.length > 0 && plugin()?.installDeltaUpdate) {
-            const result = await plugin()?.installDeltaUpdate?.({
-              deltas: info.delta.hops.map((h) => ({ url: buildCloudUrl(h.url), sha256: h.sha256, fromVersion: h.fromVersion, toVersion: h.toVersion })),
-              finalSha256: info.delta.targetApkSha256 || '',
-              fromVersion: info.currentVersion,
-              toVersion: info.version,
-            });
+            // PRODUCTION FIX ("startDownload threw — download never started |
+            // error=delta-download-failed / delta-apply-failed"): the Capacitor
+            // bridge REJECTS when the native delta pipeline fails
+            // (call.reject in BlastiNativeStatus), so the await THREW and the
+            // catch below aborted the whole startDownload — the full-APK
+            // fallback (the documented contract: "Any failure leaves the
+            // installed app untouched — the web layer falls back to the
+            // full-APK DownloadManager path") never ran and mobile users got
+            // stuck with no update. Catch the rejection and fall through,
+            // exactly like the Electron path above handles {ok:false}.
+            let result: { ok?: boolean; error?: string; apkPath?: string } | undefined;
+            try {
+              result = await plugin()?.installDeltaUpdate?.({
+                deltas: info.delta.hops.map((h) => ({ url: buildCloudUrl(h.url), sha256: h.sha256, fromVersion: h.fromVersion, toVersion: h.toVersion })),
+                finalSha256: info.delta.targetApkSha256 || '',
+                fromVersion: info.currentVersion,
+                toVersion: info.version,
+              });
+            } catch (deltaErr) {
+              result = { ok: false, error: deltaErr instanceof Error ? deltaErr.message : String(deltaErr ?? '') };
+            }
             if (result?.ok && result.apkPath) {
               set({ deltaApplied: true, status: 'downloaded', progress: { percent: 100, receivedBytes: info.delta.totalSize, totalBytes: info.delta.totalSize } });
               lastAndroidDeltaPath = result.apkPath;

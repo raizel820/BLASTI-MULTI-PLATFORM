@@ -1491,6 +1491,22 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
       let cursor = isResumeStage ? resumeCursor : null
       let hasMore = true
 
+      // PRODUCTION FIX (the /api/sync/initial-data storm: dozens of calls per
+      // second in the API journal after desktop reconnect):
+      //   • CURSOR-ADVANCE GUARD — the server can answer hasMore:true with
+      //     nextCursor:undefined (page boundary record missing its sort
+      //     field). Re-requesting with the same (null) cursor then repeats
+      //     the IDENTICAL request at raw HTTP speed — an infinite hot loop.
+      //     Any non-advancing page now fails the stage instead.
+      //   • PAGE CAP — a stage can never fetch more than MAX_STAGE_PAGES
+      //     pages in one run (a 500-row page × 30 stages is already a lot of
+      //     traffic; a stuck server can no longer pin the initializer open).
+      //   • INTER-PAGE DELAY — yield briefly between pages so legitimate big
+      //     stages page politely instead of machine-gunning the cloud API.
+      const MAX_STAGE_PAGES = 200
+      const STAGE_PAGE_DELAY_MS = 150
+      let stagePages = 0
+
       // Process paginated data for this stage
       while (hasMore) {
         if (effectiveSignal?.aborted) throw new Error('Aborted')
@@ -1517,10 +1533,17 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
         const nextCursor = response.nextCursor || null
         hasMore = response.hasMore === true
 
-        // Task 43: make the per-stage fetch VISIBLE in the main log (the
-        // evt printer only logs types, so a stage that quietly got 0 rows
-        // from the cloud was indistinguishable from one that got 50).
-        console.log(`[InitialSync] stage ${stage.id}: fetched ${records.length} record(s) from cloud (page hasMore=${hasMore})`)
+        stagePages++
+        if (stagePages > MAX_STAGE_PAGES) {
+          throw new Error(`Stage ${stage.id} exceeded ${MAX_STAGE_PAGES} pages — aborting to protect the cloud API (storm guard)`)
+        }
+        if (hasMore && !nextCursor) {
+          // Server says more pages exist but gave no usable cursor — re-asking
+          // would repeat the SAME request forever. Treat as a server fault.
+          throw new Error(`Stage ${stage.id} pagination fault: hasMore=true without nextCursor (storm guard)`)
+        }
+
+        console.log(`[InitialSync] stage ${stage.id}: fetched ${records.length} record(s) from cloud (page ${stagePages}, hasMore=${hasMore})`)
 
         // Task 46: branch-focused pre-flight diagnostics — sample keys + what
         // the sanitizer would drop, for the FIRST page of each core stage.
@@ -1568,6 +1591,13 @@ async function _runInitialSyncInner(options, activeSync, syncId, startTime) {
         // The server tells us via hasMore; also check if we got fewer than pageSize
         if (!hasMore && records.length < PAGE_SIZE) {
           hasMore = false
+        }
+
+        // PRODUCTION FIX — polite pacing between pages (the old loop issued
+        // bare awaited fetches back-to-back, so one busy agency legitimately
+        // looked like an API storm in the journal).
+        if (hasMore) {
+          await new Promise((r) => setTimeout(r, STAGE_PAGE_DELAY_MS))
         }
 
         // Emit progress

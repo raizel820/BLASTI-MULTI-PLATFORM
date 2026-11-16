@@ -172,10 +172,19 @@ export function PaymentResult() {
 
   const attemptsRef = useRef(0);
   const pollingActiveRef = useRef(false);
+  /** verify_error fires ONCE per poll session (reset when the budget restarts). */
+  const pollErrorLoggedRef = useRef(false);
   /** Latest poll payload (kept in a ref so the push listener can match ids). */
   const dataRef = useRef<CheckoutStatusData | null>(null);
   /** Immediate one-shot check — used by the realtime settlement push. */
   const pollNowRef = useRef<(() => Promise<void>) | null>(null);
+  // PRODUCTION FIX (verify_poll fields): the ledger ref from the return URL is
+  // resolved in the mount effect but only lived in local variables — verify_poll
+  // went out with NO ref and NO amount (empty fields in the Transactions tab).
+  const returnRefRef = useRef<string | null>(null);
+  // Track the phase so the unmount handler can detect an abandoned checkout.
+  const phaseRef = useRef<Phase>(phase);
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
 
   // ── Deep-link bounce (Capacitor mobile) ────────────────────────────────────
   // On phones the hosted checkout opens in the SYSTEM browser, so after
@@ -220,6 +229,7 @@ export function PaymentResult() {
     const run = async () => {
       const { status, checkout, ref } = readReturnQuery();
       if (!cancelled) setStatusParam(status);
+      returnRefRef.current = ref || null;
 
       const pendingCheckout = getPendingCheckout();
       setPending(pendingCheckout);
@@ -285,6 +295,7 @@ export function PaymentResult() {
     let timer: ReturnType<typeof setTimeout> | null = null;
     pollingActiveRef.current = true;
     attemptsRef.current = 0;
+    pollErrorLoggedRef.current = false;
 
     const stopPolling = () => {
       pollingActiveRef.current = false;
@@ -302,9 +313,13 @@ export function PaymentResult() {
       attemptsRef.current += 1;
       if (attemptsRef.current === 1) {
         // 0.6.81 — first verification tick of this poll session.
+        // PRODUCTION FIX: also carry amount + ref so verify_poll rows are
+        // self-contained in the Transactions tab (they used to be empty).
         logTx('verify_poll', `Settlement verification poll started for ${checkoutId}`, {
           checkoutId,
+          ...(returnRefRef.current ? { ref: returnRefRef.current } : {}),
           ...(dataRef.current?.type ? { txType: dataRef.current.type } : {}),
+          ...(dataRef.current?.amount != null ? { amount: dataRef.current.amount } : pending?.amount != null ? { amount: pending!.amount } : {}),
         });
       }
       try {
@@ -323,6 +338,19 @@ export function PaymentResult() {
         }
         const d = extractPaymentData<CheckoutStatusData>(body);
         if (!res.ok || !d) {
+          // PRODUCTION FIX (error-path coverage): poll/API failures used to be
+          // silent until the budget ran out — the payer saw an eternal spinner
+          // and the Transactions tab showed nothing. Emit verify_error ONCE
+          // per poll session (the first failure) with the HTTP status.
+          if (!pollErrorLoggedRef.current) {
+            pollErrorLoggedRef.current = true;
+            logTx('verify_error', `Settlement verification failed (HTTP ${res.status}) — continuing to poll`, {
+              checkoutId,
+              ...(returnRefRef.current ? { ref: returnRefRef.current } : {}),
+              ...(dataRef.current?.type ? { txType: dataRef.current.type } : {}),
+              httpStatus: res.status,
+            }, 'warn');
+          }
           // Transient API/network hiccup — keep polling while budget remains.
           if (attemptsRef.current >= TOTAL_BUDGET) {
             stopPolling();
@@ -366,6 +394,17 @@ export function PaymentResult() {
           }, 'warn');
         }
       } catch {
+        // PRODUCTION FIX (error-path coverage): network failures during
+        // verification were silent too — emit verify_error once per session.
+        if (!pollErrorLoggedRef.current) {
+          pollErrorLoggedRef.current = true;
+          logTx('verify_error', 'Settlement verification network failure — continuing to poll', {
+            checkoutId,
+            ...(returnRefRef.current ? { ref: returnRefRef.current } : {}),
+            ...(dataRef.current?.type ? { txType: dataRef.current.type } : {}),
+            httpStatus: 0,
+          }, 'warn');
+        }
         if (attemptsRef.current >= TOTAL_BUDGET) {
           stopPolling();
           setPhase('still-pending');
@@ -454,6 +493,27 @@ export function PaymentResult() {
     };
     window.addEventListener('blasti:payment-settled', onSettled);
     return () => window.removeEventListener('blasti:payment-settled', onSettled);
+  }, [checkoutId]);
+
+  // ── PRODUCTION FIX: abandonment detection ──────────────────────────────────
+  // The funnel had NO stage for "the payer left before confirmation finished"
+  // — a crash, app kill or navigation away during the confirming window was
+  // simply invisible in the Transactions tab. Emit checkout_abandoned when
+  // this view unmounts while the checkout has NOT reached a final state.
+  useEffect(() => {
+    return () => {
+      if (
+        checkoutId &&
+        (phaseRef.current === 'confirming' || phaseRef.current === 'still-pending')
+      ) {
+        logTx('checkout_abandoned', 'Payment result view closed before the checkout reached a final state', {
+          checkoutId,
+          ...(returnRefRef.current ? { ref: returnRefRef.current } : {}),
+          ...(dataRef.current?.type ? { txType: dataRef.current.type } : {}),
+          status: 'abandoned',
+        }, 'warn');
+      }
+    };
   }, [checkoutId]);
 
   const restartPolling = () => {

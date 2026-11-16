@@ -312,6 +312,11 @@ deploy_now() { # deploy_now <sha> -> 0 ok | 1 failed | 2 skipped (lock busy)
     fi
     git -C "$DIR" fetch origin "$BRANCH" || return 1
     git -C "$DIR" reset --hard "FETCH_HEAD" >/dev/null || return 1
+    # PRODUCTION FIX (watcher Permission denied): this reset re-applies git's
+    # tracked 100644 mode, wiping the exec bit systemd's ExecStart needs for
+    # THIS script. Re-arm it immediately (the next timer tick spawns this very
+    # file — a single non-executable reset would kill auto-deploy again).
+    chmod 755 "$DIR/scripts/watch-and-deploy.sh" "$DIR/scripts/deploy-oracle-vps.sh" 2>/dev/null || true
     flock -u 8 2>/dev/null || true # release: server-update takes the lock itself
     log "code updated to $sha - rebuilding + restarting services (secrets untouched)"
     if ( cd "$DIR" && bash scripts/deploy-oracle-vps.sh server-update ${DOMAIN:+--domain "$DOMAIN"} ); then

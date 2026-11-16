@@ -951,11 +951,38 @@ public class BlastiNativeStatus extends Plugin {
 
     /** Stream a URL to a file with permissive timeouts (patch-sized artifacts). */
     private void downloadToFile(String url, java.io.File dest) throws Exception {
+        // PRODUCTION FIX (mobile "delta-download-failed: failed to connect …
+        // after 15000ms"): a single attempt with a 15 s connect timeout made
+        // every slow/hiccupy mobile network a hard failure — and the failure
+        // aborted the whole delta chain. The patch download is now retried
+        // (3 attempts, linear backoff) with a 20 s connect timeout; only the
+        // LAST attempt's exception propagates (the web layer then falls back
+        // to the full APK).
+        Throwable last = null;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            try {
+                downloadToFileOnce(url, dest, attempt > 1);
+                return;
+            } catch (Throwable t) {
+                last = t;
+                Log.w(TAG, "[delta] download attempt " + attempt + "/3 failed: " + t.getMessage());
+                if (attempt < 3) {
+                    try { Thread.sleep(1500L * attempt); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw new Exception("interrupted", ie); }
+                }
+            }
+        }
+        throw new Exception(last != null ? last.getMessage() : "download failed after 3 attempts", last);
+    }
+
+    private void downloadToFileOnce(String url, java.io.File dest, boolean isRetry) throws Exception {
         // TLS stays on the platform default (network_security_config.xml) —
         // no trust-all overrides; the VPS serves a valid certificate chain.
         java.net.URL u = new java.net.URL(url.trim());
         java.net.HttpURLConnection conn = (java.net.HttpURLConnection) u.openConnection();
-        conn.setConnectTimeout(15000);
+        // 20 s connect on (re)tries — mobile networks routinely exceed 15 s
+        // for the first TLS+TCP handshake (production log: connect timeout at
+        // exactly 15000ms). Read timeout unchanged (patches are small).
+        conn.setConnectTimeout(isRetry ? 20000 : 15000);
         conn.setReadTimeout(30000);
         conn.setInstanceFollowRedirects(true);
         int code = conn.getResponseCode();

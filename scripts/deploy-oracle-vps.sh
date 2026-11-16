@@ -425,6 +425,14 @@ install_auto_update_watcher() {
     warn "scripts/watch-and-deploy.sh not found — GitHub auto-updater NOT installed"
     return 0
   fi
+  # PRODUCTION FIX (blasti-watcher.service: status=203/EXEC Permission denied):
+  # systemd's step EXEC spawns ExecStart DIRECTLY, so the script needs the exec
+  # bit — but the scripts are tracked 100644 in git, so every `git reset --hard`
+  # (each deploy) silently WIPED any manual chmod +x and the watcher died every
+  # 2 minutes until the bit was restored by hand. Always re-arm the exec bit
+  # here (and again after the git reset in cmd_update) so the watcher can never
+  # be left non-executable by a code update again.
+  chmod 755 "$root/scripts/watch-and-deploy.sh" "$root/scripts/deploy-oracle-vps.sh" 2>/dev/null || true
   log "Arming the GitHub auto-updater (checks for new commits every 2 minutes)..."
 
   cat > /etc/systemd/system/blasti-watcher.service <<EOF
@@ -833,6 +841,11 @@ cmd_update() {
   # -- 1. latest code from GitHub (untracked files like uploads survive) ------
   git -C "$DIR" fetch origin "$branch"
   git -C "$DIR" reset --hard FETCH_HEAD
+  # PRODUCTION FIX (watcher Permission denied): `git reset --hard` rewrites the
+  # tree with git's tracked mode 100644, wiping the exec bit the watcher's
+  # systemd ExecStart depends on. Restore it immediately after every reset —
+  # this runs BEFORE install_auto_update_watcher re-arms the timer.
+  chmod 755 "$DIR/scripts/watch-and-deploy.sh" "$DIR/scripts/deploy-oracle-vps.sh" 2>/dev/null || true
   ok "code updated to $(git -C "$DIR" rev-parse --short HEAD)"
   deployed_commit="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || echo "")"
 

@@ -860,10 +860,19 @@ function PaymentDialog({
     if (isChargilyMethod) {
       setSubmitting(true);
       // 0.6.81 — gateway method + plan + period chosen in the UI.
+      // PRODUCTION FIX (tx-log amount consistency): the top-level `amount`
+      // MUST be the price the payer is actually charged for the SELECTED
+      // period (base × period × discount, or the server proration quote when
+      // upgrade credit applies) — the old code logged the plan's MONTHLY base
+      // price (5000 DA) even for a 24-month checkout (96000 DA), so the UI
+      // events disagreed with checkout_created/settle_paid on the same
+      // transaction and the funnel showed impossible amounts.
+      const uiChargeAmount = quote?.credit?.eligible ? quote.chargeAmount : totalPrice;
       logTx('purchase_ui_interact', `Subscription ${selectedPlan.name} — instant payment via ${paymentMethod} selected (${period}m period)`, {
         txType: 'subscription',
         plan: selectedPlan.name,
-        amount: selectedPlan.price,
+        amount: uiChargeAmount,
+        basePrice: selectedPlan.price,
         period,
         method: paymentMethod,
         ...(user?.agencyId ? { agencyId: user.agencyId } : {}),
@@ -936,10 +945,15 @@ function PaymentDialog({
     setSubmitting(true);
     // 0.6.81 — manual receipt path chosen. The server logs manual_submit
     // when POST /agency/subscription/pay lands; this marks the UI decision.
+    // PRODUCTION FIX (tx-log amount consistency): same rule as the gateway
+    // path — top-level amount is the effective charged price for the selected
+    // period, not the plan's monthly base price.
+    const manualUiChargeAmount = quote?.credit?.eligible ? quote.chargeAmount : totalPrice;
     logTx('purchase_ui_interact', `Subscription ${selectedPlan.name} — manual receipt path selected (${paymentMethod}, ${period}m period)`, {
       txType: 'subscription',
       plan: selectedPlan.name,
-      amount: selectedPlan.price,
+      amount: manualUiChargeAmount,
+      basePrice: selectedPlan.price,
       period,
       method: 'MANUAL',
       ...(user?.agencyId ? { agencyId: user.agencyId } : {}),

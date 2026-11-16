@@ -57,6 +57,13 @@ app.post('/', async (c) => {
       isValid = await verifyWebhookSignature(rawBody, signature)
     } catch (err) {
       console.error('[payment-webhook] Signature verification error:', err)
+      appendTxEvent({
+        stage: 'webhook_rejected',
+        message: 'Chargily webhook rejected — signature verification threw',
+        level: 'warn',
+        data: { error: err instanceof Error ? err.message.slice(0, 300) : String(err).slice(0, 300) },
+        identity: { role: 'SERVER' },
+      })
       return c.json({ success: false, error: 'Signature verification failed' }, 500)
     }
 
@@ -100,31 +107,66 @@ app.post('/', async (c) => {
     })
 
     // Process based on event type — shared idempotent fulfillment.
+    // PRODUCTION FIX (tx-stream error-path coverage): a throw INSIDE the
+    // fulfillment (the db.$transaction settlement blocks) propagated straight
+    // to the outer catch — a crash mid-settlement was completely invisible in
+    // the transaction stream (no settle_failed, no webhook event at all after
+    // webhook_received). Both fulfill legs are now guarded: the exception is
+    // recorded as settle_failed with the error message, and the webhook still
+    // returns 500 so Chargily retries the delivery (same as before).
     if (type === 'checkout.paid') {
-      const result = await fulfillCheckoutPaid(
-        {
-          id: data.id,
-          status: data.status,
-          amount: data.amount,
-          payment_method: data.payment_method,
-          metadata: data.metadata,
-        },
-        'webhook',
-      )
+      let result: Awaited<ReturnType<typeof fulfillCheckoutPaid>>
+      try {
+        result = await fulfillCheckoutPaid(
+          {
+            id: data.id,
+            status: data.status,
+            amount: data.amount,
+            payment_method: data.payment_method,
+            metadata: data.metadata,
+          },
+          'webhook',
+        )
+      } catch (fulfillErr) {
+        console.error('[payment-webhook] fulfillCheckoutPaid threw:', fulfillErr)
+        appendTxEvent({
+          stage: 'settle_failed',
+          message: `Settlement CRASHED while fulfilling checkout.paid — ${fulfillErr instanceof Error ? fulfillErr.message : String(fulfillErr)}`,
+          level: 'error',
+          checkoutId: data.id,
+          identity: { role: 'SERVER' },
+          data: { source: 'webhook', eventType: type, error: fulfillErr instanceof Error ? fulfillErr.message.slice(0, 300) : String(fulfillErr).slice(0, 300) },
+        })
+        throw fulfillErr
+      }
       if (!result.handled) {
         console.warn(`[payment-webhook] No local records for checkout ${data.id} (ignored)`)
       }
     } else if (type === 'checkout.failed') {
-      const result = await fulfillCheckoutFailed(
-        {
-          id: data.id,
-          status: data.status,
-          amount: data.amount,
-          payment_method: data.payment_method,
-          metadata: data.metadata,
-        },
-        'webhook',
-      )
+      let result: Awaited<ReturnType<typeof fulfillCheckoutFailed>>
+      try {
+        result = await fulfillCheckoutFailed(
+          {
+            id: data.id,
+            status: data.status,
+            amount: data.amount,
+            payment_method: data.payment_method,
+            metadata: data.metadata,
+          },
+          'webhook',
+        )
+      } catch (fulfillErr) {
+        console.error('[payment-webhook] fulfillCheckoutFailed threw:', fulfillErr)
+        appendTxEvent({
+          stage: 'settle_failed',
+          message: `Settlement CRASHED while fulfilling checkout.failed — ${fulfillErr instanceof Error ? fulfillErr.message : String(fulfillErr)}`,
+          level: 'error',
+          checkoutId: data.id,
+          identity: { role: 'SERVER' },
+          data: { source: 'webhook', eventType: type, error: fulfillErr instanceof Error ? fulfillErr.message.slice(0, 300) : String(fulfillErr).slice(0, 300) },
+        })
+        throw fulfillErr
+      }
       if (!result.handled) {
         console.warn(`[payment-webhook] No local records for checkout ${data.id} (ignored)`)
       }

@@ -209,7 +209,14 @@ function handleAuthExpired(): void {
       if (!sessionRestored) {
         console.log(`[Auth] session restore failed → clearing Zustand state (genuine auth expiry)`);
         diag('auth-expired', { outcome: 'state-cleared' });
-        store.setState({
+        // CRITICAL FIX (production crash `i.setState is not a function`):
+        // `store` here is useAppStore.getState() — a STATE SNAPSHOT. Zustand
+        // state objects have no setState member, so calling store.setState
+        // threw TypeError on every genuine auth expiry, aborting the whole
+        // recovery chain as an unhandled rejection. setState lives on the
+        // STORE HOOK, not on the snapshot — use useAppStore.setState directly
+        // (same pattern as the revoked-clear path above).
+        useAppStore.setState({
           user: null,
           isAuthenticated: false,
           sessionToken: '',
@@ -298,6 +305,21 @@ export async function fetchWithRetry(
 
       // Don't retry other client errors (4xx) except 429
       if (res.status < 500 && res.status !== 429) {
+        return res; // Return as-is so caller can handle
+      }
+
+      // 429 anti-amplification fix (production: HTTP 429 on POST /api/auth/register):
+      // rate-limited AUTH endpoints (register/login/verify) must NEVER be auto-retried —
+      // the server's 429 is a deliberate throttle, and every retry re-charges the
+      // same IP bucket (register 5/15min) turning 2 clicks into a 30-minute IP block.
+      // Surface the response to the caller (the form already maps it to a toast).
+      const isAuthRateLimited = res.status === 429 && (
+        url.includes('/api/auth/register') ||
+        url.includes('/api/auth/login') ||
+        url.includes('/api/auth/verify') ||
+        url.includes('/api/auth/refresh-session')
+      );
+      if (isAuthRateLimited) {
         return res; // Return as-is so caller can handle
       }
 

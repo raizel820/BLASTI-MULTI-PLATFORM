@@ -97,6 +97,19 @@ const LAN_PROBE_INTERVAL_MS = 30 * 1000; // Re-probe LAN every 30s
 const LAN_PROBE_TIMEOUT_MS = 2000; // 2s timeout for LAN server probe
 const LAN_SYNC_BASE_PATH = '/api/sync'; // Same path on desktop LAN server
 const LAN_UNSUPPORTED_COOLDOWN_MS = 5 * 60 * 1000; // Retry LAN sync 5 min after a 404
+// PRODUCTION-FIX cooldowns (2026-11 logs):
+//   • LAN 401 AUTH_TOKEN_MISMATCH — the desktop local API keeps its session
+//     in MEMORY ONLY, so every app update/API restart drops it; until the
+//     adopt/restore flow heals the renderer token, the old code re-hit the
+//     same 401 on every 2-min cycle forever ([SyncEngine] Sync failed:
+//     Invalid session token). Cool the LAN target down for this window;
+//     status probing continues and the session-adopt flow still heals.
+//   • Cloud 400 "agencyId is required for SUPER_ADMIN pull" — a stale
+//     persisted role can slip past the role skip-guard; after the first 400,
+//     block cloud pulls for this window instead of 400ing every cycle.
+//     Both clear on the next successful login (resumeAfterAuth).
+const LAN_AUTH_MISMATCH_COOLDOWN_MS = 5 * 60 * 1000;
+const CLOUD_AGENCY_SCOPE_COOLDOWN_MS = 10 * 60 * 1000;
 // Task 41 — hard budget for the inline LAN discovery on the sync path.
 // quickDiscover() includes a 254-IP subnet scan (1.5 s timeout per IP,
 // batches of 10 → up to ~40 s) which stalled EVERY sync cycle on devices
@@ -145,6 +158,15 @@ class SyncEngine {
   // "Sync failed: Not found". Status probing continues so we recover
   // automatically when the desktop app is updated/restarted.
   private lanSyncUnsupportedUntil: number = 0;
+
+  // PRODUCTION FIX — after a LAN AUTH_TOKEN_MISMATCH (local API restarted,
+  // memory-only session dropped), stop targeting the LAN server for this
+  // window so the stale renderer token cannot 401-spam every 2-min cycle.
+  private lanAuthMismatchUntil: number = 0;
+  // PRODUCTION FIX — after the cloud 400s a pull with "agencyId is required
+  // for SUPER_ADMIN pull", pause cloud pulls for this window (stale persisted
+  // role slipped past the skip-guard). Cleared on the next login.
+  private cloudAgencyScopeBlockedUntil: number = 0;
 
   // Task 33-E — explicit-rejection awareness. When the cloud rejects the
   // session (401/403), sync must NOT retry forever: in Electron we pause and
@@ -504,7 +526,11 @@ class SyncEngine {
    */
   private async getSyncBaseUrl(): Promise<{ baseUrl: string; target: 'lan' | 'cloud' }> {
     const lanUrl = await this.probeLanServer();
-    if (lanUrl && Date.now() >= this.lanSyncUnsupportedUntil) {
+    if (
+      lanUrl &&
+      Date.now() >= this.lanSyncUnsupportedUntil &&
+      Date.now() >= this.lanAuthMismatchUntil
+    ) {
       return { baseUrl: lanUrl, target: 'lan' };
     }
     // Cloud target: resolved by the shared cloud-URL helper — absolute
@@ -606,6 +632,16 @@ class SyncEngine {
           this.emit({ type: 'sync-complete', status: this.getStatus() });
           return;
         }
+      }
+      // PRODUCTION FIX — cooldown after a cloud "agencyId is required" 400:
+      // a stale persisted role (server sees SUPER_ADMIN, stored state does
+      // not) used to 400 every cycle. During the cooldown, skip cloud sync
+      // entirely; re-login clears the block via resumeAfterAuth.
+      if (target === 'cloud' && Date.now() < this.cloudAgencyScopeBlockedUntil) {
+        console.log('[SyncEngine] Cloud agency-scope cooldown active — skipping this cycle (re-login clears)');
+        diag('sync-skip', { why: 'cloud-agency-cooldown', target });
+        this.emit({ type: 'sync-complete', status: this.getStatus() });
+        return;
       }
 
       const lastPulledAt = this.getLastSyncTimestamp();
@@ -715,8 +751,22 @@ class SyncEngine {
           // 0.6.49 — remember whether this cycle actually landed rows, so the
           // success path can soft-stale the REST caches ONLY when the local
           // copy advanced (an empty pull must not churn every mounted view).
-          this.lastPullRowCount =
-            changes.created.length + changes.updated.length + changes.deleted.length;
+          // ROOT FIX (production: 287× "[SyncEngine] Sync failed: Cannot read
+          // properties of undefined (reading 'length')" on web/mobile/desktop):
+          // transformPullChanges returns a TABLE-KEYED map
+          // ({ agencies: {created,updated,deleted}, … }) — the old code read
+          // .created/.updated/.deleted DIRECTLY off the map, which is always
+          // undefined → .length threw on EVERY pull cycle (this single line
+          // made cloud sync fail permanently on every platform). Sum over the
+          // table buckets instead; each bucket is Array.isArray-guarded.
+          this.lastPullRowCount = Object.values(changes).reduce(
+            (total, bucket) =>
+              total +
+              (Array.isArray(bucket?.created) ? bucket.created.length : 0) +
+              (Array.isArray(bucket?.updated) ? bucket.updated.length : 0) +
+              (Array.isArray(bucket?.deleted) ? bucket.deleted.length : 0),
+            0
+          );
 
           console.log('[SyncEngine] Pull complete, timestamp:', timestamp);
           return {
@@ -844,9 +894,37 @@ class SyncEngine {
           retryAgainstCloud = true;
         }
       } else if (target === 'lan') {
-        // Any other LAN failure — clear the cache so the next cycle re-probes
-        console.log('[SyncEngine] LAN sync failed — will re-probe next cycle');
-        this._clearLanServer();
+        // PRODUCTION FIX — LAN 401/403 AUTH_TOKEN_MISMATCH: the local API
+        // restart (every app update) drops its memory-only session, and the
+        // stale renderer token then 401'd every 2-min cycle forever. Do NOT
+        // take the terminal revocation path (a mismatch is not a revocation);
+        // cool the LAN target down instead — the session-adopt/restore flow
+        // heals the token and status probing re-opens LAN afterwards.
+        if (
+          error instanceof SyncHttpError &&
+          (error.status === 401 || error.status === 403) &&
+          error.code === 'AUTH_TOKEN_MISMATCH'
+        ) {
+          this.lanAuthMismatchUntil = Date.now() + LAN_AUTH_MISMATCH_COOLDOWN_MS;
+          this._clearLanServer();
+          console.warn(`[SyncEngine] LAN session token mismatch (local API restarted?) — cooling LAN target down for ${LAN_AUTH_MISMATCH_COOLDOWN_MS / 1000}s; session-adopt heals the token`);
+          diag('sync-skip', { why: 'lan-auth-mismatch-cooldown', target, status: error.status });
+        } else {
+          // Any other LAN failure — clear the cache so the next cycle re-probes
+          console.log('[SyncEngine] LAN sync failed — will re-probe next cycle');
+          this._clearLanServer();
+        }
+      } else if (
+        target === 'cloud' &&
+        error instanceof SyncHttpError &&
+        error.status === 400 &&
+        error.message.includes('agencyId is required')
+      ) {
+        // PRODUCTION FIX — first cloud "agencyId is required" 400 arms the
+        // cooldown so a stale/agency-less session stops 400ing every cycle.
+        this.cloudAgencyScopeBlockedUntil = Date.now() + CLOUD_AGENCY_SCOPE_COOLDOWN_MS;
+        console.warn(`[SyncEngine] Cloud pull requires an agency scope — pausing cloud pulls for ${CLOUD_AGENCY_SCOPE_COOLDOWN_MS / 1000}s (re-login clears)`);
+        diag('sync-skip', { why: 'cloud-agency-cooldown-armed', target });
       }
 
       this.emit({ type: 'sync-error', status: this.getStatus(), error: message });
@@ -872,6 +950,10 @@ class SyncEngine {
    */
   resumeAfterAuth(): void {
     this.revokedSession = false;
+    // PRODUCTION FIX — a fresh login restores agency context and the session
+    // chain, so any armed cooldowns are obsolete.
+    this.cloudAgencyScopeBlockedUntil = 0;
+    this.lanAuthMismatchUntil = 0;
     if (!isBrowser || !this.lastDatabase) return;
     // Cycle chain still running (e.g. pause never happened) — nothing to do
     // (also avoids duplicating the online/offline listeners startPeriodicSync owns).

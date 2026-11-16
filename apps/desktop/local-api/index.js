@@ -3146,6 +3146,14 @@ function createApp() {
         // the role×platform matrix at verify time AND when it picks the
         // welcome-email variant — without it a desktop signup looked 'web'.
         // The fetch itself retries transient network failures transparently.
+        // PRODUCTION FIX (429 amplification): register is charged at the
+        // cloud BEFORE validation (10/min) AND after validation (5/15min).
+        // The old attempts:2 meant one SLOW click (renderer timeout → proxy
+        // timeout retry) could burn up to 4 upstream POSTs — two slow clicks
+        // emptied the whole 15-minute bucket and real users got HTTP 429.
+        // Boot-time warmCloudConnection() already covers the cold-connection
+        // case this retry existed for, so OTP-dispatching auth POSTs now
+        // send exactly ONE upstream attempt per renderer attempt.
         const res = await cloudFetchWithRetry('/api/auth/register', {
           method: 'POST',
           headers: {
@@ -3154,7 +3162,7 @@ function createApp() {
             'x-blasti-attest': buildDesktopAttestation(),
           },
           body: JSON.stringify(body),
-        }, { timeoutMs: 15000, attempts: 2 })
+        }, { timeoutMs: 15000, attempts: 1 })
         let data = null
         try { data = await res.json() } catch { /* non-JSON error body */ }
         reg = { ok: res.ok, status: res.status, data }
@@ -3289,6 +3297,8 @@ function createApp() {
         // 0.6.67 — desktop attestation + transparent retry (see the register
         // proxy): the verify response is where the cloud mints the session
         // (platform matrix + welcome-email variant both read the platform).
+        // PRODUCTION FIX: attempts:1 — same 429-amplification reasoning as
+        // register (verify dispatches OTP/SMS and is charged per attempt).
         const res = await cloudFetchWithRetry('/api/auth/verify', {
           method: 'POST',
           headers: {
@@ -3297,7 +3307,7 @@ function createApp() {
             'x-blasti-attest': buildDesktopAttestation(),
           },
           body: JSON.stringify(body),
-        }, { timeoutMs: 15000, attempts: 2 })
+        }, { timeoutMs: 15000, attempts: 1 })
         let data = null
         try { data = await res.json() } catch { /* non-JSON */ }
         cloud = { ok: res.ok, status: res.status, data }
@@ -4033,6 +4043,52 @@ function createApp() {
       let bodyBuffer = null
       if (method !== 'GET' && method !== 'HEAD') {
         try { bodyBuffer = Buffer.from(await c.req.arrayBuffer()) } catch { bodyBuffer = null }
+      }
+      // ── PRODUCTION FIX (desktop create-agency 400 INVALID_CATEGORY) ──────
+      // Custom agency categories are created LOCALLY (POST /api/agency-
+      // categories writes locally + queues an outbox replay to the cloud).
+      // The agency-create POST is forwarded VERBATIM to the cloud, whose
+      // dictionary may NOT contain the locally-created slug yet (replay
+      // pending, offline, or the cloud DB re-seeded) → 400 INVALID_CATEGORY
+      // from the cloud, surfaced as "[LAN 400] POST /api/agencies".
+      // FIX: when the body carries a NON-BUILT-IN category slug that exists
+      // in the LOCAL dictionary, inject `newCategoryName` (the local row's
+      // name). The cloud's createPendingCategory is idempotent by name —
+      // it REUSES the cloud category when the replay already landed and
+      // CREATES it when not, so the forward always succeeds.
+      if (
+        bodyBuffer &&
+        (method === 'POST' || method === 'PUT' || method === 'PATCH') &&
+        (reqUrl.pathname === '/api/agencies')
+      ) {
+        try {
+          const bodyObj = JSON.parse(bodyBuffer.toString('utf-8'))
+          const BUILTIN_CATEGORY_SLUGS = ['DOCTOR', 'CLINIC', 'LAW_FIRM', 'BARBER']
+          const catSlug = typeof bodyObj.category === 'string' ? bodyObj.category.trim() : ''
+          if (catSlug && !BUILTIN_CATEGORY_SLUGS.includes(catSlug.toUpperCase()) && !bodyObj.newCategoryName) {
+            let localCat = null
+            try {
+              localCat = await (db || localDb).agencyCategory.findFirst({
+                where: { slug: catSlug },
+                select: { slug: true, name: true, nameAr: true, nameFr: true },
+              })
+            } catch { /* local dictionary unavailable — forward as-is */ }
+            if (localCat) {
+              // Prefer the EN/FR base name (createPendingCategory normalizes
+              // and dedups case-insensitively; Arabic names normalize to the
+              // same key on the cloud too, so any stored name works).
+              const localName = localCat.name || localCat.nameFr || localCat.nameAr || ''
+              if (localName) {
+                bodyObj.newCategoryName = String(localName).slice(0, 60)
+                if (!bodyObj.category) bodyObj.category = catSlug
+                bodyBuffer = Buffer.from(JSON.stringify(bodyObj), 'utf-8')
+                console.log(`[LocalAPI] Agencies proxy: local-only custom category "${catSlug}" → injected newCategoryName "${localName}" so the cloud dictionary can adopt/create it`)
+              }
+            }
+          }
+        } catch (catFixErr) {
+          console.warn('[LocalAPI] Agencies proxy: category pre-flight skipped:', catFixErr?.message || catFixErr)
+        }
       }
       let res
       try {
@@ -12326,6 +12382,46 @@ async function startLocalApi(dbPath, port, options) {
   }
   await setupPragmas()
   console.log(`[LocalAPI] Prisma database initialized (local SQLite)`)
+
+  // ── PRODUCTION FIX: durable session restore at boot (AUTH_TOKEN_MISMATCH) ──
+  // The local API session lived in MEMORY ONLY (sessionToken/sessionUser
+  // module vars), so every app update / API restart dropped it. The renderer
+  // then presented its persisted token while the local API had none (or one
+  // re-created from a different surface) → 401 AUTH_TOKEN_MISMATCH storms
+  // from the dashboard, notifications and the sync engine right after every
+  // update, and users appeared logged out (authenticated=false in the
+  // diagnostic dumps). The durable remember-me file (blasti-auth.json) is
+  // written by cloud-sync:set-auth — restore the session from it HERE, at
+  // the earliest possible point, so the local API holds the SAME token the
+  // renderer will present before the first request can arrive. The loading
+  // screen's import-session (cloud validation + possible rotation adoption)
+  // still runs afterwards and simply ROTATES through the grace path now.
+  // Policy-preserving: no durable file (non remember-me logins) → nothing
+  // is restored, exactly like today.
+  try {
+    if (!sessionToken) {
+      let authPath = null
+      try {
+        const electron = require('electron')
+        authPath = require('path').join(
+          electron && electron.app && typeof electron.app.getPath === 'function'
+            ? electron.app.getPath('userData')
+            : (global.__blastiUserData || require('os').homedir() + '/.blasti'),
+          'blasti-auth.json',
+        )
+      } catch { authPath = null }
+      if (authPath && require('fs').existsSync(authPath)) {
+        const parsed = JSON.parse(require('fs').readFileSync(authPath, 'utf-8'))
+        if (parsed && typeof parsed.token === 'string' && parsed.token.length > 0 && parsed.user && typeof parsed.user === 'object') {
+          assignSession(parsed.token, parsed.user, 'boot:durable-auth-restore')
+          console.log('[LocalAPI] Session restored from durable auth file at boot (remember-me) — user:', parsed.user.username || parsed.user.id)
+          diagLog('SESSION boot-restored from blasti-auth.json (user=' + (parsed.user.username || parsed.user.id) + ')')
+        }
+      }
+    }
+  } catch (restoreErr) {
+    console.warn('[LocalAPI] Durable session restore skipped (non-fatal):', restoreErr && restoreErr.message)
+  }
 
   // ── R-21F: offline LAN authority boot (election / join / write-gate) ─────
   // Runs after the DB is ready (needs _sync_meta for term + device registry

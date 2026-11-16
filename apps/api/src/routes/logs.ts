@@ -846,7 +846,11 @@ app.get('/analysis/export', async (c) => {
   const rangeLabel = rangeHours ? range : from || to ? 'custom' : 'all'
 
   const limitRaw = Number(q('limit')) || 0
-  const limit = Math.max(1, Math.min(limitRaw || 5_000, EXPORT_RAW_LIMIT_MAX))
+  // PRODUCTION FIX (export truncation): the DEFAULT when the caller sends no
+  // limit was 5_000 — a 7-day export silently truncated ("Raw entries — 5000
+  // row(s) (TRUNCATED)") and diagnosticians never saw the rest of the week.
+  // Default now equals the hard cap (20_000); an explicit ?limit still wins.
+  const limit = Math.max(1, Math.min(limitRaw || EXPORT_RAW_LIMIT_MAX, EXPORT_RAW_LIMIT_MAX))
 
   const filters = {
     uid: q('uid') || undefined,

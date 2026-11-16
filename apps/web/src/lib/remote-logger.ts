@@ -94,6 +94,11 @@ export const TX_STAGES = [
   'verify_poll',
   'settle_push',
   'redirect_back',
+  // PRODUCTION FIX (error-path coverage): the failure legs of the funnel were
+  // invisible — poll/API errors during verification and a result view closed
+  // before settlement produced NO transaction events.
+  'verify_error',
+  'checkout_abandoned',
   'result_final',
 ] as const;
 export type TxStage = (typeof TX_STAGES)[number] | (string & {});
@@ -203,7 +208,51 @@ export function logError(tag: string, message: string, data?: unknown, trigger?:
  * @param data     - { txType, ref, checkoutId, status, amount, method, ...extras }
  * @param level    - info (default) | warn | error | debug
  */
+// PRODUCTION FIX (tx-stream dedup): production showed duplicate events for
+// one logical moment — SAME-MILLISECOND page_enter pairs, double
+// return_received/verify_poll for one checkout (the browser result tab AND
+// the app shell both mount PaymentResult for shell payments), and page_enter
+// re-firing on remount. Dedup key = stage + identity (checkoutId | ref |
+// txType), once per page context with a TTL. Re-loggable moments (a user-
+// initiated restartPolling, a genuinely NEW checkout) use fresh keys.
+const TX_DEDUP_TTL_MS = 10 * 60_000;
+const TX_DEDUP_MAX = 256;
+const txDedupMap = new Map<string, number>();
+
+function txDedupKey(stage: string, data?: Record<string, unknown>): string | null {
+  const identity =
+    (typeof data?.checkoutId === 'string' && data.checkoutId) ||
+    (typeof data?.ref === 'string' && data.ref) ||
+    (typeof data?.txType === 'string' && data.txType) ||
+    '';
+  if (!identity && stage !== 'page_enter') return null; // no stable identity — never suppress
+  return `${stage}:${identity || 'page'}`;
+}
+
+function isDuplicateTxEvent(key: string | null): boolean {
+  if (!key) return false;
+  const now = Date.now();
+  const seen = txDedupMap.get(key);
+  if (seen !== undefined && now - seen < TX_DEDUP_TTL_MS) return true;
+  if (txDedupMap.size >= TX_DEDUP_MAX) {
+    // evict expired keys first, then the oldest entries
+    for (const [k, at] of txDedupMap) {
+      if (now - at >= TX_DEDUP_TTL_MS) txDedupMap.delete(k);
+    }
+    while (txDedupMap.size >= TX_DEDUP_MAX) {
+      const oldest = txDedupMap.keys().next().value;
+      if (oldest === undefined) break;
+      txDedupMap.delete(oldest);
+    }
+  }
+  txDedupMap.set(key, now);
+  return false;
+}
+
 export function logTx(stage: TxStage, message: string, data?: Record<string, unknown>, level: LogEntry['level'] = 'info'): void {
+  // Dedup BEFORE buffering — a suppressed duplicate must not consume buffer
+  // slots or urgent-flush bandwidth.
+  if (isDuplicateTxEvent(txDedupKey(stage, data))) return;
   if (buffer.length >= MAX_BUFFER) buffer = buffer.slice(-MAX_BUFFER + 1);
   // The stage RIDES INSIDE `data` — the server ingest mirror lifts it (with
   // txType/ref/checkoutId/status/amount/method) to top-level stream fields.

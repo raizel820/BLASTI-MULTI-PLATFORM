@@ -556,9 +556,22 @@ async function fetchPaginated(
 ): Promise<{ records: any[]; nextCursor?: string; hasMore: boolean; total?: number }> {
   const [allRecords, total] = await Promise.all([findManyFn(), countFn()])
 
-  const hasMore = allRecords.length > pageSize
+  let hasMore = allRecords.length > pageSize
   const records = hasMore ? allRecords.slice(0, pageSize) : allRecords
-  const nextCursor = hasMore && records.length > 0 ? makeStageCursor(records[records.length - 1], timeField) : undefined
+
+  // PRODUCTION FIX (the /api/sync/initial-data storm): makeStageCursor returns
+  // undefined when a page-boundary record lacks its sort field — the old code
+  // then answered `hasMore:true, nextCursor:undefined`, and the desktop
+  // initializer re-requested the IDENTICAL page at raw HTTP speed forever.
+  // CONTRACT: hasMore:true ⇒ a usable nextCursor MUST be present. When the
+  // boundary cursor cannot be built, close the page instead (the next init
+  // run re-pulls from the stage start — data safety over hot loops).
+  let nextCursor = hasMore && records.length > 0 ? makeStageCursor(records[records.length - 1], timeField) : undefined
+  if (hasMore && !nextCursor) {
+    console.warn(`[initial-sync] page boundary record missing ${timeField} — closing the page (hasMore=false) instead of emitting an unpaginated hasMore:true`)
+    hasMore = false
+    nextCursor = undefined
+  }
 
   return { records, nextCursor, hasMore, total }
 }

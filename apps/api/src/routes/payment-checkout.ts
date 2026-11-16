@@ -163,8 +163,11 @@ function buildReturnUrls(baseUrl: string, deepLink?: string, ref?: string): { su
 // ─── POST /create-checkout — Create a Chargily checkout session ───────
 
 app.post('/create-checkout', async (c) => {
+  // PRODUCTION FIX: hoisted so the outer catch can attribute checkout_failed
+  // events to the authenticated user (when auth already succeeded).
+  let user: Awaited<ReturnType<typeof requireAuth>> | null = null
   try {
-    const user = await requireAuth(c)
+    user = await requireAuth(c)
     const body = await c.req.json()
     const validation = validateBody(createCheckoutSchema, body)
 
@@ -730,9 +733,32 @@ app.post('/create-checkout', async (c) => {
       },
     })
   } catch (error: unknown) {
+    // ── PRODUCTION FIX (tx-stream error-path coverage) ──────────────────────
+    // Every failure that escapes the per-type inner branches used to leave NO
+    // trace in the transaction stream: gateway unconfigured (503), auth
+    // rejection (401/403), gateway API rejection (502) and generic 500s — a
+    // payer's failed attempt was invisible in the Transactions tab. Each exit
+    // below now emits checkout_failed (appendTxEvent never throws; the
+    // emission itself is additionally guarded so logging can never break the
+    // HTTP response).
+    const emitOuterCheckoutFailed = (httpStatus: number, code: string, extra?: Record<string, unknown>) => {
+      try {
+        appendTxEvent({
+          stage: 'checkout_failed',
+          message: `Checkout attempt failed (${code}, HTTP ${httpStatus})`,
+          level: 'warn' as const,
+          data: { phase: 'outer-catch', httpStatus, code, ...(extra ?? {}) },
+          ...(user
+            ? { identity: { userId: user.id, username: user.username, role: user.role, agencyId: user.agencyId } }
+            : {}),
+          origin: 'server' as const,
+        })
+      } catch { /* never block the response on logging */ }
+    }
     // Surface the chargily-not-configured and Chargily API errors usefully.
     const err = error as { status?: number; message?: string }
     if (err?.message === 'chargily_not_configured') {
+      emitOuterCheckoutFailed(503, 'chargily_not_configured')
       return c.json(
         {
           success: false,
@@ -744,12 +770,14 @@ app.post('/create-checkout', async (c) => {
     }
     const authErr = authErrorResponse(error)
     if (authErr.status === 401 || authErr.status === 403) {
+      emitOuterCheckoutFailed(authErr.status as number, 'auth-rejected')
       return c.json({ success: false, error: authErr.error }, authErr.status as 400)
     }
     if (error instanceof Error && error.message.startsWith('Chargily API error')) {
       console.error('[payment-checkout] Chargily API rejected the checkout:', error.message)
       const statusMatch = error.message.match(/Chargily API error: (\d+)/)
       const gatewayStatus = statusMatch?.[1] ?? ''
+      emitOuterCheckoutFailed(502, 'gateway-rejected', gatewayStatus ? { gatewayStatus } : undefined)
       // Status-aware message: 401/403 = key problem, 422 = payload problem,
       // 5xx = gateway outage. `details` carries the RAW gateway answer so
       // the exact reason is always visible (admin UI + client toasts).
@@ -770,6 +798,7 @@ app.post('/create-checkout', async (c) => {
       )
     }
     console.error('[payment-checkout] Error creating checkout:', error)
+    emitOuterCheckoutFailed(500, error instanceof Error ? 'internal-error' : 'unknown')
     return c.json({ success: false, error: 'Failed to create checkout session' }, 500)
   }
 })
