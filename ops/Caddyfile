@@ -22,28 +22,30 @@
 # socket and the REST API share the same public origin as the web
 # app — no CORS headaches, native shells always allowed by the API.
 #
-# 0.6.79 FIX — the SPEED ROUND 2 exclusion of app binaries used
-# `encode { match { not path_regexp … } }`, but encode's match block is
-# a RESPONSE matcher and only accepts `status` / `header` — a request
-# `path_regexp` there fails `caddy validate` and blocked every deploy
-# at the Caddy step. The exclusion is now done the valid way: a
-# download-only `handle` declared BEFORE the site-wide `encode` inside
-# an explicit `route` block (written order is honored inside route),
-# so binary responses never enter the encode middleware.
+# 0.6.80 FIX — the 0.6.79 route/handle restructure put TWO path tokens on
+# the handle line (`handle /a /b {`), but a Caddyfile directive accepts only
+# ONE matcher token: caddy aborted with "wrong argument count or unexpected
+# line ending" and every VPS deploy kept dying at `caddy validate`. Multiple
+# paths must live in a NAMED matcher (`@name path /a /b`), which the handle
+# then references with its single matcher token. The named matcher is
+# declared inside the site block (request matchers may not be defined
+# globally) and referenced from the route block below.
 # ════════════════════════════════════════════════════════════════
 
 {$SITE_ADDRESS} {
+        # SPEED ROUND 2 — binary downloads bypass compression. Installers +
+        # delta patches are pre-compressed opaque octet-streams; gzip/zstd on
+        # the fly only burns VPS CPU per streamed byte and can cap throughput
+        # below the client's line rate. This handle is evaluated FIRST inside
+        # the route (handle blocks are mutually exclusive, first match wins),
+        # so download responses stream raw byte-for-byte. `*` matches ONE
+        # segment — the delta route has an extra `/delta/<id>/` hop, hence
+        # the second pattern.
+        @binaryDownloads path /api/app-versions/*/download /api/app-versions/delta/*/download
+
         route {
                 # ── Binary downloads bypass compression (SPEED ROUND 2) ──
-                # Installers + delta patches are pre-compressed opaque
-                # octet-streams; gzip/zstd on the fly only burns VPS CPU per
-                # streamed byte and can cap throughput below the client's
-                # line rate. This handle is evaluated FIRST inside the route
-                # (handle blocks are mutually exclusive, first match wins),
-                # so download responses stream raw byte-for-byte.
-                # `*` matches ONE segment — the delta route has an extra
-                # `/delta/<id>/` hop, hence the second pattern.
-                handle /api/app-versions/*/download /api/app-versions/delta/*/download {
+                handle @binaryDownloads {
                         reverse_proxy api:3003 {
                                 flush_interval -1
                         }

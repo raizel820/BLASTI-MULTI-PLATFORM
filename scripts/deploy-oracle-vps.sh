@@ -289,8 +289,14 @@ render_caddyfile() { # repo template → /etc/caddy/Caddyfile with localhost ups
   case "$domain" in
     '' | www.*) : ;;   # :80 / raw-IP site, or the domain already IS a www host
     *)
-      log "www alias: www.$domain -> https://$domain (own auto-TLS cert + 308 redirect)"
-      cat >> /etc/caddy/Caddyfile <<EOF
+      dom_esc="$(printf '%s' "$domain" | sed 's/\./\\./g')"
+      if grep -q "www\.${dom_esc}" /etc/caddy/Caddyfile; then
+        : # www is already a serving door inside the SITE_ADDRESS list — a
+          # second site block for the same host would make the whole
+          # config invalid (same guard as the raw-IP block below)
+      else
+        log "www alias: www.$domain -> https://$domain (own auto-TLS cert + 308 redirect)"
+        cat >> /etc/caddy/Caddyfile <<EOF
 
 # www -> apex canonical redirect (appended by deploy-oracle-vps.sh).
 # Caddy obtains and renews a separate certificate for www.${domain}.
@@ -298,6 +304,7 @@ www.${domain} {
         redir https://${domain}{uri} 308
 }
 EOF
+      fi
     ;;
   esac
 
@@ -765,8 +772,10 @@ EOF
   # -- 15. Caddy gateway ------------------------------------------------------------
   log "Configuring Caddy ($SITE)..."
   render_caddyfile "$DIR" "$SITE"
-  caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
-    || die "generated Caddyfile is invalid — inspect /etc/caddy/Caddyfile"
+  if ! caddy_out="$(caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)"; then
+    printf '%s\n' "$caddy_out" | grep -v '"level":"info"' | tail -15 >&2 || true
+    die "generated Caddyfile is invalid — inspect /etc/caddy/Caddyfile (caddy error printed above)"
+  fi
   systemctl enable --now caddy >/dev/null 2>&1 || true
   systemctl restart caddy
   ok "Caddy running on 80/443"
@@ -891,8 +900,10 @@ cmd_update() {
   esac
 
   render_caddyfile "$DIR" "$SITE"
-  caddy validate --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
-    || die "generated Caddyfile is invalid — inspect /etc/caddy/Caddyfile"
+  if ! caddy_out="$(caddy validate --adapter caddyfile --config /etc/caddy/Caddyfile 2>&1)"; then
+    printf '%s\n' "$caddy_out" | grep -v '"level":"info"' | tail -15 >&2 || true
+    die "generated Caddyfile is invalid — inspect /etc/caddy/Caddyfile (caddy error printed above)"
+  fi
   systemctl restart blasti-api.service blasti-web.service caddy
   ok "services restarted (api, web, caddy)"
 
