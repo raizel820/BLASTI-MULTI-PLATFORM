@@ -1376,8 +1376,31 @@ function createWindow() {
   }
 
   // Open external links in system browser (not in Electron window)
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+  // ── 0.6.84 — EXTERNAL-OPEN DEDUPE (the "two identical gateway tabs" bug) ──
+  // The payment flow called window.open(hostedGatewayUrl): the handler below
+  // DENIED it and sent the URL to the system browser — and because a denied
+  // window.open returns null, the renderer's popup-blocked fallback fired
+  // window.location.href = sameUrl, which triggered will-navigate below →
+  // shell.openExternal AGAIN. Result: ONE checkout, TWO identical gateway
+  // tabs (the "two overlapping gateway pages" report). Both handlers now
+  // share one 5-second dedupe window per URL.
+  const recentExternalOpens = new Map();
+  const openExternalOnce = (url) => {
+    try {
+      const now = Date.now();
+      if (now - (recentExternalOpens.get(url) || 0) < 5000) return;
+      recentExternalOpens.set(url, now);
+      if (recentExternalOpens.size > 40) {
+        for (const [k, v] of recentExternalOpens) {
+          if (now - v >= 5000) recentExternalOpens.delete(k);
+        }
+      }
+    } catch { /* dedupe is best-effort */ }
     shell.openExternal(url);
+  };
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    openExternalOnce(url);
     return { action: 'deny' };
   });
 
@@ -1415,7 +1438,7 @@ function createWindow() {
 
     // Block everything else
     event.preventDefault();
-    shell.openExternal(url);
+    openExternalOnce(url);
   });
 
   // ── Window Close → QUIT the app (Task 2-b, sub-task 5) ──────────────────
@@ -3303,7 +3326,60 @@ ipcMain.handle('updates:install-delta', async (_e, payload) => {
     updateLog('DELTA', 'rejected — renderer sent an empty hop chain', { targetVersion: target.version || 'unknown' });
     return { ok: false, error: 'no-hops' };
   }
-  const fsDelta = require('@blasti/binary-delta');
+  // 0.6.85 — RESILIENT DELTA-LIB RESOLUTION (delta-updates root fix).
+  // The library used to be loaded with a bare require('@blasti/binary-delta')
+  // OUTSIDE this try block. That specifier is a bun WORKSPACE SYMLINK
+  // (node_modules/@blasti/binary-delta → ../../../../packages/binary-delta)
+  // which electron-builder cannot follow — the exact Task-55 Prisma failure
+  // class. In every PACKAGED app the module was missing, so this require
+  // threw MODULE_NOT_FOUND (ENOENT inside app.asar), the handler REJECTED,
+  // and — because the renderer had no catch around the Electron bridge call —
+  // the whole update attempt aborted with NO full-installer fallback. Deltas
+  // were dead in production AND the fallback was dead with them.
+  //
+  // Resolution order (first hit wins), all inside the handler's try so any
+  // residual failure degrades to {ok:false} + full-installer fallback:
+  //   1. './vendor/binary-delta'  — REAL file vendored into the asar by
+  //      prebuild.js (Step 4) + allow-listed in electron-builder.yml
+  //      (files: vendor/**/*). Deterministic in dev AND packaged.
+  //   2. '@blasti/binary-delta'   — bun workspace link (dev checkouts).
+  //   3. <resources>/node_modules/@blasti/binary-delta — after-pack.js
+  //      copies the dereferenced package there (mirrors the Prisma client
+  //      layout); <resources>/node_modules is on the module path of anything
+  //      loaded from app.asar (parent-of-asar resolution).
+  let fsDelta = null;
+  let fsDeltaSource = '';
+  const libAttempt = (fn, label, collector) => {
+    try {
+      const lib = fn();
+      if (lib && typeof lib.parseReleasePatch === 'function' && typeof lib.applyDeltaToFile === 'function' && typeof lib.applyTreePatch === 'function') {
+        return { lib, label };
+      }
+      collector.push(`${label}: resolved but missing the delta API surface`);
+    } catch (err) {
+      collector.push(`${label}: ${(err && err.message) || err}`);
+    }
+    return null;
+  };
+  {
+    const libErrors = [];
+    const hit = libAttempt(() => require('./vendor/binary-delta'), 'vendor/binary-delta.js', libErrors)
+      || libAttempt(() => require('@blasti/binary-delta'), "@blasti/binary-delta (workspace)", libErrors)
+      || libAttempt(() => {
+        const res = process.resourcesPath || path.join(path.dirname(process.execPath), 'resources');
+        return require(path.join(res, 'node_modules', '@blasti', 'binary-delta'));
+      }, '<resources>/node_modules/@blasti/binary-delta', libErrors);
+    if (!hit) {
+      updateLog('DELTA', 'delta library NOT LOADABLE — falling back to full installer', {
+        targetVersion: target.version || 'unknown',
+        attempts: libErrors,
+      });
+      pushUpdateFailureToCloud('DELTA', 'delta library not loadable in the packaged app', { attempts: libErrors });
+      return { ok: false, error: `delta-lib-missing (${libErrors.join(' | ')})` };
+    }
+    fsDelta = hit.lib;
+    fsDeltaSource = hit.label;
+  }
   const resourcesPath = process.resourcesPath || path.join(path.dirname(process.execPath), 'resources');
   const asarPath = path.join(resourcesPath, 'app.asar');
   const unpackedTree = path.join(resourcesPath, 'app.asar.unpacked');
@@ -3316,6 +3392,7 @@ ipcMain.handle('updates:install-delta', async (_e, payload) => {
     chain: hops.map((h) => `${h.fromVersion}→${h.toVersion}@${h.size}B`).join(' + '),
     chainBytes: hops.reduce((s, h) => s + (h.size || 0), 0),
     anchor: String(hops[0].fromArtifactHash || '').slice(0, 12) || 'none',
+    libSource: fsDeltaSource,
   });
   try {
     if (!fs.existsSync(asarPath)) {
@@ -3724,10 +3801,134 @@ ipcMain.handle('get-printers', async () => {
 //
 // IPC: 'invoice:save-pdf' — payload { html: string, suggestedName: string }
 //
-// The web app renders the A4 invoice HTML on-device (invoice-html.ts) and
-// hands the FULL standalone document here. The main process generates a real
-// .pdf file with Chromium's native printToPDF engine (A4, background colors,
-// print headers/footers off) and saves it through the system save dialog.
+// ─── 0.6.84 — In-app Chargily payment window ───────────────────────────────
+// The hosted gateway used to open in the SYSTEM browser (shell.openExternal):
+// after paying, the gateway's "return to store" button landed on the cloud
+// result page IN THE BROWSER and the payer had to find their way back to the
+// desktop app manually ("both gateway tabs lead to the web app instead of the
+// desktop app"). This dedicated window keeps the ENTIRE payment inside
+// BLASTI: gateway hosted page → cloud result route (detected here) → the
+// result query is forwarded to the MAIN window as the STANDARD blasti://
+// deep link (same buffered preload consumer as OS-level deep links) → the
+// SPA mounts the in-app payment-result view and settles via settle_push /
+// verify_poll. Navigation is allowlisted to the gateway + the cloud origin;
+// anything else is handed to the system browser.
+let paymentWindow = null;
+
+function closePaymentWindow() {
+  try {
+    if (paymentWindow && !paymentWindow.isDestroyed()) paymentWindow.close();
+  } catch { /* ignore */ }
+  paymentWindow = null;
+}
+
+ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
+  try {
+    if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+      return { ok: false, error: 'Invalid payment URL' };
+    }
+    let cloudOrigin = 'https://blastidz.online';
+    try {
+      cloudOrigin = new URL(PROD_URL || process.env.NEXTAUTH_URL || cloudOrigin).origin;
+    } catch { /* keep default */ }
+
+    // One payment at a time — a new checkout replaces the previous window.
+    closePaymentWindow();
+
+    paymentWindow = new BrowserWindow({
+      width: 520,
+      height: 760,
+      minWidth: 420,
+      minHeight: 560,
+      show: false,
+      title: 'BLASTI — Payment',
+      autoHideMenuBar: true,
+      parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
+      modal: false,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        javascript: true, // the hosted gateway page needs its own JS
+      },
+    });
+    paymentWindow.setMenuBarVisibility(false);
+
+    // Result detection — fires for full navigations AND in-page (hash) ones.
+    const finishWithResult = (deepUrl) => {
+      try {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('deep-link', deepUrl);
+          // If the app was minimized while paying, bring it back to front.
+          if (mainWindow.isMinimized()) mainWindow.restore();
+          mainWindow.focus();
+        }
+      } catch { /* best-effort — the poll fallback still settles */ }
+      closePaymentWindow();
+    };
+
+    const inspectNavigation = (u) => {
+      try {
+        if (!u || typeof u !== 'string') return;
+        // The SPA's own blasti:// bounce inside this window is ALSO a result
+        // signal (the hosted page returned and the result view fired it).
+        if (u.toLowerCase().startsWith('blasti://')) {
+          finishWithResult(u);
+          return;
+        }
+        const target = new URL(u);
+        const isGateway = /^https:\/\/([a-z0-9-]+\.)+chargily\.(net|com)([/:?#]|$)/i.test(u);
+        const isCloud = target.origin === cloudOrigin;
+        if (!isGateway && !isCloud) {
+          // Unexpected target — hand it to the system browser, stay here.
+          shell.openExternal(u);
+          return;
+        }
+        if (isCloud && (target.hash || '').startsWith('#/payment/result')) {
+          // The gateway returned to the cloud result route. Rebuild the SAME
+          // deep link the hosted flow would have issued and route the main
+          // window's SPA to the in-app payment result (query rides along —
+          // PaymentResult.readReturnQuery picks it up from the stash).
+          const qIndex = (target.hash || '').indexOf('?');
+          const query = qIndex >= 0 ? target.hash.slice(qIndex + 1) : '';
+          finishWithResult('blasti://payment/result' + (query ? '?' + query : ''));
+        }
+      } catch { /* ignore malformed URLs */ }
+    };
+
+    paymentWindow.webContents.on('did-navigate', (_e, u) => inspectNavigation(u));
+    paymentWindow.webContents.on('did-navigate-in-page', (_e, u) => inspectNavigation(u));
+    paymentWindow.webContents.on('will-navigate', (event, u) => {
+      // Block protocol/foreign navigations INSIDE this window outright —
+      // the inspectors above have already handled the result signals.
+      try {
+        if (u && u.toLowerCase().startsWith('blasti://')) event.preventDefault();
+      } catch { /* ignore */ }
+    });
+    paymentWindow.webContents.setWindowOpenHandler(({ url: childUrl }) => {
+      // Popups from the hosted page go to the system browser, never replace
+      // the payment window.
+      try { shell.openExternal(childUrl); } catch { /* ignore */ }
+      return { action: 'deny' };
+    });
+    paymentWindow.once('ready-to-show', () => {
+      try { if (paymentWindow && !paymentWindow.isDestroyed()) paymentWindow.show(); } catch { /* ignore */ }
+    });
+    paymentWindow.on('closed', () => { paymentWindow = null; });
+
+    await paymentWindow.loadURL(url);
+    return { ok: true };
+  } catch (err) {
+    console.error('[BLASTI Desktop] Payment window failed:', err && err.message);
+    closePaymentWindow();
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+});
+
+// ─── Invoice PDF (printToPDF, fully on-device) ─────────────────────────────
+// ipcMain.handle('invoice:save-pdf', …) — renders the standalone invoice HTML
+// in a hidden window (print headers/footers off) and saves it through the
+// system save dialog.
 // Nothing is generated or stored server-side — billing documents are always
 // produced locally on the user's machine.
 ipcMain.handle('invoice:save-pdf', async (_event, { html, suggestedName } = {}) => {

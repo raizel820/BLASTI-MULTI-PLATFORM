@@ -270,11 +270,38 @@ export async function startChargilyCheckout(
 /**
  * Open the hosted Chargily checkout page.
  *
+ * 0.6.84 — Electron desktop: the checkout now opens in a DEDICATED in-app
+ * payment window (electronAPI.openPaymentWindow). The main process watches
+ * its navigation and, when the gateway returns to the cloud result route,
+ * closes it and forwards the blasti:// deep link to the MAIN window — the
+ * whole round-trip stays inside BLASTI and the payer never lands on the web
+ * app in the system browser. Fallback (old shell without the bridge, or the
+ * bridge reports failure): the historic system-browser flow.
+ *
  * Regular web: a new tab (keeps the SPA alive so returning is instant).
  * Popup-blocked / embedded shells: full navigation fallback.
  */
 export function openCheckoutUrl(url: string): void {
   if (!url || !/^https?:\/\//i.test(url)) return;
+  try {
+    const bridge = (window as unknown as {
+      electronAPI?: { openPaymentWindow?: (u: string) => Promise<{ ok?: boolean }> };
+    }).electronAPI;
+    if (typeof bridge?.openPaymentWindow === 'function') {
+      bridge.openPaymentWindow(url).then((r) => {
+        if (!r || r.ok !== true) {
+          // Old/failed shell — historic external-browser flow (deduped at the
+          // main-process level since 0.6.84, so no duplicate tabs).
+          const win = window.open(url, '_blank', 'noopener,noreferrer');
+          if (!win) window.location.href = url;
+        }
+      }).catch(() => {
+        const win = window.open(url, '_blank', 'noopener,noreferrer');
+        if (!win) window.location.href = url;
+      });
+      return;
+    }
+  } catch { /* no electron bridge — browser/mobile flow below */ }
   const win = window.open(url, '_blank', 'noopener,noreferrer');
   if (!win) {
     // Popup blocked — navigate this tab instead (the SPA reloads on return).

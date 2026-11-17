@@ -9609,6 +9609,36 @@ function createApp() {
     }
   })
 
+  // GET /api/payment/subscription-quote — CLOUD-proxy (0.6.84). The agency
+  // payment dialog asks for the proration/discount quote BEFORE checkout.
+  // This route existed on the cloud but had NO local proxy, so on Electron
+  // the dialog's quote call 404'd (raw log 2026-11-17: GET
+  // /api/payment/subscription-quote → 404 "Not found") and the dialog fell
+  // back to its local estimate. Proxy it exactly like the other payment
+  // reads so the quote breakdown renders inside the desktop app too.
+  app.get('/api/payment/subscription-quote', authMiddleware, async (c) => {
+    try {
+      const query = c.req.url.includes('?') ? '?' + c.req.url.split('?')[1] : ''
+      let res
+      try {
+        res = await fetchCloudAuthHealed('/api/payment/subscription-quote' + query)
+      } catch (err) {
+        console.warn('[LocalAPI] subscription-quote proxy: cloud unreachable:', err?.message || err)
+        return c.json({
+          success: false,
+          error: 'Computing this payment quote requires an internet connection. Please connect and try again.',
+          code: 'PAYMENT_OFFLINE',
+        }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] subscription-quote proxy error:', error)
+      return c.json({ success: false, error: 'Failed to compute the subscription quote' }, 500)
+    }
+  })
+
   // GET /api/payment/pending — CLOUD-proxy (0.6.82). The payment-result
   // view's last-resort checkout recovery calls this when it has neither a
   // return-URL ref nor a localStorage pending checkout (payment started on

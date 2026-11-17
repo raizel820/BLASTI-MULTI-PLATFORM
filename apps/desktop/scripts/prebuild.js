@@ -195,7 +195,49 @@ const errors = [];
   }
 }
 
-// ─── Step 4: Packaging completeness guard (Task 71) ────────────────────────────
+// ─── Step 4: Vendor @blasti/binary-delta (0.6.85 — DELTA UPDATES ROOT FIX) ──
+// WHY: main.js loads the delta library with require('@blasti/binary-delta')
+// — a bun WORKSPACE SYMLINK (node_modules/@blasti/binary-delta →
+// ../../../../packages/binary-delta). electron-builder cannot follow bun's
+// isolated-store symlinks (the exact failure class Task 55 hit with the
+// Prisma client), so every PACKAGED app shipped WITHOUT the delta library:
+// the first delta update died on "Cannot find module '@blasti/binary-delta'"
+// (MODULE_NOT_FOUND / ENOENT inside app.asar), the updates:install-delta
+// handler rejected, and — because the renderer had no catch around the
+// Electron bridge call — the whole update attempt aborted with NO
+// full-installer fallback. Delta updates were completely dead in production.
+//
+// WHAT: copy the REAL package file (pure JS, Node builtins only, zero
+// dependencies) into apps/desktop/vendor/binary-delta.js. It is allow-listed
+// in electron-builder.yml (files: vendor/**/*) so it lands INSIDE app.asar,
+// and main.js resolves it FIRST via require('./vendor/binary-delta') — a
+// relative require that always works, dev and packaged. Single source of
+// truth stays packages/binary-delta: this step re-syncs on EVERY build, so
+// a hand-edited vendor copy cannot drift into an installer.
+{
+  const deltaSrc = path.resolve(__dirname, '../../../packages/binary-delta/index.js');
+  const vendorDir = path.resolve(__dirname, '../vendor');
+  const deltaDest = path.join(vendorDir, 'binary-delta.js');
+  if (!fs.existsSync(deltaSrc)) {
+    console.error('[prebuild] @blasti/binary-delta source not found at:', deltaSrc);
+    console.error('[prebuild]   The delta updater would be dead in the packaged app — failing the build.');
+    errors.push('binary-delta vendor source missing');
+  } else {
+    try {
+      fs.mkdirSync(vendorDir, { recursive: true });
+      fs.copyFileSync(deltaSrc, deltaDest);
+      const { createHash } = require('crypto');
+      const sha = createHash('sha256').update(fs.readFileSync(deltaDest)).digest('hex').slice(0, 12);
+      const bytes = fs.statSync(deltaDest).size;
+      console.log(`[prebuild] Vendored @blasti/binary-delta → vendor/binary-delta.js (${bytes} B, sha256 ${sha}…)`);
+    } catch (err) {
+      console.error('[prebuild] Vendoring binary-delta FAILED:', err.message || err);
+      errors.push('binary-delta vendor copy failed');
+    }
+  }
+}
+
+// ─── Step 5: Packaging completeness guard (Task 71) ────────────────────────────
 // electron-builder.yml packages from an explicit files: allowlist. A runtime
 // require()d file forgotten in that list builds fine and then crashes the
 // packaged app on first launch ("Cannot find module './load-env'"). This
@@ -216,6 +258,53 @@ const errors = [];
   } catch (err) {
     // The guard itself must never block a build on its own failure.
     console.warn('[prebuild] Packaging completeness check could not run:', err.message || err);
+  }
+}
+
+// ─── Step 6: Delta-lib packaging verification (0.6.85) ─────────────────────
+// Final belt-and-suspenders: refuse to produce an installer whose delta
+// updater cannot load. This is the check the Task 71 guard could never make
+// — the delta library is loaded with BOTH a relative and a bare require, and
+// the bare one pointed at a bun workspace symlink the packager silently
+// dropped. Three facts must hold at packaging time:
+//   1. vendor/binary-delta.js exists (Step 4 vendored it),
+//   2. its API surface is intact (parseReleasePatch + applyDeltaToFile),
+//   3. electron-builder.yml allow-lists vendor/**/* so it lands in the asar.
+{
+  const deltaDest = path.resolve(__dirname, '../vendor/binary-delta.js');
+  if (!fs.existsSync(deltaDest)) {
+    console.error('[prebuild] vendor/binary-delta.js MISSING — the packaged delta updater would fail with ENOENT');
+    errors.push('vendor/binary-delta.js missing after vendor step');
+  } else {
+    try {
+      const lib = require(deltaDest);
+      for (const fn of ['parseReleasePatch', 'applyDeltaToFile', 'applyTreePatch', 'sha256OfFile']) {
+        if (typeof lib[fn] !== 'function') {
+          console.error(`[prebuild] vendored binary-delta is missing ${fn}() — vendored copy is stale or truncated`);
+          errors.push(`vendored binary-delta missing ${fn}`);
+        }
+      }
+      const yml = fs.readFileSync(path.resolve(__dirname, '../electron-builder.yml'), 'utf-8');
+      const inFilesBlock = yml.split(/\r?\n/);
+      let inFiles = false;
+      let covered = false;
+      for (const line of inFilesBlock) {
+        if (/^files:\s*(#.*)?$/.test(line)) { inFiles = true; continue; }
+        if (inFiles && /^[A-Za-z_][A-Za-z0-9_]*\s*:/.test(line)) break;
+        const item = line && line.match(/^\s+-\s+(.+?)\s*(?:#.*)?$/);
+        if (item && item[1].trim().replace(/\/+$/, '') === 'vendor/**/*') covered = true;
+      }
+      if (!covered) {
+        console.error('[prebuild] electron-builder.yml files: does NOT include vendor/**/* — the vendored delta lib would NOT be packaged');
+        errors.push('electron-builder.yml missing vendor/**/* allowlist entry');
+      }
+      if (errors.length === 0 || errors.every((e) => !/vendor|binary-delta/.test(e))) {
+        console.log('[prebuild] Delta-lib packaging verified (vendor copy + API surface + allowlist)');
+      }
+    } catch (err) {
+      console.error('[prebuild] Delta-lib verification could not run:', err.message || err);
+      errors.push('delta-lib verification failed');
+    }
   }
 }
 

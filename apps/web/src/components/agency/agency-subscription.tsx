@@ -4493,7 +4493,16 @@ export function AgencySubscription() {
             ) : (
               <div className="space-y-3 max-h-96 overflow-y-auto custom-scrollbar">
                 {effectivePaymentHistory.map((tx) => {
-                  const isApproved = tx.status === 'APPROVED';
+                  // 0.6.84 — CRITICAL status-mapping fix: Chargily settlements
+                  // store Transaction.status = 'COMPLETED' (fulfillCheckoutPaid),
+                  // while the manual-transfer workflow uses 'APPROVED'. This row
+                  // only recognized 'APPROVED', so every SUCCESSFUL Chargily
+                  // payment fell into the else branch and rendered the red X +
+                  // t('rejected') — the "payment went through, subscription
+                  // active, invoice issued, but history says rejected" report
+                  // (web AND desktop render this same component). COMPLETED now
+                  // counts as success; FAILED/REJECTED stay rejected.
+                  const isApproved = tx.status === 'APPROVED' || tx.status === 'COMPLETED';
                   const isPending = tx.status === 'PENDING';
                   // Prefer the snapshot planName (frozen at transaction time)
                   // then fall back to resolving the legacy `plan` string against

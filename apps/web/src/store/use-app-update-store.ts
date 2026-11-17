@@ -689,10 +689,25 @@ function createAppUpdateStore() {
           // — no NSIS run at all, the app relaunches into the new version.
           // Any failure falls back to the full installer download below.
           if (info.delta && info.delta.hops.length > 0 && electronAPI()?.installDeltaUpdate) {
-            const result = await electronAPI()?.installDeltaUpdate?.({
-              hops: info.delta.hops,
-              target: { version: info.version, asarSha256: info.delta.targetAsarSha256 || '' },
-            });
+            // 0.6.85 — the bridge call is now wrapped EXACTLY like the
+            // Android path below. The packaged app used to REJECT this
+            // invoke outright (0.6.84-and-older main.js loaded the delta
+            // library with a bare require('@blasti/binary-delta') outside
+            // its try — a bun workspace symlink electron-builder cannot
+            // package, so the handler threw MODULE_NOT_FOUND). The thrown
+            // bridge call aborted startDownload entirely: no delta AND no
+            // full-installer fallback — the update was impossible on every
+            // affected install. Catch → {ok:false} → fall through to the
+            // full installer, per the documented contract.
+            let result: { ok?: boolean; error?: string; version?: string; pendingBootSwap?: boolean } | undefined;
+            try {
+              result = await electronAPI()?.installDeltaUpdate?.({
+                hops: info.delta.hops,
+                target: { version: info.version, asarSha256: info.delta.targetAsarSha256 || '' },
+              });
+            } catch (deltaBridgeErr) {
+              result = { ok: false, error: deltaBridgeErr instanceof Error ? deltaBridgeErr.message : String(deltaBridgeErr ?? '') };
+            }
             if (result?.ok) {
               set({ deltaApplied: true, status: 'downloaded', progress: { percent: 100, receivedBytes: info.delta.totalSize, totalBytes: info.delta.totalSize } });
               void maybeAutoInstall();

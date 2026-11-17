@@ -196,7 +196,32 @@ module.exports = async function afterPack(context) {
   }
   log(`Query engine shipped: ${engine}`);
 
-  // 5. SIZE ROUND (0.6.69) — fail the BUILD (not the runtime) if the slimmed
+  // 5. 0.6.85 — @blasti/binary-delta: ship the REAL package outside the asar.
+  // The library is a bun workspace symlink electron-builder cannot follow
+  // (same failure class as the Prisma client above), which left every
+  // packaged app without a working delta updater ("Cannot find module
+  // '@blasti/binary-delta'" / ENOENT inside app.asar). main.js now loads it
+  // from THREE tiers — vendor/binary-delta.js inside the asar (primary,
+  // vendored by prebuild.js), then the bare workspace name (dev), then THIS
+  // copy: <resources>/node_modules/@blasti/binary-delta, reachable through
+  // parent-of-asar module resolution exactly like the Prisma client above.
+  // This tier keeps old/bare-name callers working even if the in-asar vendor
+  // file is ever removed.
+  const deltaPkgSrc = path.join(MONOREPO_ROOT, 'packages', 'binary-delta');
+  const deltaPkgDest = path.join(destNodeModules, '@blasti', 'binary-delta');
+  if (!fs.existsSync(path.join(deltaPkgSrc, 'index.js'))) {
+    throw new Error(
+      '[afterPack] @blasti/binary-delta source not found at packages/binary-delta.\n' +
+      '  The delta updater would be dead in the packaged app — verify the monorepo checkout.'
+    );
+  }
+  copyWhitelisted(deltaPkgSrc, deltaPkgDest, (rel) => ['package.json', 'index.js', 'index.d.ts'].includes(rel));
+  if (!fs.existsSync(path.join(deltaPkgDest, 'index.js'))) {
+    throw new Error('[afterPack] binary-delta copy is missing index.js — the delta updater would fail to load.');
+  }
+  log('Copied @blasti/binary-delta (delta updater library) → resources/node_modules/@blasti/binary-delta');
+
+  // 6. SIZE ROUND (0.6.69) — fail the BUILD (not the runtime) if the slimmed
   // copies lost anything the re-export chain needs. Cheap; catches whitelist
   // drift after a future prisma upgrade.
   const shellDir = path.join(destNodeModules, '@prisma', 'client');

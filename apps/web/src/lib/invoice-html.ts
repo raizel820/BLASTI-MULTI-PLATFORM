@@ -344,52 +344,79 @@ export function buildInvoiceHtml(invoice: InvoiceRecord, options: InvoiceHtmlOpt
 <meta charset="utf-8" />
 <title>${esc(docTitle)} ${esc(invoice.displayNumber)}</title>
 <style>
-  @page { size: A4; margin: 12mm; }
+  @page { size: A4; margin: 11mm 11mm 13mm; }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   body {
     font-family: "Segoe UI", "Noto Naskh Arabic", "Amiri", Tahoma, Arial, sans-serif;
-    color: #1e293b; font-size: 11.5pt; line-height: 1.45;
+    color: #1e293b; font-size: 10.75pt; line-height: 1.38;
   }
-  .page { width: 186mm; margin: 0 auto; padding: 10mm 12mm; }
-  .doc-header { display: flex; align-items: flex-start; justify-content: space-between; border-bottom: 3px solid #0f766e; padding-bottom: 6mm; margin-bottom: 6mm; }
-  .brand { display: flex; align-items: center; gap: 4mm; }
-  .brand img { height: 18mm; width: auto; }
+  .page { width: 188mm; margin: 0 auto; padding: 6mm 8mm 14mm; }
+  .doc-header { display: flex; align-items: flex-start; justify-content: space-between; border-bottom: 2.5px solid #0f766e; padding-bottom: 3.5mm; margin-bottom: 4mm; }
+  .brand { display: flex; align-items: center; gap: 3mm; }
+  .brand img { height: 14mm; width: auto; }
   .doc-kind { text-align: ${align === 'right' ? 'left' : 'right'}; }
-  .doc-kind h1 { margin: 0 0 2mm; font-size: 20pt; color: #0f766e; letter-spacing: 1px; }
-  .doc-num { font-size: 13pt; font-weight: 700; direction: ltr; unicode-bidi: embed; }
-  .doc-date { color: #64748b; font-size: 10pt; margin-top: 1.5mm; }
-  .parties { display: flex; gap: 6mm; margin-bottom: 6mm; }
-  .party { flex: 1; border: 1px solid #cbd5e1; border-radius: 3mm; padding: 4mm 5mm; background: #f8fafc; }
-  .party-title { font-size: 9pt; text-transform: uppercase; letter-spacing: 1.5px; color: #0f766e; font-weight: 700; margin-bottom: 2mm; }
-  .party-name { font-weight: 700; font-size: 13pt; margin-bottom: 2.5mm; }
-  .legal-row { display: flex; gap: 3mm; font-size: 9.5pt; padding: 0.4mm 0; }
-  .legal-label { color: #64748b; min-width: 24mm; }
-  .legal-value { font-weight: 600; }
-  .section { border: 1px solid #cbd5e1; border-radius: 3mm; padding: 4mm 5mm; margin-bottom: 5mm; }
-  .section-title { font-size: 9pt; text-transform: uppercase; letter-spacing: 1.5px; color: #0f766e; font-weight: 700; margin-bottom: 2.5mm; }
-  .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1mm 6mm; }
-  .kv { display: flex; gap: 3mm; font-size: 10pt; padding: 0.5mm 0; }
-  .kv-label { color: #64748b; min-width: 34mm; }
+  .doc-kind h1 { margin: 0 0 1.5mm; font-size: 17.5pt; color: #0f766e; letter-spacing: 1px; }
+  .doc-num { font-size: 12pt; font-weight: 700; direction: ltr; unicode-bidi: embed; }
+  .doc-date { color: #64748b; font-size: 9.5pt; margin-top: 1mm; }
+  .parties { display: flex; gap: 4.5mm; margin-bottom: 4mm; }
+  .party { flex: 1; border: 1px solid #cbd5e1; border-radius: 3mm; padding: 3mm 4mm; background: #f8fafc; }
+  .party-title { font-size: 8.5pt; text-transform: uppercase; letter-spacing: 1.5px; color: #0f766e; font-weight: 700; margin-bottom: 1.5mm; }
+  .party-name { font-weight: 700; font-size: 11.5pt; margin-bottom: 2mm; }
+  .legal-row { display: flex; gap: 2.5mm; font-size: 8.75pt; padding: 0.3mm 0; }
+  .legal-label { color: #64748b; min-width: 21mm; flex-shrink: 0; }
+  .legal-value { font-weight: 600; word-break: break-word; }
+  .section { border: 1px solid #cbd5e1; border-radius: 3mm; padding: 3mm 4mm; margin-bottom: 3.5mm; }
+  .section-title { font-size: 8.5pt; text-transform: uppercase; letter-spacing: 1.5px; color: #0f766e; font-weight: 700; margin-bottom: 1.8mm; }
+  .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8mm 5mm; }
+  .kv { display: flex; gap: 2.5mm; font-size: 9.5pt; padding: 0.4mm 0; }
+  .kv-label { color: #64748b; min-width: 30mm; flex-shrink: 0; }
   .kv-value { font-weight: 600; word-break: break-all; }
-  table.items { width: 100%; border-collapse: collapse; margin: 2mm 0 5mm; }
-  table.items th { background: #0f766e; color: #fff; font-size: 10pt; padding: 2.5mm 3mm; text-align: ${align}; }
-  table.items td { border-bottom: 1px solid #e2e8f0; padding: 3mm; font-size: 10.5pt; text-align: ${align}; }
+  table.items { width: 100%; border-collapse: collapse; margin: 1.5mm 0 3.5mm; }
+  table.items th { background: #0f766e; color: #fff; font-size: 9.5pt; padding: 2mm 2.5mm; text-align: ${align}; }
+  table.items td { border-bottom: 1px solid #e2e8f0; padding: 2.2mm 2.5mm; font-size: 10pt; text-align: ${align}; }
   table.items td.num { text-align: end; white-space: nowrap; }
   table.items td.desc { text-align: ${align}; }
   table.items td.strong { font-weight: 700; }
-  table.items tfoot td { font-weight: 800; font-size: 12pt; color: #0f172a; background: #f1f5f9; }
-  .verify { display: flex; gap: 6mm; align-items: center; border: 1.5px dashed #0f766e; border-radius: 3mm; padding: 4mm 5mm; margin-top: 6mm; background: #f0fdfa; }
-  .verify-title { font-weight: 700; font-size: 11pt; margin-bottom: 1mm; }
-  .verify-hint { font-size: 9.5pt; color: #475569; }
-  .verify-url { font-size: 8.5pt; color: #0f766e; direction: ltr; unicode-bidi: embed; word-break: break-all; margin-top: 1.5mm; font-family: monospace; }
-  .verify-qr { width: 30mm; height: 30mm; flex-shrink: 0; }
-  .cancelled { background: #fef2f2; color: #b91c1c; border: 1.5px solid #ef4444; border-radius: 3mm; padding: 3mm 5mm; margin: 4mm 0; font-weight: 700; text-align: center; }
-  .footer-note { margin-top: 6mm; padding-top: 3mm; border-top: 1px solid #e2e8f0; font-size: 9pt; color: #64748b; }
-  .status-badge { display: inline-block; padding: 1mm 3mm; border-radius: 2mm; font-size: 9pt; font-weight: 700; }
+  table.items tfoot td { font-weight: 800; font-size: 11pt; color: #0f172a; background: #f1f5f9; }
+  .verify { display: flex; gap: 4.5mm; align-items: center; border: 1.5px dashed #0f766e; border-radius: 3mm; padding: 3mm 4mm; margin-top: 4mm; background: #f0fdfa; }
+  .verify-title { font-weight: 700; font-size: 10.5pt; margin-bottom: 0.8mm; }
+  .verify-hint { font-size: 9pt; color: #475569; }
+  .verify-url { font-size: 8pt; color: #0f766e; direction: ltr; unicode-bidi: embed; word-break: break-all; margin-top: 1mm; font-family: monospace; }
+  .verify-qr { width: 23mm; height: 23mm; flex-shrink: 0; }
+  .cancelled { background: #fef2f2; color: #b91c1c; border: 1.5px solid #ef4444; border-radius: 3mm; padding: 2.5mm 4mm; margin: 3mm 0; font-weight: 700; text-align: center; }
+  .footer-note { margin-top: 4mm; padding-top: 2.5mm; border-top: 1px solid #e2e8f0; font-size: 8.5pt; color: #64748b; }
+  .status-badge { display: inline-block; padding: 0.8mm 2.5mm; border-radius: 2mm; font-size: 8.5pt; font-weight: 700; }
   .status-issued { background: #dcfce7; color: #166534; }
   .status-cancelled { background: #fee2e2; color: #b91c1c; }
-  @media print { body { -webkit-print-color-adjust: exact; print-color-adjust: exact; } .page { width: auto; padding: 0; } }
+
+  /* ── 0.6.84 — MULTI-PAGE PAGINATION CONTRACT ─────────────────────────────
+     Requirement: the standard invoice fits ONE A4 sheet; when content does
+     span pages, NOTHING is ever cut in half and every page keeps a
+     consistent format:
+       1. Atomic blocks — header / parties / sections / verify / footer note
+          move to the next page whole (break-inside: avoid), never split.
+       2. The items table header REPEATS on every continuation page
+          (thead = table-header-group) and rows never split mid-row.
+       3. A fixed page footer (brand + document number) is painted at the
+          bottom of EVERY page (position: fixed repeats in paged media). */
+  .doc-header, .parties, .party, .section, .verify, .cancelled, .footer-note {
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  table.items thead { display: table-header-group; }
+  table.items tr { break-inside: avoid; page-break-inside: avoid; }
+  .page-footer {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    display: flex; justify-content: space-between; align-items: center;
+    border-top: 1px solid #cbd5e1; padding-top: 1.2mm;
+    font-size: 8pt; color: #64748b;
+  }
+  .page-footer .pf-brand { color: #0f766e; font-weight: 700; letter-spacing: 1px; }
+  .page-footer .pf-doc { direction: ltr; unicode-bidi: embed; }
+  @media print {
+    body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    .page { width: auto; padding: 0 0 12mm; }
+  }
 </style>
 </head>
 <body>
@@ -445,6 +472,11 @@ export function buildInvoiceHtml(invoice: InvoiceRecord, options: InvoiceHtmlOpt
     ${verifyBlock}
 
     <div class="footer-note">${esc(t('footerNote'))}</div>
+  </div>
+
+  <div class="page-footer" aria-hidden="true">
+    <span class="pf-brand">BLASTI</span>
+    <span class="pf-doc">${esc(docTitle)} ${esc(invoice.displayNumber)}</span>
   </div>
 </body>
 </html>`

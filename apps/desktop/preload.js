@@ -114,6 +114,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
     }
   },
 
+  /**
+   * 0.6.84 — open the hosted Chargily checkout INSIDE the app (dedicated
+   * payment window). The main process watches its navigation: when the
+   * gateway returns to the cloud result route, the window closes itself and
+   * the result query is forwarded to the MAIN window as the standard
+   * blasti:// deep link — the payer never touches the system browser.
+   * Resolves { ok } — ok=false means the shell can't host the window (old
+   * main process) and the caller falls back to the external browser flow.
+   */
+  openPaymentWindow: (url) => ipcRenderer.invoke('app:open-payment-window', { url }),
+
   // ─── Notifications ─────────────────────────────────────────────────────────
 
   /**

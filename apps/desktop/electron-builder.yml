@@ -70,6 +70,16 @@ files:
   # handler + both boot self-heals). Same failure class as load-env.js —
   # missing it would crash EVERY packaged app at the first update check.
   - update-log.js
+  # 0.6.85 — DELTA UPDATES ROOT FIX. The delta library is a bun WORKSPACE
+  # SYMLINK (node_modules/@blasti/binary-delta → ../../../../packages/
+  # binary-delta) that electron-builder cannot follow — the exact Task-55
+  # Prisma failure class. Every packaged app shipped WITHOUT it, so the
+  # first delta update died on "Cannot find module '@blasti/binary-delta'"
+  # (MODULE_NOT_FOUND / ENOENT inside app.asar). prebuild.js now vendors the
+  # REAL package file into vendor/binary-delta.js (regenerated from
+  # packages/binary-delta on EVERY build — no drift) and main.js loads it
+  # via a relative require. asarUnpack is NOT needed: the module is pure JS.
+  - vendor/**/*
   - package.json
   - build-stamp.json
   - local-api/**/*

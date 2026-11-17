@@ -120,11 +120,26 @@ export function InvoicePreviewDialog({ invoice, open, onOpenChange }: InvoicePre
     }
   };
 
+  // 0.6.84 — fit-to-width preview: the A4 document (188mm ≈ 711px @96dpi)
+  // renders 1:1 inside the iframe, which overflowed narrow preview windows
+  // ("the preview window is not wide enough to contain the invoice"). The
+  // document body is now zoomed so the FULL page width always fits the
+  // available dialog width (scaled down on narrow windows, 1:1 when wide).
+  const fitFrameToWidth = (el: HTMLIFrameElement | null) => {
+    try {
+      const doc = el?.contentDocument;
+      if (!el || !doc || !doc.body) return;
+      const target = 810; // page width + horizontal breathing room @96dpi
+      const scale = Math.min(1, Math.max(0.4, (el.clientWidth - 8) / target));
+      doc.body.style.zoom = String(scale);
+    } catch { /* sandboxed doc unavailable — preview still renders unscaled */ }
+  };
+
   if (!invoice) return null;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-4xl w-[95vw] max-h-[92vh] flex flex-col p-0 gap-0" dir={lang === 'ar' ? 'rtl' : 'ltr'}>
+      <DialogContent className="max-w-[1200px] w-[96vw] max-h-[92vh] flex flex-col p-0 gap-0" dir={lang === 'ar' ? 'rtl' : 'ltr'}>
         <DialogHeader className="px-4 sm:px-6 pt-4 sm:pt-6 pb-3 border-b">
           <DialogTitle className="flex items-center gap-2 text-base sm:text-lg">
             <Eye className="h-4 w-4 sm:h-5 sm:w-5 text-teal-600" aria-hidden="true" />
@@ -144,6 +159,7 @@ export function InvoicePreviewDialog({ invoice, open, onOpenChange }: InvoicePre
             <iframe
               title={`${t('billingPreview')} ${invoice.displayNumber}`}
               srcDoc={srcDoc}
+              onLoad={(e) => fitFrameToWidth(e.currentTarget)}
               className="w-full h-[calc(92vh-13rem)] min-h-[420px] bg-white border rounded-md shadow-sm"
               sandbox="allow-same-origin"
             />

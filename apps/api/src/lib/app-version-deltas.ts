@@ -547,9 +547,14 @@ export { readOutrefHeader, createOutref }
  * for every delta-capable platform:
  *
  *   1. finds the latest PUBLISHED version (the chain target devices see),
- *   2. SKIPS the platform entirely when delta rows already exist for it
- *      (generation is expensive on desktop — 80 MB asar diffs; never burn
- *      boot time on a healthy chain),
+ *   2. 0.6.85 — SKIPS the platform only when a VERIFIABLE chain exists from
+ *      the immediately-previous release to that target (computeDeltaChain
+ *      BFS). The old "any delta rows exist → healthy" check left partial
+ *      graphs unhealed forever: stale rows for old hops kept the self-heal
+ *      away while the hop field devices actually needed was missing — the
+ *      0.6.55→0.6.56 / 0.6.58→0.6.61 gap pattern. Generation stays expensive
+ *      (80 MB asar diffs), so it only runs when the chain is genuinely
+ *      broken,
  *   3. rebuilds the hop patches for the 3 nearest predecessors (same cap the
  *      CI self-heal uses to keep the synchronous work short on the 2-core
  *      VPS).
@@ -572,15 +577,25 @@ export function scheduleBootDeltaSelfHeal(): void {
         })
         const target = candidates[0]
         if (!target) continue
-        const existingRows = await db.appVersionDelta.count({ where: { platform } })
-        if (existingRows > 0) continue // chain already alive — nothing to heal
+        // 0.6.85 — verify the chain is actually USABLE, not merely non-empty.
+        // The old guard (`existingRows > 0 → skip`) left platforms with a
+        // PARTIAL graph unhealed forever: rows could exist for some pairs
+        // while the hop a field client actually needs — from the
+        // immediately-previous release to the published target — was refused
+        // or missing (the exact 0.6.55→0.6.56 / 0.6.58→0.6.61 gap pattern:
+        // rows for older hops kept the self-heal away while the live chain
+        // stayed broken and every device fell back to the full installer).
+        // Now: BFS from the previous version to the target via
+        // computeDeltaChain — only a VERIFIABLE chain counts as healthy.
         const preds = await db.appVersion.findMany({
           where: { platform, id: { not: target.id } },
           orderBy: { createdAt: 'desc' },
           take: 1,
         })
         if (preds.length === 0) continue // first release — nothing to diff against
-        console.log(`[app-version-deltas] boot self-heal: platform ${platform} has no delta rows — rebuilding hops for v${target.version}`)
+        const chain = await computeDeltaChain(platform, preds[0].version, target.id)
+        if (chain.chain) continue // chain alive AND verifiable — nothing to heal
+        console.log(`[app-version-deltas] boot self-heal: platform ${platform} chain v${preds[0].version} → v${target.version} unusable (${chain.reason}) — rebuilding hops for v${target.version}`)
         const results = await generateDeltasForVersion(target.id, { limit: 3 })
         const ok = results.filter((r) => r.ok).length
         const refused = results.filter((r) => !r.ok)
