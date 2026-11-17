@@ -2713,6 +2713,8 @@ const en: Record<TranslationKeys, string> = {
   paymentUnverifiedCta: "View payment history",
   paymentToastCompleted: "Payment confirmed successfully",
   paymentToastFailed: "The payment could not be completed",
+  paymentOpenAppCta: "Open the BLASTI app",
+  paymentOpenAppHint: "Did the app not open automatically? Use this button to return to it — your payment status will be confirmed there.",
 
   // ─── agency-fullscreen.tsx ────────────────────────────────────
   walkInAdded: "Walk-in added",

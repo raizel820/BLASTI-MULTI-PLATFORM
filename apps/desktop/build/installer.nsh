@@ -55,6 +55,35 @@
 ; is removed by electron-builder's own uninstaller code — not duplicated here.
 ; ─────────────────────────────────────────────────────────────────────────────
 
+!macro customInstall
+  ; ── 0.6.82 — blasti:// deep-link protocol AT INSTALL TIME ────────────────
+  ; The gateway's "return to store" button must be able to bounce the payer's
+  ; browser back into the desktop app (blasti://payment/result). Registration
+  ; used to depend ONLY on the runtime setAsDefaultProtocolClient call (HKCU,
+  ; first app launch). If the protocol was not yet registered under the
+  ; current user, the browser's blasti:// navigation silently no-oped and the
+  ; payer stayed on the web result page forever. Writing the same HKCU keys
+  ; during installation removes that first-launch dependency; the runtime
+  ; call keeps reinforcing them on every launch (exe path updates).
+  ; Per-user install (perMachine: false) → HKCU is the correct hive and the
+  ; uninstaller runs as the same user, so cleanup is symmetric.
+  DetailPrint "Registering the blasti:// payment deep-link protocol…"
+  WriteRegStr HKCU "Software\Classes\blasti" "" "URL:BLASTI"
+  WriteRegStr HKCU "Software\Classes\blasti" "URL Protocol" ""
+  ; electron-builder names the installed executable from `executableName`
+  ; (blasti.exe); probe both spellings so a future rename cannot silently
+  ; kill the payment return path.
+  IfFileExists "$INSTDIR\blasti.exe" blasti_reg_exe_lower blasti_reg_exe_upper
+  blasti_reg_exe_lower:
+    WriteRegStr HKCU "Software\Classes\blasti\DefaultIcon" "" "$INSTDIR\blasti.exe,0"
+    WriteRegStr HKCU "Software\Classes\blasti\shell\open\command" "" '"$INSTDIR\blasti.exe" "%1"'
+    Goto blasti_reg_done
+  blasti_reg_exe_upper:
+    WriteRegStr HKCU "Software\Classes\blasti\DefaultIcon" "" "$INSTDIR\BLASTI.exe,0"
+    WriteRegStr HKCU "Software\Classes\blasti\shell\open\command" "" '"$INSTDIR\BLASTI.exe" "%1"'
+  blasti_reg_done:
+!macroend
+
 !macro customUnInstall
   DetailPrint "Removing all BLASTI local data (offline sessions, local DB, files, logs)…"
 
@@ -80,4 +109,10 @@
 
   ; 6. Legacy ~/.blasti data (old DB default + legacy file store).
   RMDir /r "$PROFILE\.blasti"
+
+  ; 7. 0.6.82 — remove the blasti:// deep-link protocol keys written by
+  ;    customInstall (HKCU\Software\Classes\blasti). The runtime
+  ;    setAsDefaultProtocolClient writes the SAME keys, so deleting the key
+  ;    root removes both registrations in one shot.
+  DeleteRegKey HKCU "Software\Classes\blasti"
 !macroend

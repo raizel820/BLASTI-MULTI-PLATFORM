@@ -3480,4 +3480,11 @@ module.exports = {
   markAuthorizationAuthorized: markAuthorizationAuthorized,
   markAuthorizationRevoked: markAuthorizationRevoked,
   getAuthorizationStatus: function () { return _authzStatus; },
+  // 0.6.82 — the sync engine's CURRENT cloud JWT (kept fresh by the
+  // refresh-session keeper at _keepTokensFresh). The local API's payment /
+  // billing / transactions cloud proxies use it as the auth-healing fallback
+  // when the renderer session token is local-only or was invalidated by an
+  // API restart — without it every proxied cloud call 401'd forever and the
+  // checkout-status poll never settled ("stuck waiting for payment").
+  getAuthToken: function () { return _authToken; },
 };

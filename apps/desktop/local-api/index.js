@@ -9381,6 +9381,142 @@ function createApp() {
     }
   })
 
+  // ── 0.6.82 — cloud-auth-healed fetch for payment/billing/transactions ────
+  // The proxies below forward the RENDERER session token to the cloud. That
+  // token can be (a) a LOCAL-ONLY token (offline unlock — raw hex the cloud
+  // can never recognize) or (b) a cloud JWT invalidated by an API restart —
+  // the documented AUTH_TOKEN_MISMATCH 401 storm. Either way every proxied
+  // cloud call used to 401 FOREVER: the checkout-status poll could never ask
+  // Chargily, so the desktop waiting screen never settled even though the
+  // payment succeeded. When the cloud answers 401/403, retry ONCE with the
+  // sync engine's current cloud JWT (kept fresh by its refresh keeper).
+  // Network failures still THROW — callers keep their offline 503 handling.
+  async function fetchCloudAuthHealed(path, init) {
+    const doFetch = (token) => fetch(cloudBaseUrl() + path, {
+      ...(init || {}),
+      headers: {
+        ...((init && init.headers) || {}),
+        ...(token ? { Authorization: 'Bearer ' + token } : {}),
+      },
+      signal: (init && init.signal) || AbortSignal.timeout(30000),
+    })
+    let res
+    try {
+      res = await doFetch(sessionToken)
+    } catch (err) {
+      // Propagate network failures — callers turn them into PAYMENT_OFFLINE.
+      throw err
+    }
+    if ((res.status === 401 || res.status === 403) && sessionToken) {
+      let altToken = null
+      try {
+        const syncService = require('./sync-service')
+        altToken = typeof syncService.getAuthToken === 'function' ? syncService.getAuthToken() : null
+      } catch { /* sync engine not running */ }
+      if (altToken && altToken !== sessionToken) {
+        console.warn('[LocalAPI] cloud proxy 401/403 — retrying with the sync engine cloud token:', path)
+        try {
+          const healed = await doFetch(altToken)
+          if (!healed.status || healed.status < 400) return healed
+          res = healed.status === 401 || healed.status === 403 ? res : healed
+        } catch { /* keep the original 401/403 response */ }
+      }
+    }
+    return res
+  }
+
+  // ── 0.6.82 — reconcile the LOCAL LEDGER from a settled checkout ──────────
+  // The checkout-status proxy used to reconcile ONLY the Agency subscription
+  // row, never the local Transaction/SmsPurchase row — the subscriptions
+  // page's payment history (local SQLite) kept showing PENDING while the
+  // cloud had settled, and later showed FAILED for an abandoned retry while
+  // the subscription stayed ACTIVE ("payment pending → failed but the
+  // subscription is active, and no invoice" report). Mirror the settled
+  // status into the local ledger the moment a poll reveals it.
+  async function reconcileLocalLedgerFromCheckout(settled) {
+    if (!db || !settled || typeof settled !== 'object') return
+    const normalized = settled.normalizedStatus
+    if (normalized !== 'paid' && normalized !== 'failed') return
+    const now = new Date()
+    const finalStatus = normalized === 'paid' ? 'COMPLETED' : 'FAILED'
+    const txId = typeof settled.transactionId === 'string' && settled.transactionId ? settled.transactionId : null
+    const smsId = typeof settled.smsPurchaseId === 'string' && settled.smsPurchaseId ? settled.smsPurchaseId : null
+    const checkoutId = typeof settled.checkoutId === 'string' && settled.checkoutId ? settled.checkoutId : null
+    const amount = typeof settled.amount === 'number' && Number.isFinite(settled.amount) ? settled.amount : null
+
+    const mirrorTx = (where) => db.transaction.update({
+      where,
+      data: {
+        status: finalStatus,
+        ...(amount != null ? { amountPaid: amount } : {}),
+        webhookVerified: normalized === 'paid',
+        reviewedAt: now,
+        updatedAt: now,
+      },
+    })
+
+    try {
+      if (txId) {
+        const local = await db.transaction.findUnique({ where: { id: txId }, select: { id: true, status: true } }).catch(() => null)
+        if (local) {
+          if (local.status !== finalStatus) {
+            await mirrorTx({ id: txId })
+            console.log('[LocalAPI] local Transaction reconciled from checkout status:', txId, '→', finalStatus)
+          }
+          return
+        }
+        if (checkoutId) {
+          const byRef = await db.transaction.findFirst({ where: { providerRef: checkoutId }, select: { id: true, status: true } }).catch(() => null)
+          if (byRef) {
+            if (byRef.status !== finalStatus) {
+              await mirrorTx({ id: byRef.id })
+              console.log('[LocalAPI] local Transaction reconciled by providerRef:', byRef.id, '→', finalStatus)
+            }
+            return
+          }
+        }
+        // The ledger row never reached this device via the pull — create a
+        // minimal settled mirror so the payment history shows the TRUE
+        // outcome instead of a phantom PENDING. Only when the response
+        // carries enough truth to build an honest row.
+        const agencyId = await resolveSessionAgencyId().catch(() => null)
+        if (agencyId && amount != null) {
+          await db.transaction.create({
+            data: {
+              ...(txId ? { id: txId } : {}),
+              agencyId,
+              amount,
+              plan: typeof settled.plan === 'string' && settled.plan ? settled.plan : 'SUBSCRIPTION',
+              paymentMethod: 'EDAHABIA',
+              status: finalStatus,
+              paymentProvider: 'chargily',
+              providerRef: checkoutId || '',
+              amountPaid: amount,
+              planName: typeof settled.planName === 'string' && settled.planName ? settled.planName : null,
+              webhookVerified: normalized === 'paid',
+              reviewedAt: now,
+              updatedAt: now,
+            },
+          }).catch((createErr) => {
+            console.warn('[LocalAPI] settled-mirror Transaction create skipped:', createErr?.message || createErr)
+          })
+          console.log('[LocalAPI] settled-mirror Transaction created for', txId || checkoutId, '→', finalStatus)
+        }
+      } else if (smsId) {
+        const local = await db.smsPurchase.findUnique({ where: { id: smsId }, select: { id: true, status: true } }).catch(() => null)
+        if (local && local.status !== normalized) {
+          const smsStatus = normalized === 'paid' ? 'APPROVED' : 'FAILED'
+          if (local.status !== smsStatus) {
+            await db.smsPurchase.update({ where: { id: smsId }, data: { status: smsStatus, updatedAt: now } })
+            console.log('[LocalAPI] local SmsPurchase reconciled from checkout status:', smsId, '→', smsStatus)
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[LocalAPI] checkout ledger reconcile failed (non-fatal):', err?.message || err)
+    }
+  }
+
   // POST /api/payment/create-checkout — CLOUD-proxy only. The hosted Chargily
   // checkout is inherently online (it opens pay.chargily.net); there is no
   // local gateway to hand off to. Offline → 503 PAYMENT_OFFLINE so the
@@ -9390,14 +9526,12 @@ function createApp() {
       const body = await c.req.json().catch(() => ({}))
       let res
       try {
-        res = await fetch(cloudBaseUrl() + '/api/payment/create-checkout', {
+        // 0.6.82 — auth-healed: a local-only / invalidated renderer token no
+        // longer poisons the checkout creation with a cloud 401.
+        res = await fetchCloudAuthHealed('/api/payment/create-checkout', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body || {}),
-          signal: AbortSignal.timeout(30000),
         })
       } catch (err) {
         console.warn('[LocalAPI] create-checkout proxy: cloud unreachable:', err?.message || err)
@@ -9423,12 +9557,11 @@ function createApp() {
       const checkoutId = c.req.param('id')
       let res
       try {
-        res = await fetch(cloudBaseUrl() + '/api/payment/checkout/' + encodeURIComponent(checkoutId), {
-          headers: {
-            ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}),
-          },
-          signal: AbortSignal.timeout(30000),
-        })
+        // 0.6.82 — auth-healed: the poll MUST reach Chargily even when the
+        // renderer token is local-only or the cloud invalidated it — this was
+        // the "desktop stuck on the waiting screen while the payment already
+        // went through" root cause.
+        res = await fetchCloudAuthHealed('/api/payment/checkout/' + encodeURIComponent(checkoutId))
       } catch (err) {
         console.warn('[LocalAPI] checkout-status proxy: cloud unreachable:', err?.message || err)
         return c.json({
@@ -9449,17 +9582,23 @@ function createApp() {
       const settled = data?.data || data
       if (
         settled && typeof settled === 'object' &&
-        settled.normalizedStatus === 'paid' &&
-        (settled.type === 'subscription' || settled.type === 'hardware')
+        (settled.normalizedStatus === 'paid' || settled.normalizedStatus === 'failed') &&
+        (settled.type === 'subscription' || settled.type === 'hardware' || settled.type === 'sms')
       ) {
-        try {
-          const localAgencyId = await resolveSessionAgencyId()
-          if (localAgencyId) {
-            const sub = await fetchCloudSubscription()
-            if (sub) await reconcileLocalSubscriptionFromCloud(localAgencyId, sub)
+        // 0.6.82 — mirror the settled status into the LOCAL ledger row too
+        // (Transaction / SmsPurchase), not just the Agency subscription —
+        // the payment history must show the true outcome immediately.
+        reconcileLocalLedgerFromCheckout(settled).catch(() => undefined)
+        if (settled.normalizedStatus === 'paid' && (settled.type === 'subscription' || settled.type === 'hardware')) {
+          try {
+            const localAgencyId = await resolveSessionAgencyId()
+            if (localAgencyId) {
+              const sub = await fetchCloudSubscription()
+              if (sub) await reconcileLocalSubscriptionFromCloud(localAgencyId, sub)
+            }
+          } catch (recErr) {
+            console.warn('[LocalAPI] checkout settlement reconcile failed (non-fatal):', recErr?.message || recErr)
           }
-        } catch (recErr) {
-          console.warn('[LocalAPI] checkout settlement reconcile failed (non-fatal):', recErr?.message || recErr)
         }
       }
 
@@ -9469,6 +9608,77 @@ function createApp() {
       return c.json({ success: false, error: 'Failed to check the payment status' }, 500)
     }
   })
+
+  // GET /api/payment/pending — CLOUD-proxy (0.6.82). The payment-result
+  // view's last-resort checkout recovery calls this when it has neither a
+  // return-URL ref nor a localStorage pending checkout (payment started on
+  // another surface). Locally it used to 404 (no route) and the recovery
+  // path died; proxy it exactly like the other payment reads.
+  app.get('/api/payment/pending', authMiddleware, async (c) => {
+    try {
+      let res
+      try {
+        res = await fetchCloudAuthHealed('/api/payment/pending')
+      } catch (err) {
+        console.warn('[LocalAPI] payment/pending proxy: cloud unreachable:', err?.message || err)
+        return c.json({ success: false, error: 'Requires an internet connection.', code: 'PAYMENT_OFFLINE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON error body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] payment/pending proxy error:', error)
+      return c.json({ success: false, error: 'Failed to recover the pending payment' }, 500)
+    }
+  })
+
+  // ── 0.6.82 — /api/billing/* CLOUD proxies (invoices work inside Electron) ─
+  // Invoice records are CLOUD-ONLY (the local schema has no Invoice /
+  // InvoiceCounter tables), but the desktop InvoicesPanel fetched
+  // /api/billing/… against THIS local API, which had no such routes → 404 →
+  // agencies could never extract an invoice after a successful Chargily
+  // payment (the "subscription active but no invoice" report). Proxy every
+  // read + the ensure/backfill/cancel mutations, auth-healed like the
+  // payment proxies. ORDER MATTERS: literal segments (backfill-status,
+  // ensure) BEFORE the :id wildcard, mirroring the cloud route order.
+  async function proxyBilling(c, path, method = 'GET') {
+    try {
+      let init = { method }
+      if (method === 'POST' || method === 'PUT') {
+        const body = await c.req.json().catch(() => ({}))
+        init = { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }
+      }
+      let res
+      try {
+        res = await fetchCloudAuthHealed(path, init)
+      } catch (err) {
+        console.warn('[LocalAPI] billing proxy: cloud unreachable:', path, err?.message || err)
+        return c.json({ success: false, error: 'Invoices require an internet connection.', code: 'PAYMENT_OFFLINE' }, 503)
+      }
+      let data = null
+      try { data = await res.json() } catch { /* non-JSON body */ }
+      return c.json(data || { success: res.ok }, res.status)
+    } catch (error) {
+      console.error('[LocalAPI] billing proxy error:', path, error)
+      return c.json({ success: false, error: 'Failed to reach the billing service' }, 500)
+    }
+  }
+
+  app.get('/api/billing/invoices', authMiddleware, (c) =>
+    proxyBilling(c, '/api/billing/invoices' + (c.req.url.includes('?') ? '?' + c.req.url.split('?')[1] : '')))
+  app.get('/api/billing/invoices/backfill-status', authMiddleware, (c) => proxyBilling(c, '/api/billing/invoices/backfill-status'))
+  app.post('/api/billing/invoices/backfill-all', authMiddleware, (c) => proxyBilling(c, '/api/billing/invoices/backfill-all', 'POST'))
+  app.post('/api/billing/invoices/ensure', authMiddleware, (c) => proxyBilling(c, '/api/billing/invoices/ensure', 'POST'))
+  app.get('/api/billing/legal-info', authMiddleware, (c) => proxyBilling(c, '/api/billing/legal-info'))
+  app.put('/api/billing/legal-info', authMiddleware, (c) => proxyBilling(c, '/api/billing/legal-info', 'PUT'))
+  app.get('/api/billing/invoices/:id', authMiddleware, (c) =>
+    proxyBilling(c, '/api/billing/invoices/' + encodeURIComponent(c.req.param('id'))))
+  app.get('/api/billing/invoices/:id/qr', authMiddleware, (c) =>
+    proxyBilling(c, '/api/billing/invoices/' + encodeURIComponent(c.req.param('id')) + '/qr'))
+  app.get('/api/billing/invoices/:id/verifications', authMiddleware, (c) =>
+    proxyBilling(c, '/api/billing/invoices/' + encodeURIComponent(c.req.param('id')) + '/verifications'))
+  app.post('/api/billing/invoices/:id/cancel', authMiddleware, (c) =>
+    proxyBilling(c, '/api/billing/invoices/' + encodeURIComponent(c.req.param('id')) + '/cancel', 'POST'))
 
   // GET /api/payment/test + /api/payment/test-checkout — CLOUD-proxy (the
   // super admin's gateway probes; the Chargily keys live in cloud-only
@@ -9677,8 +9887,62 @@ function createApp() {
   // parsePagination clamp) + ?offset page the result. Rows carry the same
   // agency/reviewer select projections the cloud includes. Sessions without
   // an agency get the cloud's empty envelope, never an error.
+  // 0.6.82 — write-through: mirror the cloud-served Transaction statuses
+  // into the local SQLite ledger (bounded to the page the cloud returned).
+  // Rows tagged kind:'sms_purchase' belong to the SmsPurchase admin feed —
+  // they have no local Transaction row and are skipped.
+  async function writeThroughLocalTransactions(rows) {
+    if (!db || !Array.isArray(rows)) return
+    for (const row of rows.slice(0, 200)) {
+      if (!row || typeof row !== 'object' || typeof row.id !== 'string' || !row.id) continue
+      if (row.kind === 'sms_purchase') continue
+      if (typeof row.status !== 'string' || !row.status) continue
+      try {
+        const local = await db.transaction.findUnique({ where: { id: row.id }, select: { status: true } }).catch(() => null)
+        if (!local) continue // never delivered by the pull — nothing to mirror
+        if (local.status === row.status) continue
+        await db.transaction.update({
+          where: { id: row.id },
+          data: {
+            status: row.status,
+            ...(typeof row.rejectionReason === 'string' ? { rejectionReason: row.rejectionReason } : {}),
+            ...(row.reviewedAt ? { reviewedAt: new Date(row.reviewedAt) } : {}),
+            ...(typeof row.amountPaid === 'number' && Number.isFinite(row.amountPaid) ? { amountPaid: row.amountPaid } : {}),
+            webhookVerified: row.webhookVerified === true,
+            updatedAt: new Date(),
+          },
+        })
+        console.log('[LocalAPI] transaction ledger write-through:', row.id, local.status, '→', row.status)
+      } catch (err) {
+        console.warn('[LocalAPI] transaction write-through failed (non-fatal):', row.id, err?.message || err)
+      }
+    }
+  }
+
   app.get('/api/transactions', authMiddleware, async (c) => {
     try {
+      // ── 0.6.82 — CLOUD-FIRST with local ledger write-through ──────────
+      // The subscriptions page's payment history used to read ONLY the
+      // local SQLite mirror: a checkout settled on the cloud (hosted-page
+      // poll, webhook or another device) stayed PENDING here until a sync
+      // pull happened to deliver it, and an abandoned retry showed FAILED
+      // next to an ACTIVE subscription. When the cloud is reachable it is
+      // the ledger truth — serve its response AND mirror the settled
+      // statuses into the local rows; any failure (offline, timeout,
+      // non-OK) falls through to the local read below.
+      const txQuery = c.req.url.includes('?') ? '?' + c.req.url.split('?')[1] : ''
+      let cloudRes = null
+      try {
+        cloudRes = await fetchCloudAuthHealed('/api/transactions' + txQuery)
+      } catch { cloudRes = null }
+      if (cloudRes && cloudRes.ok) {
+        const data = await cloudRes.json().catch(() => null)
+        if (data && data.success !== false && Array.isArray(data.transactions)) {
+          await writeThroughLocalTransactions(data.transactions)
+          return c.json(data, 200)
+        }
+      }
+
       if (!db) return c.json({ success: false, error: 'Database not initialized' }, 503)
       const agencyId = await resolveSessionAgencyId(c.req.query('agencyId'))
       const status = c.req.query('status')

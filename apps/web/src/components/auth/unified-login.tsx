@@ -41,7 +41,7 @@ import { useRouter } from 'next/navigation'
 import { apiFetch } from '@/lib/api-fetch'
 import { APP_VERSION } from '@/lib/version'
 import { apiClient, setNativeSessionToken } from '@/lib/api-client'
-import { setSessionPersistenceMode, getLastRememberChoice } from '@/lib/auth-storage'
+import { setSessionPersistenceMode, resolveInitialRememberChoice } from '@/lib/auth-storage'
 import { adoptLocalLanguagePreference } from '@/hooks/use-language'
 import { useAppStore } from '@/store/use-app-store'
 import { adoptImportedLocalSessionUser } from '@/lib/session-heal'
@@ -197,8 +197,14 @@ export function UnifiedLoginForm() {
   const [rememberMe, setRememberMe] = useState(false)
   // Task 2-b-2 — pre-show the last "Remember me" choice (read AFTER mount so
   // the SSR/hydration pass is never mismatched).
+  // 0.6.83 — desktop session-loss-at-close fix: on a FIRST-EVER login (no
+  // recorded choice) the Electron shell now defaults the checkbox to CHECKED,
+  // so the first session is durable instead of ephemeral — closing and
+  // reopening the app keeps the user signed in (the #1 "I must re-enter my
+  // password after every close" report). A previously recorded choice (even
+  // '0') still wins, and web/Capacitor keep the unchecked default.
   useEffect(() => {
-    try { setRememberMe(getLastRememberChoice()) } catch { /* storage unavailable */ }
+    try { setRememberMe(resolveInitialRememberChoice()) } catch { /* storage unavailable */ }
   }, [])
   const [authView, setAuthView] = useState<AuthView>('login')
   // Shell diagnostics (native shells only) — one tap from the login screen.

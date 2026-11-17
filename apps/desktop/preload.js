@@ -35,6 +35,28 @@ function resolveInjectedCloudUrl() {
 }
 const CLOUD_BASE_URL = resolveInjectedCloudUrl();
 
+// ─── 0.6.82 — deep-link delivery BUFFER (payment return reliability) ────────
+// The main process forwards `blasti://payment/result` URLs on three channels
+// (macOS open-url, Windows second-instance, cold-start argv scan). Every one
+// of them can fire BEFORE the SPA mounts and calls onDeepLink(callback) —
+// did-finish-load only guarantees the page LOADED, not that React ran its
+// effects. The old preload registered the ipcRenderer.on('deep-link')
+// listener lazily (first onDeepLink call), so any URL arriving earlier was
+// SILENTLY DROPPED — the payer had paid, the OS opened the app, and the app
+// never routed to the payment-result view (the "stuck on waiting for
+// payment" report). Register the listener at preload load and queue early
+// URLs; the first onDeepLink(callback) registration flushes the queue.
+const deepLinkQueue = [];
+let deepLinkConsumer = null;
+ipcRenderer.on('deep-link', (_event, url) => {
+  if (!url) return;
+  if (typeof deepLinkConsumer === 'function') {
+    try { deepLinkConsumer(url); } catch { /* consumer error — do not lose the queue */ }
+  } else if (deepLinkQueue.length < 8) {
+    deepLinkQueue.push(url);
+  }
+});
+
 contextBridge.exposeInMainWorld('electronAPI', {
   // ─── Platform Detection ────────────────────────────────────────────────────
 
@@ -79,9 +101,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
    * The main process sends 'deep-link' events when:
    *   - A second instance is opened with a blasti:// URL
    *   - macOS open-url event fires with a blasti:// URL
+   *   - The app was COLD-STARTED by a blasti:// URL (argv scan)
+   * 0.6.82 — URLs that arrived before this registration are buffered at
+   * preload load and flushed here immediately, so a cold-start payment
+   * return can never be dropped.
    */
   onDeepLink: (callback) => {
-    ipcRenderer.on('deep-link', (_event, url) => callback(url));
+    deepLinkConsumer = callback;
+    while (deepLinkQueue.length > 0) {
+      const queuedUrl = deepLinkQueue.shift();
+      try { callback(queuedUrl); } catch { /* keep flushing the rest */ }
+    }
   },
 
   // ─── Notifications ─────────────────────────────────────────────────────────

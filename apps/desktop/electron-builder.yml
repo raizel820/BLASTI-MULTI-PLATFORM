@@ -12,6 +12,21 @@ directories:
   output: dist
   buildResources: assets
 
+# 0.6.82 — declare the blasti:// deep-link scheme in the PACKAGES THEMSELVES
+# (macOS Info.plist CFBundleURLTypes, Linux desktop entries). On Windows the
+# NSIS hook (build/installer.nsh customInstall) writes the HKCU
+# Software\Classes\blasti registry keys at install time; previously the ONLY
+# registration was the runtime setAsDefaultProtocolClient call on first app
+# launch, so a payment made before that ever ran (or from a fresh Windows
+# account) had no blasti:// handler — the gateway's "return to store" button
+# landed on the web result page in the browser FOREVER and the desktop app
+# stayed on its waiting screen. Install-time + runtime registration now
+# reinforce each other.
+protocols:
+  - name: BLASTI Deep Link
+    schemes:
+      - blasti
+
 # SIZE ROUND (0.6.69) — maximum NSIS/AppImage/dmg compression (LZMA ultra).
 # Slower builds, measurably smaller installers on the electron+prisma payload.
 compression: maximum

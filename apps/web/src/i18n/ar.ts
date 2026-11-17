@@ -2713,6 +2713,8 @@ const ar = {
   paymentUnverifiedCta: "مراجعة سجل الدفعات",
   paymentToastCompleted: "تم تأكيد الدفع بنجاح",
   paymentToastFailed: "تعذّر إتمام عملية الدفع",
+  paymentOpenAppCta: "افتح تطبيق BLASTI",
+  paymentOpenAppHint: "لم يُفتح التطبيق تلقائياً؟ استخدم هذا الزر للعودة إليه — سيتم تأكيد حالة الدفع هناك.",
 
   // ─── agency-fullscreen.tsx ────────────────────────────────────
   walkInAdded: "تمت إضافة الزائر",

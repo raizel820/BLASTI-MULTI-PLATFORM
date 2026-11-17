@@ -16,7 +16,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
-import { CheckCircle2, XCircle, Clock, Loader2, CreditCard, LogIn, HelpCircle, History } from 'lucide-react';
+import { CheckCircle2, XCircle, Clock, Loader2, CreditCard, LogIn, HelpCircle, History, ExternalLink } from 'lucide-react';
 import { useAppStore } from '@/store/use-app-store';
 import type { ViewName, UserRole } from '@/store/use-app-store';
 import { useLanguage } from '@/hooks/use-language';
@@ -41,8 +41,14 @@ const MAX_POLL_ATTEMPTS = 40;
 // retries easily outlive 2 minutes). A settlement during the slow window
 // still flips the screen to paid/failed automatically — and the realtime
 // push (blasti:payment-settled) short-circuits the wait entirely.
+// 0.6.82 — the slow window stretched from 10 min to a FULL HOUR. The cloud
+// sweeper settles gateway-unverified payments at the 30-minute mark, so a
+// 10-minute budget used to dead-stop BEFORE that settle and the payer saw
+// "still pending" forever while the app only showed the truth after a
+// restart. 15s × 240 ≈ 60 min keeps the screen live across the whole sweep
+// cycle at a negligible request rate.
 const SLOW_POLL_INTERVAL_MS = 15_000;
-const SLOW_POLL_ATTEMPTS = 40;
+const SLOW_POLL_ATTEMPTS = 240;
 
 /** Mirrors GET /api/payment/checkout/:id → data (see apps/api payment-checkout). */
 interface CheckoutStatusData {
@@ -169,6 +175,9 @@ export function PaymentResult() {
   const [pending, setPending] = useState<PendingCheckout | null>(null);
   // Bumped by the "refresh status" button to restart the polling budget.
   const [pollSession, setPollSession] = useState(0);
+  // 0.6.82 — deep-link return target captured ONCE at mount (readReturnQuery
+  // is memoized; the fallback button must survive the poll lifecycle).
+  const [deepLinkTarget, setDeepLinkTarget] = useState<string | null>(null);
 
   const attemptsRef = useRef(0);
   const pollingActiveRef = useRef(false);
@@ -186,28 +195,41 @@ export function PaymentResult() {
   const phaseRef = useRef<Phase>(phase);
   useEffect(() => { phaseRef.current = phase; }, [phase]);
 
-  // ── Deep-link bounce (Capacitor mobile) ────────────────────────────────────
-  // On phones the hosted checkout opens in the SYSTEM browser, so after
-  // paying, the gateway lands THIS page inside that browser (not the app).
-  // When the return URL carries a `deep` blasti:// link (only Capacitor
-  // callers send one — see computeReturnHints) and we are NOT already inside
-  // the app shell, bounce back into the app: Android opens BLASTI via the
-  // registered intent-filter and the payment-deep-link.ts listener routes to
-  // the in-app result. No-op on desktop/regular web (no deep param) and
-  // inside the app itself.
+  // ── Deep-link bounce (Capacitor mobile + Electron desktop) ───────────────
+  // On phones AND in the desktop shell the hosted checkout opens in the
+  // SYSTEM browser (Electron intercepts window.open → shell.openExternal),
+  // so after paying, the gateway lands THIS page inside that browser (not
+  // the app). When the return URL carries a `deep` blasti:// link (Capacitor
+  // AND Electron callers send one — see computeReturnHints) and we are NOT
+  // already inside a native shell, bounce back into the app.
+  //
+  // 0.6.82 — the bounce used to fire ONCE, 1.2s after mount, with NO retry
+  // and NO visible fallback: if the OS protocol handler was missing (or the
+  // user dismissed the "Open BLASTI?" dialog), the custom-scheme navigation
+  // silently no-oped and the payer stayed on the web result page forever
+  // while the desktop app sat on its waiting screen. Now the bounce is
+  // retried (1.2s / 3.5s / 8s — a delayed first attempt loses nothing) and
+  // an "open the app" button is ALWAYS rendered alongside (deepLinkTarget),
+  // so the return path has a manual escape hatch on every platform.
   useEffect(() => {
     const deep = readReturnQuery().deep;
+    setDeepLinkTarget(deep);
     if (!deep) return;
     try {
       const cap = (window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
       if (cap?.isNativePlatform?.()) return; // already in the app
     } catch { /* ignore */ }
-    const timer = setTimeout(() => {
+    const attempt = (n: number) => {
       // 0.6.81 — the final redirection leg: gateway browser → app.
-      logTx('redirect_back', 'blasti:// deep-link bounce into the app fired', { redirectTarget: 'blasti://payment/result' });
+      logTx('redirect_back', `blasti:// deep-link bounce attempt ${n} fired`, { redirectTarget: 'blasti://payment/result', attempt: n });
       try { window.location.href = deep; } catch { /* invalid scheme — stay put */ }
-    }, 1200);
-    return () => clearTimeout(timer);
+    };
+    const timers = [
+      setTimeout(() => attempt(1), 1200),
+      setTimeout(() => attempt(2), 3500),
+      setTimeout(() => attempt(3), 8000),
+    ];
+    return () => timers.forEach((t) => clearTimeout(t));
   }, []);
 
   // ── Resolve the checkout id (hash query → localStorage → API) ────────────
@@ -557,6 +579,19 @@ export function PaymentResult() {
 
   const knownAmount = data?.amount ?? pending?.amount ?? null;
 
+  // 0.6.82 — the manual bounce button only makes sense OUTSIDE the app shells
+  // (it rescues the payer stuck in the browser when the auto-bounce failed —
+  // missing OS protocol registration, dismissed "Open BLASTI?" dialog, etc.).
+  const showReturnToAppButton =
+    !!deepLinkTarget &&
+    !(() => {
+      try {
+        const cap = (window as unknown as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
+        if (cap?.isNativePlatform?.()) return true;
+        return !!(window as unknown as { electronAPI?: unknown }).electronAPI;
+      } catch { return false; }
+    })();
+
   // ── Effective visual state ────────────────────────────────────────────────
   // no-checkout / unauthenticated fall back to the generic result derived
   // from the `status` query param (success / failed / neutral).
@@ -753,6 +788,28 @@ export function PaymentResult() {
             {/* No-checkout hint (authenticated but nothing to track) */}
             {phase === 'no-checkout' && genericStatus !== 'neutral' && (
               <p className="text-xs text-muted-foreground/80">{t('paymentNoCheckoutFound')}</p>
+            )}
+
+            {/* 0.6.82 — manual return-to-app fallback. The auto-bounce into
+                the app fires up to 3 times; when the OS protocol handler is
+                missing (or the browser dialog was dismissed) this button is
+                the payer's visible escape hatch — WITHOUT it the desktop/mobile
+                app stayed on its waiting screen forever. */}
+            {showReturnToAppButton && (
+              <div className="w-full space-y-2">
+                <p className="text-xs text-muted-foreground leading-relaxed">{t('paymentOpenAppHint')}</p>
+                <Button
+                  onClick={() => {
+                    logTx('redirect_back', 'blasti:// deep-link manual bounce (fallback button)', { redirectTarget: 'blasti://payment/result', manual: true });
+                    try { window.location.href = deepLinkTarget as string; } catch { /* invalid scheme */ }
+                  }}
+                  variant="outline"
+                  className="w-full min-h-[44px] px-6 rounded-2xl border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 gap-2"
+                >
+                  <ExternalLink className="h-4 w-4" />
+                  {t('paymentOpenAppCta')}
+                </Button>
+              </div>
             )}
 
             {/* Actions */}

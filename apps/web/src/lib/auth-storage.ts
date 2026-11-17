@@ -50,6 +50,8 @@ const REMEMBER_MARKER_KEY = 'blasti-remember-me';
  * NOT removed by purgeAuthState()/logout — it contains no token material.
  */
 const REMEMBER_LAST_CHOICE_KEY = 'blasti-remember-me-last';
+// (resolveInitialRememberChoice — 0.6.83 desktop default-on — lives next to
+// getLastRememberChoice below; no extra state key is introduced.)
 
 /** Which persist fields are AUTH state (stripped for ephemeral sessions). */
 const AUTH_STORE_FIELDS = [
@@ -115,6 +117,49 @@ export function getLastRememberChoice(): boolean {
   const ls = safeLocalStorage();
   try {
     return ls?.getItem(REMEMBER_LAST_CHOICE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 0.6.83 — DESKTOP DEFAULT-ON REMEMBER-ME (session-loss-at-close root fix).
+ *
+ * Complaint: "in the desktop app I lose the session when I close it and must
+ * re-enter the password every time". Root cause: the remember-me checkbox
+ * defaults to UNCHECKED on a first-ever login, so the very first session is
+ * EPHEMERAL — the durable blasti-auth.json is never written, the renderer
+ * purges every token surface at quit/boot (auth-provider + main.js), and
+ * each app close intentionally ends the session. Users do not read the
+ * checkbox; every desktop app they know (Slack/Discord/VS Code/WhatsApp
+ * Desktop) keeps them signed in, so the felt experience was "the app loses
+ * my session".
+ *
+ * Policy:
+ *   - A recorded choice ALWAYS wins ('1' → checked, '0' → unchecked) — the
+ *     user keeps per-login control and the pre-show hint stays honest.
+ *   - NO recorded choice yet (first-ever login):
+ *       • Electron desktop → CHECKED by default (desktop-app convention;
+ *         closing/reopening then keeps the session until the 3-day
+ *         remember-me wall, exactly like the OS-level conventions).
+ *       • Plain web / Capacitor mobile → UNCHECKED (historic posture — the
+ *         Task 2-b-2 audit explicitly protects mobile/web behavior).
+ *
+ * SSR-safe: reads storages only, never writes; callers run it in a mount
+ * effect AFTER hydration so the first client pass never mismatches.
+ */
+export function resolveInitialRememberChoice(): boolean {
+  if (typeof window === 'undefined') return false;
+  const ls = safeLocalStorage();
+  try {
+    const hint = ls?.getItem(REMEMBER_LAST_CHOICE_KEY);
+    if (hint === '1') return true;
+    if (hint === '0') return false;
+  } catch { /* storage unavailable — fall through to the platform default */ }
+  try {
+    const isElectron = !!(window as unknown as { electronAPI?: unknown }).electronAPI ||
+      navigator.userAgent.includes('Electron');
+    return isElectron;
   } catch {
     return false;
   }

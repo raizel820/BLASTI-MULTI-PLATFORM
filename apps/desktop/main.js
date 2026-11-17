@@ -3887,9 +3887,12 @@ ipcMain.handle('tv-screen:status', () => {
 app.setAsDefaultProtocolClient(PROTOCOL);
 
 // macOS: handle open-url event
+// 0.6.82 — guard against a destroyed window (URL used to be dropped
+// silently); early sends are safe anyway since the preload now buffers
+// 'deep-link' events until the SPA registers its onDeepLink consumer.
 app.on('open-url', (_event, url) => {
   if (url && url.startsWith(`${PROTOCOL}://`)) {
-    if (mainWindow) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.focus();
       mainWindow.webContents.send('deep-link', url);
