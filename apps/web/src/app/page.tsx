@@ -12,6 +12,10 @@ import { getProxiedUrl } from '@/lib/utils';
 import { apiFetch } from '@/lib/api-fetch';
 import { isApiUnreachable } from '@/lib/api-client';
 import { getPendingCheckout } from '@/lib/chargily-checkout';
+// 0.6.89 — the background settlement watcher confirms a checkout the moment
+// it settles; the focus/visibility resume below must not resurrect the
+// waiting screen for a payment that is already confirmed and navigated home.
+import { isCheckoutLocallySettled } from '@/lib/payment-settle-watcher';
 // 0.6.68 — connection-stability round: a periodic keep-alive keeps the app's
 // connection pool to the server warm (no more cold first-request failures)
 // and the register view is HARD-GATED on real server reachability.
@@ -766,6 +770,11 @@ export default function Home() {
       try {
         const pc = getPendingCheckout();
         if (!pc) return;
+        // 0.6.89 — this exact checkout was already confirmed by the local
+        // watcher (window closed, app navigated home). Routing here would
+        // flash the "waiting for payment" screen right after the success
+        // state — the reported multi-step flow.
+        if (isCheckoutLocallySettled(pc.checkoutId)) return;
         const state = useAppStore.getState();
         if (state.currentView !== 'payment-result' && state.user) {
           state.setView('payment-result');

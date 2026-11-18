@@ -3626,7 +3626,7 @@ ipcMain.handle('updates:install-delta', async (_e, payload) => {
         sendStage(92, `apply-asar-${i + 1}`);
         const applyStartedAt = Date.now();
         const newAsar = path.join(UPDATES_DIR(), `app.asar.hop${i}`);
-        // 0.6.88 — ROOT FIX for "delta-corrupt: bad magic" (production log
+        // 0.6.89 — ROOT FIX for "delta-corrupt: bad magic" (production log
         // 2026-11-18 08:44: every hop downloaded + sha-verified fine, then
         // EVERY chain failed and every update fell back to the full
         // installer). The hop file is a BLSTRLS1 RELEASE patch whose payload
@@ -4156,6 +4156,19 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
     closePaymentWindow();
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+});
+
+// ─── 0.6.89 — renderer-driven payment-window close ────────────────────────
+// The web app's settlement watcher (payment-settle-watcher.ts) polls the
+// checkout the moment it is created; when the checkout settles — webhook OR
+// the poll fallback inside GET /payment/checkout/:id — the renderer asks for
+// the payment window to be closed. This closes it on EVERY return route,
+// including the gateway diverting its success/verification page into the
+// system browser (popup detour) while the in-app window stayed open on the
+// gateway page — the payer no longer closes it by hand.
+ipcMain.handle('app:close-payment-window', () => {
+  closePaymentWindow();
+  return { ok: true };
 });
 
 // ─── Invoice PDF (printToPDF, fully on-device) ─────────────────────────────

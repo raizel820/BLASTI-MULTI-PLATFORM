@@ -966,7 +966,9 @@ app.get('/checkout/:id', async (c) => {
             transaction
               ? transaction.status === 'COMPLETED'
                 ? 'paid'
-                : transaction.status === 'FAILED'
+                : transaction.status === 'FAILED' ||
+                    transaction.status === 'CANCELED' ||
+                    transaction.status === 'REJECTED'
                   ? 'failed'
                   : 'pending'
               : smsPurchase?.status === 'APPROVED'
@@ -1051,7 +1053,7 @@ app.get('/checkout/:id', async (c) => {
     const finalStatus = txAfter
       ? txAfter.status === 'COMPLETED'
         ? 'paid'
-        : txAfter.status === 'FAILED'
+        : txAfter.status === 'FAILED' || txAfter.status === 'CANCELED' || txAfter.status === 'REJECTED'
           ? 'failed'
           : remoteStatus || txAfter.status
       : smsAfter
@@ -1073,7 +1075,9 @@ app.get('/checkout/:id', async (c) => {
           txAfter
             ? txAfter.status === 'COMPLETED'
               ? 'paid'
-              : txAfter.status === 'FAILED'
+              : txAfter.status === 'FAILED' ||
+                  txAfter.status === 'CANCELED' ||
+                  txAfter.status === 'REJECTED'
                 ? 'failed'
                 : 'pending'
             : smsAfter?.status === 'APPROVED'

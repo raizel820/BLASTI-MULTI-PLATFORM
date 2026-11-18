@@ -2716,6 +2716,8 @@ const fr: Record<TranslationKeys, string> = {
   paymentToastFailed: "Le paiement n'a pas abouti",
   paymentOpenAppCta: "Ouvrir l'application BLASTI",
   paymentOpenAppHint: "L'application ne s'est pas ouverte automatiquement ? Utilisez ce bouton pour y revenir — l'état du paiement y sera confirmé.",
+  // 0.6.89 — automatic return after a confirmed payment (no extra steps)
+  paymentAutoReturnHint: "Retour automatique vers votre abonnement…",
 
   // ─── agency-fullscreen.tsx ────────────────────────────────────
   walkInAdded: "Visiteur ajouté",
@@ -4421,7 +4423,7 @@ const fr: Record<TranslationKeys, string> = {
   txOverrideApplied: "Correction manuelle appliquée (passerelle injoignable)",
   txRefusedPending: "La passerelle signale toujours « en attente » — action refusée",
   txReconciled: "Réconcilié",
-  // 0.6.88 — annulation d'un paiement en attente (vérifiée auprès de la passerelle)
+  // 0.6.89 — annulation d'un paiement en attente (vérifiée auprès de la passerelle)
   txCancelPayment: "Annuler le paiement",
   txCancelConfirmDesc: "Le paiement en attente sera annulé : le checkout expire auprès de la passerelle et ne pourra jamais aboutir, et l'agence pourra s'abonner à nouveau immédiatement.",
   txCancelSuccess: "Paiement annulé — l'agence peut s'abonner à nouveau",

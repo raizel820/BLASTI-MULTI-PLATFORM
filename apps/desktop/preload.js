@@ -125,6 +125,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
    */
   openPaymentWindow: (url) => ipcRenderer.invoke('app:open-payment-window', { url }),
 
+  /**
+   * 0.6.89 — close the in-app payment window from the renderer. The web
+   * app's settlement watcher calls this the moment the checkout settles
+   * (webhook or poll fallback), so the window closes itself on EVERY return
+   * route — including when the gateway diverted its success/verification
+   * page into the system browser and the in-app window was left open.
+   */
+  closePaymentWindow: () => ipcRenderer.invoke('app:close-payment-window'),
+
   // ─── Notifications ─────────────────────────────────────────────────────────
 
   /**

@@ -27,6 +27,7 @@
  */
 
 import { useAppStore } from '@/store/use-app-store';
+import { shouldSuppressPaymentResultRouting } from '@/lib/payment-settle-watcher';
 
 /** Matches the deep links we issue for the payment result view. */
 function isPaymentResultDeepLink(url: string): boolean {
@@ -46,6 +47,13 @@ export function routePaymentDeepLink(rawUrl: string): boolean {
   try {
     const qIndex = rawUrl.indexOf('?');
     const query = qIndex >= 0 ? rawUrl.slice(qIndex + 1) : '';
+    // 0.6.89 — the background settlement watcher (payment-settle-watcher.ts)
+    // already confirmed THIS checkout, closed the in-app payment window and
+    // navigated the app to the subscription/home view. The gateway's late
+    // return (verification detour in the system browser → result page →
+    // bounce) must NOT drag the SPA onto the waiting/result screen again —
+    // treat the link as consumed.
+    if (shouldSuppressPaymentResultRouting(query)) return true;
     if (query) {
       sessionStorage.setItem('blasti:payment-return-query', query);
     }

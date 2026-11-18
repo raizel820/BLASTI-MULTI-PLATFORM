@@ -27,8 +27,12 @@ import {
   openCheckoutUrl,
   type PendingCheckout,
 } from '@/lib/chargily-checkout';
-import { viewToUrl, getAllowedRolesForView } from '@/lib/route-map';
+import { viewToUrl } from '@/lib/route-map';
 import { logTx } from '@/lib/remote-logger';
+import {
+  isValidPaymentReturnView,
+  resolvePaymentReturnView,
+} from '@/lib/payment-return-view';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -151,15 +155,11 @@ function readReturnQuery(): { status: string | null; checkout: string | null; re
 }
 
 /**
- * A pending checkout may carry a `returnView` — honor it for the primary CTA
+ * A pending checkout may carry a `returnView` — the primary CTA honors it
  * only when it is a real view this role is allowed to open (and not a loop
- * back onto the result page itself).
+ * back onto the result page itself). Resolution itself lives in
+ * payment-return-view.ts — shared with the 0.6.88 settlement watcher.
  */
-function isValidReturnView(view: string | undefined, role: UserRole | undefined): view is ViewName {
-  if (!view || !(view in viewToUrl) || view === 'payment-result') return false;
-  const allowed = getAllowedRolesForView(view as ViewName);
-  return !role || allowed.length === 0 || allowed.includes(role);
-}
 
 export function PaymentResult() {
   const user = useAppStore((s) => s.user);
@@ -550,23 +550,57 @@ export function PaymentResult() {
   const primaryLabelForType =
     type === 'sms' ? t('backToSmsWallet') : t('backToSubscription');
 
-  let primaryCta: { label: string; view: ViewName } | null = null;
+  // 0.6.89 — the view/label rules live in payment-return-view.ts (ONE source
+  // of truth, also used by the background settlement watcher's navigation).
   const pendingReturnView = pending?.returnView;
-  if (isValidReturnView(pendingReturnView, role)) {
-    primaryCta = { label: primaryLabelForType, view: pendingReturnView };
-  } else if (type === 'subscription' || type === 'hardware') {
-    primaryCta = { label: t('backToSubscription'), view: 'agency-subscription' };
-  } else if (type === 'sms') {
-    primaryCta = { label: t('backToSmsWallet'), view: 'customer-profile' };
-  } else if (role === 'AGENCY_OWNER' || role === 'AGENCY_STAFF') {
-    primaryCta = { label: t('backToHome'), view: 'agency-dashboard' };
-  } else if (role === 'SUPER_ADMIN') {
-    primaryCta = { label: t('backToHome'), view: 'admin-dashboard' };
-  } else if (role === 'CUSTOMER') {
-    primaryCta = { label: t('backToHome'), view: 'customer-home' };
-  } else {
-    primaryCta = { label: t('backToHome'), view: 'landing' };
-  }
+  const primaryView = resolvePaymentReturnView(pendingReturnView, role, type);
+  const primaryCta: { label: string; view: ViewName } = {
+    // Label mirrors the original resolution exactly: a valid pending return
+    // view keeps the type-aware label; the fallbacks name where they head.
+    label: isValidPaymentReturnView(pendingReturnView, role)
+      ? primaryLabelForType
+      : type === 'subscription' || type === 'hardware'
+        ? t('backToSubscription')
+        : type === 'sms'
+          ? t('backToSmsWallet')
+          : t('backToHome'),
+    view: primaryView,
+  };
+
+  // ── 0.6.89 — AUTOMATIC RETURN ON SUCCESS (no extra steps) ────────────
+  // The full-screen result card with a manual "back" button was exactly the
+  // extra step the payer reported. When the poll (or the realtime push)
+  // confirms the payment: every mounted surface flips to the settled state,
+  // the success card shows for a brief beat, then the app navigates STRAIGHT
+  // to the view the payment started from (subscription page → ACTIVE
+  // subscription) or the role home. No dialogs. Failed / unverified states
+  // keep their manual CTAs — the payer must read those.
+  const autoReturnedRef = useRef(false);
+  useEffect(() => {
+    if (phase !== 'paid' || autoReturnedRef.current) return;
+    autoReturnedRef.current = true;
+    // Mounted surfaces refetch (idempotent with the realtime socket push).
+    try {
+      window.dispatchEvent(
+        new CustomEvent('blasti:payment-settled', {
+          detail: {
+            ok: true,
+            event: {
+              checkoutId: dataRef.current?.checkoutId || checkoutId,
+              data: {
+                transactionId: dataRef.current?.transactionId,
+                smsPurchaseId: dataRef.current?.smsPurchaseId,
+              },
+            },
+          },
+        }),
+      );
+    } catch { /* ignore */ }
+    const timer = setTimeout(() => {
+      try { setView(primaryCta.view); } catch { /* store not ready */ }
+    }, 1600);
+    return () => clearTimeout(timer);
+  }, [phase, primaryCta.view, setView, checkoutId]);
 
   // Secondary home CTA — customers only, and never a duplicate of the primary.
   const showSecondaryHome =
@@ -783,6 +817,14 @@ export function PaymentResult() {
                 {type === 'hardware' && t('hardwareOrderConfirmedMsg')}
                 {type === 'sms' && data?.smsQuantity ? ` +${data.smsQuantity}` : ''}
               </Badge>
+            )}
+
+            {/* 0.6.89 — the manual back button stays as a fallback, but the
+                app now returns to the subscription/home view on its own. */}
+            {phase === 'paid' && (
+              <p className="text-xs text-muted-foreground/70 animate-pulse">
+                {t('paymentAutoReturnHint')}
+              </p>
             )}
 
             {/* No-checkout hint (authenticated but nothing to track) */}

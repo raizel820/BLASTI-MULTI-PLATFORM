@@ -264,6 +264,20 @@ export async function startChargilyCheckout(
   });
 
   openCheckoutUrl(checkout.checkoutUrl);
+
+  // 0.6.89 — BACKGROUND SETTLEMENT WATCHER. The moment the checkout settles
+  // (webhook or the poll fallback inside GET /payment/checkout/:id), the
+  // watcher clears the pending marker, closes the desktop in-app payment
+  // window and navigates the app STRAIGHT to the view the payment started
+  // from (subscription page → shows the ACTIVE subscription). No result
+  // screen, no dialogs — whatever detour the gateway's return takes.
+  // Dynamic import: this module and the watcher reference each other (the
+  // watcher persists/clears the pending checkout marker), and a static
+  // import would create a module-evaluation cycle.
+  void import('@/lib/payment-settle-watcher')
+    .then((m) => m.startSettleWatcher(checkout, { returnView: opts?.returnView }))
+    .catch(() => { /* watcher is an optimization — the result view is the fallback */ });
+
   return checkout;
 }
 

@@ -2717,6 +2717,8 @@ const en: Record<TranslationKeys, string> = {
   paymentToastFailed: "The payment could not be completed",
   paymentOpenAppCta: "Open the BLASTI app",
   paymentOpenAppHint: "Did the app not open automatically? Use this button to return to it — your payment status will be confirmed there.",
+  // 0.6.89 — automatic return after a confirmed payment (no extra steps)
+  paymentAutoReturnHint: "Returning you to your subscription automatically…",
 
   // ─── agency-fullscreen.tsx ────────────────────────────────────
   walkInAdded: "Walk-in added",
@@ -4419,7 +4421,7 @@ const en: Record<TranslationKeys, string> = {
   txOverrideApplied: "Manual override applied (gateway unreachable)",
   txRefusedPending: "Gateway still reports pending — action refused",
   txReconciled: "Reconciled",
-  // 0.6.88 — gateway-aware cancel of a PENDING payment
+  // 0.6.89 — gateway-aware cancel of a PENDING payment
   txCancelPayment: "Cancel payment",
   txCancelConfirmDesc: "The pending payment will be canceled: the gateway checkout is expired so it can never complete, and the agency can subscribe again immediately.",
   txCancelSuccess: "Payment canceled — the agency can subscribe again",
