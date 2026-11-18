@@ -1285,6 +1285,36 @@ const OFFLINE_HTML = `<!DOCTYPE html>
 // ─── Content Security Policy ──────────────────────────────────────────────────
 
 function setCSP() {
+  // 0.6.87 — ORIGIN-SCOPED injection (root fix for the "raw-HTML payment
+  // page"). The header used to be added to EVERY response on the default
+  // session — including the in-app PAYMENT window's hosted Chargily
+  // checkout. The gateway's main document received OUR policy
+  // (default-src 'self' / style-src 'self' …) instead of (or intersected
+  // with) its own, so every stylesheet/script/font it loads from its CDNs
+  // was blocked and the checkout painted as RAW UNSTYLED HTML. A
+  // response-header policy is only meaningful for pages WE serve, so it is
+  // now injected ONLY for the app's own origins below; foreign documents
+  // (chargily.*, anything third-party) pass through with their own headers
+  // untouched. The payment window additionally runs on its own
+  // 'blasti-payment' partition — this origin scoping keeps ANY OTHER window
+  // that renders foreign content equally unaffected.
+  const appPageOrigins = new Set();
+  const addAppOrigin = (candidate) => {
+    try {
+      if (candidate && /^https?:\/\//i.test(String(candidate))) {
+        appPageOrigins.add(new URL(String(candidate)).origin);
+      }
+    } catch { /* ignore malformed */ }
+  };
+  addAppOrigin(PROD_URL);           // embedded local API / bundled SPA
+  addAppOrigin('http://127.0.0.1:3080');
+  addAppOrigin('http://localhost:3080');
+  addAppOrigin(DEV_URL);            // dev server
+  addAppOrigin('http://localhost:3000');
+  addAppOrigin(CLOUD_BASE_URL);     // cloud SPA (cloud mode)
+  addAppOrigin(process.env.NEXTAUTH_URL);
+  addAppOrigin('https://blastidz.online');
+
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     // Task 59: Electron applies onHeadersReceived CSP to data: URLs too.
     // The launch gate (and the offline/error pages) are first-party data:
@@ -1294,6 +1324,14 @@ function setCSP() {
     // (empirically proven: with CSP → no loading:ready; without → received).
     // data: pages here are always our own generated HTML — skip the CSP.
     if (details.url.startsWith('data:')) {
+      return callback({ responseHeaders: details.responseHeaders });
+    }
+    // 0.6.87 — foreign documents NEVER receive our policy.
+    let isOurPage = false;
+    try {
+      isOurPage = appPageOrigins.has(new URL(details.url).origin);
+    } catch { /* malformed URL — treat as foreign and pass through */ }
+    if (!isOurPage) {
       return callback({ responseHeaders: details.responseHeaders });
     }
     const csp = [
@@ -1463,30 +1501,20 @@ function createWindow() {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   }
 
-  // Open external links in system browser (not in Electron window)
+  // Open external links in system browser (not in Electron window).
   // ── 0.6.84 — EXTERNAL-OPEN DEDUPE (the "two identical gateway tabs" bug) ──
   // The payment flow called window.open(hostedGatewayUrl): the handler below
   // DENIED it and sent the URL to the system browser — and because a denied
   // window.open returns null, the renderer's popup-blocked fallback fired
   // window.location.href = sameUrl, which triggered will-navigate below →
   // shell.openExternal AGAIN. Result: ONE checkout, TWO identical gateway
-  // tabs (the "two overlapping gateway pages" report). Both handlers now
-  // share one 5-second dedupe window per URL.
-  const recentExternalOpens = new Map();
-  const openExternalOnce = (url) => {
-    try {
-      const now = Date.now();
-      if (now - (recentExternalOpens.get(url) || 0) < 5000) return;
-      recentExternalOpens.set(url, now);
-      if (recentExternalOpens.size > 40) {
-        for (const [k, v] of recentExternalOpens) {
-          if (now - v >= 5000) recentExternalOpens.delete(k);
-        }
-      }
-    } catch { /* dedupe is best-effort */ }
-    shell.openExternal(url);
-  };
-
+  // tabs (the "two overlapping gateway pages" report). Both handlers share
+  // one 5-second dedupe window per URL.
+  // 0.6.87 — the dedupe helper moved to MODULE scope (openExternalOnce right
+  // above the payment-window section): the in-app payment window handlers
+  // call it too, and a createWindow()-scoped const was a silent
+  // ReferenceError for them (their try/catch swallowed it, so unexpected
+  // gateway targets were neither opened in a browser nor reported).
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     openExternalOnce(url);
     return { action: 'deny' };
@@ -3889,6 +3917,37 @@ ipcMain.handle('get-printers', async () => {
 //
 // IPC: 'invoice:save-pdf' — payload { html: string, suggestedName: string }
 //
+// ─── 0.6.87 — module-scope external-open dedupe ────────────────────────────
+// Hoisted out of createWindow(): the main window handlers AND the in-app
+// payment window handlers below funnel foreign targets through ONE 5-second
+// dedupe per URL (the 0.6.84 "two identical gateway tabs" fix — see the
+// comment inside createWindow). Scoping the helper inside createWindow made
+// every payment-window call a silent ReferenceError (0.6.86 regression).
+const recentExternalOpens = new Map();
+const openExternalOnce = (url) => {
+  try {
+    const now = Date.now();
+    if (now - (recentExternalOpens.get(url) || 0) < 5000) return;
+    recentExternalOpens.set(url, now);
+    if (recentExternalOpens.size > 40) {
+      for (const [k, v] of recentExternalOpens) {
+        if (now - v >= 5000) recentExternalOpens.delete(k);
+      }
+    }
+  } catch { /* dedupe is best-effort */ }
+  shell.openExternal(url);
+};
+
+// 0.6.87 — hosted-gateway allowlist shared by inspectNavigation and
+// will-navigate: any chargily.net / chargily.com / chargily.test host
+// (subdomain optional) over http(s). pay.chargily.net serves BOTH live and
+// test checkouts today (test mode = /test/api/v2 on the same host); .test
+// keeps future sandbox domains working; http covers the bare-domain redirect
+// (pay.chargily.net 302s its root to http://biz.chargily.com/pay). A host
+// that merely CONTAINS "chargily" (evil-chargily.net) still cannot match —
+// the pattern only accepts whole chargily domains.
+const GATEWAY_URL_RE = /^https?:\/\/([a-z0-9-]+\.)*chargily\.(net|com|test)([/:?#]|$)/i;
+
 // ─── 0.6.84 — In-app Chargily payment window ───────────────────────────────
 // The hosted gateway used to open in the SYSTEM browser (shell.openExternal):
 // after paying, the gateway's "return to store" button landed on the cloud
@@ -3910,6 +3969,16 @@ ipcMain.handle('get-printers', async () => {
 // comes from CLOUD_BASE_URL — the exact origin the renderer sends as
 // returnUrl — and the result redirect is INTERCEPTED in will-navigate
 // (prevented, never rendered) and converted into the blasti:// deep link.
+// 0.6.87 — ROOT FIX for "one embedded page but RAW HTML without styles": the
+// window shared the app's DEFAULT session, so the app-wide CSP header
+// injection (setCSP) rewrote the gateway's response headers — the hosted
+// checkout document received OUR policy (default-src 'self' / style-src
+// 'self' …) instead of its own, every stylesheet/script its CDNs served was
+// blocked, and the page painted as raw unstyled HTML. The window now runs on
+// a PRIVATE in-memory partition ('blasti-payment') that the injection never
+// touches (setCSP is origin-scoped too, belt + suspenders), with a
+// normal-Chrome user agent so gateway CDNs / bot rules treat it like any
+// desktop browser.
 let paymentWindow = null;
 
 function closePaymentWindow() {
@@ -3960,9 +4029,30 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
         nodeIntegration: false,
         sandbox: true,
         javascript: true, // the hosted gateway page needs its own JS
+        // 0.6.87 — PRIVATE in-memory session for the gateway pages. Sharing
+        // the app's default session is what broke the hosted page: the
+        // app-wide CSP injection is registered per-session and rewrote the
+        // gateway's own headers (raw unstyled HTML). A dedicated partition
+        // gives the checkout a clean, unmodified Chrome environment — fresh
+        // cookies per payment (no stale XSRF), no app cookies/service
+        // workers leaked into the gateway, and nothing the gateway sets
+        // leaks back into the app session.
+        partition: 'blasti-payment',
       },
     });
     paymentWindow.setMenuBarVisibility(false);
+    // 0.6.87 — normal-browser user agent for the gateway. The Electron and
+    // app-name tokens in the default UA make some payment CDNs / Cloudflare
+    // bot rules serve degraded or challenge pages to embedded webviews.
+    // Strip both tokens and keep the exact Chromium engine version the page
+    // actually runs on (must happen BEFORE the first loadURL).
+    try {
+      paymentWindow.webContents.setUserAgent(
+        paymentWindow.webContents.getUserAgent()
+          .replace(/\s+\S*blasti\S*/gi, '')   // e.g. "blasti/0.6.87", "@blasti/desktop/0.6.87"
+          .replace(/\s+Electron\/[\w.]+/i, '')
+      );
+    } catch { /* default UA is acceptable */ }
 
     // Result detection — fires for full navigations AND in-page (hash) ones.
     const finishWithResult = (deepUrl) => {
@@ -3977,9 +4067,16 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
       closePaymentWindow();
     };
 
-    const inspectNavigation = (u) => {
+    const inspectNavigation = (u, opts = {}) => {
       try {
         if (!u || typeof u !== 'string') return;
+        // 0.6.87 — did-navigate passes alreadyRendered:true: the page is ON
+        // SCREEN (a server-redirect chain committed it — will-navigate never
+        // fires for server redirects). For unexpected targets the browser
+        // fallback must NOT run there, or the payer gets the same page TWICE
+        // (in-app + system browser) — the exact duplicate-page class of bug
+        // this window exists to prevent.
+        const alreadyRendered = opts.alreadyRendered === true;
         // The SPA's own blasti:// bounce inside this window is ALSO a result
         // signal (the hosted page returned and the result view fired it).
         if (u.toLowerCase().startsWith('blasti://')) {
@@ -3987,12 +4084,13 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
           return;
         }
         const target = new URL(u);
-        const isGateway = /^https:\/\/([a-z0-9-]+\.)+chargily\.(net|com)([/:?#]|$)/i.test(u);
+        const isGateway = GATEWAY_URL_RE.test(u);
         const isCloud = isCloudOrigin(target.origin);
         if (!isGateway && !isCloud) {
-          // Unexpected target — hand it to the system browser (deduped),
-          // never render it here.
-          openExternalOnce(u);
+          // Unexpected target — hand it to the system browser (deduped) when
+          // the navigation was still PREVENTED (will-navigate path); keep it
+          // in the window when it already committed (did-navigate path).
+          if (!alreadyRendered) openExternalOnce(u);
           return;
         }
         if (isCloud && (target.hash || '').startsWith('#/payment/result')) {
@@ -4007,8 +4105,8 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
       } catch { /* ignore malformed URLs */ }
     };
 
-    paymentWindow.webContents.on('did-navigate', (_e, u) => inspectNavigation(u));
-    paymentWindow.webContents.on('did-navigate-in-page', (_e, u) => inspectNavigation(u));
+    paymentWindow.webContents.on('did-navigate', (_e, u) => inspectNavigation(u, { alreadyRendered: true }));
+    paymentWindow.webContents.on('did-navigate-in-page', (_e, u) => inspectNavigation(u, { alreadyRendered: true }));
     paymentWindow.webContents.on('will-navigate', (event, u) => {
       // 0.6.86 — the payment window renders ONLY the hosted gateway pages.
       // Everything else is intercepted BEFORE it can paint: blasti:// bounces
@@ -4022,7 +4120,7 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
           inspectNavigation(u);
           return;
         }
-        const isGateway = /^https:\/\/([a-z0-9-]+\.)+chargily\.(net|com)([/:?#]|$)/i.test(u);
+        const isGateway = GATEWAY_URL_RE.test(u);
         if (!isGateway) {
           event.preventDefault();
           inspectNavigation(u);
