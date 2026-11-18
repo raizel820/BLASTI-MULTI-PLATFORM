@@ -88,7 +88,9 @@ interface AdminPayment {
 type TypeFilter = 'ALL' | 'manual' | 'online';
 type ReconcileAction = 'verify' | 'mark-settled' | 'mark-failed';
 
-const STATUS_FILTERS = ['ALL', 'PENDING', 'COMPLETED', 'FAILED', 'APPROVED', 'REJECTED'] as const;
+// 0.6.88 — CANCELED joins the ledger vocabulary (POST /api/transactions/:id/cancel:
+// agency/admin abort of an abandoned checkout before completion).
+const STATUS_FILTERS = ['ALL', 'PENDING', 'COMPLETED', 'FAILED', 'CANCELED', 'APPROVED', 'REJECTED'] as const;
 
 /** 0.6.55 — server-driven page size (real pagination, no more fixed 50). */
 const PAGE_SIZE = 25;
@@ -133,6 +135,11 @@ export function AdminTransactions() {
   const [rejectDialogOpen, setRejectDialogOpen] = useState(false);
   const [rejectId, setRejectId] = useState<string | null>(null);
   const [rejectReason, setRejectReason] = useState('');
+
+  // 0.6.88 — Cancel-pending-payment dialog (gateway-aware cancel)
+  const [cancelDialogOpen, setCancelDialogOpen] = useState(false);
+  const [cancelId, setCancelId] = useState<string | null>(null);
+  const [cancelTarget, setCancelTarget] = useState<AdminPayment | null>(null);
 
   // Receipt preview
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -337,6 +344,50 @@ export function AdminTransactions() {
     setRejectDialogOpen(true);
   };
 
+  // ── 0.6.88 — Cancel a PENDING payment (gateway-aware) ──
+  // POST /api/transactions/:id/cancel: probes the LIVE gateway first — a
+  // checkout that already PAID is settled instead of canceled (409), a still-
+  // pending one is expired remotely then settled FAILED, a failed one settles
+  // FAILED, and an unreachable gateway allows a local cancel only past the
+  // 30-min stale window. Releasing the agency's PENDING subscription gate is
+  // handled server-side. Works where mark-failed refuses (gateway still
+  // 'pending') and where the agency needs an immediate unblock.
+  const openCancelDialog = (payment: AdminPayment) => {
+    setCancelId(payment.id);
+    setCancelTarget(payment);
+    setCancelDialogOpen(true);
+  };
+
+  const handleCancelPayment = async () => {
+    if (!cancelId) return;
+    setActionLoading(`${cancelId}:cancel`);
+    try {
+      const res = await apiFetch(`/api/transactions/${cancelId}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        toast.success(t('txCancelSuccess') || 'Payment canceled');
+        setCancelDialogOpen(false);
+        setCancelId(null);
+        setCancelTarget(null);
+        fetchPayments();
+      } else if (res.status === 409 && /already completed/i.test(String(data.error || ''))) {
+        // The gateway says the money moved — the endpoint settled it as PAID.
+        toast.warning(data.error || t('txCancelAlreadyPaid') || 'Payment already completed — settled as paid');
+        setCancelDialogOpen(false);
+        fetchPayments();
+      } else {
+        toast.error(data.error || t('error'));
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   // ── 0.6.55 — issue an invoice for a settled row the ledger missed ──
   // Legacy payments (pre-0.6.53) and any settlement whose invoice issuance
   // failed get a one-click backfill straight from the row.
@@ -415,7 +466,9 @@ export function AdminTransactions() {
       ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'
       : status === 'APPROVED' || status === 'COMPLETED'
         ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
-        : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400';
+        : status === 'CANCELED'
+          ? 'bg-gray-100 text-gray-600 dark:bg-gray-800/60 dark:text-gray-400'
+          : 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400';
 
   const busy = (id: string, action: string) => actionLoading === `${id}:${action}`;
 
@@ -812,6 +865,25 @@ export function AdminTransactions() {
                                 )}
                                 <span className="hidden md:inline">{t('txMarkFailed')}</span>
                               </Button>
+                              {/* 0.6.88 — gateway-aware CANCEL: expires the checkout
+                                  remotely (mark-failed refuses while the gateway
+                                  still reports pending) and releases the agency's
+                                  PENDING subscription gate immediately. */}
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-9 px-3 border-gray-300 text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-900/40"
+                                onClick={() => openCancelDialog(payment)}
+                                disabled={!!actionLoading}
+                                title={t('txCancelPayment') || 'Cancel payment'}
+                              >
+                                {busy(payment.id, 'cancel') ? (
+                                  <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                  <XCircle className="h-4 w-4 me-1.5" />
+                                )}
+                                <span className="hidden md:inline">{t('txCancelPayment') || 'Cancel payment'}</span>
+                              </Button>
                             </>
                           )}
                         </div>
@@ -897,6 +969,41 @@ export function AdminTransactions() {
                 <X className="h-4 w-4 me-1.5" />
               )}
               {t('rejectTransaction')}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 0.6.88 — Cancel-Pending-Payment Dialog (gateway-aware cancel) */}
+      <Dialog open={cancelDialogOpen} onOpenChange={setCancelDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{t('txCancelPayment') || 'Cancel payment'}</DialogTitle>
+            <DialogDescription>{t('txCancelConfirmDesc') || 'The pending payment will be canceled and the agency will be able to subscribe again.'}</DialogDescription>
+          </DialogHeader>
+          {cancelTarget && (
+            <div className="rounded-xl border border-border/50 bg-muted/30 p-3 text-sm space-y-1">
+              <p className="font-medium text-foreground">{cancelTarget.planName || cancelTarget.plan}</p>
+              <p className="text-muted-foreground text-xs">
+                {cancelTarget.agencyName} · {cancelTarget.amount.toLocaleString()} {t('currency')} · {t('statusPending')}
+              </p>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCancelDialogOpen(false)}>
+              {t('cancel')}
+            </Button>
+            <Button
+              className="bg-gray-700 hover:bg-gray-800 text-white"
+              onClick={handleCancelPayment}
+              disabled={!!cancelId && actionLoading === `${cancelId}:cancel`}
+            >
+              {!!cancelId && actionLoading === `${cancelId}:cancel` ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <XCircle className="h-4 w-4 me-1.5" />
+              )}
+              {t('txCancelPayment') || 'Cancel payment'}
             </Button>
           </DialogFooter>
         </DialogContent>

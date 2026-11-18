@@ -4421,6 +4421,12 @@ const fr: Record<TranslationKeys, string> = {
   txOverrideApplied: "Correction manuelle appliquée (passerelle injoignable)",
   txRefusedPending: "La passerelle signale toujours « en attente » — action refusée",
   txReconciled: "Réconcilié",
+  // 0.6.88 — annulation d'un paiement en attente (vérifiée auprès de la passerelle)
+  txCancelPayment: "Annuler le paiement",
+  txCancelConfirmDesc: "Le paiement en attente sera annulé : le checkout expire auprès de la passerelle et ne pourra jamais aboutir, et l'agence pourra s'abonner à nouveau immédiatement.",
+  txCancelSuccess: "Paiement annulé — l'agence peut s'abonner à nouveau",
+  txCancelAlreadyPaid: "Paiement déjà effectué — réglé comme payé au lieu d'être annulé",
+  statusCanceled: "Annulé",
 
   // ─── Task 2-c: manual full sync (agency + customer settings) ────────────
   fullSyncTitle: "Synchronisation complète des données",

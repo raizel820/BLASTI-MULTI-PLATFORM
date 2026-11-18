@@ -39,7 +39,7 @@ export interface FulfillmentCheckout {
 }
 
 /** Which caller triggered the settlement — used for audit-log action naming. */
-export type FulfillmentSource = 'webhook' | 'poll' | 'sweep' | 'sweep-expired'
+export type FulfillmentSource = 'webhook' | 'poll' | 'sweep' | 'sweep-expired' | 'agency-cancel' | 'admin-cancel'
 
 /**
  * Audit-log action for a settlement — keeps the pre-existing webhook/poll
@@ -52,6 +52,8 @@ function settlementAuditAction(
 ): string {
   if (source === 'webhook') return `${base}_WEBHOOK_${outcome}`
   if (source === 'poll') return `${base}_POLL_${outcome === 'PAID' ? 'CONFIRMED' : 'FAILED'}`
+  if (source === 'agency-cancel') return `${base}_AGENCY_CANCEL_${outcome === 'PAID' ? 'CONFIRMED' : 'FAILED'}`
+  if (source === 'admin-cancel') return `${base}_ADMIN_CANCEL_${outcome === 'PAID' ? 'CONFIRMED' : 'FAILED'}`
   return `${base}_SWEEP_${outcome === 'PAID' ? 'CONFIRMED' : 'FAILED'}`
 }
 

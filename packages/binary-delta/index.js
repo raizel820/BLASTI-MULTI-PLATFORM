@@ -610,9 +610,32 @@ function parseReleasePatch(buf) {
   return openEnvelope(buf, MAGIC_RELEASE);
 }
 
+/**
+ * 0.6.88 — canonical release-patch part extractor. The BLSTRLS1 payload is
+ * the CONCATENATION [BLSTDLT1 asar delta][BLSTOUT1 tree patch]; consumers
+ * MUST slice the part they need before applying it (applyDeltaToFile parses
+ * a BLSTDLT1 container and throws `delta-corrupt: bad magic` on the whole
+ * envelope — the exact desktop bug this helper makes impossible).
+ */
+function extractReleasePatchParts(buf) {
+  const { header, payload } = parseReleasePatch(buf);
+  let cursor = 0;
+  let asarDelta = null;
+  if (header.asar) {
+    asarDelta = payload.subarray(0, header.asar.size);
+    cursor += header.asar.size;
+  }
+  let treePatch = null;
+  if (header.tree) {
+    treePatch = payload.subarray(cursor, cursor + header.tree.size);
+  }
+  return { header, asarDelta, treePatch };
+}
+
 module.exports.createOutref = createOutref;
 module.exports.readOutrefHeader = readOutrefHeader;
 module.exports.createTreePatch = createTreePatch;
 module.exports.applyTreePatch = applyTreePatch;
 module.exports.createReleasePatch = createReleasePatch;
 module.exports.parseReleasePatch = parseReleasePatch;
+module.exports.extractReleasePatchParts = extractReleasePatchParts;

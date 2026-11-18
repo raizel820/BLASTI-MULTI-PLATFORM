@@ -3626,12 +3626,23 @@ ipcMain.handle('updates:install-delta', async (_e, payload) => {
         sendStage(92, `apply-asar-${i + 1}`);
         const applyStartedAt = Date.now();
         const newAsar = path.join(UPDATES_DIR(), `app.asar.hop${i}`);
-        await fsDelta.applyDeltaToFile(currentAsar, patchBuf, newAsar); // verify sha256 inside
+        // 0.6.88 — ROOT FIX for "delta-corrupt: bad magic" (production log
+        // 2026-11-18 08:44: every hop downloaded + sha-verified fine, then
+        // EVERY chain failed and every update fell back to the full
+        // installer). The hop file is a BLSTRLS1 RELEASE patch whose payload
+        // CONCATENATES the BLSTDLT1 asar delta and the BLSTOUT1 tree patch.
+        // applyDeltaToFile parses a BLSTDLT1 container, so it must receive
+        // the SLICED asar part — feeding the whole release envelope made the
+        // magic check fail 100% of the time. The tree part was already
+        // sliced correctly via extractTreePart; the asar part was missed.
+        const asarDeltaPart = parsed.payload.subarray(0, parsed.header.asar.size);
+        await fsDelta.applyDeltaToFile(currentAsar, asarDeltaPart, newAsar); // verify sha256 inside
         appliedAsar++;
         stashedAsars.push(newAsar);
         currentAsar = newAsar;
         updateLog('DELTA', `hop ${i + 1} asar delta applied (sha256 verified inside)`, {
           hop: `${hop.fromVersion}→${hop.toVersion}`,
+          asarDeltaBytes: asarDeltaPart.length,
           seconds: ((Date.now() - applyStartedAt) / 1000).toFixed(1),
         });
       }

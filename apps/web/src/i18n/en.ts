@@ -4419,6 +4419,12 @@ const en: Record<TranslationKeys, string> = {
   txOverrideApplied: "Manual override applied (gateway unreachable)",
   txRefusedPending: "Gateway still reports pending — action refused",
   txReconciled: "Reconciled",
+  // 0.6.88 — gateway-aware cancel of a PENDING payment
+  txCancelPayment: "Cancel payment",
+  txCancelConfirmDesc: "The pending payment will be canceled: the gateway checkout is expired so it can never complete, and the agency can subscribe again immediately.",
+  txCancelSuccess: "Payment canceled — the agency can subscribe again",
+  txCancelAlreadyPaid: "Payment already completed — settled as paid instead of canceled",
+  statusCanceled: "Canceled",
 
   // ─── Task 2-c: manual full sync (agency + customer settings) ────────────
   fullSyncTitle: "Full data sync",

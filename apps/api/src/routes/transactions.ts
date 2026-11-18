@@ -4,6 +4,9 @@ import { requireAuth, requireAgencyAccess, authErrorResponse } from '../lib/auth
 import { validateBody } from '../lib/validations'
 import { ensureInvoiceForTransaction } from '../lib/billing-invoices'
 import { z } from 'zod'
+import { getCheckoutStatus, expireCheckout } from '../lib/chargily-service'
+import { fulfillCheckoutFailed, fulfillCheckoutPaid, normalizeChargilyStatus, type FulfillmentCheckout } from '../lib/chargily-fulfill'
+import { appendTxEvent } from '../lib/tx-log'
 
 const app = new Hono()
 
@@ -407,6 +410,181 @@ app.put('/:id/review', async (c) => {
     })
 
     return c.json({ success: true, transaction: updatedTransaction })
+  } catch (error: unknown) {
+    const err = authErrorResponse(error)
+    return c.json({ success: err.success, error: err.error }, err.status as any)
+  }
+})
+
+// ─── Cancel a PENDING payment (0.6.88) ───────────────────────────────────
+// POST /transactions/:id/cancel
+//
+// Field report (log export 2026-11-18): a subscription checkout whose
+// embedded gateway page was abandoned WITHOUT paying stayed PENDING forever
+// — the agency could not cancel it, the admin console had no cancel either,
+// and because subscriptionStatus PENDING counts as a "live" subscription
+// (agency-subscription.tsx hasLiveSubscription) the agency was BLOCKED from
+// re-subscribing. The 30-min sweeper only runs on an external timer and
+// settles >30-min rows; an IMMEDIATE, user-driven cancel was missing.
+//
+// Gateway-owned rows (providerRef set) are probed FIRST — never cancel a
+// payment that actually completed (the payer would lose money):
+//   gateway paid .......... settle as PAID instead and refuse the cancel
+//   gateway failed ........ settle FAILED through the standard fulfillment
+//   gateway pending ....... expire the checkout remotely, then settle FAILED
+//   gateway unreachable ... local-cancel ONLY for checkouts older than the
+//                           sweeper's 30-min stale window (hosted checkouts
+//                           auto-expire; below the window the payer may still
+//                           be mid-payment, so we ask the caller to retry)
+// Manual receipt rows (providerRef '') cancel locally with no gateway call.
+// After a successful cancel the agency's subscriptionStatus is released
+// (PENDING → INACTIVE) when no OTHER pending payment remains, un-blocking
+// the Subscribe buttons immediately.
+app.post('/:id/cancel', async (c) => {
+  try {
+    const user = await requireAuth(c)
+    const id = c.req.param('id')
+
+    const transaction = await db.transaction.findUnique({
+      where: { id },
+      include: {
+        agency: { select: { id: true, name: true, ownerId: true, subscriptionStatus: true } },
+      },
+    })
+    if (!transaction) return c.json({ success: false, error: 'Transaction not found' }, 404)
+    if (transaction.status !== 'PENDING') {
+      return c.json({ success: false, error: `Only PENDING payments can be canceled (current status: ${transaction.status})` }, 409)
+    }
+
+    // Platform admins cancel any agency's payment; otherwise the caller must
+    // belong to (own) the agency the payment belongs to.
+    const isPlatformAdmin = user.role === 'SUPER_ADMIN' || user.role === 'ADMIN'
+    if (!isPlatformAdmin) await requireAgencyAccess(c, transaction.agencyId)
+
+    const source = isPlatformAdmin ? 'admin-cancel' as const : 'agency-cancel' as const
+    const cancelReason = isPlatformAdmin
+      ? 'Canceled by platform admin before payment completion'
+      : 'Canceled by agency before payment completion'
+    const now = new Date()
+    const ageMs = now.getTime() - new Date(transaction.createdAt).getTime()
+
+    const gatewayPayload = (status: string): FulfillmentCheckout => ({
+      id: transaction.providerRef || id,
+      status,
+      amount: transaction.amount,
+      payment_method: transaction.paymentMethod,
+      metadata: null,
+    })
+
+    if (transaction.providerRef) {
+      let checkout: Awaited<ReturnType<typeof getCheckoutStatus>> | null = null
+      let gatewayError = ''
+      try {
+        checkout = await getCheckoutStatus(transaction.providerRef)
+      } catch (err) {
+        gatewayError = err instanceof Error ? err.message : String(err)
+      }
+
+      if (checkout) {
+        const normalized = normalizeChargilyStatus(String((checkout as { status?: string }).status || ''))
+        if (normalized === 'paid') {
+          // Money already moved — NEVER cancel. Settle as paid instead.
+          try {
+            await fulfillCheckoutPaid({
+              ...gatewayPayload(String((checkout as { status?: string }).status || 'paid')),
+            }, source)
+          } catch (err) {
+            console.warn('[transactions] cancel-guard: paid settlement failed:', err)
+          }
+          return c.json({
+            success: false,
+            error: 'This payment was already completed at the gateway — it has been settled as PAID instead of canceled.',
+          }, 409)
+        }
+        if (normalized === 'failed') {
+          await fulfillCheckoutFailed(gatewayPayload(String((checkout as { status?: string }).status || 'failed')), source)
+          const updated = await db.transaction.findUnique({ where: { id } })
+          return c.json({ success: true, transaction: updated, canceledVia: 'gateway-failed' })
+        }
+        // Still pending at the gateway — expire it remotely so no charge can
+        // complete after this point, then settle the local row as FAILED.
+        try { await expireCheckout(transaction.providerRef) } catch (err) {
+          console.warn('[transactions] cancel: gateway expire failed (continuing):', err instanceof Error ? err.message : err)
+        }
+        await fulfillCheckoutFailed(gatewayPayload('expired'), source)
+        const updated = await db.transaction.findUnique({ where: { id } })
+        return c.json({ success: true, transaction: updated, canceledVia: 'gateway-expired' })
+      }
+
+      // Gateway unreachable — protect the payer below the stale window.
+      if (ageMs < 30 * 60 * 1000) {
+        return c.json({
+          success: false,
+          error: `Payment gateway unreachable (${gatewayError || 'unknown error'}) — the payment is too recent to cancel blindly. Please retry in a few minutes.`,
+        }, 503)
+      }
+    }
+
+    // Local cancel (manual receipt rows, or gateway rows past the stale
+    // window with the gateway unreachable). OCC guard mirrors /review.
+    const updateResult = await db.transaction.updateMany({
+      where: { id: transaction.id, status: 'PENDING', version: transaction.version },
+      data: {
+        status: 'CANCELED',
+        rejectionReason: cancelReason,
+        reviewedBy: user.id,
+        reviewedAt: now,
+        version: { increment: 1 },
+      },
+    })
+    if (updateResult.count === 0) {
+      return c.json({ success: false, error: 'Transaction already reviewed or concurrently modified' }, 409)
+    }
+
+    // Release the agency gate: PENDING subscriptionStatus blocks re-subscribing
+    // (hasLiveSubscription counts PENDING as live). Flip to INACTIVE only when
+    // THIS was the last pending payment for the agency.
+    const agencyId = transaction.agencyId
+    const otherPending = await db.transaction.count({
+      where: { agencyId, status: 'PENDING', id: { not: transaction.id } },
+    })
+    if (!otherPending && transaction.agency?.subscriptionStatus === 'PENDING') {
+      await db.agency.update({ where: { id: agencyId }, data: { subscriptionStatus: 'INACTIVE' } })
+    }
+
+    await db.auditLog.create({
+      data: {
+        userId: user.id,
+        action: isPlatformAdmin ? 'PAYMENT_ADMIN_CANCEL' : 'PAYMENT_AGENCY_CANCEL',
+        entityType: 'TRANSACTION',
+        entityId: transaction.id,
+        details: JSON.stringify({
+          transactionId: transaction.id,
+          agencyId,
+          amount: transaction.amount,
+          plan: transaction.planName || transaction.plan,
+          providerRef: transaction.providerRef || null,
+          gatewayProbed: !!transaction.providerRef,
+          ageMinutes: Math.round(ageMs / 60000),
+        }),
+      },
+    })
+
+    appendTxEvent({
+      stage: 'payment_canceled',
+      message: `${isPlatformAdmin ? 'Platform admin' : 'Agency'} canceled the pending ${transaction.planName || transaction.plan} payment (${transaction.amount} DA) before completion`,
+      level: 'info',
+      data: { source, via: 'local', plan: transaction.plan },
+      identity: { agencyId, role: isPlatformAdmin ? 'SUPER_ADMIN' : 'AGENCY_OWNER', userId: user.id, username: user.username || undefined },
+      ref: transaction.id,
+      checkoutId: transaction.providerRef || null,
+      txType: 'subscription',
+      status: 'CANCELED',
+      amount: transaction.amount,
+    })
+
+    const updated = await db.transaction.findUnique({ where: { id } })
+    return c.json({ success: true, transaction: updated, canceledVia: 'local' })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
     return c.json({ success: err.success, error: err.error }, err.status as any)

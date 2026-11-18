@@ -2762,6 +2762,9 @@ export function AgencySubscription() {
   // GET /api/transactions?limit=20. On failure it falls back to the
   // subscription response's recentTransactions.
   const [paymentHistory, setPaymentHistory] = useState<Transaction[] | null>(null);
+  // 0.6.88 — gateway-aware cancel of a PENDING payment (agency side).
+  const [cancelTx, setCancelTx] = useState<Transaction | null>(null);
+  const [cancelTxLoading, setCancelTxLoading] = useState(false);
   const [paymentHistoryFailed, setPaymentHistoryFailed] = useState(false);
 
   // v0.6.53 — invoice QR scanner dialog (verify any BLASTI document).
@@ -2911,6 +2914,43 @@ export function AgencySubscription() {
       }
     } catch {
       setPaymentHistoryFailed(true);
+    }
+  };
+
+  // 0.6.88 — Cancel a PENDING payment (gateway-aware).
+  // POST /api/transactions/:id/cancel probes the live gateway first: an
+  // already-PAID checkout is settled instead of canceled (409 + toast), a
+  // still-pending one is expired remotely then settled FAILED, and the
+  // agency's PENDING subscription gate (which blocks the Subscribe buttons)
+  // is released server-side. This is the immediate unblock the 30-min
+  // background sweeper could never provide.
+  const handleCancelPendingTx = async () => {
+    if (!cancelTx) return;
+    setCancelTxLoading(true);
+    try {
+      const res = await apiFetch(`/api/transactions/${cancelTx.id}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        toast.success(t('txCancelSuccess') || 'Payment canceled');
+        setCancelTx(null);
+        // subscriptionStatus may have been released → refresh BOTH feeds.
+        fetchSubscription();
+        fetchPaymentHistory();
+      } else if (res.status === 409 && /already completed/i.test(String(data.error || ''))) {
+        toast.warning(data.error || t('txCancelAlreadyPaid') || 'Payment already completed — settled as paid');
+        setCancelTx(null);
+        fetchSubscription();
+        fetchPaymentHistory();
+      } else {
+        toast.error(data.error || t('error'));
+      }
+    } catch {
+      toast.error(t('error'));
+    } finally {
+      setCancelTxLoading(false);
     }
   };
 
@@ -4504,6 +4544,9 @@ export function AgencySubscription() {
                   // counts as success; FAILED/REJECTED stay rejected.
                   const isApproved = tx.status === 'APPROVED' || tx.status === 'COMPLETED';
                   const isPending = tx.status === 'PENDING';
+                  // 0.6.88 — CANCELED is its own terminal state (gateway-aware
+                  // cancel), distinct from FAILED/REJECTED.
+                  const isCanceled = tx.status === 'CANCELED';
                   // Prefer the snapshot planName (frozen at transaction time)
                   // then fall back to resolving the legacy `plan` string against
                   // the catalog, then the raw value.
@@ -4532,14 +4575,16 @@ export function AgencySubscription() {
                           ? 'bg-emerald-100 dark:bg-emerald-900/30'
                           : isPending
                             ? 'bg-amber-100 dark:bg-amber-900/30'
-                            : 'bg-red-100 dark:bg-red-900/30'
+                            : isCanceled
+                              ? 'bg-gray-100 dark:bg-gray-800/60'
+                              : 'bg-red-100 dark:bg-red-900/30'
                       }`}>
                         {isApproved ? (
                           <CheckCircle2 className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
                         ) : isPending ? (
                           <Clock className="h-5 w-5 text-amber-600 dark:text-amber-400" />
                         ) : (
-                          <X className="h-5 w-5 text-red-600 dark:text-red-400" />
+                          <X className={`h-5 w-5 ${isCanceled ? 'text-gray-500 dark:text-gray-400' : 'text-red-600 dark:text-red-400'}`} />
                         )}
                       </div>
 
@@ -4554,10 +4599,12 @@ export function AgencySubscription() {
                                 ? 'text-[10px] bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 border-emerald-200'
                                 : isPending
                                   ? 'text-[10px] bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 border-amber-200'
-                                  : 'text-[10px] bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400 border-red-200'
+                                  : isCanceled
+                                    ? 'text-[10px] bg-gray-50 text-gray-600 dark:bg-gray-800/60 dark:text-gray-400 border-gray-200'
+                                    : 'text-[10px] bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-400 border-red-200'
                             }
                           >
-                            {isApproved ? t('approved') : isPending ? t('pending') : t('rejected')}
+                            {isApproved ? t('approved') : isPending ? t('pending') : isCanceled ? (t('statusCanceled') || 'Canceled') : t('rejected')}
                           </Badge>
                         </div>
                         <p className="text-xs text-muted-foreground mt-0.5">
@@ -4570,9 +4617,22 @@ export function AgencySubscription() {
                         )}
                       </div>
 
-                      {/* Amount */}
+                      {/* Amount + cancel action */}
                       <div className="text-end flex-shrink-0">
                         <p className="text-sm font-bold text-foreground">{displayAmount.toLocaleString()} {t('currency')}</p>
+                        {isPending && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-8 px-2.5 mt-1.5 text-xs border-gray-300 text-gray-600 hover:bg-gray-50 dark:border-gray-700 dark:text-gray-400 dark:hover:bg-gray-900/40"
+                            onClick={() => setCancelTx(tx)}
+                            disabled={cancelTxLoading}
+                            title={t('txCancelPayment') || 'Cancel payment'}
+                          >
+                            <X className="h-3.5 w-3.5 me-1" />
+                            {t('txCancelPayment') || 'Cancel payment'}
+                          </Button>
+                        )}
                       </div>
                     </motion.div>
                   );
@@ -4620,6 +4680,47 @@ export function AgencySubscription() {
         hardware={hardwareProp}
         chargilyEnabled={chargilyEnabled}
       />
+
+      {/* ─── 0.6.88 — Cancel-pending-payment confirmation (gateway-aware) ─── */}
+      <AlertDialog
+        open={!!cancelTx}
+        onOpenChange={(o) => {
+          if (!o && !cancelTxLoading) setCancelTx(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('txCancelPayment') || 'Cancel payment'}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('txCancelConfirmDesc') || 'The pending payment will be canceled and the agency will be able to subscribe again.'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {cancelTx && (
+            <div className="rounded-xl border border-border/50 bg-muted/30 p-3 text-sm">
+              <p className="font-medium text-foreground">
+                {cancelTx.planName || resolvePlanName(cancelTx.plan) || cancelTx.plan}
+              </p>
+              <p className="text-muted-foreground text-xs mt-0.5">
+                {(cancelTx.amountPaid ?? cancelTx.amount).toLocaleString()} {t('currency')} · {t('pending')}
+              </p>
+            </div>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={cancelTxLoading}>{t('cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-gray-700 hover:bg-gray-800 text-white focus:ring-gray-500"
+              onClick={(e) => {
+                e.preventDefault(); // keep the dialog open while the request runs
+                handleCancelPendingTx();
+              }}
+              disabled={cancelTxLoading}
+            >
+              {cancelTxLoading ? <Loader2 className="h-4 w-4 animate-spin me-1.5" /> : <X className="h-4 w-4 me-1.5" />}
+              {t('txCancelPayment') || 'Cancel payment'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* ─── Invoice QR scanner dialog (v0.6.53) — rendered at the component
           root, outside the nested cards. ─── */}
