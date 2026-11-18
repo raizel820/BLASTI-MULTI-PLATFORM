@@ -31,6 +31,10 @@ import { markReservationConfirmed, stopNotificationSound } from '@/lib/sounds'
 import { wasTurnAlertDismissedNatively } from '@/lib/notification-channel'
 import { getNativeCloudUrl, ensureNativeCloudUrl, onNativeCloudStateChange } from '@/lib/native-cloud-resolver'
 import { handleRealtimeCacheEvent } from '@/lib/realtime-cache-invalidation'
+// 0.6.91 — device event stream: realtime connect/disconnect is now visible
+// in the Logs Manager "Devices" tab for web AND mobile (this hook runs in the
+// Capacitor WebView too).
+import { logDevice } from '@/lib/remote-logger'
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -300,6 +304,8 @@ export function useRealtime(options?: UseRealtimeOptions) {
   // Device credential for join:device (TV boards / kiosks) — re-emitted on
   // every reconnect from the connection effect below.
   const deviceTokenRef = useRef<string | null>(null)
+  // 0.6.91 — device event stream dedupe: one socket_connected entry per mount.
+  const mountedConnectedOnce = useRef(false)
 
   // ─── Connection Lifecycle ─────────────────────────────────────────────
 
@@ -328,6 +334,15 @@ export function useRealtime(options?: UseRealtimeOptions) {
 
       const onConnect = () => {
         setConnectionStatus('connected')
+        // 0.6.91 — device event stream: cloud realtime (re)connected. The
+        // server ALSO logs the authoritative join/leave — this covers the
+        // client view for web AND mobile (this hook runs in the Capacitor
+        // WebView too). Deduped per hook mount: socket.io fires 'connect' on
+        // every reconnection, and a per-mount Set keeps the stream lean.
+        if (!mountedConnectedOnce.current) {
+          mountedConnectedOnce.current = true
+          try { logDevice('socket_connected', 'Realtime connection to the server established') } catch { /* never block */ }
+        }
         // Task 75: (re)authenticate BEFORE re-joining rooms. The singleton
         // socket may have been created before the session existed (handshake
         // auth is captured once and reused on every reconnect) — without this
@@ -356,6 +371,8 @@ export function useRealtime(options?: UseRealtimeOptions) {
 
       const onDisconnect = (reason: string) => {
         setConnectionStatus('disconnected')
+        // 0.6.91 — device event stream: realtime dropped (previously console-only).
+        try { logDevice('socket_disconnected', `Realtime connection dropped (${reason})`, { reason: String(reason ?? 'unknown') }, 'warn') } catch { /* never block */ }
 
         // On native platforms, try connecting to LAN server after 5s delay
         if (isNativePlatform() && !lanSocket) {
@@ -375,6 +392,8 @@ export function useRealtime(options?: UseRealtimeOptions) {
       const onReconnectFailed = () => {
         setConnectionStatus('disconnected')
         console.log('[Realtime] Cloud reconnection failed — staying in offline mode')
+        // 0.6.91 — device event stream: every reconnect attempt exhausted.
+        try { logDevice('connect_failed', 'Realtime reconnection attempts exhausted — staying offline', undefined, 'error') } catch { /* never block */ }
       }
 
       socket.on('connect', onConnect)

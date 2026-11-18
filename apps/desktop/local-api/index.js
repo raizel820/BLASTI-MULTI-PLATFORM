@@ -3889,6 +3889,20 @@ function createApp() {
   }
 
   const forwardPendingLogs = async () => {
+    // 0.6.88 — DEVICE EVENT STREAM drain: events emitted by the local device
+    // routes, the discovery scanner and main.js kiosk windows ride the same
+    // cloud-forward pipeline as client batches (platform 'desktop', channel
+    // 'device' — the cloud ingest mirrors them into the _devices stream).
+    try {
+      const deviceEvents = require('./lib/device-event').drainDeviceEvents()
+      if (deviceEvents.length > 0) {
+        pendingCloudLogBatches.push({
+          platform: 'desktop',
+          appVersion: global.__blastiAppVersion || undefined,
+          entries: deviceEvents,
+        })
+      }
+    } catch { /* the drain never breaks the forwarder */ }
     if (pendingCloudLogBatches.length === 0) return
     // 0.6.55 — ANONYMOUS FORWARD: the old gate (`!sessionToken → return`) kept
     // update-failure trails hostage on machines where NOBODY signed in. The
@@ -4015,6 +4029,12 @@ function createApp() {
   })
   // Back-compat alias — some web builds POST the manual flush to /flush only.
   app.post('/api/logs/flush/*', (c) => c.req.path.endsWith('/flush') ? c.json({ success: true }) : c.next())
+
+  // 0.6.88 — periodic forward tick: device events (scan/pair/connect/kiosk)
+  // flush within 30 s of emission even when no client ingest traffic flows.
+  // Unref'd so it never keeps the process alive on shutdown.
+  const deviceEventForwardTimer = setInterval(() => { void forwardPendingLogs() }, 30_000)
+  try { if (deviceEventForwardTimer && typeof deviceEventForwardTimer.unref === 'function') deviceEventForwardTimer.unref() } catch { /* timers without unref are fine */ }
 
   /**
    * Round 15 — /api/agencies cloud proxy. Agency CREATION is a cloud-native

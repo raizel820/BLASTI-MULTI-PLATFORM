@@ -23,6 +23,7 @@ import {
   recordFailedRequest,
 } from '../lib/rate-limit'
 import { calculateETA, getEffectiveServiceTime, filterGhostTickets } from '../lib/eta-calculator'
+import { appendDeviceEvent } from '../lib/device-event-log'
 import { todayLocalDateString } from '../lib/queue-waiting'
 import {
   runDiscoveryScan,
@@ -1015,6 +1016,13 @@ app.post('/public/kiosk-auth', async (c) => {
     if (!foundDevice) {
       if (clientIp) recordFailedRequest(clientIp)
       recordPairingFailure(normalizedPairingCode)
+      // 0.6.88 — device event stream: kiosk credentials rejected.
+      appendDeviceEvent({
+        event: 'kiosk_auth_failed',
+        message: 'kiosk-auth rejected — pairing code not found',
+        level: 'warn',
+        data: { reason: 'not_found' },
+      })
       return c.json({ success: false, error: 'Device not found. Check pairing code.' }, 404)
     }
 
@@ -1022,6 +1030,17 @@ app.post('/public/kiosk-auth', async (c) => {
     if (foundDevice.deviceToken !== deviceToken) {
       if (clientIp) recordFailedRequest(clientIp)
       recordPairingFailure(normalizedPairingCode)
+      // 0.6.88 — device event stream: kiosk credentials rejected.
+      appendDeviceEvent({
+        event: 'kiosk_auth_failed',
+        message: 'kiosk-auth rejected — device token mismatch',
+        level: 'warn',
+        deviceId: foundDevice.id,
+        deviceName: foundDevice.name,
+        deviceType: foundDevice.type,
+        agencyId: foundDevice.agencyId,
+        data: { reason: 'token_mismatch' },
+      })
       return c.json({ success: false, error: 'Invalid device token. Contact your agency admin.' }, 401)
     }
 
@@ -1049,6 +1068,26 @@ app.post('/public/kiosk-auth', async (c) => {
       deviceId: foundDevice.id,
       deviceName: foundDevice.name,
       deviceType: foundDevice.type,
+    })
+
+    // 0.6.88 — device event stream: kiosk login succeeded → ONLINE.
+    appendDeviceEvent({
+      event: 'kiosk_auth_success',
+      message: `Kiosk authenticated with pairing code (${foundDevice.name})`,
+      deviceId: foundDevice.id,
+      deviceName: foundDevice.name,
+      deviceType: foundDevice.type,
+      agencyId: foundDevice.agencyId,
+      status: 'ONLINE',
+    })
+    appendDeviceEvent({
+      event: 'device_online',
+      message: 'Device marked ONLINE via kiosk-auth',
+      deviceId: foundDevice.id,
+      deviceName: foundDevice.name,
+      deviceType: foundDevice.type,
+      agencyId: foundDevice.agencyId,
+      status: 'ONLINE',
     })
 
     if (clientIp) recordSuccessfulRequest(clientIp)
@@ -1168,6 +1207,16 @@ app.post('/public/discover-register', async (c) => {
         deviceId: newDevice.id,
         deviceName: newDevice.name,
         deviceType: newDevice.type,
+      })
+      // 0.6.88 — device event stream: kiosk self-registered for discovery.
+      appendDeviceEvent({
+        event: 'kiosk_registered',
+        message: `Kiosk registered for discovery (${newDevice.name})`,
+        deviceId: newDevice.id,
+        deviceName: newDevice.name,
+        deviceType: newDevice.type,
+        status: 'PAIRING',
+        data: { connectionType: connectionType || 'LAN', fingerprinted: Boolean(deviceFingerprint) },
       })
     }
 
@@ -1648,6 +1697,17 @@ app.post('/device/accept-pairing', async (c) => {
       deviceType: device.type,
     })
 
+    // 0.6.88 — device event stream: kiosk approved the agency pairing request.
+    appendDeviceEvent({
+      event: 'pairing_accepted',
+      message: `Kiosk accepted pairing with agency ${agency.name}`,
+      deviceId: device.id,
+      deviceName: device.name,
+      deviceType: device.type,
+      agencyId,
+      status: 'ONLINE',
+    })
+
     return c.json({
       success: true,
       device: updatedDevice,
@@ -1687,6 +1747,16 @@ app.post('/device/reject-pairing', async (c) => {
     if (result.count === 0) {
       return c.json({ success: false, error: 'Pairing request not found or already processed' }, 404)
     }
+
+    // 0.6.88 — device event stream: kiosk rejected the pairing request.
+    appendDeviceEvent({
+      event: 'pairing_rejected',
+      message: 'Kiosk rejected the pairing request',
+      deviceId: device.id,
+      deviceName: device.name,
+      deviceType: device.type,
+      level: 'warn',
+    })
 
     return c.json({ success: true })
   } catch (error: unknown) {
@@ -1873,6 +1943,19 @@ app.post('/:id/pairing-request', async (c) => {
       commandId: command.id,
       agencyId: agency.id,
       agencyName: agency.name,
+    })
+
+    // 0.6.88 — device event stream: agency sent a pairing request to a kiosk.
+    appendDeviceEvent({
+      event: 'pairing_requested',
+      message: `Pairing request sent to ${device.name} by ${user.fullName || user.username}`,
+      deviceId: device.id,
+      deviceName: device.name,
+      deviceType: device.type,
+      agencyId: agency.id,
+      userId: user.id,
+      username: user.username,
+      data: { commandId: command.id },
     })
 
     return c.json({
@@ -2295,6 +2378,19 @@ app.post('/:id/pair', async (c) => {
       select: DEVICE_SELECT,
     })
 
+    // 0.6.88 — device event stream: pairing initiated (credentials issued).
+    appendDeviceEvent({
+      event: 'pair_started',
+      message: `Pairing initiated for ${existing.name || existing.id} — new pairing code issued`,
+      deviceId: existing.id,
+      deviceName: existing.name,
+      deviceType: existing.type,
+      agencyId: user.agencyId,
+      userId: user.id,
+      username: user.username,
+      status: 'PAIRING',
+    })
+
     return c.json({ success: true, pairingCode: device.pairingCode, deviceToken })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -2332,6 +2428,19 @@ app.post('/:id/connect', async (c) => {
     // H2: Emit realtime event
     emitAgencyDeviceEvent('agency-device:connected', user.agencyId, { deviceId: existing.id })
 
+    // 0.6.88 — device event stream: manual connect.
+    appendDeviceEvent({
+      event: 'connect_success',
+      message: `Device marked connected by ${user.fullName || user.username}`,
+      deviceId: existing.id,
+      deviceName: existing.name,
+      deviceType: existing.type,
+      agencyId: user.agencyId,
+      userId: user.id,
+      username: user.username,
+      status: 'ONLINE',
+    })
+
     return c.json({ success: true, device })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -2367,6 +2476,19 @@ app.post('/:id/disconnect', async (c) => {
 
     // H2: Emit realtime event
     emitAgencyDeviceEvent('agency-device:disconnected', user.agencyId, { deviceId: existing.id })
+
+    // 0.6.88 — device event stream: manual disconnect (token invalidated).
+    appendDeviceEvent({
+      event: 'disconnect',
+      message: `Device disconnected by ${user.fullName || user.username} — token invalidated`,
+      deviceId: existing.id,
+      deviceName: existing.name,
+      deviceType: existing.type,
+      agencyId: user.agencyId,
+      userId: user.id,
+      username: user.username,
+      status: 'OFFLINE',
+    })
 
     return c.json({ success: true, device })
   } catch (error: unknown) {
@@ -2636,6 +2758,18 @@ app.post('/:id/kiosk-credentials', async (c) => {
       data: { pairingCode, deviceToken, status: existing.status === 'DISABLED' ? 'OFFLINE' : existing.status },
     })
 
+    // 0.6.88 — device event stream: kiosk credentials (re)issued.
+    appendDeviceEvent({
+      event: 'kiosk_credentials_issued',
+      message: `Kiosk credentials generated for ${existing.name || existing.id}`,
+      deviceId: existing.id,
+      deviceName: existing.name,
+      deviceType: existing.type,
+      agencyId: user.agencyId,
+      userId: user.id,
+      username: user.username,
+    })
+
     return c.json({ success: true, pairingCode, deviceToken, regenerated: true })
   } catch (error: unknown) {
     const err = authErrorResponse(error)
@@ -2678,6 +2812,19 @@ app.post('/:id/kiosk-credentials/regenerate', async (c) => {
         status: 'PAIRING',
         statusChangedAt: new Date(),
       },
+    })
+
+    // 0.6.88 — device event stream: kiosk credentials force-regenerated.
+    appendDeviceEvent({
+      event: 'kiosk_credentials_issued',
+      message: `Kiosk credentials FORCE-regenerated for ${existing.name || existing.id} (old tokens invalidated)`,
+      deviceId: existing.id,
+      deviceName: existing.name,
+      deviceType: existing.type,
+      agencyId: user.agencyId,
+      userId: user.id,
+      username: user.username,
+      status: 'PAIRING',
     })
 
     return c.json({ success: true, pairingCode, deviceToken, regenerated: true })
@@ -2808,10 +2955,29 @@ async function runEmbeddedScan() {
       },
     })
     scanState.phase = scanAbort?.aborted ? 'idle' : 'complete'
+    // 0.6.88 — device event stream: cloud scan outcome.
+    appendDeviceEvent({
+      event: scanAbort?.aborted ? 'scan_stopped' : 'scan_completed',
+      message: `Embedded discovery scan ${scanAbort?.aborted ? 'stopped' : 'completed'} — ${scanDevices.length} device(s) known`,
+      sessionId: scanId,
+      data: {
+        subnets: subnets.length,
+        totalIPs: scanState.totalIPs,
+        devicesFound: scanDevices.length,
+        elapsedSec: Math.floor((Date.now() - startTime) / 1000),
+      },
+    })
   } catch (err) {
     scanState.phase = 'error'
     // eslint-disable-next-line no-console
     console.error('[discovery] scan failed:', err)
+    // 0.6.88 — device event stream: scan crashed.
+    appendDeviceEvent({
+      event: 'scan_failed',
+      message: `Embedded discovery scan failed: ${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}`,
+      level: 'error',
+      sessionId: scanId,
+    })
   } finally {
     scanState.scanning = false
     scanState.devicesFound = scanDevices.length
@@ -2832,6 +2998,13 @@ function stopEmbeddedScan() {
   }
   scanState.scanning = false
   scanState.phase = 'idle'
+  // 0.6.88 — device event stream: operator stopped the scan.
+  appendDeviceEvent({
+    event: 'scan_stopped',
+    message: `Embedded discovery scan stopped by operator`,
+    sessionId: scanState.scanId,
+    data: { devicesFound: scanDevices.length },
+  })
 }
 
 // ─── Response shapers (keep REST contract identical to old proxy) ──────────

@@ -35,6 +35,9 @@ const crypto = require('crypto')
 const net = require('net')
 const scanner = require('./lib/discovery-scanner')
 const castService = require('./lib/cast-service')
+// 0.6.88 — DEVICE EVENT STREAM producer (module-level: runEmbeddedScan and
+// stopEmbeddedScan live outside the route-registration closure).
+const deviceEvents = require('./lib/device-event')
 
 // ─── Helpers (mirror cloud route) ────────────────────────────────────────────
 
@@ -341,10 +344,12 @@ function scheduleDiscoveryCacheSave() {
 // Preload the cache so the UI shows previously discovered devices instantly.
 scanDevices = loadDiscoveryCache().map(markCachedDevice)
 
-async function runEmbeddedScan() {
+  async function runEmbeddedScan() {
   if (scanState.scanning) return
   const scanId = `scan-${Date.now()}`
   const subnets = scanner.getLocalSubnets()
+  // 0.6.88 — device event stream: scan started.
+  deviceEvents.deviceEvent('scan_started', `Multi-protocol LAN scan started (${subnets.length} subnet(s))`, { sessionId: scanId, subnets: subnets.length })
   scanState = {
     scanning: true,
     scanId,
@@ -385,9 +390,17 @@ async function runEmbeddedScan() {
       },
     })
     scanState.phase = scanAbort && scanAbort.aborted ? 'idle' : 'complete'
+    // 0.6.88 — device event stream: scan outcome.
+    deviceEvents.deviceEvent(
+      scanAbort && scanAbort.aborted ? 'scan_stopped' : 'scan_completed',
+      `LAN scan ${scanAbort && scanAbort.aborted ? 'stopped' : 'completed'} — ${scanDevices.length} device(s) known`,
+      { sessionId: scanId, devicesFound: scanDevices.length, elapsedSec: Math.floor((Date.now() - startTime) / 1000) },
+    )
   } catch (err) {
     scanState.phase = 'error'
     console.error('[agency-devices] scan failed:', err && err.message ? err.message : err)
+    // 0.6.88 — device event stream: scan crashed.
+    deviceEvents.deviceEvent('scan_failed', `LAN scan failed: ${err && err.message ? String(err.message).slice(0, 200) : String(err).slice(0, 200)}`, { sessionId: scanId }, 'error')
   } finally {
     scanState.scanning = false
     scanState.devicesFound = scanDevices.length
@@ -408,6 +421,10 @@ function stopEmbeddedScan() {
   }
   scanState.scanning = false
   scanState.phase = 'idle'
+  // 0.6.88 — device event stream: operator stopped the scan.
+  try {
+    deviceEvents.deviceEvent('scan_stopped', 'LAN scan stopped by operator', { sessionId: scanState.scanId, devicesFound: scanDevices.length })
+  } catch { /* logging must never break the stop path */ }
 }
 
 // ─── Discovery response shapers (identical to the cloud contract) ───────────
@@ -688,6 +705,10 @@ async function buildConnectionProfile(ip, preferredPort) {
 
 module.exports = function registerAgencyDeviceRoutes(app, ctx) {
   const { authMiddleware, requireAgencyId, broadcast, diagLog, getDb } = ctx
+  // 0.6.88 — DEVICE EVENT STREAM: every scan/pair/link/kiosk event below is
+  // emitted through lib/device-event.js (local diag trail + cloud _devices
+  // stream via the local /api/logs forward pipeline).
+  deviceEvents.setDiagLogger(diagLog)
 
   // Optional-auth wrapper for GET /discovery/default-printer (cloud parity:
   // a kiosk may look up its agency's printer via ?agencyId= without a staff
@@ -769,9 +790,18 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         }
         scheduleDiscoveryCacheSave()
       }
+      // 0.6.88 — device event stream: deep-identify probe outcome.
+      deviceEvents.deviceEvent(
+        profile.reachable ? 'connect_success' : 'connect_failed',
+        `Connection probe ${ip}:${port || 0} — ${profile.reachable ? `reachable as ${profile.type || 'unknown'}` : 'unreachable'}`,
+        { deviceType: profile.type, status: profile.reachable ? 'ONLINE' : 'OFFLINE', latencyMs: profile.latencyMs, ip, port: port || undefined },
+        profile.reachable ? 'info' : 'warn',
+      )
       return c.json({ success: true, verified: profile.reachable, profile })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE connect error: ' + (err && err.message))
+      // 0.6.88 — device event stream: probe crashed.
+      deviceEvents.deviceEvent('connect_failed', `Connection probe ${ip} failed: ${err && err.message ? String(err.message).slice(0, 150) : 'unknown error'}`, { ip, port: port || undefined }, 'error')
       return c.json({ success: false, error: 'Connect probe failed' }, 500)
     }
   })
@@ -1488,9 +1518,13 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         },
         select: DEVICE_SELECT_FIELDS,
       })
+      // 0.6.88 — device event stream: pairing initiated (credentials issued).
+      deviceEvents.deviceEvent('pair_started', `Pairing initiated for ${existing.name || existing.id} — new pairing code issued`, { deviceId: existing.id, deviceName: existing.name, deviceType: existing.type, agencyId, status: 'PAIRING' })
       return c.json({ success: true, pairingCode: device.pairingCode, deviceToken })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE pair error: ' + (err && err.message))
+      // 0.6.88 — device event stream: pair attempt crashed.
+      deviceEvents.deviceEvent('pair_failed', `Pair attempt failed: ${err && err.message ? String(err.message).slice(0, 150) : 'unknown error'}`, { deviceId: c.req.param('id'), agencyId }, 'error')
       return c.json({ success: false, error: 'Failed to initiate pairing' }, 500)
     }
   })
@@ -1519,9 +1553,13 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
       })
       broadcastSafe('agency-device:connected', { agencyId, deviceId: device.id, deviceName: device.name })
       broadcastSafe('device:online', { agencyId, deviceId: device.id })
+      // 0.6.88 — device event stream: manual connect.
+      deviceEvents.deviceEvent('connect_success', `Device marked connected: ${device.name || device.id}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId, status: 'ONLINE' })
       return c.json({ success: true, device })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE connect error: ' + (err && err.message))
+      // 0.6.88 — device event stream: connect crashed.
+      deviceEvents.deviceEvent('connect_failed', `Connect failed: ${err && err.message ? String(err.message).slice(0, 150) : 'unknown error'}`, { deviceId: c.req.param('id'), agencyId }, 'error')
       return c.json({ success: false, error: 'Failed to connect device' }, 500)
     }
   })
@@ -1547,6 +1585,8 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         select: DEVICE_SELECT_FIELDS,
       })
       broadcastSafe('agency-device:disconnected', { agencyId, deviceId: device.id, deviceName: device.name })
+      // 0.6.88 — device event stream: manual disconnect.
+      deviceEvents.deviceEvent('disconnect', `Device disconnected: ${device.name || device.id}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId, status: 'OFFLINE' })
       return c.json({ success: true, device })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE disconnect error: ' + (err && err.message))
@@ -1600,6 +1640,8 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         deviceType: existing.type,
         reason: 'unpaired',
       })
+      // 0.6.88 — device event stream: device unlinked from the agency.
+      deviceEvents.deviceEvent('unpair', `Device unpaired: ${existing.name || existing.id} (credentials invalidated)`, { deviceId: existing.id, deviceName: existing.name, deviceType: existing.type, agencyId, status: 'OFFLINE' })
       return c.json({ success: true, device })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE unpair error: ' + (err && err.message))
@@ -1770,6 +1812,8 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
         commandId: command.id,
         agencyName: agency.name,
       })
+      // 0.6.88 — device event stream: agency sent a pairing request to a kiosk.
+      deviceEvents.deviceEvent('pairing_requested', `Pairing request sent to ${device.name} by ${user.fullName || user.username}`, { deviceId: device.id, deviceName: device.name, deviceType: device.type, agencyId: agency.id, sessionId: command.id })
       return c.json({
         success: true,
         message: `Pairing request sent to ${device.name}`,
@@ -1818,6 +1862,8 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
           status: existing.status === 'DISABLED' ? 'OFFLINE' : existing.status,
         },
       })
+      // 0.6.88 — device event stream: kiosk credentials issued.
+      deviceEvents.deviceEvent('kiosk_credentials_issued', `Kiosk credentials generated for ${existing.name || existing.id}`, { deviceId: existing.id, deviceName: existing.name, deviceType: existing.type, agencyId })
       return c.json({ success: true, pairingCode, deviceToken, regenerated: true })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE kiosk-credentials error: ' + (err && err.message))
@@ -1855,6 +1901,8 @@ module.exports = function registerAgencyDeviceRoutes(app, ctx) {
           statusChangedAt: new Date(),
         },
       })
+      // 0.6.88 — device event stream: credentials force-regenerated.
+      deviceEvents.deviceEvent('kiosk_credentials_issued', `Kiosk credentials FORCE-regenerated for ${existing.name || existing.id} (old tokens invalidated)`, { deviceId: existing.id, deviceName: existing.name, deviceType: existing.type, agencyId, status: 'PAIRING' })
       return c.json({ success: true, pairingCode, deviceToken, regenerated: true })
     } catch (err) {
       if (diagLog) diagLog('AGENCY-DEVICE kiosk-credentials regenerate error: ' + (err && err.message))

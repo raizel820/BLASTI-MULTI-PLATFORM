@@ -74,6 +74,12 @@ import {
   summarizeTxEntries,
   type TxFilters,
 } from '../lib/tx-log'
+import {
+  appendDeviceEvent,
+  readDeviceEntries,
+  summarizeDeviceEntries,
+  type DeviceFilters,
+} from '../lib/device-event-log'
 
 const app = new Hono()
 
@@ -475,6 +481,45 @@ app.post('/', async (c) => {
           status: typeof d.status === 'string' ? d.status : undefined,
           amount: typeof d.amount === 'number' ? d.amount : undefined,
           method: typeof d.method === 'string' ? d.method : undefined,
+        })
+      } catch { /* the mirror never fails the ingestion */ }
+    }
+  }
+
+  // ── 0.6.88 — DEVICE CHANNEL MIRROR (one pipeline, one store) ──
+  // Entries tagged channel:'device' (client device/kiosk funnel logger) are
+  // mirrored into the dedicated cross-account stream
+  // logs/_devices/<date>.ndjson — the Logs Manager "Devices" tab reads
+  // exactly that stream. The account-vault write above is untouched.
+  const deviceMirrored = sanitized.filter((e) => (e as { channel?: string }).channel === 'device')
+  if (deviceMirrored.length > 0) {
+    for (const e of deviceMirrored) {
+      const d = (e.data && typeof e.data === 'object' ? e.data : {}) as Record<string, unknown>
+      try {
+        appendDeviceEvent({
+          event: typeof d.event === 'string' ? d.event : 'unknown',
+          message: String(e.message ?? ''),
+          level: typeof e.level === 'string' && ['debug', 'info', 'warn', 'error'].includes(e.level)
+            ? (e.level as 'debug' | 'info' | 'warn' | 'error')
+            : 'info',
+          data: d.event !== undefined
+            ? Object.fromEntries(Object.entries(d).filter(([k]) => !['event', 'deviceId', 'deviceName', 'deviceType', 'sessionId', 'status', 'agencyId'].includes(k)))
+            : d,
+          identity: {
+            uid: (uploader.meta.uid as string | null) ?? null,
+            userId: (uploader.meta.userId as string | null) ?? null,
+            username: (uploader.meta.username as string | null) ?? null,
+            role: (uploader.meta.role as string | null) ?? null,
+            agencyId: (d.agencyId as string | undefined) ?? null,
+          },
+          origin: 'client',
+          platform,
+          appVersion: body.appVersion,
+          deviceId: typeof d.deviceId === 'string' ? d.deviceId : undefined,
+          deviceName: typeof d.deviceName === 'string' ? d.deviceName : undefined,
+          deviceType: typeof d.deviceType === 'string' ? d.deviceType : undefined,
+          sessionId: typeof d.sessionId === 'string' ? d.sessionId : undefined,
+          status: typeof d.status === 'string' ? d.status : undefined,
         })
       } catch { /* the mirror never fails the ingestion */ }
     }
@@ -1252,6 +1297,50 @@ app.get('/transactions', async (c) => {
   }
   const read = readTxEntries(filters)
   const summary = summarizeTxEntries(read.entries)
+  return c.json({
+    success: true,
+    entries: read.entries,
+    scanned: read.scanned,
+    files: read.files,
+    truncated: read.truncated,
+    summary,
+  })
+})
+
+// ─── Device event stream (0.6.88) — the Logs Manager "Devices" tab ──────────
+//
+// GET /api/logs/devices?event=&deviceId=&agencyId=&origin=&platform=
+//                     &deviceType=&sessionId=&level=&uid=&q=&from=&to=&limit=
+//
+// Reads the unified cross-account stream (logs/_devices/<date>.ndjson)
+// that BOTH the client device logger (mirrored by the ingest route) and the
+// server-side device/pairing/kiosk mutations (device-event-log.ts) write to.
+// Returns the newest entries + KPI aggregation + per-device timelines.
+
+app.get('/devices', async (c) => {
+  try { await requireRole(c, 'SUPER_ADMIN') } catch (error) {
+    const err = authErrorResponse(error)
+    return c.json({ success: false, error: err.error }, err.status as any)
+  }
+  const q = (name: string) => (c.req.query(name) || '').trim()
+  const limitRaw = Number(q('limit')) || 0
+  const filters: DeviceFilters = {
+    event: q('event') || undefined,
+    deviceId: q('deviceId') || undefined,
+    agencyId: q('agencyId') || undefined,
+    uid: q('uid') || undefined,
+    origin: q('origin') || undefined,
+    platform: q('platform') || undefined,
+    deviceType: q('deviceType') || undefined,
+    sessionId: q('sessionId') || undefined,
+    level: q('level') || undefined,
+    q: q('q') || undefined,
+    from: q('from') || undefined,
+    to: q('to') || undefined,
+    limit: Math.max(1, Math.min(limitRaw || 600, 5_000)),
+  }
+  const read = readDeviceEntries(filters)
+  const summary = summarizeDeviceEntries(read.entries)
   return c.json({
     success: true,
     entries: read.entries,

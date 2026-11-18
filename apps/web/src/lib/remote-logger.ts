@@ -274,6 +274,50 @@ export function logTx(stage: TxStage, message: string, data?: Record<string, unk
 }
 
 /**
+ * 0.6.88 — REAL-TIME DEVICE EVENT LOGGER.
+ *
+ * ONE entry point for every device/kiosk lifecycle event on any surface
+ * (web console, Capacitor mobile, Electron renderer, kiosk webviews):
+ *   • device-manager SCANNING — scan started/completed/failed/stopped, found N
+ *   • PAIRING + LINKING — pair, pairing-request, accept, reject, unpair,
+ *     connect, disconnect, kiosk-credentials
+ *   • CONNECTIONS — realtime connect/disconnect/reconnect, LAN discovery
+ *   • KIOSK MODE — enter/exit, kiosk-auth result, discover-register
+ *
+ * Entries carry tag 'device' + channel 'device' so the server ingest mirrors
+ * them into the unified cross-account device stream (logs/_devices/) that the
+ * Logs Manager "Devices" tab reads. The event slug + deviceId/deviceName/
+ * deviceType/sessionId/status/agencyId ride inside `data` (the mirror lifts
+ * them to top-level stream fields).
+ *
+ * Flushes via the urgent path (≈1.2 s debounce) so pairing failures are
+ * visible in the manager while the operator is still looking at the screen.
+ * Never throws, never blocks — identical safety contract to logEvent().
+ *
+ * @param event   - one of DEVICE_EVENTS (or a new slug — kept verbatim)
+ * @param message - human-readable line (support-facing English)
+ * @param data    - { deviceId, deviceName, deviceType, sessionId, status, agencyId, ...extras }
+ * @param level   - info (default) | warn | error | debug
+ */
+export function logDevice(event: string, message: string, data?: Record<string, unknown>, level: LogEntry['level'] = 'info'): void {
+  if (buffer.length >= MAX_BUFFER) buffer = buffer.slice(-MAX_BUFFER + 1);
+  buffer.push({
+    ts: new Date().toISOString(),
+    level,
+    tag: 'device',
+    message,
+    channel: 'device',
+    data: { event, ...(data ?? {}) },
+  });
+  if (Date.now() - lastPersistAt > 5_000) {
+    lastPersistAt = Date.now();
+    persist();
+  }
+  // REAL-TIME: a device event never waits for the 30 s tick.
+  scheduleUrgentFlush('sync');
+}
+
+/**
  * STRICT MODE — schedule an urgent flush after a tiny debounce (batch a
  * burst of errors from one crash into a single request). Errors from ANY
  * source funnel here: console.error, window.onerror, unhandledrejection,

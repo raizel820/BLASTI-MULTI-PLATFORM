@@ -4453,6 +4453,15 @@ ipcMain.handle('tv-screen:open', async (event, { url } = {}) => {
   tvWindow.loadURL(tvUrl);
   tvWindow.setMenuBarVisibility(false);
 
+  // 0.6.91 — device event stream: kiosk/TV window opened (kiosk mode entered).
+  try {
+    require('./local-api/lib/device-event').deviceEvent(
+      'kiosk_enter',
+      `TV/kiosk window opened (${targetDisplay.bounds.width}x${targetDisplay.bounds.height} @ x=${targetDisplay.bounds.x},y=${targetDisplay.bounds.y})`,
+      { deviceType: 'TV', url: String(tvUrl).slice(0, 200) },
+    );
+  } catch { /* logging must never break the open path */ }
+
   // Reopen on second display if display config changes
   screen.on('display-added', () => {
     if (tvWindow && !tvWindow.isDestroyed()) {
@@ -4478,6 +4487,10 @@ ipcMain.handle('tv-screen:close', () => {
   if (tvWindow && !tvWindow.isDestroyed()) {
     tvWindow.close();
     tvWindow = null;
+    // 0.6.91 — device event stream: kiosk/TV window closed (kiosk mode exited).
+    try {
+      require('./local-api/lib/device-event').deviceEvent('kiosk_exit', 'TV/kiosk window closed', { deviceType: 'TV' });
+    } catch { /* logging must never break the close path */ }
     return { success: true };
   }
   return { success: false, error: 'No TV window open' };

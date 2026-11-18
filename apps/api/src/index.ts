@@ -27,6 +27,7 @@ import { verifySessionToken, SessionToken } from './lib/auth'
 import { recordDataUsage, classifyTrafficType, normalizeNetworkType, resolveAgencyIdFallback } from './lib/data-usage'
 import { startServerMetricsCollector, recordComponentRequest } from './lib/server-metrics'
 import { decodeJwt } from 'jose'
+import { appendDeviceEvent } from './lib/device-event-log'
 import {
   getClientIp,
   checkRateLimit,
@@ -1491,6 +1492,14 @@ io.on('connection', async (socket) => {
       // Log if this is an unauthenticated kiosk (no device token)
       if (!(socket as any)._isDevice) {
         console.log(`[KIOSK] Unauthenticated kiosk joined agency ${id} (legacy mode)`)
+        // 0.6.88 — device event stream: legacy kiosk joined the agency room.
+        appendDeviceEvent({
+          event: 'socket_connected',
+          message: `Legacy (unauthenticated) kiosk joined agency room ${id}`,
+          level: 'info',
+          agencyId: id,
+          deviceType: 'KIOSK',
+        })
       }
       socket.join(`kiosk:${id}`)
     }
@@ -1511,6 +1520,13 @@ io.on('connection', async (socket) => {
 
     if (!device) {
       console.warn(`[AUTH] Socket ${socket.id} tried join:device with invalid token — rejected`)
+      // 0.6.88 — device event stream: bad device token on the realtime gate.
+      appendDeviceEvent({
+        event: 'socket_auth_failed',
+        message: 'join:device rejected — invalid device token',
+        level: 'warn',
+        data: { socketId: socket.id },
+      })
       return // REJECTED
     }
 
@@ -1541,6 +1557,25 @@ io.on('connection', async (socket) => {
     }
 
     console.log(`⚡ Device joined: ${socket.id} (device: ${device.id}, type: ${device.type}, agency: ${device.agencyId})`)
+    // 0.6.88 — device event stream: realtime connection + online transition.
+    appendDeviceEvent({
+      event: 'socket_connected',
+      message: `Device joined realtime (socket ${socket.id})`,
+      deviceId: device.id,
+      deviceType: device.type,
+      agencyId: device.agencyId,
+      status: device.status,
+    })
+    if (device.status !== 'DISABLED') {
+      appendDeviceEvent({
+        event: 'device_online',
+        message: `Device marked ONLINE via socket join`,
+        deviceId: device.id,
+        deviceType: device.type,
+        agencyId: device.agencyId,
+        status: 'ONLINE',
+      })
+    }
   })
 
   socket.on('leave:device', () => {
@@ -1618,6 +1653,14 @@ io.on('connection', async (socket) => {
     if (deviceId) {
       // M2: Don't immediately mark OFFLINE — let the heartbeat watchdog handle it
       console.log(`🔌 Device ${deviceId} disconnected`)
+      // 0.6.88 — device event stream: realtime connection dropped.
+      appendDeviceEvent({
+        event: 'socket_disconnected',
+        message: `Device socket disconnected (${reason})`,
+        deviceId,
+        agencyId: (socket as any)._deviceAgencyId ?? null,
+        data: { reason: String(reason ?? 'unknown'), socketId: socket.id },
+      })
       socket.leave(`device:${deviceId}`)
     }
   })

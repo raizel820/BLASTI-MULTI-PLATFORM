@@ -19,6 +19,8 @@
  */
 
 import { getLocalIp } from './get-local-ip';
+// 0.6.91 — device event stream (Logs Manager "Devices" tab).
+import { logDevice } from './remote-logger';
 
 // ─── Types ─────────────────────────────────────────────────────────────────
 
@@ -293,6 +295,11 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
   if (isScanning) return null;
   if (typeof window === 'undefined') return null;
   isScanning = true;
+  // 0.6.91 — device event stream: LAN discovery is now visible in the Logs
+  // Manager "Devices" tab (previously this sweep was COMPLETELY silent — the
+  // user could not tell whether the phone ever looked for the desktop box).
+  const scanStartedAt = Date.now();
+  try { logDevice('scan_started', 'LAN discovery started (cached → localhost → gateways → subnet sweep)'); } catch { /* never block */ }
   try {
     const derived = await deriveCandidateSubnets();
 
@@ -325,13 +332,18 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
 
     // Strict precedence preserved from the sequential version:
     // a live cached server > localhost > derived-subnet gateway.
-    if (cachedAlive) return cachedAlive;
+    if (cachedAlive) {
+      try { logDevice('scan_completed', `LAN discovery found the cached desktop box at ${cachedAlive.ip}:${cachedAlive.apiPort || cachedAlive.port}`, { deviceName: cachedAlive.name || undefined, deviceType: cachedAlive.role || undefined, status: 'ONLINE' }); } catch { /* never block */ }
+      return cachedAlive;
+    }
     if (localhost) {
       cacheServer(localhost); // M26: Cache localhost result
+      try { logDevice('scan_completed', `LAN discovery found the local desktop at ${localhost.ip}:${localhost.apiPort || localhost.port}`, { deviceName: localhost.name || undefined, deviceType: localhost.role || undefined, status: 'ONLINE' }); } catch { /* never block */ }
       return localhost;
     }
     if (gateway) {
       cacheServer(gateway); // M26: Cache gateway result
+      try { logDevice('scan_completed', `LAN discovery found the gateway desktop at ${gateway.ip}:${gateway.apiPort || gateway.port}`, { deviceName: gateway.name || undefined, deviceType: gateway.role || undefined, status: 'ONLINE' }); } catch { /* never block */ }
       return gateway;
     }
 
@@ -348,7 +360,25 @@ export async function quickDiscover(): Promise<DiscoveredServer | null> {
 
     const winner = found[0] ?? null;
     if (winner) cacheServer(winner);
+    try {
+      logDevice(
+        winner ? 'scan_completed' : 'scan_failed',
+        winner
+          ? `LAN discovery found the desktop box at ${winner.ip}:${winner.apiPort || winner.port} after ${Math.round((Date.now() - scanStartedAt) / 1000)}s`
+          : `LAN discovery finished with NO desktop box found after ${Math.round((Date.now() - scanStartedAt) / 1000)}s (${candidates.length} subnet(s) swept)`,
+        winner
+          ? { deviceName: winner.name || undefined, deviceType: winner.role || undefined, status: 'ONLINE' }
+          : { subnets: candidates.length },
+        winner ? 'info' : 'warn',
+      );
+    } catch { /* never block */ }
     return winner;
+  } catch (err) {
+    // 0.6.91 — device event stream: discovery crashed (was invisible before).
+    try {
+      logDevice('scan_failed', `LAN discovery failed: ${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}`, undefined, 'error');
+    } catch { /* never block */ }
+    throw err;
   } finally {
     isScanning = false;
   }

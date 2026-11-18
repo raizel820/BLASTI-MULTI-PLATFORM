@@ -18,7 +18,7 @@ import {
 import { apiFetch } from '@/lib/api-fetch';
 import { APP_VERSION } from '@/lib/version';
 import { getLocalIp } from '@/lib/get-local-ip';
-import { flushLogsNow } from '@/lib/remote-logger';
+import { flushLogsNow, logDevice } from '@/lib/remote-logger';
 import { toast } from 'sonner';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -123,6 +123,17 @@ export function DeviceKiosk() {
   const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const agencyCodeRef = useRef(agencyCode);
   useEffect(() => { agencyCodeRef.current = agencyCode; }, [agencyCode]);
+
+  // 0.6.91 — device event stream: kiosk mode ENTERED (was invisible before —
+  // support could not tell whether a kiosk ever reached this surface).
+  const kioskEnterLoggedRef = useRef(false);
+  useEffect(() => {
+    if (kioskEnterLoggedRef.current) return;
+    kioskEnterLoggedRef.current = true;
+    try {
+      logDevice('kiosk_enter', 'Kiosk mode entered (device surface mounted)', { deviceType: 'KIOSK' });
+    } catch { /* never block the kiosk */ }
+  }, []);
 
   // Inactivity timer
   const [inactivitySeconds, setInactivitySeconds] = useState(0);
@@ -357,11 +368,23 @@ export function DeviceKiosk() {
         startDeviceHeartbeat(data.deviceToken);
         if (data.agency.isQueueOpen && !data.agency.isPaused) setStep('services');
         else setStep('services');
+        // 0.6.91 — device event stream: kiosk credentials accepted.
+        try {
+          logDevice('kiosk_auth_success', `Kiosk authenticated (pairing code accepted) — agency ${data.agency.name || ''}`, { deviceId: data.device?.id || undefined, deviceType: data.device?.type || 'KIOSK', agencyId: data.agency.id, status: 'ONLINE' });
+        } catch { /* never block the kiosk */ }
         toast.success(t('kioskPairedSuccessfully') || 'Connected!');
       } else {
+        // 0.6.91 — device event stream: kiosk credentials rejected.
+        try {
+          logDevice('kiosk_auth_failed', `Kiosk authentication failed: ${data.error || 'rejected'}`, { deviceType: 'KIOSK', status: data.error ? 'INVALID' : undefined }, 'warn');
+        } catch { /* never block the kiosk */ }
         setCredError(data.error || 'Authentication failed');
       }
     } catch {
+      // 0.6.91 — device event stream: kiosk auth network failure.
+      try {
+        logDevice('kiosk_auth_failed', 'Kiosk authentication failed — network error', { deviceType: 'KIOSK' }, 'error');
+      } catch { /* never block the kiosk */ }
       setCredError('Network error');
     } finally {
       setCredLoading(false);
@@ -381,6 +404,8 @@ export function DeviceKiosk() {
     setIsDeviceRegistered(false);
     if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
     removeDeviceToken();
+    // 0.6.91 — device event stream: device forgotten / kiosk logged out.
+    try { logDevice('kiosk_exit', 'Kiosk device forgotten — credentials cleared locally', { deviceType: 'KIOSK' }); } catch { /* never block */ }
   }, [deviceToken, realtime]);
 
   // ─── Fetch Agency (with retry) ─────────────────────────────
