@@ -146,6 +146,10 @@ import { OfflineDiagnosisPanel } from '@/components/shared/offline-diagnosis-pan
 import { BlastiSkeleton, BlastiSkeletonCompact } from '@/components/shared/blasti-skeleton';
 import { BootGate } from '@/components/shared/boot-gate';
 import { PostLoginSyncGate } from '@/components/shared/post-login-sync-gate';
+// 0.6.90 — global post-payment success dialog (verify on Chargily / home).
+// Mounted next to every Toaster so the settle event can surface it on any
+// render branch the payer happens to be on.
+import { default as PaymentSuccessDialog } from '@/components/shared/payment-success-dialog';
 // Task 81 — biometric app-open lock + remember-me session keeper.
 import { BiometricAppLock } from '@/components/shared/biometric-app-lock';
 import { startSessionKeeper, SESSION_EXPIRED_EVENT } from '@/lib/session-keeper';
@@ -1055,6 +1059,7 @@ export default function Home() {
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />
+        <PaymentSuccessDialog />
       </>
     );
   }
@@ -1083,6 +1088,7 @@ export default function Home() {
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />
+        <PaymentSuccessDialog />
         <OfflineDiagnosisPanel
           open={showDiagnosis}
           onClose={() => setShowDiagnosis(false)}
@@ -1107,6 +1113,7 @@ export default function Home() {
           </motion.div>
         </AnimatePresence>
         <Toaster richColors position="top-center" />
+        <PaymentSuccessDialog />
         <OfflineDiagnosisPanel
           open={showDiagnosis}
           onClose={() => setShowDiagnosis(false)}
@@ -1265,6 +1272,12 @@ export default function Home() {
       </main>
 
       <Toaster richColors position="top-center" />
+
+      {/* 0.6.90 — post-payment success dialog: the user-requested options
+          (verify on the Chargily platform in the system browser / return
+          home) shown the moment the background watcher confirms the payment
+          locally. */}
+      <PaymentSuccessDialog />
 
       {/* Task 46: Post-login initial-sync loading gate — holds the UI on a
           branded progress screen until the desktop workspace import is done

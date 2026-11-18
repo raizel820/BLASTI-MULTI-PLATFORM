@@ -34,6 +34,16 @@ const {
 const path = require('path');
 const fs = require('fs');
 
+// ─── 0.6.90 — CAPTCHA root fix for the embedded Chargily checkout ──────────
+// Chromium's AutomationControlled blink feature makes navigator.webdriver
+// report TRUE inside every Electron renderer, and hCaptcha / Cloudflare
+// Turnstile treat that as a hard bot signal — the hosted gateway page kept
+// serving failing challenge loops (the "many CAPTCHA problems" report).
+// Disabling the feature restores a normal-Chrome environment. Safe: it only
+// hides automation markers — the payment window stays sandboxed and isolated
+// on its own partition, and the main window only ever loads our own app.
+app.commandLine.appendSwitch('disable-blink-features', 'AutomationControlled');
+
 // ─── Persistent File Logger (Task 49) ────────────────────────────────────────
 // Mirrors every console line into <userData>/logs/main.log so startup failures
 // on end-user machines are ALWAYS diagnosable. The installed app once sat in
@@ -3959,6 +3969,93 @@ const openExternalOnce = (url) => {
 // the pattern only accepts whole chargily domains.
 const GATEWAY_URL_RE = /^https?:\/\/([a-z0-9-]+\.)*chargily\.(net|com|test)([/:?#]|$)/i;
 
+// 0.6.90 — the payment window runs on a PERSISTENT partition: cookies and
+// Cloudflare clearance survive app restarts. A fresh incognito-like session
+// for EVERY payment (the 0.6.87 in-memory partition) was the main reason the
+// hosted checkout kept demanding CAPTCHAs — a brand-new browser with zero
+// history is always challenged, and a challenge that fails once can never
+// build the trust a returning browser earns automatically.
+const PAYMENT_PARTITION = 'persist:blasti-payment';
+
+// 0.6.90 — CAPTCHA challenge providers the hosted checkout may open as
+// popups (hCaptcha, Cloudflare Turnstile, Google reCAPTCHA). These must stay
+// IN-SHELL on the same partition: the challenge widget posts its result back
+// through window.opener, which dies the moment the popup is forced into the
+// system browser (the 0.6.84–0.6.89 behavior that broke verification
+// mid-loop and surfaced as "CAPTCHA problems" too).
+const CAPTCHA_HOST_RE = /^https?:\/\/([a-z0-9-]+\.)*(hcaptcha\.com|cloudflare\.com|recaptcha\.net)([/:?#]|$)/i;
+const isCaptchaChallengeUrl = (u) =>
+  CAPTCHA_HOST_RE.test(u) || /^https?:\/\/(www\.)?google\.com\/recaptcha/i.test(u);
+
+// 0.6.90 — session hardening for the payment partition (registered ONCE):
+//   1. coherent Sec-CH-UA client hints. The 0.6.87 UA strip removes the
+//      Electron token from the user-agent STRING, but Chromium still SENDS
+//      Sec-CH-UA brand lists containing "Electron" — and gateway bot rules
+//      cross-check the two, flagging the mismatch as automation. Rewrite the
+//      brand list to a plain-Chrome one derived from the real engine
+//      version so hints and UA tell the same story.
+//   2. permission handler — grant the benign capabilities a hosted checkout
+//      or CAPTCHA widget may legitimately request (clipboard, notifications,
+//      fullscreen, pointer lock); everything else stays denied.
+let paymentSessionHardened = false;
+function hardenPaymentSession() {
+  if (paymentSessionHardened) return;
+  paymentSessionHardened = true;
+  try {
+    const paySession = session.fromPartition(PAYMENT_PARTITION);
+    paySession.webRequest.onBeforeSendHeaders((details, callback) => {
+      try {
+        const headers = { ...(details.requestHeaders || {}) };
+        // 0.6.90 — session-wide UA strip: EVERY window on the payment
+        // partition (the checkout window AND any CAPTCHA challenge popup)
+        // sends a normal-Chrome User-Agent header. The per-window
+        // setUserAgent below still matters — it also fixes what
+        // navigator.userAgent reports INSIDE page JS.
+        const ua = String(headers['User-Agent'] || '');
+        const stripped = ua
+          .replace(/\s+\S*blasti\S*/gi, '')
+          .replace(/\s+Electron\/[\w.]+/i, '')
+          .trim();
+        if (stripped && stripped !== ua) headers['User-Agent'] = stripped;
+        const chrome = stripped.match(/Chrome\/(\d+)/);
+        if (chrome && /^https:/i.test(details.url)) {
+          const v = chrome[1];
+          headers['Sec-CH-UA'] = '"Chromium";v="' + v + '", "Google Chrome";v="' + v + '", "Not?A_Brand";v="24"';
+          headers['Sec-CH-UA-Full-Version-List'] =
+            '"Chromium";v="' + v + '.0.0.0", "Google Chrome";v="' + v + '.0.0.0", "Not?A_Brand";v="24.0.0.0"';
+          if (headers['Sec-CH-UA-Mobile'] === undefined) headers['Sec-CH-UA-Mobile'] = '?0';
+        }
+        callback({ requestHeaders: headers });
+      } catch {
+        callback({ requestHeaders: details.requestHeaders });
+      }
+    });
+    paySession.setPermissionRequestHandler((_wc, permission, callback) => {
+      const granted = [
+        'clipboard-read',
+        'clipboard-sanitized-write',
+        'notifications',
+        'fullscreen',
+        'pointerLock',
+      ].includes(permission);
+      callback(granted);
+    });
+  } catch { /* session not ready — Chromium defaults remain acceptable */ }
+}
+
+// 0.6.90 — shared normal-Chrome UA for the payment partition windows (the
+// checkout window AND CAPTCHA challenge popups — the challenge page reads
+// navigator.userAgent in JS, so the strip must be applied per-window too).
+const normalBrowserUA = (wc) => {
+  try {
+    wc.setUserAgent(
+      wc.getUserAgent()
+        .replace(/\s+\S*blasti\S*/gi, '')   // e.g. "blasti/0.6.90", "@blasti/desktop/0.6.90"
+        .replace(/\s+Electron\/[\w.]+/i, '')
+    );
+  } catch { /* default UA is acceptable */ }
+};
+
 // ─── 0.6.84 — In-app Chargily payment window ───────────────────────────────
 // The hosted gateway used to open in the SYSTEM browser (shell.openExternal):
 // after paying, the gateway's "return to store" button landed on the cloud
@@ -3986,10 +4083,24 @@ const GATEWAY_URL_RE = /^https?:\/\/([a-z0-9-]+\.)*chargily\.(net|com|test)([/:?
 // checkout document received OUR policy (default-src 'self' / style-src
 // 'self' …) instead of its own, every stylesheet/script its CDNs served was
 // blocked, and the page painted as raw unstyled HTML. The window now runs on
-// a PRIVATE in-memory partition ('blasti-payment') that the injection never
-// touches (setCSP is origin-scoped too, belt + suspenders), with a
-// normal-Chrome user agent so gateway CDNs / bot rules treat it like any
-// desktop browser.
+// a PRIVATE partition that the injection never touches (setCSP is
+// origin-scoped too, belt + suspenders), with a normal-Chrome user agent so
+// gateway CDNs / bot rules treat it like any desktop browser.
+// 0.6.90 — "many CAPTCHA problems" ROOT FIX, four layers:
+//   (a) the partition is PERSISTENT (persist:blasti-payment) so Cloudflare
+//       clearance / hCaptcha trust cookies survive restarts — a returning
+//       browser is not re-challenged like a brand-new one;
+//   (b) disable-blink-features=AutomationControlled (top of file) so
+//       navigator.webdriver stops reporting true;
+//   (c) Sec-CH-UA client hints rewritten to a plain-Chrome brand list (see
+//       hardenPaymentSession) so hints stop contradicting the stripped UA;
+//   (d) CAPTCHA challenge POPUPS stay in-shell on the same partition so the
+//       widget can postMessage through window.opener (setWindowOpenHandler).
+// AND the "confirmation page opens in the system browser automatically"
+// report: Chargily opens its post-payment success/verification page with
+// window.open — through 0.6.89 every popup fell into openExternalOnce. Cloud
+// targets are now intercepted as TERMINAL in-app results (same conversion as
+// top-level navigations); only genuinely foreign popups still go external.
 let paymentWindow = null;
 
 function closePaymentWindow() {
@@ -4040,15 +4151,18 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
         nodeIntegration: false,
         sandbox: true,
         javascript: true, // the hosted gateway page needs its own JS
-        // 0.6.87 — PRIVATE in-memory session for the gateway pages. Sharing
-        // the app's default session is what broke the hosted page: the
-        // app-wide CSP injection is registered per-session and rewrote the
-        // gateway's own headers (raw unstyled HTML). A dedicated partition
-        // gives the checkout a clean, unmodified Chrome environment — fresh
-        // cookies per payment (no stale XSRF), no app cookies/service
-        // workers leaked into the gateway, and nothing the gateway sets
-        // leaks back into the app session.
-        partition: 'blasti-payment',
+        // 0.6.87 — PRIVATE session for the gateway pages. Sharing the app's
+        // default session is what broke the hosted page: the app-wide CSP
+        // injection is registered per-session and rewrote the gateway's own
+        // headers (raw unstyled HTML). A dedicated partition gives the
+        // checkout a clean, unmodified Chrome environment — no app
+        // cookies/service workers leaked into the gateway, and nothing the
+        // gateway sets leaks back into the app session.
+        // 0.6.90 — PERSISTENT (see PAYMENT_PARTITION): CAPTCHA providers
+        // (Cloudflare/hCaptcha) challenge a browser with zero history on
+        // every payment; keeping cookies between payments lets a passed
+        // challenge clear the following ones automatically.
+        partition: PAYMENT_PARTITION,
       },
     });
     paymentWindow.setMenuBarVisibility(false);
@@ -4057,13 +4171,10 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
     // bot rules serve degraded or challenge pages to embedded webviews.
     // Strip both tokens and keep the exact Chromium engine version the page
     // actually runs on (must happen BEFORE the first loadURL).
-    try {
-      paymentWindow.webContents.setUserAgent(
-        paymentWindow.webContents.getUserAgent()
-          .replace(/\s+\S*blasti\S*/gi, '')   // e.g. "blasti/0.6.87", "@blasti/desktop/0.6.87"
-          .replace(/\s+Electron\/[\w.]+/i, '')
-      );
-    } catch { /* default UA is acceptable */ }
+    normalBrowserUA(paymentWindow.webContents);
+    // 0.6.90 — coherent client hints + benign permissions for THIS window's
+    // session (idempotent — registered once per app run).
+    hardenPaymentSession();
 
     // Result detection — fires for full navigations AND in-page (hash) ones.
     const finishWithResult = (deepUrl) => {
@@ -4139,13 +4250,66 @@ ipcMain.handle('app:open-payment-window', async (_event, { url } = {}) => {
       } catch { /* ignore */ }
     });
     paymentWindow.webContents.setWindowOpenHandler(({ url: childUrl }) => {
-      // Popups from the hosted page go to the system browser (deduped), never
-      // replace the payment window.
+      // 0.6.90 — ROOT FIX for "the confirmation page opens in the browser":
+      // the gateway detours its post-payment success/verification page into a
+      // window.open popup, and through 0.6.89 EVERY popup was handed to
+      // openExternalOnce — an automatic system-browser tab over the app.
+      // Cloud targets are now TERMINAL here: the result route is converted
+      // into the blasti:// deep link (same as a top-level navigation) and any
+      // other cloud URL is dropped silently — the settlement watcher already
+      // owns the confirmation UX. NEVER open a cloud page externally from the
+      // payment window.
+      try {
+        if (childUrl && String(childUrl).toLowerCase().startsWith('blasti://')) {
+          finishWithResult(childUrl);
+          return { action: 'deny' };
+        }
+        const t = new URL(childUrl);
+        if (isCloudOrigin(t.origin)) {
+          if ((t.hash || '').startsWith('#/payment/result')) {
+            const qIndex = (t.hash || '').indexOf('?');
+            const query = qIndex >= 0 ? t.hash.slice(qIndex + 1) : '';
+            finishWithResult('blasti://payment/result' + (query ? '?' + query : ''));
+          }
+          return { action: 'deny' };
+        }
+      } catch { /* malformed — fall through to the provider checks */ }
+      // 0.6.90 — CAPTCHA/gateway challenge popups stay IN-SHELL on the same
+      // persistent partition. action:'allow' (NOT a hand-built window) keeps
+      // the window.opener relationship alive — hCaptcha/Turnstile postMessage
+      // the verification result back to the checkout page. Forcing these to
+      // the system browser is what broke the CAPTCHA loop.
+      if (GATEWAY_URL_RE.test(childUrl) || isCaptchaChallengeUrl(childUrl)) {
+        return {
+          action: 'allow',
+          overrideBrowserWindowOptions: {
+            width: 480,
+            height: 660,
+            autoHideMenuBar: true,
+            webPreferences: {
+              contextIsolation: true,
+              nodeIntegration: false,
+              sandbox: true,
+              partition: PAYMENT_PARTITION,
+            },
+          },
+        };
+      }
+      // Genuinely foreign popups (help pages, OAuth, ads) still go to the
+      // system browser (deduped) — never replace the payment window.
       try { openExternalOnce(childUrl); } catch { /* ignore */ }
       return { action: 'deny' };
     });
     paymentWindow.once('ready-to-show', () => {
       try { if (paymentWindow && !paymentWindow.isDestroyed()) paymentWindow.show(); } catch { /* ignore */ }
+    });
+    // 0.6.90 — CAPTCHA challenge popups (allowed in-shell above) get the
+    // same normal-Chrome UA: the challenge page reads navigator.userAgent in
+    // JS, and an Electron token there re-triggers the bot detection this
+    // whole fix removes. The session-level header rewrite (onBeforeSendHeaders)
+    // covers the HTTP layer; this covers the JS layer.
+    paymentWindow.webContents.on('did-create-window', (childWindow) => {
+      try { normalBrowserUA(childWindow.webContents); } catch { /* ignore */ }
     });
     paymentWindow.on('closed', () => { paymentWindow = null; });
 

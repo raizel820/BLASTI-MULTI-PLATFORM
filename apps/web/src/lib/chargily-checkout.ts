@@ -32,6 +32,12 @@ export interface PendingCheckout {
   createdAt: number;
   /** Where to send the user when they leave the result page. */
   returnView?: string;
+  /**
+   * 0.6.90 — the hosted gateway URL. Kept so the success dialog can offer
+   * "verify on the Chargily platform" (opens the gateway confirmation page
+   * in the system browser, user-initiated) after the checkout settles.
+   */
+  checkoutUrl?: string;
 }
 
 export interface CreateCheckoutResponse {
@@ -249,6 +255,8 @@ export async function startChargilyCheckout(
     amount: checkout.amount,
     createdAt: Date.now(),
     returnView: opts?.returnView,
+    // 0.6.90 — kept for the success dialog's "verify on Chargily" option.
+    checkoutUrl: checkout.checkoutUrl,
   });
 
   // 0.6.81 — the payer is being handed to the hosted gateway page.
@@ -269,8 +277,13 @@ export async function startChargilyCheckout(
   // (webhook or the poll fallback inside GET /payment/checkout/:id), the
   // watcher clears the pending marker, closes the desktop in-app payment
   // window and navigates the app STRAIGHT to the view the payment started
-  // from (subscription page → shows the ACTIVE subscription). No result
-  // screen, no dialogs — whatever detour the gateway's return takes.
+  // from (subscription page → shows the ACTIVE subscription) — whatever
+  // detour the gateway's return takes.
+  // 0.6.90 — the settle step ALSO opens the user-requested success DIALOG
+  // (blasti:payment-success): the subscription is already confirmed locally,
+  // and the dialog offers the optional "verify on the Chargily platform"
+  // (opens the gateway confirmation page in the system browser) plus a
+  // return-home button. No automatic browser tabs, no extra steps.
   // Dynamic import: this module and the watcher reference each other (the
   // watcher persists/clears the pending checkout marker), and a static
   // import would create a module-evaluation cycle.

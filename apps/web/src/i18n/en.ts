@@ -2689,6 +2689,9 @@ const en: Record<TranslationKeys, string> = {
   subscriptionActivatedMsg: "Subscription activated",
   smsCreditsAddedMsg: "SMS credits added",
   hardwareOrderConfirmedMsg: "Hardware order confirmed",
+  // 0.6.90 — success dialog options (verify on Chargily / return home)
+  paymentVerifyGateway: "Verify on the Chargily platform",
+  paymentBackHome: "Return to the home page",
   payNow: "Pay now",
   payWithGateway: "Pay via EDAHABIA / CIB",
   smsBuyTitle: "Buy an SMS pack",

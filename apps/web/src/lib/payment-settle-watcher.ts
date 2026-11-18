@@ -23,7 +23,13 @@
  *     `blasti:payment-settled` DOM event;
  *   - the SPA navigates STRAIGHT to the view the payment started from
  *     (subscription page → shows the ACTIVE subscription) or the role home —
- *     no result screen, no dialogs (the user's option 2).
+ *     no result screen.
+ *   - 0.6.90 — AND opens the user-requested success DIALOG by dispatching
+ *     `blasti:payment-success`: the payment is already confirmed locally
+ *     here, and the dialog offers the optional "verify on the Chargily
+ *     platform" action (opens the gateway confirmation page in the system
+ *     browser, user-initiated) plus a return-to-home button. No automatic
+ *     browser tab, no waiting flash, no extra steps.
  *
  * The blasti:// payment-result deep link is suppressed for a settled payment
  * (shouldSuppressPaymentResultRouting) so the late gateway return can no
@@ -74,6 +80,16 @@ const TOTAL_ATTEMPTS = FAST_ATTEMPTS + SLOW_ATTEMPTS;
 
 /** How long a locally-settled payment keeps suppressing result routing. */
 const SETTLED_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * 0.6.90 — DOM event that opens the payment success dialog (consumed by the
+ * global PaymentSuccessDialog component). Payload:
+ *   { checkoutId, type, amount, currency, verifyUrl }
+ * verifyUrl is the hosted gateway checkout URL — the dialog's optional
+ * "verify on the Chargily platform" action opens it in the SYSTEM browser
+ * on explicit user request only.
+ */
+export const PAYMENT_SUCCESS_EVENT = 'blasti:payment-success';
 
 interface ActiveWatcher {
   checkoutId: string;
@@ -204,9 +220,30 @@ export function startSettleWatcher(
       void bridge?.closePaymentWindow?.();
     } catch { /* ignore */ }
 
-    // Straight navigation — no result screen, no dialogs. The subscription
-    // page (or SMS wallet) the payment started from shows the ACTIVE state;
-    // when the start view is unknown, land on the role's home.
+    // 0.6.90 — the user-requested success DIALOG ("verify on the Chargily
+    // platform" + "return to home") over the already-activated subscription
+    // view. Fired only for CONFIRMED payments — failures keep the
+    // result-view UX so the payer can read what went wrong.
+    if (ok) {
+      try {
+        window.dispatchEvent(
+          new CustomEvent(PAYMENT_SUCCESS_EVENT, {
+            detail: {
+              checkoutId,
+              type: d?.type || checkout.type,
+              amount: d?.amount ?? checkout.amount,
+              currency: checkout.currency,
+              verifyUrl: checkout.checkoutUrl,
+            },
+          }),
+        );
+      } catch { /* ignore */ }
+    }
+
+    // Straight navigation — no result screen (the success dialog overlays
+    // this view). The subscription page (or SMS wallet) the payment started
+    // from shows the ACTIVE state; when the start view is unknown, land on
+    // the role's home.
     try {
       const state = useAppStore.getState();
       if (!state.user) return;

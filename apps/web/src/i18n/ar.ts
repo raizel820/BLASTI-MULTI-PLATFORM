@@ -2689,6 +2689,9 @@ const ar = {
   subscriptionActivatedMsg: "تم تفعيل الاشتراك",
   smsCreditsAddedMsg: "تمت إضافة رصيد الرسائل",
   hardwareOrderConfirmedMsg: "تم تأكيد طلب الأجهزة",
+  // 0.6.90 — success dialog options (verify on Chargily / return home)
+  paymentVerifyGateway: "التحقق على منصة تشارجلي",
+  paymentBackHome: "العودة إلى الصفحة الرئيسية",
   payNow: "ادفع الآن",
   payWithGateway: "الدفع عبر الذهبية / CIB",
   smsBuyTitle: "شراء رزمة رسائل",

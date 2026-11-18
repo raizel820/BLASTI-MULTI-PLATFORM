@@ -2688,6 +2688,9 @@ const fr: Record<TranslationKeys, string> = {
   subscriptionActivatedMsg: "Abonnement activé",
   smsCreditsAddedMsg: "Crédits SMS ajoutés",
   hardwareOrderConfirmedMsg: "Commande matériel confirmée",
+  // 0.6.90 — success dialog options (verify on Chargily / return home)
+  paymentVerifyGateway: "Vérifier sur la plateforme Chargily",
+  paymentBackHome: "Retour à la page d'accueil",
   payNow: "Payer maintenant",
   payWithGateway: "Payer par EDAHABIA / CIB",
   smsBuyTitle: "Acheter un pack SMS",
